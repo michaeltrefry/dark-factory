@@ -73,7 +73,7 @@ public sealed class ControlProcessTests : IAsyncLifetime
 
     private sealed class Stops(ControlProcessTests t) : IItemStops
     {
-        public async Task<string> StopAsync(int storyId, CancellationToken ct)
+        public async Task<ControlResult> StopAsync(int storyId, CancellationToken ct)
         {
             await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(t._ledger));
             return await new ItemStopper(t._stories, new WorkLedger(db, TimeProvider.System), new PostgresRunLocks(t._ledger), t._prs, t.Controls, TextWriter.Null)
@@ -136,7 +136,8 @@ public sealed class ControlProcessTests : IAsyncLifetime
 
         // Stop: Cancelled, the PR a draft again, the branch intact, the story told and back in the Backlog.
         var stop = await Actions().StopAsync(scope, "tester", ct);
-        Assert.Contains("stopped", stop);
+        Assert.True(stop.Ok, stop.Message);
+        Assert.Contains("stopped", stop.Message);
         await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_ledger)))
         {
             Assert.Equal(WorkState.Cancelled, (await db.WorkItems.SingleAsync(ct)).State);

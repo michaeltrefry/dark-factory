@@ -96,7 +96,7 @@ dotnet run --project src/DarkFactory.Orchestrator -- stop --item sc-1234   # --e
   worker gets a PreToolUse hook (`--settings`) that, once the run's flag file exists under
   `<work root>/controls` (owner-owned; the worker can read it, not write it), denies the next tool call
   and ends the session. The orchestrator does not trust the worker to obey: if it has not stopped within
-  `Worker:PauseGraceSeconds` (default 300) it is stopped like a Ctrl-C. The item is recorded Paused
+  `Worker:PauseGraceSeconds` (default 660, longer than the 600 s longest tool call) it is stopped like a Ctrl-C. The item is recorded Paused
   (`user-paused`) with its Claude session id and worktree kept.
 - **Continue** clears the scope's pause; `factory work` resumes the item on its next poll (or run
   `factory run sc-<id>`), and an interrupted worker resumes its own session with `claude --resume`, so the

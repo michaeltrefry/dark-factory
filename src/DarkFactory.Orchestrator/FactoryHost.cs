@@ -102,7 +102,8 @@ public static class FactoryHost
         services.AddSingleton<IDashboardData, DashboardData>();
         // The dashboard's only writes besides login/logout (E8): Pause, Continue and Stop.
         services.AddSingleton(sp => new Controls.ControlActions(
-            sp.GetRequiredService<Controls.IControls>(), sp.GetRequiredService<IDbContextFactory<LedgerDbContext>>(), sp.GetService<Controls.IItemStops>()));
+            sp.GetRequiredService<Controls.IControls>(), sp.GetRequiredService<IDbContextFactory<LedgerDbContext>>(), sp.GetService<Controls.IItemStops>(),
+            sp.GetService<WorkSources.IWorkSource>(), new PostgresRunLocks(options.LedgerConnectionString)));
         services.AddSingleton<ISessionViewers>(sp => sp.GetRequiredService<SessionBroadcaster>());
         return services;
     }

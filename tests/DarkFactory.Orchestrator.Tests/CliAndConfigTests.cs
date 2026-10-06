@@ -141,6 +141,15 @@ public class FactoryOptionsTests
     }
 
     [Fact]
+    public void Pause_grace_outlasts_the_longest_tool_call_and_is_validated()
+    {
+        Assert.Equal(TimeSpan.FromSeconds(660), Options([]).PauseGrace); // a 600 s Bash call (e.g. dotnet test) is never cut off
+        Assert.Equal(TimeSpan.FromSeconds(900), Options(new() { ["Worker:PauseGraceSeconds"] = "900" }).PauseGrace);
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:PauseGraceSeconds"] = "300" }).PauseGrace);
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:PauseGraceSeconds"] = "600" }).PauseGrace);
+    }
+
+    [Fact]
     public void Worker_auth_mode_is_configurable_and_validated()
     {
         Assert.Equal(Worker.WorkerAuth.RouterKey, Options(new() { ["Worker:Auth"] = "router-key" }).WorkerAuth);

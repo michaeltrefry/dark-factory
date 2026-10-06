@@ -4,9 +4,18 @@ using System.Runtime.InteropServices;
 
 namespace DarkFactory.Orchestrator.Worker;
 
-public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError, string? ResultSubtype, string? ResultText, string StderrTail)
+public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError, string? ResultSubtype, string? ResultText, string StderrTail,
+    string? TerminalReason = null)
 {
+    public const string HookStoppedReason = "hook_stopped";
+
     public bool Succeeded => ExitCode == 0 && !IsError && SessionId is not null;
+
+    /// <summary>
+    /// A hook ended the session (<c>terminal_reason: hook_stopped</c>), e.g. the pause hook at a tool boundary: the
+    /// result is a success but says nothing about the work being finished.
+    /// </summary>
+    public bool HookStopped => TerminalReason == HookStoppedReason;
 }
 
 /// <summary>
@@ -43,6 +52,14 @@ public interface IWorker
     /// enforces the pause by cancelling the run if it does not end in time.
     /// </summary>
     void RequestPause(string workingDirectory)
+    {
+    }
+
+    /// <summary>
+    /// Withdraws a <see cref="RequestPause"/> for the worker in <paramref name="workingDirectory"/> (Continue arrived
+    /// before it reached a tool boundary): its next tool call proceeds.
+    /// </summary>
+    void CancelPause(string workingDirectory)
     {
     }
 }
@@ -218,7 +235,7 @@ public sealed class ClaudeWorker(
             return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId), callbacks, ct);
         }
         var flag = PauseFlagPath(pauseFlagDirectory, workingDirectory);
-        Directory.CreateDirectory(pauseFlagDirectory);
+        EnsurePauseFlagDirectory(pauseFlagDirectory);
         File.Delete(flag); // left by a crashed run, it would stop this one at its first tool call
         try
         {
@@ -230,11 +247,43 @@ public sealed class ClaudeWorker(
         }
     }
 
+    /// <summary>The flag directory and flags are world-readable and owner-only writable whatever the umask, so the worker user's hook sees them.</summary>
+    public const UnixFileMode PauseFlagDirectoryMode =
+        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+        | UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute; // 0755
+
+    public const UnixFileMode PauseFlagMode =
+        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead; // 0644
+
+    private static void EnsurePauseFlagDirectory(string directory)
+    {
+        Directory.CreateDirectory(directory);
+        if (!OperatingSystem.IsWindows())
+        {
+            // mkdir applies the umask (under 077 the worker user could not see the flag): set the mode explicitly.
+            File.SetUnixFileMode(directory, PauseFlagDirectoryMode);
+        }
+    }
+
     public void RequestPause(string workingDirectory)
     {
         if (pauseFlagDirectory is not null)
         {
-            File.WriteAllText(PauseFlagPath(pauseFlagDirectory, workingDirectory), "paused\n");
+            EnsurePauseFlagDirectory(pauseFlagDirectory);
+            var flag = PauseFlagPath(pauseFlagDirectory, workingDirectory);
+            File.WriteAllText(flag, "paused\n");
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(flag, PauseFlagMode);
+            }
+        }
+    }
+
+    public void CancelPause(string workingDirectory)
+    {
+        if (pauseFlagDirectory is not null)
+        {
+            File.Delete(PauseFlagPath(pauseFlagDirectory, workingDirectory));
         }
     }
 
@@ -319,7 +368,8 @@ public sealed class ClaudeWorker(
             !state.SawResult || state.ResultIsError,
             state.ResultSubtype,
             state.ResultText,
-            string.Join('\n', stderr));
+            string.Join('\n', stderr),
+            state.TerminalReason);
     }
 
     /// <summary>

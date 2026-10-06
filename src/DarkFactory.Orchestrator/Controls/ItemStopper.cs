@@ -16,23 +16,31 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
 {
     /// <summary>
     /// Stops the item now unless a run holds it, in which case that run stops it (it watches the item's control).
-    /// Returns what happened.
+    /// An item whose last worker was started by a run that crashed is not finished here (this process cannot stop
+    /// that worker): it keeps its Stopping control and the next run of it stops the worker, then finishes the stop.
+    /// Returns what happened; not <see cref="ControlResult.Ok"/> when the stop is left unfinished.
     /// </summary>
-    public async Task<string> StopAsync(int storyId, CancellationToken ct)
+    public async Task<ControlResult> StopAsync(int storyId, CancellationToken ct)
     {
         var id = StoryId.Format(storyId);
         if (await ledger.FindAsync(RunPipeline.Source, id, ct) is not { } item)
         {
             await controls.ClearAsync(ControlScope.Item(id), ct);
-            return $"{id} is not in the factory ledger; nothing to stop.";
+            return new ControlResult(true, $"{id} is not in the factory ledger; nothing to stop.");
         }
         await using var runLock = await locks.TryAcquireAsync(item.Id, ct);
         if (runLock is null)
         {
-            return $"{id} is running; its run stops it at once.";
+            return new ControlResult(true, $"{id} is running; its run stops it at once.");
         }
         await ledger.RefreshAsync(item, item.Title, item.Repo, item.EpicId, ct);
-        return await StopLockedAsync(item, storyId, ct);
+        if (!Lifecycle.IsTerminal(item.State) && RunPipeline.CrashedWorkerMayBeRunning(await ledger.HistoryAsync(item, ct)))
+        {
+            return new ControlResult(false,
+                $"{id}: stop NOT finished: its worker may still be running (the run that started it crashed). It stays Stopping; "
+                + $"the next run of it (the intake loop's next poll, or `factory run {id}`) stops the worker and finishes the stop.");
+        }
+        return new ControlResult(true, await StopLockedAsync(item, storyId, ct));
     }
 
     /// <summary>Stops the item. The caller holds its run lock and its worker is not running.</summary>

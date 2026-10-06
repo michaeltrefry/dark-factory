@@ -61,7 +61,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Worker:LaunchHelper` | `/usr/local/libexec/dark-factory/factory-worker-launch` |
 | `Worker:Auth` | `claude-login` (worker's own Claude login, router passes it through) or `router-key` (router key as Claude's API key; router needs BYOK provider keys) |
 | `Worker:TimeoutMinutes` | `30` |
-| `Worker:PauseGraceSeconds` | `300` (a paused worker that has not stopped at a tool boundary by then is stopped) |
+| `Worker:PauseGraceSeconds` | `660` (a paused worker that has not stopped at a tool boundary by then is stopped; must exceed the 600 s longest tool call) |
 | `Factory:HostPort` | `47822` (`factory work`: 127.0.0.1, plus `Dashboard:BindAddress`) |
 | `Dashboard:BindAddress` | unset = loopback only; one private address (RFC 1918, 100.64/10, fc00::/7) on a local interface |
 | `Dashboard:HostName` | extra Host header the dashboard answers to (e.g. MagicDNS name); one plain DNS name, no wildcard/port |
@@ -102,10 +102,19 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   polls them every second (`ControlWatch`): Pause → `IWorker.RequestPause` (a flag file under `<work root>/controls`
   that the worker's PreToolUse hook, passed by `--settings`, turns into deny + `continue: false`, ending the session at
   the next tool boundary), and the run is cancelled anyway after `Worker:PauseGraceSeconds`; Stop (item state
-  `Stopping`) cancels at once. A pause-ended session's "success" result never counts as worker-done. Stop
+  `Stopping`) cancels at once. Continue before the boundary withdraws the flag (`IWorker.CancelPause`) and the grace.
+  A pause-ended session (result `terminal_reason: hook_stopped`) never counts as worker-done; a worker that finishes
+  on its own after a pause request does (worker-done recorded, then the pause takes effect before the push). Stop is
+  re-checked before the PR is opened and after the last step, so the run that sees it finishes it. Stop
   (`ItemStopper`): PRs back to draft (`prs-drafted`), board Stopped with a comment (`stop-reported`), Cancelled, item
-  control cleared — each checkpointed, so a failed stop stays Stopping and is finished by the next run/poll. A paused
+  control cleared — each checkpointed, so a failed stop stays Stopping and is finished by the next run/poll; an idle
+  item whose worker a crashed run left is not finished by the CLI/dashboard but by its next run (which stops the
+  worker first). Epic-scope Pause/Stop look up items with no `EpicId` on the board and record it (under the run lock);
+  unresolvable ones are reported and the CLI exits non-zero (as on a refused Continue or an unfinished stop). A paused
   factory makes the intake loop list no ready stories; the pipeline claims nothing new in a paused epic/factory.
+  Residual risk: the worker loads the target repo's `.claude/settings.json` (`--setting-sources project,local`), which
+  can set `disableAllHooks` and so switch off the pause hook; the pause grace still stops such a worker (session and
+  worktree kept), only not at a tool boundary.
 
 - Every state change is a committed ledger row before the next step (`WorkLedger.RecordAsync`), checked
   against the transition table in `Ledger/Lifecycle.cs` first; an illegal transition throws and writes nothing.

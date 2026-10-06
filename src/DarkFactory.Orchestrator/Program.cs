@@ -15,8 +15,9 @@ static async Task<int> ControlAsync(string action, string scope, CancellationTok
     var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
     try
     {
-        Console.WriteLine(await FactoryRunner.ControlAsync(options, action, scope, $"{Environment.UserName} (cli)", Console.Out, ct));
-        return 0;
+        var result = await FactoryRunner.ControlAsync(options, action, scope, $"{Environment.UserName} (cli)", Console.Out, ct);
+        Console.WriteLine(result.Message);
+        return result.ExitCode;
     }
     catch (MissingCredentialException ex)
     {

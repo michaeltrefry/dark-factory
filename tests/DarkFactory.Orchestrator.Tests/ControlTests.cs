@@ -49,7 +49,7 @@ public class ControlTests
                 {
                     if (honoursPause && Volatile.Read(ref _pause) == 1)
                     {
-                        return new WorkerResult(Session, 0, false, "success", "", ""); // hook_stopped
+                        return new WorkerResult(Session, 0, false, "success", "", "", WorkerResult.HookStoppedReason);
                     }
                     await Task.Delay(5, ct); // one tool call
                     Interlocked.Increment(ref _tools);
@@ -65,6 +65,60 @@ public class ControlTests
         public Task<bool> StopOrphanAsync(int pid, CancellationToken ct) => Task.FromResult(false);
 
         public void RequestPause(string workingDirectory) => Volatile.Write(ref _pause, 1);
+
+        public void CancelPause(string workingDirectory) => Volatile.Write(ref _pause, 0);
+    }
+
+    /// <summary>
+    /// A worker in the middle of one long tool call that ends when the test releases it. Then, with
+    /// <paramref name="anotherToolCall"/>, it starts another, which the pause hook denies (ending the session) while a
+    /// pause is requested; without, it finishes its turn and the session. A resumed session finishes at once.
+    /// </summary>
+    private sealed class GatedWorker(bool anotherToolCall) : IWorker
+    {
+        private int _pause;
+        public int Runs { get; private set; }
+        public bool Denied { get; private set; }
+        public bool Cancelled { get; private set; }
+        public TaskCompletionSource Working { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource PauseRequested { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, WorkerCallbacks? callbacks, CancellationToken ct)
+        {
+            Runs++;
+            await callbacks!.OnStarted!(WorkerPid, ct);
+            await callbacks.OnSession!(Session, ct);
+            if (resumeSessionId is null)
+            {
+                Working.TrySetResult();
+                try
+                {
+                    await Release.Task.WaitAsync(ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    Cancelled = true;
+                    throw;
+                }
+                if (anotherToolCall && Volatile.Read(ref _pause) == 1)
+                {
+                    Denied = true;
+                    return new WorkerResult(Session, 0, false, "success", "", "", WorkerResult.HookStoppedReason);
+                }
+            }
+            return new WorkerResult(Session, 0, false, "success", "done", "", "completed");
+        }
+
+        public Task<bool> StopOrphanAsync(int pid, CancellationToken ct) => Task.FromResult(false);
+
+        public void RequestPause(string workingDirectory)
+        {
+            Volatile.Write(ref _pause, 1);
+            PauseRequested.TrySetResult();
+        }
+
+        public void CancelPause(string workingDirectory) => Volatile.Write(ref _pause, 0);
     }
 
     private sealed class Harness
@@ -78,7 +132,7 @@ public class ControlTests
         public LedgerDbContextFactory Contexts => new(_options);
         public IControls Controls => new LedgerControls(Contexts, TimeProvider.System);
         public FakeWorkSource Stories { get; init; } = new(Story);
-        public FakeWorkspaces Workspaces { get; } = new();
+        public FakeWorkspaces Workspaces { get; init; } = new();
         public FakePullRequests Prs { get; init; } = new();
         public InProcessRunLocks Locks { get; } = new();
         public WorkLedger Ledger => new(Db, TimeProvider.System);
@@ -91,17 +145,22 @@ public class ControlTests
         public Task<RunOutcome> Run(IWorker worker, int story = 77) => Pipeline(worker).RunAsync(story, CancellationToken.None);
 
         public ControlActions Actions(bool stops = true) =>
-            new(Controls, Contexts, stops ? new Stops(this) : null);
+            new(Controls, Contexts, stops ? new Stops(this) : null, Stories, Locks);
 
         public async Task<List<LedgerEntry>> Rows() => await Db.LedgerEntries.AsNoTracking().OrderBy(e => e.Id).ToListAsync();
         public async Task<List<(WorkState, string?)>> Transitions() => (await Rows()).Where(r => r.Step is null).Select(r => (r.State, r.Detail)).ToList();
         public async Task<WorkItem> Item() => await Db.WorkItems.AsNoTracking().SingleAsync();
 
-        public Task<IReadOnlyList<int>> InFlight() => RunPipeline.InFlightAsync(Ledger, CancellationToken.None, Controls);
+        /// <summary>As the intake loop asks: through a fresh context, so it sees what other processes wrote.</summary>
+        public async Task<IReadOnlyList<int>> InFlight()
+        {
+            await using var db = new LedgerDbContext(_options);
+            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), CancellationToken.None, Controls);
+        }
 
         private sealed class Stops(Harness h) : IItemStops
         {
-            public Task<string> StopAsync(int storyId, CancellationToken ct) =>
+            public Task<ControlResult> StopAsync(int storyId, CancellationToken ct) =>
                 new ItemStopper(h.Stories, new WorkLedger(new LedgerDbContext(h._options), TimeProvider.System), h.Locks, h.Prs, h.Controls, TextWriter.Null)
                     .StopAsync(storyId, ct);
         }
@@ -181,7 +240,7 @@ public class ControlTests
         var result = await h.Actions().StopAsync(ControlScope.Item("sc-77"), "tester", CancellationToken.None);
         var outcome = await run.WaitAsync(TimeSpan.FromSeconds(10));
 
-        Assert.Contains("is running; its run stops it", result);
+        Assert.Contains("is running; its run stops it", result.Message);
         Assert.True(worker.Cancelled); // killed, not asked
         Assert.True(outcome.Succeeded, outcome.Error);
         Assert.Equal(WorkState.Cancelled, outcome.State);
@@ -202,7 +261,7 @@ public class ControlTests
 
         var result = await h.Actions().StopAsync(ControlScope.Item("sc-77"), "tester", CancellationToken.None);
 
-        Assert.Contains("sc-77 stopped", result);
+        Assert.Contains("sc-77 stopped", result.Message);
         Assert.Equal(WorkState.Cancelled, (await h.Item()).State);
         var rows = await h.Rows();
         Assert.Equal(PrUrl, rows.Single(r => r.Step == RunPipeline.Steps.PrsDrafted).Detail);
@@ -225,7 +284,8 @@ public class ControlTests
 
         var result = await h.Actions().StopAsync(ControlScope.Item("sc-77"), "tester", CancellationToken.None);
 
-        Assert.Contains("stop NOT finished (GitHub down)", result);
+        Assert.Contains("stop NOT finished (GitHub down)", result.Message);
+        Assert.False(result.Ok);
         Assert.Equal(WorkState.Implement, (await h.Item()).State);
         Assert.Equal(ControlState.Stopping, (await h.Controls.GetAsync(ControlScope.Item("sc-77"), CancellationToken.None))!.State);
         Assert.Equal([77], await h.InFlight()); // the intake loop retries it
@@ -327,8 +387,178 @@ public class ControlTests
         var h = new Harness();
         await h.Controls.SetAsync(ControlScope.Item("sc-77"), ControlState.Stopping, "tester", CancellationToken.None);
 
-        Assert.Contains("cannot be continued", await h.Actions().ContinueAsync(ControlScope.Item("sc-77"), "tester", CancellationToken.None));
+        var refused = await h.Actions().ContinueAsync(ControlScope.Item("sc-77"), "tester", CancellationToken.None);
+
+        Assert.Contains("cannot be continued", refused.Message);
+        Assert.False(refused.Ok);
+        Assert.Equal(1, refused.ExitCode); // `factory continue` fails
+        Assert.Equal(0, (await h.Actions().ContinueAsync(ControlScope.Factory, "tester", CancellationToken.None)).ExitCode);
         Assert.Equal(ControlState.Stopping, (await h.Controls.GetAsync(ControlScope.Item("sc-77"), CancellationToken.None))!.State);
+    }
+
+    [Fact]
+    public async Task A_worker_that_finishes_on_its_own_after_a_pause_request_is_done_and_the_pause_takes_effect_before_the_push()
+    {
+        var h = new Harness();
+        var worker = new GatedWorker(anotherToolCall: false);
+        var run = h.Run(worker);
+        await worker.Working.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await h.Actions().PauseAsync(ControlScope.Item("sc-77"), "tester", CancellationToken.None);
+        await worker.PauseRequested.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        worker.Release.SetResult(); // its last tool call ends and the worker finishes without another
+
+        var paused = await run.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(WorkState.Paused, paused.State);
+        Assert.Contains(RunPipeline.Steps.WorkerDone, (await h.Rows()).Select(r => r.Step)); // the finished step is recorded (E3)
+        Assert.DoesNotContain(h.Workspaces.Calls, c => c.StartsWith("push"));
+
+        await h.Actions().ContinueAsync(ControlScope.Item("sc-77"), "tester", CancellationToken.None);
+        var resumed = await h.Run(worker);
+
+        Assert.Equal(WorkState.Review, resumed.State);
+        Assert.Equal(1, worker.Runs); // Continue pushes the finished work; the worker does not run again
+    }
+
+    [Fact]
+    public async Task Continue_before_the_worker_reaches_a_tool_boundary_withdraws_the_pause()
+    {
+        var h = new Harness { PauseGrace = TimeSpan.FromSeconds(2) };
+        var worker = new GatedWorker(anotherToolCall: true);
+        var run = h.Run(worker);
+        await worker.Working.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await h.Actions().PauseAsync(ControlScope.Item("sc-77"), "tester", CancellationToken.None);
+        await worker.PauseRequested.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await h.Actions().ContinueAsync(ControlScope.Item("sc-77"), "tester", CancellationToken.None);
+        await Task.Delay(TimeSpan.FromSeconds(3)); // the tool call outlasts the pause grace
+        worker.Release.SetResult();
+
+        var outcome = await run.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.False(worker.Denied); // its next tool call was not stopped
+        Assert.False(worker.Cancelled); // nor was it killed at the grace
+        Assert.Equal(WorkState.Review, outcome.State);
+        Assert.Equal(1, worker.Runs);
+    }
+
+    [Fact]
+    public async Task A_stop_during_the_push_is_finished_by_the_same_run_without_opening_a_ready_pr()
+    {
+        var h = new Harness();
+        h.Workspaces.OnPush = () => h.Controls.SetAsync(ControlScope.Item("sc-77"), ControlState.Stopping, "tester", CancellationToken.None);
+
+        var outcome = await h.Run(new FakeWorker(Reports(Ok)));
+
+        Assert.Equal(WorkState.Cancelled, outcome.State);
+        Assert.Empty(h.Prs.Opened); // no ready PR for a stopped item
+        Assert.Equal(["factory/sc-77"], h.Prs.Drafted);
+        Assert.Contains("state 77 Stopped", h.Stories.Writes);
+        Assert.Null(await h.Controls.GetAsync(ControlScope.Item("sc-77"), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task A_stop_while_the_pr_is_being_opened_is_finished_by_the_same_run_and_drafts_the_pr()
+    {
+        var h = new Harness();
+        h.Prs.OnOpen = () => h.Controls.SetAsync(ControlScope.Item("sc-77"), ControlState.Stopping, "tester", CancellationToken.None);
+
+        var outcome = await h.Run(new FakeWorker(Reports(Ok)));
+
+        Assert.Equal(WorkState.Cancelled, outcome.State); // not left at Review with a ready PR and a Stopping control
+        Assert.Equal([WorkState.Review, WorkState.Cancelled], (await h.Transitions()).Select(t => t.Item1).TakeLast(2));
+        Assert.Equal(["factory/sc-77"], h.Prs.Drafted);
+        Assert.Equal(PrUrl, (await h.Rows()).Single(r => r.Step == RunPipeline.Steps.PrsDrafted).Detail);
+        Assert.Null(await h.Controls.GetAsync(ControlScope.Item("sc-77"), CancellationToken.None));
+    }
+
+    private static async Task<WorkItem> SeedImplementing(Harness h, string id, long? epic = null)
+    {
+        var item = await h.Ledger.GetOrCreateAsync(RunPipeline.Source, id, Story.Name, RunPipelineTests.Sandbox.FullName, null, CancellationToken.None, epic);
+        await h.Ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
+        return item;
+    }
+
+    [Fact]
+    public async Task Stopping_an_epic_stops_an_item_the_ledger_has_no_epic_for_once_the_board_puts_it_in_that_epic()
+    {
+        var h = new Harness { Stories = new(Story) { Epic = new WorkEpic(5, "Phase 1", null, "https://app.shortcut.com/trefry/epic/5") } };
+        await SeedImplementing(h, "sc-77"); // recorded before the ledger kept epics
+
+        var result = await h.Actions().StopAsync(ControlScope.Epic(5), "tester", CancellationToken.None);
+
+        Assert.True(result.Ok, result.Message);
+        Assert.Equal(WorkState.Cancelled, (await h.Item()).State);
+        Assert.Equal(5, (await h.Item()).EpicId); // recorded for the controls and the intake loop
+    }
+
+    [Fact]
+    public async Task Stopping_an_epic_reports_items_whose_epic_cannot_be_read()
+    {
+        var h = new Harness { Stories = new(Story) { ReadSpecFails = new HttpRequestException("Shortcut down") } };
+        await SeedImplementing(h, "sc-77");
+
+        var result = await h.Actions().StopAsync(ControlScope.Epic(5), "tester", CancellationToken.None);
+
+        Assert.False(result.Ok);
+        Assert.Contains("1 item(s) with an unknown epic NOT stopped: sc-77", result.Message);
+        Assert.Equal(WorkState.Implement, (await h.Item()).State);
+    }
+
+    [Fact]
+    public async Task Pausing_an_epic_pauses_an_item_the_ledger_has_no_epic_for_and_reports_any_it_cannot_resolve()
+    {
+        var h = new Harness { Stories = new(Story) { Epic = new WorkEpic(5, "Phase 1", null, "https://app.shortcut.com/trefry/epic/5") } };
+        await SeedImplementing(h, "sc-77");
+        Assert.Equal([77], await h.InFlight());
+
+        var result = await h.Actions().PauseAsync(ControlScope.Epic(5), "tester", CancellationToken.None);
+
+        Assert.True(result.Ok, result.Message);
+        Assert.Empty(await h.InFlight()); // the intake loop does not run it while its epic is paused
+
+        var unreachable = new Harness { Stories = new(Story) { ReadSpecFails = new HttpRequestException("Shortcut down") } };
+        await SeedImplementing(unreachable, "sc-77");
+        var reported = await unreachable.Actions().PauseAsync(ControlScope.Epic(5), "tester", CancellationToken.None);
+        Assert.False(reported.Ok);
+        Assert.Contains("1 item(s) with an unknown epic NOT paused: sc-77", reported.Message);
+    }
+
+    [Fact]
+    public async Task Stop_of_an_idle_item_whose_worker_a_crashed_run_left_waits_for_a_run_to_stop_the_worker()
+    {
+        var h = new Harness();
+        var item = await SeedImplementing(h, "sc-77");
+        await h.Ledger.CheckpointAsync(item, RunPipeline.Steps.WorkerStarted, null, "999", CancellationToken.None); // then the run crashed
+
+        var result = await h.Actions().StopAsync(ControlScope.Item("sc-77"), "tester", CancellationToken.None);
+
+        Assert.False(result.Ok);
+        Assert.Contains("its worker may still be running", result.Message);
+        Assert.Equal(WorkState.Implement, (await h.Item()).State);
+        Assert.Equal(ControlState.Stopping, (await h.Controls.GetAsync(ControlScope.Item("sc-77"), CancellationToken.None))!.State);
+        Assert.Empty(h.Prs.Drafted);
+
+        // The next run (the intake loop's poll) stops the worker first, then finishes the stop. The fake only records the pid.
+        var worker = new FakeWorker { OrphanAlive = true };
+        var outcome = await h.Run(worker);
+
+        Assert.Equal([999], worker.OrphanStops);
+        Assert.Equal(WorkState.Cancelled, outcome.State);
+        Assert.Contains(RunPipeline.Steps.OrphanKilled, (await h.Rows()).Select(r => r.Step));
+        Assert.Empty(worker.Calls);
+    }
+
+    [Fact]
+    public async Task Stop_of_a_paused_item_finishes_at_once()
+    {
+        var h = new Harness();
+        var paused = await PauseWhileWorking(h, new ToolWorker(), ControlScope.Item("sc-77"));
+        Assert.Equal(WorkState.Paused, paused.State);
+
+        var result = await h.Actions().StopAsync(ControlScope.Item("sc-77"), "tester", CancellationToken.None);
+
+        Assert.True(result.Ok, result.Message); // its worker ended before the Paused row: nothing to wait for
+        Assert.Equal(WorkState.Cancelled, (await h.Item()).State);
     }
 
     [Theory]

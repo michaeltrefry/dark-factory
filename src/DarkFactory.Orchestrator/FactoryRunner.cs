@@ -53,6 +53,7 @@ public static class FactoryRunner
         var appId = options.GitHubAppId;
         var appKey = options.GitHubAppPrivateKeyPem;
         var sandbox = options.WorkerSandbox;
+        var pauseGrace = options.PauseGrace;
 
         // Sandboxed, the worker user is single-tenant (every helper exit kills all of its processes),
         // so one sandboxed run per machine, taken before anything runs through the helper.
@@ -90,7 +91,7 @@ public static class FactoryRunner
                 new RouterClient(routerHttp, routerKey), TimeProvider.System, log),
             ignoreScope: ignoreScope,
             controls: Controls(options),
-            pauseGrace: options.PauseGrace);
+            pauseGrace: pauseGrace);
 
         return await pipeline.RunAsync(storyId, ct);
     }
@@ -103,14 +104,16 @@ public static class FactoryRunner
     /// <c>factory pause|continue|stop</c>: writes the scope's control, and for Stop finishes each item's stop
     /// at once when no run holds it (a running item is stopped by its own run within about a second).
     /// </summary>
-    public static async Task<string> ControlAsync(FactoryOptions options, string action, string scope, string by, TextWriter log, CancellationToken ct)
+    public static async Task<ControlResult> ControlAsync(FactoryOptions options, string action, string scope, string by, TextWriter log, CancellationToken ct)
     {
         await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
         var contexts = new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
         using var shortcutHttp = new HttpClient { BaseAddress = ShortcutWorkSource.DefaultBaseAddress };
-        // Stop needs the board and GitHub; Pause and Continue only write the control.
-        var stops = action == "stop" ? new FactoryItemStops(options, CreateWorkSource(options, shortcutHttp), log) : null;
-        var actions = new ControlActions(Controls(options), contexts, stops);
+        // Stop needs the board and GitHub, and an epic scope the board (for items with no epic in the ledger);
+        // Pause and Continue otherwise only write the control.
+        var source = action == "stop" || ControlScope.EpicOf(scope) is not null ? CreateWorkSource(options, shortcutHttp) : null;
+        var stops = action == "stop" ? new FactoryItemStops(options, source!, log) : null;
+        var actions = new ControlActions(Controls(options), contexts, stops, source, new PostgresRunLocks(options.LedgerConnectionString));
         return action switch
         {
             "pause" => await actions.PauseAsync(scope, by, ct),
@@ -124,7 +127,7 @@ public static class FactoryRunner
 /// <summary>Production <see cref="IItemStops"/>: an <see cref="ItemStopper"/> over the Postgres ledger, Shortcut and GitHub, per call.</summary>
 public sealed class FactoryItemStops(FactoryOptions options, IWorkSource source, TextWriter log) : IItemStops
 {
-    public async Task<string> StopAsync(int storyId, CancellationToken ct)
+    public async Task<ControlResult> StopAsync(int storyId, CancellationToken ct)
     {
         using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
         var app = new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System);

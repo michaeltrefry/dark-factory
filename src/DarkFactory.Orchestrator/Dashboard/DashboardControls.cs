@@ -29,7 +29,7 @@ public static class DashboardControls
                     "continue" => await controls.ContinueAsync(scope, By, ct),
                     _ => await controls.StopAsync(scope, By, ct),
                 };
-                Console.WriteLine($"[dashboard] {action} {scope}: {result}");
+                Console.WriteLine($"[dashboard] {action} {scope}: {result.Message}");
                 // The pipeline view shows the new control state (and a stop that did not finish stays Stopping).
                 return Results.Redirect("/");
             })

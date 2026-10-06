@@ -14,6 +14,9 @@ public sealed class StreamJsonState
     public string? ResultSubtype { get; private set; }
     public string? ResultText { get; private set; }
 
+    /// <summary>The result's <c>terminal_reason</c> (e.g. <c>completed</c>, or <c>hook_stopped</c> when a hook ended the session).</summary>
+    public string? TerminalReason { get; private set; }
+
     public void Accept(string line)
     {
         if (string.IsNullOrWhiteSpace(line) || line.TrimStart()[0] != '{')
@@ -46,6 +49,7 @@ public sealed class StreamJsonState
                 ResultIsError = root.TryGetProperty("is_error", out var err) && err.ValueKind == JsonValueKind.True;
                 ResultSubtype = root.TryGetProperty("subtype", out var sub) ? sub.GetString() : null;
                 ResultText = root.TryGetProperty("result", out var text) && text.ValueKind == JsonValueKind.String ? text.GetString() : null;
+                TerminalReason = root.TryGetProperty("terminal_reason", out var reason) && reason.ValueKind == JsonValueKind.String ? reason.GetString() : null;
             }
         }
     }
