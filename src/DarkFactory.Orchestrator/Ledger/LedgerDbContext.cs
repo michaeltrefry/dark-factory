@@ -3,14 +3,6 @@ using Microsoft.EntityFrameworkCore.Design;
 
 namespace DarkFactory.Orchestrator.Ledger;
 
-public enum WorkState
-{
-    Intake,
-    Implement,
-    Review,
-    Failed,
-}
-
 /// <summary>One unit of work pulled from a work source (here: a Shortcut story).</summary>
 public sealed class WorkItem
 {
@@ -25,12 +17,20 @@ public sealed class WorkItem
     public List<LedgerEntry> Entries { get; set; } = [];
 }
 
-/// <summary>An append-only record of a state change of a <see cref="WorkItem"/>.</summary>
+/// <summary>
+/// An append-only ledger row of a <see cref="WorkItem"/>: a state transition, or a
+/// checkpoint inside the current state that resume uses to avoid redoing a step.
+/// </summary>
 public sealed class LedgerEntry
 {
     public long Id { get; set; }
     public long WorkItemId { get; set; }
+    /// <summary>The item's state: the new state for a transition row, the unchanged state for a checkpoint.</summary>
     public WorkState State { get; set; }
+
+    /// <summary>Null for a state transition; the name of a completed sub-step for a checkpoint row.</summary>
+    public string? Step { get; set; }
+
     public DateTimeOffset RecordedAt { get; set; }
     public string? ClaudeSessionId { get; set; }
     public string? Detail { get; set; }
@@ -57,6 +57,7 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
         {
             e.ToTable("ledger_entries");
             e.Property(x => x.State).HasConversion<string>().HasMaxLength(32);
+            e.Property(x => x.Step).HasMaxLength(32);
             e.Property(x => x.ClaudeSessionId).HasMaxLength(128);
             e.HasIndex(x => x.WorkItemId);
         });

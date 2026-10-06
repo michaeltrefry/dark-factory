@@ -10,6 +10,12 @@ public interface IRepoWorkspace
 {
     Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct);
 
+    /// <summary>
+    /// Returns a story's existing worktree as left behind by an interrupted run, without
+    /// touching it, or null when it is gone or no longer on <paramref name="branch"/>.
+    /// </summary>
+    Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct);
+
     /// <summary>Commits any worker changes and pushes the branch. Returns false when there is nothing to push.</summary>
     Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, CancellationToken ct);
 
@@ -67,6 +73,21 @@ public sealed class GitWorkspace(
         }
         await Git(clone, null, ct, "worktree", "prune");
         await Git(clone, null, ct, "worktree", "add", "-B", branch, worktree, $"origin/{baseBranch}");
+        return new Workspace(worktree, branch, baseBranch);
+    }
+
+    public async Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct)
+    {
+        EnsureFactoryBranch(branch);
+        var clone = Path.Combine(workRoot, "repos", repo.Owner, repo.Name);
+        var worktree = Path.Combine(workRoot, "worktrees", repo.Owner, repo.Name, branch.Replace('/', '-'));
+        if (!Directory.Exists(Path.Combine(clone, ".git")) || !File.Exists(Path.Combine(worktree, ".git"))
+            || (await Git(worktree, null, ct, "branch", "--show-current")).Trim() != branch)
+        {
+            return null;
+        }
+        var baseBranch = (await Git(clone, null, ct, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"))
+            .Trim()["origin/".Length..];
         return new Workspace(worktree, branch, baseBranch);
     }
 

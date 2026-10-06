@@ -134,7 +134,7 @@ public class ClaudeWorkerTests
         try
         {
             var worker = new ClaudeWorker(script, Router, "rk_worker", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1));
-            var result = await worker.RunAsync(dir, "prompt", CancellationToken.None);
+            var result = await worker.RunAsync(dir, "prompt", null, null, CancellationToken.None);
 
             Assert.True(result.Succeeded);
             Assert.Equal("sess-abc", result.SessionId);
@@ -202,10 +202,51 @@ public class ClaudeWorkerTests
         File.WriteAllText(script, "#!/bin/sh\necho '{\"type\":\"system\",\"session_id\":\"s\"}'\necho boom >&2\nexit 3\n");
         File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
-        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", CancellationToken.None);
+        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, null, CancellationToken.None);
 
         Assert.False(result.Succeeded);
         Assert.Equal(3, result.ExitCode);
         Assert.Contains("boom", result.StderrTail);
+    }
+
+    [Fact]
+    public void Resume_passes_the_session_id_to_claude()
+    {
+        var args = ClaudeWorker.BuildArguments("go on", "sess-1").ToList();
+        Assert.Equal("sess-1", args[args.IndexOf("--resume") + 1]);
+        Assert.DoesNotContain("--resume", ClaudeWorker.BuildArguments("start"));
+    }
+
+    [Fact]
+    public async Task Session_callback_runs_as_soon_as_the_id_streams_before_the_worker_exits()
+    {
+        var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
+        var flag = Path.Combine(dir, "recorded");
+        var argsDump = Path.Combine(dir, "args.txt");
+        var script = Path.Combine(dir, "fake-claude.sh");
+        // The worker only finishes once the callback has created the flag file.
+        File.WriteAllText(script, $$"""
+            #!/bin/sh
+            printf '%s\n' "$@" > "{{argsDump}}"
+            echo '{"type":"system","subtype":"init","session_id":"sess-early"}'
+            i=0
+            while [ ! -f "{{flag}}" ]; do i=$((i+1)); [ $i -gt 200 ] && exit 9; sleep 0.05; done
+            echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-early"}'
+            """);
+        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var seen = new List<string>();
+
+        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", "sess-early",
+            (sid, _) =>
+            {
+                seen.Add(sid);
+                File.WriteAllText(flag, sid);
+                return Task.CompletedTask;
+            }, CancellationToken.None);
+
+        Assert.True(result.Succeeded, result.StderrTail);
+        Assert.Equal(["sess-early"], seen);
+        var args = File.ReadAllLines(argsDump).ToList();
+        Assert.Equal("sess-early", args[args.IndexOf("--resume") + 1]);
     }
 }

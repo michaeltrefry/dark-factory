@@ -10,7 +10,13 @@ public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError,
 
 public interface IWorker
 {
-    Task<WorkerResult> RunAsync(string workingDirectory, string prompt, CancellationToken ct);
+    /// <summary>
+    /// Runs one worker session. <paramref name="resumeSessionId"/> continues an earlier session;
+    /// <paramref name="onSession"/> is awaited as soon as the session id appears in the stream,
+    /// before the worker finishes, so a crash can still resume it.
+    /// </summary>
+    Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
+        Func<string, CancellationToken, Task>? onSession, CancellationToken ct);
 }
 
 /// <summary>How the worker's Claude Code authenticates. Neither mode hands the worker a provider key (E1).</summary>
@@ -64,7 +70,7 @@ public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string ro
         return env;
     }
 
-    public static IReadOnlyList<string> BuildArguments(string prompt)
+    public static IReadOnlyList<string> BuildArguments(string prompt, string? resumeSessionId = null)
     {
         var args = new List<string>
         {
@@ -79,10 +85,16 @@ public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string ro
             "--allowedTools",
         };
         args.AddRange(AllowedTools);
+        if (resumeSessionId is not null)
+        {
+            args.Add("--resume");
+            args.Add(resumeSessionId);
+        }
         return args;
     }
 
-    public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, CancellationToken ct)
+    public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
+        Func<string, CancellationToken, Task>? onSession, CancellationToken ct)
     {
         var psi = new ProcessStartInfo(claudePath)
         {
@@ -92,7 +104,7 @@ public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string ro
             RedirectStandardError = true,
             UseShellExecute = false,
         };
-        foreach (var arg in BuildArguments(prompt))
+        foreach (var arg in BuildArguments(prompt, resumeSessionId))
         {
             psi.ArgumentList.Add(arg);
         }
@@ -123,9 +135,15 @@ public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string ro
 
         try
         {
+            string? reported = null;
             while (await process.StandardOutput.ReadLineAsync(timeoutCts.Token) is { } line)
             {
                 state.Accept(line);
+                if (onSession is not null && state.SessionId is { } sid && sid != reported)
+                {
+                    reported = sid;
+                    await onSession(sid, ct);
+                }
             }
             await process.WaitForExitAsync(timeoutCts.Token);
         }
@@ -134,6 +152,12 @@ public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string ro
             process.Kill(entireProcessTree: true);
             ct.ThrowIfCancellationRequested();
             throw new TimeoutException($"Worker did not finish within {timeout} (session {state.SessionId ?? "unknown"}).");
+        }
+        catch
+        {
+            // e.g. the ledger write in onSession failed: don't leave the worker running unrecorded.
+            process.Kill(entireProcessTree: true);
+            throw;
         }
         await stderrTask;
 

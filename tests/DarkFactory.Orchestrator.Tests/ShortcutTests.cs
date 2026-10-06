@@ -84,6 +84,27 @@ public class ShortcutClientTests
     }
 
     [Fact]
+    public async Task Posts_a_comment_with_token_header()
+    {
+        var api = new FakeApi().On("POST /api/v3/stories/42/comments", HttpStatusCode.Created, """{"id":1}""");
+        var client = new ShortcutClient(api.Client("https://api.app.shortcut.com/api/v3/"), "tok-123");
+
+        await client.AddCommentAsync(42, "escalated: boom", CancellationToken.None);
+
+        var request = api.Requests.Single();
+        Assert.Equal("tok-123", request.Headers["Shortcut-Token"]);
+        Assert.Equal("escalated: boom", System.Text.Json.JsonDocument.Parse(request.Body!).RootElement.GetProperty("text").GetString());
+    }
+
+    [Fact]
+    public async Task Comment_failure_throws()
+    {
+        var client = new ShortcutClient(new FakeApi().Client("https://api.app.shortcut.com/api/v3/"), "tok");
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => client.AddCommentAsync(1, "x", CancellationToken.None));
+        Assert.Contains("comments failed: 404", ex.Message);
+    }
+
+    [Fact]
     public async Task Throws_on_error_status()
     {
         var api = new FakeApi();

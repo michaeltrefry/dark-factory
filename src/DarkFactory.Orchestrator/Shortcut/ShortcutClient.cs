@@ -13,6 +13,8 @@ public sealed record ShortcutStory(
 public interface IStorySource
 {
     Task<ShortcutStory> GetStoryAsync(int id, CancellationToken ct);
+
+    Task AddCommentAsync(int id, string text, CancellationToken ct);
 }
 
 /// <summary>Reads stories from the Shortcut REST API v3 with the orchestrator's own token.</summary>
@@ -32,5 +34,17 @@ public sealed class ShortcutClient(HttpClient http, string apiToken) : IStorySou
         }
         return await response.Content.ReadFromJsonAsync<ShortcutStory>(ct)
             ?? throw new InvalidOperationException($"Shortcut returned an empty body for story {id}.");
+    }
+
+    public async Task AddCommentAsync(int id, string text, CancellationToken ct)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"stories/{id}/comments") { Content = JsonContent.Create(new { text }) };
+        request.Headers.Add("Shortcut-Token", apiToken);
+        using var response = await http.SendAsync(request, ct);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException(
+                $"Shortcut POST stories/{id}/comments failed: {(int)response.StatusCode} {response.ReasonPhrase}");
+        }
     }
 }

@@ -29,7 +29,7 @@ public class WalkingSkeletonTests
 
         var dir = Directory.CreateTempSubdirectory("df-e2e-worker-").FullName;
         var worker = new ClaudeWorker(Harness.Options.ClaudePath, Harness.Options.RouterBaseUrl, routerKey, Harness.Options.WorkerAuth, TimeSpan.FromMinutes(5));
-        var result = await worker.RunAsync(dir, "Reply with the single word OK. Do not use any tools.", ct);
+        var result = await worker.RunAsync(dir, "Reply with the single word OK. Do not use any tools.", null, null, ct);
 
         Assert.True(result.Succeeded, $"worker failed: exit {result.ExitCode}: {result.ResultText} {result.StderrTail}");
         var cost = await Harness.WaitForCostAsync(result.SessionId!, routerKey, ct);
@@ -64,11 +64,13 @@ public class WalkingSkeletonTests
 
         // Ledger: Intake → Implement → Review for this run, timestamped, carrying the session id.
         var item = await db.WorkItems.SingleAsync(w => w.Source == RunPipeline.Source && w.ExternalId == StoryId.Format(storyId), ct);
-        var rows = await db.LedgerEntries.Where(e => e.WorkItemId == item.Id && e.RecordedAt >= startedAt)
+        // Transition rows (Step null); the session id is checkpointed in Implement and carried on Review.
+        var rows = await db.LedgerEntries.Where(e => e.WorkItemId == item.Id && e.RecordedAt >= startedAt && e.Step == null)
             .OrderBy(e => e.Id).ToListAsync(ct);
         Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Review], rows.Select(r => r.State));
         Assert.All(rows, r => Assert.True(r.RecordedAt >= startedAt));
-        Assert.Equal(outcome.SessionId, rows[1].ClaudeSessionId);
+        Assert.True(await db.LedgerEntries.AnyAsync(e => e.WorkItemId == item.Id && e.Step == RunPipeline.Steps.Session
+            && e.ClaudeSessionId == outcome.SessionId, ct));
         Assert.Equal(outcome.SessionId, rows[2].ClaudeSessionId);
 
         // GitHub: an open PR from factory/sc-<id> whose body links the story.
@@ -85,7 +87,7 @@ public class WalkingSkeletonTests
         Assert.Contains($"/story/{storyId}", pr.GetProperty("body").GetString());
 
         // Router: non-zero cost recorded for the session id in the ledger.
-        var cost = await Harness.WaitForCostAsync(rows[1].ClaudeSessionId!, routerKey, ct);
-        Assert.True(cost is { ActualCostUsdMicros: > 0 }, $"no router cost for session {rows[1].ClaudeSessionId}");
+        var cost = await Harness.WaitForCostAsync(rows[2].ClaudeSessionId!, routerKey, ct);
+        Assert.True(cost is { ActualCostUsdMicros: > 0 }, $"no router cost for session {rows[2].ClaudeSessionId}");
     }
 }

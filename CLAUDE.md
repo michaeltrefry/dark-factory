@@ -10,6 +10,8 @@ Claude Code headless workers through the Weave router.
   (`Ledger/`, migrations in `Ledger/Migrations`), Shortcut client, GitHub App auth and
   manifest setup (`GitHub/`), git worktrees (`Git/`), Claude worker (`Worker/`), router client.
 - `tests/DarkFactory.Orchestrator.Tests` — unit tests (no network; fake HTTP APIs, InMemory EF, local git).
+  `CrashResumeTests` also needs the compose Postgres (skips locally without it, fails under `CI`): it
+  SIGKILLs `tests/DarkFactory.CrashHost` (the real pipeline with a fake `claude` script) and restarts it.
 - `tests/DarkFactory.AcceptanceTests` — live epic acceptance harness; skips unless `FACTORY_E2E=1`.
 
 ## Commands
@@ -53,7 +55,12 @@ committed: they come from env/user-secrets or the macOS login keychain
 ## Invariants (epic E1–E4)
 
 - Workers get only the router URL + router key; the worker env is an allowlist (`ClaudeWorker.BuildEnvironment`).
-- Every state change is a committed ledger row before the next step (`WorkLedger.RecordAsync`).
+- Every state change is a committed ledger row before the next step (`WorkLedger.RecordAsync`), checked
+  against the transition table in `Ledger/Lifecycle.cs` first; an illegal transition throws and writes nothing.
+  New phases add handlers in `RunPipeline.Handlers`, not table rows. Sub-steps inside a state are checkpoint
+  rows (`LedgerEntry.Step`, `WorkLedger.CheckpointAsync`); `factory run` on an existing item resumes from
+  its last row and skips recorded steps (the Claude session id is checkpointed as soon as it streams, so an
+  interrupted Implement continues with `claude --resume`). Ctrl-C → Paused; a failure → Escalated + a story comment.
 - The orchestrator pushes only to `factory/*`, with a repo-scoped GitHub App installation token passed
   via git env config (never argv/remote URLs/.git/config) on every network git call. Nothing merges.
   Tokens are minted fresh per call (never cached) and refused if they outlive 1 hour (`GitHubApp`).

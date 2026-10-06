@@ -27,7 +27,7 @@ public static class FactoryCli
                 return 0;
             },
         };
-        var runCommand = new Command("run", "Run one Shortcut story through Intake → Implement → Review.") { storyArgument };
+        var runCommand = new Command("run", "Run one Shortcut story through Intake → Implement → Review, resuming from its last ledger state.") { storyArgument };
         runCommand.SetAction((parse, ct) => run(parse.GetValue(storyArgument), ct));
 
         var nameOption = new Option<string>("--name")

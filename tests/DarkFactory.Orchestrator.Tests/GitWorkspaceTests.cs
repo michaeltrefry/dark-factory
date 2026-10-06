@@ -145,6 +145,33 @@ public class GitWorkspaceTests
     }
 
     [Fact]
+    public async Task Reopen_returns_the_interrupted_worktree_untouched()
+    {
+        var workspace = Workspace();
+        var first = await workspace.PrepareAsync(Repo, "factory/sc-5", CancellationToken.None);
+        File.WriteAllText(Path.Combine(first.Path, "half-done.txt"), "wip");
+        _gitCalls.Clear();
+
+        var reopened = await workspace.ReopenAsync(Repo, "factory/sc-5", CancellationToken.None);
+
+        Assert.Equal(first, reopened);
+        Assert.True(File.Exists(Path.Combine(reopened!.Path, "half-done.txt")));
+        Assert.DoesNotContain(_gitCalls, c => IsNetworkCall(c.Args) || Subcommand(c.Args) is "worktree" or "checkout" or "reset");
+        Assert.True(await workspace.CommitAndPushAsync(Repo, reopened, "sc-5: Fix", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Reopen_returns_null_when_the_worktree_is_gone()
+    {
+        var workspace = Workspace();
+        Assert.Null(await workspace.ReopenAsync(Repo, "factory/sc-6", CancellationToken.None)); // no clone yet
+        var ws = await workspace.PrepareAsync(Repo, "factory/sc-6", CancellationToken.None);
+        await workspace.RemoveAsync(Repo, ws, CancellationToken.None);
+
+        Assert.Null(await workspace.ReopenAsync(Repo, "factory/sc-6", CancellationToken.None));
+    }
+
+    [Fact]
     public async Task Refuses_branches_outside_factory_prefix()
     {
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
