@@ -1,5 +1,6 @@
 using System.Collections;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 
 namespace DarkFactory.Orchestrator.Worker;
 
@@ -8,9 +9,31 @@ public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError,
     public bool Succeeded => ExitCode == 0 && !IsError && SessionId is not null;
 }
 
+/// <summary>
+/// Hooks a worker run awaits while it runs, so the ledger knows about the run before it ends.
+/// <see cref="OnStarted"/> gets the worker's process id as soon as the process exists;
+/// <see cref="OnSession"/> gets the Claude session id as soon as it appears in the stream.
+/// </summary>
+public sealed record WorkerCallbacks(
+    Func<int, CancellationToken, Task>? OnStarted = null,
+    Func<string, CancellationToken, Task>? OnSession = null);
+
 public interface IWorker
 {
-    Task<WorkerResult> RunAsync(string workingDirectory, string prompt, CancellationToken ct);
+    /// <summary>
+    /// Runs one worker session. <paramref name="resumeSessionId"/> continues an earlier session;
+    /// the <paramref name="callbacks"/> fire before the worker finishes, so a crash can still
+    /// resume the session and find the process.
+    /// </summary>
+    Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
+        WorkerCallbacks? callbacks, CancellationToken ct);
+
+    /// <summary>
+    /// Stops a worker process (and its process group) that an earlier, crashed orchestrator
+    /// started as <paramref name="pid"/>. Returns false, touching nothing, when that process is
+    /// gone or is no longer this worker's.
+    /// </summary>
+    Task<bool> StopOrphanAsync(int pid, CancellationToken ct);
 }
 
 /// <summary>How the worker's Claude Code authenticates. Neither mode hands the worker a provider key (E1).</summary>
@@ -33,6 +56,8 @@ public enum WorkerAuth
 /// Runs Claude Code headless in a worktree. The child gets an allowlisted
 /// environment: OS basics plus the router URL and router key — never the
 /// parent's provider keys, GitHub tokens or Claude Code session variables (E1).
+/// Each worker leads its own process group, so the whole tree (claude and the tools it
+/// runs) can be signalled together, including after the orchestrator that started it died.
 /// </summary>
 public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string routerKey, WorkerAuth auth, TimeSpan timeout) : IWorker
 {
@@ -64,7 +89,7 @@ public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string ro
         return env;
     }
 
-    public static IReadOnlyList<string> BuildArguments(string prompt)
+    public static IReadOnlyList<string> BuildArguments(string prompt, string? resumeSessionId = null)
     {
         var args = new List<string>
         {
@@ -79,12 +104,27 @@ public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string ro
             "--allowedTools",
         };
         args.AddRange(AllowedTools);
+        if (resumeSessionId is not null)
+        {
+            args.Add("--resume");
+            args.Add(resumeSessionId);
+        }
         return args;
     }
 
-    public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, CancellationToken ct)
+    /// <summary>
+    /// .NET cannot start a Unix child in a new process group, so perl does it: it makes
+    /// itself the group leader, then execs claude in place (same pid).
+    /// </summary>
+    private const string GroupLeaderLauncher = "/usr/bin/perl";
+    private const string GroupLeaderScript = """setpgrp(0, 0) or die "setpgrp: $!\n"; exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n";""";
+
+    private static readonly TimeSpan OrphanGracePeriod = TimeSpan.FromSeconds(5);
+
+    public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
+        WorkerCallbacks? callbacks, CancellationToken ct)
     {
-        var psi = new ProcessStartInfo(claudePath)
+        var psi = new ProcessStartInfo(GroupLeaderLauncher)
         {
             WorkingDirectory = workingDirectory,
             RedirectStandardInput = true,
@@ -92,7 +132,10 @@ public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string ro
             RedirectStandardError = true,
             UseShellExecute = false,
         };
-        foreach (var arg in BuildArguments(prompt))
+        psi.ArgumentList.Add("-e");
+        psi.ArgumentList.Add(GroupLeaderScript);
+        psi.ArgumentList.Add(claudePath);
+        foreach (var arg in BuildArguments(prompt, resumeSessionId))
         {
             psi.ArgumentList.Add(arg);
         }
@@ -123,9 +166,20 @@ public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string ro
 
         try
         {
+            if (callbacks?.OnStarted is { } onStarted)
+            {
+                await onStarted(process.Id, ct);
+            }
+            var onSession = callbacks?.OnSession;
+            string? reported = null;
             while (await process.StandardOutput.ReadLineAsync(timeoutCts.Token) is { } line)
             {
                 state.Accept(line);
+                if (onSession is not null && state.SessionId is { } sid && sid != reported)
+                {
+                    reported = sid;
+                    await onSession(sid, ct);
+                }
             }
             await process.WaitForExitAsync(timeoutCts.Token);
         }
@@ -134,6 +188,12 @@ public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string ro
             process.Kill(entireProcessTree: true);
             ct.ThrowIfCancellationRequested();
             throw new TimeoutException($"Worker did not finish within {timeout} (session {state.SessionId ?? "unknown"}).");
+        }
+        catch
+        {
+            // e.g. the ledger write in onSession failed: don't leave the worker running unrecorded.
+            process.Kill(entireProcessTree: true);
+            throw;
         }
         await stderrTask;
 
@@ -145,4 +205,67 @@ public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string ro
             state.ResultText,
             string.Join('\n', stderr));
     }
+
+    public async Task<bool> StopOrphanAsync(int pid, CancellationToken ct)
+    {
+        // Only a group leader running claudePath is ours: a recycled pid is left alone.
+        if (await ProcessInfoAsync(pid, ct) is not { } info || info.ProcessGroup != pid || !IsClaudeCommand(info.Command))
+        {
+            return false;
+        }
+        Signal(-pid, SigTerm);
+        if (!await GroupExitsAsync(pid, OrphanGracePeriod, ct))
+        {
+            Signal(-pid, SigKill);
+            await GroupExitsAsync(pid, OrphanGracePeriod, ct);
+        }
+        return true;
+    }
+
+    private bool IsClaudeCommand(string command) =>
+        // argv[0], or the script path when claude is a script run by an interpreter.
+        command.Split(' ', StringSplitOptions.RemoveEmptyEntries).Take(2)
+            .Any(arg => arg == claudePath || Path.GetFileName(arg) == Path.GetFileName(claudePath));
+
+    private static async Task<(int ProcessGroup, string Command)?> ProcessInfoAsync(int pid, CancellationToken ct)
+    {
+        var psi = new ProcessStartInfo("ps") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+        foreach (var arg in new[] { "-ww", "-o", "pgid=,command=", "-p", pid.ToString() })
+        {
+            psi.ArgumentList.Add(arg);
+        }
+        using var ps = Process.Start(psi)!;
+        var output = await ps.StandardOutput.ReadToEndAsync(ct);
+        await ps.WaitForExitAsync(ct);
+        var line = output.Trim();
+        var space = line.IndexOf(' ');
+        if (ps.ExitCode != 0 || space < 0 || !int.TryParse(line[..space], out var group))
+        {
+            return null;
+        }
+        return (group, line[(space + 1)..].Trim());
+    }
+
+    private static async Task<bool> GroupExitsAsync(int group, TimeSpan within, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + within;
+        while (Signal(-group, 0))
+        {
+            if (DateTime.UtcNow >= deadline)
+            {
+                return false;
+            }
+            await Task.Delay(50, ct);
+        }
+        return true;
+    }
+
+    private const int SigTerm = 15;
+    private const int SigKill = 9;
+
+    /// <summary>kill(2); true when the signal was delivered (for 0: the process or group exists).</summary>
+    private static bool Signal(int pid, int signal) => SysKill(pid, signal) == 0;
+
+    [DllImport("libc", EntryPoint = "kill", SetLastError = true)]
+    private static extern int SysKill(int pid, int sig);
 }

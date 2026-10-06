@@ -4,6 +4,7 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/DarkFactory.AcceptanceTests/DarkFactory.AcceptanceTests.csproj" />
+    <Project Path="tests/DarkFactory.CrashHost/DarkFactory.CrashHost.csproj" />
     <Project Path="tests/DarkFactory.Orchestrator.Tests/DarkFactory.Orchestrator.Tests.csproj" />
   </Folder>
 </Solution>

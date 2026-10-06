@@ -16,6 +16,8 @@
 
   <ItemGroup>
     <ProjectReference Include="../../src/DarkFactory.Orchestrator/DarkFactory.Orchestrator.csproj" />
+    <!-- Launched as a child process by CrashResumeTests; referenced so it builds and lands in this output folder. -->
+    <ProjectReference Include="../DarkFactory.CrashHost/DarkFactory.CrashHost.csproj" />
   </ItemGroup>
 
   <ItemGroup>

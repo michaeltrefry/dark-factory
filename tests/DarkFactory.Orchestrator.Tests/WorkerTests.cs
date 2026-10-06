@@ -1,4 +1,5 @@
 using System.Collections;
+using System.Diagnostics;
 using DarkFactory.Orchestrator.Worker;
 
 namespace DarkFactory.Orchestrator.Tests;
@@ -134,7 +135,7 @@ public class ClaudeWorkerTests
         try
         {
             var worker = new ClaudeWorker(script, Router, "rk_worker", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1));
-            var result = await worker.RunAsync(dir, "prompt", CancellationToken.None);
+            var result = await worker.RunAsync(dir, "prompt", null, null, CancellationToken.None);
 
             Assert.True(result.Succeeded);
             Assert.Equal("sess-abc", result.SessionId);
@@ -177,7 +178,7 @@ public class ClaudeWorkerTests
         try
         {
             var result = await new ClaudeWorker(script, Router, "rk_worker", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1))
-                .RunAsync(worktree, "implement the story", CancellationToken.None);
+                .RunAsync(worktree, "implement the story", null, null, CancellationToken.None);
 
             Assert.True(result.Succeeded);
             var probe = File.ReadAllText(dump);
@@ -202,10 +203,140 @@ public class ClaudeWorkerTests
         File.WriteAllText(script, "#!/bin/sh\necho '{\"type\":\"system\",\"session_id\":\"s\"}'\necho boom >&2\nexit 3\n");
         File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
-        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", CancellationToken.None);
+        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, null, CancellationToken.None);
 
         Assert.False(result.Succeeded);
         Assert.Equal(3, result.ExitCode);
         Assert.Contains("boom", result.StderrTail);
+    }
+
+    [Fact]
+    public void Resume_passes_the_session_id_to_claude()
+    {
+        var args = ClaudeWorker.BuildArguments("go on", "sess-1").ToList();
+        Assert.Equal("sess-1", args[args.IndexOf("--resume") + 1]);
+        Assert.DoesNotContain("--resume", ClaudeWorker.BuildArguments("start"));
+    }
+
+    [Fact]
+    public async Task Session_callback_runs_as_soon_as_the_id_streams_before_the_worker_exits()
+    {
+        var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
+        var flag = Path.Combine(dir, "recorded");
+        var argsDump = Path.Combine(dir, "args.txt");
+        var script = Path.Combine(dir, "fake-claude.sh");
+        // The worker only finishes once the callback has created the flag file.
+        File.WriteAllText(script, $$"""
+            #!/bin/sh
+            printf '%s\n' "$@" > "{{argsDump}}"
+            echo '{"type":"system","subtype":"init","session_id":"sess-early"}'
+            i=0
+            while [ ! -f "{{flag}}" ]; do i=$((i+1)); [ $i -gt 200 ] && exit 9; sleep 0.05; done
+            echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-early"}'
+            """);
+        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var seen = new List<string>();
+
+        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", "sess-early",
+            new WorkerCallbacks(OnSession: (sid, _) =>
+            {
+                seen.Add(sid);
+                File.WriteAllText(flag, sid);
+                return Task.CompletedTask;
+            }), CancellationToken.None);
+
+        Assert.True(result.Succeeded, result.StderrTail);
+        Assert.Equal(["sess-early"], seen);
+        var args = File.ReadAllLines(argsDump).ToList();
+        Assert.Equal("sess-early", args[args.IndexOf("--resume") + 1]);
+    }
+
+    [Fact]
+    public async Task Worker_leads_its_own_process_group_and_reports_its_pid_before_streaming()
+    {
+        var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
+        var ids = Path.Combine(dir, "ids.txt");
+        var script = Path.Combine(dir, "fake-claude.sh");
+        File.WriteAllText(script, $$"""
+            #!/bin/sh
+            echo "$$ $(ps -o pgid= -p $$ | tr -d ' ')" > "{{ids}}"
+            echo '{"type":"system","subtype":"init","session_id":"s"}'
+            echo '{"type":"result","subtype":"success","is_error":false,"session_id":"s"}'
+            """);
+        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var events = new List<string>();
+
+        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null,
+            new WorkerCallbacks(
+                OnStarted: (pid, _) => { events.Add($"started {pid}"); return Task.CompletedTask; },
+                OnSession: (sid, _) => { events.Add($"session {sid}"); return Task.CompletedTask; }),
+            CancellationToken.None);
+
+        Assert.True(result.Succeeded, result.StderrTail);
+        var (pid, group) = File.ReadAllText(ids).Trim().Split(' ') is [var p, var g] ? (p, g) : throw new InvalidOperationException();
+        Assert.Equal(pid, group); // claude itself (same pid as the launcher) leads its group
+        Assert.Equal([$"started {pid}", "session s"], events);
+    }
+
+    [Fact]
+    public async Task Stop_orphan_leaves_a_process_that_is_not_this_workers_claude_alone()
+    {
+        var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
+        // A group leader, like a worker, but running something other than the configured claude.
+        using var other = Process.Start(new ProcessStartInfo("/usr/bin/perl", ["-e", "setpgrp(0, 0); sleep 30"]))!;
+        try
+        {
+            await Task.Delay(300);
+            var worker = new ClaudeWorker(Path.Combine(dir, "fake-claude.sh"), Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1));
+
+            Assert.False(await worker.StopOrphanAsync(other.Id, CancellationToken.None));
+            Assert.False(other.HasExited);
+        }
+        finally
+        {
+            other.Kill();
+        }
+    }
+
+    [Fact]
+    public async Task Stop_orphan_kills_a_worker_group_including_its_children()
+    {
+        var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
+        var pids = Path.Combine(dir, "pids.txt");
+        var script = Path.Combine(dir, "fake-claude.sh");
+        // Ignores SIGTERM in the leader so only the SIGKILL escalation ends it; its child is a "tool".
+        File.WriteAllText(script, $$"""
+            #!/bin/sh
+            trap '' TERM
+            sleep 600 &
+            echo "$$ $!" > "{{pids}}"
+            echo '{"type":"system","subtype":"init","session_id":"s"}'
+            wait
+            """);
+        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var worker = new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1));
+        var started = new TaskCompletionSource<int>();
+        // Stands in for the crashed orchestrator: the worker keeps running while we stop it "from the next run".
+        var run = worker.RunAsync(dir, "p", null, new WorkerCallbacks(OnStarted: (pid, _) => { started.SetResult(pid); return Task.CompletedTask; }), CancellationToken.None);
+        var leader = await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        while (!File.Exists(pids) || File.ReadAllText(pids).Trim().Split(' ').Length < 2)
+        {
+            await Task.Delay(50);
+        }
+        var child = int.Parse(File.ReadAllText(pids).Trim().Split(' ')[1]);
+
+        Assert.True(await worker.StopOrphanAsync(leader, CancellationToken.None));
+
+        Assert.False(IsAlive(leader));
+        Assert.False(IsAlive(child));
+        Assert.False(await worker.StopOrphanAsync(leader, CancellationToken.None)); // gone now
+        Assert.False((await run.WaitAsync(TimeSpan.FromSeconds(10))).Succeeded); // the stream just ends
+    }
+
+    private static bool IsAlive(int pid)
+    {
+        using var p = Process.Start(new ProcessStartInfo("kill", ["-0", pid.ToString()]) { RedirectStandardError = true })!;
+        p.WaitForExit();
+        return p.ExitCode == 0;
     }
 }

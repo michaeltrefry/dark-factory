@@ -145,6 +145,53 @@ public class GitWorkspaceTests
     }
 
     [Fact]
+    public async Task Reopen_returns_the_interrupted_worktree_untouched()
+    {
+        var workspace = Workspace();
+        var first = await workspace.PrepareAsync(Repo, "factory/sc-5", CancellationToken.None);
+        File.WriteAllText(Path.Combine(first.Path, "half-done.txt"), "wip");
+        _gitCalls.Clear();
+
+        var reopened = await workspace.ReopenAsync(Repo, "factory/sc-5", CancellationToken.None);
+
+        Assert.Equal(first, reopened);
+        Assert.True(File.Exists(Path.Combine(reopened!.Path, "half-done.txt")));
+        Assert.DoesNotContain(_gitCalls, c => IsNetworkCall(c.Args) || Subcommand(c.Args) is "worktree" or "checkout" or "reset");
+        Assert.True(await workspace.CommitAndPushAsync(Repo, reopened, "sc-5: Fix", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Reopen_returns_null_when_the_worktree_is_gone()
+    {
+        var workspace = Workspace();
+        Assert.Null(await workspace.ReopenAsync(Repo, "factory/sc-6", CancellationToken.None)); // no clone yet
+        var ws = await workspace.PrepareAsync(Repo, "factory/sc-6", CancellationToken.None);
+        await workspace.RemoveAsync(Repo, ws, CancellationToken.None);
+
+        Assert.Null(await workspace.ReopenAsync(Repo, "factory/sc-6", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Restore_recreates_a_lost_worktree_from_the_pushed_branch()
+    {
+        var workspace = Workspace();
+        var first = await workspace.PrepareAsync(Repo, "factory/sc-7", CancellationToken.None);
+        File.WriteAllText(Path.Combine(first.Path, "pushed.txt"), "done");
+        Assert.True(await workspace.CommitAndPushAsync(Repo, first, "sc-7: Fix", CancellationToken.None));
+        var pushed = Git(_remote, "rev-parse", "factory/sc-7").Trim();
+        await workspace.RemoveAsync(Repo, first, CancellationToken.None);
+
+        var restored = await workspace.RestoreAsync(Repo, "factory/sc-7", CancellationToken.None);
+
+        Assert.Equal(first, restored);
+        Assert.Equal(pushed, Git(restored.Path, "rev-parse", "HEAD").Trim());
+        Assert.True(File.Exists(Path.Combine(restored.Path, "pushed.txt")));
+        // Pushing again changes nothing on the remote.
+        await workspace.CommitAndPushAsync(Repo, restored, "sc-7: Fix", CancellationToken.None);
+        Assert.Equal(pushed, Git(_remote, "rev-parse", "factory/sc-7").Trim());
+    }
+
+    [Fact]
     public async Task Refuses_branches_outside_factory_prefix()
     {
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(

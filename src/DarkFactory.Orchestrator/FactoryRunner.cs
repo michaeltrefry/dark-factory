@@ -28,6 +28,7 @@ public static class FactoryRunner
         var pipeline = new RunPipeline(
             new ShortcutClient(shortcutHttp, shortcutToken),
             new WorkLedger(db, TimeProvider.System),
+            new PostgresRunLocks(options.LedgerConnectionString),
             new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
                 async (repo, c) => (await app.CreateInstallationTokenAsync(repo, c)).Token),
             new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout),
