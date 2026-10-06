@@ -23,6 +23,7 @@ dotnet ef database update --project src/DarkFactory.Orchestrator
 dotnet ef migrations add <Name> --project src/DarkFactory.Orchestrator -o Ledger/Migrations
 dotnet run --project src/DarkFactory.Orchestrator -- run sc-1234
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup
+dotnet run --project src/DarkFactory.Orchestrator -- github-repo protect owner/name   # rulesets; owner's GH_TOKEN / `gh auth token`
 ```
 
 ## Configuration
@@ -55,5 +56,8 @@ committed: they come from env/user-secrets or the macOS login keychain
 - Every state change is a committed ledger row before the next step (`WorkLedger.RecordAsync`).
 - The orchestrator pushes only to `factory/*`, with a repo-scoped GitHub App installation token passed
   via git env config (never argv/remote URLs/.git/config) on every network git call. Nothing merges.
+  Tokens are minted fresh per call (never cached) and refused if they outlive 1 hour (`GitHubApp`).
+  Server-side, `github-repo protect` (`RepoProtection`) applies rulesets: default branch needs a PR, and only
+  repo admins may write refs outside `factory/**` (needs GitHub Pro for private personal repos).
   Workers get no git/gh tools, but see the S4 caveat above: they are not yet sandboxed from the owner's credentials.
 - Tests: xunit.v3 on Microsoft.Testing.Platform (`global.json` opts in).
