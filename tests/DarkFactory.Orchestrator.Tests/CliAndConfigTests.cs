@@ -92,6 +92,27 @@ public class FactoryOptionsTests
     }
 
     [Fact]
+    public void Workers_run_as_the_sandbox_user_by_default_with_a_work_root_outside_both_homes()
+    {
+        var options = Options([]);
+        Assert.Equal(new Worker.WorkerSandbox("_factory", "/usr/local/libexec/dark-factory/factory-worker-launch"), options.WorkerSandbox);
+        Assert.Equal("/opt/dark-factory/work", options.WorkRoot);
+
+        var custom = Options(new() { ["Worker:RunAs"] = "_df2", ["Worker:LaunchHelper"] = "/opt/h", ["Factory:WorkRoot"] = "/w" });
+        Assert.Equal(new Worker.WorkerSandbox("_df2", "/opt/h"), custom.WorkerSandbox);
+        Assert.Equal("/w", custom.WorkRoot);
+    }
+
+    [Fact]
+    public void Run_as_none_runs_workers_as_the_owner_under_the_owners_work_root()
+    {
+        var options = Options(new() { ["Worker:RunAs"] = "none" });
+        Assert.Null(options.WorkerSandbox);
+        Assert.Equal(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dark-factory"), options.WorkRoot);
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:RunAs"] = "" }).WorkerSandbox);
+    }
+
+    [Fact]
     public void Config_wins_over_keychain_and_keychain_is_the_fallback()
     {
         var secrets = new InMemorySecrets();

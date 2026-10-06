@@ -17,6 +17,15 @@ public static class FactoryRunner
         var routerKey = options.RouterKey;
         var appId = options.GitHubAppId;
         var appKey = options.GitHubAppPrivateKeyPem;
+        var sandbox = options.WorkerSandbox;
+
+        // Sandboxed, the worker user is single-tenant (every helper exit kills all of its processes),
+        // so one sandboxed run per machine, taken before anything runs through the helper.
+        using var sandboxLock = sandbox is null ? null : WorkerLock.Acquire(options.WorkRoot);
+        if (sandbox is not null)
+        {
+            await sandbox.EnsureReadyAsync(ct);
+        }
 
         using var shortcutHttp = new HttpClient { BaseAddress = ShortcutClient.DefaultBaseAddress };
         using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
@@ -24,14 +33,19 @@ public static class FactoryRunner
 
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
         await db.Database.MigrateAsync(ct);
+        var ledger = new WorkLedger(db, TimeProvider.System);
+
+        var workspaces = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
+            async (repo, c) => (await app.CreateInstallationTokenAsync(repo, c)).Token, sandbox: sandbox);
+        // Worktrees no run will resume (left by a killed cleanup or a worker that would not stop).
+        await workspaces.SweepOrphansAsync((name, c) => RunPipeline.WorktreeIsResumableAsync(ledger, name, c), ct);
 
         var pipeline = new RunPipeline(
             new ShortcutClient(shortcutHttp, shortcutToken),
-            new WorkLedger(db, TimeProvider.System),
+            ledger,
             new PostgresRunLocks(options.LedgerConnectionString),
-            new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
-                async (repo, c) => (await app.CreateInstallationTokenAsync(repo, c)).Token),
-            new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout),
+            workspaces,
+            new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, sandbox),
             new GitHubPullRequests(githubHttp, app),
             options.DefaultRepo,
             log);

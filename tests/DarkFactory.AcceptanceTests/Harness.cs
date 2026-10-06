@@ -72,6 +72,18 @@ internal static class Harness
 
     public static void RequireClaude()
     {
+        if (Options.WorkerSandbox is { } sandbox)
+        {
+            try
+            {
+                sandbox.EnsureReadyAsync(CancellationToken.None).GetAwaiter().GetResult();
+            }
+            catch (InvalidOperationException ex)
+            {
+                Assert.Skip($"{ex.Message} Or set Worker__RunAs=none to run workers as the owner.");
+            }
+            return;
+        }
         try
         {
             using var p = Process.Start(new ProcessStartInfo(Options.ClaudePath, "--version") { RedirectStandardOutput = true })!;

@@ -96,6 +96,10 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
     public Task<LedgerEntry> CheckpointAsync(WorkItem item, string step, string? claudeSessionId, string? detail, CancellationToken ct) =>
         AppendAsync(item, item.State, step, claudeSessionId, detail, ct);
 
+    /// <summary>The item's current state as stored, or null when there is no such item. Reads only.</summary>
+    public async Task<WorkState?> StateOfAsync(string source, string externalId, CancellationToken ct) =>
+        (await db.WorkItems.AsNoTracking().SingleOrDefaultAsync(x => x.Source == source && x.ExternalId == externalId, ct))?.State;
+
     /// <summary>Every row of the item, oldest first.</summary>
     public Task<List<LedgerEntry>> HistoryAsync(WorkItem item, CancellationToken ct) =>
         db.LedgerEntries.Where(e => e.WorkItemId == item.Id).OrderBy(e => e.Id).ToListAsync(ct);

@@ -36,6 +36,24 @@ public interface IWorker
     Task<bool> StopOrphanAsync(int pid, CancellationToken ct);
 }
 
+/// <summary>
+/// Marks a cancellation or timeout after which the worker could not be confirmed stopped, so the
+/// caller must not delete its worktree under it (the next run stops every worker-user process
+/// first: the launch helper kills them all whenever it exits).
+/// </summary>
+public static class WorkerStillRunning
+{
+    private const string Key = "DarkFactory.WorkerStillRunning";
+
+    public static TException Mark<TException>(TException ex) where TException : Exception
+    {
+        ex.Data[Key] = true;
+        return ex;
+    }
+
+    public static bool IsMarked(Exception ex) => ex.Data.Contains(Key);
+}
+
 /// <summary>How the worker's Claude Code authenticates. Neither mode hands the worker a provider key (E1).</summary>
 public enum WorkerAuth
 {
@@ -58,9 +76,17 @@ public enum WorkerAuth
 /// parent's provider keys, GitHub tokens or Claude Code session variables (E1).
 /// Each worker leads its own process group, so the whole tree (claude and the tools it
 /// runs) can be signalled together, including after the orchestrator that started it died.
+/// With a <see cref="WorkerSandbox"/> it runs as the dedicated worker user (E5) through the
+/// launch helper, which builds its environment from the router variables alone; without one
+/// (<c>Worker:RunAs=none</c>) it runs as the owner.
 /// </summary>
-public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string routerKey, WorkerAuth auth, TimeSpan timeout) : IWorker
+public sealed class ClaudeWorker(
+    string claudePath, Uri routerBaseUrl, string routerKey, WorkerAuth auth, TimeSpan timeout,
+    WorkerSandbox? sandbox = null, TimeSpan? stopGrace = null) : IWorker
 {
+    /// <summary>How long a stopped sandboxed worker gets to exit after its helper's stdin closes.</summary>
+    private readonly TimeSpan _stopGrace = stopGrace ?? TimeSpan.FromSeconds(10);
+
     public const string RouterKeyHeader = "X-Weave-Router-Key";
 
     /// <summary>Tools a skeleton worker may use; no git/gh so it cannot push or merge on its own.</summary>
@@ -70,6 +96,22 @@ public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string ro
     private static readonly string[] PassThroughVariables =
         ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "TERM", "DOTNET_ROOT"];
 
+    /// <summary>The router variables, the only secrets a worker holds (E1). The sandbox helper adds PATH, HOME and build settings.</summary>
+    public static Dictionary<string, string> BuildRouterVariables(Uri routerBaseUrl, string routerKey, WorkerAuth auth)
+    {
+        var env = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["ANTHROPIC_BASE_URL"] = routerBaseUrl.ToString().TrimEnd('/'),
+            ["ANTHROPIC_CUSTOM_HEADERS"] = $"{RouterKeyHeader}: {routerKey}",
+        };
+        if (auth == WorkerAuth.RouterKey)
+        {
+            env["ANTHROPIC_API_KEY"] = routerKey;
+        }
+        return env;
+    }
+
+    /// <summary>Unsandboxed environment: OS basics from the parent plus the router variables.</summary>
     public static Dictionary<string, string> BuildEnvironment(IDictionary parent, Uri routerBaseUrl, string routerKey, WorkerAuth auth)
     {
         var env = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -80,11 +122,9 @@ public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string ro
                 env[name] = value;
             }
         }
-        env["ANTHROPIC_BASE_URL"] = routerBaseUrl.ToString().TrimEnd('/');
-        env["ANTHROPIC_CUSTOM_HEADERS"] = $"{RouterKeyHeader}: {routerKey}";
-        if (auth == WorkerAuth.RouterKey)
+        foreach (var (k, v) in BuildRouterVariables(routerBaseUrl, routerKey, auth))
         {
-            env["ANTHROPIC_API_KEY"] = routerKey;
+            env[k] = v;
         }
         return env;
     }
@@ -124,29 +164,11 @@ public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string ro
     public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
         WorkerCallbacks? callbacks, CancellationToken ct)
     {
-        var psi = new ProcessStartInfo(GroupLeaderLauncher)
-        {
-            WorkingDirectory = workingDirectory,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        };
-        psi.ArgumentList.Add("-e");
-        psi.ArgumentList.Add(GroupLeaderScript);
-        psi.ArgumentList.Add(claudePath);
-        foreach (var arg in BuildArguments(prompt, resumeSessionId))
-        {
-            psi.ArgumentList.Add(arg);
-        }
-        psi.Environment.Clear();
-        foreach (var (k, v) in BuildEnvironment(Environment.GetEnvironmentVariables(), routerBaseUrl, routerKey, auth))
-        {
-            psi.Environment[k] = v;
-        }
-
-        using var process = Process.Start(psi) ?? throw new InvalidOperationException($"Could not start {claudePath}.");
-        process.StandardInput.Close();
+        // Sandboxed, the helper makes the worker a process-group leader and the pid reported is sudo's.
+        using var process = sandbox is null
+            ? StartDirect(workingDirectory, prompt, resumeSessionId)
+            : sandbox.Start(workingDirectory, claudePath, BuildArguments(prompt, resumeSessionId),
+                BuildRouterVariables(routerBaseUrl, routerKey, auth));
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(timeout);
 
@@ -183,19 +205,33 @@ public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string ro
             }
             await process.WaitForExitAsync(timeoutCts.Token);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException cancelled)
         {
-            process.Kill(entireProcessTree: true);
-            ct.ThrowIfCancellationRequested();
-            throw new TimeoutException($"Worker did not finish within {timeout} (session {state.SessionId ?? "unknown"}).");
+            var stopped = await StopAsync(process);
+            Exception ex = ct.IsCancellationRequested
+                ? new OperationCanceledException("Worker run cancelled.", cancelled, ct)
+                : new TimeoutException($"Worker did not finish within {timeout} (session {state.SessionId ?? "unknown"}).");
+            if (!stopped)
+            {
+                // Still Ctrl-C / timeout to the caller, but nothing may delete the worktree under it.
+                WorkerStillRunning.Mark(ex);
+            }
+            throw ex;
         }
-        catch
+        catch (Exception ex)
         {
             // e.g. the ledger write in onSession failed: don't leave the worker running unrecorded.
-            process.Kill(entireProcessTree: true);
+            if (!await StopAsync(process))
+            {
+                WorkerStillRunning.Mark(ex);
+            }
             throw;
         }
         await stderrTask;
+        if (sandbox is not null)
+        {
+            WorkerSandbox.Stop(process);
+        }
 
         return new WorkerResult(
             state.SessionId,
@@ -206,8 +242,66 @@ public sealed class ClaudeWorker(string claudePath, Uri routerBaseUrl, string ro
             string.Join('\n', stderr));
     }
 
+    /// <summary>
+    /// Stops a running worker. Unsandboxed, the owner kills the tree; sandboxed, the owner cannot
+    /// signal the worker user's processes, so it closes the helper's stdin and the helper kills them.
+    /// </summary>
+    /// <returns>False when the sandboxed worker did not exit within the grace period.</returns>
+    private async Task<bool> StopAsync(Process process)
+    {
+        if (sandbox is null)
+        {
+            process.Kill(entireProcessTree: true);
+            return true;
+        }
+        WorkerSandbox.Stop(process);
+        using var grace = new CancellationTokenSource(_stopGrace);
+        try
+        {
+            await process.WaitForExitAsync(grace.Token);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+    }
+
+    private Process StartDirect(string workingDirectory, string prompt, string? resumeSessionId)
+    {
+        var psi = new ProcessStartInfo(GroupLeaderLauncher)
+        {
+            WorkingDirectory = workingDirectory,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add("-e");
+        psi.ArgumentList.Add(GroupLeaderScript);
+        psi.ArgumentList.Add(claudePath);
+        foreach (var arg in BuildArguments(prompt, resumeSessionId))
+        {
+            psi.ArgumentList.Add(arg);
+        }
+        psi.Environment.Clear();
+        foreach (var (k, v) in BuildEnvironment(Environment.GetEnvironmentVariables(), routerBaseUrl, routerKey, auth))
+        {
+            psi.Environment[k] = v;
+        }
+        var process = Process.Start(psi) ?? throw new InvalidOperationException($"Could not start {claudePath}.");
+        process.StandardInput.Close();
+        return process;
+    }
+
     public async Task<bool> StopOrphanAsync(int pid, CancellationToken ct)
     {
+        if (sandbox is not null)
+        {
+            // The recorded pid is sudo's and the owner can't signal the worker user anyway; the worker
+            // user is single-tenant, so any of its processes is a leftover worker: the helper kills them all.
+            return await sandbox.StopAllAsync(ct);
+        }
         // Only a group leader running claudePath is ours: a recycled pid is left alone.
         if (await ProcessInfoAsync(pid, ct) is not { } info || info.ProcessGroup != pid || !IsClaudeCommand(info.Command))
         {
