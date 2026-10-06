@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/DarkFactory.Orchestrator/DarkFactory.Orchestrator.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/DarkFactory.AcceptanceTests/DarkFactory.AcceptanceTests.csproj" />
+    <Project Path="tests/DarkFactory.Orchestrator.Tests/DarkFactory.Orchestrator.Tests.csproj" />
+  </Folder>
+</Solution>
