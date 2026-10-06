@@ -54,6 +54,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Factory:DefaultRepo` | `michaeltrefry/dark-factory-sandbox` (a story line `Repo: owner/name` overrides) |
 | `Shortcut:Watch:Teams`, `Shortcut:Watch:Epics` | empty = watch nothing; comma-separated team mention names/ids, epic ids |
 | `Intake:PollSeconds` | `60` |
+| `Usage:PollSeconds` | `60` (`factory work` reads the router's subscription usage; also read at each intake poll) |
 | `Factory:WorkRoot` | `/opt/dark-factory/work` (clones + worktrees; `~/.dark-factory` when `Worker:RunAs=none`) |
 | `ConnectionStrings:Ledger` | `Host=localhost;Port=5434;Database=factory;Username=factory;Password=factory` |
 | `Worker:ClaudePath` | `claude` (as the worker user sees it: `~_factory/.local/bin` is first on its PATH) |
@@ -115,6 +116,14 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   Residual risk: the worker loads the target repo's `.claude/settings.json` (`--setting-sources project,local`), which
   can set `disableAllHooks` and so switch off the pause hook; the pause grace still stops such a worker (session and
   worktree kept), only not at a tool boundary.
+- Usage pause (`Controls/Controls.cs` `UsagePause`, `Router/UsageMonitor.cs`): a factory-wide `usage` control row (reason,
+  `ResumeAt`, `Backoff`) apart from the user's `factory` row, so neither's Continue/resume lifts the other; it pauses only
+  while `now < ResumeAt` (`Control.PausesAt`), so it lifts by itself and the intake loop wakes at `ResumeAt`. `UsageMonitor`
+  pauses when the router reports `all_exhausted` (until `resumes_at`, or a 1→60 min doubling backoff when none); unknown
+  usage never pauses. Backstop: a worker result that is `WorkerResult.UsageLimited` (Claude Code's `"error":"rate_limit"`, or
+  a marker such as the router's 429 "All enrolled subscription accounts are currently unavailable.") pauses with the
+  backoff and records Paused `usage-paused` (auto-resumed, same session) instead of Escalated. Only `continue --usage`
+  lifts it early; Pause/Stop on it are refused.
 
 - Every state change is a committed ledger row before the next step (`WorkLedger.RecordAsync`), checked
   against the transition table in `Ledger/Lifecycle.cs` first; an illegal transition throws and writes nothing.

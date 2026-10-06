@@ -111,6 +111,18 @@ public sealed class Control
     public Controls.ControlState State { get; set; }
     public required string ChangedBy { get; set; }
     public DateTimeOffset ChangedAt { get; set; }
+
+    /// <summary>Usage scope only: why the factory is paused (<see cref="Controls.UsagePause"/>).</summary>
+    public string? Reason { get; set; }
+
+    /// <summary>Usage scope only: when the pause lifts by itself (it pauses nothing from then on).</summary>
+    public DateTimeOffset? ResumeAt { get; set; }
+
+    /// <summary>Usage scope only: the backoff that set <see cref="ResumeAt"/>, when no reset time was known; doubles on a repeat.</summary>
+    public TimeSpan? Backoff { get; set; }
+
+    /// <summary>Whether this control pauses its scope at <paramref name="now"/>: a usage pause lifts at its <see cref="ResumeAt"/>.</summary>
+    public bool PausesAt(DateTimeOffset now) => State == Controls.ControlState.Paused && (ResumeAt is null || now < ResumeAt);
 }
 
 public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) : DbContext(options)
@@ -169,6 +181,7 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
             e.Property(x => x.Scope).HasMaxLength(64);
             e.Property(x => x.State).HasConversion<string>().HasMaxLength(16);
             e.Property(x => x.ChangedBy).HasMaxLength(128);
+            e.Property(x => x.Reason).HasMaxLength(64);
         });
     }
 

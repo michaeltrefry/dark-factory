@@ -20,10 +20,18 @@ public enum ControlState
     Stopping,
 }
 
-/// <summary>Control scopes: <c>factory</c>, <c>epic:&lt;id&gt;</c>, <c>item:sc-&lt;id&gt;</c>.</summary>
+/// <summary>Control scopes: <c>factory</c>, <c>usage</c>, <c>epic:&lt;id&gt;</c>, <c>item:sc-&lt;id&gt;</c>.</summary>
 public static class ControlScope
 {
     public const string Factory = "factory";
+
+    /// <summary>
+    /// The factory-wide usage pause (<see cref="UsagePause"/>): set when the router's plans are exhausted, never by a
+    /// user's Pause, and lifted by its own <see cref="Control.ResumeAt"/>. Kept apart from <see cref="Factory"/> so a
+    /// user's Continue does not lift it early and its resume does not lift a user's pause; only an explicit
+    /// <c>factory continue --usage</c> (or the dashboard's Continue on it) forces it off.
+    /// </summary>
+    public const string Usage = "usage";
 
     public static string Epic(long epicId) => $"epic:{epicId}";
 
@@ -38,7 +46,23 @@ public static class ControlScope
         scope.StartsWith("epic:", StringComparison.Ordinal) && long.TryParse(scope["epic:".Length..], out var id) && id > 0 ? id : null;
 
     /// <summary>Whether <paramref name="scope"/> is a well-formed scope.</summary>
-    public static bool IsValid(string scope) => scope == Factory || ItemStory(scope) is not null || EpicOf(scope) is not null;
+    public static bool IsValid(string scope) => scope == Factory || scope == Usage || ItemStory(scope) is not null || EpicOf(scope) is not null;
+}
+
+/// <summary>The factory-wide usage pause (<see cref="ControlScope.Usage"/>): its reasons and backoff.</summary>
+public static class UsagePause
+{
+    /// <summary>The router reports every plan the factory can use exhausted (<c>GET /v1/subscriptions/usage</c>).</summary>
+    public const string UsageExhausted = "usage-exhausted";
+
+    /// <summary>A worker failed with the router's exhaustion or a rate-limit error (the backstop).</summary>
+    public const string WorkerRateLimited = "worker-rate-limited";
+
+    /// <summary>Who writes usage pauses (<see cref="Control.ChangedBy"/>).</summary>
+    public const string By = "usage";
+
+    public static readonly TimeSpan InitialBackoff = TimeSpan.FromMinutes(1);
+    public static readonly TimeSpan MaxBackoff = TimeSpan.FromMinutes(60);
 }
 
 /// <summary>The control state every process shares (the ledger's <c>controls</c> table).</summary>
@@ -52,6 +76,17 @@ public interface IControls
 
     /// <summary>Every scope's control row.</summary>
     Task<IReadOnlyList<Control>> ListAsync(CancellationToken ct);
+
+    /// <summary>The usage pause while it is in effect (before its <see cref="Control.ResumeAt"/>), or null.</summary>
+    Task<Control?> UsagePauseAsync(CancellationToken ct);
+
+    /// <summary>
+    /// Pauses the factory for usage until <paramref name="resumeAt"/> (never shortening a pause in effect), or, with no
+    /// reset time known, for a backoff: <see cref="UsagePause.InitialBackoff"/>, doubled (up to
+    /// <see cref="UsagePause.MaxBackoff"/>) when the last backoff pause ended less than <see cref="UsagePause.MaxBackoff"/>
+    /// ago. A backoff pause in effect is left as it is. Returns the pause now in effect.
+    /// </summary>
+    Task<Control> PauseForUsageAsync(DateTimeOffset? resumeAt, string reason, CancellationToken ct);
 
     /// <summary>The scope's control row, or null when it has none.</summary>
     Task<Control?> GetAsync(string scope, CancellationToken ct);
@@ -69,6 +104,11 @@ public sealed class NoControls : IControls
 
     public Task<ControlState> EffectiveAsync(string externalId, long? epicId, CancellationToken ct) => Task.FromResult(ControlState.Running);
     public Task<IReadOnlyList<Control>> ListAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<Control>>([]);
+    public Task<Control?> UsagePauseAsync(CancellationToken ct) => Task.FromResult<Control?>(null);
+
+    /// <summary>Records nothing: without a control table nothing could honour the pause.</summary>
+    public Task<Control> PauseForUsageAsync(DateTimeOffset? resumeAt, string reason, CancellationToken ct) =>
+        Task.FromResult(new Control { Scope = ControlScope.Usage, State = ControlState.Running, ChangedBy = UsagePause.By, Reason = reason });
     public Task<Control?> GetAsync(string scope, CancellationToken ct) => Task.FromResult<Control?>(null);
     public Task SetAsync(string scope, ControlState state, string by, CancellationToken ct) => Task.CompletedTask;
     public Task ClearAsync(string scope, CancellationToken ct) => Task.CompletedTask;
@@ -83,15 +123,16 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
 {
     public async Task<ControlState> EffectiveAsync(string externalId, long? epicId, CancellationToken ct)
     {
-        var scopes = new List<string> { ControlScope.Factory, ControlScope.Item(externalId) };
+        var scopes = new List<string> { ControlScope.Factory, ControlScope.Usage, ControlScope.Item(externalId) };
         if (epicId is { } epic)
         {
             scopes.Add(ControlScope.Epic(epic));
         }
         await using var db = await contexts.CreateDbContextAsync(ct);
         var rows = await db.Controls.AsNoTracking().Where(c => scopes.Contains(c.Scope)).ToListAsync(ct);
+        var now = time.GetUtcNow();
         return rows.Any(r => r.State == ControlState.Stopping && r.Scope == ControlScope.Item(externalId)) ? ControlState.Stopping
-            : rows.Any(r => r.State == ControlState.Paused) ? ControlState.Paused
+            : rows.Any(r => r.PausesAt(now)) ? ControlState.Paused
             : ControlState.Running;
     }
 
@@ -105,6 +146,53 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
     {
         await using var db = await contexts.CreateDbContextAsync(ct);
         return await db.Controls.AsNoTracking().SingleOrDefaultAsync(c => c.Scope == scope, ct);
+    }
+
+    public async Task<Control?> UsagePauseAsync(CancellationToken ct) =>
+        await GetAsync(ControlScope.Usage, ct) is { } row && row.PausesAt(time.GetUtcNow()) ? row : null;
+
+    public async Task<Control> PauseForUsageAsync(DateTimeOffset? resumeAt, string reason, CancellationToken ct)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            await using var db = await contexts.CreateDbContextAsync(ct);
+            var row = await db.Controls.SingleOrDefaultAsync(c => c.Scope == ControlScope.Usage, ct);
+            var now = time.GetUtcNow();
+            var inEffect = row is not null && row.PausesAt(now);
+            var until = resumeAt;
+            TimeSpan? backoff = null;
+            if (until is null)
+            {
+                if (inEffect)
+                {
+                    return row!;
+                }
+                backoff = row is { Backoff: { } last, ResumeAt: { } ended } && ended > now - UsagePause.MaxBackoff
+                    ? TimeSpan.FromTicks(Math.Min(last.Ticks * 2, UsagePause.MaxBackoff.Ticks))
+                    : UsagePause.InitialBackoff;
+                until = now + backoff;
+            }
+            else if (inEffect && row!.ResumeAt >= until)
+            {
+                return row;
+            }
+            if (row is null)
+            {
+                row = new Control { Scope = ControlScope.Usage, ChangedBy = UsagePause.By };
+                db.Controls.Add(row);
+            }
+            (row.State, row.ChangedBy, row.ChangedAt, row.Reason, row.ResumeAt, row.Backoff) =
+                (ControlState.Paused, UsagePause.By, now, reason, until, backoff);
+            try
+            {
+                await db.SaveChangesAsync(ct);
+                return row;
+            }
+            catch (DbUpdateException) when (attempt == 0 && db.Entry(row).State == EntityState.Added)
+            {
+                // Another process paused first: decide again against its row.
+            }
+        }
     }
 
     public async Task SetAsync(string scope, ControlState state, string by, CancellationToken ct)

@@ -5,11 +5,39 @@ using System.Runtime.InteropServices;
 namespace DarkFactory.Orchestrator.Worker;
 
 public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError, string? ResultSubtype, string? ResultText, string StderrTail,
-    string? TerminalReason = null)
+    string? TerminalReason = null, bool RateLimited = false)
 {
     public const string HookStoppedReason = "hook_stopped";
 
     public bool Succeeded => ExitCode == 0 && !IsError && SessionId is not null;
+
+    /// <summary>
+    /// How a failed session reads when the plans ran out rather than the work failing: the router's answer when every
+    /// subscription is exhausted (429 "All enrolled subscription accounts are currently unavailable."), an upstream 429
+    /// or 529 passed through (Claude Code's "API Error: 429 …", <c>rate_limit_error</c>, <c>overloaded_error</c>,
+    /// "Repeated 529 Overloaded errors") and a plan's own limit ("usage limit reached", "hit your limit").
+    /// </summary>
+    public static readonly string[] UsageLimitMarkers =
+    [
+        "All enrolled subscription accounts are currently unavailable",
+        "API Error: 429",
+        "API Error: 529",
+        "rate_limit_error",
+        "overloaded_error",
+        "Repeated 529",
+        "usage limit reached",
+        "hit your limit",
+    ];
+
+    /// <summary>
+    /// The session failed because the router or the plan refused it for usage (exhausted, rate-limited, overloaded):
+    /// Claude Code flagged a <c>rate_limit</c> API error, or its result or stderr carries a <see cref="UsageLimitMarkers"/> marker.
+    /// Such a failure pauses the factory instead of escalating the item.
+    /// </summary>
+    public bool UsageLimited => !Succeeded && (RateLimited || HasUsageMarker(ResultText) || HasUsageMarker(StderrTail));
+
+    private static bool HasUsageMarker(string? text) =>
+        text is not null && UsageLimitMarkers.Any(m => text.Contains(m, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
     /// A hook ended the session (<c>terminal_reason: hook_stopped</c>), e.g. the pause hook at a tool boundary: the
@@ -369,7 +397,8 @@ public sealed class ClaudeWorker(
             state.ResultSubtype,
             state.ResultText,
             string.Join('\n', stderr),
-            state.TerminalReason);
+            state.TerminalReason,
+            state.RateLimited);
     }
 
     /// <summary>

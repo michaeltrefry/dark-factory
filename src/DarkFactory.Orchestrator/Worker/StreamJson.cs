@@ -17,6 +17,12 @@ public sealed class StreamJsonState
     /// <summary>The result's <c>terminal_reason</c> (e.g. <c>completed</c>, or <c>hook_stopped</c> when a hook ended the session).</summary>
     public string? TerminalReason { get; private set; }
 
+    /// <summary>
+    /// Claude Code reported an API error of kind <c>rate_limit</c> (an assistant message with <c>"error": "rate_limit"</c>,
+    /// as it writes for a 429 such as the router's exhausted subscription pool or a plan's usage limit).
+    /// </summary>
+    public bool RateLimited { get; private set; }
+
     public void Accept(string line)
     {
         if (string.IsNullOrWhiteSpace(line) || line.TrimStart()[0] != '{')
@@ -42,6 +48,10 @@ public sealed class StreamJsonState
             if (SessionId is null && root.TryGetProperty("session_id", out var sid) && sid.ValueKind == JsonValueKind.String)
             {
                 SessionId = sid.GetString();
+            }
+            if (root.TryGetProperty("error", out var apiError) && apiError.ValueKind == JsonValueKind.String && apiError.ValueEquals("rate_limit"))
+            {
+                RateLimited = true;
             }
             if (root.TryGetProperty("type", out var type) && type.ValueEquals("result"))
             {
