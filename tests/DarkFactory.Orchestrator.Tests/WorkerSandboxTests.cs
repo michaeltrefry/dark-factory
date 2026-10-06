@@ -261,21 +261,86 @@ public class WorkerSandboxTests
         }
     }
 
+    private const string KillPrimitive = "kill_pids() { kill -KILL \"$@\" 2>/dev/null || true; }";
+    private const string SelfExclusion = "[ \"$pid\" != \"$$\" ] || continue";
+
     /// <summary>
-    /// A copy of the helper whose "every process of the sandbox user" (kill -1) is narrowed to the pids
-    /// listed in <paramref name="registry"/>, so the uid-wide kill can be exercised as the current user
-    /// without signalling anything else of theirs.
+    /// A copy of the helper whose uid sweep runs for real (as the current user: enumeration, exclusion,
+    /// repeat-until-stable) with only its signal primitive replaced. The replacement logs every pid the
+    /// sweep targets to <paramref name="registry"/>.log and really kills a target only if it is listed in
+    /// <paramref name="registry"/> or is the helper itself or a child of it, so the sweep can't touch the
+    /// rest of the user's session, but a sweep that targets the helper still kills it (exit 137), exactly
+    /// as it would as <c>_factory</c>.
     /// </summary>
-    private string HelperWithRegistryKill(string registry, string sandboxUser)
+    /// <param name="spareSelf">false: the mutation that drops the helper's self-exclusion (kill -1 semantics on macOS).</param>
+    private string HelperWithRegistryKill(string registry, string sandboxUser, bool spareSelf = true)
     {
+        var seam = "kill_pids() { local p kill_ok; printf '%s\\n' \"$@\" >>'" + registry + ".log'; "
+            + "kill_ok=\" $$ $(pgrep -P $$ | tr '\\n' ' ') $(tr '\\n' ' ' <'" + registry + "') \"; "
+            + "for p in \"$@\"; do case \"$kill_ok\" in *\" $p \"*) kill -KILL \"$p\" 2>/dev/null || true ;; esac; done; }";
         var source = File.ReadAllText(SandboxSupport.Helper);
+        Assert.Contains(KillPrimitive, source);
+        Assert.Contains(SelfExclusion, source);
+        Assert.DoesNotContain("kill -KILL -1", source);
         var copy = source
             .Replace("\nsandbox_user=_factory\n", $"\nsandbox_user={sandboxUser}\n")
-            .Replace("kill -KILL -1 ", $"kill -KILL $(cat '{registry}') ");
+            .Replace(KillPrimitive, seam);
+        if (!spareSelf)
+        {
+            copy = copy.Replace(SelfExclusion, ":");
+        }
         Assert.Contains($"\nsandbox_user={sandboxUser}\n", copy);
-        Assert.Contains($"kill -KILL $(cat '{registry}') ", copy);
-        Assert.DoesNotContain("kill -KILL -1", copy);
+        Assert.Contains(seam, copy);
         return SandboxSupport.Executable(_dir, "registry-helper", copy);
+    }
+
+    private static int[] Targeted(string registry) =>
+        File.Exists(registry + ".log") ? File.ReadAllLines(registry + ".log").Select(int.Parse).ToArray() : [];
+
+    private async Task<(int ExitCode, string Stdout, int HelperPid)> RunRegistryHelperAsync(string helper, params string[] args)
+    {
+        var psi = new ProcessStartInfo(helper, args) { RedirectStandardInput = true, RedirectStandardOutput = true };
+        using var p = Process.Start(psi)!;
+        await p.StandardInput.WriteAsync("\n");
+        await p.StandardInput.FlushAsync();
+        var stdout = await p.StandardOutput.ReadToEndAsync(); // stdin stays open: no Stop
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await p.WaitForExitAsync(cts.Token);
+        p.StandardInput.Close();
+        return (p.ExitCode, stdout, p.Id);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(3)]
+    public async Task Uid_sweep_spares_the_helper_so_it_exits_with_the_workers_status(int workerExit)
+    {
+        var registry = Path.Combine(_dir, "uid-pids");
+        File.WriteAllText(registry, "");
+        var helper = HelperWithRegistryKill(registry, Environment.UserName);
+
+        var (exitCode, stdout, helperPid) = await RunRegistryHelperAsync(helper, "/bin/sh", "-c", $"echo ok; exit {workerExit}");
+
+        Assert.Equal(workerExit, exitCode);
+        Assert.Equal("ok\n", stdout);
+        var targeted = Targeted(registry);
+        Assert.NotEmpty(targeted); // the sweep ran over the user's processes
+        Assert.DoesNotContain(helperPid, targeted);
+    }
+
+    [Fact]
+    public async Task Seam_catches_a_uid_sweep_that_targets_the_helper_itself()
+    {
+        // The old kill -1: on macOS it signals the sender too, so the helper died with 137 after every run.
+        var registry = Path.Combine(_dir, "uid-pids");
+        File.WriteAllText(registry, "");
+        var helper = HelperWithRegistryKill(registry, Environment.UserName, spareSelf: false);
+
+        var (exitCode, stdout, helperPid) = await RunRegistryHelperAsync(helper, "/bin/sh", "-c", "echo ok; exit 0");
+
+        Assert.Equal("ok\n", stdout);
+        Assert.Contains(helperPid, Targeted(registry));
+        Assert.Equal(137, exitCode);
     }
 
     /// <summary>
@@ -312,6 +377,8 @@ public class WorkerSandboxTests
         p.StandardInput.Close();
 
         Assert.Equal(0, p.ExitCode);
+        Assert.Contains(grandchild, Targeted(registry));
+        Assert.DoesNotContain(p.Id, Targeted(registry));
         await SandboxSupport.WaitUntilDeadAsync(grandchild);
     }
 
@@ -333,6 +400,9 @@ public class WorkerSandboxTests
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         await p.WaitForExitAsync(cts.Token);
 
+        Assert.Equal(137, p.ExitCode); // the killed worker's status, reported by a helper that survived its sweep
+        Assert.Contains(grandchild, Targeted(registry));
+        Assert.DoesNotContain(p.Id, Targeted(registry));
         await SandboxSupport.WaitUntilDeadAsync(grandchild);
     }
 
@@ -355,6 +425,7 @@ public class WorkerSandboxTests
             await Task.Delay(500);
 
             Assert.True(SandboxSupport.IsAlive(grandchild), "the helper signalled by uid while not the sandbox user");
+            Assert.Empty(Targeted(registry));
         }
         finally
         {
@@ -542,8 +613,9 @@ public class WorkerSandboxTests
 }
 
 /// <summary>
-/// Live probes against the real sandbox user. They skip unless this Mac has run
-/// <c>scripts/setup-worker-user.sh</c> (user, helper and sudoers rule in place).
+/// Live probes against the real sandbox user. Opt-in only (FACTORY_SANDBOX_LIVE=1): the installed helper
+/// kills every process of that user, including an interactive <c>_factory</c> session such as its Claude
+/// login. They also skip unless this Mac has run <c>scripts/setup-worker-user.sh</c>.
 /// </summary>
 [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
 public class LiveWorkerSandboxTests
@@ -552,6 +624,11 @@ public class LiveWorkerSandboxTests
 
     private static async Task<WorkerSandbox> RequireSandboxAsync()
     {
+        // Before anything touches the helper: even the readiness probe ends in its uid-wide kill.
+        if (Environment.GetEnvironmentVariable("FACTORY_SANDBOX_LIVE") != "1")
+        {
+            Assert.Skip("Live sandbox test: set FACTORY_SANDBOX_LIVE=1 to run (kills every _factory process).");
+        }
         if (!OperatingSystem.IsMacOS())
         {
             Assert.Skip("The worker sandbox is macOS-only.");

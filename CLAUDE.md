@@ -71,10 +71,12 @@ The owner's home is ACL-denied to `_factory`, so `~/.ssh`, `~/.config/gh` and th
 unreachable. Router variables go to the helper on stdin; the helper builds the worker env from scratch
 (PATH, HOME from the password database, MSBuild node reuse/build server off, router vars), refuses any
 other variable or a program that isn't an absolute path/plain name, and when the worker exits or its stdin
-closes kills the tree, the process group and then every `_factory` process (`kill -1` as `_factory`; the
-helper skips that step when not running as the sandbox user). So `_factory` is single-tenant: one sandboxed
-`factory run` per machine (`WorkerLock`, `<work root>/.factory-run.lock`). Run `sudo scripts/setup-worker-user.sh`
-once; the live probe tests skip until then.
+closes kills the tree, the process group and then every other `_factory` process (a `pgrep -U` sweep that
+spares the helper's own pid — never `kill -1`, which on macOS kills the sender too; the helper skips that
+step when not running as the sandbox user), then exits with the worker's status. So `_factory` is
+single-tenant: one sandboxed `factory run` per machine (`WorkerLock`, `<work root>/.factory-run.lock`). Run
+`sudo scripts/setup-worker-user.sh` once; the live probe tests (`LiveWorkerSandboxTests`) run only with
+`FACTORY_SANDBOX_LIVE=1`, since they kill every `_factory` process (including an interactive `_factory` login).
 
 Secrets in the keychain: `security add-generic-password -w` at its interactive prompt truncates at 128 chars
 (Shortcut tokens are longer → 401). Copy the secret, then

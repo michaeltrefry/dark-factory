@@ -159,7 +159,7 @@ dotnet run --project src/DarkFactory.Orchestrator -- dashboard set-password
   `router-key` mode). It refuses any other variable and any program that is not an absolute path or a
   plain command name. When the worker exits, or its stdin closes (Stop, timeout, or the orchestrator
   dying), it kills the worker's tree and process group and then **every `_factory` process**
-  (`kill -1` as `_factory`), so nothing that forked and `setsid()`ed away survives the run.
+  (all but the helper itself, which then exits with the worker's status), so nothing that forked and `setsid()`ed away survives the run.
   That makes `_factory` single-tenant: **one sandboxed `factory run` at a time per machine**, enforced by
   a lock on `<work root>/.factory-run.lock` (a second run fails fast).
 - **`/opt/dark-factory/work`**: the work root (clones + worktrees), owned by you under a root-owned

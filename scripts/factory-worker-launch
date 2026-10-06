@@ -15,10 +15,14 @@
 # lingering, and only the allowlisted router variables (E1/E5).
 #
 # Killing: the worker's process tree and process group, and then — when running as the
-# sandbox user — every process of that user (kill -1), which also catches anything that
+# sandbox user — every other process of that user, which also catches anything that
 # forked and setsid()'d away (MSBuild node reuse, the dotnet build server, a hostile
 # worker). That makes the sandbox user single-tenant: only one helper may run at a time,
 # which the orchestrator enforces with its work-root lock (WorkerLock).
+#
+# Exit status: the worker's (137 when a Stop killed it). The uid sweep spares this helper's
+# own pid; kill -1 does not on macOS (it signals the sender too), so the helper used to kill
+# itself and every run exited 137.
 set -eu
 
 sandbox_user=_factory
@@ -73,11 +77,35 @@ collect_tree() {
     done
 }
 
-# Every process of the sandbox user except this one. Never as anyone else: as the owner
-# (e.g. running this script directly) kill -1 would take down their whole session.
+# Sends SIGKILL to the given pids: the one primitive the tests replace.
+kill_pids() { kill -KILL "$@" 2>/dev/null || true; }
+
+# Decided once, up front. Never as anyone else: as the owner (e.g. running this script
+# directly) the sweep would take down their whole session.
+self_uid=$(id -u)
+is_sandbox_user=0
+[ "$(id -un)" != "$sandbox_user" ] || is_sandbox_user=1
+
+# Every process of the sandbox user except this helper ($$; the watcher is reaped before
+# this runs). Repeats until a listing turns up nothing new, so anything forked mid-sweep is
+# caught on the next pass; SIGKILL can't be refused, so each pid is signalled once.
 kill_sandbox_user() {
-    [ "$(id -un)" = "$sandbox_user" ] || return 0
-    kill -KILL -1 2>/dev/null || true
+    [ "$is_sandbox_user" -eq 1 ] || return 0
+    local pass pid fresh signalled=" "
+    for pass in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        fresh=()
+        # Real and effective uid: also catches setuid programs the worker started. ps, not
+        # pgrep: macOS pgrep silently drops its own ancestors, hiding what the exclusion is for.
+        for pid in $( { ps -U "$self_uid" -o pid=; ps -u "$self_uid" -o pid=; } 2>/dev/null || true); do
+            [ "$pid" != "$$" ] || continue
+            case "$signalled" in *" $pid "*) continue ;; esac
+            signalled="$signalled$pid "
+            fresh+=("$pid")
+        done
+        [ ${#fresh[@]} -gt 0 ] || return 0
+        kill_pids "${fresh[@]}"
+    done
+    echo "factory-worker-launch: $sandbox_user processes still appearing after $pass sweeps" >&2
 }
 
 set -m # the worker gets its own process group
@@ -91,13 +119,15 @@ set +m
     # shellcheck disable=SC2046 # word splitting of the pid list is intended
     kill -KILL $(collect_tree "$worker") 2>/dev/null || true
     kill -KILL -- "-$worker" 2>/dev/null || true
-    kill_sandbox_user
+    # The uid sweep is the main shell's, after the worker is reaped; from here it would race
+    # (and could kill) the main shell's own commands.
 ) <&0 & # explicit, or bash gives background jobs /dev/null as stdin
 watcher=$!
 
 status=0
 wait "$worker" || status=$?
 kill "$watcher" 2>/dev/null || true
+wait "$watcher" 2>/dev/null || true # gone before the sweep, which then spares only $$
 kill -KILL -- "-$worker" 2>/dev/null || true # nothing the worker started outlives the run
 kill_sandbox_user
 exit "$status"
