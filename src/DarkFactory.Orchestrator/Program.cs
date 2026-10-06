@@ -36,10 +36,7 @@ static async Task<int> WorkAsync(CancellationToken ct)
         Console.Error.WriteLine(ex.Message);
         return 2;
     }
-    await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)))
-    {
-        await db.Database.MigrateAsync(ct);
-    }
+    await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
     await using var app = FactoryHost.Build(options);
     await app.StartAsync(ct);
     Console.WriteLine($"factory work: session hub on {app.Address()}{SessionHub.Path}; Ctrl-C stops");

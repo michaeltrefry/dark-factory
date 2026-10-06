@@ -116,4 +116,6 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `SessionHub` (`/hubs/sessions`, `JoinSession(id)`) viewers the stored backlog then live events, once each, whichever
   process (`factory work` or a separate `factory run`) recorded them. Slow viewers are disconnected, never waited on.
   The hub answers only `Host: 127.0.0.1|localhost` and same-origin (or Origin-less) clients.
+- Processes migrate the ledger through `LedgerMigrations.MigrateAsync` (advisory-locked: EF alone lets two concurrent
+  migrators apply the same migration) before reading it; tests migrate their temp database before starting a host.
 - Tests: xunit.v3 on Microsoft.Testing.Platform (`global.json` opts in).

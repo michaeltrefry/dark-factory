@@ -34,8 +34,8 @@ public static class FactoryRunner
         using var routerHttp = new HttpClient { BaseAddress = options.RouterBaseUrl };
         var app = new GitHubApp(githubHttp, appId, appKey, TimeProvider.System);
 
+        await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
-        await db.Database.MigrateAsync(ct);
         var ledger = new WorkLedger(db, TimeProvider.System);
 
         var workspaces = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,

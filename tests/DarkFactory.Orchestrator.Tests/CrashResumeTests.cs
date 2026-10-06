@@ -24,6 +24,9 @@ public sealed class CrashResumeTests : IAsyncLifetime
     {
         _db = await TempPostgresDatabase.CreateAsync("df_crash");
         _ledger = _db.ConnectionString;
+        // Fully migrated before any host starts: polling while a host migrates would see a half-built
+        // schema (e.g. ledger_entries without "Step", 42703), since each migration commits on its own.
+        await LedgerMigrations.MigrateAsync(_ledger, CancellationToken.None);
     }
 
     public async ValueTask DisposeAsync()
@@ -113,20 +116,12 @@ public sealed class CrashResumeTests : IAsyncLifetime
     private async Task<List<LedgerEntry>> Rows()
     {
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_ledger));
-        if (!(await db.Database.GetAppliedMigrationsAsync()).Any())
-        {
-            return [];
-        }
         return await db.LedgerEntries.OrderBy(e => e.Id).ToListAsync();
     }
 
     private async Task<List<SessionEvent>> Events()
     {
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_ledger));
-        if (!(await db.Database.GetAppliedMigrationsAsync()).Any())
-        {
-            return [];
-        }
         return await db.SessionEvents.OrderBy(e => e.Sequence).ToListAsync();
     }
 

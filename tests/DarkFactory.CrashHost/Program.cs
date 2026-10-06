@@ -13,8 +13,8 @@ using Microsoft.EntityFrameworkCore;
 
 var (connection, workDir, storyId) = (args[0], args[1], int.Parse(args[2]));
 
+await LedgerMigrations.MigrateAsync(connection, CancellationToken.None);
 await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(connection));
-await db.Database.MigrateAsync();
 
 var pipeline = new RunPipeline(
     new FileStories(Path.Combine(workDir, "comments.log")),
