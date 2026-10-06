@@ -295,7 +295,8 @@ public sealed class RunPipeline(
         catch (ControlRequestedException request) when (request.State == ControlState.Paused)
         {
             // The worktree, checkpoints and Claude session stay: Continue (or the usage pause lifting) resumes the same session.
-            if (await _controls.UsagePauseAsync(CancellationToken.None) is { } usage)
+            // A user's Pause on the factory, the epic or the item outranks the usage pause: Continue, not the reset, resumes it.
+            if (!await UserPausedAsync(item) && await _controls.UsagePauseAsync(CancellationToken.None) is { } usage)
             {
                 var why = $"{usage.Reason}; resumes at {usage.ResumeAt:u}";
                 await ledger.RecordAsync(item, WorkState.Paused, null, UsagePaused, CancellationToken.None);
@@ -639,6 +640,22 @@ public sealed class RunPipeline(
         {
             log.WriteLine($"[implement] could not record the end of the worker session: {captureError.Message}");
         }
+    }
+
+    /// <summary>Whether a user's Pause holds the item: on the factory, its epic or the item itself.</summary>
+    private async Task<bool> UserPausedAsync(WorkItem item)
+    {
+        string[] scopes = item.EpicId is { } epic
+            ? [ControlScope.Factory, ControlScope.Epic(epic), ControlScope.Item(item.ExternalId)]
+            : [ControlScope.Factory, ControlScope.Item(item.ExternalId)];
+        foreach (var scope in scopes)
+        {
+            if ((await _controls.GetAsync(scope, CancellationToken.None))?.State == ControlState.Paused)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private ItemStopper Stopper => new(source, ledger, locks, pullRequests, _controls, log);

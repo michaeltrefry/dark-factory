@@ -31,10 +31,11 @@ public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError,
 
     /// <summary>
     /// The session failed because the router or the plan refused it for usage (exhausted, rate-limited, overloaded):
-    /// Claude Code flagged a <c>rate_limit</c> API error, or its result or stderr carries a <see cref="UsageLimitMarkers"/> marker.
-    /// Such a failure pauses the factory instead of escalating the item.
+    /// Claude Code flagged a <c>rate_limit</c> API error, its error result (<see cref="IsError"/>) or its stderr carries a
+    /// <see cref="UsageLimitMarkers"/> marker. A result that is not an error is the model's own prose (which may well
+    /// talk about rate limits) and never counts. Such a failure pauses the factory instead of escalating the item.
     /// </summary>
-    public bool UsageLimited => !Succeeded && (RateLimited || HasUsageMarker(ResultText) || HasUsageMarker(StderrTail));
+    public bool UsageLimited => !Succeeded && (RateLimited || (IsError && HasUsageMarker(ResultText)) || HasUsageMarker(StderrTail));
 
     private static bool HasUsageMarker(string? text) =>
         text is not null && UsageLimitMarkers.Any(m => text.Contains(m, StringComparison.OrdinalIgnoreCase));

@@ -121,9 +121,10 @@ running workers stop at their next tool call as for Pause (item recorded Paused 
 unreachable, or no credential known yet, e.g. after a router restart) never pauses. Backstop: a worker that
 fails with the router's exhaustion answer (429 "All enrolled subscription accounts are currently
 unavailable."), an API 429/529 or a plan usage limit pauses the factory with the same backoff instead of
-escalating; the item resumes its own session afterwards. A user's Continue does not lift the usage pause
+escalating; the item resumes its own session afterwards. (529/overloaded is treated as usage-limited on purpose:
+it never escalates an item.) A user's Continue does not lift the usage pause
 (and its end does not lift a user's pause); `factory continue --usage` (or the dashboard banner's Continue)
-lifts it early. There are no spend caps: an item's cost on the dashboard is the sum of its sessions' router costs.
+lifts it early, and the same router reading does not set it again (a later reset or a worker hitting the limit does). There are no spend caps: an item's cost on the dashboard is the sum of its sessions' router costs.
 
 ### Lifecycle and resume
 

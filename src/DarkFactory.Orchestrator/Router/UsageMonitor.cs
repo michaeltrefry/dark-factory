@@ -24,12 +24,14 @@ public sealed class UsageMonitor(IUsageSource usage, IControls controls, UsageOp
         while (await timer.WaitForNextTickAsync(stoppingToken));
     }
 
-    /// <summary>One poll; never throws but for cancellation.</summary>
+    /// <summary>One poll, bounded by <see cref="UsageOptions.RequestTimeout"/> (the intake loop runs it inline); never throws but for cancellation.</summary>
     public async Task CheckAsync(CancellationToken ct)
     {
         try
         {
-            var report = await usage.GetUsageAsync(ct);
+            using var timeout = new CancellationTokenSource(options.RequestTimeout, time);
+            using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
+            var report = await usage.GetUsageAsync(bounded.Token);
             if (report.KnownCredentials == 0 || !report.AllExhausted)
             {
                 return;
@@ -53,4 +55,8 @@ public sealed class UsageMonitor(IUsageSource usage, IControls controls, UsageOp
     }
 }
 
-public sealed record UsageOptions(TimeSpan PollInterval);
+public sealed record UsageOptions(TimeSpan PollInterval)
+{
+    /// <summary>How long one read of the router's usage may take before it counts as unknown (a hung router must not stall intake).</summary>
+    public TimeSpan RequestTimeout { get; init; } = TimeSpan.FromSeconds(10);
+}

@@ -84,7 +84,9 @@ public interface IControls
     /// Pauses the factory for usage until <paramref name="resumeAt"/> (never shortening a pause in effect), or, with no
     /// reset time known, for a backoff: <see cref="UsagePause.InitialBackoff"/>, doubled (up to
     /// <see cref="UsagePause.MaxBackoff"/>) when the last backoff pause ended less than <see cref="UsagePause.MaxBackoff"/>
-    /// ago. A backoff pause in effect is left as it is. Returns the pause now in effect.
+    /// ago. A backoff pause in effect is left as it is. A pause a user lifted early (<c>continue --usage</c>) is not set
+    /// again by a reset no later than the one it was lifted from; a later reset or a backoff (the worker backstop) sets it.
+    /// Returns the control row as it now stands.
     /// </summary>
     Task<Control> PauseForUsageAsync(DateTimeOffset? resumeAt, string reason, CancellationToken ct);
 
@@ -151,9 +153,12 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
     public async Task<Control?> UsagePauseAsync(CancellationToken ct) =>
         await GetAsync(ControlScope.Usage, ct) is { } row && row.PausesAt(time.GetUtcNow()) ? row : null;
 
+    /// <summary>Retries of a control write that lost a race to another writer (each retry re-reads the row and decides again).</summary>
+    private const int MaxWriteAttempts = 5;
+
     public async Task<Control> PauseForUsageAsync(DateTimeOffset? resumeAt, string reason, CancellationToken ct)
     {
-        for (var attempt = 0; ; attempt++)
+        for (var attempt = 1; ; attempt++)
         {
             await using var db = await contexts.CreateDbContextAsync(ct);
             var row = await db.Controls.SingleOrDefaultAsync(c => c.Scope == ControlScope.Usage, ct);
@@ -176,6 +181,12 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
             {
                 return row;
             }
+            else if (row is { State: ControlState.Running, ResumeAt: { } lifted } && row.ChangedBy != UsagePause.By && until <= lifted)
+            {
+                // A user lifted this pause early (`factory continue --usage`): the reading that set it does not set it
+                // again. A later reset does, and so does the worker backstop (no reset time), which proves the limit holds.
+                return row;
+            }
             if (row is null)
             {
                 row = new Control { Scope = ControlScope.Usage, ChangedBy = UsagePause.By };
@@ -188,9 +199,10 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
                 await db.SaveChangesAsync(ct);
                 return row;
             }
-            catch (DbUpdateException) when (attempt == 0 && db.Entry(row).State == EntityState.Added)
+            catch (DbUpdateException ex) when (attempt < MaxWriteAttempts && (ex is DbUpdateConcurrencyException || db.Entry(row).State == EntityState.Added))
             {
-                // Another process paused first: decide again against its row.
+                // Another writer got there first (inserted the row, or changed it since it was read): decide again
+                // against its row, so a backoff never shortens a known reset it raced with.
             }
         }
     }
@@ -205,25 +217,25 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
         {
             throw new ArgumentException("Only an item is stopped through its control; stop an epic or the factory item by item.", nameof(state));
         }
-        await using var db = await contexts.CreateDbContextAsync(ct);
-        var row = await db.Controls.SingleOrDefaultAsync(c => c.Scope == scope, ct);
-        if (row is null)
+        for (var attempt = 1; ; attempt++)
         {
-            row = new Control { Scope = scope, ChangedBy = by };
-            db.Controls.Add(row);
-        }
-        (row.State, row.ChangedBy, row.ChangedAt) = (state, by, time.GetUtcNow());
-        try
-        {
-            await db.SaveChangesAsync(ct);
-        }
-        catch (DbUpdateException) when (db.Entry(row).State == EntityState.Added)
-        {
-            // Another writer inserted the scope first: write over theirs (last writer wins).
-            await using var retry = await contexts.CreateDbContextAsync(ct);
-            var existing = await retry.Controls.SingleAsync(c => c.Scope == scope, ct);
-            (existing.State, existing.ChangedBy, existing.ChangedAt) = (state, by, time.GetUtcNow());
-            await retry.SaveChangesAsync(ct);
+            await using var db = await contexts.CreateDbContextAsync(ct);
+            var row = await db.Controls.SingleOrDefaultAsync(c => c.Scope == scope, ct);
+            if (row is null)
+            {
+                row = new Control { Scope = scope, ChangedBy = by };
+                db.Controls.Add(row);
+            }
+            (row.State, row.ChangedBy, row.ChangedAt) = (state, by, time.GetUtcNow());
+            try
+            {
+                await db.SaveChangesAsync(ct);
+                return;
+            }
+            catch (DbUpdateException ex) when (attempt < MaxWriteAttempts && (ex is DbUpdateConcurrencyException || db.Entry(row).State == EntityState.Added))
+            {
+                // Another writer inserted or changed the scope first: write over theirs (last writer wins).
+            }
         }
     }
 

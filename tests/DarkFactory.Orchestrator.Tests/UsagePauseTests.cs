@@ -209,6 +209,8 @@ public class UsagePauseTests
         Assert.True(new WorkerResult("s1", 1, true, null, null, "Error: Repeated 529 Overloaded errors").UsageLimited);
         Assert.False(new WorkerResult("s1", 1, true, "error_max_turns", "ran out of turns", "").UsageLimited);
         Assert.False(new WorkerResult("s1", 0, false, "success", "Added rate_limit_error handling", "").UsageLimited); // a success never is
+        // A failed exit whose result is not an error is the model's prose, about rate limits or not: it escalates.
+        Assert.False(new WorkerResult("s1", 1, false, "success", "Added rate_limit_error handling", "").UsageLimited);
     }
 
     [Fact]
@@ -378,5 +380,178 @@ public class UsagePauseTests
         Assert.All(rows, r => Assert.Equal(ControlState.Paused, r.Control));
         l.Time.Advance(TimeSpan.FromMinutes(5));
         Assert.All(await data.ActiveItemsAsync(CancellationToken.None), r => Assert.Equal(ControlState.Running, r.Control));
+    }
+
+    private static (FakeShortcutBoard Board, ShortcutWorkSource Source) ReadyBoard()
+    {
+        var board = new FakeShortcutBoard();
+        board.Add(101, FakeShortcutBoard.FactoryTeam);
+        return (board, new ShortcutWorkSource(board.Client(), "tok", new WatchScope(["darkfactory"], [])));
+    }
+
+    [Fact]
+    public async Task Continue_on_the_usage_pause_holds_against_the_reading_that_set_it_but_not_against_a_later_reset()
+    {
+        var l = new Ledgers();
+        var resetAt = T0 + TimeSpan.FromHours(2);
+        var router = new StubRouter { Report = Usage(allExhausted: true, resumesAt: resetAt) };
+        var monitor = Monitor(router, l);
+        var (_, source) = ReadyBoard();
+        var worker = new FakeWorker(Reports(Ok));
+        var loop = new IntakeLoop(source, new Runner(l, source, worker), new IntakeOptions(Interval), l.Time, NullLogger<IntakeLoop>.Instance,
+            l.Controls, monitor);
+        await monitor.CheckAsync(CancellationToken.None);
+        Assert.Equal(resetAt, (await l.Controls.UsagePauseAsync(CancellationToken.None))?.ResumeAt);
+
+        Assert.True((await new ControlActions(l.Controls, l.Contexts).ContinueAsync(ControlScope.Usage, "tester", CancellationToken.None)).Ok);
+        await monitor.CheckAsync(CancellationToken.None); // the router still reports the same exhaustion until T
+
+        Assert.Null(await l.Controls.UsagePauseAsync(CancellationToken.None));
+        await loop.PollOnceAsync(CancellationToken.None); // reads the same report again first
+        Assert.Equal(3, router.Calls);
+        Assert.Single(worker.Calls);
+        Assert.Null(await l.Controls.UsagePauseAsync(CancellationToken.None));
+
+        // A later reset is a new exhaustion: it pauses again.
+        router.Report = Usage(allExhausted: true, resumesAt: resetAt + TimeSpan.FromHours(1));
+        await monitor.CheckAsync(CancellationToken.None);
+        Assert.Equal(resetAt + TimeSpan.FromHours(1), (await l.Controls.UsagePauseAsync(CancellationToken.None))?.ResumeAt);
+    }
+
+    [Fact]
+    public async Task The_worker_backstop_still_pauses_after_a_continue_on_the_usage_pause()
+    {
+        var l = new Ledgers();
+        var resetAt = T0 + TimeSpan.FromHours(2);
+        var router = new StubRouter { Report = Usage(allExhausted: true, resumesAt: resetAt) };
+        var monitor = Monitor(router, l);
+        await monitor.CheckAsync(CancellationToken.None);
+        await new ControlActions(l.Controls, l.Contexts).ContinueAsync(ControlScope.Usage, "tester", CancellationToken.None);
+
+        var pause = await l.Controls.PauseForUsageAsync(null, UsagePause.WorkerRateLimited, CancellationToken.None);
+
+        Assert.Equal((ControlState.Paused, T0 + UsagePause.InitialBackoff), (pause.State, pause.ResumeAt));
+        Assert.Equal(T0 + UsagePause.InitialBackoff, (await l.Controls.UsagePauseAsync(CancellationToken.None))?.ResumeAt);
+        // The worker proved the plans are still out, so the override is spent: the router's reading holds the pause to T.
+        await monitor.CheckAsync(CancellationToken.None);
+        Assert.Equal(resetAt, (await l.Controls.UsagePauseAsync(CancellationToken.None))?.ResumeAt);
+    }
+
+    /// <summary>A router that accepts the usage request and never answers.</summary>
+    private sealed class HungUsage : IUsageSource
+    {
+        private int _calls;
+        public int Calls => Volatile.Read(ref _calls);
+
+        public async Task<SubscriptionUsage> GetUsageAsync(CancellationToken ct)
+        {
+            Interlocked.Increment(ref _calls);
+            await Task.Delay(Timeout.Infinite, ct);
+            throw new InvalidOperationException("unreachable");
+        }
+    }
+
+    [Fact]
+    public async Task A_hung_router_holds_up_an_intake_poll_no_longer_than_the_usage_request_timeout()
+    {
+        var l = new Ledgers();
+        var (_, source) = ReadyBoard();
+        var worker = new FakeWorker(Reports(Ok));
+        var usage = new HungUsage();
+        var options = new UsageOptions(Interval);
+        Assert.Equal(TimeSpan.FromSeconds(10), options.RequestTimeout);
+        var monitor = new UsageMonitor(usage, l.Controls, options, l.Time, NullLogger<UsageMonitor>.Instance);
+        var loop = new IntakeLoop(source, new Runner(l, source, worker), new IntakeOptions(Interval), l.Time, NullLogger<IntakeLoop>.Instance,
+            l.Controls, monitor);
+
+        var poll = loop.PollOnceAsync(CancellationToken.None);
+        await Eventually(() => usage.Calls == 1);
+        l.Time.Advance(options.RequestTimeout - TimeSpan.FromSeconds(1));
+        await Task.Delay(100);
+        Assert.False(poll.IsCompleted);
+
+        l.Time.Advance(TimeSpan.FromSeconds(1));
+        await poll.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Single(worker.Calls); // usage unknown: the poll went on and dispatched
+        Assert.Null(await l.Controls.GetAsync(ControlScope.Usage, CancellationToken.None));
+    }
+
+    /// <summary>Lets another writer commit just before the first save of the context it is attached to.</summary>
+    private sealed class RaceOnce(Func<Task> write) : Microsoft.EntityFrameworkCore.Diagnostics.SaveChangesInterceptor
+    {
+        public bool Ran { get; private set; }
+
+        public override async ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int>> SavingChangesAsync(
+            Microsoft.EntityFrameworkCore.Diagnostics.DbContextEventData eventData,
+            Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int> result, CancellationToken cancellationToken = default)
+        {
+            if (!Ran)
+            {
+                Ran = true;
+                await write();
+            }
+            return result;
+        }
+    }
+
+    [Fact]
+    public async Task A_backoff_write_that_races_a_known_reset_never_shortens_it_and_a_racing_continue_still_lands()
+    {
+        await using var pg = await TempPostgresDatabase.CreateAsync("df_usage");
+        var plain = LedgerDbContext.PostgresOptions(pg.ConnectionString);
+        await using (var db = new LedgerDbContext(plain))
+        {
+            await db.Database.MigrateAsync();
+        }
+        var time = new FakeTimeProvider(T0);
+        var monitorSide = new LedgerControls(new LedgerDbContextFactory(plain), time);
+        LedgerControls Raced(RaceOnce race) => new(new LedgerDbContextFactory(
+            new DbContextOptionsBuilder<LedgerDbContext>().UseNpgsql(pg.ConnectionString).AddInterceptors(race).Options), time);
+        // An earlier backoff pause, now over: the backstop's next write updates that row.
+        await monitorSide.PauseForUsageAsync(null, UsagePause.WorkerRateLimited, CancellationToken.None);
+        time.Advance(UsagePause.InitialBackoff);
+        var reset = time.GetUtcNow() + TimeSpan.FromHours(3);
+
+        // The backstop read the expired row; the monitor's pause to the reset commits before the backstop saves.
+        var race = new RaceOnce(() => monitorSide.PauseForUsageAsync(reset, UsagePause.UsageExhausted, CancellationToken.None));
+        var pause = await Raced(race).PauseForUsageAsync(null, UsagePause.WorkerRateLimited, CancellationToken.None);
+
+        Assert.True(race.Ran);
+        Assert.Equal((UsagePause.UsageExhausted, reset), (pause.Reason, pause.ResumeAt));
+        var stored = await monitorSide.GetAsync(ControlScope.Usage, CancellationToken.None);
+        Assert.Equal((ControlState.Paused, UsagePause.UsageExhausted, reset), (stored!.State, stored.Reason, stored.ResumeAt));
+
+        // A user's Continue that races another write is not lost to it (last writer wins).
+        var continueRace = new RaceOnce(() => monitorSide.PauseForUsageAsync(reset + TimeSpan.FromHours(1), UsagePause.UsageExhausted, CancellationToken.None));
+        await Raced(continueRace).SetAsync(ControlScope.Usage, ControlState.Running, "tester", CancellationToken.None);
+        Assert.True(continueRace.Ran);
+        Assert.Equal((ControlState.Running, "tester"), ((await monitorSide.GetAsync(ControlScope.Usage, CancellationToken.None))!.State,
+            (await monitorSide.GetAsync(ControlScope.Usage, CancellationToken.None))!.ChangedBy));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("factory")]
+    [InlineData("epic")]
+    [InlineData("item")]
+    public async Task A_run_stopped_while_a_users_pause_and_the_usage_pause_both_hold_is_labelled_by_the_users_pause(string? userScope)
+    {
+        var l = new Ledgers();
+        var source = new FakeWorkSource(Story) { Epic = new WorkEpic(5, "Phase 1", null, "https://app.shortcut.com/trefry/epic/5") };
+        var worker = new PausableWorker();
+        var run = l.Pipeline(source, worker).RunAsync(77, CancellationToken.None);
+        await worker.Working.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        if (userScope is not null)
+        {
+            var scope = userScope switch { "factory" => ControlScope.Factory, "epic" => ControlScope.Epic(5), _ => ControlScope.Item("sc-77") };
+            await l.Controls.SetAsync(scope, ControlState.Paused, "tester", CancellationToken.None);
+        }
+        await l.Controls.PauseForUsageAsync(T0 + TimeSpan.FromHours(2), UsagePause.UsageExhausted, CancellationToken.None);
+        var paused = await run.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(WorkState.Paused, paused.State);
+        Assert.Equal((WorkState.Paused, userScope is null ? RunPipeline.UsagePaused : RunPipeline.UserPaused), (await l.Transitions())[^1]);
+        Assert.Equal(userScope is null, (await l.Rows()).Any(r => r.Step == RunPipeline.Steps.UsagePause));
     }
 }

@@ -121,6 +121,12 @@ public sealed class Control
     /// <summary>Usage scope only: the backoff that set <see cref="ResumeAt"/>, when no reset time was known; doubles on a repeat.</summary>
     public TimeSpan? Backoff { get; set; }
 
+    /// <summary>
+    /// Postgres's <c>xmin</c> as a concurrency token: a write that raced another writer's fails and is decided again
+    /// (<see cref="Controls.LedgerControls"/>), so e.g. a worker's short backoff cannot overwrite a known reset.
+    /// </summary>
+    public uint Version { get; set; }
+
     /// <summary>Whether this control pauses its scope at <paramref name="now"/>: a usage pause lifts at its <see cref="ResumeAt"/>.</summary>
     public bool PausesAt(DateTimeOffset now) => State == Controls.ControlState.Paused && (ResumeAt is null || now < ResumeAt);
 }
@@ -182,6 +188,7 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
             e.Property(x => x.State).HasConversion<string>().HasMaxLength(16);
             e.Property(x => x.ChangedBy).HasMaxLength(128);
             e.Property(x => x.Reason).HasMaxLength(64);
+            e.Property(x => x.Version).IsRowVersion();
         });
     }
 
