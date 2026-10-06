@@ -2,6 +2,7 @@ using System.Net;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Router;
 using DarkFactory.Orchestrator.Sessions;
+using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
@@ -55,6 +56,9 @@ public static class FactoryHost
         app.MapHub<SessionHub>(SessionHub.Path);
         return app;
     }
+
+    /// <summary><c>factory work</c>: the session hub host plus the intake loop polling the watch scope, in one process.</summary>
+    public static WebApplication BuildWork(FactoryOptions options) => Build(options, services => services.AddIntake(options));
 
     private static bool IsSameOrigin(string origin, HttpRequest request) =>
         Uri.TryCreate(origin, UriKind.Absolute, out var o)

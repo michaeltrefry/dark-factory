@@ -11,7 +11,7 @@ public class FactoryCliTests
     {
         var calls = new List<string>();
         var root = FactoryCli.Build(
-            (id, _) => { calls.Add($"run {id}"); return Task.FromResult(0); },
+            (id, ignoreScope, _) => { calls.Add(ignoreScope ? $"run {id} ignore-scope" : $"run {id}"); return Task.FromResult(0); },
             (name, port, _) => { calls.Add($"setup {name} {port}"); return Task.FromResult(0); },
             (repo, _) => { calls.Add($"protect {repo}"); return Task.FromResult(0); },
             _ => { calls.Add("work"); return Task.FromResult(0); });
@@ -26,6 +26,14 @@ public class FactoryCliTests
         var (root, calls) = Cli();
         Assert.Equal(0, await root.Parse(["run", arg]).InvokeAsync());
         Assert.Equal([$"run {expected}"], calls);
+    }
+
+    [Fact]
+    public async Task Run_ignores_the_scope_only_when_asked()
+    {
+        var (root, calls) = Cli();
+        Assert.Equal(0, await root.Parse(["run", "sc-7", "--ignore-scope"]).InvokeAsync());
+        Assert.Equal(["run 7 ignore-scope"], calls);
     }
 
     [Theory]
@@ -131,6 +139,24 @@ public class FactoryOptionsTests
         Assert.Equal("rk_config", Options(new() { ["Router:Key"] = "rk_config" }, secrets).RouterKey);
         Assert.Equal("rk_keychain", Options([], secrets).RouterKey);
         Assert.Equal("99", Options([], secrets).GitHubAppId);
+    }
+
+    [Fact]
+    public void Watch_scope_is_empty_by_default_and_reads_lists_or_arrays()
+    {
+        Assert.True(Options([]).WatchScope.IsEmpty);
+        Assert.Equal(TimeSpan.FromSeconds(60), Options([]).PollInterval);
+
+        var csv = Options(new() { ["Shortcut:Watch:Teams"] = "darkfactory, @other", ["Shortcut:Watch:Epics"] = "25171,7", ["Intake:PollSeconds"] = "15" });
+        Assert.Equal(["darkfactory", "other"], csv.WatchScope.Teams);
+        Assert.Equal([25171, 7], csv.WatchScope.Epics);
+        Assert.Equal(TimeSpan.FromSeconds(15), csv.PollInterval);
+
+        var array = Options(new() { ["Shortcut:Watch:Epics:0"] = "25171", ["Shortcut:Watch:Epics:1"] = "8" });
+        Assert.Empty(array.WatchScope.Teams);
+        Assert.Equal([25171, 8], array.WatchScope.Epics);
+
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Shortcut:Watch:Epics"] = "sc-1" }).WatchScope);
     }
 
     [Fact]

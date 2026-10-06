@@ -4,6 +4,7 @@ using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.Worker;
+using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 
@@ -145,28 +146,12 @@ public class WorkLedgerTests
 
 public class RunPipelineTests
 {
-    private static readonly RepoRef Sandbox = new("michaeltrefry", "dark-factory-sandbox");
-    private static readonly ShortcutStory Story =
+    internal static readonly RepoRef Sandbox = new("michaeltrefry", "dark-factory-sandbox");
+    private static readonly WorkStory Story =
         new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77");
-    private const string PrUrl = "https://github.com/michaeltrefry/dark-factory-sandbox/pull/1";
+    internal const string PrUrl = "https://github.com/michaeltrefry/dark-factory-sandbox/pull/1";
 
-    private sealed class FakeStories(ShortcutStory story, bool commentFails = false) : IStorySource
-    {
-        public bool CommentFails { get; set; } = commentFails;
-        public List<string> Comments { get; } = [];
-        public Task<ShortcutStory> GetStoryAsync(int id, CancellationToken ct) => Task.FromResult(story with { Id = id });
-        public Task AddCommentAsync(int id, string text, CancellationToken ct)
-        {
-            if (CommentFails)
-            {
-                throw new InvalidOperationException("Shortcut down");
-            }
-            Comments.Add(text);
-            return Task.CompletedTask;
-        }
-    }
-
-    private sealed class FakeWorkspaces(bool hasChanges = true, bool worktreeExists = true) : IRepoWorkspace
+    internal sealed class FakeWorkspaces(bool hasChanges = true, bool worktreeExists = true) : IRepoWorkspace
     {
         public List<string> Calls { get; } = [];
         public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct)
@@ -196,14 +181,14 @@ public class RunPipelineTests
         }
     }
 
-    private sealed record WorkerCall(string Prompt, string? Resume, WorkerCallbacks Callbacks)
+    internal sealed record WorkerCall(string Prompt, string? Resume, WorkerCallbacks Callbacks)
     {
         public Task OnSession(string sid, CancellationToken ct) => Callbacks.OnSession!(sid, ct);
     }
 
-    private const int WorkerPid = 4321;
+    internal const int WorkerPid = 4321;
 
-    private sealed class FakeWorker(params Func<WorkerCall, Task<WorkerResult>>[] behaviours) : IWorker
+    internal sealed class FakeWorker(params Func<WorkerCall, Task<WorkerResult>>[] behaviours) : IWorker
     {
         public List<WorkerCall> Calls { get; } = [];
         public List<int> OrphanStops { get; } = [];
@@ -229,7 +214,7 @@ public class RunPipelineTests
         }
     }
 
-    private static Func<WorkerCall, Task<WorkerResult>> Reports(WorkerResult result) => async call =>
+    internal static Func<WorkerCall, Task<WorkerResult>> Reports(WorkerResult result) => async call =>
     {
         if (result.SessionId is not null)
         {
@@ -245,7 +230,7 @@ public class RunPipelineTests
         throw ex;
     };
 
-    private sealed class FakePullRequests(Exception? throws = null) : IPullRequests
+    internal sealed class FakePullRequests(Exception? throws = null) : IPullRequests
     {
         public List<(RepoRef Repo, string Head, string Base, string Title, string Body)> Opened { get; } = [];
         public Task<string> OpenAsync(RepoRef repo, string head, string baseBranch, string title, string body, CancellationToken ct)
@@ -259,12 +244,12 @@ public class RunPipelineTests
         }
     }
 
-    private static readonly WorkerResult Ok = new("sess-77", 0, false, "success", "done", "");
+    internal static readonly WorkerResult Ok = new("sess-77", 0, false, "success", "done", "");
 
     private sealed class Harness
     {
         public LedgerDbContext Db { get; } = TestDb.Create();
-        public FakeStories Stories { get; init; } = new(Story);
+        public FakeWorkSource Stories { get; init; } = new(Story);
         public FakeWorkspaces Workspaces { get; init; } = new();
         public FakePullRequests Prs { get; init; } = new();
         public InProcessRunLocks Locks { get; } = new();
@@ -303,7 +288,9 @@ public class RunPipelineTests
         Assert.True(outcome.Succeeded);
         Assert.Equal((WorkState.Review, PrUrl, "sess-77"), (outcome.State, outcome.PullRequestUrl, outcome.SessionId));
         Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Review], await h.Transitions());
-        Assert.Equal(["worker-started", "session", "worker-done", "pushed"], await h.Steps());
+        Assert.Equal(["claimed", "worker-started", "session", "worker-done", "pushed", "linked"], await h.Steps());
+        Assert.Equal(["claim 77", "state 77 Claimed", $"link 77 {PrUrl} https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/sc-77"],
+            h.Stories.Writes);
         Assert.Equal(WorkerPid.ToString(), (await h.Rows()).Single(r => r.Step == "worker-started").Detail);
         var rows = await h.Rows();
         Assert.Equal(("sess-77", PrUrl), (rows[^1].ClaudeSessionId, rows[^1].Detail));
@@ -317,6 +304,41 @@ public class RunPipelineTests
         Assert.Equal(("factory/sc-77", "main"), (pr.Head, pr.Base));
         Assert.Contains("https://app.shortcut.com/trefry/story/77", pr.Body);
         Assert.Empty(h.Stories.Comments);
+    }
+
+    [Fact]
+    public async Task Resumed_intake_does_not_claim_again()
+    {
+        var h = new Harness();
+        var ledger = h.Ledger;
+        var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
+        await ledger.CheckpointAsync(item, RunPipeline.Steps.Claimed, null, null, CancellationToken.None);
+
+        await h.Run(new FakeWorker(Reports(Ok)));
+
+        Assert.DoesNotContain(h.Stories.Writes, w => w.StartsWith("claim") || w.StartsWith("state"));
+        Assert.Single(await h.Steps(), s => s == "claimed");
+    }
+
+    [Fact]
+    public async Task Worker_prompt_carries_the_epic_and_its_documents()
+    {
+        var h = new Harness
+        {
+            Stories = new(Story)
+            {
+                Epic = new WorkEpic(5, "Phase 1", "Build the walking skeleton.", "https://app.shortcut.com/trefry/epic/5"),
+                Documents = [new WorkDocument("Spec", "# Spec\nWork sources table.", "https://app.shortcut.com/trefry/write/d1")],
+            },
+        };
+        var worker = new FakeWorker(Reports(Ok));
+
+        await h.Run(worker);
+
+        var prompt = worker.Calls.Single().Prompt;
+        Assert.Contains("Phase 1", prompt);
+        Assert.Contains("Build the walking skeleton.", prompt);
+        Assert.Contains("Work sources table.", prompt);
     }
 
     [Fact]
@@ -550,7 +572,7 @@ public class RunPipelineTests
         Assert.DoesNotContain(rowsAtStop!, r => r.Step == "worker-started" && r.Detail == WorkerPid.ToString()); // stopped before the new worker
         var killed = (await h.Rows()).Single(r => r.Step == "orphan-killed");
         Assert.Equal("pid 999", killed.Detail);
-        Assert.Equal(["worker-started", "session", "orphan-killed", "worker-started", "worker-done", "pushed"], await h.Steps());
+        Assert.Equal(["worker-started", "session", "orphan-killed", "worker-started", "worker-done", "pushed", "linked"], await h.Steps());
     }
 
     [Fact]
@@ -592,7 +614,7 @@ public class RunPipelineTests
         Assert.Empty(worker.Calls);
         Assert.Equal(["reopen michaeltrefry/dark-factory-sandbox factory/sc-77", "restore michaeltrefry/dark-factory-sandbox factory/sc-77",
             "remove michaeltrefry/dark-factory-sandbox /wt/factory/sc-77"], h.Workspaces.Calls);
-        Assert.Equal("worktree-restored", (await h.Steps())[^1]);
+        Assert.Equal(["worktree-restored", "linked"], (await h.Steps())[^2..]);
         Assert.Single(h.Prs.Opened);
         Assert.Equal(WorkState.Review, (await h.Item()).State);
     }
@@ -613,20 +635,43 @@ public class RunPipelineTests
     }
 
     [Fact]
-    public async Task Rerun_of_a_parked_item_redoes_nothing()
+    public async Task Rerun_of_a_parked_item_redoes_nothing_and_tells_the_story_once()
     {
         var h = new Harness();
         await h.Run(new FakeWorker(Reports(Ok)));
         var rows = (await h.Rows()).Count;
+        var writes = h.Stories.Writes.Count;
         var worker = new FakeWorker();
 
         var outcome = await h.Run(worker);
+        await h.Run(worker);
 
         Assert.True(outcome.Succeeded);
         Assert.Equal((WorkState.Review, PrUrl), (outcome.State, outcome.PullRequestUrl));
         Assert.Empty(worker.Calls);
         Assert.Single(h.Prs.Opened);
-        Assert.Equal(rows, (await h.Rows()).Count);
+        Assert.Equal(writes, h.Stories.Writes.Count);
+        var comment = Assert.Single(h.Stories.Comments);
+        Assert.StartsWith("[author: dark-factory] sc-77 is Review in the factory ledger", comment);
+        Assert.Equal(rows + 1, (await h.Rows()).Count);
+        Assert.Equal(RunPipeline.Steps.HeldNotice, (await h.Rows())[^1].Step);
+    }
+
+    [Fact]
+    public async Task Refused_claim_parks_the_item_without_reporting_it_in_progress()
+    {
+        var h = new Harness { Stories = new FakeWorkSource(Story) { RefuseClaim = "the story is no longer in To Do" } };
+        var worker = new FakeWorker();
+
+        var outcome = await h.Run(worker);
+
+        Assert.False(outcome.Succeeded);
+        Assert.Equal(WorkState.Paused, outcome.State);
+        Assert.Empty(h.Stories.Writes);
+        Assert.Empty(h.Stories.Comments);
+        Assert.Empty(worker.Calls);
+        Assert.Equal([WorkState.Intake, WorkState.Paused], await h.Transitions());
+        Assert.Equal(["parked"], await h.Steps());
     }
 
     [Fact]

@@ -4,6 +4,7 @@ using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.Worker;
+using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
@@ -62,7 +63,7 @@ public sealed class LedgerPostgresTests : IAsyncLifetime
         var prs = new CountingPullRequests();
         await using var dbA = Context();
         await using var dbB = Context();
-        RunPipeline Pipeline(LedgerDbContext db) => new(new Stories(), new WorkLedger(db, TimeProvider.System),
+        RunPipeline Pipeline(LedgerDbContext db) => new(new FakeWorkSource(new WorkStory(1, "Fix", "Fix it.", "bug", "https://app.shortcut.com/t/story/1")), new WorkLedger(db, TimeProvider.System),
             new PostgresRunLocks(_cs), new Workspaces(), worker, prs, new RepoRef("acme", "widgets"), TextWriter.Null);
 
         var first = Task.Run(() => Pipeline(dbA).RunAsync(77, CancellationToken.None));
@@ -139,13 +140,6 @@ public sealed class LedgerPostgresTests : IAsyncLifetime
             }
         }
         Assert.Equal(["Intake", "Implement", "Failed"], states);
-    }
-
-    private sealed class Stories : IStorySource
-    {
-        public Task<ShortcutStory> GetStoryAsync(int id, CancellationToken ct) =>
-            Task.FromResult(new ShortcutStory(id, "Fix", "Fix it.", "bug", $"https://app.shortcut.com/t/story/{id}"));
-        public Task AddCommentAsync(int id, string text, CancellationToken ct) => Task.CompletedTask;
     }
 
     private sealed class Workspaces : IRepoWorkspace

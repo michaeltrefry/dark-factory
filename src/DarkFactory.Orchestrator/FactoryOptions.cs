@@ -53,6 +53,12 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         var other => throw new InvalidOperationException($"Worker:Auth must be 'claude-login' or 'router-key', not '{other}'."),
     };
 
+    /// <summary><c>Shortcut:Watch:Teams</c> / <c>Shortcut:Watch:Epics</c>; empty watches nothing.</summary>
+    public WatchScope WatchScope => WatchScope.From(config);
+
+    /// <summary><c>Intake:PollSeconds</c>: how often <c>factory work</c> polls the board.</summary>
+    public TimeSpan PollInterval => TimeSpan.FromSeconds(config.GetValue("Intake:PollSeconds", 60));
+
     /// <summary>Loopback port of the <c>factory work</c> host (session hub).</summary>
     public int HostPort => config.GetValue("Factory:HostPort", 47822);
 

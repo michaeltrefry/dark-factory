@@ -14,6 +14,38 @@ that one repo, and opens a PR whose body links the story. The ledger records
 The target repo is `michaeltrefry/dark-factory-sandbox` unless the story description
 has a `Repo: owner/name` line.
 
+### Intake: `factory work`
+
+`factory work` is the long-running trigger: next to the session hub, the same process polls Shortcut every `Intake:PollSeconds`
+(default 60; there is no public webhook endpoint on the Mac) and runs each ready story through
+the pipeline, one at a time. Ready means a story in the `To Do` workflow state inside the watch
+scope: any team in `Shortcut:Watch:Teams` (mention names or ids) or epic in
+`Shortcut:Watch:Epics` (ids), each comma-separated. An empty scope watches nothing; an unknown
+team or epic stops `factory work` at start-up (exit 2). Teams are listed with the documented
+limit/offset paging of `GET groups/{id}/stories`, epics with `GET epics/{id}/stories`; a 429 is
+retried after its `Retry-After`, a 502/503/504 on a GET or PUT with backoff.
+Items a previous process left mid-run (Intake or Implement in the ledger, or paused because the
+process was stopped) are resumed first, after checking their story is still in scope; one that left
+the scope is parked in Paused with one story comment. Items paused any other way are not resumed
+automatically.
+
+The board is touched only through `IWorkSource` (`WorkSources/`; Shortcut adapter in
+`Shortcut/ShortcutWorkSource.cs`). On Intake the story is claimed (owner = the token's member,
+plus a `factory-claimed` label) and moved to In Progress; when the PR opens, the PR and branch
+are added as external links. The detailed factory state stays in the ledger. Comments are led by
+`[author: dark-factory]`. Claiming re-reads the story first and writes nothing unless it is still
+in `To Do` (or already the factory's), in scope, and not labelled `factory-claimed` under another
+owner; the claim is read back after writing. A refused claim parks the item in Paused with no board
+write until the story is ready again. A story whose item sits in a state this phase does not drive
+(e.g. parked at Review) and is dragged back to `To Do` is not re-read: it gets one comment saying so.
+`factory run sc-<id>` goes through the same path and checks for one story; `--ignore-scope` skips
+only the scope checks.
+
+```sh
+export Shortcut__Watch__Teams=darkfactory
+dotnet run --project src/DarkFactory.Orchestrator -- work
+```
+
 ### Lifecycle and resume
 
 Items move through an explicit transition table (`Ledger/Lifecycle.cs`): Intake → Plan →

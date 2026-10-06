@@ -1,3 +1,4 @@
+using DarkFactory.Orchestrator.WorkSources;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
@@ -250,7 +251,7 @@ public sealed class SessionCaptureTests : IAsyncLifetime
             return new WorkerResult("sess-named", 0, false, "success", "done", "");
         });
         await using var ledgerDb = Context();
-        var outcome = await new RunPipeline(new Stories(), new WorkLedger(ledgerDb, TimeProvider.System), new PostgresRunLocks(_cs),
+        var outcome = await new RunPipeline(Stories(), new WorkLedger(ledgerDb, TimeProvider.System), new PostgresRunLocks(_cs),
             new Workspaces(), worker, new PullRequests(), new RepoRef("acme", "widgets"), TextWriter.Null, Recorder(new FakeCosts(FixtureCost)))
             .RunAsync(8, CancellationToken.None);
 
@@ -270,7 +271,7 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         var router = new HungCosts();
         var recorder = new SessionRecorder(Contexts(), router, TimeProvider.System, TextWriter.Null);
         await using var ledgerDb = Context();
-        var pipeline = new RunPipeline(new Stories(), new WorkLedger(ledgerDb, TimeProvider.System), new PostgresRunLocks(_cs),
+        var pipeline = new RunPipeline(Stories(), new WorkLedger(ledgerDb, TimeProvider.System), new PostgresRunLocks(_cs),
             new Workspaces(), worker, new PullRequests(), new RepoRef("acme", "widgets"), TextWriter.Null, recorder,
             failedSessionEndTimeout: TimeSpan.FromMilliseconds(300));
 
@@ -292,7 +293,7 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         var clock = Stopwatch.StartNew();
         var worker = new FixtureWorker(clock, firstBatch: 5);
         await using var ledgerDb = Context();
-        var pipeline = new RunPipeline(new Stories(), new WorkLedger(ledgerDb, TimeProvider.System), new PostgresRunLocks(_cs),
+        var pipeline = new RunPipeline(Stories(), new WorkLedger(ledgerDb, TimeProvider.System), new PostgresRunLocks(_cs),
             new Workspaces(), worker, new PullRequests(), new RepoRef("acme", "widgets"), TextWriter.Null,
             app.Services.GetRequiredService<SessionRecorder>());
         var run = Task.Run(() => pipeline.RunAsync(7, CancellationToken.None));
@@ -601,12 +602,8 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         public Task<bool> StopOrphanAsync(int pid, CancellationToken ct) => Task.FromResult(false);
     }
 
-    private sealed class Stories : IStorySource
-    {
-        public Task<ShortcutStory> GetStoryAsync(int id, CancellationToken ct) =>
-            Task.FromResult(new ShortcutStory(id, "List files", "List the files.", "feature", $"https://app.shortcut.com/t/story/{id}"));
-        public Task AddCommentAsync(int id, string text, CancellationToken ct) => Task.CompletedTask;
-    }
+    private static FakeWorkSource Stories() =>
+        new(new WorkStory(1, "List files", "List the files.", "feature", "https://app.shortcut.com/t/story/1"));
 
     private sealed class Workspaces : IRepoWorkspace
     {

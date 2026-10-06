@@ -99,6 +99,16 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
     /// <summary>The item's current state as stored, or null when there is no such item. Reads only.</summary>
     public async Task<WorkState?> StateOfAsync(string source, string externalId, CancellationToken ct) =>
         (await db.WorkItems.AsNoTracking().SingleOrDefaultAsync(x => x.Source == source && x.ExternalId == externalId, ct))?.State;
+    /// <summary>The item, or null if the ledger has never seen it. Nothing is written.</summary>
+    public Task<WorkItem?> FindAsync(string source, string externalId, CancellationToken ct) =>
+        db.WorkItems.SingleOrDefaultAsync(x => x.Source == source && x.ExternalId == externalId, ct);
+
+    /// <summary>The source's items currently in one of <paramref name="states"/>, oldest first.</summary>
+    public async Task<List<WorkItem>> ItemsInAsync(string source, IReadOnlySet<WorkState> states, CancellationToken ct)
+    {
+        var wanted = states.ToList();
+        return await db.WorkItems.Where(x => x.Source == source && wanted.Contains(x.State)).OrderBy(x => x.Id).ToListAsync(ct);
+    }
 
     /// <summary>Every row of the item, oldest first.</summary>
     public Task<List<LedgerEntry>> HistoryAsync(WorkItem item, CancellationToken ct) =>
