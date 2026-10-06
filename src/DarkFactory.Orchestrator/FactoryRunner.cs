@@ -14,23 +14,22 @@ namespace DarkFactory.Orchestrator;
 /// <summary>Production wiring for <c>factory run</c> and <c>factory work</c>; shared by the CLI and the acceptance harness.</summary>
 public static class FactoryRunner
 {
-    public static ShortcutWorkSource CreateWorkSource(FactoryOptions options, HttpClient shortcutHttp) =>
-        new(shortcutHttp, options.ShortcutApiToken, options.WatchScope);
+    public static IWorkSource CreateWorkSource(FactoryOptions options, HttpClient shortcutHttp) =>
+        new ShortcutWorkSource(shortcutHttp, options.ShortcutApiToken, options.WatchScope);
 
     /// <summary>
-    /// <c>factory work</c>'s start-up check: the Shortcut token resolves and every watched team and epic exists.
-    /// Returns what is wrong, or null.
+    /// <c>factory work</c>'s start-up check, through the work source (E6): its credentials resolve and every watched
+    /// team and epic exists. Returns what is wrong, or null.
     /// </summary>
-    public static async Task<string?> CheckWatchScopeAsync(FactoryOptions options, HttpClient shortcutHttp, CancellationToken ct)
+    public static async Task<string?> CheckWatchScopeAsync(FactoryOptions options, IWorkSource source, CancellationToken ct)
     {
         try
         {
-            var scope = options.WatchScope;
-            if (scope.IsEmpty)
+            if (options.WatchScope.IsEmpty)
             {
                 return null;
             }
-            await CreateWorkSource(options, shortcutHttp).ValidateScopeAsync(ct);
+            await source.ValidateScopeAsync(ct);
             return null;
         }
         catch (Exception ex) when (ex is MissingCredentialException or InvalidOperationException or HttpRequestException)
@@ -57,24 +56,28 @@ public static class FactoryRunner
 
         // Sandboxed, the worker user is single-tenant (every helper exit kills all of its processes),
         // so one sandboxed run per machine, taken before anything runs through the helper.
-        using var sandboxLock = sandbox is null ? null : WorkerLock.Acquire(options.WorkRoot);
+        using var sandboxLock = sandbox is null ? null : await FactoryWide("the worker run lock", () => Task.FromResult(WorkerLock.Acquire(options.WorkRoot)));
         if (sandbox is not null)
         {
-            await sandbox.EnsureReadyAsync(ct);
+            await FactoryWide("the worker sandbox", async () => { await sandbox.EnsureReadyAsync(ct); return true; });
         }
 
         using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
         using var routerHttp = new HttpClient { BaseAddress = options.RouterBaseUrl };
         var app = new GitHubApp(githubHttp, appId, appKey, TimeProvider.System);
 
-        await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
+        await FactoryWide("the ledger", async () => { await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct); return true; });
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
         var ledger = new WorkLedger(db, TimeProvider.System);
 
         var workspaces = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
             async (repo, c) => (await app.CreateInstallationTokenAsync(repo, c)).Token, sandbox: sandbox);
         // Worktrees no run will resume (left by a killed cleanup or a worker that would not stop).
-        await workspaces.SweepOrphansAsync((name, c) => RunPipeline.WorktreeIsResumableAsync(ledger, name, c), ct);
+        await FactoryWide("the worktree sweep", async () =>
+        {
+            await workspaces.SweepOrphansAsync((name, c) => RunPipeline.WorktreeIsResumableAsync(ledger, name, c), ct);
+            return true;
+        });
 
         var pipeline = new RunPipeline(
             source,
@@ -94,6 +97,19 @@ public static class FactoryRunner
             pauseGrace: pauseGrace);
 
         return await pipeline.RunAsync(storyId, ct);
+    }
+
+    /// <summary>Runs a set-up step every item shares; its failure is the factory's, not the item's (E10).</summary>
+    private static async Task<T> FactoryWide<T>(string what, Func<Task<T>> step)
+    {
+        try
+        {
+            return await step();
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new FactoryUnavailableException($"{what}: {ex.Message}", ex);
+        }
     }
 
     /// <summary>The ledger's controls table (Pause/Continue/Stop), shared by every process.</summary>
@@ -149,4 +165,11 @@ public sealed class FactoryItemRunner(FactoryOptions options, IWorkSource source
     }
 
     public Task<RunOutcome> RunAsync(int id, CancellationToken ct) => FactoryRunner.RunAsync(options, source, id, ignoreScope: false, log, ct);
+
+    public async Task<string?> GiveUpAsync(int id, string reason, CancellationToken ct)
+    {
+        await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
+        return await RunPipeline.GiveUpAsync(source, new WorkLedger(db, TimeProvider.System), new PostgresRunLocks(options.LedgerConnectionString),
+            id, reason, log, ct);
+    }
 }

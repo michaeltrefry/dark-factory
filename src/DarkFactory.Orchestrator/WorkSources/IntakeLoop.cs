@@ -2,6 +2,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using DarkFactory.Orchestrator.Shortcut;
 
 namespace DarkFactory.Orchestrator.WorkSources;
 
@@ -12,6 +13,14 @@ public interface IItemRunner
     Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct);
 
     Task<RunOutcome> RunAsync(int id, CancellationToken ct);
+
+    /// <summary>
+    /// Gives up on an item whose runs keep failing before its pipeline starts (E10): an item in a handled state is
+    /// escalated, a paused one parked (so it no longer auto-resumes), each with a story comment giving the reason; an
+    /// item the ledger does not know only gets the comment. Returns what was done, or null when nothing was (the item
+    /// is running or already finished). The default records nothing.
+    /// </summary>
+    Task<string?> GiveUpAsync(int id, string reason, CancellationToken ct) => Task.FromResult<string?>(null);
 }
 
 /// <summary>
@@ -23,11 +32,22 @@ public interface IItemRunner
 /// control pauses, and the pipeline itself refuses to claim a story in a paused epic. Each poll first reads the
 /// router's usage (<paramref name="usage"/>), and a usage pause wakes the loop at its resume time, so work starts
 /// again then without waiting for the next interval.
+/// A failing poll or run is shown on the dashboard (<paramref name="status"/>, E10). A factory-wide failure
+/// (<see cref="FactoryUnavailableException"/>, a ledger database error, or the poll itself) ends the poll and escalates
+/// nothing; any other failure counts against its item, and after <see cref="IntakeOptions.MaxItemFailures"/> in a row
+/// the loop gives up on the item (<see cref="IItemRunner.GiveUpAsync"/>) instead of retrying it every poll.
 /// </summary>
 public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOptions options, TimeProvider time, ILogger<IntakeLoop> logger,
-    Controls.IControls? controls = null, Router.UsageMonitor? usage = null)
+    Controls.IControls? controls = null, Router.UsageMonitor? usage = null, IntakeStatus? status = null)
     : BackgroundService
 {
+    private readonly IntakeStatus _status = status ?? new IntakeStatus(time);
+
+    /// <summary>Whether <paramref name="ex"/> is the factory's failure rather than its item's.</summary>
+    public static bool IsFactoryWide(Exception ex) =>
+        ex is FactoryUnavailableException or MissingCredentialException or System.Data.Common.DbException
+        || ex.InnerException is System.Data.Common.DbException;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         logger.LogInformation("Polling for work every {Interval}", options.PollInterval);
@@ -79,19 +99,39 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             logger.LogError(ex, "Poll failed; retrying next interval");
+            _status.FactoryFailed($"Poll failed: {ex.Message}");
             return resumeAt;
         }
+        var factoryFailed = false;
         foreach (var id in inFlight.Concat(ready).Distinct())
         {
             try
             {
                 var outcome = await runner.RunAsync(id, ct);
                 logger.LogInformation("{Item}: {State}{Error}", id, outcome.State, outcome.Error is null ? "" : $" ({outcome.Error})");
+                _status.ItemOk(id);
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested && IsFactoryWide(ex))
+            {
+                // Every other item would fail the same way: show it once, escalate nothing, try again next poll.
+                logger.LogError(ex, "Run of {Item} failed for a factory-wide reason; ending this poll", id);
+                _status.FactoryFailed($"{StoryId.Format(id)} could not run: {ex.Message}");
+                factoryFailed = true;
+                break;
             }
             catch (Exception ex) when (!ct.IsCancellationRequested)
             {
                 logger.LogError(ex, "Run of {Item} failed", id);
+                var failures = _status.ItemFailed(id, $"{ex.GetType().Name}: {ex.Message}");
+                if (failures == options.MaxItemFailures)
+                {
+                    await GiveUpAsync(id, $"{failures} runs in a row failed before the pipeline could start; last error: {ex.GetType().Name}: {ex.Message}", ct);
+                }
             }
+        }
+        if (!factoryFailed)
+        {
+            _status.FactoryOk();
         }
         // A run may have paused the factory for usage (its worker hit the limit) or the pause may have moved.
         try
@@ -104,9 +144,30 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
             return null;
         }
     }
+
+    private async Task GiveUpAsync(int id, string reason, CancellationToken ct)
+    {
+        try
+        {
+            if (await runner.GiveUpAsync(id, reason, ct) is { } what)
+            {
+                logger.LogWarning("{Item}: gave up after repeated failures ({What})", id, what);
+                _status.ItemGaveUp(id, what);
+            }
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            // Shown on the dashboard still; the next streak of failures tries again.
+            logger.LogError(ex, "Could not give up on {Item}", id);
+        }
+    }
 }
 
-public sealed record IntakeOptions(TimeSpan PollInterval);
+/// <param name="MaxItemFailures"><c>Intake:MaxItemFailures</c>: runs of one item in a row that may fail before the loop gives up on it.</param>
+public sealed record IntakeOptions(TimeSpan PollInterval, int MaxItemFailures = IntakeOptions.DefaultMaxItemFailures)
+{
+    public const int DefaultMaxItemFailures = 3;
+}
 
 public static class IntakeServiceCollectionExtensions
 {
@@ -114,7 +175,8 @@ public static class IntakeServiceCollectionExtensions
     public static IServiceCollection AddIntake(this IServiceCollection services, FactoryOptions options)
     {
         services.TryAddSingleton(TimeProvider.System);
-        services.AddSingleton(new IntakeOptions(options.PollInterval));
+        services.AddSingleton(new IntakeOptions(options.PollInterval, options.MaxItemFailures));
+        services.TryAddSingleton(sp => new IntakeStatus(sp.GetRequiredService<TimeProvider>()));
         services.AddSingleton(new Router.UsageOptions(options.UsagePollInterval));
         services.AddSingleton<Router.IUsageSource>(_ =>
             new Router.RouterClient(new HttpClient { BaseAddress = options.RouterBaseUrl }, options.RouterKey));
@@ -130,7 +192,7 @@ public static class IntakeServiceCollectionExtensions
         services.AddHostedService(sp => new IntakeLoop(
             sp.GetRequiredService<IWorkSource>(), sp.GetRequiredService<IItemRunner>(), sp.GetRequiredService<IntakeOptions>(),
             sp.GetRequiredService<TimeProvider>(), sp.GetRequiredService<ILogger<IntakeLoop>>(), sp.GetRequiredService<Controls.IControls>(),
-            sp.GetRequiredService<Router.UsageMonitor>()));
+            sp.GetRequiredService<Router.UsageMonitor>(), sp.GetRequiredService<IntakeStatus>()));
         return services;
     }
 }

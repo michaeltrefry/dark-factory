@@ -62,7 +62,7 @@ static async Task<int> WorkAsync(CancellationToken ct)
     }
     using (var shortcutHttp = new HttpClient { BaseAddress = ShortcutWorkSource.DefaultBaseAddress })
     {
-        if (await FactoryRunner.CheckWatchScopeAsync(options, shortcutHttp, ct) is { } scopeError)
+        if (await FactoryRunner.CheckWatchScopeAsync(options, FactoryRunner.CreateWorkSource(options, shortcutHttp), ct) is { } scopeError)
         {
             Console.Error.WriteLine(scopeError);
             return 2;

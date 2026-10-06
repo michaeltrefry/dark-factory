@@ -30,6 +30,11 @@ public sealed class FakeWorkSource(WorkStory story, bool commentFails = false) :
 
     public Task<bool> InScopeAsync(int id, CancellationToken ct) => Task.FromResult(InScope);
 
+    /// <summary>When set, the start-up scope check throws this.</summary>
+    public Exception? ValidateScopeFails { get; set; }
+
+    public Task ValidateScopeAsync(CancellationToken ct) => ValidateScopeFails is { } fails ? Task.FromException(fails) : Task.CompletedTask;
+
     public Task ReleaseAsync(int id, CancellationToken ct) => Write($"release {id}");
 
     /// <summary>When set, reading a story's spec throws this (the board is unreachable).</summary>

@@ -571,4 +571,13 @@ public class ControlTests
     [InlineData("item:nope", false)]
     [InlineData("everything", false)]
     public void Scopes_are_validated(string scope, bool valid) => Assert.Equal(valid, ControlScope.IsValid(scope));
+
+    [Fact]
+    public async Task Refused_scope_names_every_valid_scope_including_usage()
+    {
+        // Refused before the ledger is opened, so no database is needed.
+        var controls = new LedgerControls(null!, TimeProvider.System);
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() => controls.SetAsync("everything", ControlState.Paused, "tester", CancellationToken.None));
+        Assert.Contains("(factory, usage, epic:<id> or item:sc-<id>)", ex.Message);
+    }
 }

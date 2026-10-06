@@ -50,6 +50,7 @@ sealed class FileStories(string commentsPath) : IWorkSource
     public Task<IReadOnlyList<int>> ListReadyAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<int>>([]);
     public Task<ClaimResult> ClaimAsync(int id, bool ignoreScope, CancellationToken ct) => Task.FromResult(ClaimResult.Ok);
     public Task<bool> InScopeAsync(int id, CancellationToken ct) => Task.FromResult(true);
+    public Task ValidateScopeAsync(CancellationToken ct) => Task.CompletedTask;
     public Task ReleaseAsync(int id, CancellationToken ct) => Task.CompletedTask;
     public Task ReportStateAsync(int id, BoardState state, string? comment, CancellationToken ct) => Task.CompletedTask;
     public Task LinkAsync(int id, IReadOnlyList<string> urls, CancellationToken ct) => Task.CompletedTask;

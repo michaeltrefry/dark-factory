@@ -38,6 +38,9 @@ public class IntakeLoopTests
             return outcome;
         }
 
+        public Task<string?> GiveUpAsync(int id, string reason, CancellationToken ct) =>
+            RunPipeline.GiveUpAsync(source, Ledger, Locks, id, reason, TextWriter.Null, ct);
+
         public async Task<WorkItem> Item() => await Db.WorkItems.AsNoTracking().SingleAsync();
         public async Task<List<LedgerEntry>> Rows() => await Db.LedgerEntries.AsNoTracking().OrderBy(e => e.Id).ToListAsync();
     }
@@ -111,6 +114,8 @@ public class IntakeLoopTests
         var hosted = app.Services.GetServices<Microsoft.Extensions.Hosting.IHostedService>().ToList();
         Assert.Contains(hosted, s => s is DarkFactory.Orchestrator.Sessions.SessionEventRelay);
         Assert.Contains(hosted, s => s is IntakeLoop);
+        // Watches usage while a long item run holds up the intake loop: the same instance the loop reads at each poll.
+        Assert.Contains(hosted, s => ReferenceEquals(s, app.Services.GetRequiredService<DarkFactory.Orchestrator.Router.UsageMonitor>()));
     }
 
     [Fact]
@@ -424,6 +429,7 @@ public class IntakeLoopTests
         public Task<IReadOnlyList<int>> ListReadyAsync(CancellationToken ct) => Task.FromResult(ready());
         public Task<ClaimResult> ClaimAsync(int id, bool ignoreScope, CancellationToken ct) => throw new NotSupportedException();
         public Task<bool> InScopeAsync(int id, CancellationToken ct) => throw new NotSupportedException();
+        public Task ValidateScopeAsync(CancellationToken ct) => throw new NotSupportedException();
         public Task ReleaseAsync(int id, CancellationToken ct) => throw new NotSupportedException();
         public Task<WorkSpec> ReadSpecAsync(int id, CancellationToken ct) => throw new NotSupportedException();
         public Task ReportStateAsync(int id, BoardState state, string? comment, CancellationToken ct) => throw new NotSupportedException();
@@ -444,10 +450,180 @@ public class IntakeLoopTests
     }
 
     [Fact]
-    public async Task Failed_listing_skips_the_poll_without_throwing()
+    public async Task Failed_listing_skips_the_poll_without_throwing_and_shows_as_a_factory_error()
     {
         var runner = new ScriptedRunner([]);
-        await Loop(new ScriptedSource(() => throw new HttpRequestException("Shortcut down")), runner).PollOnceAsync(CancellationToken.None);
+        var status = new IntakeStatus(TimeProvider.System);
+        await Loop(new ScriptedSource(() => throw new HttpRequestException("Shortcut down")), runner, status).PollOnceAsync(CancellationToken.None);
         Assert.Empty(runner.Runs);
+        Assert.Contains("Shortcut down", status.FactoryError?.Message);
+    }
+
+    // ---- Runs that fail before the pipeline starts (E10): counted per item, given up on, shown on the dashboard. ----
+
+    private static IntakeLoop Loop(IWorkSource source, IItemRunner runner, IntakeStatus status, int maxFailures = 3) =>
+        new(source, runner, new IntakeOptions(Interval, maxFailures), TimeProvider.System, NullLogger<IntakeLoop>.Instance, status: status);
+
+    /// <summary>Story 101's item, left in <paramref name="state"/> (via Implement) by an earlier process.</summary>
+    private static async Task<PipelineRunner> LeftIn(FakeWorkSource source, WorkState state)
+    {
+        var runner = new PipelineRunner(source);
+        var item = await runner.Ledger.GetOrCreateAsync(RunPipeline.Source, "sc-101", "s", Sandbox.FullName, null, CancellationToken.None);
+        await runner.Ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
+        if (state == WorkState.Paused)
+        {
+            await runner.Ledger.RecordAsync(item, WorkState.Paused, null, RunPipeline.Interrupted, CancellationToken.None);
+        }
+        return runner;
+    }
+
+    private static FakeWorkSource GoneStory() => new(new WorkStory(101, "s", null, "chore", "https://app.shortcut.com/t/story/101"))
+    {
+        ReadSpecFails = new InvalidOperationException("Shortcut GET stories/101 failed: 404 Not Found"),
+    };
+
+    [Fact]
+    public async Task Item_whose_runs_keep_failing_before_the_pipeline_is_escalated_once_after_the_configured_failures()
+    {
+        var source = GoneStory();
+        var runner = await LeftIn(source, WorkState.Implement);
+        var status = new IntakeStatus(TimeProvider.System);
+        var loop = Loop(source, runner, status);
+
+        await loop.PollOnceAsync(CancellationToken.None);
+        await loop.PollOnceAsync(CancellationToken.None);
+
+        Assert.Equal(WorkState.Implement, (await runner.Item()).State);
+        Assert.Empty(source.Comments);
+        Assert.Equal(2, status.ItemErrors[101].Count);
+        Assert.Contains("404", status.ItemErrors[101].Message);
+        Assert.Null(status.ItemErrors[101].GaveUp);
+        Assert.Null(status.FactoryError);
+
+        await loop.PollOnceAsync(CancellationToken.None);
+
+        Assert.Equal(WorkState.Escalated, (await runner.Item()).State);
+        var escalated = (await runner.Rows()).Last(r => r.Step is null);
+        Assert.Contains("3 runs in a row", escalated.Detail);
+        Assert.Contains("404", escalated.Detail);
+        Assert.Contains("escalated", Assert.Single(source.Comments));
+        Assert.Contains("404", source.Comments[0]);
+        Assert.Equal("escalated", status.ItemErrors[101].GaveUp);
+
+        // No longer in flight: the next poll leaves it alone.
+        await loop.PollOnceAsync(CancellationToken.None);
+        Assert.Equal(3, status.ItemErrors[101].Count);
+        Assert.Single(source.Comments);
+    }
+
+    [Fact]
+    public async Task Paused_item_whose_resume_keeps_failing_is_parked_with_a_comment_and_no_longer_resumes()
+    {
+        var source = GoneStory();
+        var runner = await LeftIn(source, WorkState.Paused);
+        var status = new IntakeStatus(TimeProvider.System);
+        var loop = Loop(source, runner, status, maxFailures: 2);
+
+        await loop.PollOnceAsync(CancellationToken.None);
+        await loop.PollOnceAsync(CancellationToken.None);
+
+        Assert.Equal(WorkState.Paused, (await runner.Item()).State);
+        Assert.Contains("2 runs in a row", (await runner.Rows()).Single(r => r.Step == RunPipeline.Steps.Parked).Detail);
+        Assert.Contains("parked", Assert.Single(source.Comments));
+        Assert.Equal("parked", status.ItemErrors[101].GaveUp);
+        Assert.Empty(await runner.InFlightAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Item_that_runs_again_is_cleared_and_its_failures_start_over()
+    {
+        var source = GoneStory();
+        var runner = await LeftIn(source, WorkState.Implement);
+        var status = new IntakeStatus(TimeProvider.System);
+        var loop = Loop(source, runner, status);
+        await loop.PollOnceAsync(CancellationToken.None);
+        await loop.PollOnceAsync(CancellationToken.None);
+
+        source.ReadSpecFails = null;
+        await loop.PollOnceAsync(CancellationToken.None);
+
+        Assert.Equal(WorkState.Review, (await runner.Item()).State);
+        Assert.Empty(status.ItemErrors);
+        Assert.Empty(source.Comments);
+    }
+
+    /// <summary>Runs throw <see cref="Throws"/>'s exception for the item; records give-ups.</summary>
+    private sealed class ThrowingRunner(IReadOnlyList<int> inFlight, Func<int, Exception?> throws) : IItemRunner
+    {
+        public List<int> Runs { get; } = [];
+        public List<int> GaveUp { get; } = [];
+        public Func<int, Exception?> Throws { get; set; } = throws;
+        public Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct) => Task.FromResult(inFlight);
+        public Task<RunOutcome> RunAsync(int id, CancellationToken ct)
+        {
+            Runs.Add(id);
+            return Throws(id) is { } ex ? Task.FromException<RunOutcome>(ex) : Task.FromResult(new RunOutcome(1, WorkState.Review, null, null, null));
+        }
+        public Task<string?> GiveUpAsync(int id, string reason, CancellationToken ct)
+        {
+            GaveUp.Add(id);
+            return Task.FromResult<string?>("escalated");
+        }
+    }
+
+    [Fact]
+    public async Task Factory_wide_failure_ends_the_poll_shows_one_factory_error_and_escalates_no_item()
+    {
+        var runner = new ThrowingRunner([5, 6], _ => new FactoryUnavailableException(
+            "the worker run lock: Another factory run is using /w", new InvalidOperationException("locked")));
+        var status = new IntakeStatus(TimeProvider.System);
+        var loop = Loop(new ScriptedSource(() => [7]), runner, status);
+
+        for (var i = 0; i < 4; i++)
+        {
+            await loop.PollOnceAsync(CancellationToken.None);
+        }
+
+        Assert.Equal([5, 5, 5, 5], runner.Runs); // the rest would fail the same way
+        Assert.Empty(runner.GaveUp);
+        Assert.Empty(status.ItemErrors);
+        Assert.Equal(4, status.FactoryError!.Count);
+        Assert.Contains("Another factory run", status.FactoryError.Message);
+
+        runner.Throws = _ => null;
+        await loop.PollOnceAsync(CancellationToken.None);
+        Assert.Null(status.FactoryError);
+    }
+
+    [Fact]
+    public void Ledger_and_credential_failures_are_the_factorys_and_others_the_items()
+    {
+        Assert.True(IntakeLoop.IsFactoryWide(new FactoryUnavailableException("x", new Exception())));
+        Assert.True(IntakeLoop.IsFactoryWide(new Npgsql.NpgsqlException("ledger down")));
+        Assert.True(IntakeLoop.IsFactoryWide(new InvalidOperationException("transient", new Npgsql.NpgsqlException("ledger down"))));
+        Assert.True(IntakeLoop.IsFactoryWide(new MissingCredentialException("no router key")));
+        Assert.False(IntakeLoop.IsFactoryWide(new InvalidOperationException("Shortcut GET stories/101 failed: 404 Not Found")));
+    }
+
+    [Fact]
+    public async Task Run_set_up_failures_every_item_shares_are_factory_wide()
+    {
+        var root = Directory.CreateTempSubdirectory("df-intake-lock-").FullName;
+        var options = new FactoryOptions(new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Router:Key"] = "rk",
+            ["GitHub:AppId"] = "1",
+            ["GitHub:PrivateKeyPem"] = "pem",
+            ["Factory:WorkRoot"] = root,
+            // Never reached (the lock below is held), and never the real sandbox user or helper.
+            ["Worker:RunAs"] = "df-test-no-such-user",
+            ["Worker:LaunchHelper"] = "/nonexistent/df-test-helper",
+        }).Build(), new InMemorySecrets());
+
+        using var held = WorkerLock.Acquire(root); // another sandboxed run holds the work root
+        var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
+            FactoryRunner.RunAsync(options, GoneStory(), 101, ignoreScope: false, TextWriter.Null, CancellationToken.None));
+        Assert.Contains("only one worker may run at a time", ex.Message);
+        Assert.True(IntakeLoop.IsFactoryWide(ex));
     }
 }

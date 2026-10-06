@@ -896,6 +896,59 @@ public sealed class RunPipeline(
             : null;
     }
 
+    /// <summary>
+    /// <c>factory work</c> gives up on an item whose runs keep failing before the pipeline starts (E10; see
+    /// <see cref="IItemRunner.GiveUpAsync"/>): under the item's run lock, an item in a handled state is escalated with
+    /// the usual escalation comment; a paused one (which may not escalate) is parked with a comment, so it no longer
+    /// resumes by itself; an item the ledger does not know gets only the comment. Returns what was done, or null.
+    /// </summary>
+    public static async Task<string?> GiveUpAsync(IWorkSource source, WorkLedger ledger, IRunLocks locks, int storyId, string reason,
+        TextWriter log, CancellationToken ct)
+    {
+        var id = StoryId.Format(storyId);
+        var known = await ledger.FindAsync(Source, id, ct);
+        if (known is null)
+        {
+            await source.CommentAsync(storyId,
+                $"{id}: the factory could not start work on this story; a human needs to look. Reason: {reason}", ct);
+            log.WriteLine($"[intake] {id}: {reason}; commented");
+            return "commented";
+        }
+        await using var runLock = await locks.TryAcquireAsync(known.Id, ct);
+        if (runLock is null)
+        {
+            return null;
+        }
+        await ledger.RefreshAsync(known, known.Title, known.Repo, known.EpicId, ct);
+        if (HandledStates.Contains(known.State))
+        {
+            var history = await ledger.HistoryAsync(known, ct);
+            var session = history.LastOrDefault(e => e.ClaudeSessionId is not null)?.ClaudeSessionId;
+            await ledger.RecordAsync(known, WorkState.Escalated, session, reason, ct);
+            log.WriteLine($"[escalated] {id}: {reason}");
+            var commentError = await PostEscalationCommentAsync(source, ledger, log, known, storyId, ct);
+            return commentError is null ? "escalated" : $"escalated; {EscalationCommentNotPosted(commentError)}";
+        }
+        if (known.State == WorkState.Paused)
+        {
+            await ledger.CheckpointAsync(known, Steps.Parked, null, reason, ct);
+            log.WriteLine($"[paused] {id} parked: {reason}");
+            try
+            {
+                await source.CommentAsync(storyId,
+                    $"{id} is paused and the factory could not resume it, so it parked it; a human needs to look. Reason: {reason}\n\n"
+                    + $"Re-run with `factory run {id}` once resolved.", ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                log.WriteLine($"[paused] could not comment on {id}: {ex.Message}");
+                return $"parked; comment NOT posted: {ex.Message}";
+            }
+            return "parked";
+        }
+        return null;
+    }
+
     /// <summary>Records Escalated and comments on the story. Returns why the comment failed, or null.</summary>
     private async Task<string?> EscalateAsync(Run run, string reason)
     {
@@ -919,10 +972,12 @@ public sealed class RunPipeline(
     /// Comments the item's latest escalation (reason, the ledger state before it, session) on the
     /// story and checkpoints the result. Returns why the comment failed, or null.
     /// </summary>
-    private async Task<string?> PostEscalationCommentAsync(Run run, CancellationToken ct)
+    private Task<string?> PostEscalationCommentAsync(Run run, CancellationToken ct) =>
+        PostEscalationCommentAsync(source, ledger, log, run.Item, run.Story.Id, ct);
+
+    private static async Task<string?> PostEscalationCommentAsync(IWorkSource source, WorkLedger ledger, TextWriter log, WorkItem item, int storyId,
+        CancellationToken ct)
     {
-        var (spec, _, item) = run;
-        var story = spec.Story;
         var history = await ledger.HistoryAsync(item, ct);
         var at = history.FindLastIndex(e => e.Step is null && e.State == WorkState.Escalated);
         var (escalated, last) = (history[at], history[at - 1]);
@@ -930,22 +985,22 @@ public sealed class RunPipeline(
         var lastState = $"{last.State}{(last.Step is null ? "" : $" (after step {last.Step})")} at {last.RecordedAt:u}";
 
         var comment = $"""
-            [author: dark-factory] {StoryId.Format(story.Id)} escalated; a human needs to look.
+            [author: dark-factory] {StoryId.Format(storyId)} escalated; a human needs to look.
 
             Reason: {reason}
             Last ledger state: {lastState}
             Claude session: {session ?? "none"}
 
-            Re-run with `factory run {StoryId.Format(story.Id)}` once resolved.
+            Re-run with `factory run {StoryId.Format(storyId)}` once resolved.
             """;
         try
         {
-            await source.CommentAsync(story.Id, comment, ct);
+            await source.CommentAsync(storyId, comment, ct);
         }
         catch (Exception ex)
         {
             await ledger.CheckpointAsync(item, Steps.EscalationComment, session, $"failed: {ex.Message}", CancellationToken.None);
-            log.WriteLine($"[escalated] could not comment on {StoryId.Format(story.Id)}: {ex.Message}; `factory run {StoryId.Format(story.Id)}` retries it");
+            log.WriteLine($"[escalated] could not comment on {StoryId.Format(storyId)}: {ex.Message}; `factory run {StoryId.Format(storyId)}` retries it");
             return ex.Message;
         }
         await ledger.CheckpointAsync(item, Steps.EscalationComment, session, "posted", CancellationToken.None);

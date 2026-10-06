@@ -211,7 +211,7 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
     {
         if (!ControlScope.IsValid(scope))
         {
-            throw new ArgumentException($"'{scope}' is not a control scope (factory, epic:<id> or item:sc-<id>).", nameof(scope));
+            throw new ArgumentException($"'{scope}' is not a control scope (factory, usage, epic:<id> or item:sc-<id>).", nameof(scope));
         }
         if (state == ControlState.Stopping && ControlScope.ItemStory(scope) is null)
         {

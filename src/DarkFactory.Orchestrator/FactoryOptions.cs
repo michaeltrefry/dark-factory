@@ -59,6 +59,11 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     /// <summary><c>Intake:PollSeconds</c>: how often <c>factory work</c> polls the board.</summary>
     public TimeSpan PollInterval => TimeSpan.FromSeconds(config.GetValue("Intake:PollSeconds", 60));
 
+    /// <summary><c>Intake:MaxItemFailures</c>: runs of one item in a row that may fail before <c>factory work</c> gives up on it (E10).</summary>
+    public int MaxItemFailures => config.GetValue("Intake:MaxItemFailures", WorkSources.IntakeOptions.DefaultMaxItemFailures) is var n && n > 0
+        ? n
+        : throw new InvalidOperationException("Intake:MaxItemFailures must be at least 1.");
+
     /// <summary><c>Usage:PollSeconds</c>: how often <c>factory work</c> reads the router's subscription usage.</summary>
     public TimeSpan UsagePollInterval => TimeSpan.FromSeconds(config.GetValue("Usage:PollSeconds", 60));
 
