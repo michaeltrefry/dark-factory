@@ -116,3 +116,29 @@ public class RouterClientTests
         Assert.Null(await client.GetSessionCostAsync("nope", CancellationToken.None));
     }
 }
+
+public class MacKeychainTests
+{
+    private const string Pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEsecretkeymaterial\n-----END RSA PRIVATE KEY-----\n";
+
+    [Fact]
+    public void Set_command_sends_the_secret_on_stdin_never_in_argv()
+    {
+        var (args, stdin) = MacKeychain.BuildSetCommand(SecretAccounts.GitHubAppPrivateKey, Pem);
+        var encoded = "b64:" + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(Pem));
+
+        Assert.Equal(["-i"], args); // nothing but the interactive flag: the secret cannot be in argv
+        Assert.Equal($"add-generic-password -U -s dark-factory -a github-app-private-key -w {encoded}\n", stdin);
+    }
+
+    [Theory]
+    [InlineData("has space")]
+    [InlineData("a\nfind-generic-password")]
+    [InlineData("")]
+    public void Set_command_rejects_account_names_that_would_break_the_stdin_line(string account) =>
+        Assert.Throws<ArgumentException>(() => MacKeychain.BuildSetCommand(account, "v"));
+
+    [Fact]
+    public void Set_command_rejects_values_too_long_for_security_interactive_mode() =>
+        Assert.Throws<ArgumentException>(() => MacKeychain.BuildSetCommand("router-key", new string('k', 2800)));
+}

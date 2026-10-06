@@ -13,6 +13,11 @@ public sealed record RepoRef(string Owner, string Name)
         {
             throw new ArgumentException($"Expected owner/name, got '{fullName}'.", nameof(fullName));
         }
+        // Owner and name become path segments under the work root; "." / ".." / dot-prefixed would escape or hide.
+        if (parts.Any(p => p.TrimStart().StartsWith('.')))
+        {
+            throw new ArgumentException($"Repo owner and name may not start with '.', got '{fullName}'.", nameof(fullName));
+        }
         return new RepoRef(parts[0], parts[1]);
     }
 

@@ -12,7 +12,13 @@ public interface IRepoWorkspace
 
     /// <summary>Commits any worker changes and pushes the branch. Returns false when there is nothing to push.</summary>
     Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, CancellationToken ct);
+
+    /// <summary>Removes a story's worktree; the clone and any pushed branch stay.</summary>
+    Task RemoveAsync(RepoRef repo, Workspace workspace, CancellationToken ct);
 }
+
+/// <summary>Runs one git command in <paramref name="cwd"/> with extra environment (null for none).</summary>
+public delegate Task<string> GitCommand(string cwd, IReadOnlyDictionary<string, string>? env, IReadOnlyList<string> args, CancellationToken ct);
 
 /// <summary>
 /// Keeps one clone per target repo under the work root and gives each story its
@@ -20,9 +26,15 @@ public interface IRepoWorkspace
 /// with an installation token passed through git's environment-based config, so
 /// the token never appears in argv, remotes or files.
 /// </summary>
-public sealed class GitWorkspace(string workRoot, Func<RepoRef, string> remoteUrl, Func<RepoRef, CancellationToken, Task<string?>> token)
+public sealed class GitWorkspace(
+    string workRoot,
+    Func<RepoRef, string> remoteUrl,
+    Func<RepoRef, CancellationToken, Task<string?>> token,
+    GitCommand? git = null)
     : IRepoWorkspace
 {
+    private readonly GitCommand _git = git ?? RunGitAsync;
+
     public const string BranchPrefix = "factory/";
     private const string CommitterName = "dark-factory[bot]";
     private const string CommitterEmail = "dark-factory@users.noreply.github.com";
@@ -42,7 +54,7 @@ public sealed class GitWorkspace(string workRoot, Func<RepoRef, string> remoteUr
         else
         {
             await Git(clone, auth, ct, "fetch", "--prune", "origin");
-            await Git(clone, null, ct, "remote", "set-head", "origin", "--auto");
+            await Git(clone, auth, ct, "remote", "set-head", "origin", "--auto");
         }
 
         var baseBranch = (await Git(clone, null, ct, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"))
@@ -78,6 +90,16 @@ public sealed class GitWorkspace(string workRoot, Func<RepoRef, string> remoteUr
         return true;
     }
 
+    public async Task RemoveAsync(RepoRef repo, Workspace workspace, CancellationToken ct)
+    {
+        var clone = Path.Combine(workRoot, "repos", repo.Owner, repo.Name);
+        if (Directory.Exists(workspace.Path))
+        {
+            await Git(clone, null, ct, "worktree", "remove", "--force", workspace.Path);
+        }
+        await Git(clone, null, ct, "worktree", "prune");
+    }
+
     private static void EnsureFactoryBranch(string branch)
     {
         if (!branch.StartsWith(BranchPrefix, StringComparison.Ordinal))
@@ -105,7 +127,10 @@ public sealed class GitWorkspace(string workRoot, Func<RepoRef, string> remoteUr
         };
     }
 
-    private static async Task<string> Git(string cwd, Dictionary<string, string>? env, CancellationToken ct, params string[] args)
+    private Task<string> Git(string cwd, Dictionary<string, string>? env, CancellationToken ct, params string[] args) =>
+        _git(cwd, env, args, ct);
+
+    public static async Task<string> RunGitAsync(string cwd, IReadOnlyDictionary<string, string>? env, IReadOnlyList<string> args, CancellationToken ct)
     {
         var psi = new ProcessStartInfo("git")
         {
@@ -119,7 +144,7 @@ public sealed class GitWorkspace(string workRoot, Func<RepoRef, string> remoteUr
             psi.ArgumentList.Add(a);
         }
         psi.Environment["GIT_TERMINAL_PROMPT"] = "0";
-        foreach (var (k, v) in env ?? [])
+        foreach (var (k, v) in env ?? new Dictionary<string, string>())
         {
             psi.Environment[k] = v;
         }

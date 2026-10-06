@@ -36,9 +36,10 @@ public sealed class RunPipeline(
         log.WriteLine($"[intake] {StoryId.Format(storyId)} \"{story.Name}\" -> {repo}");
 
         string? sessionId = null;
+        Workspace? workspace = null;
         try
         {
-            var workspace = await workspaces.PrepareAsync(repo, StoryId.BranchName(storyId), ct);
+            workspace = await workspaces.PrepareAsync(repo, StoryId.BranchName(storyId), ct);
             log.WriteLine($"[implement] worktree {workspace.Path} on {workspace.Branch}");
 
             var result = await worker.RunAsync(workspace.Path, BuildPrompt(story, repo), ct);
@@ -61,7 +62,25 @@ public sealed class RunPipeline(
             log.WriteLine($"[review] {prUrl}");
             return new RunOutcome(item.Id, sessionId, prUrl, null);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (OperationCanceledException)
+        {
+            // Ctrl-C: still leave a terminal row and no worktree behind, then let the cancellation propagate.
+            await ledger.RecordAsync(item, WorkState.Failed, sessionId, "cancelled", CancellationToken.None);
+            log.WriteLine("[failed] cancelled");
+            if (workspace is not null)
+            {
+                try
+                {
+                    await workspaces.RemoveAsync(repo, workspace, CancellationToken.None);
+                }
+                catch (Exception cleanup)
+                {
+                    log.WriteLine($"[failed] could not remove worktree {workspace.Path}: {cleanup.Message}");
+                }
+            }
+            throw;
+        }
+        catch (Exception ex)
         {
             await ledger.RecordAsync(item, WorkState.Failed, sessionId, ex.Message, CancellationToken.None);
             log.WriteLine($"[failed] {ex.Message}");

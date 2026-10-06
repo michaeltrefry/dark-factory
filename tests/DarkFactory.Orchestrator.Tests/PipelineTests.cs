@@ -65,16 +65,41 @@ public class RunPipelineTests
             Calls.Add($"push {repo} {workspace.Branch} {message}");
             return Task.FromResult(hasChanges);
         }
+        public Task RemoveAsync(RepoRef repo, Workspace workspace, CancellationToken ct)
+        {
+            Calls.Add($"remove {repo} {workspace.Path}");
+            return Task.CompletedTask;
+        }
     }
 
-    private sealed class FakeWorker(WorkerResult result) : IWorker
+    private sealed class FakeWorker(WorkerResult result, Exception? throws = null) : IWorker
     {
         public string? Prompt { get; private set; }
         public Task<WorkerResult> RunAsync(string workingDirectory, string prompt, CancellationToken ct)
         {
             Prompt = prompt;
-            return Task.FromResult(result);
+            return throws is null ? Task.FromResult(result) : Task.FromException<WorkerResult>(throws);
         }
+    }
+
+    [Fact]
+    public async Task Cancelled_worker_records_failed_row_removes_worktree_and_rethrows()
+    {
+        var db = TestDb.Create();
+        var ws = new FakeWorkspaces(hasChanges: true);
+        var prs = new FakePullRequests();
+        var pipeline = new RunPipeline(new FakeStories(Story), new WorkLedger(db, TimeProvider.System), ws,
+            new FakeWorker(Ok, new OperationCanceledException()), prs, Sandbox, TextWriter.Null);
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() => pipeline.RunAsync(77, CancellationToken.None));
+
+        var rows = await db.LedgerEntries.OrderBy(e => e.Id).ToListAsync();
+        Assert.Equal([WorkState.Intake, WorkState.Failed], rows.Select(r => r.State));
+        Assert.Equal("cancelled", rows[^1].Detail);
+        Assert.Equal(WorkState.Failed, (await db.WorkItems.SingleAsync()).State);
+        Assert.Equal(["prepare michaeltrefry/dark-factory-sandbox factory/sc-77",
+            "remove michaeltrefry/dark-factory-sandbox /wt/factory/sc-77"], ws.Calls);
+        Assert.Empty(prs.Opened);
     }
 
     private sealed class FakePullRequests : IPullRequests

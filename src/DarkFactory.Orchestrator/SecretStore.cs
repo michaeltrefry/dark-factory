@@ -40,13 +40,37 @@ public sealed class MacKeychain : ISecretStore
         {
             throw new PlatformNotSupportedException("The keychain secret store requires macOS.");
         }
-        var encoded = Base64Prefix + Convert.ToBase64String(Encoding.UTF8.GetBytes(value));
-        var (exit, _) = Run("add-generic-password", "-U", "-s", SecretAccounts.Service, "-a", account, "-w", encoded);
+        var (args, stdin) = BuildSetCommand(account, value);
+        var (exit, _) = Run(stdin, args);
         if (exit != 0)
         {
             throw new InvalidOperationException($"security add-generic-password failed for '{account}' (exit {exit}).");
         }
     }
+
+    /// <summary>
+    /// <c>security -i</c> reads the add command from stdin, so the secret never appears in
+    /// argv (visible to <c>ps</c>). The base64 value and account need no quoting.
+    /// </summary>
+    public static (string[] Args, string Stdin) BuildSetCommand(string account, string value)
+    {
+        if (account.Length == 0 || !account.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_'))
+        {
+            throw new ArgumentException($"Invalid keychain account name '{account}'.", nameof(account));
+        }
+        var encoded = Base64Prefix + Convert.ToBase64String(Encoding.UTF8.GetBytes(value));
+        var line = $"add-generic-password -U -s {SecretAccounts.Service} -a {account} -w {encoded}\n";
+        if (line.Length > MaxInteractiveLine)
+        {
+            throw new ArgumentException(
+                $"Secret for '{account}' is too long for `security -i` ({line.Length} > {MaxInteractiveLine} chars).", nameof(value));
+        }
+        return (["-i"], line);
+    }
+
+    // `security -i` drops lines over its ~4 KiB input buffer (3728 chars measured OK, 4228 rejected).
+    // A 2048-bit GitHub App PEM encodes to about 2.3 KiB.
+    public const int MaxInteractiveLine = 3700;
 
     // Values written by this class carry a "b64:" prefix; values the owner adds by
     // hand with `security add-generic-password -w <value>` are plain text.
@@ -57,10 +81,13 @@ public sealed class MacKeychain : ISecretStore
             ? Encoding.UTF8.GetString(Convert.FromBase64String(stored[Base64Prefix.Length..]))
             : stored;
 
-    private static (int Exit, string Stdout) Run(params string[] args)
+    private static (int Exit, string Stdout) Run(params string[] args) => Run(null, args);
+
+    private static (int Exit, string Stdout) Run(string? stdin, string[] args)
     {
         var psi = new ProcessStartInfo("/usr/bin/security")
         {
+            RedirectStandardInput = stdin is not null,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
         };
@@ -69,6 +96,11 @@ public sealed class MacKeychain : ISecretStore
             psi.ArgumentList.Add(a);
         }
         using var p = Process.Start(psi)!;
+        if (stdin is not null)
+        {
+            p.StandardInput.Write(stdin);
+            p.StandardInput.Close();
+        }
         var stdout = p.StandardOutput.ReadToEnd();
         p.StandardError.ReadToEnd();
         p.WaitForExit();

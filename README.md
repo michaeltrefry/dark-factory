@@ -14,6 +14,10 @@ that one repo, and opens a PR whose body links the story. The ledger records
 The target repo is `michaeltrefry/dark-factory-sandbox` unless the story description
 has a `Repo: owner/name` line.
 
+**Security caveat:** until worker isolation (story S4) lands, workers run as the owner's
+macOS user and can reach the owner's keychain and gh/git credentials, so only run
+`factory run` against the sandbox repo with trusted stories.
+
 ### Build and test
 
 ```sh

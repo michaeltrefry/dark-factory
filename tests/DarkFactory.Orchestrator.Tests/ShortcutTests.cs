@@ -48,6 +48,24 @@ public class RepoResolverTests
     [InlineData("- Repo: acme/widgets")]
     public void Repo_line_overrides_default(string description) =>
         Assert.Equal(new RepoRef("acme", "widgets"), RepoResolver.Resolve(description, Default));
+
+    [Theory]
+    [InlineData("Repo: ../widgets")]
+    [InlineData("Repo: acme/..")]
+    [InlineData("Repo: ./widgets")]
+    [InlineData("Repo: acme/.")]
+    [InlineData("Repo: .hidden/widgets")]
+    [InlineData("Repo: acme/.git")]
+    public void Repo_line_with_dot_segments_is_rejected(string description) =>
+        Assert.Throws<ArgumentException>(() => RepoResolver.Resolve(description, Default));
+
+    [Theory]
+    [InlineData("..")]
+    [InlineData("../x")]
+    [InlineData("x/..")]
+    [InlineData(" ../x")]
+    public void Parse_rejects_dot_segments(string fullName) =>
+        Assert.Throws<ArgumentException>(() => RepoRef.Parse(fullName));
 }
 
 public class ShortcutClientTests

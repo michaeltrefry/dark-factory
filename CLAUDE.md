@@ -44,10 +44,16 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Worker:Auth` | `claude-login` (worker's own Claude login, router passes it through) or `router-key` (router key as Claude's API key; router needs BYOK provider keys) |
 | `Worker:TimeoutMinutes` | `30` |
 
+> **Until worker user isolation (S4, sc-25175) lands, workers run as the owner's macOS user.**
+> The `dotnet build`/`dotnet test` tools run worker-written code with the owner's HOME, so it can reach
+> the `dark-factory` keychain items and the owner's gh/git credentials. Only run `factory run` against the
+> sandbox repo with trusted stories.
+
 ## Invariants (epic E1–E4)
 
 - Workers get only the router URL + router key; the worker env is an allowlist (`ClaudeWorker.BuildEnvironment`).
 - Every state change is a committed ledger row before the next step (`WorkLedger.RecordAsync`).
-- Only the orchestrator pushes, only to `factory/*`, with a repo-scoped GitHub App installation token
-  passed via git env config (never argv/remote URLs). Nothing merges.
+- The orchestrator pushes only to `factory/*`, with a repo-scoped GitHub App installation token passed
+  via git env config (never argv/remote URLs/.git/config) on every network git call. Nothing merges.
+  Workers get no git/gh tools, but see the S4 caveat above: they are not yet sandboxed from the owner's credentials.
 - Tests: xunit.v3 on Microsoft.Testing.Platform (`global.json` opts in).
