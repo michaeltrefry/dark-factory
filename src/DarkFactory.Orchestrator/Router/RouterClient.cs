@@ -10,8 +10,15 @@ public sealed record SessionCost(
     [property: JsonPropertyName("request_count")] long RequestCount,
     [property: JsonPropertyName("actual_cost_usd_micros")] long ActualCostUsdMicros);
 
+/// <summary>Where a session's spend comes from (E9).</summary>
+public interface ISessionCostSource
+{
+    /// <summary>Returns null while no cost is committed for the session yet.</summary>
+    Task<SessionCost?> GetSessionCostAsync(string sessionId, CancellationToken ct);
+}
+
 /// <summary>Reads the Weave router's committed cost for a Claude Code session id.</summary>
-public sealed class RouterClient(HttpClient http, string routerKey)
+public sealed class RouterClient(HttpClient http, string routerKey) : ISessionCostSource
 {
     /// <summary>Returns null while the router has no committed telemetry for the session (404).</summary>
     public async Task<SessionCost?> GetSessionCostAsync(string sessionId, CancellationToken ct)

@@ -77,6 +77,30 @@ internal static class SandboxSupport
         }
     }
 
+    /// <summary>
+    /// The pid a worker script wrote to <paramref name="pidFile"/>. Startup through the launch helper can take
+    /// seconds on a loaded machine, so this waits up to 60 s (failing at once if <paramref name="run"/> ends first)
+    /// and only accepts a complete line.
+    /// </summary>
+    public static async Task<int> WaitForPidAsync(string pidFile, Task run)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(60);
+        while (true)
+        {
+            if (File.Exists(pidFile) && File.ReadAllText(pidFile) is var text && text.EndsWith('\n') && int.TryParse(text.Trim(), out var pid))
+            {
+                return pid;
+            }
+            if (run.IsCompleted)
+            {
+                await run; // surfaces why the worker never started
+                Assert.Fail($"the worker finished without writing {pidFile}");
+            }
+            Assert.True(DateTime.UtcNow < deadline, $"no pid in {pidFile} after 60 s");
+            await Task.Delay(50);
+        }
+    }
+
     /// <summary>Asserts every pid dies within 5s; kills any survivor first so a failure can't leak it.</summary>
     public static async Task WaitUntilDeadAsync(params int[] pids)
     {
@@ -402,11 +426,7 @@ public class WorkerSandboxTests
         var worker = new ClaudeWorker(claude, SandboxSupport.Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(5), LocalSandbox());
         using var cts = new CancellationTokenSource();
         var run = worker.RunAsync(_dir, "p", null, null, cts.Token);
-        for (var i = 0; i < 100 && !File.Exists(pidFile); i++)
-        {
-            await Task.Delay(50);
-        }
-        var pid = int.Parse(File.ReadAllText(pidFile).Trim());
+        var pid = await SandboxSupport.WaitForPidAsync(pidFile, run);
 
         await cts.CancelAsync();
 
@@ -427,11 +447,7 @@ public class WorkerSandboxTests
             stopGrace: TimeSpan.FromMilliseconds(300));
         using var cts = new CancellationTokenSource();
         var run = worker.RunAsync(_dir, "p", null, null, cts.Token);
-        for (var i = 0; i < 100 && !File.Exists(pidFile); i++)
-        {
-            await Task.Delay(50);
-        }
-        var pid = int.Parse(File.ReadAllText(pidFile).Trim());
+        var pid = await SandboxSupport.WaitForPidAsync(pidFile, run);
         try
         {
             await cts.CancelAsync();

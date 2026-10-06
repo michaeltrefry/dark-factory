@@ -1,6 +1,7 @@
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
+using DarkFactory.Orchestrator.Sessions;
 using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 
@@ -33,9 +34,16 @@ public sealed class RunPipeline(
     IWorker worker,
     IPullRequests pullRequests,
     RepoRef defaultRepo,
-    TextWriter log)
+    TextWriter log,
+    SessionRecorder? sessions = null,
+    TimeSpan? failedSessionEndTimeout = null)
 {
     public const string Source = "shortcut";
+
+    /// <summary>How long a failed run may spend recording its session's end (and router cost) before it escalates.</summary>
+    public static readonly TimeSpan DefaultFailedSessionEndTimeout = TimeSpan.FromSeconds(30);
+
+    private readonly TimeSpan _failedSessionEndTimeout = failedSessionEndTimeout ?? DefaultFailedSessionEndTimeout;
 
     /// <summary>Checkpoint names: completed sub-steps inside a state.</summary>
     public static class Steps
@@ -192,18 +200,51 @@ public sealed class RunPipeline(
         {
             var resume = session;
             log.WriteLine(resume is null ? "[implement] starting worker" : $"[implement] resuming claude session {resume}");
-            var result = await worker.RunAsync(workspace.Path,
-                resume is null ? BuildPrompt(story, repo) : BuildResumePrompt(story), resume,
-                new WorkerCallbacks(
-                    OnStarted: (pid, c) => ledger.CheckpointAsync(item, Steps.WorkerStarted, session, pid.ToString(), c),
-                    OnSession: async (sid, c) =>
-                    {
-                        if (sid != session)
+            // Every stdout line is stored (and pushed to live viewers) as it streams (E7).
+            await using var capture = sessions is null ? null : await sessions.StartAsync(item.Id, resume, ct);
+            WorkerResult result;
+            try
+            {
+                result = await worker.RunAsync(workspace.Path,
+                    resume is null ? BuildPrompt(story, repo) : BuildResumePrompt(story), resume,
+                    new WorkerCallbacks(
+                        OnStarted: (pid, c) => ledger.CheckpointAsync(item, Steps.WorkerStarted, session, pid.ToString(), c),
+                        OnSession: async (sid, c) =>
                         {
-                            session = sid;
-                            await ledger.CheckpointAsync(item, Steps.Session, sid, "claude session started", c);
-                        }
-                    }), ct);
+                            if (sid != session)
+                            {
+                                if (capture is not null)
+                                {
+                                    // The session row is named before the ledger points at it, so a crash
+                                    // in between cannot strand the events already stored (E7).
+                                    await capture.SetClaudeSessionIdAsync(sid, c);
+                                }
+                                session = sid;
+                                await ledger.CheckpointAsync(item, Steps.Session, sid, "claude session started", c);
+                            }
+                        },
+                        OnLine: capture is null ? null : capture.OnLineAsync), ct);
+            }
+            catch (Exception ex) when (capture is not null)
+            {
+                // A Ctrl-C'd session resumes later, so its cost waits for the run that finishes it. A failed
+                // session's cost is fetched now, bounded so a hung router or ledger cannot hold up the escalation.
+                var cancelled = ex is OperationCanceledException && ct.IsCancellationRequested;
+                using var bounded = new CancellationTokenSource(_failedSessionEndTimeout);
+                try
+                {
+                    await capture.CompleteAsync(null, cancelled ? "cancelled" : "error", fetchCost: !cancelled, bounded.Token).WaitAsync(bounded.Token);
+                }
+                catch (Exception captureError)
+                {
+                    log.WriteLine($"[implement] could not record the end of the worker session: {captureError.Message}");
+                }
+                throw;
+            }
+            if (capture is not null)
+            {
+                await capture.CompleteAsync(result.ExitCode, result.Succeeded ? "succeeded" : "failed", fetchCost: true, ct);
+            }
             session = result.SessionId ?? session;
             if (!result.Succeeded)
             {

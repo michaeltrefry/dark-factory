@@ -1,9 +1,13 @@
 using System.Diagnostics;
 using DarkFactory.Orchestrator;
 using DarkFactory.Orchestrator.GitHub;
+using DarkFactory.Orchestrator.Ledger;
+using DarkFactory.Orchestrator.Sessions;
 using DarkFactory.Orchestrator.Shortcut;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Hosting;
 
-return await FactoryCli.Build(RunAsync, SetupGitHubAppAsync, ProtectRepoAsync).Parse(args).InvokeAsync();
+return await FactoryCli.Build(RunAsync, SetupGitHubAppAsync, ProtectRepoAsync, WorkAsync).Parse(args).InvokeAsync();
 
 static async Task<int> RunAsync(int storyId, CancellationToken ct)
 {
@@ -18,6 +22,26 @@ static async Task<int> RunAsync(int storyId, CancellationToken ct)
         Console.Error.WriteLine(ex.Message);
         return 2;
     }
+}
+
+static async Task<int> WorkAsync(CancellationToken ct)
+{
+    var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
+    try
+    {
+        _ = options.RouterKey; // session costs come from the router: fail fast without its key
+    }
+    catch (MissingCredentialException ex)
+    {
+        Console.Error.WriteLine(ex.Message);
+        return 2;
+    }
+    await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
+    await using var app = FactoryHost.Build(options);
+    await app.StartAsync(ct);
+    Console.WriteLine($"factory work: session hub on {app.Address()}{SessionHub.Path}; Ctrl-C stops");
+    await app.WaitForShutdownAsync(ct);
+    return 0;
 }
 
 static async Task<int> SetupGitHubAppAsync(string name, int port, CancellationToken ct)

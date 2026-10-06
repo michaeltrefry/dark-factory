@@ -24,6 +24,9 @@ public sealed class CrashResumeTests : IAsyncLifetime
     {
         _db = await TempPostgresDatabase.CreateAsync("df_crash");
         _ledger = _db.ConnectionString;
+        // Fully migrated before any host starts: polling while a host migrates would see a half-built
+        // schema (e.g. ledger_entries without "Step", 42703), since each migration commits on its own.
+        await LedgerMigrations.MigrateAsync(_ledger, CancellationToken.None);
     }
 
     public async ValueTask DisposeAsync()
@@ -53,6 +56,7 @@ public sealed class CrashResumeTests : IAsyncLifetime
         // Run 1: the worker starts, streams its session id, then works silently; the orchestrator dies.
         using (var first = StartHost())
         {
+            // Killed as soon as the ledger names the session, whether or not its first event is stored yet.
             await WaitForAsync(async () => (await Rows()).Any(r => r.Step == RunPipeline.Steps.Session), first, "session checkpoint", ct);
             first.Kill(); // SIGKILL
             await first.WaitForExitAsync(ct);
@@ -87,6 +91,17 @@ public sealed class CrashResumeTests : IAsyncLifetime
         Assert.Contains("after-resume.txt", files);
         Assert.False(File.Exists(Path.Combine(_dir, "comments.log")));
 
+        // The resumed run appended to the same session row: no gap, no duplicate (E7). The first run's init
+        // line is stored unless the kill beat its queued write (a lost tail, never a hole).
+        var events = (await Events()).Select(e => (e.Sequence, e.Type)).ToList();
+        Assert.True(events.SequenceEqual([(1L, "system"), (2L, "system"), (3L, "result")]) || events.SequenceEqual([(1L, "system"), (2L, "result")]),
+            string.Join(", ", events));
+        await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_ledger)))
+        {
+            var session = await db.WorkerSessions.SingleAsync();
+            Assert.Equal((Session, 1, "succeeded"), (session.ClaudeSessionId, session.Attempt, session.ExitStatus));
+        }
+
         // Run 3: a parked item redoes nothing.
         using (var third = StartHost())
         {
@@ -101,11 +116,13 @@ public sealed class CrashResumeTests : IAsyncLifetime
     private async Task<List<LedgerEntry>> Rows()
     {
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_ledger));
-        if (!(await db.Database.GetAppliedMigrationsAsync()).Any())
-        {
-            return [];
-        }
         return await db.LedgerEntries.OrderBy(e => e.Id).ToListAsync();
+    }
+
+    private async Task<List<SessionEvent>> Events()
+    {
+        await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_ledger));
+        return await db.SessionEvents.OrderBy(e => e.Sequence).ToListAsync();
     }
 
     private Process StartHost()

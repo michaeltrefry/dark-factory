@@ -5,14 +5,16 @@ using DarkFactory.Orchestrator;
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
+using DarkFactory.Orchestrator.Router;
+using DarkFactory.Orchestrator.Sessions;
 using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 using Microsoft.EntityFrameworkCore;
 
 var (connection, workDir, storyId) = (args[0], args[1], int.Parse(args[2]));
 
+await LedgerMigrations.MigrateAsync(connection, CancellationToken.None);
 await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(connection));
-await db.Database.MigrateAsync();
 
 var pipeline = new RunPipeline(
     new FileStories(Path.Combine(workDir, "comments.log")),
@@ -22,11 +24,18 @@ var pipeline = new RunPipeline(
     new ClaudeWorker(Path.Combine(workDir, "fake-claude.sh"), new Uri("http://127.0.0.1:9/"), "rk_test", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(2)),
     new FilePullRequests(Path.Combine(workDir, "prs.log")),
     new RepoRef("acme", "widgets"),
-    Console.Out);
+    Console.Out,
+    new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(connection)),
+        new NoCost(), TimeProvider.System, Console.Out, costRetryDelays: []));
 
 var outcome = await pipeline.RunAsync(storyId, CancellationToken.None);
 Console.WriteLine($"outcome: {outcome}");
 return outcome.Succeeded ? 0 : 1;
+
+sealed class NoCost : ISessionCostSource
+{
+    public Task<SessionCost?> GetSessionCostAsync(string sessionId, CancellationToken ct) => Task.FromResult<SessionCost?>(null);
+}
 
 sealed class FileStories(string commentsPath) : IStorySource
 {

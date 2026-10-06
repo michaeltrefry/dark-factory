@@ -11,7 +11,8 @@ public static class FactoryCli
     public static RootCommand Build(
         Func<int, CancellationToken, Task<int>> run,
         Func<string, int, CancellationToken, Task<int>> setupGitHubApp,
-        Func<RepoRef, CancellationToken, Task<int>> protectRepo)
+        Func<RepoRef, CancellationToken, Task<int>> protectRepo,
+        Func<CancellationToken, Task<int>> work)
     {
         var storyArgument = new Argument<int>("story-id")
         {
@@ -71,9 +72,13 @@ public static class FactoryCli
         };
         protectCommand.SetAction((parse, ct) => protectRepo(parse.GetValue(repoArgument)!, ct));
 
+        var workCommand = new Command("work", "Run the long-running factory host (session hub on 127.0.0.1:Factory:HostPort) until Ctrl-C.");
+        workCommand.SetAction((_, ct) => work(ct));
+
         return new RootCommand("Dark Factory orchestrator")
         {
             runCommand,
+            workCommand,
             new Command("github-app", "GitHub App management") { setupCommand },
             new Command("github-repo", "Target repository management") { protectCommand },
         };

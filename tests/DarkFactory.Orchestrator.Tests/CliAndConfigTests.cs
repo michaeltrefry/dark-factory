@@ -13,7 +13,8 @@ public class FactoryCliTests
         var root = FactoryCli.Build(
             (id, _) => { calls.Add($"run {id}"); return Task.FromResult(0); },
             (name, port, _) => { calls.Add($"setup {name} {port}"); return Task.FromResult(0); },
-            (repo, _) => { calls.Add($"protect {repo}"); return Task.FromResult(0); });
+            (repo, _) => { calls.Add($"protect {repo}"); return Task.FromResult(0); },
+            _ => { calls.Add("work"); return Task.FromResult(0); });
         return (root, calls);
     }
 
@@ -48,6 +49,14 @@ public class FactoryCliTests
         await root.Parse(["github-app", "setup"]).InvokeAsync();
         Assert.Equal("setup df-test 50001", calls[0]);
         Assert.Equal($"setup dark-factory-{Environment.UserName} {FactoryCli.DefaultSetupPort}", calls[1]);
+    }
+
+    [Fact]
+    public async Task Work_runs_the_host()
+    {
+        var (root, calls) = Cli();
+        Assert.Equal(0, await root.Parse(["work"]).InvokeAsync());
+        Assert.Equal(["work"], calls);
     }
 
     [Fact]

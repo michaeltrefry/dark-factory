@@ -38,6 +38,23 @@ public sealed class LedgerPostgresTests : IAsyncLifetime
 
     private LedgerDbContext Context() => new(LedgerDbContext.PostgresOptions(_cs));
 
+    /// <summary>
+    /// `factory work` and `factory run` (or two runs) may start together on an unmigrated ledger. EF Core alone
+    /// lets both apply the same migration (42701 "already exists"); <see cref="LedgerMigrations"/> serialises them.
+    /// </summary>
+    [Fact]
+    public async Task Processes_migrating_a_fresh_ledger_at_once_all_succeed()
+    {
+        for (var round = 0; round < 5; round++)
+        {
+            await using var fresh = await TempPostgresDatabase.CreateAsync("df_migrate");
+            await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => Task.Run(() => LedgerMigrations.MigrateAsync(fresh.ConnectionString, CancellationToken.None))));
+
+            await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(fresh.ConnectionString));
+            Assert.Empty(await db.Database.GetPendingMigrationsAsync());
+        }
+    }
+
     [Fact]
     public async Task Second_concurrent_run_of_an_item_exits_already_running_and_the_worker_runs_once()
     {

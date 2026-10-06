@@ -135,10 +135,15 @@ public class ClaudeWorkerTests
         try
         {
             var worker = new ClaudeWorker(script, Router, "rk_worker", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1));
-            var result = await worker.RunAsync(dir, "prompt", null, null, CancellationToken.None);
+            var lines = new List<string>();
+            var result = await worker.RunAsync(dir, "prompt", null,
+                new WorkerCallbacks(OnLine: (line, _) => { lines.Add(line); return ValueTask.CompletedTask; }), CancellationToken.None);
 
             Assert.True(result.Succeeded);
             Assert.Equal("sess-abc", result.SessionId);
+            // Every stdout line reaches the tap, in order, non-JSON noise included.
+            Assert.Equal(3, lines.Count);
+            Assert.Equal("progress noise", lines[1]);
             var dumped = File.ReadAllText(envDump);
             Assert.Contains("ANTHROPIC_CUSTOM_HEADERS=X-Weave-Router-Key: rk_worker", dumped);
             Assert.DoesNotContain("sk-ant-should-not-leak", dumped);
@@ -249,6 +254,27 @@ public class ClaudeWorkerTests
         Assert.Equal(["sess-early"], seen);
         var args = File.ReadAllLines(argsDump).ToList();
         Assert.Equal("sess-early", args[args.IndexOf("--resume") + 1]);
+    }
+
+    [Fact]
+    public async Task A_stalled_line_tap_is_bounded_by_the_worker_timeout()
+    {
+        var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
+        var script = Path.Combine(dir, "fake-claude.sh");
+        File.WriteAllText(script, """
+            #!/bin/sh
+            echo '{"type":"system","subtype":"init","session_id":"sess-stall"}'
+            echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-stall"}'
+            """);
+        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        // The tap never finishes on its own (a stalled database): only the worker timeout can end it.
+        var run = new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMilliseconds(500)).RunAsync(dir, "p", null,
+            new WorkerCallbacks(OnLine: async (_, c) => await Task.Delay(Timeout.Infinite, c)), CancellationToken.None);
+
+        // (WaitAsync's own TimeoutException has a different message.)
+        var ex = await Assert.ThrowsAsync<TimeoutException>(() => run.WaitAsync(TimeSpan.FromSeconds(15)));
+        Assert.StartsWith("Worker did not finish within", ex.Message);
     }
 
     [Fact]
