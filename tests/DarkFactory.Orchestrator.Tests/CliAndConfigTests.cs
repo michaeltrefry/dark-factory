@@ -14,7 +14,8 @@ public class FactoryCliTests
             (id, ignoreScope, _) => { calls.Add(ignoreScope ? $"run {id} ignore-scope" : $"run {id}"); return Task.FromResult(0); },
             (name, port, _) => { calls.Add($"setup {name} {port}"); return Task.FromResult(0); },
             (repo, _) => { calls.Add($"protect {repo}"); return Task.FromResult(0); },
-            _ => { calls.Add("work"); return Task.FromResult(0); });
+            _ => { calls.Add("work"); return Task.FromResult(0); },
+            _ => { calls.Add("dashboard set-password"); return Task.FromResult(0); });
         return (root, calls);
     }
 
@@ -65,6 +66,14 @@ public class FactoryCliTests
         var (root, calls) = Cli();
         Assert.Equal(0, await root.Parse(["work"]).InvokeAsync());
         Assert.Equal(["work"], calls);
+    }
+
+    [Fact]
+    public async Task Dashboard_set_password_runs_its_handler()
+    {
+        var (root, calls) = Cli();
+        Assert.Equal(0, await root.Parse(["dashboard", "set-password"]).InvokeAsync());
+        Assert.Equal(["dashboard set-password"], calls);
     }
 
     [Fact]

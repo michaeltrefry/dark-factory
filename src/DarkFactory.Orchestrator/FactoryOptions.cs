@@ -59,8 +59,23 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     /// <summary><c>Intake:PollSeconds</c>: how often <c>factory work</c> polls the board.</summary>
     public TimeSpan PollInterval => TimeSpan.FromSeconds(config.GetValue("Intake:PollSeconds", 60));
 
-    /// <summary>Loopback port of the <c>factory work</c> host (session hub).</summary>
+    /// <summary>Port of the <c>factory work</c> host (dashboard and session hub), on 127.0.0.1 and <see cref="DashboardBindAddress"/>.</summary>
     public int HostPort => config.GetValue("Factory:HostPort", 47822);
+
+    /// <summary>
+    /// <c>Dashboard:BindAddress</c>: one private-network address (assigned to a local interface) the host
+    /// also listens on, beside 127.0.0.1; unset = loopback only. Validated by <see cref="Dashboard.DashboardBinding"/>.
+    /// </summary>
+    public string? DashboardBindAddress => NullIfBlank(config["Dashboard:BindAddress"]);
+
+    /// <summary><c>Dashboard:HostName</c>: an extra Host header the dashboard answers to (e.g. a Tailscale MagicDNS name).</summary>
+    public string? DashboardHostName => NullIfBlank(config["Dashboard:HostName"]);
+
+    /// <summary>The dashboard login's password hash (<c>factory dashboard set-password</c>).</summary>
+    public string DashboardPasswordHash =>
+        Secret("Dashboard:PasswordHash", null, SecretAccounts.DashboardPasswordHash, "dashboard password hash (run `factory dashboard set-password`)");
+
+    private static string? NullIfBlank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
     public TimeSpan WorkerTimeout => TimeSpan.FromMinutes(config.GetValue("Worker:TimeoutMinutes", 30));
 

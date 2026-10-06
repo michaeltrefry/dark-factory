@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using DarkFactory.Orchestrator;
+using DarkFactory.Orchestrator.Dashboard;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Sessions;
@@ -7,7 +8,7 @@ using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.Extensions.Hosting;
 
-return await FactoryCli.Build(RunAsync, SetupGitHubAppAsync, ProtectRepoAsync, WorkAsync).Parse(args).InvokeAsync();
+return await FactoryCli.Build(RunAsync, SetupGitHubAppAsync, ProtectRepoAsync, WorkAsync, SetDashboardPasswordAsync).Parse(args).InvokeAsync();
 
 static async Task<int> RunAsync(int storyId, bool ignoreScope, CancellationToken ct)
 {
@@ -30,8 +31,9 @@ static async Task<int> WorkAsync(CancellationToken ct)
     try
     {
         // Fail fast on a missing credential or a bad scope rather than on the first ready item.
-        // Session costs come from the router; intake needs Shortcut and the GitHub App.
-        _ = (options.ShortcutApiToken, options.RouterKey, options.GitHubAppId, options.GitHubAppPrivateKeyPem);
+        // Session costs come from the router; intake needs Shortcut and the GitHub App; the dashboard its login.
+        _ = (options.ShortcutApiToken, options.RouterKey, options.GitHubAppId, options.GitHubAppPrivateKeyPem, options.DashboardPasswordHash);
+        _ = DashboardBinding.Addresses(options.DashboardBindAddress);
         if (options.WatchScope.IsEmpty)
         {
             Console.Error.WriteLine("Watch scope is empty (set Shortcut:Watch:Teams and/or Shortcut:Watch:Epics); nothing will be picked up.");
@@ -54,10 +56,13 @@ static async Task<int> WorkAsync(CancellationToken ct)
     // One process: the session hub and its relay, plus the intake loop polling the watch scope.
     await using var app = FactoryHost.BuildWork(options);
     await app.StartAsync(ct);
-    Console.WriteLine($"factory work: session hub on {app.Address()}{SessionHub.Path}; intake polling every {options.PollInterval}; Ctrl-C stops");
+    Console.WriteLine($"factory work: dashboard on {string.Join(", ", app.Addresses())} (session hub {SessionHub.Path}); intake polling every {options.PollInterval}; Ctrl-C stops");
     await app.WaitForShutdownAsync(ct);
     return 0;
 }
+
+static Task<int> SetDashboardPasswordAsync(CancellationToken ct) =>
+    Task.FromResult(SetPassword.Run(new MacKeychain(), SetPassword.ReadConsoleSecret, Console.Out, Console.Error));
 
 static async Task<int> SetupGitHubAppAsync(string name, int port, CancellationToken ct)
 {

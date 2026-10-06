@@ -443,18 +443,19 @@ public sealed class SessionCaptureTests : IAsyncLifetime
     }
 
     [Theory]
-    [InlineData("127.0.0.1", null, HttpStatusCode.OK)]            // non-browser client: no Origin
-    [InlineData("localhost", null, HttpStatusCode.OK)]
-    [InlineData("127.0.0.1", "same", HttpStatusCode.OK)]          // a page served by the host itself
-    [InlineData("127.0.0.1", "http://evil.example", HttpStatusCode.Forbidden)]
-    [InlineData("127.0.0.1", "null", HttpStatusCode.Forbidden)]
-    [InlineData("rebound.evil.example", null, HttpStatusCode.BadRequest)] // DNS rebinding: wrong Host
-    public async Task Hub_accepts_only_loopback_hosts_and_same_origin_browsers(string host, string? origin, HttpStatusCode expected)
+    [InlineData("127.0.0.1", null, true, HttpStatusCode.OK)]            // non-browser client: no Origin
+    [InlineData("localhost", null, true, HttpStatusCode.OK)]
+    [InlineData("127.0.0.1", "same", true, HttpStatusCode.OK)]          // a page served by the host itself
+    [InlineData("127.0.0.1", null, false, HttpStatusCode.Unauthorized)] // not logged in
+    [InlineData("127.0.0.1", "http://evil.example", true, HttpStatusCode.Forbidden)]
+    [InlineData("127.0.0.1", "null", true, HttpStatusCode.Forbidden)]
+    [InlineData("rebound.evil.example", null, true, HttpStatusCode.BadRequest)] // DNS rebinding: wrong Host
+    public async Task Hub_accepts_only_logged_in_loopback_hosts_and_same_origin_browsers(string host, string? origin, bool loggedIn, HttpStatusCode expected)
     {
         await using var running = await StartHostAsync();
         var app = running.App;
         var address = new Uri(app.Address());
-        using var http = new HttpClient();
+        using var http = DashboardLogin.Client(app.Address(), loggedIn ? await DashboardLogin.LoginAsync(app.Address()) : null);
         using var request = new HttpRequestMessage(HttpMethod.Post, new Uri(address, SessionHub.Path + "/negotiate?negotiateVersion=1"));
         request.Headers.Host = $"{host}:{address.Port}";
         if (origin is not null)
@@ -486,7 +487,7 @@ public sealed class SessionCaptureTests : IAsyncLifetime
             ["ConnectionStrings:Ledger"] = _cs,
             ["Factory:HostPort"] = "0",
         }).Build();
-        var app = FactoryHost.Build(new FactoryOptions(config, new InMemorySecrets()), services =>
+        var app = FactoryHost.Build(new FactoryOptions(config, DashboardLogin.Secrets()), services =>
         {
             services.AddSingleton<ISessionCostSource>(new FakeCosts(FixtureCost));
             if (hubOptions is not null)
@@ -516,7 +517,8 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         public static async Task<Viewer> JoinAsync(WebApplication app, string sessionId, Stopwatch? clock = null)
         {
             clock ??= Stopwatch.StartNew();
-            var viewer = new Viewer { Connection = new HubConnectionBuilder().WithUrl(app.Address() + SessionHub.Path).Build() };
+            var cookies = await DashboardLogin.LoginAsync(app.Address());
+            var viewer = new Viewer { Connection = new HubConnectionBuilder().WithUrl(app.Address() + SessionHub.Path, o => o.Cookies = cookies).Build() };
             viewer.Connection.On<string, SessionEventMessage[]>(SessionHub.EventsMethod, (id, events) =>
             {
                 Assert.Equal(sessionId, id);

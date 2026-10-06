@@ -19,6 +19,8 @@ public static class SecretAccounts
     public const string GitHubAppSlug = "github-app-slug";
     /// <summary>Stored base64-encoded (by <see cref="MacKeychain"/>) so the multi-line PEM round-trips through <c>security -w</c>.</summary>
     public const string GitHubAppPrivateKey = "github-app-private-key";
+    /// <summary>The dashboard login's ASP.NET Identity (PBKDF2) password hash, written by <c>factory dashboard set-password</c>.</summary>
+    public const string DashboardPasswordHash = "dashboard-password-hash";
 }
 
 /// <summary>Generic passwords in the login keychain under service <c>dark-factory</c>, via <c>/usr/bin/security</c>.</summary>

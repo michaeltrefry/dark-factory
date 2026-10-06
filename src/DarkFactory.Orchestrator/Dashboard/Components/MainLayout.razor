@@ -1,0 +1,14 @@
+@inherits LayoutComponentBase
+
+<header>
+    <a class="brand" href="">Dark Factory</a>
+    <AuthorizeView>
+        <form method="post" action="@DashboardAuth.LogoutPath">
+            <AntiforgeryToken />
+            <button type="submit">Log out</button>
+        </form>
+    </AuthorizeView>
+</header>
+<main>
+    @Body
+</main>
