@@ -62,7 +62,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Worker:TimeoutMinutes` | `30` |
 | `Factory:HostPort` | `47822` (`factory work`: 127.0.0.1, plus `Dashboard:BindAddress`) |
 | `Dashboard:BindAddress` | unset = loopback only; one private address (RFC 1918, 100.64/10, fc00::/7) on a local interface |
-| `Dashboard:HostName` | extra Host header the dashboard answers to (e.g. MagicDNS name) |
+| `Dashboard:HostName` | extra Host header the dashboard answers to (e.g. MagicDNS name); one plain DNS name, no wildcard/port |
 | `Dashboard:PasswordHash` | keychain `dashboard-password-hash` (written by `factory dashboard set-password`) |
 
 Worker sandbox (E5): workers run as the hidden `_factory` user via

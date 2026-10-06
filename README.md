@@ -59,12 +59,14 @@ the result; other lines as-is; long outputs collapsed). The dashboard only reads
 Every page, the Blazor circuit and the session hub need the login (one local account): set its
 password once with `factory dashboard set-password` (read without echo; only a PBKDF2 hash goes to
 the keychain, account `dashboard-password-hash`). Logins are limited to 5 tries a minute per client.
-The cookie is HttpOnly and SameSite=Strict.
+The cookie is HttpOnly and SameSite=Strict. A login ends on logout (that cookie is revoked wherever
+a copy is held), on a new `set-password`, and at cookie expiry (12 h, sliding) — on requests within seconds,
+and on open pages and session-hub connections within a minute (the page goes to the login page).
 
 It listens on 127.0.0.1 only, unless `Dashboard:BindAddress` names one private address of this Mac
 (10/8, 172.16/12, 192.168/16, 100.64/10 — Tailscale — or fc00::/7) to listen on as well; a wildcard,
 public, or foreign address stops start-up. `Dashboard:HostName` adds a host name it answers to (e.g.
-the Mac's MagicDNS name). **The host serves plain HTTP**: on a LAN address the password and session
+the Mac's MagicDNS name): one plain DNS name — a wildcard, port, path or IP address stops start-up. **The host serves plain HTTP**: on a LAN address the password and session
 cookie cross the network unencrypted. Prefer the Tailscale address (WireGuard-encrypted) over a
 shared LAN address.
 

@@ -1,14 +1,20 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Claims;
 using DarkFactory.Orchestrator.Dashboard;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Router;
 using DarkFactory.Orchestrator.Sessions;
 using DarkFactory.Orchestrator.Tests.Support;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Components.Authorization;
+using Microsoft.AspNetCore.SignalR;
+using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Time.Testing;
 
 namespace DarkFactory.Orchestrator.Tests;
 
@@ -77,6 +83,135 @@ public class DashboardBindingTests
         }).Build();
 
         Assert.Throws<InvalidOperationException>(() => FactoryHost.Build(new FactoryOptions(config, new InMemorySecrets())));
+    }
+
+    [Theory]
+    [InlineData("*", "no wildcards")]
+    [InlineData("*.example.com", "no wildcards")]
+    [InlineData("evil.com:1", "no wildcards")]  // a port
+    [InlineData("evil.com/x", "no wildcards")]  // a path
+    [InlineData("mac .ts.net", "no wildcards")] // whitespace
+    [InlineData("192.168.1.20", "not a DNS host name")]
+    [InlineData("[fd7a::1]", "no wildcards")]
+    [InlineData("bad_name!", "not a DNS host name")]
+    public void The_host_refuses_to_start_on_a_host_name_that_is_not_one_plain_dns_name(string configured, string why)
+    {
+        var config = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Factory:HostPort"] = "0",
+            ["Dashboard:HostName"] = configured,
+        }).Build();
+
+        var ex = Assert.Throws<InvalidOperationException>(() => FactoryHost.Build(new FactoryOptions(config, new InMemorySecrets())));
+        Assert.Contains($"Dashboard:HostName '{configured}' refused: {why}", ex.Message);
+    }
+
+    [Theory]
+    [InlineData("mac.tail1234.ts.net")]
+    [InlineData("localhost")]
+    [InlineData(null)]
+    public void A_plain_dns_host_name_is_accepted(string? configured)
+    {
+        Assert.Equal(configured, DashboardBinding.ValidHostName(configured));
+    }
+}
+
+public class DashboardLoginsTests
+{
+    private static readonly DateTimeOffset Now = new(2026, 10, 6, 12, 0, 0, TimeSpan.Zero);
+
+    private static (DashboardLogins Logins, InMemorySecrets Secrets, FixedTime Time) Create()
+    {
+        var secrets = DashboardLogin.Secrets();
+        var time = new FixedTime(Now);
+        var hash = new PasswordHashSource(() => secrets.Get(SecretAccounts.DashboardPasswordHash)!, time, TimeSpan.Zero);
+        return (new DashboardLogins(hash, time), secrets, time);
+    }
+
+    private static ClaimsPrincipal Login(InMemorySecrets secrets, DateTimeOffset? expires = null)
+    {
+        var user = new ClaimsPrincipal(new ClaimsIdentity(
+            [new Claim(ClaimTypes.Name, "dashboard"), .. DashboardLogins.Issue(secrets.Values[SecretAccounts.DashboardPasswordHash])], "test"));
+        DashboardLogins.SetExpiry(user, expires);
+        return user;
+    }
+
+    [Fact]
+    public void Login_checks_reuse_a_recent_read_of_the_hash_and_a_login_read_refreshes_it()
+    {
+        var reads = 0;
+        var stored = "hash-1";
+        var time = new FixedTime(Now);
+        var source = new PasswordHashSource(() => { reads++; return stored; }, time, TimeSpan.FromSeconds(5));
+
+        Assert.Equal("hash-1", source.Recent());
+        stored = "hash-2";
+        time.Now = Now.AddSeconds(4);
+        Assert.Equal("hash-1", source.Recent()); // within the cache duration: no keychain read
+        Assert.Equal(1, reads);
+
+        Assert.Equal("hash-2", source.Get());    // a login reads afresh...
+        Assert.Equal("hash-2", source.Recent()); // ...and the checks see what it saw
+        Assert.Equal(2, reads);
+
+        stored = "hash-3";
+        time.Now = Now.AddSeconds(10);
+        Assert.Equal("hash-3", source.Recent()); // expired: read again
+    }
+
+    [Fact]
+    public void A_login_holds_until_its_cookie_expiry_passes()
+    {
+        var (logins, secrets, time) = Create();
+        var user = Login(secrets, Now.AddHours(1));
+        Assert.True(logins.IsValid(user));
+
+        time.Now = Now.AddHours(1);
+
+        Assert.False(logins.IsValid(user));
+    }
+
+    [Fact]
+    public void The_stamp_does_not_reveal_the_hash_and_changes_with_it()
+    {
+        var hash = DashboardAuth.HashPassword("one password here");
+        var stamp = DashboardLogins.Stamp(hash);
+
+        Assert.Equal(24, stamp.Length); // 16 bytes
+        Assert.DoesNotContain(stamp, hash);
+        Assert.NotEqual(stamp, DashboardLogins.Stamp(DashboardAuth.HashPassword("one password here")));
+    }
+
+    [Fact]
+    public void Logins_without_a_stamp_or_id_or_with_no_stored_hash_do_not_hold()
+    {
+        var (logins, secrets, _) = Create();
+        var user = Login(secrets);
+        Assert.True(logins.IsValid(user));
+
+        Assert.False(logins.IsValid(new ClaimsPrincipal(new ClaimsIdentity(user.Claims.Where(c => c.Type != DashboardLogins.StampClaim), "test"))));
+        Assert.False(logins.IsValid(new ClaimsPrincipal(new ClaimsIdentity(user.Claims.Where(c => c.Type != DashboardLogins.LoginIdClaim), "test"))));
+        Assert.False(logins.IsValid(new ClaimsPrincipal(new ClaimsIdentity(user.Claims)))); // not authenticated
+        secrets.Values.Remove(SecretAccounts.DashboardPasswordHash);
+        Assert.False(logins.IsValid(user));
+    }
+
+    [Fact]
+    public async Task A_circuit_becomes_anonymous_once_its_login_ends()
+    {
+        var (logins, secrets, _) = Create();
+        using var provider = new DashboardAuthStateProvider(NullLoggerFactory.Instance, logins,
+            new DashboardAuthOptions { RevalidationInterval = TimeSpan.FromMilliseconds(50) });
+        provider.SetAuthenticationState(Task.FromResult(new AuthenticationState(Login(secrets))));
+        var changed = new TaskCompletionSource<AuthenticationState>();
+        provider.AuthenticationStateChanged += async state => changed.TrySetResult(await state);
+        await Task.Delay(300); // several revalidations while the login holds
+        Assert.False(changed.Task.IsCompleted);
+
+        secrets.Values[SecretAccounts.DashboardPasswordHash] = DashboardAuth.HashPassword("a brand new password");
+
+        var state = await changed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.False(state.User.Identity?.IsAuthenticated);
     }
 }
 
@@ -325,7 +460,159 @@ public sealed class DashboardHostTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.BadRequest, wrongHost.StatusCode);
     }
 
-    private async Task<StartedHost> StartAsync(Dictionary<string, string?>? extra = null)
+    [Fact]
+    public async Task A_configured_host_name_is_answered_to()
+    {
+        await using var app = await StartAsync(new() { ["Dashboard:HostName"] = "mac.tail1234.ts.net" });
+        using var http = DashboardLogin.Client(app.Address());
+        var port = new Uri(app.Address()).Port;
+
+        using var named = new HttpRequestMessage(HttpMethod.Get, DashboardAuth.LoginPath);
+        named.Headers.Host = $"mac.tail1234.ts.net:{port}";
+        using var ok = await http.SendAsync(named);
+        using var other = new HttpRequestMessage(HttpMethod.Get, DashboardAuth.LoginPath);
+        other.Headers.Host = $"other.tail1234.ts.net:{port}";
+        using var refused = await http.SendAsync(other);
+
+        Assert.Equal(HttpStatusCode.OK, ok.StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, refused.StatusCode);
+    }
+
+    [Fact]
+    public async Task A_new_password_ends_existing_logins_on_pages_and_the_hub()
+    {
+        var secrets = DashboardLogin.Secrets();
+        await using var app = await StartAsync(secrets: secrets);
+        var cookies = await DashboardLogin.LoginAsync(app.Address());
+        using var http = DashboardLogin.Client(app.Address(), cookies);
+        using (var before = await http.GetAsync("/"))
+        {
+            Assert.Equal(HttpStatusCode.OK, before.StatusCode);
+        }
+
+        secrets.Values[SecretAccounts.DashboardPasswordHash] = DashboardAuth.HashPassword("a brand new password");
+
+        using var page = await http.GetAsync("/");
+        Assert.Equal(HttpStatusCode.Redirect, page.StatusCode);
+        Assert.StartsWith($"{app.Address()}/login?ReturnUrl=", page.Headers.Location!.ToString());
+        using var hub = await DashboardLogin.Client(app.Address(), cookies).PostAsync(SessionHub.Path + "/negotiate?negotiateVersion=1", null);
+        Assert.Equal(HttpStatusCode.Unauthorized, hub.StatusCode);
+
+        // The new password logs in at once (no restart, no stale cached hash).
+        using var fresh = DashboardLogin.Client(app.Address());
+        using var login = await DashboardLogin.SubmitAsync(fresh, "a brand new password");
+        Assert.Equal("/", login.Headers.Location!.OriginalString);
+        using var after = await fresh.GetAsync("/");
+        Assert.Equal(HttpStatusCode.OK, after.StatusCode);
+    }
+
+    [Fact]
+    public async Task Logging_out_revokes_the_cookie_even_where_a_copy_is_still_held()
+    {
+        await using var app = await StartAsync();
+        var cookies = await DashboardLogin.LoginAsync(app.Address());
+        var copy = new CookieContainer();
+        copy.Add(cookies.GetAllCookies());
+        using var http = DashboardLogin.Client(app.Address(), cookies);
+        var page = await http.GetStringAsync("/");
+
+        using var logout = await DashboardLogin.PostAsync(http, DashboardAuth.LogoutPath, new Dictionary<string, string>(), DashboardLogin.TokenFrom(page));
+        Assert.Equal(HttpStatusCode.Redirect, logout.StatusCode);
+
+        using var stolen = DashboardLogin.Client(app.Address(), copy);
+        using var refused = await stolen.GetAsync("/");
+        Assert.Equal(HttpStatusCode.Redirect, refused.StatusCode);
+        using var hub = await stolen.PostAsync(SessionHub.Path + "/negotiate?negotiateVersion=1", null);
+        Assert.Equal(HttpStatusCode.Unauthorized, hub.StatusCode);
+    }
+
+    [Theory]
+    [InlineData("set-password")]
+    [InlineData("logout")]
+    public async Task An_open_hub_connection_is_closed_once_its_login_ends_without_invoking_anything(string how)
+    {
+        var secrets = DashboardLogin.Secrets();
+        await using var app = await StartAsync(secrets: secrets, auth: new DashboardAuthOptions { RevalidationInterval = TimeSpan.FromMilliseconds(200), HashCacheDuration = TimeSpan.Zero });
+        var cookies = await DashboardLogin.LoginAsync(app.Address());
+        await using var connection = await ConnectAsync(app, cookies);
+        var closed = new TaskCompletionSource();
+        connection.Closed += _ => { closed.TrySetResult(); return Task.CompletedTask; };
+        await Task.Delay(600); // several sweeps while the login holds
+        Assert.Equal(HubConnectionState.Connected, connection.State);
+
+        await EndLoginAsync(app, secrets, cookies, how);
+
+        await closed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    [Fact]
+    public async Task A_hub_invocation_after_the_login_ends_is_refused_and_closes_the_connection()
+    {
+        var secrets = DashboardLogin.Secrets();
+        await using var app = await StartAsync(secrets: secrets, auth: new DashboardAuthOptions { RevalidationInterval = TimeSpan.FromDays(30), HashCacheDuration = TimeSpan.Zero });
+        var cookies = await DashboardLogin.LoginAsync(app.Address());
+        await using var connection = await ConnectAsync(app, cookies);
+        var closed = new TaskCompletionSource();
+        connection.Closed += _ => { closed.TrySetResult(); return Task.CompletedTask; };
+        var valid = await Assert.ThrowsAsync<HubException>(() => connection.InvokeAsync("JoinSession", "no-such-session"));
+        Assert.Contains("Unknown session", valid.Message); // the login holds: the call itself ran
+
+        await EndLoginAsync(app, secrets, cookies, "set-password");
+
+        var refused = await Assert.ThrowsAnyAsync<Exception>(() => connection.InvokeAsync("JoinSession", "no-such-session"));
+        Assert.DoesNotContain("Unknown session", refused.Message);
+        await closed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    [Fact]
+    public async Task A_hub_connection_ends_when_its_cookie_would_have_expired()
+    {
+        var time = new FakeTimeProvider(DateTimeOffset.UtcNow);
+        await using var app = await StartAsync(time: time, auth: new DashboardAuthOptions { RevalidationInterval = TimeSpan.FromDays(30), HashCacheDuration = TimeSpan.FromDays(30) });
+        var cookies = await DashboardLogin.LoginAsync(app.Address());
+        await using var connection = await ConnectAsync(app, cookies);
+        var valid = await Assert.ThrowsAsync<HubException>(() => connection.InvokeAsync("JoinSession", "no-such-session"));
+        Assert.Contains("Unknown session", valid.Message);
+
+        time.Advance(DashboardAuth.ExpireTimeSpan + TimeSpan.FromMinutes(1));
+
+        var refused = await Assert.ThrowsAnyAsync<Exception>(() => connection.InvokeAsync("JoinSession", "no-such-session"));
+        Assert.DoesNotContain("Unknown session", refused.Message);
+    }
+
+    [Fact]
+    public async Task Dashboard_circuits_recheck_their_login()
+    {
+        await using var app = await StartAsync();
+        await using var scope = app.App.Services.CreateAsyncScope();
+
+        Assert.IsType<DashboardAuthStateProvider>(scope.ServiceProvider.GetRequiredService<AuthenticationStateProvider>());
+    }
+
+    private static async Task<HubConnection> ConnectAsync(StartedHost app, CookieContainer cookies)
+    {
+        var connection = new HubConnectionBuilder().WithUrl(app.Address() + SessionHub.Path, o => o.Cookies = cookies).Build();
+        await connection.StartAsync();
+        return connection;
+    }
+
+    private static async Task EndLoginAsync(StartedHost app, InMemorySecrets secrets, CookieContainer cookies, string how)
+    {
+        if (how == "set-password")
+        {
+            secrets.Values[SecretAccounts.DashboardPasswordHash] = DashboardAuth.HashPassword("a brand new password");
+            return;
+        }
+        var copy = new CookieContainer();
+        copy.Add(cookies.GetAllCookies()); // the hub client keeps its own copy of the cookie
+        using var http = DashboardLogin.Client(app.Address(), copy);
+        var page = await http.GetStringAsync("/");
+        using var logout = await DashboardLogin.PostAsync(http, DashboardAuth.LogoutPath, new Dictionary<string, string>(), DashboardLogin.TokenFrom(page));
+        Assert.Equal(HttpStatusCode.Redirect, logout.StatusCode);
+    }
+
+    private async Task<StartedHost> StartAsync(
+        Dictionary<string, string?>? extra = null, InMemorySecrets? secrets = null, DashboardAuthOptions? auth = null, TimeProvider? time = null)
     {
         var settings = new Dictionary<string, string?>
         {
@@ -337,8 +624,16 @@ public sealed class DashboardHostTests : IAsyncLifetime
             settings[k] = v;
         }
         var config = new ConfigurationBuilder().AddInMemoryCollection(settings).Build();
-        var app = FactoryHost.Build(new FactoryOptions(config, DashboardLogin.Secrets()),
-            services => services.AddSingleton<ISessionCostSource>(new NoCosts()));
+        var app = FactoryHost.Build(new FactoryOptions(config, secrets ?? DashboardLogin.Secrets()), services =>
+        {
+            services.AddSingleton<ISessionCostSource>(new NoCosts());
+            // Checks of existing logins read the hash afresh unless a test says otherwise.
+            services.AddSingleton(auth ?? new DashboardAuthOptions { HashCacheDuration = TimeSpan.Zero });
+            if (time is not null)
+            {
+                services.AddSingleton(time);
+            }
+        });
         await app.StartAsync();
         return new StartedHost(app);
     }

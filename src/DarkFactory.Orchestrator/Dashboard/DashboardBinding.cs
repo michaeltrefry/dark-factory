@@ -48,6 +48,29 @@ public static class DashboardBinding
         return [IPAddress.Loopback, address];
     }
 
+    /// <summary>
+    /// <c>Dashboard:HostName</c> as host filtering will match it: one plain DNS name, never a pattern.
+    /// Throws <see cref="InvalidOperationException"/> for a wildcard (<c>*</c>, <c>*.example.com</c>, which
+    /// would widen host filtering and with it the DNS-rebinding guard), a port, a path, whitespace, or
+    /// anything that is not a DNS host name (an IP address belongs in <c>Dashboard:BindAddress</c>).
+    /// </summary>
+    public static string? ValidHostName(string? configured)
+    {
+        if (configured is null)
+        {
+            return null;
+        }
+        if (configured.Any(c => c is '*' or ':' or '/' || char.IsWhiteSpace(c)))
+        {
+            throw RefuseHostName(configured, "no wildcards, ports, paths or whitespace");
+        }
+        if (Uri.CheckHostName(configured) != UriHostNameType.Dns)
+        {
+            throw RefuseHostName(configured, "not a DNS host name");
+        }
+        return configured;
+    }
+
     public static bool IsPrivate(IPAddress address)
     {
         var b = address.GetAddressBytes();
@@ -75,4 +98,7 @@ public static class DashboardBinding
 
     private static InvalidOperationException Refuse(string configured, string why) =>
         new($"Dashboard:BindAddress '{configured}' refused: {why}.");
+
+    private static InvalidOperationException RefuseHostName(string configured, string why) =>
+        new($"Dashboard:HostName '{configured}' refused: {why}.");
 }

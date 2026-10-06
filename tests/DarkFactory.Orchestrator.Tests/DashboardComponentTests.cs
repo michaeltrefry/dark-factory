@@ -1,4 +1,5 @@
 using Bunit;
+using Bunit.TestDoubles;
 using DarkFactory.Orchestrator.Dashboard;
 using DarkFactory.Orchestrator.Dashboard.Components;
 using DarkFactory.Orchestrator.Dashboard.Components.Pages;
@@ -7,6 +8,10 @@ using DarkFactory.Orchestrator.Router;
 using DarkFactory.Orchestrator.Sessions;
 using DarkFactory.Orchestrator.Tests.Support;
 using Microsoft.AspNetCore.Builder;
+using System.Security.Claims;
+using Microsoft.AspNetCore.Components.Authorization;
+using Microsoft.AspNetCore.Components.Forms;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Time.Testing;
@@ -193,6 +198,44 @@ public class DashboardComponentTests : BunitContext
 
         Assert.Contains("Unknown session.", cut.Markup);
         Assert.Empty(_viewers.Joined);
+    }
+
+    [Fact]
+    public void An_open_page_whose_login_ends_is_torn_down_and_sent_to_the_login_page()
+    {
+        // The real circuit provider, rechecking a real login every 50 ms against a swappable stored hash.
+        var secrets = DashboardLogin.Secrets();
+        var logins = new DashboardLogins(new PasswordHashSource(() => secrets.Get(SecretAccounts.DashboardPasswordHash)!, TimeProvider.System, TimeSpan.Zero), TimeProvider.System);
+        var provider = new DashboardAuthStateProvider(NullLoggerFactory.Instance, logins, new DashboardAuthOptions { RevalidationInterval = TimeSpan.FromMilliseconds(50) });
+        provider.SetAuthenticationState(Task.FromResult(new AuthenticationState(new ClaimsPrincipal(new ClaimsIdentity(
+            [new Claim(ClaimTypes.Name, "dashboard"), .. DashboardLogins.Issue(secrets.Values[SecretAccounts.DashboardPasswordHash])], "Cookies")))));
+        Services.AddSingleton<AuthenticationStateProvider>(provider);
+        Services.AddAuthorizationCore();
+        Services.AddSingleton<Microsoft.AspNetCore.Authorization.IAuthorizationService, Microsoft.AspNetCore.Authorization.DefaultAuthorizationService>(); // over bUnit's placeholder
+        Services.AddCascadingAuthenticationState();
+        Services.AddSingleton<AntiforgeryStateProvider>(new NoAntiforgery());
+        var navigation = Services.GetRequiredService<BunitNavigationManager>();
+        navigation.NavigateTo("sessions/" + TranscriptLines.Sid);
+        _data.Header = new SessionHeader(1, "sc-1", "Story 1", "acme/widgets", new SessionLink(TranscriptLines.Sid, 1, Now, null, null, null));
+
+        var cut = Render<Routes>();
+        cut.WaitForAssertion(() => Assert.Equal([TranscriptLines.Sid], _viewers.Joined));
+        Thread.Sleep(300); // several revalidations while the login holds
+        Assert.Empty(_viewers.Left);
+        Assert.Contains("Story 1", cut.Markup);
+
+        secrets.Values[SecretAccounts.DashboardPasswordHash] = DashboardAuth.HashPassword("a brand new password");
+
+        cut.WaitForAssertion(() => Assert.Equal([TranscriptLines.Sid], _viewers.Left), TimeSpan.FromSeconds(10)); // the page left its feed
+        Assert.DoesNotContain("Story 1", cut.Markup);
+        var redirect = navigation.History.First();
+        Assert.Equal($"/login?returnUrl={Uri.EscapeDataString("/sessions/" + TranscriptLines.Sid)}", redirect.Uri);
+        Assert.True(redirect.Options.ForceLoad);
+    }
+
+    private sealed class NoAntiforgery : AntiforgeryStateProvider
+    {
+        public override AntiforgeryRequestToken? GetAntiforgeryToken() => null;
     }
 
     private sealed class FakeData : IDashboardData

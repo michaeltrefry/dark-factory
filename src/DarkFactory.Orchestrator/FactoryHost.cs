@@ -32,10 +32,11 @@ public static class FactoryHost
     private static readonly string[] HubPaths = [SessionHub.Path, "/_blazor"];
 
     /// <param name="configure">Extra or replacement services (tests swap the router cost source here).</param>
-    /// <exception cref="InvalidOperationException">The configured <c>Dashboard:BindAddress</c> is not allowed.</exception>
+    /// <exception cref="InvalidOperationException">The configured <c>Dashboard:BindAddress</c> or <c>Dashboard:HostName</c> is not allowed.</exception>
     public static WebApplication Build(FactoryOptions options, Action<IServiceCollection>? configure = null)
     {
         var addresses = DashboardBinding.Addresses(options.DashboardBindAddress);
+        var hostName = DashboardBinding.ValidHostName(options.DashboardHostName);
         var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions
         {
             // The factory assembly, not the entry assembly (a test host), owns the components and static assets.
@@ -55,7 +56,7 @@ public static class FactoryHost
         {
             o.AllowedHosts = AllowedHosts
                 .Concat(addresses.Skip(1).Select(DashboardBinding.HostName))
-                .Concat(options.DashboardHostName is { } name ? [name] : [])
+                .Concat(hostName is not null ? [hostName] : [])
                 .ToList();
             o.AllowEmptyHosts = false;
         });

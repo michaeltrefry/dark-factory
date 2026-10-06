@@ -1,0 +1,9 @@
+@inject NavigationManager Navigation
+
+@code {
+    /// <summary>A full page load of the login page, returning here after it.</summary>
+    protected override void OnInitialized() =>
+        Navigation.NavigateTo(
+            $"{DashboardAuth.LoginPath}?returnUrl={Uri.EscapeDataString("/" + Navigation.ToBaseRelativePath(Navigation.Uri))}",
+            forceLoad: true);
+}
