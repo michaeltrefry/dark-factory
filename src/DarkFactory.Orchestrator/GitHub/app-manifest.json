@@ -1,0 +1,17 @@
+{
+  "name": "dark-factory",
+  "url": "https://github.com/michaeltrefry/dark-factory",
+  "description": "Dark Factory workers: push factory/* branches and open pull requests. Never merges.",
+  "public": false,
+  "redirect_url": "http://localhost:47821/callback",
+  "hook_attributes": {
+    "url": "https://example.invalid/no-webhook",
+    "active": false
+  },
+  "default_permissions": {
+    "contents": "write",
+    "pull_requests": "write",
+    "metadata": "read"
+  },
+  "default_events": []
+}

@@ -1,0 +1,102 @@
+using System.Diagnostics;
+using DarkFactory.Orchestrator;
+using DarkFactory.Orchestrator.Ledger;
+using DarkFactory.Orchestrator.Router;
+using Microsoft.EntityFrameworkCore;
+
+namespace DarkFactory.AcceptanceTests;
+
+/// <summary>
+/// Gates for the live acceptance tests. They spend real model tokens and touch real
+/// GitHub/Shortcut state, so they only run with FACTORY_E2E=1 and skip with the exact
+/// missing prerequisite otherwise.
+/// </summary>
+internal static class Harness
+{
+    public static readonly FactoryOptions Options = new(FactoryOptions.LoadConfiguration(), new MacKeychain());
+
+    public static void RequireOptIn()
+    {
+        if (Environment.GetEnvironmentVariable("FACTORY_E2E") != "1")
+        {
+            Assert.Skip("Live acceptance test: set FACTORY_E2E=1 to run (spends router tokens).");
+        }
+    }
+
+    public static string RequireSecret(Func<FactoryOptions, string> secret)
+    {
+        try
+        {
+            return secret(Options);
+        }
+        catch (MissingCredentialException ex)
+        {
+            Assert.Skip(ex.Message);
+            throw;
+        }
+    }
+
+    public static string RequireEnv(string name, string purpose)
+    {
+        var value = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            Assert.Skip($"Set {name}: {purpose}.");
+        }
+        return value!;
+    }
+
+    public static async Task RequireRouterAsync()
+    {
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+        try
+        {
+            await http.GetAsync(Options.RouterBaseUrl);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            Assert.Skip($"Router not reachable at {Options.RouterBaseUrl}: {ex.Message}");
+        }
+    }
+
+    public static async Task<LedgerDbContext> RequireLedgerAsync()
+    {
+        var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(Options.LedgerConnectionString));
+        if (!await db.Database.CanConnectAsync())
+        {
+            await db.DisposeAsync();
+            Assert.Skip("Ledger Postgres not reachable; run `docker compose up -d`.");
+        }
+        return db;
+    }
+
+    public static void RequireClaude()
+    {
+        try
+        {
+            using var p = Process.Start(new ProcessStartInfo(Options.ClaudePath, "--version") { RedirectStandardOutput = true })!;
+            p.WaitForExit();
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            Assert.Skip($"Claude Code CLI '{Options.ClaudePath}' not found; set Worker__ClaudePath.");
+        }
+    }
+
+    /// <summary>The router commits telemetry asynchronously, so poll briefly for the session's cost.</summary>
+    public static async Task<SessionCost?> WaitForCostAsync(string sessionId, string routerKey, CancellationToken ct)
+    {
+        using var http = new HttpClient { BaseAddress = Options.RouterBaseUrl };
+        var router = new RouterClient(http, routerKey);
+        for (var attempt = 0; attempt < 30; attempt++)
+        {
+            var cost = await router.GetSessionCostAsync(sessionId, ct);
+            if (cost is { ActualCostUsdMicros: > 0 })
+            {
+                return cost;
+            }
+            await Task.Delay(TimeSpan.FromSeconds(2), ct);
+        }
+        return await router.GetSessionCostAsync(sessionId, ct);
+    }
+}
