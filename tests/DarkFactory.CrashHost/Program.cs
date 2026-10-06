@@ -9,6 +9,7 @@ using DarkFactory.Orchestrator.Router;
 using DarkFactory.Orchestrator.Sessions;
 using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
+using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
 
 var (connection, workDir, storyId) = (args[0], args[1], int.Parse(args[2]));
@@ -37,13 +38,23 @@ sealed class NoCost : ISessionCostSource
     public Task<SessionCost?> GetSessionCostAsync(string sessionId, CancellationToken ct) => Task.FromResult<SessionCost?>(null);
 }
 
-sealed class FileStories(string commentsPath) : IStorySource
+/// <summary>A one-story board: comments go to a file, other board writes are no-ops.</summary>
+sealed class FileStories(string commentsPath) : IWorkSource
 {
-    public Task<ShortcutStory> GetStoryAsync(int id, CancellationToken ct) =>
-        Task.FromResult(new ShortcutStory(id, "Add fix.txt", "Create fix.txt.", "bug", $"https://app.shortcut.com/test/story/{id}"));
+    public Task<WorkSpec> ReadSpecAsync(int id, CancellationToken ct) =>
+        Task.FromResult(new WorkSpec(new WorkStory(id, "Add fix.txt", "Create fix.txt.", "bug", $"https://app.shortcut.com/test/story/{id}"), null, []));
 
-    public Task AddCommentAsync(int id, string text, CancellationToken ct) =>
+    public Task CommentAsync(int id, string text, CancellationToken ct) =>
         File.AppendAllTextAsync(commentsPath, $"{id}\t{text.ReplaceLineEndings(" ")}\n", ct);
+
+    public Task<IReadOnlyList<int>> ListReadyAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<int>>([]);
+    public Task<ClaimResult> ClaimAsync(int id, bool ignoreScope, CancellationToken ct) => Task.FromResult(ClaimResult.Ok);
+    public Task<bool> InScopeAsync(int id, CancellationToken ct) => Task.FromResult(true);
+    public Task ReleaseAsync(int id, CancellationToken ct) => Task.CompletedTask;
+    public Task ReportStateAsync(int id, BoardState state, string? comment, CancellationToken ct) => Task.CompletedTask;
+    public Task LinkAsync(int id, IReadOnlyList<string> urls, CancellationToken ct) => Task.CompletedTask;
+    public Task<IReadOnlyList<int>> CreateChildrenAsync(int parentId, IReadOnlyList<ChildItem> children, CancellationToken ct) =>
+        throw new NotSupportedException();
 }
 
 /// <summary>Like GitHub: one open PR per head branch; opening again returns the existing one.</summary>

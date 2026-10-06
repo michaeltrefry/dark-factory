@@ -9,12 +9,16 @@ Claude Code headless workers through the Weave router.
 - `src/DarkFactory.Orchestrator` — the `factory` CLI (System.CommandLine), EF Core ledger
   (`Ledger/`, migrations in `Ledger/Migrations`), Shortcut client, GitHub App auth and
   manifest setup (`GitHub/`), git worktrees (`Git/`), Claude worker and its sandbox (`Worker/`), router client,
-  session capture + SignalR hub (`Sessions/`), the `factory work` host (`FactoryHost`).
+  session capture + SignalR hub (`Sessions/`), the `factory work` host (`FactoryHost`),
+  `IWorkSource` + the `factory work` intake loop (`WorkSources/`; registered on the `factory work` host by `FactoryHost.BuildWork` via `services.AddIntake(options)`)
+  and its Shortcut adapter (`Shortcut/ShortcutWorkSource.cs`).
 - `scripts/` — `setup-worker-user.sh` (one-time root setup of the `_factory` sandbox user) and
   `factory-worker-launch` (the root-installed helper every sandboxed worker runs through).
 - `tests/DarkFactory.Orchestrator.Tests` — unit tests (no network; fake HTTP APIs, InMemory EF, local git).
   `CrashResumeTests` also needs the compose Postgres (skips locally without it, fails under `CI`): it
   SIGKILLs `tests/DarkFactory.CrashHost` (the real pipeline with a fake `claude` script) and restarts it.
+  `ShortcutContractTests` replay recorded Shortcut API fixtures (`Fixtures/shortcut`, strict request matching);
+  re-record with `SHORTCUT_RECORD=1` (writes only throwaway `[dark-factory fixture]` stories, archived after).
 - `tests/DarkFactory.AcceptanceTests` — live epic acceptance harness; skips unless `FACTORY_E2E=1`.
 
 ## Commands
@@ -27,7 +31,7 @@ dotnet test                                   # unit tests; acceptance tests ski
 dotnet ef database update --project src/DarkFactory.Orchestrator
 dotnet ef migrations add <Name> --project src/DarkFactory.Orchestrator -o Ledger/Migrations
 dotnet run --project src/DarkFactory.Orchestrator -- run sc-1234
-dotnet run --project src/DarkFactory.Orchestrator -- work          # long-running host: session hub on 127.0.0.1
+dotnet run --project src/DarkFactory.Orchestrator -- work          # long-running host: session hub on 127.0.0.1 + the intake loop (polls the watch scope)
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup
 dotnet run --project src/DarkFactory.Orchestrator -- github-repo protect owner/name   # rulesets; owner's GH_TOKEN / `gh auth token`
 ```
@@ -45,6 +49,8 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
 | `Factory:DefaultRepo` | `michaeltrefry/dark-factory-sandbox` (a story line `Repo: owner/name` overrides) |
+| `Shortcut:Watch:Teams`, `Shortcut:Watch:Epics` | empty = watch nothing; comma-separated team mention names/ids, epic ids |
+| `Intake:PollSeconds` | `60` |
 | `Factory:WorkRoot` | `/opt/dark-factory/work` (clones + worktrees; `~/.dark-factory` when `Worker:RunAs=none`) |
 | `ConnectionStrings:Ledger` | `Host=localhost;Port=5434;Database=factory;Username=factory;Password=factory` |
 | `Worker:ClaudePath` | `claude` (as the worker user sees it: `~_factory/.local/bin` is first on its PATH) |
@@ -71,7 +77,15 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
 (printf is a builtin: nothing in argv) and verify with
 `[ "$(security find-generic-password -s dark-factory -a <account> -w)" = "$(pbpaste)" ] && echo stored-ok`.
 
-## Invariants (epic E1–E4)
+## Invariants (epic E1–E4, E6)
+
+- The orchestrator touches a board only through `IWorkSource` (E6). Shortcut workflow state ids are resolved by
+  name from the API (never hardcoded); "ready" = `To Do` inside the watch scope, minus stories another claimant holds.
+  Intake claims (owner + `factory-claimed` label, In Progress) as a `claimed` checkpoint; the PR and branch links
+  are a `linked` checkpoint before Review. `ClaimAsync` refuses (no write) unless the fresh story is To Do or already
+  ours, in scope (skipped by `factory run --ignore-scope`) and not another owner's, and reads the claim back; a refusal
+  parks the item (Paused + `parked` checkpoint). Only Paused rows with detail `interrupted` (`RunPipeline.Interrupted`)
+  auto-resume (`RunPipeline.InFlightAsync`); a user's Pause must use another detail. Resumes re-check the scope.
 
 - Every state change is a committed ledger row before the next step (`WorkLedger.RecordAsync`), checked
   against the transition table in `Ledger/Lifecycle.cs` first; an illegal transition throws and writes nothing.

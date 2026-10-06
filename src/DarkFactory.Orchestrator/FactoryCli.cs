@@ -9,7 +9,7 @@ public static class FactoryCli
     public const int DefaultSetupPort = 47821;
 
     public static RootCommand Build(
-        Func<int, CancellationToken, Task<int>> run,
+        Func<int, bool, CancellationToken, Task<int>> run,
         Func<string, int, CancellationToken, Task<int>> setupGitHubApp,
         Func<RepoRef, CancellationToken, Task<int>> protectRepo,
         Func<CancellationToken, Task<int>> work)
@@ -28,8 +28,16 @@ public static class FactoryCli
                 return 0;
             },
         };
-        var runCommand = new Command("run", "Run one Shortcut story through Intake → Implement → Review, resuming from its last ledger state.") { storyArgument };
-        runCommand.SetAction((parse, ct) => run(parse.GetValue(storyArgument), ct));
+        var ignoreScopeOption = new Option<bool>("--ignore-scope")
+        {
+            Description = "Claim and resume the story even if it is outside the Shortcut watch scope (the other claim checks still apply)",
+        };
+        var runCommand = new Command("run", "Run one Shortcut story through Intake → Implement → Review, resuming from its last ledger state.")
+        {
+            storyArgument,
+            ignoreScopeOption,
+        };
+        runCommand.SetAction((parse, ct) => run(parse.GetValue(storyArgument), parse.GetValue(ignoreScopeOption), ct));
 
         var nameOption = new Option<string>("--name")
         {
@@ -72,7 +80,7 @@ public static class FactoryCli
         };
         protectCommand.SetAction((parse, ct) => protectRepo(parse.GetValue(repoArgument)!, ct));
 
-        var workCommand = new Command("work", "Run the long-running factory host (session hub on 127.0.0.1:Factory:HostPort) until Ctrl-C.");
+        var workCommand = new Command("work", "Run the long-running factory host until Ctrl-C: the session hub on 127.0.0.1:Factory:HostPort, and the intake loop that polls the watched Shortcut scope and runs each ready (To Do) story, one at a time.");
         workCommand.SetAction((_, ct) => work(ct));
 
         return new RootCommand("Dark Factory orchestrator")

@@ -79,7 +79,7 @@ public sealed class CrashResumeTests : IAsyncLifetime
         Assert.Equal(["fresh", "orphans gone", $"resume {Session}"], File.ReadAllLines(Invocations));
         var rows = await Rows();
         Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Review], rows.Where(r => r.Step is null).Select(r => r.State));
-        Assert.Equal(["worker-started", "session", "orphan-killed", "worker-started", "worker-done", "pushed"],
+        Assert.Equal(["claimed", "worker-started", "session", "orphan-killed", "worker-started", "worker-done", "pushed", "linked"],
             rows.Where(r => r.Step is not null).Select(r => r.Step));
         Assert.Equal($"pid {orphan[0]}", rows.Single(r => r.Step == RunPipeline.Steps.OrphanKilled).Detail);
         Assert.Equal(Session, rows[^1].ClaudeSessionId);
@@ -102,7 +102,7 @@ public sealed class CrashResumeTests : IAsyncLifetime
             Assert.Equal((Session, 1, "succeeded"), (session.ClaudeSessionId, session.Attempt, session.ExitStatus));
         }
 
-        // Run 3: a parked item redoes nothing.
+        // Run 3: a parked item redoes nothing; the story is told once why nothing happens.
         using (var third = StartHost())
         {
             await third.WaitForExitAsync(ct);
@@ -110,7 +110,10 @@ public sealed class CrashResumeTests : IAsyncLifetime
         }
         Assert.Equal(3, File.ReadAllLines(Invocations).Length);
         Assert.Single(File.ReadAllLines(Path.Combine(_dir, "prs.log")));
-        Assert.Equal(rows.Count, (await Rows()).Count);
+        var after = await Rows();
+        Assert.Equal(rows.Count + 1, after.Count);
+        Assert.Equal(RunPipeline.Steps.HeldNotice, after[^1].Step);
+        Assert.Contains("is Review in the factory ledger", Assert.Single(File.ReadAllLines(Path.Combine(_dir, "comments.log"))));
     }
 
     private async Task<List<LedgerEntry>> Rows()

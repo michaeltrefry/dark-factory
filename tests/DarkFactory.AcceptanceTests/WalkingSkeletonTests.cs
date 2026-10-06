@@ -69,7 +69,8 @@ public class WalkingSkeletonTests
         var ct = TestContext.Current.CancellationToken;
         var startedAt = DateTimeOffset.UtcNow;
 
-        var outcome = await FactoryRunner.RunAsync(Harness.Options, storyId, Console.Out, ct);
+        // The story is named explicitly by FACTORY_E2E_STORY, like a manual `factory run --ignore-scope`.
+        var outcome = await FactoryRunner.RunAsync(Harness.Options, storyId, ignoreScope: true, Console.Out, ct);
         Assert.True(outcome.Succeeded, outcome.Error);
 
         // Ledger: Intake → Implement → Review for this run, timestamped, carrying the session id.

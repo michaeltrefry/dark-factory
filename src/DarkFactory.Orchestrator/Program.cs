@@ -4,17 +4,17 @@ using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Sessions;
 using DarkFactory.Orchestrator.Shortcut;
-using Microsoft.EntityFrameworkCore;
+using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.Extensions.Hosting;
 
 return await FactoryCli.Build(RunAsync, SetupGitHubAppAsync, ProtectRepoAsync, WorkAsync).Parse(args).InvokeAsync();
 
-static async Task<int> RunAsync(int storyId, CancellationToken ct)
+static async Task<int> RunAsync(int storyId, bool ignoreScope, CancellationToken ct)
 {
     var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
     try
     {
-        var outcome = await FactoryRunner.RunAsync(options, storyId, Console.Out, ct);
+        var outcome = await FactoryRunner.RunAsync(options, storyId, ignoreScope, Console.Out, ct);
         return outcome.Succeeded ? 0 : 1;
     }
     catch (MissingCredentialException ex)
@@ -29,17 +29,32 @@ static async Task<int> WorkAsync(CancellationToken ct)
     var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
     try
     {
-        _ = options.RouterKey; // session costs come from the router: fail fast without its key
+        // Fail fast on a missing credential or a bad scope rather than on the first ready item.
+        // Session costs come from the router; intake needs Shortcut and the GitHub App.
+        _ = (options.ShortcutApiToken, options.RouterKey, options.GitHubAppId, options.GitHubAppPrivateKeyPem);
+        if (options.WatchScope.IsEmpty)
+        {
+            Console.Error.WriteLine("Watch scope is empty (set Shortcut:Watch:Teams and/or Shortcut:Watch:Epics); nothing will be picked up.");
+        }
     }
-    catch (MissingCredentialException ex)
+    catch (Exception ex) when (ex is MissingCredentialException or InvalidOperationException)
     {
         Console.Error.WriteLine(ex.Message);
         return 2;
     }
+    using (var shortcutHttp = new HttpClient { BaseAddress = ShortcutWorkSource.DefaultBaseAddress })
+    {
+        if (await FactoryRunner.CheckWatchScopeAsync(options, shortcutHttp, ct) is { } scopeError)
+        {
+            Console.Error.WriteLine(scopeError);
+            return 2;
+        }
+    }
     await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
-    await using var app = FactoryHost.Build(options);
+    // One process: the session hub and its relay, plus the intake loop polling the watch scope.
+    await using var app = FactoryHost.BuildWork(options);
     await app.StartAsync(ct);
-    Console.WriteLine($"factory work: session hub on {app.Address()}{SessionHub.Path}; Ctrl-C stops");
+    Console.WriteLine($"factory work: session hub on {app.Address()}{SessionHub.Path}; intake polling every {options.PollInterval}; Ctrl-C stops");
     await app.WaitForShutdownAsync(ct);
     return 0;
 }
