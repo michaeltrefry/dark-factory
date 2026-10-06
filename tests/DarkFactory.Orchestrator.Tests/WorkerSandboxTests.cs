@@ -343,6 +343,115 @@ public class WorkerSandboxTests
         Assert.Equal(137, exitCode);
     }
 
+    private const string ListPrimitive =
+        "list_uid_procs() { { ps -U \"$self_uid\" -o pid=,ppid=; ps -u \"$self_uid\" -o pid=,ppid=; } 2>/dev/null || true; }";
+    private const string DescendantExclusion = "if (q != root) print p";
+
+    /// <summary>
+    /// The sweep's machinery as the sandbox user sees it on pass <c>$n</c>: the helper ($$, parent 1), the
+    /// $(...) subshell (child of $$), ps (child of the subshell), a nested subshell and its child, and a
+    /// stage run straight from $$ — all with fresh pids every pass, as on the real machine.
+    /// </summary>
+    private const string Machinery =
+        "s=$((500000 + n * 10)); echo \"$$ 1\"; echo \"$s $$\"; echo \"$((s + 1)) $s\"; "
+        + "echo \"$((s + 2)) $s\"; echo \"$((s + 3)) $((s + 2))\"; echo \"$((s + 4)) $$\"";
+
+    /// <summary>
+    /// A copy of the helper whose uid sweep sends no signals and reads no real process table: the listing
+    /// is <paramref name="listing"/> (a shell snippet printing "pid ppid" lines, with the pass number in
+    /// <c>$n</c>; the pass count lands in <c>passes</c>) and the kill primitive only logs to <c>targets</c>.
+    /// Synthetic pids are above macOS's pid limit, so even a leaked kill could not reach a real process.
+    /// </summary>
+    /// <param name="descendants">false: the mutation that drops the descendant exclusion.</param>
+    private string HelperWithFakeListing(string listing, bool descendants = true)
+    {
+        var passes = Path.Combine(_dir, "passes");
+        var targets = Path.Combine(_dir, "targets");
+        File.WriteAllText(passes, "0\n");
+        var fakeList = "list_uid_procs() { n=$(( $(cat '" + passes + "') + 1 )); echo \"$n\" >'" + passes + "'; " + listing + "; }";
+        var logOnly = "kill_pids() { printf '%s\\n' \"$@\" >>'" + targets + "'; }";
+        var source = File.ReadAllText(SandboxSupport.Helper);
+        Assert.Contains(KillPrimitive, source);
+        Assert.Contains(ListPrimitive, source);
+        Assert.Contains(DescendantExclusion, source);
+        var copy = source
+            .Replace("\nsandbox_user=_factory\n", $"\nsandbox_user={Environment.UserName}\n")
+            .Replace(KillPrimitive, logOnly)
+            .Replace(ListPrimitive, fakeList);
+        if (!descendants)
+        {
+            copy = copy.Replace(DescendantExclusion, "print p");
+        }
+        // The seam must hold before anything runs: no real listing, no signal primitive in the sweep.
+        Assert.Contains(logOnly, copy);
+        Assert.Contains(fakeList, copy);
+        Assert.DoesNotContain("ps -U", copy);
+        Assert.DoesNotContain("kill -KILL \"$@\"", copy);
+        return SandboxSupport.Executable(_dir, "fake-listing-helper", copy);
+    }
+
+    private async Task<(int ExitCode, string Stderr, int Passes, int[] Targets)> RunFakeListingHelperAsync(string helper)
+    {
+        var psi = new ProcessStartInfo(helper, ["/bin/sh", "-c", "exit 0"]) { RedirectStandardInput = true, RedirectStandardError = true };
+        using var p = Process.Start(psi)!;
+        await p.StandardInput.WriteAsync("\n");
+        await p.StandardInput.FlushAsync();
+        var stderr = await p.StandardError.ReadToEndAsync();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await p.WaitForExitAsync(cts.Token);
+        p.StandardInput.Close();
+        var targets = Path.Combine(_dir, "targets");
+        return (p.ExitCode, stderr, int.Parse(File.ReadAllText(Path.Combine(_dir, "passes")).Trim()),
+            File.Exists(targets) ? File.ReadAllLines(targets).Select(int.Parse).ToArray() : []);
+    }
+
+    [Fact]
+    public async Task Uid_sweep_ignores_its_own_machinery_and_settles_at_once()
+    {
+        var (exitCode, stderr, passes, targets) = await RunFakeListingHelperAsync(HelperWithFakeListing(Machinery));
+
+        Assert.Equal(0, exitCode);
+        Assert.Empty(targets);
+        Assert.Equal(1, passes);
+        Assert.Equal("", stderr);
+    }
+
+    [Fact]
+    public async Task Seam_catches_a_uid_sweep_that_counts_its_own_machinery()
+    {
+        // The bug seen as _factory: "processes still appearing after 20 sweeps" after every run.
+        var (exitCode, stderr, passes, targets) = await RunFakeListingHelperAsync(HelperWithFakeListing(Machinery, descendants: false));
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal(20, passes);
+        Assert.Contains("still appearing after 20 sweeps", stderr);
+        Assert.Contains(500011, targets); // pass 1's ps
+    }
+
+    [Fact]
+    public async Task Uid_sweep_kills_reparented_survivors_and_settles()
+    {
+        var (exitCode, stderr, passes, targets) = await RunFakeListingHelperAsync(
+            HelperWithFakeListing(Machinery + "; echo '400001 1'; echo '400002 400001'"));
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal([400001, 400002], targets.Order());
+        Assert.Equal(2, passes); // the second pass finds only what was already signalled
+        Assert.Equal("", stderr);
+    }
+
+    [Fact]
+    public async Task Uid_sweep_gives_up_with_a_warning_on_survivors_that_keep_appearing()
+    {
+        var (exitCode, stderr, passes, targets) = await RunFakeListingHelperAsync(
+            HelperWithFakeListing(Machinery + "; echo \"$((600000 + n)) 1\""));
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal(20, passes);
+        Assert.Equal(Enumerable.Range(600001, 20), targets.Order());
+        Assert.Contains("still appearing after 20 sweeps", stderr);
+    }
+
     /// <summary>
     /// perl: double-fork a grandchild that setsid()s away — a new session and process group, reparented
     /// to launchd, so neither the tree kill nor the group kill can reach it (as a detached build server
