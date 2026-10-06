@@ -77,6 +77,7 @@ public sealed class SessionCaptureTests : IAsyncLifetime
 {
     private TempPostgresDatabase? _db;
     private string _cs = null!;
+    private CookieContainer _cookies = null!;
 
     public async ValueTask InitializeAsync()
     {
@@ -302,7 +303,7 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         await worker.FirstBatchSent.Task.WaitAsync(TimeSpan.FromSeconds(30));
         await WaitUntilAsync(async () => (await EventsAsync()).Count == 5);
 
-        await using var viewer = await Viewer.JoinAsync(app, StreamJsonFixture.SessionId, clock);
+        await using var viewer = await Viewer.JoinAsync(app, _cookies, StreamJsonFixture.SessionId, clock);
 
         worker.Release.SetResult();
         var outcome = await run.WaitAsync(TimeSpan.FromSeconds(30));
@@ -351,11 +352,11 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         });
 
         await WaitUntilAsync(async () => (await EventsAsync()).Count >= 1);
-        await using var early = await Viewer.JoinAsync(app, sid);
+        await using var early = await Viewer.JoinAsync(app, _cookies, sid);
         await WaitUntilAsync(async () => (await EventsAsync()).Count >= total / 3);
-        await using var middle = await Viewer.JoinAsync(app, sid);
+        await using var middle = await Viewer.JoinAsync(app, _cookies, sid);
         await WaitUntilAsync(async () => (await EventsAsync()).Count >= 2 * total / 3);
-        await using var late = await Viewer.JoinAsync(app, sid);
+        await using var late = await Viewer.JoinAsync(app, _cookies, sid);
         Assert.False(writer.IsCompleted, "the writer finished before the last viewer joined: nothing was mid-stream");
         await writer.WaitAsync(TimeSpan.FromSeconds(30));
 
@@ -383,7 +384,7 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         }
         await WaitUntilAsync(async () => (await EventsAsync()).Count == 4);
 
-        await using var viewer = await Viewer.JoinAsync(app, StreamJsonFixture.SessionId);
+        await using var viewer = await Viewer.JoinAsync(app, _cookies, StreamJsonFixture.SessionId);
         await viewer.Connection.InvokeAsync("JoinSession", StreamJsonFixture.SessionId);
         foreach (var line in StreamJsonFixture.Fresh.Skip(4))
         {
@@ -420,7 +421,7 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         }
 
         await WriteAsync(1, 10);
-        await using var viewer = await Viewer.JoinAsync(app, "sess-relay");
+        await using var viewer = await Viewer.JoinAsync(app, _cookies, "sess-relay");
         await WaitUntilAsync(() => Task.FromResult(viewer.Received.Count == 10));
 
         // Kill the relay's LISTEN backend; these commits notify nobody (the relay waits 1 s to reconnect).
@@ -496,6 +497,8 @@ public sealed class SessionCaptureTests : IAsyncLifetime
             }
         });
         await app.StartAsync();
+        // Logged in once up front: a login (PBKDF2) per viewer would slow joins that race a running writer.
+        _cookies = await DashboardLogin.LoginAsync(app.Address());
         return new RunningHost(app);
     }
 
@@ -514,10 +517,9 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         public required HubConnection Connection { get; init; }
         public ConcurrentQueue<(SessionEventMessage Event, TimeSpan At)> Received { get; } = new();
 
-        public static async Task<Viewer> JoinAsync(WebApplication app, string sessionId, Stopwatch? clock = null)
+        public static async Task<Viewer> JoinAsync(WebApplication app, CookieContainer cookies, string sessionId, Stopwatch? clock = null)
         {
             clock ??= Stopwatch.StartNew();
-            var cookies = await DashboardLogin.LoginAsync(app.Address());
             var viewer = new Viewer { Connection = new HubConnectionBuilder().WithUrl(app.Address() + SessionHub.Path, o => o.Cookies = cookies).Build() };
             viewer.Connection.On<string, SessionEventMessage[]>(SessionHub.EventsMethod, (id, events) =>
             {
