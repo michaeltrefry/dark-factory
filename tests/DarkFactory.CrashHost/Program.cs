@@ -26,7 +26,7 @@ var pipeline = new RunPipeline(
     new RepoRef("acme", "widgets"),
     Console.Out,
     new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(connection)),
-        StoreOnlyPublisher.Instance, new NoCost(), TimeProvider.System, Console.Out, costRetryDelays: []));
+        new NoCost(), TimeProvider.System, Console.Out, costRetryDelays: []));
 
 var outcome = await pipeline.RunAsync(storyId, CancellationToken.None);
 Console.WriteLine($"outcome: {outcome}");

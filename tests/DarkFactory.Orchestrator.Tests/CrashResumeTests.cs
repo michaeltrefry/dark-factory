@@ -53,8 +53,8 @@ public sealed class CrashResumeTests : IAsyncLifetime
         // Run 1: the worker starts, streams its session id, then works silently; the orchestrator dies.
         using (var first = StartHost())
         {
+            // Killed as soon as the ledger names the session, whether or not its first event is stored yet.
             await WaitForAsync(async () => (await Rows()).Any(r => r.Step == RunPipeline.Steps.Session), first, "session checkpoint", ct);
-            await WaitForAsync(async () => (await Events()).Count == 1, first, "stored init event", ct);
             first.Kill(); // SIGKILL
             await first.WaitForExitAsync(ct);
         }
@@ -88,8 +88,11 @@ public sealed class CrashResumeTests : IAsyncLifetime
         Assert.Contains("after-resume.txt", files);
         Assert.False(File.Exists(Path.Combine(_dir, "comments.log")));
 
-        // The resumed run appended to the same session: no gap, no duplicate (E7).
-        Assert.Equal([(1L, "system"), (2L, "system"), (3L, "result")], (await Events()).Select(e => (e.Sequence, e.Type)));
+        // The resumed run appended to the same session row: no gap, no duplicate (E7). The first run's init
+        // line is stored unless the kill beat its queued write (a lost tail, never a hole).
+        var events = (await Events()).Select(e => (e.Sequence, e.Type)).ToList();
+        Assert.True(events.SequenceEqual([(1L, "system"), (2L, "system"), (3L, "result")]) || events.SequenceEqual([(1L, "system"), (2L, "result")]),
+            string.Join(", ", events));
         await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_ledger)))
         {
             var session = await db.WorkerSessions.SingleAsync();

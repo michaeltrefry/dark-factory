@@ -200,7 +200,8 @@ public sealed class ClaudeWorker(
             {
                 if (onLine is not null)
                 {
-                    await onLine(line, ct);
+                    // The worker's timeout also bounds a stalled tap (e.g. a slow database).
+                    await onLine(line, timeoutCts.Token);
                 }
                 state.Accept(line);
                 if (onSession is not null && state.SessionId is { } sid && sid != reported)

@@ -108,7 +108,12 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   The App private key never reaches a worker's env, argv or worktree (`ClaudeWorkerTests`).
 - Every worker stdout line is a `session_events` row (E7): `ClaudeWorker` taps each line (`WorkerCallbacks.OnLine`) into a
   bounded channel that `SessionRecorder` drains into Postgres in order (gapless `Sequence`, non-JSON lines kept as `raw`);
-  a resumed session continues its `worker_sessions` row and sequence. At session end the row gets exit status and the
-  router cost (`GET /v1/sessions/:id/cost`, reporting only, E9). In `factory work`, `SessionHub` (`/hubs/sessions`,
-  `JoinSession(id)`) sends the stored backlog then live events, once each; a one-shot `factory run` stores only.
+  a resumed session continues its `worker_sessions` row and sequence. The row is named (`SetClaudeSessionIdAsync`) before
+  the ledger checkpoints the session id, and a resume whose id matches no row continues the item's newest unnamed row.
+  At session end the row gets exit status and the router cost (`GET /v1/sessions/:id/cost`, retried ~60 s while missing
+  or zero; reporting only, E9). The recorder only stores: an insert trigger NOTIFYs `session_events`, and in `factory work`
+  `SessionEventRelay` LISTENs (reconnecting and catching up from the ledger) and `SessionBroadcaster` pushes to
+  `SessionHub` (`/hubs/sessions`, `JoinSession(id)`) viewers the stored backlog then live events, once each, whichever
+  process (`factory work` or a separate `factory run`) recorded them. Slow viewers are disconnected, never waited on.
+  The hub answers only `Host: 127.0.0.1|localhost` and same-origin (or Origin-less) clients.
 - Tests: xunit.v3 on Microsoft.Testing.Platform (`global.json` opts in).

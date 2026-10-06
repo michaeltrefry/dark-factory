@@ -99,5 +99,9 @@ public class WalkingSkeletonTests
         // Router: non-zero cost recorded for the session id in the ledger.
         var cost = await Harness.WaitForCostAsync(rows[2].ClaudeSessionId!, routerKey, ct);
         Assert.True(cost is { ActualCostUsdMicros: > 0 }, $"no router cost for session {rows[2].ClaudeSessionId}");
+
+        // S6: the ended session's row holds that cost (the run waits for the router to commit it).
+        var session = await db.WorkerSessions.AsNoTracking().SingleAsync(s => s.ClaudeSessionId == outcome.SessionId, ct);
+        Assert.True(session.CostUsd > 0, $"worker_sessions.CostUsd for {outcome.SessionId} is {session.CostUsd?.ToString() ?? "null"}");
     }
 }

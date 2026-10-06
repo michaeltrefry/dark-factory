@@ -257,6 +257,27 @@ public class ClaudeWorkerTests
     }
 
     [Fact]
+    public async Task A_stalled_line_tap_is_bounded_by_the_worker_timeout()
+    {
+        var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
+        var script = Path.Combine(dir, "fake-claude.sh");
+        File.WriteAllText(script, """
+            #!/bin/sh
+            echo '{"type":"system","subtype":"init","session_id":"sess-stall"}'
+            echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-stall"}'
+            """);
+        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        // The tap never finishes on its own (a stalled database): only the worker timeout can end it.
+        var run = new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMilliseconds(500)).RunAsync(dir, "p", null,
+            new WorkerCallbacks(OnLine: async (_, c) => await Task.Delay(Timeout.Infinite, c)), CancellationToken.None);
+
+        // (WaitAsync's own TimeoutException has a different message.)
+        var ex = await Assert.ThrowsAsync<TimeoutException>(() => run.WaitAsync(TimeSpan.FromSeconds(15)));
+        Assert.StartsWith("Worker did not finish within", ex.Message);
+    }
+
+    [Fact]
     public async Task Worker_leads_its_own_process_group_and_reports_its_pid_before_streaming()
     {
         var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;

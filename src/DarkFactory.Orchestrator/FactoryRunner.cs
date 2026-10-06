@@ -52,9 +52,9 @@ public static class FactoryRunner
             new GitHubPullRequests(githubHttp, app),
             options.DefaultRepo,
             log,
-            // One-shot run: no hub, so events are stored only (the `factory work` host pushes them live).
+            // Events are stored only; a running `factory work` host relays them to its viewers (LISTEN/NOTIFY).
             new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)),
-                StoreOnlyPublisher.Instance, new RouterClient(routerHttp, routerKey), TimeProvider.System, log));
+                new RouterClient(routerHttp, routerKey), TimeProvider.System, log));
 
         return await pipeline.RunAsync(storyId, ct);
     }

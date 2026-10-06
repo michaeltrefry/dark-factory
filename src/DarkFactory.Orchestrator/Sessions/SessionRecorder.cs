@@ -9,46 +9,32 @@ namespace DarkFactory.Orchestrator.Sessions;
 /// <summary>A stored session event as viewers receive it.</summary>
 public sealed record SessionEventMessage(long Sequence, string Type, string? Subtype, string Payload, DateTimeOffset ReceivedAt);
 
-/// <summary>Delivers newly stored session events to live viewers.</summary>
-public interface ISessionEventPublisher
-{
-    /// <summary>
-    /// Runs <paramref name="commit"/>, which stores a batch of events of the session row
-    /// <paramref name="workerSessionId"/>, then delivers the stored batch to the viewers of
-    /// <paramref name="claudeSessionId"/> (nobody while it is null). A viewer joining meanwhile
-    /// gets each event exactly once: in its backlog or live.
-    /// </summary>
-    Task CommitAndPublishAsync(long workerSessionId, string? claudeSessionId, Func<Task<IReadOnlyList<SessionEventMessage>>> commit);
-}
-
-/// <summary>No live viewers (the one-shot <c>factory run</c>): events are only stored.</summary>
-public sealed class StoreOnlyPublisher : ISessionEventPublisher
-{
-    public static readonly StoreOnlyPublisher Instance = new();
-
-    public Task CommitAndPublishAsync(long workerSessionId, string? claudeSessionId, Func<Task<IReadOnlyList<SessionEventMessage>>> commit) =>
-        commit();
-}
-
 /// <summary>
 /// Persists worker sessions and their stream-json events (E7): <see cref="StartAsync"/> opens
 /// a <see cref="SessionCapture"/> per worker run, which stores every stdout line in order and,
 /// when the run ends, the exit status and the router's cost for the session (E9).
+/// Storing is all it does: an insert trigger NOTIFYs <see cref="SessionEventRelay.Channel"/>, and the
+/// <c>factory work</c> host relays stored events to live viewers, whichever process wrote them.
 /// </summary>
 public sealed class SessionRecorder(
     IDbContextFactory<LedgerDbContext> contexts,
-    ISessionEventPublisher publisher,
     ISessionCostSource costs,
     TimeProvider time,
     TextWriter log,
-    int capacity = 4096,
+    int capacity = SessionRecorder.DefaultCapacity,
     IReadOnlyList<TimeSpan>? costRetryDelays = null)
 {
-    /// <summary>The router commits a session's cost shortly after its last request; wait this long for it.</summary>
-    private static readonly TimeSpan[] DefaultCostRetryDelays = [TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4)];
+    /// <summary>Queued lines per run. A stream-json line can be large (tool results), so this stays modest.</summary>
+    public const int DefaultCapacity = 256;
+
+    /// <summary>
+    /// The router commits a session's cost asynchronously, some time after its last request
+    /// (the acceptance harness allows ~60 s): retry this long while it is missing or still zero.
+    /// </summary>
+    public static readonly IReadOnlyList<TimeSpan> DefaultCostRetryDelays =
+        [.. new[] { 1, 2, 4, 8 }.Select(s => TimeSpan.FromSeconds(s)), .. Enumerable.Repeat(TimeSpan.FromSeconds(5), 9)];
 
     private readonly IDbContextFactory<LedgerDbContext> _contexts = contexts;
-    private readonly ISessionEventPublisher _publisher = publisher;
     private readonly ISessionCostSource _costs = costs;
     private readonly TimeProvider _time = time;
     private readonly TextWriter _log = log;
@@ -57,14 +43,25 @@ public sealed class SessionRecorder(
 
     /// <summary>
     /// Opens the capture of one worker run. Resuming <paramref name="resumeSessionId"/> continues
-    /// that session's row and sequence; otherwise a new session row is created.
+    /// that session's row and sequence; otherwise a new session row is created. A crash can leave
+    /// the session id checkpointed in the ledger before its row holds it: then the item's newest
+    /// row, if it has no session id, is that session's row and is continued.
     /// </summary>
     public async Task<SessionCapture> StartAsync(long workItemId, string? resumeSessionId, CancellationToken ct)
     {
         await using var db = await _contexts.CreateDbContextAsync(ct);
-        var session = resumeSessionId is null
-            ? null
-            : await db.WorkerSessions.SingleOrDefaultAsync(s => s.ClaudeSessionId == resumeSessionId, ct);
+        WorkerSession? session = null;
+        if (resumeSessionId is not null)
+        {
+            session = await db.WorkerSessions.SingleOrDefaultAsync(s => s.ClaudeSessionId == resumeSessionId, ct);
+            if (session is null
+                && await db.WorkerSessions.Where(s => s.WorkItemId == workItemId).OrderByDescending(s => s.Id).FirstOrDefaultAsync(ct)
+                    is { ClaudeSessionId: null } unnamed)
+            {
+                session = unnamed;
+                session.ClaudeSessionId = resumeSessionId;
+            }
+        }
         long next = 1;
         if (session is null)
         {
@@ -100,13 +97,14 @@ public sealed class SessionRecorder(
         private readonly Channel<(string Line, DateTimeOffset At)> _lines;
         private readonly Task _writer;
         private long _next;
+        private string? _claudeSessionId;
 
         internal SessionCapture(SessionRecorder recorder, long workerSessionId, long workItemId, string? claudeSessionId, long next)
         {
             _recorder = recorder;
             WorkerSessionId = workerSessionId;
             _workItemId = workItemId;
-            ClaudeSessionId = claudeSessionId;
+            _claudeSessionId = claudeSessionId;
             _next = next;
             _lines = Channel.CreateBounded<(string, DateTimeOffset)>(
                 new BoundedChannelOptions(recorder._capacity) { SingleReader = true, SingleWriter = true, FullMode = BoundedChannelFullMode.Wait });
@@ -116,11 +114,23 @@ public sealed class SessionRecorder(
         public long WorkerSessionId { get; }
 
         /// <summary>Null until the stream reports it (or the run resumes a known session).</summary>
-        public string? ClaudeSessionId { get; private set; }
+        public string? ClaudeSessionId => Volatile.Read(ref _claudeSessionId);
 
         /// <summary>The <see cref="WorkerCallbacks.OnLine"/> tap.</summary>
         public ValueTask OnLineAsync(string line, CancellationToken ct) =>
             _lines.Writer.WriteAsync((line, _recorder._time.GetUtcNow()), ct);
+
+        /// <summary>
+        /// Stores the session id on the row now, ahead of the queued line that carries it, so a crash
+        /// after the caller checkpoints the id cannot leave the row unnamed. Call it before that checkpoint.
+        /// </summary>
+        public async Task SetClaudeSessionIdAsync(string sessionId, CancellationToken ct)
+        {
+            await using var db = await _recorder._contexts.CreateDbContextAsync(ct);
+            await db.WorkerSessions.Where(s => s.Id == WorkerSessionId && s.ClaudeSessionId == null)
+                .ExecuteUpdateAsync(u => u.SetProperty(s => s.ClaudeSessionId, sessionId), ct);
+            Interlocked.CompareExchange(ref _claudeSessionId, sessionId, null);
+        }
 
         /// <summary>
         /// Stores the remaining lines, then the end of the run and, with <paramref name="fetchCost"/>,
@@ -157,29 +167,32 @@ public sealed class SessionRecorder(
             }
         }
 
+        /// <summary>
+        /// The router's committed cost: retried while it is missing (404) or still zero (not fully
+        /// committed), up to the recorder's retry delays. Null if it never arrives.
+        /// </summary>
         private async Task<SessionCost?> FetchCostAsync(string sessionId, CancellationToken ct)
         {
             var delays = _recorder._costRetryDelays;
-            try
+            for (var attempt = 0; ; attempt++)
             {
-                for (var attempt = 0; ; attempt++)
+                try
                 {
-                    if (await _recorder._costs.GetSessionCostAsync(sessionId, ct) is { } cost)
+                    if (await _recorder._costs.GetSessionCostAsync(sessionId, ct) is { ActualCostUsdMicros: > 0 } cost)
                     {
                         return cost;
                     }
-                    if (attempt >= delays.Count)
-                    {
-                        _recorder._log.WriteLine($"[session] router has no cost for session {sessionId} yet");
-                        return null;
-                    }
-                    await Task.Delay(delays[attempt], _recorder._time, ct);
                 }
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
-            {
-                _recorder._log.WriteLine($"[session] router cost for session {sessionId} unavailable: {ex.Message}");
-                return null;
+                catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+                {
+                    _recorder._log.WriteLine($"[session] router cost for session {sessionId}: {ex.Message}");
+                }
+                if (attempt >= delays.Count)
+                {
+                    _recorder._log.WriteLine($"[session] router has no committed cost for session {sessionId}; left unset");
+                    return null;
+                }
+                await Task.Delay(delays[attempt], _recorder._time, ct);
             }
         }
 
@@ -228,19 +241,24 @@ public sealed class SessionRecorder(
                     ReceivedAt = at,
                 });
             }
-            await _recorder._publisher.CommitAndPublishAsync(WorkerSessionId, ClaudeSessionId ?? learned, async () =>
+            // One transaction; the session_events insert trigger NOTIFYs the live relay when it commits.
+            await using (var db = await _recorder._contexts.CreateDbContextAsync())
+            await using (var tx = await db.Database.BeginTransactionAsync())
             {
-                await using var db = await _recorder._contexts.CreateDbContextAsync();
                 db.SessionEvents.AddRange(events);
+                await db.SaveChangesAsync();
                 if (learned is not null)
                 {
-                    (await db.WorkerSessions.SingleAsync(s => s.Id == WorkerSessionId)).ClaudeSessionId = learned;
+                    await db.WorkerSessions.Where(s => s.Id == WorkerSessionId && s.ClaudeSessionId == null)
+                        .ExecuteUpdateAsync(u => u.SetProperty(s => s.ClaudeSessionId, learned));
                 }
-                await db.SaveChangesAsync();
-                return events.Select(e => new SessionEventMessage(e.Sequence, e.Type, e.Subtype, e.Payload, e.ReceivedAt)).ToList();
-            });
+                await tx.CommitAsync();
+            }
             _next += events.Count;
-            ClaudeSessionId ??= learned;
+            if (learned is not null)
+            {
+                Interlocked.CompareExchange(ref _claudeSessionId, learned, null);
+            }
         }
     }
 }
