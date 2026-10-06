@@ -178,6 +178,40 @@ public class GitHubAppTests
         Assert.Contains("head=michaeltrefry%3Afactory%2Fsc-7", api.Requests.Last().PathAndQuery);
     }
 
+    [Fact]
+    public async Task Open_pull_requests_of_a_head_are_turned_back_into_drafts_through_graphql()
+    {
+        var api = GitHubWithInstallation()
+            .On("GET /repos/michaeltrefry/dark-factory-sandbox/pulls", HttpStatusCode.OK,
+                """[{"html_url":"https://github.com/michaeltrefry/dark-factory-sandbox/pull/3","node_id":"PR_3","draft":false},{"html_url":"https://github.com/michaeltrefry/dark-factory-sandbox/pull/4","node_id":"PR_4","draft":true}]""")
+            .On("POST /graphql", HttpStatusCode.OK, """{"data":{"convertPullRequestToDraft":{"pullRequest":{"isDraft":true}}}}""");
+        var prs = new GitHubPullRequests(api.Client("https://api.github.com/"), App(api));
+
+        var urls = await prs.ConvertOpenToDraftAsync(Sandbox, "factory/sc-7", CancellationToken.None);
+
+        Assert.Equal(["https://github.com/michaeltrefry/dark-factory-sandbox/pull/3", "https://github.com/michaeltrefry/dark-factory-sandbox/pull/4"], urls);
+        Assert.Contains("state=open&head=michaeltrefry%3Afactory%2Fsc-7", api.Requests.Single(r => r.Method == HttpMethod.Get && r.PathAndQuery.Contains("/pulls")).PathAndQuery);
+        var mutation = Assert.Single(api.Requests, r => r.PathAndQuery == "/graphql"); // the draft one is left alone
+        Assert.Equal("Bearer ghs_test", mutation.Headers["Authorization"]);
+        var body = JsonDocument.Parse(mutation.Body!).RootElement;
+        Assert.Contains("convertPullRequestToDraft", body.GetProperty("query").GetString());
+        Assert.Equal("PR_3", body.GetProperty("variables").GetProperty("id").GetString());
+        Assert.DoesNotContain(api.Requests, r => r.Method == HttpMethod.Delete || r.Method == HttpMethod.Patch || r.PathAndQuery.Contains("/merge"));
+    }
+
+    [Fact]
+    public async Task A_graphql_error_turning_a_pull_request_into_a_draft_fails_the_call()
+    {
+        var api = GitHubWithInstallation()
+            .On("GET /repos/michaeltrefry/dark-factory-sandbox/pulls", HttpStatusCode.OK,
+                """[{"html_url":"https://github.com/michaeltrefry/dark-factory-sandbox/pull/3","node_id":"PR_3","draft":false}]""")
+            .On("POST /graphql", HttpStatusCode.OK, """{"errors":[{"message":"Resource not accessible by integration"}]}""");
+        var prs = new GitHubPullRequests(api.Client("https://api.github.com/"), App(api));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => prs.ConvertOpenToDraftAsync(Sandbox, "factory/sc-7", CancellationToken.None));
+        Assert.Contains("Resource not accessible by integration", ex.Message);
+    }
+
     private static byte[] FromBase64Url(string s)
     {
         s = s.Replace('-', '+').Replace('_', '/');

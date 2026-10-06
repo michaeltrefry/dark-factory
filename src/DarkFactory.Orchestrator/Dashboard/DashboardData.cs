@@ -1,3 +1,4 @@
+using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Ledger;
 using Microsoft.EntityFrameworkCore;
 
@@ -14,7 +15,9 @@ public sealed record PipelineRow(
     DateTimeOffset UpdatedAt,
     string? PullRequestUrl,
     decimal? CostUsd,
-    IReadOnlyList<SessionLink> Sessions);
+    IReadOnlyList<SessionLink> Sessions,
+    long? EpicId = null,
+    ControlState Control = ControlState.Running);
 
 /// <summary>A worker session of an item; <see cref="ClaudeSessionId"/> is null until the worker reports it.</summary>
 public sealed record SessionLink(string? ClaudeSessionId, int Attempt, DateTimeOffset StartedAt, DateTimeOffset? EndedAt, string? ExitStatus, decimal? CostUsd)
@@ -24,23 +27,41 @@ public sealed record SessionLink(string? ClaudeSessionId, int Attempt, DateTimeO
 
 public sealed record SessionHeader(long WorkItemId, string ExternalId, string Title, string Repo, SessionLink Session);
 
-/// <summary>The dashboard's reads of the ledger. Read-only: the dashboard writes nothing (E8).</summary>
+/// <summary>
+/// The dashboard's reads of the ledger. Read-only: the dashboard's only writes are the controls
+/// (<see cref="Controls.ControlActions"/>, E8).
+/// </summary>
 public interface IDashboardData
 {
-    /// <summary>Items not Done or Cancelled, oldest first.</summary>
+    /// <summary>Items not Done or Cancelled, oldest first, each with the control that applies to it.</summary>
     Task<IReadOnlyList<PipelineRow>> ActiveItemsAsync(CancellationToken ct);
 
     Task<SessionHeader?> SessionAsync(string claudeSessionId, CancellationToken ct);
+
+    /// <summary>Every scope's control (factory, epics, items).</summary>
+    Task<IReadOnlyList<Control>> ControlsAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<Control>>([]);
 }
 
 public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts) : IDashboardData
 {
     private static readonly WorkState[] Finished = [WorkState.Done, WorkState.Cancelled];
 
+    public async Task<IReadOnlyList<Control>> ControlsAsync(CancellationToken ct)
+    {
+        await using var db = await contexts.CreateDbContextAsync(ct);
+        return await db.Controls.AsNoTracking().OrderBy(c => c.Scope).ToListAsync(ct);
+    }
+
     public async Task<IReadOnlyList<PipelineRow>> ActiveItemsAsync(CancellationToken ct)
     {
         await using var db = await contexts.CreateDbContextAsync(ct);
         var items = await db.WorkItems.AsNoTracking().Where(i => !Finished.Contains(i.State)).OrderBy(i => i.Id).ToListAsync(ct);
+        var controls = (await db.Controls.AsNoTracking().ToListAsync(ct)).ToDictionary(c => c.Scope, c => c.State);
+        ControlState ControlOf(WorkItem i) =>
+            controls.GetValueOrDefault(ControlScope.Item(i.ExternalId)) == ControlState.Stopping ? ControlState.Stopping
+            : new[] { ControlScope.Factory, ControlScope.Item(i.ExternalId), i.EpicId is { } e ? ControlScope.Epic(e) : "" }
+                .Any(s => controls.GetValueOrDefault(s) == ControlState.Paused) ? ControlState.Paused
+            : ControlState.Running;
         var ids = items.Select(i => i.Id).ToList();
         var sessions = (await db.WorkerSessions.AsNoTracking().Where(s => ids.Contains(s.WorkItemId)).OrderBy(s => s.Id).ToListAsync(ct))
             .ToLookup(s => s.WorkItemId);
@@ -54,7 +75,9 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts) :
                 i.Id, i.ExternalId, i.Title, i.Repo, i.State, i.CreatedAt, i.UpdatedAt,
                 PullRequestUrl(links.GetValueOrDefault(i.Id)),
                 sessions[i.Id].Any(s => s.CostUsd is not null) ? sessions[i.Id].Sum(s => s.CostUsd ?? 0) : null,
-                sessions[i.Id].Select(Link).ToList()))
+                sessions[i.Id].Select(Link).ToList(),
+                i.EpicId,
+                ControlOf(i)))
             .ToList();
     }
 

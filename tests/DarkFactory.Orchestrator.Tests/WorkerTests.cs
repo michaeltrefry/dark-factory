@@ -7,6 +7,17 @@ namespace DarkFactory.Orchestrator.Tests;
 public class StreamJsonTests
 {
     [Fact]
+    public void Captures_the_terminal_reason_of_a_session_a_hook_ended()
+    {
+        var state = new StreamJsonState();
+        state.Accept("""{"type":"result","subtype":"success","is_error":false,"terminal_reason":"hook_stopped","session_id":"s"}""");
+
+        Assert.Equal("hook_stopped", state.TerminalReason);
+        Assert.True(new WorkerResult("s", 0, false, "success", null, "", state.TerminalReason).HookStopped);
+        Assert.False(new WorkerResult("s", 0, false, "success", null, "", "completed").HookStopped);
+    }
+
+    [Fact]
     public void Captures_session_id_from_init_and_successful_result()
     {
         var state = new StreamJsonState();
@@ -213,6 +224,98 @@ public class ClaudeWorkerTests
         Assert.False(result.Succeeded);
         Assert.Equal(3, result.ExitCode);
         Assert.Contains("boom", result.StderrTail);
+    }
+
+    [Fact]
+    public async Task Pause_hook_denies_the_next_tool_call_and_ends_the_session_only_while_the_flag_exists()
+    {
+        var dir = Directory.CreateTempSubdirectory("df-pause-").FullName;
+        var flag = ClaudeWorker.PauseFlagPath(dir, "/work/worktrees/acme/widgets/factory-sc-7/");
+        Assert.Equal(Path.Combine(dir, "factory-sc-7.pause"), flag);
+        using var settings = System.Text.Json.JsonDocument.Parse(ClaudeWorker.BuildPauseSettings(flag));
+        var hook = settings.RootElement.GetProperty("hooks").GetProperty("PreToolUse")[0];
+        Assert.Equal("*", hook.GetProperty("matcher").GetString());
+        var command = hook.GetProperty("hooks")[0].GetProperty("command").GetString()!;
+
+        Assert.Equal("", await Sh(command)); // no flag: the call proceeds
+        File.WriteAllText(flag, "");
+        using var decision = System.Text.Json.JsonDocument.Parse(await Sh(command));
+        Assert.False(decision.RootElement.GetProperty("continue").GetBoolean());
+        Assert.Equal("deny", decision.RootElement.GetProperty("hookSpecificOutput").GetProperty("permissionDecision").GetString());
+        Assert.Equal("PreToolUse", decision.RootElement.GetProperty("hookSpecificOutput").GetProperty("hookEventName").GetString());
+
+        Assert.Throws<ArgumentException>(() => ClaudeWorker.BuildPauseSettings("/tmp/it's"));
+
+        static async Task<string> Sh(string command)
+        {
+            using var p = Process.Start(new ProcessStartInfo("/bin/sh", ["-c", command]) { RedirectStandardOutput = true })!;
+            var output = await p.StandardOutput.ReadToEndAsync();
+            await p.WaitForExitAsync();
+            Assert.Equal(0, p.ExitCode);
+            return output;
+        }
+    }
+
+    [Fact]
+    public async Task Worker_gets_the_pause_hook_and_request_pause_raises_its_flag_which_the_run_clears()
+    {
+        var dir = Directory.CreateTempSubdirectory("df-pause-").FullName;
+        var flags = Path.Combine(dir, "controls");
+        var worktree = Directory.CreateDirectory(Path.Combine(dir, "factory-sc-9")).FullName;
+        var argsDump = Path.Combine(dir, "args.txt");
+        var script = Path.Combine(dir, "fake-claude.sh");
+        // Waits until the flag exists (as a tool call would), then ends.
+        File.WriteAllText(script, $$"""
+            #!/bin/sh
+            printf '%s\n' "$@" > "{{argsDump}}"
+            if [ -e "{{Path.Combine(flags, "factory-sc-9.pause")}}" ]; then echo stale > "{{Path.Combine(dir, "saw-stale")}}"; fi
+            echo '{"type":"system","subtype":"init","session_id":"s-9"}'
+            while [ ! -e "{{Path.Combine(flags, "factory-sc-9.pause")}}" ]; do sleep 0.02; done
+            echo '{"type":"result","subtype":"success","is_error":false,"session_id":"s-9"}'
+            """);
+        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        Directory.CreateDirectory(flags);
+        File.WriteAllText(Path.Combine(flags, "factory-sc-9.pause"), "stale");
+        var worker = new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1), pauseFlagDirectory: flags);
+
+        var run = worker.RunAsync(worktree, "p", null, new WorkerCallbacks(OnSession: (_, _) =>
+        {
+            ((IWorker)worker).RequestPause(worktree);
+            return Task.CompletedTask;
+        }), CancellationToken.None);
+        var result = await run.WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.True(result.Succeeded);
+        var args = File.ReadAllLines(argsDump).ToList();
+        Assert.Equal(ClaudeWorker.BuildPauseSettings(Path.Combine(flags, "factory-sc-9.pause")), args[args.IndexOf("--settings") + 1]);
+        Assert.False(File.Exists(Path.Combine(flags, "factory-sc-9.pause"))); // cleared after the run (and the stale one before it)
+        Assert.False(File.Exists(Path.Combine(dir, "saw-stale")));
+    }
+
+    [Fact]
+    public void Pause_flags_are_readable_by_the_worker_user_whatever_the_umask_and_continue_withdraws_them()
+    {
+        var dir = Directory.CreateTempSubdirectory("df-pause-").FullName;
+        var flags = Path.Combine(dir, "controls");
+        // As mkdir/creat would leave them under umask 077: owner-only.
+        Directory.CreateDirectory(flags);
+        File.SetUnixFileMode(flags, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var flag = ClaudeWorker.PauseFlagPath(flags, Path.Combine(dir, "factory-sc-9"));
+        File.WriteAllText(flag, "");
+        File.SetUnixFileMode(flag, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        IWorker worker = new ClaudeWorker("claude", Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1), pauseFlagDirectory: flags);
+
+        worker.RequestPause(Path.Combine(dir, "factory-sc-9"));
+
+        Assert.Equal(ClaudeWorker.PauseFlagDirectoryMode, File.GetUnixFileMode(flags)); // 0755
+        Assert.Equal(ClaudeWorker.PauseFlagMode, File.GetUnixFileMode(flag)); // 0644
+        const UnixFileMode othersWrite = UnixFileMode.GroupWrite | UnixFileMode.OtherWrite;
+        Assert.Equal((UnixFileMode)0, File.GetUnixFileMode(flags) & othersWrite); // the worker user cannot raise or clear a flag
+        Assert.Equal((UnixFileMode)0, File.GetUnixFileMode(flag) & othersWrite);
+
+        worker.CancelPause(Path.Combine(dir, "factory-sc-9"));
+
+        Assert.False(File.Exists(flag));
     }
 
     [Fact]

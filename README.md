@@ -26,8 +26,9 @@ limit/offset paging of `GET groups/{id}/stories`, epics with `GET epics/{id}/sto
 retried after its `Retry-After`, a 502/503/504 on a GET or PUT with backoff.
 Items a previous process left mid-run (Intake or Implement in the ledger, or paused because the
 process was stopped) are resumed first, after checking their story is still in scope; one that left
-the scope is parked in Paused with one story comment. Items paused any other way are not resumed
-automatically.
+the scope is parked in Paused with one story comment. Items paused by a Pause control resume once
+nothing pauses them any more (after Continue, see [Controls](#controls-pause-continue-stop)); items
+paused any other way (parked) are not resumed automatically.
 
 The board is touched only through `IWorkSource` (`WorkSources/`; Shortcut adapter in
 `Shortcut/ShortcutWorkSource.cs`). On Intake the story is claimed (owner = the token's member,
@@ -54,7 +55,9 @@ elapsed time and cost (the sum of its sessions' router costs) and updates in pla
 changes, from this process or a separate `factory run` (Postgres `NOTIFY work_items`). Each item links
 its worker sessions; a **session** page replays a finished session's transcript from the ledger and
 streams a running one live (assistant text, tool calls with their input, Bash commands and output,
-the result; other lines as-is; long outputs collapsed). The dashboard only reads.
+the result; other lines as-is; long outputs collapsed). The dashboard reads; its only writes are the
+Pause / Continue / Stop buttons (factory-wide, per epic, per item; Stop asks for confirmation), plain
+form posts to `/controls` that need the login and the antiforgery token.
 
 Every page, the Blazor circuit and the session hub need the login (one local account): set its
 password once with `factory dashboard set-password` (read without echo; only a PBKDF2 hash goes to
@@ -74,6 +77,38 @@ shared LAN address.
 dotnet run --project src/DarkFactory.Orchestrator -- dashboard set-password
 export Dashboard__BindAddress=100.101.102.103   # optional: this Mac's Tailscale IP
 ```
+
+### Controls: pause, continue, stop
+
+Pause, Continue and Stop work at three scopes — one item, one epic, the whole factory — from the
+dashboard or the CLI, which write the same control rows in the ledger (`controls`), so every process
+(`factory work`, a separate `factory run`) honours them; a running pipeline re-reads its controls every
+second and the dashboard redraws on `NOTIFY`.
+
+```sh
+dotnet run --project src/DarkFactory.Orchestrator -- pause --factory       # or --epic 123 / --item sc-1234
+dotnet run --project src/DarkFactory.Orchestrator -- continue --factory
+dotnet run --project src/DarkFactory.Orchestrator -- stop --item sc-1234   # --epic / --factory stop every active item there
+```
+
+- **Pause**: nothing new is claimed (a paused factory lists no ready stories; a story in a paused epic
+  is not claimed) and no next step starts. A running worker stops after its current tool call: every
+  worker gets a PreToolUse hook (`--settings`) that, once the run's flag file exists under
+  `<work root>/controls` (owner-owned; the worker can read it, not write it), denies the next tool call
+  and ends the session. The orchestrator does not trust the worker to obey: if it has not stopped within
+  `Worker:PauseGraceSeconds` (default 660, longer than the 600 s longest tool call) it is stopped like a Ctrl-C. The item is recorded Paused
+  (`user-paused`) with its Claude session id and worktree kept.
+- **Continue** clears the scope's pause; `factory work` resumes the item on its next poll (or run
+  `factory run sc-<id>`), and an interrupted worker resumes its own session with `claude --resume`, so the
+  transcript stays one continuous session. Continue clears only that scope: an item in a paused epic stays
+  paused until the epic continues.
+- **Stop** kills the item's worker at once, turns its open PRs back into drafts (GitHub GraphQL
+  `convertPullRequestToDraft`, App token), moves its story back to the Backlog with its claim released and
+  a comment, records Cancelled and removes its worktree. Nothing is merged or deleted: the branch and PR
+  stay. An item that is not running is stopped at once by the CLI/dashboard (its worktree is removed by the
+  next run's sweep); a running one by its own run within a second. A stop that fails half way (e.g. GitHub
+  down) leaves the item Stopping (shown on the dashboard); the next poll or `factory stop` finishes it
+  without repeating the steps already done.
 
 ### Lifecycle and resume
 

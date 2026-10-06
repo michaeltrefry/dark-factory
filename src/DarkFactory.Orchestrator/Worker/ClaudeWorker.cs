@@ -4,9 +4,18 @@ using System.Runtime.InteropServices;
 
 namespace DarkFactory.Orchestrator.Worker;
 
-public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError, string? ResultSubtype, string? ResultText, string StderrTail)
+public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError, string? ResultSubtype, string? ResultText, string StderrTail,
+    string? TerminalReason = null)
 {
+    public const string HookStoppedReason = "hook_stopped";
+
     public bool Succeeded => ExitCode == 0 && !IsError && SessionId is not null;
+
+    /// <summary>
+    /// A hook ended the session (<c>terminal_reason: hook_stopped</c>), e.g. the pause hook at a tool boundary: the
+    /// result is a success but says nothing about the work being finished.
+    /// </summary>
+    public bool HookStopped => TerminalReason == HookStoppedReason;
 }
 
 /// <summary>
@@ -36,6 +45,23 @@ public interface IWorker
     /// gone or is no longer this worker's.
     /// </summary>
     Task<bool> StopOrphanAsync(int pid, CancellationToken ct);
+
+    /// <summary>
+    /// Asks the worker running in <paramref name="workingDirectory"/> to stop at its next tool boundary,
+    /// keeping its session for <c>--resume</c>. Best effort: the worker could ignore it, so the caller
+    /// enforces the pause by cancelling the run if it does not end in time.
+    /// </summary>
+    void RequestPause(string workingDirectory)
+    {
+    }
+
+    /// <summary>
+    /// Withdraws a <see cref="RequestPause"/> for the worker in <paramref name="workingDirectory"/> (Continue arrived
+    /// before it reached a tool boundary): its next tool call proceeds.
+    /// </summary>
+    void CancelPause(string workingDirectory)
+    {
+    }
 }
 
 /// <summary>
@@ -81,11 +107,17 @@ public enum WorkerAuth
 /// With a <see cref="WorkerSandbox"/> it runs as the dedicated worker user (E5) through the
 /// launch helper, which builds its environment from the router variables alone; without one
 /// (<c>Worker:RunAs=none</c>) it runs as the owner.
+/// With <paramref name="pauseFlagDirectory"/> (owner-owned, readable but not writable by the worker user) every
+/// run gets a PreToolUse hook (<c>--settings</c>, which <c>--setting-sources</c> does not filter) that denies the
+/// next tool call and ends the session (<c>continue: false</c>) once <see cref="RequestPause"/> has created the
+/// run's flag file there: the worker stops after its current tool call and <c>claude --resume</c> continues it.
 /// </summary>
 public sealed class ClaudeWorker(
     string claudePath, Uri routerBaseUrl, string routerKey, WorkerAuth auth, TimeSpan timeout,
-    WorkerSandbox? sandbox = null, TimeSpan? stopGrace = null) : IWorker
+    WorkerSandbox? sandbox = null, TimeSpan? stopGrace = null, string? pauseFlagDirectory = null) : IWorker
 {
+    public const string PauseReason = "Paused by the Dark Factory; the session resumes on Continue.";
+
     /// <summary>How long a stopped sandboxed worker gets to exit after its helper's stdin closes.</summary>
     private readonly TimeSpan _stopGrace = stopGrace ?? TimeSpan.FromSeconds(10);
 
@@ -131,7 +163,34 @@ public sealed class ClaudeWorker(
         return env;
     }
 
-    public static IReadOnlyList<string> BuildArguments(string prompt, string? resumeSessionId = null)
+    /// <summary>The pause flag of the run in <paramref name="workingDirectory"/> (one per worktree, so per item).</summary>
+    public static string PauseFlagPath(string pauseFlagDirectory, string workingDirectory) =>
+        Path.Combine(pauseFlagDirectory, $"{Path.GetFileName(Path.TrimEndingDirectorySeparator(workingDirectory))}.pause");
+
+    /// <summary>
+    /// <c>--settings</c> JSON with one PreToolUse hook: while <paramref name="flagPath"/> exists it denies the
+    /// tool call and ends the session (<c>continue: false</c>); otherwise it prints nothing and the call proceeds.
+    /// </summary>
+    public static string BuildPauseSettings(string flagPath)
+    {
+        if (flagPath.Contains('\'') || flagPath.IndexOfAny(['\n', '\r']) >= 0)
+        {
+            throw new ArgumentException($"Pause flag path '{flagPath}' must not contain a quote or a line break.", nameof(flagPath));
+        }
+        var decision = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            @continue = false,
+            stopReason = PauseReason,
+            hookSpecificOutput = new { hookEventName = "PreToolUse", permissionDecision = "deny", permissionDecisionReason = PauseReason },
+        });
+        var command = $"if [ -e '{flagPath}' ]; then printf '%s' '{decision}'; fi";
+        return System.Text.Json.JsonSerializer.Serialize(new
+        {
+            hooks = new { PreToolUse = new[] { new { matcher = "*", hooks = new[] { new { type = "command", command } } } } },
+        });
+    }
+
+    public static IReadOnlyList<string> BuildArguments(string prompt, string? resumeSessionId = null, string? settings = null)
     {
         var args = new List<string>
         {
@@ -146,6 +205,11 @@ public sealed class ClaudeWorker(
             "--allowedTools",
         };
         args.AddRange(AllowedTools);
+        if (settings is not null)
+        {
+            args.Add("--settings");
+            args.Add(settings);
+        }
         if (resumeSessionId is not null)
         {
             args.Add("--resume");
@@ -166,11 +230,69 @@ public sealed class ClaudeWorker(
     public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
         WorkerCallbacks? callbacks, CancellationToken ct)
     {
+        if (pauseFlagDirectory is null)
+        {
+            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId), callbacks, ct);
+        }
+        var flag = PauseFlagPath(pauseFlagDirectory, workingDirectory);
+        EnsurePauseFlagDirectory(pauseFlagDirectory);
+        File.Delete(flag); // left by a crashed run, it would stop this one at its first tool call
+        try
+        {
+            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, BuildPauseSettings(flag)), callbacks, ct);
+        }
+        finally
+        {
+            File.Delete(flag);
+        }
+    }
+
+    /// <summary>The flag directory and flags are world-readable and owner-only writable whatever the umask, so the worker user's hook sees them.</summary>
+    public const UnixFileMode PauseFlagDirectoryMode =
+        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+        | UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute; // 0755
+
+    public const UnixFileMode PauseFlagMode =
+        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead; // 0644
+
+    private static void EnsurePauseFlagDirectory(string directory)
+    {
+        Directory.CreateDirectory(directory);
+        if (!OperatingSystem.IsWindows())
+        {
+            // mkdir applies the umask (under 077 the worker user could not see the flag): set the mode explicitly.
+            File.SetUnixFileMode(directory, PauseFlagDirectoryMode);
+        }
+    }
+
+    public void RequestPause(string workingDirectory)
+    {
+        if (pauseFlagDirectory is not null)
+        {
+            EnsurePauseFlagDirectory(pauseFlagDirectory);
+            var flag = PauseFlagPath(pauseFlagDirectory, workingDirectory);
+            File.WriteAllText(flag, "paused\n");
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(flag, PauseFlagMode);
+            }
+        }
+    }
+
+    public void CancelPause(string workingDirectory)
+    {
+        if (pauseFlagDirectory is not null)
+        {
+            File.Delete(PauseFlagPath(pauseFlagDirectory, workingDirectory));
+        }
+    }
+
+    private async Task<WorkerResult> RunProcessAsync(string workingDirectory, IReadOnlyList<string> args, WorkerCallbacks? callbacks, CancellationToken ct)
+    {
         // Sandboxed, the helper makes the worker a process-group leader and the pid reported is sudo's.
         using var process = sandbox is null
-            ? StartDirect(workingDirectory, prompt, resumeSessionId)
-            : sandbox.Start(workingDirectory, claudePath, BuildArguments(prompt, resumeSessionId),
-                BuildRouterVariables(routerBaseUrl, routerKey, auth));
+            ? StartDirect(workingDirectory, args)
+            : sandbox.Start(workingDirectory, claudePath, args, BuildRouterVariables(routerBaseUrl, routerKey, auth));
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(timeout);
 
@@ -246,7 +368,8 @@ public sealed class ClaudeWorker(
             !state.SawResult || state.ResultIsError,
             state.ResultSubtype,
             state.ResultText,
-            string.Join('\n', stderr));
+            string.Join('\n', stderr),
+            state.TerminalReason);
     }
 
     /// <summary>
@@ -274,7 +397,7 @@ public sealed class ClaudeWorker(
         }
     }
 
-    private Process StartDirect(string workingDirectory, string prompt, string? resumeSessionId)
+    private Process StartDirect(string workingDirectory, IReadOnlyList<string> args)
     {
         var psi = new ProcessStartInfo(GroupLeaderLauncher)
         {
@@ -287,7 +410,7 @@ public sealed class ClaudeWorker(
         psi.ArgumentList.Add("-e");
         psi.ArgumentList.Add(GroupLeaderScript);
         psi.ArgumentList.Add(claudePath);
-        foreach (var arg in BuildArguments(prompt, resumeSessionId))
+        foreach (var arg in args)
         {
             psi.ArgumentList.Add(arg);
         }

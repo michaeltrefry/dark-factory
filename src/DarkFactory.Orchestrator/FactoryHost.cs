@@ -85,17 +85,25 @@ public static class FactoryHost
         app.MapStaticAssets();
         app.MapRazorComponents<App>().AddInteractiveServerRenderMode();
         app.MapDashboardAccount();
+        app.MapDashboardControls();
         app.MapHub<SessionHub>(SessionHub.Path);
         return app;
     }
 
-    /// <summary>The dashboard: login, pipeline and session pages on a Blazor Server circuit. It only reads the ledger.</summary>
+    /// <summary>
+    /// The dashboard: login, pipeline and session pages on a Blazor Server circuit. It reads the ledger; its only
+    /// writes are the Pause/Continue/Stop control posts (and login/logout).
+    /// </summary>
     public static IServiceCollection AddDashboard(this IServiceCollection services, FactoryOptions options)
     {
         services.AddRazorComponents().AddInteractiveServerComponents();
         services.AddDashboardAuth(options);
         services.TryAddSingleton(TimeProvider.System);
         services.AddSingleton<IDashboardData, DashboardData>();
+        // The dashboard's only writes besides login/logout (E8): Pause, Continue and Stop.
+        services.AddSingleton(sp => new Controls.ControlActions(
+            sp.GetRequiredService<Controls.IControls>(), sp.GetRequiredService<IDbContextFactory<LedgerDbContext>>(), sp.GetService<Controls.IItemStops>(),
+            sp.GetService<WorkSources.IWorkSource>(), new PostgresRunLocks(options.LedgerConnectionString)));
         services.AddSingleton<ISessionViewers>(sp => sp.GetRequiredService<SessionBroadcaster>());
         return services;
     }
@@ -116,6 +124,9 @@ public static class FactoryHost
         services.AddSignalR();
         services.AddSingleton<IDbContextFactory<LedgerDbContext>>(
             new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)));
+        services.TryAddSingleton(TimeProvider.System);
+        services.AddSingleton<Controls.IControls>(sp =>
+            new Controls.LedgerControls(sp.GetRequiredService<IDbContextFactory<LedgerDbContext>>(), sp.GetRequiredService<TimeProvider>()));
         services.AddSingleton(new SessionHubOptions());
         services.AddSingleton(sp => new SessionBroadcaster(
             sp.GetRequiredService<Microsoft.AspNetCore.SignalR.IHubContext<SessionHub>>(),

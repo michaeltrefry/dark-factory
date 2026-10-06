@@ -71,4 +71,7 @@ sealed class FilePullRequests(string path) : IPullRequests
         await File.AppendAllTextAsync(path, $"{head}\t{url}\n", ct);
         return url;
     }
+
+    public async Task<IReadOnlyList<string>> ConvertOpenToDraftAsync(RepoRef repo, string head, CancellationToken ct) =>
+        (File.Exists(path) ? await File.ReadAllLinesAsync(path, ct) : []).Select(l => l.Split('\t')).Where(p => p[0] == head).Select(p => p[1]).ToList();
 }

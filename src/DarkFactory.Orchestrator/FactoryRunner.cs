@@ -1,3 +1,4 @@
+using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
@@ -52,6 +53,7 @@ public static class FactoryRunner
         var appId = options.GitHubAppId;
         var appKey = options.GitHubAppPrivateKeyPem;
         var sandbox = options.WorkerSandbox;
+        var pauseGrace = options.PauseGrace;
 
         // Sandboxed, the worker user is single-tenant (every helper exit kills all of its processes),
         // so one sandboxed run per machine, taken before anything runs through the helper.
@@ -79,16 +81,60 @@ public static class FactoryRunner
             ledger,
             new PostgresRunLocks(options.LedgerConnectionString),
             workspaces,
-            new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, sandbox),
+            new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, sandbox,
+                pauseFlagDirectory: options.PauseFlagDirectory),
             new GitHubPullRequests(githubHttp, app),
             options.DefaultRepo,
             log,
             // Events are stored only; a running `factory work` host relays them to its viewers (LISTEN/NOTIFY).
             new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)),
                 new RouterClient(routerHttp, routerKey), TimeProvider.System, log),
-            ignoreScope: ignoreScope);
+            ignoreScope: ignoreScope,
+            controls: Controls(options),
+            pauseGrace: pauseGrace);
 
         return await pipeline.RunAsync(storyId, ct);
+    }
+
+    /// <summary>The ledger's controls table (Pause/Continue/Stop), shared by every process.</summary>
+    public static IControls Controls(FactoryOptions options) =>
+        new LedgerControls(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)), TimeProvider.System);
+
+    /// <summary>
+    /// <c>factory pause|continue|stop</c>: writes the scope's control, and for Stop finishes each item's stop
+    /// at once when no run holds it (a running item is stopped by its own run within about a second).
+    /// </summary>
+    public static async Task<ControlResult> ControlAsync(FactoryOptions options, string action, string scope, string by, TextWriter log, CancellationToken ct)
+    {
+        await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
+        var contexts = new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
+        using var shortcutHttp = new HttpClient { BaseAddress = ShortcutWorkSource.DefaultBaseAddress };
+        // Stop needs the board and GitHub, and an epic scope the board (for items with no epic in the ledger);
+        // Pause and Continue otherwise only write the control.
+        var source = action == "stop" || ControlScope.EpicOf(scope) is not null ? CreateWorkSource(options, shortcutHttp) : null;
+        var stops = action == "stop" ? new FactoryItemStops(options, source!, log) : null;
+        var actions = new ControlActions(Controls(options), contexts, stops, source, new PostgresRunLocks(options.LedgerConnectionString));
+        return action switch
+        {
+            "pause" => await actions.PauseAsync(scope, by, ct),
+            "continue" => await actions.ContinueAsync(scope, by, ct),
+            "stop" => await actions.StopAsync(scope, by, ct),
+            _ => throw new ArgumentException($"Unknown control action '{action}'.", nameof(action)),
+        };
+    }
+}
+
+/// <summary>Production <see cref="IItemStops"/>: an <see cref="ItemStopper"/> over the Postgres ledger, Shortcut and GitHub, per call.</summary>
+public sealed class FactoryItemStops(FactoryOptions options, IWorkSource source, TextWriter log) : IItemStops
+{
+    public async Task<ControlResult> StopAsync(int storyId, CancellationToken ct)
+    {
+        using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        var app = new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System);
+        await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
+        var stopper = new ItemStopper(source, new WorkLedger(db, TimeProvider.System), new PostgresRunLocks(options.LedgerConnectionString),
+            new GitHubPullRequests(githubHttp, app), FactoryRunner.Controls(options), log);
+        return await stopper.StopAsync(storyId, ct);
     }
 }
 
@@ -99,7 +145,7 @@ public sealed class FactoryItemRunner(FactoryOptions options, IWorkSource source
     {
         // `factory work` migrated the ledger (LedgerMigrations) before the host started.
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
-        return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ct);
+        return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ct, FactoryRunner.Controls(options));
     }
 
     public Task<RunOutcome> RunAsync(int id, CancellationToken ct) => FactoryRunner.RunAsync(options, source, id, ignoreScope: false, log, ct);

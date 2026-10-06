@@ -44,7 +44,7 @@ public class WorkLedgerTests
 
         Assert.Equal(first.Id, second.Id);
         Assert.Equal("Fix", (await db.WorkItems.AsNoTracking().SingleAsync()).Title); // nothing written before the run lock
-        await ledger.RefreshAsync(second, "New", "o/r", CancellationToken.None);
+        await ledger.RefreshAsync(second, "New", "o/r", null, CancellationToken.None);
         Assert.Equal("New", (await db.WorkItems.AsNoTracking().SingleAsync()).Title);
         Assert.Single(await db.LedgerEntries.ToListAsync());
     }
@@ -154,6 +154,8 @@ public class RunPipelineTests
     internal sealed class FakeWorkspaces(bool hasChanges = true, bool worktreeExists = true) : IRepoWorkspace
     {
         public List<string> Calls { get; } = [];
+        /// <summary>Runs while a push is in progress, e.g. to set a control then.</summary>
+        public Func<Task>? OnPush { get; set; }
         public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct)
         {
             Calls.Add($"restore {repo} {branch}");
@@ -169,10 +171,14 @@ public class RunPipelineTests
             Calls.Add($"reopen {repo} {branch}");
             return Task.FromResult(worktreeExists ? new Workspace($"/wt/{branch}", branch, "main", $"/clone/.git/worktrees/{branch}") : null);
         }
-        public Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, CancellationToken ct)
+        public async Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, CancellationToken ct)
         {
             Calls.Add($"push {repo} {workspace.Branch} {message}");
-            return Task.FromResult(hasChanges);
+            if (OnPush is not null)
+            {
+                await OnPush();
+            }
+            return hasChanges;
         }
         public Task RemoveAsync(RepoRef repo, Workspace workspace, CancellationToken ct)
         {
@@ -233,14 +239,33 @@ public class RunPipelineTests
     internal sealed class FakePullRequests(Exception? throws = null) : IPullRequests
     {
         public List<(RepoRef Repo, string Head, string Base, string Title, string Body)> Opened { get; } = [];
-        public Task<string> OpenAsync(RepoRef repo, string head, string baseBranch, string title, string body, CancellationToken ct)
+        /// <summary>Runs while a PR is being opened (after GitHub has it), e.g. to set a control then.</summary>
+        public Func<Task>? OnOpen { get; set; }
+        public async Task<string> OpenAsync(RepoRef repo, string head, string baseBranch, string title, string body, CancellationToken ct)
         {
             if (throws is not null)
             {
-                return Task.FromException<string>(throws);
+                throw throws;
             }
             Opened.Add((repo, head, baseBranch, title, body));
-            return Task.FromResult(PrUrl);
+            if (OnOpen is not null)
+            {
+                await OnOpen();
+            }
+            return PrUrl;
+        }
+
+        /// <summary>Heads whose open PRs were turned back into drafts.</summary>
+        public List<string> Drafted { get; } = [];
+
+        public Task<IReadOnlyList<string>> ConvertOpenToDraftAsync(RepoRef repo, string head, CancellationToken ct)
+        {
+            if (throws is not null)
+            {
+                return Task.FromException<IReadOnlyList<string>>(throws);
+            }
+            Drafted.Add(head);
+            return Task.FromResult<IReadOnlyList<string>>(Opened.Any(o => o.Head == head) ? [PrUrl] : []);
         }
     }
 

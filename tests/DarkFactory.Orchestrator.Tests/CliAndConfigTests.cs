@@ -15,8 +15,38 @@ public class FactoryCliTests
             (name, port, _) => { calls.Add($"setup {name} {port}"); return Task.FromResult(0); },
             (repo, _) => { calls.Add($"protect {repo}"); return Task.FromResult(0); },
             _ => { calls.Add("work"); return Task.FromResult(0); },
-            _ => { calls.Add("dashboard set-password"); return Task.FromResult(0); });
+            _ => { calls.Add("dashboard set-password"); return Task.FromResult(0); },
+            (action, scope, _) => { calls.Add($"{action} {scope}"); return Task.FromResult(0); });
         return (root, calls);
+    }
+
+    [Theory]
+    [InlineData("pause --item sc-77", "pause item:sc-77")]
+    [InlineData("continue --item 77", "continue item:sc-77")]
+    [InlineData("stop --item sc-77", "stop item:sc-77")]
+    [InlineData("pause --epic 12", "pause epic:12")]
+    [InlineData("stop --epic 12", "stop epic:12")]
+    [InlineData("pause --factory", "pause factory")]
+    [InlineData("continue --factory", "continue factory")]
+    public async Task Controls_pass_their_scope(string args, string expected)
+    {
+        var (root, calls) = Cli();
+        Assert.Equal(0, await root.Parse(args.Split(' ')).InvokeAsync());
+        Assert.Equal([expected], calls);
+    }
+
+    [Theory]
+    [InlineData("pause")]
+    [InlineData("pause --factory --item sc-1")]
+    [InlineData("stop --item nope")]
+    [InlineData("continue --epic 0")]
+    public async Task Controls_need_exactly_one_valid_scope(string args)
+    {
+        var (root, calls) = Cli();
+        var parse = root.Parse(args.Split(' '));
+        Assert.NotEmpty(parse.Errors);
+        Assert.NotEqual(0, await parse.InvokeAsync(new() { Output = TextWriter.Null, Error = TextWriter.Null }));
+        Assert.Empty(calls);
     }
 
     [Theory]
@@ -108,6 +138,15 @@ public class FactoryOptionsTests
         Assert.Equal("michaeltrefry/dark-factory-sandbox", options.DefaultRepo.FullName);
         Assert.Contains("Port=5434", options.LedgerConnectionString);
         Assert.Equal(Worker.WorkerAuth.ClaudeLogin, options.WorkerAuth);
+    }
+
+    [Fact]
+    public void Pause_grace_outlasts_the_longest_tool_call_and_is_validated()
+    {
+        Assert.Equal(TimeSpan.FromSeconds(660), Options([]).PauseGrace); // a 600 s Bash call (e.g. dotnet test) is never cut off
+        Assert.Equal(TimeSpan.FromSeconds(900), Options(new() { ["Worker:PauseGraceSeconds"] = "900" }).PauseGrace);
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:PauseGraceSeconds"] = "300" }).PauseGrace);
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:PauseGraceSeconds"] = "600" }).PauseGrace);
     }
 
     [Fact]

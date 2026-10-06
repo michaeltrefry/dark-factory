@@ -623,6 +623,8 @@ public sealed class SessionCaptureTests : IAsyncLifetime
     {
         public Task<string> OpenAsync(RepoRef repo, string head, string baseBranch, string title, string body, CancellationToken ct) =>
             Task.FromResult("https://github.com/acme/widgets/pull/1");
+
+        public Task<IReadOnlyList<string>> ConvertOpenToDraftAsync(RepoRef repo, string head, CancellationToken ct) => throw new NotSupportedException();
     }
 }
 

@@ -12,7 +12,7 @@ Claude Code headless workers through the Weave router.
   session capture + SignalR hub (`Sessions/`), the `factory work` host (`FactoryHost`) and its Blazor Server
   dashboard (`Dashboard/`: login, binding, ledger reads, transcript formatting; components in `Dashboard/Components`),
   `IWorkSource` + the `factory work` intake loop (`WorkSources/`; registered on the `factory work` host by `FactoryHost.BuildWork` via `services.AddIntake(options)`)
-  and its Shortcut adapter (`Shortcut/ShortcutWorkSource.cs`).
+  and its Shortcut adapter (`Shortcut/ShortcutWorkSource.cs`), and the Pause/Continue/Stop controls (`Controls/`).
 - `scripts/` — `setup-worker-user.sh` (one-time root setup of the `_factory` sandbox user) and
   `factory-worker-launch` (the root-installed helper every sandboxed worker runs through).
 - `tests/DarkFactory.Orchestrator.Tests` — unit tests (no network; fake HTTP APIs, InMemory EF, local git).
@@ -34,6 +34,7 @@ dotnet ef migrations add <Name> --project src/DarkFactory.Orchestrator -o Ledger
 dotnet run --project src/DarkFactory.Orchestrator -- run sc-1234
 dotnet run --project src/DarkFactory.Orchestrator -- work          # long-running host: dashboard + session hub on 127.0.0.1 + the intake loop (polls the watch scope)
 dotnet run --project src/DarkFactory.Orchestrator -- dashboard set-password   # dashboard login (hash → keychain)
+dotnet run --project src/DarkFactory.Orchestrator -- pause --factory          # also continue/stop; --epic N or --item sc-N
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup
 dotnet run --project src/DarkFactory.Orchestrator -- github-repo protect owner/name   # rulesets; owner's GH_TOKEN / `gh auth token`
 ```
@@ -60,6 +61,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Worker:LaunchHelper` | `/usr/local/libexec/dark-factory/factory-worker-launch` |
 | `Worker:Auth` | `claude-login` (worker's own Claude login, router passes it through) or `router-key` (router key as Claude's API key; router needs BYOK provider keys) |
 | `Worker:TimeoutMinutes` | `30` |
+| `Worker:PauseGraceSeconds` | `660` (a paused worker that has not stopped at a tool boundary by then is stopped; must exceed the 600 s longest tool call) |
 | `Factory:HostPort` | `47822` (`factory work`: 127.0.0.1, plus `Dashboard:BindAddress`) |
 | `Dashboard:BindAddress` | unset = loopback only; one private address (RFC 1918, 100.64/10, fc00::/7) on a local interface |
 | `Dashboard:HostName` | extra Host header the dashboard answers to (e.g. MagicDNS name); one plain DNS name, no wildcard/port |
@@ -92,7 +94,27 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   are a `linked` checkpoint before Review. `ClaimAsync` refuses (no write) unless the fresh story is To Do or already
   ours, in scope (skipped by `factory run --ignore-scope`) and not another owner's, and reads the claim back; a refusal
   parks the item (Paused + `parked` checkpoint). Only Paused rows with detail `interrupted` (`RunPipeline.Interrupted`)
-  auto-resume (`RunPipeline.InFlightAsync`); a user's Pause must use another detail. Resumes re-check the scope.
+  or `user-paused` (`RunPipeline.UserPaused`, a Pause control) auto-resume (`RunPipeline.InFlightAsync`), the latter only
+  once no control pauses the item; a parked item never does. Resumes re-check the scope.
+- Controls (`Controls/`): Pause/Continue/Stop rows in the ledger's `controls` table (scope `factory` | `epic:<id>` |
+  `item:sc-<id>`; `WorkItem.EpicId` maps items to epics), written by `factory pause|continue|stop` and the dashboard
+  (`ControlActions`), read by every process. `RunPipeline` checks them before every step and, while a worker runs,
+  polls them every second (`ControlWatch`): Pause → `IWorker.RequestPause` (a flag file under `<work root>/controls`
+  that the worker's PreToolUse hook, passed by `--settings`, turns into deny + `continue: false`, ending the session at
+  the next tool boundary), and the run is cancelled anyway after `Worker:PauseGraceSeconds`; Stop (item state
+  `Stopping`) cancels at once. Continue before the boundary withdraws the flag (`IWorker.CancelPause`) and the grace.
+  A pause-ended session (result `terminal_reason: hook_stopped`) never counts as worker-done; a worker that finishes
+  on its own after a pause request does (worker-done recorded, then the pause takes effect before the push). Stop is
+  re-checked before the PR is opened and after the last step, so the run that sees it finishes it. Stop
+  (`ItemStopper`): PRs back to draft (`prs-drafted`), board Stopped with a comment (`stop-reported`), Cancelled, item
+  control cleared — each checkpointed, so a failed stop stays Stopping and is finished by the next run/poll; an idle
+  item whose worker a crashed run left is not finished by the CLI/dashboard but by its next run (which stops the
+  worker first). Epic-scope Pause/Stop look up items with no `EpicId` on the board and record it (under the run lock);
+  unresolvable ones are reported and the CLI exits non-zero (as on a refused Continue or an unfinished stop). A paused
+  factory makes the intake loop list no ready stories; the pipeline claims nothing new in a paused epic/factory.
+  Residual risk: the worker loads the target repo's `.claude/settings.json` (`--setting-sources project,local`), which
+  can set `disableAllHooks` and so switch off the pause hook; the pause grace still stops such a worker (session and
+  worktree kept), only not at a tool boundary.
 
 - Every state change is a committed ledger row before the next step (`WorkLedger.RecordAsync`), checked
   against the transition table in `Ledger/Lifecycle.cs` first; an illegal transition throws and writes nothing.
@@ -141,8 +163,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
 - Dashboard (E8): Kestrel listens on 127.0.0.1 and at most one validated private address (`DashboardBinding`; never a
   wildcard). A fallback authorization policy makes every endpoint (pages, `/_blazor`, `/hubs/sessions`, static assets)
   require the cookie login except `/login` and the login form post (antiforgery + 5/min/IP rate limit). The dashboard
-  only reads (`IDashboardData`); its only writes are login/logout. Pipeline rows refresh on `NOTIFY work_items` (triggers on
-  `work_items`/`worker_sessions`, relayed by `SessionEventRelay` → `PipelineChanges`); session pages join the same
+  reads the ledger (`IDashboardData`); its only writes are login/logout and the control form post (`/controls`,
+  `DashboardControls`: login + antiforgery). Pipeline rows refresh on `NOTIFY work_items` (triggers on
+  `work_items`/`worker_sessions`/`controls`, relayed by `SessionEventRelay` → `PipelineChanges`); session pages join the same
   `SessionBroadcaster` as hub viewers (`ISessionViewers`), so backlog-then-live holds there too. Never log transcript content.
 - Processes migrate the ledger through `LedgerMigrations.MigrateAsync` (advisory-locked: EF alone lets two concurrent
   migrators apply the same migration) before reading it; tests migrate their temp database before starting a host.

@@ -1,0 +1,17 @@
+@* One control action as a plain form post (antiforgery-checked, login required): see DashboardControls. *@
+<form method="post" action="controls" class="control" data-action="@Action" data-scope="@Scope"
+      onsubmit="@(Action == "stop" ? $"return confirm('Stop {Scope}? Its work is cancelled (worker killed, PR back to draft, story to the Backlog).')" : null)">
+    <AntiforgeryToken />
+    <input type="hidden" name="action" value="@Action" />
+    <input type="hidden" name="scope" value="@Scope" />
+    <button type="submit">@Label</button>
+</form>
+
+@code {
+    /// <summary><c>pause</c>, <c>continue</c> or <c>stop</c>.</summary>
+    [Parameter, EditorRequired] public string Action { get; set; } = "";
+
+    [Parameter, EditorRequired] public string Scope { get; set; } = "";
+
+    private string Label => Action switch { "pause" => "Pause", "continue" => "Continue", _ => "Stop" };
+}

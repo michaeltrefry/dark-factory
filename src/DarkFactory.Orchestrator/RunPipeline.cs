@@ -1,3 +1,4 @@
+using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
@@ -34,6 +35,10 @@ public sealed class WorkerFailedException(string message) : Exception(message);
 /// it with one comment if not. <c>ignoreScope</c> (<c>factory run --ignore-scope</c>) skips only the
 /// scope checks. An item in a state nothing in this phase drives (e.g. parked at Review) is not read at
 /// all: its story gets one comment saying so.
+/// Controls (<see cref="IControls"/>) are checked before every step and watched while a worker runs: Pause
+/// records Paused (<see cref="UserPaused"/>) once the worker has stopped at a tool boundary, keeping its session
+/// and worktree; Stop kills the worker and cancels the item (<see cref="ItemStopper"/>); a paused factory or epic
+/// claims nothing new.
 /// </summary>
 public sealed class RunPipeline(
     IWorkSource source,
@@ -46,9 +51,28 @@ public sealed class RunPipeline(
     TextWriter log,
     SessionRecorder? sessions = null,
     TimeSpan? failedSessionEndTimeout = null,
-    bool ignoreScope = false)
+    bool ignoreScope = false,
+    IControls? controls = null,
+    TimeSpan? pauseGrace = null,
+    TimeSpan? controlPollInterval = null)
 {
     public const string Source = "shortcut";
+
+    /// <summary>The longest a single worker tool call may legitimately run: Claude Code's maximum Bash timeout (10 minutes).</summary>
+    public static readonly TimeSpan LongestToolCall = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// How long a paused worker gets to reach its next tool boundary before it is stopped anyway: longer than the
+    /// longest tool call, so a pause never kills a tool call (e.g. a long <c>dotnet test</c>) mid-way.
+    /// </summary>
+    public static readonly TimeSpan DefaultPauseGrace = LongestToolCall + TimeSpan.FromMinutes(1);
+
+    /// <summary>How often a running worker's run re-reads its controls.</summary>
+    public static readonly TimeSpan DefaultControlPollInterval = TimeSpan.FromSeconds(1);
+
+    private readonly IControls _controls = controls ?? NoControls.Instance;
+    private readonly TimeSpan _pauseGrace = pauseGrace ?? DefaultPauseGrace;
+    private readonly TimeSpan _controlPoll = controlPollInterval ?? DefaultControlPollInterval;
 
     /// <summary>How long a failed run may spend recording its session's end (and router cost) before it escalates.</summary>
     public static readonly TimeSpan DefaultFailedSessionEndTimeout = TimeSpan.FromSeconds(30);
@@ -80,6 +104,24 @@ public sealed class RunPipeline(
         public const string Parked = "parked";
         /// <summary>The story was told the factory holds the item in a state nothing in this phase drives.</summary>
         public const string HeldNotice = "held-notice";
+        /// <summary>Stopping: the item's open PRs are drafts again; Detail is their URLs (or <c>none</c>).</summary>
+        public const string PrsDrafted = "prs-drafted";
+        /// <summary>Stopping: the story is back in the Backlog with its claim released and a comment; Detail is who stopped it.</summary>
+        public const string StopReported = "stop-reported";
+    }
+
+    /// <summary>
+    /// Detail of the Paused row recorded when a Pause control stopped the run. Such an item resumes (its
+    /// worker with <c>claude --resume</c>) once no control pauses it any more, i.e. after Continue.
+    /// </summary>
+    public const string UserPaused = "user-paused";
+
+    /// <summary>A Pause or Stop control reached a run; the worker (if any) has ended.</summary>
+    private sealed class ControlRequestedException(ControlState state, bool workerStillRunning = false)
+        : Exception($"control: {state}")
+    {
+        public ControlState State { get; } = state;
+        public bool WorkerStillRunning { get; } = workerStillRunning;
     }
 
     /// <summary>
@@ -107,17 +149,25 @@ public sealed class RunPipeline(
     public static readonly IReadOnlySet<WorkState> HandledStates = new HashSet<WorkState> { WorkState.Intake, WorkState.Implement };
 
     /// <summary>
-    /// Story ids of items a previous run left in flight, oldest first: those in a handled state, and those
-    /// <see cref="Interrupted"/> (not parked, not paused by a user) while in one.
+    /// Story ids of items a run should pick up, oldest first: items being stopped (whatever their state), then,
+    /// unless a control pauses them, those in a handled state and those <see cref="Interrupted"/> or
+    /// <see cref="UserPaused"/> (not parked) while in one.
     /// </summary>
-    public static async Task<IReadOnlyList<int>> InFlightAsync(WorkLedger ledger, CancellationToken ct)
+    public static async Task<IReadOnlyList<int>> InFlightAsync(WorkLedger ledger, CancellationToken ct, IControls? controls = null)
     {
+        controls ??= NoControls.Instance;
+        var stopping = (await controls.ListAsync(ct)).Where(c => c.State == ControlState.Stopping).Select(c => c.Scope).ToHashSet();
         var ids = new List<int>();
-        foreach (var item in await ledger.ItemsInAsync(Source, new HashSet<WorkState>(HandledStates) { WorkState.Paused }, ct))
+        foreach (var item in await ledger.ActiveItemsAsync(Source, ct))
         {
-            if (item.State == WorkState.Paused && !ResumesAfterInterrupt(await ledger.HistoryAsync(item, ct)))
+            if (!stopping.Contains(ControlScope.Item(item.ExternalId)))
             {
-                continue;
+                var resumable = HandledStates.Contains(item.State)
+                    || (item.State == WorkState.Paused && ResumesAutomatically(await ledger.HistoryAsync(item, ct)));
+                if (!resumable || await controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) != ControlState.Running)
+                {
+                    continue;
+                }
             }
             if (StoryId.TryParse(item.ExternalId, out var id))
             {
@@ -127,11 +177,11 @@ public sealed class RunPipeline(
         return ids;
     }
 
-    private static bool ResumesAfterInterrupt(List<LedgerEntry> history)
+    private static bool ResumesAutomatically(List<LedgerEntry> history)
     {
         var paused = history.FindLastIndex(e => e.Step is null);
         var pausedFrom = TransitionContext.From(history.Where(e => e.Step is null).Select(e => e.State).ToList()).PausedFrom;
-        return history[paused] is { State: WorkState.Paused, Detail: Interrupted }
+        return history[paused] is { State: WorkState.Paused, Detail: Interrupted or UserPaused }
             && pausedFrom is { } from && HandledStates.Contains(from)
             && !history.Skip(paused + 1).Any(e => e.Step == Steps.Parked);
     }
@@ -144,9 +194,18 @@ public sealed class RunPipeline(
 
     public async Task<RunOutcome> RunAsync(int storyId, CancellationToken ct)
     {
-        // Decide from the ledger before reading anything from the board.
-        if (await ledger.FindAsync(Source, StoryId.Format(storyId), ct) is { } known)
+        // Decide from the ledger (and the controls) before reading anything from the board.
+        var known = await ledger.FindAsync(Source, StoryId.Format(storyId), ct);
+        if (known is not null)
         {
+            switch (await _controls.EffectiveAsync(known.ExternalId, known.EpicId, ct))
+            {
+                case ControlState.Stopping:
+                    return await StopIdleAsync(known, storyId, ct);
+                case ControlState.Paused:
+                    log.WriteLine($"[{known.State}] {known.ExternalId} is paused by a control; nothing to do.");
+                    return await OutcomeAsync(known, PausedMessage(known.ExternalId), ct);
+            }
             if (!Runnable(known, await ledger.ContextAsync(known, ct)))
             {
                 return await HoldAsync(known, storyId, ct);
@@ -160,8 +219,14 @@ public sealed class RunPipeline(
 
         var spec = await source.ReadSpecAsync(storyId, ct);
         var story = spec.Story;
+        if (known is null && await _controls.EffectiveAsync(StoryId.Format(storyId), spec.Epic?.Id, ct) is not ControlState.Running and var control)
+        {
+            // A paused factory or epic claims nothing new: the story stays as it is on the board.
+            log.WriteLine($"[intake] {StoryId.Format(storyId)} is {control} by a control; not claiming it.");
+            return new RunOutcome(0, WorkState.Intake, null, null, $"{StoryId.Format(storyId)} is {control} by a control; not claimed.");
+        }
         var repo = RepoResolver.Resolve(story.Description, defaultRepo);
-        var item = await ledger.GetOrCreateAsync(Source, StoryId.Format(storyId), story.Name, repo.FullName, IntakeDetail(story), ct);
+        var item = await ledger.GetOrCreateAsync(Source, StoryId.Format(storyId), story.Name, repo.FullName, IntakeDetail(story), ct, spec.Epic?.Id);
 
         await using var runLock = await locks.TryAcquireAsync(item.Id, ct);
         if (runLock is null)
@@ -170,7 +235,7 @@ public sealed class RunPipeline(
             return new RunOutcome(item.Id, item.State, null, null, $"{item.ExternalId} is already running.");
         }
         // Re-read under the lock: another run may have moved the item since it was loaded.
-        await ledger.RefreshAsync(item, story.Name, repo.FullName, ct);
+        await ledger.RefreshAsync(item, story.Name, repo.FullName, spec.Epic?.Id, ct);
         var run = new Run(spec, repo, item);
 
         if (Lifecycle.IsTerminal(item.State))
@@ -200,6 +265,8 @@ public sealed class RunPipeline(
         {
             while (Handlers.TryGetValue(item.State, out var handler))
             {
+                // Pause/Stop: no new step starts once a control says so.
+                await ThrowIfControlledAsync(item, ct);
                 var before = item.State;
                 await handler(run, ct);
                 if (item.State == before)
@@ -208,6 +275,24 @@ public sealed class RunPipeline(
                 }
                 log.WriteLine($"[{item.State}]");
             }
+            // A Stop that arrived during the last step (e.g. while the PR was being opened) is finished now, by this
+            // run: the item is not left at Review with a ready PR and a Stopping control nobody acts on. A Pause there
+            // has nothing left to pause.
+            if (await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) == ControlState.Stopping)
+            {
+                throw new ControlRequestedException(ControlState.Stopping);
+            }
+        }
+        catch (ControlRequestedException request) when (request.State == ControlState.Paused)
+        {
+            // The worktree, checkpoints and Claude session stay: Continue resumes the same session.
+            await ledger.RecordAsync(item, WorkState.Paused, null, UserPaused, CancellationToken.None);
+            log.WriteLine($"[paused] {item.ExternalId} paused by a control; its worktree and session are kept for Continue");
+            return await OutcomeAsync(item, PausedMessage(item.ExternalId), CancellationToken.None);
+        }
+        catch (ControlRequestedException request)
+        {
+            return await FinishStopAsync(item, storyId, repo, run.Workspace, request.WorkerStillRunning);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -256,7 +341,7 @@ public sealed class RunPipeline(
             log.WriteLine($"[{item.State}] {item.ExternalId} is already running; not touching it.");
             return new RunOutcome(item.Id, item.State, null, null, $"{item.ExternalId} is already running.");
         }
-        await ledger.RefreshAsync(item, item.Title, item.Repo, ct);
+        await ledger.RefreshAsync(item, item.Title, item.Repo, item.EpicId, ct);
         var history = await ledger.HistoryAsync(item, ct);
         var entered = history.FindLastIndex(e => e.Step is null);
         if (!Runnable(item, await ledger.ContextAsync(item, ct)) && !history.Skip(entered + 1).Any(e => e.Step == Steps.HeldNotice))
@@ -287,7 +372,7 @@ public sealed class RunPipeline(
             log.WriteLine($"[{item.State}] {item.ExternalId} is already running; not touching it.");
             return new RunOutcome(item.Id, item.State, null, null, $"{item.ExternalId} is already running.");
         }
-        await ledger.RefreshAsync(item, item.Title, item.Repo, ct);
+        await ledger.RefreshAsync(item, item.Title, item.Repo, item.EpicId, ct);
         const string reason = "the story is outside the watch scope";
         var history = await ledger.HistoryAsync(item, ct);
         var alreadyParked = item.State == WorkState.Paused
@@ -383,6 +468,8 @@ public sealed class RunPipeline(
             log.WriteLine(resume is null ? "[implement] starting worker" : $"[implement] resuming claude session {resume}");
             // Every stdout line is stored (and pushed to live viewers) as it streams (E7).
             await using var capture = sessions is null ? null : await sessions.StartAsync(item.Id, resume, ct);
+            // Pause asks the worker to stop at its next tool boundary (and stops it if it doesn't); Stop stops it now.
+            await using var watch = new ControlWatch(_controls, worker, log, _controlPoll, _pauseGrace, item.ExternalId, item.EpicId, workspace.Path, ct);
             WorkerResult result;
             try
             {
@@ -404,7 +491,13 @@ public sealed class RunPipeline(
                                 await ledger.CheckpointAsync(item, Steps.Session, sid, "claude session started", c);
                             }
                         },
-                        OnLine: capture is null ? null : capture.OnLineAsync), ct);
+                        OnLine: capture is null ? null : capture.OnLineAsync), watch.Token);
+            }
+            catch (Exception ex) when (watch.Requested is { } requested && !ct.IsCancellationRequested)
+            {
+                // The control cut the worker off (Stop, or a pause it did not honour in time).
+                await CompleteControlledSessionAsync(capture, requested);
+                throw new ControlRequestedException(requested, WorkerStillRunning.IsMarked(ex));
             }
             catch (Exception ex) when (capture is not null)
             {
@@ -422,6 +515,16 @@ public sealed class RunPipeline(
                 }
                 throw;
             }
+            if (watch.Requested == ControlState.Stopping || (watch.PauseRequested && result.HookStopped))
+            {
+                // Stopped; or the worker stopped at a tool boundary (the pause hook ends the session as a success,
+                // so its result says nothing about the story being done): it resumes on Continue. A worker that
+                // finished on its own after a pause request is done: WorkerDone is recorded below and the pause
+                // takes effect before the push (E3: Continue does not run a finished worker again).
+                var requested = watch.Requested == ControlState.Stopping ? ControlState.Stopping : ControlState.Paused;
+                await CompleteControlledSessionAsync(capture, requested);
+                throw new ControlRequestedException(requested);
+            }
             if (capture is not null)
             {
                 await capture.CompleteAsync(result.ExitCode, result.Succeeded ? "succeeded" : "failed", fetchCost: true, ct);
@@ -434,6 +537,7 @@ public sealed class RunPipeline(
             }
             await ledger.CheckpointAsync(item, Steps.WorkerDone, session, $"worker exit {result.ExitCode}", ct);
         }
+        await ThrowIfControlledAsync(item, ct);
 
         if (!attempt.Any(e => e.Step == Steps.Pushed))
         {
@@ -444,6 +548,8 @@ public sealed class RunPipeline(
             await ledger.CheckpointAsync(item, Steps.Pushed, session, workspace.Branch, ct);
         }
 
+        // A Stop or Pause that arrived during the push: no ready PR is opened for a stopped item.
+        await ThrowIfControlledAsync(item, ct);
         // Returns the branch's already-open PR instead of opening a second one.
         var prUrl = await pullRequests.OpenAsync(repo, workspace.Branch, workspace.BaseBranch,
             $"{StoryId.Format(story.Id)}: {story.Name}", BuildPrBody(story, session!), ct);
@@ -461,18 +567,227 @@ public sealed class RunPipeline(
 
     private async Task RemoveWorktreeAsync(Run run)
     {
-        if (run.Workspace is not { } workspace)
+        if (run.Workspace is not null && await RemoveWorktreeAsync(run.Repo, run.Workspace))
         {
-            return;
+            run.Workspace = null;
         }
+    }
+
+    private async Task<bool> RemoveWorktreeAsync(RepoRef repo, Workspace workspace)
+    {
         try
         {
-            await workspaces.RemoveAsync(run.Repo, workspace, CancellationToken.None);
-            run.Workspace = null;
+            await workspaces.RemoveAsync(repo, workspace, CancellationToken.None);
+            return true;
         }
         catch (Exception ex)
         {
             log.WriteLine($"[cleanup] could not remove worktree {workspace.Path}: {ex.Message}; the next run's sweep retries");
+            return false;
+        }
+    }
+
+    private static string PausedMessage(string externalId) => $"{externalId} is paused by a control; `factory continue` resumes it.";
+
+    private async Task ThrowIfControlledAsync(WorkItem item, CancellationToken ct)
+    {
+        if (await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) is not ControlState.Running and var state)
+        {
+            throw new ControlRequestedException(state);
+        }
+    }
+
+    /// <summary>A paused session resumes later, so its cost waits for the run that finishes it; a stopped one's is fetched now (bounded).</summary>
+    private async Task CompleteControlledSessionAsync(SessionRecorder.SessionCapture? capture, ControlState requested)
+    {
+        if (capture is null)
+        {
+            return;
+        }
+        var stopped = requested == ControlState.Stopping;
+        using var bounded = new CancellationTokenSource(_failedSessionEndTimeout);
+        try
+        {
+            await capture.CompleteAsync(null, stopped ? "stopped" : "paused", fetchCost: stopped, bounded.Token).WaitAsync(bounded.Token);
+        }
+        catch (Exception captureError)
+        {
+            log.WriteLine($"[implement] could not record the end of the worker session: {captureError.Message}");
+        }
+    }
+
+    private ItemStopper Stopper => new(source, ledger, locks, pullRequests, _controls, log);
+
+    /// <summary>
+    /// Stops an item no run is driving (its Stopping control was set while it was idle, or an earlier stop did
+    /// not finish): stops a worker a crashed run left behind, then cancels the item and removes its worktree.
+    /// </summary>
+    private async Task<RunOutcome> StopIdleAsync(WorkItem item, int storyId, CancellationToken ct)
+    {
+        await using var runLock = await locks.TryAcquireAsync(item.Id, ct);
+        if (runLock is null)
+        {
+            log.WriteLine($"[{item.State}] {item.ExternalId} is already running; its run stops it.");
+            return new RunOutcome(item.Id, item.State, null, null, $"{item.ExternalId} is already running.");
+        }
+        await ledger.RefreshAsync(item, item.Title, item.Repo, item.EpicId, ct);
+        var repo = RepoRef.Parse(item.Repo);
+        Workspace? workspace = null;
+        if (!Lifecycle.IsTerminal(item.State))
+        {
+            var attempt = CurrentImplementAttempt(await ledger.HistoryAsync(item, ct));
+            if (OrphanedWorkerPid(attempt) is { } pid && await worker.StopOrphanAsync(pid, ct))
+            {
+                await ledger.CheckpointAsync(item, Steps.OrphanKilled, null, $"pid {pid}", ct);
+            }
+            workspace = await workspaces.ReopenAsync(repo, StoryId.BranchName(storyId), ct);
+        }
+        return await FinishStopAsync(item, storyId, repo, workspace, workerStillRunning: false);
+    }
+
+    /// <summary>
+    /// Cancels the item (its worker has ended): PRs back to draft, story to the Backlog with a comment, Cancelled,
+    /// then its worktree removed (E5) unless the worker may still be running in it. A stop that fails keeps the
+    /// item's Stopping control and says so; the next run or poll finishes it.
+    /// </summary>
+    private async Task<RunOutcome> FinishStopAsync(WorkItem item, int storyId, RepoRef repo, Workspace? workspace, bool workerStillRunning)
+    {
+        string? error = null;
+        try
+        {
+            log.WriteLine($"[stopping] {await Stopper.StopLockedAsync(item, storyId, CancellationToken.None)}");
+        }
+        catch (Exception ex)
+        {
+            error = $"stop of {item.ExternalId} not finished ({ex.Message}); it stays Stopping and the next poll or `factory stop` retries it";
+            log.WriteLine($"[stopping] {error}");
+        }
+        if (workspace is not null && !workerStillRunning)
+        {
+            await RemoveWorktreeAsync(repo, workspace);
+        }
+        else if (workspace is not null)
+        {
+            log.WriteLine($"[cleanup] worker did not stop; leaving {workspace.Path} for the next run's sweep");
+        }
+        return await OutcomeAsync(item, error, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Watches a running worker's controls (polling, so it sees writes from any process). Pause: asks the worker
+    /// to stop at its next tool boundary (<see cref="IWorker.RequestPause"/>) and cancels the run if it has not
+    /// ended within the pause grace, since the worker could tamper with anything it can write. Continue before then
+    /// withdraws the request (<see cref="IWorker.CancelPause"/>) and the grace. Stop: cancels at once.
+    /// </summary>
+    private sealed class ControlWatch : IAsyncDisposable
+    {
+        private readonly IControls _controls;
+        private readonly IWorker _workerProcess;
+        private readonly TextWriter _log;
+        private readonly TimeSpan _poll;
+        private readonly TimeSpan _grace;
+        private readonly CancellationTokenSource _worker;
+        private readonly CancellationTokenSource _done = new();
+        private readonly Task _loop;
+        private int _requested = -1;
+        private int _pauseRequested;
+
+        public ControlWatch(IControls controls, IWorker worker, TextWriter log, TimeSpan poll, TimeSpan grace, string externalId, long? epicId, string workingDirectory, CancellationToken ct)
+        {
+            (_controls, _workerProcess, _log, _poll, _grace) = (controls, worker, log, poll, grace);
+            _worker = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _loop = Task.Run(() => WatchAsync(externalId, epicId, workingDirectory));
+        }
+
+        /// <summary>Cancelled by Ctrl-C, by Stop, or when a paused worker overruns its grace.</summary>
+        public CancellationToken Token => _worker.Token;
+
+        /// <summary>The control that reached the run, if any.</summary>
+        public ControlState? Requested => Volatile.Read(ref _requested) is var r and >= 0 ? (ControlState)r : null;
+
+        /// <summary>Whether this run ever asked its worker to pause (even if Continue withdrew it since).</summary>
+        public bool PauseRequested => Volatile.Read(ref _pauseRequested) == 1;
+
+        private async Task WatchAsync(string externalId, long? epicId, string workingDirectory)
+        {
+            var log = _log;
+            DateTimeOffset? deadline = null;
+            while (true)
+            {
+                try
+                {
+                    await Task.Delay(_poll, _done.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                ControlState state;
+                try
+                {
+                    state = await _controls.EffectiveAsync(externalId, epicId, _done.Token);
+                }
+                catch (OperationCanceledException) when (_done.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    log.WriteLine($"[control] could not read the controls of {externalId}: {ex.Message}; retrying");
+                    continue;
+                }
+                if (state == ControlState.Stopping)
+                {
+                    Volatile.Write(ref _requested, (int)ControlState.Stopping);
+                    log.WriteLine($"[control] {externalId} is being stopped; stopping its worker");
+                    await _worker.CancelAsync();
+                    return;
+                }
+                if (state == ControlState.Running && deadline is not null)
+                {
+                    // Continue before the worker reached a tool boundary: its next tool call proceeds, no grace kill.
+                    deadline = null;
+                    Volatile.Write(ref _requested, -1);
+                    log.WriteLine($"[control] {externalId} continued; its worker goes on");
+                    try
+                    {
+                        _workerProcess.CancelPause(workingDirectory);
+                    }
+                    catch (Exception ex)
+                    {
+                        log.WriteLine($"[control] could not withdraw the worker's pause ({ex.Message}); it stops at its next tool call");
+                    }
+                }
+                if (state == ControlState.Paused && deadline is null)
+                {
+                    Volatile.Write(ref _requested, (int)ControlState.Paused);
+                    Volatile.Write(ref _pauseRequested, 1);
+                    deadline = DateTimeOffset.UtcNow + _grace;
+                    log.WriteLine($"[control] {externalId} paused; its worker stops at its next tool call");
+                    try
+                    {
+                        _workerProcess.RequestPause(workingDirectory);
+                    }
+                    catch (Exception ex)
+                    {
+                        log.WriteLine($"[control] could not ask the worker to pause ({ex.Message}); stopping it at the deadline");
+                    }
+                }
+                if (deadline is { } d && DateTimeOffset.UtcNow >= d)
+                {
+                    log.WriteLine($"[control] {externalId}'s worker did not stop at a tool boundary within {_grace}; stopping it (session and worktree kept)");
+                    await _worker.CancelAsync();
+                    return;
+                }
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await _done.CancelAsync();
+            await _loop;
+            _done.Dispose();
+            _worker.Dispose();
         }
     }
 
@@ -515,6 +830,18 @@ public sealed class RunPipeline(
             }
         }
         return history.Skip(start).ToList();
+    }
+
+    /// <summary>
+    /// Whether the item's last worker was started by a run that recorded nothing after it (no WorkerDone, no
+    /// transition such as Paused or Escalated, no orphan kill): that run crashed and the worker may still be running.
+    /// </summary>
+    internal static bool CrashedWorkerMayBeRunning(List<LedgerEntry> history)
+    {
+        var attempt = CurrentImplementAttempt(history);
+        var started = attempt.FindLastIndex(e => e.Step == Steps.WorkerStarted);
+        return OrphanedWorkerPid(attempt) is not null
+            && !attempt.Skip(started + 1).Any(e => e.Step is null || e.Step == Steps.OrphanKilled);
     }
 
     /// <summary>The pid of the attempt's last worker if no row shows it finished.</summary>

@@ -12,6 +12,19 @@
 {
     <p class="error">Could not refresh from the ledger; showing the last known state.</p>
 }
+<div class="controls" data-scope="@ControlScope.Factory">
+    <span>Factory: <span class="control-state">@(Paused(ControlScope.Factory) ? "paused" : "running")</span></span>
+    <ControlButton Action="@(Paused(ControlScope.Factory) ? "continue" : "pause")" Scope="@ControlScope.Factory" />
+    <ControlButton Action="stop" Scope="@ControlScope.Factory" />
+</div>
+@foreach (var epic in Epics)
+{
+    <div class="controls" data-scope="@ControlScope.Epic(epic)">
+        <span>Epic @epic: <span class="control-state">@(Paused(ControlScope.Epic(epic)) ? "paused" : "running")</span></span>
+        <ControlButton Action="@(Paused(ControlScope.Epic(epic)) ? "continue" : "pause")" Scope="@ControlScope.Epic(epic)" />
+        <ControlButton Action="stop" Scope="@ControlScope.Epic(epic)" />
+    </div>
+}
 @if (_rows is null)
 {
     <p class="muted">Loading…</p>
@@ -24,7 +37,7 @@ else
 {
     <table class="pipeline">
         <thead>
-            <tr><th>Item</th><th>State</th><th>Repo</th><th>PR</th><th>Elapsed</th><th>Cost</th><th>Sessions</th></tr>
+            <tr><th>Item</th><th>State</th><th>Repo</th><th>PR</th><th>Elapsed</th><th>Cost</th><th>Sessions</th><th>Control</th></tr>
         </thead>
         <tbody>
             @foreach (var row in _rows)
@@ -51,6 +64,18 @@ else
                             <a href="sessions/@Uri.EscapeDataString(s.ClaudeSessionId!)">#@s.Attempt@(s.Running ? " (live)" : "")</a>
                         }
                     </td>
+                    <td class="control">
+                        @if (row.Control != ControlState.Running)
+                        {
+                            <span class="control-state">@(row.Control == ControlState.Stopping ? "stopping" : "paused")</span>
+                        }
+                        @if (row.Control != ControlState.Stopping)
+                        {
+                            var scope = ControlScope.Item(row.ExternalId);
+                            <ControlButton Action="@(Paused(scope) ? "continue" : "pause")" Scope="@scope" />
+                            <ControlButton Action="stop" Scope="@scope" />
+                        }
+                    </td>
                 </tr>
             }
         </tbody>
@@ -60,6 +85,14 @@ else
 @code {
     private readonly CancellationTokenSource _cts = new();
     private IReadOnlyList<PipelineRow>? _rows;
+    private IReadOnlyDictionary<string, ControlState> _controls = new Dictionary<string, ControlState>();
+
+    /// <summary>Whether this scope's own control (not an enclosing one) pauses it: Continue clears exactly that.</summary>
+    private bool Paused(string scope) => _controls.GetValueOrDefault(scope) == ControlState.Paused;
+
+    private IEnumerable<long> Epics => (_rows ?? []).Select(r => r.EpicId).OfType<long>()
+        .Concat(_controls.Keys.Select(ControlScope.EpicOf).OfType<long>())
+        .Distinct().Order();
     private ITimer? _tick;
     private bool _loading;
     private bool _again;
@@ -90,6 +123,7 @@ else
             {
                 _again = false;
                 _rows = await Data.ActiveItemsAsync(_cts.Token);
+                _controls = (await Data.ControlsAsync(_cts.Token)).ToDictionary(c => c.Scope, c => c.State);
                 _stale = false;
             }
             while (_again);

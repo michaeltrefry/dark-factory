@@ -92,9 +92,10 @@ public sealed class SessionEventRelay(
             {
                 _ = RelayAsync(e.Payload);
             }
-            else if (long.TryParse(e.Payload, out var item))
+            else
             {
-                pipeline?.Notify(item);
+                // An item id, or empty for a control change (any item may be affected).
+                pipeline?.Notify(long.TryParse(e.Payload, out var item) ? item : null);
             }
         };
         try
