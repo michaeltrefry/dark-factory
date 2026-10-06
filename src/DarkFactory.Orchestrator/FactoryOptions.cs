@@ -79,6 +79,15 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
 
     public TimeSpan WorkerTimeout => TimeSpan.FromMinutes(config.GetValue("Worker:TimeoutMinutes", 30));
 
+    /// <summary>How long a paused worker may take to reach its next tool boundary before it is stopped anyway.</summary>
+    public TimeSpan PauseGrace => TimeSpan.FromSeconds(config.GetValue("Worker:PauseGraceSeconds", (int)RunPipeline.DefaultPauseGrace.TotalSeconds));
+
+    /// <summary>
+    /// Pause flags the worker's PreToolUse hook checks: under the owner-owned work root, readable but not
+    /// writable by the worker user.
+    /// </summary>
+    public string PauseFlagDirectory => Path.Combine(WorkRoot, "controls");
+
     public string LedgerConnectionString => config.GetLedgerConnectionString();
 
     public string RouterKey => Secret("Router:Key", "FACTORY_ROUTER_KEY", SecretAccounts.RouterKey, "router key");

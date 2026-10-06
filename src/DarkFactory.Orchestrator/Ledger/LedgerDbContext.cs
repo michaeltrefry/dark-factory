@@ -11,6 +11,10 @@ public sealed class WorkItem
     public required string ExternalId { get; set; }
     public required string Title { get; set; }
     public required string Repo { get; set; }
+
+    /// <summary>The story's epic on its board, if any: the scope an epic-level control applies to.</summary>
+    public long? EpicId { get; set; }
+
     public WorkState State { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
@@ -96,12 +100,26 @@ public sealed class SessionEvent
     public DateTimeOffset ReceivedAt { get; set; }
 }
 
+/// <summary>
+/// A Pause/Continue/Stop control at one scope: <c>factory</c>, <c>epic:&lt;id&gt;</c> or <c>item:sc-&lt;id&gt;</c>
+/// (<see cref="Controls.ControlScope"/>). Written by the dashboard and the CLI; read by every pipeline and the
+/// intake loop, whichever process they run in.
+/// </summary>
+public sealed class Control
+{
+    public required string Scope { get; set; }
+    public Controls.ControlState State { get; set; }
+    public required string ChangedBy { get; set; }
+    public DateTimeOffset ChangedAt { get; set; }
+}
+
 public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) : DbContext(options)
 {
     public DbSet<WorkItem> WorkItems => Set<WorkItem>();
     public DbSet<LedgerEntry> LedgerEntries => Set<LedgerEntry>();
     public DbSet<WorkerSession> WorkerSessions => Set<WorkerSession>();
     public DbSet<SessionEvent> SessionEvents => Set<SessionEvent>();
+    public DbSet<Control> Controls => Set<Control>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -143,6 +161,14 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
             e.HasIndex(x => x.WorkItemId);
             e.HasOne<WorkerSession>().WithMany().HasForeignKey(x => x.WorkerSessionId);
             e.HasOne<WorkItem>().WithMany().HasForeignKey(x => x.WorkItemId);
+        });
+        modelBuilder.Entity<Control>(e =>
+        {
+            e.ToTable("controls");
+            e.HasKey(x => x.Scope);
+            e.Property(x => x.Scope).HasMaxLength(64);
+            e.Property(x => x.State).HasConversion<string>().HasMaxLength(16);
+            e.Property(x => x.ChangedBy).HasMaxLength(128);
         });
     }
 

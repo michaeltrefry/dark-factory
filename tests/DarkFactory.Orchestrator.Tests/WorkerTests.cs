@@ -216,6 +216,72 @@ public class ClaudeWorkerTests
     }
 
     [Fact]
+    public async Task Pause_hook_denies_the_next_tool_call_and_ends_the_session_only_while_the_flag_exists()
+    {
+        var dir = Directory.CreateTempSubdirectory("df-pause-").FullName;
+        var flag = ClaudeWorker.PauseFlagPath(dir, "/work/worktrees/acme/widgets/factory-sc-7/");
+        Assert.Equal(Path.Combine(dir, "factory-sc-7.pause"), flag);
+        using var settings = System.Text.Json.JsonDocument.Parse(ClaudeWorker.BuildPauseSettings(flag));
+        var hook = settings.RootElement.GetProperty("hooks").GetProperty("PreToolUse")[0];
+        Assert.Equal("*", hook.GetProperty("matcher").GetString());
+        var command = hook.GetProperty("hooks")[0].GetProperty("command").GetString()!;
+
+        Assert.Equal("", await Sh(command)); // no flag: the call proceeds
+        File.WriteAllText(flag, "");
+        using var decision = System.Text.Json.JsonDocument.Parse(await Sh(command));
+        Assert.False(decision.RootElement.GetProperty("continue").GetBoolean());
+        Assert.Equal("deny", decision.RootElement.GetProperty("hookSpecificOutput").GetProperty("permissionDecision").GetString());
+        Assert.Equal("PreToolUse", decision.RootElement.GetProperty("hookSpecificOutput").GetProperty("hookEventName").GetString());
+
+        Assert.Throws<ArgumentException>(() => ClaudeWorker.BuildPauseSettings("/tmp/it's"));
+
+        static async Task<string> Sh(string command)
+        {
+            using var p = Process.Start(new ProcessStartInfo("/bin/sh", ["-c", command]) { RedirectStandardOutput = true })!;
+            var output = await p.StandardOutput.ReadToEndAsync();
+            await p.WaitForExitAsync();
+            Assert.Equal(0, p.ExitCode);
+            return output;
+        }
+    }
+
+    [Fact]
+    public async Task Worker_gets_the_pause_hook_and_request_pause_raises_its_flag_which_the_run_clears()
+    {
+        var dir = Directory.CreateTempSubdirectory("df-pause-").FullName;
+        var flags = Path.Combine(dir, "controls");
+        var worktree = Directory.CreateDirectory(Path.Combine(dir, "factory-sc-9")).FullName;
+        var argsDump = Path.Combine(dir, "args.txt");
+        var script = Path.Combine(dir, "fake-claude.sh");
+        // Waits until the flag exists (as a tool call would), then ends.
+        File.WriteAllText(script, $$"""
+            #!/bin/sh
+            printf '%s\n' "$@" > "{{argsDump}}"
+            if [ -e "{{Path.Combine(flags, "factory-sc-9.pause")}}" ]; then echo stale > "{{Path.Combine(dir, "saw-stale")}}"; fi
+            echo '{"type":"system","subtype":"init","session_id":"s-9"}'
+            while [ ! -e "{{Path.Combine(flags, "factory-sc-9.pause")}}" ]; do sleep 0.02; done
+            echo '{"type":"result","subtype":"success","is_error":false,"session_id":"s-9"}'
+            """);
+        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        Directory.CreateDirectory(flags);
+        File.WriteAllText(Path.Combine(flags, "factory-sc-9.pause"), "stale");
+        var worker = new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1), pauseFlagDirectory: flags);
+
+        var run = worker.RunAsync(worktree, "p", null, new WorkerCallbacks(OnSession: (_, _) =>
+        {
+            ((IWorker)worker).RequestPause(worktree);
+            return Task.CompletedTask;
+        }), CancellationToken.None);
+        var result = await run.WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.True(result.Succeeded);
+        var args = File.ReadAllLines(argsDump).ToList();
+        Assert.Equal(ClaudeWorker.BuildPauseSettings(Path.Combine(flags, "factory-sc-9.pause")), args[args.IndexOf("--settings") + 1]);
+        Assert.False(File.Exists(Path.Combine(flags, "factory-sc-9.pause"))); // cleared after the run (and the stale one before it)
+        Assert.False(File.Exists(Path.Combine(dir, "saw-stale")));
+    }
+
+    [Fact]
     public void Resume_passes_the_session_id_to_claude()
     {
         var args = ClaudeWorker.BuildArguments("go on", "sess-1").ToList();

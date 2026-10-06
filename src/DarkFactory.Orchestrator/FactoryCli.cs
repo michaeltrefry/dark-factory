@@ -13,7 +13,8 @@ public static class FactoryCli
         Func<string, int, CancellationToken, Task<int>> setupGitHubApp,
         Func<RepoRef, CancellationToken, Task<int>> protectRepo,
         Func<CancellationToken, Task<int>> work,
-        Func<CancellationToken, Task<int>> setDashboardPassword)
+        Func<CancellationToken, Task<int>> setDashboardPassword,
+        Func<string, string, CancellationToken, Task<int>> control)
     {
         var storyArgument = new Argument<int>("story-id")
         {
@@ -91,9 +92,54 @@ public static class FactoryCli
         {
             runCommand,
             workCommand,
+            ControlCommand("pause", "Pause a scope: nothing new is claimed or started there, and running workers stop after their current tool call (session and worktree kept).", control),
+            ControlCommand("continue", "Continue a paused scope: paused items resume from the ledger (an interrupted worker resumes its own Claude session).", control),
+            ControlCommand("stop", "Stop every active item in a scope: kill its worker, mark it Cancelled, turn its open PR back into a draft and move its story to the Backlog with a comment. Nothing is merged or deleted.", control),
             new Command("github-app", "GitHub App management") { setupCommand },
             new Command("github-repo", "Target repository management") { protectCommand },
             new Command("dashboard", "Dashboard management") { setPasswordCommand },
         };
+    }
+
+    /// <summary><c>factory &lt;action&gt; --item sc-N | --epic N | --factory</c>; the handler gets the action and the control scope.</summary>
+    private static Command ControlCommand(string action, string description, Func<string, string, CancellationToken, Task<int>> control)
+    {
+        var item = new Option<int?>("--item")
+        {
+            Description = "One Shortcut story, e.g. sc-1234",
+            CustomParser = result =>
+            {
+                var token = result.Tokens.Single().Value;
+                if (StoryId.TryParse(token, out var id))
+                {
+                    return id;
+                }
+                result.AddError($"'{token}' is not a Shortcut story id (expected sc-<number> or <number>).");
+                return null;
+            },
+        };
+        var epic = new Option<long?>("--epic") { Description = "Every story of one Shortcut epic (its id)" };
+        var factory = new Option<bool>("--factory") { Description = "The whole factory" };
+        var command = new Command(action, description) { item, epic, factory };
+        command.Validators.Add(result =>
+        {
+            var given = new[] { result.GetResult(item) is not null, result.GetResult(epic) is not null, result.GetResult(factory) is not null }.Count(x => x);
+            if (given != 1)
+            {
+                result.AddError("Give exactly one of --item sc-N, --epic N or --factory.");
+            }
+            else if (result.GetValue(epic) is <= 0)
+            {
+                result.AddError("--epic must be a positive epic id.");
+            }
+        });
+        command.SetAction((parse, ct) =>
+        {
+            var scope = parse.GetValue(item) is { } story ? Controls.ControlScope.Item(StoryId.Format(story))
+                : parse.GetValue(epic) is { } epicId ? Controls.ControlScope.Epic(epicId)
+                : Controls.ControlScope.Factory;
+            return control(action, scope, ct);
+        });
+        return command;
     }
 }

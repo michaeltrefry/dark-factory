@@ -408,6 +408,74 @@ public sealed class DashboardHostTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Control_posts_need_the_login_and_the_antiforgery_token_and_write_only_the_control()
+    {
+        await using var app = await StartAsync();
+        var form = new Dictionary<string, string> { ["action"] = "pause", ["scope"] = "factory" };
+
+        using (var anonymous = DashboardLogin.Client(app.Address()))
+        {
+            using var refused = await DashboardLogin.PostAsync(anonymous, DashboardControls.Path, form, await DashboardLogin.TokenAsync(anonymous));
+            Assert.Equal(HttpStatusCode.Redirect, refused.StatusCode);
+            Assert.StartsWith($"{app.Address()}/login", refused.Headers.Location!.ToString());
+        }
+        var cookies = await DashboardLogin.LoginAsync(app.Address());
+        using var http = DashboardLogin.Client(app.Address(), cookies);
+        using (var noToken = await DashboardLogin.PostAsync(http, DashboardControls.Path, form, null))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, noToken.StatusCode);
+        }
+        using (var badScope = await DashboardLogin.PostAsync(http, DashboardControls.Path,
+            new Dictionary<string, string> { ["action"] = "pause", ["scope"] = "everything" }, DashboardLogin.TokenFrom(await http.GetStringAsync("/"))))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, badScope.StatusCode);
+        }
+        await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_db!.ConnectionString)))
+        {
+            Assert.Empty(await db.Controls.ToListAsync());
+        }
+
+        var page = await http.GetStringAsync("/");
+        Assert.Contains("data-scope=\"factory\"", page); // the factory's Pause/Stop buttons
+        using var paused = await DashboardLogin.PostAsync(http, DashboardControls.Path, form, DashboardLogin.TokenFrom(page));
+
+        Assert.Equal(HttpStatusCode.Redirect, paused.StatusCode);
+        Assert.Equal("/", paused.Headers.Location!.OriginalString);
+        await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_db!.ConnectionString)))
+        {
+            var control = await db.Controls.SingleAsync();
+            Assert.Equal(("factory", Controls.ControlState.Paused, DashboardControls.By), (control.Scope, control.State, control.ChangedBy));
+        }
+        Assert.Contains("Factory: <span class=\"control-state\">paused</span>", await http.GetStringAsync("/"));
+    }
+
+    [Fact]
+    public async Task Stop_from_the_dashboard_asks_for_confirmation_and_marks_the_item_stopping()
+    {
+        await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_db!.ConnectionString)))
+        {
+            await new WorkLedger(db, TimeProvider.System).GetOrCreateAsync(RunPipeline.Source, "sc-12", "Story", "acme/widgets", null, CancellationToken.None, 5);
+        }
+        await using var app = await StartAsync();
+        var cookies = await DashboardLogin.LoginAsync(app.Address());
+        using var http = DashboardLogin.Client(app.Address(), cookies);
+        var page = await http.GetStringAsync("/");
+        Assert.Contains("data-scope=\"epic:5\"", page);
+        Assert.Matches("<form[^>]*data-action=\"stop\"[^>]*data-scope=\"item:sc-12\"[^>]*onsubmit=\"return confirm", page);
+
+        using var stop = await DashboardLogin.PostAsync(http, DashboardControls.Path,
+            new Dictionary<string, string> { ["action"] = "stop", ["scope"] = "item:sc-12" }, DashboardLogin.TokenFrom(page));
+
+        Assert.Equal(HttpStatusCode.Redirect, stop.StatusCode);
+        await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_db!.ConnectionString)))
+        {
+            // This host has no board or GitHub (no intake): the item waits Stopping for its next run to finish it.
+            Assert.Equal(Controls.ControlState.Stopping, (await db.Controls.SingleAsync(c => c.Scope == "item:sc-12")).State);
+        }
+        Assert.Contains("<span class=\"control-state\">stopping</span>", await http.GetStringAsync("/"));
+    }
+
+    [Fact]
     public async Task Logging_out_ends_the_session()
     {
         await using var app = await StartAsync();

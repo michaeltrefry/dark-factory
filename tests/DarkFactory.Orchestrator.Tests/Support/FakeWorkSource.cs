@@ -35,7 +35,14 @@ public sealed class FakeWorkSource(WorkStory story, bool commentFails = false) :
     public Task<WorkSpec> ReadSpecAsync(int id, CancellationToken ct) =>
         Task.FromResult(new WorkSpec(story with { Id = id }, Epic, Documents));
 
-    public Task ReportStateAsync(int id, BoardState state, string? comment, CancellationToken ct) => Write($"state {id} {state}");
+    public Task ReportStateAsync(int id, BoardState state, string? comment, CancellationToken ct)
+    {
+        if (comment is not null)
+        {
+            Comments.Add(WorkSourceComments.Attributed(comment));
+        }
+        return Write($"state {id} {state}");
+    }
 
     public Task CommentAsync(int id, string text, CancellationToken ct)
     {

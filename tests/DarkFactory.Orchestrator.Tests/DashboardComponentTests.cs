@@ -227,7 +227,9 @@ public class DashboardComponentTests : BunitContext
         secrets.Values[SecretAccounts.DashboardPasswordHash] = DashboardAuth.HashPassword("a brand new password");
 
         cut.WaitForAssertion(() => Assert.Equal([TranscriptLines.Sid], _viewers.Left), TimeSpan.FromSeconds(10)); // the page left its feed
-        Assert.DoesNotContain("Story 1", cut.Markup);
+        // The page leaves its feed as it is torn down; the re-render without it can land a moment later.
+        cut.WaitForAssertion(() => Assert.DoesNotContain("Story 1", cut.Markup), TimeSpan.FromSeconds(10));
+        cut.WaitForAssertion(() => Assert.NotEmpty(navigation.History), TimeSpan.FromSeconds(10));
         var redirect = navigation.History.First();
         Assert.Equal($"/login?returnUrl={Uri.EscapeDataString("/sessions/" + TranscriptLines.Sid)}", redirect.Uri);
         Assert.True(redirect.Options.ForceLoad);

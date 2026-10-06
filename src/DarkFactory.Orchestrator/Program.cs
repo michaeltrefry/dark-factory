@@ -8,7 +8,22 @@ using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.Extensions.Hosting;
 
-return await FactoryCli.Build(RunAsync, SetupGitHubAppAsync, ProtectRepoAsync, WorkAsync, SetDashboardPasswordAsync).Parse(args).InvokeAsync();
+return await FactoryCli.Build(RunAsync, SetupGitHubAppAsync, ProtectRepoAsync, WorkAsync, SetDashboardPasswordAsync, ControlAsync).Parse(args).InvokeAsync();
+
+static async Task<int> ControlAsync(string action, string scope, CancellationToken ct)
+{
+    var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
+    try
+    {
+        Console.WriteLine(await FactoryRunner.ControlAsync(options, action, scope, $"{Environment.UserName} (cli)", Console.Out, ct));
+        return 0;
+    }
+    catch (MissingCredentialException ex)
+    {
+        Console.Error.WriteLine(ex.Message);
+        return 2;
+    }
+}
 
 static async Task<int> RunAsync(int storyId, bool ignoreScope, CancellationToken ct)
 {

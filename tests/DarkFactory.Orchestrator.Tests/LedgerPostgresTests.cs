@@ -160,6 +160,8 @@ public sealed class LedgerPostgresTests : IAsyncLifetime
             Interlocked.Increment(ref Opened);
             return Task.FromResult("https://github.com/acme/widgets/pull/1");
         }
+
+        public Task<IReadOnlyList<string>> ConvertOpenToDraftAsync(RepoRef repo, string head, CancellationToken ct) => throw new NotSupportedException();
     }
 
     /// <summary>Announces its session, then works until released.</summary>

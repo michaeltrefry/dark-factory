@@ -14,7 +14,8 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
     /// An existing item is returned as stored, unchanged: take the item's run lock, then
     /// <see cref="RefreshAsync"/> it, before writing to it.
     /// </summary>
-    public async Task<WorkItem> GetOrCreateAsync(string source, string externalId, string title, string repo, string? intakeDetail, CancellationToken ct)
+    public async Task<WorkItem> GetOrCreateAsync(string source, string externalId, string title, string repo, string? intakeDetail, CancellationToken ct,
+        long? epicId = null)
     {
         if (await db.WorkItems.SingleOrDefaultAsync(x => x.Source == source && x.ExternalId == externalId, ct) is { } existing)
         {
@@ -27,6 +28,7 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
             ExternalId = externalId,
             Title = title,
             Repo = repo,
+            EpicId = epicId,
             State = WorkState.Intake,
             CreatedAt = now,
             UpdatedAt = now,
@@ -57,18 +59,19 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
 
     /// <summary>
     /// Re-reads the item (another run may have moved it since it was loaded) and updates its
-    /// title and repo. Call while holding the item's run lock.
+    /// title, repo and epic. Call while holding the item's run lock.
     /// </summary>
-    public async Task RefreshAsync(WorkItem item, string title, string repo, CancellationToken ct)
+    public async Task RefreshAsync(WorkItem item, string title, string repo, long? epicId, CancellationToken ct)
     {
         await db.Entry(item).ReloadAsync(ct);
-        if (item.Title == title && item.Repo == repo)
+        if (item.Title == title && item.Repo == repo && item.EpicId == epicId)
         {
             return;
         }
-        var (oldTitle, oldRepo, oldUpdated, oldVersion) = (item.Title, item.Repo, item.UpdatedAt, item.Version);
+        var (oldTitle, oldRepo, oldEpic, oldUpdated, oldVersion) = (item.Title, item.Repo, item.EpicId, item.UpdatedAt, item.Version);
         item.Title = title;
         item.Repo = repo;
+        item.EpicId = epicId;
         item.UpdatedAt = time.GetUtcNow();
         item.Version++;
         try
@@ -77,7 +80,7 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
         }
         catch
         {
-            (item.Title, item.Repo, item.UpdatedAt, item.Version) = (oldTitle, oldRepo, oldUpdated, oldVersion);
+            (item.Title, item.Repo, item.EpicId, item.UpdatedAt, item.Version) = (oldTitle, oldRepo, oldEpic, oldUpdated, oldVersion);
             throw;
         }
     }
@@ -102,6 +105,10 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
     /// <summary>The item, or null if the ledger has never seen it. Nothing is written.</summary>
     public Task<WorkItem?> FindAsync(string source, string externalId, CancellationToken ct) =>
         db.WorkItems.SingleOrDefaultAsync(x => x.Source == source && x.ExternalId == externalId, ct);
+
+    /// <summary>The source's items not Done or Cancelled, oldest first.</summary>
+    public Task<List<WorkItem>> ActiveItemsAsync(string source, CancellationToken ct) =>
+        db.WorkItems.Where(x => x.Source == source && x.State != WorkState.Done && x.State != WorkState.Cancelled).OrderBy(x => x.Id).ToListAsync(ct);
 
     /// <summary>The source's items currently in one of <paramref name="states"/>, oldest first.</summary>
     public async Task<List<WorkItem>> ItemsInAsync(string source, IReadOnlySet<WorkState> states, CancellationToken ct)

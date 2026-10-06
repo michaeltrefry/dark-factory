@@ -44,7 +44,7 @@ public class WorkLedgerTests
 
         Assert.Equal(first.Id, second.Id);
         Assert.Equal("Fix", (await db.WorkItems.AsNoTracking().SingleAsync()).Title); // nothing written before the run lock
-        await ledger.RefreshAsync(second, "New", "o/r", CancellationToken.None);
+        await ledger.RefreshAsync(second, "New", "o/r", null, CancellationToken.None);
         Assert.Equal("New", (await db.WorkItems.AsNoTracking().SingleAsync()).Title);
         Assert.Single(await db.LedgerEntries.ToListAsync());
     }
@@ -241,6 +241,19 @@ public class RunPipelineTests
             }
             Opened.Add((repo, head, baseBranch, title, body));
             return Task.FromResult(PrUrl);
+        }
+
+        /// <summary>Heads whose open PRs were turned back into drafts.</summary>
+        public List<string> Drafted { get; } = [];
+
+        public Task<IReadOnlyList<string>> ConvertOpenToDraftAsync(RepoRef repo, string head, CancellationToken ct)
+        {
+            if (throws is not null)
+            {
+                return Task.FromException<IReadOnlyList<string>>(throws);
+            }
+            Drafted.Add(head);
+            return Task.FromResult<IReadOnlyList<string>>(Opened.Any(o => o.Head == head) ? [PrUrl] : []);
         }
     }
 
