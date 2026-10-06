@@ -8,6 +8,7 @@ using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Router;
 using DarkFactory.Orchestrator.Sessions;
 using DarkFactory.Orchestrator.Tests.Support;
+using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.AspNetCore.Builder;
 using System.Security.Claims;
 using Microsoft.AspNetCore.Components.Authorization;
@@ -95,6 +96,35 @@ public class DashboardComponentTests : BunitContext
         Services.AddSingleton(_changes);
         Services.AddSingleton<ISessionViewers>(_viewers);
         Services.AddSingleton<TimeProvider>(new FakeTimeProvider(Now));
+        Services.AddSingleton(_intake);
+    }
+
+    private readonly IntakeStatus _intake = new(new FakeTimeProvider(Now));
+
+    [Fact]
+    public void Intake_errors_show_as_a_factory_banner_and_per_item_lines_as_they_happen()
+    {
+        _data.Rows = [];
+        var cut = Render<Pipeline>();
+        Assert.Empty(cut.FindAll(".factory-error"));
+        Assert.Empty(cut.FindAll(".item-errors"));
+
+        _intake.FactoryFailed("sc-5 could not run: the worker run lock: Another factory run is using /w");
+        _intake.ItemFailed(101, "InvalidOperationException: Shortcut GET stories/101 failed: 404 Not Found");
+        _intake.ItemFailed(101, "InvalidOperationException: Shortcut GET stories/101 failed: 404 Not Found");
+        _intake.ItemGaveUp(101, "escalated");
+
+        cut.WaitForAssertion(() => Assert.Contains("Another factory run", cut.Find(".factory-error").TextContent));
+        var line = cut.Find(".item-errors li[data-story='101']").TextContent;
+        Assert.Contains("sc-101", line);
+        Assert.Contains("failed 2", line);
+        Assert.Contains("404 Not Found", line);
+        Assert.Contains("escalated", line);
+
+        _intake.FactoryOk();
+        _intake.ItemOk(101);
+        cut.WaitForAssertion(() => Assert.Empty(cut.FindAll(".factory-error")));
+        Assert.Empty(cut.FindAll(".item-errors"));
     }
 
     private static PipelineRow Row(long id, WorkState state, string? pr = null, decimal? cost = null, params SessionLink[] sessions) =>
@@ -335,6 +365,7 @@ public sealed class DashboardLiveTests : BunitContext, IAsyncLifetime
         Services.AddSingleton(_app.Services.GetRequiredService<IDashboardData>());
         Services.AddSingleton(_app.Services.GetRequiredService<PipelineChanges>());
         Services.AddSingleton(_app.Services.GetRequiredService<ISessionViewers>());
+        Services.AddSingleton(_app.Services.GetRequiredService<IntakeStatus>());
         Services.AddSingleton(TimeProvider.System);
     }
 

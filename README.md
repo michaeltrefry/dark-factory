@@ -28,7 +28,14 @@ Items a previous process left mid-run (Intake or Implement in the ledger, or pau
 process was stopped) are resumed first, after checking their story is still in scope; one that left
 the scope is parked in Paused with one story comment. Items paused by a Pause control resume once
 nothing pauses them any more (after Continue, see [Controls](#controls-pause-continue-stop)); items
-paused any other way (parked) are not resumed automatically.
+paused by the usage pause (`usage-paused`) resume, with the same Claude session, once it lifts at its
+resume time (or `factory continue --usage`); items paused any other way (parked) are not resumed automatically.
+A run that fails before its pipeline starts (the story was deleted, the board read fails) is retried at the next
+poll; after `Intake:MaxItemFailures` (default 3) such failures in a row the loop gives up on the item: one in Intake or
+Implement is escalated with a story comment, a paused one is parked with a comment (so it no longer auto-resumes).
+A failure every item shares (another sandboxed run holds the work root, the worker sandbox is not ready, the ledger
+or the worktree sweep fails, a missing credential) escalates nothing: it ends the poll and shows as a factory error
+banner on the dashboard's pipeline page, next to each item's repeated failures, until a poll gets past it.
 
 The board is touched only through `IWorkSource` (`WorkSources/`; Shortcut adapter in
 `Shortcut/ShortcutWorkSource.cs`). On Intake the story is claimed (owner = the token's member,
@@ -244,3 +251,5 @@ FACTORY_E2E=1 FACTORY_E2E_STORY=sc-<to-do bug story> dotnet test --project tests
 
 Each test skips with the exact missing prerequisite when a credential, the router,
 the ledger database or the Claude CLI is unavailable. See `CLAUDE.md` for all config keys.
+The epic acceptance tests AT1–AT8 (which test, which env vars, what the owner does by hand, and the
+safety notes) are in [docs/acceptance.md](docs/acceptance.md).

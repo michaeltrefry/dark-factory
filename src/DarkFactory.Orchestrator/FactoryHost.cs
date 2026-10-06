@@ -100,6 +100,8 @@ public static class FactoryHost
         services.AddDashboardAuth(options);
         services.TryAddSingleton(TimeProvider.System);
         services.AddSingleton<IDashboardData, DashboardData>();
+        // The intake loop's last errors (E10); empty on a host without one.
+        services.TryAddSingleton(sp => new IntakeStatus(sp.GetRequiredService<TimeProvider>()));
         // The dashboard's only writes besides login/logout (E8): Pause, Continue and Stop.
         services.AddSingleton(sp => new Controls.ControlActions(
             sp.GetRequiredService<Controls.IControls>(), sp.GetRequiredService<IDbContextFactory<LedgerDbContext>>(), sp.GetService<Controls.IItemStops>(),

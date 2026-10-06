@@ -771,6 +771,51 @@ public class LiveWorkerSandboxTests
         Assert.Contains("Permission denied", stderr);
     }
 
+    /// <summary>
+    /// AT6 (docs/acceptance.md): the installed helper, launched exactly as <see cref="ClaudeWorker"/> launches a sandboxed
+    /// worker (<see cref="WorkerSandbox.Start"/> with <see cref="ClaudeWorker.BuildRouterVariables"/> for the configured
+    /// router URL and <c>Worker:Auth</c>), gives the worker exactly the allowlisted environment, and nothing of the owner's.
+    /// The router key is a probe value: the real key never needs to appear in test output.
+    /// </summary>
+    [Fact]
+    public async Task Live_worker_environment_is_exactly_the_allowlist_for_the_configured_auth_mode()
+    {
+        var sandbox = await RequireSandboxAsync();
+        var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets());
+        var auth = options.WorkerAuth;
+        string[] expected = auth == WorkerAuth.RouterKey
+            ? ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH"]
+            : ["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH"];
+        const string probeKey = "rk_live_env_probe";
+        Environment.SetEnvironmentVariable("GH_TOKEN", "ghp_owner_should_not_leak");
+        try
+        {
+            using var p = sandbox.Start("/", "/usr/bin/env", [], ClaudeWorker.BuildRouterVariables(options.RouterBaseUrl, probeKey, auth));
+            var output = await p.StandardOutput.ReadToEndAsync();
+            await p.WaitForExitAsync();
+            WorkerSandbox.Stop(p);
+
+            Assert.Equal(0, p.ExitCode);
+            var env = output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .ToDictionary(l => l[..l.IndexOf('=')], l => l[(l.IndexOf('=') + 1)..]);
+            Assert.Equal(expected, env.Keys.Order());
+            Assert.Equal(options.RouterBaseUrl.ToString().TrimEnd('/'), env["ANTHROPIC_BASE_URL"].TrimEnd('/'));
+            Assert.Equal($"{ClaudeWorker.RouterKeyHeader}: {probeKey}", env["ANTHROPIC_CUSTOM_HEADERS"]);
+            if (auth == WorkerAuth.RouterKey)
+            {
+                Assert.Equal(probeKey, env["ANTHROPIC_API_KEY"]);
+            }
+            Assert.DoesNotContain(OwnerHome, env["HOME"]);
+            Assert.StartsWith(env["HOME"] + "/.local/bin:", env["PATH"]);
+            Assert.DoesNotContain(OwnerHome, env["PATH"]);
+            Assert.Equal(("1", "0"), (env["MSBUILDDISABLENODEREUSE"], env["DOTNET_CLI_USE_MSBUILD_SERVER"]));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("GH_TOKEN", null);
+        }
+    }
+
     [Fact]
     public async Task Worker_cannot_read_the_owners_keychain_items()
     {

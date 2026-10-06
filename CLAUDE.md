@@ -20,7 +20,8 @@ Claude Code headless workers through the Weave router.
   SIGKILLs `tests/DarkFactory.CrashHost` (the real pipeline with a fake `claude` script) and restarts it.
   `ShortcutContractTests` replay recorded Shortcut API fixtures (`Fixtures/shortcut`, strict request matching);
   re-record with `SHORTCUT_RECORD=1` (writes only throwaway `[dark-factory fixture]` stories, archived after).
-- `tests/DarkFactory.AcceptanceTests` — live epic acceptance harness; skips unless `FACTORY_E2E=1`.
+- `tests/DarkFactory.AcceptanceTests` — live epic acceptance harness; skips unless `FACTORY_E2E=1`. AT1–AT8 runbook:
+  `docs/acceptance.md` (the `factory work` tests use a throwaway ledger DB and their own work root, `E2e.cs`).
 
 ## Commands
 
@@ -54,6 +55,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Factory:DefaultRepo` | `michaeltrefry/dark-factory-sandbox` (a story line `Repo: owner/name` overrides) |
 | `Shortcut:Watch:Teams`, `Shortcut:Watch:Epics` | empty = watch nothing; comma-separated team mention names/ids, epic ids |
 | `Intake:PollSeconds` | `60` |
+| `Intake:MaxItemFailures` | `3` (runs of one item failing in a row before `factory work` escalates/parks it, E10) |
 | `Usage:PollSeconds` | `60` (`factory work` reads the router's subscription usage; also read at each intake poll) |
 | `Factory:WorkRoot` | `/opt/dark-factory/work` (clones + worktrees; `~/.dark-factory` when `Worker:RunAs=none`) |
 | `ConnectionStrings:Ledger` | `Host=localhost;Port=5434;Database=factory;Username=factory;Password=factory` |
@@ -92,11 +94,12 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
 - The orchestrator touches a board only through `IWorkSource` (E6). Shortcut workflow state ids are resolved by
   name from the API (never hardcoded); "ready" = `To Do` inside the watch scope, minus stories another claimant holds.
   Intake claims (owner + `factory-claimed` label, In Progress) as a `claimed` checkpoint; the PR and branch links
-  are a `linked` checkpoint before Review. `ClaimAsync` refuses (no write) unless the fresh story is To Do or already
+  are a `linked` checkpoint before Review. `factory work`'s start-up scope check is `IWorkSource.ValidateScopeAsync`. `ClaimAsync` refuses (no write) unless the fresh story is To Do or already
   ours, in scope (skipped by `factory run --ignore-scope`) and not another owner's, and reads the claim back; a refusal
-  parks the item (Paused + `parked` checkpoint). Only Paused rows with detail `interrupted` (`RunPipeline.Interrupted`)
-  or `user-paused` (`RunPipeline.UserPaused`, a Pause control) auto-resume (`RunPipeline.InFlightAsync`), the latter only
-  once no control pauses the item; a parked item never does. Resumes re-check the scope.
+  parks the item (Paused + `parked` checkpoint). Only Paused rows with detail `interrupted` (`RunPipeline.Interrupted`),
+  `user-paused` (`RunPipeline.UserPaused`, a Pause control) or `usage-paused` (`RunPipeline.UsagePaused`, the usage pause)
+  auto-resume (`RunPipeline.InFlightAsync`), the latter two only once no control pauses the item (the usage pause lifts at
+  its `ResumeAt`); a parked item never does. Resumes re-check the scope.
 - Controls (`Controls/`): Pause/Continue/Stop rows in the ledger's `controls` table (scope `factory` | `epic:<id>` |
   `item:sc-<id>`; `WorkItem.EpicId` maps items to epics), written by `factory pause|continue|stop` and the dashboard
   (`ControlActions`), read by every process. `RunPipeline` checks them before every step and, while a worker runs,
@@ -134,6 +137,12 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   usage-limited — it pauses the factory with the backoff and never escalates the item — even though it is upstream
   capacity rather than the plans running out; a transient overload thus costs at most a backoff, not an escalation.
 
+- Intake failures (E10, `WorkSources/IntakeLoop.cs`, `IntakeStatus`): a run that throws before its pipeline's try block
+  counts against its item; after `Intake:MaxItemFailures` in a row `IItemRunner.GiveUpAsync` (`RunPipeline.GiveUpAsync`)
+  escalates it (Intake/Implement, escalation comment) or parks it (Paused, with a comment) — an unknown item only gets the
+  comment. Factory-wide failures (`FactoryUnavailableException` from `FactoryRunner`'s shared set-up: worker lock, sandbox,
+  migration, worktree sweep; a `DbException`; `MissingCredentialException`; a failed poll) end the poll and escalate
+  nothing. Both show on the pipeline page (`IntakeStatus`, in memory in the `factory work` process).
 - Every state change is a committed ledger row before the next step (`WorkLedger.RecordAsync`), checked
   against the transition table in `Ledger/Lifecycle.cs` first; an illegal transition throws and writes nothing.
   New phases add handlers in `RunPipeline.Handlers`, not table rows. Sub-steps inside a state are checkpoint

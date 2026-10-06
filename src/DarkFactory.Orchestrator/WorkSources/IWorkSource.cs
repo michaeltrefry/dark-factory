@@ -54,6 +54,13 @@ public interface IWorkSource
     /// <summary>Whether the item is (still) inside the configured watch scope.</summary>
     Task<bool> InScopeAsync(int id, CancellationToken ct);
 
+    /// <summary>
+    /// <c>factory work</c>'s start-up check: the board is reachable with the configured credentials and every
+    /// part of the watch scope exists. Throws (<see cref="InvalidOperationException"/> or
+    /// <see cref="HttpRequestException"/>) naming the first problem.
+    /// </summary>
+    Task ValidateScopeAsync(CancellationToken ct);
+
     /// <summary>Removes the factory's claim. Idempotent.</summary>
     Task ReleaseAsync(int id, CancellationToken ct);
 

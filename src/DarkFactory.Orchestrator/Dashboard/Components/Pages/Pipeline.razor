@@ -4,6 +4,7 @@
 @inject IDashboardData Data
 @inject PipelineChanges Changes
 @inject TimeProvider Time
+@inject IntakeStatus Intake
 
 <PageTitle>Pipeline · Dark Factory</PageTitle>
 
@@ -11,6 +12,21 @@
 @if (_stale)
 {
     <p class="error">Could not refresh from the ledger; showing the last known state.</p>
+}
+@if (Intake.FactoryError is { } factoryError)
+{
+    <p class="error factory-error">Factory error (@factoryError.Count @(factoryError.Count == 1 ? "poll" : "polls") in a row, last at
+        @factoryError.At.ToString("u")): @factoryError.Message</p>
+}
+@if (Intake.ItemErrors is { Count: > 0 } itemErrors)
+{
+    <ul class="error item-errors">
+        @foreach (var (story, error) in itemErrors.OrderBy(e => e.Key))
+        {
+            <li data-story="@story"><span class="id">@StoryId.Format(story)</span> failed @error.Count
+                @(error.Count == 1 ? "run" : "runs") in a row before its pipeline started (last at @error.At.ToString("u")): @error.Message@(error.GaveUp is { } gaveUp ? $" — {gaveUp}" : "")</li>
+        }
+    </ul>
 }
 @if (UsagePause is { } usage)
 {
@@ -113,11 +129,14 @@ else
     {
         // Subscribe before the first read, so no change between the two is missed.
         Changes.Changed += OnChanged;
+        Intake.Changed += OnIntakeChanged;
         _tick = Time.CreateTimer(_ => _ = InvokeAsync(StateHasChanged), null, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
         await ReloadAsync();
     }
 
     private void OnChanged(long? workItemId) => _ = InvokeAsync(ReloadAsync);
+
+    private void OnIntakeChanged() => _ = InvokeAsync(StateHasChanged);
 
     /// <summary>Runs on the renderer: a change arriving mid-read is coalesced into one more read.</summary>
     private async Task ReloadAsync()
@@ -157,6 +176,7 @@ else
     public void Dispose()
     {
         Changes.Changed -= OnChanged;
+        Intake.Changed -= OnIntakeChanged;
         _tick?.Dispose();
         _cts.Cancel();
     }

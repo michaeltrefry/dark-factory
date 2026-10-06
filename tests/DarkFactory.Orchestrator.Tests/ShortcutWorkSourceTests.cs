@@ -140,8 +140,23 @@ public class ShortcutWorkSourceTests
     public async Task Work_start_up_check_reports_a_bad_scope_before_polling()
     {
         var board = new FakeShortcutBoard();
-        Assert.Null(await FactoryRunner.CheckWatchScopeAsync(Options("darkfactory"), board.Client(), CancellationToken.None));
-        Assert.Contains("no Shortcut team 'nope'", await FactoryRunner.CheckWatchScopeAsync(Options("darkfactory,nope"), board.Client(), CancellationToken.None));
+        Assert.Null(await FactoryRunner.CheckWatchScopeAsync(Options("darkfactory"),
+            FactoryRunner.CreateWorkSource(Options("darkfactory"), board.Client()), CancellationToken.None));
+        Assert.Contains("no Shortcut team 'nope'", await FactoryRunner.CheckWatchScopeAsync(Options("darkfactory,nope"),
+            FactoryRunner.CreateWorkSource(Options("darkfactory,nope"), board.Client()), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Work_start_up_check_goes_through_the_work_source_interface()
+    {
+        // Any IWorkSource (E6), not only the Shortcut adapter: its own check's failure is what start-up reports.
+        var source = new FakeWorkSource(new WorkStory(1, "s", null, "chore", "u"))
+        {
+            ValidateScopeFails = new InvalidOperationException("board says no"),
+        };
+        Assert.Equal("board says no", await FactoryRunner.CheckWatchScopeAsync(Options("darkfactory"), source, CancellationToken.None));
+        source.ValidateScopeFails = null;
+        Assert.Null(await FactoryRunner.CheckWatchScopeAsync(Options("darkfactory"), source, CancellationToken.None));
     }
 
     private static readonly ChildItem[] Plan =
