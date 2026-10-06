@@ -207,17 +207,34 @@ public class WorkerSandboxTests
             RedirectStandardError = true,
         };
         using var p = Process.Start(psi)!;
-        await p.StandardInput.WriteAsync(block);
-        await p.StandardInput.FlushAsync();
+        // The helper may refuse its arguments and exit before reading stdin; writing to it then
+        // fails with a broken pipe. That is the helper's answer, not a test failure: the exit code
+        // and stderr below are what decide.
+        await IgnoringBrokenPipeAsync(async () =>
+        {
+            await p.StandardInput.WriteAsync(block);
+            await p.StandardInput.FlushAsync();
+        });
         if (closeStdin)
         {
-            p.StandardInput.Close();
+            await IgnoringBrokenPipeAsync(() => { p.StandardInput.Close(); return Task.CompletedTask; });
         }
         var stderr = await p.StandardError.ReadToEndAsync();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         await p.WaitForExitAsync(cts.Token);
-        p.StandardInput.Close();
+        await IgnoringBrokenPipeAsync(() => { p.StandardInput.Close(); return Task.CompletedTask; });
         return (p.ExitCode, stderr);
+    }
+
+    private static async Task IgnoringBrokenPipeAsync(Func<Task> write)
+    {
+        try
+        {
+            await write();
+        }
+        catch (IOException)
+        {
+        }
     }
 
     /// <summary>
