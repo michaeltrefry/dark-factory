@@ -138,17 +138,64 @@ grep -q '^#includedir /private/etc/sudoers.d' /etc/sudoers \
     || echo "warning: /etc/sudoers has no '#includedir /private/etc/sudoers.d'; the rule is inactive." >&2
 
 # --- 5. Toolchain: dotnet and git are system-wide; Claude Code installs per user ------
+# Commands run as the worker start in a directory it can enter (sudo keeps our cwd, which
+# may be under the owner's home that step 2 closed to it).
+cd /
 as_worker() { sudo -u "$worker" env -i "HOME=$worker_home" PATH=/usr/bin:/bin:/usr/sbin:/sbin "$@"; }
 if [ ! -x "$worker_home/.local/bin/claude" ]; then
     say "Installing Claude Code for $worker (native installer)"
     as_worker /bin/bash -c 'cd ~ && curl -fsSL https://claude.ai/install.sh | bash'
 fi
 
+# Runs <command...> (the helper) the way the orchestrator does: the empty variable block on
+# stdin, then stdin held open until the command exits. The helper takes stdin EOF as Stop and
+# kills the worker, so piping the block in (stdin closes at once) kills the tool mid-run.
+with_open_stdin() {
+    local dir pid status=0
+    dir=$(mktemp -d)
+    mkfifo "$dir/stdin"
+    "$@" <"$dir/stdin" &
+    pid=$!
+    exec 3>"$dir/stdin"
+    printf '\n' >&3
+    wait "$pid" || status=$?
+    exec 3>&-
+    rm -rf "$dir"
+    return "$status"
+}
+
+# check_toolchain <command line>... - runs each as the worker through the installed helper and
+# reports its version; explains and returns 1 if any fails.
+check_toolchain() {
+    local tool out status failed=0
+    for tool in "$@"; do
+        # shellcheck disable=SC2086 # tool is a command line
+        if out=$(with_open_stdin sudo -u "$owner" sudo -n -u "$worker" "$helper" $tool 2>&1); then
+            echo "    ok    $tool: $out"
+        else
+            status=$?
+            echo "    FAIL  $tool (exit $status): $out" >&2
+            failed=1
+        fi
+    done
+    [ "$failed" -eq 0 ] && return 0
+    cat >&2 <<EOF
+The toolchain check failed. By exit code:
+  1 with 'a password is required': the sudoers rule is inactive - check that /etc/sudoers
+     has '#includedir /private/etc/sudoers.d' and that $sudoers exists.
+  127 or 'No such file': the tool is missing for $worker - dotnet must be at
+     /usr/local/share/dotnet (the .NET SDK installer), git needs the Xcode Command Line Tools
+     (xcode-select --install), Claude Code must be at $worker_home/.local/bin/claude (delete
+     it and re-run this script to reinstall).
+  137 (Killed): the helper stopped the tool because its stdin closed - this check must
+     hold stdin open until the tool exits.
+Fix the cause and re-run this script; every step is safe to repeat.
+EOF
+    return 1
+}
+
 say "Checking the toolchain as $worker through the helper"
-for tool in "/usr/local/share/dotnet/dotnet --version" "git --version" "claude --version"; do
-    # shellcheck disable=SC2086 # tool is a command line
-    (cd / && printf '\n' | sudo -u "$owner" sudo -n -u "$worker" "$helper" $tool)
-done
+check_toolchain "/usr/local/share/dotnet/dotnet --version" "git --version" "claude --version" || exit 1
 
 say "Done. Worker user: $worker  Helper: $helper  Work root: $work_root"
 cat <<EOF
