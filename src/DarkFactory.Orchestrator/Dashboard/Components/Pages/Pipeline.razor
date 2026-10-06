@@ -12,6 +12,14 @@
 {
     <p class="error">Could not refresh from the ledger; showing the last known state.</p>
 }
+@if (UsagePause is { } usage)
+{
+    <div class="controls usage-pause" data-scope="@ControlScope.Usage">
+        <span>Factory paused for usage: <span class="usage-reason">@usage.Reason</span>, resumes at
+            <span class="usage-resume">@usage.ResumeAt?.ToString("u")</span>. Running workers stop at their next tool call.</span>
+        <ControlButton Action="continue" Scope="@ControlScope.Usage" />
+    </div>
+}
 <div class="controls" data-scope="@ControlScope.Factory">
     <span>Factory: <span class="control-state">@(Paused(ControlScope.Factory) ? "paused" : "running")</span></span>
     <ControlButton Action="@(Paused(ControlScope.Factory) ? "continue" : "pause")" Scope="@ControlScope.Factory" />
@@ -85,10 +93,13 @@ else
 @code {
     private readonly CancellationTokenSource _cts = new();
     private IReadOnlyList<PipelineRow>? _rows;
-    private IReadOnlyDictionary<string, ControlState> _controls = new Dictionary<string, ControlState>();
+    private IReadOnlyDictionary<string, Control> _controls = new Dictionary<string, Control>();
 
     /// <summary>Whether this scope's own control (not an enclosing one) pauses it: Continue clears exactly that.</summary>
-    private bool Paused(string scope) => _controls.GetValueOrDefault(scope) == ControlState.Paused;
+    private bool Paused(string scope) => _controls.GetValueOrDefault(scope)?.State == ControlState.Paused;
+
+    /// <summary>The factory's usage pause while it is in effect (it lifts by itself at its resume time).</summary>
+    private Control? UsagePause => _controls.GetValueOrDefault(ControlScope.Usage) is { } c && c.PausesAt(Time.GetUtcNow()) ? c : null;
 
     private IEnumerable<long> Epics => (_rows ?? []).Select(r => r.EpicId).OfType<long>()
         .Concat(_controls.Keys.Select(ControlScope.EpicOf).OfType<long>())
@@ -123,7 +134,7 @@ else
             {
                 _again = false;
                 _rows = await Data.ActiveItemsAsync(_cts.Token);
-                _controls = (await Data.ControlsAsync(_cts.Token)).ToDictionary(c => c.Scope, c => c.State);
+                _controls = (await Data.ControlsAsync(_cts.Token)).ToDictionary(c => c.Scope);
                 _stale = false;
             }
             while (_again);

@@ -33,6 +33,10 @@ public sealed class ControlActions(
 {
     public async Task<ControlResult> PauseAsync(string scope, string by, CancellationToken ct)
     {
+        if (scope == ControlScope.Usage)
+        {
+            return UsageOnlyContinues;
+        }
         await controls.SetAsync(scope, ControlState.Paused, by, ct);
         var message = $"{scope} paused: nothing new starts there, and running workers stop at their next tool call.";
         if (ControlScope.EpicOf(scope) is not { } epic)
@@ -55,7 +59,9 @@ public sealed class ControlActions(
             return new ControlResult(false, $"{scope} is being stopped; it cannot be continued.");
         }
         await controls.SetAsync(scope, ControlState.Running, by, ct);
-        return new ControlResult(true, $"{scope} continued.");
+        return new ControlResult(true, scope == ControlScope.Usage
+            ? "usage pause lifted early: work starts again now (a worker that hits the limit again pauses the factory once more)."
+            : $"{scope} continued.");
     }
 
     public async Task<ControlResult> StopAsync(string scope, string by, CancellationToken ct)
@@ -63,6 +69,10 @@ public sealed class ControlActions(
         if (!ControlScope.IsValid(scope))
         {
             throw new ArgumentException($"'{scope}' is not a control scope.", nameof(scope));
+        }
+        if (scope == ControlScope.Usage)
+        {
+            return UsageOnlyContinues;
         }
         var stories = new List<int>();
         var unknown = new List<string>();
@@ -123,6 +133,10 @@ public sealed class ControlActions(
         }
         return new ControlResult(ok, string.Join('\n', results));
     }
+
+    /// <summary>The usage pause is set by the factory itself (<see cref="UsagePause"/>); a user may only lift it early.</summary>
+    private static readonly ControlResult UsageOnlyContinues =
+        new(false, "The usage pause is set and lifted by the factory; it can only be continued early (`factory continue --usage`). Use --factory to pause or stop the whole factory.");
 
     private sealed record EpicResolution(List<string> InEpic, List<string> Unknown, List<string> Running);
 

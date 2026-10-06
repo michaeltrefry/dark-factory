@@ -108,6 +108,8 @@ public sealed class RunPipeline(
         public const string PrsDrafted = "prs-drafted";
         /// <summary>Stopping: the story is back in the Backlog with its claim released and a comment; Detail is who stopped it.</summary>
         public const string StopReported = "stop-reported";
+        /// <summary>The item was paused by the factory's usage pause; Detail is its reason and resume time.</summary>
+        public const string UsagePause = "usage-pause";
     }
 
     /// <summary>
@@ -115,6 +117,13 @@ public sealed class RunPipeline(
     /// worker with <c>claude --resume</c>) once no control pauses it any more, i.e. after Continue.
     /// </summary>
     public const string UserPaused = "user-paused";
+
+    /// <summary>
+    /// Detail of the Paused row recorded when the factory's usage pause (<see cref="ControlScope.Usage"/>) stopped the run:
+    /// every plan was exhausted, or the worker failed with the router's exhaustion or a rate limit. Such an item resumes
+    /// (its worker with <c>claude --resume</c>) once the pause lifts at its resume time; it is never escalated for it.
+    /// </summary>
+    public const string UsagePaused = "usage-paused";
 
     /// <summary>A Pause or Stop control reached a run; the worker (if any) has ended.</summary>
     private sealed class ControlRequestedException(ControlState state, bool workerStillRunning = false)
@@ -181,7 +190,7 @@ public sealed class RunPipeline(
     {
         var paused = history.FindLastIndex(e => e.Step is null);
         var pausedFrom = TransitionContext.From(history.Where(e => e.Step is null).Select(e => e.State).ToList()).PausedFrom;
-        return history[paused] is { State: WorkState.Paused, Detail: Interrupted or UserPaused }
+        return history[paused] is { State: WorkState.Paused, Detail: Interrupted or UserPaused or UsagePaused }
             && pausedFrom is { } from && HandledStates.Contains(from)
             && !history.Skip(paused + 1).Any(e => e.Step == Steps.Parked);
     }
@@ -285,7 +294,16 @@ public sealed class RunPipeline(
         }
         catch (ControlRequestedException request) when (request.State == ControlState.Paused)
         {
-            // The worktree, checkpoints and Claude session stay: Continue resumes the same session.
+            // The worktree, checkpoints and Claude session stay: Continue (or the usage pause lifting) resumes the same session.
+            // A user's Pause on the factory, the epic or the item outranks the usage pause: Continue, not the reset, resumes it.
+            if (!await UserPausedAsync(item) && await _controls.UsagePauseAsync(CancellationToken.None) is { } usage)
+            {
+                var why = $"{usage.Reason}; resumes at {usage.ResumeAt:u}";
+                await ledger.RecordAsync(item, WorkState.Paused, null, UsagePaused, CancellationToken.None);
+                await ledger.CheckpointAsync(item, Steps.UsagePause, null, why, CancellationToken.None);
+                log.WriteLine($"[paused] {item.ExternalId} paused for usage ({why}); its worktree and session are kept");
+                return await OutcomeAsync(item, $"{item.ExternalId} is paused for usage ({why}).", CancellationToken.None);
+            }
             await ledger.RecordAsync(item, WorkState.Paused, null, UserPaused, CancellationToken.None);
             log.WriteLine($"[paused] {item.ExternalId} paused by a control; its worktree and session are kept for Continue");
             return await OutcomeAsync(item, PausedMessage(item.ExternalId), CancellationToken.None);
@@ -525,6 +543,14 @@ public sealed class RunPipeline(
                 await CompleteControlledSessionAsync(capture, requested);
                 throw new ControlRequestedException(requested);
             }
+            // The plans ran out, not the work: pause the factory (backing off) and resume this session afterwards, rather
+            // than escalate the item. Without a control table nothing could hold the pause, so the failure escalates.
+            if (result.UsageLimited && await _controls.PauseForUsageAsync(null, UsagePause.WorkerRateLimited, ct) is { State: ControlState.Paused } pause)
+            {
+                log.WriteLine($"[implement] worker hit a router exhaustion or rate-limit error; factory paused for usage until {pause.ResumeAt:u}");
+                await CompleteControlledSessionAsync(capture, ControlState.Paused);
+                throw new ControlRequestedException(ControlState.Paused);
+            }
             if (capture is not null)
             {
                 await capture.CompleteAsync(result.ExitCode, result.Succeeded ? "succeeded" : "failed", fetchCost: true, ct);
@@ -614,6 +640,22 @@ public sealed class RunPipeline(
         {
             log.WriteLine($"[implement] could not record the end of the worker session: {captureError.Message}");
         }
+    }
+
+    /// <summary>Whether a user's Pause holds the item: on the factory, its epic or the item itself.</summary>
+    private async Task<bool> UserPausedAsync(WorkItem item)
+    {
+        string[] scopes = item.EpicId is { } epic
+            ? [ControlScope.Factory, ControlScope.Epic(epic), ControlScope.Item(item.ExternalId)]
+            : [ControlScope.Factory, ControlScope.Item(item.ExternalId)];
+        foreach (var scope in scopes)
+        {
+            if ((await _controls.GetAsync(scope, CancellationToken.None))?.State == ControlState.Paused)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private ItemStopper Stopper => new(source, ledger, locks, pullRequests, _controls, log);

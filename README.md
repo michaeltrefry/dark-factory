@@ -110,6 +110,22 @@ dotnet run --project src/DarkFactory.Orchestrator -- stop --item sc-1234   # --e
   down) leaves the item Stopping (shown on the dashboard); the next poll or `factory stop` finishes it
   without repeating the steps already done.
 
+### Usage pause
+
+`factory work` reads the router's `GET /v1/subscriptions/usage` every `Usage:PollSeconds` (default 60, and at
+each intake poll). When it reports every plan exhausted (`all_exhausted`) the factory pauses itself until
+the earliest `resumes_at` — or, with no reset time known, for a backoff of 1, 2, 4 … up to 60 minutes — as a
+separate `usage` control (reason, resume time) beside the user's `factory` one: nothing is dispatched,
+running workers stop at their next tool call as for Pause (item recorded Paused `usage-paused` with a
+`usage-pause` checkpoint), and at the resume time work starts again by itself. Unknown usage (router
+unreachable, or no credential known yet, e.g. after a router restart) never pauses. Backstop: a worker that
+fails with the router's exhaustion answer (429 "All enrolled subscription accounts are currently
+unavailable."), an API 429/529 or a plan usage limit pauses the factory with the same backoff instead of
+escalating; the item resumes its own session afterwards. (529/overloaded is treated as usage-limited on purpose:
+it never escalates an item.) A user's Continue does not lift the usage pause
+(and its end does not lift a user's pause); `factory continue --usage` (or the dashboard banner's Continue)
+lifts it early, and the same router reading does not set it again (a later reset or a worker hitting the limit does). There are no spend caps: an item's cost on the dashboard is the sum of its sessions' router costs.
+
 ### Lifecycle and resume
 
 Items move through an explicit transition table (`Ledger/Lifecycle.cs`): Intake → Plan →

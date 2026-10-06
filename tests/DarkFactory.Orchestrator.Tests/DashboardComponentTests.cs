@@ -1,5 +1,6 @@
 using Bunit;
 using Bunit.TestDoubles;
+using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Dashboard;
 using DarkFactory.Orchestrator.Dashboard.Components;
 using DarkFactory.Orchestrator.Dashboard.Components.Pages;
@@ -112,6 +113,30 @@ public class DashboardComponentTests : BunitContext
         Assert.Equal("https://github.com/acme/widgets/pull/9", cut.Find("td.pr a").GetAttribute("href"));
         Assert.Equal(["sessions/s-1", "sessions/s-2"], cut.FindAll("td.sessions a").Select(a => a.GetAttribute("href")));
         Assert.Equal("#2 (live)", cut.FindAll("td.sessions a")[1].TextContent);
+    }
+
+    [Fact]
+    public void The_usage_pause_shows_as_a_banner_with_its_reason_and_resume_time_until_it_lifts()
+    {
+        var time = (FakeTimeProvider)Services.GetRequiredService<TimeProvider>();
+        _data.Rows = [Row(1, WorkState.Paused) with { Control = ControlState.Paused }];
+        _data.Controls = [new Control
+        {
+            Scope = ControlScope.Usage, State = ControlState.Paused, ChangedBy = "usage", ChangedAt = Now,
+            Reason = "usage-exhausted", ResumeAt = Now.AddMinutes(30),
+        }];
+
+        var cut = Render<Pipeline>();
+
+        var banner = cut.Find($".usage-pause[data-scope='{ControlScope.Usage}']");
+        Assert.Equal("usage-exhausted", banner.QuerySelector(".usage-reason")!.TextContent);
+        Assert.Equal("2026-10-06 12:30:00Z", banner.QuerySelector(".usage-resume")!.TextContent);
+        Assert.Equal(ControlScope.Usage, banner.QuerySelector("form[data-action='continue']")!.GetAttribute("data-scope"));
+        Assert.Equal("paused", cut.Find("tr[data-item='1'] .control-state").TextContent);
+
+        time.Advance(TimeSpan.FromMinutes(30));
+        _changes.Notify(null);
+        cut.WaitForAssertion(() => Assert.Empty(cut.FindAll(".usage-pause")));
     }
 
     [Fact]
@@ -245,6 +270,9 @@ public class DashboardComponentTests : BunitContext
         public IReadOnlyList<PipelineRow> Rows { get; set; } = [];
         public SessionHeader? Header { get; set; }
         public int Reads;
+        public IReadOnlyList<Control> Controls { get; set; } = [];
+
+        public Task<IReadOnlyList<Control>> ControlsAsync(CancellationToken ct) => Task.FromResult(Controls);
 
         public Task<IReadOnlyList<PipelineRow>> ActiveItemsAsync(CancellationToken ct)
         {

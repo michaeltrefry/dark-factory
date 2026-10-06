@@ -59,6 +59,9 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     /// <summary><c>Intake:PollSeconds</c>: how often <c>factory work</c> polls the board.</summary>
     public TimeSpan PollInterval => TimeSpan.FromSeconds(config.GetValue("Intake:PollSeconds", 60));
 
+    /// <summary><c>Usage:PollSeconds</c>: how often <c>factory work</c> reads the router's subscription usage.</summary>
+    public TimeSpan UsagePollInterval => TimeSpan.FromSeconds(config.GetValue("Usage:PollSeconds", 60));
+
     /// <summary>Port of the <c>factory work</c> host (dashboard and session hub), on 127.0.0.1 and <see cref="DashboardBindAddress"/>.</summary>
     public int HostPort => config.GetValue("Factory:HostPort", 47822);
 

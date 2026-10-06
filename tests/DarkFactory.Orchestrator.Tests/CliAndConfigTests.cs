@@ -28,6 +28,7 @@ public class FactoryCliTests
     [InlineData("stop --epic 12", "stop epic:12")]
     [InlineData("pause --factory", "pause factory")]
     [InlineData("continue --factory", "continue factory")]
+    [InlineData("continue --usage", "continue usage")]
     public async Task Controls_pass_their_scope(string args, string expected)
     {
         var (root, calls) = Cli();
@@ -40,6 +41,9 @@ public class FactoryCliTests
     [InlineData("pause --factory --item sc-1")]
     [InlineData("stop --item nope")]
     [InlineData("continue --epic 0")]
+    [InlineData("continue --usage --factory")]
+    [InlineData("pause --usage")]
+    [InlineData("stop --usage")]
     public async Task Controls_need_exactly_one_valid_scope(string args)
     {
         var (root, calls) = Cli();
@@ -237,6 +241,26 @@ public class RouterClientTests
     {
         var client = new RouterClient(new FakeApi().Client("http://localhost:8080/"), "rk");
         Assert.Null(await client.GetSessionCostAsync("nope", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Subscription_usage_is_read_with_router_key_header_and_the_routers_nanosecond_timestamps()
+    {
+        var api = new FakeApi().On("GET /v1/subscriptions/usage", HttpStatusCode.OK,
+            """
+            {"as_of":"2026-10-06T22:00:14.152459584Z","all_exhausted":true,"resumes_at":"2026-10-07T03:00:00.5Z",
+             "known_credentials":1,"observed_credentials":1,"credentials":[]}
+            """);
+        var client = new RouterClient(api.Client("http://localhost:8080/"), "rk_test");
+
+        var usage = await client.GetUsageAsync(CancellationToken.None);
+
+        Assert.True(usage.AllExhausted);
+        Assert.Equal(1, usage.KnownCredentials);
+        Assert.Equal(new DateTimeOffset(2026, 10, 7, 3, 0, 0, 500, TimeSpan.Zero), usage.ResumesAt);
+        Assert.Equal("rk_test", api.Requests.Single().Headers["X-Weave-Router-Key"]);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new RouterClient(new FakeApi().Client("http://localhost:8080/"), "rk").GetUsageAsync(CancellationToken.None));
     }
 }
 

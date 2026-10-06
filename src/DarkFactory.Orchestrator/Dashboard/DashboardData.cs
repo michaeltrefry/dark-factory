@@ -42,7 +42,7 @@ public interface IDashboardData
     Task<IReadOnlyList<Control>> ControlsAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<Control>>([]);
 }
 
-public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts) : IDashboardData
+public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, TimeProvider time) : IDashboardData
 {
     private static readonly WorkState[] Finished = [WorkState.Done, WorkState.Cancelled];
 
@@ -56,11 +56,12 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts) :
     {
         await using var db = await contexts.CreateDbContextAsync(ct);
         var items = await db.WorkItems.AsNoTracking().Where(i => !Finished.Contains(i.State)).OrderBy(i => i.Id).ToListAsync(ct);
-        var controls = (await db.Controls.AsNoTracking().ToListAsync(ct)).ToDictionary(c => c.Scope, c => c.State);
+        var controls = (await db.Controls.AsNoTracking().ToListAsync(ct)).ToDictionary(c => c.Scope);
+        var now = time.GetUtcNow();
         ControlState ControlOf(WorkItem i) =>
-            controls.GetValueOrDefault(ControlScope.Item(i.ExternalId)) == ControlState.Stopping ? ControlState.Stopping
-            : new[] { ControlScope.Factory, ControlScope.Item(i.ExternalId), i.EpicId is { } e ? ControlScope.Epic(e) : "" }
-                .Any(s => controls.GetValueOrDefault(s) == ControlState.Paused) ? ControlState.Paused
+            controls.GetValueOrDefault(ControlScope.Item(i.ExternalId))?.State == ControlState.Stopping ? ControlState.Stopping
+            : new[] { ControlScope.Factory, ControlScope.Usage, ControlScope.Item(i.ExternalId), i.EpicId is { } e ? ControlScope.Epic(e) : "" }
+                .Any(s => controls.GetValueOrDefault(s)?.PausesAt(now) == true) ? ControlState.Paused
             : ControlState.Running;
         var ids = items.Select(i => i.Id).ToList();
         var sessions = (await db.WorkerSessions.AsNoTracking().Where(s => ids.Contains(s.WorkItemId)).OrderBy(s => s.Id).ToListAsync(ct))
@@ -74,6 +75,7 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts) :
         return items.Select(i => new PipelineRow(
                 i.Id, i.ExternalId, i.Title, i.Repo, i.State, i.CreatedAt, i.UpdatedAt,
                 PullRequestUrl(links.GetValueOrDefault(i.Id)),
+                // Spend per item (E9, reporting only): the sum of its sessions' router costs.
                 sessions[i.Id].Any(s => s.CostUsd is not null) ? sessions[i.Id].Sum(s => s.CostUsd ?? 0) : null,
                 sessions[i.Id].Select(Link).ToList(),
                 i.EpicId,
