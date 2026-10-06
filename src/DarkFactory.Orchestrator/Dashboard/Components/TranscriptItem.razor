@@ -1,0 +1,39 @@
+<li class="entry @Entry.Kind @(Entry.IsError ? "is-error" : "")" data-seq="@Entry.Sequence">
+    <div class="title">@Entry.Title</div>
+    @if (Entry.Body.Length > 0)
+    {
+        @if (IsLarge)
+        {
+            <details>
+                <summary>@Preview … (@LineCount lines, @Entry.Body.Length chars)</summary>
+                <pre>@Entry.Body</pre>
+            </details>
+        }
+        else
+        {
+            <pre>@Entry.Body</pre>
+        }
+    }
+</li>
+
+@code {
+    /// <summary>Bodies over this many lines or characters start collapsed.</summary>
+    public const int MaxLines = 20;
+    public const int MaxChars = 2000;
+
+    [Parameter, EditorRequired]
+    public TranscriptEntry Entry { get; set; } = default!;
+
+    private int LineCount => Entry.Body.Count(c => c == '\n') + 1;
+
+    private bool IsLarge => LineCount > MaxLines || Entry.Body.Length > MaxChars;
+
+    private string Preview
+    {
+        get
+        {
+            var first = Entry.Body.Split('\n', 2)[0];
+            return first.Length > 160 ? first[..160] : first;
+        }
+    }
+}

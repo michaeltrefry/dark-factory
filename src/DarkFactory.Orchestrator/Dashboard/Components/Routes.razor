@@ -1,0 +1,11 @@
+<Router AppAssembly="typeof(Routes).Assembly">
+    <Found Context="routeData">
+        @* The circuit's login is rechecked while it is open (DashboardAuthStateProvider): once it no longer
+           holds, the page is torn down (leaving its feeds) and the browser goes to the login page. *@
+        <AuthorizeRouteView RouteData="routeData" DefaultLayout="typeof(MainLayout)">
+            <NotAuthorized>
+                <RedirectToLogin />
+            </NotAuthorized>
+        </AuthorizeRouteView>
+    </Found>
+</Router>

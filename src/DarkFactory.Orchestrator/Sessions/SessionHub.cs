@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using DarkFactory.Orchestrator.Ledger;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 
@@ -8,8 +9,9 @@ namespace DarkFactory.Orchestrator.Sessions;
 /// <summary>
 /// Live worker sessions. <c>JoinSession(sessionId)</c> sends the session's stored events, then
 /// its new events as they are stored, all as <see cref="EventsMethod"/>(sessionId, events[]) messages.
-/// Joining the same session again on one connection does nothing.
+/// Joining the same session again on one connection does nothing. Requires the dashboard login.
 /// </summary>
+[Authorize]
 public sealed class SessionHub(SessionBroadcaster broadcaster) : Hub
 {
     public const string Path = "/hubs/sessions";
@@ -40,20 +42,27 @@ public sealed record SessionHubOptions
 /// committed, and the broadcaster reads them back from the ledger. Per session, sending new
 /// events live and sending a joiner its backlog run under one gate, against one cursor
 /// (<c>LastSent</c>), so each viewer gets every event exactly once and in sequence order.
-/// A session's state exists only while it has viewers.
+/// A session's state exists only while it has viewers: hub connections, or dashboard circuits
+/// joining through <see cref="ISessionViewers"/>.
 /// </summary>
 public sealed class SessionBroadcaster(
     IHubContext<SessionHub> hub,
     IDbContextFactory<LedgerDbContext> contexts,
     SessionHubOptions options,
-    TextWriter log)
+    TextWriter log) : ISessionViewers
 {
     private readonly ConcurrentDictionary<long, Feed> _feeds = new();
 
     /// <summary>Sessions that currently have viewers.</summary>
     internal int FeedCount => _feeds.Count;
 
-    public async Task JoinAsync(string connectionId, string claudeSessionId, Action abort, CancellationToken ct)
+    /// <summary>A hub connection joins: pages go to it as <see cref="SessionHub.EventsMethod"/> messages.</summary>
+    public Task JoinAsync(string connectionId, string claudeSessionId, Action abort, CancellationToken ct) =>
+        JoinAsync(connectionId, claudeSessionId,
+            (page, sendCt) => hub.Clients.Client(connectionId).SendAsync(SessionHub.EventsMethod, claudeSessionId, page, sendCt),
+            abort, ct);
+
+    public async Task JoinAsync(string viewerId, string claudeSessionId, SessionEventSink send, Action abort, CancellationToken ct)
     {
         long sessionRow;
         await using (var db = await contexts.CreateDbContextAsync(ct))
@@ -64,7 +73,7 @@ public sealed class SessionBroadcaster(
         var feed = await EnterAsync(sessionRow, claudeSessionId, ct);
         try
         {
-            if (feed.Viewers.ContainsKey(connectionId))
+            if (feed.Viewers.ContainsKey(viewerId))
             {
                 return;
             }
@@ -90,8 +99,7 @@ public sealed class SessionBroadcaster(
                 timeout.CancelAfter(options.BacklogSendTimeout);
                 try
                 {
-                    await hub.Clients.Client(connectionId).SendAsync(SessionHub.EventsMethod, claudeSessionId, page, timeout.Token)
-                        .WaitAsync(options.BacklogSendTimeout, ct);
+                    await send(page, timeout.Token).WaitAsync(options.BacklogSendTimeout, ct);
                 }
                 catch (Exception ex) when (!ct.IsCancellationRequested && ex is OperationCanceledException or TimeoutException)
                 {
@@ -100,7 +108,7 @@ public sealed class SessionBroadcaster(
                 }
                 cursor = page[^1].Sequence;
             }
-            feed.Viewers[connectionId] = abort;
+            feed.Viewers[viewerId] = new Viewer(send, abort);
         }
         finally
         {
@@ -108,14 +116,14 @@ public sealed class SessionBroadcaster(
         }
     }
 
-    public async Task LeaveAsync(string connectionId)
+    public async Task LeaveAsync(string viewerId)
     {
         foreach (var feed in _feeds.Values)
         {
             await feed.Gate.WaitAsync();
             try
             {
-                feed.Viewers.Remove(connectionId);
+                feed.Viewers.Remove(viewerId);
             }
             finally
             {
@@ -176,13 +184,12 @@ public sealed class SessionBroadcaster(
         }
     }
 
-    private async Task SendLiveAsync(Feed feed, string connectionId, Action abort, IReadOnlyList<SessionEventMessage> page)
+    private async Task SendLiveAsync(Feed feed, string connectionId, Viewer viewer, IReadOnlyList<SessionEventMessage> page)
     {
         try
         {
             using var timeout = new CancellationTokenSource(options.LiveSendTimeout);
-            await hub.Clients.Client(connectionId).SendAsync(SessionHub.EventsMethod, feed.ClaudeSessionId, page, timeout.Token)
-                .WaitAsync(options.LiveSendTimeout);
+            await viewer.Send(page, timeout.Token).WaitAsync(options.LiveSendTimeout);
         }
         catch (Exception ex)
         {
@@ -192,7 +199,7 @@ public sealed class SessionBroadcaster(
             {
                 feed.Viewers.Remove(connectionId);
             }
-            abort();
+            viewer.Abort();
         }
     }
 
@@ -233,6 +240,8 @@ public sealed class SessionBroadcaster(
         feed.Gate.Release();
     }
 
+    private sealed record Viewer(SessionEventSink Send, Action Abort);
+
     private sealed class Feed(long sessionRow, string claudeSessionId)
     {
         public long SessionRow { get; } = sessionRow;
@@ -242,9 +251,24 @@ public sealed class SessionBroadcaster(
         /// <summary>Every viewer has had the events up to this sequence. Guarded by <see cref="Gate"/>.</summary>
         public long LastSent { get; set; }
 
-        /// <summary>Connection id → abort. Guarded by <see cref="Gate"/>.</summary>
-        public Dictionary<string, Action> Viewers { get; } = [];
+        /// <summary>Viewer id → its sink. Guarded by <see cref="Gate"/>.</summary>
+        public Dictionary<string, Viewer> Viewers { get; } = [];
 
         public bool Closed { get; set; }
     }
+}
+
+/// <summary>Takes one page of a session's events, in sequence order; must finish within the hub's send timeouts.</summary>
+public delegate Task SessionEventSink(IReadOnlyList<SessionEventMessage> page, CancellationToken ct);
+
+/// <summary>
+/// Watching a session: <see cref="JoinAsync"/> sends the stored events, then each new one as it is
+/// stored, exactly once, to <c>send</c>; a viewer that falls behind is dropped (<c>abort</c>).
+/// Throws <see cref="HubException"/> for an unknown session.
+/// </summary>
+public interface ISessionViewers
+{
+    Task JoinAsync(string viewerId, string claudeSessionId, SessionEventSink send, Action abort, CancellationToken ct);
+
+    Task LeaveAsync(string viewerId);
 }

@@ -12,7 +12,8 @@ public static class FactoryCli
         Func<int, bool, CancellationToken, Task<int>> run,
         Func<string, int, CancellationToken, Task<int>> setupGitHubApp,
         Func<RepoRef, CancellationToken, Task<int>> protectRepo,
-        Func<CancellationToken, Task<int>> work)
+        Func<CancellationToken, Task<int>> work,
+        Func<CancellationToken, Task<int>> setDashboardPassword)
     {
         var storyArgument = new Argument<int>("story-id")
         {
@@ -80,8 +81,11 @@ public static class FactoryCli
         };
         protectCommand.SetAction((parse, ct) => protectRepo(parse.GetValue(repoArgument)!, ct));
 
-        var workCommand = new Command("work", "Run the long-running factory host until Ctrl-C: the session hub on 127.0.0.1:Factory:HostPort, and the intake loop that polls the watched Shortcut scope and runs each ready (To Do) story, one at a time.");
+        var workCommand = new Command("work", "Run the long-running factory host until Ctrl-C: the dashboard and session hub on 127.0.0.1:Factory:HostPort (plus Dashboard:BindAddress), and the intake loop that polls the watched Shortcut scope and runs each ready (To Do) story, one at a time.");
         workCommand.SetAction((_, ct) => work(ct));
+
+        var setPasswordCommand = new Command("set-password", "Set the dashboard login password (read without echo; its hash goes to the keychain).");
+        setPasswordCommand.SetAction((_, ct) => setDashboardPassword(ct));
 
         return new RootCommand("Dark Factory orchestrator")
         {
@@ -89,6 +93,7 @@ public static class FactoryCli
             workCommand,
             new Command("github-app", "GitHub App management") { setupCommand },
             new Command("github-repo", "Target repository management") { protectCommand },
+            new Command("dashboard", "Dashboard management") { setPasswordCommand },
         };
     }
 }

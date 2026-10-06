@@ -9,7 +9,8 @@ Claude Code headless workers through the Weave router.
 - `src/DarkFactory.Orchestrator` — the `factory` CLI (System.CommandLine), EF Core ledger
   (`Ledger/`, migrations in `Ledger/Migrations`), Shortcut client, GitHub App auth and
   manifest setup (`GitHub/`), git worktrees (`Git/`), Claude worker and its sandbox (`Worker/`), router client,
-  session capture + SignalR hub (`Sessions/`), the `factory work` host (`FactoryHost`),
+  session capture + SignalR hub (`Sessions/`), the `factory work` host (`FactoryHost`) and its Blazor Server
+  dashboard (`Dashboard/`: login, binding, ledger reads, transcript formatting; components in `Dashboard/Components`),
   `IWorkSource` + the `factory work` intake loop (`WorkSources/`; registered on the `factory work` host by `FactoryHost.BuildWork` via `services.AddIntake(options)`)
   and its Shortcut adapter (`Shortcut/ShortcutWorkSource.cs`).
 - `scripts/` — `setup-worker-user.sh` (one-time root setup of the `_factory` sandbox user) and
@@ -31,7 +32,8 @@ dotnet test                                   # unit tests; acceptance tests ski
 dotnet ef database update --project src/DarkFactory.Orchestrator
 dotnet ef migrations add <Name> --project src/DarkFactory.Orchestrator -o Ledger/Migrations
 dotnet run --project src/DarkFactory.Orchestrator -- run sc-1234
-dotnet run --project src/DarkFactory.Orchestrator -- work          # long-running host: session hub on 127.0.0.1 + the intake loop (polls the watch scope)
+dotnet run --project src/DarkFactory.Orchestrator -- work          # long-running host: dashboard + session hub on 127.0.0.1 + the intake loop (polls the watch scope)
+dotnet run --project src/DarkFactory.Orchestrator -- dashboard set-password   # dashboard login (hash → keychain)
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup
 dotnet run --project src/DarkFactory.Orchestrator -- github-repo protect owner/name   # rulesets; owner's GH_TOKEN / `gh auth token`
 ```
@@ -58,7 +60,10 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Worker:LaunchHelper` | `/usr/local/libexec/dark-factory/factory-worker-launch` |
 | `Worker:Auth` | `claude-login` (worker's own Claude login, router passes it through) or `router-key` (router key as Claude's API key; router needs BYOK provider keys) |
 | `Worker:TimeoutMinutes` | `30` |
-| `Factory:HostPort` | `47822` (`factory work` binds 127.0.0.1 only) |
+| `Factory:HostPort` | `47822` (`factory work`: 127.0.0.1, plus `Dashboard:BindAddress`) |
+| `Dashboard:BindAddress` | unset = loopback only; one private address (RFC 1918, 100.64/10, fc00::/7) on a local interface |
+| `Dashboard:HostName` | extra Host header the dashboard answers to (e.g. MagicDNS name); one plain DNS name, no wildcard/port |
+| `Dashboard:PasswordHash` | keychain `dashboard-password-hash` (written by `factory dashboard set-password`) |
 
 Worker sandbox (E5): workers run as the hidden `_factory` user via
 `sudo -n -u _factory factory-worker-launch claude …` (one NOPASSWD sudoers rule for that helper only).
@@ -129,7 +134,14 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `SessionEventRelay` LISTENs (reconnecting and catching up from the ledger) and `SessionBroadcaster` pushes to
   `SessionHub` (`/hubs/sessions`, `JoinSession(id)`) viewers the stored backlog then live events, once each, whichever
   process (`factory work` or a separate `factory run`) recorded them. Slow viewers are disconnected, never waited on.
-  The hub answers only `Host: 127.0.0.1|localhost` and same-origin (or Origin-less) clients.
+  The hub answers only `Host: 127.0.0.1|localhost` (plus the configured bind address/host name), same-origin (or
+  Origin-less) clients, and logged-in ones.
+- Dashboard (E8): Kestrel listens on 127.0.0.1 and at most one validated private address (`DashboardBinding`; never a
+  wildcard). A fallback authorization policy makes every endpoint (pages, `/_blazor`, `/hubs/sessions`, static assets)
+  require the cookie login except `/login` and the login form post (antiforgery + 5/min/IP rate limit). The dashboard
+  only reads (`IDashboardData`); its only writes are login/logout. Pipeline rows refresh on `NOTIFY work_items` (triggers on
+  `work_items`/`worker_sessions`, relayed by `SessionEventRelay` → `PipelineChanges`); session pages join the same
+  `SessionBroadcaster` as hub viewers (`ISessionViewers`), so backlog-then-live holds there too. Never log transcript content.
 - Processes migrate the ledger through `LedgerMigrations.MigrateAsync` (advisory-locked: EF alone lets two concurrent
   migrators apply the same migration) before reading it; tests migrate their temp database before starting a host.
 - Tests: xunit.v3 on Microsoft.Testing.Platform (`global.json` opts in).

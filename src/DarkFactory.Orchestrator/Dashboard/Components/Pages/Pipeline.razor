@@ -1,0 +1,118 @@
+@page "/"
+@attribute [Authorize]
+@implements IDisposable
+@inject IDashboardData Data
+@inject PipelineChanges Changes
+@inject TimeProvider Time
+
+<PageTitle>Pipeline · Dark Factory</PageTitle>
+
+<h1>Pipeline</h1>
+@if (_stale)
+{
+    <p class="error">Could not refresh from the ledger; showing the last known state.</p>
+}
+@if (_rows is null)
+{
+    <p class="muted">Loading…</p>
+}
+else if (_rows.Count == 0)
+{
+    <p class="muted">No active items.</p>
+}
+else
+{
+    <table class="pipeline">
+        <thead>
+            <tr><th>Item</th><th>State</th><th>Repo</th><th>PR</th><th>Elapsed</th><th>Cost</th><th>Sessions</th></tr>
+        </thead>
+        <tbody>
+            @foreach (var row in _rows)
+            {
+                <tr @key="row.Id" data-item="@row.Id">
+                    <td><span class="id">@row.ExternalId</span> @row.Title</td>
+                    <td class="state">@row.State</td>
+                    <td>@row.Repo</td>
+                    <td class="pr">
+                        @if (row.PullRequestUrl is { } pr)
+                        {
+                            <a href="@pr" target="_blank" rel="noopener noreferrer">PR</a>
+                        }
+                        else
+                        {
+                            <span class="muted">—</span>
+                        }
+                    </td>
+                    <td class="elapsed">@Format.Elapsed(Time.GetUtcNow() - row.CreatedAt)</td>
+                    <td class="cost">@Format.Cost(row.CostUsd)</td>
+                    <td class="sessions">
+                        @foreach (var s in row.Sessions.Where(s => s.ClaudeSessionId is not null))
+                        {
+                            <a href="sessions/@Uri.EscapeDataString(s.ClaudeSessionId!)">#@s.Attempt@(s.Running ? " (live)" : "")</a>
+                        }
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private readonly CancellationTokenSource _cts = new();
+    private IReadOnlyList<PipelineRow>? _rows;
+    private ITimer? _tick;
+    private bool _loading;
+    private bool _again;
+    private bool _stale;
+
+    protected override async Task OnInitializedAsync()
+    {
+        // Subscribe before the first read, so no change between the two is missed.
+        Changes.Changed += OnChanged;
+        _tick = Time.CreateTimer(_ => _ = InvokeAsync(StateHasChanged), null, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
+        await ReloadAsync();
+    }
+
+    private void OnChanged(long? workItemId) => _ = InvokeAsync(ReloadAsync);
+
+    /// <summary>Runs on the renderer: a change arriving mid-read is coalesced into one more read.</summary>
+    private async Task ReloadAsync()
+    {
+        if (_loading)
+        {
+            _again = true;
+            return;
+        }
+        _loading = true;
+        try
+        {
+            do
+            {
+                _again = false;
+                _rows = await Data.ActiveItemsAsync(_cts.Token);
+                _stale = false;
+            }
+            while (_again);
+        }
+        catch (Exception) when (_cts.IsCancellationRequested)
+        {
+            return; // the page is gone
+        }
+        catch (Exception)
+        {
+            _stale = true;
+        }
+        finally
+        {
+            _loading = false;
+        }
+        StateHasChanged();
+    }
+
+    public void Dispose()
+    {
+        Changes.Changed -= OnChanged;
+        _tick?.Dispose();
+        _cts.Cancel();
+    }
+}
