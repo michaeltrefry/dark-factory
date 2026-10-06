@@ -44,6 +44,17 @@ public class StreamJsonTests
     }
 }
 
+/// <summary>
+/// Tests that set process-wide environment variables run alone, so no parallel test reads
+/// (or launches a process inheriting) a value they temporarily planted.
+/// </summary>
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class ProcessEnvironmentCollection
+{
+    public const string Name = "Process environment";
+}
+
+[Collection(ProcessEnvironmentCollection.Name)]
 [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
 public class ClaudeWorkerTests
 {

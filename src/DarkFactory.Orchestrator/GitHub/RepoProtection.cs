@@ -87,8 +87,10 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
         using var list = GitHubApp.Request(HttpMethod.Get, $"{path}?includes_parents=false&per_page=100", "Bearer", adminToken);
         using var listResponse = await http.SendAsync(list, ct);
         await EnsureSuccess(listResponse, repo, "list rulesets", ct);
+        // GitHub does not enforce unique ruleset names; overwrite the first of any duplicates.
         var existing = (await listResponse.Content.ReadFromJsonAsync<ExistingRuleset[]>(ct))!
-            .ToDictionary(r => r.Name, r => r.Id);
+            .GroupBy(r => r.Name)
+            .ToDictionary(g => g.Key, g => g.First().Id);
 
         foreach (var ruleset in DesiredRulesets())
         {
@@ -99,6 +101,30 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
             using var response = await http.SendAsync(request, ct);
             await EnsureSuccess(response, repo, $"{(update ? "update" : "create")} ruleset '{ruleset.Name}'", ct);
             log.WriteLine($"{(update ? "updated" : "created")} ruleset '{ruleset.Name}' on {repo}");
+        }
+    }
+
+    /// <summary>
+    /// Resolves the owner's admin token: GH_TOKEN, then GITHUB_TOKEN, then <c>gh auth token</c>;
+    /// an empty or whitespace value counts as unset.
+    /// </summary>
+    public static string? ResolveAdminToken(Func<string, string?> env, Func<string?> ghAuthToken) =>
+        NonEmpty(env("GH_TOKEN")) ?? NonEmpty(env("GITHUB_TOKEN")) ?? NonEmpty(ghAuthToken());
+
+    private static string? NonEmpty(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
+
+    /// <summary>`github-repo protect`: 0 on success, 1 when GitHub refuses or is unreachable (message only, never the token).</summary>
+    public static async Task<int> RunAsync(HttpClient http, string adminToken, RepoRef repo, TextWriter output, TextWriter error, CancellationToken ct)
+    {
+        try
+        {
+            await new RepoProtection(http, adminToken, output).ApplyAsync(repo, ct);
+            return 0;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or HttpRequestException)
+        {
+            error.WriteLine(ex.Message);
+            return 1;
         }
     }
 

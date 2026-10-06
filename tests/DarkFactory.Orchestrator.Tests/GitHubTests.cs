@@ -113,6 +113,29 @@ public class GitHubAppTests
         Assert.DoesNotContain("ghs_long", ex.Message);
     }
 
+    [Theory]
+    [InlineData("2027-01-15T09:04:00Z", true)]  // 1h + 4min: within the 5-minute clock-skew allowance
+    [InlineData("2027-01-15T09:06:00Z", false)] // 1h + 6min: beyond it
+    public async Task Token_lifetime_limit_is_one_hour_plus_five_minutes_of_skew(string expiresAt, bool accepted)
+    {
+        Assert.Equal(DateTimeOffset.Parse("2027-01-15T08:00:00Z"), Now);
+        var api = new FakeApi()
+            .On("GET /repos/michaeltrefry/dark-factory-sandbox/installation", HttpStatusCode.OK, """{"id":987}""")
+            .On("POST /app/installations/987/access_tokens", HttpStatusCode.Created,
+                $$"""{"token":"ghs_edge","expires_at":"{{expiresAt}}"}""");
+
+        var mint = App(api).CreateInstallationTokenAsync(Sandbox, CancellationToken.None);
+
+        if (accepted)
+        {
+            Assert.Equal(DateTimeOffset.Parse(expiresAt), (await mint).ExpiresAt);
+        }
+        else
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() => mint);
+        }
+    }
+
     [Fact]
     public async Task Missing_installation_says_to_install_the_app()
     {

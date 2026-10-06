@@ -59,5 +59,9 @@ committed: they come from env/user-secrets or the macOS login keychain
   Tokens are minted fresh per call (never cached) and refused if they outlive 1 hour (`GitHubApp`).
   Server-side, `github-repo protect` (`RepoProtection`) applies rulesets: default branch needs a PR, and only
   repo admins may write refs outside `factory/**` (needs GitHub Pro for private personal repos).
+  That `~ALL` ruleset also stops non-admin integrations (Dependabot, `GITHUB_TOKEN` Actions deploys such as
+  `gh-pages`) from writing any branch outside `factory/**`.
   Workers get no git/gh tools, but see the S4 caveat above: they are not yet sandboxed from the owner's credentials.
+  The App private key never reaches a worker's env, argv or worktree (`ClaudeWorkerTests`), but until S4 the
+  worker can still read it from the owner's keychain: this is not full isolation.
 - Tests: xunit.v3 on Microsoft.Testing.Platform (`global.json` opts in).

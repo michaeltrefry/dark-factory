@@ -87,4 +87,50 @@ public class RepoProtectionTests
         Assert.Contains("michaeltrefry/dark-factory-sandbox", ex.Message);
         Assert.DoesNotContain("gho_admin", ex.Message);
     }
+
+    [Fact]
+    public async Task Duplicate_ruleset_names_overwrite_the_first_instead_of_crashing()
+    {
+        var api = new FakeApi()
+            .On($"GET {Rulesets}", HttpStatusCode.OK,
+                $$"""[{"id":77,"name":"{{RepoProtection.MainRulesetName}}"},{"id":79,"name":"{{RepoProtection.MainRulesetName}}"}]""")
+            .On($"PUT {Rulesets}/77", HttpStatusCode.OK, "{}")
+            .On($"POST {Rulesets}", HttpStatusCode.Created, "{}");
+
+        await Protection(api).ApplyAsync(Sandbox, CancellationToken.None);
+
+        Assert.Equal(["GET", "PUT", "POST", "POST"], api.Requests.Select(r => r.Method.Method));
+        Assert.Equal($"{Rulesets}/77", api.Requests[1].PathAndQuery);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.Forbidden)]
+    [InlineData(null)] // network failure: HttpRequestException
+    public async Task Command_exits_1_with_the_reason_and_never_the_token(HttpStatusCode? status)
+    {
+        var api = new FakeApi().On($"GET {Rulesets}", _ => status is { } code
+            ? FakeApi.Json(code, """{"message":"Upgrade to GitHub Pro"}""")
+            : throw new HttpRequestException("Connection refused (api.github.com:443)"));
+        var output = new StringWriter();
+        var error = new StringWriter();
+
+        var exit = await RepoProtection.RunAsync(api.Client("https://api.github.com/"), "gho_admin", Sandbox, output, error, CancellationToken.None);
+
+        Assert.Equal(1, exit);
+        Assert.Contains(status is null ? "Connection refused" : "Upgrade to GitHub Pro", error.ToString());
+        Assert.DoesNotContain("gho_admin", output.ToString() + error.ToString());
+    }
+
+    [Theory]
+    [InlineData("gh_env", "gh_actions", "gh_cli", "gh_env")]
+    [InlineData(null, "gh_actions", "gh_cli", "gh_actions")]
+    [InlineData("", "gh_actions", "gh_cli", "gh_actions")]
+    [InlineData("  ", "", "gh_cli", "gh_cli")]
+    [InlineData("", " ", null, null)]
+    public void Admin_token_falls_back_past_empty_values(string? ghToken, string? githubToken, string? ghCli, string? expected)
+    {
+        var env = new Dictionary<string, string?> { ["GH_TOKEN"] = ghToken, ["GITHUB_TOKEN"] = githubToken };
+
+        Assert.Equal(expected, RepoProtection.ResolveAdminToken(env.GetValueOrDefault, () => ghCli));
+    }
 }

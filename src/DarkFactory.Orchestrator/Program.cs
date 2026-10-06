@@ -30,23 +30,14 @@ static async Task<int> SetupGitHubAppAsync(string name, int port, CancellationTo
 // Rulesets need repo admin, which the App deliberately lacks, so this uses the owner's own GitHub token.
 static async Task<int> ProtectRepoAsync(RepoRef repo, CancellationToken ct)
 {
-    var token = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN") ?? GhAuthToken();
-    if (string.IsNullOrWhiteSpace(token))
+    var token = RepoProtection.ResolveAdminToken(Environment.GetEnvironmentVariable, GhAuthToken);
+    if (token is null)
     {
         Console.Error.WriteLine("No admin GitHub token: set GH_TOKEN or run `gh auth login`.");
         return 2;
     }
     using var http = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
-    try
-    {
-        await new RepoProtection(http, token, Console.Out).ApplyAsync(repo, ct);
-        return 0;
-    }
-    catch (InvalidOperationException ex)
-    {
-        Console.Error.WriteLine(ex.Message);
-        return 1;
-    }
+    return await RepoProtection.RunAsync(http, token, repo, Console.Out, Console.Error, ct);
 }
 
 static string? GhAuthToken()
