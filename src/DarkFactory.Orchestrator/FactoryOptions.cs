@@ -19,10 +19,31 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
 
     public RepoRef DefaultRepo => RepoRef.Parse(config["Factory:DefaultRepo"] ?? "michaeltrefry/dark-factory-sandbox");
 
+    /// <summary>
+    /// Clones and worktrees. Sandboxed, it must be readable by the worker user and outside both
+    /// homes (the owner's is closed to the worker; the worker's own could be swapped under the
+    /// owner's git), so the default is the root-anchored dir <c>setup-worker-user.sh</c> creates.
+    /// </summary>
     public string WorkRoot => config["Factory:WorkRoot"]
-        ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dark-factory");
+        ?? (WorkerSandbox is null
+            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dark-factory")
+            : DefaultSandboxWorkRoot);
 
+    public const string DefaultSandboxWorkRoot = "/opt/dark-factory/work";
+
+    /// <summary>Claude Code as the worker sees it; sandboxed, it resolves on the helper's PATH (worker's <c>~/.local/bin</c> first).</summary>
     public string ClaudePath => config["Worker:ClaudePath"] ?? "claude";
+
+    /// <summary>
+    /// <c>Worker:RunAs</c> (default <c>_factory</c>) runs workers as that macOS user through
+    /// <c>Worker:LaunchHelper</c>; <c>none</c> runs them as the owner (development only).
+    /// </summary>
+    public Worker.WorkerSandbox? WorkerSandbox => (config["Worker:RunAs"] ?? Worker.WorkerSandbox.DefaultUser) switch
+    {
+        "none" => null,
+        "" => throw new InvalidOperationException("Worker:RunAs must be a macOS user name or 'none'."),
+        var user => new Worker.WorkerSandbox(user, config["Worker:LaunchHelper"] ?? Worker.WorkerSandbox.DefaultHelperPath),
+    };
 
     /// <summary><c>Worker:Auth</c> = <c>claude-login</c> (default) or <c>router-key</c>; see <see cref="Worker.WorkerAuth"/>.</summary>
     public Worker.WorkerAuth WorkerAuth => (config["Worker:Auth"] ?? "claude-login") switch

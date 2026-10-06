@@ -22,6 +22,8 @@ public sealed class WorkerFailedException(string message) : Exception(message);
 /// and never redoes a recorded step. States without a handler park the item (phase 1
 /// parks at Review with the PR open). A failure escalates with a story comment (E10).
 /// One run at a time per item: a second concurrent run exits without touching it.
+/// Worktrees are throwaway (E5): removed once the PR is open or the item escalates; only a
+/// paused (Ctrl-C) or crashed Implement keeps its worktree, for the re-run to resume in.
 /// </summary>
 public sealed class RunPipeline(
     IStorySource stories,
@@ -51,7 +53,11 @@ public sealed class RunPipeline(
         public const string EscalationComment = "escalation-comment";
     }
 
-    private sealed record Run(ShortcutStory Story, RepoRef Repo, WorkItem Item);
+    private sealed record Run(ShortcutStory Story, RepoRef Repo, WorkItem Item)
+    {
+        /// <summary>The worktree this run is using, once Implement has one.</summary>
+        public Workspace? Workspace { get; set; }
+    }
 
     private Dictionary<WorkState, Func<Run, CancellationToken, Task>> Handlers => new()
     {
@@ -122,6 +128,16 @@ public sealed class RunPipeline(
         {
             // Includes an OperationCanceledException nobody asked for, e.g. an HttpClient timeout.
             var commentError = await EscalateAsync(run, ex is WorkerFailedException ? ex.Message : $"{ex.GetType().Name}: {ex.Message}");
+            // An escalated item restarts from Intake with a fresh worktree, so this one is throwaway (E5) —
+            // unless the worker could not be stopped; the next run's sweep removes it once it is dead.
+            if (WorkerStillRunning.IsMarked(ex))
+            {
+                log.WriteLine($"[cleanup] worker did not stop; leaving {run.Workspace?.Path} for the next run's sweep");
+            }
+            else
+            {
+                await RemoveWorktreeAsync(run);
+            }
             return await OutcomeAsync(item,
                 commentError is null ? ex.Message : $"{ex.Message}; {EscalationCommentNotPosted(commentError)}", CancellationToken.None);
         }
@@ -169,6 +185,7 @@ public sealed class RunPipeline(
         {
             workspace = await workspaces.PrepareAsync(repo, branch, ct);
         }
+        run.Workspace = workspace;
         log.WriteLine($"[implement] worktree {workspace.Path} on {workspace.Branch}");
 
         if (!attempt.Any(e => e.Step == Steps.WorkerDone))
@@ -210,6 +227,39 @@ public sealed class RunPipeline(
             $"{StoryId.Format(story.Id)}: {story.Name}", BuildPrBody(story, session!), ct);
         await ledger.RecordAsync(item, WorkState.Review, session, prUrl, ct);
         log.WriteLine($"[review] {prUrl}");
+        // The work is on origin (RestoreAsync re-creates it if ever needed): the worktree is throwaway (E5).
+        await RemoveWorktreeAsync(run);
+    }
+
+    private async Task RemoveWorktreeAsync(Run run)
+    {
+        if (run.Workspace is not { } workspace)
+        {
+            return;
+        }
+        try
+        {
+            await workspaces.RemoveAsync(run.Repo, workspace, CancellationToken.None);
+            run.Workspace = null;
+        }
+        catch (Exception ex)
+        {
+            log.WriteLine($"[cleanup] could not remove worktree {workspace.Path}: {ex.Message}; the next run's sweep retries");
+        }
+    }
+
+    /// <summary>
+    /// Whether a worktree directory (<c>factory-sc-&lt;id&gt;</c>) belongs to an item a re-run would resume
+    /// in it (Implement, or Paused), so the startup sweep must keep it. Everything else is an orphan.
+    /// </summary>
+    public static async Task<bool> WorktreeIsResumableAsync(WorkLedger ledger, string worktreeName, CancellationToken ct)
+    {
+        const string prefix = "factory-";
+        if (!worktreeName.StartsWith(prefix, StringComparison.Ordinal) || !StoryId.TryParse(worktreeName[prefix.Length..], out var id))
+        {
+            return false;
+        }
+        return await ledger.StateOfAsync(Source, StoryId.Format(id), ct) is WorkState.Implement or WorkState.Paused;
     }
 
     /// <summary>

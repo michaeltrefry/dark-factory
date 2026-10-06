@@ -1,0 +1,103 @@
+#!/bin/bash
+# factory-worker-launch — runs one Dark Factory worker command as the sandbox user.
+#
+# Installed root-owned at /usr/local/libexec/dark-factory/factory-worker-launch by
+# scripts/setup-worker-user.sh (which sets sandbox_user below); the orchestrator runs it with
+#   sudo -n -u _factory factory-worker-launch <program> [args...]
+#
+# Protocol (stdin):
+#   KEY=VALUE lines for the router variables, then one empty line. The orchestrator
+#   keeps stdin open for the life of the run; when stdin closes (Stop, timeout, or the
+#   orchestrator died) the worker is killed.
+#
+# The worker gets a fresh environment: HOME (from the password database, never the
+# caller's), a fixed PATH, MSBuild/dotnet settings that keep build servers from
+# lingering, and only the allowlisted router variables (E1/E5).
+#
+# Killing: the worker's process tree and process group, and then — when running as the
+# sandbox user — every process of that user (kill -1), which also catches anything that
+# forked and setsid()'d away (MSBuild node reuse, the dotnet build server, a hostile
+# worker). That makes the sandbox user single-tenant: only one helper may run at a time,
+# which the orchestrator enforces with its work-root lock (WorkerLock).
+set -eu
+
+sandbox_user=_factory
+
+usage() {
+    echo "usage: factory-worker-launch <program> [args...] (router variables on stdin)" >&2
+    exit 64
+}
+
+[ $# -ge 1 ] || usage
+# env(1) would take NAME=value as a variable (bypassing the allowlist) and a leading '-' as
+# an option, so the program must be an absolute path or a plain command name.
+case "$1" in
+    *=* | -* | '') usage ;;
+    /*) ;;
+    */*) usage ;;
+esac
+
+vars=()
+terminated=0
+while IFS= read -r line; do
+    if [ -z "$line" ]; then
+        terminated=1
+        break
+    fi
+    case "$line" in
+        ANTHROPIC_BASE_URL=* | ANTHROPIC_CUSTOM_HEADERS=* | ANTHROPIC_API_KEY=*) vars+=("$line") ;;
+        *)
+            echo "factory-worker-launch: refusing non-allowlisted variable '${line%%=*}'" >&2
+            exit 64
+            ;;
+    esac
+done
+if [ "$terminated" -ne 1 ]; then
+    echo "factory-worker-launch: stdin closed before the variable block ended" >&2
+    exit 64
+fi
+
+# With HOME unset, ~ is the running user's home from the password database.
+unset HOME
+home=~
+path="$home/.local/bin:/usr/local/share/dotnet:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+# Stops a process and all of its descendants: freeze top-down so nothing can fork
+# away, then kill everything collected.
+collect_tree() {
+    local child
+    kill -STOP "$1" 2>/dev/null || return 0
+    echo "$1"
+    for child in $(pgrep -P "$1" || true); do
+        collect_tree "$child"
+    done
+}
+
+# Every process of the sandbox user except this one. Never as anyone else: as the owner
+# (e.g. running this script directly) kill -1 would take down their whole session.
+kill_sandbox_user() {
+    [ "$(id -un)" = "$sandbox_user" ] || return 0
+    kill -KILL -1 2>/dev/null || true
+}
+
+set -m # the worker gets its own process group
+/usr/bin/env -i "HOME=$home" "PATH=$path" MSBUILDDISABLENODEREUSE=1 DOTNET_CLI_USE_MSBUILD_SERVER=0 \
+    ${vars[@]+"${vars[@]}"} "$@" </dev/null &
+worker=$!
+set +m
+
+(
+    while IFS= read -r _; do :; done
+    # shellcheck disable=SC2046 # word splitting of the pid list is intended
+    kill -KILL $(collect_tree "$worker") 2>/dev/null || true
+    kill -KILL -- "-$worker" 2>/dev/null || true
+    kill_sandbox_user
+) <&0 & # explicit, or bash gives background jobs /dev/null as stdin
+watcher=$!
+
+status=0
+wait "$worker" || status=$?
+kill "$watcher" 2>/dev/null || true
+kill -KILL -- "-$worker" 2>/dev/null || true # nothing the worker started outlives the run
+kill_sandbox_user
+exit "$status"

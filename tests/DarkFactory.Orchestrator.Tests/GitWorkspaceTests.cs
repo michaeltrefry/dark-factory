@@ -5,6 +5,7 @@ using DarkFactory.Orchestrator.Shortcut;
 namespace DarkFactory.Orchestrator.Tests;
 
 /// <summary>Real git against a local bare "remote"; no network.</summary>
+[System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
 public class GitWorkspaceTests
 {
     private static readonly RepoRef Repo = new("acme", "widgets");
@@ -142,6 +143,214 @@ public class GitWorkspaceTests
 
         Assert.False(File.Exists(Path.Combine(second.Path, "scratch.txt")));
         Assert.False(await workspace.CommitAndPushAsync(Repo, second, "nothing", CancellationToken.None));
+    }
+
+    private sealed class FakeSandbox(bool deleteRemovesNothing = false) : DarkFactory.Orchestrator.Worker.IWorkerSandbox
+    {
+        public List<string> Calls { get; } = [];
+        public Task ShareAsync(string path, CancellationToken ct)
+        {
+            Calls.Add($"share {path} {(Directory.EnumerateFileSystemEntries(path).Any() ? "non-empty" : "empty")}");
+            return Task.CompletedTask;
+        }
+        public Task DeleteAsWorkerAsync(string path, CancellationToken ct)
+        {
+            Calls.Add($"delete {path}");
+            if (deleteRemovesNothing)
+            {
+                return Task.CompletedTask;
+            }
+            foreach (var dir in Directory.GetDirectories(path, "*", SearchOption.AllDirectories))
+            {
+                File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
+            Directory.Delete(path, recursive: true);
+            return Task.CompletedTask;
+        }
+    }
+
+    private GitWorkspace Workspace(DarkFactory.Orchestrator.Worker.IWorkerSandbox sandbox, GitCommand? git = null) =>
+        new(Path.Combine(_root, "work"), _ => _remote, (_, _) => Task.FromResult<string?>(Token), git, sandbox);
+
+    private string ClonePath => Path.Combine(_root, "work", "repos", Repo.Owner, Repo.Name);
+
+    private int WorktreeCount() => Git(ClonePath, "worktree", "list").Split('\n', StringSplitOptions.RemoveEmptyEntries).Length;
+
+    [Fact]
+    public async Task Prepare_shares_the_fresh_worktree_while_empty_and_records_its_git_dir()
+    {
+        var sandbox = new FakeSandbox();
+        var ws = await Workspace(sandbox).PrepareAsync(Repo, "factory/sc-5", CancellationToken.None);
+
+        // Shared before the checkout, so the checkout inherits the ACL instead of a recursive chmod.
+        Assert.Equal([$"share {ws.Path} empty"], sandbox.Calls);
+        Assert.True(File.Exists(Path.Combine(ws.Path, "README.md")));
+        Assert.Equal(Path.Combine(ClonePath, ".git", "worktrees", "factory-sc-5"), ws.GitDir.Replace("/private/var/", "/var/"));
+    }
+
+    [Fact]
+    public async Task Owner_git_ignores_a_worker_rewritten_dot_git_file()
+    {
+        var workspace = Workspace();
+        var ws = await workspace.PrepareAsync(Repo, "factory/sc-6", CancellationToken.None);
+        // The worker points the worktree's .git file at a repo whose hooks it controls.
+        var evil = Path.Combine(_root, "evil");
+        Git(_root, "init", evil);
+        var marker = Path.Combine(_root, "hook-ran");
+        var hook = Path.Combine(evil, ".git", "hooks", "pre-commit");
+        File.WriteAllText(hook, $"#!/bin/sh\ntouch '{marker}'\n");
+        File.SetUnixFileMode(hook, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        File.WriteAllText(Path.Combine(ws.Path, ".git"), $"gitdir: {Path.Combine(evil, ".git")}\n");
+        File.WriteAllText(Path.Combine(ws.Path, "fix.txt"), "fixed\n");
+
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-6: Fix", CancellationToken.None));
+
+        Assert.False(File.Exists(marker));
+        Assert.Equal("sc-6: Fix", Git(_remote, "log", "-1", "--format=%s", "factory/sc-6").Trim());
+    }
+
+    [Fact]
+    public async Task Reopen_finds_the_git_dir_from_the_clone_not_a_worker_rewritten_dot_git_file()
+    {
+        var workspace = Workspace();
+        var ws = await workspace.PrepareAsync(Repo, "factory/sc-8", CancellationToken.None);
+        // An interrupted worker points .git at its own repo, on the same branch name.
+        var evil = Path.Combine(_root, "evil");
+        Git(_root, "init", "-b", "factory/sc-8", evil);
+        File.WriteAllText(Path.Combine(ws.Path, ".git"), $"gitdir: {Path.Combine(evil, ".git")}\n");
+
+        var reopened = await workspace.ReopenAsync(Repo, "factory/sc-8", CancellationToken.None);
+
+        Assert.Equal(ws.GitDir, reopened?.GitDir);
+    }
+
+    [Fact]
+    public async Task Remove_deletes_as_the_worker_first_then_the_owner_removes_what_is_left()
+    {
+        var sandbox = new FakeSandbox();
+        var workspace = Workspace(sandbox);
+        var ws = await workspace.PrepareAsync(Repo, "factory/sc-7", CancellationToken.None);
+        var locked = Directory.CreateDirectory(Path.Combine(ws.Path, "obj", "locked")).FullName;
+        File.WriteAllText(Path.Combine(locked, "f"), "x");
+        File.SetUnixFileMode(locked, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+
+        await workspace.RemoveAsync(Repo, ws, CancellationToken.None);
+
+        Assert.Equal([$"share {ws.Path} empty", $"delete {ws.Path}"], sandbox.Calls);
+        Assert.False(Directory.Exists(ws.Path));
+        Assert.Equal(1, WorktreeCount());
+    }
+
+    [Fact]
+    public async Task Remove_deletes_as_the_worker_even_when_the_owner_could_delete_everything()
+    {
+        var sandbox = new FakeSandbox();
+        var workspace = Workspace(sandbox);
+        var ws = await workspace.PrepareAsync(Repo, "factory/sc-9", CancellationToken.None);
+
+        await workspace.RemoveAsync(Repo, ws, CancellationToken.None);
+
+        // The owner never walks the worker-controlled tree before the worker has emptied it.
+        Assert.Equal([$"share {ws.Path} empty", $"delete {ws.Path}"], sandbox.Calls);
+    }
+
+    [Fact]
+    public async Task Remove_has_the_owner_delete_whatever_the_worker_left()
+    {
+        var sandbox = new FakeSandbox(deleteRemovesNothing: true);
+        var workspace = Workspace(sandbox);
+        var ws = await workspace.PrepareAsync(Repo, "factory/sc-10", CancellationToken.None);
+
+        await workspace.RemoveAsync(Repo, ws, CancellationToken.None);
+
+        Assert.False(Directory.Exists(ws.Path));
+        Assert.Equal(1, WorktreeCount());
+    }
+
+    [Fact]
+    public async Task Prepare_removes_the_worktree_when_a_step_after_worktree_add_fails()
+    {
+        var sandbox = new FakeSandbox();
+        var workspace = Workspace(sandbox, (cwd, env, args, ct) => args.Contains("--absolute-git-dir")
+            ? throw new InvalidOperationException("rev-parse exploded")
+            : GitWorkspace.RunGitAsync(cwd, env, args, ct));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => workspace.PrepareAsync(Repo, "factory/sc-11", CancellationToken.None));
+
+        var path = Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name, "factory-sc-11");
+        Assert.False(Directory.Exists(path));
+        Assert.Equal(1, WorktreeCount());
+    }
+
+    [Fact]
+    public async Task Sweep_deletes_worktrees_no_run_will_resume_and_keeps_the_rest()
+    {
+        var workspace = Workspace();
+        var orphan = await workspace.PrepareAsync(Repo, "factory/sc-12", CancellationToken.None);
+        var resumable = await workspace.PrepareAsync(Repo, "factory/sc-13", CancellationToken.None);
+        var asked = new List<string>();
+
+        await Workspace().SweepOrphansAsync((name, _) =>
+        {
+            asked.Add(name);
+            return Task.FromResult(name == "factory-sc-13");
+        }, CancellationToken.None);
+
+        Assert.Equal(["factory-sc-12", "factory-sc-13"], asked.Order());
+        Assert.False(Directory.Exists(orphan.Path));
+        Assert.True(File.Exists(Path.Combine(resumable.Path, "README.md")));
+        Assert.Equal(2, WorktreeCount()); // the clone and the kept worktree
+    }
+
+    [Fact]
+    public async Task Sweep_without_any_worktrees_does_nothing()
+    {
+        await Workspace().SweepOrphansAsync((_, _) => throw new InvalidOperationException("no worktree to ask about"), CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Sharing_a_checkout_never_grants_acl_entries_on_targets_of_committed_symlinks()
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            Assert.Skip("ACLs via chmod +a are macOS-only.");
+        }
+        // A target repo commits symlinks pointing out of the worktree (e.g. at the clone's hooks).
+        var outsideDir = Directory.CreateDirectory(Path.Combine(_root, "outside-dir")).FullName;
+        var outsideFile = Path.Combine(_root, "outside-file");
+        File.WriteAllText(outsideFile, "secret\n");
+        var seed = Path.Combine(_root, "seed2");
+        Git(_root, "clone", _remote, seed);
+        File.CreateSymbolicLink(Path.Combine(seed, "dir-link"), outsideDir);
+        File.CreateSymbolicLink(Path.Combine(seed, "file-link"), outsideFile);
+        Git(seed, "add", ".");
+        Git(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "symlinks");
+        Git(seed, "push", "origin", "main");
+        // A real sandbox sharing with the current user (chmod needs an existing user); deletes run the helper unsudoed.
+        var sandbox = new DarkFactory.Orchestrator.Worker.WorkerSandbox(Environment.UserName, SandboxSupport.Helper, SandboxSupport.FakeSudo(_root));
+
+        var workspace = Workspace(sandbox);
+        var ws = await workspace.PrepareAsync(Repo, "factory/sc-14", CancellationToken.None);
+
+        Assert.True(new FileInfo(Path.Combine(ws.Path, "dir-link")).LinkTarget is not null);
+        Assert.DoesNotContain("allow", AclListing(outsideDir));
+        Assert.DoesNotContain("allow", AclListing(outsideFile));
+        Assert.DoesNotContain("allow", AclListing(Path.Combine(ClonePath, ".git", "hooks")));
+        // The checkout itself got the entries, by inheritance.
+        Assert.Contains($"user:{Environment.UserName} inherited allow", AclListing(Path.Combine(ws.Path, "README.md")));
+
+        await workspace.RemoveAsync(Repo, ws, CancellationToken.None);
+        Assert.False(Directory.Exists(ws.Path));
+        Assert.True(File.Exists(outsideFile) && Directory.Exists(outsideDir));
+    }
+
+    private static string AclListing(string path)
+    {
+        var psi = new ProcessStartInfo("/bin/ls", ["-led", path]) { RedirectStandardOutput = true };
+        using var p = Process.Start(psi)!;
+        var output = p.StandardOutput.ReadToEnd();
+        p.WaitForExit();
+        return output;
     }
 
     [Fact]

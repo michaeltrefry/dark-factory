@@ -172,17 +172,17 @@ public class RunPipelineTests
         public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct)
         {
             Calls.Add($"restore {repo} {branch}");
-            return Task.FromResult(new Workspace($"/wt/{branch}", branch, "main"));
+            return Task.FromResult(new Workspace($"/wt/{branch}", branch, "main", $"/clone/.git/worktrees/{branch}"));
         }
         public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct)
         {
             Calls.Add($"prepare {repo} {branch}");
-            return Task.FromResult(new Workspace($"/wt/{branch}", branch, "main"));
+            return Task.FromResult(new Workspace($"/wt/{branch}", branch, "main", $"/clone/.git/worktrees/{branch}"));
         }
         public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct)
         {
             Calls.Add($"reopen {repo} {branch}");
-            return Task.FromResult(worktreeExists ? new Workspace($"/wt/{branch}", branch, "main") : null);
+            return Task.FromResult(worktreeExists ? new Workspace($"/wt/{branch}", branch, "main", $"/clone/.git/worktrees/{branch}") : null);
         }
         public Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, CancellationToken ct)
         {
@@ -311,7 +311,8 @@ public class RunPipelineTests
 
         Assert.Null(worker.Calls.Single().Resume);
         Assert.Equal(["prepare michaeltrefry/dark-factory-sandbox factory/sc-77",
-            "push michaeltrefry/dark-factory-sandbox factory/sc-77 sc-77: Whitespace counts as a word"], h.Workspaces.Calls);
+            "push michaeltrefry/dark-factory-sandbox factory/sc-77 sc-77: Whitespace counts as a word",
+            "remove michaeltrefry/dark-factory-sandbox /wt/factory/sc-77"], h.Workspaces.Calls); // throwaway once the PR is open (E5)
         var pr = h.Prs.Opened.Single();
         Assert.Equal(("factory/sc-77", "main"), (pr.Head, pr.Base));
         Assert.Contains("https://app.shortcut.com/trefry/story/77", pr.Body);
@@ -364,7 +365,9 @@ public class RunPipelineTests
         Assert.Contains("Last ledger state: Implement (after step session)", comment);
         Assert.Contains("sess-x", comment);
         Assert.Equal("escalation-comment", (await h.Rows())[^1].Step);
-        Assert.Single(h.Workspaces.Calls);
+        // An escalated item restarts with a fresh worktree, so this one is removed (E5).
+        Assert.Equal(["prepare michaeltrefry/dark-factory-sandbox factory/sc-77",
+            "remove michaeltrefry/dark-factory-sandbox /wt/factory/sc-77"], h.Workspaces.Calls);
         Assert.Empty(h.Prs.Opened);
         Assert.Equal(WorkState.Escalated, (await h.Item()).State);
     }
@@ -452,6 +455,40 @@ public class RunPipelineTests
         Assert.Equal(RunPipeline.BuildResumePrompt(Story), worker.Calls[1].Prompt);
         Assert.Contains("reopen michaeltrefry/dark-factory-sandbox factory/sc-77", h.Workspaces.Calls);
         Assert.Single(h.Prs.Opened);
+    }
+
+    [Fact]
+    public async Task Startup_sweep_keeps_only_worktrees_a_rerun_would_resume_in()
+    {
+        var h = new Harness();
+        var ledger = h.Ledger;
+        Assert.False(await RunPipeline.WorktreeIsResumableAsync(ledger, "factory-sc-77", CancellationToken.None)); // no item
+        var item = await h.Crashed(RunPipeline.Steps.Session);
+        Assert.True(await RunPipeline.WorktreeIsResumableAsync(ledger, "factory-sc-77", CancellationToken.None)); // Implement
+        await ledger.RecordAsync(item, WorkState.Paused, null, "interrupted", CancellationToken.None);
+        Assert.True(await RunPipeline.WorktreeIsResumableAsync(ledger, "factory-sc-77", CancellationToken.None)); // Paused
+        await ledger.RecordAsync(item, WorkState.Implement, null, "unpaused", CancellationToken.None);
+        await ledger.RecordAsync(item, WorkState.Escalated, null, "boom", CancellationToken.None);
+        Assert.False(await RunPipeline.WorktreeIsResumableAsync(ledger, "factory-sc-77", CancellationToken.None)); // Escalated
+        Assert.False(await RunPipeline.WorktreeIsResumableAsync(ledger, "not-ours", CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Timed_out_worker_escalates_and_its_worktree_is_removed_only_once_it_stopped(bool stillRunning)
+    {
+        var h = new Harness();
+        var timeout = new TimeoutException("Worker did not finish within 00:30:00");
+        var worker = new FakeWorker(StartsThenThrows("sess-77", stillRunning ? WorkerStillRunning.Mark(timeout) : timeout));
+
+        var outcome = await h.Run(worker);
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Equal(stillRunning
+                ? ["prepare michaeltrefry/dark-factory-sandbox factory/sc-77"]
+                : ["prepare michaeltrefry/dark-factory-sandbox factory/sc-77", "remove michaeltrefry/dark-factory-sandbox /wt/factory/sc-77"],
+            h.Workspaces.Calls);
     }
 
     [Fact]
@@ -553,8 +590,8 @@ public class RunPipelineTests
 
         Assert.True(outcome.Succeeded, outcome.Error);
         Assert.Empty(worker.Calls);
-        Assert.Equal(["reopen michaeltrefry/dark-factory-sandbox factory/sc-77", "restore michaeltrefry/dark-factory-sandbox factory/sc-77"],
-            h.Workspaces.Calls);
+        Assert.Equal(["reopen michaeltrefry/dark-factory-sandbox factory/sc-77", "restore michaeltrefry/dark-factory-sandbox factory/sc-77",
+            "remove michaeltrefry/dark-factory-sandbox /wt/factory/sc-77"], h.Workspaces.Calls);
         Assert.Equal("worktree-restored", (await h.Steps())[^1]);
         Assert.Single(h.Prs.Opened);
         Assert.Equal(WorkState.Review, (await h.Item()).State);
