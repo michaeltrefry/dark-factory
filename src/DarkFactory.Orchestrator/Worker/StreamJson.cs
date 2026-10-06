@@ -50,3 +50,44 @@ public sealed class StreamJsonState
         }
     }
 }
+
+/// <summary>What the session-event store needs to know about one stream-json line.</summary>
+public sealed record StreamJsonEvent(string Type, string? Subtype, string? SessionId)
+{
+    /// <summary>The type of a line that is not a JSON object; such lines are kept, never dropped.</summary>
+    public const string Raw = "raw";
+
+    private const int MaxNameLength = 64;
+
+    public static StreamJsonEvent Parse(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line) || line.TrimStart()[0] != '{')
+        {
+            return new StreamJsonEvent(Raw, null, null);
+        }
+        try
+        {
+            using var doc = JsonDocument.Parse(line);
+            var root = doc.RootElement;
+            var type = Name(root, "type") ?? "unknown";
+            var subtype = Name(root, "subtype");
+            if (subtype is null && root.TryGetProperty("message", out var message) && message.ValueKind == JsonValueKind.Object
+                && message.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array
+                && content.GetArrayLength() > 0 && content[0].ValueKind == JsonValueKind.Object)
+            {
+                subtype = Name(content[0], "type"); // tool_use, tool_result, text, thinking
+            }
+            var sessionId = root.TryGetProperty("session_id", out var sid) && sid.ValueKind == JsonValueKind.String ? sid.GetString() : null;
+            return new StreamJsonEvent(type, subtype, sessionId);
+        }
+        catch (JsonException)
+        {
+            return new StreamJsonEvent(Raw, null, null);
+        }
+    }
+
+    private static string? Name(JsonElement obj, string property) =>
+        obj.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String && value.GetString() is { } s
+            ? s[..Math.Min(s.Length, MaxNameLength)]
+            : null;
+}

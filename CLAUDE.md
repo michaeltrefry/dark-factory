@@ -8,7 +8,8 @@ Claude Code headless workers through the Weave router.
 
 - `src/DarkFactory.Orchestrator` — the `factory` CLI (System.CommandLine), EF Core ledger
   (`Ledger/`, migrations in `Ledger/Migrations`), Shortcut client, GitHub App auth and
-  manifest setup (`GitHub/`), git worktrees (`Git/`), Claude worker and its sandbox (`Worker/`), router client.
+  manifest setup (`GitHub/`), git worktrees (`Git/`), Claude worker and its sandbox (`Worker/`), router client,
+  session capture + SignalR hub (`Sessions/`), the `factory work` host (`FactoryHost`).
 - `scripts/` — `setup-worker-user.sh` (one-time root setup of the `_factory` sandbox user) and
   `factory-worker-launch` (the root-installed helper every sandboxed worker runs through).
 - `tests/DarkFactory.Orchestrator.Tests` — unit tests (no network; fake HTTP APIs, InMemory EF, local git).
@@ -26,6 +27,7 @@ dotnet test                                   # unit tests; acceptance tests ski
 dotnet ef database update --project src/DarkFactory.Orchestrator
 dotnet ef migrations add <Name> --project src/DarkFactory.Orchestrator -o Ledger/Migrations
 dotnet run --project src/DarkFactory.Orchestrator -- run sc-1234
+dotnet run --project src/DarkFactory.Orchestrator -- work          # long-running host: session hub on 127.0.0.1
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup
 dotnet run --project src/DarkFactory.Orchestrator -- github-repo protect owner/name   # rulesets; owner's GH_TOKEN / `gh auth token`
 ```
@@ -50,6 +52,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Worker:LaunchHelper` | `/usr/local/libexec/dark-factory/factory-worker-launch` |
 | `Worker:Auth` | `claude-login` (worker's own Claude login, router passes it through) or `router-key` (router key as Claude's API key; router needs BYOK provider keys) |
 | `Worker:TimeoutMinutes` | `30` |
+| `Factory:HostPort` | `47822` (`factory work` binds 127.0.0.1 only) |
 
 Worker sandbox (E5): workers run as the hidden `_factory` user via
 `sudo -n -u _factory factory-worker-launch claude …` (one NOPASSWD sudoers rule for that helper only).
@@ -103,4 +106,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   crashed Implement keeps its worktree for resume; a worker that won't stop marks its exception
   (`WorkerStillRunning`) so nothing deletes under it. Each run sweeps worktrees no run will resume.
   The App private key never reaches a worker's env, argv or worktree (`ClaudeWorkerTests`).
+- Every worker stdout line is a `session_events` row (E7): `ClaudeWorker` taps each line (`WorkerCallbacks.OnLine`) into a
+  bounded channel that `SessionRecorder` drains into Postgres in order (gapless `Sequence`, non-JSON lines kept as `raw`);
+  a resumed session continues its `worker_sessions` row and sequence. At session end the row gets exit status and the
+  router cost (`GET /v1/sessions/:id/cost`, reporting only, E9). In `factory work`, `SessionHub` (`/hubs/sessions`,
+  `JoinSession(id)`) sends the stored backlog then live events, once each; a one-shot `factory run` stores only.
 - Tests: xunit.v3 on Microsoft.Testing.Platform (`global.json` opts in).

@@ -53,6 +53,9 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         var other => throw new InvalidOperationException($"Worker:Auth must be 'claude-login' or 'router-key', not '{other}'."),
     };
 
+    /// <summary>Loopback port of the <c>factory work</c> host (session hub).</summary>
+    public int HostPort => config.GetValue("Factory:HostPort", 47822);
+
     public TimeSpan WorkerTimeout => TimeSpan.FromMinutes(config.GetValue("Worker:TimeoutMinutes", 30));
 
     public string LedgerConnectionString => config.GetLedgerConnectionString();

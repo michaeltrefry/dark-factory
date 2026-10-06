@@ -12,11 +12,13 @@ public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError,
 /// <summary>
 /// Hooks a worker run awaits while it runs, so the ledger knows about the run before it ends.
 /// <see cref="OnStarted"/> gets the worker's process id as soon as the process exists;
-/// <see cref="OnSession"/> gets the Claude session id as soon as it appears in the stream.
+/// <see cref="OnSession"/> gets the Claude session id as soon as it appears in the stream;
+/// <see cref="OnLine"/> gets every stdout line, in order, as it is read.
 /// </summary>
 public sealed record WorkerCallbacks(
     Func<int, CancellationToken, Task>? OnStarted = null,
-    Func<string, CancellationToken, Task>? OnSession = null);
+    Func<string, CancellationToken, Task>? OnSession = null,
+    Func<string, CancellationToken, ValueTask>? OnLine = null);
 
 public interface IWorker
 {
@@ -192,10 +194,14 @@ public sealed class ClaudeWorker(
             {
                 await onStarted(process.Id, ct);
             }
-            var onSession = callbacks?.OnSession;
+            var (onSession, onLine) = (callbacks?.OnSession, callbacks?.OnLine);
             string? reported = null;
             while (await process.StandardOutput.ReadLineAsync(timeoutCts.Token) is { } line)
             {
+                if (onLine is not null)
+                {
+                    await onLine(line, ct);
+                }
                 state.Accept(line);
                 if (onSession is not null && state.SessionId is { } sid && sid != reported)
                 {

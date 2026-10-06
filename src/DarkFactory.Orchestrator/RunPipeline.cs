@@ -1,6 +1,7 @@
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
+using DarkFactory.Orchestrator.Sessions;
 using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 
@@ -33,7 +34,8 @@ public sealed class RunPipeline(
     IWorker worker,
     IPullRequests pullRequests,
     RepoRef defaultRepo,
-    TextWriter log)
+    TextWriter log,
+    SessionRecorder? sessions = null)
 {
     public const string Source = "shortcut";
 
@@ -192,18 +194,43 @@ public sealed class RunPipeline(
         {
             var resume = session;
             log.WriteLine(resume is null ? "[implement] starting worker" : $"[implement] resuming claude session {resume}");
-            var result = await worker.RunAsync(workspace.Path,
-                resume is null ? BuildPrompt(story, repo) : BuildResumePrompt(story), resume,
-                new WorkerCallbacks(
-                    OnStarted: (pid, c) => ledger.CheckpointAsync(item, Steps.WorkerStarted, session, pid.ToString(), c),
-                    OnSession: async (sid, c) =>
-                    {
-                        if (sid != session)
+            // Every stdout line is stored (and pushed to live viewers) as it streams (E7).
+            await using var capture = sessions is null ? null : await sessions.StartAsync(item.Id, resume, ct);
+            WorkerResult result;
+            try
+            {
+                result = await worker.RunAsync(workspace.Path,
+                    resume is null ? BuildPrompt(story, repo) : BuildResumePrompt(story), resume,
+                    new WorkerCallbacks(
+                        OnStarted: (pid, c) => ledger.CheckpointAsync(item, Steps.WorkerStarted, session, pid.ToString(), c),
+                        OnSession: async (sid, c) =>
                         {
-                            session = sid;
-                            await ledger.CheckpointAsync(item, Steps.Session, sid, "claude session started", c);
-                        }
-                    }), ct);
+                            if (sid != session)
+                            {
+                                session = sid;
+                                await ledger.CheckpointAsync(item, Steps.Session, sid, "claude session started", c);
+                            }
+                        },
+                        OnLine: capture is null ? null : capture.OnLineAsync), ct);
+            }
+            catch (Exception ex) when (capture is not null)
+            {
+                // An interrupted session resumes later; its cost is fetched when it ends for good.
+                var cancelled = ex is OperationCanceledException && ct.IsCancellationRequested;
+                try
+                {
+                    await capture.CompleteAsync(null, cancelled ? "cancelled" : "error", fetchCost: !cancelled, CancellationToken.None);
+                }
+                catch (Exception captureError)
+                {
+                    log.WriteLine($"[implement] could not record the end of the worker session: {captureError.Message}");
+                }
+                throw;
+            }
+            if (capture is not null)
+            {
+                await capture.CompleteAsync(result.ExitCode, result.Succeeded ? "succeeded" : "failed", fetchCost: true, ct);
+            }
             session = result.SessionId ?? session;
             if (!result.Succeeded)
             {

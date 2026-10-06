@@ -135,10 +135,15 @@ public class ClaudeWorkerTests
         try
         {
             var worker = new ClaudeWorker(script, Router, "rk_worker", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1));
-            var result = await worker.RunAsync(dir, "prompt", null, null, CancellationToken.None);
+            var lines = new List<string>();
+            var result = await worker.RunAsync(dir, "prompt", null,
+                new WorkerCallbacks(OnLine: (line, _) => { lines.Add(line); return ValueTask.CompletedTask; }), CancellationToken.None);
 
             Assert.True(result.Succeeded);
             Assert.Equal("sess-abc", result.SessionId);
+            // Every stdout line reaches the tap, in order, non-JSON noise included.
+            Assert.Equal(3, lines.Count);
+            Assert.Equal("progress noise", lines[1]);
             var dumped = File.ReadAllText(envDump);
             Assert.Contains("ANTHROPIC_CUSTOM_HEADERS=X-Weave-Router-Key: rk_worker", dumped);
             Assert.DoesNotContain("sk-ant-should-not-leak", dumped);

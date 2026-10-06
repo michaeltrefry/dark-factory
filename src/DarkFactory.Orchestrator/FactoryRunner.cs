@@ -1,6 +1,8 @@
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
+using DarkFactory.Orchestrator.Router;
+using DarkFactory.Orchestrator.Sessions;
 using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 using Microsoft.EntityFrameworkCore;
@@ -29,6 +31,7 @@ public static class FactoryRunner
 
         using var shortcutHttp = new HttpClient { BaseAddress = ShortcutClient.DefaultBaseAddress };
         using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        using var routerHttp = new HttpClient { BaseAddress = options.RouterBaseUrl };
         var app = new GitHubApp(githubHttp, appId, appKey, TimeProvider.System);
 
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
@@ -48,7 +51,10 @@ public static class FactoryRunner
             new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, sandbox),
             new GitHubPullRequests(githubHttp, app),
             options.DefaultRepo,
-            log);
+            log,
+            // One-shot run: no hub, so events are stored only (the `factory work` host pushes them live).
+            new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)),
+                StoreOnlyPublisher.Instance, new RouterClient(routerHttp, routerKey), TimeProvider.System, log));
 
         return await pipeline.RunAsync(storyId, ct);
     }
