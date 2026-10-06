@@ -67,6 +67,76 @@ public class GitHubAppTests
     }
 
     [Fact]
+    public async Task Every_run_mints_a_fresh_token_never_reusing_an_earlier_one()
+    {
+        var minted = 0;
+        var api = new FakeApi()
+            .On("GET /repos/michaeltrefry/dark-factory-sandbox/installation", HttpStatusCode.OK, """{"id":987}""")
+            .On("POST /app/installations/987/access_tokens", _ => FakeApi.Json(HttpStatusCode.Created,
+                $$"""{"token":"ghs_run{{++minted}}","expires_at":"2027-01-15T09:00:00Z"}"""));
+        var app = App(api);
+
+        var first = await app.CreateInstallationTokenAsync(Sandbox, CancellationToken.None);
+        var second = await app.CreateInstallationTokenAsync(Sandbox, CancellationToken.None);
+
+        Assert.Equal(("ghs_run1", "ghs_run2"), (first.Token, second.Token));
+        var mints = api.Requests.Where(r => r.PathAndQuery == "/app/installations/987/access_tokens").ToList();
+        Assert.Equal(2, mints.Count);
+        Assert.All(mints, m => Assert.Equal(["dark-factory-sandbox"],
+            JsonDocument.Parse(m.Body!).RootElement.GetProperty("repositories").EnumerateArray().Select(e => e.GetString())));
+    }
+
+    [Fact]
+    public async Task Token_for_another_repo_names_only_that_repo()
+    {
+        var api = new FakeApi()
+            .On("GET /repos/acme/widgets/installation", HttpStatusCode.OK, """{"id":5}""")
+            .On("POST /app/installations/5/access_tokens", HttpStatusCode.Created, """{"token":"ghs_w","expires_at":"2027-01-15T08:30:00Z"}""");
+
+        await App(api).CreateInstallationTokenAsync(new RepoRef("acme", "widgets"), CancellationToken.None);
+
+        var body = JsonDocument.Parse(api.Requests[1].Body!).RootElement;
+        Assert.Equal(["widgets"], body.GetProperty("repositories").EnumerateArray().Select(e => e.GetString()));
+    }
+
+    [Fact]
+    public async Task Token_living_longer_than_an_hour_is_refused()
+    {
+        var api = new FakeApi()
+            .On("GET /repos/michaeltrefry/dark-factory-sandbox/installation", HttpStatusCode.OK, """{"id":987}""")
+            .On("POST /app/installations/987/access_tokens", HttpStatusCode.Created,
+                """{"token":"ghs_long","expires_at":"2027-01-15T10:00:00Z"}""");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => App(api).CreateInstallationTokenAsync(Sandbox, CancellationToken.None));
+        Assert.Contains("60-minute limit", ex.Message);
+        Assert.DoesNotContain("ghs_long", ex.Message);
+    }
+
+    [Theory]
+    [InlineData("2027-01-15T09:04:00Z", true)]  // 1h + 4min: within the 5-minute clock-skew allowance
+    [InlineData("2027-01-15T09:06:00Z", false)] // 1h + 6min: beyond it
+    public async Task Token_lifetime_limit_is_one_hour_plus_five_minutes_of_skew(string expiresAt, bool accepted)
+    {
+        Assert.Equal(DateTimeOffset.Parse("2027-01-15T08:00:00Z"), Now);
+        var api = new FakeApi()
+            .On("GET /repos/michaeltrefry/dark-factory-sandbox/installation", HttpStatusCode.OK, """{"id":987}""")
+            .On("POST /app/installations/987/access_tokens", HttpStatusCode.Created,
+                $$"""{"token":"ghs_edge","expires_at":"{{expiresAt}}"}""");
+
+        var mint = App(api).CreateInstallationTokenAsync(Sandbox, CancellationToken.None);
+
+        if (accepted)
+        {
+            Assert.Equal(DateTimeOffset.Parse(expiresAt), (await mint).ExpiresAt);
+        }
+        else
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() => mint);
+        }
+    }
+
+    [Fact]
     public async Task Missing_installation_says_to_install_the_app()
     {
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(

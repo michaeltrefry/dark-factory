@@ -10,7 +10,8 @@ public static class FactoryCli
 
     public static RootCommand Build(
         Func<int, CancellationToken, Task<int>> run,
-        Func<string, int, CancellationToken, Task<int>> setupGitHubApp)
+        Func<string, int, CancellationToken, Task<int>> setupGitHubApp,
+        Func<RepoRef, CancellationToken, Task<int>> protectRepo)
     {
         var storyArgument = new Argument<int>("story-id")
         {
@@ -46,10 +47,35 @@ public static class FactoryCli
         };
         setupCommand.SetAction((parse, ct) => setupGitHubApp(parse.GetValue(nameOption)!, parse.GetValue(portOption), ct));
 
+        var repoArgument = new Argument<RepoRef>("repo")
+        {
+            Description = "Target repository, owner/name",
+            CustomParser = result =>
+            {
+                var token = result.Tokens.Single().Value;
+                try
+                {
+                    return RepoRef.Parse(token);
+                }
+                catch (ArgumentException)
+                {
+                    result.AddError($"'{token}' is not a repository (expected owner/name).");
+                    return null;
+                }
+            },
+        };
+        var protectCommand = new Command("protect",
+            "Apply the factory rulesets (main requires a PR; only admins write outside factory/**). Uses the owner's GH_TOKEN/GITHUB_TOKEN or `gh auth token`.")
+        {
+            repoArgument,
+        };
+        protectCommand.SetAction((parse, ct) => protectRepo(parse.GetValue(repoArgument)!, ct));
+
         return new RootCommand("Dark Factory orchestrator")
         {
             runCommand,
             new Command("github-app", "GitHub App management") { setupCommand },
+            new Command("github-repo", "Target repository management") { protectCommand },
         };
     }
 }

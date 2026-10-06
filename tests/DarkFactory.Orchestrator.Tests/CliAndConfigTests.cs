@@ -12,7 +12,8 @@ public class FactoryCliTests
         var calls = new List<string>();
         var root = FactoryCli.Build(
             (id, _) => { calls.Add($"run {id}"); return Task.FromResult(0); },
-            (name, port, _) => { calls.Add($"setup {name} {port}"); return Task.FromResult(0); });
+            (name, port, _) => { calls.Add($"setup {name} {port}"); return Task.FromResult(0); },
+            (repo, _) => { calls.Add($"protect {repo}"); return Task.FromResult(0); });
         return (root, calls);
     }
 
@@ -47,6 +48,24 @@ public class FactoryCliTests
         await root.Parse(["github-app", "setup"]).InvokeAsync();
         Assert.Equal("setup df-test 50001", calls[0]);
         Assert.Equal($"setup dark-factory-{Environment.UserName} {FactoryCli.DefaultSetupPort}", calls[1]);
+    }
+
+    [Fact]
+    public async Task Github_repo_protect_passes_parsed_repo()
+    {
+        var (root, calls) = Cli();
+        Assert.Equal(0, await root.Parse(["github-repo", "protect", "michaeltrefry/dark-factory-sandbox"]).InvokeAsync());
+        Assert.Equal(["protect michaeltrefry/dark-factory-sandbox"], calls);
+    }
+
+    [Theory]
+    [InlineData("not-a-repo")]
+    [InlineData("a/b/c")]
+    public async Task Github_repo_protect_rejects_malformed_repo(string arg)
+    {
+        var (root, calls) = Cli();
+        Assert.NotEqual(0, await root.Parse(["github-repo", "protect", arg]).InvokeAsync());
+        Assert.Empty(calls);
     }
 }
 

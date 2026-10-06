@@ -14,7 +14,8 @@ public sealed record InstallationToken(string Token, DateTimeOffset ExpiresAt);
 /// <summary>
 /// Authenticates as the factory's GitHub App: signs an app JWT with the app's
 /// private key and exchanges it for an installation token restricted to one
-/// repository with contents + pull_requests write.
+/// repository with contents + pull_requests write. Every call mints a fresh token;
+/// nothing is cached across runs.
 /// </summary>
 public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPem, TimeProvider time)
 {
@@ -25,6 +26,12 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
         ["contents"] = "write",
         ["pull_requests"] = "write",
     };
+
+    /// <summary>Longest installation-token lifetime the factory accepts (GitHub issues 1-hour tokens).</summary>
+    public static readonly TimeSpan MaxTokenLifetime = TimeSpan.FromHours(1);
+
+    // Tolerates clock drift between this Mac and GitHub when checking expires_at.
+    private static readonly TimeSpan ClockSkew = TimeSpan.FromMinutes(5);
 
     public string CreateJwt()
     {
@@ -57,7 +64,12 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
         using var createResponse = await http.SendAsync(create, ct);
         await EnsureSuccess(createResponse, "create installation token", ct);
         var token = await createResponse.Content.ReadFromJsonAsync<AccessTokenDto>(ct);
-        return new InstallationToken(token!.Token, token.ExpiresAt);
+        if (token!.ExpiresAt > time.GetUtcNow() + MaxTokenLifetime + ClockSkew)
+        {
+            throw new InvalidOperationException(
+                $"GitHub issued an installation token for {repo} expiring at {token.ExpiresAt:O}, beyond the {MaxTokenLifetime.TotalMinutes:0}-minute limit.");
+        }
+        return new InstallationToken(token.Token, token.ExpiresAt);
     }
 
     internal static HttpRequestMessage Request(HttpMethod method, string path, string scheme, string credential)

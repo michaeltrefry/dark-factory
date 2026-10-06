@@ -44,6 +44,17 @@ public class StreamJsonTests
     }
 }
 
+/// <summary>
+/// Tests that set process-wide environment variables run alone, so no parallel test reads
+/// (or launches a process inheriting) a value they temporarily planted.
+/// </summary>
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class ProcessEnvironmentCollection
+{
+    public const string Name = "Process environment";
+}
+
+[Collection(ProcessEnvironmentCollection.Name)]
 [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
 public class ClaudeWorkerTests
 {
@@ -135,6 +146,51 @@ public class ClaudeWorkerTests
         finally
         {
             Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", null);
+        }
+    }
+
+    /// <summary>
+    /// S5 probe: even when the orchestrator holds the App private key (here via the env-var form of
+    /// <c>GitHub:PrivateKeyPem</c>), the launched worker sees it in neither its environment, its
+    /// argv nor its worktree.
+    /// </summary>
+    [Fact]
+    public async Task Worker_never_receives_the_app_private_key_in_env_args_or_worktree()
+    {
+        var pem = System.Security.Cryptography.RSA.Create(2048).ExportRSAPrivateKeyPem();
+        var keyBody = pem.Split('\n')[1];
+        var worktree = Directory.CreateTempSubdirectory("df-worker-wt-").FullName;
+        File.WriteAllText(Path.Combine(worktree, "Program.cs"), "// worker code\n");
+        var probeDir = Directory.CreateTempSubdirectory("df-worker-probe-").FullName;
+        var dump = Path.Combine(probeDir, "probe.txt");
+        var script = Path.Combine(probeDir, "fake-claude.sh");
+        File.WriteAllText(script, $$"""
+            #!/bin/sh
+            env > "{{dump}}"
+            printf '%s\n' "$@" >> "{{dump}}"
+            grep -rIl -e "PRIVATE KEY" -e "{{keyBody[..32]}}" . > "{{dump}}.files"
+            echo '{"type":"system","subtype":"init","session_id":"sess-key"}'
+            echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-key"}'
+            """);
+        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        Environment.SetEnvironmentVariable("GitHub__PrivateKeyPem", pem);
+        try
+        {
+            var result = await new ClaudeWorker(script, Router, "rk_worker", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1))
+                .RunAsync(worktree, "implement the story", CancellationToken.None);
+
+            Assert.True(result.Succeeded);
+            var probe = File.ReadAllText(dump);
+            Assert.Contains("ANTHROPIC_BASE_URL=", probe); // the dump ran
+            Assert.Contains("implement the story", probe);
+            Assert.DoesNotContain("PRIVATE KEY", probe);
+            Assert.DoesNotContain(keyBody, probe);
+            Assert.DoesNotContain("GitHub__", probe);
+            Assert.Equal("", File.ReadAllText($"{dump}.files")); // no file in the worktree carries the key
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("GitHub__PrivateKeyPem", null);
         }
     }
 

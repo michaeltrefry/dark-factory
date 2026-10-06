@@ -34,6 +34,11 @@ dotnet test
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup
 #    then install the app on michaeltrefry/dark-factory-sandbox via the printed link
 
+# 1b. Protect the target repo (main needs a PR; the App can only write factory/**). Uses your own
+#     GH_TOKEN or `gh auth token` (repo admin). Private repos on a free personal plan need GitHub Pro.
+#     Non-admin integrations (Dependabot, GITHUB_TOKEN deploys like gh-pages) can then only write factory/**.
+dotnet run --project src/DarkFactory.Orchestrator -- github-repo protect michaeltrefry/dark-factory-sandbox
+
 # 2. Shortcut API token for the orchestrator (or export SHORTCUT_API_TOKEN)
 security add-generic-password -U -s dark-factory -a shortcut-api-token -w '<token>'
 
