@@ -23,9 +23,13 @@ runs Intake → Implement → Review and parks the item at Review with the PR op
 
 `factory run sc-<id>` is idempotent: on an existing item it continues from the last ledger
 row. A run killed during Implement resumes the same Claude session (`claude --resume`) in
-the same worktree, and never pushes or opens a PR twice. Ctrl-C pauses the item (a re-run
-unpauses it); a failure escalates it and comments on the story; re-running an escalated item
-starts it again from Intake.
+the same worktree, and never pushes or opens a PR twice. A worker the killed run left
+running is stopped (its whole process group) before the resume. If the worktree is gone after
+the branch was pushed, it is re-created from the pushed branch rather than redone. Ctrl-C
+pauses the item (a re-run unpauses it); any other failure, including a timed-out API call,
+escalates it and comments on the story; re-running an escalated item first posts that comment
+if it failed, then starts it again from Intake. Only one `factory run` drives an item at a
+time (a Postgres advisory lock); a second exits non-zero with "already running".
 
 **Security caveat:** until worker isolation (story S4) lands, workers run as the owner's
 macOS user and can reach the owner's keychain and gh/git credentials, so only run

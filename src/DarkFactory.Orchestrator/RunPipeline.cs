@@ -21,10 +21,12 @@ public sealed class WorkerFailedException(string message) : Exception(message);
 /// before the next starts (E3), so a re-run after a crash resumes where the ledger says
 /// and never redoes a recorded step. States without a handler park the item (phase 1
 /// parks at Review with the PR open). A failure escalates with a story comment (E10).
+/// One run at a time per item: a second concurrent run exits without touching it.
 /// </summary>
 public sealed class RunPipeline(
     IStorySource stories,
     WorkLedger ledger,
+    IRunLocks locks,
     IRepoWorkspace workspaces,
     IWorker worker,
     IPullRequests pullRequests,
@@ -36,10 +38,16 @@ public sealed class RunPipeline(
     /// <summary>Checkpoint names: completed sub-steps inside a state.</summary>
     public static class Steps
     {
+        /// <summary>The worker process exists; Detail is its pid.</summary>
+        public const string WorkerStarted = "worker-started";
         public const string Session = "session";
         public const string WorkerDone = "worker-done";
         public const string Pushed = "pushed";
         public const string WorktreeLost = "worktree-lost";
+        /// <summary>The worktree was gone after a push and was re-created from the pushed branch.</summary>
+        public const string WorktreeRestored = "worktree-restored";
+        /// <summary>A worker left running by a crashed run was stopped; Detail is its pid.</summary>
+        public const string OrphanKilled = "orphan-killed";
         public const string EscalationComment = "escalation-comment";
     }
 
@@ -56,6 +64,15 @@ public sealed class RunPipeline(
         var story = await stories.GetStoryAsync(storyId, ct);
         var repo = RepoResolver.Resolve(story.Description, defaultRepo);
         var item = await ledger.GetOrCreateAsync(Source, StoryId.Format(storyId), story.Name, repo.FullName, IntakeDetail(story), ct);
+
+        await using var runLock = await locks.TryAcquireAsync(item.Id, ct);
+        if (runLock is null)
+        {
+            log.WriteLine($"[{item.State}] {item.ExternalId} is already running; not touching it.");
+            return new RunOutcome(item.Id, item.State, null, null, $"{item.ExternalId} is already running.");
+        }
+        // Re-read under the lock: another run may have moved the item since it was loaded.
+        await ledger.RefreshAsync(item, story.Name, repo.FullName, ct);
         var run = new Run(story, repo, item);
 
         if (Lifecycle.IsTerminal(item.State))
@@ -65,6 +82,12 @@ public sealed class RunPipeline(
         }
         if (item.State == WorkState.Escalated)
         {
+            // The story must carry the escalation before the item moves on (E10).
+            if (!EscalationCommentPosted(await ledger.HistoryAsync(item, ct))
+                && await PostEscalationCommentAsync(run, ct) is { } commentError)
+            {
+                return await OutcomeAsync(item, EscalationCommentNotPosted(commentError), ct);
+            }
             await ledger.RecordAsync(item, WorkState.Intake, null, $"re-run after escalation; {IntakeDetail(story)}", ct);
         }
         else if (item.State == WorkState.Paused)
@@ -88,7 +111,7 @@ public sealed class RunPipeline(
                 log.WriteLine($"[{item.State}]");
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             // Ctrl-C: pause where we are; the worktree and checkpoints stay so a re-run resumes.
             await ledger.RecordAsync(item, WorkState.Paused, null, "interrupted", CancellationToken.None);
@@ -97,8 +120,10 @@ public sealed class RunPipeline(
         }
         catch (Exception ex)
         {
-            await EscalateAsync(run, ex is WorkerFailedException ? ex.Message : $"{ex.GetType().Name}: {ex.Message}");
-            return await OutcomeAsync(item, ex.Message, CancellationToken.None);
+            // Includes an OperationCanceledException nobody asked for, e.g. an HttpClient timeout.
+            var commentError = await EscalateAsync(run, ex is WorkerFailedException ? ex.Message : $"{ex.GetType().Name}: {ex.Message}");
+            return await OutcomeAsync(item,
+                commentError is null ? ex.Message : $"{ex.Message}; {EscalationCommentNotPosted(commentError)}", CancellationToken.None);
         }
 
         log.WriteLine($"[{item.State}] parked; no handler for {item.State} in this phase");
@@ -116,11 +141,24 @@ public sealed class RunPipeline(
         var attempt = CurrentImplementAttempt(await ledger.HistoryAsync(item, ct));
         var session = attempt.LastOrDefault(e => e.Step == Steps.Session)?.ClaudeSessionId;
 
+        // A worker a crashed run left behind must not keep editing (or resume the same session) alongside this one.
+        if (OrphanedWorkerPid(attempt) is { } pid && await worker.StopOrphanAsync(pid, ct))
+        {
+            await ledger.CheckpointAsync(item, Steps.OrphanKilled, session, $"pid {pid}", ct);
+            log.WriteLine($"[implement] stopped worker pid {pid} left running by an earlier run");
+        }
+
         Workspace? workspace = null;
         if (attempt.Any(e => e.Step is not null))
         {
             workspace = await workspaces.ReopenAsync(repo, branch, ct);
-            if (workspace is null)
+            if (workspace is null && attempt.Any(e => e.Step == Steps.Pushed))
+            {
+                // The work is on origin: rebuild the worktree from it rather than redo it and force-push over it.
+                workspace = await workspaces.RestoreAsync(repo, branch, ct);
+                await ledger.CheckpointAsync(item, Steps.WorktreeRestored, session, $"worktree missing on resume; re-created from origin/{branch}", ct);
+            }
+            else if (workspace is null)
             {
                 await ledger.CheckpointAsync(item, Steps.WorktreeLost, session, "worktree missing on resume; starting Implement over", ct);
                 attempt = [];
@@ -139,14 +177,16 @@ public sealed class RunPipeline(
             log.WriteLine(resume is null ? "[implement] starting worker" : $"[implement] resuming claude session {resume}");
             var result = await worker.RunAsync(workspace.Path,
                 resume is null ? BuildPrompt(story, repo) : BuildResumePrompt(story), resume,
-                async (sid, c) =>
-                {
-                    if (sid != session)
+                new WorkerCallbacks(
+                    OnStarted: (pid, c) => ledger.CheckpointAsync(item, Steps.WorkerStarted, session, pid.ToString(), c),
+                    OnSession: async (sid, c) =>
                     {
-                        session = sid;
-                        await ledger.CheckpointAsync(item, Steps.Session, sid, "claude session started", c);
-                    }
-                }, ct);
+                        if (sid != session)
+                        {
+                            session = sid;
+                            await ledger.CheckpointAsync(item, Steps.Session, sid, "claude session started", c);
+                        }
+                    }), ct);
             session = result.SessionId ?? session;
             if (!result.Succeeded)
             {
@@ -199,16 +239,47 @@ public sealed class RunPipeline(
         return history.Skip(start).ToList();
     }
 
-    private async Task EscalateAsync(Run run, string reason)
+    /// <summary>The pid of the attempt's last worker if no row shows it finished.</summary>
+    private static int? OrphanedWorkerPid(List<LedgerEntry> attempt)
+    {
+        var started = attempt.FindLastIndex(e => e.Step == Steps.WorkerStarted);
+        return started >= 0 && attempt.FindLastIndex(e => e.Step == Steps.WorkerDone) < started
+            && int.TryParse(attempt[started].Detail, out var pid)
+            ? pid
+            : null;
+    }
+
+    /// <summary>Records Escalated and comments on the story. Returns why the comment failed, or null.</summary>
+    private async Task<string?> EscalateAsync(Run run, string reason)
+    {
+        var history = await ledger.HistoryAsync(run.Item, CancellationToken.None);
+        var session = history.LastOrDefault(e => e.ClaudeSessionId is not null)?.ClaudeSessionId;
+        await ledger.RecordAsync(run.Item, WorkState.Escalated, session, reason, CancellationToken.None);
+        log.WriteLine($"[escalated] {reason}");
+        return await PostEscalationCommentAsync(run, CancellationToken.None);
+    }
+
+    /// <summary>Whether the story got a comment for the item's latest escalation.</summary>
+    private static bool EscalationCommentPosted(List<LedgerEntry> history)
+    {
+        var escalated = history.FindLastIndex(e => e.Step is null && e.State == WorkState.Escalated);
+        return history.Skip(escalated + 1).Any(e => e.Step == Steps.EscalationComment && e.Detail == "posted");
+    }
+
+    private static string EscalationCommentNotPosted(string reason) => $"escalation comment NOT posted: {reason}";
+
+    /// <summary>
+    /// Comments the item's latest escalation (reason, the ledger state before it, session) on the
+    /// story and checkpoints the result. Returns why the comment failed, or null.
+    /// </summary>
+    private async Task<string?> PostEscalationCommentAsync(Run run, CancellationToken ct)
     {
         var (story, _, item) = run;
-        var history = await ledger.HistoryAsync(item, CancellationToken.None);
-        var last = history[^1];
-        var session = history.LastOrDefault(e => e.ClaudeSessionId is not null)?.ClaudeSessionId;
+        var history = await ledger.HistoryAsync(item, ct);
+        var at = history.FindLastIndex(e => e.Step is null && e.State == WorkState.Escalated);
+        var (escalated, last) = (history[at], history[at - 1]);
+        var (reason, session) = (escalated.Detail, escalated.ClaudeSessionId);
         var lastState = $"{last.State}{(last.Step is null ? "" : $" (after step {last.Step})")} at {last.RecordedAt:u}";
-
-        await ledger.RecordAsync(item, WorkState.Escalated, session, reason, CancellationToken.None);
-        log.WriteLine($"[escalated] {reason}");
 
         var comment = $"""
             [author: dark-factory] {StoryId.Format(story.Id)} escalated; a human needs to look.
@@ -221,14 +292,16 @@ public sealed class RunPipeline(
             """;
         try
         {
-            await stories.AddCommentAsync(story.Id, comment, CancellationToken.None);
-            await ledger.CheckpointAsync(item, Steps.EscalationComment, session, "posted", CancellationToken.None);
+            await stories.AddCommentAsync(story.Id, comment, ct);
         }
         catch (Exception ex)
         {
             await ledger.CheckpointAsync(item, Steps.EscalationComment, session, $"failed: {ex.Message}", CancellationToken.None);
-            log.WriteLine($"[escalated] could not comment on {StoryId.Format(story.Id)}: {ex.Message}");
+            log.WriteLine($"[escalated] could not comment on {StoryId.Format(story.Id)}: {ex.Message}; `factory run {StoryId.Format(story.Id)}` retries it");
+            return ex.Message;
         }
+        await ledger.CheckpointAsync(item, Steps.EscalationComment, session, "posted", CancellationToken.None);
+        return null;
     }
 
     private async Task<RunOutcome> OutcomeAsync(WorkItem item, string? error, CancellationToken ct)

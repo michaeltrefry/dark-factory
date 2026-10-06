@@ -172,6 +172,26 @@ public class GitWorkspaceTests
     }
 
     [Fact]
+    public async Task Restore_recreates_a_lost_worktree_from_the_pushed_branch()
+    {
+        var workspace = Workspace();
+        var first = await workspace.PrepareAsync(Repo, "factory/sc-7", CancellationToken.None);
+        File.WriteAllText(Path.Combine(first.Path, "pushed.txt"), "done");
+        Assert.True(await workspace.CommitAndPushAsync(Repo, first, "sc-7: Fix", CancellationToken.None));
+        var pushed = Git(_remote, "rev-parse", "factory/sc-7").Trim();
+        await workspace.RemoveAsync(Repo, first, CancellationToken.None);
+
+        var restored = await workspace.RestoreAsync(Repo, "factory/sc-7", CancellationToken.None);
+
+        Assert.Equal(first, restored);
+        Assert.Equal(pushed, Git(restored.Path, "rev-parse", "HEAD").Trim());
+        Assert.True(File.Exists(Path.Combine(restored.Path, "pushed.txt")));
+        // Pushing again changes nothing on the remote.
+        await workspace.CommitAndPushAsync(Repo, restored, "sc-7: Fix", CancellationToken.None);
+        Assert.Equal(pushed, Git(_remote, "rev-parse", "factory/sc-7").Trim());
+    }
+
+    [Fact]
     public async Task Refuses_branches_outside_factory_prefix()
     {
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(

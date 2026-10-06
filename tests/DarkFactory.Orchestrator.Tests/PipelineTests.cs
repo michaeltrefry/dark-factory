@@ -5,6 +5,7 @@ using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.Worker;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 
 namespace DarkFactory.Orchestrator.Tests;
 
@@ -35,14 +36,53 @@ public class WorkLedgerTests
     }
 
     [Fact]
-    public async Task Same_story_reuses_its_work_item()
+    public async Task Same_story_reuses_its_work_item_and_refresh_updates_its_title()
     {
         var (db, ledger, first) = await NewItem();
         var second = await ledger.GetOrCreateAsync("shortcut", "sc-1", "New", "o/r", "x", CancellationToken.None);
 
         Assert.Equal(first.Id, second.Id);
-        Assert.Equal("New", (await db.WorkItems.SingleAsync()).Title);
+        Assert.Equal("Fix", (await db.WorkItems.AsNoTracking().SingleAsync()).Title); // nothing written before the run lock
+        await ledger.RefreshAsync(second, "New", "o/r", CancellationToken.None);
+        Assert.Equal("New", (await db.WorkItems.AsNoTracking().SingleAsync()).Title);
         Assert.Single(await db.LedgerEntries.ToListAsync());
+    }
+
+    private sealed class FailNextSave : SaveChangesInterceptor
+    {
+        public bool Armed { get; set; }
+        public override ValueTask<InterceptionResult<int>> SavingChangesAsync(DbContextEventData eventData, InterceptionResult<int> result, CancellationToken ct = default)
+        {
+            if (Armed)
+            {
+                Armed = false;
+                throw new InvalidOperationException("database unavailable");
+            }
+            return ValueTask.FromResult(result);
+        }
+    }
+
+    [Fact]
+    public async Task Failed_save_leaves_neither_the_new_state_nor_a_tracked_row_behind()
+    {
+        var failing = new FailNextSave();
+        var db = new LedgerDbContext(new DbContextOptionsBuilder<LedgerDbContext>()
+            .UseInMemoryDatabase(Guid.NewGuid().ToString()).AddInterceptors(failing).Options);
+        var ledger = new WorkLedger(db, TimeProvider.System);
+        var item = await ledger.GetOrCreateAsync("shortcut", "sc-1", "Fix", "o/r", null, CancellationToken.None);
+        var updatedAt = item.UpdatedAt;
+
+        failing.Armed = true;
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ledger.RecordAsync(item, WorkState.Implement, "s", "lost", CancellationToken.None));
+
+        Assert.Equal((WorkState.Intake, updatedAt), (item.State, item.UpdatedAt));
+        Assert.DoesNotContain(db.ChangeTracker.Entries<LedgerEntry>(), e => e.State == EntityState.Added);
+
+        // The next write commits exactly its own row.
+        await ledger.RecordAsync(item, WorkState.Implement, null, "ok", CancellationToken.None);
+        Assert.Equal([(WorkState.Intake, (string?)null), (WorkState.Implement, "ok")],
+            (await db.LedgerEntries.AsNoTracking().OrderBy(e => e.Id).ToListAsync()).Select(e => (e.State, e.Detail)));
     }
 
     [Fact]
@@ -112,11 +152,12 @@ public class RunPipelineTests
 
     private sealed class FakeStories(ShortcutStory story, bool commentFails = false) : IStorySource
     {
+        public bool CommentFails { get; set; } = commentFails;
         public List<string> Comments { get; } = [];
         public Task<ShortcutStory> GetStoryAsync(int id, CancellationToken ct) => Task.FromResult(story with { Id = id });
         public Task AddCommentAsync(int id, string text, CancellationToken ct)
         {
-            if (commentFails)
+            if (CommentFails)
             {
                 throw new InvalidOperationException("Shortcut down");
             }
@@ -128,6 +169,11 @@ public class RunPipelineTests
     private sealed class FakeWorkspaces(bool hasChanges = true, bool worktreeExists = true) : IRepoWorkspace
     {
         public List<string> Calls { get; } = [];
+        public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct)
+        {
+            Calls.Add($"restore {repo} {branch}");
+            return Task.FromResult(new Workspace($"/wt/{branch}", branch, "main"));
+        }
         public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct)
         {
             Calls.Add($"prepare {repo} {branch}");
@@ -150,17 +196,36 @@ public class RunPipelineTests
         }
     }
 
-    private sealed record WorkerCall(string Prompt, string? Resume, Func<string, CancellationToken, Task>? OnSession);
+    private sealed record WorkerCall(string Prompt, string? Resume, WorkerCallbacks Callbacks)
+    {
+        public Task OnSession(string sid, CancellationToken ct) => Callbacks.OnSession!(sid, ct);
+    }
+
+    private const int WorkerPid = 4321;
 
     private sealed class FakeWorker(params Func<WorkerCall, Task<WorkerResult>>[] behaviours) : IWorker
     {
         public List<WorkerCall> Calls { get; } = [];
-        public Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
-            Func<string, CancellationToken, Task>? onSession, CancellationToken ct)
+        public List<int> OrphanStops { get; } = [];
+        /// <summary>Whether a stop request finds a live orphan to stop.</summary>
+        public bool OrphanAlive { get; init; }
+        /// <summary>Runs before each StopOrphanAsync returns, e.g. to look at the ledger then.</summary>
+        public Action? OnStopOrphan { get; init; }
+
+        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
+            WorkerCallbacks? callbacks, CancellationToken ct)
         {
-            var call = new WorkerCall(prompt, resumeSessionId, onSession);
+            var call = new WorkerCall(prompt, resumeSessionId, callbacks!);
             Calls.Add(call);
-            return behaviours[Calls.Count - 1](call);
+            await callbacks!.OnStarted!(WorkerPid, CancellationToken.None);
+            return await behaviours[Calls.Count - 1](call);
+        }
+
+        public Task<bool> StopOrphanAsync(int pid, CancellationToken ct)
+        {
+            OrphanStops.Add(pid);
+            OnStopOrphan?.Invoke();
+            return Task.FromResult(OrphanAlive);
         }
     }
 
@@ -168,22 +233,27 @@ public class RunPipelineTests
     {
         if (result.SessionId is not null)
         {
-            await call.OnSession!(result.SessionId, CancellationToken.None);
+            await call.OnSession(result.SessionId, CancellationToken.None);
         }
         return result;
     };
 
-    private static Func<WorkerCall, Task<WorkerResult>> StartsThenThrows(string session, Exception ex) => async call =>
+    private static Func<WorkerCall, Task<WorkerResult>> StartsThenThrows(string session, Exception ex, Action? before = null) => async call =>
     {
-        await call.OnSession!(session, CancellationToken.None);
+        await call.OnSession(session, CancellationToken.None);
+        before?.Invoke();
         throw ex;
     };
 
-    private sealed class FakePullRequests : IPullRequests
+    private sealed class FakePullRequests(Exception? throws = null) : IPullRequests
     {
         public List<(RepoRef Repo, string Head, string Base, string Title, string Body)> Opened { get; } = [];
         public Task<string> OpenAsync(RepoRef repo, string head, string baseBranch, string title, string body, CancellationToken ct)
         {
+            if (throws is not null)
+            {
+                return Task.FromException<string>(throws);
+            }
             Opened.Add((repo, head, baseBranch, title, body));
             return Task.FromResult(PrUrl);
         }
@@ -196,11 +266,12 @@ public class RunPipelineTests
         public LedgerDbContext Db { get; } = TestDb.Create();
         public FakeStories Stories { get; init; } = new(Story);
         public FakeWorkspaces Workspaces { get; init; } = new();
-        public FakePullRequests Prs { get; } = new();
+        public FakePullRequests Prs { get; init; } = new();
+        public InProcessRunLocks Locks { get; } = new();
         public WorkLedger Ledger => new(Db, TimeProvider.System);
 
         public Task<RunOutcome> Run(FakeWorker worker, CancellationToken ct = default) =>
-            new RunPipeline(Stories, Ledger, Workspaces, worker, Prs, Sandbox, TextWriter.Null).RunAsync(77, ct);
+            new RunPipeline(Stories, Ledger, Locks, Workspaces, worker, Prs, Sandbox, TextWriter.Null).RunAsync(77, ct);
 
         public async Task<WorkItem> Item() => await Db.WorkItems.SingleAsync();
         public async Task<List<LedgerEntry>> Rows() => await Db.LedgerEntries.OrderBy(e => e.Id).ToListAsync();
@@ -215,7 +286,7 @@ public class RunPipelineTests
             await ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
             foreach (var step in steps)
             {
-                await ledger.CheckpointAsync(item, step, "sess-77", null, CancellationToken.None);
+                await ledger.CheckpointAsync(item, step, "sess-77", step == RunPipeline.Steps.WorkerStarted ? "999" : null, CancellationToken.None);
             }
             return item;
         }
@@ -232,7 +303,8 @@ public class RunPipelineTests
         Assert.True(outcome.Succeeded);
         Assert.Equal((WorkState.Review, PrUrl, "sess-77"), (outcome.State, outcome.PullRequestUrl, outcome.SessionId));
         Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Review], await h.Transitions());
-        Assert.Equal(["session", "worker-done", "pushed"], await h.Steps());
+        Assert.Equal(["worker-started", "session", "worker-done", "pushed"], await h.Steps());
+        Assert.Equal(WorkerPid.ToString(), (await h.Rows()).Single(r => r.Step == "worker-started").Detail);
         var rows = await h.Rows();
         Assert.Equal(("sess-77", PrUrl), (rows[^1].ClaudeSessionId, rows[^1].Detail));
         Assert.True(rows.Zip(rows.Skip(1)).All(p => p.First.RecordedAt <= p.Second.RecordedAt));
@@ -253,7 +325,7 @@ public class RunPipelineTests
         List<LedgerEntry>? rowsWhileRunning = null;
         var worker = new FakeWorker(async call =>
         {
-            await call.OnSession!("sess-77", CancellationToken.None);
+            await call.OnSession("sess-77", CancellationToken.None);
             rowsWhileRunning = await h.Rows();
             return Ok;
         });
@@ -298,14 +370,55 @@ public class RunPipelineTests
     }
 
     [Fact]
-    public async Task Escalation_comment_failure_is_recorded_not_swallowed()
+    public async Task Escalation_comment_failure_is_recorded_and_reported_in_the_outcome()
     {
         var h = new Harness { Stories = new(Story, commentFails: true) };
-        await h.Run(new FakeWorker(Reports(new WorkerResult("sess-x", 2, true, null, null, ""))));
+        var outcome = await h.Run(new FakeWorker(Reports(new WorkerResult("sess-x", 2, true, null, null, ""))));
 
         var last = (await h.Rows())[^1];
         Assert.Equal(("escalation-comment", WorkState.Escalated), (last.Step, last.State));
         Assert.Contains("Shortcut down", last.Detail);
+        Assert.EndsWith("escalation comment NOT posted: Shortcut down", outcome.Error);
+    }
+
+    [Fact]
+    public async Task Rerun_posts_a_failed_escalation_comment_before_requeuing()
+    {
+        var h = new Harness { Stories = new(Story, commentFails: true) };
+        var worker = new FakeWorker(Reports(new WorkerResult("sess-x", 2, true, null, "Not logged in", "")), Reports(Ok));
+        await h.Run(worker);
+        Assert.Empty(h.Stories.Comments);
+
+        // Shortcut still down: the item stays Escalated and nothing runs.
+        var stillDown = await h.Run(worker);
+        Assert.Equal(WorkState.Escalated, stillDown.State);
+        Assert.Equal("escalation comment NOT posted: Shortcut down", stillDown.Error);
+        Assert.Single(worker.Calls);
+
+        h.Stories.CommentFails = false;
+        var outcome = await h.Run(worker);
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        var comment = Assert.Single(h.Stories.Comments);
+        Assert.Contains("Not logged in", comment);
+        Assert.Contains("Last ledger state: Implement (after step session)", comment);
+        Assert.Contains("sess-x", comment);
+        var rows = await h.Rows();
+        var posted = rows.FindIndex(r => r.Step == "escalation-comment" && r.Detail == "posted");
+        Assert.Equal(WorkState.Escalated, rows[posted].State);
+        Assert.Equal(posted + 1, rows.FindIndex(r => r.Step is null && r.State == WorkState.Intake && r.Detail!.StartsWith("re-run")));
+    }
+
+    [Fact]
+    public async Task Unrequested_cancellation_such_as_an_http_timeout_escalates_instead_of_pausing()
+    {
+        var h = new Harness { Prs = new(new TaskCanceledException("The request was canceled due to the configured HttpClient.Timeout")) };
+
+        var outcome = await h.Run(new FakeWorker(Reports(Ok)), CancellationToken.None);
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Escalated], await h.Transitions());
+        Assert.Contains("HttpClient.Timeout", Assert.Single(h.Stories.Comments));
     }
 
     [Fact]
@@ -324,9 +437,10 @@ public class RunPipelineTests
     public async Task Interrupt_pauses_keeps_the_worktree_and_a_rerun_resumes_the_same_session()
     {
         var h = new Harness();
-        var worker = new FakeWorker(StartsThenThrows("sess-77", new OperationCanceledException()), Reports(Ok));
+        using var ctrlC = new CancellationTokenSource();
+        var worker = new FakeWorker(StartsThenThrows("sess-77", new OperationCanceledException(ctrlC.Token), ctrlC.Cancel), Reports(Ok));
 
-        await Assert.ThrowsAsync<OperationCanceledException>(() => h.Run(worker));
+        await Assert.ThrowsAsync<OperationCanceledException>(() => h.Run(worker, ctrlC.Token));
         Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Paused], await h.Transitions());
         Assert.DoesNotContain(h.Workspaces.Calls, c => c.StartsWith("remove"));
 
@@ -382,6 +496,68 @@ public class RunPipelineTests
         Assert.Empty(worker.Calls);
         Assert.DoesNotContain(h.Workspaces.Calls, c => c.StartsWith("push"));
         Assert.Single(h.Prs.Opened);
+    }
+
+    [Fact]
+    public async Task Resume_stops_the_crashed_runs_worker_before_starting_the_next()
+    {
+        var h = new Harness();
+        await h.Crashed(RunPipeline.Steps.WorkerStarted, RunPipeline.Steps.Session);
+        List<LedgerEntry>? rowsAtStop = null;
+        var worker = new FakeWorker(Reports(Ok)) { OrphanAlive = true, OnStopOrphan = () => rowsAtStop = h.Rows().Result };
+
+        var outcome = await h.Run(worker);
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal([999], worker.OrphanStops);
+        Assert.DoesNotContain(rowsAtStop!, r => r.Step == "worker-started" && r.Detail == WorkerPid.ToString()); // stopped before the new worker
+        var killed = (await h.Rows()).Single(r => r.Step == "orphan-killed");
+        Assert.Equal("pid 999", killed.Detail);
+        Assert.Equal(["worker-started", "session", "orphan-killed", "worker-started", "worker-done", "pushed"], await h.Steps());
+    }
+
+    [Fact]
+    public async Task Resume_after_the_worker_finished_does_not_look_for_an_orphan()
+    {
+        var h = new Harness();
+        await h.Crashed(RunPipeline.Steps.WorkerStarted, RunPipeline.Steps.Session, RunPipeline.Steps.WorkerDone);
+        var worker = new FakeWorker { OrphanAlive = true };
+
+        await h.Run(worker);
+
+        Assert.Empty(worker.OrphanStops);
+        Assert.DoesNotContain("orphan-killed", await h.Steps());
+    }
+
+    [Fact]
+    public async Task Gone_orphan_is_not_recorded_as_killed()
+    {
+        var h = new Harness();
+        await h.Crashed(RunPipeline.Steps.WorkerStarted, RunPipeline.Steps.Session);
+        var worker = new FakeWorker(Reports(Ok)) { OrphanAlive = false };
+
+        await h.Run(worker);
+
+        Assert.Equal([999], worker.OrphanStops);
+        Assert.DoesNotContain("orphan-killed", await h.Steps());
+    }
+
+    [Fact]
+    public async Task Lost_worktree_after_push_is_restored_from_the_pushed_branch_and_nothing_is_redone()
+    {
+        var h = new Harness { Workspaces = new(worktreeExists: false) };
+        await h.Crashed(RunPipeline.Steps.Session, RunPipeline.Steps.WorkerDone, RunPipeline.Steps.Pushed);
+        var worker = new FakeWorker();
+
+        var outcome = await h.Run(worker);
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Empty(worker.Calls);
+        Assert.Equal(["reopen michaeltrefry/dark-factory-sandbox factory/sc-77", "restore michaeltrefry/dark-factory-sandbox factory/sc-77"],
+            h.Workspaces.Calls);
+        Assert.Equal("worktree-restored", (await h.Steps())[^1]);
+        Assert.Single(h.Prs.Opened);
+        Assert.Equal(WorkState.Review, (await h.Item()).State);
     }
 
     [Fact]

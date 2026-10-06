@@ -17,6 +17,7 @@ await db.Database.MigrateAsync();
 var pipeline = new RunPipeline(
     new FileStories(Path.Combine(workDir, "comments.log")),
     new WorkLedger(db, TimeProvider.System),
+    new PostgresRunLocks(connection),
     new GitWorkspace(Path.Combine(workDir, "work"), _ => Path.Combine(workDir, "origin.git"), (_, _) => Task.FromResult<string?>(null)),
     new ClaudeWorker(Path.Combine(workDir, "fake-claude.sh"), new Uri("http://127.0.0.1:9/"), "rk_test", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(2)),
     new FilePullRequests(Path.Combine(workDir, "prs.log")),

@@ -11,6 +11,12 @@ public interface IRepoWorkspace
     Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct);
 
     /// <summary>
+    /// Re-creates a story's worktree from its already-pushed branch (<c>origin/&lt;branch&gt;</c>)
+    /// instead of the base branch, so pushed work is continued rather than redone.
+    /// </summary>
+    Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct);
+
+    /// <summary>
     /// Returns a story's existing worktree as left behind by an interrupted run, without
     /// touching it, or null when it is gone or no longer on <paramref name="branch"/>.
     /// </summary>
@@ -47,7 +53,13 @@ public sealed class GitWorkspace(
 
     public static string GitHubRemote(RepoRef repo) => $"https://github.com/{repo.Owner}/{repo.Name}.git";
 
-    public async Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct)
+    public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct) =>
+        CreateWorktreeAsync(repo, branch, baseBranch => $"origin/{baseBranch}", ct);
+
+    public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct) =>
+        CreateWorktreeAsync(repo, branch, _ => $"origin/{branch}", ct);
+
+    private async Task<Workspace> CreateWorktreeAsync(RepoRef repo, string branch, Func<string, string> startPoint, CancellationToken ct)
     {
         EnsureFactoryBranch(branch);
         var clone = Path.Combine(workRoot, "repos", repo.Owner, repo.Name);
@@ -72,7 +84,7 @@ public sealed class GitWorkspace(
             await Git(clone, null, ct, "worktree", "remove", "--force", worktree);
         }
         await Git(clone, null, ct, "worktree", "prune");
-        await Git(clone, null, ct, "worktree", "add", "-B", branch, worktree, $"origin/{baseBranch}");
+        await Git(clone, null, ct, "worktree", "add", "-B", branch, worktree, startPoint(baseBranch));
         return new Workspace(worktree, branch, baseBranch);
     }
 

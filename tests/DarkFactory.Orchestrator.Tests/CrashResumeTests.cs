@@ -1,13 +1,14 @@
 using System.Diagnostics;
 using DarkFactory.Orchestrator.Ledger;
+using DarkFactory.Orchestrator.Tests.Support;
 using Microsoft.EntityFrameworkCore;
-using Npgsql;
 
 namespace DarkFactory.Orchestrator.Tests;
 
 /// <summary>
 /// E3 crash resume, end to end with real processes: the orchestrator (DarkFactory.CrashHost)
-/// is SIGKILLed while its worker runs, then restarted against the same Postgres ledger.
+/// is SIGKILLed while its worker runs, then restarted at once against the same Postgres ledger.
+/// The orphaned worker is silent, so nothing (no SIGPIPE) ends it but the restarted run.
 /// Needs the compose Postgres on localhost:5434 (CI provides it as a service).
 /// </summary>
 [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
@@ -16,46 +17,31 @@ public sealed class CrashResumeTests : IAsyncLifetime
     private const int Story = 4242;
     private const string Session = "sess-crash-1";
     private readonly string _dir = Directory.CreateTempSubdirectory("df-crash-").FullName;
-    private readonly string _database = $"df_crash_{Guid.NewGuid():N}";
-    private NpgsqlConnectionStringBuilder _admin = null!;
+    private TempPostgresDatabase? _db;
     private string _ledger = null!;
 
     public async ValueTask InitializeAsync()
     {
-        _admin = new NpgsqlConnectionStringBuilder(FactoryOptions.LoadConfiguration().GetLedgerConnectionString());
-        try
-        {
-            await using var conn = new NpgsqlConnection(_admin.ConnectionString);
-            await conn.OpenAsync();
-            await using var create = new NpgsqlCommand($"CREATE DATABASE {_database}", conn);
-            await create.ExecuteNonQueryAsync();
-        }
-        catch (Exception ex) when (ex is NpgsqlException or System.Net.Sockets.SocketException && Environment.GetEnvironmentVariable("CI") is null)
-        {
-            Assert.Skip($"Ledger Postgres not reachable ({ex.Message}); run `docker compose up -d`.");
-        }
-        _ledger = new NpgsqlConnectionStringBuilder(_admin.ConnectionString) { Database = _database }.ConnectionString;
+        _db = await TempPostgresDatabase.CreateAsync("df_crash");
+        _ledger = _db.ConnectionString;
     }
 
     public async ValueTask DisposeAsync()
     {
-        foreach (var pid in File.Exists(Pids) ? File.ReadAllLines(Pids) : [])
+        foreach (var pid in new[] { Pids, FirstRun }.Where(File.Exists).SelectMany(File.ReadAllLines))
         {
             TryKill(int.Parse(pid));
         }
-        if (_ledger is null)
+        if (_db is not null)
         {
-            return;
+            await _db.DisposeAsync();
         }
-        NpgsqlConnection.ClearAllPools();
-        await using var conn = new NpgsqlConnection(_admin.ConnectionString);
-        await conn.OpenAsync();
-        await using var drop = new NpgsqlCommand($"DROP DATABASE IF EXISTS {_database} WITH (FORCE)", conn);
-        await drop.ExecuteNonQueryAsync();
     }
 
     private string Pids => Path.Combine(_dir, "worker.pids");
     private string Invocations => Path.Combine(_dir, "invocations.log");
+    /// <summary>The first (orphaned) worker's pid and its child's.</summary>
+    private string FirstRun => Path.Combine(_dir, "first-run.pids");
 
     [Fact]
     public async Task Killed_during_implement_resumes_the_same_claude_session_and_opens_exactly_one_pr()
@@ -64,7 +50,7 @@ public sealed class CrashResumeTests : IAsyncLifetime
         var origin = SeedOrigin();
         WriteFakeClaude();
 
-        // Run 1: the worker starts, streams its session id, then keeps working until the orchestrator dies.
+        // Run 1: the worker starts, streams its session id, then works silently; the orchestrator dies.
         using (var first = StartHost())
         {
             await WaitForAsync(async () => (await Rows()).Any(r => r.Step == RunPipeline.Steps.Session), first, "session checkpoint", ct);
@@ -74,21 +60,24 @@ public sealed class CrashResumeTests : IAsyncLifetime
         var crashed = await Rows();
         Assert.Equal(WorkState.Implement, crashed.Last(r => r.Step is null).State);
         Assert.Equal(Session, crashed.Single(r => r.Step == RunPipeline.Steps.Session).ClaudeSessionId);
-        // The orphaned worker dies on its next write to the dead orchestrator's pipe.
-        var workerPid = int.Parse(File.ReadAllLines(Pids).Single());
-        await WaitForAsync(() => Task.FromResult(!IsAlive(workerPid)), null, "orphaned worker to exit", ct);
+        var orphan = File.ReadAllLines(FirstRun).Select(int.Parse).ToArray();
+        Assert.Equal(orphan[0].ToString(), crashed.Single(r => r.Step == RunPipeline.Steps.WorkerStarted).Detail);
+        Assert.All(orphan, pid => Assert.True(IsAlive(pid), $"orphan {pid} should outlive the orchestrator"));
 
-        // Run 2: restart against the same ledger.
+        // Run 2: restart against the same ledger at once; it must stop the orphan before resuming.
         using (var second = StartHost())
         {
             await second.WaitForExitAsync(ct);
             Assert.True(second.ExitCode == 0, await second.StandardOutput.ReadToEndAsync(ct) + await second.StandardError.ReadToEndAsync(ct));
         }
 
-        Assert.Equal(["fresh", $"resume {Session}"], File.ReadAllLines(Invocations));
+        // The resumed claude checked, as it started, that the first one (and its child) were already dead.
+        Assert.Equal(["fresh", "orphans gone", $"resume {Session}"], File.ReadAllLines(Invocations));
         var rows = await Rows();
         Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Review], rows.Where(r => r.Step is null).Select(r => r.State));
-        Assert.Equal(["session", "worker-done", "pushed"], rows.Where(r => r.Step is not null).Select(r => r.Step));
+        Assert.Equal(["worker-started", "session", "orphan-killed", "worker-started", "worker-done", "pushed"],
+            rows.Where(r => r.Step is not null).Select(r => r.Step));
+        Assert.Equal($"pid {orphan[0]}", rows.Single(r => r.Step == RunPipeline.Steps.OrphanKilled).Detail);
         Assert.Equal(Session, rows[^1].ClaudeSessionId);
         var pr = Assert.Single(File.ReadAllLines(Path.Combine(_dir, "prs.log")));
         Assert.Equal($"factory/sc-{Story}\thttps://github.com/acme/widgets/pull/1", pr);
@@ -104,7 +93,7 @@ public sealed class CrashResumeTests : IAsyncLifetime
             await third.WaitForExitAsync(ct);
             Assert.Equal(0, third.ExitCode);
         }
-        Assert.Equal(2, File.ReadAllLines(Invocations).Length);
+        Assert.Equal(3, File.ReadAllLines(Invocations).Length);
         Assert.Single(File.ReadAllLines(Path.Combine(_dir, "prs.log")));
         Assert.Equal(rows.Count, (await Rows()).Count);
     }
@@ -149,8 +138,9 @@ public sealed class CrashResumeTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// A stand-in for `claude -p --output-format stream-json`. Fresh: announces its session,
-    /// writes a file, then streams progress forever. With --resume: finishes the work.
+    /// A stand-in for `claude -p --output-format stream-json`. Fresh: writes a file, starts a
+    /// long-running child (a "tool"), announces its session, then goes silent. With --resume:
+    /// records whether the first run's processes are dead, then finishes the work.
     /// </summary>
     private void WriteFakeClaude()
     {
@@ -159,6 +149,9 @@ public sealed class CrashResumeTests : IAsyncLifetime
             #!/bin/sh
             echo $$ >> "{{Pids}}"
             if printf '%s ' "$@" | grep -q -- '--resume {{Session}}'; then
+              alive=""
+              for p in $(cat "{{FirstRun}}"); do kill -0 "$p" 2>/dev/null && alive="$alive $p"; done
+              if [ -z "$alive" ]; then echo "orphans gone" >> "{{Invocations}}"; else echo "orphans alive:$alive" >> "{{Invocations}}"; fi
               echo "resume {{Session}}" >> "{{Invocations}}"
               echo '{"type":"system","subtype":"init","session_id":"{{Session}}"}'
               echo done > after-resume.txt
@@ -167,11 +160,10 @@ public sealed class CrashResumeTests : IAsyncLifetime
             fi
             echo fresh >> "{{Invocations}}"
             echo wip > before-crash.txt
+            sleep 600 &
+            printf '%s\n%s\n' $$ $! > "{{FirstRun}}"
             echo '{"type":"system","subtype":"init","session_id":"{{Session}}"}'
-            while true; do
-              echo '{"type":"assistant","message":{"content":[]},"session_id":"{{Session}}"}' || exit 141
-              sleep 0.2
-            done
+            wait
             """);
         File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
     }

@@ -59,3 +59,29 @@ public static class TestDb
     public static LedgerDbContext Create() =>
         new(new DbContextOptionsBuilder<LedgerDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options);
 }
+
+/// <summary>In-process stand-in for <see cref="PostgresRunLocks"/>; one instance per shared ledger.</summary>
+public sealed class InProcessRunLocks : IRunLocks
+{
+    private readonly HashSet<long> _held = [];
+
+    public Task<IAsyncDisposable?> TryAcquireAsync(long workItemId, CancellationToken ct)
+    {
+        lock (_held)
+        {
+            return Task.FromResult<IAsyncDisposable?>(_held.Add(workItemId) ? new Release(this, workItemId) : null);
+        }
+    }
+
+    private sealed class Release(InProcessRunLocks owner, long id) : IAsyncDisposable
+    {
+        public ValueTask DisposeAsync()
+        {
+            lock (owner._held)
+            {
+                owner._held.Remove(id);
+            }
+            return ValueTask.CompletedTask;
+        }
+    }
+}

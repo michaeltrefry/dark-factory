@@ -25,6 +25,8 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
         /// <inheritdoc />
         protected override void Down(MigrationBuilder migrationBuilder)
         {
+            // Without the Step column, checkpoint rows would read as duplicate transitions.
+            migrationBuilder.Sql("""DELETE FROM ledger_entries WHERE "Step" IS NOT NULL;""");
             migrationBuilder.Sql("""UPDATE work_items SET "State" = 'Failed' WHERE "State" NOT IN ('Intake', 'Implement', 'Review');""");
             migrationBuilder.Sql("""UPDATE ledger_entries SET "State" = 'Failed' WHERE "State" NOT IN ('Intake', 'Implement', 'Review');""");
             migrationBuilder.DropColumn(

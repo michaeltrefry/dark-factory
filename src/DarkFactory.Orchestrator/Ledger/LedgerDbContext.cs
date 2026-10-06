@@ -14,6 +14,13 @@ public sealed class WorkItem
     public WorkState State { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
+
+    /// <summary>
+    /// Optimistic concurrency token, bumped on every write: a writer holding a stale copy of
+    /// the item fails its save instead of overwriting another run's state.
+    /// </summary>
+    public long Version { get; set; }
+
     public List<LedgerEntry> Entries { get; set; } = [];
 }
 
@@ -50,6 +57,7 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
             e.Property(x => x.ExternalId).HasMaxLength(64);
             e.Property(x => x.Repo).HasMaxLength(200);
             e.Property(x => x.State).HasConversion<string>().HasMaxLength(32);
+            e.Property(x => x.Version).IsConcurrencyToken();
             e.HasIndex(x => new { x.Source, x.ExternalId }).IsUnique();
             e.HasMany(x => x.Entries).WithOne().HasForeignKey(x => x.WorkItemId);
         });
