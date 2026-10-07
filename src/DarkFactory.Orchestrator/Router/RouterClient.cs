@@ -34,17 +34,27 @@ public sealed record SubscriptionUsage(
     /// <summary>
     /// Plans enrolled on the router for this key (<c>router login claude|codex</c>: source <c>managed</c>, or
     /// <c>shared</c> by another member) and not disabled. Credentials presented or observed from a client's own login
-    /// do not count: in <c>router-key</c> mode the worker presents none.
+    /// do not count: in <c>router-key</c> mode the worker presents none. Nor does a plan the router reports not
+    /// <c>routable</c> (e.g. <c>reconnect_required</c>): the router cannot route onto it until a human reconnects it.
     /// </summary>
     public int EnrolledCredentials =>
-        Credentials?.Count(c => c.Source is "managed" or "shared" && c.Enabled != false) ?? 0;
+        Enrolled.Count(c => c.Enabled != false && c.Routable);
+
+    /// <summary>Enrolled plans (managed or shared) that are enabled but that the router cannot route onto.</summary>
+    public IEnumerable<UsageCredential> UnroutableEnrolledCredentials =>
+        Enrolled.Where(c => c.Enabled != false && !c.Routable);
+
+    private IEnumerable<UsageCredential> Enrolled =>
+        Credentials?.Where(c => c.Source is "managed" or "shared") ?? [];
 }
 
 /// <summary>One credential of the router's usage report, as far as the enrollment check uses it (no token is ever reported).</summary>
 public sealed record UsageCredential(
     [property: JsonPropertyName("provider")] string Provider,
     [property: JsonPropertyName("source")] string Source,
-    [property: JsonPropertyName("enabled")] bool? Enabled = null);
+    [property: JsonPropertyName("enabled")] bool? Enabled = null,
+    [property: JsonPropertyName("routable")] bool Routable = false,
+    [property: JsonPropertyName("state")] string? State = null);
 
 /// <summary>Where the factory reads whether its plans are exhausted.</summary>
 public interface IUsageSource

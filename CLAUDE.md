@@ -81,9 +81,12 @@ spares the helper's own pid — never `kill -1`, which on macOS kills the sender
 step when not running as the sandbox user), then exits with the worker's status. So `_factory` is
 single-tenant: one sandboxed `factory run` per machine (`WorkerLock`, `<work root>/.factory-run.lock`). Run
 `sudo scripts/setup-worker-user.sh` once (re-run it after a helper change: the installed helper's allowlist is
-`ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_AUTH_TOKEN`); `--remove-worker-login` (opt-in) then deletes
-`_factory`'s own Claude login (`~/.claude/.credentials.json`, keychain item `Claude Code-credentials`), as `_factory`,
-signalling nothing. The live probe tests (`LiveWorkerSandboxTests`) run only with
+`ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_AUTH_TOKEN`; `EnsureReadyAsync` probes with the real
+variable names, so a stale helper fails start-up naming the re-run). Every normal (re)run kills every `_factory`
+process (its toolchain check runs through the helper): close `_factory` sessions and stop `factory work` first.
+`--remove-worker-login` (opt-in) is a standalone mode: it runs none of the setup (no helper, no toolchain check, no
+installs) and only deletes `_factory`'s own Claude login (`~/.claude/.credentials.json`, keychain item
+`Claude Code-credentials`), as `_factory`, signalling nothing. The live probe tests (`LiveWorkerSandboxTests`) run only with
 `FACTORY_SANDBOX_LIVE=1`, since they kill every `_factory` process (including an interactive `_factory` login).
 
 Secrets in the keychain: `security add-generic-password -w` at its interactive prompt truncates at 128 chars

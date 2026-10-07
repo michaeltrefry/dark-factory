@@ -333,6 +333,20 @@ public class RouterEnrollmentCheckTests
     }
 
     [Fact]
+    public async Task An_enabled_plan_the_router_cannot_route_onto_is_not_counted_and_fails_naming_the_reconnect()
+    {
+        const string credential = """{"provider":"claude","source":"managed","credential_key":"a","routable":false,"enabled":true,"state":"reconnect_required"}""";
+
+        var error = await CheckAsync(Options("router-key"), Router(credential));
+
+        Assert.NotNull(error);
+        Assert.Contains("not routable (claude reconnect_required)", error);
+        Assert.Contains("Reconnect the plan", error);
+        Assert.Contains("router login claude", error);
+        Assert.Contains("router login codex", error);
+    }
+
+    [Fact]
     public async Task Router_key_mode_fails_when_the_usage_report_cannot_be_read()
     {
         var error = await CheckAsync(Options("router-key"), new FakeApi()); // 404: no usage route

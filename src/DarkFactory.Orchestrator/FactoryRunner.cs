@@ -66,8 +66,16 @@ public static class FactoryRunner
             return $"Worker:Auth=router-key, but the router's enrolled plans could not be read from {options.RouterBaseUrl} "
                 + $"(GET /v1/subscriptions/usage: {ex.Message}). Check that the router is up and Router:Key is right. {remedy}";
         }
-        return report.EnrolledCredentials > 0
-            ? null
+        if (report.EnrolledCredentials > 0)
+        {
+            return null;
+        }
+        var unroutable = report.UnroutableEnrolledCredentials.ToList();
+        return unroutable.Count > 0
+            ? $"Worker:Auth=router-key, but every enrolled plan the router at {options.RouterBaseUrl} lists for this router key is "
+                + $"not routable ({string.Join(", ", unroutable.Select(c => $"{c.Provider} {c.State ?? "unknown state"}"))}), so every "
+                + "worker model call would fail. Reconnect the plan on the router (`router login claude` for a Claude plan, "
+                + "`router login codex` for a Codex plan), then start again."
             : $"Worker:Auth=router-key, but the router at {options.RouterBaseUrl} lists no enrolled, enabled plan for this router key "
                 + $"(GET /v1/subscriptions/usage has no managed or shared credential), so every worker model call would fail. {remedy}";
     }
@@ -93,7 +101,7 @@ public static class FactoryRunner
         using var sandboxLock = sandbox is null ? null : await FactoryWide("the worker run lock", () => Task.FromResult(WorkerLock.Acquire(options.WorkRoot)));
         if (sandbox is not null)
         {
-            await FactoryWide("the worker sandbox", async () => { await sandbox.EnsureReadyAsync(ct); return true; });
+            await EnsureSandboxReadyAsync(sandbox, options.WorkerAuth, ct);
         }
 
         using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
@@ -132,6 +140,10 @@ public static class FactoryRunner
 
         return await pipeline.RunAsync(storyId, ct);
     }
+
+    /// <summary>The sandbox readiness probe, a factory-wide failure (E10): a stale helper fails the factory once, not every item.</summary>
+    internal static Task EnsureSandboxReadyAsync(WorkerSandbox sandbox, WorkerAuth auth, CancellationToken ct) =>
+        FactoryWide("the worker sandbox", async () => { await sandbox.EnsureReadyAsync(auth, ct); return true; });
 
     /// <summary>Runs a set-up step every item shares; its failure is the factory's, not the item's (E10).</summary>
     private static async Task<T> FactoryWide<T>(string what, Func<Task<T>> step)
