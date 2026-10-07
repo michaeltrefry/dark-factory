@@ -118,9 +118,13 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     }
 
     /// <summary>Runs a short command as the worker user and returns (exit code, stdout, stderr).</summary>
-    public async Task<(int ExitCode, string Stdout, string Stderr)> RunAsync(string workingDirectory, string program, IEnumerable<string> args, CancellationToken ct)
+    public Task<(int ExitCode, string Stdout, string Stderr)> RunAsync(string workingDirectory, string program, IEnumerable<string> args, CancellationToken ct) =>
+        RunAsync(workingDirectory, program, args, new Dictionary<string, string>(), ct);
+
+    private async Task<(int ExitCode, string Stdout, string Stderr)> RunAsync(
+        string workingDirectory, string program, IEnumerable<string> args, IReadOnlyDictionary<string, string> variables, CancellationToken ct)
     {
-        using var process = Start(workingDirectory, program, args, new Dictionary<string, string>());
+        using var process = Start(workingDirectory, program, args, variables);
         var stdout = process.StandardOutput.ReadToEndAsync(ct);
         var stderr = process.StandardError.ReadToEndAsync(ct);
         try
@@ -134,17 +138,28 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         return (process.ExitCode, await stdout, await stderr);
     }
 
-    /// <summary>Fails fast, with the setup command, when the user, helper or sudoers rule is missing.</summary>
-    public async Task EnsureReadyAsync(CancellationToken ct)
+    /// <summary>
+    /// Fails fast, with the setup command, when the user, helper or sudoers rule is missing, or when the installed helper
+    /// is stale: the probe hands it the router variable names a worker launch uses for <paramref name="auth"/> (dummy values),
+    /// so a helper whose allowlist refuses one fails here once instead of failing every worker launch.
+    /// </summary>
+    public async Task EnsureReadyAsync(WorkerAuth auth, CancellationToken ct)
     {
+        var probeVariables = ClaudeWorker.BuildRouterVariables(new Uri("http://127.0.0.1/"), "probe", auth);
         (int ExitCode, string Stdout, string Stderr) probe;
         try
         {
-            probe = await RunAsync("/", "/usr/bin/id", ["-un"], ct);
+            probe = await RunAsync("/", "/usr/bin/id", ["-un"], probeVariables, ct);
         }
         catch (System.ComponentModel.Win32Exception ex)
         {
             throw new InvalidOperationException($"Worker sandbox unavailable ({ex.Message}); {SetupHint}.", ex);
+        }
+        if (probe.ExitCode == 64 && probe.Stderr.Contains("non-allowlisted variable", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"The installed launch helper {HelperPath} is stale: it refuses the worker's router variables ({probe.Stderr.Trim()}); "
+                + "re-run `sudo scripts/setup-worker-user.sh` to install the current helper.");
         }
         if (probe.ExitCode != 0 || probe.Stdout.Trim() != User)
         {

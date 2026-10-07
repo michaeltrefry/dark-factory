@@ -76,7 +76,7 @@ internal static class Harness
         {
             try
             {
-                sandbox.EnsureReadyAsync(CancellationToken.None).GetAwaiter().GetResult();
+                sandbox.EnsureReadyAsync(Options.WorkerAuth, CancellationToken.None).GetAwaiter().GetResult();
             }
             catch (InvalidOperationException ex)
             {

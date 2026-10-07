@@ -187,7 +187,11 @@ printf 'add-generic-password -U -s dark-factory -a router-key -w %s\n' "$(pbpast
 [ "$(security find-generic-password -s dark-factory -a router-key -w)" = "$(pbpaste)" ] && echo stored-ok || echo MISMATCH
 #    (use -a shortcut-api-token to check the Shortcut token the same way)
 
-# 4. Worker sandbox user, launch helper, sudoers rule and work root (see below)
+# 4. Worker sandbox user, launch helper, sudoers rule and work root (see below). A (re)run KILLS EVERY
+#    _factory PROCESS (its toolchain check runs through the helper, whose exit kills them all): close any
+#    `sudo -u _factory` session and stop `factory work` first. Re-run it after pulling a helper change:
+#    `factory run`/`work` refuse to start while the installed helper's allowlist refuses a router variable
+#    ("... is stale ... re-run `sudo scripts/setup-worker-user.sh`").
 sudo scripts/setup-worker-user.sh
 
 # 5. Worker model auth. Default Worker__Auth=router-key: the worker holds no Anthropic/OpenAI credential,
@@ -195,11 +199,12 @@ sudo scripts/setup-worker-user.sh
 #    (michaeltrefry/router at Router:BaseUrl) for the same router key:
 router login claude     # your Claude Pro/Max plan
 router login codex      # your ChatGPT/Codex plan
-#    then delete any Claude login _factory still has (opt-in; deletes only its credentials file and
-#    keychain item, stops no process):
+#    then delete any Claude login _factory still has (opt-in, standalone: runs none of the setup, no helper,
+#    no toolchain check; deletes only its credentials file and keychain item, as _factory; signals no process):
 sudo scripts/setup-worker-user.sh --remove-worker-login
 #    `factory run` / `factory work` refuse to start until the router's GET /v1/subscriptions/usage lists
-#    an enabled enrolled (managed or shared) plan for the key.
+#    an enabled, routable, enrolled (managed or shared) plan for the key. A plan in reconnect_required is
+#    not routable: reconnect it with `router login claude` (or `router login codex`).
 #    Fallback, weaker (violates E5: the worker then holds a Claude login): Worker__Auth=claude-login, and
 #    log the _factory user in once (never copy your own credentials):
 #      sudo -u _factory -H /Users/_factory/.local/bin/claude   # then /login, then /exit
@@ -210,7 +215,8 @@ dotnet run --project src/DarkFactory.Orchestrator -- dashboard set-password
 
 ### Worker sandbox
 
-`scripts/setup-worker-user.sh` (run once with sudo; safe to re-run) sets up:
+`scripts/setup-worker-user.sh` (run once with sudo; safe to re-run, but every run ends its toolchain check by
+killing every `_factory` process, so close `_factory` sessions and stop `factory work` first) sets up:
 
 - **`_factory`**: a hidden role account (UID/GID in 400–499, own group, shell `/usr/bin/false`,
   home `/Users/_factory`, mode 0700) with its own Claude Code install in `~/.local/bin`.

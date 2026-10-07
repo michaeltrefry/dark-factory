@@ -3,9 +3,14 @@
 #
 #   sudo scripts/setup-worker-user.sh [--owner <user>] [--worker <user>] [--work-root <dir>] [--remove-worker-login]
 #
-# --remove-worker-login (opt-in, after the setup): deletes the worker user's own Claude Code login — its
+# --remove-worker-login (opt-in, standalone): deletes only the worker user's own Claude Code login — its
 # ~/.claude/.credentials.json and its 'Claude Code-credentials' keychain item — so the worker holds no
-# provider credential (E5; Worker:Auth=router-key, the default). It deletes only those; it never stops a process.
+# provider credential (E5; Worker:Auth=router-key, the default). It skips the setup entirely (no installs,
+# no helper, no toolchain check), so it signals no process.
+#
+# A normal (re)run KILLS EVERY PROCESS OF THE WORKER USER: its toolchain check runs commands through the
+# launch helper, and each helper exit kills all of that user's processes (a running `factory work` worker,
+# an interactive `sudo -u _factory` session). Close those sessions and stop `factory work` first.
 #
 # Creates a hidden role account (default _factory) whose workers:
 #   - cannot traverse the owner's home (so no ~/.ssh, ~/.config/gh or login keychain),
@@ -39,10 +44,46 @@ done
 [ "$(uname -s)" = Darwin ] || { echo "macOS only." >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || { echo "Run with sudo." >&2; exit 1; }
 [[ $worker =~ ^_?[a-z][a-z0-9_-]*$ ]] || { echo "Invalid worker user name: $worker" >&2; exit 64; }
+worker_home=/Users/$worker
+
+say() { echo "==> $*"; }
+
+# Commands run as the worker start in a directory it can enter (sudo keeps our cwd, which
+# may be under the owner's home that step 2 closes to it).
+cd /
+as_worker() { sudo -u "$worker" env -i "HOME=$worker_home" PATH=/usr/bin:/bin:/usr/sbin:/sbin "$@"; }
+
+# --remove-worker-login: delete the worker's own Claude login and nothing else. Never through the
+# launch helper (its exit kills every process of the worker user), and done as the worker, never as
+# root (root following a symlink the worker planted in its home could delete anything).
+if [ "$remove_worker_login" -eq 1 ]; then
+    id "$worker" >/dev/null 2>&1 || { echo "No such worker user: $worker" >&2; exit 1; }
+    say "Removing $worker's own Claude login (nothing else runs; no process is signalled)"
+    as_worker /bin/rm -f "$worker_home/.claude/.credentials.json"
+    kc=$worker_home/Library/Keychains/login.keychain-db
+    if as_worker /bin/test -e "$kc"; then
+        # One item per call; 44 = no (more) such item.
+        while :; do
+            status=0
+            as_worker /usr/bin/security delete-generic-password -s 'Claude Code-credentials' "$kc" >/dev/null 2>&1 || status=$?
+            [ "$status" -eq 0 ] && { echo "    deleted keychain item 'Claude Code-credentials'"; continue; }
+            [ "$status" -eq 44 ] && break
+            echo "Could not delete the 'Claude Code-credentials' item from $kc (security exit $status)." >&2
+            echo "Delete it by hand, then re-run with --remove-worker-login." >&2
+            exit 1
+        done
+    fi
+    if as_worker /bin/test -e "$worker_home/.claude/.credentials.json"; then
+        echo "$worker_home/.claude/.credentials.json still exists." >&2
+        exit 1
+    fi
+    echo "    ok    $worker holds no Claude login"
+    exit 0
+fi
+
 [ -n "$owner" ] && [ "$owner" != root ] || { echo "Pass --owner <your user> (or run via sudo from your account)." >&2; exit 64; }
 id "$owner" >/dev/null 2>&1 || { echo "No such owner user: $owner" >&2; exit 1; }
 owner_home=$(dscl . -read "/Users/$owner" NFSHomeDirectory | awk '{print $2}')
-worker_home=/Users/$worker
 case "$work_root/" in
     /*) ;;
     *) echo "--work-root must be absolute." >&2; exit 64 ;;
@@ -52,8 +93,6 @@ case "$work_root/" in
         echo "--work-root must be outside both homes (the worker can't enter the owner's; it could swap paths in its own)." >&2
         exit 64 ;;
 esac
-
-say() { echo "==> $*"; }
 
 # Removes then adds an ACL entry so re-runs don't stack duplicates. Never recursive: chmod -R
 # applies ACLs to symlink targets, and this runs as root over trees the worker can write.
@@ -144,10 +183,6 @@ grep -q '^#includedir /private/etc/sudoers.d' /etc/sudoers \
     || echo "warning: /etc/sudoers has no '#includedir /private/etc/sudoers.d'; the rule is inactive." >&2
 
 # --- 5. Toolchain: dotnet and git are system-wide; Claude Code installs per user ------
-# Commands run as the worker start in a directory it can enter (sudo keeps our cwd, which
-# may be under the owner's home that step 2 closed to it).
-cd /
-as_worker() { sudo -u "$worker" env -i "HOME=$worker_home" PATH=/usr/bin:/bin:/usr/sbin:/sbin "$@"; }
 if [ ! -x "$worker_home/.local/bin/claude" ]; then
     say "Installing Claude Code for $worker (native installer)"
     as_worker /bin/bash -c 'cd ~ && curl -fsSL https://claude.ai/install.sh | bash'
@@ -200,41 +235,17 @@ EOF
     return 1
 }
 
+echo "warning: the toolchain check runs commands as $worker through the helper, and each helper exit KILLS EVERY" >&2
+echo "         $worker process (a running factory work worker, any sudo -u $worker session). Close those first." >&2
 say "Checking the toolchain as $worker through the helper"
 check_toolchain "/usr/local/share/dotnet/dotnet --version" "git --version" "claude --version" || exit 1
-
-# --- 6. Opt-in: remove the worker's own Claude login (--remove-worker-login) -----------
-# Done as the worker, never as root (root following a symlink the worker planted in its home could delete
-# anything), and only deletes: no process is signalled.
-if [ "$remove_worker_login" -eq 1 ]; then
-    say "Removing $worker's own Claude login"
-    as_worker /bin/rm -f "$worker_home/.claude/.credentials.json"
-    kc=$worker_home/Library/Keychains/login.keychain-db
-    if [ -e "$kc" ]; then
-        # One item per call; 44 = no (more) such item.
-        while :; do
-            status=0
-            as_worker /usr/bin/security delete-generic-password -s 'Claude Code-credentials' "$kc" >/dev/null 2>&1 || status=$?
-            [ "$status" -eq 0 ] && { echo "    deleted keychain item 'Claude Code-credentials'"; continue; }
-            [ "$status" -eq 44 ] && break
-            echo "Could not delete the 'Claude Code-credentials' item from $kc (security exit $status)." >&2
-            echo "Delete it by hand, then re-run with --remove-worker-login." >&2
-            exit 1
-        done
-    fi
-    if as_worker /bin/test -e "$worker_home/.claude/.credentials.json"; then
-        echo "$worker_home/.claude/.credentials.json still exists." >&2
-        exit 1
-    fi
-    echo "    ok    $worker holds no Claude login"
-fi
 
 say "Done. Worker user: $worker  Helper: $helper  Work root: $work_root"
 cat <<EOF
 
 Workers use Worker:Auth=router-key (the default) and hold only the router key: enroll your plans on the
 router instead (router login claude, router login codex). If $worker still has a Claude login of its
-own, remove it:
+own, remove it (that runs nothing else and signals no process):
     sudo $0 --remove-worker-login
 Worker:Auth=claude-login (weaker: the worker holds a Claude login, which E5 forbids) needs the worker's
 own login instead:
