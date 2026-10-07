@@ -329,11 +329,14 @@ public sealed class SessionCaptureTests : IAsyncLifetime
     /// The backlog→live handoff under load: a recorder outside the host (as a separate
     /// <c>factory run</c>) writes without pause while viewers join mid-stream; the host relays via
     /// NOTIFY. Each viewer gets exactly 1..N. Small pages make backlog and live sends interleave.
+    /// The writer never pauses, and it stops only a fixed tail after the last viewer has joined, so
+    /// every join lands mid-stream however long it takes (a cold first join can take seconds).
     /// </summary>
     [Fact]
     public async Task Viewers_joining_mid_stream_get_every_event_exactly_once_via_the_notify_relay()
     {
-        const int total = 300;
+        const int gap = 100;  // events stored between one join and the next
+        const int tail = 100; // events written after the last viewer joined
         const string sid = "sess-race";
         await using var host = await StartHostAsync(new SessionHubOptions { PageSize = 7 });
         var app = host.App;
@@ -341,24 +344,38 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         await using var capture = await Recorder(new FakeCosts(FixtureCost)).StartAsync(item.Id, null, CancellationToken.None);
         await capture.SetClaudeSessionIdAsync(sid, CancellationToken.None);
 
+        var lastJoined = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var writer = Task.Run(async () =>
         {
-            for (var i = 1; i <= total; i++)
+            var stopAt = int.MaxValue;
+            var i = 0;
+            while (i < stopAt)
             {
+                i++;
                 await capture.OnLineAsync($$"""{"type":"assistant","session_id":"{{sid}}","n":{{i}}}""", CancellationToken.None);
+                if (stopAt == int.MaxValue && lastJoined.Task.IsCompleted)
+                {
+                    stopAt = i + tail;
+                }
+                Assert.True(i < 100_000, "the last viewer never joined");
                 await Task.Delay(Random.Shared.Next(1, 6));
             }
             await capture.CompleteAsync(0, "succeeded", fetchCost: false, CancellationToken.None);
+            return i;
         });
 
-        await WaitUntilAsync(async () => (await EventsAsync()).Count >= 1);
+        async Task<int> StoredAsync() => (await EventsAsync()).Count;
+        await WaitUntilAsync(async () => await StoredAsync() >= 1);
         await using var early = await Viewer.JoinAsync(app, _cookies, sid);
-        await WaitUntilAsync(async () => (await EventsAsync()).Count >= total / 3);
+        var mark = await StoredAsync();
+        await WaitUntilAsync(async () => await StoredAsync() >= mark + gap);
         await using var middle = await Viewer.JoinAsync(app, _cookies, sid);
-        await WaitUntilAsync(async () => (await EventsAsync()).Count >= 2 * total / 3);
+        mark = await StoredAsync();
+        await WaitUntilAsync(async () => await StoredAsync() >= mark + gap);
         await using var late = await Viewer.JoinAsync(app, _cookies, sid);
         Assert.False(writer.IsCompleted, "the writer finished before the last viewer joined: nothing was mid-stream");
-        await writer.WaitAsync(TimeSpan.FromSeconds(30));
+        lastJoined.SetResult();
+        var total = await writer.WaitAsync(TimeSpan.FromSeconds(30));
 
         foreach (var viewer in new[] { early, middle, late })
         {
