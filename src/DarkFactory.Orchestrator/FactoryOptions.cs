@@ -45,12 +45,12 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         var user => new Worker.WorkerSandbox(user, config["Worker:LaunchHelper"] ?? Worker.WorkerSandbox.DefaultHelperPath),
     };
 
-    /// <summary><c>Worker:Auth</c> = <c>claude-login</c> (default) or <c>router-key</c>; see <see cref="Worker.WorkerAuth"/>.</summary>
-    public Worker.WorkerAuth WorkerAuth => (config["Worker:Auth"] ?? "claude-login") switch
+    /// <summary><c>Worker:Auth</c> = <c>router-key</c> (default) or <c>claude-login</c> (weaker, violates E5); see <see cref="Worker.WorkerAuth"/>.</summary>
+    public Worker.WorkerAuth WorkerAuth => (config["Worker:Auth"] ?? "router-key") switch
     {
         "claude-login" => Worker.WorkerAuth.ClaudeLogin,
         "router-key" => Worker.WorkerAuth.RouterKey,
-        var other => throw new InvalidOperationException($"Worker:Auth must be 'claude-login' or 'router-key', not '{other}'."),
+        var other => throw new InvalidOperationException($"Worker:Auth must be 'router-key' or 'claude-login', not '{other}'."),
     };
 
     /// <summary><c>Shortcut:Watch:Teams</c> / <c>Shortcut:Watch:Epics</c>; empty watches nothing.</summary>

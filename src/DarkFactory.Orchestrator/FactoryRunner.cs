@@ -38,6 +38,40 @@ public static class FactoryRunner
         }
     }
 
+    /// <summary>
+    /// <c>factory run</c>'s and <c>factory work</c>'s start-up check for <c>Worker:Auth=router-key</c> (the default): the
+    /// worker holds no provider credential, so the router must have at least one plan enrolled for the router key, or
+    /// every worker model call fails. A failure, not a warning (E10): without a plan no worker can do anything, and an
+    /// unreadable usage report (router down, bad key) leaves enrollment unverified, so it fails too.
+    /// Returns what is wrong, or null (always null for <c>claude-login</c>).
+    /// </summary>
+    public static async Task<string?> CheckRouterEnrollmentAsync(FactoryOptions options, IUsageSource usage, CancellationToken ct)
+    {
+        if (options.WorkerAuth != WorkerAuth.RouterKey)
+        {
+            return null;
+        }
+        const string remedy = "Enroll a plan on the router for this key (`router login claude` and/or `router login codex`), "
+            + "or set Worker__Auth=claude-login (weaker: the worker then holds a Claude login, which E5 forbids).";
+        SubscriptionUsage report;
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(10));
+            report = await usage.GetUsageAsync(timeout.Token);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException or System.Text.Json.JsonException
+            || (ex is OperationCanceledException && !ct.IsCancellationRequested))
+        {
+            return $"Worker:Auth=router-key, but the router's enrolled plans could not be read from {options.RouterBaseUrl} "
+                + $"(GET /v1/subscriptions/usage: {ex.Message}). Check that the router is up and Router:Key is right. {remedy}";
+        }
+        return report.EnrolledCredentials > 0
+            ? null
+            : $"Worker:Auth=router-key, but the router at {options.RouterBaseUrl} lists no enrolled, enabled plan for this router key "
+                + $"(GET /v1/subscriptions/usage has no managed or shared credential), so every worker model call would fail. {remedy}";
+    }
+
     /// <param name="ignoreScope"><c>factory run --ignore-scope</c>: claim and resume the story even outside the watch scope.</param>
     public static async Task<RunOutcome> RunAsync(FactoryOptions options, int storyId, bool ignoreScope, TextWriter log, CancellationToken ct)
     {

@@ -31,6 +31,11 @@ static async Task<int> RunAsync(int storyId, bool ignoreScope, CancellationToken
     var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
     try
     {
+        if (await CheckRouterEnrollmentAsync(options, ct) is { } enrollmentError)
+        {
+            Console.Error.WriteLine(enrollmentError);
+            return 2;
+        }
         var outcome = await FactoryRunner.RunAsync(options, storyId, ignoreScope, Console.Out, ct);
         return outcome.Succeeded ? 0 : 1;
     }
@@ -68,6 +73,11 @@ static async Task<int> WorkAsync(CancellationToken ct)
             return 2;
         }
     }
+    if (await CheckRouterEnrollmentAsync(options, ct) is { } enrollmentError)
+    {
+        Console.Error.WriteLine(enrollmentError);
+        return 2;
+    }
     await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
     // One process: the session hub and its relay, plus the intake loop polling the watch scope.
     await using var app = FactoryHost.BuildWork(options);
@@ -75,6 +85,13 @@ static async Task<int> WorkAsync(CancellationToken ct)
     Console.WriteLine($"factory work: dashboard on {string.Join(", ", app.Addresses())} (session hub {SessionHub.Path}); intake polling every {options.PollInterval}; Ctrl-C stops");
     await app.WaitForShutdownAsync(ct);
     return 0;
+}
+
+// Worker:Auth=router-key needs a plan enrolled on the router for the key; checked before any work starts (E10).
+static async Task<string?> CheckRouterEnrollmentAsync(FactoryOptions options, CancellationToken ct)
+{
+    using var http = new HttpClient { BaseAddress = options.RouterBaseUrl };
+    return await FactoryRunner.CheckRouterEnrollmentAsync(options, new DarkFactory.Orchestrator.Router.RouterClient(http, options.RouterKey), ct);
 }
 
 static Task<int> SetDashboardPasswordAsync(CancellationToken ct) =>

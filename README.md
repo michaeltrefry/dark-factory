@@ -190,11 +190,19 @@ printf 'add-generic-password -U -s dark-factory -a router-key -w %s\n' "$(pbpast
 # 4. Worker sandbox user, launch helper, sudoers rule and work root (see below)
 sudo scripts/setup-worker-user.sh
 
-# 5. Worker model auth — pick one:
-#    a) router passes through the worker's own Claude login (default, Worker__Auth=claude-login).
-#       Log the _factory user in once; never copy your own credentials:
-sudo -u _factory -H /Users/_factory/.local/bin/claude   # then /login, then /exit
-#    b) router holds BYOK provider keys: export Worker__Auth=router-key (nothing else needed)
+# 5. Worker model auth. Default Worker__Auth=router-key: the worker holds no Anthropic/OpenAI credential,
+#    only the router key; the router serves it from your plans, enrolled on the local router
+#    (michaeltrefry/router at Router:BaseUrl) for the same router key:
+router login claude     # your Claude Pro/Max plan
+router login codex      # your ChatGPT/Codex plan
+#    then delete any Claude login _factory still has (opt-in; deletes only its credentials file and
+#    keychain item, stops no process):
+sudo scripts/setup-worker-user.sh --remove-worker-login
+#    `factory run` / `factory work` refuse to start until the router's GET /v1/subscriptions/usage lists
+#    an enabled enrolled (managed or shared) plan for the key.
+#    Fallback, weaker (violates E5: the worker then holds a Claude login): Worker__Auth=claude-login, and
+#    log the _factory user in once (never copy your own credentials):
+#      sudo -u _factory -H /Users/_factory/.local/bin/claude   # then /login, then /exit
 
 # 6. Dashboard login password (prompted twice, no echo; `factory work` refuses to start without it)
 dotnet run --project src/DarkFactory.Orchestrator -- dashboard set-password
@@ -213,8 +221,9 @@ dotnet run --project src/DarkFactory.Orchestrator -- dashboard set-password
   **`/etc/sudoers.d/dark-factory`**: you may run *only* that helper, *only* as `_factory`, without a password.
   The orchestrator sends the router variables on the helper's stdin; the helper starts the worker with
   exactly `PATH`, `HOME` (`_factory`'s), `MSBUILDDISABLENODEREUSE=1`, `DOTNET_CLI_USE_MSBUILD_SERVER=0`
-  (no lingering build servers) and the router URL/headers (plus the router key as `ANTHROPIC_API_KEY` in
-  `router-key` mode). It refuses any other variable and any program that is not an absolute path or a
+  (no lingering build servers) and the router URL/headers (plus the router key as `ANTHROPIC_AUTH_TOKEN` in
+  `router-key` mode, so Claude Code starts without a login; the router strips that `rk_` bearer before any
+  upstream call). It refuses any other variable (`ANTHROPIC_API_KEY` included) and any program that is not an absolute path or a
   plain command name. When the worker exits, or its stdin closes (Stop, timeout, or the orchestrator
   dying), it kills the worker's tree and process group and then **every `_factory` process**
   (all but the helper itself, which then exits with the worker's status), so nothing that forked and `setsid()`ed away survives the run.

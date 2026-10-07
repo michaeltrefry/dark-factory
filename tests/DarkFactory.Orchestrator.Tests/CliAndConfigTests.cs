@@ -141,7 +141,7 @@ public class FactoryOptionsTests
         Assert.Equal(new Uri("http://localhost:8080/"), options.RouterBaseUrl);
         Assert.Equal("michaeltrefry/dark-factory-sandbox", options.DefaultRepo.FullName);
         Assert.Contains("Port=5434", options.LedgerConnectionString);
-        Assert.Equal(Worker.WorkerAuth.ClaudeLogin, options.WorkerAuth);
+        Assert.Equal(Worker.WorkerAuth.RouterKey, options.WorkerAuth); // the worker holds no provider credential by default (E5)
     }
 
     [Fact]
@@ -157,6 +157,7 @@ public class FactoryOptionsTests
     public void Worker_auth_mode_is_configurable_and_validated()
     {
         Assert.Equal(Worker.WorkerAuth.RouterKey, Options(new() { ["Worker:Auth"] = "router-key" }).WorkerAuth);
+        Assert.Equal(Worker.WorkerAuth.ClaudeLogin, Options(new() { ["Worker:Auth"] = "claude-login" }).WorkerAuth);
         Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:Auth"] = "api-key" }).WorkerAuth);
     }
 
@@ -288,4 +289,64 @@ public class MacKeychainTests
     [Fact]
     public void Set_command_rejects_values_too_long_for_security_interactive_mode() =>
         Assert.Throws<ArgumentException>(() => MacKeychain.BuildSetCommand("router-key", new string('k', 2800)));
+}
+
+/// <summary>The router-key start-up check of <c>factory run</c>/<c>factory work</c> (<see cref="FactoryRunner.CheckRouterEnrollmentAsync"/>).</summary>
+public class RouterEnrollmentCheckTests
+{
+    private static FactoryOptions Options(string? auth) =>
+        new(new ConfigurationBuilder().AddInMemoryCollection(auth is null ? [] : new Dictionary<string, string?> { ["Worker:Auth"] = auth }).Build(),
+            new InMemorySecrets());
+
+    /// <summary>The router's usage report (<c>GET /v1/subscriptions/usage</c>) with the given credential entries.</summary>
+    private static FakeApi Router(string credentials) => new FakeApi().On("GET /v1/subscriptions/usage", HttpStatusCode.OK,
+        $$"""{"as_of":"2026-10-07T12:00:00Z","all_exhausted":false,"known_credentials":0,"observed_credentials":0,"credentials":[{{credentials}}]}""");
+
+    private static Task<string?> CheckAsync(FactoryOptions options, FakeApi api) =>
+        FactoryRunner.CheckRouterEnrollmentAsync(options, new RouterClient(api.Client("http://localhost:8080/"), "rk_test"), CancellationToken.None);
+
+    [Theory]
+    [InlineData("""{"provider":"anthropic","source":"managed","credential_key":"a","routable":true,"enabled":true}""")]
+    [InlineData("""{"provider":"openai","source":"managed","credential_key":"c","routable":true,"enabled":true}""")]
+    [InlineData("""{"provider":"anthropic","source":"shared","credential_key":"s","routable":true,"enabled":true}""")]
+    public async Task Router_key_mode_passes_when_the_router_lists_an_enrolled_plan_for_the_key(string credential)
+    {
+        var api = Router(credential);
+
+        Assert.Null(await CheckAsync(Options(null), api)); // router-key is the default
+        Assert.Equal("rk_test", api.Requests.Single().Headers[Worker.ClaudeWorker.RouterKeyHeader]);
+    }
+
+    [Theory]
+    [InlineData("")] // nothing enrolled
+    [InlineData("""{"provider":"anthropic","source":"presented","credential_key":"p","routable":true}""")] // a client's own login, not enrolled
+    [InlineData("""{"provider":"anthropic","source":"observed","credential_key":"o","routable":true}""")]
+    [InlineData("""{"provider":"anthropic","source":"managed","credential_key":"a","routable":false,"enabled":false}""")] // enrolled but disabled
+    public async Task Router_key_mode_fails_fast_naming_the_enrollment_commands_when_no_plan_is_enrolled(string credential)
+    {
+        var error = await CheckAsync(Options("router-key"), Router(credential));
+
+        Assert.NotNull(error);
+        Assert.Contains("no enrolled", error);
+        Assert.Contains("router login claude", error);
+        Assert.Contains("router login codex", error);
+    }
+
+    [Fact]
+    public async Task Router_key_mode_fails_when_the_usage_report_cannot_be_read()
+    {
+        var error = await CheckAsync(Options("router-key"), new FakeApi()); // 404: no usage route
+
+        Assert.NotNull(error);
+        Assert.Contains("could not be read", error);
+    }
+
+    [Fact]
+    public async Task Claude_login_mode_skips_the_check_without_calling_the_router()
+    {
+        var api = new FakeApi();
+
+        Assert.Null(await CheckAsync(Options("claude-login"), api));
+        Assert.Empty(api.Requests);
+    }
 }

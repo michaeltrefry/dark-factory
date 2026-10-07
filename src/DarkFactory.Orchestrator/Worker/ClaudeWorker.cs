@@ -115,14 +115,18 @@ public static class WorkerStillRunning
 public enum WorkerAuth
 {
     /// <summary>
-    /// Claude Code uses its own login (the OS user's <c>claude</c> OAuth session) and the
-    /// router passes it upstream. For routers without BYOK provider keys.
+    /// Weaker, opt-in (<c>Worker:Auth=claude-login</c>): Claude Code uses the worker user's own Claude login (its
+    /// <c>claude</c> OAuth session) and the router passes it upstream. The worker then holds an Anthropic credential,
+    /// which E5 forbids; kept only as a fallback for a router with no enrolled plans.
     /// </summary>
     ClaudeLogin,
 
     /// <summary>
-    /// The router key doubles as Claude Code's API key (sent as <c>x-api-key</c>, which the
-    /// router accepts as a routing token); the router supplies BYOK provider keys upstream.
+    /// Default (<c>Worker:Auth=router-key</c>): the worker holds no provider credential, only the router key. It goes in
+    /// <c>X-Weave-Router-Key</c> (the router's preferred routing token) and as <c>ANTHROPIC_AUTH_TOKEN</c>, so Claude Code
+    /// starts without a login and sends it as <c>Authorization: Bearer rk_…</c>, which the router strips before any
+    /// upstream relay (unlike <c>x-api-key</c>, which its pass-through tier would forward). The router serves the
+    /// request from the plans enrolled for the key (<c>router login claude</c> / <c>router login codex</c>).
     /// </summary>
     RouterKey,
 }
@@ -169,7 +173,7 @@ public sealed class ClaudeWorker(
         };
         if (auth == WorkerAuth.RouterKey)
         {
-            env["ANTHROPIC_API_KEY"] = routerKey;
+            env["ANTHROPIC_AUTH_TOKEN"] = routerKey;
         }
         return env;
     }

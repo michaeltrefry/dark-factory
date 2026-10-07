@@ -107,12 +107,15 @@ public class ClaudeWorkerTests
     }
 
     [Fact]
-    public void Router_key_auth_mode_uses_the_router_key_as_api_key_and_nothing_else()
+    public void Router_key_auth_mode_uses_the_router_key_as_bearer_auth_token_and_nothing_else()
     {
         var env = ClaudeWorker.BuildEnvironment(ParentEnvironment(), Router, "rk_worker", WorkerAuth.RouterKey);
 
-        Assert.Equal("rk_worker", env["ANTHROPIC_API_KEY"]);
-        Assert.Equal(["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "HOME", "PATH", "USER"], env.Keys.Order());
+        // Bearer (ANTHROPIC_AUTH_TOKEN), not x-api-key (ANTHROPIC_API_KEY): the router strips an rk_ bearer before
+        // any upstream relay, while its pass-through tier forwards x-api-key as is.
+        Assert.Equal("rk_worker", env["ANTHROPIC_AUTH_TOKEN"]);
+        Assert.Equal("X-Weave-Router-Key: rk_worker", env["ANTHROPIC_CUSTOM_HEADERS"]);
+        Assert.Equal(["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "HOME", "PATH", "USER"], env.Keys.Order());
         Assert.DoesNotContain(env.Values, v => v.Contains("sk-") || v.Contains("ghp_") || v.Contains("oauth") || v.Contains("leak"));
     }
 
