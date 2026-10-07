@@ -151,7 +151,7 @@ public class WorkerSandboxTests
 
     [Theory]
     [InlineData(WorkerAuth.ClaudeLogin, new[] { "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH" })]
-    [InlineData(WorkerAuth.RouterKey, new[] { "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH" })]
+    [InlineData(WorkerAuth.RouterKey, new[] { "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH" })]
     public async Task Helper_gives_the_worker_exactly_the_allowlisted_environment(WorkerAuth auth, string[] expected)
     {
         Environment.SetEnvironmentVariable("GH_TOKEN", "ghp_owner_should_not_leak");
@@ -181,6 +181,7 @@ public class WorkerSandboxTests
 
     [Theory]
     [InlineData("OPENAI_API_KEY=sk-x\n\n")]
+    [InlineData("ANTHROPIC_API_KEY=sk-ant-x\n\n")] // router-key mode sends ANTHROPIC_AUTH_TOKEN; a provider key never passes
     [InlineData("HOME=/Users/michael\n\n")]
     [InlineData("ANTHROPIC_BASE_URL=http://x\n")] // stdin closed before the terminating blank line
     [InlineData("ANTHROPIC_BASE_URL\n\n")] // no '=': env would run it as the program
@@ -784,7 +785,7 @@ public class LiveWorkerSandboxTests
         var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets());
         var auth = options.WorkerAuth;
         string[] expected = auth == WorkerAuth.RouterKey
-            ? ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH"]
+            ? ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH"]
             : ["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH"];
         const string probeKey = "rk_live_env_probe";
         Environment.SetEnvironmentVariable("GH_TOKEN", "ghp_owner_should_not_leak");
@@ -803,7 +804,7 @@ public class LiveWorkerSandboxTests
             Assert.Equal($"{ClaudeWorker.RouterKeyHeader}: {probeKey}", env["ANTHROPIC_CUSTOM_HEADERS"]);
             if (auth == WorkerAuth.RouterKey)
             {
-                Assert.Equal(probeKey, env["ANTHROPIC_API_KEY"]);
+                Assert.Equal(probeKey, env["ANTHROPIC_AUTH_TOKEN"]);
             }
             Assert.DoesNotContain(OwnerHome, env["HOME"]);
             Assert.StartsWith(env["HOME"] + "/.local/bin:", env["PATH"]);
@@ -827,6 +828,36 @@ public class LiveWorkerSandboxTests
 
         Assert.NotEqual(0, exitCode);
         Assert.Empty(stdout.Trim());
+    }
+
+    /// <summary>
+    /// AT6, <c>Worker:Auth=router-key</c> (E5): the worker user holds no Claude credential of its own — neither Claude
+    /// Code's credentials file nor its keychain item (attributes only are looked up; no secret is read). Removed by
+    /// <c>sudo scripts/setup-worker-user.sh --remove-worker-login</c>. Skips in <c>claude-login</c> mode, which needs one.
+    /// </summary>
+    [Fact]
+    public async Task Worker_user_holds_no_claude_credential_in_router_key_mode()
+    {
+        var sandbox = await RequireSandboxAsync();
+        if (new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets()).WorkerAuth != WorkerAuth.RouterKey)
+        {
+            Assert.Skip("Worker:Auth=claude-login: the worker user is expected to hold its own Claude login.");
+        }
+
+        var (exitCode, stdout, stderr) = await sandbox.RunAsync("/", "/bin/sh",
+            ["-c", """
+                found=
+                if test -e "$HOME/.claude/.credentials.json"; then found="$found $HOME/.claude/.credentials.json"; fi
+                kc="$HOME/Library/Keychains/login.keychain-db"
+                if test -e "$kc" && /usr/bin/security find-generic-password -s 'Claude Code-credentials' "$kc" >/dev/null 2>&1; then
+                    found="$found keychain:Claude Code-credentials"
+                fi
+                echo "found:$found"
+                """],
+            CancellationToken.None);
+
+        Assert.True(exitCode == 0, stderr);
+        Assert.Equal("found:", stdout.Trim());
     }
 
     [Theory]

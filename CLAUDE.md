@@ -62,7 +62,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Worker:ClaudePath` | `claude` (as the worker user sees it: `~_factory/.local/bin` is first on its PATH) |
 | `Worker:RunAs` | `_factory` (sandbox user); `none` runs workers as the owner (development only) |
 | `Worker:LaunchHelper` | `/usr/local/libexec/dark-factory/factory-worker-launch` |
-| `Worker:Auth` | `claude-login` (worker's own Claude login, router passes it through) or `router-key` (router key as Claude's API key; router needs BYOK provider keys) |
+| `Worker:Auth` | `router-key` (default: the worker holds only the router key, in `X-Weave-Router-Key` and as `ANTHROPIC_AUTH_TOKEN`; the router serves it from plans enrolled with `router login claude` / `router login codex`; `factory run`/`work` refuse to start unless `GET /v1/subscriptions/usage` lists an enabled `managed`/`shared` credential) or `claude-login` (weaker, violates E5: the worker's own Claude login, passed through by the router) |
 | `Worker:TimeoutMinutes` | `30` |
 | `Worker:PauseGraceSeconds` | `660` (a paused worker that has not stopped at a tool boundary by then is stopped; must exceed the 600 s longest tool call) |
 | `Factory:HostPort` | `47822` (`factory work`: 127.0.0.1, plus `Dashboard:BindAddress`) |
@@ -80,7 +80,10 @@ closes kills the tree, the process group and then every other `_factory` process
 spares the helper's own pid — never `kill -1`, which on macOS kills the sender too; the helper skips that
 step when not running as the sandbox user), then exits with the worker's status. So `_factory` is
 single-tenant: one sandboxed `factory run` per machine (`WorkerLock`, `<work root>/.factory-run.lock`). Run
-`sudo scripts/setup-worker-user.sh` once; the live probe tests (`LiveWorkerSandboxTests`) run only with
+`sudo scripts/setup-worker-user.sh` once (re-run it after a helper change: the installed helper's allowlist is
+`ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_AUTH_TOKEN`); `--remove-worker-login` (opt-in) then deletes
+`_factory`'s own Claude login (`~/.claude/.credentials.json`, keychain item `Claude Code-credentials`), as `_factory`,
+signalling nothing. The live probe tests (`LiveWorkerSandboxTests`) run only with
 `FACTORY_SANDBOX_LIVE=1`, since they kill every `_factory` process (including an interactive `_factory` login).
 
 Secrets in the keychain: `security add-generic-password -w` at its interactive prompt truncates at 128 chars

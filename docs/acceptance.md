@@ -30,7 +30,10 @@ opt-in: the tests skip, naming the missing prerequisite, unless their gate varia
 Common prerequisites: `docker compose up -d` (ledger Postgres on 5434), the router on `Router:BaseUrl`
 (default `http://localhost:8080`), keychain entries for the router key, Shortcut token and GitHub App
 (`factory github-app setup`), `sudo scripts/setup-worker-user.sh` done once (or `Worker__RunAs=none` to run workers
-as yourself, development only), and the `_factory` Claude login when `Worker:Auth=claude-login`.
+as yourself, development only), and the model auth: for `Worker:Auth=router-key` (the default) your plans enrolled on
+the router for the router key (`router login claude`, `router login codex`; `factory run`/`work` refuse to start
+without one) and `_factory`'s own login removed (`sudo scripts/setup-worker-user.sh --remove-worker-login`); for
+`Worker:Auth=claude-login` (weaker, violates E5) the `_factory` Claude login instead.
 
 Run one test at a time with a class filter, e.g.:
 
@@ -121,7 +124,9 @@ for its sessions.
 | Check | Test | Gate |
 | --- | --- | --- |
 | Worker token pushes `factory/*` only on its own repo; push to `main` and to another repo rejected | `AppTokenPushTests.Worker_token_pushes_factory_branches_only_on_its_own_repo` | `FACTORY_E2E=1` (`FACTORY_E2E_OTHER_REPO` optional) |
-| Worker env is exactly the allowlist for the configured `Worker:Auth` | `LiveWorkerSandboxTests.Live_worker_environment_is_exactly_the_allowlist_for_the_configured_auth_mode` | `FACTORY_SANDBOX_LIVE=1` |
+| Worker env is exactly the allowlist for the configured `Worker:Auth` (`router-key`: `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `HOME`, `MSBUILDDISABLENODEREUSE`, `PATH`; `claude-login`: the same without `ANTHROPIC_AUTH_TOKEN`) | `LiveWorkerSandboxTests.Live_worker_environment_is_exactly_the_allowlist_for_the_configured_auth_mode` | `FACTORY_SANDBOX_LIVE=1` |
+| `router-key`: `_factory` holds no Claude credential (no `~/.claude/.credentials.json`, no `Claude Code-credentials` keychain item) | `LiveWorkerSandboxTests.Worker_user_holds_no_claude_credential_in_router_key_mode` (skips for `claude-login`) | `FACTORY_SANDBOX_LIVE=1` |
+| `router-key`: `factory run`/`work` refuse to start without an enrolled plan | `RouterEnrollmentCheckTests` (unit, fake router) | none |
 | `~michael`, `.ssh`, `.config/gh`, login keychain unreachable | `LiveWorkerSandboxTests.Worker_is_denied_the_owners_home_ssh_keys_gh_config_and_login_keychain`, `Worker_cannot_read_the_owners_keychain_items` | `FACTORY_SANDBOX_LIVE=1` |
 
 The env probe runs `/usr/bin/env` through the installed helper exactly as `ClaudeWorker` launches a sandboxed worker

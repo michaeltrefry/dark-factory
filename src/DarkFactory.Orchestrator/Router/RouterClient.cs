@@ -22,12 +22,29 @@ public interface ISessionCostSource
 /// <see cref="AllExhausted"/> is true only when at least one routable credential is known and every one is exhausted
 /// (paid overage included); <see cref="ResumesAt"/> is the earliest known resume. Readings live in the router
 /// process's memory, so after a router restart nothing is known until traffic flows.
+/// <see cref="Credentials"/> lists the credentials the caller's router key can be routed onto, enrolled plans included.
 /// </summary>
 public sealed record SubscriptionUsage(
     [property: JsonPropertyName("as_of")] DateTimeOffset AsOf,
     [property: JsonPropertyName("all_exhausted")] bool AllExhausted,
     [property: JsonPropertyName("resumes_at")] DateTimeOffset? ResumesAt,
-    [property: JsonPropertyName("known_credentials")] int KnownCredentials);
+    [property: JsonPropertyName("known_credentials")] int KnownCredentials,
+    [property: JsonPropertyName("credentials")] IReadOnlyList<UsageCredential>? Credentials = null)
+{
+    /// <summary>
+    /// Plans enrolled on the router for this key (<c>router login claude|codex</c>: source <c>managed</c>, or
+    /// <c>shared</c> by another member) and not disabled. Credentials presented or observed from a client's own login
+    /// do not count: in <c>router-key</c> mode the worker presents none.
+    /// </summary>
+    public int EnrolledCredentials =>
+        Credentials?.Count(c => c.Source is "managed" or "shared" && c.Enabled != false) ?? 0;
+}
+
+/// <summary>One credential of the router's usage report, as far as the enrollment check uses it (no token is ever reported).</summary>
+public sealed record UsageCredential(
+    [property: JsonPropertyName("provider")] string Provider,
+    [property: JsonPropertyName("source")] string Source,
+    [property: JsonPropertyName("enabled")] bool? Enabled = null);
 
 /// <summary>Where the factory reads whether its plans are exhausted.</summary>
 public interface IUsageSource

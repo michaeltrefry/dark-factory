@@ -1,7 +1,11 @@
 #!/bin/bash
 # setup-worker-user.sh — one-time, idempotent setup of the Dark Factory worker sandbox (E5).
 #
-#   sudo scripts/setup-worker-user.sh [--owner <user>] [--worker <user>] [--work-root <dir>]
+#   sudo scripts/setup-worker-user.sh [--owner <user>] [--worker <user>] [--work-root <dir>] [--remove-worker-login]
+#
+# --remove-worker-login (opt-in, after the setup): deletes the worker user's own Claude Code login — its
+# ~/.claude/.credentials.json and its 'Claude Code-credentials' keychain item — so the worker holds no
+# provider credential (E5; Worker:Auth=router-key, the default). It deletes only those; it never stops a process.
 #
 # Creates a hidden role account (default _factory) whose workers:
 #   - cannot traverse the owner's home (so no ~/.ssh, ~/.config/gh or login keychain),
@@ -20,13 +24,15 @@ helper_dir=/usr/local/libexec/dark-factory
 helper=$helper_dir/factory-worker-launch
 sudoers=/private/etc/sudoers.d/dark-factory
 script_dir=$(cd "$(dirname "$0")" && pwd)
+remove_worker_login=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --owner) owner=$2; shift 2 ;;
         --worker) worker=$2; shift 2 ;;
         --work-root) work_root=$2; shift 2 ;;
-        *) echo "usage: sudo $0 [--owner <user>] [--worker <user>] [--work-root <dir>]" >&2; exit 64 ;;
+        --remove-worker-login) remove_worker_login=1; shift ;;
+        *) echo "usage: sudo $0 [--owner <user>] [--worker <user>] [--work-root <dir>] [--remove-worker-login]" >&2; exit 64 ;;
     esac
 done
 
@@ -197,11 +203,40 @@ EOF
 say "Checking the toolchain as $worker through the helper"
 check_toolchain "/usr/local/share/dotnet/dotnet --version" "git --version" "claude --version" || exit 1
 
+# --- 6. Opt-in: remove the worker's own Claude login (--remove-worker-login) -----------
+# Done as the worker, never as root (root following a symlink the worker planted in its home could delete
+# anything), and only deletes: no process is signalled.
+if [ "$remove_worker_login" -eq 1 ]; then
+    say "Removing $worker's own Claude login"
+    as_worker /bin/rm -f "$worker_home/.claude/.credentials.json"
+    kc=$worker_home/Library/Keychains/login.keychain-db
+    if [ -e "$kc" ]; then
+        # One item per call; 44 = no (more) such item.
+        while :; do
+            status=0
+            as_worker /usr/bin/security delete-generic-password -s 'Claude Code-credentials' "$kc" >/dev/null 2>&1 || status=$?
+            [ "$status" -eq 0 ] && { echo "    deleted keychain item 'Claude Code-credentials'"; continue; }
+            [ "$status" -eq 44 ] && break
+            echo "Could not delete the 'Claude Code-credentials' item from $kc (security exit $status)." >&2
+            echo "Delete it by hand, then re-run with --remove-worker-login." >&2
+            exit 1
+        done
+    fi
+    if as_worker /bin/test -e "$worker_home/.claude/.credentials.json"; then
+        echo "$worker_home/.claude/.credentials.json still exists." >&2
+        exit 1
+    fi
+    echo "    ok    $worker holds no Claude login"
+fi
+
 say "Done. Worker user: $worker  Helper: $helper  Work root: $work_root"
 cat <<EOF
 
-Next, for Worker:Auth=claude-login (the default), log the worker's own Claude Code in once
-(never copy your credentials):
+Workers use Worker:Auth=router-key (the default) and hold only the router key: enroll your plans on the
+router instead (router login claude, router login codex). If $worker still has a Claude login of its
+own, remove it:
+    sudo $0 --remove-worker-login
+Worker:Auth=claude-login (weaker: the worker holds a Claude login, which E5 forbids) needs the worker's
+own login instead:
     sudo -u $worker -H $worker_home/.local/bin/claude      # then /login, then /exit
-For Worker:Auth=router-key nothing else is needed.
 EOF
