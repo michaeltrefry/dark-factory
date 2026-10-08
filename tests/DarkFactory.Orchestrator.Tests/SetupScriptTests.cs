@@ -5,8 +5,8 @@ namespace DarkFactory.Orchestrator.Tests;
 
 /// <summary>
 /// The toolchain check in <c>scripts/setup-worker-user.sh</c>, run without root: its functions are
-/// lifted from the script and run as the current user against the repo's helper, with sudo replaced by
-/// a pass-through function. The helper's <c>sandbox_user</c> is not us, so it never kills by uid.
+/// lifted from the script and run as the current user against a <see cref="SafeHelper"/> copy of the repo's helper, with
+/// sudo replaced by a pass-through function. The copy's <c>sandbox_user</c> is not us, so it never kills by uid.
 /// </summary>
 [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
 public class SetupScriptTests
@@ -18,7 +18,7 @@ public class SetupScriptTests
     [Fact]
     public async Task Piping_the_variable_block_in_closes_stdin_and_the_helper_kills_the_tool()
     {
-        var (exitCode, stdout, _) = await BashAsync($"printf '\\n' | '{SandboxSupport.Helper}' '{SlowTool}'");
+        var (exitCode, stdout, _) = await BashAsync($"printf '\\n' | '{SafeHelper.Create(_dir).Path}' '{SlowTool}'");
 
         Assert.Equal(137, exitCode);
         Assert.DoesNotContain("ok", stdout);
@@ -196,7 +196,7 @@ public class SetupScriptTests
         var harness = $$"""
             sudo() { while :; do case "$1" in -n) shift ;; -u) shift 2 ;; *) break ;; esac; done; "$@"; }
             owner=owner worker=_factory sudoers=/nonexistent worker_home=/nonexistent
-            helper='{{SandboxSupport.Helper}}'
+            helper='{{SafeHelper.Create(_dir).Path}}'
             {{functions}}
             check_toolchain {{string.Join(' ', tools.Select(t => $"'{t}'"))}}
             """;

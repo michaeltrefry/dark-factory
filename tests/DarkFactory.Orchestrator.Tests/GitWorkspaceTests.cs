@@ -329,7 +329,7 @@ public class GitWorkspaceTests
         Git(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "symlinks");
         Git(seed, "push", "origin", "main");
         // A real sandbox sharing with the current user (chmod needs an existing user); deletes run the helper unsudoed.
-        var sandbox = new DarkFactory.Orchestrator.Worker.WorkerSandbox(Environment.UserName, SandboxSupport.Helper, SandboxSupport.FakeSudo(_root));
+        var sandbox = new DarkFactory.Orchestrator.Worker.WorkerSandbox(Environment.UserName, SafeHelper.Create(_root).Path, SandboxSupport.FakeSudo(_root));
 
         var workspace = Workspace(sandbox);
         var ws = await workspace.PrepareAsync(Repo, "factory/sc-14", CancellationToken.None);

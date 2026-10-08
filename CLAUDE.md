@@ -22,6 +22,8 @@ Claude Code headless workers through the Weave router.
 - `scripts/` — `setup-worker-user.sh` (one-time root setup of the `_factory` sandbox user) and
   `factory-worker-launch` (the root-installed helper every sandboxed worker runs through).
 - `tests/DarkFactory.Orchestrator.Tests` — unit tests (no network; fake HTTP APIs, InMemory EF, local git).
+  Tests run `scripts/factory-worker-launch` only through `SafeHelper` (a copy whose every signal goes through a seam
+  that signals only the test's own processes); `SafeHelperTests` fails if a test reaches the real helper another way.
   `CrashResumeTests` also needs the compose Postgres (skips locally without it, fails under `CI`): it
   SIGKILLs `tests/DarkFactory.CrashHost` (the real pipeline with a fake `claude` script) and restarts it.
   `ShortcutContractTests` replay recorded Shortcut API fixtures (`Fixtures/shortcut`, strict request matching);
