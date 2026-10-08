@@ -12,7 +12,9 @@ Claude Code headless workers through the Weave router.
   session capture + SignalR hub (`Sessions/`), the `factory work` host (`FactoryHost`) and its Blazor Server
   dashboard (`Dashboard/`: login, binding, ledger reads, transcript formatting; components in `Dashboard/Components`),
   `IWorkSource` + the `factory work` intake loop (`WorkSources/`; registered on the `factory work` host by `FactoryHost.BuildWork` via `services.AddIntake(options)`)
-  and its Shortcut adapter (`Shortcut/ShortcutWorkSource.cs`), the Pause/Continue/Stop controls (`Controls/`), and the
+  and its Shortcut adapter (`Shortcut/ShortcutWorkSource.cs`), GitHub issues as a second source (`Issues/`: the intake
+  `IssueIntake` — poll, triage, route, approvals — the routing rule `IssueTriage.cs`, the triage worker `TriageWorker.cs`,
+  `GitHubIssueWorkSource`; GitHub side `GitHub/GitHubIssues.cs`), the Pause/Continue/Stop controls (`Controls/`), and the
   review and merge gate (`Gate/`: `ReviewModels`/`ReviewerChoice`, `ReviewPanel` (roles, risky paths, prompts, findings),
   `RouterReviewer`, `GatePolicy`, `MergeGate`, the new-tests check `NewTestsCheck`/`XunitNewTests`/`SandboxTestRunner`;
   reviewer prompts in `factory/prompts/`; GitHub side
@@ -66,6 +68,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Gate:TestTimeoutMinutes` | `20` (one sandboxed run — restore, build, the new tests — of the `new-tests-fail-on-base` check; still running at the timeout fails the check) |
 | `Factory:DefaultRepo` | `michaeltrefry/dark-factory-sandbox` (a story line `Repo: owner/name` overrides) |
 | `Shortcut:Watch:Teams`, `Shortcut:Watch:Epics` | empty = watch nothing; comma-separated team mention names/ids, epic ids |
+| `GitHub:Watch:Repos` | empty = triage no issues; comma-separated `owner/name` whose issues `factory work` polls (the workers' App needs Issues read/write there) |
 | `Intake:PollSeconds` | `60` |
 | `Intake:MaxItemFailures` | `3` (runs of one item failing in a row before `factory work` escalates/parks it, E10) |
 | `Usage:PollSeconds` | `60` (`factory work` reads the router's subscription usage; also read at each intake poll) |
@@ -119,6 +122,34 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `user-paused` (`RunPipeline.UserPaused`, a Pause control) or `usage-paused` (`RunPipeline.UsagePaused`, the usage pause)
   auto-resume (`RunPipeline.InFlightAsync`), the latter two only once no control pauses the item (the usage pause lifts at
   its `ResumeAt`); a parked item never does. Resumes re-check the scope.
+- Work sources are named by `ItemNaming` (`sc-<story>`, `gh-<key>`: the ledger `Source`, external id, `factory/<id>` branch,
+  `factory-<id>` worktree, `item:<id>` control scope); `factory run`/`--item` take either. The intake loop polls every source
+  in turn (`IntakeLane`), so a triage and an item run never share the sandbox. The merge queue is per repo across sources.
+- GitHub issues (sc-25385, `Issues/`): `IssueIntake` polls each watched repo's open issues updated since its ledger cursor
+  (`github_issue_cursors`; the first poll of a repo starts from now, no backfill). Each issue gets a key (`github_issues`) and a
+  work item `gh-<key>` that waits Paused/parked (`awaiting triage`) until released. Each issue version (sha of title+body) is
+  triaged once by a normal, unpinned worker (`WorkerTriageRunner`: throwaway `factory/triage-gh-<key>` worktree whose git
+  holds a contents-read token; nothing is committed or pushed; the issue text is fenced as untrusted). The orchestrator — not
+  the model — routes (`IssueRouting`): question/duplicate → comment only; author without write/maintain/admin
+  (`RepoPermission.IsCollaborator`; read and triage count as outsiders) on the issue's repo, or on the target repo when the
+  triage names another watched repo → comment + `awaiting-approval`; collaborator with an
+  apparent fix (reproduced, or confidence ≥ 0.8; a fix naming its paths, none sealed/protected under the target's
+  `factory/gate.yaml` on its default branch; exactly one watched target repo) → `released` (built); else → comment +
+  `needs-human`. The `triaged` row (route included) is written before anything is posted; comments carry a
+  `<!-- dark-factory:triage <hash> -->` marker (trusted only on the App's own comments: `performed_via_github_app.id`, or
+  failing that the App's bot account — `user.type` Bot and login `<slug>[bot]`, slug from `GET /app`), so a retried post is
+  found, not repeated. Approval: a collaborator's comment whose trimmed text is exactly `Approved` (case-sensitive, never
+  edited — an edit moves `updated_at`), bound to the last triage comment before it, releases a releasable triage when that is
+  the current triage and the approver is also a collaborator on the target repo; every other `Approved` is recorded
+  `approval-ignored` once. The released triage is the item's scope (later edits are
+  not triaged) and its spec (`ReadSpecAsync`: the triage only, `Repo:` line first); the PR body says `Closes owner/name#N`,
+  and Merged closes the issue if still open. The triage title is untrusted: commit message, PR title and body carry it through
+  `UntrustedText.Inert` (no mention, reference, link, image or HTML; a code span in the body). All issue writes use
+  issues-only tokens (`GitHubIssuesClient`). A triage that fails `Intake:MaxItemFailures` times is itself the triage
+  (needs-human; its error cut at 2000 characters); one refused for usage pauses the factory. Listing pages by keyset (`since` =
+  the last page's last `updated_at`). A request GitHub refuses for good (`GitHubRequestException.Permanent`: a 4xx that is not
+  a rate limit, 401 or 408) is recorded `github-refused` on the item and the dashboard and does not hold the repo's cursor; the
+  issue is taken up again when it next changes.
 - Controls (`Controls/`): Pause/Continue/Stop rows in the ledger's `controls` table (scope `factory` | `epic:<id>` |
   `item:sc-<id>`; `WorkItem.EpicId` maps items to epics), written by `factory pause|continue|stop` and the dashboard
   (`ControlActions`), read by every process. `RunPipeline` checks them before every step and, while a worker runs,

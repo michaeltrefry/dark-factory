@@ -25,6 +25,8 @@ public class FactoryCliTests
     [InlineData("pause --item sc-77", "pause item:sc-77")]
     [InlineData("continue --item 77", "continue item:sc-77")]
     [InlineData("stop --item sc-77", "stop item:sc-77")]
+    [InlineData("stop --item gh-4", "stop item:gh-4")]
+    [InlineData("pause --item GH-4", "pause item:gh-4")]
     [InlineData("pause --epic 12", "pause epic:12")]
     [InlineData("stop --epic 12", "stop epic:12")]
     [InlineData("pause --factory", "pause factory")]
@@ -55,9 +57,11 @@ public class FactoryCliTests
     }
 
     [Theory]
-    [InlineData("sc-25172", 25172)]
-    [InlineData("42", 42)]
-    public async Task Run_passes_parsed_story_id(string arg, int expected)
+    [InlineData("sc-25172", "sc-25172")]
+    [InlineData("42", "sc-42")]
+    [InlineData("gh-12", "gh-12")]
+    [InlineData("GH-3", "gh-3")]
+    public async Task Run_passes_the_parsed_work_item(string arg, string expected)
     {
         var (root, calls) = Cli();
         Assert.Equal(0, await root.Parse(["run", arg]).InvokeAsync());
@@ -69,13 +73,16 @@ public class FactoryCliTests
     {
         var (root, calls) = Cli();
         Assert.Equal(0, await root.Parse(["run", "sc-7", "--ignore-scope"]).InvokeAsync());
-        Assert.Equal(["run 7 ignore-scope"], calls);
+        Assert.Equal(["run sc-7 ignore-scope"], calls);
     }
 
     [Theory]
     [InlineData("run", "nope")]
     [InlineData("run")]
     [InlineData("run", "sc-1", "sc-2")]
+    [InlineData("run", "gh-")]
+    [InlineData("run", "gh-0")]
+    [InlineData("run", "gh-1x")]
     public async Task Invalid_run_arguments_fail_without_running(params string[] args)
     {
         var (root, calls) = Cli();
@@ -153,6 +160,17 @@ public class FactoryOptionsTests
         Assert.Equal("michaeltrefry/dark-factory-sandbox", options.DefaultRepo.FullName);
         Assert.Contains("Port=5434", options.LedgerConnectionString);
         Assert.Equal(Worker.WorkerAuth.RouterKey, options.WorkerAuth); // the worker holds no provider credential by default (E5)
+    }
+
+    [Fact]
+    public void Watched_issue_repos_default_to_none_and_are_validated()
+    {
+        Assert.Empty(Options([]).WatchedIssueRepos);
+        Assert.Equal(["acme/widgets", "acme/gadgets"],
+            Options(new() { ["GitHub:Watch:Repos"] = " acme/widgets, acme/gadgets ,ACME/widgets" }).WatchedIssueRepos.Select(r => r.FullName));
+        Assert.Equal(["acme/widgets"], Options(new() { ["GitHub:Watch:Repos:0"] = "acme/widgets" }).WatchedIssueRepos.Select(r => r.FullName));
+        Assert.Contains("GitHub:Watch:Repos",
+            Assert.Throws<InvalidOperationException>(() => Options(new() { ["GitHub:Watch:Repos"] = "acme" }).WatchedIssueRepos).Message);
     }
 
     [Fact]

@@ -56,6 +56,33 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     /// <summary><c>Shortcut:Watch:Teams</c> / <c>Shortcut:Watch:Epics</c>; empty watches nothing.</summary>
     public WatchScope WatchScope => WatchScope.From(config);
 
+    /// <summary>
+    /// <c>GitHub:Watch:Repos</c>: the repos whose issues <c>factory work</c> triages (sc-25385), comma-separated <c>owner/name</c>
+    /// (or an array section). Empty (the default) watches no issues.
+    /// </summary>
+    public IReadOnlyList<RepoRef> WatchedIssueRepos
+    {
+        get
+        {
+            var section = config.GetSection("GitHub:Watch:Repos");
+            var raw = section.Value is { } single ? single.Split(',') : section.GetChildren().Select(c => c.Value ?? "");
+            return raw.Select(v => v.Trim()).Where(v => v.Length > 0)
+                .Select(v =>
+                {
+                    try
+                    {
+                        return RepoRef.Parse(v);
+                    }
+                    catch (ArgumentException ex)
+                    {
+                        throw new InvalidOperationException($"GitHub:Watch:Repos: {ex.Message}", ex);
+                    }
+                })
+                .DistinctBy(r => r.FullName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+    }
+
     /// <summary><c>Intake:PollSeconds</c>: how often <c>factory work</c> polls the board.</summary>
     public TimeSpan PollInterval => TimeSpan.FromSeconds(config.GetValue("Intake:PollSeconds", 60));
 

@@ -58,7 +58,11 @@ public sealed partial class RunPipeline(
     TimeSpan? controlPollInterval = null,
     GateStage? gate = null)
 {
+    /// <summary>The Shortcut source's ledger name (<see cref="ItemNaming.Shortcut"/>); a pipeline names items by its source's <see cref="Naming"/>.</summary>
     public const string Source = "shortcut";
+
+    /// <summary>How this pipeline's source names its items (ledger source, external id, branch).</summary>
+    private ItemNaming Naming => source.Naming;
 
     /// <summary>The longest a single worker tool call may legitimately run: Claude Code's maximum Bash timeout (10 minutes).</summary>
     public static readonly TimeSpan LongestToolCall = TimeSpan.FromMinutes(10);
@@ -247,14 +251,16 @@ public sealed partial class RunPipeline(
     /// <see cref="UserPaused"/> (not parked) while in one.
     /// </summary>
     /// <param name="handled">The states the runner's pipeline drives; default <see cref="HandledStates"/> (production).</param>
+    /// <param name="naming">The source whose items to list; default Shortcut stories.</param>
     public static async Task<IReadOnlyList<int>> InFlightAsync(WorkLedger ledger, CancellationToken ct, IControls? controls = null,
-        IReadOnlySet<WorkState>? handled = null)
+        IReadOnlySet<WorkState>? handled = null, ItemNaming? naming = null)
     {
         controls ??= NoControls.Instance;
         handled ??= HandledStates;
+        naming ??= ItemNaming.Shortcut;
         var stopping = (await controls.ListAsync(ct)).Where(c => c.State == ControlState.Stopping).Select(c => c.Scope).ToHashSet();
         var ids = new List<int>();
-        foreach (var item in await ledger.ActiveItemsAsync(Source, ct))
+        foreach (var item in await ledger.ActiveItemsAsync(naming.Source, ct))
         {
             if (!stopping.Contains(ControlScope.Item(item.ExternalId)))
             {
@@ -265,7 +271,7 @@ public sealed partial class RunPipeline(
                     continue;
                 }
             }
-            if (StoryId.TryParse(item.ExternalId, out var id))
+            if (naming.TryParse(item.ExternalId, out var id))
             {
                 ids.Add(id);
             }
@@ -291,7 +297,7 @@ public sealed partial class RunPipeline(
     public async Task<RunOutcome> RunAsync(int storyId, CancellationToken ct)
     {
         // Decide from the ledger (and the controls) before reading anything from the board.
-        var known = await ledger.FindAsync(Source, StoryId.Format(storyId), ct);
+        var known = await ledger.FindAsync(Naming.Source, Naming.Format(storyId), ct);
         if (known is not null)
         {
             switch (await _controls.EffectiveAsync(known.ExternalId, known.EpicId, ct))
@@ -315,14 +321,14 @@ public sealed partial class RunPipeline(
 
         var spec = await source.ReadSpecAsync(storyId, ct);
         var story = spec.Story;
-        if (known is null && await _controls.EffectiveAsync(StoryId.Format(storyId), spec.Epic?.Id, ct) is not ControlState.Running and var control)
+        if (known is null && await _controls.EffectiveAsync(Naming.Format(storyId), spec.Epic?.Id, ct) is not ControlState.Running and var control)
         {
             // A paused factory or epic claims nothing new: the story stays as it is on the board.
-            log.WriteLine($"[intake] {StoryId.Format(storyId)} is {control} by a control; not claiming it.");
-            return new RunOutcome(0, WorkState.Intake, null, null, $"{StoryId.Format(storyId)} is {control} by a control; not claimed.");
+            log.WriteLine($"[intake] {Naming.Format(storyId)} is {control} by a control; not claiming it.");
+            return new RunOutcome(0, WorkState.Intake, null, null, $"{Naming.Format(storyId)} is {control} by a control; not claimed.");
         }
         var repo = RepoResolver.Resolve(story.Description, defaultRepo);
-        var item = await ledger.GetOrCreateAsync(Source, StoryId.Format(storyId), story.Name, repo.FullName, IntakeDetail(story), ct, spec.Epic?.Id);
+        var item = await ledger.GetOrCreateAsync(Naming.Source, Naming.Format(storyId), story.Name, repo.FullName, IntakeDetail(story), ct, spec.Epic?.Id);
 
         await using var runLock = await locks.TryAcquireAsync(item.Id, ct);
         if (runLock is null)
@@ -458,7 +464,7 @@ public sealed partial class RunPipeline(
         var entered = history.FindLastIndex(e => e.Step is null);
         if (!Runnable(item, await ledger.ContextAsync(item, ct)) && !history.Skip(entered + 1).Any(e => e.Step == Steps.HeldNotice))
         {
-            var id = StoryId.Format(storyId);
+            var id = Naming.Format(storyId);
             try
             {
                 await source.CommentAsync(storyId,
@@ -496,7 +502,7 @@ public sealed partial class RunPipeline(
                 await ledger.RecordAsync(item, WorkState.Paused, null, reason, ct);
             }
             await ledger.CheckpointAsync(item, Steps.Parked, null, reason, ct);
-            var id = StoryId.Format(storyId);
+            var id = Naming.Format(storyId);
             var from = (await ledger.ContextAsync(item, ct)).PausedFrom;
             try
             {
@@ -539,7 +545,7 @@ public sealed partial class RunPipeline(
     {
         var (spec, repo, item) = run;
         var story = spec.Story;
-        var branch = StoryId.BranchName(story.Id);
+        var branch = story.Kind.BranchName(story.Id);
         var fullHistory = await ledger.HistoryAsync(item, ct);
         var attempt = CurrentWorkerAttempt(fullHistory);
         var session = attempt.LastOrDefault(e => e.Step == Steps.Session)?.ClaudeSessionId;
@@ -586,7 +592,7 @@ public sealed partial class RunPipeline(
 
         if (!attempt.Any(e => e.Step == Steps.Pushed))
         {
-            if (!await workspaces.CommitAndPushAsync(repo, workspace, $"{StoryId.Format(story.Id)}: {story.Name}", ct))
+            if (!await workspaces.CommitAndPushAsync(repo, workspace, $"{story.Ref}: {story.PublicName}", ct))
             {
                 throw new InvalidOperationException("Worker finished without changing the repository; nothing to review.");
             }
@@ -597,7 +603,7 @@ public sealed partial class RunPipeline(
         await ThrowIfControlledAsync(item, ct);
         // Returns the branch's already-open PR instead of opening a second one.
         var prUrl = await pullRequests.OpenAsync(repo, workspace.Branch, workspace.BaseBranch,
-            $"{StoryId.Format(story.Id)}: {story.Name}", BuildPrBody(story, session!), ct);
+            $"{story.Ref}: {story.PublicName}", BuildPrBody(story, session!), ct);
         var branchUrl = BranchUrl(repo, workspace.Branch);
         if (!attempt.Any(e => e.Step == Steps.Linked && e.Detail == $"{prUrl} {branchUrl}"))
         {
@@ -802,7 +808,7 @@ public sealed partial class RunPipeline(
             {
                 await ledger.CheckpointAsync(item, Steps.OrphanKilled, null, $"pid {pid}", ct);
             }
-            workspace = await workspaces.ReopenAsync(repo, StoryId.BranchName(storyId), ct);
+            workspace = await workspaces.ReopenAsync(repo, Naming.BranchName(storyId), ct);
         }
         return await FinishStopAsync(item, storyId, repo, workspace, workerStillRunning: false);
     }
@@ -954,17 +960,18 @@ public sealed partial class RunPipeline(
     }
 
     /// <summary>
-    /// Whether a worktree directory (<c>factory-sc-&lt;id&gt;</c>) belongs to an item a re-run would resume
-    /// in it (Implement, a fix round in Fixing or CIHealing, or Paused), so the startup sweep must keep it. Everything else is an orphan.
+    /// Whether a worktree directory (<c>factory-sc-&lt;id&gt;</c>, <c>factory-gh-&lt;id&gt;</c>) belongs to an item a re-run would resume
+    /// in it (Implement, a fix round in Fixing or CIHealing, or Paused), so the startup sweep must keep it. Everything else is an orphan
+    /// (a triage worktree, <c>factory-triage-gh-&lt;id&gt;</c>, never is).
     /// </summary>
     public static async Task<bool> WorktreeIsResumableAsync(WorkLedger ledger, string worktreeName, CancellationToken ct)
     {
         const string prefix = "factory-";
-        if (!worktreeName.StartsWith(prefix, StringComparison.Ordinal) || !StoryId.TryParse(worktreeName[prefix.Length..], out var id))
+        if (!worktreeName.StartsWith(prefix, StringComparison.Ordinal) || ItemNaming.ParseAny(worktreeName[prefix.Length..]) is not { } item)
         {
             return false;
         }
-        return await ledger.StateOfAsync(Source, StoryId.Format(id), ct) is WorkState.Implement or WorkState.Fixing or WorkState.CIHealing
+        return await ledger.StateOfAsync(item.Naming.Source, item.ToString(), ct) is WorkState.Implement or WorkState.Fixing or WorkState.CIHealing
             or WorkState.Paused;
     }
 
@@ -1026,8 +1033,8 @@ public sealed partial class RunPipeline(
     public static async Task<string?> GiveUpAsync(IWorkSource source, WorkLedger ledger, IRunLocks locks, int storyId, string reason,
         TextWriter log, CancellationToken ct)
     {
-        var id = StoryId.Format(storyId);
-        var known = await ledger.FindAsync(Source, id, ct);
+        var id = source.Naming.Format(storyId);
+        var known = await ledger.FindAsync(source.Naming.Source, id, ct);
         if (known is null)
         {
             await source.CommentAsync(storyId,
@@ -1106,13 +1113,13 @@ public sealed partial class RunPipeline(
         var lastState = $"{last.State}{(last.Step is null ? "" : $" (after step {last.Step})")} at {last.RecordedAt:u}";
 
         var comment = $"""
-            [author: dark-factory] {StoryId.Format(storyId)} escalated; a human needs to look.
+            [author: dark-factory] {source.Naming.Format(storyId)} escalated; a human needs to look.
 
             Reason: {reason}
             Last ledger state: {lastState}
             Claude session: {session ?? "none"}
 
-            Re-run with `factory run {StoryId.Format(storyId)}` once resolved.
+            Re-run with `factory run {source.Naming.Format(storyId)}` once resolved.
             """;
         try
         {
@@ -1121,7 +1128,7 @@ public sealed partial class RunPipeline(
         catch (Exception ex)
         {
             await ledger.CheckpointAsync(item, Steps.EscalationComment, session, $"failed: {ex.Message}", CancellationToken.None);
-            log.WriteLine($"[escalated] could not comment on {StoryId.Format(storyId)}: {ex.Message}; `factory run {StoryId.Format(storyId)}` retries it");
+            log.WriteLine($"[escalated] could not comment on {source.Naming.Format(storyId)}: {ex.Message}; `factory run {source.Naming.Format(storyId)}` retries it");
             return ex.Message;
         }
         await ledger.CheckpointAsync(item, Steps.EscalationComment, session, "posted", CancellationToken.None);
@@ -1147,7 +1154,7 @@ public sealed partial class RunPipeline(
         var story = spec.Story;
         var prompt = $"""
             You are a Dark Factory worker. The current directory is a git worktree of {repo}.
-            Implement Shortcut story {StoryId.Format(story.Id)} ({story.StoryType}): {story.Name}
+            Implement {story.Kind.Noun} {story.Ref} ({story.StoryType}): {story.Name}
 
             Story description:
             {story.Description}
@@ -1169,14 +1176,18 @@ public sealed partial class RunPipeline(
 
     public static string BuildResumePrompt(WorkStory story) =>
         $"""
-        You were interrupted while implementing Shortcut story {StoryId.Format(story.Id)}.
+        You were interrupted while implementing {story.Kind.Noun} {story.Ref}.
         Check the current state of the worktree and finish the story as originally instructed.
         """;
 
+    /// <summary>
+    /// The PR's description: it links back to the item, and for an item that closes an issue (<see cref="WorkStory.Closes"/>)
+    /// carries GitHub's closing keyword, so merging the PR closes the issue. An untrusted name (a triage's title) is inert, in a code span.
+    /// </summary>
     public static string BuildPrBody(WorkStory story, string sessionId) =>
         $"""
-        Implements Shortcut story [{StoryId.Format(story.Id)}]({story.AppUrl}): {story.Name}
-
+        Implements {story.Kind.Noun} [{story.Ref}]({story.AppUrl}): {(story.UntrustedName ? UntrustedText.CodeSpan(story.Name) : story.Name)}
+        {(story.Closes is { } closes ? $"\nCloses {closes}\n" : "")}
         Opened by Dark Factory. Claude session: `{sessionId}`
         """;
 }

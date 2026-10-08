@@ -23,7 +23,7 @@
     <ul class="error item-errors">
         @foreach (var (story, error) in itemErrors.OrderBy(e => e.Key))
         {
-            <li data-story="@story"><span class="id">@StoryId.Format(story)</span> failed @error.Count
+            <li data-story="@story"><span class="id">@story</span> failed @error.Count
                 @(error.Count == 1 ? "run" : "runs") in a row before its pipeline started (last at @error.At.ToString("u")): @error.Message@(error.GaveUp is { } gaveUp ? $" — {gaveUp}" : "")</li>
         }
     </ul>

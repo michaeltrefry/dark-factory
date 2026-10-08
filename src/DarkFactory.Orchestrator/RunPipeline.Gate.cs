@@ -441,7 +441,7 @@ public sealed partial class RunPipeline
             ?? throw new InvalidOperationException($"The verdict on {fixedHead} has no confirmed blocking findings to fix.");
         await RunFixRoundAsync(run, history, round, fixedHead, $"{findings.Count} finding(s)",
             _ => Task.FromResult(BuildFixPrompt(spec, repo, round, findings)), BuildFixResumePrompt(spec.Story, round),
-            $"{StoryId.Format(spec.Story.Id)}: fix review findings (round {round})", WorkState.Review, $"fix round {round}", ct);
+            $"{spec.Story.Ref}: fix review findings (round {round})", WorkState.Review, $"fix round {round}", ct);
     }
 
     /// <summary>
@@ -461,7 +461,7 @@ public sealed partial class RunPipeline
         var attempt = CurrentWorkerAttempt(history);
         var session = attempt.LastOrDefault(e => e.Step == Steps.Session)?.ClaudeSessionId;
         var models = ImplementerModels(history).ToHashSet(StringComparer.Ordinal);
-        var branch = StoryId.BranchName(spec.Story.Id);
+        var branch = spec.Story.Kind.BranchName(spec.Story.Id);
 
         if (OrphanedWorkerPid(attempt) is { } pid && await worker.StopOrphanAsync(pid, ct))
         {
@@ -547,7 +547,7 @@ public sealed partial class RunPipeline
         await RunFixRoundAsync(run, history, round, fixedHead, $"failing checks: {string.Join(", ", triage.Fixable)}",
             async c => BuildCiFixPrompt(spec, repo, round, fixedHead, await FailureLogsAsync(run, fixedHead, triage, c)),
             BuildCiFixResumePrompt(spec.Story, round),
-            $"{StoryId.Format(spec.Story.Id)}: fix CI (round {round})", WorkState.CI, $"ci fix round {round}", ct);
+            $"{spec.Story.Ref}: fix CI (round {round})", WorkState.CI, $"ci fix round {round}", ct);
     }
 
     /// <summary>
@@ -599,7 +599,7 @@ public sealed partial class RunPipeline
             """));
         return $"""
             You are a Dark Factory worker. The current directory is a git worktree of {repo} on the pull request branch that
-            implements Shortcut story {StoryId.Format(story.Id)} ({story.StoryType}): {story.Name}
+            implements {story.Kind.Noun} {story.Ref} ({story.StoryType}): {story.Name}
 
             Story description:
             {story.Description}
@@ -618,7 +618,7 @@ public sealed partial class RunPipeline
 
     public static string BuildCiFixResumePrompt(WorkStory story, int round) =>
         $"""
-        You were interrupted while fixing the failing CI of Shortcut story {StoryId.Format(story.Id)} (fix round {round}).
+        You were interrupted while fixing the failing CI of {story.Kind.Noun} {story.Ref} (fix round {round}).
         Check the current state of the worktree and finish fixing the failures as originally instructed.
         """;
 
@@ -639,7 +639,7 @@ public sealed partial class RunPipeline
             """));
         return $"""
             You are a Dark Factory worker. The current directory is a git worktree of {repo} on the pull request branch that
-            implements Shortcut story {StoryId.Format(story.Id)} ({story.StoryType}): {story.Name}
+            implements {story.Kind.Noun} {story.Ref} ({story.StoryType}): {story.Name}
 
             Story description:
             {story.Description}
@@ -657,7 +657,7 @@ public sealed partial class RunPipeline
 
     public static string BuildFixResumePrompt(WorkStory story, int round) =>
         $"""
-        You were interrupted while fixing the review findings of Shortcut story {StoryId.Format(story.Id)} (fix round {round}).
+        You were interrupted while fixing the review findings of {story.Kind.Noun} {story.Ref} (fix round {round}).
         Check the current state of the worktree and finish fixing the findings as originally instructed.
         """;
 
@@ -859,7 +859,7 @@ public sealed partial class RunPipeline
             try
             {
                 result = await NewTestsCheck.RunAsync(runner, NewTestsCheck.Strategies, run.Repo, pull.BaseSha, pull.HeadSha,
-                    NewTestsCheck.RunName(run.Story.Id), line => log.WriteLine($"[gate] {line}"), watch.Token);
+                    NewTestsCheck.RunName(run.Story), line => log.WriteLine($"[gate] {line}"), watch.Token);
             }
             catch (Exception) when (watch.Requested is { } requested && !ct.IsCancellationRequested)
             {

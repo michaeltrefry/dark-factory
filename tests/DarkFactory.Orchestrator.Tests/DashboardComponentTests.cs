@@ -110,19 +110,19 @@ public class DashboardComponentTests : BunitContext
         Assert.Empty(cut.FindAll(".item-errors"));
 
         _intake.FactoryFailed("sc-5 could not run: the worker run lock: Another factory run is using /w");
-        _intake.ItemFailed(101, "InvalidOperationException: Shortcut GET stories/101 failed: 404 Not Found");
-        _intake.ItemFailed(101, "InvalidOperationException: Shortcut GET stories/101 failed: 404 Not Found");
-        _intake.ItemGaveUp(101, "escalated");
+        _intake.ItemFailed("sc-101", "InvalidOperationException: Shortcut GET stories/101 failed: 404 Not Found");
+        _intake.ItemFailed("sc-101", "InvalidOperationException: Shortcut GET stories/101 failed: 404 Not Found");
+        _intake.ItemGaveUp("sc-101", "escalated");
 
         cut.WaitForAssertion(() => Assert.Contains("Another factory run", cut.Find(".factory-error").TextContent));
-        var line = cut.Find(".item-errors li[data-story='101']").TextContent;
+        var line = cut.Find(".item-errors li[data-story='sc-101']").TextContent;
         Assert.Contains("sc-101", line);
         Assert.Contains("failed 2", line);
         Assert.Contains("404 Not Found", line);
         Assert.Contains("escalated", line);
 
         _intake.FactoryOk();
-        _intake.ItemOk(101);
+        _intake.ItemOk("sc-101");
         cut.WaitForAssertion(() => Assert.Empty(cut.FindAll(".factory-error")));
         Assert.Empty(cut.FindAll(".item-errors"));
     }

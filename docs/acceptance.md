@@ -212,6 +212,27 @@ FACTORY_E2E=1 FACTORY_E2E_REVIEW_SEED=1 \
 Since sc-25378 every `factory run` / `factory work` run goes on past Review, so the Phase 1 tests above (AT1–AT5) also
 need the gate App, and their stories' PRs get merged when they pass the gate.
 
+## P2-AT-issues — GitHub issue triage, routing by author, collaborator approval (sc-25385)
+
+Automated: `IssueTriageTests` (tests/DarkFactory.AcceptanceTests), live, skipped unless `FACTORY_E2E=1` and
+`FACTORY_E2E_ISSUES=1`. They open real issues on the sandbox repo (`Factory:DefaultRepo`, watched through
+`GitHub:Watch:Repos`), run the production issue intake (`FactoryRunner.PollIssuesAsync`: the triage is a real sandboxed
+worker through the router) against a throwaway ledger, and close every issue they opened.
+
+Owner set-up, once: grant the factory's (workers') App the **Issues: Read and write** repository permission
+(`src/DarkFactory.Orchestrator/GitHub/app-manifest.json` lists it for new registrations; an existing App needs it added in
+its GitHub settings and the installation's update accepted), plus everything P2-AT1 needs (the gate merges the first test's PR).
+
+| Test | Variables | Proves |
+| --- | --- | --- |
+| `A_collaborators_issue_with_a_confident_fix_is_built_and_its_merged_pr_closes_the_issue` | `GH_TOKEN` (the owner) | the owner's issue is triaged, routed `build` and released at once; `factory run gh-<key>` takes it through the gate; the PR body says `Closes owner/name#N`; the merged PR closed the issue |
+| `An_outsiders_issue_waits_for_a_collaborators_approval` | `GH_TOKEN`, `FACTORY_E2E_OUTSIDER_TOKEN` (an account without write access) | the outsider's issue gets the triage comment and `awaiting-approval` and is not built; GitHub names the factory's App (`performed_via_github_app.id`) on that comment, posted by a Bot account (the unit fixtures are written, not recorded); the outsider's own `Approved` is ignored (recorded); the owner's `Approved` releases it |
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_ISSUES=1 GH_TOKEN=$(gh auth token) FACTORY_E2E_OUTSIDER_TOKEN=<token> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-class "*IssueTriageTests"
+```
+
 ## Upgrading a Phase 1 ledger: items parked at Review
 
 Phase 1 parked every finished item at Review; since sc-25378 Review is a state the factory drives, so the first

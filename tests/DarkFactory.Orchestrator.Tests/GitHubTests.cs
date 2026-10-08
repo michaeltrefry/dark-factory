@@ -222,7 +222,7 @@ public class GitHubAppTests
 public class GitHubAppSetupTests
 {
     [Fact]
-    public void Manifest_requests_only_contents_pr_write_and_metadata_read_without_webhook()
+    public void Manifest_requests_only_contents_pr_and_issues_write_and_metadata_read_without_webhook()
     {
         var manifest = JsonDocument.Parse(GitHubAppSetup.BuildManifest("dark-factory-test", 50123)).RootElement;
 
@@ -237,6 +237,7 @@ public class GitHubAppSetupTests
         {
             ["contents"] = "write",
             ["pull_requests"] = "write",
+            ["issues"] = "write", // sc-25385: the orchestrator reads, comments on and labels watched repos' issues
             ["metadata"] = "read",
         }, permissions);
     }

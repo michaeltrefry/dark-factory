@@ -1,0 +1,185 @@
+{
+  "source": "Written from GitHub's REST API reference (version 2022-11-28: issues, issue comments, labels, collaborators, repository contents), trimmed to the fields the factory reads. Not a live recording: the factory must never create, comment on or label a real issue to record one.",
+  "interactions": [
+    {
+      "method": "GET",
+      "path": "/repos/acme/widgets/issues?state=open&sort=updated&direction=asc&per_page=100&page=1&since=2026-10-08T12%3A00%3A00Z",
+      "token": "issues:read",
+      "request": null,
+      "status": 200,
+      "response": [
+        {
+          "number": 11,
+          "title": "Crash on empty input",
+          "body": "Run it with no arguments.",
+          "user": { "login": "visitor", "type": "User" },
+          "state": "open",
+          "labels": [],
+          "html_url": "https://github.com/acme/widgets/issues/11",
+          "created_at": "2026-10-08T11:00:00Z",
+          "updated_at": "2026-10-08T12:00:05Z",
+          "author_association": "NONE"
+        },
+        {
+          "number": 13,
+          "title": "factory/sc-1: fix the parser",
+          "body": "A pull request: the issues API lists pull requests too.",
+          "user": { "login": "dark-factory[bot]", "type": "Bot" },
+          "state": "open",
+          "labels": [],
+          "html_url": "https://github.com/acme/widgets/pull/13",
+          "updated_at": "2026-10-08T12:00:06Z",
+          "pull_request": { "url": "https://api.github.com/repos/acme/widgets/pulls/13", "html_url": "https://github.com/acme/widgets/pull/13" }
+        },
+        {
+          "number": 12,
+          "title": "WordCount counts whitespace",
+          "body": null,
+          "user": { "login": "maintainer", "type": "User" },
+          "state": "open",
+          "labels": [ { "id": 1, "name": "awaiting-approval", "color": "ededed" } ],
+          "html_url": "https://github.com/acme/widgets/issues/12",
+          "updated_at": "2026-10-08T12:00:07Z"
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/repos/acme/widgets/issues/12",
+      "token": "issues:read",
+      "request": null,
+      "status": 200,
+      "response": {
+        "number": 12,
+        "title": "WordCount counts whitespace",
+        "body": "WordCount(\"  \") returns 1.",
+        "user": { "login": "maintainer", "type": "User" },
+        "state": "open",
+        "labels": [ { "id": 1, "name": "awaiting-approval" }, { "id": 2, "name": "bug" } ],
+        "html_url": "https://github.com/acme/widgets/issues/12",
+        "updated_at": "2026-10-08T12:00:07Z"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/repos/acme/widgets/issues/12/comments?per_page=100&page=1",
+      "token": "issues:read",
+      "request": null,
+      "status": 200,
+      "response": [
+        {
+          "id": 2001,
+          "body": "[author: dark-factory] Triage of this issue\n<!-- dark-factory:triage 0123456789abcdef -->",
+          "user": { "login": "dark-factory[bot]", "type": "Bot" },
+          "created_at": "2026-10-08T12:00:08Z",
+          "updated_at": "2026-10-08T12:00:08Z",
+          "performed_via_github_app": { "id": 4242, "slug": "dark-factory", "name": "dark-factory" }
+        },
+        {
+          "id": 2002,
+          "body": "Approved",
+          "user": { "login": "maintainer", "type": "User" },
+          "created_at": "2026-10-08T12:01:00Z",
+          "updated_at": "2026-10-08T12:03:00Z",
+          "performed_via_github_app": null
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/repos/acme/widgets/collaborators/maintainer/permission",
+      "token": "metadata:read",
+      "request": null,
+      "status": 200,
+      "response": { "permission": "write", "role_name": "maintain", "user": { "login": "maintainer" } }
+    },
+    {
+      "method": "GET",
+      "path": "/repos/acme/widgets/collaborators/triager/permission",
+      "token": "metadata:read",
+      "request": null,
+      "status": 200,
+      "response": { "permission": "read", "role_name": "triage", "user": { "login": "triager" } }
+    },
+    {
+      "method": "GET",
+      "path": "/repos/acme/widgets/collaborators/stranger/permission",
+      "token": "metadata:read",
+      "request": null,
+      "status": 404,
+      "response": { "message": "stranger is not a user", "documentation_url": "https://docs.github.com/rest/collaborators/collaborators" }
+    },
+    {
+      "method": "GET",
+      "path": "/repos/acme/widgets/contents/factory/gate.yaml",
+      "token": "contents:read",
+      "request": null,
+      "status": 200,
+      "response": null,
+      "raw": "version: 2\n"
+    },
+    {
+      "method": "GET",
+      "path": "/repos/acme/gadgets/contents/factory/gate.yaml",
+      "token": "contents:read",
+      "request": null,
+      "status": 404,
+      "response": { "message": "Not Found" }
+    },
+    {
+      "method": "POST",
+      "path": "/repos/acme/widgets/issues/12/comments",
+      "token": "issues:write",
+      "request": { "body": "[author: dark-factory] hello" },
+      "status": 201,
+      "response": {
+        "id": 2003,
+        "body": "[author: dark-factory] hello",
+        "user": { "login": "dark-factory[bot]", "type": "Bot" },
+        "created_at": "2026-10-08T12:05:00Z",
+        "updated_at": "2026-10-08T12:05:00Z",
+        "performed_via_github_app": { "id": 4242 }
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/repos/acme/widgets/issues/12/labels",
+      "token": "issues:write",
+      "request": { "labels": [ "needs-human" ] },
+      "status": 200,
+      "response": [ { "id": 1, "name": "awaiting-approval" }, { "id": 3, "name": "needs-human" } ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/repos/acme/widgets/issues/12/labels/awaiting-approval",
+      "token": "issues:write",
+      "request": null,
+      "status": 200,
+      "response": [ { "id": 3, "name": "needs-human" } ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/repos/acme/widgets/issues/12/labels/factory-claimed",
+      "token": "issues:write",
+      "request": null,
+      "status": 404,
+      "response": { "message": "Label does not exist" }
+    },
+    {
+      "method": "PATCH",
+      "path": "/repos/acme/widgets/issues/12",
+      "token": "issues:write",
+      "request": { "state": "closed", "state_reason": "completed" },
+      "status": 200,
+      "response": {
+        "number": 12,
+        "title": "WordCount counts whitespace",
+        "user": { "login": "maintainer", "type": "User" },
+        "state": "closed",
+        "labels": [],
+        "html_url": "https://github.com/acme/widgets/issues/12",
+        "updated_at": "2026-10-08T12:06:00Z"
+      }
+    }
+  ]
+}

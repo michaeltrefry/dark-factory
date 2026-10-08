@@ -26,7 +26,7 @@ public static class FactoryRunner
     {
         try
         {
-            if (options.WatchScope.IsEmpty)
+            if (source.Naming == ItemNaming.Shortcut ? options.WatchScope.IsEmpty : options.WatchedIssueRepos.Count == 0)
             {
                 return null;
             }
@@ -111,6 +111,40 @@ public static class FactoryRunner
     {
         using var shortcutHttp = new HttpClient { BaseAddress = ShortcutWorkSource.DefaultBaseAddress };
         return await RunAsync(options, CreateWorkSource(options, shortcutHttp), storyId, ignoreScope, log, ct);
+    }
+
+    /// <summary><c>factory run &lt;item&gt;</c> for an item of any source: a Shortcut story (<c>sc-N</c>) or a GitHub issue (<c>gh-N</c>).</summary>
+    public static async Task<RunOutcome> RunAsync(FactoryOptions options, ItemRef item, bool ignoreScope, TextWriter log, CancellationToken ct)
+    {
+        if (item.Naming == ItemNaming.Shortcut)
+        {
+            return await RunAsync(options, item.Id, ignoreScope, log, ct);
+        }
+        using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        return await RunAsync(options, CreateIssueSource(options, githubHttp), item.Id, ignoreScope, log, ct);
+    }
+
+    /// <summary>The GitHub issue work source over the watched repos (<c>GitHub:Watch:Repos</c>), as the workers' App.</summary>
+    public static Issues.GitHubIssueWorkSource CreateIssueSource(FactoryOptions options, HttpClient githubHttp) =>
+        new(IssuesClient(options, githubHttp), Contexts(options), options.WatchedIssueRepos);
+
+    private static GitHubIssuesClient IssuesClient(FactoryOptions options, HttpClient githubHttp) =>
+        new(githubHttp, new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System));
+
+    private static LedgerDbContextFactory Contexts(FactoryOptions options) =>
+        new(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
+
+    /// <summary>
+    /// <c>factory work</c>'s GitHub issue intake, one poll (<see cref="Issues.IssueIntake"/>): triage runs in the sandbox like any
+    /// worker (<see cref="SandboxTriageRunner"/>), one at a time with the item runs (the intake loop runs both).
+    /// </summary>
+    public static async Task PollIssuesAsync(FactoryOptions options, IntakeStatus status, TextWriter log, CancellationToken ct)
+    {
+        using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        var intake = new Issues.IssueIntake(IssuesClient(options, githubHttp), options.WatchedIssueRepos, Contexts(options),
+            new PostgresRunLocks(options.LedgerConnectionString), Controls(options), new SandboxTriageRunner(options, log), status,
+            options.MaxItemFailures, TimeProvider.System, log);
+        await intake.PollAsync(ct);
     }
 
     public static Task<RunOutcome> RunAsync(FactoryOptions options, IWorkSource source, int storyId, bool ignoreScope, TextWriter log, CancellationToken ct) =>
@@ -214,7 +248,8 @@ public static class FactoryRunner
         // Stop needs the board and GitHub, and an epic scope the board (for items with no epic in the ledger);
         // Pause and Continue otherwise only write the control.
         var source = action == "stop" || ControlScope.EpicOf(scope) is not null ? CreateWorkSource(options, shortcutHttp) : null;
-        var stops = action == "stop" ? new FactoryItemStops(options, source!, log) : null;
+        using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        var stops = action == "stop" ? new FactoryItemStops(options, source!, log, CreateIssueSource(options, githubHttp)) : null;
         var actions = new ControlActions(Controls(options), contexts, stops, source, new PostgresRunLocks(options.LedgerConnectionString));
         return action switch
         {
@@ -226,28 +261,80 @@ public static class FactoryRunner
     }
 }
 
-/// <summary>Production <see cref="IItemStops"/>: an <see cref="ItemStopper"/> over the Postgres ledger, Shortcut and GitHub, per call.</summary>
-public sealed class FactoryItemStops(FactoryOptions options, IWorkSource source, TextWriter log) : IItemStops
+/// <summary>
+/// Production <see cref="IItemStops"/>: an <see cref="ItemStopper"/> over the Postgres ledger, the item's work source (Shortcut, or
+/// <paramref name="issues"/> for a GitHub issue) and GitHub, per call.
+/// </summary>
+public sealed class FactoryItemStops(FactoryOptions options, IWorkSource source, TextWriter log, IWorkSource? issues = null) : IItemStops
 {
-    public async Task<ControlResult> StopAsync(int storyId, CancellationToken ct)
+    public Task<ControlResult> StopAsync(int storyId, CancellationToken ct) => StopAsync(source, storyId, ct);
+
+    public Task<ControlResult> StopAsync(ItemRef item, CancellationToken ct) =>
+        new[] { source, issues }.OfType<IWorkSource>().FirstOrDefault(s => s.Naming == item.Naming) is { } owner
+            ? StopAsync(owner, item.Id, ct)
+            : Task.FromResult(new ControlResult(true, $"{item}: stop requested; its next run stops it."));
+
+    private async Task<ControlResult> StopAsync(IWorkSource owner, int id, CancellationToken ct)
     {
         using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
         var app = new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System);
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
-        var stopper = new ItemStopper(source, new WorkLedger(db, TimeProvider.System), new PostgresRunLocks(options.LedgerConnectionString),
+        var stopper = new ItemStopper(owner, new WorkLedger(db, TimeProvider.System), new PostgresRunLocks(options.LedgerConnectionString),
             new GitHubPullRequests(githubHttp, app), FactoryRunner.Controls(options), log);
-        return await stopper.StopAsync(storyId, ct);
+        return await stopper.StopAsync(id, ct);
     }
 }
 
-/// <summary>The intake loop's runner: the production pipeline over the Postgres ledger.</summary>
+/// <summary>
+/// Production <see cref="Issues.ITriageRunner"/>: one triage session as a sandboxed worker, like an item's run — the worker run lock,
+/// the sandbox readiness check (both factory-wide failures, E10), the router-only worker, its events stored (E7) — in a worktree whose
+/// owner-side git holds a contents-read token only (<see cref="Issues.WorkerTriageRunner.TriageWorkspaceToken"/>).
+/// </summary>
+public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) : Issues.ITriageRunner
+{
+    public async Task<WorkerResult> RunAsync(WorkItem item, RepoRef repo, string prompt, Func<string, CancellationToken, Task> onSession,
+        CancellationToken ct)
+    {
+        var routerKey = options.RouterKey;
+        var sandbox = options.WorkerSandbox;
+        using var sandboxLock = sandbox is null ? null : await FactoryWideStep("the worker run lock", () => WorkerLock.Acquire(options.WorkRoot));
+        if (sandbox is not null)
+        {
+            await FactoryRunner.EnsureSandboxReadyAsync(sandbox, options.WorkerAuth, ct);
+        }
+        using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        using var routerHttp = new HttpClient { BaseAddress = options.RouterBaseUrl };
+        var app = new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System);
+        var workspaces = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
+            async (r, c) => (await app.CreateInstallationTokenAsync(r, c, Issues.WorkerTriageRunner.TriageWorkspaceToken)).Token, sandbox: sandbox);
+        var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, sandbox,
+            pauseFlagDirectory: options.PauseFlagDirectory);
+        var sessions = new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)),
+            new RouterClient(routerHttp, routerKey), TimeProvider.System, log, costSettleDelay: options.CostSettleDelay);
+        return await new Issues.WorkerTriageRunner(workspaces, worker, sessions, log).RunAsync(item, repo, prompt, onSession, ct);
+    }
+
+    private static Task<T> FactoryWideStep<T>(string what, Func<T> step)
+    {
+        try
+        {
+            return Task.FromResult(step());
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new FactoryUnavailableException($"{what}: {ex.Message}", ex);
+        }
+    }
+}
+
+/// <summary>The intake loop's runner: the production pipeline over the Postgres ledger, for one work source's items.</summary>
 public sealed class FactoryItemRunner(FactoryOptions options, IWorkSource source, TextWriter log) : IItemRunner
 {
     public async Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct)
     {
         // `factory work` migrated the ledger (LedgerMigrations) before the host started.
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
-        return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ct, FactoryRunner.Controls(options));
+        return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ct, FactoryRunner.Controls(options), naming: source.Naming);
     }
 
     public Task<RunOutcome> RunAsync(int id, CancellationToken ct) => FactoryRunner.RunAsync(options, source, id, ignoreScope: false, log, ct);

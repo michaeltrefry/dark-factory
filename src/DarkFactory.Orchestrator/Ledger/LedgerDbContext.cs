@@ -131,8 +131,35 @@ public sealed class Control
     public bool PausesAt(DateTimeOffset now) => State == Controls.ControlState.Paused && (ResumeAt is null || now < ResumeAt);
 }
 
+/// <summary>
+/// A GitHub issue the factory has seen in a watched repo, and the key (<see cref="Id"/>) its work item is named by
+/// (<c>gh-&lt;Id&gt;</c>, <see cref="WorkSources.ItemNaming.GitHubIssue"/>): issue numbers repeat across repos.
+/// Everything the factory decides about the issue is a ledger row of that work item.
+/// </summary>
+public sealed class GitHubIssue
+{
+    public int Id { get; set; }
+
+    /// <summary>The issue's repo, <c>owner/name</c>.</summary>
+    public required string Repo { get; set; }
+
+    public int Number { get; set; }
+
+    public DateTimeOffset FirstSeenAt { get; set; }
+}
+
+/// <summary>How far the issue poll of one watched repo has read (issues updated at or after <see cref="Since"/> are read again).</summary>
+public sealed class GitHubIssueCursor
+{
+    public required string Repo { get; set; }
+
+    public DateTimeOffset Since { get; set; }
+}
+
 public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) : DbContext(options)
 {
+    public DbSet<GitHubIssue> GitHubIssues => Set<GitHubIssue>();
+    public DbSet<GitHubIssueCursor> GitHubIssueCursors => Set<GitHubIssueCursor>();
     public DbSet<WorkItem> WorkItems => Set<WorkItem>();
     public DbSet<LedgerEntry> LedgerEntries => Set<LedgerEntry>();
     public DbSet<WorkerSession> WorkerSessions => Set<WorkerSession>();
@@ -189,6 +216,18 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
             e.Property(x => x.ChangedBy).HasMaxLength(128);
             e.Property(x => x.Reason).HasMaxLength(64);
             e.Property(x => x.Version).IsRowVersion();
+        });
+        modelBuilder.Entity<GitHubIssue>(e =>
+        {
+            e.ToTable("github_issues");
+            e.Property(x => x.Repo).HasMaxLength(200);
+            e.HasIndex(x => new { x.Repo, x.Number }).IsUnique();
+        });
+        modelBuilder.Entity<GitHubIssueCursor>(e =>
+        {
+            e.ToTable("github_issue_cursors");
+            e.HasKey(x => x.Repo);
+            e.Property(x => x.Repo).HasMaxLength(200);
         });
     }
 

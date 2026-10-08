@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using DarkFactory.Orchestrator.Shortcut;
+using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.Orchestrator.Gate;
 
@@ -567,5 +568,5 @@ public static class NewTestsCheck
     }
 
     /// <summary>The worktree name prefix of an item's gate runs (swept like any worktree no run resumes).</summary>
-    public static string RunName(int storyId) => $"gate-{StoryId.Format(storyId)}";
+    public static string RunName(WorkStory story) => $"gate-{story.Ref}";
 }
