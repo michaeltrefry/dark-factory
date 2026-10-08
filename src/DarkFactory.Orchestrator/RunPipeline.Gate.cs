@@ -1,3 +1,4 @@
+using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
@@ -69,7 +70,10 @@ public sealed partial class RunPipeline
     /// <summary>
     /// Review: one reviewer, pinned through the router to a model family the implementer did not use, judges the PR's
     /// current head commit. The verdict is checkpointed bound to that commit (E3) before it counts; a commit that already
-    /// has a verdict is not reviewed again. Pass → CI; fail → escalate (the fix loop is not part of this stage yet).
+    /// has a verdict is not reviewed again. Pass → CI; fail → escalate (the fix loop is not part of this stage yet). The
+    /// reviewer's router session is named in the ledger (<see cref="Steps.ReviewSession"/>) before the call, and never as a
+    /// row's Claude session (that column stays the implementer's). The router refusing the call for usage pauses the factory
+    /// for usage (the item resumes and reviews again once it lifts) rather than escalating the item.
     /// </summary>
     private async Task ReviewAsync(Run run, CancellationToken ct)
     {
@@ -81,8 +85,24 @@ public sealed partial class RunPipeline
             var model = ReviewerChoice.Choose(Gate.ReviewerModels, ImplementerModels(history));
             log.WriteLine($"[review] {pull.HtmlUrl} head {Ci.Short(pull.HeadSha)}: reviewing with {model}");
             var diff = await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
-            verdict = await Gate.Reviewer.ReviewAsync(new ReviewRequest(run.Story, run.Repo.FullName, pull, diff, model), ct);
-            await ledger.CheckpointAsync(run.Item, Steps.Verdict, verdict.Session, verdict.ToDetail(), ct);
+            var session = Guid.NewGuid().ToString();
+            await ledger.CheckpointAsync(run.Item, Steps.ReviewSession, null, $"{session} {model} {pull.HeadSha}", ct);
+            try
+            {
+                verdict = await Gate.Reviewer.ReviewAsync(new ReviewRequest(run.Story, run.Repo.FullName, pull, diff, model, session), ct);
+            }
+            catch (RouterUsageLimitedException ex)
+            {
+                // The plans ran out, not the review: pause the factory (backing off) and review this head again afterwards.
+                // Without a control table nothing could hold the pause, so the failure escalates.
+                if (await _controls.PauseForUsageAsync(null, UsagePause.ReviewerRateLimited, ct) is { State: ControlState.Paused } pause)
+                {
+                    log.WriteLine($"[review] {ex.Message}; factory paused for usage until {pause.ResumeAt:u}");
+                    throw new ControlRequestedException(ControlState.Paused);
+                }
+                throw;
+            }
+            await ledger.CheckpointAsync(run.Item, Steps.Verdict, null, verdict.ToDetail(), ct);
         }
         log.WriteLine($"[review] {Ci.Short(pull.HeadSha)}: {verdict.Verdict} by {verdict.ServedModel ?? verdict.Model}");
         if (!verdict.Passed)
@@ -134,17 +154,20 @@ public sealed partial class RunPipeline
     /// the PR, its head commit's CI and the ledger's verdicts — and checkpoints the decision. Merge: merges exactly the
     /// gated head commit with the gate App's token, then records Merge with the merge commit. A head with no verdict (a
     /// push after the review, or one that lands between the evaluation and the merge, which GitHub refuses) → Review.
-    /// Anything else → escalate; nothing merges.
+    /// Anything else → escalate; nothing merges. A PR found merged (on resume, or re-read after a failed merge call) at a
+    /// head some <see cref="Steps.GatePassed"/> names is recorded as merged; merged at any other head, it escalates.
     /// </summary>
     private async Task MergeGateAsync(Run run, CancellationToken ct)
     {
         var (history, pull) = await ReadPullAsync(run, ct);
-        var entered = history.FindLastIndex(e => e.Step is null);
         if (pull.Merged)
         {
-            // A run that crashed after GitHub merged but before the ledger said so: only the commit this gate passed counts.
-            if (history.Skip(entered + 1).Any(e => e.Step == Steps.GatePassed && e.Detail == pull.HeadSha) && pull.MergeCommitSha is { } commit)
+            // A run that stopped after GitHub merged but before the ledger said so (a crash, Ctrl-C during the merge call,
+            // then an "unpaused" row): only a commit this gate passed counts. gate-passed is bound to its head SHA, so one
+            // anywhere in the item's history proves the merged head is a commit the gate let through.
+            if (GatePassedAt(history, pull) is { } commit)
             {
+                log.WriteLine($"[merge] {pull.HtmlUrl} was merged by the gate at {Ci.Short(pull.HeadSha)} as {commit}; recording it");
                 await ledger.RecordAsync(run.Item, WorkState.Merge, null, commit, ct);
                 return;
             }
@@ -175,7 +198,22 @@ public sealed partial class RunPipeline
 
         await ThrowIfControlledAsync(run.Item, ct);
         await ledger.CheckpointAsync(run.Item, Steps.GatePassed, null, pull.HeadSha, ct);
-        var merged = await Gate.GitHub.MergeAsync(run.Repo, pull.Number, pull.HeadSha, ct);
+        MergeResult merged;
+        try
+        {
+            merged = await Gate.GitHub.MergeAsync(run.Repo, pull.Number, pull.HeadSha, ct);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            // The call failed (e.g. timed out) but GitHub may have merged anyway: a PR merged at the gated head is merged.
+            if (await MergedAfterFailureAsync(run, pull, ex, ct) is not { } commit)
+            {
+                throw;
+            }
+            log.WriteLine($"[merge] the merge call failed ({ex.Message}), but GitHub merged {pull.HtmlUrl} at {Ci.Short(pull.HeadSha)} as {commit}");
+            await ledger.RecordAsync(run.Item, WorkState.Merge, null, commit, ct);
+            return;
+        }
         if (merged.HeadMoved)
         {
             await ledger.RecordAsync(run.Item, WorkState.Review, null, $"head moved from {pull.HeadSha} before the merge; reviewing it again", ct);
@@ -187,6 +225,28 @@ public sealed partial class RunPipeline
         }
         log.WriteLine($"[merge] {pull.HtmlUrl} merged as {merged.CommitSha}");
         await ledger.RecordAsync(run.Item, WorkState.Merge, null, merged.CommitSha, ct);
+    }
+
+    /// <summary>The merge commit of <paramref name="pull"/> when it is merged at a head a <see cref="Steps.GatePassed"/> names, else null.</summary>
+    private static string? GatePassedAt(List<LedgerEntry> history, PullFacts pull) =>
+        pull.Merged && history.Any(e => e.Step == Steps.GatePassed && e.Detail == pull.HeadSha) ? pull.MergeCommitSha : null;
+
+    /// <summary>
+    /// After a merge call failed: re-reads the PR and returns its merge commit when GitHub merged it at the gated head;
+    /// null otherwise, and when the PR cannot be read (the merge call's own failure is then the one that counts).
+    /// </summary>
+    private async Task<string?> MergedAfterFailureAsync(Run run, PullFacts gated, Exception failure, CancellationToken ct)
+    {
+        try
+        {
+            var after = await Gate.GitHub.GetPullAsync(run.Repo, gated.Number, ct);
+            return after.Merged && after.HeadSha == gated.HeadSha ? after.MergeCommitSha : null;
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            log.WriteLine($"[merge] the merge call failed ({failure.Message}) and the PR could not be re-read: {ex.Message}");
+            return null;
+        }
     }
 
     /// <summary>Merge: the change is merged (the Merge row holds the merge commit); the board shows it, then Watch.</summary>

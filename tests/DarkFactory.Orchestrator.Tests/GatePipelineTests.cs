@@ -1,3 +1,4 @@
+using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
@@ -6,6 +7,7 @@ using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Time.Testing;
 using static DarkFactory.Orchestrator.Tests.RunPipelineTests;
 
 namespace DarkFactory.Orchestrator.Tests;
@@ -63,9 +65,16 @@ public class GatePipelineTests
             return Task.FromResult(Ci.TryGetValue(sha, out var facts) ? facts : Green(sha));
         }
 
+        /// <summary>When set, the merge call throws this; with <see cref="MergesBeforeThrowing"/>, after GitHub merged (e.g. a timeout).</summary>
+        public Exception? MergeThrows { get; set; }
+        public bool MergesBeforeThrowing { get; set; }
+        /// <summary>Runs as the merge call starts, e.g. to press Ctrl-C while it is in flight.</summary>
+        public Action? OnMergeCall { get; set; }
+
         public Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct)
         {
             Calls.Add($"merge {number} {headSha}");
+            OnMergeCall?.Invoke();
             if (HeadMovesBeforeMerge is { } moved)
             {
                 Head = moved;
@@ -75,31 +84,48 @@ public class GatePipelineTests
             {
                 return Task.FromResult(new MergeResult(false, null, true, "Head branch was modified."));
             }
+            if (MergeThrows is { } failure && !MergesBeforeThrowing)
+            {
+                throw failure;
+            }
             Merged = true;
             MergeCommitSha = MergeCommit;
+            if (MergeThrows is { } late)
+            {
+                throw late;
+            }
             return Task.FromResult(new MergeResult(true, MergeCommit, false, "Pull Request successfully merged"));
         }
 
         public static CiFacts Green(string sha) => new(sha, [new CheckFact("build-test", true, "success")]);
     }
 
+    /// <summary>
+    /// A reviewer that answers <c>verdict</c> under the request's router session (as <see cref="RouterReviewer"/> does);
+    /// its first <see cref="UsageLimitedCalls"/> calls are refused by the router for usage.
+    /// </summary>
     internal sealed class FakeReviewer(string verdict = ReviewVerdict.Pass) : IReviewer
     {
         public List<ReviewRequest> Requests { get; } = [];
+        public int UsageLimitedCalls { get; set; }
 
         public Task<ReviewVerdict> ReviewAsync(ReviewRequest request, CancellationToken ct)
         {
             Requests.Add(request);
+            if (Requests.Count <= UsageLimitedCalls)
+            {
+                throw new RouterUsageLimitedException("The reviewer call through the router failed: 429 All enrolled subscription accounts are currently unavailable.");
+            }
             return Task.FromResult(new ReviewVerdict(request.Pull.HeadSha, verdict, request.Model, request.Model, ModelFamily.Of(request.Model),
-                verdict == ReviewVerdict.Pass ? "looks right" : "the tests do not cover the empty string"));
+                verdict == ReviewVerdict.Pass ? "looks right" : "the tests do not cover the empty string", request.Session));
         }
     }
 
-    /// <summary>A worker that reports the model that answered it, then succeeds.</summary>
-    private static Func<WorkerCall, Task<WorkerResult>> ReportsModel(string? model) => async call =>
+    /// <summary>A worker that reports the models that answered it, then succeeds.</summary>
+    private static Func<WorkerCall, Task<WorkerResult>> ReportsModel(params string?[] models) => async call =>
     {
         await call.OnSession(Ok.SessionId!, CancellationToken.None);
-        if (model is not null)
+        foreach (var model in models.OfType<string>())
         {
             await call.Callbacks.OnModel!(model, CancellationToken.None);
         }
@@ -108,19 +134,32 @@ public class GatePipelineTests
 
     private sealed class Harness
     {
-        public LedgerDbContext Db { get; } = TestDb.Create();
+        private readonly DbContextOptions<LedgerDbContext> _options =
+            new DbContextOptionsBuilder<LedgerDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options;
+
+        public Harness() => Db = new LedgerDbContext(_options);
+
+        public LedgerDbContext Db { get; }
+        public FakeTimeProvider Time { get; } = new(new DateTimeOffset(2026, 10, 8, 12, 0, 0, TimeSpan.Zero));
+        /// <summary>The shared control table (needed for the usage pause), on the injected clock.</summary>
+        public IControls Controls => new LedgerControls(new LedgerDbContextFactory(_options), Time);
         public FakeWorkSource Stories { get; } = new(Story);
         public FakeWorkspaces Workspaces { get; } = new();
         public FakePullRequests Prs { get; } = new();
         public InProcessRunLocks Locks { get; } = new();
         public FakeGateGitHub GitHub { get; } = new();
         public FakeReviewer Reviewer { get; init; } = new();
+        public IReadOnlyList<string> ReviewerModels { get; init; } = GateStage.DefaultReviewerModels;
         public WorkLedger Ledger => new(Db, TimeProvider.System);
 
-        public Task<RunOutcome> Run(string? implementerModel = ImplementerModel) =>
-            new RunPipeline(Stories, Ledger, Locks, Workspaces, new FakeWorker(ReportsModel(implementerModel)), Prs, Sandbox, TextWriter.Null,
-                    gate: new GateStage(GitHub, Reviewer, GateStage.DefaultReviewerModels, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5)))
-                .RunAsync(77, CancellationToken.None);
+        public Task<RunOutcome> Run(string? implementerModel = ImplementerModel, CancellationToken ct = default) =>
+            Run([implementerModel], ct);
+
+        public Task<RunOutcome> Run(string?[] implementerModels, CancellationToken ct = default) =>
+            new RunPipeline(Stories, Ledger, Locks, Workspaces, new FakeWorker(ReportsModel(implementerModels)), Prs, Sandbox, TextWriter.Null,
+                    controls: Controls,
+                    gate: new GateStage(GitHub, Reviewer, ReviewerModels, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5)))
+                .RunAsync(77, ct);
 
         public async Task<List<LedgerEntry>> Rows() => await Db.LedgerEntries.OrderBy(e => e.Id).ToListAsync();
         public async Task<List<WorkState>> Transitions() => (await Rows()).Where(r => r.Step is null).Select(r => r.State).ToList();
@@ -352,6 +391,131 @@ public class GatePipelineTests
         Assert.Equal(WorkState.Escalated, outcome.State);
         Assert.Contains("merged outside the gate", outcome.Error);
         Assert.Empty(h.Merges);
+    }
+
+    [Fact]
+    public async Task The_reviewers_router_session_is_named_before_the_call_and_never_becomes_the_items_claude_session()
+    {
+        var h = new Harness();
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(Ok.SessionId, outcome.SessionId); // the implementer's session, not the reviewer's
+        var rows = await h.Rows();
+        Assert.All(rows.Where(r => r.ClaudeSessionId is not null), r => Assert.Equal(Ok.SessionId, r.ClaudeSessionId));
+        var review = h.Reviewer.Requests.Single();
+        var named = rows.FindIndex(r => r.Step == RunPipeline.Steps.ReviewSession);
+        Assert.Equal($"{review.Session} gpt-5.6-sol {Sha1}", rows[named].Detail);
+        Assert.True(named < rows.FindIndex(r => r.Step == RunPipeline.Steps.Verdict)); // in the ledger before the verdict
+        Assert.Equal(review.Session, (await h.Verdicts()).Single().Session); // and the verdict still carries it
+    }
+
+    [Fact]
+    public async Task An_escalation_after_a_review_names_the_implementers_session_not_the_reviewers()
+    {
+        var h = new Harness { Reviewer = new FakeReviewer(ReviewVerdict.Fail) };
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Equal(Ok.SessionId, outcome.SessionId);
+        Assert.Equal(Ok.SessionId, (await h.Rows()).Single(r => r.Step is null && r.State == WorkState.Escalated).ClaudeSessionId);
+        Assert.Contains(h.Stories.Comments, c => c.Contains($"Claude session: {Ok.SessionId}"));
+    }
+
+    [Fact]
+    public async Task A_reviewer_call_the_router_refuses_for_usage_pauses_the_factory_and_reviews_again_after_it_lifts()
+    {
+        var h = new Harness { Reviewer = new FakeReviewer { UsageLimitedCalls = 1 } };
+
+        var paused = await h.Run();
+
+        Assert.Equal(WorkState.Paused, paused.State);
+        Assert.Contains("paused for usage", paused.Error);
+        var rows = await h.Rows();
+        Assert.Equal((WorkState.Paused, RunPipeline.UsagePaused), rows.Where(r => r.Step is null).Select(r => (r.State, r.Detail)).Last());
+        Assert.DoesNotContain(rows, r => r.Step is null && r.State == WorkState.Escalated);
+        Assert.Empty(h.Stories.Comments);
+        Assert.StartsWith(UsagePause.ReviewerRateLimited, rows.Last(r => r.Step == RunPipeline.Steps.UsagePause).Detail);
+        Assert.Equal(UsagePause.ReviewerRateLimited, (await h.Controls.UsagePauseAsync(CancellationToken.None))!.Reason);
+        Assert.Empty(h.Merges);
+
+        h.Time.Advance(UsagePause.InitialBackoff);
+        var resumed = await h.Run();
+
+        Assert.True(resumed.Succeeded, resumed.Error);
+        Assert.Equal(WorkState.Watch, resumed.State);
+        Assert.Equal(2, h.Reviewer.Requests.Count); // the same head reviewed again
+        Assert.Equal([WorkState.Review, WorkState.Paused, WorkState.Review, WorkState.CI],
+            (await h.Transitions()).SkipWhile(s => s != WorkState.Review).Take(4));
+        Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
+    }
+
+    [Fact]
+    public async Task An_interrupt_during_the_merge_after_github_merged_records_the_merge_on_resume_without_merging_again()
+    {
+        var h = new Harness();
+        using var interrupt = new CancellationTokenSource();
+        // Ctrl-C arrives while the merge call is in flight; GitHub has merged by then.
+        h.GitHub.MergesBeforeThrowing = true;
+        h.GitHub.MergeThrows = new OperationCanceledException(interrupt.Token);
+        h.GitHub.OnMergeCall = interrupt.Cancel;
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => h.Run(ct: interrupt.Token));
+        Assert.Equal([WorkState.MergeGate, WorkState.Paused], (await h.Transitions()).TakeLast(2));
+        Assert.Equal(RunPipeline.Interrupted, (await h.Rows()).Last(r => r.Step is null).Detail);
+        (h.GitHub.MergeThrows, h.GitHub.OnMergeCall) = (null, null);
+
+        var resumed = await h.Run();
+
+        Assert.True(resumed.Succeeded, resumed.Error);
+        Assert.Equal(WorkState.Watch, resumed.State);
+        Assert.Equal([$"merge 1 {Sha1}"], h.Merges); // only the interrupted call
+        Assert.Equal([WorkState.MergeGate, WorkState.Paused, WorkState.MergeGate, WorkState.Merge, WorkState.Watch], (await h.Transitions()).TakeLast(5));
+        Assert.Equal(MergeCommit, (await h.Rows()).Single(r => r.Step is null && r.State == WorkState.Merge).Detail);
+    }
+
+    [Fact]
+    public async Task A_merge_call_that_fails_after_github_merged_records_the_merge_instead_of_escalating()
+    {
+        var h = new Harness();
+        h.GitHub.MergesBeforeThrowing = true;
+        h.GitHub.MergeThrows = new TaskCanceledException("The request was canceled due to the configured HttpClient.Timeout of 100 seconds elapsing.");
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(WorkState.Watch, outcome.State);
+        Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
+        Assert.Equal(MergeCommit, (await h.Rows()).Single(r => r.Step is null && r.State == WorkState.Merge).Detail);
+        Assert.DoesNotContain(WorkState.Escalated, await h.Transitions());
+    }
+
+    [Fact]
+    public async Task A_merge_call_that_fails_without_github_merging_escalates()
+    {
+        var h = new Harness();
+        h.GitHub.MergeThrows = new HttpRequestException("connection reset");
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains("connection reset", outcome.Error);
+        Assert.False(h.GitHub.Merged);
+    }
+
+    [Fact]
+    public async Task An_implementer_answered_by_two_families_gets_a_reviewer_of_a_third_configured_family()
+    {
+        var h = new Harness { ReviewerModels = ["gpt-5.6-sol", "claude-opus-5-5", "gemini-3.1-pro-preview"] };
+
+        var outcome = await h.Run(["claude-sonnet-4-5", "gpt-5.6-luna"]);
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal("gemini-3.1-pro-preview", h.Reviewer.Requests.Single().Model);
+        Assert.Equal("google", (await h.Verdicts()).Single().Family);
+        Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
     }
 
     [Fact]

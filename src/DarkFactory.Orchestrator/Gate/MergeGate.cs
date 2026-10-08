@@ -10,8 +10,17 @@ public sealed record PullFacts(int Number, string HtmlUrl, bool Open, bool Merge
 /// <summary>One CI check of a commit: a check run, or a commit status mapped onto the same shape.</summary>
 public sealed record CheckFact(string Name, bool Completed, string? Conclusion);
 
-/// <summary>Every CI check GitHub reports for one commit. <see cref="Complete"/> is false when GitHub reported more than was read.</summary>
-public sealed record CiFacts(string HeadSha, IReadOnlyList<CheckFact> Checks, bool Complete = true);
+/// <summary>
+/// One check suite of a commit: what an App (e.g. <c>github-actions</c>, one suite per workflow run) registered for it, before
+/// or alongside its check runs. <see cref="Runs"/> is how many check runs it has.
+/// </summary>
+public sealed record CheckSuiteFact(string App, bool Completed, string? Conclusion, int Runs);
+
+/// <summary>
+/// Every CI check and check suite GitHub reports for one commit. <see cref="Complete"/> is false when GitHub reported more
+/// than was read.
+/// </summary>
+public sealed record CiFacts(string HeadSha, IReadOnlyList<CheckFact> Checks, bool Complete = true, IReadOnlyList<CheckSuiteFact>? Suites = null);
 
 public enum CiState
 {
@@ -27,25 +36,41 @@ public static class Ci
 {
     private static readonly HashSet<string> Passing = new(StringComparer.Ordinal) { "success", "neutral", "skipped" };
 
-    /// <summary>The commit's CI state, and why when it is not green.</summary>
+    /// <summary>GitHub Actions' App: it registers one check suite per workflow run, before that run's check runs exist.</summary>
+    public const string ActionsApp = "github-actions";
+
+    /// <summary>
+    /// The commit's CI state, and why when it is not green. Green needs at least one check, every check finished with a
+    /// passing conclusion, and every check suite finished: a workflow whose run is registered (its suite) but has no check
+    /// run yet would otherwise be invisible, and CI would read green early; a suite that finished without passing (e.g. a
+    /// workflow's <c>startup_failure</c>, which has no check run) fails. A suite of another App with no check runs is
+    /// ignored: GitHub creates one for every installed App with checks access, and an App that never runs checks (e.g. the
+    /// Claude App) leaves it queued forever. Limitation: a workflow GitHub has not registered at all
+    /// yet (no suite: e.g. one triggered later by another workflow) is still invisible.
+    /// </summary>
     public static (CiState State, string Why) Evaluate(CiFacts facts)
     {
         if (!facts.Complete)
         {
             return (CiState.Failed, $"more CI checks on {Short(facts.HeadSha)} than the gate could read");
         }
-        var failed = facts.Checks.Where(c => c.Completed && !Passing.Contains(c.Conclusion ?? "")).ToList();
+        var suites = (facts.Suites ?? []).Where(s => s.Runs > 0 || s.App == ActionsApp).ToList();
+        var failed = facts.Checks.Where(c => c.Completed && !Passing.Contains(c.Conclusion ?? "")).Select(c => $"{c.Name} ({c.Conclusion ?? "no conclusion"})")
+            .Concat(suites.Where(s => s.Completed && !Passing.Contains(s.Conclusion ?? "")).Select(s => $"{s.App} check suite ({s.Conclusion ?? "no conclusion"})"))
+            .ToList();
         if (failed.Count > 0)
         {
-            return (CiState.Failed, $"CI failed on {Short(facts.HeadSha)}: {string.Join(", ", failed.Select(c => $"{c.Name} ({c.Conclusion ?? "no conclusion"})"))}");
+            return (CiState.Failed, $"CI failed on {Short(facts.HeadSha)}: {string.Join(", ", failed)}");
         }
         if (facts.Checks.Count == 0)
         {
             return (CiState.Pending, $"no CI check has reported on {Short(facts.HeadSha)}");
         }
-        var running = facts.Checks.Where(c => !c.Completed).ToList();
+        var running = facts.Checks.Where(c => !c.Completed).Select(c => c.Name)
+            .Concat(suites.Where(s => !s.Completed).Select(s => $"{s.App} check suite"))
+            .ToList();
         return running.Count > 0
-            ? (CiState.Pending, $"CI still running on {Short(facts.HeadSha)}: {string.Join(", ", running.Select(c => c.Name))}")
+            ? (CiState.Pending, $"CI still running on {Short(facts.HeadSha)}: {string.Join(", ", running)}")
             : (CiState.Green, $"CI green on {Short(facts.HeadSha)} ({facts.Checks.Count} checks)");
     }
 

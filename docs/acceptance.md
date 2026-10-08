@@ -187,3 +187,20 @@ FACTORY_E2E=1 FACTORY_E2E_GATE_STORY=sc-<id> FACTORY_E2E_GATE_PUSH_STORY=sc-<id>
 
 Since sc-25378 every `factory run` / `factory work` run goes on past Review, so the Phase 1 tests above (AT1–AT5) also
 need the gate App, and their stories' PRs get merged when they pass the gate.
+
+## Upgrading a Phase 1 ledger: items parked at Review escalate once
+
+Phase 1 parked every finished item at Review; since sc-25378 Review is a state the factory drives, so the first
+`factory work` (or `factory run sc-<id>`) after the upgrade picks up every such item, and each one escalates once, with a
+comment on its story:
+
+- "The implementer's model is unknown …": Phase 1 never recorded which model implemented it (`implementer-model`
+  checkpoints are new), so no reviewer of a different family can be chosen. If the PR should still go through the gate,
+  `factory run sc-<id>` re-runs the item from Intake (a fresh implementation whose models are recorded); otherwise close
+  the PR and handle the story by hand.
+- "… is merged outside the factory." / "… is closed outside the factory.": the owner already merged or closed the PR.
+  Nothing more is needed from the factory: move the story on the board by hand. The item stays Escalated (in-flight
+  pickup never resumes an Escalated item).
+
+Expected and one-time: these escalations are the ledger catching up, not failures of the gate. They come from the
+ledger's state alone, so closing the stories or PRs first does not prevent them.

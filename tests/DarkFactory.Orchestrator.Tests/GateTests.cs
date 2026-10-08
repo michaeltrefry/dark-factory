@@ -132,6 +132,40 @@ public class MergeGateTests
     }
 
     [Fact]
+    public void A_workflow_registered_on_the_head_without_a_check_run_yet_keeps_ci_pending()
+    {
+        // Every check run that exists has passed, but a second workflow's suite is queued with no run yet: not green.
+        var suites = new[] { new CheckSuiteFact(Ci.ActionsApp, true, "success", 2), new CheckSuiteFact(Ci.ActionsApp, false, null, 0) };
+        var (state, why) = Ci.Evaluate(Green with { Suites = suites });
+        Assert.Equal(CiState.Pending, state);
+        Assert.Contains("github-actions check suite", why);
+        Assert.Equal(GateOutcome.Blocked, Evaluate(ci: Green with { Suites = suites }).Outcome);
+    }
+
+    [Fact]
+    public void A_workflow_suite_that_finished_without_passing_fails_ci_even_with_no_check_run()
+    {
+        var (state, why) = Ci.Evaluate(Green with { Suites = [new CheckSuiteFact(Ci.ActionsApp, true, "startup_failure", 0)] });
+        Assert.Equal(CiState.Failed, state);
+        Assert.Contains("startup_failure", why);
+    }
+
+    [Fact]
+    public void An_app_suite_with_no_check_runs_that_stays_queued_is_ignored_and_ci_is_green()
+    {
+        // GitHub creates a suite for every App with checks access (seen on the sandbox: the Claude App's stays queued, 0 runs).
+        var suites = new[] { new CheckSuiteFact("claude", false, null, 0), new CheckSuiteFact(Ci.ActionsApp, true, "success", 2) };
+        Assert.Equal(CiState.Green, Ci.Evaluate(Green with { Suites = suites }).State);
+    }
+
+    [Fact]
+    public void Limitation_a_workflow_github_has_not_registered_at_all_is_invisible_and_ci_reads_green()
+    {
+        // Documented limitation (Ci.Evaluate): no check run and no suite on the head means the gate cannot know it exists.
+        Assert.Equal(CiState.Green, Ci.Evaluate(Green with { Suites = [new CheckSuiteFact(Ci.ActionsApp, true, "success", 2)] }).State);
+    }
+
+    [Fact]
     public void A_failed_or_same_family_or_unknown_family_review_blocks()
     {
         Assert.Contains("is 'fail'", Evaluate(verdicts: [Pass with { Verdict = ReviewVerdict.Fail }]).Detail);
@@ -163,7 +197,8 @@ public class RouterReviewerTests
     private const string Head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     private static readonly ReviewRequest Request = new(
         new WorkStory(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77"),
-        "o/r", new PullFacts(1, "https://github.com/o/r/pull/1", true, false, false, Head, "main", "base", null), "+fix\n", "gpt-5.6-sol");
+        "o/r", new PullFacts(1, "https://github.com/o/r/pull/1", true, false, false, Head, "main", "base", null), "+fix\n", "gpt-5.6-sol",
+        "0b7c4d2e-0000-4000-8000-000000000001");
 
     private static string Answer(string text, string model = "gpt-5.6-sol", string stop = "end_turn") =>
         JsonSerializer.Serialize(new { model, stop_reason = stop, content = new[] { new { type = "text", text } } });
@@ -181,8 +216,9 @@ public class RouterReviewerTests
         Assert.Equal("gpt-5.6-sol", sent.Headers[RouterReviewer.ForceModelHeader]);
         Assert.Equal("rk_test", sent.Headers["X-Weave-Router-Key"]);
         Assert.Equal("Bearer rk_test", sent.Headers["Authorization"]);
-        Assert.True(Guid.TryParse(sent.Headers[RouterReviewer.SessionHeader], out _)); // its own session: the pin stays scoped to it
-        Assert.Equal(sent.Headers[RouterReviewer.SessionHeader], verdict.Session);
+        // Its own session, the one the pipeline named in the ledger before the call: the pin and the cost stay scoped to it.
+        Assert.Equal(Request.Session, sent.Headers[RouterReviewer.SessionHeader]);
+        Assert.Equal(Request.Session, verdict.Session);
         var body = JsonDocument.Parse(sent.Body!).RootElement;
         Assert.Equal("gpt-5.6-sol", body.GetProperty("model").GetString());
         var prompt = body.GetProperty("messages")[0].GetProperty("content").GetString()!;
@@ -208,13 +244,36 @@ public class RouterReviewerTests
     }
 
     [Fact]
+    public void A_router_answer_that_names_no_served_model_is_a_fail()
+    {
+        var verdict = RouterReviewer.Interpret(Head, "gpt-5.6-sol", null, "end_turn", "{\"verdict\": \"pass\", \"summary\": \"fine\"}");
+
+        Assert.Equal(ReviewVerdict.Fail, verdict.Verdict);
+        Assert.Contains("did not say which model answered", verdict.Summary);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.TooManyRequests, """{"error":"exhausted"}""")]
+    [InlineData((HttpStatusCode)529, """{"type":"error","error":{"type":"overloaded_error"}}""")]
+    [InlineData(HttpStatusCode.ServiceUnavailable,
+        """{"type":"error","error":{"type":"api_error","message":"All enrolled subscription accounts are currently unavailable."}}""")]
+    public async Task A_router_usage_refusal_throws_usage_limited(HttpStatusCode status, string body)
+    {
+        var api = new FakeApi().On("POST /v1/messages", status, body);
+
+        var ex = await Assert.ThrowsAsync<RouterUsageLimitedException>(
+            () => new RouterReviewer(api.Client("http://router.test/"), "rk").ReviewAsync(Request, CancellationToken.None));
+        Assert.Contains(((int)status).ToString(), ex.Message);
+    }
+
+    [Fact]
     public async Task A_router_error_throws_and_an_oversized_diff_fails_without_a_call()
     {
-        var api = new FakeApi().On("POST /v1/messages", HttpStatusCode.TooManyRequests, """{"error":"exhausted"}""");
+        var api = new FakeApi().On("POST /v1/messages", HttpStatusCode.InternalServerError, """{"error":"boom"}""");
         var reviewer = new RouterReviewer(api.Client("http://router.test/"), "rk");
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => reviewer.ReviewAsync(Request, CancellationToken.None));
-        Assert.Contains("429", ex.Message);
+        Assert.Contains("500", ex.Message);
 
         var big = await reviewer.ReviewAsync(Request with { Diff = new string('+', RouterReviewer.MaxDiffChars + 1) }, CancellationToken.None);
         Assert.Equal(ReviewVerdict.Fail, big.Verdict);
@@ -277,23 +336,31 @@ public class GitHubGateTests
             .On($"GET {Repo}/commits/{Head}/check-runs", HttpStatusCode.OK,
                 """{"total_count":2,"check_runs":[{"name":"build","status":"completed","conclusion":"success"},{"name":"test","status":"in_progress","conclusion":null}]}""")
             .On($"GET {Repo}/commits/{Head}/status", HttpStatusCode.OK,
-                """{"total_count":2,"statuses":[{"context":"ci/legacy","state":"error"},{"context":"ci/other","state":"pending"}]}"""));
+                """{"total_count":2,"statuses":[{"context":"ci/legacy","state":"error"},{"context":"ci/other","state":"pending"}]}""")
+            .On($"GET {Repo}/commits/{Head}/check-suites", HttpStatusCode.OK,
+                """{"total_count":2,"check_suites":[{"status":"queued","conclusion":null,"latest_check_runs_count":0,"app":{"slug":"claude"}},{"status":"completed","conclusion":"success","latest_check_runs_count":2,"app":{"slug":"github-actions"}}]}"""));
 
         var ci = await gate.GetCiAsync(Sandbox, Head, CancellationToken.None);
 
         Assert.Equal([new CheckFact("build", true, "success"), new CheckFact("test", false, null), new CheckFact("ci/legacy", true, "failure"),
             new CheckFact("ci/other", false, "pending")], ci.Checks);
+        Assert.Equal([new CheckSuiteFact("claude", false, null, 0), new CheckSuiteFact("github-actions", true, "success", 2)], ci.Suites!);
         Assert.True(ci.Complete);
         Assert.Equal(CiState.Failed, Ci.Evaluate(ci).State);
     }
 
-    [Fact]
-    public async Task More_checks_than_one_page_is_incomplete()
+    [Theory]
+    [InlineData(101, 0)]
+    [InlineData(1, 101)]
+    public async Task More_checks_or_suites_than_one_page_is_incomplete(int runs, int suites)
     {
+        const string suite = """{"status":"completed","conclusion":"success","latest_check_runs_count":1,"app":{"slug":"github-actions"}}""";
+        var page = suites > 0 ? suite : "";
         var (gate, _) = Gate(a => a
             .On($"GET {Repo}/commits/{Head}/check-runs", HttpStatusCode.OK,
-                """{"total_count":101,"check_runs":[{"name":"build","status":"completed","conclusion":"success"}]}""")
-            .On($"GET {Repo}/commits/{Head}/status", HttpStatusCode.OK, """{"total_count":0,"statuses":[]}"""));
+                $$"""{"total_count":{{runs}},"check_runs":[{"name":"build","status":"completed","conclusion":"success"}]}""")
+            .On($"GET {Repo}/commits/{Head}/status", HttpStatusCode.OK, """{"total_count":0,"statuses":[]}""")
+            .On($"GET {Repo}/commits/{Head}/check-suites", HttpStatusCode.OK, $$"""{"total_count":{{suites}},"check_suites":[{{page}}]}"""));
 
         var ci = await gate.GetCiAsync(Sandbox, Head, CancellationToken.None);
 

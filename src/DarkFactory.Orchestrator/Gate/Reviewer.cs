@@ -8,14 +8,25 @@ using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.Orchestrator.Gate;
 
-/// <summary>What the reviewer is asked to judge: the story and the diff of exactly one head commit against its base.</summary>
-public sealed record ReviewRequest(WorkStory Story, string Repo, PullFacts Pull, string Diff, string Model);
+/// <summary>
+/// What the reviewer is asked to judge: the story and the diff of exactly one head commit against its base.
+/// <see cref="Session"/> is the router session the call is accounted under; the pipeline names it in the ledger
+/// (<c>review-session</c>) before the call, so a call that never returns still has a readable cost (E9).
+/// </summary>
+public sealed record ReviewRequest(WorkStory Story, string Repo, PullFacts Pull, string Diff, string Model, string Session);
+
+/// <summary>
+/// The router refused the review call for usage (429/529, or its exhaustion or rate-limit body): the plans ran out, not the
+/// review. The pipeline pauses the factory for usage instead of escalating the item.
+/// </summary>
+public sealed class RouterUsageLimitedException(string message) : Exception(message);
 
 public interface IReviewer
 {
     /// <summary>
-    /// Reviews <see cref="ReviewRequest.Diff"/> with <see cref="ReviewRequest.Model"/> pinned. Any answer that is not a clear
-    /// pass is a fail; a call that cannot be made throws.
+    /// Reviews <see cref="ReviewRequest.Diff"/> with <see cref="ReviewRequest.Model"/> pinned, accounted under
+    /// <see cref="ReviewRequest.Session"/>. Any answer that is not a clear pass is a fail; a call that cannot be made throws
+    /// (<see cref="RouterUsageLimitedException"/> when the router refused it for usage).
     /// </summary>
     Task<ReviewVerdict> ReviewAsync(ReviewRequest request, CancellationToken ct);
 }
@@ -57,7 +68,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey) : IReviewe
             return new ReviewVerdict(sha, ReviewVerdict.Fail, request.Model, null, ModelFamily.Of(request.Model),
                 $"The diff is {request.Diff.Length} characters, more than the {MaxDiffChars} one review reads; not reviewed.");
         }
-        var session = Guid.NewGuid().ToString();
+        var session = request.Session;
         using var message = new HttpRequestMessage(HttpMethod.Post, "v1/messages");
         message.Headers.Add(SessionHeader, session);
         message.Headers.Add(ClaudeWorker.RouterKeyHeader, routerKey);
@@ -75,8 +86,12 @@ public sealed class RouterReviewer(HttpClient http, string routerKey) : IReviewe
         if (!response.IsSuccessStatusCode)
         {
             var body = await response.Content.ReadAsStringAsync(ct);
-            throw new InvalidOperationException(
-                $"The reviewer call through the router failed: {(int)response.StatusCode} {(body.Length > 500 ? body[..500] : body)}");
+            var why = $"The reviewer call through the router failed: {(int)response.StatusCode} {(body.Length > 500 ? body[..500] : body)}";
+            if (UsageLimited((int)response.StatusCode, body))
+            {
+                throw new RouterUsageLimitedException(why);
+            }
+            throw new InvalidOperationException(why);
         }
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
         var root = doc.RootElement;
@@ -97,16 +112,29 @@ public sealed class RouterReviewer(HttpClient http, string routerKey) : IReviewe
     }
 
     /// <summary>
+    /// Whether a failed router answer is a usage refusal: 429 (the router's "every subscription unavailable" answer, or an
+    /// upstream rate limit), 529 (overloaded), or a body carrying one of the worker's usage markers
+    /// (<see cref="WorkerResult.UsageLimitMarkers"/>: the router's exhaustion text, <c>rate_limit_error</c>, ...).
+    /// </summary>
+    public static bool UsageLimited(int status, string body) =>
+        status is 429 or 529 || WorkerResult.UsageLimitMarkers.Any(m => body.Contains(m, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
     /// Turns the reviewer's answer into a verdict. Pass only when the answer ends normally with a pass verdict line and the
-    /// router served the pinned model's family; anything else (truncated, no verdict line, another family) is a fail.
+    /// router said it served the pinned model's family; anything else (truncated, no verdict line, another family, no served
+    /// model named at all) is a fail.
     /// </summary>
     public static ReviewVerdict Interpret(string headSha, string model, string? served, string? stopReason, string answer)
     {
         var requestedFamily = ModelFamily.Of(model);
-        // A router that reports another model served the pin keeps the family the router says answered.
-        var family = served is null ? requestedFamily : ModelFamily.Of(served);
+        // Only the family the router says answered counts: no served model is no proof of who reviewed.
+        var family = ModelFamily.Of(served);
         ReviewVerdict Fail(string why) => new(headSha, ReviewVerdict.Fail, model, served, family, why);
 
+        if (string.IsNullOrWhiteSpace(served))
+        {
+            return Fail($"The router did not say which model answered the review pinned to {model}.");
+        }
         if (family is null || family != requestedFamily)
         {
             return Fail($"The router served '{served}' (family {family ?? "unknown"}), not the pinned {model} ({requestedFamily}).");

@@ -22,7 +22,7 @@ public interface IGateGitHub
     /// <summary>The text of <see cref="GatePolicy.Path"/> on <paramref name="baseRef"/>, or null when it does not exist.</summary>
     Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct);
 
-    /// <summary>Every check run and commit status of <paramref name="sha"/>.</summary>
+    /// <summary>Every check run, commit status and check suite of <paramref name="sha"/>.</summary>
     Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct);
 
     /// <summary>Merges PR <paramref name="number"/> only if its head is still <paramref name="headSha"/> (GitHub enforces it).</summary>
@@ -103,11 +103,18 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         await GitHubApp.EnsureSuccess(statusResponse, $"read the commit statuses of {sha}", ct);
         var status = (await statusResponse.Content.ReadFromJsonAsync<CombinedStatusDto>(ct))!;
 
+        using var suitesRequest = GitHubApp.Request(HttpMethod.Get, $"repos/{repo.Owner}/{repo.Name}/commits/{sha}/check-suites?per_page={PageSize}", "Bearer", token);
+        using var suitesResponse = await http.SendAsync(suitesRequest, ct);
+        await GitHubApp.EnsureSuccess(suitesResponse, $"read the check suites of {sha}", ct);
+        var suites = (await suitesResponse.Content.ReadFromJsonAsync<CheckSuitesDto>(ct))!;
+
         var checks = runs.CheckRuns.Select(r => new CheckFact(r.Name, r.Status == "completed", r.Conclusion))
             .Concat(status.Statuses.Select(s => new CheckFact(s.Context, s.State != "pending", s.State is "error" ? "failure" : s.State)))
             .ToList();
-        var complete = runs.TotalCount <= runs.CheckRuns.Count && status.TotalCount <= status.Statuses.Count;
-        return new CiFacts(sha, checks, complete);
+        var complete = runs.TotalCount <= runs.CheckRuns.Count && status.TotalCount <= status.Statuses.Count
+            && suites.TotalCount <= suites.CheckSuites.Count;
+        return new CiFacts(sha, checks, complete,
+            suites.CheckSuites.Select(s => new CheckSuiteFact(s.App?.Slug ?? "unknown", s.Status == "completed", s.Conclusion, s.LatestCheckRunsCount)).ToList());
     }
 
     public async Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct)
@@ -159,6 +166,18 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         [property: JsonPropertyName("name")] string Name,
         [property: JsonPropertyName("status")] string Status,
         [property: JsonPropertyName("conclusion")] string? Conclusion);
+
+    private sealed record CheckSuitesDto(
+        [property: JsonPropertyName("total_count")] int TotalCount,
+        [property: JsonPropertyName("check_suites")] List<CheckSuiteDto> CheckSuites);
+
+    private sealed record CheckSuiteDto(
+        [property: JsonPropertyName("status")] string? Status,
+        [property: JsonPropertyName("conclusion")] string? Conclusion,
+        [property: JsonPropertyName("latest_check_runs_count")] int LatestCheckRunsCount,
+        [property: JsonPropertyName("app")] AppDto? App);
+
+    private sealed record AppDto([property: JsonPropertyName("slug")] string? Slug);
 
     private sealed record CombinedStatusDto(
         [property: JsonPropertyName("total_count")] int TotalCount,
