@@ -43,8 +43,8 @@ public class WalkingSkeletonTests
 
         Assert.True(result.Succeeded, $"worker failed: exit {result.ExitCode}: {result.ResultText} {result.StderrTail}");
         var cost = await Harness.WaitForCostAsync(result.SessionId!, routerKey, ct);
-        Assert.NotNull(cost);
-        Assert.True(cost!.ActualCostUsdMicros > 0, $"router cost for {result.SessionId} was {cost.ActualCostUsdMicros}");
+        Assert.True(cost is { RequestCount: > 0, ActualCostUsdMicros: >= 0 },
+            $"router reports {cost?.RequestCount.ToString() ?? "nothing"} requests / {cost?.ActualCostUsdMicros.ToString() ?? "no"} cost micros for session {result.SessionId}");
     }
 
     /// <summary>
@@ -97,12 +97,13 @@ public class WalkingSkeletonTests
         Assert.Equal(outcome.PullRequestUrl, pr.GetProperty("html_url").GetString());
         Assert.Contains($"/story/{storyId}", pr.GetProperty("body").GetString());
 
-        // Router: non-zero cost recorded for the session id in the ledger.
+        // Router: the session id in the ledger is recorded (a cost of $0 is valid: the router's local model).
         var cost = await Harness.WaitForCostAsync(rows[2].ClaudeSessionId!, routerKey, ct);
-        Assert.True(cost is { ActualCostUsdMicros: > 0 }, $"no router cost for session {rows[2].ClaudeSessionId}");
+        Assert.True(cost is { RequestCount: > 0, ActualCostUsdMicros: >= 0 }, $"router has recorded no request for session {rows[2].ClaudeSessionId}");
 
-        // S6: the ended session's row holds that cost (the run waits for the router to commit it).
+        // S6: the ended session's row holds that recorded cost (the run waits for the router to record it).
         var session = await db.WorkerSessions.AsNoTracking().SingleAsync(s => s.ClaudeSessionId == outcome.SessionId, ct);
-        Assert.True(session.CostUsd > 0, $"worker_sessions.CostUsd for {outcome.SessionId} is {session.CostUsd?.ToString() ?? "null"}");
+        Assert.True(session is { RouterRequestCount: > 0, CostUsd: >= 0 },
+            $"worker_sessions for {outcome.SessionId}: {session.RouterRequestCount?.ToString() ?? "null"} requests, cost {session.CostUsd?.ToString() ?? "null"}");
     }
 }

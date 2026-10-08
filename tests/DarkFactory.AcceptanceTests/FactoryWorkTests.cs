@@ -67,11 +67,12 @@ public class FactoryWorkTests
             Assert.Contains(StoryId.Format(storyId), sessionPage);
             await e2e.ReplayAsync(address, cookies, sessionId, ct);
 
-            // The pipeline shows the item's cost (the run waited for the router's cost before it finished).
+            // The pipeline shows the item's cost (the run waited for the router's cost before it finished); $0 is a
+            // recorded cost (the router's local model), so recorded means not null, not > 0.
             var data = app.Services.GetRequiredService<IDashboardData>();
             PipelineRow? row = null;
             await E2e.WaitForAsync("the pipeline row's cost", TimeSpan.FromMinutes(3), async () =>
-                (row = (await data.ActiveItemsAsync(ct)).SingleOrDefault(r => r.ExternalId == StoryId.Format(storyId))) is { CostUsd: > 0 }, ct);
+                (row = (await data.ActiveItemsAsync(ct)).SingleOrDefault(r => r.ExternalId == StoryId.Format(storyId))) is { CostUsd: >= 0 }, ct);
             var pipeline = await http.GetStringAsync("/", ct);
             Assert.Contains($"data-item=\"{row!.Id}\"", pipeline);
             Assert.Contains(Format.Cost(row.CostUsd), pipeline);

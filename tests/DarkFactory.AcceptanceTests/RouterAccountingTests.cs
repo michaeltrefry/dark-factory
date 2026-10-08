@@ -2,7 +2,7 @@ namespace DarkFactory.AcceptanceTests;
 
 /// <summary>
 /// AT7, live and standalone: every worker session a ledger recorded since a given time is accounted for by the router
-/// (<c>GET /v1/sessions/{id}/cost</c>: at least one request, non-zero cost). AT2 and AT5 run the same check on their own
+/// (<c>GET /v1/sessions/{id}/cost</c>: at least one request, cost &gt;= 0 — $0 when the router served it on its local model). AT2 and AT5 run the same check on their own
 /// throwaway ledgers; this one checks a ledger the owner names, e.g. the real one after a manual run. Read-only.
 /// Runbook (including the router-log check for calls without a session): docs/acceptance.md.
 /// </summary>

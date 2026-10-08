@@ -195,6 +195,14 @@ public class FactoryOptionsTests
     }
 
     [Fact]
+    public void The_router_cost_settle_delay_defaults_to_five_seconds_and_refuses_a_negative_value()
+    {
+        Assert.Equal(TimeSpan.FromSeconds(5), Options([]).CostSettleDelay);
+        Assert.Equal(TimeSpan.FromSeconds(2.5), Options(new() { ["Router:CostSettleSeconds"] = "2.5" }).CostSettleDelay);
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Router:CostSettleSeconds"] = "-1" }).CostSettleDelay);
+    }
+
+    [Fact]
     public void Watch_scope_is_empty_by_default_and_reads_lists_or_arrays()
     {
         Assert.True(Options([]).WatchScope.IsEmpty);

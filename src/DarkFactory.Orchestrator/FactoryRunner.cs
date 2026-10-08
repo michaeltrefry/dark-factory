@@ -133,7 +133,7 @@ public static class FactoryRunner
             log,
             // Events are stored only; a running `factory work` host relays them to its viewers (LISTEN/NOTIFY).
             new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)),
-                new RouterClient(routerHttp, routerKey), TimeProvider.System, log),
+                new RouterClient(routerHttp, routerKey), TimeProvider.System, log, costSettleDelay: options.CostSettleDelay),
             ignoreScope: ignoreScope,
             controls: Controls(options),
             pauseGrace: pauseGrace);

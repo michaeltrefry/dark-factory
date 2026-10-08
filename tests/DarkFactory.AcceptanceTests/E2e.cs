@@ -227,7 +227,8 @@ internal sealed class E2e : IAsyncDisposable
 
     /// <summary>
     /// AT7: every <c>worker_sessions</c> row in <paramref name="ledger"/> started at or after <paramref name="since"/> has a
-    /// Claude session id the router reports with at least one request and a non-zero cost. Returns the session ids checked.
+    /// Claude session id the router reports with at least one request (recorded) and a cost &gt;= 0 (a session served on the
+    /// router's local model legitimately costs $0). Returns the session ids checked.
     /// </summary>
     public static async Task<List<string>> AssertRouterAccountsForSessionsAsync(string ledger, DateTimeOffset since, CancellationToken ct)
     {
@@ -239,7 +240,7 @@ internal sealed class E2e : IAsyncDisposable
         {
             Assert.False(session.ClaudeSessionId is null, $"worker_sessions row {session.Id} never got a Claude session id");
             var cost = await Harness.WaitForCostAsync(session.ClaudeSessionId!, Harness.Options.RouterKey, ct);
-            Assert.True(cost is { RequestCount: > 0, ActualCostUsdMicros: > 0 },
+            Assert.True(cost is { RequestCount: > 0, ActualCostUsdMicros: >= 0 },
                 $"router reports {cost?.RequestCount.ToString() ?? "nothing"} requests / {cost?.ActualCostUsdMicros.ToString() ?? "no"} cost micros for session {session.ClaudeSessionId}");
             checkedIds.Add(session.ClaudeSessionId!);
         }

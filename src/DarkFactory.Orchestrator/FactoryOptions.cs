@@ -67,6 +67,14 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     /// <summary><c>Usage:PollSeconds</c>: how often <c>factory work</c> reads the router's subscription usage.</summary>
     public TimeSpan UsagePollInterval => TimeSpan.FromSeconds(config.GetValue("Usage:PollSeconds", 60));
 
+    /// <summary>
+    /// <c>Router:CostSettleSeconds</c>: after the router first reports a session's cost, wait this long and read it once
+    /// more (a session's last requests can be committed later); see <see cref="Sessions.SessionRecorder"/>.
+    /// </summary>
+    public TimeSpan CostSettleDelay => config.GetValue("Router:CostSettleSeconds", Sessions.SessionRecorder.DefaultCostSettleDelay.TotalSeconds) is var s && s >= 0
+        ? TimeSpan.FromSeconds(s)
+        : throw new InvalidOperationException("Router:CostSettleSeconds must not be negative.");
+
     /// <summary>Port of the <c>factory work</c> host (dashboard and session hub), on 127.0.0.1 and <see cref="DashboardBindAddress"/>.</summary>
     public int HostPort => config.GetValue("Factory:HostPort", 47822);
 

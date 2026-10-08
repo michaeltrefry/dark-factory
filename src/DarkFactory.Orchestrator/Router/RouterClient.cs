@@ -13,7 +13,10 @@ public sealed record SessionCost(
 /// <summary>Where a session's spend comes from (E9).</summary>
 public interface ISessionCostSource
 {
-    /// <summary>Returns null while no cost is committed for the session yet.</summary>
+    /// <summary>
+    /// Returns null while the router has no telemetry row for the session (404). An answer with <c>request_count</c> &gt; 0
+    /// is recorded spend; its actual cost may legitimately be 0 (turns served on a local model are priced at $0).
+    /// </summary>
     Task<SessionCost?> GetSessionCostAsync(string sessionId, CancellationToken ct);
 }
 

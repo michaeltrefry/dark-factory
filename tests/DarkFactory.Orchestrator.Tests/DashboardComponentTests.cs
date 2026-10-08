@@ -146,6 +146,18 @@ public class DashboardComponentTests : BunitContext
     }
 
     [Fact]
+    public void A_zero_cost_shows_as_zero_dollars_and_an_unknown_cost_as_a_dash()
+    {
+        // A session served on the router's local model costs $0, which is known spend, not missing spend.
+        _data.Rows = [Row(1, WorkState.Review, cost: 0m), Row(2, WorkState.Review)];
+
+        var cut = Render<Pipeline>();
+
+        Assert.Equal("$0.00", cut.Find("tr[data-item='1'] td.cost").TextContent);
+        Assert.Equal("—", cut.Find("tr[data-item='2'] td.cost").TextContent);
+    }
+
+    [Fact]
     public void The_usage_pause_shows_as_a_banner_with_its_reason_and_resume_time_until_it_lifts()
     {
         var time = (FakeTimeProvider)Services.GetRequiredService<TimeProvider>();
@@ -359,6 +371,7 @@ public sealed class DashboardLiveTests : BunitContext, IAsyncLifetime
         {
             ["ConnectionStrings:Ledger"] = _cs,
             ["Factory:HostPort"] = "0",
+            ["Router:CostSettleSeconds"] = "0",
         }).Build();
         _app = FactoryHost.Build(new FactoryOptions(config, DashboardLogin.Secrets()), s => s.AddSingleton<ISessionCostSource>(new FixedCost()));
         await _app.StartAsync();
@@ -386,7 +399,8 @@ public sealed class DashboardLiveTests : BunitContext, IAsyncLifetime
     private LedgerDbContext Context() => new(LedgerDbContext.PostgresOptions(_cs));
 
     private SessionRecorder Recorder() =>
-        new(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(_cs)), new FixedCost(), TimeProvider.System, TextWriter.Null, costRetryDelays: [TimeSpan.Zero]);
+        new(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(_cs)), new FixedCost(), TimeProvider.System, TextWriter.Null, costRetryDelays: [TimeSpan.Zero],
+            costSettleDelay: TimeSpan.Zero);
 
     private static readonly TimeSpan Wait = TimeSpan.FromSeconds(15);
 
