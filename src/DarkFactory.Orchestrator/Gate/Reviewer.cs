@@ -231,10 +231,10 @@ public sealed class RouterReviewer(HttpClient http, string routerKey) : IReviewe
 
     private static string Cut(string s, int max) => s.Length > max ? s[..max] : s;
 
-    private static readonly Regex FenceCloser = new(@"<\s*/\s*(story|files|diff|finding)\s*>", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private static readonly Regex FenceCloser = new(@"<\s*/\s*(story|files|diff|finding|ci-log)\s*>", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     /// <summary>
-    /// Text written by others (the story, the repository's paths, the diff, a reviewer's finding) with every closing tag of
+    /// Text written by others (the story, the repository's paths, the diff, a reviewer's finding, a CI log) with every closing tag of
     /// the prompt's data blocks neutralised (<c>&lt;/diff&gt;</c> becomes <c>&lt;\/diff&gt;</c>), so it cannot end its block
     /// early and put text outside the "data written by others" fence the prompts rely on.
     /// </summary>

@@ -10,8 +10,11 @@ namespace DarkFactory.Orchestrator.Gate;
 public sealed record PullFacts(int Number, string HtmlUrl, bool Open, bool Merged, bool Draft, string HeadSha, string BaseRef, string BaseSha,
     string? MergeCommitSha, int? ChangedFiles = null);
 
-/// <summary>One CI check of a commit: a check run, or a commit status mapped onto the same shape.</summary>
-public sealed record CheckFact(string Name, bool Completed, string? Conclusion);
+/// <summary>
+/// One CI check of a commit: a check run, or a commit status mapped onto the same shape. <see cref="Id"/>: the check run's id
+/// (for GitHub Actions also its job's id, whose log a CI fixer is given); null for a commit status.
+/// </summary>
+public sealed record CheckFact(string Name, bool Completed, string? Conclusion, long? Id = null);
 
 /// <summary>
 /// One check suite of a commit: what an App (e.g. <c>github-actions</c>, one suite per workflow run) registered for it, before

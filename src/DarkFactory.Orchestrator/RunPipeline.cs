@@ -129,6 +129,12 @@ public sealed partial class RunPipeline(
         /// commit the fixer's work was pushed as.
         /// </summary>
         public const string FixProgress = "fix-progress";
+        /// <summary>
+        /// CI: the PR's head commit finished CI red; Detail is the <see cref="Gate.CiTriage"/> JSON — the failing checks a CI
+        /// fixer may work on and every failure that is not the PR's (names and conclusions only, never log text). In a CI fix
+        /// round (CIHealing) the <see cref="Pushed"/> checkpoint's Detail is the commit the fixer's work was pushed as.
+        /// </summary>
+        public const string CiFailure = "ci-failure";
         /// <summary>MergeGate: one evaluation of the gate; Detail is its decision and reasons.</summary>
         public const string GateDecision = "gate";
         /// <summary>
@@ -193,6 +199,7 @@ public sealed partial class RunPipeline(
                 handlers[WorkState.Review] = ReviewAsync;
                 handlers[WorkState.Fixing] = FixAsync;
                 handlers[WorkState.CI] = CiAsync;
+                handlers[WorkState.CIHealing] = CiFixAsync;
                 handlers[WorkState.MergeGate] = MergeGateAsync;
                 handlers[WorkState.Merge] = MergeAsync;
             }
@@ -206,7 +213,8 @@ public sealed partial class RunPipeline(
     /// <summary>States the factory's handlers drive (the production pipeline has a <see cref="GateStage"/>); an item in one is in flight.</summary>
     public static readonly IReadOnlySet<WorkState> HandledStates = new HashSet<WorkState>
     {
-        WorkState.Intake, WorkState.Implement, WorkState.Review, WorkState.Fixing, WorkState.CI, WorkState.MergeGate, WorkState.Merge,
+        WorkState.Intake, WorkState.Implement, WorkState.Review, WorkState.Fixing, WorkState.CI, WorkState.CIHealing, WorkState.MergeGate,
+        WorkState.Merge,
     };
 
     /// <summary>The states this pipeline drives.</summary>
@@ -919,7 +927,7 @@ public sealed partial class RunPipeline(
 
     /// <summary>
     /// Whether a worktree directory (<c>factory-sc-&lt;id&gt;</c>) belongs to an item a re-run would resume
-    /// in it (Implement, a fix round in Fixing, or Paused), so the startup sweep must keep it. Everything else is an orphan.
+    /// in it (Implement, a fix round in Fixing or CIHealing, or Paused), so the startup sweep must keep it. Everything else is an orphan.
     /// </summary>
     public static async Task<bool> WorktreeIsResumableAsync(WorkLedger ledger, string worktreeName, CancellationToken ct)
     {
@@ -928,11 +936,12 @@ public sealed partial class RunPipeline(
         {
             return false;
         }
-        return await ledger.StateOfAsync(Source, StoryId.Format(id), ct) is WorkState.Implement or WorkState.Fixing or WorkState.Paused;
+        return await ledger.StateOfAsync(Source, StoryId.Format(id), ct) is WorkState.Implement or WorkState.Fixing or WorkState.CIHealing
+            or WorkState.Paused;
     }
 
     /// <summary>
-    /// Rows of the current worker attempt: from the last entry into Implement or Fixing (a fix round; a return
+    /// Rows of the current worker attempt: from the last entry into Implement, Fixing or CIHealing (a fix round; a return
     /// from Paused continues the attempt) or the last lost-worktree restart.
     /// </summary>
     private static List<LedgerEntry> CurrentWorkerAttempt(List<LedgerEntry> history)
@@ -944,7 +953,7 @@ public sealed partial class RunPipeline(
             var e = history[i];
             if (e.Step is null)
             {
-                if (e.State is WorkState.Implement or WorkState.Fixing && previous != WorkState.Paused)
+                if (e.State is WorkState.Implement or WorkState.Fixing or WorkState.CIHealing && previous != WorkState.Paused)
                 {
                     start = i;
                 }
@@ -1095,7 +1104,7 @@ public sealed partial class RunPipeline(
     {
         var history = await ledger.HistoryAsync(item, ct);
         var session = history.LastOrDefault(e => e.ClaudeSessionId is not null)?.ClaudeSessionId;
-        var pr = item.State is WorkState.Review or WorkState.Fixing or WorkState.CI or WorkState.MergeGate or WorkState.Merge or WorkState.Watch
+        var pr = item.State is WorkState.Review or WorkState.Fixing or WorkState.CI or WorkState.CIHealing or WorkState.MergeGate or WorkState.Merge or WorkState.Watch
             ? LinkedPullRequestUrl(history)
             : null;
         return new RunOutcome(item.Id, item.State, session, pr, error);

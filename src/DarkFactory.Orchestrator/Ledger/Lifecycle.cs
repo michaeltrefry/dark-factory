@@ -26,12 +26,17 @@ public sealed record TransitionContext(WorkState? PausedFrom = null, int FixRoun
     public static TransitionContext From(IReadOnlyList<WorkState> transitions)
     {
         WorkState? pausedFrom = transitions.Count >= 2 && transitions[^1] == WorkState.Paused ? transitions[^2] : null;
-        // A fix round is a Review → Fixing step since the last Implement; returning from Paused is not a new round.
+        // A fix round is a Review → Fixing step (review findings) or a CI → CIHealing step (red CI, sc-25383) since the last
+        // Implement: both kinds share one count and one cap. Returning from Paused is not a new round.
         var lastImplement = transitions.ToList().FindLastIndex(s => s == WorkState.Implement);
         var fixRounds = Enumerable.Range(lastImplement + 1, transitions.Count - lastImplement - 1)
-            .Count(i => i > 0 && transitions[i] == WorkState.Fixing && transitions[i - 1] == WorkState.Review);
+            .Count(i => i > 0 && IsFixRound(transitions[i - 1], transitions[i]));
         return new TransitionContext(pausedFrom, fixRounds);
     }
+
+    /// <summary>Whether <paramref name="from"/> → <paramref name="to"/> starts a fix round (counted against <see cref="Lifecycle.MaxFixRounds"/>).</summary>
+    public static bool IsFixRound(WorkState from, WorkState to) =>
+        (from == WorkState.Review && to == WorkState.Fixing) || (from == WorkState.CI && to == WorkState.CIHealing);
 }
 
 public sealed class IllegalTransitionException(WorkState from, WorkState to, string reason)
@@ -92,7 +97,7 @@ public static class Lifecycle
         {
             return from == WorkState.Escalated ? "already escalated" : null;
         }
-        if (from == WorkState.Review && to == WorkState.Fixing && context.FixRounds >= MaxFixRounds)
+        if (TransitionContext.IsFixRound(from, to) && context.FixRounds >= MaxFixRounds)
         {
             return $"{MaxFixRounds} fix rounds used; escalate instead";
         }

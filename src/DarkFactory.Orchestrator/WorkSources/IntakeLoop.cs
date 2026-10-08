@@ -48,6 +48,16 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
         ex is FactoryUnavailableException or MissingCredentialException or System.Data.Common.DbException
         || ex.InnerException is System.Data.Common.DbException;
 
+    private int _waits;
+
+    /// <summary>
+    /// How many times the loop has finished a poll and armed its wake-up (the next tick, or the end of a usage pause) and is
+    /// waiting on it: once it has, moving an injected clock wakes it (a test must not move the clock before this).
+    /// </summary>
+    internal int Waits => Volatile.Read(ref _waits);
+
+    private void Armed() => Interlocked.Increment(ref _waits);
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         logger.LogInformation("Polling for work every {Interval}", options.PollInterval);
@@ -57,14 +67,19 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
         {
             var resumeAt = await PollOnceAsync(stoppingToken);
             tick ??= timer.WaitForNextTickAsync(stoppingToken).AsTask();
-            if (resumeAt is { } at && at - time.GetUtcNow() is var wait && wait < options.PollInterval)
+            // One clock reading decides the wait, and the wake-up is armed straight after it.
+            var now = time.GetUtcNow();
+            if (resumeAt is { } at && at - now is var wait && wait < options.PollInterval)
             {
                 // Paused for usage until before the next tick: poll again as soon as it lifts.
-                await Task.WhenAny(tick, Task.Delay(wait > TimeSpan.Zero ? wait : TimeSpan.Zero, time, stoppingToken));
+                var lifted = Task.Delay(wait > TimeSpan.Zero ? wait : TimeSpan.Zero, time, stoppingToken);
+                Armed();
+                await Task.WhenAny(tick, lifted);
                 stoppingToken.ThrowIfCancellationRequested();
             }
             else
             {
+                Armed();
                 await tick;
             }
             if (tick.IsCompleted)

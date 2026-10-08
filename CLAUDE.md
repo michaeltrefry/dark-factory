@@ -265,11 +265,31 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   finished is a regression); still unfinished after `Gate:CiTimeoutMinutes` escalates; either commit's CI not read in full
   is a failed round. Otherwise a failed round. Every round counts against
   `Lifecycle.MaxFixRounds` (3): a fail that would need a fourth escalates with the open findings listed in the comment.
+  CI self-heal (sc-25383, `Gate/CiHeal.cs`, `CiFailedAsync`/`CiFixAsync`): once every check on the reviewed head has
+  finished and CI is red, the failure is triaged (`CiHeal.Triage`) against the PR's base commit's CI and checkpointed
+  (`ci-failure`, `CiTriage`: names and conclusions only, never log text). A check that failed with `failure`/`timed_out` and
+  is not red on the base is the PR's; one also red on the base, or one CI did not run to a result (`cancelled`, `stale`,
+  `action_required`, no conclusion, a suite's `startup_failure`), is not — then the item escalates naming it, with no fixer
+  and no round spent on infrastructure. Exception: a `cancelled` check or suite next to a failure that is the PR's is
+  excused (a matrix's fail-fast cancels the other legs), recorded in the triage (`cancelled`), and CI on any later head
+  waits until every check a triage named (fixable or cancelled) has reported there (`CiHeal.Unreported`) — so it must run
+  and pass, not vanish. Otherwise CI → CIHealing (row Detail = the fixed head), a fix round that shares the
+  count and the cap with review rounds (`TransitionContext.IsFixRound`; the policy's `max_fix_rounds` counts both); at the
+  cap it escalates listing the failing checks. The CI fixer runs exactly like a review fixer (`RunFixRoundAsync`, same
+  sandbox/router key/resume/worktree rules) and gets the story plus each failing job's log read from GitHub when a fresh
+  session starts (`GET …/actions/jobs/{id}/logs`, last 256 KB, needs the gate App's **Actions: read**; without it the check
+  run's output and annotations, `Checks: read`, also used when the log read fails or exceeds `LogReadTimeout`, 60 s
+  including the body), turned into an excerpt (`CiHeal.Excerpt`: ANSI/timestamps stripped, ends at
+  the last `##[error]`, ≤ 6000 chars, at most 4 checks) with credentials redacted (`CiHeal.Redact`) and fenced in
+  `<ci-log>` blocks. Its push → CI, which waits for the PR to show it and sends it to Review (no verdict: E3). That review
+  re-runs every role whose scope the fix's own diff (fixed head → pushed head) touched (`CiHeal.TouchedRoles`: correctness
+  and spec conformance for any file, security only for a path that calls it in) and carries the rest; then CI again (green
+  → MergeGate). No `fix-progress` is recorded for a CI round.
   The router refusing a call for usage (429/529 or its
   exhaustion/rate-limit body: `RouterUsageLimitedException`) pauses the factory for usage (`reviewer-rate-limited`) like a
   worker's exhaustion; the item resumes and the head is reviewed again once it lifts. CI polls the head's check runs,
-  commit statuses and check suites until finished (none at all keeps waiting until `Gate:CiTimeoutMinutes`); red
-  escalates. A queued/in-progress check suite (a workflow registered but without check runs yet) keeps CI pending; a suite
+  commit statuses and check suites until finished (none at all keeps waiting until `Gate:CiTimeoutMinutes`); red goes to
+  the CI self-heal above (CI not read in full escalates). A queued/in-progress check suite (a workflow registered but without check runs yet) keeps CI pending; a suite
   of a non-Actions App with no check runs is ignored (GitHub creates one per App with checks access; the Claude App's stays
   queued forever). A workflow GitHub has not registered at all yet is still invisible. MergeGate (`MergeGate.Evaluate`, E1–E3) is deterministic code over
   facts read fresh each time: `factory/gate.yaml` at the PR's **base** commit (`pull.BaseSha`, the commit the diff is read

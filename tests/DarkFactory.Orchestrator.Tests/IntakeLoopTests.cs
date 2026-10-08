@@ -75,6 +75,8 @@ public class IntakeLoopTests
 
         await loop.StartAsync(CancellationToken.None);
         await Eventually(() => board.Requests.Any(r => r.PathAndQuery.StartsWith("/api/v3/groups/")));
+        // The first poll has finished and the loop waits for its next tick: only now may the board and the clock move.
+        await Eventually(() => loop.Waits == 1);
 
         // A ready story appears after the first poll; it is picked up on the next tick.
         board.Add(101, FakeShortcutBoard.FactoryTeam);

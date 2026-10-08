@@ -63,10 +63,24 @@ public class GatePipelineTests
 
         public RepoFiles Files { get; set; } = new(["README.md", "src/x.cs"], false);
 
+        /// <summary>The diff between two commits neither of which is the PR's base (e.g. a CI fix's own diff); by default <see cref="Diff"/> of the head.</summary>
+        public Func<string, string, string>? DiffBetween { get; set; }
+
         public Task<string> GetDiffAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct)
         {
             Calls.Add($"diff {baseSha}...{headSha}");
-            return Task.FromResult(Diff(headSha));
+            return Task.FromResult(baseSha != BaseSha && DiffBetween is { } between ? between(baseSha, headSha) : Diff(headSha));
+        }
+
+        /// <summary>Each failing check's log, by check name (a default one when not set); <see cref="LogThrows"/> makes the read fail.</summary>
+        public Dictionary<string, string> Logs { get; } = new();
+        public Exception? LogThrows { get; set; }
+
+        public Task<string> GetCheckLogAsync(RepoRef repo, CheckFact check, CancellationToken ct)
+        {
+            Calls.Add($"log {check.Name} {check.Id}");
+            return LogThrows is { } failure ? Task.FromException<string>(failure)
+                : Task.FromResult(Logs.TryGetValue(check.Name, out var log) ? log : $"##[error]{check.Name} failed");
         }
 
         public Task<RepoFiles> GetFilesAsync(RepoRef repo, string sha, CancellationToken ct)
@@ -465,10 +479,12 @@ public class GatePipelineTests
     }
 
     [Fact]
-    public async Task Failing_ci_on_the_head_escalates_without_merging()
+    public async Task Failing_ci_on_the_head_that_is_not_the_prs_escalates_without_merging()
     {
+        // sc-25383: a red check the PR could fix goes to a CI fixer (CiHealTests); one also red on the base escalates.
         var h = new Harness();
         h.GitHub.Ci[Sha1] = new CiFacts(Sha1, [new CheckFact("build-test", true, "failure")]);
+        h.GitHub.Ci[FakeGateGitHub.BaseSha] = new CiFacts(FakeGateGitHub.BaseSha, [new CheckFact("build-test", true, "failure")]);
 
         var outcome = await h.Run();
 

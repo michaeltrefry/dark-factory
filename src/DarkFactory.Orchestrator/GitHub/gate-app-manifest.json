@@ -1,7 +1,7 @@
 {
   "name": "dark-factory-gate",
   "url": "https://github.com/michaeltrefry/dark-factory",
-  "description": "Dark Factory merge gate: reads CI and factory/gate.yaml and merges pull requests that pass the gate. Never pushes.",
+  "description": "Dark Factory merge gate: reads CI (and failing jobs' logs) and factory/gate.yaml and merges pull requests that pass the gate. Never pushes.",
   "public": false,
   "redirect_url": "http://localhost:47821/callback",
   "hook_attributes": {
@@ -13,6 +13,7 @@
     "pull_requests": "write",
     "checks": "read",
     "statuses": "read",
+    "actions": "read",
     "metadata": "read"
   },
   "default_events": []

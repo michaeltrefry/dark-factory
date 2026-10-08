@@ -98,6 +98,20 @@ public class LifecycleTests
     }
 
     [Fact]
+    public void Ci_fix_rounds_share_the_fix_round_count_and_cap()
+    {
+        // sc-25383: CI → CIHealing is a fix round like Review → Fixing; a return from Paused is not a new round.
+        WorkState[] history = [Intake, Implement, Review, Fixing, Review, CI, CIHealing, Paused, CIHealing, CI, Review, CI];
+        Assert.Equal(2, TransitionContext.From(history).FixRounds);
+        Assert.Equal(3, TransitionContext.From([.. history, CIHealing]).FixRounds);
+        Assert.Equal(0, TransitionContext.From([.. history, Escalated, Intake, Implement]).FixRounds);
+        Assert.True(Legal(CI, CIHealing, new TransitionContext(FixRounds: 2)));
+        Assert.False(Legal(CI, CIHealing, new TransitionContext(FixRounds: 3)));
+        Assert.False(Legal(Review, Fixing, new TransitionContext(FixRounds: 3)));
+        Assert.True(Legal(CI, Escalated, new TransitionContext(FixRounds: 3)));
+    }
+
+    [Fact]
     public void Context_from_history_finds_pause_origin_and_counts_fix_rounds_since_implement()
     {
         Assert.Equal(new TransitionContext(Review, 1),

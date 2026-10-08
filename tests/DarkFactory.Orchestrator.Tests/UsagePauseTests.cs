@@ -137,7 +137,8 @@ public class UsagePauseTests
 
     private static async Task Eventually(Func<bool> condition)
     {
-        for (var i = 0; i < 500 && !condition(); i++)
+        // Up to 15 s: a full-suite run can starve the loop's thread for a while.
+        for (var i = 0; i < 1500 && !condition(); i++)
         {
             await Task.Delay(10);
         }
@@ -159,11 +160,14 @@ public class UsagePauseTests
         var loop = new IntakeLoop(source, runner, new IntakeOptions(Interval), l.Time, NullLogger<IntakeLoop>.Instance, l.Controls, Monitor(router, l));
 
         await loop.StartAsync(CancellationToken.None);
-        await Eventually(() => router.Reads == 1); // the poll has its reading: the clock can move
+        // The clock moves only once the loop has finished the poll and armed its wake-up: a usage read that returned is
+        // not enough (the poll then still reads the pause and computes its wait), and a move in between arms the wait late.
+        await Eventually(() => loop.Waits == 1);
         l.Time.Advance(Interval);
-        await Eventually(() => router.Reads == 2);
+        await Eventually(() => loop.Waits == 2);
         l.Time.Advance(Interval);
-        await Eventually(() => router.Reads == 3);
+        await Eventually(() => loop.Waits == 3);
+        Assert.Equal(3, router.Reads);
         l.Time.Advance(resetAt - l.Time.GetUtcNow() - TimeSpan.FromSeconds(1)); // one second before T
         await Task.Delay(200);
 

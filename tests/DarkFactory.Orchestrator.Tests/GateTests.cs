@@ -749,6 +749,140 @@ public class GitHubGateTests
     }
 
     [Fact]
+    public async Task Ci_keeps_each_check_runs_id_for_its_log()
+    {
+        var (gate, _) = Gate(a => a
+            .On($"GET {Repo}/commits/{Head}/check-runs", HttpStatusCode.OK,
+                """{"total_count":1,"check_runs":[{"id":4711,"name":"build","status":"completed","conclusion":"failure"}]}""")
+            .On($"GET {Repo}/commits/{Head}/status", HttpStatusCode.OK, """{"total_count":0,"statuses":[]}""")
+            .On($"GET {Repo}/commits/{Head}/check-suites", HttpStatusCode.OK, """{"total_count":0,"check_suites":[]}"""));
+
+        var ci = await gate.GetCiAsync(Sandbox, Head, CancellationToken.None);
+
+        Assert.Equal(new CheckFact("build", true, "failure", 4711), ci.Checks.Single());
+    }
+
+    [Fact]
+    public async Task Reads_a_failing_jobs_log_with_an_actions_read_token_only()
+    {
+        var (gate, api) = Gate(a => a.On($"GET {Repo}/actions/jobs/4711/logs", _ =>
+            new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("step 1\n##[error]boom\n") }));
+
+        var log = await gate.GetCheckLogAsync(Sandbox, new CheckFact("build", true, "failure", 4711), CancellationToken.None);
+
+        Assert.Equal("step 1\n##[error]boom\n", log);
+        Assert.Equal(["actions:read"], TokenPermissions(api).Single().EnumerateObject().Select(p => $"{p.Name}:{p.Value.GetString()}"));
+    }
+
+    [Fact]
+    public async Task Keeps_only_the_end_of_a_very_large_log()
+    {
+        var big = new string('x', GitHubGate.MaxLogBytes * 3) + "THE END";
+        var (gate, _) = Gate(a => a.On($"GET {Repo}/actions/jobs/4711/logs", _ =>
+            new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(big) }));
+
+        var log = await gate.GetCheckLogAsync(Sandbox, new CheckFact("build", true, "failure", 4711), CancellationToken.None);
+
+        Assert.StartsWith("[earlier log omitted]\n", log);
+        Assert.EndsWith("THE END", log);
+        Assert.True(log.Length <= GitHubGate.MaxLogBytes + 30);
+    }
+
+    [Fact]
+    public async Task Without_actions_read_the_check_runs_output_and_annotations_stand_in_for_the_log()
+    {
+        var tokens = 0;
+        var api = new FakeApi()
+            .On($"GET {Repo}/installation", HttpStatusCode.OK, """{"id":555}""")
+            // The installation was not granted "Actions: read": GitHub refuses a token that asks for it.
+            .On("POST /app/installations/555/access_tokens", r => r.Body!.Contains("\"actions\"")
+                ? FakeApi.Json(HttpStatusCode.UnprocessableEntity, """{"message":"The permissions requested are not granted to this installation."}""")
+                : FakeApi.Json(HttpStatusCode.Created, $$"""{"token":"ghs_gate{{++tokens}}","expires_at":"{{DateTimeOffset.UtcNow.AddMinutes(59):O}}"}"""))
+            .On($"GET {Repo}/check-runs/4711", HttpStatusCode.OK,
+                """{"id":4711,"name":"build","status":"completed","conclusion":"failure","output":{"title":"1 test failed","summary":"WordCountTests.Whitespace failed","text":null}}""")
+            .On($"GET {Repo}/check-runs/4711/annotations", HttpStatusCode.OK,
+                """[{"path":"src/x.cs","start_line":3,"annotation_level":"failure","message":"Assert.Equal() Failure"}]""");
+        var client = api.Client("https://api.github.com/");
+        var gate = new GitHubGate(client, new GitHubApp(client, "4242", Key.ExportRSAPrivateKeyPem(), TimeProvider.System));
+
+        var log = await gate.GetCheckLogAsync(Sandbox, new CheckFact("build", true, "failure", 4711), CancellationToken.None);
+
+        Assert.Contains("the job log could not be read", log);
+        Assert.Contains("not granted", log);
+        Assert.Contains("1 test failed\nWordCountTests.Whitespace failed\nfailure: src/x.cs:3: Assert.Equal() Failure", log);
+        Assert.DoesNotContain(api.Requests, r => r.PathAndQuery.Contains("/actions/jobs/"));
+        Assert.EndsWith("?per_page=50", api.Requests.Single(r => r.PathAndQuery.Contains("/annotations")).PathAndQuery);
+    }
+
+    [Theory]
+    [InlineData("network")]
+    [InlineData("slow-body")]
+    public async Task A_log_that_fails_or_hangs_while_read_falls_back_to_the_check_runs_output(string failure)
+    {
+        var (_, api) = Gate(a => a
+            .On($"GET {Repo}/actions/jobs/4711/logs", _ => failure == "network"
+                ? throw new HttpRequestException("connection reset")
+                : new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(new HangingStream()) })
+            .On($"GET {Repo}/check-runs/4711", HttpStatusCode.OK,
+                """{"id":4711,"name":"build","status":"completed","conclusion":"failure","output":{"title":"1 test failed","summary":null,"text":null}}""")
+            .On($"GET {Repo}/check-runs/4711/annotations", HttpStatusCode.OK, "[]"));
+        var client = api.Client("https://api.github.com/");
+        var gate = new GitHubGate(client, new GitHubApp(client, "4242", Key.ExportRSAPrivateKeyPem(), TimeProvider.System))
+        {
+            LogReadTimeout = TimeSpan.FromMilliseconds(300),
+        };
+
+        var log = await gate.GetCheckLogAsync(Sandbox, new CheckFact("build", true, "failure", 4711), CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Contains("the job log could not be read", log);
+        Assert.Contains(failure == "network" ? "connection reset" : "timed out", log);
+        Assert.EndsWith("1 test failed", log);
+    }
+
+    [Fact]
+    public async Task The_callers_cancellation_of_a_log_read_is_not_a_log_that_could_not_be_read()
+    {
+        var (gate, _) = Gate(a => a.On($"GET {Repo}/actions/jobs/4711/logs", _ =>
+            new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(new HangingStream()) }));
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => gate.GetCheckLogAsync(Sandbox, new CheckFact("build", true, "failure", 4711), cts.Token));
+    }
+
+    /// <summary>A response body that never sends a byte: it ends only when the read is cancelled.</summary>
+    private sealed class HangingStream : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+        {
+            await Task.Delay(Timeout.Infinite, ct);
+            return 0;
+        }
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) => ReadAsync(buffer.AsMemory(offset, count), ct).AsTask();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    [Fact]
+    public async Task A_commit_status_has_no_log()
+    {
+        var (gate, api) = Gate(_ => { });
+
+        var log = await gate.GetCheckLogAsync(Sandbox, new CheckFact("ci/legacy", true, "failure"), CancellationToken.None);
+
+        Assert.Contains("commit status", log);
+        Assert.Empty(api.Requests);
+    }
+
+    [Fact]
     public async Task Merges_only_the_gated_head_with_a_write_token()
     {
         var (gate, api) = Gate(a => a.On($"PUT {Repo}/pulls/7/merge", HttpStatusCode.OK,
