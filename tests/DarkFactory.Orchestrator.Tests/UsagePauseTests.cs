@@ -89,6 +89,27 @@ public class UsagePauseTests
         });
 
         public RouterClient Client => new(Api.Client("http://router.test/"), "rk");
+
+        private int _reads;
+        /// <summary>
+        /// Usage reads through <see cref="UsageSource"/> that have returned a report. A test that advances the clock must wait for
+        /// this, not <see cref="Calls"/>: the read is bounded by a timeout on the injected clock, so advancing it while a
+        /// read is still in flight cancels that read (usage unknown, no pause) instead of moving on to the next poll.
+        /// </summary>
+        public int Reads => Volatile.Read(ref _reads);
+
+        /// <summary><see cref="Client"/>, counting each read that returned (<see cref="Reads"/>).</summary>
+        public IUsageSource UsageSource => new Counting(this);
+
+        private sealed class Counting(StubRouter router) : IUsageSource
+        {
+            public async Task<SubscriptionUsage> GetUsageAsync(CancellationToken ct)
+            {
+                var report = await router.Client.GetUsageAsync(ct);
+                Interlocked.Increment(ref router._reads);
+                return report;
+            }
+        }
     }
 
     /// <summary>The router's report shape (<c>GET /v1/subscriptions/usage</c>) with one Anthropic credential.</summary>
@@ -112,7 +133,7 @@ public class UsagePauseTests
         });
 
     private static UsageMonitor Monitor(StubRouter router, Ledgers l) =>
-        new(router.Client, l.Controls, new UsageOptions(Interval), l.Time, NullLogger<UsageMonitor>.Instance);
+        new(router.UsageSource, l.Controls, new UsageOptions(Interval), l.Time, NullLogger<UsageMonitor>.Instance);
 
     private static async Task Eventually(Func<bool> condition)
     {
@@ -138,11 +159,11 @@ public class UsagePauseTests
         var loop = new IntakeLoop(source, runner, new IntakeOptions(Interval), l.Time, NullLogger<IntakeLoop>.Instance, l.Controls, Monitor(router, l));
 
         await loop.StartAsync(CancellationToken.None);
-        await Eventually(() => router.Calls == 1);
+        await Eventually(() => router.Reads == 1); // the poll has its reading: the clock can move
         l.Time.Advance(Interval);
-        await Eventually(() => router.Calls == 2);
+        await Eventually(() => router.Reads == 2);
         l.Time.Advance(Interval);
-        await Eventually(() => router.Calls == 3);
+        await Eventually(() => router.Reads == 3);
         l.Time.Advance(resetAt - l.Time.GetUtcNow() - TimeSpan.FromSeconds(1)); // one second before T
         await Task.Delay(200);
 
