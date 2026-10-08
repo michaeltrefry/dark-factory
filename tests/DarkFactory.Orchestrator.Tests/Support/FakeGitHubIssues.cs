@@ -32,6 +32,15 @@ public sealed class FakeGitHubIssues(TimeProvider time) : IGitHubIssues
     /// <summary>Permissions by login (anyone else has none).</summary>
     public Dictionary<string, RepoPermission> Permissions { get; } = new();
 
+    /// <summary>Permissions on one repo, by "owner/name:login"; they override <see cref="Permissions"/> there.</summary>
+    public Dictionary<string, RepoPermission> RepoPermissions { get; } = new();
+
+    /// <summary>Every permission read, as "owner/name:login".</summary>
+    public List<string> PermissionReads { get; } = [];
+
+    /// <summary>When set, every comment post on that issue ("owner/name#n") fails with this, nothing posted.</summary>
+    public Dictionary<string, Exception> RefuseComments { get; } = new();
+
     /// <summary>Files on each repo's default branch, by "owner/name:path".</summary>
     public Dictionary<string, string> Files { get; } = new();
 
@@ -102,7 +111,9 @@ public sealed class FakeGitHubIssues(TimeProvider time) : IGitHubIssues
     public Task<RepoPermission> PermissionAsync(RepoRef repo, string login, CancellationToken ct)
     {
         ThrowIfDown();
-        return Task.FromResult(Permissions.GetValueOrDefault(login, RepoPermission.None));
+        PermissionReads.Add($"{repo}:{login}");
+        return Task.FromResult(RepoPermissions.TryGetValue($"{repo}:{login}", out var onRepo) ? onRepo
+            : Permissions.GetValueOrDefault(login, RepoPermission.None));
     }
 
     public Task<string?> GetFileAsync(RepoRef repo, string path, CancellationToken ct)
@@ -114,6 +125,10 @@ public sealed class FakeGitHubIssues(TimeProvider time) : IGitHubIssues
     public Task<long> CommentAsync(RepoRef repo, int number, string body, CancellationToken ct)
     {
         ThrowIfDown();
+        if (RefuseComments.TryGetValue($"{repo}#{number}", out var refused))
+        {
+            throw refused;
+        }
         var issue = Find(repo, number);
         var at = time.GetUtcNow();
         var id = ++_nextComment;

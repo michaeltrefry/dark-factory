@@ -592,7 +592,7 @@ public sealed partial class RunPipeline(
 
         if (!attempt.Any(e => e.Step == Steps.Pushed))
         {
-            if (!await workspaces.CommitAndPushAsync(repo, workspace, $"{story.Ref}: {story.Name}", ct))
+            if (!await workspaces.CommitAndPushAsync(repo, workspace, $"{story.Ref}: {story.PublicName}", ct))
             {
                 throw new InvalidOperationException("Worker finished without changing the repository; nothing to review.");
             }
@@ -603,7 +603,7 @@ public sealed partial class RunPipeline(
         await ThrowIfControlledAsync(item, ct);
         // Returns the branch's already-open PR instead of opening a second one.
         var prUrl = await pullRequests.OpenAsync(repo, workspace.Branch, workspace.BaseBranch,
-            $"{story.Ref}: {story.Name}", BuildPrBody(story, session!), ct);
+            $"{story.Ref}: {story.PublicName}", BuildPrBody(story, session!), ct);
         var branchUrl = BranchUrl(repo, workspace.Branch);
         if (!attempt.Any(e => e.Step == Steps.Linked && e.Detail == $"{prUrl} {branchUrl}"))
         {
@@ -1182,11 +1182,11 @@ public sealed partial class RunPipeline(
 
     /// <summary>
     /// The PR's description: it links back to the item, and for an item that closes an issue (<see cref="WorkStory.Closes"/>)
-    /// carries GitHub's closing keyword, so merging the PR closes the issue.
+    /// carries GitHub's closing keyword, so merging the PR closes the issue. An untrusted name (a triage's title) is inert, in a code span.
     /// </summary>
     public static string BuildPrBody(WorkStory story, string sessionId) =>
         $"""
-        Implements {story.Kind.Noun} [{story.Ref}]({story.AppUrl}): {story.Name}
+        Implements {story.Kind.Noun} [{story.Ref}]({story.AppUrl}): {(story.UntrustedName ? UntrustedText.CodeSpan(story.Name) : story.Name)}
         {(story.Closes is { } closes ? $"\nCloses {closes}\n" : "")}
         Opened by Dark Factory. Claude session: `{sessionId}`
         """;

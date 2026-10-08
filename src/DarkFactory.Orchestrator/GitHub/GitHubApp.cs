@@ -33,6 +33,28 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
     /// <summary>The App's id: what GitHub reports as <c>performed_via_github_app.id</c> on what its tokens wrote.</summary>
     public string AppId => appId;
 
+    private string? _slug;
+
+    /// <summary>The App's slug (its bot account is <c>&lt;slug&gt;[bot]</c>), read once from <c>GET /app</c> as the App.</summary>
+    public async Task<string> SlugAsync(CancellationToken ct)
+    {
+        if (_slug is { } known)
+        {
+            return known;
+        }
+        using var request = Request(HttpMethod.Get, "app", "Bearer", CreateJwt());
+        using var response = await http.SendAsync(request, ct);
+        await EnsureSuccess(response, "read the App", ct);
+        var slug = (await response.Content.ReadFromJsonAsync<AppDto>(ct))?.Slug;
+        if (string.IsNullOrEmpty(slug))
+        {
+            throw new InvalidOperationException("GitHub returned no slug for the App.");
+        }
+        return _slug = slug;
+    }
+
+    private sealed record AppDto([property: JsonPropertyName("slug")] string? Slug);
+
     // Tolerates clock drift between this Mac and GitHub when checking expires_at.
     private static readonly TimeSpan ClockSkew = TimeSpan.FromMinutes(5);
 

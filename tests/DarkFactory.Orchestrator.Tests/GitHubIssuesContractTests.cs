@@ -92,9 +92,117 @@ public class GitHubIssuesContractTests
         var issues = await github.ListUpdatedAsync(Widgets, null, CancellationToken.None);
 
         Assert.Equal(103, issues.Count);
+        // A full page is followed by a first page from its last item's time; only a full page all of one second pages on.
         var pages = api.Requests.Where(r => r.PathAndQuery.StartsWith("/repos/acme/widgets/issues", StringComparison.Ordinal)).Select(r => r.PathAndQuery).ToList();
         Assert.Equal(["/repos/acme/widgets/issues?state=open&sort=updated&direction=asc&per_page=100&page=1",
-            "/repos/acme/widgets/issues?state=open&sort=updated&direction=asc&per_page=100&page=2"], pages);
+            "/repos/acme/widgets/issues?state=open&sort=updated&direction=asc&per_page=100&page=1&since=2026-10-08T12%3A00%3A00Z",
+            "/repos/acme/widgets/issues?state=open&sort=updated&direction=asc&per_page=100&page=2&since=2026-10-08T12%3A00%3A00Z"], pages);
+    }
+
+    [Theory]
+    [InlineData(422, null, true)]          // e.g. a comment over GitHub's size limit: refused for good
+    [InlineData(403, null, true)]          // e.g. a locked issue
+    [InlineData(403, "0", false)]          // a rate limit: it passes later
+    [InlineData(429, null, false)]
+    [InlineData(500, null, false)]
+    public async Task A_refused_issue_request_says_whether_it_can_pass_later(int status, string? remaining, bool permanent)
+    {
+        var api = new FakeApi()
+            .On("GET /repos/acme/widgets/installation", HttpStatusCode.OK, """{"id":1}""")
+            .On("POST /app/installations/1/access_tokens", HttpStatusCode.Created, $$"""{"token":"t","expires_at":"{{DateTimeOffset.UtcNow.AddMinutes(30):O}}"}""")
+            .On("POST /repos/acme/widgets/issues/12/comments", _ =>
+            {
+                var response = FakeApi.Json((HttpStatusCode)status, """{"message":"no"}""");
+                if (remaining is not null)
+                {
+                    response.Headers.Add("x-ratelimit-remaining", remaining);
+                }
+                return response;
+            });
+
+        var ex = await Assert.ThrowsAsync<GitHubRequestException>(() => Client(api).CommentAsync(Widgets, 12, "hi", CancellationToken.None));
+
+        Assert.Equal((status, permanent), (ex.Status, ex.Permanent));
+    }
+
+    [Fact]
+    public async Task A_token_the_app_cannot_mint_is_not_a_refusal_of_the_request()
+    {
+        var api = new FakeApi()
+            .On("GET /repos/acme/widgets/installation", HttpStatusCode.OK, """{"id":1}""")
+            .On("POST /app/installations/1/access_tokens", HttpStatusCode.UnprocessableEntity, """{"message":"permissions not granted"}""");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => Client(api).CommentAsync(Widgets, 12, "hi", CancellationToken.None));
+
+        Assert.IsNotType<GitHubRequestException>(ex);
+    }
+
+    [Fact]
+    public async Task An_issue_updated_while_the_listing_pages_shifts_no_other_issue_out_of_it()
+    {
+        // GitHub's order: open issues by updated_at ascending, filtered by since (second resolution), 100 a page.
+        var start = DateTimeOffset.Parse("2026-10-08T12:00:00Z");
+        var updated = Enumerable.Range(1, 150).ToDictionary(n => n, n => start.AddSeconds(n));
+        var calls = 0;
+        HttpResponseMessage List(RecordedRequest r)
+        {
+            var query = System.Web.HttpUtility.ParseQueryString(new Uri("https://x" + r.PathAndQuery).Query);
+            var since = query["since"] is { } s ? DateTimeOffset.Parse(s) : DateTimeOffset.MinValue;
+            var page = int.Parse(query["page"]!);
+            var batch = updated.Where(p => p.Value >= since).OrderBy(p => p.Value).Skip((page - 1) * 100).Take(100).ToList();
+            if (++calls == 1)
+            {
+                updated[5] = start.AddSeconds(1000); // issue 5 (on page 1) is updated while the listing runs: it moves to the end
+            }
+            return FakeApi.Json(HttpStatusCode.OK, new JsonArray(batch.Select(p => (JsonNode)new JsonObject
+            {
+                ["number"] = p.Key, ["title"] = $"#{p.Key}", ["state"] = "open", ["html_url"] = $"https://github.com/acme/widgets/issues/{p.Key}",
+                ["updated_at"] = p.Value.ToString("yyyy-MM-ddTHH:mm:ssZ"), ["user"] = new JsonObject { ["login"] = "u" },
+            }).ToArray()).ToJsonString());
+        }
+        var api = new FakeApi()
+            .On("GET /repos/acme/widgets/installation", HttpStatusCode.OK, """{"id":1}""")
+            .On("POST /app/installations/1/access_tokens", HttpStatusCode.Created, $$"""{"token":"t","expires_at":"{{DateTimeOffset.UtcNow.AddMinutes(30):O}}"}""")
+            .On("GET /repos/acme/widgets/issues", List);
+
+        var issues = await Client(api).ListUpdatedAsync(Widgets, start, CancellationToken.None);
+
+        // Issue 101 slid onto page 1 when issue 5 moved; page 2 by number would have started at 102.
+        Assert.Equal(Enumerable.Range(1, 150), issues.Select(i => i.Number).Order());
+        Assert.Equal(start.AddSeconds(1000), issues.Single(i => i.Number == 5).UpdatedAt);
+        Assert.Equal(5, issues[^1].Number);
+    }
+
+    [Fact]
+    public async Task A_comment_GitHub_names_no_App_for_is_the_factorys_only_from_its_own_bot_account()
+    {
+        static JsonObject Comment(long id, string login, string type, JsonNode? app) => new()
+        {
+            ["id"] = id, ["body"] = "[author: dark-factory] Triage\n<!-- dark-factory:triage 0123456789abcdef -->",
+            ["user"] = new JsonObject { ["login"] = login, ["type"] = type },
+            ["created_at"] = "2026-10-08T12:00:08Z", ["updated_at"] = "2026-10-08T12:00:08Z", ["performed_via_github_app"] = app,
+        };
+        var comments = new JsonArray(
+            Comment(1, "dark-factory[bot]", "Bot", null),                                // the App's bot, GitHub naming no App
+            Comment(2, "dark-factory[bot]", "User", null),                               // not a bot: no person can be the App
+            Comment(3, "other-app[bot]", "Bot", null),                                   // another App's bot
+            Comment(4, "dark-factory", "User", null),                                    // a person named like the App
+            Comment(5, "someone[bot]", "Bot", new JsonObject { ["id"] = 4242 }));       // GitHub names the App: trusted as before
+        var api = new FakeApi()
+            .On("GET /repos/acme/widgets/installation", HttpStatusCode.OK, """{"id":1}""")
+            .On("POST /app/installations/1/access_tokens", HttpStatusCode.Created, $$"""{"token":"t","expires_at":"{{DateTimeOffset.UtcNow.AddMinutes(30):O}}"}""")
+            .On("GET /app", HttpStatusCode.OK, """{"id":4242,"slug":"dark-factory"}""")
+            .On("GET /repos/acme/widgets/issues/12/comments", HttpStatusCode.OK, comments.ToJsonString());
+        var github = Client(api);
+
+        var read = await github.ListCommentsAsync(Widgets, 12, CancellationToken.None);
+        await github.ListCommentsAsync(Widgets, 12, CancellationToken.None);
+
+        Assert.Equal([4242L, null, null, null, 4242L], read.Select(c => c.AppId));
+        Assert.Equal(["0123456789abcdef", null, null, null, "0123456789abcdef"], read.Select(c => IssueComments.TriageHash(c, github.AppId)));
+        // The slug is read once, as the App (its JWT, not an installation token).
+        var app = Assert.Single(api.Requests, r => r.PathAndQuery == "/app");
+        Assert.NotEqual("Bearer t", app.Headers["Authorization"]);
     }
 
     [Fact]

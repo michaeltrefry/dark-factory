@@ -35,6 +35,12 @@ public static class IssueSteps
     /// or "&lt;triage hash&gt; approved by &lt;login&gt;". That triage fixes the item's scope: later edits to the issue change nothing.
     /// </summary>
     public const string Released = "released";
+
+    /// <summary>
+    /// GitHub refused a request about the issue for good (a 4xx that is not a rate limit); Detail is the error. The poll moved past
+    /// the issue, and takes it up again when it next changes.
+    /// </summary>
+    public const string Refused = "github-refused";
 }
 
 /// <summary>One <c>Approved</c> comment and what it did: bound to <see cref="TriageHash"/> (the triage comment before it), or why not.</summary>
@@ -81,6 +87,9 @@ public sealed class IssueIntake(
 
     /// <summary>Detail of the Paused row (and its parked checkpoint) an issue's new work item waits in until a triage releases it.</summary>
     public const string AwaitingTriage = "awaiting triage";
+
+    /// <summary>The longest failed-triage error the triage comment shows (it is posted in the fence and in the route reason).</summary>
+    public const int MaxError = 2000;
 
     /// <summary>One poll of every watched repo. Throws only for a failure every issue shares (GitHub or the ledger unreachable).</summary>
     public async Task PollAsync(CancellationToken ct)
@@ -173,6 +182,18 @@ public sealed class IssueIntake(
                 status.ItemOk(id);
             }
             return outcome;
+        }
+        catch (GitHubRequestException ex) when (!ct.IsCancellationRequested && ex.Permanent)
+        {
+            // GitHub refuses this issue's request as it stands (e.g. 422, 403 locked, 404 gone): retrying every poll would only hold
+            // the repo's cursor at this issue. Recorded on the item and the dashboard, and the cursor moves on; the issue is taken up
+            // again (from where its ledger stands) when it next changes.
+            var error = ex.Message.Length > MaxError ? ex.Message[..MaxError] : ex.Message;
+            await ledger.CheckpointAsync(item, IssueSteps.Refused, null, error, ct);
+            status.ItemFailed(id, $"{ex.GetType().Name}: {error}");
+            status.ItemGaveUp(id, $"GitHub refused it ({ex.Status}); recorded, and taken up again when the issue next changes");
+            log.WriteLine($"[issues] {id} ({repo}#{issue.Number}) refused by GitHub: {error}; recorded, taken up again when the issue next changes");
+            return Outcome.Done;
         }
         catch (Exception ex) when (!ct.IsCancellationRequested && !IntakeLoop.IsFactoryWide(ex))
         {
@@ -297,11 +318,22 @@ public sealed class IssueIntake(
             }
             error = $"the triage failed {failures} times in a row; last error: {ex.Message}";
         }
+        if (error is { Length: > MaxError })
+        {
+            // The error carries the worker's own output, posted on the issue twice: bounded, so the comment stays postable.
+            error = $"{error[..MaxError]} [cut at {MaxError} characters]";
+        }
         var author = issue.AuthorIsBot ? RepoPermission.None : await issues.PermissionAsync(repo, issue.Author, ct);
+        RepoPermission? authorOnTarget = null;
         GatePolicy? policy = null;
         string? policyError = null;
         if (parsed is { Buildable: true } && author.IsCollaborator && IssueRouting.Target(parsed, watched).Target is { } target)
         {
+            // The issue text steers the target: the author must be able to push to the repo the work changes, not only this one.
+            if (!SameRepo(target, repo))
+            {
+                authorOnTarget = await issues.PermissionAsync(target, issue.Author, ct);
+            }
             try
             {
                 policy = await issues.GetFileAsync(target, GatePolicy.Path, ct) is { } yaml ? GatePolicy.Parse(yaml) : null;
@@ -311,8 +343,8 @@ public sealed class IssueIntake(
                 policyError = ex.Message;
             }
         }
-        var route = IssueRouting.Decide(parsed, error, author, watched, policy, policyError);
-        return (TriageRecord.Create(version, parsed, error, issue.Author, author, route), false);
+        var route = IssueRouting.Decide(parsed, error, author, watched, policy, policyError, authorOnTarget);
+        return (TriageRecord.Create(version, parsed, error, issue.Author, author, route, authorOnTarget), false);
     }
 
     /// <summary>
@@ -333,12 +365,17 @@ public sealed class IssueIntake(
                 ? IssueComments.TriageHash(shown, issues.AppId)
                 : null;
             var permission = approval.AuthorIsBot ? RepoPermission.None : await issues.PermissionAsync(repo, approval.Author, ct);
+            // The approver must be able to push to the repo the work changes (the triage's target) as well as to the issue's.
+            var target = record.Target is { } named && RepoRef.Parse(named) is var t && !SameRepo(t, repo) ? t : null;
+            var onTarget = target is not null && permission.IsCollaborator ? await issues.PermissionAsync(target, approval.Author, ct) : null;
             var ignored = bound is null ? "no triage comment came before it"
                 : bound != record.Hash ? $"it approves triage {bound}, but the issue changed since and the current triage is {record.Hash}"
                 : !permission.IsCollaborator ? $"{approval.Author} is not a collaborator ({permission})"
+                : onTarget is { IsCollaborator: false } ? $"{approval.Author} is not a collaborator on {target} ({onTarget}), where the work would be built"
                 : !record.Releasable ? $"the triage cannot be built as it stands: {record.Why}"
                 : null;
-            var approvalRecord = new ApprovalRecord(approval.Id, approval.Author, permission.ToString(), bound, ignored);
+            var approvalRecord = new ApprovalRecord(approval.Id, approval.Author,
+                onTarget is null ? permission.ToString() : $"{permission}; on {target}: {onTarget}", bound, ignored);
             if (ignored is not null)
             {
                 await ledger.CheckpointAsync(item, IssueSteps.ApprovalIgnored, null, approvalRecord.ToJson(), ct);
@@ -351,6 +388,8 @@ public sealed class IssueIntake(
             return;
         }
     }
+
+    private static bool SameRepo(RepoRef a, RepoRef b) => string.Equals(a.FullName, b.FullName, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>The latest triage recorded for the item, or null.</summary>
     public static TriageRecord? Latest(List<LedgerEntry> history) =>

@@ -37,6 +37,38 @@ public sealed record RepoPermission(string Permission, string Role)
     public override string ToString() => Role == Permission ? Permission : $"{Role} ({Permission})";
 }
 
+/// <summary>
+/// A request about an issue GitHub answered with an error status (<see cref="GitHubIssuesClient"/>; a failed token mint is not one:
+/// it is the App's, shared by every call on the repo). <see cref="RateLimited"/> when the error is a rate limit.
+/// </summary>
+public sealed class GitHubRequestException(string message, int status, bool rateLimited) : InvalidOperationException(message)
+{
+    public int Status => status;
+
+    public bool RateLimited => rateLimited;
+
+    /// <summary>
+    /// GitHub refuses this request and will refuse it again as it stands (e.g. 404 gone, 410, 422 invalid, 403 locked): a 4xx that
+    /// is not a rate limit, a timed-out request (408) or bad credentials (401, which every call shares).
+    /// </summary>
+    public bool Permanent => status is >= 400 and < 500 and not (401 or 408 or 429) && !rateLimited;
+
+    public static async Task EnsureSuccess(HttpResponseMessage response, string action, CancellationToken ct)
+    {
+        if (response.IsSuccessStatusCode)
+        {
+            return;
+        }
+        var body = await response.Content.ReadAsStringAsync(ct);
+        var limited = response.StatusCode == HttpStatusCode.TooManyRequests
+            || (response.StatusCode == HttpStatusCode.Forbidden
+                && (response.Headers.RetryAfter is not null
+                    || (response.Headers.TryGetValues("x-ratelimit-remaining", out var left) && left.FirstOrDefault() == "0")
+                    || body.Contains("rate limit", StringComparison.OrdinalIgnoreCase)));
+        throw new GitHubRequestException($"GitHub {action} failed: {(int)response.StatusCode} {body}", (int)response.StatusCode, limited);
+    }
+}
+
 /// <summary>What the GitHub issue work source reads from and writes to GitHub (polling only; the Mac exposes no webhook).</summary>
 public interface IGitHubIssues
 {
@@ -91,21 +123,38 @@ public sealed class GitHubIssuesClient(HttpClient http, GitHubApp app) : IGitHub
 
     public async Task<IReadOnlyList<IssueFacts>> ListUpdatedAsync(RepoRef repo, DateTimeOffset? since, CancellationToken ct)
     {
+        // Keyset paging: each full page is followed by a fresh first page from its last item's updated_at, never by page N+1. An
+        // issue updated while the listing runs moves to the end of the order, which shifts numbered pages under the reader (one
+        // could be skipped while the cursor moves past it); re-querying from the last time read keeps every issue in view. Seen
+        // twice, an issue keeps its latest version. Only a full page of one second (GitHub's since has second resolution) pages on.
         var token = await TokenAsync(repo, ReadPermissions, ct);
-        var issues = new List<IssueFacts>();
-        var filter = since is { } s ? $"&since={Uri.EscapeDataString(s.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ", System.Globalization.CultureInfo.InvariantCulture))}" : "";
-        for (var page = 1; ; page++)
+        var issues = new Dictionary<int, IssueFacts>();
+        var from = since is { } s ? Second(s) : (DateTimeOffset?)null;
+        for (var page = 1; ;)
         {
+            var filter = from is { } f
+                ? $"&since={Uri.EscapeDataString(f.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ", System.Globalization.CultureInfo.InvariantCulture))}"
+                : "";
             var batch = await GetJsonAsync<List<IssueDto>>(
                 $"repos/{repo.Owner}/{repo.Name}/issues?state=open&sort=updated&direction=asc&per_page={PageSize}&page={page}{filter}", token,
                 $"list the issues of {repo}", ct);
-            issues.AddRange(batch.Where(i => i.PullRequest is null).Select(Facts));
+            foreach (var issue in batch.Where(i => i.PullRequest is null).Select(Facts))
+            {
+                if (!issues.TryGetValue(issue.Number, out var seen) || issue.UpdatedAt >= seen.UpdatedAt)
+                {
+                    issues[issue.Number] = issue;
+                }
+            }
             if (batch.Count < PageSize)
             {
-                return issues;
+                return issues.Values.OrderBy(i => i.UpdatedAt).ThenBy(i => i.Number).ToList();
             }
+            var last = Second(batch[^1].UpdatedAt);
+            (from, page) = from is null || last > from ? (last, 1) : (from, page + 1);
         }
     }
+
+    private static DateTimeOffset Second(DateTimeOffset at) => new(at.UtcTicks - at.UtcTicks % TimeSpan.TicksPerSecond, TimeSpan.Zero);
 
     public async Task<IssueFacts> GetAsync(RepoRef repo, int number, CancellationToken ct) =>
         Facts(await GetJsonAsync<IssueDto>($"repos/{repo.Owner}/{repo.Name}/issues/{number}", await TokenAsync(repo, ReadPermissions, ct),
@@ -119,8 +168,11 @@ public sealed class GitHubIssuesClient(HttpClient http, GitHubApp app) : IGitHub
         {
             var batch = await GetJsonAsync<List<CommentDto>>($"repos/{repo.Owner}/{repo.Name}/issues/{number}/comments?per_page={PageSize}&page={page}",
                 token, $"list the comments of {repo}#{number}", ct);
-            comments.AddRange(batch.Select(c => new IssueComment(c.Id, c.User?.Login ?? "", c.User?.Type == "Bot", c.Body ?? "", c.CreatedAt, c.UpdatedAt,
-                c.App?.Id)));
+            foreach (var c in batch)
+            {
+                comments.Add(new IssueComment(c.Id, c.User?.Login ?? "", c.User?.Type == "Bot", c.Body ?? "", c.CreatedAt, c.UpdatedAt,
+                    c.App?.Id ?? await BotAppIdAsync(c.User, ct)));
+            }
             if (batch.Count < PageSize)
             {
                 return comments;
@@ -137,7 +189,7 @@ public sealed class GitHubIssuesClient(HttpClient http, GitHubApp app) : IGitHub
         {
             return RepoPermission.None;
         }
-        await GitHubApp.EnsureSuccess(response, $"read {login}'s permission on {repo}", ct);
+        await GitHubRequestException.EnsureSuccess(response, $"read {login}'s permission on {repo}", ct);
         var dto = (await response.Content.ReadFromJsonAsync<PermissionDto>(ct))!;
         var permission = dto.Permission ?? "none";
         return new RepoPermission(permission, dto.RoleName ?? permission);
@@ -154,7 +206,7 @@ public sealed class GitHubIssuesClient(HttpClient http, GitHubApp app) : IGitHub
         {
             return null;
         }
-        await GitHubApp.EnsureSuccess(response, $"read {path} of {repo}", ct);
+        await GitHubRequestException.EnsureSuccess(response, $"read {path} of {repo}", ct);
         return await response.Content.ReadAsStringAsync(ct);
     }
 
@@ -164,7 +216,7 @@ public sealed class GitHubIssuesClient(HttpClient http, GitHubApp app) : IGitHub
             await TokenAsync(repo, WritePermissions, ct));
         request.Content = JsonContent.Create(new { body });
         using var response = await http.SendAsync(request, ct);
-        await GitHubApp.EnsureSuccess(response, $"comment on {repo}#{number}", ct);
+        await GitHubRequestException.EnsureSuccess(response, $"comment on {repo}#{number}", ct);
         return (await response.Content.ReadFromJsonAsync<CommentDto>(ct))!.Id;
     }
 
@@ -174,7 +226,7 @@ public sealed class GitHubIssuesClient(HttpClient http, GitHubApp app) : IGitHub
             await TokenAsync(repo, WritePermissions, ct));
         request.Content = JsonContent.Create(new { labels });
         using var response = await http.SendAsync(request, ct);
-        await GitHubApp.EnsureSuccess(response, $"label {repo}#{number}", ct);
+        await GitHubRequestException.EnsureSuccess(response, $"label {repo}#{number}", ct);
     }
 
     public async Task RemoveLabelAsync(RepoRef repo, int number, string label, CancellationToken ct)
@@ -186,7 +238,7 @@ public sealed class GitHubIssuesClient(HttpClient http, GitHubApp app) : IGitHub
         {
             return;
         }
-        await GitHubApp.EnsureSuccess(response, $"remove label {label} from {repo}#{number}", ct);
+        await GitHubRequestException.EnsureSuccess(response, $"remove label {label} from {repo}#{number}", ct);
     }
 
     public async Task CloseAsync(RepoRef repo, int number, CancellationToken ct)
@@ -195,8 +247,19 @@ public sealed class GitHubIssuesClient(HttpClient http, GitHubApp app) : IGitHub
             await TokenAsync(repo, WritePermissions, ct));
         request.Content = JsonContent.Create(new { state = "closed", state_reason = "completed" });
         using var response = await http.SendAsync(request, ct);
-        await GitHubApp.EnsureSuccess(response, $"close {repo}#{number}", ct);
+        await GitHubRequestException.EnsureSuccess(response, $"close {repo}#{number}", ct);
     }
+
+    /// <summary>
+    /// The factory App's id for a comment GitHub reports no <c>performed_via_github_app</c> for, when its author is the App's own bot
+    /// account: type <c>Bot</c> and login <c>&lt;app slug&gt;[bot]</c>. A user account cannot be of type Bot, nor have a <c>[</c> in
+    /// its login, so no person can pass for the App. The slug is read from GitHub once (<see cref="GitHubApp.SlugAsync"/>).
+    /// </summary>
+    private async Task<long?> BotAppIdAsync(UserDto? user, CancellationToken ct) =>
+        user is { Type: "Bot", Login: var login } && login.EndsWith("[bot]", StringComparison.Ordinal)
+            && login == $"{await app.SlugAsync(ct)}[bot]"
+            ? AppId
+            : null;
 
     private async Task<string> TokenAsync(RepoRef repo, IReadOnlyDictionary<string, string> permissions, CancellationToken ct) =>
         (await app.CreateInstallationTokenAsync(repo, ct, permissions)).Token;
@@ -205,7 +268,7 @@ public sealed class GitHubIssuesClient(HttpClient http, GitHubApp app) : IGitHub
     {
         using var request = GitHubApp.Request(HttpMethod.Get, path, "Bearer", token);
         using var response = await http.SendAsync(request, ct);
-        await GitHubApp.EnsureSuccess(response, what, ct);
+        await GitHubRequestException.EnsureSuccess(response, what, ct);
         return (await response.Content.ReadFromJsonAsync<T>(ct))
             ?? throw new InvalidOperationException($"GitHub {what} returned an empty body.");
     }

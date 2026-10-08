@@ -57,6 +57,21 @@ public class IssueTriageTests
         Assert.Contains(why, ex.Message);
     }
 
+    [Fact]
+    public void Parser_bounds_the_repos_and_paths_an_answer_may_name()
+    {
+        string Repos(int count) => string.Join(", ", Enumerable.Range(1, count).Select(n => $"\"acme/r{n}\""));
+
+        Assert.Equal(TriageParser.MaxRepos, Parsed(Answer(repos: Repos(TriageParser.MaxRepos))).AffectedRepos.Count);
+        Assert.Contains($"more than {TriageParser.MaxRepos} repos",
+            Assert.Throws<TriageFormatException>(() => Parsed(Answer(repos: Repos(TriageParser.MaxRepos + 1)))).Message);
+        Assert.Contains("not owner/name",
+            Assert.Throws<TriageFormatException>(() => Parsed(Answer(repos: $"\"acme/{new string('r', TriageParser.MaxName)}\""))).Message);
+        Assert.Single(Parsed(Answer(paths: $"\"{new string('p', TriageParser.MaxName)}\"")).Fix!.Paths);
+        Assert.Contains("not a path inside",
+            Assert.Throws<TriageFormatException>(() => Parsed(Answer(paths: $"\"{new string('p', TriageParser.MaxName + 1)}\""))).Message);
+    }
+
     private static Triage Parsed(string answer) => TriageParser.Parse(answer);
 
     [Fact]

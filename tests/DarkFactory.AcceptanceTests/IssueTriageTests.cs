@@ -97,6 +97,13 @@ public class IssueTriageTests
             Assert.Equal(IssueRoute.AwaitingApproval, IssueIntake.Latest(await HistoryAsync(e2e, key, ct))!.Route);
             var issue = await GetAsync(owner, $"repos/{repo}/issues/{number}", ct);
             Assert.Contains(issue.GetProperty("labels").EnumerateArray(), l => l.GetProperty("name").GetString() == IssueLabels.AwaitingApproval);
+            // GitHub names the factory's App on the triage comment it posted (performed_via_github_app), what recognising the
+            // factory's own comments rests on (the App's bot login is only the fallback): the fixtures were written, not recorded.
+            var triageComment = (await GetAsync(owner, $"repos/{repo}/issues/{number}/comments", ct)).EnumerateArray()
+                .Single(c => c.GetProperty("body").GetString()!.Contains("<!-- dark-factory:triage ", StringComparison.Ordinal));
+            Assert.Equal(long.Parse(options.GitHubAppId, System.Globalization.CultureInfo.InvariantCulture),
+                triageComment.GetProperty("performed_via_github_app").GetProperty("id").GetInt64());
+            Assert.Equal("Bot", triageComment.GetProperty("user").GetProperty("type").GetString());
 
             await CommentAsync(outsider, repo, number, "Approved", ct);
             await FactoryRunner.PollIssuesAsync(options, status, Console.Out, ct);

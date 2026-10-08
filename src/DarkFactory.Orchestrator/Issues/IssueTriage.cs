@@ -68,6 +68,10 @@ public static partial class TriageParser
     public const int MaxTitle = 120;
     public const int MaxText = 4000;
     public const int MaxPaths = 50;
+    public const int MaxRepos = 10;
+
+    /// <summary>The longest repo name or path the answer may give (each is posted on the issue, some more than once).</summary>
+    public const int MaxName = 300;
 
     [GeneratedRegex(@"```json[ \t]*\r?\n(.*?)\r?\n[ \t]*```", RegexOptions.Singleline | RegexOptions.IgnoreCase)]
     private static partial Regex JsonBlock();
@@ -113,7 +117,11 @@ public static partial class TriageParser
             throw new TriageFormatException("summary is empty");
         }
         var repos = Strings(root, "affected_repos").Select(r => r.Trim()).ToList();
-        if (repos.FirstOrDefault(r => !RepoName().IsMatch(r) || r.Split('/').Any(p => p.StartsWith('.'))) is { } badRepo)
+        if (repos.Count > MaxRepos)
+        {
+            throw new TriageFormatException($"affected_repos lists more than {MaxRepos} repos");
+        }
+        if (repos.FirstOrDefault(r => r.Length > MaxName || !RepoName().IsMatch(r) || r.Split('/').Any(p => p.StartsWith('.'))) is { } badRepo)
         {
             throw new TriageFormatException($"affected_repos has '{Cut(badRepo, 80)}', not owner/name");
         }
@@ -140,7 +148,7 @@ public static partial class TriageParser
             var normalized = new List<string>();
             foreach (var path in paths)
             {
-                if (!PathText().IsMatch(path) || RepoPath.Normalize(path) is not { } p)
+                if (path.Length > MaxName || !PathText().IsMatch(path) || RepoPath.Normalize(path) is not { } p)
                 {
                     throw new TriageFormatException($"proposed_fix.paths has '{Cut(path, 80)}', not a path inside the repository");
                 }
@@ -195,7 +203,8 @@ public sealed record RouteDecision(IssueRoute Route, string Why, RepoRef? Target
 /// <list type="bullet">
 /// <item>a triage that could not be read → needs-human (nothing to build from);</item>
 /// <item>a question or duplicate → its own route: a comment, never a build;</item>
-/// <item>an author who is not a collaborator (<see cref="RepoPermission.IsCollaborator"/>) → awaiting-approval;</item>
+/// <item>an author who is not a collaborator (<see cref="RepoPermission.IsCollaborator"/>) on the issue's repo, or on the target repo
+/// the work would change → awaiting-approval;</item>
 /// <item>a collaborator's issue with an apparent fix (<see cref="ApparentFix"/>) → build; without one → needs-human.</item>
 /// </list>
 /// A bug or feature whose triage names exactly one watched repo is releasable: a collaborator's <c>Approved</c> builds it (also a
@@ -242,8 +251,13 @@ public static class IssueRouting
         return guarded.Count == 0 ? null : $"the fix touches {string.Join(", ", guarded)}";
     }
 
+    /// <param name="author">The author's permission on the issue's repo.</param>
+    /// <param name="authorOnTarget">
+    /// The author's permission on the target, when the target is another watched repo than the issue's (null when it is the same):
+    /// the repo the work changes is the one the author must be able to push to, so a collaborator elsewhere waits for approval.
+    /// </param>
     public static RouteDecision Decide(Triage? triage, string? triageError, RepoPermission author, IReadOnlyCollection<RepoRef> watched,
-        GatePolicy? policy, string? policyError)
+        GatePolicy? policy, string? policyError, RepoPermission? authorOnTarget = null)
     {
         if (triage is null)
         {
@@ -268,6 +282,12 @@ public static class IssueRouting
         if (target is null)
         {
             return new RouteDecision(IssueRoute.NeedsHuman, noTarget!, null, false);
+        }
+        if (authorOnTarget is { IsCollaborator: false } elsewhere)
+        {
+            return new RouteDecision(IssueRoute.AwaitingApproval,
+                $"the author is not a collaborator on {target} ({elsewhere}), where the work would be built: nothing is built until a collaborator of {target} approves",
+                target, true);
         }
         return ApparentFix(triage, policy, policyError) is { } notApparent
             ? new RouteDecision(IssueRoute.NeedsHuman, $"no apparent fix: {notApparent}", target, true)
@@ -301,11 +321,14 @@ public sealed record TriageRecord(string Version, string Hash, Triage? Triage, s
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
-    public static TriageRecord Create(string version, Triage? triage, string? error, string author, RepoPermission permission, RouteDecision route)
+    /// <param name="onTarget">The author's permission on the target, when it was read (the target is another repo than the issue's).</param>
+    public static TriageRecord Create(string version, Triage? triage, string? error, string author, RepoPermission permission, RouteDecision route,
+        RepoPermission? onTarget = null)
     {
         var hash = IssueHashes.Hash($"{version}\n{JsonSerializer.Serialize(triage, Json)}\n{error}");
-        return new TriageRecord(version, hash, triage, error, author, permission.ToString(), route.Route, route.Why, route.Target?.FullName,
-            route.Releasable);
+        return new TriageRecord(version, hash, triage, error, author,
+            onTarget is null ? permission.ToString() : $"{permission}; on {route.Target?.FullName}: {onTarget}", route.Route, route.Why,
+            route.Target?.FullName, route.Releasable);
     }
 
     public string ToJson() => JsonSerializer.Serialize(this, Json);

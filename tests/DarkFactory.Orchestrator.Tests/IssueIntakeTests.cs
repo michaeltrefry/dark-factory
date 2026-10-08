@@ -69,9 +69,12 @@ public class IssueIntakeTests
 
         /// <summary>A fresh intake each time, as after a restart: everything it knows comes from the ledger.</summary>
         public IssueIntake Intake() =>
-            new(GitHub, [Repo], Contexts, Locks, Controls, Triage, Status, 3, Time, TextWriter.Null);
+            new(GitHub, Watched, Contexts, Locks, Controls, Triage, Status, 3, Time, TextWriter.Null);
 
-        public GitHubIssueWorkSource Source() => new(GitHub, Contexts, [Repo], Time);
+        public GitHubIssueWorkSource Source() => new(GitHub, Contexts, Watched, Time);
+
+        /// <summary>The repos the factory watches (only <see cref="Repo"/> unless a test adds one).</summary>
+        public List<RepoRef> Watched { get; } = [Repo];
 
         /// <summary>Starts watching (the first poll only sets the cursor), then moves the clock on.</summary>
         public async Task Watch()
@@ -545,6 +548,182 @@ public class IssueIntakeTests
         // Prepared and removed; never committed, pushed or opened as a PR.
         Assert.Equal([$"prepare {Repo} factory/triage-gh-5", $"remove {Repo} /wt/factory/triage-gh-5"], workspaces.Calls);
         Assert.Equal(new Dictionary<string, string> { ["contents"] = "read" }, WorkerTriageRunner.TriageWorkspaceToken);
+    }
+
+    private static readonly RepoRef Gadgets = new("acme", "gadgets");
+
+    /// <summary>Two watched repos: the issue is on widgets, and its triage names gadgets as the repo the work changes.</summary>
+    private static async Task<Harness> IssueOnWidgetsNamingGadgets(string author)
+    {
+        var h = new Harness(Answer(repos: "\"acme/gadgets\""));
+        h.Watched.Add(Gadgets);
+        h.GitHub.Files[$"{Gadgets}:{GatePolicy.Path}"] = TestPolicies.Standard();
+        // maintainer can push to widgets only; owner (admin) to both.
+        h.GitHub.RepoPermissions[$"{Gadgets}:maintainer"] = new RepoPermission("read", "read");
+        await h.Watch();
+        h.Open(author);
+        await h.Poll();
+        return h;
+    }
+
+    [Fact]
+    public async Task A_collaborator_on_the_issues_repo_only_cannot_get_a_build_released_into_another_watched_repo()
+    {
+        var h = await IssueOnWidgetsNamingGadgets("maintainer");
+
+        Assert.Empty(await h.Ready());
+        Assert.DoesNotContain(IssueSteps.Released, await h.Steps());
+        var record = IssueIntake.Latest(await h.Rows())!;
+        Assert.Equal((IssueRoute.AwaitingApproval, "acme/gadgets", true), (record.Route, record.Target, record.Releasable));
+        Assert.Contains("not a collaborator on acme/gadgets", record.Why);
+        Assert.Equal("maintain (write); on acme/gadgets: read", record.AuthorPermission);
+        Assert.Equal(["awaiting-approval"], h.GitHub.LabelsOf(Repo, Number));
+    }
+
+    [Fact]
+    public async Task A_collaborator_on_both_repos_gets_the_build_released_into_the_target()
+    {
+        var h = await IssueOnWidgetsNamingGadgets("owner");
+
+        Assert.Equal([1], await h.Ready());
+        Assert.Contains($"{Gadgets}:owner", h.GitHub.PermissionReads);
+        Assert.Equal("acme/gadgets", (await h.Item()).Repo);
+    }
+
+    [Fact]
+    public async Task Approved_from_a_collaborator_on_the_issues_repo_only_does_not_release_a_build_into_another_repo()
+    {
+        var h = await IssueOnWidgetsNamingGadgets("visitor");
+
+        h.GitHub.Reply(Repo, Number, "maintainer", "Approved");
+        await h.Poll();
+
+        Assert.Empty(await h.Ready());
+        Assert.DoesNotContain(IssueSteps.Released, await h.Steps());
+        var ignored = ApprovalRecord.FromJson(Assert.Single(await h.Rows(), r => r.Step == IssueSteps.ApprovalIgnored).Detail!);
+        Assert.Contains("maintainer is not a collaborator on acme/gadgets", ignored.Ignored);
+
+        // A collaborator of both repos releases it.
+        h.GitHub.Reply(Repo, Number, "owner", "Approved");
+        await h.Poll();
+        Assert.Equal([1], await h.Ready());
+        Assert.Equal("owner", ApprovalRecord.FromJson((await h.Rows()).Single(r => r.Step == IssueSteps.Approved).Detail!).Approver);
+    }
+
+    [Fact]
+    public async Task A_triage_that_failed_with_huge_worker_output_posts_a_bounded_comment()
+    {
+        var h = new Harness(Answer());
+        h.Triage.Answers.Clear();
+        h.Triage.Answers.Add(() => new WorkerResult("triage-sess", 1, true, "error_during_execution", new string('x', 100_000), new string('y', 50_000)));
+        await h.Watch();
+        h.Open("maintainer");
+
+        for (var i = 0; i < 3; i++)
+        {
+            await h.Poll();
+        }
+
+        var body = Assert.Single(h.GitHub.FactoryComments(Repo, Number)).Body;
+        Assert.Contains($"[cut at {IssueIntake.MaxError} characters]", body);
+        Assert.True(body.Length < 3 * IssueIntake.MaxError, $"the triage comment is {body.Length} characters");
+    }
+
+    [Fact]
+    public async Task An_issue_GitHub_refuses_for_good_is_recorded_and_does_not_hold_the_repos_cursor()
+    {
+        var h = new Harness(Answer());
+        await h.Watch();
+        h.Open("visitor");
+        h.Time.Advance(TimeSpan.FromSeconds(1));
+        h.Open("visitor", number: 13);
+        var refusal = new GitHubRequestException("GitHub comment on acme/widgets#12 failed: 422 {\"message\":\"Validation Failed\"}", 422, false);
+        h.GitHub.RefuseComments[$"{Repo}#{Number}"] = refusal;
+        var last = await IssueUpdatedAt(h, 13);
+
+        await h.Poll();
+
+        // The refused issue is recorded on its item and on the dashboard; the other issue is triaged and the cursor moved past both.
+        Assert.Equal("GitHub comment on acme/widgets#12 failed: 422 {\"message\":\"Validation Failed\"}",
+            Assert.Single(await h.Rows(), r => r.Step == IssueSteps.Refused).Detail);
+        Assert.NotNull(h.Status.ItemErrors["gh-1"].GaveUp);
+        Assert.Single(h.GitHub.FactoryComments(Repo, 13));
+        Assert.Equal(last, await Cursor(h));
+
+        // When the issue next changes it is taken up again from where its ledger stands.
+        h.GitHub.RefuseComments.Clear();
+        h.GitHub.Reply(Repo, Number, "visitor", "still broken");
+        await h.Poll();
+        Assert.Single(h.GitHub.FactoryComments(Repo, Number));
+        Assert.Single(await h.Rows(), r => r.Step == IssueSteps.Triaged);
+    }
+
+    [Theory]
+    [InlineData(403, true)]   // a secondary rate limit
+    [InlineData(429, false)]
+    [InlineData(500, false)]
+    [InlineData(401, false)]
+    public async Task A_failure_that_may_pass_holds_the_cursor_at_the_issue(int status, bool rateLimited)
+    {
+        var h = new Harness(Answer());
+        await h.Watch();
+        var before = await Cursor(h);
+        h.Open("visitor");
+        h.Time.Advance(TimeSpan.FromSeconds(1));
+        h.Open("visitor", number: 13);
+        h.GitHub.RefuseComments[$"{Repo}#{Number}"] = new GitHubRequestException($"GitHub comment failed: {status}", status, rateLimited);
+
+        await h.Poll();
+
+        Assert.Equal(before, await Cursor(h));
+        Assert.DoesNotContain(IssueSteps.Refused, await h.Steps());
+        Assert.Null(h.Status.ItemErrors["gh-1"].GaveUp);
+    }
+
+    private static async Task<DateTimeOffset> Cursor(Harness h)
+    {
+        await using var db = h.Db();
+        return (await db.GitHubIssueCursors.AsNoTracking().SingleAsync(c => c.Repo == Repo.FullName)).Since;
+    }
+
+    private static async Task<DateTimeOffset> IssueUpdatedAt(Harness h, int number) =>
+        (await h.GitHub.GetAsync(Repo, number, CancellationToken.None)).UpdatedAt;
+
+    [Fact]
+    public async Task A_triage_title_is_inert_in_the_commit_the_pr_title_and_the_pr_body()
+    {
+        const string title = "@acme/team [x](http://evil.example) ![i](http://evil.example/i.png) <img src=y> fixes #3 `z`";
+        var h = new Harness(Answer(title: title));
+        await h.Watch();
+        h.Open("maintainer");
+        await h.Poll();
+        var id = Assert.Single(await h.Ready());
+
+        var github = new GatePipelineTests.FakeGateGitHub();
+        var workspaces = new FakeWorkspaces();
+        var prs = new FakePullRequests();
+        await using var db = h.Db();
+        await new RunPipeline(h.Source(), new WorkLedger(db, TimeProvider.System), h.Locks, workspaces,
+                new FakeWorker(GatePipelineTests.ReportsModel(GatePipelineTests.ImplementerModel)), prs, Sandbox, TextWriter.Null, controls: h.Controls,
+                gate: new GateStage(github, new GatePipelineTests.FakeReviewer(), GatePipelineTests.TestPanel, TimeSpan.FromMilliseconds(1),
+                    TimeSpan.FromSeconds(5), null, new FakeTestRunner()))
+            .RunAsync(id, CancellationToken.None);
+
+        var pr = prs.Opened.Single();
+        var commit = workspaces.Calls.Single(c => c.StartsWith("push ", StringComparison.Ordinal));
+        var line = pr.Body.Split('\n').Single(l => l.StartsWith("Implements ", StringComparison.Ordinal));
+        // The title's text survives, but nothing GitHub reads as a mention, reference, closing keyword, link, image or HTML.
+        foreach (var text in new[] { pr.Title, commit, line[line.IndexOf(": ", StringComparison.Ordinal)..] })
+        {
+            Assert.Contains("team", text);
+            foreach (var live in new[] { "@", "#", "[", "]", "<", ">", "://", "`z`" })
+            {
+                Assert.DoesNotContain(live, text);
+            }
+        }
+        // In the body it also sits in one code span.
+        Assert.Matches("^Implements GitHub issue \\[gh-1\\]\\(https://github.com/acme/widgets/issues/12\\): `[^`]+`$", line);
+        Assert.Contains("Closes acme/widgets#12", pr.Body);
     }
 
     [Fact]

@@ -10,6 +10,15 @@ public sealed record WorkStory(int Id, string Name, string? Description, string 
 {
     public ItemNaming Kind => Naming ?? ItemNaming.Shortcut;
 
+    /// <summary>
+    /// The name as the factory writes it on GitHub (commit message, pull request title and description): a GitHub issue's name is
+    /// the triage's title, model text derived from untrusted issue text, so it is made inert (<see cref="UntrustedText.Inert"/>).
+    /// </summary>
+    public string PublicName => Kind == ItemNaming.Shortcut ? Name : UntrustedText.Inert(Name);
+
+    /// <summary>Whether <see cref="Name"/> is derived from untrusted text.</summary>
+    public bool UntrustedName => Kind != ItemNaming.Shortcut;
+
     /// <summary>The item's external id, e.g. <c>sc-12</c>.</summary>
     public string Ref => Kind.Format(Id);
 }
@@ -98,6 +107,45 @@ public interface IWorkSource
     /// (and blocker relations) an earlier, partly failed call already created.
     /// </summary>
     Task<IReadOnlyList<int>> CreateChildrenAsync(int parentId, IReadOnlyList<ChildItem> children, CancellationToken ct);
+}
+
+/// <summary>
+/// Makes untrusted one-line text inert everywhere the factory writes it on GitHub — commit messages and pull request titles (plain
+/// text GitHub still links) as well as Markdown: one line, no control or format characters, and none of the characters a mention
+/// (<c>@</c>), an issue reference or closing keyword (<c>#</c>, <c>://</c>), a link or image (<c>[ ]</c>), HTML (<c>&lt; &gt;</c>) or a
+/// code span (<c>`</c>) needs: each is swapped for a look-alike that GitHub does not read. In Markdown, also put it in a code span.
+/// </summary>
+public static partial class UntrustedText
+{
+    [System.Text.RegularExpressions.GeneratedRegex(@"\s+")]
+    private static partial System.Text.RegularExpressions.Regex Whitespace();
+
+    public static string Inert(string text)
+    {
+        var line = new System.Text.StringBuilder(text.Length);
+        foreach (var c in Whitespace().Replace(text, " ").Trim())
+        {
+            if (char.GetUnicodeCategory(c) is System.Globalization.UnicodeCategory.Control or System.Globalization.UnicodeCategory.Format)
+            {
+                continue;
+            }
+            line.Append(c switch
+            {
+                '@' => '＠', // ＠
+                '#' => '＃', // ＃
+                '[' => '［', // ［
+                ']' => '］', // ］
+                '<' => '‹', // ‹
+                '>' => '›', // ›
+                '`' => '\'',
+                _ => c,
+            });
+        }
+        return line.ToString().Replace("://", ":⁄⁄", StringComparison.Ordinal); // :⁄⁄
+    }
+
+    /// <summary><see cref="Inert"/> text in a Markdown code span (it has no backtick left to close it).</summary>
+    public static string CodeSpan(string text) => $"`{Inert(text)}`";
 }
 
 public static class WorkSourceComments
