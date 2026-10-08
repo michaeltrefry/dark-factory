@@ -7,19 +7,18 @@ using DarkFactory.Orchestrator.WorkSources;
 namespace DarkFactory.Orchestrator;
 
 /// <summary>
-/// What the Review → CI → MergeGate → Merge handlers need: GitHub as the gate App (<see cref="GitHubGate"/>), the reviewer
-/// (through the router), the reviewer models to choose from (first one of a family the implementer did not use), and how
-/// long and how often CI is waited for.
+/// What the Review → CI → MergeGate → Merge handlers need: GitHub as the gate App (<see cref="GitHubGate"/>), the review
+/// panel's calls (through the router), the panel's model lists (per role, and the second models), and how long and how
+/// often CI is waited for.
 /// </summary>
 public sealed record GateStage(
     IGateGitHub GitHub,
     IReviewer Reviewer,
-    IReadOnlyList<string> ReviewerModels,
+    ReviewPanelModels Models,
     TimeSpan CiPollInterval,
     TimeSpan CiTimeout,
     TimeProvider? Time = null)
 {
-    public static readonly IReadOnlyList<string> DefaultReviewerModels = ["gpt-5.6-sol", "claude-opus-5-5"];
     public static readonly TimeSpan DefaultCiPollInterval = TimeSpan.FromSeconds(30);
     public static readonly TimeSpan DefaultCiTimeout = TimeSpan.FromMinutes(30);
 }
@@ -68,12 +67,16 @@ public sealed partial class RunPipeline
     }
 
     /// <summary>
-    /// Review: one reviewer, pinned through the router to a model family the implementer did not use, judges the PR's
-    /// current head commit. The verdict is checkpointed bound to that commit (E3) before it counts; a commit that already
-    /// has a verdict is not reviewed again. Pass → CI; fail → escalate (the fix loop is not part of this stage yet). The
-    /// reviewer's router session is named in the ledger (<see cref="Steps.ReviewSession"/>) before the call, and never as a
-    /// row's Claude session (that column stays the implementer's). The router refusing the call for usage pauses the factory
-    /// for usage (the item resumes and reviews again once it lifts) rather than escalating the item.
+    /// Review: the review panel judges the PR's current head commit — correctness and spec conformance always, security when
+    /// the diff touches a risky path (<see cref="RiskyPaths"/>) — each role pinned through the router to the first of its
+    /// models whose family the implementer did not use, with its prompt file (<see cref="ReviewPrompts"/>). Each blocking
+    /// finding goes to a second model (<see cref="ReviewerChoice.ChooseConfirmer"/>); one it does not confirm is downgraded
+    /// to optional. The verdict (<see cref="ReviewPanel.Decide"/>: deterministic over the findings) is checkpointed bound to
+    /// that commit (E3) before it counts; a commit that already has a verdict is not reviewed again. Pass → CI; fail →
+    /// escalate (no fix loop yet). Every call's router session is named in the ledger (<see cref="Steps.ReviewSession"/>,
+    /// with its role and prompt hash) before the call, and never as a row's Claude session (that column stays the
+    /// implementer's). No eligible model for a role or a second model escalates with the reason. The router refusing a call
+    /// for usage pauses the factory for usage (the item resumes and the head is reviewed again once it lifts).
     /// </summary>
     private async Task ReviewAsync(Run run, CancellationToken ct)
     {
@@ -82,34 +85,96 @@ public sealed partial class RunPipeline
         var verdict = Verdicts(history).LastOrDefault(v => v.HeadSha == pull.HeadSha);
         if (verdict is null)
         {
-            var model = ReviewerChoice.Choose(Gate.ReviewerModels, ImplementerModels(history));
-            log.WriteLine($"[review] {pull.HtmlUrl} head {Ci.Short(pull.HeadSha)}: reviewing with {model}");
-            var diff = await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
-            var session = Guid.NewGuid().ToString();
-            await ledger.CheckpointAsync(run.Item, Steps.ReviewSession, null, $"{session} {model} {pull.HeadSha}", ct);
-            try
-            {
-                verdict = await Gate.Reviewer.ReviewAsync(new ReviewRequest(run.Story, run.Repo.FullName, pull, diff, model, session), ct);
-            }
-            catch (RouterUsageLimitedException ex)
-            {
-                // The plans ran out, not the review: pause the factory (backing off) and review this head again afterwards.
-                // Without a control table nothing could hold the pause, so the failure escalates.
-                if (await _controls.PauseForUsageAsync(null, UsagePause.ReviewerRateLimited, ct) is { State: ControlState.Paused } pause)
-                {
-                    log.WriteLine($"[review] {ex.Message}; factory paused for usage until {pause.ResumeAt:u}");
-                    throw new ControlRequestedException(ControlState.Paused);
-                }
-                throw;
-            }
+            verdict = await ReviewPanelAsync(run, pull, ImplementerModels(history), ct);
             await ledger.CheckpointAsync(run.Item, Steps.Verdict, null, verdict.ToDetail(), ct);
         }
-        log.WriteLine($"[review] {Ci.Short(pull.HeadSha)}: {verdict.Verdict} by {verdict.ServedModel ?? verdict.Model}");
+        log.WriteLine($"[review] {Ci.Short(pull.HeadSha)}: {verdict.Verdict}: {verdict.Summary}");
         if (!verdict.Passed)
         {
-            throw new ReviewFailedException($"The reviewer ({verdict.ServedModel ?? verdict.Model}) failed {pull.HtmlUrl} at {Ci.Short(pull.HeadSha)}: {verdict.Summary}");
+            throw new ReviewFailedException($"The review panel failed {pull.HtmlUrl} at {Ci.Short(pull.HeadSha)}: {verdict.Summary}");
         }
         await ledger.RecordAsync(run.Item, WorkState.CI, null, pull.HeadSha, ct);
+    }
+
+    private async Task<ReviewVerdict> ReviewPanelAsync(Run run, PullFacts pull, List<string> implementer, CancellationToken ct)
+    {
+        ReviewerChoice.ImplementerFamilies(implementer); // an unknown implementer escalates before any call
+        var diff = await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
+        var files = await Gate.GitHub.GetFilesAsync(run.Repo, pull.BaseSha, ct);
+        var risky = RiskyPaths.Touched(DiffPaths.Of(diff));
+        var roles = ReviewRoles.Required(risky.Count > 0);
+        // Every role's model is chosen before the first call: a role with no eligible family escalates without spending any.
+        var models = roles.ToDictionary(r => r, r => ReviewerChoice.Choose(Gate.Models.For(r), implementer, $"Review:{ReviewRoles.ConfigName(r)}:Models"));
+        log.WriteLine($"[review] {pull.HtmlUrl} head {Ci.Short(pull.HeadSha)}: {string.Join(", ", roles.Select(r => $"{r} by {models[r]}"))}"
+            + (risky.Count > 0 ? $" (risky: {string.Join(", ", risky)})" : ""));
+
+        var reviews = new List<RoleReview>();
+        foreach (var role in roles)
+        {
+            var prompt = ReviewPrompts.For(role);
+            var session = await NameReviewSessionAsync(run, pull, role, models[role], prompt, ct);
+            var review = await RouterCallAsync(() => Gate.Reviewer.ReviewAsync(
+                new ReviewRequest(run.Story, run.Repo.FullName, pull, diff, files, role, prompt, models[role], session), ct), ct);
+            if (review.Clean)
+            {
+                var findings = new List<Finding>();
+                foreach (var finding in review.Findings)
+                {
+                    findings.Add(finding.IsBlocking ? await ConfirmAsync(run, pull, diff, files, review, finding, implementer, ct) : finding);
+                }
+                review = review with { Findings = findings };
+            }
+            reviews.Add(review);
+        }
+        return ReviewPanel.Decide(pull.HeadSha, risky, reviews);
+    }
+
+    /// <summary>A second model checks one blocking finding; the finding comes back downgraded when it does not confirm it.</summary>
+    private async Task<Finding> ConfirmAsync(Run run, PullFacts pull, string diff, RepoFiles files, RoleReview review, Finding finding,
+        List<string> implementer, CancellationToken ct)
+    {
+        var reviewerModels = new[] { review.Model, review.ServedModel }.OfType<string>().Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        var model = ReviewerChoice.ChooseConfirmer(Gate.Models.Confirm, implementer, reviewerModels);
+        var prompt = ReviewPrompts.Confirm;
+        var session = await NameReviewSessionAsync(run, pull, $"confirm-{review.Role}", model, prompt, ct);
+        var confirmation = await RouterCallAsync(() => Gate.Reviewer.ConfirmAsync(
+            new ConfirmRequest(run.Story, run.Repo.FullName, pull, diff, files, review.Role, finding, prompt, model, session), ct), ct);
+        log.WriteLine($"[review] {review.Role} finding '{finding.Title}': {confirmation.Outcome} by {confirmation.ServedModel ?? model}");
+        return finding.ConfirmedBy(confirmation);
+    }
+
+    /// <summary>
+    /// Names a fresh router session for one panel call in the ledger before the call (E9): Detail is
+    /// "&lt;session&gt; &lt;model&gt; &lt;head sha&gt; &lt;role&gt; &lt;prompt path&gt;@sha256:&lt;hash&gt;".
+    /// </summary>
+    private async Task<string> NameReviewSessionAsync(Run run, PullFacts pull, string role, string model, ReviewPrompt prompt, CancellationToken ct)
+    {
+        await ThrowIfControlledAsync(run.Item, ct); // a Pause/Stop between the panel's calls takes effect before the next one
+        var session = Guid.NewGuid().ToString();
+        await ledger.CheckpointAsync(run.Item, Steps.ReviewSession, null, $"{session} {model} {pull.HeadSha} {role} {prompt.Id}", ct);
+        return session;
+    }
+
+    /// <summary>
+    /// Makes one panel call. The router refusing it for usage means the plans ran out, not the review: the factory pauses
+    /// (backing off) and the head is reviewed again afterwards. Without a control table nothing could hold the pause, so
+    /// the failure escalates.
+    /// </summary>
+    private async Task<T> RouterCallAsync<T>(Func<Task<T>> call, CancellationToken ct)
+    {
+        try
+        {
+            return await call();
+        }
+        catch (RouterUsageLimitedException ex)
+        {
+            if (await _controls.PauseForUsageAsync(null, UsagePause.ReviewerRateLimited, ct) is { State: ControlState.Paused } pause)
+            {
+                log.WriteLine($"[review] {ex.Message}; factory paused for usage until {pause.ResumeAt:u}");
+                throw new ControlRequestedException(ControlState.Paused);
+            }
+            throw;
+        }
     }
 
     /// <summary>

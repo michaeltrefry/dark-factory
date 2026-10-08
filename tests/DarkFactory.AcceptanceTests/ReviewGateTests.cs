@@ -47,9 +47,16 @@ public class ReviewGateTests
         var verdict = Assert.Single(RunPipeline.Verdicts(history));
         Assert.True(verdict.Passed, verdict.Summary);
         AssertDifferentFamily(verdict, RunPipeline.ImplementerModels(history));
-        // The review went through the router, accounted under its own session.
-        var cost = await Harness.WaitForCostAsync(Assert.IsType<string>(verdict.Session), options.RouterKey, ct);
-        Assert.True(cost is { RequestCount: > 0 }, $"the router recorded no request for review session {verdict.Session}");
+        // Every panel call went through the router, accounted under its own session, which the ledger named with its prompt hash.
+        var named = history.Where(e => e.Step == RunPipeline.Steps.ReviewSession).Select(e => e.Detail!).ToList();
+        foreach (var review in verdict.Reviews)
+        {
+            var session = Assert.IsType<string>(review.Session);
+            Assert.Contains($"{session} {review.Model} {verdict.HeadSha} {review.Role} {review.Prompt}", named);
+            Assert.Equal(ReviewPrompts.For(review.Role).Id, review.Prompt);
+            var cost = await Harness.WaitForCostAsync(session, options.RouterKey, ct);
+            Assert.True(cost is { RequestCount: > 0 }, $"the router recorded no request for the {review.Role} review session {session}");
+        }
 
         var pr = await MergedPullRequestAsync(options.DefaultRepo, storyId, outcome.PullRequestUrl!, ct);
         Assert.Equal(mergeCommit, pr.GetProperty("merge_commit_sha").GetString());
@@ -96,8 +103,13 @@ public class ReviewGateTests
         Assert.NotEmpty(implementerModels);
         var families = implementerModels.Select(ModelFamily.Of).ToList();
         Assert.DoesNotContain(null, families);
-        Assert.NotNull(verdict.Family);
-        Assert.DoesNotContain(verdict.Family, families);
+        Assert.NotEmpty(verdict.Reviews);
+        foreach (var family in verdict.Reviews.Select(r => r.Family)
+                     .Concat(verdict.Reviews.SelectMany(r => r.Findings).Select(f => f.Confirmation).OfType<Confirmation>().Select(c => c.Family)))
+        {
+            Assert.NotNull(family);
+            Assert.DoesNotContain(family, families);
+        }
     }
 
     /// <summary>Skips with the missing owner step unless the gate App is set up and the sandbox has a policy on main.</summary>
@@ -143,16 +155,18 @@ public class ReviewGateTests
 
         private sealed class Wrapper(PushAfterFirstVerdict owner, IReviewer inner) : IReviewer
         {
-            public async Task<ReviewVerdict> ReviewAsync(ReviewRequest request, CancellationToken ct)
+            public async Task<RoleReview> ReviewAsync(ReviewRequest request, CancellationToken ct)
             {
-                var verdict = await inner.ReviewAsync(request, ct);
+                var review = await inner.ReviewAsync(request, ct);
                 if (owner.PushedSha is null)
                 {
                     owner.ReviewedFirst = request.Pull.HeadSha;
                     owner.PushedSha = await owner.PushAsync(ct);
                 }
-                return verdict;
+                return review;
             }
+
+            public Task<Confirmation> ConfirmAsync(ConfirmRequest request, CancellationToken ct) => inner.ConfirmAsync(request, ct);
         }
 
         private async Task<string> PushAsync(CancellationToken ct)

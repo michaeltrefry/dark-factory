@@ -1,4 +1,5 @@
 using System.Net;
+using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Router;
 using DarkFactory.Orchestrator.Tests.Support;
 using Microsoft.Extensions.Configuration;
@@ -166,9 +167,29 @@ public class FactoryOptionsTests
     [Fact]
     public void Reviewer_models_default_to_two_families_and_must_each_have_a_known_family()
     {
-        Assert.Equal(["gpt-5.6-sol", "claude-opus-5-5"], Options([]).ReviewerModels);
-        Assert.Equal(["gemini-2.5-pro", "gpt-5.6-luna"], Options(new() { ["Review:Models"] = " gemini-2.5-pro , gpt-5.6-luna" }).ReviewerModels);
-        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Review:Models"] = "gpt-5.6-sol,mystery" }).ReviewerModels);
+        // Defaults: models the router's catalog deploys, of the two families the router key is known to serve.
+        var defaults = Options([]).ReviewPanel;
+        Assert.All(ReviewRoles.All, role => Assert.Equal(["gpt-5.5", "claude-opus-5"], defaults.For(role)));
+        Assert.Equal(["gpt-5.5", "claude-opus-5", "gpt-5.4-mini", "claude-sonnet-5"], defaults.Confirm);
+
+        // Review:Models is every role's list unless the role has its own; the second models have theirs.
+        var panel = Options(new()
+        {
+            ["Review:Models"] = " gemini-2.5-pro , gpt-5.6-luna",
+            ["Review:Security:Models"] = "claude-opus-5",
+            ["Review:Confirm:Models"] = "gpt-5.4-mini",
+        }).ReviewPanel;
+        Assert.Equal(["gemini-2.5-pro", "gpt-5.6-luna"], panel.For(ReviewRoles.Correctness));
+        Assert.Equal(["gemini-2.5-pro", "gpt-5.6-luna"], panel.For(ReviewRoles.SpecConformance));
+        Assert.Equal(["claude-opus-5"], panel.For(ReviewRoles.Security));
+        Assert.Equal(["gpt-5.4-mini"], panel.Confirm);
+        Assert.Equal(["qwen3-coder"], Options(new() { ["Review:Correctness:Models"] = "qwen3-coder" }).ReviewPanel.For(ReviewRoles.Correctness));
+        Assert.Equal(["kimi-k2"], Options(new() { ["Review:SpecConformance:Models"] = "kimi-k2" }).ReviewPanel.For(ReviewRoles.SpecConformance));
+
+        Assert.Contains("Review:Models", Assert.Throws<InvalidOperationException>(() => Options(new() { ["Review:Models"] = "gpt-5.5,mystery" }).ReviewPanel).Message);
+        Assert.Contains("Review:Security:Models",
+            Assert.Throws<InvalidOperationException>(() => Options(new() { ["Review:Security:Models"] = "mystery" }).ReviewPanel).Message);
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Review:Confirm:Models"] = "mystery" }).ReviewPanel);
         Assert.Equal((TimeSpan.FromSeconds(30), TimeSpan.FromMinutes(30)), (Options([]).CiPollInterval, Options([]).CiTimeout));
     }
 

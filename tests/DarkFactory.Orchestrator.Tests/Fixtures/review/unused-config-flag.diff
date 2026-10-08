@@ -1,0 +1,22 @@
+diff --git a/src/WordCount/WordCountOptions.cs b/src/WordCount/WordCountOptions.cs
+index 3b18e51..9f2c4aa 100644
+--- a/src/WordCount/WordCountOptions.cs
++++ b/src/WordCount/WordCountOptions.cs
+@@ -8,4 +8,7 @@ public sealed class WordCountOptions(IConfiguration config)
+ {
+     public bool CountHyphenatedAsOne => config.GetValue("WordCount:CountHyphenatedAsOne", true);
++
++    /// <summary>Treat runs of whitespace as no word.</summary>
++    public bool IgnoreBlankInput => config.GetValue("WordCount:IgnoreBlankInput", false);
+ }
+diff --git a/src/WordCount/WordCounter.cs b/src/WordCount/WordCounter.cs
+index 51d0a3c..c3e7f12 100644
+--- a/src/WordCount/WordCounter.cs
++++ b/src/WordCount/WordCounter.cs
+@@ -12,7 +12,7 @@ public static class WordCounter
+     public static int Count(string text, WordCountOptions options)
+     {
+-        return text.Split(' ').Length;
++        return text.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
+     }
+ }

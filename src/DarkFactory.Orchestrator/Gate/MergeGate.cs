@@ -78,18 +78,16 @@ public static class Ci
 }
 
 /// <summary>
-/// A reviewer's verdict on one head commit (E3: bound to <see cref="HeadSha"/>; a new push voids it). Stored as JSON in the
-/// ledger's <c>verdict</c> checkpoint. <see cref="Family"/> is the family of the model that actually answered;
-/// <see cref="Session"/> the session id the router accounted the review call under.
+/// The review panel's verdict on one head commit (E3: bound to <see cref="HeadSha"/>; a new push voids it). Stored as JSON
+/// in the ledger's <c>verdict</c> checkpoint. <see cref="RiskyPaths"/>: the touched paths that called the security review
+/// in; <see cref="Reviews"/>: each role's review with its findings after confirmation (<see cref="ReviewPanel.Decide"/>).
 /// </summary>
 public sealed record ReviewVerdict(
     [property: JsonPropertyName("sha")] string HeadSha,
     [property: JsonPropertyName("verdict")] string Verdict,
-    [property: JsonPropertyName("model")] string Model,
-    [property: JsonPropertyName("served")] string? ServedModel,
-    [property: JsonPropertyName("family")] string? Family,
     [property: JsonPropertyName("summary")] string Summary,
-    [property: JsonPropertyName("session")] string? Session = null)
+    [property: JsonPropertyName("risky")] IReadOnlyList<string> RiskyPaths,
+    [property: JsonPropertyName("reviews")] IReadOnlyList<RoleReview> Reviews)
 {
     public const string Pass = "pass";
     public const string Fail = "fail";
@@ -109,7 +107,9 @@ public sealed record ReviewVerdict(
         }
         try
         {
-            return JsonSerializer.Deserialize<ReviewVerdict>(detail) is { HeadSha: not null, Verdict: not null } v ? v : null;
+            return JsonSerializer.Deserialize<ReviewVerdict>(detail) is { HeadSha: not null, Verdict: not null } v
+                ? v with { RiskyPaths = v.RiskyPaths ?? [], Reviews = v.Reviews ?? [] }
+                : null;
         }
         catch (JsonException)
         {
@@ -172,7 +172,8 @@ public static class MergeGate
             return new GateDecision(GateOutcome.Blocked, head, [$"PR #{pull.Number} is not open"]);
         }
 
-        // review: pass — a verdict on this exact head commit, from a family the implementer did not use.
+        // review: pass — a panel verdict on this exact head commit: every required role reviewed, every reviewer and second
+        // model of a family the implementer did not use, no blocking finding left.
         var verdict = verdicts.LastOrDefault(v => v.HeadSha == head);
         if (verdict is null)
         {
@@ -182,13 +183,19 @@ public static class MergeGate
         {
             reasons.Add($"the review of {Ci.Short(head)} is '{verdict.Verdict}'");
         }
+        foreach (var role in ReviewRoles.Required(verdict.RiskyPaths.Count > 0).Where(r => verdict.Reviews.All(v => v.Role != r)))
+        {
+            reasons.Add($"the review of {Ci.Short(head)} has no {role} review");
+        }
         try
         {
             var families = ReviewerChoice.ImplementerFamilies(implementerModels);
-            if (verdict.Family is null || families.Contains(verdict.Family))
+            var models = verdict.Reviews.Select(r => (What: $"the {r.Role} reviewer", Served: r.ServedModel ?? r.Model, r.Family))
+                .Concat(verdict.Reviews.SelectMany(r => r.Findings).Select(f => f.Confirmation).OfType<Confirmation>()
+                    .Select(c => (What: "a second model", Served: c.ServedModel ?? c.Model, c.Family)));
+            foreach (var (what, served, family) in models.Where(m => m.Family is null || families.Contains(m.Family)))
             {
-                reasons.Add($"the reviewer ({verdict.ServedModel ?? verdict.Model}, family {verdict.Family ?? "unknown"}) is not of a family "
-                    + $"other than the implementer's ({string.Join(", ", families)})");
+                reasons.Add($"{what} ({served}, family {family ?? "unknown"}) is not of a family other than the implementer's ({string.Join(", ", families)})");
             }
         }
         catch (ReviewerChoiceException ex)
@@ -212,6 +219,7 @@ public static class MergeGate
         }
         return reasons.Count > 0
             ? new GateDecision(GateOutcome.Blocked, head, reasons)
-            : new GateDecision(GateOutcome.Merge, head, ["ci green", $"review pass by {verdict.ServedModel ?? verdict.Model} ({verdict.Family})"]);
+            : new GateDecision(GateOutcome.Merge, head,
+                ["ci green", $"review pass by {string.Join(", ", verdict.Reviews.Select(r => $"{r.Role}: {r.ServedModel ?? r.Model} ({r.Family})"))}"]);
     }
 }

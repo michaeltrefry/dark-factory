@@ -115,8 +115,10 @@ public sealed partial class RunPipeline(
         /// <summary>A model answered the implementer's session (first time seen for the item); Detail is the model id.</summary>
         public const string ImplementerModel = "implementer-model";
         /// <summary>
-        /// Review: a reviewer call is about to be made; Detail is "&lt;router session&gt; &lt;model&gt; &lt;head sha&gt;", so the
-        /// call's cost is readable even when it never returns (E9).
+        /// Review: a review panel call is about to be made; Detail is "&lt;router session&gt; &lt;model&gt; &lt;head sha&gt;
+        /// &lt;role&gt; &lt;prompt path&gt;@sha256:&lt;prompt hash&gt;" (role <c>confirm-&lt;role&gt;</c> for a second model's
+        /// check of a blocking finding), so the call's cost is readable even when it never returns (E9) and the prompt it
+        /// used is on record.
         /// </summary>
         public const string ReviewSession = "review-session";
         /// <summary>Review: a reviewer's verdict on one head commit; Detail is the <see cref="Gate.ReviewVerdict"/> JSON.</summary>

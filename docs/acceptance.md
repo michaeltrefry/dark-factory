@@ -177,7 +177,7 @@ Owner set-up, once (the test skips naming whichever is missing):
 
 | Test | Variables | Proves |
 | --- | --- | --- |
-| `Gate_merges_a_green_pr_a_different_family_reviewer_passed_and_the_ledger_records_the_merge_commit` | `FACTORY_E2E_GATE_STORY=sc-<id>` | Intake → … → Review → CI → MergeGate → Merge → Watch; one pass verdict from a family none of the implementer's models is, accounted by the router under its own session; the PR merged at the reviewed head; the Merge row holds GitHub's merge commit; the story is Done |
+| `Gate_merges_a_green_pr_a_different_family_reviewer_passed_and_the_ledger_records_the_merge_commit` | `FACTORY_E2E_GATE_STORY=sc-<id>` | Intake → … → Review → CI → MergeGate → Merge → Watch; one pass verdict from the review panel (sc-25379: correctness and spec conformance, plus security on a risky path), every reviewer and second model of a family none of the implementer's models is, each panel call accounted by the router under its own session, which the ledger named with the role's prompt file hash; the PR merged at the reviewed head; the Merge row holds GitHub's merge commit; the story is Done |
 | `A_push_after_the_verdict_blocks_the_merge_until_the_new_head_is_reviewed_again` | `FACTORY_E2E_GATE_PUSH_STORY=sc-<id>` | a commit pushed to the PR branch right after the first verdict sends the item from CI back to Review; the new head is reviewed; `gate-passed` and the merge name only the new head |
 
 ```sh
