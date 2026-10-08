@@ -1,3 +1,5 @@
+using System.Text.Json;
+
 namespace DarkFactory.Orchestrator.Worker;
 
 /// <summary>What the orchestrator hands a worker session, for the taint rule (<see cref="Taint.Of(WorkerInput)"/>).</summary>
@@ -36,11 +38,43 @@ public enum WorkerInput
 /// and CI. The excerpt is still redacted, bounded and fenced as data (<see cref="Gate.CiHeal.Excerpt"/>). Tainting them would leave
 /// no CI fixer able to push, i.e. no CI self-heal at all.
 /// </para>
+/// <para>
+/// The taint of a tool use survives an interrupted run: the callback's write is not cancellable (a Ctrl-C or Pause cannot abort a
+/// started commit), and before a session is resumed its stored stream (<c>session_events</c>) is replayed and re-tainted
+/// (<see cref="Ledger.WorkLedger.ReplayTaintsAsync"/>), failing the run if it cannot be read. Residual: an orchestrator killed
+/// outright (SIGKILL, power loss) after the worker wrote the tool_use line but before that line was stored — still in the pipe
+/// buffer, or queued in the session capture — leaves no trace the factory can replay, while Claude's own transcript of the
+/// session has it; resuming that session could then push. Closing it would need the worker's own transcript, which lives in the
+/// <c>_factory</c> user's home.
+/// </para>
+/// <para>
+/// The target repo's own Claude settings (<see cref="OfRepoSettings"/>) taint the session up front, and again if the worker wrote
+/// them during its run. Deliberate, accepted residual: the worker's allowed <c>dotnet build/test/restore</c> run code the repo and
+/// its packages supply (MSBuild targets, analyzers, test code, package restore), and the worker reads their output. That code
+/// runs in the sandbox (no credential but the router key), is the code under review or a dependency the repo already pins, goes
+/// back through the review panel and CI, and the factory cannot build or test anything without it; tainting every session that
+/// builds would leave no worker able to push.
+/// </para>
 /// </summary>
 public static class Taint
 {
     public const string IssueText = "issue-text";
     public const string OutsiderComment = "outsider-comment";
+
+    /// <summary>The target repo's own Claude settings can bring content in outside the tool stream (<see cref="OfRepoSettings"/>).</summary>
+    public const string RepoSettings = "repo-settings";
+
+    /// <summary>
+    /// The settings files Claude Code loads for a worker (<c>--setting-sources project,local</c>), relative to the worktree, and the
+    /// project MCP file (ignored under <c>--strict-mcp-config</c>, checked anyway).
+    /// </summary>
+    public static readonly string[] RepoSettingsFiles = [".claude/settings.json", ".claude/settings.local.json"];
+    public const string McpFile = ".mcp.json";
+
+    /// <summary>Settings keys that run a command or start an MCP server outside the worker's tool calls, so its stream would not show it.</summary>
+    private static readonly string[] CommandSettings =
+        ["hooks", "enableAllProjectMcpServers", "enabledMcpjsonServers", "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport",
+            "otelHeadersHelper", "statusLine"];
 
     /// <summary>The tools that read the web; workers are denied them (<see cref="ClaudeWorker.DeniedTools"/>) and their use still taints.</summary>
     public static readonly string[] WebTools = ["WebFetch", "WebSearch"];
@@ -55,6 +89,91 @@ public static class Taint
         WorkerInput.Story or WorkerInput.TriageSummary or WorkerInput.ReviewFindings or WorkerInput.CiLog => null,
         _ => throw new ArgumentOutOfRangeException(nameof(input), input, "no taint rule for this input"),
     };
+
+    /// <summary>
+    /// <see cref="RepoSettings"/> when the worktree at <paramref name="worktree"/> carries Claude settings that could feed the session
+    /// content its stream-json would not show: a settings file (<see cref="RepoSettingsFiles"/>) defining hooks, project MCP servers or
+    /// a command helper (<see cref="CommandSettings"/>), or a <c>permissions.allow</c> rule beyond <see cref="ClaudeWorker.AllowedTools"/>
+    /// (e.g. <c>Bash(curl:*)</c>); or a <see cref="McpFile"/> naming any server. A file that cannot be read or parsed taints too (E2:
+    /// unknown settings are not trusted). Null when none of that is there.
+    /// </summary>
+    public static string? OfRepoSettings(string worktree)
+    {
+        foreach (var file in RepoSettingsFiles)
+        {
+            if (Read(Path.Combine(worktree, file)) is not { } settings)
+            {
+                continue;
+            }
+            using (settings.Document)
+            {
+                if (settings.Document?.RootElement is not { ValueKind: JsonValueKind.Object } root
+                    || CommandSettings.Any(key => root.TryGetProperty(key, out _))
+                    || (root.TryGetProperty("permissions", out var permissions) && !OnlyAllowsWorkerTools(permissions)))
+                {
+                    return RepoSettings;
+                }
+            }
+        }
+        if (Read(Path.Combine(worktree, McpFile)) is { } mcp)
+        {
+            using (mcp.Document)
+            {
+                if (mcp.Document?.RootElement is not { ValueKind: JsonValueKind.Object } root
+                    || (root.TryGetProperty("mcpServers", out var servers)
+                        && (servers.ValueKind != JsonValueKind.Object || servers.EnumerateObject().Any())))
+                {
+                    return RepoSettings;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static bool OnlyAllowsWorkerTools(JsonElement permissions)
+    {
+        if (permissions.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+        if (!permissions.TryGetProperty("allow", out var allow))
+        {
+            return true;
+        }
+        return allow.ValueKind == JsonValueKind.Array && allow.EnumerateArray().All(rule =>
+            rule.ValueKind == JsonValueKind.String && ClaudeWorker.AllowedTools.Contains(rule.GetString(), StringComparer.Ordinal));
+    }
+
+    /// <summary>The file parsed (a null document when it cannot be read or is not JSON), or null when there is no file at all.</summary>
+    private static Holder? Read(string path)
+    {
+        if (!File.Exists(path) && !Directory.Exists(path) && !IsLink(path))
+        {
+            return null;
+        }
+        try
+        {
+            return new Holder(JsonDocument.Parse(File.ReadAllText(path)));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return new Holder(null);
+        }
+    }
+
+    private static bool IsLink(string path)
+    {
+        try
+        {
+            return new FileInfo(path).LinkTarget is not null;
+        }
+        catch (IOException)
+        {
+            return true;
+        }
+    }
+
+    private sealed record Holder(JsonDocument? Document);
 
     /// <summary>
     /// The taint reason of a worker's use of <paramref name="tool"/>: <c>web:&lt;tool&gt;</c> for a web tool, <c>mcp:&lt;tool&gt;</c> for

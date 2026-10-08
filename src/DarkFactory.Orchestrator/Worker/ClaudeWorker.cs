@@ -54,7 +54,7 @@ public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError,
 /// <see cref="OnLine"/> gets every stdout line, in order, as it is read;
 /// <see cref="OnModel"/> gets each model that answers the session, the first time it appears;
 /// <see cref="OnUntrusted"/> gets the session id and the taint reason (<see cref="Taint.ForTool"/>) of each web or MCP tool the session
-/// uses, the first time, before the next line is read. A session that uses one with no <see cref="OnUntrusted"/> to record it fails
+/// uses, the first time, before the next line is read, with a token that is never cancelled (the record must commit). A session that uses one with no <see cref="OnUntrusted"/> to record it fails
 /// (E2: a taint that cannot be recorded is not ignored).
 /// </summary>
 public sealed record WorkerCallbacks(
@@ -392,7 +392,8 @@ public sealed class ClaudeWorker(
                         throw new InvalidOperationException(
                             $"The worker used an untrusted-content tool ({reason}) but its taint cannot be recorded (no session id or no taint callback).");
                     }
-                    await onUntrusted(tainted, reason, ct);
+                    // Not cancellable: a Ctrl-C or Pause must not abort a taint the session has already earned (E4).
+                    await onUntrusted(tainted, reason, CancellationToken.None);
                 }
             }
             await process.WaitForExitAsync(timeoutCts.Token);

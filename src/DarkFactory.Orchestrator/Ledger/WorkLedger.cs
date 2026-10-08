@@ -171,6 +171,31 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
         db.Entry(taint).State = EntityState.Detached;
     }
 
+    /// <summary>
+    /// Replays the stored stream of <paramref name="sessionId"/> (its <c>session_events</c>) through a <see cref="Worker.StreamJsonState"/>
+    /// and taints the session for every web or MCP tool use found there (E4). It closes the window in which a run stopped after
+    /// the line was stored but before its taint committed. A failed read throws, so a session whose stream cannot be checked is
+    /// not resumed (E2).
+    /// </summary>
+    public async Task ReplayTaintsAsync(WorkItem? item, string sessionId, CancellationToken ct)
+    {
+        var state = new Worker.StreamJsonState();
+        var rows = db.WorkerSessions.Where(s => s.ClaudeSessionId == sessionId).Select(s => s.Id);
+        var lines = db.SessionEvents.AsNoTracking()
+            .Where(e => rows.Contains(e.WorkerSessionId) && e.Type == "assistant")
+            .OrderBy(e => e.WorkerSessionId).ThenBy(e => e.Sequence)
+            .Select(e => e.Payload)
+            .AsAsyncEnumerable();
+        await foreach (var line in lines.WithCancellation(ct))
+        {
+            state.Accept(line);
+        }
+        foreach (var reason in state.UntrustedReads)
+        {
+            await TaintSessionAsync(item, sessionId, reason, ct);
+        }
+    }
+
     /// <summary>The session's taint, read fresh from the ledger, or null when it is not tainted.</summary>
     public Task<SessionTaint?> TaintOfAsync(string sessionId, CancellationToken ct) =>
         db.SessionTaints.AsNoTracking().SingleOrDefaultAsync(t => t.ClaudeSessionId == sessionId, ct);

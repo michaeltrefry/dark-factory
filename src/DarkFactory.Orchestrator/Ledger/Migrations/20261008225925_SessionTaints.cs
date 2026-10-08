@@ -39,10 +39,12 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
             migrationBuilder.Sql("""
                 CREATE FUNCTION session_taints_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
                 BEGIN
-                    RAISE EXCEPTION 'session_taints rows cannot be updated or deleted';
+                    RAISE EXCEPTION 'session_taints rows cannot be updated, deleted or truncated';
                 END $$;
                 CREATE TRIGGER session_taints_immutable BEFORE UPDATE OR DELETE ON session_taints
                     FOR EACH ROW EXECUTE FUNCTION session_taints_immutable();
+                CREATE TRIGGER session_taints_no_truncate BEFORE TRUNCATE ON session_taints
+                    FOR EACH STATEMENT EXECUTE FUNCTION session_taints_immutable();
                 """);
         }
 

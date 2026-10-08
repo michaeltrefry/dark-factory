@@ -226,8 +226,20 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   refused too); the merge queue's base-update fast-forward (`PushAsync`) pushes only the orchestrator's own merge commit. A tainted implementer/fixer session is refused before it is resumed and at its push: `SessionTaintedException`
   escalates the item (comment names the session and reason), its worktree is removed, and a re-run starts a fresh session.
   Deliberate: CI logs are not a taint source (they come from the repo's CI running the base plus the factory's own reviewed
-  changes; tainting them would leave no CI fixer able to push). Residual: a network read through a tool the repo's settings
-  allow (e.g. `Bash(curl:*)`) is not detected.
+  changes; tainting them would leave no CI fixer able to push).
+  Interrupts: the taint write of a tool use runs on a never-cancelled token (`ClaudeWorker` passes `CancellationToken.None` to
+  `OnUntrusted`), and before resuming a session `RunWorkerSessionAsync` replays its stored `session_events` through
+  `StreamJsonState` (`WorkLedger.ReplayTaintsAsync`) and taints it for every web/MCP use found; a failed read fails the run.
+  Repo settings (`Taint.OfRepoSettings`, reason `repo-settings`): before launch, and again after the worker's run (it may write
+  them itself), the worktree's `.claude/settings.json` and `.claude/settings.local.json` (the `project,local` sources) are read;
+  `hooks`, `enableAllProjectMcpServers`, `enabledMcpjsonServers`, a command helper (`apiKeyHelper`, `awsAuthRefresh`,
+  `awsCredentialExport`, `otelHeadersHelper`, `statusLine`), any `permissions.allow` rule not in `ClaudeWorker.AllowedTools`, or a
+  `.mcp.json` naming a server taints the session (a new one from its start; a resumed one is refused). Unreadable or unparseable
+  settings taint too. Residuals: an orchestrator SIGKILLed after the worker wrote a tool_use line but before the line was stored
+  (pipe buffer / capture queue) leaves nothing to replay. Accepted: the allowed `dotnet build/test/restore` run repo and package
+  code (MSBuild targets, analyzers, tests, restore) whose output the worker reads; it runs sandboxed with no credential but the
+  router key, is the code under review or a pinned dependency, goes back through review and CI, and tainting it would leave no
+  worker able to push.
 - The orchestrator pushes only to `factory/*`, with a repo-scoped GitHub App installation token passed
   via git env config (never argv/remote URLs/.git/config) on every network git call. Only the merge gate merges (below).
   Tokens are minted fresh per call (never cached) and refused if they outlive 1 hour (`GitHubApp`).

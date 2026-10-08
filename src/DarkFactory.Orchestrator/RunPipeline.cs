@@ -630,13 +630,23 @@ public sealed partial class RunPipeline(
     {
         var item = run.Item;
         var resume = session;
+        // The target repo's own Claude settings may feed the session content its stream would not show (hooks, MCP, extra allow rules).
+        var taints = inputs.Select(Taint.Of).Append(Taint.OfRepoSettings(workspace.Path)).OfType<string>().ToList();
         // Every worker this runs exists to push its work: a tainted session would only be refused its push token after spending
-        // the model's time, so it is not resumed at all (E4).
-        if (resume is not null && await ledger.TaintOfAsync(resume, ct) is { } taint)
+        // the model's time, so it is not resumed at all (E4). Its stored stream is replayed first: a run stopped between storing
+        // a web tool's line and committing its taint left the use only there.
+        if (resume is not null)
         {
-            throw new SessionTaintedException(resume, taint.Reason);
+            await ledger.ReplayTaintsAsync(item, resume, ct);
+            foreach (var reason in taints)
+            {
+                await ledger.TaintSessionAsync(item, resume, reason, ct);
+            }
+            if (await ledger.TaintOfAsync(resume, ct) is { } taint)
+            {
+                throw new SessionTaintedException(resume, taint.Reason);
+            }
         }
-        var taints = inputs.Select(Taint.Of).OfType<string>().ToList();
         log.WriteLine(resume is null ? $"[{label}] starting worker" : $"[{label}] resuming claude session {resume}");
         // Every stdout line is stored (and pushed to live viewers) as it streams (E7).
         await using var capture = sessions is null ? null : await sessions.StartAsync(item.Id, resume, ct);
@@ -730,6 +740,11 @@ public sealed partial class RunPipeline(
         {
             throw new WorkerFailedException(
                 $"Worker failed (exit {result.ExitCode}, result {result.ResultSubtype ?? "none"}): {result.ResultText} {result.StderrTail}".Trim());
+        }
+        // The worker can write the repo's settings itself (a hook it added may have run in-session): checked again before it is done.
+        if (session is not null && Taint.OfRepoSettings(workspace.Path) is { } changed)
+        {
+            await ledger.TaintSessionAsync(item, session, changed, ct);
         }
         await ledger.CheckpointAsync(item, Steps.WorkerDone, session, $"worker exit {result.ExitCode}", ct);
         return session;

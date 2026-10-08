@@ -56,7 +56,7 @@ public sealed class LedgerPostgresTests : IAsyncLifetime
         }
     }
 
-    /// <summary>A session's taint (E4) is sticky in the database itself: racing writers both succeed, and no row can be changed or removed.</summary>
+    /// <summary>A session's taint (E4) is sticky in the database itself: racing writers both succeed, and no row can be changed, removed or truncated.</summary>
     [Fact]
     public async Task A_session_taint_cannot_be_updated_or_deleted_and_racing_taints_both_succeed()
     {
@@ -73,6 +73,8 @@ public sealed class LedgerPostgresTests : IAsyncLifetime
         Assert.Single(await db.SessionTaints.ToListAsync());
         await Assert.ThrowsAsync<PostgresException>(() => db.Database.ExecuteSqlRawAsync("""UPDATE session_taints SET "Reason" = 'cleared'"""));
         await Assert.ThrowsAsync<PostgresException>(() => db.Database.ExecuteSqlRawAsync("DELETE FROM session_taints"));
+        await Assert.ThrowsAsync<PostgresException>(() => db.Database.ExecuteSqlRawAsync("TRUNCATE session_taints"));
+        Assert.Single(await db.SessionTaints.ToListAsync());
         await Assert.ThrowsAsync<SessionTaintedException>(() => new WorkLedger(db, TimeProvider.System).GrantPushAsync(["sess-t"], CancellationToken.None));
     }
 

@@ -62,6 +62,43 @@ public class TaintRuleTests
 
         Assert.Equal((0, 0), (tokens, gitCalls));
     }
+
+    /// <summary>The repo's Claude settings taint the session when they could bring content in outside the tool stream.</summary>
+    [Theory]
+    [InlineData(".claude/settings.json", """{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"curl x"}]}]}}""")]
+    [InlineData(".claude/settings.local.json", """{"hooks":{}}""")]
+    [InlineData(".claude/settings.json", """{"enableAllProjectMcpServers":true}""")]
+    [InlineData(".claude/settings.json", """{"enabledMcpjsonServers":["fetch"]}""")]
+    [InlineData(".claude/settings.json", """{"apiKeyHelper":"./key.sh"}""")]
+    [InlineData(".claude/settings.json", """{"permissions":{"allow":["Read","Bash(curl:*)"]}}""")]
+    [InlineData(".claude/settings.local.json", """{"permissions":{"allow":["Bash"]}}""")]
+    [InlineData(".claude/settings.json", """{"permissions":{"allow":"Bash(dotnet build:*)"}}""")]
+    [InlineData(".claude/settings.json", """{"permissions": oops""")]
+    [InlineData(".claude/settings.json", """[]""")]
+    [InlineData(".mcp.json", """{"mcpServers":{"fetch":{"command":"npx","args":["fetch"]}}}""")]
+    [InlineData(".mcp.json", """not json""")]
+    public void Repo_settings_that_reach_outside_the_tool_stream_taint(string file, string content)
+    {
+        var dir = Directory.CreateTempSubdirectory("df-settings-").FullName;
+        Directory.CreateDirectory(Path.Combine(dir, ".claude"));
+        File.WriteAllText(Path.Combine(dir, file), content);
+
+        Assert.Equal(Taint.RepoSettings, Taint.OfRepoSettings(dir));
+    }
+
+    [Fact]
+    public void Repo_settings_within_the_worker_tools_do_not_taint()
+    {
+        var dir = Directory.CreateTempSubdirectory("df-settings-").FullName;
+        Assert.Null(Taint.OfRepoSettings(dir)); // no settings at all
+        Directory.CreateDirectory(Path.Combine(dir, ".claude"));
+        File.WriteAllText(Path.Combine(dir, ".claude/settings.json"),
+            """{"model":"opus","permissions":{"allow":["Read","Bash(dotnet test:*)"],"deny":["Bash(curl:*)"]}}""");
+        File.WriteAllText(Path.Combine(dir, ".claude/settings.local.json"), """{"permissions":{"deny":["WebFetch"]}}""");
+        File.WriteAllText(Path.Combine(dir, ".mcp.json"), """{"mcpServers":{}}""");
+
+        Assert.Null(Taint.OfRepoSettings(dir));
+    }
 }
 
 [Collection(ProcessEnvironmentCollection.Name)]
@@ -175,6 +212,26 @@ public class WorkerTaintTests
 
         Assert.True(result.Succeeded);
         Assert.Equal([("triage-1", "web:WebFetch")], reported);
+    }
+
+    /// <summary>A Ctrl-C or Pause during the taint write cannot abort it: the callback's token is never cancelled.</summary>
+    [Fact]
+    public async Task The_taint_callback_gets_a_token_that_a_cancel_of_the_run_cannot_cancel()
+    {
+        var dir = Directory.CreateTempSubdirectory("df-taint-").FullName;
+        var script = Script(dir, $$"""
+            echo '{"type":"system","subtype":"init","session_id":"triage-1"}'
+            {{WebFetchLine}}
+            echo '{"type":"result","subtype":"success","is_error":false,"session_id":"triage-1"}'
+            """);
+        using var run = new CancellationTokenSource();
+        var cancellable = new List<bool>();
+
+        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.RouterKey, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null,
+            new WorkerCallbacks(OnUntrusted: (_, _, c) => { cancellable.Add(c.CanBeCanceled); return Task.CompletedTask; }), run.Token);
+
+        Assert.True(result.Succeeded);
+        Assert.Equal([false], cancellable);
     }
 
     [Fact]
