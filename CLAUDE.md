@@ -213,6 +213,21 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   no-op through the helper, whose exit kills every `_factory` process (`WorkerSandbox.StopAllAsync`).
 - Workers get only the router URL + router key; the worker env is an allowlist (`ClaudeWorker.BuildRouterVariables`,
   enforced again by `scripts/factory-worker-launch`).
+- Untrusted-input taint (E4, sc-25386, `Worker/Taint.cs`): a worker session that has read untrusted content is tainted — a
+  `session_taints` row keyed by its Claude session id (insert-only; a Postgres trigger refuses UPDATE/DELETE; the first reason
+  is kept), so it holds across resume and crash and nothing clears it. Sources: the input the orchestrator hands it
+  (`Taint.Of(WorkerInput)`: issue text and outsider comments taint; the owner's story, an issue item's approved triage summary,
+  review findings and CI logs do not), recorded before the session id is checkpointed (the triage worker: `issue-text`); and any
+  `tool_use` of `WebFetch`/`WebSearch` or of an MCP tool in its stream-json (`web:<tool>`, `mcp:<tool>`; the use counts, even a
+  denied one), recorded by `ClaudeWorker` (`WorkerCallbacks.OnUntrusted`) before the next line is read — with no callback to
+  record it the run fails (E2). Workers are also denied the web tools (`--disallowedTools WebFetch WebSearch`, beating any allow
+  rule in the target repo's settings). Every push of worker work needs a `PushGrant` (`IRepoWorkspace.CommitAndPushAsync`; no grant,
+  no token minted), which only `WorkLedger.GrantPushAsync` issues, for the current attempt's sessions, none tainted (none at all is
+  refused too); the merge queue's base-update fast-forward (`PushAsync`) pushes only the orchestrator's own merge commit. A tainted implementer/fixer session is refused before it is resumed and at its push: `SessionTaintedException`
+  escalates the item (comment names the session and reason), its worktree is removed, and a re-run starts a fresh session.
+  Deliberate: CI logs are not a taint source (they come from the repo's CI running the base plus the factory's own reviewed
+  changes; tainting them would leave no CI fixer able to push). Residual: a network read through a tool the repo's settings
+  allow (e.g. `Bash(curl:*)`) is not detected.
 - The orchestrator pushes only to `factory/*`, with a repo-scoped GitHub App installation token passed
   via git env config (never argv/remote URLs/.git/config) on every network git call. Only the merge gate merges (below).
   Tokens are minted fresh per call (never cached) and refused if they outlive 1 hour (`GitHubApp`).

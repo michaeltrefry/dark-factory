@@ -57,6 +57,9 @@ public class CiHealTests
         Assert.Contains("WordCount(\"  \") returns 1.", fixer.Prompt); // the story, as the implementer saw it
         Assert.Contains("restore michaeltrefry/dark-factory-sandbox factory/sc-77", h.Workspaces.Calls);
         Assert.Contains("push michaeltrefry/dark-factory-sandbox factory/sc-77 sc-77: fix CI (round 1)", h.Workspaces.Calls);
+        // CI logs do not taint the CI fixer (sc-25386, Taint): it is granted its push like the implementer.
+        Assert.Empty(h.Db.SessionTaints);
+        Assert.Equal(2, h.Workspaces.Grants.Count);
 
         // The ledger: the triage (names only) before the round, the fixed and pushed commits — and no log text anywhere.
         var rows = await h.Rows();

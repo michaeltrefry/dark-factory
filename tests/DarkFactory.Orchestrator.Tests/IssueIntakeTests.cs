@@ -33,9 +33,10 @@ public class IssueIntakeTests
         public static WorkerResult Says(string answer) => new("triage-sess", 0, false, "success", answer, "");
 
         public async Task<WorkerResult> RunAsync(WorkItem item, RepoRef repo, string prompt, Func<string, CancellationToken, Task> onSession,
-            CancellationToken ct)
+            Func<string, string, CancellationToken, Task> onTaint, CancellationToken ct)
         {
             Prompts.Add(prompt);
+            await onTaint("triage-sess", Taint.IssueText, ct);
             await onSession("triage-sess", ct);
             return Answers[Math.Min(Prompts.Count, Answers.Count) - 1]();
         }
@@ -540,14 +541,33 @@ public class IssueIntakeTests
         var sessions = new List<string>();
 
         var result = await new WorkerTriageRunner(workspaces, worker, null, TextWriter.Null)
-            .RunAsync(item, Repo, "triage this", (s, _) => { sessions.Add(s); return Task.CompletedTask; }, CancellationToken.None);
+            .RunAsync(item, Repo, "triage this", (s, _) => { sessions.Add(s); return Task.CompletedTask; },
+                (s, reason, _) => { sessions.Add($"taint {s} {reason}"); return Task.CompletedTask; }, CancellationToken.None);
 
         Assert.True(result.Succeeded);
-        Assert.Equal(["triage-sess"], sessions);
+        // Tainted by the issue text it was handed before anything else learns of the session (E4).
+        Assert.Equal(["taint triage-sess issue-text", "triage-sess"], sessions);
         Assert.Equal("triage this", worker.Calls.Single().Prompt);
         // Prepared and removed; never committed, pushed or opened as a PR.
         Assert.Equal([$"prepare {Repo} factory/triage-gh-5", $"remove {Repo} /wt/factory/triage-gh-5"], workspaces.Calls);
         Assert.Equal(new Dictionary<string, string> { ["contents"] = "read" }, WorkerTriageRunner.TriageWorkspaceToken);
+    }
+
+    [Fact]
+    public async Task A_triage_session_that_read_the_issue_text_is_tainted_in_the_ledger_and_refused_a_push_grant()
+    {
+        var h = new Harness(Answer());
+        await h.Watch();
+        h.Open("maintainer");
+
+        await h.Poll();
+
+        await using var db = h.Db();
+        var taint = await db.SessionTaints.SingleAsync();
+        Assert.Equal(("triage-sess", Taint.IssueText), (taint.ClaudeSessionId, taint.Reason));
+        var refused = await Assert.ThrowsAsync<SessionTaintedException>(
+            () => new WorkLedger(db, TimeProvider.System).GrantPushAsync(["triage-sess"], CancellationToken.None));
+        Assert.Contains("holds no push token", refused.Message);
     }
 
     private static readonly RepoRef Gadgets = new("acme", "gadgets");

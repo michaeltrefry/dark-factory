@@ -3,6 +3,7 @@ using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Shortcut;
+using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.Orchestrator;
@@ -488,7 +489,7 @@ public sealed partial class RunPipeline
         var fixing = history.FindLastIndex(e => e.Step is null && e.State == WorkState.Fixing && e.Detail != "unpaused");
         var merged = history.Skip(fixing + 1).Where(e => e.Step == Steps.BaseMerged).Select(e => BaseUpdate.FromDetail(e.Detail)).LastOrDefault(u => u is not null);
         var found = history.Where(e => e.Step == Steps.MergeConflict).Select(e => BaseUpdate.FromDetail(e.Detail)).LastOrDefault(u => u?.From == fixedHead);
-        await RunFixRoundAsync(run, history, round, fixedHead, $"conflicts with the base in {string.Join(", ", found?.Files ?? [])}",
+        await RunFixRoundAsync(run, history, round, fixedHead, $"conflicts with the base in {string.Join(", ", found?.Files ?? [])}", [SpecInput(spec.Story)],
             _ => Task.FromResult(BuildConflictFixPrompt(spec, repo, round, merged!)),
             BuildConflictFixResumePrompt(spec.Story, round),
             $"{spec.Story.Ref}: merge the base and resolve its conflicts (round {round})", WorkState.Review, $"conflict fix round {round}", ct,

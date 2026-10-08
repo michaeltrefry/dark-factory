@@ -52,13 +52,17 @@ public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError,
 /// <see cref="OnStarted"/> gets the worker's process id as soon as the process exists;
 /// <see cref="OnSession"/> gets the Claude session id as soon as it appears in the stream;
 /// <see cref="OnLine"/> gets every stdout line, in order, as it is read;
-/// <see cref="OnModel"/> gets each model that answers the session, the first time it appears.
+/// <see cref="OnModel"/> gets each model that answers the session, the first time it appears;
+/// <see cref="OnUntrusted"/> gets the session id and the taint reason (<see cref="Taint.ForTool"/>) of each web or MCP tool the session
+/// uses, the first time, before the next line is read. A session that uses one with no <see cref="OnUntrusted"/> to record it fails
+/// (E2: a taint that cannot be recorded is not ignored).
 /// </summary>
 public sealed record WorkerCallbacks(
     Func<int, CancellationToken, Task>? OnStarted = null,
     Func<string, CancellationToken, Task>? OnSession = null,
     Func<string, CancellationToken, ValueTask>? OnLine = null,
-    Func<string, CancellationToken, Task>? OnModel = null);
+    Func<string, CancellationToken, Task>? OnModel = null,
+    Func<string, string, CancellationToken, Task>? OnUntrusted = null);
 
 public interface IWorker
 {
@@ -162,6 +166,12 @@ public sealed class ClaudeWorker(
     public static readonly string[] AllowedTools =
         ["Read", "Edit", "Write", "Glob", "Grep", "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(dotnet restore:*)"];
 
+    /// <summary>
+    /// Tools a worker is denied (<c>--disallowedTools</c>, which beats any allow rule, the target repo's own settings included): the
+    /// web tools (<see cref="Taint.WebTools"/>). Defence in depth: a use that still shows in the stream taints the session (E4).
+    /// </summary>
+    public static readonly string[] DeniedTools = Taint.WebTools;
+
     private static readonly string[] PassThroughVariables =
         ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "TERM", "DOTNET_ROOT"];
 
@@ -240,6 +250,8 @@ public sealed class ClaudeWorker(
             "--allowedTools",
         };
         args.AddRange(AllowedTools);
+        args.Add("--disallowedTools");
+        args.AddRange(DeniedTools);
         if (settings is not null)
         {
             args.Add("--settings");
@@ -351,9 +363,10 @@ public sealed class ClaudeWorker(
             {
                 await onStarted(process.Id, ct);
             }
-            var (onSession, onLine, onModel) = (callbacks?.OnSession, callbacks?.OnLine, callbacks?.OnModel);
+            var (onSession, onLine, onModel, onUntrusted) = (callbacks?.OnSession, callbacks?.OnLine, callbacks?.OnModel, callbacks?.OnUntrusted);
             string? reported = null;
             var modelsReported = 0;
+            var untrustedReported = 0;
             while (await process.StandardOutput.ReadLineAsync(timeoutCts.Token) is { } line)
             {
                 if (onLine is not null)
@@ -370,6 +383,16 @@ public sealed class ClaudeWorker(
                 while (onModel is not null && modelsReported < state.Models.Count)
                 {
                     await onModel(state.Models[modelsReported++], ct);
+                }
+                while (untrustedReported < state.UntrustedReads.Count)
+                {
+                    var reason = state.UntrustedReads[untrustedReported++];
+                    if (onUntrusted is null || state.SessionId is not { } tainted)
+                    {
+                        throw new InvalidOperationException(
+                            $"The worker used an untrusted-content tool ({reason}) but its taint cannot be recorded (no session id or no taint callback).");
+                    }
+                    await onUntrusted(tainted, reason, ct);
                 }
             }
             await process.WaitForExitAsync(timeoutCts.Token);

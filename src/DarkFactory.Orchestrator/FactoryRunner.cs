@@ -293,7 +293,7 @@ public sealed class FactoryItemStops(FactoryOptions options, IWorkSource source,
 public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) : Issues.ITriageRunner
 {
     public async Task<WorkerResult> RunAsync(WorkItem item, RepoRef repo, string prompt, Func<string, CancellationToken, Task> onSession,
-        CancellationToken ct)
+        Func<string, string, CancellationToken, Task> onTaint, CancellationToken ct)
     {
         var routerKey = options.RouterKey;
         var sandbox = options.WorkerSandbox;
@@ -311,7 +311,7 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
             pauseFlagDirectory: options.PauseFlagDirectory);
         var sessions = new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)),
             new RouterClient(routerHttp, routerKey), TimeProvider.System, log, costSettleDelay: options.CostSettleDelay);
-        return await new Issues.WorkerTriageRunner(workspaces, worker, sessions, log).RunAsync(item, repo, prompt, onSession, ct);
+        return await new Issues.WorkerTriageRunner(workspaces, worker, sessions, log).RunAsync(item, repo, prompt, onSession, onTaint, ct);
     }
 
     private static Task<T> FactoryWideStep<T>(string what, Func<T> step)

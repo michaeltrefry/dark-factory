@@ -226,7 +226,7 @@ public class MergeQueueTests
             }
         }
 
-        public Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, CancellationToken ct)
+        public Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, PushGrant grant, CancellationToken ct)
         {
             lock (_gate)
             {

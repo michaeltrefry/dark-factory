@@ -586,13 +586,14 @@ public sealed partial class RunPipeline(
         if (!attempt.Any(e => e.Step == Steps.WorkerDone))
         {
             session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? BuildPrompt(spec, repo) : BuildResumePrompt(story),
-                models, "implement", ct);
+                models, [SpecInput(story)], "implement", ct);
         }
         await ThrowIfControlledAsync(item, ct);
 
         if (!attempt.Any(e => e.Step == Steps.Pushed))
         {
-            if (!await workspaces.CommitAndPushAsync(repo, workspace, $"{story.Ref}: {story.PublicName}", ct))
+            var grant = await GrantPushAsync(item, session, ct);
+            if (!await workspaces.CommitAndPushAsync(repo, workspace, $"{story.Ref}: {story.PublicName}", grant, ct))
             {
                 throw new InvalidOperationException("Worker finished without changing the repository; nothing to review.");
             }
@@ -625,10 +626,17 @@ public sealed partial class RunPipeline(
     /// On success it checkpoints <see cref="Steps.WorkerDone"/> and returns the session id.
     /// </summary>
     private async Task<string?> RunWorkerSessionAsync(Run run, Workspace workspace, string? session, Func<string?, string> prompt,
-        HashSet<string> models, string label, CancellationToken ct)
+        HashSet<string> models, IReadOnlyCollection<WorkerInput> inputs, string label, CancellationToken ct)
     {
         var item = run.Item;
         var resume = session;
+        // Every worker this runs exists to push its work: a tainted session would only be refused its push token after spending
+        // the model's time, so it is not resumed at all (E4).
+        if (resume is not null && await ledger.TaintOfAsync(resume, ct) is { } taint)
+        {
+            throw new SessionTaintedException(resume, taint.Reason);
+        }
+        var taints = inputs.Select(Taint.Of).OfType<string>().ToList();
         log.WriteLine(resume is null ? $"[{label}] starting worker" : $"[{label}] resuming claude session {resume}");
         // Every stdout line is stored (and pushed to live viewers) as it streams (E7).
         await using var capture = sessions is null ? null : await sessions.StartAsync(item.Id, resume, ct);
@@ -651,6 +659,11 @@ public sealed partial class RunPipeline(
                                 await capture.SetClaudeSessionIdAsync(sid, c);
                             }
                             session = sid;
+                            // Tainted by what it was handed before the ledger points at the session (E4).
+                            foreach (var reason in taints)
+                            {
+                                await ledger.TaintSessionAsync(item, sid, reason, c);
+                            }
                             await ledger.CheckpointAsync(item, Steps.Session, sid, "claude session started", c);
                         }
                     },
@@ -661,6 +674,11 @@ public sealed partial class RunPipeline(
                         {
                             await ledger.CheckpointAsync(item, Steps.ImplementerModel, session, model, c);
                         }
+                    },
+                    OnUntrusted: async (sid, reason, c) =>
+                    {
+                        await ledger.TaintSessionAsync(item, sid, reason, c);
+                        log.WriteLine($"[{label}] session {sid} used {reason}: tainted, it gets no push token");
                     }), watch.Token);
         }
         catch (Exception ex) when (watch.Requested is { } requested && !ct.IsCancellationRequested)
@@ -715,6 +733,21 @@ public sealed partial class RunPipeline(
         }
         await ledger.CheckpointAsync(item, Steps.WorkerDone, session, $"worker exit {result.ExitCode}", ct);
         return session;
+    }
+
+    /// <summary>What the worker handed <paramref name="story"/> reads: the owner's story, or an issue item's approved triage (never the issue's text).</summary>
+    private static WorkerInput SpecInput(WorkStory story) =>
+        story.Kind == ItemNaming.GitHubIssue ? WorkerInput.TriageSummary : WorkerInput.Story;
+
+    /// <summary>
+    /// The push grant for the current worker attempt (E4): every session the attempt recorded (read fresh, so a session id that
+    /// changed on resume is included) plus <paramref name="session"/>, none of them tainted.
+    /// </summary>
+    private async Task<PushGrant> GrantPushAsync(WorkItem item, string? session, CancellationToken ct)
+    {
+        var sessions = CurrentWorkerAttempt(await ledger.HistoryAsync(item, ct))
+            .Where(e => e.Step == Steps.Session).Select(e => e.ClaudeSessionId).Append(session);
+        return await ledger.GrantPushAsync(sessions, ct);
     }
 
     private async Task RemoveWorktreeAsync(Run run)

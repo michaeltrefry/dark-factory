@@ -287,7 +287,8 @@ public sealed class IssueIntake(
         try
         {
             var result = await triage.RunAsync(item, repo, TriagePrompt.Build(repo, issue, watched),
-                (session, c) => ledger.CheckpointAsync(item, IssueSteps.TriageSession, session, version, c), ct);
+                (session, c) => ledger.CheckpointAsync(item, IssueSteps.TriageSession, session, version, c),
+                (session, reason, c) => ledger.TaintSessionAsync(item, session, reason, c), ct);
             if (result.UsageLimited && await controls.PauseForUsageAsync(null, UsagePause.WorkerRateLimited, ct) is { State: ControlState.Paused } pause)
             {
                 // Nothing recorded: the version is triaged again once the pause lifts.

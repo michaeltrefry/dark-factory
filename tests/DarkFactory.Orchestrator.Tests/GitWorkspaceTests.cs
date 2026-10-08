@@ -71,7 +71,7 @@ public class GitWorkspaceTests
         await workspace.PrepareAsync(Repo, "factory/sc-9", CancellationToken.None); // clone
         var ws = await workspace.PrepareAsync(Repo, "factory/sc-9", CancellationToken.None); // fetch + set-head
         File.WriteAllText(Path.Combine(ws.Path, "fix.txt"), "fixed\n");
-        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-9: Fix", CancellationToken.None)); // push
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-9: Fix", TestGrants.Untainted, CancellationToken.None)); // push
 
         var network = _gitCalls.Where(c => IsNetworkCall(c.Args)).ToList();
         Assert.Equal(["clone", "fetch", "remote", "push"], network.Select(c => Subcommand(c.Args)));
@@ -126,7 +126,7 @@ public class GitWorkspaceTests
         var ws = await workspace.PrepareAsync(Repo, "factory/sc-2", CancellationToken.None);
         File.WriteAllText(Path.Combine(ws.Path, "fix.txt"), "fixed\n");
 
-        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-2: Fix", CancellationToken.None));
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-2: Fix", TestGrants.Untainted, CancellationToken.None));
 
         Assert.Equal("sc-2: Fix", Git(_remote, "log", "-1", "--format=%s", "factory/sc-2").Trim());
         Assert.Equal("dark-factory[bot]", Git(_remote, "log", "-1", "--format=%an", "factory/sc-2").Trim());
@@ -144,7 +144,7 @@ public class GitWorkspaceTests
         var second = await workspace.PrepareAsync(Repo, "factory/sc-3", CancellationToken.None);
 
         Assert.False(File.Exists(Path.Combine(second.Path, "scratch.txt")));
-        Assert.False(await workspace.CommitAndPushAsync(Repo, second, "nothing", CancellationToken.None));
+        Assert.False(await workspace.CommitAndPushAsync(Repo, second, "nothing", TestGrants.Untainted, CancellationToken.None));
     }
 
     private sealed class FakeSandbox(bool deleteRemovesNothing = false) : DarkFactory.Orchestrator.Worker.IWorkerSandbox
@@ -205,7 +205,7 @@ public class GitWorkspaceTests
         File.WriteAllText(Path.Combine(ws.Path, ".git"), $"gitdir: {Path.Combine(evil, ".git")}\n");
         File.WriteAllText(Path.Combine(ws.Path, "fix.txt"), "fixed\n");
 
-        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-6: Fix", CancellationToken.None));
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-6: Fix", TestGrants.Untainted, CancellationToken.None));
 
         Assert.False(File.Exists(marker));
         Assert.Equal("sc-6: Fix", Git(_remote, "log", "-1", "--format=%s", "factory/sc-6").Trim());
@@ -368,7 +368,7 @@ public class GitWorkspaceTests
         Assert.Equal(first, reopened);
         Assert.True(File.Exists(Path.Combine(reopened!.Path, "half-done.txt")));
         Assert.DoesNotContain(_gitCalls, c => IsNetworkCall(c.Args) || Subcommand(c.Args) is "worktree" or "checkout" or "reset");
-        Assert.True(await workspace.CommitAndPushAsync(Repo, reopened, "sc-5: Fix", CancellationToken.None));
+        Assert.True(await workspace.CommitAndPushAsync(Repo, reopened, "sc-5: Fix", TestGrants.Untainted, CancellationToken.None));
     }
 
     [Fact]
@@ -388,7 +388,7 @@ public class GitWorkspaceTests
         var workspace = Workspace();
         var first = await workspace.PrepareAsync(Repo, "factory/sc-7", CancellationToken.None);
         File.WriteAllText(Path.Combine(first.Path, "pushed.txt"), "done");
-        Assert.True(await workspace.CommitAndPushAsync(Repo, first, "sc-7: Fix", CancellationToken.None));
+        Assert.True(await workspace.CommitAndPushAsync(Repo, first, "sc-7: Fix", TestGrants.Untainted, CancellationToken.None));
         var pushed = Git(_remote, "rev-parse", "factory/sc-7").Trim();
         await workspace.RemoveAsync(Repo, first, CancellationToken.None);
 
@@ -398,7 +398,7 @@ public class GitWorkspaceTests
         Assert.Equal(pushed, Git(restored.Path, "rev-parse", "HEAD").Trim());
         Assert.True(File.Exists(Path.Combine(restored.Path, "pushed.txt")));
         // Pushing again changes nothing on the remote.
-        await workspace.CommitAndPushAsync(Repo, restored, "sc-7: Fix", CancellationToken.None);
+        await workspace.CommitAndPushAsync(Repo, restored, "sc-7: Fix", TestGrants.Untainted, CancellationToken.None);
         Assert.Equal(pushed, Git(_remote, "rev-parse", "factory/sc-7").Trim());
     }
 
@@ -421,7 +421,7 @@ public class GitWorkspaceTests
     {
         var ws = await workspace.PrepareAsync(Repo, branch, CancellationToken.None);
         File.WriteAllText(Path.Combine(ws.Path, file), content);
-        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, $"{branch}: change", CancellationToken.None));
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, $"{branch}: change", TestGrants.Untainted, CancellationToken.None));
         await workspace.RemoveAsync(Repo, ws, CancellationToken.None);
         return Git(_remote, "rev-parse", branch).Trim();
     }
@@ -469,13 +469,13 @@ public class GitWorkspaceTests
         Assert.True(GitWorkspace.HasConflictMarker(File.ReadAllText(Path.Combine(ws.Path, "README.md"))));
 
         // Pushed with the markers left in: they are found in the pushed commit.
-        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-21: merge", CancellationToken.None));
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-21: merge", TestGrants.Untainted, CancellationToken.None));
         var marked = Git(_remote, "rev-parse", "factory/sc-21").Trim();
         Assert.Equal(["README.md"], await workspace.ConflictMarkersAsync(Repo, marked, ["README.md"], CancellationToken.None));
 
         // The fixer resolves it: the commit completes the merge (two parents) and has no marker left.
         File.WriteAllText(Path.Combine(ws.Path, "README.md"), "hello from both\n");
-        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-21: resolve", CancellationToken.None));
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-21: resolve", TestGrants.Untainted, CancellationToken.None));
         var resolved = Git(_remote, "rev-parse", "factory/sc-21").Trim();
         Assert.Empty(await workspace.ConflictMarkersAsync(Repo, resolved, ["README.md"], CancellationToken.None));
     }
@@ -490,7 +490,7 @@ public class GitWorkspaceTests
         await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
         File.WriteAllText(Path.Combine(ws.Path, "README.md"), "both\n");
 
-        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-23: resolve", CancellationToken.None));
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-23: resolve", TestGrants.Untainted, CancellationToken.None));
 
         var pushed = Git(_remote, "rev-parse", "factory/sc-23").Trim();
         Assert.Equal([head, main], Git(ws.Path, "rev-list", "--parents", "-n", "1", pushed).Trim().Split(' ')[1..]);
@@ -639,7 +639,7 @@ public class GitWorkspaceTests
         {
             File.WriteAllText(Path.Combine(first.Path, file), "pr\n");
         }
-        Assert.True(await workspace.CommitAndPushAsync(Repo, first, "sc-30: change", CancellationToken.None));
+        Assert.True(await workspace.CommitAndPushAsync(Repo, first, "sc-30: change", TestGrants.Untainted, CancellationToken.None));
         await workspace.RemoveAsync(Repo, first, CancellationToken.None);
         // Main changes the same files (the base update conflicts in them), and moves on.
         var other = Path.Combine(_root, "main-30");
@@ -659,7 +659,7 @@ public class GitWorkspaceTests
         {
             File.WriteAllText(Path.Combine(ws.Path, file), "both\n");
         }
-        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-30: resolve", CancellationToken.None));
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-30: resolve", TestGrants.Untainted, CancellationToken.None));
         var update = await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
         Assert.True(update.UpToDate);
         await workspace.PushAsync(Repo, ws, CancellationToken.None);
