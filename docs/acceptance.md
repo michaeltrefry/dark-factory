@@ -185,6 +185,21 @@ FACTORY_E2E=1 FACTORY_E2E_GATE_STORY=sc-<id> FACTORY_E2E_GATE_PUSH_STORY=sc-<id>
   dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-class "*ReviewGateTests"
 ```
 
+The seeded review (sc-25379) needs only the router and the router key: no GitHub, Shortcut, ledger or gate App. It sends
+the fixture diffs `tests/DarkFactory.Orchestrator.Tests/Fixtures/review/*.diff` through the production `RouterReviewer`
+to the configured models (`Review:SpecConformance:Models`, `Review:Confirm:Models`, for an anthropic implementer).
+Real models answer, so a failure names what they reported.
+
+| Test | Variables | Proves |
+| --- | --- | --- |
+| `ReviewSeedTests.The_spec_conformance_prompt_gets_a_real_model_to_flag_an_unused_config_flag_and_a_second_model_confirms_it` | `FACTORY_E2E_REVIEW_SEED=1` | the spec-conformance prompt (`factory/prompts/spec-conformance.md`) gets a real model to report a blocking finding naming `IgnoreBlankInput` on `unused-config-flag.diff` (a flag nothing reads), and the confirm prompt gets the second model to answer `confirmed` |
+| `ReviewSeedTests.The_same_flag_with_a_consumer_gets_no_blocking_spec_conformance_finding` | `FACTORY_E2E_REVIEW_SEED=1` | the same flag with a consumer (`consumed-config-flag.diff`) gets no blocking spec-conformance finding |
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_REVIEW_SEED=1 \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-class "*ReviewSeedTests"
+```
+
 Since sc-25378 every `factory run` / `factory work` run goes on past Review, so the Phase 1 tests above (AT1–AT5) also
 need the gate App, and their stories' PRs get merged when they pass the gate.
 

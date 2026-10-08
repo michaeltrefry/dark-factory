@@ -131,11 +131,22 @@ public static class RiskyPaths
             Options)),
     ];
 
+    /// <summary>What <see cref="Touched(IReadOnlyList{string}, string)"/> reports for a change whose paths cannot be read.</summary>
+    public const string Unparsed = "(unparsed diff: no file headers, so the change counts as risky)";
+
     /// <summary>The touched paths that are risky, each with why; empty when the change is not risky.</summary>
     public static IReadOnlyList<string> Touched(IEnumerable<string> paths) =>
         paths.Select(p => Rules.FirstOrDefault(r => r.Pattern.IsMatch(p)) is { Pattern: not null } rule ? $"{p} ({rule.Why})" : null)
             .OfType<string>()
             .ToList();
+
+    /// <summary>
+    /// <see cref="Touched(IEnumerable{string})"/> for the <paramref name="paths"/> read from <paramref name="diff"/>. A
+    /// non-empty diff none of whose paths could be read is risky (<see cref="Unparsed"/>): a check that cannot run counts as
+    /// failed (E2), so the security review is not skipped.
+    /// </summary>
+    public static IReadOnlyList<string> Touched(IReadOnlyList<string> paths, string diff) =>
+        paths.Count == 0 && !string.IsNullOrWhiteSpace(diff) ? [Unparsed] : Touched(paths);
 }
 
 /// <summary>

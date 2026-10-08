@@ -550,7 +550,12 @@ public class GatePipelineTests
     [Fact]
     public async Task An_implementer_answered_by_two_families_gets_a_reviewer_of_a_third_configured_family()
     {
-        var h = new Harness { Models = ReviewPanelModels.Uniform(["gpt-5.5", "claude-opus-5", "gemini-3.1-pro-preview"]) };
+        // A second model must exist too (checked before any call): another model of the third family.
+        var h = new Harness
+        {
+            Models = ReviewPanelModels.Uniform(["gpt-5.5", "claude-opus-5", "gemini-3.1-pro-preview"],
+                [.. ReviewPanelModels.DefaultConfirmers, "gemini-3-flash-preview"]),
+        };
 
         var outcome = await h.Run(["claude-sonnet-4-5", "gpt-5.6-luna"]);
 
@@ -578,6 +583,21 @@ public class GatePipelineTests
         Assert.Equal("factory/prompts/security.md", h.Reviewer.Requests.Single(r => r.Role == ReviewRoles.Security).Prompt.Path);
         var verdict = (await h.Verdicts()).Single();
         Assert.Equal([".github/workflows/ci.yml (CI and repository automation)"], verdict.RiskyPaths);
+        Assert.Equal(ReviewRoles.All, verdict.Reviews.Select(r => r.Role));
+    }
+
+    [Fact]
+    public async Task A_non_empty_diff_whose_paths_cannot_be_read_counts_as_risky_and_gets_the_security_review()
+    {
+        var h = new Harness();
+        h.GitHub.Diff = head => $"@@ -1 +1 @@\n-old\n+change at {head}\n"; // no diff --git, ---/+++ or rename header
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(ReviewRoles.All, h.Reviewer.Requests.Select(r => r.Role));
+        var verdict = (await h.Verdicts()).Single();
+        Assert.Equal([RiskyPaths.Unparsed], verdict.RiskyPaths);
         Assert.Equal(ReviewRoles.All, verdict.Reviews.Select(r => r.Role));
     }
 
@@ -657,6 +677,7 @@ public class GatePipelineTests
 
         Assert.Equal(WorkState.Escalated, outcome.State);
         Assert.Contains("a blocking finding cannot be confirmed; set Review:Confirm:Models", outcome.Error);
+        Assert.Empty(h.Reviewer.Requests); // checked before the first call: no review is spent
         Assert.Empty(h.Reviewer.Confirms);
         Assert.Empty(h.Merges);
     }

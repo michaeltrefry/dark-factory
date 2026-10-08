@@ -2,6 +2,7 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
 
@@ -243,6 +244,15 @@ public sealed class RouterReviewer(HttpClient http, string routerKey) : IReviewe
 
     private static string Cut(string s, int max) => s.Length > max ? s[..max] : s;
 
+    private static readonly Regex FenceCloser = new(@"<\s*/\s*(story|files|diff|finding)\s*>", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// Text written by others (the story, the repository's paths, the diff, a reviewer's finding) with every closing tag of
+    /// the prompt's data blocks neutralised (<c>&lt;/diff&gt;</c> becomes <c>&lt;\/diff&gt;</c>), so it cannot end its block
+    /// early and put text outside the "data written by others" fence the prompts rely on.
+    /// </summary>
+    public static string Fenced(string? text) => FenceCloser.Replace(text ?? "", m => $"<\\/{m.Groups[1].Value}>");
+
     public static string BuildPrompt(ReviewRequest request) =>
         Context(request.Story, request.Repo, request.Pull, request.Files, request.Diff);
 
@@ -252,9 +262,9 @@ public sealed class RouterReviewer(HttpClient http, string routerKey) : IReviewe
 
         The {request.Role} reviewer's blocking finding:
         <finding>
-        Title: {request.Finding.Title}
-        Where: {request.Finding.File ?? "(no file named)"}{(request.Finding.Line is { } line ? $":{line}" : "")}
-        Detail: {request.Finding.Detail}
+        Title: {Fenced(request.Finding.Title)}
+        Where: {Fenced(request.Finding.File ?? "(no file named)")}{(request.Finding.Line is { } line ? $":{line}" : "")}
+        Detail: {Fenced(request.Finding.Detail)}
         </finding>
         """;
 
@@ -265,21 +275,21 @@ public sealed class RouterReviewer(HttpClient http, string routerKey) : IReviewe
         return $"""
             Repository: {repo}
             Pull request: {pull.HtmlUrl} (head {pull.HeadSha}, base {pull.BaseRef})
-            Shortcut story {Shortcut.StoryId.Format(story.Id)} ({story.StoryType}): {story.Name}
+            Shortcut story {Shortcut.StoryId.Format(story.Id)} ({story.StoryType}): {Fenced(story.Name)}
 
             Story description:
             <story>
-            {story.Description}
+            {Fenced(story.Description)}
             </story>
 
             Files in the repository at the base commit ({shown.Count}{(cut ? ", list cut short" : "")}):
             <files>
-            {string.Join('\n', shown)}
+            {Fenced(string.Join('\n', shown))}
             </files>
 
             The change (unified diff of the head commit against its base):
             <diff>
-            {diff}
+            {Fenced(diff)}
             </diff>
             """;
     }

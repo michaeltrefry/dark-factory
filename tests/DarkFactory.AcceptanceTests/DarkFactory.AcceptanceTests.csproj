@@ -13,6 +13,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The seeded review diffs, shared with the unit tests' fake-router test (ReviewSeedTests). -->
+    <None Include="../DarkFactory.Orchestrator.Tests/Fixtures/review/*.diff" Link="Fixtures/review/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="../../src/DarkFactory.Orchestrator/DarkFactory.Orchestrator.csproj" />
   </ItemGroup>
 

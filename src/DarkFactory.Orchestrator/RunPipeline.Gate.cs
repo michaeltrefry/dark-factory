@@ -101,10 +101,16 @@ public sealed partial class RunPipeline
         ReviewerChoice.ImplementerFamilies(implementer); // an unknown implementer escalates before any call
         var diff = await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
         var files = await Gate.GitHub.GetFilesAsync(run.Repo, pull.BaseSha, ct);
-        var risky = RiskyPaths.Touched(DiffPaths.Of(diff));
+        var risky = RiskyPaths.Touched(DiffPaths.Of(diff), diff);
         var roles = ReviewRoles.Required(risky.Count > 0);
-        // Every role's model is chosen before the first call: a role with no eligible family escalates without spending any.
+        // Every role's model, and a second model for its findings, is chosen before the first call: a role with no eligible
+        // family, or no eligible second model, escalates without spending any. (The second model is chosen again for each
+        // blocking finding, then also excluding the model the router said served the review.)
         var models = roles.ToDictionary(r => r, r => ReviewerChoice.Choose(Gate.Models.For(r), implementer, $"Review:{ReviewRoles.ConfigName(r)}:Models"));
+        foreach (var role in roles)
+        {
+            ReviewerChoice.ChooseConfirmer(Gate.Models.Confirm, implementer, [models[role]]);
+        }
         log.WriteLine($"[review] {pull.HtmlUrl} head {Ci.Short(pull.HeadSha)}: {string.Join(", ", roles.Select(r => $"{r} by {models[r]}"))}"
             + (risky.Count > 0 ? $" (risky: {string.Join(", ", risky)})" : ""));
 
