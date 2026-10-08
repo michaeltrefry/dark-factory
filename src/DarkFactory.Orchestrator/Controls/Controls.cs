@@ -1,5 +1,5 @@
 using DarkFactory.Orchestrator.Ledger;
-using DarkFactory.Orchestrator.Shortcut;
+using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
 
 namespace DarkFactory.Orchestrator.Controls;
@@ -20,7 +20,7 @@ public enum ControlState
     Stopping,
 }
 
-/// <summary>Control scopes: <c>factory</c>, <c>usage</c>, <c>epic:&lt;id&gt;</c>, <c>item:sc-&lt;id&gt;</c>.</summary>
+/// <summary>Control scopes: <c>factory</c>, <c>usage</c>, <c>epic:&lt;id&gt;</c>, <c>item:sc-&lt;id&gt;</c> or <c>item:gh-&lt;key&gt;</c>.</summary>
 public static class ControlScope
 {
     public const string Factory = "factory";
@@ -37,16 +37,19 @@ public static class ControlScope
 
     public static string Item(string externalId) => $"item:{externalId}";
 
-    /// <summary>The story id of an item scope, or null for another scope.</summary>
-    public static int? ItemStory(string scope) =>
-        scope.StartsWith("item:", StringComparison.Ordinal) && StoryId.TryParse(scope["item:".Length..], out var id) ? id : null;
+    /// <summary>The Shortcut story id of an item scope, or null for another scope (or another source's item).</summary>
+    public static int? ItemStory(string scope) => ItemOf(scope) is { } item && item.Naming == ItemNaming.Shortcut ? item.Id : null;
+
+    /// <summary>The item of an item scope (<c>item:sc-12</c>, <c>item:gh-3</c>), or null for another scope.</summary>
+    public static ItemRef? ItemOf(string scope) =>
+        scope.StartsWith("item:", StringComparison.Ordinal) ? ItemNaming.ParseAny(scope["item:".Length..]) : null;
 
     /// <summary>The epic id of an epic scope, or null for another scope.</summary>
     public static long? EpicOf(string scope) =>
         scope.StartsWith("epic:", StringComparison.Ordinal) && long.TryParse(scope["epic:".Length..], out var id) && id > 0 ? id : null;
 
     /// <summary>Whether <paramref name="scope"/> is a well-formed scope.</summary>
-    public static bool IsValid(string scope) => scope == Factory || scope == Usage || ItemStory(scope) is not null || EpicOf(scope) is not null;
+    public static bool IsValid(string scope) => scope == Factory || scope == Usage || ItemOf(scope) is not null || EpicOf(scope) is not null;
 }
 
 /// <summary>The factory-wide usage pause (<see cref="ControlScope.Usage"/>): its reasons and backoff.</summary>
@@ -214,9 +217,9 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
     {
         if (!ControlScope.IsValid(scope))
         {
-            throw new ArgumentException($"'{scope}' is not a control scope (factory, usage, epic:<id> or item:sc-<id>).", nameof(scope));
+            throw new ArgumentException($"'{scope}' is not a control scope (factory, usage, epic:<id>, item:sc-<id> or item:gh-<key>).", nameof(scope));
         }
-        if (state == ControlState.Stopping && ControlScope.ItemStory(scope) is null)
+        if (state == ControlState.Stopping && ControlScope.ItemOf(scope) is null)
         {
             throw new ArgumentException("Only an item is stopped through its control; stop an epic or the factory item by item.", nameof(state));
         }

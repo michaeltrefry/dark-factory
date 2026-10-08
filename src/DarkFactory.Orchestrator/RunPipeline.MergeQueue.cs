@@ -66,7 +66,7 @@ public sealed partial class RunPipeline
                 await ledger.CheckpointAsync(run.Item, Steps.Queued, null, pull.HeadSha, ct);
             }
             var queue = new List<MergeQueue.Entry>();
-            foreach (var (item, history) in await ledger.ItemsOnRepoAsync(Source, run.Item.Repo, QueueStates, ct))
+            foreach (var (item, history) in await ledger.ItemsOnRepoAsync(null, run.Item.Repo, QueueStates, ct))
             {
                 if (MergeQueue.EntryOf(item, history, Steps.Queued, Steps.QueueTurn) is { } entry
                     && (item.Id == run.Item.Id || !await HeldIdleByControlAsync(item, ct)))
@@ -260,7 +260,7 @@ public sealed partial class RunPipeline
     private async Task<UpdateOutcome> UpdateFromBaseAsync(Run run, PullFacts pull, CancellationToken ct)
     {
         var (_, repo, item) = run;
-        var workspace = await workspaces.RestoreAsync(repo, StoryId.BranchName(run.Story.Id), ct);
+        var workspace = await workspaces.RestoreAsync(repo, run.Story.Kind.BranchName(run.Story.Id), ct);
         run.Workspace = workspace;
         try
         {
@@ -491,7 +491,7 @@ public sealed partial class RunPipeline
         await RunFixRoundAsync(run, history, round, fixedHead, $"conflicts with the base in {string.Join(", ", found?.Files ?? [])}",
             _ => Task.FromResult(BuildConflictFixPrompt(spec, repo, round, merged!)),
             BuildConflictFixResumePrompt(spec.Story, round),
-            $"{StoryId.Format(spec.Story.Id)}: merge the base and resolve its conflicts (round {round})", WorkState.Review, $"conflict fix round {round}", ct,
+            $"{spec.Story.Ref}: merge the base and resolve its conflicts (round {round})", WorkState.Review, $"conflict fix round {round}", ct,
             prepare: async (workspace, c) =>
             {
                 var merge = await workspaces.MergeBaseAsync(repo, workspace, c);
@@ -522,7 +522,7 @@ public sealed partial class RunPipeline
             : "(none: the base now merges cleanly; check that the merged branch still builds and its tests pass)";
         return $"""
             You are a Dark Factory worker. The current directory is a git worktree of {repo} on the pull request branch that
-            implements Shortcut story {StoryId.Format(story.Id)} ({story.StoryType}): {story.Name}
+            implements {story.Kind.Noun} {story.Ref} ({story.StoryType}): {story.Name}
 
             Story description:
             {story.Description}
@@ -542,7 +542,7 @@ public sealed partial class RunPipeline
 
     public static string BuildConflictFixResumePrompt(WorkStory story, int round) =>
         $"""
-        You were interrupted while resolving the merge conflicts of Shortcut story {StoryId.Format(story.Id)} (fix round {round}).
+        You were interrupted while resolving the merge conflicts of {story.Kind.Noun} {story.Ref} (fix round {round}).
         Check the current state of the worktree and finish resolving the conflicts as originally instructed.
         """;
 }

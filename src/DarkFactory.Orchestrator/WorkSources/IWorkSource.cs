@@ -1,7 +1,18 @@
 namespace DarkFactory.Orchestrator.WorkSources;
 
-/// <summary>One work item (a Shortcut story) as the orchestrator sees it.</summary>
-public sealed record WorkStory(int Id, string Name, string? Description, string StoryType, string AppUrl);
+/// <summary>One work item (a Shortcut story, or a triaged GitHub issue) as the orchestrator sees it.</summary>
+/// <param name="Naming">The item's source naming; null is a Shortcut story.</param>
+/// <param name="Closes">
+/// The issue the item's PR closes on merge, as GitHub's closing keyword takes it (<c>owner/name#12</c>); null for none.
+/// </param>
+public sealed record WorkStory(int Id, string Name, string? Description, string StoryType, string AppUrl, ItemNaming? Naming = null,
+    string? Closes = null)
+{
+    public ItemNaming Kind => Naming ?? ItemNaming.Shortcut;
+
+    /// <summary>The item's external id, e.g. <c>sc-12</c>.</summary>
+    public string Ref => Kind.Format(Id);
+}
 
 public sealed record WorkEpic(int Id, string Name, string? Description, string AppUrl);
 
@@ -40,6 +51,9 @@ public sealed record ChildItem(string Name, string Description, string StoryType
 /// </summary>
 public interface IWorkSource
 {
+    /// <summary>How this source's items are named in the ledger and on git (default: Shortcut stories).</summary>
+    ItemNaming Naming => ItemNaming.Shortcut;
+
     /// <summary>Items ready for the factory, inside the configured watch scope; never items another claimant holds.</summary>
     Task<IReadOnlyList<int>> ListReadyAsync(CancellationToken ct);
 

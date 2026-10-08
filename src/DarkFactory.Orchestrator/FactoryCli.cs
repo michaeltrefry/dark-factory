@@ -9,37 +9,37 @@ public static class FactoryCli
     public const int DefaultSetupPort = 47821;
 
     public static RootCommand Build(
-        Func<int, bool, CancellationToken, Task<int>> run,
+        Func<WorkSources.ItemRef, bool, CancellationToken, Task<int>> run,
         Func<string, int, bool, CancellationToken, Task<int>> setupGitHubApp,
         Func<RepoRef, CancellationToken, Task<int>> protectRepo,
         Func<CancellationToken, Task<int>> work,
         Func<CancellationToken, Task<int>> setDashboardPassword,
         Func<string, string, CancellationToken, Task<int>> control)
     {
-        var storyArgument = new Argument<int>("story-id")
+        var storyArgument = new Argument<WorkSources.ItemRef?>("story-id")
         {
-            Description = "Shortcut story id, e.g. sc-1234 or 1234",
+            Description = "Shortcut story id, e.g. sc-1234 or 1234, or a GitHub issue's work item, e.g. gh-12",
             CustomParser = result =>
             {
                 var token = result.Tokens.Single().Value;
-                if (StoryId.TryParse(token, out var id))
+                if (WorkSources.ItemNaming.ParseAny(token) is { } item)
                 {
-                    return id;
+                    return item;
                 }
-                result.AddError($"'{token}' is not a Shortcut story id (expected sc-<number> or <number>).");
-                return 0;
+                result.AddError($"'{token}' is not a work item id (expected sc-<number>, <number> or gh-<number>).");
+                return null;
             },
         };
         var ignoreScopeOption = new Option<bool>("--ignore-scope")
         {
             Description = "Claim and resume the story even if it is outside the Shortcut watch scope (the other claim checks still apply)",
         };
-        var runCommand = new Command("run", "Run one Shortcut story through Intake → Implement → Review → CI → MergeGate → Merge, resuming from its last ledger state.")
+        var runCommand = new Command("run", "Run one work item (a Shortcut story, or a released GitHub issue) through Intake → Implement → Review → CI → MergeGate → Merge, resuming from its last ledger state.")
         {
             storyArgument,
             ignoreScopeOption,
         };
-        runCommand.SetAction((parse, ct) => run(parse.GetValue(storyArgument), parse.GetValue(ignoreScopeOption), ct));
+        runCommand.SetAction((parse, ct) => run(parse.GetValue(storyArgument)!, parse.GetValue(ignoreScopeOption), ct));
 
         var nameOption = new Option<string>("--name")
         {
@@ -115,17 +115,17 @@ public static class FactoryCli
     /// <summary><c>factory &lt;action&gt; --item sc-N | --epic N | --factory</c>; the handler gets the action and the control scope.</summary>
     private static Command ControlCommand(string action, string description, Func<string, string, CancellationToken, Task<int>> control)
     {
-        var item = new Option<int?>("--item")
+        var item = new Option<WorkSources.ItemRef?>("--item")
         {
-            Description = "One Shortcut story, e.g. sc-1234",
+            Description = "One work item: a Shortcut story, e.g. sc-1234, or a GitHub issue's, e.g. gh-12",
             CustomParser = result =>
             {
                 var token = result.Tokens.Single().Value;
-                if (StoryId.TryParse(token, out var id))
+                if (WorkSources.ItemNaming.ParseAny(token) is { } parsed)
                 {
-                    return id;
+                    return parsed;
                 }
-                result.AddError($"'{token}' is not a Shortcut story id (expected sc-<number> or <number>).");
+                result.AddError($"'{token}' is not a work item id (expected sc-<number>, <number> or gh-<number>).");
                 return null;
             },
         };
@@ -154,7 +154,7 @@ public static class FactoryCli
         });
         command.SetAction((parse, ct) =>
         {
-            var scope = parse.GetValue(item) is { } story ? Controls.ControlScope.Item(StoryId.Format(story))
+            var scope = parse.GetValue(item) is { } story ? Controls.ControlScope.Item(story.ToString())
                 : parse.GetValue(epic) is { } epicId ? Controls.ControlScope.Epic(epicId)
                 : parse.GetValue(usage) ? Controls.ControlScope.Usage
                 : Controls.ControlScope.Factory;

@@ -578,6 +578,6 @@ public class ControlTests
         // Refused before the ledger is opened, so no database is needed.
         var controls = new LedgerControls(null!, TimeProvider.System);
         var ex = await Assert.ThrowsAsync<ArgumentException>(() => controls.SetAsync("everything", ControlState.Paused, "tester", CancellationToken.None));
-        Assert.Contains("(factory, usage, epic:<id> or item:sc-<id>)", ex.Message);
+        Assert.Contains("(factory, usage, epic:<id>, item:sc-<id> or item:gh-<key>)", ex.Message);
     }
 }

@@ -36,9 +36,12 @@ public interface IItemRunner
 /// (<see cref="FactoryUnavailableException"/>, a ledger database error, or the poll itself) ends the poll and escalates
 /// nothing; any other failure counts against its item, and after <see cref="IntakeOptions.MaxItemFailures"/> in a row
 /// the loop gives up on the item (<see cref="IItemRunner.GiveUpAsync"/>) instead of retrying it every poll.
+/// <paramref name="moreLanes"/> adds work sources after the first (GitHub issues, sc-25385), polled in turn by the same loop, so
+/// their runs never overlap; a source whose listing fails is skipped for that poll without holding up the others. Items are
+/// keyed by their external id (<c>sc-12</c>, <c>gh-3</c>) on the dashboard.
 /// </summary>
 public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOptions options, TimeProvider time, ILogger<IntakeLoop> logger,
-    Controls.IControls? controls = null, Router.UsageMonitor? usage = null, IntakeStatus? status = null)
+    Controls.IControls? controls = null, Router.UsageMonitor? usage = null, IntakeStatus? status = null, IReadOnlyList<IntakeLane>? moreLanes = null)
     : BackgroundService
 {
     private readonly IntakeStatus _status = status ?? new IntakeStatus(time);
@@ -96,20 +99,20 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
     /// <summary>One poll: resume in-flight items first, then run newly ready ones. Returns when a usage pause in effect lifts, if one is.</summary>
     public async Task<DateTimeOffset?> PollOnceAsync(CancellationToken ct)
     {
-        IReadOnlyList<int> inFlight, ready;
+        IReadOnlyList<IntakeLane> lanes = [new IntakeLane(source, runner), .. moreLanes ?? []];
+        var work = new List<(IntakeLane Lane, IReadOnlyList<int> Ids)>();
         DateTimeOffset? resumeAt = null;
+        bool factoryPaused;
         try
         {
             if (usage is not null)
             {
                 await usage.CheckAsync(ct);
             }
-            inFlight = await runner.InFlightAsync(ct);
             var usagePause = controls is null ? null : await controls.UsagePauseAsync(ct);
             resumeAt = usagePause?.ResumeAt;
-            var factoryPaused = usagePause is not null || (controls is not null
+            factoryPaused = usagePause is not null || (controls is not null
                 && (await controls.GetAsync(Controls.ControlScope.Factory, ct))?.State == Controls.ControlState.Paused);
-            ready = factoryPaused ? [] : await source.ListReadyAsync(ct);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
@@ -118,29 +121,58 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
             return resumeAt;
         }
         var factoryFailed = false;
-        foreach (var id in inFlight.Concat(ready).Distinct())
+        foreach (var lane in lanes)
         {
             try
             {
-                var outcome = await runner.RunAsync(id, ct);
-                logger.LogInformation("{Item}: {State}{Error}", id, outcome.State, outcome.Error is null ? "" : $" ({outcome.Error})");
-                _status.ItemOk(id);
-            }
-            catch (Exception ex) when (!ct.IsCancellationRequested && IsFactoryWide(ex))
-            {
-                // Every other item would fail the same way: show it once, escalate nothing, try again next poll.
-                logger.LogError(ex, "Run of {Item} failed for a factory-wide reason; ending this poll", id);
-                _status.FactoryFailed($"{StoryId.Format(id)} could not run: {ex.Message}");
-                factoryFailed = true;
-                break;
+                var inFlight = await lane.Runner.InFlightAsync(ct);
+                IReadOnlyList<int> ready = [];
+                if (!factoryPaused)
+                {
+                    // E.g. GitHub issues: triage new issues and record approvals, so the items they release are listed below.
+                    if (lane.Prepare is not null)
+                    {
+                        await lane.Prepare(ct);
+                    }
+                    ready = await lane.Source.ListReadyAsync(ct);
+                }
+                work.Add((lane, inFlight.Concat(ready).Distinct().ToList()));
             }
             catch (Exception ex) when (!ct.IsCancellationRequested)
             {
-                logger.LogError(ex, "Run of {Item} failed", id);
-                var failures = _status.ItemFailed(id, $"{ex.GetType().Name}: {ex.Message}");
-                if (failures == options.MaxItemFailures)
+                // One source failing to list (its board down) does not hold up another's items.
+                logger.LogError(ex, "Poll of {Source} failed; retrying next interval", lane.Source.Naming.Source);
+                _status.FactoryFailed($"Poll failed: {ex.Message}");
+                factoryFailed = true;
+            }
+        }
+        var runsFailed = false;
+        foreach (var (lane, ids) in work)
+        {
+            foreach (var id in ids.TakeWhile(_ => !runsFailed))
+            {
+                var name = lane.Source.Naming.Format(id);
+                try
                 {
-                    await GiveUpAsync(id, $"{failures} runs in a row failed before the pipeline could start; last error: {ex.GetType().Name}: {ex.Message}", ct);
+                    var outcome = await lane.Runner.RunAsync(id, ct);
+                    logger.LogInformation("{Item}: {State}{Error}", name, outcome.State, outcome.Error is null ? "" : $" ({outcome.Error})");
+                    _status.ItemOk(name);
+                }
+                catch (Exception ex) when (!ct.IsCancellationRequested && IsFactoryWide(ex))
+                {
+                    // Every other item would fail the same way: show it once, escalate nothing, try again next poll.
+                    logger.LogError(ex, "Run of {Item} failed for a factory-wide reason; ending this poll", name);
+                    _status.FactoryFailed($"{name} could not run: {ex.Message}");
+                    factoryFailed = runsFailed = true;
+                }
+                catch (Exception ex) when (!ct.IsCancellationRequested)
+                {
+                    logger.LogError(ex, "Run of {Item} failed", name);
+                    var failures = _status.ItemFailed(name, $"{ex.GetType().Name}: {ex.Message}");
+                    if (failures == options.MaxItemFailures)
+                    {
+                        await GiveUpAsync(lane, id, $"{failures} runs in a row failed before the pipeline could start; last error: {ex.GetType().Name}: {ex.Message}", ct);
+                    }
                 }
             }
         }
@@ -160,23 +192,31 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
         }
     }
 
-    private async Task GiveUpAsync(int id, string reason, CancellationToken ct)
+    private async Task GiveUpAsync(IntakeLane lane, int id, string reason, CancellationToken ct)
     {
+        var name = lane.Source.Naming.Format(id);
         try
         {
-            if (await runner.GiveUpAsync(id, reason, ct) is { } what)
+            if (await lane.Runner.GiveUpAsync(id, reason, ct) is { } what)
             {
-                logger.LogWarning("{Item}: gave up after repeated failures ({What})", id, what);
-                _status.ItemGaveUp(id, what);
+                logger.LogWarning("{Item}: gave up after repeated failures ({What})", name, what);
+                _status.ItemGaveUp(name, what);
             }
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             // Shown on the dashboard still; the next streak of failures tries again.
-            logger.LogError(ex, "Could not give up on {Item}", id);
+            logger.LogError(ex, "Could not give up on {Item}", name);
         }
     }
 }
+
+/// <summary>
+/// One work source the intake loop polls, with the runner of its items. <paramref name="Prepare"/>, when set, runs before each
+/// listing while the factory is not paused (GitHub issues: <see cref="Issues.IssueIntake.PollAsync"/> triages new issues
+/// and records approvals, releasing the items the listing then returns).
+/// </summary>
+public sealed record IntakeLane(IWorkSource Source, IItemRunner Runner, Func<CancellationToken, Task>? Prepare = null);
 
 /// <param name="MaxItemFailures"><c>Intake:MaxItemFailures</c>: runs of one item in a row that may fail before the loop gives up on it.</param>
 public sealed record IntakeOptions(TimeSpan PollInterval, int MaxItemFailures = IntakeOptions.DefaultMaxItemFailures)
@@ -202,12 +242,28 @@ public static class IntakeServiceCollectionExtensions
         services.AddSingleton<IWorkSource>(_ =>
             FactoryRunner.CreateWorkSource(options, new HttpClient { BaseAddress = Shortcut.ShortcutWorkSource.DefaultBaseAddress }));
         services.AddSingleton<IItemRunner>(sp => new FactoryItemRunner(options, sp.GetRequiredService<IWorkSource>(), Console.Out));
+        // GitHub issues (sc-25385): a second source, registered by its own type so IWorkSource stays the Shortcut board.
+        var issueRepos = options.WatchedIssueRepos;
+        if (issueRepos.Count > 0)
+        {
+            services.AddSingleton(_ => FactoryRunner.CreateIssueSource(options, new HttpClient { BaseAddress = GitHub.GitHubApp.DefaultBaseAddress }));
+        }
         // The dashboard's Stop finishes a stop itself when no run holds the item.
-        services.AddSingleton<Controls.IItemStops>(sp => new FactoryItemStops(options, sp.GetRequiredService<IWorkSource>(), Console.Out));
-        services.AddHostedService(sp => new IntakeLoop(
-            sp.GetRequiredService<IWorkSource>(), sp.GetRequiredService<IItemRunner>(), sp.GetRequiredService<IntakeOptions>(),
-            sp.GetRequiredService<TimeProvider>(), sp.GetRequiredService<ILogger<IntakeLoop>>(), sp.GetRequiredService<Controls.IControls>(),
-            sp.GetRequiredService<Router.UsageMonitor>(), sp.GetRequiredService<IntakeStatus>()));
+        services.AddSingleton<Controls.IItemStops>(sp => new FactoryItemStops(options, sp.GetRequiredService<IWorkSource>(), Console.Out,
+            sp.GetService<Issues.GitHubIssueWorkSource>()));
+        services.AddHostedService(sp =>
+        {
+            // One loop polls both sources in turn, so a triage and an item run never hold the single-tenant worker sandbox at once.
+            var issues = sp.GetService<Issues.GitHubIssueWorkSource>();
+            var status = sp.GetRequiredService<IntakeStatus>();
+            IReadOnlyList<IntakeLane> lanes = issues is null
+                ? []
+                : [new IntakeLane(issues, new FactoryItemRunner(options, issues, Console.Out), ct => FactoryRunner.PollIssuesAsync(options, status, Console.Out, ct))];
+            return new IntakeLoop(
+                sp.GetRequiredService<IWorkSource>(), sp.GetRequiredService<IItemRunner>(), sp.GetRequiredService<IntakeOptions>(),
+                sp.GetRequiredService<TimeProvider>(), sp.GetRequiredService<ILogger<IntakeLoop>>(), sp.GetRequiredService<Controls.IControls>(),
+                sp.GetRequiredService<Router.UsageMonitor>(), status, lanes);
+        });
         return services;
     }
 }

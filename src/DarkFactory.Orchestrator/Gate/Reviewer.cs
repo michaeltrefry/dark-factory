@@ -262,7 +262,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey) : IReviewe
         return $"""
             Repository: {repo}
             Pull request: {pull.HtmlUrl} (head {pull.HeadSha}, base {pull.BaseRef})
-            Shortcut story {Shortcut.StoryId.Format(story.Id)} ({story.StoryType}): {Fenced(story.Name)}
+            {story.Kind.Noun} {story.Ref} ({story.StoryType}): {Fenced(story.Name)}
 
             Story description:
             <story>

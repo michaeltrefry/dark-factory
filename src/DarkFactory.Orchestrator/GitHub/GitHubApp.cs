@@ -30,6 +30,9 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
     /// <summary>Longest installation-token lifetime the factory accepts (GitHub issues 1-hour tokens).</summary>
     public static readonly TimeSpan MaxTokenLifetime = TimeSpan.FromHours(1);
 
+    /// <summary>The App's id: what GitHub reports as <c>performed_via_github_app.id</c> on what its tokens wrote.</summary>
+    public string AppId => appId;
+
     // Tolerates clock drift between this Mac and GitHub when checking expires_at.
     private static readonly TimeSpan ClockSkew = TimeSpan.FromMinutes(5);
 

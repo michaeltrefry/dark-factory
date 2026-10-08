@@ -22,8 +22,8 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
     /// </summary>
     public async Task<ControlResult> StopAsync(int storyId, CancellationToken ct)
     {
-        var id = StoryId.Format(storyId);
-        if (await ledger.FindAsync(RunPipeline.Source, id, ct) is not { } item)
+        var id = source.Naming.Format(storyId);
+        if (await ledger.FindAsync(source.Naming.Source, id, ct) is not { } item)
         {
             await controls.ClearAsync(ControlScope.Item(id), ct);
             return new ControlResult(true, $"{id} is not in the factory ledger; nothing to stop.");
@@ -46,7 +46,7 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
     /// <summary>Stops the item. The caller holds its run lock and its worker is not running.</summary>
     public async Task<string> StopLockedAsync(WorkItem item, int storyId, CancellationToken ct)
     {
-        var id = StoryId.Format(storyId);
+        var id = source.Naming.Format(storyId);
         var scope = ControlScope.Item(item.ExternalId);
         if (Lifecycle.IsTerminal(item.State))
         {
@@ -57,7 +57,7 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
         var history = await ledger.HistoryAsync(item, ct);
         var steps = history.Skip(history.FindLastIndex(e => e.Step is null) + 1).ToList();
         var session = history.LastOrDefault(e => e.ClaudeSessionId is not null)?.ClaudeSessionId;
-        var branch = StoryId.BranchName(storyId);
+        var branch = source.Naming.BranchName(storyId);
 
         var drafted = steps.LastOrDefault(e => e.Step == RunPipeline.Steps.PrsDrafted)?.Detail;
         if (drafted is null)
@@ -70,13 +70,13 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
         {
             var prs = drafted == "none" ? "It had no open pull request." : $"Its pull request ({drafted}) is a draft again.";
             await source.ReportStateAsync(storyId, BoardState.Stopped,
-                $"{WorkSourceComments.Author} {id} was stopped by {by}: the factory cancelled its work on it (was {item.State}) and released it to the Backlog. "
+                $"{WorkSourceComments.Author} {id} was stopped by {by}: the factory cancelled its work on it (was {item.State}) and released its claim. "
                 + $"{prs} Branch {branch} is kept; nothing was merged or deleted.", ct);
             await ledger.CheckpointAsync(item, RunPipeline.Steps.StopReported, session, by, ct);
         }
         await ledger.RecordAsync(item, WorkState.Cancelled, session, $"stopped by {by}", ct);
         await controls.ClearAsync(scope, ct);
         log.WriteLine($"[cancelled] {id} stopped by {by}; PRs drafted: {drafted}");
-        return $"{id} stopped: Cancelled, PRs drafted: {drafted}, story back in the Backlog.";
+        return $"{id} stopped: Cancelled, PRs drafted: {drafted}, claim released.";
     }
 }

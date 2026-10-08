@@ -26,11 +26,11 @@ static async Task<int> ControlAsync(string action, string scope, CancellationTok
     }
 }
 
-static async Task<int> RunAsync(int storyId, bool ignoreScope, CancellationToken ct)
+static async Task<int> RunAsync(ItemRef item, bool ignoreScope, CancellationToken ct)
 {
     var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
     return await FactoryRunner.RunCommandAsync(options, c => CheckRouterEnrollmentAsync(options, c),
-        c => FactoryRunner.RunAsync(options, storyId, ignoreScope, Console.Out, c), Console.Error, ct);
+        c => FactoryRunner.RunAsync(options, item, ignoreScope, Console.Out, c), Console.Error, ct);
 }
 
 static async Task<int> WorkAsync(CancellationToken ct)
@@ -48,6 +48,10 @@ static async Task<int> WorkAsync(CancellationToken ct)
         {
             Console.Error.WriteLine("Watch scope is empty (set Shortcut:Watch:Teams and/or Shortcut:Watch:Epics); nothing will be picked up.");
         }
+        if (options.WatchedIssueRepos.Count == 0)
+        {
+            Console.Error.WriteLine("No GitHub issues are watched (set GitHub:Watch:Repos to triage a repo's issues).");
+        }
     }
     catch (Exception ex) when (ex is MissingCredentialException or ReviewConfigurationException or InvalidOperationException)
     {
@@ -57,6 +61,14 @@ static async Task<int> WorkAsync(CancellationToken ct)
     using (var shortcutHttp = new HttpClient { BaseAddress = ShortcutWorkSource.DefaultBaseAddress })
     {
         if (await FactoryRunner.CheckWatchScopeAsync(options, FactoryRunner.CreateWorkSource(options, shortcutHttp), ct) is { } scopeError)
+        {
+            Console.Error.WriteLine(scopeError);
+            return 2;
+        }
+    }
+    using (var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress })
+    {
+        if (await FactoryRunner.CheckWatchScopeAsync(options, FactoryRunner.CreateIssueSource(options, githubHttp), ct) is { } scopeError)
         {
             Console.Error.WriteLine(scopeError);
             return 2;
