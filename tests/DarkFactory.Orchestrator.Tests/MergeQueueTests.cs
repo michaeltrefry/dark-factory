@@ -657,15 +657,15 @@ public class MergeQueueTests
         var b = await h.Run(B);
 
         Assert.Equal(WorkState.Escalated, b.State);
-        Assert.Contains($"the cap is {Lifecycle.MaxFixRounds}", b.Error);
-        Assert.Contains("conflicts with main", b.Error);
         var transitions = await h.Transitions(B);
+        Assert.DoesNotContain(transitions.Zip(transitions.Skip(1)), p => p is (WorkState.MergeGate, WorkState.Fixing));
         Assert.Equal(Lifecycle.MaxFixRounds, TransitionContext.From(transitions).FixRounds);
         Assert.Equal(Lifecycle.MaxFixRounds, transitions.Count(t => t == WorkState.Fixing));
         Assert.Contains(WorkState.MergeGate, transitions); // the conflict was found at the gate, after the cap was used in review
-        Assert.DoesNotContain(transitions.Zip(transitions.Skip(1)), p => p is (WorkState.MergeGate, WorkState.Fixing));
         var conflict = BaseUpdate.FromDetail((await h.Steps(B, RunPipeline.Steps.MergeConflict)).Single())!;
         Assert.Equal(["src/shared.cs"], conflict.Files);
+        Assert.Contains($"the cap is {Lifecycle.MaxFixRounds}", b.Error);
+        Assert.Contains("conflicts with main", b.Error);
         Assert.Single(h.Repo.Merges); // only A's
     }
 
