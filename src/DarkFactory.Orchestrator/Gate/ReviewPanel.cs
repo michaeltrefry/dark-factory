@@ -81,20 +81,16 @@ public static class ReviewPrompts
 }
 
 /// <summary>
-/// The panel's model lists, each in order of preference. A role reviews with the first of its list whose family the
-/// implementer did not use; a blocking finding is confirmed by the first of <see cref="Confirm"/> that is not the
-/// reviewer's model and not of the implementer's family, preferring one also of a family other than the reviewer's
-/// (<see cref="ReviewerChoice"/>).
+/// The panel's model lists, each in order of preference (<see cref="ReviewerChoice"/>). A role reviews with the first of its
+/// list that is a <see cref="ReviewModels.FloorText"/>; a blocking finding is confirmed by the first Claude model of
+/// <see cref="Confirm"/> that is not the reviewer's model. Which models the implementer used does not matter. There is no
+/// default reviewer: the router's catalog (<c>GET /v1/router/models</c>, read 2026-10-08) offers no Claude Opus 5.5 or
+/// newer, so <c>Review:Models</c> must be set (<see cref="FactoryOptions.ReviewPanel"/>).
 /// </summary>
 public sealed record ReviewPanelModels(IReadOnlyDictionary<string, IReadOnlyList<string>> Roles, IReadOnlyList<string> Confirm)
 {
-    /// <summary>The router's deployed anthropic and openai models: the families the router key is known to serve.</summary>
-    public static readonly IReadOnlyList<string> DefaultReviewers = ["gpt-5.5", "claude-opus-5"];
-
-    /// <summary>Two models per family, so a second model exists whichever family the implementer and reviewer used.</summary>
-    public static readonly IReadOnlyList<string> DefaultConfirmers = ["gpt-5.5", "claude-opus-5", "gpt-5.4-mini", "claude-sonnet-5"];
-
-    public static readonly ReviewPanelModels Default = Uniform(DefaultReviewers, DefaultConfirmers);
+    /// <summary>The Claude models the router's catalog offers (2026-10-08), strongest first; neither is a reviewer's (5.5+) id.</summary>
+    public static readonly IReadOnlyList<string> DefaultConfirmers = ["claude-opus-5", "claude-sonnet-5"];
 
     /// <summary>Every role with the same <paramref name="reviewers"/>.</summary>
     public static ReviewPanelModels Uniform(IReadOnlyList<string> reviewers, IReadOnlyList<string>? confirmers = null) =>
@@ -106,14 +102,13 @@ public sealed record ReviewPanelModels(IReadOnlyDictionary<string, IReadOnlyList
 
 /// <summary>
 /// A second model's answer on one blocking finding. <see cref="Outcome"/>: <c>confirmed</c> (it reproduces from the code),
-/// <c>not-confirmed</c> (the finding is downgraded to optional), or <c>unusable</c> (no clear answer from the pinned family:
+/// <c>not-confirmed</c> (the finding is downgraded to optional), or <c>unusable</c> (no clear answer from the pinned model:
 /// the finding stays blocking, fail-closed).
 /// </summary>
 public sealed record Confirmation(
     [property: JsonPropertyName("outcome")] string Outcome,
     [property: JsonPropertyName("model")] string Model,
     [property: JsonPropertyName("served")] string? ServedModel,
-    [property: JsonPropertyName("family")] string? Family,
     [property: JsonPropertyName("session")] string? Session,
     [property: JsonPropertyName("prompt")] string? Prompt,
     [property: JsonPropertyName("reason")] string Reason)
@@ -151,7 +146,7 @@ public sealed record Finding(
 }
 
 /// <summary>
-/// One panel role's review of one head commit: the model pinned, the model the router said answered and its family, the
+/// One panel role's review of one head commit: the model pinned, the model the router said answered, the
 /// router session, the prompt (path and hash), the findings, and <see cref="Error"/> when the answer was unusable (which
 /// fails the review).
 /// <see cref="CarriedFrom"/>: after a fix round, a role with no blocking finding is not asked again (sc-25380); its review of
@@ -161,7 +156,6 @@ public sealed record RoleReview(
     [property: JsonPropertyName("role")] string Role,
     [property: JsonPropertyName("model")] string Model,
     [property: JsonPropertyName("served")] string? ServedModel,
-    [property: JsonPropertyName("family")] string? Family,
     [property: JsonPropertyName("session")] string? Session,
     [property: JsonPropertyName("prompt")] string? Prompt,
     [property: JsonPropertyName("findings")] IReadOnlyList<Finding> Findings,

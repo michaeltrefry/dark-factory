@@ -36,6 +36,20 @@ internal static class Harness
         }
     }
 
+    /// <summary>Skips naming the missing owner step unless the review panel's models are configured (<c>Review:Models</c>: no default).</summary>
+    public static Orchestrator.Gate.ReviewPanelModels RequireReviewPanel(FactoryOptions? options = null)
+    {
+        try
+        {
+            return (options ?? Options).ReviewPanel;
+        }
+        catch (ReviewConfigurationException ex)
+        {
+            Assert.Skip(ex.Message);
+            throw;
+        }
+    }
+
     public static string RequireEnv(string name, string purpose)
     {
         var value = Environment.GetEnvironmentVariable(name);

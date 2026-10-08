@@ -29,21 +29,8 @@ static async Task<int> ControlAsync(string action, string scope, CancellationTok
 static async Task<int> RunAsync(int storyId, bool ignoreScope, CancellationToken ct)
 {
     var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
-    try
-    {
-        if (await CheckRouterEnrollmentAsync(options, ct) is { } enrollmentError)
-        {
-            Console.Error.WriteLine(enrollmentError);
-            return 2;
-        }
-        var outcome = await FactoryRunner.RunAsync(options, storyId, ignoreScope, Console.Out, ct);
-        return outcome.Succeeded ? 0 : 1;
-    }
-    catch (MissingCredentialException ex)
-    {
-        Console.Error.WriteLine(ex.Message);
-        return 2;
-    }
+    return await FactoryRunner.RunCommandAsync(options, c => CheckRouterEnrollmentAsync(options, c),
+        c => FactoryRunner.RunAsync(options, storyId, ignoreScope, Console.Out, c), Console.Error, ct);
 }
 
 static async Task<int> WorkAsync(CancellationToken ct)
@@ -62,7 +49,7 @@ static async Task<int> WorkAsync(CancellationToken ct)
             Console.Error.WriteLine("Watch scope is empty (set Shortcut:Watch:Teams and/or Shortcut:Watch:Epics); nothing will be picked up.");
         }
     }
-    catch (Exception ex) when (ex is MissingCredentialException or InvalidOperationException)
+    catch (Exception ex) when (ex is MissingCredentialException or ReviewConfigurationException or InvalidOperationException)
     {
         Console.Error.WriteLine(ex.Message);
         return 2;

@@ -75,8 +75,8 @@ public sealed partial class RunPipeline
     /// the diff touches a path whose tier in the base branch's <c>factory/gate.yaml</c> requires it
     /// or that the code floor <see cref="RiskyPaths"/> matches (<see cref="GatePolicy.SecurityReviewReasons"/>; a missing or invalid
     /// policy escalates before any call) — each role pinned through the router to the first of its
-    /// models whose family the implementer did not use, with its prompt file (<see cref="ReviewPrompts"/>). Each blocking
-    /// finding goes to a second model (<see cref="ReviewerChoice.ChooseConfirmer"/>); one it does not confirm is downgraded
+    /// models that is a Claude Opus 5.5 or newer, whichever models the implementer used, with its prompt file (<see cref="ReviewPrompts"/>). Each blocking
+    /// finding goes to a second Claude model, not the reviewer's (<see cref="ReviewerChoice.ChooseConfirmer"/>); one it does not confirm is downgraded
     /// to optional. The verdict (<see cref="ReviewPanel.Decide"/>: deterministic over the findings) is checkpointed bound to
     /// that commit (E3) before it counts; a commit that already has a verdict is not reviewed again. Every call's router
     /// session is named in the ledger (<see cref="Steps.ReviewSession"/>, with its role and prompt hash) before the call, and
@@ -87,7 +87,7 @@ public sealed partial class RunPipeline
     /// → Fixing (a fixer worker gets those findings), unless <see cref="Lifecycle.MaxFixRounds"/> rounds are used: then it
     /// escalates with the open findings listed. Any other fail escalates. The review after a fix round waits for the PR to
     /// show the fixer's push, re-runs only the roles with an open blocking finding (plus any required role it lacks, or one
-    /// whose models' family wrote code since; the others' reviews are carried, <see cref="FixLoop.Carried"/>), then records
+    /// whose models break the panel's rule; the others' reviews are carried, <see cref="FixLoop.Carried"/>), then records
     /// the round's progress check (<see cref="Steps.FixProgress"/>) before deciding.
     /// </summary>
     private async Task ReviewAsync(Run run, CancellationToken ct)
@@ -104,9 +104,16 @@ public sealed partial class RunPipeline
             : verdicts.LastOrDefault(v => v.HeadSha == fix.FixedHead)
               ?? throw new InvalidOperationException($"Fix round {fix.Round} has no verdict on the commit it fixed ({fix.FixedHead}).");
         var verdict = verdicts.LastOrDefault(v => v.HeadSha == pull.HeadSha);
+        if (verdict is not null && MergeGate.Superseded(verdict, verdicts))
+        {
+            // Recorded under an earlier panel rule (e.g. a GPT reviewer before sc-25379): the current panel reviews the head once.
+            log.WriteLine($"[review] {Ci.Short(pull.HeadSha)}: the verdict was recorded under an earlier panel rule "
+                + $"({string.Join("; ", verdict.Reviews.SelectMany(ReviewModels.Problems))}); reviewing it again");
+            verdict = null;
+        }
         if (verdict is null)
         {
-            verdict = await ReviewPanelAsync(run, pull, ImplementerModels(history), previous, ct);
+            verdict = await ReviewPanelAsync(run, pull, previous, ct);
             await ledger.CheckpointAsync(run.Item, Steps.Verdict, null, verdict.ToDetail(), ct);
         }
         log.WriteLine($"[review] {Ci.Short(pull.HeadSha)}: {verdict.Verdict}: {verdict.Summary}");
@@ -282,23 +289,22 @@ public sealed partial class RunPipeline
     /// Runs the panel on <paramref name="pull"/>'s head. With <paramref name="previous"/> (the verdict on the commit a fix
     /// round fixed), only the roles <see cref="FixLoop.Carried"/> does not carry review again.
     /// </summary>
-    private async Task<ReviewVerdict> ReviewPanelAsync(Run run, PullFacts pull, List<string> implementer, ReviewVerdict? previous, CancellationToken ct)
+    private async Task<ReviewVerdict> ReviewPanelAsync(Run run, PullFacts pull, ReviewVerdict? previous, CancellationToken ct)
     {
-        var families = ReviewerChoice.ImplementerFamilies(implementer); // an unknown implementer escalates before any call
         var policy = await PolicyForReviewAsync(run, pull, ct);
         var diff = await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
         var files = await Gate.GitHub.GetFilesAsync(run.Repo, pull.BaseSha, ct);
         var risky = policy.SecurityReviewReasons(policy.Classify(diff));
         var roles = ReviewRoles.Required(risky.Count > 0);
-        var carried = previous is null ? [] : FixLoop.Carried(previous, roles, families);
+        var carried = previous is null ? [] : FixLoop.Carried(previous, roles);
         var toReview = roles.Where(r => carried.All(c => c.Role != r)).ToList();
-        // Every role's model, and a second model for its findings, is chosen before the first call: a role with no eligible
-        // family, or no eligible second model, escalates without spending any. (The second model is chosen again for each
+        // Every role's model, and a second model for its findings, is chosen before the first call: a role with no Claude Opus
+        // 5.5 or newer, or no eligible second model, escalates without spending any. (The second model is chosen again for each
         // blocking finding, then also excluding the model the router said served the review.)
-        var models = toReview.ToDictionary(r => r, r => ReviewerChoice.Choose(Gate.Models.For(r), implementer, $"Review:{ReviewRoles.ConfigName(r)}:Models"));
+        var models = toReview.ToDictionary(r => r, r => ReviewerChoice.Choose(Gate.Models.For(r), $"Review:{ReviewRoles.ConfigName(r)}:Models"));
         foreach (var role in toReview)
         {
-            ReviewerChoice.ChooseConfirmer(Gate.Models.Confirm, implementer, [models[role]]);
+            ReviewerChoice.ChooseConfirmer(Gate.Models.Confirm, [models[role]]);
         }
         log.WriteLine($"[review] {pull.HtmlUrl} head {Ci.Short(pull.HeadSha)}: {string.Join(", ", toReview.Select(r => $"{r} by {models[r]}"))}"
             + (carried.Count > 0 ? $"; carried from {Ci.Short(previous!.HeadSha)}: {string.Join(", ", carried.Select(c => c.Role))}" : "")
@@ -321,7 +327,7 @@ public sealed partial class RunPipeline
                 var findings = new List<Finding>();
                 foreach (var finding in review.Findings)
                 {
-                    findings.Add(finding.IsBlocking ? await ConfirmAsync(run, pull, diff, files, review, finding, implementer, ct) : finding);
+                    findings.Add(finding.IsBlocking ? await ConfirmAsync(run, pull, diff, files, review, finding, ct) : finding);
                 }
                 review = review with { Findings = findings };
             }
@@ -371,7 +377,7 @@ public sealed partial class RunPipeline
     /// key only) — gets the story and only the confirmed blocking findings of the verdict on the commit being fixed (the
     /// Fixing row's Detail), in a worktree restored from the PR branch; its work is committed and pushed to the same
     /// <c>factory/*</c> branch, so the PR's head moves (which voids that verdict, E3). Like Implement, every step is a
-    /// checkpoint (worker pid, session, models — which count as the implementer's for the reviewers' family rule —, done,
+    /// checkpoint (worker pid, session, the models that answered (recorded as <c>implementer-model</c>), done,
     /// the pushed commit), so an interrupted round resumes its session; a lost worktree restarts the round. → Review.
     /// </summary>
     private async Task FixAsync(Run run, CancellationToken ct)
@@ -483,11 +489,10 @@ public sealed partial class RunPipeline
         """;
 
     /// <summary>A second model checks one blocking finding; the finding comes back downgraded when it does not confirm it.</summary>
-    private async Task<Finding> ConfirmAsync(Run run, PullFacts pull, string diff, RepoFiles files, RoleReview review, Finding finding,
-        List<string> implementer, CancellationToken ct)
+    private async Task<Finding> ConfirmAsync(Run run, PullFacts pull, string diff, RepoFiles files, RoleReview review, Finding finding, CancellationToken ct)
     {
         var reviewerModels = new[] { review.Model, review.ServedModel }.OfType<string>().Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        var model = ReviewerChoice.ChooseConfirmer(Gate.Models.Confirm, implementer, reviewerModels);
+        var model = ReviewerChoice.ChooseConfirmer(Gate.Models.Confirm, reviewerModels);
         var prompt = ReviewPrompts.Confirm;
         var session = await NameReviewSessionAsync(run, pull, $"confirm-{review.Role}", model, prompt, ct);
         var confirmation = await RouterCallAsync(() => Gate.Reviewer.ConfirmAsync(
@@ -607,13 +612,13 @@ public sealed partial class RunPipeline
         var ci = await Gate.GitHub.GetCiAsync(run.Repo, pull.HeadSha, ct);
         var newTests = await NewTestsAsync(run, pull, history, policy, diff, ct);
         var decision = MergeGate.Evaluate(policy, policyError, pull, new ChangeFacts(diff, diffError, fixRounds), ci, Verdicts(history),
-            ImplementerModels(history), newTests);
+            newTests);
         await ledger.CheckpointAsync(run.Item, Steps.GateDecision, null, decision.Detail, ct);
         log.WriteLine($"[gate] {decision.Detail}");
         switch (decision.Outcome)
         {
             case GateOutcome.ReviewHead:
-                await ledger.RecordAsync(run.Item, WorkState.Review, null, $"head moved to {pull.HeadSha} after the review; reviewing it again", ct);
+                await ledger.RecordAsync(run.Item, WorkState.Review, null, $"{decision.Reasons[0]}; reviewing {pull.HeadSha} again", ct);
                 return;
             case GateOutcome.Blocked:
                 throw new GateBlockedException($"The merge gate refused {pull.HtmlUrl}: {string.Join("; ", decision.Reasons)}");

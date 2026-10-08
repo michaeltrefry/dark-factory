@@ -13,7 +13,7 @@ Claude Code headless workers through the Weave router.
   dashboard (`Dashboard/`: login, binding, ledger reads, transcript formatting; components in `Dashboard/Components`),
   `IWorkSource` + the `factory work` intake loop (`WorkSources/`; registered on the `factory work` host by `FactoryHost.BuildWork` via `services.AddIntake(options)`)
   and its Shortcut adapter (`Shortcut/ShortcutWorkSource.cs`), the Pause/Continue/Stop controls (`Controls/`), and the
-  review and merge gate (`Gate/`: `ModelFamily`/`ReviewerChoice`, `ReviewPanel` (roles, risky paths, prompts, findings),
+  review and merge gate (`Gate/`: `ReviewModels`/`ReviewerChoice`, `ReviewPanel` (roles, risky paths, prompts, findings),
   `RouterReviewer`, `GatePolicy`, `MergeGate`, the new-tests check `NewTestsCheck`/`XunitNewTests`/`SandboxTestRunner`;
   reviewer prompts in `factory/prompts/`; GitHub side
   `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`).
@@ -58,9 +58,9 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
 | `GitHub:Gate:AppId`, `GitHub:Gate:PrivateKeyPem` | keychain `github-gate-app-id`, `github-gate-app-private-key` (written by `factory github-app setup --gate`): the merge gate's App, the only credential that merges |
-| `Review:Models` | `gpt-5.5,claude-opus-5` (every panel role's reviewer models in order, unless the role sets its own; the first of a family the implementer did not use reviews; each must be of a known family) |
-| `Review:Correctness:Models`, `Review:SpecConformance:Models`, `Review:Security:Models` | `Review:Models` (one panel role's own reviewer models, in order) |
-| `Review:Confirm:Models` | `gpt-5.5,claude-opus-5,gpt-5.4-mini,claude-sonnet-5` (second models that confirm a blocking finding: the first that is not the reviewer's model and of no implementer family, preferring one of a third family) |
+| `Review:Models` | none — must be set: the router catalog (`GET /v1/router/models`, 2026-10-08) has no Claude Opus 5.5 or newer, and the factory refuses to start without one (`ReviewConfigurationException`: `factory run` and `factory work` print the reason and exit 2, before any router call) (every panel role's reviewer models in order, unless the role sets its own; each must be a Claude Opus 5.5 or newer, `ReviewModels.MeetsReviewFloor`: `claude-opus-<major>[-.]<minor>[-yyyymmdd]`, where the dotted and dashed spellings are one model everywhere ids are compared — pinned, served, reviewer vs second model — an older Opus, another Claude or another vendor's model is refused; the first entry reviews, whatever models the implementer used) |
+| `Review:Correctness:Models`, `Review:SpecConformance:Models`, `Review:Security:Models` | `Review:Models` (one panel role's own reviewer models, in order; the same Claude Opus 5.5 or newer rule) |
+| `Review:Confirm:Models` | `claude-opus-5,claude-sonnet-5` (the router catalog's Claude models; second models that confirm a blocking finding: the first Claude model that is not the reviewer's model; a non-Claude entry is refused) |
 | `Review:TimeoutMinutes` | `10` (one reviewer call) |
 | `Gate:CiPollSeconds`, `Gate:CiTimeoutMinutes` | `30`, `30` (CI on the PR head is polled until it finishes; still running at the timeout escalates) |
 | `Gate:TestTimeoutMinutes` | `20` (one sandboxed run — restore, build, the new tests — of the `new-tests-fail-on-base` check; still running at the timeout fails the check) |
@@ -222,13 +222,14 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `SessionBroadcaster` as hub viewers (`ISessionViewers`), so backlog-then-live holds there too. Never log transcript content.
 - Review → CI → MergeGate → Merge (sc-25378; `RunPipeline.Gate.cs`, only in a pipeline built with a `GateStage`, which
   production always is): Implement records every model that answers the implementer (`implementer-model` checkpoints, from
-  each assistant message's `model`). Review is a panel (sc-25379, `Gate/ReviewPanel.cs`): `correctness` and
+  each assistant message's `model`; a record only — the panel does not depend on it). Review is a panel (sc-25379, `Gate/ReviewPanel.cs`): `correctness` and
   `spec-conformance` always, `security` only when the diff touches a path whose tier in the base branch's
   `factory/gate.yaml` lists `security-review` or that the code floor `RiskyPaths` matches (`GatePolicy.SecurityReviewReasons`,
   both recorded in the verdict's risky paths; see the floors under MergeGate below; a missing/invalid policy escalates at
   Review before any call). Each role reviews with the first entry of its own
-  model list (`Review:<Role>:Models`, else `Review:Models`) of a family none of the implementer's is (`ModelFamily`; an
-  unknown implementer model or family, or a role with no eligible model, escalates before any call). Each role makes one
+  model list (`Review:<Role>:Models`, else `Review:Models`) that is a Claude Opus 5.5 or newer (owner decision 2026-10-08:
+  every reviewer and second model is Claude, whichever models the implementer used — there is no cross-family rule;
+  `ReviewModels`/`ReviewerChoice`; a role with no such model escalates before any call). Each role makes one
   router call (`RouterReviewer`: `POST /v1/messages`, router key only, `x-weave-force-model` pin, its own
   `X-Claude-Code-Session-Id` so the pin and the cost stay scoped to it) whose system prompt is the role's prompt file and
   whose message holds the story, the base commit's file list (`IGateGitHub.GetFilesAsync`) and the diff of the PR's head
@@ -236,26 +237,26 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   embedded resources (`ReviewPrompts`) — never read from the target repo or the PR (which could rewrite the prompt it is
   judged by) nor from disk at run time; changing one is a dark-factory PR. Each role answers findings tagged `blocking` or
   `optional` (an unknown severity counts as blocking); each blocking finding goes to a second model (`Review:Confirm:Models`:
-  the first that is not the reviewer's model and of no implementer family, preferring one of a family other than the
-  reviewer's too; none → escalate) with `confirm.md`: not confirmed → downgraded to optional (`downgraded: true`), does not
+  the first Claude model that is not the reviewer's pinned or served model; none → escalate) with `confirm.md`: not confirmed → downgraded to optional (`downgraded: true`), does not
   block; confirmed, or an unusable confirm answer → stays blocking. Every panel call's session id is generated by the
   pipeline and checkpointed (`review-session`: "session model sha role prompt-path@sha256:hash"; role `confirm-<role>` for
   a second model) before the call, so a call that never returns still has a readable cost (E9) and the prompt it used is on
   record; it never goes in a row's `ClaudeSessionId`, which stays the implementer's (outcomes, escalation comments and
   stops read the last one). A Pause/Stop is checked before each panel call. The verdict (`ReviewPanel.Decide`,
   deterministic: pass only when every required role answered cleanly and no finding is blocking after confirmation; it
-  lists the risky paths and every role's model, served model, family, session, prompt and findings) is a `verdict`
-  checkpoint bound to that head SHA. Anything but a clean findings line from the pinned family is an unusable review and a
-  fail (a router answer naming no served model included). Fix loop (sc-25380, `Gate/FixLoop.cs`, `FixAsync`): a fail whose
+  lists the risky paths and every role's model, served model, session, prompt and findings) is a `verdict`
+  checkpoint bound to that head SHA. Anything but a clean findings line from the pinned model is an unusable review and a
+  fail: the router must name the served model and it must be the pinned id or its dated snapshot (`<pinned>-yyyymmdd`,
+  `ReviewModels.Serves`) — a router answer naming no served model, or another model, included. Fix loop (sc-25380, `Gate/FixLoop.cs`, `FixAsync`): a fail whose
   only cause is blocking findings every one of which a second model confirmed (`FixLoop.Fixable`) goes Review → Fixing (row
   Detail = the fixed head); any other fail (an unusable answer, a missing role, an unusable confirmation) escalates. A fix
   round runs a fixer worker exactly like the implementer (same sandbox, router key only, session checkpointed and resumed,
-  its models recorded as `implementer-model` so reviewers stay of another family) in a worktree restored from the PR branch,
+  its models recorded as `implementer-model`) in a worktree restored from the PR branch,
   prompted with the story and only the confirmed blocking findings (fenced); its work is pushed to the same `factory/*`
   branch (`pushed` Detail = the pushed commit, `IRepoWorkspace.HeadAsync`) → Review. That review waits for the PR to show
   exactly that push (any other head — someone else's push — escalates), re-runs only the roles with an open blocking finding
   (plus a required role the fixed head's verdict lacks, e.g.
-  security when the fix touches a path whose tier requires it, or one whose reviewer/second model is now of an implementer family); the
+  security when the fix touches a path whose tier requires it, or one whose models break the panel's rule, `ReviewModels.Problems`); the
   others' reviews are carried into the new head's verdict marked `carried: <sha>` (the gate's merge reason names them). It
   then checkpoints `fix-progress` (`FixProgress`): progress only if the blocking count went down and no check run/status
   (by name, from GitHub's executed results) that passed on the fixed head — or reached no verdict there (`unknown_before`:
@@ -291,7 +292,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   protected > free whose patterns (`PathPattern`: root-anchored, `*`/`?`/`**`, trailing `/` = directory; sealed and
   protected case-insensitive, free case-sensitive, so case only moves a path to a stricter tier) match, else normal; the change
   needs the union of its tiers' checks: `ci-green`, `review-pass` (the head's verdict passes, holds every required role, and
-  every reviewer and second model is of a family none of the implementer's is), `security-review` (the verdict has the
+  every reviewer is a Claude Opus 5.5 or newer and every second model a Claude model other than its reviewer's, each
+  served by the router as pinned — `ReviewModels.Problems`; the implementer's models are not consulted), `security-review` (the verdict has the
   security review), `risk-threshold` (changed lines, files — renames count both paths — and fix rounds within `risk`),
   `new-tests-fail-on-base` (sc-25382, below). A sealed path always escalates (even with no verdict); a protected one escalates after its checks instead of merging; each
   evaluation is a `gate` checkpoint. A head without a verdict (a push after the review) goes back
@@ -340,9 +342,14 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   gate uses it (E5); a recorded non-error result for the same base and head is reused, never re-run. Anything but `pass`
   blocks (`gate_rejected` for the typed outcome). Pause/Stop are watched while the runs execute (polled like a worker's
   watch): either cancels them (the runner stops the sandboxed commands) and records nothing, so Continue runs the check again.
-  Upgrading from Phase 1: Review is now a handled state, so the first `factory work` picks up every item parked at Review
-  and each escalates once with a story comment — "implementer's model is unknown" (Phase 1 recorded no
-  `implementer-model`) or "merged outside the factory" (a PR the owner merged). See docs/acceptance.md.
+  Upgrading from Phase 1: Review is now a handled state, so the first `factory work` picks up every item parked at Review:
+  an open PR is reviewed by the panel like any other (Phase 1's missing `implementer-model` no longer matters, sc-25379),
+  and one the owner merged or closed escalates once with a story comment ("merged outside the factory"). An item whose
+  head already has a verdict recorded under the dropped cross-family rule (e.g. a `gpt-5.5` or `claude-opus-5` reviewer)
+  is reviewed again once by the current panel (`MergeGate.Superseded`: its models break `ReviewModels.Problems` and it is
+  the only verdict on that head — at Review it is not reused; at MergeGate the gate answers ReviewHead when those are its
+  only reasons), then merges as usual; the current panel's own verdict is a second one on the head, so if its models still
+  break the rule the gate escalates instead of reviewing again. See docs/acceptance.md.
 - Processes migrate the ledger through `LedgerMigrations.MigrateAsync` (advisory-locked: EF alone lets two concurrent
   migrators apply the same migration) before reading it; tests migrate their temp database before starting a host.
 - Tests: xunit.v3 on Microsoft.Testing.Platform (`global.json` opts in).

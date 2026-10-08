@@ -12,9 +12,6 @@ namespace DarkFactory.AcceptanceTests;
 /// </summary>
 public class ReviewSeedTests
 {
-    /// <summary>The implementer the panel avoids; anthropic, as the factory's workers are, so the reviewers come from another family.</summary>
-    private const string Implementer = "claude-sonnet-4-5";
-
     private static readonly WorkStory Story = new(25379, "Whitespace-only input counts as zero words",
         "WordCounter.Count(\"  \") returns 1. Blank input (only spaces) must count as zero words.", "bug",
         "https://app.shortcut.com/trefry/story/25379");
@@ -35,13 +32,14 @@ public class ReviewSeedTests
             Assert.Skip("Set FACTORY_E2E_REVIEW_SEED=1 to run the seeded spec-conformance review against real models.");
         }
         var routerKey = Harness.RequireSecret(o => o.RouterKey);
+        Harness.RequireReviewPanel();
         await Harness.RequireRouterAsync();
         return new RouterReviewer(new HttpClient { BaseAddress = Harness.Options.RouterBaseUrl, Timeout = Harness.Options.ReviewTimeout }, routerKey);
     }
 
     private static async Task<RoleReview> SpecConformanceAsync(RouterReviewer reviewer, string diff, CancellationToken ct)
     {
-        var model = ReviewerChoice.Choose(Harness.Options.ReviewPanel.For(ReviewRoles.SpecConformance), [Implementer]);
+        var model = ReviewerChoice.Choose(Harness.Options.ReviewPanel.For(ReviewRoles.SpecConformance), "Review:SpecConformance:Models");
         var review = await reviewer.ReviewAsync(new ReviewRequest(Story, "michaeltrefry/dark-factory-sandbox", Pull, diff, Files,
             ReviewRoles.SpecConformance, ReviewPrompts.For(ReviewRoles.SpecConformance), model, Guid.NewGuid().ToString()), ct);
         Assert.True(review.Clean, review.Error);
@@ -65,7 +63,7 @@ public class ReviewSeedTests
                 + string.Join("; ", review.Findings.Select(f => $"[{f.Severity}] {f} — {f.Detail}")));
         }
 
-        var confirmer = ReviewerChoice.ChooseConfirmer(Harness.Options.ReviewPanel.Confirm, [Implementer],
+        var confirmer = ReviewerChoice.ChooseConfirmer(Harness.Options.ReviewPanel.Confirm,
             new[] { review.Model, review.ServedModel }.OfType<string>().Distinct().ToList());
         var confirmation = await reviewer.ConfirmAsync(new ConfirmRequest(Story, "michaeltrefry/dark-factory-sandbox", Pull, diff, Files,
             ReviewRoles.SpecConformance, finding, ReviewPrompts.Confirm, confirmer, Guid.NewGuid().ToString()), ct);

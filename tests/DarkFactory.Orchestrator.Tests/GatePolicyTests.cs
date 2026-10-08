@@ -272,8 +272,7 @@ public class MergeGateTierTests
     private static readonly PullFacts Pull = new(1, "https://github.com/o/r/pull/1", true, false, false, Head, "main", "base", null);
     private static readonly CiFacts Green = new(Head, [new CheckFact("build", true, "success")]);
     private static readonly CiFacts Red = new(Head, [new CheckFact("build", true, "failure")]);
-    private static readonly string[] Implementer = ["claude-sonnet-4-5"];
-    private static RoleReview Review(string role) => new(role, "gpt-5.5", "gpt-5.5", "openai", "s", "p", [], "ok");
+    private static RoleReview Review(string role) => new(role, "claude-opus-5-5", "claude-opus-5-5", "s", "p", [], "ok");
 
     /// <summary>A passing verdict on the head with every role (security included); no risky paths claimed.</summary>
     private static readonly ReviewVerdict Full = ReviewPanel.Decide(Head, [], ReviewRoles.All.Select(Review).ToList());
@@ -284,7 +283,7 @@ public class MergeGateTierTests
 
     private static GateDecision Evaluate(string diff, int fixRounds = 0, CiFacts? ci = null, ReviewVerdict? verdict = null, string? policy = null,
         NewTestsResult? tests = null, bool testsRun = true) =>
-        MergeGate.Evaluate(policy ?? Policy, null, TestPolicies.Counting(Pull, new ChangeFacts(diff, null, 0)), new ChangeFacts(diff, null, fixRounds), ci ?? Green, verdict is null ? [Full] : [verdict], Implementer,
+        MergeGate.Evaluate(policy ?? Policy, null, TestPolicies.Counting(Pull, new ChangeFacts(diff, null, 0)), new ChangeFacts(diff, null, fixRounds), ci ?? Green, verdict is null ? [Full] : [verdict],
             testsRun ? tests ?? PassingTests : null);
 
     /// <summary>
@@ -363,7 +362,7 @@ public class MergeGateTierTests
             Assert.Contains("touches sealed path(s), which always escalate", decision.Detail);
         }
         // With no verdict at all it escalates rather than asking for another review.
-        var unreviewed = MergeGate.Evaluate(Policy, null, Pull with { ChangedFiles = 1 }, new ChangeFacts(TestPolicies.Diff("factory/gate.yaml"), null, 0), Green, [], Implementer);
+        var unreviewed = MergeGate.Evaluate(Policy, null, Pull with { ChangedFiles = 1 }, new ChangeFacts(TestPolicies.Diff("factory/gate.yaml"), null, 0), Green, []);
         Assert.Equal(GateOutcome.Blocked, unreviewed.Outcome);
     }
 
@@ -380,7 +379,7 @@ public class MergeGateTierTests
     [Fact]
     public void A_diff_that_cannot_be_read_blocks()
     {
-        var decision = MergeGate.Evaluate(Policy, null, Pull, new ChangeFacts(null, "406 diff too large", 0), Green, [Full], Implementer);
+        var decision = MergeGate.Evaluate(Policy, null, Pull, new ChangeFacts(null, "406 diff too large", 0), Green, [Full]);
         Assert.Equal(GateOutcome.Blocked, decision.Outcome);
         Assert.Contains("could not be read (406 diff too large)", decision.Detail);
         Assert.Contains("touches sealed path(s)", Evaluate("@@ -1 +1 @@\n-a\n+b\n").Detail); // no readable path: sealed
@@ -393,13 +392,13 @@ public class MergeGateTierTests
     public void A_diff_whose_file_count_differs_from_the_prs_is_incomplete_and_blocks(int? prFiles, string reason)
     {
         var decision = MergeGate.Evaluate(Policy, null, Pull with { ChangedFiles = prFiles }, new ChangeFacts(TestPolicies.Diff("docs/a.md"), null, 0),
-            Green, [Full], Implementer);
+            Green, [Full]);
         Assert.Equal(GateOutcome.Blocked, decision.Outcome);
         Assert.Contains($"the diff of {Head[..12]} is incomplete", decision.Detail);
         Assert.Contains(reason, decision.Detail);
         // The same diff with a matching count merges.
         Assert.Equal(GateOutcome.Merge, MergeGate.Evaluate(Policy, null, Pull with { ChangedFiles = 1 },
-            new ChangeFacts(TestPolicies.Diff("docs/a.md"), null, 0), Green, [Full], Implementer).Outcome);
+            new ChangeFacts(TestPolicies.Diff("docs/a.md"), null, 0), Green, [Full]).Outcome);
     }
 
     [Theory]

@@ -21,9 +21,9 @@ public class ReviewGateTests
 {
     private static readonly TimeSpan RunTimeout = TimeSpan.FromMinutes(60);
 
-    /// <summary>P2-AT1: a sandbox PR with green CI and a pass from a different-family reviewer is merged by the gate; the ledger holds the merge commit.</summary>
+    /// <summary>P2-AT1: a sandbox PR with green CI and a pass from a Claude Opus 5.5+ panel is merged by the gate; the ledger holds the merge commit.</summary>
     [Fact]
-    public async Task Gate_merges_a_green_pr_a_different_family_reviewer_passed_and_the_ledger_records_the_merge_commit()
+    public async Task Gate_merges_a_green_pr_a_claude_opus_panel_passed_and_the_ledger_records_the_merge_commit()
     {
         Harness.RequireOptIn();
         var storyId = E2e.Story("FACTORY_E2E_GATE_STORY", "a To Do bug story whose fix lands in the sandbox repo (the gate will merge it)");
@@ -46,7 +46,7 @@ public class ReviewGateTests
 
         var verdict = Assert.Single(RunPipeline.Verdicts(history));
         Assert.True(verdict.Passed, verdict.Summary);
-        AssertDifferentFamily(verdict, RunPipeline.ImplementerModels(history));
+        AssertClaudePanel(verdict);
         // Every panel call went through the router, accounted under its own session, which the ledger named with its prompt hash.
         var named = history.Where(e => e.Step == RunPipeline.Steps.ReviewSession).Select(e => e.Detail!).ToList();
         foreach (var review in verdict.Reviews)
@@ -90,7 +90,7 @@ public class ReviewGateTests
             WorkState.Merge, WorkState.Watch], history.Where(e => e.Step is null).Select(e => e.State));
         var verdicts = RunPipeline.Verdicts(history);
         Assert.Equal([pusher.ReviewedFirst, pushed], verdicts.Select(v => v.HeadSha));
-        Assert.All(verdicts, v => AssertDifferentFamily(v, RunPipeline.ImplementerModels(history)));
+        Assert.All(verdicts, AssertClaudePanel);
         Assert.Equal([pushed], history.Where(e => e.Step == RunPipeline.Steps.GatePassed).Select(e => e.Detail));
 
         var pr = await MergedPullRequestAsync(options.DefaultRepo, storyId, outcome.PullRequestUrl!, ct);
@@ -98,25 +98,20 @@ public class ReviewGateTests
         Assert.Equal(history.Single(e => e.Step is null && e.State == WorkState.Merge).Detail, pr.GetProperty("merge_commit_sha").GetString());
     }
 
-    private static void AssertDifferentFamily(ReviewVerdict verdict, List<string> implementerModels)
+    /// <summary>Every reviewer a Claude Opus 5.5 or newer and every second model Claude, each served by the router as pinned.</summary>
+    private static void AssertClaudePanel(ReviewVerdict verdict)
     {
-        Assert.NotEmpty(implementerModels);
-        var families = implementerModels.Select(ModelFamily.Of).ToList();
-        Assert.DoesNotContain(null, families);
         Assert.NotEmpty(verdict.Reviews);
-        foreach (var family in verdict.Reviews.Select(r => r.Family)
-                     .Concat(verdict.Reviews.SelectMany(r => r.Findings).Select(f => f.Confirmation).OfType<Confirmation>().Select(c => c.Family)))
-        {
-            Assert.NotNull(family);
-            Assert.DoesNotContain(family, families);
-        }
+        Assert.All(verdict.Reviews, r => Assert.True(ReviewModels.MeetsReviewFloor(r.Model), $"{r.Role} reviewed by {r.Model}"));
+        Assert.Empty(verdict.Reviews.SelectMany(ReviewModels.Problems));
     }
 
-    /// <summary>Skips with the missing owner step unless the gate App is set up and the sandbox has a policy on main.</summary>
+    /// <summary>Skips with the missing owner step unless the gate App is set up, Review:Models is set and the sandbox has a policy on main.</summary>
     private static async Task RequireGateReadyAsync(FactoryOptions options, CancellationToken ct)
     {
         Harness.RequireSecret(o => o.GitHubGateAppId);
         Harness.RequireSecret(o => o.GitHubGateAppPrivateKeyPem);
+        Harness.RequireReviewPanel(options);
         using var github = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
         var gate = new GitHubGate(github, new GitHubApp(github, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System));
         string? policy;

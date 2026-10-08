@@ -34,7 +34,7 @@ public interface IReviewer
 {
     /// <summary>
     /// One role's review with <see cref="ReviewRequest.Model"/> pinned, accounted under <see cref="ReviewRequest.Session"/>.
-    /// An answer that is not a clean findings line from the pinned family is a <see cref="RoleReview"/> with an
+    /// An answer that is not a clean findings line from the pinned model is a <see cref="RoleReview"/> with an
     /// <see cref="RoleReview.Error"/>; a call that cannot be made throws (<see cref="RouterUsageLimitedException"/> when the
     /// router refused it for usage).
     /// </summary>
@@ -42,14 +42,14 @@ public interface IReviewer
 
     /// <summary>
     /// Asks a second model whether a blocking finding reproduces from the code. An answer that is not a clean confirmation
-    /// line from the pinned family is <see cref="Confirmation.Unusable"/>; a call that cannot be made throws.
+    /// line from the pinned model is <see cref="Confirmation.Unusable"/>; a call that cannot be made throws.
     /// </summary>
     Task<Confirmation> ConfirmAsync(ConfirmRequest request, CancellationToken ct);
 }
 
 /// <summary>
 /// The panel's calls through the Weave router (never a provider directly), each pinned with <c>x-weave-force-model</c> (the
-/// router's headless <c>/force-model</c>) to a model of a family the implementer did not use. The router key is the only
+/// router's headless <c>/force-model</c>) to a Claude model (<see cref="ReviewModels"/>). The router key is the only
 /// credential sent, as the worker sends it. The system prompt is the role's prompt file, verbatim (<see cref="ReviewPrompts"/>).
 /// Reviewers read a diff and answer; they have no tools and change nothing.
 /// </summary>
@@ -77,7 +77,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey) : IReviewe
     {
         if (request.Diff.Length > MaxDiffChars)
         {
-            return new RoleReview(request.Role, request.Model, null, ModelFamily.Of(request.Model), request.Session, request.Prompt.Id, [], "",
+            return new RoleReview(request.Role, request.Model, null, request.Session, request.Prompt.Id, [], "",
                 $"The diff is {request.Diff.Length} characters, more than the {MaxDiffChars} one review reads; not reviewed.");
         }
         var (served, stop, text) = await CallAsync(request.Model, request.Session, request.Prompt.Text, BuildPrompt(request), ct);
@@ -88,7 +88,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey) : IReviewe
     {
         if (request.Diff.Length > MaxDiffChars)
         {
-            return new Confirmation(Confirmation.Unusable, request.Model, null, ModelFamily.Of(request.Model), request.Session, request.Prompt.Id,
+            return new Confirmation(Confirmation.Unusable, request.Model, null, request.Session, request.Prompt.Id,
                 $"The diff is {request.Diff.Length} characters, more than the {MaxDiffChars} one call reads.");
         }
         var (served, stop, text) = await CallAsync(request.Model, request.Session, request.Prompt.Text, BuildConfirmPrompt(request), ct);
@@ -148,36 +148,24 @@ public sealed class RouterReviewer(HttpClient http, string routerKey) : IReviewe
         status is 429 or 529 || WorkerResult.UsageLimitMarkers.Any(m => body.Contains(m, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
-    /// Why an answer cannot count as coming from the pinned model at all (no served model named, another family, ended
-    /// early), or null when it can.
+    /// Why an answer cannot count at all (<see cref="ReviewModels.CallProblem"/>: the pinned model breaks the panel's rule, or
+    /// the router did not say it served the pinned model; or the answer ended early), or null when it can.
     /// </summary>
-    private static string? ServedProblem(string model, string? served, string? stopReason)
-    {
-        var requested = ModelFamily.Of(model);
-        var family = ModelFamily.Of(served);
-        if (string.IsNullOrWhiteSpace(served))
-        {
-            return $"The router did not say which model answered the call pinned to {model}.";
-        }
-        if (family is null || family != requested)
-        {
-            return $"The router served '{served}' (family {family ?? "unknown"}), not the pinned {model} ({requested}).";
-        }
-        return stopReason is not null and not "end_turn" and not "stop_sequence" ? $"The answer ended early ({stopReason})." : null;
-    }
+    private static string? ServedProblem(string model, string? served, string? stopReason, bool reviewer) =>
+        ReviewModels.CallProblem(model, served, reviewer) is { } problem ? $"The answer cannot count: {problem}."
+        : stopReason is not null and not "end_turn" and not "stop_sequence" ? $"The answer ended early ({stopReason})." : null;
 
     /// <summary>
-    /// Turns a role reviewer's answer into its review. Usable only when the router said the pinned model's family answered,
+    /// Turns a role reviewer's answer into its review. Usable only when the router said the pinned model answered,
     /// the answer ended normally and its last line is the findings JSON; anything else is a review with an
     /// <see cref="RoleReview.Error"/> (which fails the panel). A finding whose severity is neither blocking nor optional
     /// counts as blocking.
     /// </summary>
     public static RoleReview InterpretReview(string role, string model, string? served, string? stopReason, string answer)
     {
-        var family = ModelFamily.Of(served);
-        RoleReview Unusable(string why) => new(role, model, served, family, null, null, [], "", why);
+        RoleReview Unusable(string why) => new(role, model, served, null, null, [], "", why);
 
-        if (ServedProblem(model, served, stopReason) is { } problem)
+        if (ServedProblem(model, served, stopReason, reviewer: true) is { } problem)
         {
             return Unusable(problem);
         }
@@ -197,26 +185,25 @@ public sealed class RouterReviewer(HttpClient http, string routerKey) : IReviewe
             findings.Add(new Finding(severity, Cut(Text(f, "title") ?? "(untitled finding)", MaxTitle), Text(f, "file"), line,
                 Cut(Text(f, "detail") ?? "", MaxDetail)));
         }
-        return new RoleReview(role, model, served, family, null, null, findings, Cut(Text(json, "summary") ?? "", MaxDetail));
+        return new RoleReview(role, model, served, null, null, findings, Cut(Text(json, "summary") ?? "", MaxDetail));
     }
 
     /// <summary>
     /// Turns a second model's answer into its confirmation: <see cref="Confirmation.Confirmed"/> or
-    /// <see cref="Confirmation.NotConfirmed"/> only from a clean confirmation line of the pinned family; anything else is
+    /// <see cref="Confirmation.NotConfirmed"/> only from a clean confirmation line of the pinned model; anything else is
     /// <see cref="Confirmation.Unusable"/>.
     /// </summary>
     public static Confirmation InterpretConfirmation(string model, string? served, string? stopReason, string answer)
     {
-        var family = ModelFamily.Of(served);
-        if (ServedProblem(model, served, stopReason) is { } problem)
+        if (ServedProblem(model, served, stopReason, reviewer: false) is { } problem)
         {
-            return new Confirmation(Confirmation.Unusable, model, served, family, null, null, problem);
+            return new Confirmation(Confirmation.Unusable, model, served, null, null, problem);
         }
         if (LastJsonLine(answer, "confirmed") is not { } json || json.GetProperty("confirmed").ValueKind is not (JsonValueKind.True or JsonValueKind.False))
         {
-            return new Confirmation(Confirmation.Unusable, model, served, family, null, null, "The second model's answer does not end with a confirmation line.");
+            return new Confirmation(Confirmation.Unusable, model, served, null, null, "The second model's answer does not end with a confirmation line.");
         }
-        return new Confirmation(json.GetProperty("confirmed").GetBoolean() ? Confirmation.Confirmed : Confirmation.NotConfirmed, model, served, family,
+        return new Confirmation(json.GetProperty("confirmed").GetBoolean() ? Confirmation.Confirmed : Confirmation.NotConfirmed, model, served,
             null, null, Cut(Text(json, "reason") ?? "", MaxDetail));
     }
 

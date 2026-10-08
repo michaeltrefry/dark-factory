@@ -136,29 +136,38 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         Secret("GitHub:Gate:PrivateKeyPem", null, SecretAccounts.GitHubGateAppPrivateKey, "GitHub gate App private key (run `factory github-app setup --gate`)");
 
     /// <summary>
-    /// The review panel's model lists, each comma-separated and in order of preference, each model of a known family
-    /// (<see cref="Gate.ModelFamily"/>): <c>Review:&lt;Role&gt;:Models</c> (<c>Correctness</c>, <c>SpecConformance</c>,
-    /// <c>Security</c>) per role, falling back to <c>Review:Models</c> (default
-    /// <see cref="Gate.ReviewPanelModels.DefaultReviewers"/>); <c>Review:Confirm:Models</c> for the second model that checks a
-    /// blocking finding (default <see cref="Gate.ReviewPanelModels.DefaultConfirmers"/>).
+    /// The review panel's model lists, each comma-separated and in order of preference: <c>Review:&lt;Role&gt;:Models</c>
+    /// (<c>Correctness</c>, <c>SpecConformance</c>, <c>Security</c>) per role, falling back to <c>Review:Models</c> — no
+    /// default, every entry a <see cref="Gate.ReviewModels.FloorText"/> (<see cref="Gate.ReviewModels.MeetsReviewFloor"/>);
+    /// <c>Review:Confirm:Models</c> for the second model that checks a blocking finding (default
+    /// <see cref="Gate.ReviewPanelModels.DefaultConfirmers"/>), every entry a Claude model. A role with no reviewer model, or an
+    /// entry that breaks its rule, throws <see cref="ReviewConfigurationException"/> (the factory refuses to start).
     /// </summary>
     public Gate.ReviewPanelModels ReviewPanel
     {
         get
         {
-            var shared = Models("Review:Models", Gate.ReviewPanelModels.DefaultReviewers);
-            var roles = Gate.ReviewRoles.All.ToDictionary(r => r, r => Models($"Review:{Gate.ReviewRoles.ConfigName(r)}:Models", shared));
-            return new Gate.ReviewPanelModels(roles, Models("Review:Confirm:Models", Gate.ReviewPanelModels.DefaultConfirmers));
+            var shared = Models("Review:Models", [], Gate.ReviewModels.MeetsReviewFloor, Gate.ReviewModels.FloorText);
+            var roles = Gate.ReviewRoles.All.ToDictionary(r => r, r =>
+            {
+                var key = $"Review:{Gate.ReviewRoles.ConfigName(r)}:Models";
+                var models = Models(key, shared, Gate.ReviewModels.MeetsReviewFloor, Gate.ReviewModels.FloorText);
+                return models.Count > 0 ? models : throw new ReviewConfigurationException(
+                    $"No {r} reviewer model is configured: reviewers must be a {Gate.ReviewModels.FloorText} and there is no default; "
+                    + $"set Review:Models (or {key}) to one the router routes.");
+            });
+            return new Gate.ReviewPanelModels(roles,
+                Models("Review:Confirm:Models", Gate.ReviewPanelModels.DefaultConfirmers, Gate.ReviewModels.IsClaude, "Claude model"));
         }
     }
 
-    private IReadOnlyList<string> Models(string key, IReadOnlyList<string> fallback)
+    private IReadOnlyList<string> Models(string key, IReadOnlyList<string> fallback, Func<string, bool> eligible, string rule)
     {
         var models = config[key] is { } list && !string.IsNullOrWhiteSpace(list)
             ? list.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList()
             : fallback;
-        return models.FirstOrDefault(m => Gate.ModelFamily.Of(m) is null) is { } unknown
-            ? throw new InvalidOperationException($"{key}: '{unknown}' is of no known model family.")
+        return models.FirstOrDefault(m => !eligible(m)) is { } bad
+            ? throw new ReviewConfigurationException($"{key}: '{bad}' is not a {rule}.")
             : models;
     }
 
@@ -220,6 +229,9 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
 }
 
 public sealed class MissingCredentialException(string message) : Exception(message);
+
+/// <summary>The review panel's model settings are missing or break its rule (<see cref="FactoryOptions.ReviewPanel"/>): the factory refuses to start.</summary>
+public sealed class ReviewConfigurationException(string message) : Exception(message);
 
 public static class ConfigurationExtensions
 {

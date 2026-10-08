@@ -44,8 +44,8 @@ public class FixLoopTests
         Assert.Equal([$"merge 1 {ShaA}"], h.Merges);
         // The merge record names the carried review and the commit it was made on.
         var gate = (await h.Rows()).Single(r => r.Step == RunPipeline.Steps.GateDecision).Detail!;
-        Assert.Contains($"{ReviewRoles.SpecConformance}: gpt-5.5 (openai), carried from {Sha1[..12]}", gate);
-        Assert.DoesNotContain($"{ReviewRoles.Correctness}: gpt-5.5 (openai), carried", gate);
+        Assert.Contains($"{ReviewRoles.SpecConformance}: claude-opus-5-5, carried from {Sha1[..12]}", gate);
+        Assert.DoesNotContain($"{ReviewRoles.Correctness}: claude-opus-5-5, carried", gate);
 
         // The fixer: a second worker session, in a worktree restored from the PR branch, given the story and the confirmed
         // finding (fenced: its text cannot close the block) and nothing else from the review; its work pushed to the same branch.
@@ -150,7 +150,7 @@ public class FixLoopTests
         Assert.Empty(h.Merges);
         var comment = h.Stories.Comments.Single();
         Assert.Contains("after 3 fix rounds", comment);
-        Assert.Contains("[correctness] the tests do not cover the empty string (src/x.cs:1), confirmed by gpt-5.4-mini — WordCount(\"\") is untested", comment);
+        Assert.Contains("[correctness] the tests do not cover the empty string (src/x.cs:1), confirmed by claude-opus-5 — WordCount(\"\") is untested", comment);
     }
 
     [Fact]
@@ -166,11 +166,10 @@ public class FixLoopTests
     }
 
     [Fact]
-    public async Task A_fixer_of_another_family_makes_every_role_whose_reviewer_shares_it_review_again()
+    public async Task A_fixer_of_another_model_family_does_not_make_a_clean_role_review_again()
     {
         var h = new Harness
         {
-            Models = ReviewPanelModels.Uniform(["gpt-5.5", "gemini-3.1-pro-preview"], [.. ReviewPanelModels.DefaultConfirmers, "gemini-3-flash-preview"]),
             FixerModels = ["gpt-5.6-luna"],
             Reviewer = ReviewerFor(new() { [ReviewRoles.Correctness] = new() { [Sha1] = [Blocking("one")] } }),
         };
@@ -178,11 +177,23 @@ public class FixLoopTests
         var outcome = await h.Run();
 
         Assert.True(outcome.Succeeded, outcome.Error);
-        // The fixer's model counts as the implementer's: spec conformance, reviewed by openai on Sha1, is not carried.
-        Assert.Equal([("gpt-5.5", Sha1), ("gpt-5.5", Sha1), ("gemini-3.1-pro-preview", ShaA), ("gemini-3.1-pro-preview", ShaA)],
-            h.Reviewer.Requests.Select(r => (r.Model, r.Pull.HeadSha)));
-        Assert.All((await h.Verdicts()).Last().Reviews, r => Assert.Null(r.CarriedFrom));
+        // Which models wrote the code does not matter: spec conformance, clean on Sha1, is carried; every call is the Opus.
+        Assert.Equal([(ReviewRoles.Correctness, Sha1), (ReviewRoles.SpecConformance, Sha1), (ReviewRoles.Correctness, ShaA)],
+            h.Reviewer.Requests.Select(r => (r.Role, r.Pull.HeadSha)));
+        Assert.All(h.Reviewer.Requests, r => Assert.Equal("claude-opus-5-5", r.Model));
+        Assert.Equal(Sha1, (await h.Verdicts()).Last().Reviews.Single(r => r.Role == ReviewRoles.SpecConformance).CarriedFrom);
         Assert.Equal([$"merge 1 {ShaA}"], h.Merges);
+    }
+
+    [Fact]
+    public void A_clean_review_whose_models_break_the_panels_rule_is_not_carried()
+    {
+        RoleReview Clean(string role, string model, string? served) => new(role, model, served, "s", "p", [], "ok");
+        var previous = ReviewPanel.Decide(Sha1, [], [Clean(ReviewRoles.Correctness, "claude-opus-5-5", "claude-opus-5-5"),
+            Clean(ReviewRoles.SpecConformance, "claude-opus-5", "claude-opus-5")]);
+        Assert.Equal([ReviewRoles.Correctness], FixLoop.Carried(previous, ReviewRoles.Required(false)).Select(r => r.Role));
+        var unnamed = previous with { Reviews = [previous.Reviews[0] with { ServedModel = null }, previous.Reviews[1]] };
+        Assert.Empty(FixLoop.Carried(unnamed, ReviewRoles.Required(false)));
     }
 
     [Fact]
@@ -276,10 +287,10 @@ public class FixLoopTests
     private static ReviewVerdict Verdict(string sha, params RoleReview[] reviews) => ReviewPanel.Decide(sha, [], reviews);
 
     private static RoleReview Review(string role, params Finding[] findings) =>
-        new(role, "gpt-5.5", "gpt-5.5", "openai", "s", "p", findings, "ok");
+        new(role, "claude-opus-5-5", "claude-opus-5-5", "s", "p", findings, "ok");
 
     private static Finding Confirmed(string title) =>
-        Blocking(title).ConfirmedBy(new Confirmation(Confirmation.Confirmed, "gpt-5.4-mini", "gpt-5.4-mini", "openai", "s", "p", "yes"));
+        Blocking(title).ConfirmedBy(new Confirmation(Confirmation.Confirmed, "claude-opus-5", "claude-opus-5", "s", "p", "yes"));
 
     [Fact]
     public void Only_a_verdict_failed_by_confirmed_blocking_findings_alone_is_fixable()

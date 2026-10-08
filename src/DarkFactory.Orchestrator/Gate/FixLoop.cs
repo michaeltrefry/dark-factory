@@ -98,14 +98,13 @@ public static class FixLoop
 
     /// <summary>
     /// Whether a role's review of the fixed commit must be redone on the fixer's push rather than carried: it had a blocking
-    /// finding (or an unusable answer), or its reviewer or a second model is of no known family or of a family that wrote
-    /// code since (a fixer's), which the merge gate would refuse.
+    /// finding (or an unusable answer), or its models break the panel's rule (<see cref="ReviewModels.Problems"/>), which the
+    /// merge gate would refuse.
     /// </summary>
-    public static bool MustReviewAgain(RoleReview review, IReadOnlySet<string> implementerFamilies) =>
+    public static bool MustReviewAgain(RoleReview review) =>
         !review.Clean
         || review.Findings.Any(f => f.IsBlocking)
-        || review.Family is null || implementerFamilies.Contains(review.Family)
-        || review.Findings.Select(f => f.Confirmation).OfType<Confirmation>().Any(c => c.Family is null || implementerFamilies.Contains(c.Family));
+        || ReviewModels.Problems(review).Any();
 
     /// <summary>
     /// The reviews of <paramref name="previous"/> (the fixed commit's verdict) carried into the new head's verdict: every
@@ -113,9 +112,9 @@ public static class FixLoop
     /// was made on. Every other required role reviews the new head: those with an open blocking finding, and any the previous
     /// verdict did not have (e.g. security, when the fix touches a risky path).
     /// </summary>
-    public static IReadOnlyList<RoleReview> Carried(ReviewVerdict previous, IReadOnlyList<string> required, IReadOnlySet<string> implementerFamilies) =>
+    public static IReadOnlyList<RoleReview> Carried(ReviewVerdict previous, IReadOnlyList<string> required) =>
         previous.Reviews
-            .Where(r => required.Contains(r.Role) && !MustReviewAgain(r, implementerFamilies))
+            .Where(r => required.Contains(r.Role) && !MustReviewAgain(r))
             .Select(r => r with { CarriedFrom = r.CarriedFrom ?? previous.HeadSha })
             .ToList();
 
