@@ -171,6 +171,12 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     /// <summary><c>Gate:CiTimeoutMinutes</c> (default 30): CI still running after this escalates the item.</summary>
     public TimeSpan CiTimeout => TimeSpan.FromMinutes(config.GetValue("Gate:CiTimeoutMinutes", GateStage.DefaultCiTimeout.TotalMinutes));
 
+    /// <summary>
+    /// <c>Gate:TestTimeoutMinutes</c> (default 20): one sandboxed run (restore, build, the new tests) of the
+    /// <c>new-tests-fail-on-base</c> check; a run still going after this fails the check.
+    /// </summary>
+    public TimeSpan TestTimeout => TimeSpan.FromMinutes(config.GetValue("Gate:TestTimeoutMinutes", Gate.SandboxTestRunner.DefaultTimeout.TotalMinutes));
+
     public bool TryGet(Func<FactoryOptions, string> secret, out string? value)
     {
         try

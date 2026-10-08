@@ -131,6 +131,12 @@ public sealed partial class RunPipeline(
         public const string FixProgress = "fix-progress";
         /// <summary>MergeGate: one evaluation of the gate; Detail is its decision and reasons.</summary>
         public const string GateDecision = "gate";
+        /// <summary>
+        /// MergeGate: the <c>new-tests-fail-on-base</c> check's result for one base/head pair (sc-25382); Detail is the
+        /// <see cref="Gate.NewTestsResult"/> JSON — outcome (<c>pass</c>, <c>rejected</c>, <c>no-tests</c>, <c>unsupported</c>,
+        /// <c>error</c>; anything but pass fails the check), why, and each new test's cases on the base and the head.
+        /// </summary>
+        public const string NewTests = "new-tests";
         /// <summary>MergeGate: every rule held for this head commit (Detail) and the gate is merging exactly it.</summary>
         public const string GatePassed = "gate-passed";
         /// <summary>Merge: the board shows the item merged.</summary>

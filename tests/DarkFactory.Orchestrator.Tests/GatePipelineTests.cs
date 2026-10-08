@@ -214,6 +214,8 @@ public class GatePipelineTests
         public FakePullRequests Prs { get; } = new();
         public InProcessRunLocks Locks { get; } = new();
         public FakeGateGitHub GitHub { get; } = new();
+        /// <summary>The new-tests check's runs (sc-25382); by default the PR adds one test that fails on the base and passes on the head.</summary>
+        public FakeTestRunner TestRunner { get; } = new();
         public FakeReviewer Reviewer { get; init; } = new();
         /// <summary>When set, the panel's calls go here instead of <see cref="Reviewer"/> (e.g. a real <see cref="RouterReviewer"/>).</summary>
         public IReviewer? Panel { get; init; }
@@ -228,7 +230,8 @@ public class GatePipelineTests
         public Task<RunOutcome> Run(string?[] implementerModels, CancellationToken ct = default) =>
             new RunPipeline(Stories, Ledger, Locks, Workspaces, new HarnessWorker(this, implementerModels), Prs, Sandbox, TextWriter.Null,
                     controls: Controls,
-                    gate: new GateStage(GitHub, Panel ?? Reviewer, Models, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5), GateOnFakeClock ? Time : null))
+                    gate: new GateStage(GitHub, Panel ?? Reviewer, Models, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5), GateOnFakeClock ? Time : null,
+                        TestRunner))
                 .RunAsync(77, ct);
 
         /// <summary>The implementer reports <c>implementerModels</c>; every later session (a fixer) reports <see cref="FixerModels"/>.</summary>
@@ -724,7 +727,7 @@ public class GatePipelineTests
     public async Task A_normal_tier_that_requires_the_security_review_gets_it_and_merges()
     {
         var h = new Harness();
-        h.GitHub.PolicyText = TestPolicies.Standard(normalChecks: "ci-green, review-pass, security-review, risk-threshold");
+        h.GitHub.PolicyText = TestPolicies.Standard(normalChecks: "ci-green, review-pass, security-review, risk-threshold, new-tests-fail-on-base");
 
         var outcome = await h.Run();
 

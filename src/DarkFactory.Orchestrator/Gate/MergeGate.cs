@@ -164,8 +164,12 @@ public static class MergeGate
     /// <param name="change">The diff of the PR's head commit against its base, and the fix rounds used.</param>
     /// <param name="verdicts">Every verdict in the item's ledger, oldest first.</param>
     /// <param name="implementerModels">Every model the implementer's sessions reported.</param>
+    /// <param name="newTests">
+    /// The recorded result of the <c>new-tests-fail-on-base</c> check for this base and head (<see cref="NewTestsCheck"/>),
+    /// or null when it was not run; required only when a touched tier lists the check, and then null fails it (E2).
+    /// </param>
     public static GateDecision Evaluate(string? policyText, string? policyError, PullFacts pull, ChangeFacts change, CiFacts ci,
-        IReadOnlyList<ReviewVerdict> verdicts, IReadOnlyCollection<string> implementerModels)
+        IReadOnlyList<ReviewVerdict> verdicts, IReadOnlyCollection<string> implementerModels, NewTestsResult? newTests = null)
     {
         var head = pull.HeadSha;
         var reasons = new List<string>();
@@ -279,6 +283,23 @@ public static class MergeGate
             }
         }
 
+        // new-tests-fail-on-base — the executed runs recorded for exactly this base and head (sc-25382).
+        if (classified.Requires(GateChecks.NewTestsFailOnBase))
+        {
+            if (newTests is null)
+            {
+                reasons.Add($"{GateChecks.NewTestsFailOnBase}: the tests the PR adds were not run on {Ci.Short(head)}");
+            }
+            else if (newTests.HeadSha != head || newTests.BaseSha != pull.BaseSha)
+            {
+                reasons.Add($"{GateChecks.NewTestsFailOnBase}: the tests were run for {Ci.Short(newTests.BaseSha)}...{Ci.Short(newTests.HeadSha)}, not {Ci.Short(pull.BaseSha)}...{Ci.Short(head)}");
+            }
+            else if (!newTests.Passed)
+            {
+                reasons.Add($"{GateChecks.NewTestsFailOnBase} ({newTests.Outcome}): {newTests.Reason}");
+            }
+        }
+
         if (pull.Draft)
         {
             reasons.Add($"PR #{pull.Number} is a draft");
@@ -305,6 +326,10 @@ public static class MergeGate
         if (classified.Requires(GateChecks.RiskThreshold))
         {
             passed.Add($"risk within threshold ({classified.ChangedLines} changed lines, {classified.ChangedFiles} files, {change.FixRounds} fix rounds)");
+        }
+        if (classified.Requires(GateChecks.NewTestsFailOnBase))
+        {
+            passed.Add(newTests!.Reason);
         }
         return new GateDecision(GateOutcome.Merge, head, passed);
     }

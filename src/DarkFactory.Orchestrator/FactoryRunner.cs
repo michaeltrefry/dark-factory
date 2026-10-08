@@ -134,7 +134,7 @@ public static class FactoryRunner
         });
 
         var gate = new GateStage(new GitHubGate(githubHttp, gateApp), new RouterReviewer(reviewerHttp, routerKey), reviewPanel,
-            options.CiPollInterval, options.CiTimeout);
+            options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, sandbox, options.TestTimeout));
         var pipeline = new RunPipeline(
             source,
             ledger,
