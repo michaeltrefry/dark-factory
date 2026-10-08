@@ -24,6 +24,8 @@ public class LifecycleTests
     [InlineData(CIHealing, CI)]
     [InlineData(CI, MergeGate)]
     [InlineData(MergeGate, Merge)]
+    [InlineData(CI, Review)] // a push voided the verdict (E3)
+    [InlineData(MergeGate, Review)]
     [InlineData(MergeGate, Escalated)]
     [InlineData(Merge, Watch)]
     [InlineData(Watch, Done)]

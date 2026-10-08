@@ -46,7 +46,9 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
         return $"{signingInput}.{Base64Url(signature)}";
     }
 
-    public async Task<InstallationToken> CreateInstallationTokenAsync(RepoRef repo, CancellationToken ct)
+    /// <param name="permissions">The token's permissions; default <see cref="TokenPermissions"/>. Never more than the App was granted.</param>
+    public async Task<InstallationToken> CreateInstallationTokenAsync(RepoRef repo, CancellationToken ct,
+        IReadOnlyDictionary<string, string>? permissions = null)
     {
         var jwt = CreateJwt();
 
@@ -60,7 +62,7 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
         var installation = await lookupResponse.Content.ReadFromJsonAsync<InstallationDto>(ct);
 
         using var create = Request(HttpMethod.Post, $"app/installations/{installation!.Id}/access_tokens", "Bearer", jwt);
-        create.Content = JsonContent.Create(new { repositories = new[] { repo.Name }, permissions = TokenPermissions });
+        create.Content = JsonContent.Create(new { repositories = new[] { repo.Name }, permissions = permissions ?? TokenPermissions });
         using var createResponse = await http.SendAsync(create, ct);
         await EnsureSuccess(createResponse, "create installation token", ct);
         var token = await createResponse.Content.ReadFromJsonAsync<AccessTokenDto>(ct);

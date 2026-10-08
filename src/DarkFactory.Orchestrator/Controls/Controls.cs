@@ -58,6 +58,9 @@ public static class UsagePause
     /// <summary>A worker failed with the router's exhaustion or a rate-limit error (the backstop).</summary>
     public const string WorkerRateLimited = "worker-rate-limited";
 
+    /// <summary>The router refused a reviewer call with its exhaustion or a rate-limit error.</summary>
+    public const string ReviewerRateLimited = "reviewer-rate-limited";
+
     /// <summary>Who writes usage pauses (<see cref="Control.ChangedBy"/>).</summary>
     public const string By = "usage";
 

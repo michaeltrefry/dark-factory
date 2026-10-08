@@ -614,6 +614,8 @@ public class IntakeLoopTests
             ["Router:Key"] = "rk",
             ["GitHub:AppId"] = "1",
             ["GitHub:PrivateKeyPem"] = "pem",
+            ["GitHub:Gate:AppId"] = "2",
+            ["GitHub:Gate:PrivateKeyPem"] = "gate-pem",
             ["Factory:WorkRoot"] = root,
             // Never reached (the lock below is held), and never the real sandbox user or helper.
             ["Worker:RunAs"] = "df-test-no-such-user",

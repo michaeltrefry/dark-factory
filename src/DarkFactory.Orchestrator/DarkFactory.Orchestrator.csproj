@@ -18,10 +18,12 @@
     <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.12" />
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3" />
     <PackageReference Include="System.CommandLine" Version="2.0.12" />
+    <PackageReference Include="YamlDotNet" Version="16.3.0" />
   </ItemGroup>
 
   <ItemGroup>
     <EmbeddedResource Include="GitHub/app-manifest.json" LogicalName="app-manifest.json" />
+    <EmbeddedResource Include="GitHub/gate-app-manifest.json" LogicalName="gate-app-manifest.json" />
     <InternalsVisibleTo Include="DarkFactory.Orchestrator.Tests" />
     <InternalsVisibleTo Include="DarkFactory.AcceptanceTests" />
   </ItemGroup>

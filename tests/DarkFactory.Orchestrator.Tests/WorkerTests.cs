@@ -48,6 +48,19 @@ public class StreamJsonTests
     }
 
     [Fact]
+    public void Collects_the_models_that_answered_skipping_synthetic_messages()
+    {
+        var state = new StreamJsonState();
+        state.Accept("""{"type":"system","subtype":"init","model":"claude-requested","session_id":"s"}""");
+        state.Accept("""{"type":"assistant","message":{"model":"claude-sonnet-4-5","content":[]},"session_id":"s"}""");
+        state.Accept("""{"type":"assistant","message":{"model":"<synthetic>","content":[]},"session_id":"s"}""");
+        state.Accept("""{"type":"assistant","message":{"model":"gpt-5.6-luna","content":[]},"session_id":"s"}""");
+        state.Accept("""{"type":"assistant","message":{"model":"claude-sonnet-4-5","content":[]},"session_id":"s"}""");
+
+        Assert.Equal(["claude-sonnet-4-5", "gpt-5.6-luna"], state.Models);
+    }
+
+    [Fact]
     public void Without_result_line_nothing_is_reported_as_seen()
     {
         var state = new StreamJsonState();
@@ -408,6 +421,29 @@ public class ClaudeWorkerTests
         var (pid, group) = File.ReadAllText(ids).Trim().Split(' ') is [var p, var g] ? (p, g) : throw new InvalidOperationException();
         Assert.Equal(pid, group); // claude itself (same pid as the launcher) leads its group
         Assert.Equal([$"started {pid}", "session s"], events);
+    }
+
+    [Fact]
+    public async Task Each_model_that_answers_is_reported_once_as_it_streams()
+    {
+        var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
+        var script = Path.Combine(dir, "fake-claude.sh");
+        File.WriteAllText(script, """
+            #!/bin/sh
+            echo '{"type":"system","subtype":"init","session_id":"s"}'
+            echo '{"type":"assistant","message":{"model":"claude-sonnet-4-5","content":[]},"session_id":"s"}'
+            echo '{"type":"assistant","message":{"model":"claude-sonnet-4-5","content":[]},"session_id":"s"}'
+            echo '{"type":"assistant","message":{"model":"qwen3-coder","content":[]},"session_id":"s"}'
+            echo '{"type":"result","subtype":"success","is_error":false,"session_id":"s"}'
+            """);
+        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var models = new List<string>();
+
+        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null,
+            new WorkerCallbacks(OnModel: (model, _) => { models.Add(model); return Task.CompletedTask; }), CancellationToken.None);
+
+        Assert.True(result.Succeeded, result.StderrTail);
+        Assert.Equal(["claude-sonnet-4-5", "qwen3-coder"], models);
     }
 
     [Fact]

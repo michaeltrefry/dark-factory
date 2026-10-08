@@ -1,4 +1,5 @@
 using DarkFactory.Orchestrator.Controls;
+using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
@@ -87,12 +88,20 @@ public static class FactoryRunner
         return await RunAsync(options, CreateWorkSource(options, shortcutHttp), storyId, ignoreScope, log, ct);
     }
 
-    public static async Task<RunOutcome> RunAsync(FactoryOptions options, IWorkSource source, int storyId, bool ignoreScope, TextWriter log, CancellationToken ct)
+    public static Task<RunOutcome> RunAsync(FactoryOptions options, IWorkSource source, int storyId, bool ignoreScope, TextWriter log, CancellationToken ct) =>
+        RunAsync(options, source, storyId, ignoreScope, log, ct, null);
+
+    /// <param name="adjustGate">Acceptance harness only: wraps the production gate stage (e.g. to push after the verdict).</param>
+    internal static async Task<RunOutcome> RunAsync(FactoryOptions options, IWorkSource source, int storyId, bool ignoreScope, TextWriter log,
+        CancellationToken ct, Func<GateStage, GateStage>? adjustGate)
     {
         // Resolve every credential before touching the ledger so a missing one fails fast.
         var routerKey = options.RouterKey;
         var appId = options.GitHubAppId;
         var appKey = options.GitHubAppPrivateKeyPem;
+        var gateAppId = options.GitHubGateAppId;
+        var gateAppKey = options.GitHubGateAppPrivateKeyPem;
+        var reviewerModels = options.ReviewerModels;
         var sandbox = options.WorkerSandbox;
         var pauseGrace = options.PauseGrace;
 
@@ -107,6 +116,9 @@ public static class FactoryRunner
         using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
         using var routerHttp = new HttpClient { BaseAddress = options.RouterBaseUrl };
         var app = new GitHubApp(githubHttp, appId, appKey, TimeProvider.System);
+        // The merge-capable credential: a separate App only the gate uses (workers' pushes and PRs use the one above).
+        var gateApp = new GitHubApp(githubHttp, gateAppId, gateAppKey, TimeProvider.System);
+        using var reviewerHttp = new HttpClient { BaseAddress = options.RouterBaseUrl, Timeout = options.ReviewTimeout };
 
         await FactoryWide("the ledger", async () => { await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct); return true; });
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
@@ -121,6 +133,8 @@ public static class FactoryRunner
             return true;
         });
 
+        var gate = new GateStage(new GitHubGate(githubHttp, gateApp), new RouterReviewer(reviewerHttp, routerKey), reviewerModels,
+            options.CiPollInterval, options.CiTimeout);
         var pipeline = new RunPipeline(
             source,
             ledger,
@@ -136,7 +150,8 @@ public static class FactoryRunner
                 new RouterClient(routerHttp, routerKey), TimeProvider.System, log, costSettleDelay: options.CostSettleDelay),
             ignoreScope: ignoreScope,
             controls: Controls(options),
-            pauseGrace: pauseGrace);
+            pauseGrace: pauseGrace,
+            gate: adjustGate is null ? gate : adjustGate(gate));
 
         return await pipeline.RunAsync(storyId, ct);
     }

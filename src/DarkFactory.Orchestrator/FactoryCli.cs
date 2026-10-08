@@ -10,7 +10,7 @@ public static class FactoryCli
 
     public static RootCommand Build(
         Func<int, bool, CancellationToken, Task<int>> run,
-        Func<string, int, CancellationToken, Task<int>> setupGitHubApp,
+        Func<string, int, bool, CancellationToken, Task<int>> setupGitHubApp,
         Func<RepoRef, CancellationToken, Task<int>> protectRepo,
         Func<CancellationToken, Task<int>> work,
         Func<CancellationToken, Task<int>> setDashboardPassword,
@@ -34,7 +34,7 @@ public static class FactoryCli
         {
             Description = "Claim and resume the story even if it is outside the Shortcut watch scope (the other claim checks still apply)",
         };
-        var runCommand = new Command("run", "Run one Shortcut story through Intake → Implement → Review, resuming from its last ledger state.")
+        var runCommand = new Command("run", "Run one Shortcut story through Intake → Implement → Review → CI → MergeGate → Merge, resuming from its last ledger state.")
         {
             storyArgument,
             ignoreScopeOption,
@@ -51,12 +51,23 @@ public static class FactoryCli
             Description = "Localhost port for the manifest-flow callback",
             DefaultValueFactory = _ => DefaultSetupPort,
         };
+        var gateOption = new Option<bool>("--gate")
+        {
+            Description = "Register the merge gate's own App instead (the only credential that can merge; keychain github-gate-app-*)",
+        };
         var setupCommand = new Command("setup", "Register the factory GitHub App via the manifest flow and store its key in the keychain.")
         {
             nameOption,
             portOption,
+            gateOption,
         };
-        setupCommand.SetAction((parse, ct) => setupGitHubApp(parse.GetValue(nameOption)!, parse.GetValue(portOption), ct));
+        setupCommand.SetAction((parse, ct) =>
+        {
+            var gate = parse.GetValue(gateOption);
+            // The default name is the workers' App's; the gate App needs its own (App names are unique on github.com).
+            var name = gate && parse.GetResult(nameOption) is null or { Implicit: true } ? $"dark-factory-gate-{Environment.UserName}" : parse.GetValue(nameOption)!;
+            return setupGitHubApp(name, parse.GetValue(portOption), gate, ct);
+        });
 
         var repoArgument = new Argument<RepoRef>("repo")
         {

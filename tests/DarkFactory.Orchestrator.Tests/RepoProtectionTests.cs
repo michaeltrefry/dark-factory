@@ -57,6 +57,20 @@ public class RepoProtectionTests
     }
 
     [Fact]
+    public void The_gate_app_may_bypass_the_factory_branch_rule_only_by_merging_a_pull_request()
+    {
+        var rulesets = RepoProtection.DesiredRulesets(gateAppId: 4242);
+        var branches = JsonDocument.Parse(RepoProtection.Serialize(rulesets.Single(r => r.Name == RepoProtection.BranchesRulesetName))).RootElement;
+
+        var actors = branches.GetProperty("bypass_actors").EnumerateArray()
+            .Select(a => (a.GetProperty("actor_id").GetInt64(), a.GetProperty("actor_type").GetString(), a.GetProperty("bypass_mode").GetString()));
+        Assert.Equal([((long)RepoProtection.RepositoryAdminRoleId, "RepositoryRole", "always"), (4242L, "Integration", "pull_request")], actors);
+        // Nothing else changes: main still needs a PR with no bypass, tags stay admin-only.
+        Assert.Empty(rulesets.Single(r => r.Name == RepoProtection.MainRulesetName).BypassActors);
+        Assert.Single(rulesets.Single(r => r.Name == RepoProtection.TagsRulesetName).BypassActors);
+    }
+
+    [Fact]
     public async Task Apply_creates_missing_rulesets_and_overwrites_existing_ones_by_name()
     {
         var api = new FakeApi()

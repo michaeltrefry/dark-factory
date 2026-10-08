@@ -23,6 +23,14 @@ public sealed class StreamJsonState
     /// </summary>
     public bool RateLimited { get; private set; }
 
+    private readonly List<string> _models = [];
+
+    /// <summary>
+    /// The models that answered the session's assistant turns (each message's <c>model</c>, as the router returned it), in
+    /// order of first appearance. Claude Code's own <c>&lt;synthetic&gt;</c> messages are not models and are skipped.
+    /// </summary>
+    public IReadOnlyList<string> Models => _models;
+
     public void Accept(string line)
     {
         if (string.IsNullOrWhiteSpace(line) || line.TrimStart()[0] != '{')
@@ -52,6 +60,13 @@ public sealed class StreamJsonState
             if (root.TryGetProperty("error", out var apiError) && apiError.ValueKind == JsonValueKind.String && apiError.ValueEquals("rate_limit"))
             {
                 RateLimited = true;
+            }
+            if (root.TryGetProperty("type", out var assistant) && assistant.ValueEquals("assistant")
+                && root.TryGetProperty("message", out var message) && message.ValueKind == JsonValueKind.Object
+                && message.TryGetProperty("model", out var model) && model.ValueKind == JsonValueKind.String
+                && model.GetString() is { Length: > 0 } name && !name.StartsWith('<') && !_models.Contains(name))
+            {
+                _models.Add(name);
             }
             if (root.TryGetProperty("type", out var type) && type.ValueEquals("result"))
             {

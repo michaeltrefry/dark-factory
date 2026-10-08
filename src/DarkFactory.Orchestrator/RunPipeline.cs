@@ -22,8 +22,9 @@ public sealed class WorkerFailedException(string message) : Exception(message);
 /// its last ledger state. Each registered handler does one state's work and makes one
 /// transition (E2); every transition and completed sub-step is a committed ledger row
 /// before the next starts (E3), so a re-run after a crash resumes where the ledger says
-/// and never redoes a recorded step. States without a handler park the item (phase 1
-/// parks at Review with the PR open). A failure escalates with a story comment (E10).
+/// and never redoes a recorded step. States without a handler park the item (with a
+/// <see cref="GateStage"/> the run goes on through review and the merge gate and parks at Watch
+/// once merged; without one it parks at Review with the PR open). A failure escalates with a story comment (E10).
 /// One run at a time per item: a second concurrent run exits without touching it.
 /// Worktrees are throwaway (E5): removed once the PR is open or the item escalates; only a
 /// paused (Ctrl-C) or crashed Implement keeps its worktree, for the re-run to resume in.
@@ -40,7 +41,7 @@ public sealed class WorkerFailedException(string message) : Exception(message);
 /// and worktree; Stop kills the worker and cancels the item (<see cref="ItemStopper"/>); a paused factory or epic
 /// claims nothing new.
 /// </summary>
-public sealed class RunPipeline(
+public sealed partial class RunPipeline(
     IWorkSource source,
     WorkLedger ledger,
     IRunLocks locks,
@@ -54,7 +55,8 @@ public sealed class RunPipeline(
     bool ignoreScope = false,
     IControls? controls = null,
     TimeSpan? pauseGrace = null,
-    TimeSpan? controlPollInterval = null)
+    TimeSpan? controlPollInterval = null,
+    GateStage? gate = null)
 {
     public const string Source = "shortcut";
 
@@ -110,6 +112,21 @@ public sealed class RunPipeline(
         public const string StopReported = "stop-reported";
         /// <summary>The item was paused by the factory's usage pause; Detail is its reason and resume time.</summary>
         public const string UsagePause = "usage-pause";
+        /// <summary>A model answered the implementer's session (first time seen for the item); Detail is the model id.</summary>
+        public const string ImplementerModel = "implementer-model";
+        /// <summary>
+        /// Review: a reviewer call is about to be made; Detail is "&lt;router session&gt; &lt;model&gt; &lt;head sha&gt;", so the
+        /// call's cost is readable even when it never returns (E9).
+        /// </summary>
+        public const string ReviewSession = "review-session";
+        /// <summary>Review: a reviewer's verdict on one head commit; Detail is the <see cref="Gate.ReviewVerdict"/> JSON.</summary>
+        public const string Verdict = "verdict";
+        /// <summary>MergeGate: one evaluation of the gate; Detail is its decision and reasons.</summary>
+        public const string GateDecision = "gate";
+        /// <summary>MergeGate: every rule held for this head commit (Detail) and the gate is merging exactly it.</summary>
+        public const string GatePassed = "gate-passed";
+        /// <summary>Merge: the board shows the item merged.</summary>
+        public const string MergedReported = "merged-reported";
     }
 
     /// <summary>
@@ -148,31 +165,57 @@ public sealed class RunPipeline(
         public Workspace? Workspace { get; set; }
     }
 
-    private Dictionary<WorkState, Func<Run, CancellationToken, Task>> Handlers => new()
+    private Dictionary<WorkState, Func<Run, CancellationToken, Task>> Handlers
     {
-        [WorkState.Intake] = IntakeAsync,
-        [WorkState.Implement] = ImplementAsync,
+        get
+        {
+            var handlers = new Dictionary<WorkState, Func<Run, CancellationToken, Task>>
+            {
+                [WorkState.Intake] = IntakeAsync,
+                [WorkState.Implement] = ImplementAsync,
+            };
+            if (gate is not null)
+            {
+                handlers[WorkState.Review] = ReviewAsync;
+                handlers[WorkState.CI] = CiAsync;
+                handlers[WorkState.MergeGate] = MergeGateAsync;
+                handlers[WorkState.Merge] = MergeAsync;
+            }
+            return handlers;
+        }
+    }
+
+    /// <summary>States the implement stage drives (all a pipeline without a <see cref="GateStage"/> drives).</summary>
+    public static readonly IReadOnlySet<WorkState> ImplementStates = new HashSet<WorkState> { WorkState.Intake, WorkState.Implement };
+
+    /// <summary>States the factory's handlers drive (the production pipeline has a <see cref="GateStage"/>); an item in one is in flight.</summary>
+    public static readonly IReadOnlySet<WorkState> HandledStates = new HashSet<WorkState>
+    {
+        WorkState.Intake, WorkState.Implement, WorkState.Review, WorkState.CI, WorkState.MergeGate, WorkState.Merge,
     };
 
-    /// <summary>States this phase's handlers drive; an item in one of them is in flight.</summary>
-    public static readonly IReadOnlySet<WorkState> HandledStates = new HashSet<WorkState> { WorkState.Intake, WorkState.Implement };
+    /// <summary>The states this pipeline drives.</summary>
+    private IReadOnlySet<WorkState> Handled => gate is null ? ImplementStates : HandledStates;
 
     /// <summary>
     /// Story ids of items a run should pick up, oldest first: items being stopped (whatever their state), then,
     /// unless a control pauses them, those in a handled state and those <see cref="Interrupted"/> or
     /// <see cref="UserPaused"/> (not parked) while in one.
     /// </summary>
-    public static async Task<IReadOnlyList<int>> InFlightAsync(WorkLedger ledger, CancellationToken ct, IControls? controls = null)
+    /// <param name="handled">The states the runner's pipeline drives; default <see cref="HandledStates"/> (production).</param>
+    public static async Task<IReadOnlyList<int>> InFlightAsync(WorkLedger ledger, CancellationToken ct, IControls? controls = null,
+        IReadOnlySet<WorkState>? handled = null)
     {
         controls ??= NoControls.Instance;
+        handled ??= HandledStates;
         var stopping = (await controls.ListAsync(ct)).Where(c => c.State == ControlState.Stopping).Select(c => c.Scope).ToHashSet();
         var ids = new List<int>();
         foreach (var item in await ledger.ActiveItemsAsync(Source, ct))
         {
             if (!stopping.Contains(ControlScope.Item(item.ExternalId)))
             {
-                var resumable = HandledStates.Contains(item.State)
-                    || (item.State == WorkState.Paused && ResumesAutomatically(await ledger.HistoryAsync(item, ct)));
+                var resumable = handled.Contains(item.State)
+                    || (item.State == WorkState.Paused && ResumesAutomatically(await ledger.HistoryAsync(item, ct), handled));
                 if (!resumable || await controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) != ControlState.Running)
                 {
                     continue;
@@ -186,20 +229,20 @@ public sealed class RunPipeline(
         return ids;
     }
 
-    private static bool ResumesAutomatically(List<LedgerEntry> history)
+    private static bool ResumesAutomatically(List<LedgerEntry> history, IReadOnlySet<WorkState> handled)
     {
         var paused = history.FindLastIndex(e => e.Step is null);
         var pausedFrom = TransitionContext.From(history.Where(e => e.Step is null).Select(e => e.State).ToList()).PausedFrom;
         return history[paused] is { State: WorkState.Paused, Detail: Interrupted or UserPaused or UsagePaused }
-            && pausedFrom is { } from && HandledStates.Contains(from)
+            && pausedFrom is { } from && handled.Contains(from)
             && !history.Skip(paused + 1).Any(e => e.Step == Steps.Parked);
     }
 
     /// <summary>Whether a run can move the item: it is in a handled state, escalated (re-queue), or paused from a handled state.</summary>
-    private static bool Runnable(WorkItem item, TransitionContext context) =>
-        HandledStates.Contains(item.State)
+    private bool Runnable(WorkItem item, TransitionContext context) =>
+        Handled.Contains(item.State)
         || item.State == WorkState.Escalated
-        || (item.State == WorkState.Paused && context.PausedFrom is { } from && HandledStates.Contains(from));
+        || (item.State == WorkState.Paused && context.PausedFrom is { } from && Handled.Contains(from));
 
     public async Task<RunOutcome> RunAsync(int storyId, CancellationToken ct)
     {
@@ -446,8 +489,11 @@ public sealed class RunPipeline(
         var (spec, repo, item) = run;
         var story = spec.Story;
         var branch = StoryId.BranchName(story.Id);
-        var attempt = CurrentImplementAttempt(await ledger.HistoryAsync(item, ct));
+        var fullHistory = await ledger.HistoryAsync(item, ct);
+        var attempt = CurrentImplementAttempt(fullHistory);
         var session = attempt.LastOrDefault(e => e.Step == Steps.Session)?.ClaudeSessionId;
+        // Every model that answers the implementer is recorded once, so the reviewer can be of another family.
+        var models = ImplementerModels(fullHistory).ToHashSet(StringComparer.Ordinal);
 
         // A worker a crashed run left behind must not keep editing (or resume the same session) alongside this one.
         if (OrphanedWorkerPid(attempt) is { } pid && await worker.StopOrphanAsync(pid, ct))
@@ -509,7 +555,14 @@ public sealed class RunPipeline(
                                 await ledger.CheckpointAsync(item, Steps.Session, sid, "claude session started", c);
                             }
                         },
-                        OnLine: capture is null ? null : capture.OnLineAsync), watch.Token);
+                        OnLine: capture is null ? null : capture.OnLineAsync,
+                        OnModel: async (model, c) =>
+                        {
+                            if (models.Add(model))
+                            {
+                                await ledger.CheckpointAsync(item, Steps.ImplementerModel, session, model, c);
+                            }
+                        }), watch.Token);
             }
             catch (Exception ex) when (watch.Requested is { } requested && !ct.IsCancellationRequested)
             {
@@ -1011,8 +1064,8 @@ public sealed class RunPipeline(
     {
         var history = await ledger.HistoryAsync(item, ct);
         var session = history.LastOrDefault(e => e.ClaudeSessionId is not null)?.ClaudeSessionId;
-        var pr = item.State == WorkState.Review
-            ? history.Last(e => e.Step is null && e.State == WorkState.Review).Detail
+        var pr = item.State is WorkState.Review or WorkState.CI or WorkState.MergeGate or WorkState.Merge or WorkState.Watch
+            ? LinkedPullRequestUrl(history)
             : null;
         return new RunOutcome(item.Id, item.State, session, pr, error);
     }

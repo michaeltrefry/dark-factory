@@ -19,6 +19,10 @@ public static class SecretAccounts
     public const string GitHubAppSlug = "github-app-slug";
     /// <summary>Stored base64-encoded (by <see cref="MacKeychain"/>) so the multi-line PEM round-trips through <c>security -w</c>.</summary>
     public const string GitHubAppPrivateKey = "github-app-private-key";
+    /// <summary>The merge gate's own App (<c>factory github-app setup --gate</c>): the only credential that can merge.</summary>
+    public const string GitHubGateAppId = "github-gate-app-id";
+    public const string GitHubGateAppSlug = "github-gate-app-slug";
+    public const string GitHubGateAppPrivateKey = "github-gate-app-private-key";
     /// <summary>The dashboard login's ASP.NET Identity (PBKDF2) password hash, written by <c>factory dashboard set-password</c>.</summary>
     public const string DashboardPasswordHash = "dashboard-password-hash";
 }

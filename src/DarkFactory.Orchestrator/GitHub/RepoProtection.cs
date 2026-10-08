@@ -10,9 +10,11 @@ namespace DarkFactory.Orchestrator.GitHub;
 /// Applies the factory's repository rulesets (E4) idempotently, authenticated as a
 /// repository admin (the owner's token, not the App): the default branch only changes
 /// through a pull request, and every ref outside <c>factory/**</c> can be created,
-/// updated or deleted only by repository admins — so the App can push only factory/*.
+/// updated or deleted only by repository admins — so the App can push only factory/*. With the merge gate's App id
+/// (<c>factory github-app setup --gate</c>) that App may also bypass the second rule, but only by merging a pull request
+/// (<c>bypass_mode: pull_request</c>): the gate merges; it can never push, and the workers' App can do neither.
 /// </summary>
-public sealed class RepoProtection(HttpClient http, string adminToken, TextWriter log)
+public sealed class RepoProtection(HttpClient http, string adminToken, TextWriter log, long? gateAppId = null)
 {
     /// <summary>Built-in "Repository admin" role id for ruleset bypass actors.</summary>
     public const int RepositoryAdminRoleId = 5;
@@ -48,7 +50,7 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
         [property: JsonPropertyName("required_review_thread_resolution")] bool RequiredReviewThreadResolution);
 
     public sealed record BypassActor(
-        [property: JsonPropertyName("actor_id")] int ActorId,
+        [property: JsonPropertyName("actor_id")] long ActorId,
         [property: JsonPropertyName("actor_type")] string ActorType,
         [property: JsonPropertyName("bypass_mode")] string BypassMode);
 
@@ -56,7 +58,10 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
 
     private static readonly Rule[] NoWrites = [new("creation"), new("update"), new("deletion")];
 
-    public static IReadOnlyList<Ruleset> DesiredRulesets() =>
+    /// <summary>The merge gate's App, bypassing the factory/** rule only to merge a pull request.</summary>
+    public static BypassActor GateMerges(long gateAppId) => new(gateAppId, "Integration", "pull_request");
+
+    public static IReadOnlyList<Ruleset> DesiredRulesets(long? gateAppId = null) =>
     [
         // No bypass: even the owner lands changes on main through a PR (approvals: 0, so they can merge).
         new(MainRulesetName, "branch", "active",
@@ -70,7 +75,7 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
         new(BranchesRulesetName, "branch", "active",
             new Conditions(new RefName(["~ALL"], [$"refs/heads/{Git.GitWorkspace.BranchPrefix}**"])),
             NoWrites,
-            AdminsOnly),
+            gateAppId is { } gate ? [.. AdminsOnly, GateMerges(gate)] : AdminsOnly),
         // contents:write would otherwise let the App push tags.
         new(TagsRulesetName, "tag", "active",
             new Conditions(new RefName(["~ALL"], [])),
@@ -92,7 +97,7 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
             .GroupBy(r => r.Name)
             .ToDictionary(g => g.Key, g => g.First().Id);
 
-        foreach (var ruleset in DesiredRulesets())
+        foreach (var ruleset in DesiredRulesets(gateAppId))
         {
             var update = existing.TryGetValue(ruleset.Name, out var id);
             using var request = GitHubApp.Request(update ? HttpMethod.Put : HttpMethod.Post,
@@ -114,11 +119,16 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
     private static string? NonEmpty(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
 
     /// <summary>`github-repo protect`: 0 on success, 1 when GitHub refuses or is unreachable (message only, never the token).</summary>
-    public static async Task<int> RunAsync(HttpClient http, string adminToken, RepoRef repo, TextWriter output, TextWriter error, CancellationToken ct)
+    public static async Task<int> RunAsync(HttpClient http, string adminToken, RepoRef repo, TextWriter output, TextWriter error, CancellationToken ct,
+        long? gateAppId = null)
     {
         try
         {
-            await new RepoProtection(http, adminToken, output).ApplyAsync(repo, ct);
+            if (gateAppId is null)
+            {
+                output.WriteLine("No merge gate App (`factory github-app setup --gate`): the rulesets let nothing merge pull requests but admins.");
+            }
+            await new RepoProtection(http, adminToken, output, gateAppId).ApplyAsync(repo, ct);
             return 0;
         }
         catch (Exception ex) when (ex is InvalidOperationException or HttpRequestException)

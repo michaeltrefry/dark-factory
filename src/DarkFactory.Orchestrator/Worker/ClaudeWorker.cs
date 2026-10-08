@@ -51,12 +51,14 @@ public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError,
 /// Hooks a worker run awaits while it runs, so the ledger knows about the run before it ends.
 /// <see cref="OnStarted"/> gets the worker's process id as soon as the process exists;
 /// <see cref="OnSession"/> gets the Claude session id as soon as it appears in the stream;
-/// <see cref="OnLine"/> gets every stdout line, in order, as it is read.
+/// <see cref="OnLine"/> gets every stdout line, in order, as it is read;
+/// <see cref="OnModel"/> gets each model that answers the session, the first time it appears.
 /// </summary>
 public sealed record WorkerCallbacks(
     Func<int, CancellationToken, Task>? OnStarted = null,
     Func<string, CancellationToken, Task>? OnSession = null,
-    Func<string, CancellationToken, ValueTask>? OnLine = null);
+    Func<string, CancellationToken, ValueTask>? OnLine = null,
+    Func<string, CancellationToken, Task>? OnModel = null);
 
 public interface IWorker
 {
@@ -349,8 +351,9 @@ public sealed class ClaudeWorker(
             {
                 await onStarted(process.Id, ct);
             }
-            var (onSession, onLine) = (callbacks?.OnSession, callbacks?.OnLine);
+            var (onSession, onLine, onModel) = (callbacks?.OnSession, callbacks?.OnLine, callbacks?.OnModel);
             string? reported = null;
+            var modelsReported = 0;
             while (await process.StandardOutput.ReadLineAsync(timeoutCts.Token) is { } line)
             {
                 if (onLine is not null)
@@ -363,6 +366,10 @@ public sealed class ClaudeWorker(
                 {
                     reported = sid;
                     await onSession(sid, ct);
+                }
+                while (onModel is not null && modelsReported < state.Models.Count)
+                {
+                    await onModel(state.Models[modelsReported++], ct);
                 }
             }
             await process.WaitForExitAsync(timeoutCts.Token);

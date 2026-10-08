@@ -159,3 +159,48 @@ it there before relying on a count.
 By hand (the terminal story, sc-25182): read every story of epic sc-25171 and the epic itself back from Shortcut and
 confirm their final states (stories Done once merged and validated; the epic done). Tracker writes are verified by
 reading them back, since the Shortcut tools report success even for ignored parameters.
+
+# Phase 2 acceptance runbook (review → gate → merge)
+
+## P2-AT1/P2-AT2 — the walking skeleton merges on the sandbox (sc-25378)
+
+Automated: `ReviewGateTests` (tests/DarkFactory.AcceptanceTests), live, skipped unless `FACTORY_E2E=1`. Each runs
+`factory run` (production wiring, `--ignore-scope`, a throwaway ledger) on its own To Do bug story whose fix lands in the
+sandbox, and the gate **really merges** the PR into the sandbox's main.
+
+Owner set-up, once (the test skips naming whichever is missing):
+
+1. `factory github-app setup --gate`, then install the gate App on the sandbox repo.
+2. `factory github-repo protect michaeltrefry/dark-factory-sandbox` again, so the "only admins write outside factory/**"
+   ruleset lists the gate App as a `pull_request`-mode bypass actor (it may merge PRs, never push).
+3. A committed `factory/gate.yaml` on the sandbox's main (`version: 1`, `require: {ci: green, review: pass}`).
+
+| Test | Variables | Proves |
+| --- | --- | --- |
+| `Gate_merges_a_green_pr_a_different_family_reviewer_passed_and_the_ledger_records_the_merge_commit` | `FACTORY_E2E_GATE_STORY=sc-<id>` | Intake → … → Review → CI → MergeGate → Merge → Watch; one pass verdict from a family none of the implementer's models is, accounted by the router under its own session; the PR merged at the reviewed head; the Merge row holds GitHub's merge commit; the story is Done |
+| `A_push_after_the_verdict_blocks_the_merge_until_the_new_head_is_reviewed_again` | `FACTORY_E2E_GATE_PUSH_STORY=sc-<id>` | a commit pushed to the PR branch right after the first verdict sends the item from CI back to Review; the new head is reviewed; `gate-passed` and the merge name only the new head |
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_GATE_STORY=sc-<id> FACTORY_E2E_GATE_PUSH_STORY=sc-<id> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-class "*ReviewGateTests"
+```
+
+Since sc-25378 every `factory run` / `factory work` run goes on past Review, so the Phase 1 tests above (AT1–AT5) also
+need the gate App, and their stories' PRs get merged when they pass the gate.
+
+## Upgrading a Phase 1 ledger: items parked at Review escalate once
+
+Phase 1 parked every finished item at Review; since sc-25378 Review is a state the factory drives, so the first
+`factory work` (or `factory run sc-<id>`) after the upgrade picks up every such item, and each one escalates once, with a
+comment on its story:
+
+- "The implementer's model is unknown …": Phase 1 never recorded which model implemented it (`implementer-model`
+  checkpoints are new), so no reviewer of a different family can be chosen. If the PR should still go through the gate,
+  `factory run sc-<id>` re-runs the item from Intake (a fresh implementation whose models are recorded); otherwise close
+  the PR and handle the story by hand.
+- "… is merged outside the factory." / "… is closed outside the factory.": the owner already merged or closed the PR.
+  Nothing more is needed from the factory: move the story on the board by hand. The item stays Escalated (in-flight
+  pickup never resumes an Escalated item).
+
+Expected and one-time: these escalations are the ledger catching up, not failures of the gate. They come from the
+ledger's state alone, so closing the stories or PRs first does not prevent them.
