@@ -833,9 +833,17 @@ public class RunPipelineTests
     public async Task A_new_session_in_a_repo_whose_settings_define_a_hook_is_tainted_from_its_start_and_refused_its_push()
     {
         var (h, _) = WithRepoSettings(HookSettings);
+        string? atStart = null;
+        var worker = new FakeWorker(async call =>
+        {
+            await call.OnSession("sess-77", CancellationToken.None);
+            atStart = (await h.Ledger.TaintOfAsync("sess-77", CancellationToken.None))?.Reason; // before the session does anything
+            return Ok;
+        });
 
-        var outcome = await h.Run(new FakeWorker(Reports(Ok)));
+        var outcome = await h.Run(worker);
 
+        Assert.Equal(Taint.RepoSettings, atStart);
         Assert.Equal(WorkState.Escalated, outcome.State);
         Assert.Equal(("sess-77", Taint.RepoSettings), await h.Db.SessionTaints.Select(t => ValueTuple.Create(t.ClaudeSessionId, t.Reason)).SingleAsync());
         Assert.DoesNotContain(h.Workspaces.Calls, c => c.StartsWith("push"));
