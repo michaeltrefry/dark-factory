@@ -692,14 +692,26 @@ public sealed partial class RunPipeline
         }
         else
         {
+            // The runs execute model-written code for up to Gate:TestTimeoutMinutes each: a Pause or Stop cancels them (the
+            // runner stops the sandboxed commands) and nothing is recorded, so Continue runs the check again.
+            await using var watch = new TestRunWatch(_controls, _controlPoll, run.Item, log, ct);
             try
             {
                 result = await NewTestsCheck.RunAsync(runner, NewTestsCheck.Strategies, run.Repo, pull.BaseSha, pull.HeadSha,
-                    NewTestsCheck.RunName(run.Story.Id), line => log.WriteLine($"[gate] {line}"), ct);
+                    NewTestsCheck.RunName(run.Story.Id), line => log.WriteLine($"[gate] {line}"), watch.Token);
+            }
+            catch (Exception) when (watch.Requested is { } requested && !ct.IsCancellationRequested)
+            {
+                throw new ControlRequestedException(requested);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 result = NewTestsResult.Without(pull.BaseSha, pull.HeadSha, NewTestsOutcome.Error, $"the new tests could not be run: {ex.Message}");
+            }
+            if (watch.Requested is { } late && !ct.IsCancellationRequested)
+            {
+                // The control arrived as the runs ended: the result may be from cancelled runs, so it is not recorded either.
+                throw new ControlRequestedException(late);
             }
         }
         await ledger.CheckpointAsync(run.Item, Steps.NewTests, null, result.ToDetail(), ct);
@@ -708,6 +720,63 @@ public sealed partial class RunPipeline
     }
 
     /// <summary>The merge commit of <paramref name="pull"/> when it is merged at a head a <see cref="Steps.GatePassed"/> names, else null.</summary>
+    /// <summary>
+    /// Watches an item's controls while the gate's test runs execute (polling, like a worker's watch): a Pause or Stop
+    /// cancels <see cref="Token"/> at once and is kept in <see cref="Requested"/>.
+    /// </summary>
+    private sealed class TestRunWatch : IAsyncDisposable
+    {
+        private readonly CancellationTokenSource _runs;
+        private readonly CancellationTokenSource _done = new();
+        private readonly Task _loop;
+        private int _requested = -1;
+
+        public TestRunWatch(IControls controls, TimeSpan poll, WorkItem item, TextWriter log, CancellationToken ct)
+        {
+            _runs = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _loop = Task.Run(() => WatchAsync(controls, poll, item, log));
+        }
+
+        /// <summary>Cancelled by Ctrl-C, Pause or Stop.</summary>
+        public CancellationToken Token => _runs.Token;
+
+        public ControlState? Requested => Volatile.Read(ref _requested) is var r and >= 0 ? (ControlState)r : null;
+
+        private async Task WatchAsync(IControls controls, TimeSpan poll, WorkItem item, TextWriter log)
+        {
+            while (!_done.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(poll, _done.Token);
+                    if (await controls.EffectiveAsync(item.ExternalId, item.EpicId, _done.Token) is not ControlState.Running and var state)
+                    {
+                        Volatile.Write(ref _requested, (int)state);
+                        log.WriteLine($"[control] {item.ExternalId} is {(state == ControlState.Stopping ? "being stopped" : "paused")}; stopping the gate's test runs");
+                        await _runs.CancelAsync();
+                        return;
+                    }
+                }
+                catch (OperationCanceledException) when (_done.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    log.WriteLine($"[control] could not read the controls of {item.ExternalId}: {ex.Message}; retrying");
+                }
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await _done.CancelAsync();
+            await _loop;
+            _runs.Dispose();
+            _done.Dispose();
+        }
+    }
+
     private static string? GatePassedAt(List<LedgerEntry> history, PullFacts pull) =>
         pull.Merged && history.Any(e => e.Step == Steps.GatePassed && e.Detail == pull.HeadSha) ? pull.MergeCommitSha : null;
 

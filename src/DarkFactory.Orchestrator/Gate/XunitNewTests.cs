@@ -14,10 +14,12 @@ namespace DarkFactory.Orchestrator.Gate;
 /// <c>Namespace.Class.Method</c>, nested classes joined with <c>+</c>, as xUnit names them — no base version of a changed
 /// test file has. Parsed with Roslyn's syntax tree (no build, nothing executed). New data rows on an existing theory are
 /// unisolable (its old rows would pass on the base) and test methods outside an xUnit project are another stack's: both
-/// make the check unsupported. Runs: <c>dotnet restore</c>, <c>dotnet build --no-restore</c>, then <c>dotnet test
-/// --no-build</c> on just the new tests — <c>--filter-method</c> per test and xUnit's TRX report under Microsoft.Testing.Platform
-/// (<c>global.json</c> <c>test.runner</c>), else VSTest's <c>--filter FullyQualifiedName=…</c> and TRX logger — in the
-/// repository root; results from the TRX files (cases joined to their test by class and method name).
+/// make the check unsupported. Runs, per test project holding a new test (no solution file involved, so a new test
+/// project runs on the base too): <c>dotnet restore</c>, <c>dotnet build --no-restore</c> (errors also to an errors-only
+/// file log), then <c>dotnet test --no-build</c> on just its new tests — <c>--filter-method</c> per test and xUnit's TRX
+/// report under Microsoft.Testing.Platform (<c>global.json</c> <c>test.runner</c>), else VSTest's <c>--filter
+/// FullyQualifiedName=…</c> and TRX logger; results from the TRX files (cases joined to their test by class and method
+/// name). A failed base build is explained from the error log (<see cref="ExplainBuildFailure"/>).
 /// </summary>
 public sealed class XunitNewTests : INewTestStrategy
 {
@@ -35,12 +37,14 @@ public sealed class XunitNewTests : INewTestStrategy
 
     public async Task<NewTestSet> IdentifyAsync(TestSource source, IReadOnlyList<ChangedFile> changes, CancellationToken ct)
     {
-        var headProjects = await TestProjectDirectoriesAsync(source, source.HeadSha, ct);
-        var baseProjects = await TestProjectDirectoriesAsync(source, source.BaseSha, ct);
+        var headProjectFiles = await TestProjectsAsync(source, source.HeadSha, ct);
+        var headProjects = headProjectFiles.Select(p => p.Directory).ToList();
+        var baseProjects = (await TestProjectsAsync(source, source.BaseSha, ct)).Select(p => p.Directory).ToList();
         var testFiles = changes.Where(c => (c.NewPath is { } n && Under(n, headProjects)) || (c.OldPath is { } o && Under(o, baseProjects))).ToList();
 
         var baseTests = new Dictionary<string, TestMethod>(StringComparer.Ordinal);
         var headTests = new Dictionary<string, TestMethod>(StringComparer.Ordinal);
+        var projects = new Dictionary<string, string>(StringComparer.Ordinal);
         var unisolable = new List<string>();
         foreach (var change in changes)
         {
@@ -55,9 +59,18 @@ public sealed class XunitNewTests : INewTestStrategy
                 }
                 if (change.NewPath is { } head && Understands(head))
                 {
+                    // The test's project: the deepest test project directory holding the file.
+                    var project = headProjectFiles.Where(p => Under(head, [p.Directory])).OrderByDescending(p => p.Directory.Length).Select(p => p.Project).FirstOrDefault();
                     foreach (var method in TestMethods(await source.ReadAsync(source.HeadSha, head, ct)))
                     {
-                        headTests.TryAdd(method.Id, method);
+                        if (project is null)
+                        {
+                            unisolable.Add($"{head} has test method {method.Id} outside an xUnit test project");
+                        }
+                        else if (headTests.TryAdd(method.Id, method))
+                        {
+                            projects[method.Id] = project;
+                        }
                     }
                 }
             }
@@ -76,25 +89,25 @@ public sealed class XunitNewTests : INewTestStrategy
                 unisolable.Add($"new data rows on the existing theory {id} cannot be run apart from its old rows (add them as a new test method)");
             }
         }
-        return new NewTestSet(testFiles, added, unisolable);
+        return new NewTestSet(testFiles, added, unisolable) { Projects = added.ToDictionary(id => id, id => projects[id], StringComparer.Ordinal) };
     }
 
     private static bool Under(string path, IReadOnlyList<string> directories) =>
         directories.Any(d => d.Length == 0 || path.StartsWith(d + "/", StringComparison.Ordinal));
 
-    /// <summary>The directories of the commit's projects that reference an xUnit package.</summary>
-    private static async Task<IReadOnlyList<string>> TestProjectDirectoriesAsync(TestSource source, string sha, CancellationToken ct)
+    /// <summary>The commit's projects that reference an xUnit package, with their directories.</summary>
+    private static async Task<IReadOnlyList<(string Project, string Directory)>> TestProjectsAsync(TestSource source, string sha, CancellationToken ct)
     {
-        var directories = new List<string>();
+        var projects = new List<(string, string)>();
         foreach (var project in (await source.FilesAsync(sha, ct)).Where(f => f.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase)))
         {
             if (await source.ReadAsync(sha, project, ct) is { } text && XunitReference.IsMatch(text))
             {
                 var slash = project.LastIndexOf('/');
-                directories.Add(slash < 0 ? "" : project[..slash]);
+                projects.Add((project, slash < 0 ? "" : project[..slash]));
             }
         }
-        return directories;
+        return projects;
     }
 
     /// <summary>A test method: its xUnit id, whether it is a theory, and its data attributes (whitespace-normalized source).</summary>
@@ -108,13 +121,13 @@ public sealed class XunitNewTests : INewTestStrategy
     /// </summary>
     public static IReadOnlyList<TestMethod> TestMethods(string? source, IReadOnlySet<string>? also = null)
     {
-        if (source is null)
-        {
-            return [];
-        }
+        return source is null ? [] : TestMethodNodes(CSharpSyntaxTree.ParseText(source).GetRoot(), also).Select(m => m.Method).ToList();
+    }
+
+    private static List<(TestMethod Method, MethodDeclarationSyntax Syntax)> TestMethodNodes(SyntaxNode root, IReadOnlySet<string>? also = null)
+    {
         var extra = also ?? NoAttributes;
-        var root = CSharpSyntaxTree.ParseText(source).GetRoot();
-        var methods = new List<TestMethod>();
+        var methods = new List<(TestMethod, MethodDeclarationSyntax)>();
         foreach (var method in root.DescendantNodes().OfType<MethodDeclarationSyntax>())
         {
             var attributes = method.AttributeLists.SelectMany(l => l.Attributes).Select(a => (Name: AttributeName(a), Syntax: a)).ToList();
@@ -130,7 +143,7 @@ public sealed class XunitNewTests : INewTestStrategy
             }
             var rows = attributes.Where(a => a.Name.EndsWith("Data", StringComparison.Ordinal))
                 .Select(a => Regex.Replace(a.Syntax.ToString(), @"\s+", "")).ToList();
-            methods.Add(new TestMethod($"{type}.{method.Identifier.Text}", isTheory, rows));
+            methods.Add((new TestMethod($"{type}.{method.Identifier.Text}", isTheory, rows), method));
         }
         return methods;
     }
@@ -161,30 +174,49 @@ public sealed class XunitNewTests : INewTestStrategy
         return namespaces.Count == 0 ? nested : $"{string.Join('.', namespaces)}.{nested}";
     }
 
-    public async Task<IReadOnlyList<TestStep>> StepsAsync(TestSource source, string commit, IReadOnlyList<string> tests, CancellationToken ct)
+    public string BuildLogPattern => "build-errors-*.log";
+
+    /// <summary>
+    /// Per project holding a new test (so a new test project needs no solution entry, and no other project is built):
+    /// <c>dotnet restore</c>, <c>dotnet build --no-restore</c> with an errors-only file log
+    /// (<c>build-errors-&lt;n&gt;.log</c>), then <c>dotnet test --no-build</c> on just its new tests, results in
+    /// <c>&lt;n&gt;/</c> of <paramref name="resultsDirectory"/>.
+    /// </summary>
+    public async Task<IReadOnlyList<TestStep>> StepsAsync(TestSource source, string commit, IReadOnlyList<string> tests, IReadOnlyDictionary<string, string> projects,
+        string resultsDirectory, CancellationToken ct)
     {
         var platform = UsesTestingPlatform(await source.ReadAsync(commit, "global.json", ct));
-        List<string> test = ["test", "--no-build", "--results-directory", NewTestsCheck.ResultsDirectory];
-        if (platform)
+        var byProject = tests.GroupBy(id => projects.TryGetValue(id, out var p) ? p
+                : throw new InvalidOperationException($"The new test {id} has no project."), StringComparer.Ordinal)
+            .OrderBy(g => g.Key, StringComparer.Ordinal).ToList();
+        var steps = new List<TestStep>();
+        steps.AddRange(byProject.Select(g => new TestStep(TestPhase.Restore, "dotnet", ["restore", ProjectArgument(g.Key)])));
+        steps.AddRange(byProject.Select((g, n) => new TestStep(TestPhase.Build, "dotnet",
+            ["build", "--no-restore", ProjectArgument(g.Key), $"-flp:errorsonly;logfile={resultsDirectory}/build-errors-{n}.log"])));
+        foreach (var (group, n) in byProject.Select((g, n) => (g, n)))
         {
-            test.Add("--report-xunit-trx");
-            foreach (var id in tests)
+            List<string> test = platform ? ["test", "--project", ProjectArgument(group.Key)] : ["test", ProjectArgument(group.Key)];
+            test.AddRange(["--no-build", "--results-directory", $"{resultsDirectory}/{n}"]);
+            if (platform)
             {
-                test.Add("--filter-method");
-                test.Add(id);
+                test.Add("--report-xunit-trx");
+                foreach (var id in group)
+                {
+                    test.Add("--filter-method");
+                    test.Add(id);
+                }
             }
+            else
+            {
+                test.AddRange(["--logger", "trx", "--filter", string.Join('|', group.Select(id => $"FullyQualifiedName={id}"))]);
+            }
+            steps.Add(new TestStep(TestPhase.Test, "dotnet", test));
         }
-        else
-        {
-            test.AddRange(["--logger", "trx", "--filter", string.Join('|', tests.Select(id => $"FullyQualifiedName={id}"))]);
-        }
-        return
-        [
-            new TestStep(TestPhase.Restore, "dotnet", ["restore"]),
-            new TestStep(TestPhase.Build, "dotnet", ["build", "--no-restore"]),
-            new TestStep(TestPhase.Test, "dotnet", test),
-        ];
+        return steps;
     }
+
+    /// <summary>A project path as a command argument: relative to the worktree root, never read as an option.</summary>
+    private static string ProjectArgument(string project) => $"./{project}";
 
     /// <summary>Whether <c>global.json</c> opts <c>dotnet test</c> into Microsoft.Testing.Platform (<c>"test": {"runner": …}</c>).</summary>
     public static bool UsesTestingPlatform(string? globalJson)
@@ -264,5 +296,133 @@ public sealed class XunitNewTests : INewTestStrategy
         "Passed" => TestCaseResult.Passed,
         "NotExecuted" or "Inconclusive" or "Pending" => TestCaseResult.Skipped,
         _ => TestCaseResult.Failed,
+    };
+
+    /// <summary>An MSBuild error line: <c>[n&gt;]file(line,col[,endLine,endCol]): error CODE: message [project]</c>.</summary>
+    private static readonly Regex LocatedError = new(
+        @"^\s*(?:\d+>)?(?<file>\S.*?)\((?<line>\d{1,9}),(?<col>\d{1,9})(?:,\d{1,9},\d{1,9})?\)\s*:\s*error\s+(?<code>[A-Za-z]+\d+)\s*:\s*(?<message>.*?)(?:\s+\[[^\]]*\])?\s*$",
+        RegexOptions.CultureInvariant);
+
+    private static readonly Regex UnlocatedError = new(@"error\s+(?<code>[A-Za-z]+\d+)\s*:\s*(?<message>.*?)(?:\s+\[[^\]]*\])?\s*$", RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// The errors of an errors-only MSBuild file log (<c>-flp:errorsonly</c>): one per non-empty line. A line that does not
+    /// name a file inside one of <paramref name="roots"/> becomes an error with no path (it then attributes nothing).
+    /// </summary>
+    public IReadOnlyList<BuildError> ParseBuildErrors(string log, IReadOnlyList<string> roots)
+    {
+        var errors = new List<BuildError>();
+        foreach (var line in log.Split('\n').Select(l => l.TrimEnd('\r')).Where(l => l.Trim().Length > 0))
+        {
+            if (LocatedError.Match(line) is { Success: true } located)
+            {
+                errors.Add(new BuildError(Relative(located.Groups["file"].Value, roots), int.Parse(located.Groups["line"].Value),
+                    int.Parse(located.Groups["col"].Value), located.Groups["code"].Value, located.Groups["message"].Value));
+            }
+            else
+            {
+                var bare = UnlocatedError.Match(line);
+                errors.Add(new BuildError(null, 0, 0, bare.Success ? bare.Groups["code"].Value : "", bare.Success ? bare.Groups["message"].Value : line.Trim()));
+            }
+        }
+        return errors.Distinct().ToList();
+    }
+
+    /// <summary><paramref name="file"/> relative to the first root it is under ('/'-separated), else null.</summary>
+    private static string? Relative(string file, IReadOnlyList<string> roots)
+    {
+        if (!Path.IsPathRooted(file))
+        {
+            return null;
+        }
+        var full = Path.GetFullPath(file);
+        foreach (var root in roots)
+        {
+            var prefix = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)) + Path.DirectorySeparatorChar;
+            if (full.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                return full[prefix.Length..].Replace(Path.DirectorySeparatorChar, '/');
+            }
+        }
+        return null;
+    }
+
+    private static readonly Regex CompilerCode = new(@"^CS\d+$", RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// Each compiler (<c>CS</c>) error in an applied <c>.cs</c> file is placed, by Roslyn syntax tree of that file as it was
+    /// built, in its innermost member declaration or <c>using</c> directive (its unit). A new test whose own method, or a
+    /// type that contains it, is a unit does not build on the base. The retry's files leave every outermost unit out. An
+    /// error outside any unit (e.g. an assembly attribute) is unremovable; any other error (another code, another file, no
+    /// file, a position outside the file) is unattributable; a build that names no error at all is too.
+    /// </summary>
+    public BuildFailure ExplainBuildFailure(IReadOnlyDictionary<string, string> applied, IReadOnlyList<BuildError> errors, IReadOnlyList<string> tests)
+    {
+        var unattributable = new List<string>();
+        var unremovable = new List<string>();
+        var files = new SortedDictionary<string, (SyntaxNode Root, HashSet<SyntaxNode> Units)>(StringComparer.Ordinal);
+        if (errors.Count == 0)
+        {
+            unattributable.Add("the build failed without naming an error");
+        }
+        foreach (var error in errors)
+        {
+            if (error.Path is not { } path || !CompilerCode.IsMatch(error.Code) || !Understands(path) || !applied.TryGetValue(path, out var text))
+            {
+                unattributable.Add(error.ToString());
+                continue;
+            }
+            if (!files.TryGetValue(path, out var file))
+            {
+                files[path] = file = (CSharpSyntaxTree.ParseText(text).GetRoot(), new HashSet<SyntaxNode>());
+            }
+            var lines = file.Root.SyntaxTree.GetText().Lines;
+            if (error.Line < 1 || error.Line > lines.Count)
+            {
+                unattributable.Add(error.ToString());
+                continue;
+            }
+            var line = lines[error.Line - 1];
+            var position = Math.Min(line.Start + Math.Max(error.Column - 1, 0), Math.Max(line.End - 1, line.Start));
+            var unit = file.Root.FindToken(position).Parent?.AncestorsAndSelf()
+                .FirstOrDefault(n => n is UsingDirectiveSyntax || n is MemberDeclarationSyntax and not BaseNamespaceDeclarationSyntax);
+            if (unit is null)
+            {
+                unremovable.Add(error.ToString());
+                continue;
+            }
+            file.Units.Add(unit);
+        }
+
+        var wanted = tests.ToHashSet(StringComparer.Ordinal);
+        var notBuilt = new HashSet<string>(StringComparer.Ordinal);
+        var removed = new List<string>();
+        var replacements = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var (path, (root, units)) in files.Where(f => f.Value.Units.Count > 0))
+        {
+            foreach (var (method, syntax) in TestMethodNodes(root))
+            {
+                if (wanted.Contains(method.Id) && syntax.AncestorsAndSelf().Any(units.Contains))
+                {
+                    notBuilt.Add(method.Id);
+                }
+            }
+            var outermost = units.Where(u => !u.Ancestors().Any(units.Contains)).OrderBy(u => u.SpanStart).ToList();
+            removed.AddRange(outermost.Select(u => $"{path}:{u.GetLocation().GetLineSpan().StartLinePosition.Line + 1} {Describe(u)}"));
+            replacements[path] = root.RemoveNodes(outermost, SyntaxRemoveOptions.KeepDirectives)!.ToFullString();
+        }
+        return new BuildFailure(tests.Where(notBuilt.Contains).ToList(), unattributable, unremovable, removed, replacements);
+    }
+
+    private static string Describe(SyntaxNode node) => node switch
+    {
+        UsingDirectiveSyntax u => u.ToString().Trim(),
+        TypeDeclarationSyntax t => $"{t.Keyword.Text} {t.Identifier.Text}",
+        BaseTypeDeclarationSyntax t => t.Identifier.Text,
+        MethodDeclarationSyntax m => $"{m.Identifier.Text}()",
+        ConstructorDeclarationSyntax c => $"{c.Identifier.Text}()",
+        PropertyDeclarationSyntax p => p.Identifier.Text,
+        BaseFieldDeclarationSyntax f => string.Join(", ", f.Declaration.Variables.Select(v => v.Identifier.Text)),
+        _ => node.Kind().ToString(),
     };
 }

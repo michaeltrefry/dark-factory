@@ -39,10 +39,13 @@ public sealed record TestStep(TestPhase Phase, string Program, IReadOnlyList<str
 
 /// <summary>
 /// One sandboxed test run: <see cref="Commit"/> checked out in a fresh throwaway worktree named <see cref="Name"/>; with
-/// <see cref="OverlayFrom"/>, the <see cref="OverlayPaths"/> of that commit written over it and <see cref="DeletePaths"/>
-/// removed (the base run: the PR's test files applied to the base commit); then <see cref="Steps"/>, and the files matching
-/// <see cref="INewTestStrategy.ResultFilePattern"/> under <see cref="NewTestsCheck.ResultsDirectory"/> parsed by
-/// <see cref="Strategy"/>.
+/// <see cref="OverlayFrom"/>, the <see cref="OverlayPaths"/> of that commit written over it, <see cref="DeletePaths"/>
+/// removed and the <see cref="Replacements"/> written in place of those files (the base run: the PR's test files applied
+/// to the base commit; its retry: the same without the members that did not compile there); then <see cref="Steps"/>, and
+/// the files matching <see cref="INewTestStrategy.ResultFilePattern"/> (after a failed build,
+/// <see cref="INewTestStrategy.BuildLogPattern"/>) under <see cref="ResultsDirectory"/> parsed by <see cref="Strategy"/>.
+/// <see cref="ResultsDirectory"/> is a fresh random name per run (<see cref="NewTestsCheck.NewResultsDirectory"/>), so no
+/// commit can have put files there; a worktree that already has it fails the run.
 /// </summary>
 public sealed record TestRunSpec(
     string Name,
@@ -51,7 +54,12 @@ public sealed record TestRunSpec(
     IReadOnlyList<string> OverlayPaths,
     IReadOnlyList<string> DeletePaths,
     IReadOnlyList<TestStep> Steps,
-    INewTestStrategy Strategy);
+    INewTestStrategy Strategy,
+    string ResultsDirectory)
+{
+    /// <summary>Overlaid files written with this content instead of the <see cref="OverlayFrom"/> commit's, by path.</summary>
+    public IReadOnlyDictionary<string, string> Replacements { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
+}
 
 public enum TestRunStatus
 {
@@ -59,7 +67,7 @@ public enum TestRunStatus
     Ran,
     /// <summary>The restore failed: an environment failure, never evidence about the tests.</summary>
     RestoreFailed,
-    /// <summary>The code did not build (on the base: the new tests cannot pass there).</summary>
+    /// <summary>The code did not build; <see cref="TestRunReport.BuildErrors"/> says where (on the base, <see cref="BuildFailure"/>).</summary>
     BuildFailed,
     /// <summary>The run did not finish within its timeout.</summary>
     TimedOut,
@@ -67,9 +75,21 @@ public enum TestRunStatus
     NoResults,
 }
 
+/// <summary>
+/// One error of a failed build: its file (repository-relative; null when it names no file inside the worktree, e.g. an
+/// MSBuild or NuGet error), 1-based line and column, code (e.g. <c>CS0117</c>; empty when it has none) and message.
+/// </summary>
+public sealed record BuildError(string? Path, int Line, int Column, string Code, string Message)
+{
+    public override string ToString() => Path is null ? $"{Code} {Message}".Trim() : $"{Path}({Line},{Column}): {Code} {Message}";
+}
+
 /// <summary>What one run produced: its status, each test's cases by test id, and the tail of its output.</summary>
 public sealed record TestRunReport(TestRunStatus Status, IReadOnlyDictionary<string, IReadOnlyList<TestCaseResult>> Results, string Log)
 {
+    /// <summary>A <see cref="TestRunStatus.BuildFailed"/> run's errors, read from the build's error logs.</summary>
+    public IReadOnlyList<BuildError> BuildErrors { get; init; } = [];
+
     public static TestRunReport Failed(TestRunStatus status, string log) => new(status, new Dictionary<string, IReadOnlyList<TestCaseResult>>(), log);
 }
 
@@ -117,11 +137,43 @@ public sealed class TestSource(IGateTestRunner runner, RepoRef repo, string base
 /// <summary>
 /// What one test stack found in the PR: the changed files that are its test files (<see cref="TestFiles"/>: the base run
 /// applies them), the ids of the tests the PR adds (<see cref="Tests"/>), and additions it cannot isolate as tests
-/// (<see cref="Unisolable"/>, each with why: the check cannot run them, so it fails, E2).
+/// (<see cref="Unisolable"/>, each with why: the check cannot run them, so it fails, E2). <see cref="Projects"/> names the
+/// project (at the head) that holds each new test: the runs build and test just those projects.
 /// </summary>
 public sealed record NewTestSet(IReadOnlyList<ChangedFile> TestFiles, IReadOnlyList<string> Tests, IReadOnlyList<string> Unisolable)
 {
     public static readonly NewTestSet None = new([], [], []);
+
+    /// <summary>Each new test's project file, by test id.</summary>
+    public IReadOnlyDictionary<string, string> Projects { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
+}
+
+/// <summary>
+/// What a failed base build (the base with the PR's test files) says about the new tests, by compiler evidence only: the
+/// new tests a compiler error lies in (<see cref="NotBuilt"/>: in the test method's own declaration, or the header of a
+/// type that contains it — such a test cannot pass on the base, so it counts as failing there); errors that say nothing
+/// about the tests (<see cref="Unattributable"/>: not a compiler error, or in a file the PR's test files did not apply —
+/// the base run is then no evidence, an error); compiler errors in the applied files outside any member
+/// (<see cref="Unremovable"/>: no retry can build without them, so the other new tests stay unproven); and, for the one
+/// retry, the applied files without every member and <c>using</c> that holds an error (<see cref="Replacements"/>;
+/// <see cref="Removed"/> describes each).
+/// </summary>
+public sealed record BuildFailure(
+    IReadOnlyList<string> NotBuilt,
+    IReadOnlyList<string> Unattributable,
+    IReadOnlyList<string> Unremovable,
+    IReadOnlyList<string> Removed,
+    IReadOnlyDictionary<string, string> Replacements);
+
+/// <summary>
+/// The base side of one stack's check: the base run (<see cref="Run"/>), and when it did not build, its
+/// <see cref="BuildFailure"/> (<see cref="First"/>) and the retry without the members that did not compile
+/// (<see cref="Retry"/>, and its own <see cref="RetryFailure"/> when that did not build either).
+/// </summary>
+public sealed record BaseEvidence(TestRunReport Run, BuildFailure? First = null, TestRunReport? Retry = null, BuildFailure? RetryFailure = null)
+{
+    /// <summary>The new tests a compiler error was attributed to, in the base run or its retry.</summary>
+    public IEnumerable<string> NotBuilt => (First?.NotBuilt ?? []).Concat(RetryFailure?.NotBuilt ?? []);
 }
 
 /// <summary>
@@ -140,16 +192,33 @@ public interface INewTestStrategy
     /// </summary>
     bool Understands(string path);
 
-    /// <summary>The result files a run leaves under <see cref="NewTestsCheck.ResultsDirectory"/> (e.g. <c>*.trx</c>).</summary>
+    /// <summary>The result files a run leaves under its <see cref="TestRunSpec.ResultsDirectory"/> (e.g. <c>*.trx</c>).</summary>
     string ResultFilePattern { get; }
+
+    /// <summary>The build-error logs a run's build steps leave under its <see cref="TestRunSpec.ResultsDirectory"/>.</summary>
+    string BuildLogPattern { get; }
 
     Task<NewTestSet> IdentifyAsync(TestSource source, IReadOnlyList<ChangedFile> changes, CancellationToken ct);
 
-    /// <summary>The commands that restore, build and run exactly <paramref name="tests"/> at <paramref name="commit"/>.</summary>
-    Task<IReadOnlyList<TestStep>> StepsAsync(TestSource source, string commit, IReadOnlyList<string> tests, CancellationToken ct);
+    /// <summary>
+    /// The commands that restore, build and run exactly <paramref name="tests"/> (in their <paramref name="projects"/>) at
+    /// <paramref name="commit"/>: every restore, then every build, then every test command, writing results and build-error
+    /// logs under <paramref name="resultsDirectory"/> (relative to the worktree root).
+    /// </summary>
+    Task<IReadOnlyList<TestStep>> StepsAsync(TestSource source, string commit, IReadOnlyList<string> tests, IReadOnlyDictionary<string, string> projects,
+        string resultsDirectory, CancellationToken ct);
 
     /// <summary>Each test's cases (by test id) from the run's result files.</summary>
     IReadOnlyDictionary<string, IReadOnlyList<TestCaseResult>> ParseResults(IEnumerable<string> resultFiles);
+
+    /// <summary>The errors in one build-error log; files under one of <paramref name="roots"/> (the worktree) are made relative to it.</summary>
+    IReadOnlyList<BuildError> ParseBuildErrors(string log, IReadOnlyList<string> roots);
+
+    /// <summary>
+    /// Attributes a failed base build's <paramref name="errors"/> to the new <paramref name="tests"/>, given the content of
+    /// every file the run applied (<paramref name="applied"/>, by path; deterministic, nothing compiled).
+    /// </summary>
+    BuildFailure ExplainBuildFailure(IReadOnlyDictionary<string, string> applied, IReadOnlyList<BuildError> errors, IReadOnlyList<string> tests);
 }
 
 /// <summary>The check's outcomes. Anything but <see cref="Pass"/> fails the check (the typed outcome maps it to <c>gate_rejected</c>).</summary>
@@ -157,13 +226,19 @@ public static class NewTestsOutcome
 {
     /// <summary>Every new test failed (or could not build) on the base and passed on the head.</summary>
     public const string Pass = "pass";
-    /// <summary>A new test already passes on the base (it checks nothing), or does not pass on the head.</summary>
+    /// <summary>
+    /// A new test already passes on the base (it checks nothing), is skipped there, could not be shown to fail there (the
+    /// base does not build with it, for a reason outside its own declaration), or does not pass on the head.
+    /// </summary>
     public const string Rejected = "rejected";
     /// <summary>The PR adds no test, in a tier that requires the check.</summary>
     public const string NoTests = "no-tests";
     /// <summary>The PR adds tests in a stack no strategy supports, or ones a strategy cannot isolate: the check cannot run.</summary>
     public const string Unsupported = "unsupported";
-    /// <summary>A run could not produce evidence (restore failed, timed out, no results, a git or sandbox failure).</summary>
+    /// <summary>
+    /// A run could not produce evidence (restore failed, timed out, no results, a new test not executed, a base build error
+    /// outside the PR's test files or not from the compiler, a git or sandbox failure).
+    /// </summary>
     public const string Error = "error";
 }
 
@@ -189,6 +264,14 @@ public sealed record NewTestsResult(
     [property: JsonPropertyName("head_run")] string? HeadRun,
     [property: JsonPropertyName("tests")] IReadOnlyList<NewTestResult> Tests)
 {
+    /// <summary>The base retry's status (null: none ran), after a base that did not build with the PR's test files.</summary>
+    [JsonPropertyName("base_retry")]
+    public string? BaseRetry { get; init; }
+
+    /// <summary>What the base retry left out of the PR's test files (members and <c>using</c>s that did not compile there).</summary>
+    [JsonPropertyName("base_removed")]
+    public IReadOnlyList<string> BaseRemoved { get; init; } = [];
+
     [JsonIgnore]
     public bool Passed => Outcome == NewTestsOutcome.Pass;
 
@@ -203,7 +286,7 @@ public sealed record NewTestsResult(
         try
         {
             return JsonSerializer.Deserialize<NewTestsResult>(detail) is { BaseSha: not null, HeadSha: not null, Outcome: not null } r
-                ? r with { Tests = r.Tests ?? [], Reason = r.Reason ?? "" }
+                ? r with { Tests = r.Tests ?? [], Reason = r.Reason ?? "", BaseRemoved = r.BaseRemoved ?? [] }
                 : null;
         }
         catch (JsonException)
@@ -220,15 +303,22 @@ public sealed record NewTestsResult(
 /// The merge gate's <c>new-tests-fail-on-base</c> check (sc-25382), deterministic code over executed results (E1, E5):
 /// the tests the PR adds are found from the files at the base and the head (<see cref="INewTestStrategy"/>), run on the
 /// base commit with the PR's test files applied and on the head, each in a throwaway sandboxed worktree. Every new test
-/// must not pass on the base (a failure, or a base that does not build with the new tests, counts) and must pass on the
-/// head. A new test that already passes on the base checks nothing: rejected, naming it. A PR that adds no test fails the
-/// check (it is required only where a tier lists it: normal and protected by the floor); one whose tests no strategy
-/// can run (another stack, or new data rows on an existing theory) fails as unsupported (E2).
+/// must fail on the base and pass on the head. A new test that already passes on the base checks nothing, and one skipped
+/// there proves nothing: rejected, naming it. A base that does not build with the PR's test files is evidence only for the
+/// new tests a compiler error lies in (<see cref="BuildFailure"/>: those cannot pass there, so they count as failing);
+/// the others get a real result from one retry of the base without every member that did not compile, and any the retry
+/// cannot run either stay unproven (rejected, named) — so no test that passes on the base hides behind another's compile
+/// error. A PR that adds no test fails the check (it is required only where a tier lists it: normal and protected by the
+/// floor); one whose tests no strategy can run (another stack, or new data rows on an existing theory) fails as
+/// unsupported (E2).
 /// </summary>
 public static class NewTestsCheck
 {
-    /// <summary>Where a run's result files go, relative to the worktree root.</summary>
-    public const string ResultsDirectory = ".factory-test-results";
+    /// <summary>The prefix of a run's results directory (relative to the worktree root; <see cref="NewResultsDirectory"/>).</summary>
+    public const string ResultsDirectoryPrefix = ".factory-test-results-";
+
+    /// <summary>A fresh results directory name: random, so no commit can have put result files there in advance.</summary>
+    public static string NewResultsDirectory() => ResultsDirectoryPrefix + Guid.NewGuid().ToString("N");
 
     /// <summary>The supported stacks.</summary>
     public static readonly IReadOnlyList<INewTestStrategy> Strategies = [new XunitNewTests()];
@@ -276,11 +366,49 @@ public static class NewTestsCheck
             var deletes = set.TestFiles.Where(f => f.OldPath is not null && f.OldPath != f.NewPath).Select(f => f.OldPath!)
                 .Where(p => !overlay.Contains(p)).Distinct(StringComparer.Ordinal).ToList();
             log?.Invoke($"{strategy.Name}: {set.Tests.Count} new test(s): {string.Join(", ", set.Tests)}; base {Ci.Short(baseSha)} + {overlay.Count} test file(s), then head {Ci.Short(headSha)}");
-            var baseRun = await runner.RunAsync(repo, new TestRunSpec($"{runName}-base", baseSha, headSha, overlay, deletes,
-                await strategy.StepsAsync(source, baseSha, set.Tests, ct), strategy), ct);
-            var headRun = await runner.RunAsync(repo, new TestRunSpec($"{runName}-head", headSha, null, [], [],
-                await strategy.StepsAsync(source, headSha, set.Tests, ct), strategy), ct);
-            results.Add(Judge(baseSha, headSha, strategy.Name, set.Tests, baseRun, headRun));
+            async Task<TestRunSpec> Spec(string name, string commit, string? from, IReadOnlyList<string> tests)
+            {
+                var directory = NewResultsDirectory();
+                return new TestRunSpec(name, commit, from, from is null ? [] : overlay, from is null ? [] : deletes,
+                    await strategy.StepsAsync(source, commit, tests, set.Projects, directory, ct), strategy, directory);
+            }
+            var baseSpec = await Spec($"{runName}-base", baseSha, headSha, set.Tests);
+            var baseRun = await runner.RunAsync(repo, baseSpec, ct);
+            var headRun = await runner.RunAsync(repo, await Spec($"{runName}-head", headSha, null, set.Tests), ct);
+            var evidence = new BaseEvidence(baseRun);
+            if (baseRun.Status == TestRunStatus.BuildFailed && headRun.Status == TestRunStatus.Ran)
+            {
+                // Which new tests the compiler says cannot build on the base; the others get one retry without whatever
+                // did not compile, so a test that passes there cannot hide behind another one's compile error.
+                var applied = new Dictionary<string, string>(StringComparer.Ordinal);
+                foreach (var path in overlay)
+                {
+                    if (await source.ReadAsync(headSha, path, ct) is { } text)
+                    {
+                        applied[path] = text;
+                    }
+                }
+                var first = strategy.ExplainBuildFailure(applied, baseRun.BuildErrors, set.Tests);
+                evidence = evidence with { First = first };
+                var remaining = set.Tests.Except(first.NotBuilt, StringComparer.Ordinal).ToList();
+                if (first.Unattributable.Count == 0 && first.Unremovable.Count == 0 && remaining.Count > 0 && first.Replacements.Count > 0)
+                {
+                    log?.Invoke($"{strategy.Name}: the base does not build with the PR's test files; retrying it without {string.Join(", ", first.Removed)}");
+                    var retrySpec = await Spec($"{runName}-base-retry", baseSha, headSha, remaining) with { Replacements = first.Replacements };
+                    var retry = await runner.RunAsync(repo, retrySpec, ct);
+                    evidence = evidence with { Retry = retry };
+                    if (retry.Status == TestRunStatus.BuildFailed)
+                    {
+                        var stripped = new Dictionary<string, string>(applied, StringComparer.Ordinal);
+                        foreach (var (path, text) in first.Replacements)
+                        {
+                            stripped[path] = text;
+                        }
+                        evidence = evidence with { RetryFailure = strategy.ExplainBuildFailure(stripped, retry.BuildErrors, remaining) };
+                    }
+                }
+            }
+            results.Add(Judge(baseSha, headSha, strategy.Name, set.Tests, evidence, headRun));
         }
         return results.FirstOrDefault(r => !r.Passed) ?? results[0] with
         {
@@ -290,56 +418,105 @@ public static class NewTestsCheck
         };
     }
 
+    /// <summary>A new test's base summary when a compiler error lies in its own declaration (it cannot pass on the base).</summary>
+    public const string NotBuilt = "not-built";
+
+    /// <summary>A new test's base summary when the base did not build with it for a reason outside its own declaration.</summary>
+    public const string Unproven = "unproven";
+
+    /// <summary>A new test's summary when its run ran but has no case of it.</summary>
+    public const string NotRun = "not-run";
+
+    /// <summary>Judges one stack's runs, the base run taken as it is (<see cref="BaseEvidence"/> without a build explanation).</summary>
+    public static NewTestsResult Judge(string baseSha, string headSha, string strategy, IReadOnlyList<string> tests, TestRunReport baseRun, TestRunReport headRun) =>
+        Judge(baseSha, headSha, strategy, tests, new BaseEvidence(baseRun), headRun);
+
     /// <summary>
-    /// Judges one stack's runs: the head must have run and every new test pass there (every case passed); the base must
-    /// have restored and run (or failed to build — the new tests cannot pass there) and no new test may pass there.
+    /// Judges one stack's runs. The head must have run and every new test pass there (every case passed). On the base every
+    /// new test must have failed (a failing case), or hold a compiler error in its own declaration
+    /// (<see cref="NotBuilt"/>). A new test that passes or is skipped on the base, or that the base never built for another
+    /// reason (<see cref="Unproven"/>), is rejected, named; a base run that produced no evidence (restore failed, timed
+    /// out, no results, build errors that are no compiler error in the PR's test files, a new test not executed) is an error.
     /// </summary>
-    public static NewTestsResult Judge(string baseSha, string headSha, string strategy, IReadOnlyList<string> tests, TestRunReport baseRun, TestRunReport headRun)
+    public static NewTestsResult Judge(string baseSha, string headSha, string strategy, IReadOnlyList<string> tests, BaseEvidence evidence, TestRunReport headRun)
     {
         var (b, h) = (Ci.Short(baseSha), Ci.Short(headSha));
-        var rows = tests.Select(t => new NewTestResult(t, Summary(baseRun, t), Summary(headRun, t), Cases(baseRun, t), Cases(headRun, t))).ToList();
+        var notBuilt = evidence.NotBuilt.ToHashSet(StringComparer.Ordinal);
+        // The run that has each test's base result: the retry when one ran, else the base run.
+        var baseRun = evidence.Retry ?? evidence.Run;
+        var rows = tests.Select(t => notBuilt.Contains(t)
+            ? new NewTestResult(t, NotBuilt, Summary(headRun, t), [], Cases(headRun, t))
+            : new NewTestResult(t, baseRun.Status == TestRunStatus.BuildFailed ? Unproven : Summary(baseRun, t), Summary(headRun, t), Cases(baseRun, t), Cases(headRun, t)))
+            .ToList();
         NewTestsResult Result(string outcome, string reason) =>
-            new(baseSha, headSha, outcome, reason, strategy, Status(baseRun.Status), Status(headRun.Status), rows);
+            new(baseSha, headSha, outcome, reason, strategy, Status(evidence.Run.Status), Status(headRun.Status), rows)
+            {
+                BaseRetry = evidence.Retry is { } retry ? Status(retry.Status) : null,
+                BaseRemoved = evidence.Retry is null ? [] : evidence.First?.Removed ?? [],
+            };
 
         if (headRun.Status != TestRunStatus.Ran)
         {
             return Result(NewTestsOutcome.Error, $"the head {h} could not be tested ({Status(headRun.Status)}): {Tail(headRun.Log)}");
         }
-        if (baseRun.Status is not (TestRunStatus.Ran or TestRunStatus.BuildFailed))
+        foreach (var (run, label) in new[] { (evidence.Run, "the base"), (evidence.Retry, "the base retry") })
         {
-            return Result(NewTestsOutcome.Error, $"the base {b} with the PR's test files could not be tested ({Status(baseRun.Status)}): {Tail(baseRun.Log)}");
+            if (run is not null && run.Status is not (TestRunStatus.Ran or TestRunStatus.BuildFailed))
+            {
+                return Result(NewTestsOutcome.Error, $"{label} {b} with the PR's test files could not be tested ({Status(run.Status)}): {Tail(run.Log)}");
+            }
         }
-        var notPassingOnHead = rows.Where(r => r.Head != TestCaseResult.Passed).ToList();
-        var passingOnBase = rows.Where(r => r.Base == TestCaseResult.Passed).ToList();
+        if ((evidence.Run.Status == TestRunStatus.BuildFailed && evidence.First is null)
+            || (evidence.Retry?.Status == TestRunStatus.BuildFailed && evidence.RetryFailure is null))
+        {
+            return Result(NewTestsOutcome.Error, $"the base {b} does not build with the PR's test files and its build errors were not examined: {Tail(baseRun.Log)}");
+        }
+        var unattributable = (evidence.First?.Unattributable ?? []).Concat(evidence.RetryFailure?.Unattributable ?? []).ToList();
+        if (unattributable.Count > 0)
+        {
+            return Result(NewTestsOutcome.Error,
+                $"the base {b} does not build with the PR's test files for a reason that says nothing about the new tests (not a compiler error in those files): {string.Join("; ", unattributable.Take(10))}");
+        }
+
         var reasons = new List<string>();
-        if (passingOnBase.Count > 0)
+        void Name(IEnumerable<NewTestResult> named, string why)
         {
-            reasons.Add($"new test(s) already pass on the base {b} (with the PR's test files), so they check nothing: {string.Join(", ", passingOnBase.Select(r => r.Test))}");
+            if (named.Select(r => r.Test).ToList() is { Count: > 0 } list)
+            {
+                reasons.Add($"{why}: {string.Join(", ", list)}");
+            }
         }
-        if (notPassingOnHead.Count > 0)
+        Name(rows.Where(r => r.Base == TestCaseResult.Passed), $"new test(s) already pass on the base {b} (with the PR's test files), so they check nothing");
+        Name(rows.Where(r => r.Base == TestCaseResult.Skipped), $"new test(s) are skipped on the base {b}, which does not show they fail there");
+        if (rows.Any(r => r.Base == Unproven))
         {
-            reasons.Add($"new test(s) do not pass on the head {h}: {string.Join(", ", notPassingOnHead.Select(r => $"{r.Test} ({r.Head})"))}");
+            var why = (evidence.RetryFailure ?? evidence.First)!;
+            var blocking = why.Unremovable.Concat(why.Removed).ToList();
+            Name(rows.Where(r => r.Base == Unproven),
+                $"new test(s) could not be shown to fail on the base {b}: it does not build with the PR's test files for a reason outside their own declarations ({string.Join("; ", blocking.Take(10))})");
         }
+        Name(rows.Where(r => r.Head != TestCaseResult.Passed).Select(r => r with { Test = $"{r.Test} ({r.Head})" }), $"new test(s) do not pass on the head {h}");
         if (reasons.Count > 0)
         {
             return Result(NewTestsOutcome.Rejected, string.Join("; ", reasons));
         }
-        var how = baseRun.Status == TestRunStatus.BuildFailed ? $"pass on the head {h}, and the base {b} does not build with them" : $"fail on the base {b} and pass on the head {h}";
-        return Result(NewTestsOutcome.Pass, $"{rows.Count} new test(s) {how}: {string.Join(", ", rows.Select(r => r.Test))}");
+        if (rows.Where(r => r.Base == NotRun).Select(r => r.Test).ToList() is { Count: > 0 } notRun)
+        {
+            return Result(NewTestsOutcome.Error, $"new test(s) were not executed on the base {b} (with the PR's test files), which is no evidence they fail there: {string.Join(", ", notRun)}");
+        }
+        var compiled = rows.Where(r => r.Base == NotBuilt).Select(r => r.Test).ToList();
+        var how = compiled.Count == 0 ? "" : $" ({compiled.Count} of them do not compile there: {string.Join(", ", compiled)})";
+        return Result(NewTestsOutcome.Pass, $"{rows.Count} new test(s) fail on the base {b}{how} and pass on the head {h}: {string.Join(", ", rows.Select(r => r.Test))}");
     }
 
     private static IReadOnlyList<TestCaseResult> Cases(TestRunReport run, string test) =>
         run.Results.TryGetValue(test, out var cases) ? cases : [];
 
-    /// <summary>passed (every case passed), failed (any failed), skipped, not-run (no case), not-built (the run did not build).</summary>
+    /// <summary>passed (every case passed), failed (any failed), skipped, not-run (no case).</summary>
     private static string Summary(TestRunReport run, string test)
     {
-        if (run.Status == TestRunStatus.BuildFailed)
-        {
-            return "not-built";
-        }
         var cases = Cases(run, test);
-        return cases.Count == 0 ? "not-run"
+        return cases.Count == 0 ? NotRun
             : cases.All(c => c.Outcome == TestCaseResult.Passed) ? TestCaseResult.Passed
             : cases.Any(c => c.Outcome == TestCaseResult.Failed) ? TestCaseResult.Failed
             : TestCaseResult.Skipped;

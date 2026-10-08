@@ -138,10 +138,13 @@ public sealed class GitWorkspace(
     }
 
     /// <summary>
-    /// Writes <paramref name="paths"/> as they are at <paramref name="commit"/> over the worktree and removes
-    /// <paramref name="deletes"/> (owner-side git, with the clone-side admin dir; literal pathspecs).
+    /// Writes <paramref name="paths"/> as they are at <paramref name="commit"/> over the worktree, removes
+    /// <paramref name="deletes"/>, then writes each of <paramref name="replacements"/> (one of <paramref name="paths"/>, by
+    /// path) with the given content instead. Owner-side git only, with the clone-side admin dir and literal pathspecs, so
+    /// nothing is written through a link the commit holds; call it before anything runs in the worktree.
     /// </summary>
-    public async Task OverlayAsync(Workspace workspace, string commit, IReadOnlyList<string> paths, IReadOnlyList<string> deletes, CancellationToken ct)
+    public async Task OverlayAsync(Workspace workspace, string commit, IReadOnlyList<string> paths, IReadOnlyList<string> deletes, CancellationToken ct,
+        IReadOnlyDictionary<string, string>? replacements = null)
     {
         string[] tree = ["--literal-pathspecs", $"--git-dir={workspace.GitDir}", $"--work-tree={workspace.Path}"];
         if (paths.Count > 0)
@@ -151,6 +154,31 @@ public sealed class GitWorkspace(
         if (deletes.Count > 0)
         {
             await Git(workspace.Path, null, ct, [.. tree, "rm", "-q", "-r", "--ignore-unmatch", "--", .. deletes]);
+        }
+        if (replacements is not { Count: > 0 })
+        {
+            return;
+        }
+        if (replacements.Keys.FirstOrDefault(p => !paths.Contains(p, StringComparer.Ordinal)) is { } stray)
+        {
+            throw new ArgumentException($"'{stray}' is not one of the overlaid paths.", nameof(replacements));
+        }
+        // The content goes into the object store from an owner-only temporary file, then git writes it into the worktree.
+        var staging = Directory.CreateTempSubdirectory("df-overlay-");
+        try
+        {
+            foreach (var (path, content, n) in replacements.OrderBy(r => r.Key, StringComparer.Ordinal).Select((r, n) => (r.Key, r.Value, n)))
+            {
+                var file = Path.Combine(staging.FullName, n.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                await File.WriteAllTextAsync(file, content, ct);
+                var blob = (await Git(workspace.Path, null, ct, [.. tree, "hash-object", "-w", "--no-filters", "--", file])).Trim();
+                await Git(workspace.Path, null, ct, [.. tree, "update-index", "--cacheinfo", "100644", blob, path]);
+                await Git(workspace.Path, null, ct, [.. tree, "checkout-index", "-f", "--", path]);
+            }
+        }
+        finally
+        {
+            staging.Delete(recursive: true);
         }
     }
 

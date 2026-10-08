@@ -33,29 +33,55 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
 
     public async Task<TestRunReport> RunAsync(RepoRef repo, TestRunSpec spec, CancellationToken ct)
     {
+        if (spec.ResultsDirectory is not { Length: > 0 } name || name.Contains('/') || name.Contains('\\') || name is "." or "..")
+        {
+            throw new ArgumentException($"'{spec.ResultsDirectory}' is not a results directory name.", nameof(spec));
+        }
         var workspace = await git.PrepareCommitAsync(repo, spec.Name, spec.Commit, ct);
         try
         {
             if (spec.OverlayFrom is { } overlay)
             {
-                await git.OverlayAsync(workspace, overlay, spec.OverlayPaths, spec.DeletePaths, ct);
+                await git.OverlayAsync(workspace, overlay, spec.OverlayPaths, spec.DeletePaths, ct, spec.Replacements);
+            }
+            // Every result file must come from this run: the directory is a fresh random name, and nothing may be there yet.
+            var results = Path.Combine(workspace.Path, spec.ResultsDirectory);
+            if (Directory.Exists(results) || File.Exists(results) || new FileInfo(results).LinkTarget is not null)
+            {
+                throw new InvalidOperationException($"The run's results directory {spec.ResultsDirectory} already exists in {Ci.Short(spec.Commit)}'s worktree.");
             }
             var log = new StringBuilder();
             var deadline = DateTimeOffset.UtcNow + timeout;
+            var buildFailed = false;
             foreach (var step in spec.Steps)
             {
+                if (buildFailed && step.Phase == TestPhase.Test)
+                {
+                    break;
+                }
                 var (exit, output, timedOut) = await RunStepAsync(workspace.Path, step, deadline - DateTimeOffset.UtcNow, ct);
                 log.AppendLine($"$ {step.Program} {string.Join(' ', step.Args)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
                 if (timedOut)
                 {
                     return TestRunReport.Failed(TestRunStatus.TimedOut, log.ToString());
                 }
-                if (exit != 0 && step.Phase != TestPhase.Test)
+                if (exit != 0 && step.Phase == TestPhase.Restore)
                 {
-                    return TestRunReport.Failed(step.Phase == TestPhase.Restore ? TestRunStatus.RestoreFailed : TestRunStatus.BuildFailed, log.ToString());
+                    return TestRunReport.Failed(TestRunStatus.RestoreFailed, log.ToString());
                 }
+                // Every build step runs, so the errors of every project are known.
+                buildFailed |= exit != 0 && step.Phase == TestPhase.Build;
             }
-            var files = ResultFiles(Path.Combine(workspace.Path, NewTestsCheck.ResultsDirectory), spec.Strategy.ResultFilePattern);
+            if (buildFailed)
+            {
+                string[] roots = [workspace.Path, RealPath(workspace.Path)];
+                return TestRunReport.Failed(TestRunStatus.BuildFailed, log.ToString()) with
+                {
+                    BuildErrors = ResultFiles(results, spec.Strategy.BuildLogPattern)
+                        .SelectMany(l => spec.Strategy.ParseBuildErrors(l, roots)).Distinct().ToList(),
+                };
+            }
+            var files = ResultFiles(results, spec.Strategy.ResultFilePattern);
             return files.Count == 0
                 ? TestRunReport.Failed(TestRunStatus.NoResults, log.ToString())
                 : new TestRunReport(TestRunStatus.Ran, spec.Strategy.ParseResults(files), log.ToString());
@@ -64,6 +90,25 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
         {
             await git.RemoveAsync(repo, workspace, CancellationToken.None);
         }
+    }
+
+    /// <summary>
+    /// <paramref name="path"/> with every symlinked component resolved (e.g. macOS <c>/var</c> → <c>/private/var</c>): the
+    /// form the build tools, which see the real working directory, print in their errors. The owner's own directories only.
+    /// </summary>
+    internal static string RealPath(string path)
+    {
+        var full = Path.GetFullPath(path);
+        var current = Path.GetPathRoot(full)!;
+        foreach (var part in full[current.Length..].Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
+        {
+            current = Path.Combine(current, part);
+            if (new DirectoryInfo(current) is { LinkTarget: not null } link && link.ResolveLinkTarget(returnFinalTarget: true) is { } target)
+            {
+                current = target.FullName;
+            }
+        }
+        return current;
     }
 
     /// <summary>

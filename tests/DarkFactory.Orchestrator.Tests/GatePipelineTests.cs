@@ -222,6 +222,8 @@ public class GatePipelineTests
         public ReviewPanelModels Models { get; init; } = ReviewPanelModels.Default;
         /// <summary>When set, the gate's waits run on <see cref="Time"/> (which only moves when the test advances it).</summary>
         public bool GateOnFakeClock { get; init; }
+        /// <summary>How often a run's controls are polled while a worker or the gate's test runs execute (the pipeline's default when null).</summary>
+        public TimeSpan? ControlPoll { get; init; }
         public WorkLedger Ledger => new(Db, TimeProvider.System);
 
         public Task<RunOutcome> Run(string? implementerModel = ImplementerModel, CancellationToken ct = default) =>
@@ -230,6 +232,7 @@ public class GatePipelineTests
         public Task<RunOutcome> Run(string?[] implementerModels, CancellationToken ct = default) =>
             new RunPipeline(Stories, Ledger, Locks, Workspaces, new HarnessWorker(this, implementerModels), Prs, Sandbox, TextWriter.Null,
                     controls: Controls,
+                    controlPollInterval: ControlPoll,
                     gate: new GateStage(GitHub, Panel ?? Reviewer, Models, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5), GateOnFakeClock ? Time : null,
                         TestRunner))
                 .RunAsync(77, ct);

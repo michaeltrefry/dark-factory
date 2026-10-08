@@ -53,6 +53,9 @@ internal sealed class FakeTestRunner : IGateTestRunner
     /// <summary>When set, a run throws this (e.g. the sandbox is unavailable).</summary>
     public Exception? RunThrows { get; set; }
 
+    /// <summary>When set, a run is this (e.g. one that waits on its cancellation token) instead of <see cref="Answer"/>.</summary>
+    public Func<TestRunSpec, CancellationToken, Task<TestRunReport>>? Running { get; set; }
+
     public List<TestRunSpec> Runs { get; } = [];
 
     public FakeTestRunner()
@@ -65,10 +68,12 @@ internal sealed class FakeTestRunner : IGateTestRunner
     public static TestRunReport Report(IReadOnlyList<TestStep> steps, string outcome) => new(TestRunStatus.Ran,
         Filtered(steps).ToDictionary(t => t, t => (IReadOnlyList<TestCaseResult>)[new TestCaseResult(t, outcome)]), "ran");
 
-    /// <summary>The test ids a run's test step filters on (either runner's form).</summary>
-    public static IReadOnlyList<string> Filtered(IReadOnlyList<TestStep> steps)
+    /// <summary>The test ids a run's test steps filter on (either runner's form).</summary>
+    public static IReadOnlyList<string> Filtered(IReadOnlyList<TestStep> steps) =>
+        steps.Where(s => s.Phase == TestPhase.Test).SelectMany(s => Filtered(s.Args)).ToList();
+
+    private static IEnumerable<string> Filtered(IReadOnlyList<string> args)
     {
-        var args = steps.Single(s => s.Phase == TestPhase.Test).Args;
         var methods = args.Select((a, i) => (a, i)).Where(x => x.a == "--filter-method").Select(x => args[x.i + 1]).ToList();
         if (methods.Count > 0)
         {
@@ -77,6 +82,12 @@ internal sealed class FakeTestRunner : IGateTestRunner
         var filter = args.SkipWhile(a => a != "--filter").Skip(1).FirstOrDefault() ?? "";
         return filter.Split('|', StringSplitOptions.RemoveEmptyEntries).Select(f => f["FullyQualifiedName=".Length..]).ToList();
     }
+
+    /// <summary>A base run that did not build, with these errors.</summary>
+    public static TestRunReport NotBuilt(params BuildError[] errors) => TestRunReport.Failed(TestRunStatus.BuildFailed, "build failed") with { BuildErrors = errors };
+
+    /// <summary>A compiler error at <paramref name="line"/> of <paramref name="path"/> (column 5).</summary>
+    public static BuildError CompilerError(string path, int line, string code = "CS0117") => new(path, line, 5, code, "does not compile");
 
     private Dictionary<string, string> FilesAt(string sha) => sha == BaseSha ? BaseFiles : HeadFiles(sha);
 
@@ -116,6 +127,8 @@ internal sealed class FakeTestRunner : IGateTestRunner
     public Task<TestRunReport> RunAsync(RepoRef repo, TestRunSpec spec, CancellationToken ct)
     {
         Runs.Add(spec);
-        return RunThrows is { } failure ? Task.FromException<TestRunReport>(failure) : Task.FromResult(Answer(spec));
+        return RunThrows is { } failure ? Task.FromException<TestRunReport>(failure)
+            : Running is { } running ? running(spec, ct)
+            : Task.FromResult(Answer(spec));
     }
 }
