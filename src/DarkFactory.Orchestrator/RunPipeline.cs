@@ -507,7 +507,7 @@ public sealed partial class RunPipeline(
         var fullHistory = await ledger.HistoryAsync(item, ct);
         var attempt = CurrentWorkerAttempt(fullHistory);
         var session = attempt.LastOrDefault(e => e.Step == Steps.Session)?.ClaudeSessionId;
-        // Every model that answers the implementer is recorded once, so the reviewer can be of another family.
+        // Every model that answers the implementer is recorded once (implementer-model), for the record of what wrote the code.
         var models = ImplementerModels(fullHistory).ToHashSet(StringComparer.Ordinal);
 
         // A worker a crashed run left behind must not keep editing (or resume the same session) alongside this one.
@@ -577,8 +577,8 @@ public sealed partial class RunPipeline(
     /// <summary>
     /// Runs one worker session in <paramref name="workspace"/> (the implementer's, or a fix round's), continuing
     /// <paramref name="session"/> when set: every stdout line is stored as it streams (E7), the pid, the session id and each
-    /// model that answers are checkpointed as they appear (models into <paramref name="models"/>, so the review panel is of
-    /// another family than every model that wrote the code), and Pause/Stop are watched. A paused or usage-limited session
+    /// model that answers are checkpointed as they appear (models into <paramref name="models"/>, each recorded once), and
+    /// Pause/Stop are watched. A paused or usage-limited session
     /// throws <see cref="ControlRequestedException"/> (resumed later); a failed one throws <see cref="WorkerFailedException"/>.
     /// On success it checkpoints <see cref="Steps.WorkerDone"/> and returns the session id.
     /// </summary>

@@ -179,10 +179,13 @@ Owner set-up, once (the test skips naming whichever is missing):
    a sealed or protected path escalates instead of merging. Since sc-25382 a normal-tier change must also add an xUnit test
    that fails on the base and passes on the head (`new-tests-fail-on-base`, run sandboxed as `_factory`, so `sudo
    scripts/setup-worker-user.sh` must be in place), and the policy must list that check in `normal` and `protected`.
+4. `Review:Models` set to a Claude Opus 5.5 or newer id the router routes under `x-weave-force-model` (sc-25379: every
+   reviewer is one, whichever models the implementer used; there is no default, and the factory refuses to start without
+   it — the router's catalog on 2026-10-08 offered no such id).
 
 | Test | Variables | Proves |
 | --- | --- | --- |
-| `Gate_merges_a_green_pr_a_different_family_reviewer_passed_and_the_ledger_records_the_merge_commit` | `FACTORY_E2E_GATE_STORY=sc-<id>` | Intake → … → Review → CI → MergeGate → Merge → Watch; one pass verdict from the review panel (sc-25379: correctness and spec conformance, plus security when a touched path's tier requires it), every reviewer and second model of a family none of the implementer's models is, each panel call accounted by the router under its own session, which the ledger named with the role's prompt file hash; the PR merged at the reviewed head; the Merge row holds GitHub's merge commit; the story is Done |
+| `Gate_merges_a_green_pr_a_claude_opus_panel_passed_and_the_ledger_records_the_merge_commit` | `FACTORY_E2E_GATE_STORY=sc-<id>` | Intake → … → Review → CI → MergeGate → Merge → Watch; one pass verdict from the review panel (sc-25379: correctness and spec conformance, plus security when a touched path's tier requires it), every reviewer a Claude Opus 5.5 or newer and every second model a Claude model other than its reviewer's, each served by the router as pinned, each panel call accounted by the router under its own session, which the ledger named with the role's prompt file hash; the PR merged at the reviewed head; the Merge row holds GitHub's merge commit; the story is Done |
 | `A_push_after_the_verdict_blocks_the_merge_until_the_new_head_is_reviewed_again` | `FACTORY_E2E_GATE_PUSH_STORY=sc-<id>` | a commit pushed to the PR branch right after the first verdict sends the item from CI back to Review; the new head is reviewed; `gate-passed` and the merge name only the new head |
 
 ```sh
@@ -192,7 +195,7 @@ FACTORY_E2E=1 FACTORY_E2E_GATE_STORY=sc-<id> FACTORY_E2E_GATE_PUSH_STORY=sc-<id>
 
 The seeded review (sc-25379) needs only the router and the router key: no GitHub, Shortcut, ledger or gate App. It sends
 the fixture diffs `tests/DarkFactory.Orchestrator.Tests/Fixtures/review/*.diff` through the production `RouterReviewer`
-to the configured models (`Review:SpecConformance:Models`, `Review:Confirm:Models`, for an anthropic implementer).
+to the configured models (`Review:SpecConformance:Models`, else `Review:Models` — a Claude Opus 5.5 or newer, which has no default and must be set — and `Review:Confirm:Models`).
 Real models answer, so a failure names what they reported.
 
 | Test | Variables | Proves |
@@ -208,19 +211,16 @@ FACTORY_E2E=1 FACTORY_E2E_REVIEW_SEED=1 \
 Since sc-25378 every `factory run` / `factory work` run goes on past Review, so the Phase 1 tests above (AT1–AT5) also
 need the gate App, and their stories' PRs get merged when they pass the gate.
 
-## Upgrading a Phase 1 ledger: items parked at Review escalate once
+## Upgrading a Phase 1 ledger: items parked at Review
 
 Phase 1 parked every finished item at Review; since sc-25378 Review is a state the factory drives, so the first
-`factory work` (or `factory run sc-<id>`) after the upgrade picks up every such item, and each one escalates once, with a
+`factory work` (or `factory run sc-<id>`) after the upgrade picks up every such item. One whose PR is still open is
+reviewed by the panel like any other (Phase 1 recorded no `implementer-model`, which no longer matters: since sc-25379 the
+reviewers are Claude Opus whichever models implemented it). One whose PR the owner already handled escalates once, with a
 comment on its story:
 
-- "The implementer's model is unknown …": Phase 1 never recorded which model implemented it (`implementer-model`
-  checkpoints are new), so no reviewer of a different family can be chosen. If the PR should still go through the gate,
-  `factory run sc-<id>` re-runs the item from Intake (a fresh implementation whose models are recorded); otherwise close
-  the PR and handle the story by hand.
 - "… is merged outside the factory." / "… is closed outside the factory.": the owner already merged or closed the PR.
   Nothing more is needed from the factory: move the story on the board by hand. The item stays Escalated (in-flight
   pickup never resumes an Escalated item).
 
-Expected and one-time: these escalations are the ledger catching up, not failures of the gate. They come from the
-ledger's state alone, so closing the stories or PRs first does not prevent them.
+Expected and one-time: these escalations are the ledger catching up, not failures of the gate.

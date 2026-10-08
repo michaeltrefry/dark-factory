@@ -40,7 +40,7 @@ public static class GateChecks
 {
     /// <summary>Every CI check on the head commit finished and passed.</summary>
     public const string CiGreen = "ci-green";
-    /// <summary>The review panel passed the head commit (every reviewer of a family other than the implementer's).</summary>
+    /// <summary>The review panel passed the head commit (every reviewer a Claude Opus 5.5 or newer, every second model Claude, each served as pinned).</summary>
     public const string ReviewPass = "review-pass";
     /// <summary>The panel's verdict on the head includes the security review.</summary>
     public const string SecurityReview = "security-review";

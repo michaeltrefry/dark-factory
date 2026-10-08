@@ -163,13 +163,12 @@ public static class MergeGate
     /// <param name="policyError">Why the policy could not be read at all (e.g. GitHub refused); overrides <paramref name="policyText"/>.</param>
     /// <param name="change">The diff of the PR's head commit against its base, and the fix rounds used.</param>
     /// <param name="verdicts">Every verdict in the item's ledger, oldest first.</param>
-    /// <param name="implementerModels">Every model the implementer's sessions reported.</param>
     /// <param name="newTests">
     /// The recorded result of the <c>new-tests-fail-on-base</c> check for this base and head (<see cref="NewTestsCheck"/>),
     /// or null when it was not run; required only when a touched tier lists the check, and then null fails it (E2).
     /// </param>
     public static GateDecision Evaluate(string? policyText, string? policyError, PullFacts pull, ChangeFacts change, CiFacts ci,
-        IReadOnlyList<ReviewVerdict> verdicts, IReadOnlyCollection<string> implementerModels, NewTestsResult? newTests = null)
+        IReadOnlyList<ReviewVerdict> verdicts, NewTestsResult? newTests = null)
     {
         var head = pull.HeadSha;
         var reasons = new List<string>();
@@ -219,7 +218,7 @@ public static class MergeGate
         }
 
         // review-pass — a panel verdict on this exact head commit: every required role reviewed, every reviewer and second
-        // model of a family the implementer did not use, no blocking finding left.
+        // model a Claude model served as pinned (every reviewer a Claude Opus 5.5 or newer), no blocking finding left.
         var verdict = verdicts.LastOrDefault(v => v.HeadSha == head);
         if (verdict is null)
         {
@@ -239,21 +238,7 @@ public static class MergeGate
             reasons.Add($"the review of {Ci.Short(head)} has no {role} review"
                 + (role == ReviewRoles.Security && requiredBy.Count > 0 ? $" ({GateChecks.SecurityReview} is required by {string.Join(", ", requiredBy)})" : ""));
         }
-        try
-        {
-            var families = ReviewerChoice.ImplementerFamilies(implementerModels);
-            var models = verdict.Reviews.Select(r => (What: $"the {r.Role} reviewer", Served: r.ServedModel ?? r.Model, r.Family))
-                .Concat(verdict.Reviews.SelectMany(r => r.Findings).Select(f => f.Confirmation).OfType<Confirmation>()
-                    .Select(c => (What: "a second model", Served: c.ServedModel ?? c.Model, c.Family)));
-            foreach (var (what, served, family) in models.Where(m => m.Family is null || families.Contains(m.Family)))
-            {
-                reasons.Add($"{what} ({served}, family {family ?? "unknown"}) is not of a family other than the implementer's ({string.Join(", ", families)})");
-            }
-        }
-        catch (ReviewerChoiceException ex)
-        {
-            reasons.Add(ex.Message);
-        }
+        reasons.AddRange(verdict.Reviews.SelectMany(ReviewModels.Problems));
 
         // ci-green — on this exact head commit.
         if (ci.HeadSha != head)
@@ -321,7 +306,7 @@ public static class MergeGate
         {
             $"paths: {string.Join(", ", tiers)}; checks: {string.Join(", ", GateChecks.All.Where(classified.Requires))}",
             "ci green",
-            $"review pass by {string.Join(", ", verdict.Reviews.Select(r => $"{r.Role}: {r.ServedModel ?? r.Model} ({r.Family}){(r.CarriedFrom is { } carried ? $", carried from {Ci.Short(carried)}" : "")}"))}",
+            $"review pass by {string.Join(", ", verdict.Reviews.Select(r => $"{r.Role}: {r.ServedModel ?? r.Model}{(r.CarriedFrom is { } carried ? $", carried from {Ci.Short(carried)}" : "")}"))}",
         };
         if (classified.Requires(GateChecks.RiskThreshold))
         {

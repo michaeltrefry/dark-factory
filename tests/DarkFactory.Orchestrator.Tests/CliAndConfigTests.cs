@@ -165,31 +165,42 @@ public class FactoryOptionsTests
     }
 
     [Fact]
-    public void Reviewer_models_default_to_two_families_and_must_each_have_a_known_family()
+    public void Reviewer_models_have_no_default_and_must_each_be_a_claude_opus_5_5_or_newer_and_second_models_claude()
     {
-        // Defaults: models the router's catalog deploys, of the two families the router key is known to serve.
-        var defaults = Options([]).ReviewPanel;
-        Assert.All(ReviewRoles.All, role => Assert.Equal(["gpt-5.5", "claude-opus-5"], defaults.For(role)));
-        Assert.Equal(["gpt-5.5", "claude-opus-5", "gpt-5.4-mini", "claude-sonnet-5"], defaults.Confirm);
+        // No default reviewer: the router offers no Claude Opus 5.5 or newer, so the factory refuses to start until one is set.
+        var none = Assert.Throws<InvalidOperationException>(() => Options([]).ReviewPanel).Message;
+        Assert.Contains("No correctness reviewer model is configured: reviewers must be a Claude Opus 5.5 or newer and there is no default", none);
+        Assert.Contains("set Review:Models", none);
 
-        // Review:Models is every role's list unless the role has its own; the second models have theirs.
+        // Review:Models is every role's list unless the role has its own; the second models default to the router's Claude models.
+        var shared = Options(new() { ["Review:Models"] = " claude-opus-5-5 , claude-opus-6" }).ReviewPanel;
+        Assert.All(ReviewRoles.All, role => Assert.Equal(["claude-opus-5-5", "claude-opus-6"], shared.For(role)));
+        Assert.Equal(["claude-opus-5", "claude-sonnet-5"], shared.Confirm);
         var panel = Options(new()
         {
-            ["Review:Models"] = " gemini-2.5-pro , gpt-5.6-luna",
-            ["Review:Security:Models"] = "claude-opus-5",
-            ["Review:Confirm:Models"] = "gpt-5.4-mini",
+            ["Review:Models"] = "claude-opus-5-5",
+            ["Review:Correctness:Models"] = "claude-opus-5-6",
+            ["Review:SpecConformance:Models"] = "anthropic/claude-opus-5.5",
+            ["Review:Security:Models"] = "claude-opus-6",
+            ["Review:Confirm:Models"] = "claude-haiku-4-5",
         }).ReviewPanel;
-        Assert.Equal(["gemini-2.5-pro", "gpt-5.6-luna"], panel.For(ReviewRoles.Correctness));
-        Assert.Equal(["gemini-2.5-pro", "gpt-5.6-luna"], panel.For(ReviewRoles.SpecConformance));
-        Assert.Equal(["claude-opus-5"], panel.For(ReviewRoles.Security));
-        Assert.Equal(["gpt-5.4-mini"], panel.Confirm);
-        Assert.Equal(["qwen3-coder"], Options(new() { ["Review:Correctness:Models"] = "qwen3-coder" }).ReviewPanel.For(ReviewRoles.Correctness));
-        Assert.Equal(["kimi-k2"], Options(new() { ["Review:SpecConformance:Models"] = "kimi-k2" }).ReviewPanel.For(ReviewRoles.SpecConformance));
+        Assert.Equal(["claude-opus-5-6"], panel.For(ReviewRoles.Correctness));
+        Assert.Equal(["anthropic/claude-opus-5.5"], panel.For(ReviewRoles.SpecConformance));
+        Assert.Equal(["claude-opus-6"], panel.For(ReviewRoles.Security));
+        Assert.Equal(["claude-haiku-4-5"], panel.Confirm);
+        // A role's own list alone is not enough: the other roles have none.
+        Assert.Contains("No spec-conformance reviewer model is configured",
+            Assert.Throws<InvalidOperationException>(() => Options(new() { ["Review:Correctness:Models"] = "claude-opus-5-5" }).ReviewPanel).Message);
 
-        Assert.Contains("Review:Models", Assert.Throws<InvalidOperationException>(() => Options(new() { ["Review:Models"] = "gpt-5.5,mystery" }).ReviewPanel).Message);
-        Assert.Contains("Review:Security:Models",
-            Assert.Throws<InvalidOperationException>(() => Options(new() { ["Review:Security:Models"] = "mystery" }).ReviewPanel).Message);
-        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Review:Confirm:Models"] = "mystery" }).ReviewPanel);
+        // An older Opus, another Claude, or another vendor's model cannot be configured as a reviewer; nor a non-Claude second model.
+        Assert.Contains("Review:Models: 'claude-opus-5' is not a Claude Opus 5.5 or newer",
+            Assert.Throws<InvalidOperationException>(() => Options(new() { ["Review:Models"] = "claude-opus-5-5,claude-opus-5" }).ReviewPanel).Message);
+        Assert.Contains("Review:Models: 'gpt-5.5' is not a Claude Opus 5.5 or newer",
+            Assert.Throws<InvalidOperationException>(() => Options(new() { ["Review:Models"] = "gpt-5.5" }).ReviewPanel).Message);
+        Assert.Contains("Review:Security:Models: 'claude-sonnet-6' is not a Claude Opus 5.5 or newer",
+            Assert.Throws<InvalidOperationException>(() => Options(new() { ["Review:Models"] = "claude-opus-5-5", ["Review:Security:Models"] = "claude-sonnet-6" }).ReviewPanel).Message);
+        Assert.Contains("Review:Confirm:Models: 'gpt-5.4-mini' is not a Claude model",
+            Assert.Throws<InvalidOperationException>(() => Options(new() { ["Review:Models"] = "claude-opus-5-5", ["Review:Confirm:Models"] = "claude-sonnet-5,gpt-5.4-mini" }).ReviewPanel).Message);
         Assert.Equal((TimeSpan.FromSeconds(30), TimeSpan.FromMinutes(30)), (Options([]).CiPollInterval, Options([]).CiTimeout));
     }
 

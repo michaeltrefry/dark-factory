@@ -9,32 +9,108 @@ using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.Orchestrator.Tests;
 
-public class ModelFamilyTests
+public class ReviewModelsTests
 {
     [Theory]
-    [InlineData("claude-sonnet-4-5-20250929", "anthropic")]
-    [InlineData("claude-opus-5-5", "anthropic")]
-    [InlineData("anthropic/claude-haiku-4-5", "anthropic")]
-    [InlineData("gpt-5.6-sol", "openai")]
-    [InlineData("GPT-6-astra", "openai")]
-    [InlineData("o3-mini", "openai")]
-    [InlineData("gemini-2.5-pro", "google")]
-    [InlineData("qwen3-coder-30b", "alibaba")]
-    [InlineData("opus", "anthropic")]
-    [InlineData("mystery-model", null)]
-    [InlineData("o", null)]
-    [InlineData("", null)]
-    public void Families_come_from_the_model_id(string model, string? family) => Assert.Equal(family, ModelFamily.Of(model));
+    [InlineData("claude-opus-5-5", 5, 5)]
+    [InlineData("claude-opus-5.5", 5, 5)]
+    [InlineData("anthropic/CLAUDE-OPUS-5-5", 5, 5)]
+    [InlineData("claude-opus-5-5-20261001", 5, 5)]
+    [InlineData("claude-opus-5-10", 5, 10)]
+    [InlineData("claude-opus-6", 6, 0)]
+    [InlineData("claude-opus-5", 5, 0)]
+    [InlineData("claude-opus-5-20260101", 5, 0)]
+    [InlineData("claude-opus-4-1-20250805", 4, 1)]
+    [InlineData("claude-opus-5-5-fast", null, null)]
+    [InlineData("claude-3-opus-20240229", null, null)]
+    [InlineData("claude-sonnet-5-5", null, null)]
+    [InlineData("opus", null, null)]
+    [InlineData("gpt-5.5", null, null)]
+    [InlineData("", null, null)]
+    public void The_opus_version_comes_from_the_model_id(string model, int? major, int? minor) =>
+        Assert.Equal(major is null ? null : (major.Value, minor!.Value), ReviewModels.OpusVersion(model));
+
+    [Theory]
+    [InlineData("claude-opus-5-5", true)]
+    [InlineData("claude-opus-5-6", true)]
+    [InlineData("claude-opus-6", true)]
+    [InlineData("claude-opus-6-0", true)]
+    [InlineData("claude-opus-10", true)]
+    [InlineData("claude-opus-5-4", false)]
+    [InlineData("claude-opus-5", false)]
+    [InlineData("claude-opus-4-7", false)]
+    [InlineData("claude-sonnet-6", false)]
+    [InlineData("claude-fable-5", false)]
+    [InlineData("gpt-5.5", false)]
+    [InlineData("gemini-3.1-pro-preview", false)]
+    [InlineData("mystery-model", false)]
+    public void Only_a_claude_opus_5_5_or_newer_meets_the_review_floor(string model, bool meets) =>
+        Assert.Equal(meets, ReviewModels.MeetsReviewFloor(model));
+
+    [Theory]
+    [InlineData("claude-sonnet-5", true)]
+    [InlineData("anthropic/claude-haiku-4-5", true)]
+    [InlineData("claude-opus-5", true)]
+    [InlineData("claude-", false)]
+    [InlineData("gpt-5.5", false)]
+    [InlineData("opus", false)]
+    [InlineData("qwen/qwen3-coder-next", false)]
+    [InlineData("", false)]
+    public void Second_models_must_be_claude(string model, bool claude) => Assert.Equal(claude, ReviewModels.IsClaude(model));
+
+    [Theory]
+    [InlineData("claude-opus-5-5", "claude-opus-5-5", true)]
+    [InlineData("claude-opus-5-5", "Anthropic/Claude-Opus-5-5", true)]
+    [InlineData("claude-opus-5-5", "claude-opus-5-5-20261001", true)]
+    [InlineData("claude-opus-5-5", "claude-opus-5-5-2026-01", false)]
+    [InlineData("claude-opus-5-5", "claude-opus-5-5-fast", false)]
+    [InlineData("claude-opus-5-5", "claude-opus-5", false)]
+    [InlineData("claude-opus-5", "claude-opus-5-5", false)]
+    [InlineData("claude-opus-5-5", "gpt-5.5", false)]
+    [InlineData("claude-opus-5-5", "", false)]
+    [InlineData("claude-opus-5-5", null, false)]
+    public void An_answer_counts_only_when_the_router_served_the_pinned_model(string pinned, string? served, bool serves) =>
+        Assert.Equal(serves, ReviewModels.Serves(pinned, served));
 
     [Fact]
-    public void The_reviewer_is_the_first_candidate_of_a_family_the_implementer_did_not_use()
+    public void The_reviewer_is_the_first_claude_opus_5_5_or_newer_whatever_the_implementer_used()
     {
-        string[] candidates = ["gpt-5.6-sol", "claude-opus-5-5"];
-        Assert.Equal("gpt-5.6-sol", ReviewerChoice.Choose(candidates, ["claude-sonnet-4-5"]));
-        Assert.Equal("claude-opus-5-5", ReviewerChoice.Choose(candidates, ["gpt-5.6-luna"]));
-        Assert.Throws<ReviewerChoiceException>(() => ReviewerChoice.Choose(candidates, ["claude-sonnet-4-5", "gpt-5.6-luna"]));
-        Assert.Throws<ReviewerChoiceException>(() => ReviewerChoice.Choose(candidates, []));
-        Assert.Throws<ReviewerChoiceException>(() => ReviewerChoice.Choose(candidates, ["mystery-model"]));
+        Assert.Equal("claude-opus-5-5", ReviewerChoice.Choose(["gpt-5.6-sol", "claude-opus-5", "claude-opus-5-5", "claude-opus-6"]));
+        var older = Assert.Throws<ReviewerChoiceException>(() => ReviewerChoice.Choose(["claude-opus-5", "gpt-5.5"], "Review:Security:Models"));
+        Assert.Contains("is a Claude Opus 5.5 or newer; set Review:Security:Models", older.Message);
+        var none = Assert.Throws<ReviewerChoiceException>(() => ReviewerChoice.Choose([]));
+        Assert.Contains("No reviewer model is configured", none.Message);
+        Assert.Contains("there is no default", none.Message);
+    }
+
+    [Fact]
+    public void The_confirmer_is_the_first_claude_model_that_is_not_the_reviewers()
+    {
+        string[] candidates = ["gpt-5.5", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5"];
+        Assert.Equal("claude-opus-5", ReviewerChoice.ChooseConfirmer(candidates, ["claude-opus-5-5"]));
+        // The reviewer's served id (a dated snapshot, another case) is excluded as well as the pinned one.
+        Assert.Equal("claude-sonnet-5", ReviewerChoice.ChooseConfirmer(candidates, ["claude-opus-5-5", "CLAUDE-OPUS-5-20260101"]));
+        // A non-Claude candidate is never chosen, even when it is the only other one.
+        var ex = Assert.Throws<ReviewerChoiceException>(() => ReviewerChoice.ChooseConfirmer(["claude-opus-5-5", "gpt-5.5"], ["claude-opus-5-5"]));
+        Assert.Contains("set Review:Confirm:Models", ex.Message);
+    }
+
+    [Fact]
+    public void A_reviews_models_break_the_rule_when_not_claude_opus_5_5_not_served_as_pinned_or_confirmed_by_the_reviewer_itself()
+    {
+        static RoleReview R(string model, string? served, params Confirmation[] confirmations) =>
+            new(ReviewRoles.Correctness, model, served, "s", "p",
+                confirmations.Select(c => new Finding(Finding.Blocking, "t", null, null, "d").ConfirmedBy(c)).ToList(), "ok");
+        static Confirmation C(string model, string? served) => new(Confirmation.Confirmed, model, served, "s", "p", "yes");
+
+        Assert.Empty(ReviewModels.Problems(R("claude-opus-5-5", "claude-opus-5-5-20261001", C("claude-sonnet-5", "claude-sonnet-5"))));
+        Assert.Contains("is not a Claude Opus 5.5 or newer", Assert.Single(ReviewModels.Problems(R("claude-opus-5", "claude-opus-5"))));
+        Assert.Contains("did not say which model answered", Assert.Single(ReviewModels.Problems(R("claude-opus-5-5", null))));
+        Assert.Contains("served 'gpt-5.5', not the pinned", Assert.Single(ReviewModels.Problems(R("claude-opus-5-5", "gpt-5.5"))));
+        Assert.Contains("gpt-5.5 is not a Claude model", Assert.Single(ReviewModels.Problems(R("claude-opus-5-5", "claude-opus-5-5", C("gpt-5.5", "gpt-5.5")))));
+        Assert.Contains("did not say", Assert.Single(ReviewModels.Problems(R("claude-opus-5-5", "claude-opus-5-5", C("claude-sonnet-5", null)))));
+        Assert.Contains("is the reviewer's own model",
+            Assert.Single(ReviewModels.Problems(R("claude-opus-5-5", "claude-opus-5-5", C("claude-opus-5-5", "claude-opus-5-5")))));
     }
 }
 
@@ -45,19 +121,18 @@ public class MergeGateTests
     private static readonly string Policy = TestPolicies.Standard();
     private static readonly PullFacts Pull = new(1, "https://github.com/o/r/pull/1", true, false, false, Head, "main", "base", null);
     private static readonly CiFacts Green = new(Head, [new CheckFact("build", true, "success"), new CheckFact("lint", true, "skipped")]);
-    private static RoleReview Review(string role, string model = "gpt-5.5") => new(role, model, model, ModelFamily.Of(model), "s", "p", [], "ok");
+    private static RoleReview Review(string role, string model = "claude-opus-5-5") => new(role, model, model, "s", "p", [], "ok");
     private static readonly ReviewVerdict Pass = ReviewPanel.Decide(Head, [], [Review(ReviewRoles.Correctness), Review(ReviewRoles.SpecConformance)]);
-    private static readonly string[] Implementer = ["claude-sonnet-4-5"];
     private static readonly ChangeFacts Normal = new(TestPolicies.Diff("src/x.cs"), null, 0);
 
     private static GateDecision Evaluate(string? policy = null, string? policyError = null, PullFacts? pull = null, CiFacts? ci = null,
-        ReviewVerdict[]? verdicts = null, string[]? implementer = null, ChangeFacts? change = null, bool noPolicy = false) =>
+        ReviewVerdict[]? verdicts = null, ChangeFacts? change = null, bool noPolicy = false) =>
         MergeGate.Evaluate(noPolicy ? null : policy ?? Policy, policyError, TestPolicies.Counting(pull ?? Pull, change ?? Normal), change ?? Normal,
-            ci ?? Green, verdicts ?? [Pass], implementer ?? Implementer,
+            ci ?? Green, verdicts ?? [Pass],
             new NewTestsResult("base", (pull ?? Pull).HeadSha, NewTestsOutcome.Pass, "1 new test(s) fail on the base and pass on the head: X.New", "dotnet-xunit", "ran", "ran", []));
 
     [Fact]
-    public void Merges_when_ci_is_green_and_a_different_family_passed_the_head()
+    public void Merges_when_ci_is_green_and_a_claude_opus_panel_passed_the_head()
     {
         var decision = Evaluate();
         Assert.Equal((GateOutcome.Merge, Head), (decision.Outcome, decision.HeadSha));
@@ -144,25 +219,36 @@ public class MergeGateTests
     }
 
     [Fact]
-    public void A_failed_or_same_family_or_unknown_family_review_blocks()
+    public void A_failed_review_or_a_reviewer_that_is_not_a_claude_opus_5_5_served_as_pinned_blocks()
     {
         Assert.Contains("is 'fail'", Evaluate(verdicts: [Pass with { Verdict = ReviewVerdict.Fail }]).Detail);
-        Assert.Contains("the correctness reviewer (gpt-5.5, family openai) is not of a family other", Evaluate(implementer: ["gpt-5.6-luna"]).Detail);
-        Assert.Contains("family unknown) is not of a family other",
-            Evaluate(verdicts: [Pass with { Reviews = [Pass.Reviews[0] with { Family = null }, Pass.Reviews[1]] }]).Detail);
-        Assert.Contains("implementer's model is unknown", Evaluate(implementer: []).Detail);
+        ReviewVerdict With(RoleReview correctness) => Pass with { Reviews = [correctness, Pass.Reviews[1]] };
+        var older = Evaluate(verdicts: [With(Review(ReviewRoles.Correctness, "claude-opus-5"))]);
+        Assert.Equal(GateOutcome.Blocked, older.Outcome);
+        Assert.Contains("the correctness reviewer: claude-opus-5 is not a Claude Opus 5.5 or newer", older.Detail);
+        Assert.Contains("the correctness reviewer: gpt-5.5 is not a Claude Opus 5.5", Evaluate(verdicts: [With(Review(ReviewRoles.Correctness, "gpt-5.5"))]).Detail);
+        Assert.Contains("the router served 'claude-sonnet-5', not the pinned claude-opus-5-5",
+            Evaluate(verdicts: [With(Pass.Reviews[0] with { ServedModel = "claude-sonnet-5" })]).Detail);
+        Assert.Contains("did not say which model answered", Evaluate(verdicts: [With(Pass.Reviews[0] with { ServedModel = null })]).Detail);
     }
 
     [Fact]
-    public void A_second_model_of_the_implementers_family_blocks()
+    public void A_claude_second_model_served_as_pinned_merges_and_any_other_blocks()
     {
-        var confirmed = new Confirmation(Confirmation.NotConfirmed, "claude-opus-5", "claude-opus-5", "anthropic", "s", "p", "no");
-        var finding = new Finding(Finding.Blocking, "t", null, null, "d").ConfirmedBy(confirmed);
-        var verdict = ReviewPanel.Decide(Head, [], [Review(ReviewRoles.Correctness) with { Findings = [finding] }, Review(ReviewRoles.SpecConformance)]);
+        ReviewVerdict With(string model, string? served)
+        {
+            var confirmation = new Confirmation(Confirmation.NotConfirmed, model, served, "s", "p", "no");
+            var finding = new Finding(Finding.Blocking, "t", null, null, "d").ConfirmedBy(confirmation);
+            var verdict = ReviewPanel.Decide(Head, [], [Review(ReviewRoles.Correctness) with { Findings = [finding] }, Review(ReviewRoles.SpecConformance)]);
+            Assert.True(verdict.Passed); // the panel downgraded it; the gate judges the second model itself
+            return verdict;
+        }
 
-        Assert.True(verdict.Passed); // the panel downgraded it...
-        // ...but the gate does not accept a second model of the implementer's family.
-        Assert.Contains("a second model (claude-opus-5, family anthropic) is not of a family other", Evaluate(verdicts: [verdict]).Detail);
+        Assert.Equal(GateOutcome.Merge, Evaluate(verdicts: [With("claude-sonnet-5", "claude-sonnet-5")]).Outcome);
+        Assert.Contains("a second model on a correctness finding: gpt-5.5 is not a Claude model", Evaluate(verdicts: [With("gpt-5.5", "gpt-5.5")]).Detail);
+        Assert.Contains("the router served 'gpt-5.5', not the pinned claude-sonnet-5", Evaluate(verdicts: [With("claude-sonnet-5", "gpt-5.5")]).Detail);
+        Assert.Contains("did not say which model answered", Evaluate(verdicts: [With("claude-sonnet-5", null)]).Detail);
+        Assert.Contains("is the reviewer's own model", Evaluate(verdicts: [With("claude-opus-5-5", "claude-opus-5-5")]).Detail);
     }
 
     [Fact]
@@ -185,7 +271,7 @@ public class MergeGateTests
     public void Verdicts_round_trip_through_the_ledger_detail()
     {
         var finding = new Finding(Finding.Blocking, "t", "f.cs", 3, "d")
-            .ConfirmedBy(new Confirmation(Confirmation.NotConfirmed, "gpt-5.4-mini", "gpt-5.4-mini", "openai", "s2", "p2", "no"));
+            .ConfirmedBy(new Confirmation(Confirmation.NotConfirmed, "claude-sonnet-5", "claude-sonnet-5", "s2", "p2", "no"));
         var verdict = Pass with { RiskyPaths = ["a (b)"], Reviews = [Pass.Reviews[0] with { Findings = [finding] }, Pass.Reviews[1]] };
         var detail = verdict.ToDetail();
         var back = ReviewVerdict.FromDetail(detail)!;
@@ -206,14 +292,14 @@ public class RouterReviewerTests
     private static readonly RepoFiles Files = new(["README.md", "src/WordCount.cs"], false);
 
     private static readonly ReviewRequest Request = new(Story, "o/r", Pull, "+fix\n", Files, ReviewRoles.SpecConformance,
-        ReviewPrompts.For(ReviewRoles.SpecConformance), "gpt-5.5", "0b7c4d2e-0000-4000-8000-000000000001");
+        ReviewPrompts.For(ReviewRoles.SpecConformance), "claude-opus-5-5", "0b7c4d2e-0000-4000-8000-000000000001");
 
     private static readonly Finding Blocking = new(Finding.Blocking, "flag has no consumer", "src/Options.cs", 12, "IgnoreBlank is never read");
 
     private static readonly ConfirmRequest Confirm = new(Story, "o/r", Pull, "+fix\n", Files, ReviewRoles.SpecConformance, Blocking,
-        ReviewPrompts.Confirm, "gpt-5.4-mini", "0b7c4d2e-0000-4000-8000-000000000002");
+        ReviewPrompts.Confirm, "claude-sonnet-5", "0b7c4d2e-0000-4000-8000-000000000002");
 
-    private static string Answer(string text, string model = "gpt-5.5", string stop = "end_turn") =>
+    private static string Answer(string text, string model = "claude-opus-5-5", string stop = "end_turn") =>
         JsonSerializer.Serialize(new { model, stop_reason = stop, content = new[] { new { type = "text", text } } });
 
     [Fact]
@@ -225,18 +311,18 @@ public class RouterReviewerTests
         var review = await new RouterReviewer(api.Client("http://router.test/"), "rk_test").ReviewAsync(Request, CancellationToken.None);
 
         Assert.True(review.Clean, review.Error);
-        Assert.Equal((ReviewRoles.SpecConformance, "openai", "one blocking"), (review.Role, review.Family, review.Summary));
+        Assert.Equal((ReviewRoles.SpecConformance, "claude-opus-5-5", "one blocking"), (review.Role, review.ServedModel, review.Summary));
         Assert.Equal([new Finding(Finding.Blocking, "flag has no consumer", "src/Options.cs", 12, "never read"), new Finding(Finding.Optional, "naming", null, null, "x")],
             review.Findings);
         // Its own session and the prompt it used, both as the pipeline named them in the ledger.
         Assert.Equal((Request.Session, Request.Prompt.Id), (review.Session!, review.Prompt!));
         var sent = api.Requests.Single();
-        Assert.Equal("gpt-5.5", sent.Headers[RouterReviewer.ForceModelHeader]);
+        Assert.Equal("claude-opus-5-5", sent.Headers[RouterReviewer.ForceModelHeader]);
         Assert.Equal("rk_test", sent.Headers["X-Weave-Router-Key"]);
         Assert.Equal("Bearer rk_test", sent.Headers["Authorization"]);
         Assert.Equal(Request.Session, sent.Headers[RouterReviewer.SessionHeader]);
         var body = JsonDocument.Parse(sent.Body!).RootElement;
-        Assert.Equal("gpt-5.5", body.GetProperty("model").GetString());
+        Assert.Equal("claude-opus-5-5", body.GetProperty("model").GetString());
         Assert.Equal(Request.Prompt.Text, body.GetProperty("system").GetString()); // the prompt file, verbatim
         var prompt = body.GetProperty("messages")[0].GetProperty("content").GetString()!;
         Assert.Contains("+fix", prompt);
@@ -245,15 +331,17 @@ public class RouterReviewerTests
     }
 
     [Theory]
-    [InlineData("All good.", "end_turn", "gpt-5.5", "does not end with a findings line")]
-    [InlineData("{\"findings\": [], \"summary\": \"x\"}", "max_tokens", "gpt-5.5", "ended early")]
+    [InlineData("All good.", "end_turn", "claude-opus-5-5", "does not end with a findings line")]
+    [InlineData("{\"findings\": [], \"summary\": \"x\"}", "max_tokens", "claude-opus-5-5", "ended early")]
     [InlineData("{\"findings\": [], \"summary\": \"x\"}", "end_turn", "claude-sonnet-4-5", "not the pinned")]
-    [InlineData("{\"findings\": \"none\", \"summary\": \"x\"}", "end_turn", "gpt-5.5", "does not end with a findings line")]
-    [InlineData("{\"findings\": [\"bad\"], \"summary\": \"x\"}", "end_turn", "gpt-5.5", "not a finding")]
-    [InlineData("{\"findings\": [], \"summary\": \"x\"}\nActually, one more thing.", "end_turn", "gpt-5.5", "does not end with a findings line")]
-    public void Anything_but_a_clean_findings_line_from_the_pinned_family_is_an_unusable_review(string text, string stop, string served, string reason)
+    [InlineData("{\"findings\": [], \"summary\": \"x\"}", "end_turn", "claude-opus-5", "not the pinned")]
+    [InlineData("{\"findings\": [], \"summary\": \"x\"}", "end_turn", "claude-opus-5-5-2026-01", "not the pinned")]
+    [InlineData("{\"findings\": \"none\", \"summary\": \"x\"}", "end_turn", "claude-opus-5-5", "does not end with a findings line")]
+    [InlineData("{\"findings\": [\"bad\"], \"summary\": \"x\"}", "end_turn", "claude-opus-5-5", "not a finding")]
+    [InlineData("{\"findings\": [], \"summary\": \"x\"}\nActually, one more thing.", "end_turn", "claude-opus-5-5", "does not end with a findings line")]
+    public void Anything_but_a_clean_findings_line_from_the_pinned_model_is_an_unusable_review(string text, string stop, string served, string reason)
     {
-        var review = RouterReviewer.InterpretReview(ReviewRoles.Correctness, "gpt-5.5", served, stop, text);
+        var review = RouterReviewer.InterpretReview(ReviewRoles.Correctness, "claude-opus-5-5", served, stop, text);
 
         Assert.False(review.Clean);
         Assert.Contains(reason, review.Error);
@@ -263,16 +351,28 @@ public class RouterReviewerTests
     [Fact]
     public void A_router_answer_that_names_no_served_model_is_unusable_and_a_fenced_findings_line_counts()
     {
-        Assert.Contains("did not say which model answered", RouterReviewer.InterpretReview(ReviewRoles.Correctness, "gpt-5.5", null, "end_turn",
+        Assert.Contains("did not say which model answered", RouterReviewer.InterpretReview(ReviewRoles.Correctness, "claude-opus-5-5", null, "end_turn",
             "{\"findings\": [], \"summary\": \"fine\"}").Error);
-        Assert.True(RouterReviewer.InterpretReview(ReviewRoles.Correctness, "gpt-5.5", "gpt-5.5-2026-01", "end_turn",
+        Assert.True(RouterReviewer.InterpretReview(ReviewRoles.Correctness, "claude-opus-5-5", "claude-opus-5-5-20261001", "end_turn",
             "ok\n```json\n{\"findings\": [], \"summary\": \"fine\"}\n```\n").Clean);
+    }
+
+    [Fact]
+    public void A_call_pinned_to_a_model_the_panel_may_not_use_is_unusable_even_when_served_as_pinned()
+    {
+        const string clean = "{\"findings\": [], \"summary\": \"fine\"}";
+        Assert.Contains("claude-opus-5 is not a Claude Opus 5.5 or newer",
+            RouterReviewer.InterpretReview(ReviewRoles.Correctness, "claude-opus-5", "claude-opus-5", "end_turn", clean).Error);
+        Assert.Contains("is not a Claude Opus 5.5", RouterReviewer.InterpretReview(ReviewRoles.Correctness, "gpt-5.5", "gpt-5.5", "end_turn", clean).Error);
+        var confirmation = RouterReviewer.InterpretConfirmation("gpt-5.5", "gpt-5.5", "end_turn", "{\"confirmed\": false, \"reason\": \"x\"}");
+        Assert.Equal(Confirmation.Unusable, confirmation.Outcome);
+        Assert.Contains("is not a Claude model", confirmation.Reason);
     }
 
     [Fact]
     public void A_finding_of_unknown_severity_counts_as_blocking()
     {
-        var review = RouterReviewer.InterpretReview(ReviewRoles.Correctness, "gpt-5.5", "gpt-5.5", "end_turn",
+        var review = RouterReviewer.InterpretReview(ReviewRoles.Correctness, "claude-opus-5-5", "claude-opus-5-5", "end_turn",
             "{\"findings\": [{\"severity\": \"major\", \"title\": \"t\", \"detail\": \"d\"}], \"summary\": \"s\"}");
 
         Assert.Equal(Finding.Blocking, review.Findings.Single().Severity);
@@ -282,14 +382,14 @@ public class RouterReviewerTests
     public async Task A_confirmation_calls_the_router_with_the_confirm_prompt_and_the_finding()
     {
         var api = new FakeApi().On("POST /v1/messages", HttpStatusCode.OK,
-            Answer("Line 12 declares it; nothing reads it.\n{\"confirmed\": true, \"reason\": \"declared, never read\"}", "gpt-5.4-mini"));
+            Answer("Line 12 declares it; nothing reads it.\n{\"confirmed\": true, \"reason\": \"declared, never read\"}", "claude-sonnet-5"));
 
         var confirmation = await new RouterReviewer(api.Client("http://router.test/"), "rk").ConfirmAsync(Confirm, CancellationToken.None);
 
-        Assert.Equal((Confirmation.Confirmed, "openai", "declared, never read", Confirm.Session, Confirm.Prompt.Id),
-            (confirmation.Outcome, confirmation.Family, confirmation.Reason, confirmation.Session!, confirmation.Prompt!));
+        Assert.Equal((Confirmation.Confirmed, "claude-sonnet-5", "declared, never read", Confirm.Session, Confirm.Prompt.Id),
+            (confirmation.Outcome, confirmation.ServedModel, confirmation.Reason, confirmation.Session!, confirmation.Prompt!));
         var sent = api.Requests.Single();
-        Assert.Equal("gpt-5.4-mini", sent.Headers[RouterReviewer.ForceModelHeader]);
+        Assert.Equal("claude-sonnet-5", sent.Headers[RouterReviewer.ForceModelHeader]);
         Assert.Equal(Confirm.Session, sent.Headers[RouterReviewer.SessionHeader]);
         var body = JsonDocument.Parse(sent.Body!).RootElement;
         Assert.Equal(ReviewPrompts.Confirm.Text, body.GetProperty("system").GetString());
@@ -332,14 +432,14 @@ public class RouterReviewerTests
     }
 
     [Theory]
-    [InlineData("{\"confirmed\": false, \"reason\": \"it is read on line 40\"}", "gpt-5.4-mini", "end_turn", Confirmation.NotConfirmed)]
-    [InlineData("{\"confirmed\": true, \"reason\": \"x\"}", "gpt-5.4-mini", "end_turn", Confirmation.Confirmed)]
-    [InlineData("{\"confirmed\": \"maybe\"}", "gpt-5.4-mini", "end_turn", Confirmation.Unusable)]
-    [InlineData("I agree.", "gpt-5.4-mini", "end_turn", Confirmation.Unusable)]
+    [InlineData("{\"confirmed\": false, \"reason\": \"it is read on line 40\"}", "claude-sonnet-5", "end_turn", Confirmation.NotConfirmed)]
+    [InlineData("{\"confirmed\": true, \"reason\": \"x\"}", "claude-sonnet-5", "end_turn", Confirmation.Confirmed)]
+    [InlineData("{\"confirmed\": \"maybe\"}", "claude-sonnet-5", "end_turn", Confirmation.Unusable)]
+    [InlineData("I agree.", "claude-sonnet-5", "end_turn", Confirmation.Unusable)]
     [InlineData("{\"confirmed\": false}", "claude-opus-5", "end_turn", Confirmation.Unusable)]
-    [InlineData("{\"confirmed\": false}", "gpt-5.4-mini", "max_tokens", Confirmation.Unusable)]
-    public void Only_a_clean_confirmation_line_from_the_pinned_family_confirms_or_rejects(string text, string served, string stop, string outcome) =>
-        Assert.Equal(outcome, RouterReviewer.InterpretConfirmation("gpt-5.4-mini", served, stop, text).Outcome);
+    [InlineData("{\"confirmed\": false}", "claude-sonnet-5", "max_tokens", Confirmation.Unusable)]
+    public void Only_a_clean_confirmation_line_from_the_pinned_model_confirms_or_rejects(string text, string served, string stop, string outcome) =>
+        Assert.Equal(outcome, RouterReviewer.InterpretConfirmation("claude-sonnet-5", served, stop, text).Outcome);
 
     [Theory]
     [InlineData(HttpStatusCode.TooManyRequests, """{"error":"exhausted"}""")]
@@ -377,9 +477,9 @@ public class ReviewPanelTests
     private const string Head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     private static RoleReview Review(string role, params Finding[] findings) =>
-        new(role, "gpt-5.5", "gpt-5.5", "openai", "s", "p", findings, "ok");
+        new(role, "claude-opus-5-5", "claude-opus-5-5", "s", "p", findings, "ok");
 
-    private static Confirmation Answer(string outcome) => new(outcome, "gpt-5.4-mini", "gpt-5.4-mini", "openai", "s2", "p2", "because");
+    private static Confirmation Answer(string outcome) => new(outcome, "claude-sonnet-5", "claude-sonnet-5", "s2", "p2", "because");
 
     private static readonly Finding Blocking = new(Finding.Blocking, "broken", "a.cs", 1, "d");
 
@@ -396,7 +496,7 @@ public class ReviewPanelTests
     }
 
     [Theory]
-    [InlineData(Confirmation.Confirmed, "confirmed by gpt-5.4-mini")]
+    [InlineData(Confirmation.Confirmed, "confirmed by claude-sonnet-5")]
     [InlineData(Confirmation.Unusable, "the second model's answer was unusable")]
     public void A_confirmed_or_unconfirmable_blocking_finding_fails(string outcome, string reason)
     {
@@ -413,7 +513,7 @@ public class ReviewPanelTests
     [Fact]
     public void An_unusable_review_or_a_missing_required_role_fails()
     {
-        Assert.Contains("correctness (gpt-5.5): no answer", ReviewPanel.Decide(Head, [],
+        Assert.Contains("correctness (claude-opus-5-5): no answer", ReviewPanel.Decide(Head, [],
             [Review(ReviewRoles.Correctness) with { Error = "no answer" }, Review(ReviewRoles.SpecConformance)]).Summary);
         Assert.Contains("no spec-conformance review", ReviewPanel.Decide(Head, [], [Review(ReviewRoles.Correctness)]).Summary);
         Assert.Contains("no security review", ReviewPanel.Decide(Head, ["x (y)"], [Review(ReviewRoles.Correctness), Review(ReviewRoles.SpecConformance)]).Summary);
@@ -472,22 +572,6 @@ public class ReviewPanelTests
         Assert.Equal(3, DiffPaths.Parse(diff).ChangedLines); // -x, +y and the added line that looks like a header
         Assert.Equal(3, DiffPaths.Parse(diff).Files); // the rename is one file, as GitHub's changed_files counts it
         Assert.Equal(["scripts/name.sh (scripts)"], RiskyPaths.Touched(DiffPaths.Of(diff)));
-    }
-
-    [Fact]
-    public void The_confirmer_is_another_model_of_no_implementer_family_preferring_a_family_other_than_the_reviewers()
-    {
-        string[] candidates = ["gpt-5.5", "claude-opus-5", "gpt-5.4-mini", "claude-sonnet-5", "gemini-3.1-pro-preview"];
-        // Implementer anthropic, reviewer gpt-5.5: a third family is preferred over the reviewer's own.
-        Assert.Equal("gemini-3.1-pro-preview", ReviewerChoice.ChooseConfirmer(candidates, ["claude-sonnet-4-5"], ["gpt-5.5"]));
-        // Only two families: another model of the reviewer's family.
-        Assert.Equal("gpt-5.4-mini", ReviewerChoice.ChooseConfirmer(candidates[..4], ["claude-sonnet-4-5"], ["gpt-5.5"]));
-        Assert.Equal("claude-sonnet-5", ReviewerChoice.ChooseConfirmer(candidates[..4], ["gpt-5.6-luna"], ["claude-opus-5"]));
-        // The reviewer's served id is excluded as well as the pinned one.
-        Assert.Equal("claude-sonnet-5", ReviewerChoice.ChooseConfirmer(candidates[..4], ["gpt-5.6-luna"], ["claude-opus-5", "CLAUDE-OPUS-5"]));
-        var ex = Assert.Throws<ReviewerChoiceException>(() => ReviewerChoice.ChooseConfirmer(["gpt-5.5", "claude-opus-5"], ["claude-sonnet-4-5"], ["gpt-5.5"]));
-        Assert.Contains("set Review:Confirm:Models", ex.Message);
-        Assert.Throws<ReviewerChoiceException>(() => ReviewerChoice.ChooseConfirmer(candidates, [], ["gpt-5.5"]));
     }
 }
 
