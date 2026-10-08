@@ -3,9 +3,12 @@ using System.Text.Json.Serialization;
 
 namespace DarkFactory.Orchestrator.Gate;
 
-/// <summary>A pull request as the gate sees it, read fresh from GitHub.</summary>
+/// <summary>
+/// A pull request as the gate sees it, read fresh from GitHub. <see cref="ChangedFiles"/>: GitHub's <c>changed_files</c>
+/// (null when not read), which the gate holds the diff's file count to so a diff missing files cannot pass.
+/// </summary>
 public sealed record PullFacts(int Number, string HtmlUrl, bool Open, bool Merged, bool Draft, string HeadSha, string BaseRef, string BaseSha,
-    string? MergeCommitSha);
+    string? MergeCommitSha, int? ChangedFiles = null);
 
 /// <summary>One CI check of a commit: a check run, or a commit status mapped onto the same shape.</summary>
 public sealed record CheckFact(string Name, bool Completed, string? Conclusion);
@@ -86,8 +89,8 @@ public static class Ci
 
 /// <summary>
 /// The review panel's verdict on one head commit (E3: bound to <see cref="HeadSha"/>; a new push voids it). Stored as JSON
-/// in the ledger's <c>verdict</c> checkpoint. <see cref="RiskyPaths"/>: the touched paths that called the security review
-/// in; <see cref="Reviews"/>: each role's review with its findings after confirmation (<see cref="ReviewPanel.Decide"/>).
+/// in the ledger's <c>verdict</c> checkpoint. <see cref="RiskyPaths"/>: the touched paths that called the security review in
+/// (<see cref="GatePolicy.SecurityReviewReasons"/>: by their tier, named with it, or by the code floor, named with why); <see cref="Reviews"/>: each role's review with its findings after confirmation (<see cref="ReviewPanel.Decide"/>).
 /// </summary>
 public sealed record ReviewVerdict(
     [property: JsonPropertyName("sha")] string HeadSha,
@@ -142,16 +145,26 @@ public sealed record GateDecision(GateOutcome Outcome, string HeadSha, IReadOnly
 }
 
 /// <summary>
+/// The change the gate judges, read for this evaluation: the unified diff of the candidate head against the base
+/// (<see cref="Diff"/>, or <see cref="DiffError"/> when it could not be read) and the fix rounds the ledger records since
+/// the last Implement.
+/// </summary>
+public sealed record ChangeFacts(string? Diff, string? DiffError, int FixRounds);
+
+/// <summary>
 /// The merge gate (E1): deterministic code over facts read fresh for this evaluation — the policy text from the base
-/// branch, the PR, its head commit's CI and the ledger's verdicts. No model and no score feeds it; there is no bypass (E2).
+/// branch, the PR, the diff at its head commit, that commit's CI, the ledger's verdicts and fix rounds. No model and no
+/// score feeds it; there is no bypass (E2). The touched paths and their tiers come from the diff at the head (E3), never
+/// from the plan, the PR or a worker's claim.
 /// </summary>
 public static class MergeGate
 {
     /// <param name="policyText">The base branch's <c>factory/gate.yaml</c>, or null when it does not exist.</param>
     /// <param name="policyError">Why the policy could not be read at all (e.g. GitHub refused); overrides <paramref name="policyText"/>.</param>
+    /// <param name="change">The diff of the PR's head commit against its base, and the fix rounds used.</param>
     /// <param name="verdicts">Every verdict in the item's ledger, oldest first.</param>
     /// <param name="implementerModels">Every model the implementer's sessions reported.</param>
-    public static GateDecision Evaluate(string? policyText, string? policyError, PullFacts pull, CiFacts ci,
+    public static GateDecision Evaluate(string? policyText, string? policyError, PullFacts pull, ChangeFacts change, CiFacts ci,
         IReadOnlyList<ReviewVerdict> verdicts, IReadOnlyCollection<string> implementerModels)
     {
         var head = pull.HeadSha;
@@ -165,9 +178,10 @@ public static class MergeGate
         {
             return new GateDecision(GateOutcome.Blocked, head, [$"{GatePolicy.Path} does not exist on {pull.BaseRef}"]);
         }
+        GatePolicy policy;
         try
         {
-            GatePolicy.Parse(policyText);
+            policy = GatePolicy.Parse(policyText);
         }
         catch (GatePolicyException ex)
         {
@@ -179,20 +193,47 @@ public static class MergeGate
             return new GateDecision(GateOutcome.Blocked, head, [$"PR #{pull.Number} is not open"]);
         }
 
-        // review: pass — a panel verdict on this exact head commit: every required role reviewed, every reviewer and second
+        // The tiers of the paths the head actually changes (a check that cannot run counts as failed: an unread diff blocks).
+        if (change.DiffError is not null || change.Diff is null)
+        {
+            return new GateDecision(GateOutcome.Blocked, head,
+                [$"the diff of {Ci.Short(head)} could not be read ({change.DiffError ?? "no diff"}), so the tiers of its paths are unknown"]);
+        }
+        // A diff that leaves files out (e.g. GitHub trimming a very large comparison) could leave out a sealed path: its file
+        // count must equal the PR's changed_files (a rename is one of each).
+        var diffFiles = DiffPaths.Parse(change.Diff).Files;
+        if (pull.ChangedFiles != diffFiles)
+        {
+            return new GateDecision(GateOutcome.Blocked, head,
+                [$"the diff of {Ci.Short(head)} is incomplete: it has {diffFiles} file(s), the PR {pull.ChangedFiles?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "an unread number of"} changed file(s), so the tiers of its paths are unknown"]);
+        }
+        var classified = policy.Classify(change.Diff);
+        var sealedPaths = classified.In(Tier.Sealed);
+        if (sealedPaths.Count > 0)
+        {
+            reasons.Add($"{Ci.Short(head)} touches sealed path(s), which always escalate: {string.Join(", ", sealedPaths)}");
+        }
+
+        // review-pass — a panel verdict on this exact head commit: every required role reviewed, every reviewer and second
         // model of a family the implementer did not use, no blocking finding left.
         var verdict = verdicts.LastOrDefault(v => v.HeadSha == head);
         if (verdict is null)
         {
-            return new GateDecision(GateOutcome.ReviewHead, head, [$"head {Ci.Short(head)} has no review verdict"]);
+            return reasons.Count > 0
+                ? new GateDecision(GateOutcome.Blocked, head, reasons)
+                : new GateDecision(GateOutcome.ReviewHead, head, [$"head {Ci.Short(head)} has no review verdict"]);
         }
         if (!verdict.Passed)
         {
             reasons.Add($"the review of {Ci.Short(head)} is '{verdict.Verdict}'");
         }
-        foreach (var role in ReviewRoles.Required(verdict.RiskyPaths.Count > 0).Where(r => verdict.Reviews.All(v => v.Role != r)))
+        // security-review: required by the tiers the gate derived itself or the code floor of risky paths (or by the
+        // verdict's own risky paths).
+        var requiredBy = policy.SecurityReviewReasons(classified);
+        foreach (var role in ReviewRoles.Required(requiredBy.Count > 0 || verdict.RiskyPaths.Count > 0).Where(r => verdict.Reviews.All(v => v.Role != r)))
         {
-            reasons.Add($"the review of {Ci.Short(head)} has no {role} review");
+            reasons.Add($"the review of {Ci.Short(head)} has no {role} review"
+                + (role == ReviewRoles.Security && requiredBy.Count > 0 ? $" ({GateChecks.SecurityReview} is required by {string.Join(", ", requiredBy)})" : ""));
         }
         try
         {
@@ -210,7 +251,7 @@ public static class MergeGate
             reasons.Add(ex.Message);
         }
 
-        // ci: green — on this exact head commit.
+        // ci-green — on this exact head commit.
         if (ci.HeadSha != head)
         {
             reasons.Add($"CI was read for {Ci.Short(ci.HeadSha)}, not the head {Ci.Short(head)}");
@@ -220,13 +261,51 @@ public static class MergeGate
             reasons.Add(why);
         }
 
+        // risk-threshold — diff size and fix rounds, when a touched tier requires it.
+        if (classified.Requires(GateChecks.RiskThreshold))
+        {
+            var risk = policy.Risk;
+            if (classified.ChangedLines > risk.MaxChangedLines)
+            {
+                reasons.Add($"risk threshold: {classified.ChangedLines} changed lines exceed max_changed_lines {risk.MaxChangedLines}");
+            }
+            if (classified.ChangedFiles > risk.MaxChangedFiles)
+            {
+                reasons.Add($"risk threshold: {classified.ChangedFiles} changed files exceed max_changed_files {risk.MaxChangedFiles}");
+            }
+            if (change.FixRounds > risk.MaxFixRounds)
+            {
+                reasons.Add($"risk threshold: {change.FixRounds} fix rounds exceed max_fix_rounds {risk.MaxFixRounds}");
+            }
+        }
+
         if (pull.Draft)
         {
             reasons.Add($"PR #{pull.Number} is a draft");
         }
-        return reasons.Count > 0
-            ? new GateDecision(GateOutcome.Blocked, head, reasons)
-            : new GateDecision(GateOutcome.Merge, head,
-                ["ci green", $"review pass by {string.Join(", ", verdict.Reviews.Select(r => $"{r.Role}: {r.ServedModel ?? r.Model} ({r.Family}){(r.CarriedFrom is { } carried ? $", carried from {Ci.Short(carried)}" : "")}"))}"]);
+
+        // Protected: built and reviewed like any change, but merged only after escalation — the gate escalates instead.
+        var protectedPaths = classified.In(Tier.Protected);
+        if (protectedPaths.Count > 0)
+        {
+            reasons.Add($"{Ci.Short(head)} touches protected path(s), merged only after escalation: {string.Join(", ", protectedPaths)}");
+        }
+
+        if (reasons.Count > 0)
+        {
+            return new GateDecision(GateOutcome.Blocked, head, reasons);
+        }
+        var tiers = Tiers.Precedence.Where(t => classified.In(t).Count > 0).Select(t => $"{t.Key()} {classified.In(t).Count}");
+        var passed = new List<string>
+        {
+            $"paths: {string.Join(", ", tiers)}; checks: {string.Join(", ", GateChecks.All.Where(classified.Requires))}",
+            "ci green",
+            $"review pass by {string.Join(", ", verdict.Reviews.Select(r => $"{r.Role}: {r.ServedModel ?? r.Model} ({r.Family}){(r.CarriedFrom is { } carried ? $", carried from {Ci.Short(carried)}" : "")}"))}",
+        };
+        if (classified.Requires(GateChecks.RiskThreshold))
+        {
+            passed.Add($"risk within threshold ({classified.ChangedLines} changed lines, {classified.ChangedFiles} files, {change.FixRounds} fix rounds)");
+        }
+        return new GateDecision(GateOutcome.Merge, head, passed);
     }
 }

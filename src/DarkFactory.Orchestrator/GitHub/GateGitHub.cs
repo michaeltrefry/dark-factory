@@ -22,7 +22,10 @@ public interface IGateGitHub
     /// <summary>Every file path in the tree of commit <paramref name="sha"/> (what the review panel compares new files with).</summary>
     Task<RepoFiles> GetFilesAsync(RepoRef repo, string sha, CancellationToken ct);
 
-    /// <summary>The text of <see cref="GatePolicy.Path"/> on <paramref name="baseRef"/>, or null when it does not exist.</summary>
+    /// <summary>
+    /// The text of <see cref="GatePolicy.Path"/> at <paramref name="baseRef"/> (a branch or a commit SHA; the gate passes the
+    /// PR's base commit), or null when it does not exist.
+    /// </summary>
     Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct);
 
     /// <summary>Every check run, commit status and check suite of <paramref name="sha"/>.</summary>
@@ -64,7 +67,7 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         await GitHubApp.EnsureSuccess(response, $"read pull request #{number}", ct);
         var pull = (await response.Content.ReadFromJsonAsync<PullDto>(ct))!;
         return new PullFacts(pull.Number, pull.HtmlUrl, pull.State == "open", pull.Merged, pull.Draft, pull.Head.Sha, pull.Base.Ref, pull.Base.Sha,
-            pull.MergeCommitSha);
+            pull.MergeCommitSha, pull.ChangedFiles);
     }
 
     public async Task<string> GetDiffAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct)
@@ -164,6 +167,7 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         [property: JsonPropertyName("merged")] bool Merged,
         [property: JsonPropertyName("draft")] bool Draft,
         [property: JsonPropertyName("merge_commit_sha")] string? MergeCommitSha,
+        [property: JsonPropertyName("changed_files")] int? ChangedFiles,
         [property: JsonPropertyName("head")] RefDto Head,
         [property: JsonPropertyName("base")] RefDto Base);
 

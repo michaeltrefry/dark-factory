@@ -2,14 +2,14 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Serialization;
-using System.Text.RegularExpressions;
 
 namespace DarkFactory.Orchestrator.Gate;
 
 /// <summary>
-/// The review panel's roles. Correctness and spec conformance review every change; security only one that touches a
-/// risky path (<see cref="RiskyPaths"/>). Each role has its own prompt file (<see cref="ReviewPrompts"/>) and its own
-/// ordered model list (<see cref="ReviewPanelModels"/>).
+/// The review panel's roles. Correctness and spec conformance review every change; security one that touches a path whose
+/// tier in <c>factory/gate.yaml</c> requires <c>security-review</c> or that the code floor <see cref="RiskyPaths"/> matches
+/// (<see cref="GatePolicy.SecurityReviewReasons"/>). Each
+/// role has its own prompt file (<see cref="ReviewPrompts"/>) and its own ordered model list (<see cref="ReviewPanelModels"/>).
 /// </summary>
 public static class ReviewRoles
 {
@@ -19,7 +19,7 @@ public static class ReviewRoles
 
     public static readonly IReadOnlyList<string> All = [Correctness, SpecConformance, Security];
 
-    /// <summary>The roles that must review a change: security only when it touches a risky path.</summary>
+    /// <summary>The roles that must review a change: security only when its tiers require the security review.</summary>
     public static IReadOnlyList<string> Required(bool risky) => risky ? All : [Correctness, SpecConformance];
 
     /// <summary>The role's configuration section name (<c>Review:&lt;name&gt;:Models</c>).</summary>
@@ -78,75 +78,6 @@ public static class ReviewPrompts
             return prompt;
         }
     }
-}
-
-/// <summary>The files a unified diff touches (both sides of a rename), read from its headers.</summary>
-public static class DiffPaths
-{
-    private static readonly Regex GitHeader = new(@"^diff --git (?:""?a/(?<a>[^""]+?)""?) (?:""?b/(?<b>[^""]+?)""?)$", RegexOptions.Multiline);
-    private static readonly Regex FileHeader = new(@"^(?:---|\+\+\+) ""?[ab]/(?<p>[^""\t\r\n]+)""?", RegexOptions.Multiline);
-    private static readonly Regex Rename = new(@"^(?:rename|copy) (?:from|to) (?<p>[^\r\n]+)$", RegexOptions.Multiline);
-
-    public static IReadOnlyList<string> Of(string diff)
-    {
-        var paths = new SortedSet<string>(StringComparer.Ordinal);
-        foreach (Match m in GitHeader.Matches(diff))
-        {
-            paths.Add(m.Groups["a"].Value);
-            paths.Add(m.Groups["b"].Value);
-        }
-        foreach (Match m in FileHeader.Matches(diff))
-        {
-            paths.Add(m.Groups["p"].Value.TrimEnd());
-        }
-        foreach (Match m in Rename.Matches(diff))
-        {
-            paths.Add(m.Groups["p"].Value.Trim().Trim('"'));
-        }
-        return paths.ToList();
-    }
-}
-
-/// <summary>
-/// Which paths make a change risky, so the security reviewer joins the panel. Deterministic code, matched
-/// case-insensitively against every path the diff touches.
-/// </summary>
-public static class RiskyPaths
-{
-    private const RegexOptions Options = RegexOptions.IgnoreCase | RegexOptions.CultureInvariant;
-
-    /// <summary>Each rule: what it guards, and the path pattern.</summary>
-    public static readonly IReadOnlyList<(string Why, Regex Pattern)> Rules =
-    [
-        ("CI and repository automation", new Regex(@"^\.github/", Options)),
-        ("the factory's own policy and prompts", new Regex(@"^factory/", Options)),
-        ("scripts", new Regex(@"(^|/)scripts?/|\.(sh|bash|zsh|ps1)$", Options)),
-        ("build and container definitions", new Regex(@"(^|/)(Dockerfile[^/]*|docker-compose[^/]*\.ya?ml|Makefile)$", Options)),
-        ("dependencies", new Regex(
-            @"(^|/)([^/]+\.(cs|fs|vb)proj|Directory\.(Packages|Build)\.props|nuget\.config|global\.json|dotnet-tools\.json|package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|requirements[^/]*\.txt|pyproject\.toml|poetry\.lock|go\.(mod|sum)|Cargo\.(toml|lock)|Gemfile(\.lock)?)$",
-            Options)),
-        ("keys and environment files", new Regex(@"\.(pem|key|p12|pfx|crt|cer)$|(^|/)\.env", Options)),
-        ("security-sensitive code", new Regex(
-            @"auth|secret|credential|token|crypto|passw|permission|sandbox|sudo|keychain|login|oauth|jwt|cert|ssh|security|acl|ruleset|protect",
-            Options)),
-    ];
-
-    /// <summary>What <see cref="Touched(IReadOnlyList{string}, string)"/> reports for a change whose paths cannot be read.</summary>
-    public const string Unparsed = "(unparsed diff: no file headers, so the change counts as risky)";
-
-    /// <summary>The touched paths that are risky, each with why; empty when the change is not risky.</summary>
-    public static IReadOnlyList<string> Touched(IEnumerable<string> paths) =>
-        paths.Select(p => Rules.FirstOrDefault(r => r.Pattern.IsMatch(p)) is { Pattern: not null } rule ? $"{p} ({rule.Why})" : null)
-            .OfType<string>()
-            .ToList();
-
-    /// <summary>
-    /// <see cref="Touched(IEnumerable{string})"/> for the <paramref name="paths"/> read from <paramref name="diff"/>. A
-    /// non-empty diff none of whose paths could be read is risky (<see cref="Unparsed"/>): a check that cannot run counts as
-    /// failed (E2), so the security review is not skipped.
-    /// </summary>
-    public static IReadOnlyList<string> Touched(IReadOnlyList<string> paths, string diff) =>
-        paths.Count == 0 && !string.IsNullOrWhiteSpace(diff) ? [Unparsed] : Touched(paths);
 }
 
 /// <summary>

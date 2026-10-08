@@ -38,47 +38,22 @@ public class ModelFamilyTests
     }
 }
 
-public class GatePolicyTests
-{
-    [Fact]
-    public void The_one_accepted_policy_parses()
-    {
-        Assert.Same(GatePolicy.Default, GatePolicy.Parse("# merge rules\nversion: 1\nrequire:\n  ci: green\n  review: pass\n"));
-    }
-
-    [Theory]
-    [InlineData("", "one YAML mapping")]
-    [InlineData("- a\n- b\n", "one YAML mapping")]
-    [InlineData("version: 2\nrequire:\n  ci: green\n  review: pass\n", "version must be 1")]
-    [InlineData("version: 1\n", "missing 'require'")]
-    [InlineData("version: 1\nrequire: yes\n", "require must be a mapping")]
-    [InlineData("version: 1\nrequire:\n  ci: green\n", "missing 'review'")]
-    [InlineData("version: 1\nrequire:\n  ci: green\n  review: skip\n", "require.review must be 'pass'")]
-    [InlineData("version: 1\nrequire:\n  ci: green\n  review: pass\n  bypass: true\n", "unknown key 'bypass'")]
-    [InlineData("version: 1\nbypass: true\nrequire:\n  ci: green\n  review: pass\n", "unknown key 'bypass'")]
-    [InlineData("version: 1\nrequire:\n  ci: green\n  ci: red\n  review: pass\n", "not valid YAML")]
-    [InlineData("version: [1\n", "not valid YAML")]
-    public void Anything_else_is_invalid(string yaml, string reason)
-    {
-        var ex = Assert.Throws<GatePolicyException>(() => GatePolicy.Parse(yaml));
-        Assert.Contains(reason, ex.Message);
-    }
-}
-
 public class MergeGateTests
 {
     private const string Head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     private const string Old = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    private const string Policy = "version: 1\nrequire:\n  ci: green\n  review: pass\n";
+    private static readonly string Policy = TestPolicies.Standard();
     private static readonly PullFacts Pull = new(1, "https://github.com/o/r/pull/1", true, false, false, Head, "main", "base", null);
     private static readonly CiFacts Green = new(Head, [new CheckFact("build", true, "success"), new CheckFact("lint", true, "skipped")]);
     private static RoleReview Review(string role, string model = "gpt-5.5") => new(role, model, model, ModelFamily.Of(model), "s", "p", [], "ok");
     private static readonly ReviewVerdict Pass = ReviewPanel.Decide(Head, [], [Review(ReviewRoles.Correctness), Review(ReviewRoles.SpecConformance)]);
     private static readonly string[] Implementer = ["claude-sonnet-4-5"];
+    private static readonly ChangeFacts Normal = new(TestPolicies.Diff("src/x.cs"), null, 0);
 
-    private static GateDecision Evaluate(string? policy = Policy, string? policyError = null, PullFacts? pull = null, CiFacts? ci = null,
-        ReviewVerdict[]? verdicts = null, string[]? implementer = null) =>
-        MergeGate.Evaluate(policy, policyError, pull ?? Pull, ci ?? Green, verdicts ?? [Pass], implementer ?? Implementer);
+    private static GateDecision Evaluate(string? policy = null, string? policyError = null, PullFacts? pull = null, CiFacts? ci = null,
+        ReviewVerdict[]? verdicts = null, string[]? implementer = null, ChangeFacts? change = null, bool noPolicy = false) =>
+        MergeGate.Evaluate(noPolicy ? null : policy ?? Policy, policyError, TestPolicies.Counting(pull ?? Pull, change ?? Normal), change ?? Normal,
+            ci ?? Green, verdicts ?? [Pass], implementer ?? Implementer);
 
     [Fact]
     public void Merges_when_ci_is_green_and_a_different_family_passed_the_head()
@@ -97,11 +72,12 @@ public class MergeGateTests
 
     [Theory]
     [InlineData(null, null, "does not exist")]
-    [InlineData("version: 1\nrequire:\n  ci: green\n", null, "missing 'review'")]
-    [InlineData("version: 1", "GitHub read failed: 500", "could not be read")]
+    [InlineData("version: 1\nrequire:\n  ci: green\n  review: pass\n", null, "version 1, which this gate no longer accepts")]
+    [InlineData("version: 2\ntiers: {}\nrisk: {}\n", null, "tiers is missing 'sealed'")]
+    [InlineData("version: 2", "GitHub read failed: 500", "could not be read")]
     public void An_unreadable_or_invalid_policy_blocks(string? policy, string? error, string reason)
     {
-        var decision = Evaluate(policy: policy, policyError: error);
+        var decision = Evaluate(policy: policy, policyError: error, noPolicy: policy is null);
         Assert.Equal(GateOutcome.Blocked, decision.Outcome);
         Assert.Contains(reason, decision.Detail);
     }
@@ -468,18 +444,6 @@ public class ReviewPanelTests
     public void Risky_paths_call_the_security_review_in(string path, bool risky) =>
         Assert.Equal(risky, RiskyPaths.Touched([path]).Count > 0);
 
-    [Theory]
-    [InlineData("@@ -1 +1 @@\n-a\n+b\n", true)]
-    [InlineData("Binary files differ\n", true)]
-    [InlineData("", false)]
-    [InlineData(" \n", false)]
-    [InlineData("diff --git a/README.md b/README.md\n+x\n", false)]
-    public void A_non_empty_diff_with_no_readable_path_is_risky(string diff, bool risky)
-    {
-        string[] expected = risky ? [RiskyPaths.Unparsed] : [];
-        Assert.Equal(expected, RiskyPaths.Touched(DiffPaths.Of(diff), diff));
-    }
-
     [Fact]
     public void The_paths_of_a_diff_come_from_its_headers_including_both_sides_of_a_rename()
     {
@@ -504,6 +468,8 @@ public class ReviewPanelTests
             """;
 
         Assert.Equal(["new.txt", "old/name.cs", "scripts/name.sh", "src/a.cs"], DiffPaths.Of(diff));
+        Assert.Equal(3, DiffPaths.Parse(diff).ChangedLines); // -x, +y and the added line that looks like a header
+        Assert.Equal(3, DiffPaths.Parse(diff).Files); // the rename is one file, as GitHub's changed_files counts it
         Assert.Equal(["scripts/name.sh (scripts)"], RiskyPaths.Touched(DiffPaths.Of(diff)));
     }
 
@@ -602,11 +568,11 @@ public class GitHubGateTests
     public async Task Reads_the_pull_request_with_a_read_only_token()
     {
         var (gate, api) = Gate(a => a.On($"GET {Repo}/pulls/7", HttpStatusCode.OK,
-            $$$"""{"number":7,"html_url":"https://github.com/michaeltrefry/dark-factory-sandbox/pull/7","state":"open","merged":false,"draft":false,"merge_commit_sha":null,"head":{"ref":"factory/sc-1","sha":"{{{Head}}}"},"base":{"ref":"main","sha":"b0"}}"""));
+            $$$"""{"number":7,"html_url":"https://github.com/michaeltrefry/dark-factory-sandbox/pull/7","state":"open","merged":false,"draft":false,"merge_commit_sha":null,"changed_files":3,"head":{"ref":"factory/sc-1","sha":"{{{Head}}}"},"base":{"ref":"main","sha":"b0"}}"""));
 
         var pull = await gate.GetPullAsync(Sandbox, 7, CancellationToken.None);
 
-        Assert.Equal(new PullFacts(7, "https://github.com/michaeltrefry/dark-factory-sandbox/pull/7", true, false, false, Head, "main", "b0", null), pull);
+        Assert.Equal(new PullFacts(7, "https://github.com/michaeltrefry/dark-factory-sandbox/pull/7", true, false, false, Head, "main", "b0", null, 3), pull);
         var permissions = TokenPermissions(api).Single();
         Assert.All(permissions.EnumerateObject(), p => Assert.Equal("read", p.Value.GetString()));
         Assert.Equal(["contents", "pull_requests", "checks", "statuses"], permissions.EnumerateObject().Select(p => p.Name));

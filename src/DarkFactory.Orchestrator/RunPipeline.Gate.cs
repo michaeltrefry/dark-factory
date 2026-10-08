@@ -70,7 +70,9 @@ public sealed partial class RunPipeline
 
     /// <summary>
     /// Review: the review panel judges the PR's current head commit — correctness and spec conformance always, security when
-    /// the diff touches a risky path (<see cref="RiskyPaths"/>) — each role pinned through the router to the first of its
+    /// the diff touches a path whose tier in the base branch's <c>factory/gate.yaml</c> requires it
+    /// or that the code floor <see cref="RiskyPaths"/> matches (<see cref="GatePolicy.SecurityReviewReasons"/>; a missing or invalid
+    /// policy escalates before any call) — each role pinned through the router to the first of its
     /// models whose family the implementer did not use, with its prompt file (<see cref="ReviewPrompts"/>). Each blocking
     /// finding goes to a second model (<see cref="ReviewerChoice.ChooseConfirmer"/>); one it does not confirm is downgraded
     /// to optional. The verdict (<see cref="ReviewPanel.Decide"/>: deterministic over the findings) is checkpointed bound to
@@ -281,9 +283,10 @@ public sealed partial class RunPipeline
     private async Task<ReviewVerdict> ReviewPanelAsync(Run run, PullFacts pull, List<string> implementer, ReviewVerdict? previous, CancellationToken ct)
     {
         var families = ReviewerChoice.ImplementerFamilies(implementer); // an unknown implementer escalates before any call
+        var policy = await PolicyForReviewAsync(run, pull, ct);
         var diff = await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
         var files = await Gate.GitHub.GetFilesAsync(run.Repo, pull.BaseSha, ct);
-        var risky = RiskyPaths.Touched(DiffPaths.Of(diff), diff);
+        var risky = policy.SecurityReviewReasons(policy.Classify(diff));
         var roles = ReviewRoles.Required(risky.Count > 0);
         var carried = previous is null ? [] : FixLoop.Carried(previous, roles, families);
         var toReview = roles.Where(r => carried.All(c => c.Role != r)).ToList();
@@ -323,6 +326,42 @@ public sealed partial class RunPipeline
             reviews.Add(review);
         }
         return ReviewPanel.Decide(pull.HeadSha, risky, reviews);
+    }
+
+    /// <summary>
+    /// The base branch's <c>factory/gate.yaml</c> at the PR's base commit — the one the diff is read against, so a push to
+    /// the base between the two reads cannot pair one commit's policy with another's diff — read now (E1): the text, or why
+    /// it could not be read (null text and null error: it does not exist).
+    /// </summary>
+    private async Task<(string? Text, string? Error)> ReadPolicyAsync(Run run, PullFacts pull, CancellationToken ct)
+    {
+        try
+        {
+            return (await Gate.GitHub.GetPolicyAsync(run.Repo, pull.BaseSha, ct), null);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or HttpRequestException)
+        {
+            return (null, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// The policy the review chooses its panel by (whose tiers require the security review). Missing, unreadable or
+    /// invalid: nothing can merge, so the item escalates now rather than spending a review.
+    /// </summary>
+    private async Task<GatePolicy> PolicyForReviewAsync(Run run, PullFacts pull, CancellationToken ct)
+    {
+        var (text, error) = await ReadPolicyAsync(run, pull, ct);
+        try
+        {
+            return error is not null ? throw new GatePolicyException($"{GatePolicy.Path} on {pull.BaseRef} could not be read: {error}")
+                : text is null ? throw new GatePolicyException($"{GatePolicy.Path} does not exist on {pull.BaseRef}")
+                : GatePolicy.Parse(text);
+        }
+        catch (GatePolicyException ex)
+        {
+            throw new GateBlockedException($"{pull.HtmlUrl} cannot be reviewed or merged: {ex.Message}");
+        }
     }
 
     /// <summary>
@@ -528,7 +567,8 @@ public sealed partial class RunPipeline
 
     /// <summary>
     /// MergeGate (E1–E3): evaluates <see cref="MergeGate"/> on facts read now — the base branch's <c>factory/gate.yaml</c>,
-    /// the PR, its head commit's CI and the ledger's verdicts — and checkpoints the decision. Merge: merges exactly the
+    /// the PR, the diff of its head commit (whose paths' tiers decide the checks), that commit's CI, the ledger's verdicts
+    /// and fix rounds — and checkpoints the decision. Merge: merges exactly the
     /// gated head commit with the gate App's token, then records Merge with the merge commit. A head with no verdict (a
     /// push after the review, or one that lands between the evaluation and the merge, which GitHub refuses) → Review.
     /// Anything else → escalate; nothing merges. A PR found merged (on resume, or re-read after a failed merge call) at a
@@ -551,17 +591,20 @@ public sealed partial class RunPipeline
             throw new GateBlockedException($"{pull.HtmlUrl} was merged outside the gate.");
         }
 
-        string? policy = null, policyError = null;
+        var (policy, policyError) = await ReadPolicyAsync(run, pull, ct);
+        string? diff = null, diffError = null;
         try
         {
-            policy = await Gate.GitHub.GetPolicyAsync(run.Repo, pull.BaseRef, ct);
+            diff = await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
         }
         catch (Exception ex) when (ex is InvalidOperationException or HttpRequestException)
         {
-            policyError = ex.Message;
+            diffError = ex.Message;
         }
+        var fixRounds = TransitionContext.From(history.Where(e => e.Step is null).Select(e => e.State).ToList()).FixRounds;
         var ci = await Gate.GitHub.GetCiAsync(run.Repo, pull.HeadSha, ct);
-        var decision = MergeGate.Evaluate(policy, policyError, pull, ci, Verdicts(history), ImplementerModels(history));
+        var decision = MergeGate.Evaluate(policy, policyError, pull, new ChangeFacts(diff, diffError, fixRounds), ci, Verdicts(history),
+            ImplementerModels(history));
         await ledger.CheckpointAsync(run.Item, Steps.GateDecision, null, decision.Detail, ct);
         log.WriteLine($"[gate] {decision.Detail}");
         switch (decision.Outcome)
