@@ -361,7 +361,8 @@ public static partial class IssueComments
             text.AppendLine(Fence(record.Error ?? "the triage could not be completed"));
         }
         text.AppendLine();
-        text.AppendLine($"Route: **{RouteName(record.Route)}**: {record.Why}.");
+        // The reason can name model-chosen paths or the model's malformed answer: inert in a code span (no mention, no link).
+        text.AppendLine($"Route: **{RouteName(record.Route)}**: `{record.Why.Replace("`", "'", StringComparison.Ordinal).ReplaceLineEndings(" ")}`");
         text.AppendLine(record.Route switch
         {
             IssueRoute.Build => "The factory is building this; its pull request closes this issue when it merges.",

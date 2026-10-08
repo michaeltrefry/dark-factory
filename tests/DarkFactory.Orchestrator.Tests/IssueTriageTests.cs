@@ -190,6 +190,18 @@ public class IssueTriageTests
     }
 
     [Fact]
+    public void Model_text_in_the_route_reason_stays_inert()
+    {
+        var error = Assert.Throws<TriageFormatException>(() =>
+            TriageParser.Parse("```json\n{\"type\":\"bug\",\"title\":\"t\",\"summary\":\"s\",\"confidence\":1,\"affected_repos\":[\"@everyone `x`\"]}\n```")).Message;
+        var record = TriageRecord.Create("v", null, error, "someone", Reader, IssueRouting.Decide(null, error, Reader, Watched, Policy, null));
+
+        var route = IssueComments.Triage(record).Split('\n').Single(l => l.StartsWith("Route:", StringComparison.Ordinal));
+
+        Assert.Matches("^Route: \\*\\*needs a human\\*\\*: `[^`]*@everyone[^`]*`$", route);
+    }
+
+    [Fact]
     public void Versions_and_triage_hashes_follow_their_content()
     {
         Assert.Equal(IssueHashes.Version("t", "a\r\nb"), IssueHashes.Version("t", "a\nb"));
