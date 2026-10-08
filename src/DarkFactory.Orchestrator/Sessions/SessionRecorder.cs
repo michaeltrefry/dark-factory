@@ -22,17 +22,24 @@ public sealed class SessionRecorder(
     TimeProvider time,
     TextWriter log,
     int capacity = SessionRecorder.DefaultCapacity,
-    IReadOnlyList<TimeSpan>? costRetryDelays = null)
+    IReadOnlyList<TimeSpan>? costRetryDelays = null,
+    TimeSpan? costSettleDelay = null)
 {
     /// <summary>Queued lines per run. A stream-json line can be large (tool results), so this stays modest.</summary>
     public const int DefaultCapacity = 256;
 
     /// <summary>
-    /// The router commits a session's cost asynchronously, some time after its last request
-    /// (the acceptance harness allows ~60 s): retry this long while it is missing or still zero.
+    /// The router commits a session's telemetry asynchronously, some time after its last request
+    /// (the acceptance harness allows ~60 s): retry this long while it has recorded no request for the session.
     /// </summary>
     public static readonly IReadOnlyList<TimeSpan> DefaultCostRetryDelays =
         [.. new[] { 1, 2, 4, 8 }.Select(s => TimeSpan.FromSeconds(s)), .. Enumerable.Repeat(TimeSpan.FromSeconds(5), 9)];
+
+    /// <summary>
+    /// After the first recorded answer, the cost is read once more this much later and the later answer kept:
+    /// the session's last requests may be committed after its first ones (<c>Router:CostSettleSeconds</c>).
+    /// </summary>
+    public static readonly TimeSpan DefaultCostSettleDelay = TimeSpan.FromSeconds(5);
 
     private readonly IDbContextFactory<LedgerDbContext> _contexts = contexts;
     private readonly ISessionCostSource _costs = costs;
@@ -40,6 +47,7 @@ public sealed class SessionRecorder(
     private readonly TextWriter _log = log;
     private readonly int _capacity = capacity;
     private readonly IReadOnlyList<TimeSpan> _costRetryDelays = costRetryDelays ?? DefaultCostRetryDelays;
+    private readonly TimeSpan _costSettleDelay = costSettleDelay ?? DefaultCostSettleDelay;
 
     /// <summary>
     /// Opens the capture of one worker run. Resuming <paramref name="resumeSessionId"/> continues
@@ -168,31 +176,44 @@ public sealed class SessionRecorder(
         }
 
         /// <summary>
-        /// The router's committed cost: retried while it is missing (404) or still zero (not fully
-        /// committed), up to the recorder's retry delays. Null if it never arrives.
+        /// The router's cost for the session. It counts as recorded once the router reports at least one request
+        /// (<c>request_count &gt; 0</c>); a 404 or zero requests is retried, up to the recorder's retry delays. A
+        /// recorded actual cost of 0 is valid (turns served on a local model are priced at $0) and stops the retries.
+        /// Then, after the settle delay, the cost is read once more and that later answer kept if it is recorded,
+        /// since the session's last requests may land after the first answer. Null if nothing is ever recorded.
         /// </summary>
         private async Task<SessionCost?> FetchCostAsync(string sessionId, CancellationToken ct)
         {
             var delays = _recorder._costRetryDelays;
+            SessionCost? recorded;
             for (var attempt = 0; ; attempt++)
             {
-                try
+                if ((recorded = await TryGetRecordedAsync(sessionId, ct)) is not null)
                 {
-                    if (await _recorder._costs.GetSessionCostAsync(sessionId, ct) is { ActualCostUsdMicros: > 0 } cost)
-                    {
-                        return cost;
-                    }
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
-                {
-                    _recorder._log.WriteLine($"[session] router cost for session {sessionId}: {ex.Message}");
+                    break;
                 }
                 if (attempt >= delays.Count)
                 {
-                    _recorder._log.WriteLine($"[session] router has no committed cost for session {sessionId}; left unset");
+                    _recorder._log.WriteLine($"[session] router has recorded no request for session {sessionId}; cost left unset");
                     return null;
                 }
                 await Task.Delay(delays[attempt], _recorder._time, ct);
+            }
+            await Task.Delay(_recorder._costSettleDelay, _recorder._time, ct);
+            return await TryGetRecordedAsync(sessionId, ct) ?? recorded;
+        }
+
+        /// <summary>The router's answer if it has recorded a request for the session; null on 404, zero requests or an error.</summary>
+        private async Task<SessionCost?> TryGetRecordedAsync(string sessionId, CancellationToken ct)
+        {
+            try
+            {
+                return await _recorder._costs.GetSessionCostAsync(sessionId, ct) is { RequestCount: > 0 } cost ? cost : null;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                _recorder._log.WriteLine($"[session] router cost for session {sessionId}: {ex.Message}");
+                return null;
             }
         }
 

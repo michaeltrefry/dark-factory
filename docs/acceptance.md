@@ -66,7 +66,7 @@ throwaway ledger, waits (≤ 45 min) for the item to reach Review, then asserts:
 **PR and branch external links**; the ledger transitions are exactly **Intake → Implement → Review**; exactly one PR
 from `factory/sc-<id>`; after a **real login** (login page, antiforgery token, form post) the dashboard's
 `/sessions/{id}` page names the item and the session hub **replays every stored event** of the session in order; the
-**pipeline shows the item's cost > 0**; and AT7 for the run's sessions. `WalkingSkeletonTests` additionally covers the
+**pipeline shows the item's recorded cost** (≥ $0, shown even when $0.00); and AT7 for the run's sessions. `WalkingSkeletonTests` additionally covers the
 `factory run --ignore-scope` path (it also uses `FACTORY_E2E_STORY`; give it a different story).
 
 ## AT3 — crash: kill -9 mid-Implement
@@ -143,7 +143,9 @@ FACTORY_SANDBOX_LIVE=1 dotnet test --project tests/DarkFactory.Orchestrator.Test
 Automated, three ways: AT2 and AT5 end by checking every `worker_sessions` row of their run; standalone,
 `RouterAccountingTests.Router_reports_requests_and_cost_for_every_worker_session_since_the_given_time` checks any
 ledger (`FACTORY_E2E_LEDGER`, default the configured one; read-only) for sessions started since `FACTORY_E2E_SINCE`
-(ISO 8601). Each session must have `GET /v1/sessions/{id}/cost` with `request_count > 0` and non-zero cost.
+(ISO 8601). Each session must be recorded: `GET /v1/sessions/{id}/cost` answers 200 with `request_count > 0`, and its
+cost is ≥ 0. A cost of 0 is valid: the router may serve turns (or a whole session) on a local model priced at $0, which
+still counts toward `request_count`. A 404 or `request_count == 0` means not recorded (yet).
 
 That proves every *session* is costed, not that no call bypassed a session. Owner, by hand, for the AT2 window: in the
 router's logs (`docker compose logs router --since <start> --until <end>` from the router checkout) or its telemetry

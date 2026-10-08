@@ -100,8 +100,9 @@ public sealed class SessionCaptureTests : IAsyncLifetime
     private LedgerDbContextFactory Contexts() => new(LedgerDbContext.PostgresOptions(_cs));
 
     /// <summary>A recorder of its own, as a separate <c>factory run</c> process would have.</summary>
-    private SessionRecorder Recorder(ISessionCostSource costs, int capacity = SessionRecorder.DefaultCapacity) =>
-        new(Contexts(), costs, TimeProvider.System, TextWriter.Null, capacity, costRetryDelays: [TimeSpan.Zero, TimeSpan.Zero]);
+    private SessionRecorder Recorder(ISessionCostSource costs, int capacity = SessionRecorder.DefaultCapacity, TimeSpan? settle = null) =>
+        new(Contexts(), costs, TimeProvider.System, TextWriter.Null, capacity, costRetryDelays: [TimeSpan.Zero, TimeSpan.Zero],
+            costSettleDelay: settle ?? TimeSpan.Zero);
 
     private async Task<WorkItem> ItemAsync(int story = 1)
     {
@@ -121,8 +122,8 @@ public sealed class SessionCaptureTests : IAsyncLifetime
     public async Task Every_fixture_line_is_stored_in_order_without_gaps_and_the_ended_session_holds_the_router_cost()
     {
         var item = await ItemAsync();
-        // The router has no cost when the session ends, then a partly committed zero, then the cost.
-        var costs = new FakeCosts(null, FixtureCost with { ActualCostUsdMicros = 0 }, FixtureCost);
+        // The router has no telemetry when the session ends (404), then no request yet, then the cost.
+        var costs = new FakeCosts(null, FixtureCost with { RequestCount = 0, ActualCostUsdMicros = 0 }, FixtureCost);
         // A one-slot queue: the reader waits for the database instead of dropping lines.
         await using var capture = await Recorder(costs, capacity: 1).StartAsync(item.Id, null, CancellationToken.None);
         foreach (var line in StreamJsonFixture.Fresh)
@@ -148,14 +149,15 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         Assert.NotNull(session.EndedAt);
         Assert.Equal(0.429606m, session.CostUsd);
         Assert.Equal(3, session.RouterRequestCount);
-        Assert.Equal(3, costs.Calls);
+        Assert.Equal(4, costs.Calls); // three tries until recorded, then the settle re-read
     }
 
     [Fact]
-    public async Task A_cost_that_never_commits_is_left_unset_after_the_retries()
+    public async Task A_cost_with_no_recorded_request_is_left_unset_after_the_retries()
     {
         var item = await ItemAsync();
-        var costs = new FakeCosts(FixtureCost with { ActualCostUsdMicros = 0 });
+        // A 200 with request_count 0 is not recorded spend, whatever the cost says.
+        var costs = new FakeCosts(FixtureCost with { RequestCount = 0, ActualCostUsdMicros = 0 });
         await using var capture = await Recorder(costs).StartAsync(item.Id, StreamJsonFixture.SessionId, CancellationToken.None);
         await capture.CompleteAsync(0, "succeeded", fetchCost: true, CancellationToken.None);
 
@@ -163,6 +165,54 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         var session = await db.WorkerSessions.SingleAsync();
         Assert.Equal(("succeeded", (decimal?)null), (session.ExitStatus, session.CostUsd));
         Assert.Equal(3, costs.Calls); // the first try and two retries
+    }
+
+    [Fact]
+    public async Task A_session_served_at_zero_cost_is_stored_as_zero_and_not_retried_past_the_settle_re_read()
+    {
+        // Turns served on the router's local model are priced at $0: a recorded actual cost of 0 is a real cost.
+        var item = await ItemAsync();
+        var zero = FixtureCost with { RequestCount = 2, ActualCostUsdMicros = 0 };
+        var costs = new FakeCosts(null, zero, zero, FixtureCost);
+        var recorder = new SessionRecorder(Contexts(), costs, TimeProvider.System, TextWriter.Null,
+            costRetryDelays: [.. Enumerable.Repeat(TimeSpan.Zero, 5)], costSettleDelay: TimeSpan.Zero);
+        await using var capture = await recorder.StartAsync(item.Id, StreamJsonFixture.SessionId, CancellationToken.None);
+        await capture.CompleteAsync(0, "succeeded", fetchCost: true, CancellationToken.None);
+
+        await using var db = Context();
+        var session = await db.WorkerSessions.SingleAsync();
+        Assert.Equal((0m, 2L), (session.CostUsd, session.RouterRequestCount));
+        Assert.Equal(3, costs.Calls); // the 404, the recorded zero, the settle re-read
+    }
+
+    [Fact]
+    public async Task Requests_recorded_after_the_first_answer_are_kept_by_the_settle_re_read()
+    {
+        var item = await ItemAsync();
+        var settle = TimeSpan.FromMilliseconds(300);
+        var costs = new FakeCosts(FixtureCost with { RequestCount = 1, ActualCostUsdMicros = 1000 }, FixtureCost);
+        await using var capture = await Recorder(costs, settle: settle).StartAsync(item.Id, StreamJsonFixture.SessionId, CancellationToken.None);
+        await capture.CompleteAsync(0, "succeeded", fetchCost: true, CancellationToken.None);
+
+        await using var db = Context();
+        var session = await db.WorkerSessions.SingleAsync();
+        Assert.Equal((0.429606m, 3L), (session.CostUsd, session.RouterRequestCount));
+        Assert.Equal(2, costs.Calls);
+        Assert.True(costs.CalledAt[1] - costs.CalledAt[0] >= settle - TimeSpan.FromMilliseconds(20),
+            $"the re-read came {costs.CalledAt[1] - costs.CalledAt[0]} after the first answer");
+    }
+
+    [Fact]
+    public async Task A_settle_re_read_with_nothing_recorded_keeps_the_first_answer()
+    {
+        var item = await ItemAsync();
+        var costs = new FakeCosts(FixtureCost with { RequestCount = 1, ActualCostUsdMicros = 1000 }, null);
+        await using var capture = await Recorder(costs).StartAsync(item.Id, StreamJsonFixture.SessionId, CancellationToken.None);
+        await capture.CompleteAsync(0, "succeeded", fetchCost: true, CancellationToken.None);
+
+        await using var db = Context();
+        var session = await db.WorkerSessions.SingleAsync();
+        Assert.Equal((0.001m, 1L), (session.CostUsd, session.RouterRequestCount));
     }
 
     [Fact]
@@ -504,6 +554,7 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         {
             ["ConnectionStrings:Ledger"] = _cs,
             ["Factory:HostPort"] = "0",
+            ["Router:CostSettleSeconds"] = "0",
         }).Build();
         var app = FactoryHost.Build(new FactoryOptions(config, DashboardLogin.Secrets()), services =>
         {
@@ -557,9 +608,15 @@ public sealed class SessionCaptureTests : IAsyncLifetime
     private sealed class FakeCosts(params SessionCost?[] answers) : ISessionCostSource
     {
         public int Calls;
+        public readonly System.Collections.Concurrent.ConcurrentQueue<DateTimeOffset> CallTimes = new();
 
-        public Task<SessionCost?> GetSessionCostAsync(string sessionId, CancellationToken ct) =>
-            Task.FromResult(answers[Math.Min(Interlocked.Increment(ref Calls), answers.Length) - 1]);
+        public DateTimeOffset[] CalledAt => [.. CallTimes];
+
+        public Task<SessionCost?> GetSessionCostAsync(string sessionId, CancellationToken ct)
+        {
+            CallTimes.Enqueue(DateTimeOffset.UtcNow);
+            return Task.FromResult(answers[Math.Min(Interlocked.Increment(ref Calls), answers.Length) - 1]);
+        }
     }
 
     /// <summary>A router that never answers until the caller gives up.</summary>

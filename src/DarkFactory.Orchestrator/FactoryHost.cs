@@ -145,7 +145,8 @@ public static class FactoryHost
             sp.GetRequiredService<IDbContextFactory<LedgerDbContext>>(),
             sp.GetRequiredService<ISessionCostSource>(),
             TimeProvider.System,
-            Console.Out));
+            Console.Out,
+            costSettleDelay: options.CostSettleDelay));
         return services;
     }
 

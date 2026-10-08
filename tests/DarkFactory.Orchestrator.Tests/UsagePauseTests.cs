@@ -364,7 +364,10 @@ public class UsagePauseTests
         var ledger = l.Ledger;
         var costed = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-1", "One", Sandbox.FullName, null, CancellationToken.None);
         var uncosted = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-2", "Two", Sandbox.FullName, null, CancellationToken.None);
+        var free = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-3", "Three", Sandbox.FullName, null, CancellationToken.None);
         l.Db.WorkerSessions.AddRange(
+            new WorkerSession { WorkItemId = free.Id, ClaudeSessionId = "e", Attempt = 1, StartedAt = T0, CostUsd = 0m }, // served at $0
+            new WorkerSession { WorkItemId = free.Id, ClaudeSessionId = "f", Attempt = 2, StartedAt = T0, CostUsd = null },
             new WorkerSession { WorkItemId = costed.Id, ClaudeSessionId = "a", Attempt = 1, StartedAt = T0, CostUsd = 0.25m },
             new WorkerSession { WorkItemId = costed.Id, ClaudeSessionId = "b", Attempt = 2, StartedAt = T0, CostUsd = null }, // cost not in yet
             new WorkerSession { WorkItemId = costed.Id, ClaudeSessionId = "c", Attempt = 3, StartedAt = T0, CostUsd = 1.505m },
@@ -377,6 +380,7 @@ public class UsagePauseTests
 
         Assert.Equal(1.755m, rows.Single(r => r.ExternalId == "sc-1").CostUsd);
         Assert.Null(rows.Single(r => r.ExternalId == "sc-2").CostUsd);
+        Assert.Equal(0m, rows.Single(r => r.ExternalId == "sc-3").CostUsd);
         Assert.All(rows, r => Assert.Equal(ControlState.Paused, r.Control));
         l.Time.Advance(TimeSpan.FromMinutes(5));
         Assert.All(await data.ActiveItemsAsync(CancellationToken.None), r => Assert.Equal(ControlState.Running, r.Control));

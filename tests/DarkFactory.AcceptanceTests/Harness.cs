@@ -95,7 +95,10 @@ internal static class Harness
         }
     }
 
-    /// <summary>The router commits telemetry asynchronously, so poll briefly for the session's cost.</summary>
+    /// <summary>
+    /// The router commits telemetry asynchronously, so poll briefly until it has recorded a request for the session
+    /// (<c>request_count &gt; 0</c>). The cost may then be 0: turns served on the router's local model are priced at $0.
+    /// </summary>
     public static async Task<SessionCost?> WaitForCostAsync(string sessionId, string routerKey, CancellationToken ct)
     {
         using var http = new HttpClient { BaseAddress = Options.RouterBaseUrl };
@@ -103,7 +106,7 @@ internal static class Harness
         for (var attempt = 0; attempt < 30; attempt++)
         {
             var cost = await router.GetSessionCostAsync(sessionId, ct);
-            if (cost is { ActualCostUsdMicros: > 0 })
+            if (cost is { RequestCount: > 0 })
             {
                 return cost;
             }

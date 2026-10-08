@@ -57,6 +57,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Intake:PollSeconds` | `60` |
 | `Intake:MaxItemFailures` | `3` (runs of one item failing in a row before `factory work` escalates/parks it, E10) |
 | `Usage:PollSeconds` | `60` (`factory work` reads the router's subscription usage; also read at each intake poll) |
+| `Router:CostSettleSeconds` | `5` (after a session's cost is first recorded, it is read once more this much later and the later value kept) |
 | `Factory:WorkRoot` | `/opt/dark-factory/work` (clones + worktrees; `~/.dark-factory` when `Worker:RunAs=none`) |
 | `ConnectionStrings:Ledger` | `Host=localhost;Port=5434;Database=factory;Username=factory;Password=factory` |
 | `Worker:ClaudePath` | `claude` (as the worker user sees it: `~_factory/.local/bin` is first on its PATH) |
@@ -139,6 +140,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   re-reads and decides again, so a backoff never shortens a known reset. A run stopped while a user's factory/epic/item
   Pause also holds is recorded `user-paused`, not `usage-paused`. Each usage read is bounded by
   `UsageOptions.RequestTimeout` (10 s), since the intake loop runs it inline.
+  Owner decision (2026-10-08): when every subscription is exhausted the router may keep serving on a local model
+  (`subscription_fallback`), but the factory still pauses on the router's `all_exhausted` — unattended work on the
+  local model alone is not wanted.
   Deliberate scope decision: a 529/overloaded failure (`API Error: 529`, `overloaded_error`, "Repeated 529") counts as
   usage-limited — it pauses the factory with the backoff and never escalates the item — even though it is upstream
   capacity rather than the plans running out; a transient overload thus costs at most a backoff, not an escalation.
@@ -186,8 +190,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   bounded channel that `SessionRecorder` drains into Postgres in order (gapless `Sequence`, non-JSON lines kept as `raw`);
   a resumed session continues its `worker_sessions` row and sequence. The row is named (`SetClaudeSessionIdAsync`) before
   the ledger checkpoints the session id, and a resume whose id matches no row continues the item's newest unnamed row.
-  At session end the row gets exit status and the router cost (`GET /v1/sessions/:id/cost`, retried ~60 s while missing
-  or zero; reporting only, E9). The recorder only stores: an insert trigger NOTIFYs `session_events`, and in `factory work`
+  At session end the row gets exit status and the router cost (`GET /v1/sessions/:id/cost`; reporting only, E9): retried
+  ~60 s until recorded (200 with `request_count > 0`; a 404 or zero requests is not), then re-read once after
+  `Router:CostSettleSeconds` and the later value kept (late-landing turns). A recorded cost of 0 is valid — the router
+  prices turns served on its local model at $0 — and is stored as `CostUsd = 0` (dashboard `$0.00`; unknown is `—`). The recorder only stores: an insert trigger NOTIFYs `session_events`, and in `factory work`
   `SessionEventRelay` LISTENs (reconnecting and catching up from the ledger) and `SessionBroadcaster` pushes to
   `SessionHub` (`/hubs/sessions`, `JoinSession(id)`) viewers the stored backlog then live events, once each, whichever
   process (`factory work` or a separate `factory run`) recorded them. Slow viewers are disconnected, never waited on.
