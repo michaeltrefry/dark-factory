@@ -58,7 +58,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
 | `GitHub:Gate:AppId`, `GitHub:Gate:PrivateKeyPem` | keychain `github-gate-app-id`, `github-gate-app-private-key` (written by `factory github-app setup --gate`): the merge gate's App, the only credential that merges |
-| `Review:Models` | none — must be set: the router catalog (`GET /v1/router/models`, 2026-10-08) has no Claude Opus 5.5 or newer, and the factory refuses to start without one (every panel role's reviewer models in order, unless the role sets its own; each must be a Claude Opus 5.5 or newer, `ReviewModels.MeetsReviewFloor`: `claude-opus-<major>[-.]<minor>[-yyyymmdd]`, an older Opus, another Claude or another vendor's model is refused; the first entry reviews, whatever models the implementer used) |
+| `Review:Models` | none — must be set: the router catalog (`GET /v1/router/models`, 2026-10-08) has no Claude Opus 5.5 or newer, and the factory refuses to start without one (`ReviewConfigurationException`: `factory run` and `factory work` print the reason and exit 2, before any router call) (every panel role's reviewer models in order, unless the role sets its own; each must be a Claude Opus 5.5 or newer, `ReviewModels.MeetsReviewFloor`: `claude-opus-<major>[-.]<minor>[-yyyymmdd]`, where the dotted and dashed spellings are one model everywhere ids are compared — pinned, served, reviewer vs second model — an older Opus, another Claude or another vendor's model is refused; the first entry reviews, whatever models the implementer used) |
 | `Review:Correctness:Models`, `Review:SpecConformance:Models`, `Review:Security:Models` | `Review:Models` (one panel role's own reviewer models, in order; the same Claude Opus 5.5 or newer rule) |
 | `Review:Confirm:Models` | `claude-opus-5,claude-sonnet-5` (the router catalog's Claude models; second models that confirm a blocking finding: the first Claude model that is not the reviewer's model; a non-Claude entry is refused) |
 | `Review:TimeoutMinutes` | `10` (one reviewer call) |
@@ -344,7 +344,12 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   watch): either cancels them (the runner stops the sandboxed commands) and records nothing, so Continue runs the check again.
   Upgrading from Phase 1: Review is now a handled state, so the first `factory work` picks up every item parked at Review:
   an open PR is reviewed by the panel like any other (Phase 1's missing `implementer-model` no longer matters, sc-25379),
-  and one the owner merged or closed escalates once with a story comment ("merged outside the factory"). See docs/acceptance.md.
+  and one the owner merged or closed escalates once with a story comment ("merged outside the factory"). An item whose
+  head already has a verdict recorded under the dropped cross-family rule (e.g. a `gpt-5.5` or `claude-opus-5` reviewer)
+  is reviewed again once by the current panel (`MergeGate.Superseded`: its models break `ReviewModels.Problems` and it is
+  the only verdict on that head — at Review it is not reused; at MergeGate the gate answers ReviewHead when those are its
+  only reasons), then merges as usual; the current panel's own verdict is a second one on the head, so if its models still
+  break the rule the gate escalates instead of reviewing again. See docs/acceptance.md.
 - Processes migrate the ledger through `LedgerMigrations.MigrateAsync` (advisory-locked: EF alone lets two concurrent
   migrators apply the same migration) before reading it; tests migrate their temp database before starting a host.
 - Tests: xunit.v3 on Microsoft.Testing.Platform (`global.json` opts in).

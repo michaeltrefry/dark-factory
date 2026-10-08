@@ -181,7 +181,8 @@ Owner set-up, once (the test skips naming whichever is missing):
    scripts/setup-worker-user.sh` must be in place), and the policy must list that check in `normal` and `protected`.
 4. `Review:Models` set to a Claude Opus 5.5 or newer id the router routes under `x-weave-force-model` (sc-25379: every
    reviewer is one, whichever models the implementer used; there is no default, and the factory refuses to start without
-   it — the router's catalog on 2026-10-08 offered no such id).
+   it — the router's catalog on 2026-10-08 offered no such id). Without it these tests, the seeded review (`ReviewSeedTests`) and the
+   Phase 1 AT1–AT5 runs skip naming it; `factory run`/`factory work` print the reason and exit 2.
 
 | Test | Variables | Proves |
 | --- | --- | --- |
@@ -224,3 +225,9 @@ comment on its story:
   pickup never resumes an Escalated item).
 
 Expected and one-time: these escalations are the ledger catching up, not failures of the gate.
+
+An item already past Review (at CI or MergeGate) whose head has a passing verdict recorded before sc-25379 — by the
+dropped cross-family rule's reviewer (e.g. `gpt-5.5`) or an Opus older than 5.5 — is not escalated for it: the gate sends
+it back to Review and the current panel (`Review:Models`) reviews that head once, then it merges as usual. This happens
+once per head: if the new verdict's models still break the rule (e.g. the router serves the configured Opus under another
+name), the gate escalates with the reason rather than reviewing again.
