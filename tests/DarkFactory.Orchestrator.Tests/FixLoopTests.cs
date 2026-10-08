@@ -455,6 +455,31 @@ public class FixLoopTests
     }
 
     [Fact]
+    public async Task Ci_on_the_fixed_head_still_unfinished_at_the_ci_timeout_escalates_without_a_progress_record()
+    {
+        var h = new Harness
+        {
+            GateOnFakeClock = true,
+            Reviewer = ReviewerFor(new() { [ReviewRoles.Correctness] = new() { [Sha1] = [Blocking("one")] } }),
+        };
+        h.GitHub.Ci[Sha1] = new CiFacts(Sha1, [new("build-test", false, null)]);
+        h.GitHub.OnCiRead = sha =>
+        {
+            if (sha == Sha1)
+            {
+                h.Time.Advance(TimeSpan.FromMinutes(10)); // past the 5 s CI timeout
+            }
+        };
+
+        var outcome = await h.Run().WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains($"CI on {Sha1[..12]}, the commit fix round 1 fixed, did not finish", outcome.Error);
+        Assert.DoesNotContain($"ci {ShaA}", h.GitHub.Calls);
+        Assert.Empty(await Progress(h));
+    }
+
+    [Fact]
     public async Task A_crash_after_the_verdict_but_before_the_progress_check_does_not_review_again_and_records_one_progress_check()
     {
         var h = new Harness { Reviewer = ReviewerFor(new() { [ReviewRoles.Correctness] = new() { [Sha1] = [Blocking("one")] } }) };

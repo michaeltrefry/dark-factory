@@ -250,12 +250,16 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   its models recorded as `implementer-model` so reviewers stay of another family) in a worktree restored from the PR branch,
   prompted with the story and only the confirmed blocking findings (fenced); its work is pushed to the same `factory/*`
   branch (`pushed` Detail = the pushed commit, `IRepoWorkspace.HeadAsync`) → Review. That review waits for the PR to show
-  the push, re-runs only the roles with an open blocking finding (plus a required role the fixed head's verdict lacks, e.g.
+  exactly that push (any other head — someone else's push — escalates), re-runs only the roles with an open blocking finding
+  (plus a required role the fixed head's verdict lacks, e.g.
   security when the fix touches a risky path, or one whose reviewer/second model is now of an implementer family); the
-  others' reviews are carried into the new head's verdict marked `carried: <sha>`. It then checkpoints `fix-progress`
-  (`FixProgress`): progress only if the blocking count went down and no check run/status that passed (by name, from
-  GitHub's executed results on the fixed head) fails on the new head (waited for until each such check finished or one
-  failed; unknown after `Gate:CiTimeoutMinutes` escalates); otherwise a failed round. Every round counts against
+  others' reviews are carried into the new head's verdict marked `carried: <sha>` (the gate's merge reason names them). It
+  then checkpoints `fix-progress` (`FixProgress`): progress only if the blocking count went down and no check run/status
+  (by name, from GitHub's executed results) that passed on the fixed head — or reached no verdict there (`unknown_before`:
+  cancelled, stale, no conclusion; compared like a passed one) — fails or has no run on the new head. It first waits for
+  the fixed head's CI to finish, then for each such check on the new head (one missing once the new head's CI has
+  finished is a regression); still unfinished after `Gate:CiTimeoutMinutes` escalates; either commit's CI not read in full
+  is a failed round. Otherwise a failed round. Every round counts against
   `Lifecycle.MaxFixRounds` (3): a fail that would need a fourth escalates with the open findings listed in the comment.
   The router refusing a call for usage (429/529 or its
   exhaustion/rate-limit body: `RouterUsageLimitedException`) pauses the factory for usage (`reviewer-rate-limited`) like a
