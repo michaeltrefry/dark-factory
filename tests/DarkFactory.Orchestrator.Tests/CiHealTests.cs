@@ -98,8 +98,60 @@ public class CiHealTests
         Assert.Equal([$"merge 1 {ShaA}"], h.Merges);
     }
 
+    [Fact]
+    public async Task A_check_cancelled_by_fail_fast_next_to_the_prs_failure_is_healed_and_must_then_run_and_pass()
+    {
+        var h = new Harness();
+        // A matrix with fail-fast: the lint leg fails, GitHub cancels the build-test leg.
+        h.GitHub.Ci[Sha1] = new CiFacts(Sha1, [new CheckFact("build-test", true, "cancelled", 101), new CheckFact("lint", true, "failure", 102)], true,
+            [new CheckSuiteFact(Ci.ActionsApp, true, "cancelled", 2)]);
+        // On the fixer's push build-test has not reported at first (only lint has, green): CI must wait for it.
+        h.GitHub.Ci[ShaA] = new CiFacts(ShaA, [new CheckFact("lint", true, "success")]);
+        var shaAReads = 0;
+        h.GitHub.OnCiRead = sha =>
+        {
+            if (sha == ShaA && ++shaAReads == 3)
+            {
+                h.GitHub.Ci[ShaA] = new CiFacts(ShaA, [new CheckFact("lint", true, "success"), new CheckFact("build-test", true, "success")]);
+            }
+        };
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(1, (await h.Transitions()).Count(s => s == WorkState.CIHealing));
+        var triage = (await Triages(h)).Single();
+        Assert.Equal(["lint"], triage.Fixable);
+        Assert.Equal(["build-test"], triage.Cancelled);
+        Assert.Empty(triage.NotThePrs);
+        Assert.Equal(["build-test"], CiTriage.FromDetail(triage.ToDetail())!.Cancelled);
+        Assert.Contains("Check: lint (failure)", h.WorkerCalls[1].Prompt);
+        Assert.Contains("log lint 102", h.GitHub.Calls);
+        Assert.DoesNotContain("log build-test 101", h.GitHub.Calls);
+        // The gate went on only once the cancelled check had run (and passed) on the new head.
+        Assert.True(shaAReads >= 3, shaAReads.ToString());
+        Assert.Equal([$"merge 1 {ShaA}"], h.Merges);
+    }
+
     [Theory]
     [InlineData("cancelled")]
+    [InlineData("stale")]
+    [InlineData("action_required")]
+    [InlineData(null)]
+    public async Task A_check_ci_did_not_run_to_a_result_with_no_code_failure_next_to_it_escalates_without_a_fixer(string? conclusion)
+    {
+        var h = new Harness();
+        h.GitHub.Ci[Sha1] = new CiFacts(Sha1, [new CheckFact("build-test", true, conclusion, 101), new CheckFact("lint", true, "success", 102)]);
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains($"build-test ({conclusion ?? "no conclusion"}): CI did not run it to a result", outcome.Error);
+        Assert.Single(h.WorkerCalls);
+        Assert.Empty((await Triages(h)).Single().Fixable);
+    }
+
+    [Theory]
     [InlineData("stale")]
     [InlineData("action_required")]
     [InlineData(null)]
@@ -219,12 +271,21 @@ public class CiHealTests
         Assert.Equal([$"merge 1 {ShaA}"], h.Merges);
     }
 
-    [Fact]
-    public async Task A_log_that_cannot_be_read_still_gives_the_fixer_the_failing_check()
+    [Theory]
+    [InlineData("refused")]
+    [InlineData("network")]
+    [InlineData("timeout")]
+    public async Task A_log_that_cannot_be_read_still_gives_the_fixer_the_failing_check(string failure)
     {
         var h = new Harness();
         h.GitHub.Ci[Sha1] = Red(Sha1);
-        h.GitHub.LogThrows = new InvalidOperationException($"GitHub read check run 101 failed: 403 token {Token}");
+        h.GitHub.LogThrows = failure switch
+        {
+            "refused" => new InvalidOperationException($"GitHub read check run 101 failed: 403 token {Token}"),
+            "network" => new HttpRequestException($"connection reset reading check run 101 token {Token}"),
+            // HttpClient's timeout: a cancellation the run did not ask for.
+            _ => new TaskCanceledException($"The request was canceled due to the configured HttpClient.Timeout; token {Token}"),
+        };
 
         var outcome = await h.Run();
 
@@ -278,13 +339,32 @@ public class CiHealRuleTests
         var triage = CiHeal.Triage(head, @base, "b");
 
         Assert.Equal(["unit", "slow", "legacy"], triage.Fixable);
-        Assert.Equal(2, triage.NotThePrs.Count);
-        Assert.Contains(triage.NotThePrs, r => r.StartsWith("flaky-infra (cancelled)"));
-        Assert.Contains(triage.NotThePrs, r => r.StartsWith("e2e (failure): also red on the base b"));
+        // The cancellation sits next to the PR's failures (fail-fast): excused, but recorded so the fixed head must run it.
+        Assert.Equal(["flaky-infra"], triage.Cancelled);
+        Assert.Equal(["unit", "slow", "legacy", "flaky-infra"], triage.Expected);
+        Assert.StartsWith("e2e (failure): also red on the base b", Assert.Single(triage.NotThePrs));
         Assert.False(triage.Healable);
+        // Without a failure the PR can fix, the same cancellation is CI's own.
+        var onlyCancelled = CiHeal.Triage(head with { Checks = [.. head.Checks.Where(c => c.Name is "flaky-infra" or "e2e")] }, @base, "b");
+        Assert.Contains(onlyCancelled.NotThePrs, r => r.StartsWith("flaky-infra (cancelled)"));
+        Assert.Empty(onlyCancelled.Cancelled!);
+        // A workflow that could not start is never excused, even next to the PR's failure.
+        var startup = CiHeal.Triage(head with { Checks = [.. head.Checks.Where(c => c.Name is "unit")], Suites = [new CheckSuiteFact(Ci.ActionsApp, true, "startup_failure", 0)] }, null, "b");
+        Assert.False(startup.Healable);
+        Assert.StartsWith("github-actions check suite (startup_failure)", Assert.Single(startup.NotThePrs));
         Assert.True(CiHeal.Triage(head with { Checks = [.. head.Checks.Where(c => c.Name is "unit" or "build")] }, null, "b").Healable);
         Assert.Equal(triage.ToDetail(), CiTriage.FromDetail(triage.ToDetail())!.ToDetail());
         Assert.DoesNotContain("failure", CiHeal.Triage(head, @base, "b").Fixable);
+    }
+
+    [Fact]
+    public void Unreported_names_each_check_a_triage_named_that_has_no_run_on_the_commit()
+    {
+        var triages = new[] { new CiTriage("h1", "b", ["lint"], [], ["build-test"]), new CiTriage("h2", "b", ["unit"], []) };
+
+        Assert.Equal(["build-test", "unit"], CiHeal.Unreported(triages, new CiFacts("h3", [new CheckFact("lint", true, "success")])));
+        Assert.Empty(CiHeal.Unreported(triages, new CiFacts("h3", [new CheckFact("lint", true, "success"), new CheckFact("unit", false, null),
+            new CheckFact("build-test", true, "success")])));
     }
 
     [Fact]
@@ -318,6 +398,19 @@ public class CiHealRuleTests
     [InlineData("\"api_key\": \"abcdef123456\"", "abcdef123456")]
     [InlineData("X-Weave-Router-Key: rk_live_0123456789", "rk_live_0123456789")]
     [InlineData("Authorization: token 0123456789abcdef", "0123456789abcdef")]
+    [InlineData("GITHUB_TOKEN=abcdef123456", "abcdef123456")]
+    [InlineData("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY", "wJalrXUtnFEMIK7MDENG")]
+    [InlineData("DB_PASSWORD=hunter2hunter", "hunter2hunter")]
+    [InlineData("export OPENAI_API_KEY=xyzabc0123456789", "xyzabc0123456789")]
+    [InlineData("ROUTER_KEY=rk_live_0123456789", "rk_live_0123456789")]
+    [InlineData("mysql --password hunter2hunter -h db", "hunter2hunter")]
+    [InlineData("gh auth login --with-token 'abcdef0123'", "abcdef0123")]
+    [InlineData("{\"client\": {\"api_key\": \"abcdef123456\"}}", "abcdef123456")]
+    [InlineData("database:\n  password: hunter2hunter\n", "hunter2hunter")]
+    [InlineData("Authorization: Basic dXNlcjpodW50ZXIy", "dXNlcjpodW50ZXIy")]
+    [InlineData("Host=db;Username=app;Password=s3cretpw;Database=x", "s3cretpw")]
+    [InlineData("Server=db;User Id=sa;Pwd=s3cretpw", "s3cretpw")]
+    [InlineData("fetching https://deploy:hunter2hunter@registry.example.invalid/pkg", "hunter2hunter")]
     public void Redact_removes_credentials_a_log_printed(string line, string secret)
     {
         var redacted = CiHeal.Redact(line);
@@ -329,7 +422,8 @@ public class CiHealRuleTests
     [Fact]
     public void Redact_leaves_ordinary_build_output_alone()
     {
-        const string output = "error CS1002: ; expected\nUnexpected token ';' at line 3\nFailed WordCountTests.Whitespace [12 ms]\nPassed!  - Failed: 0";
+        const string output = "error CS1002: ; expected\nUnexpected token ';' at line 3\nFailed WordCountTests.Whitespace [12 ms]\nPassed!  - Failed: 0\n"
+            + "src/TokenCache.cs(3,10): warning CS0168\nMaxTokens=4096 monkey business\nRefreshing the access token before it expires\n  dotnet test --no-build --filter Token";
         Assert.Equal(output, CiHeal.Redact(output));
     }
 

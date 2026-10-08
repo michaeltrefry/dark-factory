@@ -814,6 +814,63 @@ public class GitHubGateTests
         Assert.EndsWith("?per_page=50", api.Requests.Single(r => r.PathAndQuery.Contains("/annotations")).PathAndQuery);
     }
 
+    [Theory]
+    [InlineData("network")]
+    [InlineData("slow-body")]
+    public async Task A_log_that_fails_or_hangs_while_read_falls_back_to_the_check_runs_output(string failure)
+    {
+        var (_, api) = Gate(a => a
+            .On($"GET {Repo}/actions/jobs/4711/logs", _ => failure == "network"
+                ? throw new HttpRequestException("connection reset")
+                : new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(new HangingStream()) })
+            .On($"GET {Repo}/check-runs/4711", HttpStatusCode.OK,
+                """{"id":4711,"name":"build","status":"completed","conclusion":"failure","output":{"title":"1 test failed","summary":null,"text":null}}""")
+            .On($"GET {Repo}/check-runs/4711/annotations", HttpStatusCode.OK, "[]"));
+        var client = api.Client("https://api.github.com/");
+        var gate = new GitHubGate(client, new GitHubApp(client, "4242", Key.ExportRSAPrivateKeyPem(), TimeProvider.System))
+        {
+            LogReadTimeout = TimeSpan.FromMilliseconds(300),
+        };
+
+        var log = await gate.GetCheckLogAsync(Sandbox, new CheckFact("build", true, "failure", 4711), CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Contains("the job log could not be read", log);
+        Assert.Contains(failure == "network" ? "connection reset" : "timed out", log);
+        Assert.EndsWith("1 test failed", log);
+    }
+
+    [Fact]
+    public async Task The_callers_cancellation_of_a_log_read_is_not_a_log_that_could_not_be_read()
+    {
+        var (gate, _) = Gate(a => a.On($"GET {Repo}/actions/jobs/4711/logs", _ =>
+            new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(new HangingStream()) }));
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => gate.GetCheckLogAsync(Sandbox, new CheckFact("build", true, "failure", 4711), cts.Token));
+    }
+
+    /// <summary>A response body that never sends a byte: it ends only when the read is cancelled.</summary>
+    private sealed class HangingStream : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+        {
+            await Task.Delay(Timeout.Infinite, ct);
+            return 0;
+        }
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) => ReadAsync(buffer.AsMemory(offset, count), ct).AsTask();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
     [Fact]
     public async Task A_commit_status_has_no_log()
     {

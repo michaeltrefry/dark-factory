@@ -529,8 +529,10 @@ public sealed partial class RunPipeline
             {
                 excerpt = CiHeal.Excerpt(await Gate.GitHub.GetCheckLogAsync(run.Repo, check, ct));
             }
-            catch (Exception ex) when (ex is InvalidOperationException or HttpRequestException)
+            catch (Exception ex) when (ex is InvalidOperationException or HttpRequestException
+                || (ex is OperationCanceledException && !ct.IsCancellationRequested))
             {
+                // A timeout (OperationCanceledException without the run's own cancellation) is a log that could not be read.
                 excerpt = CiHeal.Excerpt($"(the log could not be read: {ex.Message})", 500);
             }
             logs.Add(new CiFailureLog(name, check.Conclusion, excerpt));
@@ -693,6 +695,13 @@ public sealed partial class RunPipeline
             }
             var facts = await Gate.GitHub.GetCiAsync(run.Repo, pull.HeadSha, ct);
             var (state, why) = Ci.Evaluate(facts);
+            if (state == CiState.Green
+                && CiHeal.Unreported(history.Where(e => e.Step == Steps.CiFailure).Select(e => CiTriage.FromDetail(e.Detail)).OfType<CiTriage>(), facts)
+                    is { Count: > 0 } unreported)
+            {
+                // A check a CI fix round was about (or one cancelled next to it) must run and pass, not just be absent.
+                (state, why) = (CiState.Pending, $"{why}, but {string.Join(", ", unreported)} has not reported on {Ci.Short(facts.HeadSha)} yet");
+            }
             switch (state)
             {
                 case CiState.Green:

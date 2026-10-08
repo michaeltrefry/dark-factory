@@ -8,15 +8,24 @@ namespace DarkFactory.Orchestrator.Gate;
 /// <summary>
 /// Why a red CI run on a head commit is or is not the PR's to fix (sc-25383), stored as the <c>ci-failure</c> checkpoint:
 /// the checks a CI fixer is given (<see cref="Fixable"/>, by name) and every failure that is not the PR's
-/// (<see cref="NotThePrs"/>, with why). Facts only — names and conclusions from GitHub's executed results (E5) — never log
-/// text, which can carry anything the code under test printed (E4).
+/// (<see cref="NotThePrs"/>, with why), and the cancelled checks a code failure excuses (<see cref="Cancelled"/>, by name:
+/// e.g. a matrix's fail-fast cancelling its other legs when one fails). Facts only — names and conclusions from GitHub's
+/// executed results (E5) — never log text, which can carry anything the code under test printed (E4).
 /// </summary>
 public sealed record CiTriage(
     [property: JsonPropertyName("sha")] string HeadSha,
     [property: JsonPropertyName("base")] string BaseSha,
     [property: JsonPropertyName("fixable")] IReadOnlyList<string> Fixable,
-    [property: JsonPropertyName("not_the_prs")] IReadOnlyList<string> NotThePrs)
+    [property: JsonPropertyName("not_the_prs")] IReadOnlyList<string> NotThePrs,
+    [property: JsonPropertyName("cancelled")] IReadOnlyList<string>? Cancelled = null)
 {
+    /// <summary>
+    /// The checks the fixed commit's CI must run and pass before the item goes on (<see cref="CiHeal.Unreported"/>): those
+    /// the fixer was given and those cancelled alongside them.
+    /// </summary>
+    [JsonIgnore]
+    public IEnumerable<string> Expected => Fixable.Concat(Cancelled ?? []);
+
     /// <summary>A CI fixer may work on it: at least one failure is the PR's, and every failure is.</summary>
     [JsonIgnore]
     public bool Healable => Fixable.Count > 0 && NotThePrs.Count == 0;
@@ -33,7 +42,7 @@ public sealed record CiTriage(
         try
         {
             return JsonSerializer.Deserialize<CiTriage>(detail) is { HeadSha: not null } t
-                ? t with { Fixable = t.Fixable ?? [], NotThePrs = t.NotThePrs ?? [] }
+                ? t with { Fixable = t.Fixable ?? [], NotThePrs = t.NotThePrs ?? [], Cancelled = t.Cancelled ?? [] }
                 : null;
         }
         catch (JsonException)
@@ -72,17 +81,33 @@ public static class CiHeal
     /// (<see cref="CiTriage.Fixable"/>) when it failed with a code failure (<see cref="CodeFailures"/>) and the same check is
     /// not red on the PR's base commit too; otherwise it is not the PR's, with why — red on the base too (a fixer of this PR
     /// cannot make it pass), or a conclusion that is CI's own (cancelled, stale, a workflow that could not start, …). A
-    /// counted check suite that finished with such a conclusion is not the PR's either. <paramref name="baseCi"/> null (the
-    /// base's CI could not be read) means no failure is known there.
+    /// counted check suite that finished with such a conclusion is not the PR's either. Except <c>cancelled</c> when the PR has
+    /// a code failure to fix: a matrix's fail-fast (GitHub's default) cancels the other legs when one fails, so a cancelled
+    /// check or suite next to the PR's failure is that failure's consequence, not CI's own fault — it is recorded
+    /// (<see cref="CiTriage.Cancelled"/>, checks by name) and must then run and pass on the fixed commit
+    /// (<see cref="Unreported"/>, and CI green needs every check and suite to pass). Every other conclusion of CI's own
+    /// (stale, action_required, startup_failure, none) still escalates, and a cancelled check with no code failure next to it
+    /// does too. <paramref name="baseCi"/> null (the base's CI could not be read) means no failure is known there.
     /// </summary>
     public static CiTriage Triage(CiFacts head, CiFacts? baseCi, string baseSha)
     {
         var redOnBase = (baseCi?.Checks ?? []).Where(c => c.Completed && !Ci.Passes(c.Conclusion)).Select(c => c.Name).ToHashSet(StringComparer.Ordinal);
-        var (fixable, notThePrs) = (new List<string>(), new List<string>());
-        foreach (var check in head.Checks.Where(c => c.Completed && !Ci.Passes(c.Conclusion)))
+        var failing = head.Checks.Where(c => c.Completed && !Ci.Passes(c.Conclusion)).ToList();
+        var fixable = failing.Where(c => CodeFailures.Contains(c.Conclusion ?? "") && !redOnBase.Contains(c.Name)).Select(c => c.Name).Distinct().ToList();
+        // A cancellation is excused only next to a failure a fixer can act on.
+        var excuse = fixable.Count > 0;
+        var (notThePrs, cancelled) = (new List<string>(), new List<string>());
+        foreach (var check in failing)
         {
             var conclusion = check.Conclusion ?? "no conclusion";
-            if (!CodeFailures.Contains(check.Conclusion ?? ""))
+            if (excuse && check.Conclusion == Cancelled)
+            {
+                if (!cancelled.Contains(check.Name))
+                {
+                    cancelled.Add(check.Name);
+                }
+            }
+            else if (!CodeFailures.Contains(check.Conclusion ?? ""))
             {
                 notThePrs.Add($"{check.Name} ({conclusion}): CI did not run it to a result, so no code change can fix it");
             }
@@ -90,12 +115,9 @@ public static class CiHeal
             {
                 notThePrs.Add($"{check.Name} ({conclusion}): also red on the base {Ci.Short(baseSha)}, so it is not this PR's failure");
             }
-            else if (!fixable.Contains(check.Name))
-            {
-                fixable.Add(check.Name);
-            }
         }
-        foreach (var suite in Ci.CountedSuites(head).Where(s => s.Completed && !Ci.Passes(s.Conclusion) && !CodeFailures.Contains(s.Conclusion ?? "")))
+        foreach (var suite in Ci.CountedSuites(head).Where(s => s.Completed && !Ci.Passes(s.Conclusion) && !CodeFailures.Contains(s.Conclusion ?? "")
+            && !(excuse && s.Conclusion == Cancelled)))
         {
             notThePrs.Add($"{suite.App} check suite ({suite.Conclusion ?? "no conclusion"}): CI did not run it to a result, so no code change can fix it");
         }
@@ -103,8 +125,21 @@ public static class CiHeal
         {
             notThePrs.Add("CI failed with no failing check to fix");
         }
-        return new CiTriage(head.HeadSha, baseSha, fixable, notThePrs);
+        return new CiTriage(head.HeadSha, baseSha, fixable, notThePrs, cancelled);
     }
+
+    private const string Cancelled = "cancelled";
+
+    /// <summary>
+    /// Of the checks every CI triage of the item named (<see cref="CiTriage.Expected"/>: the checks fixers were given and the
+    /// ones cancelled alongside them), those with no run at all on <paramref name="facts"/>' commit. CI green only means every
+    /// check that reported passed; a check a fix round depends on that never reported has not passed, so CI waits for it.
+    /// </summary>
+    public static IReadOnlyList<string> Unreported(IEnumerable<CiTriage> triages, CiFacts facts) =>
+        triages.SelectMany(t => t.Expected).Distinct(StringComparer.Ordinal)
+            .Where(name => !facts.Checks.Any(c => c.Name == name))
+            .Order(StringComparer.Ordinal)
+            .ToList();
 
     private static readonly Regex Ansi = new(@"\x1B\[[0-9;?]*[ -/]*[@-~]", RegexOptions.CultureInvariant);
     private static readonly Regex Timestamp = new(@"^\uFEFF?\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z ", RegexOptions.Multiline | RegexOptions.CultureInvariant);
@@ -122,9 +157,19 @@ public static class CiHeal
         new(@"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}", RegexOptions.CultureInvariant),
     ];
 
-    /// <summary>key=value / key: value forms whose key names a credential (an Authorization header's scheme is kept).</summary>
+    /// <summary>
+    /// key=value / key: value forms (env vars, JSON, YAML, headers, connection strings) whose key is an identifier ending in a
+    /// credential word — <c>GITHUB_TOKEN=</c>, <c>AWS_SECRET_ACCESS_KEY=</c>, <c>DB_PASSWORD=</c>, <c>"api_key": </c>,
+    /// <c>X-Router-Key: </c>, <c>Password=…;</c> (an Authorization header's scheme is kept). The key must be followed by
+    /// <c>:</c> or <c>=</c>, so prose such as "Unexpected token ';'" is left alone.
+    /// </summary>
     private static readonly Regex KeyValue = new(
-        @"(?<key>\b(authorization|token|access[_-]?token|auth[_-]?token|api[_-]?key|x-[a-z-]*key|secret|client[_-]?secret|password|passwd|pwd)[""']?\s*[:=]\s*[""']?\s*((bearer|basic|token)\s+)?)(?<value>[^\s""',;]{6,})",
+        @"(?<key>(?<![A-Za-z0-9])[A-Za-z0-9_.\-]*?(authorization|token|secret|password|passwd|pwd|api[_-]?key|access[_-]?key|private[_-]?key|[_-]key|credentials?)[""']?\s*[:=]\s*[""']?\s*((bearer|basic|token)\s+)?)(?<value>[^\s""',;]{4,})",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    /// <summary>A command-line flag naming a credential, its value after whitespace (<c>--password hunter2</c>, <c>--with-token abc</c>).</summary>
+    private static readonly Regex FlagValue = new(
+        @"(?<key>(?<![A-Za-z0-9\-])--?[A-Za-z0-9\-]*(password|passwd|pwd|token|secret|api-key|access-key|private-key)\s+[""']?)(?<value>[^\s""',;]{4,})",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     /// <summary>A bearer credential anywhere ("Bearer &lt;value&gt;").</summary>
@@ -145,7 +190,10 @@ public static class CiHeal
             text = pattern.Replace(text, Redacted);
         }
         text = UrlCredentials.Replace(text, m => $"{m.Groups["scheme"].Value}{Redacted}@");
-        text = KeyValue.Replace(text, m => m.Groups["value"].Value.StartsWith(Redacted, StringComparison.Ordinal) ? m.Value : $"{m.Groups["key"].Value}{Redacted}");
+        foreach (var pattern in new[] { KeyValue, FlagValue })
+        {
+            text = pattern.Replace(text, m => m.Groups["value"].Value.StartsWith(Redacted, StringComparison.Ordinal) ? m.Value : $"{m.Groups["key"].Value}{Redacted}");
+        }
         return BearerValue.Replace(text, m => $"{m.Groups["key"].Value}{Redacted}");
     }
 
@@ -186,7 +234,8 @@ public static class CiHeal
     {
         var change = policy.Classify(fixDiff);
         var roles = new HashSet<string>(StringComparer.Ordinal);
-        // An unreadable diff touches everything (Classify makes it sealed, which also calls the security review in).
+        // An empty diff (the fix left the tree as it was) touches no role, so every review carries; an unreadable diff never
+        // gets here (GetDiffAsync throws).
         if (!string.IsNullOrWhiteSpace(fixDiff))
         {
             roles.Add(ReviewRoles.Correctness);

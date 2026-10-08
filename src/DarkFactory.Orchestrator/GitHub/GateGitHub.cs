@@ -72,6 +72,12 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
     /// <summary>At most this many bytes of a job's log are kept (its end, where the failure is).</summary>
     public const int MaxLogBytes = 256 * 1024;
 
+    /// <summary>
+    /// How long reading a job's log may take, its body included (HttpClient's own timeout ends when the headers arrive, and a
+    /// log is streamed after that). Past it the check run's output is read instead.
+    /// </summary>
+    public TimeSpan LogReadTimeout { get; init; } = TimeSpan.FromSeconds(60);
+
     private const int MaxAnnotations = 50;
 
     public static readonly IReadOnlyDictionary<string, string> MergePermissions = new Dictionary<string, string>
@@ -164,13 +170,15 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         string why;
         try
         {
-            var token = (await gateApp.CreateInstallationTokenAsync(repo, ct, LogPermissions)).Token;
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(LogReadTimeout);
+            var token = (await gateApp.CreateInstallationTokenAsync(repo, timeout.Token, LogPermissions)).Token;
             // GitHub answers with a redirect to a signed download URL, which HttpClient follows without the Authorization header.
             using var request = GitHubApp.Request(HttpMethod.Get, $"repos/{repo.Owner}/{repo.Name}/actions/jobs/{id}/logs", "Bearer", token);
-            using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+            using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
             if (response.IsSuccessStatusCode)
             {
-                return await TailAsync(response.Content, MaxLogBytes, ct);
+                return await TailAsync(response.Content, MaxLogBytes, timeout.Token);
             }
             why = $"GitHub answered {(int)response.StatusCode}";
         }
@@ -178,6 +186,15 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         {
             // E.g. the gate App lacks "Actions: read", so no token with it can be minted.
             why = ex.Message;
+        }
+        catch (HttpRequestException ex)
+        {
+            why = ex.Message;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // HttpClient's own timeout, or LogReadTimeout while the body streamed; the caller's cancellation propagates.
+            why = "reading it timed out";
         }
         return $"(the job log could not be read: {why}; the check run's output follows)\n{await CheckRunOutputAsync(repo, id, ct)}";
     }
