@@ -131,17 +131,25 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   triaged once by a normal, unpinned worker (`WorkerTriageRunner`: throwaway `factory/triage-gh-<key>` worktree whose git
   holds a contents-read token; nothing is committed or pushed; the issue text is fenced as untrusted). The orchestrator — not
   the model — routes (`IssueRouting`): question/duplicate → comment only; author without write/maintain/admin
-  (`RepoPermission.IsCollaborator`; read and triage count as outsiders) → comment + `awaiting-approval`; collaborator with an
+  (`RepoPermission.IsCollaborator`; read and triage count as outsiders) on the issue's repo, or on the target repo when the
+  triage names another watched repo → comment + `awaiting-approval`; collaborator with an
   apparent fix (reproduced, or confidence ≥ 0.8; a fix naming its paths, none sealed/protected under the target's
   `factory/gate.yaml` on its default branch; exactly one watched target repo) → `released` (built); else → comment +
   `needs-human`. The `triaged` row (route included) is written before anything is posted; comments carry a
-  `<!-- dark-factory:triage <hash> -->` marker (trusted only on the App's own comments), so a retried post is found, not
-  repeated. Approval: a collaborator's comment whose trimmed text is exactly `Approved` (case-sensitive, never edited — an
-  edit moves `updated_at`), bound to the last triage comment before it, releases a releasable triage when that is the current
-  triage; every other `Approved` is recorded `approval-ignored` once. The released triage is the item's scope (later edits are
+  `<!-- dark-factory:triage <hash> -->` marker (trusted only on the App's own comments: `performed_via_github_app.id`, or
+  failing that the App's bot account — `user.type` Bot and login `<slug>[bot]`, slug from `GET /app`), so a retried post is
+  found, not repeated. Approval: a collaborator's comment whose trimmed text is exactly `Approved` (case-sensitive, never
+  edited — an edit moves `updated_at`), bound to the last triage comment before it, releases a releasable triage when that is
+  the current triage and the approver is also a collaborator on the target repo; every other `Approved` is recorded
+  `approval-ignored` once. The released triage is the item's scope (later edits are
   not triaged) and its spec (`ReadSpecAsync`: the triage only, `Repo:` line first); the PR body says `Closes owner/name#N`,
-  and Merged closes the issue if still open. All issue writes use issues-only tokens (`GitHubIssuesClient`). A triage that
-  fails `Intake:MaxItemFailures` times is itself the triage (needs-human); one refused for usage pauses the factory.
+  and Merged closes the issue if still open. The triage title is untrusted: commit message, PR title and body carry it through
+  `UntrustedText.Inert` (no mention, reference, link, image or HTML; a code span in the body). All issue writes use
+  issues-only tokens (`GitHubIssuesClient`). A triage that fails `Intake:MaxItemFailures` times is itself the triage
+  (needs-human; its error cut at 2000 characters); one refused for usage pauses the factory. Listing pages by keyset (`since` =
+  the last page's last `updated_at`). A request GitHub refuses for good (`GitHubRequestException.Permanent`: a 4xx that is not
+  a rate limit, 401 or 408) is recorded `github-refused` on the item and the dashboard and does not hold the repo's cursor; the
+  issue is taken up again when it next changes.
 - Controls (`Controls/`): Pause/Continue/Stop rows in the ledger's `controls` table (scope `factory` | `epic:<id>` |
   `item:sc-<id>`; `WorkItem.EpicId` maps items to epics), written by `factory pause|continue|stop` and the dashboard
   (`ControlActions`), read by every process. `RunPipeline` checks them before every step and, while a worker runs,

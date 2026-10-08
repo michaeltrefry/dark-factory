@@ -131,17 +131,17 @@ public static partial class UntrustedText
             }
             line.Append(c switch
             {
-                '@' => '＠', // ＠
-                '#' => '＃', // ＃
-                '[' => '［', // ［
-                ']' => '］', // ］
-                '<' => '‹', // ‹
-                '>' => '›', // ›
+                '@' => '\uFF20', // fullwidth commercial at
+                '#' => '\uFF03', // fullwidth number sign
+                '[' => '\uFF3B', // fullwidth left square bracket
+                ']' => '\uFF3D', // fullwidth right square bracket
+                '<' => '\u2039', // single left-pointing angle quotation mark
+                '>' => '\u203A', // single right-pointing angle quotation mark
                 '`' => '\'',
                 _ => c,
             });
         }
-        return line.ToString().Replace("://", ":⁄⁄", StringComparison.Ordinal); // :⁄⁄
+        return line.ToString().Replace("://", ":\u2044\u2044", StringComparison.Ordinal); // fraction slashes
     }
 
     /// <summary><see cref="Inert"/> text in a Markdown code span (it has no backtick left to close it).</summary>
