@@ -216,6 +216,24 @@ public sealed class SessionCaptureTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task A_caller_giving_up_during_the_settle_wait_still_keeps_the_recorded_cost()
+    {
+        // The failed/stopped end paths give the session end a time limit; it can run out during the settle wait.
+        var item = await ItemAsync();
+        var costs = new FakeCosts(FixtureCost);
+        await using var capture = await Recorder(costs, settle: TimeSpan.FromMinutes(5)).StartAsync(item.Id, StreamJsonFixture.SessionId, CancellationToken.None);
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => capture.CompleteAsync(0, "error", fetchCost: true, cts.Token).WaitAsync(TimeSpan.FromSeconds(20)));
+
+        await using var db = Context();
+        var session = await db.WorkerSessions.SingleAsync();
+        Assert.Equal(("error", 0.429606m, 3L), (session.ExitStatus, session.CostUsd, session.RouterRequestCount));
+        Assert.Equal(1, costs.Calls); // no settle re-read after the caller gave up
+    }
+
+    [Fact]
     public async Task Resumed_session_continues_its_row_and_sequence_and_keeps_unparseable_lines()
     {
         var item = await ItemAsync();
