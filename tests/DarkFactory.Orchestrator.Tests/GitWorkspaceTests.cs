@@ -517,6 +517,161 @@ public class GitWorkspaceTests
         Assert.Equal(moved, Git(_remote, "rev-parse", "factory/sc-22").Trim());
     }
 
+    // ---- owner-side git isolated from the owner's own git config (OwnerGit) ----
+
+    [Fact]
+    public void Owner_git_isolation_adds_its_environment_and_config_ahead_of_every_call()
+    {
+        Assert.Equal(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "rerere.enabled=false", "-c", "filter.lfs.smudge=",
+            "-c", "filter.lfs.clean=", "-c", "filter.lfs.process=", "-c", "filter.lfs.required=false"], OwnerGit.ConfigArgs);
+        var (env, args) = OwnerGit.Isolate(new Dictionary<string, string> { ["GIT_CONFIG_COUNT"] = "1" }, ["merge", "x"]);
+        Assert.Equal(new Dictionary<string, string>
+        {
+            ["GIT_CONFIG_NOSYSTEM"] = "1",
+            ["GIT_CONFIG_GLOBAL"] = "/dev/null",
+            ["GIT_LFS_SKIP_SMUDGE"] = "1",
+            ["GIT_CONFIG_COUNT"] = "1",
+        }, env);
+        Assert.Equal([.. OwnerGit.ConfigArgs, "merge", "x"], args);
+        Assert.Equal(OwnerGit.Environment, OwnerGit.Isolate(null, []).Env);
+        Assert.Throws<ArgumentException>(() => OwnerGit.Isolate(new Dictionary<string, string> { ["GIT_CONFIG_GLOBAL"] = "/home/x/.gitconfig" }, []));
+    }
+
+    [Fact]
+    public async Task Every_git_call_of_every_workspace_operation_is_isolated_from_the_owners_git_config()
+    {
+        var workspace = Workspace();
+        await PushBranch(workspace, "factory/sc-31", "README.md", "pr\n");
+        var main = AdvanceMain("other.txt", "main\n");
+        var ws = await workspace.RestoreAsync(Repo, "factory/sc-31", CancellationToken.None);
+        Assert.NotNull(await workspace.ReopenAsync(Repo, "factory/sc-31", CancellationToken.None));
+        var merge = await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
+        await workspace.PushAsync(Repo, ws, CancellationToken.None);
+        await workspace.ConflictMarkersAsync(Repo, merge.Head, ["README.md"], CancellationToken.None);
+        await workspace.ChangedFilesAsync(Repo, main, merge.Head, CancellationToken.None);
+        await workspace.FilesAsync(Repo, merge.Head, CancellationToken.None);
+        var run = await workspace.PrepareCommitAsync(Repo, "gate-sc-31-base", main, CancellationToken.None);
+        await workspace.OverlayAsync(run, merge.Head, ["README.md"], ["other.txt"], CancellationToken.None,
+            new Dictionary<string, string> { ["README.md"] = "replaced\n" });
+        await workspace.RemoveAsync(Repo, run, CancellationToken.None);
+        await workspace.SweepOrphansAsync((_, _) => Task.FromResult(false), CancellationToken.None);
+
+        Assert.Superset(new HashSet<string> { "clone", "fetch", "remote", "worktree", "rev-parse", "symbolic-ref", "add", "status", "commit", "rev-list",
+            "push", "merge", "diff", "ls-tree", "cat-file", "checkout", "rm", "hash-object", "update-index", "checkout-index" },
+            _gitCalls.Select(c => Subcommand(c.Args)).ToHashSet());
+        Assert.All(_gitCalls, c =>
+        {
+            Assert.Equal(OwnerGit.ConfigArgs, c.Args.Take(OwnerGit.ConfigArgs.Count));
+            Assert.NotNull(c.Env);
+            Assert.All(OwnerGit.Environment, e => Assert.Equal(e.Value, c.Env[e.Key]));
+        });
+        // The token-carrying push keeps its auth alongside the isolation.
+        Assert.All(_gitCalls.Where(c => Subcommand(c.Args) == "push"), c => Assert.Equal("credential.helper", c.Env!["GIT_CONFIG_KEY_1"]));
+    }
+
+    /// <summary>A script under the test root that records it ran (a file named <paramref name="marker"/> in <c>markers/</c>), then runs <paramref name="then"/>.</summary>
+    private string Script(string marker, string then)
+    {
+        var dir = Directory.CreateDirectory(Path.Combine(_root, "scripts")).FullName;
+        var markers = Directory.CreateDirectory(Path.Combine(_root, "markers")).FullName;
+        var path = Path.Combine(dir, marker);
+        File.WriteAllText(path, $"#!/bin/sh\ntouch '{Path.Combine(markers, marker)}'\n{then}\n");
+        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        return path;
+    }
+
+    private void Hook(string hooksDir, string prefix, params string[] names)
+    {
+        Directory.CreateDirectory(hooksDir);
+        foreach (var name in names)
+        {
+            File.Copy(Script($"{prefix}-{name}", "exit 0"), Path.Combine(hooksDir, name), overwrite: true);
+            File.SetUnixFileMode(Path.Combine(hooksDir, name), UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
+    private static readonly string[] HookNames = ["post-checkout", "post-merge", "pre-commit", "commit-msg", "post-commit", "pre-push", "pre-merge-commit"];
+
+    [Fact]
+    public async Task Owner_side_git_runs_no_hook_filter_merge_driver_or_fsmonitor_that_owner_config_or_a_pr_could_select()
+    {
+        // The owner's system and global git config (as git would find them through HOME and GIT_CONFIG_SYSTEM), each defining
+        // a hooks path, filter and merge drivers that a PR's .gitattributes can select.
+        var home = Directory.CreateDirectory(Path.Combine(_root, "home")).FullName;
+        Hook(Path.Combine(_root, "global-hooks"), "global-hook", HookNames);
+        File.WriteAllText(Path.Combine(home, ".gitconfig"), $"""
+            [core]
+                hooksPath = {Path.Combine(_root, "global-hooks")}
+            [filter "evil"]
+                smudge = {Script("global-smudge", "cat")}
+                clean = {Script("global-clean", "cat")}
+            [merge "evil"]
+                driver = {Script("global-merge", "exit 1")}
+            """);
+        var system = Path.Combine(_root, "system.gitconfig");
+        File.WriteAllText(system, $"""
+            [filter "sysevil"]
+                smudge = {Script("system-smudge", "cat")}
+                clean = {Script("system-clean", "cat")}
+            [merge "sysevil"]
+                driver = {Script("system-merge", "exit 1")}
+            """);
+        IReadOnlyDictionary<string, string> OwnerEnvironment(IReadOnlyDictionary<string, string>? env) =>
+            new Dictionary<string, string>(env ?? new Dictionary<string, string>())
+            {
+                ["HOME"] = home,
+                ["XDG_CONFIG_HOME"] = Path.Combine(home, ".config"),
+                ["GIT_CONFIG_SYSTEM"] = system,
+            };
+        var workspace = new GitWorkspace(Path.Combine(_root, "work"), _ => _remote, (_, _) => Task.FromResult<string?>(Token),
+            (cwd, env, args, ct) => GitWorkspace.RunGitAsync(cwd, OwnerEnvironment(env), args, ct));
+
+        var first = await workspace.PrepareAsync(Repo, "factory/sc-30", CancellationToken.None);
+        // The clone's own config and hooks dir: an LFS filter and an fsmonitor configured there, and hooks in .git/hooks.
+        var clone = Path.Combine(_root, "work", "repos", Repo.Owner, Repo.Name);
+        Git(clone, "config", "filter.lfs.smudge", Script("clone-lfs-smudge", "cat"));
+        Git(clone, "config", "filter.lfs.clean", Script("clone-lfs-clean", "cat"));
+        Git(clone, "config", "core.fsmonitor", Script("clone-fsmonitor", "exit 1"));
+        Hook(Path.Combine(clone, ".git", "hooks"), "clone-hook", HookNames);
+        // The PR selects every driver for its files.
+        File.WriteAllText(Path.Combine(first.Path, ".gitattributes"), "*.evil filter=evil merge=evil\n*.sys filter=sysevil merge=sysevil\n*.lfs filter=lfs\n");
+        foreach (var file in new[] { "a.evil", "b.sys", "c.lfs" })
+        {
+            File.WriteAllText(Path.Combine(first.Path, file), "pr\n");
+        }
+        Assert.True(await workspace.CommitAndPushAsync(Repo, first, "sc-30: change", CancellationToken.None));
+        await workspace.RemoveAsync(Repo, first, CancellationToken.None);
+        // Main changes the same files (the base update conflicts in them), and moves on.
+        var other = Path.Combine(_root, "main-30");
+        Git(_root, "clone", "-q", _remote, other);
+        foreach (var file in new[] { "a.evil", "b.sys", "c.lfs" })
+        {
+            File.WriteAllText(Path.Combine(other, file), "main\n");
+        }
+        Git(other, "add", ".");
+        Git(other, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "main: same files");
+        Git(other, "push", "-q", "origin", "main");
+
+        var ws = await workspace.RestoreAsync(Repo, "factory/sc-30", CancellationToken.None);
+        var merge = await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
+        Assert.Equal(["a.evil", "b.sys", "c.lfs"], merge.Conflicts.Order());
+        foreach (var file in new[] { "a.evil", "b.sys", "c.lfs" })
+        {
+            File.WriteAllText(Path.Combine(ws.Path, file), "both\n");
+        }
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-30: resolve", CancellationToken.None));
+        var update = await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
+        Assert.True(update.UpToDate);
+        await workspace.PushAsync(Repo, ws, CancellationToken.None);
+
+        var markers = Path.Combine(_root, "markers");
+        Assert.Empty(Directory.GetFiles(markers).Select(Path.GetFileName));
+        // The setup is live: the same git without the isolation runs the owner's filter on the PR's file.
+        File.Delete(Path.Combine(ws.Path, "a.evil"));
+        await GitWorkspace.RunGitAsync(ws.Path, OwnerEnvironment(null), ["checkout", "--", "a.evil"], CancellationToken.None);
+        Assert.Contains("global-smudge", Directory.GetFiles(markers).Select(Path.GetFileName));
+    }
+
     [Theory]
     [InlineData("a\n<<<<<<< HEAD\nb\n=======\nc\n>>>>>>> main\n", true)]
     [InlineData("<<<<<<<\n", true)]

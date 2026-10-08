@@ -463,8 +463,12 @@ public sealed class GitWorkspace(
         };
     }
 
-    private Task<string> Git(string cwd, Dictionary<string, string>? env, CancellationToken ct, params string[] args) =>
-        _git(cwd, env, args, ct);
+    /// <summary>Every git call of this class, isolated from the owner's own git config (<see cref="OwnerGit.Isolate"/>).</summary>
+    private Task<string> Git(string cwd, Dictionary<string, string>? env, CancellationToken ct, params string[] args)
+    {
+        var (isolatedEnv, isolatedArgs) = OwnerGit.Isolate(env, args);
+        return _git(cwd, isolatedEnv, isolatedArgs, ct);
+    }
 
     public static async Task<string> RunGitAsync(string cwd, IReadOnlyDictionary<string, string>? env, IReadOnlyList<string> args, CancellationToken ct)
     {

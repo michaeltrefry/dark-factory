@@ -1,3 +1,4 @@
+using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
@@ -19,6 +20,7 @@ public class MergeQueueTests
 {
     internal const int A = 101;
     internal const int B = 102;
+    internal const int C = 103;
     private static string Branch(int id) => StoryId.BranchName(id);
     private static readonly string Policy = TestPolicies.Standard();
 
@@ -407,8 +409,13 @@ public class MergeQueueTests
         public SimReviewer Reviewer { get; } = new();
         public SimWorker Worker { get; } = new();
         public IRunLocks Locks { get; set; } = locks ?? new InProcessRunLocks();
-        public IWorkSource Stories { get; } =
-            new LockedSource(new FakeWorkSource(new WorkStory(0, "Queue me", "Change one file.", "feature", "https://app.shortcut.com/trefry/story/0")));
+        /// <summary>The board behind <see cref="Stories"/> (every story id is the same story; its epic can be changed between runs).</summary>
+        public FakeWorkSource Board { get; } =
+            new(new WorkStory(0, "Queue me", "Change one file.", "feature", "https://app.shortcut.com/trefry/story/0"));
+        public IWorkSource Stories => LazyInitializer.EnsureInitialized(ref _stories, () => new LockedSource(Board));
+        private IWorkSource? _stories;
+        /// <summary>The factory's controls (Pause/Continue/Stop), kept in the shared ledger.</summary>
+        public IControls Controls => new LedgerControls(new LedgerDbContextFactory(_options), TimeProvider.System);
         private readonly StringWriter _log = new();
         private TextWriter? _writer;
         /// <summary>One synchronised writer over <see cref="_log"/> (its methods lock the writer itself).</summary>
@@ -418,7 +425,7 @@ public class MergeQueueTests
         /// <summary>A pipeline as one process would build it: its own ledger context over the shared ledger.</summary>
         public RunPipeline Pipeline() =>
             new(Stories, new WorkLedger(new LedgerDbContext(_options), TimeProvider.System), Locks, Repo, Worker, Repo, Sandbox, Log,
-                gate: new GateStage(Repo, Reviewer, GatePipelineTests.TestPanel, CiPoll, TimeSpan.FromSeconds(30)));
+                controls: Controls, gate: new GateStage(Repo, Reviewer, GatePipelineTests.TestPanel, CiPoll, TimeSpan.FromSeconds(30)));
 
         public Task<RunOutcome> Run(int story, CancellationToken ct = default) => Pipeline().RunAsync(story, ct);
 
@@ -451,7 +458,8 @@ public class MergeQueueTests
     /// Runs A until it holds the queue's turn with its head updated to main and CI on that head still running, then B through
     /// its gate approval (it queues behind A). Main moves when A's PR opens, so A's head is behind when it reaches the gate.
     /// </summary>
-    internal static async Task<(Task<RunOutcome> RunA, TaskCompletionSource ReleaseCi)> ABehindAWaitingForCi(Harness h, CancellationToken aToken = default)
+    internal static async Task<(Task<RunOutcome> RunA, TaskCompletionSource ReleaseCi)> ABehindAWaitingForCi(Harness h, CancellationToken aToken = default,
+        Action? beforeB = null)
     {
         h.Repo.OnOpen = branch =>
         {
@@ -473,6 +481,7 @@ public class MergeQueueTests
         var runA = Task.Run(() => h.Run(A, aToken));
         await waiting.Task.WaitAsync(TimeSpan.FromSeconds(30));
 
+        beforeB?.Invoke();
         var b = await h.Run(B);
 
         Assert.True(b.Succeeded, b.Error + h.Logged);
@@ -621,6 +630,46 @@ public class MergeQueueTests
     }
 
     [Fact]
+    public async Task A_conflict_after_the_fix_round_cap_is_used_escalates_instead_of_a_fix_round()
+    {
+        var h = new Harness();
+        Assert.Equal(WorkState.Watch, (await h.Run(A)).State);
+        h.Repo.Conflicting.Add(Branch(B));
+        h.Repo.OnOpen = branch =>
+        {
+            if (branch == Branch(B))
+            {
+                h.Repo.AdvanceMain("m1");
+            }
+        };
+        // B's first heads fail review until every fix round of the cap is spent; the last fix passes review and CI.
+        var blocked = new HashSet<string>();
+        h.Reviewer.Blocking = r =>
+        {
+            lock (blocked)
+            {
+                var head = r.Pull.HeadSha;
+                return head.StartsWith(Branch(B), StringComparison.Ordinal)
+                    && (blocked.Contains(head) || (blocked.Count < Lifecycle.MaxFixRounds && blocked.Add(head)));
+            }
+        };
+
+        var b = await h.Run(B);
+
+        Assert.Equal(WorkState.Escalated, b.State);
+        Assert.Contains($"the cap is {Lifecycle.MaxFixRounds}", b.Error);
+        Assert.Contains("conflicts with main", b.Error);
+        var transitions = await h.Transitions(B);
+        Assert.Equal(Lifecycle.MaxFixRounds, TransitionContext.From(transitions).FixRounds);
+        Assert.Equal(Lifecycle.MaxFixRounds, transitions.Count(t => t == WorkState.Fixing));
+        Assert.Contains(WorkState.MergeGate, transitions); // the conflict was found at the gate, after the cap was used in review
+        Assert.DoesNotContain(transitions.Zip(transitions.Skip(1)), p => p is (WorkState.MergeGate, WorkState.Fixing));
+        var conflict = BaseUpdate.FromDetail((await h.Steps(B, RunPipeline.Steps.MergeConflict)).Single())!;
+        Assert.Equal(["src/shared.cs"], conflict.Files);
+        Assert.Single(h.Repo.Merges); // only A's
+    }
+
+    [Fact]
     public async Task When_the_base_moves_again_while_ci_runs_the_head_is_updated_again_and_only_that_head_merges()
     {
         var h = new Harness();
@@ -705,6 +754,160 @@ public class MergeQueueTests
         Assert.DoesNotContain(h.Repo.Merges, m => m.Head.StartsWith($"{Branch(A)}-u", StringComparison.Ordinal));
     }
 
+    private static Task Set(Harness h, string scope, ControlState state) => h.Controls.SetAsync(scope, state, "tester", CancellationToken.None);
+
+    private static string Item(int story) => ControlScope.Item(StoryId.Format(story));
+
+    [Fact]
+    public async Task An_idle_item_whose_epic_is_paused_is_skipped_and_on_continue_merges_from_its_approval_time_place()
+    {
+        var h = new Harness();
+        const int epic = 7;
+        // A holds the turn (CI pending on its updated head); B, in epic 7, is queued behind it.
+        var (runA, release) = await ABehindAWaitingForCi(h, beforeB: () => h.Board.Epic = new WorkEpic(epic, "Epic 7", null, "https://app.shortcut.com/trefry/epic/7"));
+        h.Board.Epic = null;
+        var c = await h.Run(C);
+        Assert.Equal(WorkState.MergeGate, c.State);
+        Assert.Contains($"{StoryId.Format(C)} is 3 of 3 in the merge queue", h.Logged);
+
+        // B's epic is paused while B waits between runs: no run of B is active, so nothing is written to its ledger.
+        await Set(h, ControlScope.Epic(epic), ControlState.Paused);
+        release.SetResult();
+        Assert.Equal(WorkState.Watch, (await runA).State);
+        Assert.Equal(WorkState.MergeGate, (await h.Run(B)).State); // paused: nothing to do
+
+        // C does not wait for B: B is held by its control and idle, so C is the head of the queue now.
+        var cTurn = await h.Run(C);
+        Assert.Equal(WorkState.Watch, cTurn.State);
+        Assert.Equal([Branch(A), Branch(C)], h.Repo.Merges.Select(m => m.Branch));
+        Assert.Empty(await h.Steps(B, RunPipeline.Steps.QueueTurn));
+
+        // Continue: B keeps its approval-time place (its queued row is unchanged) and merges on a head containing C's merge.
+        var queued = (await h.Rows(B)).Single(r => r.Step == RunPipeline.Steps.Queued).Id;
+        await Set(h, ControlScope.Epic(epic), ControlState.Running);
+        Assert.Equal(WorkState.Watch, (await h.Run(B)).State);
+        Assert.Equal([Branch(A), Branch(C), Branch(B)], h.Repo.Merges.Select(m => m.Branch));
+        Assert.All(h.Repo.Merges, m => Assert.Equal(m.MainCount, m.Contained));
+        Assert.Equal(queued, (await h.Rows(B)).Single(r => r.Step == RunPipeline.Steps.Queued).Id);
+    }
+
+    [Fact]
+    public async Task An_interrupted_turn_holder_paused_since_is_skipped_and_on_continue_waits_for_the_newer_turn()
+    {
+        var h = new Harness();
+        using var interrupt = new CancellationTokenSource();
+        var (runA, release) = await ABehindAWaitingForCi(h, interrupt.Token);
+        await interrupt.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runA);
+        h.Locks = new InProcessRunLocks(); // a new process
+        await Set(h, Item(A), ControlState.Paused);
+
+        // B takes the turn A still holds in the ledger; CI on its head stays pending, so it is mid-turn.
+        release.SetResult();
+        var bInCi = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var bRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        h.Repo.CiFor = sha => sha.StartsWith(Branch(B), StringComparison.Ordinal) && !bRelease.Task.IsCompleted ? Pending(sha) : null;
+        h.Repo.OnCiRead = sha =>
+        {
+            if (sha.StartsWith(Branch(B), StringComparison.Ordinal))
+            {
+                bInCi.TrySetResult();
+            }
+        };
+        var runB = Task.Run(() => h.Run(B));
+        Assert.Same(bInCi.Task, await Task.WhenAny(bInCi.Task, runB).WaitAsync(TimeSpan.FromSeconds(30)));
+        Assert.Single(await h.Steps(B, RunPipeline.Steps.QueueTurn));
+
+        // Continue A while B holds the newer turn: A, ahead of B by approval, does not take its old turn back over B.
+        await Set(h, Item(A), ControlState.Running);
+        Assert.Equal(WorkState.MergeGate, (await h.Run(A)).State);
+        Assert.Contains($"waiting for {StoryId.Format(B)}, which holds the queue's turn", h.Logged);
+        Assert.Empty(h.Repo.Merges);
+
+        bRelease.SetResult();
+        Assert.Equal(WorkState.Watch, (await runB).State);
+        Assert.Equal(WorkState.Watch, (await h.Run(A)).State); // B has left: A holds its own turn again
+        Assert.Equal([Branch(B), Branch(A)], h.Repo.Merges.Select(m => m.Branch));
+        Assert.All(h.Repo.Merges, m => Assert.Equal(m.MainCount, m.Contained));
+        Assert.Single(await h.Steps(A, RunPipeline.Steps.QueueTurn));
+        Assert.Empty(h.Repo.Overlaps);
+    }
+
+    [Fact]
+    public async Task A_turn_holder_whose_run_is_still_active_when_paused_keeps_the_turn_until_its_run_records_the_pause()
+    {
+        var h = new Harness();
+        var (runA, release) = await ABehindAWaitingForCi(h);
+        // A's run is inside its CI wait (blocked in a CI read) when its control flips to Paused.
+        var inCi = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var hold = new ManualResetEventSlim();
+        h.Repo.OnCiRead = sha =>
+        {
+            if (sha.StartsWith($"{Branch(A)}-u", StringComparison.Ordinal))
+            {
+                inCi.TrySetResult();
+                hold.Wait(TimeSpan.FromSeconds(30));
+            }
+        };
+        await inCi.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await Set(h, Item(A), ControlState.Paused);
+
+        Assert.Equal(WorkState.MergeGate, (await h.Run(B)).State); // A's run holds its lock: B is not let past it
+        Assert.Empty(await h.Steps(B, RunPipeline.Steps.QueueTurn));
+        Assert.Empty(h.Repo.Merges);
+
+        hold.Set();
+        var a = await runA;
+        Assert.Equal(WorkState.Paused, a.State);
+        Assert.Equal(RunPipeline.UserPaused, (await h.Rows(A)).Last(r => r.Step is null).Detail);
+        Assert.Equal(WorkState.Watch, (await h.Run(B)).State); // A's pause is recorded and A is idle: B takes the turn
+        await Set(h, Item(A), ControlState.Running);
+        release.SetResult();
+        Assert.Equal(WorkState.Watch, (await h.Run(A)).State);
+        Assert.Equal([Branch(B), Branch(A)], h.Repo.Merges.Select(m => m.Branch));
+        Assert.All(h.Repo.Merges, m => Assert.Equal(m.MainCount, m.Contained));
+    }
+
+    [Fact]
+    public async Task A_factory_pause_merges_nothing_and_continue_resumes_the_approval_order()
+    {
+        var h = new Harness();
+        var (runA, release) = await ABehindAWaitingForCi(h);
+        await Set(h, ControlScope.Factory, ControlState.Paused);
+        Assert.Equal(WorkState.Paused, (await runA).State); // A's run records the pause, which releases its turn
+        release.SetResult();
+        Assert.Equal(WorkState.MergeGate, (await h.Run(B)).State);
+        Assert.Empty(h.Repo.Merges);
+        Assert.Empty(await h.Steps(B, RunPipeline.Steps.QueueTurn));
+
+        await Set(h, ControlScope.Factory, ControlState.Running);
+        // B runs first after Continue: A (approved first, its place kept through the pause) is ahead, so B waits.
+        Assert.Equal(WorkState.MergeGate, (await h.Run(B)).State);
+        Assert.Contains($"waiting for {StoryId.Format(A)}, which is ahead of it", h.Logged);
+        Assert.Empty(h.Repo.Merges);
+        Assert.Equal(WorkState.Watch, (await h.Run(A)).State);
+        Assert.Equal(WorkState.Watch, (await h.Run(B)).State);
+        await AssertMergedInOrderEachOnAHeadContainingMain(h);
+    }
+
+    [Fact]
+    public async Task An_idle_turn_holder_being_stopped_does_not_hold_up_the_queue()
+    {
+        var h = new Harness();
+        using var interrupt = new CancellationTokenSource();
+        var (runA, release) = await ABehindAWaitingForCi(h, interrupt.Token);
+        await interrupt.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runA);
+        h.Locks = new InProcessRunLocks();
+        release.SetResult();
+        await Set(h, Item(A), ControlState.Stopping); // Stop pressed; no run of A has acted on it yet
+
+        Assert.Equal(WorkState.Watch, (await h.Run(B)).State);
+        Assert.Equal([Branch(B)], h.Repo.Merges.Select(m => m.Branch));
+        Assert.Equal(WorkState.Cancelled, (await h.Run(A)).State);
+        Assert.Single(h.Repo.Merges);
+    }
+
     [Fact]
     public async Task Racing_runs_never_have_two_items_of_a_repo_in_flight()
     {
@@ -771,16 +974,38 @@ public class MergeQueueRuleTests
     [Fact]
     public void The_head_of_the_queue_takes_a_free_turn_and_everyone_else_waits_fifo()
     {
-        MergeQueue.Entry First(bool turn = false) => new(1, "sc-1", 10, turn);
-        MergeQueue.Entry Second(bool turn = false) => new(2, "sc-2", 20, turn);
+        MergeQueue.Entry First(long? turn = null) => new(1, "sc-1", 10, turn);
+        MergeQueue.Entry Second(long? turn = null) => new(2, "sc-2", 20, turn);
 
         Assert.Equal(MergeQueue.TurnKind.Take, MergeQueue.TurnOf(1, [Second(), First()]).Kind);
         var waiting = MergeQueue.TurnOf(2, [Second(), First()]);
         Assert.Equal((MergeQueue.TurnKind.Wait, "sc-1", 2, 2), (waiting.Kind, waiting.Ahead!.ExternalId, waiting.Position, waiting.Count));
         // A later item holding the turn (e.g. it took it while the head was paused) keeps it; the head waits for it.
-        Assert.Equal(MergeQueue.TurnKind.Held, MergeQueue.TurnOf(2, [First(), Second(turn: true)]).Kind);
-        Assert.Equal(MergeQueue.TurnKind.Wait, MergeQueue.TurnOf(1, [First(), Second(turn: true)]).Kind);
+        Assert.Equal(MergeQueue.TurnKind.Held, MergeQueue.TurnOf(2, [First(), Second(turn: 30)]).Kind);
+        Assert.Equal(MergeQueue.TurnKind.Wait, MergeQueue.TurnOf(1, [First(), Second(turn: 30)]).Kind);
         Assert.Throws<InvalidOperationException>(() => MergeQueue.TurnOf(3, [First()]));
+    }
+
+    [Fact]
+    public void When_two_items_hold_a_turn_the_newer_turn_is_the_repos_and_the_older_holder_waits()
+    {
+        // The head held the turn (row 15), was paused idle and left out; the second took the turn (row 30) meanwhile.
+        MergeQueue.Entry first = new(1, "sc-1", 10, 15);
+        MergeQueue.Entry second = new(2, "sc-2", 20, 30);
+
+        var head = MergeQueue.TurnOf(1, [first, second]);
+        Assert.Equal((MergeQueue.TurnKind.Wait, "sc-2"), (head.Kind, head.Ahead!.ExternalId));
+        Assert.Equal(MergeQueue.TurnKind.Held, MergeQueue.TurnOf(2, [first, second]).Kind);
+        // Once the second has left the queue, the head holds its own turn again.
+        Assert.Equal(MergeQueue.TurnKind.Held, MergeQueue.TurnOf(1, [first]).Kind);
+    }
+
+    [Fact]
+    public void The_turn_row_is_the_queue_turn_checkpoint_that_holds_the_turn()
+    {
+        var turn = Row(WorkState.MergeGate, RunPipeline.Steps.QueueTurn);
+        Assert.Equal(turn.Id, MergeQueue.TurnRowOf(Queued(turn, Row(WorkState.Paused, null, RunPipeline.Interrupted)), RunPipeline.Steps.QueueTurn));
+        Assert.Null(MergeQueue.TurnRowOf(Queued(), RunPipeline.Steps.QueueTurn));
     }
 
     [Fact]
@@ -794,8 +1019,16 @@ public class MergeQueueRuleTests
         Assert.True(MergeQueue.InTurn(interrupted, RunPipeline.Steps.QueueTurn));
         Assert.True(MergeQueue.InTurn([.. interrupted, Row(WorkState.MergeGate, null, "unpaused")], RunPipeline.Steps.QueueTurn));
 
+        // A user's Pause or the usage pause keeps the item's place (Continue resumes it) but releases its turn.
         var userPaused = Queued(turn, Row(WorkState.Paused, null, RunPipeline.UserPaused));
-        Assert.False(MergeQueue.Member(userPaused));
+        Assert.True(MergeQueue.Member(userPaused));
+        Assert.False(MergeQueue.InTurn(userPaused, RunPipeline.Steps.QueueTurn));
+        var usagePaused = Queued(turn, Row(WorkState.Paused, null, RunPipeline.UsagePaused));
+        Assert.True(MergeQueue.Member(usagePaused));
+        Assert.False(MergeQueue.InTurn(usagePaused, RunPipeline.Steps.QueueTurn));
+        // Paused any other way (e.g. a refused claim) needs a human: out of the queue.
+        Assert.False(MergeQueue.Member(Queued(turn, Row(WorkState.Paused, null, "claim refused: owner changed"))));
+        Assert.False(MergeQueue.Member([.. userPaused, Row(WorkState.Paused, RunPipeline.Steps.Parked, "out of scope")]));
         var resumed = new List<LedgerEntry>([.. userPaused, Row(WorkState.MergeGate, null, "unpaused")]);
         Assert.True(MergeQueue.Member(resumed));
         Assert.False(MergeQueue.InTurn(resumed, RunPipeline.Steps.QueueTurn)); // it must take the turn again

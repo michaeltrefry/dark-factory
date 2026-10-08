@@ -90,11 +90,21 @@ public sealed record ReviewCarry(
 /// its <c>queue-turn</c> checkpoint until it leaves the queue or is paused other than by an interruption
 /// (<see cref="InTurn"/>). One item per repo holds the turn: it is taken only by the queue's head, only when no queued item
 /// holds it, and only under the repo's lock (<see cref="LockKey"/>), so two processes cannot both take it.
+/// The caller leaves out of the queue every other item a control holds (Pause on the factory, its epic or the item, the usage
+/// pause, or Stop) whose run is not active — such an item writes no ledger row until it runs again, so the ledger alone would
+/// keep it queued and hold up its repo. Once its control lets it run again it is back at its approval-time place, but never
+/// ahead of the turn: a turn taken while it was left out is the newer one (<see cref="TurnOf"/>), so it waits for that item.
 /// </summary>
 public static class MergeQueue
 {
-    /// <summary>One queued item: its gate-approval row (the queue order) and whether it holds the repo's turn.</summary>
-    public sealed record Entry(long ItemId, string ExternalId, long QueuedRow, bool InTurn);
+    /// <summary>
+    /// One queued item: its gate-approval row (the queue order) and, when it holds the repo's turn, the row of its
+    /// <c>queue-turn</c> checkpoint (null otherwise).
+    /// </summary>
+    public sealed record Entry(long ItemId, string ExternalId, long QueuedRow, long? TurnRow = null)
+    {
+        public bool InTurn => TurnRow is not null;
+    }
 
     public enum TurnKind
     {
@@ -142,10 +152,12 @@ public static class MergeQueue
     }
 
     /// <summary>
-    /// Whether the item is in the queue now: in MergeGate, or paused from it by an interruption (<see cref="RunPipeline.Interrupted"/>:
-    /// Ctrl-C or <c>factory work</c> shutting down, which resumes by itself). A user's Pause, the usage pause or a parked item
-    /// is out of the queue (it would otherwise hold up its repo) until it is back in MergeGate; so is an interrupted item
-    /// parked since (e.g. its story left the watch scope), which never resumes by itself.
+    /// Whether the item is in the ledger's queue now: in MergeGate, or paused from it in a way that resumes by itself — an
+    /// interruption (<see cref="RunPipeline.Interrupted"/>: Ctrl-C or <c>factory work</c> shutting down), a user's Pause
+    /// (<see cref="RunPipeline.UserPaused"/>, resumed by Continue) or the usage pause (<see cref="RunPipeline.UsagePaused"/>) —
+    /// so it keeps its approval-time place. While a control still holds such an item and no run of it is active, the caller
+    /// leaves it out (<see cref="RunPipeline"/>'s queue build), so it never holds up its repo. A parked item (paused other ways,
+    /// or parked since, e.g. its story left the watch scope) never resumes by itself and is out of the queue.
     /// </summary>
     public static bool Member(IReadOnlyList<LedgerEntry> history)
     {
@@ -160,8 +172,11 @@ public static class MergeQueue
         }
         return last >= 0
             && (history[last].State == WorkState.MergeGate
-                || (IsInterruption(history[last]) && !history.Skip(last + 1).Any(e => e.Step == RunPipeline.Steps.Parked)));
+                || (ResumablePause(history[last]) && !history.Skip(last + 1).Any(e => e.Step == RunPipeline.Steps.Parked)));
     }
+
+    private static bool ResumablePause(LedgerEntry row) =>
+        row.State == WorkState.Paused && row.Detail is RunPipeline.Interrupted or RunPipeline.UserPaused or RunPipeline.UsagePaused;
 
     private static bool IsInterruption(LedgerEntry row) => row.State == WorkState.Paused && row.Detail == RunPipeline.Interrupted;
 
@@ -170,11 +185,14 @@ public static class MergeQueue
     /// checkpoint) in its current stint, after any pause other than an interruption (which releases it: a resumed item takes
     /// it again). A crash or an interruption keeps it, so the item resumes its turn where the ledger left it.
     /// </summary>
-    public static bool InTurn(IReadOnlyList<LedgerEntry> history, string step)
+    public static bool InTurn(IReadOnlyList<LedgerEntry> history, string step) => TurnRowOf(history, step) is not null;
+
+    /// <summary>The row of the <c>queue-turn</c> checkpoint by which the item holds its repo's turn (<see cref="InTurn"/>), or null.</summary>
+    public static long? TurnRowOf(IReadOnlyList<LedgerEntry> history, string step)
     {
         if (!Member(history))
         {
-            return false;
+            return null;
         }
         var from = StintStart(history);
         for (var i = history.Count - 1; i > from; i--)
@@ -185,16 +203,20 @@ public static class MergeQueue
                 break;
             }
         }
-        return history.Skip(from + 1).Any(e => e.Step == step);
+        return history.Skip(from + 1).LastOrDefault(e => e.Step == step)?.Id;
     }
 
     /// <summary>The item's queue entry, or null when it is not queued (not in the queue, <see cref="Member"/>, or not approved in this stint).</summary>
     public static Entry? EntryOf(WorkItem item, IReadOnlyList<LedgerEntry> history, string queuedStep, string turnStep) =>
         Member(history) && QueuedRow(history, queuedStep) is { } queued
-            ? new Entry(item.Id, item.ExternalId, queued.Id, InTurn(history, turnStep))
+            ? new Entry(item.Id, item.ExternalId, queued.Id, TurnRowOf(history, turnStep))
             : null;
 
-    /// <summary>What <paramref name="self"/> may do in <paramref name="queue"/> (every queued item of its repo, itself included).</summary>
+    /// <summary>
+    /// What <paramref name="self"/> may do in <paramref name="queue"/> (every queued item of its repo, itself included). When
+    /// more than one entry holds a turn (one was taken while an earlier holder was left out of the queue by a control and idle),
+    /// the newest turn is the repo's: the earlier holder waits for it, then holds its own turn again once that item has left.
+    /// </summary>
     public static Turn TurnOf(long self, IReadOnlyList<Entry> queue)
     {
         var ordered = queue.OrderBy(e => e.QueuedRow).ToList();
@@ -204,13 +226,11 @@ public static class MergeQueue
         {
             throw new InvalidOperationException($"Work item {self} is not in its repo's merge queue.");
         }
-        if (mine.InTurn)
+        if (ordered.Where(e => e.InTurn).MaxBy(e => e.TurnRow) is { } holder)
         {
-            return new Turn(TurnKind.Held, null, position, ordered.Count);
-        }
-        if (ordered.FirstOrDefault(e => e.InTurn) is { } holder)
-        {
-            return new Turn(TurnKind.Wait, holder, position, ordered.Count);
+            return holder.ItemId == self
+                ? new Turn(TurnKind.Held, null, position, ordered.Count)
+                : new Turn(TurnKind.Wait, holder, position, ordered.Count);
         }
         return ordered[0].ItemId == self
             ? new Turn(TurnKind.Take, null, position, ordered.Count)

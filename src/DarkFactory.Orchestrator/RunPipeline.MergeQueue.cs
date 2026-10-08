@@ -1,3 +1,4 @@
+using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
@@ -64,10 +65,15 @@ public sealed partial class RunPipeline
             {
                 await ledger.CheckpointAsync(run.Item, Steps.Queued, null, pull.HeadSha, ct);
             }
-            var queue = (await ledger.ItemsOnRepoAsync(Source, run.Item.Repo, QueueStates, ct))
-                .Select(x => MergeQueue.EntryOf(x.Item, x.History, Steps.Queued, Steps.QueueTurn))
-                .OfType<MergeQueue.Entry>()
-                .ToList();
+            var queue = new List<MergeQueue.Entry>();
+            foreach (var (item, history) in await ledger.ItemsOnRepoAsync(Source, run.Item.Repo, QueueStates, ct))
+            {
+                if (MergeQueue.EntryOf(item, history, Steps.Queued, Steps.QueueTurn) is { } entry
+                    && (item.Id == run.Item.Id || !await HeldIdleByControlAsync(item, ct)))
+                {
+                    queue.Add(entry);
+                }
+            }
             var decided = MergeQueue.TurnOf(run.Item.Id, queue);
             if (decided.Kind == MergeQueue.TurnKind.Take)
             {
@@ -84,6 +90,22 @@ public sealed partial class RunPipeline
         log.WriteLine($"[queue] {run.Item.ExternalId} {(turn.Kind == MergeQueue.TurnKind.Take ? "takes" : "holds")} the merge queue's turn for {run.Repo} "
             + $"({turn.Position} of {turn.Count})");
         await MergeInTurnAsync(run, approval is null ? null : (approval, pull), ct);
+    }
+
+    /// <summary>
+    /// Whether a control (Pause on the factory, the item's epic or the item, the usage pause, or Stop) holds the item and no run
+    /// of it is active (its run lock is free right now). Such an item records nothing until a run picks it up again, so its
+    /// ledger still shows it queued; it is left out of the queue meanwhile rather than holding up its repo. An item whose run is
+    /// still going (e.g. in its CI wait as the Pause lands) stays in until that run records the pause.
+    /// </summary>
+    private async Task<bool> HeldIdleByControlAsync(WorkItem item, CancellationToken ct)
+    {
+        if (await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) == ControlState.Running)
+        {
+            return false;
+        }
+        await using var idle = await locks.TryAcquireAsync(item.Id, ct);
+        return idle is not null;
     }
 
     /// <summary>
