@@ -49,7 +49,9 @@ internal sealed class StubRouter : IAsyncDisposable
         };
         var stub = new StubRouter(app, upstream, resumesAt);
         app.MapGet("/v1/subscriptions/usage", stub.Usage);
-        app.Run(stub.ProxyAsync);
+        // A catch-all endpoint, not app.Run: terminal middleware runs before any endpoint, so it would proxy the usage
+        // read too. "{**path}" rather than MapFallback's default pattern, which skips paths that look like file names.
+        app.MapFallback("{**path}", stub.ProxyAsync);
         await app.StartAsync(ct);
         return stub;
     }
