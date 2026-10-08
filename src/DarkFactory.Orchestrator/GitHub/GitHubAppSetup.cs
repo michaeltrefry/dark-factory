@@ -15,14 +15,19 @@ public sealed record CreatedApp(long Id, string Slug, string HtmlUrl);
 /// a localhost page POSTs the committed manifest to github.com, GitHub redirects back with a
 /// one-time code, and the code is exchanged for the app id and private key, which go to the keychain.
 /// </summary>
-public sealed class GitHubAppSetup(HttpClient http, ISecretStore secrets, TextWriter output)
+/// <param name="gate">
+/// Registers the merge gate's App (<c>gate-app-manifest.json</c>, keychain accounts <c>github-gate-app-*</c>) instead of the
+/// workers' App: the gate's is the only credential that can merge (and read CI); the workers' never can.
+/// </param>
+public sealed class GitHubAppSetup(HttpClient http, ISecretStore secrets, TextWriter output, bool gate = false)
 {
     public const string NewAppUrl = "https://github.com/settings/apps/new";
 
-    public static string BuildManifest(string appName, int port)
+    public static string BuildManifest(string appName, int port, bool gate = false)
     {
-        using var stream = typeof(GitHubAppSetup).Assembly.GetManifestResourceStream("app-manifest.json")
-            ?? throw new InvalidOperationException("Embedded app-manifest.json is missing.");
+        var resource = gate ? "gate-app-manifest.json" : "app-manifest.json";
+        using var stream = typeof(GitHubAppSetup).Assembly.GetManifestResourceStream(resource)
+            ?? throw new InvalidOperationException($"Embedded {resource} is missing.");
         var manifest = JsonNode.Parse(stream)!.AsObject();
         manifest["name"] = appName;
         manifest["redirect_url"] = $"http://localhost:{port}/callback";
@@ -54,16 +59,16 @@ public sealed class GitHubAppSetup(HttpClient http, ISecretStore secrets, TextWr
         var app = await response.Content.ReadFromJsonAsync<ConversionDto>(ct)
             ?? throw new InvalidOperationException("Empty manifest conversion response.");
 
-        secrets.Set(SecretAccounts.GitHubAppId, app.Id.ToString());
-        secrets.Set(SecretAccounts.GitHubAppSlug, app.Slug);
-        secrets.Set(SecretAccounts.GitHubAppPrivateKey, app.Pem);
+        secrets.Set(gate ? SecretAccounts.GitHubGateAppId : SecretAccounts.GitHubAppId, app.Id.ToString());
+        secrets.Set(gate ? SecretAccounts.GitHubGateAppSlug : SecretAccounts.GitHubAppSlug, app.Slug);
+        secrets.Set(gate ? SecretAccounts.GitHubGateAppPrivateKey : SecretAccounts.GitHubAppPrivateKey, app.Pem);
         return new CreatedApp(app.Id, app.Slug, app.HtmlUrl);
     }
 
     public async Task<CreatedApp> RunAsync(string appName, int port, CancellationToken ct)
     {
         var state = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
-        var manifest = BuildManifest(appName, port);
+        var manifest = BuildManifest(appName, port, gate);
         using var listener = new HttpListener();
         listener.Prefixes.Add($"http://localhost:{port}/");
         listener.Start();
@@ -101,6 +106,10 @@ public sealed class GitHubAppSetup(HttpClient http, ISecretStore secrets, TextWr
                 $"<p>App <b>{WebUtility.HtmlEncode(app.Slug)}</b> created. Now <a href=\"{installUrl}\">install it</a> on the target repositories.</p>");
             output.WriteLine($"Created GitHub App '{app.Slug}' (id {app.Id}); credentials stored in the login keychain (service '{SecretAccounts.Service}').");
             output.WriteLine($"Next: install it on the target repo(s): {installUrl}");
+            if (gate)
+            {
+                output.WriteLine("Then re-run `factory github-repo protect owner/name` so the gate App may merge pull requests past the rulesets.");
+            }
             return app;
         }
     }

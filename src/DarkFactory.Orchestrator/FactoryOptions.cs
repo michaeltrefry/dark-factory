@@ -129,6 +129,39 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     public string GitHubAppPrivateKeyPem =>
         Secret("GitHub:PrivateKeyPem", null, SecretAccounts.GitHubAppPrivateKey, "GitHub App private key");
 
+    /// <summary>The merge gate's App (<c>factory github-app setup --gate</c>): the merge-capable credential only the gate holds.</summary>
+    public string GitHubGateAppId => Secret("GitHub:Gate:AppId", null, SecretAccounts.GitHubGateAppId, "GitHub gate App id (run `factory github-app setup --gate`)");
+
+    public string GitHubGateAppPrivateKeyPem =>
+        Secret("GitHub:Gate:PrivateKeyPem", null, SecretAccounts.GitHubGateAppPrivateKey, "GitHub gate App private key (run `factory github-app setup --gate`)");
+
+    /// <summary>
+    /// <c>Review:Models</c> (comma-separated): the reviewer models, in order of preference; the first whose family the
+    /// implementer did not use reviews. Each must be of a known family (<see cref="Gate.ModelFamily"/>).
+    /// </summary>
+    public IReadOnlyList<string> ReviewerModels
+    {
+        get
+        {
+            var models = (config["Review:Models"] is { } list && !string.IsNullOrWhiteSpace(list)
+                    ? list.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    : GateStage.DefaultReviewerModels)
+                .ToList();
+            return models.FirstOrDefault(m => Gate.ModelFamily.Of(m) is null) is { } unknown
+                ? throw new InvalidOperationException($"Review:Models: '{unknown}' is of no known model family.")
+                : models;
+        }
+    }
+
+    /// <summary><c>Review:TimeoutMinutes</c> (default 10): the longest one reviewer call may take.</summary>
+    public TimeSpan ReviewTimeout => TimeSpan.FromMinutes(config.GetValue("Review:TimeoutMinutes", 10));
+
+    /// <summary><c>Gate:CiPollSeconds</c> (default 30): how often CI on the PR's head is read while it runs.</summary>
+    public TimeSpan CiPollInterval => TimeSpan.FromSeconds(config.GetValue("Gate:CiPollSeconds", GateStage.DefaultCiPollInterval.TotalSeconds));
+
+    /// <summary><c>Gate:CiTimeoutMinutes</c> (default 30): CI still running after this escalates the item.</summary>
+    public TimeSpan CiTimeout => TimeSpan.FromMinutes(config.GetValue("Gate:CiTimeoutMinutes", GateStage.DefaultCiTimeout.TotalMinutes));
+
     public bool TryGet(Func<FactoryOptions, string> secret, out string? value)
     {
         try

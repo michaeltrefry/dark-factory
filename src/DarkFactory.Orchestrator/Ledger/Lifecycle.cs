@@ -56,9 +56,10 @@ public static class Lifecycle
         [WorkState.Implement] = [WorkState.Review],
         [WorkState.Review] = [WorkState.Fixing, WorkState.CI],
         [WorkState.Fixing] = [WorkState.Review],
-        [WorkState.CI] = [WorkState.CIHealing, WorkState.MergeGate],
+        // A push after the review verdict voids it (E3): the new head goes back to Review.
+        [WorkState.CI] = [WorkState.CIHealing, WorkState.MergeGate, WorkState.Review],
         [WorkState.CIHealing] = [WorkState.CI],
-        [WorkState.MergeGate] = [WorkState.Merge],
+        [WorkState.MergeGate] = [WorkState.Merge, WorkState.Review],
         [WorkState.Merge] = [WorkState.Watch],
         // A reverted change reopens: back to Intake, or straight to Implement.
         [WorkState.Watch] = [WorkState.Done, WorkState.Intake, WorkState.Implement],

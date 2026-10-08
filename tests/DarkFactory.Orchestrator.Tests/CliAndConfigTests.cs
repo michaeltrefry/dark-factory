@@ -12,7 +12,7 @@ public class FactoryCliTests
         var calls = new List<string>();
         var root = FactoryCli.Build(
             (id, ignoreScope, _) => { calls.Add(ignoreScope ? $"run {id} ignore-scope" : $"run {id}"); return Task.FromResult(0); },
-            (name, port, _) => { calls.Add($"setup {name} {port}"); return Task.FromResult(0); },
+            (name, port, gate, _) => { calls.Add(gate ? $"setup {name} {port} gate" : $"setup {name} {port}"); return Task.FromResult(0); },
             (repo, _) => { calls.Add($"protect {repo}"); return Task.FromResult(0); },
             _ => { calls.Add("work"); return Task.FromResult(0); },
             _ => { calls.Add("dashboard set-password"); return Task.FromResult(0); },
@@ -95,6 +95,16 @@ public class FactoryCliTests
     }
 
     [Fact]
+    public async Task Github_app_setup_gate_registers_the_gate_app_under_its_own_default_name()
+    {
+        var (root, calls) = Cli();
+        await root.Parse(["github-app", "setup", "--gate"]).InvokeAsync();
+        await root.Parse(["github-app", "setup", "--gate", "--name", "df-gate"]).InvokeAsync();
+        Assert.Equal([$"setup dark-factory-gate-{Environment.UserName} {FactoryCli.DefaultSetupPort} gate", $"setup df-gate {FactoryCli.DefaultSetupPort} gate"],
+            calls);
+    }
+
+    [Fact]
     public async Task Work_runs_the_host()
     {
         var (root, calls) = Cli();
@@ -151,6 +161,26 @@ public class FactoryOptionsTests
         Assert.Equal(TimeSpan.FromSeconds(900), Options(new() { ["Worker:PauseGraceSeconds"] = "900" }).PauseGrace);
         Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:PauseGraceSeconds"] = "300" }).PauseGrace);
         Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:PauseGraceSeconds"] = "600" }).PauseGrace);
+    }
+
+    [Fact]
+    public void Reviewer_models_default_to_two_families_and_must_each_have_a_known_family()
+    {
+        Assert.Equal(["gpt-5.6-sol", "claude-opus-5-5"], Options([]).ReviewerModels);
+        Assert.Equal(["gemini-2.5-pro", "gpt-5.6-luna"], Options(new() { ["Review:Models"] = " gemini-2.5-pro , gpt-5.6-luna" }).ReviewerModels);
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Review:Models"] = "gpt-5.6-sol,mystery" }).ReviewerModels);
+        Assert.Equal((TimeSpan.FromSeconds(30), TimeSpan.FromMinutes(30)), (Options([]).CiPollInterval, Options([]).CiTimeout));
+    }
+
+    [Fact]
+    public void The_gate_app_is_a_separate_credential_from_the_workers_app()
+    {
+        var secrets = new InMemorySecrets();
+        secrets.Set(SecretAccounts.GitHubAppId, "1");
+        var options = Options([], secrets);
+        Assert.Throws<MissingCredentialException>(() => options.GitHubGateAppId);
+        secrets.Set(SecretAccounts.GitHubGateAppId, "2");
+        Assert.Equal(("1", "2"), (options.GitHubAppId, options.GitHubGateAppId));
     }
 
     [Fact]

@@ -12,7 +12,9 @@ Claude Code headless workers through the Weave router.
   session capture + SignalR hub (`Sessions/`), the `factory work` host (`FactoryHost`) and its Blazor Server
   dashboard (`Dashboard/`: login, binding, ledger reads, transcript formatting; components in `Dashboard/Components`),
   `IWorkSource` + the `factory work` intake loop (`WorkSources/`; registered on the `factory work` host by `FactoryHost.BuildWork` via `services.AddIntake(options)`)
-  and its Shortcut adapter (`Shortcut/ShortcutWorkSource.cs`), and the Pause/Continue/Stop controls (`Controls/`).
+  and its Shortcut adapter (`Shortcut/ShortcutWorkSource.cs`), the Pause/Continue/Stop controls (`Controls/`), and the
+  review and merge gate (`Gate/`: `ModelFamily`/`ReviewerChoice`, `RouterReviewer`, `GatePolicy`, `MergeGate`; GitHub side
+  `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`).
 - `scripts/` — `setup-worker-user.sh` (one-time root setup of the `_factory` sandbox user) and
   `factory-worker-launch` (the root-installed helper every sandboxed worker runs through).
 - `tests/DarkFactory.Orchestrator.Tests` — unit tests (no network; fake HTTP APIs, InMemory EF, local git).
@@ -37,6 +39,7 @@ dotnet run --project src/DarkFactory.Orchestrator -- work          # long-runnin
 dotnet run --project src/DarkFactory.Orchestrator -- dashboard set-password   # dashboard login (hash → keychain)
 dotnet run --project src/DarkFactory.Orchestrator -- pause --factory          # also continue/stop; --epic N or --item sc-N
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup
+dotnet run --project src/DarkFactory.Orchestrator -- github-app setup --gate   # the merge gate's own App (then re-run protect)
 dotnet run --project src/DarkFactory.Orchestrator -- github-repo protect owner/name   # rulesets; owner's GH_TOKEN / `gh auth token`
 ```
 
@@ -52,6 +55,10 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Router:Key` | env `FACTORY_ROUTER_KEY`, or keychain account `router-key` |
 | `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
+| `GitHub:Gate:AppId`, `GitHub:Gate:PrivateKeyPem` | keychain `github-gate-app-id`, `github-gate-app-private-key` (written by `factory github-app setup --gate`): the merge gate's App, the only credential that merges |
+| `Review:Models` | `gpt-5.6-sol,claude-opus-5-5` (reviewer models in order; the first of a family the implementer did not use reviews; each must be of a known family) |
+| `Review:TimeoutMinutes` | `10` (one reviewer call) |
+| `Gate:CiPollSeconds`, `Gate:CiTimeoutMinutes` | `30`, `30` (CI on the PR head is polled until it finishes; still running at the timeout escalates) |
 | `Factory:DefaultRepo` | `michaeltrefry/dark-factory-sandbox` (a story line `Repo: owner/name` overrides) |
 | `Shortcut:Watch:Teams`, `Shortcut:Watch:Epics` | empty = watch nothing; comma-separated team mention names/ids, epic ids |
 | `Intake:PollSeconds` | `60` |
@@ -171,10 +178,12 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
 - Workers get only the router URL + router key; the worker env is an allowlist (`ClaudeWorker.BuildRouterVariables`,
   enforced again by `scripts/factory-worker-launch`).
 - The orchestrator pushes only to `factory/*`, with a repo-scoped GitHub App installation token passed
-  via git env config (never argv/remote URLs/.git/config) on every network git call. Nothing merges.
+  via git env config (never argv/remote URLs/.git/config) on every network git call. Only the merge gate merges (below).
   Tokens are minted fresh per call (never cached) and refused if they outlive 1 hour (`GitHubApp`).
   Server-side, `github-repo protect` (`RepoProtection`) applies rulesets: default branch needs a PR, and only
   repo admins may write refs outside `factory/**` (needs GitHub Pro for private personal repos).
+  With the gate App's id known (`github-app setup --gate`), that ruleset also lists the gate App as a bypass actor in
+  `pull_request` mode only: it may merge a PR past it, never push.
   That `~ALL` ruleset also stops non-admin integrations (Dependabot, `GITHUB_TOKEN` Actions deploys such as
   `gh-pages`) from writing any branch outside `factory/**`.
   Workers get no git/gh tools and run as `_factory`, which cannot reach the owner's keychain (App key) or
@@ -206,6 +215,23 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `DashboardControls`: login + antiforgery). Pipeline rows refresh on `NOTIFY work_items` (triggers on
   `work_items`/`worker_sessions`/`controls`, relayed by `SessionEventRelay` → `PipelineChanges`); session pages join the same
   `SessionBroadcaster` as hub viewers (`ISessionViewers`), so backlog-then-live holds there too. Never log transcript content.
+- Review → CI → MergeGate → Merge (sc-25378; `RunPipeline.Gate.cs`, only in a pipeline built with a `GateStage`, which
+  production always is): Implement records every model that answers the implementer (`implementer-model` checkpoints, from
+  each assistant message's `model`). Review picks the first `Review:Models` entry of a family none of them is
+  (`ModelFamily`; an unknown implementer model or family escalates) and makes one router call (`RouterReviewer`: `POST
+  /v1/messages`, router key only, `x-weave-force-model` pin, its own `X-Claude-Code-Session-Id` so the pin and the cost stay
+  scoped to it) with the story and the diff of the PR's head commit; the verdict (pass/fail, model, served model, family,
+  session) is a `verdict` checkpoint bound to that head SHA. Anything but a clean pass from the pinned family is a fail, and
+  a fail escalates (no fix loop yet). CI polls the head's check runs and commit statuses until finished (none at all keeps
+  waiting until `Gate:CiTimeoutMinutes`); red escalates. MergeGate (`MergeGate.Evaluate`, E1–E3) is deterministic code over
+  facts read fresh each time: `factory/gate.yaml` from the PR's **base** branch (exactly `version: 1`, `require: {ci: green,
+  review: pass}`; missing/invalid/unreadable → no merge, escalate; no bypass key exists), the PR, the head's CI and the
+  ledger's verdicts; each evaluation is a `gate` checkpoint. A head without a verdict (a push after the review) goes back
+  to Review (CI/MergeGate → Review are table rows); otherwise any failed rule escalates. A pass checkpoints `gate-passed`
+  with the head SHA and merges with the gate App's write token and `sha` = that head (GitHub refuses a moved head: 409 →
+  Review); the Merge row's detail is the merge commit. A run that crashed after GitHub merged records Merge only if the
+  merged head is the one `gate-passed` names, else escalates. Merge reports the board Merged (`merged-reported`), then
+  Watch (no handler yet). Gate reads use a read-only gate-App token; only the merge mints a write one.
 - Processes migrate the ledger through `LedgerMigrations.MigrateAsync` (advisory-locked: EF alone lets two concurrent
   migrators apply the same migration) before reading it; tests migrate their temp database before starting a host.
 - Tests: xunit.v3 on Microsoft.Testing.Platform (`global.json` opts in).

@@ -44,7 +44,8 @@ public class FactoryWorkTests
         {
             await WaitForStateAsync(e2e, storyId, WorkState.Review, RunTimeout, ct);
             var transitions = await e2e.TransitionsAsync(storyId, ct);
-            Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Review], transitions.Select(t => t.State));
+            // Since sc-25378 the run goes on from Review (review, CI, merge gate); this test covers the way to Review.
+            Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Review], transitions.Take(3).Select(t => t.State));
             var review = transitions[2];
             var sessionId = Assert.IsType<string>(review.ClaudeSessionId);
             var prUrl = Assert.IsType<string>(review.Detail);
@@ -53,7 +54,7 @@ public class FactoryWorkTests
             await using var db = e2e.Db();
             var repo = RepoRef.Parse((await db.WorkItems.AsNoTracking().SingleAsync(i => i.ExternalId == StoryId.Format(storyId), ct)).Repo);
             var (state, links) = await E2e.StoryAsync(storyId, ct);
-            Assert.Equal("In Progress", state);
+            Assert.Contains(state, new[] { "In Progress", "Done" }); // Done once the gate has merged it
             Assert.Contains(prUrl, links);
             Assert.Contains(RunPipeline.BranchUrl(repo, StoryId.BranchName(storyId)), links);
             var pr = Assert.Single(await E2e.PullRequestsAsync(repo, storyId, ct));
@@ -209,13 +210,17 @@ public class FactoryWorkTests
         Assert.True(result.Ok, $"{action} {scope}: {result.Message}");
     }
 
-    /// <summary>Waits until the item's latest transition is <paramref name="state"/>; fails at once if it escalates instead.</summary>
+    /// <summary>
+    /// Waits until the item has reached <paramref name="state"/> (a transition into it exists: Review is passed through on the
+    /// way to the merge gate since sc-25378); fails at once if it escalates instead.
+    /// </summary>
     internal static Task WaitForStateAsync(E2e e2e, int storyId, WorkState state, TimeSpan timeout, CancellationToken ct) =>
         E2e.WaitForAsync($"{StoryId.Format(storyId)} to reach {state}", timeout, async () =>
         {
-            var last = (await e2e.TransitionsAsync(storyId, ct)).LastOrDefault();
+            var transitions = await e2e.TransitionsAsync(storyId, ct);
+            var last = transitions.LastOrDefault();
             Assert.False(last?.State == WorkState.Escalated && state != WorkState.Escalated, $"{StoryId.Format(storyId)} escalated: {last?.Detail}");
-            return last?.State == state;
+            return transitions.Any(t => t.State == state);
         }, ct);
 
     /// <summary>Waits for a <c>worker-started</c> checkpoint after ledger row <paramref name="after"/>, i.e. a running worker.</summary>
@@ -223,7 +228,7 @@ public class FactoryWorkTests
         E2e.WaitForAsync($"a worker for {StoryId.Format(storyId)}", RunTimeout, async () =>
         {
             var history = await e2e.HistoryAsync(storyId, ct);
-            Assert.False(history.LastOrDefault(e => e.Step is null)?.State is WorkState.Review or WorkState.Escalated,
+            Assert.False(history.Any(e => e.Step is null && e.State is WorkState.Review or WorkState.Escalated),
                 $"{StoryId.Format(storyId)} finished before the control: pick a story that takes the worker longer");
             return history.Any(e => e.Id > after && e.Step == RunPipeline.Steps.WorkerStarted);
         }, ct);

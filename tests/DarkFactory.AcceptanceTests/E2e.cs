@@ -52,6 +52,9 @@ internal sealed class E2e : IAsyncDisposable
         Harness.RequireSecret(o => o.RouterKey);
         Harness.RequireSecret(o => o.GitHubAppId);
         Harness.RequireSecret(o => o.GitHubAppPrivateKeyPem);
+        // `factory work` runs the whole pipeline, review and merge gate included, which needs the gate's own App.
+        Harness.RequireSecret(o => o.GitHubGateAppId);
+        Harness.RequireSecret(o => o.GitHubGateAppPrivateKeyPem);
         Harness.RequireClaude();
         await Harness.RequireRouterAsync();
 

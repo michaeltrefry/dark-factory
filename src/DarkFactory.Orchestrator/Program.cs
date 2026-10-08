@@ -53,7 +53,9 @@ static async Task<int> WorkAsync(CancellationToken ct)
     {
         // Fail fast on a missing credential or a bad scope rather than on the first ready item.
         // Session costs come from the router; intake needs Shortcut and the GitHub App; the dashboard its login.
+        // The merge gate needs its own App and a valid reviewer model list.
         _ = (options.ShortcutApiToken, options.RouterKey, options.GitHubAppId, options.GitHubAppPrivateKeyPem, options.DashboardPasswordHash);
+        _ = (options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, options.ReviewerModels);
         _ = DashboardBinding.Addresses(options.DashboardBindAddress);
         if (options.WatchScope.IsEmpty)
         {
@@ -97,10 +99,10 @@ static async Task<string?> CheckRouterEnrollmentAsync(FactoryOptions options, Ca
 static Task<int> SetDashboardPasswordAsync(CancellationToken ct) =>
     Task.FromResult(SetPassword.Run(new MacKeychain(), SetPassword.ReadConsoleSecret, Console.Out, Console.Error));
 
-static async Task<int> SetupGitHubAppAsync(string name, int port, CancellationToken ct)
+static async Task<int> SetupGitHubAppAsync(string name, int port, bool gate, CancellationToken ct)
 {
     using var http = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
-    await new GitHubAppSetup(http, new MacKeychain(), Console.Out).RunAsync(name, port, ct);
+    await new GitHubAppSetup(http, new MacKeychain(), Console.Out, gate).RunAsync(name, port, ct);
     return 0;
 }
 
@@ -113,8 +115,11 @@ static async Task<int> ProtectRepoAsync(RepoRef repo, CancellationToken ct)
         Console.Error.WriteLine("No admin GitHub token: set GH_TOKEN or run `gh auth login`.");
         return 2;
     }
+    // With the merge gate's App registered, it may merge pull requests past the rulesets (and only that).
+    var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
+    long? gateAppId = options.TryGet(o => o.GitHubGateAppId, out var id) && long.TryParse(id, out var parsed) ? parsed : null;
     using var http = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
-    return await RepoProtection.RunAsync(http, token, repo, Console.Out, Console.Error, ct);
+    return await RepoProtection.RunAsync(http, token, repo, Console.Out, Console.Error, ct, gateAppId);
 }
 
 static string? GhAuthToken()
