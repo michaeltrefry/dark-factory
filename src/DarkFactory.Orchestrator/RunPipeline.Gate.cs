@@ -91,9 +91,9 @@ public sealed partial class RunPipeline
         var (history, pull) = await ReadPullAsync(run, ct);
         EnsureOpen(pull);
         var fix = PendingFixRound(history);
-        if (fix is not null && fix.PushedHead != fix.FixedHead && pull.HeadSha == fix.FixedHead)
+        if (fix is not null && pull.HeadSha != fix.PushedHead)
         {
-            pull = await WaitForPushedHeadAsync(run, fix, ct);
+            pull = await WaitForPushedHeadAsync(run, fix, pull, ct);
         }
         var verdicts = Verdicts(history);
         var previous = fix is null ? null
@@ -173,14 +173,25 @@ public sealed partial class RunPipeline
     }
 
     /// <summary>
-    /// GitHub may show the PR's old head for a moment after the fixer's push: polls the PR until its head moves off the fixed
-    /// commit (controls checked between polls); still there after the CI timeout → escalate.
+    /// GitHub may show the PR's old head for a moment after the fixer's push: polls the PR until its head is the fixer's
+    /// pushed commit (controls checked between polls); still the fixed commit after the CI timeout → escalate. A head that
+    /// is neither (someone else pushed) escalates: it is not this round's work, and must not be judged as it.
     /// </summary>
-    private async Task<PullFacts> WaitForPushedHeadAsync(Run run, FixRound fix, CancellationToken ct)
+    private async Task<PullFacts> WaitForPushedHeadAsync(Run run, FixRound fix, PullFacts pull, CancellationToken ct)
     {
         var deadline = GateTime.GetUtcNow() + Gate.CiTimeout;
         while (true)
         {
+            if (pull.HeadSha == fix.PushedHead)
+            {
+                return pull;
+            }
+            if (pull.HeadSha != fix.FixedHead)
+            {
+                throw new InvalidOperationException(
+                    $"{pull.HtmlUrl}'s head is {pull.HeadSha}, neither the commit fix round {fix.Round} fixed ({fix.FixedHead}) nor the one it pushed "
+                    + $"({fix.PushedHead}): a push from outside the factory; it is not judged as the fix round.");
+            }
             log.WriteLine($"[review] the PR still shows {Ci.Short(fix.FixedHead)}, not fix round {fix.Round}'s push {Ci.Short(fix.PushedHead ?? "")}; checking again in {Gate.CiPollInterval}");
             if (GateTime.GetUtcNow() >= deadline)
             {
@@ -188,12 +199,8 @@ public sealed partial class RunPipeline
             }
             await Task.Delay(Gate.CiPollInterval, GateTime, ct);
             await ThrowIfControlledAsync(run.Item, ct);
-            var (_, pull) = await ReadPullAsync(run, ct);
+            (_, pull) = await ReadPullAsync(run, ct);
             EnsureOpen(pull);
-            if (pull.HeadSha != fix.FixedHead)
-            {
-                return pull;
-            }
         }
     }
 
@@ -201,8 +208,12 @@ public sealed partial class RunPipeline
     /// The fix round's progress check (<see cref="FixLoop.Judge"/>). The blocking counts come from the two verdicts; whether a
     /// check that passed on the fixed commit now fails comes from GitHub's executed check results on both commits (E5: never
     /// the fixer's report). That needs only be read when the blocking findings went down (otherwise the round failed anyway):
-    /// it waits (polling, controls checked) until each check that passed before has finished on the new head, or one fails;
-    /// a check still unknown after the CI timeout escalates, since the progress cannot be judged.
+    /// it first waits (polling, controls checked) until the fixed commit's CI has finished (<see cref="FixLoop.Settled"/>: the
+    /// review failed it before CI was awaited), then until each check that passed there — or reached no verdict there
+    /// (cancelled, e.g. by a concurrency group when the fixer pushed: <see cref="FixLoop.UnknownChecks"/>), which is compared
+    /// the same way — has finished on the new head, or one fails. Once the new head's CI has finished, such a check with no
+    /// run there is a regression. Either commit's CI not read in full is a failed round. A check still unfinished after the
+    /// CI timeout escalates, since the progress cannot be judged.
     /// </summary>
     private async Task<FixProgress> FixProgressAsync(Run run, int round, ReviewVerdict previous, ReviewVerdict current, CancellationToken ct)
     {
@@ -211,22 +222,53 @@ public sealed partial class RunPipeline
         {
             return judged;
         }
-        var passed = FixLoop.PassedChecks(await Gate.GitHub.GetCiAsync(run.Repo, previous.HeadSha, ct));
         var deadline = GateTime.GetUtcNow() + Gate.CiTimeout;
+        CiFacts before;
         while (true)
         {
-            var (failing, pending) = FixLoop.Regressions(passed, await Gate.GitHub.GetCiAsync(run.Repo, current.HeadSha, ct));
-            if (failing.Count > 0 || pending.Count == 0)
+            before = await Gate.GitHub.GetCiAsync(run.Repo, previous.HeadSha, ct);
+            if (!before.Complete || FixLoop.Settled(before))
             {
-                return FixLoop.Judge(round, previous, current, passed, failing);
+                break;
             }
+            var why = Ci.Evaluate(before).Why;
+            if (GateTime.GetUtcNow() >= deadline)
+            {
+                throw new TimeoutException(
+                    $"CI on {Ci.Short(previous.HeadSha)}, the commit fix round {round} fixed, did not finish within {Gate.CiTimeout} ({why}), "
+                    + $"so fix round {round}'s progress cannot be judged.");
+            }
+            log.WriteLine($"[fix] waiting for CI on the fixed commit to judge round {round}: {why}");
+            await Task.Delay(Gate.CiPollInterval, GateTime, ct);
+            await ThrowIfControlledAsync(run.Item, ct);
+        }
+        if (!before.Complete)
+        {
+            return FixLoop.Judge(round, previous, current, [], [], unread: previous.HeadSha);
+        }
+        var passed = FixLoop.PassedChecks(before);
+        var unknown = FixLoop.UnknownChecks(before);
+        var watched = passed.Concat(unknown).ToList();
+        while (true)
+        {
+            var now = await Gate.GitHub.GetCiAsync(run.Repo, current.HeadSha, ct);
+            if (!now.Complete)
+            {
+                return FixLoop.Judge(round, previous, current, passed, [], unknown, unread: current.HeadSha);
+            }
+            var (failing, missing, pending) = FixLoop.Regressions(watched, now);
+            if (failing.Count > 0 || (pending.Count == 0 && (missing.Count == 0 || FixLoop.Settled(now))))
+            {
+                return FixLoop.Judge(round, previous, current, passed, failing, unknown, failing.Count > 0 ? [] : missing);
+            }
+            var waiting = pending.Concat(missing).ToList();
             if (GateTime.GetUtcNow() >= deadline)
             {
                 throw new TimeoutException(
                     $"Checks that passed on {Ci.Short(previous.HeadSha)} did not finish on {Ci.Short(current.HeadSha)} within {Gate.CiTimeout} "
-                    + $"({string.Join(", ", pending)}), so fix round {round}'s progress cannot be judged.");
+                    + $"({string.Join(", ", waiting)}), so fix round {round}'s progress cannot be judged.");
             }
-            log.WriteLine($"[fix] waiting for {string.Join(", ", pending)} on {Ci.Short(current.HeadSha)} to judge round {round}");
+            log.WriteLine($"[fix] waiting for {string.Join(", ", waiting)} on {Ci.Short(current.HeadSha)} to judge round {round}");
             await Task.Delay(Gate.CiPollInterval, GateTime, ct);
             await ThrowIfControlledAsync(run.Item, ct);
         }
@@ -339,11 +381,14 @@ public sealed partial class RunPipeline
                     resume => resume is null ? BuildFixPrompt(spec, repo, round, findings) : BuildFixResumePrompt(spec.Story, round), models, "fix", ct);
             }
             await ThrowIfControlledAsync(item, ct);
-            if (!await workspaces.CommitAndPushAsync(repo, workspace, $"{StoryId.Format(spec.Story.Id)}: fix review findings (round {round})", ct))
-            {
-                throw new InvalidOperationException($"Fix round {round} left the branch with nothing to push.");
-            }
+            // The PR branch is always ahead of the base, so this pushes even when the fixer changed nothing (the same head):
+            // that round is judged like any other (no fewer blocking findings: a failed round).
+            await workspaces.CommitAndPushAsync(repo, workspace, $"{StoryId.Format(spec.Story.Id)}: fix review findings (round {round})", ct);
             pushed = await workspaces.HeadAsync(workspace, ct);
+            if (pushed == fixedHead)
+            {
+                log.WriteLine($"[fix] round {round}: the fixer changed nothing; the head stays {Ci.Short(pushed)}");
+            }
             await ledger.CheckpointAsync(item, Steps.Pushed, session, pushed, ct);
         }
         else

@@ -74,9 +74,13 @@ public class GatePipelineTests
             return Task.FromResult(PolicyText);
         }
 
+        /// <summary>Runs on each CI read, with the commit, before it is answered (e.g. to let a check finish, or to crash).</summary>
+        public Action<string>? OnCiRead { get; set; }
+
         public Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct)
         {
             Calls.Add($"ci {sha}");
+            OnCiRead?.Invoke(sha);
             return Task.FromResult(Ci.TryGetValue(sha, out var facts) ? facts : Green(sha));
         }
 
@@ -208,6 +212,8 @@ public class GatePipelineTests
         /// <summary>When set, the panel's calls go here instead of <see cref="Reviewer"/> (e.g. a real <see cref="RouterReviewer"/>).</summary>
         public IReviewer? Panel { get; init; }
         public ReviewPanelModels Models { get; init; } = ReviewPanelModels.Default;
+        /// <summary>When set, the gate's waits run on <see cref="Time"/> (which only moves when the test advances it).</summary>
+        public bool GateOnFakeClock { get; init; }
         public WorkLedger Ledger => new(Db, TimeProvider.System);
 
         public Task<RunOutcome> Run(string? implementerModel = ImplementerModel, CancellationToken ct = default) =>
@@ -216,7 +222,7 @@ public class GatePipelineTests
         public Task<RunOutcome> Run(string?[] implementerModels, CancellationToken ct = default) =>
             new RunPipeline(Stories, Ledger, Locks, Workspaces, new HarnessWorker(this, implementerModels), Prs, Sandbox, TextWriter.Null,
                     controls: Controls,
-                    gate: new GateStage(GitHub, Panel ?? Reviewer, Models, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5)))
+                    gate: new GateStage(GitHub, Panel ?? Reviewer, Models, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5), GateOnFakeClock ? Time : null))
                 .RunAsync(77, ct);
 
         /// <summary>The implementer reports <c>implementerModels</c>; every later session (a fixer) reports <see cref="FixerModels"/>.</summary>

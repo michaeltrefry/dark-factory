@@ -42,6 +42,10 @@ public class FixLoopTests
         Assert.Equal((ShaA, ReviewVerdict.Pass), (verdict.HeadSha, verdict.Verdict));
         Assert.Equal([(ReviewRoles.Correctness, (string?)null), (ReviewRoles.SpecConformance, Sha1)], verdict.Reviews.Select(r => (r.Role, r.CarriedFrom)));
         Assert.Equal([$"merge 1 {ShaA}"], h.Merges);
+        // The merge record names the carried review and the commit it was made on.
+        var gate = (await h.Rows()).Single(r => r.Step == RunPipeline.Steps.GateDecision).Detail!;
+        Assert.Contains($"{ReviewRoles.SpecConformance}: gpt-5.5 (openai), carried from {Sha1[..12]}", gate);
+        Assert.DoesNotContain($"{ReviewRoles.Correctness}: gpt-5.5 (openai), carried", gate);
 
         // The fixer: a second worker session, in a worktree restored from the PR branch, given the story and the confirmed
         // finding (fenced: its text cannot close the block) and nothing else from the review; its work pushed to the same branch.
@@ -277,9 +281,206 @@ public class FixLoopTests
         Assert.Equal(["a", "d"], FixLoop.PassedChecks(before));
 
         var now = new CiFacts(ShaA, [new("a", true, "failure"), new("d", false, null)]);
-        var (failing, pending) = FixLoop.Regressions(["a", "d", "e"], now);
+        var (failing, missing, pending) = FixLoop.Regressions(["a", "d", "e"], now);
         Assert.Equal(["a"], failing);
-        Assert.Equal(["d", "e"], pending);
+        Assert.Equal(["e"], missing);
+        Assert.Equal(["d"], pending);
+
+        // No verdict: still running, cancelled, stale, or no conclusion — and no run of the name failed.
+        var unknown = new CiFacts(Sha1, [new("a", true, "success"), new("b", true, "failure"), new("c", false, null), new("d", true, "cancelled"),
+            new("e", true, "stale"), new("f", true, null), new("g", true, "cancelled"), new("g", true, "failure")]);
+        Assert.Equal(["c", "d", "e", "f"], FixLoop.UnknownChecks(unknown));
+
+        Assert.True(FixLoop.Settled(new CiFacts(Sha1, [new("a", true, "failure")])));
+        Assert.False(FixLoop.Settled(new CiFacts(Sha1, [new("a", true, "failure"), new("b", false, null)])));
+        Assert.False(FixLoop.Settled(new CiFacts(Sha1, [])));
+        Assert.False(FixLoop.Settled(new CiFacts(Sha1, [new("a", true, "success")], Complete: false)));
+        Assert.False(FixLoop.Settled(new CiFacts(Sha1, [new("a", true, "success")], Suites: [new(Orchestrator.Gate.Ci.ActionsApp, false, null, 0)])));
+    }
+
+    [Fact]
+    public async Task The_progress_check_waits_for_the_fixed_heads_ci_before_reading_what_passed_there()
+    {
+        var h = new Harness
+        {
+            Reviewer = ReviewerFor(new()
+            {
+                [ReviewRoles.Correctness] = new() { [Sha1] = [Blocking("one"), Blocking("two")], [ShaA] = [Blocking("two")] },
+            }),
+        };
+        // The fixed head failed review before its CI was awaited: unit-tests is still running on the first read.
+        h.GitHub.Ci[Sha1] = new CiFacts(Sha1, [new("build", true, "success"), new("unit-tests", false, null)]);
+        var sha1Reads = 0;
+        h.GitHub.OnCiRead = sha =>
+        {
+            if (sha == Sha1 && ++sha1Reads == 2)
+            {
+                h.GitHub.Ci[Sha1] = Ci(Sha1, ("build", "success"), ("unit-tests", "success"));
+            }
+        };
+        h.GitHub.Ci[ShaA] = Ci(ShaA, ("build", "success"), ("unit-tests", "failure"));
+        h.GitHub.Ci[ShaB] = Ci(ShaB, ("build", "success"), ("unit-tests", "success"));
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        var progress = await Progress(h);
+        Assert.Equal(["build", "unit-tests"], progress[0].PassedBefore);
+        Assert.Empty(progress[0].UnknownBefore);
+        Assert.Equal(FixProgress.Failed, progress[0].Outcome);
+        Assert.Equal(["unit-tests"], progress[0].FailingNow);
+    }
+
+    [Theory]
+    [InlineData("failure", FixProgress.Failed)]
+    [InlineData("success", FixProgress.Progress)]
+    public async Task A_check_cancelled_on_the_fixed_head_is_compared_on_the_new_head_like_one_that_passed(string now, string outcome)
+    {
+        var h = new Harness
+        {
+            Reviewer = ReviewerFor(new()
+            {
+                [ReviewRoles.Correctness] = new() { [Sha1] = [Blocking("one"), Blocking("two")], [ShaA] = [Blocking("two")] },
+            }),
+        };
+        // The fixer's push cancelled unit-tests on the fixed head (a concurrency group): it never reached a verdict there.
+        h.GitHub.Ci[Sha1] = Ci(Sha1, ("build", "success"), ("unit-tests", "cancelled"));
+        h.GitHub.Ci[ShaA] = Ci(ShaA, ("build", "success"), ("unit-tests", now));
+        h.GitHub.Ci[ShaB] = Ci(ShaB, ("build", "success"), ("unit-tests", "success"));
+
+        var run = await h.Run();
+
+        Assert.True(run.Succeeded, run.Error);
+        var round = (await Progress(h))[0];
+        Assert.Equal(outcome, round.Outcome);
+        Assert.Equal(["build"], round.PassedBefore);
+        Assert.Equal(["unit-tests"], round.UnknownBefore);
+        Assert.Contains("unit-tests", round.Reason);
+        Assert.Contains($"no verdict on {Sha1[..12]}", round.Reason);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Ci_that_could_not_be_read_in_full_makes_a_failed_round(bool onTheFixedHead)
+    {
+        var h = new Harness
+        {
+            Reviewer = ReviewerFor(new()
+            {
+                [ReviewRoles.Correctness] = new() { [Sha1] = [Blocking("one"), Blocking("two")], [ShaA] = [Blocking("two")] },
+            }),
+        };
+        var unread = onTheFixedHead ? Sha1 : ShaA;
+        h.GitHub.Ci[Sha1] = Ci(Sha1, ("build", "success"));
+        h.GitHub.Ci[ShaA] = Ci(ShaA, ("build", "success"));
+        h.GitHub.Ci[unread] = h.GitHub.Ci[unread] with { Complete = false };
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        var round = (await Progress(h))[0];
+        Assert.Equal(FixProgress.Failed, round.Outcome);
+        Assert.StartsWith($"CI could not be read in full on {unread[..12]}", round.Reason);
+    }
+
+    [Fact]
+    public async Task A_check_that_passed_before_and_has_no_run_on_the_finished_new_head_is_a_failed_round()
+    {
+        var h = new Harness
+        {
+            Reviewer = ReviewerFor(new()
+            {
+                [ReviewRoles.Correctness] = new() { [Sha1] = [Blocking("one"), Blocking("two")], [ShaA] = [Blocking("two")] },
+            }),
+        };
+        h.GitHub.Ci[Sha1] = Ci(Sha1, ("build", "success"), ("unit-tests", "success"));
+        h.GitHub.Ci[ShaA] = Ci(ShaA, ("build", "success")); // the fix removed (or renamed) the unit-tests job
+        h.GitHub.Ci[ShaB] = Ci(ShaB, ("build", "success"));
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        var round = (await Progress(h))[0];
+        Assert.Equal(FixProgress.Failed, round.Outcome);
+        Assert.Equal(["unit-tests"], round.FailingNow);
+        Assert.Contains($"missing on {ShaA[..12]}: unit-tests", round.Reason);
+    }
+
+    [Fact]
+    public async Task A_head_that_is_not_the_fixers_push_escalates_without_being_judged_as_the_round()
+    {
+        var h = new Harness
+        {
+            FixHeads = [ShaC],
+            Reviewer = ReviewerFor(new() { [ReviewRoles.Correctness] = new() { [Sha1] = [Blocking("one")] } }),
+        };
+        // The fixer pushed ShaA, but by the time the review reads the PR someone else has pushed ShaC.
+        h.Workspaces.Head = () => h.GitHub.Head == ShaC ? ShaA : h.GitHub.Head;
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains($"head is {ShaC}", outcome.Error);
+        Assert.DoesNotContain(h.Reviewer.Requests, r => r.Pull.HeadSha == ShaC);
+        Assert.Empty(await Progress(h));
+        Assert.Empty(h.Merges);
+    }
+
+    [Fact]
+    public async Task A_check_still_unfinished_on_the_new_head_at_the_ci_timeout_escalates_without_a_progress_record()
+    {
+        var h = new Harness
+        {
+            GateOnFakeClock = true,
+            Reviewer = ReviewerFor(new() { [ReviewRoles.Correctness] = new() { [Sha1] = [Blocking("one")] } }),
+        };
+        h.GitHub.Ci[ShaA] = new CiFacts(ShaA, [new("build-test", false, null)]);
+        h.GitHub.OnCiRead = sha =>
+        {
+            if (sha == ShaA)
+            {
+                h.Time.Advance(TimeSpan.FromMinutes(10)); // past the 5 s CI timeout
+            }
+        };
+
+        var outcome = await h.Run().WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains("fix round 1's progress cannot be judged", outcome.Error);
+        Assert.Contains("build-test", outcome.Error);
+        Assert.Empty(await Progress(h));
+        Assert.Contains("fix round 1's progress cannot be judged", h.Stories.Comments.Single());
+        Assert.Empty(h.Merges);
+    }
+
+    [Fact]
+    public async Task A_crash_after_the_verdict_but_before_the_progress_check_does_not_review_again_and_records_one_progress_check()
+    {
+        var h = new Harness { Reviewer = ReviewerFor(new() { [ReviewRoles.Correctness] = new() { [Sha1] = [Blocking("one")] } }) };
+        using var crash = new CancellationTokenSource();
+        h.GitHub.OnCiRead = sha =>
+        {
+            if (sha == Sha1) // the progress check's first read, after the verdict on ShaA was checkpointed
+            {
+                crash.Cancel();
+                throw new OperationCanceledException(crash.Token);
+            }
+        };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => h.Run(ct: crash.Token));
+        Assert.Contains(await h.Verdicts(), v => v.HeadSha == ShaA);
+        Assert.Empty(await Progress(h));
+        h.GitHub.OnCiRead = null;
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Single(h.Reviewer.Requests, r => r.Pull.HeadSha == ShaA);
+        var progress = (await Progress(h)).Single(); // the judged record, not a placeholder written before the CI reads
+        Assert.Equal(FixProgress.Progress, progress.Outcome);
+        Assert.Equal(["build-test"], progress.PassedBefore);
+        Assert.Equal([$"merge 1 {ShaA}"], h.Merges);
     }
 
     [Fact]

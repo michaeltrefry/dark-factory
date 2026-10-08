@@ -14,8 +14,10 @@ public sealed record OpenFinding(string Role, Finding Finding)
 /// <summary>
 /// One fix round's progress check (sc-25380), stored as the <c>fix-progress</c> checkpoint: the fixed commit and the commit
 /// the fixer pushed, the blocking findings on each (from the panel's verdicts), the CI checks that passed on the fixed
-/// commit and those of them that fail on the new one (from GitHub's executed check results, never the fixer's report, E5),
-/// and the outcome: <see cref="Progress"/> or <see cref="Failed"/>.
+/// commit, those that reached no verdict there (<c>unknown_before</c>: cancelled, stale or without a conclusion — compared
+/// on the new head like a passed one, since nothing shows they were already failing), and those of them that fail or have no
+/// run on the new one (from GitHub's executed check results, never the fixer's report, E5), and the outcome:
+/// <see cref="Progress"/> or <see cref="Failed"/>.
 /// </summary>
 public sealed record FixProgress(
     [property: JsonPropertyName("round")] int Round,
@@ -24,6 +26,7 @@ public sealed record FixProgress(
     [property: JsonPropertyName("blocking_before")] int BlockingBefore,
     [property: JsonPropertyName("blocking_after")] int BlockingAfter,
     [property: JsonPropertyName("passed_before")] IReadOnlyList<string> PassedBefore,
+    [property: JsonPropertyName("unknown_before")] IReadOnlyList<string> UnknownBefore,
     [property: JsonPropertyName("failing_now")] IReadOnlyList<string> FailingNow,
     [property: JsonPropertyName("outcome")] string Outcome,
     [property: JsonPropertyName("reason")] string Reason)
@@ -46,7 +49,7 @@ public sealed record FixProgress(
         try
         {
             return JsonSerializer.Deserialize<FixProgress>(detail) is { FromSha: not null, Outcome: not null } p
-                ? p with { PassedBefore = p.PassedBefore ?? [], FailingNow = p.FailingNow ?? [] }
+                ? p with { PassedBefore = p.PassedBefore ?? [], UnknownBefore = p.UnknownBefore ?? [], FailingNow = p.FailingNow ?? [] }
                 : null;
         }
         catch (JsonException)
@@ -128,36 +131,69 @@ public static class FixLoop
             .ToList();
 
     /// <summary>
-    /// Of <paramref name="passedBefore"/>, the checks that fail on <paramref name="now"/> (a run of the name finished without
-    /// passing) and those not yet known there (no run of the name reported, or one still running).
+    /// The CI checks that reached no verdict on a commit: not passed, and no run of the name finished with a failing
+    /// conclusion — each run that did not pass is still running, was cancelled (e.g. by a concurrency group when the fixer
+    /// pushed), went stale, or finished without a conclusion.
     /// </summary>
-    public static (IReadOnlyList<string> Failing, IReadOnlyList<string> Pending) Regressions(IReadOnlyList<string> passedBefore, CiFacts now)
+    public static IReadOnlyList<string> UnknownChecks(CiFacts facts) =>
+        facts.Checks.GroupBy(c => c.Name, StringComparer.Ordinal)
+            .Where(g => !g.All(c => c.Completed && Ci.Passes(c.Conclusion)) && !g.Any(c => c.Completed && !Ci.Passes(c.Conclusion) && !NoVerdict(c)))
+            .Select(g => g.Key)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+
+    private static bool NoVerdict(CheckFact check) => !check.Completed || check.Conclusion is null or "cancelled" or "stale";
+
+    /// <summary>
+    /// Whether a commit's CI has finished: it was read in full, has at least one check, and every check run and counted check
+    /// suite (<see cref="Ci.CountedSuites"/>) is completed.
+    /// </summary>
+    public static bool Settled(CiFacts facts) =>
+        facts.Complete && facts.Checks.Count > 0 && facts.Checks.All(c => c.Completed) && Ci.CountedSuites(facts).All(s => s.Completed);
+
+    /// <summary>
+    /// Of <paramref name="watched"/> (the checks that passed, or reached no verdict, on the fixed commit), the checks that fail
+    /// on <paramref name="now"/> (a run of the name finished without passing), those with no run of the name there, and those
+    /// with one still running.
+    /// </summary>
+    public static (IReadOnlyList<string> Failing, IReadOnlyList<string> Missing, IReadOnlyList<string> Pending) Regressions(
+        IReadOnlyList<string> watched, CiFacts now)
     {
-        var failing = new List<string>();
-        var pending = new List<string>();
-        foreach (var name in passedBefore)
+        var (failing, missing, pending) = (new List<string>(), new List<string>(), new List<string>());
+        foreach (var name in watched)
         {
             var runs = now.Checks.Where(c => c.Name == name).ToList();
             if (runs.Any(c => c.Completed && !Ci.Passes(c.Conclusion)))
             {
                 failing.Add(name);
             }
-            else if (runs.Count == 0 || runs.Any(c => !c.Completed))
+            else if (runs.Count == 0)
+            {
+                missing.Add(name);
+            }
+            else if (runs.Any(c => !c.Completed))
             {
                 pending.Add(name);
             }
         }
-        return (failing, pending);
+        return (failing, missing, pending);
     }
 
     /// <summary>
-    /// The round's outcome: progress only when the blocking findings went down and no check that passed on the fixed commit
-    /// fails on the new one; otherwise a failed round, with why.
+    /// The round's outcome: progress only when the new head's review is usable, the blocking findings went down, both
+    /// commits' CI was read in full (<paramref name="unread"/> names the commit that was not), and no check that passed — or
+    /// reached no verdict (<paramref name="unknownBefore"/>) — on the fixed commit fails (<paramref name="failingNow"/>) or has
+    /// no run (<paramref name="missingNow"/>) on the new one; otherwise a failed round, with why.
     /// </summary>
     public static FixProgress Judge(int round, ReviewVerdict previous, ReviewVerdict current, IReadOnlyList<string> passedBefore,
-        IReadOnlyList<string> failingNow)
+        IReadOnlyList<string> failingNow, IReadOnlyList<string>? unknownBefore = null, IReadOnlyList<string>? missingNow = null,
+        string? unread = null)
     {
+        var unknown = unknownBefore ?? [];
+        var missing = missingNow ?? [];
         var (before, after) = (Open(previous).Count, Open(current).Count);
+        var (from, to) = (Ci.Short(previous.HeadSha), Ci.Short(current.HeadSha));
+        string Named(string name) => unknown.Contains(name) ? $"{name} (no verdict on {from})" : name;
         string? failed = null;
         if (current.Reviews.Any(r => !r.Clean))
         {
@@ -167,12 +203,23 @@ public static class FixLoop
         {
             failed = $"blocking findings did not go down ({before} → {after})";
         }
-        else if (failingNow.Count > 0)
+        else if (unread is not null)
         {
-            failed = $"checks that passed on {Ci.Short(previous.HeadSha)} fail on {Ci.Short(current.HeadSha)}: {string.Join(", ", failingNow)}";
+            failed = $"CI could not be read in full on {Ci.Short(unread)}, so no check can be shown not to have regressed";
         }
-        return new FixProgress(round, previous.HeadSha, current.HeadSha, before, after, passedBefore, failingNow,
+        else if (failingNow.Count > 0 || missing.Count > 0)
+        {
+            failed = string.Join("; ", new[]
+            {
+                failingNow.Count > 0 ? $"checks that passed on {from} fail on {to}: {string.Join(", ", failingNow.Select(Named))}" : null,
+                missing.Count > 0 ? $"checks that passed on {from} are missing on {to}: {string.Join(", ", missing.Select(Named))}" : null,
+            }.OfType<string>());
+        }
+        var progress = $"blocking findings {before} → {after}; no check that passed on {from} fails"
+            + (unknown.Count > 0 ? $"; {string.Join(", ", unknown)} reached no verdict on {from} (cancelled or unfinished) and pass on {to}" : "");
+        return new FixProgress(round, previous.HeadSha, current.HeadSha, before, after, passedBefore, unknown,
+            [.. failingNow, .. missing],
             failed is null ? FixProgress.Progress : FixProgress.Failed,
-            failed ?? $"blocking findings {before} → {after}; no check that passed on {Ci.Short(previous.HeadSha)} fails");
+            failed ?? progress);
     }
 }
