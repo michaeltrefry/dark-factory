@@ -1,0 +1,148 @@
+#!/bin/bash
+# factory-worker-launch — runs one Dark Factory worker command as the sandbox user.
+#
+# Installed root-owned at /usr/local/libexec/dark-factory/factory-worker-launch by
+# scripts/setup-worker-user.sh (which sets sandbox_user below); the orchestrator runs it with
+#   sudo -n -u _factory factory-worker-launch <program> [args...]
+#
+# Protocol (stdin):
+#   KEY=VALUE lines for the router variables, then one empty line. The orchestrator
+#   keeps stdin open for the life of the run; when stdin closes (Stop, timeout, or the
+#   orchestrator died) the worker is killed.
+#
+# The worker gets a fresh environment: HOME (from the password database, never the
+# caller's), a fixed PATH, MSBuild/dotnet settings that keep build servers from
+# lingering, and only the allowlisted router variables (E1/E5).
+#
+# Killing: the worker's process tree and process group, and then — when running as the
+# sandbox user — every other process of that user, which also catches anything that
+# forked and setsid()'d away (MSBuild node reuse, the dotnet build server, a hostile
+# worker). That makes the sandbox user single-tenant: only one helper may run at a time,
+# which the orchestrator enforces with its work-root lock (WorkerLock).
+#
+# Exit status: the worker's (137 when a Stop killed it). The uid sweep spares this helper's
+# own pid and its descendants (the sweep's own ps and subshells); kill -1 does not on macOS
+# (it signals the sender too), so the helper used to kill itself and every run exited 137.
+set -eu
+
+sandbox_user=_factory
+
+usage() {
+    echo "usage: factory-worker-launch <program> [args...] (router variables on stdin)" >&2
+    exit 64
+}
+
+[ $# -ge 1 ] || usage
+# env(1) would take NAME=value as a variable (bypassing the allowlist) and a leading '-' as
+# an option, so the program must be an absolute path or a plain command name.
+case "$1" in
+    *=* | -* | '') usage ;;
+    /*) ;;
+    */*) usage ;;
+esac
+
+vars=()
+terminated=0
+while IFS= read -r line; do
+    if [ -z "$line" ]; then
+        terminated=1
+        break
+    fi
+    case "$line" in
+        ANTHROPIC_BASE_URL=* | ANTHROPIC_CUSTOM_HEADERS=* | ANTHROPIC_AUTH_TOKEN=*) vars+=("$line") ;;
+        *)
+            echo "factory-worker-launch: refusing non-allowlisted variable '${line%%=*}'" >&2
+            exit 64
+            ;;
+    esac
+done
+if [ "$terminated" -ne 1 ]; then
+    echo "factory-worker-launch: stdin closed before the variable block ended" >&2
+    exit 64
+fi
+
+# With HOME unset, ~ is the running user's home from the password database.
+unset HOME
+home=~
+path="$home/.local/bin:/usr/local/share/dotnet:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+# Stops a process and all of its descendants: freeze top-down so nothing can fork
+# away, then kill everything collected.
+collect_tree() {
+    local child
+    kill -STOP "$1" 2>/dev/null || return 0
+    echo "$1"
+    for child in $(pgrep -P "$1" || true); do
+        collect_tree "$child"
+    done
+}
+
+# Sends SIGKILL to the given pids: the one primitive the tests replace.
+kill_pids() { kill -KILL "$@" 2>/dev/null || true; }
+
+# Decided once, up front. Never as anyone else: as the owner (e.g. running this script
+# directly) the sweep would take down their whole session.
+self_uid=$(id -u)
+is_sandbox_user=0
+[ "$(id -un)" != "$sandbox_user" ] || is_sandbox_user=1
+
+# "pid ppid" for every process of the sandbox user, by real and effective uid (also catches
+# setuid programs the worker started). ps, not pgrep: macOS pgrep silently drops its own
+# ancestors, hiding what the exclusions below are for.
+list_uid_procs() { { ps -U "$self_uid" -o pid=,ppid=; ps -u "$self_uid" -o pid=,ppid=; } 2>/dev/null || true; }
+
+# The pids of a "pid ppid" listing that are not descendants of pid $1. The sweep's own
+# machinery (the $(...) subshell, ps, awk) runs as the sandbox user with fresh pids every
+# pass; counted as survivors, the sweep never settled. The worker is reaped by then, so what
+# it left behind has been reparented away from the helper and is still listed.
+outside_tree() {
+    awk -v root="$1" '{ up[$1] = $2 }
+        END { for (p in up) { q = up[p]; n = 0
+                  while (q != root && (q in up) && n++ < 100000) q = up[q]
+                  if (q != root) print p } }'
+}
+
+# Every process of the sandbox user except this helper ($$) and its descendants (the watcher
+# is reaped before this runs). Repeats until a listing turns up nothing new, so anything
+# forked mid-sweep is caught on the next pass; SIGKILL can't be refused, so each pid is
+# signalled once.
+kill_sandbox_user() {
+    [ "$is_sandbox_user" -eq 1 ] || return 0
+    local pass pid fresh signalled=" "
+    for pass in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        fresh=()
+        for pid in $(list_uid_procs | outside_tree "$$"); do
+            [ "$pid" != "$$" ] || continue
+            case "$signalled" in *" $pid "*) continue ;; esac
+            signalled="$signalled$pid "
+            fresh+=("$pid")
+        done
+        [ ${#fresh[@]} -gt 0 ] || return 0
+        kill_pids "${fresh[@]}"
+    done
+    echo "factory-worker-launch: $sandbox_user processes still appearing after $pass sweeps" >&2
+}
+
+set -m # the worker gets its own process group
+/usr/bin/env -i "HOME=$home" "PATH=$path" MSBUILDDISABLENODEREUSE=1 DOTNET_CLI_USE_MSBUILD_SERVER=0 \
+    ${vars[@]+"${vars[@]}"} "$@" </dev/null &
+worker=$!
+set +m
+
+(
+    while IFS= read -r _; do :; done
+    # shellcheck disable=SC2046 # word splitting of the pid list is intended
+    kill -KILL $(collect_tree "$worker") 2>/dev/null || true
+    kill -KILL -- "-$worker" 2>/dev/null || true
+    # The uid sweep is the main shell's, after the worker is reaped; from here it would race
+    # (and could kill) the main shell's own commands.
+) <&0 & # explicit, or bash gives background jobs /dev/null as stdin
+watcher=$!
+
+status=0
+wait "$worker" || status=$?
+kill "$watcher" 2>/dev/null || true
+wait "$watcher" 2>/dev/null || true # gone before the sweep, which then spares only $$
+kill -KILL -- "-$worker" 2>/dev/null || true # nothing the worker started outlives the run
+kill_sandbox_user
+exit "$status"

@@ -1,0 +1,25 @@
+@page "/login"
+@attribute [AllowAnonymous]
+
+<PageTitle>Log in · Dark Factory</PageTitle>
+
+<h1>Log in</h1>
+<form method="post" action="@DashboardAuth.LoginPostPath" class="login">
+    <AntiforgeryToken />
+    <input type="hidden" name="returnUrl" value="@ReturnUrl" />
+    <input type="text" name="username" value="dashboard" autocomplete="username" hidden />
+    <label>Password <input type="password" name="password" autocomplete="current-password" autofocus required /></label>
+    @if (Error is not null)
+    {
+        <p class="error">Wrong password.</p>
+    }
+    <button type="submit">Log in</button>
+</form>
+
+@code {
+    [SupplyParameterFromQuery]
+    public string? ReturnUrl { get; set; }
+
+    [SupplyParameterFromQuery]
+    public string? Error { get; set; }
+}

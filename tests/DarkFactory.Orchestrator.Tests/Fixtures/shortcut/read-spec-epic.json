@@ -1,0 +1,232 @@
+{
+  "source": "story and epic recorded live; story.epic_id and the documents hand-authored from the v3 API schema",
+  "parameters": {},
+  "interactions": [
+    {
+      "method": "GET",
+      "path": "/api/v3/stories/25185",
+      "request": null,
+      "status": 200,
+      "response": {
+        "app_url": "https://app.shortcut.com/trefry/story/25185",
+        "description": "Repo: michaeltrefry/dark-factory-sandbox\n\n\u0060WordCount\u0060 returns the wrong count when words are separated by more than one space (or by tabs/newlines), e.g. \u0022hello   world\u0022 should be 2.\n\nExpected: consecutive whitespace counts as a single separator; leading/trailing whitespace is ignored; empty or whitespace-only input returns 0. Add tests covering these cases.\n\n(Test story for the Dark Factory Phase 1 live acceptance run \u2014 epic sc-25171.)",
+        "archived": false,
+        "started": true,
+        "story_links": [],
+        "entity_type": "story",
+        "labels": [],
+        "mention_ids": [],
+        "member_mention_ids": [],
+        "story_type": "bug",
+        "custom_fields": [],
+        "linked_files": [],
+        "workflow_id": 500000005,
+        "completed_at_override": null,
+        "started_at": "2026-10-06T18:28:41Z",
+        "completed_at": null,
+        "name": "WordCount miscounts runs of whitespace",
+        "global_id": "v2:s:69f08f42-5aa8-4153-a440-4cdffc48dcde:25185",
+        "completed": false,
+        "comments": [],
+        "blocker": false,
+        "branches": [
+          {
+            "entity_type": "branch",
+            "deleted": false,
+            "name": "factory/sc-25185",
+            "persistent": false,
+            "updated_at": "2026-10-06T18:28:41Z",
+            "pull_requests": [
+              {
+                "entity_type": "pull-request",
+                "closed": false,
+                "merged": false,
+                "num_added": 14,
+                "branch_id": 500006958,
+                "number": 1,
+                "branch_name": "factory/sc-25185",
+                "target_branch_name": "main",
+                "num_commits": null,
+                "title": "sc-25185: WordCount miscounts runs of whitespace",
+                "updated_at": "2026-10-06T18:29:18Z",
+                "has_overlapping_stories": false,
+                "draft": false,
+                "id": 500006960,
+                "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/1",
+                "num_removed": 6,
+                "review_status": "review-required",
+                "num_modified": null,
+                "build_status": "successful",
+                "target_branch_id": 500006959,
+                "repository_id": 500006957,
+                "created_at": "2026-10-06T18:28:43Z"
+              }
+            ],
+            "merged_branch_ids": [],
+            "id": 500006958,
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/sc-25185",
+            "repository_id": 500006957,
+            "created_at": "2026-10-06T18:28:41Z"
+          }
+        ],
+        "epic_id": 25171,
+        "story_template_id": null,
+        "external_links": [],
+        "previous_iteration_ids": [],
+        "requested_by_id": "69f08f42-a951-46b3-b1a0-897a12271e62",
+        "iteration_id": null,
+        "sub_task_story_ids": [],
+        "tasks": [],
+        "formatted_vcs_branch_name": null,
+        "label_ids": [],
+        "started_at_override": null,
+        "group_id": "6ac526c4-f2b5-4903-958f-d2d529d8bc8a",
+        "workflow_state_id": 500000008,
+        "updated_at": "2026-10-06T18:28:43Z",
+        "pull_requests": [
+          {
+            "entity_type": "pull-request",
+            "closed": false,
+            "merged": false,
+            "num_added": 14,
+            "branch_id": 500006958,
+            "number": 1,
+            "branch_name": "factory/sc-25185",
+            "target_branch_name": "main",
+            "num_commits": null,
+            "title": "sc-25185: WordCount miscounts runs of whitespace",
+            "updated_at": "2026-10-06T18:29:18Z",
+            "has_overlapping_stories": false,
+            "draft": false,
+            "id": 500006960,
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/1",
+            "num_removed": 6,
+            "review_status": "review-required",
+            "num_modified": null,
+            "build_status": "successful",
+            "target_branch_id": 500006959,
+            "repository_id": 500006957,
+            "created_at": "2026-10-06T18:28:43Z"
+          }
+        ],
+        "group_mention_ids": [],
+        "follower_ids": [
+          "69f08f42-a951-46b3-b1a0-897a12271e62"
+        ],
+        "owner_ids": [],
+        "external_id": null,
+        "id": 25185,
+        "parent_story_id": null,
+        "estimate": null,
+        "commits": [],
+        "files": [],
+        "position": 32433155072,
+        "blocked": false,
+        "project_id": null,
+        "deadline": null,
+        "stats": {
+          "num_related_documents": 0
+        },
+        "created_at": "2026-10-06T18:22:03Z",
+        "moved_at": "2026-10-06T18:28:41Z"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/v3/epics/25171",
+      "request": null,
+      "status": 200,
+      "response": {
+        "app_url": "https://app.shortcut.com/trefry/epic/25171",
+        "description": "Phase 1 of the Dark Factory project. Parent epic: [sc-25170 Dark Factory](https://app.shortcut.com/trefry/epic/25170). Spec: https://claude.ai/code/artifact/d44087a4-0bc3-44b0-a399-38631d225501\n\n## Objective\nA \u0060To Do\u0060 bug story inside the factory\u0027s watched Shortcut scope becomes an open PR on \u0060michaeltrefry/dark-factory-sandbox\u0060 with no human touch. Every model call goes through the self-hosted router, and you can watch the run live and pause, continue or stop it from the dashboard. Code lives in \u0060michaeltrefry/dark-factory\u0060; integration branch \u0060feature/phase-1-foundation\u0060.\n\n## Requirements\n- **E1** Every model call goes through the router (localhost:8080). Workers get only the router URL and router headers; no provider keys or provider URLs anywhere in factory code or worker env.\n- **E2** The orchestrator is deterministic .NET code. No model decides a state transition.\n- **E3** Every state change is a ledger row written before the step counts as done. A restart resumes each item from its last ledger state and never redoes a completed step.\n- **E4** Workers never merge and push only to \u0060factory/*\u0060, using short-lived GitHub App installation tokens scoped to one repo. Main is protected.\n- **E5** Workers run as a dedicated macOS user in fresh worktrees deleted when the run ends. They cannot reach the owner\u0027s home folder, keychain or SSH keys, and hold no secrets beyond the router headers and the scoped GitHub token.\n- **E6** The orchestrator touches a board only through \u0060IWorkSource\u0060. Boards are never synced. In Shortcut, \u0022ready\u0022 means the \u0060To Do\u0060 state within the configured watch scope.\n- **E7** Every worker session\u0027s stream-json events are persisted and replayable.\n- **E8** The dashboard binds only to 127.0.0.1 and the configured private-network interface and requires login. Its only write actions are the controls.\n- **E9** No budget caps. Spend is recorded per item, from the router\u0027s session cost endpoint, for reporting only.\n- **E10** No failure sits silently: every failure path ends in a resumable pause or an escalation comment on the item.\n\n## Epic acceptance tests (run once, by S10)\n1. \u0060dotnet test\u0060 green for the whole solution; dark-factory CI and sandbox CI green.\n2. End to end: a To Do bug story in the watch scope targeting the sandbox repo is claimed, implemented by a sandboxed worker through the router, and ends with an open PR from \u0060factory/sc-\u003Cid\u003E\u0060; the story carries the PR and branch links; the ledger shows Intake \u2192 Implement \u2192 Review; the session replays in the dashboard with its cost.\n3. Crash: kill -9 the orchestrator mid-Implement, restart; the same Claude session resumes and exactly one PR results.\n4. Controls: pause, continue and stop each exercised on a live run at item and factory scope.\n5. Usage: with a stub router reporting all plans exhausted until T, nothing dispatches before T and work resumes at T.\n6. Safety: worker push to \u0060main\u0060 and to another repo are rejected; worker env matches the allowlist; probes of \u0060~michael\u0060, \u0060.ssh\u0060 and keychain fail.\n7. Router: the router\u0027s logs/session costs account for every model call made during test 2.\n8. Tracker readback: every story in this epic and the epic itself show their final states.\n\n## Slice plan\n| # | Story | Depends on |\n|---|---|---|\n| S1 | [sc-25172](https://app.shortcut.com/trefry/story/25172) Walking skeleton: \u0060factory run\u0060 \u2192 PR on the sandbox repo | none |\n| S2 | [sc-25173](https://app.shortcut.com/trefry/story/25173) Work-source interface \u002B Shortcut adapter \u002B intake polling | S1 |\n| S3 | [sc-25174](https://app.shortcut.com/trefry/story/25174) Durable lifecycle state machine, ledger, crash resume | S1 |\n| S4 | [sc-25175](https://app.shortcut.com/trefry/story/25175) Worker sandbox: dedicated macOS user, throwaway worktrees | S1 |\n| S5 | [sc-25176](https://app.shortcut.com/trefry/story/25176) GitHub App scoped tokens \u002B \u0060factory/*\u0060 rulesets | S1 |\n| S6 | [sc-25177](https://app.shortcut.com/trefry/story/25177) Session capture: stream-json \u2192 Postgres \u002B SignalR | S1 |\n| S7 | [sc-25178](https://app.shortcut.com/trefry/story/25178) Dashboard: login, pipeline, live/replayed transcripts | S6 |\n| S8 | [sc-25179](https://app.shortcut.com/trefry/story/25179) Controls: pause / continue / stop | S3, S7 |\n| S9a | [sc-25180](https://app.shortcut.com/trefry/story/25180) Router: expose usage windows over HTTP (PR to weave-os/router) | none |\n| S9b | [sc-25181](https://app.shortcut.com/trefry/story/25181) Usage pause, resume at reset, spend per item | S9a, S3, S8 |\n| S10 | [sc-25182](https://app.shortcut.com/trefry/story/25182) Terminal: acceptance tests, feature-end review, merge to main | all |\n\nS1 first. S2\u2013S6 and S9a can then run in parallel. S7 \u2192 S8 \u2192 S9b in sequence. S10 last.\n\n## Decisions\n- Stack: .NET, Postgres (Docker) via EF Core, Blazor Server \u002B SignalR dashboard.\n- Phase 1 has no Plan step: the single worker implements from the story, and items park at Review with the PR open.\n- The exit criterion uses a Shortcut bug story; GitHub issue intake is Phase 2.\n- S9a exists because the router (checked at a535a472) tracks usage windows only in memory with no HTTP route.\n\n## Out of scope (later phases)\nGitHub issue triage, review panel, fix loop, CI self-heal, gate.yaml, merge queue (Phase 2). CodeGraph integration (Phase 3). KanbanBoard adapter, plan decomposition, multi-repo changesets, parallel workers (Phase 4). Swift (Phase 5). Post-merge watch, revert fast path, submit/epics/usage/metrics dashboard views (Phase 6).",
+        "archived": false,
+        "started": true,
+        "entity_type": "epic",
+        "labels": [],
+        "mention_ids": [],
+        "member_mention_ids": [],
+        "associated_groups": null,
+        "project_ids": [],
+        "stories_without_projects": 11,
+        "completed_at_override": null,
+        "productboard_plugin_id": null,
+        "started_at": "2026-10-06T17:27:27Z",
+        "completed_at": null,
+        "objective_ids": [],
+        "name": "Dark Factory \u2014 Phase 1: Foundation",
+        "global_id": "v2:e:69f08f42-5aa8-4153-a440-4cdffc48dcde:25171",
+        "completed": false,
+        "comments": [],
+        "productboard_url": null,
+        "planned_start_date": null,
+        "state": "in progress",
+        "milestone_id": null,
+        "requested_by_id": "69f08f42-a951-46b3-b1a0-897a12271e62",
+        "epic_state_id": 500000003,
+        "label_ids": [],
+        "started_at_override": null,
+        "group_id": "6ac526c4-f2b5-4903-958f-d2d529d8bc8a",
+        "updated_at": "2026-10-06T17:27:27Z",
+        "group_mention_ids": [],
+        "productboard_id": null,
+        "follower_ids": [
+          "69f08f42-a951-46b3-b1a0-897a12271e62"
+        ],
+        "group_ids": [
+          "6ac526c4-f2b5-4903-958f-d2d529d8bc8a"
+        ],
+        "owner_ids": [],
+        "external_id": null,
+        "id": 25171,
+        "position": 362,
+        "productboard_name": null,
+        "deadline": null,
+        "stats": {
+          "num_points_done": 0,
+          "num_related_documents": 0,
+          "num_stories_unstarted": 4,
+          "num_stories_total": 11,
+          "last_story_update": "2026-10-06T18:45:18Z",
+          "num_points_started": 0,
+          "num_points_unstarted": 0,
+          "num_stories_started": 4,
+          "num_stories_unestimated": 11,
+          "num_stories_backlog": 0,
+          "num_points_backlog": 0,
+          "num_points": 0,
+          "num_stories_done": 3
+        },
+        "created_at": "2026-10-06T17:23:37Z"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/v3/epics/25171/documents",
+      "request": null,
+      "status": 200,
+      "response": [
+        {
+          "id": "6a0d4f00-0000-4000-8000-000000000001",
+          "title": "Dark Factory Spec",
+          "app_url": "https://app.shortcut.com/trefry/write/6a0d4f00-0000-4000-8000-000000000001"
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v3/documents/6a0d4f00-0000-4000-8000-000000000001",
+      "request": null,
+      "status": 200,
+      "response": {
+        "id": "6a0d4f00-0000-4000-8000-000000000001",
+        "title": "Dark Factory Spec",
+        "archived": false,
+        "content_markdown": "# Dark Factory Spec\n\n## Work sources\n\nShortcut and KanbanBoard plug in through one adapter interface.",
+        "content_html": "\u003Ch1\u003EDark Factory Spec\u003C/h1\u003E",
+        "app_url": "https://app.shortcut.com/trefry/write/6a0d4f00-0000-4000-8000-000000000001",
+        "created_at": "2026-10-06T12:00:00Z",
+        "updated_at": "2026-10-06T12:00:00Z"
+      }
+    }
+  ]
+}

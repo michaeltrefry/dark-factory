@@ -1,0 +1,130 @@
+@page "/sessions/{SessionId}"
+@attribute [Authorize]
+@implements IAsyncDisposable
+@inject IDashboardData Data
+@inject ISessionViewers Viewers
+@inject PipelineChanges Changes
+
+<PageTitle>Session · Dark Factory</PageTitle>
+
+@if (_header is null)
+{
+    <p class="muted">@(_loaded ? "Unknown session." : "Loading…")</p>
+}
+else
+{
+    <h1><span class="id">@_header.ExternalId</span> @_header.Title</h1>
+    <p class="meta">
+        @_header.Repo · attempt @_header.Session.Attempt ·
+        <span class="status">@(_header.Session.Running ? "running (live)" : $"finished: {_header.Session.ExitStatus ?? "unknown"}")</span> ·
+        cost @Format.Cost(_header.Session.CostUsd)
+    </p>
+    <ol class="transcript">
+        @foreach (var entry in _entries)
+        {
+            <TranscriptItem Entry="entry" />
+        }
+    </ol>
+    @if (_dropped)
+    {
+        <p class="error">The live feed was dropped; reload the page to resume.</p>
+    }
+}
+
+@code {
+    [Parameter]
+    public string SessionId { get; set; } = "";
+
+    private readonly CancellationTokenSource _cts = new();
+    private readonly string _viewerId = $"dashboard-{Guid.NewGuid():N}";
+    private readonly List<TranscriptEntry> _entries = [];
+    private readonly TranscriptFormatter _formatter = new();
+    private SessionHeader? _header;
+    private bool _loaded;
+    private bool _joined;
+    private bool _dropped;
+
+    protected override async Task OnInitializedAsync()
+    {
+        Changes.Changed += OnChanged; // the session's end and cost arrive as item changes
+        _header = await Data.SessionAsync(SessionId, _cts.Token);
+        _loaded = true;
+    }
+
+    /// <summary>
+    /// Joins only once interactive (never while prerendering): the stored events arrive first, then
+    /// each new one as it is stored — a finished session is a replay, a running one streams live.
+    /// </summary>
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_header is null || _joined)
+        {
+            return;
+        }
+        _joined = true;
+        try
+        {
+            await Viewers.JoinAsync(_viewerId, SessionId, ReceiveAsync, OnDropped, _cts.Token);
+        }
+        catch (Exception) when (!_cts.IsCancellationRequested)
+        {
+            _dropped = true;
+            StateHasChanged();
+        }
+        catch (Exception)
+        {
+            // the page is gone
+        }
+    }
+
+    private Task ReceiveAsync(IReadOnlyList<SessionEventMessage> page, CancellationToken ct) => InvokeAsync(() =>
+    {
+        foreach (var e in page)
+        {
+            _entries.AddRange(_formatter.Format(e));
+        }
+        StateHasChanged();
+    });
+
+    /// <summary>The broadcaster dropped this view (it fell behind, or the circuit is gone).</summary>
+    private void OnDropped()
+    {
+        try
+        {
+            _ = InvokeAsync(() => { _dropped = true; StateHasChanged(); });
+        }
+        catch (Exception)
+        {
+            // the circuit is gone
+        }
+    }
+
+    private void OnChanged(long? workItemId)
+    {
+        if (_header is { } h && (workItemId is null || workItemId == h.WorkItemId))
+        {
+            _ = InvokeAsync(async () =>
+            {
+                try
+                {
+                    _header = await Data.SessionAsync(SessionId, _cts.Token) ?? _header;
+                    StateHasChanged();
+                }
+                catch (Exception)
+                {
+                    // keep the last known header
+                }
+            });
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        Changes.Changed -= OnChanged;
+        _cts.Cancel();
+        if (_joined)
+        {
+            await Viewers.LeaveAsync(_viewerId);
+        }
+    }
+}

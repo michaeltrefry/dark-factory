@@ -1,0 +1,23 @@
+# Ledger Postgres for local development. Runs beside the Weave router
+# (localhost:8080, whose own Postgres already holds host port 5433).
+name: dark-factory
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: factory
+      POSTGRES_PASSWORD: factory
+      POSTGRES_DB: factory
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - ledger-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U factory -d factory"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  ledger-data:
