@@ -193,9 +193,27 @@ public class FixLoopTests
 
         var outcome = await h.Run();
 
-        Assert.True(outcome.Succeeded, outcome.Error);
+        // The fix touched a protected path: reviewed by the whole panel, then escalated by the gate rather than merged.
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains("touches protected path(s)", outcome.Error);
         Assert.Equal([ReviewRoles.Correctness, ReviewRoles.Security], h.Reviewer.Requests.Where(r => r.Pull.HeadSha == ShaA).Select(r => r.Role));
         Assert.Equal(ReviewRoles.All, (await h.Verdicts()).Last().Reviews.Select(r => r.Role));
+    }
+
+    [Fact]
+    public async Task More_fix_rounds_than_the_policys_risk_threshold_allows_escalates_at_the_gate()
+    {
+        var h = new Harness { Reviewer = ReviewerFor(new() { [ReviewRoles.Correctness] = new() { [Sha1] = [Blocking("one")] } }) };
+        h.GitHub.PolicyText = Support.TestPolicies.Standard(maxFixRounds: 0);
+
+        var outcome = await h.Run();
+
+        // The round made progress and the head passed review and CI, but the change needed a fix round the policy does not allow.
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains("risk threshold: 1 fix rounds exceed max_fix_rounds 0", outcome.Error);
+        Assert.Equal([WorkState.Review, WorkState.Fixing, WorkState.Review, WorkState.CI, WorkState.MergeGate, WorkState.Escalated],
+            (await h.Transitions()).Skip(2));
+        Assert.Empty(h.Merges);
     }
 
     [Fact]

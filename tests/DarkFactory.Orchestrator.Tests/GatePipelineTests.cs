@@ -23,7 +23,7 @@ public class GatePipelineTests
     internal const string ShaD = "dddddddddddddddddddddddddddddddddddddddd";
     private const string MergeCommit = "9999999999999999999999999999999999999999";
     internal const string ImplementerModel = "claude-sonnet-4-5-20250929";
-    private const string Policy = "version: 1\nrequire:\n  ci: green\n  review: pass\n";
+    private static readonly string Policy = TestPolicies.Standard();
 
     private static readonly WorkStory Story =
         new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77");
@@ -353,8 +353,8 @@ public class GatePipelineTests
 
     [Theory]
     [InlineData(null, "does not exist")]
-    [InlineData("version: 1\nrequire:\n  review: pass\n", "missing 'ci'")]
-    [InlineData("version: 1\nrequire:\n  ci: off\n  review: pass\n", "require.ci must be 'green'")]
+    [InlineData("version: 1\nrequire:\n  ci: green\n  review: pass\n", "version 1, which this gate no longer accepts")]
+    [InlineData("version: 2\ntiers: {}\nrisk: {}\n", "tiers is missing 'sealed'")]
     [InlineData("version: [", "not valid YAML")]
     public async Task A_missing_or_invalid_policy_means_no_merge_and_an_escalation(string? policy, string reason)
     {
@@ -363,12 +363,88 @@ public class GatePipelineTests
 
         var outcome = await h.Run();
 
+        // The review needs the policy to choose its panel, so it escalates before spending a review.
         Assert.False(outcome.Succeeded);
         Assert.Equal(WorkState.Escalated, outcome.State);
         Assert.Contains(reason, outcome.Error);
         Assert.Empty(h.Merges);
-        Assert.Equal([WorkState.MergeGate, WorkState.Escalated], (await h.Transitions()).TakeLast(2));
+        Assert.Empty(h.Reviewer.Requests);
+        Assert.Equal([WorkState.Review, WorkState.Escalated], (await h.Transitions()).TakeLast(2));
         Assert.Contains(h.Stories.Comments, c => c.Contains("escalated") && c.Contains(reason));
+    }
+
+    [Theory]
+    [InlineData(null, "does not exist")]
+    [InlineData("version: 2", "tiers")]
+    public async Task A_policy_that_breaks_after_the_review_still_blocks_the_merge_and_escalates(string? policy, string reason)
+    {
+        var h = new Harness();
+        h.GitHub.OnPullRead = read =>
+        {
+            if (read == 3) // the MergeGate read: the policy on the base was deleted or corrupted after the review
+            {
+                h.GitHub.PolicyText = policy;
+            }
+        };
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains(reason, outcome.Error);
+        Assert.Empty(h.Merges);
+        Assert.Equal([WorkState.MergeGate, WorkState.Escalated], (await h.Transitions()).TakeLast(2));
+    }
+
+    // ---- sc-25381: path tiers and the risk threshold, from the diff at the head ----
+
+    [Fact]
+    public async Task A_change_touching_a_sealed_path_is_reviewed_but_escalated_by_the_gate_not_merged()
+    {
+        var h = new Harness();
+        // The PR's own diff of a free file renames the policy away: both sides count.
+        h.GitHub.Diff = head => $"diff --git a/factory/gate.yaml b/docs/old-gate.yaml\nrename from factory/gate.yaml\nrename to docs/old-gate.yaml\n"
+            + TestPolicies.Diff("docs/guide.md", marker: head);
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains("touches sealed path(s), which always escalate: factory/gate.yaml (sealed)", outcome.Error);
+        Assert.Equal(ReviewRoles.All, h.Reviewer.Requests.Select(r => r.Role)); // the sealed tier requires the security review
+        Assert.Equal(["factory/gate.yaml (sealed)"], (await h.Verdicts()).Single().RiskyPaths);
+        Assert.Empty(h.Merges);
+        Assert.Equal([WorkState.MergeGate, WorkState.Escalated], (await h.Transitions()).TakeLast(2));
+        Assert.StartsWith("Blocked ", (await h.Rows()).Single(r => r.Step == RunPipeline.Steps.GateDecision).Detail);
+        Assert.Equal(2, h.GitHub.Calls.Count(c => c == $"diff base0...{Sha1}")); // the gate read the head's diff itself
+    }
+
+    [Fact]
+    public async Task A_change_touching_a_protected_path_passes_every_check_then_escalates_instead_of_merging()
+    {
+        var h = new Harness();
+        h.GitHub.Diff = head => TestPolicies.Diff("src/auth/Session.cs", marker: head);
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains("touches protected path(s), merged only after escalation: src/auth/Session.cs (protected)", outcome.Error);
+        Assert.Equal(ReviewRoles.All, (await h.Verdicts()).Single().Reviews.Select(r => r.Role));
+        Assert.Empty(h.Merges);
+    }
+
+    [Fact]
+    public async Task A_free_change_over_the_size_limit_merges_and_a_normal_one_escalates()
+    {
+        var free = new Harness();
+        free.GitHub.Diff = head => TestPolicies.Diff("docs/guide.md", lines: 500, marker: head);
+        Assert.True((await free.Run()).Succeeded);
+        Assert.Equal([$"merge 1 {Sha1}"], free.Merges);
+
+        var normal = new Harness();
+        normal.GitHub.Diff = head => TestPolicies.Diff("src/x.cs", lines: 500, marker: head);
+        var outcome = await normal.Run();
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains("risk threshold: 500 changed lines exceed max_changed_lines 400", outcome.Error);
+        Assert.Empty(normal.Merges);
     }
 
     [Fact]
@@ -618,38 +694,54 @@ public class GatePipelineTests
 
     // ---- sc-25379: the review panel ----
 
+    /// <summary>A change to a path whose tier (protected, in the test policy) requires the security review.</summary>
     internal static string RiskyDiff(string head) =>
-        $"diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n--- a/.github/workflows/ci.yml\n+++ b/.github/workflows/ci.yml\n+  # change at {head}\n";
+        $"diff --git a/src/auth/Login.cs b/src/auth/Login.cs\n--- a/src/auth/Login.cs\n+++ b/src/auth/Login.cs\n@@ -1 +1 @@\n+  // change at {head}\n";
 
     [Fact]
-    public async Task A_diff_touching_a_risky_path_adds_the_security_review_to_the_panel()
+    public async Task A_diff_touching_a_path_whose_tier_requires_it_adds_the_security_review_to_the_panel()
     {
         var h = new Harness();
         h.GitHub.Diff = RiskyDiff;
 
         var outcome = await h.Run();
 
-        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(WorkState.Escalated, outcome.State); // protected: reviewed, then escalated rather than merged
         Assert.Equal(ReviewRoles.All, h.Reviewer.Requests.Select(r => r.Role));
         Assert.Equal("factory/prompts/security.md", h.Reviewer.Requests.Single(r => r.Role == ReviewRoles.Security).Prompt.Path);
         var verdict = (await h.Verdicts()).Single();
-        Assert.Equal([".github/workflows/ci.yml (CI and repository automation)"], verdict.RiskyPaths);
+        Assert.Equal(["src/auth/Login.cs (protected)"], verdict.RiskyPaths);
         Assert.Equal(ReviewRoles.All, verdict.Reviews.Select(r => r.Role));
     }
 
     [Fact]
-    public async Task A_non_empty_diff_whose_paths_cannot_be_read_counts_as_risky_and_gets_the_security_review()
+    public async Task A_normal_tier_that_requires_the_security_review_gets_it_and_merges()
+    {
+        var h = new Harness();
+        h.GitHub.PolicyText = TestPolicies.Standard(normalChecks: "ci-green, review-pass, security-review");
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(ReviewRoles.All, h.Reviewer.Requests.Select(r => r.Role));
+        Assert.Equal(["src/x.cs (normal)"], (await h.Verdicts()).Single().RiskyPaths);
+        Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
+    }
+
+    [Fact]
+    public async Task A_non_empty_diff_whose_paths_cannot_be_read_counts_as_sealed_gets_the_security_review_and_escalates()
     {
         var h = new Harness();
         h.GitHub.Diff = head => $"@@ -1 +1 @@\n-old\n+change at {head}\n"; // no diff --git, ---/+++ or rename header
 
         var outcome = await h.Run();
 
-        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(WorkState.Escalated, outcome.State);
         Assert.Equal(ReviewRoles.All, h.Reviewer.Requests.Select(r => r.Role));
         var verdict = (await h.Verdicts()).Single();
-        Assert.Equal([RiskyPaths.Unparsed], verdict.RiskyPaths);
+        Assert.Equal(["(unparsed diff) (sealed: no file header could be read)"], verdict.RiskyPaths);
         Assert.Equal(ReviewRoles.All, verdict.Reviews.Select(r => r.Role));
+        Assert.Empty(h.Merges);
     }
 
     [Fact]
@@ -762,7 +854,7 @@ public class GatePipelineTests
 
         var outcome = await h.Run();
 
-        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Contains("merged only after escalation", outcome.Error); // a protected path: every check passed, then escalated
         Assert.Equal([(ReviewRoles.Correctness, "gpt-5.5"), (ReviewRoles.SpecConformance, "gpt-5.4-mini"), (ReviewRoles.Security, "gemini-3.1-pro-preview")],
             h.Reviewer.Requests.Select(r => (r.Role, r.Model)));
     }
