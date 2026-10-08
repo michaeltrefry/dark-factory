@@ -136,21 +136,30 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         Secret("GitHub:Gate:PrivateKeyPem", null, SecretAccounts.GitHubGateAppPrivateKey, "GitHub gate App private key (run `factory github-app setup --gate`)");
 
     /// <summary>
-    /// <c>Review:Models</c> (comma-separated): the reviewer models, in order of preference; the first whose family the
-    /// implementer did not use reviews. Each must be of a known family (<see cref="Gate.ModelFamily"/>).
+    /// The review panel's model lists, each comma-separated and in order of preference, each model of a known family
+    /// (<see cref="Gate.ModelFamily"/>): <c>Review:&lt;Role&gt;:Models</c> (<c>Correctness</c>, <c>SpecConformance</c>,
+    /// <c>Security</c>) per role, falling back to <c>Review:Models</c> (default
+    /// <see cref="Gate.ReviewPanelModels.DefaultReviewers"/>); <c>Review:Confirm:Models</c> for the second model that checks a
+    /// blocking finding (default <see cref="Gate.ReviewPanelModels.DefaultConfirmers"/>).
     /// </summary>
-    public IReadOnlyList<string> ReviewerModels
+    public Gate.ReviewPanelModels ReviewPanel
     {
         get
         {
-            var models = (config["Review:Models"] is { } list && !string.IsNullOrWhiteSpace(list)
-                    ? list.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                    : GateStage.DefaultReviewerModels)
-                .ToList();
-            return models.FirstOrDefault(m => Gate.ModelFamily.Of(m) is null) is { } unknown
-                ? throw new InvalidOperationException($"Review:Models: '{unknown}' is of no known model family.")
-                : models;
+            var shared = Models("Review:Models", Gate.ReviewPanelModels.DefaultReviewers);
+            var roles = Gate.ReviewRoles.All.ToDictionary(r => r, r => Models($"Review:{Gate.ReviewRoles.ConfigName(r)}:Models", shared));
+            return new Gate.ReviewPanelModels(roles, Models("Review:Confirm:Models", Gate.ReviewPanelModels.DefaultConfirmers));
         }
+    }
+
+    private IReadOnlyList<string> Models(string key, IReadOnlyList<string> fallback)
+    {
+        var models = config[key] is { } list && !string.IsNullOrWhiteSpace(list)
+            ? list.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList()
+            : fallback;
+        return models.FirstOrDefault(m => Gate.ModelFamily.Of(m) is null) is { } unknown
+            ? throw new InvalidOperationException($"{key}: '{unknown}' is of no known model family.")
+            : models;
     }
 
     /// <summary><c>Review:TimeoutMinutes</c> (default 10): the longest one reviewer call may take.</summary>

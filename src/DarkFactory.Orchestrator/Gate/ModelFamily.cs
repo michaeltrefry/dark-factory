@@ -54,13 +54,33 @@ public static class ReviewerChoice
     /// <see cref="ReviewerChoiceException"/> when the implementer's models are unknown, any of them has no known family,
     /// or every candidate shares a family with them.
     /// </summary>
-    public static string Choose(IReadOnlyList<string> candidates, IReadOnlyCollection<string> implementerModels)
+    public static string Choose(IReadOnlyList<string> candidates, IReadOnlyCollection<string> implementerModels, string setting = "Review:Models")
     {
         var families = ImplementerFamilies(implementerModels);
         return candidates.FirstOrDefault(c => ModelFamily.Of(c) is { } f && !families.Contains(f))
             ?? throw new ReviewerChoiceException(
                 $"No configured reviewer model ({string.Join(", ", candidates)}) is of a family other than the implementer's "
-                + $"({string.Join(", ", families)}); set Review:Models.");
+                + $"({string.Join(", ", families)}); set {setting}.");
+    }
+
+    /// <summary>
+    /// The second model for a blocking finding <paramref name="reviewerModels"/> reported: the first of
+    /// <paramref name="candidates"/> that is none of the reviewer's models and of no implementer family, preferring one whose
+    /// family is also not the reviewer's. Throws <see cref="ReviewerChoiceException"/> when there is none.
+    /// </summary>
+    public static string ChooseConfirmer(IReadOnlyList<string> candidates, IReadOnlyCollection<string> implementerModels,
+        IReadOnlyCollection<string> reviewerModels, string setting = "Review:Confirm:Models")
+    {
+        var families = ImplementerFamilies(implementerModels);
+        var reviewerFamilies = reviewerModels.Select(ModelFamily.Of).OfType<string>().ToHashSet(StringComparer.Ordinal);
+        var eligible = candidates.Where(c => ModelFamily.Of(c) is { } f && !families.Contains(f)
+            && !reviewerModels.Contains(c, StringComparer.OrdinalIgnoreCase)).ToList();
+        return eligible.FirstOrDefault(c => !reviewerFamilies.Contains(ModelFamily.Of(c)!))
+            ?? eligible.FirstOrDefault()
+            ?? throw new ReviewerChoiceException(
+                $"No configured second model ({string.Join(", ", candidates)}) is both another model than the reviewer's "
+                + $"({string.Join(", ", reviewerModels)}) and of a family other than the implementer's ({string.Join(", ", families)}), "
+                + $"so a blocking finding cannot be confirmed; set {setting}.");
     }
 
     /// <summary>The implementer's families; throws <see cref="ReviewerChoiceException"/> when any is unknown.</summary>

@@ -101,7 +101,7 @@ public static class FactoryRunner
         var appKey = options.GitHubAppPrivateKeyPem;
         var gateAppId = options.GitHubGateAppId;
         var gateAppKey = options.GitHubGateAppPrivateKeyPem;
-        var reviewerModels = options.ReviewerModels;
+        var reviewPanel = options.ReviewPanel;
         var sandbox = options.WorkerSandbox;
         var pauseGrace = options.PauseGrace;
 
@@ -133,7 +133,7 @@ public static class FactoryRunner
             return true;
         });
 
-        var gate = new GateStage(new GitHubGate(githubHttp, gateApp), new RouterReviewer(reviewerHttp, routerKey), reviewerModels,
+        var gate = new GateStage(new GitHubGate(githubHttp, gateApp), new RouterReviewer(reviewerHttp, routerKey), reviewPanel,
             options.CiPollInterval, options.CiTimeout);
         var pipeline = new RunPipeline(
             source,

@@ -177,12 +177,27 @@ Owner set-up, once (the test skips naming whichever is missing):
 
 | Test | Variables | Proves |
 | --- | --- | --- |
-| `Gate_merges_a_green_pr_a_different_family_reviewer_passed_and_the_ledger_records_the_merge_commit` | `FACTORY_E2E_GATE_STORY=sc-<id>` | Intake → … → Review → CI → MergeGate → Merge → Watch; one pass verdict from a family none of the implementer's models is, accounted by the router under its own session; the PR merged at the reviewed head; the Merge row holds GitHub's merge commit; the story is Done |
+| `Gate_merges_a_green_pr_a_different_family_reviewer_passed_and_the_ledger_records_the_merge_commit` | `FACTORY_E2E_GATE_STORY=sc-<id>` | Intake → … → Review → CI → MergeGate → Merge → Watch; one pass verdict from the review panel (sc-25379: correctness and spec conformance, plus security on a risky path), every reviewer and second model of a family none of the implementer's models is, each panel call accounted by the router under its own session, which the ledger named with the role's prompt file hash; the PR merged at the reviewed head; the Merge row holds GitHub's merge commit; the story is Done |
 | `A_push_after_the_verdict_blocks_the_merge_until_the_new_head_is_reviewed_again` | `FACTORY_E2E_GATE_PUSH_STORY=sc-<id>` | a commit pushed to the PR branch right after the first verdict sends the item from CI back to Review; the new head is reviewed; `gate-passed` and the merge name only the new head |
 
 ```sh
 FACTORY_E2E=1 FACTORY_E2E_GATE_STORY=sc-<id> FACTORY_E2E_GATE_PUSH_STORY=sc-<id> \
   dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-class "*ReviewGateTests"
+```
+
+The seeded review (sc-25379) needs only the router and the router key: no GitHub, Shortcut, ledger or gate App. It sends
+the fixture diffs `tests/DarkFactory.Orchestrator.Tests/Fixtures/review/*.diff` through the production `RouterReviewer`
+to the configured models (`Review:SpecConformance:Models`, `Review:Confirm:Models`, for an anthropic implementer).
+Real models answer, so a failure names what they reported.
+
+| Test | Variables | Proves |
+| --- | --- | --- |
+| `ReviewSeedTests.The_spec_conformance_prompt_gets_a_real_model_to_flag_an_unused_config_flag_and_a_second_model_confirms_it` | `FACTORY_E2E_REVIEW_SEED=1` | the spec-conformance prompt (`factory/prompts/spec-conformance.md`) gets a real model to report a blocking finding naming `IgnoreBlankInput` on `unused-config-flag.diff` (a flag nothing reads), and the confirm prompt gets the second model to answer `confirmed` |
+| `ReviewSeedTests.The_same_flag_with_a_consumer_gets_no_blocking_spec_conformance_finding` | `FACTORY_E2E_REVIEW_SEED=1` | the same flag with a consumer (`consumed-config-flag.diff`) gets no blocking spec-conformance finding |
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_REVIEW_SEED=1 \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-class "*ReviewSeedTests"
 ```
 
 Since sc-25378 every `factory run` / `factory work` run goes on past Review, so the Phase 1 tests above (AT1–AT5) also

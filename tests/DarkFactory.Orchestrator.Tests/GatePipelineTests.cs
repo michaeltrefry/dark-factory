@@ -47,10 +47,21 @@ public class GatePipelineTests
             return Task.FromResult(new PullFacts(number, PrUrl, Open && !Merged, Merged, false, Head, "main", "base0", MergeCommitSha));
         }
 
+        /// <summary>The PR's diff for a head commit; by default a one-line change to an unrisky file.</summary>
+        public Func<string, string> Diff { get; set; } = head => $"diff --git a/src/x.cs b/src/x.cs\n+change at {head}\n";
+
+        public RepoFiles Files { get; set; } = new(["README.md", "src/x.cs"], false);
+
         public Task<string> GetDiffAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct)
         {
             Calls.Add($"diff {baseSha}...{headSha}");
-            return Task.FromResult($"diff --git a/x b/x\n+change at {headSha}\n");
+            return Task.FromResult(Diff(headSha));
+        }
+
+        public Task<RepoFiles> GetFilesAsync(RepoRef repo, string sha, CancellationToken ct)
+        {
+            Calls.Add($"files {sha}");
+            return Task.FromResult(Files);
         }
 
         public Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct)
@@ -101,23 +112,40 @@ public class GatePipelineTests
     }
 
     /// <summary>
-    /// A reviewer that answers <c>verdict</c> under the request's router session (as <see cref="RouterReviewer"/> does);
-    /// its first <see cref="UsageLimitedCalls"/> calls are refused by the router for usage.
+    /// The panel's calls, answered as <see cref="RouterReviewer"/> would (served by the pinned model, under the request's
+    /// session and prompt): each role reports <see cref="Findings"/>, each second model answers <see cref="Confirm"/>. The
+    /// first <see cref="UsageLimitedCalls"/> role reviews are refused by the router for usage.
     /// </summary>
-    internal sealed class FakeReviewer(string verdict = ReviewVerdict.Pass) : IReviewer
+    internal sealed class FakeReviewer : IReviewer
     {
         public List<ReviewRequest> Requests { get; } = [];
+        public List<ConfirmRequest> Confirms { get; } = [];
         public int UsageLimitedCalls { get; set; }
+        public Func<ReviewRequest, IReadOnlyList<Finding>> Findings { get; init; } = _ => [];
+        public Func<ConfirmRequest, string> Confirm { get; init; } = _ => Confirmation.Confirmed;
 
-        public Task<ReviewVerdict> ReviewAsync(ReviewRequest request, CancellationToken ct)
+        /// <summary>The correctness reviewer reports one blocking finding (which the second model confirms by default).</summary>
+        public static FakeReviewer Blocking(string title = "the tests do not cover the empty string") => new()
+        {
+            Findings = r => r.Role == ReviewRoles.Correctness ? [new Finding(Finding.Blocking, title, "src/x.cs", 1, "WordCount(\"\") is untested")] : [],
+        };
+
+        public Task<RoleReview> ReviewAsync(ReviewRequest request, CancellationToken ct)
         {
             Requests.Add(request);
             if (Requests.Count <= UsageLimitedCalls)
             {
-                throw new RouterUsageLimitedException("The reviewer call through the router failed: 429 All enrolled subscription accounts are currently unavailable.");
+                throw new RouterUsageLimitedException("The review call through the router failed: 429 All enrolled subscription accounts are currently unavailable.");
             }
-            return Task.FromResult(new ReviewVerdict(request.Pull.HeadSha, verdict, request.Model, request.Model, ModelFamily.Of(request.Model),
-                verdict == ReviewVerdict.Pass ? "looks right" : "the tests do not cover the empty string", request.Session));
+            return Task.FromResult(new RoleReview(request.Role, request.Model, request.Model, ModelFamily.Of(request.Model), request.Session,
+                request.Prompt.Id, Findings(request), "reviewed"));
+        }
+
+        public Task<Confirmation> ConfirmAsync(ConfirmRequest request, CancellationToken ct)
+        {
+            Confirms.Add(request);
+            return Task.FromResult(new Confirmation(Confirm(request), request.Model, request.Model, ModelFamily.Of(request.Model), request.Session,
+                request.Prompt.Id, "checked against the diff"));
         }
     }
 
@@ -149,7 +177,9 @@ public class GatePipelineTests
         public InProcessRunLocks Locks { get; } = new();
         public FakeGateGitHub GitHub { get; } = new();
         public FakeReviewer Reviewer { get; init; } = new();
-        public IReadOnlyList<string> ReviewerModels { get; init; } = GateStage.DefaultReviewerModels;
+        /// <summary>When set, the panel's calls go here instead of <see cref="Reviewer"/> (e.g. a real <see cref="RouterReviewer"/>).</summary>
+        public IReviewer? Panel { get; init; }
+        public ReviewPanelModels Models { get; init; } = ReviewPanelModels.Default;
         public WorkLedger Ledger => new(Db, TimeProvider.System);
 
         public Task<RunOutcome> Run(string? implementerModel = ImplementerModel, CancellationToken ct = default) =>
@@ -158,7 +188,7 @@ public class GatePipelineTests
         public Task<RunOutcome> Run(string?[] implementerModels, CancellationToken ct = default) =>
             new RunPipeline(Stories, Ledger, Locks, Workspaces, new FakeWorker(ReportsModel(implementerModels)), Prs, Sandbox, TextWriter.Null,
                     controls: Controls,
-                    gate: new GateStage(GitHub, Reviewer, ReviewerModels, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5)))
+                    gate: new GateStage(GitHub, Panel ?? Reviewer, Models, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5)))
                 .RunAsync(77, ct);
 
         public async Task<List<LedgerEntry>> Rows() => await Db.LedgerEntries.OrderBy(e => e.Id).ToListAsync();
@@ -182,14 +212,22 @@ public class GatePipelineTests
         Assert.Equal(MergeCommit, rows.Single(r => r.Step is null && r.State == WorkState.Merge).Detail);
         Assert.Equal((WorkState.Watch, PrUrl), (outcome.State, outcome.PullRequestUrl));
 
-        // The implementer's model was recorded; the reviewer was pinned to another family and bound to the head commit.
+        // The implementer's model was recorded; the panel (correctness and spec conformance: the diff touches no risky path)
+        // was pinned to another family and bound to the head commit, with the base's file list.
         Assert.Equal(ImplementerModel, rows.Single(r => r.Step == RunPipeline.Steps.ImplementerModel).Detail);
-        var review = h.Reviewer.Requests.Single();
-        Assert.Equal("gpt-5.6-sol", review.Model);
-        Assert.Equal(Sha1, review.Pull.HeadSha);
-        Assert.Contains($"change at {Sha1}", review.Diff);
+        Assert.Equal([ReviewRoles.Correctness, ReviewRoles.SpecConformance], h.Reviewer.Requests.Select(r => r.Role));
+        Assert.All(h.Reviewer.Requests, review =>
+        {
+            Assert.Equal("gpt-5.5", review.Model);
+            Assert.Equal(Sha1, review.Pull.HeadSha);
+            Assert.Contains($"change at {Sha1}", review.Diff);
+            Assert.Equal(h.GitHub.Files, review.Files);
+        });
+        Assert.Contains("files base0", h.GitHub.Calls);
         var verdict = (await h.Verdicts()).Single();
-        Assert.Equal((Sha1, ReviewVerdict.Pass, "openai"), (verdict.HeadSha, verdict.Verdict, verdict.Family));
+        Assert.Equal((Sha1, ReviewVerdict.Pass), (verdict.HeadSha, verdict.Verdict));
+        Assert.Empty(verdict.RiskyPaths);
+        Assert.All(verdict.Reviews, r => Assert.Equal("openai", r.Family));
 
         // The gate read its policy from the base branch, and merged exactly the reviewed, green commit, once.
         Assert.Contains("policy main", h.GitHub.Calls);
@@ -219,7 +257,7 @@ public class GatePipelineTests
         Assert.True(outcome.Succeeded, outcome.Error);
         Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Review, WorkState.CI, WorkState.Review, WorkState.CI, WorkState.MergeGate,
             WorkState.Merge, WorkState.Watch], await h.Transitions());
-        Assert.Equal([Sha1, Sha2], h.Reviewer.Requests.Select(r => r.Pull.HeadSha));
+        Assert.Equal([Sha1, Sha2], h.Reviewer.Requests.Select(r => r.Pull.HeadSha).Distinct());
         Assert.Equal([Sha1, Sha2], (await h.Verdicts()).Select(v => v.HeadSha));
         Assert.Equal([$"merge 1 {Sha2}"], h.Merges); // never the stale commit
         Assert.DoesNotContain($"ci {Sha1}", h.GitHub.Calls); // the voided commit's CI was never consulted
@@ -237,7 +275,7 @@ public class GatePipelineTests
         Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Review, WorkState.CI, WorkState.MergeGate, WorkState.Review, WorkState.CI,
             WorkState.MergeGate, WorkState.Merge, WorkState.Watch], await h.Transitions());
         Assert.Equal([$"merge 1 {Sha1}", $"merge 1 {Sha2}"], h.Merges);
-        Assert.Equal([Sha1, Sha2], h.Reviewer.Requests.Select(r => r.Pull.HeadSha));
+        Assert.Equal([Sha1, Sha2], h.Reviewer.Requests.Select(r => r.Pull.HeadSha).Distinct());
     }
 
     [Fact]
@@ -303,7 +341,7 @@ public class GatePipelineTests
         h.GitHub.Ci[Sha1] = new CiFacts(Sha1, []);
 
         var outcome = await new RunPipeline(h.Stories, h.Ledger, h.Locks, h.Workspaces, new FakeWorker(ReportsModel(ImplementerModel)), h.Prs, Sandbox,
-                TextWriter.Null, gate: new GateStage(h.GitHub, h.Reviewer, GateStage.DefaultReviewerModels, TimeSpan.FromMilliseconds(1), TimeSpan.FromMilliseconds(50)))
+                TextWriter.Null, gate: new GateStage(h.GitHub, h.Reviewer, ReviewPanelModels.Default, TimeSpan.FromMilliseconds(1), TimeSpan.FromMilliseconds(50)))
             .RunAsync(77, CancellationToken.None);
 
         Assert.Equal(WorkState.Escalated, outcome.State);
@@ -314,7 +352,7 @@ public class GatePipelineTests
     [Fact]
     public async Task A_fail_verdict_escalates_before_ci_and_merges_nothing()
     {
-        var h = new Harness { Reviewer = new FakeReviewer(ReviewVerdict.Fail) };
+        var h = new Harness { Reviewer = FakeReviewer.Blocking() };
 
         var outcome = await h.Run();
 
@@ -344,7 +382,7 @@ public class GatePipelineTests
 
         await h.Run(implementerModel: "gpt-5.6-sol");
 
-        Assert.Equal("claude-opus-5-5", h.Reviewer.Requests.Single().Model);
+        Assert.All(h.Reviewer.Requests, r => Assert.Equal("claude-opus-5", r.Model));
         Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
     }
 
@@ -360,7 +398,8 @@ public class GatePipelineTests
         }
         await ledger.CheckpointAsync(item, RunPipeline.Steps.ImplementerModel, null, ImplementerModel, CancellationToken.None);
         await ledger.CheckpointAsync(item, RunPipeline.Steps.Verdict, null,
-            new ReviewVerdict(Sha1, ReviewVerdict.Pass, "gpt-5.6-sol", "gpt-5.6-sol", "openai", "ok").ToDetail(), CancellationToken.None);
+            ReviewPanel.Decide(Sha1, [], ReviewRoles.Required(false)
+                .Select(r => new RoleReview(r, "gpt-5.5", "gpt-5.5", "openai", null, null, [], "ok")).ToList()).ToDetail(), CancellationToken.None);
         await ledger.RecordAsync(item, WorkState.CI, null, Sha1, CancellationToken.None);
         await ledger.RecordAsync(item, WorkState.MergeGate, null, Sha1, CancellationToken.None);
         await ledger.CheckpointAsync(item, RunPipeline.Steps.GatePassed, null, Sha1, CancellationToken.None);
@@ -404,17 +443,19 @@ public class GatePipelineTests
         Assert.Equal(Ok.SessionId, outcome.SessionId); // the implementer's session, not the reviewer's
         var rows = await h.Rows();
         Assert.All(rows.Where(r => r.ClaudeSessionId is not null), r => Assert.Equal(Ok.SessionId, r.ClaudeSessionId));
-        var review = h.Reviewer.Requests.Single();
-        var named = rows.FindIndex(r => r.Step == RunPipeline.Steps.ReviewSession);
-        Assert.Equal($"{review.Session} gpt-5.6-sol {Sha1}", rows[named].Detail);
-        Assert.True(named < rows.FindIndex(r => r.Step == RunPipeline.Steps.Verdict)); // in the ledger before the verdict
-        Assert.Equal(review.Session, (await h.Verdicts()).Single().Session); // and the verdict still carries it
+        // One named session per panel call, each recording the role's prompt file and its hash, in the ledger before the verdict.
+        var named = rows.Where(r => r.Step == RunPipeline.Steps.ReviewSession).Select(r => r.Detail).ToList();
+        Assert.Equal(h.Reviewer.Requests.Select(r => $"{r.Session} gpt-5.5 {Sha1} {r.Role} factory/prompts/{r.Role}.md@sha256:{r.Prompt.Sha256}"), named);
+        Assert.Equal(2, h.Reviewer.Requests.Select(r => r.Session).Distinct().Count());
+        Assert.True(rows.FindLastIndex(r => r.Step == RunPipeline.Steps.ReviewSession) < rows.FindIndex(r => r.Step == RunPipeline.Steps.Verdict));
+        // ...and the verdict still carries each session and prompt.
+        Assert.Equal(h.Reviewer.Requests.Select(r => (r.Session, r.Prompt.Id)), (await h.Verdicts()).Single().Reviews.Select(r => (r.Session!, r.Prompt!)));
     }
 
     [Fact]
     public async Task An_escalation_after_a_review_names_the_implementers_session_not_the_reviewers()
     {
-        var h = new Harness { Reviewer = new FakeReviewer(ReviewVerdict.Fail) };
+        var h = new Harness { Reviewer = FakeReviewer.Blocking() };
 
         var outcome = await h.Run();
 
@@ -446,7 +487,8 @@ public class GatePipelineTests
 
         Assert.True(resumed.Succeeded, resumed.Error);
         Assert.Equal(WorkState.Watch, resumed.State);
-        Assert.Equal(2, h.Reviewer.Requests.Count); // the same head reviewed again
+        Assert.Equal(3, h.Reviewer.Requests.Count); // the refused call, then the same head reviewed again by the whole panel
+        Assert.All(h.Reviewer.Requests, r => Assert.Equal(Sha1, r.Pull.HeadSha));
         Assert.Equal([WorkState.Review, WorkState.Paused, WorkState.Review, WorkState.CI],
             (await h.Transitions()).SkipWhile(s => s != WorkState.Review).Take(4));
         Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
@@ -508,13 +550,253 @@ public class GatePipelineTests
     [Fact]
     public async Task An_implementer_answered_by_two_families_gets_a_reviewer_of_a_third_configured_family()
     {
-        var h = new Harness { ReviewerModels = ["gpt-5.6-sol", "claude-opus-5-5", "gemini-3.1-pro-preview"] };
+        // A second model must exist too (checked before any call): another model of the third family.
+        var h = new Harness
+        {
+            Models = ReviewPanelModels.Uniform(["gpt-5.5", "claude-opus-5", "gemini-3.1-pro-preview"],
+                [.. ReviewPanelModels.DefaultConfirmers, "gemini-3-flash-preview"]),
+        };
 
         var outcome = await h.Run(["claude-sonnet-4-5", "gpt-5.6-luna"]);
 
         Assert.True(outcome.Succeeded, outcome.Error);
-        Assert.Equal("gemini-3.1-pro-preview", h.Reviewer.Requests.Single().Model);
-        Assert.Equal("google", (await h.Verdicts()).Single().Family);
+        Assert.All(h.Reviewer.Requests, r => Assert.Equal("gemini-3.1-pro-preview", r.Model));
+        Assert.All((await h.Verdicts()).Single().Reviews, r => Assert.Equal("google", r.Family));
+        Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
+    }
+
+    // ---- sc-25379: the review panel ----
+
+    private static string RiskyDiff(string head) =>
+        $"diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n--- a/.github/workflows/ci.yml\n+++ b/.github/workflows/ci.yml\n+  # change at {head}\n";
+
+    [Fact]
+    public async Task A_diff_touching_a_risky_path_adds_the_security_review_to_the_panel()
+    {
+        var h = new Harness();
+        h.GitHub.Diff = RiskyDiff;
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(ReviewRoles.All, h.Reviewer.Requests.Select(r => r.Role));
+        Assert.Equal("factory/prompts/security.md", h.Reviewer.Requests.Single(r => r.Role == ReviewRoles.Security).Prompt.Path);
+        var verdict = (await h.Verdicts()).Single();
+        Assert.Equal([".github/workflows/ci.yml (CI and repository automation)"], verdict.RiskyPaths);
+        Assert.Equal(ReviewRoles.All, verdict.Reviews.Select(r => r.Role));
+    }
+
+    [Fact]
+    public async Task A_non_empty_diff_whose_paths_cannot_be_read_counts_as_risky_and_gets_the_security_review()
+    {
+        var h = new Harness();
+        h.GitHub.Diff = head => $"@@ -1 +1 @@\n-old\n+change at {head}\n"; // no diff --git, ---/+++ or rename header
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(ReviewRoles.All, h.Reviewer.Requests.Select(r => r.Role));
+        var verdict = (await h.Verdicts()).Single();
+        Assert.Equal([RiskyPaths.Unparsed], verdict.RiskyPaths);
+        Assert.Equal(ReviewRoles.All, verdict.Reviews.Select(r => r.Role));
+    }
+
+    [Fact]
+    public async Task A_blocking_finding_the_second_model_does_not_confirm_is_downgraded_to_optional_and_does_not_block()
+    {
+        var h = new Harness
+        {
+            Reviewer = new FakeReviewer
+            {
+                Findings = FakeReviewer.Blocking("WordCount(\"\") still returns 1").Findings,
+                Confirm = _ => Confirmation.NotConfirmed,
+            },
+        };
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
+        // The second model is another model than the reviewer's, of no implementer family (anthropic here): the other openai one.
+        var confirm = h.Reviewer.Confirms.Single();
+        Assert.Equal(("gpt-5.4-mini", ReviewRoles.Correctness, "WordCount(\"\") still returns 1"), (confirm.Model, confirm.Role, confirm.Finding.Title));
+        Assert.Equal("factory/prompts/confirm.md", confirm.Prompt.Path);
+        var finding = (await h.Verdicts()).Single().Reviews.Single(r => r.Role == ReviewRoles.Correctness).Findings.Single();
+        Assert.Equal((Finding.Optional, true, Confirmation.NotConfirmed), (finding.Severity, finding.Downgraded, finding.Confirmation!.Outcome));
+        // The confirmation call's session is named before it, with the confirm prompt's hash.
+        Assert.Contains((await h.Rows()).Where(r => r.Step == RunPipeline.Steps.ReviewSession).Select(r => r.Detail),
+            d => d == $"{confirm.Session} gpt-5.4-mini {Sha1} confirm-correctness {ReviewPrompts.Confirm.Id}");
+    }
+
+    [Fact]
+    public async Task A_confirmed_blocking_finding_fails_the_review_and_escalates_without_merging()
+    {
+        var h = new Harness { Reviewer = FakeReviewer.Blocking() };
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains("blocking correctness finding by gpt-5.5, confirmed by gpt-5.4-mini", outcome.Error);
+        Assert.Contains("the tests do not cover the empty string (src/x.cs:1)", outcome.Error);
+        var finding = (await h.Verdicts()).Single().Reviews.Single(r => r.Role == ReviewRoles.Correctness).Findings.Single();
+        Assert.Equal((Finding.Blocking, false, Confirmation.Confirmed), (finding.Severity, finding.Downgraded, finding.Confirmation!.Outcome));
+        Assert.Empty(h.Merges);
+    }
+
+    [Fact]
+    public async Task A_blocking_finding_whose_second_model_answer_is_unusable_stays_blocking()
+    {
+        var h = new Harness { Reviewer = new FakeReviewer { Findings = FakeReviewer.Blocking().Findings, Confirm = _ => Confirmation.Unusable } };
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains("the second model's answer was unusable", outcome.Error);
+        Assert.Empty(h.Merges);
+    }
+
+    [Fact]
+    public async Task Optional_findings_do_not_block_and_are_never_sent_for_confirmation()
+    {
+        var h = new Harness { Reviewer = new FakeReviewer { Findings = _ => [new Finding(Finding.Optional, "rename the helper", null, null, "taste")] } };
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Empty(h.Reviewer.Confirms);
+        Assert.Equal(2, (await h.Verdicts()).Single().Reviews.Sum(r => r.Findings.Count));
+    }
+
+    [Fact]
+    public async Task No_eligible_second_model_escalates_with_the_reason()
+    {
+        // Implementer anthropic, reviewer gpt-5.5: the only second model configured is the reviewer's own.
+        var h = new Harness { Reviewer = FakeReviewer.Blocking(), Models = ReviewPanelModels.Uniform(["gpt-5.5"], ["gpt-5.5", "claude-opus-5"]) };
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains("a blocking finding cannot be confirmed; set Review:Confirm:Models", outcome.Error);
+        Assert.Empty(h.Reviewer.Requests); // checked before the first call: no review is spent
+        Assert.Empty(h.Reviewer.Confirms);
+        Assert.Empty(h.Merges);
+    }
+
+    [Fact]
+    public async Task A_role_with_no_eligible_family_escalates_with_the_reason_before_any_call()
+    {
+        var models = new Dictionary<string, IReadOnlyList<string>>(ReviewPanelModels.Default.Roles) { [ReviewRoles.Security] = ["claude-opus-5"] };
+        var h = new Harness { Models = ReviewPanelModels.Default with { Roles = models } };
+        h.GitHub.Diff = RiskyDiff;
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains("set Review:Security:Models", outcome.Error);
+        Assert.Empty(h.Reviewer.Requests);
+        Assert.Empty(h.Merges);
+    }
+
+    [Fact]
+    public async Task Each_role_reviews_with_its_own_configured_models()
+    {
+        var models = new Dictionary<string, IReadOnlyList<string>>(ReviewPanelModels.Default.Roles)
+        {
+            [ReviewRoles.Security] = ["gemini-3.1-pro-preview"],
+            [ReviewRoles.SpecConformance] = ["claude-opus-5", "gpt-5.4-mini"],
+        };
+        var h = new Harness { Models = ReviewPanelModels.Default with { Roles = models } };
+        h.GitHub.Diff = RiskyDiff;
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal([(ReviewRoles.Correctness, "gpt-5.5"), (ReviewRoles.SpecConformance, "gpt-5.4-mini"), (ReviewRoles.Security, "gemini-3.1-pro-preview")],
+            h.Reviewer.Requests.Select(r => (r.Role, r.Model)));
+    }
+
+    /// <summary>
+    /// The router as the panel's prompts ask it to answer, for the seeded config-flag fixtures: the spec-conformance prompt
+    /// (recognised by its checklist item) reports every configuration key the diff adds that no other added line reads; the
+    /// confirm prompt confirms a finding whose key the diff indeed reads only once; the other roles find nothing. Each
+    /// answer is served by the pinned model and ends with the JSON line the prompt asks for.
+    /// </summary>
+    private static FakeApi PromptFollowingRouter()
+    {
+        var addedKey = new System.Text.RegularExpressions.Regex(@"^\+.*GetValue\(""(?<key>[^""]+)""", System.Text.RegularExpressions.RegexOptions.Multiline);
+        return new FakeApi().On("POST /v1/messages", request =>
+        {
+            var body = System.Text.Json.JsonDocument.Parse(request.Body!).RootElement;
+            var system = body.GetProperty("system").GetString()!;
+            var user = body.GetProperty("messages")[0].GetProperty("content").GetString()!;
+            var model = body.GetProperty("model").GetString()!;
+            var diff = user[user.IndexOf("<diff>", StringComparison.Ordinal)..];
+            var unused = addedKey.Matches(diff).Select(m => m.Groups["key"].Value)
+                .Select(key => (key, Property: key.Split(':').Last()))
+                .Where(k => diff.Split('\n').Count(l => l.StartsWith('+') && l.Contains(k.Property)) == 1)
+                .ToList();
+            string answer;
+            if (system == ReviewPrompts.Confirm.Text)
+            {
+                var confirmed = unused.Any(k => user.Contains($"Title: config key {k.key} has no consumer"));
+                answer = System.Text.Json.JsonSerializer.Serialize(new { confirmed, reason = confirmed ? "declared once, read nowhere" : "it is read" });
+            }
+            else if (system.Contains("Every new control/flag/config has a consumer"))
+            {
+                var findings = unused.Select(k => new
+                {
+                    severity = "blocking", title = $"config key {k.key} has no consumer", file = "src/WordCount/WordCountOptions.cs", line = 13,
+                    detail = $"{k.Property} is declared but nothing reads it",
+                });
+                answer = System.Text.Json.JsonSerializer.Serialize(new { findings, summary = "checked the spec checklist" });
+            }
+            else
+            {
+                answer = """{"findings": [], "summary": "nothing found"}""";
+            }
+            return FakeApi.Json(System.Net.HttpStatusCode.OK, System.Text.Json.JsonSerializer.Serialize(new
+            {
+                model, stop_reason = "end_turn", content = new[] { new { type = "text", text = $"Reviewed.\n{answer}" } },
+            }));
+        });
+    }
+
+    private static string Fixture(string name) => File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Fixtures", "review", name));
+
+    [Fact]
+    public async Task A_seeded_pr_that_adds_an_unused_config_flag_gets_a_confirmed_blocking_finding_and_is_not_merged()
+    {
+        // The spec-conformance prompt carries the checklist item the fake router keys on.
+        Assert.Contains("Every new control/flag/config has a consumer", ReviewPrompts.For(ReviewRoles.SpecConformance).Text);
+        var router = PromptFollowingRouter();
+        var h = new Harness { Panel = new RouterReviewer(router.Client("http://router.test/"), "rk") };
+        h.GitHub.Diff = _ => Fixture("unused-config-flag.diff");
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        var verdict = (await h.Verdicts()).Single();
+        Assert.Equal(ReviewVerdict.Fail, verdict.Verdict);
+        var finding = verdict.Reviews.Single(r => r.Role == ReviewRoles.SpecConformance).Findings.Single();
+        Assert.Equal((Finding.Blocking, "config key WordCount:IgnoreBlankInput has no consumer", Confirmation.Confirmed, "gpt-5.4-mini"),
+            (finding.Severity, finding.Title, finding.Confirmation!.Outcome, finding.Confirmation.Model));
+        Assert.Contains("config key WordCount:IgnoreBlankInput has no consumer", outcome.Error);
+        Assert.Empty(h.Merges);
+        // Every call went through the router pinned with the role's model and that role's prompt as the system prompt.
+        Assert.Equal(["gpt-5.5", "gpt-5.5", "gpt-5.4-mini"], router.Requests.Select(r => r.Headers[RouterReviewer.ForceModelHeader]));
+    }
+
+    [Fact]
+    public async Task The_same_seeded_flag_with_a_consumer_passes_the_panel_and_merges()
+    {
+        var router = PromptFollowingRouter();
+        var h = new Harness { Panel = new RouterReviewer(router.Client("http://router.test/"), "rk") };
+        h.GitHub.Diff = _ => Fixture("consumed-config-flag.diff");
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.All((await h.Verdicts()).Single().Reviews, r => Assert.Empty(r.Findings));
         Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
     }
 

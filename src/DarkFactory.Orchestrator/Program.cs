@@ -53,9 +53,9 @@ static async Task<int> WorkAsync(CancellationToken ct)
     {
         // Fail fast on a missing credential or a bad scope rather than on the first ready item.
         // Session costs come from the router; intake needs Shortcut and the GitHub App; the dashboard its login.
-        // The merge gate needs its own App and a valid reviewer model list.
+        // The merge gate needs its own App and valid review panel model lists.
         _ = (options.ShortcutApiToken, options.RouterKey, options.GitHubAppId, options.GitHubAppPrivateKeyPem, options.DashboardPasswordHash);
-        _ = (options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, options.ReviewerModels);
+        _ = (options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, options.ReviewPanel);
         _ = DashboardBinding.Addresses(options.DashboardBindAddress);
         if (options.WatchScope.IsEmpty)
         {

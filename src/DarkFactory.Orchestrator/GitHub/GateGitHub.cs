@@ -19,6 +19,9 @@ public interface IGateGitHub
     /// <summary>The unified diff of <paramref name="headSha"/> against its merge base with <paramref name="baseSha"/>.</summary>
     Task<string> GetDiffAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct);
 
+    /// <summary>Every file path in the tree of commit <paramref name="sha"/> (what the review panel compares new files with).</summary>
+    Task<RepoFiles> GetFilesAsync(RepoRef repo, string sha, CancellationToken ct);
+
     /// <summary>The text of <see cref="GatePolicy.Path"/> on <paramref name="baseRef"/>, or null when it does not exist.</summary>
     Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct);
 
@@ -73,6 +76,16 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         using var response = await http.SendAsync(request, ct);
         await GitHubApp.EnsureSuccess(response, $"read the diff of {headSha}", ct);
         return await response.Content.ReadAsStringAsync(ct);
+    }
+
+    public async Task<RepoFiles> GetFilesAsync(RepoRef repo, string sha, CancellationToken ct)
+    {
+        using var request = GitHubApp.Request(HttpMethod.Get, $"repos/{repo.Owner}/{repo.Name}/git/trees/{sha}?recursive=1", "Bearer",
+            await ReadTokenAsync(repo, ct));
+        using var response = await http.SendAsync(request, ct);
+        await GitHubApp.EnsureSuccess(response, $"read the file tree of {sha}", ct);
+        var tree = (await response.Content.ReadFromJsonAsync<TreeDto>(ct))!;
+        return new RepoFiles(tree.Tree.Where(e => e.Type == "blob").Select(e => e.Path).ToList(), tree.Truncated);
     }
 
     public async Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct)
@@ -186,6 +199,14 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
     private sealed record StatusDto(
         [property: JsonPropertyName("context")] string Context,
         [property: JsonPropertyName("state")] string State);
+
+    private sealed record TreeDto(
+        [property: JsonPropertyName("tree")] List<TreeEntryDto> Tree,
+        [property: JsonPropertyName("truncated")] bool Truncated);
+
+    private sealed record TreeEntryDto(
+        [property: JsonPropertyName("path")] string Path,
+        [property: JsonPropertyName("type")] string Type);
 
     private sealed record MergeDto(
         [property: JsonPropertyName("sha")] string? Sha,
