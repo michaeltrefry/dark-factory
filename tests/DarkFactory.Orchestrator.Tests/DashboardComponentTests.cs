@@ -182,6 +182,30 @@ public class DashboardComponentTests : BunitContext
     }
 
     [Fact]
+    public void The_freeze_shows_as_a_banner_with_its_trigger_and_reason_and_a_continue_until_a_human_clears_it()
+    {
+        _data.Rows = [Row(1, WorkState.Paused) with { Control = ControlState.Paused }];
+        _data.Controls = [new Control
+        {
+            Scope = ControlScope.Freeze, State = ControlState.Paused, ChangedBy = FreezeTrigger.By, ChangedAt = Now,
+            Reason = FreezeTrigger.MainRed, Detail = "main of michaeltrefry/dark-factory-sandbox is red",
+        }];
+        _intake.Deferred("sc-2", "factory frozen (main-red): main of michaeltrefry/dark-factory-sandbox is red");
+
+        var cut = Render<Pipeline>();
+
+        var banner = cut.Find($".freeze[data-scope='{ControlScope.Freeze}']");
+        Assert.Equal(FreezeTrigger.MainRed, banner.QuerySelector(".freeze-trigger")!.TextContent);
+        Assert.Equal("main of michaeltrefry/dark-factory-sandbox is red", banner.QuerySelector(".freeze-detail")!.TextContent);
+        Assert.Equal(ControlScope.Freeze, banner.QuerySelector("form[data-action='continue']")!.GetAttribute("data-scope"));
+        Assert.Contains("sc-2 deferred: factory frozen (main-red)", cut.Find(".deferred").TextContent);
+
+        _data.Controls = [new Control { Scope = ControlScope.Freeze, State = ControlState.Running, ChangedBy = "dashboard", ChangedAt = Now }];
+        _changes.Notify(null);
+        cut.WaitForAssertion(() => Assert.Empty(cut.FindAll(".freeze")));
+    }
+
+    [Fact]
     public void A_pipeline_row_changes_state_when_its_ledger_changes_without_a_reload()
     {
         _data.Rows = [Row(1, WorkState.Intake), Row(2, WorkState.Implement)];

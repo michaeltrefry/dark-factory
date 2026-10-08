@@ -27,8 +27,8 @@ public interface IItemRunner
 /// <c>factory work</c>: polls the work source at a fixed interval (the Mac exposes no webhook
 /// endpoint) and runs each in-flight or ready item through the pipeline, one at a time. The
 /// pipeline's Intake claims the item; its run lock stops a second process running the same item.
-/// While the factory is paused (<see cref="Controls.ControlScope.Factory"/>, or the usage pause
-/// <see cref="Controls.ControlScope.Usage"/>) it lists no new ready items; the runner leaves out in-flight items a
+/// While the factory is paused (<see cref="Controls.ControlScope.Factory"/>, the usage pause
+/// <see cref="Controls.ControlScope.Usage"/>, or the freeze <see cref="Controls.ControlScope.Freeze"/>) it lists no new ready items; the runner leaves out in-flight items a
 /// control pauses, and the pipeline itself refuses to claim a story in a paused epic. Each poll first reads the
 /// router's usage (<paramref name="usage"/>), and a usage pause wakes the loop at its resume time, so work starts
 /// again then without waiting for the next interval.
@@ -38,7 +38,8 @@ public interface IItemRunner
 /// the loop gives up on the item (<see cref="IItemRunner.GiveUpAsync"/>) instead of retrying it every poll.
 /// <paramref name="moreLanes"/> adds work sources after the first (GitHub issues, sc-25385), polled in turn by the same loop, so
 /// their runs never overlap; a source whose listing fails is skipped for that poll without holding up the others. Items are
-/// keyed by their external id (<c>sc-12</c>, <c>gh-3</c>) on the dashboard.
+/// keyed by their external id (<c>sc-12</c>, <c>gh-3</c>) on the dashboard. A run deferred by the freeze evaluator
+/// (<see cref="RunOutcome.Deferred"/>) ends the poll and is shown on the dashboard.
 /// </summary>
 public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOptions options, TimeProvider time, ILogger<IntakeLoop> logger,
     Controls.IControls? controls = null, Router.UsageMonitor? usage = null, IntakeStatus? status = null, IReadOnlyList<IntakeLane>? moreLanes = null)
@@ -112,7 +113,9 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
             var usagePause = controls is null ? null : await controls.UsagePauseAsync(ct);
             resumeAt = usagePause?.ResumeAt;
             factoryPaused = usagePause is not null || (controls is not null
-                && (await controls.GetAsync(Controls.ControlScope.Factory, ct))?.State == Controls.ControlState.Paused);
+                && ((await controls.GetAsync(Controls.ControlScope.Factory, ct))?.State == Controls.ControlState.Paused
+                    // Frozen (sc-25387): no new work until a human's Continue; an unreadable record fails the poll above (frozen too).
+                    || (await controls.GetAsync(Controls.ControlScope.Freeze, ct)) is { State: not Controls.ControlState.Running }));
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
@@ -157,6 +160,16 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
                     var outcome = await lane.Runner.RunAsync(id, ct);
                     logger.LogInformation("{Item}: {State}{Error}", name, outcome.State, outcome.Error is null ? "" : $" ({outcome.Error})");
                     _status.ItemOk(name);
+                    if (outcome.Deferred is { } deferred)
+                    {
+                        // The factory is frozen: every other item would be deferred the same way.
+                        _status.Deferred(name, deferred);
+                        runsFailed = true;
+                    }
+                    else
+                    {
+                        _status.NotDeferred();
+                    }
                 }
                 catch (Exception ex) when (!ct.IsCancellationRequested && IsFactoryWide(ex))
                 {
@@ -231,6 +244,8 @@ public static class IntakeServiceCollectionExtensions
     {
         services.TryAddSingleton(TimeProvider.System);
         services.AddSingleton(new IntakeOptions(options.PollInterval, options.MaxItemFailures));
+        // Each run reads the Freeze:* thresholds (FactoryRunner); a bad value fails start-up here rather than every run.
+        _ = options.Freeze;
         services.TryAddSingleton(sp => new IntakeStatus(sp.GetRequiredService<TimeProvider>()));
         services.AddSingleton(new Router.UsageOptions(options.UsagePollInterval));
         services.AddSingleton<Router.IUsageSource>(_ =>

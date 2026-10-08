@@ -212,6 +212,32 @@ public class ControlTests
     }
 
     [Fact]
+    public async Task A_freeze_during_implement_stops_the_worker_at_its_next_tool_call_and_a_human_continue_resumes_the_same_session()
+    {
+        var h = new Harness();
+        var worker = new ToolWorker();
+
+        var run = h.Run(worker);
+        await worker.Working.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await h.Controls.FreezeAsync(FreezeTrigger.MainRed, "main is red", null, CancellationToken.None);
+        var paused = await run.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(WorkState.Paused, paused.State);
+        Assert.False(worker.Cancelled); // it stopped on its own, at a tool boundary
+        Assert.Contains("factory freeze (main-red)", paused.Error);
+        Assert.Equal((WorkState.Paused, RunPipeline.FreezePaused), (await h.Transitions())[^1]);
+        Assert.Empty(await h.InFlight()); // held while frozen
+
+        await h.Actions().ContinueAsync(ControlScope.Freeze, "tester", CancellationToken.None);
+        Assert.Equal([77], await h.InFlight());
+        var resumed = await h.Run(worker);
+
+        Assert.True(resumed.Succeeded, resumed.Error);
+        Assert.Equal([null, Session], worker.Resumes); // the same Claude session, resumed
+        Assert.Single(h.Prs.Opened);
+    }
+
+    [Fact]
     public async Task A_worker_that_ignores_the_pause_is_stopped_after_the_grace_and_keeps_its_session_and_worktree()
     {
         var h = new Harness { PauseGrace = TimeSpan.FromMilliseconds(200) };
@@ -573,11 +599,11 @@ public class ControlTests
     public void Scopes_are_validated(string scope, bool valid) => Assert.Equal(valid, ControlScope.IsValid(scope));
 
     [Fact]
-    public async Task Refused_scope_names_every_valid_scope_including_usage()
+    public async Task Refused_scope_names_every_valid_scope_including_usage_and_freeze()
     {
         // Refused before the ledger is opened, so no database is needed.
         var controls = new LedgerControls(null!, TimeProvider.System);
         var ex = await Assert.ThrowsAsync<ArgumentException>(() => controls.SetAsync("everything", ControlState.Paused, "tester", CancellationToken.None));
-        Assert.Contains("(factory, usage, epic:<id>, item:sc-<id> or item:gh-<key>)", ex.Message);
+        Assert.Contains("(factory, usage, freeze, epic:<id>, item:sc-<id> or item:gh-<key>)", ex.Message);
     }
 }

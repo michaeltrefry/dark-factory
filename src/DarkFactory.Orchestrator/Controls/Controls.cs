@@ -20,7 +20,7 @@ public enum ControlState
     Stopping,
 }
 
-/// <summary>Control scopes: <c>factory</c>, <c>usage</c>, <c>epic:&lt;id&gt;</c>, <c>item:sc-&lt;id&gt;</c> or <c>item:gh-&lt;key&gt;</c>.</summary>
+/// <summary>Control scopes: <c>factory</c>, <c>usage</c>, <c>freeze</c>, <c>epic:&lt;id&gt;</c>, <c>item:sc-&lt;id&gt;</c> or <c>item:gh-&lt;key&gt;</c>.</summary>
 public static class ControlScope
 {
     public const string Factory = "factory";
@@ -32,6 +32,13 @@ public static class ControlScope
     /// <c>factory continue --usage</c> (or the dashboard's Continue on it) forces it off.
     /// </summary>
     public const string Usage = "usage";
+
+    /// <summary>
+    /// The factory-wide automatic freeze (<see cref="FactoryFreeze"/>): set by the freeze evaluator when a trigger holds, never
+    /// by a user's Pause, and cleared only by a human's Continue on it (<c>factory continue --freeze</c> or the dashboard). Kept
+    /// apart from <see cref="Factory"/> so a user's Continue of a Pause does not clear a freeze, nor the reverse.
+    /// </summary>
+    public const string Freeze = "freeze";
 
     public static string Epic(long epicId) => $"epic:{epicId}";
 
@@ -49,7 +56,7 @@ public static class ControlScope
         scope.StartsWith("epic:", StringComparison.Ordinal) && long.TryParse(scope["epic:".Length..], out var id) && id > 0 ? id : null;
 
     /// <summary>Whether <paramref name="scope"/> is a well-formed scope.</summary>
-    public static bool IsValid(string scope) => scope == Factory || scope == Usage || ItemOf(scope) is not null || EpicOf(scope) is not null;
+    public static bool IsValid(string scope) => scope == Factory || scope == Usage || scope == Freeze || ItemOf(scope) is not null || EpicOf(scope) is not null;
 }
 
 /// <summary>The factory-wide usage pause (<see cref="ControlScope.Usage"/>): its reasons and backoff.</summary>
@@ -96,6 +103,14 @@ public interface IControls
     /// </summary>
     Task<Control> PauseForUsageAsync(DateTimeOffset? resumeAt, string reason, CancellationToken ct);
 
+    /// <summary>
+    /// Freezes the factory (<see cref="ControlScope.Freeze"/>) for <paramref name="trigger"/>, unless it is frozen already or its
+    /// row changed since the evaluator read it (<paramref name="readChangedAt"/>: that row's <see cref="Control.ChangedAt"/>, null
+    /// for no row) — a human's Continue that landed meanwhile is never overwritten; the next evaluation decides again. Returns
+    /// the row as it now stands.
+    /// </summary>
+    Task<Control> FreezeAsync(string trigger, string detail, DateTimeOffset? readChangedAt, CancellationToken ct);
+
     /// <summary>The scope's control row, or null when it has none.</summary>
     Task<Control?> GetAsync(string scope, CancellationToken ct);
 
@@ -117,6 +132,9 @@ public sealed class NoControls : IControls
     /// <summary>Records nothing: without a control table nothing could honour the pause.</summary>
     public Task<Control> PauseForUsageAsync(DateTimeOffset? resumeAt, string reason, CancellationToken ct) =>
         Task.FromResult(new Control { Scope = ControlScope.Usage, State = ControlState.Running, ChangedBy = UsagePause.By, Reason = reason });
+    /// <summary>Records nothing: without a control table nothing could honour the freeze.</summary>
+    public Task<Control> FreezeAsync(string trigger, string detail, DateTimeOffset? readChangedAt, CancellationToken ct) =>
+        Task.FromResult(new Control { Scope = ControlScope.Freeze, State = ControlState.Running, ChangedBy = FreezeTrigger.By, Reason = trigger, Detail = detail });
     public Task<Control?> GetAsync(string scope, CancellationToken ct) => Task.FromResult<Control?>(null);
     public Task SetAsync(string scope, ControlState state, string by, CancellationToken ct) => Task.CompletedTask;
     public Task ClearAsync(string scope, CancellationToken ct) => Task.CompletedTask;
@@ -131,7 +149,7 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
 {
     public async Task<ControlState> EffectiveAsync(string externalId, long? epicId, CancellationToken ct)
     {
-        var scopes = new List<string> { ControlScope.Factory, ControlScope.Usage, ControlScope.Item(externalId) };
+        var scopes = new List<string> { ControlScope.Factory, ControlScope.Usage, ControlScope.Freeze, ControlScope.Item(externalId) };
         if (epicId is { } epic)
         {
             scopes.Add(ControlScope.Epic(epic));
@@ -213,11 +231,45 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
         }
     }
 
+    public async Task<Control> FreezeAsync(string trigger, string detail, DateTimeOffset? readChangedAt, CancellationToken ct)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            await using var db = await contexts.CreateDbContextAsync(ct);
+            var row = await db.Controls.SingleOrDefaultAsync(c => c.Scope == ControlScope.Freeze, ct);
+            if (row is not null && (row.State != ControlState.Running || row.ChangedAt != readChangedAt))
+            {
+                return row; // frozen already, or a human's Continue landed since the evaluator read the row
+            }
+            if (row is null)
+            {
+                if (readChangedAt is not null)
+                {
+                    // The row the evaluator read is gone: decide again on the next evaluation.
+                    return new Control { Scope = ControlScope.Freeze, State = ControlState.Running, ChangedBy = FreezeTrigger.By };
+                }
+                row = new Control { Scope = ControlScope.Freeze, ChangedBy = FreezeTrigger.By };
+                db.Controls.Add(row);
+            }
+            (row.State, row.ChangedBy, row.ChangedAt, row.Reason, row.Detail, row.ResumeAt, row.Backoff) =
+                (ControlState.Paused, FreezeTrigger.By, time.GetUtcNow(), trigger, detail, null, null);
+            try
+            {
+                await db.SaveChangesAsync(ct);
+                return row;
+            }
+            catch (DbUpdateException ex) when (attempt < MaxWriteAttempts && (ex is DbUpdateConcurrencyException || db.Entry(row).State == EntityState.Added))
+            {
+                // Another writer got there first (another process froze, or a human continued): decide again against its row.
+            }
+        }
+    }
+
     public async Task SetAsync(string scope, ControlState state, string by, CancellationToken ct)
     {
         if (!ControlScope.IsValid(scope))
         {
-            throw new ArgumentException($"'{scope}' is not a control scope (factory, usage, epic:<id>, item:sc-<id> or item:gh-<key>).", nameof(scope));
+            throw new ArgumentException($"'{scope}' is not a control scope (factory, usage, freeze, epic:<id>, item:sc-<id> or item:gh-<key>).", nameof(scope));
         }
         if (state == ControlState.Stopping && ControlScope.ItemOf(scope) is null)
         {

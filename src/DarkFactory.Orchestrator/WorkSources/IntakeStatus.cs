@@ -20,6 +20,7 @@ public sealed class IntakeStatus(TimeProvider time)
     private readonly Lock _gate = new();
     private readonly Dictionary<string, IntakeError> _items = [];
     private IntakeError? _factory;
+    private IntakeError? _deferred;
 
     /// <summary>Raised after every change, on the intake loop's thread: handlers must only schedule their work.</summary>
     public event Action? Changed;
@@ -27,6 +28,37 @@ public sealed class IntakeStatus(TimeProvider time)
     public IntakeError? FactoryError
     {
         get { lock (_gate) { return _factory; } }
+    }
+
+    /// <summary>
+    /// The last run the freeze evaluator deferred (outcome <c>deferred</c>, sc-25387), until a run is dispatched again: the message
+    /// names the item and why.
+    /// </summary>
+    public IntakeError? DeferredRun
+    {
+        get { lock (_gate) { return _deferred; } }
+    }
+
+    public void Deferred(string id, string why)
+    {
+        lock (_gate)
+        {
+            _deferred = new IntakeError($"{id} deferred: {why}", time.GetUtcNow(), (_deferred?.Count ?? 0) + 1);
+        }
+        Raise();
+    }
+
+    public void NotDeferred()
+    {
+        lock (_gate)
+        {
+            if (_deferred is null)
+            {
+                return;
+            }
+            _deferred = null;
+        }
+        Raise();
     }
 
     /// <summary>Items whose last runs failed, by external id (e.g. <c>sc-12</c>, <c>gh-3</c>).</summary>

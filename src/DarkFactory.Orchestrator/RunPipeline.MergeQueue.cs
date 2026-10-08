@@ -429,6 +429,9 @@ public sealed partial class RunPipeline
     private async Task MergeGatedHeadAsync(Run run, PullFacts pull, CancellationToken ct)
     {
         await ThrowIfControlledAsync(run.Item, ct);
+        // What this merge changes, for the freeze (sc-25387): recorded before the merge, so every factory merge has it.
+        var files = DiffPaths.Of(await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct));
+        await ledger.CheckpointAsync(run.Item, Steps.MergeFiles, null, new MergeFiles(pull.BaseRef, files).ToDetail(), ct);
         await ledger.CheckpointAsync(run.Item, Steps.GatePassed, null, pull.HeadSha, ct);
         MergeResult merged;
         try

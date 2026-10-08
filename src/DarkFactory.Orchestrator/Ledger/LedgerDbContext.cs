@@ -130,8 +130,14 @@ public sealed class Control
     public required string ChangedBy { get; set; }
     public DateTimeOffset ChangedAt { get; set; }
 
-    /// <summary>Usage scope only: why the factory is paused (<see cref="Controls.UsagePause"/>).</summary>
+    /// <summary>
+    /// Usage scope: why the factory is paused (<see cref="Controls.UsagePause"/>). Freeze scope: the trigger that froze it
+    /// (<see cref="Controls.FreezeTrigger"/>).
+    /// </summary>
     public string? Reason { get; set; }
+
+    /// <summary>Freeze scope only: what tripped the freeze, in words (the trigger itself is <see cref="Reason"/>).</summary>
+    public string? Detail { get; set; }
 
     /// <summary>Usage scope only: when the pause lifts by itself (it pauses nothing from then on).</summary>
     public DateTimeOffset? ResumeAt { get; set; }

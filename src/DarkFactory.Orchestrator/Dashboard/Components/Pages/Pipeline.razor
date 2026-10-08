@@ -28,6 +28,19 @@
         }
     </ul>
 }
+@if (Freeze is { } freeze)
+{
+    <div class="controls freeze error" data-scope="@ControlScope.Freeze">
+        <span>Factory frozen: <span class="freeze-trigger">@freeze.Reason</span> — <span class="freeze-detail">@freeze.Detail</span>
+            (since @freeze.ChangedAt.ToString("u")). New work is deferred and running workers stop at their next tool call.
+            Continue clears it; only what happens after that can freeze the factory again.</span>
+        <ControlButton Action="continue" Scope="@ControlScope.Freeze" />
+    </div>
+}
+@if (Intake.DeferredRun is { } deferredRun)
+{
+    <p class="error deferred">Deferred (last at @deferredRun.At.ToString("u")): @deferredRun.Message</p>
+}
 @if (UsagePause is { } usage)
 {
     <div class="controls usage-pause" data-scope="@ControlScope.Usage">
@@ -113,6 +126,9 @@ else
 
     /// <summary>Whether this scope's own control (not an enclosing one) pauses it: Continue clears exactly that.</summary>
     private bool Paused(string scope) => _controls.GetValueOrDefault(scope)?.State == ControlState.Paused;
+
+    /// <summary>The factory's freeze while it holds (until a human's Continue).</summary>
+    private Control? Freeze => _controls.GetValueOrDefault(ControlScope.Freeze) is { State: not ControlState.Running } c ? c : null;
 
     /// <summary>The factory's usage pause while it is in effect (it lifts by itself at its resume time).</summary>
     private Control? UsagePause => _controls.GetValueOrDefault(ControlScope.Usage) is { } c && c.PausesAt(Time.GetUtcNow()) ? c : null;

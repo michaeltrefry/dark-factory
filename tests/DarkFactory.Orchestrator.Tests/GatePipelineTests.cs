@@ -325,6 +325,12 @@ public class GatePipelineTests
         Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
         Assert.StartsWith("Merge ", rows.Single(r => r.Step == RunPipeline.Steps.GateDecision).Detail);
         Assert.Equal(Sha1, rows.Single(r => r.Step == RunPipeline.Steps.GatePassed).Detail);
+        // What the merge changed is on record before the merge (the freeze's hot-file and main-red triggers read it, sc-25387).
+        var mergeFiles = rows.FindIndex(r => r.Step == RunPipeline.Steps.MergeFiles);
+        Assert.True(mergeFiles >= 0 && mergeFiles < rows.FindIndex(r => r.Step is null && r.State == WorkState.Merge));
+        var recorded = Controls.MergeFiles.FromDetail(rows[mergeFiles].Detail);
+        Assert.Equal("main", recorded!.Base);
+        Assert.Equal(["src/x.cs"], recorded.Files);
         Assert.Contains("state 77 Merged", h.Stories.Writes);
         // Every checkpoint of a stage sits after its state's transition row (a step counts only once the ledger has it).
         Assert.True(rows.FindIndex(r => r.Step == RunPipeline.Steps.Verdict) > rows.FindIndex(r => r.Step is null && r.State == WorkState.Review));

@@ -42,6 +42,7 @@ dotnet run --project src/DarkFactory.Orchestrator -- run sc-1234
 dotnet run --project src/DarkFactory.Orchestrator -- work          # long-running host: dashboard + session hub on 127.0.0.1 + the intake loop (polls the watch scope)
 dotnet run --project src/DarkFactory.Orchestrator -- dashboard set-password   # dashboard login (hash → keychain)
 dotnet run --project src/DarkFactory.Orchestrator -- pause --factory          # also continue/stop; --epic N or --item sc-N
+dotnet run --project src/DarkFactory.Orchestrator -- continue --freeze        # clear the automatic freeze (also --usage)
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup --gate   # the merge gate's own App (then re-run protect)
 dotnet run --project src/DarkFactory.Orchestrator -- github-repo protect owner/name   # rulesets; owner's GH_TOKEN / `gh auth token`
@@ -72,6 +73,9 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Intake:PollSeconds` | `60` |
 | `Intake:MaxItemFailures` | `3` (runs of one item failing in a row before `factory work` escalates/parks it, E10) |
 | `Usage:PollSeconds` | `60` (`factory work` reads the router's subscription usage; also read at each intake poll) |
+| `Freeze:MaxConsecutiveFailures` | `3` (≥ 1: distinct items escalated in a row, no factory merge between, that freeze the factory) |
+| `Freeze:HotFileMerges`, `Freeze:HotFileWindowHours` | `3` (≥ 2), `24` (> 0): factory merges changing one file within the window that freeze it |
+| `Freeze:CostRisingRounds` | `2` (≥ 1): consecutive rises of an item's cost per round (implement, then each fix round) that freeze it |
 | `Router:CostSettleSeconds` | `5` (after a session's cost is first recorded, it is read once more this much later and the later value kept) |
 | `Factory:WorkRoot` | `/opt/dark-factory/work` (clones + worktrees; `~/.dark-factory` when `Worker:RunAs=none`) |
 | `ConnectionStrings:Ledger` | `Host=localhost;Port=5434;Database=factory;Username=factory;Password=factory` |
@@ -119,9 +123,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   are a `linked` checkpoint before Review. `factory work`'s start-up scope check is `IWorkSource.ValidateScopeAsync`. `ClaimAsync` refuses (no write) unless the fresh story is To Do or already
   ours, in scope (skipped by `factory run --ignore-scope`) and not another owner's, and reads the claim back; a refusal
   parks the item (Paused + `parked` checkpoint). Only Paused rows with detail `interrupted` (`RunPipeline.Interrupted`),
-  `user-paused` (`RunPipeline.UserPaused`, a Pause control) or `usage-paused` (`RunPipeline.UsagePaused`, the usage pause)
-  auto-resume (`RunPipeline.InFlightAsync`), the latter two only once no control pauses the item (the usage pause lifts at
-  its `ResumeAt`); a parked item never does. Resumes re-check the scope.
+  `user-paused` (`RunPipeline.UserPaused`, a Pause control), `usage-paused` (`RunPipeline.UsagePaused`, the usage pause) or
+  `freeze-paused` (`RunPipeline.FreezePaused`, the automatic freeze) auto-resume (`RunPipeline.InFlightAsync`), the latter three
+  only once no control pauses the item (the usage pause lifts at its `ResumeAt`, the freeze at a human's Continue); a parked
+  item never does. Resumes re-check the scope.
 - Work sources are named by `ItemNaming` (`sc-<story>`, `gh-<key>`: the ledger `Source`, external id, `factory/<id>` branch,
   `factory-<id>` worktree, `item:<id>` control scope); `factory run`/`--item` take either. The intake loop polls every source
   in turn (`IntakeLane`), so a triage and an item run never share the sandbox. The merge queue is per repo across sources.
@@ -190,6 +195,26 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   usage-limited — it pauses the factory with the backoff and never escalates the item — even though it is upstream
   capacity rather than the plans running out; a transient overload thus costs at most a backoff, not an escalation.
 
+- Automatic freeze (sc-25387, `Controls/Freeze.cs` `FactoryFreeze`): a factory-wide `freeze` control row (trigger in `Reason`,
+  words in `Detail`), set only by the evaluator (`ChangedBy` `freeze`) and cleared only by a human's Continue
+  (`factory continue --freeze`, the dashboard banner's Continue); Pause/Stop on it are refused. `RunPipeline.RunAsync` runs the
+  evaluator before every dispatch (after finishing a pending Stop, before anything is read from the board or claimed): a freeze
+  row that is not `Running` holds; otherwise the triggers are checked and the first that holds is written (before the dispatch is
+  refused) — `consecutive-failures` (the trailing Escalated rows with no Merge row after them cover `Freeze:MaxConsecutiveFailures`
+  distinct items), `hot-file` (one file of one repo in the `merge-files` checkpoints of `Freeze:HotFileMerges` factory merges
+  within `Freeze:HotFileWindowHours`; the gate records the PR's base branch and diff files as `merge-files` before every merge),
+  `cost-rising` (an active item's rounds — its last Implement, then each fix round — whose worker sessions' router costs rise
+  strictly `Freeze:CostRisingRounds` times in a row; a round with no session or an unrecorded cost is no evidence), `main-red`
+  (per repo, the base branch's head after the latest factory merge is `Ci.Evaluate` Failed; pending is not red). The run then
+  returns the typed outcome `deferred` (`RunOutcome.Deferred`, nothing about the item changes); the intake loop ends its poll,
+  lists no ready items while the row is set, and shows the deferral (`IntakeStatus.DeferredRun`) and the freeze banner on the
+  pipeline page. Continue rule: each trigger counts only events recorded after the last Continue of the freeze (its row's
+  `ChangedAt`), so a Continue is never re-frozen by the evidence it acknowledged, and a new occurrence after it freezes again;
+  a freeze decided on a row a Continue has since changed is not written (`IControls.FreezeAsync` compares `ChangedAt`). An
+  unreadable freeze record counts as frozen; a trigger that cannot be checked (ledger or GitHub unreadable) defers the dispatch
+  too (E2) but writes no freeze. In-flight work: the row pauses every item through `EffectiveAsync` like a factory Pause — no
+  new step starts, a running worker stops at its next tool boundary (Paused `freeze-paused`, session and worktree kept) and
+  resumes automatically after the Continue.
 - Intake failures (E10, `WorkSources/IntakeLoop.cs`, `IntakeStatus`): a run that throws before its pipeline's try block
   counts against its item; after `Intake:MaxItemFailures` in a row `IItemRunner.GiveUpAsync` (`RunPipeline.GiveUpAsync`)
   escalates it (Intake/Implement, escalation comment) or parks it (Paused, with a comment) — an unknown item only gets the
