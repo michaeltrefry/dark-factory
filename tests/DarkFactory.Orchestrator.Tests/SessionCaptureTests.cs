@@ -328,6 +328,57 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         Assert.Equal("sess-named", rowAtCheckpoint);
     }
 
+    /// <summary>
+    /// E4 / AC2: Ctrl-C lands after the worker's WebFetch line was read and stored but while its taint write is in flight (the
+    /// cancelled token aborts it; the same holds when the callback is never reached). The re-run replays the stored stream, taints
+    /// the session and refuses to resume it: no further worker call, no push.
+    /// </summary>
+    [Fact]
+    public async Task A_web_fetch_whose_taint_was_cut_off_by_ctrl_c_is_found_in_the_stored_stream_and_the_resume_is_refused()
+    {
+        const string sid = "sess-web";
+        using var ctrlC = new CancellationTokenSource();
+        var calls = 0;
+        var worker = new CallbackWorker(async (callbacks, ct) =>
+        {
+            calls++;
+            await callbacks.OnSession!(sid, ct);
+            await callbacks.OnLine!($$"""{"type":"system","subtype":"init","session_id":"{{sid}}"}""", ct);
+            await callbacks.OnLine!(
+                $$$"""{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"WebFetch","input":{"url":"https://example.com"}}]},"session_id":"{{{sid}}}"}""",
+                ct);
+            ctrlC.Cancel();
+            await callbacks.OnUntrusted!(sid, "web:WebFetch", ctrlC.Token);
+            throw new InvalidOperationException("the taint write was expected to be cut off");
+        });
+        var workspaces = new Workspaces();
+        var recorder = Recorder(new FakeCosts(FixtureCost));
+        await using (var ledgerDb = Context())
+        {
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => new RunPipeline(Stories(), new WorkLedger(ledgerDb, TimeProvider.System),
+                new PostgresRunLocks(_cs), workspaces, worker, new PullRequests(), new RepoRef("acme", "widgets"), TextWriter.Null, recorder)
+                .RunAsync(1, ctrlC.Token));
+        }
+        await using (var db = Context())
+        {
+            Assert.Empty(await db.SessionTaints.ToListAsync()); // the window: the use is only in the stored stream
+            Assert.Contains(await db.SessionEvents.Select(e => e.Payload).ToListAsync(), p => p.Contains("\"WebFetch\""));
+        }
+
+        var stories = Stories();
+        await using var rerunDb = Context();
+        var outcome = await new RunPipeline(stories, new WorkLedger(rerunDb, TimeProvider.System), new PostgresRunLocks(_cs), workspaces, worker,
+            new PullRequests(), new RepoRef("acme", "widgets"), TextWriter.Null, recorder).RunAsync(1, CancellationToken.None);
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Equal(1, calls);
+        Assert.Equal(0, workspaces.Pushes);
+        Assert.Contains($"{sid} is tainted (web:WebFetch)", Assert.Single(stories.Comments));
+        await using var check = Context();
+        var taint = await check.SessionTaints.SingleAsync();
+        Assert.Equal((sid, "web:WebFetch"), (taint.ClaudeSessionId, taint.Reason));
+    }
+
     [Fact]
     public async Task A_failed_session_records_its_end_without_waiting_on_a_hung_router()
     {
@@ -707,7 +758,12 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct) => Task.FromResult(Ws(branch));
         public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct) => Task.FromResult(Ws(branch));
         public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct) => Task.FromResult<Workspace?>(Ws(branch));
-        public Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, CancellationToken ct) => Task.FromResult(true);
+        public int Pushes { get; private set; }
+        public Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, PushGrant grant, CancellationToken ct)
+        {
+            Pushes++;
+            return Task.FromResult(true);
+        }
         public Task<string> HeadAsync(Workspace workspace, CancellationToken ct) => Task.FromResult("head");
         public Task<Gate.BaseMerge> MergeBaseAsync(RepoRef repo, Workspace workspace, CancellationToken ct) => throw new NotSupportedException();
         public Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct) => throw new NotSupportedException();

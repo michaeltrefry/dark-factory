@@ -78,6 +78,24 @@ public sealed class WorkerSession
     public long? RouterRequestCount { get; set; }
 }
 
+/// <summary>
+/// A worker session that has read untrusted content (E4, <see cref="Worker.Taint"/>): it never gets a push token. Insert-only and keyed
+/// by the Claude session id, so it holds across resume and crash; the first reason recorded is kept, and the database refuses to update
+/// or delete a row.
+/// </summary>
+public sealed class SessionTaint
+{
+    public required string ClaudeSessionId { get; set; }
+
+    /// <summary>The item the session worked for, when known.</summary>
+    public long? WorkItemId { get; set; }
+
+    /// <summary>What tainted it: <c>issue-text</c>, <c>outsider-comment</c>, <c>web:&lt;tool&gt;</c> or <c>mcp:&lt;tool&gt;</c>.</summary>
+    public required string Reason { get; set; }
+
+    public DateTimeOffset TaintedAt { get; set; }
+}
+
 /// <summary>One stdout line of a worker session, in arrival order (E7).</summary>
 public sealed class SessionEvent
 {
@@ -165,6 +183,7 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
     public DbSet<WorkerSession> WorkerSessions => Set<WorkerSession>();
     public DbSet<SessionEvent> SessionEvents => Set<SessionEvent>();
     public DbSet<Control> Controls => Set<Control>();
+    public DbSet<SessionTaint> SessionTaints => Set<SessionTaint>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -222,6 +241,15 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
             e.ToTable("github_issues");
             e.Property(x => x.Repo).HasMaxLength(200);
             e.HasIndex(x => new { x.Repo, x.Number }).IsUnique();
+        });
+        modelBuilder.Entity<SessionTaint>(e =>
+        {
+            e.ToTable("session_taints");
+            e.HasKey(x => x.ClaudeSessionId);
+            e.Property(x => x.ClaudeSessionId).HasMaxLength(128);
+            e.Property(x => x.Reason).HasMaxLength(128);
+            e.HasIndex(x => x.WorkItemId);
+            e.HasOne<WorkItem>().WithMany().HasForeignKey(x => x.WorkItemId);
         });
         modelBuilder.Entity<GitHubIssueCursor>(e =>
         {

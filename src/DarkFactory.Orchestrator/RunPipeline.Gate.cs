@@ -4,6 +4,7 @@ using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Shortcut;
+using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.Orchestrator;
@@ -439,7 +440,7 @@ public sealed partial class RunPipeline
             ?? throw new InvalidOperationException($"Fix round {round} has no verdict on the commit it fixes ({fixedHead}).");
         var findings = FixLoop.Fixable(verdict)
             ?? throw new InvalidOperationException($"The verdict on {fixedHead} has no confirmed blocking findings to fix.");
-        await RunFixRoundAsync(run, history, round, fixedHead, $"{findings.Count} finding(s)",
+        await RunFixRoundAsync(run, history, round, fixedHead, $"{findings.Count} finding(s)", [SpecInput(spec.Story), WorkerInput.ReviewFindings],
             _ => Task.FromResult(BuildFixPrompt(spec, repo, round, findings)), BuildFixResumePrompt(spec.Story, round),
             $"{spec.Story.Ref}: fix review findings (round {round})", WorkState.Review, $"fix round {round}", ct);
     }
@@ -454,7 +455,7 @@ public sealed partial class RunPipeline
     /// recorded (it runs again on a resumed run that had already pushed).
     /// </summary>
     private async Task RunFixRoundAsync(Run run, List<LedgerEntry> history, int round, string fixedHead, string what,
-        Func<CancellationToken, Task<string>> prompt, string resumePrompt, string commitMessage, WorkState next, string name, CancellationToken ct,
+        IReadOnlyCollection<WorkerInput> inputs, Func<CancellationToken, Task<string>> prompt, string resumePrompt, string commitMessage, WorkState next, string name, CancellationToken ct,
         Func<Workspace, CancellationToken, Task>? prepare = null, Func<string, CancellationToken, Task>? afterPush = null)
     {
         var (spec, repo, item) = run;
@@ -499,12 +500,13 @@ public sealed partial class RunPipeline
             if (!attempt.Any(e => e.Step == Steps.WorkerDone))
             {
                 var fresh = session is null ? await prompt(ct) : null;
-                session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? fresh! : resumePrompt, models, "fix", ct);
+                session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? fresh! : resumePrompt, models, inputs, "fix", ct);
             }
             await ThrowIfControlledAsync(item, ct);
+            var grant = await GrantPushAsync(item, session, ct);
             // The PR branch is always ahead of the base, so this pushes even when the fixer changed nothing (the same head):
             // that round is judged like any other (a review round with no fewer blocking findings fails; red CI stays red).
-            await workspaces.CommitAndPushAsync(repo, workspace, commitMessage, ct);
+            await workspaces.CommitAndPushAsync(repo, workspace, commitMessage, grant, ct);
             pushed = await workspaces.HeadAsync(workspace, ct);
             if (pushed == fixedHead)
             {
@@ -544,7 +546,8 @@ public sealed partial class RunPipeline
         var fixedHead = history[healing].Detail!;
         var triage = history.Where(e => e.Step == Steps.CiFailure).Select(e => CiTriage.FromDetail(e.Detail)).LastOrDefault(t => t?.HeadSha == fixedHead)
             ?? throw new InvalidOperationException($"CI fix round {round} has no CI triage of the commit it fixes ({fixedHead}).");
-        await RunFixRoundAsync(run, history, round, fixedHead, $"failing checks: {string.Join(", ", triage.Fixable)}",
+        // CI logs do not taint the CI fixer (the rule and why: Taint).
+        await RunFixRoundAsync(run, history, round, fixedHead, $"failing checks: {string.Join(", ", triage.Fixable)}", [SpecInput(spec.Story), WorkerInput.CiLog],
             async c => BuildCiFixPrompt(spec, repo, round, fixedHead, await FailureLogsAsync(run, fixedHead, triage, c)),
             BuildCiFixResumePrompt(spec.Story, round),
             $"{spec.Story.Ref}: fix CI (round {round})", WorkState.CI, $"ci fix round {round}", ct);

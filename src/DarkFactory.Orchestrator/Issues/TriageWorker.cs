@@ -14,8 +14,11 @@ public interface ITriageRunner
     /// <summary>
     /// Runs one triage session for <paramref name="item"/> in a throwaway checkout of <paramref name="repo"/>'s default branch;
     /// <paramref name="onSession"/> gets the Claude session id as soon as it streams. Nothing the session does is pushed.
+    /// <paramref name="onTaint"/> gets the session id and a taint reason (<see cref="Taint"/>), committed before the run goes on: the
+    /// session reads the issue's text (<see cref="Taint.IssueText"/>, before <paramref name="onSession"/>), and any web or MCP tool it uses.
     /// </summary>
-    Task<WorkerResult> RunAsync(WorkItem item, RepoRef repo, string prompt, Func<string, CancellationToken, Task> onSession, CancellationToken ct);
+    Task<WorkerResult> RunAsync(WorkItem item, RepoRef repo, string prompt, Func<string, CancellationToken, Task> onSession,
+        Func<string, string, CancellationToken, Task> onTaint, CancellationToken ct);
 }
 
 /// <summary>
@@ -32,7 +35,7 @@ public sealed class WorkerTriageRunner(IRepoWorkspace workspaces, IWorker worker
     public static string Branch(WorkItem item) => $"factory/triage-{item.ExternalId}";
 
     public async Task<WorkerResult> RunAsync(WorkItem item, RepoRef repo, string prompt, Func<string, CancellationToken, Task> onSession,
-        CancellationToken ct)
+        Func<string, string, CancellationToken, Task> onTaint, CancellationToken ct)
     {
         var workspace = await workspaces.PrepareAsync(repo, Branch(item), ct);
         var remove = true;
@@ -50,6 +53,8 @@ public sealed class WorkerTriageRunner(IRepoWorkspace workspaces, IWorker worker
                         if (sid != session)
                         {
                             session = sid;
+                            // The prompt holds the issue's own text: the session is tainted from its start (E4).
+                            await onTaint(sid, Taint.Of(WorkerInput.IssueText)!, c);
                             if (capture is not null)
                             {
                                 await capture.SetClaudeSessionIdAsync(sid, c);
@@ -57,7 +62,8 @@ public sealed class WorkerTriageRunner(IRepoWorkspace workspaces, IWorker worker
                             await onSession(sid, c);
                         }
                     },
-                    OnLine: capture is null ? null : capture.OnLineAsync), ct);
+                    OnLine: capture is null ? null : capture.OnLineAsync,
+                    OnUntrusted: onTaint), ct);
             }
             catch (Exception) when (capture is not null)
             {

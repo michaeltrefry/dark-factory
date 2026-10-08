@@ -885,7 +885,7 @@ public class LiveWorkerSandboxTests
             switch (ending)
             {
                 case "success":
-                    Assert.True(await git.CommitAndPushAsync(Repo, ws, "sc-1: change", ct)); // owner reads the worker's files
+                    Assert.True(await git.CommitAndPushAsync(Repo, ws, "sc-1: change", TestGrants.Untainted, ct)); // owner reads the worker's files
                     break;
                 case "stop":
                     using (var p = sandbox.Start(ws.Path, "/bin/sh", ["-c", "sleep 600 & echo $!; wait"], new Dictionary<string, string>()))

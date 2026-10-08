@@ -141,6 +141,87 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
     public async Task<TransitionContext> ContextAsync(WorkItem item, CancellationToken ct) =>
         TransitionContext.From((await HistoryAsync(item, ct)).Where(e => e.Step is null).Select(e => e.State).ToList());
 
+    /// <summary>
+    /// Marks the worker session <paramref name="sessionId"/> tainted (E4, <see cref="Worker.Taint"/>), committed before this returns.
+    /// Sticky: an already tainted session keeps its first reason; nothing un-taints one.
+    /// </summary>
+    public async Task TaintSessionAsync(WorkItem? item, string sessionId, string reason, CancellationToken ct)
+    {
+        if (await TaintOfAsync(sessionId, ct) is not null)
+        {
+            return;
+        }
+        var taint = new SessionTaint { ClaudeSessionId = sessionId, WorkItemId = item?.Id, Reason = reason, TaintedAt = time.GetUtcNow() };
+        db.SessionTaints.Add(taint);
+        try
+        {
+            await db.SaveChangesAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            // Nothing was written: leave no tracked row behind for a later save to write.
+            db.Entry(taint).State = EntityState.Detached;
+            // A concurrent writer tainted it first: the session is tainted either way.
+            if (ex is DbUpdateException && await TaintOfAsync(sessionId, ct) is not null)
+            {
+                return;
+            }
+            throw;
+        }
+        db.Entry(taint).State = EntityState.Detached;
+    }
+
+    /// <summary>
+    /// Replays the stored stream of <paramref name="sessionId"/> (its <c>session_events</c>) through a <see cref="Worker.StreamJsonState"/>
+    /// and taints the session for every web or MCP tool use found there (E4). It closes the window in which a run stopped after
+    /// the line was stored but before its taint committed. A failed read throws, so a session whose stream cannot be checked is
+    /// not resumed (E2).
+    /// </summary>
+    public async Task ReplayTaintsAsync(WorkItem? item, string sessionId, CancellationToken ct)
+    {
+        var state = new Worker.StreamJsonState();
+        var rows = db.WorkerSessions.Where(s => s.ClaudeSessionId == sessionId).Select(s => s.Id);
+        var lines = db.SessionEvents.AsNoTracking()
+            .Where(e => rows.Contains(e.WorkerSessionId) && e.Type == "assistant")
+            .OrderBy(e => e.WorkerSessionId).ThenBy(e => e.Sequence)
+            .Select(e => e.Payload)
+            .AsAsyncEnumerable();
+        await foreach (var line in lines.WithCancellation(ct))
+        {
+            state.Accept(line);
+        }
+        foreach (var reason in state.UntrustedReads)
+        {
+            await TaintSessionAsync(item, sessionId, reason, ct);
+        }
+    }
+
+    /// <summary>The session's taint, read fresh from the ledger, or null when it is not tainted.</summary>
+    public Task<SessionTaint?> TaintOfAsync(string sessionId, CancellationToken ct) =>
+        db.SessionTaints.AsNoTracking().SingleOrDefaultAsync(t => t.ClaudeSessionId == sessionId, ct);
+
+    /// <summary>
+    /// The right to push the work of <paramref name="sessions"/> (the worker sessions of the attempt being pushed): issued only when
+    /// there is at least one and none is tainted. A tainted one throws <see cref="Worker.SessionTaintedException"/> (E4); none at
+    /// all throws too, since a push whose provenance cannot be checked is refused (E2).
+    /// </summary>
+    public async Task<Worker.PushGrant> GrantPushAsync(IEnumerable<string?> sessions, CancellationToken ct)
+    {
+        var ids = sessions.OfType<string>().Distinct(StringComparer.Ordinal).ToList();
+        if (ids.Count == 0)
+        {
+            throw new InvalidOperationException("No worker session vouches for this push, so its taint cannot be checked; refusing it (E2).");
+        }
+        foreach (var id in ids)
+        {
+            if (await TaintOfAsync(id, ct) is { } taint)
+            {
+                throw new Worker.SessionTaintedException(id, taint.Reason);
+            }
+        }
+        return new Worker.PushGrant(ids);
+    }
+
     private async Task<LedgerEntry> AppendAsync(WorkItem item, WorkState state, string? step, string? claudeSessionId, string? detail, CancellationToken ct)
     {
         var now = time.GetUtcNow();

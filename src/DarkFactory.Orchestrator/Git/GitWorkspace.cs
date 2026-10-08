@@ -24,8 +24,12 @@ public interface IRepoWorkspace
     /// </summary>
     Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct);
 
-    /// <summary>Commits any worker changes and pushes the branch. Returns false when there is nothing to push.</summary>
-    Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, CancellationToken ct);
+    /// <summary>
+    /// Commits any worker changes and pushes the branch. Returns false when there is nothing to push. The push token is minted only
+    /// with a <paramref name="grant"/> (<see cref="Ledger.WorkLedger.GrantPushAsync"/>: the worker sessions whose work this publishes
+    /// are untainted, E4).
+    /// </summary>
+    Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, PushGrant grant, CancellationToken ct);
 
     /// <summary>The commit the worktree's HEAD is at (after <see cref="CommitAndPushAsync"/>: the commit it pushed).</summary>
     Task<string> HeadAsync(Workspace workspace, CancellationToken ct);
@@ -328,8 +332,10 @@ public sealed class GitWorkspace(
         }
     }
 
-    public async Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, CancellationToken ct)
+    public async Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, PushGrant grant, CancellationToken ct)
     {
+        // No grant, no push token (E4): only the ledger's taint check issues one.
+        ArgumentNullException.ThrowIfNull(grant);
         EnsureFactoryBranch(workspace.Branch);
         var dir = workspace.Path;
         string[] tree = [$"--git-dir={workspace.GitDir}", $"--work-tree={dir}"];

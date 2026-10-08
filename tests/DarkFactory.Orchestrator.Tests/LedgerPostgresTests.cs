@@ -56,6 +56,28 @@ public sealed class LedgerPostgresTests : IAsyncLifetime
         }
     }
 
+    /// <summary>A session's taint (E4) is sticky in the database itself: racing writers both succeed, and no row can be changed, removed or truncated.</summary>
+    [Fact]
+    public async Task A_session_taint_cannot_be_updated_or_deleted_and_racing_taints_both_succeed()
+    {
+        await using (var a = Context())
+        await using (var b = Context())
+        {
+            var item = await new WorkLedger(a, TimeProvider.System).GetOrCreateAsync("shortcut", "sc-5", "t", "o/r", null, CancellationToken.None);
+            await Task.WhenAll(
+                new WorkLedger(a, TimeProvider.System).TaintSessionAsync(item, "sess-t", Taint.IssueText, CancellationToken.None),
+                new WorkLedger(b, TimeProvider.System).TaintSessionAsync(null, "sess-t", "web:WebFetch", CancellationToken.None));
+        }
+
+        await using var db = Context();
+        Assert.Single(await db.SessionTaints.ToListAsync());
+        await Assert.ThrowsAsync<PostgresException>(() => db.Database.ExecuteSqlRawAsync("""UPDATE session_taints SET "Reason" = 'cleared'"""));
+        await Assert.ThrowsAsync<PostgresException>(() => db.Database.ExecuteSqlRawAsync("DELETE FROM session_taints"));
+        await Assert.ThrowsAsync<PostgresException>(() => db.Database.ExecuteSqlRawAsync("TRUNCATE session_taints"));
+        Assert.Single(await db.SessionTaints.ToListAsync());
+        await Assert.ThrowsAsync<SessionTaintedException>(() => new WorkLedger(db, TimeProvider.System).GrantPushAsync(["sess-t"], CancellationToken.None));
+    }
+
     [Fact]
     public async Task Second_concurrent_run_of_an_item_exits_already_running_and_the_worker_runs_once()
     {
@@ -148,7 +170,7 @@ public sealed class LedgerPostgresTests : IAsyncLifetime
         public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct) => Task.FromResult(Ws(branch));
         public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct) => Task.FromResult(Ws(branch));
         public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct) => Task.FromResult<Workspace?>(Ws(branch));
-        public Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, CancellationToken ct) => Task.FromResult(true);
+        public Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, PushGrant grant, CancellationToken ct) => Task.FromResult(true);
         public Task<string> HeadAsync(Workspace workspace, CancellationToken ct) => Task.FromResult("head");
         public Task<Gate.BaseMerge> MergeBaseAsync(RepoRef repo, Workspace workspace, CancellationToken ct) => throw new NotSupportedException();
         public Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct) => throw new NotSupportedException();
