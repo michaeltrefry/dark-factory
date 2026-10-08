@@ -46,8 +46,13 @@ public static class GateChecks
     public const string SecurityReview = "security-review";
     /// <summary>The change is within the policy's risk threshold: diff size and fix rounds.</summary>
     public const string RiskThreshold = "risk-threshold";
+    /// <summary>
+    /// The tests the PR adds fail on the base commit (with the PR's test files applied) and pass on the head, both run
+    /// sandboxed (sc-25382, <see cref="NewTestsCheck"/>): a new test that already passes on the base checks nothing.
+    /// </summary>
+    public const string NewTestsFailOnBase = "new-tests-fail-on-base";
 
-    public static readonly IReadOnlyList<string> All = [CiGreen, ReviewPass, SecurityReview, RiskThreshold];
+    public static readonly IReadOnlyList<string> All = [CiGreen, ReviewPass, SecurityReview, RiskThreshold, NewTestsFailOnBase];
 }
 
 /// <summary>Repository paths as git names them: case-sensitive, relative to the repository root, '/'-separated.</summary>

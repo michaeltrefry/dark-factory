@@ -14,8 +14,10 @@ public class GatePolicyTests
         Assert.Equal(["factory/gate.yaml", ".github/workflows/", "CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS", "factory/prompts/"],
             Policy.TierRules[Tier.Sealed].Paths.Select(p => p.Text));
         Assert.Empty(Policy.TierRules[Tier.Normal].Paths);
-        Assert.Equal([GateChecks.CiGreen, GateChecks.ReviewPass, GateChecks.SecurityReview, GateChecks.RiskThreshold],
+        Assert.Equal([GateChecks.CiGreen, GateChecks.ReviewPass, GateChecks.SecurityReview, GateChecks.RiskThreshold, GateChecks.NewTestsFailOnBase],
             GateChecks.All.Where(Policy.TierRules[Tier.Protected].Checks.Contains));
+        Assert.Equal([GateChecks.CiGreen, GateChecks.ReviewPass, GateChecks.RiskThreshold, GateChecks.NewTestsFailOnBase],
+            GateChecks.All.Where(Policy.TierRules[Tier.Normal].Checks.Contains));
         Assert.Equal([GateChecks.CiGreen, GateChecks.ReviewPass], GateChecks.All.Where(Policy.TierRules[Tier.Free].Checks.Contains));
         Assert.Equal(new RiskThreshold(400, 20, 3), Policy.Risk);
     }
@@ -46,7 +48,7 @@ public class GatePolicyTests
             { Replace("    paths: [docs/, tests/]", "    paths: docs/"), "tiers.free.paths must be a non-empty list" },
             { Replace("[ci-green, review-pass]\nrisk", "[ci-green]\nrisk"), "tiers.free.checks must include review-pass" },
             { Replace("[ci-green, review-pass]\nrisk", "[review-pass]\nrisk"), "tiers.free.checks must include ci-green" },
-            { Replace("[ci-green, review-pass, security-review, risk-threshold]", "[ci-green, review-pass, risk-threshold]"),
+            { Replace("[ci-green, review-pass, security-review, risk-threshold, new-tests-fail-on-base]", "[ci-green, review-pass, risk-threshold, new-tests-fail-on-base]"),
                 "tiers.protected.checks must include security-review" },
             { Replace("[ci-green, review-pass]\nrisk", "[ci-green, review-pass, skip-ci]\nrisk"), "unknown check 'skip-ci'" },
             { Replace("paths: [factory/gate.yaml, ", "paths: ["), "the sealed tier must cover factory/gate.yaml" },
@@ -58,9 +60,15 @@ public class GatePolicyTests
             { Replace(".github/workflows/, ", ".github/workflows/*.yml, .github/workflows/*.yaml, "), "the sealed tier must cover .github/workflows/" },
             { Replace("factory/prompts/]", "factory/prompts/review.md]"), "the sealed tier must cover factory/prompts/" },
             { Replace("factory/prompts/]", "factory/prompts/*]"), "the sealed tier must cover factory/prompts/" },
-            { Replace("[ci-green, review-pass, risk-threshold]", "[ci-green, review-pass]"), "tiers.normal.checks must include risk-threshold" },
-            { Replace("[ci-green, review-pass, security-review, risk-threshold]", "[ci-green, review-pass, security-review]"),
+            { Replace("[ci-green, review-pass, risk-threshold, new-tests-fail-on-base]", "[ci-green, review-pass, new-tests-fail-on-base]"),
+                "tiers.normal.checks must include risk-threshold" },
+            { Replace("[ci-green, review-pass, security-review, risk-threshold, new-tests-fail-on-base]", "[ci-green, review-pass, security-review, new-tests-fail-on-base]"),
                 "tiers.protected.checks must include risk-threshold" },
+            // sc-25382: a code change must add a test that fails on the base; the policy cannot drop that floor.
+            { Replace("[ci-green, review-pass, risk-threshold, new-tests-fail-on-base]", "[ci-green, review-pass, risk-threshold]"),
+                "tiers.normal.checks must include new-tests-fail-on-base" },
+            { Replace("[ci-green, review-pass, security-review, risk-threshold, new-tests-fail-on-base]", "[ci-green, review-pass, security-review, risk-threshold]"),
+                "tiers.protected.checks must include new-tests-fail-on-base" },
             { Replace("infra/", "infra/../src/"), "invalid segment '..'" },
             { Replace("infra/", "/infra/"), "'/infra/' is not a path pattern" },
             { Replace("infra/", "infra**/"), "invalid segment 'infra**'" },
@@ -248,7 +256,7 @@ public class GatePolicyTests
     public void The_required_checks_are_the_union_of_the_touched_tiers()
     {
         Assert.Equal([GateChecks.CiGreen, GateChecks.ReviewPass], GateChecks.All.Where(Policy.Classify(TestPolicies.Diff("docs/a.md")).Requires));
-        Assert.Equal([GateChecks.CiGreen, GateChecks.ReviewPass, GateChecks.RiskThreshold],
+        Assert.Equal([GateChecks.CiGreen, GateChecks.ReviewPass, GateChecks.RiskThreshold, GateChecks.NewTestsFailOnBase],
             GateChecks.All.Where(Policy.Classify(TestPolicies.Diff("docs/a.md") + TestPolicies.Diff("src/a.cs")).Requires));
         Assert.Equal(GateChecks.All, GateChecks.All.Where(Policy.Classify(TestPolicies.Diff("src/a.cs") + TestPolicies.Diff("src/auth/a.cs")).Requires));
         Assert.Equal(["src/auth/a.cs (protected)"],
@@ -270,19 +278,26 @@ public class MergeGateTierTests
     /// <summary>A passing verdict on the head with every role (security included); no risky paths claimed.</summary>
     private static readonly ReviewVerdict Full = ReviewPanel.Decide(Head, [], ReviewRoles.All.Select(Review).ToList());
 
-    private static GateDecision Evaluate(string diff, int fixRounds = 0, CiFacts? ci = null, ReviewVerdict? verdict = null, string? policy = null) =>
-        MergeGate.Evaluate(policy ?? Policy, null, TestPolicies.Counting(Pull, new ChangeFacts(diff, null, 0)), new ChangeFacts(diff, null, fixRounds), ci ?? Green, verdict is null ? [Full] : [verdict], Implementer);
+    /// <summary>The new-tests check passed for exactly this base and head (sc-25382).</summary>
+    private static readonly NewTestsResult PassingTests = new("base", Head, NewTestsOutcome.Pass,
+        "1 new test(s) fail on the base and pass on the head: W.Tests.New", "dotnet-xunit", "ran", "ran", []);
+
+    private static GateDecision Evaluate(string diff, int fixRounds = 0, CiFacts? ci = null, ReviewVerdict? verdict = null, string? policy = null,
+        NewTestsResult? tests = null, bool testsRun = true) =>
+        MergeGate.Evaluate(policy ?? Policy, null, TestPolicies.Counting(Pull, new ChangeFacts(diff, null, 0)), new ChangeFacts(diff, null, fixRounds), ci ?? Green, verdict is null ? [Full] : [verdict], Implementer,
+            testsRun ? tests ?? PassingTests : null);
 
     /// <summary>
     /// One row per tier of the standard policy: a path in it, whether each check is enforced for it, and whether a change
     /// passing every check merges (sealed and protected escalate instead).
     /// </summary>
     [Theory]
-    [InlineData(".github/workflows/ci.yml", Tier.Sealed, true, true, true, false, false, "touches sealed path(s), which always escalate")]
-    [InlineData("src/auth/Login.cs", Tier.Protected, true, true, true, true, false, "touches protected path(s), merged only after escalation")]
-    [InlineData("src/WordCount.cs", Tier.Normal, true, true, false, true, true, null)]
-    [InlineData("tests/WordCountTests.cs", Tier.Free, true, true, false, false, true, null)]
-    public void Each_tier_enforces_its_required_checks(string path, Tier tier, bool ci, bool review, bool security, bool risk, bool merges, string? escalation)
+    [InlineData(".github/workflows/ci.yml", Tier.Sealed, true, true, true, false, false, false, "touches sealed path(s), which always escalate")]
+    [InlineData("src/auth/Login.cs", Tier.Protected, true, true, true, true, true, false, "touches protected path(s), merged only after escalation")]
+    [InlineData("src/WordCount.cs", Tier.Normal, true, true, false, true, true, true, null)]
+    [InlineData("tests/WordCountTests.cs", Tier.Free, true, true, false, false, false, true, null)]
+    public void Each_tier_enforces_its_required_checks(string path, Tier tier, bool ci, bool review, bool security, bool risk, bool newTests, bool merges,
+        string? escalation)
     {
         Assert.Equal(tier, GatePolicy.Parse(Policy).TierOf(path).Tier);
         var diff = TestPolicies.Diff(path);
@@ -304,6 +319,11 @@ public class MergeGateTierTests
         AssertEnforced(risk, Evaluate(TestPolicies.Diff(path, lines: 401)), "risk threshold: 401 changed lines exceed max_changed_lines 400");
         AssertEnforced(risk, Evaluate(string.Concat(Enumerable.Range(0, 21).Select(i => TestPolicies.Diff(path.Insert(path.LastIndexOf('.'), $"{i}"))))),
             "risk threshold: 21 changed files exceed max_changed_files 20");
+        // sc-25382: the new tests must have run for this base and head, and failed on the base.
+        AssertEnforced(newTests, Evaluate(diff, testsRun: false), "new-tests-fail-on-base: the tests the PR adds were not run");
+        AssertEnforced(newTests, Evaluate(diff, tests: PassingTests with { Outcome = NewTestsOutcome.Rejected, Reason = "W.Tests.Old already passes on the base" }),
+            "new-tests-fail-on-base (rejected): W.Tests.Old already passes on the base");
+        AssertEnforced(newTests, Evaluate(diff, tests: PassingTests with { HeadSha = "0123456789abcdef" }), "the tests were run for base...0123456789ab");
     }
 
     private static void AssertEnforced(bool enforced, GateDecision decision, string reason)
@@ -401,7 +421,8 @@ public class MergeGateTierTests
     {
         var decision = Evaluate(TestPolicies.Diff("docs/a.md") + TestPolicies.Diff("src/a.cs", lines: 2), fixRounds: 1);
         Assert.Equal(GateOutcome.Merge, decision.Outcome);
-        Assert.Contains("paths: free 1, normal 1; checks: ci-green, review-pass, risk-threshold", decision.Detail);
+        Assert.Contains("paths: free 1, normal 1; checks: ci-green, review-pass, risk-threshold, new-tests-fail-on-base", decision.Detail);
+        Assert.Contains("1 new test(s) fail on the base and pass on the head: W.Tests.New", decision.Detail);
         Assert.Contains("risk within threshold (3 changed lines, 2 files, 1 fix rounds)", decision.Detail);
     }
 }

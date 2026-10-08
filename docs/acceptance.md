@@ -176,7 +176,9 @@ Owner set-up, once (the test skips naming whichever is missing):
 3. A committed `factory/gate.yaml` on the sandbox's main in the version-2 format (sc-25381: path tiers and a risk
    threshold; michaeltrefry/dark-factory-sandbox#6). A version-1 policy is rejected: every review escalates. The gate
    stories must change only normal or free paths (e.g. `src/Sandbox/`, `tests/`), small enough for the risk threshold —
-   a sealed or protected path escalates instead of merging.
+   a sealed or protected path escalates instead of merging. Since sc-25382 a normal-tier change must also add an xUnit test
+   that fails on the base and passes on the head (`new-tests-fail-on-base`, run sandboxed as `_factory`, so `sudo
+   scripts/setup-worker-user.sh` must be in place), and the policy must list that check in `normal` and `protected`.
 
 | Test | Variables | Proves |
 | --- | --- | --- |

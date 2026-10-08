@@ -53,7 +53,8 @@ public class MergeGateTests
     private static GateDecision Evaluate(string? policy = null, string? policyError = null, PullFacts? pull = null, CiFacts? ci = null,
         ReviewVerdict[]? verdicts = null, string[]? implementer = null, ChangeFacts? change = null, bool noPolicy = false) =>
         MergeGate.Evaluate(noPolicy ? null : policy ?? Policy, policyError, TestPolicies.Counting(pull ?? Pull, change ?? Normal), change ?? Normal,
-            ci ?? Green, verdicts ?? [Pass], implementer ?? Implementer);
+            ci ?? Green, verdicts ?? [Pass], implementer ?? Implementer,
+            new NewTestsResult("base", (pull ?? Pull).HeadSha, NewTestsOutcome.Pass, "1 new test(s) fail on the base and pass on the head: X.New", "dotnet-xunit", "ran", "ran", []));
 
     [Fact]
     public void Merges_when_ci_is_green_and_a_different_family_passed_the_head()

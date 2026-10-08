@@ -22,9 +22,9 @@ public sealed record RiskThreshold(int MaxChangedLines, int MaxChangedFiles, int
 ///     checks: [ci-green, review-pass, security-review]
 ///   protected:                    # built and reviewed; merged only after escalation
 ///     paths: ["**/auth/", "**/migrations/", infra/, "**/secrets/", "**/payments/"]
-///     checks: [ci-green, review-pass, security-review, risk-threshold]
+///     checks: [ci-green, review-pass, security-review, risk-threshold, new-tests-fail-on-base]
 ///   normal:                       # every path no other tier matches (no paths key)
-///     checks: [ci-green, review-pass, risk-threshold]
+///     checks: [ci-green, review-pass, risk-threshold, new-tests-fail-on-base]
 ///   free:
 ///     paths: [docs/, tests/]
 ///     checks: [ci-green, review-pass]
@@ -41,7 +41,9 @@ public sealed record RiskThreshold(int MaxChangedLines, int MaxChangedFiles, int
 /// to switch a rule off:
 /// <list type="bullet">
 /// <item>checks: every tier lists <c>ci-green</c> and <c>review-pass</c>; sealed and protected also <c>security-review</c>;
-/// protected and normal also <c>risk-threshold</c> (<see cref="FloorChecks"/>);</item>
+/// protected and normal also <c>risk-threshold</c> and <c>new-tests-fail-on-base</c> (<see cref="FloorChecks"/>; so a code
+/// change in those tiers that adds no test, or only tests that already pass on the base, does not merge; free and sealed
+/// changes need no new test unless the policy adds the check);</item>
 /// <item>sealed paths: the sealed tier must cover the gate's own files and directories (<see cref="MustBeSealed"/>; a
 /// directory only by a pattern covering everything under it, never by naming files in it);</item>
 /// <item>security-review paths: a touched path calls the security review in when its tier lists <c>security-review</c>
@@ -77,8 +79,8 @@ public sealed class GatePolicy
     public static readonly IReadOnlyDictionary<Tier, string[]> FloorChecks = new Dictionary<Tier, string[]>
     {
         [Tier.Sealed] = [GateChecks.CiGreen, GateChecks.ReviewPass, GateChecks.SecurityReview],
-        [Tier.Protected] = [GateChecks.CiGreen, GateChecks.ReviewPass, GateChecks.SecurityReview, GateChecks.RiskThreshold],
-        [Tier.Normal] = [GateChecks.CiGreen, GateChecks.ReviewPass, GateChecks.RiskThreshold],
+        [Tier.Protected] = [GateChecks.CiGreen, GateChecks.ReviewPass, GateChecks.SecurityReview, GateChecks.RiskThreshold, GateChecks.NewTestsFailOnBase],
+        [Tier.Normal] = [GateChecks.CiGreen, GateChecks.ReviewPass, GateChecks.RiskThreshold, GateChecks.NewTestsFailOnBase],
         [Tier.Free] = [GateChecks.CiGreen, GateChecks.ReviewPass],
     };
 

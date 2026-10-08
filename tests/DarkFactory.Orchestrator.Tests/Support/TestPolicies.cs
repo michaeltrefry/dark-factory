@@ -6,7 +6,7 @@ namespace DarkFactory.Orchestrator.Tests.Support;
 internal static class TestPolicies
 {
     /// <summary>A valid version-2 policy: every tier, the floor checks, a risk threshold the fix-loop tests stay inside.</summary>
-    public static string Standard(int maxLines = 400, int maxFiles = 20, int maxFixRounds = 3, string normalChecks = "ci-green, review-pass, risk-threshold") => $"""
+    public static string Standard(int maxLines = 400, int maxFiles = 20, int maxFixRounds = 3, string normalChecks = "ci-green, review-pass, risk-threshold, new-tests-fail-on-base") => $"""
         # Dark Factory merge gate policy (test)
         version: 2
         tiers:
@@ -15,7 +15,7 @@ internal static class TestPolicies
             checks: [ci-green, review-pass, security-review]
           protected:
             paths: ["**/auth/", "**/migrations/", infra/, "**/secrets/", "**/payments/"]
-            checks: [ci-green, review-pass, security-review, risk-threshold]
+            checks: [ci-green, review-pass, security-review, risk-threshold, new-tests-fail-on-base]
           normal:
             checks: [{normalChecks}]
           free:

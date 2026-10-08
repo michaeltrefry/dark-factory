@@ -10,8 +10,9 @@ namespace DarkFactory.Orchestrator;
 
 /// <summary>
 /// What the Review → CI → MergeGate → Merge handlers need: GitHub as the gate App (<see cref="GitHubGate"/>), the review
-/// panel's calls (through the router), the panel's model lists (per role, and the second models), and how long and how
-/// often CI is waited for.
+/// panel's calls (through the router), the panel's model lists (per role, and the second models), how long and how
+/// often CI is waited for, and the sandboxed test runs of the <c>new-tests-fail-on-base</c> check (<see cref="Tests"/>;
+/// none: the check cannot run, so it fails wherever it is required).
 /// </summary>
 public sealed record GateStage(
     IGateGitHub GitHub,
@@ -19,7 +20,8 @@ public sealed record GateStage(
     ReviewPanelModels Models,
     TimeSpan CiPollInterval,
     TimeSpan CiTimeout,
-    TimeProvider? Time = null)
+    TimeProvider? Time = null,
+    IGateTestRunner? Tests = null)
 {
     public static readonly TimeSpan DefaultCiPollInterval = TimeSpan.FromSeconds(30);
     public static readonly TimeSpan DefaultCiTimeout = TimeSpan.FromMinutes(30);
@@ -603,8 +605,9 @@ public sealed partial class RunPipeline
         }
         var fixRounds = TransitionContext.From(history.Where(e => e.Step is null).Select(e => e.State).ToList()).FixRounds;
         var ci = await Gate.GitHub.GetCiAsync(run.Repo, pull.HeadSha, ct);
+        var newTests = await NewTestsAsync(run, pull, history, policy, diff, ct);
         var decision = MergeGate.Evaluate(policy, policyError, pull, new ChangeFacts(diff, diffError, fixRounds), ci, Verdicts(history),
-            ImplementerModels(history));
+            ImplementerModels(history), newTests);
         await ledger.CheckpointAsync(run.Item, Steps.GateDecision, null, decision.Detail, ct);
         log.WriteLine($"[gate] {decision.Detail}");
         switch (decision.Outcome)
@@ -647,7 +650,133 @@ public sealed partial class RunPipeline
         await ledger.RecordAsync(run.Item, WorkState.Merge, null, merged.CommitSha, ct);
     }
 
+    /// <summary>
+    /// The <c>new-tests-fail-on-base</c> check (sc-25382) for the PR's base and head, when the change's tiers require it (null
+    /// otherwise, and when the policy or diff is unreadable or the head has no verdict yet: the gate blocks or reviews first
+    /// without running anything). A result already recorded for this exact base and head is reused (the runs are executed
+    /// facts, E5) unless it was an error; otherwise both runs execute (<see cref="NewTestsCheck"/>, sandboxed through
+    /// <see cref="GateStage.Tests"/>) and the result — every new test's cases on both commits — is checkpointed
+    /// (<see cref="Steps.NewTests"/>) before the gate uses it. A run that fails to execute (the clone, the sandbox, no runner)
+    /// is recorded as an error result, which fails the check (E2); a Pause/Stop or Ctrl-C is not.
+    /// </summary>
+    private async Task<NewTestsResult?> NewTestsAsync(Run run, PullFacts pull, List<LedgerEntry> history, string? policyText, string? diff,
+        CancellationToken ct)
+    {
+        if (policyText is null || diff is null || !Verdicts(history).Any(v => v.HeadSha == pull.HeadSha))
+        {
+            return null;
+        }
+        try
+        {
+            if (!GatePolicy.Parse(policyText).Classify(diff).Requires(GateChecks.NewTestsFailOnBase))
+            {
+                return null;
+            }
+        }
+        catch (GatePolicyException)
+        {
+            return null;
+        }
+        var recorded = history.Where(e => e.Step == Steps.NewTests).Select(e => NewTestsResult.FromDetail(e.Detail))
+            .LastOrDefault(r => r is not null && r.BaseSha == pull.BaseSha && r.HeadSha == pull.HeadSha);
+        if (recorded is not null && recorded.Outcome != NewTestsOutcome.Error)
+        {
+            log.WriteLine($"[gate] new tests ({recorded.Outcome}, recorded): {recorded.Reason}");
+            return recorded;
+        }
+        await ThrowIfControlledAsync(run.Item, ct);
+        NewTestsResult result;
+        if (Gate.Tests is not { } runner)
+        {
+            result = NewTestsResult.Without(pull.BaseSha, pull.HeadSha, NewTestsOutcome.Error, "no test runner is configured, so the new tests cannot be run");
+        }
+        else
+        {
+            // The runs execute model-written code for up to Gate:TestTimeoutMinutes each: a Pause or Stop cancels them (the
+            // runner stops the sandboxed commands) and nothing is recorded, so Continue runs the check again.
+            await using var watch = new TestRunWatch(_controls, _controlPoll, run.Item, log, ct);
+            try
+            {
+                result = await NewTestsCheck.RunAsync(runner, NewTestsCheck.Strategies, run.Repo, pull.BaseSha, pull.HeadSha,
+                    NewTestsCheck.RunName(run.Story.Id), line => log.WriteLine($"[gate] {line}"), watch.Token);
+            }
+            catch (Exception) when (watch.Requested is { } requested && !ct.IsCancellationRequested)
+            {
+                throw new ControlRequestedException(requested);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                result = NewTestsResult.Without(pull.BaseSha, pull.HeadSha, NewTestsOutcome.Error, $"the new tests could not be run: {ex.Message}");
+            }
+            if (watch.Requested is { } late && !ct.IsCancellationRequested)
+            {
+                // The control arrived as the runs ended: the result may be from cancelled runs, so it is not recorded either.
+                throw new ControlRequestedException(late);
+            }
+        }
+        await ledger.CheckpointAsync(run.Item, Steps.NewTests, null, result.ToDetail(), ct);
+        log.WriteLine($"[gate] new tests ({result.Outcome}): {result.Reason}");
+        return result;
+    }
+
     /// <summary>The merge commit of <paramref name="pull"/> when it is merged at a head a <see cref="Steps.GatePassed"/> names, else null.</summary>
+    /// <summary>
+    /// Watches an item's controls while the gate's test runs execute (polling, like a worker's watch): a Pause or Stop
+    /// cancels <see cref="Token"/> at once and is kept in <see cref="Requested"/>.
+    /// </summary>
+    private sealed class TestRunWatch : IAsyncDisposable
+    {
+        private readonly CancellationTokenSource _runs;
+        private readonly CancellationTokenSource _done = new();
+        private readonly Task _loop;
+        private int _requested = -1;
+
+        public TestRunWatch(IControls controls, TimeSpan poll, WorkItem item, TextWriter log, CancellationToken ct)
+        {
+            _runs = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _loop = Task.Run(() => WatchAsync(controls, poll, item, log));
+        }
+
+        /// <summary>Cancelled by Ctrl-C, Pause or Stop.</summary>
+        public CancellationToken Token => _runs.Token;
+
+        public ControlState? Requested => Volatile.Read(ref _requested) is var r and >= 0 ? (ControlState)r : null;
+
+        private async Task WatchAsync(IControls controls, TimeSpan poll, WorkItem item, TextWriter log)
+        {
+            while (!_done.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(poll, _done.Token);
+                    if (await controls.EffectiveAsync(item.ExternalId, item.EpicId, _done.Token) is not ControlState.Running and var state)
+                    {
+                        Volatile.Write(ref _requested, (int)state);
+                        log.WriteLine($"[control] {item.ExternalId} is {(state == ControlState.Stopping ? "being stopped" : "paused")}; stopping the gate's test runs");
+                        await _runs.CancelAsync();
+                        return;
+                    }
+                }
+                catch (OperationCanceledException) when (_done.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    log.WriteLine($"[control] could not read the controls of {item.ExternalId}: {ex.Message}; retrying");
+                }
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await _done.CancelAsync();
+            await _loop;
+            _runs.Dispose();
+            _done.Dispose();
+        }
+    }
+
     private static string? GatePassedAt(List<LedgerEntry> history, PullFacts pull) =>
         pull.Merged && history.Any(e => e.Step == Steps.GatePassed && e.Detail == pull.HeadSha) ? pull.MergeCommitSha : null;
 

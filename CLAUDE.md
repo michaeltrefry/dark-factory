@@ -14,7 +14,8 @@ Claude Code headless workers through the Weave router.
   `IWorkSource` + the `factory work` intake loop (`WorkSources/`; registered on the `factory work` host by `FactoryHost.BuildWork` via `services.AddIntake(options)`)
   and its Shortcut adapter (`Shortcut/ShortcutWorkSource.cs`), the Pause/Continue/Stop controls (`Controls/`), and the
   review and merge gate (`Gate/`: `ModelFamily`/`ReviewerChoice`, `ReviewPanel` (roles, risky paths, prompts, findings),
-  `RouterReviewer`, `GatePolicy`, `MergeGate`; reviewer prompts in `factory/prompts/`; GitHub side
+  `RouterReviewer`, `GatePolicy`, `MergeGate`, the new-tests check `NewTestsCheck`/`XunitNewTests`/`SandboxTestRunner`;
+  reviewer prompts in `factory/prompts/`; GitHub side
   `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`).
 - `scripts/` — `setup-worker-user.sh` (one-time root setup of the `_factory` sandbox user) and
   `factory-worker-launch` (the root-installed helper every sandboxed worker runs through).
@@ -62,6 +63,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Review:Confirm:Models` | `gpt-5.5,claude-opus-5,gpt-5.4-mini,claude-sonnet-5` (second models that confirm a blocking finding: the first that is not the reviewer's model and of no implementer family, preferring one of a third family) |
 | `Review:TimeoutMinutes` | `10` (one reviewer call) |
 | `Gate:CiPollSeconds`, `Gate:CiTimeoutMinutes` | `30`, `30` (CI on the PR head is polled until it finishes; still running at the timeout escalates) |
+| `Gate:TestTimeoutMinutes` | `20` (one sandboxed run — restore, build, the new tests — of the `new-tests-fail-on-base` check; still running at the timeout fails the check) |
 | `Factory:DefaultRepo` | `michaeltrefry/dark-factory-sandbox` (a story line `Repo: owner/name` overrides) |
 | `Shortcut:Watch:Teams`, `Shortcut:Watch:Epics` | empty = watch nothing; comma-separated team mention names/ids, epic ids |
 | `Intake:PollSeconds` | `60` |
@@ -274,7 +276,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   with `checks` only, and `risk: {max_changed_lines, max_changed_files, max_fix_rounds}`; every key required; version 1 is
   rejected; missing/invalid/unreadable → no merge, escalate; no bypass key exists). The policy can tighten the gate but not
   loosen it below floors in code (E2; described once on `GatePolicy`): checks — every tier lists `ci-green` and
-  `review-pass`, sealed/protected also `security-review`, protected/normal also `risk-threshold` (`GatePolicy.FloorChecks`);
+  `review-pass`, sealed/protected also `security-review`, protected/normal also `risk-threshold` and
+  `new-tests-fail-on-base` (`GatePolicy.FloorChecks`);
   sealed — the tier must match the policy and CODEOWNERS (root, `.github/`, `docs/`) and cover `.github/workflows/` and
   `factory/prompts/` with a pattern matching everything under them (`PathPattern.CoversEverythingUnder`: a directory
   pattern or trailing `**` naming the directory or an ancestor; naming files in it is invalid); security review — a path
@@ -289,8 +292,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   protected case-insensitive, free case-sensitive, so case only moves a path to a stricter tier) match, else normal; the change
   needs the union of its tiers' checks: `ci-green`, `review-pass` (the head's verdict passes, holds every required role, and
   every reviewer and second model is of a family none of the implementer's is), `security-review` (the verdict has the
-  security review), `risk-threshold` (changed lines, files — renames count both paths — and fix rounds within `risk`). A
-  sealed path always escalates (even with no verdict); a protected one escalates after its checks instead of merging; each
+  security review), `risk-threshold` (changed lines, files — renames count both paths — and fix rounds within `risk`),
+  `new-tests-fail-on-base` (sc-25382, below). A sealed path always escalates (even with no verdict); a protected one escalates after its checks instead of merging; each
   evaluation is a `gate` checkpoint. A head without a verdict (a push after the review) goes back
   to Review (CI/MergeGate → Review are table rows); otherwise any failed rule escalates. A pass checkpoints `gate-passed`
   with the head SHA and merges with the gate App's write token and `sha` = that head (GitHub refuses a moved head: 409 →
@@ -298,6 +301,45 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   merge call, or re-read after a merge call that failed (e.g. timed out) — is recorded as Merge if its head is one some
   `gate-passed` names (anywhere in the item's history), else escalates. Merge reports the board Merged (`merged-reported`), then
   Watch (no handler yet). Gate reads use a read-only gate-App token; only the merge mints a write one.
+  `new-tests-fail-on-base` (sc-25382, `Gate/NewTests.cs`, run by `RunPipeline.NewTestsAsync` before `MergeGate.Evaluate`, only
+  when the touched tiers require it and the head has a verdict): the tests the PR adds must fail on the base and pass on the
+  head (a new test that already passes on the base checks nothing). Found deterministically on the gate's own clone
+  (`IGateTestRunner`; `git diff --name-status -M base...head`, files read with `git cat-file`, never a symlink) by a
+  per-stack `INewTestStrategy`: `XunitNewTests` (.NET/xUnit) takes every changed file under a `*.csproj` referencing an
+  `xunit*` package as a test file and, by Roslyn syntax tree (nothing compiled), the `[Fact]`/`[Theory]` methods
+  (`Namespace.Class.Method`, nested `+`) in their head versions that no base version of a changed test file has, each with
+  its project (the deepest test project holding its file). Runs, each in a fresh detached throwaway worktree
+  (`GitWorkspace.PrepareCommitAsync`, `gate-sc-<id>-base|head|base-retry`, shared with `_factory` like any worktree, deleted
+  after; swept like any other): the base commit with the PR's test files applied (`OverlayAsync`: checked out from the head,
+  renamed/deleted ones removed; files outside the test projects — production code, helpers elsewhere, the solution — stay
+  the base's), and the head. Each runs, per project holding a new test (no solution file, so a new test project runs on the
+  base too), `dotnet restore`, then `dotnet build --no-restore` (an errors-only file log too), then `dotnet test --no-build`
+  on just its new tests (`--filter-method` per test + `--report-xunit-trx` under Microsoft.Testing.Platform per
+  `global.json`, else VSTest `--filter FullyQualifiedName=…` + `--logger trx`) through `SandboxTestRunner`: sandboxed exactly
+  like workers (`WorkerSandbox.Start` as `_factory` through the launch helper, no variables at all; `Worker:RunAs=none` runs
+  as the owner with a minimal env), bounded by `Gate:TestTimeoutMinutes`. Results and build logs go to a fresh random
+  `.factory-test-results-<guid>` directory per run (a worktree that already has it fails the run), so no commit can plant
+  them; they are read as regular files only (no links), DTDs prohibited. A base that does not build is explained from its
+  error log (`XunitNewTests.ExplainBuildFailure`, Roslyn on the applied files as built): any error that is not a `CS` compiler
+  error in an applied `.cs` file (production code, an MSBuild/NuGet error, a generated file, no file) makes the base no
+  evidence (`error`); a compiler error inside a new test's own declaration, or the header of a type containing it, means that
+  test cannot pass on the base (`not-built`, counts as failing); the other new tests get one retry of the base
+  (`base-retry`) without every member and `using` that held an error (written through owner-side git before anything
+  runs), whose results judge them; a test the retry cannot build either, or with an error outside every member (e.g. an
+  assembly attribute: no retry), stays `unproven`. So a head csproj referencing a project the base lacks, or a test calling
+  a new helper outside the test projects, makes exactly the tests that use them `not-built`, and no test that passes on the
+  base hides behind another one's compile error. Judged per test method (`NewTestsCheck.Judge`): pass on the head = every
+  case passed; on the base each new test must have a failing case or be `not-built`. The result (`NewTestsResult`: outcome
+  `pass` | `rejected` (a new test passes on the base, is skipped there, or is `unproven` — each named — or does not pass on
+  the head) | `no-tests` (the PR adds none: deliberately a failure where the check is required, i.e. any normal or protected
+  path; a docs/tests-only change needs no new test) | `unsupported` (a test-looking file of a stack no strategy reads, a
+  test method outside an xUnit project, or new data rows on an existing theory, which cannot be run apart from its old
+  rows) | `error` (restore failed, timed out, no results, a new test with no result on a base that ran, a base build error
+  that is not a compiler error in the PR's test files, a head that does not build, a git/sandbox failure, no runner)), with
+  every new test's cases on both commits, the retry's status and what it left out, is a `new-tests` checkpoint before the
+  gate uses it (E5); a recorded non-error result for the same base and head is reused, never re-run. Anything but `pass`
+  blocks (`gate_rejected` for the typed outcome). Pause/Stop are watched while the runs execute (polled like a worker's
+  watch): either cancels them (the runner stops the sandboxed commands) and records nothing, so Continue runs the check again.
   Upgrading from Phase 1: Review is now a handled state, so the first `factory work` picks up every item parked at Review
   and each escalates once with a story comment — "implementer's model is unknown" (Phase 1 recorded no
   `implementer-model`) or "merged outside the factory" (a PR the owner merged). See docs/acceptance.md.
