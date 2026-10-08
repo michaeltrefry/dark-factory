@@ -130,6 +130,8 @@ public class GitWorkspaceTests
 
         Assert.Equal("sc-2: Fix", Git(_remote, "log", "-1", "--format=%s", "factory/sc-2").Trim());
         Assert.Equal("dark-factory[bot]", Git(_remote, "log", "-1", "--format=%an", "factory/sc-2").Trim());
+        // The pushed commit is the one a fix round waits for on the PR (sc-25380).
+        Assert.Equal(Git(_remote, "rev-parse", "factory/sc-2").Trim(), await workspace.HeadAsync(ws, CancellationToken.None));
     }
 
     [Fact]

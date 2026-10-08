@@ -27,6 +27,9 @@ public interface IRepoWorkspace
     /// <summary>Commits any worker changes and pushes the branch. Returns false when there is nothing to push.</summary>
     Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, CancellationToken ct);
 
+    /// <summary>The commit the worktree's HEAD is at (after <see cref="CommitAndPushAsync"/>: the commit it pushed).</summary>
+    Task<string> HeadAsync(Workspace workspace, CancellationToken ct);
+
     /// <summary>Removes a story's worktree; the clone and any pushed branch stay.</summary>
     Task RemoveAsync(RepoRef repo, Workspace workspace, CancellationToken ct);
 }
@@ -196,6 +199,9 @@ public sealed class GitWorkspace(
             [.. tree, "push", "--force", "origin", $"HEAD:refs/heads/{workspace.Branch}"]);
         return true;
     }
+
+    public async Task<string> HeadAsync(Workspace workspace, CancellationToken ct) =>
+        (await Git(workspace.Path, null, ct, $"--git-dir={workspace.GitDir}", $"--work-tree={workspace.Path}", "rev-parse", "HEAD")).Trim();
 
     public Task RemoveAsync(RepoRef repo, Workspace workspace, CancellationToken ct) =>
         DeleteWorktreeAsync(ClonePath(repo), workspace.Path, ct);

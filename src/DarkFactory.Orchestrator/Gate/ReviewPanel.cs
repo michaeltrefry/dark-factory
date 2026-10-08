@@ -223,6 +223,8 @@ public sealed record Finding(
 /// One panel role's review of one head commit: the model pinned, the model the router said answered and its family, the
 /// router session, the prompt (path and hash), the findings, and <see cref="Error"/> when the answer was unusable (which
 /// fails the review).
+/// <see cref="CarriedFrom"/>: after a fix round, a role with no blocking finding is not asked again (sc-25380); its review of
+/// the fixed commit (named here) is carried into the new head's verdict.
 /// </summary>
 public sealed record RoleReview(
     [property: JsonPropertyName("role")] string Role,
@@ -233,7 +235,8 @@ public sealed record RoleReview(
     [property: JsonPropertyName("prompt")] string? Prompt,
     [property: JsonPropertyName("findings")] IReadOnlyList<Finding> Findings,
     [property: JsonPropertyName("summary")] string Summary,
-    [property: JsonPropertyName("error")] string? Error = null)
+    [property: JsonPropertyName("error")] string? Error = null,
+    [property: JsonPropertyName("carried")] string? CarriedFrom = null)
 {
     [JsonIgnore]
     public bool Clean => Error is null;
@@ -269,7 +272,8 @@ public static class ReviewPanel
         }
         var optional = reviews.Sum(r => r.Findings.Count(f => !f.IsBlocking));
         var downgraded = reviews.Sum(r => r.Findings.Count(f => f.Downgraded));
-        var roles = string.Join(", ", reviews.Select(r => $"{r.Role} by {r.ServedModel ?? r.Model}"));
+        var roles = string.Join(", ", reviews.Select(r =>
+            $"{r.Role} by {r.ServedModel ?? r.Model}{(r.CarriedFrom is { } from ? $" (carried from {Ci.Short(from)})" : "")}"));
         return problems.Count > 0
             ? new ReviewVerdict(headSha, ReviewVerdict.Fail, string.Join("; ", problems), riskyPaths, reviews)
             : new ReviewVerdict(headSha, ReviewVerdict.Pass,

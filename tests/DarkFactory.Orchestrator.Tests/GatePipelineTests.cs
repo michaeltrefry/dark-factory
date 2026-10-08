@@ -15,10 +15,14 @@ namespace DarkFactory.Orchestrator.Tests;
 /// <summary>sc-25378: after Implement, review → CI → merge gate → merge, through the pipeline with fake GitHub and reviewer.</summary>
 public class GatePipelineTests
 {
-    private const string Sha1 = "1111111111111111111111111111111111111111";
+    internal const string Sha1 = "1111111111111111111111111111111111111111";
     private const string Sha2 = "2222222222222222222222222222222222222222";
+    internal const string ShaA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    internal const string ShaB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    internal const string ShaC = "cccccccccccccccccccccccccccccccccccccccc";
+    internal const string ShaD = "dddddddddddddddddddddddddddddddddddddddd";
     private const string MergeCommit = "9999999999999999999999999999999999999999";
-    private const string ImplementerModel = "claude-sonnet-4-5-20250929";
+    internal const string ImplementerModel = "claude-sonnet-4-5-20250929";
     private const string Policy = "version: 1\nrequire:\n  ci: green\n  review: pass\n";
 
     private static readonly WorkStory Story =
@@ -70,9 +74,13 @@ public class GatePipelineTests
             return Task.FromResult(PolicyText);
         }
 
+        /// <summary>Runs on each CI read, with the commit, before it is answered (e.g. to let a check finish, or to crash).</summary>
+        public Action<string>? OnCiRead { get; set; }
+
         public Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct)
         {
             Calls.Add($"ci {sha}");
+            OnCiRead?.Invoke(sha);
             return Task.FromResult(Ci.TryGetValue(sha, out var facts) ? facts : Green(sha));
         }
 
@@ -150,7 +158,7 @@ public class GatePipelineTests
     }
 
     /// <summary>A worker that reports the models that answered it, then succeeds.</summary>
-    private static Func<WorkerCall, Task<WorkerResult>> ReportsModel(params string?[] models) => async call =>
+    internal static Func<WorkerCall, Task<WorkerResult>> ReportsModel(params string?[] models) => async call =>
     {
         await call.OnSession(Ok.SessionId!, CancellationToken.None);
         foreach (var model in models.OfType<string>())
@@ -160,12 +168,36 @@ public class GatePipelineTests
         return Ok;
     };
 
-    private sealed class Harness
+    internal sealed class Harness
     {
         private readonly DbContextOptions<LedgerDbContext> _options =
             new DbContextOptionsBuilder<LedgerDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options;
+        private int _pushes;
 
-        public Harness() => Db = new LedgerDbContext(_options);
+        public Harness()
+        {
+            Db = new LedgerDbContext(_options);
+            // The implementer's push opens the PR at Sha1; each later push (a fix round's) moves the PR's head to the next
+            // of FixHeads (null: the fixer changed nothing, the head stays).
+            Workspaces.OnPush = () =>
+            {
+                if (++_pushes > 1 && FixHeads[_pushes - 2] is { } head)
+                {
+                    GitHub.Head = head;
+                }
+                return Task.CompletedTask;
+            };
+            Workspaces.Head = () => GitHub.Head;
+        }
+
+        /// <summary>The commits fix rounds 1, 2, 3, … push (see the constructor).</summary>
+        public List<string?> FixHeads { get; init; } = [ShaA, ShaB, ShaC, ShaD];
+        /// <summary>The models that answer a fixer worker (by default the implementer's).</summary>
+        public string?[] FixerModels { get; init; } = [ImplementerModel];
+        /// <summary>Every worker session started, over all runs: the implementer's first, then each fix round's.</summary>
+        public List<WorkerCall> WorkerCalls { get; } = [];
+        /// <summary>When set, the worker call with this index (0 = the implementer) runs this instead.</summary>
+        public Dictionary<int, Func<WorkerCall, Task<WorkerResult>>> WorkerOverrides { get; } = [];
 
         public LedgerDbContext Db { get; }
         public FakeTimeProvider Time { get; } = new(new DateTimeOffset(2026, 10, 8, 12, 0, 0, TimeSpan.Zero));
@@ -180,16 +212,35 @@ public class GatePipelineTests
         /// <summary>When set, the panel's calls go here instead of <see cref="Reviewer"/> (e.g. a real <see cref="RouterReviewer"/>).</summary>
         public IReviewer? Panel { get; init; }
         public ReviewPanelModels Models { get; init; } = ReviewPanelModels.Default;
+        /// <summary>When set, the gate's waits run on <see cref="Time"/> (which only moves when the test advances it).</summary>
+        public bool GateOnFakeClock { get; init; }
         public WorkLedger Ledger => new(Db, TimeProvider.System);
 
         public Task<RunOutcome> Run(string? implementerModel = ImplementerModel, CancellationToken ct = default) =>
             Run([implementerModel], ct);
 
         public Task<RunOutcome> Run(string?[] implementerModels, CancellationToken ct = default) =>
-            new RunPipeline(Stories, Ledger, Locks, Workspaces, new FakeWorker(ReportsModel(implementerModels)), Prs, Sandbox, TextWriter.Null,
+            new RunPipeline(Stories, Ledger, Locks, Workspaces, new HarnessWorker(this, implementerModels), Prs, Sandbox, TextWriter.Null,
                     controls: Controls,
-                    gate: new GateStage(GitHub, Panel ?? Reviewer, Models, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5)))
+                    gate: new GateStage(GitHub, Panel ?? Reviewer, Models, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5), GateOnFakeClock ? Time : null))
                 .RunAsync(77, ct);
+
+        /// <summary>The implementer reports <c>implementerModels</c>; every later session (a fixer) reports <see cref="FixerModels"/>.</summary>
+        private sealed class HarnessWorker(Harness h, string?[] implementerModels) : IWorker
+        {
+            public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, WorkerCallbacks? callbacks,
+                CancellationToken ct)
+            {
+                var call = new WorkerCall(prompt, resumeSessionId, callbacks!);
+                var index = h.WorkerCalls.Count;
+                h.WorkerCalls.Add(call);
+                await callbacks!.OnStarted!(WorkerPid, CancellationToken.None);
+                return await (h.WorkerOverrides.TryGetValue(index, out var behaviour) ? behaviour
+                    : ReportsModel(index == 0 ? implementerModels : h.FixerModels))(call);
+            }
+
+            public Task<bool> StopOrphanAsync(int pid, CancellationToken ct) => Task.FromResult(false);
+        }
 
         public async Task<List<LedgerEntry>> Rows() => await Db.LedgerEntries.OrderBy(e => e.Id).ToListAsync();
         public async Task<List<WorkState>> Transitions() => (await Rows()).Where(r => r.Step is null).Select(r => r.State).ToList();
@@ -567,7 +618,7 @@ public class GatePipelineTests
 
     // ---- sc-25379: the review panel ----
 
-    private static string RiskyDiff(string head) =>
+    internal static string RiskyDiff(string head) =>
         $"diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n--- a/.github/workflows/ci.yml\n+++ b/.github/workflows/ci.yml\n+  # change at {head}\n";
 
     [Fact]
@@ -631,14 +682,15 @@ public class GatePipelineTests
     [Fact]
     public async Task A_confirmed_blocking_finding_fails_the_review_and_escalates_without_merging()
     {
+        // The finding survives every fix round (sc-25380), so the item escalates once the rounds are used up.
         var h = new Harness { Reviewer = FakeReviewer.Blocking() };
 
         var outcome = await h.Run();
 
         Assert.Equal(WorkState.Escalated, outcome.State);
-        Assert.Contains("blocking correctness finding by gpt-5.5, confirmed by gpt-5.4-mini", outcome.Error);
-        Assert.Contains("the tests do not cover the empty string (src/x.cs:1)", outcome.Error);
-        var finding = (await h.Verdicts()).Single().Reviews.Single(r => r.Role == ReviewRoles.Correctness).Findings.Single();
+        Assert.Contains("[correctness] the tests do not cover the empty string (src/x.cs:1), confirmed by gpt-5.4-mini", outcome.Error);
+        Assert.Contains("blocking correctness finding by gpt-5.5, confirmed by gpt-5.4-mini", (await h.Verdicts()).First().Summary);
+        var finding = (await h.Verdicts()).First().Reviews.Single(r => r.Role == ReviewRoles.Correctness).Findings.Single();
         Assert.Equal((Finding.Blocking, false, Confirmation.Confirmed), (finding.Severity, finding.Downgraded, finding.Confirmation!.Outcome));
         Assert.Empty(h.Merges);
     }
@@ -774,16 +826,19 @@ public class GatePipelineTests
 
         var outcome = await h.Run();
 
+        // The fixer leaves the flag unread (the diff stays the same), so every fix round fails and the item escalates.
         Assert.Equal(WorkState.Escalated, outcome.State);
-        var verdict = (await h.Verdicts()).Single();
+        var verdict = (await h.Verdicts()).First();
         Assert.Equal(ReviewVerdict.Fail, verdict.Verdict);
         var finding = verdict.Reviews.Single(r => r.Role == ReviewRoles.SpecConformance).Findings.Single();
         Assert.Equal((Finding.Blocking, "config key WordCount:IgnoreBlankInput has no consumer", Confirmation.Confirmed, "gpt-5.4-mini"),
             (finding.Severity, finding.Title, finding.Confirmation!.Outcome, finding.Confirmation.Model));
         Assert.Contains("config key WordCount:IgnoreBlankInput has no consumer", outcome.Error);
         Assert.Empty(h.Merges);
-        // Every call went through the router pinned with the role's model and that role's prompt as the system prompt.
-        Assert.Equal(["gpt-5.5", "gpt-5.5", "gpt-5.4-mini"], router.Requests.Select(r => r.Headers[RouterReviewer.ForceModelHeader]));
+        // Every call went through the router pinned with the role's model and that role's prompt as the system prompt; after
+        // each fix push only spec conformance (the role with the blocking finding) reviewed again, and its finding was confirmed.
+        Assert.Equal(["gpt-5.5", "gpt-5.5", "gpt-5.4-mini", .. Enumerable.Repeat(new[] { "gpt-5.5", "gpt-5.4-mini" }, Lifecycle.MaxFixRounds).SelectMany(x => x)],
+            router.Requests.Select(r => r.Headers[RouterReviewer.ForceModelHeader]));
     }
 
     [Fact]

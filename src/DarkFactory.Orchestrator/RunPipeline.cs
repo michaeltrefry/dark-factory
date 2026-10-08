@@ -123,6 +123,12 @@ public sealed partial class RunPipeline(
         public const string ReviewSession = "review-session";
         /// <summary>Review: a reviewer's verdict on one head commit; Detail is the <see cref="Gate.ReviewVerdict"/> JSON.</summary>
         public const string Verdict = "verdict";
+        /// <summary>
+        /// Review after a fix round: the round's progress check; Detail is the <see cref="Gate.FixProgress"/> JSON (outcome
+        /// <c>progress</c> or <c>failed</c>). In a fix round (Fixing) the <see cref="Pushed"/> checkpoint's Detail is the
+        /// commit the fixer's work was pushed as.
+        /// </summary>
+        public const string FixProgress = "fix-progress";
         /// <summary>MergeGate: one evaluation of the gate; Detail is its decision and reasons.</summary>
         public const string GateDecision = "gate";
         /// <summary>MergeGate: every rule held for this head commit (Detail) and the gate is merging exactly it.</summary>
@@ -179,6 +185,7 @@ public sealed partial class RunPipeline(
             if (gate is not null)
             {
                 handlers[WorkState.Review] = ReviewAsync;
+                handlers[WorkState.Fixing] = FixAsync;
                 handlers[WorkState.CI] = CiAsync;
                 handlers[WorkState.MergeGate] = MergeGateAsync;
                 handlers[WorkState.Merge] = MergeAsync;
@@ -193,7 +200,7 @@ public sealed partial class RunPipeline(
     /// <summary>States the factory's handlers drive (the production pipeline has a <see cref="GateStage"/>); an item in one is in flight.</summary>
     public static readonly IReadOnlySet<WorkState> HandledStates = new HashSet<WorkState>
     {
-        WorkState.Intake, WorkState.Implement, WorkState.Review, WorkState.CI, WorkState.MergeGate, WorkState.Merge,
+        WorkState.Intake, WorkState.Implement, WorkState.Review, WorkState.Fixing, WorkState.CI, WorkState.MergeGate, WorkState.Merge,
     };
 
     /// <summary>The states this pipeline drives.</summary>
@@ -492,7 +499,7 @@ public sealed partial class RunPipeline(
         var story = spec.Story;
         var branch = StoryId.BranchName(story.Id);
         var fullHistory = await ledger.HistoryAsync(item, ct);
-        var attempt = CurrentImplementAttempt(fullHistory);
+        var attempt = CurrentWorkerAttempt(fullHistory);
         var session = attempt.LastOrDefault(e => e.Step == Steps.Session)?.ClaudeSessionId;
         // Every model that answers the implementer is recorded once, so the reviewer can be of another family.
         var models = ImplementerModels(fullHistory).ToHashSet(StringComparer.Ordinal);
@@ -530,93 +537,8 @@ public sealed partial class RunPipeline(
 
         if (!attempt.Any(e => e.Step == Steps.WorkerDone))
         {
-            var resume = session;
-            log.WriteLine(resume is null ? "[implement] starting worker" : $"[implement] resuming claude session {resume}");
-            // Every stdout line is stored (and pushed to live viewers) as it streams (E7).
-            await using var capture = sessions is null ? null : await sessions.StartAsync(item.Id, resume, ct);
-            // Pause asks the worker to stop at its next tool boundary (and stops it if it doesn't); Stop stops it now.
-            await using var watch = new ControlWatch(_controls, worker, log, _controlPoll, _pauseGrace, item.ExternalId, item.EpicId, workspace.Path, ct);
-            WorkerResult result;
-            try
-            {
-                result = await worker.RunAsync(workspace.Path,
-                    resume is null ? BuildPrompt(spec, repo) : BuildResumePrompt(story), resume,
-                    new WorkerCallbacks(
-                        OnStarted: (pid, c) => ledger.CheckpointAsync(item, Steps.WorkerStarted, session, pid.ToString(), c),
-                        OnSession: async (sid, c) =>
-                        {
-                            if (sid != session)
-                            {
-                                if (capture is not null)
-                                {
-                                    // The session row is named before the ledger points at it, so a crash
-                                    // in between cannot strand the events already stored (E7).
-                                    await capture.SetClaudeSessionIdAsync(sid, c);
-                                }
-                                session = sid;
-                                await ledger.CheckpointAsync(item, Steps.Session, sid, "claude session started", c);
-                            }
-                        },
-                        OnLine: capture is null ? null : capture.OnLineAsync,
-                        OnModel: async (model, c) =>
-                        {
-                            if (models.Add(model))
-                            {
-                                await ledger.CheckpointAsync(item, Steps.ImplementerModel, session, model, c);
-                            }
-                        }), watch.Token);
-            }
-            catch (Exception ex) when (watch.Requested is { } requested && !ct.IsCancellationRequested)
-            {
-                // The control cut the worker off (Stop, or a pause it did not honour in time).
-                await CompleteControlledSessionAsync(capture, requested);
-                throw new ControlRequestedException(requested, WorkerStillRunning.IsMarked(ex));
-            }
-            catch (Exception ex) when (capture is not null)
-            {
-                // A Ctrl-C'd session resumes later, so its cost waits for the run that finishes it. A failed
-                // session's cost is fetched now, bounded so a hung router or ledger cannot hold up the escalation.
-                var cancelled = ex is OperationCanceledException && ct.IsCancellationRequested;
-                using var bounded = new CancellationTokenSource(_failedSessionEndTimeout);
-                try
-                {
-                    await capture.CompleteAsync(null, cancelled ? "cancelled" : "error", fetchCost: !cancelled, bounded.Token).WaitAsync(bounded.Token);
-                }
-                catch (Exception captureError)
-                {
-                    log.WriteLine($"[implement] could not record the end of the worker session: {captureError.Message}");
-                }
-                throw;
-            }
-            if (watch.Requested == ControlState.Stopping || (watch.PauseRequested && result.HookStopped))
-            {
-                // Stopped; or the worker stopped at a tool boundary (the pause hook ends the session as a success,
-                // so its result says nothing about the story being done): it resumes on Continue. A worker that
-                // finished on its own after a pause request is done: WorkerDone is recorded below and the pause
-                // takes effect before the push (E3: Continue does not run a finished worker again).
-                var requested = watch.Requested == ControlState.Stopping ? ControlState.Stopping : ControlState.Paused;
-                await CompleteControlledSessionAsync(capture, requested);
-                throw new ControlRequestedException(requested);
-            }
-            // The plans ran out, not the work: pause the factory (backing off) and resume this session afterwards, rather
-            // than escalate the item. Without a control table nothing could hold the pause, so the failure escalates.
-            if (result.UsageLimited && await _controls.PauseForUsageAsync(null, UsagePause.WorkerRateLimited, ct) is { State: ControlState.Paused } pause)
-            {
-                log.WriteLine($"[implement] worker hit a router exhaustion or rate-limit error; factory paused for usage until {pause.ResumeAt:u}");
-                await CompleteControlledSessionAsync(capture, ControlState.Paused);
-                throw new ControlRequestedException(ControlState.Paused);
-            }
-            if (capture is not null)
-            {
-                await capture.CompleteAsync(result.ExitCode, result.Succeeded ? "succeeded" : "failed", fetchCost: true, ct);
-            }
-            session = result.SessionId ?? session;
-            if (!result.Succeeded)
-            {
-                throw new WorkerFailedException(
-                    $"Worker failed (exit {result.ExitCode}, result {result.ResultSubtype ?? "none"}): {result.ResultText} {result.StderrTail}".Trim());
-            }
-            await ledger.CheckpointAsync(item, Steps.WorkerDone, session, $"worker exit {result.ExitCode}", ct);
+            session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? BuildPrompt(spec, repo) : BuildResumePrompt(story),
+                models, "implement", ct);
         }
         await ThrowIfControlledAsync(item, ct);
 
@@ -644,6 +566,107 @@ public sealed partial class RunPipeline(
         log.WriteLine($"[review] {prUrl}");
         // The work is on origin (RestoreAsync re-creates it if ever needed): the worktree is throwaway (E5).
         await RemoveWorktreeAsync(run);
+    }
+
+    /// <summary>
+    /// Runs one worker session in <paramref name="workspace"/> (the implementer's, or a fix round's), continuing
+    /// <paramref name="session"/> when set: every stdout line is stored as it streams (E7), the pid, the session id and each
+    /// model that answers are checkpointed as they appear (models into <paramref name="models"/>, so the review panel is of
+    /// another family than every model that wrote the code), and Pause/Stop are watched. A paused or usage-limited session
+    /// throws <see cref="ControlRequestedException"/> (resumed later); a failed one throws <see cref="WorkerFailedException"/>.
+    /// On success it checkpoints <see cref="Steps.WorkerDone"/> and returns the session id.
+    /// </summary>
+    private async Task<string?> RunWorkerSessionAsync(Run run, Workspace workspace, string? session, Func<string?, string> prompt,
+        HashSet<string> models, string label, CancellationToken ct)
+    {
+        var item = run.Item;
+        var resume = session;
+        log.WriteLine(resume is null ? $"[{label}] starting worker" : $"[{label}] resuming claude session {resume}");
+        // Every stdout line is stored (and pushed to live viewers) as it streams (E7).
+        await using var capture = sessions is null ? null : await sessions.StartAsync(item.Id, resume, ct);
+        // Pause asks the worker to stop at its next tool boundary (and stops it if it doesn't); Stop stops it now.
+        await using var watch = new ControlWatch(_controls, worker, log, _controlPoll, _pauseGrace, item.ExternalId, item.EpicId, workspace.Path, ct);
+        WorkerResult result;
+        try
+        {
+            result = await worker.RunAsync(workspace.Path, prompt(resume), resume,
+                new WorkerCallbacks(
+                    OnStarted: (pid, c) => ledger.CheckpointAsync(item, Steps.WorkerStarted, session, pid.ToString(), c),
+                    OnSession: async (sid, c) =>
+                    {
+                        if (sid != session)
+                        {
+                            if (capture is not null)
+                            {
+                                // The session row is named before the ledger points at it, so a crash
+                                // in between cannot strand the events already stored (E7).
+                                await capture.SetClaudeSessionIdAsync(sid, c);
+                            }
+                            session = sid;
+                            await ledger.CheckpointAsync(item, Steps.Session, sid, "claude session started", c);
+                        }
+                    },
+                    OnLine: capture is null ? null : capture.OnLineAsync,
+                    OnModel: async (model, c) =>
+                    {
+                        if (models.Add(model))
+                        {
+                            await ledger.CheckpointAsync(item, Steps.ImplementerModel, session, model, c);
+                        }
+                    }), watch.Token);
+        }
+        catch (Exception ex) when (watch.Requested is { } requested && !ct.IsCancellationRequested)
+        {
+            // The control cut the worker off (Stop, or a pause it did not honour in time).
+            await CompleteControlledSessionAsync(capture, requested);
+            throw new ControlRequestedException(requested, WorkerStillRunning.IsMarked(ex));
+        }
+        catch (Exception ex) when (capture is not null)
+        {
+            // A Ctrl-C'd session resumes later, so its cost waits for the run that finishes it. A failed
+            // session's cost is fetched now, bounded so a hung router or ledger cannot hold up the escalation.
+            var cancelled = ex is OperationCanceledException && ct.IsCancellationRequested;
+            using var bounded = new CancellationTokenSource(_failedSessionEndTimeout);
+            try
+            {
+                await capture.CompleteAsync(null, cancelled ? "cancelled" : "error", fetchCost: !cancelled, bounded.Token).WaitAsync(bounded.Token);
+            }
+            catch (Exception captureError)
+            {
+                log.WriteLine($"[{label}] could not record the end of the worker session: {captureError.Message}");
+            }
+            throw;
+        }
+        if (watch.Requested == ControlState.Stopping || (watch.PauseRequested && result.HookStopped))
+        {
+            // Stopped; or the worker stopped at a tool boundary (the pause hook ends the session as a success,
+            // so its result says nothing about the story being done): it resumes on Continue. A worker that
+            // finished on its own after a pause request is done: WorkerDone is recorded below and the pause
+            // takes effect before the push (E3: Continue does not run a finished worker again).
+            var requested = watch.Requested == ControlState.Stopping ? ControlState.Stopping : ControlState.Paused;
+            await CompleteControlledSessionAsync(capture, requested);
+            throw new ControlRequestedException(requested);
+        }
+        // The plans ran out, not the work: pause the factory (backing off) and resume this session afterwards, rather
+        // than escalate the item. Without a control table nothing could hold the pause, so the failure escalates.
+        if (result.UsageLimited && await _controls.PauseForUsageAsync(null, UsagePause.WorkerRateLimited, ct) is { State: ControlState.Paused } pause)
+        {
+            log.WriteLine($"[{label}] worker hit a router exhaustion or rate-limit error; factory paused for usage until {pause.ResumeAt:u}");
+            await CompleteControlledSessionAsync(capture, ControlState.Paused);
+            throw new ControlRequestedException(ControlState.Paused);
+        }
+        if (capture is not null)
+        {
+            await capture.CompleteAsync(result.ExitCode, result.Succeeded ? "succeeded" : "failed", fetchCost: true, ct);
+        }
+        session = result.SessionId ?? session;
+        if (!result.Succeeded)
+        {
+            throw new WorkerFailedException(
+                $"Worker failed (exit {result.ExitCode}, result {result.ResultSubtype ?? "none"}): {result.ResultText} {result.StderrTail}".Trim());
+        }
+        await ledger.CheckpointAsync(item, Steps.WorkerDone, session, $"worker exit {result.ExitCode}", ct);
+        return session;
     }
 
     private async Task RemoveWorktreeAsync(Run run)
@@ -732,7 +755,7 @@ public sealed partial class RunPipeline(
         Workspace? workspace = null;
         if (!Lifecycle.IsTerminal(item.State))
         {
-            var attempt = CurrentImplementAttempt(await ledger.HistoryAsync(item, ct));
+            var attempt = CurrentWorkerAttempt(await ledger.HistoryAsync(item, ct));
             if (OrphanedWorkerPid(attempt) is { } pid && await worker.StopOrphanAsync(pid, ct))
             {
                 await ledger.CheckpointAsync(item, Steps.OrphanKilled, null, $"pid {pid}", ct);
@@ -890,7 +913,7 @@ public sealed partial class RunPipeline(
 
     /// <summary>
     /// Whether a worktree directory (<c>factory-sc-&lt;id&gt;</c>) belongs to an item a re-run would resume
-    /// in it (Implement, or Paused), so the startup sweep must keep it. Everything else is an orphan.
+    /// in it (Implement, a fix round in Fixing, or Paused), so the startup sweep must keep it. Everything else is an orphan.
     /// </summary>
     public static async Task<bool> WorktreeIsResumableAsync(WorkLedger ledger, string worktreeName, CancellationToken ct)
     {
@@ -899,14 +922,14 @@ public sealed partial class RunPipeline(
         {
             return false;
         }
-        return await ledger.StateOfAsync(Source, StoryId.Format(id), ct) is WorkState.Implement or WorkState.Paused;
+        return await ledger.StateOfAsync(Source, StoryId.Format(id), ct) is WorkState.Implement or WorkState.Fixing or WorkState.Paused;
     }
 
     /// <summary>
-    /// Rows of the current Implement attempt: from the last entry into Implement (a return
+    /// Rows of the current worker attempt: from the last entry into Implement or Fixing (a fix round; a return
     /// from Paused continues the attempt) or the last lost-worktree restart.
     /// </summary>
-    private static List<LedgerEntry> CurrentImplementAttempt(List<LedgerEntry> history)
+    private static List<LedgerEntry> CurrentWorkerAttempt(List<LedgerEntry> history)
     {
         var start = 0;
         WorkState? previous = null;
@@ -915,7 +938,7 @@ public sealed partial class RunPipeline(
             var e = history[i];
             if (e.Step is null)
             {
-                if (e.State == WorkState.Implement && previous != WorkState.Paused)
+                if (e.State is WorkState.Implement or WorkState.Fixing && previous != WorkState.Paused)
                 {
                     start = i;
                 }
@@ -935,7 +958,7 @@ public sealed partial class RunPipeline(
     /// </summary>
     internal static bool CrashedWorkerMayBeRunning(List<LedgerEntry> history)
     {
-        var attempt = CurrentImplementAttempt(history);
+        var attempt = CurrentWorkerAttempt(history);
         var started = attempt.FindLastIndex(e => e.Step == Steps.WorkerStarted);
         return OrphanedWorkerPid(attempt) is not null
             && !attempt.Skip(started + 1).Any(e => e.Step is null || e.Step == Steps.OrphanKilled);
@@ -1066,7 +1089,7 @@ public sealed partial class RunPipeline(
     {
         var history = await ledger.HistoryAsync(item, ct);
         var session = history.LastOrDefault(e => e.ClaudeSessionId is not null)?.ClaudeSessionId;
-        var pr = item.State is WorkState.Review or WorkState.CI or WorkState.MergeGate or WorkState.Merge or WorkState.Watch
+        var pr = item.State is WorkState.Review or WorkState.Fixing or WorkState.CI or WorkState.MergeGate or WorkState.Merge or WorkState.Watch
             ? LinkedPullRequestUrl(history)
             : null;
         return new RunOutcome(item.Id, item.State, session, pr, error);

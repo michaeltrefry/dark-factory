@@ -54,7 +54,7 @@ public static class Ci
         {
             return (CiState.Failed, $"more CI checks on {Short(facts.HeadSha)} than the gate could read");
         }
-        var suites = (facts.Suites ?? []).Where(s => s.Runs > 0 || s.App == ActionsApp).ToList();
+        var suites = CountedSuites(facts);
         var failed = facts.Checks.Where(c => c.Completed && !Passing.Contains(c.Conclusion ?? "")).Select(c => $"{c.Name} ({c.Conclusion ?? "no conclusion"})")
             .Concat(suites.Where(s => s.Completed && !Passing.Contains(s.Conclusion ?? "")).Select(s => $"{s.App} check suite ({s.Conclusion ?? "no conclusion"})"))
             .ToList();
@@ -73,6 +73,13 @@ public static class Ci
             ? (CiState.Pending, $"CI still running on {Short(facts.HeadSha)}: {string.Join(", ", running)}")
             : (CiState.Green, $"CI green on {Short(facts.HeadSha)} ({facts.Checks.Count} checks)");
     }
+
+    /// <summary>The check suites CI counts: GitHub Actions' and any other App's with check runs (see <see cref="Evaluate"/>).</summary>
+    public static IReadOnlyList<CheckSuiteFact> CountedSuites(CiFacts facts) =>
+        (facts.Suites ?? []).Where(s => s.Runs > 0 || s.App == ActionsApp).ToList();
+
+    /// <summary>Whether a finished check's conclusion passes (success, neutral or skipped).</summary>
+    public static bool Passes(string? conclusion) => Passing.Contains(conclusion ?? "");
 
     internal static string Short(string sha) => sha.Length > 12 ? sha[..12] : sha;
 }
@@ -220,6 +227,6 @@ public static class MergeGate
         return reasons.Count > 0
             ? new GateDecision(GateOutcome.Blocked, head, reasons)
             : new GateDecision(GateOutcome.Merge, head,
-                ["ci green", $"review pass by {string.Join(", ", verdict.Reviews.Select(r => $"{r.Role}: {r.ServedModel ?? r.Model} ({r.Family})"))}"]);
+                ["ci green", $"review pass by {string.Join(", ", verdict.Reviews.Select(r => $"{r.Role}: {r.ServedModel ?? r.Model} ({r.Family}){(r.CarriedFrom is { } carried ? $", carried from {Ci.Short(carried)}" : "")}"))}"]);
     }
 }

@@ -195,7 +195,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   file, also on resume); worktrees live under the owner-owned work root (root-owned parent), are shared with
   `_factory` by an inheritable ACL set on the empty directory before checkout (never `chmod -R`, which follows
   symlinks), and are deleted (as `_factory` first) once the PR is open or the item escalates. Only a paused or
-  crashed Implement keeps its worktree for resume; a worker that won't stop marks its exception
+  crashed Implement or fix round keeps its worktree for resume; a worker that won't stop marks its exception
   (`WorkerStillRunning`) so nothing deletes under it. Each run sweeps worktrees no run will resume.
   The App private key never reaches a worker's env, argv or worktree (`ClaudeWorkerTests`).
 - Every worker stdout line is a `session_events` row (E7): `ClaudeWorker` taps each line (`WorkerCallbacks.OnLine`) into a
@@ -243,7 +243,25 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   deterministic: pass only when every required role answered cleanly and no finding is blocking after confirmation; it
   lists the risky paths and every role's model, served model, family, session, prompt and findings) is a `verdict`
   checkpoint bound to that head SHA. Anything but a clean findings line from the pinned family is an unusable review and a
-  fail (a router answer naming no served model included), and a fail escalates (no fix loop yet). The router refusing a call for usage (429/529 or its
+  fail (a router answer naming no served model included). Fix loop (sc-25380, `Gate/FixLoop.cs`, `FixAsync`): a fail whose
+  only cause is blocking findings every one of which a second model confirmed (`FixLoop.Fixable`) goes Review → Fixing (row
+  Detail = the fixed head); any other fail (an unusable answer, a missing role, an unusable confirmation) escalates. A fix
+  round runs a fixer worker exactly like the implementer (same sandbox, router key only, session checkpointed and resumed,
+  its models recorded as `implementer-model` so reviewers stay of another family) in a worktree restored from the PR branch,
+  prompted with the story and only the confirmed blocking findings (fenced); its work is pushed to the same `factory/*`
+  branch (`pushed` Detail = the pushed commit, `IRepoWorkspace.HeadAsync`) → Review. That review waits for the PR to show
+  exactly that push (any other head — someone else's push — escalates), re-runs only the roles with an open blocking finding
+  (plus a required role the fixed head's verdict lacks, e.g.
+  security when the fix touches a risky path, or one whose reviewer/second model is now of an implementer family); the
+  others' reviews are carried into the new head's verdict marked `carried: <sha>` (the gate's merge reason names them). It
+  then checkpoints `fix-progress` (`FixProgress`): progress only if the blocking count went down and no check run/status
+  (by name, from GitHub's executed results) that passed on the fixed head — or reached no verdict there (`unknown_before`:
+  cancelled, stale, no conclusion; compared like a passed one) — fails or has no run on the new head. It first waits for
+  the fixed head's CI to finish, then for each such check on the new head (one missing once the new head's CI has
+  finished is a regression); still unfinished after `Gate:CiTimeoutMinutes` escalates; either commit's CI not read in full
+  is a failed round. Otherwise a failed round. Every round counts against
+  `Lifecycle.MaxFixRounds` (3): a fail that would need a fourth escalates with the open findings listed in the comment.
+  The router refusing a call for usage (429/529 or its
   exhaustion/rate-limit body: `RouterUsageLimitedException`) pauses the factory for usage (`reviewer-rate-limited`) like a
   worker's exhaustion; the item resumes and the head is reviewed again once it lifts. CI polls the head's check runs,
   commit statuses and check suites until finished (none at all keeps waiting until `Gate:CiTimeoutMinutes`); red
