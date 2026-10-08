@@ -74,6 +74,9 @@ public static class Ci
             : (CiState.Green, $"CI green on {Short(facts.HeadSha)} ({facts.Checks.Count} checks)");
     }
 
+    /// <summary>Whether a finished check's conclusion passes (success, neutral or skipped).</summary>
+    public static bool Passes(string? conclusion) => Passing.Contains(conclusion ?? "");
+
     internal static string Short(string sha) => sha.Length > 12 ? sha[..12] : sha;
 }
 

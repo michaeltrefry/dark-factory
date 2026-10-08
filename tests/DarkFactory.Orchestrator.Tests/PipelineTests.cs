@@ -180,6 +180,9 @@ public class RunPipelineTests
             }
             return hasChanges;
         }
+        /// <summary>The commit a worktree's HEAD is at (what the last push pushed).</summary>
+        public Func<string> Head { get; set; } = () => "head";
+        public Task<string> HeadAsync(Workspace workspace, CancellationToken ct) => Task.FromResult(Head());
         public Task RemoveAsync(RepoRef repo, Workspace workspace, CancellationToken ct)
         {
             Calls.Add($"remove {repo} {workspace.Path}");
