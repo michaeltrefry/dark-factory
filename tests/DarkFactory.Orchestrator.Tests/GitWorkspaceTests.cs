@@ -402,6 +402,128 @@ public class GitWorkspaceTests
         Assert.Equal(pushed, Git(_remote, "rev-parse", "factory/sc-7").Trim());
     }
 
+    // ---- sc-25384: the merge queue's update of a PR branch with its base ----
+
+    /// <summary>Pushes a commit writing <paramref name="file"/> to the remote's main (another PR merging meanwhile).</summary>
+    private string AdvanceMain(string file, string content)
+    {
+        var other = Path.Combine(_root, $"main-{Guid.NewGuid():N}");
+        Git(_root, "clone", "-q", _remote, other);
+        File.WriteAllText(Path.Combine(other, file), content);
+        Git(other, "add", ".");
+        Git(other, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", $"main: {file}");
+        Git(other, "push", "-q", "origin", "main");
+        return Git(other, "rev-parse", "HEAD").Trim();
+    }
+
+    /// <summary>A pushed PR branch writing <paramref name="file"/>, its worktree removed (as when it reaches the merge queue).</summary>
+    private async Task<string> PushBranch(GitWorkspace workspace, string branch, string file, string content)
+    {
+        var ws = await workspace.PrepareAsync(Repo, branch, CancellationToken.None);
+        File.WriteAllText(Path.Combine(ws.Path, file), content);
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, $"{branch}: change", CancellationToken.None));
+        await workspace.RemoveAsync(Repo, ws, CancellationToken.None);
+        return Git(_remote, "rev-parse", branch).Trim();
+    }
+
+    [Fact]
+    public async Task Merge_base_merges_the_moved_base_into_the_branch_and_pushes_it_as_a_fast_forward()
+    {
+        var workspace = Workspace();
+        var head = await PushBranch(workspace, "factory/sc-20", "fix.txt", "fixed\n");
+        var main = AdvanceMain("other.txt", "merged first\n");
+
+        var ws = await workspace.RestoreAsync(Repo, "factory/sc-20", CancellationToken.None);
+        var merge = await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
+
+        Assert.False(merge.Conflicted);
+        Assert.False(merge.UpToDate);
+        Assert.Equal(main, merge.BaseSha);
+        Assert.Equal([head, main], Git(ws.Path, "rev-list", "--parents", "-n", "1", merge.Head).Trim().Split(' ')[1..]);
+        _gitCalls.Clear();
+        await workspace.PushAsync(Repo, ws, CancellationToken.None);
+        Assert.Equal(merge.Head, Git(_remote, "rev-parse", "factory/sc-20").Trim());
+        // A plain push (never forced), carrying the App token like every network call.
+        var push = Assert.Single(_gitCalls, c => Subcommand(c.Args) == "push");
+        Assert.DoesNotContain("--force", push.Args);
+        Assert.NotNull(push.Env);
+
+        // Already up to date: nothing to merge.
+        var again = await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
+        Assert.True(again.UpToDate);
+        Assert.Equal(merge.Head, again.Head);
+    }
+
+    [Fact]
+    public async Task Merge_base_reports_a_conflict_and_leaves_the_merge_for_the_fixer_to_resolve()
+    {
+        var workspace = Workspace();
+        var head = await PushBranch(workspace, "factory/sc-21", "README.md", "hello from the PR\n");
+        AdvanceMain("README.md", "hello from main\n");
+
+        var ws = await workspace.RestoreAsync(Repo, "factory/sc-21", CancellationToken.None);
+        var merge = await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
+
+        Assert.Equal(["README.md"], merge.Conflicts);
+        Assert.Equal(head, merge.Head);
+        Assert.True(GitWorkspace.HasConflictMarker(File.ReadAllText(Path.Combine(ws.Path, "README.md"))));
+
+        // Pushed with the markers left in: they are found in the pushed commit.
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-21: merge", CancellationToken.None));
+        var marked = Git(_remote, "rev-parse", "factory/sc-21").Trim();
+        Assert.Equal(["README.md"], await workspace.ConflictMarkersAsync(Repo, marked, ["README.md"], CancellationToken.None));
+
+        // The fixer resolves it: the commit completes the merge (two parents) and has no marker left.
+        File.WriteAllText(Path.Combine(ws.Path, "README.md"), "hello from both\n");
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-21: resolve", CancellationToken.None));
+        var resolved = Git(_remote, "rev-parse", "factory/sc-21").Trim();
+        Assert.Empty(await workspace.ConflictMarkersAsync(Repo, resolved, ["README.md"], CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task A_conflicted_merge_committed_as_is_keeps_both_parents()
+    {
+        var workspace = Workspace();
+        var head = await PushBranch(workspace, "factory/sc-23", "README.md", "pr\n");
+        var main = AdvanceMain("README.md", "main\n");
+        var ws = await workspace.RestoreAsync(Repo, "factory/sc-23", CancellationToken.None);
+        await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
+        File.WriteAllText(Path.Combine(ws.Path, "README.md"), "both\n");
+
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-23: resolve", CancellationToken.None));
+
+        var pushed = Git(_remote, "rev-parse", "factory/sc-23").Trim();
+        Assert.Equal([head, main], Git(ws.Path, "rev-list", "--parents", "-n", "1", pushed).Trim().Split(' ')[1..]);
+    }
+
+    [Fact]
+    public async Task The_fast_forward_push_refuses_a_branch_that_moved_on_the_remote()
+    {
+        var workspace = Workspace();
+        await PushBranch(workspace, "factory/sc-22", "fix.txt", "fixed\n");
+        AdvanceMain("other.txt", "x\n");
+        var ws = await workspace.RestoreAsync(Repo, "factory/sc-22", CancellationToken.None);
+        await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
+        // Someone pushes to the PR branch after the queue fetched it.
+        var outside = Path.Combine(_root, "outside");
+        Git(_root, "clone", "-q", "-b", "factory/sc-22", _remote, outside);
+        File.WriteAllText(Path.Combine(outside, "outside.txt"), "y\n");
+        Git(outside, "add", ".");
+        Git(outside, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "outside");
+        Git(outside, "push", "-q", "origin", "factory/sc-22");
+        var moved = Git(_remote, "rev-parse", "factory/sc-22").Trim();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => workspace.PushAsync(Repo, ws, CancellationToken.None));
+        Assert.Equal(moved, Git(_remote, "rev-parse", "factory/sc-22").Trim());
+    }
+
+    [Theory]
+    [InlineData("a\n<<<<<<< HEAD\nb\n=======\nc\n>>>>>>> main\n", true)]
+    [InlineData("<<<<<<<\n", true)]
+    [InlineData("x <<<<<<< not at the start\n===\n", false)]
+    [InlineData("plain\n=======\n", false)]
+    public void Conflict_markers_are_lines_git_writes(string text, bool marked) => Assert.Equal(marked, GitWorkspace.HasConflictMarker(text));
+
     [Fact]
     public async Task Refuses_branches_outside_factory_prefix()
     {

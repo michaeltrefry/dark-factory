@@ -39,6 +39,12 @@ public interface IGateGitHub
     /// </summary>
     Task<string> GetCheckLogAsync(RepoRef repo, CheckFact check, CancellationToken ct);
 
+    /// <summary>
+    /// The current tip of <paramref name="baseRef"/> (the PR's base branch) and how many of its commits <paramref name="headSha"/>
+    /// does not contain (sc-25384: the merge queue updates a head that is behind before CI and the merge).
+    /// </summary>
+    Task<BaseComparison> CompareAsync(RepoRef repo, string baseRef, string headSha, CancellationToken ct);
+
     /// <summary>Merges PR <paramref name="number"/> only if its head is still <paramref name="headSha"/> (GitHub enforces it).</summary>
     Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct);
 }
@@ -252,6 +258,17 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         return trimmed ? $"[earlier log omitted]\n{text}" : text;
     }
 
+    public async Task<BaseComparison> CompareAsync(RepoRef repo, string baseRef, string headSha, CancellationToken ct)
+    {
+        var range = $"{Uri.EscapeDataString(baseRef).Replace("%2F", "/", StringComparison.Ordinal)}...{Uri.EscapeDataString(headSha)}";
+        using var request = GitHubApp.Request(HttpMethod.Get, $"repos/{repo.Owner}/{repo.Name}/compare/{range}?per_page=1", "Bearer",
+            await ReadTokenAsync(repo, ct));
+        using var response = await http.SendAsync(request, ct);
+        await GitHubApp.EnsureSuccess(response, $"compare {headSha} with {baseRef}", ct);
+        var compare = (await response.Content.ReadFromJsonAsync<CompareDto>(ct))!;
+        return new BaseComparison(compare.BaseCommit.Sha, compare.BehindBy);
+    }
+
     public async Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct)
     {
         var token = (await gateApp.CreateInstallationTokenAsync(repo, ct, MergePermissions)).Token;
@@ -343,6 +360,12 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
     private sealed record TreeEntryDto(
         [property: JsonPropertyName("path")] string Path,
         [property: JsonPropertyName("type")] string Type);
+
+    private sealed record CompareDto(
+        [property: JsonPropertyName("base_commit")] CommitDto BaseCommit,
+        [property: JsonPropertyName("behind_by")] int BehindBy);
+
+    private sealed record CommitDto([property: JsonPropertyName("sha")] string Sha);
 
     private sealed record MergeDto(
         [property: JsonPropertyName("sha")] string? Sha,

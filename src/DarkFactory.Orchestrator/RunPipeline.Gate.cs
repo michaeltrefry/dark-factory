@@ -99,6 +99,12 @@ public sealed partial class RunPipeline
         {
             pull = await WaitForPushedHeadAsync(run, fix, pull, ct);
         }
+        // After a conflict fix round (sc-25384) the pushed merge commit is reviewed in full (no role carries: it brings in the
+        // base and the fixer's resolution), once GitHub shows it.
+        if (PendingConflictRound(history) is { } conflict && pull.HeadSha != conflict.PushedHead)
+        {
+            pull = await WaitForPushedHeadAsync(run, conflict, pull, ct);
+        }
         var verdicts = Verdicts(history);
         var previous = fix is null ? null
             : verdicts.LastOrDefault(v => v.HeadSha == fix.FixedHead)
@@ -119,7 +125,7 @@ public sealed partial class RunPipeline
         }
         if (verdict is null)
         {
-            verdict = await ReviewPanelAsync(run, pull, previous, ciFix, ct);
+            verdict = await ReviewPanelAsync(run, pull, previous, ciFix is null ? null : (ciFix.FixedHead, ciFix.PushedHead!), ct);
             await ledger.CheckpointAsync(run.Item, Steps.Verdict, null, verdict.ToDetail(), ct);
         }
         log.WriteLine($"[review] {Ci.Short(pull.HeadSha)}: {verdict.Verdict}: {verdict.Summary}");
@@ -151,14 +157,15 @@ public sealed partial class RunPipeline
 
     /// <summary>
     /// A fix round: its number (review and CI rounds share one count), the commit it fixed, the commit it pushed (null until
-    /// pushed), and whether it fixed red CI (a CI → CIHealing round) rather than review findings (Review → Fixing).
+    /// pushed), and whether it fixed red CI (a CI → CIHealing round) or a conflict with the base found by the merge queue
+    /// (a MergeGate → Fixing round, <see cref="Conflict"/>) rather than review findings (Review → Fixing).
     /// </summary>
-    internal sealed record FixRound(int Round, string FixedHead, string? PushedHead, bool Ci = false);
+    internal sealed record FixRound(int Round, string FixedHead, string? PushedHead, bool Ci = false, bool Conflict = false);
 
-    /// <summary>The item's latest fix round of either kind since the last Implement, with the index of its row; null when none.</summary>
+    /// <summary>The item's latest fix round of any kind since the last Implement, with the index of its row; null when none.</summary>
     private static (int Index, FixRound Round)? LatestFixRound(List<LedgerEntry> history)
     {
-        var (at, round, ci) = (-1, 0, false);
+        var (at, round, ci, conflict) = (-1, 0, false, false);
         WorkState? previous = null;
         for (var i = 0; i < history.Count; i++)
         {
@@ -173,12 +180,26 @@ public sealed partial class RunPipeline
             }
             else if (previous is { } from && TransitionContext.IsFixRound(from, state))
             {
-                (at, round, ci) = (i, round + 1, state == WorkState.CIHealing);
+                (at, round, ci, conflict) = (i, round + 1, state == WorkState.CIHealing, from == WorkState.MergeGate);
             }
             previous = state;
         }
         return at < 0 ? null
-            : (at, new FixRound(round, history[at].Detail!, history.Skip(at + 1).LastOrDefault(e => e.Step == Steps.Pushed)?.Detail, ci));
+            : (at, new FixRound(round, history[at].Detail!, history.Skip(at + 1).LastOrDefault(e => e.Step == Steps.Pushed)?.Detail, ci, conflict));
+    }
+
+    /// <summary>
+    /// The latest fix round when it is a conflict round (MergeGate → Fixing, sc-25384) that has pushed, the item is back in
+    /// Review after it and the pushed commit has no verdict yet; else null.
+    /// </summary>
+    internal static FixRound? PendingConflictRound(List<LedgerEntry> history)
+    {
+        if (LatestFixRound(history) is not ({ } at, { Conflict: true, PushedHead: { } pushed } fix))
+        {
+            return null;
+        }
+        return history.Skip(at + 1).Any(e => e.Step is null && e.State == WorkState.Review) && !Verdicts(history).Any(v => v.HeadSha == pushed)
+            ? fix : null;
     }
 
     /// <summary>
@@ -187,7 +208,7 @@ public sealed partial class RunPipeline
     /// </summary>
     internal static FixRound? PendingFixRound(List<LedgerEntry> history)
     {
-        if (LatestFixRound(history) is not ({ } at, { Ci: false } fix))
+        if (LatestFixRound(history) is not ({ } at, { Ci: false, Conflict: false } fix))
         {
             return null;
         }
@@ -303,10 +324,12 @@ public sealed partial class RunPipeline
 
     /// <summary>
     /// Runs the panel on <paramref name="pull"/>'s head. With <paramref name="previous"/> (the verdict on the commit a fix
-    /// round fixed), only the roles <see cref="FixLoop.Carried"/> does not carry review again; after a CI fix round
-    /// (<paramref name="ciFix"/>), also every role whose scope the fix's own diff touched (<see cref="CiHeal.Carried"/>).
+    /// round fixed), only the roles <see cref="FixLoop.Carried"/> does not carry review again; with <paramref name="changedBy"/>
+    /// (a CI fix round's fixed and pushed commits, or a merge-queue base update's old and new head), also every role whose
+    /// scope the diff between the two touched (<see cref="CiHeal.Carried"/>).
     /// </summary>
-    private async Task<ReviewVerdict> ReviewPanelAsync(Run run, PullFacts pull, ReviewVerdict? previous, FixRound? ciFix, CancellationToken ct)
+    private async Task<ReviewVerdict> ReviewPanelAsync(Run run, PullFacts pull, ReviewVerdict? previous, (string From, string To)? changedBy,
+        CancellationToken ct)
     {
         var policy = await PolicyForReviewAsync(run, pull, ct);
         var diff = await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
@@ -314,8 +337,8 @@ public sealed partial class RunPipeline
         var risky = policy.SecurityReviewReasons(policy.Classify(diff));
         var roles = ReviewRoles.Required(risky.Count > 0);
         var carried = previous is null ? []
-            : ciFix is null ? FixLoop.Carried(previous, roles)
-            : CiHeal.Carried(previous, roles, policy, await Gate.GitHub.GetDiffAsync(run.Repo, ciFix.FixedHead, ciFix.PushedHead!, ct));
+            : changedBy is not { } change ? FixLoop.Carried(previous, roles)
+            : CiHeal.Carried(previous, roles, policy, await Gate.GitHub.GetDiffAsync(run.Repo, change.From, change.To, ct));
         var toReview = roles.Where(r => carried.All(c => c.Role != r)).ToList();
         // Every role's model, and a second model for its findings, is chosen before the first call: a role with no Claude Opus
         // 5.5 or newer, or no eligible second model, escalates without spending any. (The second model is chosen again for each
@@ -407,6 +430,11 @@ public sealed partial class RunPipeline
         var fixing = history.FindLastIndex(e => e.Step is null && e.State == WorkState.Fixing && e.Detail is { Length: > 0 } d && d != "unpaused");
         var fixedHead = history[fixing].Detail!;
         var round = context.FixRounds;
+        if (LatestFixRound(history) is (_, { Conflict: true }))
+        {
+            await ConflictFixAsync(run, history, round, fixedHead, ct);
+            return;
+        }
         var verdict = Verdicts(history).LastOrDefault(v => v.HeadSha == fixedHead)
             ?? throw new InvalidOperationException($"Fix round {round} has no verdict on the commit it fixes ({fixedHead}).");
         var findings = FixLoop.Fixable(verdict)
@@ -421,10 +449,13 @@ public sealed partial class RunPipeline
     /// branch's worktree, runs the fixer session (<paramref name="prompt"/> for a fresh session — built only then —,
     /// <paramref name="resumePrompt"/> to continue an interrupted one), commits and pushes to the same <c>factory/*</c> branch
     /// and checkpoints the pushed commit, then records <paramref name="next"/> ("&lt;<paramref name="name"/>&gt; pushed &lt;sha&gt;")
-    /// and removes the worktree.
+    /// and removes the worktree. <paramref name="prepare"/> runs on a freshly restored worktree before the fixer (a conflict
+    /// round merges the base into it there); <paramref name="afterPush"/> checks the pushed commit before the next state is
+    /// recorded (it runs again on a resumed run that had already pushed).
     /// </summary>
     private async Task RunFixRoundAsync(Run run, List<LedgerEntry> history, int round, string fixedHead, string what,
-        Func<CancellationToken, Task<string>> prompt, string resumePrompt, string commitMessage, WorkState next, string name, CancellationToken ct)
+        Func<CancellationToken, Task<string>> prompt, string resumePrompt, string commitMessage, WorkState next, string name, CancellationToken ct,
+        Func<Workspace, CancellationToken, Task>? prepare = null, Func<string, CancellationToken, Task>? afterPush = null)
     {
         var (spec, repo, item) = run;
         var attempt = CurrentWorkerAttempt(history);
@@ -453,7 +484,15 @@ public sealed partial class RunPipeline
                 }
             }
             // The fixer works on the PR's branch as pushed (the commit under review), not on the base branch.
-            workspace ??= await workspaces.RestoreAsync(repo, branch, ct);
+            if (workspace is null)
+            {
+                workspace = await workspaces.RestoreAsync(repo, branch, ct);
+                run.Workspace = workspace;
+                if (prepare is not null)
+                {
+                    await prepare(workspace, ct);
+                }
+            }
             run.Workspace = workspace;
             log.WriteLine($"[fix] {name} of {Lifecycle.MaxFixRounds} on {Ci.Short(fixedHead)}: {what}; worktree {workspace.Path}");
 
@@ -478,6 +517,10 @@ public sealed partial class RunPipeline
             run.Workspace = await workspaces.ReopenAsync(repo, branch, ct);
         }
         await ThrowIfControlledAsync(item, ct);
+        if (afterPush is not null)
+        {
+            await afterPush(pushed, ct);
+        }
         await ledger.RecordAsync(item, next, session, $"{name} pushed {pushed}", ct);
         log.WriteLine($"[fix] {name} pushed {Ci.Short(pushed)}");
         // The work is on origin: the worktree is throwaway (E5).
@@ -766,89 +809,6 @@ public sealed partial class RunPipeline
         }
         log.WriteLine($"[ci] dispatching a CI fixer: fix round {rounds + 1} of {Lifecycle.MaxFixRounds}");
         await ledger.RecordAsync(run.Item, WorkState.CIHealing, null, pull.HeadSha, ct);
-    }
-
-    /// <summary>
-    /// MergeGate (E1–E3): evaluates <see cref="MergeGate"/> on facts read now — the base branch's <c>factory/gate.yaml</c>,
-    /// the PR, the diff of its head commit (whose paths' tiers decide the checks), that commit's CI, the ledger's verdicts
-    /// and fix rounds — and checkpoints the decision. Merge: merges exactly the
-    /// gated head commit with the gate App's token, then records Merge with the merge commit. A head with no verdict (a
-    /// push after the review, or one that lands between the evaluation and the merge, which GitHub refuses) → Review.
-    /// Anything else → escalate; nothing merges. A PR found merged (on resume, or re-read after a failed merge call) at a
-    /// head some <see cref="Steps.GatePassed"/> names is recorded as merged; merged at any other head, it escalates.
-    /// </summary>
-    private async Task MergeGateAsync(Run run, CancellationToken ct)
-    {
-        var (history, pull) = await ReadPullAsync(run, ct);
-        if (pull.Merged)
-        {
-            // A run that stopped after GitHub merged but before the ledger said so (a crash, Ctrl-C during the merge call,
-            // then an "unpaused" row): only a commit this gate passed counts. gate-passed is bound to its head SHA, so one
-            // anywhere in the item's history proves the merged head is a commit the gate let through.
-            if (GatePassedAt(history, pull) is { } commit)
-            {
-                log.WriteLine($"[merge] {pull.HtmlUrl} was merged by the gate at {Ci.Short(pull.HeadSha)} as {commit}; recording it");
-                await ledger.RecordAsync(run.Item, WorkState.Merge, null, commit, ct);
-                return;
-            }
-            throw new GateBlockedException($"{pull.HtmlUrl} was merged outside the gate.");
-        }
-
-        var (policy, policyError) = await ReadPolicyAsync(run, pull, ct);
-        string? diff = null, diffError = null;
-        try
-        {
-            diff = await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
-        }
-        catch (Exception ex) when (ex is InvalidOperationException or HttpRequestException)
-        {
-            diffError = ex.Message;
-        }
-        var fixRounds = TransitionContext.From(history.Where(e => e.Step is null).Select(e => e.State).ToList()).FixRounds;
-        var ci = await Gate.GitHub.GetCiAsync(run.Repo, pull.HeadSha, ct);
-        var newTests = await NewTestsAsync(run, pull, history, policy, diff, ct);
-        var decision = MergeGate.Evaluate(policy, policyError, pull, new ChangeFacts(diff, diffError, fixRounds), ci, Verdicts(history),
-            newTests);
-        await ledger.CheckpointAsync(run.Item, Steps.GateDecision, null, decision.Detail, ct);
-        log.WriteLine($"[gate] {decision.Detail}");
-        switch (decision.Outcome)
-        {
-            case GateOutcome.ReviewHead:
-                await ledger.RecordAsync(run.Item, WorkState.Review, null, $"{decision.Reasons[0]}; reviewing {pull.HeadSha} again", ct);
-                return;
-            case GateOutcome.Blocked:
-                throw new GateBlockedException($"The merge gate refused {pull.HtmlUrl}: {string.Join("; ", decision.Reasons)}");
-        }
-
-        await ThrowIfControlledAsync(run.Item, ct);
-        await ledger.CheckpointAsync(run.Item, Steps.GatePassed, null, pull.HeadSha, ct);
-        MergeResult merged;
-        try
-        {
-            merged = await Gate.GitHub.MergeAsync(run.Repo, pull.Number, pull.HeadSha, ct);
-        }
-        catch (Exception ex) when (!ct.IsCancellationRequested)
-        {
-            // The call failed (e.g. timed out) but GitHub may have merged anyway: a PR merged at the gated head is merged.
-            if (await MergedAfterFailureAsync(run, pull, ex, ct) is not { } commit)
-            {
-                throw;
-            }
-            log.WriteLine($"[merge] the merge call failed ({ex.Message}), but GitHub merged {pull.HtmlUrl} at {Ci.Short(pull.HeadSha)} as {commit}");
-            await ledger.RecordAsync(run.Item, WorkState.Merge, null, commit, ct);
-            return;
-        }
-        if (merged.HeadMoved)
-        {
-            await ledger.RecordAsync(run.Item, WorkState.Review, null, $"head moved from {pull.HeadSha} before the merge; reviewing it again", ct);
-            return;
-        }
-        if (!merged.Merged || merged.CommitSha is null)
-        {
-            throw new GateBlockedException($"GitHub did not merge {pull.HtmlUrl}: {merged.Message}");
-        }
-        log.WriteLine($"[merge] {pull.HtmlUrl} merged as {merged.CommitSha}");
-        await ledger.RecordAsync(run.Item, WorkState.Merge, null, merged.CommitSha, ct);
     }
 
     /// <summary>

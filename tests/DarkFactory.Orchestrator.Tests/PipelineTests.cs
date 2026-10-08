@@ -1,3 +1,4 @@
+using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
@@ -183,6 +184,31 @@ public class RunPipelineTests
         /// <summary>The commit a worktree's HEAD is at (what the last push pushed).</summary>
         public Func<string> Head { get; set; } = () => "head";
         public Task<string> HeadAsync(Workspace workspace, CancellationToken ct) => Task.FromResult(Head());
+
+        /// <summary>What merging the base into a worktree does (sc-25384); by default it is already up to date.</summary>
+        public Func<Workspace, BaseMerge> MergeBase { get; set; } = _ => new BaseMerge("base0", "head", [], UpToDate: true);
+        /// <summary>Runs on each fast-forward push of a worktree (the merge queue's base update).</summary>
+        public Func<Workspace, Task>? OnFastForward { get; set; }
+        /// <summary>Which of the given files still hold a conflict marker at a commit; by default none.</summary>
+        public Func<string, IReadOnlyList<string>, IReadOnlyList<string>> Markers { get; set; } = (_, _) => [];
+
+        public Task<BaseMerge> MergeBaseAsync(RepoRef repo, Workspace workspace, CancellationToken ct)
+        {
+            Calls.Add($"merge-base {repo} {workspace.Branch}");
+            return Task.FromResult(MergeBase(workspace));
+        }
+
+        public async Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct)
+        {
+            Calls.Add($"fast-forward {repo} {workspace.Branch}");
+            if (OnFastForward is not null)
+            {
+                await OnFastForward(workspace);
+            }
+        }
+
+        public Task<IReadOnlyList<string>> ConflictMarkersAsync(RepoRef repo, string sha, IReadOnlyList<string> paths, CancellationToken ct) =>
+            Task.FromResult(Markers(sha, paths));
         public Task RemoveAsync(RepoRef repo, Workspace workspace, CancellationToken ct)
         {
             Calls.Add($"remove {repo} {workspace.Path}");

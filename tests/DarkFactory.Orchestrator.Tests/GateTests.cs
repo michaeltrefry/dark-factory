@@ -710,6 +710,20 @@ public class GitHubGateTests
     }
 
     [Fact]
+    public async Task Compare_reads_the_base_tip_and_how_far_the_head_is_behind_with_a_read_only_token()
+    {
+        // sc-25384: the merge queue's check of a head against its base branch.
+        var (gate, api) = Gate(a => a.On($"GET {Repo}/compare/main...{Head}", HttpStatusCode.OK,
+            """{"status":"diverged","ahead_by":2,"behind_by":3,"base_commit":{"sha":"tip0"},"merge_base_commit":{"sha":"mb"},"commits":[]}"""));
+
+        var compare = await gate.CompareAsync(Sandbox, "main", Head, CancellationToken.None);
+
+        Assert.Equal(new BaseComparison("tip0", 3), compare);
+        Assert.False(compare.UpToDate);
+        Assert.All(TokenPermissions(api).Single().EnumerateObject(), p => Assert.Equal("read", p.Value.GetString()));
+    }
+
+    [Fact]
     public async Task Ci_combines_check_runs_and_commit_statuses_of_the_commit()
     {
         var (gate, _) = Gate(a => a
