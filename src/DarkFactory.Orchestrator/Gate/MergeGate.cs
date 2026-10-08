@@ -132,7 +132,10 @@ public enum GateOutcome
 {
     /// <summary>Every rule holds for the head commit: merge exactly that commit.</summary>
     Merge,
-    /// <summary>The head commit has no verdict (a push after the review voided it, E3): review it again first.</summary>
+    /// <summary>
+    /// The head commit has no verdict (a push after the review voided it, E3), or only one recorded under an earlier panel
+    /// rule (<see cref="MergeGate.Superseded"/>): review it again first.
+    /// </summary>
     ReviewHead,
     /// <summary>A rule does not hold, or the policy is unreadable or invalid: no merge, escalate.</summary>
     Blocked,
@@ -238,7 +241,8 @@ public static class MergeGate
             reasons.Add($"the review of {Ci.Short(head)} has no {role} review"
                 + (role == ReviewRoles.Security && requiredBy.Count > 0 ? $" ({GateChecks.SecurityReview} is required by {string.Join(", ", requiredBy)})" : ""));
         }
-        reasons.AddRange(verdict.Reviews.SelectMany(ReviewModels.Problems));
+        var modelProblems = verdict.Reviews.SelectMany(ReviewModels.Problems).ToList();
+        reasons.AddRange(modelProblems);
 
         // ci-green — on this exact head commit.
         if (ci.HeadSha != head)
@@ -299,7 +303,11 @@ public static class MergeGate
 
         if (reasons.Count > 0)
         {
-            return new GateDecision(GateOutcome.Blocked, head, reasons);
+            // A verdict recorded under an earlier panel rule whose models are its only fault: the current panel reviews the head once.
+            return modelProblems.Count > 0 && reasons.All(modelProblems.Contains) && Superseded(verdict, verdicts)
+                ? new GateDecision(GateOutcome.ReviewHead, head,
+                    [$"the verdict on {Ci.Short(head)} was recorded under an earlier panel rule", .. modelProblems])
+                : new GateDecision(GateOutcome.Blocked, head, reasons);
         }
         var tiers = Tiers.Precedence.Where(t => classified.In(t).Count > 0).Select(t => $"{t.Key()} {classified.In(t).Count}");
         var passed = new List<string>
@@ -318,4 +326,14 @@ public static class MergeGate
         }
         return new GateDecision(GateOutcome.Merge, head, passed);
     }
+
+    /// <summary>
+    /// Whether <paramref name="verdict"/> was recorded under an earlier panel rule (e.g. a GPT or pre-5.5 Opus reviewer, before
+    /// sc-25379) and is replaced by one review from the current panel: its models break <see cref="ReviewModels.Problems"/>
+    /// and it is the only verdict on its head among <paramref name="verdicts"/>. The current panel's verdict on that head is a
+    /// second one, so it never qualifies: a head is re-reviewed for this at most once, and a fresh verdict whose models still
+    /// break the rule escalates.
+    /// </summary>
+    public static bool Superseded(ReviewVerdict verdict, IReadOnlyList<ReviewVerdict> verdicts) =>
+        verdicts.Count(v => v.HeadSha == verdict.HeadSha) == 1 && verdict.Reviews.SelectMany(ReviewModels.Problems).Any();
 }

@@ -104,6 +104,13 @@ public sealed partial class RunPipeline
             : verdicts.LastOrDefault(v => v.HeadSha == fix.FixedHead)
               ?? throw new InvalidOperationException($"Fix round {fix.Round} has no verdict on the commit it fixed ({fix.FixedHead}).");
         var verdict = verdicts.LastOrDefault(v => v.HeadSha == pull.HeadSha);
+        if (verdict is not null && MergeGate.Superseded(verdict, verdicts))
+        {
+            // Recorded under an earlier panel rule (e.g. a GPT reviewer before sc-25379): the current panel reviews the head once.
+            log.WriteLine($"[review] {Ci.Short(pull.HeadSha)}: the verdict was recorded under an earlier panel rule "
+                + $"({string.Join("; ", verdict.Reviews.SelectMany(ReviewModels.Problems))}); reviewing it again");
+            verdict = null;
+        }
         if (verdict is null)
         {
             verdict = await ReviewPanelAsync(run, pull, previous, ct);
@@ -611,7 +618,7 @@ public sealed partial class RunPipeline
         switch (decision.Outcome)
         {
             case GateOutcome.ReviewHead:
-                await ledger.RecordAsync(run.Item, WorkState.Review, null, $"head moved to {pull.HeadSha} after the review; reviewing it again", ct);
+                await ledger.RecordAsync(run.Item, WorkState.Review, null, $"{decision.Reasons[0]}; reviewing {pull.HeadSha} again", ct);
                 return;
             case GateOutcome.Blocked:
                 throw new GateBlockedException($"The merge gate refused {pull.HtmlUrl}: {string.Join("; ", decision.Reasons)}");

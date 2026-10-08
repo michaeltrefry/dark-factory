@@ -62,6 +62,11 @@ public class ReviewModelsTests
     [InlineData("claude-opus-5-5", "claude-opus-5-5", true)]
     [InlineData("claude-opus-5-5", "Anthropic/Claude-Opus-5-5", true)]
     [InlineData("claude-opus-5-5", "claude-opus-5-5-20261001", true)]
+    // The dotted and dashed spellings of a Claude version are one model.
+    [InlineData("claude-opus-5.5", "claude-opus-5-5", true)]
+    [InlineData("anthropic/claude-opus-5.5", "claude-opus-5-5-20261001", true)]
+    [InlineData("claude-opus-5-5", "claude-opus-5.5", true)]
+    [InlineData("claude-opus-5.5", "claude-opus-5-6", false)]
     [InlineData("claude-opus-5-5", "claude-opus-5-5-2026-01", false)]
     [InlineData("claude-opus-5-5", "claude-opus-5-5-fast", false)]
     [InlineData("claude-opus-5-5", "claude-opus-5", false)]
@@ -90,6 +95,8 @@ public class ReviewModelsTests
         Assert.Equal("claude-opus-5", ReviewerChoice.ChooseConfirmer(candidates, ["claude-opus-5-5"]));
         // The reviewer's served id (a dated snapshot, another case) is excluded as well as the pinned one.
         Assert.Equal("claude-sonnet-5", ReviewerChoice.ChooseConfirmer(candidates, ["claude-opus-5-5", "CLAUDE-OPUS-5-20260101"]));
+        // The reviewer's dotted spelling is its dashed one: never its own second model.
+        Assert.Equal("claude-sonnet-5", ReviewerChoice.ChooseConfirmer(["claude-opus-5-5", "claude-sonnet-5"], ["claude-opus-5.5"]));
         // A non-Claude candidate is never chosen, even when it is the only other one.
         var ex = Assert.Throws<ReviewerChoiceException>(() => ReviewerChoice.ChooseConfirmer(["claude-opus-5-5", "gpt-5.5"], ["claude-opus-5-5"]));
         Assert.Contains("set Review:Confirm:Models", ex.Message);
@@ -111,6 +118,9 @@ public class ReviewModelsTests
         Assert.Contains("did not say", Assert.Single(ReviewModels.Problems(R("claude-opus-5-5", "claude-opus-5-5", C("claude-sonnet-5", null)))));
         Assert.Contains("is the reviewer's own model",
             Assert.Single(ReviewModels.Problems(R("claude-opus-5-5", "claude-opus-5-5", C("claude-opus-5-5", "claude-opus-5-5")))));
+        // Pinned to the dotted spelling and served under the dashed one: served as pinned, and the dashed second model is the reviewer.
+        Assert.Contains("is the reviewer's own model",
+            Assert.Single(ReviewModels.Problems(R("claude-opus-5.5", "claude-opus-5-5", C("claude-opus-5-5", "claude-opus-5-5")))));
     }
 }
 
@@ -223,13 +233,34 @@ public class MergeGateTests
     {
         Assert.Contains("is 'fail'", Evaluate(verdicts: [Pass with { Verdict = ReviewVerdict.Fail }]).Detail);
         ReviewVerdict With(RoleReview correctness) => Pass with { Reviews = [correctness, Pass.Reviews[1]] };
-        var older = Evaluate(verdicts: [With(Review(ReviewRoles.Correctness, "claude-opus-5"))]);
+        // The second verdict on the head (the current panel's, after an earlier rule's) still breaking the rule blocks.
+        GateDecision Again(ReviewVerdict verdict) => Evaluate(verdicts: [verdict, verdict]);
+        var older = Again(With(Review(ReviewRoles.Correctness, "claude-opus-5")));
         Assert.Equal(GateOutcome.Blocked, older.Outcome);
         Assert.Contains("the correctness reviewer: claude-opus-5 is not a Claude Opus 5.5 or newer", older.Detail);
-        Assert.Contains("the correctness reviewer: gpt-5.5 is not a Claude Opus 5.5", Evaluate(verdicts: [With(Review(ReviewRoles.Correctness, "gpt-5.5"))]).Detail);
+        Assert.Contains("the correctness reviewer: gpt-5.5 is not a Claude Opus 5.5", Again(With(Review(ReviewRoles.Correctness, "gpt-5.5"))).Detail);
         Assert.Contains("the router served 'claude-sonnet-5', not the pinned claude-opus-5-5",
-            Evaluate(verdicts: [With(Pass.Reviews[0] with { ServedModel = "claude-sonnet-5" })]).Detail);
-        Assert.Contains("did not say which model answered", Evaluate(verdicts: [With(Pass.Reviews[0] with { ServedModel = null })]).Detail);
+            Again(With(Pass.Reviews[0] with { ServedModel = "claude-sonnet-5" })).Detail);
+        Assert.Contains("did not say which model answered", Again(With(Pass.Reviews[0] with { ServedModel = null })).Detail);
+    }
+
+    [Fact]
+    public void The_only_verdict_on_the_head_recorded_under_an_earlier_panel_rule_is_reviewed_again_once()
+    {
+        ReviewVerdict By(string model) => Pass with { Reviews = [Review(ReviewRoles.Correctness, model), Pass.Reviews[1]] };
+        var gpt = Evaluate(verdicts: [By("gpt-5.5")]);
+        Assert.Equal(GateOutcome.ReviewHead, gpt.Outcome);
+        Assert.Contains("recorded under an earlier panel rule", gpt.Detail);
+        Assert.Contains("the correctness reviewer: gpt-5.5 is not a Claude Opus 5.5", gpt.Detail);
+        Assert.Equal(GateOutcome.ReviewHead, Evaluate(verdicts: [Pass with { HeadSha = Old }, By("claude-opus-5")]).Outcome);
+        // A verdict on another head does not count as the head's second one.
+        Assert.True(MergeGate.Superseded(By("gpt-5.5"), [Pass with { HeadSha = Old }, By("gpt-5.5")]));
+        Assert.False(MergeGate.Superseded(Pass, [Pass]));
+        // The current panel's verdict after it (a second on the head) never is: no loop.
+        Assert.Equal(GateOutcome.Blocked, Evaluate(verdicts: [By("gpt-5.5"), By("gpt-5.5")]).Outcome);
+        // Another reason as well (here red CI) blocks: the earlier rule's verdict is not the only fault.
+        var red = Evaluate(verdicts: [By("gpt-5.5")], ci: new CiFacts(Head, [new CheckFact("build", true, "failure")]));
+        Assert.Equal(GateOutcome.Blocked, red.Outcome);
     }
 
     [Fact]
@@ -249,6 +280,9 @@ public class MergeGateTests
         Assert.Contains("the router served 'gpt-5.5', not the pinned claude-sonnet-5", Evaluate(verdicts: [With("claude-sonnet-5", "gpt-5.5")]).Detail);
         Assert.Contains("did not say which model answered", Evaluate(verdicts: [With("claude-sonnet-5", null)]).Detail);
         Assert.Contains("is the reviewer's own model", Evaluate(verdicts: [With("claude-opus-5-5", "claude-opus-5-5")]).Detail);
+        // Alone on the head these are reviewed again once (an earlier rule's verdict); the current panel's second verdict blocks.
+        var own = With("claude-opus-5-5", "claude-opus-5-5");
+        Assert.Equal(GateOutcome.Blocked, Evaluate(verdicts: [own, own]).Outcome);
     }
 
     [Fact]

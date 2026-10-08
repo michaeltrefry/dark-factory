@@ -21,7 +21,7 @@ public class ReviewGateTests
 {
     private static readonly TimeSpan RunTimeout = TimeSpan.FromMinutes(60);
 
-    /// <summary>P2-AT1: a sandbox PR with green CI and a pass from a different-family reviewer is merged by the gate; the ledger holds the merge commit.</summary>
+    /// <summary>P2-AT1: a sandbox PR with green CI and a pass from a Claude Opus 5.5+ panel is merged by the gate; the ledger holds the merge commit.</summary>
     [Fact]
     public async Task Gate_merges_a_green_pr_a_claude_opus_panel_passed_and_the_ledger_records_the_merge_commit()
     {
@@ -106,11 +106,12 @@ public class ReviewGateTests
         Assert.Empty(verdict.Reviews.SelectMany(ReviewModels.Problems));
     }
 
-    /// <summary>Skips with the missing owner step unless the gate App is set up and the sandbox has a policy on main.</summary>
+    /// <summary>Skips with the missing owner step unless the gate App is set up, Review:Models is set and the sandbox has a policy on main.</summary>
     private static async Task RequireGateReadyAsync(FactoryOptions options, CancellationToken ct)
     {
         Harness.RequireSecret(o => o.GitHubGateAppId);
         Harness.RequireSecret(o => o.GitHubGateAppPrivateKeyPem);
+        Harness.RequireReviewPanel(options);
         using var github = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
         var gate = new GitHubGate(github, new GitHubApp(github, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System));
         string? policy;

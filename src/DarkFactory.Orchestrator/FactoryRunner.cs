@@ -81,6 +81,31 @@ public static class FactoryRunner
                 + $"(GET /v1/subscriptions/usage has no managed or shared credential), so every worker model call would fail. {remedy}";
     }
 
+    /// <summary>
+    /// <c>factory run</c>'s exit code: 0 the run succeeded, 1 it did not, 2 it could not start — the review panel's models
+    /// are missing or break its rule (checked first, before any network call), a credential is missing, or
+    /// <paramref name="checkEnrollment"/> found the router unusable — with the reason on <paramref name="stderr"/>.
+    /// </summary>
+    public static async Task<int> RunCommandAsync(FactoryOptions options, Func<CancellationToken, Task<string?>> checkEnrollment,
+        Func<CancellationToken, Task<RunOutcome>> run, TextWriter stderr, CancellationToken ct)
+    {
+        try
+        {
+            _ = options.ReviewPanel;
+            if (await checkEnrollment(ct) is { } enrollmentError)
+            {
+                stderr.WriteLine(enrollmentError);
+                return 2;
+            }
+            return (await run(ct)).Succeeded ? 0 : 1;
+        }
+        catch (Exception ex) when (ex is MissingCredentialException or ReviewConfigurationException)
+        {
+            stderr.WriteLine(ex.Message);
+            return 2;
+        }
+    }
+
     /// <param name="ignoreScope"><c>factory run --ignore-scope</c>: claim and resume the story even outside the watch scope.</param>
     public static async Task<RunOutcome> RunAsync(FactoryOptions options, int storyId, bool ignoreScope, TextWriter log, CancellationToken ct)
     {

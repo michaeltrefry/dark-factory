@@ -140,6 +140,8 @@ public class GatePipelineTests
         public int UsageLimitedCalls { get; set; }
         public Func<ReviewRequest, IReadOnlyList<Finding>> Findings { get; init; } = _ => [];
         public Func<ConfirmRequest, string> Confirm { get; init; } = _ => Confirmation.Confirmed;
+        /// <summary>The model the router says served a role review (by default the pinned one).</summary>
+        public Func<ReviewRequest, string?> Served { get; init; } = r => r.Model;
 
         /// <summary>The correctness reviewer reports one blocking finding (which the second model confirms by default).</summary>
         public static FakeReviewer Blocking(string title = "the tests do not cover the empty string") => new()
@@ -154,7 +156,7 @@ public class GatePipelineTests
             {
                 throw new RouterUsageLimitedException("The review call through the router failed: 429 All enrolled subscription accounts are currently unavailable.");
             }
-            return Task.FromResult(new RoleReview(request.Role, request.Model, request.Model, request.Session,
+            return Task.FromResult(new RoleReview(request.Role, request.Model, Served(request), request.Session,
                 request.Prompt.Id, Findings(request), "reviewed"));
         }
 
@@ -522,6 +524,73 @@ public class GatePipelineTests
         // The blocking finding's second model is Claude and not the reviewer's model.
         Assert.Equal("claude-opus-5", Assert.Single(h.Reviewer.Confirms).Model);
         Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
+    }
+
+    /// <summary>
+    /// An item a Phase-1/early Phase-2 factory left in <paramref name="state"/> with a passing verdict on Sha1 by
+    /// <paramref name="oldReviewer"/> (the default reviewer under the dropped cross-family rule). The PR fake errors on its
+    /// 20th read, so a re-review loop escalates instead of hanging.
+    /// </summary>
+    private static async Task<Harness> SeededWithAnOldRuleVerdict(WorkState state, string oldReviewer, FakeReviewer? reviewer = null)
+    {
+        var h = new Harness { Reviewer = reviewer ?? new FakeReviewer() };
+        h.GitHub.OnPullRead = read =>
+        {
+            if (read >= 20)
+            {
+                throw new InvalidOperationException("the gate kept re-reviewing the same head");
+            }
+        };
+        var ledger = h.Ledger;
+        var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
+        await ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
+        await ledger.RecordAsync(item, WorkState.Review, null, PrUrl, CancellationToken.None);
+        await ledger.CheckpointAsync(item, RunPipeline.Steps.ImplementerModel, null, ImplementerModel, CancellationToken.None);
+        await ledger.CheckpointAsync(item, RunPipeline.Steps.Verdict, null,
+            ReviewPanel.Decide(Sha1, [], ReviewRoles.Required(false)
+                .Select(r => new RoleReview(r, oldReviewer, oldReviewer, null, null, [], "ok")).ToList()).ToDetail(), CancellationToken.None);
+        if (state == WorkState.CI)
+        {
+            await ledger.RecordAsync(item, WorkState.CI, null, Sha1, CancellationToken.None);
+        }
+        return h;
+    }
+
+    [Theory]
+    [InlineData(WorkState.CI, "gpt-5.5")]
+    [InlineData(WorkState.CI, "claude-opus-5")]
+    [InlineData(WorkState.Review, "gpt-5.5")]
+    public async Task A_head_passed_under_the_old_reviewer_rule_is_reviewed_once_by_the_claude_opus_panel_and_merges(WorkState state, string oldReviewer)
+    {
+        var h = await SeededWithAnOldRuleVerdict(state, oldReviewer);
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal([ReviewRoles.Correctness, ReviewRoles.SpecConformance], h.Reviewer.Requests.Select(r => r.Role));
+        Assert.All(h.Reviewer.Requests, r => Assert.Equal((Sha1, "claude-opus-5-5"), (r.Pull.HeadSha, r.Model)));
+        Assert.Equal([oldReviewer, "claude-opus-5-5"], (await h.Verdicts()).Select(v => v.Reviews[0].Model));
+        Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
+        // At CI the gate sends it back to review; at Review the stale verdict is not reused.
+        var expected = state == WorkState.CI
+            ? new[] { WorkState.MergeGate, WorkState.Review, WorkState.CI, WorkState.MergeGate, WorkState.Merge, WorkState.Watch }
+            : [WorkState.Review, WorkState.CI, WorkState.MergeGate, WorkState.Merge, WorkState.Watch];
+        Assert.Equal(expected, (await h.Transitions()).TakeLast(expected.Length));
+    }
+
+    [Fact]
+    public async Task A_re_review_whose_models_still_break_the_rule_escalates_instead_of_reviewing_again()
+    {
+        // The configured Opus is served under another name: the current panel's own verdict still breaks the rule.
+        var h = await SeededWithAnOldRuleVerdict(WorkState.CI, "gpt-5.5", new FakeReviewer { Served = _ => "claude-opus-5-5-preview" });
+
+        var outcome = await h.Run();
+
+        Assert.False(outcome.Succeeded);
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Equal(2, h.Reviewer.Requests.Count); // one re-review, not a loop
+        Assert.Contains("the router served 'claude-opus-5-5-preview', not the pinned claude-opus-5-5", outcome.Error);
+        Assert.Empty(h.Merges);
     }
 
     [Fact]

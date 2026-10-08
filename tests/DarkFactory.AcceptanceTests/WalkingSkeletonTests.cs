@@ -65,6 +65,7 @@ public class WalkingSkeletonTests
         var appKey = Harness.RequireSecret(o => o.GitHubAppPrivateKeyPem);
         Harness.RequireSecret(o => o.GitHubGateAppId); // the run goes on through review and the merge gate (sc-25378)
         Harness.RequireSecret(o => o.GitHubGateAppPrivateKeyPem);
+        Harness.RequireReviewPanel();
         Harness.RequireClaude();
         await Harness.RequireRouterAsync();
         await using var db = await Harness.RequireLedgerAsync();

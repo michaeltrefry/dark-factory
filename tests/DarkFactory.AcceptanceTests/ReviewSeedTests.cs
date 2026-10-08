@@ -32,6 +32,7 @@ public class ReviewSeedTests
             Assert.Skip("Set FACTORY_E2E_REVIEW_SEED=1 to run the seeded spec-conformance review against real models.");
         }
         var routerKey = Harness.RequireSecret(o => o.RouterKey);
+        Harness.RequireReviewPanel();
         await Harness.RequireRouterAsync();
         return new RouterReviewer(new HttpClient { BaseAddress = Harness.Options.RouterBaseUrl, Timeout = Harness.Options.ReviewTimeout }, routerKey);
     }

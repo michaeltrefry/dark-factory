@@ -21,10 +21,18 @@ public static partial class ReviewModels
     [GeneratedRegex(@"-\d{8}$", RegexOptions.CultureInvariant)]
     private static partial Regex DatedSnapshot();
 
+    // claude-<name>-<major>.<minor>…: the dotted spelling of a Claude version, rewritten to Anthropic's dashed one.
+    [GeneratedRegex(@"^(claude-[a-z]+-\d{1,3})\.(\d{1,2})(?=-|$)", RegexOptions.CultureInvariant)]
+    private static partial Regex DottedVersion();
+
+    /// <summary>
+    /// The canonical id: lower case, any <c>provider/</c> prefix dropped, and a dotted Claude version in the dashed form
+    /// (<c>claude-opus-5.5</c> is <c>claude-opus-5-5</c>), so both spellings name one model wherever ids are compared.
+    /// </summary>
     private static string Id(string model)
     {
         var id = model.Trim().ToLowerInvariant();
-        return id[(id.LastIndexOf('/') + 1)..];
+        return DottedVersion().Replace(id[(id.LastIndexOf('/') + 1)..], "$1-$2");
     }
 
     /// <summary>Whether <paramref name="model"/> is a Claude model id (<c>claude-…</c>, after any <c>provider/</c> prefix).</summary>
