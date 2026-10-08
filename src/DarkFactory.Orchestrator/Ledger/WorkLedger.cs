@@ -117,6 +117,21 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
         return await db.WorkItems.Where(x => x.Source == source && wanted.Contains(x.State)).OrderBy(x => x.Id).ToListAsync(ct);
     }
 
+    /// <summary>
+    /// The source's items on <paramref name="repo"/> currently in one of <paramref name="states"/>, oldest first, each with every
+    /// row, read fresh and untracked (other runs, in any process, write them): what the merge queue is derived from.
+    /// </summary>
+    public async Task<List<(WorkItem Item, List<LedgerEntry> History)>> ItemsOnRepoAsync(string source, string repo, IReadOnlySet<WorkState> states,
+        CancellationToken ct)
+    {
+        var wanted = states.ToList();
+        var items = await db.WorkItems.AsNoTracking().Where(x => x.Source == source && x.Repo == repo && wanted.Contains(x.State)).OrderBy(x => x.Id)
+            .ToListAsync(ct);
+        var ids = items.Select(i => i.Id).ToList();
+        var rows = await db.LedgerEntries.AsNoTracking().Where(e => ids.Contains(e.WorkItemId)).OrderBy(e => e.Id).ToListAsync(ct);
+        return items.Select(i => (i, rows.Where(r => r.WorkItemId == i.Id).ToList())).ToList();
+    }
+
     /// <summary>Every row of the item, oldest first.</summary>
     public Task<List<LedgerEntry>> HistoryAsync(WorkItem item, CancellationToken ct) =>
         db.LedgerEntries.Where(e => e.WorkItemId == item.Id).OrderBy(e => e.Id).ToListAsync(ct);

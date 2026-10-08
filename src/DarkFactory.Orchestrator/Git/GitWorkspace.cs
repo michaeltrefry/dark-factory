@@ -30,6 +30,19 @@ public interface IRepoWorkspace
     /// <summary>The commit the worktree's HEAD is at (after <see cref="CommitAndPushAsync"/>: the commit it pushed).</summary>
     Task<string> HeadAsync(Workspace workspace, CancellationToken ct);
 
+    /// <summary>
+    /// Merges the base branch as last fetched (<c>origin/&lt;base&gt;</c>; <see cref="RestoreAsync"/> fetches) into the
+    /// worktree's branch, owner-side (no worker runs git), committing the merge when it is clean. A conflicted merge is left in
+    /// progress with its conflict markers in the files; a <see cref="CommitAndPushAsync"/> after they are resolved commits it.
+    /// </summary>
+    Task<Gate.BaseMerge> MergeBaseAsync(RepoRef repo, Workspace workspace, CancellationToken ct);
+
+    /// <summary>Pushes the worktree's HEAD to its <c>factory/*</c> branch as a fast-forward only (never forced): a branch that moved on origin refuses it.</summary>
+    Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct);
+
+    /// <summary>Of <paramref name="paths"/>, those whose content at commit <paramref name="sha"/> (in the clone) still has a conflict marker line.</summary>
+    Task<IReadOnlyList<string>> ConflictMarkersAsync(RepoRef repo, string sha, IReadOnlyList<string> paths, CancellationToken ct);
+
     /// <summary>Removes a story's worktree; the clone and any pushed branch stay.</summary>
     Task RemoveAsync(RepoRef repo, Workspace workspace, CancellationToken ct);
 }
@@ -336,6 +349,62 @@ public sealed class GitWorkspace(
         return true;
     }
 
+    public async Task<Gate.BaseMerge> MergeBaseAsync(RepoRef repo, Workspace workspace, CancellationToken ct)
+    {
+        EnsureFactoryBranch(workspace.Branch);
+        var dir = workspace.Path;
+        string[] tree = [$"--git-dir={workspace.GitDir}", $"--work-tree={dir}"];
+        var upstream = $"origin/{workspace.BaseBranch}";
+        var baseSha = (await Git(dir, null, ct, [.. tree, "rev-parse", "--verify", "--end-of-options", $"{upstream}^{{commit}}"])).Trim();
+        var before = await HeadAsync(workspace, ct);
+        if (int.Parse((await Git(dir, null, ct, [.. tree, "rev-list", "--count", $"HEAD..{baseSha}"])).Trim()) == 0)
+        {
+            return new Gate.BaseMerge(baseSha, before, [], UpToDate: true);
+        }
+        try
+        {
+            await Git(dir, null, ct, [.. tree, "-c", $"user.name={CommitterName}", "-c", $"user.email={CommitterEmail}",
+                "merge", "--no-ff", "--no-edit", "-m", $"Merge {workspace.BaseBranch} into {workspace.Branch}", baseSha]);
+        }
+        catch (InvalidOperationException)
+        {
+            var conflicts = (await Git(dir, null, ct, [.. tree, "diff", "--name-only", "-z", "--diff-filter=U"]))
+                .Split('\0', StringSplitOptions.RemoveEmptyEntries);
+            if (conflicts.Length == 0)
+            {
+                throw;
+            }
+            return new Gate.BaseMerge(baseSha, before, conflicts);
+        }
+        return new Gate.BaseMerge(baseSha, await HeadAsync(workspace, ct), []);
+    }
+
+    public async Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct)
+    {
+        EnsureFactoryBranch(workspace.Branch);
+        await Git(workspace.Path, await AuthEnvironment(repo, ct), ct,
+            $"--git-dir={workspace.GitDir}", $"--work-tree={workspace.Path}", "push", "origin", $"HEAD:refs/heads/{workspace.Branch}");
+    }
+
+    public async Task<IReadOnlyList<string>> ConflictMarkersAsync(RepoRef repo, string sha, IReadOnlyList<string> paths, CancellationToken ct)
+    {
+        var marked = new List<string>();
+        foreach (var path in paths)
+        {
+            // Read from the commit in the clone (never through the worker-writable worktree): a regular file only.
+            if (await ReadFileAsync(repo, sha, path, ct) is { } text && HasConflictMarker(text))
+            {
+                marked.Add(path);
+            }
+        }
+        return marked;
+    }
+
+    /// <summary>Whether <paramref name="text"/> has a line git writes around a conflict (<c>&lt;&lt;&lt;&lt;&lt;&lt;&lt; </c> or <c>&gt;&gt;&gt;&gt;&gt;&gt;&gt; </c>).</summary>
+    public static bool HasConflictMarker(string text) =>
+        text.Split('\n').Any(line => line.TrimEnd('\r') is var l
+            && (l == "<<<<<<<" || l == ">>>>>>>" || l.StartsWith("<<<<<<< ", StringComparison.Ordinal) || l.StartsWith(">>>>>>> ", StringComparison.Ordinal)));
+
     public async Task<string> HeadAsync(Workspace workspace, CancellationToken ct) =>
         (await Git(workspace.Path, null, ct, $"--git-dir={workspace.GitDir}", $"--work-tree={workspace.Path}", "rev-parse", "HEAD")).Trim();
 
@@ -394,8 +463,12 @@ public sealed class GitWorkspace(
         };
     }
 
-    private Task<string> Git(string cwd, Dictionary<string, string>? env, CancellationToken ct, params string[] args) =>
-        _git(cwd, env, args, ct);
+    /// <summary>Every git call of this class, isolated from the owner's own git config (<see cref="OwnerGit.Isolate"/>).</summary>
+    private Task<string> Git(string cwd, Dictionary<string, string>? env, CancellationToken ct, params string[] args)
+    {
+        var (isolatedEnv, isolatedArgs) = OwnerGit.Isolate(env, args);
+        return _git(cwd, isolatedEnv, isolatedArgs, ct);
+    }
 
     public static async Task<string> RunGitAsync(string cwd, IReadOnlyDictionary<string, string>? env, IReadOnlyList<string> args, CancellationToken ct)
     {

@@ -16,7 +16,7 @@ Claude Code headless workers through the Weave router.
   review and merge gate (`Gate/`: `ReviewModels`/`ReviewerChoice`, `ReviewPanel` (roles, risky paths, prompts, findings),
   `RouterReviewer`, `GatePolicy`, `MergeGate`, the new-tests check `NewTestsCheck`/`XunitNewTests`/`SandboxTestRunner`;
   reviewer prompts in `factory/prompts/`; GitHub side
-  `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`).
+  `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`, the merge gate and queue `RunPipeline.MergeQueue.cs`).
 - `scripts/` — `setup-worker-user.sh` (one-time root setup of the `_factory` sandbox user) and
   `factory-worker-launch` (the root-installed helper every sandboxed worker runs through).
 - `tests/DarkFactory.Orchestrator.Tests` — unit tests (no network; fake HTTP APIs, InMemory EF, local git).
@@ -194,7 +194,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   Workers get no git/gh tools and run as `_factory`, which cannot reach the owner's keychain (App key) or
   gh/git credentials. Owner-side git on a worktree always passes
   `--git-dir`/`--work-tree`, with the admin dir found from the clone's side (never the worker-writable `.git`
-  file, also on resume); worktrees live under the owner-owned work root (root-owned parent), are shared with
+  file, also on resume), and every owner-side git call (all go through `GitWorkspace`) is isolated from the
+  owner's own git config by `Git/OwnerGit.cs` (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_LFS_SKIP_SMUDGE=1`;
+  `-c core.hooksPath=/dev/null`, `core.fsmonitor=false`, `rerere.enabled=false`, LFS filters emptied), so no hook, filter or
+  merge driver a PR's files or `.gitattributes` select runs as the owner; worktrees live under the owner-owned work root (root-owned parent), are shared with
   `_factory` by an inheritable ACL set on the empty directory before checkout (never `chmod -R`, which follows
   symlinks), and are deleted (as `_factory` first) once the PR is open or the item escalates. Only a paused or
   crashed Implement or fix round keeps its worktree for resume; a worker that won't stop marks its exception
@@ -323,6 +326,29 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   merge call, or re-read after a merge call that failed (e.g. timed out) — is recorded as Merge if its head is one some
   `gate-passed` names (anywhere in the item's history), else escalates. Merge reports the board Merged (`merged-reported`), then
   Watch (no handler yet). Gate reads use a read-only gate-App token; only the merge mints a write one.
+  Merge queue (sc-25384, `Gate/MergeQueue.cs`, `RunPipeline.MergeQueue.cs`): a gate pass is an approval, not a merge. The
+  item joins its repo's queue (`queued` checkpoint; FIFO by that row, derived from the ledger alone, so durable and shared
+  by every process) and one item per repo holds the turn (`queue-turn`), taken only by the queue's head while nobody holds
+  it, under a Postgres advisory lock keyed by the repo (`MergeQueue.LockKey`: negative, never an item id). Any other run
+  ends with the item left in MergeGate (`[queue] … waiting for sc-N`; no error), and a later poll retries. The turn is held
+  until the item leaves MergeGate; a crash or an `interrupted` pause keeps it (and the place), a user's or the usage pause releases it
+  (the place is kept: `MergeQueue.Member`). An item a control holds (Pause on the factory, its epic or itself, the usage pause,
+  Stop) whose run lock is free is left out of the queue while held, even before any ledger row says so, so it never holds up
+  its repo; one whose run is still active stays in until that run records the pause. Back from the control it keeps its
+  approval-time place but never preempts a turn taken meanwhile (the newest `queue-turn` row is the repo's). In its turn the item, each step a ledger row first: compares the head with the base branch
+  (`IGateGitHub.CompareAsync`); behind → the orchestrator merges the base into a fresh worktree of the branch owner-side
+  (`IRepoWorkspace.MergeBaseAsync`; no worker runs git), checkpoints `base-update` (old head, base, merge commit) and only
+  then pushes it as a fast-forward (`PushAsync`, never forced) with the factory App's token — the `factory/**` rulesets
+  already let that App write the branch, and only the gate App merges into the base. The new head's verdict (E3): when the
+  PR's diff against that base is byte-identical at the new and the reviewed head, the proof (`review-carried`: both SHA-256
+  hashes) is checkpointed and the verdict recorded for the new head with every review `carried`; otherwise the panel
+  re-reviews the roles the update's own diff touched (`CiHeal.Carried`), and a fail → Review (fix loop). Then CI on the
+  updated head (red → MergeGate → CI, i.e. CI's triage/self-heal; the item leaves the queue), the gate evaluated fresh, the
+  base compared again (moved meanwhile → update again), and the merge of exactly that head. A conflict with the base →
+  `merge-conflict` (files) and MergeGate → Fixing, a fix round sharing the count and cap; that round's fixer gets a worktree
+  where the orchestrator has merged the base (`base-merged`), resolves the conflict markers, its push completes the merge
+  (a marker left in a conflicted file of the pushed commit escalates) → Review of the merge commit in full. Residual race:
+  only an admin can move the base between the last compare and GitHub's merge (the merge binds the head SHA, not the base).
   `new-tests-fail-on-base` (sc-25382, `Gate/NewTests.cs`, run by `RunPipeline.NewTestsAsync` before `MergeGate.Evaluate`, only
   when the touched tiers require it and the head has a verdict): the tests the PR adds must fail on the base and pass on the
   head (a new test that already passes on the base checks nothing). Found deterministically on the gate's own clone

@@ -150,6 +150,10 @@ public sealed class LedgerPostgresTests : IAsyncLifetime
         public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct) => Task.FromResult<Workspace?>(Ws(branch));
         public Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, CancellationToken ct) => Task.FromResult(true);
         public Task<string> HeadAsync(Workspace workspace, CancellationToken ct) => Task.FromResult("head");
+        public Task<Gate.BaseMerge> MergeBaseAsync(RepoRef repo, Workspace workspace, CancellationToken ct) => throw new NotSupportedException();
+        public Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct) => throw new NotSupportedException();
+        public Task<IReadOnlyList<string>> ConflictMarkersAsync(RepoRef repo, string sha, IReadOnlyList<string> paths, CancellationToken ct) =>
+            throw new NotSupportedException();
         public Task RemoveAsync(RepoRef repo, Workspace workspace, CancellationToken ct) => Task.CompletedTask;
     }
 

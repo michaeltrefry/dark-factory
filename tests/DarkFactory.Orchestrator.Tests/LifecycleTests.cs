@@ -27,6 +27,8 @@ public class LifecycleTests
     [InlineData(CI, Review)] // a push voided the verdict (E3)
     [InlineData(MergeGate, Review)]
     [InlineData(MergeGate, Escalated)]
+    [InlineData(MergeGate, Fixing)] // sc-25384: the merge queue's update conflicted with the base
+    [InlineData(MergeGate, CI)] // sc-25384: the updated head's CI went red
     [InlineData(Merge, Watch)]
     [InlineData(Watch, Done)]
     [InlineData(Watch, Intake)]
@@ -118,5 +120,17 @@ public class LifecycleTests
             TransitionContext.From([Intake, Implement, Review, Fixing, Paused, Fixing, Review, Paused]));
         Assert.Equal(new TransitionContext(null, 0),
             TransitionContext.From([Intake, Implement, Review, Fixing, Review, CI, MergeGate, Merge, Watch, Implement]));
+    }
+
+    [Fact]
+    public void A_merge_queue_conflict_is_a_fix_round_sharing_the_count_and_cap()
+    {
+        // sc-25384: MergeGate → Fixing (the update to the base conflicted) counts like Review → Fixing and CI → CIHealing.
+        WorkState[] history = [Intake, Implement, Review, CI, MergeGate, Fixing, Review, CI, MergeGate];
+        Assert.Equal(1, TransitionContext.From(history).FixRounds);
+        Assert.True(Legal(MergeGate, Fixing, new TransitionContext(FixRounds: 2)));
+        Assert.False(Legal(MergeGate, Fixing, new TransitionContext(FixRounds: 3)));
+        Assert.True(Legal(MergeGate, Escalated, new TransitionContext(FixRounds: 3)));
+        Assert.Equal(0, TransitionContext.From([Intake, Implement, Review, CI, MergeGate, CI, MergeGate]).FixRounds);
     }
 }

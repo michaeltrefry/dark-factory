@@ -147,6 +147,27 @@ public sealed partial class RunPipeline(
         public const string GatePassed = "gate-passed";
         /// <summary>Merge: the board shows the item merged.</summary>
         public const string MergedReported = "merged-reported";
+        /// <summary>
+        /// MergeGate: the gate approved the head (Detail) and the item joined its repo's merge queue (sc-25384); the row's order
+        /// among the repo's queued items is the queue's (FIFO by gate approval, <see cref="Gate.MergeQueue"/>).
+        /// </summary>
+        public const string Queued = "queued";
+        /// <summary>MergeGate: the item took its repo's one merge-queue turn (Detail: its head); it holds it until it leaves MergeGate.</summary>
+        public const string QueueTurn = "queue-turn";
+        /// <summary>
+        /// MergeGate: the head was behind the base and the base was merged into it (Detail: the <see cref="Gate.BaseUpdate"/> JSON:
+        /// the old head, the base commit, the merge commit), recorded before the merge commit is pushed.
+        /// </summary>
+        public const string BaseUpdate = "base-update";
+        /// <summary>MergeGate: the head does not merge with the base (Detail: the <see cref="Gate.BaseUpdate"/> JSON with the conflicted files).</summary>
+        public const string MergeConflict = "merge-conflict";
+        /// <summary>
+        /// MergeGate: the old head's verdict was carried to the updated head because the PR's diff is unchanged by the update
+        /// (Detail: the <see cref="Gate.ReviewCarry"/> proof), before the carried verdict is recorded.
+        /// </summary>
+        public const string ReviewCarried = "review-carried";
+        /// <summary>Fixing (a conflict fix round): the base was merged into the fixer's worktree (Detail: the <see cref="Gate.BaseUpdate"/> JSON with the conflicted files).</summary>
+        public const string BaseMerged = "base-merged";
     }
 
     /// <summary>
@@ -357,6 +378,13 @@ public sealed partial class RunPipeline(
             {
                 throw new ControlRequestedException(ControlState.Stopping);
             }
+        }
+        catch (MergeQueueWaitException wait)
+        {
+            // Queued behind another item of the repo (sc-25384): the item stays in MergeGate, and a later run (the next poll)
+            // takes its turn once the queue reaches it. Nothing failed.
+            log.WriteLine($"[queue] {wait.Message}");
+            return await OutcomeAsync(item, null, CancellationToken.None);
         }
         catch (ControlRequestedException request) when (request.State == ControlState.Paused)
         {

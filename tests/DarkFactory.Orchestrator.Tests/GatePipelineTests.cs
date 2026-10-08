@@ -107,6 +107,15 @@ public class GatePipelineTests
             return Task.FromResult(Ci.TryGetValue(sha, out var facts) ? facts : Green(sha));
         }
 
+        /// <summary>How a head compares with the base branch (sc-25384); by default it is up to date with <see cref="BaseSha"/>.</summary>
+        public Func<string, BaseComparison> Compare { get; set; } = _ => new BaseComparison(BaseSha, 0);
+
+        public Task<BaseComparison> CompareAsync(RepoRef repo, string baseRef, string headSha, CancellationToken ct)
+        {
+            Calls.Add($"compare {baseRef}...{headSha}");
+            return Task.FromResult(Compare(headSha));
+        }
+
         /// <summary>When set, the merge call throws this; with <see cref="MergesBeforeThrowing"/>, after GitHub merged (e.g. a timeout).</summary>
         public Exception? MergeThrows { get; set; }
         public bool MergesBeforeThrowing { get; set; }
