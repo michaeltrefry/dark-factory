@@ -71,7 +71,8 @@ public sealed partial class RunPipeline
     /// <summary>
     /// Review: the review panel judges the PR's current head commit — correctness and spec conformance always, security when
     /// the diff touches a path whose tier in the base branch's <c>factory/gate.yaml</c> requires it
-    /// (<see cref="GatePolicy.SecurityReviewPaths"/>; a missing or invalid policy escalates before any call) — each role pinned through the router to the first of its
+    /// or that the code floor <see cref="RiskyPaths"/> matches (<see cref="GatePolicy.SecurityReviewReasons"/>; a missing or invalid
+    /// policy escalates before any call) — each role pinned through the router to the first of its
     /// models whose family the implementer did not use, with its prompt file (<see cref="ReviewPrompts"/>). Each blocking
     /// finding goes to a second model (<see cref="ReviewerChoice.ChooseConfirmer"/>); one it does not confirm is downgraded
     /// to optional. The verdict (<see cref="ReviewPanel.Decide"/>: deterministic over the findings) is checkpointed bound to
@@ -285,7 +286,7 @@ public sealed partial class RunPipeline
         var policy = await PolicyForReviewAsync(run, pull, ct);
         var diff = await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
         var files = await Gate.GitHub.GetFilesAsync(run.Repo, pull.BaseSha, ct);
-        var risky = policy.SecurityReviewPaths(policy.Classify(diff)).Select(p => p.ToString()).ToList();
+        var risky = policy.SecurityReviewReasons(policy.Classify(diff));
         var roles = ReviewRoles.Required(risky.Count > 0);
         var carried = previous is null ? [] : FixLoop.Carried(previous, roles, families);
         var toReview = roles.Where(r => carried.All(c => c.Role != r)).ToList();
@@ -328,14 +329,15 @@ public sealed partial class RunPipeline
     }
 
     /// <summary>
-    /// The base branch's <c>factory/gate.yaml</c>, read now (E1): the text, or why it could not be read (null text and
-    /// null error: it does not exist).
+    /// The base branch's <c>factory/gate.yaml</c> at the PR's base commit — the one the diff is read against, so a push to
+    /// the base between the two reads cannot pair one commit's policy with another's diff — read now (E1): the text, or why
+    /// it could not be read (null text and null error: it does not exist).
     /// </summary>
     private async Task<(string? Text, string? Error)> ReadPolicyAsync(Run run, PullFacts pull, CancellationToken ct)
     {
         try
         {
-            return (await Gate.GitHub.GetPolicyAsync(run.Repo, pull.BaseRef, ct), null);
+            return (await Gate.GitHub.GetPolicyAsync(run.Repo, pull.BaseSha, ct), null);
         }
         catch (Exception ex) when (ex is InvalidOperationException or HttpRequestException)
         {

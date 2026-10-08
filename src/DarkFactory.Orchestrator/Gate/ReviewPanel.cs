@@ -7,7 +7,8 @@ namespace DarkFactory.Orchestrator.Gate;
 
 /// <summary>
 /// The review panel's roles. Correctness and spec conformance review every change; security one that touches a path whose
-/// tier in <c>factory/gate.yaml</c> requires <c>security-review</c> (<see cref="GatePolicy.SecurityReviewPaths"/>). Each
+/// tier in <c>factory/gate.yaml</c> requires <c>security-review</c> or that the code floor <see cref="RiskyPaths"/> matches
+/// (<see cref="GatePolicy.SecurityReviewReasons"/>). Each
 /// role has its own prompt file (<see cref="ReviewPrompts"/>) and its own ordered model list (<see cref="ReviewPanelModels"/>).
 /// </summary>
 public static class ReviewRoles

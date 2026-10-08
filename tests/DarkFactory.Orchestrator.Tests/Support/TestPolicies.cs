@@ -1,3 +1,5 @@
+using DarkFactory.Orchestrator.Gate;
+
 namespace DarkFactory.Orchestrator.Tests.Support;
 
 /// <summary><c>factory/gate.yaml</c> texts the gate tests share.</summary>
@@ -24,6 +26,13 @@ internal static class TestPolicies
           max_changed_files: {maxFiles}
           max_fix_rounds: {maxFixRounds}
         """;
+
+    /// <summary>
+    /// <paramref name="pull"/> with GitHub's <c>changed_files</c> set to what <paramref name="change"/>'s diff holds, unless the
+    /// test set it (e.g. to a different count, to show an incomplete diff blocks).
+    /// </summary>
+    public static PullFacts Counting(PullFacts pull, ChangeFacts change) =>
+        pull.ChangedFiles is null && change.Diff is not null ? pull with { ChangedFiles = DiffPaths.Parse(change.Diff).Files } : pull;
 
     /// <summary>A one-file diff of <paramref name="path"/> adding <paramref name="lines"/> lines.</summary>
     public static string Diff(string path, int lines = 1, string marker = "change") =>

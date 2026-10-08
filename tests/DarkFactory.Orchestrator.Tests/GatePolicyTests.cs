@@ -50,9 +50,17 @@ public class GatePolicyTests
                 "tiers.protected.checks must include security-review" },
             { Replace("[ci-green, review-pass]\nrisk", "[ci-green, review-pass, skip-ci]\nrisk"), "unknown check 'skip-ci'" },
             { Replace("paths: [factory/gate.yaml, ", "paths: ["), "the sealed tier must cover factory/gate.yaml" },
-            { Replace(".github/workflows/, ", ""), "the sealed tier must cover .github/workflows/ci.yml" },
+            { Replace(".github/workflows/, ", ""), "the sealed tier must cover .github/workflows/" },
             { Replace(" CODEOWNERS,", ""), "the sealed tier must cover CODEOWNERS" },
-            { Replace("factory/prompts/]", "factory/prompt/]"), "the sealed tier must cover factory/prompts/review.md" },
+            { Replace("factory/prompts/]", "factory/prompt/]"), "the sealed tier must cover factory/prompts/" },
+            // Naming files in a sealed directory does not seal the directory: every other file in it would be normal.
+            { Replace(".github/workflows/, ", ".github/workflows/ci.yml, "), "the sealed tier must cover .github/workflows/" },
+            { Replace(".github/workflows/, ", ".github/workflows/*.yml, .github/workflows/*.yaml, "), "the sealed tier must cover .github/workflows/" },
+            { Replace("factory/prompts/]", "factory/prompts/review.md]"), "the sealed tier must cover factory/prompts/" },
+            { Replace("factory/prompts/]", "factory/prompts/*]"), "the sealed tier must cover factory/prompts/" },
+            { Replace("[ci-green, review-pass, risk-threshold]", "[ci-green, review-pass]"), "tiers.normal.checks must include risk-threshold" },
+            { Replace("[ci-green, review-pass, security-review, risk-threshold]", "[ci-green, review-pass, security-review]"),
+                "tiers.protected.checks must include risk-threshold" },
             { Replace("infra/", "infra/../src/"), "invalid segment '..'" },
             { Replace("infra/", "/infra/"), "'/infra/' is not a path pattern" },
             { Replace("infra/", "infra**/"), "invalid segment 'infra**'" },
@@ -98,10 +106,14 @@ public class GatePolicyTests
     [InlineData("README.md", Tier.Normal)]
     [InlineData(".github/dependabot.yml", Tier.Normal)]
     [InlineData("factory/notes.txt", Tier.Normal)]
-    [InlineData("Factory/gate.yaml", Tier.Normal)] // case-sensitive, as git is: another file
-    [InlineData("codeowners", Tier.Normal)]
-    [InlineData("src/Auth/Login.cs", Tier.Normal)]
+    // Sealed and protected patterns ignore case, free ones do not: case can only move a path to a stricter tier.
+    [InlineData("Factory/gate.yaml", Tier.Sealed)]
+    [InlineData("codeowners", Tier.Sealed)]
+    [InlineData(".GitHub/Workflows/deploy.yml", Tier.Sealed)]
+    [InlineData("src/Auth/Login.cs", Tier.Protected)]
+    [InlineData("Infra/main.tf", Tier.Protected)]
     [InlineData("Docs/guide.md", Tier.Normal)]
+    [InlineData("Tests/WordCountTests.cs", Tier.Normal)]
     [InlineData("docs", Tier.Normal)] // the directory pattern docs/ matches what is under it, not a file named docs
     [InlineData("infrastructure/main.tf", Tier.Normal)]
     public void Each_path_is_in_the_first_tier_that_matches_it(string path, Tier tier) => Assert.Equal(tier, Policy.TierOf(path).Tier);
@@ -120,6 +132,41 @@ public class GatePolicyTests
         Assert.False(Match("src/a?.cs", "src/a/.cs"));
         Assert.False(Match("src/a.cs", "src/aXcs")); // '.' is literal
         Assert.False(Match("src/a.cs", "SRC/a.cs"));
+        Assert.True(PathPattern.TryParse("src/a.cs", out _, ignoreCase: true)!.Matches("SRC/A.cs"));
+    }
+
+    [Theory]
+    [InlineData(".github/workflows/", true)]
+    [InlineData(".github/", true)] // an ancestor directory covers it too
+    [InlineData(".github/**", true)]
+    [InlineData(".github/workflows/**", true)]
+    [InlineData("**/workflows/", true)]
+    [InlineData(".github/*/", true)]
+    [InlineData("**", true)]
+    [InlineData(".github/workflows/ci.yml", false)] // files in it, not everything under it
+    [InlineData(".github/workflows/*", false)] // not nested directories
+    [InlineData(".github/workflows/*.yml", false)]
+    [InlineData(".github/workflows/nested/", false)]
+    [InlineData(".github/workflow/", false)]
+    [InlineData("src/", false)]
+    public void A_pattern_covers_a_directory_only_when_it_matches_everything_under_it(string pattern, bool covers)
+    {
+        Assert.Equal(covers, PathPattern.TryParse(pattern, out _)!.CoversEverythingUnder(".github/workflows/"));
+        // The check agrees with matching: a covering pattern matches paths no file-naming pattern could anticipate.
+        if (covers)
+        {
+            Assert.True(PathPattern.TryParse(pattern, out _)!.Matches($".github/workflows/{Guid.NewGuid():N}/{Guid.NewGuid():N}.yaml"));
+        }
+    }
+
+    [Theory]
+    [InlineData(".github/workflows/", ".github/")]
+    [InlineData(".github/workflows/", ".github/**")]
+    [InlineData("factory/prompts/", "factory/")]
+    public void A_sealed_tier_may_cover_its_directories_with_a_broader_pattern(string from, string to)
+    {
+        var policy = GatePolicy.Parse(TestPolicies.Standard().Replace(from + ",", to + ",", StringComparison.Ordinal).Replace(from + "]", to + "]", StringComparison.Ordinal));
+        Assert.Equal(Tier.Sealed, policy.TierOf(from + "nested/zz-probe.md").Tier);
     }
 
     [Fact]
@@ -224,7 +271,7 @@ public class MergeGateTierTests
     private static readonly ReviewVerdict Full = ReviewPanel.Decide(Head, [], ReviewRoles.All.Select(Review).ToList());
 
     private static GateDecision Evaluate(string diff, int fixRounds = 0, CiFacts? ci = null, ReviewVerdict? verdict = null, string? policy = null) =>
-        MergeGate.Evaluate(policy ?? Policy, null, Pull, new ChangeFacts(diff, null, fixRounds), ci ?? Green, verdict is null ? [Full] : [verdict], Implementer);
+        MergeGate.Evaluate(policy ?? Policy, null, TestPolicies.Counting(Pull, new ChangeFacts(diff, null, 0)), new ChangeFacts(diff, null, fixRounds), ci ?? Green, verdict is null ? [Full] : [verdict], Implementer);
 
     /// <summary>
     /// One row per tier of the standard policy: a path in it, whether each check is enforced for it, and whether a change
@@ -296,7 +343,7 @@ public class MergeGateTierTests
             Assert.Contains("touches sealed path(s), which always escalate", decision.Detail);
         }
         // With no verdict at all it escalates rather than asking for another review.
-        var unreviewed = MergeGate.Evaluate(Policy, null, Pull, new ChangeFacts(TestPolicies.Diff("factory/gate.yaml"), null, 0), Green, [], Implementer);
+        var unreviewed = MergeGate.Evaluate(Policy, null, Pull with { ChangedFiles = 1 }, new ChangeFacts(TestPolicies.Diff("factory/gate.yaml"), null, 0), Green, [], Implementer);
         Assert.Equal(GateOutcome.Blocked, unreviewed.Outcome);
     }
 
@@ -317,6 +364,36 @@ public class MergeGateTierTests
         Assert.Equal(GateOutcome.Blocked, decision.Outcome);
         Assert.Contains("could not be read (406 diff too large)", decision.Detail);
         Assert.Contains("touches sealed path(s)", Evaluate("@@ -1 +1 @@\n-a\n+b\n").Detail); // no readable path: sealed
+    }
+
+    [Theory]
+    [InlineData(2, "it has 1 file(s), the PR 2 changed file(s)")] // GitHub left a file out of the diff
+    [InlineData(0, "it has 1 file(s), the PR 0 changed file(s)")]
+    [InlineData(null, "the PR an unread number of changed file(s)")]
+    public void A_diff_whose_file_count_differs_from_the_prs_is_incomplete_and_blocks(int? prFiles, string reason)
+    {
+        var decision = MergeGate.Evaluate(Policy, null, Pull with { ChangedFiles = prFiles }, new ChangeFacts(TestPolicies.Diff("docs/a.md"), null, 0),
+            Green, [Full], Implementer);
+        Assert.Equal(GateOutcome.Blocked, decision.Outcome);
+        Assert.Contains($"the diff of {Head[..12]} is incomplete", decision.Detail);
+        Assert.Contains(reason, decision.Detail);
+        // The same diff with a matching count merges.
+        Assert.Equal(GateOutcome.Merge, MergeGate.Evaluate(Policy, null, Pull with { ChangedFiles = 1 },
+            new ChangeFacts(TestPolicies.Diff("docs/a.md"), null, 0), Green, [Full], Implementer).Outcome);
+    }
+
+    [Theory]
+    [InlineData("scripts/deploy.sh", "scripts/deploy.sh (scripts)")]
+    [InlineData("src/App/App.csproj", "src/App/App.csproj (dependencies)")]
+    [InlineData("tests/TokenTests.cs", "tests/TokenTests.cs (security-sensitive code)")] // a free path the floor still matches
+    public void A_path_on_the_code_floor_needs_the_security_review_whatever_its_tier(string path, string why)
+    {
+        var withoutSecurity = Full with { Reviews = Full.Reviews.Where(r => r.Role != ReviewRoles.Security).ToList() };
+        var decision = Evaluate(TestPolicies.Diff(path), verdict: withoutSecurity);
+        Assert.Equal(GateOutcome.Blocked, decision.Outcome);
+        Assert.Contains($"has no security review (security-review is required by {why})", decision.Detail);
+        Assert.Equal(GateOutcome.Merge, Evaluate(TestPolicies.Diff(path)).Outcome);
+        Assert.Equal([why], GatePolicy.Parse(Policy).SecurityReviewReasons(GatePolicy.Parse(Policy).Classify(TestPolicies.Diff(path))));
     }
 
     [Fact]

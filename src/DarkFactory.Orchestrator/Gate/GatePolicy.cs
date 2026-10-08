@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.RegularExpressions;
 using YamlDotNet.RepresentationModel;
 
 namespace DarkFactory.Orchestrator.Gate;
@@ -32,12 +33,25 @@ public sealed record RiskThreshold(int MaxChangedLines, int MaxChangedFiles, int
 ///   max_changed_files: 40
 ///   max_fix_rounds: 2
 /// </code>
-/// A path is in the first of sealed, protected, free whose patterns match it (<see cref="PathPattern"/>: case-sensitive,
-/// anchored at the root), else normal. Every tier and every risk field is required; every tier must list
-/// <c>ci-green</c> and <c>review-pass</c>, sealed and protected also <c>security-review</c>, and the sealed tier must cover
-/// the gate's own files (<see cref="MustBeSealed"/>). There is deliberately no way to switch a rule off (E2). Version 1
-/// (<c>require: {ci, review}</c>, sc-25378) is rejected with a reason: it names no tiers, and guessing them would put a
-/// second protected-path list in code. Anything invalid means no merge and an escalation.
+/// A path is in the first of sealed, protected, free whose patterns match it (<see cref="PathPattern"/>: anchored at the
+/// root; sealed and protected patterns match case-insensitively, free ones case-sensitively, so a path's case can only
+/// move it to a stricter tier), else normal. Every tier and every risk field is required.
+/// <para>
+/// The policy can tighten the gate but never loosen it below floors enforced in code (E2), so there is deliberately no way
+/// to switch a rule off:
+/// <list type="bullet">
+/// <item>checks: every tier lists <c>ci-green</c> and <c>review-pass</c>; sealed and protected also <c>security-review</c>;
+/// protected and normal also <c>risk-threshold</c> (<see cref="FloorChecks"/>);</item>
+/// <item>sealed paths: the sealed tier must cover the gate's own files and directories (<see cref="MustBeSealed"/>; a
+/// directory only by a pattern covering everything under it, never by naming files in it);</item>
+/// <item>security-review paths: a touched path calls the security review in when its tier lists <c>security-review</c>
+/// <em>or</em> it matches the code floor <see cref="RiskyPaths"/> (scripts, build and container files, dependency
+/// manifests, keys, security-sensitive names) — <see cref="SecurityReviewReasons"/>. The policy can add paths that need the
+/// security review; it cannot remove the floor.</item>
+/// </list>
+/// </para>
+/// Version 1 (<c>require: {ci, review}</c>, sc-25378) is rejected with a reason: it names no tiers. Anything invalid means
+/// no merge and an escalation.
 /// </summary>
 public sealed class GatePolicy
 {
@@ -45,17 +59,26 @@ public sealed class GatePolicy
     public const int Version = 2;
 
     /// <summary>
-    /// Paths the sealed tier must cover, or the policy is invalid: the policy itself, CI workflows, CODEOWNERS wherever
-    /// GitHub reads it, and the factory's prompts. A policy that unseals its own file could be loosened by the PRs it judges.
+    /// Files the sealed tier must match, or the policy is invalid: the policy itself and CODEOWNERS wherever GitHub reads it.
+    /// A policy that unseals its own file could be loosened by the PRs it judges.
     /// </summary>
-    public static readonly IReadOnlyList<string> MustBeSealed =
-        [Path, ".github/workflows/ci.yml", "CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS", "factory/prompts/review.md"];
+    public static readonly IReadOnlyList<string> MustBeSealedFiles = [Path, "CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"];
 
-    private static readonly IReadOnlyDictionary<Tier, string[]> FloorChecks = new Dictionary<Tier, string[]>
+    /// <summary>
+    /// Directories one sealed pattern must cover entirely (<see cref="PathPattern.CoversEverythingUnder"/>), or the policy is
+    /// invalid: CI workflows and the factory's prompts. Listing some files in them is not enough.
+    /// </summary>
+    public static readonly IReadOnlyList<string> MustBeSealedDirectories = [".github/workflows/", "factory/prompts/"];
+
+    /// <summary>Everything the sealed tier must cover: <see cref="MustBeSealedFiles"/> and <see cref="MustBeSealedDirectories"/>.</summary>
+    public static readonly IReadOnlyList<string> MustBeSealed = [.. MustBeSealedFiles, .. MustBeSealedDirectories];
+
+    /// <summary>The checks each tier must list at least (E2): a policy can require more, never fewer.</summary>
+    public static readonly IReadOnlyDictionary<Tier, string[]> FloorChecks = new Dictionary<Tier, string[]>
     {
         [Tier.Sealed] = [GateChecks.CiGreen, GateChecks.ReviewPass, GateChecks.SecurityReview],
-        [Tier.Protected] = [GateChecks.CiGreen, GateChecks.ReviewPass, GateChecks.SecurityReview],
-        [Tier.Normal] = [GateChecks.CiGreen, GateChecks.ReviewPass],
+        [Tier.Protected] = [GateChecks.CiGreen, GateChecks.ReviewPass, GateChecks.SecurityReview, GateChecks.RiskThreshold],
+        [Tier.Normal] = [GateChecks.CiGreen, GateChecks.ReviewPass, GateChecks.RiskThreshold],
         [Tier.Free] = [GateChecks.CiGreen, GateChecks.ReviewPass],
     };
 
@@ -107,6 +130,20 @@ public sealed class GatePolicy
     public IReadOnlyList<TouchedPath> SecurityReviewPaths(Classification change) =>
         change.Paths.Where(p => TierRules[p.Tier].Checks.Contains(GateChecks.SecurityReview)).ToList();
 
+    /// <summary>
+    /// Why the change needs the security review, one entry per path that calls it in: each path whose tier requires it
+    /// (<see cref="SecurityReviewPaths"/>, e.g. <c>src/auth/Login.cs (protected)</c>), then each other path the code floor
+    /// <see cref="RiskyPaths"/> matches (e.g. <c>scripts/x.sh (scripts)</c>). Empty: no security review is required.
+    /// </summary>
+    public IReadOnlyList<string> SecurityReviewReasons(Classification change)
+    {
+        var byTier = SecurityReviewPaths(change);
+        var tiered = byTier.Select(p => p.Path).ToHashSet(StringComparer.Ordinal);
+        return byTier.Select(p => p.ToString())
+            .Concat(RiskyPaths.Touched(change.Paths.Select(p => p.Path).Where(p => !tiered.Contains(p))))
+            .ToList();
+    }
+
     /// <summary>Parses <paramref name="yaml"/>; throws <see cref="GatePolicyException"/> saying what is wrong.</summary>
     public static GatePolicy Parse(string yaml)
     {
@@ -149,12 +186,12 @@ public sealed class GatePolicy
         var risk = new RiskThreshold(Int(riskNode, "max_changed_lines", 1), Int(riskNode, "max_changed_files", 1), Int(riskNode, "max_fix_rounds", 0));
 
         var policy = new GatePolicy(tiers, risk);
-        foreach (var path in MustBeSealed)
+        var uncovered = MustBeSealedFiles.Where(f => policy.TierOf(f).Tier != Tier.Sealed)
+            .Concat(MustBeSealedDirectories.Where(d => !tiers[Tier.Sealed].Paths.Any(p => p.CoversEverythingUnder(d))));
+        if (uncovered.FirstOrDefault() is { } path)
         {
-            if (policy.TierOf(path).Tier != Tier.Sealed)
-            {
-                throw new GatePolicyException($"{Path}: the sealed tier must cover {path} (the gate's own files: {string.Join(", ", MustBeSealed)}).");
-            }
+            throw new GatePolicyException(
+                $"{Path}: the sealed tier must cover {path} (the gate's own files: {string.Join(", ", MustBeSealed)}; a directory by a pattern covering everything under it, such as {MustBeSealedDirectories[0]}).");
         }
         return policy;
     }
@@ -169,7 +206,9 @@ public sealed class GatePolicy
         {
             foreach (var text in List(node, "paths", where))
             {
-                patterns.Add(PathPattern.TryParse(text, out var error) ?? throw new GatePolicyException($"{Path}: {where}.paths: {error}."));
+                // Sealed and protected ignore case, so src/Auth/ is as protected as src/auth/; free stays exact.
+                patterns.Add(PathPattern.TryParse(text, out var error, ignoreCase: tier is Tier.Sealed or Tier.Protected)
+                    ?? throw new GatePolicyException($"{Path}: {where}.paths: {error}."));
             }
         }
         var checks = List(node, "checks", where).ToHashSet(StringComparer.Ordinal);
@@ -235,3 +274,36 @@ public sealed class GatePolicy
 }
 
 public sealed class GatePolicyException(string message) : Exception(message);
+
+/// <summary>
+/// The code floor of paths that always call the security review in, whatever their tier in <c>factory/gate.yaml</c>
+/// (<see cref="GatePolicy.SecurityReviewReasons"/>): the policy can add security-review paths through its tiers but cannot
+/// remove these (E2), as it cannot unseal <see cref="GatePolicy.MustBeSealed"/>. Matched case-insensitively against every
+/// path the diff touches.
+/// </summary>
+public static class RiskyPaths
+{
+    private const RegexOptions Options = RegexOptions.IgnoreCase | RegexOptions.CultureInvariant;
+
+    /// <summary>Each rule: what it guards, and the path pattern.</summary>
+    public static readonly IReadOnlyList<(string Why, Regex Pattern)> Rules =
+    [
+        ("CI and repository automation", new Regex(@"^\.github/", Options)),
+        ("the factory's own policy and prompts", new Regex(@"^factory/", Options)),
+        ("scripts", new Regex(@"(^|/)scripts?/|\.(sh|bash|zsh|ps1)$", Options)),
+        ("build and container definitions", new Regex(@"(^|/)(Dockerfile[^/]*|docker-compose[^/]*\.ya?ml|Makefile)$", Options)),
+        ("dependencies", new Regex(
+            @"(^|/)([^/]+\.(cs|fs|vb)proj|Directory\.(Packages|Build)\.props|nuget\.config|global\.json|dotnet-tools\.json|package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|requirements[^/]*\.txt|pyproject\.toml|poetry\.lock|go\.(mod|sum)|Cargo\.(toml|lock)|Gemfile(\.lock)?)$",
+            Options)),
+        ("keys and environment files", new Regex(@"\.(pem|key|p12|pfx|crt|cer)$|(^|/)\.env", Options)),
+        ("security-sensitive code", new Regex(
+            @"auth|secret|credential|token|crypto|passw|permission|sandbox|sudo|keychain|login|oauth|jwt|cert|ssh|security|acl|ruleset|protect",
+            Options)),
+    ];
+
+    /// <summary>The touched paths the floor matches, each with why; empty when none does.</summary>
+    public static IReadOnlyList<string> Touched(IEnumerable<string> paths) =>
+        paths.Select(p => Rules.FirstOrDefault(r => r.Pattern.IsMatch(p)) is { Pattern: not null } rule ? $"{p} ({rule.Why})" : null)
+            .OfType<string>()
+            .ToList();
+}

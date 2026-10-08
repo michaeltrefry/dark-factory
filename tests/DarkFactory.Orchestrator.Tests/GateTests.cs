@@ -52,8 +52,8 @@ public class MergeGateTests
 
     private static GateDecision Evaluate(string? policy = null, string? policyError = null, PullFacts? pull = null, CiFacts? ci = null,
         ReviewVerdict[]? verdicts = null, string[]? implementer = null, ChangeFacts? change = null, bool noPolicy = false) =>
-        MergeGate.Evaluate(noPolicy ? null : policy ?? Policy, policyError, pull ?? Pull, change ?? Normal, ci ?? Green, verdicts ?? [Pass],
-            implementer ?? Implementer);
+        MergeGate.Evaluate(noPolicy ? null : policy ?? Policy, policyError, TestPolicies.Counting(pull ?? Pull, change ?? Normal), change ?? Normal,
+            ci ?? Green, verdicts ?? [Pass], implementer ?? Implementer);
 
     [Fact]
     public void Merges_when_ci_is_green_and_a_different_family_passed_the_head()
@@ -419,6 +419,31 @@ public class ReviewPanelTests
         Assert.True(ReviewPanel.Decide(Head, [], [Review(ReviewRoles.Correctness), Review(ReviewRoles.SpecConformance)]).Passed);
     }
 
+    [Theory]
+    [InlineData(".github/workflows/ci.yml", true)]
+    [InlineData(".github/CODEOWNERS", true)]
+    [InlineData("factory/gate.yaml", true)]
+    [InlineData("scripts/setup-worker-user.sh", true)]
+    [InlineData("tools/deploy.sh", true)]
+    [InlineData("Dockerfile", true)]
+    [InlineData("docker-compose.yml", true)]
+    [InlineData("src/App/App.csproj", true)]
+    [InlineData("package-lock.json", true)]
+    [InlineData("go.sum", true)]
+    [InlineData("certs/server.pem", true)]
+    [InlineData(".env.local", true)]
+    [InlineData("src/Auth/LoginController.cs", true)]
+    [InlineData("src/DarkFactory.Orchestrator/SecretStore.cs", true)]
+    [InlineData("src/Worker/WorkerSandbox.cs", true)]
+    [InlineData("src/GitHub/RepoProtection.cs", true)]
+    [InlineData("src/Crypto/Hash.cs", true)]
+    [InlineData("README.md", false)]
+    [InlineData("src/WordCount/WordCounter.cs", false)]
+    [InlineData("tests/WordCountTests.cs", false)]
+    [InlineData("docs/acceptance.md", false)]
+    public void Risky_paths_call_the_security_review_in(string path, bool risky) =>
+        Assert.Equal(risky, RiskyPaths.Touched([path]).Count > 0);
+
     [Fact]
     public void The_paths_of_a_diff_come_from_its_headers_including_both_sides_of_a_rename()
     {
@@ -444,6 +469,8 @@ public class ReviewPanelTests
 
         Assert.Equal(["new.txt", "old/name.cs", "scripts/name.sh", "src/a.cs"], DiffPaths.Of(diff));
         Assert.Equal(3, DiffPaths.Parse(diff).ChangedLines); // -x, +y and the added line that looks like a header
+        Assert.Equal(3, DiffPaths.Parse(diff).Files); // the rename is one file, as GitHub's changed_files counts it
+        Assert.Equal(["scripts/name.sh (scripts)"], RiskyPaths.Touched(DiffPaths.Of(diff)));
     }
 
     [Fact]
@@ -541,11 +568,11 @@ public class GitHubGateTests
     public async Task Reads_the_pull_request_with_a_read_only_token()
     {
         var (gate, api) = Gate(a => a.On($"GET {Repo}/pulls/7", HttpStatusCode.OK,
-            $$$"""{"number":7,"html_url":"https://github.com/michaeltrefry/dark-factory-sandbox/pull/7","state":"open","merged":false,"draft":false,"merge_commit_sha":null,"head":{"ref":"factory/sc-1","sha":"{{{Head}}}"},"base":{"ref":"main","sha":"b0"}}"""));
+            $$$"""{"number":7,"html_url":"https://github.com/michaeltrefry/dark-factory-sandbox/pull/7","state":"open","merged":false,"draft":false,"merge_commit_sha":null,"changed_files":3,"head":{"ref":"factory/sc-1","sha":"{{{Head}}}"},"base":{"ref":"main","sha":"b0"}}"""));
 
         var pull = await gate.GetPullAsync(Sandbox, 7, CancellationToken.None);
 
-        Assert.Equal(new PullFacts(7, "https://github.com/michaeltrefry/dark-factory-sandbox/pull/7", true, false, false, Head, "main", "b0", null), pull);
+        Assert.Equal(new PullFacts(7, "https://github.com/michaeltrefry/dark-factory-sandbox/pull/7", true, false, false, Head, "main", "b0", null, 3), pull);
         var permissions = TokenPermissions(api).Single();
         Assert.All(permissions.EnumerateObject(), p => Assert.Equal("read", p.Value.GetString()));
         Assert.Equal(["contents", "pull_requests", "checks", "statuses"], permissions.EnumerateObject().Select(p => p.Name));

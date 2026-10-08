@@ -222,8 +222,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   production always is): Implement records every model that answers the implementer (`implementer-model` checkpoints, from
   each assistant message's `model`). Review is a panel (sc-25379, `Gate/ReviewPanel.cs`): `correctness` and
   `spec-conformance` always, `security` only when the diff touches a path whose tier in the base branch's
-  `factory/gate.yaml` lists `security-review` (`GatePolicy.SecurityReviewPaths`; the policy is the one source of which paths
-  are sensitive — there is no path list in code; a missing/invalid policy escalates at Review before any call). Each role reviews with the first entry of its own
+  `factory/gate.yaml` lists `security-review` or that the code floor `RiskyPaths` matches (`GatePolicy.SecurityReviewReasons`,
+  both recorded in the verdict's risky paths; see the floors under MergeGate below; a missing/invalid policy escalates at
+  Review before any call). Each role reviews with the first entry of its own
   model list (`Review:<Role>:Models`, else `Review:Models`) of a family none of the implementer's is (`ModelFamily`; an
   unknown implementer model or family, or a role with no eligible model, escalates before any call). Each role makes one
   router call (`RouterReviewer`: `POST /v1/messages`, router key only, `x-weave-force-model` pin, its own
@@ -268,16 +269,24 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   escalates. A queued/in-progress check suite (a workflow registered but without check runs yet) keeps CI pending; a suite
   of a non-Actions App with no check runs is ignored (GitHub creates one per App with checks access; the Claude App's stays
   queued forever). A workflow GitHub has not registered at all yet is still invisible. MergeGate (`MergeGate.Evaluate`, E1–E3) is deterministic code over
-  facts read fresh each time: `factory/gate.yaml` from the PR's **base** branch (`GatePolicy`, `version: 2`, sc-25381:
-  path tiers `sealed`/`protected`/`free` with `paths` and `checks`, `normal` with `checks` only, and `risk:
-  {max_changed_lines, max_changed_files, max_fix_rounds}`; every key required, every tier lists `ci-green` and
-  `review-pass`, sealed/protected also `security-review`, the sealed tier must cover the policy, `.github/workflows/`,
-  CODEOWNERS and `factory/prompts/`; version 1 is rejected; missing/invalid/unreadable → no merge, escalate; no bypass key
-  exists), the PR, the diff of the head against the base (`IGateGitHub.GetDiffAsync`; unreadable → blocked), the head's CI,
-  the ledger's verdicts and fix rounds. Every path the diff touches (`DiffPaths`: both sides of a rename, deletes, C-quoted
-  names unquoted, header-looking hunk lines ignored) is normalized (`RepoPath`: `./` and `..` resolved; one escaping the
-  root, or an unparsed non-empty diff, is sealed) and put in the first of sealed > protected > free whose patterns
-  (`PathPattern`: root-anchored, case-sensitive, `*`/`?`/`**`, trailing `/` = directory) match, else normal; the change
+  facts read fresh each time: `factory/gate.yaml` at the PR's **base** commit (`pull.BaseSha`, the commit the diff is read
+  against; `GatePolicy`, `version: 2`, sc-25381: path tiers `sealed`/`protected`/`free` with `paths` and `checks`, `normal`
+  with `checks` only, and `risk: {max_changed_lines, max_changed_files, max_fix_rounds}`; every key required; version 1 is
+  rejected; missing/invalid/unreadable → no merge, escalate; no bypass key exists). The policy can tighten the gate but not
+  loosen it below floors in code (E2; described once on `GatePolicy`): checks — every tier lists `ci-green` and
+  `review-pass`, sealed/protected also `security-review`, protected/normal also `risk-threshold` (`GatePolicy.FloorChecks`);
+  sealed — the tier must match the policy and CODEOWNERS (root, `.github/`, `docs/`) and cover `.github/workflows/` and
+  `factory/prompts/` with a pattern matching everything under them (`PathPattern.CoversEverythingUnder`: a directory
+  pattern or trailing `**` naming the directory or an ancestor; naming files in it is invalid); security review — a path
+  whose tier lists `security-review` or that `RiskyPaths` matches (scripts, build/container files, dependency manifests,
+  keys/.env, security-sensitive names; case-insensitive) needs it, so the policy can add security-review paths but not
+  remove the floor. The gate also reads the PR, the diff of the head against the base (`IGateGitHub.GetDiffAsync`;
+  unreadable → blocked; a file count — one per `diff --git` header, a rename once — other than the PR's `changed_files` →
+  blocked as incomplete), the head's CI, the ledger's verdicts and fix rounds. Every path the diff touches (`DiffPaths`:
+  both sides of a rename, deletes, C-quoted names unquoted, header-looking hunk lines ignored) is normalized (`RepoPath`:
+  `./` and `..` resolved; one escaping the root, or an unparsed non-empty diff, is sealed) and put in the first of sealed >
+  protected > free whose patterns (`PathPattern`: root-anchored, `*`/`?`/`**`, trailing `/` = directory; sealed and
+  protected case-insensitive, free case-sensitive, so case only moves a path to a stricter tier) match, else normal; the change
   needs the union of its tiers' checks: `ci-green`, `review-pass` (the head's verdict passes, holds every required role, and
   every reviewer and second model is of a family none of the implementer's is), `security-review` (the verdict has the
   security review), `risk-threshold` (changed lines, files — renames count both paths — and fix rounds within `risk`). A

@@ -3,9 +3,12 @@ using System.Text.Json.Serialization;
 
 namespace DarkFactory.Orchestrator.Gate;
 
-/// <summary>A pull request as the gate sees it, read fresh from GitHub.</summary>
+/// <summary>
+/// A pull request as the gate sees it, read fresh from GitHub. <see cref="ChangedFiles"/>: GitHub's <c>changed_files</c>
+/// (null when not read), which the gate holds the diff's file count to so a diff missing files cannot pass.
+/// </summary>
 public sealed record PullFacts(int Number, string HtmlUrl, bool Open, bool Merged, bool Draft, string HeadSha, string BaseRef, string BaseSha,
-    string? MergeCommitSha);
+    string? MergeCommitSha, int? ChangedFiles = null);
 
 /// <summary>One CI check of a commit: a check run, or a commit status mapped onto the same shape.</summary>
 public sealed record CheckFact(string Name, bool Completed, string? Conclusion);
@@ -86,8 +89,8 @@ public static class Ci
 
 /// <summary>
 /// The review panel's verdict on one head commit (E3: bound to <see cref="HeadSha"/>; a new push voids it). Stored as JSON
-/// in the ledger's <c>verdict</c> checkpoint. <see cref="RiskyPaths"/>: the touched paths whose tier requires the security
-/// review (each with its tier), which called it in; <see cref="Reviews"/>: each role's review with its findings after confirmation (<see cref="ReviewPanel.Decide"/>).
+/// in the ledger's <c>verdict</c> checkpoint. <see cref="RiskyPaths"/>: the touched paths that called the security review in
+/// (<see cref="GatePolicy.SecurityReviewReasons"/>: by their tier, named with it, or by the code floor, named with why); <see cref="Reviews"/>: each role's review with its findings after confirmation (<see cref="ReviewPanel.Decide"/>).
 /// </summary>
 public sealed record ReviewVerdict(
     [property: JsonPropertyName("sha")] string HeadSha,
@@ -196,6 +199,14 @@ public static class MergeGate
             return new GateDecision(GateOutcome.Blocked, head,
                 [$"the diff of {Ci.Short(head)} could not be read ({change.DiffError ?? "no diff"}), so the tiers of its paths are unknown"]);
         }
+        // A diff that leaves files out (e.g. GitHub trimming a very large comparison) could leave out a sealed path: its file
+        // count must equal the PR's changed_files (a rename is one of each).
+        var diffFiles = DiffPaths.Parse(change.Diff).Files;
+        if (pull.ChangedFiles != diffFiles)
+        {
+            return new GateDecision(GateOutcome.Blocked, head,
+                [$"the diff of {Ci.Short(head)} is incomplete: it has {diffFiles} file(s), the PR {pull.ChangedFiles?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "an unread number of"} changed file(s), so the tiers of its paths are unknown"]);
+        }
         var classified = policy.Classify(change.Diff);
         var sealedPaths = classified.In(Tier.Sealed);
         if (sealedPaths.Count > 0)
@@ -216,8 +227,9 @@ public static class MergeGate
         {
             reasons.Add($"the review of {Ci.Short(head)} is '{verdict.Verdict}'");
         }
-        // security-review: required by the tiers the gate derived itself (or by the verdict's own risky paths).
-        var requiredBy = policy.SecurityReviewPaths(classified);
+        // security-review: required by the tiers the gate derived itself or the code floor of risky paths (or by the
+        // verdict's own risky paths).
+        var requiredBy = policy.SecurityReviewReasons(classified);
         foreach (var role in ReviewRoles.Required(requiredBy.Count > 0 || verdict.RiskyPaths.Count > 0).Where(r => verdict.Reviews.All(v => v.Role != r)))
         {
             reasons.Add($"the review of {Ci.Short(head)} has no {role} review"

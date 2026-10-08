@@ -87,27 +87,54 @@ public static class RepoPath
 }
 
 /// <summary>
-/// One path pattern of a tier, anchored at the repository root and matched case-sensitively (as git compares paths):
-/// <c>*</c> matches within one path segment, <c>?</c> one character of a segment, a <c>**</c> segment any number of
-/// segments; a pattern ending in <c>/</c> matches everything under that directory. A leading <c>./</c> is ignored; a
-/// <c>..</c> or <c>.</c> segment, an absolute pattern, or <c>**</c> inside a segment is invalid.
+/// One path pattern of a tier, anchored at the repository root and matched case-sensitively (as git compares paths) unless
+/// parsed with <c>ignoreCase</c>: <c>*</c> matches within one path segment, <c>?</c> one character of a segment, a
+/// <c>**</c> segment any number of segments; a pattern ending in <c>/</c> matches everything under that directory. A
+/// leading <c>./</c> is ignored; a <c>..</c> or <c>.</c> segment, an absolute pattern, or <c>**</c> inside a segment is
+/// invalid.
 /// </summary>
 public sealed class PathPattern
 {
     private readonly Regex _regex;
+    private readonly Regex? _cover;
 
-    private PathPattern(string text, Regex regex)
+    private PathPattern(string text, Regex regex, Regex? cover)
     {
         Text = text;
         _regex = regex;
+        _cover = cover;
     }
 
     public string Text { get; }
 
     public bool Matches(string normalizedPath) => _regex.IsMatch(normalizedPath);
 
+    /// <summary>
+    /// Whether this pattern alone matches every path under <paramref name="directory"/> (e.g. <c>.github/workflows/</c>),
+    /// decided from the pattern's form rather than by trying example paths: it is a directory pattern (trailing <c>/</c>)
+    /// or ends in <c>**</c>, and the directory it names matches <paramref name="directory"/> or one of its ancestors. A
+    /// pattern naming files (<c>.github/workflows/ci.yml</c>, <c>.github/workflows/*.yml</c>) never covers a directory.
+    /// </summary>
+    public bool CoversEverythingUnder(string directory)
+    {
+        if (_cover is null)
+        {
+            return false;
+        }
+        var segments = directory.Trim('/').Split('/');
+        for (var depth = 0; depth <= segments.Length; depth++)
+        {
+            // "" (the root), "a/", "a/b/", ...: the pattern matches everything under an ancestor-or-self of the directory.
+            if (_cover.IsMatch(depth == 0 ? "" : string.Join('/', segments[..depth]) + "/"))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// <summary>Parses <paramref name="text"/>; null, with why, when it is not a valid pattern.</summary>
-    public static PathPattern? TryParse(string text, out string? error)
+    public static PathPattern? TryParse(string text, out string? error, bool ignoreCase = false)
     {
         error = null;
         var body = text;
@@ -129,12 +156,18 @@ public sealed class PathPattern
             return null;
         }
         var regex = new StringBuilder("^");
+        // What a directory must look like (with a trailing '/') for this pattern to match everything under it.
+        string? cover = null;
         for (var i = 0; i < segments.Length; i++)
         {
             var last = i == segments.Length - 1;
             if (segments[i] == "**")
             {
                 // "**/" any number of leading directories; a trailing "**" anything below.
+                if (last)
+                {
+                    cover = regex + "$";
+                }
                 regex.Append(last ? ".*" : "(?:[^/]+/)*");
                 continue;
             }
@@ -154,17 +187,23 @@ public sealed class PathPattern
         }
         if (directory && segments[^1] != "**")
         {
+            cover = regex + "/$";
             regex.Append("/.+");
         }
         regex.Append('$');
-        return new PathPattern(text, new Regex(regex.ToString(), RegexOptions.CultureInvariant | RegexOptions.Singleline));
+        var options = RegexOptions.CultureInvariant | RegexOptions.Singleline | (ignoreCase ? RegexOptions.IgnoreCase : RegexOptions.None);
+        return new PathPattern(text, new Regex(regex.ToString(), options), cover is null ? null : new Regex(cover, options));
     }
 
     public override string ToString() => Text;
 }
 
-/// <summary>What a unified diff touches: every path (both sides of a rename or copy, deleted files too) and its changed lines.</summary>
-public sealed record DiffFacts(IReadOnlyList<string> Paths, int ChangedLines);
+/// <summary>
+/// What a unified diff touches: every path (both sides of a rename or copy, deleted files too), its changed lines, and its
+/// file entries (<see cref="Files"/>: one per <c>diff --git</c> header, so a rename counts once, as GitHub's
+/// <c>changed_files</c> does).
+/// </summary>
+public sealed record DiffFacts(IReadOnlyList<string> Paths, int ChangedLines, int Files);
 
 /// <summary>
 /// Reads a unified diff (git's format, as GitHub's compare returns it) line by line: the file headers (<c>diff --git</c>,
@@ -179,6 +218,7 @@ public static class DiffPaths
     {
         var paths = new SortedSet<string>(StringComparer.Ordinal);
         var changed = 0;
+        var files = 0;
         var inHunk = false;
         foreach (var raw in diff.Split('\n'))
         {
@@ -186,6 +226,7 @@ public static class DiffPaths
             if (line.StartsWith("diff --git ", StringComparison.Ordinal))
             {
                 inHunk = false;
+                files++;
                 foreach (var path in GitHeaderPaths(line["diff --git ".Length..]))
                 {
                     paths.Add(path);
@@ -217,7 +258,7 @@ public static class DiffPaths
                 paths.Add(renamed);
             }
         }
-        return new DiffFacts(paths.ToList(), changed);
+        return new DiffFacts(paths.ToList(), changed, files);
     }
 
     private static readonly Regex Rename = new(@"^(?:rename|copy) (?:from|to) (?<p>.+)$");

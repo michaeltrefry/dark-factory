@@ -36,6 +36,9 @@ public class GatePipelineTests
         public bool Merged { get; set; }
         public string? MergeCommitSha { get; set; }
         public string? PolicyText { get; set; } = Policy;
+        public const string BaseSha = "base0";
+        /// <summary>GitHub's changed_files for the PR; by default the file count of <see cref="Diff"/> at the head.</summary>
+        public int? ChangedFiles { get; set; }
         public Dictionary<string, CiFacts> Ci { get; } = new();
         public List<string> Calls { get; } = [];
         /// <summary>Runs on each PR read, e.g. to push a new head at a given moment.</summary>
@@ -48,7 +51,8 @@ public class GatePipelineTests
         {
             Calls.Add($"pull {number}");
             OnPullRead?.Invoke(++_reads);
-            return Task.FromResult(new PullFacts(number, PrUrl, Open && !Merged, Merged, false, Head, "main", "base0", MergeCommitSha));
+            return Task.FromResult(new PullFacts(number, PrUrl, Open && !Merged, Merged, false, Head, "main", BaseSha, MergeCommitSha,
+                ChangedFiles ?? DiffPaths.Parse(Diff(Head)).Files));
         }
 
         /// <summary>The PR's diff for a head commit; by default a one-line change to an unrisky file.</summary>
@@ -70,6 +74,8 @@ public class GatePipelineTests
 
         public Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct)
         {
+            // The policy is read at the base commit the diff is read against, never at the moving base branch.
+            Assert.Equal(BaseSha, baseRef);
             Calls.Add($"policy {baseRef}");
             return Task.FromResult(PolicyText);
         }
@@ -280,8 +286,8 @@ public class GatePipelineTests
         Assert.Empty(verdict.RiskyPaths);
         Assert.All(verdict.Reviews, r => Assert.Equal("openai", r.Family));
 
-        // The gate read its policy from the base branch, and merged exactly the reviewed, green commit, once.
-        Assert.Contains("policy main", h.GitHub.Calls);
+        // The gate read its policy at the base commit (the one its diff is against), and merged exactly the reviewed, green commit, once.
+        Assert.Contains("policy base0", h.GitHub.Calls);
         Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
         Assert.StartsWith("Merge ", rows.Single(r => r.Step == RunPipeline.Steps.GateDecision).Detail);
         Assert.Equal(Sha1, rows.Single(r => r.Step == RunPipeline.Steps.GatePassed).Detail);
@@ -718,7 +724,7 @@ public class GatePipelineTests
     public async Task A_normal_tier_that_requires_the_security_review_gets_it_and_merges()
     {
         var h = new Harness();
-        h.GitHub.PolicyText = TestPolicies.Standard(normalChecks: "ci-green, review-pass, security-review");
+        h.GitHub.PolicyText = TestPolicies.Standard(normalChecks: "ci-green, review-pass, security-review, risk-threshold");
 
         var outcome = await h.Run();
 
@@ -726,6 +732,33 @@ public class GatePipelineTests
         Assert.Equal(ReviewRoles.All, h.Reviewer.Requests.Select(r => r.Role));
         Assert.Equal(["src/x.cs (normal)"], (await h.Verdicts()).Single().RiskyPaths);
         Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
+    }
+
+    [Fact]
+    public async Task A_normal_path_on_the_code_floor_gets_the_security_review_and_merges()
+    {
+        var h = new Harness();
+        h.GitHub.Diff = head => TestPolicies.Diff("scripts/deploy.sh", marker: $"change at {head}");
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(ReviewRoles.All, h.Reviewer.Requests.Select(r => r.Role));
+        Assert.Equal(["scripts/deploy.sh (scripts)"], (await h.Verdicts()).Single().RiskyPaths);
+        Assert.Contains($"policy {FakeGateGitHub.BaseSha}", h.GitHub.Calls);
+        Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
+    }
+
+    [Fact]
+    public async Task A_diff_missing_files_the_pr_changed_escalates()
+    {
+        var h = new Harness();
+        h.GitHub.ChangedFiles = 2; // the PR changed two files; the diff GitHub returned holds one
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Empty(h.Merges);
     }
 
     [Fact]
