@@ -10,12 +10,12 @@ namespace DarkFactory.Orchestrator.Worker;
 /// </summary>
 public static class WorkerModelClass
 {
-    /// <summary>The router's request header naming the class.</summary>
-    public const string Header = "x-weave-model-class";
+    /// <summary>The router's request header naming the class (<see cref="Router.ModelClass.Header"/>).</summary>
+    public const string Header = Router.ModelClass.Header;
 
-    public const string High = "high";
-    public const string Mid = "mid";
-    public const string Low = "low";
+    public const string High = Router.ModelClass.High;
+    public const string Mid = Router.ModelClass.Mid;
+    public const string Low = Router.ModelClass.Low;
 
     /// <summary>The label that makes a story simple whatever its estimate.</summary>
     public const string SimpleLabel = "simple";

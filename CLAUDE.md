@@ -381,7 +381,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   no-op through the helper, whose exit kills every `_factory` process (`WorkerSandbox.StopAllAsync`).
 - Workers get only the router URL + router key; the worker env is an allowlist (`ClaudeWorker.BuildRouterVariables`,
   enforced again by `scripts/factory-worker-launch`).
-- Worker model classes (E8, sc-25659, `Worker/WorkerModelClass.cs`): every worker session names a router model class and no model.
+- Worker model classes (E8, sc-25659, `Worker/WorkerModelClass.cs`, over `Router/ModelClass.cs`'s header, class and `model_class_unavailable`
+  constants; reviews and second opinions run on `high`, sc-25626, below): every worker session names a router model class and no model.
   `IWorker.RunAsync` takes the class (`high`|`mid`|`low`, anything else refused before a process starts); `ClaudeWorker` sends it as a
   second `ANTHROPIC_CUSTOM_HEADERS` line, `x-weave-model-class: <class>`, after `X-Weave-Router-Key` (Claude Code splits that variable
   on line breaks; no new variable, no `--model`, no `ANTHROPIC_MODEL`, no `x-weave-force-model`). Roles, decided in code, never by a

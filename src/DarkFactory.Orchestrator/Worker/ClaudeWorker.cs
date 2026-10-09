@@ -47,7 +47,7 @@ public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError,
     public bool HookStopped => TerminalReason == HookStoppedReason;
 
     /// <summary>The router's refusal when no model of the session's class can serve it (503; the message prefix).</summary>
-    public const string ModelClassUnavailableMarker = "model_class_unavailable";
+    public const string ModelClassUnavailableMarker = Router.ModelClass.Unavailable;
 
     /// <summary>
     /// The session failed because the router had no servable model in its class (E8: it never serves another class): Claude Code's
@@ -55,10 +55,8 @@ public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError,
     /// <see cref="UsageLimited"/>, a result that is not an error is the model's own prose and never counts. Such a failure pauses
     /// for usage instead of escalating the item.
     /// </summary>
-    public bool ModelClassUnavailable => !Succeeded && ((IsError && HasMarker(ResultText, ModelClassUnavailableMarker))
-        || HasMarker(StderrTail, ModelClassUnavailableMarker));
-
-    private static bool HasMarker(string? text, string marker) => text?.Contains(marker, StringComparison.OrdinalIgnoreCase) == true;
+    public bool ModelClassUnavailable => !Succeeded && ((IsError && ResultText is { } text && Router.ModelClass.IsUnavailable(text))
+        || Router.ModelClass.IsUnavailable(StderrTail));
 }
 
 /// <summary>
