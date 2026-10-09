@@ -384,7 +384,7 @@ public class FreezeTests
     }
 
     [Fact]
-    public async Task A_repo_or_base_github_answers_404_for_has_no_tip_to_be_red()
+    public async Task A_base_the_compare_answers_404_for_under_a_working_installation_has_no_tip_to_be_red()
     {
         var h = new H();
         await h.Merged("mergeAaaaaaaaaaa", "src/a.cs");
@@ -396,6 +396,28 @@ public class FreezeTests
         Assert.Contains(status.Notes, n => n.Contains($"no main of {Repo} (404", StringComparison.Ordinal));
         Assert.True((await h.Dispatch()).Succeeded);
         Assert.Null(await h.FreezeRow());
+    }
+
+    [Theory]
+    [InlineData("installation")] // the gate App is not installed on the repo (the installation lookup's 404)
+    [InlineData("token")] // the installation lost the repo (the token mint's 404)
+    public async Task A_gate_app_that_cannot_see_the_repo_fails_the_main_red_check_instead_of_reading_no_tip(string where)
+    {
+        var h = new H { Options = new FreezeOptions { CheckFailedEvaluations = 2 } };
+        await h.Merged("mergeAaaaaaaaaaa", "src/a.cs");
+        h.GitHub.Throws = new GitHubAppNotInstalledException($"GitHub {where} for {Repo} failed: 404 Not Found");
+
+        var first = await h.Dispatch();
+
+        Assert.StartsWith($"factory frozen ({FreezeTrigger.CheckFailed}): ", first.Deferred);
+        Assert.Empty(h.Worker.Calls);
+        var status = await h.Freeze.CheckAsync(CancellationToken.None);
+        Assert.True(status.Frozen);
+        Assert.DoesNotContain(status.Notes, n => n.Contains("no tip", StringComparison.Ordinal));
+        // Held after the failures in a row, as any check that cannot run (P1-E10).
+        var held = (await h.FreezeRow())!;
+        Assert.Equal((ControlState.Paused, FreezeTrigger.CheckFailedHeld), (held.State, held.Reason));
+        Assert.Contains(nameof(GitHubAppNotInstalledException), held.Detail);
     }
 
     [Fact]

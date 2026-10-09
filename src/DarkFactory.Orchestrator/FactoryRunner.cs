@@ -336,7 +336,7 @@ public sealed class FactoryItemStops(FactoryOptions options, IWorkSource source,
 /// Production <see cref="Issues.ITriageRunner"/>: one triage session as a sandboxed worker, like an item's run — the worker run lock,
 /// the sandbox readiness check (both factory-wide failures, E10), the router-only worker, its events stored (E7) — in a worktree whose
 /// owner-side git holds a contents-read token only (<see cref="Issues.WorkerTriageRunner.TriageWorkspaceToken"/>). The worker is
-/// read-only (<see cref="WorkerTools.ReadOnly"/>: Read, Glob, Grep; E4), and never runs unsandboxed (refused, factory-wide). Its
+/// read-only and reads only its own worktree (<see cref="WorkerTools.ReadOnly"/>: Read, Glob, Grep inside it; E4), and never runs unsandboxed (refused, factory-wide). Its
 /// worktree lives under its own root (<see cref="TriageWorktrees"/>) that no item's run uses, swept of leftovers before each triage
 /// (triages run one at a time, under the worker run lock), and is not shared for writing: the worker user reads it through the work
 /// root's inherited read entry (<c>setup-worker-user.sh</c>) and cannot write it.

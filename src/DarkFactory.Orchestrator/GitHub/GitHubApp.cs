@@ -81,7 +81,7 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
         using var lookupResponse = await http.SendAsync(lookup, ct);
         if (lookupResponse.StatusCode == HttpStatusCode.NotFound)
         {
-            throw new GitHubNotFoundException($"The GitHub App is not installed on {repo}. Install it, then retry.");
+            throw new GitHubAppNotInstalledException($"The GitHub App is not installed on {repo} (or cannot see it). Install it, then retry.");
         }
         await EnsureSuccess(lookupResponse, "look up installation", ct);
         var installation = await lookupResponse.Content.ReadFromJsonAsync<InstallationDto>(ct);
@@ -89,6 +89,12 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
         using var create = Request(HttpMethod.Post, $"app/installations/{installation!.Id}/access_tokens", "Bearer", jwt);
         create.Content = JsonContent.Create(new { repositories = new[] { repo.Name }, permissions = permissions ?? TokenPermissions });
         using var createResponse = await http.SendAsync(create, ct);
+        if (createResponse.StatusCode == HttpStatusCode.NotFound)
+        {
+            // The installation went away (or lost the repo) between the lookup and the mint: the App cannot see the repo.
+            throw new GitHubAppNotInstalledException(
+                $"GitHub create installation token for {repo} failed: 404 {await createResponse.Content.ReadAsStringAsync(ct)}");
+        }
         await EnsureSuccess(createResponse, "create installation token", ct);
         var token = await createResponse.Content.ReadFromJsonAsync<AccessTokenDto>(ct);
         if (token!.ExpiresAt > time.GetUtcNow() + MaxTokenLifetime + ClockSkew)
@@ -129,5 +135,15 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
         [property: JsonPropertyName("expires_at")] DateTimeOffset ExpiresAt);
 }
 
-/// <summary>GitHub answered 404: the repo, ref or object does not exist, or the App cannot see it (not installed there).</summary>
+/// <summary>
+/// GitHub answered 404 to a request made under a working installation token: the ref or object (a branch, a commit) does not
+/// exist. An App that is not installed on the repo, or cannot see it, is <see cref="GitHubAppNotInstalledException"/> instead.
+/// </summary>
 public sealed class GitHubNotFoundException(string message) : InvalidOperationException(message);
+
+/// <summary>
+/// The App has no installation that can see the repo (the installation lookup, or the token mint, answered 404): the App is not
+/// installed there, lost access, or the repo is gone. Not a <see cref="GitHubNotFoundException"/>: nothing can be read, so a
+/// check that needed the read failed — it did not find "no such ref".
+/// </summary>
+public sealed class GitHubAppNotInstalledException(string message) : InvalidOperationException(message);

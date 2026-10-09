@@ -59,9 +59,14 @@ public enum WorkerInput
 /// The session that reads an issue's text (the triage worker) holds no write capability at all (<see cref="WorkerTools.ReadOnly"/>:
 /// Read, Glob, Grep; no edit, command, sub-agent or web tool; refused unsandboxed), so it cannot change a file that an untainted
 /// session later pushes; its comment and label are posted by the orchestrator, and an issue item's implementer sees only the
-/// approved triage, fenced as data (<see cref="PromptFence.Spec"/>). Residual, accepted: it runs as the same worker user as the
-/// item workers, so it can read (not write) the work root — clones and other items' kept worktrees — and that user's home; what
-/// it reads only reaches its own answer, which is fenced on the issue and routes nothing by the model's say-so.
+/// approved triage, fenced as data (<see cref="PromptFence.Spec"/>). Its answer is posted on the issue, so what it can read is
+/// confined to its own triage worktree: its one allow rule is <see cref="WorkerTools.ReadRule"/> of that worktree, in
+/// <c>dontAsk</c> mode (any read outside it would prompt, so it is denied), with reads outside the working directory blocked and
+/// no settings file loaded that could widen that — not the work root's other clones or kept worktrees, not the worker user's home
+/// (other sessions' transcripts). The posted free text is bounded (<see cref="Issues.TriageParser.MaxTitle"/>,
+/// <see cref="Issues.TriageParser.MaxText"/>) and fenced. Residual, accepted: it can restate what it read inside its own worktree in
+/// that answer — the target repo's own code at its default branch, the repo the issue is about — and the answer routes nothing by
+/// the model's say-so.
 /// </para>
 /// </summary>
 public static class Taint

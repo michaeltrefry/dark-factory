@@ -183,7 +183,9 @@ public class WorkerTaintTests
             // The session claude was started as holds no write or exec tool (E4): read-only allowlist, a mode that denies the rest.
             var args = File.ReadAllLines(argsDump).ToList();
             Assert.Equal("dontAsk", args[args.IndexOf("--permission-mode") + 1]);
-            Assert.Equal(["Read", "Glob", "Grep"], args.Skip(args.IndexOf("--allowedTools") + 1).TakeWhile(a => !a.StartsWith("--", StringComparison.Ordinal)));
+            var allowed = Assert.Single(args.Skip(args.IndexOf("--allowedTools") + 1).TakeWhile(a => !a.StartsWith("--", StringComparison.Ordinal)));
+            Assert.Equal(WorkerTools.ReadRule(dir), allowed); // reads confined to its own worktree
+            Assert.Equal("", args[args.IndexOf("--setting-sources") + 1]);
             Assert.Equal(["taint issue-text", "session triage-1", "taint web:WebFetch"], seen);
             Assert.Equal(Taint.IssueText, (await ledger.TaintOfAsync("triage-1", CancellationToken.None))!.Reason);
             // Its work is never pushed, and a push of it is refused: no grant, so no token.

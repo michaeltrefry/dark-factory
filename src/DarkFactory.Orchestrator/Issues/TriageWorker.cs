@@ -41,8 +41,9 @@ public sealed class WorkerTriageRunner(IRepoWorkspace workspaces, IWorker worker
         if (!worker.Tools.IsReadOnly)
         {
             throw new InvalidOperationException(
-                $"The triage worker must be read-only (E4): it was given permission mode {worker.Tools.PermissionMode} and tools "
-                + $"[{string.Join(", ", worker.Tools.Allowed)}]; only [{string.Join(", ", WorkerTools.ReadOnlyTools)}] are allowed.");
+                $"The triage worker must be read-only (E4): it was given permission mode {worker.Tools.PermissionMode}, allow rules "
+                + $"[{string.Join(", ", worker.Tools.Allowed)}] and setting sources '{worker.Tools.SettingSources}'; only "
+                + $"[{string.Join(", ", WorkerTools.ReadOnlyTools)}] inside its own worktree are allowed (WorkerTools.ReadOnly).");
         }
         var workspace = await workspaces.PrepareAsync(repo, Branch(item), ct);
         var remove = true;

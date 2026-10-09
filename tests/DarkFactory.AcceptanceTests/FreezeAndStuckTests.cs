@@ -2,6 +2,7 @@ using DarkFactory.Orchestrator;
 using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Shortcut;
+using DarkFactory.Orchestrator.Worker;
 using Microsoft.EntityFrameworkCore;
 
 namespace DarkFactory.AcceptanceTests;
@@ -14,7 +15,7 @@ namespace DarkFactory.AcceptanceTests;
 /// story before reading the board, so the story stays To Do and is never claimed.</item>
 /// <item>Stuck: the worker is a stub Claude Code CLI (a bash script the test writes) that replays a recorded stream-json
 /// transcript — the same fixtures the unit tests replay — and honours the factory's pause hook exactly as the real CLI does (it
-/// reads the hook's flag path from <c>--settings</c> and ends the session at the next tool call once the flag exists). A real model
+/// parses the hook's flag path out of the <c>--settings</c> JSON, <see cref="StubClaude.PauseFlagExtractor"/>, and ends the session at the next tool call once the flag exists). A real model
 /// cannot be made to loop on demand, so this is the deterministic looping worker. It runs as the owner (<c>Worker:RunAs=none</c>):
 /// the stub reads and writes nothing but its fixture and its own log, and the only process the factory then stops is the stub.</item>
 /// </list>
@@ -201,6 +202,8 @@ internal sealed class StubClaude : IDisposable
         // The silence comes before the second tool result (the slow test run's), as the unit test replays it.
         var silenceAt = silenceBeforeSecondResult is null ? -1
             : lines.Select((l, i) => (l, i)).Where(x => x.l.Contains("\"tool_result\"", StringComparison.Ordinal)).Select(x => x.i).Skip(1).First();
+        Extractor = Path.Combine(_dir, "pause-flag.pl");
+        File.WriteAllText(Extractor, PauseFlagExtractor);
         Script = Path.Combine(_dir, "claude");
         File.WriteAllText(Script, $$"""
             #!/bin/bash
@@ -211,8 +214,8 @@ internal sealed class StubClaude : IDisposable
               if [ "$previous" = "--settings" ]; then settings="$arg"; fi
               previous="$arg"
             done
-            flag=$(printf '%s' "$settings" | sed -n "s/.*\[ -e '\([^']*\)' \].*/\1/p")
-            session=$(/usr/bin/uuidgen | tr 'A-Z' 'a-z')
+            flag=$(/usr/bin/perl '{{Extractor}}' "$settings")
+            session=$( { /usr/bin/uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid; } | tr 'A-Z' 'a-z')
             recorded=$(head -n 1 '{{transcript}}' | sed -n 's/.*"session_id": "\([^"]*\)".*/\1/p')
             n=0
             while IFS= read -r line || [ -n "$line" ]; do
@@ -239,8 +242,28 @@ internal sealed class StubClaude : IDisposable
         }
     }
 
+    /// <summary>
+    /// Prints the pause flag path of a <c>--settings</c> value (its first argument) as <see cref="ClaudeWorker.BuildPauseSettings"/>
+    /// writes it, or nothing. It parses the JSON (core JSON::PP): the serializer escapes the hook command's quotes
+    /// (<c>'</c>), so no text match on the raw value can find the path. /usr/bin/perl is what the worker launch needs anyway.
+    /// </summary>
+    public const string PauseFlagExtractor = """
+        use strict; use warnings; use JSON::PP;
+        binmode STDOUT, ':encoding(UTF-8)';
+        my $settings = eval { JSON::PP->new->decode($ARGV[0] // '') } or exit 0;
+        for my $matcher (@{ $settings->{hooks}{PreToolUse} || [] }) {
+            for my $hook (@{ $matcher->{hooks} || [] }) {
+                if (($hook->{command} // '') =~ /\[ -e '([^']*)' \]/) { print $1; exit 0; }
+            }
+        }
+
+        """;
+
     /// <summary>The script's path.</summary>
     public string Script { get; }
+
+    /// <summary>The pause flag extractor the script runs (<see cref="PauseFlagExtractor"/>).</summary>
+    public string Extractor { get; }
 
     /// <summary>The settings that make the factory run this stub, as the owner (no sandbox: the stub is the only process run).</summary>
     public Dictionary<string, string?> Settings() => new() { ["Worker:ClaudePath"] = Script, ["Worker:RunAs"] = "none" };

@@ -63,7 +63,8 @@ Claude Code headless workers through the Weave router.
   `factory-worker-launch` (the root-installed helper every sandboxed worker runs through).
 - `tests/DarkFactory.Orchestrator.Tests` — unit tests (no network; fake HTTP APIs, InMemory EF, local git).
   Tests run `scripts/factory-worker-launch` only through `SafeHelper` (a checked copy whose every signal goes through a
-  seam that signals only the test's own processes; `SafeHelper.Source` is private); `SafeHelperTests` fails if a test
+  seam that signals only the test's own processes, and whose uid-sweep listing names only the helper's tree and the test's
+  registered pids; `SafeHelper.Source` is private); `SafeHelperTests` fails if a test
   reaches the real helper another way (a repo path, the installed path, `Worker:LaunchHelper`/`options.WorkerSandbox`).
   A test signals a process only through `OwnProcess` (pid + start time, recorded where the pid cannot have been reused;
   `KillIfStillRunning` signals only while the start time still matches); `OwnProcessTests` fails on any other kill in
@@ -207,17 +208,22 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
 - GitHub issues (sc-25385, `Issues/`): `IssueIntake` polls each watched repo's open issues updated since its ledger cursor
   (`github_issue_cursors`; the first poll of a repo starts from now, no backfill). Each issue gets a key (`github_issues`) and a
   work item `gh-<key>` that waits Paused/parked (`awaiting triage`) until released. Each issue version (sha of title+body) is
-  triaged once by a read-only, unpinned worker (`WorkerTriageRunner` over `WorkerTools.ReadOnly`: `--allowedTools Read Glob
-  Grep`, `--permission-mode dontAsk`, every write/exec/sub-agent/web tool in `WorkerTools.WriteOrExecTools` denied; the runner
-  refuses any worker whose tools are not `IsReadOnly`, so a tainted session cannot change a file an untainted session later
+  triaged once by a read-only, unpinned worker (`WorkerTriageRunner` over `WorkerTools.ReadOnly`: its only allow rule is
+  `Read(//<abs triage worktree>/**)` (`WorkerTools.ReadRule`; Claude Code bounds Glob/Grep by Read rules), `--permission-mode
+  dontAsk` (every call that would prompt — any read outside the working directory — is auto-denied), `--settings` with
+  `permissions.blockReadsOutsideWorkingDirectories`, `--setting-sources ""` (no repo or worker-user settings file can widen
+  it), every write/exec/sub-agent/web tool in `WorkerTools.WriteOrExecTools` denied; the runner refuses any worker whose tools
+  are not `IsReadOnly`, so a tainted session cannot change a file an untainted session later
   pushes, E4; the prompt has it reason from the code, building and running nothing) in a throwaway `factory/triage-gh-<key>`
   worktree under its own root (`<WorkRoot>/triage-worktrees`, `SandboxTriageRunner.TriageWorktrees`: never the items'
   `worktrees`, swept before each triage, not ACL-shared for writing — the worker user reads it through the work root's
   inherited read entry) whose git holds a contents-read token; nothing is committed or pushed; the issue text is fenced as
   untrusted. `factory work` refuses to start with `GitHub:Watch:Repos` set and `Worker:RunAs=none`
-  (`IssueIntake.UnsandboxedRefusal`; `SandboxTriageRunner` refuses an unsandboxed triage too, factory-wide). Residual: the
-  triage runs as the same `_factory` user as the items' workers, so it can read (never write) the work root — clones and other
-  items' kept worktrees — and that user's home. The intake reads and writes the issue board only through the issue source's
+  (`IssueIntake.UnsandboxedRefusal`; `SandboxTriageRunner` refuses an unsandboxed triage too, factory-wide). Its posted free
+  text is bounded (`TriageParser`: title 120, summary and fix 1,500 chars each) and fenced. Residual: it runs as the same
+  `_factory` user as the items' workers, but its file tools read only its own triage worktree (not other clones, kept
+  worktrees or the worker home's transcripts); it can still restate what it read there — the target repo's own code at its
+  default branch, the repo the issue is about — inside that bounded, fenced answer. The intake reads and writes the issue board only through the issue source's
   `IIssueIntakeSource` capability (E6): triage comment and route label, issues, comments, permissions and gate policy. The orchestrator — not
   the model — routes (`IssueRouting`): question/duplicate → comment only; author without write/maintain/admin
   (`RepoPermission.IsCollaborator`; read and triage count as outsiders) on the issue's repo, or on the target repo when the
@@ -296,8 +302,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   strictly `Freeze:CostRisingRounds` times in a row; a round with no session or an unrecorded cost is no evidence), `main-red`
   (a state: per repo the factory works on now — the configured repos, `FactoryOptions.ConfiguredRepos` = `Factory:DefaultRepo` and
   `GitHub:Watch:Repos`, and the repos of non-terminal items — the base branch's head after its latest factory merge over all history
-  is `Ci.Evaluate` Failed; pending is not red; a repo or base GitHub answers 404 for (`GitHubNotFoundException`: gone, or the gate
-  App was uninstalled) has no tip, so nothing to be red — a `FreezeStatus.Notes` line, logged `[freeze]`; a head a Continue
+  is `Ci.Evaluate` Failed; pending is not red; a base the compare answers 404 for under a working installation
+  (`GitHubNotFoundException`: the branch or merge commit is gone) has no tip, so nothing to be red; a gate App that is not
+  installed on the repo or cannot see it (`GitHubAppNotInstalledException`: the installation lookup's or token mint's 404)
+  fails the check instead (`freeze-check-failed`, held as `check-failed`) — a `FreezeStatus.Notes` line, logged `[freeze]`; a head a Continue
   acknowledged — the `red-tip <repo>@<base> <sha>` lines of the cleared freeze's `Detail`, carried into later freezes — is skipped
   until the head moves). The run then returns the typed outcome `deferred` (`RunOutcome.Deferred`, nothing about the item changes;
   the error says what lifts it, `FreezeTrigger.Remedy`); the intake loop runs no ready item of any lane after a deferral and stops a

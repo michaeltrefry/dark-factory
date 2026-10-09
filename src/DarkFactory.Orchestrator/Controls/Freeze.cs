@@ -520,8 +520,8 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
         var repo = RepoRef.Parse(merge.Repo);
         if (await TipAsync(repo, merge.Repo, merge.Files!.Base, merge.Row.Detail!, fresh, ct) is not { } tip)
         {
-            notes.Add($"main-red: GitHub has no {merge.Files.Base} of {merge.Repo} (404: the repo or branch is gone, or the gate App "
-                + "cannot see it), so there is no tip to be red");
+            notes.Add($"main-red: GitHub has no {merge.Files.Base} of {merge.Repo} (404 under the gate App's installation: the branch "
+                + "or the merge commit is gone), so there is no tip to be red");
             return null;
         }
         var marker = RedTip(merge.Repo, merge.Files.Base, tip);
@@ -537,7 +537,12 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
             : null;
     }
 
-    /// <summary>The base branch's head after <paramref name="mergeCommit"/>, or null when GitHub answers 404 for the repo or branch.</summary>
+    /// <summary>
+    /// The base branch's head after <paramref name="mergeCommit"/>, or null when the compare answers 404 under a working installation
+    /// (<see cref="GitHubNotFoundException"/>: the branch or the merge commit is gone). A gate App that is not installed on the repo or
+    /// cannot see it (<see cref="GitHubAppNotInstalledException"/>) is not "no tip": it propagates, so main-red failed to run and the
+    /// evaluation takes the check-failed path (<see cref="FreezeTrigger.CheckFailed"/>, held after repeated failures).
+    /// </summary>
     private async Task<string?> TipAsync(RepoRef repo, string repoName, string baseRef, string mergeCommit, bool fresh, CancellationToken ct)
     {
         var key = (repoName.ToLowerInvariant(), baseRef, mergeCommit);

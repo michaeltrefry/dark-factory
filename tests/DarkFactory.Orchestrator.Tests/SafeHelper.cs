@@ -22,7 +22,12 @@ internal sealed record SafeHelperOptions
     /// <summary>"pid|start time" lines (<see cref="SafeHelper.Register"/>): processes outside the helper's tree that the test made and the seam may kill.</summary>
     public string? Registry { get; init; }
 
-    /// <summary>A shell snippet printing "pid ppid" lines, the pass number in <c>$n</c>, in place of the process table. null: the real table, restricted to the test's own processes.</summary>
+    /// <summary>
+    /// A shell snippet printing "pid ppid" lines, the pass number in <c>$n</c>, in place of the process table. null: the real table,
+    /// restricted to the helper's own tree and this test's <see cref="Registry"/> pids — never another process of this test host
+    /// (another test's, e.g. a double-forked one that launchd adopts between the listing and the seam's check, which the seam
+    /// would then refuse).
+    /// </summary>
     public string? FakeListing { get; init; }
 
     /// <summary>A mutation of the helper's own logic, applied before the copy is checked. One that touches the seam or the listing is refused.</summary>
@@ -127,6 +132,19 @@ internal sealed class SafeHelper
     public static void Register(string registry, OwnProcess process) =>
         File.AppendAllText(registry, $"{process.Pid}|{process.Start}\n");
 
+    /// <summary>
+    /// A script that runs only the real listing of a copy with <paramref name="registry"/> (its seam's registry reader and its
+    /// <c>list_uid_procs</c>; nothing in it is called that signals) and prints what it lists, "pid ppid" per line; the probe's
+    /// own shell stands in for the helper. For tests of what the listing can ever hand the sweep.
+    /// </summary>
+    public static string ListingProbe(string dir, string registry)
+    {
+        var copy = BuildCopy(new SafeHelperOptions { Registry = registry }, System.IO.Path.Combine(dir, "probe.targets"),
+            System.IO.Path.Combine(dir, "probe.refusals"), null);
+        var probe = $"#!/bin/bash\nset -eu\n{Block(copy, SeamStart, SeamEnd)}\n{Block(copy, ListingStart, ListingEnd)}\nlist_uid_procs\n";
+        return SandboxSupport.Executable(dir, $"listing-probe-{Guid.NewGuid().ToString("N")[..8]}", probe);
+    }
+
     /// <summary>Writes the checked copy to <paramref name="dir"/> and returns it.</summary>
     public static SafeHelper Create(string dir, SafeHelperOptions? options = null)
     {
@@ -171,10 +189,10 @@ internal sealed class SafeHelper
                 list_uid_procs() {
                     local reg
                     reg=" $(__seam_registry | /usr/bin/tr '\n' ' ') "
-                    /bin/ps -A -o pid=,ppid=,uid= 2>/dev/null | /usr/bin/awk -v host={{host}} -v uid={{uid}} -v reg="$reg" '
+                    /bin/ps -A -o pid=,ppid=,uid= 2>/dev/null | /usr/bin/awk -v self="$$" -v uid={{uid}} -v reg="$reg" '
                         function under(p, root,   n) { n = 0; while (p != root && (p in up) && n++ < 100000) p = up[p]; return p == root }
                         { up[$1] = $2; owner[$1] = $3 }
-                        END { for (p in up) if (owner[p] == uid && p != host && (under(p, host) || index(reg, " " p " "))) print p, up[p] }'
+                        END { for (p in up) if (owner[p] == uid && (p == self || under(p, self) || index(reg, " " p " "))) print p, up[p] }'
                 }
                 """;
         var listing = $"{ListingStart}\n{listingBody}\n{ListingEnd}";

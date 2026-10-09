@@ -93,7 +93,7 @@ public class SafeHelperTests
         {
             "seam-allows-everything" => copy => copy.Replace("else out(\"refuse\", x)", "else out(\"kill\", x)"),
             "seam-no-refusal" => copy => copy.Replace("exit 99", ":"),
-            "listing-whole-table" => copy => copy.Replace("p != host && (under(p, host) || index(reg, \" \" p \" \"))", "1"),
+            "listing-whole-table" => copy => copy.Replace("(p == self || under(p, self) || index(reg, \" \" p \" \"))", "1"),
             _ => throw new ArgumentOutOfRangeException(nameof(mutation)),
         };
         var options = new SafeHelperOptions { Identity = FakeIdentity.SandboxRole, Registry = Path.Combine(_dir, "reg") };
@@ -261,6 +261,56 @@ public class SafeHelperTests
         finally
         {
             sleeper.KillIfStillRunning();
+        }
+    }
+
+    [Fact]
+    public async Task Real_listing_never_hands_the_sweep_another_process_of_this_test_host()
+    {
+        // Another test's processes: a child of this host (what a double-forked one is until launchd adopts it, sc-25391) and one
+        // already adopted. Neither is in this test's registry, so neither is ever listed — the seam then never has to re-classify
+        // one that was reparented in between (a refusal: exit 99). The registry's own process and the helper's tree are listed.
+        using var childProcess = Process.Start(new ProcessStartInfo("/bin/sleep", ["600"]) { RedirectStandardInput = true })!;
+        var child = OwnProcess.Of(childProcess);
+        var adopted = OwnProcess.StartDetached(_dir);
+        var registered = OwnProcess.StartDetached(_dir);
+        try
+        {
+            var registry = Path.Combine(_dir, "reg");
+            SafeHelper.Register(registry, registered);
+            using var probe = Process.Start(new ProcessStartInfo(SafeHelper.ListingProbe(_dir, registry))
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            })!;
+            var stdout = await probe.StandardOutput.ReadToEndAsync(TestContext.Current.CancellationToken);
+            var stderr = await probe.StandardError.ReadToEndAsync(TestContext.Current.CancellationToken);
+            await probe.WaitForExitAsync(TestContext.Current.CancellationToken);
+            Assert.True(probe.ExitCode == 0, stderr);
+            var listed = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(l => l.Split(' ')).ToList();
+
+            Assert.Contains(listed, l => l[0] == registered.Pid.ToString());
+            Assert.Contains(listed, l => l[0] == probe.Id.ToString()); // the helper's stand-in itself
+            Assert.DoesNotContain(listed, l => l[0] == child.Pid.ToString());
+            Assert.DoesNotContain(listed, l => l[0] == adopted.Pid.ToString());
+            Assert.DoesNotContain(listed, l => l[0] == Environment.ProcessId.ToString());
+            // Nothing else of this host: every pid listed is the registry's or in the probe's own tree.
+            var parents = listed.ToDictionary(l => l[0], l => l[1]);
+            Assert.All(listed, l =>
+            {
+                var p = l[0];
+                for (var n = 0; p != probe.Id.ToString() && p != registered.Pid.ToString() && parents.ContainsKey(p) && n < 100; n++)
+                {
+                    p = parents[p];
+                }
+                Assert.True(p == probe.Id.ToString() || p == registered.Pid.ToString(), $"listed {l[0]} (parent {l[1]}) is neither the probe's nor the registry's");
+            });
+        }
+        finally
+        {
+            child.KillIfStillRunning();
+            adopted.KillIfStillRunning();
+            registered.KillIfStillRunning();
         }
     }
 
