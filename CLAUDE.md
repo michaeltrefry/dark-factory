@@ -22,6 +22,12 @@ Claude Code headless workers through the Weave router.
 - `scripts/` — `setup-worker-user.sh` (one-time root setup of the `_factory` sandbox user) and
   `factory-worker-launch` (the root-installed helper every sandboxed worker runs through).
 - `tests/DarkFactory.Orchestrator.Tests` — unit tests (no network; fake HTTP APIs, InMemory EF, local git).
+  Tests run `scripts/factory-worker-launch` only through `SafeHelper` (a checked copy whose every signal goes through a
+  seam that signals only the test's own processes; `SafeHelper.Source` is private); `SafeHelperTests` fails if a test
+  reaches the real helper another way (a repo path, the installed path, `Worker:LaunchHelper`/`options.WorkerSandbox`).
+  A test signals a process only through `OwnProcess` (pid + start time, recorded where the pid cannot have been reused;
+  `KillIfStillRunning` signals only while the start time still matches); `OwnProcessTests` fails on any other kill in
+  `tests/` (`Process.Kill`, a kill(2) import, a `kill`/`pkill`/`killall` in a script).
   `CrashResumeTests` also needs the compose Postgres (skips locally without it, fails under `CI`): it
   SIGKILLs `tests/DarkFactory.CrashHost` (the real pipeline with a fake `claude` script) and restarts it.
   `ShortcutContractTests` replay recorded Shortcut API fixtures (`Fixtures/shortcut`, strict request matching);
@@ -97,12 +103,19 @@ unreachable. Router variables go to the helper on stdin; the helper builds the w
 (PATH, HOME from the password database, MSBuild node reuse/build server off, router vars), refuses any
 other variable or a program that isn't an absolute path/plain name, and when the worker exits or its stdin
 closes kills the tree, the process group and then every other `_factory` process (a `pgrep -U` sweep that
-spares the helper's own pid — never `kill -1`, which on macOS kills the sender too; the helper skips that
-step when not running as the sandbox user), then exits with the worker's status. So `_factory` is
+spares the helper's own pid and its descendants — never `kill -1`, which on macOS kills the sender too), then exits
+with the worker's status. The sweep runs only when the helper's user name is `sandbox_user` and its uid is
+`sandbox_uid`, which setup pins (it must be in 400-499, the range setup allocates, still `sandbox_user`'s uid, and not
+the sudo caller's); otherwise the helper prints `refusing the _factory uid sweep: <why>` and skips it. `send_signal`
+never signals pid or group 0 or 1 or an empty target. So `_factory` is
 single-tenant: one sandboxed `factory run` per machine (`WorkerLock`, `<work root>/.factory-run.lock`). Run
-`sudo scripts/setup-worker-user.sh` once (re-run it after a helper change: the installed helper's allowlist is
-`ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_AUTH_TOKEN`; `EnsureReadyAsync` probes with the real
-variable names, so a stale helper fails start-up naming the re-run). Every normal (re)run kills every `_factory`
+`sudo scripts/setup-worker-user.sh` once, and again after any change to `scripts/factory-worker-launch`: it installs
+the helper with `sandbox_user` and `sandbox_uid` set (setup refuses a worker uid outside 400-499). `EnsureReadyAsync`
+reads the installed helper first and fails start-up with `Stale helper: … re-run \`sudo scripts/setup-worker-user.sh\``
+unless it has `helper_version` ≥ `WorkerSandbox.HelperVersion` (2) and, with those two lines undone, the SHA-256 of the
+repo's helper (compiled into the orchestrator as a resource); then it probes with the real router variable names
+(allowlist `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_AUTH_TOKEN`) and fails if the probe's stderr
+has a uid-sweep refusal. Every normal (re)run kills every `_factory`
 process (its toolchain check runs through the helper): close `_factory` sessions and stop `factory work` first.
 `--remove-worker-login` (opt-in) is a standalone mode: it runs none of the setup (no helper, no toolchain check, no
 installs) and only deletes `_factory`'s own Claude login (`~/.claude/.credentials.json`, keychain item

@@ -189,9 +189,12 @@ printf 'add-generic-password -U -s dark-factory -a router-key -w %s\n' "$(pbpast
 
 # 4. Worker sandbox user, launch helper, sudoers rule and work root (see below). A (re)run KILLS EVERY
 #    _factory PROCESS (its toolchain check runs through the helper, whose exit kills them all): close any
-#    `sudo -u _factory` session and stop `factory work` first. Re-run it after pulling a helper change:
-#    `factory run`/`work` refuse to start while the installed helper's allowlist refuses a router variable
-#    ("... is stale ... re-run `sudo scripts/setup-worker-user.sh`").
+#    `sudo -u _factory` session and stop `factory work` first. Re-run it after pulling any change to
+#    scripts/factory-worker-launch: `factory run`/`work` refuse to start unless the installed helper is the
+#    repo's (same SHA-256 once setup's sandbox_user/sandbox_uid lines are undone, helper_version >= 2):
+#    "Stale helper: the installed launch helper ... is not the current scripts/factory-worker-launch (...);
+#    re-run `sudo scripts/setup-worker-user.sh` to install it". They also refuse a helper that skips its
+#    _factory uid sweep ("... refuses its _factory uid sweep ...").
 sudo scripts/setup-worker-user.sh
 
 # 5. Worker model auth. Default Worker__Auth=router-key: the worker holds no Anthropic/OpenAI credential,
@@ -233,6 +236,8 @@ killing every `_factory` process, so close `_factory` sessions and stop `factory
   plain command name. When the worker exits, or its stdin closes (Stop, timeout, or the orchestrator
   dying), it kills the worker's tree and process group and then **every `_factory` process**
   (all but the helper itself, which then exits with the worker's status), so nothing that forked and `setsid()`ed away survives the run.
+  That sweep runs only as `_factory`'s own uid, which setup pins into the installed helper (`sandbox_uid`, in 400–499);
+  setup refuses an existing `_factory` whose uid is outside that range.
   That makes `_factory` single-tenant: **one sandboxed `factory run` at a time per machine**, enforced by
   a lock on `<work root>/.factory-run.lock` (a second run fails fast).
 - **`/opt/dark-factory/work`**: the work root (clones + worktrees), owned by you under a root-owned
