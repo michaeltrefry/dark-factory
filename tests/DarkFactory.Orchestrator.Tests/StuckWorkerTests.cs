@@ -425,8 +425,9 @@ public class StuckFixRoundTests
         Assert.All(await Progress(h), p => Assert.Contains("stuck in a loop", p.Reason));
         Assert.Equal(1, h.Workspaces.Calls.Count(c => c.StartsWith("push"))); // the implementer's only
         Assert.Contains("after 3 fix rounds", h.Stories.Comments.Single());
-        Assert.Contains($"; {Lifecycle.MaxFixRounds} round(s) failed because the fixer was stuck in a loop (the last 5 turns were near-identical",
-            h.Stories.Comments.Single());
+        Assert.Contains($"; {Lifecycle.MaxFixRounds} of them failed because the fixer was stuck in a loop — round 1 (review findings): "
+            + "the last 5 turns were near-identical", h.Stories.Comments.Single());
+        Assert.Contains("; round 3 (review findings): the last 5 turns were near-identical", h.Stories.Comments.Single());
     }
 
     [Fact]
@@ -464,10 +465,10 @@ public class StuckFixRoundTests
         Assert.Equal(WorkState.Escalated, outcome.State);
         Assert.Equal(Lifecycle.MaxFixRounds, (await h.Transitions()).Count(s => s == WorkState.CIHealing));
         Assert.Equal(1, h.Workspaces.Calls.Count(c => c.StartsWith("push"))); // the implementer's only
-        Assert.Contains("after 3 fix rounds (the cap is 3, shared by review and CI fixes)", outcome.Error);
-        Assert.Contains($"; {Lifecycle.MaxFixRounds} round(s) failed because the CI fixer was stuck in a loop (the last 5 turns were near-identical",
-            outcome.Error);
-        Assert.Contains("because the CI fixer was stuck in a loop", h.Stories.Comments.Single());
+        Assert.Contains("after 3 fix rounds (the cap is 3, one count shared by review, CI and conflict fix rounds)", outcome.Error);
+        Assert.Contains($"; {Lifecycle.MaxFixRounds} of them failed because the fixer was stuck in a loop — round 1 (red CI): "
+            + "the last 5 turns were near-identical", outcome.Error);
+        Assert.Contains("round 3 (red CI): the last 5 turns were near-identical", h.Stories.Comments.Single());
     }
 
     [Fact]

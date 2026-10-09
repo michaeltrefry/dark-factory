@@ -81,7 +81,7 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
         using var lookupResponse = await http.SendAsync(lookup, ct);
         if (lookupResponse.StatusCode == HttpStatusCode.NotFound)
         {
-            throw new InvalidOperationException($"The GitHub App is not installed on {repo}. Install it, then retry.");
+            throw new GitHubNotFoundException($"The GitHub App is not installed on {repo}. Install it, then retry.");
         }
         await EnsureSuccess(lookupResponse, "look up installation", ct);
         var installation = await lookupResponse.Content.ReadFromJsonAsync<InstallationDto>(ct);
@@ -114,7 +114,8 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
         if (!response.IsSuccessStatusCode)
         {
             var body = await response.Content.ReadAsStringAsync(ct);
-            throw new InvalidOperationException($"GitHub {action} failed: {(int)response.StatusCode} {body}");
+            var message = $"GitHub {action} failed: {(int)response.StatusCode} {body}";
+            throw response.StatusCode == HttpStatusCode.NotFound ? new GitHubNotFoundException(message) : new InvalidOperationException(message);
         }
     }
 
@@ -127,3 +128,6 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
         [property: JsonPropertyName("token")] string Token,
         [property: JsonPropertyName("expires_at")] DateTimeOffset ExpiresAt);
 }
+
+/// <summary>GitHub answered 404: the repo, ref or object does not exist, or the App cannot see it (not installed there).</summary>
+public sealed class GitHubNotFoundException(string message) : InvalidOperationException(message);

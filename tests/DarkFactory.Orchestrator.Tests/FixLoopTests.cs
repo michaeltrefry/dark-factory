@@ -212,19 +212,66 @@ public class FixLoopTests
     }
 
     [Fact]
-    public async Task More_fix_rounds_than_the_policys_risk_threshold_allows_escalates_at_the_gate()
+    public async Task The_policys_max_fix_rounds_lowers_the_cap_the_loop_escalates_at()
     {
-        var h = new Harness { Reviewer = ReviewerFor(new() { [ReviewRoles.Correctness] = new() { [Sha1] = [Blocking("one")] } }) };
-        h.GitHub.PolicyText = Support.TestPolicies.Standard(maxFixRounds: 0);
+        var h = new Harness
+        {
+            Reviewer = ReviewerFor(new() { [ReviewRoles.Correctness] = new() { [Sha1] = [Blocking("one")], [ShaA] = [Blocking("two")] } }),
+        };
+        h.GitHub.PolicyText = Support.TestPolicies.Standard(maxFixRounds: 1);
 
         var outcome = await h.Run();
 
-        // The round made progress and the head passed review and CI, but the change needed a fix round the policy does not allow.
+        // max_fix_rounds: 1 — the loop itself escalates before a round 2 (not the hard cap of 3), naming the cap and its source.
         Assert.Equal(WorkState.Escalated, outcome.State);
-        Assert.Contains("risk threshold: 1 fix rounds exceed max_fix_rounds 0", outcome.Error);
-        Assert.Equal([WorkState.Review, WorkState.Fixing, WorkState.Review, WorkState.CI, WorkState.MergeGate, WorkState.Escalated],
-            (await h.Transitions()).Skip(2));
+        Assert.Equal([WorkState.Review, WorkState.Fixing, WorkState.Review, WorkState.Escalated], (await h.Transitions()).Skip(2));
+        Assert.Equal(2, h.WorkerCalls.Count); // the implementer and one fixer
+        Assert.Contains("after 1 fix rounds (the cap is 1, the policy's max_fix_rounds (the factory's hard cap is 3)", outcome.Error);
+        Assert.Contains("a fix round 2 is not allowed", outcome.Error);
+        // The fixer was told the effective cap, and the cap is on the ledger before the decision it was read for.
+        Assert.Contains("(fix round 1 of 1)", h.WorkerCalls[1].Prompt);
+        var rows = await h.Rows();
+        var cap = rows.Single(r => r.Step == RunPipeline.Steps.FixCap);
+        Assert.StartsWith("1 (factory/gate.yaml risk.max_fix_rounds 1;", cap.Detail);
+        Assert.True(cap.Id < rows.Single(r => r.Step is null && r.State == WorkState.Fixing).Id);
+        Assert.Equal(1, RunPipeline.FixCapOf(rows));
+        Assert.Contains("Fix rounds: 1 of 1", LedgerReport.Facts(rows, []));
         Assert.Empty(h.Merges);
+    }
+
+    [Fact]
+    public void The_cap_escalation_lists_every_stuck_round_of_any_kind_since_the_last_implement()
+    {
+        var id = 0L;
+        LedgerEntry T(WorkState state, string? detail = null) => new() { Id = ++id, State = state, Detail = detail, Outcome = StepOutcome.Passed };
+        List<LedgerEntry> history =
+        [
+            T(WorkState.Intake), T(WorkState.Implement),
+            T(WorkState.Review), T(WorkState.Fixing, Sha1), T(WorkState.Review, RunPipeline.StuckRoundDetail("fix round 1", "looping before")),
+            T(WorkState.Implement), // a new attempt: rounds before it are not this cap's
+            T(WorkState.Review), T(WorkState.Fixing, Sha1), T(WorkState.Review, RunPipeline.StuckRoundDetail("fix round 1", "review loop")),
+            T(WorkState.CI), T(WorkState.CIHealing, Sha1), T(WorkState.CI, "ci fix round 2 pushed abc"),
+            T(WorkState.Review), T(WorkState.CI), T(WorkState.CIHealing, ShaA), T(WorkState.Paused, RunPipeline.UserPaused),
+            T(WorkState.CIHealing, "unpaused"), T(WorkState.CI, RunPipeline.StuckRoundDetail("ci fix round 3", "ci loop")),
+            T(WorkState.MergeGate), T(WorkState.Fixing, ShaA), T(WorkState.Review, RunPipeline.StuckRoundDetail("conflict fix round 4", "conflict loop")),
+        ];
+
+        Assert.Equal("; 3 of them failed because the fixer was stuck in a loop — round 1 (review findings): review loop; "
+            + "round 3 (red CI): ci loop; round 4 (conflict with the base): conflict loop", RunPipeline.StuckRounds(history));
+        Assert.Equal("; 1 of them failed because the fixer was stuck in a loop — round 1 (review findings): review loop",
+            RunPipeline.StuckRounds(history.Take(14).ToList()));
+    }
+
+    [Fact]
+    public async Task A_policy_at_the_hard_cap_records_no_cap_and_the_loop_uses_the_hard_cap()
+    {
+        var h = new Harness { Reviewer = ReviewerFor(new() { [ReviewRoles.Correctness] = new() { [Sha1] = [Blocking("one")] } }) };
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Contains($"(fix round 1 of {Lifecycle.MaxFixRounds})", h.WorkerCalls[1].Prompt);
+        Assert.DoesNotContain(await h.Rows(), r => r.Step == RunPipeline.Steps.FixCap);
     }
 
     [Fact]

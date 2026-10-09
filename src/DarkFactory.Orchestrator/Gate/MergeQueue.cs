@@ -154,7 +154,9 @@ public static class MergeQueue
     /// <summary>
     /// Whether the item is in the ledger's queue now: in MergeGate, or paused from it in a way that resumes by itself — an
     /// interruption (<see cref="RunPipeline.Interrupted"/>: Ctrl-C or <c>factory work</c> shutting down), a user's Pause
-    /// (<see cref="RunPipeline.UserPaused"/>, resumed by Continue) or the usage pause (<see cref="RunPipeline.UsagePaused"/>) —
+    /// (<see cref="RunPipeline.UserPaused"/>, resumed by Continue), the usage pause (<see cref="RunPipeline.UsagePaused"/>), the
+    /// freeze (<see cref="RunPipeline.FreezePaused"/>, resumed by the freeze's Continue) or unreadable controls
+    /// (<see cref="RunPipeline.ControlsUnreadablePaused"/>) — the pauses <see cref="RunPipeline"/> resumes by itself —
     /// so it keeps its approval-time place. While a control still holds such an item and no run of it is active, the caller
     /// leaves it out (<see cref="RunPipeline"/>'s queue build), so it never holds up its repo. A parked item (paused other ways,
     /// or parked since, e.g. its story left the watch scope) never resumes by itself and is out of the queue.
@@ -176,7 +178,8 @@ public static class MergeQueue
     }
 
     private static bool ResumablePause(LedgerEntry row) =>
-        row.State == WorkState.Paused && row.Detail is RunPipeline.Interrupted or RunPipeline.UserPaused or RunPipeline.UsagePaused;
+        row.State == WorkState.Paused && row.Detail is RunPipeline.Interrupted or RunPipeline.UserPaused or RunPipeline.UsagePaused
+            or RunPipeline.FreezePaused or RunPipeline.ControlsUnreadablePaused;
 
     private static bool IsInterruption(LedgerEntry row) => row.State == WorkState.Paused && row.Detail == RunPipeline.Interrupted;
 

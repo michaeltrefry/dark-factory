@@ -343,6 +343,116 @@ public class FactoryOptionsTests
         Assert.Throws<InvalidOperationException>(() => Options(new() { ["Shortcut:Watch:Epics"] = "sc-1" }).WatchScope);
     }
 
+    // E6: each duration key is read (a non-default value comes through) and validated (0 or less refused, naming the key: 0 would
+    // poll GitHub or the board in a tight loop, or time a call out at once).
+    public static TheoryData<string, Func<FactoryOptions, TimeSpan>, TimeSpan> Durations => new()
+    {
+        { "Review:TimeoutMinutes", o => o.ReviewTimeout, TimeSpan.FromMinutes(7) },
+        { "Gate:CiPollSeconds", o => o.CiPollInterval, TimeSpan.FromSeconds(7) },
+        { "Gate:CiTimeoutMinutes", o => o.CiTimeout, TimeSpan.FromMinutes(7) },
+        { "Gate:TestTimeoutMinutes", o => o.TestTimeout, TimeSpan.FromMinutes(7) },
+        { "Intake:PollSeconds", o => o.PollInterval, TimeSpan.FromSeconds(7) },
+        { "Usage:PollSeconds", o => o.UsagePollInterval, TimeSpan.FromSeconds(7) },
+        { "Worker:TimeoutMinutes", o => o.WorkerTimeout, TimeSpan.FromMinutes(7) },
+        { "Freeze:CheckFailedMinutes", o => o.Freeze.CheckFailedWindow, TimeSpan.FromMinutes(7) },
+    };
+
+    [Theory]
+    [MemberData(nameof(Durations))]
+    public void Each_duration_comes_from_config_and_a_non_positive_one_is_refused_at_start_up(string key, Func<FactoryOptions, TimeSpan> read, TimeSpan seven)
+    {
+        Assert.NotEqual(seven, read(Options([])));
+        Assert.Equal(seven, read(Options(new() { [key] = "7" })));
+        foreach (var bad in new[] { "0", "-1" })
+        {
+            Assert.Contains($"{key} must be more than 0", Assert.Throws<InvalidOperationException>(() => read(Options(new() { [key] = bad }))).Message);
+            Assert.Contains(key, Assert.Throws<InvalidOperationException>(() => Options(new() { [key] = bad }).ValidateSettings()).Message);
+        }
+    }
+
+    [Fact]
+    public void The_gate_and_the_reviewers_client_are_built_from_their_config_keys()
+    {
+        var options = Options(new()
+        {
+            ["Gate:CiPollSeconds"] = "7", ["Gate:CiTimeoutMinutes"] = "8", ["Gate:TestTimeoutMinutes"] = "9", ["Review:TimeoutMinutes"] = "11",
+        });
+        var workspaces = new Git.GitWorkspace(Path.GetTempPath(), r => $"https://example.invalid/{r.FullName}", (_, _) => Task.FromResult<string?>(null));
+
+        var gate = FactoryRunner.CreateGate(options, new GatePipelineTests.FakeGateGitHub(), new GatePipelineTests.FakeReviewer(),
+            GatePipelineTests.TestPanel, workspaces, sandbox: null);
+        using var reviewer = FactoryRunner.ReviewerHttp(options);
+
+        Assert.Equal((TimeSpan.FromSeconds(7), TimeSpan.FromMinutes(8)), (gate.CiPollInterval, gate.CiTimeout));
+        Assert.Equal(TimeSpan.FromMinutes(9), Assert.IsType<SandboxTestRunner>(gate.Tests).Timeout);
+        Assert.Equal(TimeSpan.FromMinutes(11), reviewer.Timeout);
+    }
+
+    [Fact]
+    public void The_other_settings_come_from_config_and_out_of_range_values_are_refused()
+    {
+        Assert.Equal(5000, Options(new() { ["Factory:HostPort"] = "5000" }).HostPort);
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Factory:HostPort"] = "-1" }).HostPort);
+        Assert.Contains("Factory:HostPort", Assert.Throws<InvalidOperationException>(() => Options(new() { ["Factory:HostPort"] = "70000" }).ValidateSettings()).Message);
+
+        Assert.Equal(5, Options(new() { ["Intake:MaxItemFailures"] = "5" }).MaxItemFailures);
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Intake:MaxItemFailures"] = "0" }).MaxItemFailures);
+
+        Assert.Equal(DarkFactory.Orchestrator.RunPipeline.DefaultMaxControlReadFailures, Options([]).MaxControlReadFailures);
+        Assert.Equal(4, Options(new() { ["Controls:MaxReadFailures"] = "4" }).MaxControlReadFailures);
+        Assert.Contains("Controls:MaxReadFailures must be at least 1",
+            Assert.Throws<InvalidOperationException>(() => Options(new() { ["Controls:MaxReadFailures"] = "0" }).MaxControlReadFailures).Message);
+
+        Assert.Equal("acme/widgets", Options(new() { ["Factory:DefaultRepo"] = "acme/widgets" }).DefaultRepo.FullName);
+        Assert.Contains("Factory:DefaultRepo", Assert.Throws<InvalidOperationException>(() => Options(new() { ["Factory:DefaultRepo"] = "nope" }).ValidateSettings()).Message);
+
+        Assert.Equal("/opt/claude/bin/claude", Options(new() { ["Worker:ClaudePath"] = "/opt/claude/bin/claude" }).ClaudePath);
+        Assert.Equal("Host=db;Database=f", Options(new() { ["ConnectionStrings:Ledger"] = "Host=db;Database=f" }).LedgerConnectionString);
+
+        Assert.Equal(new Uri("http://router.local:9000/"), Options(new() { ["Router:BaseUrl"] = "http://router.local:9000" }).RouterBaseUrl);
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Router:BaseUrl"] = "router.local" }).RouterBaseUrl);
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Router:BaseUrl"] = "ftp://router.local" }).RouterBaseUrl);
+        Options([]).ValidateSettings(); // the defaults pass
+    }
+
+    // P1-E1: the lint sees only the code; a model provider's host given through config is refused when the option is read.
+    public static TheoryData<string> Providers => [.. Analyzers.GatewayAnalyzer.ProviderMarkers];
+
+    [Theory]
+    [MemberData(nameof(Providers))]
+    public void A_router_base_url_naming_a_model_provider_is_refused(string marker)
+    {
+        var url = marker.Contains('.') ? $"https://{marker.ToUpperInvariant()}/v1" : $"http://router.local/?k={marker}";
+
+        var refused = Assert.Throws<InvalidOperationException>(() => Options(new() { ["Router:BaseUrl"] = url }).RouterBaseUrl);
+
+        Assert.Contains("Router:BaseUrl names a model provider", refused.Message);
+        Assert.Contains("Router:BaseUrl", Assert.Throws<InvalidOperationException>(() => Options(new() { ["Router:BaseUrl"] = url }).ValidateSettings()).Message);
+    }
+
+    [Fact]
+    public void The_orchestrator_reads_the_same_provider_list_as_the_gateway_lint()
+    {
+        Assert.Equal(Analyzers.GatewayAnalyzer.ProviderMarkers, Gateway.ProviderMarkers.All);
+        Assert.True(Gateway.ProviderMarkers.All.Count >= 10);
+    }
+
+    [Fact]
+    public async Task Factory_run_with_a_setting_out_of_range_exits_2_naming_the_key_before_anything_runs()
+    {
+        var calls = new List<string>();
+        var stderr = new StringWriter();
+
+        var exit = await FactoryRunner.RunCommandAsync(Options(new() { ["Gate:CiPollSeconds"] = "0", ["Review:Models"] = "claude-opus-5-5" }),
+            _ => { calls.Add("enrollment"); return Task.FromResult<string?>(null); },
+            _ => { calls.Add("run"); return Task.FromResult(new RunOutcome(1, DarkFactory.Orchestrator.Ledger.WorkState.Watch, null, null, null)); },
+            stderr, CancellationToken.None);
+
+        Assert.Equal(2, exit);
+        Assert.Contains("Gate:CiPollSeconds must be more than 0", stderr.ToString());
+        Assert.Empty(calls);
+    }
+
     [Fact]
     public void Missing_credential_names_where_to_set_it_without_leaking_values()
     {

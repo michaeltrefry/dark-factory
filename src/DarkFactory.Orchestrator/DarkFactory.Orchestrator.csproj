@@ -30,6 +30,8 @@
     <EmbeddedResource Include="../../factory/prompts/*.md" LogicalName="factory/prompts/%(Filename)%(Extension)" />
     <!-- The launch helper as the repo has it: the installed one must match it (WorkerSandbox.StaleHelperReason). Only compared, never run. -->
     <EmbeddedResource Include="../../scripts/factory-worker-launch" LogicalName="factory-worker-launch" />
+    <!-- The gateway lint's model provider markers (one list, also embedded in the analyzer): Router:BaseUrl may name none. -->
+    <EmbeddedResource Include="../DarkFactory.Analyzers/ProviderMarkers.txt" LogicalName="provider-markers.txt" />
     <!-- The gateway lint (sc-25390): every build fails on outbound HTTP or a git push outside Gateway/ and on a model
          provider's host anywhere (in the code and in these additional files; Razor markup is one already). -->
     <ProjectReference Include="../DarkFactory.Analyzers/DarkFactory.Analyzers.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />

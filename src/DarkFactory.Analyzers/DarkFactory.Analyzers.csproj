@@ -13,6 +13,8 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.12.0" PrivateAssets="all" />
+    <!-- The model provider markers (the provider-host rule); the orchestrator embeds the same file for its runtime Router:BaseUrl check. -->
+    <EmbeddedResource Include="ProviderMarkers.txt" LogicalName="provider-markers.txt" />
   </ItemGroup>
 
 </Project>

@@ -209,6 +209,45 @@ public class NewTestsGateTests
     }
 
     [Fact]
+    public async Task Controls_unreadable_past_the_limit_while_the_tests_run_cancel_them_as_a_pause()
+    {
+        var h = new Harness { ControlPoll = TimeSpan.FromMilliseconds(20), MaxControlReadFailures = 2 };
+        var flaky = new FlakyControls(h.Controls);
+        h.RunControls = flaky;
+        var cancelled = false;
+        h.TestRunner.Running = async (spec, ct) =>
+        {
+            flaky.Broken = true;
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(5), ct); // a long run, unless the unreadable controls cut it off
+            }
+            catch (OperationCanceledException)
+            {
+                cancelled = true;
+                throw;
+            }
+            return FakeTestRunner.Report(spec.Steps, spec.OverlayFrom is null ? TestCaseResult.Passed : TestCaseResult.Failed);
+        };
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Paused, outcome.State);
+        Assert.True(cancelled);
+        Assert.Equal(3, flaky.Failures); // 2 failed reads are the limit; the 3rd counts as a Pause
+        Assert.Empty(await Results(h)); // nothing recorded from cancelled runs
+        var rows = await h.Rows();
+        Assert.Equal(RunPipeline.ControlsUnreadablePaused, rows.Last(r => r.Step is null).Detail);
+        Assert.Equal("3 reads in a row failed; the last: InvalidOperationException: the controls table cannot be read",
+            rows.Single(r => r.Step == RunPipeline.Steps.ControlsUnreadable).Detail);
+
+        flaky.Broken = false;
+        h.TestRunner.Running = null;
+        var resumed = await h.Run();
+        Assert.True(resumed.Succeeded, resumed.Error);
+    }
+
+    [Fact]
     public void The_policy_floor_keeps_the_check_on_normal_and_protected()
     {
         Assert.Contains(GateChecks.NewTestsFailOnBase, GatePolicy.FloorChecks[Tier.Normal]);

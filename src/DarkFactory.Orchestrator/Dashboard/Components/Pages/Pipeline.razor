@@ -100,7 +100,7 @@ else
                         }
                     </td>
                     <td class="elapsed">@Format.Elapsed(Time.GetUtcNow() - row.CreatedAt)</td>
-                    <td class="cost">@Format.Cost(row.CostUsd)</td>
+                    <td class="cost">@Format.ItemCost(row.CostUsd, row.Sessions)</td>
                     <td class="sessions">
                         @foreach (var s in row.Sessions.Where(s => s.ClaudeSessionId is not null))
                         {

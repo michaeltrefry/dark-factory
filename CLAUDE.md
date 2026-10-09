@@ -86,7 +86,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 
 | Key | Default / source |
 | --- | --- |
-| `Router:BaseUrl` | `http://localhost:8080` |
+| `Router:BaseUrl` | `http://localhost:8080` (an absolute http(s) URL; one naming a model provider's host or key — `src/DarkFactory.Analyzers/ProviderMarkers.txt`, the gateway lint's list, embedded in both the analyzer and the orchestrator, `Gateway/ProviderMarkers.cs` — is refused, P1-E1) |
 | `Router:Key` | env `FACTORY_ROUTER_KEY`, or keychain account `router-key` |
 | `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
@@ -94,18 +94,20 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Review:Models` | none — must be set: the router catalog (`GET /v1/router/models`, 2026-10-08) has no Claude Opus 5.5 or newer, and the factory refuses to start without one (`ReviewConfigurationException`: `factory run` and `factory work` print the reason and exit 2, before any router call) (every panel role's reviewer models in order, unless the role sets its own; each must be a Claude Opus 5.5 or newer, `ReviewModels.MeetsReviewFloor`: `claude-opus-<major>[-.]<minor>[-yyyymmdd]`, where the dotted and dashed spellings are one model everywhere ids are compared — pinned, served, reviewer vs second model — an older Opus, another Claude or another vendor's model is refused; the first entry reviews, whatever models the implementer used) |
 | `Review:Correctness:Models`, `Review:SpecConformance:Models`, `Review:Security:Models` | `Review:Models` (one panel role's own reviewer models, in order; the same Claude Opus 5.5 or newer rule) |
 | `Review:Confirm:Models` | `claude-opus-5,claude-sonnet-5` (the router catalog's Claude models; second models that confirm a blocking finding: the first Claude model that is not the reviewer's model; a non-Claude entry is refused) |
-| `Review:TimeoutMinutes` | `10` (one reviewer call) |
-| `Gate:CiPollSeconds`, `Gate:CiTimeoutMinutes` | `30`, `30` (CI on the PR head is polled until it finishes; still running at the timeout escalates) |
-| `Gate:TestTimeoutMinutes` | `20` (one sandboxed run — restore, build, the new tests — of the `new-tests-fail-on-base` check; still running at the timeout fails the check) |
+| `Review:TimeoutMinutes` | `10` (> 0: one reviewer call) |
+| `Gate:CiPollSeconds`, `Gate:CiTimeoutMinutes` | `30`, `30` (each > 0: CI on the PR head is polled until it finishes; still running at the timeout escalates) |
+| `Gate:TestTimeoutMinutes` | `20` (> 0: one sandboxed run — restore, build, the new tests — of the `new-tests-fail-on-base` check; still running at the timeout fails the check) |
 | `Factory:DefaultRepo` | `michaeltrefry/dark-factory-sandbox` (a story line `Repo: owner/name` overrides) |
 | `Shortcut:Watch:Teams`, `Shortcut:Watch:Epics` | empty = watch nothing; comma-separated team mention names/ids, epic ids |
 | `GitHub:Watch:Repos` | empty = triage no issues; comma-separated `owner/name` whose issues `factory work` polls (the workers' App needs Issues read/write there) |
-| `Intake:PollSeconds` | `60` |
+| `Intake:PollSeconds` | `60` (> 0) |
 | `Intake:MaxItemFailures` | `3` (runs of one item failing in a row before `factory work` escalates/parks it, E10) |
-| `Usage:PollSeconds` | `60` (`factory work` reads the router's subscription usage; also read at each intake poll) |
+| `Usage:PollSeconds` | `60` (> 0: `factory work` reads the router's subscription usage; also read at each intake poll) |
 | `Freeze:MaxConsecutiveFailures` | `3` (≥ 1: distinct items escalated in a row, no factory merge between, that freeze the factory) |
 | `Freeze:HotFileMerges`, `Freeze:HotFileWindowHours` | `3` (≥ 2), `24` (> 0): factory merges changing one file within the window that freeze it |
 | `Freeze:CostRisingRounds` | `2` (≥ 1): consecutive rises of an item's cost per round (implement, then each fix round) that freeze it |
+| `Freeze:CheckFailedEvaluations`, `Freeze:CheckFailedMinutes` | `10` (≥ 1), `30` (> 0): a freeze check failing that many evaluations in a row (counted per process, `FreezeCheckFailures.Process`), or for that long, is written as a `check-failed` freeze |
+| `Controls:MaxReadFailures` | `10` (≥ 1): failed reads in a row of an item's controls while its worker or the gate's test runs go on; the next counts as a Pause (`controls-unreadable`) |
 | `Router:CostSettleSeconds` | `5` (after a session's cost is first recorded, it is read once more this much later and the later value kept) |
 | `Factory:WorkRoot` | `/opt/dark-factory/work` (clones + worktrees; `~/.dark-factory` when `Worker:RunAs=none`) |
 | `ConnectionStrings:Ledger` | `Host=localhost;Port=5434;Database=factory;Username=factory;Password=factory` |
@@ -113,17 +115,21 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Worker:RunAs` | `_factory` (sandbox user); `none` runs workers as the owner (development only) |
 | `Worker:LaunchHelper` | `/usr/local/libexec/dark-factory/factory-worker-launch` |
 | `Worker:Auth` | `router-key` (default: the worker holds only the router key, in `X-Weave-Router-Key` and as `ANTHROPIC_AUTH_TOKEN`; the router serves it from plans enrolled with `router login claude` / `router login codex`; `factory run`/`work` refuse to start unless `GET /v1/subscriptions/usage` lists an enabled `managed`/`shared` credential) or `claude-login` (weaker, violates E5: the worker's own Claude login, passed through by the router) |
-| `Worker:TimeoutMinutes` | `30` |
+| `Worker:TimeoutMinutes` | `30` (> 0) |
 | `Worker:PauseGraceSeconds` | `660` (a paused worker that has not stopped at a tool boundary by then is stopped; must exceed the 600 s longest tool call) |
 | `Worker:StuckRepeats` | `5` (≥ 2: near-identical turns, or cycles of up to 4 turns, in a row that make a running worker stuck; sc-25388) |
 | `Worker:StuckSimilarity` | `0.96` (0 < s ≤ 1: trigram Dice similarity, after normalising whitespace (and digits outside tool inputs), at which two turns count as the same) |
 | `Worker:QuietMinutes` | `10` (> 0: a running session with no event for this long is marked quiet on the dashboard; silence never interrupts) |
-| `Factory:HostPort` | `47822` (`factory work`: 127.0.0.1, plus `Dashboard:BindAddress`) |
+| `Factory:HostPort` | `47822` (0–65535, 0 = any free port; `factory work`: 127.0.0.1, plus `Dashboard:BindAddress`) |
 | `Dashboard:BindAddress` | unset = loopback only; one private address (RFC 1918, 100.64/10, fc00::/7) on a local interface |
 | `Dashboard:HostName` | extra Host header the dashboard answers to (e.g. MagicDNS name); one plain DNS name, no wildcard/port |
 | `Dashboard:PasswordHash` | keychain `dashboard-password-hash` (written by `factory dashboard set-password`) |
 | `Metrics:SandboxRepos` | `michaeltrefry/dark-factory-sandbox` (comma-separated `owner/name`; items on these repos are left out of every metric) |
 | `Metrics:DemoMarkers` | `[demo],[sandbox]` (an item whose title carries one, case-insensitively, is left out of every metric) |
+
+Every setting with a rule is checked at start-up (`FactoryOptions.ValidateSettings`, before any other check): `factory run` and
+`factory work` print the key and why and exit 2 (E6: each key has a consumer and a test that a non-default value is read and an
+out-of-range one refused, `FactoryOptionsTests`).
 
 Worker sandbox (E5): workers run as the hidden `_factory` user via
 `sudo -n -u _factory factory-worker-launch claude …` (one NOPASSWD sudoers rule for that helper only).
@@ -165,10 +171,12 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   are a `linked` checkpoint before Review. `factory work`'s start-up scope check is `IWorkSource.ValidateScopeAsync`. `ClaimAsync` refuses (no write) unless the fresh story is To Do or already
   ours, in scope (skipped by `factory run --ignore-scope`) and not another owner's, and reads the claim back; a refusal
   parks the item (Paused + `parked` checkpoint). Only Paused rows with detail `interrupted` (`RunPipeline.Interrupted`),
-  `user-paused` (`RunPipeline.UserPaused`, a Pause control), `usage-paused` (`RunPipeline.UsagePaused`, the usage pause) or
-  `freeze-paused` (`RunPipeline.FreezePaused`, the automatic freeze) auto-resume (`RunPipeline.InFlightAsync`), the latter three
-  only once no control pauses the item (the usage pause lifts at its `ResumeAt`, the freeze at a human's Continue); a parked
-  item never does. Resumes re-check the scope.
+  `user-paused` (`RunPipeline.UserPaused`, a Pause control), `usage-paused` (`RunPipeline.UsagePaused`, the usage pause),
+  `freeze-paused` (`RunPipeline.FreezePaused`, the automatic freeze) or `controls-unreadable` (`RunPipeline.ControlsUnreadablePaused`)
+  auto-resume (`RunPipeline.InFlightAsync`), all but the first only once no control pauses the item and the controls can be read
+  (the usage pause lifts at its `ResumeAt`, the freeze at a human's Continue); a parked item never does. The same pauses keep a
+  queued item's merge-queue place (`MergeQueue.Member`). `InFlightAsync` lists the items being stopped first. Resumes re-check
+  the scope.
 - Work sources are named by `ItemNaming` (`sc-<story>`, `gh-<key>`: the ledger `Source`, external id, `factory/<id>` branch,
   `factory-<id>` worktree, `item:<id>` control scope); `factory run`/`--item` take either. The intake loop polls every source
   in turn (`IntakeLane`), so a triage and an item run never share the sandbox. The merge queue is per repo across sources.
@@ -203,7 +211,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   polls them every second (`ControlWatch`): Pause → `IWorker.RequestPause` (a flag file under `<work root>/controls`
   that the worker's PreToolUse hook, passed by `--settings`, turns into deny + `continue: false`, ending the session at
   the next tool boundary), and the run is cancelled anyway after `Worker:PauseGraceSeconds`; Stop (item state
-  `Stopping`) cancels at once. Continue before the boundary withdraws the flag (`IWorker.CancelPause`) and the grace.
+  `Stopping`) cancels at once. Continue before the boundary withdraws the flag (`IWorker.CancelPause`) and the grace. Controls
+  that cannot be read more than `Controls:MaxReadFailures` times in a row count as a Pause (E2: never run blind) — for a worker
+  and for the gate's test runs (`TestRunWatch`) — recorded as a `controls-unreadable` checkpoint (the error; outcome failed) then
+  Paused `controls-unreadable` (session and worktree kept); a read that then shows nothing pausing the item withdraws it.
   A pause-ended session (result `terminal_reason: hook_stopped`) never counts as worker-done; a worker that finishes
   on its own after a pause request does (worker-done recorded, then the pause takes effect before the push). Stop is
   re-checked before the PR is opened and after the last step, so the run that sees it finishes it. Stop
@@ -247,11 +258,15 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   within `Freeze:HotFileWindowHours`; the gate records the PR's base branch and diff files as `merge-files` before every merge),
   `cost-rising` (an active item's — not Merge/Watch/terminal — rounds — its last Implement, then each fix round — whose worker sessions' router costs rise
   strictly `Freeze:CostRisingRounds` times in a row; a round with no session or an unrecorded cost is no evidence), `main-red`
-  (a state: per repo, the base branch's head after its latest factory merge over all history is `Ci.Evaluate` Failed; pending is
-  not red; a head a Continue acknowledged — the `red-tip <repo>@<base> <sha>` lines of the cleared freeze's `Detail`, carried
-  into later freezes — is skipped until the head moves). The run then
-  returns the typed outcome `deferred` (`RunOutcome.Deferred`, nothing about the item changes); the intake loop ends its poll,
-  lists no ready items while the row is set, and shows the deferral (`IntakeStatus.DeferredRun`) and the freeze banner on the
+  (a state: per repo the factory works on now — the configured repos, `FactoryOptions.ConfiguredRepos` = `Factory:DefaultRepo` and
+  `GitHub:Watch:Repos`, and the repos of non-terminal items — the base branch's head after its latest factory merge over all history
+  is `Ci.Evaluate` Failed; pending is not red; a repo or base GitHub answers 404 for (`GitHubNotFoundException`: gone, or the gate
+  App was uninstalled) has no tip, so nothing to be red — a `FreezeStatus.Notes` line, logged `[freeze]`; a head a Continue
+  acknowledged — the `red-tip <repo>@<base> <sha>` lines of the cleared freeze's `Detail`, carried into later freezes — is skipped
+  until the head moves). The run then returns the typed outcome `deferred` (`RunOutcome.Deferred`, nothing about the item changes;
+  the error says what lifts it, `FreezeTrigger.Remedy`); the intake loop runs no ready item of any lane after a deferral and stops a
+  lane's in-flight items at its first deferral (their stops, listed first, still run in every lane), lists no ready items while the
+  row is set, and shows the deferral (`IntakeStatus.DeferredRun`, not cleared by a later stop) and the freeze banner on the
   pipeline page. Each intake poll runs the evaluator too (`IntakeLoop` `freeze`, `FactoryRunner.CreateFreeze`) before any lane
   is prepared (triage) or listed: frozen or uncheckable, nothing is triaged or listed. Within a run the evaluator also runs
   before every step but Merge's bookkeeping, before every worker session starts (implement, fixer, CI fixer), before a merge-queue
@@ -263,7 +278,12 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `ChangedAt`), so a Continue is never re-frozen by the evidence it acknowledged, and a new occurrence after it freezes again;
   a freeze decided on a row a Continue has since changed is not written (`IControls.FreezeAsync` compares `ChangedAt`). An
   unreadable freeze record counts as frozen; a trigger that cannot be checked (ledger or GitHub unreadable) defers the dispatch
-  too (E2) but writes no freeze. In-flight work: the row pauses every item through `EffectiveAsync` like a factory Pause — no
+  too (E2: `freeze-check-failed`, which resumes by itself once checkable) but writes no freeze — until the failure persists
+  (P1-E10: none sits silently): after `Freeze:CheckFailedEvaluations` failed evaluations in a row or `Freeze:CheckFailedMinutes`
+  it is written as a `check-failed` freeze naming the failing check (`ledger` or `main-red <repo>@<base>`) and a
+  `check-failed <check>: <exception type>` line; a human's Continue acknowledges exactly that failure (the same check failing the
+  same way is passed over) until it changes; such lines are not carried into later freezes. A trigger that holds still wins over
+  another repo's failing read. In-flight work: the row pauses every item through `EffectiveAsync` like a factory Pause — no
   new step starts, a running worker stops at its next tool boundary (Paused `freeze-paused`, session and worktree kept) and
   resumes automatically after the Continue.
 - Intake failures (E10, `WorkSources/IntakeLoop.cs`, `IntakeStatus`): a run that throws before its pipeline's try block
@@ -288,7 +308,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   migration — a later rule change only affects new rows). Reports are rendered only from the ledger (`LedgerReport`, E5): the
   PR description at open and again at merge (`pr-report`), the board closeout on merge (`closeout`) and the escalation comment list
   the check rows (`gate`, `ci-failure`, `new-tests`, `merge-conflict`) and verdict rows (each section's heading counts them by
-  outcome), the fix rounds and the worker cost (N/A when unrecorded); model/repo text in rows goes through `UntrustedText` (code span,
+  outcome), the fix rounds and the worker cost (N/A when unrecorded; the dashboard's pipeline cost cell likewise: N/A when no session
+  is measured, `$x of n/m measured` when some are not, `Format.ItemCost`; a session's own cost N/A until measured); model/repo text in rows goes through `UntrustedText` (code span,
   or a tilde fence for the escalation reason). Reports are bounded under GitHub's 65,536-char limit (Shortcut's is higher):
   `Facts` ≤ 60,000 chars — ≤10 blocking findings per verdict, the latest verdict always in full, then the newest checks and earlier
   verdicts that fit, with an "N earlier … not shown" line; the escalation reason is clipped to 4,000 chars. A failed `pr-report` or
@@ -387,8 +408,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   fresh session in a fresh worktree, and the second stuck session since entering Implement (`RunPipeline.MaxStuckImplementSessions`)
   escalates; in a fix round nothing is pushed, the worktree is removed and the round ends at its next state with the head
   unchanged (Review records a failed `fix-progress`, CI sees the same red CI, the merge gate the same conflict), which then
-  dispatches the next round or escalates at `Lifecycle.MaxFixRounds` — the stuck round counted when it started (the Review cap's
-  escalation says how many rounds failed because the fixer was stuck, and the last reason). A fresh implementer after
+  dispatches the next round or escalates at the fix-round cap — the stuck round counted when it started (every cap escalation
+  lists each round since the last Implement, of any kind, whose fixer was stuck, with its reason: `RunPipeline.StuckRounds`). A fresh implementer after
   `stuck-retry` gets one prompt line naming the repeated tool calls (names only, E4). A worker that
   finishes on its own after the detection is done, like one after a pause. Silence never counts: the dashboard marks a running
   session quiet (pipeline `(live, quiet)`, session page `quiet: no event for …`) after `Worker:QuietMinutes` without an event, and
@@ -443,8 +464,14 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   cancelled, stale, no conclusion; compared like a passed one) — fails or has no run on the new head. It first waits for
   the fixed head's CI to finish, then for each such check on the new head (one missing once the new head's CI has
   finished is a regression); still unfinished after `Gate:CiTimeoutMinutes` escalates; either commit's CI not read in full
-  is a failed round. Otherwise a failed round. Every round counts against
-  `Lifecycle.MaxFixRounds` (3): a fail that would need a fourth escalates with the open findings listed in the comment.
+  is a failed round. Otherwise a failed round. Every round counts against the fix-round cap: the lower of the base's
+  `factory/gate.yaml` `risk.max_fix_rounds` (1–3: it can only lower the hard cap, never raise it) and `Lifecycle.MaxFixRounds`
+  (3), read fresh at each review, CI and conflict cap decision (`FixCapAsync`; an unreadable or invalid policy leaves the hard
+  cap, and the merge gate blocks on it anyway) and checkpointed (`fix-cap`, before the decision) whenever it differs from the
+  one in effect (`RunPipeline.FixCapOf`: the latest `fix-cap`, else 3), so fixer prompts, logs and reports (`Fix rounds: n of
+  cap`) render the effective cap. A fail that would need a round past the cap escalates with the open findings listed in the
+  comment. Every cap escalation (review, CI, conflict) has the same words (`FixCapReachedAsync`): the rounds used, the cap and
+  where it came from, "one count shared by review, CI and conflict fix rounds", and the stuck rounds.
   CI self-heal (sc-25383, `Gate/CiHeal.cs`, `CiFailedAsync`/`CiFixAsync`): once every check on the reviewed head has
   finished and CI is red, the failure is triaged (`CiHeal.Triage`) against the PR's base commit's CI and checkpointed
   (`ci-failure`, `CiTriage`: names and conclusions only, never log text). A check that failed with `failure`/`timed_out` and
@@ -454,7 +481,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   excused (a matrix's fail-fast cancels the other legs), recorded in the triage (`cancelled`), and CI on any later head
   waits until every check a triage named (fixable or cancelled) has reported there (`CiHeal.Unreported`) — so it must run
   and pass, not vanish. Otherwise CI → CIHealing (row Detail = the fixed head), a fix round that shares the
-  count and the cap with review rounds (`TransitionContext.IsFixRound`; the policy's `max_fix_rounds` counts both); at the
+  count and the cap with review rounds (`TransitionContext.IsFixRound`; the effective cap above applies to both); at the
   cap it escalates listing the failing checks. The CI fixer runs exactly like a review fixer (`RunFixRoundAsync`, same
   sandbox/router key/resume/worktree rules) and gets the story plus each failing job's log read from GitHub when a fresh
   session starts (`GET …/actions/jobs/{id}/logs`, last 256 KB, needs the gate App's **Actions: read**; without it the check

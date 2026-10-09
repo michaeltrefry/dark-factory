@@ -210,7 +210,7 @@ public static class LedgerReport
         var transitions = history.Where(e => e.Step is null).ToList();
         var used = TransitionContext.From(transitions.Select(e => e.State).ToList()).FixRounds;
         var text = new StringBuilder();
-        text.Append(CultureInfo.InvariantCulture, $"Fix rounds: {used} of {Lifecycle.MaxFixRounds}\n");
+        text.Append(CultureInfo.InvariantCulture, $"Fix rounds: {used} of {RunPipeline.FixCapOf(history)}\n");
         var implemented = transitions.FindLastIndex(e => e.State == WorkState.Implement);
         var progress = history.Where(e => e.Step == RunPipeline.Steps.FixProgress).Select(e => (Row: e, Progress: FixProgress.FromDetail(e.Detail)))
             .Where(p => p.Progress is not null).ToList();

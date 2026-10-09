@@ -157,7 +157,10 @@ public class MergeQueueTests
 
         public Task<RepoFiles> GetFilesAsync(RepoRef repo, string sha, CancellationToken ct) => Task.FromResult(new RepoFiles(["README.md"], false));
 
-        public Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct) => Task.FromResult<string?>(Policy);
+        /// <summary>The base's <c>factory/gate.yaml</c>.</summary>
+        public string PolicyText { get; set; } = Policy;
+
+        public Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct) => Task.FromResult<string?>(PolicyText);
 
         public Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct)
         {
@@ -610,6 +613,59 @@ public class MergeQueueTests
     }
 
     [Fact]
+    public async Task The_conflict_fixer_is_told_the_fix_round_cap_in_effect()
+    {
+        var h = new Harness();
+        h.Repo.PolicyText = TestPolicies.Standard(maxFixRounds: 2);
+        Assert.Equal(WorkState.Watch, (await h.Run(A)).State);
+        h.Repo.Conflicting.Add(Branch(B));
+        h.Repo.OnOpen = branch =>
+        {
+            if (branch == Branch(B))
+            {
+                h.Repo.AdvanceMain("m1");
+            }
+        };
+
+        Assert.Equal(WorkState.Watch, (await h.Run(B)).State);
+        Assert.Contains("could not be merged (fix round 1 of 2)", h.Worker.Prompts[^1]);
+    }
+
+    [Fact]
+    public async Task The_policys_max_fix_rounds_caps_conflict_fix_rounds_too()
+    {
+        var h = new Harness();
+        h.Repo.PolicyText = TestPolicies.Standard(maxFixRounds: 1);
+        Assert.Equal(WorkState.Watch, (await h.Run(A)).State);
+        h.Repo.Conflicting.Add(Branch(B));
+        h.Repo.OnOpen = branch =>
+        {
+            if (branch == Branch(B))
+            {
+                h.Repo.AdvanceMain("m1");
+            }
+        };
+        // B's first head fails review once: its one fix round is used before the conflict is found.
+        var blocked = new HashSet<string>();
+        h.Reviewer.Blocking = r =>
+        {
+            lock (blocked)
+            {
+                var head = r.Pull.HeadSha;
+                return head.StartsWith(Branch(B), StringComparison.Ordinal) && (blocked.Contains(head) || (blocked.Count < 1 && blocked.Add(head)));
+            }
+        };
+
+        var b = await h.Run(B);
+
+        Assert.Equal(WorkState.Escalated, b.State);
+        Assert.Equal(1, TransitionContext.From(await h.Transitions(B)).FixRounds);
+        Assert.Contains("conflicts with main", b.Error);
+        Assert.Contains("after 1 fix rounds (the cap is 1, the policy's max_fix_rounds (the factory's hard cap is 3), one count shared by review, "
+            + "CI and conflict fix rounds); a fix round 2 is not allowed", b.Error);
+    }
+
+    [Fact]
     public async Task A_conflict_fix_that_leaves_conflict_markers_escalates()
     {
         var h = new Harness();
@@ -666,7 +722,8 @@ public class MergeQueueTests
         Assert.Contains(WorkState.MergeGate, transitions); // the conflict was found at the gate, after the cap was used in review
         var conflict = BaseUpdate.FromDetail((await h.Steps(B, RunPipeline.Steps.MergeConflict)).Single())!;
         Assert.Equal(["src/shared.cs"], conflict.Files);
-        Assert.Contains($"the cap is {Lifecycle.MaxFixRounds}", b.Error);
+        Assert.Contains($"after {Lifecycle.MaxFixRounds} fix rounds (the cap is {Lifecycle.MaxFixRounds}, one count shared by review, CI and conflict fix rounds); "
+            + $"a fix round {Lifecycle.MaxFixRounds + 1} is not allowed", b.Error);
         Assert.Contains("conflicts with main", b.Error);
         Assert.Single(h.Repo.Merges); // only A's
     }
@@ -893,6 +950,27 @@ public class MergeQueueTests
     }
 
     [Fact]
+    public async Task A_freeze_pauses_the_turn_holder_and_after_the_freezes_continue_the_approval_order_holds()
+    {
+        var h = new Harness();
+        var (runA, release) = await ABehindAWaitingForCi(h);
+        await h.Controls.FreezeAsync(FreezeTrigger.MainRed, "main is red", null, CancellationToken.None);
+        var a = await runA;
+        Assert.Equal(WorkState.Paused, a.State);
+        Assert.Equal(RunPipeline.FreezePaused, (await h.Rows(A)).Last(r => r.Step is null).Detail);
+        release.SetResult();
+
+        await Set(h, ControlScope.Freeze, ControlState.Running); // the freeze's Continue
+        // B runs first after the Continue: A (approved first) keeps its place through the freeze, so B waits for it.
+        Assert.Equal(WorkState.MergeGate, (await h.Run(B)).State);
+        Assert.Contains($"waiting for {StoryId.Format(A)}, which is ahead of it", h.Logged);
+        Assert.Empty(h.Repo.Merges);
+        Assert.Equal(WorkState.Watch, (await h.Run(A)).State);
+        Assert.Equal(WorkState.Watch, (await h.Run(B)).State);
+        await AssertMergedInOrderEachOnAHeadContainingMain(h);
+    }
+
+    [Fact]
     public async Task An_idle_turn_holder_being_stopped_does_not_hold_up_the_queue()
     {
         var h = new Harness();
@@ -1028,6 +1106,13 @@ public class MergeQueueRuleTests
         var usagePaused = Queued(turn, Row(WorkState.Paused, null, RunPipeline.UsagePaused));
         Assert.True(MergeQueue.Member(usagePaused));
         Assert.False(MergeQueue.InTurn(usagePaused, RunPipeline.Steps.QueueTurn));
+        // So do the freeze (its Continue resumes it) and controls that could not be read (they resume once readable).
+        foreach (var detail in new[] { RunPipeline.FreezePaused, RunPipeline.ControlsUnreadablePaused })
+        {
+            var held = Queued(turn, Row(WorkState.Paused, null, detail));
+            Assert.True(MergeQueue.Member(held), detail);
+            Assert.False(MergeQueue.InTurn(held, RunPipeline.Steps.QueueTurn), detail);
+        }
         // Paused any other way (e.g. a refused claim) needs a human: out of the queue.
         Assert.False(MergeQueue.Member(Queued(turn, Row(WorkState.Paused, null, "claim refused: owner changed"))));
         Assert.False(MergeQueue.Member([.. userPaused, Row(WorkState.Paused, RunPipeline.Steps.Parked, "out of scope")]));

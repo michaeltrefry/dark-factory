@@ -257,17 +257,22 @@ public class GatePipelineTests
         public LedgerDbContextFactory Contexts => new(_options);
         /// <summary>When set, the run's freeze evaluator (sc-25387) checks these thresholds, on the system clock and <see cref="GitHub"/>.</summary>
         public FreezeOptions? Freeze { get; init; }
+        /// <summary>When set, the run reads and writes its controls through this instead of <see cref="Controls"/> (e.g. reads that fail).</summary>
+        public IControls? RunControls { get; set; }
+        /// <summary><c>Controls:MaxReadFailures</c> for the run (the pipeline's default when null).</summary>
+        public int? MaxControlReadFailures { get; init; }
 
         public Task<RunOutcome> Run(string? implementerModel = ImplementerModel, CancellationToken ct = default) =>
             Run([implementerModel], ct);
 
         public Task<RunOutcome> Run(string?[] implementerModels, CancellationToken ct = default) =>
             new RunPipeline(Stories, Ledger, Locks, Workspaces, new HarnessWorker(this, implementerModels), Prs, Sandbox, TextWriter.Null,
-                    controls: Controls,
+                    controls: RunControls ?? Controls,
                     controlPollInterval: ControlPoll,
                     gate: new GateStage(GitHub, Panel ?? Reviewer, Models, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5), GateOnFakeClock ? Time : null,
                         TestRunner),
-                    freeze: Freeze is null ? null : new FactoryFreeze(Contexts, Controls, Freeze, TimeProvider.System, GitHub))
+                    freeze: Freeze is null ? null : new FactoryFreeze(Contexts, Controls, Freeze, TimeProvider.System, GitHub),
+                    maxControlReadFailures: MaxControlReadFailures)
                 .RunAsync(77, ct);
 
         /// <summary>The implementer reports <c>implementerModels</c>; every later session (a fixer) reports <see cref="FixerModels"/>.</summary>

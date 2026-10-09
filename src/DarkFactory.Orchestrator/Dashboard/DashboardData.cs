@@ -138,8 +138,9 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
         return items.Select(i => new PipelineRow(
                 i.Id, i.ExternalId, i.Title, i.Repo, i.State, i.CreatedAt, i.UpdatedAt,
                 PullRequestUrl(links.GetValueOrDefault(i.Id)),
-                // Spend per item (E9, reporting only): the sum of its sessions' router costs.
-                sessions[i.Id].Any(s => s.CostUsd is not null) ? sessions[i.Id].Sum(s => s.CostUsd ?? 0) : null,
+                // Spend per item (E9, reporting only): the sum of its sessions' measured router costs, null (N/A) when none is
+                // measured; the page labels a partial sum with how many sessions it covers (Format.ItemCost, E5).
+                sessions[i.Id].Any(s => s.CostUsd is not null) ? sessions[i.Id].Where(s => s.CostUsd is not null).Sum(s => s.CostUsd!.Value) : null,
                 sessions[i.Id].Select(s => Link(s, lastEvents.GetValueOrDefault(s.Id))).ToList(),
                 i.EpicId,
                 ControlOf(i),

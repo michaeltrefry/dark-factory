@@ -87,7 +87,13 @@ public class FreezeTests
         public FreezeOptions Options { get; set; } = new();
         public FakeWorker Worker { get; } = new(Reports(Ok));
 
-        public FactoryFreeze Freeze => new(Contexts, Controls ?? Ledger, Options, Time, GitHub);
+        /// <summary>The configured repos main-red reads besides those of non-terminal items (null: none).</summary>
+        public IReadOnlyCollection<string>? Repos { get; set; }
+
+        /// <summary>Failed checks in a row, shared by every evaluator of this harness (as by every one of a process).</summary>
+        public FreezeCheckFailures Failures { get; } = new();
+
+        public FactoryFreeze Freeze => new(Contexts, Controls ?? Ledger, Options, Time, GitHub, Repos, Failures);
 
         public RunPipeline Pipeline() =>
             new(new FakeWorkSource(Story), new WorkLedger(Db, Time), new InProcessRunLocks(), new FakeWorkspaces(), Worker, new FakePullRequests(),
@@ -129,7 +135,10 @@ public class FreezeTests
 
         public Task Merged(string commit, params string[] files) => MergedIn(Repo, commit, files);
 
-        public Task MergedIn(string repo, string commit, params string[] files) => ItemIn(repo, WorkState.Watch,
+        public Task MergedIn(string repo, string commit, params string[] files) => MergedIn(repo, WorkState.Watch, commit, files);
+
+        /// <summary>A factory merge into <paramref name="repo"/>'s main by an item now in <paramref name="final"/>.</summary>
+        public Task MergedIn(string repo, WorkState final, string commit, params string[] files) => ItemIn(repo, final,
             (WorkState.MergeGate, RunPipeline.Steps.MergeFiles, new MergeFiles("main", files).ToDetail()),
             (WorkState.Merge, null, commit),
             (WorkState.Watch, null, commit));
@@ -160,10 +169,10 @@ public class FreezeTests
             }
         }
 
-        private async Task Row(WorkItem item, WorkState state)
+        public async Task Row(WorkItem item, WorkState state, string? detail = null)
         {
             Time.Advance(TimeSpan.FromSeconds(1));
-            Db.LedgerEntries.Add(new LedgerEntry { WorkItemId = item.Id, State = state, RecordedAt = Time.GetUtcNow(), Outcome = StepOutcomes.Of(null, state, null, null) });
+            Db.LedgerEntries.Add(new LedgerEntry { WorkItemId = item.Id, State = state, Detail = detail, RecordedAt = Time.GetUtcNow(), Outcome = StepOutcomes.Of(null, state, null, detail) });
             await Db.SaveChangesAsync();
         }
     }
@@ -320,6 +329,142 @@ public class FreezeTests
     }
 
     [Fact]
+    public async Task A_check_that_keeps_failing_is_written_as_a_freeze_a_continue_acknowledges_until_the_failure_changes()
+    {
+        var h = new H { Options = new FreezeOptions { CheckFailedEvaluations = 3 } };
+        await h.Merged("mergeAaaaaaaaaaa", "src/a.cs");
+        h.GitHub.Throws = new HttpRequestException("GitHub is down");
+
+        // The first failures defer the dispatch (E2) and write nothing.
+        for (var i = 1; i < 3; i++)
+        {
+            var transient = await h.Dispatch();
+            Assert.StartsWith($"factory frozen ({FreezeTrigger.CheckFailed}): ", transient.Deferred);
+            Assert.Contains("resumes on its own", transient.Error);
+            Assert.DoesNotContain("factory continue --freeze` clears it", transient.Error);
+            Assert.Null(await h.FreezeRow());
+        }
+
+        // The 3rd in a row is written as a freeze naming the failing check, so a human sees it and can Continue (P1-E10).
+        var held = await h.Dispatch();
+        Assert.StartsWith($"factory frozen ({FreezeTrigger.CheckFailedHeld}): ", held.Deferred);
+        Assert.Contains("`factory continue --freeze` clears it", held.Error);
+        var row = (await h.FreezeRow())!;
+        Assert.Equal((ControlState.Paused, FreezeTrigger.CheckFailedHeld, FreezeTrigger.By), (row.State, row.Reason, row.ChangedBy));
+        Assert.Contains($"main-red {Repo}@main has failed 3 time(s) in a row", row.Detail);
+        Assert.Contains("GitHub is down", row.Detail);
+        Assert.Empty(h.Worker.Calls);
+
+        // The Continue acknowledges exactly that failure: the same check failing the same way no longer holds anything up.
+        h.Time.Advance(TimeSpan.FromMinutes(1));
+        Assert.True((await new ControlActions(h.Ledger, h.Contexts).ContinueAsync(ControlScope.Freeze, "tester", CancellationToken.None)).Ok);
+        Assert.True((await h.Dispatch()).Succeeded);
+        Assert.Equal(FreezeStatus.Clear, await h.Freeze.CheckAsync(CancellationToken.None));
+
+        // A changed failure is not acknowledged: it defers again, and is counted afresh.
+        h.GitHub.Throws = new InvalidOperationException("GitHub compare failed: 500");
+        Assert.Equal(FreezeTrigger.CheckFailed, (await h.Freeze.CheckAsync(CancellationToken.None)).Trigger);
+        Assert.Equal(ControlState.Running, (await h.FreezeRow())!.State);
+    }
+
+    [Fact]
+    public async Task Main_red_reads_only_the_repos_the_factory_works_on_now()
+    {
+        var h = new H { Repos = [Repo] };
+        h.GitHub.Ci = new CiFacts(h.GitHub.Tip, [new CheckFact("build-test", true, "failure")]);
+        // A repo merged into long ago whose items are all finished, and that is not configured: not the factory's any more.
+        await h.MergedIn("michaeltrefry/retired", WorkState.Done, "mergeRaaaaaaaaaa", "src/a.cs");
+
+        Assert.Equal(FreezeStatus.Clear, await h.Freeze.CheckAsync(CancellationToken.None));
+        Assert.DoesNotContain(h.GitHub.Calls, c => c.Contains("michaeltrefry/retired", StringComparison.Ordinal));
+
+        // A configured repo is read even when every item merged into it is finished.
+        await h.MergedIn(Repo, WorkState.Done, "mergeCaaaaaaaaaa", "src/a.cs");
+        Assert.Equal(FreezeTrigger.MainRed, (await h.Freeze.CheckAsync(CancellationToken.None)).Trigger);
+    }
+
+    [Fact]
+    public async Task A_repo_or_base_github_answers_404_for_has_no_tip_to_be_red()
+    {
+        var h = new H();
+        await h.Merged("mergeAaaaaaaaaaa", "src/a.cs");
+        h.GitHub.Throws = new GitHubNotFoundException("GitHub compare mergeAaaaaaaaaaa with main failed: 404 Not Found");
+
+        var status = await h.Freeze.CheckAsync(CancellationToken.None);
+
+        Assert.False(status.Frozen);
+        Assert.Contains(status.Notes, n => n.Contains($"no main of {Repo} (404", StringComparison.Ordinal));
+        Assert.True((await h.Dispatch()).Succeeded);
+        Assert.Null(await h.FreezeRow());
+    }
+
+    [Fact]
+    public async Task Costs_rising_after_a_pause_during_implement_still_freeze()
+    {
+        var h = new H();
+        var item = await h.Item(WorkState.Review, (WorkState.Intake, null, null), (WorkState.Implement, null, null));
+        await h.Session(item, 0.40m); // the implementer's session started before the pause; its resume keeps that start
+        await h.Row(item, WorkState.Paused, RunPipeline.UserPaused);
+        await h.Row(item, WorkState.Implement, "unpaused");
+        foreach (var cost in new[] { 0.55m, 0.80m })
+        {
+            await h.Row(item, WorkState.Review);
+            await h.Row(item, WorkState.Fixing);
+            await h.Session(item, cost);
+        }
+        await h.Row(item, WorkState.Review);
+
+        var status = await h.Freeze.CheckAsync(CancellationToken.None);
+
+        Assert.Equal(FreezeTrigger.CostRising, status.Trigger);
+        Assert.Contains("implement $0.40 → fix 1 $0.55 → fix 2 $0.80", status.Detail);
+    }
+
+    [Fact]
+    public async Task In_flight_items_being_stopped_are_listed_before_the_rest()
+    {
+        var h = new H();
+        await h.Item(WorkState.Implement, (WorkState.Intake, null, null), (WorkState.Implement, null, null)); // sc-501, older
+        await h.Item(WorkState.Review, (WorkState.Intake, null, null), (WorkState.Implement, null, null), (WorkState.Review, null, null)); // sc-502
+        await h.Ledger.SetAsync(ControlScope.Item("sc-502"), ControlState.Stopping, "tester", CancellationToken.None);
+
+        Assert.Equal([502, 501], await RunPipeline.InFlightAsync(new WorkLedger(h.Db, h.Time), CancellationToken.None, h.Ledger));
+    }
+
+    [Fact]
+    public async Task A_deferred_run_still_lets_every_lanes_pending_stops_run_but_no_new_work()
+    {
+        var h = new H();
+        var status = new IntakeStatus(h.Time);
+        // Lane 1: sc-5 being stopped (listed first), then sc-6 in flight, which is deferred; sc-7 ready. Lane 2: gh-8 being
+        // stopped; gh-9 ready.
+        var shortcut = new DeferringRunner([5, 6], deferred: 6);
+        var issues = new DeferringRunner([8]);
+        var loop = new IntakeLoop(new Ready(7), shortcut, new IntakeOptions(TimeSpan.FromMinutes(1)), h.Time, NullLogger<IntakeLoop>.Instance,
+            h.Ledger, status: status, moreLanes: [new IntakeLane(new Ready(9), issues)]);
+
+        await loop.PollOnceAsync(CancellationToken.None);
+
+        Assert.Equal([5, 6], shortcut.Runs); // the stop ran before the deferral; the ready item did not run after it
+        Assert.Equal([8], issues.Runs); // the other lane's stop ran too; its ready item did not
+        Assert.Equal("sc-6 deferred: factory frozen (main-red): main is red", status.DeferredRun!.Message); // not cleared by gh-8's stop
+    }
+
+    private sealed class DeferringRunner(IReadOnlyList<int> inFlight, int? deferred = null) : IItemRunner
+    {
+        public List<int> Runs { get; } = [];
+
+        public Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct) => Task.FromResult(inFlight);
+
+        public Task<RunOutcome> RunAsync(int id, CancellationToken ct)
+        {
+            Runs.Add(id);
+            var why = id == deferred ? "factory frozen (main-red): main is red" : null;
+            return Task.FromResult(new RunOutcome(0, WorkState.Intake, null, null, why) { Deferred = why });
+        }
+    }
+
+    [Fact]
     public async Task A_trigger_that_cannot_be_checked_defers_the_dispatch_without_recording_a_freeze()
     {
         var h = new H();
@@ -432,6 +577,44 @@ public class FreezeTests
         Assert.Throws<InvalidOperationException>(() => Options(("Freeze:HotFileMerges", "1")).Freeze);
         Assert.Throws<InvalidOperationException>(() => Options(("Freeze:HotFileWindowHours", "0")).Freeze);
         Assert.Throws<InvalidOperationException>(() => Options(("Freeze:CostRisingRounds", "0")).Freeze);
+        Assert.Equal((10, TimeSpan.FromMinutes(30)), (Options().Freeze.CheckFailedEvaluations, Options().Freeze.CheckFailedWindow));
+        Assert.Equal((4, TimeSpan.FromMinutes(7.5)),
+            (Options(("Freeze:CheckFailedEvaluations", "4")).Freeze.CheckFailedEvaluations, Options(("Freeze:CheckFailedMinutes", "7.5")).Freeze.CheckFailedWindow));
+        Assert.Contains("Freeze:CheckFailedEvaluations must be at least 1",
+            Assert.Throws<InvalidOperationException>(() => Options(("Freeze:CheckFailedEvaluations", "0")).Freeze).Message);
+        Assert.Contains("Freeze:CheckFailedMinutes must be more than 0",
+            Assert.Throws<InvalidOperationException>(() => Options(("Freeze:CheckFailedMinutes", "0")).Freeze).Message);
+    }
+
+    // E6 / P1-E10: the check-failed thresholds are read, and change when a failing check is written as a freeze.
+    [Fact]
+    public async Task The_check_failed_evaluations_come_from_config()
+    {
+        var h = new H();
+        await h.Merged("mergeAaaaaaaaaaa", "src/a.cs");
+        h.GitHub.Throws = new HttpRequestException("GitHub is down");
+        h.Options = Options(("Freeze:CheckFailedEvaluations", "2")).Freeze;
+
+        Assert.Equal(FreezeTrigger.CheckFailed, (await h.Freeze.CheckAsync(CancellationToken.None)).Trigger);
+        Assert.Equal(FreezeTrigger.CheckFailedHeld, (await h.Freeze.CheckAsync(CancellationToken.None)).Trigger); // the 2nd, not the 10th
+        Assert.Equal((ControlState.Paused, FreezeTrigger.CheckFailedHeld), ((await h.FreezeRow())!.State, (await h.FreezeRow())!.Reason));
+    }
+
+    [Fact]
+    public async Task A_check_failing_for_the_configured_minutes_is_written_as_a_freeze_even_before_the_count()
+    {
+        var h = new H();
+        await h.Merged("mergeAaaaaaaaaaa", "src/a.cs");
+        h.GitHub.Throws = new HttpRequestException("GitHub is down");
+        h.Options = Options(("Freeze:CheckFailedMinutes", "10")).Freeze;
+
+        Assert.Equal(FreezeTrigger.CheckFailed, (await h.Freeze.CheckAsync(CancellationToken.None)).Trigger);
+        h.Time.Advance(TimeSpan.FromMinutes(9));
+        Assert.Equal(FreezeTrigger.CheckFailed, (await h.Freeze.CheckAsync(CancellationToken.None)).Trigger);
+        Assert.Null(await h.FreezeRow());
+        h.Time.Advance(TimeSpan.FromMinutes(1)); // 10 minutes since the first failure, 3 evaluations of the default 10
+        Assert.Equal(FreezeTrigger.CheckFailedHeld, (await h.Freeze.CheckAsync(CancellationToken.None)).Trigger);
+        Assert.Equal(FreezeTrigger.CheckFailedHeld, (await h.FreezeRow())!.Reason);
     }
 
     [Fact]
@@ -692,6 +875,7 @@ public class FreezeTests
 
         Assert.Empty(h.Merges);
         Assert.Contains($"factory freeze ({FreezeTrigger.CheckFailed})", outcome.Error);
+        Assert.Contains("it resumes on its own once the freeze triggers can be checked again", outcome.Error); // not "continue --freeze"
         Assert.Equal((WorkState.Paused, RunPipeline.FreezePaused), await LastTransition(h)); // resumes on its own once checkable
         Assert.Null(await h.Controls.GetAsync(ControlScope.Freeze, CancellationToken.None));
     }
