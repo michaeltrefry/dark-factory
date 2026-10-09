@@ -280,7 +280,7 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     public static string? OutdatedClaudeReason(string versionOutput)
     {
         var text = versionOutput.Trim();
-        var match = Regex.Match(text, @"^([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})(?![0-9.])");
+        var match = Regex.Match(text, @"^([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})(?![0-9.\-])"); // a pre-release (-beta) sorts before its release: refused
         if (!match.Success)
         {
             return $"its `claude --version` printed '{(text.Length > 80 ? text[..80] : text)}', no version (Claude Code {MinClaudeVersion} or newer is required)";

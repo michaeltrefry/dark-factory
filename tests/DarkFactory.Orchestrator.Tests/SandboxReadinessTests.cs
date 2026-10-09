@@ -67,6 +67,8 @@ public class SandboxReadinessTests
     [InlineData("2.0.999 (Claude Code)")]
     [InlineData("1.9.400")]
     [InlineData("Claude Code")]
+    [InlineData("2.1.291-beta")]
+    [InlineData("2.1.291-rc.1 (Claude Code)")]
     public async Task A_worker_claude_older_than_the_minimum_fails_the_factory_naming_the_upgrade(string version)
     {
         var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
@@ -82,6 +84,7 @@ public class SandboxReadinessTests
     [InlineData("2.1.300 (Claude Code)")]
     [InlineData("2.2.0")]
     [InlineData("3.0.0 (Claude Code)")]
+    [InlineData("2.1.291+abc")]
     public async Task A_worker_claude_at_or_above_the_minimum_passes(string version) =>
         await FactoryRunner.EnsureSandboxReadyAsync(Sandbox(CurrentAllowlist), WorkerAuth.RouterKey, Claude(version), CancellationToken.None);
 
