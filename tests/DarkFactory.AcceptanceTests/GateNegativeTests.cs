@@ -212,18 +212,14 @@ public class GateNegativeTests
     {
         await using var run = await StartAsync("FACTORY_E2E_GATE_ROUNDS_STORY", "df_e2e_p2at4_rounds");
         var reviewer = new SeededReviewer(blocking: true);
-        IGateGitHub? github = null;
 
-        var outcome = await FactoryRunAsync(run, gate =>
-        {
-            github = gate.GitHub;
-            return gate with { Reviewer = reviewer };
-        });
+        var outcome = await FactoryRunAsync(run, gate => gate with { Reviewer = reviewer });
 
         Assert.Equal(WorkState.Escalated, outcome.State);
         var history = await run.E2e.HistoryAsync(run.StoryId, run.Ct);
         var pr = await LinkedPullAsync(run, history);
-        var cap = ExpectedFixCap(await github!.GetPolicyAsync(run.Sandbox.Repo, pr.GetProperty("base").GetProperty("ref").GetString()!, run.Ct));
+        // Read through the test's own client: the run's GitHub client was disposed when FactoryRunner.RunAsync returned.
+        var cap = ExpectedFixCap(await run.Sandbox.GatePolicyAsync(pr.GetProperty("base").GetProperty("ref").GetString()!, run.Ct));
         ReviewGateTests.AssertTypedOutcomes(history);
         Assert.Equal(cap, RunPipeline.FixCapOf(history));
         var transitions = history.Where(e => e.Step is null).Select(e => e.State).ToList();

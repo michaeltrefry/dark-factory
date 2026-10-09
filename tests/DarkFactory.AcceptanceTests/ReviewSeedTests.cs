@@ -6,14 +6,25 @@ namespace DarkFactory.AcceptanceTests;
 /// <summary>
 /// sc-25379 AC3 against real models: the spec-conformance prompt, sent by the production <see cref="RouterReviewer"/> through
 /// the router to the configured spec-conformance model, flags a seeded change that adds a config flag nothing reads, and
-/// the configured second model confirms it; the same flag with a consumer gets no blocking spec-conformance finding.
+/// the configured second model confirms it; the same flag with a consumer, against a story that asks for it (and with tests),
+/// gets no blocking spec-conformance finding.
 /// (GatePipelineTests covers the plumbing with a fake router; this proves the prompt.) No GitHub or Shortcut state: the
 /// seeded diffs are fixtures. Live: skipped unless FACTORY_E2E=1 and FACTORY_E2E_REVIEW_SEED=1. Spends router tokens.
 /// </summary>
 public class ReviewSeedTests
 {
-    private static readonly WorkStory Story = new(25379, "Whitespace-only input counts as zero words",
+    internal static readonly WorkStory Story = new(25379, "Whitespace-only input counts as zero words",
         "WordCounter.Count(\"  \") returns 1. Blank input (only spaces) must count as zero words.", "bug",
+        "https://app.shortcut.com/trefry/story/25379");
+
+    /// <summary>
+    /// The story the consumed flag is reviewed against: it asks for the <c>WordCount:IgnoreBlankInput</c> setting the fixture adds,
+    /// on by default, and for tests of both settings, so <c>consumed-config-flag.diff</c> is a complete, in-scope change.
+    /// </summary>
+    internal static readonly WorkStory ConsumedStory = new(25379, "Whitespace-only input counts as zero words, behind a setting",
+        "WordCounter.Count(\"  \") returns 1. Add a `WordCount:IgnoreBlankInput` setting, on by default: when it is on, blank input "
+        + "(only spaces) counts as zero words and runs of spaces do not count as extra words; when it is off, Count keeps today's "
+        + "behaviour for callers that rely on it. Add tests for the default and for the setting switched off.", "bug",
         "https://app.shortcut.com/trefry/story/25379");
 
     private static readonly PullFacts Pull = new(1, "https://github.com/michaeltrefry/dark-factory-sandbox/pull/1", true, false, false,
@@ -37,10 +48,10 @@ public class ReviewSeedTests
         return new RouterReviewer(OutboundHttp.RouterApi(Harness.Options.RouterBaseUrl, Harness.Options.ReviewTimeout), routerKey);
     }
 
-    private static async Task<RoleReview> SpecConformanceAsync(RouterReviewer reviewer, string diff, CancellationToken ct)
+    private static async Task<RoleReview> SpecConformanceAsync(RouterReviewer reviewer, WorkStory story, string diff, CancellationToken ct)
     {
         var model = ReviewerChoice.Choose(Harness.Options.ReviewPanel.For(ReviewRoles.SpecConformance), "Review:SpecConformance:Models");
-        var review = await reviewer.ReviewAsync(new ReviewRequest(Story, "michaeltrefry/dark-factory-sandbox", Pull, diff, Files,
+        var review = await reviewer.ReviewAsync(new ReviewRequest(story, "michaeltrefry/dark-factory-sandbox", Pull, diff, Files,
             ReviewRoles.SpecConformance, ReviewPrompts.For(ReviewRoles.SpecConformance), model, Guid.NewGuid().ToString()), ct);
         Assert.True(review.Clean, review.Error);
         return review;
@@ -53,7 +64,7 @@ public class ReviewSeedTests
         var ct = TestContext.Current.CancellationToken;
         var diff = Fixture("unused-config-flag.diff");
 
-        var review = await SpecConformanceAsync(reviewer, diff, ct);
+        var review = await SpecConformanceAsync(reviewer, Story, diff, ct);
 
         var finding = review.Findings.FirstOrDefault(f => f.IsBlocking
             && (f.Title.Contains("IgnoreBlankInput", StringComparison.Ordinal) || f.Detail.Contains("IgnoreBlankInput", StringComparison.Ordinal)));
@@ -76,7 +87,7 @@ public class ReviewSeedTests
     {
         var reviewer = await RequireLiveAsync();
 
-        var review = await SpecConformanceAsync(reviewer, Fixture("consumed-config-flag.diff"), TestContext.Current.CancellationToken);
+        var review = await SpecConformanceAsync(reviewer, ConsumedStory, Fixture("consumed-config-flag.diff"), TestContext.Current.CancellationToken);
 
         var blocking = review.Findings.Where(f => f.IsBlocking).ToList();
         Assert.True(blocking.Count == 0,

@@ -67,6 +67,28 @@ internal sealed class SandboxRepo(FactoryOptions options, RepoRef repo) : IDispo
         return (await SendAsync(HttpMethod.Put, $"contents/{path}", token, body, ct))!.Value.GetProperty("commit").GetProperty("sha").GetString()!;
     }
 
+    /// <summary>
+    /// Pushes one commit onto <paramref name="branch"/> whose tree is <paramref name="head"/>'s own: the head moves, the change does
+    /// not (its diff against the base is the one already reviewed). Fast-forward only, so it fails if the branch is no longer at
+    /// <paramref name="head"/>. Returns the new commit.
+    /// </summary>
+    public async Task<string> PushSameTreeAsync(string token, string branch, string head, string message, CancellationToken ct)
+    {
+        var tree = (await SendAsync(HttpMethod.Get, $"git/commits/{head}", token, null, ct))!.Value.GetProperty("tree").GetProperty("sha").GetString()!;
+        var commit = (await SendAsync(HttpMethod.Post, "git/commits", token, new { message, tree, parents = new[] { head } }, ct))!.Value
+            .GetProperty("sha").GetString()!;
+        await SendAsync(HttpMethod.Patch, $"git/refs/heads/{branch}", token, new { sha = commit, force = false }, ct);
+        return commit;
+    }
+
+    /// <summary>
+    /// The gate policy (<see cref="GatePolicy.Path"/>) at <paramref name="gitRef"/> as the merge gate's App reads it, through this
+    /// test-owned client (never one a finished <c>factory run</c> has disposed); null when there is none.
+    /// </summary>
+    public Task<string?> GatePolicyAsync(string gitRef, CancellationToken ct) =>
+        new GitHubGate(_github, new GitHubApp(_github, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System))
+            .GetPolicyAsync(repo, gitRef, ct);
+
     /// <summary>Creates <paramref name="branch"/> at <paramref name="sha"/>.</summary>
     public Task CreateBranchAsync(string token, string branch, string sha, CancellationToken ct) =>
         SendAsync(HttpMethod.Post, "git/refs", token, new { @ref = $"refs/heads/{branch}", sha }, ct);
