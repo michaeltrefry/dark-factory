@@ -189,6 +189,7 @@ public sealed class LedgerPostgresTests : IAsyncLifetime
         }
 
         public Task<IReadOnlyList<string>> ConvertOpenToDraftAsync(RepoRef repo, string head, CancellationToken ct) => throw new NotSupportedException();
+        public Task UpdateBodyAsync(RepoRef repo, string pullUrl, string body, CancellationToken ct) => Task.CompletedTask;
     }
 
     /// <summary>Announces its session, then works until released.</summary>

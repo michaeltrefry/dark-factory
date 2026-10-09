@@ -17,7 +17,12 @@ public sealed record PipelineRow(
     decimal? CostUsd,
     IReadOnlyList<SessionLink> Sessions,
     long? EpicId = null,
-    ControlState Control = ControlState.Running);
+    ControlState Control = ControlState.Running,
+    CloseoutStatus? FailedCloseout = null)
+{
+    /// <summary>Whether the factory will try the failed closeout again (the next poll), or has left it to a human.</summary>
+    public bool CloseoutRetrying => FailedCloseout is { Attempts: < RunPipeline.MaxCloseoutAttempts };
+}
 
 /// <summary>
 /// A worker session of an item; <see cref="ClaudeSessionId"/> is null until the worker reports it. <see cref="LastEventAt"/>: when
@@ -53,10 +58,45 @@ public interface IDashboardData
 
     /// <summary>How long a running session may go without an event before the pages mark it quiet (<c>Worker:QuietMinutes</c>).</summary>
     TimeSpan QuietThreshold => DashboardData.DefaultQuietThreshold;
+
+    /// <summary>The factory's metrics over the ledger (<see cref="LedgerMetrics"/>; N/A when unmeasured, sandbox and demo items left out).</summary>
+    Task<IReadOnlyList<Metric>> MetricsAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<Metric>>([]);
 }
 
-public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, TimeProvider time, TimeSpan? quietThreshold = null) : IDashboardData
+public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, TimeProvider time, TimeSpan? quietThreshold = null,
+    MetricsOptions? metrics = null, TimeSpan? metricsTtl = null) : IDashboardData
 {
+    private readonly LedgerMetrics _metrics = new(contexts, metrics ?? MetricsOptions.Default);
+    private readonly TimeSpan _metricsTtl = metricsTtl ?? DefaultMetricsTtl;
+    private readonly SemaphoreSlim _metricsGate = new(1, 1);
+    private (IReadOnlyList<Metric> Value, DateTimeOffset At)? _cachedMetrics;
+
+    /// <summary>
+    /// How long computed metrics are served before they are computed again: they read every item's rows, so they are not recomputed on
+    /// every ledger change the pipeline page reloads on.
+    /// </summary>
+    public static readonly TimeSpan DefaultMetricsTtl = TimeSpan.FromSeconds(60);
+
+    /// <summary>The metrics, computed at most once per <see cref="DefaultMetricsTtl"/> (<c>metricsTtl</c>) for every page and viewer.</summary>
+    public async Task<IReadOnlyList<Metric>> MetricsAsync(CancellationToken ct)
+    {
+        await _metricsGate.WaitAsync(ct);
+        try
+        {
+            if (_cachedMetrics is { } cached && time.GetUtcNow() - cached.At < _metricsTtl)
+            {
+                return cached.Value;
+            }
+            var value = await _metrics.ComputeAsync(ct);
+            _cachedMetrics = (value, time.GetUtcNow());
+            return value;
+        }
+        finally
+        {
+            _metricsGate.Release();
+        }
+    }
+
     /// <summary>
     /// <c>Worker:QuietMinutes</c>'s default: the longest legitimate tool call (<see cref="RunPipeline.LongestToolCall"/>, a long
     /// <c>dotnet test</c>) streams nothing for that long, so only a silence past it is worth a look.
@@ -94,6 +134,7 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
                 .ToListAsync(ct))
             .GroupBy(e => e.WorkItemId)
             .ToDictionary(g => g.Key, g => g.Last().Detail);
+        var closeouts = await new WorkLedger(db, time).CloseoutRowsAsync(items.Where(i => i.State == WorkState.Watch).Select(i => i.Id).ToList(), ct);
         return items.Select(i => new PipelineRow(
                 i.Id, i.ExternalId, i.Title, i.Repo, i.State, i.CreatedAt, i.UpdatedAt,
                 PullRequestUrl(links.GetValueOrDefault(i.Id)),
@@ -101,7 +142,8 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
                 sessions[i.Id].Any(s => s.CostUsd is not null) ? sessions[i.Id].Sum(s => s.CostUsd ?? 0) : null,
                 sessions[i.Id].Select(s => Link(s, lastEvents.GetValueOrDefault(s.Id))).ToList(),
                 i.EpicId,
-                ControlOf(i)))
+                ControlOf(i),
+                i.State == WorkState.Watch && RunPipeline.CloseoutOf(closeouts[i.Id]) is { Posted: false, Attempts: > 0 } failed ? failed : null))
             .ToList();
     }
 

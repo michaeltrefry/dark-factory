@@ -146,6 +146,12 @@ public static partial class UntrustedText
 
     /// <summary><see cref="Inert"/> text in a Markdown code span (it has no backtick left to close it).</summary>
     public static string CodeSpan(string text) => $"`{Inert(text)}`";
+
+    /// <summary>
+    /// Untrusted multi-line text inside a tilde fence nothing in it can close: kept verbatim (line breaks too), but no mention, link or
+    /// markup in it renders.
+    /// </summary>
+    public static string Fenced(string text) => $"~~~~text\n{text.Replace("~~~", "~ ~ ~", StringComparison.Ordinal)}\n~~~~";
 }
 
 public static class WorkSourceComments

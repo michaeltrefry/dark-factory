@@ -81,7 +81,13 @@ else
             {
                 <tr @key="row.Id" data-item="@row.Id">
                     <td><span class="id">@row.ExternalId</span> @row.Title</td>
-                    <td class="state">@row.State</td>
+                    <td class="state">@row.State
+                        @if (row.FailedCloseout is { } closeout)
+                        {
+                            <span class="error closeout-failed">closeout not posted (attempt @closeout.Attempts of @RunPipeline.MaxCloseoutAttempts;
+                                @(row.CloseoutRetrying ? "retried on the next poll" : "not retried again: post it by hand")): @closeout.LastFailure</span>
+                        }
+                    </td>
                     <td>@row.Repo</td>
                     <td class="pr">
                         @if (row.PullRequestUrl is { } pr)
@@ -120,10 +126,35 @@ else
         </tbody>
     </table>
 }
+@if (_metricsStale)
+{
+    <p class="error metrics-error">Could not compute the metrics; showing the last known values.</p>
+}
+@if (_metrics is { Count: > 0 } metrics)
+{
+    <h2>Metrics</h2>
+    <table class="metrics">
+        <thead>
+            <tr><th>Metric</th><th>Value</th><th>Over</th></tr>
+        </thead>
+        <tbody>
+            @foreach (var metric in metrics)
+            {
+                <tr data-metric="@metric.Name">
+                    <td>@metric.Name</td>
+                    <td class="@(metric.Value is null ? "value muted" : "value")">@metric.Display</td>
+                    <td class="muted">@metric.Note</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+    <p class="muted">From the ledger's executed results only; sandbox and demo items are left out.</p>
+}
 
 @code {
     private readonly CancellationTokenSource _cts = new();
     private IReadOnlyList<PipelineRow>? _rows;
+    private IReadOnlyList<Metric>? _metrics;
     private IReadOnlyDictionary<string, Control> _controls = new Dictionary<string, Control>();
 
     /// <summary>Whether this scope's own control (not an enclosing one) pauses it: Continue clears exactly that.</summary>
@@ -142,6 +173,7 @@ else
     private bool _loading;
     private bool _again;
     private bool _stale;
+    private bool _metricsStale;
 
     protected override async Task OnInitializedAsync()
     {
@@ -185,6 +217,7 @@ else
                 _rows = await Data.ActiveItemsAsync(_cts.Token);
                 _controls = (await Data.ControlsAsync(_cts.Token)).ToDictionary(c => c.Scope);
                 _stale = false;
+                await ReloadMetricsAsync();
             }
             while (_again);
         }
@@ -201,6 +234,20 @@ else
             _loading = false;
         }
         StateHasChanged();
+    }
+
+    /// <summary>The metrics (computed on their own cadence, <see cref="DashboardData.MetricsAsync"/>): a failure marks only them stale.</summary>
+    private async Task ReloadMetricsAsync()
+    {
+        try
+        {
+            _metrics = await Data.MetricsAsync(_cts.Token);
+            _metricsStale = false;
+        }
+        catch (Exception) when (!_cts.IsCancellationRequested)
+        {
+            _metricsStale = true;
+        }
     }
 
     public void Dispose()

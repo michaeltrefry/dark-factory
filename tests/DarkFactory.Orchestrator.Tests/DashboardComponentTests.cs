@@ -127,6 +127,55 @@ public class DashboardComponentTests : BunitContext
         Assert.Empty(cut.FindAll(".item-errors"));
     }
 
+    [Fact]
+    public void The_pipeline_shows_the_metrics_with_unmeasured_ones_as_not_available()
+    {
+        _data.Rows = [];
+        _data.Metrics = LedgerMetrics.Compute([], MetricsOptions.Default);
+
+        var cut = Render<Pipeline>();
+
+        var rows = cut.FindAll("table.metrics tbody tr");
+        Assert.Equal(6, rows.Count);
+        Assert.All(rows, r => Assert.Equal("N/A", r.QuerySelector(".value")!.TextContent));
+        Assert.Contains("14-day revert rate", cut.Find("tr[data-metric='14-day revert rate']").TextContent);
+        Assert.Contains("sandbox and demo items are left out", cut.Markup);
+    }
+
+    [Fact]
+    public void A_metrics_failure_marks_only_the_metrics_stale_and_the_items_still_show()
+    {
+        _data.Rows = [Row(1, WorkState.Review)];
+        _data.MetricsFails = new InvalidOperationException("metrics query timed out");
+
+        var cut = Render<Pipeline>();
+
+        Assert.Single(cut.FindAll("tr[data-item='1']"));
+        Assert.Empty(cut.FindAll("p.error:not(.metrics-error)"));
+        Assert.Contains("Could not compute the metrics", cut.Find(".metrics-error").TextContent);
+    }
+
+    [Fact]
+    public void A_failed_closeout_shows_on_its_item_with_whether_it_is_retried()
+    {
+        _data.Rows =
+        [
+            Row(1, WorkState.Watch) with { FailedCloseout = new CloseoutStatus(1, false, "failed: Shortcut down") },
+            Row(2, WorkState.Watch) with { FailedCloseout = new CloseoutStatus(RunPipeline.MaxCloseoutAttempts, false, "failed: 413 too large") },
+            Row(3, WorkState.Watch),
+        ];
+
+        var cut = Render<Pipeline>();
+
+        var retrying = cut.Find("tr[data-item='1'] .closeout-failed").TextContent;
+        Assert.Contains("failed: Shortcut down", retrying);
+        Assert.Contains("retried on the next poll", retrying);
+        var given = cut.Find("tr[data-item='2'] .closeout-failed").TextContent;
+        Assert.Contains("failed: 413 too large", given);
+        Assert.Contains("post it by hand", given);
+        Assert.Empty(cut.FindAll("tr[data-item='3'] .closeout-failed"));
+    }
+
     private static PipelineRow Row(long id, WorkState state, string? pr = null, decimal? cost = null, params SessionLink[] sessions) =>
         new(id, $"sc-{id}", $"Story {id}", "acme/widgets", state, Now.AddMinutes(-65), Now, pr, cost, sessions);
 
@@ -410,6 +459,13 @@ public class DashboardComponentTests : BunitContext
 
         public Task<SessionHeader?> SessionAsync(string claudeSessionId, CancellationToken ct) =>
             Task.FromResult(Header?.Session.ClaudeSessionId == claudeSessionId ? Header : null);
+
+        public IReadOnlyList<Metric> Metrics { get; set; } = [];
+
+        public Exception? MetricsFails { get; set; }
+
+        public Task<IReadOnlyList<Metric>> MetricsAsync(CancellationToken ct) =>
+            MetricsFails is { } fails ? Task.FromException<IReadOnlyList<Metric>>(fails) : Task.FromResult(Metrics);
     }
 
     private sealed class FakeViewers : ISessionViewers

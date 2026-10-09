@@ -45,6 +45,12 @@ public sealed class LedgerEntry
     public DateTimeOffset RecordedAt { get; set; }
     public string? ClaudeSessionId { get; set; }
     public string? Detail { get; set; }
+
+    /// <summary>
+    /// How the step this row closes ended (E7, sc-25389), decided by <see cref="StepOutcomes.Of"/> when <see cref="WorkLedger"/> writes the
+    /// row. Required: no row is written without one (the column is NOT NULL and checked against the five names).
+    /// </summary>
+    public required StepOutcome Outcome { get; set; }
 }
 
 /// <summary>
@@ -206,10 +212,12 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
         });
         modelBuilder.Entity<LedgerEntry>(e =>
         {
-            e.ToTable("ledger_entries");
+            e.ToTable("ledger_entries", t => t.HasCheckConstraint("CK_ledger_entries_outcome",
+                $"\"Outcome\" IN ('{StepOutcomes.PassedName}', '{StepOutcomes.FailedName}', '{StepOutcomes.GateRejectedName}', '{StepOutcomes.DeferredName}', '{StepOutcomes.EscalatedName}')"));
             e.Property(x => x.State).HasConversion<string>().HasMaxLength(32);
             e.Property(x => x.Step).HasMaxLength(32);
             e.Property(x => x.ClaudeSessionId).HasMaxLength(128);
+            e.Property(x => x.Outcome).HasConversion(o => StepOutcomes.Name(o), name => StepOutcomes.Parse(name)).HasMaxLength(16).IsRequired();
             e.HasIndex(x => x.WorkItemId);
         });
         modelBuilder.Entity<WorkerSession>(e =>

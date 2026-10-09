@@ -98,6 +98,8 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Dashboard:BindAddress` | unset = loopback only; one private address (RFC 1918, 100.64/10, fc00::/7) on a local interface |
 | `Dashboard:HostName` | extra Host header the dashboard answers to (e.g. MagicDNS name); one plain DNS name, no wildcard/port |
 | `Dashboard:PasswordHash` | keychain `dashboard-password-hash` (written by `factory dashboard set-password`) |
+| `Metrics:SandboxRepos` | `michaeltrefry/dark-factory-sandbox` (comma-separated `owner/name`; items on these repos are left out of every metric) |
+| `Metrics:DemoMarkers` | `[demo],[sandbox]` (an item whose title carries one, case-insensitively, is left out of every metric) |
 
 Worker sandbox (E5): workers run as the hidden `_factory` user via
 `sudo -n -u _factory factory-worker-launch claude …` (one NOPASSWD sudoers rule for that helper only).
@@ -254,6 +256,25 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   interrupted Implement continues with `claude --resume`). Ctrl-C → Paused; a failure (including an
   unrequested `OperationCanceledException`, e.g. an HttpClient timeout) → Escalated + a story comment; a failed
   comment is retried on the next run before the item is re-queued.
+- Typed step outcomes (E7, sc-25389): every ledger row has `Outcome` (`passed`, `failed`, `gate_rejected`, `deferred`,
+  `escalated`; NOT NULL + a check constraint), decided in one place — `StepOutcomes.Of(from, state, step, detail)`, called by
+  `WorkLedger` for every row it writes (`LedgerEntry.Outcome` is `required`). The rules map earlier stories' typed results (verdict,
+  fix-progress, gate decision, new-tests outcome, stuck rounds, pauses, issue routes); migration `StepOutcomes` backfilled older rows
+  with the rules as they stood, as frozen SQL (a Postgres test checks it against a frozen literal corpus; never edit the shipped
+  migration — a later rule change only affects new rows). Reports are rendered only from the ledger (`LedgerReport`, E5): the
+  PR description at open and again at merge (`pr-report`), the board closeout on merge (`closeout`) and the escalation comment list
+  the check rows (`gate`, `ci-failure`, `new-tests`, `merge-conflict`) and verdict rows (each section's heading counts them by
+  outcome), the fix rounds and the worker cost (N/A when unrecorded); model/repo text in rows goes through `UntrustedText` (code span,
+  or a tilde fence for the escalation reason). Reports are bounded under GitHub's 65,536-char limit (Shortcut's is higher):
+  `Facts` ≤ 60,000 chars — ≤10 blocking findings per verdict, the latest verdict always in full, then the newest checks and earlier
+  verdicts that fit, with an "N earlier … not shown" line; the escalation reason is clipped to 4,000 chars. A failed `pr-report` or
+  `closeout` is recorded (`failed: …`, outcome failed), never escalated: the merge stands. A failed closeout shows on the dashboard
+  item and is retried from Watch on the next polls (`InFlightAsync` lists it; `HoldAsync` posts it), each attempt recorded, up to
+  `RunPipeline.MaxCloseoutAttempts` (3) per merge; after that the dashboard says to post it by hand. `LedgerMetrics` (dashboard
+  pipeline page; computed at most once per 60 s, `DashboardData.DefaultMetricsTtl`, and a metrics failure marks only the metrics
+  stale) computes cost per merged PR, 14-day revert rate (N/A: no revert
+  data yet), escalation rate, fix rounds per merged PR, reviewer precision (blocking findings a second model confirmed / those it
+  answered) and intake-to-merge time; N/A over zero matching items; sandbox/demo items are excluded (`Metrics:*`).
 - One run per item: `RunPipeline` holds a Postgres advisory lock on the item id (`PostgresRunLocks`) for the whole
   run, and `WorkItem.Version` is an optimistic concurrency token, so a stale writer's save throws.
 - Workers lead their own process group (launched via `/usr/bin/perl` `setpgrp` + `exec`); the pid is checkpointed

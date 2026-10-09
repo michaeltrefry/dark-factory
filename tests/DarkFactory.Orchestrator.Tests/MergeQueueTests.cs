@@ -129,6 +129,8 @@ public class MergeQueueTests
         public Task<IReadOnlyList<string>> ConvertOpenToDraftAsync(RepoRef repo, string head, CancellationToken ct) =>
             Task.FromResult<IReadOnlyList<string>>([]);
 
+        public Task UpdateBodyAsync(RepoRef repo, string pullUrl, string body, CancellationToken ct) => Task.CompletedTask;
+
         // ---- IGateGitHub ----
 
         public Task<PullFacts> GetPullAsync(RepoRef repo, int number, CancellationToken ct)
@@ -966,7 +968,7 @@ public class MergeQueueRuleTests
     private static long _id;
 
     private static LedgerEntry Row(WorkState state, string? step = null, string? detail = null) =>
-        new() { Id = Interlocked.Increment(ref _id), State = state, Step = step, Detail = detail };
+        new() { Id = Interlocked.Increment(ref _id), State = state, Step = step, Detail = detail, Outcome = StepOutcomes.Of(null, state, step, detail) };
 
     private static List<LedgerEntry> Queued(params LedgerEntry[] more) =>
         [Row(WorkState.Review), Row(WorkState.CI), Row(WorkState.MergeGate, null, "sha"), Row(WorkState.MergeGate, RunPipeline.Steps.Queued, "sha"), .. more];

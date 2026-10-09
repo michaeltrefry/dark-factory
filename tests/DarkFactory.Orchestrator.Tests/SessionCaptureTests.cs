@@ -778,6 +778,7 @@ public sealed class SessionCaptureTests : IAsyncLifetime
             Task.FromResult("https://github.com/acme/widgets/pull/1");
 
         public Task<IReadOnlyList<string>> ConvertOpenToDraftAsync(RepoRef repo, string head, CancellationToken ct) => throw new NotSupportedException();
+        public Task UpdateBodyAsync(RepoRef repo, string pullUrl, string body, CancellationToken ct) => Task.CompletedTask;
     }
 }
 

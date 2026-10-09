@@ -75,4 +75,6 @@ sealed class FilePullRequests(string path) : IPullRequests
 
     public async Task<IReadOnlyList<string>> ConvertOpenToDraftAsync(RepoRef repo, string head, CancellationToken ct) =>
         (File.Exists(path) ? await File.ReadAllLinesAsync(path, ct) : []).Select(l => l.Split('\t')).Where(p => p[0] == head).Select(p => p[1]).ToList();
+
+    public Task UpdateBodyAsync(RepoRef repo, string pullUrl, string body, CancellationToken ct) => Task.CompletedTask;
 }

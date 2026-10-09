@@ -164,6 +164,16 @@ public class FactoryOptionsTests
     }
 
     [Fact]
+    public void Metrics_leave_out_the_sandbox_repo_and_demo_markers_by_default_and_as_configured()
+    {
+        Assert.Equal(["michaeltrefry/dark-factory-sandbox"], Options([]).Metrics.SandboxRepos);
+        Assert.Equal(["[demo]", "[sandbox]"], Options([]).Metrics.DemoMarkers);
+        var configured = Options(new() { ["Metrics:SandboxRepos"] = " acme/play , acme/demo", ["Metrics:DemoMarkers"] = "(trial)" }).Metrics;
+        Assert.Equal(["acme/play", "acme/demo"], configured.SandboxRepos);
+        Assert.Equal(["(trial)"], configured.DemoMarkers);
+    }
+
+    [Fact]
     public void Watched_issue_repos_default_to_none_and_are_validated()
     {
         Assert.Empty(Options([]).WatchedIssueRepos);

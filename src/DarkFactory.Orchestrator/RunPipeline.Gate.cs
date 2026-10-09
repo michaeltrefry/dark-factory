@@ -195,6 +195,21 @@ public sealed partial class RunPipeline
         return stuck.Count == 0 ? "" : $"; {stuck.Count} round(s) failed because the fixer was stuck in a loop ({stuck[^1]})";
     }
 
+    /// <summary>
+    /// For the CI fix-round cap's escalation: <c>"; N round(s) failed because the CI fixer was stuck in a loop (why, the last)"</c> when any CI
+    /// fix round since the last Implement ended stuck (<see cref="StuckRoundDetail"/> on its CIHealing → CI row); else empty.
+    /// </summary>
+    private async Task<string> StuckCiRoundsAsync(WorkItem item, CancellationToken ct)
+    {
+        var history = await ledger.HistoryAsync(item, ct);
+        var transitions = history.Where(e => e.Step is null).ToList();
+        var implemented = transitions.FindLastIndex(e => e.State == WorkState.Implement);
+        var stuck = transitions.Select((e, i) => (e, i))
+            .Where(x => x.i > implemented && x.i > 0 && transitions[x.i - 1].State == WorkState.CIHealing && x.e.State == WorkState.CI)
+            .Select(x => StuckRoundReason(x.e.Detail)).OfType<string>().ToList();
+        return stuck.Count == 0 ? "" : $"; {stuck.Count} round(s) failed because the CI fixer was stuck in a loop ({stuck[^1]})";
+    }
+
     /// <summary>The item's latest fix round of any kind since the last Implement, with the index of its row; null when none.</summary>
     private static (int Index, FixRound Round)? LatestFixRound(List<LedgerEntry> history)
     {
@@ -598,9 +613,25 @@ public sealed partial class RunPipeline
                 + "could not be removed.");
         }
         run.Workspace = null;
-        await ledger.RecordAsync(run.Item, next, stuckSession.Session, $"{name} stuck: {stuckSession.Reason}; nothing pushed", ct);
+        await ledger.RecordAsync(run.Item, next, stuckSession.Session, StuckRoundDetail(name, stuckSession.Reason), ct);
         log.WriteLine($"[fix] {name}: the fixer was stuck in a loop; the round failed and nothing was pushed");
     }
+
+    private const string StuckRoundInfix = " stuck: ";
+    private const string StuckRoundSuffix = "; nothing pushed";
+
+    /// <summary>The Detail of the row a stuck fix round (<see cref="StuckFixRoundAsync"/>) ends with: "&lt;name&gt; stuck: &lt;why&gt;; nothing pushed".</summary>
+    public static string StuckRoundDetail(string name, string reason) => $"{name}{StuckRoundInfix}{reason}{StuckRoundSuffix}";
+
+    /// <summary>Whether <paramref name="detail"/> is a <see cref="StuckRoundDetail"/>: the fix round it closes failed, its fixer stuck in a loop.</summary>
+    public static bool IsStuckRound(string? detail) =>
+        detail is not null && detail.Contains(StuckRoundInfix, StringComparison.Ordinal) && detail.EndsWith(StuckRoundSuffix, StringComparison.Ordinal);
+
+    /// <summary>Why the CI fix round a <see cref="StuckRoundDetail"/> closes was stuck, else null.</summary>
+    private static string? StuckRoundReason(string? detail) =>
+        detail is not null && IsStuckRound(detail)
+            ? detail[(detail.IndexOf(StuckRoundInfix, StringComparison.Ordinal) + StuckRoundInfix.Length)..^StuckRoundSuffix.Length]
+            : null;
 
     /// <summary>
     /// CIHealing (sc-25383): one CI fix round — a fix round like a review one (<see cref="RunFixRoundAsync"/>: the same
@@ -881,7 +912,8 @@ public sealed partial class RunPipeline
         {
             throw new GateBlockedException(
                 $"CI still fails on {pull.HtmlUrl} at {Ci.Short(pull.HeadSha)} after {rounds} fix rounds (the cap is {Lifecycle.MaxFixRounds}, shared by "
-                + $"review and CI fixes); a fix round {rounds + 1} is not allowed. Failing checks:\n{CiHeal.Describe(triage.Fixable)}");
+                + $"review and CI fixes); a fix round {rounds + 1} is not allowed{await StuckCiRoundsAsync(run.Item, ct)}. Failing checks:\n"
+                + CiHeal.Describe(triage.Fixable));
         }
         log.WriteLine($"[ci] dispatching a CI fixer: fix round {rounds + 1} of {Lifecycle.MaxFixRounds}");
         await ledger.RecordAsync(run.Item, WorkState.CIHealing, null, pull.HeadSha, ct);
@@ -1035,17 +1067,89 @@ public sealed partial class RunPipeline
         }
     }
 
-    /// <summary>Merge: the change is merged (the Merge row holds the merge commit); the board shows it, then Watch.</summary>
+    /// <summary>
+    /// Merge: the change is merged (the Merge row holds the merge commit); the board shows it and gets the closeout comment, and the PR's
+    /// description is rewritten — both rendered from the ledger (<see cref="LedgerReport"/>, E5) — then Watch. A closeout or a description
+    /// that cannot be posted is recorded (<see cref="Steps.Closeout"/> or <see cref="Steps.PrReport"/> <c>failed: …</c>), not escalated: the
+    /// merge stands and the report is only a report. A failed closeout shows on the dashboard and is retried from Watch
+    /// (<see cref="CloseoutPending"/>).
+    /// </summary>
     private async Task MergeAsync(Run run, CancellationToken ct)
     {
         var history = await ledger.HistoryAsync(run.Item, ct);
         var entered = history.FindLastIndex(e => e.Step is null);
         var commit = history[entered].Detail;
-        if (!history.Skip(entered + 1).Any(e => e.Step == Steps.MergedReported))
+        var done = history.Skip(entered + 1).Select(e => e.Step).ToHashSet();
+        if (!done.Contains(Steps.MergedReported))
         {
             await source.ReportStateAsync(run.Story.Id, BoardState.Merged, null, ct);
             await ledger.CheckpointAsync(run.Item, Steps.MergedReported, null, commit, ct);
         }
+        if (!done.Contains(Steps.Closeout))
+        {
+            await PostCloseoutAsync(run.Item, run.Story.Id, ct);
+        }
+        if (!done.Contains(Steps.PrReport) && LinkedPullRequestUrl(history) is { } prUrl)
+        {
+            string result;
+            try
+            {
+                await pullRequests.UpdateBodyAsync(run.Repo, prUrl, await PullRequestBodyAsync(run, ct), ct);
+                result = "merge";
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                log.WriteLine($"[merge] could not rewrite the description of {prUrl}: {ex.Message}");
+                result = $"failed: {ex.Message}";
+            }
+            await ledger.CheckpointAsync(run.Item, Steps.PrReport, null, result, ct);
+        }
         await ledger.RecordAsync(run.Item, WorkState.Watch, null, commit, ct);
     }
+
+    /// <summary>One closeout attempt: posts the merged closeout on the item and records <c>posted</c> or <c>failed: &lt;why&gt;</c>.</summary>
+    private async Task<string?> PostCloseoutAsync(WorkItem item, int storyId, CancellationToken ct)
+    {
+        string? error = null;
+        try
+        {
+            var closeout = LedgerReport.MergedCloseout(item.ExternalId, await ledger.HistoryAsync(item, ct), await ledger.SessionCostsAsync(item, ct));
+            await source.CommentAsync(storyId, closeout, ct);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            error = ex.Message;
+            log.WriteLine($"[{item.State}] could not post the closeout on {item.ExternalId}: {ex.Message}");
+        }
+        await ledger.CheckpointAsync(item, Steps.Closeout, null, error is null ? Posted : $"failed: {error}", ct);
+        return error;
+    }
+
+    /// <summary>The <see cref="Steps.Closeout"/> detail of a closeout that is on the board.</summary>
+    public const string Posted = "posted";
+
+    /// <summary>Closeout attempts per merge (the one at Merge and the retries from Watch) before the factory leaves it to a human.</summary>
+    public const int MaxCloseoutAttempts = 3;
+
+    /// <summary>
+    /// The item's closeout since its latest merge: how many attempts were made, whether one was posted, and the last one's failure. Reads
+    /// only the Merge transitions and <see cref="Steps.Closeout"/> rows of <paramref name="rows"/> (oldest first; other rows may be absent).
+    /// </summary>
+    public static CloseoutStatus CloseoutOf(IEnumerable<LedgerEntry> rows)
+    {
+        var relevant = rows.Where(e => (e.Step is null && e.State == WorkState.Merge) || e.Step == Steps.Closeout).ToList();
+        var attempts = relevant.Skip(relevant.FindLastIndex(e => e.Step is null) + 1).ToList();
+        return new CloseoutStatus(attempts.Count, attempts.Any(a => a.Detail == Posted),
+            attempts.LastOrDefault() is { Detail: { } last } && last != Posted ? last : null);
+    }
+
+    /// <summary>
+    /// Whether an item in Watch has a closeout that failed and may be tried again (fewer than <see cref="MaxCloseoutAttempts"/> attempts):
+    /// the poll lists it (<see cref="InFlightAsync"/>) and its run retries it.
+    /// </summary>
+    public static bool CloseoutPending(WorkState state, IEnumerable<LedgerEntry> rows) =>
+        state == WorkState.Watch && CloseoutOf(rows) is { Posted: false, Attempts: > 0 and < MaxCloseoutAttempts };
 }
+
+/// <summary>An item's closeout since its latest merge (<see cref="RunPipeline.CloseoutOf"/>); <see cref="LastFailure"/> is the last attempt's <c>failed: …</c>.</summary>
+public sealed record CloseoutStatus(int Attempts, bool Posted, string? LastFailure);
