@@ -42,12 +42,36 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
 
     public sealed record Rule(string Type, PullRequestParameters? Parameters = null);
 
+    /// <summary>
+    /// Every parameter GitHub's pull_request rule accepts, always sent: one left out takes GitHub's default, and
+    /// <c>require_extra_approval_for_unattributed_changes</c> defaulted to <c>true</c>, which blocked every PR of unsigned
+    /// commits (the workers') although no approval is required. The read-back in <see cref="ApplyAsync"/> fails on any
+    /// parameter GitHub stores that is not listed here.
+    /// </summary>
     public sealed record PullRequestParameters(
         [property: JsonPropertyName("required_approving_review_count")] int RequiredApprovingReviewCount,
         [property: JsonPropertyName("dismiss_stale_reviews_on_push")] bool DismissStaleReviewsOnPush,
         [property: JsonPropertyName("require_code_owner_review")] bool RequireCodeOwnerReview,
         [property: JsonPropertyName("require_last_push_approval")] bool RequireLastPushApproval,
-        [property: JsonPropertyName("required_review_thread_resolution")] bool RequiredReviewThreadResolution);
+        [property: JsonPropertyName("required_review_thread_resolution")] bool RequiredReviewThreadResolution,
+        [property: JsonPropertyName("require_extra_approval_for_unattributed_changes")] bool RequireExtraApprovalForUnattributedChanges,
+        [property: JsonPropertyName("required_reviewers")] IReadOnlyList<JsonElement> RequiredReviewers,
+        [property: JsonPropertyName("allowed_merge_methods")] IReadOnlyList<string> AllowedMergeMethods);
+
+    /// <summary>
+    /// The main ruleset's PR rule: no approvals and no review conditions (the merge gate is the review, and a PR's
+    /// author cannot approve it), no extra approval for unattributed (unsigned) commits, no required reviewers, and
+    /// every merge method GitHub offers (the gate merges with <c>merge</c>; the owner may use any).
+    /// </summary>
+    public static readonly PullRequestParameters MainPullRequest = new(
+        RequiredApprovingReviewCount: 0,
+        DismissStaleReviewsOnPush: false,
+        RequireCodeOwnerReview: false,
+        RequireLastPushApproval: false,
+        RequiredReviewThreadResolution: false,
+        RequireExtraApprovalForUnattributedChanges: false,
+        RequiredReviewers: [],
+        AllowedMergeMethods: ["merge", "squash", "rebase"]);
 
     public sealed record BypassActor(
         [property: JsonPropertyName("actor_id")] long ActorId,
@@ -67,7 +91,7 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
         new(MainRulesetName, "branch", "active",
             new Conditions(new RefName(["~DEFAULT_BRANCH"], [])),
             [
-                new("pull_request", new PullRequestParameters(0, false, false, false, false)),
+                new("pull_request", MainPullRequest),
                 new("non_fast_forward"),
                 new("deletion"),
             ],
@@ -85,7 +109,10 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
 
     public static string Serialize(Ruleset ruleset) => JsonSerializer.Serialize(ruleset, Json);
 
-    /// <summary>Creates each missing ruleset and overwrites any existing one with the same name.</summary>
+    /// <summary>
+    /// Creates each missing ruleset and overwrites any existing one with the same name, then reads each back and
+    /// throws (naming every difference) unless GitHub holds exactly what was sent.
+    /// </summary>
     public async Task ApplyAsync(RepoRef repo, CancellationToken ct)
     {
         var path = $"repos/{repo.Owner}/{repo.Name}/rulesets";
@@ -105,9 +132,92 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
             request.Content = new StringContent(Serialize(ruleset), System.Text.Encoding.UTF8, "application/json");
             using var response = await http.SendAsync(request, ct);
             await EnsureSuccess(response, repo, $"{(update ? "update" : "create")} ruleset '{ruleset.Name}'", ct);
+            if (!update)
+            {
+                id = await response.Content.ReadFromJsonAsync<ExistingRuleset>(ct) is { Id: > 0 } created
+                    ? created.Id
+                    : throw new InvalidOperationException($"GitHub created ruleset '{ruleset.Name}' on {repo} but returned no id.");
+            }
             log.WriteLine($"{(update ? "updated" : "created")} ruleset '{ruleset.Name}' on {repo}");
+
+            using var read = GitHubApp.Request(HttpMethod.Get, $"{path}/{id}", "Bearer", adminToken);
+            using var readResponse = await http.SendAsync(read, ct);
+            await EnsureSuccess(readResponse, repo, $"read back ruleset '{ruleset.Name}'", ct);
+            using var stored = JsonDocument.Parse(await readResponse.Content.ReadAsStringAsync(ct));
+            var differences = Differences(ruleset, stored.RootElement);
+            if (differences.Count > 0)
+            {
+                throw new InvalidOperationException(
+                    $"Ruleset '{ruleset.Name}' (id {id}) on {repo} does not hold what was sent:{Environment.NewLine}  " +
+                    string.Join($"{Environment.NewLine}  ", differences));
+            }
+            log.WriteLine($"verified ruleset '{ruleset.Name}' on {repo}");
         }
     }
+
+    private static readonly string[] VerifiedFields = ["name", "target", "enforcement", "conditions", "bypass_actors"];
+
+    /// <summary>
+    /// Every way a stored ruleset differs from the one sent: the top-level fields, the rule types, and each rule's
+    /// parameters, including one GitHub stores that was not sent (a GitHub default). Arrays compare as sets.
+    /// </summary>
+    public static IReadOnlyList<string> Differences(Ruleset sent, JsonElement stored)
+    {
+        var expected = JsonDocument.Parse(Serialize(sent)).RootElement;
+        var differences = new List<string>();
+        foreach (var field in VerifiedFields)
+        {
+            Compare(field, expected.GetProperty(field), Field(stored, field), differences);
+        }
+
+        var storedRules = Field(stored, "rules") is { ValueKind: JsonValueKind.Array } rules ? rules.EnumerateArray().ToList() : [];
+        var sentRules = expected.GetProperty("rules").EnumerateArray().ToList();
+        Compare("rule types", Types(sentRules), Types(storedRules), differences);
+        foreach (var rule in sentRules)
+        {
+            var type = rule.GetProperty("type").GetString()!;
+            var match = storedRules.FirstOrDefault(r => Field(r, "type") is { ValueKind: JsonValueKind.String } t && t.GetString() == type);
+            if (match.ValueKind != JsonValueKind.Object)
+            {
+                continue; // already reported under "rule types"
+            }
+            var sentParameters = Field(rule, "parameters");
+            var storedParameters = Field(match, "parameters");
+            foreach (var name in Names(sentParameters).Union(Names(storedParameters)).Order(StringComparer.Ordinal))
+            {
+                Compare($"{type}.{name}", Field(sentParameters, name), Field(storedParameters, name), differences);
+            }
+        }
+        return differences;
+
+        static JsonElement Types(List<JsonElement> rules) => JsonSerializer.SerializeToElement(
+            rules.Select(r => Field(r, "type") is { ValueKind: JsonValueKind.String } t ? t.GetString() : null));
+
+        static IEnumerable<string> Names(JsonElement element) =>
+            element.ValueKind == JsonValueKind.Object ? element.EnumerateObject().Select(p => p.Name) : [];
+    }
+
+    private static JsonElement Field(JsonElement element, string name) =>
+        element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out var value) ? value : default;
+
+    private static void Compare(string what, JsonElement sent, JsonElement stored, List<string> differences)
+    {
+        if (Canonical(sent) != Canonical(stored))
+        {
+            differences.Add($"{what}: sent {Canonical(sent)}, GitHub holds {Canonical(stored)}");
+        }
+    }
+
+    /// <summary>Order-insensitive JSON text (object keys and array elements sorted); a missing value is <c>(absent)</c>.</summary>
+    private static string Canonical(JsonElement element) => element.ValueKind switch
+    {
+        JsonValueKind.Undefined => "(absent)",
+        JsonValueKind.Object => "{" + string.Join(",", element.EnumerateObject()
+            .OrderBy(p => p.Name, StringComparer.Ordinal)
+            .Select(p => $"{JsonSerializer.Serialize(p.Name)}:{Canonical(p.Value)}")) + "}",
+        JsonValueKind.Array => "[" + string.Join(",", element.EnumerateArray().Select(Canonical).Order(StringComparer.Ordinal)) + "]",
+        _ => element.GetRawText(),
+    };
 
     /// <summary>
     /// Resolves the owner's admin token: GH_TOKEN, then GITHUB_TOKEN, then <c>gh auth token</c>;
