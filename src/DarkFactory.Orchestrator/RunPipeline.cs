@@ -75,8 +75,19 @@ public sealed partial class RunPipeline(
     TimeSpan? controlPollInterval = null,
     GateStage? gate = null,
     FactoryFreeze? freeze = null,
-    StuckDetection? stuck = null)
+    StuckDetection? stuck = null,
+    int? maxControlReadFailures = null)
 {
+    /// <summary>
+    /// Reads of an item's controls in a row that may fail while a worker or the gate's test runs go on (<c>Controls:MaxReadFailures</c>);
+    /// the next failure counts as a Pause (E2: a check that cannot run counts as failed), recorded as <see cref="ControlsUnreadablePaused"/>.
+    /// </summary>
+    public const int DefaultMaxControlReadFailures = 10;
+
+    private readonly int _maxControlReadFailures = maxControlReadFailures is { } max
+        ? max >= 1 ? max : throw new ArgumentOutOfRangeException(nameof(maxControlReadFailures), max, "must be at least 1")
+        : DefaultMaxControlReadFailures;
+
     /// <summary>When a running worker counts as stuck (<c>Worker:StuckRepeats</c>, <c>Worker:StuckSimilarity</c>; sc-25388).</summary>
     private readonly StuckDetection _stuck = (stuck ?? StuckDetection.Default).Validate();
 
@@ -144,6 +155,11 @@ public sealed partial class RunPipeline(
         public const string StopReported = "stop-reported";
         /// <summary>The item was paused by the factory's usage pause; Detail is its reason and resume time.</summary>
         public const string UsagePause = "usage-pause";
+        /// <summary>
+        /// The item's controls could not be read <c>Controls:MaxReadFailures</c> times in a row while its worker (or the gate's test
+        /// runs) went on, so it was paused; Detail is the last read's error. Recorded before the Paused row.
+        /// </summary>
+        public const string ControlsUnreadable = "controls-unreadable";
         /// <summary>A model answered the implementer's session (first time seen for the item); Detail is the model id.</summary>
         public const string ImplementerModel = "implementer-model";
         /// <summary>
@@ -193,6 +209,12 @@ public sealed partial class RunPipeline(
         public const string BaseUpdate = "base-update";
         /// <summary>MergeGate: the head does not merge with the base (Detail: the <see cref="Gate.BaseUpdate"/> JSON with the conflicted files).</summary>
         public const string MergeConflict = "merge-conflict";
+        /// <summary>
+        /// The fix-round cap in effect changed (<see cref="FixCapOf"/>): Detail starts with the cap — the lower of the base's
+        /// <c>risk.max_fix_rounds</c> and <see cref="Lifecycle.MaxFixRounds"/> — then says where it came from. Recorded, before the
+        /// fix-round decision it is read for, only when it differs from the one in effect (none recorded: the hard cap).
+        /// </summary>
+        public const string FixCap = "fix-cap";
         /// <summary>
         /// MergeGate: the old head's verdict was carried to the updated head because the PR's diff is unchanged by the update
         /// (Detail: the <see cref="Gate.ReviewCarry"/> proof), before the carried verdict is recorded.
@@ -244,6 +266,13 @@ public sealed partial class RunPipeline(
     /// </summary>
     public const string FreezePaused = "freeze-paused";
 
+    /// <summary>
+    /// Detail of the Paused row recorded when the item's controls could not be read <c>Controls:MaxReadFailures</c> times in a row
+    /// while its worker (or the gate's test runs) went on: counted as a Pause rather than run blind (E2). Such an item resumes
+    /// (its worker with <c>claude --resume</c>) once its controls can be read and none pauses it.
+    /// </summary>
+    public const string ControlsUnreadablePaused = "controls-unreadable";
+
     /// <summary>A Pause or Stop control reached a run; the worker (if any) has ended.</summary>
     private sealed class ControlRequestedException(ControlState state, bool workerStillRunning = false)
         : Exception($"control: {state}")
@@ -252,6 +281,8 @@ public sealed partial class RunPipeline(
         public bool WorkerStillRunning { get; } = workerStillRunning;
         /// <summary>Set when the freeze evaluator (not a control row) paused the run: why it is frozen.</summary>
         public FreezeStatus? Frozen { get; init; }
+        /// <summary>Set when the controls could not be read (<see cref="ControlsUnreadablePaused"/>): the last read's error.</summary>
+        public string? ControlsUnreadable { get; init; }
     }
 
     /// <summary>
@@ -305,9 +336,9 @@ public sealed partial class RunPipeline(
     private IReadOnlySet<WorkState> Handled => gate is null ? ImplementStates : HandledStates;
 
     /// <summary>
-    /// Story ids of items a run should pick up, oldest first: items being stopped (whatever their state), then,
-    /// unless a control pauses them, those in a handled state and those <see cref="Interrupted"/> or
-    /// <see cref="UserPaused"/> (not parked) while in one.
+    /// Story ids of items a run should pick up: first the items being stopped (whatever their state; a stop is finished even in a
+    /// frozen factory, before anything is deferred), then, oldest first and unless a control pauses them, those in a handled
+    /// state and those paused in one in a way that resumes by itself (<see cref="ResumesAutomatically"/>, not parked).
     /// </summary>
     /// <param name="handled">The states the runner's pipeline drives; default <see cref="HandledStates"/> (production).</param>
     /// <param name="naming">The source whose items to list; default Shortcut stories.</param>
@@ -318,6 +349,7 @@ public sealed partial class RunPipeline(
         handled ??= HandledStates;
         naming ??= ItemNaming.Shortcut;
         var stopping = (await controls.ListAsync(ct)).Where(c => c.State == ControlState.Stopping).Select(c => c.Scope).ToHashSet();
+        var stops = new List<int>();
         var ids = new List<int>();
         var active = await ledger.ActiveItemsAsync(naming.Source, ct);
         // A merged item whose closeout failed is listed until it is posted or its attempts are used up (a run retries it from Watch).
@@ -326,7 +358,8 @@ public sealed partial class RunPipeline(
             : Array.Empty<LedgerEntry>().ToLookup(e => e.WorkItemId);
         foreach (var item in active)
         {
-            if (!stopping.Contains(ControlScope.Item(item.ExternalId)))
+            var beingStopped = stopping.Contains(ControlScope.Item(item.ExternalId));
+            if (!beingStopped)
             {
                 var resumable = handled.Contains(item.State)
                     || CloseoutPending(item.State, closeouts[item.Id])
@@ -338,17 +371,17 @@ public sealed partial class RunPipeline(
             }
             if (naming.TryParse(item.ExternalId, out var id))
             {
-                ids.Add(id);
+                (beingStopped ? stops : ids).Add(id);
             }
         }
-        return ids;
+        return [.. stops, .. ids];
     }
 
     private static bool ResumesAutomatically(List<LedgerEntry> history, IReadOnlySet<WorkState> handled)
     {
         var paused = history.FindLastIndex(e => e.Step is null);
         var pausedFrom = TransitionContext.From(history.Where(e => e.Step is null).Select(e => e.State).ToList()).PausedFrom;
-        return history[paused] is { State: WorkState.Paused, Detail: Interrupted or UserPaused or UsagePaused or FreezePaused }
+        return history[paused] is { State: WorkState.Paused, Detail: Interrupted or UserPaused or UsagePaused or FreezePaused or ControlsUnreadablePaused }
             && pausedFrom is { } from && handled.Contains(from)
             && !history.Skip(paused + 1).Any(e => e.Step == Steps.Parked);
     }
@@ -370,10 +403,11 @@ public sealed partial class RunPipeline(
             return await StopIdleAsync(known, storyId, ct);
         }
         // The freeze evaluator runs before every dispatch (sc-25387): a frozen factory defers the run, changing nothing.
-        if (freeze is not null && await freeze.CheckAsync(ct) is { Frozen: true } frozen)
+        if (freeze is not null && await CheckFreezeAsync(ct) is { Frozen: true } frozen)
         {
-            log.WriteLine($"[deferred] {Naming.Format(storyId)}: {frozen.Message}");
-            return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null, $"{Naming.Format(storyId)} deferred: {frozen.Message}")
+            log.WriteLine($"[deferred] {Naming.Format(storyId)}: {frozen.Message}; {frozen.Remedy}");
+            return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null,
+                $"{Naming.Format(storyId)} deferred: {frozen.Message}; {frozen.Remedy}")
             {
                 Deferred = frozen.Message,
             };
@@ -479,6 +513,15 @@ public sealed partial class RunPipeline(
         catch (ControlRequestedException request) when (request.State == ControlState.Paused)
         {
             // The worktree, checkpoints and Claude session stay: Continue (or the usage pause lifting) resumes the same session.
+            if (request.ControlsUnreadable is { } unreadable)
+            {
+                // Recorded without reading the controls again: they were unreadable, and the item resumes once they are not.
+                await ledger.CheckpointAsync(item, Steps.ControlsUnreadable, null, unreadable, CancellationToken.None);
+                await ledger.RecordAsync(item, WorkState.Paused, null, ControlsUnreadablePaused, CancellationToken.None);
+                log.WriteLine($"[paused] {item.ExternalId}: its controls could not be read ({unreadable}); paused, worktree and session kept");
+                return await OutcomeAsync(item, $"{item.ExternalId} is paused: its controls could not be read more than {_maxControlReadFailures} "
+                    + $"times in a row ({unreadable}); it resumes on its own once they can be read and nothing pauses it.", CancellationToken.None);
+            }
             // A user's Pause on the factory, the epic or the item outranks the usage pause: Continue, not the reset, resumes it.
             var userPaused = await UserPausedAsync(item);
             if (!userPaused && await _controls.UsagePauseAsync(CancellationToken.None) is { } usage)
@@ -498,8 +541,8 @@ public sealed partial class RunPipeline(
             if (!userPaused && frozenBy is not null)
             {
                 await ledger.RecordAsync(item, WorkState.Paused, null, FreezePaused, CancellationToken.None);
-                log.WriteLine($"[paused] {item.ExternalId} paused by the factory freeze ({frozenBy}); its worktree and session are kept for Continue");
-                return await OutcomeAsync(item, $"{item.ExternalId} is paused by the factory freeze ({frozenBy}); `factory continue --freeze` clears it.",
+                log.WriteLine($"[paused] {item.ExternalId} paused by the factory freeze ({frozenBy}); its worktree and session are kept");
+                return await OutcomeAsync(item, $"{item.ExternalId} is paused by the factory freeze ({frozenBy}); {FreezeTrigger.Remedy(frozenBy)}.",
                     CancellationToken.None);
             }
             await ledger.RecordAsync(item, WorkState.Paused, null, UserPaused, CancellationToken.None);
@@ -870,7 +913,8 @@ public sealed partial class RunPipeline(
         // Every stdout line is stored (and pushed to live viewers) as it streams (E7).
         await using var capture = sessions is null ? null : await sessions.StartAsync(item.Id, resume, ct);
         // Pause asks the worker to stop at its next tool boundary (and stops it if it doesn't); Stop stops it now.
-        await using var watch = new ControlWatch(_controls, worker, log, _controlPoll, _pauseGrace, item.ExternalId, item.EpicId, workspace.Path, ct);
+        await using var watch = new ControlWatch(_controls, worker, log, _controlPoll, _pauseGrace, item.ExternalId, item.EpicId, workspace.Path,
+            _maxControlReadFailures, ct);
         // A looping session is interrupted at its next tool boundary like a Pause, but never resumed (sc-25388).
         var detector = new StuckDetector(_stuck);
         string? stuckReason = null;
@@ -932,7 +976,10 @@ public sealed partial class RunPipeline(
         {
             // The control cut the worker off (Stop, or a pause it did not honour in time).
             await CompleteControlledSessionAsync(capture, requested);
-            throw new ControlRequestedException(requested, WorkerStillRunning.IsMarked(ex));
+            throw new ControlRequestedException(requested, WorkerStillRunning.IsMarked(ex))
+            {
+                ControlsUnreadable = requested == ControlState.Paused ? watch.ControlsUnreadable : null,
+            };
         }
         catch (Exception ex) when (stuckReason is not null && watch.Token.IsCancellationRequested && !ct.IsCancellationRequested)
         {
@@ -972,7 +1019,10 @@ public sealed partial class RunPipeline(
             // takes effect before the push (E3: Continue does not run a finished worker again).
             var requested = watch.Requested == ControlState.Stopping ? ControlState.Stopping : ControlState.Paused;
             await CompleteControlledSessionAsync(capture, requested);
-            throw new ControlRequestedException(requested);
+            throw new ControlRequestedException(requested)
+            {
+                ControlsUnreadable = requested == ControlState.Paused ? watch.ControlsUnreadable : null,
+            };
         }
         // The plans ran out, not the work: pause the factory (backing off) and resume this session afterwards, rather
         // than escalate the item. Without a control table nothing could hold the pause, so the failure escalates.
@@ -1057,11 +1107,22 @@ public sealed partial class RunPipeline(
     /// </summary>
     private async Task ThrowIfFrozenAsync(WorkItem item, CancellationToken ct, bool fresh = false)
     {
-        if (freeze is not null && await freeze.CheckAsync(ct, fresh) is { Frozen: true } frozen)
+        if (freeze is not null && await CheckFreezeAsync(ct, fresh) is { Frozen: true } frozen)
         {
             log.WriteLine($"[frozen] {item.ExternalId}: {frozen.Message}");
             throw new ControlRequestedException(ControlState.Paused) { Frozen = frozen };
         }
+    }
+
+    /// <summary>The freeze evaluator's answer, its notes (what it passed over, e.g. a base branch GitHub no longer has) logged.</summary>
+    private async Task<FreezeStatus> CheckFreezeAsync(CancellationToken ct, bool fresh = false)
+    {
+        var status = await freeze!.CheckAsync(ct, fresh);
+        foreach (var note in status.Notes)
+        {
+            log.WriteLine($"[freeze] {note}");
+        }
+        return status;
     }
 
     /// <summary>A paused session resumes later, so its cost waits for the run that finishes it; a stopped one's is fetched now (bounded).</summary>
@@ -1178,7 +1239,9 @@ public sealed partial class RunPipeline(
     /// Watches a running worker's controls (polling, so it sees writes from any process). Pause: asks the worker
     /// to stop at its next tool boundary (<see cref="IWorker.RequestPause"/>) and cancels the run if it has not
     /// ended within the pause grace, since the worker could tamper with anything it can write. Continue before then
-    /// withdraws the request (<see cref="IWorker.CancelPause"/>) and the grace. Stop: cancels at once.
+    /// withdraws the request (<see cref="IWorker.CancelPause"/>) and the grace. Stop: cancels at once. Controls that cannot be
+    /// read more than <c>maxReadFailures</c> times in a row count as a Pause (<see cref="ControlsUnreadable"/>); a read that then
+    /// shows nothing pausing the item withdraws it like a Continue.
     /// </summary>
     private sealed class ControlWatch : IAsyncDisposable
     {
@@ -1191,13 +1254,17 @@ public sealed partial class RunPipeline(
         private readonly CancellationTokenSource _done = new();
         private readonly Task _loop;
         private readonly string _workingDirectory;
+        private readonly int _maxReadFailures;
         private int _requested = -1;
         private int _pauseRequested;
         private int _stuck;
+        private string? _unreadable;
 
-        public ControlWatch(IControls controls, IWorker worker, TextWriter log, TimeSpan poll, TimeSpan grace, string externalId, long? epicId, string workingDirectory, CancellationToken ct)
+        public ControlWatch(IControls controls, IWorker worker, TextWriter log, TimeSpan poll, TimeSpan grace, string externalId, long? epicId, string workingDirectory,
+            int maxReadFailures, CancellationToken ct)
         {
-            (_controls, _workerProcess, _log, _poll, _grace, _workingDirectory) = (controls, worker, log, poll, grace, workingDirectory);
+            (_controls, _workerProcess, _log, _poll, _grace, _workingDirectory, _maxReadFailures) =
+                (controls, worker, log, poll, grace, workingDirectory, maxReadFailures);
             _worker = CancellationTokenSource.CreateLinkedTokenSource(ct);
             _loop = Task.Run(() => WatchAsync(externalId, epicId, workingDirectory));
         }
@@ -1213,6 +1280,9 @@ public sealed partial class RunPipeline(
 
         /// <summary>Whether the stuck detector interrupted the worker (<see cref="InterruptStuck"/>).</summary>
         public bool Stuck => Volatile.Read(ref _stuck) == 1;
+
+        /// <summary>While the controls are unreadable past the limit (counted as a Pause): the last read's error.</summary>
+        public string? ControlsUnreadable => Volatile.Read(ref _unreadable);
 
         /// <summary>
         /// The stuck detector found the worker looping (sc-25388): asks it to stop at its next tool boundary now, through the same
@@ -1240,6 +1310,7 @@ public sealed partial class RunPipeline(
             var log = _log;
             DateTimeOffset? deadline = null;
             var pausedByControl = false;
+            var readFailures = 0;
             while (true)
             {
                 try
@@ -1251,6 +1322,7 @@ public sealed partial class RunPipeline(
                     return;
                 }
                 ControlState state;
+                var unreadableNow = false;
                 try
                 {
                     state = await _controls.EffectiveAsync(externalId, epicId, _done.Token);
@@ -1261,8 +1333,22 @@ public sealed partial class RunPipeline(
                 }
                 catch (Exception ex)
                 {
-                    log.WriteLine($"[control] could not read the controls of {externalId}: {ex.Message}; retrying");
-                    continue;
+                    if (++readFailures <= _maxReadFailures)
+                    {
+                        log.WriteLine($"[control] could not read the controls of {externalId} ({readFailures} in a row): {ex.Message}; retrying");
+                        continue;
+                    }
+                    // Unreadable for too long: a Pause, not a worker running blind (E2). The run records it once the worker stops.
+                    // The reads that paused it are recorded (later failures while the worker stops change nothing).
+                    Interlocked.CompareExchange(ref _unreadable, $"{readFailures} reads in a row failed; the last: {ex.GetType().Name}: {ex.Message}", null);
+                    state = ControlState.Paused;
+                    unreadableNow = true;
+                }
+                if (!unreadableNow)
+                {
+                    // Read: whatever the controls say now decides (a Continue-like withdrawal when nothing pauses the item).
+                    readFailures = 0;
+                    Volatile.Write(ref _unreadable, null);
                 }
                 if (state == ControlState.Stopping)
                 {
@@ -1303,7 +1389,9 @@ public sealed partial class RunPipeline(
                     Volatile.Write(ref _requested, (int)ControlState.Paused);
                     Volatile.Write(ref _pauseRequested, 1);
                     deadline ??= DateTimeOffset.UtcNow + _grace;
-                    log.WriteLine($"[control] {externalId} paused; its worker stops at its next tool call");
+                    log.WriteLine(ControlsUnreadable is { } why
+                        ? $"[control] the controls of {externalId} could not be read {readFailures} times in a row ({why}); counted as a pause: its worker stops at its next tool call"
+                        : $"[control] {externalId} paused; its worker stops at its next tool call");
                     try
                     {
                         _workerProcess.RequestPause(workingDirectory);

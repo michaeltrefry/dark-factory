@@ -9,7 +9,10 @@ namespace DarkFactory.Orchestrator.WorkSources;
 /// <summary>Runs one item through the pipeline, and lists items a previous process left mid-run.</summary>
 public interface IItemRunner
 {
-    /// <summary>Items whose ledger state has a handler (still in flight), e.g. after a crash.</summary>
+    /// <summary>
+    /// Items whose ledger state has a handler (still in flight), e.g. after a crash; items being stopped first (a stop starts no
+    /// new work, so it is finished even when the factory is frozen and the rest are deferred).
+    /// </summary>
     Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct);
 
     Task<RunOutcome> RunAsync(int id, CancellationToken ct);
@@ -39,7 +42,10 @@ public interface IItemRunner
 /// <paramref name="moreLanes"/> adds work sources after the first (GitHub issues, sc-25385), polled in turn by the same loop, so
 /// their runs never overlap; a source whose listing fails is skipped for that poll without holding up the others. Items are
 /// keyed by their external id (<c>sc-12</c>, <c>gh-3</c>) on the dashboard. A run deferred by the freeze evaluator
-/// (<see cref="RunOutcome.Deferred"/>) ends the poll and is shown on the dashboard. <paramref name="freeze"/>, when set, is the
+/// (<see cref="RunOutcome.Deferred"/>) is shown on the dashboard and ends the poll's new work: no ready item of any lane is run,
+/// and a lane's in-flight items stop at its first deferral — but every lane's in-flight items are run up to then, and those
+/// being stopped come first (<see cref="IItemRunner.InFlightAsync"/>), so a pending Stop is finished in a frozen factory too.
+/// <paramref name="freeze"/>, when set, is the
 /// freeze evaluator run at the start of each poll: frozen (or unable to check), no lane is prepared (no triage) or listed.
 /// </summary>
 public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOptions options, TimeProvider time, ILogger<IntakeLoop> logger,
@@ -103,7 +109,7 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
     public async Task<DateTimeOffset?> PollOnceAsync(CancellationToken ct)
     {
         IReadOnlyList<IntakeLane> lanes = [new IntakeLane(source, runner), .. moreLanes ?? []];
-        var work = new List<(IntakeLane Lane, IReadOnlyList<int> Ids)>();
+        var work = new List<(IntakeLane Lane, IReadOnlyList<int> InFlight, IReadOnlyList<int> Ready)>();
         DateTimeOffset? resumeAt = null;
         bool factoryPaused;
         try
@@ -125,7 +131,7 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
                 if (await freeze(ct) is { Frozen: true } frozen)
                 {
                     factoryPaused = true;
-                    _status.Deferred("intake", frozen.Message);
+                    _status.Deferred("intake", $"{frozen.Message}; {frozen.Remedy}");
                 }
                 else
                 {
@@ -155,7 +161,7 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
                     }
                     ready = await lane.Source.ListReadyAsync(ct);
                 }
-                work.Add((lane, inFlight.Concat(ready).Distinct().ToList()));
+                work.Add((lane, inFlight, ready.Except(inFlight).Distinct().ToList()));
             }
             catch (Exception ex) when (!ct.IsCancellationRequested)
             {
@@ -166,9 +172,14 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
             }
         }
         var runsFailed = false;
-        foreach (var (lane, ids) in work)
+        var deferredRun = false;
+        foreach (var (lane, inFlight, ready) in work)
         {
-            foreach (var id in ids.TakeWhile(_ => !runsFailed))
+            var laneDeferred = false;
+            // In-flight items (those being stopped first) even after another lane's deferral: a Stop starts no new work. Ready ones
+            // only while nothing was deferred: the factory is frozen, so every new item would be deferred the same way.
+            var ids = inFlight.Select(id => (Id: id, Ready: false)).Concat(ready.Select(id => (Id: id, Ready: true)));
+            foreach (var (id, isReady) in ids.TakeWhile(x => !runsFailed && !laneDeferred && !(x.Ready && deferredRun)))
             {
                 var name = lane.Source.Naming.Format(id);
                 try
@@ -178,11 +189,11 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
                     _status.ItemOk(name);
                     if (outcome.Deferred is { } deferred)
                     {
-                        // The factory is frozen: every other item would be deferred the same way.
+                        // The factory is frozen: every other item of the lane would be deferred the same way (its stops came first).
                         _status.Deferred(name, deferred);
-                        runsFailed = true;
+                        deferredRun = laneDeferred = true;
                     }
-                    else
+                    else if (!deferredRun)
                     {
                         _status.NotDeferred();
                     }

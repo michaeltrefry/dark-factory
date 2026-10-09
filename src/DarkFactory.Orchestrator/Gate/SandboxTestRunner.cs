@@ -19,6 +19,9 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
 {
     public static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(20);
 
+    /// <summary>How long one sandboxed run may take (<c>Gate:TestTimeoutMinutes</c>).</summary>
+    public TimeSpan Timeout => timeout;
+
     /// <summary>How long a stopped run gets to exit after its helper's stdin closes.</summary>
     private static readonly TimeSpan StopGrace = TimeSpan.FromSeconds(10);
 

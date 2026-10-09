@@ -139,7 +139,8 @@ public class GitHubAppTests
     [Fact]
     public async Task Missing_installation_says_to_install_the_app()
     {
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+        // A 404 (GitHubNotFoundException, an InvalidOperationException): main-red reads a repo the App lost as having no tip.
+        var ex = await Assert.ThrowsAsync<GitHubNotFoundException>(
             () => App(new FakeApi()).CreateInstallationTokenAsync(Sandbox, CancellationToken.None));
         Assert.Contains("not installed on michaeltrefry/dark-factory-sandbox", ex.Message);
     }

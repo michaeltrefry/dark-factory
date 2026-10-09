@@ -74,7 +74,10 @@ public class GatePolicyTests
             { Replace("infra/", "infra**/"), "invalid segment 'infra**'" },
             { Replace("max_changed_lines: 400", "max_changed_lines: 0"), "risk.max_changed_lines must be a whole number of at least 1" },
             { Replace("max_changed_files: 20", "max_changed_files: lots"), "risk.max_changed_files must be a whole number" },
-            { Replace("max_fix_rounds: 3", "max_fix_rounds: -1"), "risk.max_fix_rounds must be a whole number of at least 0" },
+            { Replace("max_fix_rounds: 3", "max_fix_rounds: -1"), "risk.max_fix_rounds must be a whole number from 1 to 3" },
+            // It can only lower the factory's hard cap (Lifecycle.MaxFixRounds), never raise it or switch fix rounds off.
+            { Replace("max_fix_rounds: 3", "max_fix_rounds: 0"), "risk.max_fix_rounds must be a whole number from 1 to 3 (it can only lower" },
+            { Replace("max_fix_rounds: 3", "max_fix_rounds: 4"), "risk.max_fix_rounds must be a whole number from 1 to 3 (it can only lower" },
             { Replace("\n  max_fix_rounds: 3", ""), "risk is missing 'max_fix_rounds'" },
             { Replace("risk:\n", "risk: none\n").Split("  max_changed_lines")[0], "risk in the top level must be a mapping" },
         };

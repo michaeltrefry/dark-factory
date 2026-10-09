@@ -24,6 +24,23 @@ public class CiHealTests
         (await h.Rows()).Where(r => r.Step == RunPipeline.Steps.CiFailure).Select(r => CiTriage.FromDetail(r.Detail)!).ToList();
 
     [Fact]
+    public async Task The_policys_max_fix_rounds_caps_ci_fix_rounds_too()
+    {
+        var h = new Harness();
+        h.GitHub.PolicyText = Support.TestPolicies.Standard(maxFixRounds: 1);
+        h.GitHub.Ci[Sha1] = Red(Sha1);
+        h.GitHub.Ci[ShaA] = Red(ShaA);
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Equal(1, (await h.Transitions()).Count(s => s == WorkState.CIHealing)); // no CI fix round 2
+        Assert.Contains("CI failed on commit 111111111111 (fix round 1 of 1)", h.WorkerCalls[1].Prompt);
+        Assert.Contains("after 1 fix rounds (the cap is 1, the policy's max_fix_rounds (the factory's hard cap is 3), one count shared by review, "
+            + "CI and conflict fix rounds); a fix round 2 is not allowed", outcome.Error);
+    }
+
+    [Fact]
     public async Task A_red_ci_run_dispatches_a_ci_fixer_with_the_failing_jobs_log_and_green_ci_on_its_push_proceeds_to_the_gate()
     {
         var h = new Harness();
@@ -236,7 +253,7 @@ public class CiHealTests
         Assert.Equal(1 + Lifecycle.MaxFixRounds, h.WorkerCalls.Count); // the implementer, one review fixer, two CI fixers; no fourth
         Assert.Contains("CI failed on commit aaaaaaaaaaaa (fix round 2 of 3)", h.WorkerCalls[2].Prompt);
         Assert.Contains($"push michaeltrefry/dark-factory-sandbox factory/sc-77 sc-77: fix CI (round 3)", h.Workspaces.Calls);
-        Assert.Contains("after 3 fix rounds (the cap is 3, shared by review and CI fixes)", outcome.Error);
+        Assert.Contains("after 3 fix rounds (the cap is 3, one count shared by review, CI and conflict fix rounds)", outcome.Error);
         Assert.Contains("- build-test", outcome.Error);
         Assert.Empty(h.Merges);
     }

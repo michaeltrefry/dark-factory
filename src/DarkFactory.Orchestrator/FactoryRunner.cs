@@ -92,6 +92,15 @@ public static class FactoryRunner
     {
         try
         {
+            options.ValidateSettings();
+        }
+        catch (InvalidOperationException ex)
+        {
+            stderr.WriteLine(ex.Message);
+            return 2;
+        }
+        try
+        {
             _ = options.ReviewPanel;
             if (await checkEnrollment(ct) is { } enrollmentError)
             {
@@ -140,7 +149,8 @@ public static class FactoryRunner
     {
         var http = OutboundHttp.GitHubApi();
         var gateApp = new GitHubApp(http, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System);
-        return new FactoryFreeze(Contexts(options), Controls(options), options.Freeze, TimeProvider.System, new GitHubGate(http, gateApp));
+        return new FactoryFreeze(Contexts(options), Controls(options), options.Freeze, TimeProvider.System, new GitHubGate(http, gateApp),
+            options.ConfiguredRepos, FreezeCheckFailures.Process);
     }
 
     private static LedgerDbContextFactory Contexts(FactoryOptions options) =>
@@ -177,6 +187,7 @@ public static class FactoryRunner
         var pauseGrace = options.PauseGrace;
         var freezeOptions = options.Freeze;
         var stuck = options.StuckDetection;
+        var maxControlReadFailures = options.MaxControlReadFailures;
 
         // Sandboxed, the worker user is single-tenant (every helper exit kills all of its processes),
         // so one sandboxed run per machine, taken before anything runs through the helper.
@@ -191,7 +202,7 @@ public static class FactoryRunner
         var app = new GitHubApp(githubHttp, appId, appKey, TimeProvider.System);
         // The merge-capable credential: a separate App only the gate uses (workers' pushes and PRs use the one above).
         var gateApp = new GitHubApp(githubHttp, gateAppId, gateAppKey, TimeProvider.System);
-        using var reviewerHttp = OutboundHttp.RouterApi(options.RouterBaseUrl, options.ReviewTimeout);
+        using var reviewerHttp = ReviewerHttp(options);
 
         await FactoryWide("the ledger", async () => { await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct); return true; });
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
@@ -206,8 +217,7 @@ public static class FactoryRunner
             return true;
         });
 
-        var gate = new GateStage(new GitHubGate(githubHttp, gateApp), new RouterReviewer(reviewerHttp, routerKey), reviewPanel,
-            options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, sandbox, options.TestTimeout));
+        var gate = CreateGate(options, new GitHubGate(githubHttp, gateApp), new RouterReviewer(reviewerHttp, routerKey), reviewPanel, workspaces, sandbox);
         if (adjustGate is not null)
         {
             gate = adjustGate(gate);
@@ -231,12 +241,26 @@ public static class FactoryRunner
             pauseGrace: pauseGrace,
             gate: gate,
             // Before every dispatch (sc-25387): a frozen factory defers the run.
-            freeze: new FactoryFreeze(Contexts(options), controls, freezeOptions, TimeProvider.System, gate.GitHub),
+            // Failed checks are counted per process (FreezeCheckFailures.Process), across runs and the intake loop's polls.
+            freeze: new FactoryFreeze(Contexts(options), controls, freezeOptions, TimeProvider.System, gate.GitHub, options.ConfiguredRepos,
+                FreezeCheckFailures.Process),
             // A looping worker is interrupted at its next tool boundary and its round fails (sc-25388).
-            stuck: stuck);
+            stuck: stuck,
+            maxControlReadFailures: maxControlReadFailures);
 
         return await pipeline.RunAsync(storyId, ct);
     }
+
+    /// <summary>The reviewers' router client: one reviewer call may take <c>Review:TimeoutMinutes</c>.</summary>
+    internal static HttpClient ReviewerHttp(FactoryOptions options) => OutboundHttp.RouterApi(options.RouterBaseUrl, options.ReviewTimeout);
+
+    /// <summary>
+    /// The merge gate as configured: CI on the PR's head polled every <c>Gate:CiPollSeconds</c> until <c>Gate:CiTimeoutMinutes</c>,
+    /// the new tests run sandboxed for up to <c>Gate:TestTimeoutMinutes</c> each.
+    /// </summary>
+    internal static GateStage CreateGate(FactoryOptions options, IGateGitHub github, IReviewer reviewer, ReviewPanelModels panel, GitWorkspace workspaces,
+        WorkerSandbox? sandbox) =>
+        new(github, reviewer, panel, options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, sandbox, options.TestTimeout));
 
     /// <summary>The sandbox readiness probe, a factory-wide failure (E10): a stale helper fails the factory once, not every item.</summary>
     internal static Task EnsureSandboxReadyAsync(WorkerSandbox sandbox, WorkerAuth auth, CancellationToken ct) =>

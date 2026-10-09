@@ -140,12 +140,24 @@ public sealed class GatewayAnalyzer : DiagnosticAnalyzer
         // The dotnet host that runs `factory work` in the crash acceptance test (DOTNET_HOST_PATH, else dotnet).
         "DarkFactory.AcceptanceTests.CrashRestartTests.DotnetHost");
 
-    /// <summary>Model provider API hosts and key variables (matched case-insensitively).</summary>
-    public static readonly ImmutableArray<string> ProviderMarkers = ImmutableArray.Create(
-        "api.anthropic.com", "api.openai.com", "openai.azure.com", "generativelanguage.googleapis.com",
-        "aiplatform.googleapis.com", "bedrock-runtime", "api.mistral.ai", "api.cohere.ai", "api.cohere.com", "api.groq.com",
-        "openrouter.ai", "api.x.ai", "api.deepseek.com", "api.together.xyz", "api.fireworks.ai",
-        "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "sk-ant-");
+    /// <summary>
+    /// Model provider API hosts and key variables (matched case-insensitively): <c>ProviderMarkers.txt</c>, embedded here and in the
+    /// orchestrator (which refuses a <c>Router:BaseUrl</c> naming one at runtime), so both read the one list.
+    /// </summary>
+    public static readonly ImmutableArray<string> ProviderMarkers = LoadProviderMarkers();
+
+    /// <summary>The embedded name of <c>ProviderMarkers.txt</c> (the same in the orchestrator).</summary>
+    public const string ProviderMarkersResource = "provider-markers.txt";
+
+    private static ImmutableArray<string> LoadProviderMarkers()
+    {
+        using var stream = typeof(GatewayAnalyzer).Assembly.GetManifestResourceStream(ProviderMarkersResource)
+            ?? throw new InvalidOperationException($"The analyzer lacks its embedded {ProviderMarkersResource}.");
+        using var reader = new System.IO.StreamReader(stream);
+        var markers = reader.ReadToEnd().Split('\n').Select(l => l.Trim()).Where(l => l.Length > 0 && !l.StartsWith("#", StringComparison.Ordinal))
+            .ToImmutableArray();
+        return markers.Length > 0 ? markers : throw new InvalidOperationException($"The analyzer's {ProviderMarkersResource} lists no marker.");
+    }
 
     /// <summary>Hosts only the gateway names (matched case-insensitively).</summary>
     public static readonly ImmutableArray<string> ServiceHosts = ImmutableArray.Create("api.github.com", "uploads.github.com", "api.app.shortcut.com");

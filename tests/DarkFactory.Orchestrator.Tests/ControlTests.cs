@@ -137,10 +137,14 @@ public class ControlTests
         public InProcessRunLocks Locks { get; } = new();
         public WorkLedger Ledger => new(Db, TimeProvider.System);
         public TimeSpan PauseGrace { get; init; } = TimeSpan.FromSeconds(30);
+        /// <summary>When set, the run reads its controls through this (to make the reads fail).</summary>
+        public FlakyControls? Flaky { get; set; }
+        public int? MaxReadFailures { get; init; }
 
         public RunPipeline Pipeline(IWorker worker) =>
             new(Stories, Ledger, Locks, Workspaces, worker, Prs, RunPipelineTests.Sandbox, TextWriter.Null,
-                controls: Controls, pauseGrace: PauseGrace, controlPollInterval: TimeSpan.FromMilliseconds(10));
+                controls: (IControls?)Flaky ?? Controls, pauseGrace: PauseGrace, controlPollInterval: TimeSpan.FromMilliseconds(10),
+                maxControlReadFailures: MaxReadFailures);
 
         public Task<RunOutcome> Run(IWorker worker, int story = 77) => Pipeline(worker).RunAsync(story, CancellationToken.None);
 
@@ -444,6 +448,61 @@ public class ControlTests
 
         Assert.Equal(WorkState.Review, resumed.State);
         Assert.Equal(1, worker.Runs); // Continue pushes the finished work; the worker does not run again
+    }
+
+    [Fact]
+    public async Task Controls_unreadable_past_the_limit_pause_the_worker_and_it_resumes_once_they_can_be_read()
+    {
+        var h = new Harness { MaxReadFailures = 3 };
+        h.Flaky = new FlakyControls(h.Controls);
+        var worker = new ToolWorker();
+
+        var run = h.Run(worker);
+        await worker.Working.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        h.Flaky.Broken = true; // the ledger's controls table cannot be read while the worker works
+        var paused = await run.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // Not run blind (E2): after 3 failed reads the 4th counts as a Pause, recorded with the error, worker stopped at a tool boundary.
+        Assert.Equal(WorkState.Paused, paused.State);
+        Assert.False(worker.Cancelled);
+        Assert.True(h.Flaky.Failures >= 4); // the watch may read once more before the worker reaches its tool boundary
+        Assert.Contains("its controls could not be read more than 3 times in a row", paused.Error);
+        Assert.Equal((WorkState.Paused, RunPipeline.ControlsUnreadablePaused), (await h.Transitions())[^1]);
+        var recorded = (await h.Rows()).Single(r => r.Step == RunPipeline.Steps.ControlsUnreadable);
+        Assert.Equal("4 reads in a row failed; the last: InvalidOperationException: the controls table cannot be read", recorded.Detail);
+        Assert.Equal(StepOutcome.Failed, recorded.Outcome);
+        Assert.DoesNotContain(h.Workspaces.Calls, c => c.StartsWith("remove") || c.StartsWith("push")); // worktree kept
+
+        // Readable again and nothing pauses it: it resumes on its own, in the same session.
+        h.Flaky.Broken = false;
+        Assert.Equal([77], await h.InFlight());
+        var resumed = await h.Run(worker);
+        Assert.True(resumed.Succeeded, resumed.Error);
+        Assert.Equal([null, Session], worker.Resumes);
+    }
+
+    [Fact]
+    public async Task Controls_unreadable_fewer_times_than_the_limit_leave_the_worker_running()
+    {
+        var h = new Harness { MaxReadFailures = 3 };
+        h.Flaky = new FlakyControls(h.Controls);
+        var worker = new GatedWorker(anotherToolCall: true);
+        var run = h.Run(worker);
+        await worker.Working.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        h.Flaky.FailNext = 3;
+        while (h.Flaky.Failures < 3)
+        {
+            await Task.Delay(10);
+        }
+        await Task.Delay(100); // a few good reads after them
+        worker.Release.SetResult();
+
+        var outcome = await run.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.False(worker.PauseRequested.Task.IsCompleted); // 3 failures in a row is the limit, not past it
+        Assert.False(worker.Denied);
+        Assert.Equal(WorkState.Review, outcome.State);
+        Assert.DoesNotContain(await h.Rows(), r => r.Step == RunPipeline.Steps.ControlsUnreadable);
     }
 
     [Fact]

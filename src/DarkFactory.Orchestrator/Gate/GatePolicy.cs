@@ -31,7 +31,7 @@ public sealed record RiskThreshold(int MaxChangedLines, int MaxChangedFiles, int
 /// risk:
 ///   max_changed_lines: 800
 ///   max_changed_files: 40
-///   max_fix_rounds: 2
+///   max_fix_rounds: 2             # 1-3: lowers the factory's hard cap (Lifecycle.MaxFixRounds), never raises it
 /// </code>
 /// A path is in the first of sealed, protected, free whose patterns match it (<see cref="PathPattern"/>: anchored at the
 /// root; sealed and protected patterns match case-insensitively, free ones case-sensitively, so a path's case can only
@@ -186,7 +186,9 @@ public sealed class GatePolicy
 
         var riskNode = Mapping(root, "risk", "the top level");
         Expect(riskNode, ["max_changed_lines", "max_changed_files", "max_fix_rounds"], "risk");
-        var risk = new RiskThreshold(Int(riskNode, "max_changed_lines", 1), Int(riskNode, "max_changed_files", 1), Int(riskNode, "max_fix_rounds", 0));
+        // max_fix_rounds can only lower the factory's hard cap (Lifecycle.MaxFixRounds), never raise it: 1 to that cap.
+        var risk = new RiskThreshold(Int(riskNode, "max_changed_lines", 1), Int(riskNode, "max_changed_files", 1),
+            Int(riskNode, "max_fix_rounds", 1, Ledger.Lifecycle.MaxFixRounds));
 
         var policy = new GatePolicy(tiers, risk);
         var uncovered = MustBeSealedFiles.Where(f => policy.TierOf(f).Tier != Tier.Sealed)
@@ -267,12 +269,15 @@ public sealed class GatePolicy
             .ToList();
     }
 
-    private static int Int(YamlMappingNode node, string key, int min)
+    private static int Int(YamlMappingNode node, string key, int min, int? max = null)
     {
         var text = Scalar(node, key, "risk");
-        return text is not null && text.All(char.IsAsciiDigit) && int.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var value) && value >= min
+        return text is not null && text.All(char.IsAsciiDigit) && int.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var value)
+            && value >= min && (max is null || value <= max)
             ? value
-            : throw new GatePolicyException($"{Path}: risk.{key} must be a whole number of at least {min}.");
+            : throw new GatePolicyException(max is null
+                ? $"{Path}: risk.{key} must be a whole number of at least {min}."
+                : $"{Path}: risk.{key} must be a whole number from {min} to {max} (it can only lower the factory's hard cap of {max} fix rounds).");
     }
 }
 

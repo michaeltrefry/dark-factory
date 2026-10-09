@@ -188,7 +188,8 @@ public class DashboardComponentTests : BunitContext
         var cut = Render<Pipeline>();
 
         var cells = cut.FindAll("tr[data-item='1'] td").Select(td => td.TextContent.Trim()).ToList();
-        Assert.Equal(["sc-1 Story 1", "Review", "acme/widgets", "PR", "1h 05m", "$1.50"], cells.Take(6));
+        // s-2 is running and its cost not measured yet: the sum says it covers one of the two sessions (E5).
+        Assert.Equal(["sc-1 Story 1", "Review", "acme/widgets", "PR", "1h 05m", "$1.50 of 1/2 measured"], cells.Take(6));
         Assert.Equal("https://github.com/acme/widgets/pull/9", cut.Find("td.pr a").GetAttribute("href"));
         Assert.Equal(["sessions/s-1", "sessions/s-2"], cut.FindAll("td.sessions a").Select(a => a.GetAttribute("href")));
         Assert.Equal("#2 (live)", cut.FindAll("td.sessions a")[1].TextContent);
@@ -244,6 +245,7 @@ public class DashboardComponentTests : BunitContext
         var cut = Render<Session>(p => p.Add(x => x.SessionId, TranscriptLines.Sid));
         cut.WaitForAssertion(() => Assert.Equal("quiet: no event for 12m 00s", cut.Find(".quiet").TextContent));
         Assert.Contains("running (live)", cut.Find(".status").TextContent);
+        Assert.EndsWith("cost N/A", cut.Find(".meta").TextContent.Trim()); // not measured yet: N/A, never a dash or $0 (E5)
 
         _viewers.Send([new SessionEventMessage(2, "assistant", "text", TranscriptLines.All[1], time.GetUtcNow())]);
         cut.WaitForAssertion(() => Assert.Empty(cut.FindAll(".quiet")));
@@ -254,15 +256,22 @@ public class DashboardComponentTests : BunitContext
     }
 
     [Fact]
-    public void A_zero_cost_shows_as_zero_dollars_and_an_unknown_cost_as_a_dash()
+    public void A_zero_cost_shows_as_zero_dollars_an_unmeasured_one_as_n_a_and_a_partial_sum_says_what_it_covers()
     {
-        // A session served on the router's local model costs $0, which is known spend, not missing spend.
-        _data.Rows = [Row(1, WorkState.Review, cost: 0m), Row(2, WorkState.Review)];
+        // A session served on the router's local model costs $0, which is known spend, not missing spend (E5).
+        _data.Rows =
+        [
+            Row(1, WorkState.Review, null, 0m, new SessionLink("s-1", 1, Now, Now, "succeeded", 0m)),
+            Row(2, WorkState.Review, null, null, new SessionLink("s-2", 1, Now, Now, "failed", null)),
+            Row(3, WorkState.Review, null, 0.4m, new SessionLink("s-3", 1, Now, Now, "succeeded", 0.4m), new SessionLink("s-4", 2, Now, Now, "failed", null),
+                new SessionLink("s-5", 3, Now, Now, "succeeded", null)),
+        ];
 
         var cut = Render<Pipeline>();
 
         Assert.Equal("$0.00", cut.Find("tr[data-item='1'] td.cost").TextContent);
-        Assert.Equal("—", cut.Find("tr[data-item='2'] td.cost").TextContent);
+        Assert.Equal("N/A", cut.Find("tr[data-item='2'] td.cost").TextContent);
+        Assert.Equal("$0.40 of 1/3 measured", cut.Find("tr[data-item='3'] td.cost").TextContent);
     }
 
     [Fact]

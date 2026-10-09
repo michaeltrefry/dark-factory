@@ -1,0 +1,21 @@
+# Model provider API hosts and key variables (matched case-insensitively), one per line; '#' starts a comment.
+# The one list of them: the gateway lint (GatewayAnalyzer.ProviderMarkers, DF0003) and the orchestrator's runtime check of
+# Router:BaseUrl (Gateway/ProviderMarkers.cs) both embed this file. Phase 1 E1: every model call goes through the router only.
+api.anthropic.com
+api.openai.com
+openai.azure.com
+generativelanguage.googleapis.com
+aiplatform.googleapis.com
+bedrock-runtime
+api.mistral.ai
+api.cohere.ai
+api.cohere.com
+api.groq.com
+openrouter.ai
+api.x.ai
+api.deepseek.com
+api.together.xyz
+api.fireworks.ai
+ANTHROPIC_API_KEY
+OPENAI_API_KEY
+sk-ant-

@@ -15,9 +15,42 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     public const string DefaultConnectionString =
         "Host=localhost;Port=5434;Database=factory;Username=factory;Password=factory";
 
-    public Uri RouterBaseUrl => new(config["Router:BaseUrl"] ?? "http://localhost:8080");
+    /// <summary>
+    /// <c>Router:BaseUrl</c> (default <c>http://localhost:8080</c>): the Weave router every model call goes through. An absolute
+    /// http(s) URL naming no model provider (<see cref="Gateway.ProviderMarkers"/>, the gateway lint's list): the lint sees only the
+    /// code, so a provider host given through configuration is refused here (Phase 1 E1), and the factory refuses to start.
+    /// </summary>
+    public Uri RouterBaseUrl
+    {
+        get
+        {
+            var text = config["Router:BaseUrl"] ?? "http://localhost:8080";
+            if (!Uri.TryCreate(text, UriKind.Absolute, out var url) || url.Scheme is not ("http" or "https"))
+            {
+                throw new InvalidOperationException($"Router:BaseUrl must be an absolute http(s) URL, not '{text}'.");
+            }
+            return Gateway.ProviderMarkers.In(text) is { } provider
+                ? throw new InvalidOperationException(
+                    $"Router:BaseUrl names a model provider ('{provider}'): every model call goes through the Weave router only (Phase 1 E1).")
+                : url;
+        }
+    }
 
-    public RepoRef DefaultRepo => RepoRef.Parse(config["Factory:DefaultRepo"] ?? "michaeltrefry/dark-factory-sandbox");
+    /// <summary><c>Factory:DefaultRepo</c> (default the sandbox repo): an <c>owner/name</c>, else the factory refuses to start.</summary>
+    public RepoRef DefaultRepo
+    {
+        get
+        {
+            try
+            {
+                return RepoRef.Parse(config["Factory:DefaultRepo"] ?? "michaeltrefry/dark-factory-sandbox");
+            }
+            catch (ArgumentException ex)
+            {
+                throw new InvalidOperationException($"Factory:DefaultRepo: {ex.Message}", ex);
+            }
+        }
+    }
 
     /// <summary>
     /// Clones and worktrees. Sandboxed, it must be readable by the worker user and outside both
@@ -83,8 +116,8 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         }
     }
 
-    /// <summary><c>Intake:PollSeconds</c>: how often <c>factory work</c> polls the board.</summary>
-    public TimeSpan PollInterval => TimeSpan.FromSeconds(config.GetValue("Intake:PollSeconds", 60));
+    /// <summary><c>Intake:PollSeconds</c> (&gt; 0, default 60): how often <c>factory work</c> polls the board.</summary>
+    public TimeSpan PollInterval => Positive("Intake:PollSeconds", 60, TimeSpan.FromSeconds);
 
     /// <summary><c>Intake:MaxItemFailures</c>: runs of one item in a row that may fail before <c>factory work</c> gives up on it (E10).</summary>
     public int MaxItemFailures => config.GetValue("Intake:MaxItemFailures", WorkSources.IntakeOptions.DefaultMaxItemFailures) is var n && n > 0
@@ -93,8 +126,9 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
 
     /// <summary>
     /// The automatic freeze's thresholds (<see cref="Controls.FreezeOptions"/>): <c>Freeze:MaxConsecutiveFailures</c> (≥ 1),
-    /// <c>Freeze:HotFileMerges</c> (≥ 2), <c>Freeze:HotFileWindowHours</c> (&gt; 0), <c>Freeze:CostRisingRounds</c> (≥ 1). A value
-    /// out of range throws (the factory refuses to start).
+    /// <c>Freeze:HotFileMerges</c> (≥ 2), <c>Freeze:HotFileWindowHours</c> (&gt; 0), <c>Freeze:CostRisingRounds</c> (≥ 1),
+    /// <c>Freeze:CheckFailedEvaluations</c> (≥ 1), <c>Freeze:CheckFailedMinutes</c> (&gt; 0). A value out of range throws (the
+    /// factory refuses to start).
     /// </summary>
     public Controls.FreezeOptions Freeze => new()
     {
@@ -104,13 +138,25 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
             ? TimeSpan.FromHours(hours)
             : throw new InvalidOperationException("Freeze:HotFileWindowHours must be more than 0."),
         CostRisingRounds = AtLeast("Freeze:CostRisingRounds", Controls.FreezeOptions.DefaultCostRisingRounds, 1),
+        CheckFailedEvaluations = AtLeast("Freeze:CheckFailedEvaluations", Controls.FreezeOptions.DefaultCheckFailedEvaluations, 1),
+        CheckFailedWindow = Positive("Freeze:CheckFailedMinutes", Controls.FreezeOptions.DefaultCheckFailedMinutes, TimeSpan.FromMinutes),
     };
 
-    private int AtLeast(string key, int fallback, int min) =>
-        config.GetValue(key, fallback) is var n && n >= min ? n : throw new InvalidOperationException($"{key} must be at least {min}.");
+    /// <summary>
+    /// The repos the factory is configured to work on (<see cref="DefaultRepo"/> and <see cref="WatchedIssueRepos"/>): the
+    /// freeze's main-red trigger reads these and the repos of non-terminal items.
+    /// </summary>
+    public IReadOnlyList<string> ConfiguredRepos => [DefaultRepo.FullName, .. WatchedIssueRepos.Select(r => r.FullName)];
 
-    /// <summary><c>Usage:PollSeconds</c>: how often <c>factory work</c> reads the router's subscription usage.</summary>
-    public TimeSpan UsagePollInterval => TimeSpan.FromSeconds(config.GetValue("Usage:PollSeconds", 60));
+    private int AtLeast(string key, int fallback, int min) =>
+        config.GetValue(key, fallback) is var n && n >= min ? n : throw new InvalidOperationException($"{key} must be at least {min}, not {n}.");
+
+    /// <summary>A duration key: more than 0 (0 or less would make a tight loop or an instant timeout), else the factory refuses to start.</summary>
+    private TimeSpan Positive(string key, double fallback, Func<double, TimeSpan> unit) =>
+        config.GetValue(key, fallback) is var n && n > 0 ? unit(n) : throw new InvalidOperationException($"{key} must be more than 0, not {n}.");
+
+    /// <summary><c>Usage:PollSeconds</c> (&gt; 0, default 60): how often <c>factory work</c> reads the router's subscription usage.</summary>
+    public TimeSpan UsagePollInterval => Positive("Usage:PollSeconds", 60, TimeSpan.FromSeconds);
 
     /// <summary>
     /// <c>Router:CostSettleSeconds</c>: after the router first reports a session's cost, wait this long and read it once
@@ -120,8 +166,13 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         ? TimeSpan.FromSeconds(s)
         : throw new InvalidOperationException("Router:CostSettleSeconds must not be negative.");
 
-    /// <summary>Port of the <c>factory work</c> host (dashboard and session hub), on 127.0.0.1 and <see cref="DashboardBindAddress"/>.</summary>
-    public int HostPort => config.GetValue("Factory:HostPort", 47822);
+    /// <summary>
+    /// <c>Factory:HostPort</c> (0–65535, 0 = any free port; default 47822): port of the <c>factory work</c> host (dashboard and session hub), on
+    /// 127.0.0.1 and <see cref="DashboardBindAddress"/>.
+    /// </summary>
+    public int HostPort => config.GetValue("Factory:HostPort", 47822) is var port && port is >= 0 and <= 65535
+        ? port
+        : throw new InvalidOperationException($"Factory:HostPort must be a port from 0 (any free port) to 65535, not {port}.");
 
     /// <summary>
     /// <c>Dashboard:BindAddress</c>: one private-network address (assigned to a local interface) the host
@@ -138,7 +189,14 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
 
     private static string? NullIfBlank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
-    public TimeSpan WorkerTimeout => TimeSpan.FromMinutes(config.GetValue("Worker:TimeoutMinutes", 30));
+    /// <summary><c>Worker:TimeoutMinutes</c> (&gt; 0, default 30): the longest one worker session may run.</summary>
+    public TimeSpan WorkerTimeout => Positive("Worker:TimeoutMinutes", 30, TimeSpan.FromMinutes);
+
+    /// <summary>
+    /// <c>Controls:MaxReadFailures</c> (≥ 1, default <see cref="RunPipeline.DefaultMaxControlReadFailures"/>): reads of an item's
+    /// controls in a row that may fail while its worker or the gate's test runs go on; the next counts as a Pause.
+    /// </summary>
+    public int MaxControlReadFailures => AtLeast("Controls:MaxReadFailures", RunPipeline.DefaultMaxControlReadFailures, 1);
 
     /// <summary>
     /// How long a paused worker may take to reach its next tool boundary before it is stopped anyway. It must be longer
@@ -245,20 +303,32 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         ? list.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList()
         : null;
 
-    /// <summary><c>Review:TimeoutMinutes</c> (default 10): the longest one reviewer call may take.</summary>
-    public TimeSpan ReviewTimeout => TimeSpan.FromMinutes(config.GetValue("Review:TimeoutMinutes", 10));
+    /// <summary><c>Review:TimeoutMinutes</c> (&gt; 0, default 10): the longest one reviewer call may take.</summary>
+    public TimeSpan ReviewTimeout => Positive("Review:TimeoutMinutes", 10, TimeSpan.FromMinutes);
 
-    /// <summary><c>Gate:CiPollSeconds</c> (default 30): how often CI on the PR's head is read while it runs.</summary>
-    public TimeSpan CiPollInterval => TimeSpan.FromSeconds(config.GetValue("Gate:CiPollSeconds", GateStage.DefaultCiPollInterval.TotalSeconds));
+    /// <summary><c>Gate:CiPollSeconds</c> (&gt; 0, default 30): how often CI on the PR's head is read while it runs (0 would poll GitHub in a tight loop).</summary>
+    public TimeSpan CiPollInterval => Positive("Gate:CiPollSeconds", GateStage.DefaultCiPollInterval.TotalSeconds, TimeSpan.FromSeconds);
 
-    /// <summary><c>Gate:CiTimeoutMinutes</c> (default 30): CI still running after this escalates the item.</summary>
-    public TimeSpan CiTimeout => TimeSpan.FromMinutes(config.GetValue("Gate:CiTimeoutMinutes", GateStage.DefaultCiTimeout.TotalMinutes));
+    /// <summary><c>Gate:CiTimeoutMinutes</c> (&gt; 0, default 30): CI still running after this escalates the item.</summary>
+    public TimeSpan CiTimeout => Positive("Gate:CiTimeoutMinutes", GateStage.DefaultCiTimeout.TotalMinutes, TimeSpan.FromMinutes);
 
     /// <summary>
-    /// <c>Gate:TestTimeoutMinutes</c> (default 20): one sandboxed run (restore, build, the new tests) of the
+    /// <c>Gate:TestTimeoutMinutes</c> (&gt; 0, default 20): one sandboxed run (restore, build, the new tests) of the
     /// <c>new-tests-fail-on-base</c> check; a run still going after this fails the check.
     /// </summary>
-    public TimeSpan TestTimeout => TimeSpan.FromMinutes(config.GetValue("Gate:TestTimeoutMinutes", Gate.SandboxTestRunner.DefaultTimeout.TotalMinutes));
+    public TimeSpan TestTimeout => Positive("Gate:TestTimeoutMinutes", Gate.SandboxTestRunner.DefaultTimeout.TotalMinutes, TimeSpan.FromMinutes);
+
+    /// <summary>
+    /// Reads every non-secret setting that has a rule, so a value out of range fails at start-up with its key named
+    /// (<see cref="InvalidOperationException"/>; the review panel's models are checked apart, <see cref="ReviewPanel"/>), not
+    /// mid-run. <c>factory run</c> and <c>factory work</c> call it before anything else and exit 2 on a failure.
+    /// </summary>
+    public void ValidateSettings()
+    {
+        _ = (RouterBaseUrl, DefaultRepo, WorkerSandbox, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures);
+        _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
+        _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout);
+    }
 
     public bool TryGet(Func<FactoryOptions, string> secret, out string? value)
     {

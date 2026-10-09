@@ -110,7 +110,7 @@ public static class StepOutcomes
             _ => StepOutcome.Failed,
         },
         RunPipeline.Steps.CiFailure or RunPipeline.Steps.MergeConflict or RunPipeline.Steps.Stuck or RunPipeline.Steps.StuckRetry
-            or RunPipeline.Steps.WorktreeLost or Issues.IssueSteps.Refused => StepOutcome.Failed,
+            or RunPipeline.Steps.WorktreeLost or RunPipeline.Steps.ControlsUnreadable or Issues.IssueSteps.Refused => StepOutcome.Failed,
         RunPipeline.Steps.EscalationComment => detail == "posted" ? StepOutcome.Passed : StepOutcome.Failed,
         Issues.IssueSteps.RoutedToHuman => StepOutcome.Escalated,
         RunPipeline.Steps.PrReport or RunPipeline.Steps.Closeout =>
