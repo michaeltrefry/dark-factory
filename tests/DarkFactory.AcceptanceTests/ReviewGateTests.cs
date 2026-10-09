@@ -86,10 +86,17 @@ public class ReviewGateTests
 
         var history = await e2e.HistoryAsync(storyId, ct);
         var reviewedFirst = Assert.IsType<string>(pusher.ReviewedFirst);
-        Assert.NotEqual(reviewedFirst, Assert.IsType<string>(pusher.PushedSha));
-        // The push voided the first verdict: back to Review, and only a head with a passing verdict went through the gate. Whether
-        // a fix round ran on the way (after either review) is the panel's call, so the exact transitions are not pinned.
-        var problems = PushAfterVerdict.Problems(history, reviewedFirst);
+        var pushed = Assert.IsType<string>(pusher.PushedSha);
+        Assert.NotEqual(reviewedFirst, pushed);
+        // The push voided the first (passing) verdict: from CI back to Review for the pushed head, which was reviewed, and only a
+        // head with a passing verdict went through the gate. A fix round after the pushed head's review is the panel's call, so
+        // the exact transitions are not pinned; a run that never took the push-after-verdict path fails as inconclusive.
+        var problems = PushAfterVerdict.Problems(history, reviewedFirst, pushed);
+        if (problems.Any(p => p.StartsWith(PushAfterVerdict.Inconclusive, StringComparison.Ordinal)))
+        {
+            Assert.Fail($"{PushAfterVerdict.Inconclusive}: this run did not exercise the push after a passing verdict (rerun on a fresh story): "
+                + string.Join("; ", problems));
+        }
         Assert.True(problems.Count == 0, string.Join("; ", problems));
         Assert.Equal([WorkState.MergeGate, WorkState.Merge, WorkState.Watch], history.Where(e => e.Step is null).Select(e => e.State).TakeLast(3));
         Assert.All(RunPipeline.Verdicts(history), AssertClaudePanel);

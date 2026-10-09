@@ -1,5 +1,5 @@
 diff --git a/src/WordCount/WordCountOptions.cs b/src/WordCount/WordCountOptions.cs
-index 3b18e51..9f2c4aa 100644
+index 4c29f62..a1d07be 100644
 --- a/src/WordCount/WordCountOptions.cs
 +++ b/src/WordCount/WordCountOptions.cs
 @@ -6,4 +6,7 @@ namespace WordCount;
@@ -11,7 +11,7 @@ index 3b18e51..9f2c4aa 100644
 +    public bool IgnoreBlankInput => config.GetValue("WordCount:IgnoreBlankInput", true);
  }
 diff --git a/src/WordCount/WordCounter.cs b/src/WordCount/WordCounter.cs
-index 51d0a3c..c3e7f12 100644
+index 62e1b4d..d84a5f0 100644
 --- a/src/WordCount/WordCounter.cs
 +++ b/src/WordCount/WordCounter.cs
 @@ -5,6 +5,8 @@ public static class WordCounter
