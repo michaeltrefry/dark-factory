@@ -172,7 +172,10 @@ Owner set-up, once (the test skips naming whichever is missing):
 
 1. `factory github-app setup --gate`, then install the gate App on the sandbox repo.
 2. `factory github-repo protect michaeltrefry/dark-factory-sandbox` again, so the "only admins write outside factory/**"
-   ruleset lists the gate App as a `pull_request`-mode bypass actor (it may merge PRs, never push).
+   ruleset lists the gate App as a `pull_request`-mode bypass actor (it may merge PRs, never push). Re-run it once more
+   after sc-25391's ruleset fix merged (a `protect` from before it left `require_extra_approval_for_unattributed_changes`
+   at GitHub's default `true` on the main ruleset, which blocks every PR of unsigned commits — sandbox PR #6 among
+   them); it must end with three `verified ruleset` lines, and then sandbox PR #6 is no longer blocked.
 3. A committed `factory/gate.yaml` on the sandbox's main in the version-2 format (sc-25381: path tiers and a risk
    threshold; michaeltrefry/dark-factory-sandbox#6). A version-1 policy is rejected: every review escalates. The gate
    stories must change only normal or free paths (e.g. `src/Sandbox/`, `tests/`), small enough for the risk threshold —

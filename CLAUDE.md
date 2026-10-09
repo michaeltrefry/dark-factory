@@ -422,6 +422,12 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   repo admins may write refs outside `factory/**` (needs GitHub Pro for private personal repos).
   With the gate App's id known (`github-app setup --gate`), that ruleset also lists the gate App as a bypass actor in
   `pull_request` mode only: it may merge a PR past it, never push.
+  The main ruleset's `pull_request` rule sends every parameter GitHub takes (`RepoProtection.MainPullRequest`: 0
+  approvals, no stale-dismiss/code-owner/last-push/thread-resolution, `require_extra_approval_for_unattributed_changes:
+  false`, `required_reviewers: []`, `allowed_merge_methods: merge, squash, rebase`) — a left-out one takes GitHub's
+  default, and the unattributed-changes default (`true`) blocked every PR of unsigned (worker) commits. After each
+  write, `protect` reads the ruleset back and exits 1 naming every field or parameter GitHub holds otherwise (including
+  one it stores that was not sent). Re-running `protect` overwrites same-named rulesets (PUT), so it repairs them.
   That `~ALL` ruleset also stops non-admin integrations (Dependabot, `GITHUB_TOKEN` Actions deploys such as
   `gh-pages`) from writing any branch outside `factory/**`.
   Workers get no git/gh tools and run as `_factory`, which cannot reach the owner's keychain (App key) or
