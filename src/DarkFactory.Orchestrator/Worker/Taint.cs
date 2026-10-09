@@ -118,6 +118,19 @@ public static class Taint
     /// </summary>
     public static string? OfRepoSettings(string worktree)
     {
+        // A .claude that is a symlink (or not a directory) is never read through: it taints.
+        var claude = new FileInfo(Path.Combine(worktree, ".claude"));
+        try
+        {
+            if (claude.LinkTarget is not null || (claude.Exists && !Directory.Exists(claude.FullName)))
+            {
+                return RepoSettings;
+            }
+        }
+        catch (IOException)
+        {
+            return RepoSettings;
+        }
         foreach (var file in RepoSettingsFiles)
         {
             if (Read(Path.Combine(worktree, file)) is not { } settings)

@@ -62,9 +62,13 @@ public static class SafeFile
             {
                 total += read;
             }
-            return total > MaxBytes
-                ? new(null, $"is larger than {MaxBytes} bytes")
-                : new(new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true).GetString(buffer, 0, total), null);
+            if (total > MaxBytes)
+            {
+                return new(null, $"is larger than {MaxBytes} bytes");
+            }
+            // A UTF-8 byte order mark is not text: JSON parsers (Claude Code's included) skip it, so it must not make the file unreadable.
+            var start = total >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF ? 3 : 0;
+            return new(new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true).GetString(buffer, start, total - start), null);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OutOfMemoryException or DecoderFallbackException
             or NotSupportedException or ArgumentException)
@@ -73,17 +77,27 @@ public static class SafeFile
         }
     }
 
-    /// <summary><c>O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC</c> for this platform.</summary>
-    private static int OpenFlags()
+    private static int OpenFlags() => OpenFlags(OperatingSystem.IsMacOS(), OperatingSystem.IsLinux(), RuntimeInformation.ProcessArchitecture);
+
+    /// <summary>
+    /// <c>O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC</c> for the platform: macOS, or Linux on an architecture whose values are known
+    /// (x64; arm64 and 32-bit arm, where <c>O_NOFOLLOW</c> differs). Anything else throws (fail closed: wrong flags could follow a link
+    /// or block on a FIFO).
+    /// </summary>
+    internal static int OpenFlags(bool macOS, bool linux, Architecture architecture)
     {
-        if (OperatingSystem.IsMacOS())
+        if (macOS)
         {
             return 0x4 | 0x100 | 0x1000000;
         }
-        if (OperatingSystem.IsLinux())
+        if (linux)
         {
-            var noFollow = RuntimeInformation.ProcessArchitecture is Architecture.Arm64 or Architecture.Arm ? 0x8000 : 0x20000;
-            return 0x800 | noFollow | 0x80000;
+            return architecture switch
+            {
+                Architecture.X64 => 0x800 | 0x20000 | 0x80000,
+                Architecture.Arm64 or Architecture.Arm => 0x800 | 0x8000 | 0x80000,
+                _ => throw new PlatformNotSupportedException($"SafeFile has no open flags for Linux on {architecture}."),
+            };
         }
         throw new PlatformNotSupportedException("SafeFile reads only on macOS and Linux.");
     }
