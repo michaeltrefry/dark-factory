@@ -9,8 +9,9 @@ namespace DarkFactory.Orchestrator.Tests;
 public class ReviewFixtureTests
 {
     /// <summary>
-    /// The WordCount files the fixture diffs are written against (the seeded repo's base; the README is laid out like the
-    /// sandbox's: title, one-paragraph description, build commands, then a configuration table).
+    /// The WordCount files the fixture diffs are written against (the seeded repo's base). The README is a synthetic base for
+    /// this fictional WordCount repo: it borrows the sandbox README's opening layout (title, one-paragraph description, the
+    /// <c>sh</c> build/test block) and adds a configuration table, which the sandbox's README does not have.
     /// </summary>
     private static readonly Dictionary<string, string> Base = new()
     {
