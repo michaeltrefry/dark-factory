@@ -203,12 +203,21 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   refused) — `consecutive-failures` (the trailing Escalated rows with no Merge row after them cover `Freeze:MaxConsecutiveFailures`
   distinct items), `hot-file` (one file of one repo in the `merge-files` checkpoints of `Freeze:HotFileMerges` factory merges
   within `Freeze:HotFileWindowHours`; the gate records the PR's base branch and diff files as `merge-files` before every merge),
-  `cost-rising` (an active item's rounds — its last Implement, then each fix round — whose worker sessions' router costs rise
+  `cost-rising` (an active item's — not Merge/Watch/terminal — rounds — its last Implement, then each fix round — whose worker sessions' router costs rise
   strictly `Freeze:CostRisingRounds` times in a row; a round with no session or an unrecorded cost is no evidence), `main-red`
-  (per repo, the base branch's head after the latest factory merge is `Ci.Evaluate` Failed; pending is not red). The run then
+  (a state: per repo, the base branch's head after its latest factory merge over all history is `Ci.Evaluate` Failed; pending is
+  not red; a head a Continue acknowledged — the `red-tip <repo>@<base> <sha>` lines of the cleared freeze's `Detail`, carried
+  into later freezes — is skipped until the head moves). The run then
   returns the typed outcome `deferred` (`RunOutcome.Deferred`, nothing about the item changes); the intake loop ends its poll,
   lists no ready items while the row is set, and shows the deferral (`IntakeStatus.DeferredRun`) and the freeze banner on the
-  pipeline page. Continue rule: each trigger counts only events recorded after the last Continue of the freeze (its row's
+  pipeline page. Each intake poll runs the evaluator too (`IntakeLoop` `freeze`, `FactoryRunner.CreateFreeze`) before any lane
+  is prepared (triage) or listed: frozen or uncheckable, nothing is triaged or listed. Within a run the evaluator also runs
+  before every step but Merge's bookkeeping, before every worker session starts (implement, fixer, CI fixer), before a merge-queue
+  base-update push and right before a merge (`RunPipeline.ThrowIfFrozenAsync`); frozen there, the run pauses like a Pause
+  (Paused `freeze-paused`, also when the check failed and wrote no row). Cost rule: the ledger triggers are read fresh every
+  check; main-red's GitHub reads (base tip per merge, CI per tip) are reused per evaluator for `FactoryFreeze.MainRedCacheTtl`
+  (30 s), except the check right before a merge, which reads them fresh. `continue --freeze` on a factory that is not frozen (no
+  row, or `Running`) is refused ("the factory is not frozen") and writes nothing. Continue rule: each trigger but main-red counts only events recorded after the last Continue of the freeze (its row's
   `ChangedAt`), so a Continue is never re-frozen by the evidence it acknowledged, and a new occurrence after it freezes again;
   a freeze decided on a row a Continue has since changed is not written (`IControls.FreezeAsync` compares `ChangedAt`). An
   unreadable freeze record counts as frozen; a trigger that cannot be checked (ledger or GitHub unreadable) defers the dispatch
