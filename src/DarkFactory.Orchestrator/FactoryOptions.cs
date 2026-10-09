@@ -255,38 +255,24 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     public string GitHubGateAppPrivateKeyPem =>
         Secret("GitHub:Gate:PrivateKeyPem", null, SecretAccounts.GitHubGateAppPrivateKey, "GitHub gate App private key (run `factory github-app setup --gate`)");
 
-    /// <summary>
-    /// The review panel's model lists, each comma-separated and in order of preference: <c>Review:&lt;Role&gt;:Models</c>
-    /// (<c>Correctness</c>, <c>SpecConformance</c>, <c>Security</c>) per role, falling back to <c>Review:Models</c> (default
-    /// <see cref="Gate.ReviewPanelModels.DefaultReviewers"/>), every entry a <see cref="Gate.ReviewModels.FloorText"/>
-    /// (<see cref="Gate.ReviewModels.MeetsReviewFloor"/>); <c>Review:Confirm:Models</c> for the second model that checks a
-    /// blocking finding (default <see cref="Gate.ReviewPanelModels.DefaultConfirmers"/>), every entry a Claude model. An entry
-    /// that breaks its rule throws <see cref="ReviewConfigurationException"/> (the factory refuses to start).
-    /// </summary>
-    public Gate.ReviewPanelModels ReviewPanel
-    {
-        get
-        {
-            var shared = Models("Review:Models", Gate.ReviewPanelModels.DefaultReviewers, Gate.ReviewModels.MeetsReviewFloor, Gate.ReviewModels.FloorText);
-            var roles = Gate.ReviewRoles.All.ToDictionary(r => r,
-                r => Models($"Review:{Gate.ReviewRoles.ConfigName(r)}:Models", shared, Gate.ReviewModels.MeetsReviewFloor, Gate.ReviewModels.FloorText));
-            return new Gate.ReviewPanelModels(roles,
-                Models("Review:Confirm:Models", Gate.ReviewPanelModels.DefaultConfirmers, Gate.ReviewModels.IsClaude, "Claude model"));
-        }
-    }
+    /// <summary>The pinned review-model settings that existed before sc-25626; none is read any more.</summary>
+    public static readonly IReadOnlyList<string> RetiredReviewModelSettings =
+        ["Review:Models", "Review:Correctness:Models", "Review:SpecConformance:Models", "Review:Security:Models", "Review:Confirm:Models"];
 
-    private IReadOnlyList<string> Models(string key, IReadOnlyList<string> fallback, Func<string, bool> eligible, string rule)
+    /// <summary>
+    /// The review panel's models are not configurable (sc-25626, epic E8): every review and second opinion names the router's
+    /// high model class and the router picks the model (<see cref="Gate.ReviewModels"/>). A retired setting that is still set
+    /// (any value, even empty) throws <see cref="ReviewConfigurationException"/> — the factory refuses to start — rather than be
+    /// silently ignored by an owner who expects it to apply.
+    /// </summary>
+    public void RejectReviewModelSettings()
     {
-        var models = config[key] is { } list && !string.IsNullOrWhiteSpace(list)
-            ? list.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList()
-            : fallback;
-        if (models.Count == 0)
+        if (RetiredReviewModelSettings.FirstOrDefault(k => config.GetSection(k).Exists()) is { } key)
         {
-            throw new ReviewConfigurationException($"{key} lists no model (only separators); set it to a {rule} or leave it unset.");
+            throw new ReviewConfigurationException(
+                $"{key} is no longer a setting: reviews and second opinions run on the router's {Gate.ReviewModels.Class} model class "
+                + "and the router picks the model (no reviewer model is pinned); remove it.");
         }
-        return models.FirstOrDefault(m => !eligible(m)) is { } bad
-            ? throw new ReviewConfigurationException($"{key}: '{bad}' is not a {rule}.")
-            : models;
     }
 
     /// <summary>
@@ -318,7 +304,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
 
     /// <summary>
     /// Reads every non-secret setting that has a rule, so a value out of range fails at start-up with its key named
-    /// (<see cref="InvalidOperationException"/>; the review panel's models are checked apart, <see cref="ReviewPanel"/>), not
+    /// (<see cref="InvalidOperationException"/>; a retired review-model setting is refused apart, <see cref="RejectReviewModelSettings"/>), not
     /// mid-run. <c>factory run</c> and <c>factory work</c> call it before anything else and exit 2 on a failure.
     /// </summary>
     public void ValidateSettings()
@@ -372,7 +358,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
 
 public sealed class MissingCredentialException(string message) : Exception(message);
 
-/// <summary>The review panel's model settings are missing or break its rule (<see cref="FactoryOptions.ReviewPanel"/>): the factory refuses to start.</summary>
+/// <summary>A retired review-model setting is set (<see cref="FactoryOptions.RejectReviewModelSettings"/>): the factory refuses to start.</summary>
 public sealed class ReviewConfigurationException(string message) : Exception(message);
 
 public static class ConfigurationExtensions

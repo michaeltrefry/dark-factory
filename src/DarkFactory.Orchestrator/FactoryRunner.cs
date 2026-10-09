@@ -83,8 +83,8 @@ public static class FactoryRunner
     }
 
     /// <summary>
-    /// <c>factory run</c>'s exit code: 0 the run succeeded, 1 it did not, 2 it could not start — the review panel's models
-    /// are missing or break its rule (checked first, before any network call), a credential is missing, or
+    /// <c>factory run</c>'s exit code: 0 the run succeeded, 1 it did not, 2 it could not start — a retired review-model
+    /// setting is set (checked first, before any network call), a credential is missing, or
     /// <paramref name="checkEnrollment"/> found the router unusable — with the reason on <paramref name="stderr"/>.
     /// </summary>
     public static async Task<int> RunCommandAsync(FactoryOptions options, Func<CancellationToken, Task<string?>> checkEnrollment,
@@ -101,7 +101,7 @@ public static class FactoryRunner
         }
         try
         {
-            _ = options.ReviewPanel;
+            options.RejectReviewModelSettings();
             if (await checkEnrollment(ct) is { } enrollmentError)
             {
                 stderr.WriteLine(enrollmentError);
@@ -182,7 +182,7 @@ public static class FactoryRunner
         var appKey = options.GitHubAppPrivateKeyPem;
         var gateAppId = options.GitHubGateAppId;
         var gateAppKey = options.GitHubGateAppPrivateKeyPem;
-        var reviewPanel = options.ReviewPanel;
+        options.RejectReviewModelSettings();
         var sandbox = options.WorkerSandbox;
         var pauseGrace = options.PauseGrace;
         var freezeOptions = options.Freeze;
@@ -217,7 +217,7 @@ public static class FactoryRunner
             return true;
         });
 
-        var gate = CreateGate(options, new GitHubGate(githubHttp, gateApp), new RouterReviewer(reviewerHttp, routerKey), reviewPanel, workspaces, sandbox);
+        var gate = CreateGate(options, new GitHubGate(githubHttp, gateApp), new RouterReviewer(reviewerHttp, routerKey), workspaces, sandbox);
         if (adjustGate is not null)
         {
             gate = adjustGate(gate);
@@ -258,9 +258,9 @@ public static class FactoryRunner
     /// The merge gate as configured: CI on the PR's head polled every <c>Gate:CiPollSeconds</c> until <c>Gate:CiTimeoutMinutes</c>,
     /// the new tests run sandboxed for up to <c>Gate:TestTimeoutMinutes</c> each.
     /// </summary>
-    internal static GateStage CreateGate(FactoryOptions options, IGateGitHub github, IReviewer reviewer, ReviewPanelModels panel, GitWorkspace workspaces,
+    internal static GateStage CreateGate(FactoryOptions options, IGateGitHub github, IReviewer reviewer, GitWorkspace workspaces,
         WorkerSandbox? sandbox) =>
-        new(github, reviewer, panel, options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, sandbox, options.TestTimeout));
+        new(github, reviewer, options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, sandbox, options.TestTimeout));
 
     /// <summary>The sandbox readiness probe, a factory-wide failure (E10): a stale helper fails the factory once, not every item.</summary>
     internal static Task EnsureSandboxReadyAsync(WorkerSandbox sandbox, WorkerAuth auth, string claudePath, CancellationToken ct) =>

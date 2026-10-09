@@ -8,7 +8,7 @@ namespace DarkFactory.Orchestrator.Gate;
 public sealed record OpenFinding(string Role, Finding Finding)
 {
     public override string ToString() =>
-        $"[{Role}] {Finding}{(Finding.Confirmation is { Outcome: Confirmation.Confirmed } c ? $", confirmed by {c.ServedModel ?? c.Model}" : "")} — {Finding.Detail}";
+        $"[{Role}] {Finding}{(Finding.Confirmation is { Outcome: Confirmation.Confirmed } c ? $", confirmed by {c.ServedName}" : "")} — {Finding.Detail}";
 }
 
 /// <summary>
@@ -71,12 +71,13 @@ public static class FixLoop
 
     /// <summary>
     /// The findings a fixer gets for a failed verdict: its blocking findings, when the verdict failed only because of them and
-    /// each was confirmed by a second model. Null when anything else failed it — a role's unusable answer, a required role
-    /// missing, a blocking finding whose second model's answer was unusable — which a fixer cannot act on: that escalates.
+    /// each was confirmed by a second opinion. Null when anything else failed it — a role's unusable answer, a required role
+    /// missing, a blocking finding whose second opinion was unusable, a call not served on the high class
+    /// (<see cref="ReviewModels.Problems"/>) — which a fixer cannot act on: that escalates.
     /// </summary>
     public static IReadOnlyList<OpenFinding>? Fixable(ReviewVerdict verdict)
     {
-        if (verdict.Passed || verdict.Reviews.Any(r => !r.Clean)
+        if (verdict.Passed || verdict.Reviews.Any(r => !r.Clean) || verdict.Reviews.SelectMany(ReviewModels.Problems).Any()
             || ReviewRoles.Required(verdict.RiskyPaths.Count > 0).Any(role => verdict.Reviews.All(r => r.Role != role)))
         {
             return null;
@@ -98,8 +99,8 @@ public static class FixLoop
 
     /// <summary>
     /// Whether a role's review of the fixed commit must be redone on the fixer's push rather than carried: it had a blocking
-    /// finding (or an unusable answer), or its models break the panel's rule (<see cref="ReviewModels.Problems"/>), which the
-    /// merge gate would refuse.
+    /// finding (or an unusable answer), or one of its calls was not served on the high class (<see cref="ReviewModels.Problems"/>),
+    /// which the merge gate would refuse.
     /// </summary>
     public static bool MustReviewAgain(RoleReview review) =>
         !review.Clean

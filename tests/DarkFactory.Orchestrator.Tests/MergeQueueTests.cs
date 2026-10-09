@@ -330,11 +330,11 @@ public class MergeQueueTests
             IReadOnlyList<Finding> findings = Blocking(request) && request.Role == ReviewRoles.Correctness
                 ? [new Finding(Finding.Blocking, "the merge broke it", "src/x.cs", 1, "broken")]
                 : [];
-            return Task.FromResult(new RoleReview(request.Role, request.Model, request.Model, request.Session, request.Prompt.Id, findings, "reviewed"));
+            return Task.FromResult(new RoleReview(request.Role, "claude-opus-5-5", "high", request.Session, request.Prompt.Id, findings, "reviewed"));
         }
 
         public Task<Confirmation> ConfirmAsync(ConfirmRequest request, CancellationToken ct) =>
-            Task.FromResult(new Confirmation(Confirmation.Confirmed, request.Model, request.Model, request.Session, request.Prompt.Id, "checked"));
+            Task.FromResult(new Confirmation(Confirmation.Confirmed, "claude-opus-5-5", "high", request.Session, request.Prompt.Id, "checked"));
 
         public List<ReviewRequest> Snapshot()
         {
@@ -430,7 +430,7 @@ public class MergeQueueTests
         /// <summary>A pipeline as one process would build it: its own ledger context over the shared ledger.</summary>
         public RunPipeline Pipeline() =>
             new(Stories, new WorkLedger(new LedgerDbContext(_options), TimeProvider.System), Locks, Repo, Worker, Repo, Sandbox, Log,
-                controls: Controls, gate: new GateStage(Repo, Reviewer, GatePipelineTests.TestPanel, CiPoll, TimeSpan.FromSeconds(30)));
+                controls: Controls, gate: new GateStage(Repo, Reviewer, CiPoll, TimeSpan.FromSeconds(30)));
 
         public Task<RunOutcome> Run(int story, CancellationToken ct = default) => Pipeline().RunAsync(story, ct);
 

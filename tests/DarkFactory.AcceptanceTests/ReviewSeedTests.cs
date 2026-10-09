@@ -5,9 +5,9 @@ namespace DarkFactory.AcceptanceTests;
 
 /// <summary>
 /// sc-25379 AC3 against real models: the spec-conformance prompt, sent by the production <see cref="RouterReviewer"/> through
-/// the router to the configured spec-conformance model, flags a seeded change that adds a config flag nothing reads, and
-/// the configured second model confirms it; the same flag with a consumer, against a story that asks for it (and with tests),
-/// gets no blocking spec-conformance finding.
+/// the router on the high model class (sc-25626: the router picks the model), flags a seeded change that adds a config flag
+/// nothing reads, and a second opinion (its own high-class call, any model) confirms it; the same flag with a consumer,
+/// against a story that asks for it (and with tests), gets no blocking spec-conformance finding.
 /// (GatePipelineTests covers the plumbing with a fake router; this proves the prompt.) No GitHub or Shortcut state: the
 /// seeded diffs are fixtures. Live: skipped unless FACTORY_E2E=1 and FACTORY_E2E_REVIEW_SEED=1. Spends router tokens.
 /// </summary>
@@ -44,22 +44,22 @@ public class ReviewSeedTests
             Assert.Skip("Set FACTORY_E2E_REVIEW_SEED=1 to run the seeded spec-conformance review against real models.");
         }
         var routerKey = Harness.RequireSecret(o => o.RouterKey);
-        Harness.RequireReviewPanel();
+        Harness.RequireReviewSettings();
         await Harness.RequireRouterAsync();
         return new RouterReviewer(OutboundHttp.RouterApi(Harness.Options.RouterBaseUrl, Harness.Options.ReviewTimeout), routerKey);
     }
 
     private static async Task<RoleReview> SpecConformanceAsync(RouterReviewer reviewer, WorkStory story, string diff, CancellationToken ct)
     {
-        var model = ReviewerChoice.Choose(Harness.Options.ReviewPanel.For(ReviewRoles.SpecConformance), "Review:SpecConformance:Models");
         var review = await reviewer.ReviewAsync(new ReviewRequest(story, "michaeltrefry/dark-factory-sandbox", Pull, diff, Files,
-            ReviewRoles.SpecConformance, ReviewPrompts.For(ReviewRoles.SpecConformance), model, Guid.NewGuid().ToString()), ct);
+            ReviewRoles.SpecConformance, ReviewPrompts.For(ReviewRoles.SpecConformance), Guid.NewGuid().ToString()), ct);
         Assert.True(review.Clean, review.Error);
+        Assert.Equal(ReviewModels.Class, review.ServedClass);
         return review;
     }
 
     [Fact]
-    public async Task The_spec_conformance_prompt_gets_a_real_model_to_flag_an_unused_config_flag_and_a_second_model_confirms_it()
+    public async Task The_spec_conformance_prompt_gets_a_real_model_to_flag_an_unused_config_flag_and_a_second_opinion_confirms_it()
     {
         var reviewer = await RequireLiveAsync();
         var ct = TestContext.Current.CancellationToken;
@@ -75,11 +75,10 @@ public class ReviewSeedTests
                 + string.Join("; ", review.Findings.Select(f => $"[{f.Severity}] {f} — {f.Detail}")));
         }
 
-        var confirmer = ReviewerChoice.ChooseConfirmer(Harness.Options.ReviewPanel.Confirm, [review.Model], review.ServedModel);
         var confirmation = await reviewer.ConfirmAsync(new ConfirmRequest(Story, "michaeltrefry/dark-factory-sandbox", Pull, diff, Files,
-            ReviewRoles.SpecConformance, finding, ReviewPrompts.Confirm, confirmer, Guid.NewGuid().ToString()), ct);
+            ReviewRoles.SpecConformance, finding, ReviewPrompts.Confirm, Guid.NewGuid().ToString()), ct);
         Assert.True(confirmation.Outcome == Confirmation.Confirmed,
-            $"{confirmation.ServedModel ?? confirmer} answered {confirmation.Outcome} on '{finding}': {confirmation.Reason}");
+            $"{confirmation.ServedName} ({confirmation.ServedClass ?? "no class named"}) answered {confirmation.Outcome} on '{finding}': {confirmation.Reason}");
     }
 
     [Fact]

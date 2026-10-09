@@ -55,7 +55,7 @@ internal sealed class E2e : IAsyncDisposable
         // `factory work` runs the whole pipeline, review and merge gate included, which needs the gate's own App.
         Harness.RequireSecret(o => o.GitHubGateAppId);
         Harness.RequireSecret(o => o.GitHubGateAppPrivateKeyPem);
-        Harness.RequireReviewPanel();
+        Harness.RequireReviewSettings();
         Harness.RequireClaude();
         await Harness.RequireRouterAsync();
 

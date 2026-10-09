@@ -9,7 +9,7 @@ namespace DarkFactory.Orchestrator.Gate;
 /// The review panel's roles. Correctness and spec conformance review every change; security one that touches a path whose
 /// tier in <c>factory/gate.yaml</c> requires <c>security-review</c> or that the code floor <see cref="RiskyPaths"/> matches
 /// (<see cref="GatePolicy.SecurityReviewReasons"/>). Each
-/// role has its own prompt file (<see cref="ReviewPrompts"/>) and its own ordered model list (<see cref="ReviewPanelModels"/>).
+/// role has its own prompt file (<see cref="ReviewPrompts"/>); every role reviews on the high model class (<see cref="ReviewModels"/>).
 /// </summary>
 public static class ReviewRoles
 {
@@ -21,15 +21,6 @@ public static class ReviewRoles
 
     /// <summary>The roles that must review a change: security only when its tiers require the security review.</summary>
     public static IReadOnlyList<string> Required(bool risky) => risky ? All : [Correctness, SpecConformance];
-
-    /// <summary>The role's configuration section name (<c>Review:&lt;name&gt;:Models</c>).</summary>
-    public static string ConfigName(string role) => role switch
-    {
-        Correctness => "Correctness",
-        SpecConformance => "SpecConformance",
-        Security => "Security",
-        _ => throw new ArgumentOutOfRangeException(nameof(role), role, "not a review role"),
-    };
 }
 
 /// <summary>One versioned reviewer prompt: its path in the factory repo, its text and the SHA-256 of its bytes.</summary>
@@ -81,39 +72,15 @@ public static class ReviewPrompts
 }
 
 /// <summary>
-/// The panel's model lists, each in order of preference (<see cref="ReviewerChoice"/>). A role reviews with the first of its
-/// list that is a <see cref="ReviewModels.FloorText"/>; a blocking finding is confirmed by the first Claude model of
-/// <see cref="Confirm"/> not pinned to the reviewer's model. Which models the implementer used does not matter.
-/// <c>Review:Models</c> defaults to <see cref="DefaultReviewers"/> (<see cref="FactoryOptions.ReviewPanel"/>).
-/// </summary>
-public sealed record ReviewPanelModels(IReadOnlyDictionary<string, IReadOnlyList<string>> Roles, IReadOnlyList<string> Confirm)
-{
-    /// <summary>
-    /// The default reviewer (owner decision 2026-10-09, sc-25391): the router's catalog has no Opus 5.5 id, and its
-    /// <c>model_mapping</c> serves <c>claude-opus-5</c> as <c>claude-opus-5-5</c> (an upgrade <see cref="ReviewModels.Serves"/> accepts).
-    /// </summary>
-    public static readonly IReadOnlyList<string> DefaultReviewers = ["claude-opus-5"];
-
-    /// <summary>The Claude models the router's catalog offers (2026-10-08), strongest first.</summary>
-    public static readonly IReadOnlyList<string> DefaultConfirmers = ["claude-opus-5", "claude-sonnet-5"];
-
-    /// <summary>Every role with the same <paramref name="reviewers"/>.</summary>
-    public static ReviewPanelModels Uniform(IReadOnlyList<string> reviewers, IReadOnlyList<string>? confirmers = null) =>
-        new(ReviewRoles.All.ToDictionary(r => r, _ => reviewers), confirmers ?? DefaultConfirmers);
-
-    public IReadOnlyList<string> For(string role) =>
-        Roles.TryGetValue(role, out var models) ? models : throw new ReviewerChoiceException($"No reviewer models are configured for the {role} review.");
-}
-
-/// <summary>
-/// A second model's answer on one blocking finding. <see cref="Outcome"/>: <c>confirmed</c> (it reproduces from the code),
-/// <c>not-confirmed</c> (the finding is downgraded to optional), or <c>unusable</c> (no clear answer from the pinned model:
-/// the finding stays blocking, fail-closed).
+/// A second opinion on one blocking finding (its own high-class router session). <see cref="Outcome"/>: <c>confirmed</c> (it
+/// reproduces from the code), <c>not-confirmed</c> (the finding is downgraded to optional), or <c>unusable</c> (no clear answer
+/// on the high class: the finding stays blocking, fail-closed). <see cref="ServedModel"/> and <see cref="ServedClass"/> are what
+/// the router said served the call (the model for reporting; the class is what counts, <see cref="ReviewModels"/>).
 /// </summary>
 public sealed record Confirmation(
     [property: JsonPropertyName("outcome")] string Outcome,
-    [property: JsonPropertyName("model")] string Model,
     [property: JsonPropertyName("served")] string? ServedModel,
+    [property: JsonPropertyName("class")] string? ServedClass,
     [property: JsonPropertyName("session")] string? Session,
     [property: JsonPropertyName("prompt")] string? Prompt,
     [property: JsonPropertyName("reason")] string Reason)
@@ -121,6 +88,10 @@ public sealed record Confirmation(
     public const string Confirmed = "confirmed";
     public const string NotConfirmed = "not-confirmed";
     public const string Unusable = "unusable";
+
+    /// <summary>The served model as reports name it.</summary>
+    [JsonIgnore]
+    public string ServedName => ServedModel ?? "(the router named no served model)";
 }
 
 /// <summary>One finding of a panel role. <see cref="Downgraded"/>: it was blocking, and the second model did not confirm it.</summary>
@@ -151,16 +122,16 @@ public sealed record Finding(
 }
 
 /// <summary>
-/// One panel role's review of one head commit: the model pinned, the model the router said answered, the
-/// router session, the prompt (path and hash), the findings, and <see cref="Error"/> when the answer was unusable (which
+/// One panel role's review of one head commit: the model and the model class the router said served it (the class is what
+/// counts, <see cref="ReviewModels"/>; the model is for reporting), the router session, the prompt (path and hash), the findings, and <see cref="Error"/> when the answer was unusable (which
 /// fails the review).
 /// <see cref="CarriedFrom"/>: after a fix round, a role with no blocking finding is not asked again (sc-25380); its review of
 /// the fixed commit (named here) is carried into the new head's verdict.
 /// </summary>
 public sealed record RoleReview(
     [property: JsonPropertyName("role")] string Role,
-    [property: JsonPropertyName("model")] string Model,
     [property: JsonPropertyName("served")] string? ServedModel,
+    [property: JsonPropertyName("class")] string? ServedClass,
     [property: JsonPropertyName("session")] string? Session,
     [property: JsonPropertyName("prompt")] string? Prompt,
     [property: JsonPropertyName("findings")] IReadOnlyList<Finding> Findings,
@@ -170,6 +141,10 @@ public sealed record RoleReview(
 {
     [JsonIgnore]
     public bool Clean => Error is null;
+
+    /// <summary>The served model as reports name it.</summary>
+    [JsonIgnore]
+    public string ServedName => ServedModel ?? "(the router named no served model)";
 }
 
 public static class ReviewPanel
@@ -177,7 +152,8 @@ public static class ReviewPanel
     /// <summary>
     /// The panel's verdict on <paramref name="headSha"/> (deterministic, E1: models only produce findings). Pass only when
     /// every required role (security when <paramref name="riskyPaths"/> is not empty) reviewed with a usable answer and no
-    /// finding is blocking after confirmation.
+    /// finding is blocking after confirmation. (An answer not served on the high class is unusable already,
+    /// <see cref="RouterReviewer.InterpretReview"/>; the merge gate checks every call's class again, <see cref="ReviewModels.Problems"/>.)
     /// </summary>
     public static ReviewVerdict Decide(string headSha, IReadOnlyList<string> riskyPaths, IReadOnlyList<RoleReview> reviews)
     {
@@ -190,20 +166,20 @@ public static class ReviewPanel
         {
             if (review.Error is { } error)
             {
-                problems.Add($"{review.Role} ({review.ServedModel ?? review.Model}): {error}");
+                problems.Add($"{review.Role} ({review.ServedName}): {error}");
             }
             foreach (var finding in review.Findings.Where(f => f.IsBlocking))
             {
-                var how = finding.Confirmation is { Outcome: Confirmation.Confirmed } c ? $"confirmed by {c.ServedModel ?? c.Model}"
-                    : finding.Confirmation is { } u ? $"unconfirmed, the second model's answer was unusable: {u.Reason}"
-                    : "not checked by a second model";
-                problems.Add($"blocking {review.Role} finding by {review.ServedModel ?? review.Model}, {how}: {finding} — {finding.Detail}");
+                var how = finding.Confirmation is { Outcome: Confirmation.Confirmed } c ? $"confirmed by {c.ServedName}"
+                    : finding.Confirmation is { } u ? $"unconfirmed, the second opinion was unusable: {u.Reason}"
+                    : "not checked by a second opinion";
+                problems.Add($"blocking {review.Role} finding by {review.ServedName}, {how}: {finding} — {finding.Detail}");
             }
         }
         var optional = reviews.Sum(r => r.Findings.Count(f => !f.IsBlocking));
         var downgraded = reviews.Sum(r => r.Findings.Count(f => f.Downgraded));
         var roles = string.Join(", ", reviews.Select(r =>
-            $"{r.Role} by {r.ServedModel ?? r.Model}{(r.CarriedFrom is { } from ? $" (carried from {Ci.Short(from)})" : "")}"));
+            $"{r.Role} by {r.ServedName}{(r.CarriedFrom is { } from ? $" (carried from {Ci.Short(from)})" : "")}"));
         return problems.Count > 0
             ? new ReviewVerdict(headSha, ReviewVerdict.Fail, string.Join("; ", problems), riskyPaths, reviews)
             : new ReviewVerdict(headSha, ReviewVerdict.Pass,

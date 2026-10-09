@@ -112,9 +112,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
 | `GitHub:Gate:AppId`, `GitHub:Gate:PrivateKeyPem` | keychain `github-gate-app-id`, `github-gate-app-private-key` (written by `factory github-app setup --gate`): the merge gate's App, the only credential that merges |
-| `Review:Models` | `claude-opus-5` (`ReviewPanelModels.DefaultReviewers`; owner decision 2026-10-09: the router catalog has no Opus 5.5 id and its `model_mapping` serves `claude-opus-5` as `claude-opus-5-5`) (every panel role's reviewer models in order, unless the role sets its own; each must be a Claude Opus 5 or newer, `ReviewModels.MeetsReviewFloor`, else the factory refuses to start — `ReviewConfigurationException`: `factory run` and `factory work` print the reason and exit 2, before any router call; ids read as `claude-opus-<major>[-.]<minor>[-yyyymmdd]`, where the dotted and dashed spellings are one model everywhere ids are compared — pinned, served, reviewer vs second model — an older Opus, another Claude or another vendor's model is refused; the first entry reviews, whatever models the implementer used) |
-| `Review:Correctness:Models`, `Review:SpecConformance:Models`, `Review:Security:Models` | `Review:Models` (one panel role's own reviewer models, in order; the same Claude Opus 5 or newer rule) |
-| `Review:Confirm:Models` | `claude-opus-5,claude-sonnet-5` (the router catalog's Claude models; second models that confirm a blocking finding: the first Claude model not pinned to the reviewer's pinned id and, once the router named the reviewer's served model, not one it may serve as that model (`ReviewModels.Serves`); a non-Claude entry is refused) |
+| `Review:Models`, `Review:Correctness:Models`, `Review:SpecConformance:Models`, `Review:Security:Models`, `Review:Confirm:Models` | retired (sc-25626, epic E8): no reviewer or second-opinion model is pinned — every panel call names the router's `high` model class. Any of them set (even empty) is refused at start-up (`FactoryOptions.RejectReviewModelSettings`, `ReviewConfigurationException`: `factory run` and `factory work` print the reason and exit 2, before any router call) rather than silently ignored |
 | `Review:TimeoutMinutes` | `10` (> 0: one reviewer call, its whole answer stream included) |
 | `Gate:CiPollSeconds`, `Gate:CiTimeoutMinutes` | `30`, `30` (each > 0: CI on the PR head is polled until it finishes; still running at the timeout escalates) |
 | `Gate:TestTimeoutMinutes` | `20` (> 0: one sandboxed run — restore, build, the new tests — of the `new-tests-fail-on-base` check; still running at the timeout fails the check) |
@@ -371,7 +369,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `RunPipeline.MaxCloseoutAttempts` (3) per merge; after that the dashboard says to post it by hand. `LedgerMetrics` (dashboard
   pipeline page; computed at most once per 60 s, `DashboardData.DefaultMetricsTtl`, and a metrics failure marks only the metrics
   stale) computes cost per merged PR, 14-day revert rate (N/A: no revert
-  data yet), escalation rate, fix rounds per merged PR, reviewer precision (blocking findings a second model confirmed / those it
+  data yet), escalation rate, fix rounds per merged PR, reviewer precision (blocking findings a second opinion confirmed / those it
   answered) and intake-to-merge time; N/A over zero matching items; sandbox/demo items are excluded (`Metrics:*`).
 - One run per item: `RunPipeline` holds a Postgres advisory lock on the item id (`PostgresRunLocks`) for the whole
   run, and `WorkItem.Version` is an optimistic concurrency token, so a stale writer's save throws.
@@ -494,34 +492,37 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `spec-conformance` always, `security` only when the diff touches a path whose tier in the base branch's
   `factory/gate.yaml` lists `security-review` or that the code floor `RiskyPaths` matches (`GatePolicy.SecurityReviewReasons`,
   both recorded in the verdict's risky paths; see the floors under MergeGate below; a missing/invalid policy escalates at
-  Review before any call). Each role reviews with the first entry of its own
-  model list (`Review:<Role>:Models`, else `Review:Models`, default `claude-opus-5`) that is a Claude Opus 5 or newer (owner decisions 2026-10-08 and 2026-10-09:
-  every reviewer and second model is Claude, whichever models the implementer used — there is no cross-family rule;
-  `ReviewModels`/`ReviewerChoice`; a role with no such model escalates before any call). Each role makes one
+  Review before any call). Every review and second opinion runs on the router's `high` model class (owner decision
+  2026-10-09, epic E8, sc-25626; `ReviewModels`, `Router/ModelClass.cs`): no model id is pinned in code or config, the router
+  picks the model inside the class, and any model may review or confirm — including the one that wrote the code, or the
+  one that served the review a second opinion checks (there is no family, version or independence rule). Each role makes one
   router call (`RouterReviewer`: `POST /v1/messages` with `"stream": true` — the router cancels a call that has sent its
   client nothing for 10 s — assembled by `MessageStream`, which fails closed on an `error` event, a stream without
-  `message_stop` or one silent for 2 min; router key only, `x-weave-force-model` pin, its own
-  `X-Claude-Code-Session-Id` so the pin and the cost stay scoped to it) whose system prompt is the role's prompt file and
-  whose message holds the story, the base commit's file list (`IGateGitHub.GetFilesAsync`) and the diff of the PR's head
-  commit. Prompts: `factory/prompts/{correctness,spec-conformance,security,confirm}.md` in this repo, compiled in as
+  `message_stop` or one silent for 2 min; router key only, `x-weave-model-class: high` and never `x-weave-force-model` (the
+  router refuses the two together), body `model` the fixed placeholder `ModelClass.RequestModel` (`default`: no catalog model
+  has it, so no passthrough lane serves it verbatim; the router's in-class pick serves the call — the factory's router key
+  must therefore have no routing-policy caller passthrough or blind-experiment passthrough arm, which 503s
+  `model_class_unavailable` for a body model outside the class and would usage-pause every review in a loop), its own fresh
+  `X-Claude-Code-Session-Id` so the cost stays scoped to it and no worker session or transcript reaches it) whose system
+  prompt is the role's prompt file and whose message holds the story, the base commit's file list
+  (`IGateGitHub.GetFilesAsync`) and the diff of the PR's head commit — nothing else. Prompts: `factory/prompts/{correctness,spec-conformance,security,confirm}.md` in this repo, compiled in as
   embedded resources (`ReviewPrompts`) — never read from the target repo or the PR (which could rewrite the prompt it is
   judged by) nor from disk at run time; changing one is a dark-factory PR. Each role answers findings tagged `blocking` or
-  `optional` (an unknown severity counts as blocking); each blocking finding goes to a second model (`Review:Confirm:Models`:
-  the first Claude model not pinned to the reviewer's pinned id (`ReviewModels.SamePinned`: same id or its dated snapshot) and not one the router may serve as the model that served the review (`ReviewModels.Serves`: with the reviewer pinned `claude-opus-5-5`, a `claude-opus-5` pin may be upgraded to it, so the default list picks `claude-sonnet-5`); none → escalate) with `confirm.md`: not confirmed → downgraded to optional (`downgraded: true`), does not
+  `optional` (an unknown severity counts as blocking); each blocking finding goes to a second opinion (its own high-class router session) with `confirm.md`: not confirmed → downgraded to optional (`downgraded: true`), does not
   block; confirmed, or an unusable confirm answer → stays blocking. Every panel call's session id is generated by the
-  pipeline and checkpointed (`review-session`: "session model sha role prompt-path@sha256:hash"; role `confirm-<role>` for
-  a second model) before the call, so a call that never returns still has a readable cost (E9) and the prompt it used is on
+  pipeline and checkpointed (`review-session`: "session class sha role prompt-path@sha256:hash", class always `high`; role
+  `confirm-<role>` for a second opinion) before the call, so a call that never returns still has a readable cost (E9) and the prompt it used is on
   record; it never goes in a row's `ClaudeSessionId`, which stays the implementer's (outcomes, escalation comments and
   stops read the last one). A Pause/Stop is checked before each panel call. The verdict (`ReviewPanel.Decide`,
   deterministic: pass only when every required role answered cleanly and no finding is blocking after confirmation; it
-  lists the risky paths and every role's model, served model, session, prompt and findings) is a `verdict`
-  checkpoint bound to that head SHA. Anything but a clean findings line from the pinned model is an unusable review and a
-  fail: the router must name the served model and it must be the pinned id or its dated snapshot (`<pinned>-yyyymmdd`,
-  `ReviewModels.Serves`), or — only when the pinned id is a Claude Opus — a Claude Opus of the same or a higher version (the
-  router may upgrade, e.g. `claude-opus-5` served as `claude-opus-5-5`, never downgrade); a non-Opus pin such as
-  `claude-sonnet-5` counts only as itself or its snapshot. A router answer naming no served model, a lower Opus, a non-Opus
-  or a non-Claude model fails closed. Fix loop (sc-25380, `Gate/FixLoop.cs`, `FixAsync`): a fail whose
-  only cause is blocking findings every one of which a second model confirmed (`FixLoop.Fixable`) goes Review → Fixing (row
+  lists the risky paths and, per review and per second opinion, the served model (`served`, for reporting, from the
+  stream's `message_start`) and served class (`class`, from the `X-Weave-Model-Class` response header), session, prompt and
+  findings) is a `verdict` checkpoint bound to that head SHA. Anything but a clean findings line served on the `high` class
+  is an unusable review and a fail; a second opinion not served on it is unusable (the finding stays blocking). A missing or
+  blank class header fails closed (E2). The router's `model_class_unavailable` 503 (no high-class model can serve; it never
+  falls back to another class) and the class's spent-subscription 429 are usage refusals: they pause the factory
+  (`UsagePause.ReviewerRateLimited`) and never escalate. Fix loop (sc-25380, `Gate/FixLoop.cs`, `FixAsync`): a fail whose
+  only cause is blocking findings every one of which a second opinion confirmed (`FixLoop.Fixable`; a review or confirmation not served on the high class makes it unfixable) goes Review → Fixing (row
   Detail = the fixed head); any other fail (an unusable answer, a missing role, an unusable confirmation) escalates. A fix
   round runs a fixer worker exactly like the implementer (same sandbox, router key only, session checkpointed and resumed,
   its models recorded as `implementer-model`) in a worktree restored from the PR branch,
@@ -591,9 +592,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   protected > free whose patterns (`PathPattern`: root-anchored, `*`/`?`/`**`, trailing `/` = directory; sealed and
   protected case-insensitive, free case-sensitive, so case only moves a path to a stricter tier) match, else normal; the change
   needs the union of its tiers' checks: `ci-green`, `review-pass` (the head's verdict passes, holds every required role, and
-  every reviewer is a Claude Opus 5 or newer and every second model a Claude model pinned to another id than its
-  reviewer's and, when both served models are known, served as another model than its reviewer (an Opus upgrade must not
-  make one model confirm its own finding), each served by the router as pinned or, for an Opus pin, as a same-or-newer Opus — `ReviewModels.Problems`; the implementer's models are not consulted), `security-review` (the verdict has the
+  every review and second opinion was served on the router's `high` model class — its recorded `class`, a missing one
+  failing closed — `ReviewModels.Problems`; which model served, and the implementer's models, are not consulted), `security-review` (the verdict has the
   security review), `risk-threshold` (changed lines, files — renames count both paths — and fix rounds within `risk`),
   `new-tests-fail-on-base` (sc-25382, below). A sealed path always escalates (even with no verdict); a protected one escalates after its checks instead of merging; each
   evaluation is a `gate` checkpoint. A head without a verdict (a push after the review) goes back
@@ -668,11 +668,12 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   Upgrading from Phase 1: Review is now a handled state, so the first `factory work` picks up every item parked at Review:
   an open PR is reviewed by the panel like any other (Phase 1's missing `implementer-model` no longer matters, sc-25379),
   and one the owner merged or closed escalates once with a story comment ("merged outside the factory"). An item whose
-  head already has a verdict recorded under the dropped cross-family rule (e.g. a `gpt-5.5` or `claude-opus-4-7` reviewer)
-  is reviewed again once by the current panel (`MergeGate.Superseded`: its models break `ReviewModels.Problems` and it is
-  the only verdict on that head — at Review it is not reused; at MergeGate the gate answers ReviewHead when those are its
-  only reasons), then merges as usual; the current panel's own verdict is a second one on the head, so if its models still
-  break the rule the gate escalates instead of reviewing again. See docs/acceptance.md.
+  head already has a verdict recorded under an earlier panel rule (pinned reviewer models, before sc-25626: no served
+  `class`) is reviewed again once by the current panel (`MergeGate.Superseded`: its calls break `ReviewModels.Problems`
+  and it is the only verdict on that head — at Review it is not reused; at MergeGate the gate answers ReviewHead when those
+  are its only reasons), then merges as usual; the current panel's own verdict is a second one on the head, so if its calls
+  still break the rule the gate escalates instead of reviewing again. The fix loop and CI self-heal never carry such a
+  role's review (`FixLoop.MustReviewAgain`). See docs/acceptance.md.
 - Processes migrate the ledger through `LedgerMigrations.MigrateAsync` (advisory-locked: EF alone lets two concurrent
   migrators apply the same migration) before reading it; tests migrate their temp database before starting a host.
 - Tests: xunit.v3 on Microsoft.Testing.Platform (`global.json` opts in).
