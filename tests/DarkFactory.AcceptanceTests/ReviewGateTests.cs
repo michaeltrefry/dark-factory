@@ -1,6 +1,3 @@
-using System.Net;
-using System.Net.Http.Json;
-using System.Text;
 using System.Text.Json;
 using DarkFactory.Orchestrator;
 using DarkFactory.Orchestrator.Gate;
@@ -81,23 +78,25 @@ public class ReviewGateTests
         await RequireGateReadyAsync(options, ct);
 
         using var shortcutHttp = OutboundHttp.ShortcutApi();
-        var pusher = new PushAfterFirstVerdict(options, options.DefaultRepo, StoryId.BranchName(storyId));
+        using var sandbox = new SandboxRepo(options, options.DefaultRepo);
+        var pusher = new PushAfterFirstVerdict(sandbox, StoryId.BranchName(storyId));
         var outcome = await FactoryRunner.RunAsync(options, FactoryRunner.CreateWorkSource(options, shortcutHttp), storyId, ignoreScope: true,
             Console.Out, ct, gate => gate with { Reviewer = pusher.Wrap(gate.Reviewer) });
         Assert.True(outcome.Succeeded, outcome.Error);
 
         var history = await e2e.HistoryAsync(storyId, ct);
-        var pushed = Assert.IsType<string>(pusher.PushedSha);
-        // Reviewed, then the push voided the verdict at CI: back to Review for the new head, and only then on to the gate.
-        Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Review, WorkState.CI, WorkState.Review, WorkState.CI, WorkState.MergeGate,
-            WorkState.Merge, WorkState.Watch], history.Where(e => e.Step is null).Select(e => e.State));
-        var verdicts = RunPipeline.Verdicts(history);
-        Assert.Equal([pusher.ReviewedFirst, pushed], verdicts.Select(v => v.HeadSha));
-        Assert.All(verdicts, AssertClaudePanel);
-        Assert.Equal([pushed], history.Where(e => e.Step == RunPipeline.Steps.GatePassed).Select(e => e.Detail));
+        var reviewedFirst = Assert.IsType<string>(pusher.ReviewedFirst);
+        Assert.NotEqual(reviewedFirst, Assert.IsType<string>(pusher.PushedSha));
+        // The push voided the first verdict: back to Review, and only a head with a passing verdict went through the gate. Whether
+        // a fix round ran on the way (after either review) is the panel's call, so the exact transitions are not pinned.
+        var problems = PushAfterVerdict.Problems(history, reviewedFirst);
+        Assert.True(problems.Count == 0, string.Join("; ", problems));
+        Assert.Equal([WorkState.MergeGate, WorkState.Merge, WorkState.Watch], history.Where(e => e.Step is null).Select(e => e.State).TakeLast(3));
+        Assert.All(RunPipeline.Verdicts(history), AssertClaudePanel);
+        var merged = history.Last(e => e.Step == RunPipeline.Steps.GatePassed).Detail;
 
         var pr = await MergedPullRequestAsync(options.DefaultRepo, storyId, outcome.PullRequestUrl!, ct);
-        Assert.Equal(pushed, pr.GetProperty("head").GetProperty("sha").GetString());
+        Assert.Equal(merged, pr.GetProperty("head").GetProperty("sha").GetString());
         Assert.Equal(history.Single(e => e.Step is null && e.State == WorkState.Merge).Detail, pr.GetProperty("merge_commit_sha").GetString());
         await AssertTypedOutcomesQueueAndReportsAsync(e2e, options, storyId, pr, ct);
     }
@@ -200,61 +199,48 @@ public class ReviewGateTests
 
     /// <summary>
     /// After the first verdict is recorded-to-be, pushes one more commit to the PR's factory/* branch (as the workers' App,
-    /// which may write only there), as a late push would: that verdict no longer describes the head.
+    /// which may write only there), as a late push would: that verdict no longer describes the head. The commit keeps the
+    /// reviewed tree (<see cref="SandboxRepo.PushSameTreeAsync"/>), so the change stays exactly the story's and a reviewer has
+    /// nothing new to judge — a probe file once got blocked as out of scope — while the head, which the verdict is bound to, moves.
     /// </summary>
-    private sealed class PushAfterFirstVerdict(FactoryOptions options, RepoRef repo, string branch)
+    private sealed class PushAfterFirstVerdict(SandboxRepo sandbox, string branch)
     {
         public string? ReviewedFirst { get; private set; }
         public string? PushedSha { get; private set; }
 
+        private readonly SemaphoreSlim _once = new(1, 1);
+
         public IReviewer Wrap(IReviewer inner) => new Wrapper(this, inner);
+
+        /// <summary>The first call pushes onto <paramref name="head"/>; later ones (other roles' reviews) do nothing.</summary>
+        private async Task PushOnceAsync(string head, CancellationToken ct)
+        {
+            await _once.WaitAsync(ct);
+            try
+            {
+                if (PushedSha is null)
+                {
+                    ReviewedFirst = head;
+                    PushedSha = await sandbox.PushSameTreeAsync(await sandbox.AppTokenAsync(ct), branch, head,
+                        "acceptance: a push after the review verdict (same tree)", ct);
+                }
+            }
+            finally
+            {
+                _once.Release();
+            }
+        }
 
         private sealed class Wrapper(PushAfterFirstVerdict owner, IReviewer inner) : IReviewer
         {
             public async Task<RoleReview> ReviewAsync(ReviewRequest request, CancellationToken ct)
             {
                 var review = await inner.ReviewAsync(request, ct);
-                if (owner.PushedSha is null)
-                {
-                    owner.ReviewedFirst = request.Pull.HeadSha;
-                    owner.PushedSha = await owner.PushAsync(ct);
-                }
+                await owner.PushOnceAsync(request.Pull.HeadSha, ct);
                 return review;
             }
 
             public Task<Confirmation> ConfirmAsync(ConfirmRequest request, CancellationToken ct) => inner.ConfirmAsync(request, ct);
-        }
-
-        private async Task<string> PushAsync(CancellationToken ct)
-        {
-            using var github = OutboundHttp.GitHubApi();
-            var token = (await new GitHubApp(github, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System)
-                .CreateInstallationTokenAsync(repo, ct)).Token;
-            const string path = "factory-e2e/push-after-verdict.txt";
-            string? existing = null;
-            using (var get = GitHubApp.Request(HttpMethod.Get, $"repos/{repo.Owner}/{repo.Name}/contents/{path}?ref={Uri.EscapeDataString(branch)}", "Bearer", token))
-            using (var response = await github.SendAsync(get, ct))
-            {
-                if (response.StatusCode == HttpStatusCode.OK)
-                {
-                    existing = (await response.Content.ReadFromJsonAsync<JsonElement>(ct)).GetProperty("sha").GetString();
-                }
-            }
-            using var put = GitHubApp.Request(HttpMethod.Put, $"repos/{repo.Owner}/{repo.Name}/contents/{path}", "Bearer", token);
-            var body = new Dictionary<string, string>
-            {
-                ["message"] = "acceptance: a push after the review verdict",
-                ["content"] = Convert.ToBase64String(Encoding.UTF8.GetBytes($"pushed after the verdict at {DateTimeOffset.UtcNow:O}\n")),
-                ["branch"] = branch,
-            };
-            if (existing is not null)
-            {
-                body["sha"] = existing; // updating the file a re-run left on the branch
-            }
-            put.Content = JsonContent.Create(body);
-            using var pushed = await github.SendAsync(put, ct);
-            pushed.EnsureSuccessStatusCode();
-            return (await pushed.Content.ReadFromJsonAsync<JsonElement>(ct)).GetProperty("commit").GetProperty("sha").GetString()!;
         }
     }
 }
