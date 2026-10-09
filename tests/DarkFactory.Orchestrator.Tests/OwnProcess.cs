@@ -83,12 +83,12 @@ internal sealed record OwnProcess(int Pid, string Start)
     public static bool Exists(int pid) => StartTimeOf(pid) is not null;
 
     /// <summary>This process is still running (the pid has the recorded start time).</summary>
-    public bool IsAlive => StartTimeOf(Pid) == Start;
+    public bool IsAlive => Pid > 1 && StartTimeOf(Pid) == Start;
 
-    /// <summary>SIGKILL, only while the pid is still this process; otherwise nothing.</summary>
+    /// <summary>SIGKILL, only while the pid is still this process (<see cref="IsAlive"/>); otherwise nothing.</summary>
     public void KillIfStillRunning()
     {
-        if (Pid > 1 && StartTimeOf(Pid) == Start)
+        if (IsAlive)
         {
             SendSignal(Pid, SigKill);
         }

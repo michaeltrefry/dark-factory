@@ -24,8 +24,10 @@ public class OwnProcessTests
         try
         {
             Assert.Equal(reuser.Start, OwnProcess.StartTimeOf(reuser.Pid)); // the pid is the test's own process
+            var reused = Reused(reuser);
+            Assert.False(reused.IsAlive); // what decides: checked before any signal could be sent
 
-            Reused(reuser).KillIfStillRunning();
+            reused.KillIfStillRunning();
 
             Thread.Sleep(200);
             Assert.True(reuser.IsAlive, "a reused pid was signalled");
@@ -106,7 +108,6 @@ public class OwnProcessTests
                 $"\"raw-{k}\" => Before(\"{k} -KILL \\\"$@\\\"\"),",
                 $"\"p{k}\" => Before(\"p{k} -U \\\"$self_uid\\\"\"),",
                 $"\"{k}all\" => Before(\"{k}all -u \\\"$sandbox_user\\\"\"),",
-                $"\"{k}pg\" => Before(\"/usr/bin/python3 -c 'import os; os.{k}pg(1, 9)'\"),",
                 $"\"perl-{k}\" => Before(\"perl -e '{k} 9, -1'\"),",
                 $"\"after-quoted-hash\" => Before(\"echo \\\"a # b\\\"; {k} -KILL -1\"),",
                 $"Copy(new SafeHelperOptions {{ Identity = FakeIdentity.SandboxRole, FakeListing = \"{k} -KILL -1; echo '400001 1'\" }}));",

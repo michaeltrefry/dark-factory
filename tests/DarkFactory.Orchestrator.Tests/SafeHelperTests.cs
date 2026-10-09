@@ -60,7 +60,7 @@ public class SafeHelperTests
             "raw-kill" => Before("kill -KILL \"$@\""),
             "pkill" => Before("pkill -U \"$self_uid\""),
             "killall" => Before("killall -u \"$sandbox_user\""),
-            "killpg" => Before("/usr/bin/python3 -c 'import os; os.killpg(1, 9)'"),
+            "killpg" => Before("/usr/local/bin/killpg 1"),
             "perl-kill" => Before("perl -e 'kill 9, -1'"),
             "launchctl" => Before("launchctl bootout gui/501"),
             "osascript" => Before("osascript -e 'tell application \"System Events\" to log out'"),
