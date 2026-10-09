@@ -735,10 +735,21 @@ public class FreezeTests
     {
         var h = new GatePipelineTests.Harness { Freeze = new FreezeOptions() };
         h.GitHub.Compare = head => head == GatePipelineTests.Sha1 ? new BaseComparison("base1", 1) : new BaseComparison("base1", 0);
+        var seeded = false;
         h.Workspaces.MergeBase = _ =>
         {
-            SeedEscalations(h.Contexts, 3);
+            if (!seeded)
+            {
+                SeedEscalations(h.Contexts, 3);
+                seeded = true;
+            }
             return new BaseMerge("base1", GatePipelineTests.ShaA, []);
+        };
+        // Were it pushed, the PR's head would move to the update (so a run that wrongly pushes still ends).
+        h.Workspaces.OnFastForward = _ =>
+        {
+            h.GitHub.Head = GatePipelineTests.ShaA;
+            return Task.CompletedTask;
         };
 
         var outcome = await h.Run();
