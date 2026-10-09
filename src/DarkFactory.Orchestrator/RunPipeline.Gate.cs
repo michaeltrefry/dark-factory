@@ -1069,8 +1069,10 @@ public sealed partial class RunPipeline
 
     /// <summary>
     /// Merge: the change is merged (the Merge row holds the merge commit); the board shows it and gets the closeout comment, and the PR's
-    /// description is rewritten — both rendered from the ledger (<see cref="LedgerReport"/>, E5) — then Watch. A description that cannot be
-    /// rewritten is recorded (<see cref="Steps.PrReport"/> <c>failed: …</c>), not escalated: the merge stands and the report is only a report.
+    /// description is rewritten — both rendered from the ledger (<see cref="LedgerReport"/>, E5) — then Watch. A closeout or a description
+    /// that cannot be posted is recorded (<see cref="Steps.Closeout"/> or <see cref="Steps.PrReport"/> <c>failed: …</c>), not escalated: the
+    /// merge stands and the report is only a report. A failed closeout shows on the dashboard and is retried from Watch
+    /// (<see cref="CloseoutPending"/>).
     /// </summary>
     private async Task MergeAsync(Run run, CancellationToken ct)
     {
@@ -1085,9 +1087,7 @@ public sealed partial class RunPipeline
         }
         if (!done.Contains(Steps.Closeout))
         {
-            var closeout = LedgerReport.MergedCloseout(run.Item.ExternalId, await ledger.HistoryAsync(run.Item, ct), await ledger.SessionCostsAsync(run.Item, ct));
-            await source.CommentAsync(run.Story.Id, closeout, ct);
-            await ledger.CheckpointAsync(run.Item, Steps.Closeout, null, "posted", ct);
+            await PostCloseoutAsync(run.Item, run.Story.Id, ct);
         }
         if (!done.Contains(Steps.PrReport) && LinkedPullRequestUrl(history) is { } prUrl)
         {
@@ -1106,4 +1106,50 @@ public sealed partial class RunPipeline
         }
         await ledger.RecordAsync(run.Item, WorkState.Watch, null, commit, ct);
     }
+
+    /// <summary>One closeout attempt: posts the merged closeout on the item and records <c>posted</c> or <c>failed: &lt;why&gt;</c>.</summary>
+    private async Task<string?> PostCloseoutAsync(WorkItem item, int storyId, CancellationToken ct)
+    {
+        string? error = null;
+        try
+        {
+            var closeout = LedgerReport.MergedCloseout(item.ExternalId, await ledger.HistoryAsync(item, ct), await ledger.SessionCostsAsync(item, ct));
+            await source.CommentAsync(storyId, closeout, ct);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            error = ex.Message;
+            log.WriteLine($"[{item.State}] could not post the closeout on {item.ExternalId}: {ex.Message}");
+        }
+        await ledger.CheckpointAsync(item, Steps.Closeout, null, error is null ? Posted : $"failed: {error}", ct);
+        return error;
+    }
+
+    /// <summary>The <see cref="Steps.Closeout"/> detail of a closeout that is on the board.</summary>
+    public const string Posted = "posted";
+
+    /// <summary>Closeout attempts per merge (the one at Merge and the retries from Watch) before the factory leaves it to a human.</summary>
+    public const int MaxCloseoutAttempts = 3;
+
+    /// <summary>
+    /// The item's closeout since its latest merge: how many attempts were made, whether one was posted, and the last one's failure. Reads
+    /// only the Merge transitions and <see cref="Steps.Closeout"/> rows of <paramref name="rows"/> (oldest first; other rows may be absent).
+    /// </summary>
+    public static CloseoutStatus CloseoutOf(IEnumerable<LedgerEntry> rows)
+    {
+        var relevant = rows.Where(e => (e.Step is null && e.State == WorkState.Merge) || e.Step == Steps.Closeout).ToList();
+        var attempts = relevant.Skip(relevant.FindLastIndex(e => e.Step is null) + 1).ToList();
+        return new CloseoutStatus(attempts.Count, attempts.Any(a => a.Detail == Posted),
+            attempts.LastOrDefault() is { Detail: { } last } && last != Posted ? last : null);
+    }
+
+    /// <summary>
+    /// Whether an item in Watch has a closeout that failed and may be tried again (fewer than <see cref="MaxCloseoutAttempts"/> attempts):
+    /// the poll lists it (<see cref="InFlightAsync"/>) and its run retries it.
+    /// </summary>
+    public static bool CloseoutPending(WorkState state, IEnumerable<LedgerEntry> rows) =>
+        state == WorkState.Watch && CloseoutOf(rows) is { Posted: false, Attempts: > 0 and < MaxCloseoutAttempts };
 }
+
+/// <summary>An item's closeout since its latest merge (<see cref="RunPipeline.CloseoutOf"/>); <see cref="LastFailure"/> is the last attempt's <c>failed: …</c>.</summary>
+public sealed record CloseoutStatus(int Attempts, bool Posted, string? LastFailure);

@@ -1,6 +1,8 @@
+using DarkFactory.Orchestrator.Dashboard;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Ledger;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Time.Testing;
 
 namespace DarkFactory.Orchestrator.Tests;
 
@@ -127,5 +129,31 @@ public class MetricsTests
         Assert.Equal(("$0.75", 1), (Get(metrics, LedgerMetrics.CostPerMergedPr).Display, Get(metrics, LedgerMetrics.CostPerMergedPr).Sample));
         Assert.Equal("0%", Get(metrics, LedgerMetrics.EscalationRate).Display);
         Assert.Equal("N/A", Get(metrics, LedgerMetrics.ReviewerPrecision).Display);
+    }
+
+    [Fact]
+    public async Task The_dashboard_computes_the_metrics_at_most_once_per_ttl()
+    {
+        var options = new DbContextOptionsBuilder<LedgerDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options;
+        var time = new FakeTimeProvider(T0);
+        var data = new DashboardData(new LedgerDbContextFactory(options), time, metrics: Options);
+        async Task StartItemAsync(string id)
+        {
+            await using var db = new LedgerDbContext(options);
+            var ledger = new WorkLedger(db, TimeProvider.System);
+            var item = await ledger.GetOrCreateAsync("shortcut", id, "Fix", "acme/widgets", null, CancellationToken.None);
+            await ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
+        }
+        int Started(IReadOnlyList<Metric> metrics) => Get(metrics, LedgerMetrics.EscalationRate).Sample;
+
+        await StartItemAsync("sc-1");
+        Assert.Equal(1, Started(await data.MetricsAsync(CancellationToken.None)));
+        await StartItemAsync("sc-2");
+
+        // Within the TTL the ledger change is not recomputed; once it has passed it is.
+        time.Advance(DashboardData.DefaultMetricsTtl - TimeSpan.FromSeconds(1));
+        Assert.Equal(1, Started(await data.MetricsAsync(CancellationToken.None)));
+        time.Advance(TimeSpan.FromSeconds(1));
+        Assert.Equal(2, Started(await data.MetricsAsync(CancellationToken.None)));
     }
 }

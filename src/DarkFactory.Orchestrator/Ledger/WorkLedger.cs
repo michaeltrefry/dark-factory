@@ -141,6 +141,17 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
     public Task<List<LedgerEntry>> HistoryAsync(WorkItem item, CancellationToken ct) =>
         db.LedgerEntries.Where(e => e.WorkItemId == item.Id).OrderBy(e => e.Id).ToListAsync(ct);
 
+    /// <summary>
+    /// The Merge transitions and closeout rows (<see cref="RunPipeline.CloseoutOf"/>) of each of <paramref name="itemIds"/>, oldest first,
+    /// in one read (untracked).
+    /// </summary>
+    public async Task<ILookup<long, LedgerEntry>> CloseoutRowsAsync(IReadOnlyCollection<long> itemIds, CancellationToken ct) =>
+        itemIds.Count == 0 ? Array.Empty<LedgerEntry>().ToLookup(e => e.WorkItemId)
+            : (await db.LedgerEntries.AsNoTracking()
+                .Where(e => itemIds.Contains(e.WorkItemId)
+                    && ((e.Step == null && e.State == WorkState.Merge) || e.Step == RunPipeline.Steps.Closeout))
+                .OrderBy(e => e.Id).ToListAsync(ct)).ToLookup(e => e.WorkItemId);
+
     /// <summary>The router cost of each of the item's worker sessions (null: not recorded), read fresh: the session recorder writes them.</summary>
     public async Task<IReadOnlyList<decimal?>> SessionCostsAsync(WorkItem item, CancellationToken ct) =>
         await db.WorkerSessions.AsNoTracking().Where(s => s.WorkItemId == item.Id).OrderBy(s => s.Id).Select(s => s.CostUsd).ToListAsync(ct);

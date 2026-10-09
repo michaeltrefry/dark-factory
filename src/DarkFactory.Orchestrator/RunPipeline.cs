@@ -319,11 +319,17 @@ public sealed partial class RunPipeline(
         naming ??= ItemNaming.Shortcut;
         var stopping = (await controls.ListAsync(ct)).Where(c => c.State == ControlState.Stopping).Select(c => c.Scope).ToHashSet();
         var ids = new List<int>();
-        foreach (var item in await ledger.ActiveItemsAsync(naming.Source, ct))
+        var active = await ledger.ActiveItemsAsync(naming.Source, ct);
+        // A merged item whose closeout failed is listed until it is posted or its attempts are used up (a run retries it from Watch).
+        var closeouts = handled.Contains(WorkState.Merge)
+            ? await ledger.CloseoutRowsAsync(active.Where(i => i.State == WorkState.Watch).Select(i => i.Id).ToList(), ct)
+            : Array.Empty<LedgerEntry>().ToLookup(e => e.WorkItemId);
+        foreach (var item in active)
         {
             if (!stopping.Contains(ControlScope.Item(item.ExternalId)))
             {
                 var resumable = handled.Contains(item.State)
+                    || CloseoutPending(item.State, closeouts[item.Id])
                     || (item.State == WorkState.Paused && ResumesAutomatically(await ledger.HistoryAsync(item, ct), handled));
                 if (!resumable || await controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) != ControlState.Running)
                 {
@@ -553,6 +559,12 @@ public sealed partial class RunPipeline(
         }
         await ledger.RefreshAsync(item, item.Title, item.Repo, item.EpicId, ct);
         var history = await ledger.HistoryAsync(item, ct);
+        if (gate is not null && CloseoutPending(item.State, history))
+        {
+            // The merge's closeout failed: one more attempt, recorded like the first (bounded by MaxCloseoutAttempts).
+            var error = await PostCloseoutAsync(item, storyId, ct);
+            return await OutcomeAsync(item, error is null ? null : $"{item.ExternalId}: closeout NOT posted: {error}", ct);
+        }
         var entered = history.FindLastIndex(e => e.Step is null);
         if (!Runnable(item, await ledger.ContextAsync(item, ct)) && !history.Skip(entered + 1).Any(e => e.Step == Steps.HeldNotice))
         {
@@ -1452,7 +1464,7 @@ public sealed partial class RunPipeline(
             [author: dark-factory] {source.Naming.Format(storyId)} escalated; a human needs to look.
 
             Reason:
-            {UntrustedText.Fenced(reason ?? "none recorded")}
+            {UntrustedText.Fenced(LedgerReport.Clip(reason ?? "none recorded", LedgerReport.MaxReasonLength))}
             Last ledger state: {lastState}
             Claude session: {session ?? "none"}
 

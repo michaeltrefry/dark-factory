@@ -260,11 +260,19 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `escalated`; NOT NULL + a check constraint), decided in one place — `StepOutcomes.Of(from, state, step, detail)`, called by
   `WorkLedger` for every row it writes (`LedgerEntry.Outcome` is `required`). The rules map earlier stories' typed results (verdict,
   fix-progress, gate decision, new-tests outcome, stuck rounds, pauses, issue routes); migration `StepOutcomes` backfilled older rows
-  with the same rules as SQL (a Postgres test checks they agree). Reports are rendered only from the ledger (`LedgerReport`, E5): the
-  PR description at open and again at merge (`pr-report`; a failed rewrite is recorded, not escalated), the board closeout on merge
-  (`closeout`) and the escalation comment list every check row (`gate`, `ci-failure`, `new-tests`), every verdict row, the fix rounds
-  and the worker cost (N/A when unrecorded); model/repo text in rows goes through `UntrustedText` (code span, or a tilde fence for
-  the escalation reason). `LedgerMetrics` (dashboard pipeline page) computes cost per merged PR, 14-day revert rate (N/A: no revert
+  with the rules as they stood, as frozen SQL (a Postgres test checks it against a frozen literal corpus; never edit the shipped
+  migration — a later rule change only affects new rows). Reports are rendered only from the ledger (`LedgerReport`, E5): the
+  PR description at open and again at merge (`pr-report`), the board closeout on merge (`closeout`) and the escalation comment list
+  the check rows (`gate`, `ci-failure`, `new-tests`, `merge-conflict`) and verdict rows (each section's heading counts them by
+  outcome), the fix rounds and the worker cost (N/A when unrecorded); model/repo text in rows goes through `UntrustedText` (code span,
+  or a tilde fence for the escalation reason). Reports are bounded under GitHub's 65,536-char limit (Shortcut's is higher):
+  `Facts` ≤ 60,000 chars — ≤10 blocking findings per verdict, the latest verdict always in full, then the newest checks and earlier
+  verdicts that fit, with an "N earlier … not shown" line; the escalation reason is clipped to 4,000 chars. A failed `pr-report` or
+  `closeout` is recorded (`failed: …`, outcome failed), never escalated: the merge stands. A failed closeout shows on the dashboard
+  item and is retried from Watch on the next polls (`InFlightAsync` lists it; `HoldAsync` posts it), each attempt recorded, up to
+  `RunPipeline.MaxCloseoutAttempts` (3) per merge; after that the dashboard says to post it by hand. `LedgerMetrics` (dashboard
+  pipeline page; computed at most once per 60 s, `DashboardData.DefaultMetricsTtl`, and a metrics failure marks only the metrics
+  stale) computes cost per merged PR, 14-day revert rate (N/A: no revert
   data yet), escalation rate, fix rounds per merged PR, reviewer precision (blocking findings a second model confirmed / those it
   answered) and intake-to-merge time; N/A over zero matching items; sandbox/demo items are excluded (`Metrics:*`).
 - One run per item: `RunPipeline` holds a Postgres advisory lock on the item id (`PostgresRunLocks`) for the whole

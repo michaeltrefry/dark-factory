@@ -16,7 +16,7 @@ public static class LedgerReport
 {
     /// <summary>The steps reported as checks run.</summary>
     public static readonly IReadOnlySet<string> CheckSteps =
-        new HashSet<string> { RunPipeline.Steps.GateDecision, RunPipeline.Steps.CiFailure, RunPipeline.Steps.NewTests };
+        new HashSet<string> { RunPipeline.Steps.GateDecision, RunPipeline.Steps.CiFailure, RunPipeline.Steps.NewTests, RunPipeline.Steps.MergeConflict };
 
     private const int MaxFragment = 400;
 
@@ -48,47 +48,102 @@ public static class LedgerReport
 
     /// <summary>
     /// The ledger's facts about the item as Markdown: its state, its worker sessions, every check row, every verdict row, the fix rounds and
-    /// the cost.
+    /// the cost. Bounded to <see cref="MaxFactsLength"/> characters, so a PR body or a comment carrying it stays under GitHub's (65,536) and
+    /// Shortcut's limits whatever the item's history: each section's heading counts its rows by outcome, and the most recent verdict is always
+    /// shown (with at most <see cref="MaxBlockingFindingsShown"/> blocking findings); what is left of the budget shows the newest checks, then
+    /// the newest earlier verdicts, and a line says how many older ones are left out (the ledger has them all).
     /// </summary>
     public static string Facts(IReadOnlyList<LedgerEntry> history, IReadOnlyList<decimal?> sessionCosts)
     {
-        var text = new StringBuilder();
-        text.Append("**From the factory ledger** (results the orchestrator executed and recorded, never a worker's own report):\n\n");
+        var head = new StringBuilder();
+        head.Append("**From the factory ledger** (results the orchestrator executed and recorded, never a worker's own report):\n\n");
         if (history.LastOrDefault(e => e.Step is null) is { } state)
         {
-            text.Append(CultureInfo.InvariantCulture, $"- State: {state.State} ({StepOutcomes.Name(state.Outcome)}, {state.RecordedAt:u})\n");
+            head.Append(CultureInfo.InvariantCulture, $"- State: {state.State} ({StepOutcomes.Name(state.Outcome)}, {state.RecordedAt:u})\n");
         }
         var sessions = history.Where(e => e.Step == RunPipeline.Steps.Session && e.ClaudeSessionId is not null).Select(e => e.ClaudeSessionId!)
             .Distinct(StringComparer.Ordinal).ToList();
-        text.Append(CultureInfo.InvariantCulture,
-            $"- Worker sessions: {(sessions.Count == 0 ? "none" : string.Join(", ", sessions.Select(Code)))}\n");
+        head.Append(CultureInfo.InvariantCulture, $"- Worker sessions: {List(sessions)}\n");
 
-        text.Append("\nChecks run:\n");
         var checks = history.Where(e => e.Step is { } step && CheckSteps.Contains(step)).ToList();
+        var verdicts = history.Where(e => e.Step == RunPipeline.Steps.Verdict).ToList();
+        var checkLines = checks.Select(row => $"- {Outcome(row)} {Check(row)}\n").ToList();
+        var verdictBlocks = verdicts.Select(Verdict).ToList();
+        var checksHeading = $"\nChecks run ({Summary(checks)}):\n";
+        var verdictsHeading = $"\nReview verdicts ({Summary(verdicts)}):\n";
+        var tail = $"\n{Rounds(history)}" + string.Create(CultureInfo.InvariantCulture, $"\nWorker cost: {Cost(sessionCosts)}\n");
+        var earlier = verdictBlocks.Take(Math.Max(verdictBlocks.Count - 1, 0)).ToList();
+        var latest = verdictBlocks.Count == 0 ? "" : verdictBlocks[^1];
+
+        var budget = MaxFactsLength - head.Length - checksHeading.Length - verdictsHeading.Length - tail.Length - latest.Length
+            - (2 * OmittedLineReserve);
+        var shownChecks = Newest(checkLines, ref budget);
+        var shownVerdicts = Newest(earlier, ref budget);
+
+        var text = new StringBuilder(head.ToString());
+        text.Append(checksHeading);
         if (checks.Count == 0)
         {
             text.Append("- none recorded\n");
         }
-        foreach (var row in checks)
+        Omitted(text, checkLines.Count - shownChecks, "check(s)");
+        foreach (var line in checkLines.Skip(checkLines.Count - shownChecks))
         {
-            text.Append(CultureInfo.InvariantCulture, $"- {Outcome(row)} {Check(row)}\n");
+            text.Append(line);
         }
-
-        text.Append("\nReview verdicts:\n");
-        var verdicts = history.Where(e => e.Step == RunPipeline.Steps.Verdict).ToList();
+        text.Append(verdictsHeading);
         if (verdicts.Count == 0)
         {
             text.Append("- none recorded\n");
         }
-        foreach (var row in verdicts)
+        Omitted(text, earlier.Count - shownVerdicts, "verdict(s)");
+        foreach (var block in earlier.Skip(earlier.Count - shownVerdicts))
         {
-            text.Append(Verdict(row));
+            text.Append(block);
         }
-
-        text.Append('\n').Append(Rounds(history));
-        text.Append(CultureInfo.InvariantCulture, $"\nWorker cost: {Cost(sessionCosts)}\n");
-        return text.ToString();
+        text.Append(latest).Append(tail);
+        return text.Length <= MaxFactsLength ? text.ToString() : text.ToString(0, MaxFactsLength) + "\n… (cut short; the ledger has the rest)\n";
     }
+
+    /// <summary>The longest <see cref="Facts"/> renders (characters; plus a short cut-short line in the worst case).</summary>
+    public const int MaxFactsLength = 60_000;
+
+    /// <summary>The blocking findings listed per verdict; the rest are counted.</summary>
+    public const int MaxBlockingFindingsShown = 10;
+
+    /// <summary>The longest escalation reason a comment quotes (characters): with the facts it stays under GitHub's comment limit.</summary>
+    public const int MaxReasonLength = 4_000;
+
+    /// <summary><paramref name="text"/>, cut to <paramref name="max"/> characters with a note when longer.</summary>
+    public static string Clip(string text, int max) =>
+        text.Length <= max ? text : text[..max] + $"… ({text.Length - max} more characters; the ledger has them)";
+
+    private const int MaxNamesShown = 20;
+    private const int OmittedLineReserve = 80;
+
+    /// <summary>How many of <paramref name="lines"/>' newest fit in <paramref name="budget"/> (and takes them from it).</summary>
+    private static int Newest(IReadOnlyList<string> lines, ref int budget)
+    {
+        var shown = 0;
+        for (var i = lines.Count - 1; i >= 0 && lines[i].Length <= budget; i--, shown++)
+        {
+            budget -= lines[i].Length;
+        }
+        return shown;
+    }
+
+    private static void Omitted(StringBuilder text, int count, string what)
+    {
+        if (count > 0)
+        {
+            text.Append(CultureInfo.InvariantCulture, $"- … {count} earlier {what} not shown (the ledger has them)\n");
+        }
+    }
+
+    /// <summary>A section's count, by outcome: <c>3: 2 passed, 1 failed</c>.</summary>
+    private static string Summary(IReadOnlyList<LedgerEntry> rows) =>
+        rows.Count == 0 ? "0"
+            : $"{rows.Count}: " + string.Join(", ", rows.GroupBy(r => r.Outcome).OrderBy(g => g.Key).Select(g => $"{g.Count()} {StepOutcomes.Name(g.Key)}"));
 
     /// <summary>The summed router cost of the item's worker sessions, or N/A when none is recorded (never $0 for unmeasured, E5).</summary>
     public static string Cost(IReadOnlyList<decimal?> sessionCosts)
@@ -110,6 +165,8 @@ public static class LedgerReport
                 return $"merge gate: {Code(row.Detail ?? "")}";
             case RunPipeline.Steps.CiFailure when CiTriage.FromDetail(row.Detail) is { } triage:
                 return $"CI on {Code(Ci.Short(triage.HeadSha))} failed: the PR's {List(triage.Fixable)}; not the PR's {List(triage.NotThePrs)}";
+            case RunPipeline.Steps.MergeConflict:
+                return $"merge with the base: conflict {Code(row.Detail ?? "")}";
             case RunPipeline.Steps.NewTests when NewTestsResult.FromDetail(row.Detail) is { } tests:
                 return $"{GateChecks.NewTestsFailOnBase} on {Code(Ci.Short(tests.BaseSha))}...{Code(Ci.Short(tests.HeadSha))}: "
                     + $"{Code(tests.Outcome)}, {Code(tests.Reason)} ({tests.Tests.Count} new test(s))";
@@ -133,12 +190,16 @@ public static class LedgerReport
             + $"{(r.Error is null ? "" : ", unusable answer")})")));
         text.Append(CultureInfo.InvariantCulture,
             $"; {blocking.Count} blocking, {findings.Count - blocking.Count} optional ({findings.Count(f => f.Finding.Downgraded)} downgraded by the second model)\n");
-        foreach (var (role, finding) in blocking)
+        foreach (var (role, finding) in blocking.Take(MaxBlockingFindingsShown))
         {
             var how = finding.Confirmation is { Outcome: Confirmation.Confirmed } c ? $"confirmed by {Code(c.ServedModel ?? c.Model)}"
                 : finding.Confirmation is not null ? "the second model's answer was unusable"
                 : "not checked by a second model";
             text.Append(CultureInfo.InvariantCulture, $"  - blocking {role} finding, {how}: {Code(finding.ToString())}\n");
+        }
+        if (blocking.Count > MaxBlockingFindingsShown)
+        {
+            text.Append(CultureInfo.InvariantCulture, $"  - … and {blocking.Count - MaxBlockingFindingsShown} more blocking finding(s) (the ledger has them)\n");
         }
         return text.ToString();
     }
@@ -175,7 +236,10 @@ public static class LedgerReport
         return text.ToString();
     }
 
-    private static string List(IReadOnlyList<string> names) => names.Count == 0 ? "none" : string.Join(", ", names.Select(Code));
+    /// <summary>At most <see cref="MaxNamesShown"/> names (the rest counted).</summary>
+    private static string List(IReadOnlyList<string> names) =>
+        names.Count == 0 ? "none"
+            : string.Join(", ", names.Take(MaxNamesShown).Select(Code)) + (names.Count > MaxNamesShown ? $" and {names.Count - MaxNamesShown} more" : "");
 
     /// <summary>Text from a row, inert and in a code span (bounded: a row's detail can be long).</summary>
     private static string Code(string text) => UntrustedText.CodeSpan(text.Length > MaxFragment ? text[..MaxFragment] + "…" : text);
