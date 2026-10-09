@@ -223,7 +223,9 @@ need the gate App, and their stories' PRs get merged when they pass the gate.
 Automated: `IssueTriageTests` (tests/DarkFactory.AcceptanceTests), live, skipped unless `FACTORY_E2E=1` and
 `FACTORY_E2E_ISSUES=1`. They open real issues on the sandbox repo (`Factory:DefaultRepo`, watched through
 `GitHub:Watch:Repos`), run the production issue intake (`FactoryRunner.PollIssuesAsync`: the triage is a real sandboxed
-worker through the router) against a throwaway ledger, and close every issue they opened.
+worker through the router) against a throwaway ledger, and close every issue they opened. GitHub's `issues?since=` listing
+can show a just-opened issue (or a just-posted `Approved` comment) late, so each step polls the intake again every 5 s until
+it has acted on it, and fails naming what it never saw after 2 min (`PollUntil`).
 
 These tests need the worker sandbox: issue triage refuses `Worker__RunAs=none` (the triage reads untrusted issue text).
 
