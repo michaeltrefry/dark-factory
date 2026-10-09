@@ -7,6 +7,7 @@ using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Shortcut;
+using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.AcceptanceTests;
 
@@ -62,6 +63,8 @@ public class ReviewGateTests
         Assert.Equal(mergeCommit, pr.GetProperty("merge_commit_sha").GetString());
         Assert.Equal(verdict.HeadSha, pr.GetProperty("head").GetProperty("sha").GetString());
         Assert.Equal("Done", (await E2e.StoryAsync(storyId, ct)).State);
+        // sc-25391 (epic AT2): a typed outcome on every row, the merge through the queue, the PR body and closeout from the ledger.
+        await AssertTypedOutcomesQueueAndReportsAsync(e2e, options, storyId, pr, ct);
     }
 
     /// <summary>P2-AT2: a push after the verdict blocks the merge until the new head is reviewed again (verdict bound to head SHA).</summary>
@@ -96,7 +99,65 @@ public class ReviewGateTests
         var pr = await MergedPullRequestAsync(options.DefaultRepo, storyId, outcome.PullRequestUrl!, ct);
         Assert.Equal(pushed, pr.GetProperty("head").GetProperty("sha").GetString());
         Assert.Equal(history.Single(e => e.Step is null && e.State == WorkState.Merge).Detail, pr.GetProperty("merge_commit_sha").GetString());
+        await AssertTypedOutcomesQueueAndReportsAsync(e2e, options, storyId, pr, ct);
     }
+
+    /// <summary>
+    /// Epic AT2 (sc-25391), on the item's ledger after its merge: every row carries the outcome <see cref="StepOutcomes.Of"/> gives
+    /// it (from the item's state before the row, its state, step and detail); the merge went through the merge queue
+    /// (<c>queued</c>, then <c>queue-turn</c>, then <c>gate-passed</c>, then Merge); the merged PR's description is exactly
+    /// <see cref="LedgerReport.PullRequestBody"/> of the rows written before its rewrite (<c>pr-report</c> <c>merge</c>), and the
+    /// story's closeout comment exactly <see cref="LedgerReport.MergedCloseout"/> of the rows written before it was posted.
+    /// The session costs are read now: a cost the recorder wrote after the merge would show as a mismatch naming both texts.
+    /// </summary>
+    internal static async Task AssertTypedOutcomesQueueAndReportsAsync(E2e e2e, FactoryOptions options, int storyId, JsonElement mergedPr,
+        CancellationToken ct)
+    {
+        var history = await e2e.HistoryAsync(storyId, ct);
+        AssertTypedOutcomes(history);
+
+        int Index(Func<LedgerEntry, bool> row, string what)
+        {
+            var index = history.FindIndex(e => row(e));
+            Assert.True(index >= 0, $"the ledger has no {what} row");
+            return index;
+        }
+        var queued = Index(e => e.Step == RunPipeline.Steps.Queued, "queued");
+        var turn = Index(e => e.Step == RunPipeline.Steps.QueueTurn, "queue-turn");
+        var passed = history.FindLastIndex(e => e.Step == RunPipeline.Steps.GatePassed);
+        var merge = Index(e => e.Step is null && e.State == WorkState.Merge, "Merge");
+        Assert.True(queued < turn && turn < passed && passed < merge, $"queued {queued}, queue-turn {turn}, gate-passed {passed}, Merge {merge}");
+
+        var costs = await e2e.SessionCostsAsync(storyId, ct);
+        using var shortcutHttp = OutboundHttp.ShortcutApi();
+        var story = (await FactoryRunner.CreateWorkSource(options, shortcutHttp).ReadSpecAsync(storyId, ct)).Story;
+        var report = Index(e => e.Step == RunPipeline.Steps.PrReport, "pr-report");
+        Assert.Equal("merge", history[report].Detail);
+        Assert.Equal(Lines(LedgerReport.PullRequestBody(story, history.Take(report).ToList(), costs)), Lines(mergedPr.GetProperty("body").GetString()));
+
+        var closeout = Index(e => e.Step == RunPipeline.Steps.Closeout && e.Detail == RunPipeline.Posted, "closeout posted");
+        var expected = WorkSourceComments.Attributed(LedgerReport.MergedCloseout(StoryId.Format(storyId), history.Take(closeout).ToList(), costs));
+        var comments = (await E2e.StoryCommentsAsync(storyId, ct)).Select(Lines).ToList();
+        Assert.Contains(Lines(expected), comments);
+    }
+
+    /// <summary>Every row's outcome is the one <see cref="StepOutcomes.Of"/> decides for it (E7).</summary>
+    internal static void AssertTypedOutcomes(IReadOnlyList<LedgerEntry> history)
+    {
+        WorkState? state = null;
+        foreach (var row in history)
+        {
+            var expected = StepOutcomes.Of(state, row.State, row.Step, row.Detail);
+            Assert.True(expected == row.Outcome,
+                $"row {row.Id} ({row.Step ?? $"{state?.ToString() ?? "new"} → {row.State}"}: {row.Detail}) has outcome {StepOutcomes.Name(row.Outcome)}, not {StepOutcomes.Name(expected)}");
+            if (row.Step is null)
+            {
+                state = row.State;
+            }
+        }
+    }
+
+    private static string Lines(string? text) => (text ?? "").Replace("\r\n", "\n", StringComparison.Ordinal);
 
     /// <summary>Every reviewer a Claude Opus 5.5 or newer and every second model Claude, each served by the router as pinned.</summary>
     private static void AssertClaudePanel(ReviewVerdict verdict)
@@ -107,7 +168,7 @@ public class ReviewGateTests
     }
 
     /// <summary>Skips with the missing owner step unless the gate App is set up, Review:Models is set and the sandbox has a policy on main.</summary>
-    private static async Task RequireGateReadyAsync(FactoryOptions options, CancellationToken ct)
+    internal static async Task RequireGateReadyAsync(FactoryOptions options, CancellationToken ct)
     {
         Harness.RequireSecret(o => o.GitHubGateAppId);
         Harness.RequireSecret(o => o.GitHubGateAppPrivateKeyPem);
@@ -130,7 +191,7 @@ public class ReviewGateTests
         }
     }
 
-    private static async Task<JsonElement> MergedPullRequestAsync(RepoRef repo, int storyId, string url, CancellationToken ct)
+    internal static async Task<JsonElement> MergedPullRequestAsync(RepoRef repo, int storyId, string url, CancellationToken ct)
     {
         var pr = (await E2e.PullRequestsAsync(repo, storyId, ct)).Single(p => p.GetProperty("html_url").GetString() == url);
         Assert.NotEqual(JsonValueKind.Null, pr.GetProperty("merged_at").ValueKind);

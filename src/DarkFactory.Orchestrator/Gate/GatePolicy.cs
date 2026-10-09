@@ -142,7 +142,8 @@ public sealed class GatePolicy
         var byTier = SecurityReviewPaths(change);
         var tiered = byTier.Select(p => p.Path).ToHashSet(StringComparer.Ordinal);
         return byTier.Select(p => p.ToString())
-            .Concat(RiskyPaths.Touched(change.Paths.Select(p => p.Path).Where(p => !tiered.Contains(p))))
+            .Concat(GateCheckSeam.Off(GateCheckSeam.FloorSecurityReviewPaths) ? []
+                : RiskyPaths.Touched(change.Paths.Select(p => p.Path).Where(p => !tiered.Contains(p))))
             .ToList();
     }
 
@@ -190,7 +191,7 @@ public sealed class GatePolicy
         var policy = new GatePolicy(tiers, risk);
         var uncovered = MustBeSealedFiles.Where(f => policy.TierOf(f).Tier != Tier.Sealed)
             .Concat(MustBeSealedDirectories.Where(d => !tiers[Tier.Sealed].Paths.Any(p => p.CoversEverythingUnder(d))));
-        if (uncovered.FirstOrDefault() is { } path)
+        if (uncovered.FirstOrDefault() is { } path && !GateCheckSeam.Off(GateCheckSeam.FloorSealedPaths))
         {
             throw new GatePolicyException(
                 $"{Path}: the sealed tier must cover {path} (the gate's own files: {string.Join(", ", MustBeSealed)}; a directory by a pattern covering everything under it, such as {MustBeSealedDirectories[0]}).");
@@ -218,7 +219,7 @@ public sealed class GatePolicy
         {
             throw new GatePolicyException($"{Path}: {where}.checks has an unknown check '{unknown}' (known: {string.Join(", ", GateChecks.All)}).");
         }
-        if (FloorChecks[tier].FirstOrDefault(c => !checks.Contains(c)) is { } missing)
+        if (FloorChecks[tier].FirstOrDefault(c => !checks.Contains(c)) is { } missing && !GateCheckSeam.Off(GateCheckSeam.FloorChecks))
         {
             throw new GatePolicyException($"{Path}: {where}.checks must include {missing} (every {tier.Key()} change needs {string.Join(", ", FloorChecks[tier])}).");
         }

@@ -235,6 +235,100 @@ FACTORY_E2E=1 FACTORY_E2E_ISSUES=1 GH_TOKEN=$(gh auth token) FACTORY_E2E_OUTSIDE
   dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-class "*IssueTriageTests"
 ```
 
+## Phase 2 epic acceptance tests (epic sc-25377: AT2, AT4, AT5, AT6; sc-25391)
+
+The terminal story runs these once, live, against `michaeltrefry/dark-factory-sandbox`. Each is opt-in (`FACTORY_E2E=1` plus its
+own variables) and skips naming whatever is missing; each runs the production wiring (`factory run`, `FactoryRunner.RunAsync`, or
+the issue intake `FactoryRunner.PollIssuesAsync`) against a **throwaway ledger** and its own work root, like the tests above. Every
+`*_STORY` must be a **fresh To Do bug story** whose fix lands in **normal** code of the sandbox (e.g. `src/Sandbox/`, not `tests/`,
+`docs/`, a sealed or a protected path), small enough for the risk threshold — the P2-AT1 kind; give each test its own story.
+Prerequisites: everything P2-AT1 needs (gate App installed, rulesets re-applied, a version-2 `factory/gate.yaml` on the sandbox's
+main, `Review:Models`, `sudo scripts/setup-worker-user.sh`).
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_GATE_SEALED_STORY=sc-<id> FACTORY_E2E_GATE_POLICY_STORY=sc-<id> GH_TOKEN=$(gh auth token) \
+  FACTORY_E2E_GATE_PASSING_TEST_STORY=sc-<id> FACTORY_E2E_GATE_ROUNDS_STORY=sc-<id> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-class "*GateNegativeTests"
+FACTORY_E2E=1 FACTORY_E2E_FREEZE_STORY=sc-<id> FACTORY_E2E_STUCK_STORY=sc-<id> FACTORY_E2E_SILENT_STORY=sc-<id> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-class "*FreezeAndStuckTests"
+```
+
+### AT2 — a To Do sandbox bug story goes end to end with no human touch
+
+Automated: `ReviewGateTests.Gate_merges_a_green_pr_a_claude_opus_panel_passed_and_the_ledger_records_the_merge_commit` (and the
+same checks at the end of `A_push_after_the_verdict_blocks_the_merge_until_the_new_head_is_reviewed_again`), variables as in P2-AT1
+above. On top of P2-AT1's assertions (states, the Claude Opus panel through the router, the merge commit, the story Done), the run's
+ledger is checked row by row (`ReviewGateTests.AssertTypedOutcomesQueueAndReportsAsync`):
+
+- **a typed outcome per step:** every row's `Outcome` equals `StepOutcomes.Of(<the item's state before it>, State, Step, Detail)`;
+- **the merge queue:** a `queued` row, then `queue-turn`, then `gate-passed`, then the Merge transition;
+- **the PR body matches the ledger:** the merged PR's description equals `LedgerReport.PullRequestBody` of the rows written before
+  its rewrite (`pr-report` `merge`) and the worker sessions' recorded costs;
+- **the closeout matches the ledger:** a comment on the story equals `LedgerReport.MergedCloseout` of the rows written before the
+  `closeout` `posted` row (attributed `[author: dark-factory]`).
+
+The costs are read when the test checks: if the session recorder wrote a cost after the merge, the body check fails showing both
+texts (rerun the comparison by hand from the throwaway ledger before it is dropped, or rerun the test).
+
+### AT4 — gate negatives on seeded PRs
+
+Automated: `GateNegativeTests` (`tests/DarkFactory.AcceptanceTests`). The review panel is replaced by a seeded stand-in
+(`SeededReviewer`: every role answered as the pinned `Review:Models` model with no finding, or one confirmed blocking finding), so
+the gate's own rule decides deterministically; the real panel is AT2's. The seeding writes go through the gateway's GitHub client:
+to the item's own `factory/sc-<id>` branch as the workers' App (it may write only `factory/**`), or to a throwaway
+`e2e/corrupt-policy-<guid>` branch as the owner (`GH_TOKEN`). **The sandbox's main is never written.** None of these merges.
+**Cleanup (automatic):** each test closes its PR and deletes its `factory/sc-<id>` branch (and the throwaway branch) at the end.
+**By hand:** move each story back (it ends In Progress with an escalation comment) or archive it; delete a branch a crashed run
+left (`factory/sc-<id>`, `e2e/corrupt-policy-*`).
+
+| Test | Variables | Setup it does | Expected on the ledger |
+| --- | --- | --- | --- |
+| `A_sealed_path_on_the_pr_head_escalates_instead_of_merging` | `FACTORY_E2E_GATE_SEALED_STORY` | before the first review, commits `factory/prompts/e2e-sealed-probe.md` (sealed on every valid policy: the floor seals `factory/prompts/`) to the PR branch | the head moves, back to Review (`gate_rejected`), reviewed, CI; the last `gate` row is `Blocked …touches sealed path(s), which always escalate…factory/prompts/e2e-sealed-probe.md (sealed)` (`gate_rejected`); transitions end MergeGate → Escalated (`escalated`); no `gate-passed`, no Merge; the PR is not merged |
+| `A_corrupt_gate_policy_blocks_the_merge_and_escalates` | `FACTORY_E2E_GATE_POLICY_STORY`, `GH_TOKEN` (the owner, an admin) | branches `e2e/corrupt-policy-<guid>` off main and commits `factory/gate.yaml` = `version: [` there; once the item is reviewed (on the real policy), every policy read of the gate is redirected to that branch (`PolicyFromRef`), so the gate reads a really corrupt file through GitHub | the last `gate` row is `Blocked …factory/gate.yaml is not valid YAML…` (`gate_rejected`); MergeGate → Escalated; nothing merged; the throwaway branch deleted |
+| `A_new_test_that_already_passes_on_the_base_is_gate_rejected` | `FACTORY_E2E_GATE_PASSING_TEST_STORY` | before the first review, commits `<the sandbox's first *Tests.csproj directory>/E2eAlreadyPassingTests.cs` (one `[Fact]` asserting `true`) to the PR branch | the last `new-tests` row is `rejected` (`gate_rejected`) naming `DarkFactoryE2e.E2eAlreadyPassingTests.Already_passes_on_the_base` (passed on the base and the head); the last `gate` row is `Blocked …new-tests-fail-on-base (rejected)…`; MergeGate → Escalated |
+| `A_fourth_fix_round_escalates_with_the_open_finding` | `FACTORY_E2E_GATE_ROUNDS_STORY` | none: the seeded panel reports one confirmed blocking correctness finding on every head (the real fixer runs each round, so this spends three fixer sessions) | exactly 3 (`Lifecycle.MaxFixRounds`) Fixing transitions (`failed`), every verdict `fail`, transitions end Review → Escalated, never MergeGate; the escalation comment says `after 3 fix rounds` and names the finding |
+
+The push-after-verdict negative is P2-AT2 above (`A_push_after_the_verdict_blocks_the_merge_until_the_new_head_is_reviewed_again`).
+The in-process versions, which run in every `dotnet test`: `GatePipelineTests.A_change_touching_a_sealed_path_is_reviewed_but_escalated_by_the_gate_not_merged`,
+`A_missing_or_invalid_policy_means_no_merge_and_an_escalation`, `A_policy_that_breaks_after_the_review_still_blocks_the_merge_and_escalates`,
+`NewTestsTests.A_new_test_that_already_passes_on_the_base_is_rejected_with_the_test_named`,
+`FixLoopTests.A_fourth_round_escalates_with_the_open_findings_attached`.
+
+### AT5 — freeze and stuck
+
+Automated: `FreezeAndStuckTests`. The freeze tests write only the throwaway ledger; their story is never claimed (it stays To Do
+and can be reused). The stuck tests replace the worker with a **stub Claude Code CLI** (`StubClaude`, a bash script the test
+writes): it replays a recorded stream-json transcript (the unit tests' fixtures `stream-json-stuck-loop.jsonl`,
+`stream-json-silence-progress.jsonl`) under a fresh session id, one line a second, and honours the factory's pause hook exactly as
+the real CLI does (it reads the hook's flag path from `--settings` and ends the session at the next tool call once the flag exists,
+`terminal_reason: hook_stopped`). A real model cannot be made to loop on demand, so the stub is the deterministic looping worker. It
+runs as the owner (`Worker:RunAs=none`, set by the test): it reads and writes nothing but its fixture and its own log, and the only
+process the factory stops is that stub: through the pause flag, which the stub obeys and exits on; were it ever to need a signal,
+`ClaudeWorker` signals only the process group it started, whose leader runs the configured (stub) path. The stuck stories end
+Escalated with nothing pushed (move them back by hand).
+
+| Test | Variables | Setup it does | Expected |
+| --- | --- | --- | --- |
+| `N_items_escalated_in_a_row_freeze_the_factory_and_the_next_dispatch_is_deferred` | `FACTORY_E2E_FREEZE_STORY` | seeds `Freeze:MaxConsecutiveFailures` (default 3) items Intake → Implement → Escalated in the throwaway ledger | the run is deferred `factory frozen (consecutive-failures): 3 items escalated in a row…`; the `freeze` control row is Paused, reason `consecutive-failures`, by `freeze`; the story has no ledger row, is still in its board state and has no PR; a second dispatch is deferred from the record alone |
+| `An_unreadable_freeze_record_counts_as_frozen_and_the_dispatch_is_deferred` | `FACTORY_E2E_FREEZE_STORY` | inserts the throwaway ledger's `freeze` control row with state `corrupted` (raw SQL: no `ControlState` has it, so reading it fails) | deferred `factory frozen (freeze-record-unreadable): the freeze record could not be read…`; no ledger row, story untouched |
+| `A_looping_worker_is_interrupted_at_its_next_tool_call_and_the_item_escalates_after_its_retry` | `FACTORY_E2E_STUCK_STORY` | the stub replays the looping transcript | two `stuck` rows (`failed`, `repeating tool calls: Edit`), one `stuck-retry`, transitions Intake → Implement → Escalated; both stub sessions stopped at a tool call by the pause hook, neither ran to its end; no PR |
+| `A_silent_worker_that_then_makes_progress_is_not_interrupted` | `FACTORY_E2E_SILENT_STORY`, optional `FACTORY_E2E_SILENCE_SECONDS` (default 120) | the stub replays the silence-then-progress transcript with that silence before the slow test run's result | no `stuck` row; the stub session ran to its end; one `worker-done` row with its session (it then escalates: the stub changes nothing, so there is nothing to review) |
+
+In-process versions (every `dotnet test`): `FreezeTests.Each_trigger_seeded_in_the_ledger_stops_dispatch_with_that_trigger_named`,
+`An_unreadable_freeze_record_counts_as_frozen`, `The_intake_loop_dispatches_nothing_while_the_freeze_record_is_unreadable_or_set`,
+`StuckWorkerTests.A_replayed_transcript_that_loops_is_interrupted_at_its_next_tool_call_and_records_a_failed_round_then_a_fresh_session_retries`,
+`A_replayed_transcript_with_a_long_silence_and_then_progress_is_not_interrupted`.
+
+### AT6 — taint: a session that read issue text cannot push
+
+Automated: `IssueTriageTests.A_triage_session_that_read_issue_text_is_tainted_and_cannot_push`, gated like P2-AT-issues
+(`FACTORY_E2E=1`, `FACTORY_E2E_ISSUES=1`, `GH_TOKEN`; the factory's App needs Issues read and write). The owner opens one fixture
+issue on the sandbox; the production intake triages it in a real sandboxed worker session. Expected: the issue's item has a
+`session_taints` row for that session with reason `issue-text`; `WorkLedger.GrantPushAsync` for the session throws
+`SessionTaintedException` (no grant, so no installation token is minted for it); GitHub has no `factory/triage-gh-<key>` branch.
+Cleanup (automatic): the issue is closed. In-process: `TaintTests.A_triage_session_holds_no_github_credential_is_tainted_and_its_push_is_refused`
+(also checks the triage worker's environment holds no GitHub token, which a live run cannot observe from outside the sandbox).
+
 ## Upgrading a Phase 1 ledger: items parked at Review
 
 Phase 1 parked every finished item at Review; since sc-25378 Review is a state the factory drives, so the first
