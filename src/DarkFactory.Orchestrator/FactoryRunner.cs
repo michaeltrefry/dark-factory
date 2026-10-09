@@ -131,6 +131,17 @@ public static class FactoryRunner
     private static GitHubIssuesClient IssuesClient(FactoryOptions options, HttpClient githubHttp) =>
         new(githubHttp, new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System));
 
+    /// <summary>
+    /// A freeze evaluator over the ledger and the gate App's view of GitHub (main-red), for the intake loop's per-poll check. Its
+    /// HttpClient lives as long as the evaluator (the host's life).
+    /// </summary>
+    public static FactoryFreeze CreateFreeze(FactoryOptions options)
+    {
+        var http = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        var gateApp = new GitHubApp(http, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System);
+        return new FactoryFreeze(Contexts(options), Controls(options), options.Freeze, TimeProvider.System, new GitHubGate(http, gateApp));
+    }
+
     private static LedgerDbContextFactory Contexts(FactoryOptions options) =>
         new(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
 
@@ -163,6 +174,7 @@ public static class FactoryRunner
         var reviewPanel = options.ReviewPanel;
         var sandbox = options.WorkerSandbox;
         var pauseGrace = options.PauseGrace;
+        var freezeOptions = options.Freeze;
 
         // Sandboxed, the worker user is single-tenant (every helper exit kills all of its processes),
         // so one sandboxed run per machine, taken before anything runs through the helper.
@@ -194,6 +206,11 @@ public static class FactoryRunner
 
         var gate = new GateStage(new GitHubGate(githubHttp, gateApp), new RouterReviewer(reviewerHttp, routerKey), reviewPanel,
             options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, sandbox, options.TestTimeout));
+        if (adjustGate is not null)
+        {
+            gate = adjustGate(gate);
+        }
+        var controls = Controls(options);
         var pipeline = new RunPipeline(
             source,
             ledger,
@@ -208,9 +225,11 @@ public static class FactoryRunner
             new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)),
                 new RouterClient(routerHttp, routerKey), TimeProvider.System, log, costSettleDelay: options.CostSettleDelay),
             ignoreScope: ignoreScope,
-            controls: Controls(options),
+            controls: controls,
             pauseGrace: pauseGrace,
-            gate: adjustGate is null ? gate : adjustGate(gate));
+            gate: gate,
+            // Before every dispatch (sc-25387): a frozen factory defers the run.
+            freeze: new FactoryFreeze(Contexts(options), controls, freezeOptions, TimeProvider.System, gate.GitHub));
 
         return await pipeline.RunAsync(storyId, ct);
     }

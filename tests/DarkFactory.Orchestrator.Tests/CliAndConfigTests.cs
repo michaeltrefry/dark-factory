@@ -32,6 +32,7 @@ public class FactoryCliTests
     [InlineData("pause --factory", "pause factory")]
     [InlineData("continue --factory", "continue factory")]
     [InlineData("continue --usage", "continue usage")]
+    [InlineData("continue --freeze", "continue freeze")]
     public async Task Controls_pass_their_scope(string args, string expected)
     {
         var (root, calls) = Cli();

@@ -12,6 +12,12 @@ namespace DarkFactory.Orchestrator;
 public sealed record RunOutcome(long WorkItemId, WorkState State, string? SessionId, string? PullRequestUrl, string? Error)
 {
     public bool Succeeded => Error is null;
+
+    /// <summary>
+    /// Set when the run was not dispatched because the factory is frozen (<see cref="FactoryFreeze"/>): the typed outcome
+    /// <c>deferred</c>, with why. Nothing about the item changed.
+    /// </summary>
+    public string? Deferred { get; init; }
 }
 
 /// <summary>A worker session that ended without success.</summary>
@@ -56,7 +62,8 @@ public sealed partial class RunPipeline(
     IControls? controls = null,
     TimeSpan? pauseGrace = null,
     TimeSpan? controlPollInterval = null,
-    GateStage? gate = null)
+    GateStage? gate = null,
+    FactoryFreeze? freeze = null)
 {
     /// <summary>The Shortcut source's ledger name (<see cref="ItemNaming.Shortcut"/>); a pipeline names items by its source's <see cref="Naming"/>.</summary>
     public const string Source = "shortcut";
@@ -170,6 +177,11 @@ public sealed partial class RunPipeline(
         /// (Detail: the <see cref="Gate.ReviewCarry"/> proof), before the carried verdict is recorded.
         /// </summary>
         public const string ReviewCarried = "review-carried";
+        /// <summary>
+        /// MergeGate: the gated head is about to be merged; Detail is the <see cref="MergeFiles"/> JSON (the PR's base branch and
+        /// the files its diff changes), which the freeze's hot-file and main-red triggers read (<see cref="FactoryFreeze"/>).
+        /// </summary>
+        public const string MergeFiles = "merge-files";
         /// <summary>Fixing (a conflict fix round): the base was merged into the fixer's worktree (Detail: the <see cref="Gate.BaseUpdate"/> JSON with the conflicted files).</summary>
         public const string BaseMerged = "base-merged";
     }
@@ -187,12 +199,20 @@ public sealed partial class RunPipeline(
     /// </summary>
     public const string UsagePaused = "usage-paused";
 
+    /// <summary>
+    /// Detail of the Paused row recorded when the factory-wide freeze (<see cref="ControlScope.Freeze"/>) stopped the run at a
+    /// step or tool boundary. Such an item resumes (its worker with <c>claude --resume</c>) once a human's Continue clears the freeze.
+    /// </summary>
+    public const string FreezePaused = "freeze-paused";
+
     /// <summary>A Pause or Stop control reached a run; the worker (if any) has ended.</summary>
     private sealed class ControlRequestedException(ControlState state, bool workerStillRunning = false)
         : Exception($"control: {state}")
     {
         public ControlState State { get; } = state;
         public bool WorkerStillRunning { get; } = workerStillRunning;
+        /// <summary>Set when the freeze evaluator (not a control row) paused the run: why it is frozen.</summary>
+        public FreezeStatus? Frozen { get; init; }
     }
 
     /// <summary>
@@ -283,7 +303,7 @@ public sealed partial class RunPipeline(
     {
         var paused = history.FindLastIndex(e => e.Step is null);
         var pausedFrom = TransitionContext.From(history.Where(e => e.Step is null).Select(e => e.State).ToList()).PausedFrom;
-        return history[paused] is { State: WorkState.Paused, Detail: Interrupted or UserPaused or UsagePaused }
+        return history[paused] is { State: WorkState.Paused, Detail: Interrupted or UserPaused or UsagePaused or FreezePaused }
             && pausedFrom is { } from && handled.Contains(from)
             && !history.Skip(paused + 1).Any(e => e.Step == Steps.Parked);
     }
@@ -298,15 +318,27 @@ public sealed partial class RunPipeline(
     {
         // Decide from the ledger (and the controls) before reading anything from the board.
         var known = await ledger.FindAsync(Naming.Source, Naming.Format(storyId), ct);
+        var knownControl = known is null ? ControlState.Running : await _controls.EffectiveAsync(known.ExternalId, known.EpicId, ct);
+        if (known is not null && knownControl == ControlState.Stopping)
+        {
+            // A stop is finished even while the factory is frozen: it starts no new work.
+            return await StopIdleAsync(known, storyId, ct);
+        }
+        // The freeze evaluator runs before every dispatch (sc-25387): a frozen factory defers the run, changing nothing.
+        if (freeze is not null && await freeze.CheckAsync(ct) is { Frozen: true } frozen)
+        {
+            log.WriteLine($"[deferred] {Naming.Format(storyId)}: {frozen.Message}");
+            return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null, $"{Naming.Format(storyId)} deferred: {frozen.Message}")
+            {
+                Deferred = frozen.Message,
+            };
+        }
         if (known is not null)
         {
-            switch (await _controls.EffectiveAsync(known.ExternalId, known.EpicId, ct))
+            if (knownControl == ControlState.Paused)
             {
-                case ControlState.Stopping:
-                    return await StopIdleAsync(known, storyId, ct);
-                case ControlState.Paused:
-                    log.WriteLine($"[{known.State}] {known.ExternalId} is paused by a control; nothing to do.");
-                    return await OutcomeAsync(known, PausedMessage(known.ExternalId), ct);
+                log.WriteLine($"[{known.State}] {known.ExternalId} is paused by a control; nothing to do.");
+                return await OutcomeAsync(known, PausedMessage(known.ExternalId), ct);
             }
             if (!Runnable(known, await ledger.ContextAsync(known, ct)))
             {
@@ -369,6 +401,13 @@ public sealed partial class RunPipeline(
             {
                 // Pause/Stop: no new step starts once a control says so.
                 await ThrowIfControlledAsync(item, ct);
+                // Nor once the factory is frozen (sc-25387): the triggers are evaluated before every step, so this run's own
+                // fix rounds, escalations and merges (and main turning red while it waits) stop it. A merged item's bookkeeping
+                // (Merge → Watch) starts no new work and is not held.
+                if (item.State != WorkState.Merge)
+                {
+                    await ThrowIfFrozenAsync(item, ct);
+                }
                 var before = item.State;
                 await handler(run, ct);
                 if (item.State == before)
@@ -396,13 +435,27 @@ public sealed partial class RunPipeline(
         {
             // The worktree, checkpoints and Claude session stay: Continue (or the usage pause lifting) resumes the same session.
             // A user's Pause on the factory, the epic or the item outranks the usage pause: Continue, not the reset, resumes it.
-            if (!await UserPausedAsync(item) && await _controls.UsagePauseAsync(CancellationToken.None) is { } usage)
+            var userPaused = await UserPausedAsync(item);
+            if (!userPaused && await _controls.UsagePauseAsync(CancellationToken.None) is { } usage)
             {
                 var why = $"{usage.Reason}; resumes at {usage.ResumeAt:u}";
                 await ledger.RecordAsync(item, WorkState.Paused, null, UsagePaused, CancellationToken.None);
                 await ledger.CheckpointAsync(item, Steps.UsagePause, null, why, CancellationToken.None);
                 log.WriteLine($"[paused] {item.ExternalId} paused for usage ({why}); its worktree and session are kept");
                 return await OutcomeAsync(item, $"{item.ExternalId} is paused for usage ({why}).", CancellationToken.None);
+            }
+            var frozenBy = request.Frozen?.Trigger;
+            if (!userPaused && frozenBy is null
+                && await _controls.GetAsync(ControlScope.Freeze, CancellationToken.None) is { State: not ControlState.Running } frozenRow)
+            {
+                frozenBy = frozenRow.Reason;
+            }
+            if (!userPaused && frozenBy is not null)
+            {
+                await ledger.RecordAsync(item, WorkState.Paused, null, FreezePaused, CancellationToken.None);
+                log.WriteLine($"[paused] {item.ExternalId} paused by the factory freeze ({frozenBy}); its worktree and session are kept for Continue");
+                return await OutcomeAsync(item, $"{item.ExternalId} is paused by the factory freeze ({frozenBy}); `factory continue --freeze` clears it.",
+                    CancellationToken.None);
             }
             await ledger.RecordAsync(item, WorkState.Paused, null, UserPaused, CancellationToken.None);
             log.WriteLine($"[paused] {item.ExternalId} paused by a control; its worktree and session are kept for Continue");
@@ -647,6 +700,8 @@ public sealed partial class RunPipeline(
                 throw new SessionTaintedException(resume, taint.Reason);
             }
         }
+        // No worker session starts into a frozen factory (implement, a fix round, a CI fix).
+        await ThrowIfFrozenAsync(item, ct);
         log.WriteLine(resume is null ? $"[{label}] starting worker" : $"[{label}] resuming claude session {resume}");
         // Every stdout line is stored (and pushed to live viewers) as it streams (E7).
         await using var capture = sessions is null ? null : await sessions.StartAsync(item.Id, resume, ct);
@@ -794,6 +849,22 @@ public sealed partial class RunPipeline(
         if (await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) is not ControlState.Running and var state)
         {
             throw new ControlRequestedException(state);
+        }
+    }
+
+    /// <summary>
+    /// Runs the freeze evaluator (sc-25387) and, when the factory is frozen, pauses the run like a Pause control (Paused
+    /// <see cref="FreezePaused"/>, worktree and session kept; it resumes after the Continue). Called before every step, before
+    /// every worker session starts, before a merge-queue base-update push and (reading GitHub fresh, <paramref name="fresh"/>)
+    /// right before a merge. Its cost is bounded: the ledger triggers are a few queries; main-red's GitHub reads are reused for
+    /// <see cref="FactoryFreeze.MainRedCacheTtl"/> except right before a merge.
+    /// </summary>
+    private async Task ThrowIfFrozenAsync(WorkItem item, CancellationToken ct, bool fresh = false)
+    {
+        if (freeze is not null && await freeze.CheckAsync(ct, fresh) is { Frozen: true } frozen)
+        {
+            log.WriteLine($"[frozen] {item.ExternalId}: {frozen.Message}");
+            throw new ControlRequestedException(ControlState.Paused) { Frozen = frozen };
         }
     }
 

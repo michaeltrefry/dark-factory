@@ -47,6 +47,10 @@ public sealed class ControlActions(
         {
             return UsageOnlyContinues;
         }
+        if (scope == ControlScope.Freeze)
+        {
+            return FreezeOnlyContinues;
+        }
         await controls.SetAsync(scope, ControlState.Paused, by, ct);
         var message = $"{scope} paused: nothing new starts there, and running workers stop at their next tool call.";
         if (ControlScope.EpicOf(scope) is not { } epic)
@@ -64,13 +68,21 @@ public sealed class ControlActions(
 
     public async Task<ControlResult> ContinueAsync(string scope, string by, CancellationToken ct)
     {
-        if ((await controls.GetAsync(scope, ct))?.State == ControlState.Stopping)
+        var row = await controls.GetAsync(scope, ct);
+        if (row?.State == ControlState.Stopping)
         {
             return new ControlResult(false, $"{scope} is being stopped; it cannot be continued.");
+        }
+        if (scope == ControlScope.Freeze && row?.State is null or ControlState.Running)
+        {
+            // A Continue resets what the triggers count from: one with no freeze to clear would silently discard that evidence.
+            return new ControlResult(false, "the factory is not frozen");
         }
         await controls.SetAsync(scope, ControlState.Running, by, ct);
         return new ControlResult(true, scope == ControlScope.Usage
             ? "usage pause lifted early: work starts again now (a worker that hits the limit again pauses the factory once more)."
+            : scope == ControlScope.Freeze
+            ? "freeze cleared: work starts again now. Only what happens from now on (new escalations, merges, fix rounds) can freeze the factory again."
             : $"{scope} continued.");
     }
 
@@ -83,6 +95,10 @@ public sealed class ControlActions(
         if (scope == ControlScope.Usage)
         {
             return UsageOnlyContinues;
+        }
+        if (scope == ControlScope.Freeze)
+        {
+            return FreezeOnlyContinues;
         }
         var stories = new List<ItemRef>();
         var unknown = new List<string>();
@@ -149,6 +165,10 @@ public sealed class ControlActions(
     /// <summary>The usage pause is set by the factory itself (<see cref="UsagePause"/>); a user may only lift it early.</summary>
     private static readonly ControlResult UsageOnlyContinues =
         new(false, "The usage pause is set and lifted by the factory; it can only be continued early (`factory continue --usage`). Use --factory to pause or stop the whole factory.");
+
+    /// <summary>The freeze is set by the factory itself (<see cref="FactoryFreeze"/>); a human only clears it.</summary>
+    private static readonly ControlResult FreezeOnlyContinues =
+        new(false, "The freeze is set by the factory when a trigger holds; it can only be cleared (`factory continue --freeze`). Use --factory to pause or stop the whole factory.");
 
     private sealed record EpicResolution(List<string> InEpic, List<string> Unknown, List<string> Running);
 

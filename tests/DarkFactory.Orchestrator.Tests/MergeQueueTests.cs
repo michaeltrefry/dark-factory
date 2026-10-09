@@ -537,7 +537,7 @@ public class MergeQueueTests
         // Every queue step is a ledger row, in order, inside MergeGate.
         var steps = (await h.Rows(B)).Where(r => r.State == WorkState.MergeGate && r.Step is not null).Select(r => r.Step).ToList();
         Assert.Equal([RunPipeline.Steps.GateDecision, RunPipeline.Steps.Queued, RunPipeline.Steps.QueueTurn, RunPipeline.Steps.BaseUpdate,
-            RunPipeline.Steps.ReviewCarried, RunPipeline.Steps.Verdict, RunPipeline.Steps.GateDecision, RunPipeline.Steps.GatePassed], steps);
+            RunPipeline.Steps.ReviewCarried, RunPipeline.Steps.Verdict, RunPipeline.Steps.GateDecision, RunPipeline.Steps.MergeFiles, RunPipeline.Steps.GatePassed], steps);
     }
 
     [Fact]

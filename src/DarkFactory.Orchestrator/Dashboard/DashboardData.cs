@@ -60,7 +60,7 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
         var now = time.GetUtcNow();
         ControlState ControlOf(WorkItem i) =>
             controls.GetValueOrDefault(ControlScope.Item(i.ExternalId))?.State == ControlState.Stopping ? ControlState.Stopping
-            : new[] { ControlScope.Factory, ControlScope.Usage, ControlScope.Item(i.ExternalId), i.EpicId is { } e ? ControlScope.Epic(e) : "" }
+            : new[] { ControlScope.Factory, ControlScope.Usage, ControlScope.Freeze, ControlScope.Item(i.ExternalId), i.EpicId is { } e ? ControlScope.Epic(e) : "" }
                 .Any(s => controls.GetValueOrDefault(s)?.PausesAt(now) == true) ? ControlState.Paused
             : ControlState.Running;
         var ids = items.Select(i => i.Id).ToList();

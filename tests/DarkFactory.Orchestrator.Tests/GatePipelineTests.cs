@@ -253,6 +253,10 @@ public class GatePipelineTests
         /// <summary>How often a run's controls are polled while a worker or the gate's test runs execute (the pipeline's default when null).</summary>
         public TimeSpan? ControlPoll { get; init; }
         public WorkLedger Ledger => new(Db, TimeProvider.System);
+        /// <summary>The ledger's contexts (for a freeze evaluator, or to seed other items beside the run's).</summary>
+        public LedgerDbContextFactory Contexts => new(_options);
+        /// <summary>When set, the run's freeze evaluator (sc-25387) checks these thresholds, on the system clock and <see cref="GitHub"/>.</summary>
+        public FreezeOptions? Freeze { get; init; }
 
         public Task<RunOutcome> Run(string? implementerModel = ImplementerModel, CancellationToken ct = default) =>
             Run([implementerModel], ct);
@@ -262,7 +266,8 @@ public class GatePipelineTests
                     controls: Controls,
                     controlPollInterval: ControlPoll,
                     gate: new GateStage(GitHub, Panel ?? Reviewer, Models, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5), GateOnFakeClock ? Time : null,
-                        TestRunner))
+                        TestRunner),
+                    freeze: Freeze is null ? null : new FactoryFreeze(Contexts, Controls, Freeze, TimeProvider.System, GitHub))
                 .RunAsync(77, ct);
 
         /// <summary>The implementer reports <c>implementerModels</c>; every later session (a fixer) reports <see cref="FixerModels"/>.</summary>
@@ -325,6 +330,12 @@ public class GatePipelineTests
         Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
         Assert.StartsWith("Merge ", rows.Single(r => r.Step == RunPipeline.Steps.GateDecision).Detail);
         Assert.Equal(Sha1, rows.Single(r => r.Step == RunPipeline.Steps.GatePassed).Detail);
+        // What the merge changed is on record before the merge (the freeze's hot-file and main-red triggers read it, sc-25387).
+        var mergeFiles = rows.FindIndex(r => r.Step == RunPipeline.Steps.MergeFiles);
+        Assert.True(mergeFiles >= 0 && mergeFiles < rows.FindIndex(r => r.Step is null && r.State == WorkState.Merge));
+        var recorded = Controls.MergeFiles.FromDetail(rows[mergeFiles].Detail);
+        Assert.Equal("main", recorded!.Base);
+        Assert.Equal(["src/x.cs"], recorded.Files);
         Assert.Contains("state 77 Merged", h.Stories.Writes);
         // Every checkpoint of a stage sits after its state's transition row (a step counts only once the ledger has it).
         Assert.True(rows.FindIndex(r => r.Step == RunPipeline.Steps.Verdict) > rows.FindIndex(r => r.Step is null && r.State == WorkState.Review));

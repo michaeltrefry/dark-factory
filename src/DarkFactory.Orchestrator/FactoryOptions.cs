@@ -91,6 +91,24 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         ? n
         : throw new InvalidOperationException("Intake:MaxItemFailures must be at least 1.");
 
+    /// <summary>
+    /// The automatic freeze's thresholds (<see cref="Controls.FreezeOptions"/>): <c>Freeze:MaxConsecutiveFailures</c> (≥ 1),
+    /// <c>Freeze:HotFileMerges</c> (≥ 2), <c>Freeze:HotFileWindowHours</c> (&gt; 0), <c>Freeze:CostRisingRounds</c> (≥ 1). A value
+    /// out of range throws (the factory refuses to start).
+    /// </summary>
+    public Controls.FreezeOptions Freeze => new()
+    {
+        MaxConsecutiveFailures = AtLeast("Freeze:MaxConsecutiveFailures", Controls.FreezeOptions.DefaultMaxConsecutiveFailures, 1),
+        HotFileMerges = AtLeast("Freeze:HotFileMerges", Controls.FreezeOptions.DefaultHotFileMerges, 2),
+        HotFileWindow = config.GetValue("Freeze:HotFileWindowHours", Controls.FreezeOptions.DefaultHotFileWindowHours) is var hours && hours > 0
+            ? TimeSpan.FromHours(hours)
+            : throw new InvalidOperationException("Freeze:HotFileWindowHours must be more than 0."),
+        CostRisingRounds = AtLeast("Freeze:CostRisingRounds", Controls.FreezeOptions.DefaultCostRisingRounds, 1),
+    };
+
+    private int AtLeast(string key, int fallback, int min) =>
+        config.GetValue(key, fallback) is var n && n >= min ? n : throw new InvalidOperationException($"{key} must be at least {min}.");
+
     /// <summary><c>Usage:PollSeconds</c>: how often <c>factory work</c> reads the router's subscription usage.</summary>
     public TimeSpan UsagePollInterval => TimeSpan.FromSeconds(config.GetValue("Usage:PollSeconds", 60));
 

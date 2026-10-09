@@ -159,9 +159,12 @@ public class RunPipelineTests
         public string Root { get; init; } = "/wt";
         /// <summary>Runs while a push is in progress, e.g. to set a control then.</summary>
         public Func<Task>? OnPush { get; set; }
+        /// <summary>Runs on each restore of a branch's worktree (e.g. as a fix round starts), before it returns.</summary>
+        public Action? OnRestore { get; set; }
         public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct)
         {
             Calls.Add($"restore {repo} {branch}");
+            OnRestore?.Invoke();
             return Task.FromResult(new Workspace($"{Root}/{branch}", branch, "main", $"/clone/.git/worktrees/{branch}"));
         }
         public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct)

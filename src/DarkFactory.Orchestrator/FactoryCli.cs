@@ -132,19 +132,22 @@ public static class FactoryCli
         var epic = new Option<long?>("--epic") { Description = "Every story of one Shortcut epic (its id)" };
         var factory = new Option<bool>("--factory") { Description = "The whole factory" };
         var usage = new Option<bool>("--usage") { Description = "The factory's usage pause (plans exhausted): lift it before its reset time" };
+        var freeze = new Option<bool>("--freeze") { Description = "The factory's automatic freeze: clear it (only later events can freeze it again)" };
         var command = new Command(action, description) { item, epic, factory };
         if (action == "continue")
         {
             command.Options.Add(usage);
+            command.Options.Add(freeze);
         }
         command.Validators.Add(result =>
         {
-            var given = new[] { result.GetResult(item) is not null, result.GetResult(epic) is not null, result.GetResult(factory) is not null, result.GetResult(usage) is not null }
+            var given = new[] { result.GetResult(item) is not null, result.GetResult(epic) is not null, result.GetResult(factory) is not null, result.GetResult(usage) is not null,
+                    result.GetResult(freeze) is not null }
                 .Count(x => x);
             if (given != 1)
             {
                 result.AddError(action == "continue"
-                    ? "Give exactly one of --item sc-N, --epic N, --factory or --usage."
+                    ? "Give exactly one of --item sc-N, --epic N, --factory, --usage or --freeze."
                     : "Give exactly one of --item sc-N, --epic N or --factory.");
             }
             else if (result.GetValue(epic) is <= 0)
@@ -157,6 +160,7 @@ public static class FactoryCli
             var scope = parse.GetValue(item) is { } story ? Controls.ControlScope.Item(story.ToString())
                 : parse.GetValue(epic) is { } epicId ? Controls.ControlScope.Epic(epicId)
                 : parse.GetValue(usage) ? Controls.ControlScope.Usage
+                : parse.GetValue(freeze) ? Controls.ControlScope.Freeze
                 : Controls.ControlScope.Factory;
             return control(action, scope, ct);
         });
