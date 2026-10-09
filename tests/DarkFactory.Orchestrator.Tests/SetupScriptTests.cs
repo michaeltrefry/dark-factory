@@ -5,8 +5,8 @@ namespace DarkFactory.Orchestrator.Tests;
 
 /// <summary>
 /// The toolchain check in <c>scripts/setup-worker-user.sh</c>, run without root: its functions are
-/// lifted from the script and run as the current user against the repo's helper, with sudo replaced by
-/// a pass-through function. The helper's <c>sandbox_user</c> is not us, so it never kills by uid.
+/// lifted from the script and run as the current user against a <see cref="SafeHelper"/> copy of the repo's helper, with
+/// sudo replaced by a pass-through function. The copy's <c>sandbox_user</c> is not us, so it never kills by uid.
 /// </summary>
 [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
 public class SetupScriptTests
@@ -18,7 +18,7 @@ public class SetupScriptTests
     [Fact]
     public async Task Piping_the_variable_block_in_closes_stdin_and_the_helper_kills_the_tool()
     {
-        var (exitCode, stdout, _) = await BashAsync($"printf '\\n' | '{SandboxSupport.Helper}' '{SlowTool}'");
+        var (exitCode, stdout, _) = await BashAsync($"printf '\\n' | '{SafeHelper.Create(_dir).Path}' '{SlowTool}'");
 
         Assert.Equal(137, exitCode);
         Assert.DoesNotContain("ok", stdout);
@@ -85,11 +85,41 @@ public class SetupScriptTests
         Assert.DoesNotContain(run.Calls, c => c.StartsWith("security "));
     }
 
+    [Fact]
+    public async Task Setup_installs_the_helper_pinned_to_the_worker_and_its_uid_which_the_orchestrator_accepts()
+    {
+        var run = new WholeScriptRun(_dir);
+
+        var (exitCode, output) = await run.RunAsync();
+
+        Assert.True(exitCode == 0, output);
+        var installed = File.ReadAllText(run.InstalledHelper); // only read: never run
+        Assert.Contains("\nsandbox_user=_dftest\n", installed);
+        Assert.Contains("\nsandbox_uid=450\n", installed);
+        Assert.Null(Worker.WorkerSandbox.StaleHelperReason(installed, "_dftest"));
+    }
+
+    [Theory]
+    [InlineData("89")] // an existing role account outside the range setup allocates (e.g. _spotlight's)
+    [InlineData("501")] // a login account
+    public async Task Setup_refuses_a_worker_whose_uid_is_outside_400_499_before_installing_anything(string uid)
+    {
+        var run = new WholeScriptRun(_dir, uid);
+
+        var (exitCode, output) = await run.RunAsync();
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains($"_dftest has uid '{uid}', outside 400-499", output);
+        Assert.False(File.Exists(run.InstalledHelper));
+        Assert.DoesNotContain(run.Calls, c => c.StartsWith("install ") || c.StartsWith("sudo "));
+    }
+
     /// <summary>
     /// The whole <c>setup-worker-user.sh</c>, run as the current user (never root, never real sudo) with every privileged
     /// or system-changing command replaced on PATH by a fake that records its call. Worker <c>_dftest</c>, whose home
     /// <c>/Users/_dftest</c> the fake sudo maps to a temp dir holding a Claude credentials file and a keychain with two
-    /// <c>Claude Code-credentials</c> items. The fake sudo answers a helper invocation itself; nothing ever execs a helper.
+    /// <c>Claude Code-credentials</c> items, and uid <paramref name="uid"/> (dscl). The fake sudo answers a helper invocation
+    /// itself; nothing ever execs a helper. The fake install keeps a copy of the installed helper (<see cref="InstalledHelper"/>).
     /// </summary>
     private sealed class WholeScriptRun
     {
@@ -97,9 +127,10 @@ public class SetupScriptTests
         private readonly string _log;
         private readonly string _items;
 
-        public WholeScriptRun(string dir)
+        public WholeScriptRun(string dir, string uid = "450")
         {
             _dir = dir;
+            InstalledHelper = Path.Combine(dir, "installed-helper");
             var bin = Directory.CreateDirectory(Path.Combine(dir, "bin")).FullName;
             var home = Path.Combine(dir, "home");
             Directory.CreateDirectory(Path.Combine(home, ".claude"));
@@ -149,9 +180,15 @@ public class SetupScriptTests
                 case "$*" in
                     *NFSHomeDirectory*) echo "NFSHomeDirectory: {{dir}}/ownerhome" ;;
                     *PrimaryGroupID*) echo "PrimaryGroupID: 450" ;;
+                    *UniqueID*) echo "UniqueID: {{uid}}" ;;
                 esac
                 """);
-            foreach (var name in new[] { "chown", "chmod", "install", "visudo", "mkdir", "curl" })
+            SandboxSupport.Executable(bin, "install", $$"""
+                #!/bin/bash
+                echo "install $*" >>'{{_log}}'
+                case "${@: -1}" in */factory-worker-launch) cp "${@: -2:1}" '{{InstalledHelper}}' ;; esac
+                """);
+            foreach (var name in new[] { "chown", "chmod", "visudo", "mkdir", "curl" })
             {
                 SandboxSupport.Executable(bin, name, $"#!/bin/sh\necho \"{name} $*\" >>'{_log}'\n");
             }
@@ -162,6 +199,8 @@ public class SetupScriptTests
         }
 
         public string CredentialsFile { get; }
+
+        public string InstalledHelper { get; }
 
         public int KeychainItems => int.Parse(File.ReadAllText(_items).Trim());
 
@@ -196,7 +235,7 @@ public class SetupScriptTests
         var harness = $$"""
             sudo() { while :; do case "$1" in -n) shift ;; -u) shift 2 ;; *) break ;; esac; done; "$@"; }
             owner=owner worker=_factory sudoers=/nonexistent worker_home=/nonexistent
-            helper='{{SandboxSupport.Helper}}'
+            helper='{{SafeHelper.Create(_dir).Path}}'
             {{functions}}
             check_toolchain {{string.Join(' ', tools.Select(t => $"'{t}'"))}}
             """;

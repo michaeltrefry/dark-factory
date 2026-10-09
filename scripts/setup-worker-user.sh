@@ -133,6 +133,12 @@ if ! dscl . -read "/Users/$worker" >/dev/null 2>&1; then
     dscl . -create "/Users/$worker" Password '*'
     dscl . -create "/Users/$worker" IsHidden 1
 fi
+# The helper's uid sweep runs only as this uid, which it pins (step 4): it must be one this script allocates.
+uid=$(dscl . -read "/Users/$worker" UniqueID | awk '{print $2}')
+if ! [[ $uid =~ ^[0-9]+$ ]] || [ "$uid" -lt 400 ] || [ "$uid" -gt 499 ]; then
+    echo "$worker has uid '$uid', outside 400-499: not a role account this script created. Pick another --worker." >&2
+    exit 1
+fi
 
 if [ ! -d "$worker_home" ]; then
     say "Creating $worker_home"
@@ -163,10 +169,13 @@ set_acl "user:$worker allow list,search,read,readattr,readextattr,readsecurity,f
 # --- 4. Launch helper (root-owned) and the one sudoers rule ---------------------------
 say "Installing $helper"
 install -d -o root -g wheel -m 0755 "$helper_dir"
-# The helper kills every process of sandbox_user when a run ends, so it must name this worker.
+# The helper kills every process of sandbox_user when a run ends, so it must name this worker and pin
+# its uid. The orchestrator compares the installed file with the repo's after these same two edits.
 helper_src=$(mktemp)
-sed "s/^sandbox_user=.*/sandbox_user=$worker/" "$script_dir/factory-worker-launch" >"$helper_src"
+sed -e "s/^sandbox_user=.*/sandbox_user=$worker/" -e "s/^sandbox_uid=.*/sandbox_uid=$uid/" \
+    "$script_dir/factory-worker-launch" >"$helper_src"
 grep -qx "sandbox_user=$worker" "$helper_src" || { echo "Could not set sandbox_user in the helper." >&2; exit 1; }
+grep -qx "sandbox_uid=$uid" "$helper_src" || { echo "Could not set sandbox_uid in the helper." >&2; exit 1; }
 install -o root -g wheel -m 0755 "$helper_src" "$helper"
 rm -f "$helper_src"
 

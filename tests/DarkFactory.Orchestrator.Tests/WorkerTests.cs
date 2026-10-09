@@ -451,18 +451,19 @@ public class ClaudeWorkerTests
     {
         var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
         // A group leader, like a worker, but running something other than the configured claude.
-        using var other = Process.Start(new ProcessStartInfo("/usr/bin/perl", ["-e", "setpgrp(0, 0); sleep 30"]))!;
+        using var otherProcess = Process.Start(new ProcessStartInfo("/usr/bin/perl", ["-e", "setpgrp(0, 0); sleep 30"]))!;
+        var other = OwnProcess.Of(otherProcess);
         try
         {
             await Task.Delay(300);
             var worker = new ClaudeWorker(Path.Combine(dir, "fake-claude.sh"), Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1));
 
-            Assert.False(await worker.StopOrphanAsync(other.Id, CancellationToken.None));
-            Assert.False(other.HasExited);
+            Assert.False(await worker.StopOrphanAsync(other.Pid, CancellationToken.None));
+            Assert.False(otherProcess.HasExited);
         }
         finally
         {
-            other.Kill();
+            other.KillIfStillRunning();
         }
     }
 
@@ -495,16 +496,9 @@ public class ClaudeWorkerTests
 
         Assert.True(await worker.StopOrphanAsync(leader, CancellationToken.None));
 
-        Assert.False(IsAlive(leader));
-        Assert.False(IsAlive(child));
+        Assert.False(OwnProcess.Exists(leader));
+        Assert.False(OwnProcess.Exists(child));
         Assert.False(await worker.StopOrphanAsync(leader, CancellationToken.None)); // gone now
         Assert.False((await run.WaitAsync(TimeSpan.FromSeconds(10))).Succeeded); // the stream just ends
-    }
-
-    private static bool IsAlive(int pid)
-    {
-        using var p = Process.Start(new ProcessStartInfo("kill", ["-0", pid.ToString()]) { RedirectStandardError = true })!;
-        p.WaitForExit();
-        return p.ExitCode == 0;
     }
 }

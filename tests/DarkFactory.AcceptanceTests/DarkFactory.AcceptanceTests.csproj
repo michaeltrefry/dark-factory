@@ -18,6 +18,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The one way a test signals a process it started (start-time checked); OwnProcessTests guards both projects. -->
+    <Compile Include="../DarkFactory.Orchestrator.Tests/OwnProcess.cs" Link="OwnProcess.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="../../src/DarkFactory.Orchestrator/DarkFactory.Orchestrator.csproj" />
   </ItemGroup>
 
