@@ -76,9 +76,20 @@ public class GateNegativeTests
         Assert.Contains(reason, gate.Detail);
         Assert.Equal(StepOutcome.GateRejected, gate.Outcome);
         Assert.Equal(StepOutcome.Escalated, history.Last(e => e.Step is null).Outcome);
-        var pr = (await E2e.PullRequestsAsync(run.Sandbox.Repo, run.StoryId, run.Ct)).Single(p => p.GetProperty("html_url").GetString() == outcome.PullRequestUrl);
+        var pr = await LinkedPullAsync(run, history);
         Assert.Equal(JsonValueKind.Null, pr.GetProperty("merged_at").ValueKind);
         return (history, gate);
+    }
+
+    /// <summary>
+    /// The item's PR on GitHub, found by the PR its ledger's <c>linked</c> checkpoint names: the ledger, not the run's
+    /// outcome, is the record of which PR the item opened.
+    /// </summary>
+    private static async Task<JsonElement> LinkedPullAsync(Run run, List<LedgerEntry> history)
+    {
+        var url = RunPipeline.LinkedPullRequestUrl(history);
+        Assert.True(url is not null, $"sc-{run.StoryId}'s ledger links no pull request.");
+        return (await E2e.PullRequestsAsync(run.Sandbox.Repo, run.StoryId, run.Ct)).Single(p => p.GetProperty("html_url").GetString() == url);
     }
 
     /// <summary>
@@ -210,9 +221,9 @@ public class GateNegativeTests
         });
 
         Assert.Equal(WorkState.Escalated, outcome.State);
-        var pr = (await E2e.PullRequestsAsync(run.Sandbox.Repo, run.StoryId, run.Ct)).Single(p => p.GetProperty("html_url").GetString() == outcome.PullRequestUrl);
-        var cap = ExpectedFixCap(await github!.GetPolicyAsync(run.Sandbox.Repo, pr.GetProperty("base").GetProperty("ref").GetString()!, run.Ct));
         var history = await run.E2e.HistoryAsync(run.StoryId, run.Ct);
+        var pr = await LinkedPullAsync(run, history);
+        var cap = ExpectedFixCap(await github!.GetPolicyAsync(run.Sandbox.Repo, pr.GetProperty("base").GetProperty("ref").GetString()!, run.Ct));
         ReviewGateTests.AssertTypedOutcomes(history);
         Assert.Equal(cap, RunPipeline.FixCapOf(history));
         var transitions = history.Where(e => e.Step is null).Select(e => e.State).ToList();

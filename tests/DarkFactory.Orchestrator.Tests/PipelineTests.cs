@@ -455,6 +455,7 @@ public class RunPipelineTests
 
         Assert.False(outcome.Succeeded);
         Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Null(outcome.PullRequestUrl); // escalated before any PR was opened
         Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Escalated], await h.Transitions());
         var escalated = (await h.Rows()).Last(r => r.Step is null);
         Assert.Equal("sess-x", escalated.ClaudeSessionId);
