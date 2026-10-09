@@ -246,6 +246,11 @@ public class FactoryOptionsTests
             Assert.Throws<ReviewConfigurationException>(() => Options(new() { ["Review:Models"] = "claude-opus-5-5", ["Review:Security:Models"] = "claude-sonnet-6" }).ReviewPanel).Message);
         Assert.Contains("Review:Confirm:Models: 'gpt-5.4-mini' is not a Claude model",
             Assert.Throws<ReviewConfigurationException>(() => Options(new() { ["Review:Models"] = "claude-opus-5-5", ["Review:Confirm:Models"] = "claude-sonnet-5,gpt-5.4-mini" }).ReviewPanel).Message);
+        // A list of separators only names no model: refused at start-up (not an empty panel that escalates every item).
+        Assert.Contains("Review:Models lists no model",
+            Assert.Throws<ReviewConfigurationException>(() => Options(new() { ["Review:Models"] = " , " }).ReviewPanel).Message);
+        Assert.Contains("Review:SpecConformance:Models lists no model",
+            Assert.Throws<ReviewConfigurationException>(() => Options(new() { ["Review:SpecConformance:Models"] = "," }).ReviewPanel).Message);
         Assert.Equal((TimeSpan.FromSeconds(30), TimeSpan.FromMinutes(30)), (Options([]).CiPollInterval, Options([]).CiTimeout));
     }
 

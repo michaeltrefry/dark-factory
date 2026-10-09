@@ -280,6 +280,10 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         var models = config[key] is { } list && !string.IsNullOrWhiteSpace(list)
             ? list.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList()
             : fallback;
+        if (models.Count == 0)
+        {
+            throw new ReviewConfigurationException($"{key} lists no model (only separators); set it to a {rule} or leave it unset.");
+        }
         return models.FirstOrDefault(m => !eligible(m)) is { } bad
             ? throw new ReviewConfigurationException($"{key}: '{bad}' is not a {rule}.")
             : models;

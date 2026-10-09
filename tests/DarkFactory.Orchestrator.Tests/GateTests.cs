@@ -47,6 +47,9 @@ public class ReviewModelsTests
     [InlineData("gpt-5.5", false)]
     [InlineData("gemini-3.1-pro-preview", false)]
     [InlineData("mystery-model", false)]
+    [InlineData("claude-opus-5-5-thinking", false)]
+    [InlineData("claude-opus-latest", false)]
+    [InlineData("claude-opus-5-5[1m]", false)]
     public void Only_a_claude_opus_5_or_newer_meets_the_review_floor(string model, bool meets) =>
         Assert.Equal(meets, ReviewModels.MeetsReviewFloor(model));
 
@@ -82,6 +85,11 @@ public class ReviewModelsTests
     [InlineData("claude-opus-5", null, false)]
     [InlineData("claude-opus-5-5", "claude-opus-5-5-2026-01", false)]
     [InlineData("claude-opus-5-5", "claude-opus-5-5-fast", false)]
+    [InlineData("claude-opus-9", "claude-opus-10", true)] // versions compare as numbers, not text
+    [InlineData("claude-opus-5", "claude-opus-5-5-thinking", false)]
+    [InlineData("claude-opus-5", "claude-opus-latest", false)]
+    [InlineData("claude-opus-5", "claude-opus-5-5[1m]", false)]
+    [InlineData("claude-opus-5-5", "claude-opus-5-20261001", false)] // a dated Opus 5.0, not 5.20261001
     [InlineData("claude-opus-5-5", "gpt-5.5", false)]
     [InlineData("claude-opus-5-5", "", false)]
     [InlineData("claude-opus-5-5", null, false)]
