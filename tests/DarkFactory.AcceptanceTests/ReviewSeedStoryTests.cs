@@ -10,7 +10,7 @@ public class ReviewSeedStoryTests
     private static string Fixture(string name) => File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Fixtures", "review", name));
 
     [Fact]
-    public void The_consumed_flag_story_asks_for_the_setting_the_fixture_adds_on_by_default_and_for_tests()
+    public void The_consumed_flag_story_asks_for_the_setting_the_fixture_adds_on_by_default_for_tests_and_its_readme_row()
     {
         var story = ReviewSeedTests.ConsumedStory.Description;
         var diff = Fixture("consumed-config-flag.diff");
@@ -19,6 +19,8 @@ public class ReviewSeedStoryTests
         Assert.Contains("""+    public bool IgnoreBlankInput => config.GetValue("WordCount:IgnoreBlankInput", true);""", diff);
         Assert.Contains("Add tests for the default and for the setting switched off", story);
         Assert.Contains("+++ b/tests/WordCountTests.cs", diff);
+        Assert.Contains("document the setting in the README's configuration table", story);
+        Assert.Contains("+| `WordCount:IgnoreBlankInput` | `true` |", diff);
     }
 
     [Fact]

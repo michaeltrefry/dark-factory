@@ -19,12 +19,13 @@ public class ReviewSeedTests
 
     /// <summary>
     /// The story the consumed flag is reviewed against: it asks for the <c>WordCount:IgnoreBlankInput</c> setting the fixture adds,
-    /// on by default, and for tests of both settings, so <c>consumed-config-flag.diff</c> is a complete, in-scope change.
+    /// on by default, for tests of both settings and for its README row, so <c>consumed-config-flag.diff</c> is a complete, in-scope change.
     /// </summary>
     internal static readonly WorkStory ConsumedStory = new(25379, "Whitespace-only input counts as zero words, behind a setting",
         "WordCounter.Count(\"  \") returns 1. Add a `WordCount:IgnoreBlankInput` setting, on by default: when it is on, blank input "
         + "(only spaces) counts as zero words and runs of spaces do not count as extra words; when it is off, Count keeps today's "
-        + "behaviour for callers that rely on it. Add tests for the default and for the setting switched off.", "bug",
+        + "behaviour for callers that rely on it. Add tests for the default and for the setting switched off, and document the "
+        + "setting in the README's configuration table.", "bug",
         "https://app.shortcut.com/trefry/story/25379");
 
     private static readonly PullFacts Pull = new(1, "https://github.com/michaeltrefry/dark-factory-sandbox/pull/1", true, false, false,
