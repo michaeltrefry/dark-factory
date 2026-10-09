@@ -389,15 +389,31 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   when the story is simple — the `simple` label, any case, or an estimate of 1 or 2 points — else `mid`, no estimate included); the
   CI fixer on `mid` (`CiFix`); issue triage on `low` (`Triage`). Labels and estimate come through `IWorkSource.ReadSpecAsync`
   (`WorkStory.Labels`/`Estimate`: Shortcut's story `labels` and `estimate`; a GitHub issue item has no estimate and its labels are
-  read from the issue at spec time). Each run of a worker session checkpoints `worker-model-class` (Detail: the class), right after
+  read from the issue at spec time — they only pick the class, and need not come from a collaborator, since an issue template can
+  apply one; a failed read logs a warning and counts as no labels, i.e. `mid`, never an item failure). Each run of a worker session checkpoints `worker-model-class` (Detail: the class), right after
   the session's `session` row (a resumed session gets a fresh row: the class is re-derived each run). A failed session whose error
   result (`is_error`) or stderr carries `model_class_unavailable` (the router's 503 when no model of the class can serve; it never
   falls back to another class) is `WorkerResult.ModelClassUnavailable`: it pauses the factory for usage like the rate-limit backstop
   (reason `worker-model-class-unavailable`, backoff, Paused `usage-paused`, auto-resumed, same session) and never escalates; the same
   text in a non-error result is model prose and the failure escalates as usual. A class whose models are all refused by a spent
   subscription comes back as that 429 and takes the existing usage path. Claude Code's own small utility calls (titles, summaries)
-  carry the same headers, so they run on the session's class too (accepted). Residual risk, as with hooks: an implementer loads the
-  target repo's `.claude/settings.json`, whose `env` could replace `ANTHROPIC_CUSTOM_HEADERS` (dropping the class) or set a model.
+  carry the same headers, so they run on the session's class too (accepted). The router key is refused if it holds a CR or LF, in
+  every auth mode (it would end its header line and could add another).
+  Repo settings guard (`Worker/RepoSettingsGuard.cs`): an implementing worker loads the worktree's `.claude/settings.json` and
+  `.claude/settings.local.json` (`--setting-sources project,local`), whose `env` outranks the env the factory sets (it could drop the
+  class, add `x-weave-force-model`, change `ANTHROPIC_BASE_URL`), as could `apiKeyHelper` or `model`. The factory's `--settings`
+  outranks project settings (Claude Code's documented precedence; not re-verified against 2.1.291) but can only add values (overriding `env` would put the router key in argv), so instead
+  `RunWorkerSessionAsync` checks the files owner-side, fail-closed by allowlist: a settings file may hold only top-level keys that
+  cannot change the model, endpoint, headers or credentials (`RepoSettingsGuard.AllowedKeys`: `permissions`, `hooks`,
+  `disableAllHooks`, `includeCoAuthoredBy`, …); any other key (`env`, `model`, `apiKeyHelper`, unknown or future ones), an unreadable
+  or non-object file, a symlinked file or `.claude` (never read through), or a non-regular file fails the round (Escalated, with the
+  reason). It runs before every implement, review/conflict fix and CI fix session (new or resumed: a branch the worker committed
+  such a file to in an earlier round is refused before the next round starts) and again when the worker finishes, before
+  `worker-done` (so a worker that writes one never has it pushed). Residual risk, accepted: Claude Code may reload a settings file the
+  worker writes mid-session, so that session's own later calls could run unclassed or on another endpoint until it ends (its work is
+  then refused); project subagents or commands (`.claude/agents`, `.claude/commands`) may name a model in their front matter, which
+  only asks for it in the request body — the class header still holds the router to the class. A target repo whose default branch
+  carries such settings gets no implementer until they are removed. Triage loads no settings at all (`--setting-sources ""`).
 - Untrusted-input taint (E4, sc-25386, `Worker/Taint.cs`): a worker session that has read untrusted content is tainted — a
   `session_taints` row keyed by its Claude session id (insert-only; a Postgres trigger refuses UPDATE/DELETE; the first reason
   is kept), so it holds across resume and crash and nothing clears it. Sources: the input the orchestrator hands it

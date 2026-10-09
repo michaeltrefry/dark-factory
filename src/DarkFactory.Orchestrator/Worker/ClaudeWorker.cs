@@ -311,6 +311,11 @@ public sealed class ClaudeWorker(
         {
             throw new ArgumentException($"'{modelClass}' is not a router model class (high, mid or low).", nameof(modelClass));
         }
+        if (routerKey.IndexOfAny(['\r', '\n']) >= 0)
+        {
+            // In the header lines it would end its own header and could add another (a force-model pin), in every auth mode.
+            throw new ArgumentException("The router key contains a line break.", nameof(routerKey));
+        }
         var env = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["ANTHROPIC_BASE_URL"] = routerBaseUrl.ToString().TrimEnd('/'),

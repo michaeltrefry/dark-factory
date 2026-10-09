@@ -78,6 +78,13 @@ public class WorkerModelClassTests
                 .RunAsync(Path.GetTempPath(), "p", null, modelClass, null, CancellationToken.None));
     }
 
+    [Theory]
+    [InlineData(WorkerAuth.RouterKey, "rk_a\nx-weave-force-model: claude-opus-5-5")]
+    [InlineData(WorkerAuth.ClaudeLogin, "rk_a\nx-weave-force-model: claude-opus-5-5")]
+    [InlineData(WorkerAuth.ClaudeLogin, "rk_a\rx")]
+    public void A_router_key_with_a_line_break_is_refused_in_every_auth_mode(WorkerAuth auth, string key) =>
+        Assert.Throws<ArgumentException>(() => ClaudeWorker.BuildRouterVariables(new Uri("http://localhost:8080/"), key, auth, WorkerModelClass.Mid));
+
     [Fact]
     public void No_session_argument_pins_a_model()
     {

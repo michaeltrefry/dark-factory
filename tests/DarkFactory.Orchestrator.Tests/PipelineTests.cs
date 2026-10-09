@@ -156,7 +156,7 @@ public class RunPipelineTests
     {
         public List<string> Calls { get; } = [];
         /// <summary>Where worktrees live (<c>&lt;root&gt;/&lt;branch&gt;</c>); a real directory only when a test puts files there.</summary>
-        public string Root { get; init; } = "/wt";
+        public string Root { get; set; } = "/wt";
         /// <summary>Runs while a push is in progress, e.g. to set a control then.</summary>
         public Func<Task>? OnPush { get; set; }
         /// <summary>Runs on each restore of a branch's worktree (e.g. as a fix round starts), before it returns.</summary>

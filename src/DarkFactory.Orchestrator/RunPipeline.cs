@@ -918,6 +918,8 @@ public sealed partial class RunPipeline(
                 throw new SessionTaintedException(resume, taint.Reason);
             }
         }
+        // The worktree's Claude settings must not replace the router variables or pin a model (E8): the session does not start.
+        ThrowIfUnsafeRepoSettings(workspace, starting: true);
         // No worker session starts into a frozen factory (implement, a fix round, a CI fix).
         await ThrowIfFrozenAsync(item, ct);
         log.WriteLine(resume is null ? $"[{label}] starting worker" : $"[{label}] resuming claude session {resume}");
@@ -1070,8 +1072,22 @@ public sealed partial class RunPipeline(
         {
             await ledger.TaintSessionAsync(item, session, changed, ct);
         }
+        // Nor may the worker leave such settings for a later session (or push them): its round fails instead.
+        ThrowIfUnsafeRepoSettings(workspace, starting: false);
         await ledger.CheckpointAsync(item, Steps.WorkerDone, session, $"worker exit {result.ExitCode}", ct);
         return session;
+    }
+
+    /// <summary>Fails the worker round (escalates) when the worktree's Claude settings are not safe (<see cref="RepoSettingsGuard"/>).</summary>
+    private static void ThrowIfUnsafeRepoSettings(Workspace workspace, bool starting)
+    {
+        if (RepoSettingsGuard.Refusal(workspace.Path) is { } refusal)
+        {
+            throw new WorkerFailedException(starting
+                ? $"The worker session was not started: the worktree's Claude settings are refused ({refusal}). Only keys that cannot "
+                    + "change the model, endpoint, headers or credentials are allowed in the branch's .claude settings."
+                : $"The worker left Claude settings the factory refuses ({refusal}), so its work is not pushed.");
+        }
     }
 
     /// <summary>

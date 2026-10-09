@@ -362,6 +362,14 @@ public class IssueIntakeTests
         var labelled = (await h.Source().ReadSpecAsync(1, CancellationToken.None)).Story;
         Assert.Contains(WorkerModelClass.SimpleLabel, labelled.Labels!);
         Assert.Equal(WorkerModelClass.Low, WorkerModelClass.Coding(labelled));
+
+        // GitHub unreachable: the spec still reads (no labels: complex, mid), with a warning; no item failure.
+        h.GitHub.Down = new HttpRequestException("GitHub is down");
+        var log = new StringWriter();
+        var unread = (await new GitHubIssueWorkSource(h.GitHub, h.Contexts, h.Watched, h.Time, log).ReadSpecAsync(1, CancellationToken.None)).Story;
+        Assert.Null(unread.Labels);
+        Assert.Equal(WorkerModelClass.Mid, WorkerModelClass.Coding(unread));
+        Assert.Contains("could not read the issue's labels (GitHub is down)", log.ToString());
     }
 
     [Fact]
