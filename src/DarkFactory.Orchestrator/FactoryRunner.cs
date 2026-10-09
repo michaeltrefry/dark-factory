@@ -1,5 +1,6 @@
 using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Gate;
+using DarkFactory.Orchestrator.Gateway;
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
@@ -109,7 +110,7 @@ public static class FactoryRunner
     /// <param name="ignoreScope"><c>factory run --ignore-scope</c>: claim and resume the story even outside the watch scope.</param>
     public static async Task<RunOutcome> RunAsync(FactoryOptions options, int storyId, bool ignoreScope, TextWriter log, CancellationToken ct)
     {
-        using var shortcutHttp = new HttpClient { BaseAddress = ShortcutWorkSource.DefaultBaseAddress };
+        using var shortcutHttp = OutboundHttp.ShortcutApi();
         return await RunAsync(options, CreateWorkSource(options, shortcutHttp), storyId, ignoreScope, log, ct);
     }
 
@@ -120,7 +121,7 @@ public static class FactoryRunner
         {
             return await RunAsync(options, item.Id, ignoreScope, log, ct);
         }
-        using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        using var githubHttp = OutboundHttp.GitHubApi();
         return await RunAsync(options, CreateIssueSource(options, githubHttp), item.Id, ignoreScope, log, ct);
     }
 
@@ -137,7 +138,7 @@ public static class FactoryRunner
     /// </summary>
     public static FactoryFreeze CreateFreeze(FactoryOptions options)
     {
-        var http = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        var http = OutboundHttp.GitHubApi();
         var gateApp = new GitHubApp(http, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System);
         return new FactoryFreeze(Contexts(options), Controls(options), options.Freeze, TimeProvider.System, new GitHubGate(http, gateApp));
     }
@@ -151,7 +152,7 @@ public static class FactoryRunner
     /// </summary>
     public static async Task PollIssuesAsync(FactoryOptions options, IntakeStatus status, TextWriter log, CancellationToken ct)
     {
-        using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        using var githubHttp = OutboundHttp.GitHubApi();
         var intake = new Issues.IssueIntake(IssuesClient(options, githubHttp), options.WatchedIssueRepos, Contexts(options),
             new PostgresRunLocks(options.LedgerConnectionString), Controls(options), new SandboxTriageRunner(options, log), status,
             options.MaxItemFailures, TimeProvider.System, log);
@@ -185,12 +186,12 @@ public static class FactoryRunner
             await EnsureSandboxReadyAsync(sandbox, options.WorkerAuth, ct);
         }
 
-        using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
-        using var routerHttp = new HttpClient { BaseAddress = options.RouterBaseUrl };
+        using var githubHttp = OutboundHttp.GitHubApi();
+        using var routerHttp = OutboundHttp.RouterApi(options.RouterBaseUrl);
         var app = new GitHubApp(githubHttp, appId, appKey, TimeProvider.System);
         // The merge-capable credential: a separate App only the gate uses (workers' pushes and PRs use the one above).
         var gateApp = new GitHubApp(githubHttp, gateAppId, gateAppKey, TimeProvider.System);
-        using var reviewerHttp = new HttpClient { BaseAddress = options.RouterBaseUrl, Timeout = options.ReviewTimeout };
+        using var reviewerHttp = OutboundHttp.RouterApi(options.RouterBaseUrl, options.ReviewTimeout);
 
         await FactoryWide("the ledger", async () => { await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct); return true; });
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
@@ -266,11 +267,11 @@ public static class FactoryRunner
     {
         await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
         var contexts = new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
-        using var shortcutHttp = new HttpClient { BaseAddress = ShortcutWorkSource.DefaultBaseAddress };
+        using var shortcutHttp = OutboundHttp.ShortcutApi();
         // Stop needs the board and GitHub, and an epic scope the board (for items with no epic in the ledger);
         // Pause and Continue otherwise only write the control.
         var source = action == "stop" || ControlScope.EpicOf(scope) is not null ? CreateWorkSource(options, shortcutHttp) : null;
-        using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        using var githubHttp = OutboundHttp.GitHubApi();
         var stops = action == "stop" ? new FactoryItemStops(options, source!, log, CreateIssueSource(options, githubHttp)) : null;
         var actions = new ControlActions(Controls(options), contexts, stops, source, new PostgresRunLocks(options.LedgerConnectionString));
         return action switch
@@ -298,7 +299,7 @@ public sealed class FactoryItemStops(FactoryOptions options, IWorkSource source,
 
     private async Task<ControlResult> StopAsync(IWorkSource owner, int id, CancellationToken ct)
     {
-        using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        using var githubHttp = OutboundHttp.GitHubApi();
         var app = new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System);
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
         var stopper = new ItemStopper(owner, new WorkLedger(db, TimeProvider.System), new PostgresRunLocks(options.LedgerConnectionString),
@@ -324,8 +325,8 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         {
             await FactoryRunner.EnsureSandboxReadyAsync(sandbox, options.WorkerAuth, ct);
         }
-        using var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
-        using var routerHttp = new HttpClient { BaseAddress = options.RouterBaseUrl };
+        using var githubHttp = OutboundHttp.GitHubApi();
+        using var routerHttp = OutboundHttp.RouterApi(options.RouterBaseUrl);
         var app = new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System);
         var workspaces = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
             async (r, c) => (await app.CreateInstallationTokenAsync(r, c, Issues.WorkerTriageRunner.TriageWorkspaceToken)).Token, sandbox: sandbox);

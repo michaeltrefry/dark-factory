@@ -187,6 +187,7 @@ public class MergeGateTests
     }
 
     [Fact]
+    [FailsGateCheck(GateChecks.CiGreen)]
     public void No_ci_at_all_or_unreadable_ci_blocks_a_check_that_cannot_run_counts_as_failed()
     {
         Assert.Contains("no CI check has reported", Evaluate(ci: new CiFacts(Head, [])).Detail);
@@ -229,6 +230,7 @@ public class MergeGateTests
     }
 
     [Fact]
+    [FailsGateCheck(GateChecks.ReviewPass)]
     public void A_failed_review_or_a_reviewer_that_is_not_a_claude_opus_5_5_served_as_pinned_blocks()
     {
         Assert.Contains("is 'fail'", Evaluate(verdicts: [Pass with { Verdict = ReviewVerdict.Fail }]).Detail);
@@ -286,6 +288,8 @@ public class MergeGateTests
     }
 
     [Fact]
+    [FailsGateCheck(GateChecks.ReviewPass)]
+    [FailsGateCheck(GateChecks.SecurityReview)]
     public void A_verdict_missing_a_required_role_blocks()
     {
         Assert.Contains("has no spec-conformance review", Evaluate(verdicts: [Pass with { Reviews = [Pass.Reviews[0]] }]).Detail);

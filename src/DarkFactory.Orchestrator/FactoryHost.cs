@@ -1,5 +1,6 @@
 using DarkFactory.Orchestrator.Dashboard;
 using DarkFactory.Orchestrator.Dashboard.Components;
+using DarkFactory.Orchestrator.Gateway;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Router;
 using DarkFactory.Orchestrator.Sessions;
@@ -143,7 +144,7 @@ public static class FactoryHost
             options.LedgerConnectionString, sp.GetRequiredService<SessionBroadcaster>(), Console.Out, pipeline: sp.GetRequiredService<PipelineChanges>()));
         services.AddHostedService(sp => sp.GetRequiredService<SessionEventRelay>());
         services.AddSingleton<ISessionCostSource>(_ =>
-            new RouterClient(new HttpClient { BaseAddress = options.RouterBaseUrl }, options.RouterKey));
+            new RouterClient(OutboundHttp.RouterApi(options.RouterBaseUrl), options.RouterKey));
         services.AddSingleton(sp => new SessionRecorder(
             sp.GetRequiredService<IDbContextFactory<LedgerDbContext>>(),
             sp.GetRequiredService<ISessionCostSource>(),

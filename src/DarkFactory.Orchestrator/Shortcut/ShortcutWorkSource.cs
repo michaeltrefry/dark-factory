@@ -50,7 +50,7 @@ public sealed record WatchScope(IReadOnlyList<string> Teams, IReadOnlyList<int> 
 /// </summary>
 public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchScope scope, TimeProvider? time = null) : IWorkSource
 {
-    public static readonly Uri DefaultBaseAddress = new("https://api.app.shortcut.com/api/v3/");
+    public static readonly Uri DefaultBaseAddress = Gateway.OutboundHttp.ShortcutApiBase;
 
     public const string ClaimLabel = "factory-claimed";
     public const string ReadyState = "To Do";

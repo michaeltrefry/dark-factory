@@ -1,5 +1,5 @@
 using System.Diagnostics;
-using System.Text;
+using DarkFactory.Orchestrator.Gateway;
 using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 
@@ -350,8 +350,7 @@ public sealed class GitWorkspace(
         {
             return false;
         }
-        await Git(dir, await AuthEnvironment(repo, ct), ct,
-            [.. tree, "push", "--force", "origin", $"HEAD:refs/heads/{workspace.Branch}"]);
+        await Git(dir, await AuthEnvironment(repo, ct), ct, GitRemoteWrites.Push(tree, workspace.Branch, force: true));
         return true;
     }
 
@@ -389,7 +388,7 @@ public sealed class GitWorkspace(
     {
         EnsureFactoryBranch(workspace.Branch);
         await Git(workspace.Path, await AuthEnvironment(repo, ct), ct,
-            $"--git-dir={workspace.GitDir}", $"--work-tree={workspace.Path}", "push", "origin", $"HEAD:refs/heads/{workspace.Branch}");
+            GitRemoteWrites.Push([$"--git-dir={workspace.GitDir}", $"--work-tree={workspace.Path}"], workspace.Branch, force: false));
     }
 
     public async Task<IReadOnlyList<string>> ConflictMarkersAsync(RepoRef repo, string sha, IReadOnlyList<string> paths, CancellationToken ct)
@@ -450,24 +449,9 @@ public sealed class GitWorkspace(
         }
     }
 
-    private async Task<Dictionary<string, string>?> AuthEnvironment(RepoRef repo, CancellationToken ct)
-    {
-        var value = await token(repo, ct);
-        if (value is null)
-        {
-            return null;
-        }
-        var basic = Convert.ToBase64String(Encoding.ASCII.GetBytes($"x-access-token:{value}"));
-        return new Dictionary<string, string>
-        {
-            ["GIT_CONFIG_COUNT"] = "2",
-            ["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader",
-            ["GIT_CONFIG_VALUE_0"] = $"AUTHORIZATION: basic {basic}",
-            // Don't let the owner's credential helper substitute their own identity.
-            ["GIT_CONFIG_KEY_1"] = "credential.helper",
-            ["GIT_CONFIG_VALUE_1"] = "",
-        };
-    }
+    /// <summary>The installation token's git credentials (<see cref="GitRemoteWrites.Credentials"/>), or none without a token.</summary>
+    private async Task<Dictionary<string, string>?> AuthEnvironment(RepoRef repo, CancellationToken ct) =>
+        await token(repo, ct) is { } value ? GitRemoteWrites.Credentials(value) : null;
 
     /// <summary>Every git call of this class, isolated from the owner's own git config (<see cref="OwnerGit.Isolate"/>).</summary>
     private Task<string> Git(string cwd, Dictionary<string, string>? env, CancellationToken ct, params string[] args)

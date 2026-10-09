@@ -18,7 +18,17 @@ Claude Code headless workers through the Weave router.
   review and merge gate (`Gate/`: `ReviewModels`/`ReviewerChoice`, `ReviewPanel` (roles, risky paths, prompts, findings),
   `RouterReviewer`, `GatePolicy`, `MergeGate`, the new-tests check `NewTestsCheck`/`XunitNewTests`/`SandboxTestRunner`;
   reviewer prompts in `factory/prompts/`; GitHub side
-  `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`, the merge gate and queue `RunPipeline.MergeQueue.cs`).
+  `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`, the merge gate and queue `RunPipeline.MergeQueue.cs`),
+  and the outbound gateway (`Gateway/`: `OutboundHttp` builds every GitHub, Shortcut and router `HttpClient`;
+  `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token credentials).
+- `src/DarkFactory.Analyzers` — the gateway lint (sc-25390), a Roslyn analyzer every orchestrator build runs (CI's
+  `build-test` included), all errors: DF0001 an HTTP client/handler, socket, web socket, `WebRequest`/`WebClient`,
+  `IHttpClientFactory`/`AddHttpClient` outside `Gateway/`; DF0002 a `push`/`set-url` git argument or `git push` text outside
+  it; DF0003 a model provider host or key (`api.anthropic.com`, `ANTHROPIC_API_KEY`, …) anywhere, the embedded manifests,
+  prompts, scripts and Razor markup included; DF0004 GitHub's or Shortcut's API host outside it. `GatewayLintTests` seed each
+  violation and lint the current tree. Gate checks: a test that makes a check fail carries `[FailsGateCheck("…")]`;
+  `GateCheckCoverageTests` fails unless every check in `GateCheckCoverage.Registry` (`GateChecks.All` + the policy floors)
+  has a running (not skipped/explicit) one.
 - `scripts/` — `setup-worker-user.sh` (one-time root setup of the `_factory` sandbox user) and
   `factory-worker-launch` (the root-installed helper every sandboxed worker runs through).
 - `tests/DarkFactory.Orchestrator.Tests` — unit tests (no network; fake HTTP APIs, InMemory EF, local git).

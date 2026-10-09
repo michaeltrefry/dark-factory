@@ -82,6 +82,8 @@ public class GatePolicyTests
 
     [Theory]
     [MemberData(nameof(Invalid))]
+    [FailsGateCheck(GateCheckCoverage.FloorChecks)]
+    [FailsGateCheck(GateCheckCoverage.FloorSealedPaths)]
     public void A_corrupt_or_incomplete_policy_is_invalid(string yaml, string reason)
     {
         var ex = Assert.Throws<GatePolicyException>(() => GatePolicy.Parse(yaml));
@@ -295,6 +297,11 @@ public class MergeGateTierTests
     [InlineData("src/auth/Login.cs", Tier.Protected, true, true, true, true, true, false, "touches protected path(s), merged only after escalation")]
     [InlineData("src/WordCount.cs", Tier.Normal, true, true, false, true, true, true, null)]
     [InlineData("tests/WordCountTests.cs", Tier.Free, true, true, false, false, false, true, null)]
+    [FailsGateCheck(GateChecks.CiGreen)]
+    [FailsGateCheck(GateChecks.ReviewPass)]
+    [FailsGateCheck(GateChecks.SecurityReview)]
+    [FailsGateCheck(GateChecks.RiskThreshold)]
+    [FailsGateCheck(GateChecks.NewTestsFailOnBase)]
     public void Each_tier_enforces_its_required_checks(string path, Tier tier, bool ci, bool review, bool security, bool risk, bool newTests, bool merges,
         string? escalation)
     {
@@ -339,6 +346,7 @@ public class MergeGateTierTests
     }
 
     [Fact]
+    [FailsGateCheck(GateChecks.RiskThreshold)]
     public void The_risk_threshold_holds_at_its_limits()
     {
         Assert.Equal(GateOutcome.Merge, Evaluate(TestPolicies.Diff("src/a.cs", lines: 400), fixRounds: 3).Outcome);
@@ -367,6 +375,8 @@ public class MergeGateTierTests
     }
 
     [Fact]
+    [FailsGateCheck(GateChecks.CiGreen)]
+    [FailsGateCheck(GateChecks.SecurityReview)]
     public void A_sealed_tier_change_still_needs_its_checks_and_says_so()
     {
         var decision = Evaluate(TestPolicies.Diff(".github/workflows/ci.yml"), ci: Red,
@@ -405,6 +415,7 @@ public class MergeGateTierTests
     [InlineData("scripts/deploy.sh", "scripts/deploy.sh (scripts)")]
     [InlineData("src/App/App.csproj", "src/App/App.csproj (dependencies)")]
     [InlineData("tests/TokenTests.cs", "tests/TokenTests.cs (security-sensitive code)")] // a free path the floor still matches
+    [FailsGateCheck(GateCheckCoverage.FloorSecurityReviewPaths)]
     public void A_path_on_the_code_floor_needs_the_security_review_whatever_its_tier(string path, string why)
     {
         var withoutSecurity = Full with { Reviews = Full.Reviews.Where(r => r.Role != ReviewRoles.Security).ToList() };
