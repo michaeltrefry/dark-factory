@@ -190,7 +190,7 @@ public class FixLoopTests
     {
         RoleReview Clean(string role, string model, string? served) => new(role, model, served, "s", "p", [], "ok");
         var previous = ReviewPanel.Decide(Sha1, [], [Clean(ReviewRoles.Correctness, "claude-opus-5-5", "claude-opus-5-5"),
-            Clean(ReviewRoles.SpecConformance, "claude-opus-5", "claude-opus-5")]);
+            Clean(ReviewRoles.SpecConformance, "claude-opus-4-7", "claude-opus-4-7")]);
         Assert.Equal([ReviewRoles.Correctness], FixLoop.Carried(previous, ReviewRoles.Required(false)).Select(r => r.Role));
         var unnamed = previous with { Reviews = [previous.Reviews[0] with { ServedModel = null }, previous.Reviews[1]] };
         Assert.Empty(FixLoop.Carried(unnamed, ReviewRoles.Required(false)));

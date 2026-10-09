@@ -257,25 +257,19 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
 
     /// <summary>
     /// The review panel's model lists, each comma-separated and in order of preference: <c>Review:&lt;Role&gt;:Models</c>
-    /// (<c>Correctness</c>, <c>SpecConformance</c>, <c>Security</c>) per role, falling back to <c>Review:Models</c> — no
-    /// default, every entry a <see cref="Gate.ReviewModels.FloorText"/> (<see cref="Gate.ReviewModels.MeetsReviewFloor"/>);
-    /// <c>Review:Confirm:Models</c> for the second model that checks a blocking finding (default
-    /// <see cref="Gate.ReviewPanelModels.DefaultConfirmers"/>), every entry a Claude model. A role with no reviewer model, or an
-    /// entry that breaks its rule, throws <see cref="ReviewConfigurationException"/> (the factory refuses to start).
+    /// (<c>Correctness</c>, <c>SpecConformance</c>, <c>Security</c>) per role, falling back to <c>Review:Models</c> (default
+    /// <see cref="Gate.ReviewPanelModels.DefaultReviewers"/>), every entry a <see cref="Gate.ReviewModels.FloorText"/>
+    /// (<see cref="Gate.ReviewModels.MeetsReviewFloor"/>); <c>Review:Confirm:Models</c> for the second model that checks a
+    /// blocking finding (default <see cref="Gate.ReviewPanelModels.DefaultConfirmers"/>), every entry a Claude model. An entry
+    /// that breaks its rule throws <see cref="ReviewConfigurationException"/> (the factory refuses to start).
     /// </summary>
     public Gate.ReviewPanelModels ReviewPanel
     {
         get
         {
-            var shared = Models("Review:Models", [], Gate.ReviewModels.MeetsReviewFloor, Gate.ReviewModels.FloorText);
-            var roles = Gate.ReviewRoles.All.ToDictionary(r => r, r =>
-            {
-                var key = $"Review:{Gate.ReviewRoles.ConfigName(r)}:Models";
-                var models = Models(key, shared, Gate.ReviewModels.MeetsReviewFloor, Gate.ReviewModels.FloorText);
-                return models.Count > 0 ? models : throw new ReviewConfigurationException(
-                    $"No {r} reviewer model is configured: reviewers must be a {Gate.ReviewModels.FloorText} and there is no default; "
-                    + $"set Review:Models (or {key}) to one the router routes.");
-            });
+            var shared = Models("Review:Models", Gate.ReviewPanelModels.DefaultReviewers, Gate.ReviewModels.MeetsReviewFloor, Gate.ReviewModels.FloorText);
+            var roles = Gate.ReviewRoles.All.ToDictionary(r => r,
+                r => Models($"Review:{Gate.ReviewRoles.ConfigName(r)}:Models", shared, Gate.ReviewModels.MeetsReviewFloor, Gate.ReviewModels.FloorText));
             return new Gate.ReviewPanelModels(roles,
                 Models("Review:Confirm:Models", Gate.ReviewPanelModels.DefaultConfirmers, Gate.ReviewModels.IsClaude, "Claude model"));
         }

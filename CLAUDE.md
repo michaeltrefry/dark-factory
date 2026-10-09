@@ -112,9 +112,9 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
 | `GitHub:Gate:AppId`, `GitHub:Gate:PrivateKeyPem` | keychain `github-gate-app-id`, `github-gate-app-private-key` (written by `factory github-app setup --gate`): the merge gate's App, the only credential that merges |
-| `Review:Models` | none — must be set: the router catalog (`GET /v1/router/models`, 2026-10-08) has no Claude Opus 5.5 or newer, and the factory refuses to start without one (`ReviewConfigurationException`: `factory run` and `factory work` print the reason and exit 2, before any router call) (every panel role's reviewer models in order, unless the role sets its own; each must be a Claude Opus 5.5 or newer, `ReviewModels.MeetsReviewFloor`: `claude-opus-<major>[-.]<minor>[-yyyymmdd]`, where the dotted and dashed spellings are one model everywhere ids are compared — pinned, served, reviewer vs second model — an older Opus, another Claude or another vendor's model is refused; the first entry reviews, whatever models the implementer used) |
-| `Review:Correctness:Models`, `Review:SpecConformance:Models`, `Review:Security:Models` | `Review:Models` (one panel role's own reviewer models, in order; the same Claude Opus 5.5 or newer rule) |
-| `Review:Confirm:Models` | `claude-opus-5,claude-sonnet-5` (the router catalog's Claude models; second models that confirm a blocking finding: the first Claude model that is not the reviewer's model; a non-Claude entry is refused) |
+| `Review:Models` | `claude-opus-5` (`ReviewPanelModels.DefaultReviewers`; owner decision 2026-10-09: the router catalog has no Opus 5.5 id and its `model_mapping` serves `claude-opus-5` as `claude-opus-5-5`) (every panel role's reviewer models in order, unless the role sets its own; each must be a Claude Opus 5 or newer, `ReviewModels.MeetsReviewFloor`, else the factory refuses to start — `ReviewConfigurationException`: `factory run` and `factory work` print the reason and exit 2, before any router call; ids read as `claude-opus-<major>[-.]<minor>[-yyyymmdd]`, where the dotted and dashed spellings are one model everywhere ids are compared — pinned, served, reviewer vs second model — an older Opus, another Claude or another vendor's model is refused; the first entry reviews, whatever models the implementer used) |
+| `Review:Correctness:Models`, `Review:SpecConformance:Models`, `Review:Security:Models` | `Review:Models` (one panel role's own reviewer models, in order; the same Claude Opus 5 or newer rule) |
+| `Review:Confirm:Models` | `claude-opus-5,claude-sonnet-5` (the router catalog's Claude models; second models that confirm a blocking finding: the first Claude model not pinned to the reviewer's pinned id — pinned ids are compared, never served ones; a non-Claude entry is refused) |
 | `Review:TimeoutMinutes` | `10` (> 0: one reviewer call) |
 | `Gate:CiPollSeconds`, `Gate:CiTimeoutMinutes` | `30`, `30` (each > 0: CI on the PR head is polled until it finishes; still running at the timeout escalates) |
 | `Gate:TestTimeoutMinutes` | `20` (> 0: one sandboxed run — restore, build, the new tests — of the `new-tests-fail-on-base` check; still running at the timeout fails the check) |
@@ -487,7 +487,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `factory/gate.yaml` lists `security-review` or that the code floor `RiskyPaths` matches (`GatePolicy.SecurityReviewReasons`,
   both recorded in the verdict's risky paths; see the floors under MergeGate below; a missing/invalid policy escalates at
   Review before any call). Each role reviews with the first entry of its own
-  model list (`Review:<Role>:Models`, else `Review:Models`) that is a Claude Opus 5.5 or newer (owner decision 2026-10-08:
+  model list (`Review:<Role>:Models`, else `Review:Models`, default `claude-opus-5`) that is a Claude Opus 5 or newer (owner decisions 2026-10-08 and 2026-10-09:
   every reviewer and second model is Claude, whichever models the implementer used — there is no cross-family rule;
   `ReviewModels`/`ReviewerChoice`; a role with no such model escalates before any call). Each role makes one
   router call (`RouterReviewer`: `POST /v1/messages`, router key only, `x-weave-force-model` pin, its own
@@ -497,7 +497,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   embedded resources (`ReviewPrompts`) — never read from the target repo or the PR (which could rewrite the prompt it is
   judged by) nor from disk at run time; changing one is a dark-factory PR. Each role answers findings tagged `blocking` or
   `optional` (an unknown severity counts as blocking); each blocking finding goes to a second model (`Review:Confirm:Models`:
-  the first Claude model that is not the reviewer's pinned or served model; none → escalate) with `confirm.md`: not confirmed → downgraded to optional (`downgraded: true`), does not
+  the first Claude model not pinned to the reviewer's pinned id (`ReviewModels.SamePinned`: same id or its dated snapshot; what the router served never makes two pins the same or different); none → escalate) with `confirm.md`: not confirmed → downgraded to optional (`downgraded: true`), does not
   block; confirmed, or an unusable confirm answer → stays blocking. Every panel call's session id is generated by the
   pipeline and checkpointed (`review-session`: "session model sha role prompt-path@sha256:hash"; role `confirm-<role>` for
   a second model) before the call, so a call that never returns still has a readable cost (E9) and the prompt it used is on
@@ -507,7 +507,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   lists the risky paths and every role's model, served model, session, prompt and findings) is a `verdict`
   checkpoint bound to that head SHA. Anything but a clean findings line from the pinned model is an unusable review and a
   fail: the router must name the served model and it must be the pinned id or its dated snapshot (`<pinned>-yyyymmdd`,
-  `ReviewModels.Serves`) — a router answer naming no served model, or another model, included. Fix loop (sc-25380, `Gate/FixLoop.cs`, `FixAsync`): a fail whose
+  `ReviewModels.Serves`), or — only when the pinned id is a Claude Opus — a Claude Opus of the same or a higher version (the
+  router may upgrade, e.g. `claude-opus-5` served as `claude-opus-5-5`, never downgrade); a non-Opus pin such as
+  `claude-sonnet-5` counts only as itself or its snapshot. A router answer naming no served model, a lower Opus, a non-Opus
+  or a non-Claude model fails closed. Fix loop (sc-25380, `Gate/FixLoop.cs`, `FixAsync`): a fail whose
   only cause is blocking findings every one of which a second model confirmed (`FixLoop.Fixable`) goes Review → Fixing (row
   Detail = the fixed head); any other fail (an unusable answer, a missing role, an unusable confirmation) escalates. A fix
   round runs a fixer worker exactly like the implementer (same sandbox, router key only, session checkpointed and resumed,
@@ -578,8 +581,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   protected > free whose patterns (`PathPattern`: root-anchored, `*`/`?`/`**`, trailing `/` = directory; sealed and
   protected case-insensitive, free case-sensitive, so case only moves a path to a stricter tier) match, else normal; the change
   needs the union of its tiers' checks: `ci-green`, `review-pass` (the head's verdict passes, holds every required role, and
-  every reviewer is a Claude Opus 5.5 or newer and every second model a Claude model other than its reviewer's, each
-  served by the router as pinned — `ReviewModels.Problems`; the implementer's models are not consulted), `security-review` (the verdict has the
+  every reviewer is a Claude Opus 5 or newer and every second model a Claude model pinned to another id than its
+  reviewer's, each served by the router as pinned or, for an Opus pin, as a same-or-newer Opus — `ReviewModels.Problems`; the implementer's models are not consulted), `security-review` (the verdict has the
   security review), `risk-threshold` (changed lines, files — renames count both paths — and fix rounds within `risk`),
   `new-tests-fail-on-base` (sc-25382, below). A sealed path always escalates (even with no verdict); a protected one escalates after its checks instead of merging; each
   evaluation is a `gate` checkpoint. A head without a verdict (a push after the review) goes back
@@ -654,7 +657,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   Upgrading from Phase 1: Review is now a handled state, so the first `factory work` picks up every item parked at Review:
   an open PR is reviewed by the panel like any other (Phase 1's missing `implementer-model` no longer matters, sc-25379),
   and one the owner merged or closed escalates once with a story comment ("merged outside the factory"). An item whose
-  head already has a verdict recorded under the dropped cross-family rule (e.g. a `gpt-5.5` or `claude-opus-5` reviewer)
+  head already has a verdict recorded under the dropped cross-family rule (e.g. a `gpt-5.5` or `claude-opus-4-7` reviewer)
   is reviewed again once by the current panel (`MergeGate.Superseded`: its models break `ReviewModels.Problems` and it is
   the only verdict on that head — at Review it is not reused; at MergeGate the gate answers ReviewHead when those are its
   only reasons), then merges as usual; the current panel's own verdict is a second one on the head, so if its models still

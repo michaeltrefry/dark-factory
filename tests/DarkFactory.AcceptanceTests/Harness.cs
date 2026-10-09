@@ -36,7 +36,7 @@ internal static class Harness
         }
     }
 
-    /// <summary>Skips naming the missing owner step unless the review panel's models are configured (<c>Review:Models</c>: no default).</summary>
+    /// <summary>Skips naming the owner step unless the review panel's models are valid (<c>Review:Models</c>, default <c>claude-opus-5</c>).</summary>
     public static Orchestrator.Gate.ReviewPanelModels RequireReviewPanel(FactoryOptions? options = null)
     {
         try

@@ -76,8 +76,8 @@ public sealed partial class RunPipeline
     /// the diff touches a path whose tier in the base branch's <c>factory/gate.yaml</c> requires it
     /// or that the code floor <see cref="RiskyPaths"/> matches (<see cref="GatePolicy.SecurityReviewReasons"/>; a missing or invalid
     /// policy escalates before any call) — each role pinned through the router to the first of its
-    /// models that is a Claude Opus 5.5 or newer, whichever models the implementer used, with its prompt file (<see cref="ReviewPrompts"/>). Each blocking
-    /// finding goes to a second Claude model, not the reviewer's (<see cref="ReviewerChoice.ChooseConfirmer"/>); one it does not confirm is downgraded
+    /// models that is a Claude Opus 5 or newer, whichever models the implementer used, with its prompt file (<see cref="ReviewPrompts"/>). Each blocking
+    /// finding goes to a second Claude model pinned to another id than the reviewer's (<see cref="ReviewerChoice.ChooseConfirmer"/>); one it does not confirm is downgraded
     /// to optional. The verdict (<see cref="ReviewPanel.Decide"/>: deterministic over the findings) is checkpointed bound to
     /// that commit (E3) before it counts; a commit that already has a verdict is not reviewed again. Every call's router
     /// session is named in the ledger (<see cref="Steps.ReviewSession"/>, with its role and prompt hash) before the call, and
@@ -455,8 +455,8 @@ public sealed partial class RunPipeline
             : CiHeal.Carried(previous, roles, policy, await Gate.GitHub.GetDiffAsync(run.Repo, change.From, change.To, ct));
         var toReview = roles.Where(r => carried.All(c => c.Role != r)).ToList();
         // Every role's model, and a second model for its findings, is chosen before the first call: a role with no Claude Opus
-        // 5.5 or newer, or no eligible second model, escalates without spending any. (The second model is chosen again for each
-        // blocking finding, then also excluding the model the router said served the review.)
+        // 5 or newer, or no eligible second model, escalates without spending any. (The second model is chosen again for each
+        // blocking finding, by the same pinned-id rule: what the router served the review does not change the choice.)
         var models = toReview.ToDictionary(r => r, r => ReviewerChoice.Choose(Gate.Models.For(r), $"Review:{ReviewRoles.ConfigName(r)}:Models"));
         foreach (var role in toReview)
         {
@@ -818,8 +818,7 @@ public sealed partial class RunPipeline
     /// <summary>A second model checks one blocking finding; the finding comes back downgraded when it does not confirm it.</summary>
     private async Task<Finding> ConfirmAsync(Run run, PullFacts pull, string diff, RepoFiles files, RoleReview review, Finding finding, CancellationToken ct)
     {
-        var reviewerModels = new[] { review.Model, review.ServedModel }.OfType<string>().Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        var model = ReviewerChoice.ChooseConfirmer(Gate.Models.Confirm, reviewerModels);
+        var model = ReviewerChoice.ChooseConfirmer(Gate.Models.Confirm, [review.Model]);
         var prompt = ReviewPrompts.Confirm;
         var session = await NameReviewSessionAsync(run, pull, $"confirm-{review.Role}", model, prompt, ct);
         var confirmation = await RouterCallAsync(() => Gate.Reviewer.ConfirmAsync(
