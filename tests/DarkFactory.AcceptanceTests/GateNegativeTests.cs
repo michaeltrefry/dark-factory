@@ -1,6 +1,7 @@
 using System.Text.Json;
 using DarkFactory.Orchestrator;
 using DarkFactory.Orchestrator.Gate;
+using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Shortcut;
 
@@ -182,29 +183,46 @@ public class GateNegativeTests
     }
 
     /// <summary>
-    /// AT4: a fourth fix round escalates. The seeded panel reports one confirmed blocking correctness finding on every head, so
-    /// the real fixer runs <see cref="Lifecycle.MaxFixRounds"/> rounds (each a real worker session) and the review after the last one
-    /// escalates instead of starting a fourth, with the open finding attached; nothing reaches the merge gate.
+    /// The fix-round cap a PR whose base has <paramref name="policy"/> (<see cref="GatePolicy.Path"/>; null: none) runs under: the
+    /// policy's <c>risk.max_fix_rounds</c>, never above the hard cap <see cref="Lifecycle.MaxFixRounds"/> (what the pipeline's
+    /// <c>fix-cap</c> row records). The sandbox's policy sets 2.
+    /// </summary>
+    internal static int ExpectedFixCap(string? policy) =>
+        policy is null ? Lifecycle.MaxFixRounds : Math.Min(GatePolicy.Parse(policy).Risk.MaxFixRounds, Lifecycle.MaxFixRounds);
+
+    /// <summary>
+    /// AT4: a fix round past the cap escalates. The seeded panel reports one confirmed blocking correctness finding on every head,
+    /// so the real fixer runs as many rounds as the cap allows (each a real worker session) — the cap the base's policy sets
+    /// (<see cref="ExpectedFixCap"/>, read from the sandbox here, and the cap the ledger's <c>fix-cap</c> row records) — and the review
+    /// after the last one escalates instead of starting another, with the open finding attached; nothing reaches the merge gate.
     /// </summary>
     [Fact]
-    public async Task A_fourth_fix_round_escalates_with_the_open_finding()
+    public async Task A_fix_round_past_the_cap_escalates_with_the_open_finding()
     {
         await using var run = await StartAsync("FACTORY_E2E_GATE_ROUNDS_STORY", "df_e2e_p2at4_rounds");
         var reviewer = new SeededReviewer(blocking: true);
+        IGateGitHub? github = null;
 
-        var outcome = await FactoryRunAsync(run, gate => gate with { Reviewer = reviewer });
+        var outcome = await FactoryRunAsync(run, gate =>
+        {
+            github = gate.GitHub;
+            return gate with { Reviewer = reviewer };
+        });
 
         Assert.Equal(WorkState.Escalated, outcome.State);
+        var pr = (await E2e.PullRequestsAsync(run.Sandbox.Repo, run.StoryId, run.Ct)).Single(p => p.GetProperty("html_url").GetString() == outcome.PullRequestUrl);
+        var cap = ExpectedFixCap(await github!.GetPolicyAsync(run.Sandbox.Repo, pr.GetProperty("base").GetProperty("ref").GetString()!, run.Ct));
         var history = await run.E2e.HistoryAsync(run.StoryId, run.Ct);
         ReviewGateTests.AssertTypedOutcomes(history);
+        Assert.Equal(cap, RunPipeline.FixCapOf(history));
         var transitions = history.Where(e => e.Step is null).Select(e => e.State).ToList();
-        Assert.Equal(Lifecycle.MaxFixRounds, transitions.Count(s => s == WorkState.Fixing));
+        Assert.Equal(cap, transitions.Count(s => s == WorkState.Fixing));
         Assert.Equal([WorkState.Review, WorkState.Escalated], transitions.TakeLast(2));
         Assert.DoesNotContain(WorkState.MergeGate, transitions);
         Assert.All(history.Where(e => e.Step is null && e.State == WorkState.Fixing), e => Assert.Equal(StepOutcome.Failed, e.Outcome));
         Assert.NotEmpty(RunPipeline.Verdicts(history));
         Assert.All(RunPipeline.Verdicts(history), v => Assert.False(v.Passed));
         Assert.Contains(await E2e.StoryCommentsAsync(run.StoryId, run.Ct),
-            c => c.Contains($"after {Lifecycle.MaxFixRounds} fix rounds", StringComparison.Ordinal) && c.Contains(SeededReviewer.FindingTitle, StringComparison.Ordinal));
+            c => c.Contains($"after {cap} fix rounds", StringComparison.Ordinal) && c.Contains(SeededReviewer.FindingTitle, StringComparison.Ordinal));
     }
 }

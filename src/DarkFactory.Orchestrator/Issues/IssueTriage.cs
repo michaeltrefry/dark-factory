@@ -67,8 +67,12 @@ public sealed class TriageFormatException(string message) : Exception(message);
 /// </summary>
 public static partial class TriageParser
 {
+    /// <summary>
+    /// The model's free text is posted on the issue (fenced): the title is cut to <see cref="MaxTitle"/> and the summary and the
+    /// proposed fix's description to <see cref="MaxText"/> each, which bounds how much a triage session could restate there (E4).
+    /// </summary>
     public const int MaxTitle = 120;
-    public const int MaxText = 4000;
+    public const int MaxText = 1500;
     public const int MaxPaths = 50;
     public const int MaxRepos = 10;
 

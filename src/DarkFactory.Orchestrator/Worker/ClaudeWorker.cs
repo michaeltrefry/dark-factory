@@ -108,18 +108,64 @@ public interface IWorker
 /// </summary>
 public sealed record WorkerTools
 {
-    private WorkerTools(string permissionMode, IReadOnlyList<string> allowed, IReadOnlyList<string> denied) =>
-        (PermissionMode, Allowed, Denied) = (permissionMode, allowed, denied);
+    private WorkerTools(string permissionMode, IReadOnlyList<string> allowed, IReadOnlyList<string> denied, string settingSources,
+        bool confinedToWorkingDirectory) =>
+        (PermissionMode, Allowed, Denied, SettingSources, ConfinedToWorkingDirectory) =
+        (permissionMode, allowed, denied, settingSources, confinedToWorkingDirectory);
 
     public string PermissionMode { get; }
+
+    /// <summary>The allow rules every session gets; a confined session also gets <see cref="ReadRule"/> of its working directory.</summary>
     public IReadOnlyList<string> Allowed { get; }
+
     public IReadOnlyList<string> Denied { get; }
 
-    /// <summary>An implementing worker (implement, review fix, CI fix, conflict fix): edits files and builds and tests; no web, no git.</summary>
-    public static readonly WorkerTools Implementer = new("acceptEdits", ClaudeWorker.AllowedTools, ClaudeWorker.DeniedTools);
+    /// <summary>Claude Code's <c>--setting-sources</c>: which settings files the session loads (empty: none, only <c>--settings</c>).</summary>
+    public string SettingSources { get; }
 
-    /// <summary>The only tools a read-only session is allowed: it reads and searches the checkout, nothing else.</summary>
+    /// <summary>
+    /// Whether the session's file reads are confined to its working directory: its only allow rule is <see cref="ReadRule"/> of that
+    /// directory and its <c>--settings</c> set <see cref="BlockReadsOutsideWorkingDirectories"/>.
+    /// </summary>
+    public bool ConfinedToWorkingDirectory { get; }
+
+    /// <summary>
+    /// An implementing worker (implement, review fix, CI fix, conflict fix): edits files and builds and tests; no web, no git. It loads
+    /// the target repo's own Claude settings (<c>project,local</c>; <see cref="Taint.OfRepoSettings"/>).
+    /// </summary>
+    public static readonly WorkerTools Implementer = new("acceptEdits", ClaudeWorker.AllowedTools, ClaudeWorker.DeniedTools, "project,local",
+        confinedToWorkingDirectory: false);
+
+    /// <summary>
+    /// The tools a read-only session uses: it reads and searches its own checkout, nothing else. None is allowed by name (a bare
+    /// <c>Read</c> rule would pre-approve a read of any path): Claude Code runs them without approval inside the working directory
+    /// only, and bounds Glob and Grep by the <c>Read</c> rules.
+    /// </summary>
     public static readonly string[] ReadOnlyTools = ["Read", "Glob", "Grep"];
+
+    /// <summary>The settings key that makes Claude Code's file tools refuse every path outside the working directories, in every mode.</summary>
+    public const string BlockReadsOutsideWorkingDirectories = "blockReadsOutsideWorkingDirectories";
+
+    /// <summary>
+    /// The one allow rule of a confined session: <c>Read(//&lt;absolute directory&gt;/**)</c> (Claude Code's <c>//</c> anchors at the
+    /// filesystem root; a single <c>/</c> would anchor at the settings source). Refuses a directory whose path a gitignore pattern
+    /// would read as more than itself (<c>* ? [ ] \ !</c>, a leading <c>#</c>, a line break) or that is not absolute.
+    /// </summary>
+    public static string ReadRule(string directory)
+    {
+        var path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory));
+        if (!path.StartsWith('/') || path == "/" || path.IndexOfAny(['*', '?', '[', ']', '\\', '!', '#', '\n', '\r', '(', ')']) >= 0)
+        {
+            throw new ArgumentException($"Cannot confine reads to '{directory}': not an absolute path a Read rule matches literally.", nameof(directory));
+        }
+        return $"Read(/{path}/**)";
+    }
+
+    /// <summary>The allow rules of a session in <paramref name="workingDirectory"/>: <see cref="Allowed"/>, plus its <see cref="ReadRule"/> when confined.</summary>
+    public IReadOnlyList<string> AllowedIn(string? workingDirectory) => !ConfinedToWorkingDirectory
+        ? Allowed
+        : [.. Allowed, ReadRule(workingDirectory ?? throw new ArgumentNullException(nameof(workingDirectory),
+            "a session confined to its working directory needs that directory"))];
 
     /// <summary>
     /// The tools that write a file, run a command, start a sub-agent (which could be given other tools) or reach the web: every one is
@@ -129,25 +175,30 @@ public sealed record WorkerTools
         ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput", "KillShell", "Task", "Agent", .. Taint.WebTools];
 
     /// <summary>
-    /// Claude Code's mode that auto-denies every tool call no allow rule pre-approves (headless, nobody can approve one): with only
-    /// <see cref="ReadOnlyTools"/> allowed, nothing else runs; <c>acceptEdits</c> would let a session edit files unasked.
+    /// Claude Code's mode that auto-denies every tool call that would otherwise prompt (headless, nobody can approve one): file reads
+    /// inside the working directory and calls an allow rule pre-approves still run, nothing else does; <c>acceptEdits</c> would let a
+    /// session edit files unasked.
     /// </summary>
     public const string ReadOnlyPermissionMode = "dontAsk";
 
     /// <summary>
-    /// The triage worker (E4): a session that reads an issue's text holds no write or exec capability at all — Read, Glob and Grep, in
-    /// <see cref="ReadOnlyPermissionMode"/>, with every <see cref="WriteOrExecTools"/> tool denied. It reasons from the code; it builds
-    /// and runs nothing.
+    /// The triage worker (E4): a session that reads an issue's text holds no write or exec capability at all and reads nothing but its
+    /// own triage worktree — Read, Glob and Grep inside its working directory (<see cref="ReadRule"/> its only allow rule,
+    /// <see cref="BlockReadsOutsideWorkingDirectories"/> set), in <see cref="ReadOnlyPermissionMode"/>, with every
+    /// <see cref="WriteOrExecTools"/> tool denied and no settings file loaded (<c>--setting-sources ""</c>: neither the repo's nor the
+    /// worker user's settings can widen it). It reasons from the code; it builds and runs nothing.
     /// </summary>
-    public static readonly WorkerTools ReadOnly = new(ReadOnlyPermissionMode, ReadOnlyTools, WriteOrExecTools);
+    public static readonly WorkerTools ReadOnly = new(ReadOnlyPermissionMode, [], WriteOrExecTools, "", confinedToWorkingDirectory: true);
 
     /// <summary>
-    /// Whether these tools are read-only: allowed only <see cref="ReadOnlyTools"/> (no rule with a specifier, no other tool), denied
-    /// every <see cref="WriteOrExecTools"/> tool, in <see cref="ReadOnlyPermissionMode"/>.
+    /// Whether these tools are read-only and confined: no allow rule beyond the working directory's <see cref="ReadRule"/>, every
+    /// <see cref="WriteOrExecTools"/> tool denied, in <see cref="ReadOnlyPermissionMode"/>, loading no settings file.
     /// </summary>
     public bool IsReadOnly =>
         PermissionMode == ReadOnlyPermissionMode
-        && Allowed.All(t => ReadOnlyTools.Contains(t, StringComparer.Ordinal))
+        && Allowed.Count == 0
+        && ConfinedToWorkingDirectory
+        && SettingSources.Length == 0
         && WriteOrExecTools.All(t => Denied.Contains(t, StringComparer.Ordinal));
 }
 
@@ -290,8 +341,27 @@ public sealed class ClaudeWorker(
         });
     }
 
+    /// <summary>
+    /// <paramref name="settings"/> (<c>--settings</c> JSON, or none) with <c>permissions.blockReadsOutsideWorkingDirectories</c> set:
+    /// Claude Code's file tools then refuse every path outside the working directories in every permission mode.
+    /// </summary>
+    public static string WithReadsBlockedOutsideWorkingDirectories(string? settings)
+    {
+        var root = settings is null ? new System.Text.Json.Nodes.JsonObject() : System.Text.Json.Nodes.JsonNode.Parse(settings)!.AsObject();
+        if (root["permissions"] is not System.Text.Json.Nodes.JsonObject permissions)
+        {
+            root["permissions"] = permissions = new System.Text.Json.Nodes.JsonObject();
+        }
+        permissions[WorkerTools.BlockReadsOutsideWorkingDirectories] = true;
+        return root.ToJsonString();
+    }
+
+    /// <summary>
+    /// The CLI arguments of a session. Its working directory is required for tools confined to it
+    /// (<see cref="WorkerTools.ConfinedToWorkingDirectory"/>), whose one allow rule names it.
+    /// </summary>
     public static IReadOnlyList<string> BuildArguments(string prompt, string? resumeSessionId = null, string? settings = null,
-        WorkerTools? tools = null)
+        WorkerTools? tools = null, string? workingDirectory = null)
     {
         tools ??= WorkerTools.Implementer;
         var args = new List<string>
@@ -300,15 +370,19 @@ public sealed class ClaudeWorker(
             "--output-format", "stream-json",
             "--verbose",
             "--permission-mode", tools.PermissionMode,
-            // Ignore the OS user's ~/.claude settings (env, hooks, plugins) and MCP servers so the
-            // worker sees only what the factory passes; the repo's own .claude settings still apply.
-            "--setting-sources", "project,local",
+            // Never the OS user's ~/.claude settings (env, hooks, plugins) or MCP servers, so the worker sees only what the factory
+            // passes; an implementer still loads the repo's own .claude settings (project,local), a read-only session none ("").
+            "--setting-sources", tools.SettingSources,
             "--strict-mcp-config",
             "--allowedTools",
         };
-        args.AddRange(tools.Allowed);
+        args.AddRange(tools.AllowedIn(workingDirectory));
         args.Add("--disallowedTools");
         args.AddRange(tools.Denied);
+        if (tools.ConfinedToWorkingDirectory)
+        {
+            settings = WithReadsBlockedOutsideWorkingDirectories(settings);
+        }
         if (settings is not null)
         {
             args.Add("--settings");
@@ -336,14 +410,14 @@ public sealed class ClaudeWorker(
     {
         if (pauseFlagDirectory is null)
         {
-            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, tools: Tools), callbacks, ct);
+            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, tools: Tools, workingDirectory: workingDirectory), callbacks, ct);
         }
         var flag = PauseFlagPath(pauseFlagDirectory, workingDirectory);
         EnsurePauseFlagDirectory(pauseFlagDirectory);
         File.Delete(flag); // left by a crashed run, it would stop this one at its first tool call
         try
         {
-            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, BuildPauseSettings(flag), Tools), callbacks, ct);
+            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, BuildPauseSettings(flag), Tools, workingDirectory), callbacks, ct);
         }
         finally
         {

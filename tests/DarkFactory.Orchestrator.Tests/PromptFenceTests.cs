@@ -1,3 +1,4 @@
+using System.Text.Json;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Issues;
 using DarkFactory.Orchestrator.Shortcut;
@@ -88,19 +89,57 @@ public class PromptFenceTests
         var tools = WorkerTools.ReadOnly;
 
         Assert.True(tools.IsReadOnly);
-        Assert.Equal(["Read", "Glob", "Grep"], tools.Allowed);
+        Assert.Empty(tools.Allowed); // nothing by name: a bare Read would pre-approve reading any path
         Assert.Equal("dontAsk", tools.PermissionMode);
         Assert.All(["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "Task", "Agent", "WebFetch", "WebSearch"],
             t => Assert.Contains(t, tools.Denied));
-        Assert.DoesNotContain(tools.Allowed, t => t.StartsWith("Bash", StringComparison.Ordinal) || t is "Write" or "Edit");
         // The implementer's tools are not read-only, so a triage runner refuses them.
         Assert.False(WorkerTools.Implementer.IsReadOnly);
+        Assert.Throws<ArgumentNullException>(() => ClaudeWorker.BuildArguments("triage", tools: tools)); // confined: needs its directory
+    }
 
-        var args = ClaudeWorker.BuildArguments("triage", tools: tools).ToList();
+    [Fact]
+    public void The_triage_session_reads_only_its_own_worktree_and_loads_no_settings_file()
+    {
+        // E4: the session that reads issue text can read nothing but its own triage worktree (not the work root's other clones and
+        // kept worktrees, not the worker user's home and its transcripts), and no settings file can widen that.
+        const string worktree = "/opt/dark-factory/work/triage-worktrees/factory-triage-gh-7";
+        var pause = ClaudeWorker.BuildPauseSettings("/opt/dark-factory/work/controls/factory-triage-gh-7.pause");
+
+        var args = ClaudeWorker.BuildArguments("triage", null, pause, WorkerTools.ReadOnly, worktree + "/").ToList();
+
         Assert.Equal("dontAsk", args[args.IndexOf("--permission-mode") + 1]);
-        Assert.DoesNotContain("acceptEdits", args);
-        Assert.Equal(["Read", "Glob", "Grep"], args.Skip(args.IndexOf("--allowedTools") + 1).Take(3));
-        Assert.Equal("--disallowedTools", args[args.IndexOf("--allowedTools") + 4]);
+        Assert.Equal("", args[args.IndexOf("--setting-sources") + 1]);
+        var allowed = args[(args.IndexOf("--allowedTools") + 1)..args.IndexOf("--disallowedTools")];
+        Assert.Equal([$"Read(/{worktree}/**)"], allowed); // "//" anchors at the filesystem root
+        Assert.Equal(WorkerTools.WriteOrExecTools, args[(args.IndexOf("--disallowedTools") + 1)..args.IndexOf("--settings")]);
+        using var settings = JsonDocument.Parse(args[args.IndexOf("--settings") + 1]);
+        Assert.True(settings.RootElement.GetProperty("permissions").GetProperty("blockReadsOutsideWorkingDirectories").GetBoolean());
+        Assert.Equal(JsonDocument.Parse(pause).RootElement.GetProperty("hooks").GetRawText(), settings.RootElement.GetProperty("hooks").GetRawText());
+        Assert.Equal(["-p", "triage", "--output-format", "stream-json", "--verbose", "--permission-mode", "dontAsk", "--setting-sources", "",
+            "--strict-mcp-config", "--allowedTools", $"Read(/{worktree}/**)", "--disallowedTools", .. WorkerTools.WriteOrExecTools, "--settings",
+            args[args.IndexOf("--settings") + 1]], args);
+        // The implementer still loads the repo's settings and gets no read confinement (its sessions taint on repo settings instead).
+        var implementer = ClaudeWorker.BuildArguments("go", tools: WorkerTools.Implementer).ToList();
+        Assert.Equal("project,local", implementer[implementer.IndexOf("--setting-sources") + 1]);
+        Assert.DoesNotContain(implementer, a => a.Contains("blockReadsOutsideWorkingDirectories", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("relative/worktree")]
+    [InlineData("/work/tri*ge")]
+    [InlineData("/work/[x]")]
+    [InlineData("/work/!x")]
+    [InlineData("/")]
+    public void A_confined_session_refuses_a_directory_a_read_rule_would_not_match_literally(string directory)
+    {
+        if (directory == "relative/worktree")
+        {
+            // GetFullPath makes it absolute: the rule names the real directory, never a pattern relative to the cwd.
+            Assert.Equal($"Read(/{Path.GetFullPath(directory)}/**)", WorkerTools.ReadRule(directory));
+            return;
+        }
+        Assert.Throws<ArgumentException>(() => WorkerTools.ReadRule(directory));
     }
 
     [Fact]

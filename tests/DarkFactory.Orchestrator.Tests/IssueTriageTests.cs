@@ -216,6 +216,33 @@ public class IssueTriageTests
     }
 
     [Fact]
+    public void The_triage_comment_bounds_the_models_free_text_inside_the_fence()
+    {
+        // E4: a triage session could restate what it read; what it can post is bounded (title 120, summary and fix 1,500 each).
+        var answer = Answer(title: new string('T', 500))
+            .Replace("WordCount returns 1 for whitespace-only input.", new string('S', 5000), StringComparison.Ordinal)
+            .Replace("Split with RemoveEmptyEntries.", new string('F', 5000), StringComparison.Ordinal);
+        var triage = Parsed(answer);
+        var record = TriageRecord.Create("v1v1v1v1v1v1v1v1", triage, null, "someone", Writer,
+            IssueRouting.Decide(triage, null, Writer, Watched, Policy, null));
+
+        var body = IssueComments.Triage(record);
+
+        Assert.Equal((120, 1500, 1500), (triage.Title.Length, triage.Summary.Length, triage.Fix!.Description.Length));
+        var open = body.IndexOf("~~~~text\n", StringComparison.Ordinal);
+        var close = body.IndexOf("\n~~~~\n", open + 1, StringComparison.Ordinal);
+        Assert.True(open >= 0 && close > open);
+        var fenced = body[open..close];
+        Assert.Equal(120, fenced.Count(c => c == 'T'));
+        Assert.Equal(1500, fenced.Count(c => c == 'S'));
+        Assert.Equal(1500, fenced.Count(c => c == 'F'));
+        var outside = body[..open] + body[close..];
+        Assert.DoesNotContain("TTTT", outside);
+        Assert.DoesNotContain("SSSS", outside);
+        Assert.DoesNotContain("FFFF", outside);
+    }
+
+    [Fact]
     public void The_models_reproduction_claim_is_shown_only_inside_the_fence_labelled_model_reported()
     {
         var triage = Parsed(Answer(reproduced: true));
