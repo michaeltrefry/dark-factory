@@ -401,19 +401,35 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   every auth mode (it would end its header line and could add another).
   Repo settings guard (`Worker/RepoSettingsGuard.cs`): an implementing worker loads the worktree's `.claude/settings.json` and
   `.claude/settings.local.json` (`--setting-sources project,local`), whose `env` outranks the env the factory sets (it could drop the
-  class, add `x-weave-force-model`, change `ANTHROPIC_BASE_URL`), as could `apiKeyHelper` or `model`. The factory's `--settings`
-  outranks project settings (Claude Code's documented precedence; not re-verified against 2.1.291) but can only add values (overriding `env` would put the router key in argv), so instead
-  `RunWorkerSessionAsync` checks the files owner-side, fail-closed by allowlist: a settings file may hold only top-level keys that
-  cannot change the model, endpoint, headers or credentials (`RepoSettingsGuard.AllowedKeys`: `permissions`, `hooks`,
-  `disableAllHooks`, `includeCoAuthoredBy`, …); any other key (`env`, `model`, `apiKeyHelper`, unknown or future ones), an unreadable
-  or non-object file, a symlinked file or `.claude` (never read through), or a non-regular file fails the round (Escalated, with the
-  reason). It runs before every implement, review/conflict fix and CI fix session (new or resumed: a branch the worker committed
-  such a file to in an earlier round is refused before the next round starts) and again when the worker finishes, before
-  `worker-done` (so a worker that writes one never has it pushed). Residual risk, accepted: Claude Code may reload a settings file the
-  worker writes mid-session, so that session's own later calls could run unclassed or on another endpoint until it ends (its work is
-  then refused); project subagents or commands (`.claude/agents`, `.claude/commands`) may name a model in their front matter, which
-  only asks for it in the request body — the class header still holds the router to the class. A target repo whose default branch
-  carries such settings gets no implementer until they are removed. Triage loads no settings at all (`--setting-sources ""`).
+  class, add `x-weave-force-model`, change `ANTHROPIC_BASE_URL`), as could `apiKeyHelper` or `model`. `RunWorkerSessionAsync` checks
+  the files owner-side, fail-closed by allowlist: a settings file may hold only top-level keys that cannot change the model,
+  endpoint, headers or credentials (`RepoSettingsGuard.AllowedKeys`: `permissions`, `hooks`, `disableAllHooks`,
+  `includeCoAuthoredBy`, …); any other key (`env`, `model`, `apiKeyHelper`, unknown or future ones), a non-object or unparsable file,
+  or a file `SafeFile.Read` refuses fails the round (Escalated, with the reason). `SafeFile.Read` (also behind `Taint.OfRepoSettings`,
+  where a refused file taints) never follows a symlink (`.claude` itself may not be one either), opens with `O_NONBLOCK|O_NOFOLLOW`
+  and refuses anything that is not a regular file (a FIFO would otherwise block the open forever while the run holds the item's
+  lock), refuses a file over 1 MiB without reading past the cap, and turns any I/O or memory failure into a refusal. The guard runs
+  before every implement, review/conflict fix and CI fix session (new or resumed: a branch the worker committed such a file to in
+  an earlier round is refused before the next round starts) and again when the worker finishes, before `worker-done` (a worker that
+  leaves one never has it pushed).
+  Why not re-assert the router variables through the factory's own `--settings` (which by Claude Code's documented precedence —
+  not re-verified against 2.1.291 — outranks project settings; it takes inline JSON or a file path): `ANTHROPIC_CUSTOM_HEADERS` and
+  `ANTHROPIC_AUTH_TOKEN` hold the router key, so the flag would put the key either in argv (inline JSON, readable by every local user
+  through `ps`) or at rest in a file the worker user can read, which the owner cannot create for `_factory` alone without root (the
+  launch helper would have to write it, a helper change) — a new copy of the key for a case the guard already refuses. Re-asserting
+  only `ANTHROPIC_BASE_URL` (no secret) would leave the headers, the part that carries the class, unprotected, so it is not done.
+  Residual risks, accepted:
+  - Mid-session settings: a worker that writes a settings file with `env` during its session, makes calls (Claude Code may reload
+    it), then deletes the file before it exits is NOT refused — the finish check sees no file; only the `implementer-model`
+    checkpoints (the models that answered) would show calls outside the class. A file still present at the end fails the round.
+  - Front matter: project subagents and commands (`.claude/agents`, `.claude/commands`) and prompt/agent hooks (`hooks` is allowed)
+    may name a model; that only asks for it in the request body, and the class header still holds the router to the class.
+  - `~_factory/.claude.json` (Claude Code's global config) is not filtered by `--setting-sources`, is writable by the worker and
+    persists across items; whether it can carry `env` or model overrides is unverified.
+  - E8 covers the session's own calls: a worker holds the router key, so code it runs (a test, a build step) can call the router
+    directly with any class or none.
+  A target repo whose default branch carries refused settings gets no implementer until they are removed. Triage loads no settings
+  at all (`--setting-sources ""`).
 - Untrusted-input taint (E4, sc-25386, `Worker/Taint.cs`): a worker session that has read untrusted content is tainted — a
   `session_taints` row keyed by its Claude session id (insert-only; a Postgres trigger refuses UPDATE/DELETE; the first reason
   is kept), so it holds across resume and crash and nothing clears it. Sources: the input the orchestrator hands it

@@ -90,6 +90,88 @@ public sealed class RepoSettingsGuardTests : IDisposable
         Assert.Contains("not a regular file", RepoSettingsGuard.Refusal(directory));
     }
 
+    private static void MkFifo(string path)
+    {
+        using var p = System.Diagnostics.Process.Start("/usr/bin/mkfifo", [path])!;
+        p.WaitForExit();
+        Assert.Equal(0, p.ExitCode);
+    }
+
+    /// <summary>
+    /// Runs <paramref name="check"/> off the test thread and fails (instead of hanging the suite) if it does not return within 10 s;
+    /// a reader stuck opening <paramref name="fifo"/> is then released by opening its write end.
+    /// </summary>
+    private static async Task<T> Bounded<T>(Func<T> check, string fifo)
+    {
+        var run = Task.Run(check);
+        try
+        {
+            return await run.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        catch (TimeoutException)
+        {
+            using (File.OpenWrite(fifo))
+            {
+            }
+            throw new Xunit.Sdk.XunitException("the read blocked on a FIFO");
+        }
+    }
+
+    [Fact]
+    public async Task A_fifo_is_refused_at_once_by_the_guard_and_taints_instead_of_blocking()
+    {
+        var wt = Worktree();
+        Directory.CreateDirectory(Path.Combine(wt, ".claude"));
+        var fifo = Path.Combine(wt, ".claude", "settings.json");
+        MkFifo(fifo);
+
+        Assert.Contains(".claude/settings.json is not a regular file", await Bounded(() => RepoSettingsGuard.Refusal(wt), fifo));
+        Assert.Equal(Taint.RepoSettings, await Bounded(() => Taint.OfRepoSettings(wt), fifo));
+        Assert.NotNull((await Bounded(() => SafeFile.Read(fifo), fifo)).Refusal);
+    }
+
+    [Fact]
+    public void A_socket_is_refused()
+    {
+        // A socket path is limited to ~104 bytes: a short directory under /tmp, not the (long) temp directory.
+        var wt = Path.Combine("/tmp", $"dfs-{Guid.NewGuid():N}"[..12]);
+        Directory.CreateDirectory(Path.Combine(wt, ".claude"));
+        try
+        {
+            var path = Path.Combine(wt, ".claude", "settings.local.json");
+            using var socket = new System.Net.Sockets.Socket(System.Net.Sockets.AddressFamily.Unix, System.Net.Sockets.SocketType.Stream,
+                System.Net.Sockets.ProtocolType.Unspecified);
+            socket.Bind(new System.Net.Sockets.UnixDomainSocketEndPoint(path));
+
+            Assert.NotNull(RepoSettingsGuard.Refusal(wt));
+            Assert.Equal(Taint.RepoSettings, Taint.OfRepoSettings(wt));
+        }
+        finally
+        {
+            Directory.Delete(wt, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void An_oversized_or_sparse_huge_file_is_refused_without_reading_it_all()
+    {
+        var wt = Worktree();
+        Directory.CreateDirectory(Path.Combine(wt, ".claude"));
+        var path = Path.Combine(wt, ".claude", "settings.json");
+        using (var file = File.Create(path))
+        {
+            file.SetLength(3L << 30); // sparse: 3 GiB of zeros
+        }
+
+        Assert.Contains($"is larger than {SafeFile.MaxBytes} bytes", RepoSettingsGuard.Refusal(wt));
+        Assert.Equal(Taint.RepoSettings, Taint.OfRepoSettings(wt));
+
+        File.WriteAllText(path, "{\"permissions\":{}}" + new string(' ', SafeFile.MaxBytes)); // just over the cap
+        Assert.Contains("is larger than", RepoSettingsGuard.Refusal(wt));
+        File.WriteAllText(path, "{\"permissions\":{}}" + new string(' ', SafeFile.MaxBytes - 20)); // at the cap: read
+        Assert.Null(RepoSettingsGuard.Refusal(wt));
+    }
+
     [Fact]
     public async Task An_implementer_does_not_start_on_a_branch_whose_settings_set_env_and_the_item_escalates()
     {

@@ -40,25 +40,22 @@ public static class RepoSettingsGuard
         }
         foreach (var file in Taint.RepoSettingsFiles)
         {
-            var path = Path.Combine(worktree, file);
-            if (IsLink(path))
-            {
-                return $"{file} is a symlink";
-            }
-            if (Directory.Exists(path))
-            {
-                return $"{file} is not a regular file";
-            }
-            if (!File.Exists(path))
+            // Never follows a link, never blocks on a FIFO, bounded in size (SafeFile).
+            var read = SafeFile.Read(Path.Combine(worktree, file));
+            if (read.IsMissing)
             {
                 continue;
+            }
+            if (read.Refusal is { } refusal)
+            {
+                return $"{file} {refusal}";
             }
             JsonDocument document;
             try
             {
-                document = JsonDocument.Parse(File.ReadAllText(path));
+                document = JsonDocument.Parse(read.Text!);
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+            catch (JsonException ex)
             {
                 return $"{file} cannot be read as JSON ({ex.GetType().Name})";
             }
