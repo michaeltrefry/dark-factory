@@ -8,6 +8,9 @@
     <AssemblyName>factory</AssemblyName>
     <RootNamespace>DarkFactory.Orchestrator</RootNamespace>
     <UserSecretsId>dark-factory-orchestrator</UserSecretsId>
+    <!-- The generated sources (the Razor components' code above all) stay on disk under obj/<config>/<tfm>/generated, so
+         GatewayLintTests compile and lint exactly what the build linted (sc-25391). -->
+    <EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
   </PropertyGroup>
 
   <ItemGroup>

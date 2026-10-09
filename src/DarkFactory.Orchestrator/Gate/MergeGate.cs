@@ -181,11 +181,13 @@ public static class MergeGate
 
         if (policyError is not null)
         {
-            return new GateDecision(GateOutcome.Blocked, head, [$"{GatePolicy.Path} on {pull.BaseRef} could not be read: {policyError}"]);
+            return GateCheckSeam.Off(GateCheckSeam.PreconditionPolicy) ? SeamMerge(head, GateCheckSeam.PreconditionPolicy)
+                : new GateDecision(GateOutcome.Blocked, head, [$"{GatePolicy.Path} on {pull.BaseRef} could not be read: {policyError}"]);
         }
         if (policyText is null)
         {
-            return new GateDecision(GateOutcome.Blocked, head, [$"{GatePolicy.Path} does not exist on {pull.BaseRef}"]);
+            return GateCheckSeam.Off(GateCheckSeam.PreconditionPolicy) ? SeamMerge(head, GateCheckSeam.PreconditionPolicy)
+                : new GateDecision(GateOutcome.Blocked, head, [$"{GatePolicy.Path} does not exist on {pull.BaseRef}"]);
         }
         GatePolicy policy;
         try
@@ -194,31 +196,33 @@ public static class MergeGate
         }
         catch (GatePolicyException ex)
         {
-            return new GateDecision(GateOutcome.Blocked, head, [ex.Message]);
+            return GateCheckSeam.Off(GateCheckSeam.PreconditionPolicy) ? SeamMerge(head, GateCheckSeam.PreconditionPolicy)
+                : new GateDecision(GateOutcome.Blocked, head, [ex.Message]);
         }
 
-        if (!pull.Open || pull.Merged)
+        if ((!pull.Open || pull.Merged) && !GateCheckSeam.Off(GateCheckSeam.PreconditionPrOpen))
         {
             return new GateDecision(GateOutcome.Blocked, head, [$"PR #{pull.Number} is not open"]);
         }
 
         // The tiers of the paths the head actually changes (a check that cannot run counts as failed: an unread diff blocks).
-        if (change.DiffError is not null || change.Diff is null)
+        if ((change.DiffError is not null || change.Diff is null) && !GateCheckSeam.Off(GateCheckSeam.PreconditionDiffComplete))
         {
             return new GateDecision(GateOutcome.Blocked, head,
                 [$"the diff of {Ci.Short(head)} could not be read ({change.DiffError ?? "no diff"}), so the tiers of its paths are unknown"]);
         }
+        var diff = change.Diff ?? "";
         // A diff that leaves files out (e.g. GitHub trimming a very large comparison) could leave out a sealed path: its file
         // count must equal the PR's changed_files (a rename is one of each).
-        var diffFiles = DiffPaths.Parse(change.Diff).Files;
-        if (pull.ChangedFiles != diffFiles)
+        var diffFiles = DiffPaths.Parse(diff).Files;
+        if (pull.ChangedFiles != diffFiles && !GateCheckSeam.Off(GateCheckSeam.PreconditionDiffComplete))
         {
             return new GateDecision(GateOutcome.Blocked, head,
                 [$"the diff of {Ci.Short(head)} is incomplete: it has {diffFiles} file(s), the PR {pull.ChangedFiles?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "an unread number of"} changed file(s), so the tiers of its paths are unknown"]);
         }
-        var classified = policy.Classify(change.Diff);
+        var classified = policy.Classify(diff);
         var sealedPaths = classified.In(Tier.Sealed);
-        if (sealedPaths.Count > 0)
+        if (sealedPaths.Count > 0 && !GateCheckSeam.Off(GateCheckSeam.SealedEscalation))
         {
             reasons.Add($"{Ci.Short(head)} touches sealed path(s), which always escalate: {string.Join(", ", sealedPaths)}");
         }
@@ -232,33 +236,38 @@ public static class MergeGate
                 ? new GateDecision(GateOutcome.Blocked, head, reasons)
                 : new GateDecision(GateOutcome.ReviewHead, head, [$"head {Ci.Short(head)} has no review verdict"]);
         }
-        if (!verdict.Passed)
+        var reviewPass = !GateCheckSeam.Off(GateChecks.ReviewPass);
+        if (!verdict.Passed && reviewPass)
         {
             reasons.Add($"the review of {Ci.Short(head)} is '{verdict.Verdict}'");
         }
         // security-review: required by the tiers the gate derived itself or the code floor of risky paths (or by the
         // verdict's own risky paths).
         var requiredBy = policy.SecurityReviewReasons(classified);
-        foreach (var role in ReviewRoles.Required(requiredBy.Count > 0 || verdict.RiskyPaths.Count > 0).Where(r => verdict.Reviews.All(v => v.Role != r)))
+        var security = (requiredBy.Count > 0 || verdict.RiskyPaths.Count > 0) && !GateCheckSeam.Off(GateChecks.SecurityReview);
+        foreach (var role in ReviewRoles.Required(security)
+                     .Where(r => verdict.Reviews.All(v => v.Role != r) && (reviewPass || r == ReviewRoles.Security)))
         {
             reasons.Add($"the review of {Ci.Short(head)} has no {role} review"
                 + (role == ReviewRoles.Security && requiredBy.Count > 0 ? $" ({GateChecks.SecurityReview} is required by {string.Join(", ", requiredBy)})" : ""));
         }
-        var modelProblems = verdict.Reviews.SelectMany(ReviewModels.Problems).ToList();
+        var modelProblems = reviewPass ? verdict.Reviews.SelectMany(ReviewModels.Problems).ToList() : [];
         reasons.AddRange(modelProblems);
 
         // ci-green — on this exact head commit.
-        if (ci.HeadSha != head)
+        var ciGreen = !GateCheckSeam.Off(GateChecks.CiGreen);
+        if (ciGreen && ci.HeadSha != head)
         {
             reasons.Add($"CI was read for {Ci.Short(ci.HeadSha)}, not the head {Ci.Short(head)}");
         }
-        else if (Ci.Evaluate(ci) is var (state, why) && state != CiState.Green)
+        else if (ciGreen && Ci.Evaluate(ci) is var (state, why) && state != CiState.Green)
         {
             reasons.Add(why);
         }
 
         // risk-threshold — diff size and fix rounds, when a touched tier requires it.
-        if (classified.Requires(GateChecks.RiskThreshold))
+        var riskRequired = classified.Requires(GateChecks.RiskThreshold) && !GateCheckSeam.Off(GateChecks.RiskThreshold);
+        if (riskRequired)
         {
             var risk = policy.Risk;
             if (classified.ChangedLines > risk.MaxChangedLines)
@@ -276,7 +285,8 @@ public static class MergeGate
         }
 
         // new-tests-fail-on-base — the executed runs recorded for exactly this base and head (sc-25382).
-        if (classified.Requires(GateChecks.NewTestsFailOnBase))
+        var newTestsRequired = classified.Requires(GateChecks.NewTestsFailOnBase) && !GateCheckSeam.Off(GateChecks.NewTestsFailOnBase);
+        if (newTestsRequired)
         {
             if (newTests is null)
             {
@@ -292,7 +302,7 @@ public static class MergeGate
             }
         }
 
-        if (pull.Draft)
+        if (pull.Draft && !GateCheckSeam.Off(GateCheckSeam.PreconditionPrOpen))
         {
             reasons.Add($"PR #{pull.Number} is a draft");
         }
@@ -319,16 +329,19 @@ public static class MergeGate
             "ci green",
             $"review pass by {string.Join(", ", verdict.Reviews.Select(r => $"{r.Role}: {r.ServedModel ?? r.Model}{(r.CarriedFrom is { } carried ? $", carried from {Ci.Short(carried)}" : "")}"))}",
         };
-        if (classified.Requires(GateChecks.RiskThreshold))
+        if (riskRequired)
         {
             passed.Add($"risk within threshold ({classified.ChangedLines} changed lines, {classified.ChangedFiles} files, {change.FixRounds} fix rounds)");
         }
-        if (classified.Requires(GateChecks.NewTestsFailOnBase))
+        if (newTestsRequired)
         {
             passed.Add(newTests!.Reason);
         }
         return new GateDecision(GateOutcome.Merge, head, passed);
     }
+
+    /// <summary>The decision when <see cref="GateCheckSeam"/> disabled the policy precondition and the policy is unusable (coverage tests only).</summary>
+    private static GateDecision SeamMerge(string head, string check) => new(GateOutcome.Merge, head, [$"{check} disabled by the coverage test seam"]);
 
     /// <summary>
     /// Whether <paramref name="verdict"/> was recorded under an earlier panel rule (e.g. a GPT or pre-5.5 Opus reviewer, before
