@@ -70,7 +70,7 @@ public class IssueIntakeTests
 
         /// <summary>A fresh intake each time, as after a restart: everything it knows comes from the ledger.</summary>
         public IssueIntake Intake() =>
-            new(GitHub, Watched, Contexts, Locks, Controls, Triage, Status, 3, Time, TextWriter.Null);
+            new(Source(), Watched, Contexts, Locks, Controls, Triage, Status, 3, Time, TextWriter.Null);
 
         public GitHubIssueWorkSource Source() => new(GitHub, Contexts, Watched, Time);
 
@@ -519,8 +519,12 @@ public class IssueIntakeTests
         Assert.Contains("https://github.com/acme/widgets/issues/12", pr.Body);
         // The implementer saw the triage, never the issue's own text (E4).
         var implementer = worker.Calls[0].Prompt;
-        Assert.Contains("Implement GitHub issue gh-1 (bug): Count whitespace-only input as zero words", implementer);
-        Assert.Contains("WordCount returns 1 for whitespace-only input.", implementer);
+        Assert.Contains("Implement GitHub issue gh-1 (bug): the change the approved triage below describes.", implementer);
+        // The triage-derived spec is model text from an issue: fenced as data, its block closed once (E4).
+        var block = implementer[implementer.IndexOf("<triage>\n", StringComparison.Ordinal)..(implementer.IndexOf("\n</triage>", StringComparison.Ordinal) + 1)];
+        Assert.Contains("Title: Count whitespace-only input as zero words", block);
+        Assert.Contains("WordCount returns 1 for whitespace-only input.", block);
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(implementer, "</triage>"));
         Assert.DoesNotContain("IGNORE PREVIOUS INSTRUCTIONS", implementer);
         Assert.Contains("merge 1 ", string.Join("\n", github.Calls));
         // The merge closed the issue (the closing keyword does it on GitHub; the work source makes sure) and took the claim off.
@@ -536,7 +540,7 @@ public class IssueIntakeTests
     public async Task The_triage_worker_runs_in_a_throwaway_checkout_and_publishes_nothing()
     {
         var workspaces = new FakeWorkspaces();
-        var worker = new FakeWorker(Reports(new WorkerResult("triage-sess", 0, false, "success", Answer(), "")));
+        var worker = new FakeWorker(Reports(new WorkerResult("triage-sess", 0, false, "success", Answer(), ""))) { Tools = WorkerTools.ReadOnly };
         var item = new WorkItem { Id = 5, Source = "github", ExternalId = "gh-5", Title = "t", Repo = Repo.FullName };
         var sessions = new List<string>();
 
@@ -768,6 +772,121 @@ public class IssueIntakeTests
         issueRuns.InFlight.Add(1);
         await loop.PollOnceAsync(CancellationToken.None);
         Assert.Equal(1, h.Status.ItemErrors["gh-1"].Count);
+    }
+
+    /// <summary>One pipeline run of the issue item (no gate: Intake and Implement only).</summary>
+    private static async Task<RunOutcome> RunOnce(Harness h, int id)
+    {
+        await using var db = h.Db();
+        return await new RunPipeline(h.Source(), new WorkLedger(db, TimeProvider.System), h.Locks, new FakeWorkspaces(), new FakeWorker(),
+            new FakePullRequests(), Sandbox, TextWriter.Null, controls: h.Controls).RunAsync(id, CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task A_released_issue_whose_claim_is_refused_is_listed_again_and_escalates_after_the_bound()
+    {
+        var h = new Harness(Answer());
+        await h.Watch();
+        h.Open("maintainer");
+        await h.Poll();
+        var id = Assert.Single(await h.Ready());
+        h.GitHub.Close(Repo, Number); // every claim is refused now
+
+        for (var refusal = 1; refusal < GitHubIssueWorkSource.ClaimRefusals; refusal++)
+        {
+            Assert.Equal(WorkState.Paused, (await RunOnce(h, id)).State);
+            // Each refusal is recorded, and the next poll lists the item again rather than never.
+            Assert.Equal(refusal, RunPipeline.ClaimRefusalsInARow(await h.Rows()));
+            Assert.Equal([id], await h.Ready());
+        }
+        var last = await RunOnce(h, id);
+
+        // The bound reached, it escalates visibly (E10): the ledger, and a comment on the issue; nothing lists it any more.
+        Assert.Equal(WorkState.Escalated, last.State);
+        Assert.Contains($"refused {GitHubIssueWorkSource.ClaimRefusals} times in a row; last refusal: the issue is closed",
+            (await h.Rows()).Last(r => r.Step is null).Detail);
+        Assert.Contains(h.GitHub.FactoryComments(Repo, Number), c => c.Body.Contains("escalated; a human needs to look"));
+        Assert.Empty(await h.Ready());
+    }
+
+    [Fact]
+    public async Task A_needs_human_route_is_its_own_escalated_row_and_counts_in_the_escalation_metric()
+    {
+        var h = new Harness(Answer(confidence: 0.3));
+        await h.Watch();
+        h.Open("maintainer");
+
+        await h.Poll();
+        await h.Poll();
+
+        var rows = await h.Rows();
+        var routed = Assert.Single(rows, r => r.Step == IssueSteps.RoutedToHuman);
+        Assert.Equal(StepOutcome.Escalated, routed.Outcome);
+        Assert.Contains("confidence (0.3) is under 0.8", routed.Detail);
+        // Approved and built later, the item counts as escalated at least once (it was routed to a human).
+        var item = await h.Item();
+        var built = rows.Append(new LedgerEntry { WorkItemId = item.Id, State = WorkState.Implement, Outcome = StepOutcome.Passed }).ToList();
+        var rate = LedgerMetrics.Compute([new MetricItem(item, built, [])], new MetricsOptions([], [])).Single(m => m.Name == LedgerMetrics.EscalationRate);
+        Assert.Equal(1.0, rate.Value);
+    }
+
+    [Fact]
+    public async Task An_issue_that_left_the_watch_scope_is_told_how_in_github_terms()
+    {
+        var h = new Harness(Answer());
+        await h.Watch();
+        h.Open("maintainer");
+        await h.Poll();
+        var id = Assert.Single(await h.Ready());
+        await using (var db = h.Db())
+        {
+            // In flight (Implement) when its repo leaves the watch scope.
+            var ledger = new WorkLedger(db, TimeProvider.System);
+            var item = await db.WorkItems.SingleAsync(i => i.ExternalId == "gh-1");
+            await ledger.RecordAsync(item, WorkState.Intake, null, "unpaused", CancellationToken.None);
+            await ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
+        }
+        h.Watched.Clear();
+
+        var outcome = await RunOnce(h, id);
+
+        Assert.Contains("parked", outcome.Error);
+        var comment = h.GitHub.FactoryComments(Repo, Number)[^1].Body;
+        Assert.Contains("left the factory's watch scope", comment);
+        Assert.Contains("Add its repo back to GitHub:Watch:Repos, or run `factory run gh-1 --ignore-scope`, to resume it.", comment);
+        Assert.DoesNotContain("To Do", comment);
+    }
+
+    [Fact]
+    public async Task Giving_up_on_an_issue_the_ledger_does_not_know_names_it_a_github_issue()
+    {
+        var h = new Harness(Answer());
+        h.GitHub.Open(Repo, 99, "t", "b", "maintainer");
+        await using var db = h.Db();
+        var key = await IssueIntake.KeyAsync(db, Repo, 99, CancellationToken.None);
+
+        var what = await RunPipeline.GiveUpAsync(h.Source(), new WorkLedger(db, TimeProvider.System), h.Locks, key, "boom", TextWriter.Null,
+            CancellationToken.None);
+
+        Assert.Equal("commented", what);
+        var body = Assert.Single(h.GitHub.FactoryComments(Repo, 99)).Body;
+        Assert.Contains($"gh-{key}: the factory could not start work on this GitHub issue; a human needs to look. Reason: boom", body);
+        Assert.DoesNotContain("story", body);
+    }
+
+    [Fact]
+    public async Task The_triage_runner_refuses_a_worker_that_could_write_or_run_anything()
+    {
+        var workspaces = new FakeWorkspaces();
+        var worker = new FakeWorker(Reports(new WorkerResult("triage-sess", 0, false, "success", Answer(), "")));
+        var item = new WorkItem { Id = 5, Source = "github", ExternalId = "gh-5", Title = "t", Repo = Repo.FullName };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => new WorkerTriageRunner(workspaces, worker, null, TextWriter.Null)
+            .RunAsync(item, Repo, "triage this", (_, _) => Task.CompletedTask, (_, _, _) => Task.CompletedTask, CancellationToken.None));
+
+        Assert.Contains("must be read-only", ex.Message);
+        Assert.Empty(workspaces.Calls);
+        Assert.Empty(worker.Calls);
     }
 
     private sealed class Runner : IItemRunner

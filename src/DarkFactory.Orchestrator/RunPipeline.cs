@@ -612,7 +612,7 @@ public sealed partial class RunPipeline(
             {
                 await source.CommentAsync(storyId,
                     $"{id} left the factory's watch scope, so the factory stopped working on it (paused at {from}). "
-                    + $"Move it back into scope and to To Do, or run `factory run {id} --ignore-scope`, to resume it.", ct);
+                    + $"{source.ScopeReturnHint}, or run `factory run {id} --ignore-scope`, to resume it.", ct);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -632,8 +632,13 @@ public sealed partial class RunPipeline(
             var claim = await source.ClaimAsync(run.Story.Id, ignoreScope, ct);
             if (!claim.Claimed)
             {
+                // A source that lists a refused item again by itself bounds the retries: the last refusal escalates (E10).
+                if (source.MaxClaimRefusals is { } max && ClaimRefusalsInARow(history) + 1 >= max)
+                {
+                    throw new InvalidOperationException($"the claim was refused {max} times in a row; last refusal: {claim.Refusal}");
+                }
                 // Not ours to take any more: write nothing to the board and wait until it is ready again.
-                await ledger.RecordAsync(run.Item, WorkState.Paused, null, $"claim refused: {claim.Refusal}", ct);
+                await ledger.RecordAsync(run.Item, WorkState.Paused, null, $"{ClaimRefused}: {claim.Refusal}", ct);
                 await ledger.CheckpointAsync(run.Item, Steps.Parked, null, claim.Refusal, ct);
                 return;
             }
@@ -643,6 +648,32 @@ public sealed partial class RunPipeline(
         }
         // Phase 1 has no Plan step: the worker implements straight from the story.
         await ledger.RecordAsync(run.Item, WorkState.Implement, null, null, ct);
+    }
+
+    /// <summary>The Paused row's detail prefix when the work source refused the claim.</summary>
+    public const string ClaimRefused = "claim refused";
+
+    public static bool IsClaimRefused(string? detail) => detail?.StartsWith(ClaimRefused, StringComparison.Ordinal) == true;
+
+    /// <summary>
+    /// The claim refusals (Paused, <see cref="ClaimRefused"/>) since the item last did anything else: counted back over its transitions,
+    /// passing the Intake rows a re-run records between them, up to the first other transition.
+    /// </summary>
+    public static int ClaimRefusalsInARow(IReadOnlyList<LedgerEntry> history)
+    {
+        var count = 0;
+        foreach (var row in history.Where(e => e.Step is null).Reverse())
+        {
+            if (row.State == WorkState.Paused && IsClaimRefused(row.Detail))
+            {
+                count++;
+            }
+            else if (row.State != WorkState.Intake)
+            {
+                break;
+            }
+        }
+        return count;
     }
 
     private async Task ImplementAsync(Run run, CancellationToken ct)
@@ -1384,7 +1415,7 @@ public sealed partial class RunPipeline(
         if (known is null)
         {
             await source.CommentAsync(storyId,
-                $"{id}: the factory could not start work on this story; a human needs to look. Reason: {reason}", ct);
+                $"{id}: the factory could not start work on this {source.Naming.Noun}; a human needs to look. Reason: {reason}", ct);
             log.WriteLine($"[intake] {id}: {reason}; commented");
             return "commented";
         }
@@ -1504,10 +1535,7 @@ public sealed partial class RunPipeline(
         var story = spec.Story;
         var prompt = $"""
             You are a Dark Factory worker. The current directory is a git worktree of {repo}.
-            Implement {story.Kind.Noun} {story.Ref} ({story.StoryType}): {story.Name}
-
-            Story description:
-            {story.Description}
+            Implement {story.Kind.Noun} {story.Ref} ({story.StoryType}): {PromptFence.Spec(story)}
 
             Make the smallest change that satisfies the story, including a test when the
             project has tests, and make sure `dotnet build` and `dotnet test` pass.

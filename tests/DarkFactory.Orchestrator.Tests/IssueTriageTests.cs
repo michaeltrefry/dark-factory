@@ -82,8 +82,19 @@ public class IssueTriageTests
             var route = IssueRouting.Decide(Parsed(Answer()), null, author, Watched, Policy, null);
             Assert.Equal((IssueRoute.Build, Repo, true), (route.Route, route.Target, route.Releasable));
         }
-        // A reproduced failure counts even below the confidence threshold.
-        Assert.Equal(IssueRoute.Build, IssueRouting.Decide(Parsed(Answer(confidence: 0.3, reproduced: true)), null, Writer, Watched, Policy, null).Route);
+    }
+
+    [Fact]
+    public void The_models_reproduction_claim_never_routes_an_issue_to_build()
+    {
+        // The read-only triage runs nothing, so "reproduced" is the model's own word (E5): below the threshold it needs a human.
+        var claimed = IssueRouting.Decide(Parsed(Answer(confidence: 0.3, reproduced: true)), null, Writer, Watched, Policy, null);
+
+        Assert.Equal((IssueRoute.NeedsHuman, true), (claimed.Route, claimed.Releasable));
+        Assert.Contains("confidence (0.3) is under 0.8", claimed.Why);
+        Assert.DoesNotContain("reproduc", claimed.Why);
+        // And it does not hold back a confident fix either: the claim plays no part.
+        Assert.Equal(IssueRoute.Build, IssueRouting.Decide(Parsed(Answer(confidence: 0.8, reproduced: false)), null, Writer, Watched, Policy, null).Route);
     }
 
     [Theory]
@@ -202,6 +213,23 @@ public class IssueTriageTests
         // A marker is trusted only on the factory App's own comments.
         Assert.Null(IssueComments.TriageHash(new IssueComment(6, "mallory", false, body, default, default, null), 77));
         Assert.Null(IssueComments.TriageHash(new IssueComment(7, "other[bot]", true, body, default, default, 78), 77));
+    }
+
+    [Fact]
+    public void The_models_reproduction_claim_is_shown_only_inside_the_fence_labelled_model_reported()
+    {
+        var triage = Parsed(Answer(reproduced: true));
+        var record = TriageRecord.Create("v1v1v1v1v1v1v1v1", triage, null, "someone", Writer,
+            IssueRouting.Decide(triage, null, Writer, Watched, Policy, null));
+
+        var body = IssueComments.Triage(record);
+
+        var open = body.IndexOf("~~~~text\n", StringComparison.Ordinal);
+        var close = body.IndexOf("\n~~~~\n", open + 1, StringComparison.Ordinal);
+        var outside = body[..open] + body[close..];
+        Assert.DoesNotContain("eproduced", outside);
+        Assert.Contains("- Confidence: 0.9\n", outside.ReplaceLineEndings("\n"));
+        Assert.Contains("Reproduced (model-reported; the triage reads code and runs nothing): yes", body[open..close]);
     }
 
     [Fact]

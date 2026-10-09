@@ -55,6 +55,14 @@ public enum WorkerInput
 /// back through the review panel and CI, and the factory cannot build or test anything without it; tainting every session that
 /// builds would leave no worker able to push.
 /// </para>
+/// <para>
+/// The session that reads an issue's text (the triage worker) holds no write capability at all (<see cref="WorkerTools.ReadOnly"/>:
+/// Read, Glob, Grep; no edit, command, sub-agent or web tool; refused unsandboxed), so it cannot change a file that an untainted
+/// session later pushes; its comment and label are posted by the orchestrator, and an issue item's implementer sees only the
+/// approved triage, fenced as data (<see cref="PromptFence.Spec"/>). Residual, accepted: it runs as the same worker user as the
+/// item workers, so it can read (not write) the work root — clones and other items' kept worktrees — and that user's home; what
+/// it reads only reaches its own answer, which is fenced on the issue and routes nothing by the model's say-so.
+/// </para>
 /// </summary>
 public static class Taint
 {

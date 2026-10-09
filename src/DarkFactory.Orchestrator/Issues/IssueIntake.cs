@@ -37,6 +37,12 @@ public static class IssueSteps
     public const string Released = "released";
 
     /// <summary>
+    /// The triage routed the issue to a human (<see cref="IssueRoute.NeedsHuman"/>); Detail is why. Its outcome is escalated (the
+    /// escalation metric counts it), recorded once per triage before the item is parked.
+    /// </summary>
+    public const string RoutedToHuman = "routed-to-human";
+
+    /// <summary>
     /// GitHub refused a request about the issue for good (a 4xx that is not a rate limit); Detail is the error. The poll moved past
     /// the issue, and takes it up again when it next changes.
     /// </summary>
@@ -61,8 +67,9 @@ public sealed record ApprovalRecord(long CommentId, string Approver, string Perm
 /// <item>gives the issue a work item (<c>gh-&lt;key&gt;</c>) and, for a version (title and body) not triaged yet, runs the triage
 /// worker, reads the author's permission and routes it (<see cref="IssueRouting"/>), recording the <see cref="IssueSteps.Triaged"/>
 /// row before anything is posted;</item>
-/// <item>posts the triage comment and the route's label as the orchestrator, with an issues-only token (never the model, E4),
-/// each checkpointed; a retried post finds the comment already there by its marker, so nothing is posted twice;</item>
+/// <item>posts the triage comment and the route's label as the orchestrator, through the issue source (<see cref="IIssueIntakeSource"/>,
+/// E6) with an issues-only token (never the model, E4), each checkpointed; a retried post finds the comment already there by its
+/// marker, so nothing is posted twice;</item>
 /// <item>builds a collaborator's issue with an apparent fix (<see cref="IssueSteps.Released"/>: the item stays in Intake for the
 /// pipeline), and parks every other route (Paused, <c>parked</c>);</item>
 /// <item>releases a parked, releasable triage on a collaborator's exact <c>Approved</c> (<see cref="IssueComments.IsApproval"/>)
@@ -72,7 +79,7 @@ public sealed record ApprovalRecord(long CommentId, string Approver, string Perm
 /// a failed triage after <c>maxFailures</c> tries and routed to a human (E10). A worker refused for usage pauses the factory.
 /// </summary>
 public sealed class IssueIntake(
-    IGitHubIssues issues,
+    IIssueIntakeSource issues,
     IReadOnlyList<RepoRef> watched,
     IDbContextFactory<LedgerDbContext> contexts,
     IRunLocks locks,
@@ -84,6 +91,17 @@ public sealed class IssueIntake(
     TextWriter log)
 {
     public static readonly ItemNaming Naming = ItemNaming.GitHubIssue;
+
+    /// <summary>
+    /// Why <c>factory work</c> refuses to start the issue intake, or null: watched issue repos (<c>GitHub:Watch:Repos</c>) with
+    /// unsandboxed workers (<c>Worker:RunAs=none</c>). The triage session reads untrusted issue text (E4); it must run as the worker
+    /// user (P1-E5), never as the owner with the owner's files and credentials in reach.
+    /// </summary>
+    public static string? UnsandboxedRefusal(Worker.WorkerSandbox? sandbox, IReadOnlyCollection<RepoRef> watched) =>
+        sandbox is null && watched.Count > 0
+            ? "GitHub:Watch:Repos is set but Worker:RunAs=none: the issue triage reads untrusted issue text and must run as the sandboxed "
+                + "worker user (E4, P1-E5). Set Worker:RunAs to the worker user, or clear GitHub:Watch:Repos."
+            : null;
 
     /// <summary>Detail of the Paused row (and its parked checkpoint) an issue's new work item waits in until a triage releases it.</summary>
     public const string AwaitingTriage = "awaiting triage";
@@ -241,18 +259,13 @@ public sealed class IssueIntake(
         if (!steps.Any(e => e.Step == IssueSteps.TriageComment))
         {
             var posted = comments.FirstOrDefault(c => IssueComments.TriageHash(c, issues.AppId) == record.Hash)?.Id
-                ?? await issues.CommentAsync(repo, issue.Number, IssueComments.Triage(record), ct);
+                ?? await issues.PostTriageAsync(repo, issue.Number, IssueComments.Triage(record), ct);
             await ledger.CheckpointAsync(item, IssueSteps.TriageComment, null, $"{record.Hash} {posted}", ct);
             comments = await issues.ListCommentsAsync(repo, issue.Number, ct);
         }
         if (IssueRouting.Label(record.Route) is { } label && !steps.Any(e => e.Step == IssueSteps.Labeled))
         {
-            await issues.AddLabelsAsync(repo, issue.Number, [label], ct);
-            // A re-triage that changed the route takes the other route's label off.
-            foreach (var stale in new[] { IssueLabels.AwaitingApproval, IssueLabels.NeedsHuman }.Where(l => l != label && issue.Labels.Contains(l)))
-            {
-                await issues.RemoveLabelAsync(repo, issue.Number, stale, ct);
-            }
+            await issues.LabelRouteAsync(repo, issue.Number, label, issue.Labels, ct);
             await ledger.CheckpointAsync(item, IssueSteps.Labeled, null, $"{record.Hash} {label}", ct);
         }
 
@@ -267,6 +280,11 @@ public sealed class IssueIntake(
             if (item.State != WorkState.Paused)
             {
                 await ledger.RecordAsync(item, WorkState.Paused, null, IssueComments.RouteName(record.Route), ct);
+            }
+            if (record.Route == IssueRoute.NeedsHuman && !steps.Any(e => e.Step == IssueSteps.RoutedToHuman))
+            {
+                // The item already waits Paused (awaiting triage), so no transition shows the escalation: its own row does.
+                await ledger.CheckpointAsync(item, IssueSteps.RoutedToHuman, null, record.Why, ct);
             }
             await ledger.CheckpointAsync(item, RunPipeline.Steps.Parked, null, $"{IssueComments.RouteName(record.Route)}: {record.Why}", ct);
         }
@@ -337,7 +355,7 @@ public sealed class IssueIntake(
             }
             try
             {
-                policy = await issues.GetFileAsync(target, GatePolicy.Path, ct) is { } yaml ? GatePolicy.Parse(yaml) : null;
+                policy = await issues.GatePolicyAsync(target, ct) is { } yaml ? GatePolicy.Parse(yaml) : null;
             }
             catch (GatePolicyException ex)
             {

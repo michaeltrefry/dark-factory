@@ -305,6 +305,30 @@ public class GitWorkspaceTests
     }
 
     [Fact]
+    public async Task A_triage_worktree_lives_apart_from_the_items_worktrees_and_is_not_shared_for_writing()
+    {
+        var sandbox = new FakeSandbox();
+        var triage = new GitWorkspace(Path.Combine(_root, "work"), _ => _remote, (_, _) => Task.FromResult<string?>(Token), null, sandbox,
+            worktreesDirectory: SandboxTriageRunner.TriageWorktrees, shareWithWorker: false);
+        var item = await Workspace(sandbox).PrepareAsync(Repo, "factory/sc-15", CancellationToken.None);
+        sandbox.Calls.Clear();
+
+        var ws = await triage.PrepareAsync(Repo, "factory/triage-gh-1", CancellationToken.None);
+
+        // Its own root, never the items' worktrees; read through the work root's inherited entry, not granted write.
+        Assert.Equal(Path.Combine(_root, "work", SandboxTriageRunner.TriageWorktrees, Repo.Owner, Repo.Name, "factory-triage-gh-1"), ws.Path);
+        Assert.True(File.Exists(Path.Combine(ws.Path, "README.md")));
+        Assert.DoesNotContain(sandbox.Calls, c => c.StartsWith("share", StringComparison.Ordinal));
+        // Each sweep sees only its own root: the items' sweep never asks about the triage worktree, and the triage sweep keeps no item's.
+        var asked = new List<string>();
+        await Workspace(sandbox).SweepOrphansAsync((name, _) => { asked.Add(name); return Task.FromResult(true); }, CancellationToken.None);
+        Assert.Equal(["factory-sc-15"], asked);
+        await triage.SweepOrphansAsync((_, _) => Task.FromResult(false), CancellationToken.None);
+        Assert.False(Directory.Exists(ws.Path));
+        Assert.True(File.Exists(Path.Combine(item.Path, "README.md")));
+    }
+
+    [Fact]
     public async Task Sweep_without_any_worktrees_does_nothing()
     {
         await Workspace().SweepOrphansAsync((_, _) => throw new InvalidOperationException("no worktree to ask about"), CancellationToken.None);

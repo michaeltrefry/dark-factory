@@ -239,6 +239,8 @@ public class RunPipelineTests
         public bool OrphanAlive { get; init; }
         /// <summary>Runs before each StopOrphanAsync returns, e.g. to look at the ledger then.</summary>
         public Action? OnStopOrphan { get; init; }
+        /// <summary>The tools the worker says its sessions run with.</summary>
+        public WorkerTools Tools { get; init; } = WorkerTools.Implementer;
 
         public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
             WorkerCallbacks? callbacks, CancellationToken ct)
