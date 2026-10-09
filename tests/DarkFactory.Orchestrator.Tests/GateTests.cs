@@ -396,13 +396,13 @@ public class RouterReviewerTests
     private static readonly ConfirmRequest Confirm = new(Story, "o/r", Pull, "+fix\n", Files, ReviewRoles.SpecConformance, Blocking,
         ReviewPrompts.Confirm, "claude-sonnet-5", "0b7c4d2e-0000-4000-8000-000000000002");
 
-    private static string Answer(string text, string model = "claude-opus-5-5", string stop = "end_turn") =>
-        JsonSerializer.Serialize(new { model, stop_reason = stop, content = new[] { new { type = "text", text } } });
+    /// <summary>The router answering every model call with <paramref name="events"/> (an Anthropic event stream).</summary>
+    private static FakeApi Router(string events) => new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(events));
 
     [Fact]
     public async Task A_role_review_calls_the_router_pinned_with_the_roles_prompt_file_and_only_the_router_key()
     {
-        var api = new FakeApi().On("POST /v1/messages", HttpStatusCode.OK, Answer(
+        var api = Router(SseAnswers.Answer(
             "One problem.\n{\"findings\": [{\"severity\": \"blocking\", \"title\": \"flag has no consumer\", \"file\": \"src/Options.cs\", \"line\": 12, \"detail\": \"never read\"}, {\"severity\": \"optional\", \"title\": \"naming\", \"file\": null, \"line\": null, \"detail\": \"x\"}], \"summary\": \"one blocking\"}"));
 
         var review = await new RouterReviewer(api.Client("http://router.test/"), "rk_test").ReviewAsync(Request, CancellationToken.None);
@@ -420,6 +420,8 @@ public class RouterReviewerTests
         Assert.Equal(Request.Session, sent.Headers[RouterReviewer.SessionHeader]);
         var body = JsonDocument.Parse(sent.Body!).RootElement;
         Assert.Equal("claude-opus-5-5", body.GetProperty("model").GetString());
+        // Streamed: the router cancels a call that has sent its client nothing for 10 s (sc-25391).
+        Assert.True(body.GetProperty("stream").GetBoolean());
         Assert.Equal(Request.Prompt.Text, body.GetProperty("system").GetString()); // the prompt file, verbatim
         var prompt = body.GetProperty("messages")[0].GetProperty("content").GetString()!;
         Assert.Contains("+fix", prompt);
@@ -481,8 +483,8 @@ public class RouterReviewerTests
     [Fact]
     public async Task A_confirmation_calls_the_router_with_the_confirm_prompt_and_the_finding()
     {
-        var api = new FakeApi().On("POST /v1/messages", HttpStatusCode.OK,
-            Answer("Line 12 declares it; nothing reads it.\n{\"confirmed\": true, \"reason\": \"declared, never read\"}", "claude-sonnet-5"));
+        var api = Router(SseAnswers.Answer(
+            "Line 12 declares it; nothing reads it.\n{\"confirmed\": true, \"reason\": \"declared, never read\"}", "claude-sonnet-5"));
 
         var confirmation = await new RouterReviewer(api.Client("http://router.test/"), "rk").ConfirmAsync(Confirm, CancellationToken.None);
 
@@ -570,6 +572,222 @@ public class RouterReviewerTests
         Assert.Contains("not reviewed", (await reviewer.ReviewAsync(Request with { Diff = big }, CancellationToken.None)).Error);
         Assert.Equal(Confirmation.Unusable, (await reviewer.ConfirmAsync(Confirm with { Diff = big }, CancellationToken.None)).Outcome);
         Assert.Single(api.Requests);
+    }
+
+    private const string CleanFindings = "{\"findings\": [], \"summary\": \"fine\"}";
+
+    [Fact]
+    public async Task A_streamed_answer_is_assembled_from_its_text_deltas_with_the_served_model_from_message_start()
+    {
+        // Two text blocks around a thinking block (ignored), split mid-line, with pings; the stop reason arrives last.
+        var events = SseAnswers.MessageStart("claude-opus-5-5-20261001") + SseAnswers.Ping
+            + SseAnswers.TextBlockStart(0) + SseAnswers.TextDelta(0, "Looked at ") + SseAnswers.TextDelta(0, "the diff.") + SseAnswers.BlockStop(0)
+            + SseAnswers.Event("content_block_start", new { type = "content_block_start", index = 1, content_block = new { type = "thinking", thinking = "" } })
+            + SseAnswers.Event("content_block_delta", new { type = "content_block_delta", index = 1, delta = new { type = "thinking_delta", thinking = "{\"findings\": [{}]}" } })
+            + SseAnswers.BlockStop(1)
+            + SseAnswers.TextBlockStart(2) + SseAnswers.TextDelta(2, "{\"findings\": [], ") + SseAnswers.Ping + SseAnswers.TextDelta(2, "\"summary\": \"fine\"}")
+            + SseAnswers.BlockStop(2) + SseAnswers.MessageDelta("end_turn") + SseAnswers.MessageStop;
+
+        var answer = await MessageStream.ReadAsync(new MemoryStream(System.Text.Encoding.UTF8.GetBytes(events)), TimeSpan.FromSeconds(5), CancellationToken.None);
+
+        Assert.Equal(new StreamedAnswer("claude-opus-5-5-20261001", "end_turn", "Looked at the diff.\n" + CleanFindings + "\n"), answer);
+        var review = await new RouterReviewer(Router(events).Client("http://router.test/"), "rk").ReviewAsync(Request, CancellationToken.None);
+        Assert.True(review.Clean, review.Error);
+        Assert.Equal("claude-opus-5-5-20261001", review.ServedModel);
+    }
+
+    [Fact]
+    public async Task A_stream_served_by_another_model_or_stopped_early_is_an_unusable_review()
+    {
+        var other = await new RouterReviewer(Router(SseAnswers.Answer(CleanFindings, "claude-sonnet-4-5")).Client("http://router.test/"), "rk")
+            .ReviewAsync(Request, CancellationToken.None);
+        Assert.Contains("not the pinned", other.Error);
+
+        var cut = await new RouterReviewer(Router(SseAnswers.Answer(CleanFindings, stop: "max_tokens")).Client("http://router.test/"), "rk")
+            .ReviewAsync(Request, CancellationToken.None);
+        Assert.Contains("ended early (max_tokens)", cut.Error);
+    }
+
+    [Theory]
+    [InlineData("overloaded_error", "Overloaded")]
+    [InlineData("rate_limit_error", "Number of request tokens has exceeded your per-minute rate limit")]
+    [InlineData("api_error", "All enrolled subscription accounts are currently unavailable.")]
+    public async Task A_usage_error_event_mid_stream_throws_usage_limited(string type, string message)
+    {
+        var events = SseAnswers.MessageStart("claude-opus-5-5") + SseAnswers.TextBlockStart(0) + SseAnswers.TextDelta(0, "Partial")
+            + SseAnswers.Error(type, message);
+        var reviewer = new RouterReviewer(Router(events).Client("http://router.test/"), "rk");
+
+        var ex = await Assert.ThrowsAsync<RouterUsageLimitedException>(() => reviewer.ReviewAsync(Request, CancellationToken.None));
+        Assert.Contains("mid-stream", ex.Message);
+        await Assert.ThrowsAsync<RouterUsageLimitedException>(() => reviewer.ConfirmAsync(Confirm, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Any_other_error_event_mid_stream_fails_the_call()
+    {
+        // The error arrives after a complete-looking findings line: the partial answer must not count.
+        var events = SseAnswers.MessageStart("claude-opus-5-5") + SseAnswers.TextBlockStart(0) + SseAnswers.TextDelta(0, CleanFindings)
+            + SseAnswers.BlockStop(0) + SseAnswers.Error("api_error", "Internal server error") + SseAnswers.MessageDelta("end_turn") + SseAnswers.MessageStop;
+        var reviewer = new RouterReviewer(Router(events).Client("http://router.test/"), "rk");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => reviewer.ReviewAsync(Request, CancellationToken.None));
+        Assert.Contains("failed mid-stream", ex.Message);
+        Assert.Contains("Internal server error", ex.Message);
+    }
+
+    [Fact]
+    public async Task A_stream_that_ends_without_message_stop_fails_closed()
+    {
+        // Everything but message_stop: the findings line and the stop reason are there, the stream is still cut short.
+        var full = SseAnswers.Answer(CleanFindings);
+        var truncated = full[..full.LastIndexOf("event: message_stop", StringComparison.Ordinal)];
+        var reviewer = new RouterReviewer(Router(truncated).Client("http://router.test/"), "rk");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => reviewer.ReviewAsync(Request, CancellationToken.None));
+        Assert.Contains("ended without message_stop", ex.Message);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => reviewer.ConfirmAsync(Confirm, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task An_answer_that_is_not_an_event_stream_fails_and_a_usage_body_still_counts_as_usage()
+    {
+        var json = JsonSerializer.Serialize(new { model = "claude-opus-5-5", stop_reason = "end_turn", content = new[] { new { type = "text", text = CleanFindings } } });
+        var reviewer = new RouterReviewer(new FakeApi().On("POST /v1/messages", HttpStatusCode.OK, json).Client("http://router.test/"), "rk");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => reviewer.ReviewAsync(Request, CancellationToken.None));
+        Assert.Contains("not an event stream", ex.Message);
+
+        var usage = new RouterReviewer(new FakeApi().On("POST /v1/messages", HttpStatusCode.OK,
+            """{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}""").Client("http://router.test/"), "rk");
+        await Assert.ThrowsAsync<RouterUsageLimitedException>(() => usage.ReviewAsync(Request, CancellationToken.None));
+
+        // A model's answer that only talks about rate limits is no usage refusal: it fails as a non-stream answer.
+        var prose = JsonSerializer.Serialize(new
+        {
+            type = "message", model = "claude-opus-5-5", stop_reason = "end_turn",
+            content = new[] { new { type = "text", text = "The retry loop treats rate_limit_error as fatal.\n" + CleanFindings } },
+        });
+        var talker = new RouterReviewer(new FakeApi().On("POST /v1/messages", HttpStatusCode.OK, prose).Client("http://router.test/"), "rk");
+        var notUsage = await Assert.ThrowsAsync<InvalidOperationException>(() => talker.ReviewAsync(Request, CancellationToken.None));
+        Assert.Contains("not an event stream", notUsage.Message);
+    }
+
+    /// <summary>A router that sends <paramref name="first"/> at once, then each of <paramref name="later"/> after <paramref name="gap"/>.</summary>
+    private static (FakeApi Api, Task Writer) SlowRouter(string first, IReadOnlyList<string> later, TimeSpan gap, bool complete = true)
+    {
+        var (reader, writer) = SlowBytes(System.Text.Encoding.UTF8.GetBytes(first), later.Select(System.Text.Encoding.UTF8.GetBytes).ToList(), gap, complete);
+        return (new FakeApi().On("POST /v1/messages", _ => SseAnswers.Streamed(reader)), writer);
+    }
+
+    /// <summary>Raw body bytes: <paramref name="first"/> at once, then each of <paramref name="later"/> after <paramref name="gap"/>.</summary>
+    private static (System.Threading.Channels.ChannelReader<byte[]> Reader, Task Writer) SlowBytes(byte[] first, IReadOnlyList<byte[]> later, TimeSpan gap,
+        bool complete = true)
+    {
+        var channel = System.Threading.Channels.Channel.CreateUnbounded<byte[]>();
+        channel.Writer.TryWrite(first);
+        var writer = Task.Run(async () =>
+        {
+            foreach (var chunk in later)
+            {
+                await Task.Delay(gap);
+                channel.Writer.TryWrite(chunk);
+            }
+            if (complete)
+            {
+                channel.Writer.Complete();
+            }
+        });
+        return (channel.Reader, writer);
+    }
+
+    [Fact]
+    public async Task A_stream_with_crlf_lines_comments_multi_line_data_a_split_character_and_a_long_thinking_block_is_read_per_the_sse_spec()
+    {
+        static byte[] Crlf(string s) => System.Text.Encoding.UTF8.GetBytes(s.Replace("\n", "\r\n"));
+        var chunks = new List<byte[]>
+        {
+            // A thinking block over ~1.2 s, a delta every 300 ms: longer than the 500 ms idle gap, never silent for it.
+            Crlf(SseAnswers.Event("content_block_start", new { type = "content_block_start", index = 0, content_block = new { type = "thinking", thinking = "" } })),
+        };
+        for (var i = 0; i < 4; i++)
+        {
+            chunks.Add(Crlf(SseAnswers.Event("content_block_delta",
+                new { type = "content_block_delta", index = 0, delta = new { type = "thinking_delta", thinking = "{\"findings\": [{}]}" } })));
+        }
+        chunks.Add(Crlf(SseAnswers.BlockStop(0) + SseAnswers.TextBlockStart(1)));
+        // One event whose data spans two lines, with a comment line between them, and a ✓ (3 bytes) split across two chunks.
+        var multiLine = Crlf("event: content_block_delta\n: a comment, ignored\ndata: {\"type\":\"content_block_delta\",\"index\":1,\n"
+            + "data: \"delta\":{\"type\":\"text_delta\",\"text\":\"Checked ✓ ok.\\n\"}}\n\n");
+        var split = Array.IndexOf(multiLine, (byte)0xE2) + 1;
+        chunks.Add(multiLine[..split]);
+        chunks.Add(multiLine[split..]);
+        chunks.Add(Crlf(SseAnswers.TextDelta(1, CleanFindings) + SseAnswers.BlockStop(1) + SseAnswers.MessageDelta("end_turn") + SseAnswers.MessageStop));
+        var (reader, writer) = SlowBytes(Crlf(SseAnswers.MessageStart("claude-opus-5-5") + ": keep-alive\n\n"), chunks, TimeSpan.FromMilliseconds(300));
+        var started = System.Diagnostics.Stopwatch.StartNew();
+
+        var answer = await MessageStream.ReadAsync(await SseAnswers.Streamed(reader).Content.ReadAsStreamAsync(TestContext.Current.CancellationToken),
+            TimeSpan.FromMilliseconds(500), TestContext.Current.CancellationToken);
+
+        Assert.Equal(new StreamedAnswer("claude-opus-5-5", "end_turn", "Checked ✓ ok.\n" + CleanFindings + "\n"), answer);
+        Assert.True(started.Elapsed > TimeSpan.FromSeconds(1), $"{started.Elapsed}");
+        await writer;
+
+        // Exactly one space after "data:" is stripped, a second one is the value's own.
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => MessageStream.ReadAsync(
+            new MemoryStream(System.Text.Encoding.UTF8.GetBytes("event: error\ndata:  {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"x\"}}\n\n")),
+            TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        Assert.Contains("mid-stream:  {\"type\":\"error\"", error.Message);
+    }
+
+    [Fact]
+    public async Task A_slow_stream_is_read_as_it_arrives_and_only_a_gap_longer_than_the_idle_timeout_fails_it()
+    {
+        // message_start at once, then a text delta every 300 ms for ~2.4 s: longer in all than the 1 s idle gap, never
+        // silent for it. Reading as it arrives, the call succeeds.
+        var text = "Reviewed the change in small steps.\n" + CleanFindings;
+        var deltas = Enumerable.Range(0, (text.Length + 4) / 5).Select(i => SseAnswers.TextDelta(0, text.Substring(i * 5, Math.Min(5, text.Length - i * 5))))
+            .Prepend(SseAnswers.TextBlockStart(0)).Append(SseAnswers.BlockStop(0) + SseAnswers.MessageDelta("end_turn") + SseAnswers.MessageStop).ToList();
+        var slow = SlowRouter(SseAnswers.MessageStart("claude-opus-5-5"), deltas, TimeSpan.FromMilliseconds(2400.0 / deltas.Count));
+        var started = System.Diagnostics.Stopwatch.StartNew();
+
+        var review = await new RouterReviewer(slow.Api.Client("http://router.test/"), "rk", idleTimeout: TimeSpan.FromSeconds(1))
+            .ReviewAsync(Request, CancellationToken.None);
+
+        Assert.True(review.Clean, review.Error);
+        Assert.True(started.Elapsed > TimeSpan.FromSeconds(1.5), $"{started.Elapsed}");
+        await slow.Writer;
+
+        // message_start and one delta, then silence (the stream stays open): the idle gap fails it, long before the whole
+        // call's 60 s deadline and without waiting for a body that never ends.
+        var stalled = SlowRouter(SseAnswers.MessageStart("claude-opus-5-5") + SseAnswers.TextBlockStart(0), [SseAnswers.TextDelta(0, "Partial")],
+            TimeSpan.FromMilliseconds(100), complete: false);
+        using var http = stalled.Api.Client("http://router.test/");
+        http.Timeout = TimeSpan.FromSeconds(60);
+        started.Restart();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new RouterReviewer(http, "rk", idleTimeout: TimeSpan.FromMilliseconds(700)).ReviewAsync(Request, CancellationToken.None));
+
+        Assert.Contains("stalled: nothing for 0.7 s after 3 event(s)", ex.Message);
+        Assert.True(started.Elapsed < TimeSpan.FromSeconds(10), $"{started.Elapsed}");
+    }
+
+    [Fact]
+    public async Task The_review_timeout_bounds_the_whole_stream_not_just_its_headers()
+    {
+        // A delta every 100 ms for 6 s, never message_stop: never idle, so only the client's 1 s timeout can end it in time.
+        var forever = Enumerable.Repeat(SseAnswers.Ping, 60).ToList();
+        var slow = SlowRouter(SseAnswers.MessageStart("claude-opus-5-5"), forever, TimeSpan.FromMilliseconds(100));
+        using var http = slow.Api.Client("http://router.test/");
+        http.Timeout = TimeSpan.FromSeconds(1);
+        var started = System.Diagnostics.Stopwatch.StartNew();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new RouterReviewer(http, "rk", idleTimeout: TimeSpan.FromSeconds(5)).ReviewAsync(Request, CancellationToken.None));
+
+        Assert.Contains("did not finish within", ex.Message);
+        Assert.True(started.Elapsed < TimeSpan.FromSeconds(4), $"{started.Elapsed}");
     }
 }
 

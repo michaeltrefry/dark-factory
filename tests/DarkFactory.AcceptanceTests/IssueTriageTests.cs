@@ -55,9 +55,7 @@ public class IssueTriageTests
         var number = await OpenIssueAsync(owner, repo, "[dark-factory fixture] whitespace-only text counts as one word", ConfidentBug, ct);
         try
         {
-            await FactoryRunner.PollIssuesAsync(options, status, Console.Out, ct);
-
-            var key = await KeyAsync(e2e, repo, number, ct);
+            var key = await PollUntilTriagedAsync(e2e, options, status, repo, number, ct);
             var history = await HistoryAsync(e2e, key, ct);
             var triage = IssueIntake.Latest(history);
             Assert.True(triage is { Route: IssueRoute.Build }, $"the triage routed it {triage?.Route}: {triage?.Why}");
@@ -93,8 +91,7 @@ public class IssueTriageTests
         var number = await OpenIssueAsync(outsider, repo, "[dark-factory fixture] whitespace-only text counts as one word", ConfidentBug, ct);
         try
         {
-            await FactoryRunner.PollIssuesAsync(options, status, Console.Out, ct);
-            var key = await KeyAsync(e2e, repo, number, ct);
+            var key = await PollUntilTriagedAsync(e2e, options, status, repo, number, ct);
             Assert.Equal(IssueRoute.AwaitingApproval, IssueIntake.Latest(await HistoryAsync(e2e, key, ct))!.Route);
             var issue = await GetAsync(owner, $"repos/{repo}/issues/{number}", ct);
             Assert.Contains(issue.GetProperty("labels").EnumerateArray(), l => l.GetProperty("name").GetString() == IssueLabels.AwaitingApproval);
@@ -106,15 +103,18 @@ public class IssueTriageTests
                 triageComment.GetProperty("performed_via_github_app").GetProperty("id").GetInt64());
             Assert.Equal("Bot", triageComment.GetProperty("user").GetProperty("type").GetString());
 
+            // Each comment updates the issue, which the listing may also show late: poll until the intake has acted on it.
             await CommentAsync(outsider, repo, number, "Approved", ct);
-            await FactoryRunner.PollIssuesAsync(options, status, Console.Out, ct);
+            await PollUntil.SeenAsync(c => FactoryRunner.PollIssuesAsync(options, status, Console.Out, c),
+                async c => (await HistoryAsync(e2e, key, c)).Any(e => e.Step == IssueSteps.ApprovalIgnored),
+                $"the intake ignoring the outsider's approval on {repo}#{number}", ct);
             Assert.DoesNotContain(await HistoryAsync(e2e, key, ct), e => e.Step == IssueSteps.Released);
-            Assert.Contains(await HistoryAsync(e2e, key, ct), e => e.Step == IssueSteps.ApprovalIgnored);
 
             await CommentAsync(owner, repo, number, "Approved", ct);
-            await FactoryRunner.PollIssuesAsync(options, status, Console.Out, ct);
             using var github = OutboundHttp.GitHubApi();
-            Assert.Contains(key, await FactoryRunner.CreateIssueSource(options, github).ListReadyAsync(ct));
+            await PollUntil.SeenAsync(c => FactoryRunner.PollIssuesAsync(options, status, Console.Out, c),
+                async c => (await FactoryRunner.CreateIssueSource(options, github).ListReadyAsync(c)).Contains(key),
+                $"{repo}#{number} ready after the owner's approval", ct);
         }
         finally
         {
@@ -139,9 +139,7 @@ public class IssueTriageTests
         var number = await OpenIssueAsync(owner, repo, "[dark-factory fixture] taint probe: whitespace-only text counts as one word", ConfidentBug, ct);
         try
         {
-            await FactoryRunner.PollIssuesAsync(options, status, Console.Out, ct);
-
-            var key = await KeyAsync(e2e, repo, number, ct);
+            var key = await PollUntilTriagedAsync(e2e, options, status, repo, number, ct);
             Assert.NotNull(IssueIntake.Latest(await HistoryAsync(e2e, key, ct))); // it was triaged
             await using var db = e2e.Db();
             var externalId = ItemNaming.GitHubIssue.Format(key);
@@ -194,6 +192,32 @@ public class IssueTriageTests
     private static async Task CloseAsync(HttpClient owner, RepoRef repo, int number)
     {
         using var response = await owner.PatchAsJsonAsync($"repos/{repo}/issues/{number}", new { state = "closed", state_reason = "not_planned" });
+    }
+
+    /// <summary>
+    /// Polls the issue intake (<see cref="PollUntil"/>) until it has triaged issue <paramref name="number"/>, which GitHub's
+    /// <c>issues?since=</c> listing may show a poll or two late; the issue's key.
+    /// </summary>
+    private static async Task<int> PollUntilTriagedAsync(E2e e2e, FactoryOptions options, IntakeStatus status, RepoRef repo, int number,
+        CancellationToken ct)
+    {
+        await PollUntil.SeenAsync(c => FactoryRunner.PollIssuesAsync(options, status, Console.Out, c),
+            c => TriagedAsync(e2e, repo, number, c), $"the triage of {repo}#{number}", ct);
+        return await KeyAsync(e2e, repo, number, ct);
+    }
+
+    private static async Task<bool> TriagedAsync(E2e e2e, RepoRef repo, int number, CancellationToken ct)
+    {
+        await using var db = e2e.Db();
+        var issue = await db.GitHubIssues.AsNoTracking().SingleOrDefaultAsync(i => i.Repo == repo.FullName && i.Number == number, ct);
+        if (issue is null)
+        {
+            return false;
+        }
+        var externalId = ItemNaming.GitHubIssue.Format(issue.Id);
+        var item = await db.WorkItems.AsNoTracking().SingleOrDefaultAsync(i => i.Source == "github" && i.ExternalId == externalId, ct);
+        return item is not null
+            && IssueIntake.Latest(await db.LedgerEntries.AsNoTracking().Where(e => e.WorkItemId == item.Id).OrderBy(e => e.Id).ToListAsync(ct)) is not null;
     }
 
     private static async Task<int> KeyAsync(E2e e2e, RepoRef repo, int number, CancellationToken ct)

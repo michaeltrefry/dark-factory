@@ -1107,10 +1107,7 @@ public class GatePipelineTests
             {
                 answer = """{"findings": [], "summary": "nothing found"}""";
             }
-            return FakeApi.Json(System.Net.HttpStatusCode.OK, System.Text.Json.JsonSerializer.Serialize(new
-            {
-                model, stop_reason = "end_turn", content = new[] { new { type = "text", text = $"Reviewed.\n{answer}" } },
-            }));
+            return SseAnswers.Response(SseAnswers.Answer($"Reviewed.\n{answer}", model));
         });
     }
 
@@ -1129,6 +1126,8 @@ public class GatePipelineTests
 
         // The fixer leaves the flag unread (the diff stays the same), so every fix round fails and the item escalates.
         Assert.Equal(WorkState.Escalated, outcome.State);
+        // The escalated item's outcome still names its PR, the one an operator has to look at.
+        Assert.Equal(PrUrl, outcome.PullRequestUrl);
         var verdict = (await h.Verdicts()).First();
         Assert.Equal(ReviewVerdict.Fail, verdict.Verdict);
         var finding = verdict.Reviews.Single(r => r.Role == ReviewRoles.SpecConformance).Findings.Single();

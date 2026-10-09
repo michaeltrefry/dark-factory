@@ -9,6 +9,10 @@ using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.Orchestrator;
 
+/// <summary>
+/// What a run left: the item's state, its last Claude session, its pull request (the ledger's <c>linked</c> PR, in any state,
+/// escalated included; null when it never got one) and why the run did not succeed.
+/// </summary>
 public sealed record RunOutcome(long WorkItemId, WorkState State, string? SessionId, string? PullRequestUrl, string? Error)
 {
     public bool Succeeded => Error is null;
@@ -1608,10 +1612,9 @@ public sealed partial class RunPipeline(
     {
         var history = await ledger.HistoryAsync(item, ct);
         var session = history.LastOrDefault(e => e.ClaudeSessionId is not null)?.ClaudeSessionId;
-        var pr = item.State is WorkState.Review or WorkState.Fixing or WorkState.CI or WorkState.CIHealing or WorkState.MergeGate or WorkState.Merge or WorkState.Watch
-            ? LinkedPullRequestUrl(history)
-            : null;
-        return new RunOutcome(item.Id, item.State, session, pr, error);
+        // The item's PR whenever it has one, whatever its state: an escalated, paused or stopped item's PR is the one an
+        // operator has to look at.
+        return new RunOutcome(item.Id, item.State, session, LinkedPullRequestUrl(history), error);
     }
 
     private static string IntakeDetail(WorkStory story) => $"{story.StoryType}: {story.AppUrl}";

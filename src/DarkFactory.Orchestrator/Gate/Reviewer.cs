@@ -1,6 +1,5 @@
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
-using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using DarkFactory.Orchestrator.Worker;
@@ -51,10 +50,16 @@ public interface IReviewer
 /// The panel's calls through the Weave router (never a provider directly), each pinned with <c>x-weave-force-model</c> (the
 /// router's headless <c>/force-model</c>) to a Claude model (<see cref="ReviewModels"/>). The router key is the only
 /// credential sent, as the worker sends it. The system prompt is the role's prompt file, verbatim (<see cref="ReviewPrompts"/>).
-/// Reviewers read a diff and answer; they have no tools and change nothing.
+/// Reviewers read a diff and answer; they have no tools and change nothing. Every call streams (<see cref="MessageStream"/>):
+/// <c>Review:TimeoutMinutes</c> (the client's timeout) bounds the whole call, and a stream silent for the idle gap fails.
 /// </summary>
-public sealed class RouterReviewer(HttpClient http, string routerKey) : IReviewer
+public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? idleTimeout = null) : IReviewer
 {
+    /// <summary>The longest gap between two lines of an answer stream before the call fails as stalled.</summary>
+    public static readonly TimeSpan DefaultIdleTimeout = TimeSpan.FromMinutes(2);
+
+    private readonly TimeSpan _idleTimeout = idleTimeout ?? DefaultIdleTimeout;
+
     public const string ForceModelHeader = "x-weave-force-model";
 
     /// <summary>
@@ -109,34 +114,70 @@ public sealed class RouterReviewer(HttpClient http, string routerKey) : IReviewe
             max_tokens = MaxTokens,
             system,
             messages = new[] { new { role = "user", content = user } },
+            // Streamed: the router cancels a call that has sent its client nothing for 10 s, and a review takes longer.
+            stream = true,
         });
-        using var response = await http.SendAsync(message, ct);
-        if (!response.IsSuccessStatusCode)
+        // The whole call, stream included, is bounded by the client's timeout (Review:TimeoutMinutes): HttpClient's own
+        // timeout ends at the response headers, and the answer streams after them.
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        if (http.Timeout != Timeout.InfiniteTimeSpan)
         {
-            var body = await response.Content.ReadAsStringAsync(ct);
-            var why = $"The review call through the router failed: {(int)response.StatusCode} {(body.Length > 500 ? body[..500] : body)}";
-            if (UsageLimited((int)response.StatusCode, body))
-            {
-                throw new RouterUsageLimitedException(why);
-            }
-            throw new InvalidOperationException(why);
+            deadline.CancelAfter(http.Timeout);
         }
-        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
-        var root = doc.RootElement;
-        var served = root.TryGetProperty("model", out var m) && m.ValueKind == JsonValueKind.String ? m.GetString() : null;
-        var stop = root.TryGetProperty("stop_reason", out var s) && s.ValueKind == JsonValueKind.String ? s.GetString() : null;
-        var text = new StringBuilder();
-        if (root.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array)
+        try
         {
-            foreach (var block in content.EnumerateArray())
+            using var response = await http.SendAsync(message, HttpCompletionOption.ResponseHeadersRead, deadline.Token);
+            if (!response.IsSuccessStatusCode)
             {
-                if (block.TryGetProperty("type", out var type) && type.ValueEquals("text") && block.TryGetProperty("text", out var t))
+                var body = await response.Content.ReadAsStringAsync(deadline.Token);
+                var why = $"The review call through the router failed: {(int)response.StatusCode} {Cut(body, 500)}";
+                if (UsageLimited((int)response.StatusCode, body))
                 {
-                    text.Append(t.GetString()).Append('\n');
+                    throw new RouterUsageLimitedException(why);
                 }
+                throw new InvalidOperationException(why);
             }
+            if (response.Content.Headers.ContentType?.MediaType != "text/event-stream")
+            {
+                // Anything but a stream is not an answer the panel reads; a usage refusal that arrives this way still pauses.
+                var body = await response.Content.ReadAsStringAsync(deadline.Token);
+                var why = $"The review call through the router answered {(int)response.StatusCode} "
+                    + $"{response.Content.Headers.ContentType?.MediaType ?? "(no content type)"}, not an event stream: {Cut(body, 500)}";
+                if (IsErrorBody(body) && UsageLimited(0, body))
+                {
+                    throw new RouterUsageLimitedException(why);
+                }
+                throw new InvalidOperationException(why);
+            }
+            await using var stream = await response.Content.ReadAsStreamAsync(deadline.Token);
+            var answer = await MessageStream.ReadAsync(stream, _idleTimeout, deadline.Token);
+            return (answer.Served, answer.StopReason, answer.Text);
         }
-        return (served, stop, text.ToString());
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new InvalidOperationException($"The review call through the router did not finish within {http.Timeout.TotalMinutes:0.##} min.");
+        }
+    }
+
+    /// <summary>
+    /// Whether a successful non-stream body is an error rather than a model's answer: an Anthropic error object
+    /// (<c>{"type":"error",...}</c>), or anything without a JSON <c>content</c>. A model's answer may well talk about rate
+    /// limits, so its text is never scanned for usage markers (the rule <see cref="WorkerResult.UsageLimited"/> follows).
+    /// </summary>
+    private static bool IsErrorBody(string body)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+            return root.ValueKind != JsonValueKind.Object
+                || (root.TryGetProperty("type", out var type) && type.ValueKind == JsonValueKind.String && type.ValueEquals("error"))
+                || !root.TryGetProperty("content", out _);
+        }
+        catch (JsonException)
+        {
+            return true;
+        }
     }
 
     /// <summary>
