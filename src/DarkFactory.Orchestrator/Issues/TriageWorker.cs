@@ -7,7 +7,10 @@ using DarkFactory.Orchestrator.Worker;
 
 namespace DarkFactory.Orchestrator.Issues;
 
-/// <summary>Runs the triage worker for one issue (a read-only worker session through the router, unpinned).</summary>
+/// <summary>
+/// Runs the triage worker for one issue (a read-only worker session through the router, unpinned, on
+/// <see cref="WorkerModelClass.Triage"/>, E8).
+/// </summary>
 public interface ITriageRunner
 {
     /// <summary>
@@ -60,7 +63,7 @@ public sealed class WorkerTriageRunner(IRepoWorkspace workspaces, IWorker worker
             WorkerResult result;
             try
             {
-                result = await worker.RunAsync(workspace.Path, prompt, null, new WorkerCallbacks(
+                result = await worker.RunAsync(workspace.Path, prompt, null, WorkerModelClass.Triage, new WorkerCallbacks(
                     OnStarted: (_, _) => Task.CompletedTask,
                     OnSession: async (sid, c) =>
                     {

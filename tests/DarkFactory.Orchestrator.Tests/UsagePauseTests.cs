@@ -360,7 +360,7 @@ public class UsagePauseTests
         public List<string?> Resumes { get; } = [];
         public TaskCompletionSource Working { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, WorkerCallbacks? callbacks, CancellationToken ct)
+        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass, WorkerCallbacks? callbacks, CancellationToken ct)
         {
             Resumes.Add(resumeSessionId);
             await callbacks!.OnStarted!(WorkerPid, ct);
@@ -582,5 +582,51 @@ public class UsagePauseTests
         Assert.Equal(WorkState.Paused, paused.State);
         Assert.Equal((WorkState.Paused, userScope is null ? RunPipeline.UsagePaused : RunPipeline.UserPaused), (await l.Transitions())[^1]);
         Assert.Equal(userScope is null, (await l.Rows()).Any(r => r.Step == RunPipeline.Steps.UsagePause));
+    }
+
+    private const string ClassUnavailable =
+        """API Error: 503 {"type":"error","error":{"type":"api_error","message":"model_class_unavailable: no model of class mid can serve this request"}}""";
+
+    [Fact]
+    public async Task A_worker_refused_with_model_class_unavailable_pauses_like_a_usage_refusal_and_resumes_its_session()
+    {
+        var l = new Ledgers();
+        var source = new FakeWorkSource(Story);
+        var worker = new FakeWorker(
+            Reports(new WorkerResult("sess-77", 1, true, "success", ClassUnavailable, "")),
+            Reports(Ok));
+
+        var paused = await l.Pipeline(source, worker).RunAsync(77, CancellationToken.None);
+
+        Assert.Equal(WorkState.Paused, paused.State);
+        var transitions = await l.Transitions();
+        Assert.Equal((WorkState.Paused, RunPipeline.UsagePaused), transitions[^1]);
+        Assert.DoesNotContain(transitions, t => t.Item1 == WorkState.Escalated);
+        Assert.Empty(source.Comments); // no escalation comment
+        var pause = await l.Controls.UsagePauseAsync(CancellationToken.None);
+        Assert.Equal((UsagePause.WorkerModelClassUnavailable, T0 + UsagePause.InitialBackoff), (pause!.Reason, pause.ResumeAt));
+
+        l.Time.Advance(UsagePause.InitialBackoff);
+        Assert.Equal([77], await l.InFlight());
+        var resumed = await l.Pipeline(source, worker).RunAsync(77, CancellationToken.None);
+
+        Assert.True(resumed.Succeeded, resumed.Error);
+        Assert.Equal("sess-77", worker.Calls[1].Resume);
+        Assert.Equal([WorkerModelClass.Mid, WorkerModelClass.Mid], worker.Calls.Select(c => c.ModelClass)); // same class on resume
+    }
+
+    [Fact]
+    public async Task A_worker_whose_prose_mentions_model_class_unavailable_in_a_non_error_result_still_escalates()
+    {
+        var l = new Ledgers();
+        var source = new FakeWorkSource(Story);
+        var worker = new FakeWorker(Reports(new WorkerResult("sess-77", 1, false, "success",
+            "The router returns model_class_unavailable (503) when a class has no servable model; I could not finish the tests.", "")));
+
+        var outcome = await l.Pipeline(source, worker).RunAsync(77, CancellationToken.None);
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Null(await l.Controls.UsagePauseAsync(CancellationToken.None));
+        Assert.Contains(source.Comments, c => c.Contains("escalated"));
     }
 }

@@ -214,7 +214,7 @@ public class WorkerTaintTests
             """);
         var reported = new List<(string, string)>();
 
-        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.RouterKey, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null,
+        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.RouterKey, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
             new WorkerCallbacks(OnUntrusted: (s, reason, _) => { reported.Add((s, reason)); File.WriteAllText(flag, ""); return Task.CompletedTask; }),
             CancellationToken.None);
 
@@ -235,7 +235,7 @@ public class WorkerTaintTests
         using var run = new CancellationTokenSource();
         var cancellable = new List<bool>();
 
-        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.RouterKey, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null,
+        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.RouterKey, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
             new WorkerCallbacks(OnUntrusted: (_, _, c) => { cancellable.Add(c.CanBeCanceled); return Task.CompletedTask; }), run.Token);
 
         Assert.True(result.Succeeded);
@@ -253,7 +253,7 @@ public class WorkerTaintTests
             """);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            new ClaudeWorker(script, Router, "k", WorkerAuth.RouterKey, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, null, CancellationToken.None));
+            new ClaudeWorker(script, Router, "k", WorkerAuth.RouterKey, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid, null, CancellationToken.None));
 
         Assert.Contains("web:WebFetch", ex.Message);
     }

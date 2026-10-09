@@ -166,9 +166,10 @@ single-tenant: one sandboxed `factory run` per machine (`WorkerLock`, `<work roo
 `sudo scripts/setup-worker-user.sh` once, and again after any change to `scripts/factory-worker-launch`: it installs
 the helper with `sandbox_user` and `sandbox_uid` set (setup refuses a worker uid outside 400-499). `EnsureReadyAsync`
 reads the installed helper first and fails start-up with `Stale helper: … re-run \`sudo scripts/setup-worker-user.sh\``
-unless it has `helper_version` ≥ `WorkerSandbox.HelperVersion` (2) and, with those two lines undone, the SHA-256 of the
+unless it has `helper_version` ≥ `WorkerSandbox.HelperVersion` (3) and, with those two lines undone, the SHA-256 of the
 repo's helper (compiled into the orchestrator as a resource); then it probes with the real router variable names
-(allowlist `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_AUTH_TOKEN`) and fails if the probe's stderr
+(allowlist `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_AUTH_TOKEN`; `ANTHROPIC_CUSTOM_HEADERS` may come on several
+stdin lines, one header each, which the helper joins with line breaks — helper_version 3, sc-25659) and fails if the probe's stderr
 has a uid-sweep refusal; last it runs `<Worker:ClaudePath> --version` as `_factory` through the helper and fails start-up with
 `Upgrade _factory's claude: …` (and the `claude update` command) below `WorkerSandbox.MinClaudeVersion` (2.1.291, the release
 the triage confinement — `--setting-sources ""`, `blockReadsOutsideWorkingDirectories`, `dontAsk` — was checked against; an
@@ -380,6 +381,56 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   no-op through the helper, whose exit kills every `_factory` process (`WorkerSandbox.StopAllAsync`).
 - Workers get only the router URL + router key; the worker env is an allowlist (`ClaudeWorker.BuildRouterVariables`,
   enforced again by `scripts/factory-worker-launch`).
+- Worker model classes (E8, sc-25659, `Worker/WorkerModelClass.cs`, over `Router/ModelClass.cs`'s header, class and `model_class_unavailable`
+  constants; reviews and second opinions run on `high`, sc-25626, below): every worker session names a router model class and no model.
+  `IWorker.RunAsync` takes the class (`high`|`mid`|`low`, anything else refused before a process starts); `ClaudeWorker` sends it as a
+  second `ANTHROPIC_CUSTOM_HEADERS` line, `x-weave-model-class: <class>`, after `X-Weave-Router-Key` (Claude Code splits that variable
+  on line breaks; no new variable, no `--model`, no `ANTHROPIC_MODEL`, no `x-weave-force-model`). Roles, decided in code, never by a
+  model: the implementer and its review and conflict fix rounds run on the item's coding class (`WorkerModelClass.Coding`: `low`
+  when the story is simple — the `simple` label, any case, or an estimate of 1 or 2 points — else `mid`, no estimate included); the
+  CI fixer on `mid` (`CiFix`); issue triage on `low` (`Triage`). Labels and estimate come through `IWorkSource.ReadSpecAsync`
+  (`WorkStory.Labels`/`Estimate`: Shortcut's story `labels` and `estimate`; a GitHub issue item has no estimate and its labels are
+  read from the issue at spec time — they only pick the class, and need not come from a collaborator, since an issue template can
+  apply one; a failed read logs a warning and counts as no labels, i.e. `mid`, never an item failure). Each run of a worker session checkpoints `worker-model-class` (Detail: the class), right after
+  the session's `session` row (a resumed session gets a fresh row: the class is re-derived each run). A failed session whose error
+  result (`is_error`) or stderr carries `model_class_unavailable` (the router's 503 when no model of the class can serve; it never
+  falls back to another class) is `WorkerResult.ModelClassUnavailable`: it pauses the factory for usage like the rate-limit backstop
+  (reason `worker-model-class-unavailable`, backoff, Paused `usage-paused`, auto-resumed, same session) and never escalates; the same
+  text in a non-error result is model prose and the failure escalates as usual. A class whose models are all refused by a spent
+  subscription comes back as that 429 and takes the existing usage path. Claude Code's own small utility calls (titles, summaries)
+  carry the same headers, so they run on the session's class too (accepted). The router key is refused if it holds a CR or LF, in
+  every auth mode (it would end its header line and could add another).
+  Repo settings guard (`Worker/RepoSettingsGuard.cs`): an implementing worker loads the worktree's `.claude/settings.json` and
+  `.claude/settings.local.json` (`--setting-sources project,local`), whose `env` outranks the env the factory sets (it could drop the
+  class, add `x-weave-force-model`, change `ANTHROPIC_BASE_URL`), as could `apiKeyHelper` or `model`. `RunWorkerSessionAsync` checks
+  the files owner-side, fail-closed by allowlist: a settings file may hold only top-level keys that cannot change the model,
+  endpoint, headers or credentials (`RepoSettingsGuard.AllowedKeys`: `permissions`, `hooks`, `disableAllHooks`,
+  `includeCoAuthoredBy`, …); any other key (`env`, `model`, `apiKeyHelper`, unknown or future ones), a non-object or unparsable file,
+  or a file `SafeFile.Read` refuses fails the round (Escalated, with the reason). `SafeFile.Read` (also behind `Taint.OfRepoSettings`,
+  where a refused file taints) never follows a symlink (`.claude` itself may not be one either), opens with `O_NONBLOCK|O_NOFOLLOW`
+  and refuses anything that is not a regular file (a FIFO would otherwise block the open forever while the run holds the item's
+  lock), refuses a file over 1 MiB without reading past the cap, and turns any I/O or memory failure into a refusal. The guard runs
+  before every implement, review/conflict fix and CI fix session (new or resumed: a branch the worker committed such a file to in
+  an earlier round is refused before the next round starts) and again when the worker finishes, before `worker-done` (a worker that
+  leaves one never has it pushed).
+  Why not re-assert the router variables through the factory's own `--settings` (which by Claude Code's documented precedence —
+  not re-verified against 2.1.291 — outranks project settings; it takes inline JSON or a file path): `ANTHROPIC_CUSTOM_HEADERS` and
+  `ANTHROPIC_AUTH_TOKEN` hold the router key, so the flag would put the key either in argv (inline JSON, readable by every local user
+  through `ps`) or at rest in a file the worker user can read, which the owner cannot create for `_factory` alone without root (the
+  launch helper would have to write it, a helper change) — a new copy of the key for a case the guard already refuses. Re-asserting
+  only `ANTHROPIC_BASE_URL` (no secret) would leave the headers, the part that carries the class, unprotected, so it is not done.
+  Residual risks, accepted:
+  - Mid-session settings: a worker that writes a settings file with `env` during its session, makes calls (Claude Code may reload
+    it), then deletes the file before it exits is NOT refused — the finish check sees no file; only the `implementer-model`
+    checkpoints (the models that answered) would show calls outside the class. A file still present at the end fails the round.
+  - Front matter: project subagents and commands (`.claude/agents`, `.claude/commands`) and prompt/agent hooks (`hooks` is allowed)
+    may name a model; that only asks for it in the request body, and the class header still holds the router to the class.
+  - `~_factory/.claude.json` (Claude Code's global config) is not filtered by `--setting-sources`, is writable by the worker and
+    persists across items; whether it can carry `env` or model overrides is unverified.
+  - E8 covers the session's own calls: a worker holds the router key, so code it runs (a test, a build step) can call the router
+    directly with any class or none.
+  A target repo whose default branch carries refused settings gets no implementer until they are removed. Triage loads no settings
+  at all (`--setting-sources ""`).
 - Untrusted-input taint (E4, sc-25386, `Worker/Taint.cs`): a worker session that has read untrusted content is tainted — a
   `session_taints` row keyed by its Claude session id (insert-only; a Postgres trigger refuses UPDATE/DELETE; the first reason
   is kept), so it holds across resume and crash and nothing clears it. Sources: the input the orchestrator hands it

@@ -33,7 +33,7 @@ public class ControlTests
         public int Tools => Volatile.Read(ref _tools);
         public bool Cancelled { get; private set; }
 
-        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, WorkerCallbacks? callbacks, CancellationToken ct)
+        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass, WorkerCallbacks? callbacks, CancellationToken ct)
         {
             Resumes.Add(resumeSessionId);
             await callbacks!.OnStarted!(WorkerPid, ct);
@@ -84,7 +84,7 @@ public class ControlTests
         public TaskCompletionSource PauseRequested { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, WorkerCallbacks? callbacks, CancellationToken ct)
+        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass, WorkerCallbacks? callbacks, CancellationToken ct)
         {
             Runs++;
             await callbacks!.OnStarted!(WorkerPid, ct);

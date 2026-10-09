@@ -241,7 +241,7 @@ public class GatePipelineTests
         public FakeTimeProvider Time { get; } = new(new DateTimeOffset(2026, 10, 8, 12, 0, 0, TimeSpan.Zero));
         /// <summary>The shared control table (needed for the usage pause), on the injected clock.</summary>
         public IControls Controls => new LedgerControls(new LedgerDbContextFactory(_options), Time);
-        public FakeWorkSource Stories { get; } = new(Story);
+        public FakeWorkSource Stories { get; init; } = new(Story);
         public FakeWorkspaces Workspaces { get; } = new();
         public FakePullRequests Prs { get; } = new();
         public InProcessRunLocks Locks { get; } = new();
@@ -281,10 +281,10 @@ public class GatePipelineTests
         /// <summary>The implementer reports <c>implementerModels</c>; every later session (a fixer) reports <see cref="FixerModels"/>.</summary>
         private sealed class HarnessWorker(Harness h, string?[] implementerModels) : IWorker
         {
-            public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, WorkerCallbacks? callbacks,
+            public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass, WorkerCallbacks? callbacks,
                 CancellationToken ct)
             {
-                var call = new WorkerCall(prompt, resumeSessionId, callbacks!);
+                var call = new WorkerCall(prompt, resumeSessionId, callbacks!, modelClass);
                 var index = h.WorkerCalls.Count;
                 h.WorkerCalls.Add(call);
                 h.PauseFlag = false; // as ClaudeWorker deletes a stale flag when a run starts

@@ -500,7 +500,7 @@ public sealed partial class RunPipeline
         await RunFixRoundAsync(run, history, round, fixedHead, $"conflicts with the base in {string.Join(", ", found?.Files ?? [])}", [SpecInput(spec.Story)],
             _ => Task.FromResult(BuildConflictFixPrompt(spec, repo, round, merged!, FixCapOf(history))),
             BuildConflictFixResumePrompt(spec.Story, round),
-            $"{spec.Story.Ref}: merge the base and resolve its conflicts (round {round})", WorkState.Review, $"conflict fix round {round}", ct,
+            $"{spec.Story.Ref}: merge the base and resolve its conflicts (round {round})", WorkState.Review, $"conflict fix round {round}", WorkerModelClass.Coding(spec.Story), ct,
             prepare: async (workspace, c) =>
             {
                 var merge = await workspaces.MergeBaseAsync(repo, workspace, c);

@@ -118,6 +118,19 @@ public static class Taint
     /// </summary>
     public static string? OfRepoSettings(string worktree)
     {
+        // A .claude that is a symlink (or not a directory) is never read through: it taints.
+        var claude = new FileInfo(Path.Combine(worktree, ".claude"));
+        try
+        {
+            if (claude.LinkTarget is not null || (claude.Exists && !Directory.Exists(claude.FullName)))
+            {
+                return RepoSettings;
+            }
+        }
+        catch (IOException)
+        {
+            return RepoSettings;
+        }
         foreach (var file in RepoSettingsFiles)
         {
             if (Read(Path.Combine(worktree, file)) is not { } settings)
@@ -163,32 +176,24 @@ public static class Taint
             rule.ValueKind == JsonValueKind.String && ClaudeWorker.AllowedTools.Contains(rule.GetString(), StringComparer.Ordinal));
     }
 
-    /// <summary>The file parsed (a null document when it cannot be read or is not JSON), or null when there is no file at all.</summary>
+    /// <summary>
+    /// The file parsed, or null when there is no file at all. A null document — which taints — when it is refused by
+    /// <see cref="SafeFile.Read"/> (a symlink, FIFO or other non-regular file, too large, unreadable) or is not JSON.
+    /// </summary>
     private static Holder? Read(string path)
     {
-        if (!File.Exists(path) && !Directory.Exists(path) && !IsLink(path))
+        var file = SafeFile.Read(path);
+        if (file.IsMissing)
         {
             return null;
         }
         try
         {
-            return new Holder(JsonDocument.Parse(File.ReadAllText(path)));
+            return new Holder(file.Text is { } text ? JsonDocument.Parse(text) : null);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        catch (JsonException)
         {
             return new Holder(null);
-        }
-    }
-
-    private static bool IsLink(string path)
-    {
-        try
-        {
-            return new FileInfo(path).LinkTarget is not null;
-        }
-        catch (IOException)
-        {
-            return true;
         }
     }
 

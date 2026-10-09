@@ -81,8 +81,11 @@ public sealed class CrashResumeTests : IAsyncLifetime
         Assert.Equal(["fresh", "orphans gone", $"resume {Session}"], File.ReadAllLines(Invocations));
         var rows = await Rows();
         Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Review], rows.Where(r => r.Step is null).Select(r => r.State));
+        // The kill may land before or after the first run's model-class row; the resumed run records its own (E8, an unestimated story: mid).
         Assert.Equal(["claimed", "worker-started", "session", "orphan-killed", "worker-started", "worker-done", "pushed", "linked"],
-            rows.Where(r => r.Step is not null).Select(r => r.Step));
+            rows.Where(r => r.Step is not null && r.Step != RunPipeline.Steps.ModelClass).Select(r => r.Step));
+        var resumedClass = rows.SkipWhile(r => r.Step != RunPipeline.Steps.OrphanKilled).Single(r => r.Step == RunPipeline.Steps.ModelClass);
+        Assert.Equal((Session, "mid"), (resumedClass.ClaudeSessionId, resumedClass.Detail));
         Assert.Equal($"pid {orphan[0].Pid}", rows.Single(r => r.Step == RunPipeline.Steps.OrphanKilled).Detail);
         Assert.Equal(Session, rows[^1].ClaudeSessionId);
         var pr = Assert.Single(File.ReadAllLines(Path.Combine(_dir, "prs.log")));

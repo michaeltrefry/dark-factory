@@ -46,9 +46,10 @@ public interface IIssueIntakeSource : IWorkSource
 /// is not the default).
 /// </summary>
 public sealed class GitHubIssueWorkSource(IGitHubIssues issues, IDbContextFactory<LedgerDbContext> contexts, IReadOnlyList<RepoRef> watched,
-    TimeProvider? time = null) : IIssueIntakeSource
+    TimeProvider? time = null, TextWriter? log = null) : IIssueIntakeSource
 {
     private readonly TimeProvider _time = time ?? TimeProvider.System;
+    private readonly TextWriter _log = log ?? Console.Error;
 
     public ItemNaming Naming => ItemNaming.GitHubIssue;
 
@@ -211,7 +212,20 @@ public sealed class GitHubIssueWorkSource(IGitHubIssues issues, IDbContextFactor
         {
             description += $"\n\nProposed fix:\n{fix.Description}\n\nPaths it changes: {string.Join(", ", fix.Paths)}";
         }
-        return new WorkSpec(new WorkStory(id, triage.Title, description, triage.Type.ToString().ToLowerInvariant(), url, Naming, closes), null, []);
+        // An issue has no estimate: it is complex unless labelled simple (WorkerModelClass.Coding, E8). The labels pick only the
+        // worker's model class (simple: low, else mid), nothing else; they need not come from a collaborator (an issue template can
+        // apply one when an outsider opens the issue). A failed read is no failure of the item: no labels, so complex (mid).
+        IReadOnlyList<string>? labels = null;
+        try
+        {
+            labels = (await issues.GetAsync(RepoRef.Parse(row.Repo), row.Number, ct)).Labels;
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _log.WriteLine($"[issues] {Naming.Format(id)}: could not read the issue's labels ({ex.Message}); treating it as complex (model class mid)");
+        }
+        return new WorkSpec(new WorkStory(id, triage.Title, description, triage.Type.ToString().ToLowerInvariant(), url, Naming, closes, labels),
+            null, []);
     }
 
     /// <summary>

@@ -146,8 +146,9 @@ public class IssueIntakeTests
         Assert.Contains("says exactly `Approved`", comment.Body);
         Assert.Equal(["awaiting-approval"], h.GitHub.LabelsOf(Repo, Number));
         // The decision is in the ledger before anything was posted, and the item waits parked: not ready, not in flight.
-        Assert.Equal([RunPipeline.Steps.Parked, IssueSteps.TriageSession, IssueSteps.Triaged, IssueSteps.TriageComment, IssueSteps.Labeled,
+        Assert.Equal([RunPipeline.Steps.Parked, IssueSteps.TriageSession, RunPipeline.Steps.ModelClass, IssueSteps.Triaged, IssueSteps.TriageComment, IssueSteps.Labeled,
             RunPipeline.Steps.Parked], await h.Steps());
+        Assert.Equal(WorkerModelClass.Triage, (await h.Rows()).Single(r => r.Step == RunPipeline.Steps.ModelClass).Detail);
         var record = TriageRecord.FromJson((await h.Rows()).Single(r => r.Step == IssueSteps.Triaged).Detail!);
         Assert.Equal((IssueRoute.AwaitingApproval, "visitor", "none", "acme/widgets"), (record.Route, record.Author, record.AuthorPermission, record.Target));
         Assert.Equal(WorkState.Paused, (await h.Item()).State);
@@ -353,6 +354,22 @@ public class IssueIntakeTests
         Assert.DoesNotContain("IGNORE PREVIOUS INSTRUCTIONS", spec.Story.Description);
         Assert.DoesNotContain("WordCount counts whitespace", spec.Story.Name);
         Assert.Equal(new RepoRef("acme", "widgets"), RepoResolver.Resolve(spec.Story.Description, new RepoRef("x", "y")));
+
+        // An issue has no estimate: complex (mid) unless it carries the simple label, read from the issue now (E8).
+        Assert.Null(spec.Story.Estimate);
+        Assert.Equal(WorkerModelClass.Mid, WorkerModelClass.Coding(spec.Story));
+        await h.GitHub.AddLabelsAsync(Repo, Number, [WorkerModelClass.SimpleLabel], CancellationToken.None);
+        var labelled = (await h.Source().ReadSpecAsync(1, CancellationToken.None)).Story;
+        Assert.Contains(WorkerModelClass.SimpleLabel, labelled.Labels!);
+        Assert.Equal(WorkerModelClass.Low, WorkerModelClass.Coding(labelled));
+
+        // GitHub unreachable: the spec still reads (no labels: complex, mid), with a warning; no item failure.
+        h.GitHub.Down = new HttpRequestException("GitHub is down");
+        var log = new StringWriter();
+        var unread = (await new GitHubIssueWorkSource(h.GitHub, h.Contexts, h.Watched, h.Time, log).ReadSpecAsync(1, CancellationToken.None)).Story;
+        Assert.Null(unread.Labels);
+        Assert.Equal(WorkerModelClass.Mid, WorkerModelClass.Coding(unread));
+        Assert.Contains("could not read the issue's labels (GitHub is down)", log.ToString());
     }
 
     [Fact]
@@ -457,6 +474,25 @@ public class IssueIntakeTests
         await h.Poll();
 
         Assert.NotNull(await h.Controls.UsagePauseAsync(CancellationToken.None));
+        Assert.DoesNotContain(IssueSteps.Triaged, await h.Steps());
+        Assert.Empty(h.GitHub.Writes);
+        Assert.Empty(h.Status.ItemErrors);
+    }
+
+    [Fact]
+    public async Task A_triage_refused_because_no_model_of_its_class_can_serve_pauses_the_factory_and_records_nothing()
+    {
+        var h = new Harness(Answer());
+        h.Triage.Answers.Clear();
+        h.Triage.Answers.Add(() => new WorkerResult("triage-sess", 1, true, "error",
+            "API Error: 503 {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"model_class_unavailable: no low model can serve\"}}", ""));
+        await h.Watch();
+        h.Open("maintainer");
+
+        await h.Poll();
+
+        var pause = await h.Controls.UsagePauseAsync(CancellationToken.None);
+        Assert.Equal(UsagePause.WorkerModelClassUnavailable, pause!.Reason);
         Assert.DoesNotContain(IssueSteps.Triaged, await h.Steps());
         Assert.Empty(h.GitHub.Writes);
         Assert.Empty(h.Status.ItemErrors);

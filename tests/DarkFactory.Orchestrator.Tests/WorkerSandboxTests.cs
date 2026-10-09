@@ -46,6 +46,29 @@ internal static class SandboxSupport
         return path;
     }
 
+    /// <summary>
+    /// <c>/usr/bin/env</c>'s output as variables: a line with no <c>=</c> continues the value before it (ANTHROPIC_CUSTOM_HEADERS holds
+    /// one header per line).
+    /// </summary>
+    public static Dictionary<string, string> ParseEnv(string output)
+    {
+        var env = new Dictionary<string, string>(StringComparer.Ordinal);
+        string? last = null;
+        foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (line.IndexOf('=') is var eq and > 0)
+            {
+                last = line[..eq];
+                env[last] = line[(eq + 1)..];
+            }
+            else
+            {
+                env[last ?? throw new InvalidOperationException($"env output starts with a line that has no '=': {line}")] += "\n" + line;
+            }
+        }
+        return env;
+    }
+
     /// <summary>The current user's home from the password database (what the helper must give the worker).</summary>
     public static string PasswdHome()
     {
@@ -111,17 +134,16 @@ public class WorkerSandboxTests
         Environment.SetEnvironmentVariable("GH_TOKEN", "ghp_owner_should_not_leak");
         try
         {
-            using var p = LocalSandbox().Start(_dir, "/usr/bin/env", [], ClaudeWorker.BuildRouterVariables(SandboxSupport.Router, "rk_worker", auth));
+            using var p = LocalSandbox().Start(_dir, "/usr/bin/env", [], ClaudeWorker.BuildRouterVariables(SandboxSupport.Router, "rk_worker", auth, WorkerModelClass.Low));
             var output = await p.StandardOutput.ReadToEndAsync();
             await p.WaitForExitAsync();
             WorkerSandbox.Stop(p);
 
             Assert.Equal(0, p.ExitCode);
-            var env = output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                .ToDictionary(l => l[..l.IndexOf('=')], l => l[(l.IndexOf('=') + 1)..]);
+            var env = SandboxSupport.ParseEnv(output);
             Assert.Equal(expected, env.Keys.Order());
             Assert.Equal("http://localhost:8080", env["ANTHROPIC_BASE_URL"]);
-            Assert.Equal("X-Weave-Router-Key: rk_worker", env["ANTHROPIC_CUSTOM_HEADERS"]);
+            Assert.Equal("X-Weave-Router-Key: rk_worker\nx-weave-model-class: low", env["ANTHROPIC_CUSTOM_HEADERS"]);
             Assert.Equal(SandboxSupport.PasswdHome(), env["HOME"]);
             Assert.StartsWith(env["HOME"] + "/.local/bin:", env["PATH"]);
             // Build servers would otherwise detach and outlive the run.
@@ -587,7 +609,7 @@ public class WorkerSandboxTests
         try
         {
             var worker = new ClaudeWorker(claude, SandboxSupport.Router, "rk_worker", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1), LocalSandbox());
-            var result = await worker.RunAsync(_dir, "prompt", null, null, CancellationToken.None);
+            var result = await worker.RunAsync(_dir, "prompt", null, WorkerModelClass.Mid, null, CancellationToken.None);
 
             Assert.True(result.Succeeded, result.StderrTail);
             Assert.Equal("sess-sbx", result.SessionId);
@@ -607,7 +629,7 @@ public class WorkerSandboxTests
             $"#!/bin/sh\necho {OwnProcess.ShellRecord("$$")} > '{pidFile}'\necho '{{\"type\":\"system\",\"session_id\":\"s\"}}'\nsleep 600\n");
         var worker = new ClaudeWorker(claude, SandboxSupport.Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(5), LocalSandbox());
         using var cts = new CancellationTokenSource();
-        var run = worker.RunAsync(_dir, "p", null, null, cts.Token);
+        var run = worker.RunAsync(_dir, "p", null, WorkerModelClass.Mid, null, cts.Token);
         var pid = await SandboxSupport.WaitForPidAsync(pidFile, run);
 
         await cts.CancelAsync();
@@ -628,7 +650,7 @@ public class WorkerSandboxTests
         var worker = new ClaudeWorker("claude", SandboxSupport.Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(5), sandbox,
             stopGrace: TimeSpan.FromMilliseconds(300));
         using var cts = new CancellationTokenSource();
-        var run = worker.RunAsync(_dir, "p", null, null, cts.Token);
+        var run = worker.RunAsync(_dir, "p", null, WorkerModelClass.Mid, null, cts.Token);
         var pid = await SandboxSupport.WaitForPidAsync(pidFile, run);
         try
         {
@@ -788,17 +810,16 @@ public class LiveWorkerSandboxTests
         Environment.SetEnvironmentVariable("GH_TOKEN", "ghp_owner_should_not_leak");
         try
         {
-            using var p = sandbox.Start("/", "/usr/bin/env", [], ClaudeWorker.BuildRouterVariables(options.RouterBaseUrl, probeKey, auth));
+            using var p = sandbox.Start("/", "/usr/bin/env", [], ClaudeWorker.BuildRouterVariables(options.RouterBaseUrl, probeKey, auth, WorkerModelClass.Mid));
             var output = await p.StandardOutput.ReadToEndAsync();
             await p.WaitForExitAsync();
             WorkerSandbox.Stop(p);
 
             Assert.Equal(0, p.ExitCode);
-            var env = output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                .ToDictionary(l => l[..l.IndexOf('=')], l => l[(l.IndexOf('=') + 1)..]);
+            var env = SandboxSupport.ParseEnv(output);
             Assert.Equal(expected, env.Keys.Order());
             Assert.Equal(options.RouterBaseUrl.ToString().TrimEnd('/'), env["ANTHROPIC_BASE_URL"].TrimEnd('/'));
-            Assert.Equal($"{ClaudeWorker.RouterKeyHeader}: {probeKey}", env["ANTHROPIC_CUSTOM_HEADERS"]);
+            Assert.Equal($"{ClaudeWorker.RouterKeyHeader}: {probeKey}\n{WorkerModelClass.Header}: {WorkerModelClass.Mid}", env["ANTHROPIC_CUSTOM_HEADERS"]);
             if (auth == WorkerAuth.RouterKey)
             {
                 Assert.Equal(probeKey, env["ANTHROPIC_AUTH_TOKEN"]);

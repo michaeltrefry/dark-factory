@@ -80,6 +80,7 @@ public class TriageWorktreeTests
 
         Assert.True(result.Succeeded);
         Assert.Equal(["chain", "docs/in-link", "self"], worker.LinksAtStart);
+        Assert.Equal([WorkerModelClass.Triage], worker.ModelClasses); // the triage runs on the low class (E8)
         Assert.Contains($"removed symlink abs-out -> {Path.Combine(Outside, "secret.txt")}", log.ToString());
         Assert.Contains("removed symlink dir-out", log.ToString());
     }
@@ -88,13 +89,15 @@ public class TriageWorktreeTests
     private sealed class LinkRecordingWorker : IWorker
     {
         public List<string> LinksAtStart { get; } = [];
+        public List<string> ModelClasses { get; } = [];
 
         public WorkerTools Tools => WorkerTools.ReadOnly;
 
-        public Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, WorkerCallbacks? callbacks,
+        public Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass, WorkerCallbacks? callbacks,
             CancellationToken ct)
         {
             LinksAtStart.AddRange(Links(workingDirectory).Select(p => Path.GetRelativePath(workingDirectory, p)).Order(StringComparer.Ordinal));
+            ModelClasses.Add(modelClass);
             return Task.FromResult(new WorkerResult("triage-sess", 0, false, "success", "{}", ""));
         }
 

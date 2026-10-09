@@ -199,7 +199,7 @@ public sealed class LedgerPostgresTests : IAsyncLifetime
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
+        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
             WorkerCallbacks? callbacks, CancellationToken ct)
         {
             Interlocked.Increment(ref Calls);

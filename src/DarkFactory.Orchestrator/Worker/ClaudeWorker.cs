@@ -45,6 +45,18 @@ public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError,
     /// result is a success but says nothing about the work being finished.
     /// </summary>
     public bool HookStopped => TerminalReason == HookStoppedReason;
+
+    /// <summary>The router's refusal when no model of the session's class can serve it (503; the message prefix).</summary>
+    public const string ModelClassUnavailableMarker = Router.ModelClass.Unavailable;
+
+    /// <summary>
+    /// The session failed because the router had no servable model in its class (E8: it never serves another class): Claude Code's
+    /// error result (<see cref="IsError"/>) or its stderr carries <see cref="ModelClassUnavailableMarker"/>. Like
+    /// <see cref="UsageLimited"/>, a result that is not an error is the model's own prose and never counts. Such a failure pauses
+    /// for usage instead of escalating the item.
+    /// </summary>
+    public bool ModelClassUnavailable => !Succeeded && ((IsError && ResultText is { } text && Router.ModelClass.IsUnavailable(text))
+        || Router.ModelClass.IsUnavailable(StderrTail));
 }
 
 /// <summary>
@@ -69,9 +81,10 @@ public interface IWorker
     /// <summary>
     /// Runs one worker session. <paramref name="resumeSessionId"/> continues an earlier session;
     /// the <paramref name="callbacks"/> fire before the worker finishes, so a crash can still
-    /// resume the session and find the process.
+    /// resume the session and find the process. Every call names the router model class it runs on
+    /// (<paramref name="modelClass"/>, <see cref="WorkerModelClass"/>, E8); none pins a model.
     /// </summary>
-    Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
+    Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
         WorkerCallbacks? callbacks, CancellationToken ct);
 
     /// <summary>
@@ -285,13 +298,26 @@ public sealed class ClaudeWorker(
     private static readonly string[] PassThroughVariables =
         ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "TERM", "DOTNET_ROOT"];
 
-    /// <summary>The router variables, the only secrets a worker holds (E1). The sandbox helper adds PATH, HOME and build settings.</summary>
-    public static Dictionary<string, string> BuildRouterVariables(Uri routerBaseUrl, string routerKey, WorkerAuth auth)
+    /// <summary>
+    /// The router variables, the only secrets a worker holds (E1). The sandbox helper adds PATH, HOME and build settings.
+    /// <c>ANTHROPIC_CUSTOM_HEADERS</c> holds two header lines (Claude Code splits it on line breaks): the router key and the session's
+    /// model class (<see cref="WorkerModelClass.Header"/>, E8). Nothing names a model: no <c>ANTHROPIC_MODEL</c>, no force-model header.
+    /// </summary>
+    public static Dictionary<string, string> BuildRouterVariables(Uri routerBaseUrl, string routerKey, WorkerAuth auth, string modelClass)
     {
+        if (!WorkerModelClass.IsValid(modelClass))
+        {
+            throw new ArgumentException($"'{modelClass}' is not a router model class (high, mid or low).", nameof(modelClass));
+        }
+        if (routerKey.IndexOfAny(['\r', '\n']) >= 0)
+        {
+            // In the header lines it would end its own header and could add another (a force-model pin), in every auth mode.
+            throw new ArgumentException("The router key contains a line break.", nameof(routerKey));
+        }
         var env = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["ANTHROPIC_BASE_URL"] = routerBaseUrl.ToString().TrimEnd('/'),
-            ["ANTHROPIC_CUSTOM_HEADERS"] = $"{RouterKeyHeader}: {routerKey}",
+            ["ANTHROPIC_CUSTOM_HEADERS"] = $"{RouterKeyHeader}: {routerKey}\n{WorkerModelClass.Header}: {modelClass}",
         };
         if (auth == WorkerAuth.RouterKey)
         {
@@ -301,7 +327,8 @@ public sealed class ClaudeWorker(
     }
 
     /// <summary>Unsandboxed environment: OS basics from the parent plus the router variables.</summary>
-    public static Dictionary<string, string> BuildEnvironment(IDictionary parent, Uri routerBaseUrl, string routerKey, WorkerAuth auth)
+    public static Dictionary<string, string> BuildEnvironment(IDictionary parent, Uri routerBaseUrl, string routerKey, WorkerAuth auth,
+        string modelClass)
     {
         var env = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var name in PassThroughVariables)
@@ -311,7 +338,7 @@ public sealed class ClaudeWorker(
                 env[name] = value;
             }
         }
-        foreach (var (k, v) in BuildRouterVariables(routerBaseUrl, routerKey, auth))
+        foreach (var (k, v) in BuildRouterVariables(routerBaseUrl, routerKey, auth, modelClass))
         {
             env[k] = v;
         }
@@ -409,19 +436,25 @@ public sealed class ClaudeWorker(
 
     private static readonly TimeSpan OrphanGracePeriod = TimeSpan.FromSeconds(5);
 
-    public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
+    public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
         WorkerCallbacks? callbacks, CancellationToken ct)
     {
+        if (!WorkerModelClass.IsValid(modelClass))
+        {
+            throw new ArgumentException($"'{modelClass}' is not a router model class (high, mid or low).", nameof(modelClass));
+        }
         if (pauseFlagDirectory is null)
         {
-            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, tools: Tools, workingDirectory: workingDirectory), callbacks, ct);
+            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, tools: Tools, workingDirectory: workingDirectory),
+                modelClass, callbacks, ct);
         }
         var flag = PauseFlagPath(pauseFlagDirectory, workingDirectory);
         EnsurePauseFlagDirectory(pauseFlagDirectory);
         File.Delete(flag); // left by a crashed run, it would stop this one at its first tool call
         try
         {
-            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, BuildPauseSettings(flag), Tools, workingDirectory), callbacks, ct);
+            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, BuildPauseSettings(flag), Tools, workingDirectory),
+                modelClass, callbacks, ct);
         }
         finally
         {
@@ -469,12 +502,13 @@ public sealed class ClaudeWorker(
         }
     }
 
-    private async Task<WorkerResult> RunProcessAsync(string workingDirectory, IReadOnlyList<string> args, WorkerCallbacks? callbacks, CancellationToken ct)
+    private async Task<WorkerResult> RunProcessAsync(string workingDirectory, IReadOnlyList<string> args, string modelClass,
+        WorkerCallbacks? callbacks, CancellationToken ct)
     {
         // Sandboxed, the helper makes the worker a process-group leader and the pid reported is sudo's.
         using var process = sandbox is null
-            ? StartDirect(workingDirectory, args)
-            : sandbox.Start(workingDirectory, claudePath, args, BuildRouterVariables(routerBaseUrl, routerKey, auth));
+            ? StartDirect(workingDirectory, args, modelClass)
+            : sandbox.Start(workingDirectory, claudePath, args, BuildRouterVariables(routerBaseUrl, routerKey, auth, modelClass));
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(timeout);
 
@@ -597,7 +631,7 @@ public sealed class ClaudeWorker(
         }
     }
 
-    private Process StartDirect(string workingDirectory, IReadOnlyList<string> args)
+    private Process StartDirect(string workingDirectory, IReadOnlyList<string> args, string modelClass)
     {
         var psi = new ProcessStartInfo(GroupLeaderLauncher)
         {
@@ -615,7 +649,7 @@ public sealed class ClaudeWorker(
             psi.ArgumentList.Add(arg);
         }
         psi.Environment.Clear();
-        foreach (var (k, v) in BuildEnvironment(Environment.GetEnvironmentVariables(), routerBaseUrl, routerKey, auth))
+        foreach (var (k, v) in BuildEnvironment(Environment.GetEnvironmentVariables(), routerBaseUrl, routerKey, auth, modelClass))
         {
             psi.Environment[k] = v;
         }

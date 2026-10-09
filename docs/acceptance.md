@@ -124,7 +124,7 @@ for its sessions.
 | Check | Test | Gate |
 | --- | --- | --- |
 | Worker token pushes `factory/*` only on its own repo; push to `main` and to another repo rejected | `AppTokenPushTests.Worker_token_pushes_factory_branches_only_on_its_own_repo` | `FACTORY_E2E=1` (`FACTORY_E2E_OTHER_REPO` optional) |
-| Worker env is exactly the allowlist for the configured `Worker:Auth` (`router-key`: `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `HOME`, `MSBUILDDISABLENODEREUSE`, `PATH`; `claude-login`: the same without `ANTHROPIC_AUTH_TOKEN`) | `LiveWorkerSandboxTests.Live_worker_environment_is_exactly_the_allowlist_for_the_configured_auth_mode` | `FACTORY_SANDBOX_LIVE=1` |
+| Worker env is exactly the allowlist for the configured `Worker:Auth` (`router-key`: `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `HOME`, `MSBUILDDISABLENODEREUSE`, `PATH`; `claude-login`: the same without `ANTHROPIC_AUTH_TOKEN`); `ANTHROPIC_CUSTOM_HEADERS` is two lines, the router key and `x-weave-model-class` (sc-25659) | `LiveWorkerSandboxTests.Live_worker_environment_is_exactly_the_allowlist_for_the_configured_auth_mode` | `FACTORY_SANDBOX_LIVE=1` |
 | `router-key`: `_factory` holds no Claude credential (no `~/.claude/.credentials.json`, no `Claude Code-credentials` keychain item) | `LiveWorkerSandboxTests.Worker_user_holds_no_claude_credential_in_router_key_mode` (skips for `claude-login`) | `FACTORY_SANDBOX_LIVE=1` |
 | `router-key`: `factory run`/`work` refuse to start without an enrolled plan | `RouterEnrollmentCheckTests` (unit, fake router) | none |
 | `~michael`, `.ssh`, `.config/gh`, login keychain unreachable | `LiveWorkerSandboxTests.Worker_is_denied_the_owners_home_ssh_keys_gh_config_and_login_keychain`, `Worker_cannot_read_the_owners_keychain_items` | `FACTORY_SANDBOX_LIVE=1` |
@@ -280,6 +280,31 @@ ledger is checked row by row (`ReviewGateTests.AssertTypedOutcomesQueueAndReport
 
 The costs are read when the test checks: if the session recorder wrote a cost after the merge, the body check fails showing both
 texts (rerun the comparison by hand from the throwaway ledger before it is dropped, or rerun the test).
+
+### Worker model classes (E8, sc-25659)
+
+Every worker session names a router model class and pins no model. Prerequisite: the launch helper is helper_version 3 (it joins
+the two `ANTHROPIC_CUSTOM_HEADERS` lines); a helper installed before sc-25659 fails start-up as stale, so re-run
+`sudo scripts/setup-worker-user.sh` once (stop `factory work` first: it kills every `_factory` process). The router must know the
+classes (`x-weave-model-class`, michaeltrefry/router "Model tiers and classes") and have a servable model in `mid` and `low`.
+
+Unit-tested (no gate): the class per role and the simple/complex rule (`WorkerModelClassTests`; conflict fix rounds in
+`MergeQueueTests.A_branch_that_conflicts_with_main_goes_to_the_fix_loop_instead_of_merging`, triage in `TriageWorktreeTests` and
+`IssueIntakeTests`), the headers and the unchanged allowlist (`WorkerModelClassTests`, `WorkerSandboxTests`), and a
+`model_class_unavailable` refusal pausing for usage instead of escalating while the same words in a non-error result still
+escalate (`UsagePauseTests`, `IssueIntakeTests`). The live check rides on the AT2 run above, by hand, from its throwaway ledger
+before it is dropped:
+
+- every `worker_sessions` row's Claude session has a `worker-model-class` checkpoint, `mid` for the implementer of an unestimated
+  bug story (`low` if the story carries the `simple` label or 1–2 points), the same class for its review fix rounds, `mid` for a CI
+  fix round;
+- the router served each of those sessions' requests inside its class: its answers carry `X-Weave-Model-Class` naming that class,
+  and `GET /admin/v1/models` gives each served model's `class` (which log field or telemetry query shows the served model per session
+  is the router's and is not pinned here — check it there). Claude Code's own small utility calls (titles, summaries) carry the same
+  headers and so the same class: expected, not a failure.
+
+A run whose router has no servable model in the class shows Paused `usage-paused` with a `usage-pause` checkpoint
+`worker-model-class-unavailable; resumes at …`, never Escalated.
 
 ### AT4 — gate negatives on seeded PRs
 

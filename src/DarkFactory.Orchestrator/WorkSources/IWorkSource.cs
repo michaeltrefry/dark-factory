@@ -5,8 +5,10 @@ namespace DarkFactory.Orchestrator.WorkSources;
 /// <param name="Closes">
 /// The issue the item's PR closes on merge, as GitHub's closing keyword takes it (<c>owner/name#12</c>); null for none.
 /// </param>
+/// <param name="Labels">The item's labels on its board (none when the board has none).</param>
+/// <param name="Estimate">The item's estimate in points; null when it has none (a GitHub issue never has one).</param>
 public sealed record WorkStory(int Id, string Name, string? Description, string StoryType, string AppUrl, ItemNaming? Naming = null,
-    string? Closes = null)
+    string? Closes = null, IReadOnlyList<string>? Labels = null, int? Estimate = null)
 {
     public ItemNaming Kind => Naming ?? ItemNaming.Shortcut;
 

@@ -167,6 +167,12 @@ public sealed partial class RunPipeline(
         /// <summary>A model answered the implementer's session (first time seen for the item); Detail is the model id.</summary>
         public const string ImplementerModel = "implementer-model";
         /// <summary>
+        /// A worker session (implement, a fix round, a CI fix, a triage) ran on a router model class (E8); Detail is the class
+        /// (<c>high</c>, <c>mid</c> or <c>low</c>, <see cref="WorkerModelClass"/>). Recorded each time a run starts or resumes
+        /// the session, as soon as its id streams.
+        /// </summary>
+        public const string ModelClass = "worker-model-class";
+        /// <summary>
         /// Review: a review panel call is about to be made; Detail is "&lt;router session&gt; &lt;model class&gt; &lt;head sha&gt;
         /// &lt;role&gt; &lt;prompt path&gt;@sha256:&lt;prompt hash&gt;" (role <c>confirm-&lt;role&gt;</c> for a second model's
         /// check of a blocking finding), so the call's cost is readable even when it never returns (E9) and the prompt it
@@ -779,7 +785,7 @@ public sealed partial class RunPipeline(
             try
             {
                 session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? BuildPrompt(spec, repo) + stuckHint : BuildResumePrompt(story),
-                    models, [SpecInput(story)], "implement", ct);
+                    models, [SpecInput(story)], "implement", WorkerModelClass.Coding(story), ct);
             }
             catch (WorkerStuckException stuckSession) when (!WorkerStillRunning.IsMarked(stuckSession))
             {
@@ -885,12 +891,13 @@ public sealed partial class RunPipeline(
     /// Runs one worker session in <paramref name="workspace"/> (the implementer's, or a fix round's), continuing
     /// <paramref name="session"/> when set: every stdout line is stored as it streams (E7), the pid, the session id and each
     /// model that answers are checkpointed as they appear (models into <paramref name="models"/>, each recorded once), and
-    /// Pause/Stop are watched. A paused or usage-limited session
+    /// Pause/Stop are watched. The session runs on <paramref name="modelClass"/> (E8; checkpointed as <see cref="Steps.ModelClass"/>
+    /// once its id streams). A paused, usage-limited or class-refused (<see cref="WorkerResult.ModelClassUnavailable"/>) session
     /// throws <see cref="ControlRequestedException"/> (resumed later); a failed one throws <see cref="WorkerFailedException"/>.
     /// On success it checkpoints <see cref="Steps.WorkerDone"/> and returns the session id.
     /// </summary>
     private async Task<string?> RunWorkerSessionAsync(Run run, Workspace workspace, string? session, Func<string?, string> prompt,
-        HashSet<string> models, IReadOnlyCollection<WorkerInput> inputs, string label, CancellationToken ct)
+        HashSet<string> models, IReadOnlyCollection<WorkerInput> inputs, string label, string modelClass, CancellationToken ct)
     {
         var item = run.Item;
         var resume = session;
@@ -911,6 +918,8 @@ public sealed partial class RunPipeline(
                 throw new SessionTaintedException(resume, taint.Reason);
             }
         }
+        // The worktree's Claude settings must not replace the router variables or pin a model (E8): the session does not start.
+        ThrowIfUnsafeRepoSettings(workspace, starting: true);
         // No worker session starts into a frozen factory (implement, a fix round, a CI fix).
         await ThrowIfFrozenAsync(item, ct);
         log.WriteLine(resume is null ? $"[{label}] starting worker" : $"[{label}] resuming claude session {resume}");
@@ -922,10 +931,12 @@ public sealed partial class RunPipeline(
         // A looping session is interrupted at its next tool boundary like a Pause, but never resumed (sc-25388).
         var detector = new StuckDetector(_stuck);
         string? stuckReason = null;
+        var classRecorded = false;
+        log.WriteLine($"[{label}] model class {modelClass}");
         WorkerResult result;
         try
         {
-            result = await worker.RunAsync(workspace.Path, prompt(resume), resume,
+            result = await worker.RunAsync(workspace.Path, prompt(resume), resume, modelClass,
                 new WorkerCallbacks(
                     OnStarted: (pid, c) => ledger.CheckpointAsync(item, Steps.WorkerStarted, session, pid.ToString(), c),
                     OnSession: async (sid, c) =>
@@ -945,6 +956,12 @@ public sealed partial class RunPipeline(
                                 await ledger.TaintSessionAsync(item, sid, reason, c);
                             }
                             await ledger.CheckpointAsync(item, Steps.Session, sid, "claude session started", c);
+                        }
+                        if (!classRecorded)
+                        {
+                            // The class this run of the session sends on every call (E8), on record once per run, new or resumed.
+                            classRecorded = true;
+                            await ledger.CheckpointAsync(item, Steps.ModelClass, sid, modelClass, c);
                         }
                     },
                     OnLine: async (line, c) =>
@@ -1029,10 +1046,14 @@ public sealed partial class RunPipeline(
             };
         }
         // The plans ran out, not the work: pause the factory (backing off) and resume this session afterwards, rather
-        // than escalate the item. Without a control table nothing could hold the pause, so the failure escalates.
-        if (result.UsageLimited && await _controls.PauseForUsageAsync(null, UsagePause.WorkerRateLimited, ct) is { State: ControlState.Paused } pause)
+        // than escalate the item. Without a control table nothing could hold the pause, so the failure escalates. The router having no
+        // servable model in the session's class (E8: it never falls back to another class) is treated the same way.
+        if (UsagePauseReason(result) is { } usageReason
+            && await _controls.PauseForUsageAsync(null, usageReason, ct) is { State: ControlState.Paused } pause)
         {
-            log.WriteLine($"[{label}] worker hit a router exhaustion or rate-limit error; factory paused for usage until {pause.ResumeAt:u}");
+            log.WriteLine(usageReason == UsagePause.WorkerModelClassUnavailable
+                ? $"[{label}] the router had no servable model in class {modelClass} (model_class_unavailable); factory paused for usage until {pause.ResumeAt:u}"
+                : $"[{label}] worker hit a router exhaustion or rate-limit error; factory paused for usage until {pause.ResumeAt:u}");
             await CompleteControlledSessionAsync(capture, ControlState.Paused);
             throw new ControlRequestedException(ControlState.Paused);
         }
@@ -1051,9 +1072,33 @@ public sealed partial class RunPipeline(
         {
             await ledger.TaintSessionAsync(item, session, changed, ct);
         }
+        // Nor may the worker leave such settings for a later session (or push them): its round fails instead.
+        ThrowIfUnsafeRepoSettings(workspace, starting: false);
         await ledger.CheckpointAsync(item, Steps.WorkerDone, session, $"worker exit {result.ExitCode}", ct);
         return session;
     }
+
+    /// <summary>Fails the worker round (escalates) when the worktree's Claude settings are not safe (<see cref="RepoSettingsGuard"/>).</summary>
+    private static void ThrowIfUnsafeRepoSettings(Workspace workspace, bool starting)
+    {
+        if (RepoSettingsGuard.Refusal(workspace.Path) is { } refusal)
+        {
+            throw new WorkerFailedException(starting
+                ? $"The worker session was not started: the worktree's Claude settings are refused ({refusal}). Only keys that cannot "
+                    + "change the model, endpoint, headers or credentials are allowed in the branch's .claude settings."
+                : $"The worker left Claude settings the factory refuses ({refusal}), so its work is not pushed.");
+        }
+    }
+
+    /// <summary>
+    /// Why a failed worker session pauses the factory for usage instead of escalating, or null when it does not: the router had no
+    /// servable model in its class (<see cref="UsagePause.WorkerModelClassUnavailable"/>), or the plans refused it
+    /// (<see cref="UsagePause.WorkerRateLimited"/>).
+    /// </summary>
+    internal static string? UsagePauseReason(WorkerResult result) =>
+        result.ModelClassUnavailable ? UsagePause.WorkerModelClassUnavailable
+        : result.UsageLimited ? UsagePause.WorkerRateLimited
+        : null;
 
     /// <summary>What the worker handed <paramref name="story"/> reads: the owner's story, or an issue item's approved triage (never the issue's text).</summary>
     private static WorkerInput SpecInput(WorkStory story) =>
