@@ -182,14 +182,17 @@ Owner set-up, once (the test skips naming whichever is missing):
    a sealed or protected path escalates instead of merging. Since sc-25382 a normal-tier change must also add an xUnit test
    that fails on the base and passes on the head (`new-tests-fail-on-base`, run sandboxed as `_factory`, so `sudo
    scripts/setup-worker-user.sh` must be in place), and the policy must list that check in `normal` and `protected`.
-4. `Review:Models` set to a Claude Opus 5.5 or newer id the router routes under `x-weave-force-model` (sc-25379: every
-   reviewer is one, whichever models the implementer used; there is no default, and the factory refuses to start without
-   it — the router's catalog on 2026-10-08 offered no such id). Without it these tests, the seeded review (`ReviewSeedTests`) and the
-   Phase 1 AT1–AT5 runs skip naming it; `factory run`/`factory work` print the reason and exit 2.
+
+No reviewer model needs setting: `Review:Models` defaults to `claude-opus-5` (owner decision 2026-10-09, sc-25391). The
+router's catalog has no Opus 5.5 id; its `model_mapping` maps `claude-opus-5` → `claude-opus-5-5`, so the panel pins
+`claude-opus-5` under `x-weave-force-model` and accepts the router serving it as `claude-opus-5-5` (a same-or-newer Opus
+counts for an Opus pin; a lower Opus, a non-Opus or an unnamed served model does not). An override must still be a Claude
+Opus 5 or newer, else these tests, the seeded review (`ReviewSeedTests`) and the Phase 1 AT1–AT5 runs skip naming it and
+`factory run`/`factory work` print the reason and exit 2.
 
 | Test | Variables | Proves |
 | --- | --- | --- |
-| `Gate_merges_a_green_pr_a_claude_opus_panel_passed_and_the_ledger_records_the_merge_commit` | `FACTORY_E2E_GATE_STORY=sc-<id>` | Intake → … → Review → CI → MergeGate → Merge → Watch; one pass verdict from the review panel (sc-25379: correctness and spec conformance, plus security when a touched path's tier requires it), every reviewer a Claude Opus 5.5 or newer and every second model a Claude model other than its reviewer's, each served by the router as pinned, each panel call accounted by the router under its own session, which the ledger named with the role's prompt file hash; the PR merged at the reviewed head; the Merge row holds GitHub's merge commit; the story is Done |
+| `Gate_merges_a_green_pr_a_claude_opus_panel_passed_and_the_ledger_records_the_merge_commit` | `FACTORY_E2E_GATE_STORY=sc-<id>` | Intake → … → Review → CI → MergeGate → Merge → Watch; one pass verdict from the review panel (sc-25379: correctness and spec conformance, plus security when a touched path's tier requires it), every reviewer a Claude Opus 5 or newer and every second model a Claude model pinned to another id than its reviewer's, each served by the router as pinned (an Opus pin: or a newer Opus), each panel call accounted by the router under its own session, which the ledger named with the role's prompt file hash; the PR merged at the reviewed head; the Merge row holds GitHub's merge commit; the story is Done |
 | `A_push_after_the_verdict_blocks_the_merge_until_the_new_head_is_reviewed_again` | `FACTORY_E2E_GATE_PUSH_STORY=sc-<id>` | a commit pushed to the PR branch right after the first verdict sends the item from CI back to Review; the new head is reviewed; `gate-passed` and the merge name only the new head |
 
 ```sh
@@ -199,7 +202,7 @@ FACTORY_E2E=1 FACTORY_E2E_GATE_STORY=sc-<id> FACTORY_E2E_GATE_PUSH_STORY=sc-<id>
 
 The seeded review (sc-25379) needs only the router and the router key: no GitHub, Shortcut, ledger or gate App. It sends
 the fixture diffs `tests/DarkFactory.Orchestrator.Tests/Fixtures/review/*.diff` through the production `RouterReviewer`
-to the configured models (`Review:SpecConformance:Models`, else `Review:Models` — a Claude Opus 5.5 or newer, which has no default and must be set — and `Review:Confirm:Models`).
+to the configured models (`Review:SpecConformance:Models`, else `Review:Models` — a Claude Opus 5 or newer, default `claude-opus-5` — and `Review:Confirm:Models`).
 Real models answer, so a failure names what they reported.
 
 | Test | Variables | Proves |
@@ -246,7 +249,7 @@ the issue intake `FactoryRunner.PollIssuesAsync`) against a **throwaway ledger**
 `*_STORY` must be a **fresh To Do bug story** whose fix lands in **normal** code of the sandbox (e.g. `src/Sandbox/`, not `tests/`,
 `docs/`, a sealed or a protected path), small enough for the risk threshold — the P2-AT1 kind; give each test its own story.
 Prerequisites: everything P2-AT1 needs (gate App installed, rulesets re-applied, a version-2 `factory/gate.yaml` on the sandbox's
-main, `Review:Models`, `sudo scripts/setup-worker-user.sh`).
+main, `sudo scripts/setup-worker-user.sh`).
 
 ```sh
 FACTORY_E2E=1 FACTORY_E2E_GATE_SEALED_STORY=sc-<id> FACTORY_E2E_GATE_POLICY_STORY=sc-<id> GH_TOKEN=$(gh auth token) \
@@ -349,7 +352,7 @@ comment on its story:
 Expected and one-time: these escalations are the ledger catching up, not failures of the gate.
 
 An item already past Review (at CI or MergeGate) whose head has a passing verdict recorded before sc-25379 — by the
-dropped cross-family rule's reviewer (e.g. `gpt-5.5`) or an Opus older than 5.5 — is not escalated for it: the gate sends
+dropped cross-family rule's reviewer (e.g. `gpt-5.5`) or an Opus older than 5 — is not escalated for it: the gate sends
 it back to Review and the current panel (`Review:Models`) reviews that head once, then it merges as usual. This happens
 once per head: if the new verdict's models still break the rule (e.g. the router serves the configured Opus under another
 name), the gate escalates with the reason rather than reviewing again.

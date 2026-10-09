@@ -3,16 +3,18 @@ using System.Text.RegularExpressions;
 namespace DarkFactory.Orchestrator.Gate;
 
 /// <summary>
-/// Which models may sit on the review panel (owner decision 2026-10-08, sc-25379): every reviewer is a Claude Opus 5.5 or
-/// newer and every second model is Claude, whichever models the implementer used. Deterministic and fail-closed: an id this
-/// parser does not read as such is not eligible, and an answer counts only when the router says the pinned model served it.
+/// Which models may sit on the review panel (owner decisions 2026-10-08, sc-25379, and 2026-10-09, sc-25391): every reviewer
+/// is a Claude Opus 5 or newer and every second model is Claude, whichever models the implementer used. Deterministic and
+/// fail-closed: an id this parser does not read as such is not eligible, and an answer counts only when the router says the
+/// pinned model served it — or, for a pinned Claude Opus, a Claude Opus of the same or a higher version (the router may
+/// upgrade, e.g. its <c>model_mapping</c> maps <c>claude-opus-5</c> to <c>claude-opus-5-5</c>, never downgrade).
 /// </summary>
 public static partial class ReviewModels
 {
     /// <summary>The oldest Claude Opus a reviewer may be.</summary>
-    public static readonly (int Major, int Minor) OpusFloor = (5, 5);
+    public static readonly (int Major, int Minor) OpusFloor = (5, 0);
 
-    public const string FloorText = "Claude Opus 5.5 or newer";
+    public const string FloorText = "Claude Opus 5 or newer";
 
     // claude-opus-<major>[(-|.)<minor>][-<yyyymmdd>], after any "provider/" prefix; anything else is not read as an Opus id.
     [GeneratedRegex(@"^claude-opus-(?<major>\d{1,3})(?:[-.](?<minor>\d{1,2}))?(?:-(?<date>\d{8}))?$", RegexOptions.CultureInvariant)]
@@ -56,18 +58,29 @@ public static partial class ReviewModels
         OpusVersion(model) is { } v && (v.Major > OpusFloor.Major || (v.Major == OpusFloor.Major && v.Minor >= OpusFloor.Minor));
 
     /// <summary>
-    /// Whether the router's <paramref name="served"/> model is <paramref name="pinned"/>: the same id (case and any
-    /// <c>provider/</c> prefix aside), or that id's dated snapshot (<c>&lt;pinned&gt;-yyyymmdd</c>).
+    /// Whether the router's <paramref name="served"/> model counts as <paramref name="pinned"/>: the same id (case and any
+    /// <c>provider/</c> prefix aside) or that id's dated snapshot (<c>&lt;pinned&gt;-yyyymmdd</c>); or, when
+    /// <paramref name="pinned"/> is a Claude Opus, a Claude Opus of the same or a higher version (an upgrade, never a
+    /// downgrade). Any other pinned model (e.g. <c>claude-sonnet-5</c>) counts only as itself or its snapshot.
     /// </summary>
-    public static bool Serves(string pinned, string? served)
+    public static bool Serves(string pinned, string? served) =>
+        !string.IsNullOrWhiteSpace(served)
+        && (IsSnapshotOf(Id(pinned), Id(served))
+            || (OpusVersion(pinned) is { } p && OpusVersion(served) is { } s && (s.Major > p.Major || (s.Major == p.Major && s.Minor >= p.Minor))));
+
+    /// <summary>
+    /// Whether two pinned ids name one model: the same id (case, any <c>provider/</c> prefix and the dotted spelling aside),
+    /// or one the other's dated snapshot. Pinned ids only: what the router served never makes two pins the same or different.
+    /// </summary>
+    public static bool SamePinned(string a, string b)
     {
-        if (string.IsNullOrWhiteSpace(served))
-        {
-            return false;
-        }
-        var (p, s) = (Id(pinned), Id(served));
-        return s == p || (s.StartsWith(p + "-", StringComparison.Ordinal) && s.Length == p.Length + 9 && DatedSnapshot().IsMatch(s));
+        var (x, y) = (Id(a), Id(b));
+        return IsSnapshotOf(x, y) || IsSnapshotOf(y, x);
     }
+
+    // s is p, or p's dated snapshot (both canonical ids).
+    private static bool IsSnapshotOf(string p, string s) =>
+        s == p || (s.StartsWith(p + "-", StringComparison.Ordinal) && s.Length == p.Length + 9 && DatedSnapshot().IsMatch(s));
 
     /// <summary>
     /// Why a panel call pinned to <paramref name="model"/> (a role reviewer when <paramref name="reviewer"/>, else a second
@@ -83,12 +96,14 @@ public static partial class ReviewModels
         {
             return $"the router did not say which model answered the call pinned to {model}";
         }
-        return Serves(model, served) ? null : $"the router served '{served}', not the pinned {model}";
+        return Serves(model, served) ? null
+            : $"the router served '{served}', not the pinned {model}{(OpusVersion(model) is null ? "" : " or a newer Claude Opus")}";
     }
 
     /// <summary>
     /// Every reason <paramref name="review"/>'s models cannot count: its reviewer is not a <see cref="FloorText"/> or was not
-    /// served as pinned; a second model is not Claude, is the reviewer's own model, or was not served as pinned.
+    /// served as pinned; a second model is not Claude, was pinned to the reviewer's own model (<see cref="SamePinned"/>), or
+    /// was not served as pinned.
     /// </summary>
     public static IEnumerable<string> Problems(RoleReview review)
     {
@@ -102,9 +117,9 @@ public static partial class ReviewModels
             {
                 yield return $"a second model on a {review.Role} finding: {confirmProblem}";
             }
-            else if (Serves(review.Model, c.ServedModel) || (review.ServedModel is { } s && Serves(c.Model, s)))
+            else if (SamePinned(review.Model, c.Model))
             {
-                yield return $"a second model on a {review.Role} finding ({c.ServedModel}) is the reviewer's own model";
+                yield return $"a second model on a {review.Role} finding ({c.Model}) is the reviewer's own model";
             }
         }
     }
@@ -117,22 +132,23 @@ public static class ReviewerChoice
 {
     /// <summary>
     /// The first of <paramref name="candidates"/> that is a <see cref="ReviewModels.FloorText"/>. Throws
-    /// <see cref="ReviewerChoiceException"/> when there is none (including when none is configured: there is no default).
+    /// <see cref="ReviewerChoiceException"/> when there is none.
     /// </summary>
     public static string Choose(IReadOnlyList<string> candidates, string setting = "Review:Models") =>
         candidates.FirstOrDefault(ReviewModels.MeetsReviewFloor)
         ?? throw new ReviewerChoiceException(candidates.Count == 0
-            ? $"No reviewer model is configured: reviewers must be a {ReviewModels.FloorText} and there is no default; set {setting} (or Review:Models) to one the router routes."
+            ? $"No reviewer model is configured: reviewers must be a {ReviewModels.FloorText}; set {setting} (or Review:Models) to one the router routes."
             : $"No configured reviewer model ({string.Join(", ", candidates)}) is a {ReviewModels.FloorText}; set {setting}.");
 
     /// <summary>
     /// The second model for a blocking finding <paramref name="reviewerModels"/> reported: the first of
-    /// <paramref name="candidates"/> that is a Claude model and none of the reviewer's models. Throws
+    /// <paramref name="candidates"/> that is a Claude model and not pinned to any of the reviewer's pinned models
+    /// (<see cref="ReviewModels.SamePinned"/>). Throws
     /// <see cref="ReviewerChoiceException"/> when there is none.
     /// </summary>
     public static string ChooseConfirmer(IReadOnlyList<string> candidates, IReadOnlyCollection<string> reviewerModels,
         string setting = "Review:Confirm:Models") =>
-        candidates.FirstOrDefault(c => ReviewModels.IsClaude(c) && !reviewerModels.Any(r => ReviewModels.Serves(c, r) || ReviewModels.Serves(r, c)))
+        candidates.FirstOrDefault(c => ReviewModels.IsClaude(c) && !reviewerModels.Any(r => ReviewModels.SamePinned(c, r)))
         ?? throw new ReviewerChoiceException(
             $"No configured second model ({string.Join(", ", candidates)}) is a Claude model other than the reviewer's "
             + $"({string.Join(", ", reviewerModels)}), so a blocking finding cannot be confirmed; set {setting}.");

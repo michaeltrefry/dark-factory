@@ -24,7 +24,7 @@ public class GatePipelineTests
     private const string MergeCommit = "9999999999999999999999999999999999999999";
     internal const string ImplementerModel = "claude-sonnet-4-5-20250929";
 
-    /// <summary>The panel the tests run with: a Claude Opus 5.5 reviews every role, the default Claude second models confirm.</summary>
+    /// <summary>The panel the tests run with: a Claude Opus 5.5 reviews every role (pinned above the default claude-opus-5), the default Claude second models confirm.</summary>
     internal static readonly ReviewPanelModels TestPanel = ReviewPanelModels.Uniform(["claude-opus-5-5"]);
     private static readonly string Policy = TestPolicies.Standard();
 
@@ -575,6 +575,47 @@ public class GatePipelineTests
         Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
     }
 
+    [Theory]
+    [InlineData("claude-opus-5-5", true)] // the router's model_mapping upgrade
+    [InlineData("claude-opus-4-7", false)] // a downgrade never counts
+    public async Task The_default_panel_pinned_to_claude_opus_5_merges_when_served_an_equal_or_newer_opus(string served, bool merges)
+    {
+        var h = new Harness
+        {
+            Models = ReviewPanelModels.Uniform(ReviewPanelModels.DefaultReviewers),
+            Reviewer = new FakeReviewer { Findings = FakeReviewer.Blocking().Findings, Confirm = _ => Confirmation.NotConfirmed, Served = _ => served },
+        };
+
+        var outcome = await h.Run();
+
+        Assert.All(h.Reviewer.Requests, r => Assert.Equal("claude-opus-5", r.Model));
+        // The second model is the first default one not pinned to the reviewer's claude-opus-5.
+        Assert.All(h.Reviewer.Confirms, c => Assert.Equal("claude-sonnet-5", c.Model));
+        Assert.Equal(merges, outcome.Succeeded);
+        Assert.Equal(merges ? [$"merge 1 {Sha1}"] : [], h.Merges);
+        if (!merges)
+        {
+            Assert.Contains("the router served 'claude-opus-4-7', not the pinned claude-opus-5", outcome.Error);
+        }
+    }
+
+    [Fact]
+    public async Task The_second_model_is_chosen_by_pinned_ids_not_by_what_the_router_served_the_reviewer()
+    {
+        // The reviewer pinned claude-opus-5 is served as claude-opus-5-5; a second model pinned to claude-opus-5-5 is another pin.
+        var h = new Harness
+        {
+            Models = ReviewPanelModels.Uniform(["claude-opus-5"], ["claude-opus-5-5", "claude-sonnet-5"]),
+            Reviewer = new FakeReviewer { Findings = FakeReviewer.Blocking().Findings, Confirm = _ => Confirmation.NotConfirmed, Served = _ => "claude-opus-5-5" },
+        };
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal("claude-opus-5-5", Assert.Single(h.Reviewer.Confirms).Model);
+        Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
+    }
+
     /// <summary>
     /// An item a Phase-1/early Phase-2 factory left in <paramref name="state"/> with a passing verdict on Sha1 by
     /// <paramref name="oldReviewer"/> (the default reviewer under the dropped cross-family rule). The PR fake errors on its
@@ -607,7 +648,7 @@ public class GatePipelineTests
 
     [Theory]
     [InlineData(WorkState.CI, "gpt-5.5")]
-    [InlineData(WorkState.CI, "claude-opus-5")]
+    [InlineData(WorkState.CI, "claude-opus-4-7")]
     [InlineData(WorkState.Review, "gpt-5.5")]
     public async Task A_head_passed_under_the_old_reviewer_rule_is_reviewed_once_by_the_claude_opus_panel_and_merges(WorkState state, string oldReviewer)
     {
@@ -804,11 +845,11 @@ public class GatePipelineTests
     }
 
     [Fact]
-    public async Task The_reviewer_is_the_first_claude_opus_5_5_or_newer_and_the_second_model_the_first_other_claude()
+    public async Task The_reviewer_is_the_first_claude_opus_5_or_newer_and_the_second_model_the_first_other_claude()
     {
         var h = new Harness
         {
-            Models = ReviewPanelModels.Uniform(["gpt-5.5", "claude-opus-5", "claude-opus-6"], ["gpt-5.5", "claude-opus-6", "claude-sonnet-5"]),
+            Models = ReviewPanelModels.Uniform(["gpt-5.5", "claude-opus-4-7", "claude-opus-6"], ["gpt-5.5", "claude-opus-6", "claude-sonnet-5"]),
             Reviewer = new FakeReviewer { Findings = FakeReviewer.Blocking().Findings, Confirm = _ => Confirmation.NotConfirmed },
         };
 
@@ -982,16 +1023,16 @@ public class GatePipelineTests
     }
 
     [Fact]
-    public async Task A_role_with_no_claude_opus_5_5_or_newer_escalates_with_the_reason_before_any_call()
+    public async Task A_role_with_no_claude_opus_5_or_newer_escalates_with_the_reason_before_any_call()
     {
-        var models = new Dictionary<string, IReadOnlyList<string>>(TestPanel.Roles) { [ReviewRoles.Security] = ["claude-opus-5", "gpt-5.5"] };
+        var models = new Dictionary<string, IReadOnlyList<string>>(TestPanel.Roles) { [ReviewRoles.Security] = ["claude-opus-4-7", "gpt-5.5"] };
         var h = new Harness { Models = TestPanel with { Roles = models } };
         h.GitHub.Diff = RiskyDiff;
 
         var outcome = await h.Run();
 
         Assert.Equal(WorkState.Escalated, outcome.State);
-        Assert.Contains("(claude-opus-5, gpt-5.5) is a Claude Opus 5.5 or newer; set Review:Security:Models", outcome.Error);
+        Assert.Contains("(claude-opus-4-7, gpt-5.5) is a Claude Opus 5 or newer; set Review:Security:Models", outcome.Error);
         Assert.Empty(h.Reviewer.Requests);
         Assert.Empty(h.Merges);
     }
@@ -1004,7 +1045,7 @@ public class GatePipelineTests
         var outcome = await h.Run();
 
         Assert.Equal(WorkState.Escalated, outcome.State);
-        Assert.Contains("No reviewer model is configured: reviewers must be a Claude Opus 5.5 or newer and there is no default", outcome.Error);
+        Assert.Contains("No reviewer model is configured: reviewers must be a Claude Opus 5 or newer", outcome.Error);
         Assert.Empty(h.Reviewer.Requests);
         Assert.Empty(h.Merges);
     }
@@ -1015,7 +1056,7 @@ public class GatePipelineTests
         var models = new Dictionary<string, IReadOnlyList<string>>(TestPanel.Roles)
         {
             [ReviewRoles.Security] = ["claude-opus-6"],
-            [ReviewRoles.SpecConformance] = ["claude-opus-5", "claude-opus-5-6"],
+            [ReviewRoles.SpecConformance] = ["claude-opus-4-7", "claude-opus-5-6"],
         };
         var h = new Harness { Models = TestPanel with { Roles = models } };
         h.GitHub.Diff = RiskyDiff;

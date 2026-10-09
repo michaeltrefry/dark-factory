@@ -83,13 +83,18 @@ public static class ReviewPrompts
 /// <summary>
 /// The panel's model lists, each in order of preference (<see cref="ReviewerChoice"/>). A role reviews with the first of its
 /// list that is a <see cref="ReviewModels.FloorText"/>; a blocking finding is confirmed by the first Claude model of
-/// <see cref="Confirm"/> that is not the reviewer's model. Which models the implementer used does not matter. There is no
-/// default reviewer: the router's catalog (<c>GET /v1/router/models</c>, read 2026-10-08) offers no Claude Opus 5.5 or
-/// newer, so <c>Review:Models</c> must be set (<see cref="FactoryOptions.ReviewPanel"/>).
+/// <see cref="Confirm"/> not pinned to the reviewer's model. Which models the implementer used does not matter.
+/// <c>Review:Models</c> defaults to <see cref="DefaultReviewers"/> (<see cref="FactoryOptions.ReviewPanel"/>).
 /// </summary>
 public sealed record ReviewPanelModels(IReadOnlyDictionary<string, IReadOnlyList<string>> Roles, IReadOnlyList<string> Confirm)
 {
-    /// <summary>The Claude models the router's catalog offers (2026-10-08), strongest first; neither is a reviewer's (5.5+) id.</summary>
+    /// <summary>
+    /// The default reviewer (owner decision 2026-10-09, sc-25391): the router's catalog has no Opus 5.5 id, and its
+    /// <c>model_mapping</c> serves <c>claude-opus-5</c> as <c>claude-opus-5-5</c> (an upgrade <see cref="ReviewModels.Serves"/> accepts).
+    /// </summary>
+    public static readonly IReadOnlyList<string> DefaultReviewers = ["claude-opus-5"];
+
+    /// <summary>The Claude models the router's catalog offers (2026-10-08), strongest first.</summary>
     public static readonly IReadOnlyList<string> DefaultConfirmers = ["claude-opus-5", "claude-sonnet-5"];
 
     /// <summary>Every role with the same <paramref name="reviewers"/>.</summary>

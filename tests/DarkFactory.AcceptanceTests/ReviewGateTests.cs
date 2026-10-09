@@ -22,7 +22,7 @@ public class ReviewGateTests
 {
     private static readonly TimeSpan RunTimeout = TimeSpan.FromMinutes(60);
 
-    /// <summary>P2-AT1: a sandbox PR with green CI and a pass from a Claude Opus 5.5+ panel is merged by the gate; the ledger holds the merge commit.</summary>
+    /// <summary>P2-AT1: a sandbox PR with green CI and a pass from a Claude Opus 5+ panel is merged by the gate; the ledger holds the merge commit.</summary>
     [Fact]
     public async Task Gate_merges_a_green_pr_a_claude_opus_panel_passed_and_the_ledger_records_the_merge_commit()
     {
@@ -159,7 +159,7 @@ public class ReviewGateTests
 
     private static string Lines(string? text) => (text ?? "").Replace("\r\n", "\n", StringComparison.Ordinal);
 
-    /// <summary>Every reviewer a Claude Opus 5.5 or newer and every second model Claude, each served by the router as pinned.</summary>
+    /// <summary>Every reviewer a Claude Opus 5 or newer and every second model Claude, each served by the router as pinned (or, for an Opus, as a newer Opus).</summary>
     private static void AssertClaudePanel(ReviewVerdict verdict)
     {
         Assert.NotEmpty(verdict.Reviews);
@@ -167,7 +167,7 @@ public class ReviewGateTests
         Assert.Empty(verdict.Reviews.SelectMany(ReviewModels.Problems));
     }
 
-    /// <summary>Skips with the missing owner step unless the gate App is set up, Review:Models is set and the sandbox has a policy on main.</summary>
+    /// <summary>Skips with the missing owner step unless the gate App is set up, the review panel models are valid and the sandbox has a policy on main.</summary>
     internal static async Task RequireGateReadyAsync(FactoryOptions options, CancellationToken ct)
     {
         Harness.RequireSecret(o => o.GitHubGateAppId);

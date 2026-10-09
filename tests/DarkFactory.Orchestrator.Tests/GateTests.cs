@@ -36,15 +36,21 @@ public class ReviewModelsTests
     [InlineData("claude-opus-6", true)]
     [InlineData("claude-opus-6-0", true)]
     [InlineData("claude-opus-10", true)]
-    [InlineData("claude-opus-5-4", false)]
-    [InlineData("claude-opus-5", false)]
+    [InlineData("claude-opus-5", true)]
+    [InlineData("claude-opus-5-0", true)]
+    [InlineData("anthropic/claude-opus-5-20260101", true)]
+    [InlineData("claude-opus-4-9", false)]
     [InlineData("claude-opus-4-7", false)]
+    [InlineData("claude-opus-4", false)]
     [InlineData("claude-sonnet-6", false)]
     [InlineData("claude-fable-5", false)]
     [InlineData("gpt-5.5", false)]
     [InlineData("gemini-3.1-pro-preview", false)]
     [InlineData("mystery-model", false)]
-    public void Only_a_claude_opus_5_5_or_newer_meets_the_review_floor(string model, bool meets) =>
+    [InlineData("claude-opus-5-5-thinking", false)]
+    [InlineData("claude-opus-latest", false)]
+    [InlineData("claude-opus-5-5[1m]", false)]
+    public void Only_a_claude_opus_5_or_newer_meets_the_review_floor(string model, bool meets) =>
         Assert.Equal(meets, ReviewModels.MeetsReviewFloor(model));
 
     [Theory]
@@ -66,26 +72,43 @@ public class ReviewModelsTests
     [InlineData("claude-opus-5.5", "claude-opus-5-5", true)]
     [InlineData("anthropic/claude-opus-5.5", "claude-opus-5-5-20261001", true)]
     [InlineData("claude-opus-5-5", "claude-opus-5.5", true)]
-    [InlineData("claude-opus-5.5", "claude-opus-5-6", false)]
+    // A pinned Claude Opus counts as served by the same or a higher Opus (the router's model_mapping upgrades), never a lower one.
+    [InlineData("claude-opus-5", "claude-opus-5", true)]
+    [InlineData("claude-opus-5", "claude-opus-5-5", true)]
+    [InlineData("claude-opus-5", "claude-opus-5-5-20261001", true)]
+    [InlineData("claude-opus-5", "claude-opus-6", true)]
+    [InlineData("claude-opus-5.5", "claude-opus-5-6", true)]
+    [InlineData("claude-opus-5", "claude-opus-4-7", false)]
+    [InlineData("claude-opus-5-5", "claude-opus-5", false)]
+    [InlineData("claude-opus-5", "claude-sonnet-5", false)]
+    [InlineData("claude-opus-5", "gpt-5.5", false)]
+    [InlineData("claude-opus-5", null, false)]
     [InlineData("claude-opus-5-5", "claude-opus-5-5-2026-01", false)]
     [InlineData("claude-opus-5-5", "claude-opus-5-5-fast", false)]
-    [InlineData("claude-opus-5-5", "claude-opus-5", false)]
-    [InlineData("claude-opus-5", "claude-opus-5-5", false)]
+    [InlineData("claude-opus-9", "claude-opus-10", true)] // versions compare as numbers, not text
+    [InlineData("claude-opus-5", "claude-opus-5-5-thinking", false)]
+    [InlineData("claude-opus-5", "claude-opus-latest", false)]
+    [InlineData("claude-opus-5", "claude-opus-5-5[1m]", false)]
+    [InlineData("claude-opus-5-5", "claude-opus-5-20261001", false)] // a dated Opus 5.0, not 5.20261001
     [InlineData("claude-opus-5-5", "gpt-5.5", false)]
     [InlineData("claude-opus-5-5", "", false)]
     [InlineData("claude-opus-5-5", null, false)]
-    public void An_answer_counts_only_when_the_router_served_the_pinned_model(string pinned, string? served, bool serves) =>
+    // A pinned non-Opus (a second model such as claude-sonnet-5) counts only as itself or its snapshot.
+    [InlineData("claude-sonnet-5", "claude-sonnet-5", true)]
+    [InlineData("claude-sonnet-5", "claude-sonnet-5-20261001", true)]
+    [InlineData("claude-sonnet-5", "claude-sonnet-5-5", false)]
+    [InlineData("claude-sonnet-5", "claude-opus-6", false)]
+    public void An_answer_counts_when_the_router_served_the_pinned_model_or_an_opus_upgrade(string pinned, string? served, bool serves) =>
         Assert.Equal(serves, ReviewModels.Serves(pinned, served));
 
     [Fact]
-    public void The_reviewer_is_the_first_claude_opus_5_5_or_newer_whatever_the_implementer_used()
+    public void The_reviewer_is_the_first_claude_opus_5_or_newer_whatever_the_implementer_used()
     {
-        Assert.Equal("claude-opus-5-5", ReviewerChoice.Choose(["gpt-5.6-sol", "claude-opus-5", "claude-opus-5-5", "claude-opus-6"]));
-        var older = Assert.Throws<ReviewerChoiceException>(() => ReviewerChoice.Choose(["claude-opus-5", "gpt-5.5"], "Review:Security:Models"));
-        Assert.Contains("is a Claude Opus 5.5 or newer; set Review:Security:Models", older.Message);
+        Assert.Equal("claude-opus-5", ReviewerChoice.Choose(["gpt-5.6-sol", "claude-opus-4-7", "claude-opus-5", "claude-opus-6"]));
+        var older = Assert.Throws<ReviewerChoiceException>(() => ReviewerChoice.Choose(["claude-opus-4-9", "gpt-5.5"], "Review:Security:Models"));
+        Assert.Contains("is a Claude Opus 5 or newer; set Review:Security:Models", older.Message);
         var none = Assert.Throws<ReviewerChoiceException>(() => ReviewerChoice.Choose([]));
         Assert.Contains("No reviewer model is configured", none.Message);
-        Assert.Contains("there is no default", none.Message);
     }
 
     [Fact]
@@ -93,8 +116,12 @@ public class ReviewModelsTests
     {
         string[] candidates = ["gpt-5.5", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5"];
         Assert.Equal("claude-opus-5", ReviewerChoice.ChooseConfirmer(candidates, ["claude-opus-5-5"]));
-        // The reviewer's served id (a dated snapshot, another case) is excluded as well as the pinned one.
+        // A pinned id's dated snapshot (in another case) is the same pin.
         Assert.Equal("claude-sonnet-5", ReviewerChoice.ChooseConfirmer(candidates, ["claude-opus-5-5", "CLAUDE-OPUS-5-20260101"]));
+        // Pinned ids are compared, not what the router may upgrade them to: the default reviewer claude-opus-5 (served as
+        // claude-opus-5-5) does not exclude a confirmer pinned to claude-opus-5-5, and does exclude one pinned to claude-opus-5.
+        Assert.Equal("claude-opus-5-5", ReviewerChoice.ChooseConfirmer(candidates, ["claude-opus-5"]));
+        Assert.Equal("claude-sonnet-5", ReviewerChoice.ChooseConfirmer(ReviewPanelModels.DefaultConfirmers, ReviewPanelModels.DefaultReviewers));
         // The reviewer's dotted spelling is its dashed one: never its own second model.
         Assert.Equal("claude-sonnet-5", ReviewerChoice.ChooseConfirmer(["claude-opus-5-5", "claude-sonnet-5"], ["claude-opus-5.5"]));
         // A non-Claude candidate is never chosen, even when it is the only other one.
@@ -103,7 +130,7 @@ public class ReviewModelsTests
     }
 
     [Fact]
-    public void A_reviews_models_break_the_rule_when_not_claude_opus_5_5_not_served_as_pinned_or_confirmed_by_the_reviewer_itself()
+    public void A_reviews_models_break_the_rule_when_not_claude_opus_5_not_served_as_pinned_or_confirmed_by_the_reviewer_itself()
     {
         static RoleReview R(string model, string? served, params Confirmation[] confirmations) =>
             new(ReviewRoles.Correctness, model, served, "s", "p",
@@ -111,7 +138,19 @@ public class ReviewModelsTests
         static Confirmation C(string model, string? served) => new(Confirmation.Confirmed, model, served, "s", "p", "yes");
 
         Assert.Empty(ReviewModels.Problems(R("claude-opus-5-5", "claude-opus-5-5-20261001", C("claude-sonnet-5", "claude-sonnet-5"))));
-        Assert.Contains("is not a Claude Opus 5.5 or newer", Assert.Single(ReviewModels.Problems(R("claude-opus-5", "claude-opus-5"))));
+        Assert.Contains("is not a Claude Opus 5 or newer", Assert.Single(ReviewModels.Problems(R("claude-opus-4-9", "claude-opus-4-9"))));
+        // The default reviewer served as the router's upgrade counts; a downgrade does not.
+        Assert.Empty(ReviewModels.Problems(R("claude-opus-5", "claude-opus-5-5", C("claude-sonnet-5", "claude-sonnet-5"))));
+        Assert.Contains("served 'claude-opus-4-7', not the pinned claude-opus-5 or a newer Claude Opus",
+            Assert.Single(ReviewModels.Problems(R("claude-opus-5", "claude-opus-4-7"))));
+        // A second model pinned to a non-Opus is not upgraded: claude-sonnet-5 served as claude-sonnet-5-5 does not count.
+        Assert.Contains("served 'claude-sonnet-5-5', not the pinned claude-sonnet-5",
+            Assert.Single(ReviewModels.Problems(R("claude-opus-5", "claude-opus-5", C("claude-sonnet-5", "claude-sonnet-5-5")))));
+        // The reviewer's own model is judged by the pinned ids: pinned apart they differ even when the router served both as
+        // claude-opus-5-5; pinned alike they are the same even when served differently.
+        Assert.Empty(ReviewModels.Problems(R("claude-opus-5", "claude-opus-5-5", C("claude-opus-5-5", "claude-opus-5-5"))));
+        Assert.Contains("(claude-opus-5) is the reviewer's own model",
+            Assert.Single(ReviewModels.Problems(R("claude-opus-5", "claude-opus-5-5", C("claude-opus-5", "claude-opus-6")))));
         Assert.Contains("did not say which model answered", Assert.Single(ReviewModels.Problems(R("claude-opus-5-5", null))));
         Assert.Contains("served 'gpt-5.5', not the pinned", Assert.Single(ReviewModels.Problems(R("claude-opus-5-5", "gpt-5.5"))));
         Assert.Contains("gpt-5.5 is not a Claude model", Assert.Single(ReviewModels.Problems(R("claude-opus-5-5", "claude-opus-5-5", C("gpt-5.5", "gpt-5.5")))));
@@ -233,19 +272,30 @@ public class MergeGateTests
 
     [Fact]
     [FailsGateCheck(GateChecks.ReviewPass)]
-    public void A_failed_review_or_a_reviewer_that_is_not_a_claude_opus_5_5_served_as_pinned_blocks()
+    public void A_failed_review_or_a_reviewer_that_is_not_a_claude_opus_5_served_as_pinned_blocks()
     {
         Assert.Contains("is 'fail'", Evaluate(verdicts: [Pass with { Verdict = ReviewVerdict.Fail }]).Detail);
         ReviewVerdict With(RoleReview correctness) => Pass with { Reviews = [correctness, Pass.Reviews[1]] };
         // The second verdict on the head (the current panel's, after an earlier rule's) still breaking the rule blocks.
         GateDecision Again(ReviewVerdict verdict) => Evaluate(verdicts: [verdict, verdict]);
-        var older = Again(With(Review(ReviewRoles.Correctness, "claude-opus-5")));
+        var older = Again(With(Review(ReviewRoles.Correctness, "claude-opus-4-7")));
         Assert.Equal(GateOutcome.Blocked, older.Outcome);
-        Assert.Contains("the correctness reviewer: claude-opus-5 is not a Claude Opus 5.5 or newer", older.Detail);
-        Assert.Contains("the correctness reviewer: gpt-5.5 is not a Claude Opus 5.5", Again(With(Review(ReviewRoles.Correctness, "gpt-5.5"))).Detail);
+        Assert.Contains("the correctness reviewer: claude-opus-4-7 is not a Claude Opus 5 or newer", older.Detail);
+        Assert.Contains("the correctness reviewer: gpt-5.5 is not a Claude Opus 5 or newer", Again(With(Review(ReviewRoles.Correctness, "gpt-5.5"))).Detail);
         Assert.Contains("the router served 'claude-sonnet-5', not the pinned claude-opus-5-5",
             Again(With(Pass.Reviews[0] with { ServedModel = "claude-sonnet-5" })).Detail);
         Assert.Contains("did not say which model answered", Again(With(Pass.Reviews[0] with { ServedModel = null })).Detail);
+    }
+
+    [Fact]
+    public void A_review_pinned_to_claude_opus_5_merges_when_served_as_claude_opus_5_5_and_blocks_when_served_lower()
+    {
+        ReviewVerdict Served(string served) =>
+            ReviewPanel.Decide(Head, [], [Review(ReviewRoles.Correctness, "claude-opus-5") with { ServedModel = served }, Review(ReviewRoles.SpecConformance, "claude-opus-5")]);
+        Assert.Equal(GateOutcome.Merge, Evaluate(verdicts: [Served("claude-opus-5-5")]).Outcome);
+        var lower = Evaluate(verdicts: [Served("claude-opus-4-7"), Served("claude-opus-4-7")]);
+        Assert.Equal(GateOutcome.Blocked, lower.Outcome);
+        Assert.Contains("the correctness reviewer: the router served 'claude-opus-4-7', not the pinned claude-opus-5", lower.Detail);
     }
 
     [Fact]
@@ -255,8 +305,8 @@ public class MergeGateTests
         var gpt = Evaluate(verdicts: [By("gpt-5.5")]);
         Assert.Equal(GateOutcome.ReviewHead, gpt.Outcome);
         Assert.Contains("recorded under an earlier panel rule", gpt.Detail);
-        Assert.Contains("the correctness reviewer: gpt-5.5 is not a Claude Opus 5.5", gpt.Detail);
-        Assert.Equal(GateOutcome.ReviewHead, Evaluate(verdicts: [Pass with { HeadSha = Old }, By("claude-opus-5")]).Outcome);
+        Assert.Contains("the correctness reviewer: gpt-5.5 is not a Claude Opus 5 or newer", gpt.Detail);
+        Assert.Equal(GateOutcome.ReviewHead, Evaluate(verdicts: [Pass with { HeadSha = Old }, By("claude-opus-4-7")]).Outcome);
         // A verdict on another head does not count as the head's second one.
         Assert.True(MergeGate.Superseded(By("gpt-5.5"), [Pass with { HeadSha = Old }, By("gpt-5.5")]));
         Assert.False(MergeGate.Superseded(Pass, [Pass]));
@@ -402,15 +452,18 @@ public class RouterReviewerTests
             "{\"findings\": [], \"summary\": \"fine\"}").Error);
         Assert.True(RouterReviewer.InterpretReview(ReviewRoles.Correctness, "claude-opus-5-5", "claude-opus-5-5-20261001", "end_turn",
             "ok\n```json\n{\"findings\": [], \"summary\": \"fine\"}\n```\n").Clean);
+        // The router's model_mapping serves the pinned claude-opus-5 as claude-opus-5-5: an upgrade, so the answer counts.
+        Assert.True(RouterReviewer.InterpretReview(ReviewRoles.Correctness, "claude-opus-5", "claude-opus-5-5", "end_turn",
+            "{\"findings\": [], \"summary\": \"fine\"}").Clean);
     }
 
     [Fact]
     public void A_call_pinned_to_a_model_the_panel_may_not_use_is_unusable_even_when_served_as_pinned()
     {
         const string clean = "{\"findings\": [], \"summary\": \"fine\"}";
-        Assert.Contains("claude-opus-5 is not a Claude Opus 5.5 or newer",
-            RouterReviewer.InterpretReview(ReviewRoles.Correctness, "claude-opus-5", "claude-opus-5", "end_turn", clean).Error);
-        Assert.Contains("is not a Claude Opus 5.5", RouterReviewer.InterpretReview(ReviewRoles.Correctness, "gpt-5.5", "gpt-5.5", "end_turn", clean).Error);
+        Assert.Contains("claude-opus-4-9 is not a Claude Opus 5 or newer",
+            RouterReviewer.InterpretReview(ReviewRoles.Correctness, "claude-opus-4-9", "claude-opus-4-9", "end_turn", clean).Error);
+        Assert.Contains("is not a Claude Opus 5 or newer", RouterReviewer.InterpretReview(ReviewRoles.Correctness, "gpt-5.5", "gpt-5.5", "end_turn", clean).Error);
         var confirmation = RouterReviewer.InterpretConfirmation("gpt-5.5", "gpt-5.5", "end_turn", "{\"confirmed\": false, \"reason\": \"x\"}");
         Assert.Equal(Confirmation.Unusable, confirmation.Outcome);
         Assert.Contains("is not a Claude model", confirmation.Reason);

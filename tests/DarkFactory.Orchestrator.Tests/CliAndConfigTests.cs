@@ -209,12 +209,16 @@ public class FactoryOptionsTests
     }
 
     [Fact]
-    public void Reviewer_models_have_no_default_and_must_each_be_a_claude_opus_5_5_or_newer_and_second_models_claude()
+    public void Reviewer_models_default_to_claude_opus_5_and_must_each_be_a_claude_opus_5_or_newer_and_second_models_claude()
     {
-        // No default reviewer: the router offers no Claude Opus 5.5 or newer, so the factory refuses to start until one is set.
-        var none = Assert.Throws<ReviewConfigurationException>(() => Options([]).ReviewPanel).Message;
-        Assert.Contains("No correctness reviewer model is configured: reviewers must be a Claude Opus 5.5 or newer and there is no default", none);
-        Assert.Contains("set Review:Models", none);
+        // The default reviewer is claude-opus-5 (the router serves it as claude-opus-5-5) for every role; second models keep theirs.
+        var defaults = Options([]).ReviewPanel;
+        Assert.All(ReviewRoles.All, role => Assert.Equal(["claude-opus-5"], defaults.For(role)));
+        Assert.Equal(["claude-opus-5", "claude-sonnet-5"], defaults.Confirm);
+        // A role's own list overrides the default for that role only.
+        var own = Options(new() { ["Review:Security:Models"] = "claude-opus-6" }).ReviewPanel;
+        Assert.Equal(["claude-opus-6"], own.For(ReviewRoles.Security));
+        Assert.Equal(["claude-opus-5"], own.For(ReviewRoles.Correctness));
 
         // Review:Models is every role's list unless the role has its own; the second models default to the router's Claude models.
         var shared = Options(new() { ["Review:Models"] = " claude-opus-5-5 , claude-opus-6" }).ReviewPanel;
@@ -232,24 +236,43 @@ public class FactoryOptionsTests
         Assert.Equal(["anthropic/claude-opus-5.5"], panel.For(ReviewRoles.SpecConformance));
         Assert.Equal(["claude-opus-6"], panel.For(ReviewRoles.Security));
         Assert.Equal(["claude-haiku-4-5"], panel.Confirm);
-        // A role's own list alone is not enough: the other roles have none.
-        Assert.Contains("No spec-conformance reviewer model is configured",
-            Assert.Throws<ReviewConfigurationException>(() => Options(new() { ["Review:Correctness:Models"] = "claude-opus-5-5" }).ReviewPanel).Message);
 
         // An older Opus, another Claude, or another vendor's model cannot be configured as a reviewer; nor a non-Claude second model.
-        Assert.Contains("Review:Models: 'claude-opus-5' is not a Claude Opus 5.5 or newer",
-            Assert.Throws<ReviewConfigurationException>(() => Options(new() { ["Review:Models"] = "claude-opus-5-5,claude-opus-5" }).ReviewPanel).Message);
-        Assert.Contains("Review:Models: 'gpt-5.5' is not a Claude Opus 5.5 or newer",
+        Assert.Contains("Review:Models: 'claude-opus-4-9' is not a Claude Opus 5 or newer",
+            Assert.Throws<ReviewConfigurationException>(() => Options(new() { ["Review:Models"] = "claude-opus-5,claude-opus-4-9" }).ReviewPanel).Message);
+        Assert.Contains("Review:Models: 'gpt-5.5' is not a Claude Opus 5 or newer",
             Assert.Throws<ReviewConfigurationException>(() => Options(new() { ["Review:Models"] = "gpt-5.5" }).ReviewPanel).Message);
-        Assert.Contains("Review:Security:Models: 'claude-sonnet-6' is not a Claude Opus 5.5 or newer",
+        Assert.Contains("Review:Security:Models: 'claude-sonnet-6' is not a Claude Opus 5 or newer",
             Assert.Throws<ReviewConfigurationException>(() => Options(new() { ["Review:Models"] = "claude-opus-5-5", ["Review:Security:Models"] = "claude-sonnet-6" }).ReviewPanel).Message);
         Assert.Contains("Review:Confirm:Models: 'gpt-5.4-mini' is not a Claude model",
             Assert.Throws<ReviewConfigurationException>(() => Options(new() { ["Review:Models"] = "claude-opus-5-5", ["Review:Confirm:Models"] = "claude-sonnet-5,gpt-5.4-mini" }).ReviewPanel).Message);
+        // A list of separators only names no model: refused at start-up (not an empty panel that escalates every item).
+        Assert.Contains("Review:Models lists no model",
+            Assert.Throws<ReviewConfigurationException>(() => Options(new() { ["Review:Models"] = " , " }).ReviewPanel).Message);
+        Assert.Contains("Review:SpecConformance:Models lists no model",
+            Assert.Throws<ReviewConfigurationException>(() => Options(new() { ["Review:SpecConformance:Models"] = "," }).ReviewPanel).Message);
         Assert.Equal((TimeSpan.FromSeconds(30), TimeSpan.FromMinutes(30)), (Options([]).CiPollInterval, Options([]).CiTimeout));
     }
 
     [Fact]
-    public async Task Factory_run_without_review_models_exits_2_with_the_reason_before_any_router_call()
+    public async Task Factory_run_with_an_ineligible_review_model_exits_2_with_the_reason_before_any_router_call()
+    {
+        var calls = new List<string>();
+        var stderr = new StringWriter();
+
+        var exit = await FactoryRunner.RunCommandAsync(Options(new() { ["Review:Models"] = "claude-opus-4-7" }),
+            _ => { calls.Add("enrollment"); return Task.FromResult<string?>(null); },
+            _ => { calls.Add("run"); return Task.FromResult(new RunOutcome(1, DarkFactory.Orchestrator.Ledger.WorkState.Watch, null, null, null)); },
+            stderr, CancellationToken.None);
+
+        Assert.Equal(2, exit); // not 1, a failed run
+        Assert.Contains("Review:Models: 'claude-opus-4-7' is not a Claude Opus 5 or newer", stderr.ToString());
+        Assert.DoesNotContain(" at ", stderr.ToString()); // the message, not a stack trace
+        Assert.Empty(calls);
+    }
+
+    [Fact]
+    public async Task Factory_run_with_no_review_models_configured_starts_with_the_default_reviewer()
     {
         var calls = new List<string>();
         var stderr = new StringWriter();
@@ -259,10 +282,8 @@ public class FactoryOptionsTests
             _ => { calls.Add("run"); return Task.FromResult(new RunOutcome(1, DarkFactory.Orchestrator.Ledger.WorkState.Watch, null, null, null)); },
             stderr, CancellationToken.None);
 
-        Assert.Equal(2, exit); // not 1, a failed run
-        Assert.Contains("set Review:Models", stderr.ToString());
-        Assert.DoesNotContain(" at ", stderr.ToString()); // the message, not a stack trace
-        Assert.Empty(calls);
+        Assert.Equal((0, ""), (exit, stderr.ToString()));
+        Assert.Equal(["enrollment", "run"], calls);
     }
 
     [Fact]
