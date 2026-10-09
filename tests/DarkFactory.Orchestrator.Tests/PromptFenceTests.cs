@@ -91,8 +91,9 @@ public class PromptFenceTests
         Assert.True(tools.IsReadOnly);
         Assert.Empty(tools.Allowed); // nothing by name: a bare Read would pre-approve reading any path
         Assert.Equal("dontAsk", tools.PermissionMode);
-        Assert.All(["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "Task", "Agent", "WebFetch", "WebSearch"],
-            t => Assert.Contains(t, tools.Denied));
+        Assert.All(["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "Task", "Agent", "WebFetch", "WebSearch",
+                "Monitor", "PowerShell", "EnterWorktree", "ExitWorktree", "TaskStop", "SendMessage"],
+            t => Assert.Contains(t, tools.Denied)); // belt and braces: dontAsk with no named allow rule is what denies any other tool
         // The implementer's tools are not read-only, so a triage runner refuses them.
         Assert.False(WorkerTools.Implementer.IsReadOnly);
         Assert.Throws<ArgumentNullException>(() => ClaudeWorker.BuildArguments("triage", tools: tools)); // confined: needs its directory

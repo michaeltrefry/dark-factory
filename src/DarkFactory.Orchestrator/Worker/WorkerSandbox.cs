@@ -35,6 +35,14 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     /// <summary>The <c>helper_version</c> of <c>scripts/factory-worker-launch</c>: an installed helper below it is stale.</summary>
     public const int HelperVersion = 2;
 
+    /// <summary>
+    /// The oldest Claude Code the worker user may run: 2.1.291, the release the confined triage session was built and checked
+    /// against (it honours <c>--setting-sources ""</c>, <c>permissions.blockReadsOutsideWorkingDirectories</c> and the
+    /// <c>dontAsk</c> permission mode). No earlier release is pinned as honouring all three, and an older CLI that does not know
+    /// a setting ignores it silently, so <see cref="EnsureReadyAsync"/> refuses one below this.
+    /// </summary>
+    public const string MinClaudeVersion = "2.1.291";
+
     /// <summary><c>scripts/factory-worker-launch</c> as built into this assembly (never written out or run: only compared).</summary>
     private static readonly Lazy<string> CompiledHelper = new(() =>
     {
@@ -202,9 +210,10 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     /// installed 0755, so readable): an older one may lack the uid sweep's guards. Then the probe hands it the router variable
     /// names a worker launch uses for <paramref name="auth"/> (dummy values), so a helper whose allowlist refuses one fails
     /// here once instead of failing every worker launch; and a helper that refuses its uid sweep (its pinned uid is not the
-    /// worker user's, or outside 400-499) fails too, since a worker's leftovers would then outlive every run.
+    /// worker user's, or outside 400-499) fails too, since a worker's leftovers would then outlive every run. Last, the worker
+    /// user's own Claude Code (<paramref name="claudePath"/>, as the worker sees it) must be at least <see cref="MinClaudeVersion"/>.
     /// </summary>
-    public async Task EnsureReadyAsync(WorkerAuth auth, CancellationToken ct)
+    public async Task EnsureReadyAsync(WorkerAuth auth, string claudePath, CancellationToken ct)
     {
         string installed;
         try
@@ -249,6 +258,37 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
                 $"The installed launch helper {HelperPath} refuses its {User} uid sweep, so a worker's leftovers would outlive its run "
                 + $"({refusal.Trim()}); re-run `{ReinstallCommand}` (it pins {User}'s uid; a {User} whose uid is outside 400-499 must be recreated).");
         }
+        var claude = await RunAsync("/", claudePath, ["--version"], ct);
+        if (claude.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"Cannot run `{claudePath} --version` as {User} through {HelperPath} (exit {claude.ExitCode}: {claude.Stderr.Trim()}); {SetupHint}.");
+        }
+        if (OutdatedClaudeReason(claude.Stdout) is { } outdated)
+        {
+            throw new InvalidOperationException(
+                $"Upgrade {User}'s claude: {outdated}, and an older CLI may silently ignore the triage session's read confinement "
+                + $"(`--setting-sources \"\"`, `blockReadsOutsideWorkingDirectories`, `dontAsk`); run `sudo -u {User} -H ~{User}/.local/bin/claude update` "
+                + $"(or delete ~{User}/.local/bin/claude and re-run `{ReinstallCommand}` to reinstall it).");
+        }
+    }
+
+    /// <summary>
+    /// Why <paramref name="versionOutput"/> (what <c>claude --version</c> printed, e.g. <c>2.1.291 (Claude Code)</c>) is not at least
+    /// <see cref="MinClaudeVersion"/>, or null.
+    /// </summary>
+    public static string? OutdatedClaudeReason(string versionOutput)
+    {
+        var text = versionOutput.Trim();
+        var match = Regex.Match(text, @"^([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})(?![0-9.])");
+        if (!match.Success)
+        {
+            return $"its `claude --version` printed '{(text.Length > 80 ? text[..80] : text)}', no version (Claude Code {MinClaudeVersion} or newer is required)";
+        }
+        var version = new Version(int.Parse(match.Groups[1].Value), int.Parse(match.Groups[2].Value), int.Parse(match.Groups[3].Value));
+        return version < Version.Parse(MinClaudeVersion)
+            ? $"it runs Claude Code {version}, older than the {MinClaudeVersion} the factory requires"
+            : null;
     }
 
     /// <summary>

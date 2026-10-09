@@ -742,7 +742,8 @@ public class LiveWorkerSandboxTests
         var sandbox = new WorkerSandbox(WorkerSandbox.DefaultUser, WorkerSandbox.DefaultHelperPath);
         try
         {
-            await sandbox.EnsureReadyAsync(new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets()).WorkerAuth, CancellationToken.None);
+            var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets());
+            await sandbox.EnsureReadyAsync(options.WorkerAuth, options.ClaudePath, CancellationToken.None);
         }
         catch (InvalidOperationException ex)
         {

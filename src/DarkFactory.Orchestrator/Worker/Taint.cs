@@ -66,7 +66,13 @@ public enum WorkerInput
 /// (other sessions' transcripts). The posted free text is bounded (<see cref="Issues.TriageParser.MaxTitle"/>,
 /// <see cref="Issues.TriageParser.MaxText"/>) and fenced. Residual, accepted: it can restate what it read inside its own worktree in
 /// that answer — the target repo's own code at its default branch, the repo the issue is about — and the answer routes nothing by
-/// the model's say-so.
+/// the model's say-so. A symlink committed in that repo cannot lead it out: the owner removes every symlink whose resolved target
+/// is outside the worktree after checkout and before the session starts (<see cref="Issues.TriageWorktree.RemoveOutOfTreeSymlinks"/>),
+/// and the worker user's Claude Code must be at least <see cref="WorkerSandbox.MinClaudeVersion"/>, so the read block is not
+/// silently ignored. Residual, accepted: Read and the read block are enforced by Claude Code itself, and its enforcement on Glob and
+/// Grep (a search given an explicit path or pattern outside the working directory) is best-effort and not verified by the factory —
+/// a gap there would let a search reach what the <c>_factory</c> user can read (other clones, kept worktrees, its home), bounded
+/// only by the answer's size and fence.
 /// </para>
 /// </summary>
 public static class Taint
