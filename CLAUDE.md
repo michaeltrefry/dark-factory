@@ -500,7 +500,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   client nothing for 10 s — assembled by `MessageStream`, which fails closed on an `error` event, a stream without
   `message_stop` or one silent for 2 min; router key only, `x-weave-model-class: high` and never `x-weave-force-model` (the
   router refuses the two together), body `model` the fixed placeholder `ModelClass.RequestModel` (`default`: no catalog model
-  has it, so no passthrough lane serves it verbatim; the router's in-class pick serves the call), its own fresh
+  has it, so no passthrough lane serves it verbatim; the router's in-class pick serves the call — the factory's router key
+  must therefore have no routing-policy caller passthrough or blind-experiment passthrough arm, which 503s
+  `model_class_unavailable` for a body model outside the class and would usage-pause every review in a loop), its own fresh
   `X-Claude-Code-Session-Id` so the cost stays scoped to it and no worker session or transcript reaches it) whose system
   prompt is the role's prompt file and whose message holds the story, the base commit's file list
   (`IGateGitHub.GetFilesAsync`) and the diff of the PR's head commit — nothing else. Prompts: `factory/prompts/{correctness,spec-conformance,security,confirm}.md` in this repo, compiled in as

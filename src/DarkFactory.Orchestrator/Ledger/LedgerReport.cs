@@ -189,12 +189,12 @@ public static class LedgerReport
             $"{r.Role} ({Code(r.ServedName)}{(r.CarriedFrom is { } from ? $", carried from {Code(Ci.Short(from))}" : "")}"
             + $"{(r.Error is null ? "" : ", unusable answer")})")));
         text.Append(CultureInfo.InvariantCulture,
-            $"; {blocking.Count} blocking, {findings.Count - blocking.Count} optional ({findings.Count(f => f.Finding.Downgraded)} downgraded by the second model)\n");
+            $"; {blocking.Count} blocking, {findings.Count - blocking.Count} optional ({findings.Count(f => f.Finding.Downgraded)} downgraded by the second opinion)\n");
         foreach (var (role, finding) in blocking.Take(MaxBlockingFindingsShown))
         {
             var how = finding.Confirmation is { Outcome: Confirmation.Confirmed } c ? $"confirmed by {Code(c.ServedName)}"
-                : finding.Confirmation is not null ? "the second model's answer was unusable"
-                : "not checked by a second model";
+                : finding.Confirmation is not null ? "the second opinion was unusable"
+                : "not checked by a second opinion";
             text.Append(CultureInfo.InvariantCulture, $"  - blocking {role} finding, {how}: {Code(finding.ToString())}\n");
         }
         if (blocking.Count > MaxBlockingFindingsShown)

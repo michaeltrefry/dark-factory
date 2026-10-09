@@ -751,7 +751,7 @@ public class ReviewPanelTests
 
     [Theory]
     [InlineData(Confirmation.Confirmed, "confirmed by claude-sonnet-5")]
-    [InlineData(Confirmation.Unusable, "the second model's answer was unusable")]
+    [InlineData(Confirmation.Unusable, "the second opinion was unusable")]
     public void A_confirmed_or_unconfirmable_blocking_finding_fails(string outcome, string reason)
     {
         var finding = Blocking.ConfirmedBy(Answer(outcome));

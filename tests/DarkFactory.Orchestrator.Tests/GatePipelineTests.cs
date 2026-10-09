@@ -964,7 +964,7 @@ public class GatePipelineTests
         var outcome = await h.Run();
 
         Assert.Equal(WorkState.Escalated, outcome.State);
-        Assert.Contains("the second model's answer was unusable", outcome.Error);
+        Assert.Contains("the second opinion was unusable", outcome.Error);
         Assert.Empty(h.Merges);
     }
 

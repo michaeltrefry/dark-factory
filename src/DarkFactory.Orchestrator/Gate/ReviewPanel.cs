@@ -91,7 +91,7 @@ public sealed record Confirmation(
 
     /// <summary>The served model as reports name it.</summary>
     [JsonIgnore]
-    public string ServedName => ServedModel ?? "an unnamed model";
+    public string ServedName => ServedModel ?? "(the router named no served model)";
 }
 
 /// <summary>One finding of a panel role. <see cref="Downgraded"/>: it was blocking, and the second model did not confirm it.</summary>
@@ -144,7 +144,7 @@ public sealed record RoleReview(
 
     /// <summary>The served model as reports name it.</summary>
     [JsonIgnore]
-    public string ServedName => ServedModel ?? "an unnamed model";
+    public string ServedName => ServedModel ?? "(the router named no served model)";
 }
 
 public static class ReviewPanel
@@ -171,8 +171,8 @@ public static class ReviewPanel
             foreach (var finding in review.Findings.Where(f => f.IsBlocking))
             {
                 var how = finding.Confirmation is { Outcome: Confirmation.Confirmed } c ? $"confirmed by {c.ServedName}"
-                    : finding.Confirmation is { } u ? $"unconfirmed, the second model's answer was unusable: {u.Reason}"
-                    : "not checked by a second model";
+                    : finding.Confirmation is { } u ? $"unconfirmed, the second opinion was unusable: {u.Reason}"
+                    : "not checked by a second opinion";
                 problems.Add($"blocking {review.Role} finding by {review.ServedName}, {how}: {finding} — {finding.Detail}");
             }
         }

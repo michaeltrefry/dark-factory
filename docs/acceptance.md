@@ -186,7 +186,10 @@ Owner set-up, once (the test skips naming whichever is missing):
 No reviewer model is set anywhere (owner decision 2026-10-09, epic E8, sc-25626): every review and second opinion names
 the router's `high` model class (`x-weave-model-class: high`, never `x-weave-force-model`) and the router picks the model,
 so the router must have a servable `high` class (its `model_tiers`/`model_classes`; a `model_class_unavailable` 503 pauses
-the factory for usage). A call counts only when the router's `X-Weave-Model-Class` response header says `high`. The retired
+the factory for usage). The factory's router key must have no routing-policy caller passthrough and no blind-experiment
+passthrough arm: that path 503s `model_class_unavailable` for a class request whose body model (`default`) is outside the
+class, which would usage-pause every review in a loop. A call counts only when the router's `X-Weave-Model-Class` response
+header says `high`. The retired
 `Review:*Models` settings are refused: with one set, these tests, the seeded review (`ReviewSeedTests`) and the Phase 1
 AT1–AT5 runs skip naming it, and `factory run`/`factory work` print the reason and exit 2.
 
