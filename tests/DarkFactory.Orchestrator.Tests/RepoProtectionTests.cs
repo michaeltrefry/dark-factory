@@ -282,14 +282,20 @@ public class RepoProtectionTests
     [Fact]
     public async Task Duplicate_ruleset_names_overwrite_the_first_instead_of_crashing()
     {
-        var github = new GitHubRulesets((77, Named(RepoProtection.MainRulesetName)), (79, Named(RepoProtection.MainRulesetName)));
+        var github = new GitHubRulesets((77, Named(RepoProtection.MainRulesetName)), (79, Named(RepoProtection.MainRulesetName)),
+            (81, Named(RepoProtection.MainRulesetName)), (83, Named("someone else's")), (84, Named("someone else's")));
+        var log = new StringWriter();
 
-        await Protection(github.Api).ApplyAsync(Sandbox, CancellationToken.None);
+        await new RepoProtection(github.Api.Client("https://api.github.com/"), "gho_admin", log).ApplyAsync(Sandbox, CancellationToken.None);
 
         var api = github.Api;
         Assert.Equal(["GET", "PUT", "GET", "POST", "GET", "POST", "GET"], api.Requests.Select(r => r.Method.Method));
         Assert.Equal($"{Rulesets}/77", api.Requests[1].PathAndQuery);
-        Assert.DoesNotContain(api.Requests, r => r.PathAndQuery.EndsWith("/79"));
+        Assert.DoesNotContain(api.Requests, r => r.PathAndQuery.EndsWith("/79") || r.PathAndQuery.EndsWith("/81"));
+        // The duplicates are left alone but named, since they still apply; an unmanaged name's duplicates are not ours to report.
+        var warning = Assert.Single(log.ToString().Split(Environment.NewLine), l => l.StartsWith("warning:", StringComparison.Ordinal));
+        Assert.Equal($"warning: {Sandbox} also has ruleset id(s) 79, 81 named '{RepoProtection.MainRulesetName}', left unchanged and "
+            + "unverified; they still apply. Delete them in the repository's rulesets settings if stale.", warning);
     }
 
     [Theory]

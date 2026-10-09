@@ -111,7 +111,8 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
 
     /// <summary>
     /// Creates each missing ruleset and overwrites any existing one with the same name, then reads each back and
-    /// throws (naming every difference) unless GitHub holds exactly what was sent.
+    /// throws (naming every difference) unless GitHub holds exactly what was sent. Of several existing rulesets with one
+    /// managed name only the first is written; the others are left as they are and named in a warning, since they still apply.
     /// </summary>
     public async Task ApplyAsync(RepoRef repo, CancellationToken ct)
     {
@@ -120,9 +121,10 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
         using var listResponse = await http.SendAsync(list, ct);
         await EnsureSuccess(listResponse, repo, "list rulesets", ct);
         // GitHub does not enforce unique ruleset names; overwrite the first of any duplicates.
-        var existing = (await listResponse.Content.ReadFromJsonAsync<ExistingRuleset[]>(ct))!
+        var byName = (await listResponse.Content.ReadFromJsonAsync<ExistingRuleset[]>(ct))!
             .GroupBy(r => r.Name)
-            .ToDictionary(g => g.Key, g => g.First().Id);
+            .ToDictionary(g => g.Key, g => g.Select(r => r.Id).ToList());
+        var existing = byName.ToDictionary(e => e.Key, e => e.Value[0]);
 
         foreach (var ruleset in DesiredRulesets(gateAppId))
         {
@@ -152,6 +154,11 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
                     string.Join($"{Environment.NewLine}  ", differences));
             }
             log.WriteLine($"verified ruleset '{ruleset.Name}' on {repo}");
+            if (byName.TryGetValue(ruleset.Name, out var ids) && ids.Count > 1)
+            {
+                log.WriteLine($"warning: {repo} also has ruleset id(s) {string.Join(", ", ids.Skip(1))} named '{ruleset.Name}', "
+                    + $"left unchanged and unverified; they still apply. Delete them in the repository's rulesets settings if stale.");
+            }
         }
     }
 

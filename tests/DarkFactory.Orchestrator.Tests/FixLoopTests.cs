@@ -150,7 +150,7 @@ public class FixLoopTests
         Assert.Empty(h.Merges);
         var comment = h.Stories.Comments.Single();
         Assert.Contains("after 3 fix rounds", comment);
-        Assert.Contains("[correctness] the tests do not cover the empty string (src/x.cs:1), confirmed by claude-opus-5 — WordCount(\"\") is untested", comment);
+        Assert.Contains("[correctness] the tests do not cover the empty string (src/x.cs:1), confirmed by claude-sonnet-5 — WordCount(\"\") is untested", comment);
     }
 
     [Fact]

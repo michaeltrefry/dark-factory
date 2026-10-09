@@ -75,8 +75,7 @@ public class ReviewSeedTests
                 + string.Join("; ", review.Findings.Select(f => $"[{f.Severity}] {f} — {f.Detail}")));
         }
 
-        var confirmer = ReviewerChoice.ChooseConfirmer(Harness.Options.ReviewPanel.Confirm,
-            new[] { review.Model, review.ServedModel }.OfType<string>().Distinct().ToList());
+        var confirmer = ReviewerChoice.ChooseConfirmer(Harness.Options.ReviewPanel.Confirm, [review.Model], review.ServedModel);
         var confirmation = await reviewer.ConfirmAsync(new ConfirmRequest(Story, "michaeltrefry/dark-factory-sandbox", Pull, diff, Files,
             ReviewRoles.SpecConformance, finding, ReviewPrompts.Confirm, confirmer, Guid.NewGuid().ToString()), ct);
         Assert.True(confirmation.Outcome == Confirmation.Confirmed,
