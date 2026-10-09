@@ -153,7 +153,7 @@ public static class FactoryRunner
     public static async Task PollIssuesAsync(FactoryOptions options, IntakeStatus status, TextWriter log, CancellationToken ct)
     {
         using var githubHttp = OutboundHttp.GitHubApi();
-        var intake = new Issues.IssueIntake(IssuesClient(options, githubHttp), options.WatchedIssueRepos, Contexts(options),
+        var intake = new Issues.IssueIntake(CreateIssueSource(options, githubHttp), options.WatchedIssueRepos, Contexts(options),
             new PostgresRunLocks(options.LedgerConnectionString), Controls(options), new SandboxTriageRunner(options, log), status,
             options.MaxItemFailures, TimeProvider.System, log);
         await intake.PollAsync(ct);
@@ -311,15 +311,28 @@ public sealed class FactoryItemStops(FactoryOptions options, IWorkSource source,
 /// <summary>
 /// Production <see cref="Issues.ITriageRunner"/>: one triage session as a sandboxed worker, like an item's run — the worker run lock,
 /// the sandbox readiness check (both factory-wide failures, E10), the router-only worker, its events stored (E7) — in a worktree whose
-/// owner-side git holds a contents-read token only (<see cref="Issues.WorkerTriageRunner.TriageWorkspaceToken"/>).
+/// owner-side git holds a contents-read token only (<see cref="Issues.WorkerTriageRunner.TriageWorkspaceToken"/>). The worker is
+/// read-only (<see cref="WorkerTools.ReadOnly"/>: Read, Glob, Grep; E4), and never runs unsandboxed (refused, factory-wide). Its
+/// worktree lives under its own root (<see cref="TriageWorktrees"/>) that no item's run uses, swept of leftovers before each triage
+/// (triages run one at a time, under the worker run lock), and is not shared for writing: the worker user reads it through the work
+/// root's inherited read entry (<c>setup-worker-user.sh</c>) and cannot write it.
 /// </summary>
 public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) : Issues.ITriageRunner
 {
+    /// <summary>The work root's directory of triage worktrees, apart from the items' <c>worktrees</c>.</summary>
+    public const string TriageWorktrees = "triage-worktrees";
+
     public async Task<WorkerResult> RunAsync(WorkItem item, RepoRef repo, string prompt, Func<string, CancellationToken, Task> onSession,
         Func<string, string, CancellationToken, Task> onTaint, CancellationToken ct)
     {
         var routerKey = options.RouterKey;
         var sandbox = options.WorkerSandbox;
+        if (sandbox is null)
+        {
+            // factory work refuses to start like this (Program); a triage reached any other way is refused here, factory-wide.
+            var refusal = Issues.IssueIntake.UnsandboxedRefusal(sandbox, [repo])!;
+            throw new FactoryUnavailableException($"the issue triage: {refusal}", new InvalidOperationException(refusal));
+        }
         using var sandboxLock = sandbox is null ? null : await FactoryWideStep("the worker run lock", () => WorkerLock.Acquire(options.WorkRoot));
         if (sandbox is not null)
         {
@@ -329,9 +342,19 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         using var routerHttp = OutboundHttp.RouterApi(options.RouterBaseUrl);
         var app = new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System);
         var workspaces = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
-            async (r, c) => (await app.CreateInstallationTokenAsync(r, c, Issues.WorkerTriageRunner.TriageWorkspaceToken)).Token, sandbox: sandbox);
+            async (r, c) => (await app.CreateInstallationTokenAsync(r, c, Issues.WorkerTriageRunner.TriageWorkspaceToken)).Token, sandbox: sandbox,
+            worktreesDirectory: TriageWorktrees, shareWithWorker: false);
+        // Under the worker run lock no other triage runs: whatever a crashed or unstoppable one left is swept (nothing resumes a triage).
+        try
+        {
+            await workspaces.SweepOrphansAsync((_, _) => Task.FromResult(false), ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new FactoryUnavailableException($"the triage worktree sweep: {ex.Message}", ex);
+        }
         var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, sandbox,
-            pauseFlagDirectory: options.PauseFlagDirectory);
+            pauseFlagDirectory: options.PauseFlagDirectory, tools: WorkerTools.ReadOnly);
         var sessions = new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)),
             new RouterClient(routerHttp, routerKey), TimeProvider.System, log, costSettleDelay: options.CostSettleDelay);
         return await new Issues.WorkerTriageRunner(workspaces, worker, sessions, log).RunAsync(item, repo, prompt, onSession, onTaint, ct);

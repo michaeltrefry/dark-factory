@@ -231,15 +231,6 @@ public sealed class RouterReviewer(HttpClient http, string routerKey) : IReviewe
 
     private static string Cut(string s, int max) => s.Length > max ? s[..max] : s;
 
-    private static readonly Regex FenceCloser = new(@"<\s*/\s*(story|files|diff|finding|ci-log)\s*>", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-
-    /// <summary>
-    /// Text written by others (the story, the repository's paths, the diff, a reviewer's finding, a CI log) with every closing tag of
-    /// the prompt's data blocks neutralised (<c>&lt;/diff&gt;</c> becomes <c>&lt;\/diff&gt;</c>), so it cannot end its block
-    /// early and put text outside the "data written by others" fence the prompts rely on.
-    /// </summary>
-    public static string Fenced(string? text) => FenceCloser.Replace(text ?? "", m => $"<\\/{m.Groups[1].Value}>");
-
     public static string BuildPrompt(ReviewRequest request) =>
         Context(request.Story, request.Repo, request.Pull, request.Files, request.Diff);
 
@@ -248,12 +239,17 @@ public sealed class RouterReviewer(HttpClient http, string routerKey) : IReviewe
         {Context(request.Story, request.Repo, request.Pull, request.Files, request.Diff)}
 
         The {request.Role} reviewer's blocking finding:
-        <finding>
-        Title: {Fenced(request.Finding.Title)}
-        Where: {Fenced(request.Finding.File ?? "(no file named)")}{(request.Finding.Line is { } line ? $":{line}" : "")}
-        Detail: {Fenced(request.Finding.Detail)}
-        </finding>
+        {FindingBlock(request.Finding)}
         """;
+
+    /// <summary>
+    /// A reviewer's finding as a <c>&lt;finding&gt;</c> block (<see cref="PromptFence"/>): its title, where and detail are model text, so
+    /// they are data, not instructions. <paramref name="role"/>, when given, is the factory's own name of the reviewer's role.
+    /// </summary>
+    public static string FindingBlock(Finding finding, string? role = null) =>
+        PromptFence.Block("finding",
+            (role is null ? "" : $"Role: {role}\n")
+            + $"Title: {finding.Title}\nWhere: {finding.File ?? "(no file named)"}{(finding.Line is { } line ? $":{line}" : "")}\nDetail: {finding.Detail}");
 
     private static string Context(WorkStory story, string repo, PullFacts pull, RepoFiles files, string diff)
     {
@@ -262,22 +258,16 @@ public sealed class RouterReviewer(HttpClient http, string routerKey) : IReviewe
         return $"""
             Repository: {repo}
             Pull request: {pull.HtmlUrl} (head {pull.HeadSha}, base {pull.BaseRef})
-            {story.Kind.Noun} {story.Ref} ({story.StoryType}): {Fenced(story.Name)}
+            {story.Kind.Noun} {story.Ref} ({story.StoryType}), named and described in the <story> block.
 
-            Story description:
-            <story>
-            {Fenced(story.Description)}
-            </story>
+            Story:
+            {PromptFence.Block("story", $"Name: {story.Name}\n\n{story.Description}")}
 
             Files in the repository at the base commit ({shown.Count}{(cut ? ", list cut short" : "")}):
-            <files>
-            {Fenced(string.Join('\n', shown))}
-            </files>
+            {PromptFence.Block("files", string.Join('\n', shown))}
 
             The change (unified diff of the head commit against its base):
-            <diff>
-            {Fenced(diff)}
-            </diff>
+            {PromptFence.Block("diff", diff)}
             """;
     }
 }

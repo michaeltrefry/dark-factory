@@ -59,21 +59,28 @@ public delegate Task<string> GitCommand(string cwd, IReadOnlyDictionary<string, 
 /// own git worktree on <c>factory/sc-&lt;id&gt;</c>. Network git calls authenticate
 /// with an installation token passed through git's environment-based config, so
 /// the token never appears in argv, remotes or files.
-/// With a sandbox, each fresh worktree is shared with the worker user; owner-side git
+/// With a sandbox, each fresh worktree is shared with the worker user (unless <paramref name="shareWithWorker"/> is false: a
+/// read-only session's worktree, which the worker user reads through the work root's inherited read entry and cannot write); owner-side git
 /// on it always names the git dir explicitly, so a worker-edited <c>.git</c> file can't
-/// point the owner's git at a repository (config, hooks) the worker controls.
+/// point the owner's git at a repository (config, hooks) the worker controls. <paramref name="worktreesDirectory"/> is the work
+/// root's directory the worktrees live in (and <see cref="SweepOrphansAsync"/> sweeps).
 /// </summary>
 public sealed class GitWorkspace(
     string workRoot,
     Func<RepoRef, string> remoteUrl,
     Func<RepoRef, CancellationToken, Task<string?>> token,
     GitCommand? git = null,
-    IWorkerSandbox? sandbox = null)
+    IWorkerSandbox? sandbox = null,
+    string worktreesDirectory = GitWorkspace.ItemWorktrees,
+    bool shareWithWorker = true)
     : IRepoWorkspace
 {
     private readonly GitCommand _git = git ?? RunGitAsync;
 
     public const string BranchPrefix = "factory/";
+
+    /// <summary>The work root's directory of the items' worktrees (a triage's live apart, <see cref="SandboxTriageRunner.TriageWorktrees"/>).</summary>
+    public const string ItemWorktrees = "worktrees";
     private const string CommitterName = "dark-factory[bot]";
     private const string CommitterEmail = "dark-factory@users.noreply.github.com";
 
@@ -118,7 +125,7 @@ public sealed class GitWorkspace(
         Directory.CreateDirectory(worktree);
         try
         {
-            if (sandbox is not null)
+            if (sandbox is not null && shareWithWorker)
             {
                 // Share the empty directory and let the checkout inherit the ACL; sharing afterwards
                 // would follow committed symlinks out of the worktree.
@@ -303,7 +310,7 @@ public sealed class GitWorkspace(
 
     private string ClonePath(RepoRef repo) => Path.Combine(workRoot, "repos", repo.Owner, repo.Name);
 
-    private string WorktreesRoot => Path.Combine(workRoot, "worktrees");
+    private string WorktreesRoot => Path.Combine(workRoot, worktreesDirectory);
 
     private string WorktreePath(RepoRef repo, string branch) =>
         Path.Combine(WorktreesRoot, repo.Owner, repo.Name, branch.Replace('/', '-'));

@@ -63,6 +63,19 @@ public interface IWorkSource
     /// <summary>How this source's items are named in the ledger and on git (default: Shortcut stories).</summary>
     ItemNaming Naming => ItemNaming.Shortcut;
 
+    /// <summary>
+    /// How many claim refusals in a row an item may get before its run escalates it instead of parking it again (E10), for a source
+    /// that lists a refused item again by itself (<see cref="ListReadyAsync"/>); null for a source that lists a refused item only once
+    /// the board makes it ready again (Shortcut: the story back in To Do), which is no failure.
+    /// </summary>
+    int? MaxClaimRefusals => null;
+
+    /// <summary>
+    /// What a human does to bring an item that left the watch scope back into it, in this board's terms (posted on the item when it is
+    /// parked out of scope): one sentence fragment, completed by ", or run `factory run … --ignore-scope`, to resume it."
+    /// </summary>
+    string ScopeReturnHint => "Move it back into scope and to To Do";
+
     /// <summary>Items ready for the factory, inside the configured watch scope; never items another claimant holds.</summary>
     Task<IReadOnlyList<int>> ListReadyAsync(CancellationToken ct);
 

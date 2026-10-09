@@ -148,8 +148,10 @@ public class WorkerTaintTests
     {
         var dir = Directory.CreateTempSubdirectory("df-taint-").FullName;
         var envDump = Path.Combine(dir, "env.txt");
+        var argsDump = Path.Combine(dir, "args.txt");
         var script = Script(dir, $$"""
             env > "{{envDump}}"
+            printf '%s\n' "$@" > "{{argsDump}}"
             echo '{"type":"system","subtype":"init","session_id":"triage-1"}'
             {{WebFetchLine}}
             echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"triage-1"}'
@@ -162,7 +164,7 @@ public class WorkerTaintTests
             var ledger = new WorkLedger(db, TimeProvider.System);
             var item = await ledger.GetOrCreateAsync("github", "gh-1", "t", "acme/widgets", null, CancellationToken.None);
             var workspaces = new LocalWorkspaces(dir);
-            var worker = new ClaudeWorker(script, Router, "rk_worker", WorkerAuth.RouterKey, TimeSpan.FromMinutes(1));
+            var worker = new ClaudeWorker(script, Router, "rk_worker", WorkerAuth.RouterKey, TimeSpan.FromMinutes(1), tools: WorkerTools.ReadOnly);
             var seen = new List<string>();
 
             var result = await new WorkerTriageRunner(workspaces, worker, null, TextWriter.Null).RunAsync(item, new RepoRef("acme", "widgets"),
@@ -178,6 +180,10 @@ public class WorkerTaintTests
             Assert.DoesNotContain("ghs_", env);
             Assert.DoesNotContain("GH_TOKEN", env);
             Assert.DoesNotContain("GITHUB_TOKEN", env);
+            // The session claude was started as holds no write or exec tool (E4): read-only allowlist, a mode that denies the rest.
+            var args = File.ReadAllLines(argsDump).ToList();
+            Assert.Equal("dontAsk", args[args.IndexOf("--permission-mode") + 1]);
+            Assert.Equal(["Read", "Glob", "Grep"], args.Skip(args.IndexOf("--allowedTools") + 1).TakeWhile(a => !a.StartsWith("--", StringComparison.Ordinal)));
             Assert.Equal(["taint issue-text", "session triage-1", "taint web:WebFetch"], seen);
             Assert.Equal(Taint.IssueText, (await ledger.TaintOfAsync("triage-1", CancellationToken.None))!.Reason);
             // Its work is never pushed, and a push of it is refused: no grant, so no token.

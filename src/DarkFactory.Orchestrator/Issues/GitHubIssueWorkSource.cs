@@ -7,6 +7,36 @@ using Microsoft.EntityFrameworkCore;
 namespace DarkFactory.Orchestrator.Issues;
 
 /// <summary>
+/// What the issue intake (<see cref="IssueIntake"/>) reads and writes on the GitHub issue board: an optional capability of the issue
+/// source's <see cref="IWorkSource"/>, so the intake touches the board only through its work source (E6) — the triage comment and the
+/// route's label (the writes), the issues, comments, permissions and gate policy it routes by (the reads). The Shortcut board has no
+/// intake triage and does not implement it.
+/// </summary>
+public interface IIssueIntakeSource : IWorkSource
+{
+    /// <summary>The id of the App whose tokens write the factory's comments (its own comments are recognised by it).</summary>
+    long AppId { get; }
+
+    /// <summary>Open issues of <paramref name="repo"/> updated at or after <paramref name="since"/>, least recently updated first.</summary>
+    Task<IReadOnlyList<IssueFacts>> ListUpdatedAsync(RepoRef repo, DateTimeOffset since, CancellationToken ct);
+
+    /// <summary>Every comment of the issue, oldest first.</summary>
+    Task<IReadOnlyList<IssueComment>> ListCommentsAsync(RepoRef repo, int number, CancellationToken ct);
+
+    /// <summary>The user's permission on the repo.</summary>
+    Task<RepoPermission> PermissionAsync(RepoRef repo, string login, CancellationToken ct);
+
+    /// <summary>The repo's <c>factory/gate.yaml</c> on its default branch, or null when it has none.</summary>
+    Task<string?> GatePolicyAsync(RepoRef repo, CancellationToken ct);
+
+    /// <summary>Posts the orchestrator's triage comment (attributed) on the issue; returns its id.</summary>
+    Task<long> PostTriageAsync(RepoRef repo, int number, string body, CancellationToken ct);
+
+    /// <summary>Puts the route's <paramref name="label"/> on the issue and takes off the other route labels it <paramref name="carries"/>.</summary>
+    Task LabelRouteAsync(RepoRef repo, int number, string label, IReadOnlyCollection<string> carries, CancellationToken ct);
+}
+
+/// <summary>
 /// GitHub issues as a work source (sc-25385), behind <see cref="IWorkSource"/> like the Shortcut board (E6). An item is a watched
 /// repo's issue that <see cref="IssueIntake"/> triaged and released (<see cref="IssueSteps.Released"/>); its id is the issue's
 /// ledger key (<c>gh-&lt;key&gt;</c>). Its spec is the released triage only — never the issue's own title or body (E4) — and
@@ -16,13 +46,52 @@ namespace DarkFactory.Orchestrator.Issues;
 /// is not the default).
 /// </summary>
 public sealed class GitHubIssueWorkSource(IGitHubIssues issues, IDbContextFactory<LedgerDbContext> contexts, IReadOnlyList<RepoRef> watched,
-    TimeProvider? time = null) : IWorkSource
+    TimeProvider? time = null) : IIssueIntakeSource
 {
     private readonly TimeProvider _time = time ?? TimeProvider.System;
 
     public ItemNaming Naming => ItemNaming.GitHubIssue;
 
-    /// <summary>Released items not running yet: parked (or new) in Intake with a release recorded after their last transition, in a watched repo.</summary>
+    /// <summary>
+    /// Claim refusals in a row before the run escalates a released issue (<see cref="IWorkSource.MaxClaimRefusals"/>): a refused
+    /// claim is listed again on the next poll (<see cref="ListReadyAsync"/>), each refusal recorded, and the last one escalates.
+    /// </summary>
+    public const int ClaimRefusals = 3;
+
+    public int? MaxClaimRefusals => ClaimRefusals;
+
+    public string ScopeReturnHint => "Add its repo back to GitHub:Watch:Repos";
+
+    public long AppId => issues.AppId;
+
+    public Task<IReadOnlyList<IssueFacts>> ListUpdatedAsync(RepoRef repo, DateTimeOffset since, CancellationToken ct) =>
+        issues.ListUpdatedAsync(repo, since, ct);
+
+    public Task<IReadOnlyList<IssueComment>> ListCommentsAsync(RepoRef repo, int number, CancellationToken ct) =>
+        issues.ListCommentsAsync(repo, number, ct);
+
+    public Task<RepoPermission> PermissionAsync(RepoRef repo, string login, CancellationToken ct) => issues.PermissionAsync(repo, login, ct);
+
+    public Task<string?> GatePolicyAsync(RepoRef repo, CancellationToken ct) => issues.GetFileAsync(repo, Gate.GatePolicy.Path, ct);
+
+    public Task<long> PostTriageAsync(RepoRef repo, int number, string body, CancellationToken ct) =>
+        issues.CommentAsync(repo, number, WorkSourceComments.Attributed(body), ct);
+
+    public async Task LabelRouteAsync(RepoRef repo, int number, string label, IReadOnlyCollection<string> carries, CancellationToken ct)
+    {
+        await issues.AddLabelsAsync(repo, number, [label], ct);
+        // A re-triage that changed the route takes the other route's label off.
+        foreach (var stale in new[] { IssueLabels.AwaitingApproval, IssueLabels.NeedsHuman }.Where(l => l != label && carries.Contains(l)))
+        {
+            await issues.RemoveLabelAsync(repo, number, stale, ct);
+        }
+    }
+
+    /// <summary>
+    /// Released items not running yet, in a watched repo: parked (or new) in Intake with a release recorded after their last
+    /// transition, or released and parked by a refused claim (<see cref="RunPipeline.ClaimRefused"/>) fewer than
+    /// <see cref="ClaimRefusals"/> times in a row, so a refusal is retried on the next poll rather than never.
+    /// </summary>
     public async Task<IReadOnlyList<int>> ListReadyAsync(CancellationToken ct)
     {
         await using var db = await contexts.CreateDbContextAsync(ct);
@@ -34,7 +103,10 @@ public sealed class GitHubIssueWorkSource(IGitHubIssues issues, IDbContextFactor
             var last = history.FindLastIndex(e => e.Step is null);
             var waitsInIntake = item.State == WorkState.Intake
                 || TransitionContext.From(history.Where(e => e.Step is null).Select(e => e.State).ToList()).PausedFrom == WorkState.Intake;
-            if (waitsInIntake && history.Skip(last + 1).Any(e => e.Step == IssueSteps.Released) && Naming.TryParse(item.ExternalId, out var id)
+            var released = history.Skip(last + 1).Any(e => e.Step == IssueSteps.Released)
+                || (last >= 0 && history[last] is { State: WorkState.Paused } paused && RunPipeline.IsClaimRefused(paused.Detail)
+                    && history.Any(e => e.Step == IssueSteps.Released) && RunPipeline.ClaimRefusalsInARow(history) < ClaimRefusals);
+            if (waitsInIntake && released && Naming.TryParse(item.ExternalId, out var id)
                 && await RowAsync(db, id, ct) is { } row && Watched(row.Repo))
             {
                 ready.Add(id);
