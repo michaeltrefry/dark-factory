@@ -253,6 +253,10 @@ public class GatePipelineTests
         /// <summary>How often a run's controls are polled while a worker or the gate's test runs execute (the pipeline's default when null).</summary>
         public TimeSpan? ControlPoll { get; init; }
         public WorkLedger Ledger => new(Db, TimeProvider.System);
+        /// <summary>The ledger's contexts (for a freeze evaluator, or to seed other items beside the run's).</summary>
+        public LedgerDbContextFactory Contexts => new(_options);
+        /// <summary>When set, the run's freeze evaluator (sc-25387) checks these thresholds, on the system clock and <see cref="GitHub"/>.</summary>
+        public FreezeOptions? Freeze { get; init; }
 
         public Task<RunOutcome> Run(string? implementerModel = ImplementerModel, CancellationToken ct = default) =>
             Run([implementerModel], ct);
@@ -262,7 +266,8 @@ public class GatePipelineTests
                     controls: Controls,
                     controlPollInterval: ControlPoll,
                     gate: new GateStage(GitHub, Panel ?? Reviewer, Models, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5), GateOnFakeClock ? Time : null,
-                        TestRunner))
+                        TestRunner),
+                    freeze: Freeze is null ? null : new FactoryFreeze(Contexts, Controls, Freeze, TimeProvider.System, GitHub))
                 .RunAsync(77, ct);
 
         /// <summary>The implementer reports <c>implementerModels</c>; every later session (a fixer) reports <see cref="FixerModels"/>.</summary>

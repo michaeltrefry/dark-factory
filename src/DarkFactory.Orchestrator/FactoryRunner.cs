@@ -131,6 +131,17 @@ public static class FactoryRunner
     private static GitHubIssuesClient IssuesClient(FactoryOptions options, HttpClient githubHttp) =>
         new(githubHttp, new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System));
 
+    /// <summary>
+    /// A freeze evaluator over the ledger and the gate App's view of GitHub (main-red), for the intake loop's per-poll check. Its
+    /// HttpClient lives as long as the evaluator (the host's life).
+    /// </summary>
+    public static FactoryFreeze CreateFreeze(FactoryOptions options)
+    {
+        var http = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        var gateApp = new GitHubApp(http, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System);
+        return new FactoryFreeze(Contexts(options), Controls(options), options.Freeze, TimeProvider.System, new GitHubGate(http, gateApp));
+    }
+
     private static LedgerDbContextFactory Contexts(FactoryOptions options) =>
         new(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
 

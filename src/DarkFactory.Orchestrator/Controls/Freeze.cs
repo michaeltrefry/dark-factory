@@ -98,22 +98,27 @@ public sealed record MergeFiles(string Base, IReadOnlyList<string> Files)
 }
 
 /// <summary>
-/// The factory-wide automatic freeze (sc-25387). <see cref="CheckAsync"/> runs before every dispatch (<see cref="RunPipeline.RunAsync"/>):
+/// The factory-wide automatic freeze (sc-25387). <see cref="CheckAsync"/> runs before every dispatch (<see cref="RunPipeline.RunAsync"/>),
+/// before every step and worker session of a run, before a merge-queue base-update push, right before a merge, and at the start
+/// of every intake poll (before triage):
 /// a freeze in the ledger (<see cref="ControlScope.Freeze"/>) holds until a human's Continue; otherwise each trigger is checked
 /// on the ledger (and, for main-red, GitHub) and the first that holds is written as the freeze before the dispatch is deferred.
 /// <para>
 /// Continue rule: a human's Continue clears the freeze and starts a fresh count — only events recorded after it (escalations,
 /// merges, fix rounds) can freeze the factory again, so a Continue is never undone by the evidence it acknowledged, and a new
-/// occurrence after it freezes again. The trigger rules, each over the events after the last Continue:
+/// occurrence after it freezes again. The trigger rules, each but main-red over the events after the last Continue:
 /// consecutive-failures — the trailing run of Escalated rows with no Merge row after them covers
 /// <see cref="FreezeOptions.MaxConsecutiveFailures"/> distinct items; hot-file — one file of one repo is in the recorded files of
 /// <see cref="FreezeOptions.HotFileMerges"/> factory merges within <see cref="FreezeOptions.HotFileWindow"/>; cost-rising — an
 /// active item's rounds (its last Implement, then each fix round, <see cref="TransitionContext.IsFixRound"/>) cost (the router
 /// cost of the worker sessions started in each) strictly more each round over the last
 /// <see cref="FreezeOptions.CostRisingRounds"/> rises, the newest round started after the Continue and every one of those rounds'
-/// costs recorded (an unrecorded cost is not evidence of either kind); main-red — for each repo, the base branch's head after
-/// the latest factory merge into it is red by the gate's CI rule (<see cref="Ci.Evaluate"/>: a failed check, or checks that
-/// could not all be read; pending is not red).
+/// costs recorded (an unrecorded cost is not evidence of either kind), merged items (Merge, Watch) not active; main-red — a
+/// state, not an event: for each repo, the base branch's head after its latest factory merge over all history is red by the
+/// gate's CI rule (<see cref="Ci.Evaluate"/>: a failed check, or checks that could not all be read; pending is not red), unless
+/// that very head is one a Continue acknowledged (the cleared freeze's <see cref="RedTipMarker"/> lines, carried into later
+/// freezes) — once the head moves and is still red, it freezes again. Main-red's GitHub reads are reused by this evaluator for
+/// <see cref="MainRedCacheTtl"/> unless a check asks for them fresh (the one right before a merge).
 /// </para>
 /// <para>
 /// An unreadable freeze record counts as frozen; a trigger that cannot be checked (the ledger or GitHub unreadable) defers the
@@ -125,7 +130,21 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
 {
     private sealed record Hit(string Trigger, string Detail);
 
-    public async Task<FreezeStatus> CheckAsync(CancellationToken ct)
+    /// <summary>How long a main-red read (the base tip after a merge, and that tip's CI) is reused by later checks of this evaluator.</summary>
+    public static readonly TimeSpan MainRedCacheTtl = TimeSpan.FromSeconds(30);
+
+    /// <summary>The line a main-red freeze's Detail carries per red tip; a Continue of that freeze acknowledges exactly that tip.</summary>
+    internal const string RedTipMarker = "red-tip ";
+
+    private readonly Lock _cacheGate = new();
+    private readonly Dictionary<(string Repo, string Base, string Merge), (DateTimeOffset At, string Tip)> _tips = [];
+    private readonly Dictionary<(string Repo, string Tip), (DateTimeOffset At, CiState State, string Why)> _ci = [];
+
+    /// <summary>
+    /// Whether the factory is frozen now. <paramref name="fresh"/>: read main-red from GitHub now rather than reuse a read younger
+    /// than <see cref="MainRedCacheTtl"/> (the check right before a merge); the ledger triggers are always read fresh.
+    /// </summary>
+    public async Task<FreezeStatus> CheckAsync(CancellationToken ct, bool fresh = false)
     {
         Control? row;
         try
@@ -143,7 +162,7 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
         Hit? hit;
         try
         {
-            hit = await FindTriggerAsync(row?.ChangedAt, ct);
+            hit = await FindTriggerAsync(row?.ChangedAt, Acknowledged(row), fresh, ct);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
@@ -155,6 +174,9 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
         }
         try
         {
+            // Red tips a Continue acknowledged stay acknowledged through a later freeze's Continue (they are carried over).
+            var carried = Acknowledged(row).Where(m => !hit.Detail.Contains(m, StringComparison.Ordinal)).ToList();
+            hit = hit with { Detail = carried.Count == 0 ? hit.Detail : $"{hit.Detail}\n{string.Join("\n", carried)}" };
             var stored = await controls.FreezeAsync(hit.Trigger, hit.Detail, row?.ChangedAt, ct);
             if (stored.State != ControlState.Running)
             {
@@ -169,7 +191,15 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
         }
     }
 
-    private async Task<Hit?> FindTriggerAsync(DateTimeOffset? since, CancellationToken ct)
+    /// <summary>The red tips the last Continue acknowledged: the <see cref="RedTipMarker"/> lines of the cleared freeze's Detail.</summary>
+    private static List<string> Acknowledged(Control? row) =>
+        row is { State: ControlState.Running, Detail: { } detail }
+            ? detail.Split('\n').Where(l => l.StartsWith(RedTipMarker, StringComparison.Ordinal)).Distinct(StringComparer.Ordinal).ToList()
+            : [];
+
+    private static string RedTip(string repo, string baseRef, string tip) => $"{RedTipMarker}{repo.ToLowerInvariant()}@{baseRef} {tip}";
+
+    private async Task<Hit?> FindTriggerAsync(DateTimeOffset? since, List<string> acknowledged, bool fresh, CancellationToken ct)
     {
         await using var db = await contexts.CreateDbContextAsync(ct);
         var transitions = await db.LedgerEntries.AsNoTracking()
@@ -180,7 +210,7 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
         return ConsecutiveFailures(transitions, names)
             ?? await HotFileAsync(db, transitions, names, ct)
             ?? await CostRisingAsync(db, since, names, ct)
-            ?? await MainRedAsync(db, transitions, names, ct);
+            ?? await MainRedAsync(db, names, acknowledged, fresh, ct);
     }
 
     private Hit? ConsecutiveFailures(List<LedgerEntry> transitions, Dictionary<long, (string ExternalId, string Repo, WorkState State)> names)
@@ -233,7 +263,9 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
     private async Task<Hit?> CostRisingAsync(LedgerDbContext db, DateTimeOffset? since,
         Dictionary<long, (string ExternalId, string Repo, WorkState State)> names, CancellationToken ct)
     {
-        var active = names.Where(n => !Lifecycle.IsTerminal(n.Value.State)).Select(n => n.Key).ToList();
+        // Merged items (Merge, Watch) and finished ones: no further round can follow, so their past rounds are no evidence.
+        var active = names.Where(n => !Lifecycle.IsTerminal(n.Value.State) && n.Value.State is not (WorkState.Merge or WorkState.Watch))
+            .Select(n => n.Key).ToList();
         var rows = (await db.LedgerEntries.AsNoTracking().Where(e => e.Step == null && active.Contains(e.WorkItemId)).OrderBy(e => e.Id).ToListAsync(ct))
             .ToLookup(e => e.WorkItemId);
         var sessions = (await db.WorkerSessions.AsNoTracking().Where(s => active.Contains(s.WorkItemId)).ToListAsync(ct)).ToLookup(s => s.WorkItemId);
@@ -281,14 +313,16 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
         return null;
     }
 
-    private async Task<Hit?> MainRedAsync(LedgerDbContext db, List<LedgerEntry> transitions,
-        Dictionary<long, (string ExternalId, string Repo, WorkState State)> names, CancellationToken ct)
+    private async Task<Hit?> MainRedAsync(LedgerDbContext db, Dictionary<long, (string ExternalId, string Repo, WorkState State)> names,
+        List<string> acknowledged, bool fresh, CancellationToken ct)
     {
         if (github is null)
         {
             return null;
         }
-        var latest = (await MergesAsync(db, transitions, names, ct))
+        // Main-red is a state, not an event: the latest factory merge of each repo over all history, not only since the Continue.
+        var allMerges = await db.LedgerEntries.AsNoTracking().Where(e => e.Step == null && e.State == WorkState.Merge).OrderBy(e => e.Id).ToListAsync(ct);
+        var latest = (await MergesAsync(db, allMerges, names, ct))
             .Where(m => m.Files is not null && m.Row.Detail is not null && m.Repo.Length > 0)
             .GroupBy(m => m.Repo, StringComparer.OrdinalIgnoreCase)
             .Select(g => g.MaxBy(m => m.Row.Id)!)
@@ -297,16 +331,59 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
         foreach (var merge in latest)
         {
             var repo = RepoRef.Parse(merge.Repo);
-            var tip = (await github.CompareAsync(repo, merge.Files!.Base, merge.Row.Detail!, ct)).BaseSha;
-            var (state, why) = Ci.Evaluate(await github.GetCiAsync(repo, tip, ct));
+            var tip = await TipAsync(repo, merge.Repo, merge.Files!.Base, merge.Row.Detail!, fresh, ct);
+            var marker = RedTip(merge.Repo, merge.Files.Base, tip);
+            if (acknowledged.Contains(marker))
+            {
+                continue; // a Continue acknowledged main red at exactly this tip; a new tip is checked again
+            }
+            var (state, why) = await CiAsync(repo, merge.Repo, tip, fresh, ct);
             if (state == CiState.Failed)
             {
                 return new Hit(FreezeTrigger.MainRed,
                     $"{merge.Files.Base} of {merge.Repo} is red at {Ci.Short(tip)} after the factory merged {Name(names, merge.Row.WorkItemId)} "
-                    + $"as {Ci.Short(merge.Row.Detail!)}: {why}");
+                    + $"as {Ci.Short(merge.Row.Detail!)}: {why}\n{marker}");
             }
         }
         return null;
+    }
+
+    private async Task<string> TipAsync(RepoRef repo, string repoName, string baseRef, string mergeCommit, bool fresh, CancellationToken ct)
+    {
+        var key = (repoName.ToLowerInvariant(), baseRef, mergeCommit);
+        var now = time.GetUtcNow();
+        lock (_cacheGate)
+        {
+            if (!fresh && _tips.TryGetValue(key, out var hit) && now - hit.At < MainRedCacheTtl)
+            {
+                return hit.Tip;
+            }
+        }
+        var tip = (await github!.CompareAsync(repo, baseRef, mergeCommit, ct)).BaseSha;
+        lock (_cacheGate)
+        {
+            _tips[key] = (now, tip);
+        }
+        return tip;
+    }
+
+    private async Task<(CiState State, string Why)> CiAsync(RepoRef repo, string repoName, string tip, bool fresh, CancellationToken ct)
+    {
+        var key = (repoName.ToLowerInvariant(), tip);
+        var now = time.GetUtcNow();
+        lock (_cacheGate)
+        {
+            if (!fresh && _ci.TryGetValue(key, out var hit) && now - hit.At < MainRedCacheTtl)
+            {
+                return (hit.State, hit.Why);
+            }
+        }
+        var (state, why) = Ci.Evaluate(await github!.GetCiAsync(repo, tip, ct));
+        lock (_cacheGate)
+        {
+            _ci[key] = (now, state, why);
+        }
+        return (state, why);
     }
 
     private static string Name(Dictionary<long, (string ExternalId, string Repo, WorkState State)> names, long id) =>

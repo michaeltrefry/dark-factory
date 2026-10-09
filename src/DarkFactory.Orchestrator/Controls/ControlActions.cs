@@ -68,9 +68,15 @@ public sealed class ControlActions(
 
     public async Task<ControlResult> ContinueAsync(string scope, string by, CancellationToken ct)
     {
-        if ((await controls.GetAsync(scope, ct))?.State == ControlState.Stopping)
+        var row = await controls.GetAsync(scope, ct);
+        if (row?.State == ControlState.Stopping)
         {
             return new ControlResult(false, $"{scope} is being stopped; it cannot be continued.");
+        }
+        if (scope == ControlScope.Freeze && row?.State is null or ControlState.Running)
+        {
+            // A Continue resets what the triggers count from: one with no freeze to clear would silently discard that evidence.
+            return new ControlResult(false, "the factory is not frozen");
         }
         await controls.SetAsync(scope, ControlState.Running, by, ct);
         return new ControlResult(true, scope == ControlScope.Usage

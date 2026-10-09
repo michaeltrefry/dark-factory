@@ -296,6 +296,7 @@ public sealed partial class RunPipeline
             await ledger.CheckpointAsync(item, Steps.BaseUpdate, null,
                 new BaseUpdate(BaseUpdate.Kinds.Update, head, merge.BaseSha, merge.Head).ToDetail(), ct);
             await ThrowIfControlledAsync(item, ct);
+            await ThrowIfFrozenAsync(item, ct);
             await workspaces.PushAsync(repo, workspace, ct);
             log.WriteLine($"[queue] merged {pull.BaseRef} ({Ci.Short(merge.BaseSha)}) into {Ci.Short(head)} as {Ci.Short(merge.Head)} and pushed it");
             return UpdateOutcome.Updated;
@@ -429,6 +430,9 @@ public sealed partial class RunPipeline
     private async Task MergeGatedHeadAsync(Run run, PullFacts pull, CancellationToken ct)
     {
         await ThrowIfControlledAsync(run.Item, ct);
+        // Never merge into a frozen factory: main may have turned red (or another trigger tripped) while this run waited for
+        // CI or its turn in the queue. Main-red is read fresh here, not from the evaluator's short cache.
+        await ThrowIfFrozenAsync(run.Item, ct, fresh: true);
         // What this merge changes, for the freeze (sc-25387): recorded before the merge, so every factory merge has it.
         var files = DiffPaths.Of(await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct));
         await ledger.CheckpointAsync(run.Item, Steps.MergeFiles, null, new MergeFiles(pull.BaseRef, files).ToDetail(), ct);

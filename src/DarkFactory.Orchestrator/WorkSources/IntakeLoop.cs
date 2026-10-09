@@ -39,10 +39,12 @@ public interface IItemRunner
 /// <paramref name="moreLanes"/> adds work sources after the first (GitHub issues, sc-25385), polled in turn by the same loop, so
 /// their runs never overlap; a source whose listing fails is skipped for that poll without holding up the others. Items are
 /// keyed by their external id (<c>sc-12</c>, <c>gh-3</c>) on the dashboard. A run deferred by the freeze evaluator
-/// (<see cref="RunOutcome.Deferred"/>) ends the poll and is shown on the dashboard.
+/// (<see cref="RunOutcome.Deferred"/>) ends the poll and is shown on the dashboard. <paramref name="freeze"/>, when set, is the
+/// freeze evaluator run at the start of each poll: frozen (or unable to check), no lane is prepared (no triage) or listed.
 /// </summary>
 public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOptions options, TimeProvider time, ILogger<IntakeLoop> logger,
-    Controls.IControls? controls = null, Router.UsageMonitor? usage = null, IntakeStatus? status = null, IReadOnlyList<IntakeLane>? moreLanes = null)
+    Controls.IControls? controls = null, Router.UsageMonitor? usage = null, IntakeStatus? status = null, IReadOnlyList<IntakeLane>? moreLanes = null,
+    Func<CancellationToken, Task<Controls.FreezeStatus>>? freeze = null)
     : BackgroundService
 {
     private readonly IntakeStatus _status = status ?? new IntakeStatus(time);
@@ -116,6 +118,20 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
                 && ((await controls.GetAsync(Controls.ControlScope.Factory, ct))?.State == Controls.ControlState.Paused
                     // Frozen (sc-25387): no new work until a human's Continue; an unreadable record fails the poll above (frozen too).
                     || (await controls.GetAsync(Controls.ControlScope.Freeze, ct)) is { State: not Controls.ControlState.Running }));
+            // The freeze evaluator itself (sc-25387), before any lane is listed or prepared: a trigger that holds but is not yet
+            // written, or one that cannot be checked (E2), stops triage and new work this poll as a written freeze does.
+            if (!factoryPaused && freeze is not null)
+            {
+                if (await freeze(ct) is { Frozen: true } frozen)
+                {
+                    factoryPaused = true;
+                    _status.Deferred("intake", frozen.Message);
+                }
+                else
+                {
+                    _status.NotDeferred();
+                }
+            }
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
@@ -274,10 +290,14 @@ public static class IntakeServiceCollectionExtensions
             IReadOnlyList<IntakeLane> lanes = issues is null
                 ? []
                 : [new IntakeLane(issues, new FactoryItemRunner(options, issues, Console.Out), ct => FactoryRunner.PollIssuesAsync(options, status, Console.Out, ct))];
+            // One evaluator for the loop's life, so its main-red reads are reused within FactoryFreeze.MainRedCacheTtl; built on the
+            // first poll, so a missing credential fails that poll (counted as frozen) rather than the host's start.
+            Controls.FactoryFreeze? evaluator = null;
             return new IntakeLoop(
                 sp.GetRequiredService<IWorkSource>(), sp.GetRequiredService<IItemRunner>(), sp.GetRequiredService<IntakeOptions>(),
                 sp.GetRequiredService<TimeProvider>(), sp.GetRequiredService<ILogger<IntakeLoop>>(), sp.GetRequiredService<Controls.IControls>(),
-                sp.GetRequiredService<Router.UsageMonitor>(), status, lanes);
+                sp.GetRequiredService<Router.UsageMonitor>(), status, lanes,
+                ct => (evaluator ??= FactoryRunner.CreateFreeze(options)).CheckAsync(ct));
         });
         return services;
     }
