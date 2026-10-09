@@ -255,7 +255,8 @@ worktree directory itself is created by you, so `safe.directory` never applies. 
 `_factory`'s home on purpose: anything inside a directory the worker owns could be swapped (e.g. for a symlink)
 under your git.
 
-Set `Worker__RunAs=none` to run workers as yourself (development only; no isolation).
+Set `Worker__RunAs=none` to run workers as yourself (development only; no isolation). `factory work` refuses it while
+`GitHub:Watch:Repos` is set: the issue triage reads untrusted issue text and must run sandboxed.
 
 Live checks (skip until the setup has run):
 

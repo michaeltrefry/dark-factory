@@ -97,6 +97,58 @@ public interface IWorker
     void CancelPause(string workingDirectory)
     {
     }
+
+    /// <summary>The tools and permission mode the worker's sessions run with (<see cref="WorkerTools"/>).</summary>
+    WorkerTools Tools => WorkerTools.Implementer;
+}
+
+/// <summary>
+/// What a worker session may do: Claude Code's <c>--permission-mode</c>, <c>--allowedTools</c> and <c>--disallowedTools</c>
+/// (a deny beats any allow rule, the target repo's own settings included).
+/// </summary>
+public sealed record WorkerTools
+{
+    private WorkerTools(string permissionMode, IReadOnlyList<string> allowed, IReadOnlyList<string> denied) =>
+        (PermissionMode, Allowed, Denied) = (permissionMode, allowed, denied);
+
+    public string PermissionMode { get; }
+    public IReadOnlyList<string> Allowed { get; }
+    public IReadOnlyList<string> Denied { get; }
+
+    /// <summary>An implementing worker (implement, review fix, CI fix, conflict fix): edits files and builds and tests; no web, no git.</summary>
+    public static readonly WorkerTools Implementer = new("acceptEdits", ClaudeWorker.AllowedTools, ClaudeWorker.DeniedTools);
+
+    /// <summary>The only tools a read-only session is allowed: it reads and searches the checkout, nothing else.</summary>
+    public static readonly string[] ReadOnlyTools = ["Read", "Glob", "Grep"];
+
+    /// <summary>
+    /// The tools that write a file, run a command, start a sub-agent (which could be given other tools) or reach the web: every one is
+    /// denied to a read-only session, whatever the repo's settings allow.
+    /// </summary>
+    public static readonly string[] WriteOrExecTools =
+        ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput", "KillShell", "Task", "Agent", .. Taint.WebTools];
+
+    /// <summary>
+    /// Claude Code's mode that auto-denies every tool call no allow rule pre-approves (headless, nobody can approve one): with only
+    /// <see cref="ReadOnlyTools"/> allowed, nothing else runs; <c>acceptEdits</c> would let a session edit files unasked.
+    /// </summary>
+    public const string ReadOnlyPermissionMode = "dontAsk";
+
+    /// <summary>
+    /// The triage worker (E4): a session that reads an issue's text holds no write or exec capability at all — Read, Glob and Grep, in
+    /// <see cref="ReadOnlyPermissionMode"/>, with every <see cref="WriteOrExecTools"/> tool denied. It reasons from the code; it builds
+    /// and runs nothing.
+    /// </summary>
+    public static readonly WorkerTools ReadOnly = new(ReadOnlyPermissionMode, ReadOnlyTools, WriteOrExecTools);
+
+    /// <summary>
+    /// Whether these tools are read-only: allowed only <see cref="ReadOnlyTools"/> (no rule with a specifier, no other tool), denied
+    /// every <see cref="WriteOrExecTools"/> tool, in <see cref="ReadOnlyPermissionMode"/>.
+    /// </summary>
+    public bool IsReadOnly =>
+        PermissionMode == ReadOnlyPermissionMode
+        && Allowed.All(t => ReadOnlyTools.Contains(t, StringComparer.Ordinal))
+        && WriteOrExecTools.All(t => Denied.Contains(t, StringComparer.Ordinal));
 }
 
 /// <summary>
@@ -153,8 +205,11 @@ public enum WorkerAuth
 /// </summary>
 public sealed class ClaudeWorker(
     string claudePath, Uri routerBaseUrl, string routerKey, WorkerAuth auth, TimeSpan timeout,
-    WorkerSandbox? sandbox = null, TimeSpan? stopGrace = null, string? pauseFlagDirectory = null) : IWorker
+    WorkerSandbox? sandbox = null, TimeSpan? stopGrace = null, string? pauseFlagDirectory = null, WorkerTools? tools = null) : IWorker
 {
+    /// <summary>The tools and permission mode every session of this worker runs with (default <see cref="WorkerTools.Implementer"/>).</summary>
+    public WorkerTools Tools { get; } = tools ?? WorkerTools.Implementer;
+
     public const string PauseReason = "Paused by the Dark Factory; the session resumes on Continue.";
 
     /// <summary>How long a stopped sandboxed worker gets to exit after its helper's stdin closes.</summary>
@@ -235,23 +290,25 @@ public sealed class ClaudeWorker(
         });
     }
 
-    public static IReadOnlyList<string> BuildArguments(string prompt, string? resumeSessionId = null, string? settings = null)
+    public static IReadOnlyList<string> BuildArguments(string prompt, string? resumeSessionId = null, string? settings = null,
+        WorkerTools? tools = null)
     {
+        tools ??= WorkerTools.Implementer;
         var args = new List<string>
         {
             "-p", prompt,
             "--output-format", "stream-json",
             "--verbose",
-            "--permission-mode", "acceptEdits",
+            "--permission-mode", tools.PermissionMode,
             // Ignore the OS user's ~/.claude settings (env, hooks, plugins) and MCP servers so the
             // worker sees only what the factory passes; the repo's own .claude settings still apply.
             "--setting-sources", "project,local",
             "--strict-mcp-config",
             "--allowedTools",
         };
-        args.AddRange(AllowedTools);
+        args.AddRange(tools.Allowed);
         args.Add("--disallowedTools");
-        args.AddRange(DeniedTools);
+        args.AddRange(tools.Denied);
         if (settings is not null)
         {
             args.Add("--settings");
@@ -279,14 +336,14 @@ public sealed class ClaudeWorker(
     {
         if (pauseFlagDirectory is null)
         {
-            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId), callbacks, ct);
+            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, tools: Tools), callbacks, ct);
         }
         var flag = PauseFlagPath(pauseFlagDirectory, workingDirectory);
         EnsurePauseFlagDirectory(pauseFlagDirectory);
         File.Delete(flag); // left by a crashed run, it would stop this one at its first tool call
         try
         {
-            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, BuildPauseSettings(flag)), callbacks, ct);
+            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, BuildPauseSettings(flag), Tools), callbacks, ct);
         }
         finally
         {

@@ -43,7 +43,7 @@ public enum StepOutcome
 /// <item>Checkpoints: <c>verdict</c> pass → passed, fail → failed; <c>fix-progress</c> progress → passed, failed → failed; <c>gate</c> Merge →
 /// passed, ReviewHead/Blocked → gate_rejected; <c>new-tests</c> pass → passed, rejected/no-tests → gate_rejected, unsupported/error (the check
 /// could not produce evidence) → failed; <c>ci-failure</c>, <c>merge-conflict</c>, <c>stuck</c>, <c>stuck-retry</c>, <c>worktree-lost</c>,
-/// <c>github-refused</c> → failed; <c>escalation-comment</c> posted → passed, else failed; <c>pr-report</c> or <c>closeout</c> failed → failed; <c>approval-ignored</c> → gate_rejected;
+/// <c>github-refused</c> → failed; <c>routed-to-human</c> (a triage routed an issue to a human) → escalated; <c>escalation-comment</c> posted → passed, else failed; <c>pr-report</c> or <c>closeout</c> failed → failed; <c>approval-ignored</c> → gate_rejected;
 /// <c>usage-pause</c>, <c>parked</c> → deferred; every other checkpoint (a completed sub-step) → passed.</item>
 /// </list>
 /// A run deferred by the freeze before it starts (<see cref="RunOutcome.Deferred"/>) writes no row, so it has no outcome to record.
@@ -112,6 +112,7 @@ public static class StepOutcomes
         RunPipeline.Steps.CiFailure or RunPipeline.Steps.MergeConflict or RunPipeline.Steps.Stuck or RunPipeline.Steps.StuckRetry
             or RunPipeline.Steps.WorktreeLost or RunPipeline.Steps.ControlsUnreadable or Issues.IssueSteps.Refused => StepOutcome.Failed,
         RunPipeline.Steps.EscalationComment => detail == "posted" ? StepOutcome.Passed : StepOutcome.Failed,
+        Issues.IssueSteps.RoutedToHuman => StepOutcome.Escalated,
         RunPipeline.Steps.PrReport or RunPipeline.Steps.Closeout =>
             detail?.StartsWith("failed", StringComparison.Ordinal) == true ? StepOutcome.Failed : StepOutcome.Passed,
         Issues.IssueSteps.ApprovalIgnored => StepOutcome.GateRejected,

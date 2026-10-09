@@ -53,6 +53,11 @@ static async Task<int> WorkAsync(CancellationToken ct)
         {
             Console.Error.WriteLine("No GitHub issues are watched (set GitHub:Watch:Repos to triage a repo's issues).");
         }
+        if (DarkFactory.Orchestrator.Issues.IssueIntake.UnsandboxedRefusal(options.WorkerSandbox, options.WatchedIssueRepos) is { } unsandboxed)
+        {
+            Console.Error.WriteLine(unsandboxed);
+            return 2;
+        }
     }
     catch (Exception ex) when (ex is MissingCredentialException or ReviewConfigurationException or InvalidOperationException)
     {

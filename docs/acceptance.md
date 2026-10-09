@@ -219,6 +219,8 @@ Automated: `IssueTriageTests` (tests/DarkFactory.AcceptanceTests), live, skipped
 `GitHub:Watch:Repos`), run the production issue intake (`FactoryRunner.PollIssuesAsync`: the triage is a real sandboxed
 worker through the router) against a throwaway ledger, and close every issue they opened.
 
+These tests need the worker sandbox: issue triage refuses `Worker__RunAs=none` (the triage reads untrusted issue text).
+
 Owner set-up, once: grant the factory's (workers') App the **Issues: Read and write** repository permission
 (`src/DarkFactory.Orchestrator/GitHub/app-manifest.json` lists it for new registrations; an existing App needs it added in
 its GitHub settings and the installation's update accepted), plus everything P2-AT1 needs (the gate merges the first test's PR).

@@ -170,7 +170,11 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   Intake claims (owner + `factory-claimed` label, In Progress) as a `claimed` checkpoint; the PR and branch links
   are a `linked` checkpoint before Review. `factory work`'s start-up scope check is `IWorkSource.ValidateScopeAsync`. `ClaimAsync` refuses (no write) unless the fresh story is To Do or already
   ours, in scope (skipped by `factory run --ignore-scope`) and not another owner's, and reads the claim back; a refusal
-  parks the item (Paused + `parked` checkpoint). Only Paused rows with detail `interrupted` (`RunPipeline.Interrupted`),
+  parks the item (Paused `claim refused: …` + `parked` checkpoint). A source that lists a refused item again by itself
+  (`IWorkSource.MaxClaimRefusals`; GitHub issues: `GitHubIssueWorkSource.ClaimRefusals` = 3) bounds it: a released issue whose
+  claim is refused is listed again on the next poll, each refusal recorded, and the refusal that reaches the bound escalates
+  the item (Escalated + comment, E10); Shortcut (null) waits for the story to be ready again. Wording a human acts on comes
+  from the source (`IWorkSource.ScopeReturnHint`, `ItemNaming.Noun`), never Shortcut terms on a GitHub issue. Only Paused rows with detail `interrupted` (`RunPipeline.Interrupted`),
   `user-paused` (`RunPipeline.UserPaused`, a Pause control), `usage-paused` (`RunPipeline.UsagePaused`, the usage pause),
   `freeze-paused` (`RunPipeline.FreezePaused`, the automatic freeze) or `controls-unreadable` (`RunPipeline.ControlsUnreadablePaused`)
   auto-resume (`RunPipeline.InFlightAsync`), all but the first only once no control pauses the item and the controls can be read
@@ -183,14 +187,26 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
 - GitHub issues (sc-25385, `Issues/`): `IssueIntake` polls each watched repo's open issues updated since its ledger cursor
   (`github_issue_cursors`; the first poll of a repo starts from now, no backfill). Each issue gets a key (`github_issues`) and a
   work item `gh-<key>` that waits Paused/parked (`awaiting triage`) until released. Each issue version (sha of title+body) is
-  triaged once by a normal, unpinned worker (`WorkerTriageRunner`: throwaway `factory/triage-gh-<key>` worktree whose git
-  holds a contents-read token; nothing is committed or pushed; the issue text is fenced as untrusted). The orchestrator — not
+  triaged once by a read-only, unpinned worker (`WorkerTriageRunner` over `WorkerTools.ReadOnly`: `--allowedTools Read Glob
+  Grep`, `--permission-mode dontAsk`, every write/exec/sub-agent/web tool in `WorkerTools.WriteOrExecTools` denied; the runner
+  refuses any worker whose tools are not `IsReadOnly`, so a tainted session cannot change a file an untainted session later
+  pushes, E4; the prompt has it reason from the code, building and running nothing) in a throwaway `factory/triage-gh-<key>`
+  worktree under its own root (`<WorkRoot>/triage-worktrees`, `SandboxTriageRunner.TriageWorktrees`: never the items'
+  `worktrees`, swept before each triage, not ACL-shared for writing — the worker user reads it through the work root's
+  inherited read entry) whose git holds a contents-read token; nothing is committed or pushed; the issue text is fenced as
+  untrusted. `factory work` refuses to start with `GitHub:Watch:Repos` set and `Worker:RunAs=none`
+  (`IssueIntake.UnsandboxedRefusal`; `SandboxTriageRunner` refuses an unsandboxed triage too, factory-wide). Residual: the
+  triage runs as the same `_factory` user as the items' workers, so it can read (never write) the work root — clones and other
+  items' kept worktrees — and that user's home. The intake reads and writes the issue board only through the issue source's
+  `IIssueIntakeSource` capability (E6): triage comment and route label, issues, comments, permissions and gate policy. The orchestrator — not
   the model — routes (`IssueRouting`): question/duplicate → comment only; author without write/maintain/admin
   (`RepoPermission.IsCollaborator`; read and triage count as outsiders) on the issue's repo, or on the target repo when the
   triage names another watched repo → comment + `awaiting-approval`; collaborator with an
-  apparent fix (reproduced, or confidence ≥ 0.8; a fix naming its paths, none sealed/protected under the target's
+  apparent fix (confidence ≥ 0.8; a fix naming its paths, none sealed/protected under the target's
   `factory/gate.yaml` on its default branch; exactly one watched target repo) → `released` (built); else → comment +
-  `needs-human`. The `triaged` row (route included) is written before anything is posted; comments carry a
+  `needs-human` and a `routed-to-human` row (outcome escalated, so the escalation metric counts it). The model's `reproduced`
+  is its own claim (the triage runs nothing; E5): it never routes and is shown only inside the comment's fence, labelled
+  model-reported. The `triaged` row (route included) is written before anything is posted; comments carry a
   `<!-- dark-factory:triage <hash> -->` marker (trusted only on the App's own comments: `performed_via_github_app.id`, or
   failing that the App's bot account — `user.type` Bot and login `<slug>[bot]`, slug from `GET /app`), so a retried post is
   found, not repeated. Approval: a collaborator's comment whose trimmed text is exactly `Approved` (case-sensitive, never
@@ -343,6 +359,12 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   escalates the item (comment names the session and reason), its worktree is removed, and a re-run starts a fresh session.
   Deliberate: CI logs are not a taint source (they come from the repo's CI running the base plus the factory's own reviewed
   changes; tainting them would leave no CI fixer able to push).
+  Prompt fences: every prompt puts text written by others in a `<tag>` block via `Worker/PromptFence` (`Block`/`Escape`: the
+  block's own closing tag, any case or spacing, is neutralised inside it) — the issue (`issue-title`, `issue-body`), the
+  reviewer context (`story`, `files`, `diff`, `finding`), findings, CI logs (`ci-log`), conflicted paths (`file`). A GitHub issue
+  item's spec (the approved triage's title, summary and proposed fix: model text from untrusted issue text) is fenced as data
+  (`triage`, `PromptFence.Spec`) in every worker prompt (implement, review fix, CI fix, conflict fix); a Shortcut story is
+  written on the owner's board and stays unfenced instructions.
   Interrupts: the taint write of a tool use runs on a never-cancelled token (`ClaudeWorker` passes `CancellationToken.None` to
   `OnUntrusted`), and before resuming a session `RunWorkerSessionAsync` replays its stored `session_events` through
   `StreamJsonState` (`WorkLedger.ReplayTaintsAsync`) and taints it for every web/MCP use found; a failed read fails the run.

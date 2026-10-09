@@ -528,14 +528,11 @@ public sealed partial class RunPipeline
     {
         var story = spec.Story;
         var files = merge.Files is { Count: > 0 } conflicted
-            ? string.Join("\n", conflicted.Select(f => $"<file>{RouterReviewer.Fenced(f)}</file>"))
+            ? string.Join("\n", conflicted.Select(f => PromptFence.Block("file", f)))
             : "(none: the base now merges cleanly; check that the merged branch still builds and its tests pass)";
         return $"""
             You are a Dark Factory worker. The current directory is a git worktree of {repo} on the pull request branch that
-            implements {story.Kind.Noun} {story.Ref} ({story.StoryType}): {story.Name}
-
-            Story description:
-            {story.Description}
+            implements {story.Kind.Noun} {story.Ref} ({story.StoryType}): {PromptFence.Spec(story)}
 
             The branch conflicted with its base branch, so it could not be merged (fix round {round} of {cap}).
             The orchestrator has started merging the base (commit {Ci.Short(merge.Base)}) into the branch; the merge stopped with

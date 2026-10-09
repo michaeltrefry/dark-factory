@@ -46,11 +46,13 @@ public sealed record ProposedFix(string Description, IReadOnlyList<string> Paths
 /// <summary>
 /// The triage worker's structured answer (<see cref="TriageParser"/>). Model output derived from untrusted issue text: it is
 /// shown on the issue only inside a fence, and it is the only thing about the issue the implementing worker ever sees (E4).
+/// <see cref="Reproduced"/> is the model's own claim (the read-only triage runs nothing, E5): it is shown only inside the fence,
+/// labelled as model-reported, and never routes anything.
 /// </summary>
 public sealed record Triage(IssueType Type, string Title, string Summary, IReadOnlyList<string> AffectedRepos, double Confidence, bool Reproduced,
     ProposedFix? Fix, string? DuplicateOf)
 {
-    /// <summary>The confidence at or above which a fix counts as confident without a reproduction (the apparent-fix threshold).</summary>
+    /// <summary>The confidence at or above which a proposed fix counts as confident (the apparent-fix threshold).</summary>
     public const double ConfidentAt = 0.8;
 
     /// <summary>Bugs and features are built; questions and duplicates never are.</summary>
@@ -228,15 +230,16 @@ public static class IssueRouting
     }
 
     /// <summary>
-    /// Null when the fix is apparent: a reproduced failure or a confidence of at least <see cref="Triage.ConfidentAt"/>, a proposed
-    /// fix naming the paths it changes, and none of them sealed or protected under the target's <c>factory/gate.yaml</c> on its
-    /// default branch (<paramref name="policy"/>; a missing or invalid policy cannot show that, so it is not apparent). Else why not.
+    /// Null when the fix is apparent: a confidence of at least <see cref="Triage.ConfidentAt"/>, a proposed fix naming the paths it
+    /// changes, and none of them sealed or protected under the target's <c>factory/gate.yaml</c> on its default branch
+    /// (<paramref name="policy"/>; a missing or invalid policy cannot show that, so it is not apparent). Else why not. The model's
+    /// <see cref="Triage.Reproduced"/> claim plays no part: nothing was run, so it is no fact (E5).
     /// </summary>
     public static string? ApparentFix(Triage triage, GatePolicy? policy, string? policyError)
     {
-        if (!triage.Reproduced && triage.Confidence < Triage.ConfidentAt)
+        if (triage.Confidence < Triage.ConfidentAt)
         {
-            return $"the failure was not reproduced and the confidence ({triage.Confidence.ToString("0.##", CultureInfo.InvariantCulture)}) is under "
+            return $"the confidence ({triage.Confidence.ToString("0.##", CultureInfo.InvariantCulture)}) is under "
                 + Triage.ConfidentAt.ToString("0.##", CultureInfo.InvariantCulture);
         }
         if (triage.Fix is not { Paths.Count: > 0 } fix)
@@ -369,7 +372,7 @@ public static partial class IssueComments
         {
             text.AppendLine($"- Type: {t.Type.ToString().ToLowerInvariant()}");
             text.AppendLine($"- Affected repos: {(t.AffectedRepos.Count == 0 ? "none named" : string.Join(", ", t.AffectedRepos.Select(r => $"`{r}`")))}");
-            text.AppendLine($"- Confidence: {t.Confidence.ToString("0.##", CultureInfo.InvariantCulture)}; reproduced: {(t.Reproduced ? "yes" : "no")}");
+            text.AppendLine($"- Confidence: {t.Confidence.ToString("0.##", CultureInfo.InvariantCulture)}");
             if (t.Fix is { Paths.Count: > 0 } fix)
             {
                 text.AppendLine($"- Proposed fix changes: {string.Join(", ", fix.Paths.Select(p => $"`{p}`"))}");
@@ -377,7 +380,8 @@ public static partial class IssueComments
             text.AppendLine();
             text.AppendLine(Fence($"{t.Title}\n\n{t.Summary}"
                 + (t.Fix is { Description.Length: > 0 } f ? $"\n\nProposed fix: {f.Description}" : "")
-                + (t.DuplicateOf is { } d ? $"\n\nDuplicate of: {d}" : "")));
+                + (t.DuplicateOf is { } d ? $"\n\nDuplicate of: {d}" : "")
+                + $"\n\n{ModelReportedReproduction(t.Reproduced)}"));
         }
         else
         {
@@ -397,6 +401,10 @@ public static partial class IssueComments
         text.Append($"<!-- dark-factory:triage {record.Hash} -->");
         return text.ToString();
     }
+
+    /// <summary>The model's reproduction claim as the comment shows it, inside the fence: model-reported, nothing was run (E5).</summary>
+    public static string ModelReportedReproduction(bool reproduced) =>
+        $"Reproduced (model-reported; the triage reads code and runs nothing): {(reproduced ? "yes" : "no")}";
 
     public static string RouteName(IssueRoute route) => route switch
     {
