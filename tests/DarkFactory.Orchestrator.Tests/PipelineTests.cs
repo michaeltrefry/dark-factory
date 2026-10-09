@@ -304,6 +304,22 @@ public class RunPipelineTests
             Drafted.Add(head);
             return Task.FromResult<IReadOnlyList<string>>(Opened.Any(o => o.Head == head) ? [PrUrl] : []);
         }
+
+        /// <summary>Each rewrite of a PR's description (sc-25389), in order.</summary>
+        public List<(string Url, string Body)> BodyUpdates { get; } = [];
+
+        /// <summary>When set, rewriting a description throws this.</summary>
+        public Exception? UpdateThrows { get; set; }
+
+        public Task UpdateBodyAsync(RepoRef repo, string pullUrl, string body, CancellationToken ct)
+        {
+            if (UpdateThrows is { } failure)
+            {
+                return Task.FromException(failure);
+            }
+            BodyUpdates.Add((pullUrl, body));
+            return Task.CompletedTask;
+        }
     }
 
     internal static readonly WorkerResult Ok = new("sess-77", 0, false, "success", "done", "");

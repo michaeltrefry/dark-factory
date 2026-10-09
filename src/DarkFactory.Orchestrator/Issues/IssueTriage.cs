@@ -409,5 +409,5 @@ public static partial class IssueComments
     };
 
     /// <summary>Model text inside a tilde fence nothing in it can close: no mention, link or markup in it renders.</summary>
-    private static string Fence(string text) => $"~~~~text\n{text.Replace("~~~", "~ ~ ~", StringComparison.Ordinal)}\n~~~~";
+    private static string Fence(string text) => WorkSources.UntrustedText.Fenced(text);
 }

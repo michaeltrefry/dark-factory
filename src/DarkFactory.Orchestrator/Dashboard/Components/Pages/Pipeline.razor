@@ -120,10 +120,31 @@ else
         </tbody>
     </table>
 }
+@if (_metrics is { Count: > 0 } metrics)
+{
+    <h2>Metrics</h2>
+    <table class="metrics">
+        <thead>
+            <tr><th>Metric</th><th>Value</th><th>Over</th></tr>
+        </thead>
+        <tbody>
+            @foreach (var metric in metrics)
+            {
+                <tr data-metric="@metric.Name">
+                    <td>@metric.Name</td>
+                    <td class="@(metric.Value is null ? "value muted" : "value")">@metric.Display</td>
+                    <td class="muted">@metric.Note</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+    <p class="muted">From the ledger's executed results only; sandbox and demo items are left out.</p>
+}
 
 @code {
     private readonly CancellationTokenSource _cts = new();
     private IReadOnlyList<PipelineRow>? _rows;
+    private IReadOnlyList<Metric>? _metrics;
     private IReadOnlyDictionary<string, Control> _controls = new Dictionary<string, Control>();
 
     /// <summary>Whether this scope's own control (not an enclosing one) pauses it: Continue clears exactly that.</summary>
@@ -184,6 +205,7 @@ else
                 _again = false;
                 _rows = await Data.ActiveItemsAsync(_cts.Token);
                 _controls = (await Data.ControlsAsync(_cts.Token)).ToDictionary(c => c.Scope);
+                _metrics = await Data.MetricsAsync(_cts.Token);
                 _stale = false;
             }
             while (_again);

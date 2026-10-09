@@ -445,5 +445,44 @@ public class StuckFixRoundTests
         Assert.StartsWith("ci fix round 1 stuck:", rows.Where(r => r.Step is null && r.State == WorkState.CI).ElementAt(1).Detail);
         Assert.Equal(2, h.Workspaces.Calls.Count(c => c.StartsWith("push")));
         Assert.Null(h.WorkerCalls[2].Resume);
+        // The stuck round's row is a failed step (sc-25389).
+        Assert.Equal(StepOutcome.Failed, rows.Where(r => r.Step is null && r.State == WorkState.CI).ElementAt(1).Outcome);
+    }
+
+    [Fact]
+    public async Task Stuck_ci_fixers_at_the_fix_round_cap_escalate_saying_the_ci_fixer_was_stuck()
+    {
+        var h = new GatePipelineTests.Harness();
+        h.GitHub.Ci[GatePipelineTests.Sha1] = new CiFacts(GatePipelineTests.Sha1, [new CheckFact("build-test", true, "failure")]);
+        for (var round = 1; round <= Lifecycle.MaxFixRounds; round++)
+        {
+            h.WorkerOverrides[round] = Replays(h, StuckFixtures.Loop);
+        }
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Equal(Lifecycle.MaxFixRounds, (await h.Transitions()).Count(s => s == WorkState.CIHealing));
+        Assert.Equal(1, h.Workspaces.Calls.Count(c => c.StartsWith("push"))); // the implementer's only
+        Assert.Contains("after 3 fix rounds (the cap is 3, shared by review and CI fixes)", outcome.Error);
+        Assert.Contains($"; {Lifecycle.MaxFixRounds} round(s) failed because the CI fixer was stuck in a loop (the last 5 turns were near-identical",
+            outcome.Error);
+        Assert.Contains("because the CI fixer was stuck in a loop", h.Stories.Comments.Single());
+    }
+
+    [Fact]
+    public async Task A_ci_cap_with_no_stuck_round_says_nothing_about_loops()
+    {
+        var h = new GatePipelineTests.Harness();
+        foreach (var sha in new[] { GatePipelineTests.Sha1, GatePipelineTests.ShaA, GatePipelineTests.ShaB, GatePipelineTests.ShaC })
+        {
+            h.GitHub.Ci[sha] = new CiFacts(sha, [new CheckFact("build-test", true, "failure")]);
+        }
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains("after 3 fix rounds", outcome.Error);
+        Assert.DoesNotContain("stuck", outcome.Error);
     }
 }

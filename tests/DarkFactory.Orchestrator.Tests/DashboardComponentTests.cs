@@ -127,6 +127,21 @@ public class DashboardComponentTests : BunitContext
         Assert.Empty(cut.FindAll(".item-errors"));
     }
 
+    [Fact]
+    public void The_pipeline_shows_the_metrics_with_unmeasured_ones_as_not_available()
+    {
+        _data.Rows = [];
+        _data.Metrics = LedgerMetrics.Compute([], MetricsOptions.Default);
+
+        var cut = Render<Pipeline>();
+
+        var rows = cut.FindAll("table.metrics tbody tr");
+        Assert.Equal(6, rows.Count);
+        Assert.All(rows, r => Assert.Equal("N/A", r.QuerySelector(".value")!.TextContent));
+        Assert.Contains("14-day revert rate", cut.Find("tr[data-metric='14-day revert rate']").TextContent);
+        Assert.Contains("sandbox and demo items are left out", cut.Markup);
+    }
+
     private static PipelineRow Row(long id, WorkState state, string? pr = null, decimal? cost = null, params SessionLink[] sessions) =>
         new(id, $"sc-{id}", $"Story {id}", "acme/widgets", state, Now.AddMinutes(-65), Now, pr, cost, sessions);
 
@@ -410,6 +425,10 @@ public class DashboardComponentTests : BunitContext
 
         public Task<SessionHeader?> SessionAsync(string claudeSessionId, CancellationToken ct) =>
             Task.FromResult(Header?.Session.ClaudeSessionId == claudeSessionId ? Header : null);
+
+        public IReadOnlyList<Metric> Metrics { get; set; } = [];
+
+        public Task<IReadOnlyList<Metric>> MetricsAsync(CancellationToken ct) => Task.FromResult(Metrics);
     }
 
     private sealed class FakeViewers : ISessionViewers

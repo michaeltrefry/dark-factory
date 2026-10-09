@@ -53,10 +53,18 @@ public interface IDashboardData
 
     /// <summary>How long a running session may go without an event before the pages mark it quiet (<c>Worker:QuietMinutes</c>).</summary>
     TimeSpan QuietThreshold => DashboardData.DefaultQuietThreshold;
+
+    /// <summary>The factory's metrics over the ledger (<see cref="LedgerMetrics"/>; N/A when unmeasured, sandbox and demo items left out).</summary>
+    Task<IReadOnlyList<Metric>> MetricsAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<Metric>>([]);
 }
 
-public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, TimeProvider time, TimeSpan? quietThreshold = null) : IDashboardData
+public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, TimeProvider time, TimeSpan? quietThreshold = null,
+    MetricsOptions? metrics = null) : IDashboardData
 {
+    private readonly LedgerMetrics _metrics = new(contexts, metrics ?? MetricsOptions.Default);
+
+    public Task<IReadOnlyList<Metric>> MetricsAsync(CancellationToken ct) => _metrics.ComputeAsync(ct);
+
     /// <summary>
     /// <c>Worker:QuietMinutes</c>'s default: the longest legitimate tool call (<see cref="RunPipeline.LongestToolCall"/>, a long
     /// <c>dotnet test</c>) streams nothing for that long, so only a silence past it is worth a look.

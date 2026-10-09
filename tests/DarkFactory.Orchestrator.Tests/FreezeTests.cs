@@ -112,7 +112,7 @@ public class FreezeTests
             foreach (var (state, step, detail) in rows)
             {
                 Time.Advance(TimeSpan.FromSeconds(1));
-                Db.LedgerEntries.Add(new LedgerEntry { WorkItemId = item.Id, State = state, Step = step, Detail = detail, RecordedAt = Time.GetUtcNow() });
+                Db.LedgerEntries.Add(new LedgerEntry { WorkItemId = item.Id, State = state, Step = step, Detail = detail, RecordedAt = Time.GetUtcNow(), Outcome = StepOutcomes.Of(null, state, step, detail) });
                 await Db.SaveChangesAsync();
             }
             return item;
@@ -163,7 +163,7 @@ public class FreezeTests
         private async Task Row(WorkItem item, WorkState state)
         {
             Time.Advance(TimeSpan.FromSeconds(1));
-            Db.LedgerEntries.Add(new LedgerEntry { WorkItemId = item.Id, State = state, RecordedAt = Time.GetUtcNow() });
+            Db.LedgerEntries.Add(new LedgerEntry { WorkItemId = item.Id, State = state, RecordedAt = Time.GetUtcNow(), Outcome = StepOutcomes.Of(null, state, null, null) });
             await Db.SaveChangesAsync();
         }
     }
@@ -594,7 +594,7 @@ public class FreezeTests
             };
             db.WorkItems.Add(item);
             db.SaveChanges();
-            db.LedgerEntries.Add(new LedgerEntry { WorkItemId = item.Id, State = WorkState.Escalated, Detail = "boom", RecordedAt = DateTimeOffset.UtcNow });
+            db.LedgerEntries.Add(new LedgerEntry { WorkItemId = item.Id, State = WorkState.Escalated, Detail = "boom", RecordedAt = DateTimeOffset.UtcNow, Outcome = StepOutcome.Escalated });
             db.SaveChanges();
         }
     }
@@ -710,9 +710,9 @@ public class FreezeTests
             await db.SaveChangesAsync();
             db.LedgerEntries.AddRange(
                 new LedgerEntry { WorkItemId = earlier.Id, State = WorkState.MergeGate, Step = RunPipeline.Steps.MergeFiles,
-                    Detail = new MergeFiles("main", ["src/a.cs"]).ToDetail(), RecordedAt = DateTimeOffset.UtcNow },
-                new LedgerEntry { WorkItemId = earlier.Id, State = WorkState.Merge, Detail = "mergeAaaaaaaaaaa", RecordedAt = DateTimeOffset.UtcNow },
-                new LedgerEntry { WorkItemId = earlier.Id, State = WorkState.Watch, Detail = "mergeAaaaaaaaaaa", RecordedAt = DateTimeOffset.UtcNow });
+                    Detail = new MergeFiles("main", ["src/a.cs"]).ToDetail(), RecordedAt = DateTimeOffset.UtcNow, Outcome = StepOutcome.Passed },
+                new LedgerEntry { WorkItemId = earlier.Id, State = WorkState.Merge, Detail = "mergeAaaaaaaaaaa", RecordedAt = DateTimeOffset.UtcNow, Outcome = StepOutcome.Passed },
+                new LedgerEntry { WorkItemId = earlier.Id, State = WorkState.Watch, Detail = "mergeAaaaaaaaaaa", RecordedAt = DateTimeOffset.UtcNow, Outcome = StepOutcome.Passed });
             await db.SaveChangesAsync();
         }
     }

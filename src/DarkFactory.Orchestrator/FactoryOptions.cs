@@ -233,6 +233,18 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
             : models;
     }
 
+    /// <summary>
+    /// The items the metrics leave out (<see cref="Ledger.MetricsOptions"/>): <c>Metrics:SandboxRepos</c> (comma-separated <c>owner/name</c>,
+    /// default the factory's sandbox repo) and <c>Metrics:DemoMarkers</c> (comma-separated title markers, default <c>[demo]</c>, <c>[sandbox]</c>).
+    /// </summary>
+    public Ledger.MetricsOptions Metrics => new(
+        List("Metrics:SandboxRepos") ?? Ledger.MetricsOptions.DefaultSandboxRepos,
+        List("Metrics:DemoMarkers") ?? Ledger.MetricsOptions.DefaultDemoMarkers);
+
+    private List<string>? List(string key) => config[key] is { } list && !string.IsNullOrWhiteSpace(list)
+        ? list.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList()
+        : null;
+
     /// <summary><c>Review:TimeoutMinutes</c> (default 10): the longest one reviewer call may take.</summary>
     public TimeSpan ReviewTimeout => TimeSpan.FromMinutes(config.GetValue("Review:TimeoutMinutes", 10));
 

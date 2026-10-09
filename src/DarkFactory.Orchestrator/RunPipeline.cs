@@ -216,6 +216,13 @@ public sealed partial class RunPipeline(
         /// session, why, and the count of <see cref="MaxStuckImplementSessions"/>); a new worker attempt starts after it.
         /// </summary>
         public const string StuckRetry = "stuck-retry";
+        /// <summary>Merge: the closeout comment (the ledger's facts, <see cref="LedgerReport.MergedCloseout"/>) is on the board item.</summary>
+        public const string Closeout = "closeout";
+        /// <summary>
+        /// Merge: the PR's description was rewritten from the ledger (<see cref="LedgerReport.PullRequestBody"/>); Detail is <c>merge</c>, or
+        /// <c>failed: &lt;why&gt;</c> (the description is a report only: a failure is recorded, not escalated).
+        /// </summary>
+        public const string PrReport = "pr-report";
     }
 
     /// <summary>
@@ -706,7 +713,7 @@ public sealed partial class RunPipeline(
         await ThrowIfControlledAsync(item, ct);
         // Returns the branch's already-open PR instead of opening a second one.
         var prUrl = await pullRequests.OpenAsync(repo, workspace.Branch, workspace.BaseBranch,
-            $"{story.Ref}: {story.PublicName}", BuildPrBody(story, session!), ct);
+            $"{story.Ref}: {story.PublicName}", await PullRequestBodyAsync(run, ct), ct);
         var branchUrl = BranchUrl(repo, workspace.Branch);
         if (!attempt.Any(e => e.Step == Steps.Linked && e.Detail == $"{prUrl} {branchUrl}"))
         {
@@ -1439,15 +1446,19 @@ public sealed partial class RunPipeline(
         var (reason, session) = (escalated.Detail, escalated.ClaudeSessionId);
         var lastState = $"{last.State}{(last.Step is null ? "" : $" (after step {last.Step})")} at {last.RecordedAt:u}";
 
+        // The closeout on escalation (sc-25389): the reason (factory text that can quote model findings, so fenced as data) and the
+        // ledger's facts, never a worker's summary.
         var comment = $"""
             [author: dark-factory] {source.Naming.Format(storyId)} escalated; a human needs to look.
 
-            Reason: {reason}
+            Reason:
+            {UntrustedText.Fenced(reason ?? "none recorded")}
             Last ledger state: {lastState}
             Claude session: {session ?? "none"}
 
             Re-run with `factory run {source.Naming.Format(storyId)}` once resolved.
-            """;
+
+            """ + "\n" + LedgerReport.Facts(history, await ledger.SessionCostsAsync(item, ct)).TrimEnd();
         try
         {
             await source.CommentAsync(storyId, comment, ct);
@@ -1508,13 +1519,9 @@ public sealed partial class RunPipeline(
         """;
 
     /// <summary>
-    /// The PR's description: it links back to the item, and for an item that closes an issue (<see cref="WorkStory.Closes"/>)
-    /// carries GitHub's closing keyword, so merging the PR closes the issue. An untrusted name (a triage's title) is inert, in a code span.
+    /// The PR's description, rendered from the item's ledger rows and recorded session costs (<see cref="LedgerReport.PullRequestBody"/>): it
+    /// links back to the item and, for an item that closes an issue (<see cref="WorkStory.Closes"/>), carries GitHub's closing keyword.
     /// </summary>
-    public static string BuildPrBody(WorkStory story, string sessionId) =>
-        $"""
-        Implements {story.Kind.Noun} [{story.Ref}]({story.AppUrl}): {(story.UntrustedName ? UntrustedText.CodeSpan(story.Name) : story.Name)}
-        {(story.Closes is { } closes ? $"\nCloses {closes}\n" : "")}
-        Opened by Dark Factory. Claude session: `{sessionId}`
-        """;
+    private async Task<string> PullRequestBodyAsync(Run run, CancellationToken ct) =>
+        LedgerReport.PullRequestBody(run.Story, await ledger.HistoryAsync(run.Item, ct), await ledger.SessionCostsAsync(run.Item, ct));
 }
