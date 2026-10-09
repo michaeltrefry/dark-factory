@@ -213,6 +213,25 @@ internal sealed class E2e : IAsyncDisposable
         return (state, links);
     }
 
+    /// <summary>The text of every comment on the story that is not deleted, oldest first, read straight from the Shortcut API.</summary>
+    public static async Task<List<string>> StoryCommentsAsync(int storyId, CancellationToken ct)
+    {
+        using var http = OutboundHttp.ShortcutApi();
+        http.DefaultRequestHeaders.Add("Shortcut-Token", Harness.Options.ShortcutApiToken);
+        var story = await http.GetFromJsonAsync<JsonElement>($"stories/{storyId}", ct);
+        return [.. story.GetProperty("comments").EnumerateArray()
+            .Where(c => !(c.TryGetProperty("deleted", out var deleted) && deleted.ValueKind == JsonValueKind.True))
+            .Select(c => c.GetProperty("text").GetString() ?? "")];
+    }
+
+    /// <summary>The router cost of each of the item's worker sessions, as <see cref="WorkLedger.SessionCostsAsync"/> reads them.</summary>
+    public async Task<IReadOnlyList<decimal?>> SessionCostsAsync(int storyId, CancellationToken ct)
+    {
+        await using var db = Db();
+        var item = await db.WorkItems.AsNoTracking().SingleAsync(i => i.ExternalId == StoryId.Format(storyId), ct);
+        return await new WorkLedger(db, TimeProvider.System).SessionCostsAsync(item, ct);
+    }
+
     /// <summary>Every PR (any state) whose head is the item's <c>factory/sc-&lt;id&gt;</c> branch.</summary>
     public static async Task<List<JsonElement>> PullRequestsAsync(RepoRef repo, int storyId, CancellationToken ct)
     {

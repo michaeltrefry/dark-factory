@@ -21,28 +21,44 @@ Claude Code headless workers through the Weave router.
   `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`, the merge gate and queue `RunPipeline.MergeQueue.cs`),
   and the outbound gateway (`Gateway/`: `OutboundHttp` builds every GitHub, Shortcut and router `HttpClient` (and the
   acceptance tests' dashboard client); `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token
-  credentials; `GitHubCli` is the only `gh` run).
+  credentials; `GitRemoteReads` the github.com remote URL and every clone/fetch's arguments (sc-25391); `GitHubCli` is the only
+  `gh` run).
 - `src/DarkFactory.Analyzers` — the gateway lint (sc-25390), a Roslyn analyzer every build of the orchestrator and of
   `tests/DarkFactory.AcceptanceTests` runs (CI's `build-test` included), all errors: DF0001 an HTTP client/handler (made,
   subclassed, in `typeof` or an explicit type argument like `Activator.CreateInstance<HttpClient>()`), socket, web socket,
-  `WebRequest`/`WebClient`, `IHttpClientFactory`/`AddHttpClient`, or `gh`/`curl`/`wget`/`nc` started by `Process.Start`/
-  `ProcessStartInfo`, outside `Gateway/`; DF0002 a git remote write outside it (text whose subcommand, past git's global
+  `WebRequest`/`WebClient`, `IHttpClientFactory`/`AddHttpClient`, or a subprocess started by `Process.Start`/`ProcessStartInfo`
+  that is a network program (`gh`/`curl`/`wget`/`nc`/`ssh`/…, `NetworkPrograms`), a shell/interpreter/launcher (`bash`, `env`,
+  `python`, `perl`, `sudo`, …: `Launchers`) whose arguments or member's strings name one, a URL or a network library, or a
+  program whose name is not a constant unless read from `KnownLocalPrograms` (the inventory of today's: the gate's `TestStep.Program`,
+  `WorkerSandbox.SudoPath`, `WorkerSandbox.RunChecked(program)`, `FactoryOptions.ClaudePath`, `CrashRestartTests.DotnetHost`;
+  add one there only for a local program), outside `Gateway/`; DF0002 a git remote write outside it (text whose subcommand, past git's global
   options like `-C <dir>`/`--git-dir=…`, is `push`/`send-pack`/`http-push`/`remote set-url`, at its start — so a lone `push`
   argument — or after a `git` word); DF0003 a model provider host or key (`api.anthropic.com`, `ANTHROPIC_API_KEY`, …)
-  anywhere, the embedded manifests, prompts, scripts and Razor markup included; DF0004 GitHub's or Shortcut's API host outside
-  it. Strings are read as the compiler folds them (`"api.github" + ".com"`, consts, interpolations). Every rule is
+  anywhere, the embedded manifests, prompts, scripts and Razor markup included; DF0004 GitHub's or Shortcut's API host, or a
+  github.com git remote (a `.git` URL, an `@github.com` user, git's `http.https://github.com/` config), outside it; DF0005 a
+  `SuppressMessage`/`UnconditionalSuppressMessage` whose constant check id starts `DF`, anywhere (Roslyn honours those even for
+  NotConfigurable rules, so the attribute itself fails the build). Since such an attribute could hide its own DF0005, the
+  `GatewaySuppressionGuard` source generator (same assembly) adds an unsuppressible `#error` (CS1029) for each, and for any DF id
+  quoted in a `.razor` file. Razor components' generated code is linted like any source (generated code is analyzed). Strings are
+  read as the compiler folds them (`"api.github" + ".com"`, consts, interpolations). Every rule is
   `NotConfigurable` (no `#pragma`, `NoWarn` or `.editorconfig` severity turns it off), and both projects fail the build on
   `-p:RunAnalyzers=false` (target `RequireGatewayLint`). The unit test projects (`DarkFactory.Orchestrator.Tests`,
   `DarkFactory.CrashHost`) are exempt: they make only fake `HttpClient`s over fake handlers and loopback servers.
-  `GatewayLintTests` seed each violation, lint the current tree (orchestrator and acceptance tests, suppressed diagnostics
-  included), and fail on anything that would switch the lint off: a bare `#pragma warning disable` or one naming a DF rule, an
-  attribute (`SuppressMessage`, which Roslyn still honours for NotConfigurable rules) naming `Gateway` or a DF rule, a
-  `DiagnosticSuppressor`, and in project/MSBuild/analyzer-config/CI files a DF rule id, `dotnet_analyzer_diagnostic.`,
-  `category-Gateway`, `<RunAnalyzers>`/`<RunAnalyzersDuringBuild>`, `RunAnalyzers…=` or `<Analyzer Remove>`. Gate checks: a
-  test that makes a check fail carries `[FailsGateCheck("…")]`; `GateCheckCoverageTests` fails unless every check in
-  `GateCheckCoverage.Registry` (`GateChecks.All`, which must hold every `GateChecks` constant; the policy floors; the merge
-  gate's fail-closed `precondition:policy`/`precondition:pr-open`/`precondition:diff-complete` and `sealed-escalation`) has a
-  running (not skipped/explicit) test tagged with that check alone (a multi-check test does not count).
+  `GatewayLintTests` seed each violation, lint the current tree (orchestrator — its sources plus every source its build generated,
+  the Razor components' included, read from `obj/<config>/<tfm>/generated`: the orchestrator sets `EmitCompilerGeneratedFiles` —
+  and acceptance tests, suppressed diagnostics included), build a throwaway Razor library with `dotnet build` to prove a Razor
+  component's client and a (self-hiding) suppression fail the real build, and fail on anything that would switch the lint off: a
+  bare `#pragma warning disable` or one naming a DF rule, an attribute naming `Gateway` or a DF rule (in `.cs` and in the
+  generated Razor sources), a `DiagnosticSuppressor`, and in project/MSBuild/analyzer-config/CI files and `.razor` files a DF rule
+  id, `dotnet_analyzer_diagnostic.`, `category-Gateway`, `<RunAnalyzers>`/`<RunAnalyzersDuringBuild>`, `RunAnalyzers…=` or
+  `<Analyzer Remove>`. Gate checks: a test that makes a check fail carries `[FailsGateCheck("…")]`; `GateCheckCoverageTests`
+  fails unless every check in `GateCheckCoverage.Registry` (`GateChecks.All`, which must hold every `GateChecks` constant; the
+  policy floors; the merge gate's fail-closed `precondition:policy`/`precondition:pr-open`/`precondition:diff-complete` and
+  `sealed-escalation`) has a running (not skipped/explicit) test tagged with that check alone (a multi-check test does not count),
+  and unless each such test, run by the coverage test (every data row) with its check disabled through `Gate/GateCheckSeam`
+  (internal, per async flow, set only by `Disable`, which no production code calls and which reads no config/env/CLI — a test
+  checks both: no runtime bypass, E2), fails an assertion while passing with every check on (an empty or unrelated tagged test is
+  reported).
 - `scripts/` — `setup-worker-user.sh` (one-time root setup of the `_factory` sandbox user) and
   `factory-worker-launch` (the root-installed helper every sandboxed worker runs through).
 - `tests/DarkFactory.Orchestrator.Tests` — unit tests (no network; fake HTTP APIs, InMemory EF, local git).
@@ -57,7 +73,11 @@ Claude Code headless workers through the Weave router.
   `ShortcutContractTests` replay recorded Shortcut API fixtures (`Fixtures/shortcut`, strict request matching);
   re-record with `SHORTCUT_RECORD=1` (writes only throwaway `[dark-factory fixture]` stories, archived after).
 - `tests/DarkFactory.AcceptanceTests` — live epic acceptance harness; skips unless `FACTORY_E2E=1`. AT1–AT8 runbook:
-  `docs/acceptance.md` (the `factory work` tests use a throwaway ledger DB and their own work root, `E2e.cs`).
+  `docs/acceptance.md` (the `factory work` tests use a throwaway ledger DB and their own work root, `E2e.cs`). Phase 2's epic
+  AT2/AT4/AT5/AT6 (sc-25391): `ReviewGateTests` (typed outcome per row, merge queue, PR body and closeout equal to the ledger's),
+  `GateNegativeTests` (sealed path, corrupt policy on a throwaway branch, a new test passing on the base, a 4th fix round; review
+  panel replaced by `SeededReviewer`, seeding through `SandboxRepo`), `FreezeAndStuckTests` (freeze seeded in the throwaway
+  ledger; a stub Claude CLI replaying the stuck/silent fixtures), `IssueTriageTests.A_triage_session_that_read_issue_text_is_tainted_and_cannot_push`.
 
 ## Commands
 

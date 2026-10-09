@@ -5,6 +5,7 @@ using DarkFactory.Orchestrator;
 using DarkFactory.Orchestrator.Issues;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Shortcut;
+using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
 
@@ -114,6 +115,46 @@ public class IssueTriageTests
             await FactoryRunner.PollIssuesAsync(options, status, Console.Out, ct);
             using var github = OutboundHttp.GitHubApi();
             Assert.Contains(key, await FactoryRunner.CreateIssueSource(options, github).ListReadyAsync(ct));
+        }
+        finally
+        {
+            await CloseAsync(owner, repo, number);
+        }
+    }
+
+    /// <summary>
+    /// Epic AT6 (sc-25391): a session that read issue text cannot push. The owner opens an issue; the production intake triages it
+    /// in a real sandboxed worker session, which the ledger marks tainted (issue text) before anything else learns of it; the push
+    /// grant for that session is refused (so no installation token is minted for it), and no triage branch reached GitHub.
+    /// </summary>
+    [Fact]
+    public async Task A_triage_session_that_read_issue_text_is_tainted_and_cannot_push()
+    {
+        await using var e2e = await StartAsync("df_e2e_p2at6_taint");
+        var (_, options, repo) = Options(e2e);
+        var ct = TestContext.Current.CancellationToken;
+        var status = new IntakeStatus(TimeProvider.System);
+        await FactoryRunner.PollIssuesAsync(options, status, Console.Out, ct); // starts watching from now
+        using var owner = UserClient(Environment.GetEnvironmentVariable("GH_TOKEN")!);
+        var number = await OpenIssueAsync(owner, repo, "[dark-factory fixture] taint probe: whitespace-only text counts as one word", ConfidentBug, ct);
+        try
+        {
+            await FactoryRunner.PollIssuesAsync(options, status, Console.Out, ct);
+
+            var key = await KeyAsync(e2e, repo, number, ct);
+            Assert.NotNull(IssueIntake.Latest(await HistoryAsync(e2e, key, ct))); // it was triaged
+            await using var db = e2e.Db();
+            var externalId = ItemNaming.GitHubIssue.Format(key);
+            var item = await db.WorkItems.AsNoTracking().SingleAsync(i => i.Source == "github" && i.ExternalId == externalId, ct);
+            var taints = await db.SessionTaints.AsNoTracking().Where(t => t.WorkItemId == item.Id).ToListAsync(ct);
+            var session = Assert.Single(taints, t => t.Reason == Taint.IssueText).ClaudeSessionId;
+            Assert.False(string.IsNullOrEmpty(session));
+            // Its work cannot be pushed: no grant, so no push token.
+            var refused = await Assert.ThrowsAsync<SessionTaintedException>(() => new WorkLedger(db, TimeProvider.System).GrantPushAsync([session], ct));
+            Assert.Contains(Taint.IssueText, refused.Message);
+            // Nothing was pushed from it.
+            using var branch = await owner.GetAsync($"repos/{repo}/branches/{Uri.EscapeDataString($"factory/triage-{externalId}")}", ct);
+            Assert.Equal(System.Net.HttpStatusCode.NotFound, branch.StatusCode);
         }
         finally
         {
