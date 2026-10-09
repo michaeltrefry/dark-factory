@@ -28,8 +28,15 @@ internal static class SandboxSupport
     public static string FakeSudo(string dir) => Executable(dir, "fake-sudo.sh",
         "#!/bin/sh\n[ \"$1\" = -n ] && [ \"$2\" = -u ] || exit 99\nshift 3\nexec \"$@\"\n");
 
-    /// <summary>A sandbox whose helper is a <see cref="SafeHelper"/> copy (as <c>_factory</c>, which we are not: no uid sweep).</summary>
-    public static WorkerSandbox LocalSandbox(string dir) => new("_factory", SafeHelper.Create(dir).Path, FakeSudo(dir));
+    /// <summary>
+    /// A sandbox whose helper is a <see cref="SafeHelper"/> copy (as <c>_factory</c>, which we are not: no uid sweep), with
+    /// <see cref="LocalRegistry"/> as its registry.
+    /// </summary>
+    public static WorkerSandbox LocalSandbox(string dir) =>
+        new("_factory", SafeHelper.Create(dir, new SafeHelperOptions { Registry = LocalRegistry(dir) }).Path, FakeSudo(dir));
+
+    /// <summary>Where a worker of <see cref="LocalSandbox"/> records ("pid|start") a process it leaves behind for the helper to kill.</summary>
+    public static string LocalRegistry(string dir) => Path.Combine(dir, "local-registry");
 
     public static string Executable(string dir, string name, string content)
     {
@@ -49,46 +56,19 @@ internal static class SandboxSupport
         return home;
     }
 
-    public static bool IsAlive(int pid)
-    {
-        try
-        {
-            using var p = Process.GetProcessById(pid);
-            return !p.HasExited;
-        }
-        catch (ArgumentException)
-        {
-            return false;
-        }
-    }
-
-    /// <summary>Cleanup for a test that failed to kill what it started (so the test run never hangs on it).</summary>
-    public static void KillQuietly(int pid)
-    {
-        try
-        {
-            using var p = Process.GetProcessById(pid);
-            p.Kill();
-        }
-        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
-        {
-            // Already gone.
-        }
-    }
-
     /// <summary>
-    /// The pid a worker script wrote to <paramref name="pidFile"/>. Startup through the launch helper can take
-    /// seconds on a loaded machine, so this waits up to 60 s (failing at once if <paramref name="run"/> ends first)
-    /// and only accepts a complete line.
+    /// The process whose "pid|start" record (<see cref="OwnProcess.ShellRecord"/>) a worker script wrote to
+    /// <paramref name="pidFile"/>. Startup through the launch helper can take seconds on a loaded machine, so this waits up
+    /// to 60 s (failing at once if <paramref name="run"/> ends first) and only accepts a complete line.
     /// </summary>
-    public static async Task<int> WaitForPidAsync(string pidFile, Task run)
+    public static async Task<OwnProcess> WaitForPidAsync(string pidFile, Task run)
     {
         var deadline = DateTime.UtcNow.AddSeconds(60);
         while (true)
         {
-            if (File.Exists(pidFile) && File.ReadAllText(pidFile) is var text && text.EndsWith('\n') && int.TryParse(text.Trim(), out var pid))
+            if (File.Exists(pidFile) && File.ReadAllText(pidFile) is var text && text.EndsWith('\n') && text.Contains('|'))
             {
-                return pid;
+                return OwnProcess.Parse(text);
             }
             if (run.IsCompleted)
             {
@@ -98,31 +78,6 @@ internal static class SandboxSupport
             Assert.True(DateTime.UtcNow < deadline, $"no pid in {pidFile} after 60 s");
             await Task.Delay(50);
         }
-    }
-
-    /// <summary>Asserts every pid dies within 5s; kills any survivor first so a failure can't leak it.</summary>
-    public static async Task WaitUntilDeadAsync(params int[] pids)
-    {
-        try
-        {
-            await WaitUntilDeadCoreAsync(pids);
-        }
-        finally
-        {
-            foreach (var pid in pids)
-            {
-                KillQuietly(pid);
-            }
-        }
-    }
-
-    private static async Task WaitUntilDeadCoreAsync(int[] pids)
-    {
-        for (var i = 0; i < 50 && pids.Any(IsAlive); i++)
-        {
-            await Task.Delay(100);
-        }
-        Assert.All(pids, pid => Assert.False(IsAlive(pid), $"process {pid} survived the stop"));
     }
 }
 
@@ -273,8 +228,8 @@ public class WorkerSandboxTests
     /// <param name="spareSelf">false: the mutation that drops the helper's self-exclusion (kill -1 semantics on macOS).</param>
     private SafeHelper HelperWithRegistryKill(string registry, bool sandboxRole = true, bool spareSelf = true)
     {
-        Assert.Contains(SelfExclusion, SafeHelper.Source);
-        Assert.DoesNotContain("kill -KILL -1", SafeHelper.Source);
+        Assert.True(SafeHelper.SourceContains(SelfExclusion));
+        Assert.False(SafeHelper.SourceContains("kill -KILL -1"));
         return SafeHelper.Create(_dir, new SafeHelperOptions
         {
             Identity = sandboxRole ? FakeIdentity.SandboxRole : null,
@@ -310,7 +265,8 @@ public class WorkerSandboxTests
     {
         var registry = Path.Combine(_dir, "uid-pids");
         using var sleeper = StartSetsidSleeper();
-        SafeHelper.Register(registry, sleeper.Id);
+        var own = OwnProcess.Of(sleeper);
+        SafeHelper.Register(registry, own);
         var helper = HelperWithRegistryKill(registry);
 
         var (exitCode, stdout, helperPid) = await RunRegistryHelperAsync(helper, "/bin/sh", "-c", $"echo ok; exit {workerExit}");
@@ -320,7 +276,7 @@ public class WorkerSandboxTests
         Assert.Contains(sleeper.Id, helper.Targets); // the sweep ran over the user's processes
         Assert.DoesNotContain(helperPid, helper.Targets);
         Assert.Empty(helper.Refusals);
-        await SandboxSupport.WaitUntilDeadAsync(sleeper.Id);
+        await OwnProcess.WaitUntilDeadAsync(own);
     }
 
     [Fact]
@@ -357,7 +313,7 @@ public class WorkerSandboxTests
     /// <param name="descendants">false: the mutation that drops the descendant exclusion.</param>
     private SafeHelper HelperWithFakeListing(string listing, bool descendants = true, FakeIdentity? identity = null)
     {
-        Assert.Contains(DescendantExclusion, SafeHelper.Source);
+        Assert.True(SafeHelper.SourceContains(DescendantExclusion));
         return SafeHelper.Create(_dir, new SafeHelperOptions
         {
             Identity = identity ?? FakeIdentity.SandboxRole,
@@ -434,23 +390,27 @@ public class WorkerSandboxTests
     }
 
     /// <summary>
-    /// The helper's second sweep check (by uid), through a copy with a fake <c>id</c> whose name check passes: a
-    /// <c>sandbox_user</c> that is root, a login account (the owner's), not this uid, unresolvable, or the uid of whoever
-    /// invoked sudo is refused before the process table is ever read, and nothing is signalled.
+    /// The helper's second sweep check (by uid), through a copy with a fake <c>id</c> whose name check passes: unless the
+    /// pinned <c>sandbox_uid</c> is set, in 400-499 (so not root, a login account such as the owner's, or another role
+    /// account such as _spotlight), still <c>sandbox_user</c>'s uid and this helper's, and not the uid of whoever invoked
+    /// sudo, the sweep is refused before the process table is ever read, and nothing is signalled.
     /// </summary>
     [Theory]
-    [InlineData("michael", "501", "michael=501", "", "", "login account")] // sandbox_user renamed to the owner
-    [InlineData("_dftest", "0", "_dftest=0", "", "", "root or a login account")]
-    [InlineData("_dftest", "450", "_dftest=451", "", "", "is not _dftest's (451)")]
-    [InlineData("_dftest", "450", "", "", "", "_dftest has no uid")]
-    [InlineData("_dftest", "450", "_dftest=450", "", "450", "SUDO_UID")]
-    [InlineData("_dftest", "450", "_dftest=450,owner=450", "owner", "", "invoking user owner's")]
-    [InlineData("_dftest", "450", "_dftest=450", "ghost", "", "invoking user ghost's")] // fails closed
+    [InlineData("michael", "501", "michael=501", "501", "", "", "pinned uid 501 is outside 400-499")] // sandbox_user renamed to the owner
+    [InlineData("_spotlight", "89", "_spotlight=89", "89", "", "", "pinned uid 89 is outside 400-499")] // another role account
+    [InlineData("_dftest", "0", "_dftest=0", "0", "", "", "pinned uid 0 is outside 400-499")] // root
+    [InlineData("_dftest", "450", "_dftest=450", "", "", "", "no sandbox_uid pinned")] // never installed by setup
+    [InlineData("_dftest", "450", "_dftest=451", "450", "", "", "_dftest's uid 451 is not the pinned 450")]
+    [InlineData("_dftest", "452", "_dftest=450", "450", "", "", "effective uid 452 is not _dftest's (450)")]
+    [InlineData("_dftest", "450", "", "450", "", "", "_dftest has no uid")]
+    [InlineData("_dftest", "450", "_dftest=450", "450", "", "450", "SUDO_UID")]
+    [InlineData("_dftest", "450", "_dftest=450,owner=450", "450", "owner", "", "invoking user owner's")]
+    [InlineData("_dftest", "450", "_dftest=450", "450", "ghost", "", "invoking user ghost's")] // fails closed
     public async Task Uid_sweep_refuses_unless_it_runs_as_the_sandbox_role_accounts_own_uid(
-        string user, string uid, string uids, string sudoUser, string sudoUid, string reason)
+        string user, string uid, string uids, string pinned, string sudoUser, string sudoUid, string reason)
     {
         var identity = new FakeIdentity(user, uid, uids.Split(',', StringSplitOptions.RemoveEmptyEntries)
-            .ToDictionary(e => e.Split('=')[0], e => e.Split('=')[1]));
+            .ToDictionary(e => e.Split('=')[0], e => e.Split('=')[1]), pinned);
         var env = new Dictionary<string, string>();
         if (sudoUser != "")
         {
@@ -476,7 +436,7 @@ public class WorkerSandboxTests
     public async Task Uid_sweep_runs_as_the_sandbox_role_account_invoked_through_sudo_by_the_owner()
     {
         // The control for the refusals above: the production case (owner 501 sudo's to the role account 450).
-        var identity = new FakeIdentity("_dftest", "450", new Dictionary<string, string> { ["_dftest"] = "450", ["owner"] = "501" });
+        var identity = new FakeIdentity("_dftest", "450", new Dictionary<string, string> { ["_dftest"] = "450", ["owner"] = "501" }, "450");
         var helper = HelperWithFakeListing(Machinery + "; echo '400001 1'", identity: identity);
 
         var (exitCode, stderr, passes, targets) = await RunFakeListingHelperAsync(helper, new Dictionary<string, string> { ["SUDO_USER"] = "owner", ["SUDO_UID"] = "501" });
@@ -490,7 +450,7 @@ public class WorkerSandboxTests
     /// <summary>
     /// perl: double-fork a grandchild that setsid()s away — a new session and process group, reparented
     /// to launchd, so neither the tree kill nor the group kill can reach it (as a detached build server
-    /// would be) — records "pid|start time" in the registry and sleeps. The worker prints that pid, then
+    /// would be) — records "pid|start time" in the registry and sleeps. The worker prints that record, then
     /// sleeps <paramref name="parentSleeps"/> seconds (0: exits at once).
     /// </summary>
     private static string[] SetsidGrandchild(string registry, int parentSleeps = 0) =>
@@ -501,7 +461,7 @@ public class WorkerSandboxTests
         + "my $ls = `/bin/ps -o lstart= -p $$`; $ls =~ s/\\s+/ /g; $ls =~ s/^ | $//g; "
         + "open(my $f, '>>', $r); print $f \"$$|$ls\\n\"; close $f; exec('/bin/sleep', '600'); } "
         + "waitpid($pid, 0); select(undef, undef, undef, 0.05) until -s $r; "
-        + "open(my $g, '<', $r); my ($gc) = split(/\\|/, scalar(<$g>)); print \"$gc\\n\"; sleep(shift);",
+        + "open(my $g, '<', $r); print scalar(<$g>); sleep(shift);",
         registry, parentSleeps.ToString(),
     ];
 
@@ -516,15 +476,15 @@ public class WorkerSandboxTests
         using var p = Process.Start(psi)!;
         await p.StandardInput.WriteAsync("\n");
         await p.StandardInput.FlushAsync();
-        var grandchild = int.Parse((await p.StandardOutput.ReadLineAsync())!);
+        var grandchild = OwnProcess.Parse((await p.StandardOutput.ReadLineAsync())!);
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         await p.WaitForExitAsync(cts.Token);
         p.StandardInput.Close();
 
         Assert.Equal(0, p.ExitCode);
-        Assert.Contains(grandchild, helper.Targets);
+        Assert.Contains(grandchild.Pid, helper.Targets);
         Assert.DoesNotContain(p.Id, helper.Targets);
-        await SandboxSupport.WaitUntilDeadAsync(grandchild);
+        await OwnProcess.WaitUntilDeadAsync(grandchild);
     }
 
     [Fact]
@@ -538,17 +498,17 @@ public class WorkerSandboxTests
         using var p = Process.Start(psi)!;
         await p.StandardInput.WriteAsync("\n");
         await p.StandardInput.FlushAsync();
-        var grandchild = int.Parse((await p.StandardOutput.ReadLineAsync())!);
-        Assert.True(SandboxSupport.IsAlive(grandchild));
+        var grandchild = OwnProcess.Parse((await p.StandardOutput.ReadLineAsync())!);
+        Assert.True(grandchild.IsAlive);
 
         p.StandardInput.Close(); // Stop
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         await p.WaitForExitAsync(cts.Token);
 
         Assert.Equal(137, p.ExitCode); // the killed worker's status, reported by a helper that survived its sweep
-        Assert.Contains(grandchild, helper.Targets);
+        Assert.Contains(grandchild.Pid, helper.Targets);
         Assert.DoesNotContain(p.Id, helper.Targets);
-        await SandboxSupport.WaitUntilDeadAsync(grandchild);
+        await OwnProcess.WaitUntilDeadAsync(grandchild);
     }
 
     [Fact]
@@ -561,7 +521,7 @@ public class WorkerSandboxTests
         using var p = Process.Start(psi)!;
         await p.StandardInput.WriteAsync("\n");
         await p.StandardInput.FlushAsync();
-        var grandchild = int.Parse((await p.StandardOutput.ReadLineAsync())!);
+        var grandchild = OwnProcess.Parse((await p.StandardOutput.ReadLineAsync())!);
         try
         {
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
@@ -569,41 +529,47 @@ public class WorkerSandboxTests
             p.StandardInput.Close();
             await Task.Delay(500);
 
-            Assert.True(SandboxSupport.IsAlive(grandchild), "the helper signalled by uid while not the sandbox user");
+            Assert.True(grandchild.IsAlive, "the helper signalled by uid while not the sandbox user");
             Assert.Empty(helper.Targets);
         }
         finally
         {
-            SandboxSupport.KillQuietly(grandchild);
+            grandchild.KillIfStillRunning();
         }
     }
 
     [Fact]
     public async Task Closing_the_helpers_stdin_kills_the_whole_worker_tree()
     {
-        using var p = LocalSandbox().Start(_dir, "/bin/sh", ["-c", "sleep 600 & echo $!; echo $$; wait"], new Dictionary<string, string>());
-        var child = int.Parse((await p.StandardOutput.ReadLineAsync())!);
-        var shell = int.Parse((await p.StandardOutput.ReadLineAsync())!);
-        Assert.True(SandboxSupport.IsAlive(child) && SandboxSupport.IsAlive(shell));
+        using var p = LocalSandbox().Start(_dir, "/bin/sh",
+            ["-c", $"sleep 600 & echo {OwnProcess.ShellRecord("$!")}; echo {OwnProcess.ShellRecord("$$")}; wait"], new Dictionary<string, string>());
+        var child = OwnProcess.Parse((await p.StandardOutput.ReadLineAsync())!);
+        var shell = OwnProcess.Parse((await p.StandardOutput.ReadLineAsync())!);
+        Assert.True(child.IsAlive && shell.IsAlive);
 
         WorkerSandbox.Stop(p);
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         await p.WaitForExitAsync(cts.Token);
 
-        await SandboxSupport.WaitUntilDeadAsync(child, shell);
+        await OwnProcess.WaitUntilDeadAsync(child, shell);
     }
 
     [Fact]
     public async Task Background_processes_do_not_outlive_the_worker()
     {
-        using var p = LocalSandbox().Start(_dir, "/bin/sh", ["-c", "sleep 600 >/dev/null 2>&1 & echo $!"], new Dictionary<string, string>());
-        var orphan = int.Parse((await p.StandardOutput.ReadLineAsync())!);
+        // Reparented to launchd once the worker exits, so the seam allows the worker's group kill only because the worker
+        // registered it (its own child, recorded before it exits).
+        var registry = SandboxSupport.LocalRegistry(_dir);
+        using var p = LocalSandbox().Start(_dir, "/bin/sh",
+            ["-c", $"sleep 600 >/dev/null 2>&1 & r={OwnProcess.ShellRecord("$!")}; echo \"$r\" >>'{registry}'; echo \"$r\""],
+            new Dictionary<string, string>());
+        var orphan = OwnProcess.Parse((await p.StandardOutput.ReadLineAsync())!);
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         await p.WaitForExitAsync(cts.Token);
         WorkerSandbox.Stop(p);
 
         Assert.Equal(0, p.ExitCode);
-        await SandboxSupport.WaitUntilDeadAsync(orphan);
+        await OwnProcess.WaitUntilDeadAsync(orphan);
     }
 
     [Fact]
@@ -638,7 +604,7 @@ public class WorkerSandboxTests
     {
         var pidFile = Path.Combine(_dir, "pid");
         var claude = SandboxSupport.Executable(_dir, "slow-claude.sh",
-            $"#!/bin/sh\necho $$ > '{pidFile}'\necho '{{\"type\":\"system\",\"session_id\":\"s\"}}'\nsleep 600\n");
+            $"#!/bin/sh\necho {OwnProcess.ShellRecord("$$")} > '{pidFile}'\necho '{{\"type\":\"system\",\"session_id\":\"s\"}}'\nsleep 600\n");
         var worker = new ClaudeWorker(claude, SandboxSupport.Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(5), LocalSandbox());
         using var cts = new CancellationTokenSource();
         var run = worker.RunAsync(_dir, "p", null, null, cts.Token);
@@ -648,7 +614,7 @@ public class WorkerSandboxTests
 
         var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
         Assert.False(WorkerStillRunning.IsMarked(ex)); // stopped: its worktree may go
-        await SandboxSupport.WaitUntilDeadAsync(pid);
+        await OwnProcess.WaitUntilDeadAsync(pid);
     }
 
     [Fact]
@@ -657,7 +623,7 @@ public class WorkerSandboxTests
         var pidFile = Path.Combine(_dir, "stuck-pid");
         // A "sudo" that ignores its stdin closing, as a wedged helper would.
         var stuckSudo = SandboxSupport.Executable(_dir, "stuck-sudo.sh",
-            $"#!/bin/sh\necho $$ > '{pidFile}'\necho '{{\"type\":\"system\",\"session_id\":\"s\"}}'\nexec /bin/sleep 600 </dev/null\n");
+            $"#!/bin/sh\necho {OwnProcess.ShellRecord("$$")} > '{pidFile}'\necho '{{\"type\":\"system\",\"session_id\":\"s\"}}'\nexec /bin/sleep 600 </dev/null\n");
         var sandbox = new WorkerSandbox("_factory", SafeHelper.Create(_dir).Path, stuckSudo);
         var worker = new ClaudeWorker("claude", SandboxSupport.Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(5), sandbox,
             stopGrace: TimeSpan.FromMilliseconds(300));
@@ -671,11 +637,11 @@ public class WorkerSandboxTests
             // Still Ctrl-C to the caller (not an ordinary failure), flagged so nobody deletes the worktree under it.
             var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
             Assert.True(WorkerStillRunning.IsMarked(ex));
-            Assert.True(SandboxSupport.IsAlive(pid));
+            Assert.True(pid.IsAlive);
         }
         finally
         {
-            SandboxSupport.KillQuietly(pid);
+            pid.KillIfStillRunning();
         }
     }
 
@@ -695,13 +661,14 @@ public class WorkerSandboxTests
         // The recorded pid is sudo's (root-owned, and gone after a crash); the orphan is _factory's.
         var registry = Path.Combine(_dir, "uid-pids");
         var helper = HelperWithRegistryKill(registry);
-        using var orphan = StartSetsidSleeper();
-        SafeHelper.Register(registry, orphan.Id);
+        using var orphanProcess = StartSetsidSleeper();
+        var orphan = OwnProcess.Of(orphanProcess);
+        SafeHelper.Register(registry, orphan);
         var worker = new ClaudeWorker("claude", SandboxSupport.Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1),
             new WorkerSandbox(Environment.UserName, helper.Path, SandboxSupport.FakeSudo(_dir)));
 
         Assert.True(await worker.StopOrphanAsync(999_999, CancellationToken.None));
-        await SandboxSupport.WaitUntilDeadAsync(orphan.Id);
+        await OwnProcess.WaitUntilDeadAsync(orphan);
     }
 
     [Fact]
@@ -721,12 +688,13 @@ public class WorkerSandboxTests
         var registry = Path.Combine(_dir, "uid-pids");
         var helper = HelperWithRegistryKill(registry);
         using var sleeper = StartSetsidSleeper();
-        SafeHelper.Register(registry, sleeper.Id);
+        var own = OwnProcess.Of(sleeper);
+        SafeHelper.Register(registry, own);
 
         var stopped = await new WorkerSandbox(Environment.UserName, helper.Path, SandboxSupport.FakeSudo(_dir)).StopAllAsync(CancellationToken.None);
 
         Assert.True(stopped);
-        await SandboxSupport.WaitUntilDeadAsync(sleeper.Id);
+        await OwnProcess.WaitUntilDeadAsync(own);
     }
 
     [Fact]
@@ -916,12 +884,12 @@ public class LiveWorkerSandboxTests
                     Assert.True(await git.CommitAndPushAsync(Repo, ws, "sc-1: change", ct)); // owner reads the worker's files
                     break;
                 case "stop":
-                    using (var p = sandbox.Start(ws.Path, "/bin/sh", ["-c", "sleep 600 & echo $!; wait"], new Dictionary<string, string>()))
+                    using (var p = sandbox.Start(ws.Path, "/bin/sh", ["-c", $"sleep 600 & echo {OwnProcess.ShellRecord("$!")}; wait"], new Dictionary<string, string>()))
                     {
-                        var pid = int.Parse((await p.StandardOutput.ReadLineAsync(ct))!);
+                        var pid = OwnProcess.Parse((await p.StandardOutput.ReadLineAsync(ct))!);
                         WorkerSandbox.Stop(p);
                         await p.WaitForExitAsync(ct);
-                        await SandboxSupport.WaitUntilDeadAsync(pid);
+                        await OwnProcess.WaitUntilDeadAsync(pid);
                     }
                     break;
             }

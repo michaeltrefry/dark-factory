@@ -28,6 +28,8 @@
     <EmbeddedResource Include="GitHub/gate-app-manifest.json" LogicalName="gate-app-manifest.json" />
     <!-- The review panel's prompts (sealed: the factory's own repo, compiled in; never read from a target repo or disk). -->
     <EmbeddedResource Include="../../factory/prompts/*.md" LogicalName="factory/prompts/%(Filename)%(Extension)" />
+    <!-- The launch helper as the repo has it: the installed one must match it (WorkerSandbox.StaleHelperReason). Only compared, never run. -->
+    <EmbeddedResource Include="../../scripts/factory-worker-launch" LogicalName="factory-worker-launch" />
     <InternalsVisibleTo Include="DarkFactory.Orchestrator.Tests" />
     <InternalsVisibleTo Include="DarkFactory.AcceptanceTests" />
   </ItemGroup>
