@@ -84,7 +84,8 @@ public sealed class GitWorkspace(
     private const string CommitterName = "dark-factory[bot]";
     private const string CommitterEmail = "dark-factory@users.noreply.github.com";
 
-    public static string GitHubRemote(RepoRef repo) => $"https://github.com/{repo.Owner}/{repo.Name}.git";
+    /// <summary>The repository's github.com remote (<see cref="GitRemoteReads.GitHubRemote"/>: the gateway owns it).</summary>
+    public static string GitHubRemote(RepoRef repo) => GitRemoteReads.GitHubRemote(repo);
 
     public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct) =>
         CreateWorktreeAsync(repo, branch, baseBranch => $"origin/{baseBranch}", ct);
@@ -108,12 +109,12 @@ public sealed class GitWorkspace(
         if (!Directory.Exists(Path.Combine(clone, ".git")))
         {
             Directory.CreateDirectory(Path.GetDirectoryName(clone)!);
-            await Git(Path.GetDirectoryName(clone)!, auth, ct, "clone", remoteUrl(repo), clone);
+            await Git(Path.GetDirectoryName(clone)!, auth, ct, GitRemoteReads.Clone(remoteUrl(repo), clone));
         }
         else
         {
-            await Git(clone, auth, ct, "fetch", "--prune", "origin");
-            await Git(clone, auth, ct, "remote", "set-head", "origin", "--auto");
+            await Git(clone, auth, ct, GitRemoteReads.Fetch());
+            await Git(clone, auth, ct, GitRemoteReads.RefreshHead());
         }
         return clone;
     }

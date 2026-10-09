@@ -49,7 +49,7 @@ public class AppTokenPushTests
         }
 
         var dir = Directory.CreateTempSubdirectory("df-e2e-push-").FullName;
-        await GitWorkspace.RunGitAsync(dir, auth, ["clone", "--depth", "1", GitWorkspace.GitHubRemote(Sandbox), "repo"], ct);
+        await GitWorkspace.RunGitAsync(dir, auth, GitRemoteReads.Clone(GitRemoteReads.GitHubRemote(Sandbox), "repo", shallow: true), ct);
         var repo = Path.Combine(dir, "repo");
         await File.WriteAllTextAsync(Path.Combine(repo, "e2e-push-probe.txt"), $"{Guid.NewGuid()}\n", ct);
         await GitWorkspace.RunGitAsync(repo, null, ["add", "-A"], ct);
@@ -90,7 +90,7 @@ public class AppTokenPushTests
         }
         Assert.NotEqual(Sandbox, OtherRepo);
         var other = await Assert.ThrowsAsync<InvalidOperationException>(() => GitWorkspace.RunGitAsync(repo, auth,
-            GitRemoteWrites.PushRef(GitWorkspace.GitHubRemote(OtherRepo), $"HEAD:{branch}"), ct));
+            GitRemoteWrites.PushRef(GitRemoteReads.GitHubRemote(OtherRepo), $"HEAD:{branch}"), ct));
         Assert.True(other.Message.Contains("403") || other.Message.Contains("denied", StringComparison.OrdinalIgnoreCase),
             $"the push to {OtherRepo} failed for a reason other than access denial: {other.Message}");
     }

@@ -86,9 +86,12 @@ public class CrashRestartTests
     }
 
     /// <summary><c>dotnet DarkFactory.Orchestrator.dll work</c> with the test's settings; its output goes to the test log.</summary>
+    /// <summary>The dotnet host <c>dotnet test</c> runs under (a known local program of the gateway lint), else <c>dotnet</c> on PATH.</summary>
+    private static string DotnetHost => Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet";
+
     private static Process StartWork(IReadOnlyDictionary<string, string> environment)
     {
-        var psi = new ProcessStartInfo(Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
+        var psi = new ProcessStartInfo(DotnetHost)
         {
             RedirectStandardOutput = true,
             RedirectStandardError = true,
