@@ -91,6 +91,9 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Worker:Auth` | `router-key` (default: the worker holds only the router key, in `X-Weave-Router-Key` and as `ANTHROPIC_AUTH_TOKEN`; the router serves it from plans enrolled with `router login claude` / `router login codex`; `factory run`/`work` refuse to start unless `GET /v1/subscriptions/usage` lists an enabled `managed`/`shared` credential) or `claude-login` (weaker, violates E5: the worker's own Claude login, passed through by the router) |
 | `Worker:TimeoutMinutes` | `30` |
 | `Worker:PauseGraceSeconds` | `660` (a paused worker that has not stopped at a tool boundary by then is stopped; must exceed the 600 s longest tool call) |
+| `Worker:StuckRepeats` | `5` (≥ 2: near-identical turns, or cycles of up to 4 turns, in a row that make a running worker stuck; sc-25388) |
+| `Worker:StuckSimilarity` | `0.96` (0 < s ≤ 1: trigram Dice similarity, after normalising whitespace (and digits outside tool inputs), at which two turns count as the same) |
+| `Worker:QuietMinutes` | `10` (> 0: a running session with no event for this long is marked quiet on the dashboard; silence never interrupts) |
 | `Factory:HostPort` | `47822` (`factory work`: 127.0.0.1, plus `Dashboard:BindAddress`) |
 | `Dashboard:BindAddress` | unset = loopback only; one private address (RFC 1918, 100.64/10, fc00::/7) on a local interface |
 | `Dashboard:HostName` | extra Host header the dashboard answers to (e.g. MagicDNS name); one plain DNS name, no wildcard/port |
@@ -321,6 +324,30 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   process (`factory work` or a separate `factory run`) recorded them. Slow viewers are disconnected, never waited on.
   The hub answers only `Host: 127.0.0.1|localhost` (plus the configured bind address/host name), same-origin (or
   Origin-less) clients, and logged-in ones.
+- Stuck workers (sc-25388, `Sessions/StuckDetector.cs`): every implementer/fixer session's stdout is folded, line by line, into
+  turns (one assistant `message.id`: its text, each tool call's name + input JSON and that call's `tool_result` with its error
+  flag; thinking and the router's banner/feedback footer left out). Parts are normalised separately: tool name + input collapse
+  whitespace only (digits kept: `Step1.cs` ≠ `Step2.cs`); text and results also make digit runs `0`; each result's outcome (error
+  flag + pass/fail/error word counts) must match exactly. Similarity is character-trigram Dice over the whole normalised part (no
+  head/tail cut). Two turns are the same when outcomes match and calls, and text+results, are each ≥ `Worker:StuckSimilarity`;
+  their tool calls are the same when both made calls, outcomes match and calls and results (text left out) are each that alike.
+  A session is stuck when, for a cycle length p = 1…4, its last `Worker:StuckRepeats` × p complete turns repeat one p-turn cycle
+  — each turn the same as (or with the same tool calls as) the turn p later — the whole recent sequence, so the same test
+  command after different edits, or with a different result, is not a loop; the same failing call narrated differently is. Only
+  the last `StuckRepeats` × 4 complete turns are kept. Only complete turns (all tool results in,
+  or a later turn started) are compared, so it trips on the last repetition's result. Then `stuck` (Detail: why, tool names only)
+  is checkpointed before the worker is interrupted at its next tool boundary through the Pause mechanism (`IWorker.RequestPause`;
+  a Continue does not withdraw it; the pause grace stops a worker that ignores it); the session ends `stuck` (cost fetched) and
+  is never resumed. Its round fails: in Implement (no fix rounds) the worktree is removed and a `stuck-retry` checkpoint starts a
+  fresh session in a fresh worktree, and the second stuck session since entering Implement (`RunPipeline.MaxStuckImplementSessions`)
+  escalates; in a fix round nothing is pushed, the worktree is removed and the round ends at its next state with the head
+  unchanged (Review records a failed `fix-progress`, CI sees the same red CI, the merge gate the same conflict), which then
+  dispatches the next round or escalates at `Lifecycle.MaxFixRounds` — the stuck round counted when it started (the Review cap's
+  escalation says how many rounds failed because the fixer was stuck, and the last reason). A fresh implementer after
+  `stuck-retry` gets one prompt line naming the repeated tool calls (names only, E4). A worker that
+  finishes on its own after the detection is done, like one after a pause. Silence never counts: the dashboard marks a running
+  session quiet (pipeline `(live, quiet)`, session page `quiet: no event for …`) after `Worker:QuietMinutes` without an event, and
+  nothing else happens. The triage worker (read-only, no round) is not watched.
 - Dashboard (E8): Kestrel listens on 127.0.0.1 and at most one validated private address (`DashboardBinding`; never a
   wildcard). A fallback authorization policy makes every endpoint (pages, `/_blazor`, `/hubs/sessions`, static assets)
   require the cookie login except `/login` and the login form post (antiforgery + 5/min/IP rate limit). The dashboard

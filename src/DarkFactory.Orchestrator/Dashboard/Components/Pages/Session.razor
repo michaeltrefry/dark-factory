@@ -4,6 +4,7 @@
 @inject IDashboardData Data
 @inject ISessionViewers Viewers
 @inject PipelineChanges Changes
+@inject TimeProvider Time
 
 <PageTitle>Session · Dark Factory</PageTitle>
 
@@ -17,6 +18,10 @@ else
     <p class="meta">
         @_header.Repo · attempt @_header.Session.Attempt ·
         <span class="status">@(_header.Session.Running ? "running (live)" : $"finished: {_header.Session.ExitStatus ?? "unknown"}")</span> ·
+        @if (Quiet is { } silent)
+        {
+            <span class="quiet">quiet: no event for @Format.Elapsed(silent)</span><text> · </text>
+        }
         cost @Format.Cost(_header.Session.CostUsd)
     </p>
     <ol class="transcript">
@@ -44,9 +49,25 @@ else
     private bool _joined;
     private bool _dropped;
 
+    private DateTimeOffset? _lastEventAt;
+    private ITimer? _tick;
+
+    /// <summary>
+    /// How long the running session has been silent, when that is at least the quiet threshold (sc-25388): marked only, silence
+    /// alone never interrupts a worker. The last event is the latest of the header's read and the events received since.
+    /// </summary>
+    private TimeSpan? Quiet =>
+        _header?.Session is { Running: true } s && (s with { LastEventAt = Latest(s.LastEventAt, _lastEventAt) }) is var seen
+        && seen.QuietAt(Time.GetUtcNow(), Data.QuietThreshold)
+            ? Time.GetUtcNow() - (seen.LastEventAt ?? seen.StartedAt)
+            : null;
+
+    private static DateTimeOffset? Latest(DateTimeOffset? a, DateTimeOffset? b) => a is null ? b : b is null ? a : a > b ? a : b;
+
     protected override async Task OnInitializedAsync()
     {
         Changes.Changed += OnChanged; // the session's end and cost arrive as item changes
+        _tick = Time.CreateTimer(_ => _ = InvokeAsync(StateHasChanged), null, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
         _header = await Data.SessionAsync(SessionId, _cts.Token);
         _loaded = true;
     }
@@ -82,6 +103,7 @@ else
         foreach (var e in page)
         {
             _entries.AddRange(_formatter.Format(e));
+            _lastEventAt = Latest(_lastEventAt, e.ReceivedAt);
         }
         StateHasChanged();
     });
@@ -121,6 +143,7 @@ else
     public async ValueTask DisposeAsync()
     {
         Changes.Changed -= OnChanged;
+        _tick?.Dispose();
         _cts.Cancel();
         if (_joined)
         {

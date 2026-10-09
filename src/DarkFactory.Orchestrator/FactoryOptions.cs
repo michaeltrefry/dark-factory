@@ -157,6 +157,23 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     }
 
     /// <summary>
+    /// When a running worker counts as stuck and is interrupted (sc-25388, <see cref="Sessions.StuckDetector"/>):
+    /// <c>Worker:StuckRepeats</c> (≥ 2, default 5) near-identical turns or cycles in a row, each at least
+    /// <c>Worker:StuckSimilarity</c> (0 &lt; s ≤ 1, default 0.96) alike. A value out of range throws (the factory refuses to start).
+    /// </summary>
+    public Sessions.StuckDetection StuckDetection => new Sessions.StuckDetection(
+        config.GetValue("Worker:StuckRepeats", Sessions.StuckDetection.DefaultRepeats),
+        config.GetValue("Worker:StuckSimilarity", Sessions.StuckDetection.DefaultSimilarity)).Validate();
+
+    /// <summary>
+    /// <c>Worker:QuietMinutes</c> (&gt; 0, default 10): a running session with no event for this long is marked quiet on the
+    /// dashboard. Silence alone never interrupts a worker (sc-25388).
+    /// </summary>
+    public TimeSpan QuietThreshold => config.GetValue("Worker:QuietMinutes", Dashboard.DashboardData.DefaultQuietThreshold.TotalMinutes) is var m && m > 0
+        ? TimeSpan.FromMinutes(m)
+        : throw new InvalidOperationException("Worker:QuietMinutes must be more than 0.");
+
+    /// <summary>
     /// Pause flags the worker's PreToolUse hook checks: under the owner-owned work root, readable but not
     /// writable by the worker user.
     /// </summary>

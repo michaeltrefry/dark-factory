@@ -99,7 +99,9 @@ public static class FactoryHost
         services.AddRazorComponents().AddInteractiveServerComponents();
         services.AddDashboardAuth(options);
         services.TryAddSingleton(TimeProvider.System);
-        services.AddSingleton<IDashboardData, DashboardData>();
+        var quiet = options.QuietThreshold; // read now: an invalid Worker:QuietMinutes refuses to start the host
+        services.AddSingleton<IDashboardData>(sp =>
+            new DashboardData(sp.GetRequiredService<IDbContextFactory<LedgerDbContext>>(), sp.GetRequiredService<TimeProvider>(), quiet));
         // The intake loop's last errors (E10); empty on a host without one.
         services.TryAddSingleton(sp => new IntakeStatus(sp.GetRequiredService<TimeProvider>()));
         // The dashboard's only writes besides login/logout (E8): Pause, Continue and Stop.

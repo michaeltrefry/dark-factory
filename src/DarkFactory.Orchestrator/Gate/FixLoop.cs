@@ -179,6 +179,27 @@ public static class FixLoop
     }
 
     /// <summary>
+    /// A round whose fixer was found looping and interrupted (sc-25388): failed, with nothing pushed — the head is still the
+    /// fixed commit and its blocking findings are all still open.
+    /// </summary>
+    public static FixProgress Stuck(int round, ReviewVerdict fixedVerdict, string reason)
+    {
+        var open = Open(fixedVerdict).Count;
+        return new FixProgress(round, fixedVerdict.HeadSha, fixedVerdict.HeadSha, open, open, [], [], [], FixProgress.Failed,
+            $"{StuckPrefix}{reason}{StuckSuffix}");
+    }
+
+    private const string StuckPrefix = "the fixer was stuck in a loop and was interrupted (";
+    private const string StuckSuffix = "); nothing was pushed";
+
+    /// <summary>Why the round's fixer was stuck, when <paramref name="progress"/> is a <see cref="Stuck"/> round; else null.</summary>
+    public static string? StuckReason(FixProgress progress) =>
+        progress.Outcome == FixProgress.Failed && progress.Reason.StartsWith(StuckPrefix, StringComparison.Ordinal)
+            && progress.Reason.EndsWith(StuckSuffix, StringComparison.Ordinal)
+            ? progress.Reason[StuckPrefix.Length..^StuckSuffix.Length]
+            : null;
+
+    /// <summary>
     /// The round's outcome: progress only when the new head's review is usable, the blocking findings went down, both
     /// commits' CI was read in full (<paramref name="unread"/> names the commit that was not), and no check that passed — or
     /// reached no verdict (<paramref name="unknownBefore"/>) — on the fixed commit fails (<paramref name="failingNow"/>) or has

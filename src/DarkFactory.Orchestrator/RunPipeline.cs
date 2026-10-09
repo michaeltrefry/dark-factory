@@ -24,6 +24,17 @@ public sealed record RunOutcome(long WorkItemId, WorkState State, string? Sessio
 public sealed class WorkerFailedException(string message) : Exception(message);
 
 /// <summary>
+/// A worker session the stuck detector (<see cref="Sessions.StuckDetector"/>, sc-25388) found looping and interrupted at a tool
+/// boundary: its round failed. <see cref="Reason"/> names the repetition (never transcript content).
+/// </summary>
+public sealed class WorkerStuckException(string reason, string? session)
+    : Exception($"Worker session {session ?? "(unnamed)"} was stuck in a loop and interrupted: {reason}")
+{
+    public string Reason { get; } = reason;
+    public string? Session { get; } = session;
+}
+
+/// <summary>
 /// <c>factory run</c>: drives one Shortcut story through the <see cref="Lifecycle"/> from
 /// its last ledger state. Each registered handler does one state's work and makes one
 /// transition (E2); every transition and completed sub-step is a committed ledger row
@@ -63,8 +74,18 @@ public sealed partial class RunPipeline(
     TimeSpan? pauseGrace = null,
     TimeSpan? controlPollInterval = null,
     GateStage? gate = null,
-    FactoryFreeze? freeze = null)
+    FactoryFreeze? freeze = null,
+    StuckDetection? stuck = null)
 {
+    /// <summary>When a running worker counts as stuck (<c>Worker:StuckRepeats</c>, <c>Worker:StuckSimilarity</c>; sc-25388).</summary>
+    private readonly StuckDetection _stuck = (stuck ?? StuckDetection.Default).Validate();
+
+    /// <summary>
+    /// Implementer sessions in a row that may be found stuck before the item escalates (sc-25388): the first stuck session's
+    /// attempt fails and one fresh session (in a fresh worktree) retries Implement; a second escalates.
+    /// </summary>
+    public const int MaxStuckImplementSessions = 2;
+
     /// <summary>The Shortcut source's ledger name (<see cref="ItemNaming.Shortcut"/>); a pipeline names items by its source's <see cref="Naming"/>.</summary>
     public const string Source = "shortcut";
 
@@ -184,6 +205,17 @@ public sealed partial class RunPipeline(
         public const string MergeFiles = "merge-files";
         /// <summary>Fixing (a conflict fix round): the base was merged into the fixer's worktree (Detail: the <see cref="Gate.BaseUpdate"/> JSON with the conflicted files).</summary>
         public const string BaseMerged = "base-merged";
+        /// <summary>
+        /// The stuck detector (<see cref="StuckDetector"/>, sc-25388) found the running worker session looping, as it found it and
+        /// before the worker is interrupted; Detail is why (tool names, never transcript content). The session is never resumed:
+        /// its round failed.
+        /// </summary>
+        public const string Stuck = "stuck";
+        /// <summary>
+        /// Implement: the stuck implementer's worktree was removed and a fresh session in a fresh worktree retries (Detail: which
+        /// session, why, and the count of <see cref="MaxStuckImplementSessions"/>); a new worker attempt starts after it.
+        /// </summary>
+        public const string StuckRetry = "stuck-retry";
     }
 
     /// <summary>
@@ -601,6 +633,7 @@ public sealed partial class RunPipeline(
         var branch = story.Kind.BranchName(story.Id);
         var fullHistory = await ledger.HistoryAsync(item, ct);
         var attempt = CurrentWorkerAttempt(fullHistory);
+        var stuckHint = StuckRetryHint(fullHistory);
         var session = attempt.LastOrDefault(e => e.Step == Steps.Session)?.ClaudeSessionId;
         // Every model that answers the implementer is recorded once (implementer-model), for the record of what wrote the code.
         var models = ImplementerModels(fullHistory).ToHashSet(StringComparer.Ordinal);
@@ -610,6 +643,14 @@ public sealed partial class RunPipeline(
         {
             await ledger.CheckpointAsync(item, Steps.OrphanKilled, session, $"pid {pid}", ct);
             log.WriteLine($"[implement] stopped worker pid {pid} left running by an earlier run");
+        }
+
+        // A session found looping is never resumed (a run that stopped after the detection left only its checkpoint).
+        if (StuckSession(attempt) is { } found)
+        {
+            run.Workspace = await workspaces.ReopenAsync(repo, branch, ct);
+            await StuckImplementAsync(run, found, ct);
+            return;
         }
 
         Workspace? workspace = null;
@@ -638,8 +679,16 @@ public sealed partial class RunPipeline(
 
         if (!attempt.Any(e => e.Step == Steps.WorkerDone))
         {
-            session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? BuildPrompt(spec, repo) : BuildResumePrompt(story),
-                models, [SpecInput(story)], "implement", ct);
+            try
+            {
+                session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? BuildPrompt(spec, repo) + stuckHint : BuildResumePrompt(story),
+                    models, [SpecInput(story)], "implement", ct);
+            }
+            catch (WorkerStuckException stuckSession) when (!WorkerStillRunning.IsMarked(stuckSession))
+            {
+                await StuckImplementAsync(run, stuckSession, ct);
+                return;
+            }
         }
         await ThrowIfControlledAsync(item, ct);
 
@@ -668,6 +717,71 @@ public sealed partial class RunPipeline(
         log.WriteLine($"[review] {prUrl}");
         // The work is on origin (RestoreAsync re-creates it if ever needed): the worktree is throwaway (E5).
         await RemoveWorktreeAsync(run);
+    }
+
+    /// <summary>
+    /// The attempt's worker session the stuck detector stopped (its <see cref="Steps.Stuck"/> checkpoint), unless the worker then
+    /// finished on its own (<see cref="Steps.WorkerDone"/> after it: no tool boundary came, and its work is judged like any other).
+    /// </summary>
+    private static WorkerStuckException? StuckSession(List<LedgerEntry> attempt)
+    {
+        var found = attempt.FindLastIndex(e => e.Step == Steps.Stuck);
+        return found >= 0 && !attempt.Skip(found + 1).Any(e => e.Step == Steps.WorkerDone)
+            ? new WorkerStuckException(attempt[found].Detail ?? "stuck", attempt[found].ClaudeSessionId)
+            : null;
+    }
+
+    /// <summary>
+    /// For a fresh implementer that retries after a stuck one (a <see cref="Steps.StuckRetry"/> since Implement began): one line
+    /// naming the tool calls the stuck session kept repeating — tool names only, from the detector's reason, never transcript
+    /// content (E4). Empty otherwise.
+    /// </summary>
+    private static string StuckRetryHint(List<LedgerEntry> history)
+    {
+        var entered = history.FindLastIndex(e => e.Step is null && e.State == WorkState.Implement && e.Detail != "unpaused");
+        var retry = history.FindLastIndex(e => e.Step == Steps.StuckRetry);
+        if (retry <= entered)
+        {
+            return "";
+        }
+        var tools = StuckDetector.RepeatedTools(history.Take(retry).LastOrDefault(e => e.Step == Steps.Stuck)?.Detail);
+        return "\n\nAn earlier session on this story was stopped because it was stuck in a loop, repeating the same "
+            + (tools.Count > 0 ? $"tool calls ({string.Join(", ", tools)})" : "turns")
+            + " with the same results; its edits were discarded. Take a different approach rather than repeating them.";
+    }
+
+    /// <summary>
+    /// Implement's failed round (sc-25388): the implementer was found looping and interrupted. Implement has no fix rounds, so its
+    /// round is the session: the first stuck session since the item entered Implement is retried once by a fresh session in a fresh
+    /// worktree (the looping session's edits are discarded, never pushed; <see cref="Steps.StuckRetry"/> starts a new attempt), and
+    /// the <see cref="MaxStuckImplementSessions"/>th escalates. A worktree that cannot be removed escalates too (the retry must not
+    /// build on the looping session's edits).
+    /// </summary>
+    private async Task StuckImplementAsync(Run run, WorkerStuckException stuckSession, CancellationToken ct)
+    {
+        var item = run.Item;
+        var history = await ledger.HistoryAsync(item, ct);
+        var entered = history.FindLastIndex(e => e.Step is null && e.State == WorkState.Implement && e.Detail != "unpaused");
+        var count = history.Skip(entered + 1).Count(e => e.Step == Steps.Stuck);
+        if (count >= MaxStuckImplementSessions)
+        {
+            throw new WorkerFailedException(
+                $"The implementer was stuck in a loop in {count} sessions in a row (the cap is {MaxStuckImplementSessions}), so Implement is not "
+                + $"retried again. Last: session {stuckSession.Session ?? "(unnamed)"}: {stuckSession.Reason}");
+        }
+        if (run.Workspace is { } workspace && !await RemoveWorktreeAsync(run.Repo, workspace))
+        {
+            throw new WorkerFailedException(
+                $"The implementer session {stuckSession.Session ?? "(unnamed)"} was stuck in a loop ({stuckSession.Reason}), and its worktree could "
+                + "not be removed, so no fresh session can start clean.");
+        }
+        run.Workspace = null;
+        await ledger.CheckpointAsync(item, Steps.StuckRetry, stuckSession.Session,
+            $"session {stuckSession.Session ?? "(unnamed)"} stuck ({stuckSession.Reason}); a fresh session retries Implement "
+            + $"(stuck session {count} of {MaxStuckImplementSessions})", ct);
+        log.WriteLine($"[implement] the worker was stuck in a loop; retrying with a fresh session (stuck session {count} of {MaxStuckImplementSessions})");
+        await ThrowIfControlledAsync(item, ct);
+        await ImplementAsync(run, ct);
     }
 
     /// <summary>
@@ -707,6 +821,9 @@ public sealed partial class RunPipeline(
         await using var capture = sessions is null ? null : await sessions.StartAsync(item.Id, resume, ct);
         // Pause asks the worker to stop at its next tool boundary (and stops it if it doesn't); Stop stops it now.
         await using var watch = new ControlWatch(_controls, worker, log, _controlPoll, _pauseGrace, item.ExternalId, item.EpicId, workspace.Path, ct);
+        // A looping session is interrupted at its next tool boundary like a Pause, but never resumed (sc-25388).
+        var detector = new StuckDetector(_stuck);
+        string? stuckReason = null;
         WorkerResult result;
         try
         {
@@ -732,7 +849,22 @@ public sealed partial class RunPipeline(
                             await ledger.CheckpointAsync(item, Steps.Session, sid, "claude session started", c);
                         }
                     },
-                    OnLine: capture is null ? null : capture.OnLineAsync,
+                    OnLine: async (line, c) =>
+                    {
+                        if (capture is not null)
+                        {
+                            await capture.OnLineAsync(line, c);
+                        }
+                        if (detector.Accept(line) is { } reason)
+                        {
+                            // On the ledger before the interrupt (and on a token nothing cancels): a run that stops now must not
+                            // resume the looping session.
+                            stuckReason = reason;
+                            await ledger.CheckpointAsync(item, Steps.Stuck, session, reason, CancellationToken.None);
+                            log.WriteLine($"[{label}] session {session ?? "(unnamed)"} is stuck: {reason}; interrupting it at its next tool call");
+                            watch.InterruptStuck();
+                        }
+                    },
                     OnModel: async (model, c) =>
                     {
                         if (models.Add(model))
@@ -752,6 +884,13 @@ public sealed partial class RunPipeline(
             await CompleteControlledSessionAsync(capture, requested);
             throw new ControlRequestedException(requested, WorkerStillRunning.IsMarked(ex));
         }
+        catch (Exception ex) when (stuckReason is not null && watch.Token.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            // The stuck worker did not reach a tool boundary within the grace and was stopped: still a failed round.
+            await CompleteStuckSessionAsync(capture);
+            var failed = new WorkerStuckException(stuckReason, session);
+            throw WorkerStillRunning.IsMarked(ex) ? WorkerStillRunning.Mark(failed) : failed;
+        }
         catch (Exception ex) when (capture is not null)
         {
             // A Ctrl-C'd session resumes later, so its cost waits for the run that finishes it. A failed
@@ -767,6 +906,13 @@ public sealed partial class RunPipeline(
                 log.WriteLine($"[{label}] could not record the end of the worker session: {captureError.Message}");
             }
             throw;
+        }
+        if (stuckReason is not null && watch.Requested != ControlState.Stopping && result.HookStopped)
+        {
+            // Stopped at a tool boundary for looping (even if a Pause also asked): the round failed; the session is not resumed.
+            // A worker that finished on its own after the detection (no tool boundary came) is done, like one after a pause.
+            await CompleteStuckSessionAsync(capture);
+            throw new WorkerStuckException(stuckReason, result.SessionId ?? session);
         }
         if (watch.Requested == ControlState.Stopping || (watch.PauseRequested && result.HookStopped))
         {
@@ -887,6 +1033,24 @@ public sealed partial class RunPipeline(
         }
     }
 
+    /// <summary>A stuck session is never resumed, so it ends now: exit status <c>stuck</c> and its cost fetched (bounded).</summary>
+    private async Task CompleteStuckSessionAsync(SessionRecorder.SessionCapture? capture)
+    {
+        if (capture is null)
+        {
+            return;
+        }
+        using var bounded = new CancellationTokenSource(_failedSessionEndTimeout);
+        try
+        {
+            await capture.CompleteAsync(null, "stuck", fetchCost: true, bounded.Token).WaitAsync(bounded.Token);
+        }
+        catch (Exception captureError)
+        {
+            log.WriteLine($"[stuck] could not record the end of the worker session: {captureError.Message}");
+        }
+    }
+
     /// <summary>Whether a user's Pause holds the item: on the factory, its epic or the item itself.</summary>
     private async Task<bool> UserPausedAsync(WorkItem item)
     {
@@ -976,12 +1140,14 @@ public sealed partial class RunPipeline(
         private readonly CancellationTokenSource _worker;
         private readonly CancellationTokenSource _done = new();
         private readonly Task _loop;
+        private readonly string _workingDirectory;
         private int _requested = -1;
         private int _pauseRequested;
+        private int _stuck;
 
         public ControlWatch(IControls controls, IWorker worker, TextWriter log, TimeSpan poll, TimeSpan grace, string externalId, long? epicId, string workingDirectory, CancellationToken ct)
         {
-            (_controls, _workerProcess, _log, _poll, _grace) = (controls, worker, log, poll, grace);
+            (_controls, _workerProcess, _log, _poll, _grace, _workingDirectory) = (controls, worker, log, poll, grace, workingDirectory);
             _worker = CancellationTokenSource.CreateLinkedTokenSource(ct);
             _loop = Task.Run(() => WatchAsync(externalId, epicId, workingDirectory));
         }
@@ -995,10 +1161,35 @@ public sealed partial class RunPipeline(
         /// <summary>Whether this run ever asked its worker to pause (even if Continue withdrew it since).</summary>
         public bool PauseRequested => Volatile.Read(ref _pauseRequested) == 1;
 
+        /// <summary>Whether the stuck detector interrupted the worker (<see cref="InterruptStuck"/>).</summary>
+        public bool Stuck => Volatile.Read(ref _stuck) == 1;
+
+        /// <summary>
+        /// The stuck detector found the worker looping (sc-25388): asks it to stop at its next tool boundary now, through the same
+        /// mechanism as a Pause (<see cref="IWorker.RequestPause"/>), and the watch stops it if it has not within the pause grace.
+        /// A Continue does not withdraw it. Once only.
+        /// </summary>
+        public void InterruptStuck()
+        {
+            if (Interlocked.Exchange(ref _stuck, 1) == 1)
+            {
+                return;
+            }
+            try
+            {
+                _workerProcess.RequestPause(_workingDirectory);
+            }
+            catch (Exception ex)
+            {
+                _log.WriteLine($"[stuck] could not ask the worker to stop ({ex.Message}); stopping it at the deadline");
+            }
+        }
+
         private async Task WatchAsync(string externalId, long? epicId, string workingDirectory)
         {
             var log = _log;
             DateTimeOffset? deadline = null;
+            var pausedByControl = false;
             while (true)
             {
                 try
@@ -1030,26 +1221,38 @@ public sealed partial class RunPipeline(
                     await _worker.CancelAsync();
                     return;
                 }
-                if (state == ControlState.Running && deadline is not null)
+                var stuck = Stuck;
+                if (stuck && deadline is null)
                 {
-                    // Continue before the worker reached a tool boundary: its next tool call proceeds, no grace kill.
-                    deadline = null;
+                    // The stuck interrupt (InterruptStuck) asked the worker to stop at its next tool call: the pause grace applies too.
+                    deadline = DateTimeOffset.UtcNow + _grace;
+                }
+                if (state == ControlState.Running && pausedByControl)
+                {
+                    // Continue before the worker reached a tool boundary: its next tool call proceeds, no grace kill — unless it is
+                    // stuck, whose interrupt a Continue does not withdraw.
+                    pausedByControl = false;
                     Volatile.Write(ref _requested, -1);
-                    log.WriteLine($"[control] {externalId} continued; its worker goes on");
-                    try
+                    if (!stuck)
                     {
-                        _workerProcess.CancelPause(workingDirectory);
-                    }
-                    catch (Exception ex)
-                    {
-                        log.WriteLine($"[control] could not withdraw the worker's pause ({ex.Message}); it stops at its next tool call");
+                        deadline = null;
+                        log.WriteLine($"[control] {externalId} continued; its worker goes on");
+                        try
+                        {
+                            _workerProcess.CancelPause(workingDirectory);
+                        }
+                        catch (Exception ex)
+                        {
+                            log.WriteLine($"[control] could not withdraw the worker's pause ({ex.Message}); it stops at its next tool call");
+                        }
                     }
                 }
-                if (state == ControlState.Paused && deadline is null)
+                if (state == ControlState.Paused && !pausedByControl)
                 {
+                    pausedByControl = true;
                     Volatile.Write(ref _requested, (int)ControlState.Paused);
                     Volatile.Write(ref _pauseRequested, 1);
-                    deadline = DateTimeOffset.UtcNow + _grace;
+                    deadline ??= DateTimeOffset.UtcNow + _grace;
                     log.WriteLine($"[control] {externalId} paused; its worker stops at its next tool call");
                     try
                     {
@@ -1116,6 +1319,11 @@ public sealed partial class RunPipeline(
             else if (e.Step == Steps.WorktreeLost)
             {
                 start = i;
+            }
+            else if (e.Step == Steps.StuckRetry)
+            {
+                // The stuck session's worktree is gone: the retry starts with nothing of the attempt before it.
+                start = i + 1;
             }
         }
         return history.Skip(start).ToList();
