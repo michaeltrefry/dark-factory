@@ -56,7 +56,7 @@ internal sealed class SafeHelper
         send_signal() {
             local a n
             for a in "$@"; do
-                case "$a" in '' | -) return 1 ;; -[A-Z]* | --) continue ;; esac
+                case "$a" in -[A-Z]* | --) continue ;; esac
                 n=${a#-}
                 case "$n" in '' | *[!0-9]*) return 1 ;; esac
                 [ "$((10#$n))" -gt 1 ] || return 1
