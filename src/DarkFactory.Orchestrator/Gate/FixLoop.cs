@@ -186,8 +186,18 @@ public static class FixLoop
     {
         var open = Open(fixedVerdict).Count;
         return new FixProgress(round, fixedVerdict.HeadSha, fixedVerdict.HeadSha, open, open, [], [], [], FixProgress.Failed,
-            $"the fixer was stuck in a loop and was interrupted ({reason}); nothing was pushed");
+            $"{StuckPrefix}{reason}{StuckSuffix}");
     }
+
+    private const string StuckPrefix = "the fixer was stuck in a loop and was interrupted (";
+    private const string StuckSuffix = "); nothing was pushed";
+
+    /// <summary>Why the round's fixer was stuck, when <paramref name="progress"/> is a <see cref="Stuck"/> round; else null.</summary>
+    public static string? StuckReason(FixProgress progress) =>
+        progress.Outcome == FixProgress.Failed && progress.Reason.StartsWith(StuckPrefix, StringComparison.Ordinal)
+            && progress.Reason.EndsWith(StuckSuffix, StringComparison.Ordinal)
+            ? progress.Reason[StuckPrefix.Length..^StuckSuffix.Length]
+            : null;
 
     /// <summary>
     /// The round's outcome: progress only when the new head's review is usable, the blocking findings went down, both

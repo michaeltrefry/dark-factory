@@ -167,7 +167,8 @@ public sealed partial class RunPipeline
         {
             throw new ReviewFailedException(
                 $"{pull.HtmlUrl} still has {open.Count} confirmed blocking finding(s) at {Ci.Short(pull.HeadSha)} after {rounds} fix rounds "
-                + $"(the cap is {Lifecycle.MaxFixRounds}); a fix round {rounds + 1} is not allowed. Open blocking findings:\n{FixLoop.Describe(open)}");
+                + $"(the cap is {Lifecycle.MaxFixRounds}); a fix round {rounds + 1} is not allowed{await StuckRoundsAsync(run.Item, ct)}. "
+                + $"Open blocking findings:\n{FixLoop.Describe(open)}");
         }
         log.WriteLine($"[review] {open.Count} confirmed blocking finding(s); fix round {rounds + 1} of {Lifecycle.MaxFixRounds}");
         await ledger.RecordAsync(run.Item, WorkState.Fixing, null, pull.HeadSha, ct);
@@ -180,6 +181,19 @@ public sealed partial class RunPipeline
     /// </summary>
     /// <remarks><see cref="Stuck"/>: why the round's fixer was found looping, when it was and pushed nothing (sc-25388).</remarks>
     internal sealed record FixRound(int Round, string FixedHead, string? PushedHead, bool Ci = false, bool Conflict = false, string? Stuck = null);
+
+    /// <summary>
+    /// For the fix-round cap's escalation (sc-25388): <c>"; N round(s) failed because the fixer was stuck in a loop (why, the last)"</c>
+    /// when any fix round since the last Implement failed that way (<see cref="FixLoop.Stuck"/>); else empty.
+    /// </summary>
+    private async Task<string> StuckRoundsAsync(WorkItem item, CancellationToken ct)
+    {
+        var history = await ledger.HistoryAsync(item, ct);
+        var implemented = history.FindLastIndex(e => e.Step is null && e.State == WorkState.Implement);
+        var stuck = history.Skip(implemented + 1).Where(e => e.Step == Steps.FixProgress)
+            .Select(e => FixProgress.FromDetail(e.Detail) is { } p ? FixLoop.StuckReason(p) : null).OfType<string>().ToList();
+        return stuck.Count == 0 ? "" : $"; {stuck.Count} round(s) failed because the fixer was stuck in a loop ({stuck[^1]})";
+    }
 
     /// <summary>The item's latest fix round of any kind since the last Implement, with the index of its row; null when none.</summary>
     private static (int Index, FixRound Round)? LatestFixRound(List<LedgerEntry> history)

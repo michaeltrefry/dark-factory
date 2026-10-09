@@ -633,6 +633,7 @@ public sealed partial class RunPipeline(
         var branch = story.Kind.BranchName(story.Id);
         var fullHistory = await ledger.HistoryAsync(item, ct);
         var attempt = CurrentWorkerAttempt(fullHistory);
+        var stuckHint = StuckRetryHint(fullHistory);
         var session = attempt.LastOrDefault(e => e.Step == Steps.Session)?.ClaudeSessionId;
         // Every model that answers the implementer is recorded once (implementer-model), for the record of what wrote the code.
         var models = ImplementerModels(fullHistory).ToHashSet(StringComparer.Ordinal);
@@ -680,7 +681,7 @@ public sealed partial class RunPipeline(
         {
             try
             {
-                session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? BuildPrompt(spec, repo) : BuildResumePrompt(story),
+                session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? BuildPrompt(spec, repo) + stuckHint : BuildResumePrompt(story),
                     models, [SpecInput(story)], "implement", ct);
             }
             catch (WorkerStuckException stuckSession) when (!WorkerStillRunning.IsMarked(stuckSession))
@@ -728,6 +729,25 @@ public sealed partial class RunPipeline(
         return found >= 0 && !attempt.Skip(found + 1).Any(e => e.Step == Steps.WorkerDone)
             ? new WorkerStuckException(attempt[found].Detail ?? "stuck", attempt[found].ClaudeSessionId)
             : null;
+    }
+
+    /// <summary>
+    /// For a fresh implementer that retries after a stuck one (a <see cref="Steps.StuckRetry"/> since Implement began): one line
+    /// naming the tool calls the stuck session kept repeating — tool names only, from the detector's reason, never transcript
+    /// content (E4). Empty otherwise.
+    /// </summary>
+    private static string StuckRetryHint(List<LedgerEntry> history)
+    {
+        var entered = history.FindLastIndex(e => e.Step is null && e.State == WorkState.Implement && e.Detail != "unpaused");
+        var retry = history.FindLastIndex(e => e.Step == Steps.StuckRetry);
+        if (retry <= entered)
+        {
+            return "";
+        }
+        var tools = StuckDetector.RepeatedTools(history.Take(retry).LastOrDefault(e => e.Step == Steps.Stuck)?.Detail);
+        return "\n\nAn earlier session on this story was stopped because it was stuck in a loop, repeating the same "
+            + (tools.Count > 0 ? $"tool calls ({string.Join(", ", tools)})" : "turns")
+            + " with the same results; its edits were discarded. Take a different approach rather than repeating them.";
     }
 
     /// <summary>

@@ -77,6 +77,7 @@ public class StuckWorkerTests
     {
         private volatile bool _pause;
         public List<string?> Resumes { get; } = [];
+        public List<string> Prompts { get; } = [];
         public int PauseRequests;
         public bool Paused => _pause;
 
@@ -84,6 +85,7 @@ public class StuckWorkerTests
         {
             _pause = false;
             Resumes.Add(resumeSessionId);
+            Prompts.Add(prompt);
             await callbacks!.OnStarted!(WorkerPid, ct);
             return await sessions[Resumes.Count - 1].RunAsync(callbacks, ct);
         }
@@ -154,7 +156,9 @@ public class StuckWorkerTests
         Assert.Contains($"session {StuckFixtures.LoopSession} stuck", retry.Detail);
         Assert.Contains("stuck session 1 of 2", retry.Detail);
         Assert.Equal([null, null], worker.Resumes);
-        Assert.Equal(
+        // The fresh session is told the earlier one looped, and on which tool calls — tool names only, no transcript content.
+        Assert.DoesNotContain("stuck in a loop", worker.Prompts[0]);
+        Assert.Contains("stuck in a loop, repeating the same tool calls (Edit) with the same results", worker.Prompts[1]);        Assert.Equal(
             ["prepare michaeltrefry/dark-factory-sandbox factory/sc-77", "remove michaeltrefry/dark-factory-sandbox /wt/factory/sc-77",
              "prepare michaeltrefry/dark-factory-sandbox factory/sc-77", "push michaeltrefry/dark-factory-sandbox factory/sc-77 sc-77: Whitespace counts as a word",
              "remove michaeltrefry/dark-factory-sandbox /wt/factory/sc-77"],
@@ -421,6 +425,8 @@ public class StuckFixRoundTests
         Assert.All(await Progress(h), p => Assert.Contains("stuck in a loop", p.Reason));
         Assert.Equal(1, h.Workspaces.Calls.Count(c => c.StartsWith("push"))); // the implementer's only
         Assert.Contains("after 3 fix rounds", h.Stories.Comments.Single());
+        Assert.Contains($"; {Lifecycle.MaxFixRounds} round(s) failed because the fixer was stuck in a loop (the last 5 turns were near-identical",
+            h.Stories.Comments.Single());
     }
 
     [Fact]
