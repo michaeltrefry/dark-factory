@@ -171,7 +171,10 @@ reads the installed helper first and fails start-up with `Stale helper: … re-r
 unless it has `helper_version` ≥ `WorkerSandbox.HelperVersion` (2) and, with those two lines undone, the SHA-256 of the
 repo's helper (compiled into the orchestrator as a resource); then it probes with the real router variable names
 (allowlist `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_AUTH_TOKEN`) and fails if the probe's stderr
-has a uid-sweep refusal. Every normal (re)run kills every `_factory`
+has a uid-sweep refusal; last it runs `<Worker:ClaudePath> --version` as `_factory` through the helper and fails start-up with
+`Upgrade _factory's claude: …` (and the `claude update` command) below `WorkerSandbox.MinClaudeVersion` (2.1.291, the release
+the triage confinement — `--setting-sources ""`, `blockReadsOutsideWorkingDirectories`, `dontAsk` — was checked against; an
+older CLI may silently ignore a setting it does not know). Every normal (re)run kills every `_factory`
 process (its toolchain check runs through the helper): close `_factory` sessions and stop `factory work` first.
 `--remove-worker-login` (opt-in) is a standalone mode: it runs none of the setup (no helper, no toolchain check, no
 installs) and only deletes `_factory`'s own Claude login (`~/.claude/.credentials.json`, keychain item
@@ -212,18 +215,24 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `Read(//<abs triage worktree>/**)` (`WorkerTools.ReadRule`; Claude Code bounds Glob/Grep by Read rules), `--permission-mode
   dontAsk` (every call that would prompt — any read outside the working directory — is auto-denied), `--settings` with
   `permissions.blockReadsOutsideWorkingDirectories`, `--setting-sources ""` (no repo or worker-user settings file can widen
-  it), every write/exec/sub-agent/web tool in `WorkerTools.WriteOrExecTools` denied; the runner refuses any worker whose tools
+  it), every known write/exec/sub-agent/worktree/web tool in `WorkerTools.WriteOrExecTools` denied by name (belt and braces: not
+  exhaustive as the CLI adds tools — the guarantee is `dontAsk` with no allow rule but the `ReadRule`, so any unnamed tool is
+  auto-denied too); the runner refuses any worker whose tools
   are not `IsReadOnly`, so a tainted session cannot change a file an untainted session later
   pushes, E4; the prompt has it reason from the code, building and running nothing) in a throwaway `factory/triage-gh-<key>`
   worktree under its own root (`<WorkRoot>/triage-worktrees`, `SandboxTriageRunner.TriageWorktrees`: never the items'
   `worktrees`, swept before each triage, not ACL-shared for writing — the worker user reads it through the work root's
   inherited read entry) whose git holds a contents-read token; nothing is committed or pushed; the issue text is fenced as
-  untrusted. `factory work` refuses to start with `GitHub:Watch:Repos` set and `Worker:RunAs=none`
+  untrusted. After checkout and before the session starts, the owner removes every symlink in that worktree whose `realpath`
+  is outside it (a dangling or looping one counts as outside; `TriageWorktree.RemoveOutOfTreeSymlinks`), logging each
+  `[triage] gh-<key>: removed symlink <link> -> <target>`. `factory work` refuses to start with `GitHub:Watch:Repos` set and `Worker:RunAs=none`
   (`IssueIntake.UnsandboxedRefusal`; `SandboxTriageRunner` refuses an unsandboxed triage too, factory-wide). Its posted free
   text is bounded (`TriageParser`: title 120, summary and fix 1,500 chars each) and fenced. Residual: it runs as the same
   `_factory` user as the items' workers, but its file tools read only its own triage worktree (not other clones, kept
   worktrees or the worker home's transcripts); it can still restate what it read there — the target repo's own code at its
-  default branch, the repo the issue is about — inside that bounded, fenced answer. The intake reads and writes the issue board only through the issue source's
+  default branch, the repo the issue is about — inside that bounded, fenced answer. Residual, accepted: Read and the read block
+  are Claude Code's own enforcement, and on Glob and Grep (a search given an explicit path or pattern outside the working
+  directory) it is best-effort and unverified by the factory; a gap there would reach what `_factory` can read. The intake reads and writes the issue board only through the issue source's
   `IIssueIntakeSource` capability (E6): triage comment and route label, issues, comments, permissions and gate policy. The orchestrator — not
   the model — routes (`IssueRouting`): question/duplicate → comment only; author without write/maintain/admin
   (`RepoPermission.IsCollaborator`; read and triage count as outsiders) on the issue's repo, or on the target repo when the

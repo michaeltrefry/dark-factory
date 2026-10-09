@@ -168,11 +168,15 @@ public sealed record WorkerTools
             "a session confined to its working directory needs that directory"))];
 
     /// <summary>
-    /// The tools that write a file, run a command, start a sub-agent (which could be given other tools) or reach the web: every one is
-    /// denied to a read-only session, whatever the repo's settings allow.
+    /// The known Claude Code tools that write a file, run or stop a command, change the working tree's git state, start or message a
+    /// sub-agent (which could be given other tools) or reach the web, each denied by name to a read-only session. Belt and braces, not
+    /// the guarantee: the CLI adds tools over time, so this list is not exhaustive. What keeps a read-only session from any tool not
+    /// named here is <see cref="ReadOnlyPermissionMode"/> with no allow rule but its working directory's <see cref="ReadRule"/> (and no
+    /// settings file loaded): every call that would prompt — any tool beyond reading inside that directory — is auto-denied.
     /// </summary>
     public static readonly string[] WriteOrExecTools =
-        ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput", "KillShell", "Task", "Agent", .. Taint.WebTools];
+        ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput", "KillShell", "PowerShell", "Monitor", "TaskStop", "Task",
+            "Agent", "SendMessage", "EnterWorktree", "ExitWorktree", .. Taint.WebTools];
 
     /// <summary>
     /// Claude Code's mode that auto-denies every tool call that would otherwise prompt (headless, nobody can approve one): file reads

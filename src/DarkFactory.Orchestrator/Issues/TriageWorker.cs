@@ -49,6 +49,12 @@ public sealed class WorkerTriageRunner(IRepoWorkspace workspaces, IWorker worker
         var remove = true;
         try
         {
+            // Owner-side, after checkout and before the session starts: the repo's own symlinks must not lead its reads out of the
+            // worktree, whether or not Claude Code's read block resolves them.
+            foreach (var (link, target) in TriageWorktree.RemoveOutOfTreeSymlinks(workspace.Path))
+            {
+                log.WriteLine($"[triage] {item.ExternalId}: removed symlink {link} -> {target} (it resolves outside the triage worktree)");
+            }
             await using var capture = sessions is null ? null : await sessions.StartAsync(item.Id, null, ct);
             string? session = null;
             WorkerResult result;
@@ -107,6 +113,75 @@ public sealed class WorkerTriageRunner(IRepoWorkspace workspaces, IWorker worker
             }
         }
     }
+}
+
+/// <summary>
+/// The triage worktree's symlinks (E4): a committed symlink whose resolved target is outside the worktree would let a session whose
+/// reads are confined to its working directory read through it, if Claude Code's read block does not resolve links (unverified), so
+/// the owner removes every one before the triage session starts.
+/// </summary>
+public static class TriageWorktree
+{
+    /// <summary>
+    /// Removes (unlinks; the target is untouched) every symlink under <paramref name="worktree"/> whose fully resolved target
+    /// (<c>realpath</c>: every link and <c>..</c> on the way followed) is not <paramref name="worktree"/> or inside it; a link that does
+    /// not resolve (dangling, a loop) counts as outside. Directory symlinks are never descended into. Returns each removed link,
+    /// relative to the worktree, with the target it named. A worktree that does not exist holds no link (nothing is removed).
+    /// </summary>
+    public static IReadOnlyList<(string Link, string Target)> RemoveOutOfTreeSymlinks(string worktree)
+    {
+        if (!Directory.Exists(worktree))
+        {
+            return [];
+        }
+        var root = RealPath(worktree) ?? throw new DirectoryNotFoundException($"Cannot resolve the triage worktree {worktree}.");
+        var removed = new List<(string, string)>();
+        var pending = new Stack<DirectoryInfo>([new DirectoryInfo(root)]);
+        while (pending.TryPop(out var directory))
+        {
+            foreach (var entry in directory.EnumerateFileSystemInfos())
+            {
+                if (entry.LinkTarget is { } target)
+                {
+                    var resolved = RealPath(entry.FullName);
+                    if (resolved is null || (resolved != root && !resolved.StartsWith(root + "/", StringComparison.Ordinal)))
+                    {
+                        File.Delete(entry.FullName); // unlink(2): removes the link itself, a directory link included
+                        removed.Add((Path.GetRelativePath(root, entry.FullName), target));
+                    }
+                }
+                else if (entry is DirectoryInfo sub)
+                {
+                    pending.Push(sub);
+                }
+            }
+        }
+        return removed;
+    }
+
+    private static string? RealPath(string path)
+    {
+        var buffer = realpath(path, IntPtr.Zero);
+        if (buffer == IntPtr.Zero)
+        {
+            return null;
+        }
+        try
+        {
+            return System.Runtime.InteropServices.Marshal.PtrToStringUTF8(buffer);
+        }
+        finally
+        {
+            free(buffer);
+        }
+    }
+
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "realpath", SetLastError = true)]
+    private static extern IntPtr realpath([System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.LPUTF8Str)] string path,
+        IntPtr resolved);
+
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "free")]
+    private static extern void free(IntPtr pointer);
 }
 
 /// <summary>The triage worker's prompt. The issue's title and body are fenced as untrusted data (E4, <see cref="PromptFence"/>).</summary>

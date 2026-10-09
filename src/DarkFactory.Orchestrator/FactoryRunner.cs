@@ -194,7 +194,7 @@ public static class FactoryRunner
         using var sandboxLock = sandbox is null ? null : await FactoryWide("the worker run lock", () => Task.FromResult(WorkerLock.Acquire(options.WorkRoot)));
         if (sandbox is not null)
         {
-            await EnsureSandboxReadyAsync(sandbox, options.WorkerAuth, ct);
+            await EnsureSandboxReadyAsync(sandbox, options.WorkerAuth, options.ClaudePath, ct);
         }
 
         using var githubHttp = OutboundHttp.GitHubApi();
@@ -263,8 +263,8 @@ public static class FactoryRunner
         new(github, reviewer, panel, options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, sandbox, options.TestTimeout));
 
     /// <summary>The sandbox readiness probe, a factory-wide failure (E10): a stale helper fails the factory once, not every item.</summary>
-    internal static Task EnsureSandboxReadyAsync(WorkerSandbox sandbox, WorkerAuth auth, CancellationToken ct) =>
-        FactoryWide("the worker sandbox", async () => { await sandbox.EnsureReadyAsync(auth, ct); return true; });
+    internal static Task EnsureSandboxReadyAsync(WorkerSandbox sandbox, WorkerAuth auth, string claudePath, CancellationToken ct) =>
+        FactoryWide("the worker sandbox", async () => { await sandbox.EnsureReadyAsync(auth, claudePath, ct); return true; });
 
     /// <summary>Runs a set-up step every item shares; its failure is the factory's, not the item's (E10).</summary>
     private static async Task<T> FactoryWide<T>(string what, Func<Task<T>> step)
@@ -360,7 +360,7 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         using var sandboxLock = sandbox is null ? null : await FactoryWideStep("the worker run lock", () => WorkerLock.Acquire(options.WorkRoot));
         if (sandbox is not null)
         {
-            await FactoryRunner.EnsureSandboxReadyAsync(sandbox, options.WorkerAuth, ct);
+            await FactoryRunner.EnsureSandboxReadyAsync(sandbox, options.WorkerAuth, options.ClaudePath, ct);
         }
         using var githubHttp = OutboundHttp.GitHubApi();
         using var routerHttp = OutboundHttp.RouterApi(options.RouterBaseUrl);
