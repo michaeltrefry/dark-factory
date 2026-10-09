@@ -551,8 +551,11 @@ public sealed class GatewayLintTests
             Assert.Contains(WellKnownDiagnosticTags.NotConfigurable, d.CustomTags);
         });
 
-        // Nothing switches a rule or the analyzers off.
-        AssertNone(SwitchOffs(SwitchOffCandidates()));
+        // Nothing switches a rule or the analyzers off — the Razor components, as written and as generated, included.
+        var candidates = SwitchOffCandidates();
+        AssertNone(SwitchOffs(candidates));
+        var scanned = candidates.Select(c => c.Item1).ToHashSet(StringComparer.Ordinal);
+        Assert.All(Files(OrchestratorDir, "*.razor").Concat(RazorGenerated().Select(g => g.Item1)), f => Assert.Contains(f, scanned));
 
         // CI's required build-test job builds (the lint runs) and tests (this file and the gate-check coverage run).
         var ci = File.ReadAllText(Path.Combine(RepoRoot, ".github", "workflows", "ci.yml"));
