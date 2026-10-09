@@ -115,7 +115,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Review:Models` | `claude-opus-5` (`ReviewPanelModels.DefaultReviewers`; owner decision 2026-10-09: the router catalog has no Opus 5.5 id and its `model_mapping` serves `claude-opus-5` as `claude-opus-5-5`) (every panel role's reviewer models in order, unless the role sets its own; each must be a Claude Opus 5 or newer, `ReviewModels.MeetsReviewFloor`, else the factory refuses to start — `ReviewConfigurationException`: `factory run` and `factory work` print the reason and exit 2, before any router call; ids read as `claude-opus-<major>[-.]<minor>[-yyyymmdd]`, where the dotted and dashed spellings are one model everywhere ids are compared — pinned, served, reviewer vs second model — an older Opus, another Claude or another vendor's model is refused; the first entry reviews, whatever models the implementer used) |
 | `Review:Correctness:Models`, `Review:SpecConformance:Models`, `Review:Security:Models` | `Review:Models` (one panel role's own reviewer models, in order; the same Claude Opus 5 or newer rule) |
 | `Review:Confirm:Models` | `claude-opus-5,claude-sonnet-5` (the router catalog's Claude models; second models that confirm a blocking finding: the first Claude model not pinned to the reviewer's pinned id — pinned ids are compared, never served ones; a non-Claude entry is refused) |
-| `Review:TimeoutMinutes` | `10` (> 0: one reviewer call) |
+| `Review:TimeoutMinutes` | `10` (> 0: one reviewer call, its whole answer stream included) |
 | `Gate:CiPollSeconds`, `Gate:CiTimeoutMinutes` | `30`, `30` (each > 0: CI on the PR head is polled until it finishes; still running at the timeout escalates) |
 | `Gate:TestTimeoutMinutes` | `20` (> 0: one sandboxed run — restore, build, the new tests — of the `new-tests-fail-on-base` check; still running at the timeout fails the check) |
 | `Factory:DefaultRepo` | `michaeltrefry/dark-factory-sandbox` (a story line `Repo: owner/name` overrides) |
@@ -496,7 +496,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   model list (`Review:<Role>:Models`, else `Review:Models`, default `claude-opus-5`) that is a Claude Opus 5 or newer (owner decisions 2026-10-08 and 2026-10-09:
   every reviewer and second model is Claude, whichever models the implementer used — there is no cross-family rule;
   `ReviewModels`/`ReviewerChoice`; a role with no such model escalates before any call). Each role makes one
-  router call (`RouterReviewer`: `POST /v1/messages`, router key only, `x-weave-force-model` pin, its own
+  router call (`RouterReviewer`: `POST /v1/messages` with `"stream": true` — the router cancels a call that has sent its
+  client nothing for 10 s — assembled by `MessageStream`, which fails closed on an `error` event, a stream without
+  `message_stop` or one silent for 2 min; router key only, `x-weave-force-model` pin, its own
   `X-Claude-Code-Session-Id` so the pin and the cost stay scoped to it) whose system prompt is the role's prompt file and
   whose message holds the story, the base commit's file list (`IGateGitHub.GetFilesAsync`) and the diff of the PR's head
   commit. Prompts: `factory/prompts/{correctness,spec-conformance,security,confirm}.md` in this repo, compiled in as
