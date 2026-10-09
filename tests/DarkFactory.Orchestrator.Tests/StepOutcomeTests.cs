@@ -360,6 +360,7 @@ public class StepOutcomeTests
         { null, WorkState.Paused, RunPipeline.Steps.UsagePause, "exhausted", StepOutcome.Deferred },
         { null, WorkState.Paused, RunPipeline.Steps.Parked, "claim refused", StepOutcome.Deferred },
         { null, WorkState.Paused, Issues.IssueSteps.ApprovalIgnored, "{}", StepOutcome.GateRejected },
+        { null, WorkState.Paused, Issues.IssueSteps.RoutedToHuman, "no apparent fix", StepOutcome.Escalated },
         { null, WorkState.Implement, RunPipeline.Steps.Session, null, StepOutcome.Passed },
         { null, WorkState.MergeGate, RunPipeline.Steps.MergeConflict, "{}", StepOutcome.Failed },
         { null, WorkState.Merge, RunPipeline.Steps.Closeout, RunPipeline.Posted, StepOutcome.Passed },
