@@ -7,7 +7,7 @@ namespace DarkFactory.Orchestrator.Gateway;
 /// worker's branch, the merge queue's base-update push) and the environment that authenticates git to GitHub with an
 /// installation token (through git's environment-based config, so the token never appears in argv, remotes or files).
 /// <c>GitWorkspace</c> runs them; the gateway lint (DF0002) fails the build on a <c>push</c> or <c>remote set-url</c>
-/// argument anywhere else in the orchestrator.
+/// argument anywhere else in the orchestrator or the acceptance tests.
 /// </summary>
 public static class GitRemoteWrites
 {
@@ -17,6 +17,12 @@ public static class GitRemoteWrites
     /// </summary>
     public static string[] Push(IReadOnlyList<string> tree, string branch, bool force) =>
         [.. tree, "push", .. (force ? ["--force"] : Array.Empty<string>()), "origin", $"HEAD:refs/heads/{branch}"];
+
+    /// <summary>
+    /// <c>push &lt;remote&gt; &lt;refspec&gt;</c>: the live acceptance test's probe pushes (and deletes, <c>:&lt;ref&gt;</c>) of an
+    /// App token's reach (<c>AppTokenPushTests</c>).
+    /// </summary>
+    public static string[] PushRef(string remote, string refspec) => ["push", remote, refspec];
 
     /// <summary>
     /// Environment that sends <paramref name="token"/> (an installation token) to github.com as basic auth and switches off

@@ -1,3 +1,4 @@
+using System.Reflection;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Tests.Support;
 
@@ -12,8 +13,17 @@ public sealed class GateCheckCoverageTests
         // Every test class but the seeded tags below, which exist to prove Find reads what does not run.
         var tests = GateCheckCoverage.Find(typeof(GateCheckCoverageTests).Assembly.GetTypes().Where(t => t != typeof(Seeded)));
         Assert.Empty(GateCheckCoverage.Problems(GateCheckCoverage.Registry, tests));
-        // The registry follows the gate: a check added to GateChecks.All needs its failing-case test too.
-        Assert.All(GateChecks.All, c => Assert.Contains(c, GateCheckCoverage.Registry));
+    }
+
+    [Fact]
+    public void Every_check_the_gate_names_is_in_gate_checks_all_and_so_in_the_registry()
+    {
+        // A check added to GateChecks as a constant but left out of All (and so out of the registry and its coverage) fails here.
+        var named = typeof(GateChecks).GetFields(BindingFlags.Public | BindingFlags.Static)
+            .Where(f => f.IsLiteral && f.FieldType == typeof(string))
+            .Select(f => (string)f.GetRawConstantValue()!);
+        Assert.Equal(named.Order(), GateChecks.All.Order());
+        Assert.Equal(GateChecks.All, GateCheckCoverage.Registry.Take(GateChecks.All.Count));
     }
 
     private static readonly GateCheckTest CiRed = new("T.Red_ci_blocks", [GateChecks.CiGreen], null);
@@ -25,15 +35,18 @@ public sealed class GateCheckCoverageTests
         string[] registry = [GateChecks.CiGreen, GateChecks.ReviewPass];
         Assert.Empty(GateCheckCoverage.Problems(registry, [CiRed, ReviewFail]));
 
-        Assert.Equal(["gate check 'review-pass' has no running test that makes it fail ([FailsGateCheck(\"review-pass\")])"],
+        Assert.Equal(["gate check 'review-pass' has no running test that makes it fail on its own ([FailsGateCheck(\"review-pass\")] as its only tag)"],
             GateCheckCoverage.Problems(registry, [CiRed]));
+        // A test tagged with several checks does not stand in for a check's own test: it may fail on one of the others.
+        Assert.Equal(["gate check 'review-pass' has no running test that makes it fail on its own ([FailsGateCheck(\"review-pass\")] as its only tag)"],
+            GateCheckCoverage.Problems(registry, [CiRed, new("T.Every_check", [GateChecks.CiGreen, GateChecks.ReviewPass], null)]));
     }
 
     [Fact]
     public void A_failing_case_test_that_would_not_run_or_names_an_unknown_check_is_reported()
     {
         string[] registry = [GateChecks.CiGreen, GateChecks.ReviewPass];
-        Assert.Equal(["T.Failed_review_blocks would not run in CI: skipped", "gate check 'review-pass' has no running test that makes it fail ([FailsGateCheck(\"review-pass\")])"],
+        Assert.Equal(["T.Failed_review_blocks would not run in CI: skipped", "gate check 'review-pass' has no running test that makes it fail on its own ([FailsGateCheck(\"review-pass\")] as its only tag)"],
             GateCheckCoverage.Problems(registry, [CiRed, ReviewFail with { Runs = "skipped" }]));
         Assert.Equal(["T.Typo names 'ci-gren', which is not a registered gate check"],
             GateCheckCoverage.Problems(registry, [CiRed, ReviewFail, new("T.Typo", ["ci-gren"], null)]));

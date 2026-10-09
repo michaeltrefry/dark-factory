@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <Using Include="Xunit" />
+    <Using Include="DarkFactory.Orchestrator.Gateway" />
   </ItemGroup>
 
   <ItemGroup>
@@ -24,7 +25,14 @@
 
   <ItemGroup>
     <ProjectReference Include="../../src/DarkFactory.Orchestrator/DarkFactory.Orchestrator.csproj" />
+    <!-- The gateway lint (sc-25390): the live tests reach GitHub, Shortcut and the router only through the orchestrator's gateway. -->
+    <ProjectReference Include="../../src/DarkFactory.Analyzers/DarkFactory.Analyzers.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
   </ItemGroup>
+
+  <!-- Switching analyzers off on the command line (the RunAnalyzers properties) fails the build too: the gateway lint always runs. -->
+  <Target Name="RequireGatewayLint" BeforeTargets="CoreCompile">
+    <Error Condition="'$(RunAnalyzers)' == 'false' or '$(RunAnalyzersDuringBuild)' == 'false'" Text="The gateway lint (sc-25390) runs in every build: RunAnalyzers and RunAnalyzersDuringBuild may not be false." />
+  </Target>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.12" />

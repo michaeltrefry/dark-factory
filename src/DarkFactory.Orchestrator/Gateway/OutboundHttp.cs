@@ -1,3 +1,5 @@
+using System.Net;
+
 namespace DarkFactory.Orchestrator.Gateway;
 
 /// <summary>
@@ -6,7 +8,7 @@ namespace DarkFactory.Orchestrator.Gateway;
 /// the router is built here, one named client per service; the typed clients (<c>GitHubApp</c>, <c>GitHubPullRequests</c>,
 /// <c>GitHubGate</c>, <c>GitHubIssuesClient</c>, <c>RepoProtection</c>, <c>GitHubAppSetup</c>, <c>ShortcutWorkSource</c>,
 /// <c>RouterClient</c>, <c>RouterReviewer</c>) use the one they are given. The <c>DarkFactory.Analyzers</c> gateway lint fails
-/// the build on an HTTP client, handler, socket or web request made anywhere else in the orchestrator (DF0001) and on a
+/// the build on an HTTP client, handler, socket or web request made anywhere else in the orchestrator or the acceptance tests (DF0001) and on a
 /// service host named outside this folder (DF0004). Model calls go only to the router (Phase 1 E1): no provider host is
 /// named anywhere (DF0003).
 /// </summary>
@@ -34,4 +36,11 @@ public static class OutboundHttp
         }
         return http;
     }
+
+    /// <summary>
+    /// A client for the factory's own dashboard at <paramref name="baseAddress"/> (the live acceptance tests' login): it keeps
+    /// <paramref name="cookies"/> and does not follow redirects.
+    /// </summary>
+    public static HttpClient Dashboard(Uri baseAddress, CookieContainer cookies) =>
+        new(new HttpClientHandler { CookieContainer = cookies, AllowAutoRedirect = false }) { BaseAddress = baseAddress };
 }

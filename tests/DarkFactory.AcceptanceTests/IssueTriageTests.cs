@@ -112,7 +112,7 @@ public class IssueTriageTests
 
             await CommentAsync(owner, repo, number, "Approved", ct);
             await FactoryRunner.PollIssuesAsync(options, status, Console.Out, ct);
-            using var github = new HttpClient { BaseAddress = Orchestrator.GitHub.GitHubApp.DefaultBaseAddress };
+            using var github = OutboundHttp.GitHubApi();
             Assert.Contains(key, await FactoryRunner.CreateIssueSource(options, github).ListReadyAsync(ct));
         }
         finally
@@ -123,7 +123,7 @@ public class IssueTriageTests
 
     private static HttpClient UserClient(string token)
     {
-        var http = new HttpClient { BaseAddress = Orchestrator.GitHub.GitHubApp.DefaultBaseAddress };
+        var http = OutboundHttp.GitHubApi();
         http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
         http.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("dark-factory-e2e", "0.1"));
         http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));

@@ -161,6 +161,7 @@ public class MergeGateTests
     [InlineData("version: 1\nrequire:\n  ci: green\n  review: pass\n", null, "version 1, which this gate no longer accepts")]
     [InlineData("version: 2\ntiers: {}\nrisk: {}\n", null, "tiers is missing 'sealed'")]
     [InlineData("version: 2", "GitHub read failed: 500", "could not be read")]
+    [FailsGateCheck(GateCheckCoverage.PreconditionPolicy)]
     public void An_unreadable_or_invalid_policy_blocks(string? policy, string? error, string reason)
     {
         var decision = Evaluate(policy: policy, policyError: error, noPolicy: policy is null);
@@ -169,6 +170,7 @@ public class MergeGateTests
     }
 
     [Fact]
+    [FailsGateCheck(GateCheckCoverage.PreconditionPolicy)]
     public void An_invalid_policy_blocks_even_when_the_head_is_unreviewed()
     {
         Assert.Equal(GateOutcome.Blocked, Evaluate(policy: "version: 2", verdicts: []).Outcome);
@@ -289,16 +291,23 @@ public class MergeGateTests
 
     [Fact]
     [FailsGateCheck(GateChecks.ReviewPass)]
-    [FailsGateCheck(GateChecks.SecurityReview)]
     public void A_verdict_missing_a_required_role_blocks()
     {
         Assert.Contains("has no spec-conformance review", Evaluate(verdicts: [Pass with { Reviews = [Pass.Reviews[0]] }]).Detail);
-        // A risky change needs the security review too.
-        Assert.Contains("has no security review", Evaluate(verdicts: [Pass with { RiskyPaths = [".github/workflows/ci.yml (CI)"] }]).Detail);
+    }
+
+    [Fact]
+    [FailsGateCheck(GateChecks.SecurityReview)]
+    public void A_risky_change_without_the_security_review_blocks()
+    {
+        var decision = Evaluate(verdicts: [Pass with { RiskyPaths = [".github/workflows/ci.yml (CI)"] }]);
+        Assert.Equal(GateOutcome.Blocked, decision.Outcome);
+        Assert.Contains("has no security review", decision.Detail);
         Assert.Equal(GateOutcome.Merge, Evaluate(verdicts: [Pass with { RiskyPaths = ["x"], Reviews = [.. Pass.Reviews, Review(ReviewRoles.Security)] }]).Outcome);
     }
 
     [Fact]
+    [FailsGateCheck(GateCheckCoverage.PreconditionPrOpen)]
     public void A_draft_or_closed_pr_blocks()
     {
         Assert.Contains("draft", Evaluate(pull: Pull with { Draft = true }).Detail);

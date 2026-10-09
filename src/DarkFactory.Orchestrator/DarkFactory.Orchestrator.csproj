@@ -38,4 +38,9 @@
     <InternalsVisibleTo Include="DarkFactory.AcceptanceTests" />
   </ItemGroup>
 
+  <!-- Switching analyzers off on the command line (the RunAnalyzers properties) fails the build too: the gateway lint always runs. -->
+  <Target Name="RequireGatewayLint" BeforeTargets="CoreCompile">
+    <Error Condition="'$(RunAnalyzers)' == 'false' or '$(RunAnalyzersDuringBuild)' == 'false'" Text="The gateway lint (sc-25390) runs in every build: RunAnalyzers and RunAnalyzersDuringBuild may not be false." />
+  </Target>
+
 </Project>

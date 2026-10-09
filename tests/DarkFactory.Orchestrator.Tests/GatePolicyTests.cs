@@ -82,12 +82,48 @@ public class GatePolicyTests
 
     [Theory]
     [MemberData(nameof(Invalid))]
-    [FailsGateCheck(GateCheckCoverage.FloorChecks)]
-    [FailsGateCheck(GateCheckCoverage.FloorSealedPaths)]
     public void A_corrupt_or_incomplete_policy_is_invalid(string yaml, string reason)
     {
         var ex = Assert.Throws<GatePolicyException>(() => GatePolicy.Parse(yaml));
         Assert.Contains(reason, ex.Message);
+    }
+
+    /// <summary>The rows of <see cref="Invalid"/> whose reason contains <paramref name="reason"/>.</summary>
+    private static TheoryData<string, string> InvalidFor(string reason)
+    {
+        var rows = new TheoryData<string, string>();
+        foreach (var row in Invalid())
+        {
+            if (row.Data.Item2.Contains(reason, StringComparison.Ordinal))
+            {
+                rows.Add(row.Data.Item1, row.Data.Item2);
+            }
+        }
+        return rows;
+    }
+
+    /// <summary>A tier dropping a check its floor requires (<see cref="GatePolicy.FloorChecks"/>).</summary>
+    public static TheoryData<string, string> FloorCheckDrops() => InvalidFor(".checks must include ");
+
+    /// <summary>A sealed tier that leaves out a path the floor seals (<see cref="GatePolicy.MustBeSealed"/>).</summary>
+    public static TheoryData<string, string> Unsealed() => InvalidFor("the sealed tier must cover ");
+
+    [Theory]
+    [MemberData(nameof(FloorCheckDrops))]
+    [FailsGateCheck(GateCheckCoverage.FloorChecks)]
+    public void A_policy_dropping_a_floor_check_is_refused(string yaml, string reason)
+    {
+        Assert.Equal(7, FloorCheckDrops().Count);
+        Assert.Contains(reason, Assert.Throws<GatePolicyException>(() => GatePolicy.Parse(yaml)).Message);
+    }
+
+    [Theory]
+    [MemberData(nameof(Unsealed))]
+    [FailsGateCheck(GateCheckCoverage.FloorSealedPaths)]
+    public void A_policy_unsealing_a_floor_path_is_refused(string yaml, string reason)
+    {
+        Assert.Equal(8, Unsealed().Count);
+        Assert.Contains(reason, Assert.Throws<GatePolicyException>(() => GatePolicy.Parse(yaml)).Message);
     }
 
     [Theory]
@@ -357,6 +393,7 @@ public class MergeGateTierTests
     }
 
     [Fact]
+    [FailsGateCheck(GateCheckCoverage.SealedEscalation)]
     public void A_sealed_path_escalates_even_when_the_review_and_the_pr_claim_otherwise()
     {
         // The verdict lists no risky path (the panel, like a plan or the PR, says nothing sensitive changed), every check
@@ -387,6 +424,7 @@ public class MergeGateTierTests
     }
 
     [Fact]
+    [FailsGateCheck(GateCheckCoverage.PreconditionDiffComplete)]
     public void A_diff_that_cannot_be_read_blocks()
     {
         var decision = MergeGate.Evaluate(Policy, null, Pull, new ChangeFacts(null, "406 diff too large", 0), Green, [Full]);
@@ -399,6 +437,7 @@ public class MergeGateTierTests
     [InlineData(2, "it has 1 file(s), the PR 2 changed file(s)")] // GitHub left a file out of the diff
     [InlineData(0, "it has 1 file(s), the PR 0 changed file(s)")]
     [InlineData(null, "the PR an unread number of changed file(s)")]
+    [FailsGateCheck(GateCheckCoverage.PreconditionDiffComplete)]
     public void A_diff_whose_file_count_differs_from_the_prs_is_incomplete_and_blocks(int? prFiles, string reason)
     {
         var decision = MergeGate.Evaluate(Policy, null, Pull with { ChangedFiles = prFiles }, new ChangeFacts(TestPolicies.Diff("docs/a.md"), null, 0),

@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using DarkFactory.Orchestrator;
 using DarkFactory.Orchestrator.Dashboard;
 using DarkFactory.Orchestrator.Gateway;
@@ -109,7 +108,7 @@ static async Task<int> SetupGitHubAppAsync(string name, int port, bool gate, Can
 // Rulesets need repo admin, which the App deliberately lacks, so this uses the owner's own GitHub token.
 static async Task<int> ProtectRepoAsync(RepoRef repo, CancellationToken ct)
 {
-    var token = RepoProtection.ResolveAdminToken(Environment.GetEnvironmentVariable, GhAuthToken);
+    var token = RepoProtection.ResolveAdminToken(Environment.GetEnvironmentVariable, GitHubCli.AuthToken);
     if (token is null)
     {
         Console.Error.WriteLine("No admin GitHub token: set GH_TOKEN or run `gh auth login`.");
@@ -120,20 +119,4 @@ static async Task<int> ProtectRepoAsync(RepoRef repo, CancellationToken ct)
     long? gateAppId = options.TryGet(o => o.GitHubGateAppId, out var id) && long.TryParse(id, out var parsed) ? parsed : null;
     using var http = OutboundHttp.GitHubApi();
     return await RepoProtection.RunAsync(http, token, repo, Console.Out, Console.Error, ct, gateAppId);
-}
-
-static string? GhAuthToken()
-{
-    try
-    {
-        using var p = Process.Start(new ProcessStartInfo("gh", "auth token") { RedirectStandardOutput = true, RedirectStandardError = true })!;
-        var token = p.StandardOutput.ReadToEnd().Trim();
-        p.StandardError.ReadToEnd();
-        p.WaitForExit();
-        return p.ExitCode == 0 && token.Length > 0 ? token : null;
-    }
-    catch (System.ComponentModel.Win32Exception)
-    {
-        return null;
-    }
 }

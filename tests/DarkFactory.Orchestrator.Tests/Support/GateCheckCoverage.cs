@@ -18,9 +18,10 @@ public sealed class FailsGateCheckAttribute(string check) : Attribute
 public sealed record GateCheckTest(string Name, IReadOnlyList<string> Checks, string? Runs);
 
 /// <summary>
-/// The registry of gate checks and the CI check that each has at least one running test that makes it fail
-/// (<see cref="FailsGateCheckAttribute"/>). Run by <c>GateCheckCoverageTests</c> in CI's <c>build-test</c>: removing the
-/// failing-case test of any check, skipping it or tagging a check that does not exist fails CI.
+/// The registry of gate checks and the CI check that each has at least one running test dedicated to it — tagged
+/// <see cref="FailsGateCheckAttribute"/> with that check alone — that makes it fail. Run by <c>GateCheckCoverageTests</c> in
+/// CI's <c>build-test</c>: removing a check's dedicated failing-case test, skipping it or tagging a check that does not exist
+/// fails CI.
 /// </summary>
 public static class GateCheckCoverage
 {
@@ -33,8 +34,27 @@ public static class GateCheckCoverage
     /// <summary>The code floor of paths that call the security review in (<see cref="RiskyPaths"/>), whatever their tier.</summary>
     public const string FloorSecurityReviewPaths = "policy-floor:security-review-paths";
 
-    /// <summary>Every gate check: the named checks a tier can require (<see cref="GateChecks.All"/>) and the policy floors.</summary>
-    public static readonly IReadOnlyList<string> Registry = [.. GateChecks.All, FloorChecks, FloorSealedPaths, FloorSecurityReviewPaths];
+    /// <summary><see cref="MergeGate"/> blocks when the base's policy is unreadable, missing or invalid.</summary>
+    public const string PreconditionPolicy = "precondition:policy";
+
+    /// <summary><see cref="MergeGate"/> blocks a PR that is closed, merged or a draft.</summary>
+    public const string PreconditionPrOpen = "precondition:pr-open";
+
+    /// <summary><see cref="MergeGate"/> blocks when the head's diff is unreadable or leaves files out (the tiers of its paths are unknown).</summary>
+    public const string PreconditionDiffComplete = "precondition:diff-complete";
+
+    /// <summary><see cref="MergeGate"/> escalates every change touching a sealed path, whatever the review, the PR or the plan claim.</summary>
+    public const string SealedEscalation = "sealed-escalation";
+
+    /// <summary>
+    /// Every gate check: the named checks a tier can require (<see cref="GateChecks.All"/>), the policy floors, and the merge
+    /// gate's fail-closed preconditions and sealed-path escalation.
+    /// </summary>
+    public static readonly IReadOnlyList<string> Registry =
+    [
+        .. GateChecks.All, FloorChecks, FloorSealedPaths, FloorSecurityReviewPaths,
+        PreconditionPolicy, PreconditionPrOpen, PreconditionDiffComplete, SealedEscalation,
+    ];
 
     /// <summary>Every method of <paramref name="types"/> carrying <see cref="FailsGateCheckAttribute"/>.</summary>
     public static IReadOnlyList<GateCheckTest> Find(IEnumerable<Type> types) =>
@@ -59,15 +79,16 @@ public static class GateCheckCoverage
 
     /// <summary>
     /// What is wrong with the coverage of <paramref name="registry"/> by <paramref name="tests"/>: a registered check with no
-    /// running test that makes it fail, a test that would not run, a test naming a check that is not registered. Empty: covered.
+    /// running test dedicated to it (tagged with that check alone: a test tagged with several checks may also fail on one of
+    /// the others, so it never counts), a test that would not run, a test naming a check that is not registered. Empty: covered.
     /// </summary>
     public static IReadOnlyList<string> Problems(IReadOnlyList<string> registry, IReadOnlyList<GateCheckTest> tests)
     {
         var problems = new List<string>();
         problems.AddRange(tests.Where(t => t.Runs is not null).Select(t => $"{t.Name} would not run in CI: {t.Runs}"));
         problems.AddRange(tests.SelectMany(t => t.Checks.Where(c => !registry.Contains(c)).Select(c => $"{t.Name} names '{c}', which is not a registered gate check")));
-        problems.AddRange(registry.Where(c => !tests.Any(t => t.Runs is null && t.Checks.Contains(c)))
-            .Select(c => $"gate check '{c}' has no running test that makes it fail ([FailsGateCheck(\"{c}\")])"));
+        problems.AddRange(registry.Where(c => !tests.Any(t => t.Runs is null && t.Checks.Count == 1 && t.Checks[0] == c))
+            .Select(c => $"gate check '{c}' has no running test that makes it fail on its own ([FailsGateCheck(\"{c}\")] as its only tag)"));
         return problems;
     }
 }

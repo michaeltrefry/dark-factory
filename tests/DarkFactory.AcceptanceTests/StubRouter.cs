@@ -41,12 +41,9 @@ internal sealed class StubRouter : IAsyncDisposable
         var builder = WebApplication.CreateSlimBuilder();
         builder.WebHost.ConfigureKestrel(k => k.Listen(IPAddress.Loopback, 0));
         var app = builder.Build();
-        // No automatic decompression: bodies pass through byte for byte with their Content-Encoding.
-        var upstream = new HttpClient(new SocketsHttpHandler { AutomaticDecompression = DecompressionMethods.None })
-        {
-            BaseAddress = realRouter,
-            Timeout = Timeout.InfiniteTimeSpan,
-        };
+        // The gateway's router client: its default handler does no automatic decompression, so bodies pass through byte for
+        // byte with their Content-Encoding.
+        var upstream = OutboundHttp.RouterApi(realRouter, Timeout.InfiniteTimeSpan);
         var stub = new StubRouter(app, upstream, resumesAt);
         app.MapGet("/v1/subscriptions/usage", stub.Usage);
         // A catch-all endpoint, not app.Run: terminal middleware runs before any endpoint, so it would proxy the usage
