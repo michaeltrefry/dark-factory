@@ -27,7 +27,7 @@ public class StubRouterTests
             .GetRequiredFeature<IServerAddressesFeature>().Addresses.First());
 
         await using var stub = await StubRouter.StartAsync(upstreamUrl, DateTimeOffset.UtcNow.AddMinutes(2), ct);
-        using var http = new HttpClient { BaseAddress = stub.BaseUrl };
+        using var http = OutboundHttp.RouterApi(stub.BaseUrl);
 
         var usage = await http.GetFromJsonAsync<SubscriptionUsage>("v1/subscriptions/usage", ct);
         Assert.NotNull(usage);

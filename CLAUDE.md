@@ -18,7 +18,31 @@ Claude Code headless workers through the Weave router.
   review and merge gate (`Gate/`: `ReviewModels`/`ReviewerChoice`, `ReviewPanel` (roles, risky paths, prompts, findings),
   `RouterReviewer`, `GatePolicy`, `MergeGate`, the new-tests check `NewTestsCheck`/`XunitNewTests`/`SandboxTestRunner`;
   reviewer prompts in `factory/prompts/`; GitHub side
-  `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`, the merge gate and queue `RunPipeline.MergeQueue.cs`).
+  `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`, the merge gate and queue `RunPipeline.MergeQueue.cs`),
+  and the outbound gateway (`Gateway/`: `OutboundHttp` builds every GitHub, Shortcut and router `HttpClient` (and the
+  acceptance tests' dashboard client); `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token
+  credentials; `GitHubCli` is the only `gh` run).
+- `src/DarkFactory.Analyzers` — the gateway lint (sc-25390), a Roslyn analyzer every build of the orchestrator and of
+  `tests/DarkFactory.AcceptanceTests` runs (CI's `build-test` included), all errors: DF0001 an HTTP client/handler (made,
+  subclassed, in `typeof` or an explicit type argument like `Activator.CreateInstance<HttpClient>()`), socket, web socket,
+  `WebRequest`/`WebClient`, `IHttpClientFactory`/`AddHttpClient`, or `gh`/`curl`/`wget`/`nc` started by `Process.Start`/
+  `ProcessStartInfo`, outside `Gateway/`; DF0002 a git remote write outside it (text whose subcommand, past git's global
+  options like `-C <dir>`/`--git-dir=…`, is `push`/`send-pack`/`http-push`/`remote set-url`, at its start — so a lone `push`
+  argument — or after a `git` word); DF0003 a model provider host or key (`api.anthropic.com`, `ANTHROPIC_API_KEY`, …)
+  anywhere, the embedded manifests, prompts, scripts and Razor markup included; DF0004 GitHub's or Shortcut's API host outside
+  it. Strings are read as the compiler folds them (`"api.github" + ".com"`, consts, interpolations). Every rule is
+  `NotConfigurable` (no `#pragma`, `NoWarn` or `.editorconfig` severity turns it off), and both projects fail the build on
+  `-p:RunAnalyzers=false` (target `RequireGatewayLint`). The unit test projects (`DarkFactory.Orchestrator.Tests`,
+  `DarkFactory.CrashHost`) are exempt: they make only fake `HttpClient`s over fake handlers and loopback servers.
+  `GatewayLintTests` seed each violation, lint the current tree (orchestrator and acceptance tests, suppressed diagnostics
+  included), and fail on anything that would switch the lint off: a bare `#pragma warning disable` or one naming a DF rule, an
+  attribute (`SuppressMessage`, which Roslyn still honours for NotConfigurable rules) naming `Gateway` or a DF rule, a
+  `DiagnosticSuppressor`, and in project/MSBuild/analyzer-config/CI files a DF rule id, `dotnet_analyzer_diagnostic.`,
+  `category-Gateway`, `<RunAnalyzers>`/`<RunAnalyzersDuringBuild>`, `RunAnalyzers…=` or `<Analyzer Remove>`. Gate checks: a
+  test that makes a check fail carries `[FailsGateCheck("…")]`; `GateCheckCoverageTests` fails unless every check in
+  `GateCheckCoverage.Registry` (`GateChecks.All`, which must hold every `GateChecks` constant; the policy floors; the merge
+  gate's fail-closed `precondition:policy`/`precondition:pr-open`/`precondition:diff-complete` and `sealed-escalation`) has a
+  running (not skipped/explicit) test tagged with that check alone (a multi-check test does not count).
 - `scripts/` — `setup-worker-user.sh` (one-time root setup of the `_factory` sandbox user) and
   `factory-worker-launch` (the root-installed helper every sandboxed worker runs through).
 - `tests/DarkFactory.Orchestrator.Tests` — unit tests (no network; fake HTTP APIs, InMemory EF, local git).

@@ -62,7 +62,7 @@ internal static class Harness
 
     public static async Task RequireRouterAsync()
     {
-        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+        using var http = OutboundHttp.RouterApi(Options.RouterBaseUrl, TimeSpan.FromSeconds(3));
         try
         {
             await http.GetAsync(Options.RouterBaseUrl);
@@ -115,7 +115,7 @@ internal static class Harness
     /// </summary>
     public static async Task<SessionCost?> WaitForCostAsync(string sessionId, string routerKey, CancellationToken ct)
     {
-        using var http = new HttpClient { BaseAddress = Options.RouterBaseUrl };
+        using var http = OutboundHttp.RouterApi(Options.RouterBaseUrl);
         var router = new RouterClient(http, routerKey);
         for (var attempt = 0; attempt < 30; attempt++)
         {

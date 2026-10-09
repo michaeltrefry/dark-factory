@@ -34,7 +34,7 @@ public class ReviewSeedTests
         var routerKey = Harness.RequireSecret(o => o.RouterKey);
         Harness.RequireReviewPanel();
         await Harness.RequireRouterAsync();
-        return new RouterReviewer(new HttpClient { BaseAddress = Harness.Options.RouterBaseUrl, Timeout = Harness.Options.ReviewTimeout }, routerKey);
+        return new RouterReviewer(OutboundHttp.RouterApi(Harness.Options.RouterBaseUrl, Harness.Options.ReviewTimeout), routerKey);
     }
 
     private static async Task<RoleReview> SpecConformanceAsync(RouterReviewer reviewer, string diff, CancellationToken ct)

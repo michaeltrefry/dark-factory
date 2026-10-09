@@ -89,7 +89,7 @@ public class WalkingSkeletonTests
 
         // GitHub: a PR from factory/sc-<id> whose body links the story (merged by now if the gate passed it).
         var repo = RepoRef.Parse(item.Repo);
-        using var github = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        using var github = OutboundHttp.GitHubApi();
         var token = (await new GitHubApp(github, appId, appKey, TimeProvider.System).CreateInstallationTokenAsync(repo, ct)).Token;
         using var request = GitHubApp.Request(HttpMethod.Get,
             $"repos/{repo.Owner}/{repo.Name}/pulls?state=all&head={Uri.EscapeDataString($"{repo.Owner}:{StoryId.BranchName(storyId)}")}",

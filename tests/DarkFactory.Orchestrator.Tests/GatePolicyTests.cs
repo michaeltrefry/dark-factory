@@ -88,6 +88,44 @@ public class GatePolicyTests
         Assert.Contains(reason, ex.Message);
     }
 
+    /// <summary>The rows of <see cref="Invalid"/> whose reason contains <paramref name="reason"/>.</summary>
+    private static TheoryData<string, string> InvalidFor(string reason)
+    {
+        var rows = new TheoryData<string, string>();
+        foreach (var row in Invalid())
+        {
+            if (row.Data.Item2.Contains(reason, StringComparison.Ordinal))
+            {
+                rows.Add(row.Data.Item1, row.Data.Item2);
+            }
+        }
+        return rows;
+    }
+
+    /// <summary>A tier dropping a check its floor requires (<see cref="GatePolicy.FloorChecks"/>).</summary>
+    public static TheoryData<string, string> FloorCheckDrops() => InvalidFor(".checks must include ");
+
+    /// <summary>A sealed tier that leaves out a path the floor seals (<see cref="GatePolicy.MustBeSealed"/>).</summary>
+    public static TheoryData<string, string> Unsealed() => InvalidFor("the sealed tier must cover ");
+
+    [Theory]
+    [MemberData(nameof(FloorCheckDrops))]
+    [FailsGateCheck(GateCheckCoverage.FloorChecks)]
+    public void A_policy_dropping_a_floor_check_is_refused(string yaml, string reason)
+    {
+        Assert.Equal(7, FloorCheckDrops().Count);
+        Assert.Contains(reason, Assert.Throws<GatePolicyException>(() => GatePolicy.Parse(yaml)).Message);
+    }
+
+    [Theory]
+    [MemberData(nameof(Unsealed))]
+    [FailsGateCheck(GateCheckCoverage.FloorSealedPaths)]
+    public void A_policy_unsealing_a_floor_path_is_refused(string yaml, string reason)
+    {
+        Assert.Equal(8, Unsealed().Count);
+        Assert.Contains(reason, Assert.Throws<GatePolicyException>(() => GatePolicy.Parse(yaml)).Message);
+    }
+
     [Theory]
     [InlineData("factory/gate.yaml", Tier.Sealed)]
     [InlineData(".github/workflows/ci.yml", Tier.Sealed)]
@@ -295,6 +333,11 @@ public class MergeGateTierTests
     [InlineData("src/auth/Login.cs", Tier.Protected, true, true, true, true, true, false, "touches protected path(s), merged only after escalation")]
     [InlineData("src/WordCount.cs", Tier.Normal, true, true, false, true, true, true, null)]
     [InlineData("tests/WordCountTests.cs", Tier.Free, true, true, false, false, false, true, null)]
+    [FailsGateCheck(GateChecks.CiGreen)]
+    [FailsGateCheck(GateChecks.ReviewPass)]
+    [FailsGateCheck(GateChecks.SecurityReview)]
+    [FailsGateCheck(GateChecks.RiskThreshold)]
+    [FailsGateCheck(GateChecks.NewTestsFailOnBase)]
     public void Each_tier_enforces_its_required_checks(string path, Tier tier, bool ci, bool review, bool security, bool risk, bool newTests, bool merges,
         string? escalation)
     {
@@ -339,6 +382,7 @@ public class MergeGateTierTests
     }
 
     [Fact]
+    [FailsGateCheck(GateChecks.RiskThreshold)]
     public void The_risk_threshold_holds_at_its_limits()
     {
         Assert.Equal(GateOutcome.Merge, Evaluate(TestPolicies.Diff("src/a.cs", lines: 400), fixRounds: 3).Outcome);
@@ -349,6 +393,7 @@ public class MergeGateTierTests
     }
 
     [Fact]
+    [FailsGateCheck(GateCheckCoverage.SealedEscalation)]
     public void A_sealed_path_escalates_even_when_the_review_and_the_pr_claim_otherwise()
     {
         // The verdict lists no risky path (the panel, like a plan or the PR, says nothing sensitive changed), every check
@@ -367,6 +412,8 @@ public class MergeGateTierTests
     }
 
     [Fact]
+    [FailsGateCheck(GateChecks.CiGreen)]
+    [FailsGateCheck(GateChecks.SecurityReview)]
     public void A_sealed_tier_change_still_needs_its_checks_and_says_so()
     {
         var decision = Evaluate(TestPolicies.Diff(".github/workflows/ci.yml"), ci: Red,
@@ -377,6 +424,7 @@ public class MergeGateTierTests
     }
 
     [Fact]
+    [FailsGateCheck(GateCheckCoverage.PreconditionDiffComplete)]
     public void A_diff_that_cannot_be_read_blocks()
     {
         var decision = MergeGate.Evaluate(Policy, null, Pull, new ChangeFacts(null, "406 diff too large", 0), Green, [Full]);
@@ -389,6 +437,7 @@ public class MergeGateTierTests
     [InlineData(2, "it has 1 file(s), the PR 2 changed file(s)")] // GitHub left a file out of the diff
     [InlineData(0, "it has 1 file(s), the PR 0 changed file(s)")]
     [InlineData(null, "the PR an unread number of changed file(s)")]
+    [FailsGateCheck(GateCheckCoverage.PreconditionDiffComplete)]
     public void A_diff_whose_file_count_differs_from_the_prs_is_incomplete_and_blocks(int? prFiles, string reason)
     {
         var decision = MergeGate.Evaluate(Policy, null, Pull with { ChangedFiles = prFiles }, new ChangeFacts(TestPolicies.Diff("docs/a.md"), null, 0),
@@ -405,6 +454,7 @@ public class MergeGateTierTests
     [InlineData("scripts/deploy.sh", "scripts/deploy.sh (scripts)")]
     [InlineData("src/App/App.csproj", "src/App/App.csproj (dependencies)")]
     [InlineData("tests/TokenTests.cs", "tests/TokenTests.cs (security-sensitive code)")] // a free path the floor still matches
+    [FailsGateCheck(GateCheckCoverage.FloorSecurityReviewPaths)]
     public void A_path_on_the_code_floor_needs_the_security_review_whatever_its_tier(string path, string why)
     {
         var withoutSecurity = Full with { Reviews = Full.Reviews.Where(r => r.Role != ReviewRoles.Security).ToList() };

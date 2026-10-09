@@ -19,7 +19,7 @@ public sealed record InstallationToken(string Token, DateTimeOffset ExpiresAt);
 /// </summary>
 public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPem, TimeProvider time)
 {
-    public static readonly Uri DefaultBaseAddress = new("https://api.github.com/");
+    public static readonly Uri DefaultBaseAddress = Gateway.OutboundHttp.GitHubApiBase;
 
     public static readonly IReadOnlyDictionary<string, string> TokenPermissions = new Dictionary<string, string>
     {

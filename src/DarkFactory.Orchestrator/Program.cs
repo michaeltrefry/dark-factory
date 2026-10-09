@@ -1,6 +1,6 @@
-using System.Diagnostics;
 using DarkFactory.Orchestrator;
 using DarkFactory.Orchestrator.Dashboard;
+using DarkFactory.Orchestrator.Gateway;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Sessions;
@@ -58,7 +58,7 @@ static async Task<int> WorkAsync(CancellationToken ct)
         Console.Error.WriteLine(ex.Message);
         return 2;
     }
-    using (var shortcutHttp = new HttpClient { BaseAddress = ShortcutWorkSource.DefaultBaseAddress })
+    using (var shortcutHttp = OutboundHttp.ShortcutApi())
     {
         if (await FactoryRunner.CheckWatchScopeAsync(options, FactoryRunner.CreateWorkSource(options, shortcutHttp), ct) is { } scopeError)
         {
@@ -66,7 +66,7 @@ static async Task<int> WorkAsync(CancellationToken ct)
             return 2;
         }
     }
-    using (var githubHttp = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress })
+    using (var githubHttp = OutboundHttp.GitHubApi())
     {
         if (await FactoryRunner.CheckWatchScopeAsync(options, FactoryRunner.CreateIssueSource(options, githubHttp), ct) is { } scopeError)
         {
@@ -91,7 +91,7 @@ static async Task<int> WorkAsync(CancellationToken ct)
 // Worker:Auth=router-key needs a plan enrolled on the router for the key; checked before any work starts (E10).
 static async Task<string?> CheckRouterEnrollmentAsync(FactoryOptions options, CancellationToken ct)
 {
-    using var http = new HttpClient { BaseAddress = options.RouterBaseUrl };
+    using var http = OutboundHttp.RouterApi(options.RouterBaseUrl);
     return await FactoryRunner.CheckRouterEnrollmentAsync(options, new DarkFactory.Orchestrator.Router.RouterClient(http, options.RouterKey), ct);
 }
 
@@ -100,7 +100,7 @@ static Task<int> SetDashboardPasswordAsync(CancellationToken ct) =>
 
 static async Task<int> SetupGitHubAppAsync(string name, int port, bool gate, CancellationToken ct)
 {
-    using var http = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+    using var http = OutboundHttp.GitHubApi();
     await new GitHubAppSetup(http, new MacKeychain(), Console.Out, gate).RunAsync(name, port, ct);
     return 0;
 }
@@ -108,7 +108,7 @@ static async Task<int> SetupGitHubAppAsync(string name, int port, bool gate, Can
 // Rulesets need repo admin, which the App deliberately lacks, so this uses the owner's own GitHub token.
 static async Task<int> ProtectRepoAsync(RepoRef repo, CancellationToken ct)
 {
-    var token = RepoProtection.ResolveAdminToken(Environment.GetEnvironmentVariable, GhAuthToken);
+    var token = RepoProtection.ResolveAdminToken(Environment.GetEnvironmentVariable, GitHubCli.AuthToken);
     if (token is null)
     {
         Console.Error.WriteLine("No admin GitHub token: set GH_TOKEN or run `gh auth login`.");
@@ -117,22 +117,6 @@ static async Task<int> ProtectRepoAsync(RepoRef repo, CancellationToken ct)
     // With the merge gate's App registered, it may merge pull requests past the rulesets (and only that).
     var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
     long? gateAppId = options.TryGet(o => o.GitHubGateAppId, out var id) && long.TryParse(id, out var parsed) ? parsed : null;
-    using var http = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+    using var http = OutboundHttp.GitHubApi();
     return await RepoProtection.RunAsync(http, token, repo, Console.Out, Console.Error, ct, gateAppId);
-}
-
-static string? GhAuthToken()
-{
-    try
-    {
-        using var p = Process.Start(new ProcessStartInfo("gh", "auth token") { RedirectStandardOutput = true, RedirectStandardError = true })!;
-        var token = p.StandardOutput.ReadToEnd().Trim();
-        p.StandardError.ReadToEnd();
-        p.WaitForExit();
-        return p.ExitCode == 0 && token.Length > 0 ? token : null;
-    }
-    catch (System.ComponentModel.Win32Exception)
-    {
-        return null;
-    }
 }

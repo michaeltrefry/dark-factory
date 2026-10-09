@@ -265,19 +265,19 @@ public static class IntakeServiceCollectionExtensions
         services.TryAddSingleton(sp => new IntakeStatus(sp.GetRequiredService<TimeProvider>()));
         services.AddSingleton(new Router.UsageOptions(options.UsagePollInterval));
         services.AddSingleton<Router.IUsageSource>(_ =>
-            new Router.RouterClient(new HttpClient { BaseAddress = options.RouterBaseUrl }, options.RouterKey));
+            new Router.RouterClient(Gateway.OutboundHttp.RouterApi(options.RouterBaseUrl), options.RouterKey));
         services.AddSingleton(sp => new Router.UsageMonitor(sp.GetRequiredService<Router.IUsageSource>(), sp.GetRequiredService<Controls.IControls>(),
             sp.GetRequiredService<Router.UsageOptions>(), sp.GetRequiredService<TimeProvider>(), sp.GetRequiredService<ILogger<Router.UsageMonitor>>()));
         // Watches usage while a long item run holds up the intake loop, so running workers pause too.
         services.AddHostedService(sp => sp.GetRequiredService<Router.UsageMonitor>());
         services.AddSingleton<IWorkSource>(_ =>
-            FactoryRunner.CreateWorkSource(options, new HttpClient { BaseAddress = Shortcut.ShortcutWorkSource.DefaultBaseAddress }));
+            FactoryRunner.CreateWorkSource(options, Gateway.OutboundHttp.ShortcutApi()));
         services.AddSingleton<IItemRunner>(sp => new FactoryItemRunner(options, sp.GetRequiredService<IWorkSource>(), Console.Out));
         // GitHub issues (sc-25385): a second source, registered by its own type so IWorkSource stays the Shortcut board.
         var issueRepos = options.WatchedIssueRepos;
         if (issueRepos.Count > 0)
         {
-            services.AddSingleton(_ => FactoryRunner.CreateIssueSource(options, new HttpClient { BaseAddress = GitHub.GitHubApp.DefaultBaseAddress }));
+            services.AddSingleton(_ => FactoryRunner.CreateIssueSource(options, Gateway.OutboundHttp.GitHubApi()));
         }
         // The dashboard's Stop finishes a stop itself when no run holds the item.
         services.AddSingleton<Controls.IItemStops>(sp => new FactoryItemStops(options, sp.GetRequiredService<IWorkSource>(), Console.Out,

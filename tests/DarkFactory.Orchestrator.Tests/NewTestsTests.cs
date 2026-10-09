@@ -51,6 +51,7 @@ public class NewTestsGateTests
     }
 
     [Fact]
+    [FailsGateCheck(GateChecks.NewTestsFailOnBase)]
     public async Task A_new_test_that_already_passes_on_the_base_is_rejected_with_the_test_named()
     {
         var h = new Harness();
@@ -82,6 +83,7 @@ public class NewTestsGateTests
     }
 
     [Fact]
+    [FailsGateCheck(GateChecks.NewTestsFailOnBase)]
     public async Task A_code_change_that_adds_no_test_fails_the_check_and_runs_nothing()
     {
         var h = new Harness();

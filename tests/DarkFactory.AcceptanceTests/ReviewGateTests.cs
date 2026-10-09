@@ -34,7 +34,7 @@ public class ReviewGateTests
         var ct = timeout.Token;
         await RequireGateReadyAsync(options, ct);
 
-        using var shortcutHttp = new HttpClient { BaseAddress = ShortcutWorkSource.DefaultBaseAddress };
+        using var shortcutHttp = OutboundHttp.ShortcutApi();
         var outcome = await FactoryRunner.RunAsync(options, FactoryRunner.CreateWorkSource(options, shortcutHttp), storyId, ignoreScope: true,
             Console.Out, ct);
         Assert.True(outcome.Succeeded, outcome.Error);
@@ -77,7 +77,7 @@ public class ReviewGateTests
         var ct = timeout.Token;
         await RequireGateReadyAsync(options, ct);
 
-        using var shortcutHttp = new HttpClient { BaseAddress = ShortcutWorkSource.DefaultBaseAddress };
+        using var shortcutHttp = OutboundHttp.ShortcutApi();
         var pusher = new PushAfterFirstVerdict(options, options.DefaultRepo, StoryId.BranchName(storyId));
         var outcome = await FactoryRunner.RunAsync(options, FactoryRunner.CreateWorkSource(options, shortcutHttp), storyId, ignoreScope: true,
             Console.Out, ct, gate => gate with { Reviewer = pusher.Wrap(gate.Reviewer) });
@@ -112,7 +112,7 @@ public class ReviewGateTests
         Harness.RequireSecret(o => o.GitHubGateAppId);
         Harness.RequireSecret(o => o.GitHubGateAppPrivateKeyPem);
         Harness.RequireReviewPanel(options);
-        using var github = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        using var github = OutboundHttp.GitHubApi();
         var gate = new GitHubGate(github, new GitHubApp(github, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System));
         string? policy;
         try
@@ -166,7 +166,7 @@ public class ReviewGateTests
 
         private async Task<string> PushAsync(CancellationToken ct)
         {
-            using var github = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+            using var github = OutboundHttp.GitHubApi();
             var token = (await new GitHubApp(github, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System)
                 .CreateInstallationTokenAsync(repo, ct)).Token;
             const string path = "factory-e2e/push-after-verdict.txt";
