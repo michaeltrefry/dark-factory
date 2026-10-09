@@ -36,12 +36,15 @@ internal static class Harness
         }
     }
 
-    /// <summary>Skips naming the owner step unless the review panel's models are valid (<c>Review:Models</c>, default <c>claude-opus-5</c>).</summary>
-    public static Orchestrator.Gate.ReviewPanelModels RequireReviewPanel(FactoryOptions? options = null)
+    /// <summary>
+    /// Skips naming the owner step when a retired pinned review-model setting (<c>Review:Models</c>, ...) is still set: the
+    /// factory refuses to start with one (reviews run on the router's high model class, sc-25626).
+    /// </summary>
+    public static void RequireReviewSettings(FactoryOptions? options = null)
     {
         try
         {
-            return (options ?? Options).ReviewPanel;
+            (options ?? Options).RejectReviewModelSettings();
         }
         catch (ReviewConfigurationException ex)
         {

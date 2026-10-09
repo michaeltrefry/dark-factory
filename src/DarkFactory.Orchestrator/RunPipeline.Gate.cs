@@ -11,14 +11,13 @@ namespace DarkFactory.Orchestrator;
 
 /// <summary>
 /// What the Review → CI → MergeGate → Merge handlers need: GitHub as the gate App (<see cref="GitHubGate"/>), the review
-/// panel's calls (through the router), the panel's model lists (per role, and the second models), how long and how
-/// often CI is waited for, and the sandboxed test runs of the <c>new-tests-fail-on-base</c> check (<see cref="Tests"/>;
-/// none: the check cannot run, so it fails wherever it is required).
+/// panel's calls (through the router, on the high model class), how long and how often CI is waited for, and the sandboxed
+/// test runs of the <c>new-tests-fail-on-base</c> check (<see cref="Tests"/>; none: the check cannot run, so it fails
+/// wherever it is required).
 /// </summary>
 public sealed record GateStage(
     IGateGitHub GitHub,
     IReviewer Reviewer,
-    ReviewPanelModels Models,
     TimeSpan CiPollInterval,
     TimeSpan CiTimeout,
     TimeProvider? Time = null,
@@ -75,20 +74,20 @@ public sealed partial class RunPipeline
     /// Review: the review panel judges the PR's current head commit — correctness and spec conformance always, security when
     /// the diff touches a path whose tier in the base branch's <c>factory/gate.yaml</c> requires it
     /// or that the code floor <see cref="RiskyPaths"/> matches (<see cref="GatePolicy.SecurityReviewReasons"/>; a missing or invalid
-    /// policy escalates before any call) — each role pinned through the router to the first of its
-    /// models that is a Claude Opus 5 or newer, whichever models the implementer used, with its prompt file (<see cref="ReviewPrompts"/>). Each blocking
-    /// finding goes to a second Claude model pinned to another id than the reviewer's and not served as the reviewer's served model (<see cref="ReviewerChoice.ChooseConfirmer"/>); one it does not confirm is downgraded
+    /// policy escalates before any call) — each role in its own fresh router session on the high model class (no model is
+    /// pinned; the router picks one, which may be the model that wrote the code), with its prompt file (<see cref="ReviewPrompts"/>). Each blocking
+    /// finding goes to a second opinion, again its own high-class session (<see cref="ReviewModels"/>); one it does not confirm is downgraded
     /// to optional. The verdict (<see cref="ReviewPanel.Decide"/>: deterministic over the findings) is checkpointed bound to
     /// that commit (E3) before it counts; a commit that already has a verdict is not reviewed again. Every call's router
     /// session is named in the ledger (<see cref="Steps.ReviewSession"/>, with its role and prompt hash) before the call, and
-    /// never as a row's Claude session (that column stays the worker's). No eligible model for a role or a second model
-    /// escalates with the reason. The router refusing a call for usage pauses the factory for usage (the item resumes and the
+    /// never as a row's Claude session (that column stays the worker's). The router refusing a call for usage (including its
+    /// <c>model_class_unavailable</c> 503: no high-class model can serve) pauses the factory for usage (the item resumes and the
     /// head is reviewed again once it lifts).
     /// Fix loop (sc-25380): pass → CI. A fail whose only cause is confirmed blocking findings (<see cref="FixLoop.Fixable"/>)
     /// → Fixing (a fixer worker gets those findings), unless <see cref="Lifecycle.MaxFixRounds"/> rounds are used: then it
     /// escalates with the open findings listed. Any other fail escalates. The review after a fix round waits for the PR to
     /// show the fixer's push, re-runs only the roles with an open blocking finding (plus any required role it lacks, or one
-    /// whose models break the panel's rule; the others' reviews are carried, <see cref="FixLoop.Carried"/>), then records
+    /// whose calls were not served on the high class; the others' reviews are carried, <see cref="FixLoop.Carried"/>), then records
     /// the round's progress check (<see cref="Steps.FixProgress"/>) before deciding.
     /// </summary>
     private async Task ReviewAsync(Run run, CancellationToken ct)
@@ -136,7 +135,8 @@ public sealed partial class RunPipeline
         var verdict = verdicts.LastOrDefault(v => v.HeadSha == pull.HeadSha);
         if (verdict is not null && MergeGate.Superseded(verdict, verdicts))
         {
-            // Recorded under an earlier panel rule (e.g. a GPT reviewer before sc-25379): the current panel reviews the head once.
+            // Recorded under an earlier panel rule (e.g. pinned reviewer models before sc-25626, with no served class): the
+            // current panel reviews the head once.
             log.WriteLine($"[review] {Ci.Short(pull.HeadSha)}: the verdict was recorded under an earlier panel rule "
                 + $"({string.Join("; ", verdict.Reviews.SelectMany(ReviewModels.Problems))}); reviewing it again");
             verdict = null;
@@ -454,15 +454,7 @@ public sealed partial class RunPipeline
             : changedBy is not { } change ? FixLoop.Carried(previous, roles)
             : CiHeal.Carried(previous, roles, policy, await Gate.GitHub.GetDiffAsync(run.Repo, change.From, change.To, ct));
         var toReview = roles.Where(r => carried.All(c => c.Role != r)).ToList();
-        // Every role's model, and a second model for its findings, is chosen before the first call: a role with no Claude Opus
-        // 5 or newer, or no eligible second model, escalates without spending any. (The second model is chosen again for each
-        // blocking finding, then also skipping any the router may serve as the model that served the review.)
-        var models = toReview.ToDictionary(r => r, r => ReviewerChoice.Choose(Gate.Models.For(r), $"Review:{ReviewRoles.ConfigName(r)}:Models"));
-        foreach (var role in toReview)
-        {
-            ReviewerChoice.ChooseConfirmer(Gate.Models.Confirm, [models[role]]);
-        }
-        log.WriteLine($"[review] {pull.HtmlUrl} head {Ci.Short(pull.HeadSha)}: {string.Join(", ", toReview.Select(r => $"{r} by {models[r]}"))}"
+        log.WriteLine($"[review] {pull.HtmlUrl} head {Ci.Short(pull.HeadSha)}: {string.Join(", ", toReview)} on the {ReviewModels.Class} class"
             + (carried.Count > 0 ? $"; carried from {Ci.Short(previous!.HeadSha)}: {string.Join(", ", carried.Select(c => c.Role))}" : "")
             + (risky.Count > 0 ? $" (risky: {string.Join(", ", risky)})" : ""));
 
@@ -475,9 +467,9 @@ public sealed partial class RunPipeline
                 continue;
             }
             var prompt = ReviewPrompts.For(role);
-            var session = await NameReviewSessionAsync(run, pull, role, models[role], prompt, ct);
+            var session = await NameReviewSessionAsync(run, pull, role, prompt, ct);
             var review = await RouterCallAsync(() => Gate.Reviewer.ReviewAsync(
-                new ReviewRequest(run.Story, run.Repo.FullName, pull, diff, files, role, prompt, models[role], session), ct), ct);
+                new ReviewRequest(run.Story, run.Repo.FullName, pull, diff, files, role, prompt, session), ct), ct);
             if (review.Clean)
             {
                 var findings = new List<Finding>();
@@ -815,32 +807,36 @@ public sealed partial class RunPipeline
         Check the current state of the worktree and finish fixing the findings as originally instructed.
         """;
 
-    /// <summary>A second model checks one blocking finding; the finding comes back downgraded when it does not confirm it.</summary>
+    /// <summary>
+    /// A second opinion (its own high-class session; the router may serve it with the reviewer's model) checks one blocking
+    /// finding; the finding comes back downgraded when it does not confirm it.
+    /// </summary>
     private async Task<Finding> ConfirmAsync(Run run, PullFacts pull, string diff, RepoFiles files, RoleReview review, Finding finding, CancellationToken ct)
     {
-        var model = ReviewerChoice.ChooseConfirmer(Gate.Models.Confirm, [review.Model], review.ServedModel);
         var prompt = ReviewPrompts.Confirm;
-        var session = await NameReviewSessionAsync(run, pull, $"confirm-{review.Role}", model, prompt, ct);
+        var session = await NameReviewSessionAsync(run, pull, $"confirm-{review.Role}", prompt, ct);
         var confirmation = await RouterCallAsync(() => Gate.Reviewer.ConfirmAsync(
-            new ConfirmRequest(run.Story, run.Repo.FullName, pull, diff, files, review.Role, finding, prompt, model, session), ct), ct);
-        log.WriteLine($"[review] {review.Role} finding '{finding.Title}': {confirmation.Outcome} by {confirmation.ServedModel ?? model}");
+            new ConfirmRequest(run.Story, run.Repo.FullName, pull, diff, files, review.Role, finding, prompt, session), ct), ct);
+        log.WriteLine($"[review] {review.Role} finding '{finding.Title}': {confirmation.Outcome} by {confirmation.ServedName} ({confirmation.ServedClass ?? "no class named"})");
         return finding.ConfirmedBy(confirmation);
     }
 
     /// <summary>
     /// Names a fresh router session for one panel call in the ledger before the call (E9): Detail is
-    /// "&lt;session&gt; &lt;model&gt; &lt;head sha&gt; &lt;role&gt; &lt;prompt path&gt;@sha256:&lt;hash&gt;".
+    /// "&lt;session&gt; &lt;model class&gt; &lt;head sha&gt; &lt;role&gt; &lt;prompt path&gt;@sha256:&lt;hash&gt;" (the class the call names, always
+    /// <see cref="ReviewModels.Class"/>; which model and class served it is in the verdict). The session is a fresh id, never a worker's.
     /// </summary>
-    private async Task<string> NameReviewSessionAsync(Run run, PullFacts pull, string role, string model, ReviewPrompt prompt, CancellationToken ct)
+    private async Task<string> NameReviewSessionAsync(Run run, PullFacts pull, string role, ReviewPrompt prompt, CancellationToken ct)
     {
         await ThrowIfControlledAsync(run.Item, ct); // a Pause/Stop between the panel's calls takes effect before the next one
         var session = Guid.NewGuid().ToString();
-        await ledger.CheckpointAsync(run.Item, Steps.ReviewSession, null, $"{session} {model} {pull.HeadSha} {role} {prompt.Id}", ct);
+        await ledger.CheckpointAsync(run.Item, Steps.ReviewSession, null, $"{session} {ReviewModels.Class} {pull.HeadSha} {role} {prompt.Id}", ct);
         return session;
     }
 
     /// <summary>
-    /// Makes one panel call. The router refusing it for usage means the plans ran out, not the review: the factory pauses
+    /// Makes one panel call. The router refusing it for usage (<see cref="RouterReviewer.UsageLimited"/>: a 429, 529, or its
+    /// <c>model_class_unavailable</c> 503) means the plans ran out, not the review: the factory pauses
     /// (backing off) and the head is reviewed again afterwards. Without a control table nothing could hold the pause, so
     /// the failure escalates.
     /// </summary>

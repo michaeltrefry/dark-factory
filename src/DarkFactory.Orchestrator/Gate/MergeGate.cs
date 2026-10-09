@@ -227,8 +227,8 @@ public static class MergeGate
             reasons.Add($"{Ci.Short(head)} touches sealed path(s), which always escalate: {string.Join(", ", sealedPaths)}");
         }
 
-        // review-pass — a panel verdict on this exact head commit: every required role reviewed, every reviewer and second
-        // model a Claude model served as pinned (every reviewer a Claude Opus 5 or newer), no blocking finding left.
+        // review-pass — a panel verdict on this exact head commit: every required role reviewed, every review and second
+        // opinion served on the high model class (the router's X-Weave-Model-Class; missing fails), no blocking finding left.
         var verdict = verdicts.LastOrDefault(v => v.HeadSha == head);
         if (verdict is null)
         {
@@ -327,7 +327,7 @@ public static class MergeGate
         {
             $"paths: {string.Join(", ", tiers)}; checks: {string.Join(", ", GateChecks.All.Where(classified.Requires))}",
             "ci green",
-            $"review pass by {string.Join(", ", verdict.Reviews.Select(r => $"{r.Role}: {r.ServedModel ?? r.Model}{(r.CarriedFrom is { } carried ? $", carried from {Ci.Short(carried)}" : "")}"))}",
+            $"review pass by {string.Join(", ", verdict.Reviews.Select(r => $"{r.Role}: {r.ServedName}{(r.CarriedFrom is { } carried ? $", carried from {Ci.Short(carried)}" : "")}"))}",
         };
         if (riskRequired)
         {
@@ -344,10 +344,10 @@ public static class MergeGate
     private static GateDecision SeamMerge(string head, string check) => new(GateOutcome.Merge, head, [$"{check} disabled by the coverage test seam"]);
 
     /// <summary>
-    /// Whether <paramref name="verdict"/> was recorded under an earlier panel rule (e.g. a GPT or pre-5 Opus reviewer, before
-    /// sc-25379) and is replaced by one review from the current panel: its models break <see cref="ReviewModels.Problems"/>
+    /// Whether <paramref name="verdict"/> was recorded under an earlier panel rule (e.g. pinned reviewer models with no served
+    /// class, before sc-25626) and is replaced by one review from the current panel: its calls break <see cref="ReviewModels.Problems"/>
     /// and it is the only verdict on its head among <paramref name="verdicts"/>. The current panel's verdict on that head is a
-    /// second one, so it never qualifies: a head is re-reviewed for this at most once, and a fresh verdict whose models still
+    /// second one, so it never qualifies: a head is re-reviewed for this at most once, and a fresh verdict whose calls still
     /// break the rule escalates.
     /// </summary>
     public static bool Superseded(ReviewVerdict verdict, IReadOnlyList<ReviewVerdict> verdicts) =>

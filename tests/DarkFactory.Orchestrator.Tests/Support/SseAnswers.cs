@@ -49,15 +49,28 @@ public static class SseAnswers
         return sb.Append(BlockStop(0)).Append(MessageDelta(stop)).Append(MessageStop).ToString();
     }
 
-    public static HttpResponseMessage Response(string events, HttpStatusCode status = HttpStatusCode.OK) =>
-        new(status) { Content = new StringContent(events, Encoding.UTF8, "text/event-stream") };
+    /// <summary>
+    /// The router's streamed answer, naming the served model's class in <c>X-Weave-Model-Class</c> as every proxied answer does
+    /// (<paramref name="modelClass"/> null: no such header).
+    /// </summary>
+    public static HttpResponseMessage Response(string events, HttpStatusCode status = HttpStatusCode.OK, string? modelClass = "high") =>
+        WithClass(new(status) { Content = new StringContent(events, Encoding.UTF8, "text/event-stream") }, modelClass);
 
     /// <summary>A response whose body the test writes chunk by chunk, as a router streams it (completing the channel ends it).</summary>
-    public static HttpResponseMessage Streamed(ChannelReader<byte[]> chunks)
+    public static HttpResponseMessage Streamed(ChannelReader<byte[]> chunks, string? modelClass = "high")
     {
         var content = new StreamContent(new ChannelStream(chunks));
         content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("text/event-stream");
-        return new HttpResponseMessage(HttpStatusCode.OK) { Content = content };
+        return WithClass(new HttpResponseMessage(HttpStatusCode.OK) { Content = content }, modelClass);
+    }
+
+    private static HttpResponseMessage WithClass(HttpResponseMessage response, string? modelClass)
+    {
+        if (modelClass is not null)
+        {
+            response.Headers.Add("X-Weave-Model-Class", modelClass);
+        }
+        return response;
     }
 
     private sealed class ChannelStream(ChannelReader<byte[]> chunks) : Stream

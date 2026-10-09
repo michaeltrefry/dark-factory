@@ -186,13 +186,13 @@ public static class LedgerReport
         var blocking = findings.Where(f => f.Finding.IsBlocking).ToList();
         text.Append(CultureInfo.InvariantCulture, $"- {Outcome(row)} {Code(verdict.Verdict)} on {Code(Ci.Short(verdict.HeadSha))} by ");
         text.Append(string.Join(", ", verdict.Reviews.Select(r =>
-            $"{r.Role} ({Code(r.ServedModel ?? r.Model)}{(r.CarriedFrom is { } from ? $", carried from {Code(Ci.Short(from))}" : "")}"
+            $"{r.Role} ({Code(r.ServedName)}{(r.CarriedFrom is { } from ? $", carried from {Code(Ci.Short(from))}" : "")}"
             + $"{(r.Error is null ? "" : ", unusable answer")})")));
         text.Append(CultureInfo.InvariantCulture,
             $"; {blocking.Count} blocking, {findings.Count - blocking.Count} optional ({findings.Count(f => f.Finding.Downgraded)} downgraded by the second model)\n");
         foreach (var (role, finding) in blocking.Take(MaxBlockingFindingsShown))
         {
-            var how = finding.Confirmation is { Outcome: Confirmation.Confirmed } c ? $"confirmed by {Code(c.ServedModel ?? c.Model)}"
+            var how = finding.Confirmation is { Outcome: Confirmation.Confirmed } c ? $"confirmed by {Code(c.ServedName)}"
                 : finding.Confirmation is not null ? "the second model's answer was unusable"
                 : "not checked by a second model";
             text.Append(CultureInfo.InvariantCulture, $"  - blocking {role} finding, {how}: {Code(finding.ToString())}\n");

@@ -146,7 +146,7 @@ internal sealed class SandboxRepo(FactoryOptions options, RepoRef repo) : IDispo
 
 /// <summary>
 /// A stand-in for the review panel in the gate-negative acceptance tests (sc-25391): it never calls the router; it answers every role
-/// as the pinned model with no finding — or, <paramref name="blocking"/>, the correctness role with one blocking finding no fix
+/// on the high class with no finding — or, <paramref name="blocking"/>, the correctness role with one blocking finding no fix
 /// clears, which the second model confirms — so what decides each test is the gate's own rule, deterministically. Before its first
 /// review it runs <paramref name="beforeFirst"/> (e.g. a seeding push to the PR branch, which moves the head the gate judges).
 /// The real panel is AT2's (<see cref="ReviewGateTests"/>).
@@ -185,11 +185,11 @@ internal sealed class SeededReviewer(bool blocking = false, Func<ReviewRequest, 
             ? [new Finding(Finding.Blocking, FindingTitle, null, null,
                 "Seeded by the acceptance test so that every review round fails. Make one small, safe improvement and push it.")]
             : [];
-        return new RoleReview(request.Role, request.Model, request.Model, request.Session, request.Prompt.Id, findings, "seeded review (acceptance test)");
+        return new RoleReview(request.Role, "seeded", ReviewModels.Class, request.Session, request.Prompt.Id, findings, "seeded review (acceptance test)");
     }
 
     public Task<Confirmation> ConfirmAsync(ConfirmRequest request, CancellationToken ct) =>
-        Task.FromResult(new Confirmation(Confirmation.Confirmed, request.Model, request.Model, request.Session, request.Prompt.Id,
+        Task.FromResult(new Confirmation(Confirmation.Confirmed, "seeded", ReviewModels.Class, request.Session, request.Prompt.Id,
             "seeded confirmation (acceptance test)"));
 }
 

@@ -109,7 +109,7 @@ public class StepOutcomeTests
             Assert.Equal(
                 ["- **failed** `fail` on `111111111111`", "- **passed** `pass` on `aaaaaaaaaaaa`"],
                 Section(report, "Review verdicts (2: 1 passed, 1 failed):").Where(l => l.StartsWith("- ", StringComparison.Ordinal)).Select(l => l[..l.IndexOf(" by ", StringComparison.Ordinal)]));
-            Assert.Contains("  - blocking correctness finding, confirmed by `claude-sonnet-5`: `whitespace-only input (src/x.cs:1)`", report);
+            Assert.Contains("  - blocking correctness finding, confirmed by `gpt-6-astra`: `whitespace-only input (src/x.cs:1)`", report);
             Assert.Contains("Fix rounds: 1 of 3", report);
             Assert.Contains("- round 1 (review findings): **passed**, `fix round 1 pushed aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`; progress check **passed**", report);
             Assert.Contains("Worker cost: N/A", report);
@@ -193,7 +193,7 @@ public class StepOutcomeTests
 
     /// <summary>A blocking finding with a 400-character title (the most a report quotes of one).</summary>
     private static Finding LongFinding(int n) => new(Finding.Blocking, $"finding {n:000} " + new string('x', 400), "src/x.cs", n, "detail",
-        new Confirmation(Confirmation.Confirmed, "m", "m", null, null, "r"));
+        new Confirmation(Confirmation.Confirmed, "m", "high", null, null, "r"));
 
     [Fact]
     public void Reports_over_a_long_history_stay_under_the_github_limit_and_keep_the_checks_summary_and_the_latest_verdict()
@@ -219,7 +219,7 @@ public class StepOutcomeTests
         {
             var findings = Enumerable.Range(1, 200).Select(LongFinding).ToList();
             Add(WorkState.Review, RunPipeline.Steps.Verdict, new ReviewVerdict(Sha(v), ReviewVerdict.Fail, "s", [],
-                [new RoleReview(ReviewRoles.Correctness, "m", "m", null, null, findings, "s")]).ToDetail());
+                [new RoleReview(ReviewRoles.Correctness, "m", "high", null, null, findings, "s")]).ToDetail());
             var names = Enumerable.Range(1, 40).Select(i => $"check {i} " + new string('y', 400)).ToList();
             Add(WorkState.CI, RunPipeline.Steps.CiFailure, JsonSerializer.Serialize(new CiTriage(Sha(v), "base0", names, names)));
         }

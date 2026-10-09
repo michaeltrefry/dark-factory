@@ -44,8 +44,8 @@ public class FixLoopTests
         Assert.Equal([$"merge 1 {ShaA}"], h.Merges);
         // The merge record names the carried review and the commit it was made on.
         var gate = (await h.Rows()).Single(r => r.Step == RunPipeline.Steps.GateDecision).Detail!;
-        Assert.Contains($"{ReviewRoles.SpecConformance}: claude-opus-5-5, carried from {Sha1[..12]}", gate);
-        Assert.DoesNotContain($"{ReviewRoles.Correctness}: claude-opus-5-5, carried", gate);
+        Assert.Contains($"{ReviewRoles.SpecConformance}: {PanelModel}, carried from {Sha1[..12]}", gate);
+        Assert.DoesNotContain($"{ReviewRoles.Correctness}: {PanelModel}, carried", gate);
 
         // The fixer: a second worker session, in a worktree restored from the PR branch, given the story and the confirmed
         // finding (fenced: its text cannot close the block) and nothing else from the review; its work pushed to the same branch.
@@ -150,7 +150,7 @@ public class FixLoopTests
         Assert.Empty(h.Merges);
         var comment = h.Stories.Comments.Single();
         Assert.Contains("after 3 fix rounds", comment);
-        Assert.Contains("[correctness] the tests do not cover the empty string (src/x.cs:1), confirmed by claude-sonnet-5 — WordCount(\"\") is untested", comment);
+        Assert.Contains($"[correctness] the tests do not cover the empty string (src/x.cs:1), confirmed by {PanelModel} — WordCount(\"\") is untested", comment);
     }
 
     [Fact]
@@ -166,7 +166,7 @@ public class FixLoopTests
     }
 
     [Fact]
-    public async Task A_fixer_of_another_model_family_does_not_make_a_clean_role_review_again()
+    public async Task A_fixer_of_another_model_does_not_make_a_clean_role_review_again()
     {
         var h = new Harness
         {
@@ -177,23 +177,24 @@ public class FixLoopTests
         var outcome = await h.Run();
 
         Assert.True(outcome.Succeeded, outcome.Error);
-        // Which models wrote the code does not matter: spec conformance, clean on Sha1, is carried; every call is the Opus.
+        // Which models wrote the code does not matter: spec conformance, clean on Sha1, is carried.
         Assert.Equal([(ReviewRoles.Correctness, Sha1), (ReviewRoles.SpecConformance, Sha1), (ReviewRoles.Correctness, ShaA)],
             h.Reviewer.Requests.Select(r => (r.Role, r.Pull.HeadSha)));
-        Assert.All(h.Reviewer.Requests, r => Assert.Equal("claude-opus-5-5", r.Model));
         Assert.Equal(Sha1, (await h.Verdicts()).Last().Reviews.Single(r => r.Role == ReviewRoles.SpecConformance).CarriedFrom);
         Assert.Equal([$"merge 1 {ShaA}"], h.Merges);
     }
 
     [Fact]
-    public void A_clean_review_whose_models_break_the_panels_rule_is_not_carried()
+    public void A_clean_review_not_served_on_the_high_class_is_not_carried()
     {
-        RoleReview Clean(string role, string model, string? served) => new(role, model, served, "s", "p", [], "ok");
-        var previous = ReviewPanel.Decide(Sha1, [], [Clean(ReviewRoles.Correctness, "claude-opus-5-5", "claude-opus-5-5"),
-            Clean(ReviewRoles.SpecConformance, "claude-opus-4-7", "claude-opus-4-7")]);
+        RoleReview Clean(string role, string? servedClass) => new(role, "claude-opus-5-5", servedClass, "s", "p", [], "ok");
+        var previous = ReviewPanel.Decide(Sha1, [], [Clean(ReviewRoles.Correctness, "high"), Clean(ReviewRoles.SpecConformance, "mid")]);
         Assert.Equal([ReviewRoles.Correctness], FixLoop.Carried(previous, ReviewRoles.Required(false)).Select(r => r.Role));
-        var unnamed = previous with { Reviews = [previous.Reviews[0] with { ServedModel = null }, previous.Reviews[1]] };
-        Assert.Empty(FixLoop.Carried(unnamed, ReviewRoles.Required(false)));
+        // A review whose answer named no class (missing header, or a verdict from before sc-25626) is never carried.
+        var unclassed = previous with { Reviews = [previous.Reviews[0] with { ServedClass = null }, previous.Reviews[1]] };
+        Assert.Empty(FixLoop.Carried(unclassed, ReviewRoles.Required(false)));
+        // The served model does not matter.
+        Assert.Single(FixLoop.Carried(previous with { Reviews = [previous.Reviews[0] with { ServedModel = null }] }, ReviewRoles.Required(false)));
     }
 
     [Fact]
@@ -334,10 +335,10 @@ public class FixLoopTests
     private static ReviewVerdict Verdict(string sha, params RoleReview[] reviews) => ReviewPanel.Decide(sha, [], reviews);
 
     private static RoleReview Review(string role, params Finding[] findings) =>
-        new(role, "claude-opus-5-5", "claude-opus-5-5", "s", "p", findings, "ok");
+        new(role, "claude-opus-5-5", "high", "s", "p", findings, "ok");
 
     private static Finding Confirmed(string title) =>
-        Blocking(title).ConfirmedBy(new Confirmation(Confirmation.Confirmed, "claude-opus-5", "claude-opus-5", "s", "p", "yes"));
+        Blocking(title).ConfirmedBy(new Confirmation(Confirmation.Confirmed, "claude-opus-5", "high", "s", "p", "yes"));
 
     [Fact]
     public void Only_a_verdict_failed_by_confirmed_blocking_findings_alone_is_fixable()
@@ -348,6 +349,22 @@ public class FixLoopTests
         Assert.Null(FixLoop.Fixable(Verdict(Sha1, Review(ReviewRoles.Correctness, Confirmed("a")),
             Review(ReviewRoles.SpecConformance) with { Error = "unusable" })));
         Assert.Null(FixLoop.Fixable(Verdict(Sha1, Review(ReviewRoles.Correctness, Blocking("unchecked")), Review(ReviewRoles.SpecConformance))));
+        // A confirmation (or a review) not served on the high class is not fixable: fail closed, it escalates.
+        var fixable = Verdict(Sha1, Review(ReviewRoles.Correctness, Confirmed("a")), Review(ReviewRoles.SpecConformance));
+        var unclassedConfirm = fixable with
+        {
+            Reviews = [fixable.Reviews[0] with { Findings = [fixable.Reviews[0].Findings[0] with { Confirmation = fixable.Reviews[0].Findings[0].Confirmation! with { ServedClass = null } }] },
+                fixable.Reviews[1]],
+        };
+        Assert.Null(FixLoop.Fixable(unclassedConfirm));
+        Assert.Null(FixLoop.Fixable(fixable with { Reviews = [fixable.Reviews[0], fixable.Reviews[1] with { ServedClass = "mid" }] }));
+        // The model that served the review may confirm its own finding: still fixable.
+        var self = fixable with
+        {
+            Reviews = [fixable.Reviews[0] with { Findings = [fixable.Reviews[0].Findings[0] with { Confirmation = fixable.Reviews[0].Findings[0].Confirmation! with { ServedModel = "claude-opus-5-5" } }] },
+                fixable.Reviews[1]],
+        };
+        Assert.Single(FixLoop.Fixable(self)!);
     }
 
     [Fact]

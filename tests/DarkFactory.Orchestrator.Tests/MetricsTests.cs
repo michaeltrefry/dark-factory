@@ -41,9 +41,9 @@ public class MetricsTests
 
     private static string Verdict(params (string Outcome, bool Downgraded)[] confirmations) => new ReviewVerdict("sha", ReviewVerdict.Fail, "s", [],
     [
-        new RoleReview(ReviewRoles.Correctness, "m", "m", null, null,
+        new RoleReview(ReviewRoles.Correctness, "m", "high", null, null,
             confirmations.Select(c => new Finding(c.Downgraded ? Finding.Optional : Finding.Blocking, "t", null, null, "d",
-                new Confirmation(c.Outcome, "c", "c", null, null, "r"), c.Downgraded)).ToList(), "s"),
+                new Confirmation(c.Outcome, "c", "high", null, null, "r"), c.Downgraded)).ToList(), "s"),
     ]).ToDetail();
 
     private static readonly object[] MergedAfterOneFixRound =

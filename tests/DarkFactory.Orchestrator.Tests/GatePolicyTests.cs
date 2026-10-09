@@ -313,7 +313,7 @@ public class MergeGateTierTests
     private static readonly PullFacts Pull = new(1, "https://github.com/o/r/pull/1", true, false, false, Head, "main", "base", null);
     private static readonly CiFacts Green = new(Head, [new CheckFact("build", true, "success")]);
     private static readonly CiFacts Red = new(Head, [new CheckFact("build", true, "failure")]);
-    private static RoleReview Review(string role) => new(role, "claude-opus-5-5", "claude-opus-5-5", "s", "p", [], "ok");
+    private static RoleReview Review(string role) => new(role, "claude-opus-5-5", "high", "s", "p", [], "ok");
 
     /// <summary>A passing verdict on the head with every role (security included); no risky paths claimed.</summary>
     private static readonly ReviewVerdict Full = ReviewPanel.Decide(Head, [], ReviewRoles.All.Select(Review).ToList());

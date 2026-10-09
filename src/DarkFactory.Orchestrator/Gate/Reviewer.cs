@@ -2,6 +2,7 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using DarkFactory.Orchestrator.Router;
 using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
 
@@ -12,44 +13,47 @@ public sealed record RepoFiles(IReadOnlyList<string> Paths, bool Truncated);
 
 /// <summary>
 /// One panel role's review of the diff of exactly one head commit against its base, with the story and the base's file list
-/// (so a reviewer can tell a new file from a duplicate of an existing one). <see cref="Session"/> is the router session the
-/// call is accounted under; the pipeline names it in the ledger (<c>review-session</c>, with the prompt's hash) before the
+/// (so a reviewer can tell a new file from a duplicate of an existing one), on the high model class. <see cref="Session"/> is
+/// the call's own fresh router session (never a worker's), the one it is accounted under; the pipeline names it in the ledger (<c>review-session</c>, with the prompt's hash) before the
 /// call, so a call that never returns still has a readable cost (E9).
 /// </summary>
 public sealed record ReviewRequest(WorkStory Story, string Repo, PullFacts Pull, string Diff, RepoFiles Files, string Role, ReviewPrompt Prompt,
-    string Model, string Session);
+    string Session);
 
-/// <summary>A second model's check of one blocking <see cref="Finding"/> a <see cref="Role"/> reviewer reported.</summary>
+/// <summary>A second opinion's check of one blocking <see cref="Finding"/> a <see cref="Role"/> reviewer reported.</summary>
 public sealed record ConfirmRequest(WorkStory Story, string Repo, PullFacts Pull, string Diff, RepoFiles Files, string Role, Finding Finding,
-    ReviewPrompt Prompt, string Model, string Session);
+    ReviewPrompt Prompt, string Session);
 
 /// <summary>
-/// The router refused a review call for usage (429/529, or its exhaustion or rate-limit body): the plans ran out, not the
-/// review. The pipeline pauses the factory for usage instead of escalating the item.
+/// The router refused a review call for usage (429/529, its exhaustion or rate-limit body, or 503
+/// <see cref="ModelClass.Unavailable"/>: no model of the high class can serve): the plans ran out, not the review. The pipeline pauses the factory for usage instead of escalating the item.
 /// </summary>
 public sealed class RouterUsageLimitedException(string message) : Exception(message);
 
 public interface IReviewer
 {
     /// <summary>
-    /// One role's review with <see cref="ReviewRequest.Model"/> pinned, accounted under <see cref="ReviewRequest.Session"/>.
-    /// An answer that is not a clean findings line from the pinned model is a <see cref="RoleReview"/> with an
+    /// One role's review on the high model class, accounted under <see cref="ReviewRequest.Session"/>.
+    /// An answer that is not a clean findings line served on the high class is a <see cref="RoleReview"/> with an
     /// <see cref="RoleReview.Error"/>; a call that cannot be made throws (<see cref="RouterUsageLimitedException"/> when the
     /// router refused it for usage).
     /// </summary>
     Task<RoleReview> ReviewAsync(ReviewRequest request, CancellationToken ct);
 
     /// <summary>
-    /// Asks a second model whether a blocking finding reproduces from the code. An answer that is not a clean confirmation
-    /// line from the pinned model is <see cref="Confirmation.Unusable"/>; a call that cannot be made throws.
+    /// Asks for a second opinion (on the high class) on whether a blocking finding reproduces from the code. An answer that is
+    /// not a clean confirmation line served on the high class is <see cref="Confirmation.Unusable"/>; a call that cannot be made throws.
     /// </summary>
     Task<Confirmation> ConfirmAsync(ConfirmRequest request, CancellationToken ct);
 }
 
 /// <summary>
-/// The panel's calls through the Weave router (never a provider directly), each pinned with <c>x-weave-force-model</c> (the
-/// router's headless <c>/force-model</c>) to a Claude model (<see cref="ReviewModels"/>). The router key is the only
-/// credential sent, as the worker sends it. The system prompt is the role's prompt file, verbatim (<see cref="ReviewPrompts"/>).
+/// The panel's calls through the Weave router (never a provider directly), each naming the high model class with
+/// <see cref="ModelClass.Header"/> and never a model id (no <c>x-weave-force-model</c>, which the router refuses alongside a
+/// class): the router picks the model inside the class (<see cref="ReviewModels"/>), and the body's required <c>model</c> is
+/// the fixed placeholder <see cref="ModelClass.RequestModel"/>. Each call is its own fresh router session that carries only the
+/// role's prompt, the story and the PR (<see cref="BuildPrompt"/>). The router key is the only credential sent, as the worker
+/// sends it. The system prompt is the role's prompt file, verbatim (<see cref="ReviewPrompts"/>).
 /// Reviewers read a diff and answer; they have no tools and change nothing. Every call streams (<see cref="MessageStream"/>):
 /// <c>Review:TimeoutMinutes</c> (the client's timeout) bounds the whole call, and a stream silent for the idle gap fails.
 /// </summary>
@@ -60,11 +64,9 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
 
     private readonly TimeSpan _idleTimeout = idleTimeout ?? DefaultIdleTimeout;
 
-    public const string ForceModelHeader = "x-weave-force-model";
-
     /// <summary>
-    /// The header Claude Code names its session with; the router accounts (and scopes the force-model pin to) each review
-    /// call under its own fresh id, so the pin never reaches a worker's session and the call's cost is readable (E9).
+    /// The header Claude Code names its session with; the router accounts each review call under its own fresh id, so no call
+    /// shares a worker's session (or its history) and the call's cost is readable (E9).
     /// </summary>
     public const string SessionHeader = "X-Claude-Code-Session-Id";
 
@@ -82,35 +84,35 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     {
         if (request.Diff.Length > MaxDiffChars)
         {
-            return new RoleReview(request.Role, request.Model, null, request.Session, request.Prompt.Id, [], "",
+            return new RoleReview(request.Role, null, null, request.Session, request.Prompt.Id, [], "",
                 $"The diff is {request.Diff.Length} characters, more than the {MaxDiffChars} one review reads; not reviewed.");
         }
-        var (served, stop, text) = await CallAsync(request.Model, request.Session, request.Prompt.Text, BuildPrompt(request), ct);
-        return InterpretReview(request.Role, request.Model, served, stop, text) with { Session = request.Session, Prompt = request.Prompt.Id };
+        var (served, servedClass, stop, text) = await CallAsync(request.Session, request.Prompt.Text, BuildPrompt(request), ct);
+        return InterpretReview(request.Role, served, servedClass, stop, text) with { Session = request.Session, Prompt = request.Prompt.Id };
     }
 
     public async Task<Confirmation> ConfirmAsync(ConfirmRequest request, CancellationToken ct)
     {
         if (request.Diff.Length > MaxDiffChars)
         {
-            return new Confirmation(Confirmation.Unusable, request.Model, null, request.Session, request.Prompt.Id,
+            return new Confirmation(Confirmation.Unusable, null, null, request.Session, request.Prompt.Id,
                 $"The diff is {request.Diff.Length} characters, more than the {MaxDiffChars} one call reads.");
         }
-        var (served, stop, text) = await CallAsync(request.Model, request.Session, request.Prompt.Text, BuildConfirmPrompt(request), ct);
-        return InterpretConfirmation(request.Model, served, stop, text) with { Session = request.Session, Prompt = request.Prompt.Id };
+        var (served, servedClass, stop, text) = await CallAsync(request.Session, request.Prompt.Text, BuildConfirmPrompt(request), ct);
+        return InterpretConfirmation(served, servedClass, stop, text) with { Session = request.Session, Prompt = request.Prompt.Id };
     }
 
-    private async Task<(string? Served, string? Stop, string Text)> CallAsync(string model, string session, string system, string user, CancellationToken ct)
+    private async Task<(string? Served, string? ServedClass, string? Stop, string Text)> CallAsync(string session, string system, string user, CancellationToken ct)
     {
         using var message = new HttpRequestMessage(HttpMethod.Post, "v1/messages");
         message.Headers.Add(SessionHeader, session);
         message.Headers.Add(ClaudeWorker.RouterKeyHeader, routerKey);
         message.Headers.Authorization = new AuthenticationHeaderValue("Bearer", routerKey);
         message.Headers.Add("anthropic-version", "2023-06-01");
-        message.Headers.Add(ForceModelHeader, model);
+        message.Headers.Add(ModelClass.Header, ReviewModels.Class);
         message.Content = JsonContent.Create(new
         {
-            model,
+            model = ModelClass.RequestModel,
             max_tokens = MaxTokens,
             system,
             messages = new[] { new { role = "user", content = user } },
@@ -151,7 +153,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
             }
             await using var stream = await response.Content.ReadAsStreamAsync(deadline.Token);
             var answer = await MessageStream.ReadAsync(stream, _idleTimeout, deadline.Token);
-            return (answer.Served, answer.StopReason, answer.Text);
+            return (answer.Served, ModelClass.Served(response), answer.StopReason, answer.Text);
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
@@ -181,32 +183,35 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     }
 
     /// <summary>
-    /// Whether a failed router answer is a usage refusal: 429 (the router's "every subscription unavailable" answer, or an
-    /// upstream rate limit), 529 (overloaded), or a body carrying one of the worker's usage markers
-    /// (<see cref="WorkerResult.UsageLimitMarkers"/>: the router's exhaustion text, <c>rate_limit_error</c>, ...).
+    /// Whether a failed router answer is a usage refusal: 429 (the router's "every subscription unavailable" answer, a class
+    /// whose models a spent subscription refuses, or an upstream rate limit), 529 (overloaded), the router's
+    /// <see cref="ModelClass.Unavailable"/> (no model of the high class can serve: never another class, so the factory waits),
+    /// or a body carrying one of the worker's usage markers (<see cref="WorkerResult.UsageLimitMarkers"/>: the router's
+    /// exhaustion text, <c>rate_limit_error</c>, ...).
     /// </summary>
     public static bool UsageLimited(int status, string body) =>
-        status is 429 or 529 || WorkerResult.UsageLimitMarkers.Any(m => body.Contains(m, StringComparison.OrdinalIgnoreCase));
+        status is 429 or 529 || ModelClass.IsUnavailable(body)
+        || WorkerResult.UsageLimitMarkers.Any(m => body.Contains(m, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
-    /// Why an answer cannot count at all (<see cref="ReviewModels.CallProblem"/>: the pinned model breaks the panel's rule, or
-    /// the router did not say it served the pinned model; or the answer ended early), or null when it can.
+    /// Why an answer cannot count at all (<see cref="ReviewModels.CallProblem"/>: the router did not say the high class served
+    /// it; or the answer ended early), or null when it can.
     /// </summary>
-    private static string? ServedProblem(string model, string? served, string? stopReason, bool reviewer) =>
-        ReviewModels.CallProblem(model, served, reviewer) is { } problem ? $"The answer cannot count: {problem}."
+    private static string? ServedProblem(string? servedClass, string? stopReason) =>
+        ReviewModels.CallProblem(servedClass) is { } problem ? $"The answer cannot count: {problem}."
         : stopReason is not null and not "end_turn" and not "stop_sequence" ? $"The answer ended early ({stopReason})." : null;
 
     /// <summary>
-    /// Turns a role reviewer's answer into its review. Usable only when the router said the pinned model answered,
+    /// Turns a role reviewer's answer into its review. Usable only when the router said the high class served it,
     /// the answer ended normally and its last line is the findings JSON; anything else is a review with an
     /// <see cref="RoleReview.Error"/> (which fails the panel). A finding whose severity is neither blocking nor optional
     /// counts as blocking.
     /// </summary>
-    public static RoleReview InterpretReview(string role, string model, string? served, string? stopReason, string answer)
+    public static RoleReview InterpretReview(string role, string? served, string? servedClass, string? stopReason, string answer)
     {
-        RoleReview Unusable(string why) => new(role, model, served, null, null, [], "", why);
+        RoleReview Unusable(string why) => new(role, served, servedClass, null, null, [], "", why);
 
-        if (ServedProblem(model, served, stopReason, reviewer: true) is { } problem)
+        if (ServedProblem(servedClass, stopReason) is { } problem)
         {
             return Unusable(problem);
         }
@@ -226,25 +231,25 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
             findings.Add(new Finding(severity, Cut(Text(f, "title") ?? "(untitled finding)", MaxTitle), Text(f, "file"), line,
                 Cut(Text(f, "detail") ?? "", MaxDetail)));
         }
-        return new RoleReview(role, model, served, null, null, findings, Cut(Text(json, "summary") ?? "", MaxDetail));
+        return new RoleReview(role, served, servedClass, null, null, findings, Cut(Text(json, "summary") ?? "", MaxDetail));
     }
 
     /// <summary>
-    /// Turns a second model's answer into its confirmation: <see cref="Confirmation.Confirmed"/> or
-    /// <see cref="Confirmation.NotConfirmed"/> only from a clean confirmation line of the pinned model; anything else is
+    /// Turns a second opinion's answer into its confirmation: <see cref="Confirmation.Confirmed"/> or
+    /// <see cref="Confirmation.NotConfirmed"/> only from a clean confirmation line served on the high class; anything else is
     /// <see cref="Confirmation.Unusable"/>.
     /// </summary>
-    public static Confirmation InterpretConfirmation(string model, string? served, string? stopReason, string answer)
+    public static Confirmation InterpretConfirmation(string? served, string? servedClass, string? stopReason, string answer)
     {
-        if (ServedProblem(model, served, stopReason, reviewer: false) is { } problem)
+        if (ServedProblem(servedClass, stopReason) is { } problem)
         {
-            return new Confirmation(Confirmation.Unusable, model, served, null, null, problem);
+            return new Confirmation(Confirmation.Unusable, served, servedClass, null, null, problem);
         }
         if (LastJsonLine(answer, "confirmed") is not { } json || json.GetProperty("confirmed").ValueKind is not (JsonValueKind.True or JsonValueKind.False))
         {
-            return new Confirmation(Confirmation.Unusable, model, served, null, null, "The second model's answer does not end with a confirmation line.");
+            return new Confirmation(Confirmation.Unusable, served, servedClass, null, null, "The second opinion's answer does not end with a confirmation line.");
         }
-        return new Confirmation(json.GetProperty("confirmed").GetBoolean() ? Confirmation.Confirmed : Confirmation.NotConfirmed, model, served,
+        return new Confirmation(json.GetProperty("confirmed").GetBoolean() ? Confirmation.Confirmed : Confirmation.NotConfirmed, served, servedClass,
             null, null, Cut(Text(json, "reason") ?? "", MaxDetail));
     }
 
