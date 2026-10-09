@@ -33,7 +33,7 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     public const string SetupHint = $"run `{ReinstallCommand}` once (see README, Worker sandbox)";
 
     /// <summary>The <c>helper_version</c> of <c>scripts/factory-worker-launch</c>: an installed helper below it is stale.</summary>
-    public const int HelperVersion = 2;
+    public const int HelperVersion = 3;
 
     /// <summary>
     /// The oldest Claude Code the worker user may run: 2.1.291, the release the confined triage session was built and checked
@@ -61,17 +61,31 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     public IReadOnlyList<string> BuildLaunchArguments(string program, IEnumerable<string> args) =>
         ["-n", "-u", User, HelperPath, program, .. args];
 
-    /// <summary>The helper's stdin block: allowlisted <c>KEY=VALUE</c> lines and a terminating empty line.</summary>
+    /// <summary>The one variable whose value may span lines: one header per line (the router key, the model class).</summary>
+    public const string MultiLineVariable = "ANTHROPIC_CUSTOM_HEADERS";
+
+    /// <summary>
+    /// The helper's stdin block: allowlisted <c>KEY=VALUE</c> lines and a terminating empty line. A
+    /// <see cref="MultiLineVariable"/> value of several lines goes as one <c>KEY=line</c> line each, which the helper joins back
+    /// with line breaks; none of its lines may be empty (that would end the block). Any other line break is refused.
+    /// </summary>
     public static string BuildVariableBlock(IReadOnlyDictionary<string, string> variables)
     {
+        var block = new StringBuilder();
         foreach (var (key, value) in variables)
         {
-            if (key.Contains('=') || $"{key}{value}".IndexOfAny(['\n', '\r']) >= 0)
+            var lines = key == MultiLineVariable ? value.Split('\n') : [value];
+            if (key.Contains('=') || key.IndexOfAny(['\n', '\r']) >= 0 || lines.Any(l => l.IndexOfAny(['\n', '\r']) >= 0)
+                || (lines.Length > 1 && lines.Any(l => l.Length == 0)))
             {
-                throw new ArgumentException($"Worker variable '{key}' contains '=' in its name or a line break.");
+                throw new ArgumentException($"Worker variable '{key}' contains '=' in its name, a line break or an empty header line.");
+            }
+            foreach (var line in lines)
+            {
+                block.Append(key).Append('=').Append(line).Append('\n');
             }
         }
-        return string.Concat(variables.Select(kv => $"{kv.Key}={kv.Value}\n")) + "\n";
+        return block.Append('\n').ToString();
     }
 
     /// <summary>Starts <paramref name="program"/> as the worker user. The caller must keep stdin open for the life of the run.</summary>
@@ -230,7 +244,8 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
                 $"Stale helper: the installed launch helper {HelperPath} is not the current scripts/factory-worker-launch ({stale}); "
                 + $"re-run `{ReinstallCommand}` to install it (that kills every {User} process: stop `factory work` first).");
         }
-        var probeVariables = ClaudeWorker.BuildRouterVariables(new Uri("http://127.0.0.1/"), "probe", auth);
+        // Shaped like a real launch: the headers of a classed session span two lines (E8).
+        var probeVariables = ClaudeWorker.BuildRouterVariables(new Uri("http://127.0.0.1/"), "probe", auth, WorkerModelClass.Mid);
         (int ExitCode, string Stdout, string Stderr) probe;
         try
         {

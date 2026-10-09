@@ -126,7 +126,7 @@ public class SandboxReadinessTests
     /// </summary>
     [Theory]
     [InlineData("no-version", "no helper_version line")] // installed before this check existed
-    [InlineData("old-version", "helper_version 1 is older than 2")]
+    [InlineData("old-version", "helper_version 1 is older than 3")]
     [InlineData("edited", "its text differs from the repo")]
     [InlineData("other-user", "sandbox_user is not")]
     [InlineData("unpinned", "no pinned sandbox_uid")]

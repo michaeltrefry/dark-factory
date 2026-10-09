@@ -350,14 +350,17 @@ public class MergeQueueTests
     {
         private int _n;
         public List<string> Prompts { get; } = [];
+        /// <summary>The model class each session named, in order (E8).</summary>
+        public List<string> ModelClasses { get; } = [];
 
-        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, WorkerCallbacks? callbacks,
+        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass, WorkerCallbacks? callbacks,
             CancellationToken ct)
         {
             var session = $"sess-{Interlocked.Increment(ref _n)}";
             lock (Prompts)
             {
                 Prompts.Add(prompt);
+                ModelClasses.Add(modelClass);
             }
             await callbacks!.OnStarted!(WorkerPid, CancellationToken.None);
             await callbacks.OnSession!(session, CancellationToken.None);
@@ -415,7 +418,7 @@ public class MergeQueueTests
         public SimWorker Worker { get; } = new();
         public IRunLocks Locks { get; set; } = locks ?? new InProcessRunLocks();
         /// <summary>The board behind <see cref="Stories"/> (every story id is the same story; its epic can be changed between runs).</summary>
-        public FakeWorkSource Board { get; } =
+        public FakeWorkSource Board { get; init; } =
             new(new WorkStory(0, "Queue me", "Change one file.", "feature", "https://app.shortcut.com/trefry/story/0"));
         public IWorkSource Stories => LazyInitializer.EnsureInitialized(ref _stories, () => new LockedSource(Board));
         private IWorkSource? _stories;
@@ -579,7 +582,11 @@ public class MergeQueueTests
     [Fact]
     public async Task A_branch_that_conflicts_with_main_goes_to_the_fix_loop_instead_of_merging()
     {
-        var h = new Harness();
+        // A simple story: its conflict fix round runs on its coding class (low), not the CI fixer's (mid) (E8).
+        var h = new Harness
+        {
+            Board = new(new WorkStory(0, "Queue me", "Change one file.", "feature", "https://app.shortcut.com/trefry/story/0", Labels: ["simple"])),
+        };
         Assert.Equal(WorkState.Watch, (await h.Run(A)).State);
         h.Repo.Conflicting.Add(Branch(B));
         h.Repo.OnOpen = branch =>
@@ -606,6 +613,8 @@ public class MergeQueueTests
         // The fixer got the conflicted file in a worktree where the orchestrator had merged main; its resolution was reviewed in full.
         Assert.Contains("src/shared.cs", h.Worker.Prompts[^1]);
         Assert.Contains("conflict markers", h.Worker.Prompts[^1]);
+        Assert.All(h.Worker.ModelClasses, c => Assert.Equal(WorkerModelClass.Low, c));
+        Assert.Equal(h.Worker.Prompts.Count, h.Worker.ModelClasses.Count);
         Assert.NotNull((await h.Steps(B, RunPipeline.Steps.BaseMerged)).Single());
         var resolved = h.Repo.Merges[^1].Head;
         Assert.Equal([ReviewRoles.Correctness, ReviewRoles.SpecConformance], h.Reviewer.Snapshot().Where(r => r.Pull.HeadSha == resolved).Select(r => r.Role));

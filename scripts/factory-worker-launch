@@ -6,7 +6,9 @@
 #   sudo -n -u _factory factory-worker-launch <program> [args...]
 #
 # Protocol (stdin):
-#   KEY=VALUE lines for the router variables, then one empty line. The orchestrator
+#   KEY=VALUE lines for the router variables, then one empty line. ANTHROPIC_CUSTOM_HEADERS
+#   may come on several lines (one header each: the router key, the model class); they are
+#   joined with line breaks into one variable, as Claude Code reads it. The orchestrator
 #   keeps stdin open for the life of the run; when stdin closes (Stop, timeout, or the
 #   orchestrator died) the worker is killed.
 #
@@ -38,7 +40,7 @@ sandbox_uid=
 # The orchestrator refuses to start unless the installed helper is this file (EnsureReadyAsync):
 # re-run setup-worker-user.sh after any change here.
 # shellcheck disable=SC2034 # read by the orchestrator, not by this script
-helper_version=2
+helper_version=3
 
 usage() {
     echo "usage: factory-worker-launch <program> [args...] (router variables on stdin)" >&2
@@ -55,6 +57,10 @@ case "$1" in
 esac
 
 vars=()
+headers=
+have_headers=0
+newline='
+'
 terminated=0
 while IFS= read -r line; do
     if [ -z "$line" ]; then
@@ -62,7 +68,15 @@ while IFS= read -r line; do
         break
     fi
     case "$line" in
-        ANTHROPIC_BASE_URL=* | ANTHROPIC_CUSTOM_HEADERS=* | ANTHROPIC_AUTH_TOKEN=*) vars+=("$line") ;;
+        ANTHROPIC_CUSTOM_HEADERS=*)
+            if [ "$have_headers" -eq 1 ]; then
+                headers="$headers$newline${line#ANTHROPIC_CUSTOM_HEADERS=}"
+            else
+                headers=${line#ANTHROPIC_CUSTOM_HEADERS=}
+                have_headers=1
+            fi
+            ;;
+        ANTHROPIC_BASE_URL=* | ANTHROPIC_AUTH_TOKEN=*) vars+=("$line") ;;
         *)
             echo "factory-worker-launch: refusing non-allowlisted variable '${line%%=*}'" >&2
             exit 64
@@ -73,6 +87,7 @@ if [ "$terminated" -ne 1 ]; then
     echo "factory-worker-launch: stdin closed before the variable block ended" >&2
     exit 64
 fi
+[ "$have_headers" -eq 0 ] || vars+=("ANTHROPIC_CUSTOM_HEADERS=$headers")
 
 # With HOME unset, ~ is the running user's home from the password database.
 unset HOME

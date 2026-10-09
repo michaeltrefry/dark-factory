@@ -703,7 +703,7 @@ public sealed class SessionCaptureTests : IAsyncLifetime
 
     private sealed class CallbackWorker(Func<WorkerCallbacks, CancellationToken, Task<WorkerResult>> run) : IWorker
     {
-        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
+        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
             WorkerCallbacks? callbacks, CancellationToken ct)
         {
             await callbacks!.OnStarted!(1, ct);
@@ -720,7 +720,7 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TimeSpan[] EmittedAt { get; } = new TimeSpan[StreamJsonFixture.Fresh.Length];
 
-        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
+        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
             WorkerCallbacks? callbacks, CancellationToken ct)
         {
             await callbacks!.OnStarted!(1, ct);

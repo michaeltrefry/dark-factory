@@ -4,6 +4,7 @@ using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Shortcut;
+using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
 
@@ -305,12 +306,18 @@ public sealed class IssueIntake(
         try
         {
             var result = await triage.RunAsync(item, repo, TriagePrompt.Build(repo, issue, watched),
-                (session, c) => ledger.CheckpointAsync(item, IssueSteps.TriageSession, session, version, c),
+                async (session, c) =>
+                {
+                    await ledger.CheckpointAsync(item, IssueSteps.TriageSession, session, version, c);
+                    await ledger.CheckpointAsync(item, RunPipeline.Steps.ModelClass, session, WorkerModelClass.Triage, c);
+                },
                 (session, reason, c) => ledger.TaintSessionAsync(item, session, reason, c), ct);
-            if (result.UsageLimited && await controls.PauseForUsageAsync(null, UsagePause.WorkerRateLimited, ct) is { State: ControlState.Paused } pause)
+            // Refused for usage, or no model of the triage's class could serve it (E8): never a failure of the issue.
+            if (RunPipeline.UsagePauseReason(result) is { } usageReason
+                && await controls.PauseForUsageAsync(null, usageReason, ct) is { State: ControlState.Paused } pause)
             {
                 // Nothing recorded: the version is triaged again once the pause lifts.
-                log.WriteLine($"[issues] triage worker hit a router exhaustion or rate-limit error; factory paused for usage until {pause.ResumeAt:u}");
+                log.WriteLine($"[issues] triage worker refused by the router ({usageReason}); factory paused for usage until {pause.ResumeAt:u}");
                 return (null, true);
             }
             if (!result.Succeeded)

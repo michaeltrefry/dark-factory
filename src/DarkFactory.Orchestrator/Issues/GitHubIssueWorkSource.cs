@@ -211,7 +211,11 @@ public sealed class GitHubIssueWorkSource(IGitHubIssues issues, IDbContextFactor
         {
             description += $"\n\nProposed fix:\n{fix.Description}\n\nPaths it changes: {string.Join(", ", fix.Paths)}";
         }
-        return new WorkSpec(new WorkStory(id, triage.Title, description, triage.Type.ToString().ToLowerInvariant(), url, Naming, closes), null, []);
+        // An issue has no estimate: it is complex unless labelled simple (WorkerModelClass.Coding, E8). Labels are set by people with
+        // triage access to the repo, never by an outsider's issue text.
+        var labels = (await issues.GetAsync(RepoRef.Parse(row.Repo), row.Number, ct)).Labels;
+        return new WorkSpec(new WorkStory(id, triage.Title, description, triage.Type.ToString().ToLowerInvariant(), url, Naming, closes, labels),
+            null, []);
     }
 
     /// <summary>

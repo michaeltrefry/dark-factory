@@ -224,7 +224,7 @@ public class RunPipelineTests
         }
     }
 
-    internal sealed record WorkerCall(string Prompt, string? Resume, WorkerCallbacks Callbacks)
+    internal sealed record WorkerCall(string Prompt, string? Resume, WorkerCallbacks Callbacks, string ModelClass)
     {
         public Task OnSession(string sid, CancellationToken ct) => Callbacks.OnSession!(sid, ct);
     }
@@ -242,10 +242,10 @@ public class RunPipelineTests
         /// <summary>The tools the worker says its sessions run with.</summary>
         public WorkerTools Tools { get; init; } = WorkerTools.Implementer;
 
-        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
+        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
             WorkerCallbacks? callbacks, CancellationToken ct)
         {
-            var call = new WorkerCall(prompt, resumeSessionId, callbacks!);
+            var call = new WorkerCall(prompt, resumeSessionId, callbacks!, modelClass);
             Calls.Add(call);
             await callbacks!.OnStarted!(WorkerPid, CancellationToken.None);
             return await behaviours[Calls.Count - 1](call);
@@ -368,7 +368,7 @@ public class RunPipelineTests
         Assert.True(outcome.Succeeded);
         Assert.Equal((WorkState.Review, PrUrl, "sess-77"), (outcome.State, outcome.PullRequestUrl, outcome.SessionId));
         Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Review], await h.Transitions());
-        Assert.Equal(["claimed", "worker-started", "session", "worker-done", "pushed", "linked"], await h.Steps());
+        Assert.Equal(["claimed", "worker-started", "session", "worker-model-class", "worker-done", "pushed", "linked"], await h.Steps());
         Assert.Equal(["claim 77", "state 77 Claimed", $"link 77 {PrUrl} https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/sc-77"],
             h.Stories.Writes);
         Assert.Equal(WorkerPid.ToString(), (await h.Rows()).Single(r => r.Step == "worker-started").Detail);
@@ -435,7 +435,7 @@ public class RunPipelineTests
 
         await h.Run(worker);
 
-        Assert.Equal(("session", "sess-77"), (rowsWhileRunning![^1].Step, rowsWhileRunning[^1].ClaudeSessionId));
+        Assert.Equal([("session", "sess-77"), ("worker-model-class", "sess-77")], rowsWhileRunning![^2..].Select(r => (r.Step, r.ClaudeSessionId)));
     }
 
     [Fact]
@@ -465,7 +465,7 @@ public class RunPipelineTests
         Assert.StartsWith("[author: dark-factory]", comment);
         Assert.Contains("exit 1", comment);
         Assert.Contains("Not logged in", comment);
-        Assert.Contains("Last ledger state: Implement (after step session)", comment);
+        Assert.Contains("Last ledger state: Implement (after step worker-model-class)", comment);
         Assert.Contains("sess-x", comment);
         Assert.Equal("escalation-comment", (await h.Rows())[^1].Step);
         // An escalated item restarts with a fresh worktree, so this one is removed (E5).
@@ -507,7 +507,7 @@ public class RunPipelineTests
         Assert.True(outcome.Succeeded, outcome.Error);
         var comment = Assert.Single(h.Stories.Comments);
         Assert.Contains("Not logged in", comment);
-        Assert.Contains("Last ledger state: Implement (after step session)", comment);
+        Assert.Contains("Last ledger state: Implement (after step worker-model-class)", comment);
         Assert.Contains("sess-x", comment);
         var rows = await h.Rows();
         var posted = rows.FindIndex(r => r.Step == "escalation-comment" && r.Detail == "posted");
@@ -653,7 +653,7 @@ public class RunPipelineTests
         Assert.DoesNotContain(rowsAtStop!, r => r.Step == "worker-started" && r.Detail == WorkerPid.ToString()); // stopped before the new worker
         var killed = (await h.Rows()).Single(r => r.Step == "orphan-killed");
         Assert.Equal("pid 999", killed.Detail);
-        Assert.Equal(["worker-started", "session", "orphan-killed", "worker-started", "worker-done", "pushed", "linked"], await h.Steps());
+        Assert.Equal(["worker-started", "session", "orphan-killed", "worker-started", "worker-model-class", "worker-done", "pushed", "linked"], await h.Steps());
     }
 
     [Fact]

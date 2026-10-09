@@ -547,7 +547,7 @@ public sealed partial class RunPipeline
             ?? throw new InvalidOperationException($"The verdict on {fixedHead} has no confirmed blocking findings to fix.");
         await RunFixRoundAsync(run, history, round, fixedHead, $"{findings.Count} finding(s)", [SpecInput(spec.Story), WorkerInput.ReviewFindings],
             _ => Task.FromResult(BuildFixPrompt(spec, repo, round, findings, FixCapOf(history))), BuildFixResumePrompt(spec.Story, round),
-            $"{spec.Story.Ref}: fix review findings (round {round})", WorkState.Review, $"fix round {round}", ct);
+            $"{spec.Story.Ref}: fix review findings (round {round})", WorkState.Review, $"fix round {round}", WorkerModelClass.Coding(spec.Story), ct);
     }
 
     /// <summary>
@@ -557,10 +557,12 @@ public sealed partial class RunPipeline
     /// and checkpoints the pushed commit, then records <paramref name="next"/> ("&lt;<paramref name="name"/>&gt; pushed &lt;sha&gt;")
     /// and removes the worktree. <paramref name="prepare"/> runs on a freshly restored worktree before the fixer (a conflict
     /// round merges the base into it there); <paramref name="afterPush"/> checks the pushed commit before the next state is
-    /// recorded (it runs again on a resumed run that had already pushed).
+    /// recorded (it runs again on a resumed run that had already pushed). The fixer runs on <paramref name="modelClass"/> (E8: a
+    /// review or conflict fix round on the item's coding class, a CI fix on <see cref="WorkerModelClass.CiFix"/>).
     /// </summary>
     private async Task RunFixRoundAsync(Run run, List<LedgerEntry> history, int round, string fixedHead, string what,
-        IReadOnlyCollection<WorkerInput> inputs, Func<CancellationToken, Task<string>> prompt, string resumePrompt, string commitMessage, WorkState next, string name, CancellationToken ct,
+        IReadOnlyCollection<WorkerInput> inputs, Func<CancellationToken, Task<string>> prompt, string resumePrompt, string commitMessage, WorkState next, string name, string modelClass,
+        CancellationToken ct,
         Func<Workspace, CancellationToken, Task>? prepare = null, Func<string, CancellationToken, Task>? afterPush = null)
     {
         var (spec, repo, item) = run;
@@ -614,7 +616,7 @@ public sealed partial class RunPipeline
                 var fresh = session is null ? await prompt(ct) : null;
                 try
                 {
-                    session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? fresh! : resumePrompt, models, inputs, "fix", ct);
+                    session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? fresh! : resumePrompt, models, inputs, "fix", modelClass, ct);
                 }
                 catch (WorkerStuckException stuckSession) when (!WorkerStillRunning.IsMarked(stuckSession))
                 {
@@ -707,7 +709,7 @@ public sealed partial class RunPipeline
         await RunFixRoundAsync(run, history, round, fixedHead, $"failing checks: {string.Join(", ", triage.Fixable)}", [SpecInput(spec.Story), WorkerInput.CiLog],
             async c => BuildCiFixPrompt(spec, repo, round, fixedHead, await FailureLogsAsync(run, fixedHead, triage, c), FixCapOf(history)),
             BuildCiFixResumePrompt(spec.Story, round),
-            $"{spec.Story.Ref}: fix CI (round {round})", WorkState.CI, $"ci fix round {round}", ct);
+            $"{spec.Story.Ref}: fix CI (round {round})", WorkState.CI, $"ci fix round {round}", WorkerModelClass.CiFix, ct);
     }
 
     /// <summary>

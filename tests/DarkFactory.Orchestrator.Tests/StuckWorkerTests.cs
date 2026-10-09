@@ -81,7 +81,7 @@ public class StuckWorkerTests
         public int PauseRequests;
         public bool Paused => _pause;
 
-        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, WorkerCallbacks? callbacks, CancellationToken ct)
+        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass, WorkerCallbacks? callbacks, CancellationToken ct)
         {
             _pause = false;
             Resumes.Add(resumeSessionId);
