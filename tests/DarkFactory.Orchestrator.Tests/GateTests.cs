@@ -661,12 +661,30 @@ public class RouterReviewerTests
         var usage = new RouterReviewer(new FakeApi().On("POST /v1/messages", HttpStatusCode.OK,
             """{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}""").Client("http://router.test/"), "rk");
         await Assert.ThrowsAsync<RouterUsageLimitedException>(() => usage.ReviewAsync(Request, CancellationToken.None));
+
+        // A model's answer that only talks about rate limits is no usage refusal: it fails as a non-stream answer.
+        var prose = JsonSerializer.Serialize(new
+        {
+            type = "message", model = "claude-opus-5-5", stop_reason = "end_turn",
+            content = new[] { new { type = "text", text = "The retry loop treats rate_limit_error as fatal.\n" + CleanFindings } },
+        });
+        var talker = new RouterReviewer(new FakeApi().On("POST /v1/messages", HttpStatusCode.OK, prose).Client("http://router.test/"), "rk");
+        var notUsage = await Assert.ThrowsAsync<InvalidOperationException>(() => talker.ReviewAsync(Request, CancellationToken.None));
+        Assert.Contains("not an event stream", notUsage.Message);
     }
 
     /// <summary>A router that sends <paramref name="first"/> at once, then each of <paramref name="later"/> after <paramref name="gap"/>.</summary>
     private static (FakeApi Api, Task Writer) SlowRouter(string first, IReadOnlyList<string> later, TimeSpan gap, bool complete = true)
     {
-        var channel = System.Threading.Channels.Channel.CreateUnbounded<string>();
+        var (reader, writer) = SlowBytes(System.Text.Encoding.UTF8.GetBytes(first), later.Select(System.Text.Encoding.UTF8.GetBytes).ToList(), gap, complete);
+        return (new FakeApi().On("POST /v1/messages", _ => SseAnswers.Streamed(reader)), writer);
+    }
+
+    /// <summary>Raw body bytes: <paramref name="first"/> at once, then each of <paramref name="later"/> after <paramref name="gap"/>.</summary>
+    private static (System.Threading.Channels.ChannelReader<byte[]> Reader, Task Writer) SlowBytes(byte[] first, IReadOnlyList<byte[]> later, TimeSpan gap,
+        bool complete = true)
+    {
+        var channel = System.Threading.Channels.Channel.CreateUnbounded<byte[]>();
         channel.Writer.TryWrite(first);
         var writer = Task.Run(async () =>
         {
@@ -680,7 +698,46 @@ public class RouterReviewerTests
                 channel.Writer.Complete();
             }
         });
-        return (new FakeApi().On("POST /v1/messages", _ => SseAnswers.Streamed(channel.Reader)), writer);
+        return (channel.Reader, writer);
+    }
+
+    [Fact]
+    public async Task A_stream_with_crlf_lines_comments_multi_line_data_a_split_character_and_a_long_thinking_block_is_read_per_the_sse_spec()
+    {
+        static byte[] Crlf(string s) => System.Text.Encoding.UTF8.GetBytes(s.Replace("\n", "\r\n"));
+        var chunks = new List<byte[]>
+        {
+            // A thinking block over ~1.2 s, a delta every 300 ms: longer than the 500 ms idle gap, never silent for it.
+            Crlf(SseAnswers.Event("content_block_start", new { type = "content_block_start", index = 0, content_block = new { type = "thinking", thinking = "" } })),
+        };
+        for (var i = 0; i < 4; i++)
+        {
+            chunks.Add(Crlf(SseAnswers.Event("content_block_delta",
+                new { type = "content_block_delta", index = 0, delta = new { type = "thinking_delta", thinking = "{\"findings\": [{}]}" } })));
+        }
+        chunks.Add(Crlf(SseAnswers.BlockStop(0) + SseAnswers.TextBlockStart(1)));
+        // One event whose data spans two lines, with a comment line between them, and a ✓ (3 bytes) split across two chunks.
+        var multiLine = Crlf("event: content_block_delta\n: a comment, ignored\ndata: {\"type\":\"content_block_delta\",\"index\":1,\n"
+            + "data: \"delta\":{\"type\":\"text_delta\",\"text\":\"Checked ✓ ok.\\n\"}}\n\n");
+        var split = Array.IndexOf(multiLine, (byte)0xE2) + 1;
+        chunks.Add(multiLine[..split]);
+        chunks.Add(multiLine[split..]);
+        chunks.Add(Crlf(SseAnswers.TextDelta(1, CleanFindings) + SseAnswers.BlockStop(1) + SseAnswers.MessageDelta("end_turn") + SseAnswers.MessageStop));
+        var (reader, writer) = SlowBytes(Crlf(SseAnswers.MessageStart("claude-opus-5-5") + ": keep-alive\n\n"), chunks, TimeSpan.FromMilliseconds(300));
+        var started = System.Diagnostics.Stopwatch.StartNew();
+
+        var answer = await MessageStream.ReadAsync(await SseAnswers.Streamed(reader).Content.ReadAsStreamAsync(TestContext.Current.CancellationToken),
+            TimeSpan.FromMilliseconds(500), TestContext.Current.CancellationToken);
+
+        Assert.Equal(new StreamedAnswer("claude-opus-5-5", "end_turn", "Checked ✓ ok.\n" + CleanFindings + "\n"), answer);
+        Assert.True(started.Elapsed > TimeSpan.FromSeconds(1), $"{started.Elapsed}");
+        await writer;
+
+        // Exactly one space after "data:" is stripped, a second one is the value's own.
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => MessageStream.ReadAsync(
+            new MemoryStream(System.Text.Encoding.UTF8.GetBytes("event: error\ndata:  {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"x\"}}\n\n")),
+            TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        Assert.Contains("mid-stream:  {\"type\":\"error\"", error.Message);
     }
 
     [Fact]

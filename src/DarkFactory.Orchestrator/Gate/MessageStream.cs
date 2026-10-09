@@ -49,7 +49,9 @@ public static class MessageStream
             {
                 if (line.StartsWith("data:", StringComparison.Ordinal))
                 {
-                    data.Append(data.Length > 0 ? "\n" : "").Append(line.AsSpan(5).TrimStart(' '));
+                    // The SSE spec strips exactly one space after the colon.
+                    var value = line.AsSpan(5);
+                    data.Append(data.Length > 0 ? "\n" : "").Append(value.StartsWith(" ") ? value[1..] : value);
                 }
                 else if (line.StartsWith("event:", StringComparison.Ordinal))
                 {

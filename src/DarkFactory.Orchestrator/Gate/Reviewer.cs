@@ -143,7 +143,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
                 var body = await response.Content.ReadAsStringAsync(deadline.Token);
                 var why = $"The review call through the router answered {(int)response.StatusCode} "
                     + $"{response.Content.Headers.ContentType?.MediaType ?? "(no content type)"}, not an event stream: {Cut(body, 500)}";
-                if (UsageLimited(0, body))
+                if (IsErrorBody(body) && UsageLimited(0, body))
                 {
                     throw new RouterUsageLimitedException(why);
                 }
@@ -156,6 +156,27 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             throw new InvalidOperationException($"The review call through the router did not finish within {http.Timeout.TotalMinutes:0.##} min.");
+        }
+    }
+
+    /// <summary>
+    /// Whether a successful non-stream body is an error rather than a model's answer: an Anthropic error object
+    /// (<c>{"type":"error",...}</c>), or anything without a JSON <c>content</c>. A model's answer may well talk about rate
+    /// limits, so its text is never scanned for usage markers (the rule <see cref="WorkerResult.UsageLimited"/> follows).
+    /// </summary>
+    private static bool IsErrorBody(string body)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+            return root.ValueKind != JsonValueKind.Object
+                || (root.TryGetProperty("type", out var type) && type.ValueKind == JsonValueKind.String && type.ValueEquals("error"))
+                || !root.TryGetProperty("content", out _);
+        }
+        catch (JsonException)
+        {
+            return true;
         }
     }
 

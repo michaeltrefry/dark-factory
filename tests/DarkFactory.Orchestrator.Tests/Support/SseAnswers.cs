@@ -53,14 +53,14 @@ public static class SseAnswers
         new(status) { Content = new StringContent(events, Encoding.UTF8, "text/event-stream") };
 
     /// <summary>A response whose body the test writes chunk by chunk, as a router streams it (completing the channel ends it).</summary>
-    public static HttpResponseMessage Streamed(ChannelReader<string> chunks)
+    public static HttpResponseMessage Streamed(ChannelReader<byte[]> chunks)
     {
         var content = new StreamContent(new ChannelStream(chunks));
         content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("text/event-stream");
         return new HttpResponseMessage(HttpStatusCode.OK) { Content = content };
     }
 
-    private sealed class ChannelStream(ChannelReader<string> chunks) : Stream
+    private sealed class ChannelStream(ChannelReader<byte[]> chunks) : Stream
     {
         private ReadOnlyMemory<byte> _pending;
 
@@ -74,7 +74,7 @@ public static class SseAnswers
                 }
                 if (chunks.TryRead(out var chunk))
                 {
-                    _pending = Encoding.UTF8.GetBytes(chunk);
+                    _pending = chunk;
                 }
             }
             var n = Math.Min(buffer.Length, _pending.Length);
