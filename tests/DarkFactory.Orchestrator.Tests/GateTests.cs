@@ -122,6 +122,16 @@ public class ReviewModelsTests
         // claude-opus-5-5) does not exclude a confirmer pinned to claude-opus-5-5, and does exclude one pinned to claude-opus-5.
         Assert.Equal("claude-opus-5-5", ReviewerChoice.ChooseConfirmer(candidates, ["claude-opus-5"]));
         Assert.Equal("claude-sonnet-5", ReviewerChoice.ChooseConfirmer(ReviewPanelModels.DefaultConfirmers, ReviewPanelModels.DefaultReviewers));
+        // Once the router has said which model served the review, a candidate it may serve as that model is skipped too: the
+        // reviewer pinned claude-opus-5-5 makes the default list pick claude-sonnet-5, since claude-opus-5 may be served as
+        // claude-opus-5-5 (an Opus pin's upgrade), and so does the default reviewer served as claude-opus-5-5.
+        Assert.Equal("claude-sonnet-5", ReviewerChoice.ChooseConfirmer(ReviewPanelModels.DefaultConfirmers, ["claude-opus-5-5"], "claude-opus-5-5"));
+        Assert.Equal("claude-sonnet-5", ReviewerChoice.ChooseConfirmer(candidates, ["claude-opus-5"], "claude-opus-5-5"));
+        Assert.Equal("claude-sonnet-5", ReviewerChoice.ChooseConfirmer(ReviewPanelModels.DefaultConfirmers, ReviewPanelModels.DefaultReviewers, "claude-opus-5-5"));
+        // A newer Opus than the one that served the review cannot be served as it (never a downgrade), so it stays eligible.
+        Assert.Equal("claude-opus-6", ReviewerChoice.ChooseConfirmer(["claude-opus-5", "claude-opus-6"], ["claude-opus-5"], "claude-opus-5-5-20261001"));
+        var served = Assert.Throws<ReviewerChoiceException>(() => ReviewerChoice.ChooseConfirmer(["claude-opus-5-5"], ["claude-opus-5"], "claude-opus-5-5"));
+        Assert.Contains("(claude-opus-5, served as claude-opus-5-5)", served.Message);
         // The reviewer's dotted spelling is its dashed one: never its own second model.
         Assert.Equal("claude-sonnet-5", ReviewerChoice.ChooseConfirmer(["claude-opus-5-5", "claude-sonnet-5"], ["claude-opus-5.5"]));
         // A non-Claude candidate is never chosen, even when it is the only other one.
@@ -146,9 +156,15 @@ public class ReviewModelsTests
         // A second model pinned to a non-Opus is not upgraded: claude-sonnet-5 served as claude-sonnet-5-5 does not count.
         Assert.Contains("served 'claude-sonnet-5-5', not the pinned claude-sonnet-5",
             Assert.Single(ReviewModels.Problems(R("claude-opus-5", "claude-opus-5", C("claude-sonnet-5", "claude-sonnet-5-5")))));
-        // The reviewer's own model is judged by the pinned ids: pinned apart they differ even when the router served both as
-        // claude-opus-5-5; pinned alike they are the same even when served differently.
-        Assert.Empty(ReviewModels.Problems(R("claude-opus-5", "claude-opus-5-5", C("claude-opus-5-5", "claude-opus-5-5"))));
+        // The reviewer's own model is the same pin, or the same served model: pinned apart but both served as claude-opus-5-5
+        // (the reviewer's claude-opus-5 upgraded), one model confirmed its own finding; pinned alike they are the same even
+        // when served differently.
+        Assert.Contains("(claude-opus-5-5) was served as 'claude-opus-5-5', the model that served the reviewer (claude-opus-5)",
+            Assert.Single(ReviewModels.Problems(R("claude-opus-5", "claude-opus-5-5", C("claude-opus-5-5", "claude-opus-5-5")))));
+        Assert.Contains("the model that served the reviewer",
+            Assert.Single(ReviewModels.Problems(R("claude-opus-5-5", "claude-opus-5-5-20261001", C("claude-opus-5", "CLAUDE-OPUS-5-5")))));
+        // Served apart they are independent (the reviewer's upgrade is not the second model's), and the default panel passes.
+        Assert.Empty(ReviewModels.Problems(R("claude-opus-5", "claude-opus-5-5", C("claude-opus-5-5", "claude-opus-6"))));
         Assert.Contains("(claude-opus-5) is the reviewer's own model",
             Assert.Single(ReviewModels.Problems(R("claude-opus-5", "claude-opus-5-5", C("claude-opus-5", "claude-opus-6")))));
         Assert.Contains("did not say which model answered", Assert.Single(ReviewModels.Problems(R("claude-opus-5-5", null))));

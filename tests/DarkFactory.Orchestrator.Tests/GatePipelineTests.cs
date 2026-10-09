@@ -570,8 +570,9 @@ public class GatePipelineTests
         Assert.True(outcome.Succeeded, outcome.Error);
         Assert.Equal([ReviewRoles.Correctness, ReviewRoles.SpecConformance], h.Reviewer.Requests.Select(r => r.Role));
         Assert.All(h.Reviewer.Requests, r => Assert.Equal("claude-opus-5-5", r.Model));
-        // The blocking finding's second model is Claude and not the reviewer's model.
-        Assert.Equal("claude-opus-5", Assert.Single(h.Reviewer.Confirms).Model);
+        // The blocking finding's second model is Claude and not the reviewer's model, nor one the router may serve as it
+        // (claude-opus-5 may be served as the reviewer's claude-opus-5-5).
+        Assert.Equal("claude-sonnet-5", Assert.Single(h.Reviewer.Confirms).Model);
         Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
     }
 
@@ -600,20 +601,44 @@ public class GatePipelineTests
     }
 
     [Fact]
-    public async Task The_second_model_is_chosen_by_pinned_ids_not_by_what_the_router_served_the_reviewer()
+    public async Task The_second_model_skips_a_pin_the_router_may_serve_as_the_reviewers_served_model()
     {
-        // The reviewer pinned claude-opus-5 is served as claude-opus-5-5; a second model pinned to claude-opus-5-5 is another pin.
+        // The reviewer pinned claude-opus-5 is served as claude-opus-5-5; a second model pinned to claude-opus-5-5 is another
+        // pin but would be the same served model confirming (or downgrading) its own finding, so the next one is chosen.
         var h = new Harness
         {
             Models = ReviewPanelModels.Uniform(["claude-opus-5"], ["claude-opus-5-5", "claude-sonnet-5"]),
-            Reviewer = new FakeReviewer { Findings = FakeReviewer.Blocking().Findings, Confirm = _ => Confirmation.NotConfirmed, Served = _ => "claude-opus-5-5" },
+            Reviewer = new FakeReviewer
+            {
+                Findings = FakeReviewer.Blocking().Findings, Confirm = _ => Confirmation.NotConfirmed,
+                Served = r => r.Model == "claude-opus-5" ? "claude-opus-5-5" : r.Model,
+            },
         };
 
         var outcome = await h.Run();
 
         Assert.True(outcome.Succeeded, outcome.Error);
-        Assert.Equal("claude-opus-5-5", Assert.Single(h.Reviewer.Confirms).Model);
+        Assert.Equal("claude-sonnet-5", Assert.Single(h.Reviewer.Confirms).Model);
         Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
+    }
+
+    [Fact]
+    public async Task A_finding_is_never_downgraded_by_the_model_that_served_its_reviewer()
+    {
+        // The only second model, claude-opus-5-5, is another pin than the reviewer's claude-opus-5 but the model the router
+        // served it as: the finding is not sent to it, and nothing merges.
+        var h = new Harness
+        {
+            Models = ReviewPanelModels.Uniform(["claude-opus-5"], ["claude-opus-5-5"]),
+            Reviewer = new FakeReviewer { Findings = FakeReviewer.Blocking().Findings, Confirm = _ => Confirmation.NotConfirmed, Served = _ => "claude-opus-5-5" },
+        };
+
+        var outcome = await h.Run();
+
+        Assert.False(outcome.Succeeded);
+        Assert.Empty(h.Reviewer.Confirms);
+        Assert.Empty(h.Merges);
+        Assert.Contains("(claude-opus-5, served as claude-opus-5-5)", outcome.Error);
     }
 
     /// <summary>
@@ -956,15 +981,15 @@ public class GatePipelineTests
 
         Assert.True(outcome.Succeeded, outcome.Error);
         Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
-        // The second model is the first Claude model that is not the reviewer's.
+        // The second model is the first Claude model that is not the reviewer's and cannot be served as it.
         var confirm = h.Reviewer.Confirms.Single();
-        Assert.Equal(("claude-opus-5", ReviewRoles.Correctness, "WordCount(\"\") still returns 1"), (confirm.Model, confirm.Role, confirm.Finding.Title));
+        Assert.Equal(("claude-sonnet-5", ReviewRoles.Correctness, "WordCount(\"\") still returns 1"), (confirm.Model, confirm.Role, confirm.Finding.Title));
         Assert.Equal("factory/prompts/confirm.md", confirm.Prompt.Path);
         var finding = (await h.Verdicts()).Single().Reviews.Single(r => r.Role == ReviewRoles.Correctness).Findings.Single();
         Assert.Equal((Finding.Optional, true, Confirmation.NotConfirmed), (finding.Severity, finding.Downgraded, finding.Confirmation!.Outcome));
         // The confirmation call's session is named before it, with the confirm prompt's hash.
         Assert.Contains((await h.Rows()).Where(r => r.Step == RunPipeline.Steps.ReviewSession).Select(r => r.Detail),
-            d => d == $"{confirm.Session} claude-opus-5 {Sha1} confirm-correctness {ReviewPrompts.Confirm.Id}");
+            d => d == $"{confirm.Session} claude-sonnet-5 {Sha1} confirm-correctness {ReviewPrompts.Confirm.Id}");
     }
 
     [Fact]
@@ -976,8 +1001,8 @@ public class GatePipelineTests
         var outcome = await h.Run();
 
         Assert.Equal(WorkState.Escalated, outcome.State);
-        Assert.Contains("[correctness] the tests do not cover the empty string (src/x.cs:1), confirmed by claude-opus-5", outcome.Error);
-        Assert.Contains("blocking correctness finding by claude-opus-5-5, confirmed by claude-opus-5", (await h.Verdicts()).First().Summary);
+        Assert.Contains("[correctness] the tests do not cover the empty string (src/x.cs:1), confirmed by claude-sonnet-5", outcome.Error);
+        Assert.Contains("blocking correctness finding by claude-opus-5-5, confirmed by claude-sonnet-5", (await h.Verdicts()).First().Summary);
         var finding = (await h.Verdicts()).First().Reviews.Single(r => r.Role == ReviewRoles.Correctness).Findings.Single();
         Assert.Equal((Finding.Blocking, false, Confirmation.Confirmed), (finding.Severity, finding.Downgraded, finding.Confirmation!.Outcome));
         Assert.Empty(h.Merges);
@@ -1131,13 +1156,13 @@ public class GatePipelineTests
         var verdict = (await h.Verdicts()).First();
         Assert.Equal(ReviewVerdict.Fail, verdict.Verdict);
         var finding = verdict.Reviews.Single(r => r.Role == ReviewRoles.SpecConformance).Findings.Single();
-        Assert.Equal((Finding.Blocking, "config key WordCount:IgnoreBlankInput has no consumer", Confirmation.Confirmed, "claude-opus-5"),
+        Assert.Equal((Finding.Blocking, "config key WordCount:IgnoreBlankInput has no consumer", Confirmation.Confirmed, "claude-sonnet-5"),
             (finding.Severity, finding.Title, finding.Confirmation!.Outcome, finding.Confirmation.Model));
         Assert.Contains("config key WordCount:IgnoreBlankInput has no consumer", outcome.Error);
         Assert.Empty(h.Merges);
         // Every call went through the router pinned with the role's model and that role's prompt as the system prompt; after
         // each fix push only spec conformance (the role with the blocking finding) reviewed again, and its finding was confirmed.
-        Assert.Equal(["claude-opus-5-5", "claude-opus-5-5", "claude-opus-5", .. Enumerable.Repeat(new[] { "claude-opus-5-5", "claude-opus-5" }, Lifecycle.MaxFixRounds).SelectMany(x => x)],
+        Assert.Equal(["claude-opus-5-5", "claude-opus-5-5", "claude-sonnet-5", .. Enumerable.Repeat(new[] { "claude-opus-5-5", "claude-sonnet-5" }, Lifecycle.MaxFixRounds).SelectMany(x => x)],
             router.Requests.Select(r => r.Headers[RouterReviewer.ForceModelHeader]));
     }
 

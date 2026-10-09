@@ -69,8 +69,9 @@ public static partial class ReviewModels
             || (OpusVersion(pinned) is { } p && OpusVersion(served) is { } s && (s.Major > p.Major || (s.Major == p.Major && s.Minor >= p.Minor))));
 
     /// <summary>
-    /// Whether two pinned ids name one model: the same id (case, any <c>provider/</c> prefix and the dotted spelling aside),
-    /// or one the other's dated snapshot. Pinned ids only: what the router served never makes two pins the same or different.
+    /// Whether two ids name one model: the same id (case, any <c>provider/</c> prefix and the dotted spelling aside), or one
+    /// the other's dated snapshot. Compares two pinned ids, or two served ids; never a pin with what the router served
+    /// (that is <see cref="Serves"/>).
     /// </summary>
     public static bool SamePinned(string a, string b)
     {
@@ -102,8 +103,9 @@ public static partial class ReviewModels
 
     /// <summary>
     /// Every reason <paramref name="review"/>'s models cannot count: its reviewer is not a <see cref="FloorText"/> or was not
-    /// served as pinned; a second model is not Claude, was pinned to the reviewer's own model (<see cref="SamePinned"/>), or
-    /// was not served as pinned.
+    /// served as pinned; a second model is not Claude, was not served as pinned, was pinned to the reviewer's own model
+    /// (<see cref="SamePinned"/>), or was served as the model that served the reviewer (an Opus pin may be served as a newer
+    /// Opus, so two different pins can be answered by one model, which then confirmed its own finding).
     /// </summary>
     public static IEnumerable<string> Problems(RoleReview review)
     {
@@ -120,6 +122,11 @@ public static partial class ReviewModels
             else if (SamePinned(review.Model, c.Model))
             {
                 yield return $"a second model on a {review.Role} finding ({c.Model}) is the reviewer's own model";
+            }
+            else if (review.ServedModel is { } reviewerServed && c.ServedModel is { } confirmerServed && SamePinned(reviewerServed, confirmerServed))
+            {
+                yield return $"a second model on a {review.Role} finding ({c.Model}) was served as '{c.ServedModel}', "
+                    + $"the model that served the reviewer ({review.Model}): it would confirm its own finding";
             }
         }
     }
@@ -142,14 +149,18 @@ public static class ReviewerChoice
 
     /// <summary>
     /// The second model for a blocking finding <paramref name="reviewerModels"/> reported: the first of
-    /// <paramref name="candidates"/> that is a Claude model and not pinned to any of the reviewer's pinned models
-    /// (<see cref="ReviewModels.SamePinned"/>). Throws
+    /// <paramref name="candidates"/> that is a Claude model, not pinned to any of the reviewer's pinned models
+    /// (<see cref="ReviewModels.SamePinned"/>) and, when the router said which model served the review
+    /// (<paramref name="reviewerServed"/>), not one the router may serve as that model (<see cref="ReviewModels.Serves"/>:
+    /// a pinned <c>claude-opus-5</c> may be served as the reviewer's <c>claude-opus-5-5</c>). Throws
     /// <see cref="ReviewerChoiceException"/> when there is none.
     /// </summary>
     public static string ChooseConfirmer(IReadOnlyList<string> candidates, IReadOnlyCollection<string> reviewerModels,
-        string setting = "Review:Confirm:Models") =>
-        candidates.FirstOrDefault(c => ReviewModels.IsClaude(c) && !reviewerModels.Any(r => ReviewModels.SamePinned(c, r)))
+        string? reviewerServed = null, string setting = "Review:Confirm:Models") =>
+        candidates.FirstOrDefault(c => ReviewModels.IsClaude(c) && !reviewerModels.Any(r => ReviewModels.SamePinned(c, r))
+            && (reviewerServed is null || !ReviewModels.Serves(c, reviewerServed)))
         ?? throw new ReviewerChoiceException(
             $"No configured second model ({string.Join(", ", candidates)}) is a Claude model other than the reviewer's "
-            + $"({string.Join(", ", reviewerModels)}), so a blocking finding cannot be confirmed; set {setting}.");
+            + $"({string.Join(", ", reviewerModels)}{(reviewerServed is null ? "" : $", served as {reviewerServed}")}), "
+            + $"so a blocking finding cannot be confirmed; set {setting}.");
 }
