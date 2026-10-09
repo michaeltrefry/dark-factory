@@ -146,6 +146,65 @@ public class DashboardComponentTests : BunitContext
     }
 
     [Fact]
+    public void A_running_session_silent_for_the_quiet_threshold_is_marked_quiet_and_unmarked_once_it_speaks_again()
+    {
+        var time = (FakeTimeProvider)Services.GetRequiredService<TimeProvider>();
+        var live = new SessionLink("s-2", 2, Now.AddMinutes(-30), null, null, null, LastEventAt: Now.AddMinutes(-9));
+        _data.Rows = [Row(1, WorkState.Implement, sessions: live)];
+
+        var cut = Render<Pipeline>();
+        Assert.Equal("#2 (live)", cut.Find("td.sessions a").TextContent);
+
+        // Two quiet minutes later (the page re-reads a running session's last event on its tick; stream events are not item changes).
+        time.Advance(TimeSpan.FromMinutes(2));
+        cut.WaitForAssertion(() => Assert.Equal("#2 (live, quiet)", cut.Find("td.sessions a").TextContent));
+        Assert.Equal("quiet", cut.Find("td.sessions a").GetAttribute("class"));
+        Assert.Equal("no event for 11m 00s", cut.Find("td.sessions a").GetAttribute("title"));
+
+        // It speaks again: the next tick's read shows it.
+        _data.Rows = [Row(1, WorkState.Implement, sessions: live with { LastEventAt = time.GetUtcNow() })];
+        time.Advance(TimeSpan.FromSeconds(15));
+        cut.WaitForAssertion(() => Assert.Equal("#2 (live)", cut.Find("td.sessions a").TextContent));
+
+        // A finished session is never quiet.
+        _data.Rows = [Row(1, WorkState.Review, sessions: live with { EndedAt = Now, ExitStatus = "stuck", LastEventAt = null })];
+        _changes.Notify(1);
+        cut.WaitForAssertion(() => Assert.Equal("#2", cut.Find("td.sessions a").TextContent));
+    }
+
+    [Fact]
+    public void Worker_QuietMinutes_sets_when_a_session_counts_as_quiet()
+    {
+        _data.Quiet = TimeSpan.FromMinutes(20);
+        _data.Rows = [Row(1, WorkState.Implement, sessions: new SessionLink("s-2", 2, Now.AddMinutes(-30), null, null, null, LastEventAt: Now.AddMinutes(-15)))];
+
+        Assert.Equal("#2 (live)", Render<Pipeline>().Find("td.sessions a").TextContent);
+
+        _data.Quiet = TimeSpan.FromMinutes(10);
+        Assert.Equal("#2 (live, quiet)", Render<Pipeline>().Find("td.sessions a").TextContent);
+    }
+
+    [Fact]
+    public void The_session_page_marks_a_silent_running_session_quiet_until_an_event_arrives()
+    {
+        var time = (FakeTimeProvider)Services.GetRequiredService<TimeProvider>();
+        _data.Header = new SessionHeader(1, "sc-1", "Story 1", "acme/widgets",
+            new SessionLink(TranscriptLines.Sid, 1, Now.AddMinutes(-40), null, null, null, LastEventAt: Now.AddMinutes(-12)));
+        _viewers.Backlog = [TranscriptLines.Event(0)]; // stored long ago (ReceivedAt is the epoch)
+
+        var cut = Render<Session>(p => p.Add(x => x.SessionId, TranscriptLines.Sid));
+        cut.WaitForAssertion(() => Assert.Equal("quiet: no event for 12m 00s", cut.Find(".quiet").TextContent));
+        Assert.Contains("running (live)", cut.Find(".status").TextContent);
+
+        _viewers.Send([new SessionEventMessage(2, "assistant", "text", TranscriptLines.All[1], time.GetUtcNow())]);
+        cut.WaitForAssertion(() => Assert.Empty(cut.FindAll(".quiet")));
+
+        // Silent again past the threshold: the page's tick marks it without any new read.
+        time.Advance(TimeSpan.FromMinutes(10));
+        cut.WaitForAssertion(() => Assert.Equal("quiet: no event for 10m 00s", cut.Find(".quiet").TextContent));
+    }
+
+    [Fact]
     public void A_zero_cost_shows_as_zero_dollars_and_an_unknown_cost_as_a_dash()
     {
         // A session served on the router's local model costs $0, which is known spend, not missing spend.
@@ -337,6 +396,9 @@ public class DashboardComponentTests : BunitContext
         public SessionHeader? Header { get; set; }
         public int Reads;
         public IReadOnlyList<Control> Controls { get; set; } = [];
+        public TimeSpan Quiet { get; set; } = DashboardData.DefaultQuietThreshold;
+
+        public TimeSpan QuietThreshold => Quiet;
 
         public Task<IReadOnlyList<Control>> ControlsAsync(CancellationToken ct) => Task.FromResult(Controls);
 

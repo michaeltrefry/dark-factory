@@ -96,6 +96,23 @@ public sealed partial class RunPipeline
         var (history, pull) = await ReadPullAsync(run, ct);
         EnsureOpen(pull);
         var fix = PendingFixRound(history);
+        if (fix is { Stuck: { } stuckReason })
+        {
+            // The round's fixer was stuck in a loop and pushed nothing (sc-25388): a failed round, recorded before it counts; the
+            // fixed head keeps its verdict, so the next round (or, at the cap, the escalation) follows from it below.
+            if (pull.HeadSha != fix.FixedHead)
+            {
+                throw new InvalidOperationException(
+                    $"{pull.HtmlUrl}'s head is {pull.HeadSha}, not the commit fix round {fix.Round} fixed ({fix.FixedHead}), though the round pushed "
+                    + "nothing: a push from outside the factory; it is not judged as the fix round.");
+            }
+            var fixedVerdict = Verdicts(history).LastOrDefault(v => v.HeadSha == fix.FixedHead)
+                ?? throw new InvalidOperationException($"Fix round {fix.Round} has no verdict on the commit it fixed ({fix.FixedHead}).");
+            var failed = FixLoop.Stuck(fix.Round, fixedVerdict, stuckReason);
+            await ledger.CheckpointAsync(run.Item, Steps.FixProgress, null, failed.ToDetail(), ct);
+            log.WriteLine($"[fix] round {failed.Round}: {failed.Outcome}: {failed.Reason}");
+            fix = null;
+        }
         if (fix is not null && pull.HeadSha != fix.PushedHead)
         {
             pull = await WaitForPushedHeadAsync(run, fix, pull, ct);
@@ -161,7 +178,8 @@ public sealed partial class RunPipeline
     /// pushed), and whether it fixed red CI (a CI → CIHealing round) or a conflict with the base found by the merge queue
     /// (a MergeGate → Fixing round, <see cref="Conflict"/>) rather than review findings (Review → Fixing).
     /// </summary>
-    internal sealed record FixRound(int Round, string FixedHead, string? PushedHead, bool Ci = false, bool Conflict = false);
+    /// <remarks><see cref="Stuck"/>: why the round's fixer was found looping, when it was and pushed nothing (sc-25388).</remarks>
+    internal sealed record FixRound(int Round, string FixedHead, string? PushedHead, bool Ci = false, bool Conflict = false, string? Stuck = null);
 
     /// <summary>The item's latest fix round of any kind since the last Implement, with the index of its row; null when none.</summary>
     private static (int Index, FixRound Round)? LatestFixRound(List<LedgerEntry> history)
@@ -185,8 +203,13 @@ public sealed partial class RunPipeline
             }
             previous = state;
         }
-        return at < 0 ? null
-            : (at, new FixRound(round, history[at].Detail!, history.Skip(at + 1).LastOrDefault(e => e.Step == Steps.Pushed)?.Detail, ci, conflict));
+        if (at < 0)
+        {
+            return null;
+        }
+        var pushed = history.Skip(at + 1).LastOrDefault(e => e.Step == Steps.Pushed)?.Detail;
+        var stuck = pushed is null ? history.Skip(at + 1).LastOrDefault(e => e.Step == Steps.Stuck)?.Detail : null;
+        return (at, new FixRound(round, history[at].Detail!, pushed, ci, conflict, stuck));
     }
 
     /// <summary>
@@ -471,6 +494,13 @@ public sealed partial class RunPipeline
         }
 
         var pushed = attempt.LastOrDefault(e => e.Step == Steps.Pushed)?.Detail;
+        // A fixer found looping is never resumed (a run that stopped after the detection left only its checkpoint): the round failed.
+        if (pushed is null && StuckSession(attempt) is { } found)
+        {
+            run.Workspace = await workspaces.ReopenAsync(repo, branch, ct);
+            await StuckFixRoundAsync(run, found, next, name, ct);
+            return;
+        }
         if (pushed is null)
         {
             Workspace? workspace = null;
@@ -500,7 +530,15 @@ public sealed partial class RunPipeline
             if (!attempt.Any(e => e.Step == Steps.WorkerDone))
             {
                 var fresh = session is null ? await prompt(ct) : null;
-                session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? fresh! : resumePrompt, models, inputs, "fix", ct);
+                try
+                {
+                    session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? fresh! : resumePrompt, models, inputs, "fix", ct);
+                }
+                catch (WorkerStuckException stuckSession) when (!WorkerStillRunning.IsMarked(stuckSession))
+                {
+                    await StuckFixRoundAsync(run, stuckSession, next, name, ct);
+                    return;
+                }
             }
             await ThrowIfControlledAsync(item, ct);
             var grant = await GrantPushAsync(item, session, ct);
@@ -527,6 +565,27 @@ public sealed partial class RunPipeline
         log.WriteLine($"[fix] {name} pushed {Ci.Short(pushed)}");
         // The work is on origin: the worktree is throwaway (E5).
         await RemoveWorktreeAsync(run);
+    }
+
+    /// <summary>
+    /// A fix round's failed round (sc-25388): the fixer was found looping and interrupted. Nothing of its work is pushed (its
+    /// worktree is removed; one that cannot be removed escalates), and the round — already counted against
+    /// <see cref="Lifecycle.MaxFixRounds"/> when it started — ends at <paramref name="next"/> as it would after a push, with the
+    /// head unchanged: a review round's Review records a failed <see cref="Steps.FixProgress"/> and dispatches the next round (a
+    /// fresh fixer session) or escalates at the cap; a CI round's CI finds the same red CI and does the same; a conflict round's
+    /// head meets the same conflict at the merge gate.
+    /// </summary>
+    private async Task StuckFixRoundAsync(Run run, WorkerStuckException stuckSession, WorkState next, string name, CancellationToken ct)
+    {
+        if (run.Workspace is { } workspace && !await RemoveWorktreeAsync(run.Repo, workspace))
+        {
+            throw new WorkerFailedException(
+                $"The {name} fixer session {stuckSession.Session ?? "(unnamed)"} was stuck in a loop ({stuckSession.Reason}), and its worktree "
+                + "could not be removed.");
+        }
+        run.Workspace = null;
+        await ledger.RecordAsync(run.Item, next, stuckSession.Session, $"{name} stuck: {stuckSession.Reason}; nothing pushed", ct);
+        log.WriteLine($"[fix] {name}: the fixer was stuck in a loop; the round failed and nothing was pushed");
     }
 
     /// <summary>

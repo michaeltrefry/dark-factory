@@ -184,6 +184,21 @@ public class FactoryOptionsTests
     }
 
     [Fact]
+    public void Stuck_detection_and_the_quiet_threshold_are_read_from_config_and_validated()
+    {
+        Assert.Equal(new Sessions.StuckDetection(5, 0.96), Options([]).StuckDetection);
+        Assert.Equal(new Sessions.StuckDetection(3, 0.9),
+            Options(new() { ["Worker:StuckRepeats"] = "3", ["Worker:StuckSimilarity"] = "0.9" }).StuckDetection);
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:StuckRepeats"] = "1" }).StuckDetection);
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:StuckSimilarity"] = "0" }).StuckDetection);
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:StuckSimilarity"] = "1.5" }).StuckDetection);
+
+        Assert.Equal(TimeSpan.FromMinutes(10), Options([]).QuietThreshold); // the longest legitimate tool call streams nothing that long
+        Assert.Equal(TimeSpan.FromMinutes(2.5), Options(new() { ["Worker:QuietMinutes"] = "2.5" }).QuietThreshold);
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:QuietMinutes"] = "0" }).QuietThreshold);
+    }
+
+    [Fact]
     public void Reviewer_models_have_no_default_and_must_each_be_a_claude_opus_5_5_or_newer_and_second_models_claude()
     {
         // No default reviewer: the router offers no Claude Opus 5.5 or newer, so the factory refuses to start until one is set.

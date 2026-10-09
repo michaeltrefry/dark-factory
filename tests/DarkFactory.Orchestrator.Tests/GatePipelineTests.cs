@@ -279,13 +279,21 @@ public class GatePipelineTests
                 var call = new WorkerCall(prompt, resumeSessionId, callbacks!);
                 var index = h.WorkerCalls.Count;
                 h.WorkerCalls.Add(call);
+                h.PauseFlag = false; // as ClaudeWorker deletes a stale flag when a run starts
                 await callbacks!.OnStarted!(WorkerPid, CancellationToken.None);
                 return await (h.WorkerOverrides.TryGetValue(index, out var behaviour) ? behaviour
                     : ReportsModel(index == 0 ? implementerModels : h.FixerModels))(call);
             }
 
             public Task<bool> StopOrphanAsync(int pid, CancellationToken ct) => Task.FromResult(false);
+
+            public void RequestPause(string workingDirectory) => h.PauseFlag = true;
+
+            public void CancelPause(string workingDirectory) => h.PauseFlag = false;
         }
+
+        /// <summary>The running worker's pause flag (<see cref="IWorker.RequestPause"/>: a Pause, or the stuck detector's interrupt).</summary>
+        public volatile bool PauseFlag;
 
         public async Task<List<LedgerEntry>> Rows() => await Db.LedgerEntries.OrderBy(e => e.Id).ToListAsync();
         public async Task<List<WorkState>> Transitions() => (await Rows()).Where(r => r.Step is null).Select(r => r.State).ToList();

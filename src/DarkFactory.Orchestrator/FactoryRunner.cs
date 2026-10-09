@@ -175,6 +175,7 @@ public static class FactoryRunner
         var sandbox = options.WorkerSandbox;
         var pauseGrace = options.PauseGrace;
         var freezeOptions = options.Freeze;
+        var stuck = options.StuckDetection;
 
         // Sandboxed, the worker user is single-tenant (every helper exit kills all of its processes),
         // so one sandboxed run per machine, taken before anything runs through the helper.
@@ -229,7 +230,9 @@ public static class FactoryRunner
             pauseGrace: pauseGrace,
             gate: gate,
             // Before every dispatch (sc-25387): a frozen factory defers the run.
-            freeze: new FactoryFreeze(Contexts(options), controls, freezeOptions, TimeProvider.System, gate.GitHub));
+            freeze: new FactoryFreeze(Contexts(options), controls, freezeOptions, TimeProvider.System, gate.GitHub),
+            // A looping worker is interrupted at its next tool boundary and its round fails (sc-25388).
+            stuck: stuck);
 
         return await pipeline.RunAsync(storyId, ct);
     }

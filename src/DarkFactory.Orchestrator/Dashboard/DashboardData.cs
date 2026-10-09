@@ -19,10 +19,20 @@ public sealed record PipelineRow(
     long? EpicId = null,
     ControlState Control = ControlState.Running);
 
-/// <summary>A worker session of an item; <see cref="ClaudeSessionId"/> is null until the worker reports it.</summary>
-public sealed record SessionLink(string? ClaudeSessionId, int Attempt, DateTimeOffset StartedAt, DateTimeOffset? EndedAt, string? ExitStatus, decimal? CostUsd)
+/// <summary>
+/// A worker session of an item; <see cref="ClaudeSessionId"/> is null until the worker reports it. <see cref="LastEventAt"/>: when
+/// its latest stream event was stored (read for running sessions only).
+/// </summary>
+public sealed record SessionLink(string? ClaudeSessionId, int Attempt, DateTimeOffset StartedAt, DateTimeOffset? EndedAt, string? ExitStatus, decimal? CostUsd,
+    DateTimeOffset? LastEventAt = null)
 {
     public bool Running => EndedAt is null;
+
+    /// <summary>
+    /// A running session with no event (nor, before its first, since it started) for <paramref name="threshold"/> at
+    /// <paramref name="now"/> is quiet (sc-25388). Only marked on the dashboard: silence alone never interrupts a worker.
+    /// </summary>
+    public bool QuietAt(DateTimeOffset now, TimeSpan threshold) => Running && now - (LastEventAt ?? StartedAt) >= threshold;
 }
 
 public sealed record SessionHeader(long WorkItemId, string ExternalId, string Title, string Repo, SessionLink Session);
@@ -40,11 +50,22 @@ public interface IDashboardData
 
     /// <summary>Every scope's control (factory, epics, items).</summary>
     Task<IReadOnlyList<Control>> ControlsAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<Control>>([]);
+
+    /// <summary>How long a running session may go without an event before the pages mark it quiet (<c>Worker:QuietMinutes</c>).</summary>
+    TimeSpan QuietThreshold => DashboardData.DefaultQuietThreshold;
 }
 
-public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, TimeProvider time) : IDashboardData
+public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, TimeProvider time, TimeSpan? quietThreshold = null) : IDashboardData
 {
+    /// <summary>
+    /// <c>Worker:QuietMinutes</c>'s default: the longest legitimate tool call (<see cref="RunPipeline.LongestToolCall"/>, a long
+    /// <c>dotnet test</c>) streams nothing for that long, so only a silence past it is worth a look.
+    /// </summary>
+    public static readonly TimeSpan DefaultQuietThreshold = RunPipeline.LongestToolCall;
+
     private static readonly WorkState[] Finished = [WorkState.Done, WorkState.Cancelled];
+
+    public TimeSpan QuietThreshold { get; } = quietThreshold ?? DefaultQuietThreshold;
 
     public async Task<IReadOnlyList<Control>> ControlsAsync(CancellationToken ct)
     {
@@ -64,8 +85,9 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
                 .Any(s => controls.GetValueOrDefault(s)?.PausesAt(now) == true) ? ControlState.Paused
             : ControlState.Running;
         var ids = items.Select(i => i.Id).ToList();
-        var sessions = (await db.WorkerSessions.AsNoTracking().Where(s => ids.Contains(s.WorkItemId)).OrderBy(s => s.Id).ToListAsync(ct))
-            .ToLookup(s => s.WorkItemId);
+        var rows = await db.WorkerSessions.AsNoTracking().Where(s => ids.Contains(s.WorkItemId)).OrderBy(s => s.Id).ToListAsync(ct);
+        var lastEvents = await LastEventsAsync(db, rows.Where(s => s.EndedAt is null).Select(s => s.Id), ct);
+        var sessions = rows.ToLookup(s => s.WorkItemId);
         var links = (await db.LedgerEntries.AsNoTracking()
                 .Where(e => ids.Contains(e.WorkItemId) && e.Step == RunPipeline.Steps.Linked)
                 .OrderBy(e => e.Id)
@@ -77,7 +99,7 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
                 PullRequestUrl(links.GetValueOrDefault(i.Id)),
                 // Spend per item (E9, reporting only): the sum of its sessions' router costs.
                 sessions[i.Id].Any(s => s.CostUsd is not null) ? sessions[i.Id].Sum(s => s.CostUsd ?? 0) : null,
-                sessions[i.Id].Select(Link).ToList(),
+                sessions[i.Id].Select(s => Link(s, lastEvents.GetValueOrDefault(s.Id))).ToList(),
                 i.EpicId,
                 ControlOf(i)))
             .ToList();
@@ -92,10 +114,27 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
             return null;
         }
         var item = await db.WorkItems.AsNoTracking().SingleAsync(i => i.Id == session.WorkItemId, ct);
-        return new SessionHeader(item.Id, item.ExternalId, item.Title, item.Repo, Link(session));
+        var lastEvents = await LastEventsAsync(db, session.EndedAt is null ? [session.Id] : [], ct);
+        return new SessionHeader(item.Id, item.ExternalId, item.Title, item.Repo, Link(session, lastEvents.GetValueOrDefault(session.Id)));
     }
 
-    private static SessionLink Link(WorkerSession s) => new(s.ClaudeSessionId, s.Attempt, s.StartedAt, s.EndedAt, s.ExitStatus, s.CostUsd);
+    /// <summary>When each of <paramref name="sessionIds"/>' latest event was stored (its highest sequence: the unique index).</summary>
+    private static async Task<Dictionary<long, DateTimeOffset>> LastEventsAsync(LedgerDbContext db, IEnumerable<long> sessionIds, CancellationToken ct)
+    {
+        var last = new Dictionary<long, DateTimeOffset>();
+        foreach (var id in sessionIds)
+        {
+            if (await db.SessionEvents.AsNoTracking().Where(e => e.WorkerSessionId == id).OrderByDescending(e => e.Sequence)
+                    .Select(e => (DateTimeOffset?)e.ReceivedAt).FirstOrDefaultAsync(ct) is { } at)
+            {
+                last[id] = at;
+            }
+        }
+        return last;
+    }
+
+    private static SessionLink Link(WorkerSession s, DateTimeOffset? lastEventAt) =>
+        new(s.ClaudeSessionId, s.Attempt, s.StartedAt, s.EndedAt, s.ExitStatus, s.CostUsd, s.EndedAt is null ? lastEventAt : null);
 
     /// <summary>The <c>linked</c> checkpoint's detail is "&lt;PR url&gt; &lt;branch url&gt;".</summary>
     private static string? PullRequestUrl(string? linkedDetail) =>
