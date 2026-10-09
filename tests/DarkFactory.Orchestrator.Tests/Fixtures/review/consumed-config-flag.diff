@@ -1,3 +1,12 @@
+diff --git a/README.md b/README.md
+index 1e7a3c9..5b20d4f 100644
+--- a/README.md
++++ b/README.md
+@@ -14,3 +14,4 @@ Settings are read from the `WordCount` configuration section.
+ | Key | Default | Effect |
+ | --- | --- | --- |
+ | `WordCount:CountHyphenatedAsOne` | `true` | A hyphenated word (`well-known`) counts as one word. |
++| `WordCount:IgnoreBlankInput` | `true` | Blank input (only spaces) counts as zero words and runs of spaces do not count as extra words; `false` keeps the previous count. |
 diff --git a/src/WordCount/WordCountOptions.cs b/src/WordCount/WordCountOptions.cs
 index 4c29f62..a1d07be 100644
 --- a/src/WordCount/WordCountOptions.cs
