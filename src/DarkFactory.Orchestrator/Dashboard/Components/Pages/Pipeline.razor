@@ -23,10 +23,23 @@
     <ul class="error item-errors">
         @foreach (var (story, error) in itemErrors.OrderBy(e => e.Key))
         {
-            <li data-story="@story"><span class="id">@StoryId.Format(story)</span> failed @error.Count
+            <li data-story="@story"><span class="id">@story</span> failed @error.Count
                 @(error.Count == 1 ? "run" : "runs") in a row before its pipeline started (last at @error.At.ToString("u")): @error.Message@(error.GaveUp is { } gaveUp ? $" — {gaveUp}" : "")</li>
         }
     </ul>
+}
+@if (Freeze is { } freeze)
+{
+    <div class="controls freeze error" data-scope="@ControlScope.Freeze">
+        <span>Factory frozen: <span class="freeze-trigger">@freeze.Reason</span> — <span class="freeze-detail">@freeze.Detail</span>
+            (since @freeze.ChangedAt.ToString("u")). New work is deferred and running workers stop at their next tool call.
+            Continue clears it; only what happens after that can freeze the factory again.</span>
+        <ControlButton Action="continue" Scope="@ControlScope.Freeze" />
+    </div>
+}
+@if (Intake.DeferredRun is { } deferredRun)
+{
+    <p class="error deferred">Deferred (last at @deferredRun.At.ToString("u")): @deferredRun.Message</p>
 }
 @if (UsagePause is { } usage)
 {
@@ -68,7 +81,13 @@ else
             {
                 <tr @key="row.Id" data-item="@row.Id">
                     <td><span class="id">@row.ExternalId</span> @row.Title</td>
-                    <td class="state">@row.State</td>
+                    <td class="state">@row.State
+                        @if (row.FailedCloseout is { } closeout)
+                        {
+                            <span class="error closeout-failed">closeout not posted (attempt @closeout.Attempts of @RunPipeline.MaxCloseoutAttempts;
+                                @(row.CloseoutRetrying ? "retried on the next poll" : "not retried again: post it by hand")): @closeout.LastFailure</span>
+                        }
+                    </td>
                     <td>@row.Repo</td>
                     <td class="pr">
                         @if (row.PullRequestUrl is { } pr)
@@ -81,11 +100,13 @@ else
                         }
                     </td>
                     <td class="elapsed">@Format.Elapsed(Time.GetUtcNow() - row.CreatedAt)</td>
-                    <td class="cost">@Format.Cost(row.CostUsd)</td>
+                    <td class="cost">@Format.ItemCost(row.CostUsd, row.Sessions)</td>
                     <td class="sessions">
                         @foreach (var s in row.Sessions.Where(s => s.ClaudeSessionId is not null))
                         {
-                            <a href="sessions/@Uri.EscapeDataString(s.ClaudeSessionId!)">#@s.Attempt@(s.Running ? " (live)" : "")</a>
+                            var quiet = s.QuietAt(Time.GetUtcNow(), Data.QuietThreshold);
+                            <a href="sessions/@Uri.EscapeDataString(s.ClaudeSessionId!)" class="@(quiet ? "quiet" : null)"
+                               title="@(quiet ? $"no event for {Format.Elapsed(Time.GetUtcNow() - (s.LastEventAt ?? s.StartedAt))}" : null)">#@s.Attempt@(s.Running ? (quiet ? " (live, quiet)" : " (live)") : "")</a>
                         }
                     </td>
                     <td class="control">
@@ -105,14 +126,42 @@ else
         </tbody>
     </table>
 }
+@if (_metricsStale)
+{
+    <p class="error metrics-error">Could not compute the metrics; showing the last known values.</p>
+}
+@if (_metrics is { Count: > 0 } metrics)
+{
+    <h2>Metrics</h2>
+    <table class="metrics">
+        <thead>
+            <tr><th>Metric</th><th>Value</th><th>Over</th></tr>
+        </thead>
+        <tbody>
+            @foreach (var metric in metrics)
+            {
+                <tr data-metric="@metric.Name">
+                    <td>@metric.Name</td>
+                    <td class="@(metric.Value is null ? "value muted" : "value")">@metric.Display</td>
+                    <td class="muted">@metric.Note</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+    <p class="muted">From the ledger's executed results only; sandbox and demo items are left out.</p>
+}
 
 @code {
     private readonly CancellationTokenSource _cts = new();
     private IReadOnlyList<PipelineRow>? _rows;
+    private IReadOnlyList<Metric>? _metrics;
     private IReadOnlyDictionary<string, Control> _controls = new Dictionary<string, Control>();
 
     /// <summary>Whether this scope's own control (not an enclosing one) pauses it: Continue clears exactly that.</summary>
     private bool Paused(string scope) => _controls.GetValueOrDefault(scope)?.State == ControlState.Paused;
+
+    /// <summary>The factory's freeze while it holds (until a human's Continue).</summary>
+    private Control? Freeze => _controls.GetValueOrDefault(ControlScope.Freeze) is { State: not ControlState.Running } c ? c : null;
 
     /// <summary>The factory's usage pause while it is in effect (it lifts by itself at its resume time).</summary>
     private Control? UsagePause => _controls.GetValueOrDefault(ControlScope.Usage) is { } c && c.PausesAt(Time.GetUtcNow()) ? c : null;
@@ -124,17 +173,30 @@ else
     private bool _loading;
     private bool _again;
     private bool _stale;
+    private bool _metricsStale;
 
     protected override async Task OnInitializedAsync()
     {
         // Subscribe before the first read, so no change between the two is missed.
         Changes.Changed += OnChanged;
         Intake.Changed += OnIntakeChanged;
-        _tick = Time.CreateTimer(_ => _ = InvokeAsync(StateHasChanged), null, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
+        // Elapsed times move on; a running session's last event is read again (stream events are not item changes), so a
+        // session that went quiet, or spoke again, shows it.
+        _tick = Time.CreateTimer(_ => _ = InvokeAsync(OnTickAsync), null, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
         await ReloadAsync();
     }
 
     private void OnChanged(long? workItemId) => _ = InvokeAsync(ReloadAsync);
+
+    private Task OnTickAsync()
+    {
+        if (_rows?.Any(r => r.Sessions.Any(s => s.Running)) == true)
+        {
+            return ReloadAsync();
+        }
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
 
     private void OnIntakeChanged() => _ = InvokeAsync(StateHasChanged);
 
@@ -155,6 +217,7 @@ else
                 _rows = await Data.ActiveItemsAsync(_cts.Token);
                 _controls = (await Data.ControlsAsync(_cts.Token)).ToDictionary(c => c.Scope);
                 _stale = false;
+                await ReloadMetricsAsync();
             }
             while (_again);
         }
@@ -171,6 +234,20 @@ else
             _loading = false;
         }
         StateHasChanged();
+    }
+
+    /// <summary>The metrics (computed on their own cadence, <see cref="DashboardData.MetricsAsync"/>): a failure marks only them stale.</summary>
+    private async Task ReloadMetricsAsync()
+    {
+        try
+        {
+            _metrics = await Data.MetricsAsync(_cts.Token);
+            _metricsStale = false;
+        }
+        catch (Exception) when (!_cts.IsCancellationRequested)
+        {
+            _metricsStale = true;
+        }
     }
 
     public void Dispose()

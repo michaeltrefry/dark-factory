@@ -16,6 +16,9 @@ public interface IPullRequests
     /// Nothing is closed, merged or deleted. Returns the URLs of the head's open PRs, drafts already or not.
     /// </summary>
     Task<IReadOnlyList<string>> ConvertOpenToDraftAsync(RepoRef repo, string head, CancellationToken ct);
+
+    /// <summary>Replaces the description of the PR at <paramref name="pullUrl"/> (the factory's ledger report, as the item moves on).</summary>
+    Task UpdateBodyAsync(RepoRef repo, string pullUrl, string body, CancellationToken ct);
 }
 
 /// <summary>Opens pull requests with a repo-scoped installation token.</summary>
@@ -38,6 +41,20 @@ public sealed class GitHubPullRequests(HttpClient http, GitHubApp app) : IPullRe
         }
         await GitHubApp.EnsureSuccess(response, "create pull request", ct);
         return (await response.Content.ReadFromJsonAsync<PullDto>(ct))!.HtmlUrl;
+    }
+
+    public async Task UpdateBodyAsync(RepoRef repo, string pullUrl, string body, CancellationToken ct)
+    {
+        var (pullRepo, number) = GitHubGate.ParsePullUrl(pullUrl);
+        if (!string.Equals(pullRepo.FullName, repo.FullName, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException($"{pullUrl} is not a pull request of {repo}.");
+        }
+        var token = (await app.CreateInstallationTokenAsync(repo, ct)).Token;
+        using var update = GitHubApp.Request(HttpMethod.Patch, $"repos/{repo.Owner}/{repo.Name}/pulls/{number}", "Bearer", token);
+        update.Content = JsonContent.Create(new { body });
+        using var response = await http.SendAsync(update, ct);
+        await GitHubApp.EnsureSuccess(response, "update pull request description", ct);
     }
 
     public async Task<IReadOnlyList<string>> ConvertOpenToDraftAsync(RepoRef repo, string head, CancellationToken ct)

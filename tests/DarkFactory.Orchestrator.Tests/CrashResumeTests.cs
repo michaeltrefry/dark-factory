@@ -31,9 +31,10 @@ public sealed class CrashResumeTests : IAsyncLifetime
 
     public async ValueTask DisposeAsync()
     {
-        foreach (var pid in new[] { Pids, FirstRun }.Where(File.Exists).SelectMany(File.ReadAllLines))
+        // Each recorded with its start time by the process itself, so a pid reused since is never signalled.
+        foreach (var record in new[] { Pids, FirstRun }.Where(File.Exists).SelectMany(File.ReadAllLines))
         {
-            TryKill(int.Parse(pid));
+            OwnProcess.Parse(record).KillIfStillRunning();
         }
         if (_db is not null)
         {
@@ -43,7 +44,7 @@ public sealed class CrashResumeTests : IAsyncLifetime
 
     private string Pids => Path.Combine(_dir, "worker.pids");
     private string Invocations => Path.Combine(_dir, "invocations.log");
-    /// <summary>The first (orphaned) worker's pid and its child's.</summary>
+    /// <summary>The first (orphaned) worker's and its child's "pid|start" records.</summary>
     private string FirstRun => Path.Combine(_dir, "first-run.pids");
 
     [Fact]
@@ -56,17 +57,18 @@ public sealed class CrashResumeTests : IAsyncLifetime
         // Run 1: the worker starts, streams its session id, then works silently; the orchestrator dies.
         using (var first = StartHost())
         {
+            var host = OwnProcess.Of(first);
             // Killed as soon as the ledger names the session, whether or not its first event is stored yet.
             await WaitForAsync(async () => (await Rows()).Any(r => r.Step == RunPipeline.Steps.Session), first, "session checkpoint", ct);
-            first.Kill(); // SIGKILL
+            host.KillIfStillRunning(); // SIGKILL
             await first.WaitForExitAsync(ct);
         }
         var crashed = await Rows();
         Assert.Equal(WorkState.Implement, crashed.Last(r => r.Step is null).State);
         Assert.Equal(Session, crashed.Single(r => r.Step == RunPipeline.Steps.Session).ClaudeSessionId);
-        var orphan = File.ReadAllLines(FirstRun).Select(int.Parse).ToArray();
-        Assert.Equal(orphan[0].ToString(), crashed.Single(r => r.Step == RunPipeline.Steps.WorkerStarted).Detail);
-        Assert.All(orphan, pid => Assert.True(IsAlive(pid), $"orphan {pid} should outlive the orchestrator"));
+        var orphan = File.ReadAllLines(FirstRun).Select(OwnProcess.Parse).ToArray();
+        Assert.Equal(orphan[0].Pid.ToString(), crashed.Single(r => r.Step == RunPipeline.Steps.WorkerStarted).Detail);
+        Assert.All(orphan, o => Assert.True(o.IsAlive, $"orphan {o.Pid} should outlive the orchestrator"));
 
         // Run 2: restart against the same ledger at once; it must stop the orphan before resuming.
         using (var second = StartHost())
@@ -79,9 +81,12 @@ public sealed class CrashResumeTests : IAsyncLifetime
         Assert.Equal(["fresh", "orphans gone", $"resume {Session}"], File.ReadAllLines(Invocations));
         var rows = await Rows();
         Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Review], rows.Where(r => r.Step is null).Select(r => r.State));
+        // The kill may land before or after the first run's model-class row; the resumed run records its own (E8, an unestimated story: mid).
         Assert.Equal(["claimed", "worker-started", "session", "orphan-killed", "worker-started", "worker-done", "pushed", "linked"],
-            rows.Where(r => r.Step is not null).Select(r => r.Step));
-        Assert.Equal($"pid {orphan[0]}", rows.Single(r => r.Step == RunPipeline.Steps.OrphanKilled).Detail);
+            rows.Where(r => r.Step is not null && r.Step != RunPipeline.Steps.ModelClass).Select(r => r.Step));
+        var resumedClass = rows.SkipWhile(r => r.Step != RunPipeline.Steps.OrphanKilled).Single(r => r.Step == RunPipeline.Steps.ModelClass);
+        Assert.Equal((Session, "mid"), (resumedClass.ClaudeSessionId, resumedClass.Detail));
+        Assert.Equal($"pid {orphan[0].Pid}", rows.Single(r => r.Step == RunPipeline.Steps.OrphanKilled).Detail);
         Assert.Equal(Session, rows[^1].ClaudeSessionId);
         var pr = Assert.Single(File.ReadAllLines(Path.Combine(_dir, "prs.log")));
         Assert.Equal($"factory/sc-{Story}\thttps://github.com/acme/widgets/pull/1", pr);
@@ -165,12 +170,15 @@ public sealed class CrashResumeTests : IAsyncLifetime
     private void WriteFakeClaude()
     {
         var script = Path.Combine(_dir, "fake-claude.sh");
-        File.WriteAllText(script, $$"""
+        SandboxSupport.ExecutableAt(script, $$"""
             #!/bin/sh
-            echo $$ >> "{{Pids}}"
+            echo {{OwnProcess.ShellRecord("$$")}} >> "{{Pids}}"
             if printf '%s ' "$@" | grep -q -- '--resume {{Session}}'; then
               alive=""
-              for p in $(cat "{{FirstRun}}"); do kill -0 "$p" 2>/dev/null && alive="$alive $p"; done
+              while IFS='|' read -r p start; do
+                cur=$(/bin/ps -o lstart= -p "$p" | /usr/bin/awk '{ $1 = $1; print }')
+                if [ -n "$cur" ] && [ "$cur" = "$start" ]; then alive="$alive $p"; fi
+              done < "{{FirstRun}}"
               if [ -z "$alive" ]; then echo "orphans gone" >> "{{Invocations}}"; else echo "orphans alive:$alive" >> "{{Invocations}}"; fi
               echo "resume {{Session}}" >> "{{Invocations}}"
               echo '{"type":"system","subtype":"init","session_id":"{{Session}}"}'
@@ -181,11 +189,10 @@ public sealed class CrashResumeTests : IAsyncLifetime
             echo fresh >> "{{Invocations}}"
             echo wip > before-crash.txt
             sleep 600 &
-            printf '%s\n%s\n' $$ $! > "{{FirstRun}}"
+            { echo {{OwnProcess.ShellRecord("$$")}}; echo {{OwnProcess.ShellRecord("$!")}}; } > "{{FirstRun}}"
             echo '{"type":"system","subtype":"init","session_id":"{{Session}}"}'
             wait
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
     }
 
     private static async Task WaitForAsync(Func<Task<bool>> condition, Process? host, string what, CancellationToken ct)
@@ -199,25 +206,6 @@ public sealed class CrashResumeTests : IAsyncLifetime
             }
             Assert.True(DateTime.UtcNow < deadline, $"timed out waiting for {what}");
             await Task.Delay(100, ct);
-        }
-    }
-
-    private static bool IsAlive(int pid)
-    {
-        using var p = Process.Start(new ProcessStartInfo("kill", ["-0", pid.ToString()]) { RedirectStandardError = true })!;
-        p.WaitForExit();
-        return p.ExitCode == 0;
-    }
-
-    private static void TryKill(int pid)
-    {
-        try
-        {
-            using var p = Process.GetProcessById(pid);
-            p.Kill();
-        }
-        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
-        {
         }
     }
 

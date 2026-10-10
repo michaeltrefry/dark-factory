@@ -15,7 +15,17 @@ public sealed record ControlResult(bool Ok, string Message)
 /// <summary>Stops one item now if no run holds it (<see cref="ItemStopper.StopAsync"/>); returns what happened.</summary>
 public interface IItemStops
 {
+    /// <summary>Stops one Shortcut story.</summary>
     Task<ControlResult> StopAsync(int storyId, CancellationToken ct);
+
+    /// <summary>
+    /// Stops one item of any source. The default stops a Shortcut story with <see cref="StopAsync(int, CancellationToken)"/> and
+    /// leaves another source's item to its next run (its Stopping control is already set), saying so.
+    /// </summary>
+    Task<ControlResult> StopAsync(ItemRef item, CancellationToken ct) =>
+        item.Naming == ItemNaming.Shortcut
+            ? StopAsync(item.Id, ct)
+            : Task.FromResult(new ControlResult(true, $"{item}: stop requested; its next run stops it."));
 }
 
 /// <summary>
@@ -37,6 +47,10 @@ public sealed class ControlActions(
         {
             return UsageOnlyContinues;
         }
+        if (scope == ControlScope.Freeze)
+        {
+            return FreezeOnlyContinues;
+        }
         await controls.SetAsync(scope, ControlState.Paused, by, ct);
         var message = $"{scope} paused: nothing new starts there, and running workers stop at their next tool call.";
         if (ControlScope.EpicOf(scope) is not { } epic)
@@ -54,13 +68,21 @@ public sealed class ControlActions(
 
     public async Task<ControlResult> ContinueAsync(string scope, string by, CancellationToken ct)
     {
-        if ((await controls.GetAsync(scope, ct))?.State == ControlState.Stopping)
+        var row = await controls.GetAsync(scope, ct);
+        if (row?.State == ControlState.Stopping)
         {
             return new ControlResult(false, $"{scope} is being stopped; it cannot be continued.");
+        }
+        if (scope == ControlScope.Freeze && row?.State is null or ControlState.Running)
+        {
+            // A Continue resets what the triggers count from: one with no freeze to clear would silently discard that evidence.
+            return new ControlResult(false, "the factory is not frozen");
         }
         await controls.SetAsync(scope, ControlState.Running, by, ct);
         return new ControlResult(true, scope == ControlScope.Usage
             ? "usage pause lifted early: work starts again now (a worker that hits the limit again pauses the factory once more)."
+            : scope == ControlScope.Freeze
+            ? "freeze cleared: work starts again now. Only what happens from now on (new escalations, merges, fix rounds) can freeze the factory again."
             : $"{scope} continued.");
     }
 
@@ -74,9 +96,13 @@ public sealed class ControlActions(
         {
             return UsageOnlyContinues;
         }
-        var stories = new List<int>();
+        if (scope == ControlScope.Freeze)
+        {
+            return FreezeOnlyContinues;
+        }
+        var stories = new List<ItemRef>();
         var unknown = new List<string>();
-        if (ControlScope.ItemStory(scope) is { } story)
+        if (ControlScope.ItemOf(scope) is { } story)
         {
             stories.Add(story);
         }
@@ -84,34 +110,36 @@ public sealed class ControlActions(
         {
             var epic = ControlScope.EpicOf(scope);
             await using var db = await contexts.CreateDbContextAsync(ct);
+            // The factory scope stops every source's items; an epic is a Shortcut epic, so only stories are in one.
             var items = await db.WorkItems.AsNoTracking()
-                .Where(i => i.Source == RunPipeline.Source && i.State != WorkState.Done && i.State != WorkState.Cancelled
+                .Where(i => (epic == null || i.Source == RunPipeline.Source) && i.State != WorkState.Done && i.State != WorkState.Cancelled
                     && (epic == null || i.EpicId == epic))
                 .OrderBy(i => i.Id)
-                .Select(i => i.ExternalId)
+                .Select(i => new { i.Source, i.ExternalId })
                 .ToListAsync(ct);
+            var found = items.Select(i => ItemNaming.ParseAny(i.ExternalId) is { } r && r.Naming.Source == i.Source ? r : null).ToList();
             if (epic is { } epicId)
             {
                 // An item is stopped through its own control, so one in the epic is stopped whether or not its epic could be recorded.
                 var resolved = await ResolveUnknownEpicsAsync(epicId, ct);
-                items.AddRange(resolved.InEpic);
+                found.AddRange(resolved.InEpic.Select(e => ItemNaming.Shortcut.TryParse(e, out var id) ? new ItemRef(ItemNaming.Shortcut, id) : null));
                 unknown = resolved.Unknown;
             }
-            stories.AddRange(items.Select(e => StoryId.TryParse(e, out var id) ? id : 0).Where(id => id > 0).Distinct());
+            stories.AddRange(found.OfType<ItemRef>().Distinct());
         }
         var ok = unknown.Count == 0;
         var results = new List<string>();
-        foreach (var id in stories)
+        foreach (var item in stories)
         {
-            await controls.SetAsync(ControlScope.Item(StoryId.Format(id)), ControlState.Stopping, by, ct);
+            await controls.SetAsync(ControlScope.Item(item.ToString()), ControlState.Stopping, by, ct);
             if (stops is null)
             {
-                results.Add($"{StoryId.Format(id)}: stop requested; its next run stops it.");
+                results.Add($"{item}: stop requested; its next run stops it.");
                 continue;
             }
             try
             {
-                var stopped = await stops.StopAsync(id, ct);
+                var stopped = await stops.StopAsync(item, ct);
                 ok &= stopped.Ok;
                 results.Add(stopped.Message);
             }
@@ -119,7 +147,7 @@ public sealed class ControlActions(
             {
                 // The item keeps its Stopping control: the intake loop's next poll (or a retry) finishes the stop.
                 ok = false;
-                results.Add($"{StoryId.Format(id)}: stop NOT finished ({ex.Message}); it stays Stopping and the next poll or `factory stop` retries it.");
+                results.Add($"{item}: stop NOT finished ({ex.Message}); it stays Stopping and the next poll or `factory stop` retries it.");
             }
         }
         if (unknown.Count > 0)
@@ -137,6 +165,10 @@ public sealed class ControlActions(
     /// <summary>The usage pause is set by the factory itself (<see cref="UsagePause"/>); a user may only lift it early.</summary>
     private static readonly ControlResult UsageOnlyContinues =
         new(false, "The usage pause is set and lifted by the factory; it can only be continued early (`factory continue --usage`). Use --factory to pause or stop the whole factory.");
+
+    /// <summary>The freeze is set by the factory itself (<see cref="FactoryFreeze"/>); a human only clears it.</summary>
+    private static readonly ControlResult FreezeOnlyContinues =
+        new(false, "The freeze is set by the factory when a trigger holds; it can only be cleared (`factory continue --freeze`). Use --factory to pause or stop the whole factory.");
 
     private sealed record EpicResolution(List<string> InEpic, List<string> Unknown, List<string> Running);
 

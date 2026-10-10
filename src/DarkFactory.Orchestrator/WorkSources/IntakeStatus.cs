@@ -18,8 +18,9 @@ public sealed record IntakeError(string Message, DateTimeOffset At, int Count, s
 public sealed class IntakeStatus(TimeProvider time)
 {
     private readonly Lock _gate = new();
-    private readonly Dictionary<int, IntakeError> _items = [];
+    private readonly Dictionary<string, IntakeError> _items = [];
     private IntakeError? _factory;
+    private IntakeError? _deferred;
 
     /// <summary>Raised after every change, on the intake loop's thread: handlers must only schedule their work.</summary>
     public event Action? Changed;
@@ -29,10 +30,41 @@ public sealed class IntakeStatus(TimeProvider time)
         get { lock (_gate) { return _factory; } }
     }
 
-    /// <summary>Items whose last runs failed, by story id.</summary>
-    public IReadOnlyDictionary<int, IntakeError> ItemErrors
+    /// <summary>
+    /// The last run the freeze evaluator deferred (outcome <c>deferred</c>, sc-25387), until a run is dispatched again: the message
+    /// names the item and why.
+    /// </summary>
+    public IntakeError? DeferredRun
     {
-        get { lock (_gate) { return new Dictionary<int, IntakeError>(_items); } }
+        get { lock (_gate) { return _deferred; } }
+    }
+
+    public void Deferred(string id, string why)
+    {
+        lock (_gate)
+        {
+            _deferred = new IntakeError($"{id} deferred: {why}", time.GetUtcNow(), (_deferred?.Count ?? 0) + 1);
+        }
+        Raise();
+    }
+
+    public void NotDeferred()
+    {
+        lock (_gate)
+        {
+            if (_deferred is null)
+            {
+                return;
+            }
+            _deferred = null;
+        }
+        Raise();
+    }
+
+    /// <summary>Items whose last runs failed, by external id (e.g. <c>sc-12</c>, <c>gh-3</c>).</summary>
+    public IReadOnlyDictionary<string, IntakeError> ItemErrors
+    {
+        get { lock (_gate) { return new Dictionary<string, IntakeError>(_items); } }
     }
 
     public void FactoryFailed(string message)
@@ -58,7 +90,7 @@ public sealed class IntakeStatus(TimeProvider time)
     }
 
     /// <summary>Records one more failed run of the item; returns how many in a row have failed.</summary>
-    public int ItemFailed(int id, string message)
+    public int ItemFailed(string id, string message)
     {
         int count;
         lock (_gate)
@@ -72,7 +104,7 @@ public sealed class IntakeStatus(TimeProvider time)
     }
 
     /// <summary>The intake loop gave up on the item (escalated, parked or commented); <paramref name="what"/> says how.</summary>
-    public void ItemGaveUp(int id, string what)
+    public void ItemGaveUp(string id, string what)
     {
         lock (_gate)
         {
@@ -85,7 +117,7 @@ public sealed class IntakeStatus(TimeProvider time)
         Raise();
     }
 
-    public void ItemOk(int id)
+    public void ItemOk(string id)
     {
         lock (_gate)
         {

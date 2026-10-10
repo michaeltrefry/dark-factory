@@ -1,0 +1,56 @@
+diff --git a/README.md b/README.md
+index 1e7a3c9..5b20d4f 100644
+--- a/README.md
++++ b/README.md
+@@ -14,3 +14,4 @@ Settings are read from the `WordCount` configuration section.
+ | Key | Default | Effect |
+ | --- | --- | --- |
+ | `WordCount:CountHyphenatedAsOne` | `true` | A hyphenated word (`well-known`) counts as one word. |
++| `WordCount:IgnoreBlankInput` | `true` | Blank input (only spaces) counts as zero words and runs of spaces do not count as extra words; `false` keeps the previous count. |
+diff --git a/src/WordCount/WordCountOptions.cs b/src/WordCount/WordCountOptions.cs
+index 4c29f62..a1d07be 100644
+--- a/src/WordCount/WordCountOptions.cs
++++ b/src/WordCount/WordCountOptions.cs
+@@ -6,4 +6,7 @@ namespace WordCount;
+ public sealed class WordCountOptions(IConfiguration config)
+ {
+     public bool CountHyphenatedAsOne => config.GetValue("WordCount:CountHyphenatedAsOne", true);
++
++    /// <summary>When on (the default), blank input and runs of spaces count as no word; off keeps the previous count.</summary>
++    public bool IgnoreBlankInput => config.GetValue("WordCount:IgnoreBlankInput", true);
+ }
+diff --git a/src/WordCount/WordCounter.cs b/src/WordCount/WordCounter.cs
+index 62e1b4d..d84a5f0 100644
+--- a/src/WordCount/WordCounter.cs
++++ b/src/WordCount/WordCounter.cs
+@@ -5,6 +5,8 @@ public static class WordCounter
+     /// <summary>Counts the space-separated words in <paramref name="text"/>.</summary>
+     public static int Count(string text, WordCountOptions options)
+     {
+-        return text.Split(' ').Length;
++        return options.IgnoreBlankInput
++            ? text.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length
++            : text.Split(' ').Length;
+     }
+ }
+diff --git a/tests/WordCountTests.cs b/tests/WordCountTests.cs
+index 7d0e4a1..b25c9f3 100644
+--- a/tests/WordCountTests.cs
++++ b/tests/WordCountTests.cs
+@@ -9,4 +9,16 @@ public class WordCountTests
+ 
+     [Fact]
+     public void Counts_space_separated_words() => Assert.Equal(3, WordCounter.Count("one two three", Options()));
++
++    [Theory]
++    [InlineData(" ")]
++    [InlineData("   ")]
++    public void Blank_input_counts_as_zero_words_by_default(string text) => Assert.Equal(0, WordCounter.Count(text, Options()));
++
++    [Fact]
++    public void Runs_of_spaces_do_not_count_as_extra_words_by_default() => Assert.Equal(2, WordCounter.Count(" one  two ", Options()));
++
++    [Fact]
++    public void With_IgnoreBlankInput_off_the_previous_count_is_kept() =>
++        Assert.Equal(3, WordCounter.Count("  ", Options(("WordCount:IgnoreBlankInput", "false"))));
+ }

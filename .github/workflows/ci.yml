@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:17
+        image: public.ecr.aws/docker/library/postgres:17
         env:
           POSTGRES_USER: factory
           POSTGRES_PASSWORD: factory
@@ -29,8 +29,9 @@ jobs:
         with:
           dotnet-version: 10.0.x
       - run: dotnet tool restore
-      - run: dotnet build
+      - name: Build (fails on the gateway lint, sc-25390)
+        run: dotnet build
       - name: Apply ledger migrations to a fresh Postgres
         run: dotnet ef database update --project src/DarkFactory.Orchestrator --no-build
-      - name: Test (live acceptance tests skip without FACTORY_E2E=1)
+      - name: Test (incl. the lint's seeded-violation tests and the gate-check coverage; live acceptance tests skip without FACTORY_E2E=1)
         run: dotnet test --no-build

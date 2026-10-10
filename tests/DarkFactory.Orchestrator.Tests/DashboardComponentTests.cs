@@ -110,21 +110,70 @@ public class DashboardComponentTests : BunitContext
         Assert.Empty(cut.FindAll(".item-errors"));
 
         _intake.FactoryFailed("sc-5 could not run: the worker run lock: Another factory run is using /w");
-        _intake.ItemFailed(101, "InvalidOperationException: Shortcut GET stories/101 failed: 404 Not Found");
-        _intake.ItemFailed(101, "InvalidOperationException: Shortcut GET stories/101 failed: 404 Not Found");
-        _intake.ItemGaveUp(101, "escalated");
+        _intake.ItemFailed("sc-101", "InvalidOperationException: Shortcut GET stories/101 failed: 404 Not Found");
+        _intake.ItemFailed("sc-101", "InvalidOperationException: Shortcut GET stories/101 failed: 404 Not Found");
+        _intake.ItemGaveUp("sc-101", "escalated");
 
         cut.WaitForAssertion(() => Assert.Contains("Another factory run", cut.Find(".factory-error").TextContent));
-        var line = cut.Find(".item-errors li[data-story='101']").TextContent;
+        var line = cut.Find(".item-errors li[data-story='sc-101']").TextContent;
         Assert.Contains("sc-101", line);
         Assert.Contains("failed 2", line);
         Assert.Contains("404 Not Found", line);
         Assert.Contains("escalated", line);
 
         _intake.FactoryOk();
-        _intake.ItemOk(101);
+        _intake.ItemOk("sc-101");
         cut.WaitForAssertion(() => Assert.Empty(cut.FindAll(".factory-error")));
         Assert.Empty(cut.FindAll(".item-errors"));
+    }
+
+    [Fact]
+    public void The_pipeline_shows_the_metrics_with_unmeasured_ones_as_not_available()
+    {
+        _data.Rows = [];
+        _data.Metrics = LedgerMetrics.Compute([], MetricsOptions.Default);
+
+        var cut = Render<Pipeline>();
+
+        var rows = cut.FindAll("table.metrics tbody tr");
+        Assert.Equal(6, rows.Count);
+        Assert.All(rows, r => Assert.Equal("N/A", r.QuerySelector(".value")!.TextContent));
+        Assert.Contains("14-day revert rate", cut.Find("tr[data-metric='14-day revert rate']").TextContent);
+        Assert.Contains("sandbox and demo items are left out", cut.Markup);
+    }
+
+    [Fact]
+    public void A_metrics_failure_marks_only_the_metrics_stale_and_the_items_still_show()
+    {
+        _data.Rows = [Row(1, WorkState.Review)];
+        _data.MetricsFails = new InvalidOperationException("metrics query timed out");
+
+        var cut = Render<Pipeline>();
+
+        Assert.Single(cut.FindAll("tr[data-item='1']"));
+        Assert.Empty(cut.FindAll("p.error:not(.metrics-error)"));
+        Assert.Contains("Could not compute the metrics", cut.Find(".metrics-error").TextContent);
+    }
+
+    [Fact]
+    public void A_failed_closeout_shows_on_its_item_with_whether_it_is_retried()
+    {
+        _data.Rows =
+        [
+            Row(1, WorkState.Watch) with { FailedCloseout = new CloseoutStatus(1, false, "failed: Shortcut down") },
+            Row(2, WorkState.Watch) with { FailedCloseout = new CloseoutStatus(RunPipeline.MaxCloseoutAttempts, false, "failed: 413 too large") },
+            Row(3, WorkState.Watch),
+        ];
+
+        var cut = Render<Pipeline>();
+
+        var retrying = cut.Find("tr[data-item='1'] .closeout-failed").TextContent;
+        Assert.Contains("failed: Shortcut down", retrying);
+        Assert.Contains("retried on the next poll", retrying);
+        var given = cut.Find("tr[data-item='2'] .closeout-failed").TextContent;
+        Assert.Contains("failed: 413 too large", given);
+        Assert.Contains("post it by hand", given);
+        Assert.Empty(cut.FindAll("tr[data-item='3'] .closeout-failed"));
     }
 
     private static PipelineRow Row(long id, WorkState state, string? pr = null, decimal? cost = null, params SessionLink[] sessions) =>
@@ -139,22 +188,90 @@ public class DashboardComponentTests : BunitContext
         var cut = Render<Pipeline>();
 
         var cells = cut.FindAll("tr[data-item='1'] td").Select(td => td.TextContent.Trim()).ToList();
-        Assert.Equal(["sc-1 Story 1", "Review", "acme/widgets", "PR", "1h 05m", "$1.50"], cells.Take(6));
+        // s-2 is running and its cost not measured yet: the sum says it covers one of the two sessions (E5).
+        Assert.Equal(["sc-1 Story 1", "Review", "acme/widgets", "PR", "1h 05m", "$1.50 of 1/2 measured"], cells.Take(6));
         Assert.Equal("https://github.com/acme/widgets/pull/9", cut.Find("td.pr a").GetAttribute("href"));
         Assert.Equal(["sessions/s-1", "sessions/s-2"], cut.FindAll("td.sessions a").Select(a => a.GetAttribute("href")));
         Assert.Equal("#2 (live)", cut.FindAll("td.sessions a")[1].TextContent);
     }
 
     [Fact]
-    public void A_zero_cost_shows_as_zero_dollars_and_an_unknown_cost_as_a_dash()
+    public void A_running_session_silent_for_the_quiet_threshold_is_marked_quiet_and_unmarked_once_it_speaks_again()
     {
-        // A session served on the router's local model costs $0, which is known spend, not missing spend.
-        _data.Rows = [Row(1, WorkState.Review, cost: 0m), Row(2, WorkState.Review)];
+        var time = (FakeTimeProvider)Services.GetRequiredService<TimeProvider>();
+        var live = new SessionLink("s-2", 2, Now.AddMinutes(-30), null, null, null, LastEventAt: Now.AddMinutes(-9));
+        _data.Rows = [Row(1, WorkState.Implement, sessions: live)];
+
+        var cut = Render<Pipeline>();
+        Assert.Equal("#2 (live)", cut.Find("td.sessions a").TextContent);
+
+        // Two quiet minutes later (the page re-reads a running session's last event on its tick; stream events are not item changes).
+        time.Advance(TimeSpan.FromMinutes(2));
+        cut.WaitForAssertion(() => Assert.Equal("#2 (live, quiet)", cut.Find("td.sessions a").TextContent));
+        Assert.Equal("quiet", cut.Find("td.sessions a").GetAttribute("class"));
+        Assert.Equal("no event for 11m 00s", cut.Find("td.sessions a").GetAttribute("title"));
+
+        // It speaks again: the next tick's read shows it.
+        _data.Rows = [Row(1, WorkState.Implement, sessions: live with { LastEventAt = time.GetUtcNow() })];
+        time.Advance(TimeSpan.FromSeconds(15));
+        cut.WaitForAssertion(() => Assert.Equal("#2 (live)", cut.Find("td.sessions a").TextContent));
+
+        // A finished session is never quiet.
+        _data.Rows = [Row(1, WorkState.Review, sessions: live with { EndedAt = Now, ExitStatus = "stuck", LastEventAt = null })];
+        _changes.Notify(1);
+        cut.WaitForAssertion(() => Assert.Equal("#2", cut.Find("td.sessions a").TextContent));
+    }
+
+    [Fact]
+    public void Worker_QuietMinutes_sets_when_a_session_counts_as_quiet()
+    {
+        _data.Quiet = TimeSpan.FromMinutes(20);
+        _data.Rows = [Row(1, WorkState.Implement, sessions: new SessionLink("s-2", 2, Now.AddMinutes(-30), null, null, null, LastEventAt: Now.AddMinutes(-15)))];
+
+        Assert.Equal("#2 (live)", Render<Pipeline>().Find("td.sessions a").TextContent);
+
+        _data.Quiet = TimeSpan.FromMinutes(10);
+        Assert.Equal("#2 (live, quiet)", Render<Pipeline>().Find("td.sessions a").TextContent);
+    }
+
+    [Fact]
+    public void The_session_page_marks_a_silent_running_session_quiet_until_an_event_arrives()
+    {
+        var time = (FakeTimeProvider)Services.GetRequiredService<TimeProvider>();
+        _data.Header = new SessionHeader(1, "sc-1", "Story 1", "acme/widgets",
+            new SessionLink(TranscriptLines.Sid, 1, Now.AddMinutes(-40), null, null, null, LastEventAt: Now.AddMinutes(-12)));
+        _viewers.Backlog = [TranscriptLines.Event(0)]; // stored long ago (ReceivedAt is the epoch)
+
+        var cut = Render<Session>(p => p.Add(x => x.SessionId, TranscriptLines.Sid));
+        cut.WaitForAssertion(() => Assert.Equal("quiet: no event for 12m 00s", cut.Find(".quiet").TextContent));
+        Assert.Contains("running (live)", cut.Find(".status").TextContent);
+        Assert.EndsWith("cost N/A", cut.Find(".meta").TextContent.Trim()); // not measured yet: N/A, never a dash or $0 (E5)
+
+        _viewers.Send([new SessionEventMessage(2, "assistant", "text", TranscriptLines.All[1], time.GetUtcNow())]);
+        cut.WaitForAssertion(() => Assert.Empty(cut.FindAll(".quiet")));
+
+        // Silent again past the threshold: the page's tick marks it without any new read.
+        time.Advance(TimeSpan.FromMinutes(10));
+        cut.WaitForAssertion(() => Assert.Equal("quiet: no event for 10m 00s", cut.Find(".quiet").TextContent));
+    }
+
+    [Fact]
+    public void A_zero_cost_shows_as_zero_dollars_an_unmeasured_one_as_n_a_and_a_partial_sum_says_what_it_covers()
+    {
+        // A session served on the router's local model costs $0, which is known spend, not missing spend (E5).
+        _data.Rows =
+        [
+            Row(1, WorkState.Review, null, 0m, new SessionLink("s-1", 1, Now, Now, "succeeded", 0m)),
+            Row(2, WorkState.Review, null, null, new SessionLink("s-2", 1, Now, Now, "failed", null)),
+            Row(3, WorkState.Review, null, 0.4m, new SessionLink("s-3", 1, Now, Now, "succeeded", 0.4m), new SessionLink("s-4", 2, Now, Now, "failed", null),
+                new SessionLink("s-5", 3, Now, Now, "succeeded", null)),
+        ];
 
         var cut = Render<Pipeline>();
 
         Assert.Equal("$0.00", cut.Find("tr[data-item='1'] td.cost").TextContent);
-        Assert.Equal("—", cut.Find("tr[data-item='2'] td.cost").TextContent);
+        Assert.Equal("N/A", cut.Find("tr[data-item='2'] td.cost").TextContent);
+        Assert.Equal("$0.40 of 1/3 measured", cut.Find("tr[data-item='3'] td.cost").TextContent);
     }
 
     [Fact]
@@ -179,6 +296,30 @@ public class DashboardComponentTests : BunitContext
         time.Advance(TimeSpan.FromMinutes(30));
         _changes.Notify(null);
         cut.WaitForAssertion(() => Assert.Empty(cut.FindAll(".usage-pause")));
+    }
+
+    [Fact]
+    public void The_freeze_shows_as_a_banner_with_its_trigger_and_reason_and_a_continue_until_a_human_clears_it()
+    {
+        _data.Rows = [Row(1, WorkState.Paused) with { Control = ControlState.Paused }];
+        _data.Controls = [new Control
+        {
+            Scope = ControlScope.Freeze, State = ControlState.Paused, ChangedBy = FreezeTrigger.By, ChangedAt = Now,
+            Reason = FreezeTrigger.MainRed, Detail = "main of michaeltrefry/dark-factory-sandbox is red",
+        }];
+        _intake.Deferred("sc-2", "factory frozen (main-red): main of michaeltrefry/dark-factory-sandbox is red");
+
+        var cut = Render<Pipeline>();
+
+        var banner = cut.Find($".freeze[data-scope='{ControlScope.Freeze}']");
+        Assert.Equal(FreezeTrigger.MainRed, banner.QuerySelector(".freeze-trigger")!.TextContent);
+        Assert.Equal("main of michaeltrefry/dark-factory-sandbox is red", banner.QuerySelector(".freeze-detail")!.TextContent);
+        Assert.Equal(ControlScope.Freeze, banner.QuerySelector("form[data-action='continue']")!.GetAttribute("data-scope"));
+        Assert.Contains("sc-2 deferred: factory frozen (main-red)", cut.Find(".deferred").TextContent);
+
+        _data.Controls = [new Control { Scope = ControlScope.Freeze, State = ControlState.Running, ChangedBy = "dashboard", ChangedAt = Now }];
+        _changes.Notify(null);
+        cut.WaitForAssertion(() => Assert.Empty(cut.FindAll(".freeze")));
     }
 
     [Fact]
@@ -313,6 +454,9 @@ public class DashboardComponentTests : BunitContext
         public SessionHeader? Header { get; set; }
         public int Reads;
         public IReadOnlyList<Control> Controls { get; set; } = [];
+        public TimeSpan Quiet { get; set; } = DashboardData.DefaultQuietThreshold;
+
+        public TimeSpan QuietThreshold => Quiet;
 
         public Task<IReadOnlyList<Control>> ControlsAsync(CancellationToken ct) => Task.FromResult(Controls);
 
@@ -324,6 +468,13 @@ public class DashboardComponentTests : BunitContext
 
         public Task<SessionHeader?> SessionAsync(string claudeSessionId, CancellationToken ct) =>
             Task.FromResult(Header?.Session.ClaudeSessionId == claudeSessionId ? Header : null);
+
+        public IReadOnlyList<Metric> Metrics { get; set; } = [];
+
+        public Exception? MetricsFails { get; set; }
+
+        public Task<IReadOnlyList<Metric>> MetricsAsync(CancellationToken ct) =>
+            MetricsFails is { } fails ? Task.FromException<IReadOnlyList<Metric>>(fails) : Task.FromResult(Metrics);
     }
 
     private sealed class FakeViewers : ISessionViewers

@@ -1,5 +1,6 @@
 using DarkFactory.Orchestrator.Dashboard;
 using DarkFactory.Orchestrator.Dashboard.Components;
+using DarkFactory.Orchestrator.Gateway;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Router;
 using DarkFactory.Orchestrator.Sessions;
@@ -99,7 +100,10 @@ public static class FactoryHost
         services.AddRazorComponents().AddInteractiveServerComponents();
         services.AddDashboardAuth(options);
         services.TryAddSingleton(TimeProvider.System);
-        services.AddSingleton<IDashboardData, DashboardData>();
+        var quiet = options.QuietThreshold; // read now: an invalid Worker:QuietMinutes refuses to start the host
+        var metrics = options.Metrics;
+        services.AddSingleton<IDashboardData>(sp =>
+            new DashboardData(sp.GetRequiredService<IDbContextFactory<LedgerDbContext>>(), sp.GetRequiredService<TimeProvider>(), quiet, metrics));
         // The intake loop's last errors (E10); empty on a host without one.
         services.TryAddSingleton(sp => new IntakeStatus(sp.GetRequiredService<TimeProvider>()));
         // The dashboard's only writes besides login/logout (E8): Pause, Continue and Stop.
@@ -140,7 +144,7 @@ public static class FactoryHost
             options.LedgerConnectionString, sp.GetRequiredService<SessionBroadcaster>(), Console.Out, pipeline: sp.GetRequiredService<PipelineChanges>()));
         services.AddHostedService(sp => sp.GetRequiredService<SessionEventRelay>());
         services.AddSingleton<ISessionCostSource>(_ =>
-            new RouterClient(new HttpClient { BaseAddress = options.RouterBaseUrl }, options.RouterKey));
+            new RouterClient(OutboundHttp.RouterApi(options.RouterBaseUrl), options.RouterKey));
         services.AddSingleton(sp => new SessionRecorder(
             sp.GetRequiredService<IDbContextFactory<LedgerDbContext>>(),
             sp.GetRequiredService<ISessionCostSource>(),

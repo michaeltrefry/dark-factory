@@ -1,4 +1,3 @@
-using System.Text;
 using System.Text.Json;
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
@@ -31,11 +30,11 @@ public class AppTokenPushTests
         var appKey = Harness.RequireSecret(o => o.GitHubAppPrivateKeyPem);
         var ct = TestContext.Current.CancellationToken;
 
-        using var github = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        using var github = OutboundHttp.GitHubApi();
         var app = new GitHubApp(github, appId, appKey, TimeProvider.System);
         var token = await app.CreateInstallationTokenAsync(Sandbox, ct);
         Assert.True(token.ExpiresAt <= DateTimeOffset.UtcNow + GitHubApp.MaxTokenLifetime + TimeSpan.FromMinutes(1));
-        var auth = TokenEnvironment(token.Token);
+        var auth = GitRemoteWrites.Credentials(token.Token);
 
         // GitHub's own view of the token's scope: exactly the sandbox, whatever else the App is installed on.
         using (var scope = GitHubApp.Request(HttpMethod.Get, "installation/repositories", "Bearer", token.Token))
@@ -50,17 +49,17 @@ public class AppTokenPushTests
         }
 
         var dir = Directory.CreateTempSubdirectory("df-e2e-push-").FullName;
-        await GitWorkspace.RunGitAsync(dir, auth, ["clone", "--depth", "1", GitWorkspace.GitHubRemote(Sandbox), "repo"], ct);
+        await GitWorkspace.RunGitAsync(dir, auth, GitRemoteReads.Clone(GitRemoteReads.GitHubRemote(Sandbox), "repo", shallow: true), ct);
         var repo = Path.Combine(dir, "repo");
         await File.WriteAllTextAsync(Path.Combine(repo, "e2e-push-probe.txt"), $"{Guid.NewGuid()}\n", ct);
         await GitWorkspace.RunGitAsync(repo, null, ["add", "-A"], ct);
         await GitWorkspace.RunGitAsync(repo, null, ["-c", "user.name=dark-factory-e2e", "-c", "user.email=e2e@invalid", "commit", "-m", "e2e push probe"], ct);
 
         var branch = $"refs/heads/factory/e2e-push-{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}";
-        await GitWorkspace.RunGitAsync(repo, auth, ["push", "origin", $"HEAD:{branch}"], ct);
+        await GitWorkspace.RunGitAsync(repo, auth, GitRemoteWrites.PushRef("origin", $"HEAD:{branch}"), ct);
         try
         {
-            await GitWorkspace.RunGitAsync(repo, auth, ["push", "origin", $":{branch}"], CancellationToken.None);
+            await GitWorkspace.RunGitAsync(repo, auth, GitRemoteWrites.PushRef("origin", $":{branch}"), CancellationToken.None);
         }
         catch (InvalidOperationException)
         {
@@ -76,7 +75,7 @@ public class AppTokenPushTests
                 $"main on {Sandbox} is not guarded by the factory rulesets (run `factory github-repo protect {Sandbox}`): {(int)rulesResponse.StatusCode} {body}");
         }
         var main = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => GitWorkspace.RunGitAsync(repo, auth, ["push", "origin", "HEAD:refs/heads/main"], ct));
+            () => GitWorkspace.RunGitAsync(repo, auth, GitRemoteWrites.PushRef("origin", "HEAD:refs/heads/main"), ct));
         Assert.Contains("rule", main.Message, StringComparison.OrdinalIgnoreCase);
 
         // Only meaningful where the App is installed: there, refusal comes from the token's repo scope alone.
@@ -91,18 +90,8 @@ public class AppTokenPushTests
         }
         Assert.NotEqual(Sandbox, OtherRepo);
         var other = await Assert.ThrowsAsync<InvalidOperationException>(() => GitWorkspace.RunGitAsync(repo, auth,
-            ["push", GitWorkspace.GitHubRemote(OtherRepo), $"HEAD:{branch}"], ct));
+            GitRemoteWrites.PushRef(GitRemoteReads.GitHubRemote(OtherRepo), $"HEAD:{branch}"), ct));
         Assert.True(other.Message.Contains("403") || other.Message.Contains("denied", StringComparison.OrdinalIgnoreCase),
-            $"push to {OtherRepo} failed for a reason other than access denial: {other.Message}");
+            $"the push to {OtherRepo} failed for a reason other than access denial: {other.Message}");
     }
-
-    /// <summary>Same env-config auth the orchestrator uses (<see cref="GitWorkspace"/>): never argv or files.</summary>
-    private static Dictionary<string, string> TokenEnvironment(string token) => new()
-    {
-        ["GIT_CONFIG_COUNT"] = "2",
-        ["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader",
-        ["GIT_CONFIG_VALUE_0"] = $"AUTHORIZATION: basic {Convert.ToBase64String(Encoding.ASCII.GetBytes($"x-access-token:{token}"))}",
-        ["GIT_CONFIG_KEY_1"] = "credential.helper",
-        ["GIT_CONFIG_VALUE_1"] = "",
-    };
 }

@@ -50,7 +50,7 @@ public sealed record WatchScope(IReadOnlyList<string> Teams, IReadOnlyList<int> 
 /// </summary>
 public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchScope scope, TimeProvider? time = null) : IWorkSource
 {
-    public static readonly Uri DefaultBaseAddress = new("https://api.app.shortcut.com/api/v3/");
+    public static readonly Uri DefaultBaseAddress = Gateway.OutboundHttp.ShortcutApiBase;
 
     public const string ClaimLabel = "factory-claimed";
     public const string ReadyState = "To Do";
@@ -177,7 +177,9 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
     public async Task<WorkSpec> ReadSpecAsync(int id, CancellationToken ct)
     {
         var story = await GetStoryAsync(id, ct);
-        var work = new WorkStory(story.Id, story.Name, story.Description, story.StoryType, story.AppUrl);
+        // The labels and estimate decide the item's coding model class (WorkerModelClass.Coding, E8).
+        var work = new WorkStory(story.Id, story.Name, story.Description, story.StoryType, story.AppUrl, Labels: story.LabelNames,
+            Estimate: story.Estimate);
         if (story.EpicId is not { } epicId)
         {
             return new WorkSpec(work, null, []);
@@ -467,7 +469,8 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
         [property: JsonPropertyName("owner_ids")] List<string>? Owners,
         [property: JsonPropertyName("labels")] List<Label>? Labels,
         [property: JsonPropertyName("external_links")] List<string>? Links,
-        [property: JsonPropertyName("story_links")] List<StoryLink>? Relations)
+        [property: JsonPropertyName("story_links")] List<StoryLink>? Relations,
+        [property: JsonPropertyName("estimate")] int? Estimate = null)
     {
         public List<string> OwnerIds => Owners ?? [];
         public List<string> LabelNames => Labels?.Select(l => l.Name).ToList() ?? [];

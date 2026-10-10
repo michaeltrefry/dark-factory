@@ -36,6 +36,23 @@ internal static class Harness
         }
     }
 
+    /// <summary>
+    /// Skips naming the owner step when a retired pinned review-model setting (<c>Review:Models</c>, ...) is still set: the
+    /// factory refuses to start with one (reviews run on the router's high model class, sc-25626).
+    /// </summary>
+    public static void RequireReviewSettings(FactoryOptions? options = null)
+    {
+        try
+        {
+            (options ?? Options).RejectReviewModelSettings();
+        }
+        catch (ReviewConfigurationException ex)
+        {
+            Assert.Skip(ex.Message);
+            throw;
+        }
+    }
+
     public static string RequireEnv(string name, string purpose)
     {
         var value = Environment.GetEnvironmentVariable(name);
@@ -48,7 +65,7 @@ internal static class Harness
 
     public static async Task RequireRouterAsync()
     {
-        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+        using var http = OutboundHttp.RouterApi(Options.RouterBaseUrl, TimeSpan.FromSeconds(3));
         try
         {
             await http.GetAsync(Options.RouterBaseUrl);
@@ -76,7 +93,7 @@ internal static class Harness
         {
             try
             {
-                sandbox.EnsureReadyAsync(Options.WorkerAuth, CancellationToken.None).GetAwaiter().GetResult();
+                sandbox.EnsureReadyAsync(Options.WorkerAuth, Options.ClaudePath, CancellationToken.None).GetAwaiter().GetResult();
             }
             catch (InvalidOperationException ex)
             {
@@ -101,7 +118,7 @@ internal static class Harness
     /// </summary>
     public static async Task<SessionCost?> WaitForCostAsync(string sessionId, string routerKey, CancellationToken ct)
     {
-        using var http = new HttpClient { BaseAddress = Options.RouterBaseUrl };
+        using var http = OutboundHttp.RouterApi(Options.RouterBaseUrl);
         var router = new RouterClient(http, routerKey);
         for (var attempt = 0; attempt < 30; attempt++)
         {

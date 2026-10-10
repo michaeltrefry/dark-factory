@@ -39,6 +39,9 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                         .HasMaxLength(128)
                         .HasColumnType("character varying(128)");
 
+                    b.Property<string>("Detail")
+                        .HasColumnType("text");
+
                     b.Property<string>("Reason")
                         .HasMaxLength(64)
                         .HasColumnType("character varying(64)");
@@ -62,6 +65,47 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                     b.ToTable("controls", (string)null);
                 });
 
+            modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.GitHubIssue", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<DateTimeOffset>("FirstSeenAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("Number")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("Repo")
+                        .IsRequired()
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Repo", "Number")
+                        .IsUnique();
+
+                    b.ToTable("github_issues", (string)null);
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.GitHubIssueCursor", b =>
+                {
+                    b.Property<string>("Repo")
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)");
+
+                    b.Property<DateTimeOffset>("Since")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("Repo");
+
+                    b.ToTable("github_issue_cursors", (string)null);
+                });
+
             modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.LedgerEntry", b =>
                 {
                     b.Property<long>("Id")
@@ -76,6 +120,11 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
 
                     b.Property<string>("Detail")
                         .HasColumnType("text");
+
+                    b.Property<string>("Outcome")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
 
                     b.Property<DateTimeOffset>("RecordedAt")
                         .HasColumnType("timestamp with time zone");
@@ -96,7 +145,10 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
 
                     b.HasIndex("WorkItemId");
 
-                    b.ToTable("ledger_entries", (string)null);
+                    b.ToTable("ledger_entries", null, t =>
+                        {
+                            t.HasCheckConstraint("CK_ledger_entries_outcome", "\"Outcome\" IN ('passed', 'failed', 'gate_rejected', 'deferred', 'escalated')");
+                        });
                 });
 
             modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.SessionEvent", b =>
@@ -140,6 +192,30 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                         .IsUnique();
 
                     b.ToTable("session_events", (string)null);
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.SessionTaint", b =>
+                {
+                    b.Property<string>("ClaudeSessionId")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("Reason")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<DateTimeOffset>("TaintedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long?>("WorkItemId")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("ClaudeSessionId");
+
+                    b.HasIndex("WorkItemId");
+
+                    b.ToTable("session_taints", (string)null);
                 });
 
             modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.WorkItem", b =>
@@ -265,6 +341,13 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                         .HasForeignKey("WorkerSessionId")
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.SessionTaint", b =>
+                {
+                    b.HasOne("DarkFactory.Orchestrator.Ledger.WorkItem", null)
+                        .WithMany()
+                        .HasForeignKey("WorkItemId");
                 });
 
             modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.WorkerSession", b =>

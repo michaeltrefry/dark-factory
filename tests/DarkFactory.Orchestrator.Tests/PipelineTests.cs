@@ -1,3 +1,4 @@
+using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
@@ -154,25 +155,33 @@ public class RunPipelineTests
     internal sealed class FakeWorkspaces(bool hasChanges = true, bool worktreeExists = true) : IRepoWorkspace
     {
         public List<string> Calls { get; } = [];
+        /// <summary>Where worktrees live (<c>&lt;root&gt;/&lt;branch&gt;</c>); a real directory only when a test puts files there.</summary>
+        public string Root { get; set; } = "/wt";
         /// <summary>Runs while a push is in progress, e.g. to set a control then.</summary>
         public Func<Task>? OnPush { get; set; }
+        /// <summary>Runs on each restore of a branch's worktree (e.g. as a fix round starts), before it returns.</summary>
+        public Action? OnRestore { get; set; }
         public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct)
         {
             Calls.Add($"restore {repo} {branch}");
-            return Task.FromResult(new Workspace($"/wt/{branch}", branch, "main", $"/clone/.git/worktrees/{branch}"));
+            OnRestore?.Invoke();
+            return Task.FromResult(new Workspace($"{Root}/{branch}", branch, "main", $"/clone/.git/worktrees/{branch}"));
         }
         public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct)
         {
             Calls.Add($"prepare {repo} {branch}");
-            return Task.FromResult(new Workspace($"/wt/{branch}", branch, "main", $"/clone/.git/worktrees/{branch}"));
+            return Task.FromResult(new Workspace($"{Root}/{branch}", branch, "main", $"/clone/.git/worktrees/{branch}"));
         }
         public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct)
         {
             Calls.Add($"reopen {repo} {branch}");
-            return Task.FromResult(worktreeExists ? new Workspace($"/wt/{branch}", branch, "main", $"/clone/.git/worktrees/{branch}") : null);
+            return Task.FromResult(worktreeExists ? new Workspace($"{Root}/{branch}", branch, "main", $"/clone/.git/worktrees/{branch}") : null);
         }
-        public async Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, CancellationToken ct)
+        /// <summary>The grant of each push: the worker sessions it publishes (E4).</summary>
+        public List<PushGrant> Grants { get; } = [];
+        public async Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, PushGrant grant, CancellationToken ct)
         {
+            Grants.Add(grant);
             Calls.Add($"push {repo} {workspace.Branch} {message}");
             if (OnPush is not null)
             {
@@ -180,6 +189,34 @@ public class RunPipelineTests
             }
             return hasChanges;
         }
+        /// <summary>The commit a worktree's HEAD is at (what the last push pushed).</summary>
+        public Func<string> Head { get; set; } = () => "head";
+        public Task<string> HeadAsync(Workspace workspace, CancellationToken ct) => Task.FromResult(Head());
+
+        /// <summary>What merging the base into a worktree does (sc-25384); by default it is already up to date.</summary>
+        public Func<Workspace, BaseMerge> MergeBase { get; set; } = _ => new BaseMerge("base0", "head", [], UpToDate: true);
+        /// <summary>Runs on each fast-forward push of a worktree (the merge queue's base update).</summary>
+        public Func<Workspace, Task>? OnFastForward { get; set; }
+        /// <summary>Which of the given files still hold a conflict marker at a commit; by default none.</summary>
+        public Func<string, IReadOnlyList<string>, IReadOnlyList<string>> Markers { get; set; } = (_, _) => [];
+
+        public Task<BaseMerge> MergeBaseAsync(RepoRef repo, Workspace workspace, CancellationToken ct)
+        {
+            Calls.Add($"merge-base {repo} {workspace.Branch}");
+            return Task.FromResult(MergeBase(workspace));
+        }
+
+        public async Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct)
+        {
+            Calls.Add($"fast-forward {repo} {workspace.Branch}");
+            if (OnFastForward is not null)
+            {
+                await OnFastForward(workspace);
+            }
+        }
+
+        public Task<IReadOnlyList<string>> ConflictMarkersAsync(RepoRef repo, string sha, IReadOnlyList<string> paths, CancellationToken ct) =>
+            Task.FromResult(Markers(sha, paths));
         public Task RemoveAsync(RepoRef repo, Workspace workspace, CancellationToken ct)
         {
             Calls.Add($"remove {repo} {workspace.Path}");
@@ -187,7 +224,7 @@ public class RunPipelineTests
         }
     }
 
-    internal sealed record WorkerCall(string Prompt, string? Resume, WorkerCallbacks Callbacks)
+    internal sealed record WorkerCall(string Prompt, string? Resume, WorkerCallbacks Callbacks, string ModelClass)
     {
         public Task OnSession(string sid, CancellationToken ct) => Callbacks.OnSession!(sid, ct);
     }
@@ -202,11 +239,13 @@ public class RunPipelineTests
         public bool OrphanAlive { get; init; }
         /// <summary>Runs before each StopOrphanAsync returns, e.g. to look at the ledger then.</summary>
         public Action? OnStopOrphan { get; init; }
+        /// <summary>The tools the worker says its sessions run with.</summary>
+        public WorkerTools Tools { get; init; } = WorkerTools.Implementer;
 
-        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
+        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
             WorkerCallbacks? callbacks, CancellationToken ct)
         {
-            var call = new WorkerCall(prompt, resumeSessionId, callbacks!);
+            var call = new WorkerCall(prompt, resumeSessionId, callbacks!, modelClass);
             Calls.Add(call);
             await callbacks!.OnStarted!(WorkerPid, CancellationToken.None);
             return await behaviours[Calls.Count - 1](call);
@@ -267,6 +306,22 @@ public class RunPipelineTests
             Drafted.Add(head);
             return Task.FromResult<IReadOnlyList<string>>(Opened.Any(o => o.Head == head) ? [PrUrl] : []);
         }
+
+        /// <summary>Each rewrite of a PR's description (sc-25389), in order.</summary>
+        public List<(string Url, string Body)> BodyUpdates { get; } = [];
+
+        /// <summary>When set, rewriting a description throws this.</summary>
+        public Exception? UpdateThrows { get; set; }
+
+        public Task UpdateBodyAsync(RepoRef repo, string pullUrl, string body, CancellationToken ct)
+        {
+            if (UpdateThrows is { } failure)
+            {
+                return Task.FromException(failure);
+            }
+            BodyUpdates.Add((pullUrl, body));
+            return Task.CompletedTask;
+        }
     }
 
     internal static readonly WorkerResult Ok = new("sess-77", 0, false, "success", "done", "");
@@ -313,7 +368,7 @@ public class RunPipelineTests
         Assert.True(outcome.Succeeded);
         Assert.Equal((WorkState.Review, PrUrl, "sess-77"), (outcome.State, outcome.PullRequestUrl, outcome.SessionId));
         Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Review], await h.Transitions());
-        Assert.Equal(["claimed", "worker-started", "session", "worker-done", "pushed", "linked"], await h.Steps());
+        Assert.Equal(["claimed", "worker-started", "session", "worker-model-class", "worker-done", "pushed", "linked"], await h.Steps());
         Assert.Equal(["claim 77", "state 77 Claimed", $"link 77 {PrUrl} https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/sc-77"],
             h.Stories.Writes);
         Assert.Equal(WorkerPid.ToString(), (await h.Rows()).Single(r => r.Step == "worker-started").Detail);
@@ -380,7 +435,7 @@ public class RunPipelineTests
 
         await h.Run(worker);
 
-        Assert.Equal(("session", "sess-77"), (rowsWhileRunning![^1].Step, rowsWhileRunning[^1].ClaudeSessionId));
+        Assert.Equal([("session", "sess-77"), ("worker-model-class", "sess-77")], rowsWhileRunning![^2..].Select(r => (r.Step, r.ClaudeSessionId)));
     }
 
     [Fact]
@@ -400,6 +455,7 @@ public class RunPipelineTests
 
         Assert.False(outcome.Succeeded);
         Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Null(outcome.PullRequestUrl); // escalated before any PR was opened
         Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Escalated], await h.Transitions());
         var escalated = (await h.Rows()).Last(r => r.Step is null);
         Assert.Equal("sess-x", escalated.ClaudeSessionId);
@@ -409,7 +465,7 @@ public class RunPipelineTests
         Assert.StartsWith("[author: dark-factory]", comment);
         Assert.Contains("exit 1", comment);
         Assert.Contains("Not logged in", comment);
-        Assert.Contains("Last ledger state: Implement (after step session)", comment);
+        Assert.Contains("Last ledger state: Implement (after step worker-model-class)", comment);
         Assert.Contains("sess-x", comment);
         Assert.Equal("escalation-comment", (await h.Rows())[^1].Step);
         // An escalated item restarts with a fresh worktree, so this one is removed (E5).
@@ -451,7 +507,7 @@ public class RunPipelineTests
         Assert.True(outcome.Succeeded, outcome.Error);
         var comment = Assert.Single(h.Stories.Comments);
         Assert.Contains("Not logged in", comment);
-        Assert.Contains("Last ledger state: Implement (after step session)", comment);
+        Assert.Contains("Last ledger state: Implement (after step worker-model-class)", comment);
         Assert.Contains("sess-x", comment);
         var rows = await h.Rows();
         var posted = rows.FindIndex(r => r.Step == "escalation-comment" && r.Detail == "posted");
@@ -597,7 +653,7 @@ public class RunPipelineTests
         Assert.DoesNotContain(rowsAtStop!, r => r.Step == "worker-started" && r.Detail == WorkerPid.ToString()); // stopped before the new worker
         var killed = (await h.Rows()).Single(r => r.Step == "orphan-killed");
         Assert.Equal("pid 999", killed.Detail);
-        Assert.Equal(["worker-started", "session", "orphan-killed", "worker-started", "worker-done", "pushed", "linked"], await h.Steps());
+        Assert.Equal(["worker-started", "session", "orphan-killed", "worker-started", "worker-model-class", "worker-done", "pushed", "linked"], await h.Steps());
     }
 
     [Fact]
@@ -713,6 +769,174 @@ public class RunPipelineTests
             await h.Transitions());
         Assert.Null(worker.Calls[1].Resume);
         Assert.Equal(2, h.Workspaces.Calls.Count(c => c.StartsWith("prepare")));
+    }
+
+    /// <summary>The worker's session starts, it uses <paramref name="tool"/> (the stream shows the tool_use), then behaves like <paramref name="then"/>.</summary>
+    private static Func<WorkerCall, Task<WorkerResult>> UsesTool(string session, string tool, Func<WorkerCall, Task<WorkerResult>> then) => async call =>
+    {
+        await call.OnSession(session, CancellationToken.None);
+        await call.Callbacks.OnUntrusted!(session, Taint.ForTool(tool)!, CancellationToken.None);
+        return await then(call);
+    };
+
+    [Fact]
+    public async Task An_untainted_implementer_pushes_with_a_grant_naming_its_session()
+    {
+        var h = new Harness();
+
+        Assert.True((await h.Run(new FakeWorker(Reports(Ok)))).Succeeded);
+
+        Assert.Equal(["sess-77"], Assert.Single(h.Workspaces.Grants).Sessions);
+        Assert.Empty(h.Db.SessionTaints);
+    }
+
+    [Fact]
+    public async Task An_implementer_that_fetched_the_web_is_tainted_and_refused_its_push_which_escalates_visibly()
+    {
+        var h = new Harness();
+
+        var outcome = await h.Run(new FakeWorker(UsesTool("sess-77", "WebFetch", _ => Task.FromResult(Ok))));
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        var taint = await h.Db.SessionTaints.SingleAsync();
+        Assert.Equal(("sess-77", "web:WebFetch", (await h.Item()).Id), (taint.ClaudeSessionId, taint.Reason, taint.WorkItemId));
+        // No push token: nothing pushed, no PR; the escalation says why and the worktree goes (a re-run starts a fresh session).
+        Assert.DoesNotContain(h.Workspaces.Calls, c => c.StartsWith("push"));
+        Assert.Empty(h.Workspaces.Grants);
+        Assert.Empty(h.Prs.Opened);
+        var comment = Assert.Single(h.Stories.Comments);
+        Assert.Contains("sess-77 is tainted (web:WebFetch)", comment);
+        Assert.Contains("holds no push token", comment);
+        Assert.Contains("remove michaeltrefry/dark-factory-sandbox /wt/factory/sc-77", h.Workspaces.Calls);
+    }
+
+    /// <summary>
+    /// A taint that committed before the interrupt. The window where Ctrl-C lands after the tool_use line but before its taint
+    /// commits needs the session-event store: SessionCaptureTests.A_web_fetch_whose_taint_was_cut_off_by_ctrl_c_...
+    /// </summary>
+    [Fact]
+    public async Task A_session_whose_web_search_taint_committed_before_an_interrupt_is_refused_on_resume_and_never_pushes()
+    {
+        var h = new Harness();
+        using var ctrlC = new CancellationTokenSource();
+        var worker = new FakeWorker(
+            UsesTool("sess-77", "WebSearch", _ => { ctrlC.Cancel(); throw new OperationCanceledException(ctrlC.Token); }),
+            Reports(Ok));
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() => h.Run(worker, ctrlC.Token));
+        Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Paused], await h.Transitions());
+        Assert.Equal("web:WebSearch", (await h.Db.SessionTaints.SingleAsync()).Reason);
+
+        var outcome = await h.Run(worker);
+
+        // The resume is refused before the worker runs again: no second worker call, no push, escalated with the reason.
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Single(worker.Calls);
+        Assert.DoesNotContain(h.Workspaces.Calls, c => c.StartsWith("push"));
+        Assert.Contains("sess-77 is tainted (web:WebSearch)", Assert.Single(h.Stories.Comments));
+    }
+
+    /// <summary>A harness whose worktree is a real directory, with <paramref name="settings"/> as the repo's .claude/settings.json (none when null).</summary>
+    private static (Harness H, string Worktree) WithRepoSettings(string? settings)
+    {
+        var root = Directory.CreateTempSubdirectory("df-taint-wt-").FullName;
+        var worktree = Path.Combine(root, "factory", "sc-77");
+        Directory.CreateDirectory(Path.Combine(worktree, ".claude"));
+        if (settings is not null)
+        {
+            File.WriteAllText(Path.Combine(worktree, ".claude", "settings.json"), settings);
+        }
+        return (new Harness { Workspaces = new FakeWorkspaces { Root = root } }, worktree);
+    }
+
+    private const string HookSettings = """{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"curl -s https://example.com"}]}]}}""";
+
+    [Fact]
+    public async Task A_new_session_in_a_repo_whose_settings_define_a_hook_is_tainted_from_its_start_and_refused_its_push()
+    {
+        var (h, _) = WithRepoSettings(HookSettings);
+        string? atStart = null;
+        var worker = new FakeWorker(async call =>
+        {
+            await call.OnSession("sess-77", CancellationToken.None);
+            atStart = (await h.Ledger.TaintOfAsync("sess-77", CancellationToken.None))?.Reason; // before the session does anything
+            return Ok;
+        });
+
+        var outcome = await h.Run(worker);
+
+        Assert.Equal(Taint.RepoSettings, atStart);
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Equal(("sess-77", Taint.RepoSettings), await h.Db.SessionTaints.Select(t => ValueTuple.Create(t.ClaudeSessionId, t.Reason)).SingleAsync());
+        Assert.DoesNotContain(h.Workspaces.Calls, c => c.StartsWith("push"));
+        Assert.Contains("sess-77 is tainted (repo-settings)", Assert.Single(h.Stories.Comments));
+    }
+
+    [Fact]
+    public async Task A_session_is_not_resumed_in_a_repo_whose_settings_allow_more_than_the_worker_tools()
+    {
+        var (h, _) = WithRepoSettings("""{"permissions":{"allow":["Read","Bash(curl:*)"]}}""");
+        await h.Crashed(RunPipeline.Steps.WorkerStarted, RunPipeline.Steps.Session);
+        var worker = new FakeWorker(Reports(Ok));
+
+        var outcome = await h.Run(worker);
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Empty(worker.Calls);
+        Assert.Equal(Taint.RepoSettings, (await h.Ledger.TaintOfAsync("sess-77", CancellationToken.None))!.Reason);
+        Assert.DoesNotContain(h.Workspaces.Calls, c => c.StartsWith("push"));
+    }
+
+    [Fact]
+    public async Task A_worker_that_adds_a_hook_to_the_repo_settings_taints_its_own_session_and_is_refused_its_push()
+    {
+        var (h, worktree) = WithRepoSettings(null);
+        var worker = new FakeWorker(async call =>
+        {
+            await call.OnSession("sess-77", CancellationToken.None);
+            File.WriteAllText(Path.Combine(worktree, ".claude", "settings.local.json"), HookSettings);
+            return Ok;
+        });
+
+        var outcome = await h.Run(worker);
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Equal(Taint.RepoSettings, (await h.Db.SessionTaints.SingleAsync()).Reason);
+        Assert.DoesNotContain(h.Workspaces.Calls, c => c.StartsWith("push"));
+    }
+
+    [Fact]
+    public async Task A_crashed_run_whose_session_was_tainted_gets_no_push_token_when_resumed_after_the_worker_finished()
+    {
+        var h = new Harness();
+        // The crashed run had recorded the session as done (worker-done) but not pushed; its session was tainted meanwhile.
+        var item = await h.Crashed(RunPipeline.Steps.WorkerStarted, RunPipeline.Steps.Session, RunPipeline.Steps.WorkerDone);
+        await h.Ledger.TaintSessionAsync(item, "sess-77", "web:WebFetch", CancellationToken.None);
+        var worker = new FakeWorker();
+
+        var outcome = await h.Run(worker);
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Empty(worker.Calls);
+        Assert.DoesNotContain(h.Workspaces.Calls, c => c.StartsWith("push"));
+    }
+
+    [Fact]
+    public async Task A_taint_is_sticky_and_a_grant_needs_at_least_one_untainted_session()
+    {
+        var h = new Harness();
+        var ledger = h.Ledger;
+        var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
+
+        await ledger.TaintSessionAsync(item, "s-1", Taint.IssueText, CancellationToken.None);
+        await ledger.TaintSessionAsync(item, "s-1", "web:WebFetch", CancellationToken.None);
+
+        Assert.Equal(Taint.IssueText, (await ledger.TaintOfAsync("s-1", CancellationToken.None))!.Reason); // the first reason is kept
+        Assert.Null(await ledger.TaintOfAsync("s-2", CancellationToken.None));
+        var refused = await Assert.ThrowsAsync<SessionTaintedException>(() => ledger.GrantPushAsync(["s-2", "s-1"], CancellationToken.None));
+        Assert.Equal(("s-1", Taint.IssueText), (refused.SessionId, refused.Reason));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => ledger.GrantPushAsync([null], CancellationToken.None)); // E2
+        Assert.Equal(["s-2"], (await ledger.GrantPushAsync(["s-2", null, "s-2"], CancellationToken.None)).Sessions);
     }
 
     [Fact]

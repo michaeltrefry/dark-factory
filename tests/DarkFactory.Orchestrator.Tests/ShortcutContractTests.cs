@@ -2,6 +2,7 @@ using System.Net.Http.Json;
 using System.Text.Json.Nodes;
 using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
+using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.Orchestrator.Tests;
@@ -102,6 +103,34 @@ public class ShortcutContractTests
         Assert.StartsWith("https://app.shortcut.com/trefry/story/25185", spec.Story.AppUrl);
         Assert.Null(spec.Epic);
         Assert.Empty(spec.Documents);
+        // The recorded story has no labels and no estimate: complex, the mid class (E8).
+        Assert.Empty(spec.Story.Labels!);
+        Assert.Null(spec.Story.Estimate);
+        Assert.Equal(WorkerModelClass.Mid, WorkerModelClass.Coding(spec.Story));
+    }
+
+    [Theory]
+    [InlineData(2, null, 2, "low")]
+    [InlineData(3, null, 3, "mid")]
+    [InlineData(null, "simple", null, "low")]
+    public async Task Read_spec_carries_the_storys_labels_and_estimate(int? estimate, string? label, int? expected, string modelClass)
+    {
+        // The recorded story with its estimate and labels set as the v3 schema has them (Story.estimate: integer or null;
+        // labels: LabelSlim objects); the request is unchanged, so replay stays strict.
+        var fixture = ShortcutFixture.Load("read-spec.json");
+        var call = fixture.Interactions.Single();
+        var story = call.Response!.DeepClone();
+        story["estimate"] = estimate;
+        story["labels"] = label is null ? new JsonArray() : new JsonArray(JsonNode.Parse($$"""{"entity_type":"label","id":1,"name":"{{label}}"}"""));
+        fixture.Interactions[0] = call with { Response = story };
+        var (source, replay) = Replay(fixture);
+
+        var spec = await source.ReadSpecAsync(25185, CancellationToken.None);
+
+        Assert.True(replay.AllReplayed);
+        Assert.Equal(expected, spec.Story.Estimate);
+        Assert.Equal(label is null ? [] : [label], spec.Story.Labels!);
+        Assert.Equal(modelClass, WorkerModelClass.Coding(spec.Story));
     }
 
     [Fact]

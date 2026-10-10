@@ -23,6 +23,24 @@ public sealed class StreamJsonState
     /// </summary>
     public bool RateLimited { get; private set; }
 
+    private readonly List<string> _models = [];
+
+    /// <summary>
+    /// The models that answered the session's assistant turns (each message's <c>model</c>, as the router returned it), in
+    /// order of first appearance. Claude Code's own <c>&lt;synthetic&gt;</c> messages are not models and are skipped.
+    /// </summary>
+    public IReadOnlyList<string> Models => _models;
+
+    private readonly List<string> _untrustedReads = [];
+
+    /// <summary>
+    /// Why the session has read untrusted content, one reason per tool (<see cref="Taint.ForTool"/>) in order of first use: each
+    /// <c>tool_use</c> of a web tool (<c>WebFetch</c>, <c>WebSearch</c>) or of any MCP tool in an assistant message. The tool's use
+    /// counts, not its result: a call the worker's settings deny still counts, and so does one whose result never streamed (a
+    /// crash mid-call), since the ledger must hold the taint before the content could reach a push (E4).
+    /// </summary>
+    public IReadOnlyList<string> UntrustedReads => _untrustedReads;
+
     public void Accept(string line)
     {
         if (string.IsNullOrWhiteSpace(line) || line.TrimStart()[0] != '{')
@@ -52,6 +70,27 @@ public sealed class StreamJsonState
             if (root.TryGetProperty("error", out var apiError) && apiError.ValueKind == JsonValueKind.String && apiError.ValueEquals("rate_limit"))
             {
                 RateLimited = true;
+            }
+            if (root.TryGetProperty("type", out var assistant) && assistant.ValueEquals("assistant")
+                && root.TryGetProperty("message", out var message) && message.ValueKind == JsonValueKind.Object
+                && message.TryGetProperty("model", out var model) && model.ValueKind == JsonValueKind.String
+                && model.GetString() is { Length: > 0 } name && !name.StartsWith('<') && !_models.Contains(name))
+            {
+                _models.Add(name);
+            }
+            if (root.TryGetProperty("type", out var turn) && turn.ValueEquals("assistant")
+                && root.TryGetProperty("message", out var said) && said.ValueKind == JsonValueKind.Object
+                && said.TryGetProperty("content", out var blocks) && blocks.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var block in blocks.EnumerateArray())
+                {
+                    if (block.ValueKind == JsonValueKind.Object && block.TryGetProperty("type", out var kind) && kind.ValueEquals("tool_use")
+                        && block.TryGetProperty("name", out var tool) && tool.ValueKind == JsonValueKind.String
+                        && Taint.ForTool(tool.GetString()!) is { } reason && !_untrustedReads.Contains(reason))
+                    {
+                        _untrustedReads.Add(reason);
+                    }
+                }
             }
             if (root.TryGetProperty("type", out var type) && type.ValueEquals("result"))
             {

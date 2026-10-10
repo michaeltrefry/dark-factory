@@ -1,6 +1,6 @@
-using System.Diagnostics;
 using DarkFactory.Orchestrator;
 using DarkFactory.Orchestrator.Dashboard;
+using DarkFactory.Orchestrator.Gateway;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Sessions;
@@ -26,24 +26,11 @@ static async Task<int> ControlAsync(string action, string scope, CancellationTok
     }
 }
 
-static async Task<int> RunAsync(int storyId, bool ignoreScope, CancellationToken ct)
+static async Task<int> RunAsync(ItemRef item, bool ignoreScope, CancellationToken ct)
 {
     var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
-    try
-    {
-        if (await CheckRouterEnrollmentAsync(options, ct) is { } enrollmentError)
-        {
-            Console.Error.WriteLine(enrollmentError);
-            return 2;
-        }
-        var outcome = await FactoryRunner.RunAsync(options, storyId, ignoreScope, Console.Out, ct);
-        return outcome.Succeeded ? 0 : 1;
-    }
-    catch (MissingCredentialException ex)
-    {
-        Console.Error.WriteLine(ex.Message);
-        return 2;
-    }
+    return await FactoryRunner.RunCommandAsync(options, c => CheckRouterEnrollmentAsync(options, c),
+        c => FactoryRunner.RunAsync(options, item, ignoreScope, Console.Out, c), Console.Error, ct);
 }
 
 static async Task<int> WorkAsync(CancellationToken ct)
@@ -53,21 +40,42 @@ static async Task<int> WorkAsync(CancellationToken ct)
     {
         // Fail fast on a missing credential or a bad scope rather than on the first ready item.
         // Session costs come from the router; intake needs Shortcut and the GitHub App; the dashboard its login.
+        // The merge gate needs its own App, and no retired review-model setting may be set. Every setting with a rule is checked first.
+        options.ValidateSettings();
         _ = (options.ShortcutApiToken, options.RouterKey, options.GitHubAppId, options.GitHubAppPrivateKeyPem, options.DashboardPasswordHash);
+        _ = (options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem);
+        options.RejectReviewModelSettings();
         _ = DashboardBinding.Addresses(options.DashboardBindAddress);
         if (options.WatchScope.IsEmpty)
         {
             Console.Error.WriteLine("Watch scope is empty (set Shortcut:Watch:Teams and/or Shortcut:Watch:Epics); nothing will be picked up.");
         }
+        if (options.WatchedIssueRepos.Count == 0)
+        {
+            Console.Error.WriteLine("No GitHub issues are watched (set GitHub:Watch:Repos to triage a repo's issues).");
+        }
+        if (DarkFactory.Orchestrator.Issues.IssueIntake.UnsandboxedRefusal(options.WorkerSandbox, options.WatchedIssueRepos) is { } unsandboxed)
+        {
+            Console.Error.WriteLine(unsandboxed);
+            return 2;
+        }
     }
-    catch (Exception ex) when (ex is MissingCredentialException or InvalidOperationException)
+    catch (Exception ex) when (ex is MissingCredentialException or ReviewConfigurationException or InvalidOperationException)
     {
         Console.Error.WriteLine(ex.Message);
         return 2;
     }
-    using (var shortcutHttp = new HttpClient { BaseAddress = ShortcutWorkSource.DefaultBaseAddress })
+    using (var shortcutHttp = OutboundHttp.ShortcutApi())
     {
         if (await FactoryRunner.CheckWatchScopeAsync(options, FactoryRunner.CreateWorkSource(options, shortcutHttp), ct) is { } scopeError)
+        {
+            Console.Error.WriteLine(scopeError);
+            return 2;
+        }
+    }
+    using (var githubHttp = OutboundHttp.GitHubApi())
+    {
+        if (await FactoryRunner.CheckWatchScopeAsync(options, FactoryRunner.CreateIssueSource(options, githubHttp), ct) is { } scopeError)
         {
             Console.Error.WriteLine(scopeError);
             return 2;
@@ -90,45 +98,32 @@ static async Task<int> WorkAsync(CancellationToken ct)
 // Worker:Auth=router-key needs a plan enrolled on the router for the key; checked before any work starts (E10).
 static async Task<string?> CheckRouterEnrollmentAsync(FactoryOptions options, CancellationToken ct)
 {
-    using var http = new HttpClient { BaseAddress = options.RouterBaseUrl };
+    using var http = OutboundHttp.RouterApi(options.RouterBaseUrl);
     return await FactoryRunner.CheckRouterEnrollmentAsync(options, new DarkFactory.Orchestrator.Router.RouterClient(http, options.RouterKey), ct);
 }
 
 static Task<int> SetDashboardPasswordAsync(CancellationToken ct) =>
     Task.FromResult(SetPassword.Run(new MacKeychain(), SetPassword.ReadConsoleSecret, Console.Out, Console.Error));
 
-static async Task<int> SetupGitHubAppAsync(string name, int port, CancellationToken ct)
+static async Task<int> SetupGitHubAppAsync(string name, int port, bool gate, CancellationToken ct)
 {
-    using var http = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
-    await new GitHubAppSetup(http, new MacKeychain(), Console.Out).RunAsync(name, port, ct);
+    using var http = OutboundHttp.GitHubApi();
+    await new GitHubAppSetup(http, new MacKeychain(), Console.Out, gate).RunAsync(name, port, ct);
     return 0;
 }
 
 // Rulesets need repo admin, which the App deliberately lacks, so this uses the owner's own GitHub token.
 static async Task<int> ProtectRepoAsync(RepoRef repo, CancellationToken ct)
 {
-    var token = RepoProtection.ResolveAdminToken(Environment.GetEnvironmentVariable, GhAuthToken);
+    var token = RepoProtection.ResolveAdminToken(Environment.GetEnvironmentVariable, GitHubCli.AuthToken);
     if (token is null)
     {
         Console.Error.WriteLine("No admin GitHub token: set GH_TOKEN or run `gh auth login`.");
         return 2;
     }
-    using var http = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
-    return await RepoProtection.RunAsync(http, token, repo, Console.Out, Console.Error, ct);
-}
-
-static string? GhAuthToken()
-{
-    try
-    {
-        using var p = Process.Start(new ProcessStartInfo("gh", "auth token") { RedirectStandardOutput = true, RedirectStandardError = true })!;
-        var token = p.StandardOutput.ReadToEnd().Trim();
-        p.StandardError.ReadToEnd();
-        p.WaitForExit();
-        return p.ExitCode == 0 && token.Length > 0 ? token : null;
-    }
-    catch (System.ComponentModel.Win32Exception)
-    {
-        return null;
-    }
+    // With the merge gate's App registered, it may merge pull requests past the rulesets (and only that).
+    var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
+    long? gateAppId = options.TryGet(o => o.GitHubGateAppId, out var id) && long.TryParse(id, out var parsed) ? parsed : null;
+    using var http = OutboundHttp.GitHubApi();
+    return await RepoProtection.RunAsync(http, token, repo, Console.Out, Console.Error, ct, gateAppId);
 }

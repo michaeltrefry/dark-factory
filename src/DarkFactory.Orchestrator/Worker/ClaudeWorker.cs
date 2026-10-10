@@ -45,27 +45,46 @@ public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError,
     /// result is a success but says nothing about the work being finished.
     /// </summary>
     public bool HookStopped => TerminalReason == HookStoppedReason;
+
+    /// <summary>The router's refusal when no model of the session's class can serve it (503; the message prefix).</summary>
+    public const string ModelClassUnavailableMarker = Router.ModelClass.Unavailable;
+
+    /// <summary>
+    /// The session failed because the router had no servable model in its class (E8: it never serves another class): Claude Code's
+    /// error result (<see cref="IsError"/>) or its stderr carries <see cref="ModelClassUnavailableMarker"/>. Like
+    /// <see cref="UsageLimited"/>, a result that is not an error is the model's own prose and never counts. Such a failure pauses
+    /// for usage instead of escalating the item.
+    /// </summary>
+    public bool ModelClassUnavailable => !Succeeded && ((IsError && ResultText is { } text && Router.ModelClass.IsUnavailable(text))
+        || Router.ModelClass.IsUnavailable(StderrTail));
 }
 
 /// <summary>
 /// Hooks a worker run awaits while it runs, so the ledger knows about the run before it ends.
 /// <see cref="OnStarted"/> gets the worker's process id as soon as the process exists;
 /// <see cref="OnSession"/> gets the Claude session id as soon as it appears in the stream;
-/// <see cref="OnLine"/> gets every stdout line, in order, as it is read.
+/// <see cref="OnLine"/> gets every stdout line, in order, as it is read;
+/// <see cref="OnModel"/> gets each model that answers the session, the first time it appears;
+/// <see cref="OnUntrusted"/> gets the session id and the taint reason (<see cref="Taint.ForTool"/>) of each web or MCP tool the session
+/// uses, the first time, before the next line is read, with a token that is never cancelled (the record must commit). A session that uses one with no <see cref="OnUntrusted"/> to record it fails
+/// (E2: a taint that cannot be recorded is not ignored).
 /// </summary>
 public sealed record WorkerCallbacks(
     Func<int, CancellationToken, Task>? OnStarted = null,
     Func<string, CancellationToken, Task>? OnSession = null,
-    Func<string, CancellationToken, ValueTask>? OnLine = null);
+    Func<string, CancellationToken, ValueTask>? OnLine = null,
+    Func<string, CancellationToken, Task>? OnModel = null,
+    Func<string, string, CancellationToken, Task>? OnUntrusted = null);
 
 public interface IWorker
 {
     /// <summary>
     /// Runs one worker session. <paramref name="resumeSessionId"/> continues an earlier session;
     /// the <paramref name="callbacks"/> fire before the worker finishes, so a crash can still
-    /// resume the session and find the process.
+    /// resume the session and find the process. Every call names the router model class it runs on
+    /// (<paramref name="modelClass"/>, <see cref="WorkerModelClass"/>, E8); none pins a model.
     /// </summary>
-    Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
+    Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
         WorkerCallbacks? callbacks, CancellationToken ct);
 
     /// <summary>
@@ -91,6 +110,113 @@ public interface IWorker
     void CancelPause(string workingDirectory)
     {
     }
+
+    /// <summary>The tools and permission mode the worker's sessions run with (<see cref="WorkerTools"/>).</summary>
+    WorkerTools Tools => WorkerTools.Implementer;
+}
+
+/// <summary>
+/// What a worker session may do: Claude Code's <c>--permission-mode</c>, <c>--allowedTools</c> and <c>--disallowedTools</c>
+/// (a deny beats any allow rule, the target repo's own settings included).
+/// </summary>
+public sealed record WorkerTools
+{
+    private WorkerTools(string permissionMode, IReadOnlyList<string> allowed, IReadOnlyList<string> denied, string settingSources,
+        bool confinedToWorkingDirectory) =>
+        (PermissionMode, Allowed, Denied, SettingSources, ConfinedToWorkingDirectory) =
+        (permissionMode, allowed, denied, settingSources, confinedToWorkingDirectory);
+
+    public string PermissionMode { get; }
+
+    /// <summary>The allow rules every session gets; a confined session also gets <see cref="ReadRule"/> of its working directory.</summary>
+    public IReadOnlyList<string> Allowed { get; }
+
+    public IReadOnlyList<string> Denied { get; }
+
+    /// <summary>Claude Code's <c>--setting-sources</c>: which settings files the session loads (empty: none, only <c>--settings</c>).</summary>
+    public string SettingSources { get; }
+
+    /// <summary>
+    /// Whether the session's file reads are confined to its working directory: its only allow rule is <see cref="ReadRule"/> of that
+    /// directory and its <c>--settings</c> set <see cref="BlockReadsOutsideWorkingDirectories"/>.
+    /// </summary>
+    public bool ConfinedToWorkingDirectory { get; }
+
+    /// <summary>
+    /// An implementing worker (implement, review fix, CI fix, conflict fix): edits files and builds and tests; no web, no git. It loads
+    /// the target repo's own Claude settings (<c>project,local</c>; <see cref="Taint.OfRepoSettings"/>).
+    /// </summary>
+    public static readonly WorkerTools Implementer = new("acceptEdits", ClaudeWorker.AllowedTools, ClaudeWorker.DeniedTools, "project,local",
+        confinedToWorkingDirectory: false);
+
+    /// <summary>
+    /// The tools a read-only session uses: it reads and searches its own checkout, nothing else. None is allowed by name (a bare
+    /// <c>Read</c> rule would pre-approve a read of any path): Claude Code runs them without approval inside the working directory
+    /// only, and bounds Glob and Grep by the <c>Read</c> rules.
+    /// </summary>
+    public static readonly string[] ReadOnlyTools = ["Read", "Glob", "Grep"];
+
+    /// <summary>The settings key that makes Claude Code's file tools refuse every path outside the working directories, in every mode.</summary>
+    public const string BlockReadsOutsideWorkingDirectories = "blockReadsOutsideWorkingDirectories";
+
+    /// <summary>
+    /// The one allow rule of a confined session: <c>Read(//&lt;absolute directory&gt;/**)</c> (Claude Code's <c>//</c> anchors at the
+    /// filesystem root; a single <c>/</c> would anchor at the settings source). Refuses a directory whose path a gitignore pattern
+    /// would read as more than itself (<c>* ? [ ] \ !</c>, a leading <c>#</c>, a line break) or that is not absolute.
+    /// </summary>
+    public static string ReadRule(string directory)
+    {
+        var path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory));
+        if (!path.StartsWith('/') || path == "/" || path.IndexOfAny(['*', '?', '[', ']', '\\', '!', '#', '\n', '\r', '(', ')']) >= 0)
+        {
+            throw new ArgumentException($"Cannot confine reads to '{directory}': not an absolute path a Read rule matches literally.", nameof(directory));
+        }
+        return $"Read(/{path}/**)";
+    }
+
+    /// <summary>The allow rules of a session in <paramref name="workingDirectory"/>: <see cref="Allowed"/>, plus its <see cref="ReadRule"/> when confined.</summary>
+    public IReadOnlyList<string> AllowedIn(string? workingDirectory) => !ConfinedToWorkingDirectory
+        ? Allowed
+        : [.. Allowed, ReadRule(workingDirectory ?? throw new ArgumentNullException(nameof(workingDirectory),
+            "a session confined to its working directory needs that directory"))];
+
+    /// <summary>
+    /// The known Claude Code tools that write a file, run or stop a command, change the working tree's git state, start or message a
+    /// sub-agent (which could be given other tools) or reach the web, each denied by name to a read-only session. Belt and braces, not
+    /// the guarantee: the CLI adds tools over time, so this list is not exhaustive. What keeps a read-only session from any tool not
+    /// named here is <see cref="ReadOnlyPermissionMode"/> with no allow rule but its working directory's <see cref="ReadRule"/> (and no
+    /// settings file loaded): every call that would prompt — any tool beyond reading inside that directory — is auto-denied.
+    /// </summary>
+    public static readonly string[] WriteOrExecTools =
+        ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput", "KillShell", "PowerShell", "Monitor", "TaskStop", "Task",
+            "Agent", "SendMessage", "EnterWorktree", "ExitWorktree", .. Taint.WebTools];
+
+    /// <summary>
+    /// Claude Code's mode that auto-denies every tool call that would otherwise prompt (headless, nobody can approve one): file reads
+    /// inside the working directory and calls an allow rule pre-approves still run, nothing else does; <c>acceptEdits</c> would let a
+    /// session edit files unasked.
+    /// </summary>
+    public const string ReadOnlyPermissionMode = "dontAsk";
+
+    /// <summary>
+    /// The triage worker (E4): a session that reads an issue's text holds no write or exec capability at all and reads nothing but its
+    /// own triage worktree — Read, Glob and Grep inside its working directory (<see cref="ReadRule"/> its only allow rule,
+    /// <see cref="BlockReadsOutsideWorkingDirectories"/> set), in <see cref="ReadOnlyPermissionMode"/>, with every
+    /// <see cref="WriteOrExecTools"/> tool denied and no settings file loaded (<c>--setting-sources ""</c>: neither the repo's nor the
+    /// worker user's settings can widen it). It reasons from the code; it builds and runs nothing.
+    /// </summary>
+    public static readonly WorkerTools ReadOnly = new(ReadOnlyPermissionMode, [], WriteOrExecTools, "", confinedToWorkingDirectory: true);
+
+    /// <summary>
+    /// Whether these tools are read-only and confined: no allow rule beyond the working directory's <see cref="ReadRule"/>, every
+    /// <see cref="WriteOrExecTools"/> tool denied, in <see cref="ReadOnlyPermissionMode"/>, loading no settings file.
+    /// </summary>
+    public bool IsReadOnly =>
+        PermissionMode == ReadOnlyPermissionMode
+        && Allowed.Count == 0
+        && ConfinedToWorkingDirectory
+        && SettingSources.Length == 0
+        && WriteOrExecTools.All(t => Denied.Contains(t, StringComparer.Ordinal));
 }
 
 /// <summary>
@@ -147,8 +273,11 @@ public enum WorkerAuth
 /// </summary>
 public sealed class ClaudeWorker(
     string claudePath, Uri routerBaseUrl, string routerKey, WorkerAuth auth, TimeSpan timeout,
-    WorkerSandbox? sandbox = null, TimeSpan? stopGrace = null, string? pauseFlagDirectory = null) : IWorker
+    WorkerSandbox? sandbox = null, TimeSpan? stopGrace = null, string? pauseFlagDirectory = null, WorkerTools? tools = null) : IWorker
 {
+    /// <summary>The tools and permission mode every session of this worker runs with (default <see cref="WorkerTools.Implementer"/>).</summary>
+    public WorkerTools Tools { get; } = tools ?? WorkerTools.Implementer;
+
     public const string PauseReason = "Paused by the Dark Factory; the session resumes on Continue.";
 
     /// <summary>How long a stopped sandboxed worker gets to exit after its helper's stdin closes.</summary>
@@ -160,16 +289,35 @@ public sealed class ClaudeWorker(
     public static readonly string[] AllowedTools =
         ["Read", "Edit", "Write", "Glob", "Grep", "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(dotnet restore:*)"];
 
+    /// <summary>
+    /// Tools a worker is denied (<c>--disallowedTools</c>, which beats any allow rule, the target repo's own settings included): the
+    /// web tools (<see cref="Taint.WebTools"/>). Defence in depth: a use that still shows in the stream taints the session (E4).
+    /// </summary>
+    public static readonly string[] DeniedTools = Taint.WebTools;
+
     private static readonly string[] PassThroughVariables =
         ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "TERM", "DOTNET_ROOT"];
 
-    /// <summary>The router variables, the only secrets a worker holds (E1). The sandbox helper adds PATH, HOME and build settings.</summary>
-    public static Dictionary<string, string> BuildRouterVariables(Uri routerBaseUrl, string routerKey, WorkerAuth auth)
+    /// <summary>
+    /// The router variables, the only secrets a worker holds (E1). The sandbox helper adds PATH, HOME and build settings.
+    /// <c>ANTHROPIC_CUSTOM_HEADERS</c> holds two header lines (Claude Code splits it on line breaks): the router key and the session's
+    /// model class (<see cref="WorkerModelClass.Header"/>, E8). Nothing names a model: no <c>ANTHROPIC_MODEL</c>, no force-model header.
+    /// </summary>
+    public static Dictionary<string, string> BuildRouterVariables(Uri routerBaseUrl, string routerKey, WorkerAuth auth, string modelClass)
     {
+        if (!WorkerModelClass.IsValid(modelClass))
+        {
+            throw new ArgumentException($"'{modelClass}' is not a router model class (high, mid or low).", nameof(modelClass));
+        }
+        if (routerKey.IndexOfAny(['\r', '\n']) >= 0)
+        {
+            // In the header lines it would end its own header and could add another (a force-model pin), in every auth mode.
+            throw new ArgumentException("The router key contains a line break.", nameof(routerKey));
+        }
         var env = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["ANTHROPIC_BASE_URL"] = routerBaseUrl.ToString().TrimEnd('/'),
-            ["ANTHROPIC_CUSTOM_HEADERS"] = $"{RouterKeyHeader}: {routerKey}",
+            ["ANTHROPIC_CUSTOM_HEADERS"] = $"{RouterKeyHeader}: {routerKey}\n{WorkerModelClass.Header}: {modelClass}",
         };
         if (auth == WorkerAuth.RouterKey)
         {
@@ -179,7 +327,8 @@ public sealed class ClaudeWorker(
     }
 
     /// <summary>Unsandboxed environment: OS basics from the parent plus the router variables.</summary>
-    public static Dictionary<string, string> BuildEnvironment(IDictionary parent, Uri routerBaseUrl, string routerKey, WorkerAuth auth)
+    public static Dictionary<string, string> BuildEnvironment(IDictionary parent, Uri routerBaseUrl, string routerKey, WorkerAuth auth,
+        string modelClass)
     {
         var env = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var name in PassThroughVariables)
@@ -189,7 +338,7 @@ public sealed class ClaudeWorker(
                 env[name] = value;
             }
         }
-        foreach (var (k, v) in BuildRouterVariables(routerBaseUrl, routerKey, auth))
+        foreach (var (k, v) in BuildRouterVariables(routerBaseUrl, routerKey, auth, modelClass))
         {
             env[k] = v;
         }
@@ -223,21 +372,48 @@ public sealed class ClaudeWorker(
         });
     }
 
-    public static IReadOnlyList<string> BuildArguments(string prompt, string? resumeSessionId = null, string? settings = null)
+    /// <summary>
+    /// <paramref name="settings"/> (<c>--settings</c> JSON, or none) with <c>permissions.blockReadsOutsideWorkingDirectories</c> set:
+    /// Claude Code's file tools then refuse every path outside the working directories in every permission mode.
+    /// </summary>
+    public static string WithReadsBlockedOutsideWorkingDirectories(string? settings)
     {
+        var root = settings is null ? new System.Text.Json.Nodes.JsonObject() : System.Text.Json.Nodes.JsonNode.Parse(settings)!.AsObject();
+        if (root["permissions"] is not System.Text.Json.Nodes.JsonObject permissions)
+        {
+            root["permissions"] = permissions = new System.Text.Json.Nodes.JsonObject();
+        }
+        permissions[WorkerTools.BlockReadsOutsideWorkingDirectories] = true;
+        return root.ToJsonString();
+    }
+
+    /// <summary>
+    /// The CLI arguments of a session. Its working directory is required for tools confined to it
+    /// (<see cref="WorkerTools.ConfinedToWorkingDirectory"/>), whose one allow rule names it.
+    /// </summary>
+    public static IReadOnlyList<string> BuildArguments(string prompt, string? resumeSessionId = null, string? settings = null,
+        WorkerTools? tools = null, string? workingDirectory = null)
+    {
+        tools ??= WorkerTools.Implementer;
         var args = new List<string>
         {
             "-p", prompt,
             "--output-format", "stream-json",
             "--verbose",
-            "--permission-mode", "acceptEdits",
-            // Ignore the OS user's ~/.claude settings (env, hooks, plugins) and MCP servers so the
-            // worker sees only what the factory passes; the repo's own .claude settings still apply.
-            "--setting-sources", "project,local",
+            "--permission-mode", tools.PermissionMode,
+            // Never the OS user's ~/.claude settings (env, hooks, plugins) or MCP servers, so the worker sees only what the factory
+            // passes; an implementer still loads the repo's own .claude settings (project,local), a read-only session none ("").
+            "--setting-sources", tools.SettingSources,
             "--strict-mcp-config",
             "--allowedTools",
         };
-        args.AddRange(AllowedTools);
+        args.AddRange(tools.AllowedIn(workingDirectory));
+        args.Add("--disallowedTools");
+        args.AddRange(tools.Denied);
+        if (tools.ConfinedToWorkingDirectory)
+        {
+            settings = WithReadsBlockedOutsideWorkingDirectories(settings);
+        }
         if (settings is not null)
         {
             args.Add("--settings");
@@ -260,19 +436,25 @@ public sealed class ClaudeWorker(
 
     private static readonly TimeSpan OrphanGracePeriod = TimeSpan.FromSeconds(5);
 
-    public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId,
+    public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
         WorkerCallbacks? callbacks, CancellationToken ct)
     {
+        if (!WorkerModelClass.IsValid(modelClass))
+        {
+            throw new ArgumentException($"'{modelClass}' is not a router model class (high, mid or low).", nameof(modelClass));
+        }
         if (pauseFlagDirectory is null)
         {
-            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId), callbacks, ct);
+            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, tools: Tools, workingDirectory: workingDirectory),
+                modelClass, callbacks, ct);
         }
         var flag = PauseFlagPath(pauseFlagDirectory, workingDirectory);
         EnsurePauseFlagDirectory(pauseFlagDirectory);
         File.Delete(flag); // left by a crashed run, it would stop this one at its first tool call
         try
         {
-            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, BuildPauseSettings(flag)), callbacks, ct);
+            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, BuildPauseSettings(flag), Tools, workingDirectory),
+                modelClass, callbacks, ct);
         }
         finally
         {
@@ -320,12 +502,13 @@ public sealed class ClaudeWorker(
         }
     }
 
-    private async Task<WorkerResult> RunProcessAsync(string workingDirectory, IReadOnlyList<string> args, WorkerCallbacks? callbacks, CancellationToken ct)
+    private async Task<WorkerResult> RunProcessAsync(string workingDirectory, IReadOnlyList<string> args, string modelClass,
+        WorkerCallbacks? callbacks, CancellationToken ct)
     {
         // Sandboxed, the helper makes the worker a process-group leader and the pid reported is sudo's.
         using var process = sandbox is null
-            ? StartDirect(workingDirectory, args)
-            : sandbox.Start(workingDirectory, claudePath, args, BuildRouterVariables(routerBaseUrl, routerKey, auth));
+            ? StartDirect(workingDirectory, args, modelClass)
+            : sandbox.Start(workingDirectory, claudePath, args, BuildRouterVariables(routerBaseUrl, routerKey, auth, modelClass));
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(timeout);
 
@@ -349,8 +532,10 @@ public sealed class ClaudeWorker(
             {
                 await onStarted(process.Id, ct);
             }
-            var (onSession, onLine) = (callbacks?.OnSession, callbacks?.OnLine);
+            var (onSession, onLine, onModel, onUntrusted) = (callbacks?.OnSession, callbacks?.OnLine, callbacks?.OnModel, callbacks?.OnUntrusted);
             string? reported = null;
+            var modelsReported = 0;
+            var untrustedReported = 0;
             while (await process.StandardOutput.ReadLineAsync(timeoutCts.Token) is { } line)
             {
                 if (onLine is not null)
@@ -363,6 +548,21 @@ public sealed class ClaudeWorker(
                 {
                     reported = sid;
                     await onSession(sid, ct);
+                }
+                while (onModel is not null && modelsReported < state.Models.Count)
+                {
+                    await onModel(state.Models[modelsReported++], ct);
+                }
+                while (untrustedReported < state.UntrustedReads.Count)
+                {
+                    var reason = state.UntrustedReads[untrustedReported++];
+                    if (onUntrusted is null || state.SessionId is not { } tainted)
+                    {
+                        throw new InvalidOperationException(
+                            $"The worker used an untrusted-content tool ({reason}) but its taint cannot be recorded (no session id or no taint callback).");
+                    }
+                    // Not cancellable: a Ctrl-C or Pause must not abort a taint the session has already earned (E4).
+                    await onUntrusted(tainted, reason, CancellationToken.None);
                 }
             }
             await process.WaitForExitAsync(timeoutCts.Token);
@@ -431,7 +631,7 @@ public sealed class ClaudeWorker(
         }
     }
 
-    private Process StartDirect(string workingDirectory, IReadOnlyList<string> args)
+    private Process StartDirect(string workingDirectory, IReadOnlyList<string> args, string modelClass)
     {
         var psi = new ProcessStartInfo(GroupLeaderLauncher)
         {
@@ -449,7 +649,7 @@ public sealed class ClaudeWorker(
             psi.ArgumentList.Add(arg);
         }
         psi.Environment.Clear();
-        foreach (var (k, v) in BuildEnvironment(Environment.GetEnvironmentVariables(), routerBaseUrl, routerKey, auth))
+        foreach (var (k, v) in BuildEnvironment(Environment.GetEnvironmentVariables(), routerBaseUrl, routerKey, auth, modelClass))
         {
             psi.Environment[k] = v;
         }

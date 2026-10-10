@@ -26,12 +26,18 @@ public sealed record TransitionContext(WorkState? PausedFrom = null, int FixRoun
     public static TransitionContext From(IReadOnlyList<WorkState> transitions)
     {
         WorkState? pausedFrom = transitions.Count >= 2 && transitions[^1] == WorkState.Paused ? transitions[^2] : null;
-        // A fix round is a Review → Fixing step since the last Implement; returning from Paused is not a new round.
+        // A fix round is a Review → Fixing step (review findings), a CI → CIHealing step (red CI, sc-25383) or a MergeGate →
+        // Fixing step (the merge queue's update to the base conflicted, sc-25384) since the last Implement: every kind shares one
+        // count and one cap. Returning from Paused is not a new round.
         var lastImplement = transitions.ToList().FindLastIndex(s => s == WorkState.Implement);
         var fixRounds = Enumerable.Range(lastImplement + 1, transitions.Count - lastImplement - 1)
-            .Count(i => i > 0 && transitions[i] == WorkState.Fixing && transitions[i - 1] == WorkState.Review);
+            .Count(i => i > 0 && IsFixRound(transitions[i - 1], transitions[i]));
         return new TransitionContext(pausedFrom, fixRounds);
     }
+
+    /// <summary>Whether <paramref name="from"/> → <paramref name="to"/> starts a fix round (counted against <see cref="Lifecycle.MaxFixRounds"/>).</summary>
+    public static bool IsFixRound(WorkState from, WorkState to) =>
+        (from is WorkState.Review or WorkState.MergeGate && to == WorkState.Fixing) || (from == WorkState.CI && to == WorkState.CIHealing);
 }
 
 public sealed class IllegalTransitionException(WorkState from, WorkState to, string reason)
@@ -56,9 +62,11 @@ public static class Lifecycle
         [WorkState.Implement] = [WorkState.Review],
         [WorkState.Review] = [WorkState.Fixing, WorkState.CI],
         [WorkState.Fixing] = [WorkState.Review],
-        [WorkState.CI] = [WorkState.CIHealing, WorkState.MergeGate],
+        // A push after the review verdict voids it (E3): the new head goes back to Review.
+        [WorkState.CI] = [WorkState.CIHealing, WorkState.MergeGate, WorkState.Review],
         [WorkState.CIHealing] = [WorkState.CI],
-        [WorkState.MergeGate] = [WorkState.Merge],
+        // The merge queue (sc-25384): a conflict with the base goes to the fixer; the updated head's red CI goes to CI's triage.
+        [WorkState.MergeGate] = [WorkState.Merge, WorkState.Review, WorkState.Fixing, WorkState.CI],
         [WorkState.Merge] = [WorkState.Watch],
         // A reverted change reopens: back to Intake, or straight to Implement.
         [WorkState.Watch] = [WorkState.Done, WorkState.Intake, WorkState.Implement],
@@ -91,7 +99,7 @@ public static class Lifecycle
         {
             return from == WorkState.Escalated ? "already escalated" : null;
         }
-        if (from == WorkState.Review && to == WorkState.Fixing && context.FixRounds >= MaxFixRounds)
+        if (TransitionContext.IsFixRound(from, to) && context.FixRounds >= MaxFixRounds)
         {
             return $"{MaxFixRounds} fix rounds used; escalate instead";
         }

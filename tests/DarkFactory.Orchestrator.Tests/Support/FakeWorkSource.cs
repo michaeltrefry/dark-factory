@@ -9,7 +9,7 @@ public sealed class FakeWorkSource(WorkStory story, bool commentFails = false) :
     public List<string> Comments { get; } = [];
     /// <summary>Board writes in order, e.g. "claim 77", "state 77 Claimed", "link 77 a b".</summary>
     public List<string> Writes { get; } = [];
-    public WorkEpic? Epic { get; init; }
+    public WorkEpic? Epic { get; set; }
     public IReadOnlyList<WorkDocument> Documents { get; init; } = [];
 
     public Task<IReadOnlyList<int>> ListReadyAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<int>>([]);

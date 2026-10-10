@@ -10,11 +10,31 @@
 
   <ItemGroup>
     <Using Include="Xunit" />
+    <Using Include="DarkFactory.Orchestrator.Gateway" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The seeded review diffs, shared with the unit tests' fake-router test (ReviewSeedTests). -->
+    <None Include="../DarkFactory.Orchestrator.Tests/Fixtures/review/*.diff" Link="Fixtures/review/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <!-- The recorded transcripts the stub Claude Code CLI of the stuck tests replays (FreezeAndStuckTests), shared with StuckWorkerTests. -->
+    <None Include="../DarkFactory.Orchestrator.Tests/Fixtures/stream-json-stuck-loop.jsonl;../DarkFactory.Orchestrator.Tests/Fixtures/stream-json-silence-progress.jsonl" Link="Fixtures/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The one way a test signals a process it started (start-time checked); OwnProcessTests guards both projects. -->
+    <Compile Include="../DarkFactory.Orchestrator.Tests/OwnProcess.cs" Link="OwnProcess.cs" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="../../src/DarkFactory.Orchestrator/DarkFactory.Orchestrator.csproj" />
+    <!-- The gateway lint (sc-25390): the live tests reach GitHub, Shortcut and the router only through the orchestrator's gateway. -->
+    <ProjectReference Include="../../src/DarkFactory.Analyzers/DarkFactory.Analyzers.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
   </ItemGroup>
+
+  <!-- Switching analyzers off on the command line (the RunAnalyzers properties) fails the build too: the gateway lint always runs. -->
+  <Target Name="RequireGatewayLint" BeforeTargets="CoreCompile">
+    <Error Condition="'$(RunAnalyzers)' == 'false' or '$(RunAnalyzersDuringBuild)' == 'false'" Text="The gateway lint (sc-25390) runs in every build: RunAnalyzers and RunAnalyzersDuringBuild may not be false." />
+  </Target>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.12" />

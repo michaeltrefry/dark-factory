@@ -2,11 +2,13 @@
 # factory-worker-launch — runs one Dark Factory worker command as the sandbox user.
 #
 # Installed root-owned at /usr/local/libexec/dark-factory/factory-worker-launch by
-# scripts/setup-worker-user.sh (which sets sandbox_user below); the orchestrator runs it with
+# scripts/setup-worker-user.sh (which sets sandbox_user and sandbox_uid below); the orchestrator runs it with
 #   sudo -n -u _factory factory-worker-launch <program> [args...]
 #
 # Protocol (stdin):
-#   KEY=VALUE lines for the router variables, then one empty line. The orchestrator
+#   KEY=VALUE lines for the router variables, then one empty line. ANTHROPIC_CUSTOM_HEADERS
+#   may come on several lines (one header each: the router key, the model class); they are
+#   joined with line breaks into one variable, as Claude Code reads it. The orchestrator
 #   keeps stdin open for the life of the run; when stdin closes (Stop, timeout, or the
 #   orchestrator died) the worker is killed.
 #
@@ -20,12 +22,25 @@
 # worker). That makes the sandbox user single-tenant: only one helper may run at a time,
 # which the orchestrator enforces with its work-root lock (WorkerLock).
 #
+# That uid-wide sweep needs two independent checks to run: this helper's user name is
+# sandbox_user, and its effective uid is sandbox_uid — the uid setup-worker-user.sh created or
+# verified for sandbox_user and pinned below, in the 400-499 range it allocates (never root, a
+# login account or another role account such as _spotlight), still sandbox_user's own uid, and not
+# the uid of whoever invoked sudo. Renaming sandbox_user to a login account (the owner's) or to
+# another role account can therefore never sweep that account's processes.
+#
 # Exit status: the worker's (137 when a Stop killed it). The uid sweep spares this helper's
 # own pid and its descendants (the sweep's own ps and subshells); kill -1 does not on macOS
 # (it signals the sender too), so the helper used to kill itself and every run exited 137.
 set -eu
 
 sandbox_user=_factory
+# Pinned by setup-worker-user.sh; empty in the repo, so an uninstalled copy never sweeps.
+sandbox_uid=
+# The orchestrator refuses to start unless the installed helper is this file (EnsureReadyAsync):
+# re-run setup-worker-user.sh after any change here.
+# shellcheck disable=SC2034 # read by the orchestrator, not by this script
+helper_version=3
 
 usage() {
     echo "usage: factory-worker-launch <program> [args...] (router variables on stdin)" >&2
@@ -42,6 +57,10 @@ case "$1" in
 esac
 
 vars=()
+headers=
+have_headers=0
+newline='
+'
 terminated=0
 while IFS= read -r line; do
     if [ -z "$line" ]; then
@@ -49,7 +68,15 @@ while IFS= read -r line; do
         break
     fi
     case "$line" in
-        ANTHROPIC_BASE_URL=* | ANTHROPIC_CUSTOM_HEADERS=* | ANTHROPIC_AUTH_TOKEN=*) vars+=("$line") ;;
+        ANTHROPIC_CUSTOM_HEADERS=*)
+            if [ "$have_headers" -eq 1 ]; then
+                headers="$headers$newline${line#ANTHROPIC_CUSTOM_HEADERS=}"
+            else
+                headers=${line#ANTHROPIC_CUSTOM_HEADERS=}
+                have_headers=1
+            fi
+            ;;
+        ANTHROPIC_BASE_URL=* | ANTHROPIC_AUTH_TOKEN=*) vars+=("$line") ;;
         *)
             echo "factory-worker-launch: refusing non-allowlisted variable '${line%%=*}'" >&2
             exit 64
@@ -60,6 +87,7 @@ if [ "$terminated" -ne 1 ]; then
     echo "factory-worker-launch: stdin closed before the variable block ended" >&2
     exit 64
 fi
+[ "$have_headers" -eq 0 ] || vars+=("ANTHROPIC_CUSTOM_HEADERS=$headers")
 
 # With HOME unset, ~ is the running user's home from the password database.
 unset HOME
@@ -70,21 +98,77 @@ path="$home/.local/bin:/usr/local/share/dotnet:/opt/homebrew/bin:/usr/local/bin:
 # away, then kill everything collected.
 collect_tree() {
     local child
-    kill -STOP "$1" 2>/dev/null || return 0
+    send_signal -STOP "$1" || return 0
     echo "$1"
     for child in $(pgrep -P "$1" || true); do
         collect_tree "$child"
     done
 }
 
-# Sends SIGKILL to the given pids: the one primitive the tests replace.
-kill_pids() { kill -KILL "$@" 2>/dev/null || true; }
+# Every signal this helper sends goes through here: the one primitive the tests replace, with a
+# seam that logs each target and signals only the test's own processes. It never signals pid or
+# group 0 or 1 (kill -- -0 is the caller's own group, -1 every process it may signal), nor an
+# empty target (an unset pid).
+send_signal() {
+    local a n
+    for a in "$@"; do
+        case "$a" in -[A-Z]* | --) continue ;; esac
+        n=${a#-}
+        case "$n" in '' | *[!0-9]*) return 1 ;; esac
+        [ "$((10#$n))" -gt 1 ] || return 1
+    done
+    kill "$@" 2>/dev/null
+}
+
+# Sends SIGKILL to the given pids.
+kill_pids() { send_signal -KILL "$@" || true; }
 
 # Decided once, up front. Never as anyone else: as the owner (e.g. running this script
 # directly) the sweep would take down their whole session.
 self_uid=$(id -u)
 is_sandbox_user=0
 [ "$(id -un)" != "$sandbox_user" ] || is_sandbox_user=1
+
+# The second, independent check, by uid (see the header). Prints why the sweep must not run, or
+# nothing. Fails closed: a uid it cannot resolve refuses.
+uid_sweep_refusal() {
+    local actual_uid owner_uid
+    case "$sandbox_uid" in
+        '' | *[!0-9]*) echo "no sandbox_uid pinned (setup-worker-user.sh pins it)"; return 0 ;;
+    esac
+    if [ "$((10#$sandbox_uid))" -lt 400 ] || [ "$((10#$sandbox_uid))" -gt 499 ]; then
+        echo "pinned uid $sandbox_uid is outside 400-499, the range setup-worker-user.sh allocates"; return 0
+    fi
+    actual_uid=$(id -u "$sandbox_user" 2>/dev/null) || actual_uid=
+    case "$actual_uid" in
+        '' | *[!0-9]*) echo "$sandbox_user has no uid"; return 0 ;;
+    esac
+    if [ "$actual_uid" != "$sandbox_uid" ]; then
+        echo "$sandbox_user's uid $actual_uid is not the pinned $sandbox_uid"; return 0
+    fi
+    if [ "$self_uid" != "$sandbox_uid" ]; then
+        echo "effective uid $self_uid is not $sandbox_user's ($sandbox_uid)"; return 0
+    fi
+    if [ "${SUDO_UID:-}" = "$sandbox_uid" ]; then
+        echo "uid $sandbox_uid is the invoking user's (SUDO_UID)"; return 0
+    fi
+    if [ -n "${SUDO_USER:-}" ]; then
+        owner_uid=$(id -u "$SUDO_USER" 2>/dev/null) || owner_uid=
+        if [ -z "$owner_uid" ] || [ "$owner_uid" = "$sandbox_uid" ]; then
+            echo "uid $sandbox_uid is (or may be) the invoking user $SUDO_USER's"; return 0
+        fi
+    fi
+    return 0
+}
+uid_sweep_ok=0
+if [ "$is_sandbox_user" -eq 1 ]; then
+    refusal=$(uid_sweep_refusal)
+    if [ -z "$refusal" ]; then
+        uid_sweep_ok=1
+    else
+        echo "factory-worker-launch: refusing the $sandbox_user uid sweep: $refusal" >&2
+    fi
+fi
 
 # "pid ppid" for every process of the sandbox user, by real and effective uid (also catches
 # setuid programs the worker started). ps, not pgrep: macOS pgrep silently drops its own
@@ -107,7 +191,7 @@ outside_tree() {
 # forked mid-sweep is caught on the next pass; SIGKILL can't be refused, so each pid is
 # signalled once.
 kill_sandbox_user() {
-    [ "$is_sandbox_user" -eq 1 ] || return 0
+    [ "$is_sandbox_user" -eq 1 ] && [ "$uid_sweep_ok" -eq 1 ] || return 0
     local pass pid fresh signalled=" "
     for pass in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
         fresh=()
@@ -132,8 +216,8 @@ set +m
 (
     while IFS= read -r _; do :; done
     # shellcheck disable=SC2046 # word splitting of the pid list is intended
-    kill -KILL $(collect_tree "$worker") 2>/dev/null || true
-    kill -KILL -- "-$worker" 2>/dev/null || true
+    send_signal -KILL $(collect_tree "$worker") || true
+    send_signal -KILL -- "-$worker" || true
     # The uid sweep is the main shell's, after the worker is reaped; from here it would race
     # (and could kill) the main shell's own commands.
 ) <&0 & # explicit, or bash gives background jobs /dev/null as stdin
@@ -141,8 +225,8 @@ watcher=$!
 
 status=0
 wait "$worker" || status=$?
-kill "$watcher" 2>/dev/null || true
+send_signal "$watcher" || true
 wait "$watcher" 2>/dev/null || true # gone before the sweep, which then spares only $$
-kill -KILL -- "-$worker" 2>/dev/null || true # nothing the worker started outlives the run
+send_signal -KILL -- "-$worker" || true # nothing the worker started outlives the run
 kill_sandbox_user
 exit "$status"

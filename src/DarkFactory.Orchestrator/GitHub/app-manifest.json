@@ -1,7 +1,7 @@
 {
   "name": "dark-factory",
   "url": "https://github.com/michaeltrefry/dark-factory",
-  "description": "Dark Factory workers: push factory/* branches and open pull requests. Never merges.",
+  "description": "Dark Factory workers: push factory/* branches and open pull requests; the orchestrator reads, comments on and labels watched repos' issues (triage). Never merges.",
   "public": false,
   "redirect_url": "http://localhost:47821/callback",
   "hook_attributes": {
@@ -11,6 +11,7 @@
   "default_permissions": {
     "contents": "write",
     "pull_requests": "write",
+    "issues": "write",
     "metadata": "read"
   },
   "default_events": []

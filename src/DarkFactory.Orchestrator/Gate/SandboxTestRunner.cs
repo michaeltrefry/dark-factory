@@ -1,0 +1,271 @@
+using System.Diagnostics;
+using System.Text;
+using DarkFactory.Orchestrator.Git;
+using DarkFactory.Orchestrator.Shortcut;
+using DarkFactory.Orchestrator.Worker;
+
+namespace DarkFactory.Orchestrator.Gate;
+
+/// <summary>
+/// The gate's test runs (sc-25382) on the factory's own clone (<see cref="GitWorkspace"/>), executed exactly like a worker:
+/// each run gets a fresh throwaway worktree shared with the worker user, and every command goes through the root-installed
+/// launch helper as that user (<see cref="WorkerSandbox.Start"/>) with no variables at all — no router key, no token — so
+/// the tests the PR's model wrote never run as the owner. The worktree is deleted after the run (as the worker user first).
+/// Without a sandbox (<c>Worker:RunAs=none</c>, development only) the commands run as the owner with a minimal environment,
+/// as unsandboxed workers do. A run is bounded by <paramref name="timeout"/>; the result files are read only as regular
+/// files (never through a link the tests could plant).
+/// </summary>
+public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, TimeSpan timeout, long maxResultFileBytes = SandboxTestRunner.MaxResultFileBytes)
+    : IGateTestRunner
+{
+    public static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(20);
+
+    /// <summary>How long one sandboxed run may take (<c>Gate:TestTimeoutMinutes</c>).</summary>
+    public TimeSpan Timeout => timeout;
+
+    /// <summary>How long a stopped run gets to exit after its helper's stdin closes.</summary>
+    private static readonly TimeSpan StopGrace = TimeSpan.FromSeconds(10);
+
+    /// <summary>The largest result file or build log read (a larger result file makes the run's report unreadable).</summary>
+    public const long MaxResultFileBytes = 50 * 1024 * 1024;
+
+    public Task<IReadOnlyList<ChangedFile>> ChangesAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct) =>
+        git.ChangedFilesAsync(repo, baseSha, headSha, ct);
+
+    public Task<IReadOnlyList<string>> FilesAsync(RepoRef repo, string sha, CancellationToken ct) => git.FilesAsync(repo, sha, ct);
+
+    public Task<string?> ReadAsync(RepoRef repo, string sha, string path, CancellationToken ct) => git.ReadFileAsync(repo, sha, path, ct);
+
+    public async Task<TestRunReport> RunAsync(RepoRef repo, TestRunSpec spec, CancellationToken ct)
+    {
+        if (spec.ResultsDirectory is not { Length: > 0 } name || name.Contains('/') || name.Contains('\\') || name is "." or "..")
+        {
+            throw new ArgumentException($"'{spec.ResultsDirectory}' is not a results directory name.", nameof(spec));
+        }
+        var workspace = await git.PrepareCommitAsync(repo, spec.Name, spec.Commit, ct);
+        try
+        {
+            if (spec.OverlayFrom is { } overlay)
+            {
+                await git.OverlayAsync(workspace, overlay, spec.OverlayPaths, spec.DeletePaths, ct, spec.Replacements);
+            }
+            // Every result file must come from this run: the directory is a fresh random name, and nothing may be there yet.
+            var results = Path.Combine(workspace.Path, spec.ResultsDirectory);
+            if (Directory.Exists(results) || File.Exists(results) || new FileInfo(results).LinkTarget is not null)
+            {
+                throw new InvalidOperationException($"The run's results directory {spec.ResultsDirectory} already exists in {Ci.Short(spec.Commit)}'s worktree.");
+            }
+            var log = new StringBuilder();
+            var deadline = DateTimeOffset.UtcNow + timeout;
+            var buildFailed = false;
+            foreach (var step in spec.Steps)
+            {
+                if (buildFailed && step.Phase == TestPhase.Test)
+                {
+                    break;
+                }
+                var (exit, output, timedOut) = await RunStepAsync(workspace.Path, step, deadline - DateTimeOffset.UtcNow, ct);
+                log.AppendLine($"$ {step.Program} {string.Join(' ', step.Args)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
+                for (var fallback = step.Fallback; !timedOut && exit == TestStep.InvalidCommandLine && fallback is not null; fallback = fallback.Fallback)
+                {
+                    (exit, output, timedOut) = await RunStepAsync(workspace.Path, fallback, deadline - DateTimeOffset.UtcNow, ct);
+                    log.AppendLine($"$ {fallback.Program} {string.Join(' ', fallback.Args)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
+                }
+                if (timedOut)
+                {
+                    return TestRunReport.Failed(TestRunStatus.TimedOut, log.ToString());
+                }
+                if (exit != 0 && step.Phase == TestPhase.Restore)
+                {
+                    return TestRunReport.Failed(TestRunStatus.RestoreFailed, log.ToString());
+                }
+                // Every build step runs, so the errors of every project are known.
+                buildFailed |= exit != 0 && step.Phase == TestPhase.Build;
+            }
+            if (buildFailed)
+            {
+                string[] roots = [workspace.Path, RealPath(workspace.Path)];
+                return TestRunReport.Failed(TestRunStatus.BuildFailed, log.ToString()) with
+                {
+                    BuildErrors = ResultFiles(results, spec.Strategy.BuildLogPattern, maxResultFileBytes)
+                        .Where(l => l.Content is not null).SelectMany(l => spec.Strategy.ParseBuildErrors(l.Content!, roots)).Distinct().ToList(),
+                };
+            }
+            // Only the reports the test steps ask their runner for (one format per run), so nothing else is read as results.
+            var files = spec.Steps.Select(s => s.ResultFilePattern).OfType<string>().Distinct(StringComparer.Ordinal)
+                .SelectMany(p => ResultFiles(results, p, maxResultFileBytes)).DistinctBy(f => f.Name).ToList();
+            if (files.Count == 0)
+            {
+                return TestRunReport.Failed(TestRunStatus.NoResults, log.ToString());
+            }
+            var parsed = spec.Strategy.ParseResults(files.Where(f => f.Content is not null).Select(f => new ResultFile(f.Name, f.Content!)));
+            var limit = maxResultFileBytes % (1024 * 1024) == 0 ? $"{maxResultFileBytes / (1024 * 1024)} MB" : $"{maxResultFileBytes} bytes";
+            var tooLarge = files.Where(f => f.Content is null).Select(f => $"{f.Name}: it is larger than {limit}, so it was not read");
+            return new TestRunReport(TestRunStatus.Ran, parsed.Cases, log.ToString()) { UnreadableReports = [.. tooLarge, .. parsed.Unreadable] };
+        }
+        finally
+        {
+            await git.RemoveAsync(repo, workspace, CancellationToken.None);
+        }
+    }
+
+    /// <summary>
+    /// <paramref name="path"/> with every symlinked component resolved (e.g. macOS <c>/var</c> → <c>/private/var</c>): the
+    /// form the build tools, which see the real working directory, print in their errors. The owner's own directories only.
+    /// </summary>
+    internal static string RealPath(string path)
+    {
+        var full = Path.GetFullPath(path);
+        var current = Path.GetPathRoot(full)!;
+        foreach (var part in full[current.Length..].Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
+        {
+            current = Path.Combine(current, part);
+            if (new DirectoryInfo(current) is { LinkTarget: not null } link && link.ResolveLinkTarget(returnFinalTarget: true) is { } target)
+            {
+                current = target.FullName;
+            }
+        }
+        return current;
+    }
+
+    /// <summary>
+    /// The result files, by path relative to <paramref name="directory"/> ('/'-separated), with their contents: regular files
+    /// only, found without following links (the directory and everything in it were written by the tests); a file larger
+    /// than <paramref name="maxBytes"/> is listed with no content (not read).
+    /// </summary>
+    internal static List<(string Name, string? Content)> ResultFiles(string directory, string pattern, long maxBytes)
+    {
+        var info = new DirectoryInfo(directory);
+        if (!info.Exists || info.LinkTarget is not null)
+        {
+            return [];
+        }
+        var options = new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint, IgnoreInaccessible = true };
+        return info.EnumerateFiles(pattern, options)
+            .Where(f => f.LinkTarget is null)
+            .OrderBy(f => f.FullName, StringComparer.Ordinal)
+            .Select(f => (Path.GetRelativePath(info.FullName, f.FullName).Replace(Path.DirectorySeparatorChar, '/'),
+                f.Length <= maxBytes ? File.ReadAllText(f.FullName) : null))
+            .ToList();
+    }
+
+    private async Task<(int ExitCode, string Output, bool TimedOut)> RunStepAsync(string worktree, TestStep step, TimeSpan remaining, CancellationToken ct)
+    {
+        using var process = sandbox is null ? StartDirect(worktree, step) : sandbox.Start(worktree, step.Program, step.Args, new Dictionary<string, string>());
+        var output = new Tail();
+        var stdout = PumpAsync(process.StandardOutput, output);
+        var stderr = PumpAsync(process.StandardError, output);
+        using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        bounded.CancelAfter(remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero);
+        try
+        {
+            await process.WaitForExitAsync(bounded.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            await StopAsync(process);
+            if (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            return (-1, output.ToString(), true);
+        }
+        finally
+        {
+            if (sandbox is not null)
+            {
+                WorkerSandbox.Stop(process); // the helper then kills whatever the step left running
+            }
+        }
+        await Task.WhenAll(stdout, stderr);
+        return (process.ExitCode, output.ToString(), false);
+    }
+
+    private async Task StopAsync(Process process)
+    {
+        if (sandbox is null)
+        {
+            process.Kill(entireProcessTree: true);
+            return;
+        }
+        WorkerSandbox.Stop(process);
+        using var grace = new CancellationTokenSource(StopGrace);
+        try
+        {
+            await process.WaitForExitAsync(grace.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // Still running as the worker user: the next helper exit (the worktree's deletion) kills it.
+        }
+    }
+
+    private static async Task PumpAsync(StreamReader reader, Tail tail)
+    {
+        while (await reader.ReadLineAsync() is { } line)
+        {
+            tail.Add(line);
+        }
+    }
+
+    /// <summary>The variables an unsandboxed run keeps from the owner's environment (no secrets: never the router key or a token).</summary>
+    private static readonly string[] PassThrough = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "DOTNET_ROOT"];
+
+    private static Process StartDirect(string worktree, TestStep step)
+    {
+        var psi = new ProcessStartInfo(step.Program)
+        {
+            WorkingDirectory = worktree,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        foreach (var arg in step.Args)
+        {
+            psi.ArgumentList.Add(arg);
+        }
+        var parent = Environment.GetEnvironmentVariables();
+        psi.Environment.Clear();
+        foreach (var name in PassThrough)
+        {
+            if (parent[name] is string value)
+            {
+                psi.Environment[name] = value;
+            }
+        }
+        // As the helper sets them: no build server or node outlives the run.
+        psi.Environment["MSBUILDDISABLENODEREUSE"] = "1";
+        psi.Environment["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0";
+        var process = Process.Start(psi) ?? throw new InvalidOperationException($"Could not start {step.Program}.");
+        process.StandardInput.Close();
+        return process;
+    }
+
+    /// <summary>The last lines of a run's output (thread-safe: stdout and stderr both add).</summary>
+    private sealed class Tail
+    {
+        private const int MaxLines = 60;
+        private readonly Queue<string> _lines = new();
+
+        public void Add(string line)
+        {
+            lock (_lines)
+            {
+                _lines.Enqueue(line);
+                if (_lines.Count > MaxLines)
+                {
+                    _lines.Dequeue();
+                }
+            }
+        }
+
+        public override string ToString()
+        {
+            lock (_lines)
+            {
+                return string.Join('\n', _lines);
+            }
+        }
+    }
+}

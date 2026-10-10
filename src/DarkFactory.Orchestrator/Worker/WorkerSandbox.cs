@@ -1,4 +1,7 @@
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
 
 namespace DarkFactory.Orchestrator.Worker;
 
@@ -17,13 +20,37 @@ public interface IWorkerSandbox
 /// (<c>scripts/factory-worker-launch</c>), which <c>scripts/setup-worker-user.sh</c> installs
 /// and allows the owner to run as <see cref="User"/> via a NOPASSWD sudoers rule.
 /// Router variables travel on the helper's stdin, never argv; closing stdin stops the worker.
+/// <paramref name="HelperSource"/>: the helper as <c>scripts/factory-worker-launch</c> has it, which the installed one must
+/// match (<see cref="StaleHelperReason"/>); null is the copy compiled into this assembly.
 /// </summary>
-public sealed record WorkerSandbox(string User, string HelperPath, string SudoPath = WorkerSandbox.DefaultSudoPath) : IWorkerSandbox
+public sealed record WorkerSandbox(string User, string HelperPath, string SudoPath = WorkerSandbox.DefaultSudoPath, string? HelperSource = null)
+    : IWorkerSandbox
 {
     public const string DefaultUser = "_factory";
     public const string DefaultHelperPath = "/usr/local/libexec/dark-factory/factory-worker-launch";
     public const string DefaultSudoPath = "/usr/bin/sudo";
-    public const string SetupHint = "run `sudo scripts/setup-worker-user.sh` once (see README, Worker sandbox)";
+    public const string ReinstallCommand = "sudo scripts/setup-worker-user.sh";
+    public const string SetupHint = $"run `{ReinstallCommand}` once (see README, Worker sandbox)";
+
+    /// <summary>The <c>helper_version</c> of <c>scripts/factory-worker-launch</c>: an installed helper below it is stale.</summary>
+    public const int HelperVersion = 3;
+
+    /// <summary>
+    /// The oldest Claude Code the worker user may run: 2.1.291, the release the confined triage session was built and checked
+    /// against (it honours <c>--setting-sources ""</c>, <c>permissions.blockReadsOutsideWorkingDirectories</c> and the
+    /// <c>dontAsk</c> permission mode). No earlier release is pinned as honouring all three, and an older CLI that does not know
+    /// a setting ignores it silently, so <see cref="EnsureReadyAsync"/> refuses one below this.
+    /// </summary>
+    public const string MinClaudeVersion = "2.1.291";
+
+    /// <summary><c>scripts/factory-worker-launch</c> as built into this assembly (never written out or run: only compared).</summary>
+    private static readonly Lazy<string> CompiledHelper = new(() =>
+    {
+        using var stream = typeof(WorkerSandbox).Assembly.GetManifestResourceStream("factory-worker-launch")
+            ?? throw new InvalidOperationException("The launch helper is not compiled into the orchestrator.");
+        using var reader = new StreamReader(stream);
+        return reader.ReadToEnd();
+    });
 
     /// <summary>Directory ACL for the worker user and the owner; file_inherit/directory_inherit carry it to everything created later.</summary>
     private const string AclRights =
@@ -34,17 +61,31 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     public IReadOnlyList<string> BuildLaunchArguments(string program, IEnumerable<string> args) =>
         ["-n", "-u", User, HelperPath, program, .. args];
 
-    /// <summary>The helper's stdin block: allowlisted <c>KEY=VALUE</c> lines and a terminating empty line.</summary>
+    /// <summary>The one variable whose value may span lines: one header per line (the router key, the model class).</summary>
+    public const string MultiLineVariable = "ANTHROPIC_CUSTOM_HEADERS";
+
+    /// <summary>
+    /// The helper's stdin block: allowlisted <c>KEY=VALUE</c> lines and a terminating empty line. A
+    /// <see cref="MultiLineVariable"/> value of several lines goes as one <c>KEY=line</c> line each, which the helper joins back
+    /// with line breaks; none of its lines may be empty (that would end the block). Any other line break is refused.
+    /// </summary>
     public static string BuildVariableBlock(IReadOnlyDictionary<string, string> variables)
     {
+        var block = new StringBuilder();
         foreach (var (key, value) in variables)
         {
-            if (key.Contains('=') || $"{key}{value}".IndexOfAny(['\n', '\r']) >= 0)
+            var lines = key == MultiLineVariable ? value.Split('\n') : [value];
+            if (key.Contains('=') || key.IndexOfAny(['\n', '\r']) >= 0 || lines.Any(l => l.IndexOfAny(['\n', '\r']) >= 0)
+                || (lines.Length > 1 && lines.Any(l => l.Length == 0)))
             {
-                throw new ArgumentException($"Worker variable '{key}' contains '=' in its name or a line break.");
+                throw new ArgumentException($"Worker variable '{key}' contains '=' in its name, a line break or an empty header line.");
+            }
+            foreach (var line in lines)
+            {
+                block.Append(key).Append('=').Append(line).Append('\n');
             }
         }
-        return string.Concat(variables.Select(kv => $"{kv.Key}={kv.Value}\n")) + "\n";
+        return block.Append('\n').ToString();
     }
 
     /// <summary>Starts <paramref name="program"/> as the worker user. The caller must keep stdin open for the life of the run.</summary>
@@ -139,13 +180,72 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     }
 
     /// <summary>
-    /// Fails fast, with the setup command, when the user, helper or sudoers rule is missing, or when the installed helper
-    /// is stale: the probe hands it the router variable names a worker launch uses for <paramref name="auth"/> (dummy values),
-    /// so a helper whose allowlist refuses one fails here once instead of failing every worker launch.
+    /// Why <paramref name="installed"/> (the installed helper's text) is not the current helper set up for
+    /// <paramref name="user"/>, or null. Setup installs <c>scripts/factory-worker-launch</c> with exactly two lines edited,
+    /// <c>sandbox_user=&lt;user&gt;</c> and <c>sandbox_uid=&lt;its uid&gt;</c>; with those two undone, the installed file
+    /// must have the same SHA-256 as <paramref name="source"/> (null: the compiled-in helper). So a helper installed before
+    /// a change (or edited since) is stale, whatever its version line says.
     /// </summary>
-    public async Task EnsureReadyAsync(WorkerAuth auth, CancellationToken ct)
+    public static string? StaleHelperReason(string installed, string user, string? source = null)
     {
-        var probeVariables = ClaudeWorker.BuildRouterVariables(new Uri("http://127.0.0.1/"), "probe", auth);
+        source ??= CompiledHelper.Value;
+        var version = Regex.Match(installed, "^helper_version=([0-9]{1,9})$", RegexOptions.Multiline);
+        if (!version.Success)
+        {
+            return "it has no helper_version line";
+        }
+        if (int.Parse(version.Groups[1].Value) < HelperVersion)
+        {
+            return $"its helper_version {version.Groups[1].Value} is older than {HelperVersion}";
+        }
+        var users = Regex.Matches(installed, "^sandbox_user=(.*)$", RegexOptions.Multiline);
+        if (users.Count != 1 || users[0].Groups[1].Value != user)
+        {
+            return $"its sandbox_user is not {user}";
+        }
+        var uids = Regex.Matches(installed, "^sandbox_uid=(.*)$", RegexOptions.Multiline);
+        if (uids.Count != 1 || !Regex.IsMatch(uids[0].Groups[1].Value, "^[0-9]+$"))
+        {
+            return "it has no pinned sandbox_uid";
+        }
+        var unpinned = installed
+            .Remove(uids[0].Index, uids[0].Length).Insert(uids[0].Index, "sandbox_uid=");
+        var userLine = Regex.Match(unpinned, "^sandbox_user=.*$", RegexOptions.Multiline);
+        unpinned = unpinned.Remove(userLine.Index, userLine.Length).Insert(userLine.Index, $"sandbox_user={DefaultUser}");
+        var (have, want) = (Sha256(unpinned), Sha256(source));
+        return have == want ? null : $"its text differs from the repo helper, scripts/factory-worker-launch (sha256 {have[..12]}…, expected {want[..12]}…)";
+    }
+
+    private static string Sha256(string text) => Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(text)));
+
+    /// <summary>
+    /// Fails fast, with the setup command, when the user, helper or sudoers rule is missing, or when the installed helper
+    /// is stale. Before anything runs, the installed file must be the current helper (<see cref="StaleHelperReason"/>; it is
+    /// installed 0755, so readable): an older one may lack the uid sweep's guards. Then the probe hands it the router variable
+    /// names a worker launch uses for <paramref name="auth"/> (dummy values), so a helper whose allowlist refuses one fails
+    /// here once instead of failing every worker launch; and a helper that refuses its uid sweep (its pinned uid is not the
+    /// worker user's, or outside 400-499) fails too, since a worker's leftovers would then outlive every run. Last, the worker
+    /// user's own Claude Code (<paramref name="claudePath"/>, as the worker sees it) must be at least <see cref="MinClaudeVersion"/>.
+    /// </summary>
+    public async Task EnsureReadyAsync(WorkerAuth auth, string claudePath, CancellationToken ct)
+    {
+        string installed;
+        try
+        {
+            installed = await File.ReadAllTextAsync(HelperPath, ct);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new InvalidOperationException($"Worker sandbox unavailable: cannot read the launch helper {HelperPath} ({ex.Message}); {SetupHint}.", ex);
+        }
+        if (StaleHelperReason(installed, User, HelperSource) is { } stale)
+        {
+            throw new InvalidOperationException(
+                $"Stale helper: the installed launch helper {HelperPath} is not the current scripts/factory-worker-launch ({stale}); "
+                + $"re-run `{ReinstallCommand}` to install it (that kills every {User} process: stop `factory work` first).");
+        }
+        // Shaped like a real launch: the headers of a classed session span two lines (E8).
+        var probeVariables = ClaudeWorker.BuildRouterVariables(new Uri("http://127.0.0.1/"), "probe", auth, WorkerModelClass.Mid);
         (int ExitCode, string Stdout, string Stderr) probe;
         try
         {
@@ -166,6 +266,44 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
             throw new InvalidOperationException(
                 $"Worker sandbox user '{User}' is not usable through {HelperPath} ({probe.Stderr.Trim()}); {SetupHint}.");
         }
+        if (probe.Stderr.Split('\n').FirstOrDefault(l => l.Contains("refusing the", StringComparison.Ordinal) && l.Contains("uid sweep", StringComparison.Ordinal))
+            is { } refusal)
+        {
+            throw new InvalidOperationException(
+                $"The installed launch helper {HelperPath} refuses its {User} uid sweep, so a worker's leftovers would outlive its run "
+                + $"({refusal.Trim()}); re-run `{ReinstallCommand}` (it pins {User}'s uid; a {User} whose uid is outside 400-499 must be recreated).");
+        }
+        var claude = await RunAsync("/", claudePath, ["--version"], ct);
+        if (claude.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"Cannot run `{claudePath} --version` as {User} through {HelperPath} (exit {claude.ExitCode}: {claude.Stderr.Trim()}); {SetupHint}.");
+        }
+        if (OutdatedClaudeReason(claude.Stdout) is { } outdated)
+        {
+            throw new InvalidOperationException(
+                $"Upgrade {User}'s claude: {outdated}, and an older CLI may silently ignore the triage session's read confinement "
+                + $"(`--setting-sources \"\"`, `blockReadsOutsideWorkingDirectories`, `dontAsk`); run `sudo -u {User} -H ~{User}/.local/bin/claude update` "
+                + $"(or delete ~{User}/.local/bin/claude and re-run `{ReinstallCommand}` to reinstall it).");
+        }
+    }
+
+    /// <summary>
+    /// Why <paramref name="versionOutput"/> (what <c>claude --version</c> printed, e.g. <c>2.1.291 (Claude Code)</c>) is not at least
+    /// <see cref="MinClaudeVersion"/>, or null.
+    /// </summary>
+    public static string? OutdatedClaudeReason(string versionOutput)
+    {
+        var text = versionOutput.Trim();
+        var match = Regex.Match(text, @"^([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})(?![0-9.\-])"); // a pre-release (-beta) sorts before its release: refused
+        if (!match.Success)
+        {
+            return $"its `claude --version` printed '{(text.Length > 80 ? text[..80] : text)}', no version (Claude Code {MinClaudeVersion} or newer is required)";
+        }
+        var version = new Version(int.Parse(match.Groups[1].Value), int.Parse(match.Groups[2].Value), int.Parse(match.Groups[3].Value));
+        return version < Version.Parse(MinClaudeVersion)
+            ? $"it runs Claude Code {version}, older than the {MinClaudeVersion} the factory requires"
+            : null;
     }
 
     /// <summary>

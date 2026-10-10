@@ -139,9 +139,37 @@ public class GitHubAppTests
     [Fact]
     public async Task Missing_installation_says_to_install_the_app()
     {
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+        // Not a GitHubNotFoundException ("no such ref"): main-red must not read a repo the App cannot see as having no tip.
+        var ex = await Assert.ThrowsAsync<GitHubAppNotInstalledException>(
             () => App(new FakeApi()).CreateInstallationTokenAsync(Sandbox, CancellationToken.None));
         Assert.Contains("not installed on michaeltrefry/dark-factory-sandbox", ex.Message);
+    }
+
+    [Fact]
+    public async Task A_token_mint_404_is_an_app_that_cannot_see_the_repo()
+    {
+        var api = new FakeApi().On("GET /repos/michaeltrefry/dark-factory-sandbox/installation", HttpStatusCode.OK, """{"id":987}""");
+
+        var ex = await Assert.ThrowsAsync<GitHubAppNotInstalledException>(
+            () => App(api).CreateInstallationTokenAsync(Sandbox, CancellationToken.None));
+        Assert.Contains("create installation token", ex.Message);
+    }
+
+    [Fact]
+    public async Task A_compare_404_under_a_working_installation_is_not_found_and_a_missing_installation_is_not()
+    {
+        const string compare = "GET /repos/michaeltrefry/dark-factory-sandbox/compare/main...mergeAaaaaaaaaaa";
+        var installed = GitHubWithInstallation().On(compare, HttpStatusCode.NotFound, """{"message":"Not Found"}""");
+        var gate = new GitHubGate(installed.Client("https://api.github.com/"), App(installed));
+
+        await Assert.ThrowsAsync<GitHubNotFoundException>(() => gate.CompareAsync(Sandbox, "main", "mergeAaaaaaaaaaa", CancellationToken.None));
+        Assert.Contains(installed.Requests, r => r.PathAndQuery.StartsWith("/repos/michaeltrefry/dark-factory-sandbox/compare/", StringComparison.Ordinal));
+
+        var uninstalled = new FakeApi().On(compare, HttpStatusCode.OK, """{"base_commit":{"sha":"tip"},"behind_by":0}""");
+        var blind = new GitHubGate(uninstalled.Client("https://api.github.com/"), App(uninstalled));
+
+        await Assert.ThrowsAsync<GitHubAppNotInstalledException>(() => blind.CompareAsync(Sandbox, "main", "mergeAaaaaaaaaaa", CancellationToken.None));
+        Assert.DoesNotContain(uninstalled.Requests, r => r.PathAndQuery.Contains("/compare/", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -222,7 +250,7 @@ public class GitHubAppTests
 public class GitHubAppSetupTests
 {
     [Fact]
-    public void Manifest_requests_only_contents_pr_write_and_metadata_read_without_webhook()
+    public void Manifest_requests_only_contents_pr_and_issues_write_and_metadata_read_without_webhook()
     {
         var manifest = JsonDocument.Parse(GitHubAppSetup.BuildManifest("dark-factory-test", 50123)).RootElement;
 
@@ -237,6 +265,7 @@ public class GitHubAppSetupTests
         {
             ["contents"] = "write",
             ["pull_requests"] = "write",
+            ["issues"] = "write", // sc-25385: the orchestrator reads, comments on and labels watched repos' issues
             ["metadata"] = "read",
         }, permissions);
     }

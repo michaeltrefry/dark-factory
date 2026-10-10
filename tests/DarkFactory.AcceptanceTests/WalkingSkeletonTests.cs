@@ -39,7 +39,7 @@ public class WalkingSkeletonTests
             await sandbox.ShareAsync(dir, ct);
         }
         var worker = new ClaudeWorker(Harness.Options.ClaudePath, Harness.Options.RouterBaseUrl, routerKey, Harness.Options.WorkerAuth, TimeSpan.FromMinutes(5), sandbox);
-        var result = await worker.RunAsync(dir, "Reply with the single word OK. Do not use any tools.", null, null, ct);
+        var result = await worker.RunAsync(dir, "Reply with the single word OK. Do not use any tools.", null, WorkerModelClass.Mid, null, ct);
 
         Assert.True(result.Succeeded, $"worker failed: exit {result.ExitCode}: {result.ResultText} {result.StderrTail}");
         var cost = await Harness.WaitForCostAsync(result.SessionId!, routerKey, ct);
@@ -63,6 +63,9 @@ public class WalkingSkeletonTests
         var routerKey = Harness.RequireSecret(o => o.RouterKey);
         var appId = Harness.RequireSecret(o => o.GitHubAppId);
         var appKey = Harness.RequireSecret(o => o.GitHubAppPrivateKeyPem);
+        Harness.RequireSecret(o => o.GitHubGateAppId); // the run goes on through review and the merge gate (sc-25378)
+        Harness.RequireSecret(o => o.GitHubGateAppPrivateKeyPem);
+        Harness.RequireReviewSettings();
         Harness.RequireClaude();
         await Harness.RequireRouterAsync();
         await using var db = await Harness.RequireLedgerAsync();
@@ -78,23 +81,23 @@ public class WalkingSkeletonTests
         // Transition rows (Step null); the session id is checkpointed in Implement and carried on Review.
         var rows = await db.LedgerEntries.Where(e => e.WorkItemId == item.Id && e.RecordedAt >= startedAt && e.Step == null)
             .OrderBy(e => e.Id).ToListAsync(ct);
-        Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Review], rows.Select(r => r.State));
+        Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Review], rows.Take(3).Select(r => r.State));
         Assert.All(rows, r => Assert.True(r.RecordedAt >= startedAt));
         Assert.True(await db.LedgerEntries.AnyAsync(e => e.WorkItemId == item.Id && e.Step == RunPipeline.Steps.Session
             && e.ClaudeSessionId == outcome.SessionId, ct));
         Assert.Equal(outcome.SessionId, rows[2].ClaudeSessionId);
 
-        // GitHub: an open PR from factory/sc-<id> whose body links the story.
+        // GitHub: a PR from factory/sc-<id> whose body links the story (merged by now if the gate passed it).
         var repo = RepoRef.Parse(item.Repo);
-        using var github = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        using var github = OutboundHttp.GitHubApi();
         var token = (await new GitHubApp(github, appId, appKey, TimeProvider.System).CreateInstallationTokenAsync(repo, ct)).Token;
         using var request = GitHubApp.Request(HttpMethod.Get,
-            $"repos/{repo.Owner}/{repo.Name}/pulls?state=open&head={Uri.EscapeDataString($"{repo.Owner}:{StoryId.BranchName(storyId)}")}",
+            $"repos/{repo.Owner}/{repo.Name}/pulls?state=all&head={Uri.EscapeDataString($"{repo.Owner}:{StoryId.BranchName(storyId)}")}",
             "Bearer", token);
         using var response = await github.SendAsync(request, ct);
         response.EnsureSuccessStatusCode();
-        var pr = (await response.Content.ReadFromJsonAsync<JsonElement>(ct)).EnumerateArray().Single();
-        Assert.Equal(outcome.PullRequestUrl, pr.GetProperty("html_url").GetString());
+        var pr = (await response.Content.ReadFromJsonAsync<JsonElement>(ct)).EnumerateArray()
+            .Single(p => p.GetProperty("html_url").GetString() == outcome.PullRequestUrl);
         Assert.Contains($"/story/{storyId}", pr.GetProperty("body").GetString());
 
         // Router: the session id in the ledger is recorded (a cost of $0 is valid: the router's local model).

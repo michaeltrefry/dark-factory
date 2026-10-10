@@ -19,7 +19,7 @@ public sealed record InstallationToken(string Token, DateTimeOffset ExpiresAt);
 /// </summary>
 public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPem, TimeProvider time)
 {
-    public static readonly Uri DefaultBaseAddress = new("https://api.github.com/");
+    public static readonly Uri DefaultBaseAddress = Gateway.OutboundHttp.GitHubApiBase;
 
     public static readonly IReadOnlyDictionary<string, string> TokenPermissions = new Dictionary<string, string>
     {
@@ -29,6 +29,31 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
 
     /// <summary>Longest installation-token lifetime the factory accepts (GitHub issues 1-hour tokens).</summary>
     public static readonly TimeSpan MaxTokenLifetime = TimeSpan.FromHours(1);
+
+    /// <summary>The App's id: what GitHub reports as <c>performed_via_github_app.id</c> on what its tokens wrote.</summary>
+    public string AppId => appId;
+
+    private string? _slug;
+
+    /// <summary>The App's slug (its bot account is <c>&lt;slug&gt;[bot]</c>), read once from <c>GET /app</c> as the App.</summary>
+    public async Task<string> SlugAsync(CancellationToken ct)
+    {
+        if (_slug is { } known)
+        {
+            return known;
+        }
+        using var request = Request(HttpMethod.Get, "app", "Bearer", CreateJwt());
+        using var response = await http.SendAsync(request, ct);
+        await EnsureSuccess(response, "read the App", ct);
+        var slug = (await response.Content.ReadFromJsonAsync<AppDto>(ct))?.Slug;
+        if (string.IsNullOrEmpty(slug))
+        {
+            throw new InvalidOperationException("GitHub returned no slug for the App.");
+        }
+        return _slug = slug;
+    }
+
+    private sealed record AppDto([property: JsonPropertyName("slug")] string? Slug);
 
     // Tolerates clock drift between this Mac and GitHub when checking expires_at.
     private static readonly TimeSpan ClockSkew = TimeSpan.FromMinutes(5);
@@ -46,7 +71,9 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
         return $"{signingInput}.{Base64Url(signature)}";
     }
 
-    public async Task<InstallationToken> CreateInstallationTokenAsync(RepoRef repo, CancellationToken ct)
+    /// <param name="permissions">The token's permissions; default <see cref="TokenPermissions"/>. Never more than the App was granted.</param>
+    public async Task<InstallationToken> CreateInstallationTokenAsync(RepoRef repo, CancellationToken ct,
+        IReadOnlyDictionary<string, string>? permissions = null)
     {
         var jwt = CreateJwt();
 
@@ -54,14 +81,20 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
         using var lookupResponse = await http.SendAsync(lookup, ct);
         if (lookupResponse.StatusCode == HttpStatusCode.NotFound)
         {
-            throw new InvalidOperationException($"The GitHub App is not installed on {repo}. Install it, then retry.");
+            throw new GitHubAppNotInstalledException($"The GitHub App is not installed on {repo} (or cannot see it). Install it, then retry.");
         }
         await EnsureSuccess(lookupResponse, "look up installation", ct);
         var installation = await lookupResponse.Content.ReadFromJsonAsync<InstallationDto>(ct);
 
         using var create = Request(HttpMethod.Post, $"app/installations/{installation!.Id}/access_tokens", "Bearer", jwt);
-        create.Content = JsonContent.Create(new { repositories = new[] { repo.Name }, permissions = TokenPermissions });
+        create.Content = JsonContent.Create(new { repositories = new[] { repo.Name }, permissions = permissions ?? TokenPermissions });
         using var createResponse = await http.SendAsync(create, ct);
+        if (createResponse.StatusCode == HttpStatusCode.NotFound)
+        {
+            // The installation went away (or lost the repo) between the lookup and the mint: the App cannot see the repo.
+            throw new GitHubAppNotInstalledException(
+                $"GitHub create installation token for {repo} failed: 404 {await createResponse.Content.ReadAsStringAsync(ct)}");
+        }
         await EnsureSuccess(createResponse, "create installation token", ct);
         var token = await createResponse.Content.ReadFromJsonAsync<AccessTokenDto>(ct);
         if (token!.ExpiresAt > time.GetUtcNow() + MaxTokenLifetime + ClockSkew)
@@ -87,7 +120,8 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
         if (!response.IsSuccessStatusCode)
         {
             var body = await response.Content.ReadAsStringAsync(ct);
-            throw new InvalidOperationException($"GitHub {action} failed: {(int)response.StatusCode} {body}");
+            var message = $"GitHub {action} failed: {(int)response.StatusCode} {body}";
+            throw response.StatusCode == HttpStatusCode.NotFound ? new GitHubNotFoundException(message) : new InvalidOperationException(message);
         }
     }
 
@@ -100,3 +134,16 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
         [property: JsonPropertyName("token")] string Token,
         [property: JsonPropertyName("expires_at")] DateTimeOffset ExpiresAt);
 }
+
+/// <summary>
+/// GitHub answered 404 to a request made under a working installation token: the ref or object (a branch, a commit) does not
+/// exist. An App that is not installed on the repo, or cannot see it, is <see cref="GitHubAppNotInstalledException"/> instead.
+/// </summary>
+public sealed class GitHubNotFoundException(string message) : InvalidOperationException(message);
+
+/// <summary>
+/// The App has no installation that can see the repo (the installation lookup, or the token mint, answered 404): the App is not
+/// installed there, lost access, or the repo is gone. Not a <see cref="GitHubNotFoundException"/>: nothing can be read, so a
+/// check that needed the read failed — it did not find "no such ref".
+/// </summary>
+public sealed class GitHubAppNotInstalledException(string message) : InvalidOperationException(message);

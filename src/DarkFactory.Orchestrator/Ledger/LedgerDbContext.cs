@@ -45,6 +45,12 @@ public sealed class LedgerEntry
     public DateTimeOffset RecordedAt { get; set; }
     public string? ClaudeSessionId { get; set; }
     public string? Detail { get; set; }
+
+    /// <summary>
+    /// How the step this row closes ended (E7, sc-25389), decided by <see cref="StepOutcomes.Of"/> when <see cref="WorkLedger"/> writes the
+    /// row. Required: no row is written without one (the column is NOT NULL and checked against the five names).
+    /// </summary>
+    public required StepOutcome Outcome { get; set; }
 }
 
 /// <summary>
@@ -76,6 +82,24 @@ public sealed class WorkerSession
     public decimal? CostUsd { get; set; }
 
     public long? RouterRequestCount { get; set; }
+}
+
+/// <summary>
+/// A worker session that has read untrusted content (E4, <see cref="Worker.Taint"/>): it never gets a push token. Insert-only and keyed
+/// by the Claude session id, so it holds across resume and crash; the first reason recorded is kept, and the database refuses to update
+/// or delete a row.
+/// </summary>
+public sealed class SessionTaint
+{
+    public required string ClaudeSessionId { get; set; }
+
+    /// <summary>The item the session worked for, when known.</summary>
+    public long? WorkItemId { get; set; }
+
+    /// <summary>What tainted it: <c>issue-text</c>, <c>outsider-comment</c>, <c>web:&lt;tool&gt;</c> or <c>mcp:&lt;tool&gt;</c>.</summary>
+    public required string Reason { get; set; }
+
+    public DateTimeOffset TaintedAt { get; set; }
 }
 
 /// <summary>One stdout line of a worker session, in arrival order (E7).</summary>
@@ -112,8 +136,14 @@ public sealed class Control
     public required string ChangedBy { get; set; }
     public DateTimeOffset ChangedAt { get; set; }
 
-    /// <summary>Usage scope only: why the factory is paused (<see cref="Controls.UsagePause"/>).</summary>
+    /// <summary>
+    /// Usage scope: why the factory is paused (<see cref="Controls.UsagePause"/>). Freeze scope: the trigger that froze it
+    /// (<see cref="Controls.FreezeTrigger"/>).
+    /// </summary>
     public string? Reason { get; set; }
+
+    /// <summary>Freeze scope only: what tripped the freeze, in words (the trigger itself is <see cref="Reason"/>).</summary>
+    public string? Detail { get; set; }
 
     /// <summary>Usage scope only: when the pause lifts by itself (it pauses nothing from then on).</summary>
     public DateTimeOffset? ResumeAt { get; set; }
@@ -131,13 +161,41 @@ public sealed class Control
     public bool PausesAt(DateTimeOffset now) => State == Controls.ControlState.Paused && (ResumeAt is null || now < ResumeAt);
 }
 
+/// <summary>
+/// A GitHub issue the factory has seen in a watched repo, and the key (<see cref="Id"/>) its work item is named by
+/// (<c>gh-&lt;Id&gt;</c>, <see cref="WorkSources.ItemNaming.GitHubIssue"/>): issue numbers repeat across repos.
+/// Everything the factory decides about the issue is a ledger row of that work item.
+/// </summary>
+public sealed class GitHubIssue
+{
+    public int Id { get; set; }
+
+    /// <summary>The issue's repo, <c>owner/name</c>.</summary>
+    public required string Repo { get; set; }
+
+    public int Number { get; set; }
+
+    public DateTimeOffset FirstSeenAt { get; set; }
+}
+
+/// <summary>How far the issue poll of one watched repo has read (issues updated at or after <see cref="Since"/> are read again).</summary>
+public sealed class GitHubIssueCursor
+{
+    public required string Repo { get; set; }
+
+    public DateTimeOffset Since { get; set; }
+}
+
 public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) : DbContext(options)
 {
+    public DbSet<GitHubIssue> GitHubIssues => Set<GitHubIssue>();
+    public DbSet<GitHubIssueCursor> GitHubIssueCursors => Set<GitHubIssueCursor>();
     public DbSet<WorkItem> WorkItems => Set<WorkItem>();
     public DbSet<LedgerEntry> LedgerEntries => Set<LedgerEntry>();
     public DbSet<WorkerSession> WorkerSessions => Set<WorkerSession>();
     public DbSet<SessionEvent> SessionEvents => Set<SessionEvent>();
     public DbSet<Control> Controls => Set<Control>();
+    public DbSet<SessionTaint> SessionTaints => Set<SessionTaint>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -154,10 +212,12 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
         });
         modelBuilder.Entity<LedgerEntry>(e =>
         {
-            e.ToTable("ledger_entries");
+            e.ToTable("ledger_entries", t => t.HasCheckConstraint("CK_ledger_entries_outcome",
+                $"\"Outcome\" IN ('{StepOutcomes.PassedName}', '{StepOutcomes.FailedName}', '{StepOutcomes.GateRejectedName}', '{StepOutcomes.DeferredName}', '{StepOutcomes.EscalatedName}')"));
             e.Property(x => x.State).HasConversion<string>().HasMaxLength(32);
             e.Property(x => x.Step).HasMaxLength(32);
             e.Property(x => x.ClaudeSessionId).HasMaxLength(128);
+            e.Property(x => x.Outcome).HasConversion(o => StepOutcomes.Name(o), name => StepOutcomes.Parse(name)).HasMaxLength(16).IsRequired();
             e.HasIndex(x => x.WorkItemId);
         });
         modelBuilder.Entity<WorkerSession>(e =>
@@ -189,6 +249,27 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
             e.Property(x => x.ChangedBy).HasMaxLength(128);
             e.Property(x => x.Reason).HasMaxLength(64);
             e.Property(x => x.Version).IsRowVersion();
+        });
+        modelBuilder.Entity<GitHubIssue>(e =>
+        {
+            e.ToTable("github_issues");
+            e.Property(x => x.Repo).HasMaxLength(200);
+            e.HasIndex(x => new { x.Repo, x.Number }).IsUnique();
+        });
+        modelBuilder.Entity<SessionTaint>(e =>
+        {
+            e.ToTable("session_taints");
+            e.HasKey(x => x.ClaudeSessionId);
+            e.Property(x => x.ClaudeSessionId).HasMaxLength(128);
+            e.Property(x => x.Reason).HasMaxLength(128);
+            e.HasIndex(x => x.WorkItemId);
+            e.HasOne<WorkItem>().WithMany().HasForeignKey(x => x.WorkItemId);
+        });
+        modelBuilder.Entity<GitHubIssueCursor>(e =>
+        {
+            e.ToTable("github_issue_cursors");
+            e.HasKey(x => x.Repo);
+            e.Property(x => x.Repo).HasMaxLength(200);
         });
     }
 

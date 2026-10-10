@@ -8,6 +8,9 @@
     <AssemblyName>factory</AssemblyName>
     <RootNamespace>DarkFactory.Orchestrator</RootNamespace>
     <UserSecretsId>dark-factory-orchestrator</UserSecretsId>
+    <!-- The generated sources (the Razor components' code above all) stay on disk under obj/<config>/<tfm>/generated, so
+         GatewayLintTests compile and lint exactly what the build linted (sc-25391). -->
+    <EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
   </PropertyGroup>
 
   <ItemGroup>
@@ -16,14 +19,33 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.12" />
+    <!-- Syntax trees only (no compilation, nothing run): the gate finds the xUnit tests a PR adds (sc-25382). -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.0.0" />
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3" />
     <PackageReference Include="System.CommandLine" Version="2.0.12" />
+    <PackageReference Include="YamlDotNet" Version="16.3.0" />
   </ItemGroup>
 
   <ItemGroup>
     <EmbeddedResource Include="GitHub/app-manifest.json" LogicalName="app-manifest.json" />
+    <EmbeddedResource Include="GitHub/gate-app-manifest.json" LogicalName="gate-app-manifest.json" />
+    <!-- The review panel's prompts (sealed: the factory's own repo, compiled in; never read from a target repo or disk). -->
+    <EmbeddedResource Include="../../factory/prompts/*.md" LogicalName="factory/prompts/%(Filename)%(Extension)" />
+    <!-- The launch helper as the repo has it: the installed one must match it (WorkerSandbox.StaleHelperReason). Only compared, never run. -->
+    <EmbeddedResource Include="../../scripts/factory-worker-launch" LogicalName="factory-worker-launch" />
+    <!-- The gateway lint's model provider markers (one list, also embedded in the analyzer): Router:BaseUrl may name none. -->
+    <EmbeddedResource Include="../DarkFactory.Analyzers/ProviderMarkers.txt" LogicalName="provider-markers.txt" />
+    <!-- The gateway lint (sc-25390): every build fails on outbound HTTP or a git push outside Gateway/ and on a model
+         provider's host anywhere (in the code and in these additional files; Razor markup is one already). -->
+    <ProjectReference Include="../DarkFactory.Analyzers/DarkFactory.Analyzers.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+    <AdditionalFiles Include="GitHub/*.json;../../factory/prompts/*.md;../../scripts/*" />
     <InternalsVisibleTo Include="DarkFactory.Orchestrator.Tests" />
     <InternalsVisibleTo Include="DarkFactory.AcceptanceTests" />
   </ItemGroup>
+
+  <!-- Switching analyzers off on the command line (the RunAnalyzers properties) fails the build too: the gateway lint always runs. -->
+  <Target Name="RequireGatewayLint" BeforeTargets="CoreCompile">
+    <Error Condition="'$(RunAnalyzers)' == 'false' or '$(RunAnalyzersDuringBuild)' == 'false'" Text="The gateway lint (sc-25390) runs in every build: RunAnalyzers and RunAnalyzersDuringBuild may not be false." />
+  </Target>
 
 </Project>

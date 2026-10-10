@@ -33,7 +33,7 @@ public class ControlTests
         public int Tools => Volatile.Read(ref _tools);
         public bool Cancelled { get; private set; }
 
-        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, WorkerCallbacks? callbacks, CancellationToken ct)
+        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass, WorkerCallbacks? callbacks, CancellationToken ct)
         {
             Resumes.Add(resumeSessionId);
             await callbacks!.OnStarted!(WorkerPid, ct);
@@ -84,7 +84,7 @@ public class ControlTests
         public TaskCompletionSource PauseRequested { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, WorkerCallbacks? callbacks, CancellationToken ct)
+        public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass, WorkerCallbacks? callbacks, CancellationToken ct)
         {
             Runs++;
             await callbacks!.OnStarted!(WorkerPid, ct);
@@ -137,10 +137,14 @@ public class ControlTests
         public InProcessRunLocks Locks { get; } = new();
         public WorkLedger Ledger => new(Db, TimeProvider.System);
         public TimeSpan PauseGrace { get; init; } = TimeSpan.FromSeconds(30);
+        /// <summary>When set, the run reads its controls through this (to make the reads fail).</summary>
+        public FlakyControls? Flaky { get; set; }
+        public int? MaxReadFailures { get; init; }
 
         public RunPipeline Pipeline(IWorker worker) =>
             new(Stories, Ledger, Locks, Workspaces, worker, Prs, RunPipelineTests.Sandbox, TextWriter.Null,
-                controls: Controls, pauseGrace: PauseGrace, controlPollInterval: TimeSpan.FromMilliseconds(10));
+                controls: (IControls?)Flaky ?? Controls, pauseGrace: PauseGrace, controlPollInterval: TimeSpan.FromMilliseconds(10),
+                maxControlReadFailures: MaxReadFailures);
 
         public Task<RunOutcome> Run(IWorker worker, int story = 77) => Pipeline(worker).RunAsync(story, CancellationToken.None);
 
@@ -208,6 +212,32 @@ public class ControlTests
         Assert.Equal(
             [WorkState.Intake, WorkState.Implement, WorkState.Paused, WorkState.Implement, WorkState.Review],
             (await h.Transitions()).Select(t => t.Item1));
+        Assert.Single(h.Prs.Opened);
+    }
+
+    [Fact]
+    public async Task A_freeze_during_implement_stops_the_worker_at_its_next_tool_call_and_a_human_continue_resumes_the_same_session()
+    {
+        var h = new Harness();
+        var worker = new ToolWorker();
+
+        var run = h.Run(worker);
+        await worker.Working.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await h.Controls.FreezeAsync(FreezeTrigger.MainRed, "main is red", null, CancellationToken.None);
+        var paused = await run.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(WorkState.Paused, paused.State);
+        Assert.False(worker.Cancelled); // it stopped on its own, at a tool boundary
+        Assert.Contains("factory freeze (main-red)", paused.Error);
+        Assert.Equal((WorkState.Paused, RunPipeline.FreezePaused), (await h.Transitions())[^1]);
+        Assert.Empty(await h.InFlight()); // held while frozen
+
+        await h.Actions().ContinueAsync(ControlScope.Freeze, "tester", CancellationToken.None);
+        Assert.Equal([77], await h.InFlight());
+        var resumed = await h.Run(worker);
+
+        Assert.True(resumed.Succeeded, resumed.Error);
+        Assert.Equal([null, Session], worker.Resumes); // the same Claude session, resumed
         Assert.Single(h.Prs.Opened);
     }
 
@@ -421,6 +451,61 @@ public class ControlTests
     }
 
     [Fact]
+    public async Task Controls_unreadable_past_the_limit_pause_the_worker_and_it_resumes_once_they_can_be_read()
+    {
+        var h = new Harness { MaxReadFailures = 3 };
+        h.Flaky = new FlakyControls(h.Controls);
+        var worker = new ToolWorker();
+
+        var run = h.Run(worker);
+        await worker.Working.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        h.Flaky.Broken = true; // the ledger's controls table cannot be read while the worker works
+        var paused = await run.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // Not run blind (E2): after 3 failed reads the 4th counts as a Pause, recorded with the error, worker stopped at a tool boundary.
+        Assert.Equal(WorkState.Paused, paused.State);
+        Assert.False(worker.Cancelled);
+        Assert.True(h.Flaky.Failures >= 4); // the watch may read once more before the worker reaches its tool boundary
+        Assert.Contains("its controls could not be read more than 3 times in a row", paused.Error);
+        Assert.Equal((WorkState.Paused, RunPipeline.ControlsUnreadablePaused), (await h.Transitions())[^1]);
+        var recorded = (await h.Rows()).Single(r => r.Step == RunPipeline.Steps.ControlsUnreadable);
+        Assert.Equal("4 reads in a row failed; the last: InvalidOperationException: the controls table cannot be read", recorded.Detail);
+        Assert.Equal(StepOutcome.Failed, recorded.Outcome);
+        Assert.DoesNotContain(h.Workspaces.Calls, c => c.StartsWith("remove") || c.StartsWith("push")); // worktree kept
+
+        // Readable again and nothing pauses it: it resumes on its own, in the same session.
+        h.Flaky.Broken = false;
+        Assert.Equal([77], await h.InFlight());
+        var resumed = await h.Run(worker);
+        Assert.True(resumed.Succeeded, resumed.Error);
+        Assert.Equal([null, Session], worker.Resumes);
+    }
+
+    [Fact]
+    public async Task Controls_unreadable_fewer_times_than_the_limit_leave_the_worker_running()
+    {
+        var h = new Harness { MaxReadFailures = 3 };
+        h.Flaky = new FlakyControls(h.Controls);
+        var worker = new GatedWorker(anotherToolCall: true);
+        var run = h.Run(worker);
+        await worker.Working.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        h.Flaky.FailNext = 3;
+        while (h.Flaky.Failures < 3)
+        {
+            await Task.Delay(10);
+        }
+        await Task.Delay(100); // a few good reads after them
+        worker.Release.SetResult();
+
+        var outcome = await run.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.False(worker.PauseRequested.Task.IsCompleted); // 3 failures in a row is the limit, not past it
+        Assert.False(worker.Denied);
+        Assert.Equal(WorkState.Review, outcome.State);
+        Assert.DoesNotContain(await h.Rows(), r => r.Step == RunPipeline.Steps.ControlsUnreadable);
+    }
+
+    [Fact]
     public async Task Continue_before_the_worker_reaches_a_tool_boundary_withdraws_the_pause()
     {
         var h = new Harness { PauseGrace = TimeSpan.FromSeconds(2) };
@@ -573,11 +658,11 @@ public class ControlTests
     public void Scopes_are_validated(string scope, bool valid) => Assert.Equal(valid, ControlScope.IsValid(scope));
 
     [Fact]
-    public async Task Refused_scope_names_every_valid_scope_including_usage()
+    public async Task Refused_scope_names_every_valid_scope_including_usage_and_freeze()
     {
         // Refused before the ledger is opened, so no database is needed.
         var controls = new LedgerControls(null!, TimeProvider.System);
         var ex = await Assert.ThrowsAsync<ArgumentException>(() => controls.SetAsync("everything", ControlState.Paused, "tester", CancellationToken.None));
-        Assert.Contains("(factory, usage, epic:<id> or item:sc-<id>)", ex.Message);
+        Assert.Contains("(factory, usage, freeze, epic:<id>, item:sc-<id> or item:gh-<key>)", ex.Message);
     }
 }

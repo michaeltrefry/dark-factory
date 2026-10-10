@@ -71,7 +71,7 @@ public class GitWorkspaceTests
         await workspace.PrepareAsync(Repo, "factory/sc-9", CancellationToken.None); // clone
         var ws = await workspace.PrepareAsync(Repo, "factory/sc-9", CancellationToken.None); // fetch + set-head
         File.WriteAllText(Path.Combine(ws.Path, "fix.txt"), "fixed\n");
-        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-9: Fix", CancellationToken.None)); // push
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-9: Fix", TestGrants.Untainted, CancellationToken.None)); // push
 
         var network = _gitCalls.Where(c => IsNetworkCall(c.Args)).ToList();
         Assert.Equal(["clone", "fetch", "remote", "push"], network.Select(c => Subcommand(c.Args)));
@@ -126,10 +126,12 @@ public class GitWorkspaceTests
         var ws = await workspace.PrepareAsync(Repo, "factory/sc-2", CancellationToken.None);
         File.WriteAllText(Path.Combine(ws.Path, "fix.txt"), "fixed\n");
 
-        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-2: Fix", CancellationToken.None));
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-2: Fix", TestGrants.Untainted, CancellationToken.None));
 
         Assert.Equal("sc-2: Fix", Git(_remote, "log", "-1", "--format=%s", "factory/sc-2").Trim());
         Assert.Equal("dark-factory[bot]", Git(_remote, "log", "-1", "--format=%an", "factory/sc-2").Trim());
+        // The pushed commit is the one a fix round waits for on the PR (sc-25380).
+        Assert.Equal(Git(_remote, "rev-parse", "factory/sc-2").Trim(), await workspace.HeadAsync(ws, CancellationToken.None));
     }
 
     [Fact]
@@ -142,7 +144,7 @@ public class GitWorkspaceTests
         var second = await workspace.PrepareAsync(Repo, "factory/sc-3", CancellationToken.None);
 
         Assert.False(File.Exists(Path.Combine(second.Path, "scratch.txt")));
-        Assert.False(await workspace.CommitAndPushAsync(Repo, second, "nothing", CancellationToken.None));
+        Assert.False(await workspace.CommitAndPushAsync(Repo, second, "nothing", TestGrants.Untainted, CancellationToken.None));
     }
 
     private sealed class FakeSandbox(bool deleteRemovesNothing = false) : DarkFactory.Orchestrator.Worker.IWorkerSandbox
@@ -198,12 +200,11 @@ public class GitWorkspaceTests
         Git(_root, "init", evil);
         var marker = Path.Combine(_root, "hook-ran");
         var hook = Path.Combine(evil, ".git", "hooks", "pre-commit");
-        File.WriteAllText(hook, $"#!/bin/sh\ntouch '{marker}'\n");
-        File.SetUnixFileMode(hook, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        SandboxSupport.ExecutableAt(hook, $"#!/bin/sh\ntouch '{marker}'\n");
         File.WriteAllText(Path.Combine(ws.Path, ".git"), $"gitdir: {Path.Combine(evil, ".git")}\n");
         File.WriteAllText(Path.Combine(ws.Path, "fix.txt"), "fixed\n");
 
-        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-6: Fix", CancellationToken.None));
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-6: Fix", TestGrants.Untainted, CancellationToken.None));
 
         Assert.False(File.Exists(marker));
         Assert.Equal("sc-6: Fix", Git(_remote, "log", "-1", "--format=%s", "factory/sc-6").Trim());
@@ -303,6 +304,30 @@ public class GitWorkspaceTests
     }
 
     [Fact]
+    public async Task A_triage_worktree_lives_apart_from_the_items_worktrees_and_is_not_shared_for_writing()
+    {
+        var sandbox = new FakeSandbox();
+        var triage = new GitWorkspace(Path.Combine(_root, "work"), _ => _remote, (_, _) => Task.FromResult<string?>(Token), null, sandbox,
+            worktreesDirectory: SandboxTriageRunner.TriageWorktrees, shareWithWorker: false);
+        var item = await Workspace(sandbox).PrepareAsync(Repo, "factory/sc-15", CancellationToken.None);
+        sandbox.Calls.Clear();
+
+        var ws = await triage.PrepareAsync(Repo, "factory/triage-gh-1", CancellationToken.None);
+
+        // Its own root, never the items' worktrees; read through the work root's inherited entry, not granted write.
+        Assert.Equal(Path.Combine(_root, "work", SandboxTriageRunner.TriageWorktrees, Repo.Owner, Repo.Name, "factory-triage-gh-1"), ws.Path);
+        Assert.True(File.Exists(Path.Combine(ws.Path, "README.md")));
+        Assert.DoesNotContain(sandbox.Calls, c => c.StartsWith("share", StringComparison.Ordinal));
+        // Each sweep sees only its own root: the items' sweep never asks about the triage worktree, and the triage sweep keeps no item's.
+        var asked = new List<string>();
+        await Workspace(sandbox).SweepOrphansAsync((name, _) => { asked.Add(name); return Task.FromResult(true); }, CancellationToken.None);
+        Assert.Equal(["factory-sc-15"], asked);
+        await triage.SweepOrphansAsync((_, _) => Task.FromResult(false), CancellationToken.None);
+        Assert.False(Directory.Exists(ws.Path));
+        Assert.True(File.Exists(Path.Combine(item.Path, "README.md")));
+    }
+
+    [Fact]
     public async Task Sweep_without_any_worktrees_does_nothing()
     {
         await Workspace().SweepOrphansAsync((_, _) => throw new InvalidOperationException("no worktree to ask about"), CancellationToken.None);
@@ -327,7 +352,7 @@ public class GitWorkspaceTests
         Git(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "symlinks");
         Git(seed, "push", "origin", "main");
         // A real sandbox sharing with the current user (chmod needs an existing user); deletes run the helper unsudoed.
-        var sandbox = new DarkFactory.Orchestrator.Worker.WorkerSandbox(Environment.UserName, SandboxSupport.Helper, SandboxSupport.FakeSudo(_root));
+        var sandbox = new DarkFactory.Orchestrator.Worker.WorkerSandbox(Environment.UserName, SafeHelper.Create(_root).Path, SandboxSupport.FakeSudo(_root));
 
         var workspace = Workspace(sandbox);
         var ws = await workspace.PrepareAsync(Repo, "factory/sc-14", CancellationToken.None);
@@ -366,7 +391,7 @@ public class GitWorkspaceTests
         Assert.Equal(first, reopened);
         Assert.True(File.Exists(Path.Combine(reopened!.Path, "half-done.txt")));
         Assert.DoesNotContain(_gitCalls, c => IsNetworkCall(c.Args) || Subcommand(c.Args) is "worktree" or "checkout" or "reset");
-        Assert.True(await workspace.CommitAndPushAsync(Repo, reopened, "sc-5: Fix", CancellationToken.None));
+        Assert.True(await workspace.CommitAndPushAsync(Repo, reopened, "sc-5: Fix", TestGrants.Untainted, CancellationToken.None));
     }
 
     [Fact]
@@ -386,7 +411,7 @@ public class GitWorkspaceTests
         var workspace = Workspace();
         var first = await workspace.PrepareAsync(Repo, "factory/sc-7", CancellationToken.None);
         File.WriteAllText(Path.Combine(first.Path, "pushed.txt"), "done");
-        Assert.True(await workspace.CommitAndPushAsync(Repo, first, "sc-7: Fix", CancellationToken.None));
+        Assert.True(await workspace.CommitAndPushAsync(Repo, first, "sc-7: Fix", TestGrants.Untainted, CancellationToken.None));
         var pushed = Git(_remote, "rev-parse", "factory/sc-7").Trim();
         await workspace.RemoveAsync(Repo, first, CancellationToken.None);
 
@@ -396,9 +421,284 @@ public class GitWorkspaceTests
         Assert.Equal(pushed, Git(restored.Path, "rev-parse", "HEAD").Trim());
         Assert.True(File.Exists(Path.Combine(restored.Path, "pushed.txt")));
         // Pushing again changes nothing on the remote.
-        await workspace.CommitAndPushAsync(Repo, restored, "sc-7: Fix", CancellationToken.None);
+        await workspace.CommitAndPushAsync(Repo, restored, "sc-7: Fix", TestGrants.Untainted, CancellationToken.None);
         Assert.Equal(pushed, Git(_remote, "rev-parse", "factory/sc-7").Trim());
     }
+
+    // ---- sc-25384: the merge queue's update of a PR branch with its base ----
+
+    /// <summary>Pushes a commit writing <paramref name="file"/> to the remote's main (another PR merging meanwhile).</summary>
+    private string AdvanceMain(string file, string content)
+    {
+        var other = Path.Combine(_root, $"main-{Guid.NewGuid():N}");
+        Git(_root, "clone", "-q", _remote, other);
+        File.WriteAllText(Path.Combine(other, file), content);
+        Git(other, "add", ".");
+        Git(other, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", $"main: {file}");
+        Git(other, "push", "-q", "origin", "main");
+        return Git(other, "rev-parse", "HEAD").Trim();
+    }
+
+    /// <summary>A pushed PR branch writing <paramref name="file"/>, its worktree removed (as when it reaches the merge queue).</summary>
+    private async Task<string> PushBranch(GitWorkspace workspace, string branch, string file, string content)
+    {
+        var ws = await workspace.PrepareAsync(Repo, branch, CancellationToken.None);
+        File.WriteAllText(Path.Combine(ws.Path, file), content);
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, $"{branch}: change", TestGrants.Untainted, CancellationToken.None));
+        await workspace.RemoveAsync(Repo, ws, CancellationToken.None);
+        return Git(_remote, "rev-parse", branch).Trim();
+    }
+
+    [Fact]
+    public async Task Merge_base_merges_the_moved_base_into_the_branch_and_pushes_it_as_a_fast_forward()
+    {
+        var workspace = Workspace();
+        var head = await PushBranch(workspace, "factory/sc-20", "fix.txt", "fixed\n");
+        var main = AdvanceMain("other.txt", "merged first\n");
+
+        var ws = await workspace.RestoreAsync(Repo, "factory/sc-20", CancellationToken.None);
+        var merge = await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
+
+        Assert.False(merge.Conflicted);
+        Assert.False(merge.UpToDate);
+        Assert.Equal(main, merge.BaseSha);
+        Assert.Equal([head, main], Git(ws.Path, "rev-list", "--parents", "-n", "1", merge.Head).Trim().Split(' ')[1..]);
+        _gitCalls.Clear();
+        await workspace.PushAsync(Repo, ws, CancellationToken.None);
+        Assert.Equal(merge.Head, Git(_remote, "rev-parse", "factory/sc-20").Trim());
+        // A plain push (never forced), carrying the App token like every network call.
+        var push = Assert.Single(_gitCalls, c => Subcommand(c.Args) == "push");
+        Assert.DoesNotContain("--force", push.Args);
+        Assert.NotNull(push.Env);
+
+        // Already up to date: nothing to merge.
+        var again = await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
+        Assert.True(again.UpToDate);
+        Assert.Equal(merge.Head, again.Head);
+    }
+
+    [Fact]
+    public async Task Merge_base_reports_a_conflict_and_leaves_the_merge_for_the_fixer_to_resolve()
+    {
+        var workspace = Workspace();
+        var head = await PushBranch(workspace, "factory/sc-21", "README.md", "hello from the PR\n");
+        AdvanceMain("README.md", "hello from main\n");
+
+        var ws = await workspace.RestoreAsync(Repo, "factory/sc-21", CancellationToken.None);
+        var merge = await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
+
+        Assert.Equal(["README.md"], merge.Conflicts);
+        Assert.Equal(head, merge.Head);
+        Assert.True(GitWorkspace.HasConflictMarker(File.ReadAllText(Path.Combine(ws.Path, "README.md"))));
+
+        // Pushed with the markers left in: they are found in the pushed commit.
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-21: merge", TestGrants.Untainted, CancellationToken.None));
+        var marked = Git(_remote, "rev-parse", "factory/sc-21").Trim();
+        Assert.Equal(["README.md"], await workspace.ConflictMarkersAsync(Repo, marked, ["README.md"], CancellationToken.None));
+
+        // The fixer resolves it: the commit completes the merge (two parents) and has no marker left.
+        File.WriteAllText(Path.Combine(ws.Path, "README.md"), "hello from both\n");
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-21: resolve", TestGrants.Untainted, CancellationToken.None));
+        var resolved = Git(_remote, "rev-parse", "factory/sc-21").Trim();
+        Assert.Empty(await workspace.ConflictMarkersAsync(Repo, resolved, ["README.md"], CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task A_conflicted_merge_committed_as_is_keeps_both_parents()
+    {
+        var workspace = Workspace();
+        var head = await PushBranch(workspace, "factory/sc-23", "README.md", "pr\n");
+        var main = AdvanceMain("README.md", "main\n");
+        var ws = await workspace.RestoreAsync(Repo, "factory/sc-23", CancellationToken.None);
+        await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
+        File.WriteAllText(Path.Combine(ws.Path, "README.md"), "both\n");
+
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-23: resolve", TestGrants.Untainted, CancellationToken.None));
+
+        var pushed = Git(_remote, "rev-parse", "factory/sc-23").Trim();
+        Assert.Equal([head, main], Git(ws.Path, "rev-list", "--parents", "-n", "1", pushed).Trim().Split(' ')[1..]);
+    }
+
+    [Fact]
+    public async Task The_fast_forward_push_refuses_a_branch_that_moved_on_the_remote()
+    {
+        var workspace = Workspace();
+        await PushBranch(workspace, "factory/sc-22", "fix.txt", "fixed\n");
+        AdvanceMain("other.txt", "x\n");
+        var ws = await workspace.RestoreAsync(Repo, "factory/sc-22", CancellationToken.None);
+        await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
+        // Someone pushes to the PR branch after the queue fetched it.
+        var outside = Path.Combine(_root, "outside");
+        Git(_root, "clone", "-q", "-b", "factory/sc-22", _remote, outside);
+        File.WriteAllText(Path.Combine(outside, "outside.txt"), "y\n");
+        Git(outside, "add", ".");
+        Git(outside, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "outside");
+        Git(outside, "push", "-q", "origin", "factory/sc-22");
+        var moved = Git(_remote, "rev-parse", "factory/sc-22").Trim();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => workspace.PushAsync(Repo, ws, CancellationToken.None));
+        Assert.Equal(moved, Git(_remote, "rev-parse", "factory/sc-22").Trim());
+    }
+
+    // ---- owner-side git isolated from the owner's own git config (OwnerGit) ----
+
+    [Fact]
+    public void Owner_git_isolation_adds_its_environment_and_config_ahead_of_every_call()
+    {
+        Assert.Equal(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "rerere.enabled=false", "-c", "filter.lfs.smudge=",
+            "-c", "filter.lfs.clean=", "-c", "filter.lfs.process=", "-c", "filter.lfs.required=false"], OwnerGit.ConfigArgs);
+        var (env, args) = OwnerGit.Isolate(new Dictionary<string, string> { ["GIT_CONFIG_COUNT"] = "1" }, ["merge", "x"]);
+        Assert.Equal(new Dictionary<string, string>
+        {
+            ["GIT_CONFIG_NOSYSTEM"] = "1",
+            ["GIT_CONFIG_GLOBAL"] = "/dev/null",
+            ["GIT_LFS_SKIP_SMUDGE"] = "1",
+            ["GIT_CONFIG_COUNT"] = "1",
+        }, env);
+        Assert.Equal([.. OwnerGit.ConfigArgs, "merge", "x"], args);
+        Assert.Equal(OwnerGit.Environment, OwnerGit.Isolate(null, []).Env);
+        Assert.Throws<ArgumentException>(() => OwnerGit.Isolate(new Dictionary<string, string> { ["GIT_CONFIG_GLOBAL"] = "/home/x/.gitconfig" }, []));
+    }
+
+    [Fact]
+    public async Task Every_git_call_of_every_workspace_operation_is_isolated_from_the_owners_git_config()
+    {
+        var workspace = Workspace();
+        await PushBranch(workspace, "factory/sc-31", "README.md", "pr\n");
+        var main = AdvanceMain("other.txt", "main\n");
+        var ws = await workspace.RestoreAsync(Repo, "factory/sc-31", CancellationToken.None);
+        Assert.NotNull(await workspace.ReopenAsync(Repo, "factory/sc-31", CancellationToken.None));
+        var merge = await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
+        await workspace.PushAsync(Repo, ws, CancellationToken.None);
+        await workspace.ConflictMarkersAsync(Repo, merge.Head, ["README.md"], CancellationToken.None);
+        await workspace.ChangedFilesAsync(Repo, main, merge.Head, CancellationToken.None);
+        await workspace.FilesAsync(Repo, merge.Head, CancellationToken.None);
+        var run = await workspace.PrepareCommitAsync(Repo, "gate-sc-31-base", main, CancellationToken.None);
+        await workspace.OverlayAsync(run, merge.Head, ["README.md"], ["other.txt"], CancellationToken.None,
+            new Dictionary<string, string> { ["README.md"] = "replaced\n" });
+        await workspace.RemoveAsync(Repo, run, CancellationToken.None);
+        await workspace.SweepOrphansAsync((_, _) => Task.FromResult(false), CancellationToken.None);
+
+        Assert.Superset(new HashSet<string> { "clone", "fetch", "remote", "worktree", "rev-parse", "symbolic-ref", "add", "status", "commit", "rev-list",
+            "push", "merge", "diff", "ls-tree", "cat-file", "checkout", "rm", "hash-object", "update-index", "checkout-index" },
+            _gitCalls.Select(c => Subcommand(c.Args)).ToHashSet());
+        Assert.All(_gitCalls, c =>
+        {
+            Assert.Equal(OwnerGit.ConfigArgs, c.Args.Take(OwnerGit.ConfigArgs.Count));
+            Assert.NotNull(c.Env);
+            Assert.All(OwnerGit.Environment, e => Assert.Equal(e.Value, c.Env[e.Key]));
+        });
+        // The token-carrying push keeps its auth alongside the isolation.
+        Assert.All(_gitCalls.Where(c => Subcommand(c.Args) == "push"), c => Assert.Equal("credential.helper", c.Env!["GIT_CONFIG_KEY_1"]));
+    }
+
+    /// <summary>A script under the test root that records it ran (a file named <paramref name="marker"/> in <c>markers/</c>), then runs <paramref name="then"/>.</summary>
+    private string Script(string marker, string then)
+    {
+        var dir = Directory.CreateDirectory(Path.Combine(_root, "scripts")).FullName;
+        var markers = Directory.CreateDirectory(Path.Combine(_root, "markers")).FullName;
+        var path = Path.Combine(dir, marker);
+        SandboxSupport.ExecutableAt(path, $"#!/bin/sh\ntouch '{Path.Combine(markers, marker)}'\n{then}\n");
+        return path;
+    }
+
+    private void Hook(string hooksDir, string prefix, params string[] names)
+    {
+        Directory.CreateDirectory(hooksDir);
+        foreach (var name in names)
+        {
+            SandboxSupport.ExecutableAt(Path.Combine(hooksDir, name), File.ReadAllText(Script($"{prefix}-{name}", "exit 0")));
+        }
+    }
+
+    private static readonly string[] HookNames = ["post-checkout", "post-merge", "pre-commit", "commit-msg", "post-commit", "pre-push", "pre-merge-commit"];
+
+    [Fact]
+    public async Task Owner_side_git_runs_no_hook_filter_merge_driver_or_fsmonitor_that_owner_config_or_a_pr_could_select()
+    {
+        // The owner's system and global git config (as git would find them through HOME and GIT_CONFIG_SYSTEM), each defining
+        // a hooks path, filter and merge drivers that a PR's .gitattributes can select.
+        var home = Directory.CreateDirectory(Path.Combine(_root, "home")).FullName;
+        Hook(Path.Combine(_root, "global-hooks"), "global-hook", HookNames);
+        File.WriteAllText(Path.Combine(home, ".gitconfig"), $"""
+            [core]
+                hooksPath = {Path.Combine(_root, "global-hooks")}
+            [filter "evil"]
+                smudge = {Script("global-smudge", "cat")}
+                clean = {Script("global-clean", "cat")}
+            [merge "evil"]
+                driver = {Script("global-merge", "exit 1")}
+            """);
+        var system = Path.Combine(_root, "system.gitconfig");
+        File.WriteAllText(system, $"""
+            [filter "sysevil"]
+                smudge = {Script("system-smudge", "cat")}
+                clean = {Script("system-clean", "cat")}
+            [merge "sysevil"]
+                driver = {Script("system-merge", "exit 1")}
+            """);
+        IReadOnlyDictionary<string, string> OwnerEnvironment(IReadOnlyDictionary<string, string>? env) =>
+            new Dictionary<string, string>(env ?? new Dictionary<string, string>())
+            {
+                ["HOME"] = home,
+                ["XDG_CONFIG_HOME"] = Path.Combine(home, ".config"),
+                ["GIT_CONFIG_SYSTEM"] = system,
+            };
+        var workspace = new GitWorkspace(Path.Combine(_root, "work"), _ => _remote, (_, _) => Task.FromResult<string?>(Token),
+            (cwd, env, args, ct) => GitWorkspace.RunGitAsync(cwd, OwnerEnvironment(env), args, ct));
+
+        var first = await workspace.PrepareAsync(Repo, "factory/sc-30", CancellationToken.None);
+        // The clone's own config and hooks dir: an LFS filter and an fsmonitor configured there, and hooks in .git/hooks.
+        var clone = Path.Combine(_root, "work", "repos", Repo.Owner, Repo.Name);
+        Git(clone, "config", "filter.lfs.smudge", Script("clone-lfs-smudge", "cat"));
+        Git(clone, "config", "filter.lfs.clean", Script("clone-lfs-clean", "cat"));
+        Git(clone, "config", "core.fsmonitor", Script("clone-fsmonitor", "exit 1"));
+        Hook(Path.Combine(clone, ".git", "hooks"), "clone-hook", HookNames);
+        // The PR selects every driver for its files.
+        File.WriteAllText(Path.Combine(first.Path, ".gitattributes"), "*.evil filter=evil merge=evil\n*.sys filter=sysevil merge=sysevil\n*.lfs filter=lfs\n");
+        foreach (var file in new[] { "a.evil", "b.sys", "c.lfs" })
+        {
+            File.WriteAllText(Path.Combine(first.Path, file), "pr\n");
+        }
+        Assert.True(await workspace.CommitAndPushAsync(Repo, first, "sc-30: change", TestGrants.Untainted, CancellationToken.None));
+        await workspace.RemoveAsync(Repo, first, CancellationToken.None);
+        // Main changes the same files (the base update conflicts in them), and moves on.
+        var other = Path.Combine(_root, "main-30");
+        Git(_root, "clone", "-q", _remote, other);
+        foreach (var file in new[] { "a.evil", "b.sys", "c.lfs" })
+        {
+            File.WriteAllText(Path.Combine(other, file), "main\n");
+        }
+        Git(other, "add", ".");
+        Git(other, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "main: same files");
+        Git(other, "push", "-q", "origin", "main");
+
+        var ws = await workspace.RestoreAsync(Repo, "factory/sc-30", CancellationToken.None);
+        var merge = await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
+        Assert.Equal(["a.evil", "b.sys", "c.lfs"], merge.Conflicts.Order());
+        foreach (var file in new[] { "a.evil", "b.sys", "c.lfs" })
+        {
+            File.WriteAllText(Path.Combine(ws.Path, file), "both\n");
+        }
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-30: resolve", TestGrants.Untainted, CancellationToken.None));
+        var update = await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
+        Assert.True(update.UpToDate);
+        await workspace.PushAsync(Repo, ws, CancellationToken.None);
+
+        var markers = Path.Combine(_root, "markers");
+        Assert.Empty(Directory.GetFiles(markers).Select(Path.GetFileName));
+        // The setup is live: the same git without the isolation runs the owner's filter on the PR's file.
+        File.Delete(Path.Combine(ws.Path, "a.evil"));
+        await GitWorkspace.RunGitAsync(ws.Path, OwnerEnvironment(null), ["checkout", "--", "a.evil"], CancellationToken.None);
+        Assert.Contains("global-smudge", Directory.GetFiles(markers).Select(Path.GetFileName));
+    }
+
+    [Theory]
+    [InlineData("a\n<<<<<<< HEAD\nb\n=======\nc\n>>>>>>> main\n", true)]
+    [InlineData("<<<<<<<\n", true)]
+    [InlineData("x <<<<<<< not at the start\n===\n", false)]
+    [InlineData("plain\n=======\n", false)]
+    public void Conflict_markers_are_lines_git_writes(string text, bool marked) => Assert.Equal(marked, GitWorkspace.HasConflictMarker(text));
 
     [Fact]
     public async Task Refuses_branches_outside_factory_prefix()

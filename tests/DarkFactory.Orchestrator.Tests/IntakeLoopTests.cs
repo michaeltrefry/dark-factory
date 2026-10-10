@@ -75,6 +75,8 @@ public class IntakeLoopTests
 
         await loop.StartAsync(CancellationToken.None);
         await Eventually(() => board.Requests.Any(r => r.PathAndQuery.StartsWith("/api/v3/groups/")));
+        // The first poll has finished and the loop waits for its next tick: only now may the board and the clock move.
+        await Eventually(() => loop.Waits == 1);
 
         // A ready story appears after the first poll; it is picked up on the next tick.
         board.Add(101, FakeShortcutBoard.FactoryTeam);
@@ -495,9 +497,9 @@ public class IntakeLoopTests
 
         Assert.Equal(WorkState.Implement, (await runner.Item()).State);
         Assert.Empty(source.Comments);
-        Assert.Equal(2, status.ItemErrors[101].Count);
-        Assert.Contains("404", status.ItemErrors[101].Message);
-        Assert.Null(status.ItemErrors[101].GaveUp);
+        Assert.Equal(2, status.ItemErrors["sc-101"].Count);
+        Assert.Contains("404", status.ItemErrors["sc-101"].Message);
+        Assert.Null(status.ItemErrors["sc-101"].GaveUp);
         Assert.Null(status.FactoryError);
 
         await loop.PollOnceAsync(CancellationToken.None);
@@ -508,11 +510,11 @@ public class IntakeLoopTests
         Assert.Contains("404", escalated.Detail);
         Assert.Contains("escalated", Assert.Single(source.Comments));
         Assert.Contains("404", source.Comments[0]);
-        Assert.Equal("escalated", status.ItemErrors[101].GaveUp);
+        Assert.Equal("escalated", status.ItemErrors["sc-101"].GaveUp);
 
         // No longer in flight: the next poll leaves it alone.
         await loop.PollOnceAsync(CancellationToken.None);
-        Assert.Equal(3, status.ItemErrors[101].Count);
+        Assert.Equal(3, status.ItemErrors["sc-101"].Count);
         Assert.Single(source.Comments);
     }
 
@@ -530,7 +532,7 @@ public class IntakeLoopTests
         Assert.Equal(WorkState.Paused, (await runner.Item()).State);
         Assert.Contains("2 runs in a row", (await runner.Rows()).Single(r => r.Step == RunPipeline.Steps.Parked).Detail);
         Assert.Contains("parked", Assert.Single(source.Comments));
-        Assert.Equal("parked", status.ItemErrors[101].GaveUp);
+        Assert.Equal("parked", status.ItemErrors["sc-101"].GaveUp);
         Assert.Empty(await runner.InFlightAsync(CancellationToken.None));
     }
 
@@ -614,6 +616,8 @@ public class IntakeLoopTests
             ["Router:Key"] = "rk",
             ["GitHub:AppId"] = "1",
             ["GitHub:PrivateKeyPem"] = "pem",
+            ["GitHub:Gate:AppId"] = "2",
+            ["GitHub:Gate:PrivateKeyPem"] = "gate-pem",
             ["Factory:WorkRoot"] = root,
             // Never reached (the lock below is held), and never the real sandbox user or helper.
             ["Worker:RunAs"] = "df-test-no-such-user",

@@ -1,5 +1,6 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/DarkFactory.Analyzers/DarkFactory.Analyzers.csproj" />
     <Project Path="src/DarkFactory.Orchestrator/DarkFactory.Orchestrator.csproj" />
   </Folder>
   <Folder Name="/tests/">

@@ -48,6 +48,19 @@ public class StreamJsonTests
     }
 
     [Fact]
+    public void Collects_the_models_that_answered_skipping_synthetic_messages()
+    {
+        var state = new StreamJsonState();
+        state.Accept("""{"type":"system","subtype":"init","model":"claude-requested","session_id":"s"}""");
+        state.Accept("""{"type":"assistant","message":{"model":"claude-sonnet-4-5","content":[]},"session_id":"s"}""");
+        state.Accept("""{"type":"assistant","message":{"model":"<synthetic>","content":[]},"session_id":"s"}""");
+        state.Accept("""{"type":"assistant","message":{"model":"gpt-5.6-luna","content":[]},"session_id":"s"}""");
+        state.Accept("""{"type":"assistant","message":{"model":"claude-sonnet-4-5","content":[]},"session_id":"s"}""");
+
+        Assert.Equal(["claude-sonnet-4-5", "gpt-5.6-luna"], state.Models);
+    }
+
+    [Fact]
     public void Without_result_line_nothing_is_reported_as_seen()
     {
         var state = new StreamJsonState();
@@ -95,10 +108,10 @@ public class ClaudeWorkerTests
     [Fact]
     public void Environment_carries_only_router_url_and_router_key_header()
     {
-        var env = ClaudeWorker.BuildEnvironment(ParentEnvironment(), Router, "rk_worker", WorkerAuth.ClaudeLogin);
+        var env = ClaudeWorker.BuildEnvironment(ParentEnvironment(), Router, "rk_worker", WorkerAuth.ClaudeLogin, WorkerModelClass.Mid);
 
         Assert.Equal("http://localhost:8080", env["ANTHROPIC_BASE_URL"]);
-        Assert.Equal("X-Weave-Router-Key: rk_worker", env["ANTHROPIC_CUSTOM_HEADERS"]);
+        Assert.Equal("X-Weave-Router-Key: rk_worker\nx-weave-model-class: mid", env["ANTHROPIC_CUSTOM_HEADERS"]);
         Assert.Equal("/usr/bin:/bin", env["PATH"]);
         Assert.Equal("/Users/someone", env["HOME"]);
 
@@ -109,12 +122,12 @@ public class ClaudeWorkerTests
     [Fact]
     public void Router_key_auth_mode_uses_the_router_key_as_bearer_auth_token_and_nothing_else()
     {
-        var env = ClaudeWorker.BuildEnvironment(ParentEnvironment(), Router, "rk_worker", WorkerAuth.RouterKey);
+        var env = ClaudeWorker.BuildEnvironment(ParentEnvironment(), Router, "rk_worker", WorkerAuth.RouterKey, WorkerModelClass.Low);
 
         // Bearer (ANTHROPIC_AUTH_TOKEN), not x-api-key (ANTHROPIC_API_KEY): the router strips an rk_ bearer before
         // any upstream relay, while its pass-through tier forwards x-api-key as is.
         Assert.Equal("rk_worker", env["ANTHROPIC_AUTH_TOKEN"]);
-        Assert.Equal("X-Weave-Router-Key: rk_worker", env["ANTHROPIC_CUSTOM_HEADERS"]);
+        Assert.Equal("X-Weave-Router-Key: rk_worker\nx-weave-model-class: low", env["ANTHROPIC_CUSTOM_HEADERS"]);
         Assert.Equal(["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "HOME", "PATH", "USER"], env.Keys.Order());
         Assert.DoesNotContain(env.Values, v => v.Contains("sk-") || v.Contains("ghp_") || v.Contains("oauth") || v.Contains("leak"));
     }
@@ -136,7 +149,7 @@ public class ClaudeWorkerTests
         var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
         var envDump = Path.Combine(dir, "env.txt");
         var script = Path.Combine(dir, "fake-claude.sh");
-        File.WriteAllText(script, $$"""
+        SandboxSupport.ExecutableAt(script, $$"""
             #!/bin/sh
             env > "{{envDump}}"
             pwd >> "{{envDump}}"
@@ -144,13 +157,12 @@ public class ClaudeWorkerTests
             echo 'progress noise'
             echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-abc"}'
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", "sk-ant-should-not-leak");
         try
         {
             var worker = new ClaudeWorker(script, Router, "rk_worker", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1));
             var lines = new List<string>();
-            var result = await worker.RunAsync(dir, "prompt", null,
+            var result = await worker.RunAsync(dir, "prompt", null, WorkerModelClass.Mid,
                 new WorkerCallbacks(OnLine: (line, _) => { lines.Add(line); return ValueTask.CompletedTask; }), CancellationToken.None);
 
             Assert.True(result.Succeeded);
@@ -184,7 +196,7 @@ public class ClaudeWorkerTests
         var probeDir = Directory.CreateTempSubdirectory("df-worker-probe-").FullName;
         var dump = Path.Combine(probeDir, "probe.txt");
         var script = Path.Combine(probeDir, "fake-claude.sh");
-        File.WriteAllText(script, $$"""
+        SandboxSupport.ExecutableAt(script, $$"""
             #!/bin/sh
             env > "{{dump}}"
             printf '%s\n' "$@" >> "{{dump}}"
@@ -192,12 +204,11 @@ public class ClaudeWorkerTests
             echo '{"type":"system","subtype":"init","session_id":"sess-key"}'
             echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-key"}'
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         Environment.SetEnvironmentVariable("GitHub__PrivateKeyPem", pem);
         try
         {
             var result = await new ClaudeWorker(script, Router, "rk_worker", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1))
-                .RunAsync(worktree, "implement the story", null, null, CancellationToken.None);
+                .RunAsync(worktree, "implement the story", null, WorkerModelClass.Mid, null, CancellationToken.None);
 
             Assert.True(result.Succeeded);
             var probe = File.ReadAllText(dump);
@@ -219,10 +230,9 @@ public class ClaudeWorkerTests
     {
         var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
         var script = Path.Combine(dir, "fake-claude.sh");
-        File.WriteAllText(script, "#!/bin/sh\necho '{\"type\":\"system\",\"session_id\":\"s\"}'\necho boom >&2\nexit 3\n");
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        SandboxSupport.ExecutableAt(script, "#!/bin/sh\necho '{\"type\":\"system\",\"session_id\":\"s\"}'\necho boom >&2\nexit 3\n");
 
-        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, null, CancellationToken.None);
+        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid, null, CancellationToken.None);
 
         Assert.False(result.Succeeded);
         Assert.Equal(3, result.ExitCode);
@@ -268,7 +278,7 @@ public class ClaudeWorkerTests
         var argsDump = Path.Combine(dir, "args.txt");
         var script = Path.Combine(dir, "fake-claude.sh");
         // Waits until the flag exists (as a tool call would), then ends.
-        File.WriteAllText(script, $$"""
+        SandboxSupport.ExecutableAt(script, $$"""
             #!/bin/sh
             printf '%s\n' "$@" > "{{argsDump}}"
             if [ -e "{{Path.Combine(flags, "factory-sc-9.pause")}}" ]; then echo stale > "{{Path.Combine(dir, "saw-stale")}}"; fi
@@ -276,12 +286,11 @@ public class ClaudeWorkerTests
             while [ ! -e "{{Path.Combine(flags, "factory-sc-9.pause")}}" ]; do sleep 0.02; done
             echo '{"type":"result","subtype":"success","is_error":false,"session_id":"s-9"}'
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         Directory.CreateDirectory(flags);
         File.WriteAllText(Path.Combine(flags, "factory-sc-9.pause"), "stale");
         var worker = new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1), pauseFlagDirectory: flags);
 
-        var run = worker.RunAsync(worktree, "p", null, new WorkerCallbacks(OnSession: (_, _) =>
+        var run = worker.RunAsync(worktree, "p", null, WorkerModelClass.Mid, new WorkerCallbacks(OnSession: (_, _) =>
         {
             ((IWorker)worker).RequestPause(worktree);
             return Task.CompletedTask;
@@ -337,7 +346,7 @@ public class ClaudeWorkerTests
         var argsDump = Path.Combine(dir, "args.txt");
         var script = Path.Combine(dir, "fake-claude.sh");
         // The worker only finishes once the callback has created the flag file.
-        File.WriteAllText(script, $$"""
+        SandboxSupport.ExecutableAt(script, $$"""
             #!/bin/sh
             printf '%s\n' "$@" > "{{argsDump}}"
             echo '{"type":"system","subtype":"init","session_id":"sess-early"}'
@@ -345,10 +354,9 @@ public class ClaudeWorkerTests
             while [ ! -f "{{flag}}" ]; do i=$((i+1)); [ $i -gt 200 ] && exit 9; sleep 0.05; done
             echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-early"}'
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         var seen = new List<string>();
 
-        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", "sess-early",
+        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", "sess-early", WorkerModelClass.Mid,
             new WorkerCallbacks(OnSession: (sid, _) =>
             {
                 seen.Add(sid);
@@ -367,15 +375,14 @@ public class ClaudeWorkerTests
     {
         var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
         var script = Path.Combine(dir, "fake-claude.sh");
-        File.WriteAllText(script, """
+        SandboxSupport.ExecutableAt(script, """
             #!/bin/sh
             echo '{"type":"system","subtype":"init","session_id":"sess-stall"}'
             echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-stall"}'
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         // The tap never finishes on its own (a stalled database): only the worker timeout can end it.
-        var run = new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMilliseconds(500)).RunAsync(dir, "p", null,
+        var run = new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMilliseconds(500)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
             new WorkerCallbacks(OnLine: async (_, c) => await Task.Delay(Timeout.Infinite, c)), CancellationToken.None);
 
         // (WaitAsync's own TimeoutException has a different message.)
@@ -389,16 +396,15 @@ public class ClaudeWorkerTests
         var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
         var ids = Path.Combine(dir, "ids.txt");
         var script = Path.Combine(dir, "fake-claude.sh");
-        File.WriteAllText(script, $$"""
+        SandboxSupport.ExecutableAt(script, $$"""
             #!/bin/sh
             echo "$$ $(ps -o pgid= -p $$ | tr -d ' ')" > "{{ids}}"
             echo '{"type":"system","subtype":"init","session_id":"s"}'
             echo '{"type":"result","subtype":"success","is_error":false,"session_id":"s"}'
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         var events = new List<string>();
 
-        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null,
+        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
             new WorkerCallbacks(
                 OnStarted: (pid, _) => { events.Add($"started {pid}"); return Task.CompletedTask; },
                 OnSession: (sid, _) => { events.Add($"session {sid}"); return Task.CompletedTask; }),
@@ -411,22 +417,45 @@ public class ClaudeWorkerTests
     }
 
     [Fact]
+    public async Task Each_model_that_answers_is_reported_once_as_it_streams()
+    {
+        var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
+        var script = Path.Combine(dir, "fake-claude.sh");
+        SandboxSupport.ExecutableAt(script, """
+            #!/bin/sh
+            echo '{"type":"system","subtype":"init","session_id":"s"}'
+            echo '{"type":"assistant","message":{"model":"claude-sonnet-4-5","content":[]},"session_id":"s"}'
+            echo '{"type":"assistant","message":{"model":"claude-sonnet-4-5","content":[]},"session_id":"s"}'
+            echo '{"type":"assistant","message":{"model":"qwen3-coder","content":[]},"session_id":"s"}'
+            echo '{"type":"result","subtype":"success","is_error":false,"session_id":"s"}'
+            """);
+        var models = new List<string>();
+
+        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
+            new WorkerCallbacks(OnModel: (model, _) => { models.Add(model); return Task.CompletedTask; }), CancellationToken.None);
+
+        Assert.True(result.Succeeded, result.StderrTail);
+        Assert.Equal(["claude-sonnet-4-5", "qwen3-coder"], models);
+    }
+
+    [Fact]
     public async Task Stop_orphan_leaves_a_process_that_is_not_this_workers_claude_alone()
     {
         var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
         // A group leader, like a worker, but running something other than the configured claude.
-        using var other = Process.Start(new ProcessStartInfo("/usr/bin/perl", ["-e", "setpgrp(0, 0); sleep 30"]))!;
+        using var otherProcess = Process.Start(new ProcessStartInfo("/usr/bin/perl", ["-e", "setpgrp(0, 0); sleep 30"]))!;
+        var other = OwnProcess.Of(otherProcess);
         try
         {
             await Task.Delay(300);
             var worker = new ClaudeWorker(Path.Combine(dir, "fake-claude.sh"), Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1));
 
-            Assert.False(await worker.StopOrphanAsync(other.Id, CancellationToken.None));
-            Assert.False(other.HasExited);
+            Assert.False(await worker.StopOrphanAsync(other.Pid, CancellationToken.None));
+            Assert.False(otherProcess.HasExited);
         }
         finally
         {
-            other.Kill();
+            other.KillIfStillRunning();
         }
     }
 
@@ -437,7 +466,7 @@ public class ClaudeWorkerTests
         var pids = Path.Combine(dir, "pids.txt");
         var script = Path.Combine(dir, "fake-claude.sh");
         // Ignores SIGTERM in the leader so only the SIGKILL escalation ends it; its child is a "tool".
-        File.WriteAllText(script, $$"""
+        SandboxSupport.ExecutableAt(script, $$"""
             #!/bin/sh
             trap '' TERM
             sleep 600 &
@@ -445,11 +474,10 @@ public class ClaudeWorkerTests
             echo '{"type":"system","subtype":"init","session_id":"s"}'
             wait
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         var worker = new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1));
         var started = new TaskCompletionSource<int>();
         // Stands in for the crashed orchestrator: the worker keeps running while we stop it "from the next run".
-        var run = worker.RunAsync(dir, "p", null, new WorkerCallbacks(OnStarted: (pid, _) => { started.SetResult(pid); return Task.CompletedTask; }), CancellationToken.None);
+        var run = worker.RunAsync(dir, "p", null, WorkerModelClass.Mid, new WorkerCallbacks(OnStarted: (pid, _) => { started.SetResult(pid); return Task.CompletedTask; }), CancellationToken.None);
         var leader = await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
         while (!File.Exists(pids) || File.ReadAllText(pids).Trim().Split(' ').Length < 2)
         {
@@ -459,16 +487,9 @@ public class ClaudeWorkerTests
 
         Assert.True(await worker.StopOrphanAsync(leader, CancellationToken.None));
 
-        Assert.False(IsAlive(leader));
-        Assert.False(IsAlive(child));
+        Assert.False(OwnProcess.Exists(leader));
+        Assert.False(OwnProcess.Exists(child));
         Assert.False(await worker.StopOrphanAsync(leader, CancellationToken.None)); // gone now
         Assert.False((await run.WaitAsync(TimeSpan.FromSeconds(10))).Succeeded); // the stream just ends
-    }
-
-    private static bool IsAlive(int pid)
-    {
-        using var p = Process.Start(new ProcessStartInfo("kill", ["-0", pid.ToString()]) { RedirectStandardError = true })!;
-        p.WaitForExit();
-        return p.ExitCode == 0;
     }
 }

@@ -191,12 +191,13 @@ public sealed class ControlProcessTests : IAsyncLifetime
     /// A stand-in for <c>claude -p --output-format stream-json</c> working in tool calls. Before each call it runs the
     /// PreToolUse hook from <c>--settings</c>; on <c>continue: false</c> it denies the call and ends the session as
     /// Claude Code does (result success, terminal_reason hook_stopped). Fresh, it works until stopped; resumed, it
-    /// makes two more calls and finishes.
+    /// makes two more calls and finishes. Each call writes a different file (named in its input), so the stuck detector
+    /// (sc-25388) never takes the calls for a loop, however many run before the pause lands.
     /// </summary>
     private void WriteFakeClaude()
     {
         var script = Path.Combine(_dir, "fake-claude.sh");
-        File.WriteAllText(script, $$$"""
+        SandboxSupport.ExecutableAt(script, $$$"""
             #!/bin/sh
             settings=""; resume=""
             while [ $# -gt 0 ]; do
@@ -213,7 +214,7 @@ public sealed class ControlProcessTests : IAsyncLifetime
             n=0
             while [ $n -lt $max ]; do
               n=$((n+1)); id="$prefix$n"
-              echo "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"$id\",\"name\":\"Write\",\"input\":{}}]},\"session_id\":\"$S\"}"
+              echo "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"$id\",\"name\":\"Write\",\"input\":{\"file_path\":\"tool-$id.txt\"}}]},\"session_id\":\"$S\"}"
               decision=$(sh -c "$hook")
               if printf '%s' "$decision" | grep -q '"continue":false'; then
                 echo "denied $id" >> "{{{Log}}}"
@@ -229,7 +230,6 @@ public sealed class ControlProcessTests : IAsyncLifetime
             done
             echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"$S\"}"
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
     }
 
     private void SeedOrigin()

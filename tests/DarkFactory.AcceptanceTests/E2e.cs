@@ -52,6 +52,10 @@ internal sealed class E2e : IAsyncDisposable
         Harness.RequireSecret(o => o.RouterKey);
         Harness.RequireSecret(o => o.GitHubAppId);
         Harness.RequireSecret(o => o.GitHubAppPrivateKeyPem);
+        // `factory work` runs the whole pipeline, review and merge gate included, which needs the gate's own App.
+        Harness.RequireSecret(o => o.GitHubGateAppId);
+        Harness.RequireSecret(o => o.GitHubGateAppPrivateKeyPem);
+        Harness.RequireReviewSettings();
         Harness.RequireClaude();
         await Harness.RequireRouterAsync();
 
@@ -199,7 +203,7 @@ internal sealed class E2e : IAsyncDisposable
     /// <summary>The story's workflow state name and external links, read straight from the Shortcut API.</summary>
     public static async Task<(string State, List<string> Links)> StoryAsync(int storyId, CancellationToken ct)
     {
-        using var http = new HttpClient { BaseAddress = ShortcutWorkSource.DefaultBaseAddress };
+        using var http = OutboundHttp.ShortcutApi();
         http.DefaultRequestHeaders.Add("Shortcut-Token", Harness.Options.ShortcutApiToken);
         var story = await http.GetFromJsonAsync<JsonElement>($"stories/{storyId}", ct);
         var workflow = await http.GetFromJsonAsync<JsonElement>($"workflows/{story.GetProperty("workflow_id").GetInt64()}", ct);
@@ -209,10 +213,29 @@ internal sealed class E2e : IAsyncDisposable
         return (state, links);
     }
 
+    /// <summary>The text of every comment on the story that is not deleted, oldest first, read straight from the Shortcut API.</summary>
+    public static async Task<List<string>> StoryCommentsAsync(int storyId, CancellationToken ct)
+    {
+        using var http = OutboundHttp.ShortcutApi();
+        http.DefaultRequestHeaders.Add("Shortcut-Token", Harness.Options.ShortcutApiToken);
+        var story = await http.GetFromJsonAsync<JsonElement>($"stories/{storyId}", ct);
+        return [.. story.GetProperty("comments").EnumerateArray()
+            .Where(c => !(c.TryGetProperty("deleted", out var deleted) && deleted.ValueKind == JsonValueKind.True))
+            .Select(c => c.GetProperty("text").GetString() ?? "")];
+    }
+
+    /// <summary>The router cost of each of the item's worker sessions, as <see cref="WorkLedger.SessionCostsAsync"/> reads them.</summary>
+    public async Task<IReadOnlyList<decimal?>> SessionCostsAsync(int storyId, CancellationToken ct)
+    {
+        await using var db = Db();
+        var item = await db.WorkItems.AsNoTracking().SingleAsync(i => i.ExternalId == StoryId.Format(storyId), ct);
+        return await new WorkLedger(db, TimeProvider.System).SessionCostsAsync(item, ct);
+    }
+
     /// <summary>Every PR (any state) whose head is the item's <c>factory/sc-&lt;id&gt;</c> branch.</summary>
     public static async Task<List<JsonElement>> PullRequestsAsync(RepoRef repo, int storyId, CancellationToken ct)
     {
-        using var github = new HttpClient { BaseAddress = GitHubApp.DefaultBaseAddress };
+        using var github = OutboundHttp.GitHubApi();
         var app = new GitHubApp(github, Harness.Options.GitHubAppId, Harness.Options.GitHubAppPrivateKeyPem, TimeProvider.System);
         var token = (await app.CreateInstallationTokenAsync(repo, ct)).Token;
         using var request = GitHubApp.Request(HttpMethod.Get,
@@ -269,7 +292,7 @@ internal sealed class E2e : IAsyncDisposable
     }
 
     public static HttpClient DashboardClient(string baseAddress, CookieContainer cookies) =>
-        new(new HttpClientHandler { CookieContainer = cookies, AllowAutoRedirect = false }) { BaseAddress = new Uri(baseAddress) };
+        OutboundHttp.Dashboard(new Uri(baseAddress), cookies);
 
     /// <summary>
     /// Replays the session as a logged-in dashboard viewer does (the session hub's backlog) and returns the sequences

@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using DarkFactory.Orchestrator;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Shortcut;
+using DarkFactory.Orchestrator.Tests;
 using Microsoft.EntityFrameworkCore;
 
 namespace DarkFactory.AcceptanceTests;
@@ -14,6 +15,7 @@ namespace DarkFactory.AcceptanceTests;
 /// only, never its process tree or anything else — and starts it again. The restarted host resumes the same session and
 /// the item reaches Review with exactly one PR. Runbook: docs/acceptance.md.
 /// </summary>
+[System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
 public class CrashRestartTests
 {
     [Fact]
@@ -27,7 +29,9 @@ public class CrashRestartTests
         var environment = e2e.ChildEnvironment(scope, FreePort());
 
         var first = StartWork(environment);
+        var firstOwn = OwnProcess.Of(first);
         Process? second = null;
+        OwnProcess? secondOwn = null;
         try
         {
             await E2e.WaitForAsync("the session checkpoint", TimeSpan.FromMinutes(20), async () =>
@@ -41,10 +45,11 @@ public class CrashRestartTests
             var workerPid = int.Parse(before.Last(e => e.Step == RunPipeline.Steps.WorkerStarted).Detail!);
             var killedAfter = before[^1].Id;
 
-            first.Kill(entireProcessTree: false); // SIGKILL to this child's own pid only
+            firstOwn.KillIfStillRunning(); // SIGKILL to this child's own pid only
             await first.WaitForExitAsync(ct);
 
             second = StartWork(environment);
+            secondOwn = OwnProcess.Of(second);
             await FactoryWorkTests.WaitForStateAsync(e2e, storyId, WorkState.Review, TimeSpan.FromMinutes(45), ct);
             var history = await e2e.HistoryAsync(storyId, ct);
 
@@ -68,11 +73,11 @@ public class CrashRestartTests
         finally
         {
             // Only the children this test started, each by its own pid.
-            foreach (var child in new[] { first, second })
+            foreach (var (child, own) in new[] { (first, (OwnProcess?)firstOwn), (second, secondOwn) })
             {
-                if (child is { HasExited: false })
+                if (child is { HasExited: false } && own is not null)
                 {
-                    child.Kill(entireProcessTree: false);
+                    own.KillIfStillRunning();
                     await child.WaitForExitAsync(CancellationToken.None);
                 }
                 child?.Dispose();
@@ -81,9 +86,12 @@ public class CrashRestartTests
     }
 
     /// <summary><c>dotnet DarkFactory.Orchestrator.dll work</c> with the test's settings; its output goes to the test log.</summary>
+    /// <summary>The dotnet host <c>dotnet test</c> runs under (a known local program of the gateway lint), else <c>dotnet</c> on PATH.</summary>
+    private static string DotnetHost => Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet";
+
     private static Process StartWork(IReadOnlyDictionary<string, string> environment)
     {
-        var psi = new ProcessStartInfo(Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
+        var psi = new ProcessStartInfo(DotnetHost)
         {
             RedirectStandardOutput = true,
             RedirectStandardError = true,
