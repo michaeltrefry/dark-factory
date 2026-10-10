@@ -83,7 +83,7 @@ public class McpProxyTests
         var codeGraph = CodeGraphServer();
         await using var proxy = await McpProxy.StartAsync(Upstreams(codeGraph), CancellationToken.None);
         Assert.Equal("127.0.0.1", proxy.BaseAddress.Host);
-        var grant = proxy.Grant(Repo);
+        var grant = proxy.Grant(Repo, McpProfile.Planner);
 
         var (status, init) = await Rpc(proxy, McpServers.CodeGraph, grant.Credential, "initialize",
             new JsonObject { ["protocolVersion"] = McpHttpClient.ProtocolVersion });
@@ -110,7 +110,7 @@ public class McpProxyTests
         Assert.Equal(HttpStatusCode.Unauthorized,
             (await Call(proxy, McpServers.CodeGraph, grant.Credential, "analyze_impact", new JsonObject { ["name"] = "X" })).Status);
         // Another session's credential is its own.
-        var other = proxy.Grant(Repo);
+        var other = proxy.Grant(Repo, McpProfile.Planner);
         Assert.NotEqual(grant.Credential, other.Credential);
         Assert.Equal(HttpStatusCode.OK, (await Rpc(proxy, McpServers.CodeGraph, other.Credential, "tools/list")).Status);
     }
@@ -127,7 +127,7 @@ public class McpProxyTests
     {
         var codeGraph = CodeGraphServer();
         await using var proxy = await McpProxy.StartAsync(Upstreams(codeGraph), CancellationToken.None);
-        using var grant = proxy.Grant(Repo);
+        using var grant = proxy.Grant(Repo, McpProfile.Planner);
 
         Assert.DoesNotContain(offList, Listed((await Rpc(proxy, McpServers.CodeGraph, grant.Credential, "tools/list")).Body!));
         var (status, body) = await Call(proxy, McpServers.CodeGraph, grant.Credential, offList, new JsonObject { ["name"] = "X", ["query"] = "q" });
@@ -144,7 +144,7 @@ public class McpProxyTests
             ? FakeMcpServer.Text("## Secret (Class) — Other\n\nclass Secret {}")
             : FakeMcpServer.Text("ok"));
         await using var proxy = await McpProxy.StartAsync(Upstreams(codeGraph), CancellationToken.None);
-        using var grant = proxy.Grant(Repo);
+        using var grant = proxy.Grant(Repo, McpProfile.Planner);
 
         foreach (var project in new[] { "Other", "r-tools", "r service" })
         {
@@ -169,7 +169,7 @@ public class McpProxyTests
         Assert.DoesNotContain("class Secret", node.ToJsonString());
 
         // A repository CodeGraph does not index answers an error, and nothing else is asked.
-        using var unindexed = proxy.Grant(new RepoRef("nobody", "nothing"));
+        using var unindexed = proxy.Grant(new RepoRef("nobody", "nothing"), McpProfile.Planner);
         var (_, none) = await Call(proxy, McpServers.CodeGraph, unindexed.Credential, "analyze_impact", new JsonObject { ["name"] = "X" });
         Assert.Contains(ReviewTools.NotIndexed, none!["result"]!["content"]![0]!["text"]!.GetValue<string>());
     }
@@ -179,7 +179,7 @@ public class McpProxyTests
     {
         var codeGraph = CodeGraphServer();
         await using var proxy = await McpProxy.StartAsync(Upstreams(codeGraph), CancellationToken.None);
-        using var grant = proxy.Grant(Repo);
+        using var grant = proxy.Grant(Repo, McpProfile.Planner);
 
         Assert.Equal(HttpStatusCode.OK, (await Rpc(proxy, McpServers.CodeGraph, grant.Credential, "tools/list",
             adjust: r => r.Headers.Host = $"localhost:{proxy.BaseAddress.Port}")).Status);
@@ -201,7 +201,7 @@ public class McpProxyTests
         var codeGraph = CodeGraphServer();
         var kanban = KanbanServer();
         await using var proxy = await McpProxy.StartAsync(Upstreams(codeGraph, kanban), CancellationToken.None);
-        using var grant = proxy.Grant(Repo);
+        using var grant = proxy.Grant(Repo, McpProfile.Planner);
         Assert.Equal([McpServers.CodeGraph, McpServers.Kanban], grant.Servers);
 
         var listed = Listed((await Rpc(proxy, McpServers.Kanban, grant.Credential, "tools/list")).Body!);
@@ -238,7 +238,7 @@ public class McpProxyTests
 
         string credential;
         string path;
-        await using (var session = await sessions.OpenAsync(Repo, CancellationToken.None))
+        await using (var session = await sessions.OpenAsync(Repo, McpProfile.Planner, CancellationToken.None))
         {
             path = session.ConfigPath;
             Assert.True(Path.IsPathFullyQualified(path));
@@ -292,12 +292,21 @@ public class McpProxyTests
             return json.load(urllib.request.urlopen(req))
         rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake", "version": "1"}})
         listed = [t["name"] for t in rpc("tools/list", {})["result"]["tools"]]
-        answer = rpc("tools/call", {"name": "analyze_impact", "arguments": {"name": "X.Count"}})["result"]["content"][0]["text"]
-        refused = rpc("tools/call", {"name": "ask", "arguments": {"question": "q"}})["error"]["code"]
-        open(os.path.join(dump, "mcp.json"), "w").write(json.dumps({"listed": listed, "answer": answer, "refused": refused}))
+        answer = rpc("tools/call", {"name": "search_graph", "arguments": {"namePattern": "X%"}})["result"]["content"][0]["text"]
+        refused = {t: rpc("tools/call", {"name": t, "arguments": {"name": "X"}})["error"]["code"]
+            for t in ["ask", "analyze_impact", "trace_call_path", "find_consumers", "find_publishers"]}
+        try:
+            urllib.request.urlopen(urllib.request.Request(server["url"].replace("/mcp/codegraph", "/mcp/kanban"),
+                data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).encode(), method="POST",
+                headers=dict(server["headers"], **{"Content-Type": "application/json"})))
+            kanban = 200
+        except urllib.error.HTTPError as e:
+            kanban = e.code
+        open(os.path.join(dump, "mcp.json"), "w").write(json.dumps({"servers": sorted(config["mcpServers"]), "listed": listed,
+            "answer": answer, "refused": refused, "kanban": kanban}))
         print(json.dumps({"type": "system", "subtype": "init", "session_id": "triage-mcp"}))
         print(json.dumps({"type": "assistant", "session_id": "triage-mcp", "message": {"content": [
-            {"type": "tool_use", "id": "t1", "name": "mcp__codegraph__analyze_impact", "input": {"name": "X.Count"}}]}}))
+            {"type": "tool_use", "id": "t1", "name": "mcp__codegraph__search_graph", "input": {"namePattern": "X%"}}]}}))
         print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "done", "session_id": "triage-mcp"}))
         """;
 
@@ -318,7 +327,8 @@ public class McpProxyTests
         var upstreams = Upstreams(codeGraph, KanbanServer());
         await using var proxy = await McpProxy.StartAsync(upstreams, CancellationToken.None);
         var configs = Path.Combine(root, McpProxySessions.DirectoryName);
-        var tools = WorkerTools.ReadOnly.WithMcp(McpServers.ToolRules(upstreams));
+        // Kanban is configured here, but the triage profile grants none of it (as production, which does not even start its upstream).
+        var tools = WorkerTools.ReadOnly.WithMcp(McpProfile.Triage.ToolRules(upstreams));
         Assert.True(tools.IsReadOnly);
         var worker = new ClaudeWorker(script, new Uri("http://localhost:8080/"), "rk_worker", WorkerAuth.RouterKey, TimeSpan.FromMinutes(1), tools: tools);
         var workspaces = new DirWorkspaces(worktree);
@@ -331,14 +341,19 @@ public class McpProxyTests
             "triage prompt", (_, _) => Task.CompletedTask, (_, reason, _) => { taints.Add(reason); return Task.CompletedTask; }, CancellationToken.None);
 
         Assert.True(result.Succeeded, result.StderrTail);
-        // It listed exactly the allowlist and called through the proxy, pinned to the item's repository; an off-list tool was refused.
+        // Its config names only codegraph; it listed exactly the triage profile's tools and called through the proxy, pinned to the
+        // item's repository; every other CodeGraph tool was refused, and Kanban is not served to it (404).
         var mcp = JsonNode.Parse(File.ReadAllText(Path.Combine(dump, "mcp.json")))!;
-        Assert.Equal(ReviewTools.CodeGraphTools.Order(), mcp["listed"]!.AsArray().Select(t => t!.GetValue<string>()).Order());
-        Assert.Equal($"analyze_impact of X.Count in {Project}", mcp["answer"]!.GetValue<string>());
-        Assert.Equal(McpProxy.InvalidParams, mcp["refused"]!.GetValue<int>());
-        Assert.DoesNotContain(codeGraph.Calls, c => c.Tool == "ask");
+        string[] triageTools = ["search_graph", "get_code_snippet", "read_node_source"];
+        Assert.Equal([McpServers.CodeGraph], mcp["servers"]!.AsArray().Select(t => t!.GetValue<string>()));
+        Assert.Equal(triageTools.Order(), mcp["listed"]!.AsArray().Select(t => t!.GetValue<string>()).Order());
+        Assert.Equal($"search_graph of  in {Project}", mcp["answer"]!.GetValue<string>());
+        Assert.All(mcp["refused"]!.AsObject(), r => Assert.Equal(McpProxy.InvalidParams, r.Value!.GetValue<int>()));
+        Assert.Equal(5, mcp["refused"]!.AsObject().Count);
+        Assert.Equal(404, mcp["kanban"]!.GetValue<int>());
+        Assert.Equal(["search_projects", "search_graph"], codeGraph.Calls.Select(c => c.Tool));
         // The MCP use tainted the session too (on top of the issue text).
-        Assert.Equal([Taint.IssueText, "mcp:mcp__codegraph__analyze_impact"], taints);
+        Assert.Equal([Taint.IssueText, "mcp:mcp__codegraph__search_graph"], taints);
 
         // E5: no upstream token in the worker's env, argv or worktree; E6: no proxy credential in argv either (only the file's path).
         var credential = File.ReadAllText(Path.Combine(dump, "credential.txt"));
@@ -357,8 +372,13 @@ public class McpProxyTests
         var configPath = argv[argv.IndexOf("--mcp-config") + 1];
         Assert.StartsWith(configs, configPath);
         Assert.False(configPath.StartsWith(worktree, StringComparison.Ordinal)); // outside the worktree its reads are confined to
-        Assert.Equal(McpServers.ToolRules(upstreams).Order(),
+        Assert.Equal(triageTools.Select(t => $"mcp__codegraph__{t}").Order(),
             argv.Skip(argv.IndexOf("--allowedTools") + 1).TakeWhile(a => !a.StartsWith("--", StringComparison.Ordinal)).Where(a => a.StartsWith("mcp__")).Order());
+        // Its prompt names the granted tools only.
+        var sentPrompt = string.Join("\n", argv.Skip(argv.IndexOf("-p") + 1).TakeWhile(a => !a.StartsWith("--", StringComparison.Ordinal)));
+        Assert.Contains("mcp__codegraph__search_graph", sentPrompt);
+        Assert.DoesNotContain("analyze_impact", sentPrompt);
+        Assert.DoesNotContain("kanban", sentPrompt, StringComparison.OrdinalIgnoreCase);
         Assert.Equal("dontAsk", argv[argv.IndexOf("--permission-mode") + 1]);
         Assert.Equal("", argv[argv.IndexOf("--setting-sources") + 1]);
 
@@ -403,6 +423,147 @@ public class McpProxyTests
         Assert.Throws<ArgumentException>(() => WorkerTools.ReadOnly.WithMcp(["mcp__codegraph__ask"]));
         Assert.Throws<ArgumentException>(() => WorkerTools.ReadOnly.WithMcp(["mcp__kanban__CreateWorkItem"]));
         Assert.Throws<ArgumentException>(() => WorkerTools.ReadOnly.WithMcp(["mcp__codegraph"]));
+        // Only read-only, confined tools take MCP tools: an implementer's never do.
+        Assert.Throws<ArgumentException>(() => WorkerTools.Implementer.WithMcp(McpProfile.Triage.ToolRules(Upstreams(CodeGraphServer()))));
+    }
+
+    [Fact]
+    public async Task A_triage_grant_serves_only_the_codegraph_tools_whose_answers_stay_in_the_pinned_project_and_no_kanban()
+    {
+        var codeGraph = CodeGraphServer();
+        var kanban = KanbanServer();
+        var upstreams = Upstreams(codeGraph, kanban);
+        await using var proxy = await McpProxy.StartAsync(upstreams, CancellationToken.None);
+        using var grant = proxy.Grant(Repo, McpProfile.Triage);
+        string[] triageTools = ["search_graph", "get_code_snippet", "read_node_source"];
+
+        Assert.Equal([McpServers.CodeGraph], grant.Servers);
+        Assert.Equal([McpServers.CodeGraph], JsonNode.Parse(grant.McpConfigJson())!["mcpServers"]!.AsObject().Select(s => s.Key));
+        Assert.Equal(triageTools.Select(t => $"mcp__codegraph__{t}"), McpProfile.Triage.ToolRules(upstreams));
+        Assert.Equal(triageTools.Order(), Listed((await Rpc(proxy, McpServers.CodeGraph, grant.Credential, "tools/list")).Body!).Order());
+        foreach (var crossProject in new[] { "analyze_impact", "trace_call_path", "find_consumers", "find_publishers" })
+        {
+            var (_, body) = await Call(proxy, McpServers.CodeGraph, grant.Credential, crossProject, new JsonObject { ["name"] = "X" });
+            Assert.Equal(McpProxy.InvalidParams, body!["error"]!["code"]!.GetValue<int>());
+        }
+        Assert.Empty(codeGraph.Calls); // nothing forwarded, not even the project lookup
+        var (_, own) = await Call(proxy, McpServers.CodeGraph, grant.Credential, "search_graph", new JsonObject { ["namePattern"] = "X%" });
+        Assert.False(own!["result"]!["isError"]!.GetValue<bool>());
+        // Kanban is configured, but not served to a triage credential at all.
+        Assert.Equal(HttpStatusCode.NotFound, (await Rpc(proxy, McpServers.Kanban, grant.Credential, "tools/list")).Status);
+        Assert.Equal(HttpStatusCode.NotFound, (await Call(proxy, McpServers.Kanban, grant.Credential, "GetBoard", new JsonObject())).Status);
+        Assert.Empty(kanban.Api.Requests);
+        // The production triage worker's --allowedTools: exactly these MCP tools, even with Kanban configured.
+        Assert.Equal(triageTools.Select(t => $"mcp__codegraph__{t}"), SandboxTriageRunner.TriageTools(upstreams, proxied: true).McpAllowed);
+        Assert.Empty(SandboxTriageRunner.TriageTools(upstreams, proxied: false).McpAllowed);
+        // The planner profile (Phase 4) keeps every allowlisted tool of both.
+        using var planner = proxy.Grant(Repo, McpProfile.Planner);
+        Assert.Equal(McpServers.AllToolRules, planner.ToolRules);
+    }
+
+    [Fact]
+    public async Task A_relayed_answer_is_cut_with_a_marker_and_a_grant_past_its_call_budget_is_refused()
+    {
+        var huge = new string('x', McpProxy.MaxAnswerChars * 2);
+        var codeGraph = CodeGraphServer((_, _) => FakeMcpServer.Text(huge));
+        var kanban = new FakeMcpServer("/mcp", KanbanListed, (_, _) => FakeMcpServer.Text(huge));
+        await using var proxy = await McpProxy.StartAsync(Upstreams(codeGraph, kanban), CancellationToken.None);
+        using var grant = proxy.Grant(Repo, McpProfile.Planner);
+
+        foreach (var (server, tool, args) in new[]
+        {
+            (McpServers.CodeGraph, "search_graph", new JsonObject { ["namePattern"] = "X%" }),
+            (McpServers.Kanban, "GetBoard", new JsonObject { ["projectId"] = 3 }),
+        })
+        {
+            var text = (await Call(proxy, server, grant.Credential, tool, args)).Body!["result"]!["content"]![0]!["text"]!.GetValue<string>();
+            Assert.Contains("[cut: ", text);
+            Assert.True(text.Length < McpProxy.MaxAnswerChars + 200, $"{server}: {text.Length}");
+        }
+
+        // The budget: two calls made above; the rest up to the cap are served, the next is refused and not forwarded.
+        for (var i = 2; i < McpProxy.MaxCallsPerGrant; i++)
+        {
+            Assert.NotNull((await Call(proxy, McpServers.Kanban, grant.Credential, "GetBoard", new JsonObject())).Body!["result"]);
+        }
+        var forwarded = kanban.Calls.Count;
+        var (_, over) = await Call(proxy, McpServers.CodeGraph, grant.Credential, "search_graph", new JsonObject { ["namePattern"] = "X%" });
+        Assert.Equal(McpProxy.InvalidParams, over!["error"]!["code"]!.GetValue<int>());
+        Assert.Equal(forwarded, kanban.Calls.Count);
+        Assert.Single(codeGraph.Calls, c => c.Tool == "search_graph");
+        // Another session's budget is its own.
+        using var other = proxy.Grant(Repo, McpProfile.Planner);
+        Assert.NotNull((await Call(proxy, McpServers.Kanban, other.Credential, "GetBoard", new JsonObject())).Body!["result"]);
+    }
+
+    [Fact]
+    public async Task A_session_config_the_worker_user_cannot_read_by_acl_is_a_factory_wide_failure_and_leaves_nothing()
+    {
+        await using var proxy = await McpProxy.StartAsync(Upstreams(CodeGraphServer()), CancellationToken.None);
+        var directory = Path.Combine(Directory.CreateTempSubdirectory("df-mcp-acl-").FullName, McpProxySessions.DirectoryName);
+        const string granted = "drwx------+ 2 me staff 64 Oct 10 12:00 x\n 0: user:_factory inherited allow list,search,read,readattr\n";
+        const string fileGranted = "-rw-------+ 1 me staff 9 Oct 10 12:00 x\n 0: user:_factory inherited allow read,readattr\n";
+        string Acl(string path) => path.EndsWith(".json", StringComparison.Ordinal) ? fileGranted : granted;
+
+        await using (var ok = await new McpProxySessions(proxy, directory, "_factory", (p, _) => Task.FromResult(Acl(p)))
+            .OpenAsync(Repo, McpProfile.Triage, CancellationToken.None))
+        {
+            Assert.True(File.Exists(ok.ConfigPath));
+        }
+
+        // The file carries no read entry for the worker user: refused factory-wide, its file deleted, nothing granted.
+        var seen = new List<string>();
+        var missing = new McpProxySessions(proxy, directory, "_factory", (p, _) =>
+        {
+            seen.Add(p);
+            return Task.FromResult(p.EndsWith(".json", StringComparison.Ordinal) ? "-rw-------  1 me staff 9 Oct 10 12:00 x\n" : granted);
+        });
+        var ex = await Assert.ThrowsAsync<WorkSources.FactoryUnavailableException>(() => missing.OpenAsync(Repo, McpProfile.Triage, CancellationToken.None));
+        Assert.Contains("setup-worker-user.sh", ex.Message);
+        Assert.Empty(Directory.EnumerateFiles(directory));
+        Assert.Equal(2, seen.Count);
+        // Without a worker user (Worker:RunAs=none) nothing is checked.
+        await using (await new McpProxySessions(proxy, directory, null, (_, _) => throw new InvalidOperationException("not asked"))
+            .OpenAsync(Repo, McpProfile.Triage, CancellationToken.None))
+        {
+        }
+    }
+
+    [Theory]
+    [InlineData(" 0: user:_factory inherited allow read,readattr", "read", true)]
+    [InlineData(" 0: user:_factory allow list,search,read", "search", true)]
+    [InlineData(" 0: user:_factory inherited allow readattr,readextattr", "read", false)]
+    [InlineData(" 0: user:_factory2 inherited allow read", "read", false)]
+    [InlineData(" 0: group:_factory inherited allow read", "read", false)]
+    [InlineData(" 0: user:_factory deny read\n 1: user:_factory allow read", "read", false)]
+    [InlineData("-rw-------  1 me staff 9 Oct 10 12:00 user:_factory allow read", "read", false)]
+    public void An_acl_listing_grants_a_right_only_through_an_allow_entry_for_that_user_and_no_deny(string listing, string right, bool grants) =>
+        Assert.Equal(grants, McpProxySessions.AclGrants(listing, "_factory", right));
+
+    [Fact]
+    public async Task A_failing_mcp_config_sweep_or_proxy_start_is_factory_wide()
+    {
+        var upstreams = Upstreams(CodeGraphServer());
+        var configs = Directory.CreateTempSubdirectory("df-mcp-sweep-").FullName;
+        File.WriteAllText(Path.Combine(configs, "left.json"), "{}");
+        File.SetUnixFileMode(configs, UnixFileMode.UserRead | UnixFileMode.UserExecute); // its files cannot be deleted
+        try
+        {
+            var swept = await Assert.ThrowsAsync<WorkSources.FactoryUnavailableException>(() =>
+                SandboxTriageRunner.StartMcpProxyAsync(upstreams, configs, CancellationToken.None));
+            Assert.StartsWith("the MCP proxy: ", swept.Message);
+        }
+        finally
+        {
+            File.SetUnixFileMode(configs, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+        var started = await Assert.ThrowsAsync<WorkSources.FactoryUnavailableException>(() =>
+            SandboxTriageRunner.StartMcpProxyAsync(upstreams, configs, CancellationToken.None,
+                (_, _) => throw new IOException("address in use")));
+        Assert.Contains("address in use", started.Message);
+        // Without CodeGraph no proxy is started.
+        Assert.Null(await SandboxTriageRunner.StartMcpProxyAsync(McpUpstreams.None, configs, CancellationToken.None,
+            (_, _) => throw new InvalidOperationException("not started")));
     }
 
     [Fact]

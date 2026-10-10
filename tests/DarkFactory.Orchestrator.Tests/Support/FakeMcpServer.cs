@@ -14,7 +14,8 @@ public sealed class FakeMcpServer
 {
     public FakeApi Api { get; } = new();
 
-    public FakeMcpServer(string path, IReadOnlyList<string> tools, Func<string, JsonObject, JsonObject> answer)
+    public FakeMcpServer(string path, IReadOnlyList<string> tools, Func<string, JsonObject, JsonObject> answer,
+        Func<string, JsonNode?>? schema = null)
     {
         Api.On($"DELETE {path}", _ => new HttpResponseMessage(HttpStatusCode.NoContent))
             .On($"POST {path}", r =>
@@ -39,7 +40,7 @@ public sealed class FakeMcpServer
                             {
                                 ["name"] = t,
                                 ["description"] = $"upstream {t}",
-                                ["inputSchema"] = new JsonObject
+                                ["inputSchema"] = schema?.Invoke(t)?.DeepClone() ?? new JsonObject
                                 {
                                     ["type"] = "object",
                                     ["properties"] = new JsonObject

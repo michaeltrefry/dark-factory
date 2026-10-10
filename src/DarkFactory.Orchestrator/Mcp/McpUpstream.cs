@@ -90,7 +90,63 @@ public static class McpServers
         .. KanbanTools.Select(t => ToolRule(Kanban, t)),
     ];
 
-    /// <summary>The allow rules for <paramref name="upstreams"/>' allowlisted tools.</summary>
-    public static IReadOnlyList<string> ToolRules(McpUpstreams upstreams) =>
-        upstreams.All.SelectMany(u => u.Allowlist.Select(t => ToolRule(u.Name, t))).ToList();
+    /// <summary>The upstream allowlist of <paramref name="server"/> (empty for a server the factory does not know).</summary>
+    public static IReadOnlyList<string> AllowlistOf(string server) => server switch
+    {
+        CodeGraph => Gate.ReviewTools.CodeGraphTools,
+        Kanban => KanbanTools,
+        _ => [],
+    };
+}
+
+/// <summary>
+/// The exact upstream tools one kind of session is granted through the loopback proxy (sc-25707): per MCP server, a subset of that
+/// upstream's allowlist (<see cref="McpServers.AllowlistOf"/>; anything else is refused when the profile is made). A grant
+/// (<see cref="McpProxy.Grant"/>) serves only its profile's tools: the rest of the allowlist is neither listed nor forwarded, and a
+/// server the profile names no tool of is not served to it at all (404).
+/// </summary>
+public sealed class McpProfile
+{
+    private readonly IReadOnlyDictionary<string, IReadOnlyList<string>> _tools;
+
+    private McpProfile(string name, IReadOnlyDictionary<string, IReadOnlyList<string>> tools)
+    {
+        foreach (var (server, list) in tools)
+        {
+            if (list.FirstOrDefault(t => !McpServers.AllowlistOf(server).Contains(t, StringComparer.Ordinal)) is { } off)
+            {
+                throw new ArgumentException($"'{off}' is not on the {server} allowlist; no profile grants it.", nameof(tools));
+            }
+        }
+        (Name, _tools) = (name, tools);
+    }
+
+    public string Name { get; }
+
+    /// <summary>
+    /// Issue triage: a session driven by untrusted (possibly an outsider's) issue text, whose summary and fix are posted on the issue
+    /// (possibly public). Only CodeGraph tools whose answers stay inside the item's pinned project: <c>search_graph</c> and
+    /// <c>get_code_snippet</c> (the project set by the proxy) and <c>read_node_source</c> (shown only for a node of that project). No
+    /// Kanban (the owner's whole board), and none of <c>analyze_impact</c>, <c>trace_call_path</c>, <c>find_consumers</c>,
+    /// <c>find_publishers</c>, whose answers follow edges into other (private) indexed projects: an issue could otherwise have
+    /// private planning or code structure posted publicly.
+    /// </summary>
+    public static readonly McpProfile Triage = new("triage", new Dictionary<string, IReadOnlyList<string>>
+    {
+        [McpServers.CodeGraph] = [Gate.ReviewTools.SearchGraph, Gate.ReviewTools.GetCodeSnippet, Gate.ReviewTools.ReadNodeSource],
+    });
+
+    /// <summary>Planning sessions (Phase 4; not used yet): every allowlisted CodeGraph tool and Kanban read tool.</summary>
+    public static readonly McpProfile Planner = new("planner", new Dictionary<string, IReadOnlyList<string>>
+    {
+        [McpServers.CodeGraph] = Gate.ReviewTools.CodeGraphTools,
+        [McpServers.Kanban] = McpServers.KanbanTools,
+    });
+
+    /// <summary>The tools of <paramref name="server"/> this profile grants (empty: the server is not served).</summary>
+    public IReadOnlyList<string> ToolsOf(string server) => _tools.TryGetValue(server, out var tools) ? tools : [];
+
+    /// <summary>The allow rules (<c>mcp__&lt;server&gt;__&lt;tool&gt;</c>) of this profile's tools on <paramref name="upstreams"/>.</summary>
+    public IReadOnlyList<string> ToolRules(McpUpstreams upstreams) =>
+        upstreams.All.SelectMany(u => ToolsOf(u.Name).Where(u.Allows).Select(t => McpServers.ToolRule(u.Name, t))).ToList();
 }

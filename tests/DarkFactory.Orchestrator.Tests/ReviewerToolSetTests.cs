@@ -530,6 +530,38 @@ public class ReviewerToolSetTests
     }
 
     [Fact]
+    public async Task A_kanban_tool_whose_schema_is_malformed_or_huge_is_left_out_and_the_review_still_runs()
+    {
+        var huge = new JsonObject { ["type"] = "object", ["description"] = new string('d', ReviewTools.MaxKanbanSchemaChars) };
+        var server = new FakeMcpServer("/mcp", KanbanListed, (tool, args) => FakeMcpServer.Text($"board {tool}"), tool => tool switch
+        {
+            "ListEpics" => new JsonObject { ["type"] = "array" },
+            "GetEpic" => new JsonObject { ["properties"] = new JsonObject() },
+            "ListProjects" => huge,
+            _ => null,
+        });
+        var upstream = new Mcp.McpUpstream(Mcp.McpServers.Kanban,
+            new Mcp.McpHttpClient(server.Client("https://kanban.test/mcp"), "kb_test_token", "Kanban", ""), Mcp.McpServers.KanbanTools, repoScoped: false);
+        var router = Router(SseAnswers.ToolTurn(("toolu_1", "ListEpics", "{}")), SseAnswers.Answer(CleanFindings), SseAnswers.Answer(CleanFindings));
+        var log = new StringWriter();
+        var reviewer = new RouterReviewer(router.Client("http://router.test/"), "rk", tools: new ReviewTools(null, null, upstream, log));
+
+        var review = await reviewer.ReviewAsync(Request(), CancellationToken.None);
+        Assert.True((await reviewer.ReviewAsync(Request(), CancellationToken.None)).Clean); // a second review: each skip logged once
+
+        Assert.True(review.Clean, review.Error);
+        string[] usable = ["GetBoard", "ListEpicDocuments", "GetEpicDocument", "ListWorkItems", "ListEpicWorkItems", "GetIssues"];
+        Assert.All(router.Requests, r =>
+            Assert.Equal([.. ReviewTools.Names, .. usable], Body(r).GetProperty("tools").EnumerateArray().Select(t => t.GetProperty("name").GetString())));
+        // A left-out tool is not forwarded either.
+        Assert.True(Assert.Single(review.Tools!).Error);
+        Assert.Empty(server.Calls);
+        Assert.Equal(3, log.ToString().Split('\n').Count(l => l.Contains("left out")));
+        Assert.False(ReviewTools.UsableSchema(huge));
+        Assert.True(ReviewTools.UsableSchema(new JsonObject { ["type"] = "object" }));
+    }
+
+    [Fact]
     public async Task Without_kanban_no_kanban_tool_is_offered_or_forwarded()
     {
         var router = Router(SseAnswers.ToolTurn(("toolu_1", "GetBoard", "{\"projectId\": 3}")), SseAnswers.Answer(CleanFindings));

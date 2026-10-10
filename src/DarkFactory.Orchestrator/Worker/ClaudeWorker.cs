@@ -151,6 +151,11 @@ public sealed record WorkerTools
     /// </summary>
     public WorkerTools WithMcp(IReadOnlyList<string> mcpRules)
     {
+        if (!IsReadOnly)
+        {
+            // Only a read-only, confined session (planning, triage) reaches the proxy; implementers and fixers never do (E6).
+            throw new ArgumentException("Only read-only, confined tools (WorkerTools.ReadOnly) may be given MCP tools.", nameof(mcpRules));
+        }
         if (mcpRules.FirstOrDefault(r => !Mcp.McpServers.AllToolRules.Contains(r, StringComparer.Ordinal)) is { } off)
         {
             throw new ArgumentException($"'{off}' is not an allowlisted MCP tool; a session is never allowed it.", nameof(mcpRules));

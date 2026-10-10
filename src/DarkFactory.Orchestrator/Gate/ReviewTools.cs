@@ -126,15 +126,30 @@ public sealed record ToolOutcome(string Content, bool IsError, ToolCall Record);
 /// UTF-8 bytes and at what is left of the session's budget (<see cref="Budget"/>), with an explicit <c>[cut: …]</c> marker; a call
 /// once the budget is spent is not run and answers an error.
 /// </summary>
-public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGraph, Mcp.McpUpstream? kanban = null)
+public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGraph, Mcp.McpUpstream? kanban = null, TextWriter? log = null)
 {
     /// <summary>The longest JSON input a Kanban tool is sent.</summary>
     public const int MaxKanbanArgumentChars = 2_000;
 
+    /// <summary>The longest input schema (serialized JSON) of a Kanban tool that is offered; a longer one leaves the tool out.</summary>
+    public const int MaxKanbanSchemaChars = 4 * 1024;
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> _skippedSchemas = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Whether a Kanban tool's <paramref name="schema"/> goes to the router as it is: a JSON object whose <c>type</c> is
+    /// <c>"object"</c>, at most <see cref="MaxKanbanSchemaChars"/> characters serialized. Anything else could fail every review.
+    /// </summary>
+    public static bool UsableSchema(JsonObject? schema) =>
+        schema is not null
+        && schema["type"] is JsonValue type && type.TryGetValue<string>(out var t) && t == "object"
+        && schema.ToJsonString().Length <= MaxKanbanSchemaChars;
+
     /// <summary>
     /// The tool definitions <paramref name="session"/> is offered: <see cref="Definitions"/>, then (with a Kanban upstream) each of its
     /// allowlisted tools the upstream lists, with its own description and input schema. A Kanban listing that fails offers no Kanban
-    /// tool (the review goes on without them). The offered Kanban names are kept on the session: only those are forwarded.
+    /// tool (the review goes on without them); a tool whose schema is not usable (<see cref="UsableSchema"/>) is left out (logged
+    /// once per tool). The offered Kanban names are kept on the session: only those are forwarded.
     /// </summary>
     public async Task<IReadOnlyList<object>> DefinitionsAsync(ReviewToolSession session, CancellationToken ct)
     {
@@ -151,7 +166,19 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
         {
             listed = [];
         }
-        var offered = listed.Where(t => kanban.Allows(t.Name) && !Names.Contains(t.Name)).ToList();
+        var offered = new List<Mcp.McpToolInfo>();
+        foreach (var tool in listed.Where(t => kanban.Allows(t.Name) && !Names.Contains(t.Name)))
+        {
+            if (UsableSchema(tool.InputSchema))
+            {
+                offered.Add(tool);
+            }
+            else if (_skippedSchemas.TryAdd(tool.Name, true))
+            {
+                log?.WriteLine($"[review] Kanban tool {tool.Name} left out: its input schema is not a JSON object of type \"object\" "
+                    + $"within {MaxKanbanSchemaChars} characters");
+            }
+        }
         session.KanbanTools = offered.Select(t => t.Name).ToList();
         return
         [

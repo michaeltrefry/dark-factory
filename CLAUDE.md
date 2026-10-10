@@ -115,7 +115,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Router:Key` | env `FACTORY_ROUTER_KEY`, or keychain account `router-key` |
 | `CodeGraph:BaseUrl` | the hosted CodeGraph (`OutboundHttp.CodeGraphDefaultBase`; an absolute http(s) URL naming no model provider): reviewers' CodeGraph tools (`ReviewTools.CodeGraphTools`) go to its `mcp` endpoint |
 | `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional: without it the factory starts and every CodeGraph tool answers the reviewer an error result (recorded), and triage gets no CodeGraph |
-| `Kanban:McpUrl` | `https://kanban-mcp.trefry.net/mcp` (`OutboundHttp.KanbanDefaultMcpUrl`; an absolute http(s) URL naming no model provider; MCP Streamable HTTP): the Kanban upstream (sc-25707), served to triage sessions through the loopback MCP proxy and to reviewers through their tool loop |
+| `Kanban:McpUrl` | `https://kanban-mcp.trefry.net/mcp` (`OutboundHttp.KanbanDefaultMcpUrl`; an absolute http(s) URL naming no model provider; MCP Streamable HTTP): the Kanban upstream (sc-25707), offered to reviewers through their tool loop (and kept for Phase 4's planner, `McpProfile.Planner`); never to triage sessions, whose proxy is started without it (`McpProfile.Triage`: the issue text is untrusted and the triage's answer is posted on the issue) |
 | `Kanban:Token` | env `FACTORY_KANBAN_TOKEN`, or keychain account `kanban-token`: a KanbanBoard PAT (`Authorization: Bearer`), owner-side only (E5). Optional: without it there is no Kanban upstream (not an error) |
 | `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
@@ -226,8 +226,13 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   exhaustive as the CLI adds tools — the guarantee is `dontAsk` with no allow rule but the `ReadRule` and the allowlisted MCP
   tools below, so any unnamed tool is auto-denied too); the runner refuses any worker whose tools
   are not `IsReadOnly` (which accepts, beyond the `ReadRule`, only allow rules in `McpServers.AllToolRules`), so a tainted session cannot change a file an untainted session later
-  pushes, E4; the prompt has it reason from the code, building and running nothing; with CodeGraph or Kanban configured it may
-  also call their allowlisted read tools through the loopback MCP proxy, below, and its prompt says so, `TriagePrompt.McpNote`) in a throwaway `factory/triage-gh-<key>`
+  pushes, E4; the prompt has it reason from the code, building and running nothing; with CodeGraph configured it may also call,
+  through the loopback MCP proxy below, only the triage profile's tools (`McpProfile.Triage`: `search_graph`, `get_code_snippet`,
+  `read_node_source` — the CodeGraph tools whose answers stay inside the issue repo's pinned project; no Kanban and none of
+  `analyze_impact`/`trace_call_path`/`find_consumers`/`find_publishers`, whose answers cross into other private indexed projects:
+  the issue text is untrusted, possibly an outsider's, and the triage's summary and fix are posted on the issue, possibly
+  public), and its prompt names them, `TriagePrompt.McpNote`; its `--allowedTools` names exactly those three,
+  `SandboxTriageRunner.TriageTools`) in a throwaway `factory/triage-gh-<key>`
   worktree under its own root (`<WorkRoot>/triage-worktrees`, `SandboxTriageRunner.TriageWorktrees`: never the items'
   `worktrees`, swept before each triage, not ACL-shared for writing — the worker user reads it through the work root's
   inherited read entry) whose git holds a contents-read token; nothing is committed or pushed; the issue text is fenced as
@@ -242,17 +247,24 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   are Claude Code's own enforcement, and on Glob and Grep (a search given an explicit path or pattern outside the working
   directory) it is best-effort and unverified by the factory; a gap there would reach what `_factory` can read.
   Loopback MCP proxy (sc-25707, `Mcp/`, E5/E6): sessions that plan or triage reach CodeGraph and Kanban only through
-  `McpProxy`, hosted by the process that runs the session (`SandboxTriageRunner` starts one per triage, in `factory work`
-  or whatever process triages, and stops it after) on `127.0.0.1` only (a free port; never the dashboard's bind address; no
+  `McpProxy`, hosted by the process that runs the session (`SandboxTriageRunner` starts one per triage when CodeGraph is
+  configured, with the CodeGraph upstream only, in `factory work` or whatever process triages, and stops it after; a failed
+  sweep of leftover config files or proxy start is factory-wide, `FactoryUnavailableException`) on `127.0.0.1` only (a free port; never the dashboard's bind address; no
   configuration source is read, so no `Kestrel:Endpoints`/URLs can add a listener, and start-up fails unless it listens on
   exactly one `127.0.0.1` address). It holds the upstream tokens (`McpUpstreams`, the one registry it shares with the
   reviewers' tool loop: `CodeGraphMcpClient.Upstream` and the Kanban `McpUpstream`, both over the generic `McpHttpClient`);
-  the session gets `--mcp-config <file>` naming `http://127.0.0.1:<port>/mcp/<server>` (`codegraph`, `kanban`) with a
-  per-session bearer credential (`McpProxy.Grant`, 32 random bytes, kept hashed), plus `--allowedTools` rules
-  `mcp__<server>__<tool>` for exactly the allowlisted tools (`WorkerTools.WithMcp`; refuses any other), and keeps
+  each grant is a per-session tool set, `McpProxy.Grant(repo, McpProfile)`: `McpProfile.Triage` (above) or
+  `McpProfile.Planner` (every allowlisted CodeGraph tool and Kanban read tool; for Phase 4, unused yet), each a subset of the
+  upstreams' allowlists (checked when the profile is made). The session gets `--mcp-config <file>` naming
+  `http://127.0.0.1:<port>/mcp/<server>` for each server its profile grants a tool of, with a
+  per-session bearer credential (32 random bytes, kept hashed), plus `--allowedTools` rules
+  `mcp__<server>__<tool>` for exactly its profile's tools (`WorkerTools.WithMcp`; refuses any rule off the allowlists, and any
+  base tools that are not read-only and confined, so an implementer can never be given one), and keeps
   `--strict-mcp-config`. Requests need `Host` `127.0.0.1:<port>`/`localhost:<port>` and no `Origin` (else 403) and a live
-  credential (else 401; not the dashboard's cookie login); a server not configured is 404. `tools/list` shows only the
-  upstream's allowlisted tools; `tools/call` refuses any other with JSON-RPC error -32602, nothing forwarded. One allowlist per
+  credential (else 401; not the dashboard's cookie login); a server not configured, or one the grant has no tool of, is 404.
+  `tools/list` shows only the grant's tools; `tools/call` refuses any other with JSON-RPC error -32602, nothing forwarded, and
+  so every call past `McpProxy.MaxCallsPerGrant` (100) per grant; every relayed answer (CodeGraph's and Kanban's) is its text
+  cut at `McpProxy.MaxAnswerChars` (60,000 chars and UTF-8 bytes) with a `[cut: …]` marker. One allowlist per
   upstream: CodeGraph's is `ReviewTools.CodeGraphTools` (7 model-free tools), Kanban's `McpServers.KanbanTools` (ListProjects,
   GetBoard, ListEpics, GetEpic, ListEpicDocuments, GetEpicDocument, ListWorkItems, ListEpicWorkItems, GetIssues, GetWorkItem,
   SearchWorkItems — the last two arrive with KanbanBoard sc-25711; an upstream without them just does not list them; no
@@ -262,12 +274,15 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `read_node_source` shown only for a node of that project, schemas listed without a project argument. Kanban has no repository
   mapping, so it is NOT repo-scoped: its read calls go through with the session's arguments. The credential never goes in argv
   (every local user can read `ps`): `McpProxySessions` writes the config to `<WorkRoot>/mcp-sessions/<guid>.json` (directory
-  `0700`, file created `0600`; the worker user reads it through the work root's inherited read ACL; outside the triage
+  `0700`, file created `0600`; the worker user reads it through the work root's inherited read ACL, which the owner checks
+  with `/bin/ls -led` once the file is written — a `search` entry for `Worker:RunAs` on the directory and a `read` entry on the
+  file (`McpProxySessions.AclGrants`; no deny), else the session is not started, factory-wide, "re-run `sudo
+  scripts/setup-worker-user.sh`"; not checked with `Worker:RunAs=none`; outside the triage
   worktree, so the confined session cannot Read it into its transcript) after checkout and before launch, and when the session
   ends deletes it and revokes the credential (`McpProxyGrant.Dispose`: refused from then on); leftover files are swept before
   each triage. Residual, accepted: while the session runs, a process that can read that file — the owner, root, or another
-  `_factory` process (none runs then: the triage holds the worker run lock) — could call the read-only allowlist through the
-  proxy. Upstream tokens are only in the owner process (never in the worker's env, argv, worktree, prompt or transcript;
+  `_factory` process (none runs then: the triage holds the worker run lock) — could call the session's granted tools through
+  the proxy. Upstream tokens are only in the owner process (never in the worker's env, argv, worktree, prompt or transcript;
   `McpProxyTests`). Every MCP tool use still taints the session (`mcp:<tool>`; triage is already tainted by the issue text and
   never pushes). Implementers and fixers get no MCP: their tools allow none, and `ClaudeWorker.BuildArguments`/`RunAsync` refuse
   an MCP config for them (`--strict-mcp-config` and no `--mcp-config`). Phase 4's planner reuses `McpProxy`/`McpProxySessions`. The intake reads and writes the issue board only through the issue source's
@@ -625,7 +640,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `Commit: <40-hex sha>` — otherwise "commit unknown" (today's hosted answers carry neither until sc-25702 deploys) — always "not
   the PR head". Kanban tools (sc-25707, only with `Kanban:Token`): each session lists the Kanban upstream once
   (`ReviewTools.DefinitionsAsync`) and is offered, after `ReviewTools.Names`, its tools on `McpServers.KanbanTools` with their own
-  input schemas (a failed listing offers none), plus one prompt line saying so; a call is forwarded owner-side through the same
+  input schemas (a failed listing offers none; a tool whose schema is not a JSON object of `"type": "object"` within
+  `ReviewTools.MaxKanbanSchemaChars`, 4 KB serialized, is left out and logged once, `ReviewTools.UsableSchema`), plus one
+  prompt line saying so; a call is forwarded owner-side through the same
   `McpUpstreams` registry the loopback proxy uses (input ≤ `ReviewTools.MaxKanbanArgumentChars` 2,000, not repo-scoped: Kanban
   has no repository mapping), and a Kanban write tool is on no allowlist, so it answers an error and is never forwarded. A turn stopping for `tool_use` has the orchestrator run each call and answer it in a `<tool-result>` fence in the
   next turn of the same session (same session id, class header, placeholder model), at most `RouterReviewer.MaxTurns` (8) turns

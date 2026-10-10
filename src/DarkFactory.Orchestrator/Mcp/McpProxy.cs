@@ -27,9 +27,10 @@ namespace DarkFactory.Orchestrator.Mcp;
 /// <para>
 /// One endpoint per upstream, <c>/mcp/&lt;server&gt;</c> (MCP Streamable HTTP, stateless: every answer is one JSON response).
 /// Requests are refused unless the <c>Host</c> header is <c>127.0.0.1:&lt;port&gt;</c> or <c>localhost:&lt;port&gt;</c> and carry no
-/// <c>Origin</c> (DNS rebinding), and unless they carry a live credential (else 401). <c>tools/list</c> shows only the upstream's tools
-/// on its allowlist (<see cref="McpUpstream.Allowlist"/>; one per upstream, shared with the reviewers' tool loop); <c>tools/call</c>
-/// refuses any other tool (JSON-RPC error, nothing forwarded). CodeGraph is pinned to the grant's repository like the reviewers'
+/// <c>Origin</c> (DNS rebinding), and unless they carry a live credential (else 401). A grant serves exactly its
+/// <see cref="McpProfile"/>'s tools (a subset of each upstream's allowlist, <see cref="McpUpstream.Allowlist"/>; an upstream it grants
+/// no tool of answers 404): <c>tools/list</c> shows only those; <c>tools/call</c> refuses any other tool (JSON-RPC error, nothing
+/// forwarded), and any call past <see cref="MaxCallsPerGrant"/>. Every relayed answer is cut at <see cref="MaxAnswerChars"/>. CodeGraph is pinned to the grant's repository like the reviewers'
 /// tools: its project is the one whose GitHub URL is exactly the repository's (<see cref="ICodeGraph.FindProjectAsync"/>), a call
 /// naming any other <c>project</c> is refused, the arguments are rebuilt by <see cref="ReviewTools.CodeGraphArguments"/> (anything
 /// else is dropped) with the project set, and <c>read_node_source</c> is shown only for a node of that project. Kanban has no
@@ -52,6 +53,18 @@ public sealed class McpProxy : IAsyncDisposable
 
     /// <summary>JSON-RPC: the request is not a single JSON-RPC request object.</summary>
     public const int InvalidRequest = -32600;
+
+    /// <summary>
+    /// The most characters (and UTF-8 bytes, <see cref="ReviewTools.MaxResultBytes"/>) of one relayed tool answer; a longer one is
+    /// cut with a <c>[cut: …]</c> marker (<see cref="ReviewTools.Bounded"/>).
+    /// </summary>
+    public const int MaxAnswerChars = ReviewTools.MaxResultBytes;
+
+    /// <summary>
+    /// The most <c>tools/call</c> requests one grant (one session) may make; every later one answers <see cref="InvalidParams"/>
+    /// and is not forwarded.
+    /// </summary>
+    public const int MaxCallsPerGrant = 100;
 
     private readonly WebApplication _app;
     private readonly McpUpstreams _upstreams;
@@ -102,12 +115,18 @@ public sealed class McpProxy : IAsyncDisposable
     }
 
     /// <summary>
-    /// A credential for one session about <paramref name="repo"/>: valid until the grant is disposed (the session ended), then refused.
+    /// A credential for one session about <paramref name="repo"/>, granted exactly <paramref name="profile"/>'s tools of the configured
+    /// upstreams (an upstream the profile grants no tool of is not served to it): valid until the grant is disposed (the session
+    /// ended), then refused.
     /// </summary>
-    public McpProxyGrant Grant(RepoRef repo)
+    public McpProxyGrant Grant(RepoRef repo, McpProfile profile)
     {
         var credential = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
-        var grant = new McpProxyGrant(this, credential, repo, _upstreams.All.Select(u => u.Name).ToList());
+        var tools = _upstreams.All
+            .Select(u => (u.Name, Tools: (IReadOnlyList<string>)profile.ToolsOf(u.Name).Where(u.Allows).ToList()))
+            .Where(s => s.Tools.Count > 0)
+            .ToList();
+        var grant = new McpProxyGrant(this, credential, repo, tools);
         _grants[Hash(credential)] = grant;
         return grant;
     }
@@ -151,7 +170,7 @@ public sealed class McpProxy : IAsyncDisposable
         }
         var path = request.Path.Value ?? "";
         var server = path.StartsWith(PathPrefix, StringComparison.Ordinal) ? path[PathPrefix.Length..] : null;
-        if (server is null || !grant.Servers.Contains(server) || _upstreams.Named(server) is not { } upstream)
+        if (server is null || grant.ToolsOf(server).Count == 0 || _upstreams.Named(server) is not { } upstream)
         {
             response.StatusCode = StatusCodes.Status404NotFound;
             return;
@@ -195,6 +214,8 @@ public sealed class McpProxy : IAsyncDisposable
                 "initialize" => Result(id, Initialize(parameters, upstream)),
                 "ping" => Result(id, new JsonObject()),
                 "tools/list" => Result(id, await ListAsync(upstream, grant, context.RequestAborted)),
+                "tools/call" when !grant.CountCall() =>
+                    Error(id, InvalidParams, $"This session's {MaxCallsPerGrant} tool calls are spent; nothing more is forwarded."),
                 "tools/call" => await CallAsync(id, parameters, upstream, grant, context.RequestAborted),
                 _ => Error(id, MethodNotFound, $"Method '{Cut(method, 100)}' is not served."),
             };
@@ -217,7 +238,7 @@ public sealed class McpProxy : IAsyncDisposable
     private static async Task<JsonObject> ListAsync(McpUpstream upstream, McpProxyGrant grant, CancellationToken ct)
     {
         var tools = new JsonArray();
-        foreach (var tool in await upstream.ListToolsAsync(ct))
+        foreach (var tool in (await upstream.ListToolsAsync(ct)).Where(t => grant.Allows(upstream.Name, t.Name)))
         {
             var schema = upstream.RepoScoped && CodeGraphSchema(tool.Name) is { } own ? own : tool.InputSchema;
             var description = upstream.RepoScoped
@@ -235,16 +256,19 @@ public sealed class McpProxy : IAsyncDisposable
 
     private async Task<JsonObject> CallAsync(JsonNode id, JsonObject parameters, McpUpstream upstream, McpProxyGrant grant, CancellationToken ct)
     {
-        if (parameters["name"] is not JsonValue n || !n.TryGetValue<string>(out var tool) || !upstream.Allows(tool))
+        if (parameters["name"] is not JsonValue n || !n.TryGetValue<string>(out var tool) || !upstream.Allows(tool)
+            || !grant.Allows(upstream.Name, tool))
         {
-            // Off the allowlist (E2): refused here, nothing forwarded.
-            return Error(id, InvalidParams, $"Unknown tool; the {upstream.Service} tools are {string.Join(", ", upstream.Allowlist)}.");
+            // Off the allowlist or the session's profile (E2): refused here, nothing forwarded.
+            return Error(id, InvalidParams,
+                $"Unknown tool; this session's {upstream.Service} tools are {string.Join(", ", grant.ToolsOf(upstream.Name))}.");
         }
         var arguments = parameters["arguments"] as JsonObject ?? new JsonObject();
         if (!upstream.RepoScoped)
         {
             // Kanban: no repository mapping, so not repository-scoped; read-only by its allowlist.
-            return Result(id, (await upstream.CallAsync(tool, (JsonObject)arguments.DeepClone(), ct)).Result);
+            var relayed = await upstream.CallAsync(tool, (JsonObject)arguments.DeepClone(), ct);
+            return Relayed(id, relayed.Text, relayed.IsError);
         }
         var codeGraph = _upstreams.CodeGraph!;
         var resolved = await grant.ProjectAsync(codeGraph, ct);
@@ -274,13 +298,15 @@ public sealed class McpProxy : IAsyncDisposable
         {
             return Result(id, McpHttpClient.ErrorResult($"Node {built["nodeId"]} is not a node of {resolved} with readable source; not shown."));
         }
-        var text = ReviewTools.Bounded(answer.Text, int.MaxValue);
-        return Result(id, new JsonObject
-        {
-            ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text }),
-            ["isError"] = answer.IsError,
-        });
+        return Relayed(id, answer.Text, answer.IsError);
     }
+
+    /// <summary>An upstream answer as the session gets it: its text, cut at <see cref="MaxAnswerChars"/> with a marker.</summary>
+    private static JsonObject Relayed(JsonNode id, string text, bool isError) => Result(id, new JsonObject
+    {
+        ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = ReviewTools.Bounded(text, MaxAnswerChars) }),
+        ["isError"] = isError,
+    });
 
     private static JsonObject Result(JsonNode id, JsonObject result) => new() { ["jsonrpc"] = "2.0", ["id"] = id, ["result"] = result };
 
@@ -299,17 +325,20 @@ public sealed class McpProxy : IAsyncDisposable
 
 /// <summary>
 /// One session's credential for the <see cref="McpProxy"/>: the bearer token, the repository its CodeGraph queries are pinned to, the
-/// upstreams it may use, and its <c>--mcp-config</c> JSON. Disposed when the session ends: the proxy then refuses the credential.
+/// upstream tools it may use (its <see cref="McpProfile"/> on the configured upstreams), and its <c>--mcp-config</c> JSON. Disposed
+/// when the session ends: the proxy then refuses the credential.
 /// </summary>
 public sealed class McpProxyGrant : IDisposable
 {
     private readonly McpProxy _proxy;
     private readonly SemaphoreSlim _resolve = new(1, 1);
+    private readonly IReadOnlyList<(string Server, IReadOnlyList<string> Tools)> _tools;
     private bool _projectResolved;
     private string? _project;
+    private int _calls;
 
-    internal McpProxyGrant(McpProxy proxy, string credential, RepoRef repo, IReadOnlyList<string> servers) =>
-        (_proxy, Credential, Repo, Servers) = (proxy, credential, repo, servers);
+    internal McpProxyGrant(McpProxy proxy, string credential, RepoRef repo, IReadOnlyList<(string Server, IReadOnlyList<string> Tools)> tools) =>
+        (_proxy, Credential, Repo, _tools) = (proxy, credential, repo, tools);
 
     /// <summary>The session's bearer credential (never in argv; only in its <c>--mcp-config</c> file).</summary>
     public string Credential { get; }
@@ -317,7 +346,18 @@ public sealed class McpProxyGrant : IDisposable
     public RepoRef Repo { get; }
 
     /// <summary>The MCP server names the session is given (<see cref="McpServers"/>).</summary>
-    public IReadOnlyList<string> Servers { get; }
+    public IReadOnlyList<string> Servers => _tools.Select(t => t.Server).ToList();
+
+    /// <summary>The tools of <paramref name="server"/> the session is granted (empty: the server is not served to it).</summary>
+    public IReadOnlyList<string> ToolsOf(string server) => _tools.FirstOrDefault(t => t.Server == server).Tools ?? [];
+
+    public bool Allows(string server, string tool) => ToolsOf(server).Contains(tool, StringComparer.Ordinal);
+
+    /// <summary>The session's granted tools as Claude Code allow rules (<c>mcp__&lt;server&gt;__&lt;tool&gt;</c>).</summary>
+    public IReadOnlyList<string> ToolRules => _tools.SelectMany(t => t.Tools.Select(n => McpServers.ToolRule(t.Server, n))).ToList();
+
+    /// <summary>Counts one <c>tools/call</c>; false once <see cref="McpProxy.MaxCallsPerGrant"/> have been made.</summary>
+    internal bool CountCall() => Interlocked.Increment(ref _calls) <= McpProxy.MaxCallsPerGrant;
 
     public bool Revoked { get; private set; }
 

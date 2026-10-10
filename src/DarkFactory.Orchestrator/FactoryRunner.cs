@@ -264,7 +264,7 @@ public static class FactoryRunner
         HttpClient? kanbanHttp = null)
     {
         var upstreams = CreateUpstreams(options, codeGraphHttp, kanbanHttp, log);
-        return new ReviewTools(files, upstreams.CodeGraph, upstreams.Kanban);
+        return new ReviewTools(files, upstreams.CodeGraph, upstreams.Kanban, log);
     }
 
     /// <summary>
@@ -426,21 +426,47 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         {
             throw new FactoryUnavailableException($"the triage worktree sweep: {ex.Message}", ex);
         }
-        // CodeGraph (and Kanban, when configured) through the loopback MCP proxy this process hosts for the session (sc-25707): the
-        // upstream tokens stay here; the session gets a credential revoked when it ends, in a file (never argv).
+        // CodeGraph through the loopback MCP proxy this process hosts for the session (sc-25707), granted only the triage profile
+        // (Mcp.McpProfile.Triage: the CodeGraph tools whose answers stay in the pinned project; no Kanban upstream at all — the issue
+        // text is untrusted and the triage's answer is posted on the issue). The upstream token stays here; the session gets a
+        // credential revoked when it ends, in a file (never argv).
         using var codeGraphHttp = OutboundHttp.CodeGraphApi(options.CodeGraphBaseUrl);
-        using var kanbanHttp = OutboundHttp.KanbanApi(options.KanbanMcpUrl);
-        var upstreams = FactoryRunner.CreateUpstreams(options, codeGraphHttp, kanbanHttp, log);
+        var upstreams = FactoryRunner.CreateUpstreams(options, codeGraphHttp, kanbanHttp: null, log);
         var configs = Path.Combine(options.WorkRoot, Mcp.McpProxySessions.DirectoryName);
-        Mcp.McpProxySessions.Sweep(configs); // under the worker run lock: no other triage's file is live
-        await using var proxy = upstreams.All.Count > 0 ? await Mcp.McpProxy.StartAsync(upstreams, ct) : null;
-        var tools = proxy is null ? WorkerTools.ReadOnly : WorkerTools.ReadOnly.WithMcp(Mcp.McpServers.ToolRules(upstreams));
+        await using var proxy = await StartMcpProxyAsync(upstreams, configs, ct);
+        var tools = TriageTools(upstreams, proxy is not null);
         var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, sandbox,
             pauseFlagDirectory: options.PauseFlagDirectory, tools: tools);
         var sessions = new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)),
             new RouterClient(routerHttp, routerKey), TimeProvider.System, log, costSettleDelay: options.CostSettleDelay);
         return await new Issues.WorkerTriageRunner(workspaces, worker, sessions, log,
-            proxy is null ? null : new Mcp.McpProxySessions(proxy, configs)).RunAsync(item, repo, prompt, onSession, onTaint, ct);
+            proxy is null ? null : new Mcp.McpProxySessions(proxy, configs, sandbox!.User)).RunAsync(item, repo, prompt, onSession, onTaint, ct);
+    }
+
+    /// <summary>
+    /// The triage worker's tools: <see cref="WorkerTools.ReadOnly"/>, plus (with the proxy) exactly the triage profile's MCP tools
+    /// (<see cref="Mcp.McpProfile.Triage"/>) — its <c>--allowedTools</c> names no other MCP tool.
+    /// </summary>
+    internal static WorkerTools TriageTools(Mcp.McpUpstreams upstreams, bool proxied) =>
+        proxied ? WorkerTools.ReadOnly.WithMcp(Mcp.McpProfile.Triage.ToolRules(upstreams)) : WorkerTools.ReadOnly;
+
+    /// <summary>
+    /// Sweeps <paramref name="configs"/> of a crashed process's session files (under the worker run lock: no other triage's file is
+    /// live) and starts the loopback MCP proxy when CodeGraph is configured (else null). Either failing is factory-wide
+    /// (<see cref="FactoryUnavailableException"/>, E10), never the issue's.
+    /// </summary>
+    internal static async Task<Mcp.McpProxy?> StartMcpProxyAsync(Mcp.McpUpstreams upstreams, string configs, CancellationToken ct,
+        Func<Mcp.McpUpstreams, CancellationToken, Task<Mcp.McpProxy>>? start = null)
+    {
+        try
+        {
+            Mcp.McpProxySessions.Sweep(configs);
+            return upstreams.CodeGraph is null ? null : await (start ?? Mcp.McpProxy.StartAsync)(upstreams, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new FactoryUnavailableException($"the MCP proxy: {ex.Message}", ex);
+        }
     }
 
     private static Task<T> FactoryWideStep<T>(string what, Func<T> step)
