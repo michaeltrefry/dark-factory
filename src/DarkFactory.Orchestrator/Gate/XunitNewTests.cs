@@ -28,7 +28,8 @@ public sealed class XunitNewTests : INewTestStrategy
     /// <summary>The name of xUnit's XML report under Microsoft.Testing.Platform (one per project, in its own directory).</summary>
     public const string XunitReportFileName = "results.xunit.xml";
 
-    public IReadOnlyList<string> ResultFilePatterns => ["*.trx", "*.xunit.xml"];
+    /// <summary>The reports read: xUnit's XML report under Microsoft.Testing.Platform, the TRX logger's under VSTest (never both).</summary>
+    private const string XunitReportPattern = "*.xunit.xml", TrxPattern = "*.trx";
 
     public bool Understands(string path) => path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase);
 
@@ -223,8 +224,11 @@ public sealed class XunitNewTests : INewTestStrategy
             // (\xNNNN). Its option is --report-xunit-xml since 4.0 and --report-xunit before, so an older xunit.v3, which
             // rejects the new name before running anything, gets the old one.
             steps.Add(platform
-                ? new TestStep(TestPhase.Test, "dotnet", Test("--report-xunit-xml")) { Fallback = new TestStep(TestPhase.Test, "dotnet", Test("--report-xunit")) }
-                : new TestStep(TestPhase.Test, "dotnet", Test(null)));
+                ? new TestStep(TestPhase.Test, "dotnet", Test("--report-xunit-xml"))
+                {
+                    Fallback = new TestStep(TestPhase.Test, "dotnet", Test("--report-xunit")), ResultFilePattern = XunitReportPattern,
+                }
+                : new TestStep(TestPhase.Test, "dotnet", Test(null)) { ResultFilePattern = TrxPattern });
         }
         return steps;
     }
@@ -254,18 +258,18 @@ public sealed class XunitNewTests : INewTestStrategy
     }
 
     /// <summary>
-    /// Each test's cases from the run's reports: xUnit's XML report (<c>&lt;assemblies&gt;</c>: each <c>test</c> names its
+    /// Each test's cases from the run's reports (each format only from its own file name: <c>*.trx</c> TRX, else xUnit XML): xUnit's XML report (<c>&lt;assemblies&gt;</c>: each <c>test</c> names its
     /// class and method by <c>type</c> and <c>method</c>, which come from the test's reflected method, not its display name,
     /// and its <c>result</c>) or TRX (<c>UnitTest</c> definitions name the class and method, <c>TestMethod className</c>
     /// and <c>name</c>; <c>UnitTestResult</c>s carry the case's display name and outcome, joined by test id). A file that
-    /// cannot be read — empty (a report writer that failed), not well-formed XML, neither format, or an xUnit result it
+    /// cannot be read — empty (a report writer that failed), not well-formed XML, not its name's format, or an xUnit result it
     /// does not know — contributes nothing and is named in <see cref="TestResults.Unreadable"/>.
     /// </summary>
-    public TestResults ParseResults(IEnumerable<string> resultFiles)
+    public TestResults ParseResults(IEnumerable<ResultFile> resultFiles)
     {
         var results = new Dictionary<string, List<TestCaseResult>>(StringComparer.Ordinal);
         var unreadable = new List<string>();
-        foreach (var (file, n) in resultFiles.Select((f, i) => (f, i + 1)))
+        foreach (var (name, file) in resultFiles)
         {
             List<(string Test, TestCaseResult Case)> cases;
             try
@@ -276,16 +280,17 @@ public sealed class XunitNewTests : INewTestStrategy
                 }
                 using var reader = XmlReader.Create(new StringReader(file),
                     new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit, XmlResolver = null, IgnoreComments = true });
-                cases = reader.MoveToContent() == XmlNodeType.Element ? reader.LocalName switch
+                var trx = name.EndsWith(".trx", StringComparison.OrdinalIgnoreCase);
+                cases = reader.MoveToContent() == XmlNodeType.Element ? (reader.LocalName, trx) switch
                 {
-                    "assemblies" => ReadXunitXml(reader),
-                    "TestRun" => ReadTrx(reader),
-                    var root => throw new InvalidDataException($"it is neither an xUnit XML nor a TRX report (root element <{root}>)"),
+                    ("assemblies", false) => ReadXunitXml(reader),
+                    ("TestRun", true) => ReadTrx(reader),
+                    (var root, _) => throw new InvalidDataException($"it is not {(trx ? "a TRX" : "an xUnit XML")} report (root element <{root}>)"),
                 } : throw new InvalidDataException("it has no root element");
             }
             catch (Exception e) when (e is XmlException or InvalidDataException)
             {
-                unreadable.Add($"result file {n}: {(e is XmlException ? $"it is not well-formed XML ({e.Message})" : e.Message)}");
+                unreadable.Add($"{name}: {(e is XmlException ? $"it is not well-formed XML ({e.Message})" : e.Message)}");
                 continue;
             }
             foreach (var (test, result) in cases)

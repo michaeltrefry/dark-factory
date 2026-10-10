@@ -15,7 +15,8 @@ namespace DarkFactory.Orchestrator.Gate;
 /// as unsandboxed workers do. A run is bounded by <paramref name="timeout"/>; the result files are read only as regular
 /// files (never through a link the tests could plant).
 /// </summary>
-public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, TimeSpan timeout) : IGateTestRunner
+public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, TimeSpan timeout, long maxResultFileBytes = SandboxTestRunner.MaxResultFileBytes)
+    : IGateTestRunner
 {
     public static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(20);
 
@@ -25,7 +26,8 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
     /// <summary>How long a stopped run gets to exit after its helper's stdin closes.</summary>
     private static readonly TimeSpan StopGrace = TimeSpan.FromSeconds(10);
 
-    private const int MaxResultFileBytes = 50 * 1024 * 1024;
+    /// <summary>The largest result file or build log read (a larger result file makes the run's report unreadable).</summary>
+    public const long MaxResultFileBytes = 50 * 1024 * 1024;
 
     public Task<IReadOnlyList<ChangedFile>> ChangesAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct) =>
         git.ChangedFilesAsync(repo, baseSha, headSha, ct);
@@ -85,17 +87,21 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
                 string[] roots = [workspace.Path, RealPath(workspace.Path)];
                 return TestRunReport.Failed(TestRunStatus.BuildFailed, log.ToString()) with
                 {
-                    BuildErrors = ResultFiles(results, spec.Strategy.BuildLogPattern)
-                        .SelectMany(l => spec.Strategy.ParseBuildErrors(l, roots)).Distinct().ToList(),
+                    BuildErrors = ResultFiles(results, spec.Strategy.BuildLogPattern, maxResultFileBytes)
+                        .Where(l => l.Content is not null).SelectMany(l => spec.Strategy.ParseBuildErrors(l.Content!, roots)).Distinct().ToList(),
                 };
             }
-            var files = spec.Strategy.ResultFilePatterns.SelectMany(p => ResultFiles(results, p)).ToList();
+            // Only the reports the test steps ask their runner for (one format per run), so nothing else is read as results.
+            var files = spec.Steps.Select(s => s.ResultFilePattern).OfType<string>().Distinct(StringComparer.Ordinal)
+                .SelectMany(p => ResultFiles(results, p, maxResultFileBytes)).DistinctBy(f => f.Name).ToList();
             if (files.Count == 0)
             {
                 return TestRunReport.Failed(TestRunStatus.NoResults, log.ToString());
             }
-            var parsed = spec.Strategy.ParseResults(files);
-            return new TestRunReport(TestRunStatus.Ran, parsed.Cases, log.ToString()) { UnreadableReports = parsed.Unreadable };
+            var parsed = spec.Strategy.ParseResults(files.Where(f => f.Content is not null).Select(f => new ResultFile(f.Name, f.Content!)));
+            var limit = maxResultFileBytes % (1024 * 1024) == 0 ? $"{maxResultFileBytes / (1024 * 1024)} MB" : $"{maxResultFileBytes} bytes";
+            var tooLarge = files.Where(f => f.Content is null).Select(f => $"{f.Name}: it is larger than {limit}, so it was not read");
+            return new TestRunReport(TestRunStatus.Ran, parsed.Cases, log.ToString()) { UnreadableReports = [.. tooLarge, .. parsed.Unreadable] };
         }
         finally
         {
@@ -123,10 +129,11 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
     }
 
     /// <summary>
-    /// The result files' contents: regular files only, found without following links (the directory and everything in it
-    /// were written by the tests), each at most <see cref="MaxResultFileBytes"/>.
+    /// The result files, by path relative to <paramref name="directory"/> ('/'-separated), with their contents: regular files
+    /// only, found without following links (the directory and everything in it were written by the tests); a file larger
+    /// than <paramref name="maxBytes"/> is listed with no content (not read).
     /// </summary>
-    internal static List<string> ResultFiles(string directory, string pattern)
+    internal static List<(string Name, string? Content)> ResultFiles(string directory, string pattern, long maxBytes)
     {
         var info = new DirectoryInfo(directory);
         if (!info.Exists || info.LinkTarget is not null)
@@ -135,9 +142,10 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
         }
         var options = new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint, IgnoreInaccessible = true };
         return info.EnumerateFiles(pattern, options)
-            .Where(f => f.LinkTarget is null && f.Length <= MaxResultFileBytes)
+            .Where(f => f.LinkTarget is null)
             .OrderBy(f => f.FullName, StringComparer.Ordinal)
-            .Select(f => File.ReadAllText(f.FullName))
+            .Select(f => (Path.GetRelativePath(info.FullName, f.FullName).Replace(Path.DirectorySeparatorChar, '/'),
+                f.Length <= maxBytes ? File.ReadAllText(f.FullName) : null))
             .ToList();
     }
 

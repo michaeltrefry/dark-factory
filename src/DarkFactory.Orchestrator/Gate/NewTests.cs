@@ -46,14 +46,23 @@ public sealed record TestStep(TestPhase Phase, string Program, IReadOnlyList<str
 
     /// <summary>The step run instead when this one exits with <see cref="InvalidCommandLine"/>.</summary>
     public TestStep? Fallback { get; init; }
+
+    /// <summary>
+    /// The result files this test step's runner writes (a file pattern, under the run's results directory; its fallback
+    /// writes the same): only these are read as the run's results.
+    /// </summary>
+    public string? ResultFilePattern { get; init; }
 }
+
+/// <summary>One result file of a run: its path relative to the results directory, and its content.</summary>
+public sealed record ResultFile(string Name, string Content);
 
 /// <summary>
 /// One sandboxed test run: <see cref="Commit"/> checked out in a fresh throwaway worktree named <see cref="Name"/>; with
 /// <see cref="OverlayFrom"/>, the <see cref="OverlayPaths"/> of that commit written over it, <see cref="DeletePaths"/>
 /// removed and the <see cref="Replacements"/> written in place of those files (the base run: the PR's test files applied
 /// to the base commit; its retry: the same without the members that did not compile there); then <see cref="Steps"/>, and
-/// the files matching <see cref="INewTestStrategy.ResultFilePatterns"/> (after a failed build,
+/// the files matching its test steps' <see cref="TestStep.ResultFilePattern"/> (after a failed build,
 /// <see cref="INewTestStrategy.BuildLogPattern"/>) under <see cref="ResultsDirectory"/> parsed by <see cref="Strategy"/>.
 /// <see cref="ResultsDirectory"/> is a fresh random name per run (<see cref="NewTestsCheck.NewResultsDirectory"/>), so no
 /// commit can have put files there; a worktree that already has it fails the run.
@@ -206,9 +215,6 @@ public interface INewTestStrategy
     /// </summary>
     bool Understands(string path);
 
-    /// <summary>The result files a run leaves under its <see cref="TestRunSpec.ResultsDirectory"/> (e.g. <c>*.trx</c>).</summary>
-    IReadOnlyList<string> ResultFilePatterns { get; }
-
     /// <summary>The build-error logs a run's build steps leave under its <see cref="TestRunSpec.ResultsDirectory"/>.</summary>
     string BuildLogPattern { get; }
 
@@ -217,13 +223,14 @@ public interface INewTestStrategy
     /// <summary>
     /// The commands that restore, build and run exactly <paramref name="tests"/> (in their <paramref name="projects"/>) at
     /// <paramref name="commit"/>: every restore, then every build, then every test command, writing results and build-error
-    /// logs under <paramref name="resultsDirectory"/> (relative to the worktree root).
+    /// logs under <paramref name="resultsDirectory"/> (relative to the worktree root); each test command names the result
+    /// files it writes (<see cref="TestStep.ResultFilePattern"/>).
     /// </summary>
     Task<IReadOnlyList<TestStep>> StepsAsync(TestSource source, string commit, IReadOnlyList<string> tests, IReadOnlyDictionary<string, string> projects,
         string resultsDirectory, CancellationToken ct);
 
     /// <summary>Each test's cases (by test id) from the run's result files, and why any of them could not be read.</summary>
-    TestResults ParseResults(IEnumerable<string> resultFiles);
+    TestResults ParseResults(IEnumerable<ResultFile> resultFiles);
 
     /// <summary>The errors in one build-error log; files under one of <paramref name="roots"/> (the worktree) are made relative to it.</summary>
     IReadOnlyList<BuildError> ParseBuildErrors(string log, IReadOnlyList<string> roots);
