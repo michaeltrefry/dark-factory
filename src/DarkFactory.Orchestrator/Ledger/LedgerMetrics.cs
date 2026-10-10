@@ -98,7 +98,7 @@ public sealed class LedgerMetrics(IDbContextFactory<LedgerDbContext> contexts, M
             new(FixRoundsPerPr, Mean(merged.Select(m => (double)FixRounds(m.i.History)).ToList()), MetricUnit.Count, merged.Count,
                 $"fix rounds (review, CI and conflict) over {merged.Count} merged item(s)"),
             new(ReviewerPrecision, judged == 0 ? null : (double)confirmed / judged, MetricUnit.Percent, judged,
-                $"{confirmed} of {judged} blocking finding(s) a second model confirmed (not-confirmed ones were downgraded; unusable or unchecked answers not counted; carried reviews counted once)"),
+                $"{confirmed} of {judged} blocking finding(s) a second opinion confirmed (not-confirmed ones were downgraded; unusable or unchecked answers not counted; carried reviews counted once)"),
             new(IntakeToMerge, Mean(merged.Select(m => (m.Merge!.RecordedAt - m.i.Item.CreatedAt).TotalHours).ToList()), MetricUnit.Hours, merged.Count,
                 $"mean from intake to the merge row over {merged.Count} merged item(s)"),
         ];
@@ -114,7 +114,7 @@ public sealed class LedgerMetrics(IDbContextFactory<LedgerDbContext> contexts, M
     }
 
     /// <summary>
-    /// Blocking findings a second model confirmed, over those it answered clearly (confirmed or not): every fresh review of every verdict
+    /// Blocking findings a second opinion confirmed, over those it answered clearly (confirmed or not): every fresh review of every verdict
     /// row (a review carried from an earlier head is the same review, counted once).
     /// </summary>
     private static (int Confirmed, int Judged) Precision(IEnumerable<MetricItem> items)

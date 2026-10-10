@@ -46,7 +46,7 @@ public static class ReviewPrompts
     /// <summary>The prompt of a review role (<see cref="ReviewRoles"/>).</summary>
     public static ReviewPrompt For(string role) => Load(role);
 
-    /// <summary>The second model's prompt: does a blocking finding reproduce from the code.</summary>
+    /// <summary>The second opinion's prompt: does a blocking finding reproduce from the code.</summary>
     public static ReviewPrompt Confirm => Load(ConfirmName);
 
     private static ReviewPrompt Load(string name)
@@ -94,7 +94,7 @@ public sealed record Confirmation(
     public string ServedName => ServedModel ?? "(the router named no served model)";
 }
 
-/// <summary>One finding of a panel role. <see cref="Downgraded"/>: it was blocking, and the second model did not confirm it.</summary>
+/// <summary>One finding of a panel role. <see cref="Downgraded"/>: it was blocking, and the second opinion did not confirm it.</summary>
 public sealed record Finding(
     [property: JsonPropertyName("severity")] string Severity,
     [property: JsonPropertyName("title")] string Title,
@@ -111,7 +111,7 @@ public sealed record Finding(
     public bool IsBlocking => Severity == Blocking;
 
     /// <summary>
-    /// The finding after its second model answered: not confirmed → optional (and does not block); confirmed or an unusable
+    /// The finding after its second opinion answered: not confirmed → optional (and does not block); confirmed or an unusable
     /// answer → still blocking.
     /// </summary>
     public Finding ConfirmedBy(Confirmation confirmation) => confirmation.Outcome == Confirmation.NotConfirmed
@@ -183,7 +183,7 @@ public static class ReviewPanel
         return problems.Count > 0
             ? new ReviewVerdict(headSha, ReviewVerdict.Fail, string.Join("; ", problems), riskyPaths, reviews)
             : new ReviewVerdict(headSha, ReviewVerdict.Pass,
-                $"{roles}: no blocking finding ({optional} optional, {downgraded} of them downgraded because the second model did not confirm them)",
+                $"{roles}: no blocking finding ({optional} optional, {downgraded} of them downgraded because the second opinion did not confirm them)",
                 riskyPaths, reviews);
     }
 }

@@ -642,7 +642,8 @@ public class RouterReviewerTests
         static byte[] Crlf(string s) => System.Text.Encoding.UTF8.GetBytes(s.Replace("\n", "\r\n"));
         var chunks = new List<byte[]>
         {
-            // A thinking block over ~1.2 s, a delta every 300 ms: longer than the 500 ms idle gap, never silent for it.
+            // A thinking block, a chunk every 500 ms (~3.5 s in all): longer than the 3 s idle gap, never silent for it. The idle
+            // gap is 6x a chunk's, so a loaded machine's late timer cannot turn a chunk's gap into a stall.
             Crlf(SseAnswers.Event("content_block_start", new { type = "content_block_start", index = 0, content_block = new { type = "thinking", thinking = "" } })),
         };
         for (var i = 0; i < 4; i++)
@@ -658,14 +659,14 @@ public class RouterReviewerTests
         chunks.Add(multiLine[..split]);
         chunks.Add(multiLine[split..]);
         chunks.Add(Crlf(SseAnswers.TextDelta(1, CleanFindings) + SseAnswers.BlockStop(1) + SseAnswers.MessageDelta("end_turn") + SseAnswers.MessageStop));
-        var (reader, writer) = SlowBytes(Crlf(SseAnswers.MessageStart("claude-opus-5-5") + ": keep-alive\n\n"), chunks, TimeSpan.FromMilliseconds(300));
+        var (reader, writer) = SlowBytes(Crlf(SseAnswers.MessageStart("claude-opus-5-5") + ": keep-alive\n\n"), chunks, TimeSpan.FromMilliseconds(500));
         var started = System.Diagnostics.Stopwatch.StartNew();
 
         var answer = await MessageStream.ReadAsync(await SseAnswers.Streamed(reader).Content.ReadAsStreamAsync(TestContext.Current.CancellationToken),
-            TimeSpan.FromMilliseconds(500), TestContext.Current.CancellationToken);
+            TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
 
         Assert.Equal(new StreamedAnswer("claude-opus-5-5", "end_turn", "Checked ✓ ok.\n" + CleanFindings + "\n"), answer);
-        Assert.True(started.Elapsed > TimeSpan.FromSeconds(1), $"{started.Elapsed}");
+        Assert.True(started.Elapsed > TimeSpan.FromSeconds(3), $"{started.Elapsed}");
         await writer;
 
         // Exactly one space after "data:" is stripped, a second one is the value's own.
@@ -678,25 +679,27 @@ public class RouterReviewerTests
     [Fact]
     public async Task A_slow_stream_is_read_as_it_arrives_and_only_a_gap_longer_than_the_idle_timeout_fails_it()
     {
-        // message_start at once, then a text delta every 300 ms for ~2.4 s: longer in all than the 1 s idle gap, never
-        // silent for it. Reading as it arrives, the call succeeds.
+        // message_start at once, then text deltas spread over ~4 s (each well under 0.5 s apart): longer in all than the 3 s
+        // idle gap, never silent for it (the idle gap is many times a delta's, so a late timer under load cannot fail it).
+        // Reading as it arrives, the call succeeds.
         var text = "Reviewed the change in small steps.\n" + CleanFindings;
         var deltas = Enumerable.Range(0, (text.Length + 4) / 5).Select(i => SseAnswers.TextDelta(0, text.Substring(i * 5, Math.Min(5, text.Length - i * 5))))
             .Prepend(SseAnswers.TextBlockStart(0)).Append(SseAnswers.BlockStop(0) + SseAnswers.MessageDelta("end_turn") + SseAnswers.MessageStop).ToList();
-        var slow = SlowRouter(SseAnswers.MessageStart("claude-opus-5-5"), deltas, TimeSpan.FromMilliseconds(2400.0 / deltas.Count));
+        var slow = SlowRouter(SseAnswers.MessageStart("claude-opus-5-5"), deltas, TimeSpan.FromMilliseconds(4000.0 / deltas.Count));
         var started = System.Diagnostics.Stopwatch.StartNew();
 
-        var review = await new RouterReviewer(slow.Api.Client("http://router.test/"), "rk", idleTimeout: TimeSpan.FromSeconds(1))
+        Assert.True(4000.0 / deltas.Count < 500, $"{deltas.Count} deltas");
+        var review = await new RouterReviewer(slow.Api.Client("http://router.test/"), "rk", idleTimeout: TimeSpan.FromSeconds(3))
             .ReviewAsync(Request, CancellationToken.None);
 
         Assert.True(review.Clean, review.Error);
-        Assert.True(started.Elapsed > TimeSpan.FromSeconds(1.5), $"{started.Elapsed}");
+        Assert.True(started.Elapsed > TimeSpan.FromSeconds(3), $"{started.Elapsed}");
         await slow.Writer;
 
-        // message_start and one delta, then silence (the stream stays open): the idle gap fails it, long before the whole
-        // call's 60 s deadline and without waiting for a body that never ends.
-        var stalled = SlowRouter(SseAnswers.MessageStart("claude-opus-5-5") + SseAnswers.TextBlockStart(0), [SseAnswers.TextDelta(0, "Partial")],
-            TimeSpan.FromMilliseconds(100), complete: false);
+        // message_start and one delta at once, then silence (the stream stays open): the idle gap fails it, long before the
+        // whole call's 60 s deadline and without waiting for a body that never ends.
+        var stalled = SlowRouter(SseAnswers.MessageStart("claude-opus-5-5") + SseAnswers.TextBlockStart(0) + SseAnswers.TextDelta(0, "Partial"), [],
+            TimeSpan.Zero, complete: false);
         using var http = stalled.Api.Client("http://router.test/");
         http.Timeout = TimeSpan.FromSeconds(60);
         started.Restart();

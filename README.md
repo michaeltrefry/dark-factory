@@ -191,7 +191,7 @@ printf 'add-generic-password -U -s dark-factory -a router-key -w %s\n' "$(pbpast
 #    _factory PROCESS (its toolchain check runs through the helper, whose exit kills them all): close any
 #    `sudo -u _factory` session and stop `factory work` first. Re-run it after pulling any change to
 #    scripts/factory-worker-launch: `factory run`/`work` refuse to start unless the installed helper is the
-#    repo's (same SHA-256 once setup's sandbox_user/sandbox_uid lines are undone, helper_version >= 2):
+#    repo's (same SHA-256 once setup's sandbox_user/sandbox_uid lines are undone, helper_version >= 3):
 #    "Stale helper: the installed launch helper ... is not the current scripts/factory-worker-launch (...);
 #    re-run `sudo scripts/setup-worker-user.sh` to install it". They also refuse a helper that skips its
 #    _factory uid sweep ("... refuses its _factory uid sweep ...").
