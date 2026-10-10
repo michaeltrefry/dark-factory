@@ -16,16 +16,19 @@ namespace DarkFactory.Orchestrator.Gate;
 /// unisolable (its old rows would pass on the base) and test methods outside an xUnit project are another stack's: both
 /// make the check unsupported. Runs, per test project holding a new test (no solution file involved, so a new test
 /// project runs on the base too): <c>dotnet restore</c>, <c>dotnet build --no-restore</c> (errors also to an errors-only
-/// file log), then <c>dotnet test --no-build</c> on just its new tests — <c>--filter-method</c> per test and xUnit's TRX
-/// report under Microsoft.Testing.Platform (<c>global.json</c> <c>test.runner</c>), else VSTest's <c>--filter
-/// FullyQualifiedName=…</c> and TRX logger; results from the TRX files (cases joined to their test by class and method
-/// name). A failed base build is explained from the error log (<see cref="ExplainBuildFailure"/>).
+/// file log), then <c>dotnet test --no-build</c> on just its new tests — <c>--filter-method</c> per test and xUnit's own
+/// XML report under Microsoft.Testing.Platform (<c>global.json</c> <c>test.runner</c>), else VSTest's <c>--filter
+/// FullyQualifiedName=…</c> and TRX logger; results from those reports (cases joined to their test by class and method
+/// name, never by display name). A failed base build is explained from the error log (<see cref="ExplainBuildFailure"/>).
 /// </summary>
 public sealed class XunitNewTests : INewTestStrategy
 {
     public string Name => "dotnet-xunit";
 
-    public string ResultFilePattern => "*.trx";
+    /// <summary>The name of xUnit's XML report under Microsoft.Testing.Platform (one per project, in its own directory).</summary>
+    public const string XunitReportFileName = "results.xunit.xml";
+
+    public IReadOnlyList<string> ResultFilePatterns => ["*.trx", "*.xunit.xml"];
 
     public bool Understands(string path) => path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase);
 
@@ -195,22 +198,33 @@ public sealed class XunitNewTests : INewTestStrategy
             ["build", "--no-restore", ProjectArgument(g.Key), $"-flp:errorsonly;logfile={resultsDirectory}/build-errors-{n}.log"])));
         foreach (var (group, n) in byProject.Select((g, n) => (g, n)))
         {
-            List<string> test = platform ? ["test", "--project", ProjectArgument(group.Key)] : ["test", ProjectArgument(group.Key)];
-            test.AddRange(["--no-build", "--results-directory", $"{resultsDirectory}/{n}"]);
-            if (platform)
+            List<string> Test(string? report)
             {
-                test.Add("--report-xunit-trx");
-                foreach (var id in group)
+                List<string> test = report is not null ? ["test", "--project", ProjectArgument(group.Key)] : ["test", ProjectArgument(group.Key)];
+                test.AddRange(["--no-build", "--results-directory", $"{resultsDirectory}/{n}"]);
+                if (report is not null)
                 {
-                    test.Add("--filter-method");
-                    test.Add(id);
+                    test.AddRange([report, $"{report}-filename", XunitReportFileName]);
+                    foreach (var id in group)
+                    {
+                        test.Add("--filter-method");
+                        test.Add(id);
+                    }
                 }
+                else
+                {
+                    test.AddRange(["--logger", "trx", "--filter", string.Join('|', group.Select(id => $"FullyQualifiedName={id}"))]);
+                }
+                return test;
             }
-            else
-            {
-                test.AddRange(["--logger", "trx", "--filter", string.Join('|', group.Select(id => $"FullyQualifiedName={id}"))]);
-            }
-            steps.Add(new TestStep(TestPhase.Test, "dotnet", test));
+            // Under the testing platform, xUnit's own XML report, never its TRX: since xunit.v3 4.0 the TRX (and JUnit,
+            // NUnit, HTML) writer puts a failure message's text into XML as it is, so an unpaired UTF-16 surrogate (e.g. a
+            // string reverse that splits a pair) aborts it and leaves an empty file; the XML report escapes such characters
+            // (\xNNNN). Its option is --report-xunit-xml since 4.0 and --report-xunit before, so an older xunit.v3, which
+            // rejects the new name before running anything, gets the old one.
+            steps.Add(platform
+                ? new TestStep(TestPhase.Test, "dotnet", Test("--report-xunit-xml")) { Fallback = new TestStep(TestPhase.Test, "dotnet", Test("--report-xunit")) }
+                : new TestStep(TestPhase.Test, "dotnet", Test(null)));
         }
         return steps;
     }
@@ -240,55 +254,101 @@ public sealed class XunitNewTests : INewTestStrategy
     }
 
     /// <summary>
-    /// Each test's cases from TRX files: <c>UnitTest</c> definitions name the class and method (<c>TestMethod
-    /// className</c>, <c>name</c>), <c>UnitTestResult</c>s carry the case's display name and outcome, joined by test id.
-    /// A file that is not readable TRX contributes nothing (the tests it held then count as not run).
+    /// Each test's cases from the run's reports: xUnit's XML report (<c>&lt;assemblies&gt;</c>: each <c>test</c> names its
+    /// class and method by <c>type</c> and <c>method</c>, which come from the test's reflected method, not its display name,
+    /// and its <c>result</c>) or TRX (<c>UnitTest</c> definitions name the class and method, <c>TestMethod className</c>
+    /// and <c>name</c>; <c>UnitTestResult</c>s carry the case's display name and outcome, joined by test id). A file that
+    /// cannot be read — empty (a report writer that failed), not well-formed XML, neither format, or an xUnit result it
+    /// does not know — contributes nothing and is named in <see cref="TestResults.Unreadable"/>.
     /// </summary>
-    public IReadOnlyDictionary<string, IReadOnlyList<TestCaseResult>> ParseResults(IEnumerable<string> resultFiles)
+    public TestResults ParseResults(IEnumerable<string> resultFiles)
     {
         var results = new Dictionary<string, List<TestCaseResult>>(StringComparer.Ordinal);
-        foreach (var file in resultFiles)
+        var unreadable = new List<string>();
+        foreach (var (file, n) in resultFiles.Select((f, i) => (f, i + 1)))
         {
-            var definitions = new Dictionary<string, string>(StringComparer.Ordinal);
-            var outcomes = new List<(string TestId, string Name, string Outcome)>();
+            List<(string Test, TestCaseResult Case)> cases;
             try
             {
+                if (string.IsNullOrWhiteSpace(file))
+                {
+                    throw new InvalidDataException("it is empty (the test runner could not write it)");
+                }
                 using var reader = XmlReader.Create(new StringReader(file),
                     new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit, XmlResolver = null, IgnoreComments = true });
-                string? unitTestId = null;
-                while (reader.Read())
+                cases = reader.MoveToContent() == XmlNodeType.Element ? reader.LocalName switch
                 {
-                    if (reader.NodeType != XmlNodeType.Element)
-                    {
-                        continue;
-                    }
-                    switch (reader.LocalName)
-                    {
-                        case "UnitTestResult" when reader.GetAttribute("testId") is { } id:
-                            outcomes.Add((id, reader.GetAttribute("testName") ?? "", Outcome(reader.GetAttribute("outcome"))));
-                            break;
-                        case "UnitTest":
-                            unitTestId = reader.GetAttribute("id");
-                            break;
-                        case "TestMethod" when unitTestId is not null && reader.GetAttribute("className") is { } cls && reader.GetAttribute("name") is { } method:
-                            definitions[unitTestId] = $"{cls}.{method}";
-                            break;
-                    }
-                }
+                    "assemblies" => ReadXunitXml(reader),
+                    "TestRun" => ReadTrx(reader),
+                    var root => throw new InvalidDataException($"it is neither an xUnit XML nor a TRX report (root element <{root}>)"),
+                } : throw new InvalidDataException("it has no root element");
             }
-            catch (XmlException)
+            catch (Exception e) when (e is XmlException or InvalidDataException)
+            {
+                unreadable.Add($"result file {n}: {(e is XmlException ? $"it is not well-formed XML ({e.Message})" : e.Message)}");
+                continue;
+            }
+            foreach (var (test, result) in cases)
+            {
+                (results.TryGetValue(test, out var list) ? list : results[test] = []).Add(result);
+            }
+        }
+        return new TestResults(results.ToDictionary(kv => kv.Key, kv => (IReadOnlyList<TestCaseResult>)kv.Value, StringComparer.Ordinal), unreadable);
+    }
+
+    /// <summary>xUnit's XML report (v2+ format): every <c>test</c> element, by its <c>type</c> and <c>method</c>.</summary>
+    private static List<(string, TestCaseResult)> ReadXunitXml(XmlReader reader)
+    {
+        var cases = new List<(string, TestCaseResult)>();
+        while (reader.Read())
+        {
+            if (reader.NodeType != XmlNodeType.Element || reader.LocalName != "test")
             {
                 continue;
             }
-            foreach (var (testId, name, outcome) in outcomes)
+            if (reader.GetAttribute("type") is not { Length: > 0 } type || reader.GetAttribute("method") is not { Length: > 0 } method)
             {
-                if (definitions.TryGetValue(testId, out var test))
-                {
-                    (results.TryGetValue(test, out var cases) ? cases : results[test] = []).Add(new TestCaseResult(name, outcome));
-                }
+                throw new InvalidDataException("a test result names no type and method");
+            }
+            var outcome = reader.GetAttribute("result") switch
+            {
+                "Pass" => TestCaseResult.Passed,
+                "Fail" => TestCaseResult.Failed,
+                "Skip" or "NotRun" => TestCaseResult.Skipped,
+                var other => throw new InvalidDataException($"test {type}.{method} has the unknown result '{other}'"),
+            };
+            cases.Add(($"{type}.{method}", new TestCaseResult(reader.GetAttribute("name") ?? "", outcome)));
+        }
+        return cases;
+    }
+
+    /// <summary>A TRX file: <c>UnitTestResult</c>s joined to their <c>UnitTest</c> definition's class and method by test id.</summary>
+    private static List<(string, TestCaseResult)> ReadTrx(XmlReader reader)
+    {
+        var definitions = new Dictionary<string, string>(StringComparer.Ordinal);
+        var outcomes = new List<(string TestId, string Name, string Outcome)>();
+        string? unitTestId = null;
+        do
+        {
+            if (reader.NodeType != XmlNodeType.Element)
+            {
+                continue;
+            }
+            switch (reader.LocalName)
+            {
+                case "UnitTestResult" when reader.GetAttribute("testId") is { } id:
+                    outcomes.Add((id, reader.GetAttribute("testName") ?? "", Outcome(reader.GetAttribute("outcome"))));
+                    break;
+                case "UnitTest":
+                    unitTestId = reader.GetAttribute("id");
+                    break;
+                case "TestMethod" when unitTestId is not null && reader.GetAttribute("className") is { } cls && reader.GetAttribute("name") is { } method:
+                    definitions[unitTestId] = $"{cls}.{method}";
+                    break;
             }
         }
-        return results.ToDictionary(kv => kv.Key, kv => (IReadOnlyList<TestCaseResult>)kv.Value, StringComparer.Ordinal);
+        while (reader.Read());
+        return outcomes.Where(o => definitions.ContainsKey(o.TestId)).Select(o => (definitions[o.TestId], new TestCaseResult(o.Name, o.Outcome))).ToList();
     }
 
     private static string Outcome(string? trx) => trx switch

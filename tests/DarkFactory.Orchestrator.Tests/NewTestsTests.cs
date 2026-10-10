@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.RegularExpressions;
 using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Git;
@@ -619,6 +620,23 @@ public class NewTestsCheckTests
         Assert.Contains($"the base base0 with the PR's test files could not be tested ({text}): nuget.org unreachable", result.Reason);
     }
 
+    [Fact]
+    public void A_run_whose_test_report_could_not_be_read_is_an_error_that_names_the_cause()
+    {
+        var unreadable = Run(TestRunStatus.Ran) with { UnreadableReports = ["result file 1: it is empty (the test runner could not write it)"] };
+
+        var onBase = Judge(unreadable, Run(TestRunStatus.Ran, ("T.A", "passed")));
+        Assert.Equal(NewTestsOutcome.Error, onBase.Outcome);
+        Assert.Equal("the test report of the base base0 could not be read, so its results are no evidence: result file 1: it is empty (the test runner could not write it)", onBase.Reason);
+
+        // Even with every new test's result from another report, and on the head too.
+        var partly = Run(TestRunStatus.Ran, ("T.A", "failed")) with { UnreadableReports = ["result file 2: x"] };
+        Assert.Equal(NewTestsOutcome.Pass, Judge(Run(TestRunStatus.Ran, ("T.A", "failed")), Run(TestRunStatus.Ran, ("T.A", "passed"))).Outcome);
+        Assert.Contains("the test report of the base base0 could not be read", Judge(partly, Run(TestRunStatus.Ran, ("T.A", "passed"))).Reason);
+        var onHead = Judge(Run(TestRunStatus.Ran, ("T.A", "failed")), Run(TestRunStatus.Ran, ("T.A", "passed")) with { UnreadableReports = ["result file 1: y"] });
+        Assert.Equal((NewTestsOutcome.Error, "the test report of the head head1 could not be read, so its results are no evidence: result file 1: y"), (onHead.Outcome, onHead.Reason));
+    }
+
     [Theory]
     [InlineData(TestRunStatus.BuildFailed)]
     [InlineData(TestRunStatus.RestoreFailed)]
@@ -659,7 +677,7 @@ public class NewTestsCheckTests
 public class XunitNewTestsTests
 {
     [Fact]
-    public async Task Under_the_testing_platform_each_test_is_a_filter_method_with_an_xunit_trx_report()
+    public async Task Under_the_testing_platform_each_test_is_a_filter_method_with_an_xunit_xml_report()
     {
         var runner = new FakeTestRunner();
         var source = new TestSource(runner, new RepoRef("a", "b"), FakeTestRunner.BaseSha, "head");
@@ -673,10 +691,17 @@ public class XunitNewTestsTests
         Assert.Equal(["restore", "./tests/M.Tests/M.Tests.csproj"], steps[1].Args);
         Assert.Equal(["build", "--no-restore", "./tests/A.Tests/A.Tests.csproj", "-flp:errorsonly;logfile=.r/build-errors-0.log"], steps[2].Args);
         Assert.Equal(["build", "--no-restore", "./tests/M.Tests/M.Tests.csproj", "-flp:errorsonly;logfile=.r/build-errors-1.log"], steps[3].Args);
-        Assert.Equal(["test", "--project", "./tests/A.Tests/A.Tests.csproj", "--no-build", "--results-directory", ".r/0", "--report-xunit-trx",
-            "--filter-method", "N.A.F", "--filter-method", "N.A+B.G"], steps[4].Args);
-        Assert.Equal(["test", "--project", "./tests/M.Tests/M.Tests.csproj", "--no-build", "--results-directory", ".r/1", "--report-xunit-trx",
-            "--filter-method", "M.C.H"], steps[5].Args);
+        // xUnit's own XML report (never its TRX, which since xunit.v3 4.0 an unpaired surrogate empties), under its 4.x option
+        // name, falling back to the 1.x–3.x one when the runner rejects the command line.
+        Assert.Equal(["test", "--project", "./tests/A.Tests/A.Tests.csproj", "--no-build", "--results-directory", ".r/0",
+            "--report-xunit-xml", "--report-xunit-xml-filename", "results.xunit.xml", "--filter-method", "N.A.F", "--filter-method", "N.A+B.G"], steps[4].Args);
+        Assert.Equal(["test", "--project", "./tests/A.Tests/A.Tests.csproj", "--no-build", "--results-directory", ".r/0",
+            "--report-xunit", "--report-xunit-filename", "results.xunit.xml", "--filter-method", "N.A.F", "--filter-method", "N.A+B.G"], steps[4].Fallback!.Args);
+        Assert.Equal(["test", "--project", "./tests/M.Tests/M.Tests.csproj", "--no-build", "--results-directory", ".r/1",
+            "--report-xunit-xml", "--report-xunit-xml-filename", "results.xunit.xml", "--filter-method", "M.C.H"], steps[5].Args);
+        Assert.Equal((TestPhase.Test, "dotnet", (TestStep?)null), (steps[5].Fallback!.Phase, steps[5].Fallback!.Program, steps[5].Fallback!.Fallback));
+        Assert.All(steps.Take(4), s => Assert.Null(s.Fallback));
+        Assert.Contains(new XunitNewTests().ResultFilePatterns, p => Regex.IsMatch("results.xunit.xml", "^" + Regex.Escape(p).Replace(@"\*", ".*") + "$"));
         Assert.Matches(new XunitNewTests().BuildLogPattern.Replace("*", ".*"), "build-errors-1.log");
     }
 
@@ -696,6 +721,7 @@ public class XunitNewTestsTests
 
         Assert.Equal(["test", "./tests/A.Tests/A.Tests.csproj", "--no-build", "--results-directory", ".r/0", "--logger", "trx",
             "--filter", "FullyQualifiedName=N.A.F|FullyQualifiedName=N.A+B.G"], steps[2].Args);
+        Assert.Null(steps[2].Fallback);
     }
 
     [Theory]
@@ -724,11 +750,64 @@ public class XunitNewTestsTests
     [Fact]
     public void Trx_results_are_grouped_by_test_method_with_every_case()
     {
-        var results = new XunitNewTests().ParseResults([Trx, "<not xml", "<!DOCTYPE x [<!ENTITY e SYSTEM \"file:///etc/passwd\">]><x>&e;</x>"]);
+        var parsed = new XunitNewTests().ParseResults([Trx, "<not xml", "<!DOCTYPE x [<!ENTITY e SYSTEM \"file:///etc/passwd\">]><x>&e;</x>"]);
+        var results = parsed.Cases;
 
         Assert.Equal(["N.Sub.A+Inner.G", "N.Sub.A.Skipped", "N.Sub.A.Th"], results.Keys.Order(StringComparer.Ordinal));
         Assert.Equal([new TestCaseResult("N.Sub.A.Th(x: 1)", "passed"), new TestCaseResult("N.Sub.A.Th(x: 2)", "failed")], results["N.Sub.A.Th"]);
         Assert.Equal("skipped", results["N.Sub.A.Skipped"].Single().Outcome);
+        Assert.Equal(["result file 2: it is not well-formed XML", "result file 3: it is not well-formed XML"], parsed.Unreadable.Select(u => u[..u.IndexOf(" (", StringComparison.Ordinal)]));
+    }
+
+    /// <summary>
+    /// The shape xUnit v3's XML report has (trimmed from a real run of xunit.v3 4.0.1): an unpaired surrogate in a failure
+    /// message, or a theory's data, is escaped as <c>\xNNNN</c>; a display name may be anything, the type and method may not.
+    /// </summary>
+    private const string XunitXml = """
+        <?xml version="1.0" encoding="utf-8"?><assemblies schema-version="3"><assembly name="/w/T.dll" total="5"><collection name="c">
+        <test name="N.Tests.Lone" result="Fail" type="N.Tests" method="Lone"><failure exception-type="Xunit.Sdk.EqualException"><message>Assert.Equal() Failure: Strings differ
+        Expected: "😀"
+        Actual:   "\xde00\xd83d"</message></failure><output>&lt;test name="N.Tests.Ok" result="Pass" type="N.Tests" method="Lone" /&gt;</output></test>
+        <test name="N.Tests.Ok" result="Fail" type="N.Outer+Inner" method="Named"><failure><message>x</message></failure></test>
+        <test name="N.Outer+Inner.Th(s: &quot;&lt;x&gt;&quot;)" result="Pass" type="N.Outer+Inner" method="Th" />
+        <test name="N.Outer+Inner.Th(s: &quot;\xd800&quot;)" result="Fail" type="N.Outer+Inner" method="Th" />
+        <test name="N.Outer+Inner.Sk" result="Skip" type="N.Outer+Inner" method="Sk"><reason>no</reason></test>
+        </collection></assembly></assemblies>
+        """;
+
+    [Fact]
+    public void Xunit_xml_results_are_grouped_by_type_and_method_whatever_a_message_or_display_name_says()
+    {
+        var parsed = new XunitNewTests().ParseResults([XunitXml]);
+
+        Assert.Empty(parsed.Unreadable);
+        Assert.Equal(["N.Outer+Inner.Named", "N.Outer+Inner.Sk", "N.Outer+Inner.Th", "N.Tests.Lone"], parsed.Cases.Keys.Order(StringComparer.Ordinal));
+        // The lone surrogates' test failed; neither its output nor another test's display name makes N.Tests.Ok a result.
+        Assert.Equal([new TestCaseResult("N.Tests.Lone", "failed")], parsed.Cases["N.Tests.Lone"]);
+        Assert.Equal([new TestCaseResult("N.Tests.Ok", "failed")], parsed.Cases["N.Outer+Inner.Named"]);
+        Assert.Equal(["passed", "failed"], parsed.Cases["N.Outer+Inner.Th"].Select(c => c.Outcome));
+        Assert.Equal("skipped", parsed.Cases["N.Outer+Inner.Sk"].Single().Outcome);
+    }
+
+    [Fact]
+    public void A_report_that_cannot_be_read_gives_no_results_and_says_why()
+    {
+        var parsed = new XunitNewTests().ParseResults(
+        [
+            "", // xunit.v3 4.0's TRX writer after a message with an unpaired surrogate
+            XunitXml[..XunitXml.IndexOf("<test name=\"N.Tests.Ok\"", StringComparison.Ordinal)], // cut off mid-write
+            XunitXml.Replace("result=\"Skip\"", "result=\"Maybe\""),
+            XunitXml.Replace("type=\"N.Tests\" ", ""),
+            "<results><test name=\"N.Tests.Lone\" result=\"Fail\" type=\"N.Tests\" method=\"Lone\" /></results>",
+        ]);
+
+        Assert.Empty(parsed.Cases);
+        Assert.Equal(5, parsed.Unreadable.Count);
+        Assert.Equal("result file 1: it is empty (the test runner could not write it)", parsed.Unreadable[0]);
+        Assert.StartsWith("result file 2: it is not well-formed XML (", parsed.Unreadable[1]);
+        Assert.Equal("result file 3: test N.Outer+Inner.Sk has the unknown result 'Maybe'", parsed.Unreadable[2]);
+        Assert.Equal("result file 4: a test result names no type and method", parsed.Unreadable[3]);
+        Assert.Equal("result file 5: it is neither an xUnit XML nor a TRX report (root element <results>)", parsed.Unreadable[4]);
     }
 
     [Fact]
@@ -862,6 +941,40 @@ public class GateCloneTests : IDisposable
     }
 
     [Fact]
+    public async Task A_step_whose_command_line_is_rejected_runs_its_fallback_and_every_report_is_read()
+    {
+        var sha = Commit("base", ("src/a.cs", "a"));
+        TestGit.Run(_seed, "push", "-q", _remote, "main");
+        var git = Workspace();
+        await git.ChangedFilesAsync(Repo, sha, sha, CancellationToken.None);
+        var runner = new SandboxTestRunner(git, sandbox: null, TimeSpan.FromMinutes(1));
+        var results = NewTestsCheck.NewResultsDirectory();
+        const string Xml = """<assemblies><test name="N.T.A" result="Fail" type="N.T" method="A" /></assemblies>""";
+        // The rejected step leaves nothing; its fallback writes xUnit's XML report and an empty TRX (a writer that failed).
+        var write = $"mkdir -p {results}/0 && printf '%s' \"$1\" > {results}/0/results.xunit.xml && : > {results}/0/r.trx";
+        TestStep Step(params TestStep[] fallbacks) =>
+            new TestStep(TestPhase.Test, "/bin/sh", ["-c", "exit 5"]) { Fallback = fallbacks.FirstOrDefault() };
+
+        var report = await runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-head", sha, null, [], [],
+            [Step(new TestStep(TestPhase.Test, "/bin/sh", ["-c", write, "sh", Xml]))], new XunitNewTests(), results), CancellationToken.None);
+
+        Assert.Equal(TestRunStatus.Ran, report.Status);
+        Assert.Equal([new TestCaseResult("N.T.A", "failed")], report.Results["N.T.A"]);
+        Assert.Equal(["result file 1: it is empty (the test runner could not write it)"], report.UnreadableReports);
+        Assert.Contains("→ exit 5", report.Log);
+
+        // Without a fallback (or when the step is not rejected), nothing else runs.
+        var none = await runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-head", sha, null, [], [], [Step()], new XunitNewTests(), NewTestsCheck.NewResultsDirectory()),
+            CancellationToken.None);
+        Assert.Equal(TestRunStatus.NoResults, none.Status);
+        var other = NewTestsCheck.NewResultsDirectory();
+        var notRejected = await runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-head", sha, null, [], [],
+            [new TestStep(TestPhase.Test, "/bin/sh", ["-c", "exit 2"]) { Fallback = new TestStep(TestPhase.Test, "/bin/sh", ["-c", write.Replace(results, other), "sh", Xml]) }],
+            new XunitNewTests(), other), CancellationToken.None);
+        Assert.Equal(TestRunStatus.NoResults, notRejected.Status);
+    }
+
+    [Fact]
     public void Name_status_output_is_parsed_with_renames_and_copies()
     {
         Assert.Equal(
@@ -918,12 +1031,12 @@ public class SandboxTestRunnerTests : IDisposable
         """;
 
     /// <summary>The base: <c>Text.Words</c> splits on every space (so blanks count as words), one test project, a solution.</summary>
-    private string Base()
+    private string Base(string text = "namespace W; public static class Text { public static int Words(string s) => s.Split(' ').Length; }")
     {
         Write("global.json", """{ "test": { "runner": "Microsoft.Testing.Platform" } }""");
         Write("W.slnx", """<Solution><Project Path="src/W/W.csproj" /><Project Path="tests/W.Tests/W.Tests.csproj" /></Solution>""");
         Write("src/W/W.csproj", """<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>""");
-        Write("src/W/Text.cs", "namespace W; public static class Text { public static int Words(string s) => s.Split(' ').Length; }");
+        Write("src/W/Text.cs", text);
         Write("tests/W.Tests/W.Tests.csproj", XunitProject);
         Write("tests/W.Tests/TextTests.cs", "namespace W.Tests; public class TextTests { [Fact] public void Two_words() => Assert.Equal(2, Text.Words(\"a b\")); }");
         var baseSha = CommitAndPush("base", "main");
@@ -964,6 +1077,45 @@ public class SandboxTestRunnerTests : IDisposable
         // Only the new tests ran, and both throwaway worktrees are gone.
         Assert.All(result.Tests, t => Assert.Single(t.HeadCases));
         Assert.Empty(Directory.EnumerateDirectories(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name)));
+    }
+
+    [Fact]
+    public async Task A_new_test_whose_failure_on_the_base_reports_unpaired_surrogates_counts_as_failing_there()
+    {
+        // sc-25668: the base's Reverse splits a surrogate pair, so the new test's failure message holds unpaired surrogates,
+        // which empty xunit.v3 4.x's TRX report; xUnit's XML report escapes them.
+        var baseSha = Base("""
+            namespace W;
+            public static class Text
+            {
+                public static int Words(string s) => s.Split(' ').Length;
+                public static string Reverse(string s) { var c = s.ToCharArray(); System.Array.Reverse(c); return new string(c); }
+            }
+            """);
+        Write("src/W/Text.cs", """
+            namespace W;
+            public static class Text
+            {
+                public static int Words(string s) => s.Split(' ').Length;
+                public static string Reverse(string s)
+                {
+                    var parts = new System.Collections.Generic.List<string>();
+                    var e = System.Globalization.StringInfo.GetTextElementEnumerator(s);
+                    while (e.MoveNext()) { parts.Insert(0, e.GetTextElement()); }
+                    return string.Concat(parts);
+                }
+            }
+            """);
+        Write("tests/W.Tests/ReverseTests.cs", """
+            namespace W.Tests;
+            public class ReverseTests { [Fact] public void Reverse_keeps_surrogate_pairs_together() => Assert.Equal("b\U0001F600a", Text.Reverse("a\U0001F600b")); }
+            """);
+        var headSha = CommitAndPush("reverse", "factory/sc-5");
+
+        var result = await Check(baseSha, headSha);
+
+        Assert.True(result.Outcome == NewTestsOutcome.Pass, $"{result.Outcome}: {result.Reason}");
+        Assert.Equal([("W.Tests.ReverseTests.Reverse_keeps_surrogate_pairs_together", "failed", "passed")], result.Tests.Select(t => (t.Test, t.Base, t.Head)));
     }
 
     [Fact]

@@ -64,6 +64,11 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
                 }
                 var (exit, output, timedOut) = await RunStepAsync(workspace.Path, step, deadline - DateTimeOffset.UtcNow, ct);
                 log.AppendLine($"$ {step.Program} {string.Join(' ', step.Args)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
+                for (var fallback = step.Fallback; !timedOut && exit == TestStep.InvalidCommandLine && fallback is not null; fallback = fallback.Fallback)
+                {
+                    (exit, output, timedOut) = await RunStepAsync(workspace.Path, fallback, deadline - DateTimeOffset.UtcNow, ct);
+                    log.AppendLine($"$ {fallback.Program} {string.Join(' ', fallback.Args)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
+                }
                 if (timedOut)
                 {
                     return TestRunReport.Failed(TestRunStatus.TimedOut, log.ToString());
@@ -84,10 +89,13 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
                         .SelectMany(l => spec.Strategy.ParseBuildErrors(l, roots)).Distinct().ToList(),
                 };
             }
-            var files = ResultFiles(results, spec.Strategy.ResultFilePattern);
-            return files.Count == 0
-                ? TestRunReport.Failed(TestRunStatus.NoResults, log.ToString())
-                : new TestRunReport(TestRunStatus.Ran, spec.Strategy.ParseResults(files), log.ToString());
+            var files = spec.Strategy.ResultFilePatterns.SelectMany(p => ResultFiles(results, p)).ToList();
+            if (files.Count == 0)
+            {
+                return TestRunReport.Failed(TestRunStatus.NoResults, log.ToString());
+            }
+            var parsed = spec.Strategy.ParseResults(files);
+            return new TestRunReport(TestRunStatus.Ran, parsed.Cases, log.ToString()) { UnreadableReports = parsed.Unreadable };
         }
         finally
         {

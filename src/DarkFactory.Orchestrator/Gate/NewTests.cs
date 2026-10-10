@@ -35,15 +35,25 @@ public enum TestPhase
     Test,
 }
 
-/// <summary>One command of a test run, run in the worktree's root.</summary>
-public sealed record TestStep(TestPhase Phase, string Program, IReadOnlyList<string> Args);
+/// <summary>
+/// One command of a test run, run in the worktree's root. When it exits with <see cref="InvalidCommandLine"/> and has a
+/// <see cref="Fallback"/>, the fallback runs instead (e.g. an option an older test framework version names differently).
+/// </summary>
+public sealed record TestStep(TestPhase Phase, string Program, IReadOnlyList<string> Args)
+{
+    /// <summary>Microsoft.Testing.Platform's exit code for a command line it rejects (e.g. an unknown option): nothing ran.</summary>
+    public const int InvalidCommandLine = 5;
+
+    /// <summary>The step run instead when this one exits with <see cref="InvalidCommandLine"/>.</summary>
+    public TestStep? Fallback { get; init; }
+}
 
 /// <summary>
 /// One sandboxed test run: <see cref="Commit"/> checked out in a fresh throwaway worktree named <see cref="Name"/>; with
 /// <see cref="OverlayFrom"/>, the <see cref="OverlayPaths"/> of that commit written over it, <see cref="DeletePaths"/>
 /// removed and the <see cref="Replacements"/> written in place of those files (the base run: the PR's test files applied
 /// to the base commit; its retry: the same without the members that did not compile there); then <see cref="Steps"/>, and
-/// the files matching <see cref="INewTestStrategy.ResultFilePattern"/> (after a failed build,
+/// the files matching <see cref="INewTestStrategy.ResultFilePatterns"/> (after a failed build,
 /// <see cref="INewTestStrategy.BuildLogPattern"/>) under <see cref="ResultsDirectory"/> parsed by <see cref="Strategy"/>.
 /// <see cref="ResultsDirectory"/> is a fresh random name per run (<see cref="NewTestsCheck.NewResultsDirectory"/>), so no
 /// commit can have put files there; a worktree that already has it fails the run.
@@ -88,6 +98,9 @@ public sealed record BuildError(string? Path, int Line, int Column, string Code,
 /// <summary>What one run produced: its status, each test's cases by test id, and the tail of its output.</summary>
 public sealed record TestRunReport(TestRunStatus Status, IReadOnlyDictionary<string, IReadOnlyList<TestCaseResult>> Results, string Log)
 {
+    /// <summary>Why each result file of a <see cref="TestRunStatus.Ran"/> run that could not be read was unreadable (it gave no results).</summary>
+    public IReadOnlyList<string> UnreadableReports { get; init; } = [];
+
     /// <summary>A <see cref="TestRunStatus.BuildFailed"/> run's errors, read from the build's error logs.</summary>
     public IReadOnlyList<BuildError> BuildErrors { get; init; } = [];
 
@@ -194,7 +207,7 @@ public interface INewTestStrategy
     bool Understands(string path);
 
     /// <summary>The result files a run leaves under its <see cref="TestRunSpec.ResultsDirectory"/> (e.g. <c>*.trx</c>).</summary>
-    string ResultFilePattern { get; }
+    IReadOnlyList<string> ResultFilePatterns { get; }
 
     /// <summary>The build-error logs a run's build steps leave under its <see cref="TestRunSpec.ResultsDirectory"/>.</summary>
     string BuildLogPattern { get; }
@@ -209,8 +222,8 @@ public interface INewTestStrategy
     Task<IReadOnlyList<TestStep>> StepsAsync(TestSource source, string commit, IReadOnlyList<string> tests, IReadOnlyDictionary<string, string> projects,
         string resultsDirectory, CancellationToken ct);
 
-    /// <summary>Each test's cases (by test id) from the run's result files.</summary>
-    IReadOnlyDictionary<string, IReadOnlyList<TestCaseResult>> ParseResults(IEnumerable<string> resultFiles);
+    /// <summary>Each test's cases (by test id) from the run's result files, and why any of them could not be read.</summary>
+    TestResults ParseResults(IEnumerable<string> resultFiles);
 
     /// <summary>The errors in one build-error log; files under one of <paramref name="roots"/> (the worktree) are made relative to it.</summary>
     IReadOnlyList<BuildError> ParseBuildErrors(string log, IReadOnlyList<string> roots);
@@ -221,6 +234,12 @@ public interface INewTestStrategy
     /// </summary>
     BuildFailure ExplainBuildFailure(IReadOnlyDictionary<string, string> applied, IReadOnlyList<BuildError> errors, IReadOnlyList<string> tests);
 }
+
+/// <summary>
+/// A run's results: each test's cases by test id from the result files that could be read, and why each other result file
+/// could not be (<see cref="Unreadable"/>; the tests it held then have no cases).
+/// </summary>
+public sealed record TestResults(IReadOnlyDictionary<string, IReadOnlyList<TestCaseResult>> Cases, IReadOnlyList<string> Unreadable);
 
 /// <summary>The check's outcomes. Anything but <see cref="Pass"/> fails the check (the typed outcome maps it to <c>gate_rejected</c>).</summary>
 public static class NewTestsOutcome
@@ -237,7 +256,7 @@ public static class NewTestsOutcome
     /// <summary>The PR adds tests in a stack no strategy supports, or ones a strategy cannot isolate: the check cannot run.</summary>
     public const string Unsupported = "unsupported";
     /// <summary>
-    /// A run could not produce evidence (restore failed, timed out, no results, a new test not executed, a base build error
+    /// A run could not produce evidence (restore failed, timed out, no results, an unreadable test report, a new test not executed, a base build error
     /// outside the PR's test files or not from the compiler, a git or sandbox failure).
     /// </summary>
     public const string Error = "error";
@@ -436,8 +455,9 @@ public static class NewTestsCheck
     /// Judges one stack's runs. The head must have run and every new test pass there (every case passed). On the base every
     /// new test must have failed (a failing case), or hold a compiler error in its own declaration
     /// (<see cref="NotBuilt"/>). A new test that passes or is skipped on the base, or that the base never built for another
-    /// reason (<see cref="Unproven"/>), is rejected, named; a base run that produced no evidence (restore failed, timed
-    /// out, no results, build errors that are no compiler error in the PR's test files, a new test not executed) is an error.
+    /// reason (<see cref="Unproven"/>), is rejected, named; a run that produced no evidence (restore failed, timed out, no
+    /// results, a test report that could not be read, build errors that are no compiler error in the PR's test files, a new
+    /// test not executed) is an error.
     /// </summary>
     public static NewTestsResult Judge(string baseSha, string headSha, string strategy, IReadOnlyList<string> tests, BaseEvidence evidence, TestRunReport headRun)
     {
@@ -477,6 +497,15 @@ public static class NewTestsCheck
         {
             return Result(NewTestsOutcome.Error,
                 $"the base {b} does not build with the PR's test files for a reason that says nothing about the new tests (not a compiler error in those files): {string.Join("; ", unattributable.Take(10))}");
+        }
+
+        foreach (var (run, label) in new[] { (evidence.Run, $"the base {b}"), (evidence.Retry, $"the base retry {b}"), (headRun, $"the head {h}") })
+        {
+            if (run is { UnreadableReports.Count: > 0 })
+            {
+                return Result(NewTestsOutcome.Error,
+                    $"the test report of {label} could not be read, so its results are no evidence: {string.Join("; ", run.UnreadableReports.Take(10))}");
+            }
         }
 
         var reasons = new List<string>();
