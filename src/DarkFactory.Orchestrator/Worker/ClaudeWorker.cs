@@ -88,6 +88,18 @@ public interface IWorker
         WorkerCallbacks? callbacks, CancellationToken ct);
 
     /// <summary>
+    /// <see cref="RunAsync(string, string, string?, string, WorkerCallbacks?, CancellationToken)"/> with the session's
+    /// <c>--mcp-config</c> file (<paramref name="mcpConfigPath"/>, sc-25707: the loopback MCP proxy and the session's credential). Only
+    /// a worker whose tools allow MCP tools (<see cref="WorkerTools.McpAllowed"/>: planning and triage sessions) takes one; implementers
+    /// and fixers never do. A worker that does not support it refuses one.
+    /// </summary>
+    Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
+        WorkerCallbacks? callbacks, string? mcpConfigPath, CancellationToken ct) =>
+        mcpConfigPath is null
+            ? RunAsync(workingDirectory, prompt, resumeSessionId, modelClass, callbacks, ct)
+            : throw new NotSupportedException("This worker takes no MCP configuration.");
+
+    /// <summary>
     /// Stops a worker process (and its process group) that an earlier, crashed orchestrator
     /// started as <paramref name="pid"/>. Returns false, touching nothing, when that process is
     /// gone or is no longer this worker's.
@@ -122,9 +134,34 @@ public interface IWorker
 public sealed record WorkerTools
 {
     private WorkerTools(string permissionMode, IReadOnlyList<string> allowed, IReadOnlyList<string> denied, string settingSources,
-        bool confinedToWorkingDirectory) =>
-        (PermissionMode, Allowed, Denied, SettingSources, ConfinedToWorkingDirectory) =
-        (permissionMode, allowed, denied, settingSources, confinedToWorkingDirectory);
+        bool confinedToWorkingDirectory, IReadOnlyList<string>? mcpAllowed = null) =>
+        (PermissionMode, Allowed, Denied, SettingSources, ConfinedToWorkingDirectory, McpAllowed) =
+        (permissionMode, allowed, denied, settingSources, confinedToWorkingDirectory, mcpAllowed ?? []);
+
+    /// <summary>
+    /// The MCP tools the session may call (sc-25707), each by its full name (<c>mcp__&lt;server&gt;__&lt;tool&gt;</c>), all on an upstream's
+    /// read-only allowlist (<see cref="Mcp.McpServers.AllToolRules"/>): served through the loopback MCP proxy named by the session's
+    /// <c>--mcp-config</c>. Empty for implementers and fixers, which get <c>--strict-mcp-config</c> and no MCP server at all.
+    /// </summary>
+    public IReadOnlyList<string> McpAllowed { get; }
+
+    /// <summary>
+    /// These tools plus the allowlisted MCP tools <paramref name="mcpRules"/> (each one of <see cref="Mcp.McpServers.AllToolRules"/>;
+    /// anything else is refused). Everything else stays as it was (for <see cref="ReadOnly"/>: auto-denied).
+    /// </summary>
+    public WorkerTools WithMcp(IReadOnlyList<string> mcpRules)
+    {
+        if (!IsReadOnly)
+        {
+            // Only a read-only, confined session (planning, triage) reaches the proxy; implementers and fixers never do (E6).
+            throw new ArgumentException("Only read-only, confined tools (WorkerTools.ReadOnly) may be given MCP tools.", nameof(mcpRules));
+        }
+        if (mcpRules.FirstOrDefault(r => !Mcp.McpServers.AllToolRules.Contains(r, StringComparer.Ordinal)) is { } off)
+        {
+            throw new ArgumentException($"'{off}' is not an allowlisted MCP tool; a session is never allowed it.", nameof(mcpRules));
+        }
+        return new WorkerTools(PermissionMode, Allowed, Denied, SettingSources, ConfinedToWorkingDirectory, [.. mcpRules.Distinct()]);
+    }
 
     public string PermissionMode { get; }
 
@@ -176,9 +213,9 @@ public sealed record WorkerTools
 
     /// <summary>The allow rules of a session in <paramref name="workingDirectory"/>: <see cref="Allowed"/>, plus its <see cref="ReadRule"/> when confined.</summary>
     public IReadOnlyList<string> AllowedIn(string? workingDirectory) => !ConfinedToWorkingDirectory
-        ? Allowed
+        ? [.. Allowed, .. McpAllowed]
         : [.. Allowed, ReadRule(workingDirectory ?? throw new ArgumentNullException(nameof(workingDirectory),
-            "a session confined to its working directory needs that directory"))];
+            "a session confined to its working directory needs that directory")), .. McpAllowed];
 
     /// <summary>
     /// The known Claude Code tools that write a file, run or stop a command, change the working tree's git state, start or message a
@@ -208,12 +245,14 @@ public sealed record WorkerTools
     public static readonly WorkerTools ReadOnly = new(ReadOnlyPermissionMode, [], WriteOrExecTools, "", confinedToWorkingDirectory: true);
 
     /// <summary>
-    /// Whether these tools are read-only and confined: no allow rule beyond the working directory's <see cref="ReadRule"/>, every
+    /// Whether these tools are read-only and confined: no allow rule beyond the working directory's <see cref="ReadRule"/> and
+    /// allowlisted MCP tools (<see cref="Mcp.McpServers.AllToolRules"/>, read-only by construction, sc-25707), every
     /// <see cref="WriteOrExecTools"/> tool denied, in <see cref="ReadOnlyPermissionMode"/>, loading no settings file.
     /// </summary>
     public bool IsReadOnly =>
         PermissionMode == ReadOnlyPermissionMode
         && Allowed.Count == 0
+        && McpAllowed.All(r => Mcp.McpServers.AllToolRules.Contains(r, StringComparer.Ordinal))
         && ConfinedToWorkingDirectory
         && SettingSources.Length == 0
         && WriteOrExecTools.All(t => Denied.Contains(t, StringComparer.Ordinal));
@@ -392,9 +431,18 @@ public sealed class ClaudeWorker(
     /// (<see cref="WorkerTools.ConfinedToWorkingDirectory"/>), whose one allow rule names it.
     /// </summary>
     public static IReadOnlyList<string> BuildArguments(string prompt, string? resumeSessionId = null, string? settings = null,
-        WorkerTools? tools = null, string? workingDirectory = null)
+        WorkerTools? tools = null, string? workingDirectory = null, string? mcpConfigPath = null)
     {
         tools ??= WorkerTools.Implementer;
+        if (mcpConfigPath is not null && tools.McpAllowed.Count == 0)
+        {
+            // Implementers and fixers get no MCP server (E6): only a session allowed MCP tools takes a proxy config.
+            throw new ArgumentException("A session whose tools allow no MCP tool takes no MCP configuration.", nameof(mcpConfigPath));
+        }
+        if (mcpConfigPath is not null && !Path.IsPathFullyQualified(mcpConfigPath))
+        {
+            throw new ArgumentException($"The MCP configuration must be an absolute file path, not '{mcpConfigPath}'.", nameof(mcpConfigPath));
+        }
         var args = new List<string>
         {
             "-p", prompt,
@@ -404,9 +452,16 @@ public sealed class ClaudeWorker(
             // Never the OS user's ~/.claude settings (env, hooks, plugins) or MCP servers, so the worker sees only what the factory
             // passes; an implementer still loads the repo's own .claude settings (project,local), a read-only session none ("").
             "--setting-sources", tools.SettingSources,
+            // Only the MCP servers the factory passes: none for implementers and fixers; for a session allowed MCP tools, the loopback
+            // proxy, as a file path (its credential is never in argv, which every local user can read).
             "--strict-mcp-config",
-            "--allowedTools",
         };
+        if (mcpConfigPath is not null)
+        {
+            args.Add("--mcp-config");
+            args.Add(mcpConfigPath);
+        }
+        args.Add("--allowedTools");
         args.AddRange(tools.AllowedIn(workingDirectory));
         args.Add("--disallowedTools");
         args.AddRange(tools.Denied);
@@ -436,8 +491,12 @@ public sealed class ClaudeWorker(
 
     private static readonly TimeSpan OrphanGracePeriod = TimeSpan.FromSeconds(5);
 
+    public Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
+        WorkerCallbacks? callbacks, CancellationToken ct) =>
+        RunAsync(workingDirectory, prompt, resumeSessionId, modelClass, callbacks, null, ct);
+
     public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
-        WorkerCallbacks? callbacks, CancellationToken ct)
+        WorkerCallbacks? callbacks, string? mcpConfigPath, CancellationToken ct)
     {
         if (!WorkerModelClass.IsValid(modelClass))
         {
@@ -445,7 +504,8 @@ public sealed class ClaudeWorker(
         }
         if (pauseFlagDirectory is null)
         {
-            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, tools: Tools, workingDirectory: workingDirectory),
+            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, tools: Tools, workingDirectory: workingDirectory,
+                mcpConfigPath: mcpConfigPath),
                 modelClass, callbacks, ct);
         }
         var flag = PauseFlagPath(pauseFlagDirectory, workingDirectory);
@@ -453,7 +513,7 @@ public sealed class ClaudeWorker(
         File.Delete(flag); // left by a crashed run, it would stop this one at its first tool call
         try
         {
-            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, BuildPauseSettings(flag), Tools, workingDirectory),
+            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, BuildPauseSettings(flag), Tools, workingDirectory, mcpConfigPath),
                 modelClass, callbacks, ct);
         }
         finally

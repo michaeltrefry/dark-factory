@@ -63,6 +63,32 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         }
     }
 
+    /// <summary>
+    /// <c>Kanban:McpUrl</c> (default the hosted KanbanBoard's MCP endpoint, <see cref="Gateway.OutboundHttp.KanbanDefaultMcpUrl"/>): the
+    /// Kanban upstream (sc-25707; MCP Streamable HTTP), used only with a <see cref="KanbanToken"/>. An absolute http(s) URL naming no
+    /// model provider, else the factory refuses to start.
+    /// </summary>
+    public Uri KanbanMcpUrl
+    {
+        get
+        {
+            var text = config["Kanban:McpUrl"];
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return Gateway.OutboundHttp.KanbanDefaultMcpUrl;
+            }
+            if (!Uri.TryCreate(text.Trim(), UriKind.Absolute, out var url) || url.Scheme is not ("http" or "https"))
+            {
+                throw new InvalidOperationException($"Kanban:McpUrl must be an absolute http(s) URL, not '{text}'.");
+            }
+            if (Gateway.ProviderMarkers.In(text) is { } provider)
+            {
+                throw new InvalidOperationException($"Kanban:McpUrl names a model provider ('{provider}'); it must be KanbanBoard's MCP endpoint.");
+            }
+            return url;
+        }
+    }
+
     /// <summary><c>Factory:DefaultRepo</c> (default the sandbox repo): an <c>owner/name</c>, else the factory refuses to start.</summary>
     public RepoRef DefaultRepo
     {
@@ -276,6 +302,13 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     public string CodeGraphToken =>
         Secret("CodeGraph:Token", "FACTORY_CODEGRAPH_TOKEN", SecretAccounts.CodeGraphToken, "CodeGraph token");
 
+    /// <summary>
+    /// The Kanban token (<c>Kanban:Token</c>, env <c>FACTORY_KANBAN_TOKEN</c>, or keychain account <c>kanban-token</c>): a KanbanBoard
+    /// personal access token, owner-side only (E5), sent by the Kanban upstream client and nowhere else. Optional: without it there is
+    /// no Kanban upstream (not an error).
+    /// </summary>
+    public string KanbanToken => Secret("Kanban:Token", "FACTORY_KANBAN_TOKEN", SecretAccounts.KanbanToken, "Kanban token");
+
     public string ShortcutApiToken =>
         Secret("Shortcut:ApiToken", "SHORTCUT_API_TOKEN", SecretAccounts.ShortcutApiToken, "Shortcut API token");
 
@@ -346,7 +379,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     {
         _ = (RouterBaseUrl, DefaultRepo, WorkerSandbox, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures);
         _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
-        _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl);
+        _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl, KanbanMcpUrl);
     }
 
     public bool TryGet(Func<FactoryOptions, string> secret, out string? value)

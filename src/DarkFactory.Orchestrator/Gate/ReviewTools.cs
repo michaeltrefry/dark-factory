@@ -87,6 +87,9 @@ public sealed class ReviewToolSession(RepoRef repo, string headSha, string baseS
 
     internal bool ProjectResolved { get; set; }
     internal string? Project { get; set; }
+
+    /// <summary>The Kanban tools this session was offered (<see cref="ReviewTools.DefinitionsAsync"/>); empty without Kanban.</summary>
+    public IReadOnlyList<string> KanbanTools { get; internal set; } = [];
 }
 
 /// <summary>What one tool call gave the model (<see cref="Content"/>, before fencing) and how the verdict records it.</summary>
@@ -111,6 +114,11 @@ public sealed record ToolOutcome(string Content, bool IsError, ToolCall Record);
 /// filtered: <c>analyze_impact</c>, <c>trace_call_path</c>, <c>find_consumers</c> and <c>find_publishers</c> follow edges into
 /// other indexed projects, so an answer may name nodes of other projects that depend on or call this one (the tools' note says
 /// so).</item>
+/// <item>Kanban tools (sc-25707, only with a Kanban upstream configured, <c>Kanban:Token</c>): the upstream's tools on its read-only
+/// allowlist (<see cref="Mcp.McpServers.KanbanTools"/>), listed from the upstream once per session with their own input schemas
+/// (<see cref="DefinitionsAsync"/>) and forwarded owner-side through the same upstream registry the loopback proxy uses. Kanban has
+/// no repository mapping, so its calls are not repository-scoped. A Kanban write tool is on no allowlist: never offered or
+/// forwarded.</item>
 /// </list>
 /// A tool name that is not on the list answers an error result and is never forwarded. A tool that cannot answer — no such file,
 /// a binary file, a repository CodeGraph does not index, CodeGraph unreachable or not configured — returns an error result the
@@ -118,8 +126,72 @@ public sealed record ToolOutcome(string Content, bool IsError, ToolCall Record);
 /// UTF-8 bytes and at what is left of the session's budget (<see cref="Budget"/>), with an explicit <c>[cut: …]</c> marker; a call
 /// once the budget is spent is not run and answers an error.
 /// </summary>
-public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGraph)
+public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGraph, Mcp.McpUpstream? kanban = null, TextWriter? log = null)
 {
+    /// <summary>The longest JSON input a Kanban tool is sent.</summary>
+    public const int MaxKanbanArgumentChars = 2_000;
+
+    /// <summary>The longest input schema (serialized JSON) of a Kanban tool that is offered; a longer one leaves the tool out.</summary>
+    public const int MaxKanbanSchemaChars = 4 * 1024;
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> _skippedSchemas = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Whether a Kanban tool's <paramref name="schema"/> goes to the router as it is: a JSON object whose <c>type</c> is
+    /// <c>"object"</c>, at most <see cref="MaxKanbanSchemaChars"/> characters serialized. Anything else could fail every review.
+    /// </summary>
+    public static bool UsableSchema(JsonObject? schema) =>
+        schema is not null
+        && schema["type"] is JsonValue type && type.TryGetValue<string>(out var t) && t == "object"
+        && schema.ToJsonString().Length <= MaxKanbanSchemaChars;
+
+    /// <summary>
+    /// The tool definitions <paramref name="session"/> is offered: <see cref="Definitions"/>, then (with a Kanban upstream) each of its
+    /// allowlisted tools the upstream lists, with its own description and input schema. A Kanban listing that fails offers no Kanban
+    /// tool (the review goes on without them); a tool whose schema is not usable (<see cref="UsableSchema"/>) is left out (logged
+    /// once per tool). The offered Kanban names are kept on the session: only those are forwarded.
+    /// </summary>
+    public async Task<IReadOnlyList<object>> DefinitionsAsync(ReviewToolSession session, CancellationToken ct)
+    {
+        if (kanban is null)
+        {
+            return Definitions;
+        }
+        IReadOnlyList<Mcp.McpToolInfo> listed;
+        try
+        {
+            listed = await kanban.ListToolsAsync(ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            listed = [];
+        }
+        var offered = new List<Mcp.McpToolInfo>();
+        foreach (var tool in listed.Where(t => kanban.Allows(t.Name) && !Names.Contains(t.Name)))
+        {
+            if (UsableSchema(tool.InputSchema))
+            {
+                offered.Add(tool);
+            }
+            else if (_skippedSchemas.TryAdd(tool.Name, true))
+            {
+                log?.WriteLine($"[review] Kanban tool {tool.Name} left out: its input schema is not a JSON object of type \"object\" "
+                    + $"within {MaxKanbanSchemaChars} characters");
+            }
+        }
+        session.KanbanTools = offered.Select(t => t.Name).ToList();
+        return
+        [
+            .. Definitions,
+            .. offered.Select(t => (object)new
+            {
+                name = t.Name,
+                description = $"Kanban board (read-only; not about this repository's code): {Cut(t.Description ?? t.Name, 1_000)}",
+                input_schema = t.InputSchema,
+            }),
+        ];
+    }
+
     public const string ReadFile = "read_file";
     public const string ListFiles = "list_files";
     public const string Grep = "grep";
@@ -381,10 +453,12 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
     {
         var name = use.Name ?? "(no tool named)";
         var arguments = Cut(use.InputJson ?? "", MaxRecordedArguments);
-        if (!Names.Contains(name))
+        var kanbanTool = kanban is not null && session.KanbanTools.Contains(name) && kanban.Allows(name);
+        if (!Names.Contains(name) && !kanbanTool)
         {
-            // Off the allowlist (E2): answered here, never forwarded to CodeGraph or anything else.
-            return Error(name, arguments, $"There is no tool named '{Cut(name, 100)}'; the tools are {string.Join(", ", Names)}.");
+            // Off the allowlist (E2): answered here, never forwarded to CodeGraph, Kanban or anything else.
+            return Error(name, arguments,
+                $"There is no tool named '{Cut(name, 100)}'; the tools are {string.Join(", ", [.. Names, .. session.KanbanTools])}.");
         }
         JsonElement input;
         try
@@ -401,6 +475,10 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
             return Error(name, arguments, "The tool input is not a JSON object.");
         }
         var call = new Call(name, arguments, input, session, maxChars);
+        if (kanbanTool)
+        {
+            return await KanbanAsync(call, use.InputJson ?? "{}", ct);
+        }
         return name switch
         {
             ReadFile => await ReadFileAsync(call, ct),
@@ -561,7 +639,7 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
     /// </summary>
     private async Task<ToolOutcome> CodeGraphAsync(Call call, CancellationToken ct)
     {
-        if (CodeGraphArguments(call) is not { } arguments)
+        if (CodeGraphArguments(call.Tool, call.Input) is not { } arguments)
         {
             return call.Fail(CodeGraphUsage(call.Tool));
         }
@@ -607,12 +685,37 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
     }
 
     /// <summary>
+    /// A Kanban tool (on the allowlist and offered to this session): the model's input object forwarded as it is (at most
+    /// <see cref="MaxKanbanArgumentChars"/> characters of JSON) through the upstream registry's Kanban client. Not repository-scoped.
+    /// </summary>
+    private async Task<ToolOutcome> KanbanAsync(Call call, string inputJson, CancellationToken ct)
+    {
+        if (inputJson.Length > MaxKanbanArgumentChars || JsonNode.Parse(inputJson) is not JsonObject arguments)
+        {
+            return call.Fail($"{call.Tool} takes a JSON object of at most {MaxKanbanArgumentChars} characters.");
+        }
+        Mcp.McpToolResult answer;
+        try
+        {
+            answer = await kanban!.CallAsync(call.Tool, arguments, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            return call.Fail($"Kanban could not be reached or asked: {Cut(ex.Message, 500)}");
+        }
+        return call.Answer($"Kanban's {call.Tool}{(answer.IsError ? " (Kanban answered with an error)" : "")}:", answer.Text, answer.Text, answer.IsError);
+    }
+
+    /// <summary>
     /// The arguments CodeGraph is sent for <paramref name="call"/> (without the project, which only the orchestrator sets), or null
     /// when a required one is missing or malformed. Strings are cut at <see cref="MaxCodeGraphArgumentChars"/>; numbers clamped.
     /// </summary>
-    private static JsonObject? CodeGraphArguments(Call call)
+    public static JsonObject? CodeGraphArguments(string tool, JsonElement input)
     {
-        var input = call.Input;
+        if (input.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
         string? Required(string name) => Text(input, name) is { } s && s.Trim().Length > 0 ? Cut(s.Trim(), MaxCodeGraphArgumentChars) : null;
         int? Number(string name, int min, int max) =>
             input.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var n) ? Math.Clamp(n, min, max) : null;
@@ -624,7 +727,7 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
             }
             return o;
         }
-        switch (call.Tool)
+        switch (tool)
         {
             case AnalyzeImpact:
                 return Required("name") is { } element ? With(new JsonObject { ["name"] = element }, "depth", Number("depth", 1, 5)) : null;
@@ -666,7 +769,7 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
         }
     }
 
-    private static string CodeGraphUsage(string tool) => tool switch
+    public static string CodeGraphUsage(string tool) => tool switch
     {
         AnalyzeImpact => "analyze_impact needs the 'name' of a code element.",
         SearchGraph => "search_graph needs a 'namePattern'.",

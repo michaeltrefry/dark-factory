@@ -236,6 +236,11 @@ public sealed class GatewayLintTests
         Assert.Equal("DF0004", codeGraph.Id);
         Assert.Contains("codegraph-api.trefry.net", codeGraph.GetMessage());
         Assert.Empty(await Lint(Inside, Wrap("""return "https://codegraph-api.trefry.net/";""")));
+        // sc-25707: so is the hosted KanbanBoard's MCP endpoint (OutboundHttp.KanbanApi).
+        var kanban = Assert.Single(await Lint(Outside, Wrap("""return "https://Kanban-MCP.trefry" + ".net/mcp";""")));
+        Assert.Equal("DF0004", kanban.Id);
+        Assert.Contains("kanban-mcp.trefry.net", kanban.GetMessage());
+        Assert.Empty(await Lint(Inside, Wrap("""return "https://kanban-mcp.trefry.net/mcp";""")));
         // Links to github.com pages (not the API) are not outbound calls.
         Assert.Empty(await Lint(Outside, Wrap("""return $"https://github.com/{branch}/pull/1";""")));
     }

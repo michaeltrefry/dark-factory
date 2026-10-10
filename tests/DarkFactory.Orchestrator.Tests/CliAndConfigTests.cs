@@ -358,6 +358,52 @@ public class FactoryOptionsTests
     }
 
     [Fact]
+    public void Kanban_mcp_url_defaults_to_the_hosted_kanbanboard_is_read_from_config_and_an_invalid_one_is_refused_at_start_up()
+    {
+        // sc-25707, E7.
+        Assert.Equal(new Uri("https://kanban-mcp.trefry" + ".net/mcp"), Options([]).KanbanMcpUrl);
+        Assert.Equal(Gateway.OutboundHttp.KanbanDefaultMcpUrl, Options([]).KanbanMcpUrl);
+        Assert.Equal(new Uri("http://127.0.0.1:5006/kb/mcp"), Options(new() { ["Kanban:McpUrl"] = "http://127.0.0.1:5006/kb/mcp" }).KanbanMcpUrl);
+        foreach (var bad in new[] { "kanban.local/mcp", "ftp://kanban.local/mcp", "https://api.anthropic.com/mcp" })
+        {
+            Assert.Contains("Kanban:McpUrl",
+                Assert.Throws<InvalidOperationException>(() => Options(new() { ["Kanban:McpUrl"] = bad }).ValidateSettings()).Message);
+        }
+    }
+
+    [Fact]
+    public async Task The_kanban_token_comes_from_config_or_keychain_and_without_one_there_is_no_kanban_upstream()
+    {
+        var secrets = new InMemorySecrets();
+        secrets.Set(SecretAccounts.KanbanToken, "kb_keychain");
+        Assert.Equal("kb_config", Options(new() { ["Kanban:Token"] = "kb_config" }, secrets).KanbanToken);
+        Assert.Equal("kb_keychain", Options([], secrets).KanbanToken);
+        Assert.Equal("kanban-token", SecretAccounts.KanbanToken);
+
+        using var http = new HttpClient();
+        if (Environment.GetEnvironmentVariable("FACTORY_KANBAN_TOKEN") is null)
+        {
+            // Missing: not an error; start-up is unaffected and there is no Kanban upstream (said once).
+            var none = Options([]);
+            Assert.False(none.TryGet(o => o.KanbanToken, out _));
+            none.ValidateSettings();
+            var log = new StringWriter();
+            Assert.Null(FactoryRunner.CreateUpstreams(none, http, http, log).Kanban);
+            Assert.Contains("no Kanban token", log.ToString());
+        }
+        // With a token, the upstream asks Kanban:McpUrl with it.
+        var kanban = new FakeMcpServer("/kb/mcp", ["GetBoard", "CreateWorkItem"], (t, _) => FakeMcpServer.Text(t));
+        var upstreams = FactoryRunner.CreateUpstreams(Options(new() { ["Kanban:Token"] = "kb_config" }), http,
+            kanban.Client("https://kanban.test/kb/mcp"), TextWriter.Null);
+        var upstream = Assert.IsType<Mcp.McpUpstream>(upstreams.Kanban);
+        Assert.False(upstream.RepoScoped);
+        Assert.Equal(["GetBoard"], (await upstream.ListToolsAsync(CancellationToken.None)).Select(t => t.Name));
+        Assert.All(kanban.Api.Requests, r => Assert.Equal("Bearer kb_config", r.Headers["Authorization"]));
+        await Assert.ThrowsAsync<Mcp.ToolNotAllowedException>(() =>
+            upstream.CallAsync("CreateWorkItem", new System.Text.Json.Nodes.JsonObject(), CancellationToken.None));
+    }
+
+    [Fact]
     public void The_router_cost_settle_delay_defaults_to_five_seconds_and_refuses_a_negative_value()
     {
         Assert.Equal(TimeSpan.FromSeconds(5), Options([]).CostSettleDelay);
