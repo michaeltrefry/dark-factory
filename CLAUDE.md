@@ -690,8 +690,12 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   renamed/deleted ones removed; files outside the test projects — production code, helpers elsewhere, the solution — stay
   the base's), and the head. Each runs, per project holding a new test (no solution file, so a new test project runs on the
   base too), `dotnet restore`, then `dotnet build --no-restore` (an errors-only file log too), then `dotnet test --no-build`
-  on just its new tests (`--filter-method` per test + `--report-xunit-trx` under Microsoft.Testing.Platform per
-  `global.json`, else VSTest `--filter FullyQualifiedName=…` + `--logger trx`) through `SandboxTestRunner`: sandboxed exactly
+  on just its new tests (`--filter-method` per test + xUnit's own XML report under Microsoft.Testing.Platform per
+  `global.json` — `--report-xunit-xml`, falling back to xunit.v3 < 4's `--report-xunit` when the runner exits 5 (rejected
+  command line); never xUnit's TRX, which since xunit.v3 4.0 an unpaired surrogate in a failure message leaves empty
+  (sc-25668) — else VSTest `--filter FullyQualifiedName=…` + `--logger trx`; cases joined by type + method, never display
+  name; only the run's own format is read, `*.xunit.xml` or `*.trx`; an unreadable or over-50 MB report makes the check
+  an `error` naming the file and why) through `SandboxTestRunner`: sandboxed exactly
   like workers (`WorkerSandbox.Start` as `_factory` through the launch helper, no variables at all; `Worker:RunAs=none` runs
   as the owner with a minimal env), bounded by `Gate:TestTimeoutMinutes`. Results and build logs go to a fresh random
   `.factory-test-results-<guid>` directory per run (a worktree that already has it fails the run), so no commit can plant
