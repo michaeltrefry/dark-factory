@@ -7,8 +7,15 @@ namespace DarkFactory.Orchestrator.Gate;
 /// <summary>One tier of the policy: the path patterns that put a path in it (none for normal) and the checks it requires.</summary>
 public sealed record TierRule(Tier Tier, IReadOnlyList<PathPattern> Paths, IReadOnlySet<string> Checks);
 
-/// <summary>The risk threshold: a change over any limit is not merged by the gate (when its tiers require the check).</summary>
-public sealed record RiskThreshold(int MaxChangedLines, int MaxChangedFiles, int MaxFixRounds);
+/// <summary>
+/// The risk threshold: a change over any limit is not merged by the gate (when its tiers require the check).
+/// <see cref="MaxBlastRadius"/>: version 3's <c>max_blast_radius</c>, the worst CodeGraph blast radius a touched file may have at the
+/// head (null: the policy sets none, version 2); the code floor (<see cref="GatePolicy.BlastRadiusFloor"/>) applies whatever it says.
+/// <see cref="MaxHotspot"/>: version 3's <c>max_hotspot</c>, the highest hotspot score (CodeGraph's <c>riskScore</c>) a touched file
+/// may have on the default branch (null: <c>off</c>, or version 2; there is no code floor for hotspots).
+/// </summary>
+public sealed record RiskThreshold(int MaxChangedLines, int MaxChangedFiles, int MaxFixRounds, BlastRadius? MaxBlastRadius = null,
+    double? MaxHotspot = null);
 
 /// <summary>
 /// A target repository's merge policy, <c>factory/gate.yaml</c> on the PR's base branch (never the PR's own head, which
@@ -33,6 +40,18 @@ public sealed record RiskThreshold(int MaxChangedLines, int MaxChangedFiles, int
 ///   max_changed_files: 40
 ///   max_fix_rounds: 2             # 1-3: lowers the factory's hard cap (Lifecycle.MaxFixRounds), never raises it
 /// </code>
+/// Version 3 (sc-25709) is version 2 plus two required risk keys, CodeGraph's inputs to <c>risk-threshold</c>:
+/// <code>
+/// risk:
+///   ...
+///   max_blast_radius: high        # low | medium | high: the worst blast radius a touched file may have at the head
+///   max_hotspot: off              # off, or a number >= 0: the highest hotspot score (riskScore) a touched file may have
+/// </code>
+/// <c>max_blast_radius</c> is a maximum, like <c>max_changed_lines</c>: a file over it fails. The code floor
+/// (<see cref="BlastRadiusFloor"/>, high: a critical blast radius always fails) applies to every version, so version 3 can only
+/// tighten it; <c>critical</c> — which would allow a critical file — is looser than the floor and invalid. <c>max_hotspot</c> is
+/// required too (every key is), and <c>off</c> is its explicit opt-out: hotspots have no code floor, they are recorded and
+/// reported, and fail only a repository that sets a limit. Version 2 parses as before and runs at the floor with no hotspot limit.
 /// A path is in the first of sealed, protected, free whose patterns match it (<see cref="PathPattern"/>: anchored at the
 /// root; sealed and protected patterns match case-insensitively, free ones case-sensitively, so a path's case can only
 /// move it to a stricter tier), else normal. Every tier and every risk field is required.
@@ -58,7 +77,21 @@ public sealed record RiskThreshold(int MaxChangedLines, int MaxChangedFiles, int
 public sealed class GatePolicy
 {
     public const string Path = "factory/gate.yaml";
-    public const int Version = 2;
+
+    /// <summary>The newest policy version; <see cref="Versions"/> are all the gate accepts.</summary>
+    public const int Version = 3;
+
+    /// <summary>The versions the gate accepts: 2 (runs at the code floor of every CodeGraph input) and 3.</summary>
+    public static readonly IReadOnlyList<int> Versions = [2, 3];
+
+    /// <summary>
+    /// The code floor of <c>risk-threshold</c>'s CodeGraph blast radius (sc-25709, E7): the worst blast radius a touched file may
+    /// have whatever the policy says — high, so a critical file always fails. A version 3 <c>max_blast_radius</c> can only lower it.
+    /// </summary>
+    public const BlastRadius BlastRadiusFloor = BlastRadius.High;
+
+    /// <summary>The <c>max_hotspot</c> value that sets no hotspot limit.</summary>
+    public const string HotspotOff = "off";
 
     /// <summary>
     /// Files the sealed tier must match, or the policy is invalid: the policy itself and CODEOWNERS wherever GitHub reads it.
@@ -170,9 +203,9 @@ public sealed class GatePolicy
             throw new GatePolicyException(
                 $"{Path} is version 1, which this gate no longer accepts: it needs version {Version}, with path tiers (sealed, protected, normal, free) and a risk threshold.");
         }
-        if (version != Version.ToString(CultureInfo.InvariantCulture))
+        if (Versions.FirstOrDefault(v => version == v.ToString(CultureInfo.InvariantCulture)) is not (> 0 and var number))
         {
-            throw new GatePolicyException($"{Path}: version must be {Version}.");
+            throw new GatePolicyException($"{Path}: version must be {string.Join(" or ", Versions)}.");
         }
         Expect(root, ["version", "tiers", "risk"], "the top level");
 
@@ -185,10 +218,12 @@ public sealed class GatePolicy
         }
 
         var riskNode = Mapping(root, "risk", "the top level");
-        Expect(riskNode, ["max_changed_lines", "max_changed_files", "max_fix_rounds"], "risk");
+        Expect(riskNode, number == 2 ? ["max_changed_lines", "max_changed_files", "max_fix_rounds"]
+            : ["max_changed_lines", "max_changed_files", "max_fix_rounds", "max_blast_radius", "max_hotspot"], "risk");
         // max_fix_rounds can only lower the factory's hard cap (Lifecycle.MaxFixRounds), never raise it: 1 to that cap.
         var risk = new RiskThreshold(Int(riskNode, "max_changed_lines", 1), Int(riskNode, "max_changed_files", 1),
-            Int(riskNode, "max_fix_rounds", 1, Ledger.Lifecycle.MaxFixRounds));
+            Int(riskNode, "max_fix_rounds", 1, Ledger.Lifecycle.MaxFixRounds),
+            number == 2 ? null : MaxBlastRadius(riskNode), number == 2 ? null : MaxHotspot(riskNode));
 
         var policy = new GatePolicy(tiers, risk);
         var uncovered = MustBeSealedFiles.Where(f => policy.TierOf(f).Tier != Tier.Sealed)
@@ -267,6 +302,40 @@ public sealed class GatePolicy
             .Select(c => c is YamlScalarNode { Value: { Length: > 0 } v } ? v.Trim()
                 : throw new GatePolicyException($"{Path}: {where}.{key} must list plain values."))
             .ToList();
+    }
+
+    /// <summary>
+    /// <c>risk.max_blast_radius</c>: low, medium or high. Critical (it would allow a critical file) is looser than
+    /// <see cref="BlastRadiusFloor"/> and refused.
+    /// </summary>
+    private static BlastRadius MaxBlastRadius(YamlMappingNode node)
+    {
+        var text = Scalar(node, "max_blast_radius", "risk");
+        var allowed = string.Join(", ", Enum.GetValues<BlastRadius>().Where(r => r is > BlastRadius.None and <= BlastRadiusFloor).Select(BlastRadii.Name));
+        var known = BlastRadii.TryParse(text, out var radius);
+        if (known && radius > BlastRadiusFloor && !GateCheckSeam.Off(GateCheckSeam.FloorBlastRadius))
+        {
+            throw new GatePolicyException(
+                $"{Path}: risk.max_blast_radius '{text}' is looser than the code floor ({BlastRadii.Name(BlastRadiusFloor)}: a {BlastRadii.Name(BlastRadius.Critical)} blast radius always fails); it must be one of {allowed}.");
+        }
+        return known && radius > BlastRadius.None
+            ? radius
+            : throw new GatePolicyException($"{Path}: risk.max_blast_radius must be one of {allowed}.");
+    }
+
+    /// <summary><c>risk.max_hotspot</c>: <c>off</c> (null), or a number of at least 0 — the highest hotspot score (riskScore) allowed.</summary>
+    private static double? MaxHotspot(YamlMappingNode node)
+    {
+        var text = Scalar(node, "max_hotspot", "risk");
+        if (text == HotspotOff)
+        {
+            return null;
+        }
+        return text is { Length: > 0 } && text.All(c => char.IsAsciiDigit(c) || c == '.')
+            && double.TryParse(text, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var value) && double.IsFinite(value)
+            ? value
+            : throw new GatePolicyException(
+                $"{Path}: risk.max_hotspot must be {HotspotOff} or a number of at least 0 (the highest hotspot score, CodeGraph's riskScore, a touched file may have).");
     }
 
     private static int Int(YamlMappingNode node, string key, int min, int? max = null)

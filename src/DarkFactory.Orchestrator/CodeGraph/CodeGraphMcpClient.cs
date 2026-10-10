@@ -30,8 +30,12 @@ namespace DarkFactory.Orchestrator.CodeGraph;
 /// proxy sends them. A commit-pinned read (<c>sha</c>, CodeGraph C4) that CodeGraph cannot answer for that commit carries
 /// <c>structuredContent.notIndexed</c> (<see cref="NotIndexedOf"/>).
 /// </para>
+/// <para>
+/// Risk tools (sc-25709, <see cref="ICodeGraphRisk"/>; CodeGraph C7, sc-25735): <see cref="AnalyzeImpactFileTool"/> and
+/// <see cref="FileHotspotTool"/> are likewise sent by the orchestrator only (the merge gate's <c>risk-threshold</c>), on no allowlist.
+/// </para>
 /// </summary>
-public sealed partial class CodeGraphMcpClient : ICodeGraph, ICodeGraphOverlays
+public sealed partial class CodeGraphMcpClient : ICodeGraph, ICodeGraphRisk
 {
     public const string ProtocolVersion = McpHttpClient.ProtocolVersion;
     public const string SessionHeader = McpHttpClient.SessionHeader;
@@ -118,6 +122,50 @@ public sealed partial class CodeGraphMcpClient : ICodeGraph, ICodeGraphOverlays
             : null;
 
     private static string? Str(JsonObject? o, string name) => o?[name] is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
+
+    /// <summary>CodeGraph's per-file blast radius tool (C7, sc-25735): orchestrator only, for the merge gate's risk-threshold.</summary>
+    public const string AnalyzeImpactFileTool = "analyze_impact_file";
+
+    /// <summary>CodeGraph's per-file hotspot tool (C7): orchestrator only, for the merge gate's risk-threshold.</summary>
+    public const string FileHotspotTool = "file_hotspot";
+
+    /// <summary>The risk tools (sc-25709), which no model-facing surface may list or forward.</summary>
+    public static readonly IReadOnlyList<string> RiskTools = [AnalyzeImpactFileTool, FileHotspotTool];
+
+    /// <summary><c>analyze_impact_file(repo, path, sha, depth)</c>, straight through the MCP client (on no allowlist).</summary>
+    public async Task<ImpactFileAnswer> AnalyzeImpactFileAsync(string project, string path, string sha, int depth, CancellationToken ct) =>
+        ImpactFile(await _client.CallToolAsync(AnalyzeImpactFileTool,
+            new JsonObject { ["repo"] = project, ["path"] = path, ["sha"] = sha, ["depth"] = depth }, ct));
+
+    /// <summary><c>file_hotspot(repo, path)</c>, straight through the MCP client (on no allowlist).</summary>
+    public async Task<HotspotAnswer> FileHotspotAsync(string project, string path, CancellationToken ct) =>
+        Hotspot(await _client.CallToolAsync(FileHotspotTool, new JsonObject { ["repo"] = project, ["path"] = path }, ct));
+
+    /// <summary>
+    /// An <c>analyze_impact_file</c> answer (C7): CodeGraph's <c>CommitAnswer.Create</c> structured content (<c>commitSha</c>,
+    /// <c>source</c>, …) carrying the tool's fields <c>found</c> and <c>blastRadius</c>; a SHA with no ready overlay is C4's
+    /// <c>notIndexed</c>; an error is <c>isError</c> with <c>{"error": {code, message}}</c>.
+    /// </summary>
+    public static ImpactFileAnswer ImpactFile(McpToolResult result)
+    {
+        var s = result.Structured as JsonObject;
+        return new ImpactFileAnswer(result.IsError, result.Text, Commit(result.Structured, result.Text), NotIndexedOf(result.Structured),
+            s?["error"] is JsonObject e ? Str(e, "code") : null, Bool(s, "found"), Str(s, "blastRadius"), Str(s, "path"));
+    }
+
+    /// <summary>
+    /// A <c>file_hotspot</c> answer (C7): <c>commitSha</c> and <c>source</c> (CommitAnswer) with the tool's <c>found</c> and
+    /// <c>riskScore</c>; an error is <c>isError</c> with <c>{"error": {code, message}}</c>.
+    /// </summary>
+    public static HotspotAnswer Hotspot(McpToolResult result)
+    {
+        var s = result.Structured as JsonObject;
+        double? score = s?["riskScore"] is JsonValue v && v.TryGetValue<double>(out var d) ? d : null;
+        return new HotspotAnswer(result.IsError, result.Text, Commit(result.Structured, result.Text), Str(s, "source"),
+            s?["error"] is JsonObject e ? Str(e, "code") : null, Bool(s, "found"), score, Str(s, "path"));
+    }
+
+    private static bool? Bool(JsonObject? o, string name) => o?[name] is JsonValue v && v.TryGetValue<bool>(out var b) ? b : null;
 
     /// <summary>
     /// The CodeGraph project indexing <paramref name="repo"/>, from <c>search_projects</c>: only the orchestrator calls it (it is on no

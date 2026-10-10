@@ -145,12 +145,20 @@ public enum GateOutcome
     ReviewHead,
     /// <summary>A rule does not hold, or the policy is unreadable or invalid: no merge, escalate.</summary>
     Blocked,
+    /// <summary>
+    /// Nothing blocks but <c>risk-threshold</c>'s CodeGraph inputs, which could not be read (sc-25709, E4): the gate waits and reads
+    /// everything again, like pending CI, and escalates once <c>Gate:CiTimeoutMinutes</c> have passed.
+    /// </summary>
+    Pending,
 }
 
-/// <summary>The gate's decision on one evaluation, with every reason it did not merge.</summary>
-public sealed record GateDecision(GateOutcome Outcome, string HeadSha, IReadOnlyList<string> Reasons)
+/// <summary>
+/// The gate's decision on one evaluation, with every reason it did not merge. <see cref="Inputs"/>: CodeGraph's inputs to
+/// <c>risk-threshold</c> (<see cref="CodeGraphRisk.Describe"/>, sc-25709), recorded in the <c>gate</c> checkpoint with the decision.
+/// </summary>
+public sealed record GateDecision(GateOutcome Outcome, string HeadSha, IReadOnlyList<string> Reasons, string? Inputs = null)
 {
-    public string Detail => $"{Outcome} {Ci.Short(HeadSha)}: {string.Join("; ", Reasons)}";
+    public string Detail => $"{Outcome} {Ci.Short(HeadSha)}: {string.Join("; ", Reasons)}{(Inputs is null ? "" : $" | {Inputs}")}";
 }
 
 /// <summary>
@@ -162,8 +170,9 @@ public sealed record ChangeFacts(string? Diff, string? DiffError, int FixRounds)
 
 /// <summary>
 /// The merge gate (E1): deterministic code over facts read fresh for this evaluation — the policy text from the base
-/// branch, the PR, the diff at its head commit, that commit's CI, the ledger's verdicts and fix rounds. No model and no
-/// score feeds it; there is no bypass (E2). The touched paths and their tiers come from the diff at the head (E3), never
+/// branch, the PR, the diff at its head commit, that commit's CI, the ledger's verdicts and fix rounds, and CodeGraph's blast
+/// radius and hotspot score of each touched file (sc-25709: numbers CodeGraph computes from the code, read like CI). No model
+/// feeds it; there is no bypass (E2). The touched paths and their tiers come from the diff at the head (E3), never
 /// from the plan, the PR or a worker's claim.
 /// </summary>
 public static class MergeGate
@@ -176,8 +185,19 @@ public static class MergeGate
     /// The recorded result of the <c>new-tests-fail-on-base</c> check for this base and head (<see cref="NewTestsCheck"/>),
     /// or null when it was not run; required only when a touched tier lists the check, and then null fails it (E2).
     /// </param>
+    /// <param name="risk">
+    /// CodeGraph's inputs to <c>risk-threshold</c> for this head (sc-25709: each touched file's blast radius at the head, its hotspot
+    /// score on the default branch), or null when they were not read (no CodeGraph configured); required only when a touched tier
+    /// lists <c>risk-threshold</c>, and then null fails it (E4). Inputs that could not be read make the decision
+    /// <see cref="GateOutcome.Pending"/> when nothing else blocks.
+    /// </param>
+    /// <param name="riskUnread">
+    /// CodeGraph is configured but its inputs are not read yet (<paramref name="risk"/> null): the pipeline evaluates everything else
+    /// first, so CodeGraph is asked only about a change nothing else blocks. Then a change that needs <c>risk-threshold</c> and that
+    /// nothing else blocks is <see cref="GateOutcome.Pending"/> (never Merge) until it is evaluated again with the inputs.
+    /// </param>
     public static GateDecision Evaluate(string? policyText, string? policyError, PullFacts pull, ChangeFacts change, CiFacts ci,
-        IReadOnlyList<ReviewVerdict> verdicts, NewTestsResult? newTests = null)
+        IReadOnlyList<ReviewVerdict> verdicts, NewTestsResult? newTests = null, CodeGraphRisk? risk = null, bool riskUnread = false)
     {
         var head = pull.HeadSha;
         var reasons = new List<string>();
@@ -268,24 +288,32 @@ public static class MergeGate
             reasons.Add(why);
         }
 
-        // risk-threshold — diff size and fix rounds, when a touched tier requires it.
+        // risk-threshold — diff size, fix rounds and CodeGraph's inputs (sc-25709), when a touched tier requires it.
         var riskRequired = classified.Requires(GateChecks.RiskThreshold) && !GateCheckSeam.Off(GateChecks.RiskThreshold);
+        var pending = new List<string>();
+        var (limit, limitBy) = BlastRadiusLimit(policy.Risk);
+        var unread = riskRequired && risk is null && riskUnread;
         if (riskRequired)
         {
-            var risk = policy.Risk;
-            if (classified.ChangedLines > risk.MaxChangedLines)
+            var threshold = policy.Risk;
+            if (classified.ChangedLines > threshold.MaxChangedLines)
             {
-                reasons.Add($"risk threshold: {classified.ChangedLines} changed lines exceed max_changed_lines {risk.MaxChangedLines}");
+                reasons.Add($"risk threshold: {classified.ChangedLines} changed lines exceed max_changed_lines {threshold.MaxChangedLines}");
             }
-            if (classified.ChangedFiles > risk.MaxChangedFiles)
+            if (classified.ChangedFiles > threshold.MaxChangedFiles)
             {
-                reasons.Add($"risk threshold: {classified.ChangedFiles} changed files exceed max_changed_files {risk.MaxChangedFiles}");
+                reasons.Add($"risk threshold: {classified.ChangedFiles} changed files exceed max_changed_files {threshold.MaxChangedFiles}");
             }
-            if (change.FixRounds > risk.MaxFixRounds)
+            if (change.FixRounds > threshold.MaxFixRounds)
             {
-                reasons.Add($"risk threshold: {change.FixRounds} fix rounds exceed max_fix_rounds {risk.MaxFixRounds}");
+                reasons.Add($"risk threshold: {change.FixRounds} fix rounds exceed max_fix_rounds {threshold.MaxFixRounds}");
+            }
+            if (!unread)
+            {
+                CodeGraphReasons(threshold, limit, limitBy, head, TouchedFiles(diff), risk, reasons, pending);
             }
         }
+        var inputs = riskRequired ? risk?.Describe(limit, policy.Risk.MaxHotspot) : null;
 
         // new-tests-fail-on-base — the executed runs recorded for exactly this base and head (sc-25382).
         var newTestsRequired = classified.Requires(GateChecks.NewTestsFailOnBase) && !GateCheckSeam.Off(GateChecks.NewTestsFailOnBase);
@@ -322,8 +350,18 @@ public static class MergeGate
             // A verdict recorded under an earlier panel rule whose models are its only fault: the current panel reviews the head once.
             return modelProblems.Count > 0 && reasons.All(modelProblems.Contains) && Superseded(verdict, verdicts)
                 ? new GateDecision(GateOutcome.ReviewHead, head,
-                    [$"the verdict on {Ci.Short(head)} was recorded under an earlier panel rule", .. modelProblems])
-                : new GateDecision(GateOutcome.Blocked, head, reasons);
+                    [$"the verdict on {Ci.Short(head)} was recorded under an earlier panel rule", .. modelProblems], inputs)
+                : new GateDecision(GateOutcome.Blocked, head, [.. reasons, .. pending], inputs);
+        }
+        if (pending.Count > 0)
+        {
+            // Only CodeGraph's inputs are missing: wait for them like pending CI (E4: never merged without them).
+            return new GateDecision(GateOutcome.Pending, head, pending, inputs);
+        }
+        if (unread)
+        {
+            // Everything else holds: CodeGraph's inputs are read now, and the gate evaluated again with them.
+            return new GateDecision(GateOutcome.Pending, head, [$"risk threshold: CodeGraph's inputs for {Ci.Short(head)} are still to be read"]);
         }
         var tiers = Tiers.Precedence.Where(t => classified.In(t).Count > 0).Select(t => $"{t.Key()} {classified.In(t).Count}");
         var passed = new List<string>
@@ -334,13 +372,89 @@ public static class MergeGate
         };
         if (riskRequired)
         {
-            passed.Add($"risk within threshold ({classified.ChangedLines} changed lines, {classified.ChangedFiles} files, {change.FixRounds} fix rounds)");
+            var worst = risk!.Worst;
+            var hottest = risk.Hottest;
+            passed.Add($"risk within threshold ({classified.ChangedLines} changed lines, {classified.ChangedFiles} files, {change.FixRounds} fix rounds, "
+                + $"worst blast radius {(worst is null ? "none (no file)" : $"{BlastRadii.Name(worst.Radius)} ({worst.Path})")}, "
+                + $"highest hotspot score {(hottest is null ? "none (no file)" : $"{CodeGraphRisk.Score(hottest.Score)} ({hottest.Path})")}"
+                + $"{(policy.Risk.MaxHotspot is { } max ? $" within max_hotspot {CodeGraphRisk.Score(max)}" : ", max_hotspot off")})");
         }
         if (newTestsRequired)
         {
             passed.Add(newTests!.Reason);
         }
-        return new GateDecision(GateOutcome.Merge, head, passed);
+        return new GateDecision(GateOutcome.Merge, head, passed, inputs);
+    }
+
+    /// <summary>The repository files a diff touches (both sides of a rename, deletes too), normalized: the files CodeGraph is asked about.</summary>
+    public static IReadOnlyList<string> TouchedFiles(string diff) =>
+        DiffPaths.Parse(diff).Paths.Select(RepoPath.Normalize).OfType<string>().Distinct(StringComparer.Ordinal).ToList();
+
+    /// <summary>Where <c>CodeGraph:Token</c> comes from, as the gate's reason and the start-up warning name it.</summary>
+    public const string CodeGraphTokenSources =
+        "CodeGraph:Token, env FACTORY_CODEGRAPH_TOKEN, or keychain account 'codegraph-token' (service 'dark-factory')";
+
+    /// <summary>
+    /// The blast radius <c>risk-threshold</c> allows and what sets it: the policy's <c>max_blast_radius</c> when it is no looser than the
+    /// code floor (version 3 can only tighten it), else the floor (<see cref="GatePolicy.BlastRadiusFloor"/>: critical always fails).
+    /// </summary>
+    private static (BlastRadius? Limit, string By) BlastRadiusLimit(RiskThreshold threshold)
+    {
+        if (GateCheckSeam.Off(GateCheckSeam.FloorBlastRadius))
+        {
+            return threshold.MaxBlastRadius is { } policyMax ? (policyMax, $"max_blast_radius {BlastRadii.Name(policyMax)}") : (null, "");
+        }
+        return threshold.MaxBlastRadius is { } max && max <= GatePolicy.BlastRadiusFloor
+            ? (max, $"max_blast_radius {BlastRadii.Name(max)}")
+            : (GatePolicy.BlastRadiusFloor, $"the code floor ({BlastRadii.Name(BlastRadius.Critical)} always fails)");
+    }
+
+    /// <summary>
+    /// <c>risk-threshold</c>'s CodeGraph inputs (sc-25709): each touched file's blast radius at exactly the head must be within
+    /// <paramref name="limit"/> (<see cref="BlastRadiusLimit"/>), and, when the policy sets <c>max_hotspot</c>, each file's hotspot score
+    /// (CodeGraph's riskScore, on the default branch) within it. Inputs not read at all (no CodeGraph configured), read for another
+    /// commit or leaving a touched file out block. A file read over a limit blocks even when other inputs could not be read; otherwise
+    /// inputs CodeGraph could not read are pending.
+    /// </summary>
+    private static void CodeGraphReasons(RiskThreshold threshold, BlastRadius? limit, string by, string head, IReadOnlyList<string> files,
+        CodeGraphRisk? risk, List<string> reasons, List<string> pending)
+    {
+        if (risk is null)
+        {
+            reasons.Add($"risk threshold: CodeGraph's blast radius and hotspots were not read for {Ci.Short(head)} (CodeGraph is not configured: "
+                + $"no CodeGraph token; set {CodeGraphTokenSources})");
+            return;
+        }
+        if (!string.Equals(risk.HeadSha, head, StringComparison.OrdinalIgnoreCase))
+        {
+            reasons.Add($"risk threshold: CodeGraph's inputs were read for {Ci.Short(risk.HeadSha)}, not the head {Ci.Short(head)}");
+            return;
+        }
+        var over = risk.BlastRadius.Where(f => limit is { } l && f.Radius > l).OrderByDescending(f => f.Radius).ToList();
+        if (over.Count > 0)
+        {
+            reasons.Add($"risk threshold: blast radius at {Ci.Short(head)} over {by}: {string.Join(", ", over.Select(f => $"{f.Path} {BlastRadii.Name(f.Radius)}"))}");
+        }
+        if (threshold.MaxHotspot is { } maxHotspot)
+        {
+            var hot = risk.Hotspots.Where(f => f.Score > maxHotspot).OrderByDescending(f => f.Score).ToList();
+            if (hot.Count > 0)
+            {
+                reasons.Add($"risk threshold: hotspot score (riskScore) over max_hotspot {CodeGraphRisk.Score(maxHotspot)}: "
+                    + string.Join(", ", hot.Select(f => $"{f.Path} {CodeGraphRisk.Score(f.Score)} on the default branch at {Ci.Short(f.CommitSha)}")));
+            }
+        }
+        if (risk.Unreadable.Count > 0)
+        {
+            // The files not read yet are left out by design: pending, or named beside a file already over a limit (which blocks).
+            pending.Add($"risk threshold: CodeGraph could not be read for {Ci.Short(head)}: {risk.UnreadableText}");
+            return;
+        }
+        var missing = files.Where(f => risk.BlastRadius.All(b => b.Path != f) || risk.Hotspots.All(h => h.Path != f)).ToList();
+        if (missing.Count > 0)
+        {
+            reasons.Add($"risk threshold: CodeGraph's inputs leave out {string.Join(", ", missing)}");
+        }
     }
 
     /// <summary>The decision when <see cref="GateCheckSeam"/> disabled the policy precondition and the policy is unusable (coverage tests only).</summary>

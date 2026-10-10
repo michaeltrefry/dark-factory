@@ -35,6 +35,9 @@ public static class GateCheckCoverage
     /// <summary>The code floor of paths that call the security review in (<see cref="RiskyPaths"/>), whatever their tier.</summary>
     public const string FloorSecurityReviewPaths = GateCheckSeam.FloorSecurityReviewPaths;
 
+    /// <summary>The code floor of the CodeGraph blast radius (<see cref="GatePolicy.BlastRadiusFloor"/>): critical fails, version 3 only tightens it.</summary>
+    public const string FloorBlastRadius = GateCheckSeam.FloorBlastRadius;
+
     /// <summary><see cref="MergeGate"/> blocks when the base's policy is unreadable, missing or invalid.</summary>
     public const string PreconditionPolicy = GateCheckSeam.PreconditionPolicy;
 
@@ -53,7 +56,7 @@ public static class GateCheckCoverage
     /// </summary>
     public static readonly IReadOnlyList<string> Registry =
     [
-        .. GateChecks.All, FloorChecks, FloorSealedPaths, FloorSecurityReviewPaths,
+        .. GateChecks.All, FloorChecks, FloorSealedPaths, FloorSecurityReviewPaths, FloorBlastRadius,
         PreconditionPolicy, PreconditionPrOpen, PreconditionDiffComplete, SealedEscalation,
     ];
 

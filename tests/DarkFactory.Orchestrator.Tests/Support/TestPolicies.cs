@@ -27,6 +27,11 @@ internal static class TestPolicies
           max_fix_rounds: {maxFixRounds}
         """;
 
+    /// <summary>The standard policy as version 3 (sc-25709), with <c>max_blast_radius</c> and <c>max_hotspot</c> as given.</summary>
+    public static string V3(string maxBlastRadius, string maxHotspot) =>
+        Standard().Replace("version: 2", "version: 3", StringComparison.Ordinal)
+        + $"\n  max_blast_radius: {maxBlastRadius}\n  max_hotspot: {maxHotspot}";
+
     /// <summary>
     /// <paramref name="pull"/> with GitHub's <c>changed_files</c> set to what <paramref name="change"/>'s diff holds, unless the
     /// test set it (e.g. to a different count, to show an incomplete diff blocks).

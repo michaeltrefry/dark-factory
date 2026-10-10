@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using DarkFactory.Orchestrator.CodeGraph;
@@ -75,14 +74,18 @@ public class ReviewOverlayTests
     public async Task An_overlay_still_indexing_at_the_timeout_ends_the_wait_there_as_timed_out()
     {
         var server = OverlayServer("indexing");
-        var clock = Stopwatch.StartNew();
+        // Fake time (every wait moves the clock on by itself): the timeout is reached in polls, however loaded the machine is.
+        var start = new DateTimeOffset(2026, 10, 8, 12, 0, 0, TimeSpan.Zero);
+        var clock = new SteppingClock(start, TimeSpan.FromMinutes(1));
+        var overlays = new ReviewOverlays(Client(server), TimeSpan.FromMinutes(10), TimeSpan.FromMinutes(1));
 
-        var overlay = await Overlays(server, TimeSpan.FromMilliseconds(300)).WaitAsync(Repo, Head, NoControls, TimeProvider.System, CancellationToken.None);
+        var overlay = await overlays.WaitAsync(Repo, Head, NoControls, clock, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(30));
 
         Assert.Equal((CodeGraphOverlay.TimedOut, 41L), (overlay.Outcome, overlay.OverlayId));
-        Assert.Contains("not ready within", overlay.Reason);
-        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(5), $"the wait took {clock.Elapsed}");
-        Assert.True(server.Calls.Count(c => c.Tool == "get_overlay_status") > 1);
+        Assert.Contains("not ready within 10 min", overlay.Reason);
+        // Polled while it was indexing, and ended at the timeout: not before it (a few polls), not after it.
+        Assert.InRange(server.Calls.Count(c => c.Tool == "get_overlay_status"), 2, 10);
+        Assert.True(clock.GetUtcNow() - start < TimeSpan.FromMinutes(15), $"the wait ran {clock.GetUtcNow() - start} of fake time");
     }
 
     [Theory]
@@ -501,7 +504,8 @@ public class ReviewOverlayTests
         Assert.Contains("CodeGraph overlay of the head `timed-out`", LedgerReport.Facts(await h.Rows(), []));
         Assert.Contains("answers from the default branch", LedgerReport.Facts(await h.Rows(), []));
         // The wait's outcome is checkpointed (typed: anything but ready is failed — the overlay's, not the review's).
-        var row = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.CodeGraphOverlay);
+        // The review's row (the gate then asks for its own overlay of the head, sc-25709).
+        var row = (await h.Rows()).First(r => r.Step == RunPipeline.Steps.CodeGraphOverlay);
         Assert.Equal((CodeGraphOverlay.TimedOut, StepOutcome.Failed), (CodeGraphOverlay.FromDetail(row.Detail)!.Outcome, row.Outcome));
     }
 
@@ -559,7 +563,8 @@ public class ReviewOverlayTests
 
         Assert.Equal(WorkState.Paused, (await h.Run()).State);
         Assert.Empty(h.Reviewer.Requests);
-        var row = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.CodeGraphOverlay);
+        // The review's row (the gate then asks for its own overlay of the head, sc-25709).
+        var row = (await h.Rows()).First(r => r.Step == RunPipeline.Steps.CodeGraphOverlay);
         Assert.Equal(StepOutcome.Passed, row.Outcome);
 
         await h.Controls.SetAsync(ControlScope.Item("sc-77"), ControlState.Running, "tester", CancellationToken.None);

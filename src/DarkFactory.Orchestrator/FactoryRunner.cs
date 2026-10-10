@@ -102,6 +102,10 @@ public static class FactoryRunner
         try
         {
             options.RejectReviewModelSettings();
+            if (CodeGraphTokenWarning(options) is { } warning)
+            {
+                stderr.WriteLine(warning);
+            }
             if (await checkEnrollment(ct) is { } enrollmentError)
             {
                 stderr.WriteLine(enrollmentError);
@@ -115,6 +119,14 @@ public static class FactoryRunner
             return 2;
         }
     }
+
+    /// <summary>
+    /// The start-up warning of <c>factory run</c> and <c>factory work</c> when no CodeGraph token is configured (sc-25709: the factory still
+    /// starts, but <c>risk-threshold</c> cannot read CodeGraph, so the gate merges nothing that needs it), or null with a token.
+    /// </summary>
+    internal static string? CodeGraphTokenWarning(FactoryOptions options) =>
+        options.TryGet(o => o.CodeGraphToken, out _) ? null
+            : $"no CodeGraph token ({MergeGate.CodeGraphTokenSources}): the merge gate will merge no change whose tier requires risk-threshold";
 
     /// <param name="ignoreScope"><c>factory run --ignore-scope</c>: claim and resume the story even outside the watch scope.</param>
     public static async Task<RunOutcome> RunAsync(FactoryOptions options, int storyId, bool ignoreScope, TextWriter log, CancellationToken ct)
@@ -309,12 +321,14 @@ public static class FactoryRunner
     /// The merge gate as configured: CI on the PR's head polled every <c>Gate:CiPollSeconds</c> until <c>Gate:CiTimeoutMinutes</c>,
     /// the new tests run sandboxed for up to <c>Gate:TestTimeoutMinutes</c> each, and each review waits up to
     /// <c>CodeGraph:OverlayTimeoutMinutes</c> for CodeGraph's overlay of the head (sc-25708; without a CodeGraph token the wait ends at
-    /// once, recorded as unavailable).
+    /// once, recorded as unavailable), and <c>risk-threshold</c> reads CodeGraph's blast radius and hotspots through the same client
+    /// (sc-25709; without a CodeGraph token there is none, and the check fails wherever a tier requires it).
     /// </summary>
     internal static GateStage CreateGate(FactoryOptions options, IGateGitHub github, IReviewer reviewer, GitWorkspace workspaces,
         WorkerSandbox? sandbox, ICodeGraphOverlays? codeGraph = null) =>
         new(github, reviewer, options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, sandbox, options.TestTimeout),
-            Overlays: new ReviewOverlays(codeGraph, options.CodeGraphOverlayTimeout));
+            Overlays: new ReviewOverlays(codeGraph, options.CodeGraphOverlayTimeout),
+            Risk: codeGraph is ICodeGraphRisk risk ? new CodeGraphRiskReader(risk, options.CodeGraphOverlayTimeout) : null);
 
     /// <summary>The sandbox readiness probe, a factory-wide failure (E10): a stale helper fails the factory once, not every item.</summary>
     internal static Task EnsureSandboxReadyAsync(WorkerSandbox sandbox, WorkerAuth auth, string claudePath, CancellationToken ct) =>

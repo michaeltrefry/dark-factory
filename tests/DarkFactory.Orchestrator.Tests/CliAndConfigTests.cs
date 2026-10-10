@@ -250,12 +250,36 @@ public class FactoryOptionsTests
         var calls = new List<string>();
         var stderr = new StringWriter();
 
-        var exit = await FactoryRunner.RunCommandAsync(Options([]),
+        var exit = await FactoryRunner.RunCommandAsync(Options(new() { ["CodeGraph:Token"] = "cg_config" }),
             _ => { calls.Add("enrollment"); return Task.FromResult<string?>(null); },
             _ => { calls.Add("run"); return Task.FromResult(new RunOutcome(1, DarkFactory.Orchestrator.Ledger.WorkState.Watch, null, null, null)); },
             stderr, CancellationToken.None);
 
         Assert.Equal((0, ""), (exit, stderr.ToString()));
+        Assert.Equal(["enrollment", "run"], calls);
+    }
+
+    [Fact]
+    public async Task Factory_run_and_work_warn_at_start_up_without_a_codegraph_token_and_still_start()
+    {
+        Assert.Null(FactoryRunner.CodeGraphTokenWarning(Options(new() { ["CodeGraph:Token"] = "cg_config" })));
+        if (Environment.GetEnvironmentVariable("FACTORY_CODEGRAPH_TOKEN") is not null)
+        {
+            return; // the environment supplies a token
+        }
+        const string warning = "no CodeGraph token (CodeGraph:Token, env FACTORY_CODEGRAPH_TOKEN, or keychain account 'codegraph-token' "
+            + "(service 'dark-factory')): the merge gate will merge no change whose tier requires risk-threshold";
+        // `factory work` prints the same warning (Program.cs, through CodeGraphTokenWarning) before it starts.
+        Assert.Equal(warning, FactoryRunner.CodeGraphTokenWarning(Options([])));
+        var stderr = new StringWriter();
+        var calls = new List<string>();
+
+        var exit = await FactoryRunner.RunCommandAsync(Options([]),
+            _ => { calls.Add("enrollment"); return Task.FromResult<string?>(null); },
+            _ => { calls.Add("run"); return Task.FromResult(new RunOutcome(1, DarkFactory.Orchestrator.Ledger.WorkState.Watch, null, null, null)); },
+            stderr, CancellationToken.None);
+
+        Assert.Equal((0, warning + Environment.NewLine), (exit, stderr.ToString()));
         Assert.Equal(["enrollment", "run"], calls);
     }
 
@@ -477,6 +501,12 @@ public class FactoryOptionsTests
         Assert.Equal(ReviewOverlays.DefaultTimeout, FactoryRunner.CreateGate(Options([]), new GatePipelineTests.FakeGateGitHub(),
             new GatePipelineTests.FakeReviewer(), workspaces, sandbox: null).Overlays!.Timeout);
         Assert.Equal(TimeSpan.FromMinutes(11), reviewer.Timeout);
+        // sc-25709: risk-threshold reads CodeGraph through the same client, its overlay wait on the same timeout; no client, no reader.
+        Assert.Null(gate.Risk);
+        using var codeGraphHttp = new HttpClient();
+        var withCodeGraph = FactoryRunner.CreateGate(options, new GatePipelineTests.FakeGateGitHub(), new GatePipelineTests.FakeReviewer(),
+            workspaces, sandbox: null, new CodeGraph.CodeGraphMcpClient(codeGraphHttp, "cg_test_token"));
+        Assert.Equal(TimeSpan.FromMinutes(12), withCodeGraph.Risk!.Overlays.Timeout);
     }
 
     [Fact]
