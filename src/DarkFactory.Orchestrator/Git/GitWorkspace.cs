@@ -55,6 +55,14 @@ public interface IRepoWorkspace
 public delegate Task<string> GitCommand(string cwd, IReadOnlyDictionary<string, string>? env, IReadOnlyList<string> args, CancellationToken ct);
 
 /// <summary>
+/// Runs one git command in <paramref name="cwd"/>, handing its standard output, as bytes, to <paramref name="read"/> as it arrives.
+/// <paramref name="read"/> answers true when it read to the end (git's exit status is then checked) or false when it stopped early
+/// (git, still running, is stopped with its whole process tree and its status is not checked).
+/// </summary>
+public delegate Task GitStreamCommand(string cwd, IReadOnlyDictionary<string, string>? env, IReadOnlyList<string> args,
+    Func<Stream, CancellationToken, Task<bool>> read, CancellationToken ct);
+
+/// <summary>
 /// Keeps one clone per target repo under the work root and gives each story its
 /// own git worktree on <c>factory/sc-&lt;id&gt;</c>. Network git calls authenticate
 /// with an installation token passed through git's environment-based config, so
@@ -72,10 +80,12 @@ public sealed class GitWorkspace(
     GitCommand? git = null,
     IWorkerSandbox? sandbox = null,
     string worktreesDirectory = GitWorkspace.ItemWorktrees,
-    bool shareWithWorker = true)
+    bool shareWithWorker = true,
+    GitStreamCommand? gitStream = null)
     : IRepoWorkspace, Gate.IReviewFiles
 {
     private readonly GitCommand _git = git ?? RunGitAsync;
+    private readonly GitStreamCommand _gitStream = gitStream ?? RunGitStreamAsync;
 
     public const string BranchPrefix = "factory/";
 
@@ -274,6 +284,60 @@ public sealed class GitWorkspace(
     private static readonly System.Text.RegularExpressions.Regex FullSha = new("^[0-9a-f]{40}$");
 
     /// <summary>
+    /// How long one git command of a reviewer's read may run (each on its own clock, apart from the review's): a read still running
+    /// then is stopped and answers an error.
+    /// </summary>
+    public static readonly TimeSpan ReviewReadTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>The review read timeout this workspace applies (<see cref="ReviewReadTimeout"/>; tests shorten it).</summary>
+    internal TimeSpan ReviewReadLimit { get; init; } = ReviewReadTimeout;
+
+    /// <summary>
+    /// At most this many bytes of a <c>list_files</c> listing, or of <c>grep</c>'s kept lines, are read from git before it is
+    /// stopped (the answer then says there were more).
+    /// </summary>
+    public const int MaxReviewReadBytes = Gate.ReviewTools.MaxResultBytes * 4;
+
+    /// <summary>At most this many bytes of one <c>grep</c> output line (path, line number and text) are kept; the rest is skipped.</summary>
+    public const int MaxGrepRecordBytes = 8 * 1024;
+
+    /// <summary>A listed path longer than this many bytes ends the listing (the answer then says there were more).</summary>
+    private const int MaxPathBytes = 4096;
+
+    private static readonly System.Text.Encoding StrictUtf8 = new System.Text.UTF8Encoding(false, throwOnInvalidBytes: true);
+
+    /// <summary>One git command of a reviewer's read, run under its own <see cref="ReviewReadLimit"/> as well as <paramref name="ct"/>.</summary>
+    private async Task<T> ReviewReadAsync<T>(string what, Func<CancellationToken, Task<T>> read, CancellationToken ct)
+    {
+        using var limit = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        limit.CancelAfter(ReviewReadLimit);
+        try
+        {
+            return await read(limit.Token);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new TimeoutException($"git {what} did not finish within {ReviewReadLimit.TotalSeconds:0.###} s.");
+        }
+    }
+
+    private Task<string> ReviewGit(string what, string cwd, CancellationToken ct, params string[] args) =>
+        ReviewReadAsync(what, limit => Git(cwd, null, limit, args), ct);
+
+    /// <summary>
+    /// A reviewer's git read whose output is streamed to <paramref name="read"/> (<see cref="GitStreamCommand"/>), isolated like
+    /// <see cref="Git"/>; true when <paramref name="read"/> read it to the end.
+    /// </summary>
+    private Task<bool> ReviewGitStream(string what, string cwd, string[] args, Func<Stream, CancellationToken, Task<bool>> read, CancellationToken ct) =>
+        ReviewReadAsync(what, async limit =>
+        {
+            var (isolatedEnv, isolatedArgs) = OwnerGit.Isolate(null, args);
+            var whole = false;
+            await _gitStream(cwd, isolatedEnv, isolatedArgs, async (stream, token) => whole = await read(stream, token), limit);
+            return whole;
+        }, ct);
+
+    /// <summary>
     /// The clone, with <paramref name="sha"/> in it: cloned or fetched first when it is not (the PR head is on a
     /// <c>factory/*</c> branch, the base on the base branch). <paramref name="sha"/> must be a full lowercase commit id.
     /// </summary>
@@ -288,7 +352,7 @@ public sealed class GitWorkspace(
         {
             try
             {
-                await Git(clone, null, ct, "cat-file", "-e", "--end-of-options", $"{sha}^{{commit}}");
+                await ReviewGit("cat-file", clone, ct, "cat-file", "-e", "--end-of-options", $"{sha}^{{commit}}");
                 return clone;
             }
             catch (InvalidOperationException ex) when (ExitCode(ex) is not null)
@@ -301,12 +365,12 @@ public sealed class GitWorkspace(
 
     /// <summary>
     /// A regular file's text at <paramref name="sha"/> (<see cref="Gate.IReviewFiles.ReadAsync"/>): read by blob id from the clone,
-    /// its size checked before it is read; NUL bytes or invalid UTF-8 make it binary.
+    /// its size checked before it is read. Read as bytes: a NUL byte or invalid UTF-8 makes it binary (so UTF-16 text is binary).
     /// </summary>
     async Task<string?> Gate.IReviewFiles.ReadAsync(RepoRef repo, string sha, string path, CancellationToken ct)
     {
         var clone = await CloneWithAsync(repo, sha, ct);
-        var entry = await Git(clone, null, ct, "--literal-pathspecs", "ls-tree", "-l", "-z", "--full-tree", "--end-of-options", sha, "--", path);
+        var entry = await ReviewGit("ls-tree", clone, ct, "--literal-pathspecs", "ls-tree", "-l", "-z", "--full-tree", "--end-of-options", sha, "--", path);
         // "<mode> <type> <object> <size>\t<path>" (the size right-aligned with spaces)
         var line = entry.Split('\0', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
         var tab = line?.IndexOf('\t') ?? -1;
@@ -319,62 +383,156 @@ public sealed class GitWorkspace(
         {
             throw new InvalidOperationException($"{path} is {size} bytes, more than the {Gate.ReviewTools.MaxFileBytes} a reviewer reads.");
         }
-        var text = await Git(clone, null, ct, "cat-file", "blob", blob);
-        // git's output is decoded as UTF-8 with invalid bytes replaced: a replacement character or a NUL marks a binary file.
-        if (text.Contains('\0') || text.Contains('�'))
+        using var content = new MemoryStream();
+        var whole = await ReviewGitStream("cat-file", clone, ["cat-file", "blob", blob], async (stdout, token) =>
+        {
+            var buffer = new byte[81920];
+            int n;
+            while ((n = await stdout.ReadAsync(buffer, token)) > 0)
+            {
+                if (content.Length + n > Gate.ReviewTools.MaxFileBytes)
+                {
+                    return false;
+                }
+                content.Write(buffer, 0, n);
+            }
+            return true;
+        }, ct);
+        if (!whole)
+        {
+            throw new InvalidOperationException($"{path} is more than the {Gate.ReviewTools.MaxFileBytes} bytes a reviewer reads.");
+        }
+        var raw = content.GetBuffer().AsSpan(0, (int)content.Length);
+        if (raw.Contains((byte)0))
         {
             throw new Gate.BinaryFileException(path);
         }
-        return text;
+        try
+        {
+            return StrictUtf8.GetString(raw);
+        }
+        catch (System.Text.DecoderFallbackException)
+        {
+            throw new Gate.BinaryFileException(path);
+        }
     }
 
-    async Task<IReadOnlyList<string>> Gate.IReviewFiles.ListAsync(RepoRef repo, string sha, string? directory, CancellationToken ct)
+    /// <summary>
+    /// <c>git ls-tree -r</c> on the commit (<see cref="Gate.IReviewFiles.ListAsync"/>), streamed: git is stopped once
+    /// <see cref="Gate.ReviewTools.MaxListedFiles"/> paths are read and another follows, or <see cref="MaxReviewReadBytes"/> are read.
+    /// </summary>
+    async Task<Gate.Bounded<string>> Gate.IReviewFiles.ListAsync(RepoRef repo, string sha, string? directory, CancellationToken ct)
     {
         var clone = await CloneWithAsync(repo, sha, ct);
         string[] args = directory is null
             ? ["ls-tree", "-r", "-z", "--name-only", "--full-tree", "--end-of-options", sha]
             : ["--literal-pathspecs", "ls-tree", "-r", "-z", "--name-only", "--full-tree", "--end-of-options", sha, "--", directory];
-        return (await Git(clone, null, ct, args)).Split('\0', StringSplitOptions.RemoveEmptyEntries);
+        var paths = new List<string>();
+        var kept = 0;
+        var whole = await ReviewGitStream("ls-tree", clone, args, (stdout, token) => ReadRecordsAsync(stdout, 0, MaxPathBytes, (record, cut) =>
+        {
+            kept += record.Length;
+            if (cut || paths.Count == Gate.ReviewTools.MaxListedFiles || kept > MaxReviewReadBytes)
+            {
+                return false;
+            }
+            paths.Add(System.Text.Encoding.UTF8.GetString(record));
+            return true;
+        }, token), ct);
+        return new Gate.Bounded<string>(paths, More: !whole);
     }
 
     /// <summary>
     /// <c>git grep</c> on the commit's tree (<see cref="Gate.IReviewFiles.GrepAsync"/>): POSIX extended regular expression, text files
     /// only (<c>-I</c>), no textconv, at most <paramref name="perFile"/> lines a file. git answers 1 for no match: an empty list.
+    /// Streamed: each output line keeps at most <see cref="MaxGrepRecordBytes"/> bytes, and git is stopped once
+    /// <see cref="Gate.ReviewTools.MaxGrepMatches"/> matches are read and another follows, or <see cref="MaxReviewReadBytes"/> are kept.
     /// </summary>
-    async Task<IReadOnlyList<Gate.GrepMatch>> Gate.IReviewFiles.GrepAsync(RepoRef repo, string sha, string pattern, string? directory, int perFile,
+    async Task<Gate.Bounded<Gate.GrepMatch>> Gate.IReviewFiles.GrepAsync(RepoRef repo, string sha, string pattern, string? directory, int perFile,
         CancellationToken ct)
     {
         var clone = await CloneWithAsync(repo, sha, ct);
-        string output;
+        var matches = new List<Gate.GrepMatch>();
+        var kept = 0;
+        bool whole;
         try
         {
-            output = await Git(clone, null, ct, ["--literal-pathspecs", "grep", "-I", "-n", "-z", "--no-color", "--no-textconv", "-E",
-                $"--max-count={perFile}", "-e", pattern, "--end-of-options", sha, "--", .. directory is null ? Array.Empty<string>() : [directory]]);
+            whole = await ReviewGitStream("grep", clone, ["--literal-pathspecs", "grep", "-I", "-n", "-z", "--no-color", "--no-textconv", "-E",
+                $"--max-count={perFile}", "-e", pattern, "--end-of-options", sha, "--", .. directory is null ? Array.Empty<string>() : [directory]],
+                (stdout, token) => ReadRecordsAsync(stdout, (byte)'\n', MaxGrepRecordBytes, (record, _) =>
+                {
+                    if (ParseGrepRecord(System.Text.Encoding.UTF8.GetString(record), sha) is not { } match)
+                    {
+                        return true;
+                    }
+                    kept += record.Length;
+                    if (matches.Count == Gate.ReviewTools.MaxGrepMatches || kept > MaxReviewReadBytes)
+                    {
+                        return false;
+                    }
+                    matches.Add(match);
+                    return true;
+                }, token), ct);
         }
         catch (InvalidOperationException ex) when (ExitCode(ex) == 1)
         {
-            return [];
+            return new Gate.Bounded<Gate.GrepMatch>([], More: false);
         }
-        return ParseGrep(output, sha);
+        return new Gate.Bounded<Gate.GrepMatch>(matches, More: !whole);
+    }
+
+    /// <summary>
+    /// Splits <paramref name="stream"/> at <paramref name="separator"/>, handing each record to <paramref name="record"/> (at most
+    /// <paramref name="maxRecord"/> bytes of it kept, the rest skipped, which its second argument says), which answers false to
+    /// stop. True when the stream was read to its end.
+    /// </summary>
+    private static async Task<bool> ReadRecordsAsync(Stream stream, byte separator, int maxRecord, Func<byte[], bool, bool> record,
+        CancellationToken ct)
+    {
+        var buffer = new byte[81920];
+        using var current = new MemoryStream();
+        var cut = false;
+        int n;
+        while ((n = await stream.ReadAsync(buffer, ct)) > 0)
+        {
+            var start = 0;
+            while (start < n)
+            {
+                var end = Array.IndexOf(buffer, separator, start, n - start);
+                var take = (end < 0 ? n : end) - start;
+                var room = maxRecord - (int)current.Length;
+                current.Write(buffer, start, Math.Min(take, room));
+                cut |= take > room;
+                if (end < 0)
+                {
+                    break;
+                }
+                if (!record(current.ToArray(), cut))
+                {
+                    return false;
+                }
+                current.SetLength(0);
+                cut = false;
+                start = end + 1;
+            }
+        }
+        return current.Length == 0 || record(current.ToArray(), cut);
     }
 
     /// <summary>
     /// Parses <c>git grep -n -z</c> on a commit: one line per match, <c>&lt;sha&gt;:&lt;path&gt;\0&lt;line&gt;\0&lt;text&gt;</c> (the NULs
     /// stand where git would print colons, so a path or text holding one parses).
     /// </summary>
-    public static IReadOnlyList<Gate.GrepMatch> ParseGrep(string output, string sha)
+    public static IReadOnlyList<Gate.GrepMatch> ParseGrep(string output, string sha) =>
+        output.Split('\n').Select(record => ParseGrepRecord(record, sha)).OfType<Gate.GrepMatch>().ToList();
+
+    /// <summary>One line of <see cref="ParseGrep"/>'s output, or null when it is not a match line.</summary>
+    private static Gate.GrepMatch? ParseGrepRecord(string record, string sha)
     {
-        var matches = new List<Gate.GrepMatch>();
-        foreach (var record in output.Split('\n'))
-        {
-            var fields = record.Split('\0', 3);
-            if (fields.Length < 3 || !fields[0].StartsWith(sha + ":", StringComparison.Ordinal) || !int.TryParse(fields[1], out var line))
-            {
-                continue;
-            }
-            matches.Add(new Gate.GrepMatch(fields[0][(sha.Length + 1)..], line, fields[2].TrimEnd('\r')));
-        }
-        return matches;
+        var fields = record.Split('\0', 3);
+        return fields.Length < 3 || !fields[0].StartsWith(sha + ":", StringComparison.Ordinal) || !int.TryParse(fields[1], out var line)
+            ? null
+            : new Gate.GrepMatch(fields[0][(sha.Length + 1)..], line, fields[2].TrimEnd('\r'));
     }
 
     /// <summary>Reads the branch through the clone-side admin dir, never the worktree's worker-writable <c>.git</c> file.</summary>
@@ -576,7 +734,86 @@ public sealed class GitWorkspace(
         return _git(cwd, isolatedEnv, isolatedArgs, ct);
     }
 
-    public static async Task<string> RunGitAsync(string cwd, IReadOnlyDictionary<string, string>? env, IReadOnlyList<string> args, CancellationToken ct)
+    public static Task<string> RunGitAsync(string cwd, IReadOnlyDictionary<string, string>? env, IReadOnlyList<string> args, CancellationToken ct) =>
+        RunGitAsync(cwd, env, args, null, ct);
+
+    /// <summary>
+    /// <see cref="RunGitAsync(string, IReadOnlyDictionary{string, string}?, IReadOnlyList{string}, CancellationToken)"/>, handing the
+    /// started git to <paramref name="started"/> (tests). Cancelled, git is stopped with its whole process tree before this throws.
+    /// </summary>
+    internal static async Task<string> RunGitAsync(string cwd, IReadOnlyDictionary<string, string>? env, IReadOnlyList<string> args,
+        Action<Process>? started, CancellationToken ct)
+    {
+        using var p = Process.Start(GitStartInfo(cwd, env, args))!;
+        started?.Invoke(p);
+        var stdout = p.StandardOutput.ReadToEndAsync(CancellationToken.None);
+        var stderr = p.StandardError.ReadToEndAsync(CancellationToken.None);
+        try
+        {
+            await p.WaitForExitAsync(ct);
+        }
+        catch (OperationCanceledException)
+        {
+            await StopAsync(p);
+            throw;
+        }
+        ThrowIfFailed(p, args, await stderr);
+        return await stdout;
+    }
+
+    /// <summary>
+    /// The default <see cref="GitStreamCommand"/>. Cancelled, or <paramref name="read"/> failing, git is stopped with its whole
+    /// process tree before this throws.
+    /// </summary>
+    public static async Task RunGitStreamAsync(string cwd, IReadOnlyDictionary<string, string>? env, IReadOnlyList<string> args,
+        Func<Stream, CancellationToken, Task<bool>> read, CancellationToken ct)
+    {
+        using var p = Process.Start(GitStartInfo(cwd, env, args))!;
+        var stderr = p.StandardError.ReadToEndAsync(CancellationToken.None);
+        try
+        {
+            if (!await read(p.StandardOutput.BaseStream, ct))
+            {
+                await StopAsync(p);
+                return;
+            }
+            await p.WaitForExitAsync(ct);
+        }
+        catch
+        {
+            await StopAsync(p);
+            throw;
+        }
+        ThrowIfFailed(p, args, await stderr);
+    }
+
+    /// <summary>Stops a git this class started (with anything it started), then waits for it to exit.</summary>
+    private static async Task StopAsync(Process p)
+    {
+        try
+        {
+            p.Kill(entireProcessTree: true);
+        }
+        catch (InvalidOperationException)
+        {
+            // Already exited.
+        }
+        await p.WaitForExitAsync(CancellationToken.None);
+    }
+
+    private static void ThrowIfFailed(Process p, IReadOnlyList<string> args, string stderr)
+    {
+        if (p.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"git {args.FirstOrDefault(a => !a.StartsWith('-') && !a.Contains('='))} failed ({p.ExitCode}): {stderr.Trim()}")
+            {
+                Data = { [ExitCodeKey] = p.ExitCode },
+            };
+        }
+    }
+
+    private static ProcessStartInfo GitStartInfo(string cwd, IReadOnlyDictionary<string, string>? env, IReadOnlyList<string> args)
     {
         var psi = new ProcessStartInfo("git")
         {
@@ -594,19 +831,7 @@ public sealed class GitWorkspace(
         {
             psi.Environment[k] = v;
         }
-        using var p = Process.Start(psi)!;
-        var stdout = p.StandardOutput.ReadToEndAsync(ct);
-        var stderr = p.StandardError.ReadToEndAsync(ct);
-        await p.WaitForExitAsync(ct);
-        if (p.ExitCode != 0)
-        {
-            throw new InvalidOperationException(
-                $"git {args.FirstOrDefault(a => !a.StartsWith('-') && !a.Contains('='))} failed ({p.ExitCode}): {(await stderr).Trim()}")
-            {
-                Data = { [ExitCodeKey] = p.ExitCode },
-            };
-        }
-        return await stdout;
+        return psi;
     }
 
     /// <summary>The <see cref="Exception.Data"/> key of a failed git command's exit status.</summary>

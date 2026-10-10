@@ -10,6 +10,9 @@ namespace DarkFactory.Orchestrator.Gate;
 /// <summary>One line <c>grep</c> found: the file, its 1-based line number and the line's text.</summary>
 public sealed record GrepMatch(string Path, int Line, string Text);
 
+/// <summary>The first <paramref name="Items"/> of a bounded read, and whether there were more (the read stopped there).</summary>
+public sealed record Bounded<T>(IReadOnlyList<T> Items, bool More);
+
 /// <summary>
 /// The repository at a commit, read owner-side for a reviewer's <c>read_file</c>, <c>list_files</c> and <c>grep</c> (sc-25705,
 /// sc-25706): from the gate's clone, by object (no checkout, so no filter, hook or symlink of the PR's runs or is followed).
@@ -23,15 +26,19 @@ public interface IReviewFiles
     /// </summary>
     Task<string?> ReadAsync(RepoRef repo, string sha, string path, CancellationToken ct);
 
-    /// <summary>Every file path under <paramref name="directory"/> (null: the whole tree) at <paramref name="sha"/>, recursively.</summary>
-    Task<IReadOnlyList<string>> ListAsync(RepoRef repo, string sha, string? directory, CancellationToken ct);
+    /// <summary>
+    /// The file paths under <paramref name="directory"/> (null: the whole tree) at <paramref name="sha"/>, recursively: at most
+    /// <see cref="ReviewTools.MaxListedFiles"/> (fewer when a byte bound stops the read first), <c>More</c> when there were others.
+    /// </summary>
+    Task<Bounded<string>> ListAsync(RepoRef repo, string sha, string? directory, CancellationToken ct);
 
     /// <summary>
     /// The lines of text files under <paramref name="directory"/> (null: the whole tree) at <paramref name="sha"/> that match the
-    /// POSIX extended regular expression <paramref name="pattern"/>, at most <paramref name="perFile"/> per file. Throws when git
-    /// refuses the pattern.
+    /// POSIX extended regular expression <paramref name="pattern"/>, at most <paramref name="perFile"/> per file and at most
+    /// <see cref="ReviewTools.MaxGrepMatches"/> in all (fewer when a byte bound stops the read first), <c>More</c> when there were
+    /// others. Throws when git refuses the pattern.
     /// </summary>
-    Task<IReadOnlyList<GrepMatch>> GrepAsync(RepoRef repo, string sha, string pattern, string? directory, int perFile, CancellationToken ct);
+    Task<Bounded<GrepMatch>> GrepAsync(RepoRef repo, string sha, string pattern, string? directory, int perFile, CancellationToken ct);
 }
 
 /// <summary>The file asked for is binary (not valid UTF-8, or holding a NUL byte): a reviewer is not shown it.</summary>
@@ -98,9 +105,12 @@ public sealed record ToolOutcome(string Content, bool IsError, ToolCall Record);
 /// <see cref="MaxGrepLineChars"/>).</item>
 /// <item>CodeGraph tools (<see cref="CodeGraphTools"/>, <see cref="ICodeGraph"/>): graph reads only, never one that runs a model.
 /// CodeGraph's index is of the default branch, so every answer is labelled with the commit it describes, or
-/// <see cref="UnknownCommit"/>, and "not the PR head" (E3). Every call is about the PR's own repository: the project argument is
-/// the CodeGraph project whose GitHub URL is the repository's (<see cref="ICodeGraph.FindProjectAsync"/>, resolved once per
-/// session), never one the model names (no tool offers a project argument, and one sent anyway is ignored).</item>
+/// <see cref="UnknownCommit"/>, and "not the PR head" (E3). Every call is asked about the PR's own repository: the project argument
+/// is the CodeGraph project whose GitHub URL is the repository's (<see cref="ICodeGraph.FindProjectAsync"/>, resolved once per
+/// session), never one the model names (no tool offers a project argument, and one sent anyway is ignored). The answers are not
+/// filtered: <c>analyze_impact</c>, <c>trace_call_path</c>, <c>find_consumers</c> and <c>find_publishers</c> follow edges into
+/// other indexed projects, so an answer may name nodes of other projects that depend on or call this one (the tools' note says
+/// so).</item>
 /// </list>
 /// A tool name that is not on the list answers an error result and is never forwarded. A tool that cannot answer — no such file,
 /// a binary file, a repository CodeGraph does not index, CodeGraph unreachable or not configured — returns an error result the
@@ -225,7 +235,8 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
     private static object Int(string description) => new { type = "integer", description };
 
     private const string CodeGraphNote = "CodeGraph indexes the repository's default branch, not this pull request: each answer names the "
-        + "commit it describes. It always answers about this repository.";
+        + "commit it describes. Queries are asked about this repository; answers may name nodes of other indexed projects that "
+        + "depend on or call it.";
 
     /// <summary>The tools as the Messages API request lists them, one per <see cref="Names"/> entry, in that order.</summary>
     public static readonly object[] Definitions =
@@ -485,7 +496,7 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
         {
             return call.Fail("list_files is not available in this session.");
         }
-        IReadOnlyList<string> paths;
+        Bounded<string> paths;
         try
         {
             paths = await files.ListAsync(call.Session.Repo, sha, directory, ct);
@@ -494,9 +505,11 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
         {
             return call.Fail($"The files under {directory ?? "the root"} could not be listed at {sha}: {Cut(ex.Message, 500)}");
         }
-        var listing = string.Join('\n', paths.Take(MaxListedFiles));
-        var header = $"{paths.Count} files under {directory ?? "the repository root"} at {sha}"
-            + (paths.Count > MaxListedFiles ? $" (the first {MaxListedFiles} shown)" : "") + ":";
+        var listed = paths.Items.Take(MaxListedFiles).ToList();
+        var listing = string.Join('\n', listed);
+        var header = paths.More || paths.Items.Count > MaxListedFiles
+            ? $"More than {listed.Count} files under {directory ?? "the repository root"} at {sha} (the first {listed.Count} shown):"
+            : $"{listed.Count} files under {directory ?? "the repository root"} at {sha}:";
         return call.Answer(header, listing, listing);
     }
 
@@ -522,7 +535,7 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
         {
             return call.Fail("grep is not available in this session.");
         }
-        IReadOnlyList<GrepMatch> matches;
+        Bounded<GrepMatch> matches;
         try
         {
             matches = await files.GrepAsync(call.Session.Repo, sha, pattern, directory, MaxGrepPerFile, ct);
@@ -531,11 +544,14 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
         {
             return call.Fail($"grep could not search at {sha}: {Cut(ex.Message, 500)}");
         }
-        var shown = string.Join('\n', matches.Take(MaxGrepMatches).Select(m => $"{m.Path}:{m.Line}: {Cut(m.Text, MaxGrepLineChars)}"));
-        var header = matches.Count == 0
-            ? $"No line matches under {directory ?? "the repository root"} at {sha}."
-            : $"{matches.Count} matching lines under {directory ?? "the repository root"} at {sha} (at most {MaxGrepPerFile} per file"
-                + (matches.Count > MaxGrepMatches ? $"; the first {MaxGrepMatches} shown" : "") + "):";
+        var found = matches.Items.Take(MaxGrepMatches).ToList();
+        var shown = string.Join('\n', found.Select(m => $"{m.Path}:{m.Line}: {Cut(m.Text, MaxGrepLineChars)}"));
+        var header = matches.More || matches.Items.Count > MaxGrepMatches
+            ? $"More than {found.Count} matching lines under {directory ?? "the repository root"} at {sha} (at most {MaxGrepPerFile} per file; "
+                + $"the first {found.Count} shown):"
+            : found.Count == 0
+                ? $"No line matches under {directory ?? "the repository root"} at {sha}."
+                : $"{found.Count} matching lines under {directory ?? "the repository root"} at {sha} (at most {MaxGrepPerFile} per file):";
         return call.Answer(header, shown, shown);
     }
 

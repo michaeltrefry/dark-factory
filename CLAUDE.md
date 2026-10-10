@@ -566,10 +566,14 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   forwarded, and `CodeGraphMcpClient.CallAsync` refuses one before sending anything). Repository tools, `IReviewFiles` served
   owner-side from the gate's clone (`GitWorkspace`, by object, `OwnerGit`-isolated: no checkout, so no filter, hook or symlink of
   the PR runs or is followed; a commit not yet in the clone is fetched first): `read_file` (`git ls-tree -l` + `cat-file`; a
-  symlink/submodule/directory is no file, one over `MaxFileBytes` 1 MiB is not read, a NUL or invalid UTF-8 is binary, "binary file,
-  not shown"), `list_files` (`ls-tree -r`, at most `MaxListedFiles` 2,000 shown with the total) and `grep` (`git grep -I -E
-  --no-textconv` on the tree, pattern ≤ `MaxPatternChars` 200, `MaxGrepPerFile` 20 per file, `MaxGrepMatches` 200 shown, lines cut
-  at `MaxGrepLineChars` 300), each at the PR head or, with `ref: base`, its base commit; a path is normalised (`RepoPath`) and
+  symlink/submodule/directory is no file, one over `MaxFileBytes` 1 MiB is not read; the blob is read as bytes, and a NUL byte or
+  invalid UTF-8 — so UTF-16 too — is binary, "binary file, not shown"; a valid U+FFFD is text), `list_files` (`ls-tree -r`, at most
+  `MaxListedFiles` 2,000 shown) and `grep` (`git grep -I -E --no-textconv -e <pattern>` on the tree, pattern ≤ `MaxPatternChars` 200,
+  `MaxGrepPerFile` 20 per file, `MaxGrepMatches` 200 shown, lines cut at `MaxGrepLineChars` 300), each at the PR head or, with
+  `ref: base`, its base commit. Their git reads stream git's output and stop git (its whole process tree) once the shown cap is
+  passed ("More than N …, the first N shown"), a listing passes `GitWorkspace.MaxReviewReadBytes` (240,000) or grep's kept lines
+  do (each line keeps at most `MaxGrepRecordBytes` 8 KiB); each git command of a read has its own `GitWorkspace.ReviewReadTimeout`
+  (30 s) and answers an error past it; a cancelled git read (`RunGitAsync` included) stops the git it started before it throws; a path is normalised (`RepoPath`) and
   one leaving the repository is refused before anything is read (`--literal-pathspecs`: no glob or magic). CodeGraph tools
   (`ReviewTools.CodeGraphTools`, each checked against CodeGraph's source to reach only the graph store and indexed files, never a
   model — the reason per tool is the comment on the list): `analyze_impact`, `search_graph`, `trace_call_path`, `find_consumers`,
@@ -578,7 +582,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (strings cut at 300, depths clamped 1–5, a snippet path `RepoPath`-normalised). No tool takes a project: the orchestrator always
   sets the PR's repository, the CodeGraph project whose `search_projects` entry's `Repo:` URL is exactly
   `https://github.com/<owner>/<name>` (with or without `.git`, case-insensitive; resolved once per session), and a repository no
-  entry matches answers the error "repository not indexed in CodeGraph"; `read_node_source` (whose CodeGraph handler takes only a
+  entry matches answers the error "repository not indexed in CodeGraph". Queries are asked about this repository; answers are not
+  filtered and may name nodes of other indexed projects that depend on or call it (`analyze_impact`'s cross-repo impact,
+  `trace_call_path`, `find_consumers`/`find_publishers` cross projects), which every graph tool's description says; `read_node_source` (whose CodeGraph handler takes only a
   node id) is shown only when its answer's header names that project. Each answer is labelled with the default-branch commit its
   index describes, read only from CodeGraph's contract (CodeGraph sc-25702): `structuredContent.commitSha`, else a first text line
   `Commit: <40-hex sha>` — otherwise "commit unknown" (today's hosted answers carry neither until sc-25702 deploys) — always "not

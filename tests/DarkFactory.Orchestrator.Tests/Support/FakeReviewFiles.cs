@@ -29,18 +29,20 @@ public sealed class FakeReviewFiles(Dictionary<string, Dictionary<string, string
         return Task.FromResult(commits.GetValueOrDefault(sha)?.GetValueOrDefault(path));
     }
 
-    public Task<IReadOnlyList<string>> ListAsync(RepoRef repo, string sha, string? directory, CancellationToken ct)
+    public Task<Bounded<string>> ListAsync(RepoRef repo, string sha, string? directory, CancellationToken ct)
     {
         Listings.Add((sha, directory));
-        return Task.FromResult<IReadOnlyList<string>>(Under(sha, directory).Select(f => f.Key).ToList());
+        var paths = Under(sha, directory).Select(f => f.Key).ToList();
+        return Task.FromResult(new Bounded<string>(paths.Take(ReviewTools.MaxListedFiles).ToList(), paths.Count > ReviewTools.MaxListedFiles));
     }
 
-    public Task<IReadOnlyList<GrepMatch>> GrepAsync(RepoRef repo, string sha, string pattern, string? directory, int perFile, CancellationToken ct)
+    public Task<Bounded<GrepMatch>> GrepAsync(RepoRef repo, string sha, string pattern, string? directory, int perFile, CancellationToken ct)
     {
         Searches.Add((sha, pattern, directory));
         var regex = new Regex(pattern);
-        return Task.FromResult<IReadOnlyList<GrepMatch>>(Under(sha, directory)
+        var matches = Under(sha, directory)
             .SelectMany(f => f.Value.Split('\n').Select((line, i) => new GrepMatch(f.Key, i + 1, line)).Where(m => regex.IsMatch(m.Text)).Take(perFile))
-            .ToList());
+            .ToList();
+        return Task.FromResult(new Bounded<GrepMatch>(matches.Take(ReviewTools.MaxGrepMatches).ToList(), matches.Count > ReviewTools.MaxGrepMatches));
     }
 }

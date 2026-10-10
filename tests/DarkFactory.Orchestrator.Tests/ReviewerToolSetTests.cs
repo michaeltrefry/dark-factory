@@ -244,6 +244,27 @@ public class ReviewerToolSetTests
     }
 
     [Fact]
+    public async Task A_graph_answer_naming_another_projects_node_is_passed_through_and_the_tools_say_answers_may()
+    {
+        const string crossProject = "- **Billing.Charge** — payments-service (CALLS, risk: high)";
+        var router = Router(SseAnswers.ToolTurn(("toolu_1", "analyze_impact", "{\"name\": \"X.Count\"}")), SseAnswers.Answer(CleanFindings));
+        var codeGraph = CodeGraphServer(_ => Text($"Commit: {IndexCommit}\n## Cross-Repo Impact\n{crossProject}\n"));
+
+        var review = await Reviewer(router, codeGraph: Client(codeGraph)).ReviewAsync(Request(), CancellationToken.None);
+
+        Assert.True(review.Clean, review.Error);
+        var (content, error) = Assert.Single(Results(router, 1));
+        Assert.False(error, content);
+        Assert.Contains(crossProject, content);
+        // Queries are pinned to the PR's repository, answers are not filtered: the graph tools say so.
+        var offered = Body(router.Requests[0]).GetProperty("tools").EnumerateArray()
+            .ToDictionary(t => t.GetProperty("name").GetString()!, t => t.GetProperty("description").GetString()!);
+        Assert.All(ReviewTools.CodeGraphTools, tool => Assert.Contains(
+            "Queries are asked about this repository; answers may name nodes of other indexed projects that depend on or call it.", offered[tool]));
+        Assert.All(offered.Values, d => Assert.DoesNotContain("always answers about this repository", d));
+    }
+
+    [Fact]
     public async Task Read_node_source_shows_only_a_node_of_the_pr_repositorys_project()
     {
         var router = Router(SseAnswers.ToolTurn(("toolu_1", "read_node_source", "{\"nodeId\": 7}"), ("toolu_2", "read_node_source", "{\"nodeId\": 8}"),
@@ -325,11 +346,11 @@ public class ReviewerToolSetTests
 
         var results = Results(router, 1);
         var listing = results[0].Content.Split('\n');
-        Assert.Equal($"{many.Count} files under the repository root at {Head} (the first {ReviewTools.MaxListedFiles} shown):", listing[0]);
+        Assert.Equal($"More than {ReviewTools.MaxListedFiles} files under the repository root at {Head} (the first {ReviewTools.MaxListedFiles} shown):", listing[0]);
         Assert.Equal(ReviewTools.MaxListedFiles, listing.Length - 1);
         Assert.Equal($"f/long.txt:1: {longLine[..ReviewTools.MaxGrepLineChars]}", results[1].Content.Split('\n')[1]);
         var grep = results[2].Content.Split('\n');
-        Assert.Equal($"{ReviewTools.MaxListedFiles + 5} matching lines under the repository root at {Head} (at most {ReviewTools.MaxGrepPerFile} per file; "
+        Assert.Equal($"More than {ReviewTools.MaxGrepMatches} matching lines under the repository root at {Head} (at most {ReviewTools.MaxGrepPerFile} per file; "
             + $"the first {ReviewTools.MaxGrepMatches} shown):", grep[0]);
         Assert.Equal(ReviewTools.MaxGrepMatches, grep.Length - 1);
     }
