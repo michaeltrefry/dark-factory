@@ -433,7 +433,7 @@ public class MergeQueueTests
         /// <summary>A pipeline as one process would build it: its own ledger context over the shared ledger.</summary>
         public RunPipeline Pipeline() =>
             new(Stories, new WorkLedger(new LedgerDbContext(_options), TimeProvider.System), Locks, Repo, Worker, Repo, Sandbox, Log,
-                controls: Controls, gate: new GateStage(Repo, Reviewer, CiPoll, TimeSpan.FromSeconds(30)));
+                controls: Controls, gate: new GateStage(Repo, Reviewer, CiPoll, TimeSpan.FromSeconds(30), Risk: FakeCodeGraphRisk.Reader()));
 
         public Task<RunOutcome> Run(int story, CancellationToken ct = default) => Pipeline().RunAsync(story, ct);
 

@@ -14,7 +14,8 @@ namespace DarkFactory.Orchestrator;
 /// panel's calls (through the router, on the high model class), how long and how often CI is waited for, and the sandboxed
 /// test runs of the <c>new-tests-fail-on-base</c> check (<see cref="Tests"/>; none: the check cannot run, so it fails
 /// wherever it is required), and the wait for CodeGraph's overlay of the head at the start of a review (<see cref="Overlays"/>,
-/// sc-25708; none: no overlay is asked for and reviewers' CodeGraph calls read the default-branch index).
+/// sc-25708; none: no overlay is asked for and reviewers' CodeGraph calls read the default-branch index), and CodeGraph's inputs to
+/// <c>risk-threshold</c> (<see cref="Risk"/>, sc-25709; none: no CodeGraph is configured, so the check fails wherever it is required).
 /// </summary>
 public sealed record GateStage(
     IGateGitHub GitHub,
@@ -23,7 +24,8 @@ public sealed record GateStage(
     TimeSpan CiTimeout,
     TimeProvider? Time = null,
     IGateTestRunner? Tests = null,
-    ReviewOverlays? Overlays = null)
+    ReviewOverlays? Overlays = null,
+    CodeGraphRiskReader? Risk = null)
 {
     public static readonly TimeSpan DefaultCiPollInterval = TimeSpan.FromSeconds(30);
     public static readonly TimeSpan DefaultCiTimeout = TimeSpan.FromMinutes(30);
@@ -499,20 +501,67 @@ public sealed partial class RunPipeline
         {
             return null;
         }
+        var overlay = await HeadOverlayAsync(run, pull, overlays, "review", ct);
+        log.WriteLine(overlay.IsReady ? "[review] CodeGraph answers about the head"
+            : "[review] CodeGraph answers from the default branch, labelled as not the PR head");
+        return overlay;
+    }
+
+    /// <summary>
+    /// CodeGraph's overlay of the PR head (sc-25708): a ready one recorded for this head (a resumed review, or the review before the
+    /// merge gate) is reused; otherwise it is requested and waited for through <paramref name="overlays"/> and the outcome checkpointed
+    /// (<see cref="Steps.CodeGraphOverlay"/>).
+    /// </summary>
+    private async Task<CodeGraphOverlay> HeadOverlayAsync(Run run, PullFacts pull, ReviewOverlays overlays, string tag, CancellationToken ct)
+    {
         await ThrowIfControlledAsync(run.Item, ct);
-        if ((await ledger.HistoryAsync(run.Item, ct)).LastOrDefault(e => e.Step == Steps.CodeGraphOverlay
-                && CodeGraphOverlay.FromDetail(e.Detail)?.HeadSha == pull.HeadSha) is { } row
-            && CodeGraphOverlay.FromDetail(row.Detail) is { IsReady: true } recorded)
+        var row = (await ledger.HistoryAsync(run.Item, ct)).LastOrDefault(e => e.Step == Steps.CodeGraphOverlay
+            && CodeGraphOverlay.FromDetail(e.Detail)?.HeadSha == pull.HeadSha);
+        if (CodeGraphOverlay.FromDetail(row?.Detail) is { IsReady: true } recorded)
         {
-            // A resumed review (crash, Ctrl-C, a pause) of the same head: the overlay was ready, so it is not waited for again.
-            log.WriteLine($"[review] CodeGraph overlay of {Ci.Short(pull.HeadSha)}: {recorded.Describe} (recorded); CodeGraph answers about the head");
+            // The overlay of this head was ready, so it is not waited for again.
+            log.WriteLine($"[{tag}] CodeGraph overlay of {Ci.Short(pull.HeadSha)}: {recorded.Describe} (recorded)");
             return recorded;
         }
         var overlay = await overlays.WaitAsync(run.Repo, pull.HeadSha, c => ThrowIfControlledAsync(run.Item, c), GateTime, ct);
-        await ledger.CheckpointAsync(run.Item, Steps.CodeGraphOverlay, null, overlay.ToDetail(), ct);
-        log.WriteLine($"[review] CodeGraph overlay of {Ci.Short(pull.HeadSha)}: {overlay.Describe}"
-            + (overlay.IsReady ? "; CodeGraph answers about the head" : "; CodeGraph answers from the default branch, labelled as not the PR head"));
+        // The gate's pending wait asks again every poll: an outcome the last row for this head already records is not written again.
+        if (row?.Detail != overlay.ToDetail())
+        {
+            await ledger.CheckpointAsync(run.Item, Steps.CodeGraphOverlay, null, overlay.ToDetail(), ct);
+        }
+        log.WriteLine($"[{tag}] CodeGraph overlay of {Ci.Short(pull.HeadSha)}: {overlay.Describe}");
         return overlay;
+    }
+
+    /// <summary>
+    /// CodeGraph's inputs to <c>risk-threshold</c> for the PR head (sc-25709), when the change's tiers require the check (null otherwise,
+    /// and when the policy or diff is unreadable or the head has no verdict yet: the gate blocks or reviews first, reading nothing; and
+    /// when no CodeGraph is configured, which fails the check). The blast radius needs CodeGraph's overlay of exactly the head
+    /// (<see cref="HeadOverlayAsync"/>: a ready one recorded for it is reused); the hotspots are read from the default branch.
+    /// </summary>
+    private async Task<CodeGraphRisk?> CodeGraphRiskAsync(Run run, PullFacts pull, List<LedgerEntry> history, string? policyText, string? diff,
+        CancellationToken ct)
+    {
+        if (policyText is null || diff is null || Gate.Risk is not { } reader || !Verdicts(history).Any(v => v.HeadSha == pull.HeadSha))
+        {
+            return null;
+        }
+        try
+        {
+            if (!GatePolicy.Parse(policyText).Classify(diff).Requires(GateChecks.RiskThreshold))
+            {
+                return null;
+            }
+        }
+        catch (GatePolicyException)
+        {
+            return null;
+        }
+        var overlay = await HeadOverlayAsync(run, pull, reader.Overlays, "gate", ct);
+        await ThrowIfControlledAsync(run.Item, ct);
+        var risk = await reader.ReadAsync(run.Repo, pull.HeadSha, overlay, MergeGate.TouchedFiles(diff), ct);
+        log.WriteLine($"[gate] {risk.Describe()}");
+        return risk;
     }
 
     /// <summary>

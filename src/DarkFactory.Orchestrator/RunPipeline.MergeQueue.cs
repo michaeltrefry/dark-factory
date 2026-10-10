@@ -390,26 +390,50 @@ public sealed partial class RunPipeline
 
     /// <summary>
     /// One evaluation of the gate on <paramref name="pull"/> (facts read now, E1), checkpointed. Merge → the decision. A head
-    /// with no verdict → Review (null). Anything else → escalate.
+    /// with no verdict → Review (null). Pending (only CodeGraph's inputs to <c>risk-threshold</c> could not be read, sc-25709) →
+    /// every fact is read again after <c>Gate:CiPollSeconds</c> (controls checked between reads), like pending CI, and still pending
+    /// after <c>Gate:CiTimeoutMinutes</c> it is blocked. Anything else → escalate.
     /// </summary>
     private async Task<GateDecision?> EvaluateGateAsync(Run run, PullFacts pull, CancellationToken ct)
     {
-        var history = await ledger.HistoryAsync(run.Item, ct);
-        var (policy, policyError) = await ReadPolicyAsync(run, pull, ct);
-        string? diff = null, diffError = null;
-        try
+        var deadline = GateTime.GetUtcNow() + Gate.CiTimeout;
+        GateDecision decision;
+        while (true)
         {
-            diff = await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
+            var history = await ledger.HistoryAsync(run.Item, ct);
+            var (policy, policyError) = await ReadPolicyAsync(run, pull, ct);
+            string? diff = null, diffError = null;
+            try
+            {
+                diff = await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or HttpRequestException)
+            {
+                diffError = ex.Message;
+            }
+            var fixRounds = TransitionContext.From(history.Where(e => e.Step is null).Select(e => e.State).ToList()).FixRounds;
+            var ci = await Gate.GitHub.GetCiAsync(run.Repo, pull.HeadSha, ct);
+            var newTests = await NewTestsAsync(run, pull, history, policy, diff, ct);
+            var risk = await CodeGraphRiskAsync(run, pull, history, policy, diff, ct);
+            decision = MergeGate.Evaluate(policy, policyError, pull, new ChangeFacts(diff, diffError, fixRounds), ci, Verdicts(history),
+                newTests, risk);
+            if (decision.Outcome != GateOutcome.Pending)
+            {
+                break;
+            }
+            if (GateTime.GetUtcNow() >= deadline)
+            {
+                decision = decision with
+                {
+                    Outcome = GateOutcome.Blocked,
+                    Reasons = [.. decision.Reasons, $"risk threshold: CodeGraph could still not be read after {Gate.CiTimeout} (Gate:CiTimeoutMinutes)"],
+                };
+                break;
+            }
+            log.WriteLine($"[gate] {decision.Detail}; reading again in {Gate.CiPollInterval}");
+            await Task.Delay(Gate.CiPollInterval, GateTime, ct);
+            await ThrowIfControlledAsync(run.Item, ct);
         }
-        catch (Exception ex) when (ex is InvalidOperationException or HttpRequestException)
-        {
-            diffError = ex.Message;
-        }
-        var fixRounds = TransitionContext.From(history.Where(e => e.Step is null).Select(e => e.State).ToList()).FixRounds;
-        var ci = await Gate.GitHub.GetCiAsync(run.Repo, pull.HeadSha, ct);
-        var newTests = await NewTestsAsync(run, pull, history, policy, diff, ct);
-        var decision = MergeGate.Evaluate(policy, policyError, pull, new ChangeFacts(diff, diffError, fixRounds), ci, Verdicts(history),
-            newTests);
         await ledger.CheckpointAsync(run.Item, Steps.GateDecision, null, decision.Detail, ct);
         log.WriteLine($"[gate] {decision.Detail}");
         switch (decision.Outcome)

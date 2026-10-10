@@ -18,6 +18,12 @@ internal static class GateCheckSeam
     /// <summary>The code floor of paths that call the security review in (<see cref="RiskyPaths"/>), whatever their tier.</summary>
     internal const string FloorSecurityReviewPaths = "policy-floor:security-review-paths";
 
+    /// <summary>
+    /// The code floor of <c>risk-threshold</c>'s CodeGraph blast radius (<see cref="GatePolicy.BlastRadiusFloor"/>, sc-25709): a critical
+    /// file fails whatever the policy says, and a version 3 <c>max_blast_radius</c> looser than the floor is refused.
+    /// </summary>
+    internal const string FloorBlastRadius = "policy-floor:blast-radius";
+
     /// <summary><see cref="MergeGate"/> blocks when the base's policy is unreadable, missing or invalid.</summary>
     internal const string PreconditionPolicy = "precondition:policy";
 

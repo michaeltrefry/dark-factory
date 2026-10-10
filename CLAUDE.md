@@ -115,7 +115,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Router:Key` | env `FACTORY_ROUTER_KEY`, or keychain account `router-key` |
 | `CodeGraph:BaseUrl` | the hosted CodeGraph (`OutboundHttp.CodeGraphDefaultBase`; an absolute http(s) URL naming no model provider): reviewers' CodeGraph tools (`ReviewTools.CodeGraphTools`) go to its `mcp` endpoint |
 | `CodeGraph:OverlayTimeoutMinutes` | `10` (> 0: how long a review waits, before its first panel call, for CodeGraph's overlay of the PR head; not ready by then, reviewers' CodeGraph calls read the default-branch index, labelled not the PR head; sc-25708) |
-| `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional: without it the factory starts and every CodeGraph tool answers the reviewer an error result (recorded), and triage gets no CodeGraph |
+| `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional: without it the factory starts and every CodeGraph tool answers the reviewer an error result (recorded), triage gets no CodeGraph, and the merge gate's `risk-threshold` fails wherever a tier requires it (sc-25709), so no normal or protected change merges |
 | `Kanban:McpUrl` | `https://kanban-mcp.trefry.net/mcp` (`OutboundHttp.KanbanDefaultMcpUrl`; an absolute http(s) URL naming no model provider; MCP Streamable HTTP): the Kanban upstream (sc-25707), offered to reviewers through their tool loop (and kept for Phase 4's planner, `McpProfile.Planner`); never to triage sessions, whose proxy is started without it (`McpProfile.Triage`: the issue text is untrusted and the triage's answer is posted on the issue) |
 | `Kanban:Token` | env `FACTORY_KANBAN_TOKEN`, or keychain account `kanban-token`: a KanbanBoard PAT (`Authorization: Bearer`), owner-side only (E5). Optional: without it there is no Kanban upstream (not an error) |
 | `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
@@ -752,9 +752,13 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   of a non-Actions App with no check runs is ignored (GitHub creates one per App with checks access; the Claude App's stays
   queued forever). A workflow GitHub has not registered at all yet is still invisible. MergeGate (`MergeGate.Evaluate`, E1–E3) is deterministic code over
   facts read fresh each time: `factory/gate.yaml` at the PR's **base** commit (`pull.BaseSha`, the commit the diff is read
-  against; `GatePolicy`, `version: 2`, sc-25381: path tiers `sealed`/`protected`/`free` with `paths` and `checks`, `normal`
-  with `checks` only, and `risk: {max_changed_lines, max_changed_files, max_fix_rounds}`; every key required; version 1 is
-  rejected; missing/invalid/unreadable → no merge, escalate; no bypass key exists). The policy can tighten the gate but not
+  against; `GatePolicy`, `version: 2` or `3`, sc-25381: path tiers `sealed`/`protected`/`free` with `paths` and `checks`, `normal`
+  with `checks` only, and `risk: {max_changed_lines, max_changed_files, max_fix_rounds}` — version 3 (sc-25709) adds two required
+  risk keys, `max_blast_radius` (`low`|`medium`|`high`: a maximum, a file over it fails; `critical` would allow a critical file, is
+  looser than the code floor and invalid) and `max_hotspot` (`off`, or a number ≥ 0: the opt-in limit on the hotspot score; `off`
+  is the explicit opt-out, chosen over an optional key so every key stays required); each version's key set is strict, so a CodeGraph
+  key in a version 2 policy is unknown; version 2 still parses and runs at the floor with no hotspot limit; every key required;
+  version 1 is rejected; missing/invalid/unreadable → no merge, escalate; no bypass key exists). The policy can tighten the gate but not
   loosen it below floors in code (E2; described once on `GatePolicy`): checks — every tier lists `ci-green` and
   `review-pass`, sealed/protected also `security-review`, protected/normal also `risk-threshold` and
   `new-tests-fail-on-base` (`GatePolicy.FloorChecks`);
@@ -773,8 +777,30 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   needs the union of its tiers' checks: `ci-green`, `review-pass` (the head's verdict passes, holds every required role, and
   every review and second opinion was served on the router's `high` model class — its recorded `class`, a missing one
   failing closed — `ReviewModels.Problems`; which model served, and the implementer's models, are not consulted), `security-review` (the verdict has the
-  security review), `risk-threshold` (changed lines, files — renames count both paths — and fix rounds within `risk`),
-  `new-tests-fail-on-base` (sc-25382, below). A sealed path always escalates (even with no verdict); a protected one escalates after its checks instead of merging; each
+  security review), `risk-threshold` (changed lines, files — renames count both paths — and fix rounds within `risk`, and
+  CodeGraph's inputs, below), `new-tests-fail-on-base` (sc-25382, below). Risk score (sc-25709, `Gate/CodeGraphRisk.cs`; CodeGraph
+  C7, sc-25735, not deployed yet — the fakes follow its contract and C4's `CommitAnswer` shape, PR #71): when the change's tiers
+  require `risk-threshold` and the head has a verdict, the pipeline (`RunPipeline.CodeGraphRiskAsync`) reads, owner-side through
+  the CodeGraph client (`CodeGraphRiskReader` over `ICodeGraphRisk`, the project pinned by exact repo URL), for every touched file
+  (`MergeGate.TouchedFiles`: both sides of a rename, deletes) `analyze_impact_file(repo, path, sha = head, depth = 3)` — only once
+  CodeGraph's overlay of exactly the head is ready (a ready `codegraph-overlay` checkpoint for that head, e.g. the review's, is
+  reused; otherwise requested and waited for like the review's and checkpointed, an outcome the last row for that head already
+  records not written again) and only an answer naming the head (E3) — and
+  `file_hotspot(repo, path)` from the default branch only (`source: default-branch`), recorded with the commit it names (E3's
+  exception). "The hotspot score" is CodeGraph's `riskScore`. The blast radius has a code floor (`GatePolicy.BlastRadiusFloor` =
+  high: a critical file always fails; seam `policy-floor:blast-radius`), `max_blast_radius` can only lower it; hotspots have no
+  floor — recorded and reported, failing only above an opted-in `max_hotspot`. A file CodeGraph has no data for (`found: false`,
+  e.g. a new file) counts as blast radius none / hotspot 0; one it cannot read (an error answer, HTTP 403 `tool_not_entitled`,
+  unreachable, the repo not indexed, a C4 `notIndexed` answer, no ready overlay of the head, an answer for another commit or
+  without a commit) makes the decision `Pending` when nothing else blocks (owner decision 2026-10-10): `EvaluateGateAsync` reads
+  every fact again every `Gate:CiPollSeconds` like pending CI (controls checked between reads; pending evaluations are not
+  checkpointed) and after `Gate:CiTimeoutMinutes` records it Blocked and escalates. No CodeGraph configured (no token: `GateStage.Risk`
+  null) fails the check at once, wherever it is required — so a factory without a CodeGraph token merges no normal or protected
+  change. Inputs read for another head or leaving a touched file out block. Every input — each file's blast radius at the head,
+  each hotspot score with its commit, what could not be read — is in the `gate` checkpoint's Detail after ` | `, and a failure's
+  reason names each file over the limit with its blast radius (or hotspot score), so the escalation comment and the PR report (both
+  from the ledger) name it. `analyze_impact_file`/`file_hotspot` (`CodeGraphMcpClient.RiskTools`) are sent straight through the MCP
+  client and are on no allowlist, profile or tool list (a test asserts it). A sealed path always escalates (even with no verdict); a protected one escalates after its checks instead of merging; each
   evaluation is a `gate` checkpoint. A head without a verdict (a push after the review) goes back
   to Review (CI/MergeGate → Review are table rows); otherwise any failed rule escalates. A pass checkpoints `gate-passed`
   with the head SHA and merges with the gate App's write token and `sha` = that head (GitHub refuses a moved head: 409 →

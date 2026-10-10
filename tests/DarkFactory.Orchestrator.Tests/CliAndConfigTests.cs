@@ -477,6 +477,12 @@ public class FactoryOptionsTests
         Assert.Equal(ReviewOverlays.DefaultTimeout, FactoryRunner.CreateGate(Options([]), new GatePipelineTests.FakeGateGitHub(),
             new GatePipelineTests.FakeReviewer(), workspaces, sandbox: null).Overlays!.Timeout);
         Assert.Equal(TimeSpan.FromMinutes(11), reviewer.Timeout);
+        // sc-25709: risk-threshold reads CodeGraph through the same client, its overlay wait on the same timeout; no client, no reader.
+        Assert.Null(gate.Risk);
+        using var codeGraphHttp = new HttpClient();
+        var withCodeGraph = FactoryRunner.CreateGate(options, new GatePipelineTests.FakeGateGitHub(), new GatePipelineTests.FakeReviewer(),
+            workspaces, sandbox: null, new CodeGraph.CodeGraphMcpClient(codeGraphHttp, "cg_test_token"));
+        Assert.Equal(TimeSpan.FromMinutes(12), withCodeGraph.Risk!.Overlays.Timeout);
     }
 
     [Fact]

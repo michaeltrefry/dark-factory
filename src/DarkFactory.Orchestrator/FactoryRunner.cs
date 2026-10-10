@@ -309,12 +309,14 @@ public static class FactoryRunner
     /// The merge gate as configured: CI on the PR's head polled every <c>Gate:CiPollSeconds</c> until <c>Gate:CiTimeoutMinutes</c>,
     /// the new tests run sandboxed for up to <c>Gate:TestTimeoutMinutes</c> each, and each review waits up to
     /// <c>CodeGraph:OverlayTimeoutMinutes</c> for CodeGraph's overlay of the head (sc-25708; without a CodeGraph token the wait ends at
-    /// once, recorded as unavailable).
+    /// once, recorded as unavailable), and <c>risk-threshold</c> reads CodeGraph's blast radius and hotspots through the same client
+    /// (sc-25709; without a CodeGraph token there is none, and the check fails wherever a tier requires it).
     /// </summary>
     internal static GateStage CreateGate(FactoryOptions options, IGateGitHub github, IReviewer reviewer, GitWorkspace workspaces,
         WorkerSandbox? sandbox, ICodeGraphOverlays? codeGraph = null) =>
         new(github, reviewer, options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, sandbox, options.TestTimeout),
-            Overlays: new ReviewOverlays(codeGraph, options.CodeGraphOverlayTimeout));
+            Overlays: new ReviewOverlays(codeGraph, options.CodeGraphOverlayTimeout),
+            Risk: codeGraph is ICodeGraphRisk risk ? new CodeGraphRiskReader(risk, options.CodeGraphOverlayTimeout) : null);
 
     /// <summary>The sandbox readiness probe, a factory-wide failure (E10): a stale helper fails the factory once, not every item.</summary>
     internal static Task EnsureSandboxReadyAsync(WorkerSandbox sandbox, WorkerAuth auth, string claudePath, CancellationToken ct) =>

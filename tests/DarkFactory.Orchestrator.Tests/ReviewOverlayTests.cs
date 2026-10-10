@@ -501,7 +501,8 @@ public class ReviewOverlayTests
         Assert.Contains("CodeGraph overlay of the head `timed-out`", LedgerReport.Facts(await h.Rows(), []));
         Assert.Contains("answers from the default branch", LedgerReport.Facts(await h.Rows(), []));
         // The wait's outcome is checkpointed (typed: anything but ready is failed — the overlay's, not the review's).
-        var row = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.CodeGraphOverlay);
+        // The review's row (the gate then asks for its own overlay of the head, sc-25709).
+        var row = (await h.Rows()).First(r => r.Step == RunPipeline.Steps.CodeGraphOverlay);
         Assert.Equal((CodeGraphOverlay.TimedOut, StepOutcome.Failed), (CodeGraphOverlay.FromDetail(row.Detail)!.Outcome, row.Outcome));
     }
 
@@ -559,7 +560,8 @@ public class ReviewOverlayTests
 
         Assert.Equal(WorkState.Paused, (await h.Run()).State);
         Assert.Empty(h.Reviewer.Requests);
-        var row = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.CodeGraphOverlay);
+        // The review's row (the gate then asks for its own overlay of the head, sc-25709).
+        var row = (await h.Rows()).First(r => r.Step == RunPipeline.Steps.CodeGraphOverlay);
         Assert.Equal(StepOutcome.Passed, row.Outcome);
 
         await h.Controls.SetAsync(ControlScope.Item("sc-77"), ControlState.Running, "tester", CancellationToken.None);

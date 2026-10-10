@@ -71,7 +71,8 @@ public class MergeGateTests
         ReviewVerdict[]? verdicts = null, ChangeFacts? change = null, bool noPolicy = false) =>
         MergeGate.Evaluate(noPolicy ? null : policy ?? Policy, policyError, TestPolicies.Counting(pull ?? Pull, change ?? Normal), change ?? Normal,
             ci ?? Green, verdicts ?? [Pass],
-            new NewTestsResult("base", (pull ?? Pull).HeadSha, NewTestsOutcome.Pass, "1 new test(s) fail on the base and pass on the head: X.New", "dotnet-xunit", "ran", "ran", []));
+            new NewTestsResult("base", (pull ?? Pull).HeadSha, NewTestsOutcome.Pass, "1 new test(s) fail on the base and pass on the head: X.New", "dotnet-xunit", "ran", "ran", []),
+            TestRisk.None((pull ?? Pull).HeadSha, (change ?? Normal).Diff));
 
     [Fact]
     public void Merges_when_ci_is_green_and_a_high_class_panel_passed_the_head()
