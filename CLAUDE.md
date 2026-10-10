@@ -21,7 +21,7 @@ Claude Code headless workers through the Weave router.
   check `NewTests.cs` (`NewTestsCheck`)/`XunitNewTests`/`SandboxTestRunner`;
   reviewer prompts in `factory/prompts/`; GitHub side
   `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`, the merge gate and queue `RunPipeline.MergeQueue.cs`),
-  and the outbound gateway (`Gateway/`: `OutboundHttp` builds every GitHub, Shortcut and router `HttpClient` (and the
+  and the outbound gateway (`Gateway/`: `OutboundHttp` builds every GitHub, Shortcut, router and CodeGraph `HttpClient` (and the
   acceptance tests' dashboard client); `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token
   credentials; `GitRemoteReads` the github.com remote URL and every clone/fetch's arguments (sc-25391); `GitHubCli` is the only
   `gh` run).
@@ -36,7 +36,7 @@ Claude Code headless workers through the Weave router.
   add one there only for a local program), outside `Gateway/`; DF0002 a git remote write outside it (text whose subcommand, past git's global
   options like `-C <dir>`/`--git-dir=…`, is `push`/`send-pack`/`http-push`/`remote set-url`, at its start — so a lone `push`
   argument — or after a `git` word); DF0003 a model provider host or key (`api.anthropic.com`, `ANTHROPIC_API_KEY`, …)
-  anywhere, the embedded manifests, prompts, scripts and Razor markup included; DF0004 GitHub's or Shortcut's API host, or a
+  anywhere, the embedded manifests, prompts, scripts and Razor markup included; DF0004 GitHub's or Shortcut's API host or the hosted CodeGraph's, or a
   github.com git remote (a `.git` URL, an `@github.com` user, git's `http.https://github.com/` config), outside it; DF0005 a
   `SuppressMessage`/`UnconditionalSuppressMessage` whose constant check id starts `DF`, anywhere (Roslyn honours those even for
   NotConfigurable rules, so the attribute itself fails the build). Since such an attribute could hide its own DF0005, the
@@ -111,6 +111,8 @@ committed: they come from env/user-secrets or the macOS login keychain
 | --- | --- |
 | `Router:BaseUrl` | `http://localhost:8080` (an absolute http(s) URL; one naming a model provider's host or key — `src/DarkFactory.Analyzers/ProviderMarkers.txt`, the gateway lint's list, embedded in both the analyzer and the orchestrator, `Gateway/ProviderMarkers.cs` — is refused, P1-E1) |
 | `Router:Key` | env `FACTORY_ROUTER_KEY`, or keychain account `router-key` |
+| `CodeGraph:BaseUrl` | the hosted CodeGraph (`OutboundHttp.CodeGraphDefaultBase`; an absolute http(s) URL naming no model provider): reviewers' `analyze_impact` goes to its `mcp` endpoint |
+| `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional: without it the factory starts and `analyze_impact` answers the reviewer an error result (recorded) |
 | `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
 | `GitHub:Gate:AppId`, `GitHub:Gate:PrivateKeyPem` | keychain `github-gate-app-id`, `github-gate-app-private-key` (written by `factory github-app setup --gate`): the merge gate's App, the only credential that merges |
@@ -558,7 +560,27 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `model_class_unavailable` for a body model outside the class and would usage-pause every review in a loop), its own fresh
   `X-Claude-Code-Session-Id` so the cost stays scoped to it and no worker session or transcript reaches it) whose system
   prompt is the role's prompt file and whose message holds the story, the base commit's file list
-  (`IGateGitHub.GetFilesAsync`) and the diff of the PR's head commit — nothing else. Prompts: `factory/prompts/{correctness,spec-conformance,security,confirm}.md` in this repo, compiled in as
+  (`IGateGitHub.GetFilesAsync`) and the diff of the PR's head commit — nothing else. Tool loop (sc-25705, `Gate/ReviewTools.cs`): every
+  panel call offers `read_file` (a repo path at the PR head, read owner-side by the gate's read-only GitHub access,
+  `GitHubGate.ReadFileAsync`; a file with a NUL byte or invalid UTF-8 is binary, "binary file, not shown") and `analyze_impact`
+  (forwarded owner-side to CodeGraph's MCP endpoint, `CodeGraph/CodeGraphMcpClient`, one MCP session per call, ended by a
+  best-effort `DELETE`). The model names only the element and depth, never a project: the orchestrator always asks about the PR's
+  repository, the CodeGraph project whose `search_projects` entry's `Repo:` URL is exactly `https://github.com/<owner>/<name>`
+  (with or without `.git`, case-insensitive; resolved once per session), and a repository no entry matches answers the error
+  "repository not indexed in CodeGraph". Each answer is labelled with the default-branch commit its index describes, read only
+  from CodeGraph's contract (CodeGraph sc-25702): `structuredContent.commitSha`, else a first text line `Commit: <40-hex sha>` —
+  otherwise "commit unknown" (today's hosted answers carry neither until sc-25702 deploys) — always "not the PR head". A turn
+  stopping for `tool_use` has the orchestrator run each call and answer it
+  in a `<tool-result>` fence in the next turn of the same session (same session id, class header, placeholder model), at most
+  `RouterReviewer.MaxTurns` (8) turns and `MaxToolCalls` (24) calls, and the session's tool results together at most
+  `ReviewTools.Budget` characters (`MaxSessionChars` 200,000 less the prompt, at least `MinSessionBudget` 8,000; each result is cut
+  to what is left, a call once it is spent answers an error); every turn must be served on `high` (the first that is not
+  ends the session, unusable), a usage refusal on any turn pauses as below, and a router 400/413 on a later turn (a conversation
+  grown too long) makes the answer unusable rather than failing the run. A tool that cannot answer (no such file, a binary file,
+  a repository CodeGraph does not index, CodeGraph unreachable or unconfigured) gives the model an error result; it never fails
+  the review by itself. Each call is recorded in the
+  verdict's review or second opinion (`tools`: tool, arguments, SHA-256 of the raw result, error, CodeGraph commit) and the
+  report counts them per review. Prompts: `factory/prompts/{correctness,spec-conformance,security,confirm}.md` in this repo, compiled in as
   embedded resources (`ReviewPrompts`) — never read from the target repo or the PR (which could rewrite the prompt it is
   judged by) nor from disk at run time; changing one is a dark-factory PR. Each role answers findings tagged `blocking` or
   `optional` (an unknown severity counts as blocking); each blocking finding goes to a second opinion (its own high-class router session) with `confirm.md`: not confirmed → downgraded to optional (`downgraded: true`), does not

@@ -231,6 +231,11 @@ public sealed class GatewayLintTests
     public async Task The_gateways_service_hosts_outside_it_fail_the_lint()
     {
         Assert.Equal("DF0004", Assert.Single(await Lint(Outside, Wrap("""return "https://api.app.shortcut.com/api/v3/";"""))).Id);
+        // sc-25705: the hosted CodeGraph is the gateway's too (OutboundHttp.CodeGraphApi), in any case.
+        var codeGraph = Assert.Single(await Lint(Outside, Wrap("""return "https://CodeGraph-API.trefry" + ".net/mcp";""")));
+        Assert.Equal("DF0004", codeGraph.Id);
+        Assert.Contains("codegraph-api.trefry.net", codeGraph.GetMessage());
+        Assert.Empty(await Lint(Inside, Wrap("""return "https://codegraph-api.trefry.net/";""")));
         // Links to github.com pages (not the API) are not outbound calls.
         Assert.Empty(await Lint(Outside, Wrap("""return $"https://github.com/{branch}/pull/1";""")));
     }

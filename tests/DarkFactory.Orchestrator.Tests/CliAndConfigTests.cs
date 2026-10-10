@@ -312,6 +312,57 @@ public class FactoryOptionsTests
     }
 
     [Fact]
+    public void CodeGraph_base_url_defaults_to_the_hosted_codegraph_is_read_from_config_and_an_invalid_one_is_refused_at_start_up()
+    {
+        // sc-25705, E7.
+        Assert.Equal(Gateway.OutboundHttp.CodeGraphDefaultBase, Options([]).CodeGraphBaseUrl);
+        Assert.Equal(new Uri("http://127.0.0.1:5005/cg/"), Options(new() { ["CodeGraph:BaseUrl"] = "http://127.0.0.1:5005/cg" }).CodeGraphBaseUrl);
+        foreach (var bad in new[] { "codegraph.local", "ftp://codegraph.local", "https://api.anthropic.com/" })
+        {
+            Assert.Contains("CodeGraph:BaseUrl",
+                Assert.Throws<InvalidOperationException>(() => Options(new() { ["CodeGraph:BaseUrl"] = bad }).ValidateSettings()).Message);
+        }
+    }
+
+    [Fact]
+    public async Task The_codegraph_token_comes_from_config_or_keychain_and_without_one_analyze_impact_answers_an_error()
+    {
+        var secrets = new InMemorySecrets();
+        secrets.Set(SecretAccounts.CodeGraphToken, "cg_keychain");
+        Assert.Equal("cg_config", Options(new() { ["CodeGraph:Token"] = "cg_config" }, secrets).CodeGraphToken);
+        Assert.Equal("cg_keychain", Options([], secrets).CodeGraphToken);
+        Assert.Equal("codegraph-token", SecretAccounts.CodeGraphToken);
+
+        // Missing: start-up is unaffected (ValidateSettings reads no secret); the reviewers' tool answers an error, said once.
+        var none = Options([]);
+        if (Environment.GetEnvironmentVariable("FACTORY_CODEGRAPH_TOKEN") is null)
+        {
+            Assert.False(none.TryGet(o => o.CodeGraphToken, out _));
+            none.ValidateSettings();
+            var log = new StringWriter();
+            using var http = new HttpClient();
+            var tools = FactoryRunner.CreateReviewTools(none, new NoFiles(), http, log);
+            Assert.Contains("no CodeGraph token", log.ToString());
+            var outcome = await tools.RunAsync(new AnswerBlock(AnswerBlock.ToolUse, null, "toolu_1", ReviewTools.AnalyzeImpact, "{\"name\":\"X\"}"),
+                ReviewTools.Session(new Shortcut.RepoRef("o", "r"), "head", 0), CancellationToken.None);
+            Assert.True(outcome.IsError);
+            Assert.Contains("CodeGraph is not configured", outcome.Content);
+        }
+        // With a token, analyze_impact asks CodeGraph with it.
+        var codeGraph = new FakeApi();
+        var configured = FactoryRunner.CreateReviewTools(Options(new() { ["CodeGraph:Token"] = "cg_config" }), new NoFiles(),
+            codeGraph.Client("https://codegraph.test/"), TextWriter.Null);
+        await configured.RunAsync(new AnswerBlock(AnswerBlock.ToolUse, null, "toolu_1", ReviewTools.AnalyzeImpact, "{\"name\":\"X\"}"),
+            ReviewTools.Session(new Shortcut.RepoRef("o", "r"), "head", 0), CancellationToken.None);
+        Assert.Equal("Bearer cg_config", codeGraph.Requests.First().Headers["Authorization"]);
+    }
+
+    private sealed class NoFiles : IReviewFiles
+    {
+        public Task<string?> ReadFileAsync(Shortcut.RepoRef repo, string sha, string path, CancellationToken ct) => Task.FromResult<string?>(null);
+    }
+
+    [Fact]
     public void The_router_cost_settle_delay_defaults_to_five_seconds_and_refuses_a_negative_value()
     {
         Assert.Equal(TimeSpan.FromSeconds(5), Options([]).CostSettleDelay);

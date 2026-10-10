@@ -83,7 +83,8 @@ public sealed record Confirmation(
     [property: JsonPropertyName("class")] string? ServedClass,
     [property: JsonPropertyName("session")] string? Session,
     [property: JsonPropertyName("prompt")] string? Prompt,
-    [property: JsonPropertyName("reason")] string Reason)
+    [property: JsonPropertyName("reason")] string Reason,
+    [property: JsonPropertyName("tools"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<ToolCall>? Tools = null)
 {
     public const string Confirmed = "confirmed";
     public const string NotConfirmed = "not-confirmed";
@@ -93,6 +94,19 @@ public sealed record Confirmation(
     [JsonIgnore]
     public string ServedName => ServedModel ?? "(the router named no served model)";
 }
+
+/// <summary>
+/// One tool call a panel session made (sc-25705, <see cref="ReviewTools"/>), as the verdict records it: the tool, its arguments as
+/// the model sent them (cut at <see cref="ReviewTools.MaxRecordedArguments"/> characters), the SHA-256 of the result the model was
+/// given (before fencing), whether that result was an error, and for a CodeGraph answer the commit it describes
+/// (<see cref="ReviewTools.UnknownCommit"/> when CodeGraph did not say).
+/// </summary>
+public sealed record ToolCall(
+    [property: JsonPropertyName("tool")] string Tool,
+    [property: JsonPropertyName("arguments")] string Arguments,
+    [property: JsonPropertyName("sha256")] string ResultSha256,
+    [property: JsonPropertyName("error")] bool Error = false,
+    [property: JsonPropertyName("commit"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Commit = null);
 
 /// <summary>One finding of a panel role. <see cref="Downgraded"/>: it was blocking, and the second opinion did not confirm it.</summary>
 public sealed record Finding(
@@ -137,7 +151,8 @@ public sealed record RoleReview(
     [property: JsonPropertyName("findings")] IReadOnlyList<Finding> Findings,
     [property: JsonPropertyName("summary")] string Summary,
     [property: JsonPropertyName("error")] string? Error = null,
-    [property: JsonPropertyName("carried")] string? CarriedFrom = null)
+    [property: JsonPropertyName("carried")] string? CarriedFrom = null,
+    [property: JsonPropertyName("tools"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<ToolCall>? Tools = null)
 {
     [JsonIgnore]
     public bool Clean => Error is null;

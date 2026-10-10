@@ -36,6 +36,33 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         }
     }
 
+    /// <summary>
+    /// <c>CodeGraph:BaseUrl</c> (default the hosted CodeGraph, <see cref="Gateway.OutboundHttp.CodeGraphDefaultBase"/>): where reviewers'
+    /// <c>analyze_impact</c> calls go (its <c>mcp</c> endpoint, sc-25705). An absolute http(s) URL naming no model provider, else the
+    /// factory refuses to start.
+    /// </summary>
+    public Uri CodeGraphBaseUrl
+    {
+        get
+        {
+            var text = config["CodeGraph:BaseUrl"];
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return Gateway.OutboundHttp.CodeGraphDefaultBase;
+            }
+            if (!Uri.TryCreate(text.Trim(), UriKind.Absolute, out var url) || url.Scheme is not ("http" or "https"))
+            {
+                throw new InvalidOperationException($"CodeGraph:BaseUrl must be an absolute http(s) URL, not '{text}'.");
+            }
+            if (Gateway.ProviderMarkers.In(text) is { } provider)
+            {
+                throw new InvalidOperationException($"CodeGraph:BaseUrl names a model provider ('{provider}'); it must be CodeGraph's address.");
+            }
+            // The MCP endpoint is resolved relative to it, so the base keeps a trailing slash.
+            return url.AbsolutePath.EndsWith('/') ? url : new Uri(url + "/");
+        }
+    }
+
     /// <summary><c>Factory:DefaultRepo</c> (default the sandbox repo): an <c>owner/name</c>, else the factory refuses to start.</summary>
     public RepoRef DefaultRepo
     {
@@ -241,6 +268,14 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
 
     public string RouterKey => Secret("Router:Key", "FACTORY_ROUTER_KEY", SecretAccounts.RouterKey, "router key");
 
+    /// <summary>
+    /// The CodeGraph token (<c>CodeGraph:Token</c>, env <c>FACTORY_CODEGRAPH_TOKEN</c>, or keychain account <c>codegraph-token</c>):
+    /// owner-side only, sent by the reviewers' CodeGraph client and nowhere else (E5). Optional: without it the factory starts and
+    /// reviewers' <c>analyze_impact</c> answers an error result (recorded in the verdict) instead of asking CodeGraph.
+    /// </summary>
+    public string CodeGraphToken =>
+        Secret("CodeGraph:Token", "FACTORY_CODEGRAPH_TOKEN", SecretAccounts.CodeGraphToken, "CodeGraph token");
+
     public string ShortcutApiToken =>
         Secret("Shortcut:ApiToken", "SHORTCUT_API_TOKEN", SecretAccounts.ShortcutApiToken, "Shortcut API token");
 
@@ -311,7 +346,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     {
         _ = (RouterBaseUrl, DefaultRepo, WorkerSandbox, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures);
         _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
-        _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout);
+        _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl);
     }
 
     public bool TryGet(Func<FactoryOptions, string> secret, out string? value)

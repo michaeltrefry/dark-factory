@@ -503,7 +503,7 @@ public class RouterReviewerTests
 
         var answer = await MessageStream.ReadAsync(new MemoryStream(System.Text.Encoding.UTF8.GetBytes(events)), TimeSpan.FromSeconds(5), CancellationToken.None);
 
-        Assert.Equal(new StreamedAnswer("claude-opus-5-5-20261001", "end_turn", "Looked at the diff.\n" + CleanFindings + "\n"), answer);
+        Assert.Equal(("claude-opus-5-5-20261001", "end_turn", "Looked at the diff.\n" + CleanFindings + "\n"), (answer.Served, answer.StopReason, answer.Text));
         var review = await new RouterReviewer(Router(events).Client("http://router.test/"), "rk").ReviewAsync(Request, CancellationToken.None);
         Assert.True(review.Clean, review.Error);
         Assert.Equal(("claude-opus-5-5-20261001", "high"), (review.ServedModel, review.ServedClass));
@@ -665,7 +665,7 @@ public class RouterReviewerTests
         var answer = await MessageStream.ReadAsync(await SseAnswers.Streamed(reader).Content.ReadAsStreamAsync(TestContext.Current.CancellationToken),
             TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
 
-        Assert.Equal(new StreamedAnswer("claude-opus-5-5", "end_turn", "Checked ✓ ok.\n" + CleanFindings + "\n"), answer);
+        Assert.Equal(("claude-opus-5-5", "end_turn", "Checked ✓ ok.\n" + CleanFindings + "\n"), (answer.Served, answer.StopReason, answer.Text));
         Assert.True(started.Elapsed > TimeSpan.FromSeconds(3), $"{started.Elapsed}");
         await writer;
 
@@ -930,6 +930,48 @@ public class GitHubGateTests
         Assert.Equal("version: 1\n", await gate.GetPolicyAsync(Sandbox, "main", CancellationToken.None));
         Assert.Null(await gate.GetPolicyAsync(Sandbox, "other", CancellationToken.None));
         Assert.Contains("raw", api.Requests.First(r => r.PathAndQuery.Contains("gate.yaml")).Headers["Accept"]);
+    }
+
+    [Fact]
+    public async Task A_reviewers_file_is_read_at_the_head_commit_with_a_read_only_token_and_a_missing_one_or_a_directory_is_null()
+    {
+        // sc-25705: read_file is answered from the PR head through the gate's read-only access.
+        var source = "namespace X;\npublic class Y { } // ü\n";
+        var (gate, api) = Gate(a => a
+            .On($"GET {Repo}/contents/src/My%20Dir/X.cs", r => r.PathAndQuery.EndsWith($"?ref={Head}")
+                ? FakeApi.Json(HttpStatusCode.OK, JsonSerializer.Serialize(new
+                {
+                    type = "file", encoding = "base64",
+                    content = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(source)).Insert(8, "\n"),
+                }))
+                : new HttpResponseMessage(HttpStatusCode.NotFound))
+            .On($"GET {Repo}/contents/src", HttpStatusCode.OK, """[{"type":"file","name":"X.cs"}]""")
+            .On($"GET {Repo}/contents/big.bin", HttpStatusCode.OK, """{"type":"file","encoding":"none","content":""}"""));
+
+        Assert.Equal(source, await gate.ReadFileAsync(Sandbox, Head, "src/My Dir/X.cs", CancellationToken.None));
+        Assert.Null(await gate.ReadFileAsync(Sandbox, "b0", "src/My Dir/X.cs", CancellationToken.None));
+        Assert.Null(await gate.ReadFileAsync(Sandbox, Head, "src", CancellationToken.None));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => gate.ReadFileAsync(Sandbox, Head, "big.bin", CancellationToken.None));
+        Assert.All(TokenPermissions(api), p => Assert.All(p.EnumerateObject(), v => Assert.Equal("read", v.Value.GetString())));
+    }
+
+    [Theory]
+    [InlineData(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A })] // a PNG header: not valid UTF-8
+    [InlineData(new byte[] { 0x61, 0x62, 0x00, 0x63 })] // valid UTF-8, but a NUL byte
+    public async Task A_reviewers_read_of_a_binary_file_is_refused_not_decoded_leniently(byte[] bytes)
+    {
+        var (gate, _) = Gate(a => a.On($"GET {Repo}/contents/logo.png", HttpStatusCode.OK,
+            JsonSerializer.Serialize(new { type = "file", encoding = "base64", content = Convert.ToBase64String(bytes) })));
+
+        await Assert.ThrowsAsync<BinaryFileException>(() => gate.ReadFileAsync(Sandbox, Head, "logo.png", CancellationToken.None));
+
+        // The reviewer's read_file answers an error result naming it binary, and records the call as an error.
+        var outcome = await new ReviewTools(gate, null).RunAsync(
+            new AnswerBlock(AnswerBlock.ToolUse, null, "toolu_1", ReviewTools.ReadFile, "{\"path\":\"logo.png\"}"),
+            ReviewTools.Session(Sandbox, Head, 0), CancellationToken.None);
+        Assert.True(outcome.IsError);
+        Assert.Equal($"logo.png at {Head}: {ReviewTools.BinaryNotShown}.", outcome.Content);
+        Assert.True(outcome.Record.Error);
     }
 
     [Fact]
