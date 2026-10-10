@@ -31,7 +31,7 @@ namespace DarkFactory.Analyzers;
 /// argument in an argument array, collection or <c>ArgumentList.Add</c>) or after a <c>git</c> word (a command line);</item>
 /// <item>DF0003: a model provider's host or key variable anywhere, the gateway and the additional files (embedded manifests,
 /// prompts, scripts, Razor markup) included: model calls go to the router only;</item>
-/// <item>DF0004: a service host the gateway owns (GitHub's or Shortcut's API) named outside the gateway, or a git remote on
+/// <item>DF0004: a service host the gateway owns (GitHub's or Shortcut's API, the hosted CodeGraph) named outside the gateway, or a git remote on
 /// github.com (<c>https://github.com/o/r.git</c>, <c>git@github.com:</c>, git's <c>http.https://github.com/</c> credential
 /// config): every clone, fetch and push of GitHub, and its installation-token credentials, are the gateway's;</item>
 /// <item>DF0005: a <c>SuppressMessage</c> or <c>UnconditionalSuppressMessage</c> attribute whose check id names a gateway rule
@@ -160,7 +160,8 @@ public sealed class GatewayAnalyzer : DiagnosticAnalyzer
     }
 
     /// <summary>Hosts only the gateway names (matched case-insensitively).</summary>
-    public static readonly ImmutableArray<string> ServiceHosts = ImmutableArray.Create("api.github.com", "uploads.github.com", "api.app.shortcut.com");
+    public static readonly ImmutableArray<string> ServiceHosts = ImmutableArray.Create(
+        "api.github.com", "uploads.github.com", "api.app.shortcut.com", "codegraph-api.trefry.net");
 
     /// <summary>
     /// A git remote on github.com (matched case-insensitively): a repository URL ending <c>.git</c>, an <c>@github.com</c> user

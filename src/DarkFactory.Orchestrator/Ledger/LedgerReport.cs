@@ -187,6 +187,7 @@ public static class LedgerReport
         text.Append(CultureInfo.InvariantCulture, $"- {Outcome(row)} {Code(verdict.Verdict)} on {Code(Ci.Short(verdict.HeadSha))} by ");
         text.Append(string.Join(", ", verdict.Reviews.Select(r =>
             $"{r.Role} ({Code(r.ServedName)}{(r.CarriedFrom is { } from ? $", carried from {Code(Ci.Short(from))}" : "")}"
+            + $"{(r.Tools is { Count: > 0 } tools ? $", {tools.Count} tool call{(tools.Count == 1 ? "" : "s")}" : "")}"
             + $"{(r.Error is null ? "" : ", unusable answer")})")));
         text.Append(CultureInfo.InvariantCulture,
             $"; {blocking.Count} blocking, {findings.Count - blocking.Count} optional ({findings.Count(f => f.Finding.Downgraded)} downgraded by the second opinion)\n");

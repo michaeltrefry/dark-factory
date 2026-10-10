@@ -56,7 +56,7 @@ public interface IGateGitHub
 /// (<see cref="RepoProtection"/>). Reads use a read-only token; only <see cref="MergeAsync"/> mints a write token. Tokens are
 /// minted per call and never cached.
 /// </summary>
-public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
+public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub, IReviewFiles
 {
     public static readonly IReadOnlyDictionary<string, string> ReadPermissions = new Dictionary<string, string>
     {
@@ -138,6 +138,37 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         }
         await GitHubApp.EnsureSuccess(response, $"read {GatePolicy.Path} on {baseRef}", ct);
         return await response.Content.ReadAsStringAsync(ct);
+    }
+
+    /// <summary>
+    /// A reviewer's <c>read_file</c> (sc-25705): <paramref name="path"/> at commit <paramref name="sha"/>, raw, with the gate's
+    /// read-only token, through the contents API's JSON form (base64 content). Null when GitHub has no such path there or the path
+    /// is not a file (a directory's listing, a symlink, a submodule). A file too large for that form (over 1 MB) throws, which the
+    /// reviewer's tool turns into an error result.
+    /// </summary>
+    public async Task<string?> ReadFileAsync(RepoRef repo, string sha, string path, CancellationToken ct)
+    {
+        var escaped = string.Join('/', path.Split('/').Select(Uri.EscapeDataString));
+        using var request = GitHubApp.Request(HttpMethod.Get,
+            $"repos/{repo.Owner}/{repo.Name}/contents/{escaped}?ref={Uri.EscapeDataString(sha)}", "Bearer", await ReadTokenAsync(repo, ct));
+        using var response = await http.SendAsync(request, ct);
+        if (response.StatusCode == HttpStatusCode.NotFound)
+        {
+            return null;
+        }
+        await GitHubApp.EnsureSuccess(response, $"read {path} at {sha}", ct);
+        using var doc = System.Text.Json.JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
+        var root = doc.RootElement;
+        if (root.ValueKind != System.Text.Json.JsonValueKind.Object || !root.TryGetProperty("type", out var type) || !type.ValueEquals("file"))
+        {
+            return null;
+        }
+        if (!root.TryGetProperty("encoding", out var encoding) || !encoding.ValueEquals("base64")
+            || !root.TryGetProperty("content", out var content) || content.GetString() is not { } base64)
+        {
+            throw new InvalidOperationException($"{path} at {sha} is too large for GitHub's contents API to return.");
+        }
+        return new UTF8Encoding(false).GetString(Convert.FromBase64String(base64.Replace("\n", "").Replace("\r", "")));
     }
 
     public async Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct)

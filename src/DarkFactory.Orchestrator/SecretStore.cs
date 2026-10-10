@@ -25,6 +25,8 @@ public static class SecretAccounts
     public const string GitHubGateAppPrivateKey = "github-gate-app-private-key";
     /// <summary>The dashboard login's ASP.NET Identity (PBKDF2) password hash, written by <c>factory dashboard set-password</c>.</summary>
     public const string DashboardPasswordHash = "dashboard-password-hash";
+    /// <summary>The reviewers' CodeGraph token (sc-25705): owner-side only, optional.</summary>
+    public const string CodeGraphToken = "codegraph-token";
 }
 
 /// <summary>Generic passwords in the login keychain under service <c>dark-factory</c>, via <c>/usr/bin/security</c>.</summary>
