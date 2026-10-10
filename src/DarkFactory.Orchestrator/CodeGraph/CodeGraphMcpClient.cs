@@ -49,16 +49,19 @@ public sealed partial class CodeGraphMcpClient(HttpClient http, string token) : 
     [GeneratedRegex(@"\A\s*Repo:\s*(?<url>\S+)\s*\z", RegexOptions.CultureInvariant)]
     private static partial Regex RepoLine();
 
-    public Task<CodeGraphAnswer> AnalyzeImpactAsync(string name, int? depth, string project, CancellationToken ct)
+    /// <summary>
+    /// Calls one of the reviewers' CodeGraph tools. A tool not on <see cref="ReviewTools.CodeGraphTools"/> is refused here too, before
+    /// anything is sent (E2: no model-running CodeGraph tool is reachable through this client).
+    /// </summary>
+    public Task<CodeGraphAnswer> CallAsync(string tool, JsonObject arguments, CancellationToken ct)
     {
-        var arguments = new JsonObject { ["name"] = name, ["project"] = project };
-        if (depth is { } d)
+        if (!ReviewTools.CodeGraphTools.Contains(tool))
         {
-            arguments["depth"] = d;
+            throw new ArgumentException($"'{tool}' is not one of the reviewers' CodeGraph tools; it is never sent.", nameof(tool));
         }
         return InSessionAsync(async session =>
         {
-            var (text, isError, structured) = await CallToolAsync(session, "analyze_impact", arguments, ct);
+            var (text, isError, structured) = await CallToolAsync(session, tool, arguments, ct);
             return new CodeGraphAnswer(text, isError, Commit(structured, text));
         }, ct);
     }

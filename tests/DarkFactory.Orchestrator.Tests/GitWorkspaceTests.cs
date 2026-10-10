@@ -708,6 +708,87 @@ public class GitWorkspaceTests
         Assert.Contains("factory/", ex.Message);
     }
 
+    // ---- a reviewer's read_file, list_files and grep (sc-25706): the clone's objects, never a checkout ----
+
+    /// <summary>A commit on the remote's main that <paramref name="write"/> makes in a fresh clone; returns its sha.</summary>
+    private string CommitToMain(string message, Action<string> write)
+    {
+        var other = Path.Combine(_root, $"main-{Guid.NewGuid():N}");
+        Git(_root, "clone", "-q", _remote, other);
+        write(other);
+        Git(other, "add", "-A");
+        Git(other, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", message);
+        Git(other, "push", "-q", "origin", "main");
+        return Git(other, "rev-parse", "HEAD").Trim();
+    }
+
+    [Fact]
+    public async Task A_reviewers_reads_come_from_the_commits_objects_in_the_clone_and_a_missing_commit_is_fetched()
+    {
+        var ct = CancellationToken.None;
+        Gate.IReviewFiles files = Workspace();
+        var baseSha = CommitToMain("base", dir =>
+        {
+            Directory.CreateDirectory(Path.Combine(dir, "src"));
+            File.WriteAllText(Path.Combine(dir, "src", "X.cs"), "class X {}\n");
+        });
+        var head = CommitToMain("head", dir =>
+        {
+            File.WriteAllText(Path.Combine(dir, "src", "X.cs"), "class X { int Count; }\n");
+            Directory.CreateDirectory(Path.Combine(dir, "a:b"));
+            File.WriteAllText(Path.Combine(dir, "a:b", "c d.txt"), "Count: 1\nno\nCount: 2\n");
+            File.WriteAllText(Path.Combine(dir, "-dash.txt"), "Count\n");
+            File.WriteAllBytes(Path.Combine(dir, "nul.dat"), [0x43, 0x6F, 0x75, 0x6E, 0x74, 0x00, 0x62]); // "Count\0b"
+            File.WriteAllBytes(Path.Combine(dir, "logo.png"), [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+            File.WriteAllText(Path.Combine(dir, "big.txt"), new string('x', Gate.ReviewTools.MaxFileBytes + 1));
+            File.CreateSymbolicLink(Path.Combine(dir, "link.cs"), "src/X.cs");
+        });
+
+        // The first read clones; the base's version is read too.
+        Assert.Equal("class X { int Count; }\n", await files.ReadAsync(Repo, head, "src/X.cs", ct));
+        Assert.Equal("class X {}\n", await files.ReadAsync(Repo, baseSha, "src/X.cs", ct));
+        Assert.Equal("Count: 1\nno\nCount: 2\n", await files.ReadAsync(Repo, head, "a:b/c d.txt", ct));
+        // A directory, a symlink (never followed) and a missing path are no file.
+        Assert.Null(await files.ReadAsync(Repo, head, "src", ct));
+        Assert.Null(await files.ReadAsync(Repo, head, "link.cs", ct));
+        Assert.Null(await files.ReadAsync(Repo, head, "nope.cs", ct));
+        await Assert.ThrowsAsync<Gate.BinaryFileException>(() => files.ReadAsync(Repo, head, "nul.dat", ct));
+        await Assert.ThrowsAsync<Gate.BinaryFileException>(() => files.ReadAsync(Repo, head, "logo.png", ct));
+        Assert.Contains($"more than the {Gate.ReviewTools.MaxFileBytes} a reviewer reads",
+            (await Assert.ThrowsAsync<InvalidOperationException>(() => files.ReadAsync(Repo, head, "big.txt", ct))).Message);
+        await Assert.ThrowsAsync<ArgumentException>(() => files.ReadAsync(Repo, "main", "src/X.cs", ct)); // a full commit id only
+
+        // A commit made after the clone is fetched before it is read.
+        var later = CommitToMain("later", dir => File.WriteAllText(Path.Combine(dir, "later.txt"), "later\n"));
+        Assert.Equal("later\n", await files.ReadAsync(Repo, later, "later.txt", ct));
+
+        Assert.Equal(["src/X.cs"], await files.ListAsync(Repo, head, "src", ct));
+        Assert.Equal(["-dash.txt", "README.md", "a:b/c d.txt", "big.txt", "link.cs", "logo.png", "nul.dat", "src/X.cs"],
+            await files.ListAsync(Repo, head, null, ct));
+        Assert.Empty(await files.ListAsync(Repo, head, "*", ct)); // literal pathspecs: no glob or magic
+
+        // grep: text files only (nul.dat is skipped), at most perFile lines a file, paths with colons and dashes intact.
+        Assert.Equal([new Gate.GrepMatch("-dash.txt", 1, "Count"), new Gate.GrepMatch("a:b/c d.txt", 1, "Count: 1")],
+            await files.GrepAsync(Repo, head, "^Count", null, 1, ct));
+        Assert.Equal([new Gate.GrepMatch("a:b/c d.txt", 1, "Count: 1"), new Gate.GrepMatch("a:b/c d.txt", 3, "Count: 2")],
+            await files.GrepAsync(Repo, head, "^Count: [0-9]$", "a:b", 5, ct));
+        Assert.Empty(await files.GrepAsync(Repo, baseSha, "Count", null, 5, ct)); // git's "no match" (exit 1) is an empty answer
+        Assert.Equal(128, GitWorkspace.ExitCode(await Assert.ThrowsAsync<InvalidOperationException>(() => files.GrepAsync(Repo, head, "(", null, 5, ct)))); // a pattern git refuses
+
+        // Nothing was checked out: no worktree, and every call was isolated from the owner's git config.
+        Assert.False(Directory.Exists(Path.Combine(_root, "work", GitWorkspace.ItemWorktrees)));
+        Assert.All(_gitCalls, c => Assert.Equal(OwnerGit.ConfigArgs, c.Args.Take(OwnerGit.ConfigArgs.Count)));
+        Assert.DoesNotContain(_gitCalls, c => Subcommand(c.Args) is "checkout" or "worktree");
+    }
+
+    [Fact]
+    public void Grep_output_is_parsed_by_its_nul_separators()
+    {
+        const string sha = "0123456789abcdef0123456789abcdef01234567";
+        Assert.Equal([new Gate.GrepMatch("a:b.txt", 12, "x: y\0z"), new Gate.GrepMatch("c.txt", 1, "")],
+            GitWorkspace.ParseGrep($"{sha}:a:b.txt\012\0x: y\0z\r\n{sha}:c.txt\01\0\nnot a match line\n", sha));
+    }
+
     private static string Git(string cwd, params string[] args)
     {
         var psi = new ProcessStartInfo("git") { WorkingDirectory = cwd, RedirectStandardOutput = true, RedirectStandardError = true };

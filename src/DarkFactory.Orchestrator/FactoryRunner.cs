@@ -219,7 +219,7 @@ public static class FactoryRunner
 
         var gateGitHub = new GitHubGate(githubHttp, gateApp);
         using var codeGraphHttp = OutboundHttp.CodeGraphApi(options.CodeGraphBaseUrl);
-        var reviewer = new RouterReviewer(reviewerHttp, routerKey, tools: CreateReviewTools(options, gateGitHub, codeGraphHttp, log));
+        var reviewer = new RouterReviewer(reviewerHttp, routerKey, tools: CreateReviewTools(options, workspaces, codeGraphHttp, log));
         var gate = CreateGate(options, gateGitHub, reviewer, workspaces, sandbox);
         if (adjustGate is not null)
         {
@@ -255,9 +255,9 @@ public static class FactoryRunner
     }
 
     /// <summary>
-    /// The reviewers' tools (sc-25705): <c>read_file</c> through the gate's read-only GitHub access, <c>analyze_impact</c> through
-    /// CodeGraph with the owner's CodeGraph token. Without a token the factory still starts (only the reviewers use CodeGraph):
-    /// <c>analyze_impact</c> then answers an error result, recorded in the verdict, and this says so once.
+    /// The reviewers' tools (sc-25705, sc-25706): <c>read_file</c>, <c>list_files</c> and <c>grep</c> from the gate's clone (owner-side git, by object), the
+    /// CodeGraph tools with the owner's CodeGraph token. Without a token the factory still starts (only the reviewers use CodeGraph):
+    /// every CodeGraph tool then answers an error result, recorded in the verdict, and this says so once.
     /// </summary>
     internal static ReviewTools CreateReviewTools(FactoryOptions options, IReviewFiles files, HttpClient codeGraphHttp, TextWriter log)
     {
@@ -266,7 +266,7 @@ public static class FactoryRunner
             return new ReviewTools(files, new CodeGraph.CodeGraphMcpClient(codeGraphHttp, token!));
         }
         log.WriteLine("[review] no CodeGraph token (CodeGraph:Token, env FACTORY_CODEGRAPH_TOKEN or keychain account "
-            + $"'{SecretAccounts.CodeGraphToken}'): reviewers' analyze_impact will answer an error");
+            + $"'{SecretAccounts.CodeGraphToken}'): reviewers' CodeGraph tools will answer an error");
         return new ReviewTools(files, null);
     }
 

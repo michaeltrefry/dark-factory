@@ -341,25 +341,20 @@ public class FactoryOptionsTests
             none.ValidateSettings();
             var log = new StringWriter();
             using var http = new HttpClient();
-            var tools = FactoryRunner.CreateReviewTools(none, new NoFiles(), http, log);
+            var tools = FactoryRunner.CreateReviewTools(none, new FakeReviewFiles("head", []), http, log);
             Assert.Contains("no CodeGraph token", log.ToString());
             var outcome = await tools.RunAsync(new AnswerBlock(AnswerBlock.ToolUse, null, "toolu_1", ReviewTools.AnalyzeImpact, "{\"name\":\"X\"}"),
-                ReviewTools.Session(new Shortcut.RepoRef("o", "r"), "head", 0), CancellationToken.None);
+                ReviewTools.Session(new Shortcut.RepoRef("o", "r"), "head", "base", 0), CancellationToken.None);
             Assert.True(outcome.IsError);
             Assert.Contains("CodeGraph is not configured", outcome.Content);
         }
         // With a token, analyze_impact asks CodeGraph with it.
         var codeGraph = new FakeApi();
-        var configured = FactoryRunner.CreateReviewTools(Options(new() { ["CodeGraph:Token"] = "cg_config" }), new NoFiles(),
+        var configured = FactoryRunner.CreateReviewTools(Options(new() { ["CodeGraph:Token"] = "cg_config" }), new FakeReviewFiles("head", []),
             codeGraph.Client("https://codegraph.test/"), TextWriter.Null);
         await configured.RunAsync(new AnswerBlock(AnswerBlock.ToolUse, null, "toolu_1", ReviewTools.AnalyzeImpact, "{\"name\":\"X\"}"),
-            ReviewTools.Session(new Shortcut.RepoRef("o", "r"), "head", 0), CancellationToken.None);
+            ReviewTools.Session(new Shortcut.RepoRef("o", "r"), "head", "base", 0), CancellationToken.None);
         Assert.Equal("Bearer cg_config", codeGraph.Requests.First().Headers["Authorization"]);
-    }
-
-    private sealed class NoFiles : IReviewFiles
-    {
-        public Task<string?> ReadFileAsync(Shortcut.RepoRef repo, string sha, string path, CancellationToken ct) => Task.FromResult<string?>(null);
     }
 
     [Fact]

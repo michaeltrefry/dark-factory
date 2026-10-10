@@ -73,7 +73,7 @@ public sealed class GitWorkspace(
     IWorkerSandbox? sandbox = null,
     string worktreesDirectory = GitWorkspace.ItemWorktrees,
     bool shareWithWorker = true)
-    : IRepoWorkspace
+    : IRepoWorkspace, Gate.IReviewFiles
 {
     private readonly GitCommand _git = git ?? RunGitAsync;
 
@@ -267,6 +267,114 @@ public sealed class GitWorkspace(
             return null;
         }
         return await Git(clone, null, ct, "cat-file", "blob", blob);
+    }
+
+    // ---- a reviewer's read_file, list_files and grep (sc-25706): objects of the clone, never a checkout ----
+
+    private static readonly System.Text.RegularExpressions.Regex FullSha = new("^[0-9a-f]{40}$");
+
+    /// <summary>
+    /// The clone, with <paramref name="sha"/> in it: cloned or fetched first when it is not (the PR head is on a
+    /// <c>factory/*</c> branch, the base on the base branch). <paramref name="sha"/> must be a full lowercase commit id.
+    /// </summary>
+    private async Task<string> CloneWithAsync(RepoRef repo, string sha, CancellationToken ct)
+    {
+        if (!FullSha.IsMatch(sha))
+        {
+            throw new ArgumentException($"'{sha}' is not a full commit id.", nameof(sha));
+        }
+        var clone = ClonePath(repo);
+        if (Directory.Exists(Path.Combine(clone, ".git")))
+        {
+            try
+            {
+                await Git(clone, null, ct, "cat-file", "-e", "--end-of-options", $"{sha}^{{commit}}");
+                return clone;
+            }
+            catch (InvalidOperationException ex) when (ExitCode(ex) is not null)
+            {
+                // Not fetched yet.
+            }
+        }
+        return await FetchAsync(repo, ct);
+    }
+
+    /// <summary>
+    /// A regular file's text at <paramref name="sha"/> (<see cref="Gate.IReviewFiles.ReadAsync"/>): read by blob id from the clone,
+    /// its size checked before it is read; NUL bytes or invalid UTF-8 make it binary.
+    /// </summary>
+    async Task<string?> Gate.IReviewFiles.ReadAsync(RepoRef repo, string sha, string path, CancellationToken ct)
+    {
+        var clone = await CloneWithAsync(repo, sha, ct);
+        var entry = await Git(clone, null, ct, "--literal-pathspecs", "ls-tree", "-l", "-z", "--full-tree", "--end-of-options", sha, "--", path);
+        // "<mode> <type> <object> <size>\t<path>" (the size right-aligned with spaces)
+        var line = entry.Split('\0', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+        var tab = line?.IndexOf('\t') ?? -1;
+        if (line is null || tab < 0 || line[(tab + 1)..] != path
+            || line[..tab].Split(' ', StringSplitOptions.RemoveEmptyEntries) is not [var mode, "blob", var blob, var size] || mode == "120000")
+        {
+            return null;
+        }
+        if (!long.TryParse(size, out var bytes) || bytes > Gate.ReviewTools.MaxFileBytes)
+        {
+            throw new InvalidOperationException($"{path} is {size} bytes, more than the {Gate.ReviewTools.MaxFileBytes} a reviewer reads.");
+        }
+        var text = await Git(clone, null, ct, "cat-file", "blob", blob);
+        // git's output is decoded as UTF-8 with invalid bytes replaced: a replacement character or a NUL marks a binary file.
+        if (text.Contains('\0') || text.Contains('�'))
+        {
+            throw new Gate.BinaryFileException(path);
+        }
+        return text;
+    }
+
+    async Task<IReadOnlyList<string>> Gate.IReviewFiles.ListAsync(RepoRef repo, string sha, string? directory, CancellationToken ct)
+    {
+        var clone = await CloneWithAsync(repo, sha, ct);
+        string[] args = directory is null
+            ? ["ls-tree", "-r", "-z", "--name-only", "--full-tree", "--end-of-options", sha]
+            : ["--literal-pathspecs", "ls-tree", "-r", "-z", "--name-only", "--full-tree", "--end-of-options", sha, "--", directory];
+        return (await Git(clone, null, ct, args)).Split('\0', StringSplitOptions.RemoveEmptyEntries);
+    }
+
+    /// <summary>
+    /// <c>git grep</c> on the commit's tree (<see cref="Gate.IReviewFiles.GrepAsync"/>): POSIX extended regular expression, text files
+    /// only (<c>-I</c>), no textconv, at most <paramref name="perFile"/> lines a file. git answers 1 for no match: an empty list.
+    /// </summary>
+    async Task<IReadOnlyList<Gate.GrepMatch>> Gate.IReviewFiles.GrepAsync(RepoRef repo, string sha, string pattern, string? directory, int perFile,
+        CancellationToken ct)
+    {
+        var clone = await CloneWithAsync(repo, sha, ct);
+        string output;
+        try
+        {
+            output = await Git(clone, null, ct, ["--literal-pathspecs", "grep", "-I", "-n", "-z", "--no-color", "--no-textconv", "-E",
+                $"--max-count={perFile}", "-e", pattern, "--end-of-options", sha, "--", .. directory is null ? Array.Empty<string>() : [directory]]);
+        }
+        catch (InvalidOperationException ex) when (ExitCode(ex) == 1)
+        {
+            return [];
+        }
+        return ParseGrep(output, sha);
+    }
+
+    /// <summary>
+    /// Parses <c>git grep -n -z</c> on a commit: one line per match, <c>&lt;sha&gt;:&lt;path&gt;\0&lt;line&gt;\0&lt;text&gt;</c> (the NULs
+    /// stand where git would print colons, so a path or text holding one parses).
+    /// </summary>
+    public static IReadOnlyList<Gate.GrepMatch> ParseGrep(string output, string sha)
+    {
+        var matches = new List<Gate.GrepMatch>();
+        foreach (var record in output.Split('\n'))
+        {
+            var fields = record.Split('\0', 3);
+            if (fields.Length < 3 || !fields[0].StartsWith(sha + ":", StringComparison.Ordinal) || !int.TryParse(fields[1], out var line))
+            {
+                continue;
+            }
+            matches.Add(new Gate.GrepMatch(fields[0][(sha.Length + 1)..], line, fields[2].TrimEnd('\r')));
+        }
+        return matches;
     }
 
     /// <summary>Reads the branch through the clone-side admin dir, never the worktree's worker-writable <c>.git</c> file.</summary>
@@ -492,8 +600,18 @@ public sealed class GitWorkspace(
         await p.WaitForExitAsync(ct);
         if (p.ExitCode != 0)
         {
-            throw new InvalidOperationException($"git {args.FirstOrDefault(a => !a.StartsWith('-') && !a.Contains('='))} failed ({p.ExitCode}): {(await stderr).Trim()}");
+            throw new InvalidOperationException(
+                $"git {args.FirstOrDefault(a => !a.StartsWith('-') && !a.Contains('='))} failed ({p.ExitCode}): {(await stderr).Trim()}")
+            {
+                Data = { [ExitCodeKey] = p.ExitCode },
+            };
         }
         return await stdout;
     }
+
+    /// <summary>The <see cref="Exception.Data"/> key of a failed git command's exit status.</summary>
+    public const string ExitCodeKey = "git-exit-code";
+
+    /// <summary>A failed git command's exit status (<c>git grep</c> answers 1 for "no line matched"), or null for any other exception.</summary>
+    public static int? ExitCode(Exception ex) => ex.Data[ExitCodeKey] as int?;
 }
