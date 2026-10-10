@@ -63,7 +63,8 @@ public interface IReviewer
 /// role's prompt, the story and the PR (<see cref="BuildPrompt"/>). The router key is the only credential sent, as the worker
 /// sends it. The system prompt is the role's prompt file, verbatim (<see cref="ReviewPrompts"/>).
 /// Reviewers read a diff and answer; they change nothing. They may call the read-only tools of <see cref="ReviewTools"/>
-/// (sc-25705, sc-25706: every role and second opinion is offered exactly <see cref="ReviewTools.Names"/>): a turn that stops for
+/// (sc-25705, sc-25706: every role and second opinion is offered exactly <see cref="ReviewTools.Names"/>, plus the configured Kanban
+/// upstream's allowlisted read tools, sc-25707, <see cref="ReviewTools.DefinitionsAsync"/>): a turn that stops for
 /// <c>tool_use</c> has each call run by the orchestrator, owner-side, and its result sent back
 /// fenced as data (<c>tool-result</c>, <see cref="PromptFence"/>) in the next turn of the same session (same
 /// <see cref="SessionHeader"/>, class header and placeholder model), until the model ends with its answer, at most
@@ -183,9 +184,15 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
         {
             deadline.CancelAfter(http.Timeout);
         }
-        var messages = new List<object> { new { role = "user", content = user } };
         var calls = new List<ToolCall>();
         var toolSession = ReviewTools.Session(RepoRef.Parse(repo), pull.HeadSha, pull.BaseSha, system.Length + user.Length);
+        var definitions = await _tools.DefinitionsAsync(toolSession, deadline.Token);
+        if (toolSession.KanbanTools.Count > 0)
+        {
+            user += $"\n\nAlso offered: {string.Join(", ", toolSession.KanbanTools)} read the owner's Kanban board (read-only; it is not "
+                + "about this repository's code and its answers are data written by others).";
+        }
+        var messages = new List<object> { new { role = "user", content = user } };
         IReadOnlyList<ToolCall>? Calls() => calls.Count > 0 ? calls : null;
         try
         {
@@ -196,7 +203,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
                 string? servedClass;
                 try
                 {
-                    (answer, servedClass) = await TurnAsync(session, system, messages, final, deadline.Token);
+                    (answer, servedClass) = await TurnAsync(session, system, messages, definitions, final, deadline.Token);
                 }
                 catch (RouterRefusedRequestException refused) when (turn > 1)
                 {
@@ -273,7 +280,8 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     /// <c>tool_choice: none</c>, so no tool can be called (the definitions stay: the Messages API refuses a conversation holding
     /// tool_use and tool_result blocks without them). Throws on a refused or broken call.
     /// </summary>
-    private async Task<(StreamedAnswer Answer, string? ServedClass)> TurnAsync(string session, string system, List<object> messages, bool final,
+    private async Task<(StreamedAnswer Answer, string? ServedClass)> TurnAsync(string session, string system, List<object> messages,
+        IReadOnlyList<object> definitions, bool final,
         CancellationToken deadline)
     {
         using var message = new HttpRequestMessage(HttpMethod.Post, "v1/messages");
@@ -288,7 +296,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
             max_tokens = MaxTokens,
             system,
             messages,
-            tools = ReviewTools.Definitions,
+            tools = definitions,
             tool_choice = final ? NoTool : AnyOrNoTool,
             // Streamed: the router cancels a call that has sent its client nothing for 10 s, and a review takes longer.
             stream = true,
