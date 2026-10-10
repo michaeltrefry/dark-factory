@@ -110,8 +110,7 @@ public class WorkerTaintTests
     private static string Script(string dir, string body)
     {
         var script = Path.Combine(dir, "fake-claude.sh");
-        File.WriteAllText(script, "#!/bin/sh\n" + body);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        SandboxSupport.ExecutableAt(script, "#!/bin/sh\n" + body);
         return script;
     }
 

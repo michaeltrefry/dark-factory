@@ -200,8 +200,7 @@ public class GitWorkspaceTests
         Git(_root, "init", evil);
         var marker = Path.Combine(_root, "hook-ran");
         var hook = Path.Combine(evil, ".git", "hooks", "pre-commit");
-        File.WriteAllText(hook, $"#!/bin/sh\ntouch '{marker}'\n");
-        File.SetUnixFileMode(hook, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        SandboxSupport.ExecutableAt(hook, $"#!/bin/sh\ntouch '{marker}'\n");
         File.WriteAllText(Path.Combine(ws.Path, ".git"), $"gitdir: {Path.Combine(evil, ".git")}\n");
         File.WriteAllText(Path.Combine(ws.Path, "fix.txt"), "fixed\n");
 
@@ -599,8 +598,7 @@ public class GitWorkspaceTests
         var dir = Directory.CreateDirectory(Path.Combine(_root, "scripts")).FullName;
         var markers = Directory.CreateDirectory(Path.Combine(_root, "markers")).FullName;
         var path = Path.Combine(dir, marker);
-        File.WriteAllText(path, $"#!/bin/sh\ntouch '{Path.Combine(markers, marker)}'\n{then}\n");
-        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        SandboxSupport.ExecutableAt(path, $"#!/bin/sh\ntouch '{Path.Combine(markers, marker)}'\n{then}\n");
         return path;
     }
 
@@ -609,8 +607,7 @@ public class GitWorkspaceTests
         Directory.CreateDirectory(hooksDir);
         foreach (var name in names)
         {
-            File.Copy(Script($"{prefix}-{name}", "exit 0"), Path.Combine(hooksDir, name), overwrite: true);
-            File.SetUnixFileMode(Path.Combine(hooksDir, name), UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            SandboxSupport.ExecutableAt(Path.Combine(hooksDir, name), File.ReadAllText(Script($"{prefix}-{name}", "exit 0")));
         }
     }
 

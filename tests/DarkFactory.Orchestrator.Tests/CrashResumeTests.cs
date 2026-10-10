@@ -170,7 +170,7 @@ public sealed class CrashResumeTests : IAsyncLifetime
     private void WriteFakeClaude()
     {
         var script = Path.Combine(_dir, "fake-claude.sh");
-        File.WriteAllText(script, $$"""
+        SandboxSupport.ExecutableAt(script, $$"""
             #!/bin/sh
             echo {{OwnProcess.ShellRecord("$$")}} >> "{{Pids}}"
             if printf '%s ' "$@" | grep -q -- '--resume {{Session}}'; then
@@ -193,7 +193,6 @@ public sealed class CrashResumeTests : IAsyncLifetime
             echo '{"type":"system","subtype":"init","session_id":"{{Session}}"}'
             wait
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
     }
 
     private static async Task WaitForAsync(Func<Task<bool>> condition, Process? host, string what, CancellationToken ct)

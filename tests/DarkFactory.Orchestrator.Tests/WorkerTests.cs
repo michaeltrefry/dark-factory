@@ -149,7 +149,7 @@ public class ClaudeWorkerTests
         var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
         var envDump = Path.Combine(dir, "env.txt");
         var script = Path.Combine(dir, "fake-claude.sh");
-        File.WriteAllText(script, $$"""
+        SandboxSupport.ExecutableAt(script, $$"""
             #!/bin/sh
             env > "{{envDump}}"
             pwd >> "{{envDump}}"
@@ -157,7 +157,6 @@ public class ClaudeWorkerTests
             echo 'progress noise'
             echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-abc"}'
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", "sk-ant-should-not-leak");
         try
         {
@@ -197,7 +196,7 @@ public class ClaudeWorkerTests
         var probeDir = Directory.CreateTempSubdirectory("df-worker-probe-").FullName;
         var dump = Path.Combine(probeDir, "probe.txt");
         var script = Path.Combine(probeDir, "fake-claude.sh");
-        File.WriteAllText(script, $$"""
+        SandboxSupport.ExecutableAt(script, $$"""
             #!/bin/sh
             env > "{{dump}}"
             printf '%s\n' "$@" >> "{{dump}}"
@@ -205,7 +204,6 @@ public class ClaudeWorkerTests
             echo '{"type":"system","subtype":"init","session_id":"sess-key"}'
             echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-key"}'
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         Environment.SetEnvironmentVariable("GitHub__PrivateKeyPem", pem);
         try
         {
@@ -232,8 +230,7 @@ public class ClaudeWorkerTests
     {
         var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
         var script = Path.Combine(dir, "fake-claude.sh");
-        File.WriteAllText(script, "#!/bin/sh\necho '{\"type\":\"system\",\"session_id\":\"s\"}'\necho boom >&2\nexit 3\n");
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        SandboxSupport.ExecutableAt(script, "#!/bin/sh\necho '{\"type\":\"system\",\"session_id\":\"s\"}'\necho boom >&2\nexit 3\n");
 
         var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid, null, CancellationToken.None);
 
@@ -281,7 +278,7 @@ public class ClaudeWorkerTests
         var argsDump = Path.Combine(dir, "args.txt");
         var script = Path.Combine(dir, "fake-claude.sh");
         // Waits until the flag exists (as a tool call would), then ends.
-        File.WriteAllText(script, $$"""
+        SandboxSupport.ExecutableAt(script, $$"""
             #!/bin/sh
             printf '%s\n' "$@" > "{{argsDump}}"
             if [ -e "{{Path.Combine(flags, "factory-sc-9.pause")}}" ]; then echo stale > "{{Path.Combine(dir, "saw-stale")}}"; fi
@@ -289,7 +286,6 @@ public class ClaudeWorkerTests
             while [ ! -e "{{Path.Combine(flags, "factory-sc-9.pause")}}" ]; do sleep 0.02; done
             echo '{"type":"result","subtype":"success","is_error":false,"session_id":"s-9"}'
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         Directory.CreateDirectory(flags);
         File.WriteAllText(Path.Combine(flags, "factory-sc-9.pause"), "stale");
         var worker = new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1), pauseFlagDirectory: flags);
@@ -350,7 +346,7 @@ public class ClaudeWorkerTests
         var argsDump = Path.Combine(dir, "args.txt");
         var script = Path.Combine(dir, "fake-claude.sh");
         // The worker only finishes once the callback has created the flag file.
-        File.WriteAllText(script, $$"""
+        SandboxSupport.ExecutableAt(script, $$"""
             #!/bin/sh
             printf '%s\n' "$@" > "{{argsDump}}"
             echo '{"type":"system","subtype":"init","session_id":"sess-early"}'
@@ -358,7 +354,6 @@ public class ClaudeWorkerTests
             while [ ! -f "{{flag}}" ]; do i=$((i+1)); [ $i -gt 200 ] && exit 9; sleep 0.05; done
             echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-early"}'
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         var seen = new List<string>();
 
         var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", "sess-early", WorkerModelClass.Mid,
@@ -380,12 +375,11 @@ public class ClaudeWorkerTests
     {
         var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
         var script = Path.Combine(dir, "fake-claude.sh");
-        File.WriteAllText(script, """
+        SandboxSupport.ExecutableAt(script, """
             #!/bin/sh
             echo '{"type":"system","subtype":"init","session_id":"sess-stall"}'
             echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-stall"}'
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         // The tap never finishes on its own (a stalled database): only the worker timeout can end it.
         var run = new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMilliseconds(500)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
@@ -402,13 +396,12 @@ public class ClaudeWorkerTests
         var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
         var ids = Path.Combine(dir, "ids.txt");
         var script = Path.Combine(dir, "fake-claude.sh");
-        File.WriteAllText(script, $$"""
+        SandboxSupport.ExecutableAt(script, $$"""
             #!/bin/sh
             echo "$$ $(ps -o pgid= -p $$ | tr -d ' ')" > "{{ids}}"
             echo '{"type":"system","subtype":"init","session_id":"s"}'
             echo '{"type":"result","subtype":"success","is_error":false,"session_id":"s"}'
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         var events = new List<string>();
 
         var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
@@ -428,7 +421,7 @@ public class ClaudeWorkerTests
     {
         var dir = Directory.CreateTempSubdirectory("df-worker-").FullName;
         var script = Path.Combine(dir, "fake-claude.sh");
-        File.WriteAllText(script, """
+        SandboxSupport.ExecutableAt(script, """
             #!/bin/sh
             echo '{"type":"system","subtype":"init","session_id":"s"}'
             echo '{"type":"assistant","message":{"model":"claude-sonnet-4-5","content":[]},"session_id":"s"}'
@@ -436,7 +429,6 @@ public class ClaudeWorkerTests
             echo '{"type":"assistant","message":{"model":"qwen3-coder","content":[]},"session_id":"s"}'
             echo '{"type":"result","subtype":"success","is_error":false,"session_id":"s"}'
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         var models = new List<string>();
 
         var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
@@ -474,7 +466,7 @@ public class ClaudeWorkerTests
         var pids = Path.Combine(dir, "pids.txt");
         var script = Path.Combine(dir, "fake-claude.sh");
         // Ignores SIGTERM in the leader so only the SIGKILL escalation ends it; its child is a "tool".
-        File.WriteAllText(script, $$"""
+        SandboxSupport.ExecutableAt(script, $$"""
             #!/bin/sh
             trap '' TERM
             sleep 600 &
@@ -482,7 +474,6 @@ public class ClaudeWorkerTests
             echo '{"type":"system","subtype":"init","session_id":"s"}'
             wait
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         var worker = new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1));
         var started = new TaskCompletionSource<int>();
         // Stands in for the crashed orchestrator: the worker keeps running while we stop it "from the next run".

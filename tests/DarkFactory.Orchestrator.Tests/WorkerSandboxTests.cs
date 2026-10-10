@@ -38,11 +38,30 @@ internal static class SandboxSupport
     /// <summary>Where a worker of <see cref="LocalSandbox"/> records ("pid|start") a process it leaves behind for the helper to kill.</summary>
     public static string LocalRegistry(string dir) => Path.Combine(dir, "local-registry");
 
-    public static string Executable(string dir, string name, string content)
+    public static string Executable(string dir, string name, string content) => ExecutableAt(Path.Combine(dir, name), content);
+
+    /// <summary>
+    /// Writes an owner-executable script at <paramref name="path"/> that an exec can never find busy (Linux ETXTBSY: a file this
+    /// process opened for writing stays open in any child another test's <c>Process.Start</c> forked meanwhile, until that child
+    /// execs). The content goes to a staging file here; <c>/bin/cp</c>, a separate process whose descriptors no fork of ours
+    /// inherits, writes the executable under a temporary name, and once cp has exited it is renamed into place: nothing holds
+    /// it open for writing.
+    /// </summary>
+    public static string ExecutableAt(string path, string content)
     {
-        var path = Path.Combine(dir, name);
-        File.WriteAllText(path, content);
-        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var id = Guid.NewGuid().ToString("N")[..8];
+        var staged = $"{path}.{id}.staged";
+        var copy = $"{path}.{id}.copy";
+        File.WriteAllText(staged, content);
+        using (var cp = Process.Start(new ProcessStartInfo("/bin/cp", [staged, copy]) { RedirectStandardError = true })!)
+        {
+            var error = cp.StandardError.ReadToEnd();
+            cp.WaitForExit();
+            Assert.True(cp.ExitCode == 0, $"cp {staged}: {error}");
+        }
+        File.Delete(staged);
+        File.SetUnixFileMode(copy, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        File.Move(copy, path, overwrite: true);
         return path;
     }
 

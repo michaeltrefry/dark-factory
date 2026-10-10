@@ -197,7 +197,7 @@ public sealed class ControlProcessTests : IAsyncLifetime
     private void WriteFakeClaude()
     {
         var script = Path.Combine(_dir, "fake-claude.sh");
-        File.WriteAllText(script, $$$"""
+        SandboxSupport.ExecutableAt(script, $$$"""
             #!/bin/sh
             settings=""; resume=""
             while [ $# -gt 0 ]; do
@@ -230,7 +230,6 @@ public sealed class ControlProcessTests : IAsyncLifetime
             done
             echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"$S\"}"
             """);
-        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
     }
 
     private void SeedOrigin()
