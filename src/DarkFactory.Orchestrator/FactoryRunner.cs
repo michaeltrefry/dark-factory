@@ -254,7 +254,6 @@ public static class FactoryRunner
         return await pipeline.RunAsync(storyId, ct);
     }
 
-    /// <summary>The reviewers' router client: one reviewer call may take <c>Review:TimeoutMinutes</c>.</summary>
     /// <summary>
     /// The reviewers' tools (sc-25705): <c>read_file</c> through the gate's read-only GitHub access, <c>analyze_impact</c> through
     /// CodeGraph with the owner's CodeGraph token. Without a token the factory still starts (only the reviewers use CodeGraph):
@@ -271,6 +270,7 @@ public static class FactoryRunner
         return new ReviewTools(files, null);
     }
 
+    /// <summary>The reviewers' router client: one reviewer call may take <c>Review:TimeoutMinutes</c>.</summary>
     internal static HttpClient ReviewerHttp(FactoryOptions options) => OutboundHttp.RouterApi(options.RouterBaseUrl, options.ReviewTimeout);
 
     /// <summary>

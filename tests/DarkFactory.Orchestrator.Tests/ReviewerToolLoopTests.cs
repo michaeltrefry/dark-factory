@@ -52,36 +52,78 @@ public class ReviewerToolLoopTests
     }
 
     /// <summary>
-    /// A fake CodeGraph MCP endpoint (Streamable HTTP): initialize hands out a session, the initialized notification is accepted,
-    /// and tools/call answers <paramref name="analyzeImpact"/> (as an event stream) or <paramref name="searchProjects"/>.
+    /// CodeGraph's search_projects listing as the hosted CodeGraph answers it today (one entry per project: a bold name with its
+    /// language and index date, then its repository URL), searched for "r": the PR repo's project (o/r) is not the first entry, and
+    /// the others have similar names or URLs. The shape is the one the sc-25705 review read off the live instance; the entries are
+    /// made up for o/r.
     /// </summary>
-    private static FakeApi CodeGraphServer(JsonObject analyzeImpact, JsonObject? searchProjects = null) =>
-        new FakeApi().On("POST /mcp", r =>
-        {
-            var message = JsonNode.Parse(r.Body!)!;
-            var id = message["id"]?.DeepClone();
-            switch (message["method"]!.GetValue<string>())
+    private const string LiveListing =
+        "- **r-tools** [csharp] (indexed: 2026-10-01)\n  Repo: https://github.com/o/r-tools\n"
+        + "- **r** [typescript] (indexed: 2026-10-02)\n  Repo: https://github.com/other/r\n"
+        + "- **R Service** [csharp] (indexed: 2026-10-03)\n  Repo: https://github.com/O/R.git\n"
+        + "- **r2** [go] (indexed: 2026-10-04)\n  Repo: https://github.com/o/r2\n";
+
+    /// <summary>The CodeGraph project <see cref="LiveListing"/> holds for o/r.</summary>
+    private const string Project = "R Service";
+
+    /// <summary>
+    /// analyze_impact's answer under CodeGraph's contract (sc-25702): the commit in <c>structuredContent.commitSha</c> and as the
+    /// text's first line.
+    /// </summary>
+    private static JsonObject ContractAnswer(string text) =>
+        Text($"Commit: {IndexCommit}\n{text}", new JsonObject { ["commitSha"] = IndexCommit, ["project"] = Project });
+
+    /// <summary>
+    /// analyze_impact's answer as the hosted CodeGraph gives it today: markdown text only, no structured content, no commit (the
+    /// shape the sc-25705 review read off the live instance; the content is made up for X.Count).
+    /// </summary>
+    private const string LiveImpact = "# Blast Radius: X.Count\n\n**Risk:** Medium\n\n## Direct callers (depth 1)\n- `Program.Main` (src/Program.cs)\n";
+
+    /// <summary>
+    /// A fake CodeGraph MCP endpoint (Streamable HTTP): initialize hands out a session (a new id each time), the initialized
+    /// notification is accepted, tools/call answers <paramref name="analyzeImpact"/> (as an event stream) or
+    /// <paramref name="searchProjects"/> (default <see cref="LiveListing"/>), and DELETE ends a session.
+    /// </summary>
+    private static FakeApi CodeGraphServer(JsonObject analyzeImpact, JsonObject? searchProjects = null)
+    {
+        var sessions = 0;
+        return new FakeApi()
+            .On("DELETE /mcp", _ => new HttpResponseMessage(HttpStatusCode.NoContent))
+            .On("POST /mcp", r =>
             {
-                case "initialize":
-                    var init = FakeApi.Json(HttpStatusCode.OK, new JsonObject
-                    {
-                        ["jsonrpc"] = "2.0", ["id"] = id,
-                        ["result"] = new JsonObject { ["protocolVersion"] = CodeGraphMcpClient.ProtocolVersion, ["capabilities"] = new JsonObject() },
-                    }.ToJsonString());
-                    init.Headers.Add(CodeGraphMcpClient.SessionHeader, "mcp-session-1");
-                    return init;
-                case "notifications/initialized":
-                    return new HttpResponseMessage(HttpStatusCode.Accepted);
-                default:
-                    var tool = message["params"]!["name"]!.GetValue<string>();
-                    var result = tool == "analyze_impact" ? analyzeImpact : searchProjects ?? Text("no projects");
-                    var json = new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id, ["result"] = result.DeepClone() }.ToJsonString();
-                    return new HttpResponseMessage(HttpStatusCode.OK)
-                    {
-                        Content = new StringContent($"event: message\ndata: {json}\n\n", Encoding.UTF8, "text/event-stream"),
-                    };
-            }
-        });
+                var message = JsonNode.Parse(r.Body!)!;
+                var id = message["id"]?.DeepClone();
+                switch (message["method"]!.GetValue<string>())
+                {
+                    case "initialize":
+                        var init = FakeApi.Json(HttpStatusCode.OK, new JsonObject
+                        {
+                            ["jsonrpc"] = "2.0", ["id"] = id,
+                            ["result"] = new JsonObject { ["protocolVersion"] = CodeGraphMcpClient.ProtocolVersion, ["capabilities"] = new JsonObject() },
+                        }.ToJsonString());
+                        init.Headers.Add(CodeGraphMcpClient.SessionHeader, $"mcp-session-{++sessions}");
+                        return init;
+                    case "notifications/initialized":
+                        return new HttpResponseMessage(HttpStatusCode.Accepted);
+                    default:
+                        var tool = message["params"]!["name"]!.GetValue<string>();
+                        var result = tool == "analyze_impact" ? analyzeImpact : searchProjects ?? Text(LiveListing);
+                        var json = new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id, ["result"] = result.DeepClone() }.ToJsonString();
+                        return new HttpResponseMessage(HttpStatusCode.OK)
+                        {
+                            Content = new StringContent($"event: message\ndata: {json}\n\n", Encoding.UTF8, "text/event-stream"),
+                        };
+                }
+            });
+    }
+
+    /// <summary>The tools/call requests a fake CodeGraph got: tool name and arguments.</summary>
+    private static List<(string Tool, JsonNode Arguments)> ToolCalls(FakeApi codeGraph) =>
+        codeGraph.Requests.Where(r => r.Method == HttpMethod.Post)
+            .Select(r => JsonNode.Parse(r.Body!)!)
+            .Where(m => m["method"]!.GetValue<string>() == "tools/call")
+            .Select(m => (m["params"]!["name"]!.GetValue<string>(), m["params"]!["arguments"]!))
+            .ToList();
 
     private static JsonObject Text(string text, JsonObject? structured = null)
     {
@@ -180,26 +222,33 @@ public class ReviewerToolLoopTests
     public async Task A_review_that_calls_analyze_impact_gets_codegraphs_answer_labelled_with_the_commit_it_describes()
     {
         var router = Router((SseAnswers.ToolTurn(("toolu_1", "analyze_impact", "{\"name\": \"X.Count\", \"depth\": 9}")), "high"), (SseAnswers.Answer(CleanFindings), "high"));
-        var codeGraph = CodeGraphServer(Text("X.Count: 3 callers (High: Program.Main)", new JsonObject { ["project"] = "r", ["lastCommitSha"] = IndexCommit }));
+        var impact = "X.Count: 3 callers (High: Program.Main)";
+        var codeGraph = CodeGraphServer(ContractAnswer(impact));
 
         var review = await Reviewer(router, codeGraph: new CodeGraphMcpClient(codeGraph.Client("https://codegraph.test/"), CodeGraphToken))
             .ReviewAsync(Request, CancellationToken.None);
 
         Assert.True(review.Clean, review.Error);
         var call = Assert.Single(review.Tools!);
-        Assert.Equal((ReviewTools.AnalyzeImpact, false, IndexCommit, ReviewTools.Sha256("X.Count: 3 callers (High: Program.Main)")),
+        Assert.Equal((ReviewTools.AnalyzeImpact, false, IndexCommit, ReviewTools.Sha256($"Commit: {IndexCommit}\n{impact}")),
             (call.Tool, call.Error, call.Commit, call.ResultSha256));
         var content = Body(router.Requests[1]).GetProperty("messages")[2].GetProperty("content")[0].GetProperty("content").GetString()!;
-        Assert.Contains($"CodeGraph's index of r's default branch as of {IndexCommit}, not the PR head {Head}", content);
-        Assert.Contains("X.Count: 3 callers", content);
+        Assert.Contains($"CodeGraph's index of {Project}'s default branch as of {IndexCommit}, not the PR head {Head}", content);
+        Assert.Contains(impact, content);
 
-        // MCP: initialize, initialized, tools/call — each with the owner's token, the session after the first; the depth clamped, the project defaulted.
-        Assert.Equal(["initialize", "notifications/initialized", "tools/call"],
-            codeGraph.Requests.Select(r => JsonNode.Parse(r.Body!)!["method"]!.GetValue<string>()));
+        // MCP: two sessions (find the project, then ask), each initialize, initialized, tools/call, then DELETE with its session id;
+        // the owner's token on every request.
+        Assert.Equal(["POST initialize", "POST notifications/initialized", "POST tools/call", "DELETE",
+                "POST initialize", "POST notifications/initialized", "POST tools/call", "DELETE"],
+            codeGraph.Requests.Select(r => r.Method == HttpMethod.Delete ? "DELETE" : $"POST {JsonNode.Parse(r.Body!)!["method"]!.GetValue<string>()}"));
         Assert.All(codeGraph.Requests, r => Assert.Equal($"Bearer {CodeGraphToken}", r.Headers["Authorization"]));
-        Assert.All(codeGraph.Requests.Skip(1), r => Assert.Equal("mcp-session-1", r.Headers[CodeGraphMcpClient.SessionHeader]));
-        var arguments = JsonNode.Parse(codeGraph.Requests[2].Body!)!["params"]!["arguments"]!;
-        Assert.Equal(("X.Count", 5, "r"), (arguments["name"]!.GetValue<string>(), arguments["depth"]!.GetValue<int>(), arguments["project"]!.GetValue<string>()));
+        Assert.Equal(["mcp-session-1", "mcp-session-1", "mcp-session-1", "mcp-session-2", "mcp-session-2", "mcp-session-2"],
+            codeGraph.Requests.Where(r => r.Headers.ContainsKey(CodeGraphMcpClient.SessionHeader)).Select(r => r.Headers[CodeGraphMcpClient.SessionHeader]));
+        // The project is the one whose GitHub URL is the PR's repository, searched by its name; the depth clamped.
+        var calls = ToolCalls(codeGraph);
+        Assert.Equal(("search_projects", "r"), (calls[0].Tool, calls[0].Arguments["search"]!.GetValue<string>()));
+        Assert.Equal(("analyze_impact", "X.Count", 5, Project),
+            (calls[1].Tool, calls[1].Arguments["name"]!.GetValue<string>(), calls[1].Arguments["depth"]!.GetValue<int>(), calls[1].Arguments["project"]!.GetValue<string>()));
         // E5: the CodeGraph token never goes to the router (no prompt, no header).
         Assert.All(router.Requests, r =>
         {
@@ -209,20 +258,72 @@ public class ReviewerToolLoopTests
     }
 
     [Fact]
-    public async Task A_codegraph_answer_without_its_commit_takes_it_from_the_project_listing_or_is_labelled_commit_unknown()
+    public async Task A_codegraph_answer_in_todays_live_shape_carries_no_commit_and_is_labelled_commit_unknown()
     {
-        var withListing = CodeGraphServer(Text("impact text"), Text($"- r\n  Repo: https://example.invalid/o/r\n  Last commit SHA: {IndexCommit}"));
-        var answer = await new CodeGraphMcpClient(withListing.Client("https://codegraph.test/"), CodeGraphToken)
-            .AnalyzeImpactAsync("X.Count", null, "r", CancellationToken.None);
-        Assert.Equal(new CodeGraphAnswer("impact text", false, IndexCommit), answer);
-        Assert.Equal("search_projects", JsonNode.Parse(withListing.Requests.Last().Body!)!["params"]!["name"]!.GetValue<string>());
-
         var router = Router((SseAnswers.ToolTurn(("toolu_1", "analyze_impact", "{\"name\": \"X.Count\"}")), "high"), (SseAnswers.Answer(CleanFindings), "high"));
-        var review = await Reviewer(router, codeGraph: new CodeGraphMcpClient(CodeGraphServer(Text("impact text")).Client("https://codegraph.test/"), CodeGraphToken))
+        var codeGraph = CodeGraphServer(Text(LiveImpact));
+
+        var review = await Reviewer(router, codeGraph: new CodeGraphMcpClient(codeGraph.Client("https://codegraph.test/"), CodeGraphToken))
             .ReviewAsync(Request, CancellationToken.None);
-        Assert.Equal(ReviewTools.UnknownCommit, Assert.Single(review.Tools!).Commit);
-        Assert.Contains($"default branch, commit unknown, not the PR head {Head}",
-            Body(router.Requests[1]).GetProperty("messages")[2].GetProperty("content")[0].GetProperty("content").GetString());
+
+        Assert.True(review.Clean, review.Error);
+        Assert.Equal((ReviewTools.UnknownCommit, false), (Assert.Single(review.Tools!).Commit, review.Tools![0].Error));
+        var content = Body(router.Requests[1]).GetProperty("messages")[2].GetProperty("content")[0].GetProperty("content").GetString()!;
+        Assert.Contains($"CodeGraph's index of {Project}'s default branch, commit unknown, not the PR head {Head}", content);
+        Assert.Contains("# Blast Radius: X.Count", content);
+    }
+
+    [Fact]
+    public async Task Analyze_impact_always_asks_about_the_pr_repository_resolved_once_per_session()
+    {
+        // The model cannot pick another project: the tool offers no such argument and one it sends anyway is ignored.
+        var schema = JsonSerializer.SerializeToElement(ReviewTools.Definitions[1]).GetProperty("input_schema").GetProperty("properties");
+        Assert.Equal(["name", "depth"], schema.EnumerateObject().Select(p => p.Name));
+        var router = Router((SseAnswers.ToolTurn(("toolu_1", "analyze_impact", "{\"name\": \"X.Count\", \"project\": \"secrets-service\"}"),
+            ("toolu_2", "analyze_impact", "{\"name\": \"Y.Run\"}")), "high"), (SseAnswers.Answer(CleanFindings), "high"));
+        var codeGraph = CodeGraphServer(ContractAnswer("impact"));
+
+        var review = await Reviewer(router, codeGraph: new CodeGraphMcpClient(codeGraph.Client("https://codegraph.test/"), CodeGraphToken))
+            .ReviewAsync(Request, CancellationToken.None);
+
+        Assert.True(review.Clean, review.Error);
+        Assert.All(review.Tools!, c => Assert.False(c.Error));
+        var calls = ToolCalls(codeGraph);
+        Assert.Equal(["search_projects", "analyze_impact", "analyze_impact"], calls.Select(c => c.Tool));
+        Assert.All(calls.Skip(1), c => Assert.Equal(Project, c.Arguments["project"]!.GetValue<string>()));
+    }
+
+    [Fact]
+    public async Task A_repository_codegraph_does_not_index_is_an_error_result_and_codegraph_is_not_asked_about_another()
+    {
+        var router = Router((SseAnswers.ToolTurn(("toolu_1", "analyze_impact", "{\"name\": \"X.Count\"}")), "high"), (SseAnswers.Answer(CleanFindings), "high"));
+        // Today's live listing for a search that finds only similarly named projects.
+        var codeGraph = CodeGraphServer(ContractAnswer("impact"), Text(
+            "- **r-tools** [csharp] (indexed: 2026-10-01)\n  Repo: https://github.com/o/r-tools\n- **r** [go] (indexed: 2026-10-02)\n  Repo: https://github.com/other/r\n"));
+
+        var review = await Reviewer(router, codeGraph: new CodeGraphMcpClient(codeGraph.Client("https://codegraph.test/"), CodeGraphToken))
+            .ReviewAsync(Request, CancellationToken.None);
+
+        Assert.True(review.Clean, review.Error);
+        Assert.True(Assert.Single(review.Tools!).Error);
+        var result = Body(router.Requests[1]).GetProperty("messages")[2].GetProperty("content")[0];
+        Assert.True(result.GetProperty("is_error").GetBoolean());
+        Assert.Contains($"o/r: {ReviewTools.NotIndexed}", result.GetProperty("content").GetString());
+        Assert.Equal(["search_projects"], ToolCalls(codeGraph).Select(c => c.Tool));
+    }
+
+    [Fact]
+    public void The_codegraph_project_is_the_entry_whose_own_repo_url_is_exactly_the_repositorys()
+    {
+        var repo = new RepoRef("o", "r");
+        Assert.Equal(Project, CodeGraphMcpClient.ProjectFor(LiveListing, repo));
+        Assert.Equal("a", CodeGraphMcpClient.ProjectFor("- **a** [x] (indexed: d)\n  Repo: https://GitHub.com/o/R/\r\n", repo));
+        Assert.Equal("a", CodeGraphMcpClient.ProjectFor("- **a** [x] (indexed: d)\n  Repo: https://github.com/o/r\n", repo));
+        // Similar names or URLs, another host or scheme, a prefix, and a URL before any entry never match.
+        Assert.Null(CodeGraphMcpClient.ProjectFor(
+            "  Repo: https://github.com/o/r\n- **r** [x] (indexed: d)\n  Repo: https://github.com/o/r-tools\n- **o/r** [x]\n  Repo: https://gitlab.com/o/r\n"
+            + "- **r3** [x]\n  Repo: http://github.com/o/r\n- **r4** [x]\n  Repo: https://github.com/o/r/tree/main\n", repo));
+        Assert.Null(CodeGraphMcpClient.ProjectFor("no projects", repo));
     }
 
     [Fact]
@@ -336,10 +437,62 @@ public class ReviewerToolLoopTests
     }
 
     [Fact]
-    public void The_codegraph_commit_is_read_from_structured_content_or_text_and_never_guessed()
+    public void The_codegraph_commit_is_read_from_the_contract_and_never_guessed()
     {
-        Assert.Equal(IndexCommit, CodeGraphMcpClient.Commit(new JsonObject { ["repo"] = new JsonObject { ["LastCommitSha"] = IndexCommit.ToUpperInvariant() } }, ""));
-        Assert.Equal("abc1234", CodeGraphMcpClient.Commit(null, "Indexed. last_commit_sha: abc1234"));
-        Assert.Null(CodeGraphMcpClient.Commit(new JsonObject { ["lastCommitSha"] = "not-a-sha" }, "commit at HEAD"));
+        // CodeGraph's contract (sc-25702): structuredContent.commitSha, else a first text line "Commit: <40-hex sha>".
+        Assert.Equal(IndexCommit, CodeGraphMcpClient.Commit(new JsonObject { ["commitSha"] = IndexCommit.ToUpperInvariant() }, ""));
+        Assert.Equal(IndexCommit, CodeGraphMcpClient.Commit(null, $"Commit: {IndexCommit}\n# Blast Radius: X"));
+        Assert.Equal(IndexCommit, CodeGraphMcpClient.Commit(new JsonObject { ["commitSha"] = "abc1234" }, $"Commit: {IndexCommit}"));
+        // Today's live answer, a short or malformed sha, a commit line that is not first, and other names are no commit.
+        Assert.Null(CodeGraphMcpClient.Commit(null, LiveImpact));
+        Assert.Null(CodeGraphMcpClient.Commit(new JsonObject { ["commitSha"] = "abc1234" }, "Commit: abc1234"));
+        Assert.Null(CodeGraphMcpClient.Commit(null, $"Commit: {IndexCommit}0"));
+        Assert.Null(CodeGraphMcpClient.Commit(null, $"# Blast Radius: X\nCommit: {IndexCommit}"));
+        Assert.Null(CodeGraphMcpClient.Commit(new JsonObject { ["lastCommitSha"] = IndexCommit, ["repo"] = new JsonObject { ["commitSha"] = IndexCommit } },
+            $"last commit sha: {IndexCommit}"));
+    }
+
+    [Fact]
+    public async Task A_session_past_its_tool_result_budget_gets_error_results_and_still_completes_with_its_findings()
+    {
+        var big = new string('x', ReviewTools.MaxResultChars + 100);
+        var calls = Enumerable.Range(1, 6).Select(i => ($"toolu_{i}", "read_file", "{\"path\": \"big.cs\"}")).ToArray();
+        var router = Router((SseAnswers.ToolTurn(calls), "high"), (SseAnswers.Answer(CleanFindings), "high"));
+        var repo = new Repo(new() { ["big.cs"] = big });
+
+        var review = await Reviewer(router, repo).ReviewAsync(Request, CancellationToken.None);
+
+        Assert.True(review.Clean, review.Error);
+        var budget = ReviewTools.Budget(Request.Prompt.Text.Length + RouterReviewer.BuildPrompt(Request).Length);
+        var results = Body(router.Requests[1]).GetProperty("messages")[2].GetProperty("content").EnumerateArray()
+            .Select(r => (Content: r.GetProperty("content").GetString()!, Error: r.GetProperty("is_error").GetBoolean())).ToList();
+        // Three full results fit, the fourth is cut to what is left, and the calls after it are not run.
+        Assert.Equal([false, false, false, false, true, true], results.Select(r => r.Error));
+        Assert.Equal(4, repo.Reads.Count);
+        Assert.All(results.Take(3), r => Assert.Contains($"the first {ReviewTools.MaxResultChars} shown", r.Content));
+        var shown = int.Parse(System.Text.RegularExpressions.Regex.Match(results[3].Content, @"the first (\d+) shown").Groups[1].Value);
+        Assert.InRange(shown, 1, ReviewTools.MaxResultChars - 1);
+        Assert.All(results.Skip(4), r => Assert.Contains($"used its budget of {budget} characters of tool results", r.Content));
+        // Everything sent back stays within the budget, but for the fences and the cut notes.
+        Assert.InRange(results.Sum(r => r.Content.Length), budget, budget + 1_000);
+    }
+
+    [Fact]
+    public async Task A_router_refusal_of_a_later_turn_makes_the_review_unusable_and_of_the_first_turn_fails_the_call()
+    {
+        var turns = 0;
+        var router = new FakeApi().On("POST /v1/messages", _ => turns++ == 0
+            ? SseAnswers.Response(SseAnswers.ToolTurn(("toolu_1", "read_file", "{\"path\": \"src/X.cs\"}")))
+            : FakeApi.Json(HttpStatusCode.BadRequest, """{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}"""));
+
+        var review = await Reviewer(router, new Repo(new() { ["src/X.cs"] = XSource })).ReviewAsync(Request, CancellationToken.None);
+
+        Assert.Contains("The router refused turn 2 of the session, after 1 tool calls", review.Error);
+        Assert.Contains("prompt is too long", review.Error);
+        Assert.Equal(ReviewTools.Sha256(XSource), Assert.Single(review.Tools!).ResultSha256);
+        Assert.False(review.Clean);
+
+        var first = new FakeApi().On("POST /v1/messages", _ => FakeApi.Json(HttpStatusCode.BadRequest, """{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"""));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Reviewer(first).ReviewAsync(Request, CancellationToken.None));
     }
 }

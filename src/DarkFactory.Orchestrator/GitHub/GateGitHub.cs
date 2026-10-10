@@ -144,7 +144,8 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
     /// A reviewer's <c>read_file</c> (sc-25705): <paramref name="path"/> at commit <paramref name="sha"/>, raw, with the gate's
     /// read-only token, through the contents API's JSON form (base64 content). Null when GitHub has no such path there or the path
     /// is not a file (a directory's listing, a symlink, a submodule). A file too large for that form (over 1 MB) throws, which the
-    /// reviewer's tool turns into an error result.
+    /// reviewer's tool turns into an error result. A file holding a NUL byte or bytes that are not valid UTF-8 is binary
+    /// (<see cref="BinaryFileException"/>): it is never decoded leniently into replacement characters.
     /// </summary>
     public async Task<string?> ReadFileAsync(RepoRef repo, string sha, string path, CancellationToken ct)
     {
@@ -168,8 +169,23 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         {
             throw new InvalidOperationException($"{path} at {sha} is too large for GitHub's contents API to return.");
         }
-        return new UTF8Encoding(false).GetString(Convert.FromBase64String(base64.Replace("\n", "").Replace("\r", "")));
+        var bytes = Convert.FromBase64String(base64.Replace("\n", "").Replace("\r", ""));
+        if (Array.IndexOf(bytes, (byte)0) >= 0)
+        {
+            throw new BinaryFileException(path);
+        }
+        try
+        {
+            return StrictUtf8.GetString(bytes);
+        }
+        catch (DecoderFallbackException)
+        {
+            throw new BinaryFileException(path);
+        }
     }
+
+    /// <summary>UTF-8 that throws on an invalid byte sequence rather than replacing it: such a file is binary.</summary>
+    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
     public async Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct)
     {

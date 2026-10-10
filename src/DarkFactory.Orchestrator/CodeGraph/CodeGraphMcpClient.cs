@@ -4,6 +4,8 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using DarkFactory.Orchestrator.Gate;
+using DarkFactory.Orchestrator.Gateway;
+using DarkFactory.Orchestrator.Shortcut;
 
 namespace DarkFactory.Orchestrator.CodeGraph;
 
@@ -11,14 +13,19 @@ namespace DarkFactory.Orchestrator.CodeGraph;
 /// The owner-side client of the hosted CodeGraph's MCP endpoint (<c>mcp</c> under <c>CodeGraph:BaseUrl</c>; MCP Streamable HTTP,
 /// JSON-RPC 2.0), over the <see cref="Gateway.OutboundHttp.CodeGraphApi"/> client it is given (sc-25705). Every call is a fresh MCP
 /// session: <c>initialize</c>, <c>notifications/initialized</c>, then <c>tools/call</c>, the session id (<c>Mcp-Session-Id</c>) the
-/// server hands out sent back on the later requests. The token (<c>CodeGraph:Token</c>) goes only in this client's
-/// <c>Authorization: Bearer</c> header (E5: never in a worker's env, argv, worktree or a prompt). An answer may come as JSON or as
-/// an event stream carrying the JSON-RPC response. Bounded: the client's timeout covers each request, and at most
-/// <see cref="MaxAnswerBytes"/> of an answer is read.
+/// server hands out sent back on the later requests, and the session ended afterwards with a best-effort <c>DELETE</c>. The token
+/// (<c>CodeGraph:Token</c>) goes only in this client's <c>Authorization: Bearer</c> header (E5: never in a worker's env, argv,
+/// worktree or a prompt). An answer may come as JSON or as an event stream carrying the JSON-RPC response. Bounded: the client's
+/// timeout covers each request, and at most <see cref="MaxAnswerBytes"/> of an answer is read.
 /// <para>
-/// The commit (E3): CodeGraph indexes the default branch. The commit its index describes is read from the <c>analyze_impact</c>
-/// answer (a <c>lastCommitSha</c> in its structured content, or a "last commit sha" line in its text); when the answer does not
-/// carry it, from CodeGraph's <c>search_projects</c> answer for the project; failing both, it is unknown (null).
+/// The commit (E3): CodeGraph indexes the default branch, and by its contract (CodeGraph sc-25702) every answer names the commit
+/// its index describes: <c>structuredContent.commitSha</c>, or a first text line <c>Commit: &lt;40-hex sha&gt;</c>
+/// (<see cref="Commit"/>). An answer that carries neither has an unknown commit (null); nothing else is searched for one.
+/// </para>
+/// <para>
+/// The project (<see cref="FindProjectAsync"/>): the CodeGraph project whose listed GitHub repository URL is exactly the
+/// repository's (<c>https://github.com/&lt;owner&gt;/&lt;name&gt;</c>, with or without the git suffix, case-insensitive), read from
+/// <c>search_projects</c>' entries (a <c>- **Name** …</c> line, then a <c>Repo: &lt;url&gt;</c> line).
 /// </para>
 /// </summary>
 public sealed partial class CodeGraphMcpClient(HttpClient http, string token) : ICodeGraph
@@ -27,62 +34,124 @@ public sealed partial class CodeGraphMcpClient(HttpClient http, string token) : 
     public const string SessionHeader = "Mcp-Session-Id";
     public const int MaxAnswerBytes = 1024 * 1024;
 
-    [GeneratedRegex(@"last[\s_-]*commit[\s_-]*(?:sha)?\W{0,4}([0-9a-f]{7,40})\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
-    private static partial Regex CommitInText();
+    /// <summary>How long the best-effort session close may take.</summary>
+    public static readonly TimeSpan CloseTimeout = TimeSpan.FromSeconds(10);
 
-    public async Task<CodeGraphAnswer> AnalyzeImpactAsync(string name, int? depth, string project, CancellationToken ct)
+    [GeneratedRegex(@"\ACommit: ([0-9a-fA-F]{40})[ \t]*(?:\r?\n|\z)", RegexOptions.CultureInvariant)]
+    private static partial Regex CommitLine();
+
+    [GeneratedRegex(@"\A[0-9a-fA-F]{40}\z", RegexOptions.CultureInvariant)]
+    private static partial Regex FullSha();
+
+    [GeneratedRegex(@"\A\s*-\s+\*\*(?<name>[^*\r\n]+)\*\*", RegexOptions.CultureInvariant)]
+    private static partial Regex ProjectEntry();
+
+    [GeneratedRegex(@"\A\s*Repo:\s*(?<url>\S+)\s*\z", RegexOptions.CultureInvariant)]
+    private static partial Regex RepoLine();
+
+    public Task<CodeGraphAnswer> AnalyzeImpactAsync(string name, int? depth, string project, CancellationToken ct)
     {
         var arguments = new JsonObject { ["name"] = name, ["project"] = project };
         if (depth is { } d)
         {
             arguments["depth"] = d;
         }
-        var session = await InitializeAsync(ct);
-        var (text, isError, structured) = await CallToolAsync(session, "analyze_impact", arguments, ct);
-        var commit = Commit(structured, text);
-        if (commit is null)
+        return InSessionAsync(async session =>
         {
-            try
-            {
-                var (projects, projectsError, projectsStructured) = await CallToolAsync(session, "search_projects", new JsonObject { ["search"] = project }, ct);
-                commit = projectsError ? null : Commit(projectsStructured, projects);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
-            {
-                // The answer stands; only its commit stays unknown.
-            }
-        }
-        return new CodeGraphAnswer(text, isError, commit);
+            var (text, isError, structured) = await CallToolAsync(session, "analyze_impact", arguments, ct);
+            return new CodeGraphAnswer(text, isError, Commit(structured, text));
+        }, ct);
     }
 
-    /// <summary>The commit a CodeGraph answer says its index describes, or null.</summary>
+    public Task<string?> FindProjectAsync(RepoRef repo, CancellationToken ct) =>
+        InSessionAsync(async session =>
+        {
+            var (text, isError, _) = await CallToolAsync(session, "search_projects", new JsonObject { ["search"] = repo.Name }, ct);
+            if (isError)
+            {
+                throw new InvalidOperationException($"CodeGraph's search_projects answered an error: {Cut(text)}");
+            }
+            return ProjectFor(text, repo);
+        }, ct);
+
+    /// <summary>
+    /// The commit a CodeGraph answer says its index describes (CodeGraph's contract, sc-25702): <c>structuredContent.commitSha</c>,
+    /// else a first text line <c>Commit: &lt;sha&gt;</c>; a full 40-hex sha only, lowercased; otherwise null (never guessed).
+    /// </summary>
     public static string? Commit(JsonNode? structured, string text)
     {
-        if (structured is not null && FindCommit(structured) is { } fromStructure)
+        if (structured is JsonObject obj && obj["commitSha"] is JsonValue v && v.TryGetValue<string>(out var sha) && FullSha().IsMatch(sha))
         {
-            return fromStructure;
+            return sha.ToLowerInvariant();
         }
-        return CommitInText().Match(text) is { Success: true } m ? m.Groups[1].Value.ToLowerInvariant() : null;
+        return CommitLine().Match(text) is { Success: true } m ? m.Groups[1].Value.ToLowerInvariant() : null;
     }
 
-    private static string? FindCommit(JsonNode node)
+    /// <summary>
+    /// The name of the entry of a <c>search_projects</c> listing whose own <c>Repo:</c> URL is exactly <paramref name="repo"/>'s GitHub
+    /// URL (with or without the git suffix or a trailing slash, case-insensitive), or null when no entry's is.
+    /// </summary>
+    public static string? ProjectFor(string listing, RepoRef repo)
     {
-        switch (node)
+        var wanted = RepoUrl(GitRemoteReads.GitHubRemote(repo));
+        string? name = null;
+        foreach (var line in listing.Split('\n'))
         {
-            case JsonObject obj:
-                foreach (var (key, value) in obj)
-                {
-                    if (key.Equals("lastCommitSha", StringComparison.OrdinalIgnoreCase) && value is JsonValue v && v.TryGetValue<string>(out var sha)
-                        && Regex.IsMatch(sha, "^[0-9a-fA-F]{7,40}$"))
-                    {
-                        return sha.ToLowerInvariant();
-                    }
-                }
-                return obj.Select(p => p.Value).OfType<JsonNode>().Select(FindCommit).FirstOrDefault(c => c is not null);
-            case JsonArray array:
-                return array.OfType<JsonNode>().Select(FindCommit).FirstOrDefault(c => c is not null);
-            default:
-                return null;
+            if (ProjectEntry().Match(line) is { Success: true } entry)
+            {
+                name = entry.Groups["name"].Value.Trim();
+            }
+            else if (name is not null && RepoLine().Match(line) is { Success: true } url
+                && string.Equals(RepoUrl(url.Groups["url"].Value), wanted, StringComparison.OrdinalIgnoreCase))
+            {
+                return name;
+            }
+        }
+        return null;
+    }
+
+    private static string RepoUrl(string url)
+    {
+        var u = url.Trim().TrimEnd('/');
+        return u.EndsWith(GitSuffix, StringComparison.OrdinalIgnoreCase) ? u[..^GitSuffix.Length] : u;
+    }
+
+    private const string GitSuffix = ".git";
+
+    /// <summary>Runs <paramref name="work"/> in a fresh MCP session, ended afterwards whatever happens.</summary>
+    private async Task<T> InSessionAsync<T>(Func<string?, Task<T>> work, CancellationToken ct)
+    {
+        var session = await InitializeAsync(ct);
+        try
+        {
+            await SendAsync(session, new JsonObject { ["jsonrpc"] = "2.0", ["method"] = "notifications/initialized" }, null, ct);
+            return await work(session);
+        }
+        finally
+        {
+            await CloseAsync(session);
+        }
+    }
+
+    /// <summary>Ends the MCP session (<c>DELETE</c> with its id). Best effort: a server that refuses or is gone changes nothing.</summary>
+    private async Task CloseAsync(string? session)
+    {
+        if (session is null)
+        {
+            return;
+        }
+        try
+        {
+            using var timeout = new CancellationTokenSource(CloseTimeout);
+            using var request = new HttpRequestMessage(HttpMethod.Delete, "mcp");
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            request.Headers.Add(SessionHeader, session);
+            request.Headers.Add("MCP-Protocol-Version", ProtocolVersion);
+            using var response = await http.SendAsync(request, timeout.Token);
+        }
+        catch (Exception)
+        {
+            // Best effort: the server expires the session anyway.
         }
     }
 
@@ -102,9 +171,9 @@ public sealed partial class CodeGraphMcpClient(HttpClient http, string token) : 
         }, 1, ct);
         if (response?["result"] is null)
         {
+            await CloseAsync(session);
             throw new InvalidOperationException($"CodeGraph refused to initialize an MCP session: {Cut(response?["error"]?.ToJsonString() ?? "(no answer)")}");
         }
-        await SendAsync(session, new JsonObject { ["jsonrpc"] = "2.0", ["method"] = "notifications/initialized" }, null, ct);
         return session;
     }
 

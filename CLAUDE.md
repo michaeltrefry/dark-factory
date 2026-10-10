@@ -562,13 +562,23 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   prompt is the role's prompt file and whose message holds the story, the base commit's file list
   (`IGateGitHub.GetFilesAsync`) and the diff of the PR's head commit — nothing else. Tool loop (sc-25705, `Gate/ReviewTools.cs`): every
   panel call offers `read_file` (a repo path at the PR head, read owner-side by the gate's read-only GitHub access,
-  `GitHubGate.ReadFileAsync`) and `analyze_impact` (forwarded owner-side to CodeGraph's MCP endpoint, `CodeGraph/CodeGraphMcpClient`,
-  each answer labelled with the default-branch commit its index describes — `lastCommitSha` from the answer or `search_projects` —
-  or "commit unknown", always "not the PR head"); a turn stopping for `tool_use` has the orchestrator run each call and answer it
+  `GitHubGate.ReadFileAsync`; a file with a NUL byte or invalid UTF-8 is binary, "binary file, not shown") and `analyze_impact`
+  (forwarded owner-side to CodeGraph's MCP endpoint, `CodeGraph/CodeGraphMcpClient`, one MCP session per call, ended by a
+  best-effort `DELETE`). The model names only the element and depth, never a project: the orchestrator always asks about the PR's
+  repository, the CodeGraph project whose `search_projects` entry's `Repo:` URL is exactly `https://github.com/<owner>/<name>`
+  (with or without `.git`, case-insensitive; resolved once per session), and a repository no entry matches answers the error
+  "repository not indexed in CodeGraph". Each answer is labelled with the default-branch commit its index describes, read only
+  from CodeGraph's contract (CodeGraph sc-25702): `structuredContent.commitSha`, else a first text line `Commit: <40-hex sha>` —
+  otherwise "commit unknown" (today's hosted answers carry neither until sc-25702 deploys) — always "not the PR head". A turn
+  stopping for `tool_use` has the orchestrator run each call and answer it
   in a `<tool-result>` fence in the next turn of the same session (same session id, class header, placeholder model), at most
-  `RouterReviewer.MaxTurns` (8) turns and `MaxToolCalls` (24) calls; every turn must be served on `high` (the first that is not
-  ends the session, unusable) and a usage refusal on any turn pauses as below. A tool that cannot answer (no such file, CodeGraph
-  unreachable or unconfigured) gives the model an error result; it never fails the review by itself. Each call is recorded in the
+  `RouterReviewer.MaxTurns` (8) turns and `MaxToolCalls` (24) calls, and the session's tool results together at most
+  `ReviewTools.Budget` characters (`MaxSessionChars` 200,000 less the prompt, at least `MinSessionBudget` 8,000; each result is cut
+  to what is left, a call once it is spent answers an error); every turn must be served on `high` (the first that is not
+  ends the session, unusable), a usage refusal on any turn pauses as below, and a router 400/413 on a later turn (a conversation
+  grown too long) makes the answer unusable rather than failing the run. A tool that cannot answer (no such file, a binary file,
+  a repository CodeGraph does not index, CodeGraph unreachable or unconfigured) gives the model an error result; it never fails
+  the review by itself. Each call is recorded in the
   verdict's review or second opinion (`tools`: tool, arguments, SHA-256 of the raw result, error, CodeGraph commit) and the
   report counts them per review. Prompts: `factory/prompts/{correctness,spec-conformance,security,confirm}.md` in this repo, compiled in as
   embedded resources (`ReviewPrompts`) — never read from the target repo or the PR (which could rewrite the prompt it is

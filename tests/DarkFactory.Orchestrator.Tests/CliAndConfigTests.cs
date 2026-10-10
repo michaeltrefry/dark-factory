@@ -344,7 +344,7 @@ public class FactoryOptionsTests
             var tools = FactoryRunner.CreateReviewTools(none, new NoFiles(), http, log);
             Assert.Contains("no CodeGraph token", log.ToString());
             var outcome = await tools.RunAsync(new AnswerBlock(AnswerBlock.ToolUse, null, "toolu_1", ReviewTools.AnalyzeImpact, "{\"name\":\"X\"}"),
-                new Shortcut.RepoRef("o", "r"), "head", CancellationToken.None);
+                ReviewTools.Session(new Shortcut.RepoRef("o", "r"), "head", 0), CancellationToken.None);
             Assert.True(outcome.IsError);
             Assert.Contains("CodeGraph is not configured", outcome.Content);
         }
@@ -353,7 +353,7 @@ public class FactoryOptionsTests
         var configured = FactoryRunner.CreateReviewTools(Options(new() { ["CodeGraph:Token"] = "cg_config" }), new NoFiles(),
             codeGraph.Client("https://codegraph.test/"), TextWriter.Null);
         await configured.RunAsync(new AnswerBlock(AnswerBlock.ToolUse, null, "toolu_1", ReviewTools.AnalyzeImpact, "{\"name\":\"X\"}"),
-            new Shortcut.RepoRef("o", "r"), "head", CancellationToken.None);
+            ReviewTools.Session(new Shortcut.RepoRef("o", "r"), "head", 0), CancellationToken.None);
         Assert.Equal("Bearer cg_config", codeGraph.Requests.First().Headers["Authorization"]);
     }
 

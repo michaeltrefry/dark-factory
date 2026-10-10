@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -31,6 +32,12 @@ public sealed record ConfirmRequest(WorkStory Story, string Repo, PullFacts Pull
 /// </summary>
 public sealed class RouterUsageLimitedException(string message) : Exception(message);
 
+/// <summary>
+/// The router refused a review turn's request itself (400 or 413: for a later turn, most likely a conversation grown too long).
+/// On a session's first turn it is rethrown as a plain <see cref="InvalidOperationException"/>; on a later turn the answer is unusable.
+/// </summary>
+internal sealed class RouterRefusedRequestException(string message) : InvalidOperationException(message);
+
 public interface IReviewer
 {
     /// <summary>
@@ -59,7 +66,9 @@ public interface IReviewer
 /// (sc-25705): a turn that stops for <c>tool_use</c> has each call run by the orchestrator, owner-side, and its result sent back
 /// fenced as data (<c>tool-result</c>, <see cref="PromptFence"/>) in the next turn of the same session (same
 /// <see cref="SessionHeader"/>, class header and placeholder model), until the model ends with its answer, at most
-/// <see cref="MaxTurns"/> turns and <see cref="MaxToolCalls"/> calls. Every turn must be served on the high class: the first that
+/// <see cref="MaxTurns"/> turns and <see cref="MaxToolCalls"/> calls, its tool results bounded together by the session's budget
+/// (<see cref="ReviewTools.Budget"/>: <see cref="ReviewTools.MaxSessionChars"/> less the prompt; a call past it answers an error),
+/// and a router refusal (400/413) of a later turn makes the answer unusable. Every turn must be served on the high class: the first that
 /// is not ends the session, and the answer is unusable. A usage refusal on any turn throws <see cref="RouterUsageLimitedException"/>.
 /// The calls are recorded in the review (<see cref="RoleReview.Tools"/>, <see cref="Confirmation.Tools"/>). Every turn streams
 /// (<see cref="MessageStream"/>): <c>Review:TimeoutMinutes</c> (the client's timeout) bounds the whole session, its turns and tool
@@ -146,12 +155,30 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
         }
         var messages = new List<object> { new { role = "user", content = user } };
         var calls = new List<ToolCall>();
+        var toolSession = ReviewTools.Session(RepoRef.Parse(repo), headSha, system.Length + user.Length);
         IReadOnlyList<ToolCall>? Calls() => calls.Count > 0 ? calls : null;
         try
         {
             for (var turn = 1; ; turn++)
             {
-                var (answer, servedClass) = await TurnAsync(session, system, messages, deadline.Token);
+                StreamedAnswer answer;
+                string? servedClass;
+                try
+                {
+                    (answer, servedClass) = await TurnAsync(session, system, messages, deadline.Token);
+                }
+                catch (RouterRefusedRequestException refused) when (turn > 1)
+                {
+                    // The conversation the tool results grew is what the router refused (too long, most likely): the review is
+                    // unusable, as an answer that cannot count is, rather than a failure of the run.
+                    return new SessionEnd(null, null, null, "",
+                        $"The router refused turn {turn} of the session, after {calls.Count} tool calls: {refused.Message}", Calls());
+                }
+                catch (RouterRefusedRequestException refused)
+                {
+                    // The first turn's refusal fails the call as any other refusal does, as before the tool loop.
+                    throw new InvalidOperationException(refused.Message);
+                }
                 if (ReviewModels.CallProblem(servedClass) is not null || answer.StopReason != "tool_use")
                 {
                     return new SessionEnd(answer.Served, servedClass, answer.StopReason, answer.Text, null, Calls());
@@ -171,7 +198,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
                 foreach (var use in uses)
                 {
                     var outcome = calls.Count < MaxToolCalls
-                        ? await _tools.RunAsync(use, RepoRef.Parse(repo), headSha, deadline.Token)
+                        ? await _tools.RunAsync(use, toolSession, deadline.Token)
                         : ReviewTools.OverBudget(use, MaxToolCalls);
                     calls.Add(outcome.Record);
                     results.Add(new { type = "tool_result", tool_use_id = use.Id, content = PromptFence.Block(ToolResultTag, outcome.Content), is_error = outcome.IsError });
@@ -234,6 +261,10 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
             if (UsageLimited((int)response.StatusCode, body))
             {
                 throw new RouterUsageLimitedException(why);
+            }
+            if (response.StatusCode is HttpStatusCode.BadRequest or HttpStatusCode.RequestEntityTooLarge)
+            {
+                throw new RouterRefusedRequestException(why);
             }
             throw new InvalidOperationException(why);
         }
