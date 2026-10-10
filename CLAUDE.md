@@ -111,8 +111,8 @@ committed: they come from env/user-secrets or the macOS login keychain
 | --- | --- |
 | `Router:BaseUrl` | `http://localhost:8080` (an absolute http(s) URL; one naming a model provider's host or key — `src/DarkFactory.Analyzers/ProviderMarkers.txt`, the gateway lint's list, embedded in both the analyzer and the orchestrator, `Gateway/ProviderMarkers.cs` — is refused, P1-E1) |
 | `Router:Key` | env `FACTORY_ROUTER_KEY`, or keychain account `router-key` |
-| `CodeGraph:BaseUrl` | the hosted CodeGraph (`OutboundHttp.CodeGraphDefaultBase`; an absolute http(s) URL naming no model provider): reviewers' `analyze_impact` goes to its `mcp` endpoint |
-| `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional: without it the factory starts and `analyze_impact` answers the reviewer an error result (recorded) |
+| `CodeGraph:BaseUrl` | the hosted CodeGraph (`OutboundHttp.CodeGraphDefaultBase`; an absolute http(s) URL naming no model provider): reviewers' CodeGraph tools (`ReviewTools.CodeGraphTools`) go to its `mcp` endpoint |
+| `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional: without it the factory starts and every CodeGraph tool answers the reviewer an error result (recorded) |
 | `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
 | `GitHub:Gate:AppId`, `GitHub:Gate:PrivateKeyPem` | keychain `github-gate-app-id`, `github-gate-app-private-key` (written by `factory github-app setup --gate`): the merge gate's App, the only credential that merges |
@@ -560,27 +560,51 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `model_class_unavailable` for a body model outside the class and would usage-pause every review in a loop), its own fresh
   `X-Claude-Code-Session-Id` so the cost stays scoped to it and no worker session or transcript reaches it) whose system
   prompt is the role's prompt file and whose message holds the story, the base commit's file list
-  (`IGateGitHub.GetFilesAsync`) and the diff of the PR's head commit — nothing else. Tool loop (sc-25705, `Gate/ReviewTools.cs`): every
-  panel call offers `read_file` (a repo path at the PR head, read owner-side by the gate's read-only GitHub access,
-  `GitHubGate.ReadFileAsync`; a file with a NUL byte or invalid UTF-8 is binary, "binary file, not shown") and `analyze_impact`
-  (forwarded owner-side to CodeGraph's MCP endpoint, `CodeGraph/CodeGraphMcpClient`, one MCP session per call, ended by a
-  best-effort `DELETE`). The model names only the element and depth, never a project: the orchestrator always asks about the PR's
-  repository, the CodeGraph project whose `search_projects` entry's `Repo:` URL is exactly `https://github.com/<owner>/<name>`
-  (with or without `.git`, case-insensitive; resolved once per session), and a repository no entry matches answers the error
-  "repository not indexed in CodeGraph". Each answer is labelled with the default-branch commit its index describes, read only
-  from CodeGraph's contract (CodeGraph sc-25702): `structuredContent.commitSha`, else a first text line `Commit: <40-hex sha>` —
-  otherwise "commit unknown" (today's hosted answers carry neither until sc-25702 deploys) — always "not the PR head". A turn
-  stopping for `tool_use` has the orchestrator run each call and answer it
-  in a `<tool-result>` fence in the next turn of the same session (same session id, class header, placeholder model), at most
-  `RouterReviewer.MaxTurns` (8) turns and `MaxToolCalls` (24) calls, and the session's tool results together at most
-  `ReviewTools.Budget` characters (`MaxSessionChars` 200,000 less the prompt, at least `MinSessionBudget` 8,000; each result is cut
-  to what is left, a call once it is spent answers an error); every turn must be served on `high` (the first that is not
-  ends the session, unusable), a usage refusal on any turn pauses as below, and a router 400/413 on a later turn (a conversation
-  grown too long) makes the answer unusable rather than failing the run. A tool that cannot answer (no such file, a binary file,
-  a repository CodeGraph does not index, CodeGraph unreachable or unconfigured) gives the model an error result; it never fails
-  the review by itself. Each call is recorded in the
-  verdict's review or second opinion (`tools`: tool, arguments, SHA-256 of the raw result, error, CodeGraph commit) and the
-  report counts them per review. Prompts: `factory/prompts/{correctness,spec-conformance,security,confirm}.md` in this repo, compiled in as
+  (`IGateGitHub.GetFilesAsync`) and the diff of the PR's head commit — nothing else. Tool loop (sc-25705, sc-25706,
+  `Gate/ReviewTools.cs`): every role and every second opinion is offered exactly `ReviewTools.Names` (E2, a read-only allowlist
+  in code; a tool name off it — CodeGraph's Ask, `project_report`, `rag_search`, … — answers an error result and is never
+  forwarded, and `CodeGraphMcpClient.CallAsync` refuses one before sending anything). Repository tools, `IReviewFiles` served
+  owner-side from the gate's clone (`GitWorkspace`, by object, `OwnerGit`-isolated: no checkout, so no filter, hook or symlink of
+  the PR runs or is followed; a commit not yet in the clone is fetched first): `read_file` (`git ls-tree -l` + `cat-file`; a
+  symlink/submodule/directory is no file, one over `MaxFileBytes` 1 MiB is not read; the blob is read as bytes, and a NUL byte or
+  invalid UTF-8 — so UTF-16 too — is binary, "binary file, not shown"; a valid U+FFFD is text), `list_files` (`ls-tree -r`, at most
+  `MaxListedFiles` 2,000 shown) and `grep` (`git grep -I -E --no-textconv -e <pattern>` on the tree, pattern ≤ `MaxPatternChars` 200,
+  `MaxGrepPerFile` 20 per file, `MaxGrepMatches` 200 shown, lines cut at `MaxGrepLineChars` 300), each at the PR head or, with
+  `ref: base`, its base commit. Their git reads stream git's output and stop git (its whole process tree) once the shown cap is
+  passed ("More than N …, the first N shown"), a listing passes `GitWorkspace.MaxReviewReadBytes` (240,000) or grep's kept lines
+  do (each line keeps at most `MaxGrepRecordBytes` 8 KiB); each git command of a read has its own `GitWorkspace.ReviewReadTimeout`
+  (30 s) and answers an error past it; a cancelled git read (`RunGitAsync` included) stops the git it started before it throws; a path is normalised (`RepoPath`) and
+  one leaving the repository is refused before anything is read (`--literal-pathspecs`: no glob or magic). CodeGraph tools
+  (`ReviewTools.CodeGraphTools`, each checked against CodeGraph's source to reach only the graph store and indexed files, never a
+  model — the reason per tool is the comment on the list): `analyze_impact`, `search_graph`, `trace_call_path`, `find_consumers`,
+  `find_publishers`, `get_code_snippet`, `read_node_source`; forwarded owner-side to CodeGraph's MCP endpoint
+  (`CodeGraph/CodeGraphMcpClient`, one MCP session per call, ended by a best-effort `DELETE`), arguments built by the orchestrator
+  (strings cut at 300, depths clamped 1–5, a snippet path `RepoPath`-normalised). No tool takes a project: the orchestrator always
+  sets the PR's repository, the CodeGraph project whose `search_projects` entry's `Repo:` URL is exactly
+  `https://github.com/<owner>/<name>` (with or without `.git`, case-insensitive; resolved once per session), and a repository no
+  entry matches answers the error "repository not indexed in CodeGraph". Queries are asked about this repository; answers are not
+  filtered and may name nodes of other indexed projects that depend on or call it (`analyze_impact`'s cross-repo impact,
+  `trace_call_path`, `find_consumers`/`find_publishers` cross projects), which every graph tool's description says; `read_node_source` (whose CodeGraph handler takes only a
+  node id) is shown only when its answer's header names that project. Each answer is labelled with the default-branch commit its
+  index describes, read only from CodeGraph's contract (CodeGraph sc-25702): `structuredContent.commitSha`, else a first text line
+  `Commit: <40-hex sha>` — otherwise "commit unknown" (today's hosted answers carry neither until sc-25702 deploys) — always "not
+  the PR head". A turn stopping for `tool_use` has the orchestrator run each call and answer it in a `<tool-result>` fence in the
+  next turn of the same session (same session id, class header, placeholder model), at most `RouterReviewer.MaxTurns` (8) turns
+  with tools (`tool_choice: auto`) and `MaxToolCalls` (24) calls; a model still asking for tools in the 8th turn gets those calls
+  answered "not run" plus a final-answer request (`RouterReviewer.FinalAnswerRequest`) and one more turn with `tool_choice: none`
+  (the tool definitions stay: the Messages API refuses tool blocks without them); no findings/confirmation line there — or tools
+  asked for again — is unusable ("No usable final answer after the turn cap: …"). The session's tool results together are at most
+  `ReviewTools.Budget` characters (`MaxSessionChars` 200,000 less the prompt, at least `MinSessionBudget` 8,000), and each result at
+  most `MaxResultBytes` (60,000) UTF-8 bytes, cut on a character boundary with an explicit `[cut: N bytes, the first M bytes shown]`
+  marker; a call once the budget is spent answers an error. Every turn must be served on `high` (the first that is not ends the
+  session, unusable), a usage refusal on any turn pauses as below, and a router 400/413 on a later turn (a conversation grown too
+  long) makes the answer unusable rather than failing the run. A tool that cannot answer (no such file, a binary file, a
+  repository CodeGraph does not index, CodeGraph unreachable or unconfigured) gives the model an error result; it never fails
+  the review by itself. Each call is recorded in the verdict's review or, for a second opinion, on the finding's confirmation
+  under its own `confirm-<role>` session (`tools`: tool, arguments, SHA-256 of the raw result, error, CodeGraph commit) and the
+  report counts them per review. The prompts make reading code a rule: no claim about code outside the diff without reading it
+  (a finding about unread code is not allowed), and a second opinion on a finding that depends on unshown code reads it, then
+  confirms or rejects. Prompts: `factory/prompts/{correctness,spec-conformance,security,confirm}.md` in this repo, compiled in as
   embedded resources (`ReviewPrompts`) — never read from the target repo or the PR (which could rewrite the prompt it is
   judged by) nor from disk at run time; changing one is a dark-factory PR. Each role answers findings tagged `blocking` or
   `optional` (an unknown severity counts as blocking); each blocking finding goes to a second opinion (its own high-class router session) with `confirm.md`: not confirmed → downgraded to optional (`downgraded: true`), does not
