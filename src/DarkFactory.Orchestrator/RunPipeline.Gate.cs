@@ -509,21 +509,26 @@ public sealed partial class RunPipeline
 
     /// <summary>
     /// CodeGraph's overlay of the PR head (sc-25708): a ready one recorded for this head (a resumed review, or the review before the
-    /// merge gate) is reused; otherwise it is requested and waited for through <paramref name="overlays"/> and the outcome checkpointed
-    /// (<see cref="Steps.CodeGraphOverlay"/>).
+    /// merge gate) is reused unless <paramref name="requestAgain"/> (CodeGraph has since answered that it has no usable overlay of the
+    /// head, e.g. the recorded one went stale when the default branch moved past its base: <see cref="CodeGraphRisk.OverlayUnusable"/>);
+    /// otherwise it is requested and waited for through <paramref name="overlays"/> (which requests a stale overlay again) and the outcome
+    /// checkpointed (<see cref="Steps.CodeGraphOverlay"/>) unless the last row for this head already records exactly it.
+    /// <paramref name="wait"/> bounds the wait (the gate's <c>Gate:CiTimeoutMinutes</c>; <paramref name="ct"/> when not given), while
+    /// the ledger and the controls use <paramref name="ct"/>.
     /// </summary>
-    private async Task<CodeGraphOverlay> HeadOverlayAsync(Run run, PullFacts pull, ReviewOverlays overlays, string tag, CancellationToken ct)
+    private async Task<CodeGraphOverlay> HeadOverlayAsync(Run run, PullFacts pull, ReviewOverlays overlays, string tag, CancellationToken ct,
+        bool requestAgain = false, CancellationToken? wait = null)
     {
         await ThrowIfControlledAsync(run.Item, ct);
         var row = (await ledger.HistoryAsync(run.Item, ct)).LastOrDefault(e => e.Step == Steps.CodeGraphOverlay
             && CodeGraphOverlay.FromDetail(e.Detail)?.HeadSha == pull.HeadSha);
-        if (CodeGraphOverlay.FromDetail(row?.Detail) is { IsReady: true } recorded)
+        if (!requestAgain && CodeGraphOverlay.FromDetail(row?.Detail) is { IsReady: true } recorded)
         {
             // The overlay of this head was ready, so it is not waited for again.
             log.WriteLine($"[{tag}] CodeGraph overlay of {Ci.Short(pull.HeadSha)}: {recorded.Describe} (recorded)");
             return recorded;
         }
-        var overlay = await overlays.WaitAsync(run.Repo, pull.HeadSha, c => ThrowIfControlledAsync(run.Item, c), GateTime, ct);
+        var overlay = await overlays.WaitAsync(run.Repo, pull.HeadSha, _ => ThrowIfControlledAsync(run.Item, ct), GateTime, wait ?? ct);
         // The gate's pending wait asks again every poll: an outcome the last row for this head already records is not written again.
         if (row?.Detail != overlay.ToDetail())
         {
@@ -534,32 +539,18 @@ public sealed partial class RunPipeline
     }
 
     /// <summary>
-    /// CodeGraph's inputs to <c>risk-threshold</c> for the PR head (sc-25709), when the change's tiers require the check (null otherwise,
-    /// and when the policy or diff is unreadable or the head has no verdict yet: the gate blocks or reviews first, reading nothing; and
-    /// when no CodeGraph is configured, which fails the check). The blast radius needs CodeGraph's overlay of exactly the head
-    /// (<see cref="HeadOverlayAsync"/>: a ready one recorded for it is reused); the hotspots are read from the default branch.
+    /// CodeGraph's inputs to <c>risk-threshold</c> for the PR head (sc-25709), read only once everything else the gate checks holds (the
+    /// gate evaluated without them came out <see cref="GateOutcome.Pending"/>). The blast radius needs CodeGraph's overlay of exactly the
+    /// head (<see cref="HeadOverlayAsync"/>: a ready one recorded for it is reused unless <paramref name="requestOverlay"/>); the hotspots
+    /// are read from the default branch (reused from <paramref name="hotspots"/> within one wait). <paramref name="wait"/> bounds the
+    /// CodeGraph calls (the gate's deadline).
     /// </summary>
-    private async Task<CodeGraphRisk?> CodeGraphRiskAsync(Run run, PullFacts pull, List<LedgerEntry> history, string? policyText, string? diff,
-        CancellationToken ct)
+    private async Task<CodeGraphRisk> CodeGraphRiskAsync(Run run, PullFacts pull, string diff, CodeGraphRiskReader reader, bool requestOverlay,
+        HotspotCache hotspots, CancellationToken wait, CancellationToken ct)
     {
-        if (policyText is null || diff is null || Gate.Risk is not { } reader || !Verdicts(history).Any(v => v.HeadSha == pull.HeadSha))
-        {
-            return null;
-        }
-        try
-        {
-            if (!GatePolicy.Parse(policyText).Classify(diff).Requires(GateChecks.RiskThreshold))
-            {
-                return null;
-            }
-        }
-        catch (GatePolicyException)
-        {
-            return null;
-        }
-        var overlay = await HeadOverlayAsync(run, pull, reader.Overlays, "gate", ct);
+        var overlay = await HeadOverlayAsync(run, pull, reader.Overlays, "gate", ct, requestOverlay, wait);
         await ThrowIfControlledAsync(run.Item, ct);
-        var risk = await reader.ReadAsync(run.Repo, pull.HeadSha, overlay, MergeGate.TouchedFiles(diff), ct);
+        var risk = await reader.ReadAsync(run.Repo, pull.HeadSha, overlay, MergeGate.TouchedFiles(diff), wait, hotspots);
         log.WriteLine($"[gate] {risk.Describe()}");
         return risk;
     }

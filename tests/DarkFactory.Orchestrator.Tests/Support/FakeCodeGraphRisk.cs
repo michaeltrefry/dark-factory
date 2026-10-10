@@ -1,13 +1,14 @@
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Shortcut;
+using Microsoft.Extensions.Time.Testing;
 
 namespace DarkFactory.Orchestrator.Tests.Support;
 
 /// <summary>
 /// A CodeGraph for the merge gate's <c>risk-threshold</c> (sc-25709), in memory: the project is found, the overlay of any commit is
 /// ready at once, and by default every file has no data (<c>found: false</c>: blast radius none, hotspot 0) — so a pipeline test's
-/// gate passes the check unless the test says otherwise through <see cref="Impact"/>, <see cref="Hotspot"/>, <see cref="Overlay"/>
-/// or <see cref="Project"/>.
+/// gate passes the check unless the test says otherwise through <see cref="Impact"/>, <see cref="Hotspot"/>, <see cref="Overlay"/>,
+/// <see cref="Status"/> or <see cref="Project"/>. Like a real client, a call made with a cancelled token throws.
 /// </summary>
 public sealed class FakeCodeGraphRisk : ICodeGraphRisk
 {
@@ -18,6 +19,9 @@ public sealed class FakeCodeGraphRisk : ICodeGraphRisk
 
     /// <summary>When set, the overlay answer for a requested commit (else ready at that commit).</summary>
     public Func<string, OverlayAnswer>? Overlay { get; set; }
+
+    /// <summary>When set, the status answer for an overlay id (else failed).</summary>
+    public Func<long, OverlayAnswer>? Status { get; set; }
 
     /// <summary>When set, the impact answer for (path, sha); throw from it to make the call fail.</summary>
     public Func<string, string, ImpactFileAnswer>? Impact { get; set; }
@@ -32,42 +36,68 @@ public sealed class FakeCodeGraphRisk : ICodeGraphRisk
         new(fake ?? new FakeCodeGraphRisk(), TimeSpan.FromSeconds(5), TimeSpan.FromMilliseconds(1));
 
     /// <summary>A found file's impact answer at <paramref name="sha"/>.</summary>
-    public static ImpactFileAnswer Found(string sha, BlastRadius radius) =>
-        new(false, $"Commit: {sha}", sha, null, null, true, BlastRadii.Name(radius));
+    public static ImpactFileAnswer Found(string path, string sha, BlastRadius radius) =>
+        new(false, $"Commit: {sha}", sha, null, null, true, BlastRadii.Name(radius), path);
 
     /// <summary>A found file's hotspot answer with <paramref name="riskScore"/>.</summary>
-    public static HotspotAnswer Hot(double riskScore) =>
-        new(false, $"Commit: {IndexCommit}", IndexCommit, CodeGraphRiskReader.DefaultBranchSource, null, true, riskScore);
+    public static HotspotAnswer Hot(string path, double riskScore) =>
+        new(false, $"Commit: {IndexCommit}", IndexCommit, CodeGraphRiskReader.DefaultBranchSource, null, true, riskScore, path);
+
+    /// <summary>C4's not-indexed answer of a SHA CodeGraph has no usable overlay of (e.g. status <c>stale</c>).</summary>
+    public static ImpactFileAnswer NotIndexed(string sha, string status) =>
+        new(false, "Not indexed", sha, new CodeGraphNotIndexed("commit_not_indexed", status, "No ready overlay for this commit.", 7, null), null, null, null);
 
     public Task<string?> FindProjectAsync(RepoRef repo, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         Calls.Add(("search_projects", repo.FullName));
         return Task.FromResult(Project);
     }
 
     public Task<OverlayAnswer> RequestOverlayAsync(string project, string gitRef, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         Calls.Add(("request_overlay", gitRef));
         return Task.FromResult(Overlay?.Invoke(gitRef) ?? new OverlayAnswer(false, "ready", 7, "ready", gitRef, IndexCommit, null));
     }
 
     public Task<OverlayAnswer> OverlayStatusAsync(long overlayId, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         Calls.Add(("get_overlay_status", overlayId.ToString(System.Globalization.CultureInfo.InvariantCulture)));
-        return Task.FromResult(new OverlayAnswer(false, "failed", overlayId, "failed", null, null, "polled"));
+        return Task.FromResult(Status?.Invoke(overlayId) ?? new OverlayAnswer(false, "failed", overlayId, "failed", null, null, "polled"));
     }
 
     public Task<ImpactFileAnswer> AnalyzeImpactFileAsync(string project, string path, string sha, int depth, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         Calls.Add(("analyze_impact_file", path));
-        return Task.FromResult(Impact?.Invoke(path, sha) ?? new ImpactFileAnswer(false, $"Commit: {sha}", sha, null, null, false, "none"));
+        return Task.FromResult(Impact?.Invoke(path, sha) ?? new ImpactFileAnswer(false, $"Commit: {sha}", sha, null, null, false, "none", path));
     }
 
     public Task<HotspotAnswer> FileHotspotAsync(string project, string path, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         Calls.Add(("file_hotspot", path));
         return Task.FromResult(Hotspot?.Invoke(path)
-            ?? new HotspotAnswer(false, $"Commit: {IndexCommit}", IndexCommit, CodeGraphRiskReader.DefaultBranchSource, null, false, null));
+            ?? new HotspotAnswer(false, $"Commit: {IndexCommit}", IndexCommit, CodeGraphRiskReader.DefaultBranchSource, null, false, null, path));
+    }
+}
+
+/// <summary>
+/// A fake clock on which every wait finishes by itself: each timer created (a <c>Task.Delay</c>, a <c>CancellationTokenSource</c>
+/// deadline) moves the clock on by <see cref="Step"/> once it exists, so waits run in fake time, deterministically, however loaded the
+/// machine is — the time elapsed is (timers created) × <see cref="Step"/>, and a deadline of N steps fires after N timers.
+/// </summary>
+public sealed class SteppingClock(DateTimeOffset start, TimeSpan step) : FakeTimeProvider(start)
+{
+    public TimeSpan Step { get; } = step;
+
+    public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+    {
+        var timer = base.CreateTimer(callback, state, dueTime, period);
+        _ = Task.Run(() => Advance(Step));
+        return timer;
     }
 }
 

@@ -115,7 +115,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Router:Key` | env `FACTORY_ROUTER_KEY`, or keychain account `router-key` |
 | `CodeGraph:BaseUrl` | the hosted CodeGraph (`OutboundHttp.CodeGraphDefaultBase`; an absolute http(s) URL naming no model provider): reviewers' CodeGraph tools (`ReviewTools.CodeGraphTools`) go to its `mcp` endpoint |
 | `CodeGraph:OverlayTimeoutMinutes` | `10` (> 0: how long a review waits, before its first panel call, for CodeGraph's overlay of the PR head; not ready by then, reviewers' CodeGraph calls read the default-branch index, labelled not the PR head; sc-25708) |
-| `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional: without it the factory starts and every CodeGraph tool answers the reviewer an error result (recorded), triage gets no CodeGraph, and the merge gate's `risk-threshold` fails wherever a tier requires it (sc-25709), so no normal or protected change merges |
+| `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional: without it the factory starts and every CodeGraph tool answers the reviewer an error result (recorded), triage gets no CodeGraph, and the merge gate's `risk-threshold` fails wherever a tier requires it (sc-25709), so no normal or protected change merges (`factory run` and `factory work` warn at start-up) |
 | `Kanban:McpUrl` | `https://kanban-mcp.trefry.net/mcp` (`OutboundHttp.KanbanDefaultMcpUrl`; an absolute http(s) URL naming no model provider; MCP Streamable HTTP): the Kanban upstream (sc-25707), offered to reviewers through their tool loop (and kept for Phase 4's planner, `McpProfile.Planner`); never to triage sessions, whose proxy is started without it (`McpProfile.Triage`: the issue text is untrusted and the triage's answer is posted on the issue) |
 | `Kanban:Token` | env `FACTORY_KANBAN_TOKEN`, or keychain account `kanban-token`: a KanbanBoard PAT (`Authorization: Bearer`), owner-side only (E5). Optional: without it there is no Kanban upstream (not an error) |
 | `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
@@ -779,25 +779,37 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   failing closed — `ReviewModels.Problems`; which model served, and the implementer's models, are not consulted), `security-review` (the verdict has the
   security review), `risk-threshold` (changed lines, files — renames count both paths — and fix rounds within `risk`, and
   CodeGraph's inputs, below), `new-tests-fail-on-base` (sc-25382, below). Risk score (sc-25709, `Gate/CodeGraphRisk.cs`; CodeGraph
-  C7, sc-25735, not deployed yet — the fakes follow its contract and C4's `CommitAnswer` shape, PR #71): when the change's tiers
-  require `risk-threshold` and the head has a verdict, the pipeline (`RunPipeline.CodeGraphRiskAsync`) reads, owner-side through
+  C7, sc-25735, not deployed yet — the fakes follow its contract and C4's `CommitAnswer` shape, PR #71): `EvaluateGateAsync` first
+  evaluates the gate without CodeGraph (`MergeGate.Evaluate(…, riskUnread: true)`: a change that needs `risk-threshold` and that
+  nothing else blocks is `Pending`, never Merge), so a change another rule blocks (sealed path, failed verdict, new tests, size)
+  escalates without a CodeGraph call; only then the pipeline (`RunPipeline.CodeGraphRiskAsync`) reads, owner-side through
   the CodeGraph client (`CodeGraphRiskReader` over `ICodeGraphRisk`, the project pinned by exact repo URL), for every touched file
   (`MergeGate.TouchedFiles`: both sides of a rename, deletes) `analyze_impact_file(repo, path, sha = head, depth = 3)` — only once
   CodeGraph's overlay of exactly the head is ready (a ready `codegraph-overlay` checkpoint for that head, e.g. the review's, is
-  reused; otherwise requested and waited for like the review's and checkpointed, an outcome the last row for that head already
-  records not written again) and only an answer naming the head (E3) — and
-  `file_hotspot(repo, path)` from the default branch only (`source: default-branch`), recorded with the commit it names (E3's
-  exception). "The hotspot score" is CodeGraph's `riskScore`. The blast radius has a code floor (`GatePolicy.BlastRadiusFloor` =
+  reused until a read answers C4's `notIndexed` — e.g. status `stale`, the default branch moved past its base:
+  `CodeGraphRisk.OverlayUnusable` — after which the next read requests the overlay again, `ReviewOverlays.WaitAsync` re-requesting a
+  stale one; otherwise requested and waited for like the review's and checkpointed, an outcome the last row for that head already
+  records not written again) and only an answer naming the head (E3) and the file asked about (its `path`, normalized like the
+  diff's) — then `file_hotspot(repo, path)` from the default branch only (`source: default-branch`, the asked `path`), recorded with
+  the commit it names (E3's exception), each answer reused within one wait while the ready overlay's base is that commit
+  (`HotspotCache`). The reader stops at the first input it cannot read. "The hotspot score" is CodeGraph's `riskScore`. The blast
+  radius has a code floor (`GatePolicy.BlastRadiusFloor` =
   high: a critical file always fails; seam `policy-floor:blast-radius`), `max_blast_radius` can only lower it; hotspots have no
   floor — recorded and reported, failing only above an opted-in `max_hotspot`. A file CodeGraph has no data for (`found: false`,
-  e.g. a new file) counts as blast radius none / hotspot 0; one it cannot read (an error answer, HTTP 403 `tool_not_entitled`,
-  unreachable, the repo not indexed, a C4 `notIndexed` answer, no ready overlay of the head, an answer for another commit or
-  without a commit) makes the decision `Pending` when nothing else blocks (owner decision 2026-10-10): `EvaluateGateAsync` reads
-  every fact again every `Gate:CiPollSeconds` like pending CI (controls checked between reads; pending evaluations are not
-  checkpointed) and after `Gate:CiTimeoutMinutes` records it Blocked and escalates. No CodeGraph configured (no token: `GateStage.Risk`
-  null) fails the check at once, wherever it is required — so a factory without a CodeGraph token merges no normal or protected
-  change. Inputs read for another head or leaving a touched file out block. Every input — each file's blast radius at the head,
-  each hotspot score with its commit, what could not be read — is in the `gate` checkpoint's Detail after ` | `, and a failure's
+  e.g. a new file) counts as blast radius none / hotspot 0; a file read over a limit blocks at once, even when another could not be
+  read; one CodeGraph cannot read (an error answer, HTTP 403 `tool_not_entitled`, unreachable, the repo not indexed, a C4
+  `notIndexed` answer, no ready overlay of the head, an answer for another commit, another file or without a commit) otherwise
+  makes the decision `Pending` (owner decision 2026-10-10): `EvaluateGateAsync` reads every fact again every `Gate:CiPollSeconds`
+  like pending CI (controls checked and the PR read again between reads — found merged → recorded as found merged, closed →
+  escalate, a new head → Review — so the wait never holds the queue's turn for an old head; pending evaluations are not
+  checkpointed). One deadline bounds the whole wait, CodeGraph's overlay wait and calls included (a `CancellationTokenSource` on
+  `GateTime`): at `Gate:CiTimeoutMinutes` it is recorded Blocked and escalates, even mid-call; a real Pause/Stop still propagates.
+  No CodeGraph configured (no token: `GateStage.Risk` null) fails the check at once, wherever it is required — so a factory without
+  a CodeGraph token merges no normal or protected change; the reason names the setting, and `factory run` and `factory work` warn
+  at start-up (`FactoryRunner.CodeGraphTokenWarning`). Inputs read for another head or leaving a touched file out block. The inputs
+  are in the `gate` checkpoint's Detail after ` | ` (`CodeGraphRisk.Describe`): every file over a limit, the worst and the hottest,
+  then the first `CodeGraphRisk.MaxListed` (20) others with "… N more", each hotspot with its commit, and what could not be read
+  (capped likewise), so one row stays inside the reports' budget; a failure's
   reason names each file over the limit with its blast radius (or hotspot score), so the escalation comment and the PR report (both
   from the ledger) name it. `analyze_impact_file`/`file_hotspot` (`CodeGraphMcpClient.RiskTools`) are sent straight through the MCP
   client and are on no allowlist, profile or tool list (a test asserts it). A sealed path always escalates (even with no verdict); a protected one escalates after its checks instead of merging; each

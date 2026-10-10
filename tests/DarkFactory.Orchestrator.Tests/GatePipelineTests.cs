@@ -238,7 +238,7 @@ public class GatePipelineTests
         public Dictionary<int, Func<WorkerCall, Task<WorkerResult>>> WorkerOverrides { get; } = [];
 
         public LedgerDbContext Db { get; }
-        public FakeTimeProvider Time { get; } = new(new DateTimeOffset(2026, 10, 8, 12, 0, 0, TimeSpan.Zero));
+        public FakeTimeProvider Time { get; init; } = new(new DateTimeOffset(2026, 10, 8, 12, 0, 0, TimeSpan.Zero));
         /// <summary>The shared control table (needed for the usage pause), on the injected clock.</summary>
         public IControls Controls => new LedgerControls(new LedgerDbContextFactory(_options), Time);
         public FakeWorkSource Stories { get; init; } = new(Story);
@@ -254,9 +254,11 @@ public class GatePipelineTests
         /// <summary>When set, each review first waits for CodeGraph's overlay of the head through this (sc-25708).</summary>
         public ReviewOverlays? Overlays { get; init; }
         /// <summary>The CodeGraph risk-threshold reads (sc-25709); by default every file has no data, so the check passes.</summary>
-        public FakeCodeGraphRisk CodeGraph { get; } = new();
+        public FakeCodeGraphRisk CodeGraph { get; init; } = new();
         /// <summary>When set, the gate has no CodeGraph (no token): risk-threshold fails wherever it is required.</summary>
         public bool NoCodeGraph { get; init; }
+        /// <summary>When set, the gate reads CodeGraph through this reader (e.g. over <see cref="CodeGraph"/> with its own overlay wait).</summary>
+        public CodeGraphRiskReader? RiskReader { get; init; }
         /// <summary><c>Gate:CiTimeoutMinutes</c> for the run.</summary>
         public TimeSpan CiTimeout { get; init; } = TimeSpan.FromSeconds(5);
         /// <summary>When set, the gate's waits run on <see cref="Time"/> (which only moves when the test advances it).</summary>
@@ -281,7 +283,7 @@ public class GatePipelineTests
                     controls: RunControls ?? Controls,
                     controlPollInterval: ControlPoll,
                     gate: new GateStage(GitHub, Panel ?? Reviewer, TimeSpan.FromMilliseconds(1), CiTimeout, GateOnFakeClock ? Time : null,
-                        TestRunner, Overlays, NoCodeGraph ? null : FakeCodeGraphRisk.Reader(CodeGraph)),
+                        TestRunner, Overlays, NoCodeGraph ? null : RiskReader ?? FakeCodeGraphRisk.Reader(CodeGraph)),
                     freeze: Freeze is null ? null : new FactoryFreeze(Contexts, Controls, Freeze, TimeProvider.System, GitHub),
                     maxControlReadFailures: MaxControlReadFailures)
                 .RunAsync(77, ct);

@@ -191,8 +191,13 @@ public static class MergeGate
     /// lists <c>risk-threshold</c>, and then null fails it (E4). Inputs that could not be read make the decision
     /// <see cref="GateOutcome.Pending"/> when nothing else blocks.
     /// </param>
+    /// <param name="riskUnread">
+    /// CodeGraph is configured but its inputs are not read yet (<paramref name="risk"/> null): the pipeline evaluates everything else
+    /// first, so CodeGraph is asked only about a change nothing else blocks. Then a change that needs <c>risk-threshold</c> and that
+    /// nothing else blocks is <see cref="GateOutcome.Pending"/> (never Merge) until it is evaluated again with the inputs.
+    /// </param>
     public static GateDecision Evaluate(string? policyText, string? policyError, PullFacts pull, ChangeFacts change, CiFacts ci,
-        IReadOnlyList<ReviewVerdict> verdicts, NewTestsResult? newTests = null, CodeGraphRisk? risk = null)
+        IReadOnlyList<ReviewVerdict> verdicts, NewTestsResult? newTests = null, CodeGraphRisk? risk = null, bool riskUnread = false)
     {
         var head = pull.HeadSha;
         var reasons = new List<string>();
@@ -286,6 +291,8 @@ public static class MergeGate
         // risk-threshold — diff size, fix rounds and CodeGraph's inputs (sc-25709), when a touched tier requires it.
         var riskRequired = classified.Requires(GateChecks.RiskThreshold) && !GateCheckSeam.Off(GateChecks.RiskThreshold);
         var pending = new List<string>();
+        var (limit, limitBy) = BlastRadiusLimit(policy.Risk);
+        var unread = riskRequired && risk is null && riskUnread;
         if (riskRequired)
         {
             var threshold = policy.Risk;
@@ -301,9 +308,12 @@ public static class MergeGate
             {
                 reasons.Add($"risk threshold: {change.FixRounds} fix rounds exceed max_fix_rounds {threshold.MaxFixRounds}");
             }
-            CodeGraphReasons(threshold, head, TouchedFiles(diff), risk, reasons, pending);
+            if (!unread)
+            {
+                CodeGraphReasons(threshold, limit, limitBy, head, TouchedFiles(diff), risk, reasons, pending);
+            }
         }
-        var inputs = riskRequired ? risk?.Describe() : null;
+        var inputs = riskRequired ? risk?.Describe(limit, policy.Risk.MaxHotspot) : null;
 
         // new-tests-fail-on-base — the executed runs recorded for exactly this base and head (sc-25382).
         var newTestsRequired = classified.Requires(GateChecks.NewTestsFailOnBase) && !GateCheckSeam.Off(GateChecks.NewTestsFailOnBase);
@@ -348,6 +358,11 @@ public static class MergeGate
             // Only CodeGraph's inputs are missing: wait for them like pending CI (E4: never merged without them).
             return new GateDecision(GateOutcome.Pending, head, pending, inputs);
         }
+        if (unread)
+        {
+            // Everything else holds: CodeGraph's inputs are read now, and the gate evaluated again with them.
+            return new GateDecision(GateOutcome.Pending, head, [$"risk threshold: CodeGraph's inputs for {Ci.Short(head)} are still to be read"]);
+        }
         var tiers = Tiers.Precedence.Where(t => classified.In(t).Count > 0).Select(t => $"{t.Key()} {classified.In(t).Count}");
         var passed = new List<string>
         {
@@ -375,45 +390,45 @@ public static class MergeGate
     public static IReadOnlyList<string> TouchedFiles(string diff) =>
         DiffPaths.Parse(diff).Paths.Select(RepoPath.Normalize).OfType<string>().Distinct(StringComparer.Ordinal).ToList();
 
+    /// <summary>Where <c>CodeGraph:Token</c> comes from, as the gate's reason and the start-up warning name it.</summary>
+    public const string CodeGraphTokenSources =
+        "CodeGraph:Token, env FACTORY_CODEGRAPH_TOKEN, or keychain account 'codegraph-token' (service 'dark-factory')";
+
     /// <summary>
-    /// <c>risk-threshold</c>'s CodeGraph inputs (sc-25709): each touched file's blast radius at exactly the head must be within the
-    /// policy's <c>max_blast_radius</c> and the code floor (<see cref="GatePolicy.BlastRadiusFloor"/>: critical always fails), and,
-    /// when the policy sets <c>max_hotspot</c>, each file's hotspot score (CodeGraph's riskScore, on the default branch) within it.
-    /// Inputs not read at all (no CodeGraph configured), read for another commit or leaving a touched file out block; inputs
-    /// CodeGraph could not read are pending.
+    /// The blast radius <c>risk-threshold</c> allows and what sets it: the policy's <c>max_blast_radius</c> when it is no looser than the
+    /// code floor (version 3 can only tighten it), else the floor (<see cref="GatePolicy.BlastRadiusFloor"/>: critical always fails).
     /// </summary>
-    private static void CodeGraphReasons(RiskThreshold threshold, string head, IReadOnlyList<string> files, CodeGraphRisk? risk,
-        List<string> reasons, List<string> pending)
+    private static (BlastRadius? Limit, string By) BlastRadiusLimit(RiskThreshold threshold)
+    {
+        if (GateCheckSeam.Off(GateCheckSeam.FloorBlastRadius))
+        {
+            return threshold.MaxBlastRadius is { } policyMax ? (policyMax, $"max_blast_radius {BlastRadii.Name(policyMax)}") : (null, "");
+        }
+        return threshold.MaxBlastRadius is { } max && max <= GatePolicy.BlastRadiusFloor
+            ? (max, $"max_blast_radius {BlastRadii.Name(max)}")
+            : (GatePolicy.BlastRadiusFloor, $"the code floor ({BlastRadii.Name(BlastRadius.Critical)} always fails)");
+    }
+
+    /// <summary>
+    /// <c>risk-threshold</c>'s CodeGraph inputs (sc-25709): each touched file's blast radius at exactly the head must be within
+    /// <paramref name="limit"/> (<see cref="BlastRadiusLimit"/>), and, when the policy sets <c>max_hotspot</c>, each file's hotspot score
+    /// (CodeGraph's riskScore, on the default branch) within it. Inputs not read at all (no CodeGraph configured), read for another
+    /// commit or leaving a touched file out block. A file read over a limit blocks even when other inputs could not be read; otherwise
+    /// inputs CodeGraph could not read are pending.
+    /// </summary>
+    private static void CodeGraphReasons(RiskThreshold threshold, BlastRadius? limit, string by, string head, IReadOnlyList<string> files,
+        CodeGraphRisk? risk, List<string> reasons, List<string> pending)
     {
         if (risk is null)
         {
-            reasons.Add($"risk threshold: CodeGraph's blast radius and hotspots were not read for {Ci.Short(head)} (CodeGraph is not configured: no CodeGraph token)");
+            reasons.Add($"risk threshold: CodeGraph's blast radius and hotspots were not read for {Ci.Short(head)} (CodeGraph is not configured: "
+                + $"no CodeGraph token; set {CodeGraphTokenSources})");
             return;
         }
         if (!string.Equals(risk.HeadSha, head, StringComparison.OrdinalIgnoreCase))
         {
             reasons.Add($"risk threshold: CodeGraph's inputs were read for {Ci.Short(risk.HeadSha)}, not the head {Ci.Short(head)}");
             return;
-        }
-        if (risk.Unreadable.Count > 0)
-        {
-            pending.Add($"risk threshold: CodeGraph could not be read for {Ci.Short(head)}: {string.Join("; ", risk.Unreadable)}");
-            return;
-        }
-        var missing = files.Where(f => risk.BlastRadius.All(b => b.Path != f) || risk.Hotspots.All(h => h.Path != f)).ToList();
-        if (missing.Count > 0)
-        {
-            reasons.Add($"risk threshold: CodeGraph's inputs leave out {string.Join(", ", missing)}");
-        }
-        // The effective limit: the policy's max_blast_radius when it is no looser than the floor (version 3 can only tighten), else
-        // the floor.
-        BlastRadius? limit = threshold.MaxBlastRadius is { } max && max <= GatePolicy.BlastRadiusFloor ? max : GatePolicy.BlastRadiusFloor;
-        var by = limit == threshold.MaxBlastRadius ? $"max_blast_radius {BlastRadii.Name(limit.Value)}"
-            : $"the code floor ({BlastRadii.Name(BlastRadius.Critical)} always fails)";
-        if (GateCheckSeam.Off(GateCheckSeam.FloorBlastRadius))
-        {
-            limit = threshold.MaxBlastRadius;
-            by = limit is { } policyMax ? $"max_blast_radius {BlastRadii.Name(policyMax)}" : "";
         }
         var over = risk.BlastRadius.Where(f => limit is { } l && f.Radius > l).OrderByDescending(f => f.Radius).ToList();
         if (over.Count > 0)
@@ -428,6 +443,17 @@ public static class MergeGate
                 reasons.Add($"risk threshold: hotspot score (riskScore) over max_hotspot {CodeGraphRisk.Score(maxHotspot)}: "
                     + string.Join(", ", hot.Select(f => $"{f.Path} {CodeGraphRisk.Score(f.Score)} on the default branch at {Ci.Short(f.CommitSha)}")));
             }
+        }
+        if (risk.Unreadable.Count > 0)
+        {
+            // The files not read yet are left out by design: pending, or named beside a file already over a limit (which blocks).
+            pending.Add($"risk threshold: CodeGraph could not be read for {Ci.Short(head)}: {risk.UnreadableText}");
+            return;
+        }
+        var missing = files.Where(f => risk.BlastRadius.All(b => b.Path != f) || risk.Hotspots.All(h => h.Path != f)).ToList();
+        if (missing.Count > 0)
+        {
+            reasons.Add($"risk threshold: CodeGraph's inputs leave out {string.Join(", ", missing)}");
         }
     }
 

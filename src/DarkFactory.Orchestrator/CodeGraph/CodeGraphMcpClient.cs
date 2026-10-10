@@ -150,7 +150,7 @@ public sealed partial class CodeGraphMcpClient : ICodeGraph, ICodeGraphRisk
     {
         var s = result.Structured as JsonObject;
         return new ImpactFileAnswer(result.IsError, result.Text, Commit(result.Structured, result.Text), NotIndexedOf(result.Structured),
-            s?["error"] is JsonObject e ? Str(e, "code") : null, Bool(s, "found"), Str(s, "blastRadius"));
+            s?["error"] is JsonObject e ? Str(e, "code") : null, Bool(s, "found"), Str(s, "blastRadius"), Str(s, "path"));
     }
 
     /// <summary>
@@ -162,7 +162,7 @@ public sealed partial class CodeGraphMcpClient : ICodeGraph, ICodeGraphRisk
         var s = result.Structured as JsonObject;
         double? score = s?["riskScore"] is JsonValue v && v.TryGetValue<double>(out var d) ? d : null;
         return new HotspotAnswer(result.IsError, result.Text, Commit(result.Structured, result.Text), Str(s, "source"),
-            s?["error"] is JsonObject e ? Str(e, "code") : null, Bool(s, "found"), score);
+            s?["error"] is JsonObject e ? Str(e, "code") : null, Bool(s, "found"), score, Str(s, "path"));
     }
 
     private static bool? Bool(JsonObject? o, string name) => o?[name] is JsonValue v && v.TryGetValue<bool>(out var b) ? b : null;

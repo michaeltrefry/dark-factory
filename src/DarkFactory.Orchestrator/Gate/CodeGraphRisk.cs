@@ -39,16 +39,19 @@ public static class BlastRadii
 /// <summary>
 /// One <c>analyze_impact_file</c> answer (CodeGraph C7, sc-25735): whether it is an error, its text, the commit it names
 /// (<c>structuredContent.commitSha</c>, <see cref="CodeGraphMcpClient.Commit"/>), the typed not-indexed answer of a SHA with no ready
-/// overlay (C4), an error answer's code (<c>structuredContent.error.code</c>), and the tool's own <c>found</c> and <c>blastRadius</c>.
+/// overlay (C4), an error answer's code (<c>structuredContent.error.code</c>), and the tool's own <c>found</c>, <c>blastRadius</c> and
+/// <c>path</c> (the file it answered about, which must be the one asked about).
 /// </summary>
 public sealed record ImpactFileAnswer(bool IsError, string Text, string? CommitSha, CodeGraphNotIndexed? NotIndexed, string? ErrorCode,
-    bool? Found, string? BlastRadius);
+    bool? Found, string? BlastRadius, string? Path = null);
 
 /// <summary>
 /// One <c>file_hotspot</c> answer (C7): whether it is an error, its text, the commit it names, its <c>source</c>
-/// (<c>default-branch</c> or <c>overlay</c>), an error answer's code, and the tool's own <c>found</c> and <c>riskScore</c>.
+/// (<c>default-branch</c> or <c>overlay</c>), an error answer's code, and the tool's own <c>found</c>, <c>riskScore</c> and <c>path</c>
+/// (the file it answered about, which must be the one asked about).
 /// </summary>
-public sealed record HotspotAnswer(bool IsError, string Text, string? CommitSha, string? Source, string? ErrorCode, bool? Found, double? RiskScore);
+public sealed record HotspotAnswer(bool IsError, string Text, string? CommitSha, string? Source, string? ErrorCode, bool? Found, double? RiskScore,
+    string? Path = null);
 
 /// <summary>
 /// CodeGraph's per-file risk tools, owner-side (sc-25709): <c>analyze_impact_file</c> and <c>file_hotspot</c>. Called only by the
@@ -78,36 +81,93 @@ public sealed record FileHotspot(string Path, double Score, bool Found, string C
 /// CodeGraph's inputs to <c>risk-threshold</c> for one evaluation (sc-25709), read fresh: each touched file's blast radius for exactly
 /// <see cref="HeadSha"/> (E3) and its hotspot score on the default branch, each recorded with the commit CodeGraph named (the
 /// default-branch exception of E3). <see cref="Unreadable"/>: what could not be read (CodeGraph unreachable or refusing, the repository
-/// not indexed, no ready overlay of the head, an answer for another commit or an unreadable one): non-empty, <c>risk-threshold</c> is
-/// pending — the gate waits like pending CI and escalates at <c>Gate:CiTimeoutMinutes</c> (E4).
+/// not indexed, no ready overlay of the head, an answer for another commit or file, or an unreadable one; the reader stops at the
+/// first): non-empty, <c>risk-threshold</c> is pending unless a file already read is over a limit — the gate waits like pending CI and
+/// escalates at <c>Gate:CiTimeoutMinutes</c> (E4). <see cref="OverlayUnusable"/>: CodeGraph answered that it has no usable overlay of
+/// the head (C4's <c>notIndexed</c>, e.g. a ready overlay gone stale once the default branch moved past its base), so a recorded ready
+/// overlay must not be reused: the next read requests the overlay again.
 /// </summary>
 public sealed record CodeGraphRisk(string HeadSha, IReadOnlyList<FileBlastRadius> BlastRadius, IReadOnlyList<FileHotspot> Hotspots,
-    IReadOnlyList<string> Unreadable)
+    IReadOnlyList<string> Unreadable, bool OverlayUnusable = false)
 {
+    /// <summary>
+    /// How many files <see cref="Describe"/> lists beyond those over a limit and the worst and hottest (and how many unreadable entries
+    /// it quotes), so one <c>gate</c> row stays well inside the reports' budget (<see cref="Ledger.LedgerReport.MaxFactsLength"/>) whatever
+    /// the PR's size: the rest are counted.
+    /// </summary>
+    public const int MaxListed = 20;
+
     /// <summary>The file with the worst blast radius (the first such), or null when none was read.</summary>
     public FileBlastRadius? Worst => BlastRadius.OrderByDescending(f => f.Radius).FirstOrDefault();
 
     /// <summary>The file with the highest hotspot score (the first such), or null when none was read.</summary>
     public FileHotspot? Hottest => Hotspots.OrderByDescending(f => f.Score).FirstOrDefault();
 
-    /// <summary>Every input as the <c>gate</c> checkpoint records it: each file's blast radius at the head, each hotspot score with its commit.</summary>
-    public string Describe() =>
-        $"codegraph blast radius at {HeadSha}: "
-        + (BlastRadius.Count == 0 ? "none read" : string.Join(", ", BlastRadius.Select(f => $"{f.Path} {BlastRadii.Name(f.Radius)}{(f.Found ? "" : " (no data)")}")))
-        + "; hotspot score (riskScore) on the default branch: "
-        + (Hotspots.Count == 0 ? "none read" : string.Join("; ", Hotspots.GroupBy(f => f.CommitSha).Select(g =>
-            $"at {g.Key}: {string.Join(", ", g.Select(f => $"{f.Path} {Score(f.Score)}{(f.Found ? "" : " (no data)")}"))}")))
-        + (Unreadable.Count == 0 ? "" : $"; unreadable: {string.Join("; ", Unreadable)}");
+    /// <summary>
+    /// The inputs as the <c>gate</c> checkpoint records them: each file's blast radius at the head and each hotspot score with its commit
+    /// — every file over <paramref name="limit"/> or <paramref name="maxHotspot"/>, the worst and the hottest, then the first
+    /// <see cref="MaxListed"/> others, and how many more there are — and what could not be read (<see cref="UnreadableText"/>).
+    /// </summary>
+    public string Describe(BlastRadius? limit = null, double? maxHotspot = null)
+    {
+        var worst = Worst;
+        var hottest = Hottest;
+        var blast = Listed(BlastRadius, f => (limit is { } l && f.Radius > l) || ReferenceEquals(f, worst),
+            f => $"{f.Path} {BlastRadii.Name(f.Radius)}{(f.Found ? "" : " (no data)")}", ", ");
+        var hot = Hotspots.GroupBy(f => f.CommitSha).Select(g => $"at {g.Key}: " + Listed(g.ToList(),
+            f => (maxHotspot is { } m && f.Score > m) || ReferenceEquals(f, hottest), f => $"{f.Path} {Score(f.Score)}{(f.Found ? "" : " (no data)")}", ", "));
+        return $"codegraph blast radius at {HeadSha}: {(BlastRadius.Count == 0 ? "none read" : blast)}"
+            + $"; hotspot score (riskScore) on the default branch: {(Hotspots.Count == 0 ? "none read" : string.Join("; ", hot))}"
+            + (Unreadable.Count == 0 ? "" : $"; unreadable: {UnreadableText}");
+    }
+
+    /// <summary>What could not be read: the first <see cref="MaxListed"/> entries, and how many more.</summary>
+    public string UnreadableText => Listed(Unreadable, _ => false, u => u, "; ");
+
+    /// <summary>Every item <paramref name="always"/> picks, the first <see cref="MaxListed"/> of the others (in order), and "… N more".</summary>
+    private static string Listed<T>(IReadOnlyList<T> items, Func<T, bool> always, Func<T, string> text, string separator)
+    {
+        var others = 0;
+        var shown = new List<string>();
+        foreach (var item in items)
+        {
+            if (always(item) || others++ < MaxListed)
+            {
+                shown.Add(text(item));
+            }
+        }
+        var more = others - MaxListed;
+        return string.Join(separator, shown) + (more > 0 ? $"{separator}… {more} more" : "");
+    }
 
     public static string Score(double score) => score.ToString("0.###", CultureInfo.InvariantCulture);
+}
+
+/// <summary>
+/// The hotspot scores one gate wait has read (sc-25709), by file and the default-branch commit CodeGraph named: one is reused while the
+/// head's ready overlay is built on that commit (its base), so a wait that reads again every poll asks for each file's hotspot once per
+/// default-branch commit.
+/// </summary>
+public sealed class HotspotCache
+{
+    private readonly Dictionary<(string Path, string Commit), FileHotspot> _scores = new();
+
+    public bool TryGet(string path, string? commit, out FileHotspot? hotspot)
+    {
+        hotspot = null;
+        return commit is not null && _scores.TryGetValue((path, commit.ToLowerInvariant()), out hotspot);
+    }
+
+    public void Add(FileHotspot hotspot) => _scores[(hotspot.Path, hotspot.CommitSha.ToLowerInvariant())] = hotspot;
 }
 
 /// <summary>
 /// Reads <see cref="CodeGraphRisk"/> for a PR head (sc-25709), owner-side: the project pinned by exact repository URL
 /// (<see cref="ICodeGraphOverlays.FindProjectAsync"/>), then per touched file <c>analyze_impact_file</c> with <c>sha</c> = the head
 /// and <c>depth</c> = <see cref="ImpactDepth"/> (only once CodeGraph's overlay of the head is ready: <see cref="Overlays"/>, waited
-/// for by the pipeline), and <c>file_hotspot</c> (default branch only). A file CodeGraph has no data for (<c>found: false</c>, e.g. a
-/// new file) counts as blast radius none and hotspot 0 (owner decision 2026-10-10); one it cannot read is <see cref="CodeGraphRisk.Unreadable"/>.
+/// for by the pipeline), then per file <c>file_hotspot</c> (default branch only). It stops at the first input it cannot read
+/// (<see cref="CodeGraphRisk.Unreadable"/>): the gate is pending then anyway, and reads everything again. A file CodeGraph has no data
+/// for (<c>found: false</c>, e.g. a new file) counts as blast radius none and hotspot 0 (owner decision 2026-10-10).
 /// </summary>
 public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overlayTimeout, TimeSpan? pollInterval = null)
 {
@@ -120,69 +180,78 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
     /// <summary>The wait for CodeGraph's overlay of the head (<c>CodeGraph:OverlayTimeoutMinutes</c>), on the same client.</summary>
     public ReviewOverlays Overlays { get; } = new(codeGraph, overlayTimeout, pollInterval);
 
-    public async Task<CodeGraphRisk> ReadAsync(RepoRef repo, string headSha, CodeGraphOverlay overlay, IReadOnlyList<string> paths, CancellationToken ct)
+    /// <param name="hotspots">
+    /// Hotspot scores read earlier in the same wait: one read at the ready overlay's base commit is used instead of asking again.
+    /// </param>
+    public async Task<CodeGraphRisk> ReadAsync(RepoRef repo, string headSha, CodeGraphOverlay overlay, IReadOnlyList<string> paths, CancellationToken ct,
+        HotspotCache? hotspots = null)
     {
         var unreadable = new List<string>();
-        string? project = null;
+        var blast = new List<FileBlastRadius>();
+        var scores = new List<FileHotspot>();
+        CodeGraphRisk Result(bool overlayUnusable = false) => new(headSha, blast, scores, unreadable, overlayUnusable);
+        string? project;
         try
         {
             project = await codeGraph.FindProjectAsync(repo, ct);
-            if (project is null)
-            {
-                unreadable.Add($"{repo.FullName}: {ReviewTools.NotIndexed}");
-            }
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
         {
             unreadable.Add($"CodeGraph could not be reached or asked: {Cut(ex.Message)}");
+            return Result();
         }
-        var blast = new List<FileBlastRadius>();
-        var hotspots = new List<FileHotspot>();
         if (project is null)
         {
-            return new CodeGraphRisk(headSha, blast, hotspots, unreadable);
+            unreadable.Add($"{repo.FullName}: {ReviewTools.NotIndexed}");
+            return Result();
         }
         var head = headSha.ToLowerInvariant();
         if (!overlay.IsReady || !string.Equals(overlay.HeadSha, headSha, StringComparison.OrdinalIgnoreCase))
         {
             // E3: the blast radius is read for exactly the head, which CodeGraph answers only from a ready overlay of it.
             unreadable.Add($"blast radius: no ready CodeGraph overlay of {headSha} ({overlay.Describe})");
-        }
-        else
-        {
-            foreach (var path in paths)
-            {
-                ct.ThrowIfCancellationRequested();
-                if (await Call(() => codeGraph.AnalyzeImpactFileAsync(project, path, headSha, ImpactDepth, ct), CodeGraphMcpClient.AnalyzeImpactFileTool, path, unreadable, ct)
-                    is not { } answer)
-                {
-                    continue;
-                }
-                if (Impact(answer, path, head) is { } why)
-                {
-                    unreadable.Add(why);
-                    continue;
-                }
-                blast.Add(answer.Found == true && BlastRadii.TryParse(answer.BlastRadius, out var radius)
-                    ? new FileBlastRadius(path, radius, true)
-                    : new FileBlastRadius(path, BlastRadius.None, false));
-            }
+            return Result();
         }
         foreach (var path in paths)
         {
             ct.ThrowIfCancellationRequested();
+            if (await Call(() => codeGraph.AnalyzeImpactFileAsync(project, path, headSha, ImpactDepth, ct), CodeGraphMcpClient.AnalyzeImpactFileTool, path, unreadable, ct)
+                is not { } answer)
+            {
+                return Result();
+            }
+            if (Impact(answer, path, head) is { } why)
+            {
+                unreadable.Add(why);
+                // CodeGraph has no usable overlay of the head (e.g. the recorded one went stale): the next read requests it again.
+                return Result(overlayUnusable: answer.NotIndexed is not null);
+            }
+            blast.Add(answer.Found == true && BlastRadii.TryParse(answer.BlastRadius, out var radius)
+                ? new FileBlastRadius(path, radius, true)
+                : new FileBlastRadius(path, BlastRadius.None, false));
+        }
+        foreach (var path in paths)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (hotspots is not null && hotspots.TryGet(path, overlay.BaseSha, out var known))
+            {
+                scores.Add(known!);
+                continue;
+            }
             if (await Call(() => codeGraph.FileHotspotAsync(project, path, ct), CodeGraphMcpClient.FileHotspotTool, path, unreadable, ct) is not { } answer)
             {
-                continue;
+                return Result();
             }
             if (Hotspot(answer, path) is { } why)
             {
                 unreadable.Add(why);
-                continue;
+                return Result();
             }
-            hotspots.Add(answer.Found == true ? new FileHotspot(path, answer.RiskScore!.Value, true, answer.CommitSha!) : new FileHotspot(path, 0, false, answer.CommitSha!));
+            var score = answer.Found == true ? new FileHotspot(path, answer.RiskScore!.Value, true, answer.CommitSha!) : new FileHotspot(path, 0, false, answer.CommitSha!);
+            scores.Add(score);
+            hotspots?.Add(score);
         }
-        return new CodeGraphRisk(headSha, blast, hotspots, unreadable);
+        return Result();
     }
 
     /// <summary>Why an impact answer cannot be used for <paramref name="head"/>, or null when it can.</summary>
@@ -191,6 +260,7 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
         { NotIndexed: { } n } => $"{path}: {CodeGraphMcpClient.AnalyzeImpactFileTool} is not indexed for the head ({Cut(n.Code)}, status {Cut(n.Status)})",
         { IsError: true } => $"{path}: {CodeGraphMcpClient.AnalyzeImpactFileTool}{(answer.ErrorCode is { } code ? $" ({Cut(code)})" : "")}: {Cut(answer.Text)}",
         _ when answer.CommitSha != head => $"{path}: {CodeGraphMcpClient.AnalyzeImpactFileTool} answered for {answer.CommitSha ?? "an unnamed commit"}, not the head",
+        _ when !SamePath(answer.Path, path) => OtherPath(CodeGraphMcpClient.AnalyzeImpactFileTool, answer.Path, path),
         { Found: null } => $"{path}: {CodeGraphMcpClient.AnalyzeImpactFileTool} answered no 'found'",
         { Found: true } when !BlastRadii.TryParse(answer.BlastRadius, out _) =>
             $"{path}: {CodeGraphMcpClient.AnalyzeImpactFileTool} answered an unknown blast radius '{Cut(answer.BlastRadius ?? "(none)")}'",
@@ -204,11 +274,19 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
         // E3's exception is the default branch only, recorded with its commit: an answer naming no commit, or not from it, is not used.
         { CommitSha: null } => $"{path}: {CodeGraphMcpClient.FileHotspotTool} named no commit",
         { Source: { } source } when source != DefaultBranchSource => $"{path}: {CodeGraphMcpClient.FileHotspotTool} answered from '{Cut(source)}', not the default branch",
+        _ when !SamePath(answer.Path, path) => OtherPath(CodeGraphMcpClient.FileHotspotTool, answer.Path, path),
         { Found: null } => $"{path}: {CodeGraphMcpClient.FileHotspotTool} answered no 'found'",
         { Found: true, RiskScore: null } => $"{path}: {CodeGraphMcpClient.FileHotspotTool} answered no riskScore",
         { Found: true, RiskScore: < 0 or double.NaN or double.PositiveInfinity } => $"{path}: {CodeGraphMcpClient.FileHotspotTool} answered an invalid riskScore",
         _ => null,
     };
+
+    /// <summary>Whether an answer's <c>path</c> names the file asked about (both normalized as the gate normalizes a diff's paths).</summary>
+    private static bool SamePath(string? answered, string asked) =>
+        answered is not null && RepoPath.Normalize(answered) is { } a && a == RepoPath.Normalize(asked);
+
+    private static string OtherPath(string tool, string? answered, string asked) =>
+        $"{asked}: {tool} answered about {(answered is null ? "no path" : $"'{Cut(answered)}'")}, not {asked}";
 
     /// <summary>One call; a call that cannot be made (unreachable, refused over HTTP) is recorded as unreadable and answers null.</summary>
     private static async Task<T?> Call<T>(Func<Task<T>> call, string tool, string path, List<string> unreadable, CancellationToken ct) where T : class

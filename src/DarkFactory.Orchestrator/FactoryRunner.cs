@@ -102,6 +102,10 @@ public static class FactoryRunner
         try
         {
             options.RejectReviewModelSettings();
+            if (CodeGraphTokenWarning(options) is { } warning)
+            {
+                stderr.WriteLine(warning);
+            }
             if (await checkEnrollment(ct) is { } enrollmentError)
             {
                 stderr.WriteLine(enrollmentError);
@@ -115,6 +119,14 @@ public static class FactoryRunner
             return 2;
         }
     }
+
+    /// <summary>
+    /// The start-up warning of <c>factory run</c> and <c>factory work</c> when no CodeGraph token is configured (sc-25709: the factory still
+    /// starts, but <c>risk-threshold</c> cannot read CodeGraph, so the gate merges nothing that needs it), or null with a token.
+    /// </summary>
+    internal static string? CodeGraphTokenWarning(FactoryOptions options) =>
+        options.TryGet(o => o.CodeGraphToken, out _) ? null
+            : $"no CodeGraph token ({MergeGate.CodeGraphTokenSources}): the merge gate will merge no change whose tier requires risk-threshold";
 
     /// <param name="ignoreScope"><c>factory run --ignore-scope</c>: claim and resume the story even outside the watch scope.</param>
     public static async Task<RunOutcome> RunAsync(FactoryOptions options, int storyId, bool ignoreScope, TextWriter log, CancellationToken ct)
