@@ -91,12 +91,20 @@ public sealed partial class CodeGraphMcpClient : ICodeGraph, ICodeGraphOverlays
     public async Task<OverlayAnswer> OverlayStatusAsync(long overlayId, CancellationToken ct) =>
         Overlay(await _client.CallToolAsync(OverlayStatusTool, new JsonObject { ["overlayId"] = overlayId }, ct));
 
-    /// <summary>An overlay tool's answer: its fields from <c>structuredContent</c> (<c>overlayId</c>, <c>status</c>, <c>headSha</c>, <c>baseSha</c>, <c>error</c>).</summary>
+    /// <summary>
+    /// An overlay tool's answer (CodeGraph C6, michaeltrefry/CodeGraph PR #75, <c>OverlayMcpServer</c>): from an overlay's
+    /// <c>structuredContent</c> its <c>overlayId</c>, <c>status</c>, <c>headSha</c>, <c>baseSha</c>, <c>stale</c> and
+    /// <c>overlayError</c> (a failed overlay's error); from an error answer's (<c>isError</c>, <c>{"error": {code, message}}</c>) the
+    /// code.
+    /// </summary>
     public static OverlayAnswer Overlay(McpToolResult result)
     {
         var s = result.Structured as JsonObject;
         long? id = s?["overlayId"] is JsonValue v && v.TryGetValue<long>(out var n) ? n : null;
-        return new OverlayAnswer(result.IsError, result.Text, id, Str(s, "status"), Str(s, "headSha"), Str(s, "baseSha"), Str(s, "error"));
+        var stale = s?["stale"] is JsonValue st && st.TryGetValue<bool>(out var flag) && flag;
+        var code = s?["error"] is JsonObject e ? Str(e, "code") : null;
+        return new OverlayAnswer(result.IsError, result.Text, id, Str(s, "status"), Str(s, "headSha"), Str(s, "baseSha"),
+            Str(s, "overlayError"), stale, code);
     }
 
     /// <summary>

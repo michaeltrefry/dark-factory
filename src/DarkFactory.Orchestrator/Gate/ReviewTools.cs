@@ -717,7 +717,12 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
         }
         var commit = answer.Commit ?? UnknownCommit;
         // E3: only an answer for exactly the head, from a call pinned to it, is presented as the head's.
-        var label = answer.NotIndexed is null && fallback is null && session.CodeGraphSha is { } head
+        // A call pinned to the head that CodeGraph answered with an error naming no commit (not a not-indexed answer, no fallback):
+        // its error is about the head, never the default branch.
+        var pinnedError = answer.IsError && answer.Commit is null && answer.NotIndexed is null && fallback is null && session.CodeGraphSha is not null;
+        var label = pinnedError
+            ? $"CodeGraph's answer for the PR head {session.CodeGraphSha} (error)"
+            : answer.NotIndexed is null && fallback is null && session.CodeGraphSha is { } head
             && string.Equals(answer.Commit, head, StringComparison.OrdinalIgnoreCase)
             ? $"CodeGraph's index of {project} at the PR head {session.HeadSha}"
             : answer.Commit is { } sha
@@ -727,7 +732,8 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
         {
             label += $" ({fallback})";
         }
-        var outcome = call.Answer($"{label}{(answer.IsError ? " (CodeGraph answered with an error)" : "")}:", answer.Text, answer.Text, answer.IsError, commit);
+        var outcome = call.Answer($"{label}{(answer.IsError && !pinnedError ? " (CodeGraph answered with an error)" : "")}:", answer.Text, answer.Text,
+            answer.IsError, commit);
         return fallback is null ? outcome : outcome with { Record = outcome.Record with { Fallback = fallback } };
     }
 

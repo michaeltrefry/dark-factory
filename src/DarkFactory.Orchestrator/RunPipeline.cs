@@ -179,6 +179,12 @@ public sealed partial class RunPipeline(
         /// used is on record.
         /// </summary>
         public const string ReviewSession = "review-session";
+        /// <summary>
+        /// Review: what became of CodeGraph's overlay of the head a review waited for (sc-25708); Detail is the
+        /// <see cref="Gate.CodeGraphOverlay"/> JSON (outcome, head, overlay, base, reason). A <c>ready</c> one for the same head is
+        /// reused when the review is resumed (crash, Ctrl-C, a pause) instead of waiting again; any other outcome is retried.
+        /// </summary>
+        public const string CodeGraphOverlay = "codegraph-overlay";
         /// <summary>Review: a reviewer's verdict on one head commit; Detail is the <see cref="Gate.ReviewVerdict"/> JSON.</summary>
         public const string Verdict = "verdict";
         /// <summary>

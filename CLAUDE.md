@@ -642,12 +642,21 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (sc-25708, `Gate/ReviewOverlay.cs`, E3): when a review starts — once per head, before the first panel call, only if a role is
   reviewed there (not when every review is carried) — the orchestrator, never a model, asks CodeGraph for an overlay of the PR
   head (`ReviewOverlays`: `request_overlay(repo = the pinned project, ref = head SHA)`, then `get_overlay_status(overlayId)`
-  every `ReviewOverlays.DefaultPollInterval` (10 s); CodeGraph sc-25726, C6, coded to its contract with fakes) and waits at most
-  `CodeGraph:OverlayTimeoutMinutes` (the calls included), a Pause/Stop checked before each status read like before each panel
-  call. The outcome — `ready` (status ready and `headSha` exactly the head), `failed` (failed/expired, or a ready overlay of
-  another commit), `refused` (an error answer: no entitlement, unknown repo, no such tool), `timed-out`, `unavailable` (no
-  token, repo not indexed, CodeGraph unreachable) — with overlay id, head and base, is the verdict's `codegraph` and a line of
-  the PR report; none fails the review (E4). Ready, every CodeGraph call of every role and second opinion passes `sha` = head
+  every `ReviewOverlays.DefaultPollInterval` (10 s); CodeGraph C6, michaeltrefry/CodeGraph PR #75, whose shapes the fakes copy) and
+  waits at most `CodeGraph:OverlayTimeoutMinutes` (the calls included), a Pause/Stop checked before each status read like before
+  each panel call. The outcome — `ready` (status ready, not `stale`, and `headSha` exactly the head), `failed` (failed/expired with
+  its `structuredContent.overlayError`, a ready overlay of another commit, or one still `stale` — its base no longer the
+  default-branch index commit, which read tools will not use — after one new `request_overlay`, which CodeGraph answers with a
+  fresh overlay: "the overlay is stale (default branch moved past its base)"), `refused` (HTTP 403 `tool_not_entitled` from
+  CodeGraph's entitlement middleware, `McpHttpException`: "not entitled to request_overlay"; or an error answer,
+  `structuredContent.error.code` in the reason: `repo_not_found`, `invalid_ref`, `overlays_unavailable`, …), `timed-out`,
+  `unavailable` (no token, repo not indexed, CodeGraph unreachable or the request/lookup timing out in its HTTP client, or a
+  `temporarily_unavailable` answer — requested again every poll interval — still so at the timeout; a status read that fails or
+  times out is read again until the timeout) — with overlay id, head and base, is the verdict's `codegraph`, a line of the PR
+  report and a `codegraph-overlay` checkpoint (Detail: its JSON; outcome passed when ready, else failed); a review resumed on the
+  same head (crash, Ctrl-C, a pause) reuses a recorded `ready` instead of waiting again (other outcomes are retried). A Pause, Stop
+  or shutdown still ends the wait by throwing; none of the outcomes fails the review (E4). A head-pinned call CodeGraph answers with
+  an error naming no commit is labelled "CodeGraph's answer for the PR head <sha> (error)". Ready, every CodeGraph call of every role and second opinion passes `sha` = head
   (C4, CodeGraph PR #71) and only an answer naming exactly the head is labelled "CodeGraph's index of <project> at the PR head";
   a typed not-indexed answer (`structuredContent.notIndexed`, which names the head yet carries no data) makes that call fall
   back to the default-branch call, labelled and recorded (`tools[].fallback`). Not ready, the calls go without `sha` and are

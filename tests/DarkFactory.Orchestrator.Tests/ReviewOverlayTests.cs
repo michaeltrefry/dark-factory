@@ -16,8 +16,9 @@ namespace DarkFactory.Orchestrator.Tests;
 /// <summary>
 /// sc-25708: a review first asks CodeGraph for its overlay of the PR head (owner-side) and waits for it, bounded; with it ready the
 /// reviewers' CodeGraph calls carry <c>sha</c> = head and the answers name the head; otherwise they read the default-branch index,
-/// labelled as not the PR head. The CodeGraph shapes are its contract's: overlays C6 (sc-25726, not built yet) and commit-pinned reads
-/// C4 (michaeltrefry/CodeGraph PR #71), see <see cref="FakeMcpServer.CommitAnswer"/> and <see cref="FakeMcpServer.NotIndexed"/>.
+/// labelled as not the PR head. The CodeGraph shapes are its contract's: overlays C6 (michaeltrefry/CodeGraph PR #75, see
+/// <see cref="FakeMcpServer.Overlay"/>, <see cref="FakeMcpServer.OverlayError"/> and <see cref="FakeMcpServer.NotEntitled"/>) and
+/// commit-pinned reads C4 (PR #71), see <see cref="FakeMcpServer.CommitAnswer"/> and <see cref="FakeMcpServer.NotIndexed"/>.
 /// </summary>
 public class ReviewOverlayTests
 {
@@ -98,19 +99,145 @@ public class ReviewOverlayTests
         Assert.Equal(2, server.Calls.Count(c => c.Tool.Contains("overlay")));
     }
 
-    [Theory]
-    [InlineData("This PAT user is not entitled to request overlays.")] // no entitlement
-    [InlineData("Repository 'R Service' was not found.")] // unknown repository
-    [InlineData("Unknown tool: 'request_overlay'")] // a CodeGraph without the tool (C6 not deployed)
-    public async Task A_refused_request_falls_back_at_once_and_says_why(string refusal)
+    [Fact]
+    public async Task A_failed_overlays_error_is_read_from_overlay_error()
     {
-        var server = FakeMcpServer.CodeGraph(Listing, (_, _) => FakeMcpServer.Structured(refusal, new JsonObject { ["error"] = "refused" }, isError: true));
+        // C6 (PR #75): a failed overlay's text is `["overlayError"] = overlay.Error`, not an `error` field.
+        var server = FakeMcpServer.CodeGraph(Listing, (_, _) => FakeMcpServer.Overlay(41, "failed", Head, IndexCommit, error: "git fetch failed"));
+
+        var overlay = await Overlays(server).WaitAsync(Repo, Head, NoControls, TimeProvider.System, CancellationToken.None);
+
+        Assert.Equal((CodeGraphOverlay.Failed, "the overlay is failed: git fetch failed"), (overlay.Outcome, overlay.Reason));
+    }
+
+    [Theory]
+    // C6 (PR #75, OverlayMcpServer.RequestOverlay): `catch (KeyNotFoundException ex) { return Error(RepoNotFoundCode, ex.Message); }`,
+    // `catch (ArgumentException ex) { return Error(InvalidRefCode, ex.Message); }`, `catch (NotSupportedException ex) { return Error(OverlaysUnavailableCode, ex.Message); }`
+    [InlineData("repo_not_found", "Repository 'R Service' was not found.")]
+    [InlineData("invalid_ref", "ref is required: a branch name, tag, or full commit SHA.")]
+    [InlineData("overlays_unavailable", "Branch overlays are not available.")]
+    public async Task A_refused_request_falls_back_at_once_and_says_why(string code, string message)
+    {
+        var server = FakeMcpServer.CodeGraph(Listing, (_, _) => FakeMcpServer.OverlayError(code, message));
 
         var overlay = await Overlays(server).WaitAsync(Repo, Head, NoControls, TimeProvider.System, CancellationToken.None);
 
         Assert.Equal(CodeGraphOverlay.Refused, overlay.Outcome);
-        Assert.Contains(refusal, overlay.Reason);
+        Assert.Equal($"request_overlay ({code}): Error ({code}): {message}", overlay.Reason);
         Assert.Equal(["search_projects", "request_overlay"], server.Calls.Select(c => c.Tool));
+    }
+
+    [Fact]
+    public async Task A_token_not_entitled_to_request_overlay_is_refused_from_the_http_403()
+    {
+        var server = FakeMcpServer.CodeGraph(Listing, (tool, _) => throw FakeMcpServer.NotEntitled(tool));
+
+        var overlay = await Overlays(server).WaitAsync(Repo, Head, NoControls, TimeProvider.System, CancellationToken.None);
+
+        Assert.Equal((CodeGraphOverlay.Refused, "not entitled to request_overlay"), (overlay.Outcome, overlay.Reason));
+        Assert.Equal(["search_projects", "request_overlay"], server.Calls.Select(c => c.Tool));
+    }
+
+    [Fact]
+    public async Task A_temporarily_unavailable_request_is_requested_again_until_ready()
+    {
+        var n = 0;
+        // C6 (PR #75): `catch (Exception ex) when (ex is BranchOverlayTransientException or TimeoutException) { return Error(TemporarilyUnavailableCode, ex.Message); }`
+        var server = FakeMcpServer.CodeGraph(Listing, (_, _) => n++ < 2
+            ? FakeMcpServer.OverlayError("temporarily_unavailable", "origin did not answer")
+            : FakeMcpServer.Overlay(41, "ready", Head, IndexCommit));
+
+        var overlay = await Overlays(server).WaitAsync(Repo, Head, NoControls, TimeProvider.System, CancellationToken.None);
+
+        Assert.Equal(new CodeGraphOverlay(CodeGraphOverlay.Ready, Head, 41, IndexCommit), overlay);
+        Assert.Equal(3, server.Calls.Count(c => c.Tool == "request_overlay"));
+    }
+
+    [Fact]
+    public async Task A_request_temporarily_unavailable_until_the_timeout_is_unavailable()
+    {
+        var server = FakeMcpServer.CodeGraph(Listing, (_, _) => FakeMcpServer.OverlayError("temporarily_unavailable", "origin did not answer"));
+
+        var overlay = await Overlays(server, TimeSpan.FromMilliseconds(300)).WaitAsync(Repo, Head, NoControls, TimeProvider.System, CancellationToken.None);
+
+        Assert.Equal(CodeGraphOverlay.Unavailable, overlay.Outcome);
+        Assert.Contains("temporarily unavailable until the timeout", overlay.Reason);
+        Assert.Contains("origin did not answer", overlay.Reason);
+        Assert.True(server.Calls.Count(c => c.Tool == "request_overlay") > 1);
+    }
+
+    [Fact]
+    public async Task A_stale_ready_overlay_is_requested_once_more_and_the_fresh_one_used()
+    {
+        var requests = 0;
+        var server = FakeMcpServer.CodeGraph(Listing, (tool, _) => tool == CodeGraphMcpClient.RequestOverlayTool
+            ? ++requests == 1 ? FakeMcpServer.Overlay(40, "ready", Head, Base, stale: true) : FakeMcpServer.Overlay(41, "queued", Head, IndexCommit)
+            : FakeMcpServer.Overlay(41, "ready", Head, IndexCommit));
+
+        var overlay = await Overlays(server).WaitAsync(Repo, Head, NoControls, TimeProvider.System, CancellationToken.None);
+
+        Assert.Equal(new CodeGraphOverlay(CodeGraphOverlay.Ready, Head, 41, IndexCommit), overlay);
+        Assert.Equal(["search_projects", "request_overlay", "request_overlay", "get_overlay_status"], server.Calls.Select(c => c.Tool));
+    }
+
+    [Fact]
+    public async Task An_overlay_still_stale_after_one_new_request_is_failed()
+    {
+        var server = FakeMcpServer.CodeGraph(Listing, (_, _) => FakeMcpServer.Overlay(40, "ready", Head, Base, stale: true));
+
+        var overlay = await Overlays(server).WaitAsync(Repo, Head, NoControls, TimeProvider.System, CancellationToken.None);
+
+        Assert.Equal((CodeGraphOverlay.Failed, ReviewOverlays.StaleReason), (overlay.Outcome, overlay.Reason));
+        Assert.Equal("the overlay is stale (default branch moved past its base)", ReviewOverlays.StaleReason);
+        Assert.Equal(2, server.Calls.Count(c => c.Tool == "request_overlay"));
+    }
+
+    // The CodeGraph HTTP client's own timeout surfaces as a TaskCanceledException whose token nobody cancelled.
+
+    [Fact]
+    public async Task A_request_or_project_lookup_that_times_out_in_the_http_client_is_unavailable()
+    {
+        var request = FakeMcpServer.CodeGraph(Listing, (_, _) => throw new TaskCanceledException("The request was canceled due to the configured HttpClient.Timeout"));
+        var overlay = await Overlays(request).WaitAsync(Repo, Head, NoControls, TimeProvider.System, CancellationToken.None);
+        Assert.Equal(CodeGraphOverlay.Unavailable, overlay.Outcome);
+        Assert.StartsWith("request_overlay could not be sent:", overlay.Reason);
+
+        var lookup = new FakeMcpServer("/mcp", [], (_, _) => throw new TaskCanceledException("The request was canceled due to the configured HttpClient.Timeout"));
+        var looked = await Overlays(lookup).WaitAsync(Repo, Head, NoControls, TimeProvider.System, CancellationToken.None);
+        Assert.Equal(CodeGraphOverlay.Unavailable, looked.Outcome);
+        Assert.StartsWith("CodeGraph could not be reached or asked:", looked.Reason);
+    }
+
+    [Fact]
+    public async Task A_status_read_that_times_out_in_the_http_client_is_read_again()
+    {
+        var reads = 0;
+        var recovers = FakeMcpServer.CodeGraph(Listing, (tool, _) => tool == CodeGraphMcpClient.RequestOverlayTool
+            ? FakeMcpServer.Overlay(41, "queued", Head, IndexCommit)
+            : ++reads == 1 ? throw new TaskCanceledException("timeout") : FakeMcpServer.Overlay(41, "ready", Head, IndexCommit));
+        Assert.Equal(new CodeGraphOverlay(CodeGraphOverlay.Ready, Head, 41, IndexCommit),
+            await Overlays(recovers).WaitAsync(Repo, Head, NoControls, TimeProvider.System, CancellationToken.None));
+
+        var never = FakeMcpServer.CodeGraph(Listing, (tool, _) => tool == CodeGraphMcpClient.RequestOverlayTool
+            ? FakeMcpServer.Overlay(41, "queued", Head, IndexCommit)
+            : throw new TaskCanceledException("timeout"));
+        var overlay = await Overlays(never, TimeSpan.FromMilliseconds(300)).WaitAsync(Repo, Head, NoControls, TimeProvider.System, CancellationToken.None);
+        Assert.Equal((CodeGraphOverlay.TimedOut, 41L), (overlay.Outcome, overlay.OverlayId));
+        Assert.Contains("last status read failed", overlay.Reason);
+    }
+
+    [Fact]
+    public async Task A_cancelled_wait_still_ends_by_throwing()
+    {
+        using var cts = new CancellationTokenSource();
+        var server = FakeMcpServer.CodeGraph(Listing, (_, _) =>
+        {
+            cts.Cancel();
+            return FakeMcpServer.Overlay(41, "queued", Head, IndexCommit);
+        });
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            Overlays(server).WaitAsync(Repo, Head, NoControls, TimeProvider.System, cts.Token));
     }
 
     [Fact]
@@ -229,6 +356,25 @@ public class ReviewOverlayTests
         {
             Assert.Equal(IndexCommit, t.Commit);
             Assert.StartsWith("the PR head is not indexed for this call (commit_not_indexed, status expired)", t.Fallback);
+        });
+    }
+
+    [Fact]
+    public async Task An_error_answer_to_a_head_pinned_call_is_labelled_as_the_heads_answer()
+    {
+        var router = Router();
+        var codeGraph = FakeMcpServer.CodeGraph(Listing, (_, args) => args["sha"] is not null
+            ? FakeMcpServer.Structured("Error: the graph store is unavailable.", new JsonObject(), isError: true)
+            : FakeMcpServer.CommitAnswer(IndexCommit, "# on the default branch"));
+
+        var review = await new RouterReviewer(router.Client("http://router.test/"), "rk", tools: new ReviewTools(null, Client(codeGraph)))
+            .ReviewAsync(Request(ReadyOverlay), CancellationToken.None);
+
+        Assert.True(review.Clean, review.Error);
+        Assert.All(Results(router), r =>
+        {
+            Assert.StartsWith($"<tool-result>\nCodeGraph's answer for the PR head {Head} (error):", r);
+            Assert.DoesNotContain("default branch", r);
         });
     }
 
@@ -354,6 +500,76 @@ public class ReviewOverlayTests
         Assert.All(h.Reviewer.Requests, r => Assert.Equal(CodeGraphOverlay.TimedOut, r.Overlay!.Outcome));
         Assert.Contains("CodeGraph overlay of the head `timed-out`", LedgerReport.Facts(await h.Rows(), []));
         Assert.Contains("answers from the default branch", LedgerReport.Facts(await h.Rows(), []));
+        // The wait's outcome is checkpointed (typed: anything but ready is failed — the overlay's, not the review's).
+        var row = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.CodeGraphOverlay);
+        Assert.Equal((CodeGraphOverlay.TimedOut, StepOutcome.Failed), (CodeGraphOverlay.FromDetail(row.Detail)!.Outcome, row.Outcome));
+    }
+
+    [Fact]
+    public async Task A_request_timing_out_in_the_http_client_is_recorded_unavailable_and_the_review_goes_on()
+    {
+        var server = FakeMcpServer.CodeGraph(SandboxListing, (_, _) => throw new TaskCanceledException("HttpClient.Timeout"));
+        var h = new Harness { Overlays = Overlays(server) };
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(WorkState.Watch, outcome.State);
+        Assert.Equal(CodeGraphOverlay.Unavailable, (await h.Verdicts()).Single().Overlay!.Outcome);
+        Assert.NotEmpty(h.Reviewer.Requests);
+    }
+
+    [Fact]
+    public async Task A_recorded_ready_overlay_is_not_reused_for_another_head()
+    {
+        // A confirmed blocking finding on the first head: a fix round pushes ShaA, whose review asks for its own overlay.
+        var server = FakeMcpServer.CodeGraph(SandboxListing, (tool, args) =>
+            FakeMcpServer.Overlay(41, "ready", args["ref"]?.GetValue<string>() ?? Sha1, IndexCommit));
+        var h = new Harness
+        {
+            Overlays = Overlays(server),
+            Reviewer = new FakeReviewer
+            {
+                Findings = r => r.Role == ReviewRoles.Correctness && r.Pull.HeadSha == Sha1 ? [new Finding(Finding.Blocking, "bug", "src/x.cs", 1, "x")] : [],
+            },
+        };
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal([Sha1, ShaA], server.Calls.Where(c => c.Tool == CodeGraphMcpClient.RequestOverlayTool).Select(c => c.Arguments["ref"]!.GetValue<string>()));
+        Assert.Equal([Sha1, ShaA], (await h.Verdicts()).Select(v => v.Overlay!.HeadSha));
+    }
+
+    [Fact]
+    public async Task A_resumed_review_reuses_the_recorded_ready_overlay_of_the_same_head()
+    {
+        Harness? harness = null;
+        // Ready on the first status read, which also pauses the item: the wait ends ready, the next panel call's control check pauses.
+        var server = FakeMcpServer.CodeGraph(SandboxListing, (tool, _) =>
+        {
+            if (tool == CodeGraphMcpClient.RequestOverlayTool)
+            {
+                return FakeMcpServer.Overlay(41, "queued", Sha1, IndexCommit);
+            }
+            harness!.Controls.SetAsync(ControlScope.Item("sc-77"), ControlState.Paused, "tester", CancellationToken.None).GetAwaiter().GetResult();
+            return FakeMcpServer.Overlay(41, "ready", Sha1, IndexCommit);
+        });
+        var h = harness = new Harness { Overlays = Overlays(server) };
+
+        Assert.Equal(WorkState.Paused, (await h.Run()).State);
+        Assert.Empty(h.Reviewer.Requests);
+        var row = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.CodeGraphOverlay);
+        Assert.Equal(StepOutcome.Passed, row.Outcome);
+
+        await h.Controls.SetAsync(ControlScope.Item("sc-77"), ControlState.Running, "tester", CancellationToken.None);
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(1, server.Calls.Count(c => c.Tool == CodeGraphMcpClient.RequestOverlayTool));
+        var overlay = new CodeGraphOverlay(CodeGraphOverlay.Ready, Sha1, 41, IndexCommit);
+        Assert.All(h.Reviewer.Requests, r => Assert.Equal(overlay, r.Overlay));
+        Assert.Equal(overlay, (await h.Verdicts()).Single().Overlay);
     }
 
     [Fact]

@@ -194,7 +194,7 @@ public sealed class McpHttpClient(HttpClient http, string token, string service,
         var body = await ReadBoundedAsync(response.Content, ct);
         if (!response.IsSuccessStatusCode)
         {
-            throw new InvalidOperationException($"{service} answered {(int)response.StatusCode}: {Cut(body)}");
+            throw new McpHttpException(service, (int)response.StatusCode, ErrorCode(body), Cut(body));
         }
         var newSession = response.Headers.TryGetValues(SessionHeader, out var values) ? values.FirstOrDefault() : session;
         if (id is null)
@@ -219,6 +219,29 @@ public sealed class McpHttpClient(HttpClient http, string token, string service,
             }
         }
         throw new InvalidOperationException($"{service}'s answer holds no JSON-RPC response with id {id}: {Cut(body)}");
+    }
+
+    /// <summary>
+    /// The error code of a refusal's JSON body, or null: a string <c>error</c> (CodeGraph's middleware refusals,
+    /// <c>WriteAsJsonAsync(new { error = code, message })</c>, e.g. <c>tool_not_entitled</c> with HTTP 403) or an object's <c>code</c>.
+    /// </summary>
+    private static string? ErrorCode(string body)
+    {
+        try
+        {
+            return JsonNode.Parse(body) is JsonObject o
+                ? o["error"] switch
+                {
+                    JsonValue v when v.TryGetValue<string>(out var code) => code,
+                    JsonObject e when e["code"] is JsonValue c && c.TryGetValue<string>(out var code) => code,
+                    _ => null,
+                }
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 
     /// <summary>The data of each event of a server-sent-event body.</summary>
@@ -258,4 +281,19 @@ public sealed class McpHttpClient(HttpClient http, string token, string service,
     }
 
     private static string Cut(string s) => s.Length > 500 ? s[..500] : s;
+}
+
+/// <summary>
+/// An MCP server answered a request with a non-success HTTP status (sc-25708): the status and, when its JSON body names one, the
+/// error code (e.g. CodeGraph's <c>tool_not_entitled</c> 403 for a token not entitled to the tool it called).
+/// </summary>
+public sealed class McpHttpException(string service, int statusCode, string? code, string body)
+    : InvalidOperationException($"{service} answered {statusCode}: {body}")
+{
+    /// <summary>CodeGraph's code for a token not entitled to the tool it called (its <c>McpToolEntitlementMiddleware</c>).</summary>
+    public const string NotEntitled = "tool_not_entitled";
+
+    public int StatusCode { get; } = statusCode;
+
+    public string? Code { get; } = code;
 }

@@ -500,7 +500,16 @@ public sealed partial class RunPipeline
             return null;
         }
         await ThrowIfControlledAsync(run.Item, ct);
+        if ((await ledger.HistoryAsync(run.Item, ct)).LastOrDefault(e => e.Step == Steps.CodeGraphOverlay
+                && CodeGraphOverlay.FromDetail(e.Detail)?.HeadSha == pull.HeadSha) is { } row
+            && CodeGraphOverlay.FromDetail(row.Detail) is { IsReady: true } recorded)
+        {
+            // A resumed review (crash, Ctrl-C, a pause) of the same head: the overlay was ready, so it is not waited for again.
+            log.WriteLine($"[review] CodeGraph overlay of {Ci.Short(pull.HeadSha)}: {recorded.Describe} (recorded); CodeGraph answers about the head");
+            return recorded;
+        }
         var overlay = await overlays.WaitAsync(run.Repo, pull.HeadSha, c => ThrowIfControlledAsync(run.Item, c), GateTime, ct);
+        await ledger.CheckpointAsync(run.Item, Steps.CodeGraphOverlay, null, overlay.ToDetail(), ct);
         log.WriteLine($"[review] CodeGraph overlay of {Ci.Short(pull.HeadSha)}: {overlay.Describe}"
             + (overlay.IsReady ? "; CodeGraph answers about the head" : "; CodeGraph answers from the default branch, labelled as not the PR head"));
         return overlay;

@@ -1,14 +1,19 @@
 using System.Text.Json.Serialization;
+using DarkFactory.Orchestrator.CodeGraph;
+using DarkFactory.Orchestrator.Mcp;
 using DarkFactory.Orchestrator.Shortcut;
 
 namespace DarkFactory.Orchestrator.Gate;
 
 /// <summary>
-/// One answer of CodeGraph's overlay tools (<c>request_overlay</c>, <c>get_overlay_status</c>; CodeGraph sc-25726): whether it is an
-/// error (refused: no entitlement, unknown repository, no such tool, …) with its text, and the overlay's id, status (<c>queued</c>,
-/// <c>indexing</c>, <c>ready</c>, <c>failed</c>, <c>expired</c>), head and base commits and error, from <c>structuredContent</c>.
+/// One answer of CodeGraph's overlay tools (<c>request_overlay</c>, <c>get_overlay_status</c>; CodeGraph C6, michaeltrefry/CodeGraph
+/// PR #75): whether it is an error (<c>isError</c>: unknown repository, invalid ref, overlays unavailable, temporarily unavailable, …)
+/// with its text and code (<c>structuredContent.error.code</c>), and the overlay's id, status (<c>queued</c>, <c>indexing</c>,
+/// <c>ready</c>, <c>failed</c>, <c>expired</c>), head and base commits, error (<c>overlayError</c>) and whether a ready overlay is
+/// stale (<c>stale</c>: its base is no longer the default-branch index commit, so read tools will not use it).
 /// </summary>
-public sealed record OverlayAnswer(bool IsError, string Text, long? OverlayId, string? Status, string? HeadSha, string? BaseSha, string? Error);
+public sealed record OverlayAnswer(bool IsError, string Text, long? OverlayId, string? Status, string? HeadSha, string? BaseSha, string? Error,
+    bool Stale = false, string? ErrorCode = null);
 
 /// <summary>
 /// CodeGraph's overlay index of one commit, owner-side (sc-25708): requested and polled only by the orchestrator. The two tools are
@@ -22,7 +27,8 @@ public interface ICodeGraphOverlays
 
     /// <summary>
     /// <c>request_overlay(repo, ref)</c>: an overlay of <paramref name="project"/> at <paramref name="gitRef"/> (a full commit SHA here),
-    /// new or the live one CodeGraph already has for the same repository and commit. Throws when CodeGraph cannot be reached.
+    /// new or the live one CodeGraph already has for the same repository and commit. Throws when CodeGraph cannot be reached
+    /// (<see cref="McpHttpException"/> for an HTTP refusal, e.g. 403 <c>tool_not_entitled</c>).
     /// </summary>
     Task<OverlayAnswer> RequestOverlayAsync(string project, string gitRef, CancellationToken ct);
 
@@ -33,10 +39,11 @@ public interface ICodeGraphOverlays
 /// <summary>
 /// What became of the CodeGraph overlay a review asked for, as the verdict records it (sc-25708, E3): <see cref="Outcome"/>
 /// <c>ready</c> (CodeGraph indexed exactly <see cref="HeadSha"/>: reviewers' CodeGraph calls pass it as <c>sha</c>), <c>failed</c>
-/// (the overlay failed or expired), <c>refused</c> (CodeGraph refused the request: no entitlement, unknown repository, no overlay
-/// tool), <c>timed-out</c> (not ready within <c>CodeGraph:OverlayTimeoutMinutes</c>) or <c>unavailable</c> (no CodeGraph token, the
-/// repository not indexed, CodeGraph unreachable). Anything but ready: the tools answer from the default-branch index, labelled
-/// as not the PR head. None is a review failure (E4).
+/// (the overlay failed or expired, or is still stale after one new request), <c>refused</c> (CodeGraph refused the request: the token
+/// not entitled to <c>request_overlay</c> (HTTP 403 <c>tool_not_entitled</c>), unknown repository, invalid ref, overlays
+/// unavailable), <c>timed-out</c> (not ready within <c>CodeGraph:OverlayTimeoutMinutes</c>) or <c>unavailable</c> (no CodeGraph token,
+/// the repository not indexed, CodeGraph unreachable or its call timing out, or temporarily unavailable until the timeout). Anything
+/// but ready: the tools answer from the default-branch index, labelled as not the PR head. None is a review failure (E4).
 /// </summary>
 public sealed record CodeGraphOverlay(
     [property: JsonPropertyName("outcome")] string Outcome,
@@ -54,6 +61,26 @@ public sealed record CodeGraphOverlay(
     [JsonIgnore]
     public bool IsReady => Outcome == Ready;
 
+    /// <summary>The <c>codegraph-overlay</c> checkpoint's Detail (<see cref="RunPipeline.Steps.CodeGraphOverlay"/>).</summary>
+    public string ToDetail() => System.Text.Json.JsonSerializer.Serialize(this);
+
+    /// <summary>A <c>codegraph-overlay</c> checkpoint's overlay, or null when its Detail is not one.</summary>
+    public static CodeGraphOverlay? FromDetail(string? detail)
+    {
+        if (detail is null)
+        {
+            return null;
+        }
+        try
+        {
+            return System.Text.Json.JsonSerializer.Deserialize<CodeGraphOverlay>(detail) is { Outcome: not null, HeadSha: not null } overlay ? overlay : null;
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>The outcome in a few words (log lines, prompts and reports).</summary>
     [JsonIgnore]
     public string Describe => IsReady
@@ -66,8 +93,13 @@ public sealed record CodeGraphOverlay(
 /// CodeGraph for an overlay of the PR head (<c>request_overlay</c> with the PR repository's project and the head SHA) and polls
 /// <c>get_overlay_status</c> every <see cref="PollInterval"/> until it is ready, failed or expired, for at most <see cref="Timeout"/>
 /// (<c>CodeGraph:OverlayTimeoutMinutes</c>; the calls themselves included). Before each poll the run's controls are checked (a
-/// Pause or Stop ends the wait as it ends the panel's calls). A refused request, an overlay that failed or expired, or no CodeGraph
-/// at all ends the wait at once; none of them fails the review.
+/// Pause or Stop ends the wait as it ends the panel's calls). A refused request (an error answer, or HTTP 403 for a token not
+/// entitled to the tool), an overlay that failed or expired, or no CodeGraph at all ends the wait at once. A call that cannot be
+/// made (CodeGraph unreachable, its HTTP client's own timeout) is <c>unavailable</c> for the request, and is read again until the
+/// timeout for a status read. A <c>temporarily_unavailable</c> answer is requested again every <see cref="PollInterval"/> (still so
+/// at the timeout: <c>unavailable</c>). A ready overlay that is <c>stale</c> (its base is no longer the default-branch index commit,
+/// so CodeGraph's read tools will not use it; CodeGraph never answers a request with a stale overlay, so a new request queues a fresh
+/// one) is requested once more; stale again, it is <c>failed</c>. None of them fails the review.
 /// </summary>
 public sealed class ReviewOverlays(ICodeGraphOverlays? codeGraph, TimeSpan timeout, TimeSpan? pollInterval = null)
 {
@@ -76,6 +108,12 @@ public sealed class ReviewOverlays(ICodeGraphOverlays? codeGraph, TimeSpan timeo
 
     /// <summary>The default of <c>CodeGraph:OverlayTimeoutMinutes</c>.</summary>
     public static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(10);
+
+    /// <summary>Why an overlay still stale after one new request is not used.</summary>
+    public const string StaleReason = "the overlay is stale (default branch moved past its base)";
+
+    /// <summary>CodeGraph's error code for a request it cannot serve now (C6's <c>TemporarilyUnavailableCode</c>).</summary>
+    public const string TemporarilyUnavailable = "temporarily_unavailable";
 
     public TimeSpan Timeout { get; } = timeout;
 
@@ -102,6 +140,8 @@ public sealed class ReviewOverlays(ICodeGraphOverlays? codeGraph, TimeSpan timeo
         using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct, deadline.Token);
         long? overlayId = null;
         string? lastError = null;
+        string? unavailable = null;
+        var staleAnswers = 0;
         try
         {
             string project;
@@ -113,59 +153,92 @@ public sealed class ReviewOverlays(ICodeGraphOverlays? codeGraph, TimeSpan timeo
                 }
                 project = found;
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            // Anything but the wait's own cancellation (a Pause, Stop, shutdown or the deadline), e.g. the HTTP client's own timeout.
+            catch (Exception ex) when (ex is not OperationCanceledException || !bounded.IsCancellationRequested)
             {
                 return new(CodeGraphOverlay.Unavailable, headSha, Reason: $"CodeGraph could not be reached or asked: {Cut(ex.Message)}");
             }
-            OverlayAnswer answer;
-            try
-            {
-                answer = await codeGraph.RequestOverlayAsync(project, headSha, bounded.Token);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                return new(CodeGraphOverlay.Unavailable, headSha, Reason: $"request_overlay could not be sent: {Cut(ex.Message)}");
-            }
-            if (answer.IsError)
-            {
-                return new(CodeGraphOverlay.Refused, headSha, answer.OverlayId, answer.BaseSha, $"request_overlay: {Cut(answer.Text)}");
-            }
-            if (answer.OverlayId is null && answer.Status != StatusReady)
-            {
-                return new(CodeGraphOverlay.Refused, headSha, null, answer.BaseSha,
-                    $"request_overlay answered no overlay id (status {answer.Status ?? "none"})");
-            }
-            overlayId = answer.OverlayId;
             while (true)
             {
-                if (Settled(answer, headSha) is { } settled)
-                {
-                    return settled;
-                }
-                await Task.Delay(PollInterval, time, bounded.Token);
-                await checkControls(ct);
+                OverlayAnswer answer;
                 try
                 {
-                    answer = await codeGraph.OverlayStatusAsync(overlayId!.Value, bounded.Token);
-                    lastError = null;
+                    answer = await codeGraph.RequestOverlayAsync(project, headSha, bounded.Token);
                 }
-                catch (Exception ex) when (ex is not OperationCanceledException)
+                catch (McpHttpException ex) when (ex.StatusCode == 403)
                 {
-                    // A status read that could not be made is not the overlay's failure: read again until the timeout.
-                    lastError = Cut(ex.Message);
+                    // CodeGraph's tool entitlement refuses an unentitled token before the tool runs: HTTP 403, code tool_not_entitled.
+                    return new(CodeGraphOverlay.Refused, headSha, Reason: ex.Code == McpHttpException.NotEntitled
+                        ? $"not entitled to {CodeGraphMcpClient.RequestOverlayTool}"
+                        : $"request_overlay: CodeGraph answered 403{(ex.Code is { } code ? $" ({Cut(code)})" : "")}");
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException || !bounded.IsCancellationRequested)
+                {
+                    return new(CodeGraphOverlay.Unavailable, headSha, Reason: $"request_overlay could not be sent: {Cut(ex.Message)}");
+                }
+                if (answer.IsError && answer.ErrorCode == TemporarilyUnavailable)
+                {
+                    // CodeGraph could not look the ref up now: ask again until the timeout.
+                    unavailable = Cut(answer.Text);
+                    await Task.Delay(PollInterval, time, bounded.Token);
+                    await checkControls(ct);
                     continue;
                 }
+                unavailable = null;
                 if (answer.IsError)
                 {
-                    return new(CodeGraphOverlay.Failed, headSha, overlayId, answer.BaseSha, $"get_overlay_status: {Cut(answer.Text)}");
+                    return new(CodeGraphOverlay.Refused, headSha, answer.OverlayId, answer.BaseSha,
+                        $"request_overlay{(answer.ErrorCode is { } code ? $" ({Cut(code)})" : "")}: {Cut(answer.Text)}");
                 }
-                answer = answer with { OverlayId = answer.OverlayId ?? overlayId };
+                if (answer.OverlayId is null && answer.Status != StatusReady)
+                {
+                    return new(CodeGraphOverlay.Refused, headSha, null, answer.BaseSha,
+                        $"request_overlay answered no overlay id (status {answer.Status ?? "none"})");
+                }
+                overlayId = answer.OverlayId;
+                while (true)
+                {
+                    if (answer.Status == StatusReady && answer.Stale && string.Equals(answer.HeadSha, headSha, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (staleAnswers++ > 0)
+                        {
+                            return new(CodeGraphOverlay.Failed, headSha, answer.OverlayId, answer.BaseSha, StaleReason);
+                        }
+                        break; // request it again: CodeGraph queues a fresh overlay of the head against the current default branch
+                    }
+                    if (Settled(answer, headSha) is { } settled)
+                    {
+                        return settled;
+                    }
+                    await Task.Delay(PollInterval, time, bounded.Token);
+                    await checkControls(ct);
+                    try
+                    {
+                        answer = await codeGraph.OverlayStatusAsync(overlayId!.Value, bounded.Token);
+                        lastError = null;
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException || !bounded.IsCancellationRequested)
+                    {
+                        // A status read that could not be made (unreachable, the HTTP client's own timeout) is not the overlay's
+                        // failure: read again until the timeout.
+                        lastError = Cut(ex.Message);
+                        continue;
+                    }
+                    if (answer.IsError)
+                    {
+                        return new(CodeGraphOverlay.Failed, headSha, overlayId, answer.BaseSha, $"get_overlay_status: {Cut(answer.Text)}");
+                    }
+                    answer = answer with { OverlayId = answer.OverlayId ?? overlayId };
+                }
             }
         }
         catch (OperationCanceledException) when (deadline.IsCancellationRequested && !ct.IsCancellationRequested)
         {
-            return new(CodeGraphOverlay.TimedOut, headSha, overlayId, null,
-                $"not ready within {Timeout.TotalMinutes:0.##} min{(lastError is null ? "" : $" (last status read failed: {lastError})")}");
+            return unavailable is not null
+                ? new(CodeGraphOverlay.Unavailable, headSha, overlayId, null,
+                    $"CodeGraph was temporarily unavailable until the timeout ({Timeout.TotalMinutes:0.##} min): {unavailable}")
+                : new(CodeGraphOverlay.TimedOut, headSha, overlayId, null,
+                    $"not ready within {Timeout.TotalMinutes:0.##} min{(lastError is null ? "" : $" (last status read failed: {lastError})")}");
         }
     }
 

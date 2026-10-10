@@ -53,7 +53,14 @@ public sealed class FakeMcpServer
                         };
                         break;
                     case "tools/call":
-                        result = answer(message["params"]!["name"]!.GetValue<string>(), message["params"]!["arguments"]!.AsObject());
+                        try
+                        {
+                            result = answer(message["params"]!["name"]!.GetValue<string>(), message["params"]!["arguments"]!.AsObject());
+                        }
+                        catch (HttpAnswer http)
+                        {
+                            return http.Response;
+                        }
                         break;
                     default:
                         return new HttpResponseMessage(HttpStatusCode.Accepted);
@@ -130,13 +137,59 @@ public sealed class FakeMcpServer
         }, isError: code != "commit_not_indexed");
 
     /// <summary>
-    /// An overlay tool's answer (CodeGraph C6, sc-25726: <c>request_overlay</c> / <c>get_overlay_status</c> answer in
-    /// <c>structuredContent</c> <c>overlayId</c>, <c>status</c> (queued | indexing | ready | failed | expired), <c>headSha</c>,
-    /// <c>baseSha</c>; field names as C3's <c>BranchOverlayResponse</c>, PR #67, serialized camelCase).
+    /// An overlay tool's answer (CodeGraph C6, michaeltrefry/CodeGraph PR #75, <c>OverlayMcpServer.AnswerAsync</c>), copied from:
+    /// <code>
+    /// ["commitSha"] = overlay.HeadSha, ["overlayId"] = overlay.OverlayId, ["repo"] = overlay.Repo, ["ref"] = overlay.Ref,
+    /// ["status"] = overlay.Status, ["headSha"] = overlay.HeadSha, ["baseSha"] = overlay.BaseSha, ["stale"] = stale,
+    /// ["overlayError"] = overlay.Error, ...
+    /// $"Commit: {overlay.HeadSha ?? "unknown (resolved when indexing starts)"}", "",
+    /// $"Overlay {overlay.OverlayId} for {overlay.Repo}@{overlay.Ref}: {overlay.Status}" + ...
+    /// </code>
+    /// (serialized camelCase; no <c>isError</c>: a failed or expired overlay is an answer, its text in <c>overlayError</c>).
     /// </summary>
-    public static JsonObject Overlay(long overlayId, string status, string? headSha, string? baseSha, string? error = null) =>
-        Structured($"Overlay {overlayId}: {status}", new JsonObject
-        {
-            ["overlayId"] = overlayId, ["status"] = status, ["headSha"] = headSha, ["baseSha"] = baseSha, ["error"] = error,
-        });
+    public static JsonObject Overlay(long overlayId, string status, string? headSha, string? baseSha, string? error = null, bool stale = false,
+        string repo = "R Service") =>
+        Structured(
+            $"Commit: {headSha ?? "unknown (resolved when indexing starts)"}\n\nOverlay {overlayId} for {repo}@{headSha}: {status}.\n"
+            + $"Head: {headSha ?? "not resolved yet"}\nBase (default-branch index commit): {baseSha ?? "not resolved yet"}\n"
+            + (status, stale) switch
+            {
+                ("ready", true) => "Stale: the default-branch index has moved past this overlay's base, so read tools will not use it. Request a new overlay.\n",
+                ("ready", false) => $"Ready: 1 changed files, 10 nodes. Pass sha={headSha} to the read tools.\n",
+                ("failed", _) => $"Failed: {error ?? "no error recorded"}. Request it again to queue a new overlay.\n",
+                _ => $"Not ready yet; poll get_overlay_status(overlayId: {overlayId}).\n",
+            },
+            new JsonObject
+            {
+                ["commitSha"] = headSha, ["overlayId"] = overlayId, ["repo"] = repo, ["ref"] = headSha, ["status"] = status,
+                ["headSha"] = headSha, ["baseSha"] = baseSha, ["stale"] = stale, ["overlayError"] = error,
+            });
+
+    /// <summary>
+    /// An overlay tool's error answer (C6, PR #75, <c>OverlayMcpServer.Error</c>), copied from:
+    /// <code>
+    /// ["error"] = new JsonObject { ["code"] = code, ["message"] = message }
+    /// Content = [new TextContentBlock { Text = $"Error ({code}): {message}" }], ..., IsError = true
+    /// </code>
+    /// Codes: <c>repo_not_found</c>, <c>invalid_ref</c>, <c>overlay_not_found</c>, <c>invalid_request</c>, <c>overlays_unavailable</c>,
+    /// <c>temporarily_unavailable</c>.
+    /// </summary>
+    public static JsonObject OverlayError(string code, string message) =>
+        Structured($"Error ({code}): {message}", new JsonObject { ["error"] = new JsonObject { ["code"] = code, ["message"] = message } }, isError: true);
+
+    /// <summary>
+    /// CodeGraph's refusal of a <c>tools/call</c> for a tool the token is not entitled to (its <c>McpToolEntitlementMiddleware</c>,
+    /// before any tool runs; asserted in PR #75's <c>McpToolEntitlementMiddlewareTests</c>:
+    /// <c>refused.StatusCode.ShouldBe(StatusCodes.Status403Forbidden); refused.Body.ShouldContain("tool_not_entitled");</c>), copied from
+    /// <c>RejectAsync</c>: <c>StatusCode = Status403Forbidden; ContentType = "application/json"; WriteAsJsonAsync(new { error = code, message })</c>
+    /// with <c>"tool_not_entitled", $"This MCP token is not entitled to call '{toolName}'."</c>. Thrown from an answer function.
+    /// </summary>
+    public static HttpAnswer NotEntitled(string tool) => new(FakeApi.Json(HttpStatusCode.Forbidden,
+        new JsonObject { ["error"] = "tool_not_entitled", ["message"] = $"This MCP token is not entitled to call '{tool}'." }.ToJsonString()));
+
+    /// <summary>Thrown from an answer function: the <c>tools/call</c> is answered with <see cref="Response"/> instead of a result.</summary>
+    public sealed class HttpAnswer(HttpResponseMessage response) : Exception("an HTTP answer")
+    {
+        public HttpResponseMessage Response { get; } = response;
+    }
 }
