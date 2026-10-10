@@ -336,8 +336,10 @@ public sealed class GatewayLintTests
                     problems.Add($"{path} has a #pragma warning disable naming a DF rule");
                 }
             }
+            // Only the arguments' own tokens: their trivia (comments, a generated #line directive's file path) names nothing.
             foreach (var attribute in root.DescendantNodes().OfType<AttributeSyntax>()
-                .Where(a => a.ArgumentList is { } args && Regex.IsMatch(args.ToString(), @"Gateway|DF\d", RegexOptions.IgnoreCase)))
+                .Where(a => a.ArgumentList is { } args
+                    && Regex.IsMatch(string.Concat(args.DescendantTokens().Select(t => t.Text)), @"Gateway|DF\d", RegexOptions.IgnoreCase)))
             {
                 problems.Add($"{path} has an attribute naming the gateway lint: {attribute}");
             }
@@ -370,6 +372,29 @@ public sealed class GatewayLintTests
     public void Every_way_to_switch_the_lint_off_is_refused(string path, string text, string what)
     {
         Assert.Contains(SwitchOffs([(path, text)]), p => p.Contains(what, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void A_generated_line_directive_or_comment_naming_a_path_is_not_an_attribute_naming_the_lint()
+    {
+        // As the Razor generator writes a route: the #line path (a worktree such as agent-…df78…, a Gateway/ folder) and the
+        // comment are trivia, not the attribute's arguments.
+        static string Route(string value) => $$"""
+            [global::Microsoft.AspNetCore.Components.RouteAttribute(
+                // language=Route,Component Gateway DF0001
+            #nullable restore
+            #line (1,7)-(1,10) "/Users/x/.claude/worktrees/agent-afe083c7e9df78b09/Gateway/Pages/Pipeline.razor"
+            {{value}}
+            #line default
+            #line hidden
+            #nullable disable
+                )]
+            public partial class Pipeline { }
+            """;
+        const string path = "src/X/obj/generated/Pipeline_razor.g.cs";
+        Assert.Empty(SwitchOffs([(path, Route("\"/\""))]));
+        // The same shape whose argument itself names a rule is still refused.
+        Assert.Contains(SwitchOffs([(path, Route("\"/DF0001\""))]), p => p.Contains("attribute naming the gateway lint", StringComparison.Ordinal));
     }
 
     /// <summary>The files a build of the linted projects reads, but bin/obj.</summary>
