@@ -190,7 +190,21 @@ public static class LedgerReport
             + $"{(r.Tools is { Count: > 0 } tools ? $", {tools.Count} tool call{(tools.Count == 1 ? "" : "s")}" : "")}"
             + $"{(r.Error is null ? "" : ", unusable answer")})")));
         text.Append(CultureInfo.InvariantCulture,
-            $"; {blocking.Count} blocking, {findings.Count - blocking.Count} optional ({findings.Count(f => f.Finding.Downgraded)} downgraded by the second opinion)\n");
+            $"; {blocking.Count} blocking, {findings.Count - blocking.Count} optional ({findings.Count(f => f.Finding.Downgraded)} downgraded by the second opinion)");
+        if (verdict.Overlay is { } overlay)
+        {
+            // sc-25708 (E3): whether the reviewers' CodeGraph answers were of the head or of the default branch.
+            text.Append(overlay.IsReady
+                ? $"; CodeGraph answered about the head (overlay {Code(overlay.OverlayId?.ToString(CultureInfo.InvariantCulture) ?? "?")})"
+                : $"; CodeGraph overlay of the head {Code(overlay.Outcome)}{(overlay.Reason is { } why ? $" ({Code(why)})" : "")}, answers from the default branch");
+        }
+        var fallbacks = verdict.Reviews.Where(r => r.CarriedFrom is null)
+            .SelectMany(r => (r.Tools ?? []).Concat(r.Findings.SelectMany(f => f.Confirmation?.Tools ?? []))).Count(t => t.Fallback is not null);
+        if (fallbacks > 0)
+        {
+            text.Append(CultureInfo.InvariantCulture, $"; {fallbacks} CodeGraph call(s) fell back to the default branch (the head not indexed)");
+        }
+        text.Append('\n');
         foreach (var (role, finding) in blocking.Take(MaxBlockingFindingsShown))
         {
             var how = finding.Confirmation is { Outcome: Confirmation.Confirmed } c ? $"confirmed by {Code(c.ServedName)}"

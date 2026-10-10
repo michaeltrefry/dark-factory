@@ -13,7 +13,8 @@ namespace DarkFactory.Orchestrator;
 /// What the Review → CI → MergeGate → Merge handlers need: GitHub as the gate App (<see cref="GitHubGate"/>), the review
 /// panel's calls (through the router, on the high model class), how long and how often CI is waited for, and the sandboxed
 /// test runs of the <c>new-tests-fail-on-base</c> check (<see cref="Tests"/>; none: the check cannot run, so it fails
-/// wherever it is required).
+/// wherever it is required), and the wait for CodeGraph's overlay of the head at the start of a review (<see cref="Overlays"/>,
+/// sc-25708; none: no overlay is asked for and reviewers' CodeGraph calls read the default-branch index).
 /// </summary>
 public sealed record GateStage(
     IGateGitHub GitHub,
@@ -21,7 +22,8 @@ public sealed record GateStage(
     TimeSpan CiPollInterval,
     TimeSpan CiTimeout,
     TimeProvider? Time = null,
-    IGateTestRunner? Tests = null)
+    IGateTestRunner? Tests = null,
+    ReviewOverlays? Overlays = null)
 {
     public static readonly TimeSpan DefaultCiPollInterval = TimeSpan.FromSeconds(30);
     public static readonly TimeSpan DefaultCiTimeout = TimeSpan.FromMinutes(30);
@@ -458,6 +460,8 @@ public sealed partial class RunPipeline
             + (carried.Count > 0 ? $"; carried from {Ci.Short(previous!.HeadSha)}: {string.Join(", ", carried.Select(c => c.Role))}" : "")
             + (risky.Count > 0 ? $" (risky: {string.Join(", ", risky)})" : ""));
 
+        // CodeGraph's overlay of the head (sc-25708), asked for once, before the first panel call, only when a role is reviewed here.
+        var overlay = toReview.Count > 0 ? await OverlayForReviewAsync(run, pull, ct) : null;
         var reviews = new List<RoleReview>();
         foreach (var role in roles)
         {
@@ -469,19 +473,37 @@ public sealed partial class RunPipeline
             var prompt = ReviewPrompts.For(role);
             var session = await NameReviewSessionAsync(run, pull, role, prompt, ct);
             var review = await RouterCallAsync(() => Gate.Reviewer.ReviewAsync(
-                new ReviewRequest(run.Story, run.Repo.FullName, pull, diff, files, role, prompt, session), ct), ct);
+                new ReviewRequest(run.Story, run.Repo.FullName, pull, diff, files, role, prompt, session, overlay), ct), ct);
             if (review.Clean)
             {
                 var findings = new List<Finding>();
                 foreach (var finding in review.Findings)
                 {
-                    findings.Add(finding.IsBlocking ? await ConfirmAsync(run, pull, diff, files, review, finding, ct) : finding);
+                    findings.Add(finding.IsBlocking ? await ConfirmAsync(run, pull, diff, files, review, finding, overlay, ct) : finding);
                 }
                 review = review with { Findings = findings };
             }
             reviews.Add(review);
         }
-        return ReviewPanel.Decide(pull.HeadSha, risky, reviews);
+        return ReviewPanel.Decide(pull.HeadSha, risky, reviews) with { Overlay = overlay };
+    }
+
+    /// <summary>
+    /// Asks CodeGraph for its overlay of the PR head and waits for it (<see cref="ReviewOverlays"/>, sc-25708): owner-side, before any
+    /// panel call, bounded by <c>CodeGraph:OverlayTimeoutMinutes</c>, a Pause or Stop checked before each status read (as before each
+    /// panel call). Null without an overlay wait configured. Whatever it ends with is recorded in the verdict; none fails the review.
+    /// </summary>
+    private async Task<CodeGraphOverlay?> OverlayForReviewAsync(Run run, PullFacts pull, CancellationToken ct)
+    {
+        if (Gate.Overlays is not { } overlays)
+        {
+            return null;
+        }
+        await ThrowIfControlledAsync(run.Item, ct);
+        var overlay = await overlays.WaitAsync(run.Repo, pull.HeadSha, c => ThrowIfControlledAsync(run.Item, c), GateTime, ct);
+        log.WriteLine($"[review] CodeGraph overlay of {Ci.Short(pull.HeadSha)}: {overlay.Describe}"
+            + (overlay.IsReady ? "; CodeGraph answers about the head" : "; CodeGraph answers from the default branch, labelled as not the PR head"));
+        return overlay;
     }
 
     /// <summary>
@@ -813,12 +835,13 @@ public sealed partial class RunPipeline
     /// A second opinion (its own high-class session; the router may serve it with the reviewer's model) checks one blocking
     /// finding; the finding comes back downgraded when it does not confirm it.
     /// </summary>
-    private async Task<Finding> ConfirmAsync(Run run, PullFacts pull, string diff, RepoFiles files, RoleReview review, Finding finding, CancellationToken ct)
+    private async Task<Finding> ConfirmAsync(Run run, PullFacts pull, string diff, RepoFiles files, RoleReview review, Finding finding,
+        CodeGraphOverlay? overlay, CancellationToken ct)
     {
         var prompt = ReviewPrompts.Confirm;
         var session = await NameReviewSessionAsync(run, pull, $"confirm-{review.Role}", prompt, ct);
         var confirmation = await RouterCallAsync(() => Gate.Reviewer.ConfirmAsync(
-            new ConfirmRequest(run.Story, run.Repo.FullName, pull, diff, files, review.Role, finding, prompt, session), ct), ct);
+            new ConfirmRequest(run.Story, run.Repo.FullName, pull, diff, files, review.Role, finding, prompt, session, overlay), ct), ct);
         log.WriteLine($"[review] {review.Role} finding '{finding.Title}': {confirmation.Outcome} by {confirmation.ServedName} ({confirmation.ServedClass ?? "no class named"})");
         return finding.ConfirmedBy(confirmation);
     }

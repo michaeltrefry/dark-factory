@@ -79,4 +79,64 @@ public sealed class FakeMcpServer
     /// <summary>A <c>tools/call</c> result with one text block.</summary>
     public static JsonObject Text(string text) =>
         new() { ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text }) };
+
+    /// <summary>A <c>tools/call</c> result with one text block and <paramref name="structured"/> as its <c>structuredContent</c>.</summary>
+    public static JsonObject Structured(string text, JsonObject structured, bool isError = false)
+    {
+        var result = Text(text);
+        result["structuredContent"] = structured;
+        if (isError)
+        {
+            result["isError"] = true;
+        }
+        return result;
+    }
+
+    // ---- CodeGraph's answers, in the shapes of its contract (sc-25708) ----
+
+    /// <summary>
+    /// A fake hosted CodeGraph at <c>/mcp</c>: <c>search_projects</c> answers <paramref name="listing"/>, every other tool
+    /// <paramref name="answer"/> (overlay tools included).
+    /// </summary>
+    public static FakeMcpServer CodeGraph(string listing, Func<string, JsonObject, JsonObject> answer) =>
+        new("/mcp", [], (tool, args) => tool == "search_projects" ? Text(listing) : answer(tool, args));
+
+    /// <summary>
+    /// A read answered for a commit (CodeGraph C4, michaeltrefry/CodeGraph PR #71, <c>CommitAnswer.Create</c>): the first text line
+    /// <c>Commit: &lt;sha&gt;</c> and <c>structuredContent.commitSha</c>, as in
+    /// <c>Result($"{commit.HeaderLine}\n\n{text}", structured, isError: false)</c> with <c>["commitSha"] = commit.CommitSha</c> and
+    /// <c>["source"] = scope.Overlay is not null ? "overlay" : "default-branch"</c>.
+    /// </summary>
+    public static JsonObject CommitAnswer(string sha, string text, bool overlay = false) =>
+        Structured($"Commit: {sha}\n\n{text}", new JsonObject { ["commitSha"] = sha, ["source"] = overlay ? "overlay" : "default-branch" });
+
+    /// <summary>
+    /// A commit-pinned read CodeGraph cannot answer for <paramref name="sha"/> (C4, PR #71, <c>CommitAnswer.NotIndexed</c>):
+    /// <c>$"Commit: {sha}\n\n" + $"Not indexed ({code}, status: {status}): {message}"</c>, <c>["commitSha"] = sha</c>,
+    /// <c>["notIndexed"]</c> = <c>CommitNotIndexedResponse(Code, Repo, Sha, Status, Message, OverlayId, BaseSha)</c> in camelCase, and
+    /// <c>isError: notIndexed.Code != NotIndexedCode</c> (so <c>commit_not_indexed</c> is not an error). It names the SHA asked
+    /// about, yet carries no data.
+    /// </summary>
+    public static JsonObject NotIndexed(string repo, string sha, string status, long? overlayId = null, string? baseSha = null,
+        string code = "commit_not_indexed", string message = "No ready overlay for this commit.") =>
+        Structured($"Commit: {sha}\n\nNot indexed ({code}, status: {status}): {message}", new JsonObject
+        {
+            ["commitSha"] = sha,
+            ["notIndexed"] = new JsonObject
+            {
+                ["code"] = code, ["repo"] = repo, ["sha"] = sha, ["status"] = status, ["message"] = message,
+                ["overlayId"] = overlayId, ["baseSha"] = baseSha,
+            },
+        }, isError: code != "commit_not_indexed");
+
+    /// <summary>
+    /// An overlay tool's answer (CodeGraph C6, sc-25726: <c>request_overlay</c> / <c>get_overlay_status</c> answer in
+    /// <c>structuredContent</c> <c>overlayId</c>, <c>status</c> (queued | indexing | ready | failed | expired), <c>headSha</c>,
+    /// <c>baseSha</c>; field names as C3's <c>BranchOverlayResponse</c>, PR #67, serialized camelCase).
+    /// </summary>
+    public static JsonObject Overlay(long overlayId, string status, string? headSha, string? baseSha, string? error = null) =>
+        Structured($"Overlay {overlayId}: {status}", new JsonObject
+        {
+            ["overlayId"] = overlayId, ["status"] = status, ["headSha"] = headSha, ["baseSha"] = baseSha, ["error"] = error,
+        });
 }

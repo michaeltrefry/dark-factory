@@ -220,8 +220,10 @@ public static class FactoryRunner
         var gateGitHub = new GitHubGate(githubHttp, gateApp);
         using var codeGraphHttp = OutboundHttp.CodeGraphApi(options.CodeGraphBaseUrl);
         using var kanbanHttp = OutboundHttp.KanbanApi(options.KanbanMcpUrl);
-        var reviewer = new RouterReviewer(reviewerHttp, routerKey, tools: CreateReviewTools(options, workspaces, codeGraphHttp, log, kanbanHttp));
-        var gate = CreateGate(options, gateGitHub, reviewer, workspaces, sandbox);
+        // One upstream registry: the reviewers' tools and the review's overlay wait (sc-25708) share its CodeGraph client.
+        var upstreams = CreateUpstreams(options, codeGraphHttp, kanbanHttp, log);
+        var reviewer = new RouterReviewer(reviewerHttp, routerKey, tools: new ReviewTools(workspaces, upstreams.CodeGraph, upstreams.Kanban, log));
+        var gate = CreateGate(options, gateGitHub, reviewer, workspaces, sandbox, upstreams.CodeGraph);
         if (adjustGate is not null)
         {
             gate = adjustGate(gate);
@@ -305,11 +307,14 @@ public static class FactoryRunner
 
     /// <summary>
     /// The merge gate as configured: CI on the PR's head polled every <c>Gate:CiPollSeconds</c> until <c>Gate:CiTimeoutMinutes</c>,
-    /// the new tests run sandboxed for up to <c>Gate:TestTimeoutMinutes</c> each.
+    /// the new tests run sandboxed for up to <c>Gate:TestTimeoutMinutes</c> each, and each review waits up to
+    /// <c>CodeGraph:OverlayTimeoutMinutes</c> for CodeGraph's overlay of the head (sc-25708; without a CodeGraph token the wait ends at
+    /// once, recorded as unavailable).
     /// </summary>
     internal static GateStage CreateGate(FactoryOptions options, IGateGitHub github, IReviewer reviewer, GitWorkspace workspaces,
-        WorkerSandbox? sandbox) =>
-        new(github, reviewer, options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, sandbox, options.TestTimeout));
+        WorkerSandbox? sandbox, ICodeGraphOverlays? codeGraph = null) =>
+        new(github, reviewer, options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, sandbox, options.TestTimeout),
+            Overlays: new ReviewOverlays(codeGraph, options.CodeGraphOverlayTimeout));
 
     /// <summary>The sandbox readiness probe, a factory-wide failure (E10): a stale helper fails the factory once, not every item.</summary>
     internal static Task EnsureSandboxReadyAsync(WorkerSandbox sandbox, WorkerAuth auth, string claudePath, CancellationToken ct) =>

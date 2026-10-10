@@ -114,6 +114,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Router:BaseUrl` | `http://localhost:8080` (an absolute http(s) URL; one naming a model provider's host or key — `src/DarkFactory.Analyzers/ProviderMarkers.txt`, the gateway lint's list, embedded in both the analyzer and the orchestrator, `Gateway/ProviderMarkers.cs` — is refused, P1-E1) |
 | `Router:Key` | env `FACTORY_ROUTER_KEY`, or keychain account `router-key` |
 | `CodeGraph:BaseUrl` | the hosted CodeGraph (`OutboundHttp.CodeGraphDefaultBase`; an absolute http(s) URL naming no model provider): reviewers' CodeGraph tools (`ReviewTools.CodeGraphTools`) go to its `mcp` endpoint |
+| `CodeGraph:OverlayTimeoutMinutes` | `10` (> 0: how long a review waits, before its first panel call, for CodeGraph's overlay of the PR head; not ready by then, reviewers' CodeGraph calls read the default-branch index, labelled not the PR head; sc-25708) |
 | `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional: without it the factory starts and every CodeGraph tool answers the reviewer an error result (recorded), and triage gets no CodeGraph |
 | `Kanban:McpUrl` | `https://kanban-mcp.trefry.net/mcp` (`OutboundHttp.KanbanDefaultMcpUrl`; an absolute http(s) URL naming no model provider; MCP Streamable HTTP): the Kanban upstream (sc-25707), offered to reviewers through their tool loop (and kept for Phase 4's planner, `McpProfile.Planner`); never to triage sessions, whose proxy is started without it (`McpProfile.Triage`: the issue text is untrusted and the triage's answer is posted on the issue) |
 | `Kanban:Token` | env `FACTORY_KANBAN_TOKEN`, or keychain account `kanban-token`: a KanbanBoard PAT (`Authorization: Bearer`), owner-side only (E5). Optional: without it there is no Kanban upstream (not an error) |
@@ -635,10 +636,24 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   entry matches answers the error "repository not indexed in CodeGraph". Queries are asked about this repository; answers are not
   filtered and may name nodes of other indexed projects that depend on or call it (`analyze_impact`'s cross-repo impact,
   `trace_call_path`, `find_consumers`/`find_publishers` cross projects), which every graph tool's description says; `read_node_source` (whose CodeGraph handler takes only a
-  node id) is shown only when its answer's header names that project. Each answer is labelled with the default-branch commit its
-  index describes, read only from CodeGraph's contract (CodeGraph sc-25702): `structuredContent.commitSha`, else a first text line
-  `Commit: <40-hex sha>` — otherwise "commit unknown" (today's hosted answers carry neither until sc-25702 deploys) — always "not
-  the PR head". Kanban tools (sc-25707, only with `Kanban:Token`): each session lists the Kanban upstream once
+  node id) is shown only when its answer's header names that project. Each answer is labelled with the commit its index
+  describes, read only from CodeGraph's contract (CodeGraph sc-25702): `structuredContent.commitSha`, else a first text line
+  `Commit: <40-hex sha>` — otherwise "commit unknown" (today's hosted answers carry neither until sc-25702 deploys). Head overlay
+  (sc-25708, `Gate/ReviewOverlay.cs`, E3): when a review starts — once per head, before the first panel call, only if a role is
+  reviewed there (not when every review is carried) — the orchestrator, never a model, asks CodeGraph for an overlay of the PR
+  head (`ReviewOverlays`: `request_overlay(repo = the pinned project, ref = head SHA)`, then `get_overlay_status(overlayId)`
+  every `ReviewOverlays.DefaultPollInterval` (10 s); CodeGraph sc-25726, C6, coded to its contract with fakes) and waits at most
+  `CodeGraph:OverlayTimeoutMinutes` (the calls included), a Pause/Stop checked before each status read like before each panel
+  call. The outcome — `ready` (status ready and `headSha` exactly the head), `failed` (failed/expired, or a ready overlay of
+  another commit), `refused` (an error answer: no entitlement, unknown repo, no such tool), `timed-out`, `unavailable` (no
+  token, repo not indexed, CodeGraph unreachable) — with overlay id, head and base, is the verdict's `codegraph` and a line of
+  the PR report; none fails the review (E4). Ready, every CodeGraph call of every role and second opinion passes `sha` = head
+  (C4, CodeGraph PR #71) and only an answer naming exactly the head is labelled "CodeGraph's index of <project> at the PR head";
+  a typed not-indexed answer (`structuredContent.notIndexed`, which names the head yet carries no data) makes that call fall
+  back to the default-branch call, labelled and recorded (`tools[].fallback`). Not ready, the calls go without `sha` and are
+  labelled "…'s default branch as of <sha>, not the PR head". `request_overlay`/`get_overlay_status`
+  (`CodeGraphMcpClient.OverlayTools`) are sent straight through the MCP client and are on no allowlist, profile or tool list (a
+  test asserts it). Triage is unchanged (no `sha`). Overlay node ids are negative, so `read_node_source` takes any integer id. Kanban tools (sc-25707, only with `Kanban:Token`): each session lists the Kanban upstream once
   (`ReviewTools.DefinitionsAsync`) and is offered, after `ReviewTools.Names`, its tools on `McpServers.KanbanTools` with their own
   input schemas (a failed listing offers none; a tool whose schema is not a JSON object of `"type": "object"` within
   `ReviewTools.MaxKanbanSchemaChars`, 4 KB serialized, is left out and logged once, `ReviewTools.UsableSchema`), plus one

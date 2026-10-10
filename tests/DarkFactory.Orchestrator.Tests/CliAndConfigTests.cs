@@ -441,6 +441,7 @@ public class FactoryOptionsTests
         { "Usage:PollSeconds", o => o.UsagePollInterval, TimeSpan.FromSeconds(7) },
         { "Worker:TimeoutMinutes", o => o.WorkerTimeout, TimeSpan.FromMinutes(7) },
         { "Freeze:CheckFailedMinutes", o => o.Freeze.CheckFailedWindow, TimeSpan.FromMinutes(7) },
+        { "CodeGraph:OverlayTimeoutMinutes", o => o.CodeGraphOverlayTimeout, TimeSpan.FromMinutes(7) },
     };
 
     [Theory]
@@ -462,6 +463,7 @@ public class FactoryOptionsTests
         var options = Options(new()
         {
             ["Gate:CiPollSeconds"] = "7", ["Gate:CiTimeoutMinutes"] = "8", ["Gate:TestTimeoutMinutes"] = "9", ["Review:TimeoutMinutes"] = "11",
+            ["CodeGraph:OverlayTimeoutMinutes"] = "12",
         });
         var workspaces = new Git.GitWorkspace(Path.GetTempPath(), r => $"https://example.invalid/{r.FullName}", (_, _) => Task.FromResult<string?>(null));
 
@@ -471,6 +473,9 @@ public class FactoryOptionsTests
 
         Assert.Equal((TimeSpan.FromSeconds(7), TimeSpan.FromMinutes(8)), (gate.CiPollInterval, gate.CiTimeout));
         Assert.Equal(TimeSpan.FromMinutes(9), Assert.IsType<SandboxTestRunner>(gate.Tests).Timeout);
+        Assert.Equal((TimeSpan.FromMinutes(12), ReviewOverlays.DefaultPollInterval), (gate.Overlays!.Timeout, gate.Overlays.PollInterval));
+        Assert.Equal(ReviewOverlays.DefaultTimeout, FactoryRunner.CreateGate(Options([]), new GatePipelineTests.FakeGateGitHub(),
+            new GatePipelineTests.FakeReviewer(), workspaces, sandbox: null).Overlays!.Timeout);
         Assert.Equal(TimeSpan.FromMinutes(11), reviewer.Timeout);
     }
 
