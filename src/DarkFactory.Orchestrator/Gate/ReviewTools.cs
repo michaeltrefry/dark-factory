@@ -45,10 +45,14 @@ public interface IReviewFiles
 public sealed class BinaryFileException(string path) : Exception($"{path} is a binary file.");
 
 /// <summary>
-/// CodeGraph's answer to one tool call: its text, whether CodeGraph said it is an error, and the commit of the default branch
-/// its index describes (E3), null when CodeGraph did not say.
+/// CodeGraph's answer to one tool call: its text, whether CodeGraph said it is an error, and the commit its index describes (E3),
+/// null when CodeGraph did not say; <see cref="NotIndexed"/> when a commit-pinned call (<c>sha</c>) could not be answered for that
+/// commit (it then carries no data).
 /// </summary>
-public sealed record CodeGraphAnswer(string Text, bool IsError, string? Commit);
+public sealed record CodeGraphAnswer(string Text, bool IsError, string? Commit, CodeGraphNotIndexed? NotIndexed = null);
+
+/// <summary>CodeGraph's typed not-indexed answer (C4: <c>structuredContent.notIndexed</c>): why a commit-pinned read has no answer.</summary>
+public sealed record CodeGraphNotIndexed(string Code, string Status, string Message, long? OverlayId, string? BaseSha);
 
 /// <summary>The hosted CodeGraph, owner-side (its token never reaches a worker or a prompt, E5).</summary>
 public interface ICodeGraph
@@ -90,6 +94,12 @@ public sealed class ReviewToolSession(RepoRef repo, string headSha, string baseS
 
     /// <summary>The Kanban tools this session was offered (<see cref="ReviewTools.DefinitionsAsync"/>); empty without Kanban.</summary>
     public IReadOnlyList<string> KanbanTools { get; internal set; } = [];
+
+    /// <summary>
+    /// The commit every CodeGraph call is pinned to (<c>sha</c>), or null: the head when CodeGraph's overlay of it was ready at the
+    /// start of the review (sc-25708, <see cref="ReviewOverlays"/>); otherwise calls read the default-branch index.
+    /// </summary>
+    public string? CodeGraphSha { get; init; }
 }
 
 /// <summary>What one tool call gave the model (<see cref="Content"/>, before fencing) and how the verdict records it.</summary>
@@ -107,8 +117,11 @@ public sealed record ToolOutcome(string Content, bool IsError, ToolCall Record);
 /// and shows at most <see cref="MaxGrepMatches"/> lines (<see cref="MaxGrepPerFile"/> per file, each cut at
 /// <see cref="MaxGrepLineChars"/>).</item>
 /// <item>CodeGraph tools (<see cref="CodeGraphTools"/>, <see cref="ICodeGraph"/>): graph reads only, never one that runs a model.
-/// CodeGraph's index is of the default branch, so every answer is labelled with the commit it describes, or
-/// <see cref="UnknownCommit"/>, and "not the PR head" (E3). Every call is asked about the PR's own repository: the project argument
+/// Every answer is labelled with the commit it describes, or <see cref="UnknownCommit"/> (E3). When CodeGraph's overlay of the PR
+/// head was ready at the start of the review (sc-25708, <see cref="ReviewToolSession.CodeGraphSha"/>) every call passes the head as
+/// <c>sha</c>, and only an answer naming exactly the head is labelled "at the PR head"; a typed not-indexed answer for the head makes
+/// the call fall back to the default-branch index (recorded, <see cref="ToolCall.Fallback"/>). Otherwise calls read the default
+/// branch's index, labelled "as of &lt;commit&gt;, not the PR head". Every call is asked about the PR's own repository: the project argument
 /// is the CodeGraph project whose GitHub URL is the repository's (<see cref="ICodeGraph.FindProjectAsync"/>, resolved once per
 /// session), never one the model names (no tool offers a project argument, and one sent anyway is ignored). The answers are not
 /// filtered: <c>analyze_impact</c>, <c>trace_call_path</c>, <c>find_consumers</c> and <c>find_publishers</c> follow edges into
@@ -283,9 +296,15 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
     /// <summary>The error a read_file answers for a binary file.</summary>
     public const string BinaryNotShown = "binary file, not shown";
 
-    /// <summary>A new session's tool state.</summary>
-    public static ReviewToolSession Session(RepoRef repo, string headSha, string baseSha, int promptChars) =>
-        new(repo, headSha, baseSha, Budget(promptChars));
+    /// <summary>
+    /// A new session's tool state; with <paramref name="overlay"/> ready (CodeGraph indexed exactly <paramref name="headSha"/>), every
+    /// CodeGraph call passes the head as <c>sha</c>.
+    /// </summary>
+    public static ReviewToolSession Session(RepoRef repo, string headSha, string baseSha, int promptChars, CodeGraphOverlay? overlay = null) =>
+        new(repo, headSha, baseSha, Budget(promptChars))
+        {
+            CodeGraphSha = overlay is { IsReady: true } o && string.Equals(o.HeadSha, headSha, StringComparison.OrdinalIgnoreCase) ? headSha : null,
+        };
 
     /// <summary>At most this many characters of a call's arguments are recorded in the verdict.</summary>
     public const int MaxRecordedArguments = 1_000;
@@ -306,9 +325,9 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
     private static object Str(string description) => new { type = "string", description };
     private static object Int(string description) => new { type = "integer", description };
 
-    private const string CodeGraphNote = "CodeGraph indexes the repository's default branch, not this pull request: each answer names the "
-        + "commit it describes. Queries are asked about this repository; answers may name nodes of other indexed projects that "
-        + "depend on or call it.";
+    private const string CodeGraphNote = "Each answer names the commit it describes: the pull request's head when CodeGraph has indexed it "
+        + "for this review, otherwise the repository's default branch (not this pull request). Queries are asked about this repository; "
+        + "answers may name nodes of other indexed projects that depend on or call it.";
 
     /// <summary>The tools as the Messages API request lists them, one per <see cref="Names"/> entry, in that order.</summary>
     public static readonly object[] Definitions =
@@ -414,7 +433,7 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
         new
         {
             name = GetCodeSnippet,
-            description = $"Read lines of a file from CodeGraph's copy of the default branch (use read_file for the pull request's own code). {CodeGraphNote}",
+            description = $"Read lines of a file from CodeGraph's copy of the commit it has indexed (use read_file for the pull request's own code). {CodeGraphNote}",
             input_schema = new
             {
                 type = "object",
@@ -431,7 +450,7 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
         {
             name = ReadNodeSource,
             description = $"Read the source of a CodeGraph node by its id (only nodes of this repository are shown). {CodeGraphNote}",
-            input_schema = new { type = "object", properties = new { nodeId = Int("The node's id in CodeGraph.") }, required = new[] { "nodeId" } },
+            input_schema = new { type = "object", properties = new { nodeId = Int("The node's id in CodeGraph (negative for a node of the PR head's index).") }, required = new[] { "nodeId" } },
         },
     ];
 
@@ -650,6 +669,7 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
         var session = call.Session;
         CodeGraphAnswer answer;
         string project;
+        string? fallback = null;
         try
         {
             if (!session.ProjectResolved)
@@ -666,7 +686,25 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
             {
                 arguments["project"] = project;
             }
-            answer = await codeGraph.CallAsync(call.Tool, arguments, ct);
+            if (session.CodeGraphSha is { } pinned)
+            {
+                // The head's overlay was ready (sc-25708): ask about the head itself.
+                var atHead = (JsonObject)arguments.DeepClone();
+                atHead["sha"] = pinned;
+                answer = await codeGraph.CallAsync(call.Tool, atHead, ct);
+                if (answer.NotIndexed is { } missing)
+                {
+                    // CodeGraph cannot answer for the head now (the overlay expired, the default branch moved, ...): the default-branch
+                    // index answers instead, labelled as not the PR head, and the call records why.
+                    fallback = $"the PR head is not indexed for this call ({Cut(missing.Code, 100)}, status {Cut(missing.Status, 100)}): "
+                        + Cut(missing.Message, 300);
+                    answer = await codeGraph.CallAsync(call.Tool, arguments, ct);
+                }
+            }
+            else
+            {
+                answer = await codeGraph.CallAsync(call.Tool, arguments, ct);
+            }
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
         {
@@ -678,10 +716,25 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
             return call.Fail($"Node {arguments["nodeId"]} is not a node of {project} with readable source; not shown.");
         }
         var commit = answer.Commit ?? UnknownCommit;
-        var label = answer.Commit is { } sha
-            ? $"CodeGraph's index of {project}'s default branch as of {sha}, not the PR head {session.HeadSha}"
-            : $"CodeGraph's index of {project}'s default branch, commit unknown, not the PR head {session.HeadSha}";
-        return call.Answer($"{label}{(answer.IsError ? " (CodeGraph answered with an error)" : "")}:", answer.Text, answer.Text, answer.IsError, commit);
+        // E3: only an answer for exactly the head, from a call pinned to it, is presented as the head's.
+        // A call pinned to the head that CodeGraph answered with an error naming no commit (not a not-indexed answer, no fallback):
+        // its error is about the head, never the default branch.
+        var pinnedError = answer.IsError && answer.Commit is null && answer.NotIndexed is null && fallback is null && session.CodeGraphSha is not null;
+        var label = pinnedError
+            ? $"CodeGraph's answer for the PR head {session.CodeGraphSha} (error)"
+            : answer.NotIndexed is null && fallback is null && session.CodeGraphSha is { } head
+            && string.Equals(answer.Commit, head, StringComparison.OrdinalIgnoreCase)
+            ? $"CodeGraph's index of {project} at the PR head {session.HeadSha}"
+            : answer.Commit is { } sha
+                ? $"CodeGraph's index of {project}'s default branch as of {sha}, not the PR head {session.HeadSha}"
+                : $"CodeGraph's index of {project}'s default branch, commit unknown, not the PR head {session.HeadSha}";
+        if (fallback is not null)
+        {
+            label += $" ({fallback})";
+        }
+        var outcome = call.Answer($"{label}{(answer.IsError && !pinnedError ? " (CodeGraph answered with an error)" : "")}:", answer.Text, answer.Text,
+            answer.IsError, commit);
+        return fallback is null ? outcome : outcome with { Record = outcome.Record with { Fallback = fallback } };
     }
 
     /// <summary>
@@ -761,7 +814,7 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
                 return With(With(new JsonObject { ["filePath"] = file }, "startLine", Number("startLine", 0, int.MaxValue)),
                     "endLine", Number("endLine", 0, int.MaxValue));
             case ReadNodeSource:
-                return input.TryGetProperty("nodeId", out var id) && id.ValueKind == JsonValueKind.Number && id.TryGetInt64(out var nodeId) && nodeId >= 0
+                return input.TryGetProperty("nodeId", out var id) && id.ValueKind == JsonValueKind.Number && id.TryGetInt64(out var nodeId)
                     ? new JsonObject { ["nodeId"] = nodeId }
                     : null;
             default:

@@ -251,6 +251,8 @@ public class GatePipelineTests
         public FakeReviewer Reviewer { get; init; } = new();
         /// <summary>When set, the panel's calls go here instead of <see cref="Reviewer"/> (e.g. a real <see cref="RouterReviewer"/>).</summary>
         public IReviewer? Panel { get; init; }
+        /// <summary>When set, each review first waits for CodeGraph's overlay of the head through this (sc-25708).</summary>
+        public ReviewOverlays? Overlays { get; init; }
         /// <summary>When set, the gate's waits run on <see cref="Time"/> (which only moves when the test advances it).</summary>
         public bool GateOnFakeClock { get; init; }
         /// <summary>How often a run's controls are polled while a worker or the gate's test runs execute (the pipeline's default when null).</summary>
@@ -273,7 +275,7 @@ public class GatePipelineTests
                     controls: RunControls ?? Controls,
                     controlPollInterval: ControlPoll,
                     gate: new GateStage(GitHub, Panel ?? Reviewer, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5), GateOnFakeClock ? Time : null,
-                        TestRunner),
+                        TestRunner, Overlays),
                     freeze: Freeze is null ? null : new FactoryFreeze(Contexts, Controls, Freeze, TimeProvider.System, GitHub),
                     maxControlReadFailures: MaxControlReadFailures)
                 .RunAsync(77, ct);

@@ -23,8 +23,15 @@ namespace DarkFactory.Orchestrator.CodeGraph;
 /// repository's (<c>https://github.com/&lt;owner&gt;/&lt;name&gt;</c>, with or without the git suffix, case-insensitive), read from
 /// <c>search_projects</c>' entries (a <c>- **Name** …</c> line, then a <c>Repo: &lt;url&gt;</c> line).
 /// </para>
+/// <para>
+/// Overlays (sc-25708, <see cref="ICodeGraphOverlays"/>; CodeGraph sc-25726): <see cref="RequestOverlayTool"/> and
+/// <see cref="OverlayStatusTool"/> are sent by the orchestrator only (<see cref="ReviewOverlays"/>), straight through the MCP client
+/// like <c>search_projects</c>: they are on no allowlist, so neither <see cref="CallAsync"/>, the upstream registry nor the loopback
+/// proxy sends them. A commit-pinned read (<c>sha</c>, CodeGraph C4) that CodeGraph cannot answer for that commit carries
+/// <c>structuredContent.notIndexed</c> (<see cref="NotIndexedOf"/>).
+/// </para>
 /// </summary>
-public sealed partial class CodeGraphMcpClient : ICodeGraph
+public sealed partial class CodeGraphMcpClient : ICodeGraph, ICodeGraphOverlays
 {
     public const string ProtocolVersion = McpHttpClient.ProtocolVersion;
     public const string SessionHeader = McpHttpClient.SessionHeader;
@@ -64,8 +71,53 @@ public sealed partial class CodeGraphMcpClient : ICodeGraph
             throw new ArgumentException($"'{tool}' is not one of the reviewers' CodeGraph tools; it is never sent.", nameof(tool));
         }
         var answer = await Upstream.CallAsync(tool, arguments, ct);
-        return new CodeGraphAnswer(answer.Text, answer.IsError, Commit(answer.Structured, answer.Text));
+        return new CodeGraphAnswer(answer.Text, answer.IsError, Commit(answer.Structured, answer.Text), NotIndexedOf(answer.Structured));
     }
+
+    /// <summary>CodeGraph's tool that creates (or returns the live) overlay of a repository at a ref: orchestrator only.</summary>
+    public const string RequestOverlayTool = "request_overlay";
+
+    /// <summary>CodeGraph's tool that reads an overlay's status: orchestrator only.</summary>
+    public const string OverlayStatusTool = "get_overlay_status";
+
+    /// <summary>The overlay tools, which no model-facing surface may list or forward.</summary>
+    public static readonly IReadOnlyList<string> OverlayTools = [RequestOverlayTool, OverlayStatusTool];
+
+    /// <summary><c>request_overlay(repo, ref)</c>: <paramref name="project"/> is the CodeGraph repository name (<see cref="FindProjectAsync"/>).</summary>
+    public async Task<OverlayAnswer> RequestOverlayAsync(string project, string gitRef, CancellationToken ct) =>
+        Overlay(await _client.CallToolAsync(RequestOverlayTool, new JsonObject { ["repo"] = project, ["ref"] = gitRef }, ct));
+
+    /// <summary><c>get_overlay_status(overlayId)</c>.</summary>
+    public async Task<OverlayAnswer> OverlayStatusAsync(long overlayId, CancellationToken ct) =>
+        Overlay(await _client.CallToolAsync(OverlayStatusTool, new JsonObject { ["overlayId"] = overlayId }, ct));
+
+    /// <summary>
+    /// An overlay tool's answer (CodeGraph C6, michaeltrefry/CodeGraph PR #75, <c>OverlayMcpServer</c>): from an overlay's
+    /// <c>structuredContent</c> its <c>overlayId</c>, <c>status</c>, <c>headSha</c>, <c>baseSha</c>, <c>stale</c> and
+    /// <c>overlayError</c> (a failed overlay's error); from an error answer's (<c>isError</c>, <c>{"error": {code, message}}</c>) the
+    /// code.
+    /// </summary>
+    public static OverlayAnswer Overlay(McpToolResult result)
+    {
+        var s = result.Structured as JsonObject;
+        long? id = s?["overlayId"] is JsonValue v && v.TryGetValue<long>(out var n) ? n : null;
+        var stale = s?["stale"] is JsonValue st && st.TryGetValue<bool>(out var flag) && flag;
+        var code = s?["error"] is JsonObject e ? Str(e, "code") : null;
+        return new OverlayAnswer(result.IsError, result.Text, id, Str(s, "status"), Str(s, "headSha"), Str(s, "baseSha"),
+            Str(s, "overlayError"), stale, code);
+    }
+
+    /// <summary>
+    /// The typed not-indexed answer of a commit-pinned read (CodeGraph C4: <c>structuredContent.notIndexed</c> = {code, repo, sha, status,
+    /// message, overlayId, baseSha}), or null when the answer is not one.
+    /// </summary>
+    public static CodeGraphNotIndexed? NotIndexedOf(JsonNode? structured) =>
+        structured is JsonObject obj && obj["notIndexed"] is JsonObject n
+            ? new CodeGraphNotIndexed(Str(n, "code") ?? "unknown", Str(n, "status") ?? "unknown", Str(n, "message") ?? "",
+                n["overlayId"] is JsonValue v && v.TryGetValue<long>(out var id) ? id : null, Str(n, "baseSha"))
+            : null;
+
+    private static string? Str(JsonObject? o, string name) => o?[name] is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
 
     /// <summary>
     /// The CodeGraph project indexing <paramref name="repo"/>, from <c>search_projects</c>: only the orchestrator calls it (it is on no

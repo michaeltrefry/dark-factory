@@ -99,14 +99,16 @@ public sealed record Confirmation(
 /// One tool call a panel session made (sc-25705, <see cref="ReviewTools"/>), as the verdict records it: the tool, its arguments as
 /// the model sent them (cut at <see cref="ReviewTools.MaxRecordedArguments"/> characters), the SHA-256 of the result the model was
 /// given (before fencing), whether that result was an error, and for a CodeGraph answer the commit it describes
-/// (<see cref="ReviewTools.UnknownCommit"/> when CodeGraph did not say).
+/// (<see cref="ReviewTools.UnknownCommit"/> when CodeGraph did not say). <see cref="Fallback"/>: the call was pinned to the PR head
+/// (its overlay was ready, sc-25708) but CodeGraph could not answer for the head, so the default-branch index answered; why.
 /// </summary>
 public sealed record ToolCall(
     [property: JsonPropertyName("tool")] string Tool,
     [property: JsonPropertyName("arguments")] string Arguments,
     [property: JsonPropertyName("sha256")] string ResultSha256,
     [property: JsonPropertyName("error")] bool Error = false,
-    [property: JsonPropertyName("commit"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Commit = null);
+    [property: JsonPropertyName("commit"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Commit = null,
+    [property: JsonPropertyName("fallback"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Fallback = null);
 
 /// <summary>One finding of a panel role. <see cref="Downgraded"/>: it was blocking, and the second opinion did not confirm it.</summary>
 public sealed record Finding(

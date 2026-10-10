@@ -17,14 +17,19 @@ public sealed record RepoFiles(IReadOnlyList<string> Paths, bool Truncated);
 /// One panel role's review of the diff of exactly one head commit against its base, with the story and the base's file list
 /// (so a reviewer can tell a new file from a duplicate of an existing one), on the high model class. <see cref="Session"/> is
 /// the call's own fresh router session (never a worker's), the one it is accounted under; the pipeline names it in the ledger (<c>review-session</c>, with the prompt's hash) before the
-/// call, so a call that never returns still has a readable cost (E9).
+/// call, so a call that never returns still has a readable cost (E9). <see cref="Overlay"/>: what became of CodeGraph's overlay of the
+/// head, requested at the start of the review (sc-25708; null: none was requested); ready, the session's CodeGraph calls pass the
+/// head as <c>sha</c>.
 /// </summary>
 public sealed record ReviewRequest(WorkStory Story, string Repo, PullFacts Pull, string Diff, RepoFiles Files, string Role, ReviewPrompt Prompt,
-    string Session);
+    string Session, CodeGraphOverlay? Overlay = null);
 
-/// <summary>A second opinion's check of one blocking <see cref="Finding"/> a <see cref="Role"/> reviewer reported.</summary>
+/// <summary>
+/// A second opinion's check of one blocking <see cref="Finding"/> a <see cref="Role"/> reviewer reported, with the same CodeGraph
+/// overlay state as the review (<see cref="ReviewRequest.Overlay"/>).
+/// </summary>
 public sealed record ConfirmRequest(WorkStory Story, string Repo, PullFacts Pull, string Diff, RepoFiles Files, string Role, Finding Finding,
-    ReviewPrompt Prompt, string Session);
+    ReviewPrompt Prompt, string Session, CodeGraphOverlay? Overlay = null);
 
 /// <summary>
 /// The router refused a review call for usage (429/529, its exhaustion or rate-limit body, or 503
@@ -120,7 +125,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
             return new RoleReview(request.Role, null, null, request.Session, request.Prompt.Id, [], "",
                 $"The diff is {request.Diff.Length} characters, more than the {MaxDiffChars} one review reads; not reviewed.");
         }
-        var session = await ConverseAsync(request.Session, request.Prompt.Text, BuildPrompt(request), request.Repo, request.Pull, false, ct);
+        var session = await ConverseAsync(request.Session, request.Prompt.Text, BuildPrompt(request), request.Repo, request.Pull, request.Overlay, false, ct);
         var review = session.Problem is { } problem
             ? new RoleReview(request.Role, session.Served, session.ServedClass, null, null, [], "", problem)
             : InterpretReview(request.Role, session.Served, session.ServedClass, session.Stop, session.Text);
@@ -138,7 +143,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
             return new Confirmation(Confirmation.Unusable, null, null, request.Session, request.Prompt.Id,
                 $"The diff is {request.Diff.Length} characters, more than the {MaxDiffChars} one call reads.");
         }
-        var session = await ConverseAsync(request.Session, request.Prompt.Text, BuildConfirmPrompt(request), request.Repo, request.Pull, true, ct);
+        var session = await ConverseAsync(request.Session, request.Prompt.Text, BuildConfirmPrompt(request), request.Repo, request.Pull, request.Overlay, true, ct);
         var confirmation = session.Problem is { } problem
             ? new Confirmation(Confirmation.Unusable, session.Served, session.ServedClass, null, null, problem)
             : InterpretConfirmation(session.Served, session.ServedClass, session.Stop, session.Text);
@@ -176,8 +181,8 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     /// turn gets those calls answered as not run, and one more turn with no tool callable (<c>tool_choice: none</c>) for its final
     /// answer (sc-25706); asking for tools again there is unusable. The client's timeout bounds the whole session.
     /// </summary>
-    private async Task<SessionEnd> ConverseAsync(string session, string system, string user, string repo, PullFacts pull, bool confirm,
-        CancellationToken ct)
+    private async Task<SessionEnd> ConverseAsync(string session, string system, string user, string repo, PullFacts pull, CodeGraphOverlay? overlay,
+        bool confirm, CancellationToken ct)
     {
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         if (http.Timeout != Timeout.InfiniteTimeSpan)
@@ -185,7 +190,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
             deadline.CancelAfter(http.Timeout);
         }
         var calls = new List<ToolCall>();
-        var toolSession = ReviewTools.Session(RepoRef.Parse(repo), pull.HeadSha, pull.BaseSha, system.Length + user.Length);
+        var toolSession = ReviewTools.Session(RepoRef.Parse(repo), pull.HeadSha, pull.BaseSha, system.Length + user.Length, overlay);
         var definitions = await _tools.DefinitionsAsync(toolSession, deadline.Token);
         if (toolSession.KanbanTools.Count > 0)
         {
@@ -452,11 +457,11 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     private static string Cut(string s, int max) => s.Length > max ? s[..max] : s;
 
     public static string BuildPrompt(ReviewRequest request) =>
-        Context(request.Story, request.Repo, request.Pull, request.Files, request.Diff);
+        Context(request.Story, request.Repo, request.Pull, request.Files, request.Diff, request.Overlay);
 
     public static string BuildConfirmPrompt(ConfirmRequest request) =>
         $"""
-        {Context(request.Story, request.Repo, request.Pull, request.Files, request.Diff)}
+        {Context(request.Story, request.Repo, request.Pull, request.Files, request.Diff, request.Overlay)}
 
         The {request.Role} reviewer's blocking finding:
         {FindingBlock(request.Finding)}
@@ -471,7 +476,18 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
             (role is null ? "" : $"Role: {role}\n")
             + $"Title: {finding.Title}\nWhere: {finding.File ?? "(no file named)"}{(finding.Line is { } line ? $":{line}" : "")}\nDetail: {finding.Detail}");
 
-    private static string Context(WorkStory story, string repo, PullFacts pull, RepoFiles files, string diff)
+    /// <summary>
+    /// What the prompt says CodeGraph's answers describe: the PR head when its overlay was ready (sc-25708), else the default branch
+    /// (with why the head is not indexed, when an overlay was asked for).
+    /// </summary>
+    public static string CodeGraphScope(PullFacts pull, CodeGraphOverlay? overlay) =>
+        overlay is { IsReady: true } && string.Equals(overlay.HeadSha, pull.HeadSha, StringComparison.OrdinalIgnoreCase)
+            ? $"CodeGraph has indexed this pull request's head ({pull.HeadSha}) for this review: an answer labelled \"at the PR head\" "
+              + "describes the head; one labelled with another commit describes the default branch, not this pull request."
+            : "CodeGraph indexes the default branch: its answers describe the commit they name, not this pull request"
+              + (overlay is null ? "." : $" (CodeGraph's index of the head is {overlay.Outcome}).");
+
+    private static string Context(WorkStory story, string repo, PullFacts pull, RepoFiles files, string diff, CodeGraphOverlay? overlay)
     {
         var shown = files.Paths.Take(MaxFilePaths).ToList();
         var cut = files.Truncated || files.Paths.Count > shown.Count;
@@ -485,8 +501,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
             - {ReviewTools.ReadFile}, {ReviewTools.ListFiles} and {ReviewTools.Grep} read the repository at the head commit, or at the
               base commit with "ref": "base". Read the code before you claim anything about code the diff does not show.
             - {string.Join(", ", ReviewTools.CodeGraphTools)} ask CodeGraph about this repository's code graph (what depends on an
-              element, callers and callees, consumers and publishers, search, source). CodeGraph indexes the default branch: its
-              answers describe the commit they name, not this pull request.
+              element, callers and callees, consumers and publishers, search, source). {CodeGraphScope(pull, overlay)}
             - At most {MaxTurns} turns with tools and {MaxToolCalls} tool calls; then you are asked for your final answer.
 
             Story:

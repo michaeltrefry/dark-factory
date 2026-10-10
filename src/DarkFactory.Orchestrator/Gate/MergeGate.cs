@@ -94,13 +94,16 @@ public static class Ci
 /// The review panel's verdict on one head commit (E3: bound to <see cref="HeadSha"/>; a new push voids it). Stored as JSON
 /// in the ledger's <c>verdict</c> checkpoint. <see cref="RiskyPaths"/>: the touched paths that called the security review in
 /// (<see cref="GatePolicy.SecurityReviewReasons"/>: by their tier, named with it, or by the code floor, named with why); <see cref="Reviews"/>: each role's review with its findings after confirmation (<see cref="ReviewPanel.Decide"/>).
+/// <see cref="Overlay"/>: what became of CodeGraph's overlay of the head that this review's sessions asked (sc-25708; null when no
+/// role was reviewed here, e.g. every review carried, or the verdict predates it). A report only: it never decides the verdict.
 /// </summary>
 public sealed record ReviewVerdict(
     [property: JsonPropertyName("sha")] string HeadSha,
     [property: JsonPropertyName("verdict")] string Verdict,
     [property: JsonPropertyName("summary")] string Summary,
     [property: JsonPropertyName("risky")] IReadOnlyList<string> RiskyPaths,
-    [property: JsonPropertyName("reviews")] IReadOnlyList<RoleReview> Reviews)
+    [property: JsonPropertyName("reviews")] IReadOnlyList<RoleReview> Reviews,
+    [property: JsonPropertyName("codegraph"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] CodeGraphOverlay? Overlay = null)
 {
     public const string Pass = "pass";
     public const string Fail = "fail";

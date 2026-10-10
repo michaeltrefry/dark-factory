@@ -371,6 +371,13 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     public TimeSpan TestTimeout => Positive("Gate:TestTimeoutMinutes", Gate.SandboxTestRunner.DefaultTimeout.TotalMinutes, TimeSpan.FromMinutes);
 
     /// <summary>
+    /// <c>CodeGraph:OverlayTimeoutMinutes</c> (&gt; 0, default 10): the longest a review waits, before its first panel call, for
+    /// CodeGraph's overlay of the PR head (sc-25708); not ready by then, reviewers' CodeGraph calls read the default-branch index.
+    /// </summary>
+    public TimeSpan CodeGraphOverlayTimeout =>
+        Positive("CodeGraph:OverlayTimeoutMinutes", Gate.ReviewOverlays.DefaultTimeout.TotalMinutes, TimeSpan.FromMinutes);
+
+    /// <summary>
     /// Reads every non-secret setting that has a rule, so a value out of range fails at start-up with its key named
     /// (<see cref="InvalidOperationException"/>; a retired review-model setting is refused apart, <see cref="RejectReviewModelSettings"/>), not
     /// mid-run. <c>factory run</c> and <c>factory work</c> call it before anything else and exit 2 on a failure.
@@ -380,6 +387,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         _ = (RouterBaseUrl, DefaultRepo, WorkerSandbox, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures);
         _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
         _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl, KanbanMcpUrl);
+        _ = CodeGraphOverlayTimeout;
     }
 
     public bool TryGet(Func<FactoryOptions, string> secret, out string? value)
