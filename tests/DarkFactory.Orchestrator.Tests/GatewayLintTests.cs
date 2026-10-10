@@ -336,10 +336,12 @@ public sealed class GatewayLintTests
                     problems.Add($"{path} has a #pragma warning disable naming a DF rule");
                 }
             }
-            // Only the arguments' own tokens: their trivia (comments, a generated #line directive's file path) names nothing.
+            // The arguments' own tokens plus any text an inactive #if branch holds (always a token's leading trivia: trailing
+            // trivia ends at the line's end, before any directive): comments and directives (a generated #line path) name nothing.
             foreach (var attribute in root.DescendantNodes().OfType<AttributeSyntax>()
-                .Where(a => a.ArgumentList is { } args
-                    && Regex.IsMatch(string.Concat(args.DescendantTokens().Select(t => t.Text)), @"Gateway|DF\d", RegexOptions.IgnoreCase)))
+                .Where(a => a.ArgumentList is { } args && Regex.IsMatch(string.Concat(args.DescendantTokens().SelectMany(t =>
+                        Disabled(t.LeadingTrivia).Append(t.Text))),
+                    @"Gateway|DF\d", RegexOptions.IgnoreCase)))
             {
                 problems.Add($"{path} has an attribute naming the gateway lint: {attribute}");
             }
@@ -351,12 +353,16 @@ public sealed class GatewayLintTests
         return problems;
     }
 
+    private static IEnumerable<string> Disabled(SyntaxTriviaList trivia) =>
+        trivia.Where(r => r.IsKind(SyntaxKind.DisabledTextTrivia)).Select(r => r.ToString());
+
     [Theory]
     [InlineData("src/X/Seeded.cs", "#pragma warning disable\nclass C { }\n#pragma warning restore\n", "bare #pragma warning disable")]
     [InlineData("src/X/Seeded.cs", "#pragma   warning disable // everything\nclass C { }\n", "bare #pragma warning disable")]
     [InlineData("src/X/Seeded.cs", "#pragma warning disable CS0168, DF0001\nclass C { }\n", "#pragma warning disable naming a DF rule")]
     [InlineData("src/X/Seeded.cs", "[System.Diagnostics.CodeAnalysis.SuppressMessage(\n    \"Gateway\",\n    \"Anything\")]\nclass C { }\n", "attribute naming the gateway lint")]
     [InlineData("src/X/Seeded.cs", "using S = System.Diagnostics.CodeAnalysis.SuppressMessageAttribute;\n[assembly: S(\"Other\", \"DF0001:Outbound\")]\n", "attribute naming the gateway lint")]
+    [InlineData("src/X/Seeded.cs", "[System.Diagnostics.CodeAnalysis.SuppressMessage(\n#if RELEASE\n\"Gateway\", \"DF0001\"\n#else\n\"x\", \"y\"\n#endif\n)]\nclass C { }\n", "attribute naming the gateway lint")]
     [InlineData("src/X/Suppressor.cs", "class S : Microsoft.CodeAnalysis.Diagnostics.DiagnosticSuppressor { }\n", "DiagnosticSuppressor")]
     [InlineData(".editorconfig", "[*.cs]\ndotnet_diagnostic.DF0001.severity = none\n", "names a gateway rule")]
     [InlineData("src/X/X.csproj", "<Project><PropertyGroup><NoWarn>$(NoWarn);DF0002</NoWarn></PropertyGroup></Project>", "names a gateway rule")]

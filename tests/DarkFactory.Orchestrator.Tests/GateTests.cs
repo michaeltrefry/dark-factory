@@ -642,7 +642,7 @@ public class RouterReviewerTests
         static byte[] Crlf(string s) => System.Text.Encoding.UTF8.GetBytes(s.Replace("\n", "\r\n"));
         var chunks = new List<byte[]>
         {
-            // A thinking block, a chunk every 500 ms (~3.5 s in all): longer than the 3 s idle gap, never silent for it. The idle
+            // A thinking block, a chunk every 500 ms (9 chunks, ~4.5 s in all): longer than the 3 s idle gap, never silent for it. The idle
             // gap is 6x a chunk's, so a loaded machine's late timer cannot turn a chunk's gap into a stall.
             Crlf(SseAnswers.Event("content_block_start", new { type = "content_block_start", index = 0, content_block = new { type = "thinking", thinking = "" } })),
         };
