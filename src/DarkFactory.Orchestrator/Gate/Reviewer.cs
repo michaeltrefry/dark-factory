@@ -133,7 +133,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
         {
             review = review with { Error = $"{AfterCap}: {error}" };
         }
-        return review with { Session = request.Session, Prompt = request.Prompt.Id, Tools = session.Tools };
+        return review with { Session = request.Session, Prompt = request.Prompt.Id, Tools = session.Tools, Turns = session.Turns };
     }
 
     public async Task<Confirmation> ConfirmAsync(ConfirmRequest request, CancellationToken ct)
@@ -151,7 +151,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
         {
             confirmation = confirmation with { Reason = $"{AfterCap}: {confirmation.Reason}" };
         }
-        return confirmation with { Session = request.Session, Prompt = request.Prompt.Id, Tools = session.Tools };
+        return confirmation with { Session = request.Session, Prompt = request.Prompt.Id, Tools = session.Tools, Turns = session.Turns };
     }
 
     private const string AfterCap = "No usable final answer after the turn cap";
@@ -168,7 +168,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     /// tool calls it made (null: none); <see cref="AfterCap"/> when the last turn was the final-answer turn past the turn cap.
     /// </summary>
     private sealed record SessionEnd(string? Served, string? ServedClass, string? Stop, string Text, string? Problem, IReadOnlyList<ToolCall>? Tools,
-        bool AfterCap = false);
+        bool AfterCap = false, IReadOnlyList<ServedTurn>? Turns = null);
 
     /// <summary>The text the final-answer turn adds after the turn cap (sc-25706): no tool runs, the answer is due now.</summary>
     public static string FinalAnswerRequest(bool confirm) =>
@@ -199,6 +199,9 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
         }
         var messages = new List<object> { new { role = "user", content = user } };
         IReadOnlyList<ToolCall>? Calls() => calls.Count > 0 ? calls : null;
+        // E1: every turn's served model and class, the final-answer turn included, as the router named them.
+        var served = new List<ServedTurn>();
+        IReadOnlyList<ServedTurn>? Turns() => served.Count > 0 ? served : null;
         try
         {
             for (var turn = 1; ; turn++)
@@ -215,18 +218,19 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
                     // The conversation the tool results grew is what the router refused (too long, most likely): the review is
                     // unusable, as an answer that cannot count is, rather than a failure of the run.
                     return new SessionEnd(null, null, null, "",
-                        $"The router refused turn {turn} of the session, after {calls.Count} tool calls: {refused.Message}", Calls());
+                        $"The router refused turn {turn} of the session, after {calls.Count} tool calls: {refused.Message}", Calls(), Turns: Turns());
                 }
                 catch (RouterRefusedRequestException refused)
                 {
                     // The first turn's refusal fails the call as any other refusal does, as before the tool loop.
                     throw new InvalidOperationException(refused.Message);
                 }
+                served.Add(new ServedTurn(turn, answer.Served, servedClass));
                 if (ReviewModels.CallProblem(servedClass) is not null || answer.StopReason != "tool_use")
                 {
-                    return new SessionEnd(answer.Served, servedClass, answer.StopReason, answer.Text, null, Calls(), final);
+                    return new SessionEnd(answer.Served, servedClass, answer.StopReason, answer.Text, null, Calls(), final, Turns());
                 }
-                SessionEnd Unusable(string why) => new(answer.Served, servedClass, answer.StopReason, answer.Text, why, Calls(), final);
+                SessionEnd Unusable(string why) => new(answer.Served, servedClass, answer.StopReason, answer.Text, why, Calls(), final, Turns());
                 if (final)
                 {
                     return Unusable($"the reviewer asked for tools again in its final-answer turn, after {MaxTurns} turns with tools.");

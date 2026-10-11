@@ -267,45 +267,17 @@ public class CodeGraphRiskTests
 
     // ---- the reader: CodeGraph's answers (C7 contract) ----
 
-    /// <summary>
-    /// An <c>analyze_impact_file</c> answer as C7 shapes it: <c>CommitAnswer.Create</c> (commitSha, source) carrying the tool's fields.
-    /// </summary>
-    private static JsonObject ImpactAnswer(string sha, string path, bool found, string blastRadius)
-    {
-        var answer = FakeMcpServer.CommitAnswer(sha, $"Impact of {path}: {blastRadius}", overlay: true);
-        var s = answer["structuredContent"]!.AsObject();
-        s["repo"] = Project;
-        s["overlayId"] = 41;
-        s["baseSha"] = IndexCommit;
-        s["path"] = path;
-        s["found"] = found;
-        s["blastRadius"] = blastRadius;
-        foreach (var count in new[] { "criticalCount", "highCount", "mediumCount", "lowCount", "totalAffected", "crossRepoCount", "lowConfidenceCount", "unmappedInboundEdges" })
-        {
-            s[count] = found ? 2 : 0;
-        }
-        return answer;
-    }
+    /// <summary>An <c>analyze_impact_file</c> answer as C7 (michaeltrefry/CodeGraph PR #76) shapes it, field by field (<see cref="C7Answers"/>).</summary>
+    private static JsonObject ImpactAnswer(string sha, string path, bool found, string blastRadius) =>
+        C7Answers.ImpactFile(Project, path, sha, found, blastRadius);
 
-    /// <summary>A <c>file_hotspot</c> answer as C7 shapes it (default branch only): CommitAnswer's fields with the tool's.</summary>
-    private static JsonObject HotspotAnswer(string path, bool found, double? riskScore, string sha = IndexCommit, string source = "default-branch")
-    {
-        var answer = FakeMcpServer.CommitAnswer(sha, $"Hotspot of {path}");
-        var s = answer["structuredContent"]!.AsObject();
-        s["source"] = source;
-        s["path"] = path;
-        s["found"] = found;
-        if (found)
-        {
-            s["riskScore"] = riskScore;
-            s["concernScore"] = 0.4;
-            s["healthScore"] = 0.6;
-            s["churn365d"] = 12;
-            s["complexityScore"] = 7.5;
-            s["computedAt"] = "2026-10-09T12:00:00Z";
-        }
-        return answer;
-    }
+    /// <summary>
+    /// A <c>file_hotspot</c> answer as C7 (PR #76) shapes it (default branch only, <see cref="C7Answers"/>): not found → <c>commitSha</c>
+    /// null, the index commit only in <c>indexCommitSha</c>.
+    /// </summary>
+    private static JsonObject HotspotAnswer(string path, bool found, double? riskScore, string? sha = IndexCommit, string source = "default-branch",
+        string? indexCommitSha = IndexCommit) =>
+        C7Answers.Hotspot(Project, path, found ? riskScore : null, sha, indexCommitSha, source);
 
     private static JsonObject WithPath(JsonObject answer, string path)
     {
@@ -340,7 +312,9 @@ public class CodeGraphRiskTests
 
         Assert.Empty(risk.Unreadable);
         Assert.Equal([new FileBlastRadius("src/a.cs", BlastRadius.High, true), new FileBlastRadius("src/New.cs", BlastRadius.None, false)], risk.BlastRadius);
-        Assert.Equal([new FileHotspot("src/a.cs", 0.42, true, IndexCommit), new FileHotspot("src/New.cs", 0, false, IndexCommit)], risk.Hotspots);
+        // C7 (PR #76) names no metrics commit for a file without metrics (commitSha null): its 0 is recorded at indexCommitSha.
+        Assert.Equal([new FileHotspot("src/a.cs", 0.42, true, IndexCommit, IndexCommit), new FileHotspot("src/New.cs", 0, false, IndexCommit, IndexCommit)],
+            risk.Hotspots);
         // The project pinned by exact repo URL, the head SHA and depth 3 for the blast radius; no SHA for the hotspot (default branch).
         Assert.Equal($$"""{"repo":"{{Project}}","path":"src/a.cs","sha":"{{Head}}","depth":3}""",
             server.Calls.First(c => c.Tool == "analyze_impact_file").Arguments.ToJsonString());
@@ -364,7 +338,7 @@ public class CodeGraphRiskTests
         { "hotspot-error", "src/a.cs: file_hotspot (repo_not_found): Error (repo_not_found): Unknown repository 'Sandbox'." },
         { "hotspot-not-entitled", "src/a.cs: not entitled to file_hotspot" },
         { "hotspot-overlay", "src/a.cs: file_hotspot answered from 'overlay', not the default branch" },
-        { "hotspot-no-commit", "src/a.cs: file_hotspot named no commit" },
+        { "hotspot-no-commit", "src/a.cs: file_hotspot named no commit (neither commitSha nor indexCommitSha)" },
         { "hotspot-no-score", "src/a.cs: file_hotspot answered no riskScore" },
         { "other-path", "src/a.cs: analyze_impact_file answered about 'src/b.cs', not src/a.cs" },
         { "no-path", "src/a.cs: analyze_impact_file answered about no path, not src/a.cs" },
@@ -390,7 +364,7 @@ public class CodeGraphRiskTests
             ("hotspot-other-path", "file_hotspot") => HotspotAnswer("src/a.cs.bak", true, 0.1),
             ("unreachable", "analyze_impact_file") => throw new HttpRequestException("connection refused"),
             ("hotspot-overlay", "file_hotspot") => HotspotAnswer("src/a.cs", true, 0.1, source: "overlay"),
-            ("hotspot-no-commit", "file_hotspot") => FakeMcpServer.Structured("Hotspot", new JsonObject { ["found"] = true, ["riskScore"] = 0.1 }),
+            ("hotspot-no-commit", "file_hotspot") => HotspotAnswer("src/a.cs", true, 0.1, sha: null, indexCommitSha: null),
             ("hotspot-no-score", "file_hotspot") => FakeMcpServer.Structured($"Commit: {IndexCommit}", new JsonObject
                 { ["commitSha"] = IndexCommit, ["source"] = "default-branch", ["found"] = true, ["path"] = "src/a.cs" }),
             (_, "analyze_impact_file") => ImpactAnswer(Head, args["path"]!.GetValue<string>(), true, "low"),
@@ -401,6 +375,46 @@ public class CodeGraphRiskTests
 
         Assert.StartsWith(why, Assert.Single(risk.Unreadable));
         Assert.Equal(GateOutcome.Pending, Evaluate(risk, diff: TestPolicies.Diff("src/a.cs")).Outcome);
+    }
+
+    [Fact]
+    public async Task Metrics_computed_before_codegraph_recorded_their_commit_are_used_at_the_index_commit_labelled_unknown()
+    {
+        // C7 (PR #76): `double? concernScore = metric is null || commitSha is null ? null : metric.ConcernScore;` — a found file whose
+        // metrics predate recorded commits answers commitSha null; the index commit is still named in indexCommitSha.
+        var server = Server((tool, args) => tool == "file_hotspot"
+            ? HotspotAnswer(args["path"]!.GetValue<string>(), true, 0.7, sha: null)
+            : ImpactAnswer(Head, args["path"]!.GetValue<string>(), true, "low"));
+
+        var risk = await Reader(server).ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None);
+
+        Assert.Empty(risk.Unreadable);
+        Assert.Equal([new FileHotspot("src/a.cs", 0.7, true, IndexCommit, IndexCommit, VitalsCommitUnknown: true)], risk.Hotspots);
+        Assert.Contains($"vitals commit unknown; index at {IndexCommit}: src/a.cs 0.7", risk.Describe());
+        // The score counts: a version 3 hotspot limit below it fails the check.
+        var diff = TestPolicies.Diff("src/a.cs");
+        Assert.Equal(GateOutcome.Merge, Evaluate(risk, TestPolicies.V3("high", "1"), diff).Outcome);
+        Assert.NotEqual(GateOutcome.Merge, Evaluate(risk, TestPolicies.V3("high", "0.5"), diff).Outcome);
+    }
+
+    [Fact]
+    public async Task A_hotspot_read_in_a_wait_is_reused_by_its_index_commit_even_when_the_metrics_are_older()
+    {
+        // The metrics were computed at an older default-branch commit than the index's now (commitSha != indexCommitSha): the score is
+        // recorded at its own commit, and the cache is keyed by the index commit — the commit the next read looks it up by (the overlay's base).
+        var server = Server((tool, args) => tool == "file_hotspot"
+            ? HotspotAnswer(args["path"]!.GetValue<string>(), true, 0.3, sha: Other)
+            : ImpactAnswer(Head, args["path"]!.GetValue<string>(), true, "low"));
+        var reader = Reader(server);
+        var cache = new HotspotCache();
+
+        var first = await reader.ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None, cache);
+        var second = await reader.ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None, cache);
+
+        Assert.Equal([new FileHotspot("src/a.cs", 0.3, true, Other, IndexCommit)], first.Hotspots);
+        Assert.Contains($"at {Other}: src/a.cs 0.3", first.Describe());
+        Assert.Equal(first.Hotspots, second.Hotspots);
+        Assert.Single(server.Calls, c => c.Tool == "file_hotspot");
     }
 
     [Fact]
@@ -533,6 +547,26 @@ public class CodeGraphRiskTests
         // The blast radius was read for the head only once its overlay was ready, the overlay recorded.
         Assert.Equal(Sha1, h.CodeGraph.Calls.Single(c => c.Tool == "request_overlay").Argument);
         Assert.Contains(await h.Rows(), r => r.Step == RunPipeline.Steps.CodeGraphOverlay && CodeGraphOverlay.FromDetail(r.Detail)!.IsReady);
+    }
+
+    [Fact]
+    public async Task A_pr_adding_a_new_file_passes_risk_threshold_and_merges()
+    {
+        // A new file: CodeGraph has no nodes and no metrics for it. C7 (PR #76) answers analyze_impact_file found:false, blastRadius
+        // none, commitSha = the head (pinned), and file_hotspot found:false with commitSha null and only indexCommitSha set — counted as
+        // none / 0 (owner decision 2026-10-10), never unreadable.
+        var h = new Harness();
+        h.GitHub.Diff = head => $"diff --git a/src/New.cs b/src/New.cs\nnew file mode 100644\n--- /dev/null\n+++ b/src/New.cs\n@@ -0,0 +1 @@\n+{head}\n";
+        h.CodeGraph.Hotspot = path => CodeGraphMcpClient.Hotspot(C7Answers.Result(C7Answers.Hotspot("Sandbox", path, null, commitSha: null)));
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(WorkState.Watch, outcome.State);
+        var gate = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.GateDecision);
+        Assert.StartsWith("Merge ", gate.Detail);
+        Assert.Contains($"codegraph blast radius at {Sha1}: src/New.cs none (no data)", gate.Detail);
+        Assert.Contains($"at {FakeCodeGraphRisk.IndexCommit}: src/New.cs 0 (no data)", gate.Detail);
     }
 
     [Fact]

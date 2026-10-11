@@ -160,7 +160,7 @@ public class IssueTriageTests
         }
     }
 
-    private static HttpClient UserClient(string token)
+    internal static HttpClient UserClient(string token)
     {
         var http = OutboundHttp.GitHubApi();
         http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
@@ -169,7 +169,7 @@ public class IssueTriageTests
         return http;
     }
 
-    private static async Task<int> OpenIssueAsync(HttpClient user, RepoRef repo, string title, string body, CancellationToken ct)
+    internal static async Task<int> OpenIssueAsync(HttpClient user, RepoRef repo, string title, string body, CancellationToken ct)
     {
         using var response = await user.PostAsJsonAsync($"repos/{repo}/issues", new { title, body }, ct);
         response.EnsureSuccessStatusCode();
@@ -189,7 +189,7 @@ public class IssueTriageTests
         return await response.Content.ReadFromJsonAsync<JsonElement>(ct);
     }
 
-    private static async Task CloseAsync(HttpClient owner, RepoRef repo, int number)
+    internal static async Task CloseAsync(HttpClient owner, RepoRef repo, int number)
     {
         using var response = await owner.PatchAsJsonAsync($"repos/{repo}/issues/{number}", new { state = "closed", state_reason = "not_planned" });
     }
@@ -198,7 +198,7 @@ public class IssueTriageTests
     /// Polls the issue intake (<see cref="PollUntil"/>) until it has triaged issue <paramref name="number"/>, which GitHub's
     /// <c>issues?since=</c> listing may show a poll or two late; the issue's key.
     /// </summary>
-    private static async Task<int> PollUntilTriagedAsync(E2e e2e, FactoryOptions options, IntakeStatus status, RepoRef repo, int number,
+    internal static async Task<int> PollUntilTriagedAsync(E2e e2e, FactoryOptions options, IntakeStatus status, RepoRef repo, int number,
         CancellationToken ct)
     {
         await PollUntil.SeenAsync(c => FactoryRunner.PollIssuesAsync(options, status, Console.Out, c),
@@ -226,7 +226,7 @@ public class IssueTriageTests
         return (await db.GitHubIssues.AsNoTracking().SingleAsync(i => i.Repo == repo.FullName && i.Number == number, ct)).Id;
     }
 
-    private static async Task<List<LedgerEntry>> HistoryAsync(E2e e2e, int key, CancellationToken ct)
+    internal static async Task<List<LedgerEntry>> HistoryAsync(E2e e2e, int key, CancellationToken ct)
     {
         await using var db = e2e.Db();
         var externalId = ItemNaming.GitHubIssue.Format(key);

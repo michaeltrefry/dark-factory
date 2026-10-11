@@ -514,7 +514,7 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
 
         public ToolOutcome Answer(string header, string body, string hashed, bool isError = false, string? commit = null) =>
             new(body.Length == 0 ? header : $"{header}\n{Bounded(body, MaxChars - header.Length - 1)}", isError,
-                new ToolCall(Tool, Arguments, Sha256(hashed), isError, commit));
+                new ToolCall(Tool, Arguments, Sha256(hashed), isError, commit, Bytes: Utf8Bytes(hashed)));
     }
 
     /// <summary>A call past the session's call cap: answered (every tool_use needs its result) with an error, and recorded.</summary>
@@ -725,9 +725,7 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
             : answer.NotIndexed is null && fallback is null && session.CodeGraphSha is { } head
             && string.Equals(answer.Commit, head, StringComparison.OrdinalIgnoreCase)
             ? $"CodeGraph's index of {project} at the PR head {session.HeadSha}"
-            : answer.Commit is { } sha
-                ? $"CodeGraph's index of {project}'s default branch as of {sha}, not the PR head {session.HeadSha}"
-                : $"CodeGraph's index of {project}'s default branch, commit unknown, not the PR head {session.HeadSha}";
+            : DefaultBranchLabel(project, answer.Commit, session.HeadSha);
         if (fallback is not null)
         {
             label += $" ({fallback})";
@@ -736,6 +734,17 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
             answer.IsError, commit);
         return fallback is null ? outcome : outcome with { Record = outcome.Record with { Fallback = fallback } };
     }
+
+    /// <summary>
+    /// How a CodeGraph answer that is not for exactly a PR head is labelled (E3), by the reviewers' tool loop and the loopback MCP proxy
+    /// alike: CodeGraph's index of the project's default branch "as of &lt;commit&gt;, not the PR head", or "commit unknown" when CodeGraph
+    /// named none; with the PR head named when there is one (a review; a triage or planning session has none).
+    /// </summary>
+    public static string DefaultBranchLabel(string project, string? commit, string? head = null) =>
+        (commit is { } sha
+            ? $"CodeGraph's index of {project}'s default branch as of {sha}, not the PR head"
+            : $"CodeGraph's index of {project}'s default branch, commit unknown, not the PR head")
+        + (head is null ? "" : $" {head}");
 
     /// <summary>
     /// A Kanban tool (on the allowlist and offered to this session): the model's input object forwarded as it is (at most
@@ -850,7 +859,7 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
     }
 
     private static ToolOutcome Error(string tool, string arguments, string why) =>
-        new(why, true, new ToolCall(tool, arguments, Sha256(why), Error: true));
+        new(why, true, new ToolCall(tool, arguments, Sha256(why), Error: true, Bytes: Utf8Bytes(why)));
 
     /// <summary>
     /// <paramref name="text"/> cut, with an explicit marker, to at most <see cref="MaxResultBytes"/> UTF-8 bytes and
@@ -878,6 +887,9 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
         }
         return $"{text[..keep]}\n[cut: {bytes} bytes, the first {used} bytes shown]";
     }
+
+    /// <summary>The size of <paramref name="text"/> in UTF-8 bytes (a tool call's recorded <see cref="ToolCall.Bytes"/>).</summary>
+    public static long Utf8Bytes(string text) => Encoding.UTF8.GetByteCount(text);
 
     /// <summary>The lowercase hex SHA-256 of <paramref name="text"/>'s UTF-8 bytes.</summary>
     public static string Sha256(string text) => Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(text)));

@@ -242,7 +242,8 @@ public sealed class McpProxy : IAsyncDisposable
         {
             var schema = upstream.RepoScoped && CodeGraphSchema(tool.Name) is { } own ? own : tool.InputSchema;
             var description = upstream.RepoScoped
-                ? $"{tool.Description} (Asked about {grant.Repo.FullName} only; CodeGraph indexes its default branch.)"
+                ? $"{tool.Description} (Asked about {grant.Repo.FullName} only; CodeGraph indexes its default branch, and each answer starts "
+                    + "with the commit of that index it describes, or says the commit is unknown.)"
                 : tool.Description;
             tools.Add(new JsonObject { ["name"] = tool.Name, ["description"] = description, ["inputSchema"] = schema.DeepClone() });
         }
@@ -298,7 +299,9 @@ public sealed class McpProxy : IAsyncDisposable
         {
             return Result(id, McpHttpClient.ErrorResult($"Node {built["nodeId"]} is not a node of {resolved} with readable source; not shown."));
         }
-        return Relayed(id, answer.Text, answer.IsError);
+        // E3: the same label as the reviewers' tool loop (the proxy never pins a commit: CodeGraph answers from its default branch).
+        var label = $"{ReviewTools.DefaultBranchLabel(resolved, answer.Commit)}{(answer.IsError ? " (CodeGraph answered with an error)" : "")}:";
+        return Relayed(id, $"{label}\n{answer.Text}", answer.IsError);
     }
 
     /// <summary>An upstream answer as the session gets it: its text, cut at <see cref="MaxAnswerChars"/> with a marker.</summary>

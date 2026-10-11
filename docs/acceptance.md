@@ -182,6 +182,16 @@ Owner set-up, once (the test skips naming whichever is missing):
    a sealed or protected path escalates instead of merging. Since sc-25382 a normal-tier change must also add an xUnit test
    that fails on the base and passes on the head (`new-tests-fail-on-base`, run sandboxed as `_factory`, so `sudo
    scripts/setup-worker-user.sh` must be in place), and the policy must list that check in `normal` and `protected`.
+4. **CodeGraph, since Phase 3 (sc-25709):** every normal or protected change needs `risk-threshold`, which reads CodeGraph's blast
+   radius for the head and hotspots for the default branch, so a live merge also needs (a) the CodeGraph token in the keychain
+   (account `codegraph-token`, or `CodeGraph:Token` / env `FACTORY_CODEGRAPH_TOKEN`; without one `factory run`/`work` warn at
+   start-up and the gate fails `risk-threshold` at once), (b) `michaeltrefry/dark-factory-sandbox` indexed in the hosted CodeGraph
+   (its project's repository URL exactly `https://github.com/michaeltrefry/dark-factory-sandbox`), and (c) CodeGraph's head overlays
+   (C4/C6, michaeltrefry/CodeGraph PRs #71/#75) and risk tools (C7, PR #76: `analyze_impact_file`, `file_hotspot`) deployed and the
+   token entitled to them. Missing any of these, the gate waits on `risk-threshold` like pending CI and escalates at
+   `Gate:CiTimeoutMinutes` instead of merging — so `ReviewGateTests`, `IssueTriageTests`' build test, the P2 epic AT2 run and the
+   Phase 1 AT1–AT5 runs (which go through the gate) all need them; `GateNegativeTests` and `FreezeAndStuckTests` escalate before
+   `risk-threshold` is read and do not.
 
 No reviewer model is set anywhere (owner decision 2026-10-09, epic E8, sc-25626): every review and second opinion names
 the router's `high` model class (`x-weave-model-class: high`, never `x-weave-force-model`) and the router picks the model,
@@ -254,7 +264,8 @@ the issue intake `FactoryRunner.PollIssuesAsync`) against a **throwaway ledger**
 `*_STORY` must be a **fresh To Do bug story** whose fix lands in **normal** code of the sandbox (e.g. `src/Sandbox/`, not `tests/`,
 `docs/`, a sealed or a protected path), small enough for the risk threshold — the P2-AT1 kind; give each test its own story.
 Prerequisites: everything P2-AT1 needs (gate App installed, rulesets re-applied, a version-2 `factory/gate.yaml` on the sandbox's
-main, `sudo scripts/setup-worker-user.sh`).
+main, `sudo scripts/setup-worker-user.sh`, and — for any run that is meant to merge — the CodeGraph token, the sandbox indexed in
+CodeGraph and C7 deployed, P2-AT1 step 4).
 
 ```sh
 FACTORY_E2E=1 FACTORY_E2E_GATE_SEALED_STORY=sc-<id> FACTORY_E2E_GATE_POLICY_STORY=sc-<id> GH_TOKEN=$(gh auth token) \
@@ -366,6 +377,50 @@ issue on the sandbox; the production intake triages it in a real sandboxed worke
 `SessionTaintedException` (no grant, so no installation token is minted for it); GitHub has no `factory/triage-gh-<key>` branch.
 Cleanup (automatic): the issue is closed. In-process: `TaintTests.A_triage_session_holds_no_github_credential_is_tainted_and_its_push_is_refused`
 (also checks the triage worker's environment holds no GitHub token, which a live run cannot observe from outside the sandbox).
+
+# Phase 3 acceptance runbook (CodeGraph integration, epic sc-25704; sc-25710)
+
+The terminal story writes these; they run once, live, against `michaeltrefry/dark-factory-sandbox` and the hosted CodeGraph. Each is
+opt-in (`FACTORY_E2E=1` plus its own variables) and skips naming whatever is missing; each runs the production wiring against a
+**throwaway ledger** and its own work root, like the tests above. They live in
+`tests/DarkFactory.AcceptanceTests/CodeGraphAcceptanceTests.cs`; the wrapper the triage test uses is checked in every `dotnet test`
+(`LiveHelperTests.The_scan_wrapper_counts_the_secret_by_hash_and_hands_over_to_claude`).
+
+Prerequisites, on top of P2-AT1's (gate App, rulesets, `factory/gate.yaml`, the worker sandbox):
+
+- the CodeGraph token in the keychain (`codegraph-token`), entitled to the reviewers' seven tools, `request_overlay`,
+  `get_overlay_status`, `analyze_impact_file` and `file_hotspot`;
+- the sandbox indexed in the hosted CodeGraph (`CodeGraph:BaseUrl`, default the hosted one), its project's repository URL exactly
+  `https://github.com/michaeltrefry/dark-factory-sandbox`;
+- CodeGraph C4 (commit-pinned reads, PR #71), C6 (overlays, PR #75) and C7 (risk tools, PR #76) deployed — P3-AT2 and P3-AT4 need
+  them; P3-AT1 needs them only for its PR to merge;
+- for the Kanban check, a Kanban token (`kanban-token`) and the hosted KanbanBoard at `Kanban:McpUrl`.
+
+Every `*_STORY` is a fresh To Do bug story whose fix lands in **normal** code of the sandbox (e.g. `src/Sandbox/`), with a test that
+fails on the base — the P2-AT1 kind; give each test its own story.
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_P3_REVIEW_STORY=sc-<id> FACTORY_E2E_P3_OVERLAY_STORY=sc-<id> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-class "*CodeGraphReviewTests"
+FACTORY_E2E=1 FACTORY_E2E_ISSUES=1 GH_TOKEN=$(gh auth token) \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-class "*CodeGraphTriageTests"
+FACTORY_E2E=1 FACTORY_E2E_P3_CRITICAL_STORY=sc-<id> FACTORY_E2E_P3_UNREACHABLE_STORY=sc-<id> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-class "*CodeGraphGateTests"
+```
+
+| Test | Variables | Setup it does | Expected evidence |
+| --- | --- | --- | --- |
+| P3-AT1 `CodeGraphReviewTests.A_review_reads_the_code_and_asks_codegraph_and_the_verdict_and_pr_body_record_it` | `FACTORY_E2E_P3_REVIEW_STORY` | none: `factory run` with the real panel | the first verdict's reviews and second opinions list `tools[]` with `read_file` and at least one CodeGraph tool, each with a 64-hex `sha256` and a `bytes` size; every review and second opinion has `turns` numbered 1…n, every one served on `high`; the PR body contains the tool use (`… tool call(s)…`) and, once the merge-time `pr-report` exists, equals `LedgerReport.PullRequestBody` of the ledger. A panel that made no `read_file` or no CodeGraph call fails as `INCONCLUSIVE` (the prompts ask for both; the model chooses): rerun on a fresh story |
+| P3-AT2 `CodeGraphReviewTests.The_reviewers_codegraph_answers_are_for_the_head_overlay` | `FACTORY_E2E_P3_OVERLAY_STORY` | none | a `codegraph-overlay` checkpoint `ready` for the reviewed head and the verdict's `codegraph` ready; every reviewer CodeGraph call has no `fallback`, and every non-error one has `commit` = the head SHA (at least one non-error call); no CodeGraph call at all is `INCONCLUSIVE` |
+| P3-AT3 `CodeGraphTriageTests.A_triage_session_uses_codegraph_through_the_proxy_and_holds_no_codegraph_token` | `FACTORY_E2E_ISSUES=1`, `GH_TOKEN` (the owner) | opens a fixture issue asking for a `search_graph` lookup; sets `Worker:ClaudePath` to a scanning wrapper (`ScanWrapper`, a Perl script under the test's work root, which the worker user reads through the work root's inherited read entry): as `_factory`, with the exact env and argv the factory gives Claude Code, it compares the SHA-256 of every window of the CodeGraph token's length in its env values, argv, the `--mcp-config` file and every file of the triage worktree with the token's hash (only the hash is written into it), prints `dark-factory-e2e-scan {…counts…}` as the session's first (raw) line, then `exec`s the real `claude` | the session's events hold a `mcp__codegraph__search_graph` tool_use whose result carries the factory's commit label ("CodeGraph's index of …"); a `session_taints` row `mcp:mcp__codegraph__search_graph`; the scan line shows 0 hits in env, argv, `--mcp-config` and worktree (and that it saw variables, arguments, the config file and files); no stored event holds the token; then, through the production proxy with a triage grant (the test as its MCP client, `OutboundHttp.LoopbackMcp`), `tools/list` is exactly `search_graph`, `get_code_snippet`, `read_node_source`, `analyze_impact` is refused with JSON-RPC -32602, `search_graph` answers with the commit label, and the Kanban endpoint is 404. No `search_graph` call is `INCONCLUSIVE`. Cleanup: the issue is closed |
+| Epic AT5 Kanban `CodeGraphTriageTests.A_reviewer_session_can_call_a_kanban_read_tool_and_is_never_offered_a_write_tool` | a Kanban token | none (no model: the test plays the reviewer's tool_use blocks) | the reviewers' tools offer `ListProjects` and only tools on `McpServers.KanbanTools`, no write tool; `ListProjects` answers (not an error), recorded with its hash and size; `CreateWorkItem` asked for anyway answers "There is no tool named …" and is not forwarded |
+| P3-AT4 (a) `CodeGraphGateTests.A_pr_touching_a_critical_file_escalates_on_risk_threshold` | `FACTORY_E2E_P3_CRITICAL_STORY` | finds a critical file itself: every normal-tier `src/**/*.cs` file on the sandbox's main (at most 60) asked of `analyze_impact_file` at CodeGraph's default-branch index commit (`file_hotspot`'s `indexCommitSha`) until one answers `critical`; then, before the first (seeded) review, appends `// [dark-factory e2e] P3-AT4 blast-radius probe` to it on the PR branch as the workers' App | the last `gate` row is `Blocked …blast radius at <head> over the code floor (critical always fails): <file> critical…` (`gate_rejected`); MergeGate → Escalated; no `gate-passed`, no Merge; the PR not merged. **Seeding a critical file** when none is found (the test skips saying so): CodeGraph rates a file by the worst risk level among the code that depends on it, so add (on main, by a normal reviewed PR) a small type under `src/Sandbox/` that many other files call — e.g. one helper method referenced from most classes and tests — and wait for CodeGraph to re-index the default branch; check it with `analyze_impact_file` before running. Cleanup: the PR is closed and its branch deleted |
+| P3-AT4 (b) `CodeGraphGateTests.With_codegraph_unreachable_the_gate_waits_then_blocks_and_does_not_merge` | `FACTORY_E2E_P3_UNREACHABLE_STORY` (and a CodeGraph token: without one the check fails at once instead of waiting) | `CodeGraph:BaseUrl` = `http://127.0.0.1:9/` (a closed port: every CodeGraph call is refused), `CodeGraph:OverlayTimeoutMinutes` = 1, `Gate:CiTimeoutMinutes` = 3; the panel seeded | every `codegraph-overlay` row is not ready; the last `gate` row is `Blocked …CodeGraph could still not be read after 00:03:00 (Gate:CiTimeoutMinutes)…` (`gate_rejected`); MergeGate → Escalated; nothing merged. The pending evaluations themselves are not ledger rows (only decisions are, by design), so "pending" shows as the not-ready overlay rows and the Blocked reason naming the timeout. Cleanup: the PR is closed and its branch deleted |
+
+In-process versions (every `dotnet test`): `ReviewerToolLoopTests` (tool calls with hash and size, every turn's class, the report's
+tool errors), `ReviewOverlayTests`, `McpProxyTests` (the triage session's env/argv/worktree with a fake CLI, the proxy's refusals, the
+commit label), `CodeGraphRiskTests` (C7's shapes field by field — a new file passes, a critical file escalates, CodeGraph unreadable
+waits then blocks).
 
 ## Upgrading a Phase 1 ledger: items parked at Review
 

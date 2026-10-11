@@ -136,7 +136,8 @@ public class ReviewerToolLoopTests
     public async Task A_review_that_reads_a_file_gets_it_at_the_pr_head_and_its_findings_are_parsed_and_the_call_recorded()
     {
         var router = Router((SseAnswers.ToolTurn(("toolu_1", "read_file", "{\"path\": \"src/X.cs\"}")), "high"),
-            (SseAnswers.Answer("X.cs is fine.\n" + "{\"findings\": [{\"severity\": \"optional\", \"title\": \"naming\", \"file\": \"src/X.cs\", \"line\": 2, \"detail\": \"x\"}], \"summary\": \"read it\"}"), "high"));
+            (SseAnswers.Answer("X.cs is fine.\n" + "{\"findings\": [{\"severity\": \"optional\", \"title\": \"naming\", \"file\": \"src/X.cs\", \"line\": 2, \"detail\": \"x\"}], \"summary\": \"read it\"}",
+                model: "claude-final-turn"), "high"));
         var repo = Repo(new() { ["src/X.cs"] = XSource });
 
         var review = await Reviewer(router, repo).ReviewAsync(Request, CancellationToken.None);
@@ -148,6 +149,10 @@ public class ReviewerToolLoopTests
         var call = Assert.Single(review.Tools!);
         Assert.Equal((ReviewTools.ReadFile, "{\"path\": \"src/X.cs\"}", ReviewTools.Sha256(XSource), false, (string?)null),
             (call.Tool, call.Arguments, call.ResultSha256, call.Error, call.Commit));
+        // E1: the raw result's UTF-8 size beside its hash, and every turn's served model and class (the last turn's also kept as before).
+        Assert.Equal(Encoding.UTF8.GetByteCount(XSource), call.Bytes);
+        Assert.Equal([new ServedTurn(1, "claude-opus-5-5", "high"), new ServedTurn(2, "claude-final-turn", "high")], review.Turns!);
+        Assert.Equal(("claude-final-turn", "high"), (review.ServedModel, review.ServedClass));
 
         // Both turns: one session, the high class, the placeholder model, never a pinned model, the tools offered.
         Assert.Equal(2, router.Requests.Count);
@@ -175,7 +180,44 @@ public class ReviewerToolLoopTests
         // The verdict lists the call, and the report counts it.
         var verdict = ReviewVerdict.FromDetail(ReviewPanel.Decide(Head, [], [review, review with { Role = ReviewRoles.SpecConformance }]).ToDetail())!;
         var recorded = Assert.Single(verdict.Reviews[0].Tools!);
-        Assert.Equal((ReviewTools.ReadFile, ReviewTools.Sha256(XSource)), (recorded.Tool, recorded.ResultSha256));
+        Assert.Equal((ReviewTools.ReadFile, ReviewTools.Sha256(XSource), (long?)Encoding.UTF8.GetByteCount(XSource)),
+            (recorded.Tool, recorded.ResultSha256, recorded.Bytes));
+        Assert.Equal(review.Turns!, verdict.Reviews[0].Turns!);
+    }
+
+    [Fact]
+    public async Task Every_turns_served_class_is_recorded_and_a_later_turn_off_the_high_class_makes_the_review_unusable()
+    {
+        var router = Router((SseAnswers.ToolTurn(("toolu_1", "read_file", "{\"path\": \"src/X.cs\"}")), "high"),
+            (SseAnswers.Answer(CleanFindings, model: "small-model"), "low"));
+
+        var review = await Reviewer(router, Repo(new() { ["src/X.cs"] = XSource })).ReviewAsync(Request, CancellationToken.None);
+
+        Assert.False(review.Clean);
+        Assert.Equal([new ServedTurn(1, "claude-opus-5-5", "high"), new ServedTurn(2, "small-model", "low")], review.Turns!);
+        Assert.Equal("low", review.ServedClass);
+    }
+
+    [Fact]
+    public void A_verdict_recorded_before_bytes_and_turns_reads_back_with_them_empty()
+    {
+        // A verdict row written by sc-25705..sc-25709 (tools without "bytes", reviews and second opinions without "turns").
+        var old = $$"""
+            {"sha":"{{Head}}","verdict":"pass","summary":"ok","risky":[],"reviews":[{"role":"correctness","served":"m","class":"high",
+            "session":"s","prompt":"p","findings":[{"severity":"optional","title":"t","file":null,"line":null,"detail":"d",
+            "confirmation":{"outcome":"not-confirmed","served":"m","class":"high","session":"c","prompt":"p","reason":"r",
+            "tools":[{"tool":"grep","arguments":"{}","sha256":"22","error":false}]},"downgraded":true}],"summary":"ok","error":null,
+            "carried":null,"tools":[{"tool":"read_file","arguments":"{}","sha256":"00","error":false}]}]}
+            """.ReplaceLineEndings("");
+
+        var verdict = ReviewVerdict.FromDetail(old)!;
+
+        var review = verdict.Reviews.Single();
+        Assert.Equal(("read_file", "00", (long?)null), (review.Tools![0].Tool, review.Tools[0].ResultSha256, review.Tools[0].Bytes));
+        Assert.Null(review.Turns);
+        var confirmation = review.Findings.Single().Confirmation!;
+        Assert.Null(confirmation.Turns);
+        Assert.Null(confirmation.Tools!.Single().Bytes);
     }
 
     [Fact]
@@ -395,6 +437,8 @@ public class ReviewerToolLoopTests
 
         Assert.Equal(Confirmation.Confirmed, confirmation.Outcome);
         Assert.Equal(ReviewTools.Sha256(XSource), Assert.Single(confirmation.Tools!).ResultSha256);
+        Assert.Equal(Encoding.UTF8.GetByteCount(XSource), confirmation.Tools![0].Bytes);
+        Assert.Equal([new ServedTurn(1, "claude-opus-5-5", "high"), new ServedTurn(2, "claude-opus-5-5", "high")], confirmation.Turns!);
         Assert.All(router.Requests, r => Assert.Equal(Confirm.Session, r.Headers[RouterReviewer.SessionHeader]));
     }
 
@@ -429,6 +473,41 @@ public class ReviewerToolLoopTests
         var facts = DarkFactory.Orchestrator.Ledger.LedgerReport.Facts(history, []);
 
         Assert.Contains("correctness (`m`, 2 tool calls), spec-conformance (`m`)", facts);
+    }
+
+    [Fact]
+    public void The_report_names_each_reviews_and_second_opinions_tool_errors_from_the_ledger()
+    {
+        // E4/E8: a review's tool errors (count and up to three failing tools, distinct) and its second opinions' calls and errors.
+        ToolCall Failed(string tool) => new(tool, "{}", "ee", Error: true);
+        var review = new[]
+        {
+            new ToolCall(ReviewTools.ReadFile, "{}", "00"), Failed("made_up_tool` [x](http://e.test) <b>"), Failed(ReviewTools.Grep), Failed(ReviewTools.Grep),
+            Failed(ReviewTools.AnalyzeImpact), Failed(ReviewTools.ListFiles),
+        };
+        var confirmation = new Confirmation(Confirmation.Confirmed, "m2", "high", "c", "p", "yes",
+            [new ToolCall(ReviewTools.ReadFile, "{}", "11"), Failed(ReviewTools.SearchGraph)]);
+        var finding = new Finding(Finding.Blocking, "off by one", "src/X.cs", 2, "d").ConfirmedBy(confirmation);
+        var detail = new ReviewVerdict(Head, ReviewVerdict.Fail, "x", [],
+            [new RoleReview(ReviewRoles.Correctness, "m", "high", null, null, [finding], "x", Tools: review)]).ToDetail();
+        var history = new List<DarkFactory.Orchestrator.Ledger.LedgerEntry>
+        {
+            new()
+            {
+                Id = 1, State = DarkFactory.Orchestrator.Ledger.WorkState.Review, Step = RunPipeline.Steps.Verdict, Detail = detail,
+                RecordedAt = DateTimeOffset.UnixEpoch,
+                Outcome = DarkFactory.Orchestrator.Ledger.StepOutcomes.Of(DarkFactory.Orchestrator.Ledger.WorkState.Review,
+                    DarkFactory.Orchestrator.Ledger.WorkState.Review, RunPipeline.Steps.Verdict, detail),
+            },
+        };
+
+        var facts = DarkFactory.Orchestrator.Ledger.LedgerReport.Facts(history, []);
+
+        // A failing tool's name is the model's text: shown only inert, in a code span.
+        var madeUp = UntrustedText.CodeSpan("made_up_tool` [x](http://e.test) <b>");
+        Assert.Contains($"correctness (`m`, 6 tool calls, 5 tool errors: {madeUp}, `grep`, `analyze_impact` and 1 more; "
+            + "second opinions: 2 tool calls, 1 tool error: `search_graph`)", facts);
+        Assert.DoesNotContain("[x](http://e.test)", facts);
     }
 
     [Fact]
