@@ -74,6 +74,47 @@ public class McpProxyTests
     private static Task<(HttpStatusCode Status, JsonObject? Body)> Call(McpProxy proxy, string server, string credential, string tool, JsonObject arguments) =>
         Rpc(proxy, server, credential, "tools/call", new JsonObject { ["name"] = tool, ["arguments"] = arguments });
 
+    /// <summary>The label of a CodeGraph answer naming no commit, as the proxy relays it (the reviewers' label, no PR head).</summary>
+    private const string Unknown = $"CodeGraph's index of {Project}'s default branch, commit unknown:";
+
+    [Fact]
+    public async Task A_relayed_codegraph_answer_is_labelled_with_the_commit_it_describes_as_the_reviewers_label_it()
+    {
+        // E3: both seams — the reviewers' tool loop and the loopback proxy — name the commit a CodeGraph answer describes the same way.
+        const string Index = "c0ffee0123456789abcdef0123456789abcdef01";
+        var codeGraph = CodeGraphServer((tool, args) => tool switch
+        {
+            "search_graph" => FakeMcpServer.CommitAnswer(Index, "X.Count (Method)"),
+            "get_code_snippet" => FakeMcpServer.Structured($"Commit: {Index}\n\nno such file", new JsonObject { ["commitSha"] = Index }, isError: true),
+            _ => FakeMcpServer.Text("no commit named"),
+        });
+        await using var proxy = await McpProxy.StartAsync(Upstreams(codeGraph, KanbanServer()), CancellationToken.None);
+        using var grant = proxy.Grant(Repo, McpProfile.Planner);
+        async Task<string> Text(string server, string tool, JsonObject args) =>
+            (await Call(proxy, server, grant.Credential, tool, args)).Body!["result"]!["content"]![0]!["text"]!.GetValue<string>();
+
+        var known = await Text(McpServers.CodeGraph, "search_graph", new JsonObject { ["namePattern"] = "X%" });
+        var error = await Text(McpServers.CodeGraph, "get_code_snippet", new JsonObject { ["filePath"] = "src/Gone.cs" });
+        var unknown = await Text(McpServers.CodeGraph, "find_consumers", new JsonObject { ["name"] = "Orders" });
+        var kanban = await Text(McpServers.Kanban, "GetBoard", new JsonObject { ["projectId"] = 3 });
+
+        var asOf = $"CodeGraph's index of {Project}'s default branch as of {Index}";
+        Assert.Equal(asOf, ReviewTools.DefaultBranchLabel(Project, Index));
+        Assert.Equal($"CodeGraph's index of {Project}'s default branch, commit unknown", ReviewTools.DefaultBranchLabel(Project, null));
+        // A review names its PR head; a triage or planning session (no head) is never said to be "not the PR head".
+        Assert.Equal($"{asOf}, not the PR head abc", ReviewTools.DefaultBranchLabel(Project, Index, "abc"));
+        Assert.Equal($"CodeGraph's index of {Project}'s default branch, commit unknown, not the PR head abc",
+            ReviewTools.DefaultBranchLabel(Project, null, "abc"));
+        Assert.Equal($"{asOf}:\nCommit: {Index}\n\nX.Count (Method)", known);
+        Assert.Equal($"{asOf} (CodeGraph answered with an error):\nCommit: {Index}\n\nno such file", error);
+        Assert.Equal($"{Unknown}\nno commit named", unknown);
+        Assert.StartsWith("kanban GetBoard", kanban); // Kanban is not CodeGraph: no commit label
+        // The tool descriptions say so too.
+        var (_, list) = await Rpc(proxy, McpServers.CodeGraph, grant.Credential, "tools/list");
+        Assert.All(list!["result"]!["tools"]!.AsArray(),
+            t => Assert.Contains("each answer starts with the commit of that index it describes", t!["description"]!.GetValue<string>()));
+    }
+
     private static List<string> Listed(JsonObject body) =>
         body["result"]!["tools"]!.AsArray().Select(t => t!["name"]!.GetValue<string>()).ToList();
 
@@ -98,7 +139,7 @@ public class McpProxyTests
         var (_, called) = await Call(proxy, McpServers.CodeGraph, grant.Credential, "analyze_impact", new JsonObject { ["name"] = "X.Count" });
         var result = called!["result"]!;
         Assert.False(result["isError"]!.GetValue<bool>());
-        Assert.Equal($"analyze_impact of X.Count in {Project}", result["content"]![0]!["text"]!.GetValue<string>());
+        Assert.Equal($"{Unknown}\nanalyze_impact of X.Count in {Project}", result["content"]![0]!["text"]!.GetValue<string>());
         var (tool, arguments) = Assert.Single(codeGraph.Calls, c => c.Tool != "search_projects");
         Assert.Equal("analyze_impact", tool);
         Assert.Equal(Project, arguments["project"]!.GetValue<string>()); // pinned to the item's repository, resolved by exact URL
@@ -158,7 +199,7 @@ public class McpProxyTests
         // Naming the item's own project is fine; an unknown argument is dropped, not forwarded.
         var (_, own) = await Call(proxy, McpServers.CodeGraph, grant.Credential, "search_graph",
             new JsonObject { ["namePattern"] = "X%", ["project"] = Project, ["repo"] = "someone/else" });
-        Assert.Equal("ok", own!["result"]!["content"]![0]!["text"]!.GetValue<string>());
+        Assert.Equal($"{Unknown}\nok", own!["result"]!["content"]![0]!["text"]!.GetValue<string>());
         var forwarded = Assert.Single(codeGraph.Calls, c => c.Tool == "search_graph").Arguments;
         Assert.Equal(Project, forwarded["project"]!.GetValue<string>());
         Assert.Null(forwarded["repo"]);
@@ -347,7 +388,7 @@ public class McpProxyTests
         string[] triageTools = ["search_graph", "get_code_snippet", "read_node_source"];
         Assert.Equal([McpServers.CodeGraph], mcp["servers"]!.AsArray().Select(t => t!.GetValue<string>()));
         Assert.Equal(triageTools.Order(), mcp["listed"]!.AsArray().Select(t => t!.GetValue<string>()).Order());
-        Assert.Equal($"search_graph of  in {Project}", mcp["answer"]!.GetValue<string>());
+        Assert.Equal($"{Unknown}\nsearch_graph of  in {Project}", mcp["answer"]!.GetValue<string>());
         Assert.All(mcp["refused"]!.AsObject(), r => Assert.Equal(McpProxy.InvalidParams, r.Value!.GetValue<int>()));
         Assert.Equal(5, mcp["refused"]!.AsObject().Count);
         Assert.Equal(404, mcp["kanban"]!.GetValue<int>());

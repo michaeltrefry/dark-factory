@@ -1,3 +1,4 @@
+using DarkFactory.Orchestrator.CodeGraph;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Shortcut;
 using Microsoft.Extensions.Time.Testing;
@@ -6,7 +7,9 @@ namespace DarkFactory.Orchestrator.Tests.Support;
 
 /// <summary>
 /// A CodeGraph for the merge gate's <c>risk-threshold</c> (sc-25709), in memory: the project is found, the overlay of any commit is
-/// ready at once, and by default every file has no data (<c>found: false</c>: blast radius none, hotspot 0) — so a pipeline test's
+/// ready at once, and by default every file has no data (<c>found: false</c>: blast radius none, hotspot 0) — each answer built field by
+/// field as CodeGraph's C7 (michaeltrefry/CodeGraph PR #76) shapes it (<see cref="C7Answers"/>: a file without metrics answers
+/// <c>commitSha: null</c> and names the index only in <c>indexCommitSha</c>) and parsed by the factory's own client — so a pipeline test's
 /// gate passes the check unless the test says otherwise through <see cref="Impact"/>, <see cref="Hotspot"/>, <see cref="Overlay"/>,
 /// <see cref="Status"/> or <see cref="Project"/>. Like a real client, a call made with a cancelled token throws.
 /// </summary>
@@ -35,17 +38,16 @@ public sealed class FakeCodeGraphRisk : ICodeGraphRisk
     public static CodeGraphRiskReader Reader(FakeCodeGraphRisk? fake = null) =>
         new(fake ?? new FakeCodeGraphRisk(), TimeSpan.FromSeconds(5), TimeSpan.FromMilliseconds(1));
 
-    /// <summary>A found file's impact answer at <paramref name="sha"/>.</summary>
+    /// <summary>A found file's impact answer at <paramref name="sha"/> (C7).</summary>
     public static ImpactFileAnswer Found(string path, string sha, BlastRadius radius) =>
-        new(false, $"Commit: {sha}", sha, null, null, true, BlastRadii.Name(radius), path);
+        C7Answers.ParsedImpactFile("Sandbox", path, sha, true, BlastRadii.Name(radius));
 
-    /// <summary>A found file's hotspot answer with <paramref name="riskScore"/>.</summary>
-    public static HotspotAnswer Hot(string path, double riskScore) =>
-        new(false, $"Commit: {IndexCommit}", IndexCommit, CodeGraphRiskReader.DefaultBranchSource, null, true, riskScore, path);
+    /// <summary>A found file's hotspot answer with <paramref name="riskScore"/>, its metrics computed at the index commit (C7).</summary>
+    public static HotspotAnswer Hot(string path, double riskScore) => C7Answers.ParsedHotspot("Sandbox", path, riskScore);
 
     /// <summary>C4's not-indexed answer of a SHA CodeGraph has no usable overlay of (e.g. status <c>stale</c>).</summary>
     public static ImpactFileAnswer NotIndexed(string sha, string status) =>
-        new(false, "Not indexed", sha, new CodeGraphNotIndexed("commit_not_indexed", status, "No ready overlay for this commit.", 7, null), null, null, null);
+        CodeGraphMcpClient.ImpactFile(C7Answers.Result(FakeMcpServer.NotIndexed("Sandbox", sha, status, 7)));
 
     public Task<string?> FindProjectAsync(RepoRef repo, CancellationToken ct)
     {
@@ -72,15 +74,14 @@ public sealed class FakeCodeGraphRisk : ICodeGraphRisk
     {
         ct.ThrowIfCancellationRequested();
         Calls.Add(("analyze_impact_file", path));
-        return Task.FromResult(Impact?.Invoke(path, sha) ?? new ImpactFileAnswer(false, $"Commit: {sha}", sha, null, null, false, "none", path));
+        return Task.FromResult(Impact?.Invoke(path, sha) ?? C7Answers.ParsedImpactFile(project, path, sha, false, "none"));
     }
 
     public Task<HotspotAnswer> FileHotspotAsync(string project, string path, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         Calls.Add(("file_hotspot", path));
-        return Task.FromResult(Hotspot?.Invoke(path)
-            ?? new HotspotAnswer(false, $"Commit: {IndexCommit}", IndexCommit, CodeGraphRiskReader.DefaultBranchSource, null, false, null, path));
+        return Task.FromResult(Hotspot?.Invoke(path) ?? C7Answers.ParsedHotspot(project, path, null));
     }
 }
 

@@ -154,16 +154,21 @@ public sealed partial class CodeGraphMcpClient : ICodeGraph, ICodeGraphRisk
     }
 
     /// <summary>
-    /// A <c>file_hotspot</c> answer (C7): <c>commitSha</c> and <c>source</c> (CommitAnswer) with the tool's <c>found</c> and
-    /// <c>riskScore</c>; an error is <c>isError</c> with <c>{"error": {code, message}}</c>.
+    /// A <c>file_hotspot</c> answer (C7, michaeltrefry/CodeGraph PR #76): <c>commitSha</c> (the metrics' commit — null for a file
+    /// without metrics and for metrics computed before the commit was recorded) and <c>source</c> (CommitAnswer) with the tool's
+    /// <c>found</c>, <c>riskScore</c>, <c>path</c> and <c>indexCommitSha</c> (the current default-branch index commit); an error is
+    /// <c>isError</c> with <c>{"error": {code, message}}</c>.
     /// </summary>
     public static HotspotAnswer Hotspot(McpToolResult result)
     {
         var s = result.Structured as JsonObject;
         double? score = s?["riskScore"] is JsonValue v && v.TryGetValue<double>(out var d) ? d : null;
         return new HotspotAnswer(result.IsError, result.Text, Commit(result.Structured, result.Text), Str(s, "source"),
-            s?["error"] is JsonObject e ? Str(e, "code") : null, Bool(s, "found"), score, Str(s, "path"));
+            s?["error"] is JsonObject e ? Str(e, "code") : null, Bool(s, "found"), score, Str(s, "path"), Sha(s, "indexCommitSha"));
     }
+
+    /// <summary>A full 40-hex sha field, lowercased; otherwise null (never guessed).</summary>
+    private static string? Sha(JsonObject? o, string name) => Str(o, name) is { } sha && FullSha().IsMatch(sha) ? sha.ToLowerInvariant() : null;
 
     private static bool? Bool(JsonObject? o, string name) => o?[name] is JsonValue v && v.TryGetValue<bool>(out var b) ? b : null;
 

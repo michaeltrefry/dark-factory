@@ -108,6 +108,21 @@ internal sealed class SandboxRepo(FactoryOptions options, RepoRef repo) : IDispo
         }
     }
 
+    /// <summary>Every file (blob) path in <paramref name="branch"/>'s tree (sc-25710: the P3 blast-radius test looks for a critical file).</summary>
+    public async Task<List<string>> TreeFilesAsync(string token, string branch, CancellationToken ct)
+    {
+        var tree = (await SendAsync(HttpMethod.Get, $"git/trees/{Uri.EscapeDataString(branch)}?recursive=1", token, null, ct))!.Value;
+        return [.. tree.GetProperty("tree").EnumerateArray().Where(e => e.GetProperty("type").GetString() == "blob")
+            .Select(e => e.GetProperty("path").GetString()!)];
+    }
+
+    /// <summary>The text of <paramref name="path"/> on <paramref name="branch"/>.</summary>
+    public async Task<string> FileTextAsync(string token, string branch, string path, CancellationToken ct)
+    {
+        var file = (await SendAsync(HttpMethod.Get, $"contents/{path}?ref={Uri.EscapeDataString(branch)}", token, null, ct))!.Value;
+        return Encoding.UTF8.GetString(Convert.FromBase64String(file.GetProperty("content").GetString()!.Replace("\n", "", StringComparison.Ordinal)));
+    }
+
     /// <summary>
     /// The directory of the first xUnit test project (<c>*Tests.csproj</c>) in <paramref name="branch"/>'s tree, where a seeded test
     /// file builds and runs.

@@ -46,12 +46,14 @@ public sealed record ImpactFileAnswer(bool IsError, string Text, string? CommitS
     bool? Found, string? BlastRadius, string? Path = null);
 
 /// <summary>
-/// One <c>file_hotspot</c> answer (C7): whether it is an error, its text, the commit it names, its <c>source</c>
-/// (<c>default-branch</c> or <c>overlay</c>), an error answer's code, and the tool's own <c>found</c>, <c>riskScore</c> and <c>path</c>
-/// (the file it answered about, which must be the one asked about).
+/// One <c>file_hotspot</c> answer (C7, michaeltrefry/CodeGraph PR #76): whether it is an error, its text, the commit its metrics were
+/// computed at (<c>commitSha</c>: null when <c>found</c> is false, and null for metrics computed before CodeGraph recorded the commit),
+/// its <c>source</c> (<c>default-branch</c> or <c>overlay</c>), an error answer's code, the tool's own <c>found</c>, <c>riskScore</c> and
+/// <c>path</c> (the file it answered about, which must be the one asked about), and <c>indexCommitSha</c> — the current default-branch
+/// index commit, given whether or not the file has metrics.
 /// </summary>
 public sealed record HotspotAnswer(bool IsError, string Text, string? CommitSha, string? Source, string? ErrorCode, bool? Found, double? RiskScore,
-    string? Path = null);
+    string? Path = null, string? IndexCommitSha = null);
 
 /// <summary>
 /// CodeGraph's per-file risk tools, owner-side (sc-25709): <c>analyze_impact_file</c> and <c>file_hotspot</c>. Called only by the
@@ -72,10 +74,20 @@ public interface ICodeGraphRisk : ICodeGraphOverlays
 public sealed record FileBlastRadius(string Path, BlastRadius Radius, bool Found);
 
 /// <summary>
-/// One touched file's hotspot score — CodeGraph's <c>riskScore</c> is "the hotspot score" — on the default branch at
-/// <see cref="CommitSha"/> (<see cref="Found"/> false: no metrics, counted as 0).
+/// One touched file's hotspot score — CodeGraph's <c>riskScore</c> is "the hotspot score" — on the default branch, recorded at
+/// <see cref="CommitSha"/>: the commit the metrics were computed at, or the default-branch index commit when the file has no metrics
+/// (<see cref="Found"/> false: counted as 0) or CodeGraph did not record the metrics' commit (<see cref="VitalsCommitUnknown"/>: the
+/// score is used, labelled "vitals commit unknown; index at &lt;sha&gt;"). <see cref="IndexCommitSha"/>: the default-branch index commit
+/// CodeGraph named (null: the same as <see cref="CommitSha"/>), which keys <see cref="HotspotCache"/>.
 /// </summary>
-public sealed record FileHotspot(string Path, double Score, bool Found, string CommitSha);
+public sealed record FileHotspot(string Path, double Score, bool Found, string CommitSha, string? IndexCommitSha = null, bool VitalsCommitUnknown = false)
+{
+    /// <summary>The default-branch index commit the score was read against.</summary>
+    public string IndexCommit => IndexCommitSha ?? CommitSha;
+
+    /// <summary>How the <c>gate</c> row names the commit the score is recorded at.</summary>
+    public string CommitLabel => VitalsCommitUnknown ? $"vitals commit unknown; index at {CommitSha}" : $"at {CommitSha}";
+}
 
 /// <summary>
 /// CodeGraph's inputs to <c>risk-threshold</c> for one evaluation (sc-25709), read fresh: each touched file's blast radius for exactly
@@ -114,7 +126,7 @@ public sealed record CodeGraphRisk(string HeadSha, IReadOnlyList<FileBlastRadius
         var hottest = Hottest;
         var blast = Listed(BlastRadius, f => (limit is { } l && f.Radius > l) || ReferenceEquals(f, worst),
             f => $"{f.Path} {BlastRadii.Name(f.Radius)}{(f.Found ? "" : " (no data)")}", ", ");
-        var hot = Hotspots.GroupBy(f => f.CommitSha).Select(g => $"at {g.Key}: " + Listed(g.ToList(),
+        var hot = Hotspots.GroupBy(f => f.CommitLabel).Select(g => $"{g.Key}: " + Listed(g.ToList(),
             f => (maxHotspot is { } m && f.Score > m) || ReferenceEquals(f, hottest), f => $"{f.Path} {Score(f.Score)}{(f.Found ? "" : " (no data)")}", ", "));
         return $"codegraph blast radius at {HeadSha}: {(BlastRadius.Count == 0 ? "none read" : blast)}"
             + $"; hotspot score (riskScore) on the default branch: {(Hotspots.Count == 0 ? "none read" : string.Join("; ", hot))}"
@@ -144,9 +156,10 @@ public sealed record CodeGraphRisk(string HeadSha, IReadOnlyList<FileBlastRadius
 }
 
 /// <summary>
-/// The hotspot scores one gate wait has read (sc-25709), by file and the default-branch commit CodeGraph named: one is reused while the
-/// head's ready overlay is built on that commit (its base), so a wait that reads again every poll asks for each file's hotspot once per
-/// default-branch commit.
+/// The hotspot scores one gate wait has read (sc-25709), by file and the default-branch index commit CodeGraph named
+/// (<c>indexCommitSha</c>, <see cref="FileHotspot.IndexCommit"/>): one is reused while the head's ready overlay is built on that same
+/// commit (its base — the commit the lookup names), so a wait that reads again every poll asks for each file's hotspot once per
+/// default-branch index commit.
 /// </summary>
 public sealed class HotspotCache
 {
@@ -158,7 +171,7 @@ public sealed class HotspotCache
         return commit is not null && _scores.TryGetValue((path, commit.ToLowerInvariant()), out hotspot);
     }
 
-    public void Add(FileHotspot hotspot) => _scores[(hotspot.Path, hotspot.CommitSha.ToLowerInvariant())] = hotspot;
+    public void Add(FileHotspot hotspot) => _scores[(hotspot.Path, hotspot.IndexCommit.ToLowerInvariant())] = hotspot;
 }
 
 /// <summary>
@@ -167,7 +180,8 @@ public sealed class HotspotCache
 /// and <c>depth</c> = <see cref="ImpactDepth"/> (only once CodeGraph's overlay of the head is ready: <see cref="Overlays"/>, waited
 /// for by the pipeline), then per file <c>file_hotspot</c> (default branch only). It stops at the first input it cannot read
 /// (<see cref="CodeGraphRisk.Unreadable"/>): the gate is pending then anyway, and reads everything again. A file CodeGraph has no data
-/// for (<c>found: false</c>, e.g. a new file) counts as blast radius none and hotspot 0 (owner decision 2026-10-10).
+/// for (<c>found: false</c>, e.g. a new file) counts as blast radius none and hotspot 0 (owner decision 2026-10-10); its hotspot is
+/// recorded at CodeGraph's <c>indexCommitSha</c>, since C7 names no metrics commit (<c>commitSha</c> null) for a file without metrics.
 /// </summary>
 public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overlayTimeout, TimeSpan? pollInterval = null)
 {
@@ -247,12 +261,23 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
                 unreadable.Add(why);
                 return Result();
             }
-            var score = answer.Found == true ? new FileHotspot(path, answer.RiskScore!.Value, true, answer.CommitSha!) : new FileHotspot(path, 0, false, answer.CommitSha!);
+            var score = Score(answer, path);
             scores.Add(score);
             hotspots?.Add(score);
         }
         return Result();
     }
+
+    /// <summary>
+    /// A usable hotspot answer as recorded (C7, PR #76): found with a metrics commit → its score at that commit; found without one
+    /// (metrics computed before CodeGraph recorded commits) → its score at the index commit, labelled vitals commit unknown; not found
+    /// → 0 at the index commit. <see cref="Hotspot"/> has already refused an answer naming neither commit.
+    /// </summary>
+    private static FileHotspot Score(HotspotAnswer answer, string path) => answer.Found == true
+        ? answer.CommitSha is { } computed
+            ? new FileHotspot(path, answer.RiskScore!.Value, true, computed, answer.IndexCommitSha)
+            : new FileHotspot(path, answer.RiskScore!.Value, true, answer.IndexCommitSha!, answer.IndexCommitSha, VitalsCommitUnknown: true)
+        : new FileHotspot(path, 0, false, answer.IndexCommitSha ?? answer.CommitSha!, answer.IndexCommitSha);
 
     /// <summary>Why an impact answer cannot be used for <paramref name="head"/>, or null when it can.</summary>
     private static string? Impact(ImpactFileAnswer answer, string path, string head) => answer switch
@@ -271,8 +296,9 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
     private static string? Hotspot(HotspotAnswer answer, string path) => answer switch
     {
         { IsError: true } => $"{path}: {CodeGraphMcpClient.FileHotspotTool}{(answer.ErrorCode is { } code ? $" ({Cut(code)})" : "")}: {Cut(answer.Text)}",
-        // E3's exception is the default branch only, recorded with its commit: an answer naming no commit, or not from it, is not used.
-        { CommitSha: null } => $"{path}: {CodeGraphMcpClient.FileHotspotTool} named no commit",
+        // E3's exception is the default branch only, recorded with its commit: an answer naming no commit at all (neither the metrics'
+        // commitSha nor the index's indexCommitSha), or not from the default branch, is not used.
+        { CommitSha: null, IndexCommitSha: null } => $"{path}: {CodeGraphMcpClient.FileHotspotTool} named no commit (neither commitSha nor indexCommitSha)",
         { Source: { } source } when source != DefaultBranchSource => $"{path}: {CodeGraphMcpClient.FileHotspotTool} answered from '{Cut(source)}', not the default branch",
         _ when !SamePath(answer.Path, path) => OtherPath(CodeGraphMcpClient.FileHotspotTool, answer.Path, path),
         { Found: null } => $"{path}: {CodeGraphMcpClient.FileHotspotTool} answered no 'found'",

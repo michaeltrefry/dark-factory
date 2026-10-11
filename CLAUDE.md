@@ -24,7 +24,7 @@ Claude Code headless workers through the Weave router.
   the MCP upstreams and the loopback MCP proxy (`Mcp/`: `McpHttpClient`, `McpUpstream`/`McpUpstreams`/`McpServers`
   (allowlists), `McpProxy`, `McpProxySessions`; CodeGraph's client `CodeGraph/CodeGraphMcpClient.cs`; sc-25707),
   and the outbound gateway (`Gateway/`: `OutboundHttp` builds every GitHub, Shortcut, router, CodeGraph and Kanban `HttpClient` (and the
-  acceptance tests' dashboard client); `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token
+  acceptance tests' dashboard client and their loopback-only client of the MCP proxy, `LoopbackMcp`); `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token
   credentials; `GitRemoteReads` the github.com remote URL and every clone/fetch's arguments (sc-25391); `GitHubCli` is the only
   `gh` run).
 - `src/DarkFactory.Analyzers` — the gateway lint (sc-25390), a Roslyn analyzer every build of the orchestrator and of
@@ -83,6 +83,10 @@ Claude Code headless workers through the Weave router.
   `GateNegativeTests` (sealed path, corrupt policy on a throwaway branch, a new test passing on the base, a 4th fix round; review
   panel replaced by `SeededReviewer`, seeding through `SandboxRepo`), `FreezeAndStuckTests` (freeze seeded in the throwaway
   ledger; a stub Claude CLI replaying the stuck/silent fixtures), `IssueTriageTests.A_triage_session_that_read_issue_text_is_tainted_and_cannot_push`.
+  Phase 3's epic AT1–AT5 (sc-25710, `CodeGraphAcceptanceTests.cs`): `CodeGraphReviewTests` (the real panel's tool calls, turns and
+  overlay-bound CodeGraph answers), `CodeGraphTriageTests` (a triage session through the proxy, scanned for the CodeGraph token by a
+  wrapper Claude Code path, `ScanWrapper`; the production proxy refusing off-profile tools; a live Kanban read through the reviewers'
+  tools), `CodeGraphGateTests` (a critical file escalating on risk-threshold; CodeGraph unreachable blocking at the CI timeout).
 
 ## Commands
 
@@ -265,7 +269,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   credential (else 401; not the dashboard's cookie login); a server not configured, or one the grant has no tool of, is 404.
   `tools/list` shows only the grant's tools; `tools/call` refuses any other with JSON-RPC error -32602, nothing forwarded, and
   so every call past `McpProxy.MaxCallsPerGrant` (100) per grant; every relayed answer (CodeGraph's and Kanban's) is its text
-  cut at `McpProxy.MaxAnswerChars` (60,000 chars and UTF-8 bytes) with a `[cut: …]` marker. One allowlist per
+  cut at `McpProxy.MaxAnswerChars` (60,000 chars and UTF-8 bytes) with a `[cut: …]` marker, a CodeGraph answer first labelled
+  with the commit it describes as the reviewers' are ("CodeGraph's index of <project>'s default branch as of <sha>", or "…, commit
+  unknown"; a review adds ", not the PR head <head>", a proxy session has no PR head; `ReviewTools.DefaultBranchLabel`, E3), which
+  the CodeGraph tools' descriptions and the triage prompt say. One allowlist per
   upstream: CodeGraph's is `ReviewTools.CodeGraphTools` (7 model-free tools), Kanban's `McpServers.KanbanTools` (ListProjects,
   GetBoard, ListEpics, GetEpic, ListEpicDocuments, GetEpicDocument, ListWorkItems, ListEpicWorkItems, GetIssues, GetWorkItem,
   SearchWorkItems — the last two arrive with KanbanBoard sc-25711; an upstream without them just does not list them; no
@@ -660,7 +667,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (C4, CodeGraph PR #71) and only an answer naming exactly the head is labelled "CodeGraph's index of <project> at the PR head";
   a typed not-indexed answer (`structuredContent.notIndexed`, which names the head yet carries no data) makes that call fall
   back to the default-branch call, labelled and recorded (`tools[].fallback`). Not ready, the calls go without `sha` and are
-  labelled "…'s default branch as of <sha>, not the PR head". `request_overlay`/`get_overlay_status`
+  labelled "…'s default branch as of <sha>, not the PR head" (`ReviewTools.DefaultBranchLabel`, which the loopback proxy prepends
+  to every CodeGraph answer it relays too, without a head and so without "not the PR head": both seams name the commit the same way). `request_overlay`/`get_overlay_status`
   (`CodeGraphMcpClient.OverlayTools`) are sent straight through the MCP client and are on no allowlist, profile or tool list (a
   test asserts it). Triage is unchanged (no `sha`). Overlay node ids are negative, so `read_node_source` takes any integer id. Kanban tools (sc-25707, only with `Kanban:Token`): each session lists the Kanban upstream once
   (`ReviewTools.DefinitionsAsync`) and is offered, after `ReviewTools.Names`, its tools on `McpServers.KanbanTools` with their own
@@ -681,8 +689,12 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   long) makes the answer unusable rather than failing the run. A tool that cannot answer (no such file, a binary file, a
   repository CodeGraph does not index, CodeGraph unreachable or unconfigured) gives the model an error result; it never fails
   the review by itself. Each call is recorded in the verdict's review or, for a second opinion, on the finding's confirmation
-  under its own `confirm-<role>` session (`tools`: tool, arguments, SHA-256 of the raw result, error, CodeGraph commit) and the
-  report counts them per review. The prompts make reading code a rule: no claim about code outside the diff without reading it
+  under its own `confirm-<role>` session (`tools`: tool, arguments, SHA-256 and UTF-8 size (`bytes`) of the raw result before
+  fencing and bounding, error, CodeGraph commit; `turns`: every turn's number, served model and served class, the final-answer turn
+  included — the review's own `served`/`class` stay the last turn's; both absent in a verdict recorded before sc-25710, which still
+  reads) and the reports (PR body, closeout, escalation; `LedgerReport`) show per review its calls, how many answered an error and
+  up to `LedgerReport.MaxFailingToolsShown` (3) distinct failing tool names (inert code spans), and the same for its second
+  opinions (E4/E8). The prompts make reading code a rule: no claim about code outside the diff without reading it
   (a finding about unread code is not allowed), and a second opinion on a finding that depends on unshown code reads it, then
   confirms or rejects. Prompts: `factory/prompts/{correctness,spec-conformance,security,confirm}.md` in this repo, compiled in as
   embedded resources (`ReviewPrompts`) — never read from the target repo or the PR (which could rewrite the prompt it is
@@ -791,8 +803,12 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   stale one; otherwise requested and waited for like the review's and checkpointed, an outcome the last row for that head already
   records not written again) and only an answer naming the head (E3) and the file asked about (its `path`, normalized like the
   diff's) — then `file_hotspot(repo, path)` from the default branch only (`source: default-branch`, the asked `path`), recorded with
-  the commit it names (E3's exception), each answer reused within one wait while the ready overlay's base is that commit
-  (`HotspotCache`). The reader stops at the first input it cannot read. "The hotspot score" is CodeGraph's `riskScore`. The blast
+  the commit it names (E3's exception) as C7 (michaeltrefry/CodeGraph PR #76) shapes it: `commitSha` is the metrics' commit and
+  `indexCommitSha` the current default-branch index commit; a file without metrics (`found: false`, e.g. new) answers `commitSha`
+  null and counts as 0 recorded at `indexCommitSha`; a found file with a null `commitSha` (metrics computed before CodeGraph recorded
+  commits) keeps its score, recorded at `indexCommitSha` and labelled "vitals commit unknown; index at <sha>"; an answer naming
+  neither commit is unreadable. Each answer is reused within one wait while the ready overlay's base is its index commit
+  (`HotspotCache`, keyed by `indexCommitSha` — the commit the lookup names). The reader stops at the first input it cannot read. "The hotspot score" is CodeGraph's `riskScore`. The blast
   radius has a code floor (`GatePolicy.BlastRadiusFloor` =
   high: a critical file always fails; seam `policy-floor:blast-radius`), `max_blast_radius` can only lower it; hotspots have no
   floor — recorded and reported, failing only above an opted-in `max_hotspot`. A file CodeGraph has no data for (`found: false`,

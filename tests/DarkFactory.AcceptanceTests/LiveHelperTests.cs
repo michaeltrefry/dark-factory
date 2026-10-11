@@ -63,6 +63,67 @@ public class LiveHelperTests
         }
     }
 
+    /// <summary>
+    /// P3-AT3's scanning wrapper (sc-25710) finds a secret, by hash only, in an env value, an argument, the <c>--mcp-config</c> file
+    /// and a worktree file, prints its counts as the first line, then hands over to the <c>claude</c> on PATH with the same arguments;
+    /// with <c>--version</c> it hands over at once, printing nothing.
+    /// </summary>
+    [Fact]
+    public async Task The_scan_wrapper_counts_the_secret_by_hash_and_hands_over_to_claude()
+    {
+        const string secret = "cg_e2e_scan_secret_4f9a";
+        var root = Directory.CreateTempSubdirectory("df-e2e-scan-").FullName;
+        try
+        {
+            var bin = Directory.CreateDirectory(Path.Combine(root, "bin")).FullName;
+            var fakeClaude = Path.Combine(bin, "claude");
+            File.WriteAllText(fakeClaude, "#!/bin/sh\necho \"claude $*\"\n");
+            File.SetUnixFileMode(fakeClaude, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            var worktree = Directory.CreateDirectory(Path.Combine(root, "worktree")).FullName;
+            File.WriteAllText(Path.Combine(worktree, "clean.txt"), "nothing here\n");
+            File.WriteAllText(Path.Combine(worktree, "leak.txt"), $"token={secret}\n");
+            var config = Path.Combine(root, "mcp.json");
+            File.WriteAllText(config, """{"mcpServers":{"codegraph":{"headers":{"Authorization":"Bearer """ + secret + "\"}}}}");
+            var wrapper = ScanWrapper.Write(root, [secret]);
+            Assert.DoesNotContain(secret, File.ReadAllText(wrapper)); // only its hash is written
+
+            ProcessStartInfo Start(params string[] args)
+            {
+                var psi = new ProcessStartInfo("/usr/bin/perl", [wrapper, .. args]) { WorkingDirectory = worktree };
+                psi.Environment.Clear();
+                psi.Environment["PATH"] = $"{bin}:/usr/bin:/bin";
+                psi.Environment["LEAKY"] = $"x{secret}y";
+                return psi;
+            }
+            var (exitCode, stdout, stderr) = await RunAsync(Start("-p", $"prompt {secret}", "--mcp-config", config));
+
+            Assert.True(exitCode == 0, stderr);
+            var lines = stdout.TrimEnd('\n').Split('\n');
+            Assert.Equal(2, lines.Length);
+            var scan = Assert.IsType<ScanWrapper.Scan>(ScanWrapper.Result(lines));
+            Assert.Equal((1, 1, 1, 1, true), (scan.Env, scan.Argv, scan.Worktree, scan.McpConfigHits, scan.McpConfig));
+            Assert.Equal((2, 4), (scan.Files, scan.Args));
+            Assert.Equal($"claude -p prompt {secret} --mcp-config {config}", lines[1]);
+
+            var version = await RunAsync(Start("--version"));
+            Assert.Equal("claude --version\n", version.Stdout);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    /// <summary>The live tests' MCP client of the factory's loopback proxy reaches loopback addresses only (sc-25710).</summary>
+    [Fact]
+    public void The_loopback_mcp_client_refuses_anything_but_a_loopback_address()
+    {
+        using var loopback = OutboundHttp.LoopbackMcp(new Uri("http://127.0.0.1:4711/mcp/codegraph"));
+        Assert.Equal(new Uri("http://127.0.0.1:4711/mcp/codegraph"), loopback.BaseAddress);
+        Assert.Throws<ArgumentException>(() => OutboundHttp.LoopbackMcp(new Uri("https://codegraph.example/mcp")));
+        Assert.Throws<ArgumentException>(() => OutboundHttp.LoopbackMcp(new Uri("http://10.0.0.5:4711/mcp/codegraph")));
+    }
+
     private const string Policy = """
         version: 2
         tiers:
