@@ -300,4 +300,15 @@ public class IssueTriageTests
         Assert.Contains("```json", prompt);
         Assert.Contains("acme/widgets, acme/gadgets", prompt);
     }
+
+    [Fact]
+    public void The_triage_prompts_codegraph_note_names_the_index_commit_without_a_pr_head()
+    {
+        // A triage session has no PR head: the note quotes the proxy's label forms, never "not the PR head" (sc-25710).
+        var note = TriagePrompt.McpNote([$"mcp__{DarkFactory.Orchestrator.Mcp.McpServers.CodeGraph}__search_graph"]);
+
+        Assert.Contains("(\"as of <sha>\", or \"commit unknown\"; it may lag the files you read)", note);
+        Assert.DoesNotContain("PR head", note);
+        Assert.Equal("", TriagePrompt.McpNote([]));
+    }
 }

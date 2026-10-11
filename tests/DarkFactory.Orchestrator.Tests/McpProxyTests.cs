@@ -75,7 +75,7 @@ public class McpProxyTests
         Rpc(proxy, server, credential, "tools/call", new JsonObject { ["name"] = tool, ["arguments"] = arguments });
 
     /// <summary>The label of a CodeGraph answer naming no commit, as the proxy relays it (the reviewers' label, no PR head).</summary>
-    private const string Unknown = $"CodeGraph's index of {Project}'s default branch, commit unknown, not the PR head:";
+    private const string Unknown = $"CodeGraph's index of {Project}'s default branch, commit unknown:";
 
     [Fact]
     public async Task A_relayed_codegraph_answer_is_labelled_with_the_commit_it_describes_as_the_reviewers_label_it()
@@ -98,8 +98,13 @@ public class McpProxyTests
         var unknown = await Text(McpServers.CodeGraph, "find_consumers", new JsonObject { ["name"] = "Orders" });
         var kanban = await Text(McpServers.Kanban, "GetBoard", new JsonObject { ["projectId"] = 3 });
 
-        var asOf = $"CodeGraph's index of {Project}'s default branch as of {Index}, not the PR head";
+        var asOf = $"CodeGraph's index of {Project}'s default branch as of {Index}";
         Assert.Equal(asOf, ReviewTools.DefaultBranchLabel(Project, Index));
+        Assert.Equal($"CodeGraph's index of {Project}'s default branch, commit unknown", ReviewTools.DefaultBranchLabel(Project, null));
+        // A review names its PR head; a triage or planning session (no head) is never said to be "not the PR head".
+        Assert.Equal($"{asOf}, not the PR head abc", ReviewTools.DefaultBranchLabel(Project, Index, "abc"));
+        Assert.Equal($"CodeGraph's index of {Project}'s default branch, commit unknown, not the PR head abc",
+            ReviewTools.DefaultBranchLabel(Project, null, "abc"));
         Assert.Equal($"{asOf}:\nCommit: {Index}\n\nX.Count (Method)", known);
         Assert.Equal($"{asOf} (CodeGraph answered with an error):\nCommit: {Index}\n\nno such file", error);
         Assert.Equal($"{Unknown}\nno commit named", unknown);

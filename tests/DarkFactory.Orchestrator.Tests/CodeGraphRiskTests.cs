@@ -152,7 +152,7 @@ public class CodeGraphRiskTests
         var decision = Evaluate(Radii(BlastRadius.Low, hotA: 0.9, hotB: 0.5), TestPolicies.V3("high", "0.5"));
 
         Assert.Equal(GateOutcome.Blocked, decision.Outcome);
-        Assert.Equal($"risk threshold: hotspot score (riskScore) over max_hotspot 0.5: src/a.cs 0.9 on the default branch at {IndexCommit[..12]}",
+        Assert.Equal($"risk threshold: hotspot score (riskScore) over max_hotspot 0.5: src/a.cs 0.9 on the default branch at {IndexCommit}",
             Assert.Single(decision.Reasons));
         // At the limit it passes; off (or version 2) the score is only recorded and reported.
         Assert.Equal(GateOutcome.Merge, Evaluate(Radii(BlastRadius.Low, hotA: 0.5, hotB: 0.5), TestPolicies.V3("high", "0.5")).Outcome);
@@ -394,7 +394,10 @@ public class CodeGraphRiskTests
         // The score counts: a version 3 hotspot limit below it fails the check.
         var diff = TestPolicies.Diff("src/a.cs");
         Assert.Equal(GateOutcome.Merge, Evaluate(risk, TestPolicies.V3("high", "1"), diff).Outcome);
-        Assert.NotEqual(GateOutcome.Merge, Evaluate(risk, TestPolicies.V3("high", "0.5"), diff).Outcome);
+        var over = Evaluate(risk, TestPolicies.V3("high", "0.5"), diff);
+        Assert.NotEqual(GateOutcome.Merge, over.Outcome);
+        // The block reason names the commit as the risk description does: never "at <index commit>" as if the vitals were computed there.
+        Assert.Contains($"src/a.cs 0.7 on the default branch vitals commit unknown; index at {IndexCommit}", Assert.Single(over.Reasons));
     }
 
     [Fact]

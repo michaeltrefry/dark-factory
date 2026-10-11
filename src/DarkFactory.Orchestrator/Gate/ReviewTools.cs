@@ -737,14 +737,14 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
 
     /// <summary>
     /// How a CodeGraph answer that is not for exactly a PR head is labelled (E3), by the reviewers' tool loop and the loopback MCP proxy
-    /// alike: CodeGraph's index of the project's default branch "as of &lt;commit&gt;, not the PR head", or "commit unknown" when CodeGraph
-    /// named none; with the PR head named when there is one (a review; a triage or planning session has none).
+    /// alike: CodeGraph's index of the project's default branch "as of &lt;commit&gt;", or "commit unknown" when CodeGraph named none;
+    /// a review adds ", not the PR head &lt;head&gt;" (a triage or planning session has no PR head, so its label names none).
     /// </summary>
     public static string DefaultBranchLabel(string project, string? commit, string? head = null) =>
         (commit is { } sha
-            ? $"CodeGraph's index of {project}'s default branch as of {sha}, not the PR head"
-            : $"CodeGraph's index of {project}'s default branch, commit unknown, not the PR head")
-        + (head is null ? "" : $" {head}");
+            ? $"CodeGraph's index of {project}'s default branch as of {sha}"
+            : $"CodeGraph's index of {project}'s default branch, commit unknown")
+        + (head is null ? "" : $", not the PR head {head}");
 
     /// <summary>
     /// A Kanban tool (on the allowlist and offered to this session): the model's input object forwarded as it is (at most

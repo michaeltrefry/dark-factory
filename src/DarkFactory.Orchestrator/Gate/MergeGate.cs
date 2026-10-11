@@ -441,7 +441,7 @@ public static class MergeGate
             if (hot.Count > 0)
             {
                 reasons.Add($"risk threshold: hotspot score (riskScore) over max_hotspot {CodeGraphRisk.Score(maxHotspot)}: "
-                    + string.Join(", ", hot.Select(f => $"{f.Path} {CodeGraphRisk.Score(f.Score)} on the default branch at {Ci.Short(f.CommitSha)}")));
+                    + string.Join(", ", hot.Select(f => $"{f.Path} {CodeGraphRisk.Score(f.Score)} on the default branch {f.CommitLabel}")));
             }
         }
         if (risk.Unreadable.Count > 0)

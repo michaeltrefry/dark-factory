@@ -126,19 +126,24 @@ public class CodeGraphReviewTests
             Assert.Equal(Enumerable.Range(1, turns!.Count), turns.Select(t => t.Turn));
         }
 
+        // The PR body carries the review's tool use only once it is rewritten from the ledger at merge (MergeAsync's pr-report row):
+        // the body written when the PR opened predates the review.
+        var latest = await e2e.HistoryAsync(storyId, ct);
+        var report = latest.FindLastIndex(e => e.Step == RunPipeline.Steps.PrReport);
+        if (report < 0)
+        {
+            Assert.Fail($"INCONCLUSIVE/needs merge: sc-{storyId} has no pr-report row (it did not merge; last state "
+                + $"{latest.LastOrDefault()?.State}), so its PR body is still the one written at open, before the review; it needs a "
+                + "merge (the gate must pass, CodeGraph C7 deployed) before the body can show the tool use: rerun on a fresh story.");
+        }
         var pr = (await E2e.PullRequestsAsync(options.DefaultRepo, storyId, ct)).Single(p => p.GetProperty("html_url").GetString() == RunPipeline.LinkedPullRequestUrl(history));
         var body = pr.GetProperty("body").GetString() ?? "";
         Assert.Contains(" tool call", body);
-        var latest = await e2e.HistoryAsync(storyId, ct);
-        var report = latest.FindLastIndex(e => e.Step == RunPipeline.Steps.PrReport);
-        if (report >= 0)
-        {
-            // The body is the ledger's report (E8), tool use included.
-            using var shortcutHttp = OutboundHttp.ShortcutApi();
-            var story = (await FactoryRunner.CreateWorkSource(options, shortcutHttp).ReadSpecAsync(storyId, ct)).Story;
-            Assert.Equal(LedgerReport.PullRequestBody(story, latest.Take(report).ToList(), await e2e.SessionCostsAsync(storyId, ct)).ReplaceLineEndings("\n"),
-                body.ReplaceLineEndings("\n"));
-        }
+        // The body is the ledger's report (E8), tool use included.
+        using var shortcutHttp = OutboundHttp.ShortcutApi();
+        var story = (await FactoryRunner.CreateWorkSource(options, shortcutHttp).ReadSpecAsync(storyId, ct)).Story;
+        Assert.Equal(LedgerReport.PullRequestBody(story, latest.Take(report).ToList(), await e2e.SessionCostsAsync(storyId, ct)).ReplaceLineEndings("\n"),
+            body.ReplaceLineEndings("\n"));
     }
 
     /// <summary>
@@ -363,8 +368,8 @@ public class CodeGraphGateTests
     /// sandbox's main itself — each normal-tier <c>.cs</c> file under <c>src/</c> asked of <c>analyze_impact_file</c> at CodeGraph's
     /// default-branch index commit (named by <c>file_hotspot</c>'s <c>indexCommitSha</c>) until one answers <c>critical</c>; none
     /// skips with how to seed one (docs/acceptance.md) — then, before the first review, appends a comment line to it on the PR branch
-    /// (as the workers' App). Expected: the last <c>gate</c> row is Blocked naming the file's blast radius over the code floor
-    /// (critical always fails), gate_rejected; MergeGate → Escalated; nothing merged.
+    /// (as the workers' App). Expected: the last <c>gate</c> row is Blocked naming the file's blast radius (<c>critical</c>) over the
+    /// limit (worded by the sandbox policy's version), gate_rejected; MergeGate → Escalated; nothing merged.
     /// </summary>
     [Fact]
     public async Task A_pr_touching_a_critical_file_escalates_on_risk_threshold()
@@ -393,7 +398,9 @@ public class CodeGraphGateTests
             var outcome = await FactoryRunner.RunAsync(options, FactoryRunner.CreateWorkSource(options, shortcutHttp), storyId, ignoreScope: true,
                 Console.Out, ct, gate => gate with { Reviewer = reviewer });
 
-            var gateRow = await AssertEscalatedAtTheGateAsync(e2e, options, storyId, outcome, "over the code floor (critical always fails)", ct);
+            // The limit's wording depends on the sandbox's policy version (the code floor, or a v3 max_blast_radius): not asserted.
+            var gateRow = await AssertEscalatedAtTheGateAsync(e2e, options, storyId, outcome, "risk threshold: blast radius at", ct);
+            Assert.Contains($"{critical} critical", outcome.Error);
             Assert.Contains($"{critical} critical", gateRow.Detail);
             Assert.True(reviewer.Reviews > 0);
         }
@@ -406,7 +413,7 @@ public class CodeGraphGateTests
     /// <summary>
     /// P3-AT4 (b): with CodeGraph unreachable (<c>CodeGraph:BaseUrl</c> = a closed loopback port, <see cref="Unreachable"/>) the gate
     /// waits on risk-threshold like pending CI — the overlay of the head cannot be read, recorded as a not-ready
-    /// <c>codegraph-overlay</c> checkpoint — and at <c>Gate:CiTimeoutMinutes</c> (3 here) records Blocked and escalates; nothing merges.
+    /// <c>codegraph-overlay</c> checkpoint — and at <c>Gate:CiTimeoutMinutes</c> (10 here: it also bounds the CI wait before MergeGate, so the sandbox CI must finish within it) records Blocked and escalates; nothing merges.
     /// The pending evaluations themselves are not ledger rows (by design: only decisions are), so "pending" shows as the not-ready
     /// overlay row and the Blocked reason naming the timeout.
     /// </summary>
@@ -423,7 +430,7 @@ public class CodeGraphGateTests
         {
             ["CodeGraph:BaseUrl"] = Unreachable,
             ["CodeGraph:OverlayTimeoutMinutes"] = "1",
-            ["Gate:CiTimeoutMinutes"] = "3",
+            ["Gate:CiTimeoutMinutes"] = "10", // also bounds the CI wait before MergeGate: the sandbox CI must finish within it
         });
         CodeGraphLive.RequireToken(options); // without a token risk-threshold fails at once instead of waiting
         await ReviewGateTests.RequireGateReadyAsync(options, ct);
@@ -434,7 +441,7 @@ public class CodeGraphGateTests
             var outcome = await FactoryRunner.RunAsync(options, FactoryRunner.CreateWorkSource(options, shortcutHttp), storyId, ignoreScope: true,
                 Console.Out, ct, gate => gate with { Reviewer = new SeededReviewer() });
 
-            await AssertEscalatedAtTheGateAsync(e2e, options, storyId, outcome, "CodeGraph could still not be read after 00:03:00 (Gate:CiTimeoutMinutes)", ct);
+            await AssertEscalatedAtTheGateAsync(e2e, options, storyId, outcome, "CodeGraph could still not be read after 00:10:00 (Gate:CiTimeoutMinutes)", ct);
             var history = await e2e.HistoryAsync(storyId, ct);
             var overlays = history.Where(e => e.Step == RunPipeline.Steps.CodeGraphOverlay).Select(e => CodeGraphOverlay.FromDetail(e.Detail)).ToList();
             Assert.NotEmpty(overlays);

@@ -270,9 +270,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `tools/list` shows only the grant's tools; `tools/call` refuses any other with JSON-RPC error -32602, nothing forwarded, and
   so every call past `McpProxy.MaxCallsPerGrant` (100) per grant; every relayed answer (CodeGraph's and Kanban's) is its text
   cut at `McpProxy.MaxAnswerChars` (60,000 chars and UTF-8 bytes) with a `[cut: …]` marker, a CodeGraph answer first labelled
-  with the commit it describes exactly as the reviewers' are ("CodeGraph's index of <project>'s default branch as of <sha>, not
-  the PR head", or "commit unknown"; `ReviewTools.DefaultBranchLabel`, E3), which the CodeGraph tools' descriptions and the triage
-  prompt say. One allowlist per
+  with the commit it describes as the reviewers' are ("CodeGraph's index of <project>'s default branch as of <sha>", or "…, commit
+  unknown"; a review adds ", not the PR head <head>", a proxy session has no PR head; `ReviewTools.DefaultBranchLabel`, E3), which
+  the CodeGraph tools' descriptions and the triage prompt say. One allowlist per
   upstream: CodeGraph's is `ReviewTools.CodeGraphTools` (7 model-free tools), Kanban's `McpServers.KanbanTools` (ListProjects,
   GetBoard, ListEpics, GetEpic, ListEpicDocuments, GetEpicDocument, ListWorkItems, ListEpicWorkItems, GetIssues, GetWorkItem,
   SearchWorkItems — the last two arrive with KanbanBoard sc-25711; an upstream without them just does not list them; no
@@ -668,7 +668,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   a typed not-indexed answer (`structuredContent.notIndexed`, which names the head yet carries no data) makes that call fall
   back to the default-branch call, labelled and recorded (`tools[].fallback`). Not ready, the calls go without `sha` and are
   labelled "…'s default branch as of <sha>, not the PR head" (`ReviewTools.DefaultBranchLabel`, which the loopback proxy prepends
-  to every CodeGraph answer it relays too, without a head: both seams name the commit the same way). `request_overlay`/`get_overlay_status`
+  to every CodeGraph answer it relays too, without a head and so without "not the PR head": both seams name the commit the same way). `request_overlay`/`get_overlay_status`
   (`CodeGraphMcpClient.OverlayTools`) are sent straight through the MCP client and are on no allowlist, profile or tool list (a
   test asserts it). Triage is unchanged (no `sha`). Overlay node ids are negative, so `read_node_source` takes any integer id. Kanban tools (sc-25707, only with `Kanban:Token`): each session lists the Kanban upstream once
   (`ReviewTools.DefinitionsAsync`) and is offered, after `ReviewTools.Names`, its tools on `McpServers.KanbanTools` with their own

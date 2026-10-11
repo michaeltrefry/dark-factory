@@ -64,9 +64,10 @@ public static class OutboundHttp
 
     /// <summary>
     /// A client for one endpoint of the factory's own loopback MCP proxy (<c>McpProxy.Endpoint</c>; the live acceptance tests' MCP
-    /// client of it, sc-25710): a loopback address only, anything else refused.
+    /// client of it, sc-25710): a loopback address only, anything else refused; it does not follow redirects (a redirect could lead
+    /// off loopback).
     /// </summary>
     public static HttpClient LoopbackMcp(Uri endpoint) => endpoint.IsLoopback
-        ? new() { BaseAddress = endpoint, Timeout = CodeGraphTimeout }
+        ? new(new HttpClientHandler { AllowAutoRedirect = false }) { BaseAddress = endpoint, Timeout = CodeGraphTimeout }
         : throw new ArgumentException($"'{endpoint}' is not a loopback address: only the factory's own MCP proxy is reached this way.", nameof(endpoint));
 }
