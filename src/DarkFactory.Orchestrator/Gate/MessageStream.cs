@@ -31,11 +31,18 @@ public sealed record AnswerBlock(string Type, string? Text, string? Id = null, s
 /// block followed by a newline), the stop reason from <c>message_delta</c>. The router cancels a call that has sent its client
 /// nothing for 10 s, so the panel's calls stream (sc-25391). A <c>tool_use</c> block (its <c>input_json_delta</c> parts joined) is
 /// kept in <see cref="StreamedAnswer.Blocks"/> for the reviewer's tool loop (sc-25705). Fails closed: an <c>error</c> event throws (usage-limited when it
-/// is a usage refusal), and a stream that ends without <c>message_stop</c> or stalls longer than the idle gap throws rather
+/// is a usage refusal; <see cref="RouterTransientStreamException"/> when its type is in <see cref="TransientErrorTypes"/>), and a stream that ends without <c>message_stop</c> or stalls longer than the idle gap throws rather
 /// than count a partial answer.
 /// </summary>
 public static class MessageStream
 {
+    /// <summary>
+    /// The <c>error</c> event types that are an upstream's transient failure (seen live: OpenAI's <c>server_error</c> on the high
+    /// class), which the reviewer sends again (<see cref="RouterReviewer.MaxTransientRetries"/>). <c>overloaded_error</c> is not here:
+    /// it is a usage refusal (<see cref="RouterReviewer.UsageLimited"/>) and pauses the factory.
+    /// </summary>
+    public static readonly IReadOnlyList<string> TransientErrorTypes = ["server_error", "api_error"];
+
     public static async Task<StreamedAnswer> ReadAsync(Stream body, TimeSpan idleTimeout, CancellationToken ct)
     {
         using var reader = new StreamReader(body, Encoding.UTF8);
@@ -171,6 +178,10 @@ public static class MessageStream
                     if (RouterReviewer.UsageLimited(0, payload))
                     {
                         throw new RouterUsageLimitedException(why);
+                    }
+                    if (root.TryGetProperty("error", out var error) && Str(error, "type") is { } errorType && TransientErrorTypes.Contains(errorType))
+                    {
+                        throw new RouterTransientStreamException(why);
                     }
                     throw new InvalidOperationException(why);
                 default:

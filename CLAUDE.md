@@ -273,10 +273,11 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   with the commit it describes as the reviewers' are ("CodeGraph's index of <project>'s default branch as of <sha>", or "…, commit
   unknown"; a review adds ", not the PR head <head>", a proxy session has no PR head; `ReviewTools.DefaultBranchLabel`, E3), which
   the CodeGraph tools' descriptions and the triage prompt say. One allowlist per
-  upstream: CodeGraph's is `ReviewTools.CodeGraphTools` (7 model-free tools), Kanban's `McpServers.KanbanTools` (ListProjects,
-  GetBoard, ListEpics, GetEpic, ListEpicDocuments, GetEpicDocument, ListWorkItems, ListEpicWorkItems, GetIssues, GetWorkItem,
-  SearchWorkItems — the last two arrive with KanbanBoard sc-25711; an upstream without them just does not list them; no
-  Create*/Update*/Delete*/Move*/Add*Comment tool is ever offered or forwarded). CodeGraph is repo-scoped like the reviewers'
+  upstream: CodeGraph's is `ReviewTools.CodeGraphTools` (7 model-free tools), Kanban's `McpServers.KanbanTools` (the hosted
+  server's exact snake_case names, read from its `tools/list` on 2026-10-12, sc-25710: list_projects, get_board, list_epics,
+  get_epic, list_epic_documents, get_epic_document, list_work_items, list_epic_work_items, get_issues, get_work_item,
+  search_work_items; names match exactly, so a PascalCase spelling is never offered; no create_*/update_*/delete_*/move_*/
+  add_*_comment tool is ever offered or forwarded). CodeGraph is repo-scoped like the reviewers'
   tools: the grant's repository's project (exact repo URL match, resolved once per grant), a call naming another `project`
   refused (-32602), the arguments rebuilt by `ReviewTools.CodeGraphArguments` (unknown ones dropped) with the project set,
   `read_node_source` shown only for a node of that project, schemas listed without a project argument. Kanban has no repository
@@ -610,7 +611,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   picks the model inside the class, and any model may review or confirm — including the one that wrote the code, or the
   one that served the review a second opinion checks (there is no family, version or independence rule). Each role makes one
   router call (`RouterReviewer`: `POST /v1/messages` with `"stream": true` — the router cancels a call that has sent its
-  client nothing for 10 s — assembled by `MessageStream`, which fails closed on an `error` event, a stream without
+  client nothing for 10 s — assembled by `MessageStream`, which fails closed on an `error` event (a transient `server_error`/`api_error` one after the turn is retried, below), a stream without
   `message_stop` or one silent for 2 min; router key only, `x-weave-model-class: high` and never `x-weave-force-model` (the
   router refuses the two together), body `model` the fixed placeholder `ModelClass.RequestModel` (`default`: no catalog model
   has it, so no passthrough lane serves it verbatim; the router's in-class pick serves the call — the factory's router key
@@ -685,7 +686,11 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `ReviewTools.Budget` characters (`MaxSessionChars` 200,000 less the prompt, at least `MinSessionBudget` 8,000), and each result at
   most `MaxResultBytes` (60,000) UTF-8 bytes, cut on a character boundary with an explicit `[cut: N bytes, the first M bytes shown]`
   marker; a call once the budget is spent answers an error. Every turn must be served on `high` (the first that is not ends the
-  session, unusable), a usage refusal on any turn pauses as below, and a router 400/413 on a later turn (a conversation grown too
+  session, unusable), a usage refusal on any turn pauses as below, a turn whose stream ends in an upstream `error` event of type
+  `server_error` or `api_error` (`MessageStream.TransientErrorTypes`; seen live from OpenAI on the high class; not a usage refusal —
+  `overloaded_error` stays one) is sent again — the same request, session id and class header — at most
+  `RouterReviewer.MaxTransientRetries` (2) times after a short backoff (2 s, then 4 s), each failed attempt's error recorded on that
+  turn (`turns[].retried`), and fails closed as any broken stream when every attempt fails (sc-25710), and a router 400/413 on a later turn (a conversation grown too
   long) makes the answer unusable rather than failing the run. A tool that cannot answer (no such file, a binary file, a
   repository CodeGraph does not index, CodeGraph unreachable or unconfigured) gives the model an error result; it never fails
   the review by itself. Each call is recorded in the verdict's review or, for a second opinion, on the finding's confirmation
@@ -695,7 +700,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   reads) and the reports (PR body, closeout, escalation; `LedgerReport`) show per review its calls, how many answered an error and
   up to `LedgerReport.MaxFailingToolsShown` (3) distinct failing tool names (inert code spans), and the same for its second
   opinions (E4/E8). The prompts make reading code a rule: no claim about code outside the diff without reading it
-  (a finding about unread code is not allowed), and a second opinion on a finding that depends on unshown code reads it, then
+  (a finding about unread code is not allowed); the correctness prompt also requires, before a pass, one CodeGraph
+  `analyze_impact`/`trace_call_path`/`find_consumers` query for each changed non-private symbol (at most the 5 most significant),
+  naming the callers found, or saying CodeGraph answered an error or not indexed and going on (sc-25710); and a second opinion on a finding that depends on unshown code reads it, then
   confirms or rejects. Prompts: `factory/prompts/{correctness,spec-conformance,security,confirm}.md` in this repo, compiled in as
   embedded resources (`ReviewPrompts`) — never read from the target repo or the PR (which could rewrite the prompt it is
   judged by) nor from disk at run time; changing one is a dark-factory PR. Each role answers findings tagged `blocking` or

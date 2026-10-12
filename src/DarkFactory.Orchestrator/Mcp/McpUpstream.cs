@@ -68,13 +68,14 @@ public static class McpServers
     public const string Kanban = "kanban";
 
     /// <summary>
-    /// KanbanBoard's read tools (it runs no models). Its write tools (Create*, Update*, Delete*, Move*, Add*Comment) are never offered or
-    /// forwarded. <c>GetWorkItem</c> and <c>SearchWorkItems</c> come with KanbanBoard sc-25711; an upstream without them does not list them.
+    /// KanbanBoard's read tools (it runs no models), by the exact snake_case names the hosted server lists (read from its
+    /// <c>tools/list</c> on 2026-10-12, sc-25710; matched exactly, so a PascalCase spelling is not offered). Its write tools (create_*,
+    /// update_*, delete_*, move_*, add_*_comment) are never offered or forwarded.
     /// </summary>
     public static readonly IReadOnlyList<string> KanbanTools =
     [
-        "ListProjects", "GetBoard", "ListEpics", "GetEpic", "ListEpicDocuments", "GetEpicDocument", "ListWorkItems",
-        "ListEpicWorkItems", "GetIssues", "GetWorkItem", "SearchWorkItems",
+        "list_projects", "get_board", "list_epics", "get_epic", "list_epic_documents", "get_epic_document", "list_work_items",
+        "list_epic_work_items", "get_issues", "get_work_item", "search_work_items",
     ];
 
     /// <summary>Claude Code's name for an MCP tool: <c>mcp__&lt;server&gt;__&lt;tool&gt;</c>.</summary>

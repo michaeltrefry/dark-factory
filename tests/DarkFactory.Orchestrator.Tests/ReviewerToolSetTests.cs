@@ -287,6 +287,31 @@ public class ReviewerToolSetTests
         Assert.Null(ReviewTools.NodeProject($"# Count — {Project}\n"));
     }
 
+    [Fact]
+    public async Task A_transient_error_on_the_turn_after_a_tool_call_resends_that_turn_without_running_the_tool_again()
+    {
+        // Turn 1 asks for a tool; turn 2's first attempt breaks with a transient upstream error; its retry answers.
+        var n = 0;
+        var broken = SseAnswers.MessageStart("claude-opus-5-5") + SseAnswers.TextBlockStart(0) + SseAnswers.TextDelta(0, "Partial")
+            + SseAnswers.Error("server_error", "The server had an error while processing your request.");
+        var turns = new[] { SseAnswers.ToolTurn(("toolu_1", "analyze_impact", "{\"name\": \"X.Count\"}")), broken, SseAnswers.Answer(CleanFindings) };
+        var router = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(turns[Math.Min(n++, turns.Length - 1)]));
+        var codeGraph = CodeGraphServer(_ => Text($"Commit: {IndexCommit}\n# impact"));
+        var reviewer = new RouterReviewer(router.Client("http://router.test/"), "rk", tools: new ReviewTools(null, Client(codeGraph)),
+            transientRetryDelay: TimeSpan.Zero);
+
+        var review = await reviewer.ReviewAsync(Request(), CancellationToken.None);
+
+        Assert.True(review.Clean, review.Error);
+        Assert.Equal(3, router.Requests.Count);
+        Assert.Equal(router.Requests[1].Body, router.Requests[2].Body); // the failed turn is sent again as it was
+        Assert.Equal("analyze_impact", Assert.Single(review.Tools!).Tool);
+        Assert.Single(ToolCalls(codeGraph), c => c.Tool == "analyze_impact");
+        Assert.Equal([1, 2], review.Turns!.Select(t => t.Turn));
+        Assert.Null(review.Turns![0].Retried);
+        Assert.Contains("server_error", Assert.Single(review.Turns![1].Retried!));
+    }
+
     // ---- repository tools ----
 
     [Fact]
@@ -446,6 +471,14 @@ public class ReviewerToolSetTests
         }
         var confirm = System.Text.RegularExpressions.Regex.Replace(ReviewPrompts.Confirm.Text, @"\s+", " ");
         Assert.DoesNotContain("depends on code that is not shown", confirm);
+        // The correctness reviewer must ask CodeGraph about the changed symbols before a pass (sc-25710), and go on without it.
+        var correctness = System.Text.RegularExpressions.Regex.Replace(ReviewPrompts.For(ReviewRoles.Correctness).Text, @"\s+", " ");
+        Assert.Contains("CodeGraph is required, not optional", correctness);
+        Assert.Contains("at most the 5 most significant", correctness);
+        Assert.Contains("one analyze_impact or trace_call_path query each for a code symbol", correctness);
+        Assert.Contains("find_consumers answers only for message or event types: use it, not those, for such a type", correctness);
+        Assert.Contains("name for each symbol the callers or dependents CodeGraph found", correctness);
+        Assert.Contains("If CodeGraph answers an error or says the project is not indexed, say so", correctness);
         Assert.Contains("read that code, then confirm or reject the finding", confirm);
         Assert.Contains("read the file the finding names", confirm);
         Assert.Contains("""{"confirmed": true or false, "reason": "<the code that shows it, or why it does not reproduce>"}""", confirm);
@@ -489,8 +522,8 @@ public class ReviewerToolSetTests
 
     /// <summary>KanbanBoard's tools as its server lists them: its read tools and its write tools.</summary>
     private static readonly string[] KanbanListed =
-        ["ListProjects", "GetBoard", "ListEpics", "GetEpic", "ListEpicDocuments", "GetEpicDocument", "ListWorkItems", "ListEpicWorkItems",
-            "GetIssues", "CreateWorkItem", "UpdateWorkItem", "DeleteWorkItem", "MoveWorkItem", "AddWorkItemComment"];
+        ["list_projects", "get_board", "list_epics", "get_epic", "list_epic_documents", "get_epic_document", "list_work_items", "list_epic_work_items",
+            "get_issues", "create_work_item", "update_work_item", "delete_work_item", "move_work_item", "add_work_item_comment"];
 
     private static (FakeMcpServer Server, Mcp.McpUpstream Upstream) Kanban()
     {
@@ -504,29 +537,48 @@ public class ReviewerToolSetTests
     {
         var (kanban, upstream) = Kanban();
         var router = Router(
-            SseAnswers.ToolTurn(("toolu_1", "GetBoard", "{\"projectId\": 3}"), ("toolu_2", "CreateWorkItem", "{\"title\": \"x\"}")),
+            SseAnswers.ToolTurn(("toolu_1", "get_board", "{\"projectId\": 3}"), ("toolu_2", "create_work_item", "{\"title\": \"x\"}")),
             SseAnswers.Answer(CleanFindings));
         var reviewer = new RouterReviewer(router.Client("http://router.test/"), "rk", tools: new ReviewTools(null, null, upstream));
 
         var review = await reviewer.ReviewAsync(Request(), CancellationToken.None);
 
         Assert.True(review.Clean, review.Error);
-        string[] reads = ["ListProjects", "GetBoard", "ListEpics", "GetEpic", "ListEpicDocuments", "GetEpicDocument", "ListWorkItems",
-            "ListEpicWorkItems", "GetIssues"];
+        string[] reads = ["list_projects", "get_board", "list_epics", "get_epic", "list_epic_documents", "get_epic_document", "list_work_items",
+            "list_epic_work_items", "get_issues"];
         Assert.All(router.Requests, r =>
             Assert.Equal([.. ReviewTools.Names, .. reads], Body(r).GetProperty("tools").EnumerateArray().Select(t => t.GetProperty("name").GetString())));
         // Each Kanban tool comes with the upstream's own input schema.
         Assert.Equal("object", Body(router.Requests[0]).GetProperty("tools").EnumerateArray()
-            .Single(t => t.GetProperty("name").GetString() == "GetBoard").GetProperty("input_schema").GetProperty("type").GetString());
+            .Single(t => t.GetProperty("name").GetString() == "get_board").GetProperty("input_schema").GetProperty("type").GetString());
         Assert.Contains("Kanban", Body(router.Requests[0]).GetProperty("messages")[0].GetProperty("content").GetString());
         // The read went to Kanban as asked (not repository-scoped); the write was answered an error and never forwarded.
         var (tool, arguments) = Assert.Single(kanban.Calls);
-        Assert.Equal(("GetBoard", "{\"projectId\":3}"), (tool, arguments.ToJsonString()));
+        Assert.Equal(("get_board", "{\"projectId\":3}"), (tool, arguments.ToJsonString()));
         Assert.All(kanban.Api.Requests, r => Assert.Equal("Bearer kb_test_token", r.Headers["Authorization"]));
         var results = Results(router, 1);
-        Assert.Equal(("Kanban's GetBoard:\nboard GetBoard {\"projectId\":3}", false), results[0]);
+        Assert.Equal(("Kanban's get_board:\nboard get_board {\"projectId\":3}", false), results[0]);
         Assert.True(results[1].Error);
-        Assert.Equal([("GetBoard", false), ("CreateWorkItem", true)], review.Tools!.Select(c => (c.Tool, c.Error)));
+        Assert.Equal([("get_board", false), ("create_work_item", true)], review.Tools!.Select(c => (c.Tool, c.Error)));
+    }
+
+    [Fact]
+    public async Task A_kanban_tool_listed_under_a_pascal_case_name_is_not_offered_or_forwarded()
+    {
+        // The hosted KanbanBoard lists snake_case names (sc-25710); the allowlist matches them exactly, never a respelling.
+        var server = new FakeMcpServer("/mcp", ["GetBoard", "ListProjects", "get_board"], (tool, args) => FakeMcpServer.Text($"board {tool}"));
+        var upstream = new Mcp.McpUpstream(Mcp.McpServers.Kanban,
+            new Mcp.McpHttpClient(server.Client("https://kanban.test/mcp"), "kb_test_token", "Kanban", ""), Mcp.McpServers.KanbanTools, repoScoped: false);
+        var router = Router(SseAnswers.ToolTurn(("toolu_1", "GetBoard", "{}")), SseAnswers.Answer(CleanFindings));
+        var reviewer = new RouterReviewer(router.Client("http://router.test/"), "rk", tools: new ReviewTools(null, null, upstream));
+
+        var review = await reviewer.ReviewAsync(Request(), CancellationToken.None);
+
+        Assert.True(review.Clean, review.Error);
+        Assert.All(router.Requests, r =>
+            Assert.Equal([.. ReviewTools.Names, "get_board"], Body(r).GetProperty("tools").EnumerateArray().Select(t => t.GetProperty("name").GetString())));
+        Assert.True(Assert.Single(review.Tools!).Error);
+        Assert.Empty(server.Calls);
     }
 
     [Fact]
@@ -535,14 +587,14 @@ public class ReviewerToolSetTests
         var huge = new JsonObject { ["type"] = "object", ["description"] = new string('d', ReviewTools.MaxKanbanSchemaChars) };
         var server = new FakeMcpServer("/mcp", KanbanListed, (tool, args) => FakeMcpServer.Text($"board {tool}"), tool => tool switch
         {
-            "ListEpics" => new JsonObject { ["type"] = "array" },
-            "GetEpic" => new JsonObject { ["properties"] = new JsonObject() },
-            "ListProjects" => huge,
+            "list_epics" => new JsonObject { ["type"] = "array" },
+            "get_epic" => new JsonObject { ["properties"] = new JsonObject() },
+            "list_projects" => huge,
             _ => null,
         });
         var upstream = new Mcp.McpUpstream(Mcp.McpServers.Kanban,
             new Mcp.McpHttpClient(server.Client("https://kanban.test/mcp"), "kb_test_token", "Kanban", ""), Mcp.McpServers.KanbanTools, repoScoped: false);
-        var router = Router(SseAnswers.ToolTurn(("toolu_1", "ListEpics", "{}")), SseAnswers.Answer(CleanFindings), SseAnswers.Answer(CleanFindings));
+        var router = Router(SseAnswers.ToolTurn(("toolu_1", "list_epics", "{}")), SseAnswers.Answer(CleanFindings), SseAnswers.Answer(CleanFindings));
         var log = new StringWriter();
         var reviewer = new RouterReviewer(router.Client("http://router.test/"), "rk", tools: new ReviewTools(null, null, upstream, log));
 
@@ -550,7 +602,7 @@ public class ReviewerToolSetTests
         Assert.True((await reviewer.ReviewAsync(Request(), CancellationToken.None)).Clean); // a second review: each skip logged once
 
         Assert.True(review.Clean, review.Error);
-        string[] usable = ["GetBoard", "ListEpicDocuments", "GetEpicDocument", "ListWorkItems", "ListEpicWorkItems", "GetIssues"];
+        string[] usable = ["get_board", "list_epic_documents", "get_epic_document", "list_work_items", "list_epic_work_items", "get_issues"];
         Assert.All(router.Requests, r =>
             Assert.Equal([.. ReviewTools.Names, .. usable], Body(r).GetProperty("tools").EnumerateArray().Select(t => t.GetProperty("name").GetString())));
         // A left-out tool is not forwarded either.
@@ -564,7 +616,7 @@ public class ReviewerToolSetTests
     [Fact]
     public async Task Without_kanban_no_kanban_tool_is_offered_or_forwarded()
     {
-        var router = Router(SseAnswers.ToolTurn(("toolu_1", "GetBoard", "{\"projectId\": 3}")), SseAnswers.Answer(CleanFindings));
+        var router = Router(SseAnswers.ToolTurn(("toolu_1", "get_board", "{\"projectId\": 3}")), SseAnswers.Answer(CleanFindings));
         var review = await Reviewer(router).ReviewAsync(Request(), CancellationToken.None);
 
         Assert.True(review.Clean, review.Error);
