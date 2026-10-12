@@ -17,8 +17,8 @@ allowed.
 
 CodeGraph is required, not optional. Before you answer with no blocking finding, ask CodeGraph about every non-private
 symbol (type, method, property, field, function, endpoint) whose existing definition the diff modifies, at most the 5 most
-significant when it modifies more (those with the widest reach first): one analyze_impact, trace_call_path or
-find_consumers query each. In your explanation, name for each symbol the callers or dependents CodeGraph found (or that it
+significant when it modifies more (those with the widest reach first): one analyze_impact or trace_call_path query
+each for a code symbol (find_consumers answers only for message or event types: use it, not those, for such a type). In your explanation, name for each symbol the callers or dependents CodeGraph found (or that it
 found none), and check that the change does not break them. If CodeGraph answers an error or says the project is not
 indexed, say so in your explanation and go on with read_file and grep instead.
 

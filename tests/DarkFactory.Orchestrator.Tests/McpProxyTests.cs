@@ -615,8 +615,8 @@ public class McpProxyTests
         Assert.True(codeGraph.Upstream.RepoScoped);
         Assert.Equal(["list_projects", "get_board", "list_epics", "get_epic", "list_epic_documents", "get_epic_document", "list_work_items",
             "list_epic_work_items", "get_issues", "get_work_item", "search_work_items"], McpServers.KanbanTools);
-        Assert.DoesNotContain(McpServers.KanbanTools, t => t.StartsWith("Create") || t.StartsWith("Update") || t.StartsWith("Delete")
-            || t.StartsWith("Move") || t.EndsWith("Comment"));
+        Assert.DoesNotContain(McpServers.KanbanTools, t => t.StartsWith("create_") || t.StartsWith("update_") || t.StartsWith("delete_")
+            || t.StartsWith("move_") || (t.StartsWith("add_") && t.EndsWith("_comment")));
         Assert.Equal(ReviewTools.CodeGraphTools.Count + McpServers.KanbanTools.Count, McpServers.AllToolRules.Count);
     }
 

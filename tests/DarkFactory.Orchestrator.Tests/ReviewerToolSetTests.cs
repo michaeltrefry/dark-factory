@@ -287,6 +287,31 @@ public class ReviewerToolSetTests
         Assert.Null(ReviewTools.NodeProject($"# Count — {Project}\n"));
     }
 
+    [Fact]
+    public async Task A_transient_error_on_the_turn_after_a_tool_call_resends_that_turn_without_running_the_tool_again()
+    {
+        // Turn 1 asks for a tool; turn 2's first attempt breaks with a transient upstream error; its retry answers.
+        var n = 0;
+        var broken = SseAnswers.MessageStart("claude-opus-5-5") + SseAnswers.TextBlockStart(0) + SseAnswers.TextDelta(0, "Partial")
+            + SseAnswers.Error("server_error", "The server had an error while processing your request.");
+        var turns = new[] { SseAnswers.ToolTurn(("toolu_1", "analyze_impact", "{\"name\": \"X.Count\"}")), broken, SseAnswers.Answer(CleanFindings) };
+        var router = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(turns[Math.Min(n++, turns.Length - 1)]));
+        var codeGraph = CodeGraphServer(_ => Text($"Commit: {IndexCommit}\n# impact"));
+        var reviewer = new RouterReviewer(router.Client("http://router.test/"), "rk", tools: new ReviewTools(null, Client(codeGraph)),
+            transientRetryDelay: TimeSpan.Zero);
+
+        var review = await reviewer.ReviewAsync(Request(), CancellationToken.None);
+
+        Assert.True(review.Clean, review.Error);
+        Assert.Equal(3, router.Requests.Count);
+        Assert.Equal(router.Requests[1].Body, router.Requests[2].Body); // the failed turn is sent again as it was
+        Assert.Equal("analyze_impact", Assert.Single(review.Tools!).Tool);
+        Assert.Single(ToolCalls(codeGraph), c => c.Tool == "analyze_impact");
+        Assert.Equal([1, 2], review.Turns!.Select(t => t.Turn));
+        Assert.Null(review.Turns![0].Retried);
+        Assert.Contains("server_error", Assert.Single(review.Turns![1].Retried!));
+    }
+
     // ---- repository tools ----
 
     [Fact]
@@ -450,7 +475,8 @@ public class ReviewerToolSetTests
         var correctness = System.Text.RegularExpressions.Regex.Replace(ReviewPrompts.For(ReviewRoles.Correctness).Text, @"\s+", " ");
         Assert.Contains("CodeGraph is required, not optional", correctness);
         Assert.Contains("at most the 5 most significant", correctness);
-        Assert.Contains("one analyze_impact, trace_call_path or find_consumers query each", correctness);
+        Assert.Contains("one analyze_impact or trace_call_path query each for a code symbol", correctness);
+        Assert.Contains("find_consumers answers only for message or event types: use it, not those, for such a type", correctness);
         Assert.Contains("name for each symbol the callers or dependents CodeGraph found", correctness);
         Assert.Contains("If CodeGraph answers an error or says the project is not indexed, say so", correctness);
         Assert.Contains("read that code, then confirm or reject the finding", confirm);

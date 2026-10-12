@@ -616,6 +616,22 @@ public class RouterReviewerTests
     }
 
     [Fact]
+    public async Task A_retry_backoff_longer_than_the_review_deadline_ends_in_the_timeout_error()
+    {
+        var api = FlakyRouter("server_error", failures: int.MaxValue);
+        using var http = api.Client("http://router.test/");
+        http.Timeout = TimeSpan.FromMilliseconds(300);
+        var started = System.Diagnostics.Stopwatch.StartNew();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new RouterReviewer(http, "rk", transientRetryDelay: TimeSpan.FromSeconds(30)).ReviewAsync(Request, CancellationToken.None));
+
+        Assert.Contains("did not finish within", ex.Message);
+        Assert.Single(api.Requests); // the backoff is cut by the deadline: no second attempt
+        Assert.True(started.Elapsed < TimeSpan.FromSeconds(10), $"{started.Elapsed}");
+    }
+
+    [Fact]
     public async Task A_usage_error_mid_stream_is_not_retried_and_still_pauses()
     {
         var api = FlakyRouter("overloaded_error", failures: 1);
