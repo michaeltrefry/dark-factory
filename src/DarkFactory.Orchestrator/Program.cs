@@ -45,6 +45,10 @@ static async Task<int> WorkAsync(CancellationToken ct)
         _ = (options.ShortcutApiToken, options.RouterKey, options.GitHubAppId, options.GitHubAppPrivateKeyPem, options.DashboardPasswordHash);
         _ = (options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem);
         options.RejectReviewModelSettings();
+        if (FactoryRunner.CodeGraphTokenWarning(options) is { } codeGraphWarning)
+        {
+            Console.Error.WriteLine(codeGraphWarning);
+        }
         _ = DashboardBinding.Addresses(options.DashboardBindAddress);
         if (options.WatchScope.IsEmpty)
         {

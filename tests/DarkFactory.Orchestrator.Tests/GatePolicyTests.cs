@@ -35,7 +35,7 @@ public class GatePolicyTests
             { "- a\n- b\n", "one YAML mapping" },
             { "version: [1\n", "not valid YAML" },
             { "version: 1\nrequire:\n  ci: green\n  review: pass\n", "version 1, which this gate no longer accepts" },
-            { Replace("version: 2", "version: 3"), "version must be 2" },
+            { Replace("version: 2", "version: 4"), "version must be 2 or 3" },
             { Without("version: 2"), "the top level is missing 'version'" },
             { ok + "\nbypass: true\n", "unknown key 'bypass' in the top level" },
             { ok[..ok.IndexOf("risk:", StringComparison.Ordinal)], "the top level is missing 'risk'" },
@@ -323,9 +323,9 @@ public class MergeGateTierTests
         "1 new test(s) fail on the base and pass on the head: W.Tests.New", "dotnet-xunit", "ran", "ran", []);
 
     private static GateDecision Evaluate(string diff, int fixRounds = 0, CiFacts? ci = null, ReviewVerdict? verdict = null, string? policy = null,
-        NewTestsResult? tests = null, bool testsRun = true) =>
+        NewTestsResult? tests = null, bool testsRun = true, CodeGraphRisk? risk = null) =>
         MergeGate.Evaluate(policy ?? Policy, null, TestPolicies.Counting(Pull, new ChangeFacts(diff, null, 0)), new ChangeFacts(diff, null, fixRounds), ci ?? Green, verdict is null ? [Full] : [verdict],
-            testsRun ? tests ?? PassingTests : null);
+            testsRun ? tests ?? PassingTests : null, risk ?? TestRisk.None(Head, diff));
 
     /// <summary>
     /// One row per tier of the standard policy: a path in it, whether each check is enforced for it, and whether a change
@@ -475,6 +475,6 @@ public class MergeGateTierTests
         Assert.Equal(GateOutcome.Merge, decision.Outcome);
         Assert.Contains("paths: free 1, normal 1; checks: ci-green, review-pass, risk-threshold, new-tests-fail-on-base", decision.Detail);
         Assert.Contains("1 new test(s) fail on the base and pass on the head: W.Tests.New", decision.Detail);
-        Assert.Contains("risk within threshold (3 changed lines, 2 files, 1 fix rounds)", decision.Detail);
+        Assert.Contains("risk within threshold (3 changed lines, 2 files, 1 fix rounds, worst blast radius none (docs/a.md), highest hotspot score 0 (docs/a.md), max_hotspot off)", decision.Detail);
     }
 }

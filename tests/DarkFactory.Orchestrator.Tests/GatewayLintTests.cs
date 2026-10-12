@@ -231,6 +231,16 @@ public sealed class GatewayLintTests
     public async Task The_gateways_service_hosts_outside_it_fail_the_lint()
     {
         Assert.Equal("DF0004", Assert.Single(await Lint(Outside, Wrap("""return "https://api.app.shortcut.com/api/v3/";"""))).Id);
+        // sc-25705: the hosted CodeGraph is the gateway's too (OutboundHttp.CodeGraphApi), in any case.
+        var codeGraph = Assert.Single(await Lint(Outside, Wrap("""return "https://CodeGraph-API.trefry" + ".net/mcp";""")));
+        Assert.Equal("DF0004", codeGraph.Id);
+        Assert.Contains("codegraph-api.trefry.net", codeGraph.GetMessage());
+        Assert.Empty(await Lint(Inside, Wrap("""return "https://codegraph-api.trefry.net/";""")));
+        // sc-25707: so is the hosted KanbanBoard's MCP endpoint (OutboundHttp.KanbanApi).
+        var kanban = Assert.Single(await Lint(Outside, Wrap("""return "https://Kanban-MCP.trefry" + ".net/mcp";""")));
+        Assert.Equal("DF0004", kanban.Id);
+        Assert.Contains("kanban-mcp.trefry.net", kanban.GetMessage());
+        Assert.Empty(await Lint(Inside, Wrap("""return "https://kanban-mcp.trefry.net/mcp";""")));
         // Links to github.com pages (not the API) are not outbound calls.
         Assert.Empty(await Lint(Outside, Wrap("""return $"https://github.com/{branch}/pull/1";""")));
     }
@@ -848,5 +858,40 @@ public sealed class GatewayLintTests
         Assert.Equal("", env["GIT_CONFIG_VALUE_1"]);
         Assert.Equal(new Uri("https://api.github.com/"), OutboundHttp.GitHubApi().BaseAddress);
         Assert.Equal(TimeSpan.FromSeconds(7), OutboundHttp.RouterApi(new Uri("http://localhost:8080/"), TimeSpan.FromSeconds(7)).Timeout);
+    }
+
+    /// <summary>The live tests' loopback MCP client does not follow a redirect (one could lead off loopback; sc-25710).</summary>
+    [Fact]
+    public async Task The_loopback_mcp_client_does_not_follow_a_redirect()
+    {
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        using var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+        var requests = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var server = Task.Run(async () =>
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                using var client = await listener.AcceptTcpClientAsync(stop.Token);
+                await using var stream = client.GetStream();
+                var buffer = new byte[8192];
+                var read = await stream.ReadAsync(buffer, stop.Token);
+                var line = System.Text.Encoding.ASCII.GetString(buffer, 0, read).Split("\r\n")[0];
+                requests.Enqueue(line);
+                var response = line.Contains("/elsewhere", StringComparison.Ordinal)
+                    ? "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    : $"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                await stream.WriteAsync(System.Text.Encoding.ASCII.GetBytes(response), stop.Token);
+            }
+        }, stop.Token);
+
+        using var http = OutboundHttp.LoopbackMcp(new Uri($"http://127.0.0.1:{port}/mcp/codegraph"));
+        using var answer = await http.GetAsync("", TestContext.Current.CancellationToken);
+
+        Assert.Equal(System.Net.HttpStatusCode.Found, answer.StatusCode);
+        Assert.Equal(["GET /mcp/codegraph HTTP/1.1"], requests.ToArray());
+        await stop.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => server);
     }
 }

@@ -111,7 +111,8 @@ public static class StepOutcomes
         },
         RunPipeline.Steps.CiFailure or RunPipeline.Steps.MergeConflict or RunPipeline.Steps.Stuck or RunPipeline.Steps.StuckRetry
             or RunPipeline.Steps.WorktreeLost or RunPipeline.Steps.ControlsUnreadable or Issues.IssueSteps.Refused => StepOutcome.Failed,
-        RunPipeline.Steps.EscalationComment => detail == "posted" ? StepOutcome.Passed : StepOutcome.Failed,
+        RunPipeline.Steps.CodeGraphOverlay => Gate.CodeGraphOverlay.FromDetail(detail) is { IsReady: true } ? StepOutcome.Passed : StepOutcome.Failed,
+        RunPipeline.Steps.EscalationComment =>detail == "posted" ? StepOutcome.Passed : StepOutcome.Failed,
         Issues.IssueSteps.RoutedToHuman => StepOutcome.Escalated,
         RunPipeline.Steps.PrReport or RunPipeline.Steps.Closeout =>
             detail?.StartsWith("failed", StringComparison.Ordinal) == true ? StepOutcome.Failed : StepOutcome.Passed,

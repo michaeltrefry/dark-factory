@@ -20,6 +20,12 @@ public static class LedgerReport
 
     private const int MaxFragment = 400;
 
+    /// <summary>How many failing tools' names a review's (or its second opinions') tool use names; the rest are counted.</summary>
+    public const int MaxFailingToolsShown = 3;
+
+    /// <summary>The most characters of one failing tool's name a report shows.</summary>
+    private const int MaxToolName = 60;
+
     /// <summary>
     /// The PR's description: the item it implements (and, for an issue, GitHub's closing keyword), then the ledger's facts. Rendered when the
     /// PR is opened and again as the item moves on (at merge).
@@ -187,9 +193,25 @@ public static class LedgerReport
         text.Append(CultureInfo.InvariantCulture, $"- {Outcome(row)} {Code(verdict.Verdict)} on {Code(Ci.Short(verdict.HeadSha))} by ");
         text.Append(string.Join(", ", verdict.Reviews.Select(r =>
             $"{r.Role} ({Code(r.ServedName)}{(r.CarriedFrom is { } from ? $", carried from {Code(Ci.Short(from))}" : "")}"
+            + $"{(r.Tools is { Count: > 0 } tools ? $", {ToolUse(tools)}" : "")}"
+            + $"{(r.Findings.SelectMany(f => f.Confirmation?.Tools ?? []).ToList() is { Count: > 0 } confirms ? $"; second opinions: {ToolUse(confirms)}" : "")}"
             + $"{(r.Error is null ? "" : ", unusable answer")})")));
         text.Append(CultureInfo.InvariantCulture,
-            $"; {blocking.Count} blocking, {findings.Count - blocking.Count} optional ({findings.Count(f => f.Finding.Downgraded)} downgraded by the second opinion)\n");
+            $"; {blocking.Count} blocking, {findings.Count - blocking.Count} optional ({findings.Count(f => f.Finding.Downgraded)} downgraded by the second opinion)");
+        if (verdict.Overlay is { } overlay)
+        {
+            // sc-25708 (E3): whether the reviewers' CodeGraph answers were of the head or of the default branch.
+            text.Append(overlay.IsReady
+                ? $"; CodeGraph answered about the head (overlay {Code(overlay.OverlayId?.ToString(CultureInfo.InvariantCulture) ?? "?")})"
+                : $"; CodeGraph overlay of the head {Code(overlay.Outcome)}{(overlay.Reason is { } why ? $" ({Code(why)})" : "")}, answers from the default branch");
+        }
+        var fallbacks = verdict.Reviews.Where(r => r.CarriedFrom is null)
+            .SelectMany(r => (r.Tools ?? []).Concat(r.Findings.SelectMany(f => f.Confirmation?.Tools ?? []))).Count(t => t.Fallback is not null);
+        if (fallbacks > 0)
+        {
+            text.Append(CultureInfo.InvariantCulture, $"; {fallbacks} CodeGraph call(s) fell back to the default branch (the head not indexed)");
+        }
+        text.Append('\n');
         foreach (var (role, finding) in blocking.Take(MaxBlockingFindingsShown))
         {
             var how = finding.Confirmation is { Outcome: Confirmation.Confirmed } c ? $"confirmed by {Code(c.ServedName)}"
@@ -202,6 +224,20 @@ public static class LedgerReport
             text.Append(CultureInfo.InvariantCulture, $"  - … and {blocking.Count - MaxBlockingFindingsShown} more blocking finding(s) (the ledger has them)\n");
         }
         return text.ToString();
+    }
+
+    /// <summary>
+    /// A review's or its second opinions' tool use as recorded (E4/E8): the calls, how many answered an error, and the first
+    /// <see cref="MaxFailingToolsShown"/> failing tools' names (distinct, each cut and inert: a model may name any tool).
+    /// </summary>
+    private static string ToolUse(IReadOnlyCollection<ToolCall> calls)
+    {
+        var failed = calls.Where(c => c.Error).ToList();
+        var names = failed.Select(c => c.Tool.Length > MaxToolName ? c.Tool[..MaxToolName] + "…" : c.Tool).Distinct(StringComparer.Ordinal).ToList();
+        var shown = string.Join(", ", names.Take(MaxFailingToolsShown).Select(UntrustedText.CodeSpan))
+            + (names.Count > MaxFailingToolsShown ? $" and {names.Count - MaxFailingToolsShown} more" : "");
+        return $"{calls.Count} tool call{(calls.Count == 1 ? "" : "s")}"
+            + (failed.Count == 0 ? "" : $", {failed.Count} tool error{(failed.Count == 1 ? "" : "s")}: {shown}");
     }
 
     /// <summary>The fix rounds since the last Implement: each with its kind, how it ended, and (a review round) its progress check.</summary>

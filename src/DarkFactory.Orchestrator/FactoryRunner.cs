@@ -102,6 +102,10 @@ public static class FactoryRunner
         try
         {
             options.RejectReviewModelSettings();
+            if (CodeGraphTokenWarning(options) is { } warning)
+            {
+                stderr.WriteLine(warning);
+            }
             if (await checkEnrollment(ct) is { } enrollmentError)
             {
                 stderr.WriteLine(enrollmentError);
@@ -115,6 +119,14 @@ public static class FactoryRunner
             return 2;
         }
     }
+
+    /// <summary>
+    /// The start-up warning of <c>factory run</c> and <c>factory work</c> when no CodeGraph token is configured (sc-25709: the factory still
+    /// starts, but <c>risk-threshold</c> cannot read CodeGraph, so the gate merges nothing that needs it), or null with a token.
+    /// </summary>
+    internal static string? CodeGraphTokenWarning(FactoryOptions options) =>
+        options.TryGet(o => o.CodeGraphToken, out _) ? null
+            : $"no CodeGraph token ({MergeGate.CodeGraphTokenSources}): the merge gate will merge no change whose tier requires risk-threshold";
 
     /// <param name="ignoreScope"><c>factory run --ignore-scope</c>: claim and resume the story even outside the watch scope.</param>
     public static async Task<RunOutcome> RunAsync(FactoryOptions options, int storyId, bool ignoreScope, TextWriter log, CancellationToken ct)
@@ -217,7 +229,13 @@ public static class FactoryRunner
             return true;
         });
 
-        var gate = CreateGate(options, new GitHubGate(githubHttp, gateApp), new RouterReviewer(reviewerHttp, routerKey), workspaces, sandbox);
+        var gateGitHub = new GitHubGate(githubHttp, gateApp);
+        using var codeGraphHttp = OutboundHttp.CodeGraphApi(options.CodeGraphBaseUrl);
+        using var kanbanHttp = OutboundHttp.KanbanApi(options.KanbanMcpUrl);
+        // One upstream registry: the reviewers' tools and the review's overlay wait (sc-25708) share its CodeGraph client.
+        var upstreams = CreateUpstreams(options, codeGraphHttp, kanbanHttp, log);
+        var reviewer = new RouterReviewer(reviewerHttp, routerKey, tools: new ReviewTools(workspaces, upstreams.CodeGraph, upstreams.Kanban, log));
+        var gate = CreateGate(options, gateGitHub, reviewer, workspaces, sandbox, upstreams.CodeGraph);
         if (adjustGate is not null)
         {
             gate = adjustGate(gate);
@@ -251,16 +269,66 @@ public static class FactoryRunner
         return await pipeline.RunAsync(storyId, ct);
     }
 
+    /// <summary>
+    /// The reviewers' tools (sc-25705, sc-25706): <c>read_file</c>, <c>list_files</c> and <c>grep</c> from the gate's clone (owner-side git, by object), the
+    /// CodeGraph tools with the owner's CodeGraph token. Without a token the factory still starts (only the reviewers use CodeGraph):
+    /// every CodeGraph tool then answers an error result, recorded in the verdict, and this says so once.
+    /// </summary>
+    internal static ReviewTools CreateReviewTools(FactoryOptions options, IReviewFiles files, HttpClient codeGraphHttp, TextWriter log,
+        HttpClient? kanbanHttp = null)
+    {
+        var upstreams = CreateUpstreams(options, codeGraphHttp, kanbanHttp, log);
+        return new ReviewTools(files, upstreams.CodeGraph, upstreams.Kanban, log);
+    }
+
+    /// <summary>
+    /// The upstream MCP registry (sc-25707), shared by the reviewers' tool loop and the loopback MCP proxy: CodeGraph with the owner's
+    /// CodeGraph token, Kanban (at <c>Kanban:McpUrl</c>, over <paramref name="kanbanHttp"/>) with the owner's Kanban token. Each is
+    /// optional: without its token it is left out (reviewers' CodeGraph tools then answer an error, and no Kanban tool is offered),
+    /// and this says so once.
+    /// </summary>
+    internal static Mcp.McpUpstreams CreateUpstreams(FactoryOptions options, HttpClient codeGraphHttp, HttpClient? kanbanHttp, TextWriter log)
+    {
+        CodeGraph.CodeGraphMcpClient? codeGraph = null;
+        if (options.TryGet(o => o.CodeGraphToken, out var token))
+        {
+            codeGraph = new CodeGraph.CodeGraphMcpClient(codeGraphHttp, token!);
+        }
+        else
+        {
+            log.WriteLine("[review] no CodeGraph token (CodeGraph:Token, env FACTORY_CODEGRAPH_TOKEN or keychain account "
+                + $"'{SecretAccounts.CodeGraphToken}'): reviewers' CodeGraph tools will answer an error");
+        }
+        Mcp.McpUpstream? kanban = null;
+        if (kanbanHttp is not null && options.TryGet(o => o.KanbanToken, out var kanbanToken))
+        {
+            // Kanban:McpUrl is the endpoint itself: requests go to the client's base address.
+            kanban = new Mcp.McpUpstream(Mcp.McpServers.Kanban, new Mcp.McpHttpClient(kanbanHttp, kanbanToken!, "Kanban", ""),
+                Mcp.McpServers.KanbanTools, repoScoped: false);
+        }
+        else if (kanbanHttp is not null)
+        {
+            log.WriteLine("[mcp] no Kanban token (Kanban:Token, env FACTORY_KANBAN_TOKEN or keychain account "
+                + $"'{SecretAccounts.KanbanToken}'): no Kanban upstream");
+        }
+        return new Mcp.McpUpstreams(codeGraph, kanban);
+    }
+
     /// <summary>The reviewers' router client: one reviewer call may take <c>Review:TimeoutMinutes</c>.</summary>
     internal static HttpClient ReviewerHttp(FactoryOptions options) => OutboundHttp.RouterApi(options.RouterBaseUrl, options.ReviewTimeout);
 
     /// <summary>
     /// The merge gate as configured: CI on the PR's head polled every <c>Gate:CiPollSeconds</c> until <c>Gate:CiTimeoutMinutes</c>,
-    /// the new tests run sandboxed for up to <c>Gate:TestTimeoutMinutes</c> each.
+    /// the new tests run sandboxed for up to <c>Gate:TestTimeoutMinutes</c> each, and each review waits up to
+    /// <c>CodeGraph:OverlayTimeoutMinutes</c> for CodeGraph's overlay of the head (sc-25708; without a CodeGraph token the wait ends at
+    /// once, recorded as unavailable), and <c>risk-threshold</c> reads CodeGraph's blast radius and hotspots through the same client
+    /// (sc-25709; without a CodeGraph token there is none, and the check fails wherever a tier requires it).
     /// </summary>
     internal static GateStage CreateGate(FactoryOptions options, IGateGitHub github, IReviewer reviewer, GitWorkspace workspaces,
-        WorkerSandbox? sandbox) =>
-        new(github, reviewer, options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, sandbox, options.TestTimeout));
+        WorkerSandbox? sandbox, ICodeGraphOverlays? codeGraph = null) =>
+        new(github, reviewer, options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, sandbox, options.TestTimeout),
+            Overlays: new ReviewOverlays(codeGraph, options.CodeGraphOverlayTimeout),
+            Risk: codeGraph is ICodeGraphRisk risk ? new CodeGraphRiskReader(risk, options.CodeGraphOverlayTimeout) : null);
 
     /// <summary>The sandbox readiness probe, a factory-wide failure (E10): a stale helper fails the factory once, not every item.</summary>
     internal static Task EnsureSandboxReadyAsync(WorkerSandbox sandbox, WorkerAuth auth, string claudePath, CancellationToken ct) =>
@@ -377,11 +445,47 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         {
             throw new FactoryUnavailableException($"the triage worktree sweep: {ex.Message}", ex);
         }
+        // CodeGraph through the loopback MCP proxy this process hosts for the session (sc-25707), granted only the triage profile
+        // (Mcp.McpProfile.Triage: the CodeGraph tools whose answers stay in the pinned project; no Kanban upstream at all — the issue
+        // text is untrusted and the triage's answer is posted on the issue). The upstream token stays here; the session gets a
+        // credential revoked when it ends, in a file (never argv).
+        using var codeGraphHttp = OutboundHttp.CodeGraphApi(options.CodeGraphBaseUrl);
+        var upstreams = FactoryRunner.CreateUpstreams(options, codeGraphHttp, kanbanHttp: null, log);
+        var configs = Path.Combine(options.WorkRoot, Mcp.McpProxySessions.DirectoryName);
+        await using var proxy = await StartMcpProxyAsync(upstreams, configs, ct);
+        var tools = TriageTools(upstreams, proxy is not null);
         var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, sandbox,
-            pauseFlagDirectory: options.PauseFlagDirectory, tools: WorkerTools.ReadOnly);
+            pauseFlagDirectory: options.PauseFlagDirectory, tools: tools);
         var sessions = new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)),
             new RouterClient(routerHttp, routerKey), TimeProvider.System, log, costSettleDelay: options.CostSettleDelay);
-        return await new Issues.WorkerTriageRunner(workspaces, worker, sessions, log).RunAsync(item, repo, prompt, onSession, onTaint, ct);
+        return await new Issues.WorkerTriageRunner(workspaces, worker, sessions, log,
+            proxy is null ? null : new Mcp.McpProxySessions(proxy, configs, sandbox!.User)).RunAsync(item, repo, prompt, onSession, onTaint, ct);
+    }
+
+    /// <summary>
+    /// The triage worker's tools: <see cref="WorkerTools.ReadOnly"/>, plus (with the proxy) exactly the triage profile's MCP tools
+    /// (<see cref="Mcp.McpProfile.Triage"/>) — its <c>--allowedTools</c> names no other MCP tool.
+    /// </summary>
+    internal static WorkerTools TriageTools(Mcp.McpUpstreams upstreams, bool proxied) =>
+        proxied ? WorkerTools.ReadOnly.WithMcp(Mcp.McpProfile.Triage.ToolRules(upstreams)) : WorkerTools.ReadOnly;
+
+    /// <summary>
+    /// Sweeps <paramref name="configs"/> of a crashed process's session files (under the worker run lock: no other triage's file is
+    /// live) and starts the loopback MCP proxy when CodeGraph is configured (else null). Either failing is factory-wide
+    /// (<see cref="FactoryUnavailableException"/>, E10), never the issue's.
+    /// </summary>
+    internal static async Task<Mcp.McpProxy?> StartMcpProxyAsync(Mcp.McpUpstreams upstreams, string configs, CancellationToken ct,
+        Func<Mcp.McpUpstreams, CancellationToken, Task<Mcp.McpProxy>>? start = null)
+    {
+        try
+        {
+            Mcp.McpProxySessions.Sweep(configs);
+            return upstreams.CodeGraph is null ? null : await (start ?? Mcp.McpProxy.StartAsync)(upstreams, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new FactoryUnavailableException($"the MCP proxy: {ex.Message}", ex);
+        }
     }
 
     private static Task<T> FactoryWideStep<T>(string what, Func<T> step)

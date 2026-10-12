@@ -4,10 +4,10 @@ namespace DarkFactory.Orchestrator.Gateway;
 
 /// <summary>
 /// The factory's only outbound HTTP (E2, sc-25390): every <see cref="HttpClient"/> to GitHub's REST API (both Apps, the
-/// owner's admin token for rulesets, CI job logs and the blob-storage download GitHub redirects them to), to Shortcut and to
-/// the router is built here, one named client per service; the typed clients (<c>GitHubApp</c>, <c>GitHubPullRequests</c>,
+/// owner's admin token for rulesets, CI job logs and the blob-storage download GitHub redirects them to), to Shortcut, to
+/// the router, to CodeGraph and to Kanban is built here, one named client per service; the typed clients (<c>GitHubApp</c>, <c>GitHubPullRequests</c>,
 /// <c>GitHubGate</c>, <c>GitHubIssuesClient</c>, <c>RepoProtection</c>, <c>GitHubAppSetup</c>, <c>ShortcutWorkSource</c>,
-/// <c>RouterClient</c>, <c>RouterReviewer</c>) use the one they are given. The <c>DarkFactory.Analyzers</c> gateway lint fails
+/// <c>RouterClient</c>, <c>RouterReviewer</c>, <c>CodeGraphMcpClient</c>, <c>McpHttpClient</c>) use the one they are given. The <c>DarkFactory.Analyzers</c> gateway lint fails
 /// the build on an HTTP client, handler, socket or web request made anywhere else in the orchestrator or the acceptance tests (DF0001) and on a
 /// service host named outside this folder (DF0004). Model calls go only to the router (Phase 1 E1): no provider host is
 /// named anywhere (DF0003).
@@ -37,10 +37,37 @@ public static class OutboundHttp
         return http;
     }
 
+    /// <summary>The hosted CodeGraph (<c>CodeGraph:BaseUrl</c>'s default): reviewers' <c>analyze_impact</c> goes to its MCP endpoint.</summary>
+    public static readonly Uri CodeGraphDefaultBase = new("https://codegraph-api.trefry.net/");
+
+    /// <summary>How long one request to CodeGraph may take (the reviewer's whole call is bounded apart, <c>Review:TimeoutMinutes</c>).</summary>
+    public static readonly TimeSpan CodeGraphTimeout = TimeSpan.FromSeconds(60);
+
+    /// <summary>A client for CodeGraph at <paramref name="baseUrl"/> (<c>CodeGraph:BaseUrl</c>; the typed client is <c>CodeGraphMcpClient</c>).</summary>
+    public static HttpClient CodeGraphApi(Uri baseUrl) => new() { BaseAddress = baseUrl, Timeout = CodeGraphTimeout };
+
+    /// <summary>The hosted KanbanBoard's MCP endpoint (<c>Kanban:McpUrl</c>'s default; sc-25707).</summary>
+    public static readonly Uri KanbanDefaultMcpUrl = new("https://kanban-mcp.trefry.net/mcp");
+
+    /// <summary>How long one request to Kanban may take.</summary>
+    public static readonly TimeSpan KanbanTimeout = TimeSpan.FromSeconds(60);
+
+    /// <summary>A client for KanbanBoard's MCP endpoint <paramref name="mcpUrl"/> (<c>Kanban:McpUrl</c>; requests go to the base address itself).</summary>
+    public static HttpClient KanbanApi(Uri mcpUrl) => new() { BaseAddress = mcpUrl, Timeout = KanbanTimeout };
+
     /// <summary>
     /// A client for the factory's own dashboard at <paramref name="baseAddress"/> (the live acceptance tests' login): it keeps
     /// <paramref name="cookies"/> and does not follow redirects.
     /// </summary>
     public static HttpClient Dashboard(Uri baseAddress, CookieContainer cookies) =>
         new(new HttpClientHandler { CookieContainer = cookies, AllowAutoRedirect = false }) { BaseAddress = baseAddress };
+
+    /// <summary>
+    /// A client for one endpoint of the factory's own loopback MCP proxy (<c>McpProxy.Endpoint</c>; the live acceptance tests' MCP
+    /// client of it, sc-25710): a loopback address only, anything else refused; it does not follow redirects (a redirect could lead
+    /// off loopback).
+    /// </summary>
+    public static HttpClient LoopbackMcp(Uri endpoint) => endpoint.IsLoopback
+        ? new(new HttpClientHandler { AllowAutoRedirect = false }) { BaseAddress = endpoint, Timeout = CodeGraphTimeout }
+        : throw new ArgumentException($"'{endpoint}' is not a loopback address: only the factory's own MCP proxy is reached this way.", nameof(endpoint));
 }

@@ -38,6 +38,29 @@ public static class SseAnswers
 
     public static string Error(string type, string message) => Event("error", new { type = "error", error = new { type, message } });
 
+    public static string ToolUseStart(int index, string id, string name) =>
+        Event("content_block_start", new { type = "content_block_start", index, content_block = new { type = "tool_use", id, name, input = new { } } });
+
+    public static string InputDelta(int index, string partialJson) =>
+        Event("content_block_delta", new { type = "content_block_delta", index, delta = new { type = "input_json_delta", partial_json = partialJson } });
+
+    /// <summary>
+    /// A turn that stops for tool use (sc-25705): a short text block, then one tool_use block per call, each input streamed in
+    /// two input_json_delta parts.
+    /// </summary>
+    public static string ToolTurn(params (string Id, string Name, string InputJson)[] calls)
+    {
+        var sb = new StringBuilder(MessageStart("claude-opus-5-5")).Append(TextBlockStart(0)).Append(TextDelta(0, "Let me look.")).Append(BlockStop(0));
+        for (var i = 0; i < calls.Length; i++)
+        {
+            var (id, name, input) = calls[i];
+            var half = input.Length / 2;
+            sb.Append(ToolUseStart(i + 1, id, name)).Append(InputDelta(i + 1, input[..half])).Append(Ping)
+                .Append(InputDelta(i + 1, input[half..])).Append(BlockStop(i + 1));
+        }
+        return sb.Append(MessageDelta("tool_use")).Append(MessageStop).ToString();
+    }
+
     /// <summary>A whole answer: <paramref name="text"/> in one text block, cut into a few deltas, with a ping in between.</summary>
     public static string Answer(string text, string model = "claude-opus-5-5", string stop = "end_turn")
     {

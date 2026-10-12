@@ -250,12 +250,36 @@ public class FactoryOptionsTests
         var calls = new List<string>();
         var stderr = new StringWriter();
 
-        var exit = await FactoryRunner.RunCommandAsync(Options([]),
+        var exit = await FactoryRunner.RunCommandAsync(Options(new() { ["CodeGraph:Token"] = "cg_config" }),
             _ => { calls.Add("enrollment"); return Task.FromResult<string?>(null); },
             _ => { calls.Add("run"); return Task.FromResult(new RunOutcome(1, DarkFactory.Orchestrator.Ledger.WorkState.Watch, null, null, null)); },
             stderr, CancellationToken.None);
 
         Assert.Equal((0, ""), (exit, stderr.ToString()));
+        Assert.Equal(["enrollment", "run"], calls);
+    }
+
+    [Fact]
+    public async Task Factory_run_and_work_warn_at_start_up_without_a_codegraph_token_and_still_start()
+    {
+        Assert.Null(FactoryRunner.CodeGraphTokenWarning(Options(new() { ["CodeGraph:Token"] = "cg_config" })));
+        if (Environment.GetEnvironmentVariable("FACTORY_CODEGRAPH_TOKEN") is not null)
+        {
+            return; // the environment supplies a token
+        }
+        const string warning = "no CodeGraph token (CodeGraph:Token, env FACTORY_CODEGRAPH_TOKEN, or keychain account 'codegraph-token' "
+            + "(service 'dark-factory')): the merge gate will merge no change whose tier requires risk-threshold";
+        // `factory work` prints the same warning (Program.cs, through CodeGraphTokenWarning) before it starts.
+        Assert.Equal(warning, FactoryRunner.CodeGraphTokenWarning(Options([])));
+        var stderr = new StringWriter();
+        var calls = new List<string>();
+
+        var exit = await FactoryRunner.RunCommandAsync(Options([]),
+            _ => { calls.Add("enrollment"); return Task.FromResult<string?>(null); },
+            _ => { calls.Add("run"); return Task.FromResult(new RunOutcome(1, DarkFactory.Orchestrator.Ledger.WorkState.Watch, null, null, null)); },
+            stderr, CancellationToken.None);
+
+        Assert.Equal((0, warning + Environment.NewLine), (exit, stderr.ToString()));
         Assert.Equal(["enrollment", "run"], calls);
     }
 
@@ -312,6 +336,98 @@ public class FactoryOptionsTests
     }
 
     [Fact]
+    public void CodeGraph_base_url_defaults_to_the_hosted_codegraph_is_read_from_config_and_an_invalid_one_is_refused_at_start_up()
+    {
+        // sc-25705, E7.
+        Assert.Equal(Gateway.OutboundHttp.CodeGraphDefaultBase, Options([]).CodeGraphBaseUrl);
+        Assert.Equal(new Uri("http://127.0.0.1:5005/cg/"), Options(new() { ["CodeGraph:BaseUrl"] = "http://127.0.0.1:5005/cg" }).CodeGraphBaseUrl);
+        foreach (var bad in new[] { "codegraph.local", "ftp://codegraph.local", "https://api.anthropic.com/" })
+        {
+            Assert.Contains("CodeGraph:BaseUrl",
+                Assert.Throws<InvalidOperationException>(() => Options(new() { ["CodeGraph:BaseUrl"] = bad }).ValidateSettings()).Message);
+        }
+    }
+
+    [Fact]
+    public async Task The_codegraph_token_comes_from_config_or_keychain_and_without_one_analyze_impact_answers_an_error()
+    {
+        var secrets = new InMemorySecrets();
+        secrets.Set(SecretAccounts.CodeGraphToken, "cg_keychain");
+        Assert.Equal("cg_config", Options(new() { ["CodeGraph:Token"] = "cg_config" }, secrets).CodeGraphToken);
+        Assert.Equal("cg_keychain", Options([], secrets).CodeGraphToken);
+        Assert.Equal("codegraph-token", SecretAccounts.CodeGraphToken);
+
+        // Missing: start-up is unaffected (ValidateSettings reads no secret); the reviewers' tool answers an error, said once.
+        var none = Options([]);
+        if (Environment.GetEnvironmentVariable("FACTORY_CODEGRAPH_TOKEN") is null)
+        {
+            Assert.False(none.TryGet(o => o.CodeGraphToken, out _));
+            none.ValidateSettings();
+            var log = new StringWriter();
+            using var http = new HttpClient();
+            var tools = FactoryRunner.CreateReviewTools(none, new FakeReviewFiles("head", []), http, log);
+            Assert.Contains("no CodeGraph token", log.ToString());
+            var outcome = await tools.RunAsync(new AnswerBlock(AnswerBlock.ToolUse, null, "toolu_1", ReviewTools.AnalyzeImpact, "{\"name\":\"X\"}"),
+                ReviewTools.Session(new Shortcut.RepoRef("o", "r"), "head", "base", 0), CancellationToken.None);
+            Assert.True(outcome.IsError);
+            Assert.Contains("CodeGraph is not configured", outcome.Content);
+        }
+        // With a token, analyze_impact asks CodeGraph with it.
+        var codeGraph = new FakeApi();
+        var configured = FactoryRunner.CreateReviewTools(Options(new() { ["CodeGraph:Token"] = "cg_config" }), new FakeReviewFiles("head", []),
+            codeGraph.Client("https://codegraph.test/"), TextWriter.Null);
+        await configured.RunAsync(new AnswerBlock(AnswerBlock.ToolUse, null, "toolu_1", ReviewTools.AnalyzeImpact, "{\"name\":\"X\"}"),
+            ReviewTools.Session(new Shortcut.RepoRef("o", "r"), "head", "base", 0), CancellationToken.None);
+        Assert.Equal("Bearer cg_config", codeGraph.Requests.First().Headers["Authorization"]);
+    }
+
+    [Fact]
+    public void Kanban_mcp_url_defaults_to_the_hosted_kanbanboard_is_read_from_config_and_an_invalid_one_is_refused_at_start_up()
+    {
+        // sc-25707, E7.
+        Assert.Equal(new Uri("https://kanban-mcp.trefry" + ".net/mcp"), Options([]).KanbanMcpUrl);
+        Assert.Equal(Gateway.OutboundHttp.KanbanDefaultMcpUrl, Options([]).KanbanMcpUrl);
+        Assert.Equal(new Uri("http://127.0.0.1:5006/kb/mcp"), Options(new() { ["Kanban:McpUrl"] = "http://127.0.0.1:5006/kb/mcp" }).KanbanMcpUrl);
+        foreach (var bad in new[] { "kanban.local/mcp", "ftp://kanban.local/mcp", "https://api.anthropic.com/mcp" })
+        {
+            Assert.Contains("Kanban:McpUrl",
+                Assert.Throws<InvalidOperationException>(() => Options(new() { ["Kanban:McpUrl"] = bad }).ValidateSettings()).Message);
+        }
+    }
+
+    [Fact]
+    public async Task The_kanban_token_comes_from_config_or_keychain_and_without_one_there_is_no_kanban_upstream()
+    {
+        var secrets = new InMemorySecrets();
+        secrets.Set(SecretAccounts.KanbanToken, "kb_keychain");
+        Assert.Equal("kb_config", Options(new() { ["Kanban:Token"] = "kb_config" }, secrets).KanbanToken);
+        Assert.Equal("kb_keychain", Options([], secrets).KanbanToken);
+        Assert.Equal("kanban-token", SecretAccounts.KanbanToken);
+
+        using var http = new HttpClient();
+        if (Environment.GetEnvironmentVariable("FACTORY_KANBAN_TOKEN") is null)
+        {
+            // Missing: not an error; start-up is unaffected and there is no Kanban upstream (said once).
+            var none = Options([]);
+            Assert.False(none.TryGet(o => o.KanbanToken, out _));
+            none.ValidateSettings();
+            var log = new StringWriter();
+            Assert.Null(FactoryRunner.CreateUpstreams(none, http, http, log).Kanban);
+            Assert.Contains("no Kanban token", log.ToString());
+        }
+        // With a token, the upstream asks Kanban:McpUrl with it.
+        var kanban = new FakeMcpServer("/kb/mcp", ["get_board", "create_work_item"], (t, _) => FakeMcpServer.Text(t));
+        var upstreams = FactoryRunner.CreateUpstreams(Options(new() { ["Kanban:Token"] = "kb_config" }), http,
+            kanban.Client("https://kanban.test/kb/mcp"), TextWriter.Null);
+        var upstream = Assert.IsType<Mcp.McpUpstream>(upstreams.Kanban);
+        Assert.False(upstream.RepoScoped);
+        Assert.Equal(["get_board"], (await upstream.ListToolsAsync(CancellationToken.None)).Select(t => t.Name));
+        Assert.All(kanban.Api.Requests, r => Assert.Equal("Bearer kb_config", r.Headers["Authorization"]));
+        await Assert.ThrowsAsync<Mcp.ToolNotAllowedException>(() =>
+            upstream.CallAsync("create_work_item", new System.Text.Json.Nodes.JsonObject(), CancellationToken.None));
+    }
+
+    [Fact]
     public void The_router_cost_settle_delay_defaults_to_five_seconds_and_refuses_a_negative_value()
     {
         Assert.Equal(TimeSpan.FromSeconds(5), Options([]).CostSettleDelay);
@@ -349,6 +465,7 @@ public class FactoryOptionsTests
         { "Usage:PollSeconds", o => o.UsagePollInterval, TimeSpan.FromSeconds(7) },
         { "Worker:TimeoutMinutes", o => o.WorkerTimeout, TimeSpan.FromMinutes(7) },
         { "Freeze:CheckFailedMinutes", o => o.Freeze.CheckFailedWindow, TimeSpan.FromMinutes(7) },
+        { "CodeGraph:OverlayTimeoutMinutes", o => o.CodeGraphOverlayTimeout, TimeSpan.FromMinutes(7) },
     };
 
     [Theory]
@@ -370,6 +487,7 @@ public class FactoryOptionsTests
         var options = Options(new()
         {
             ["Gate:CiPollSeconds"] = "7", ["Gate:CiTimeoutMinutes"] = "8", ["Gate:TestTimeoutMinutes"] = "9", ["Review:TimeoutMinutes"] = "11",
+            ["CodeGraph:OverlayTimeoutMinutes"] = "12",
         });
         var workspaces = new Git.GitWorkspace(Path.GetTempPath(), r => $"https://example.invalid/{r.FullName}", (_, _) => Task.FromResult<string?>(null));
 
@@ -379,7 +497,16 @@ public class FactoryOptionsTests
 
         Assert.Equal((TimeSpan.FromSeconds(7), TimeSpan.FromMinutes(8)), (gate.CiPollInterval, gate.CiTimeout));
         Assert.Equal(TimeSpan.FromMinutes(9), Assert.IsType<SandboxTestRunner>(gate.Tests).Timeout);
+        Assert.Equal((TimeSpan.FromMinutes(12), ReviewOverlays.DefaultPollInterval), (gate.Overlays!.Timeout, gate.Overlays.PollInterval));
+        Assert.Equal(ReviewOverlays.DefaultTimeout, FactoryRunner.CreateGate(Options([]), new GatePipelineTests.FakeGateGitHub(),
+            new GatePipelineTests.FakeReviewer(), workspaces, sandbox: null).Overlays!.Timeout);
         Assert.Equal(TimeSpan.FromMinutes(11), reviewer.Timeout);
+        // sc-25709: risk-threshold reads CodeGraph through the same client, its overlay wait on the same timeout; no client, no reader.
+        Assert.Null(gate.Risk);
+        using var codeGraphHttp = new HttpClient();
+        var withCodeGraph = FactoryRunner.CreateGate(options, new GatePipelineTests.FakeGateGitHub(), new GatePipelineTests.FakeReviewer(),
+            workspaces, sandbox: null, new CodeGraph.CodeGraphMcpClient(codeGraphHttp, "cg_test_token"));
+        Assert.Equal(TimeSpan.FromMinutes(12), withCodeGraph.Risk!.Overlays.Timeout);
     }
 
     [Fact]

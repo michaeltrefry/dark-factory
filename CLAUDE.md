@@ -21,8 +21,10 @@ Claude Code headless workers through the Weave router.
   check `NewTests.cs` (`NewTestsCheck`)/`XunitNewTests`/`SandboxTestRunner`;
   reviewer prompts in `factory/prompts/`; GitHub side
   `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`, the merge gate and queue `RunPipeline.MergeQueue.cs`),
-  and the outbound gateway (`Gateway/`: `OutboundHttp` builds every GitHub, Shortcut and router `HttpClient` (and the
-  acceptance tests' dashboard client); `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token
+  the MCP upstreams and the loopback MCP proxy (`Mcp/`: `McpHttpClient`, `McpUpstream`/`McpUpstreams`/`McpServers`
+  (allowlists), `McpProxy`, `McpProxySessions`; CodeGraph's client `CodeGraph/CodeGraphMcpClient.cs`; sc-25707),
+  and the outbound gateway (`Gateway/`: `OutboundHttp` builds every GitHub, Shortcut, router, CodeGraph and Kanban `HttpClient` (and the
+  acceptance tests' dashboard client and their loopback-only client of the MCP proxy, `LoopbackMcp`); `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token
   credentials; `GitRemoteReads` the github.com remote URL and every clone/fetch's arguments (sc-25391); `GitHubCli` is the only
   `gh` run).
 - `src/DarkFactory.Analyzers` — the gateway lint (sc-25390), a Roslyn analyzer every build of the orchestrator and of
@@ -36,7 +38,7 @@ Claude Code headless workers through the Weave router.
   add one there only for a local program), outside `Gateway/`; DF0002 a git remote write outside it (text whose subcommand, past git's global
   options like `-C <dir>`/`--git-dir=…`, is `push`/`send-pack`/`http-push`/`remote set-url`, at its start — so a lone `push`
   argument — or after a `git` word); DF0003 a model provider host or key (`api.anthropic.com`, `ANTHROPIC_API_KEY`, …)
-  anywhere, the embedded manifests, prompts, scripts and Razor markup included; DF0004 GitHub's or Shortcut's API host, or a
+  anywhere, the embedded manifests, prompts, scripts and Razor markup included; DF0004 GitHub's or Shortcut's API host or the hosted CodeGraph's or KanbanBoard's MCP host, or a
   github.com git remote (a `.git` URL, an `@github.com` user, git's `http.https://github.com/` config), outside it; DF0005 a
   `SuppressMessage`/`UnconditionalSuppressMessage` whose constant check id starts `DF`, anywhere (Roslyn honours those even for
   NotConfigurable rules, so the attribute itself fails the build). Since such an attribute could hide its own DF0005, the
@@ -81,6 +83,10 @@ Claude Code headless workers through the Weave router.
   `GateNegativeTests` (sealed path, corrupt policy on a throwaway branch, a new test passing on the base, a 4th fix round; review
   panel replaced by `SeededReviewer`, seeding through `SandboxRepo`), `FreezeAndStuckTests` (freeze seeded in the throwaway
   ledger; a stub Claude CLI replaying the stuck/silent fixtures), `IssueTriageTests.A_triage_session_that_read_issue_text_is_tainted_and_cannot_push`.
+  Phase 3's epic AT1–AT5 (sc-25710, `CodeGraphAcceptanceTests.cs`): `CodeGraphReviewTests` (the real panel's tool calls, turns and
+  overlay-bound CodeGraph answers), `CodeGraphTriageTests` (a triage session through the proxy, scanned for the CodeGraph token by a
+  wrapper Claude Code path, `ScanWrapper`; the production proxy refusing off-profile tools; a live Kanban read through the reviewers'
+  tools), `CodeGraphGateTests` (a critical file escalating on risk-threshold; CodeGraph unreachable blocking at the CI timeout).
 
 ## Commands
 
@@ -111,6 +117,11 @@ committed: they come from env/user-secrets or the macOS login keychain
 | --- | --- |
 | `Router:BaseUrl` | `http://localhost:8080` (an absolute http(s) URL; one naming a model provider's host or key — `src/DarkFactory.Analyzers/ProviderMarkers.txt`, the gateway lint's list, embedded in both the analyzer and the orchestrator, `Gateway/ProviderMarkers.cs` — is refused, P1-E1) |
 | `Router:Key` | env `FACTORY_ROUTER_KEY`, or keychain account `router-key` |
+| `CodeGraph:BaseUrl` | the hosted CodeGraph (`OutboundHttp.CodeGraphDefaultBase`; an absolute http(s) URL naming no model provider): reviewers' CodeGraph tools (`ReviewTools.CodeGraphTools`) go to its `mcp` endpoint |
+| `CodeGraph:OverlayTimeoutMinutes` | `10` (> 0: how long a review waits, before its first panel call, for CodeGraph's overlay of the PR head; not ready by then, reviewers' CodeGraph calls read the default-branch index, labelled not the PR head; sc-25708) |
+| `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional: without it the factory starts and every CodeGraph tool answers the reviewer an error result (recorded), triage gets no CodeGraph, and the merge gate's `risk-threshold` fails wherever a tier requires it (sc-25709), so no normal or protected change merges (`factory run` and `factory work` warn at start-up) |
+| `Kanban:McpUrl` | `https://kanban-mcp.trefry.net/mcp` (`OutboundHttp.KanbanDefaultMcpUrl`; an absolute http(s) URL naming no model provider; MCP Streamable HTTP): the Kanban upstream (sc-25707), offered to reviewers through their tool loop (and kept for Phase 4's planner, `McpProfile.Planner`); never to triage sessions, whose proxy is started without it (`McpProfile.Triage`: the issue text is untrusted and the triage's answer is posted on the issue) |
+| `Kanban:Token` | env `FACTORY_KANBAN_TOKEN`, or keychain account `kanban-token`: a KanbanBoard PAT (`Authorization: Bearer`), owner-side only (E5). Optional: without it there is no Kanban upstream (not an error) |
 | `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
 | `GitHub:Gate:AppId`, `GitHub:Gate:PrivateKeyPem` | keychain `github-gate-app-id`, `github-gate-app-private-key` (written by `factory github-app setup --gate`): the merge gate's App, the only credential that merges |
@@ -217,10 +228,16 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   dontAsk` (every call that would prompt — any read outside the working directory — is auto-denied), `--settings` with
   `permissions.blockReadsOutsideWorkingDirectories`, `--setting-sources ""` (no repo or worker-user settings file can widen
   it), every known write/exec/sub-agent/worktree/web tool in `WorkerTools.WriteOrExecTools` denied by name (belt and braces: not
-  exhaustive as the CLI adds tools — the guarantee is `dontAsk` with no allow rule but the `ReadRule`, so any unnamed tool is
-  auto-denied too); the runner refuses any worker whose tools
-  are not `IsReadOnly`, so a tainted session cannot change a file an untainted session later
-  pushes, E4; the prompt has it reason from the code, building and running nothing) in a throwaway `factory/triage-gh-<key>`
+  exhaustive as the CLI adds tools — the guarantee is `dontAsk` with no allow rule but the `ReadRule` and the allowlisted MCP
+  tools below, so any unnamed tool is auto-denied too); the runner refuses any worker whose tools
+  are not `IsReadOnly` (which accepts, beyond the `ReadRule`, only allow rules in `McpServers.AllToolRules`), so a tainted session cannot change a file an untainted session later
+  pushes, E4; the prompt has it reason from the code, building and running nothing; with CodeGraph configured it may also call,
+  through the loopback MCP proxy below, only the triage profile's tools (`McpProfile.Triage`: `search_graph`, `get_code_snippet`,
+  `read_node_source` — the CodeGraph tools whose answers stay inside the issue repo's pinned project; no Kanban and none of
+  `analyze_impact`/`trace_call_path`/`find_consumers`/`find_publishers`, whose answers cross into other private indexed projects:
+  the issue text is untrusted, possibly an outsider's, and the triage's summary and fix are posted on the issue, possibly
+  public), and its prompt names them, `TriagePrompt.McpNote`; its `--allowedTools` names exactly those three,
+  `SandboxTriageRunner.TriageTools`) in a throwaway `factory/triage-gh-<key>`
   worktree under its own root (`<WorkRoot>/triage-worktrees`, `SandboxTriageRunner.TriageWorktrees`: never the items'
   `worktrees`, swept before each triage, not ACL-shared for writing — the worker user reads it through the work root's
   inherited read entry) whose git holds a contents-read token; nothing is committed or pushed; the issue text is fenced as
@@ -233,7 +250,51 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   worktrees or the worker home's transcripts); it can still restate what it read there — the target repo's own code at its
   default branch, the repo the issue is about — inside that bounded, fenced answer. Residual, accepted: Read and the read block
   are Claude Code's own enforcement, and on Glob and Grep (a search given an explicit path or pattern outside the working
-  directory) it is best-effort and unverified by the factory; a gap there would reach what `_factory` can read. The intake reads and writes the issue board only through the issue source's
+  directory) it is best-effort and unverified by the factory; a gap there would reach what `_factory` can read.
+  Loopback MCP proxy (sc-25707, `Mcp/`, E5/E6): sessions that plan or triage reach CodeGraph and Kanban only through
+  `McpProxy`, hosted by the process that runs the session (`SandboxTriageRunner` starts one per triage when CodeGraph is
+  configured, with the CodeGraph upstream only, in `factory work` or whatever process triages, and stops it after; a failed
+  sweep of leftover config files or proxy start is factory-wide, `FactoryUnavailableException`) on `127.0.0.1` only (a free port; never the dashboard's bind address; no
+  configuration source is read, so no `Kestrel:Endpoints`/URLs can add a listener, and start-up fails unless it listens on
+  exactly one `127.0.0.1` address). It holds the upstream tokens (`McpUpstreams`, the one registry it shares with the
+  reviewers' tool loop: `CodeGraphMcpClient.Upstream` and the Kanban `McpUpstream`, both over the generic `McpHttpClient`);
+  each grant is a per-session tool set, `McpProxy.Grant(repo, McpProfile)`: `McpProfile.Triage` (above) or
+  `McpProfile.Planner` (every allowlisted CodeGraph tool and Kanban read tool; for Phase 4, unused yet), each a subset of the
+  upstreams' allowlists (checked when the profile is made). The session gets `--mcp-config <file>` naming
+  `http://127.0.0.1:<port>/mcp/<server>` for each server its profile grants a tool of, with a
+  per-session bearer credential (32 random bytes, kept hashed), plus `--allowedTools` rules
+  `mcp__<server>__<tool>` for exactly its profile's tools (`WorkerTools.WithMcp`; refuses any rule off the allowlists, and any
+  base tools that are not read-only and confined, so an implementer can never be given one), and keeps
+  `--strict-mcp-config`. Requests need `Host` `127.0.0.1:<port>`/`localhost:<port>` and no `Origin` (else 403) and a live
+  credential (else 401; not the dashboard's cookie login); a server not configured, or one the grant has no tool of, is 404.
+  `tools/list` shows only the grant's tools; `tools/call` refuses any other with JSON-RPC error -32602, nothing forwarded, and
+  so every call past `McpProxy.MaxCallsPerGrant` (100) per grant; every relayed answer (CodeGraph's and Kanban's) is its text
+  cut at `McpProxy.MaxAnswerChars` (60,000 chars and UTF-8 bytes) with a `[cut: …]` marker, a CodeGraph answer first labelled
+  with the commit it describes as the reviewers' are ("CodeGraph's index of <project>'s default branch as of <sha>", or "…, commit
+  unknown"; a review adds ", not the PR head <head>", a proxy session has no PR head; `ReviewTools.DefaultBranchLabel`, E3), which
+  the CodeGraph tools' descriptions and the triage prompt say. One allowlist per
+  upstream: CodeGraph's is `ReviewTools.CodeGraphTools` (7 model-free tools), Kanban's `McpServers.KanbanTools` (the hosted
+  server's exact snake_case names, read from its `tools/list` on 2026-10-12, sc-25710: list_projects, get_board, list_epics,
+  get_epic, list_epic_documents, get_epic_document, list_work_items, list_epic_work_items, get_issues, get_work_item,
+  search_work_items; names match exactly, so a PascalCase spelling is never offered; no create_*/update_*/delete_*/move_*/
+  add_*_comment tool is ever offered or forwarded). CodeGraph is repo-scoped like the reviewers'
+  tools: the grant's repository's project (exact repo URL match, resolved once per grant), a call naming another `project`
+  refused (-32602), the arguments rebuilt by `ReviewTools.CodeGraphArguments` (unknown ones dropped) with the project set,
+  `read_node_source` shown only for a node of that project, schemas listed without a project argument. Kanban has no repository
+  mapping, so it is NOT repo-scoped: its read calls go through with the session's arguments. The credential never goes in argv
+  (every local user can read `ps`): `McpProxySessions` writes the config to `<WorkRoot>/mcp-sessions/<guid>.json` (directory
+  `0700`, file created `0600`; the worker user reads it through the work root's inherited read ACL, which the owner checks
+  with `/bin/ls -led` once the file is written — a `search` entry for `Worker:RunAs` on the directory and a `read` entry on the
+  file (`McpProxySessions.AclGrants`; no deny), else the session is not started, factory-wide, "re-run `sudo
+  scripts/setup-worker-user.sh`"; not checked with `Worker:RunAs=none`; outside the triage
+  worktree, so the confined session cannot Read it into its transcript) after checkout and before launch, and when the session
+  ends deletes it and revokes the credential (`McpProxyGrant.Dispose`: refused from then on); leftover files are swept before
+  each triage. Residual, accepted: while the session runs, a process that can read that file — the owner, root, or another
+  `_factory` process (none runs then: the triage holds the worker run lock) — could call the session's granted tools through
+  the proxy. Upstream tokens are only in the owner process (never in the worker's env, argv, worktree, prompt or transcript;
+  `McpProxyTests`). Every MCP tool use still taints the session (`mcp:<tool>`; triage is already tainted by the issue text and
+  never pushes). Implementers and fixers get no MCP: their tools allow none, and `ClaudeWorker.BuildArguments`/`RunAsync` refuse
+  an MCP config for them (`--strict-mcp-config` and no `--mcp-config`). Phase 4's planner reuses `McpProxy`/`McpProxySessions`. The intake reads and writes the issue board only through the issue source's
   `IIssueIntakeSource` capability (E6): triage comment and route label, issues, comments, permissions and gate policy. The orchestrator — not
   the model — routes (`IssueRouting`): question/duplicate → comment only; author without write/maintain/admin
   (`RepoPermission.IsCollaborator`; read and triage count as outsiders) on the issue's repo, or on the target repo when the
@@ -550,7 +611,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   picks the model inside the class, and any model may review or confirm — including the one that wrote the code, or the
   one that served the review a second opinion checks (there is no family, version or independence rule). Each role makes one
   router call (`RouterReviewer`: `POST /v1/messages` with `"stream": true` — the router cancels a call that has sent its
-  client nothing for 10 s — assembled by `MessageStream`, which fails closed on an `error` event, a stream without
+  client nothing for 10 s — assembled by `MessageStream`, which fails closed on an `error` event (a transient `server_error`/`api_error` one after the turn is retried, below), a stream without
   `message_stop` or one silent for 2 min; router key only, `x-weave-model-class: high` and never `x-weave-force-model` (the
   router refuses the two together), body `model` the fixed placeholder `ModelClass.RequestModel` (`default`: no catalog model
   has it, so no passthrough lane serves it verbatim; the router's in-class pick serves the call — the factory's router key
@@ -558,7 +619,91 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `model_class_unavailable` for a body model outside the class and would usage-pause every review in a loop), its own fresh
   `X-Claude-Code-Session-Id` so the cost stays scoped to it and no worker session or transcript reaches it) whose system
   prompt is the role's prompt file and whose message holds the story, the base commit's file list
-  (`IGateGitHub.GetFilesAsync`) and the diff of the PR's head commit — nothing else. Prompts: `factory/prompts/{correctness,spec-conformance,security,confirm}.md` in this repo, compiled in as
+  (`IGateGitHub.GetFilesAsync`) and the diff of the PR's head commit — nothing else. Tool loop (sc-25705, sc-25706,
+  `Gate/ReviewTools.cs`): every role and every second opinion is offered exactly `ReviewTools.Names` (E2, a read-only allowlist
+  in code; a tool name off it — CodeGraph's Ask, `project_report`, `rag_search`, … — answers an error result and is never
+  forwarded, and `CodeGraphMcpClient.CallAsync` refuses one before sending anything). Repository tools, `IReviewFiles` served
+  owner-side from the gate's clone (`GitWorkspace`, by object, `OwnerGit`-isolated: no checkout, so no filter, hook or symlink of
+  the PR runs or is followed; a commit not yet in the clone is fetched first): `read_file` (`git ls-tree -l` + `cat-file`; a
+  symlink/submodule/directory is no file, one over `MaxFileBytes` 1 MiB is not read; the blob is read as bytes, and a NUL byte or
+  invalid UTF-8 — so UTF-16 too — is binary, "binary file, not shown"; a valid U+FFFD is text), `list_files` (`ls-tree -r`, at most
+  `MaxListedFiles` 2,000 shown) and `grep` (`git grep -I -E --no-textconv -e <pattern>` on the tree, pattern ≤ `MaxPatternChars` 200,
+  `MaxGrepPerFile` 20 per file, `MaxGrepMatches` 200 shown, lines cut at `MaxGrepLineChars` 300), each at the PR head or, with
+  `ref: base`, its base commit. Their git reads stream git's output and stop git (its whole process tree) once the shown cap is
+  passed ("More than N …, the first N shown"), a listing passes `GitWorkspace.MaxReviewReadBytes` (240,000) or grep's kept lines
+  do (each line keeps at most `MaxGrepRecordBytes` 8 KiB); each git command of a read has its own `GitWorkspace.ReviewReadTimeout`
+  (30 s) and answers an error past it; a cancelled git read (`RunGitAsync` included) stops the git it started before it throws; a path is normalised (`RepoPath`) and
+  one leaving the repository is refused before anything is read (`--literal-pathspecs`: no glob or magic). CodeGraph tools
+  (`ReviewTools.CodeGraphTools`, each checked against CodeGraph's source to reach only the graph store and indexed files, never a
+  model — the reason per tool is the comment on the list): `analyze_impact`, `search_graph`, `trace_call_path`, `find_consumers`,
+  `find_publishers`, `get_code_snippet`, `read_node_source`; forwarded owner-side to CodeGraph's MCP endpoint
+  (`CodeGraph/CodeGraphMcpClient`, one MCP session per call, ended by a best-effort `DELETE`), arguments built by the orchestrator
+  (strings cut at 300, depths clamped 1–5, a snippet path `RepoPath`-normalised). No tool takes a project: the orchestrator always
+  sets the PR's repository, the CodeGraph project whose `search_projects` entry's `Repo:` URL is exactly
+  `https://github.com/<owner>/<name>` (with or without `.git`, case-insensitive; resolved once per session), and a repository no
+  entry matches answers the error "repository not indexed in CodeGraph". Queries are asked about this repository; answers are not
+  filtered and may name nodes of other indexed projects that depend on or call it (`analyze_impact`'s cross-repo impact,
+  `trace_call_path`, `find_consumers`/`find_publishers` cross projects), which every graph tool's description says; `read_node_source` (whose CodeGraph handler takes only a
+  node id) is shown only when its answer's header names that project. Each answer is labelled with the commit its index
+  describes, read only from CodeGraph's contract (CodeGraph sc-25702): `structuredContent.commitSha`, else a first text line
+  `Commit: <40-hex sha>` — otherwise "commit unknown" (today's hosted answers carry neither until sc-25702 deploys). Head overlay
+  (sc-25708, `Gate/ReviewOverlay.cs`, E3): when a review starts — once per head, before the first panel call, only if a role is
+  reviewed there (not when every review is carried) — the orchestrator, never a model, asks CodeGraph for an overlay of the PR
+  head (`ReviewOverlays`: `request_overlay(repo = the pinned project, ref = head SHA)`, then `get_overlay_status(overlayId)`
+  every `ReviewOverlays.DefaultPollInterval` (10 s); CodeGraph C6, michaeltrefry/CodeGraph PR #75, whose shapes the fakes copy) and
+  waits at most `CodeGraph:OverlayTimeoutMinutes` (the calls included), a Pause/Stop checked before each status read like before
+  each panel call. The outcome — `ready` (status ready, not `stale`, and `headSha` exactly the head), `failed` (failed/expired with
+  its `structuredContent.overlayError`, a ready overlay of another commit, or one still `stale` — its base no longer the
+  default-branch index commit, which read tools will not use — after one new `request_overlay`, which CodeGraph answers with a
+  fresh overlay: "the overlay is stale (default branch moved past its base)"), `refused` (HTTP 403 `tool_not_entitled` from
+  CodeGraph's entitlement middleware, `McpHttpException`: "not entitled to request_overlay"; or an error answer,
+  `structuredContent.error.code` in the reason: `repo_not_found`, `invalid_ref`, `overlays_unavailable`, …), `timed-out`,
+  `unavailable` (no token, repo not indexed, CodeGraph unreachable or the request/lookup timing out in its HTTP client, or a
+  `temporarily_unavailable` answer — requested again every poll interval — still so at the timeout; a status read that fails or
+  times out is read again until the timeout) — with overlay id, head and base, is the verdict's `codegraph`, a line of the PR
+  report and a `codegraph-overlay` checkpoint (Detail: its JSON; outcome passed when ready, else failed); a review resumed on the
+  same head (crash, Ctrl-C, a pause) reuses a recorded `ready` instead of waiting again (other outcomes are retried). A Pause, Stop
+  or shutdown still ends the wait by throwing; none of the outcomes fails the review (E4). A head-pinned call CodeGraph answers with
+  an error naming no commit is labelled "CodeGraph's answer for the PR head <sha> (error)". Ready, every CodeGraph call of every role and second opinion passes `sha` = head
+  (C4, CodeGraph PR #71) and only an answer naming exactly the head is labelled "CodeGraph's index of <project> at the PR head";
+  a typed not-indexed answer (`structuredContent.notIndexed`, which names the head yet carries no data) makes that call fall
+  back to the default-branch call, labelled and recorded (`tools[].fallback`). Not ready, the calls go without `sha` and are
+  labelled "…'s default branch as of <sha>, not the PR head" (`ReviewTools.DefaultBranchLabel`, which the loopback proxy prepends
+  to every CodeGraph answer it relays too, without a head and so without "not the PR head": both seams name the commit the same way). `request_overlay`/`get_overlay_status`
+  (`CodeGraphMcpClient.OverlayTools`) are sent straight through the MCP client and are on no allowlist, profile or tool list (a
+  test asserts it). Triage is unchanged (no `sha`). Overlay node ids are negative, so `read_node_source` takes any integer id. Kanban tools (sc-25707, only with `Kanban:Token`): each session lists the Kanban upstream once
+  (`ReviewTools.DefinitionsAsync`) and is offered, after `ReviewTools.Names`, its tools on `McpServers.KanbanTools` with their own
+  input schemas (a failed listing offers none; a tool whose schema is not a JSON object of `"type": "object"` within
+  `ReviewTools.MaxKanbanSchemaChars`, 4 KB serialized, is left out and logged once, `ReviewTools.UsableSchema`), plus one
+  prompt line saying so; a call is forwarded owner-side through the same
+  `McpUpstreams` registry the loopback proxy uses (input ≤ `ReviewTools.MaxKanbanArgumentChars` 2,000, not repo-scoped: Kanban
+  has no repository mapping), and a Kanban write tool is on no allowlist, so it answers an error and is never forwarded. A turn stopping for `tool_use` has the orchestrator run each call and answer it in a `<tool-result>` fence in the
+  next turn of the same session (same session id, class header, placeholder model), at most `RouterReviewer.MaxTurns` (8) turns
+  with tools (`tool_choice: auto`) and `MaxToolCalls` (24) calls; a model still asking for tools in the 8th turn gets those calls
+  answered "not run" plus a final-answer request (`RouterReviewer.FinalAnswerRequest`) and one more turn with `tool_choice: none`
+  (the tool definitions stay: the Messages API refuses tool blocks without them); no findings/confirmation line there — or tools
+  asked for again — is unusable ("No usable final answer after the turn cap: …"). The session's tool results together are at most
+  `ReviewTools.Budget` characters (`MaxSessionChars` 200,000 less the prompt, at least `MinSessionBudget` 8,000), and each result at
+  most `MaxResultBytes` (60,000) UTF-8 bytes, cut on a character boundary with an explicit `[cut: N bytes, the first M bytes shown]`
+  marker; a call once the budget is spent answers an error. Every turn must be served on `high` (the first that is not ends the
+  session, unusable), a usage refusal on any turn pauses as below, a turn whose stream ends in an upstream `error` event of type
+  `server_error` or `api_error` (`MessageStream.TransientErrorTypes`; seen live from OpenAI on the high class; not a usage refusal —
+  `overloaded_error` stays one) is sent again — the same request, session id and class header — at most
+  `RouterReviewer.MaxTransientRetries` (2) times after a short backoff (2 s, then 4 s), each failed attempt's error recorded on that
+  turn (`turns[].retried`), and fails closed as any broken stream when every attempt fails (sc-25710), and a router 400/413 on a later turn (a conversation grown too
+  long) makes the answer unusable rather than failing the run. A tool that cannot answer (no such file, a binary file, a
+  repository CodeGraph does not index, CodeGraph unreachable or unconfigured) gives the model an error result; it never fails
+  the review by itself. Each call is recorded in the verdict's review or, for a second opinion, on the finding's confirmation
+  under its own `confirm-<role>` session (`tools`: tool, arguments, SHA-256 and UTF-8 size (`bytes`) of the raw result before
+  fencing and bounding, error, CodeGraph commit; `turns`: every turn's number, served model and served class, the final-answer turn
+  included — the review's own `served`/`class` stay the last turn's; both absent in a verdict recorded before sc-25710, which still
+  reads) and the reports (PR body, closeout, escalation; `LedgerReport`) show per review its calls, how many answered an error and
+  up to `LedgerReport.MaxFailingToolsShown` (3) distinct failing tool names (inert code spans), and the same for its second
+  opinions (E4/E8). The prompts make reading code a rule: no claim about code outside the diff without reading it
+  (a finding about unread code is not allowed); the correctness prompt also requires, before a pass, one CodeGraph
+  `analyze_impact`/`trace_call_path`/`find_consumers` query for each changed non-private symbol (at most the 5 most significant),
+  naming the callers found, or saying CodeGraph answered an error or not indexed and going on (sc-25710); and a second opinion on a finding that depends on unshown code reads it, then
+  confirms or rejects. Prompts: `factory/prompts/{correctness,spec-conformance,security,confirm}.md` in this repo, compiled in as
   embedded resources (`ReviewPrompts`) — never read from the target repo or the PR (which could rewrite the prompt it is
   judged by) nor from disk at run time; changing one is a dark-factory PR. Each role answers findings tagged `blocking` or
   `optional` (an unknown severity counts as blocking); each blocking finding goes to a second opinion (its own high-class router session) with `confirm.md`: not confirmed → downgraded to optional (`downgraded: true`), does not
@@ -626,9 +771,13 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   of a non-Actions App with no check runs is ignored (GitHub creates one per App with checks access; the Claude App's stays
   queued forever). A workflow GitHub has not registered at all yet is still invisible. MergeGate (`MergeGate.Evaluate`, E1–E3) is deterministic code over
   facts read fresh each time: `factory/gate.yaml` at the PR's **base** commit (`pull.BaseSha`, the commit the diff is read
-  against; `GatePolicy`, `version: 2`, sc-25381: path tiers `sealed`/`protected`/`free` with `paths` and `checks`, `normal`
-  with `checks` only, and `risk: {max_changed_lines, max_changed_files, max_fix_rounds}`; every key required; version 1 is
-  rejected; missing/invalid/unreadable → no merge, escalate; no bypass key exists). The policy can tighten the gate but not
+  against; `GatePolicy`, `version: 2` or `3`, sc-25381: path tiers `sealed`/`protected`/`free` with `paths` and `checks`, `normal`
+  with `checks` only, and `risk: {max_changed_lines, max_changed_files, max_fix_rounds}` — version 3 (sc-25709) adds two required
+  risk keys, `max_blast_radius` (`low`|`medium`|`high`: a maximum, a file over it fails; `critical` would allow a critical file, is
+  looser than the code floor and invalid) and `max_hotspot` (`off`, or a number ≥ 0: the opt-in limit on the hotspot score; `off`
+  is the explicit opt-out, chosen over an optional key so every key stays required); each version's key set is strict, so a CodeGraph
+  key in a version 2 policy is unknown; version 2 still parses and runs at the floor with no hotspot limit; every key required;
+  version 1 is rejected; missing/invalid/unreadable → no merge, escalate; no bypass key exists). The policy can tighten the gate but not
   loosen it below floors in code (E2; described once on `GatePolicy`): checks — every tier lists `ci-green` and
   `review-pass`, sealed/protected also `security-review`, protected/normal also `risk-threshold` and
   `new-tests-fail-on-base` (`GatePolicy.FloorChecks`);
@@ -647,8 +796,47 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   needs the union of its tiers' checks: `ci-green`, `review-pass` (the head's verdict passes, holds every required role, and
   every review and second opinion was served on the router's `high` model class — its recorded `class`, a missing one
   failing closed — `ReviewModels.Problems`; which model served, and the implementer's models, are not consulted), `security-review` (the verdict has the
-  security review), `risk-threshold` (changed lines, files — renames count both paths — and fix rounds within `risk`),
-  `new-tests-fail-on-base` (sc-25382, below). A sealed path always escalates (even with no verdict); a protected one escalates after its checks instead of merging; each
+  security review), `risk-threshold` (changed lines, files — renames count both paths — and fix rounds within `risk`, and
+  CodeGraph's inputs, below), `new-tests-fail-on-base` (sc-25382, below). Risk score (sc-25709, `Gate/CodeGraphRisk.cs`; CodeGraph
+  C7, sc-25735, not deployed yet — the fakes follow its contract and C4's `CommitAnswer` shape, PR #71): `EvaluateGateAsync` first
+  evaluates the gate without CodeGraph (`MergeGate.Evaluate(…, riskUnread: true)`: a change that needs `risk-threshold` and that
+  nothing else blocks is `Pending`, never Merge), so a change another rule blocks (sealed path, failed verdict, new tests, size)
+  escalates without a CodeGraph call; only then the pipeline (`RunPipeline.CodeGraphRiskAsync`) reads, owner-side through
+  the CodeGraph client (`CodeGraphRiskReader` over `ICodeGraphRisk`, the project pinned by exact repo URL), for every touched file
+  (`MergeGate.TouchedFiles`: both sides of a rename, deletes) `analyze_impact_file(repo, path, sha = head, depth = 3)` — only once
+  CodeGraph's overlay of exactly the head is ready (a ready `codegraph-overlay` checkpoint for that head, e.g. the review's, is
+  reused until a read answers C4's `notIndexed` — e.g. status `stale`, the default branch moved past its base:
+  `CodeGraphRisk.OverlayUnusable` — after which the next read requests the overlay again, `ReviewOverlays.WaitAsync` re-requesting a
+  stale one; otherwise requested and waited for like the review's and checkpointed, an outcome the last row for that head already
+  records not written again) and only an answer naming the head (E3) and the file asked about (its `path`, normalized like the
+  diff's) — then `file_hotspot(repo, path)` from the default branch only (`source: default-branch`, the asked `path`), recorded with
+  the commit it names (E3's exception) as C7 (michaeltrefry/CodeGraph PR #76) shapes it: `commitSha` is the metrics' commit and
+  `indexCommitSha` the current default-branch index commit; a file without metrics (`found: false`, e.g. new) answers `commitSha`
+  null and counts as 0 recorded at `indexCommitSha`; a found file with a null `commitSha` (metrics computed before CodeGraph recorded
+  commits) keeps its score, recorded at `indexCommitSha` and labelled "vitals commit unknown; index at <sha>"; an answer naming
+  neither commit is unreadable. Each answer is reused within one wait while the ready overlay's base is its index commit
+  (`HotspotCache`, keyed by `indexCommitSha` — the commit the lookup names). The reader stops at the first input it cannot read. "The hotspot score" is CodeGraph's `riskScore`. The blast
+  radius has a code floor (`GatePolicy.BlastRadiusFloor` =
+  high: a critical file always fails; seam `policy-floor:blast-radius`), `max_blast_radius` can only lower it. CodeGraph rates a file critical only for a non-test dependent in another repo (depth 1, or depth 2 over a message edge) or a non-test depth-1 message consumer (`CONSUMES`, built only for repos in its `TrustedDotnetRepositories`); in-repo callers rate high at most, so in practice the floor fires on cross-repo dependents and
+  consumers (docs/acceptance.md, P3-AT4a); hotspots have no
+  floor — recorded and reported, failing only above an opted-in `max_hotspot`. A file CodeGraph has no data for (`found: false`,
+  e.g. a new file) counts as blast radius none / hotspot 0; a file read over a limit blocks at once, even when another could not be
+  read; one CodeGraph cannot read (an error answer, HTTP 403 `tool_not_entitled`, unreachable, the repo not indexed, a C4
+  `notIndexed` answer, no ready overlay of the head, an answer for another commit, another file or without a commit) otherwise
+  makes the decision `Pending` (owner decision 2026-10-10): `EvaluateGateAsync` reads every fact again every `Gate:CiPollSeconds`
+  like pending CI (controls checked and the PR read again between reads — found merged → recorded as found merged, closed →
+  escalate, a new head → Review — so the wait never holds the queue's turn for an old head; pending evaluations are not
+  checkpointed). One deadline bounds the whole wait, CodeGraph's overlay wait and calls included (a `CancellationTokenSource` on
+  `GateTime`): at `Gate:CiTimeoutMinutes` it is recorded Blocked and escalates, even mid-call; a real Pause/Stop still propagates.
+  No CodeGraph configured (no token: `GateStage.Risk` null) fails the check at once, wherever it is required — so a factory without
+  a CodeGraph token merges no normal or protected change; the reason names the setting, and `factory run` and `factory work` warn
+  at start-up (`FactoryRunner.CodeGraphTokenWarning`). Inputs read for another head or leaving a touched file out block. The inputs
+  are in the `gate` checkpoint's Detail after ` | ` (`CodeGraphRisk.Describe`): every file over a limit, the worst and the hottest,
+  then the first `CodeGraphRisk.MaxListed` (20) others with "… N more", each hotspot with its commit, and what could not be read
+  (capped likewise), so one row stays inside the reports' budget; a failure's
+  reason names each file over the limit with its blast radius (or hotspot score), so the escalation comment and the PR report (both
+  from the ledger) name it. `analyze_impact_file`/`file_hotspot` (`CodeGraphMcpClient.RiskTools`) are sent straight through the MCP
+  client and are on no allowlist, profile or tool list (a test asserts it). A sealed path always escalates (even with no verdict); a protected one escalates after its checks instead of merging; each
   evaluation is a `gate` checkpoint. A head without a verdict (a push after the review) goes back
   to Review (CI/MergeGate → Review are table rows); otherwise any failed rule escalates. A pass checkpoints `gate-passed`
   with the head SHA and merges with the gate App's write token and `sha` = that head (GitHub refuses a moved head: 409 →

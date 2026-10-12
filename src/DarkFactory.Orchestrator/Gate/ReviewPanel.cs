@@ -83,7 +83,9 @@ public sealed record Confirmation(
     [property: JsonPropertyName("class")] string? ServedClass,
     [property: JsonPropertyName("session")] string? Session,
     [property: JsonPropertyName("prompt")] string? Prompt,
-    [property: JsonPropertyName("reason")] string Reason)
+    [property: JsonPropertyName("reason")] string Reason,
+    [property: JsonPropertyName("tools"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<ToolCall>? Tools = null,
+    [property: JsonPropertyName("turns"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<ServedTurn>? Turns = null)
 {
     public const string Confirmed = "confirmed";
     public const string NotConfirmed = "not-confirmed";
@@ -93,6 +95,35 @@ public sealed record Confirmation(
     [JsonIgnore]
     public string ServedName => ServedModel ?? "(the router named no served model)";
 }
+
+/// <summary>
+/// One tool call a panel session made (sc-25705, <see cref="ReviewTools"/>), as the verdict records it: the tool, its arguments as
+/// the model sent them (cut at <see cref="ReviewTools.MaxRecordedArguments"/> characters), the SHA-256 and the UTF-8 size in bytes
+/// (<see cref="Bytes"/>; null in a verdict recorded before it was) of the raw result the model was given (before fencing and the
+/// session's bounds), whether that result was an error, and for a CodeGraph answer the commit it describes
+/// (<see cref="ReviewTools.UnknownCommit"/> when CodeGraph did not say). <see cref="Fallback"/>: the call was pinned to the PR head
+/// (its overlay was ready, sc-25708) but CodeGraph could not answer for the head, so the default-branch index answered; why.
+/// </summary>
+public sealed record ToolCall(
+    [property: JsonPropertyName("tool")] string Tool,
+    [property: JsonPropertyName("arguments")] string Arguments,
+    [property: JsonPropertyName("sha256")] string ResultSha256,
+    [property: JsonPropertyName("error")] bool Error = false,
+    [property: JsonPropertyName("commit"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Commit = null,
+    [property: JsonPropertyName("fallback"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Fallback = null,
+    [property: JsonPropertyName("bytes"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] long? Bytes = null);
+
+/// <summary>
+/// One model turn of a panel session (E1): its number (1-based; the final-answer turn after the turn cap included) and the model and
+/// model class the router said served it. The session's last turn is also the review's or second opinion's own <c>served</c>/<c>class</c>.
+/// <see cref="Retried"/>: each earlier attempt of this turn that failed mid-stream with a transient upstream error and was sent again
+/// (sc-25710, <see cref="RouterReviewer.MaxTransientRetries"/>), its error as the stream gave it; null when the first attempt answered.
+/// </summary>
+public sealed record ServedTurn(
+    [property: JsonPropertyName("turn")] int Turn,
+    [property: JsonPropertyName("served")] string? ServedModel,
+    [property: JsonPropertyName("class")] string? ServedClass,
+    [property: JsonPropertyName("retried"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<string>? Retried = null);
 
 /// <summary>One finding of a panel role. <see cref="Downgraded"/>: it was blocking, and the second opinion did not confirm it.</summary>
 public sealed record Finding(
@@ -137,7 +168,9 @@ public sealed record RoleReview(
     [property: JsonPropertyName("findings")] IReadOnlyList<Finding> Findings,
     [property: JsonPropertyName("summary")] string Summary,
     [property: JsonPropertyName("error")] string? Error = null,
-    [property: JsonPropertyName("carried")] string? CarriedFrom = null)
+    [property: JsonPropertyName("carried")] string? CarriedFrom = null,
+    [property: JsonPropertyName("tools"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<ToolCall>? Tools = null,
+    [property: JsonPropertyName("turns"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<ServedTurn>? Turns = null)
 {
     [JsonIgnore]
     public bool Clean => Error is null;

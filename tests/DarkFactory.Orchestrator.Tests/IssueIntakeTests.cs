@@ -542,7 +542,7 @@ public class IssueIntakeTests
         var outcome = await new RunPipeline(h.Source(), new WorkLedger(db, TimeProvider.System), h.Locks, workspaces, worker, prs, Sandbox,
                 TextWriter.Null, controls: h.Controls,
                 gate: new GateStage(github, reviewer, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5), null,
-                    new FakeTestRunner()))
+                    new FakeTestRunner(), Risk: FakeCodeGraphRisk.Reader()))
             .RunAsync(id, CancellationToken.None);
 
         Assert.True(outcome.Succeeded, outcome.Error);
@@ -766,7 +766,7 @@ public class IssueIntakeTests
         await new RunPipeline(h.Source(), new WorkLedger(db, TimeProvider.System), h.Locks, workspaces,
                 new FakeWorker(GatePipelineTests.ReportsModel(GatePipelineTests.ImplementerModel)), prs, Sandbox, TextWriter.Null, controls: h.Controls,
                 gate: new GateStage(github, new GatePipelineTests.FakeReviewer(), TimeSpan.FromMilliseconds(1),
-                    TimeSpan.FromSeconds(5), null, new FakeTestRunner()))
+                    TimeSpan.FromSeconds(5), null, new FakeTestRunner(), Risk: FakeCodeGraphRisk.Reader()))
             .RunAsync(id, CancellationToken.None);
 
         var pr = prs.Opened.Single();

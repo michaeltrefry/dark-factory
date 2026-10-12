@@ -24,14 +24,20 @@ public class ControlTests
     /// Works in tool calls until its run is cancelled or, honouring a pause, until the call after the pause request
     /// (as the PreToolUse hook does: the session then ends as a success). A resumed session finishes at once.
     /// </summary>
-    private sealed class ToolWorker(bool honoursPause = true) : IWorker
+    /// <remarks>
+    /// With <paramref name="holdCancel"/>, a cancelled run does not end until the test completes it, so a test can act while the
+    /// run still holds the item (its run lock) however slowly the test itself runs.
+    /// </remarks>
+    private sealed class ToolWorker(bool honoursPause = true, TaskCompletionSource? holdCancel = null) : IWorker
     {
         private int _pause;
         private int _tools;
+        private int _cancelled;
         public List<string?> Resumes { get; } = [];
         public TaskCompletionSource Working { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource CancelSeen { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public int Tools => Volatile.Read(ref _tools);
-        public bool Cancelled { get; private set; }
+        public bool Cancelled => Volatile.Read(ref _cancelled) == 1;
 
         public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass, WorkerCallbacks? callbacks, CancellationToken ct)
         {
@@ -57,7 +63,12 @@ public class ControlTests
             }
             catch (OperationCanceledException)
             {
-                Cancelled = true;
+                Volatile.Write(ref _cancelled, 1);
+                CancelSeen.TrySetResult();
+                if (holdCancel is not null)
+                {
+                    await holdCancel.Task;
+                }
                 throw;
             }
         }
@@ -263,12 +274,17 @@ public class ControlTests
     public async Task Stop_during_implement_kills_the_worker_cancels_the_item_and_tells_the_story()
     {
         var h = new Harness();
-        var worker = new ToolWorker();
+        // The run sees the Stop within a second (its control watch) and kills the worker; the worker's exit is held until the Stop
+        // call has returned, so a loaded runner cannot let the run finish the stop before that call looks at the run lock.
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var worker = new ToolWorker(holdCancel: release);
         var run = h.Run(worker);
-        await worker.Working.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await worker.Working.Task.WaitAsync(TimeSpan.FromSeconds(60));
 
         var result = await h.Actions().StopAsync(ControlScope.Item("sc-77"), "tester", CancellationToken.None);
-        var outcome = await run.WaitAsync(TimeSpan.FromSeconds(10));
+        await worker.CancelSeen.Task.WaitAsync(TimeSpan.FromSeconds(60));
+        release.SetResult();
+        var outcome = await run.WaitAsync(TimeSpan.FromSeconds(60));
 
         Assert.Contains("is running; its run stops it", result.Message);
         Assert.True(worker.Cancelled); // killed, not asked
