@@ -490,10 +490,10 @@ public class CodeGraphRiskTests
             Assert.Single((await Reader(down).ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None)).Unreadable));
     }
 
-    // ---- the risk tools are the orchestrator's alone ----
+    // ---- the risk tools are the gate's and, through the proxy, the planner's (sc-25874) ----
 
     [Fact]
-    public async Task The_risk_tools_are_on_no_model_facing_tool_list_and_are_never_forwarded()
+    public async Task The_risk_tools_are_on_no_reviewer_or_triage_tool_list_only_the_planners()
     {
         var riskTools = CodeGraphMcpClient.RiskTools;
         Assert.Equal(["analyze_impact_file", "file_hotspot"], riskTools);
@@ -503,26 +503,25 @@ public class CodeGraphRiskTests
             Assert.DoesNotContain(tool, ReviewTools.CodeGraphTools);
             Assert.DoesNotContain(ReviewTools.Definitions, d => JsonSerializer.SerializeToElement(d).GetProperty("name").GetString() == tool);
             Assert.DoesNotContain(McpServers.KanbanTools, t => t == tool);
-            Assert.DoesNotContain(McpServers.AllToolRules, r => r.EndsWith("__" + tool, StringComparison.Ordinal));
-            foreach (var profile in new[] { McpProfile.Triage, McpProfile.Planner })
-            {
-                Assert.DoesNotContain(tool, profile.ToolsOf(McpServers.CodeGraph));
-                Assert.DoesNotContain(tool, profile.ToolsOf(McpServers.Kanban));
-            }
+            Assert.DoesNotContain(tool, McpProfile.Triage.ToolsOf(McpServers.CodeGraph));
+            Assert.DoesNotContain(tool, McpProfile.Triage.ToolsOf(McpServers.Kanban));
+            // The one model-facing list that holds them: the planner profile's CodeGraph tools.
+            Assert.Contains(tool, PlannerCodeGraph.Tools);
+            Assert.Contains(tool, McpProfile.Planner.ToolsOf(McpServers.CodeGraph));
+            Assert.DoesNotContain(tool, McpProfile.Planner.ToolsOf(McpServers.Kanban));
         }
 
-        // A CodeGraph that lists them: the upstream (the proxy's and the reviewers' registry) neither lists nor calls them, and the
-        // reviewers' client refuses them before sending anything.
+        // A CodeGraph that lists them: the reviewers' client refuses them before sending anything; only the upstream registry (the
+        // loopback proxy's, which serves them to a planner grant alone) lists them.
         var server = new FakeMcpServer("/mcp", [.. riskTools, ReviewTools.AnalyzeImpact], (_, _) => FakeMcpServer.Text("x"));
         var client = new CodeGraphMcpClient(server.Client("https://codegraph.test/"), "cg_test_token");
-        Assert.Equal([ReviewTools.AnalyzeImpact], (await client.Upstream.ListToolsAsync(CancellationToken.None)).Select(t => t.Name));
         var before = server.Api.Requests.Count;
         foreach (var tool in riskTools)
         {
-            await Assert.ThrowsAsync<ToolNotAllowedException>(() => client.Upstream.CallAsync(tool, new JsonObject(), CancellationToken.None));
             await Assert.ThrowsAsync<ArgumentException>(() => client.CallAsync(tool, new JsonObject(), CancellationToken.None));
         }
         Assert.Equal(before, server.Api.Requests.Count);
+        Assert.Equal([.. riskTools, ReviewTools.AnalyzeImpact], (await client.Upstream.ListToolsAsync(CancellationToken.None)).Select(t => t.Name));
     }
 
     // ---- through the pipeline ----

@@ -247,12 +247,14 @@ public class PlanPipelineTests
         public List<string> Seats { get; } = [];
         public int Closed { get; private set; }
 
-        public async Task<T> RunAsync<T>(WorkItem item, RepoRef repo, Func<PlannerSeat, CancellationToken, Task<T>> session, CancellationToken ct)
+        public async Task<T> RunAsync<T>(WorkItem item, IReadOnlyList<RepoRef> repos, Func<PlannerSeat, CancellationToken, Task<T>> session,
+            CancellationToken ct)
         {
-            Seats.Add($"{item.ExternalId} {repo}");
+            Seats.Add($"{item.ExternalId} {string.Join(' ', repos)}");
             try
             {
-                return await session(new PlannerSeat(worker, "/plan-wt", null, ["mcp__codegraph__search_graph"]), ct);
+                return await session(new PlannerSeat(worker, "/plan-wt", null, ["mcp__codegraph__search_graph"],
+                    repos.Count == 1 ? [] : repos.Select(r => new PlanCheckout(r, r.FullName)).ToList()), ct);
             }
             finally
             {
@@ -278,6 +280,8 @@ public class PlanPipelineTests
         /// <summary>The implementer: no plan item ever reaches it.</summary>
         public FakeWorker Implementer { get; init; } = new(Reports(Ok));
         public FakePlanRunner? Planner { get; private set; }
+        /// <summary>The factory's configured repositories (null: the default repository alone).</summary>
+        public IReadOnlyList<RepoRef>? Configured { get; init; }
 
         public Task<RunOutcome> Run(IWorkSource source, IWorker? planner, int id = 77, CancellationToken ct = default)
         {
@@ -287,7 +291,7 @@ public class PlanPipelineTests
 
         public Task<RunOutcome> RunWith(IWorkSource source, IPlanRunner? runner, int id = 77, CancellationToken ct = default) =>
             new RunPipeline(source, Ledger, Locks, Workspaces, Implementer, Prs, Sandbox, TextWriter.Null, controls: Controls,
-                controlPollInterval: TimeSpan.FromMilliseconds(10), planner: runner).RunAsync(id, ct);
+                controlPollInterval: TimeSpan.FromMilliseconds(10), planner: runner, configuredRepos: Configured).RunAsync(id, ct);
 
         /// <summary>Puts sc-77 in the ledger as an earlier run left it: in Plan, then each row (a null step is a transition to that state).</summary>
         public async Task Left(params (string? Step, WorkState State, string? Detail)[] rows)
@@ -578,7 +582,7 @@ public class PlanPipelineTests
     /// <summary>A planner whose seat cannot be set up: the factory's failure (the sweep, the MCP proxy, the session file's ACL).</summary>
     private sealed class UnavailablePlanRunner : IPlanRunner
     {
-        public Task<T> RunAsync<T>(WorkItem item, RepoRef repo, Func<PlannerSeat, CancellationToken, Task<T>> session, CancellationToken ct) =>
+        public Task<T> RunAsync<T>(WorkItem item, IReadOnlyList<RepoRef> repos, Func<PlannerSeat, CancellationToken, Task<T>> session, CancellationToken ct) =>
             throw new FactoryUnavailableException("the planner's set-up: no proxy", new InvalidOperationException("no proxy"));
     }
 
@@ -865,6 +869,82 @@ public class PlanPipelineTests
         Assert.Empty(source.Children);
     }
 
+    // ---- sc-25874: the plan's repository set ----
+
+    private static readonly RepoRef Widgets = new("acme", "widgets");
+    private static readonly RepoRef Gears = new("acme", "gears");
+    private static readonly WorkStory TwoRepoStory = PlanStory with { Description = "Share the mesh format.\n\nRepo: acme/widgets\nRepo: acme/gears" };
+
+    [Fact]
+    public async Task A_plan_naming_several_configured_repositories_seats_the_planner_in_all_of_them_and_its_stories_stay_in_the_first()
+    {
+        var h = new Harness { Configured = [Sandbox, Gears, new RepoRef("Acme", "Widgets")] };
+        var source = new FakeWorkSource(TwoRepoStory) { PlansItems = true };
+        var planner = Planner(Reports(Planned));
+
+        var outcome = await h.Run(source, planner);
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(WorkState.Planned, outcome.State);
+        // The whole set, the item's primary repository (the first line) first.
+        Assert.Equal(["sc-77 acme/widgets acme/gears"], h.Planner!.Seats);
+        var prompt = Assert.Single(planner.Calls).Prompt;
+        Assert.Contains("- acme/widgets/ is acme/widgets (the plan's primary repository)", prompt);
+        Assert.Contains("- acme/gears/ is acme/gears", prompt);
+        Assert.Contains("a required \"repo\" argument naming it: one of acme/widgets, acme/gears", prompt);
+        // The rest of the pipeline still uses the primary repository alone.
+        Assert.Equal("acme/widgets", (await h.Db.WorkItems.AsNoTracking().SingleAsync()).Repo);
+        Assert.NotEmpty(source.Children);
+        Assert.All(source.Children, c => Assert.Equal(Widgets, RepoResolver.Resolve(c.Child.Description, Sandbox)));
+    }
+
+    [Fact]
+    public async Task A_plan_naming_an_unconfigured_repository_escalates_before_any_session_and_creates_nothing()
+    {
+        var h = new Harness { Configured = [Sandbox, Widgets] };
+        var source = new FakeWorkSource(TwoRepoStory) { PlansItems = true };
+        var planner = Planner(Reports(Planned));
+
+        var outcome = await h.Run(source, planner);
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains("acme/gears is not configured for this factory", outcome.Error);
+        Assert.Contains("no planner session was started and no story was created", outcome.Error);
+        Assert.Empty(h.Planner!.Seats); // no seat, so no checkout and no proxy grant
+        Assert.Empty(planner.Calls);
+        Assert.Empty(source.Children);
+        var steps = await h.Steps();
+        Assert.DoesNotContain(RunPipeline.Steps.Session, steps);
+        Assert.DoesNotContain(RunPipeline.Steps.WorkerStarted, steps);
+        Assert.DoesNotContain(RunPipeline.Steps.Plan, steps);
+        Assert.DoesNotContain(RunPipeline.Steps.PlanCreating, steps);
+        Assert.Contains(source.Comments, c => c.Contains("acme/gears is not configured"));
+
+        // Without the configured list only the default repository is configured: both lines are refused, each named.
+        var bare = new Harness();
+        var refused = await bare.Run(new FakeWorkSource(TwoRepoStory) { PlansItems = true }, Planner(Reports(Planned)));
+        Assert.Contains("acme/widgets, acme/gears are not configured", refused.Error);
+    }
+
+    [Fact]
+    public async Task A_plan_with_one_repo_line_or_none_is_planned_in_that_repository_as_before()
+    {
+        // One line, naming a repository that is not in the configured list: as before sc-25874, the planner runs in it.
+        var h = new Harness { Configured = [Sandbox] };
+        var one = new FakeWorkSource(PlanStory with { Description = "Reports need a CSV download.\n\nRepo: acme/gears" }) { PlansItems = true };
+        var planner = Planner(Reports(Planned));
+
+        Assert.True((await h.Run(one, planner)).Succeeded);
+        Assert.Equal(["sc-77 acme/gears"], h.Planner!.Seats);
+        var prompt = Assert.Single(planner.Calls).Prompt;
+        Assert.Contains("The current directory is a checkout of acme/gears's default branch.", prompt);
+        Assert.DoesNotContain("\"repo\" argument", prompt);
+
+        var none = new Harness();
+        Assert.True((await none.Run(new FakeWorkSource(PlanStory) { PlansItems = true }, Planner(Reports(Planned)))).Succeeded);
+        Assert.Equal([$"sc-77 {Sandbox}"], none.Planner!.Seats);
+    }
+
     [Fact]
     public async Task A_waiting_plan_item_is_in_no_handled_state_and_gets_no_held_notice()
     {
@@ -920,7 +1000,7 @@ public class PlanRunnerTests
         var sessions = new Sessions();
         var worker = new FakeWorker { Tools = WorkerTools.ReadOnly.WithMcp(["mcp__codegraph__analyze_impact"]) };
 
-        var seat = await new WorkerPlanRunner(workspaces, worker, TextWriter.Null, sessions).RunAsync(Item, Repo, (s, _) =>
+        var seat = await new WorkerPlanRunner(workspaces, worker, TextWriter.Null, sessions).RunAsync(Item, [Repo], (s, _) =>
         {
             Assert.Equal(0, sessions.Disposed);
             Assert.DoesNotContain(workspaces.Calls, c => c.StartsWith("remove"));
@@ -942,13 +1022,13 @@ public class PlanRunnerTests
         var sessions = new Sessions();
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => new WorkerPlanRunner(workspaces, new FakeWorker(), TextWriter.Null, sessions)
-            .RunAsync(Item, Repo, (_, _) => Task.FromResult(0), CancellationToken.None));
+            .RunAsync(Item, [Repo], (_, _) => Task.FromResult(0), CancellationToken.None));
 
         Assert.Contains("must be read-only", ex.Message);
         Assert.Empty(workspaces.Calls);
 
         var seat = await new WorkerPlanRunner(workspaces, new FakeWorker { Tools = WorkerTools.ReadOnly }, TextWriter.Null, sessions)
-            .RunAsync(Item, Repo, (s, _) => Task.FromResult(s), CancellationToken.None);
+            .RunAsync(Item, [Repo], (s, _) => Task.FromResult(s), CancellationToken.None);
 
         Assert.Empty(sessions.Opened);
         Assert.Null(seat.McpConfig);
@@ -961,11 +1041,11 @@ public class PlanRunnerTests
         var workspaces = new FakeWorkspaces();
         var runner = new WorkerPlanRunner(workspaces, new FakeWorker { Tools = WorkerTools.ReadOnly }, TextWriter.Null);
 
-        await Assert.ThrowsAsync<WorkerFailedException>(() => runner.RunAsync<int>(Item, Repo, (_, _) => throw new WorkerFailedException("boom"), CancellationToken.None));
+        await Assert.ThrowsAsync<WorkerFailedException>(() => runner.RunAsync<int>(Item, [Repo], (_, _) => throw new WorkerFailedException("boom"), CancellationToken.None));
         Assert.Contains("remove acme/widgets /wt/factory/plan-sc-5", workspaces.Calls);
 
         workspaces.Calls.Clear();
-        await Assert.ThrowsAsync<WorkerFailedException>(() => runner.RunAsync<int>(Item, Repo,
+        await Assert.ThrowsAsync<WorkerFailedException>(() => runner.RunAsync<int>(Item, [Repo],
             (_, _) => throw WorkerStillRunning.Mark(new WorkerFailedException("still running")), CancellationToken.None));
         Assert.DoesNotContain(workspaces.Calls, c => c.StartsWith("remove"));
     }

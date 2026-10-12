@@ -503,6 +503,28 @@ names; a second `factory run` adds no ledger row and no story.
 
 Not run live yet (2026-10-12): written with sc-25870, to be run by the owner.
 
+## P4-AT3 (proxy part) — a planner grant over two repositories (sc-25874)
+
+`PlanAcceptanceTests.P4_AT3_a_planner_grant_over_two_repositories_answers_for_each_and_refuses_a_third_project_and_off_list_tools`:
+the production upstream registry and loopback proxy with a planner grant over two repositories; the test plays the planner's MCP
+client itself, so no model is called and nothing is written anywhere.
+
+Prerequisites: a CodeGraph token (`CodeGraph:Token`) and `FACTORY_E2E_P4_PLAN_REPOS=owner/a,owner/b`: two repositories the hosted
+CodeGraph indexes (each project's repository URL exactly `https://github.com/<owner>/<name>`), e.g. SceneWorks and inference;
+CodeGraph must index at least one more project (the "third").
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_P4_PLAN_REPOS=owner/a,owner/b \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4_AT3*"
+```
+
+Expected evidence: `tools/list` shows only planner-profile tools, the six cross-repository ones among them, `search_graph` with a
+`repo` enum of the two repositories; a `search_graph` answer for each repository, labelled with that repository's CodeGraph
+project; and JSON-RPC -32602 for a `project` naming a third indexed project (alone, and against a `repo` of the set), a `repo`
+outside the set, a call naming no repository, and `get_architecture`, `get_service_summary` and `rag_search`.
+
+Not run live yet (2026-10-12): written with sc-25874, to be run by the owner.
+
 ## Upgrading a Phase 1 ledger: items parked at Review
 
 Phase 1 parked every finished item at Review; since sc-25378 Review is a state the factory drives, so the first

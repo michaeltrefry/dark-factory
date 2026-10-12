@@ -23,6 +23,14 @@ public interface IMcpSessions
 {
     /// <summary>Opens a session about <paramref name="repo"/> granted exactly <paramref name="profile"/>'s tools.</summary>
     Task<IMcpSession> OpenAsync(RepoRef repo, McpProfile profile, CancellationToken ct);
+
+    /// <summary>
+    /// Opens a session about every repository of <paramref name="repos"/> (sc-25874: a planner's, the only profile granted more than
+    /// one, <see cref="McpProxy.Grant(IReadOnlyList{RepoRef}, McpProfile)"/>).
+    /// </summary>
+    Task<IMcpSession> OpenAsync(IReadOnlyList<RepoRef> repos, McpProfile profile, CancellationToken ct) => repos.Count == 1
+        ? OpenAsync(repos[0], profile, ct)
+        : throw new NotSupportedException("These MCP sessions are about exactly one repository.");
 }
 
 /// <summary>
@@ -62,7 +70,9 @@ public sealed partial class McpProxySessions(McpProxy proxy, string directory, s
         }
     }
 
-    public async Task<IMcpSession> OpenAsync(RepoRef repo, McpProfile profile, CancellationToken ct)
+    public Task<IMcpSession> OpenAsync(RepoRef repo, McpProfile profile, CancellationToken ct) => OpenAsync([repo], profile, ct);
+
+    public async Task<IMcpSession> OpenAsync(IReadOnlyList<RepoRef> repos, McpProfile profile, CancellationToken ct)
     {
         if (!OperatingSystem.IsWindows())
         {
@@ -73,7 +83,7 @@ public sealed partial class McpProxySessions(McpProxy proxy, string directory, s
         {
             Directory.CreateDirectory(directory);
         }
-        var grant = proxy.Grant(repo, profile);
+        var grant = proxy.Grant(repos, profile);
         var path = Path.Combine(Path.GetFullPath(directory), $"{Guid.NewGuid():N}.json");
         try
         {
