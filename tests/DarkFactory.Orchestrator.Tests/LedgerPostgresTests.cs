@@ -164,6 +164,57 @@ public sealed class LedgerPostgresTests : IAsyncLifetime
         Assert.Equal(["Intake", "Implement", "Failed"], states);
     }
 
+    /// <summary>
+    /// sc-25871: the <c>PlanItems</c> migration. A story's plan link is a nullable reference to the plan's own work item; rows that
+    /// existed before it have none; and the plan of a story is found from the plan item's <c>plan-stories</c> row in real SQL.
+    /// </summary>
+    [Fact]
+    public async Task The_plan_items_migration_adds_a_nullable_plan_link_that_must_name_a_work_item_and_rolls_back()
+    {
+        long planId;
+        await using (var db = Context())
+        {
+            var ledger = new WorkLedger(db, TimeProvider.System);
+            var plan = await ledger.GetOrCreateAsync("shortcut", "sc-1", "Plan", "o/r", null, CancellationToken.None);
+            await ledger.RecordAsync(plan, WorkState.Plan, null, null, CancellationToken.None);
+            await ledger.CheckpointAsync(plan, RunPipeline.Steps.PlanStories, null, "sc-20 sc-21", CancellationToken.None);
+            await ledger.RecordAsync(plan, WorkState.Planned, null, "2 stories: sc-20 sc-21", CancellationToken.None);
+            await ledger.GetOrCreateAsync("shortcut", "sc-20", "Story", "o/r", null, CancellationToken.None);
+            planId = plan.Id;
+
+            // Down drops the link and keeps the rows; up again gives every existing row no plan.
+            var migrator = db.GetService<IMigrator>();
+            await migrator.MigrateAsync("20261009011317_StepOutcomes");
+            await migrator.MigrateAsync();
+        }
+        await using (var db = Context())
+        {
+            var ledger = new WorkLedger(db, TimeProvider.System);
+            Assert.All(await db.WorkItems.AsNoTracking().ToListAsync(), i => Assert.Null(i.PlanItemId));
+            Assert.Equal(planId, await ledger.PlanOfAsync("shortcut", "sc-20", CancellationToken.None));
+            Assert.Equal(planId, await ledger.PlanOfAsync("shortcut", "sc-21", CancellationToken.None));
+            Assert.Null(await ledger.PlanOfAsync("shortcut", "sc-2", CancellationToken.None)); // a prefix of a listed id
+            Assert.Null(await ledger.PlanOfAsync("github", "sc-20", CancellationToken.None));
+
+            var story = (await ledger.FindAsync("shortcut", "sc-20", CancellationToken.None))!;
+            await ledger.LinkPlanAsync(story, planId, CancellationToken.None);
+            var version = story.Version;
+            await ledger.LinkPlanAsync(story, planId, CancellationToken.None); // already linked: nothing written
+            Assert.Equal(version, story.Version);
+
+            // The link must name a work item: one that does not exist is refused and nothing is left changed in memory.
+            await Assert.ThrowsAsync<DbUpdateException>(() => ledger.LinkPlanAsync(story, planId + 1000, CancellationToken.None));
+            Assert.Equal((planId, version), (story.PlanItemId, story.Version));
+        }
+        await using (var db = Context())
+        {
+            Assert.Equal(planId, (await db.WorkItems.AsNoTracking().SingleAsync(i => i.ExternalId == "sc-20")).PlanItemId);
+            var known = await new WorkLedger(db, TimeProvider.System).ItemsByIdAsync("shortcut", ["sc-1", "sc-20", "sc-99"], CancellationToken.None);
+            Assert.Equal(["sc-1", "sc-20"], known.Keys.Order());
+            Assert.Equal([null, RunPipeline.Steps.PlanStories, null], known["sc-1"].History.Skip(1).Select(r => r.Step));
+        }
+    }
+
     private sealed class Workspaces : IRepoWorkspace
     {
         private static Workspace Ws(string branch) => new($"/wt/{branch}", branch, "main", $"/clone/.git/worktrees/{branch}");

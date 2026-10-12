@@ -17,6 +17,7 @@ public class LifecycleTests
     [InlineData(Intake, Implement)]
     [InlineData(Plan, Implement)]
     [InlineData(Plan, Planned)] // sc-25870: a plan item's stories are on the board; it waits on them
+    [InlineData(Planned, Done)] // sc-25871: every story of the plan merged and the plan was closed out
     [InlineData(Implement, Review)]
     [InlineData(Review, Fixing)]
     [InlineData(Fixing, Review)]

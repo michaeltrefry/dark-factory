@@ -52,6 +52,42 @@ public static class LedgerReport
             + Facts(history, sessionCosts).TrimEnd();
     }
 
+    /// <summary>The most stories a plan's closeout lists; the rest are counted (a plan holds at most <see cref="Plans.PlanParser.MaxStories"/>).</summary>
+    public const int MaxPlanStoriesShown = 40;
+
+    /// <summary>
+    /// The board comment that closes a plan item out once every story of its plan has merged (sc-25871): one line per story, from
+    /// that story's own ledger rows — its typed outcome and state, the merge commit its Merge row holds and its pull request (the
+    /// <c>linked</c> checkpoint). A story's title is a planner's text: inert, in a code span.
+    /// </summary>
+    public static string PlanCloseout(string externalId, IReadOnlyList<PlanStoryReport> stories)
+    {
+        var merged = stories.Count(s => s.History.Any(e => e.Step is null && e.State == WorkState.Merge));
+        var text = new StringBuilder();
+        text.Append(CultureInfo.InvariantCulture,
+            $"{WorkSourceComments.Author} {externalId}'s plan is complete: {merged} of its {stories.Count} stories merged through the factory's merge gate.\n\n");
+        text.Append("**From the factory ledger** (results the orchestrator executed and recorded, never a worker's own report):\n\n");
+        foreach (var story in stories.Take(MaxPlanStoriesShown))
+        {
+            var history = story.History.ToList();
+            var state = history.LastOrDefault(e => e.Step is null);
+            var commit = history.LastOrDefault(e => e.Step is null && e.State == WorkState.Merge)?.Detail;
+            var pull = RunPipeline.LinkedPullRequestUrl(history);
+            text.Append(CultureInfo.InvariantCulture, $"- {story.ExternalId} {Code(story.Title)}: ");
+            text.Append(state is null ? "no ledger row" : $"{Outcome(state)} {state.State}");
+            text.Append(commit is null ? ", not merged" : $", merged as {Code(commit)}");
+            text.Append(pull is null ? ", no pull request recorded"
+                : pull.Length <= MaxFragment && Uri.TryCreate(pull, UriKind.Absolute, out var uri) && uri.Scheme == Uri.UriSchemeHttps ? $", {pull}"
+                : $", {Code(pull)}");
+            text.Append('\n');
+        }
+        if (stories.Count > MaxPlanStoriesShown)
+        {
+            text.Append(CultureInfo.InvariantCulture, $"- … and {stories.Count - MaxPlanStoriesShown} more (the ledger has them)\n");
+        }
+        return Clip(text.ToString().TrimEnd(), MaxFactsLength);
+    }
+
     /// <summary>
     /// The ledger's facts about the item as Markdown: its state, its worker sessions, every check row, every verdict row, the fix rounds and
     /// the cost. Bounded to <see cref="MaxFactsLength"/> characters, so a PR body or a comment carrying it stays under GitHub's (65,536) and
@@ -280,3 +316,6 @@ public static class LedgerReport
     /// <summary>Text from a row, inert and in a code span (bounded: a row's detail can be long).</summary>
     private static string Code(string text) => UntrustedText.CodeSpan(text.Length > MaxFragment ? text[..MaxFragment] + "…" : text);
 }
+
+/// <summary>One story of a plan as its plan's closeout reports it: its id, its title (a planner's text) and its own ledger rows.</summary>
+public sealed record PlanStoryReport(string ExternalId, string Title, IReadOnlyList<LedgerEntry> History);

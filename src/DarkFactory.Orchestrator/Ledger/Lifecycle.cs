@@ -5,7 +5,10 @@ public enum WorkState
 {
     Intake,
     Plan,
-    /// <summary>A plan item whose stories are on the board (sc-25870): it waits on them; nothing implements it.</summary>
+    /// <summary>
+    /// A plan item whose stories are on the board (sc-25870): nothing implements it. Each poll releases the stories whose blockers
+    /// have merged, and once every story has merged the item is closed out and goes to <see cref="Done"/> (sc-25871).
+    /// </summary>
     Planned,
     Implement,
     Review,
@@ -62,6 +65,8 @@ public static class Lifecycle
         [WorkState.Intake] = [WorkState.Plan, WorkState.Implement],
         // A plan item's stories were created: it waits on them (sc-25870) and never goes on to Implement itself.
         [WorkState.Plan] = [WorkState.Implement, WorkState.Planned],
+        // Every story of the plan merged and the plan item was reported and closed out on its board (sc-25871): it is finished.
+        [WorkState.Planned] = [WorkState.Done],
         [WorkState.Implement] = [WorkState.Review],
         [WorkState.Review] = [WorkState.Fixing, WorkState.CI],
         [WorkState.Fixing] = [WorkState.Review],

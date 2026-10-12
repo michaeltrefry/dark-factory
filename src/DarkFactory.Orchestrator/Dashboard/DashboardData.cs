@@ -134,7 +134,7 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
                 .ToListAsync(ct))
             .GroupBy(e => e.WorkItemId)
             .ToDictionary(g => g.Key, g => g.Last().Detail);
-        var closeouts = await new WorkLedger(db, time).CloseoutRowsAsync(items.Where(i => i.State == WorkState.Watch).Select(i => i.Id).ToList(), ct);
+        var closeouts = await new WorkLedger(db, time).CloseoutRowsAsync(items.Where(i => i.State is WorkState.Watch or WorkState.Planned).Select(i => i.Id).ToList(), ct);
         return items.Select(i => new PipelineRow(
                 i.Id, i.ExternalId, i.Title, i.Repo, i.State, i.CreatedAt, i.UpdatedAt,
                 PullRequestUrl(links.GetValueOrDefault(i.Id)),
@@ -144,7 +144,8 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
                 sessions[i.Id].Select(s => Link(s, lastEvents.GetValueOrDefault(s.Id))).ToList(),
                 i.EpicId,
                 ControlOf(i),
-                i.State == WorkState.Watch && RunPipeline.CloseoutOf(closeouts[i.Id]) is { Posted: false, Attempts: > 0 } failed ? failed : null))
+                // A merged item's closeout, or a finished plan's (sc-25871: a plan item has no Merge row, so every closeout row is its own).
+                i.State is WorkState.Watch or WorkState.Planned && RunPipeline.CloseoutOf(closeouts[i.Id]) is { Posted: false, Attempts: > 0 } failed ? failed : null))
             .ToList();
     }
 

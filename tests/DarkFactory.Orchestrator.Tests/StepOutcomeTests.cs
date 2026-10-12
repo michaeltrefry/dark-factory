@@ -376,6 +376,16 @@ public class StepOutcomeTests
         { null, WorkState.Plan, RunPipeline.Steps.Plan, "{}", StepOutcome.Passed },
         { null, WorkState.Plan, RunPipeline.Steps.PlanRejected, "cycle: a, b", StepOutcome.GateRejected },
         { null, WorkState.Plan, RunPipeline.Steps.PlanStories, "sc-12 sc-13", StepOutcome.Passed },
+        // sc-25871: a waiting plan item's rows, and a plan story's refused claim.
+        { null, WorkState.Planned, RunPipeline.Steps.PlanReleased, "sc-12", StepOutcome.Passed },
+        { null, WorkState.Planned, RunPipeline.Steps.PlanHeld, "sc-13 held by sc-99 (not a story of this plan, not merged by the factory)", StepOutcome.Deferred },
+        { null, WorkState.Planned, RunPipeline.Steps.MergedReported, "2 stories merged", StepOutcome.Passed },
+        { null, WorkState.Planned, RunPipeline.Steps.Closeout, RunPipeline.Posted, StepOutcome.Passed },
+        { null, WorkState.Planned, RunPipeline.Steps.Closeout, "failed: Shortcut down", StepOutcome.Failed },
+        { WorkState.Planned, WorkState.Done, null, "2 stories merged", StepOutcome.Passed },
+        { WorkState.Planned, WorkState.Paused, null, RunPipeline.UserPaused, StepOutcome.Deferred },
+        { WorkState.Planned, WorkState.Cancelled, null, "stopped", StepOutcome.Deferred },
+        { WorkState.Intake, WorkState.Paused, null, "claim refused: blocked by sc-12 (not merged)", StepOutcome.Deferred },
     };
 
     [Theory]

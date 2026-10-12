@@ -15,6 +15,13 @@ public sealed class WorkItem
     /// <summary>The story's epic on its board, if any: the scope an epic-level control applies to.</summary>
     public long? EpicId { get; set; }
 
+    /// <summary>
+    /// The plan item (its <see cref="Id"/>) whose plan created this story (sc-25871), null for any other item: set, once, from the
+    /// plan item's <c>plan-stories</c> checkpoint when the story is first run (<see cref="WorkLedger.LinkPlanAsync"/>). A story of a
+    /// plan is not started before its blockers are satisfied, and a plan's stories are grouped on it.
+    /// </summary>
+    public long? PlanItemId { get; set; }
+
     public WorkState State { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
@@ -208,6 +215,8 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
             e.Property(x => x.State).HasConversion<string>().HasMaxLength(32);
             e.Property(x => x.Version).IsConcurrencyToken();
             e.HasIndex(x => new { x.Source, x.ExternalId }).IsUnique();
+            e.HasIndex(x => x.PlanItemId);
+            e.HasOne<WorkItem>().WithMany().HasForeignKey(x => x.PlanItemId).OnDelete(DeleteBehavior.Restrict);
             e.HasMany(x => x.Entries).WithOne().HasForeignKey(x => x.WorkItemId);
         });
         modelBuilder.Entity<LedgerEntry>(e =>

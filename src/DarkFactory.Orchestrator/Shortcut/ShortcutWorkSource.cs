@@ -314,6 +314,26 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
         return ids;
     }
 
+    /// <summary>
+    /// The stories that block <paramref name="id"/>: the subject of every <c>blocks</c> relation whose object it is (the story's own
+    /// <c>story_links</c>; a relation is listed on both of its stories).
+    /// </summary>
+    public async Task<IReadOnlyList<int>> BlockersAsync(int id, CancellationToken ct) =>
+        (await GetStoryAsync(id, ct)).StoryLinks.Where(l => l.Verb == "blocks" && l.ObjectId == id && l.SubjectId != id)
+            .Select(l => l.SubjectId).Distinct().Order().ToList();
+
+    /// <summary>Backlog → <see cref="ReadyState"/>, only for a story still in its workflow's Backlog (state ids by name, from the API).</summary>
+    public async Task<bool> MakeReadyAsync(int id, CancellationToken ct)
+    {
+        var story = await GetStoryAsync(id, ct);
+        if (story.Archived || story.WorkflowStateId != await StateIdAsync(story.WorkflowId, BoardStateName(BoardState.Stopped), ct))
+        {
+            return false;
+        }
+        await UpdateAsync(id, new { workflow_state_id = await StateIdAsync(story.WorkflowId, ReadyState, ct) }, ct);
+        return true;
+    }
+
     /// <summary>Whether a stored description is the one that was sent (line endings and outer whitespace aside).</summary>
     private static bool SameText(string? stored, string sent) =>
         string.Equals((stored ?? "").ReplaceLineEndings("\n").Trim(), sent.ReplaceLineEndings("\n").Trim(), StringComparison.Ordinal);

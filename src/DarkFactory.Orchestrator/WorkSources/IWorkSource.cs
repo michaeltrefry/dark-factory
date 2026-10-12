@@ -145,6 +145,22 @@ public interface IWorkSource
     /// (<see cref="ChildrenRefusedException"/>) when it could not find the children again after a failed attempt.
     /// </summary>
     Task<IReadOnlyList<int>> CreateChildrenAsync(int parentId, IReadOnlyList<ChildItem> children, CancellationToken ct);
+
+    /// <summary>
+    /// The items that block <paramref name="id"/> on the board (sc-25871): every item the board relates to it as its blocker, whoever
+    /// made the relation, inside a plan or not. Reads only. Whether a blocker is satisfied is not the board's to say: the pipeline
+    /// decides it from the ledger (<see cref="Plans.PlanRelease.Satisfied"/>). A source without blocker relations has none (the default).
+    /// </summary>
+    Task<IReadOnlyList<int>> BlockersAsync(int id, CancellationToken ct) => Task.FromResult<IReadOnlyList<int>>([]);
+
+    /// <summary>
+    /// Moves an item <see cref="CreateChildrenAsync"/> created out of the backlog into the source's ready state (Shortcut: To Do), where
+    /// <see cref="ListReadyAsync"/> finds it if it is in the watch scope (sc-25871). Idempotent, and it never moves an item back: it
+    /// writes only while the item still waits in the backlog, and returns false, writing nothing, when it does not (someone moved
+    /// it already, or it is being worked). A source that creates no children does not support it (the default).
+    /// </summary>
+    Task<bool> MakeReadyAsync(int id, CancellationToken ct) =>
+        throw new NotSupportedException("This work source creates no plan children, so it has none to make ready.");
 }
 
 /// <summary>

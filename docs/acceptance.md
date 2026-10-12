@@ -440,18 +440,22 @@ CodeGraph story sc-25846).
 #46 merged; #47 (P3-AT4a, critical file) escalated on risk-threshold, not merged; #42 (P3-AT4b) blocked at the timeout, not merged;
 issue #45 was P3-AT3's fixture.
 
-## P4-AT1 (first version) — a plan item is planned into stories (sc-25870)
+## P4-AT1 — a plan item is planned into stories and releases them in dependency order (sc-25870, sc-25871)
 
-`PlanAcceptanceTests.A_plan_item_is_planned_by_a_real_planner_into_backlog_stories_created_once`: `factory run` on a `plan`-labelled
-story with the real planner (a sandboxed read-only session on the `high` class, CodeGraph and Kanban through the loopback proxy
-when their tokens are configured), a throwaway ledger and its own work root. It goes as far as "stories created"; later stories
-of the epic extend it.
+`PlanAcceptanceTests.A_plan_item_is_planned_by_a_real_planner_into_backlog_stories_created_once_and_released_in_dependency_order`:
+`factory run` on a `plan`-labelled story with the real planner (a sandboxed read-only session on the `high` class, CodeGraph and
+Kanban through the loopback proxy when their tokens are configured), a throwaway ledger and its own work root. It goes as far as
+"stories released in order": the stories are not worked (each released tier's Merge rows are seeded in the throwaway ledger, which
+is all the release reads) and the last tier is left unmerged, so the plan is never closed out on the real board. Later stories of
+the epic extend it.
 
 Prerequisites: everything AT2 needs (router with an enrolled plan, both GitHub Apps, the Shortcut token, the sandbox set up), and
 `FACTORY_E2E_P4_PLAN_STORY=sc-<id>`: a **To Do** story carrying the `plan` label whose repository is the sandbox (the default
 repo, or a `Repo:` line) and whose description is work worth two or more stories. The test writes to that story's board: it claims
-the plan story (In Progress) and creates the plan's stories in the Backlog of its team and epic; it archives the created stories
-when it ends (best effort), and leaves the plan story claimed.
+the plan story (In Progress) and creates the plan's stories in the Backlog of its team and epic, then moves them to To Do as
+they are released; it archives the created stories when it ends (best effort), and leaves the plan story claimed. **Stop any
+`factory work` whose watch scope covers that team or epic first** (or use a team and epic nothing watches): a released story is an
+ordinary To Do story, and a running factory would claim and implement it.
 
 ```sh
 FACTORY_E2E=1 FACTORY_E2E_P4_PLAN_STORY=sc-<id> \
@@ -462,9 +466,15 @@ Expected evidence: the run succeeds with the item `Planned` (transitions Intake 
 `worker-model-class` is `high` and whose `session_taints` hold `planner`; the `plan` checkpoint parses under every rule
 (`Plan.FromDetail`); `plan-stories` lists one distinct id per plan story, and each of those stories, read back from Shortcut, has the
 plan's title, is in Backlog, carries the planned-story marker and is blocked (`blocks` links) by exactly the stories its plan entry
-names; a second `factory run` adds no ledger row and no story.
+names. Every later `factory run` runs no planner and creates no story: the first releases exactly the stories nothing blocks (To Do
+on the board, one `plan-released` row each, the rest still in Backlog); after each released tier's Merge rows are seeded, the next
+run releases exactly the stories whose blockers are all merged, until every story is released; a run with nothing newly merged adds
+no ledger row and moves no story; no `closeout` row is written.
 
-Not run live yet (2026-10-12): written with sc-25870, to be run by the owner.
+Not run live yet (2026-10-12): written with sc-25870 and extended with sc-25871, to be run by the owner. The live run is also the
+first time the release's Shortcut requests meet the real API: `GET stories/{id}` returning a story with `story_links`, and
+`PUT stories/{id}` with only `workflow_state_id` (Backlog → To Do) have no recorded contract fixture yet (`Fixtures/shortcut`); the
+unit tests cover them against the fake board and against the story shape the `list-ready.json` recording holds.
 
 ## Upgrading a Phase 1 ledger: items parked at Review
 
