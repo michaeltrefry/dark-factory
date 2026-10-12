@@ -235,6 +235,8 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
         }
     }
 
+    public bool PlansItems => true;
+
     public async Task<IReadOnlyList<int>> CreateChildrenAsync(int parentId, IReadOnlyList<ChildItem> children, CancellationToken ct)
     {
         for (var i = 0; i < children.Count; i++)

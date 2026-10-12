@@ -440,6 +440,32 @@ CodeGraph story sc-25846).
 #46 merged; #47 (P3-AT4a, critical file) escalated on risk-threshold, not merged; #42 (P3-AT4b) blocked at the timeout, not merged;
 issue #45 was P3-AT3's fixture.
 
+## P4-AT1 (first version) — a plan item is planned into stories (sc-25870)
+
+`PlanAcceptanceTests.A_plan_item_is_planned_by_a_real_planner_into_backlog_stories_created_once`: `factory run` on a `plan`-labelled
+story with the real planner (a sandboxed read-only session on the `high` class, CodeGraph and Kanban through the loopback proxy
+when their tokens are configured), a throwaway ledger and its own work root. It goes as far as "stories created"; later stories
+of the epic extend it.
+
+Prerequisites: everything AT2 needs (router with an enrolled plan, both GitHub Apps, the Shortcut token, the sandbox set up), and
+`FACTORY_E2E_P4_PLAN_STORY=sc-<id>`: a **To Do** story carrying the `plan` label whose repository is the sandbox (the default
+repo, or a `Repo:` line) and whose description is work worth two or more stories. The test writes to that story's board: it claims
+the plan story (In Progress) and creates the plan's stories in the Backlog of its team and epic; it archives the created stories
+when it ends (best effort), and leaves the plan story claimed.
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_P4_PLAN_STORY=sc-<id> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-class "*PlanAcceptanceTests"
+```
+
+Expected evidence: the run succeeds with the item `Planned` (transitions Intake → Plan → Planned, no PR); one `session` row whose
+`worker-model-class` is `high` and whose `session_taints` hold `planner`; the `plan` checkpoint parses under every rule
+(`Plan.FromDetail`); `plan-stories` lists one distinct id per plan story, and each of those stories, read back from Shortcut, has the
+plan's title, is in Backlog, carries the planned-story marker and is blocked (`blocks` links) by exactly the stories its plan entry
+names; a second `factory run` adds no ledger row and no story.
+
+Not run live yet (2026-10-12): written with sc-25870, to be run by the owner.
+
 ## Upgrading a Phase 1 ledger: items parked at Review
 
 Phase 1 parked every finished item at Review; since sc-25378 Review is a state the factory drives, so the first

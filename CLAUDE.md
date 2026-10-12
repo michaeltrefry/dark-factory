@@ -23,6 +23,9 @@ Claude Code headless workers through the Weave router.
   `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`, the merge gate and queue `RunPipeline.MergeQueue.cs`),
   the MCP upstreams and the loopback MCP proxy (`Mcp/`: `McpHttpClient`, `McpUpstream`/`McpUpstreams`/`McpServers`
   (allowlists), `McpProxy`, `McpProxySessions`; CodeGraph's client `CodeGraph/CodeGraphMcpClient.cs`; sc-25707),
+  plan items (`Plans/`: `Plan.cs` — the typed plan, `PlanParser`, the `plan` label and the planned-story marker — and
+  `PlanWorker.cs` — `IPlanRunner`, `WorkerPlanRunner`, `PlanPrompt`; pipeline handler `RunPipeline.Plan.cs`; the production seat
+  `SandboxPlanRunner` in `FactoryRunner.cs`; sc-25870),
   and the outbound gateway (`Gateway/`: `OutboundHttp` builds every GitHub, Shortcut, router, CodeGraph and Kanban `HttpClient` (and the
   acceptance tests' dashboard client and their loopback-only client of the MCP proxy, `LoopbackMcp`); `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token
   credentials; `GitRemoteReads` the github.com remote URL and every clone/fetch's arguments (sc-25391); `GitHubCli` is the only
@@ -83,6 +86,8 @@ Claude Code headless workers through the Weave router.
   `GateNegativeTests` (sealed path, corrupt policy on a throwaway branch, a new test passing on the base, a 4th fix round; review
   panel replaced by `SeededReviewer`, seeding through `SandboxRepo`), `FreezeAndStuckTests` (freeze seeded in the throwaway
   ledger; a stub Claude CLI replaying the stuck/silent fixtures), `IssueTriageTests.A_triage_session_that_read_issue_text_is_tainted_and_cannot_push`.
+  Phase 4a's P4-AT1, first version (sc-25870, `PlanAcceptanceTests`): a real planner plans a `plan`-labelled story into Backlog
+  stories, created once.
   Phase 3's epic AT1–AT5 (sc-25710, `CodeGraphAcceptanceTests.cs`): `CodeGraphReviewTests` (the real panel's tool calls, turns and
   overlay-bound CodeGraph answers), `CodeGraphTriageTests` (a triage session through the proxy, scanned for the CodeGraph token by a
   wrapper Claude Code path, `ScanWrapper`; the production proxy refusing off-profile tools; a live Kanban read through the reviewers'
@@ -120,7 +125,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `CodeGraph:BaseUrl` | the hosted CodeGraph (`OutboundHttp.CodeGraphDefaultBase`; an absolute http(s) URL naming no model provider): reviewers' CodeGraph tools (`ReviewTools.CodeGraphTools`) go to its `mcp` endpoint |
 | `CodeGraph:OverlayTimeoutMinutes` | `10` (> 0: how long a review waits, before its first panel call, for CodeGraph's overlay of the PR head; not ready by then, reviewers' CodeGraph calls read the default-branch index, labelled not the PR head; sc-25708) |
 | `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional: without it the factory starts and every CodeGraph tool answers the reviewer an error result (recorded), triage gets no CodeGraph, and the merge gate's `risk-threshold` fails wherever a tier requires it (sc-25709), so no normal or protected change merges (`factory run` and `factory work` warn at start-up) |
-| `Kanban:McpUrl` | `https://kanban-mcp.trefry.net/mcp` (`OutboundHttp.KanbanDefaultMcpUrl`; an absolute http(s) URL naming no model provider; MCP Streamable HTTP): the Kanban upstream (sc-25707), offered to reviewers through their tool loop (and kept for Phase 4's planner, `McpProfile.Planner`); never to triage sessions, whose proxy is started without it (`McpProfile.Triage`: the issue text is untrusted and the triage's answer is posted on the issue) |
+| `Kanban:McpUrl` | `https://kanban-mcp.trefry.net/mcp` (`OutboundHttp.KanbanDefaultMcpUrl`; an absolute http(s) URL naming no model provider; MCP Streamable HTTP): the Kanban upstream (sc-25707), offered to reviewers through their tool loop and to a plan item's planner session through the loopback proxy (`McpProfile.Planner`, sc-25870); never to triage sessions, whose proxy is started without it (`McpProfile.Triage`: the issue text is untrusted and the triage's answer is posted on the issue) |
 | `Kanban:Token` | env `FACTORY_KANBAN_TOKEN`, or keychain account `kanban-token`: a KanbanBoard PAT (`Authorization: Bearer`), owner-side only (E5). Optional: without it there is no Kanban upstream (not an error) |
 | `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
@@ -259,7 +264,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   exactly one `127.0.0.1` address). It holds the upstream tokens (`McpUpstreams`, the one registry it shares with the
   reviewers' tool loop: `CodeGraphMcpClient.Upstream` and the Kanban `McpUpstream`, both over the generic `McpHttpClient`);
   each grant is a per-session tool set, `McpProxy.Grant(repo, McpProfile)`: `McpProfile.Triage` (above) or
-  `McpProfile.Planner` (every allowlisted CodeGraph tool and Kanban read tool; for Phase 4, unused yet), each a subset of the
+  `McpProfile.Planner` (every allowlisted CodeGraph tool and Kanban read tool; a plan item's planner session, sc-25870), each a subset of the
   upstreams' allowlists (checked when the profile is made). The session gets `--mcp-config <file>` naming
   `http://127.0.0.1:<port>/mcp/<server>` for each server its profile grants a tool of, with a
   per-session bearer credential (32 random bytes, kept hashed), plus `--allowedTools` rules
@@ -294,7 +299,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   the proxy. Upstream tokens are only in the owner process (never in the worker's env, argv, worktree, prompt or transcript;
   `McpProxyTests`). Every MCP tool use still taints the session (`mcp:<tool>`; triage is already tainted by the issue text and
   never pushes). Implementers and fixers get no MCP: their tools allow none, and `ClaudeWorker.BuildArguments`/`RunAsync` refuse
-  an MCP config for them (`--strict-mcp-config` and no `--mcp-config`). Phase 4's planner reuses `McpProxy`/`McpProxySessions`. The intake reads and writes the issue board only through the issue source's
+  an MCP config for them (`--strict-mcp-config` and no `--mcp-config`). A plan item's planner session (below) uses the same `McpProxy`/`McpProxySessions` under `McpProfile.Planner`. The intake reads and writes the issue board only through the issue source's
   `IIssueIntakeSource` capability (E6): triage comment and route label, issues, comments, permissions and gate policy. The orchestrator — not
   the model — routes (`IssueRouting`): question/duplicate → comment only; author without write/maintain/admin
   (`RepoPermission.IsCollaborator`; read and triage count as outsiders) on the issue's repo, or on the target repo when the
@@ -409,7 +414,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   nothing. Both show on the pipeline page (`IntakeStatus`, in memory in the `factory work` process).
 - Every state change is a committed ledger row before the next step (`WorkLedger.RecordAsync`), checked
   against the transition table in `Ledger/Lifecycle.cs` first; an illegal transition throws and writes nothing.
-  New phases add handlers in `RunPipeline.Handlers`, not table rows. Sub-steps inside a state are checkpoint
+  New phases add handlers in `RunPipeline.Handlers`, not table rows (one exception: `Plan → Planned`, a plan item waiting on its
+  stories, sc-25870). Sub-steps inside a state are checkpoint
   rows (`LedgerEntry.Step`, `WorkLedger.CheckpointAsync`); `factory run` on an existing item resumes from
   its last row and skips recorded steps (the Claude session id is checkpointed as soon as it streams, so an
   interrupted Implement continues with `claude --resume`). Ctrl-C → Paused; a failure (including an
@@ -435,6 +441,39 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   stale) computes cost per merged PR, 14-day revert rate (N/A: no revert
   data yet), escalation rate, fix rounds per merged PR, reviewer precision (blocking findings a second opinion confirmed / those it
   answered) and intake-to-merge time; N/A over zero matching items; sandbox/demo items are excluded (`Metrics:*`).
+- Plan items (Phase 4a, sc-25870; `Plans/`, `RunPipeline.Plan.cs`): an item labelled `plan` (`PlanLabel`, any case) on a source that
+  plans (`IWorkSource.PlansItems`: Shortcut; false by default, so a GitHub issue's label — which anyone may apply — plans nothing)
+  goes Intake → Plan instead of Implement, and is never implemented itself. Plan runs one planner session (E2): a fresh one every
+  time (never resumed: its checkout is throwaway), on the `high` class (`WorkerModelClass.Planner`), confined like the triage worker
+  — `WorkerTools.ReadOnly` (`ReadRule` of its own worktree, `dontAsk`, `--setting-sources ""`; `WorkerPlanRunner` refuses any other
+  tools before checkout), in a throwaway `factory/plan-sc-<id>` worktree under its own root (`<WorkRoot>/plan-worktrees`,
+  `SandboxPlanRunner.PlanWorktrees`; contents-read token only, not shared for writing, out-of-tree symlinks removed first, swept
+  with the leftover MCP session files before each planner session when sandboxed, i.e. under the worker run lock) — and reaching
+  CodeGraph and Kanban only through the loopback MCP proxy under `McpProfile.Planner` (started per session by `SandboxPlanRunner`
+  when an upstream is configured; its `--allowedTools` name exactly that profile's tools, `PlannerTools`). The pipeline runs it like
+  any worker session of the item (`RunSessionAsync`: pid, `session` and `worker-model-class` checkpoints, every line stored,
+  Pause/Stop and the freeze watched, a usage-limited or `model_class_unavailable` session pausing the factory, never escalating)
+  but without the repo-settings guard and the stuck detector (it loads no settings file and has no round), and taints it from its
+  start (`Taint.Planner`), so nothing it did can be pushed. Models propose, code decides (E1): the answer's last fenced `json`
+  block (`{"stories": [{key, title, description, acceptance[], type, blocked_by[]}]}`) is read by `PlanParser`, which refuses — never
+  cuts — anything off the rules: 1–`MaxStories` (20) stories, unique `key`s (a-z, 0-9, `-`, `_`; ≤ 32) and unique titles (≤ 120; the
+  board finds a created story by its exact name), description ≤ 2,000, 1–5 one-line acceptance entries ≤ 300, type
+  feature/chore/bug, `blocked_by` naming other stories of the plan, never itself, no cycle; text is cleaned of control and format
+  characters, and the stories are ordered blockers-first. Invalid → a `plan-rejected` checkpoint (why; outcome `gate_rejected`), the
+  item escalates and no story is created. Valid → the `plan` checkpoint (the plan as JSON) before any board write, then
+  `IWorkSource.CreateChildrenAsync` (the parent's team and epic, Backlog, `blocks` links; idempotent by name), then `plan-stories`
+  (the ids in plan order, e.g. `sc-12 sc-13`), then Plan → `Planned`. A recorded `plan` without a later `plan-stories` is the plan a
+  later run creates — after a crash, a pause or an escalation (the board was down) no second planner session runs, so no second
+  plan's stories land beside the first's (E4). `Planned` (the one new state and table row, `Plan → Planned`) has no handler: the
+  item waits on its stories, is listed by no `InFlightAsync`, a `factory run` on it changes nothing (no held notice) and succeeds,
+  and it is not a failure (outcome `passed`). Planner text is untrusted (E3): each created story's description starts with the
+  marker `<!-- dark-factory:planned-from sc-<parent> -->` (`PlannedStory`), then a `Repo:` line naming the plan item's repository
+  (the first such line decides, `RepoResolver`: the planner's text cannot send a story to another repo; one repository per plan),
+  then the planner's text in a tilde fence (no mention, link or image renders). A story whose description carries the marker is
+  `WorkStory.PlannerAuthored`, so `UntrustedName`: its spec is fenced as data in every worker prompt (`PromptFence.Spec`) and its
+  name is inert in commit messages and PR titles and a code span in PR bodies, like an approved triage. The marker is written by
+  code, never by the model; a person who removes it has taken the story over. Not in this story: releasing created stories to
+  ready, changeset branches, multi-repo plans, plan-scope controls.
 - One run per item: `RunPipeline` holds a Postgres advisory lock on the item id (`PostgresRunLocks`) for the whole
   run, and `WorkItem.Version` is an optimistic concurrency token, so a stale writer's save throws.
 - Workers lead their own process group (launched via `/usr/bin/perl` `setpgrp` + `exec`); the pid is checkpointed
@@ -451,7 +490,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   on line breaks; no new variable, no `--model`, no `ANTHROPIC_MODEL`, no `x-weave-force-model`). Roles, decided in code, never by a
   model: the implementer and its review and conflict fix rounds run on the item's coding class (`WorkerModelClass.Coding`: `low`
   when the story is simple — the `simple` label, any case, or an estimate of 1 or 2 points — else `mid`, no estimate included); the
-  CI fixer on `mid` (`CiFix`); issue triage on `low` (`Triage`). Labels and estimate come through `IWorkSource.ReadSpecAsync`
+  CI fixer on `mid` (`CiFix`); issue triage on `low` (`Triage`); a plan item's planner on `high` (`Planner`, sc-25870). Labels and estimate come through `IWorkSource.ReadSpecAsync`
   (`WorkStory.Labels`/`Estimate`: Shortcut's story `labels` and `estimate`; a GitHub issue item has no estimate and its labels are
   read from the issue at spec time — they only pick the class, and need not come from a collaborator, since an issue template can
   apply one; a failed read logs a warning and counts as no labels, i.e. `mid`, never an item failure). Each run of a worker session checkpoints `worker-model-class` (Detail: the class), right after

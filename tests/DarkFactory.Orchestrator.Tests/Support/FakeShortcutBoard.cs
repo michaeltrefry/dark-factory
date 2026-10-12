@@ -137,6 +137,9 @@ public sealed class FakeShortcutBoard : HttpMessageHandler
         }
         var id = Interlocked.Increment(ref _nextId);
         Add(id, (string?)body["group_id"] ?? "", (long)body["workflow_state_id"]!, (int?)body["epic_id"], (string)body["name"]!);
+        // Like the real API, the story keeps the description and type it was created with.
+        _stories[id]["description"] = (string?)body["description"];
+        _stories[id]["story_type"] = (string?)body["story_type"] ?? "feature";
         return Ok(new JsonObject { ["id"] = id }, HttpStatusCode.Created);
     }
 

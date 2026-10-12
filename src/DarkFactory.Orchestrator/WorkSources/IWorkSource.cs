@@ -13,13 +13,20 @@ public sealed record WorkStory(int Id, string Name, string? Description, string 
     public ItemNaming Kind => Naming ?? ItemNaming.Shortcut;
 
     /// <summary>
-    /// The name as the factory writes it on GitHub (commit message, pull request title and description): a GitHub issue's name is
-    /// the triage's title, model text derived from untrusted issue text, so it is made inert (<see cref="UntrustedText.Inert"/>).
+    /// The name as the factory writes it on GitHub (commit message, pull request title and description): an untrusted name
+    /// (<see cref="UntrustedName"/>) is made inert (<see cref="UntrustedText.Inert"/>).
     /// </summary>
-    public string PublicName => Kind == ItemNaming.Shortcut ? Name : UntrustedText.Inert(Name);
+    public string PublicName => UntrustedName ? UntrustedText.Inert(Name) : Name;
 
-    /// <summary>Whether <see cref="Name"/> is derived from untrusted text.</summary>
-    public bool UntrustedName => Kind != ItemNaming.Shortcut;
+    /// <summary>
+    /// Whether <see cref="Name"/> and <see cref="Description"/> are a model's text rather than the owner's: a GitHub issue's item (its
+    /// name is the triage's title, derived from untrusted issue text), or a story the factory created from a plan
+    /// (<see cref="PlannerAuthored"/>, sc-25870).
+    /// </summary>
+    public bool UntrustedName => Kind != ItemNaming.Shortcut || PlannerAuthored;
+
+    /// <summary>Whether the factory created this story from a plan: its description carries the plan's marker (<see cref="Plans.PlannedStory"/>).</summary>
+    public bool PlannerAuthored => Plans.PlannedStory.IsMarked(Description);
 
     /// <summary>The item's external id, e.g. <c>sc-12</c>.</summary>
     public string Ref => Kind.Format(Id);
@@ -77,6 +84,13 @@ public interface IWorkSource
     /// parked out of scope): one sentence fragment, completed by ", or run `factory run … --ignore-scope`, to resume it."
     /// </summary>
     string ScopeReturnHint => "Move it back into scope and to To Do";
+
+    /// <summary>
+    /// Whether an item of this source labelled <see cref="Plans.PlanLabel.Name"/> is planned into child stories instead of implemented
+    /// (sc-25870): the source's labels are the owner's to set and <see cref="CreateChildrenAsync"/> works. False (the default) for a
+    /// source that creates no children or whose labels anyone may apply (a GitHub issue's): such an item is implemented like any other.
+    /// </summary>
+    bool PlansItems => false;
 
     /// <summary>Items ready for the factory, inside the configured watch scope; never items another claimant holds.</summary>
     Task<IReadOnlyList<int>> ListReadyAsync(CancellationToken ct);

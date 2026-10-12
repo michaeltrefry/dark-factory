@@ -500,6 +500,13 @@ public class McpProxyTests
         // The planner profile (Phase 4) keeps every allowlisted tool of both.
         using var planner = proxy.Grant(Repo, McpProfile.Planner);
         Assert.Equal(McpServers.AllToolRules, planner.ToolRules);
+        // The production planner's --allowedTools (sc-25870): read-only and confined, plus exactly the profile's tools on the configured upstreams.
+        var plannerTools = SandboxPlanRunner.PlannerTools(upstreams, proxied: true);
+        Assert.True(plannerTools.IsReadOnly);
+        Assert.Equal(McpServers.AllToolRules, plannerTools.McpAllowed);
+        Assert.Empty(SandboxPlanRunner.PlannerTools(upstreams, proxied: false).McpAllowed);
+        Assert.Equal(Gate.ReviewTools.CodeGraphTools.Select(t => $"mcp__codegraph__{t}"),
+            SandboxPlanRunner.PlannerTools(Upstreams(codeGraph, null), proxied: true).McpAllowed);
     }
 
     [Fact]

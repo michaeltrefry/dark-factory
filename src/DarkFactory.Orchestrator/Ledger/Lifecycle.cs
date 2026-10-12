@@ -5,6 +5,8 @@ public enum WorkState
 {
     Intake,
     Plan,
+    /// <summary>A plan item whose stories are on the board (sc-25870): it waits on them; nothing implements it.</summary>
+    Planned,
     Implement,
     Review,
     Fixing,
@@ -58,7 +60,8 @@ public static class Lifecycle
     private static readonly Dictionary<WorkState, WorkState[]> Forward = new()
     {
         [WorkState.Intake] = [WorkState.Plan, WorkState.Implement],
-        [WorkState.Plan] = [WorkState.Implement],
+        // A plan item's stories were created: it waits on them (sc-25870) and never goes on to Implement itself.
+        [WorkState.Plan] = [WorkState.Implement, WorkState.Planned],
         [WorkState.Implement] = [WorkState.Review],
         [WorkState.Review] = [WorkState.Fixing, WorkState.CI],
         [WorkState.Fixing] = [WorkState.Review],

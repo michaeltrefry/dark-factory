@@ -16,6 +16,7 @@ public class LifecycleTests
     [InlineData(Intake, Plan)]
     [InlineData(Intake, Implement)]
     [InlineData(Plan, Implement)]
+    [InlineData(Plan, Planned)] // sc-25870: a plan item's stories are on the board; it waits on them
     [InlineData(Implement, Review)]
     [InlineData(Review, Fixing)]
     [InlineData(Fixing, Review)]
@@ -48,6 +49,11 @@ public class LifecycleTests
     [InlineData(Merge, Done)]
     [InlineData(Escalated, Implement)]
     [InlineData(Implement, Implement)]
+    [InlineData(Intake, Planned)] // only a plan (Plan) leads to Planned
+    [InlineData(Implement, Planned)]
+    [InlineData(Planned, Implement)] // a plan item is never implemented itself
+    [InlineData(Planned, Plan)]
+    [InlineData(Planned, Intake)]
     public void Shortcuts_and_backwards_steps_are_illegal(WorkState from, WorkState to)
     {
         Assert.False(Legal(from, to));

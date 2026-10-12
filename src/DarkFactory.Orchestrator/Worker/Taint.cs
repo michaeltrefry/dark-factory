@@ -81,6 +81,12 @@ public static class Taint
     public const string IssueText = "issue-text";
     public const string OutsiderComment = "outsider-comment";
 
+    /// <summary>
+    /// A planner session (sc-25870): it exists to read — the repository, CodeGraph's answers about other projects, the owner's Kanban
+    /// board — and to answer, so it is tainted from its start whether or not it calls a tool, and never gets a push token.
+    /// </summary>
+    public const string Planner = "planner";
+
     /// <summary>The target repo's own Claude settings can bring content in outside the tool stream (<see cref="OfRepoSettings"/>).</summary>
     public const string RepoSettings = "repo-settings";
 
