@@ -13,7 +13,10 @@ namespace DarkFactory.Orchestrator.Gate;
 /// the tests the PR's model wrote never run as the owner. The worktree is deleted after the run (as the worker user first).
 /// Without a sandbox (<c>Worker:RunAs=none</c>, development only) the commands run as the owner with a minimal environment,
 /// as unsandboxed workers do. A run is bounded by <paramref name="timeout"/>; the result files are read only as regular
-/// files (never through a link the tests could plant).
+/// files (never through a link the tests could plant). A step that reports on its standard output
+/// (<see cref="TestStep.CaptureOutput"/>: cargo) has it kept in memory, with its exit code, instead of a file. A failed
+/// <see cref="TestPhase.Toolchain"/> step (the stack's tool is not installed for the run's user, or not on the helper's
+/// fixed PATH) ends the run as <see cref="TestRunStatus.ToolchainMissing"/>, naming the program.
 /// </summary>
 public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, TimeSpan timeout, long maxResultFileBytes = SandboxTestRunner.MaxResultFileBytes)
     : IGateTestRunner
@@ -58,22 +61,42 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
             var log = new StringBuilder();
             var deadline = DateTimeOffset.UtcNow + timeout;
             var buildFailed = false;
+            // The outputs kept for the steps that report on standard output: build steps' are build logs, test steps' results.
+            var buildOutputs = new List<(string Name, string? Content)>();
+            var testOutputs = new List<(string Name, string? Content, int ExitCode)>();
             foreach (var step in spec.Steps)
             {
                 if (buildFailed && step.Phase == TestPhase.Test)
                 {
                     break;
                 }
-                var (exit, output, timedOut) = await RunStepAsync(workspace.Path, step, deadline - DateTimeOffset.UtcNow, ct);
+                var (exit, output, timedOut, captured) = await RunStepAsync(workspace.Path, step, deadline - DateTimeOffset.UtcNow, ct);
                 log.AppendLine($"$ {step.Program} {string.Join(' ', step.Args)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
                 for (var fallback = step.Fallback; !timedOut && exit == TestStep.InvalidCommandLine && fallback is not null; fallback = fallback.Fallback)
                 {
-                    (exit, output, timedOut) = await RunStepAsync(workspace.Path, fallback, deadline - DateTimeOffset.UtcNow, ct);
+                    (exit, output, timedOut, captured) = await RunStepAsync(workspace.Path, fallback, deadline - DateTimeOffset.UtcNow, ct);
                     log.AppendLine($"$ {fallback.Program} {string.Join(' ', fallback.Args)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
                 }
                 if (timedOut)
                 {
                     return TestRunReport.Failed(TestRunStatus.TimedOut, log.ToString());
+                }
+                if (exit != 0 && step.Phase == TestPhase.Toolchain)
+                {
+                    log.AppendLine($"{step.Program} is not available to the gate's test runs{(sandbox is null ? "" : $" as {sandbox.User}")} (`{step.Program} {string.Join(' ', step.Args)}` exited {exit}): "
+                        + $"install it where the test runs' PATH finds it{(sandbox is null ? "" : " (the launch helper's fixed PATH: /opt/homebrew/bin, /usr/local/bin, …)")}.");
+                    return TestRunReport.Failed(TestRunStatus.ToolchainMissing, log.ToString());
+                }
+                if (step.CaptureOutput is { } capture)
+                {
+                    if (step.Phase == TestPhase.Build)
+                    {
+                        buildOutputs.Add((capture, captured));
+                    }
+                    else if (step.Phase == TestPhase.Test)
+                    {
+                        testOutputs.Add((capture, captured, exit));
+                    }
                 }
                 if (exit != 0 && step.Phase == TestPhase.Restore)
                 {
@@ -87,20 +110,22 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
                 string[] roots = [workspace.Path, RealPath(workspace.Path)];
                 return TestRunReport.Failed(TestRunStatus.BuildFailed, log.ToString()) with
                 {
-                    BuildErrors = ResultFiles(results, spec.Strategy.BuildLogPattern, maxResultFileBytes)
+                    BuildErrors = ResultFiles(results, spec.Strategy.BuildLogPattern, maxResultFileBytes).Concat(buildOutputs)
                         .Where(l => l.Content is not null).SelectMany(l => spec.Strategy.ParseBuildErrors(l.Content!, roots)).Distinct().ToList(),
                 };
             }
             // Only the reports the test steps ask their runner for (one format per run), so nothing else is read as results.
             var files = spec.Steps.Select(s => s.ResultFilePattern).OfType<string>().Distinct(StringComparer.Ordinal)
                 .SelectMany(p => ResultFiles(results, p, maxResultFileBytes)).DistinctBy(f => f.Name).ToList();
-            if (files.Count == 0)
+            if (files.Count == 0 && testOutputs.Count == 0)
             {
                 return TestRunReport.Failed(TestRunStatus.NoResults, log.ToString());
             }
-            var parsed = spec.Strategy.ParseResults(files.Where(f => f.Content is not null).Select(f => new ResultFile(f.Name, f.Content!)));
+            var parsed = spec.Strategy.ParseResults(files.Where(f => f.Content is not null).Select(f => new ResultFile(f.Name, f.Content!))
+                .Concat(testOutputs.Where(o => o.Content is not null).Select(o => new ResultFile(o.Name, o.Content!) { ExitCode = o.ExitCode })));
             var limit = maxResultFileBytes % (1024 * 1024) == 0 ? $"{maxResultFileBytes / (1024 * 1024)} MB" : $"{maxResultFileBytes} bytes";
-            var tooLarge = files.Where(f => f.Content is null).Select(f => $"{f.Name}: it is larger than {limit}, so it was not read");
+            var tooLarge = files.Where(f => f.Content is null).Select(f => f.Name).Concat(testOutputs.Where(o => o.Content is null).Select(o => o.Name))
+                .Select(name => $"{name}: it is larger than {limit}, so it was not read");
             return new TestRunReport(TestRunStatus.Ran, parsed.Cases, log.ToString()) { UnreadableReports = [.. tooLarge, .. parsed.Unreadable] };
         }
         finally
@@ -149,11 +174,26 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
             .ToList();
     }
 
-    private async Task<(int ExitCode, string Output, bool TimedOut)> RunStepAsync(string worktree, TestStep step, TimeSpan remaining, CancellationToken ct)
+    /// <summary>
+    /// Runs one step. <c>Captured</c> is its whole standard output when the step asks for it (<see cref="TestStep.CaptureOutput"/>),
+    /// null when it does not or the output is larger than the result-file limit.
+    /// </summary>
+    private async Task<(int ExitCode, string Output, bool TimedOut, string? Captured)> RunStepAsync(string worktree, TestStep step, TimeSpan remaining, CancellationToken ct)
     {
-        using var process = sandbox is null ? StartDirect(worktree, step) : sandbox.Start(worktree, step.Program, step.Args, new Dictionary<string, string>());
+        Process started;
+        try
+        {
+            started = sandbox is null ? StartDirect(worktree, step) : sandbox.Start(worktree, step.Program, step.Args, new Dictionary<string, string>());
+        }
+        catch (System.ComponentModel.Win32Exception e) when (sandbox is null)
+        {
+            // Unsandboxed, a program that is not installed fails at start; sandboxed, the helper exits 127 for it.
+            return (127, $"{step.Program} could not be started: {e.Message}", false, null);
+        }
+        using var process = started;
         var output = new Tail();
-        var stdout = PumpAsync(process.StandardOutput, output);
+        var capture = step.CaptureOutput is null ? null : new Capture(maxResultFileBytes);
+        var stdout = PumpAsync(process.StandardOutput, output, capture);
         var stderr = PumpAsync(process.StandardError, output);
         using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct);
         bounded.CancelAfter(remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero);
@@ -168,7 +208,7 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
             {
                 throw;
             }
-            return (-1, output.ToString(), true);
+            return (-1, output.ToString(), true, null);
         }
         finally
         {
@@ -178,7 +218,24 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
             }
         }
         await Task.WhenAll(stdout, stderr);
-        return (process.ExitCode, output.ToString(), false);
+        return (process.ExitCode, output.ToString(), false, capture?.Text);
+    }
+
+    /// <summary>A step's whole standard output, up to <paramref name="maxChars"/> characters: past that it is dropped (<see cref="Text"/> null).</summary>
+    private sealed class Capture(long maxChars)
+    {
+        private StringBuilder? _text = new();
+
+        public string? Text => _text?.ToString();
+
+        public void Add(string line)
+        {
+            if (_text is not null && _text.Length + line.Length + 1 > maxChars)
+            {
+                _text = null;
+            }
+            _text?.Append(line).Append('\n');
+        }
     }
 
     private async Task StopAsync(Process process)
@@ -200,11 +257,12 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
         }
     }
 
-    private static async Task PumpAsync(StreamReader reader, Tail tail)
+    private static async Task PumpAsync(StreamReader reader, Tail tail, Capture? capture = null)
     {
         while (await reader.ReadLineAsync() is { } line)
         {
             tail.Add(line);
+            capture?.Add(line);
         }
     }
 

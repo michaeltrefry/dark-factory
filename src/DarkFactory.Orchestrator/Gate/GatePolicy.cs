@@ -372,6 +372,8 @@ public static class RiskyPaths
         ("dependencies", new Regex(
             @"(^|/)([^/]+\.(cs|fs|vb)proj|Directory\.(Packages|Build)\.props|nuget\.config|global\.json|dotnet-tools\.json|package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|requirements[^/]*\.txt|pyproject\.toml|poetry\.lock|go\.(mod|sum)|Cargo\.(toml|lock)|Gemfile(\.lock)?)$",
             Options)),
+        // Rust: a build script runs at build time, the toolchain file picks the compiler, cargo's config can set runners, linkers and registries.
+        ("Rust build and toolchain configuration", new Regex(@"(^|/)(build\.rs|rust-toolchain[^/]*|\.cargo/config[^/]*)$", Options)),
         ("keys and environment files", new Regex(@"\.(pem|key|p12|pfx|crt|cer)$|(^|/)\.env", Options)),
         ("security-sensitive code", new Regex(
             @"auth|secret|credential|token|crypto|passw|permission|sandbox|sudo|keychain|login|oauth|jwt|cert|ssh|security|acl|ruleset|protect",
