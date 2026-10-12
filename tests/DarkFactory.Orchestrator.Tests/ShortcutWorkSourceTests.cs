@@ -205,4 +205,42 @@ public class ShortcutWorkSourceTests
         Assert.Single(board.Links);
         Assert.Contains(board.Requests, r => r.PathAndQuery == "/api/v3/epics/77/stories");
     }
+
+    [Fact]
+    public async Task A_child_is_found_again_by_name_and_description_never_by_name_alone()
+    {
+        var board = new FakeShortcutBoard();
+        board.Add(500, FakeShortcutBoard.FactoryTeam);
+        board.Add(501, FakeShortcutBoard.FactoryTeam, name: "child 1"); // someone else's story of that name
+        var source = new ShortcutWorkSource(board.Client(), "tok", Team);
+
+        var first = await source.CreateChildrenAsync(500, Plan, CancellationToken.None);
+
+        Assert.DoesNotContain(501, first);
+        Assert.Equal(2, Named(board, "child 1").Count);
+        // The board may store the text with other line endings or outer whitespace: it is still the child.
+        ChildItem[] lines = [new("lines", "First.\nSecond.", "chore", [])];
+        var created = Assert.Single(await source.CreateChildrenAsync(500, lines, CancellationToken.None));
+        board.Story(created)["description"] = "First.\r\nSecond.\n";
+        var posts = board.Requests.Count(r => r.Method == HttpMethod.Post);
+
+        Assert.Equal([created], await source.CreateChildrenAsync(500, lines, CancellationToken.None));
+        Assert.Equal(first, await source.CreateChildrenAsync(500, Plan, CancellationToken.None));
+        Assert.Equal(posts, board.Requests.Count(r => r.Method == HttpMethod.Post));
+    }
+
+    [Fact]
+    public async Task Children_of_a_story_with_neither_an_epic_nor_a_team_are_refused_before_any_write()
+    {
+        var board = new FakeShortcutBoard();
+        board.Add(500, FakeShortcutBoard.FactoryTeam);
+        board.Story(500)["group_id"] = null;
+        var source = new ShortcutWorkSource(board.Client(), "tok", Team);
+
+        var ex = await Assert.ThrowsAsync<ChildrenRefusedException>(() => source.CreateChildrenAsync(500, Plan, CancellationToken.None));
+
+        Assert.Contains("sc-500 has neither an epic nor a team", ex.Message);
+        Assert.DoesNotContain(board.Requests, r => r.Method != HttpMethod.Get);
+        Assert.Single(board.Stories);
+    }
 }

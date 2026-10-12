@@ -74,6 +74,9 @@ public class PlanParserTests
     {
         { "no json block", "Here is my plan: three stories.", "no fenced json block" },
         { "unreadable json", "```json\n{\"stories\": [\n```", "not readable JSON" },
+        { "a property named twice in a story", "```json\n{\"stories\": [{\"key\": \"a\", \"title\": \"T\", \"title\": \"U\"}]}\n```", "not readable JSON" },
+        { "stories named twice", "```json\n{\"stories\": [], \"stories\": []}\n```", "not readable JSON" },
+        { "a lone surrogate escape", PlanAnswers.Answer(PlanAnswers.Story("a", "T")).Replace("\"title\":\"T\"", "\"title\":\"T\\ud800\""), "not readable JSON" },
         { "not an object", "```json\n[1]\n```", "not one JSON object" },
         { "no stories list", "```json\n{\"plan\": []}\n```", "stories is missing or not a list" },
         { "an empty plan", PlanAnswers.Answer(), "no story" },
@@ -273,14 +276,36 @@ public class PlanPipelineTests
         public FakeWorkspaces Workspaces { get; } = new();
         public FakePullRequests Prs { get; } = new();
         /// <summary>The implementer: no plan item ever reaches it.</summary>
-        public FakeWorker Implementer { get; } = new(Reports(Ok));
+        public FakeWorker Implementer { get; init; } = new(Reports(Ok));
         public FakePlanRunner? Planner { get; private set; }
 
         public Task<RunOutcome> Run(IWorkSource source, IWorker? planner, int id = 77, CancellationToken ct = default)
         {
             Planner = planner is null ? null : new FakePlanRunner(planner);
-            return new RunPipeline(source, Ledger, Locks, Workspaces, Implementer, Prs, Sandbox, TextWriter.Null, controls: Controls,
-                controlPollInterval: TimeSpan.FromMilliseconds(10), planner: Planner).RunAsync(id, ct);
+            return RunWith(source, Planner, id, ct);
+        }
+
+        public Task<RunOutcome> RunWith(IWorkSource source, IPlanRunner? runner, int id = 77, CancellationToken ct = default) =>
+            new RunPipeline(source, Ledger, Locks, Workspaces, Implementer, Prs, Sandbox, TextWriter.Null, controls: Controls,
+                controlPollInterval: TimeSpan.FromMilliseconds(10), planner: runner).RunAsync(id, ct);
+
+        /// <summary>Puts sc-77 in the ledger as an earlier run left it: in Plan, then each row (a null step is a transition to that state).</summary>
+        public async Task Left(params (string? Step, WorkState State, string? Detail)[] rows)
+        {
+            var ledger = Ledger;
+            var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", PlanStory.Name, Sandbox.FullName, null, CancellationToken.None);
+            await ledger.RecordAsync(item, WorkState.Plan, null, null, CancellationToken.None);
+            foreach (var (step, state, detail) in rows)
+            {
+                if (step is null)
+                {
+                    await ledger.RecordAsync(item, state, null, detail, CancellationToken.None);
+                }
+                else
+                {
+                    await ledger.CheckpointAsync(item, step, "plan-sess-0", detail, CancellationToken.None);
+                }
+            }
         }
 
         public async Task<IReadOnlyList<int>> InFlight()
@@ -348,8 +373,9 @@ public class PlanPipelineTests
         var rows = await h.Rows();
         Assert.Equal(
             [RunPipeline.Steps.Claimed, RunPipeline.Steps.WorkerStarted, RunPipeline.Steps.Session, RunPipeline.Steps.ModelClass,
-                RunPipeline.Steps.WorkerDone, RunPipeline.Steps.Plan, RunPipeline.Steps.PlanStories],
+                RunPipeline.Steps.WorkerDone, RunPipeline.Steps.Plan, RunPipeline.Steps.PlanCreating, RunPipeline.Steps.PlanStories],
             await h.Steps());
+        Assert.Empty(h.Implementer.OrphanStops); // its only session finished: no orphan is looked for
         Assert.Equal(WorkerModelClass.High, rows.Single(r => r.Step == RunPipeline.Steps.ModelClass).Detail);
         Assert.Equal(["a", "b", "c"], Plan.FromDetail(rows.Single(r => r.Step == RunPipeline.Steps.Plan).Detail).Stories.Select(s => s.Key));
         var ids = $"sc-{a["id"]} sc-{b["id"]} sc-{c["id"]}";
@@ -415,6 +441,8 @@ public class PlanPipelineTests
 
         Assert.Equal([WorkState.Intake, WorkState.Plan, WorkState.Paused], await h.Transitions());
         Assert.Equal(3, source.Children.Count);
+        // The ledger said the board was being written before it was: the row is there although the call never returned.
+        Assert.Equal([RunPipeline.Steps.Plan, RunPipeline.Steps.PlanCreating], (await h.Steps()).TakeLast(2));
         Assert.Equal([77], await h.InFlight());
 
         var resumed = await h.Run(source, planner);
@@ -424,6 +452,199 @@ public class PlanPipelineTests
         Assert.Single(planner.Calls);
         Assert.Equal(3, source.Children.Count);
         Assert.Equal("sc-9000 sc-9001 sc-9002", (await h.Rows()).Single(r => r.Step == RunPipeline.Steps.PlanStories).Detail);
+    }
+
+    private static readonly string OtherPlan = PlanAnswers.Answer(PlanAnswers.Story("x", "Another plan entirely"));
+
+    [Fact]
+    public async Task A_namesake_someone_else_wrote_is_never_taken_for_a_plan_story()
+    {
+        var h = new Harness();
+        var (board, source) = Board();
+        // A person's own story in the same epic and team, with the title the planner will choose.
+        board.Add(600, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.Backlog, epic: 42, name: "First story");
+
+        var outcome = await h.Run(source, Planner(Reports(Planned)), 500);
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(3, StoryPosts(board));
+        var mine = board.Stories.Single(s => (string?)s["name"] == "First story" && PlannedStory.IsMarked((string?)s["description"]));
+        var ids = (await h.Rows()).Single(r => r.Step == RunPipeline.Steps.PlanStories).Detail!.Split(' ');
+        Assert.Equal(3, ids.Length);
+        Assert.Equal($"sc-{mine["id"]}", ids[0]);
+        Assert.DoesNotContain("sc-600", ids);
+        Assert.Equal(3, board.Links.Count);
+        Assert.DoesNotContain(board.Links, l => (int)l["subject_id"]! == 600 || (int)l["object_id"]! == 600);
+        Assert.Equal("WordCount(\"  \") returns 1.", (string?)board.Story(600)["description"]); // untouched
+    }
+
+    [Fact]
+    public async Task A_rerun_after_an_escalation_before_any_board_write_plans_afresh_and_creates_the_new_plan()
+    {
+        var h = new Harness();
+        var source = new FakeWorkSource(PlanStory) { PlansItems = true };
+        // A plan was recorded, then the item escalated before the board was asked for anything (no plan-creating row).
+        await h.Left((RunPipeline.Steps.Plan, default, PlanParser.Parse(PlanAnswers.Valid).ToDetail()), (null, WorkState.Escalated, "boom"));
+        var planner = Planner(Reports(Planned with { SessionId = "plan-sess-2", ResultText = OtherPlan }));
+
+        var outcome = await h.Run(source, planner);
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(WorkState.Planned, outcome.State);
+        Assert.Single(planner.Calls); // a second planner session, after the recorded plan's
+        Assert.Equal(["Another plan entirely"], source.Children.Select(c => c.Child.Name));
+        var plans = (await h.Rows()).Where(r => r.Step == RunPipeline.Steps.Plan).ToList();
+        Assert.Equal(["plan-sess-0", "plan-sess-2"], plans.Select(p => p.ClaudeSessionId));
+        Assert.Equal(["x"], Plan.FromDetail(plans[1].Detail).Stories.Select(s => s.Key));
+        Assert.Equal("1 stories: sc-9000", (await h.Rows()).Last().Detail);
+    }
+
+    [Fact]
+    public async Task A_rerun_after_a_crash_between_the_board_write_and_its_record_runs_no_planner_and_creates_no_duplicate()
+    {
+        var h = new Harness();
+        var source = new FakeWorkSource(PlanStory) { PlansItems = true };
+        var plan = PlanParser.Parse(PlanAnswers.Valid);
+        // The crashed run's stories reached the board; its last row is plan-creating.
+        await source.CreateChildrenAsync(77, plan.Children("sc-77", Sandbox), CancellationToken.None);
+        await h.Left((RunPipeline.Steps.Plan, default, plan.ToDetail()), (RunPipeline.Steps.PlanCreating, default, null));
+        var planner = Planner(Reports(Planned with { ResultText = OtherPlan }));
+
+        var outcome = await h.Run(source, planner);
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Empty(planner.Calls);
+        Assert.Empty(h.Planner!.Seats);
+        Assert.Equal(["First story", "Second story", "Third story"], source.Children.Select(c => c.Child.Name));
+        var steps = await h.Steps();
+        Assert.Equal([RunPipeline.Steps.Plan, RunPipeline.Steps.PlanCreating, RunPipeline.Steps.PlanStories], steps);
+        Assert.Equal("sc-9000 sc-9001 sc-9002", (await h.Rows()).Single(r => r.Step == RunPipeline.Steps.PlanStories).Detail);
+    }
+
+    [Fact]
+    public async Task A_recorded_plan_that_no_longer_validates_escalates_saying_so_and_is_replaced_only_if_no_story_of_it_can_exist()
+    {
+        // Recorded under rules it no longer passes (here: no story at all), before any board write.
+        var h = new Harness();
+        var source = new FakeWorkSource(PlanStory) { PlansItems = true };
+        await h.Left((RunPipeline.Steps.Plan, default, """{"stories": []}"""));
+        var planner = Planner(Reports(Planned));
+
+        var outcome = await h.Run(source, planner);
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains("no longer validates, so this run created no story from it: the plan has no story", outcome.Error);
+        Assert.Contains("a re-run plans afresh", outcome.Error);
+        Assert.Empty(planner.Calls);
+        Assert.Empty(source.Children);
+        Assert.Contains(source.Comments, c => c.Contains("no longer validates"));
+
+        var again = await h.Run(source, planner);
+
+        Assert.True(again.Succeeded, again.Error);
+        Assert.Single(planner.Calls);
+        Assert.Equal(3, source.Children.Count);
+
+        // With the board write begun, stories of it may exist: no other plan may land beside them, so every run says the same.
+        var begun = new Harness();
+        await begun.Left((RunPipeline.Steps.Plan, default, """{"stories": []}"""), (RunPipeline.Steps.PlanCreating, default, null));
+        var unused = Planner(Reports(Planned));
+        foreach (var _ in new[] { 1, 2 })
+        {
+            var stuck = await begun.Run(new FakeWorkSource(PlanStory) { PlansItems = true }, unused);
+
+            Assert.Equal(WorkState.Escalated, stuck.State);
+            Assert.Contains("no longer validates", stuck.Error);
+            Assert.Contains("finish or archive those stories by hand", stuck.Error);
+        }
+        Assert.Empty(unused.Calls);
+    }
+
+    [Fact]
+    public async Task A_source_that_could_not_find_the_stories_again_refuses_and_the_item_escalates_with_none_created()
+    {
+        var h = new Harness();
+        var source = new FakeWorkSource(PlanStory) { PlansItems = true, RefuseChildren = "sc-77 has neither an epic nor a team" };
+
+        var outcome = await h.Run(source, Planner(Reports(Planned)));
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Equal("The plan's stories were not created, none of them: sc-77 has neither an epic nor a team.", outcome.Error);
+        Assert.Empty(source.Children);
+        Assert.DoesNotContain(RunPipeline.Steps.PlanStories, await h.Steps());
+        Assert.Contains(source.Comments, c => c.Contains("neither an epic nor a team"));
+    }
+
+    /// <summary>A planner whose seat cannot be set up: the factory's failure (the sweep, the MCP proxy, the session file's ACL).</summary>
+    private sealed class UnavailablePlanRunner : IPlanRunner
+    {
+        public Task<T> RunAsync<T>(WorkItem item, RepoRef repo, Func<PlannerSeat, CancellationToken, Task<T>> session, CancellationToken ct) =>
+            throw new FactoryUnavailableException("the planner's set-up: no proxy", new InvalidOperationException("no proxy"));
+    }
+
+    [Fact]
+    public async Task A_planner_seat_the_factory_cannot_set_up_is_the_factorys_failure_not_the_items()
+    {
+        var h = new Harness();
+        var source = new FakeWorkSource(PlanStory) { PlansItems = true };
+
+        var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() => h.RunWith(source, new UnavailablePlanRunner()));
+
+        Assert.True(IntakeLoop.IsFactoryWide(ex));
+        Assert.Equal([WorkState.Intake, WorkState.Plan], await h.Transitions());
+        Assert.Equal([RunPipeline.Steps.Claimed], await h.Steps());
+        Assert.Empty(source.Comments);
+        Assert.Empty(source.Children);
+        Assert.Equal([77], await h.InFlight()); // still in Plan: the next poll takes it up again
+
+        var later = await h.Run(source, Planner(Reports(Planned)));
+
+        Assert.True(later.Succeeded, later.Error);
+        Assert.Equal([WorkState.Intake, WorkState.Plan, WorkState.Planned], await h.Transitions());
+    }
+
+    [Fact]
+    public async Task A_resumed_plan_stops_the_planner_a_crashed_run_left_before_starting_the_next()
+    {
+        List<LedgerEntry>? rowsAtStop = null;
+        Harness? harness = null;
+        var h = harness = new Harness
+        {
+            Implementer = new FakeWorker(Reports(Ok)) { OrphanAlive = true, OnStopOrphan = () => rowsAtStop = harness!.Rows().Result },
+        };
+        var source = new FakeWorkSource(PlanStory) { PlansItems = true };
+        // The crashed run started a planner (pid 999) and recorded nothing after its session id.
+        await h.Left((RunPipeline.Steps.WorkerStarted, default, "999"), (RunPipeline.Steps.Session, default, null));
+        var planner = Planner(Reports(Planned));
+
+        var outcome = await h.Run(source, planner);
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal([999], h.Implementer.OrphanStops);
+        Assert.DoesNotContain(rowsAtStop!, r => r.Step == RunPipeline.Steps.WorkerStarted && r.Detail == WorkerPid.ToString()); // before the new planner
+        var killed = (await h.Rows()).Single(r => r.Step == RunPipeline.Steps.OrphanKilled);
+        Assert.Equal(("pid 999", "plan-sess-0"), (killed.Detail, killed.ClaudeSessionId));
+        Assert.Equal(
+            [RunPipeline.Steps.WorkerStarted, RunPipeline.Steps.Session, RunPipeline.Steps.OrphanKilled, RunPipeline.Steps.WorkerStarted],
+            (await h.Steps()).Take(4));
+        Assert.Empty(planner.OrphanStops); // stopped by the pipeline's worker, before any seat exists
+    }
+
+    [Fact]
+    public async Task A_rerun_after_a_failed_planner_session_looks_for_no_orphan_of_the_escalated_attempt()
+    {
+        var h = new Harness { Implementer = new FakeWorker(Reports(Ok)) { OrphanAlive = true } };
+        var source = new FakeWorkSource(PlanStory) { PlansItems = true };
+        // The session failed (no worker-done row) and the item escalated: that worker ended with its run.
+        var planner = Planner(Reports(new WorkerResult("plan-sess", 1, true, "error_during_execution", "boom", "")),
+            Reports(Planned with { SessionId = "plan-sess-2" }));
+        Assert.Equal(WorkState.Escalated, (await h.Run(source, planner)).State);
+
+        var again = await h.Run(source, planner);
+
+        Assert.True(again.Succeeded, again.Error);
+        Assert.Empty(h.Implementer.OrphanStops);
+        Assert.DoesNotContain(RunPipeline.Steps.OrphanKilled, await h.Steps());
     }
 
     /// <summary>A work source whose child creation succeeds on the board and is then cut off by a cancelled run.</summary>

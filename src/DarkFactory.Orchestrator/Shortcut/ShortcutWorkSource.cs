@@ -247,17 +247,35 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
             }
         }
         var parent = await GetStoryAsync(parentId, ct);
+        // The children are found again among the stories of the parent's epic or team: with neither, a retry after a failure part
+        // way would create every child a second time, so nothing is created at all.
+        if (parent.EpicId is null && parent.GroupId is null)
+        {
+            throw new ChildrenRefusedException($"{ItemNaming.Shortcut.Format(parentId)} has neither an epic nor a team, so stories created from it could "
+                + "not be found again after a failed attempt; put it in an epic or a team first");
+        }
         // Plan output waits in Backlog: nothing picks a child up until it is moved to To Do.
         var backlog = await StateIdAsync(parent.WorkflowId, BoardStateName(BoardState.Stopped), ct);
-        // A retry after a partial failure reuses what the earlier call created: an unarchived story with
-        // the child's exact name in the parent's epic and team, and its blocker relations.
+        // A retry after a partial failure reuses what the earlier call created: an unarchived story in the parent's epic and team
+        // with the child's exact name and description, and its blocker relations. The name alone never decides: a namesake
+        // someone else wrote is not this call's child.
         var existing = (await SiblingsAsync(parent, ct))
             .Where(s => !s.Archived && s.Id != parentId && s.EpicId == parent.EpicId && s.GroupId == parent.GroupId)
             .ToList();
         var ids = new List<int>();
         foreach (var child in children)
         {
-            var reused = existing.FirstOrDefault(s => s.Name == child.Name && !ids.Contains(s.Id));
+            Story? reused = null;
+            foreach (var namesake in existing.Where(s => s.Name == child.Name && !ids.Contains(s.Id)))
+            {
+                // The listings carry no description: each namesake is read in full.
+                var full = await GetStoryAsync(namesake.Id, ct);
+                if (!full.Archived && SameText(full.Description, child.Description))
+                {
+                    reused = full;
+                    break;
+                }
+            }
             int id;
             if (reused is not null)
             {
@@ -295,6 +313,10 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
         }
         return ids;
     }
+
+    /// <summary>Whether a stored description is the one that was sent (line endings and outer whitespace aside).</summary>
+    private static bool SameText(string? stored, string sent) =>
+        string.Equals((stored ?? "").ReplaceLineEndings("\n").Trim(), sent.ReplaceLineEndings("\n").Trim(), StringComparison.Ordinal);
 
     /// <summary>The stories that share the parent's epic (or, without one, its team); none if it has neither.</summary>
     private async Task<List<Story>> SiblingsAsync(Story parent, CancellationToken ct) =>

@@ -9,8 +9,8 @@ namespace DarkFactory.Orchestrator.Tests.Support;
 
 /// <summary>
 /// A stateful in-memory Shortcut API (the subset <see cref="ShortcutWorkSource"/> uses): stories
-/// change when PUT, team listings page by limit/offset and epic listings return every story, like the
-/// real API. Every request is recorded.
+/// change when PUT, team listings page by limit/offset and epic listings return every story (both without
+/// descriptions), like the real API. Every request is recorded.
 /// </summary>
 public sealed class FakeShortcutBoard : HttpMessageHandler
 {
@@ -97,7 +97,7 @@ public sealed class FakeShortcutBoard : HttpMessageHandler
                 Sorted().Where(s => IgnoreListingFilter || (string?)s["group_id"] == team),
                 int.Parse(query["offset"] ?? "0"), int.Parse(query["limit"] ?? "1000"))),
             ("GET", ["epics", var epic, "stories"]) => Ok(new JsonArray(
-                Sorted().Where(s => IgnoreListingFilter || (int?)s["epic_id"] == int.Parse(epic)).Select(WithLinks).ToArray())),
+                Sorted().Where(s => IgnoreListingFilter || (int?)s["epic_id"] == int.Parse(epic)).Select(Slim).ToArray())),
             ("GET", ["epics", var epic]) when int.Parse(epic) < 1000 => Ok(new JsonObject
             {
                 ["id"] = int.Parse(epic),
@@ -118,7 +118,15 @@ public sealed class FakeShortcutBoard : HttpMessageHandler
     private IEnumerable<JsonObject> Sorted() => _stories.Values.OrderBy(s => (int)s["id"]!);
 
     private JsonArray Page(IEnumerable<JsonObject> stories, int offset, int limit) =>
-        new(stories.Skip(offset).Take(limit).Select(WithLinks).ToArray());
+        new(stories.Skip(offset).Take(limit).Select(Slim).ToArray());
+
+    /// <summary>A story as a team or epic listing returns it: like the real API's, without its description.</summary>
+    private JsonNode Slim(JsonObject story)
+    {
+        var slim = WithLinks(story).AsObject();
+        slim.Remove("description");
+        return slim;
+    }
 
     private JsonNode WithLinks(JsonObject story)
     {

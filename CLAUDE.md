@@ -450,21 +450,43 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `SandboxPlanRunner.PlanWorktrees`; contents-read token only, not shared for writing, out-of-tree symlinks removed first, swept
   with the leftover MCP session files before each planner session when sandboxed, i.e. under the worker run lock) — and reaching
   CodeGraph and Kanban only through the loopback MCP proxy under `McpProfile.Planner` (started per session by `SandboxPlanRunner`
-  when an upstream is configured; its `--allowedTools` name exactly that profile's tools, `PlannerTools`). The pipeline runs it like
+  when an upstream is configured; its `--allowedTools` name exactly that profile's tools, `PlannerTools`). With `Worker:RunAs=none`
+  (development only) the planner still runs — unlike triage, which refuses: its input is the owner's own story, the same trust as
+  an unsandboxed implementer — but as the owner, so its read-only confinement is then only Claude Code's own (`dontAsk`, the
+  `ReadRule`, the denied tools): no `_factory` user and no ACL stand between it and the owner's files, and nothing is swept. A
+  seat the factory cannot set up (the sweep, the proxy start, the session file's ACL check: `FactoryUnavailableException`) is
+  factory-wide, as for triage: the exception leaves `RunPipeline.RunAsync` (the only exception its catch-all lets through), the
+  item stays in Plan with nothing recorded against it — no Escalated row, no comment — and the intake loop ends the poll
+  (`IntakeLoop.IsFactoryWide`). A planner a crashed run left behind (`worker-started` with no `worker-done` since the item last
+  entered Plan; `CurrentWorkerAttempt` starts at Plan too) is stopped before the next seat is set up (`StopOrphanAsync`,
+  `orphan-killed`), like Implement's. The pipeline runs it like
   any worker session of the item (`RunSessionAsync`: pid, `session` and `worker-model-class` checkpoints, every line stored,
   Pause/Stop and the freeze watched, a usage-limited or `model_class_unavailable` session pausing the factory, never escalating)
   but without the repo-settings guard and the stuck detector (it loads no settings file and has no round), and taints it from its
   start (`Taint.Planner`), so nothing it did can be pushed. Models propose, code decides (E1): the answer's last fenced `json`
   block (`{"stories": [{key, title, description, acceptance[], type, blocked_by[]}]}`) is read by `PlanParser`, which refuses — never
-  cuts — anything off the rules: 1–`MaxStories` (20) stories, unique `key`s (a-z, 0-9, `-`, `_`; ≤ 32) and unique titles (≤ 120; the
-  board finds a created story by its exact name), description ≤ 2,000, 1–5 one-line acceptance entries ≤ 300, type
+  cuts — anything off the rules: 1–`MaxStories` (20) stories, unique `key`s (a-z, 0-9, `-`, `_`; ≤ 32) and unique titles (≤ 120),
+  description ≤ 2,000, 1–5 one-line acceptance entries ≤ 300, type
   feature/chore/bug, `blocked_by` naming other stories of the plan, never itself, no cycle; text is cleaned of control and format
-  characters, and the stories are ordered blockers-first. Invalid → a `plan-rejected` checkpoint (why; outcome `gate_rejected`), the
-  item escalates and no story is created. Valid → the `plan` checkpoint (the plan as JSON) before any board write, then
-  `IWorkSource.CreateChildrenAsync` (the parent's team and epic, Backlog, `blocks` links; idempotent by name), then `plan-stories`
-  (the ids in plan order, e.g. `sc-12 sc-13`), then Plan → `Planned`. A recorded `plan` without a later `plan-stories` is the plan a
-  later run creates — after a crash, a pause or an escalation (the board was down) no second planner session runs, so no second
-  plan's stories land beside the first's (E4). `Planned` (the one new state and table row, `Plan → Planned`) has no handler: the
+  characters, and the stories are ordered blockers-first; JSON that cannot be read — also a property named twice or a lone
+  surrogate escape, which System.Text.Json reports only when the node is used — is refused the same way. Invalid → a
+  `plan-rejected` checkpoint (why; outcome `gate_rejected`), the item escalates and no story is created. Valid → the `plan`
+  checkpoint (the plan as JSON), then `plan-creating` right before the board is asked for anything, then
+  `IWorkSource.CreateChildrenAsync` (the parent's team and epic, Backlog, `blocks` links), then `plan-stories` (the ids in plan
+  order, e.g. `sc-12 sc-13`), then Plan → `Planned`. `CreateChildrenAsync` is idempotent, and finds a child again only by name
+  and description together (the description starts with the code-written marker below; the listings carry no description, so
+  each namesake is read in full; line endings and outer whitespace aside): a story someone else wrote with a plan story's title
+  is never reused, recorded or linked — the plan's own story is created beside it. A source that could not find the children
+  again refuses before any write (`ChildrenRefusedException`: a Shortcut parent with neither epic nor team, possible only with
+  `--ignore-scope`), and the item escalates with no story created. Which plan a later run uses (`RunPipeline.ReusesRecordedPlan`;
+  the newest `plan` row is the one considered): a recorded plan is reused — no planner session — when a `plan-creating` or
+  `plan-stories` row follows it (a story of it may be on the board: no second plan's stories land beside the first's, E4, also
+  after an escalation because the board was down), or when no Escalated row follows it (a crash, a pause, an interrupted run).
+  A plan the item escalated on before `plan-creating` is dropped (the owner may have edited the story before re-queuing it, and
+  nothing of the plan exists): the re-run plans afresh with a new session and records a new `plan`. A recorded plan that no
+  longer passes `PlanParser` escalates saying so ("no longer validates"): before `plan-creating` the next run therefore plans
+  afresh; after it every run says the same, and its stories are finished or archived by hand. With `plan-stories` recorded only
+  the transition is left and the plan is not read again. `Planned` (the one new state and table row, `Plan → Planned`) has no handler: the
   item waits on its stories, is listed by no `InFlightAsync`, a `factory run` on it changes nothing (no held notice) and succeeds,
   and it is not a failure (outcome `passed`). Planner text is untrusted (E3): each created story's description starts with the
   marker `<!-- dark-factory:planned-from sc-<parent> -->` (`PlannedStory`), then a `Repo:` line naming the plan item's repository

@@ -102,6 +102,20 @@ public static partial class PlanParser
     /// <summary>The plan <paramref name="json"/> holds (the planner's schema), or <see cref="PlanFormatException"/>.</summary>
     public static Plan FromJson(string json)
     {
+        try
+        {
+            return Read(json);
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+        {
+            // What System.Text.Json throws only when a node is first used: a property named twice, a string that is not valid
+            // UTF-16 (a lone surrogate escape).
+            throw new PlanFormatException($"the plan is not readable JSON ({Cut(ex.Message, 200)})");
+        }
+    }
+
+    private static Plan Read(string json)
+    {
         JsonObject root;
         try
         {
@@ -142,7 +156,8 @@ public static partial class PlanParser
             }
             var title = Whitespace().Replace(Clean(String(node, "title", at), multiline: false), " ").Trim();
             Bound(title, MaxTitle, $"{at}.title");
-            // The board finds a story it already created by its exact name (IWorkSource.CreateChildrenAsync), so names are unique.
+            // The board finds a story it already created by its exact name and description (IWorkSource.CreateChildrenAsync), and a
+            // person tells the plan's stories apart by name: names are unique.
             if (stories.Any(s => s.Title == title))
             {
                 throw new PlanFormatException($"{at}.title '{Cut(title, 80)}' is used twice");

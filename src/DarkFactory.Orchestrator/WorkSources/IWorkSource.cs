@@ -60,6 +60,12 @@ public sealed record ClaimResult(bool Claimed, string? Refusal)
     public static ClaimResult Refused(string reason) => new(false, reason);
 }
 
+/// <summary>
+/// The work source will not create children under this parent and has written nothing (<see cref="IWorkSource.CreateChildrenAsync"/>):
+/// the message says why, in words the item's owner can act on.
+/// </summary>
+public sealed class ChildrenRefusedException(string reason) : Exception(reason);
+
 /// <summary>A story to create from a plan. <see cref="BlockedBy"/> holds indices of earlier children.</summary>
 public sealed record ChildItem(string Name, string Description, string StoryType, IReadOnlyList<int> BlockedBy);
 
@@ -133,7 +139,10 @@ public interface IWorkSource
     /// <summary>
     /// Creates stories from a plan in <paramref name="parentId"/>'s team and epic, waiting in the backlog,
     /// joined by blocker relations. Returns their ids in order. Idempotent: a retry reuses the children
-    /// (and blocker relations) an earlier, partly failed call already created.
+    /// (and blocker relations) an earlier, partly failed call already created. A child is found again only by its name and
+    /// description together — never by name alone: the name may be a model's text, and a namesake someone else wrote is not
+    /// this call's child — so a caller leads each description with text only it writes. Refuses before any board write
+    /// (<see cref="ChildrenRefusedException"/>) when it could not find the children again after a failed attempt.
     /// </summary>
     Task<IReadOnlyList<int>> CreateChildrenAsync(int parentId, IReadOnlyList<ChildItem> children, CancellationToken ct);
 }

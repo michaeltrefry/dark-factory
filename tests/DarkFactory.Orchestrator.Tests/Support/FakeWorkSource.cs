@@ -67,7 +67,10 @@ public sealed class FakeWorkSource(WorkStory story, bool commentFails = false) :
     /// <summary>Whether a story labelled <c>plan</c> is planned into children (default: no, like a source that creates none).</summary>
     public bool PlansItems { get; set; }
 
-    /// <summary>The children created so far, each once (by name, like the Shortcut adapter).</summary>
+    /// <summary>When set, child creation is refused with this reason and nothing is created.</summary>
+    public string? RefuseChildren { get; set; }
+
+    /// <summary>The children created so far, each once (by name and description, like the Shortcut adapter).</summary>
     public List<(int Id, ChildItem Child)> Children { get; } = [];
 
     public Task<IReadOnlyList<int>> CreateChildrenAsync(int parentId, IReadOnlyList<ChildItem> children, CancellationToken ct)
@@ -76,10 +79,14 @@ public sealed class FakeWorkSource(WorkStory story, bool commentFails = false) :
         {
             throw new NotSupportedException();
         }
+        if (RefuseChildren is { } refusal)
+        {
+            throw new ChildrenRefusedException(refusal);
+        }
         var ids = new List<int>();
         foreach (var child in children)
         {
-            if (Children.FirstOrDefault(c => c.Child.Name == child.Name) is { Id: > 0 } known)
+            if (Children.FirstOrDefault(c => c.Child.Name == child.Name && c.Child.Description == child.Description) is { Id: > 0 } known)
             {
                 ids.Add(known.Id);
                 continue;

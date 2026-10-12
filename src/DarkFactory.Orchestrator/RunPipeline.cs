@@ -267,10 +267,15 @@ public sealed partial class RunPipeline(
         public const string PrReport = "pr-report";
         /// <summary>
         /// Plan: the planner's answer passed every rule (<see cref="Plans.PlanParser"/>); Detail is the plan
-        /// (<see cref="Plans.Plan.ToDetail"/>), recorded before any story is created (sc-25870). A recorded plan whose stories are not
-        /// all recorded yet (<see cref="PlanStories"/>) is the one a later run creates: no second planner session replaces it.
+        /// (<see cref="Plans.Plan.ToDetail"/>), recorded before any story is created (sc-25870). Whether a later run creates this
+        /// plan's stories or plans afresh: <see cref="ReusesRecordedPlan"/>.
         /// </summary>
         public const string Plan = "plan";
+        /// <summary>
+        /// Plan: written right before the work source is first asked to create the newest plan's stories. From this row on a story
+        /// of that plan may be on the board, so no later run replaces the plan.
+        /// </summary>
+        public const string PlanCreating = "plan-creating";
         /// <summary>Plan: the planner's answer broke a rule (Detail: which); no story is created and the item escalates.</summary>
         public const string PlanRejected = "plan-rejected";
         /// <summary>Plan: the plan's stories are on the board; Detail is their ids, in the plan's order (e.g. <c>sc-12 sc-13</c>).</summary>
@@ -591,7 +596,10 @@ public sealed partial class RunPipeline(
             log.WriteLine($"[paused] interrupted; `factory run {item.ExternalId}` resumes");
             throw;
         }
-        catch (Exception ex)
+        // The factory's own failure (the planner's seat: its sweep, the MCP proxy, the session file's ACL) is not the item's: it
+        // reaches the caller, which treats it as factory-wide (IntakeLoop.IsFactoryWide). The item stays where it is, nothing is
+        // recorded against it, and the next run takes the step again; whatever threw it has already cleaned up after itself.
+        catch (Exception ex) when (ex is not FactoryUnavailableException)
         {
             // Includes an OperationCanceledException nobody asked for, e.g. an HttpClient timeout.
             var commentError = await EscalateAsync(run, ex is WorkerFailedException ? ex.Message : $"{ex.GetType().Name}: {ex.Message}");
@@ -1534,8 +1542,8 @@ public sealed partial class RunPipeline(
     }
 
     /// <summary>
-    /// Rows of the current worker attempt: from the last entry into Implement, Fixing or CIHealing (a fix round; a return
-    /// from Paused continues the attempt) or the last lost-worktree restart.
+    /// Rows of the current worker attempt: from the last entry into Implement, Fixing or CIHealing (a fix round), or Plan (a plan
+    /// item's planner; a return from Paused continues the attempt) or the last lost-worktree restart.
     /// </summary>
     private static List<LedgerEntry> CurrentWorkerAttempt(List<LedgerEntry> history)
     {
@@ -1546,7 +1554,7 @@ public sealed partial class RunPipeline(
             var e = history[i];
             if (e.Step is null)
             {
-                if (e.State is WorkState.Implement or WorkState.Fixing or WorkState.CIHealing && previous != WorkState.Paused)
+                if (e.State is WorkState.Implement or WorkState.Fixing or WorkState.CIHealing or WorkState.Plan && previous != WorkState.Paused)
                 {
                     start = i;
                 }
