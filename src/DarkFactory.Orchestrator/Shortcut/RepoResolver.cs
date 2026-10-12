@@ -39,4 +39,16 @@ public static partial class RepoResolver
         var match = RepoLine().Match(storyDescription ?? "");
         return match.Success ? RepoRef.Parse(match.Groups[1].Value) : defaultRepo;
     }
+
+    /// <summary>
+    /// Every repository the description names, one per <c>Repo: owner/name</c> line, in order and without repeats (GitHub's names
+    /// are case-insensitive); <paramref name="defaultRepo"/> alone when it has no such line. The first is <see cref="Resolve"/>'s.
+    /// Only a plan item's planner reads more than the first (sc-25874): every other item is worked in one repository.
+    /// </summary>
+    public static IReadOnlyList<RepoRef> ResolveAll(string? storyDescription, RepoRef defaultRepo)
+    {
+        var named = RepoLine().Matches(storyDescription ?? "").Select(m => RepoRef.Parse(m.Groups[1].Value))
+            .DistinctBy(r => r.FullName, StringComparer.OrdinalIgnoreCase).ToList();
+        return named.Count > 0 ? named : [defaultRepo];
+    }
 }

@@ -333,6 +333,67 @@ public class GitWorkspaceTests
     }
 
     [Fact]
+    public async Task A_seat_holds_a_read_only_checkout_of_each_repository_fetched_with_its_own_token_and_nothing_is_pushed()
+    {
+        // sc-25874: a second repository with its own remote; the planner's seat holds a worktree of each under one directory.
+        var gears = new RepoRef("acme", "gears");
+        var gearsRemote = Path.Combine(_root, "gears.git");
+        var seed = Path.Combine(_root, "gears-seed");
+        Git(_root, "init", "--bare", "-b", "trunk", gearsRemote);
+        Git(_root, "init", "-b", "trunk", seed);
+        File.WriteAllText(Path.Combine(seed, "Cargo.toml"), "[package]\nname = \"gears\"\n");
+        Git(seed, "add", ".");
+        Git(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init");
+        Git(seed, "push", gearsRemote, "trunk");
+        var tokens = new List<string>();
+        var sandbox = new FakeSandbox();
+        GitWorkspace Planner() => new(Path.Combine(_root, "work"), r => r == gears ? gearsRemote : _remote,
+            (r, _) =>
+            {
+                tokens.Add(r.FullName);
+                return Task.FromResult<string?>(Token);
+            },
+            (cwd, env, args, ct) =>
+            {
+                _gitCalls.Add((args, env));
+                return GitWorkspace.RunGitAsync(cwd, env, args, ct);
+            }, sandbox: sandbox, worktreesDirectory: SandboxPlanRunner.PlanWorktrees, shareWithWorker: false);
+
+        var seat = await Planner().PrepareSeatAsync([Repo, gears], "factory/plan-sc-9", CancellationToken.None);
+
+        // One directory, under the planner's own root where the first repository's worktree would be, a checkout of each inside it.
+        Assert.Equal(Path.Combine(_root, "work", SandboxPlanRunner.PlanWorktrees, Repo.Owner, Repo.Name, "factory-plan-sc-9"), seat.Path);
+        Assert.Equal([(Repo, Path.Combine(seat.Path, "acme", "widgets")), (gears, Path.Combine(seat.Path, "acme", "gears"))],
+            seat.Checkouts.Select(c => (c.Repo, c.Workspace.Path)));
+        Assert.Equal("hello\n", File.ReadAllText(Path.Combine(seat.Path, "acme", "widgets", "README.md")));
+        Assert.StartsWith("[package]", File.ReadAllText(Path.Combine(seat.Path, "acme", "gears", "Cargo.toml")));
+        Assert.Equal(["main", "trunk"], seat.Checkouts.Select(c => c.Workspace.BaseBranch)); // each repository's own default branch
+        // Each clone was fetched with a token minted for that repository; nothing was pushed, and nothing shared for writing.
+        Assert.Equal(["acme/widgets", "acme/gears"], tokens);
+        Assert.Equal(["clone", "clone"], _gitCalls.Where(c => IsNetworkCall(c.Args)).Select(c => Subcommand(c.Args)));
+        Assert.DoesNotContain(sandbox.Calls, c => c.StartsWith("share", StringComparison.Ordinal));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Planner().PrepareSeatAsync([Repo, gears], "plan-sc-9", CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            Planner().PrepareSeatAsync([Repo, new RepoRef("ACME", "Widgets")], "factory/plan-sc-9", CancellationToken.None));
+
+        // A leftover seat (a crashed run's) is replaced by the next one, and the sweep removes one nothing resumes.
+        File.WriteAllText(Path.Combine(seat.Path, "acme", "widgets", "stale.txt"), "left behind");
+        var again = await Planner().PrepareSeatAsync([Repo, gears], "factory/plan-sc-9", CancellationToken.None);
+        Assert.False(File.Exists(Path.Combine(again.Path, "acme", "widgets", "stale.txt")));
+        Assert.True(File.Exists(Path.Combine(again.Path, "acme", "gears", "Cargo.toml")));
+        await Planner().SweepOrphansAsync((_, _) => Task.FromResult(false), CancellationToken.None);
+        Assert.False(Directory.Exists(again.Path));
+
+        // Removing a seat deletes every checkout and the directory, and leaves neither clone a registered worktree.
+        var last = await Planner().PrepareSeatAsync([Repo, gears], "factory/plan-sc-9", CancellationToken.None);
+        await Planner().RemoveSeatAsync(last, CancellationToken.None);
+        Assert.False(Directory.Exists(last.Path));
+        Assert.Equal(1, WorktreeCount());
+        Assert.Single(Git(Path.Combine(_root, "work", "repos", "acme", "gears"), "worktree", "list").Split('\n', StringSplitOptions.RemoveEmptyEntries));
+        Assert.DoesNotContain(_gitCalls, c => Subcommand(c.Args) == "push");
+    }
+
+    [Fact]
     public async Task Sweep_without_any_worktrees_does_nothing()
     {
         await Workspace().SweepOrphansAsync((_, _) => throw new InvalidOperationException("no worktree to ask about"), CancellationToken.None);

@@ -8,6 +8,25 @@ namespace DarkFactory.Orchestrator.Git;
 /// <param name="GitDir">The worktree's git admin dir in the owner's clone, recorded before the worker runs.</param>
 public sealed record Workspace(string Path, string Branch, string BaseBranch, string GitDir);
 
+/// <summary>A throwaway directory (<paramref name="Path"/>) holding a checkout of each of several repositories, each in its own directory under it.</summary>
+public sealed record SeatWorkspace(string Path, IReadOnlyList<(RepoRef Repo, Workspace Workspace)> Checkouts);
+
+/// <summary>
+/// Checkouts of several repositories under one directory (sc-25874): a plan item's planner reads every repository its plan may
+/// touch, and its one <c>Read</c> rule allows one directory.
+/// </summary>
+public interface ISeatWorkspace
+{
+    /// <summary>
+    /// A fresh directory holding, for each of <paramref name="repos"/>, a worktree of its default branch on <paramref name="branch"/>
+    /// (a local <c>factory/*</c> name, never pushed) at <c>&lt;owner&gt;/&lt;name&gt;</c> under it.
+    /// </summary>
+    Task<SeatWorkspace> PrepareSeatAsync(IReadOnlyList<RepoRef> repos, string branch, CancellationToken ct);
+
+    /// <summary>Deletes the seat: every checkout, then the directory.</summary>
+    Task RemoveSeatAsync(SeatWorkspace seat, CancellationToken ct);
+}
+
 public interface IRepoWorkspace
 {
     Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct);
@@ -82,7 +101,7 @@ public sealed class GitWorkspace(
     string worktreesDirectory = GitWorkspace.ItemWorktrees,
     bool shareWithWorker = true,
     GitStreamCommand? gitStream = null)
-    : IRepoWorkspace, Gate.IReviewFiles
+    : IRepoWorkspace, ISeatWorkspace, Gate.IReviewFiles
 {
     private readonly GitCommand _git = git ?? RunGitAsync;
     private readonly GitStreamCommand _gitStream = gitStream ?? RunGitStreamAsync;
@@ -109,6 +128,60 @@ public sealed class GitWorkspace(
         var clone = await FetchAsync(repo, ct);
         var baseBranch = await BaseBranchAsync(clone, ct);
         return await AddWorktreeAsync(clone, WorktreePath(repo, branch), branch, baseBranch, ["-B", branch], startPoint(baseBranch), ct);
+    }
+
+    /// <summary>
+    /// The seat's directory is where <paramref name="repos"/>' first repository's worktree of <paramref name="branch"/> would be
+    /// (so <see cref="SweepOrphansAsync"/> finds a leftover one), each checkout a worktree at <c>&lt;owner&gt;/&lt;name&gt;</c> inside it,
+    /// created like any worktree (<see cref="AddWorktreeAsync"/>: the clone fetched with that repository's own token).
+    /// </summary>
+    public async Task<SeatWorkspace> PrepareSeatAsync(IReadOnlyList<RepoRef> repos, string branch, CancellationToken ct)
+    {
+        EnsureFactoryBranch(branch);
+        if (repos.Count == 0 || repos.DistinctBy(r => r.FullName, StringComparer.OrdinalIgnoreCase).Count() != repos.Count)
+        {
+            throw new ArgumentException("A seat holds at least one repository, each once.", nameof(repos));
+        }
+        var path = WorktreePath(repos[0], branch);
+        // Whatever an earlier run left there (a seat, or the single worktree of the same name), and its registration in the clone.
+        await DeleteWorktreeAsync(ClonePath(repos[0]), path, ct);
+        Directory.CreateDirectory(path);
+        var checkouts = new List<(RepoRef, Workspace)>();
+        try
+        {
+            foreach (var repo in repos)
+            {
+                var clone = await FetchAsync(repo, ct);
+                var baseBranch = await BaseBranchAsync(clone, ct);
+                checkouts.Add((repo, await AddWorktreeAsync(clone, Path.Combine(path, repo.Owner, repo.Name), branch, baseBranch, ["-B", branch],
+                    $"origin/{baseBranch}", ct)));
+            }
+            return new SeatWorkspace(path, checkouts);
+        }
+        catch
+        {
+            await RemoveSeatAsync(new SeatWorkspace(path, checkouts), CancellationToken.None);
+            throw;
+        }
+    }
+
+    public async Task RemoveSeatAsync(SeatWorkspace seat, CancellationToken ct)
+    {
+        foreach (var (repo, workspace) in seat.Checkouts)
+        {
+            await DeleteWorktreeAsync(ClonePath(repo), workspace.Path, ct);
+        }
+        if (Directory.Exists(seat.Path))
+        {
+            if (sandbox is not null)
+            {
+                await sandbox.DeleteAsWorkerAsync(seat.Path, ct);
+            }
+            if (Directory.Exists(seat.Path))
+            {
+                Directory.Delete(seat.Path, recursive: true);
+            }
+        }
     }
 
     /// <summary>Clones the repo on first use, else fetches (pruning) and refreshes <c>origin/HEAD</c>; returns the clone's path.</summary>

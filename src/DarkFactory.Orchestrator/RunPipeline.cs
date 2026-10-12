@@ -84,8 +84,15 @@ public sealed partial class RunPipeline(
     FactoryFreeze? freeze = null,
     StuckDetection? stuck = null,
     int? maxControlReadFailures = null,
-    Plans.IPlanRunner? planner = null)
+    Plans.IPlanRunner? planner = null,
+    IReadOnlyList<RepoRef>? configuredRepos = null)
 {
+    /// <summary>
+    /// The factory's configured repositories (<c>FactoryOptions.ConfiguredRepos</c>; the default repository alone when not given): the
+    /// only ones a plan naming several repositories may name (sc-25874, <see cref="PlanRepositories"/>).
+    /// </summary>
+    private readonly IReadOnlyList<RepoRef> _configuredRepos = configuredRepos ?? [defaultRepo];
+
     /// <summary>
     /// Reads of an item's controls in a row that may fail while a worker or the gate's test runs go on (<c>Controls:MaxReadFailures</c>);
     /// the next failure counts as a Pause (E2: a check that cannot run counts as failed), recorded as <see cref="ControlsUnreadablePaused"/>.
