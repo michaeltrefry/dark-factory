@@ -50,7 +50,10 @@ public sealed class WorkerStuckException(string reason, string? session)
 /// Worktrees are throwaway (E5): removed once the PR is open or the item escalates; only a
 /// paused (Ctrl-C) or crashed Implement keeps its worktree, for the re-run to resume in.
 /// The board is touched only through <see cref="IWorkSource"/> (E6): Intake claims the item and
-/// reports it In Progress; Implement links the PR and branch before the item reaches Review.
+/// reports it In Progress; Implement links the PR and branch before the item reaches Review. An item labelled <c>plan</c> on a
+/// source that plans (<see cref="IWorkSource.PlansItems"/>) goes to Plan instead (sc-25870, <see cref="PlanAsync"/>): a read-only
+/// planner session proposes stories, the code checks the plan and creates them, and the item waits on them in
+/// <see cref="WorkState.Planned"/>, never implemented itself.
 /// A claim the work source refuses (the story left To Do or the watch scope, or another claimant holds
 /// it) parks the item in Paused with no board write; it is picked up again when it is ready again.
 /// Resuming an item already in the ledger first checks the story is still in the watch scope, and parks
@@ -80,7 +83,8 @@ public sealed partial class RunPipeline(
     GateStage? gate = null,
     FactoryFreeze? freeze = null,
     StuckDetection? stuck = null,
-    int? maxControlReadFailures = null)
+    int? maxControlReadFailures = null,
+    Plans.IPlanRunner? planner = null)
 {
     /// <summary>
     /// Reads of an item's controls in a row that may fail while a worker or the gate's test runs go on (<c>Controls:MaxReadFailures</c>);
@@ -261,6 +265,21 @@ public sealed partial class RunPipeline(
         /// <c>failed: &lt;why&gt;</c> (the description is a report only: a failure is recorded, not escalated).
         /// </summary>
         public const string PrReport = "pr-report";
+        /// <summary>
+        /// Plan: the planner's answer passed every rule (<see cref="Plans.PlanParser"/>); Detail is the plan
+        /// (<see cref="Plans.Plan.ToDetail"/>), recorded before any story is created (sc-25870). Whether a later run creates this
+        /// plan's stories or plans afresh: <see cref="ReusesRecordedPlan"/>.
+        /// </summary>
+        public const string Plan = "plan";
+        /// <summary>
+        /// Plan: written right before the work source is first asked to create the newest plan's stories. From this row on a story
+        /// of that plan may be on the board, so no later run replaces the plan.
+        /// </summary>
+        public const string PlanCreating = "plan-creating";
+        /// <summary>Plan: the planner's answer broke a rule (Detail: which); no story is created and the item escalates.</summary>
+        public const string PlanRejected = "plan-rejected";
+        /// <summary>Plan: the plan's stories are on the board; Detail is their ids, in the plan's order (e.g. <c>sc-12 sc-13</c>).</summary>
+        public const string PlanStories = "plan-stories";
     }
 
     /// <summary>
@@ -323,6 +342,7 @@ public sealed partial class RunPipeline(
             var handlers = new Dictionary<WorkState, Func<Run, CancellationToken, Task>>
             {
                 [WorkState.Intake] = IntakeAsync,
+                [WorkState.Plan] = PlanAsync,
                 [WorkState.Implement] = ImplementAsync,
             };
             if (gate is not null)
@@ -339,13 +359,13 @@ public sealed partial class RunPipeline(
     }
 
     /// <summary>States the implement stage drives (all a pipeline without a <see cref="GateStage"/> drives).</summary>
-    public static readonly IReadOnlySet<WorkState> ImplementStates = new HashSet<WorkState> { WorkState.Intake, WorkState.Implement };
+    public static readonly IReadOnlySet<WorkState> ImplementStates = new HashSet<WorkState> { WorkState.Intake, WorkState.Plan, WorkState.Implement };
 
     /// <summary>States the factory's handlers drive (the production pipeline has a <see cref="GateStage"/>); an item in one is in flight.</summary>
     public static readonly IReadOnlySet<WorkState> HandledStates = new HashSet<WorkState>
     {
-        WorkState.Intake, WorkState.Implement, WorkState.Review, WorkState.Fixing, WorkState.CI, WorkState.CIHealing, WorkState.MergeGate,
-        WorkState.Merge,
+        WorkState.Intake, WorkState.Plan, WorkState.Implement, WorkState.Review, WorkState.Fixing, WorkState.CI, WorkState.CIHealing,
+        WorkState.MergeGate, WorkState.Merge,
     };
 
     /// <summary>The states this pipeline drives.</summary>
@@ -576,7 +596,10 @@ public sealed partial class RunPipeline(
             log.WriteLine($"[paused] interrupted; `factory run {item.ExternalId}` resumes");
             throw;
         }
-        catch (Exception ex)
+        // The factory's own failure (the planner's seat: its sweep, the MCP proxy, the session file's ACL) is not the item's: it
+        // reaches the caller, which treats it as factory-wide (IntakeLoop.IsFactoryWide). The item stays where it is, nothing is
+        // recorded against it, and the next run takes the step again; whatever threw it has already cleaned up after itself.
+        catch (Exception ex) when (ex is not FactoryUnavailableException)
         {
             // Includes an OperationCanceledException nobody asked for, e.g. an HttpClient timeout.
             var commentError = await EscalateAsync(run, ex is WorkerFailedException ? ex.Message : $"{ex.GetType().Name}: {ex.Message}");
@@ -600,7 +623,9 @@ public sealed partial class RunPipeline(
             log.WriteLine($"[paused] {item.ExternalId} parked: {reason}");
             return await OutcomeAsync(item, $"{item.ExternalId} parked: {reason}", ct);
         }
-        log.WriteLine($"[{item.State}] parked; no handler for {item.State} in this phase");
+        log.WriteLine(item.State == WorkState.Planned
+            ? $"[{item.State}] {item.ExternalId} waits on its plan's stories"
+            : $"[{item.State}] parked; no handler for {item.State} in this phase");
         return await OutcomeAsync(item, null, ct);
     }
 
@@ -625,7 +650,9 @@ public sealed partial class RunPipeline(
             return await OutcomeAsync(item, error is null ? null : $"{item.ExternalId}: closeout NOT posted: {error}", ct);
         }
         var entered = history.FindLastIndex(e => e.Step is null);
-        if (!Runnable(item, await ledger.ContextAsync(item, ct)) && !history.Skip(entered + 1).Any(e => e.Step == Steps.HeldNotice))
+        // A plan item waiting on its stories (sc-25870) is where it should be: its story is told nothing.
+        if (item.State != WorkState.Planned && !Runnable(item, await ledger.ContextAsync(item, ct))
+            && !history.Skip(entered + 1).Any(e => e.Step == Steps.HeldNotice))
         {
             var id = Naming.Format(storyId);
             try
@@ -705,7 +732,12 @@ public sealed partial class RunPipeline(
             await ledger.CheckpointAsync(run.Item, Steps.Claimed, null, null, ct);
             log.WriteLine($"[intake] claimed {run.Item.ExternalId}");
         }
-        // Phase 1 has no Plan step: the worker implements straight from the story.
+        // A plan item (sc-25870) is planned into stories, never implemented itself; any other item is implemented straight from its story.
+        if (source.PlansItems && Plans.PlanLabel.IsOn(run.Story))
+        {
+            await ledger.RecordAsync(run.Item, WorkState.Plan, null, $"label {Plans.PlanLabel.Name}", ct);
+            return;
+        }
         await ledger.RecordAsync(run.Item, WorkState.Implement, null, null, ct);
     }
 
@@ -903,12 +935,25 @@ public sealed partial class RunPipeline(
     /// On success it checkpoints <see cref="Steps.WorkerDone"/> and returns the session id.
     /// </summary>
     private async Task<string?> RunWorkerSessionAsync(Run run, Workspace workspace, string? session, Func<string?, string> prompt,
-        HashSet<string> models, IReadOnlyCollection<WorkerInput> inputs, string label, string modelClass, CancellationToken ct)
+        HashSet<string> models, IReadOnlyCollection<WorkerInput> inputs, string label, string modelClass, CancellationToken ct) =>
+        (await RunSessionAsync(run, worker, workspace.Path, null, implementing: true, session, prompt, models,
+            inputs.Select(Taint.Of).OfType<string>().ToList(), label, modelClass, ct)).Session;
+
+    /// <summary>
+    /// <see cref="RunWorkerSessionAsync"/> for any session of the item: <paramref name="runner"/> in <paramref name="path"/>, tainted from
+    /// its start by <paramref name="inputTaints"/>. An <paramref name="implementing"/> session (the implementer, a fixer) loads the
+    /// worktree's Claude settings — which taint and are guarded (<see cref="RepoSettingsGuard"/>) —, has its models recorded and is
+    /// watched by the stuck detector; a planner session (sc-25870: read-only, no settings file loaded, no round to fail, reaching the
+    /// loopback MCP proxy through <paramref name="mcpConfig"/>) is not. Returns the session id and the worker's result.
+    /// </summary>
+    private async Task<(string? Session, WorkerResult Result)> RunSessionAsync(Run run, IWorker runner, string path, string? mcpConfig, bool implementing,
+        string? session, Func<string?, string> prompt, HashSet<string> models, IReadOnlyList<string> inputTaints, string label, string modelClass,
+        CancellationToken ct)
     {
         var item = run.Item;
         var resume = session;
         // The target repo's own Claude settings may feed the session content its stream would not show (hooks, MCP, extra allow rules).
-        var taints = inputs.Select(Taint.Of).Append(Taint.OfRepoSettings(workspace.Path)).OfType<string>().ToList();
+        var taints = implementing ? inputTaints.Append(Taint.OfRepoSettings(path)).OfType<string>().ToList() : inputTaints;
         // Every worker this runs exists to push its work: a tainted session would only be refused its push token after spending
         // the model's time, so it is not resumed at all (E4). Its stored stream is replayed first: a run stopped between storing
         // a web tool's line and committing its taint left the use only there.
@@ -925,14 +970,17 @@ public sealed partial class RunPipeline(
             }
         }
         // The worktree's Claude settings must not replace the router variables or pin a model (E8): the session does not start.
-        ThrowIfUnsafeRepoSettings(workspace, starting: true);
+        if (implementing)
+        {
+            ThrowIfUnsafeRepoSettings(path, starting: true);
+        }
         // No worker session starts into a frozen factory (implement, a fix round, a CI fix).
         await ThrowIfFrozenAsync(item, ct);
         log.WriteLine(resume is null ? $"[{label}] starting worker" : $"[{label}] resuming claude session {resume}");
         // Every stdout line is stored (and pushed to live viewers) as it streams (E7).
         await using var capture = sessions is null ? null : await sessions.StartAsync(item.Id, resume, ct);
         // Pause asks the worker to stop at its next tool boundary (and stops it if it doesn't); Stop stops it now.
-        await using var watch = new ControlWatch(_controls, worker, log, _controlPoll, _pauseGrace, item.ExternalId, item.EpicId, workspace.Path,
+        await using var watch = new ControlWatch(_controls, runner, log, _controlPoll, _pauseGrace, item.ExternalId, item.EpicId, path,
             _maxControlReadFailures, ct);
         // A looping session is interrupted at its next tool boundary like a Pause, but never resumed (sc-25388).
         var detector = new StuckDetector(_stuck);
@@ -942,7 +990,7 @@ public sealed partial class RunPipeline(
         WorkerResult result;
         try
         {
-            result = await worker.RunAsync(workspace.Path, prompt(resume), resume, modelClass,
+            result = await runner.RunAsync(path, prompt(resume), resume, modelClass,
                 new WorkerCallbacks(
                     OnStarted: (pid, c) => ledger.CheckpointAsync(item, Steps.WorkerStarted, session, pid.ToString(), c),
                     OnSession: async (sid, c) =>
@@ -976,7 +1024,7 @@ public sealed partial class RunPipeline(
                         {
                             await capture.OnLineAsync(line, c);
                         }
-                        if (detector.Accept(line) is { } reason)
+                        if (implementing && detector.Accept(line) is { } reason)
                         {
                             // On the ledger before the interrupt (and on a token nothing cancels): a run that stops now must not
                             // resume the looping session.
@@ -988,7 +1036,7 @@ public sealed partial class RunPipeline(
                     },
                     OnModel: async (model, c) =>
                     {
-                        if (models.Add(model))
+                        if (implementing && models.Add(model))
                         {
                             await ledger.CheckpointAsync(item, Steps.ImplementerModel, session, model, c);
                         }
@@ -997,7 +1045,7 @@ public sealed partial class RunPipeline(
                     {
                         await ledger.TaintSessionAsync(item, sid, reason, c);
                         log.WriteLine($"[{label}] session {sid} used {reason}: tainted, it gets no push token");
-                    }), watch.Token);
+                    }), mcpConfig, watch.Token);
         }
         catch (Exception ex) when (watch.Requested is { } requested && !ct.IsCancellationRequested)
         {
@@ -1074,20 +1122,23 @@ public sealed partial class RunPipeline(
                 $"Worker failed (exit {result.ExitCode}, result {result.ResultSubtype ?? "none"}): {result.ResultText} {result.StderrTail}".Trim());
         }
         // The worker can write the repo's settings itself (a hook it added may have run in-session): checked again before it is done.
-        if (session is not null && Taint.OfRepoSettings(workspace.Path) is { } changed)
+        if (implementing && session is not null && Taint.OfRepoSettings(path) is { } changed)
         {
             await ledger.TaintSessionAsync(item, session, changed, ct);
         }
         // Nor may the worker leave such settings for a later session (or push them): its round fails instead.
-        ThrowIfUnsafeRepoSettings(workspace, starting: false);
+        if (implementing)
+        {
+            ThrowIfUnsafeRepoSettings(path, starting: false);
+        }
         await ledger.CheckpointAsync(item, Steps.WorkerDone, session, $"worker exit {result.ExitCode}", ct);
-        return session;
+        return (session, result);
     }
 
     /// <summary>Fails the worker round (escalates) when the worktree's Claude settings are not safe (<see cref="RepoSettingsGuard"/>).</summary>
-    private static void ThrowIfUnsafeRepoSettings(Workspace workspace, bool starting)
+    private static void ThrowIfUnsafeRepoSettings(string worktree, bool starting)
     {
-        if (RepoSettingsGuard.Refusal(workspace.Path) is { } refusal)
+        if (RepoSettingsGuard.Refusal(worktree) is { } refusal)
         {
             throw new WorkerFailedException(starting
                 ? $"The worker session was not started: the worktree's Claude settings are refused ({refusal}). Only keys that cannot "
@@ -1491,8 +1542,8 @@ public sealed partial class RunPipeline(
     }
 
     /// <summary>
-    /// Rows of the current worker attempt: from the last entry into Implement, Fixing or CIHealing (a fix round; a return
-    /// from Paused continues the attempt) or the last lost-worktree restart.
+    /// Rows of the current worker attempt: from the last entry into Implement, Fixing or CIHealing (a fix round), or Plan (a plan
+    /// item's planner; a return from Paused continues the attempt) or the last lost-worktree restart.
     /// </summary>
     private static List<LedgerEntry> CurrentWorkerAttempt(List<LedgerEntry> history)
     {
@@ -1503,7 +1554,7 @@ public sealed partial class RunPipeline(
             var e = history[i];
             if (e.Step is null)
             {
-                if (e.State is WorkState.Implement or WorkState.Fixing or WorkState.CIHealing && previous != WorkState.Paused)
+                if (e.State is WorkState.Implement or WorkState.Fixing or WorkState.CIHealing or WorkState.Plan && previous != WorkState.Paused)
                 {
                     start = i;
                 }

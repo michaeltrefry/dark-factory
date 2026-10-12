@@ -368,6 +368,14 @@ public class StepOutcomeTests
         { null, WorkState.Watch, RunPipeline.Steps.Closeout, "failed: Shortcut down", StepOutcome.Failed },
         { null, WorkState.Merge, RunPipeline.Steps.PrReport, "failed: 502", StepOutcome.Failed },
         { null, WorkState.Merge, RunPipeline.Steps.PrReport, "merge", StepOutcome.Passed },
+        // sc-25870: a plan item's rows.
+        { WorkState.Intake, WorkState.Plan, null, "label plan", StepOutcome.Passed },
+        { WorkState.Plan, WorkState.Planned, null, "2 stories: sc-12 sc-13", StepOutcome.Passed },
+        { WorkState.Plan, WorkState.Escalated, null, "not a valid plan", StepOutcome.Escalated },
+        { WorkState.Plan, WorkState.Paused, null, RunPipeline.UsagePaused, StepOutcome.Deferred },
+        { null, WorkState.Plan, RunPipeline.Steps.Plan, "{}", StepOutcome.Passed },
+        { null, WorkState.Plan, RunPipeline.Steps.PlanRejected, "cycle: a, b", StepOutcome.GateRejected },
+        { null, WorkState.Plan, RunPipeline.Steps.PlanStories, "sc-12 sc-13", StepOutcome.Passed },
     };
 
     [Theory]
