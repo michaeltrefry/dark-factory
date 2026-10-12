@@ -50,6 +50,19 @@ public class SetupScriptTests
     }
 
     [Fact]
+    public async Task A_missing_optional_tool_is_reported_with_what_needs_it_and_never_fails_the_setup()
+    {
+        var good = SlowTool;
+        var bad = SandboxSupport.Executable(_dir, "missing-tool.sh", "#!/bin/sh\necho 'not installed' >&2\nexit 127\n");
+
+        var (exitCode, stdout, stderr) = await RunCheckAsync("check_optional_toolchain 'Rust repos only' ", good, bad);
+
+        Assert.True(exitCode == 0, stderr);
+        Assert.Contains($"ok    {good}: ok", stdout);
+        Assert.Contains($"none  {bad} (exit 127): not available to _factory (Rust repos only)", stdout);
+    }
+
+    [Fact]
     public async Task Remove_worker_login_deletes_only_the_credentials_and_never_runs_the_helper_or_the_setup()
     {
         var run = new WholeScriptRun(_dir);
@@ -223,10 +236,12 @@ public class SetupScriptTests
         }
     }
 
-    private Task<(int ExitCode, string Stdout, string Stderr)> CheckToolchainAsync(params string[] tools)
+    private Task<(int ExitCode, string Stdout, string Stderr)> CheckToolchainAsync(params string[] tools) => RunCheckAsync("check_toolchain ", tools);
+
+    private Task<(int ExitCode, string Stdout, string Stderr)> RunCheckAsync(string call, params string[] tools)
     {
         var script = File.ReadAllText(Path.Combine(SandboxSupport.RepoRoot, "scripts", "setup-worker-user.sh"));
-        var functions = string.Join("\n", new[] { "with_open_stdin", "check_toolchain" }.Select(name =>
+        var functions = string.Join("\n", new[] { "with_open_stdin", "check_toolchain", "check_optional_toolchain" }.Select(name =>
         {
             var match = Regex.Match(script, $@"^{name}\(\) \{{.*?^\}}$", RegexOptions.Multiline | RegexOptions.Singleline);
             Assert.True(match.Success, $"{name} not found in setup-worker-user.sh");
@@ -237,7 +252,7 @@ public class SetupScriptTests
             owner=owner worker=_factory sudoers=/nonexistent worker_home=/nonexistent
             helper='{{SafeHelper.Create(_dir).Path}}'
             {{functions}}
-            check_toolchain {{string.Join(' ', tools.Select(t => $"'{t}'"))}}
+            {{call}}{{string.Join(' ', tools.Select(t => $"'{t}'"))}}
             """;
         return BashAsync(harness);
     }

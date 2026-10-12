@@ -30,6 +30,8 @@ public sealed record TestCaseResult(
 /// <summary>What a failed command of a test run means: restore and build are told apart from the tests' own failures.</summary>
 public enum TestPhase
 {
+    /// <summary>A probe of the stack's toolchain (e.g. <c>cargo --version</c>): failing, the toolchain is missing for the run's user.</summary>
+    Toolchain,
     Restore,
     Build,
     Test,
@@ -52,10 +54,24 @@ public sealed record TestStep(TestPhase Phase, string Program, IReadOnlyList<str
     /// writes the same): only these are read as the run's results.
     /// </summary>
     public string? ResultFilePattern { get; init; }
+
+    /// <summary>
+    /// When set, the step's standard output is kept by the runner (in memory, never a file the run could write) under this
+    /// name: a test step's is read as a result file with the step's exit code (<see cref="ResultFile.ExitCode"/>), a build
+    /// step's as a build-error log. For a tool that reports on its output rather than in a file (cargo).
+    /// </summary>
+    public string? CaptureOutput { get; init; }
 }
 
-/// <summary>One result file of a run: its path relative to the results directory, and its content.</summary>
-public sealed record ResultFile(string Name, string Content);
+/// <summary>
+/// One result file of a run: its path relative to the results directory, and its content; or a step's captured standard
+/// output (<see cref="TestStep.CaptureOutput"/>: its name, the output, and the step's <see cref="ExitCode"/>).
+/// </summary>
+public sealed record ResultFile(string Name, string Content)
+{
+    /// <summary>The exit code of the step whose output this is; null for a file the run wrote.</summary>
+    public int? ExitCode { get; init; }
+}
 
 /// <summary>
 /// One sandboxed test run: <see cref="Commit"/> checked out in a fresh throwaway worktree named <see cref="Name"/>; with
@@ -93,6 +109,8 @@ public enum TestRunStatus
     TimedOut,
     /// <summary>The tests ran but left no result file.</summary>
     NoResults,
+    /// <summary>The stack's toolchain is not available to the run's user (a <see cref="TestPhase.Toolchain"/> step failed): nothing was built or run.</summary>
+    ToolchainMissing,
 }
 
 /// <summary>
@@ -163,12 +181,19 @@ public sealed class TestSource(IGateTestRunner runner, RepoRef repo, string base
 /// (<see cref="Unisolable"/>, each with why: the check cannot run them, so it fails, E2). <see cref="Projects"/> names the
 /// project (at the head) that holds each new test: the runs build and test just those projects.
 /// </summary>
-public sealed record NewTestSet(IReadOnlyList<ChangedFile> TestFiles, IReadOnlyList<string> Tests, IReadOnlyList<string> Unisolable)
+public record NewTestSet(IReadOnlyList<ChangedFile> TestFiles, IReadOnlyList<string> Tests, IReadOnlyList<string> Unisolable)
 {
     public static readonly NewTestSet None = new([], [], []);
 
     /// <summary>Each new test's project file, by test id.</summary>
     public IReadOnlyDictionary<string, string> Projects { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Test files the base run gets with this content instead of the head's, by path (each also one of
+    /// <see cref="TestFiles"/>): a file that holds production code too, where only the PR's test code may be applied to
+    /// the base (a Rust file's <c>#[cfg(test)]</c> modules grafted into its base version, <see cref="CargoNewTests"/>).
+    /// </summary>
+    public IReadOnlyDictionary<string, string> BaseReplacements { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
 }
 
 /// <summary>
@@ -201,8 +226,8 @@ public sealed record BaseEvidence(TestRunReport Run, BuildFailure? First = null,
 
 /// <summary>
 /// One language/framework's way to find the tests a PR adds (deterministically, from the files at the base and the head)
-/// and to run just those tests. <see cref="XunitNewTests"/> is .NET/xUnit; a stack none claims is
-/// <see cref="NewTestsOutcome.Unsupported"/>.
+/// and to run just those tests. <see cref="XunitNewTests"/> is .NET/xUnit, <see cref="CargoNewTests"/> Rust/cargo; a
+/// stack none claims is <see cref="NewTestsOutcome.Unsupported"/>.
 /// </summary>
 public interface INewTestStrategy
 {
@@ -236,10 +261,11 @@ public interface INewTestStrategy
     IReadOnlyList<BuildError> ParseBuildErrors(string log, IReadOnlyList<string> roots);
 
     /// <summary>
-    /// Attributes a failed base build's <paramref name="errors"/> to the new <paramref name="tests"/>, given the content of
-    /// every file the run applied (<paramref name="applied"/>, by path; deterministic, nothing compiled).
+    /// Attributes a failed base build's <paramref name="errors"/> to the new <paramref name="tests"/> of
+    /// <paramref name="set"/> (what <see cref="IdentifyAsync"/> found), given the content of every file the run applied
+    /// (<paramref name="applied"/>, by path; deterministic, nothing compiled).
     /// </summary>
-    BuildFailure ExplainBuildFailure(IReadOnlyDictionary<string, string> applied, IReadOnlyList<BuildError> errors, IReadOnlyList<string> tests);
+    BuildFailure ExplainBuildFailure(NewTestSet set, IReadOnlyDictionary<string, string> applied, IReadOnlyList<BuildError> errors, IReadOnlyList<string> tests);
 }
 
 /// <summary>
@@ -263,8 +289,8 @@ public static class NewTestsOutcome
     /// <summary>The PR adds tests in a stack no strategy supports, or ones a strategy cannot isolate: the check cannot run.</summary>
     public const string Unsupported = "unsupported";
     /// <summary>
-    /// A run could not produce evidence (restore failed, timed out, no results, an unreadable test report, a new test not executed, a base build error
-    /// outside the PR's test files or not from the compiler, a git or sandbox failure).
+    /// A run could not produce evidence (the stack's toolchain is missing, restore failed, timed out, no results, an unreadable test report, a new test
+    /// not executed, a base build error outside the PR's test code or not from the compiler, a git or sandbox failure).
     /// </summary>
     public const string Error = "error";
 }
@@ -348,7 +374,7 @@ public static class NewTestsCheck
     public static string NewResultsDirectory() => ResultsDirectoryPrefix + Guid.NewGuid().ToString("N");
 
     /// <summary>The supported stacks.</summary>
-    public static readonly IReadOnlyList<INewTestStrategy> Strategies = [new XunitNewTests()];
+    public static readonly IReadOnlyList<INewTestStrategy> Strategies = [new XunitNewTests(), new CargoNewTests()];
 
     public static async Task<NewTestsResult> RunAsync(IGateTestRunner runner, IReadOnlyList<INewTestStrategy> strategies, RepoRef repo,
         string baseSha, string headSha, string runName, Action<string>? log, CancellationToken ct)
@@ -397,7 +423,10 @@ public static class NewTestsCheck
             {
                 var directory = NewResultsDirectory();
                 return new TestRunSpec(name, commit, from, from is null ? [] : overlay, from is null ? [] : deletes,
-                    await strategy.StepsAsync(source, commit, tests, set.Projects, directory, ct), strategy, directory);
+                    await strategy.StepsAsync(source, commit, tests, set.Projects, directory, ct), strategy, directory)
+                {
+                    Replacements = from is null ? new Dictionary<string, string>(StringComparer.Ordinal) : set.BaseReplacements,
+                };
             }
             var baseSpec = await Spec($"{runName}-base", baseSha, headSha, set.Tests);
             var baseRun = await runner.RunAsync(repo, baseSpec, ct);
@@ -410,28 +439,31 @@ public static class NewTestsCheck
                 var applied = new Dictionary<string, string>(StringComparer.Ordinal);
                 foreach (var path in overlay)
                 {
-                    if (await source.ReadAsync(headSha, path, ct) is { } text)
+                    if ((set.BaseReplacements.TryGetValue(path, out var grafted) ? grafted : await source.ReadAsync(headSha, path, ct)) is { } text)
                     {
                         applied[path] = text;
                     }
                 }
-                var first = strategy.ExplainBuildFailure(applied, baseRun.BuildErrors, set.Tests);
+                var first = strategy.ExplainBuildFailure(set, applied, baseRun.BuildErrors, set.Tests);
                 evidence = evidence with { First = first };
                 var remaining = set.Tests.Except(first.NotBuilt, StringComparer.Ordinal).ToList();
                 if (first.Unattributable.Count == 0 && first.Unremovable.Count == 0 && remaining.Count > 0 && first.Replacements.Count > 0)
                 {
                     log?.Invoke($"{strategy.Name}: the base does not build with the PR's test files; retrying it without {string.Join(", ", first.Removed)}");
-                    var retrySpec = await Spec($"{runName}-base-retry", baseSha, headSha, remaining) with { Replacements = first.Replacements };
+                    var stripped = new Dictionary<string, string>(applied, StringComparer.Ordinal);
+                    foreach (var (path, text) in first.Replacements)
+                    {
+                        stripped[path] = text;
+                    }
+                    // The retry's files: the base run's replacements, and over them the files without what did not compile.
+                    var replaced = set.BaseReplacements.Keys.Concat(first.Replacements.Keys).Distinct(StringComparer.Ordinal)
+                        .ToDictionary(p => p, p => stripped[p], StringComparer.Ordinal);
+                    var retrySpec = await Spec($"{runName}-base-retry", baseSha, headSha, remaining) with { Replacements = replaced };
                     var retry = await runner.RunAsync(repo, retrySpec, ct);
                     evidence = evidence with { Retry = retry };
                     if (retry.Status == TestRunStatus.BuildFailed)
                     {
-                        var stripped = new Dictionary<string, string>(applied, StringComparer.Ordinal);
-                        foreach (var (path, text) in first.Replacements)
-                        {
-                            stripped[path] = text;
-                        }
-                        evidence = evidence with { RetryFailure = strategy.ExplainBuildFailure(stripped, retry.BuildErrors, remaining) };
+                        evidence = evidence with { RetryFailure = strategy.ExplainBuildFailure(set, stripped, retry.BuildErrors, remaining) };
                     }
                 }
             }
@@ -566,6 +598,7 @@ public static class NewTestsCheck
         TestRunStatus.BuildFailed => "build-failed",
         TestRunStatus.TimedOut => "timed-out",
         TestRunStatus.NoResults => "no-results",
+        TestRunStatus.ToolchainMissing => "toolchain-missing",
         _ => status.ToString(),
     };
 

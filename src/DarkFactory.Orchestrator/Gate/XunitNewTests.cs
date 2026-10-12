@@ -421,7 +421,7 @@ public sealed class XunitNewTests : INewTestStrategy
     /// error outside any unit (e.g. an assembly attribute) is unremovable; any other error (another code, another file, no
     /// file, a position outside the file) is unattributable; a build that names no error at all is too.
     /// </summary>
-    public BuildFailure ExplainBuildFailure(IReadOnlyDictionary<string, string> applied, IReadOnlyList<BuildError> errors, IReadOnlyList<string> tests)
+    public BuildFailure ExplainBuildFailure(NewTestSet set, IReadOnlyDictionary<string, string> applied, IReadOnlyList<BuildError> errors, IReadOnlyList<string> tests)
     {
         var unattributable = new List<string>();
         var unremovable = new List<string>();

@@ -18,7 +18,7 @@ Claude Code headless workers through the Weave router.
   review and merge gate (`Gate/`: `ReviewModels` (which panel calls count), `ReviewPanel` (roles, prompts, findings),
   `Reviewer.cs` (`IReviewer`/`RouterReviewer`) reading the router's stream with `MessageStream`, `GatePolicy` (+ `RiskyPaths`)
   and the path tiers `PathTiers`, `MergeGate`, `FixLoop`, `CiHeal`, `MergeQueue`, the test-only `GateCheckSeam`, the new-tests
-  check `NewTests.cs` (`NewTestsCheck`)/`XunitNewTests`/`SandboxTestRunner`;
+  check `NewTests.cs` (`NewTestsCheck`)/`XunitNewTests`/`CargoNewTests` (Rust, over the lexer-level `RustSource`)/`SandboxTestRunner`;
   reviewer prompts in `factory/prompts/`; GitHub side
   `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`, the merge gate and queue `RunPipeline.MergeQueue.cs`),
   the MCP upstreams and the loopback MCP proxy (`Mcp/`: `McpHttpClient`, `McpUpstream`/`McpUpstreams`/`McpServers`
@@ -87,6 +87,8 @@ Claude Code headless workers through the Weave router.
   overlay-bound CodeGraph answers), `CodeGraphTriageTests` (a triage session through the proxy, scanned for the CodeGraph token by a
   wrapper Claude Code path, `ScanWrapper`; the production proxy refusing off-profile tools; a live Kanban read through the reviewers'
   tools), `CodeGraphGateTests` (a critical file escalating on risk-threshold; CodeGraph unreachable blocking at the CI timeout).
+  Phase 4a's P4-AT4 (sc-25875): `GateNegativeTests.P4_AT4_…` (a seeded cargo package on the PR branch: the new-tests check run by
+  cargo as the worker user; needs cargo and rustc for `_factory`).
 
 ## Commands
 
@@ -186,7 +188,9 @@ stdin lines, one header each, which the helper joins with line breaks — helper
 has a uid-sweep refusal; last it runs `<Worker:ClaudePath> --version` as `_factory` through the helper and fails start-up with
 `Upgrade _factory's claude: …` (and the `claude update` command) below `WorkerSandbox.MinClaudeVersion` (2.1.291, the release
 the triage confinement — `--setting-sources ""`, `blockReadsOutsideWorkingDirectories`, `dontAsk` — was checked against; an
-older CLI may silently ignore a setting it does not know). Every normal (re)run kills every `_factory`
+older CLI may silently ignore a setting it does not know). Setup also reports, without failing, whether `cargo` and `rustc`
+answer `_factory` through the helper (Rust target repos only: the new-tests check of a Rust pull request is an `error` without
+them, sc-25875). Every normal (re)run kills every `_factory`
 process (its toolchain check runs through the helper): close `_factory` sessions and stop `factory work` first.
 `--remove-worker-login` (opt-in) is a standalone mode: it runs none of the setup (no helper, no toolchain check, no
 installs) and only deletes `_factory`'s own Claude login (`~/.claude/.credentials.json`, keychain item
@@ -784,7 +788,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   sealed — the tier must match the policy and CODEOWNERS (root, `.github/`, `docs/`) and cover `.github/workflows/` and
   `factory/prompts/` with a pattern matching everything under them (`PathPattern.CoversEverythingUnder`: a directory
   pattern or trailing `**` naming the directory or an ancestor; naming files in it is invalid); security review — a path
-  whose tier lists `security-review` or that `RiskyPaths` matches (scripts, build/container files, dependency manifests,
+  whose tier lists `security-review` or that `RiskyPaths` matches (scripts, build/container files, dependency manifests, Rust's
+  `build.rs`, `rust-toolchain*` and `.cargo/config*`,
   keys/.env, security-sensitive names; case-insensitive) needs it, so the policy can add security-review paths but not
   remove the floor. The gate also reads the PR, the diff of the head against the base (`IGateGitHub.GetDiffAsync`;
   unreadable → blocked; a file count — one per `diff --git` header, a rename once — other than the PR's `changed_files` →
@@ -910,6 +915,53 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   gate uses it (E5); a recorded non-error result for the same base and head is reused, never re-run. Anything but `pass`
   blocks (`gate_rejected` for the typed outcome). Pause/Stop are watched while the runs execute (polled like a worker's
   watch): either cancels them (the runner stops the sandboxed commands) and records nothing, so Continue runs the check again.
+  Rust/cargo (sc-25875, `Gate/CargoNewTests.cs`, a second `INewTestStrategy` beside `XunitNewTests`; `NewTestsCheck.Strategies`
+  runs both, each for its own files, so a .NET change is judged exactly as before and a repo with both stacks by both). Found
+  by syntax, nothing compiled: `Gate/RustSource.cs` is a lexer-level reader (no Rust parser ships with .NET) that knows line and
+  nested block comments, string/byte/C strings, raw strings (`r#"…"#`), character literals as against lifetimes and raw
+  identifiers, and reads module bodies only — inline modules and braced item macros (`proptest! { … }`) are read, function,
+  `impl`, `trait` and `macro_rules!` bodies skipped; unbalanced source throws and the file is unisolable (never "no tests"). New
+  tests: functions with a test attribute (`#[test]` under any path — `#[tokio::test]`, `#[sqlx::test]` — `#[rstest]`,
+  `#[test_case(…)]`, `#[test_matrix]`, `#[quickcheck]`, `#[proptest]`) in the head versions of a cargo package's changed `.rs`
+  files (the nearest `Cargo.toml` with `[package]`; workspaces at any depth), in `tests/` or `src/`, whose id no base version of a
+  changed file has. Id = `package:target:path` as libtest names it: `words:lib:count::tests::blank`, `tool:bins:tests::runs`,
+  `words:test/api:deep::nested` (`tests/api.rs`, or `tests/api/main.rs` and its modules); a module file is the library's when
+  `src/lib.rs` declares its top module (or is all there is), else the binary's. A function with cases (`#[test_case]`, rstest
+  `#[case]`/`#[values]`) is one test `…::name::*` (every case under it; new cases on an existing one are unisolable, like a
+  theory's rows). Not new: a renamed file's test the old file had, and a test moved unchanged from where the PR removes it (ids are
+  path-based, so a pure move would otherwise look new). Overlay (the PR's test code applied to the base): everything changed
+  under a package's `tests/` and every file of a `#[cfg(test)]` module (`#![cfg(test)]`, or declared `#[cfg(test)] mod x;` at
+  any level above) comes whole from the head; a production file with inline tests is written — through owner-side git, as the
+  retry's files are (`NewTestSet.BaseReplacements`) — as its **base** version with the head's test code grafted in
+  (`CargoNewTests.Graft`): per module the two share, every `#[cfg(test)]` module and every test function replaced by the head's
+  or added (removed when the head has none), so helpers and `use`s in the test module come along and the production code stays the
+  base's; a file the base lacks (added or renamed) that holds new tests is written with its test code alone (an empty `fn main`
+  kept for a binary) and its `mod` declaration added to the base's parent module file, so a test of new code is compiled on the
+  base and fails there in its own declaration; a manifest's `dev-dependencies` tables are the head's (a new package's manifest is
+  applied whole, its new crate roots with their test code alone). Unisolable (`unsupported`): a changed `.rs` file the reader
+  cannot read; a new test outside `src/` and `tests/`, in no package, or in a module shared by integration tests
+  (`tests/common/mod.rs`); a custom target layout (`[[test]]`, `autotests`/`autobins`/`autolib`, a non-default `path`); a
+  `#[cfg(test)]` item that is not a module, or tests inside a macro, outside every `#[cfg(test)]` module, that the base lacks;
+  dotted `dev-dependencies` keys; a new file whose `mod` declaration is not at the top of its parent's file. Runs, from the
+  worktree root per package with a new test, all through `SandboxTestRunner` like xUnit's (as `_factory`, no variables):
+  `cargo --version` (`TestPhase.Toolchain`: failing, the run is `ToolchainMissing` → `error` naming cargo, never a pass — cargo is
+  needed only where a Rust check runs, so a .NET-only factory needs none; `setup-worker-user.sh` reports `cargo`/`rustc` as an
+  optional check; they must be on the launch helper's fixed PATH, `/opt/homebrew/bin` or `/usr/local/bin`: the helper did not
+  change), `cargo fetch` (the restore, the one step meant to use the network, as `dotnet restore` is; `cargo` reaches the lint
+  only through `TestStep.Program`, the same known local program), `cargo test --no-run --message-format=json` for the targets
+  with new tests (the build: cargo's JSON diagnostics, stable), then one `cargo test … --no-fail-fast -- --exact <path>` per new
+  test (`--lib`, `--bins` or `--test <name>`; a parameterized one by its `path::` prefix). cargo reports on standard output, so
+  such a step's output is kept by the runner in memory with its exit code (`TestStep.CaptureOutput`, `ResultFile.ExitCode`;
+  nothing the run writes is read as a result). Results: libtest's JSON is nightly-only, so the stable lines are parsed
+  (`test <name> ... ok|FAILED|ignored`, `test result: …`), and since a test can print such lines they are believed only when
+  they agree with what it cannot forge — a summary whose counts add up to the lines', no test with two results, exit code 0 with
+  no failure or non-zero with one; anything else (no summary: a crashed or custom harness; a mismatch) is an unreadable report,
+  `error`. `ignored` is skipped; a run of 0 tests gives no case (`not-run`: `error` on the base, not passing on the head). A base
+  that does not build: each `compiler-message` error (file placed from rustc's workspace-relative name and the package's
+  manifest path) is put in the innermost item at its position; only test code counts (a whole test file, or in a grafted file a
+  `#[cfg(test)]` item or test function): in a new test's own function → `not-built`; another item of the test code (a `use`, a
+  helper) is left out of the one retry; anywhere else — the base's production code, a file not applied (e.g. another module's
+  test the base cannot build), no file (manifest, dependency, linker, no rustc), or no error named — is unattributable, `error`.
   Upgrading from Phase 1: Review is now a handled state, so the first `factory work` picks up every item parked at Review:
   an open PR is reviewed by the panel like any other (Phase 1's missing `implementer-model` no longer matters, sc-25379),
   and one the owner merged or closed escalates once with a story comment ("merged outside the factory"). An item whose

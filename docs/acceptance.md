@@ -341,6 +341,29 @@ The in-process versions, which run in every `dotnet test`: `GatePipelineTests.A_
 `NewTestsTests.A_new_test_that_already_passes_on_the_base_is_rejected_with_the_test_named`,
 `FixLoopTests.A_fourth_round_escalates_with_the_open_findings_attached`.
 
+### P4-AT4 — the new-tests check on a Rust pull request (sc-25875)
+
+Automated: `GateNegativeTests.P4_AT4_a_rust_test_that_already_passes_on_the_base_is_gate_rejected_and_one_calling_new_code_does_not_build_there`
+(`FACTORY_E2E=1` and `FACTORY_E2E_P4_CARGO_STORY` = a To Do bug story like AT4's). Same harness, seeding and cleanup as the AT4
+negatives above: nothing merges and **the sandbox's main is never written**, so the sandbox needs no Rust of its own.
+
+**Prerequisite (once, the owner):** cargo and rustc for the worker user, on the launch helper's fixed PATH — `/opt/homebrew/bin`
+or `/usr/local/bin` (`brew install rust`; or rustup installed as `_factory`, with its `cargo` and `rustc` linked into
+`/usr/local/bin`: `~_factory/.cargo/bin` itself is not on that PATH). `sudo scripts/setup-worker-user.sh` reports both
+(`ok    cargo --version: …`, or `none  cargo --version … not available to _factory`); the helper itself did not change. The first
+run also needs the network for `cargo fetch` (the seeded package has no dependency, so nothing is downloaded).
+
+| Setup it does | Expected on the ledger |
+| --- | --- |
+| before the first review, commits to the PR branch `e2e-rust/Cargo.toml` (package `df-e2e-rust`) and `e2e-rust/src/lib.rs`: `pub fn double`, and an inline `#[cfg(test)] mod tests` with `doubles` (calls `double`) and `already_passes_on_the_base` (asserts `1 + 1 == 2`) | the last `new-tests` row is `rejected` (`gate_rejected`), strategy `rust-cargo`, `base_run` `build-failed`, `base_retry` `ran`, `head_run` `ran`; `df-e2e-rust:lib:tests::doubles` is `not-built` on the base (it calls code the pull request adds: the base gets the package with its test code alone) and `passed` on the head; `df-e2e-rust:lib:tests::already_passes_on_the_base` is `passed` on both and named in the reason; the last `gate` row is `Blocked …new-tests-fail-on-base (rejected)…`; MergeGate → Escalated; nothing merged |
+
+Without cargo for the worker user the `new-tests` row is `error` (`…(toolchain-missing): cargo is not available to the gate's test
+runs as _factory…`) and the test fails on its first assertion, quoting that reason. The same seed runs in every `dotnet test` where
+cargo is installed (`CargoRunnerTests.With_cargo_a_new_package_is_applied_to_the_base_with_its_test_code_alone`, unsandboxed), with
+`With_cargo_a_new_test_failing_on_the_base_passes_and_one_already_passing_there_is_named` (the `pass` outcome),
+`…a_new_inline_test_calling_code_the_pull_request_adds_does_not_build_on_the_base…`, `…in_a_workspace_below_the_repository_root…`
+and `…a_base_whose_other_tests_do_not_build_is_an_error_not_evidence`.
+
 ### AT5 — freeze and stuck
 
 Automated: `FreezeAndStuckTests`. The freeze tests write only the throwaway ledger; their story is never claimed (it stays To Do
