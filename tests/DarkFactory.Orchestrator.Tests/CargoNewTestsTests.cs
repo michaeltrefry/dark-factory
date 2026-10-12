@@ -116,6 +116,68 @@ public class RustSourceTests
         Assert.Equal(source.IndexOf("mod tests", StringComparison.Ordinal), file.Position(3, 1));
         Assert.Equal(-1, file.Position(99, 1));
         Assert.True(RustSource.Parse("#![cfg(test)]\nfn helper() {}").IsGated);
+        // extern crate is an import, like use.
+        Assert.Equal(["use", "use", "item"], RustSource.Parse("extern crate alloc;\n#[macro_use] extern crate log;\nextern \"C\" { fn f(); }").Items.Select(i => i.Kind));
+    }
+
+    [Theory]
+    [InlineData("cfg(test)", true)]
+    [InlineData("cfg(all(test, not(miri)))", true)]
+    [InlineData("cfg(all(test, not(target_arch = \"wasm32\")))", true)]
+    [InlineData("cfg(all(unix, any(test)))", true)]
+    [InlineData("cfg(any(test, all(test, unix)))", true)]
+    [InlineData("cfg(any(test, feature = \"x\"))", false)] // also compiled into a production build with the feature
+    [InlineData("cfg(not(test))", false)]
+    [InlineData("cfg(all(not(test), unix))", false)]
+    [InlineData("cfg(not(not(test)))", false)] // never looked through
+    [InlineData("cfg(any())", false)]
+    [InlineData("cfg(all())", false)]
+    [InlineData("cfg(feature = \"test\")", false)]
+    [InlineData("cfg(testing)", false)]
+    [InlineData("cfg_attr(test, ignore)", false)]
+    [InlineData("allow(test)", false)]
+    public void A_cfg_is_test_only_by_its_predicate_not_by_naming_test(string attribute, bool gated)
+    {
+        Assert.Equal(gated, RustSource.Parse($"#[{attribute}]\nmod m {{ fn f() {{}} }}").Items.Single().IsGated);
+        Assert.Equal(gated, RustSource.Parse($"#![{attribute}]\nfn f() {{}}").IsGated);
+    }
+
+    [Fact]
+    public void An_inline_modules_inner_cfg_test_gates_it()
+    {
+        var file = RustSource.Parse("mod tests {\n    #![cfg(test)]\n    use super::*;\n    #[test] fn adds() {}\n}\nmod plain { #![allow(dead_code)] fn f() {} }\n");
+
+        Assert.Equal([true, false], file.Items.Select(i => i.IsGated));
+        Assert.Equal(["cfg ( test )"], file.Items[0].InnerAttributes.Select(a => a.Text));
+        Assert.False(file.IsGated); // the module's attribute is not the file's
+        Assert.Equal(["tests::adds"], file.TestFns().Select(t => t.Path));
+    }
+
+    [Fact]
+    public void A_use_tree_is_flattened_into_its_single_imports()
+    {
+        const string item = "#[allow(unused)] pub(crate) use a::{b, c::{d as e, *}, f::{self}, g as _};";
+
+        var leaves = RustSource.UseLeaves(item);
+
+        Assert.Equal(
+        [
+            "#[allow(unused)] pub(crate) use a::b;", "#[allow(unused)] pub(crate) use a::c::d as e;", "#[allow(unused)] pub(crate) use a::c::*;",
+            "#[allow(unused)] pub(crate) use a::f::{self};", "#[allow(unused)] pub(crate) use a::g as _;",
+        ], leaves.Select(l => l.Statement));
+        Assert.Equal(["a::b", "a::c::d as e", "a::c::*", "a::f::{self}", "a::g as _"], leaves.Select(l => l.Key));
+        Assert.Equal(["b", "e", null, "f", null], leaves.Select(l => l.Name));
+        // An error is placed in the imports whose tokens it lies in: a shared prefix is in each of them.
+        Assert.Equal([1], Enumerable.Range(0, 5).Where(n => leaves[n].Holds(item.IndexOf("d as e", StringComparison.Ordinal))));
+        Assert.Equal([1, 2], Enumerable.Range(0, 5).Where(n => leaves[n].Holds(item.IndexOf("c::", StringComparison.Ordinal))));
+        Assert.Equal([0, 1, 2, 3, 4], Enumerable.Range(0, 5).Where(n => leaves[n].Holds(item.IndexOf("a::", StringComparison.Ordinal))));
+        Assert.DoesNotContain(leaves, l => l.Holds(item.IndexOf("use", StringComparison.Ordinal)));
+
+        Assert.Equal(["use std::fmt;"], RustSource.UseLeaves("use  std :: fmt ;").Select(l => l.Statement));
+        Assert.Equal(["use ::a::b;", "use ::a::c;"], RustSource.UseLeaves("use ::a::{b, c,};").Select(l => l.Statement));
+        // An extern crate is one import, as written.
+        var crate = Assert.Single(RustSource.UseLeaves("#[macro_use] extern crate log;"));
+        Assert.Equal(("#[macro_use] extern crate log;", (string?)null), (crate.Statement, crate.Name));
     }
 
     [Theory]
@@ -237,14 +299,14 @@ public class CargoIdentifyTests
             ("rust/crates/words/tests/suite/part.rs", "#[test] fn in_part() {}\n"),
             ("rust/crates/tool/src/main.rs", "mod run;\nfn main() {}\n#[cfg(test)] mod tests { #[test] fn of_main() {} }\n"),
             ("rust/crates/tool/src/run.rs", "pub fn r() {}\n#[cfg(test)] mod tests { #[test] fn runs() {} }\n"),
-            ("rust/crates/tool/src/bin/extra.rs", "fn main() {}\n#[test] fn of_extra() {}\n"));
+            ("rust/crates/tool/src/bin/extra.rs", "fn main() {}\n#[cfg(test)] mod tests { #[test] fn of_extra() {} }\n"));
 
         var set = await Identify(runner);
 
         Assert.Empty(set.Unisolable);
         Assert.Equal(
         [
-            "tool:bins:of_extra", "tool:bins:run::tests::runs", "tool:bins:tests::of_main", "words:lib:count::tests::counts", "words:lib:deep::tests::in_mod_rs",
+            "tool:bins:run::tests::runs", "tool:bins:tests::of_extra", "tool:bins:tests::of_main", "words:lib:count::tests::counts", "words:lib:deep::tests::in_mod_rs",
             "words:test/api:deep::nested", "words:test/api:top", "words:test/suite:in_main", "words:test/suite:part::in_part",
         ], set.Tests.Order(StringComparer.Ordinal));
         Assert.Equal("rust/crates/tool/Cargo.toml", set.Projects["tool:bins:tests::of_main"]);
@@ -309,6 +371,15 @@ public class CargoIdentifyTests
     [InlineData("tests/api.rs", "#[test] fn open() {", "tests/api.rs cannot be read as Rust source (an unclosed '{' at offset 18)")]
     [InlineData("src/lib.rs", "pub fn words() {}\n#[cfg(test)] use std::fmt;\n#[cfg(test)] mod tests { #[test] fn t() {} }", "src/lib.rs:2 adds or changes a #[cfg(test)] item that is not a module")]
     [InlineData("src/lib.rs", "pub fn words() {}\nproptest! { #[test] fn p(x in 0..1u8) {} }", "src/lib.rs:2 adds or changes tests inside proptest! outside every #[cfg(test)] module")]
+    // sc-25875 review: test code the gate cannot apply faithfully fails closed, it is never grafted function by function.
+    [InlineData("src/lib.rs", "use std::collections::HashMap;\npub fn words() {}\n#[test] fn maps_are_empty() { assert!(HashMap::<u8, u8>::new().is_empty()); }",
+        "src/lib.rs:3 adds or changes the test maps_are_empty outside every #[cfg(test)] module")]
+    [InlineData("src/lib.rs", "pub fn words() {}\n#[cfg(test)] #[test] fn gated_alone() {}", "src/lib.rs:2 adds or changes the test gated_alone outside every #[cfg(test)] module")]
+    [InlineData("src/lib.rs", "pub fn words() {}\nmod real { pub fn q() {} #[test] fn in_a_production_module() {} }", "src/lib.rs:2 adds or changes the test in_a_production_module outside every")]
+    [InlineData("src/lib.rs", "pub fn words() {}\n#[cfg(any(test, feature = \"x\"))] mod real2 { pub fn q() {} #[test] fn t() {} }", "src/lib.rs:2 adds or changes the test t outside every #[cfg(test)] module")]
+    [InlineData("src/lib.rs", "pub fn words() {}\npub struct W;\n#[cfg(test)] impl W { fn probe(&self) {} }\n#[cfg(test)] mod tests { #[test] fn t() {} }", "src/lib.rs:3 adds or changes a #[cfg(test)] item that is not a module")]
+    [InlineData("src/lib.rs", "pub fn words() {}\n#[cfg(all(test, unix))] mod tests { #[test] fn t() {} }\n#[cfg(all(test, windows))] mod tests { #[test] fn t() {} }",
+        "src/lib.rs:2 has more than one mod tests in one module at the base or the head (cfg alternates)")]
     public async Task Tests_the_gate_cannot_run_or_apply_to_the_base_fail_the_check_as_unsupported(string path, string content, string why)
     {
         var runner = With(Runner(("Cargo.toml", Manifest), ("src/lib.rs", "pub fn words() {}\n")), (path, content));
@@ -400,9 +471,11 @@ public class CargoIdentifyTests
         CargoNewTests.Graft(before, RustSource.Parse(head), declarations, problems ?? [], "src/lib.rs");
 
     [Fact]
-    public void The_graft_keeps_the_base_production_code_and_takes_the_heads_test_code()
+    public void The_graft_keeps_the_base_production_code_and_takes_the_heads_test_modules_and_imports()
     {
         const string before = """
+            use std::fmt;
+            use crate::a::X;
             pub fn words(s: &str) -> usize { s.split(' ').count() }
             #[test] fn bare() { assert_eq!(words("a"), 1); }
             #[cfg(test)]
@@ -418,11 +491,14 @@ public class CargoIdentifyTests
             }
             """;
         const string head = """
+            use std::{fmt, collections::HashMap};
+            use crate::b::X;
+            pub(crate) use crate::a::Y as Z;
             pub fn words(s: &str) -> usize { s.split_whitespace().count() }
             pub fn added() {}
-            #[test] fn bare() { assert_eq!(words("a b"), 2); }
-            #[test] fn bare_new() { added(); }
-            #[cfg(test)]
+            #[test]
+            fn bare() { assert_eq!(words("a"), 1); }
+            #[cfg(all(test, not(miri)))]
             mod tests {
                 use super::*;
                 fn helper() {}
@@ -430,23 +506,34 @@ public class CargoIdentifyTests
                 #[test] fn blank() {}
             }
             mod inner {
+                use super::words;
                 pub fn head_only() {}
                 #[cfg(test)] mod tests { #[test] fn inner_new() {} }
             }
             mod fresh {
+                #![allow(dead_code)]
+                use std::fmt::Debug;
                 pub fn production() {}
-                #[cfg(test)] mod tests { #[test] fn in_fresh() {} }
+                mod tests { #![cfg(test)] #[test] fn in_fresh() {} }
             }
+            mod plain { pub fn nothing_to_test() {} }
             #[cfg(test)]
             mod support;
             """;
+        var problems = new List<string>();
+        var added = new HashSet<string>();
 
-        var grafted = Graft(before, head);
+        var grafted = CargoNewTests.Graft(before, RustSource.Parse(head), [], problems, "src/lib.rs", addedUses: added);
 
+        // The base's production code and its own imports (X stays crate::a::X); the head's test modules whole (a module
+        // gated by cfg(all(test, not(miri))) or by an inner #![cfg(test)] is one); the head's imports the base lacks,
+        // one statement each; a module only the head has with its imports and test code, without its production code.
         Assert.Equal("""
+            use std::fmt;
+            use crate::a::X;
             pub fn words(s: &str) -> usize { s.split(' ').count() }
-            #[test] fn bare() { assert_eq!(words("a b"), 2); }
-            #[cfg(test)]
+            #[test] fn bare() { assert_eq!(words("a"), 1); }
+            #[cfg(all(test, not(miri)))]
             mod tests {
                 use super::*;
                 fn helper() {}
@@ -457,39 +544,115 @@ public class CargoIdentifyTests
             mod inner {
                 pub fn base_only() {}
                 #[cfg(test)] mod tests { #[test] fn inner_new() {} }
+
+            use super::words;
             }
-            #[test] fn bare_new() { added(); }
+            use std::collections::HashMap;
+
+            pub(crate) use crate::a::Y as Z;
 
             mod fresh {
-            #[cfg(test)] mod tests { #[test] fn in_fresh() {} }
+            #![allow ( dead_code )]
+            use std::fmt::Debug;
+            mod tests { #![cfg(test)] #[test] fn in_fresh() {} }
             }
 
             #[cfg(test)]
             mod support;
 
             """, grafted);
-        // The same test code already there: nothing to write.
+        Assert.Empty(problems);
+        Assert.Equal(new[] { "pub(crate) use crate::a::Y as Z;", "use std::collections::HashMap;", "use std::fmt::Debug;", "use super::words;" }.Select(RustSource.Normalize).Order(StringComparer.Ordinal),
+            added.Order(StringComparer.Ordinal));
+        // The same test code and imports already there: nothing to write.
         Assert.Equal(before, Graft(before, before.Replace("s.split(' ')", "s.split_whitespace()")));
     }
 
+    [Theory]
+    // A test outside every #[cfg(test)] module: new, changed, or made a test only now.
+    [InlineData("pub fn p() {}\n", "pub fn p() {}\n#[test] fn fresh() {}\n", "src/lib.rs:2 adds or changes the test fresh outside every #[cfg(test)] module")]
+    [InlineData("pub fn p() {}\n#[test] fn t() { p(); }\n", "pub fn p() {}\n#[test] fn t() { p(); p(); }\n", "src/lib.rs:2 adds or changes the test t outside every #[cfg(test)] module")]
+    [InlineData("pub fn p() {}\nfn t() {}\n", "pub fn p() {}\n#[test] fn t() {}\n", "src/lib.rs:2 adds or changes the test t outside every #[cfg(test)] module")]
+    // The base's module is test-only, the head's of that name is not: its tests are outside every test-only module now.
+    [InlineData("#[cfg(test)] mod tests { #[test] fn old() {} }\n", "mod tests { #[test] fn old() {} #[test] fn fresh() {} }\n", "src/lib.rs:1 adds or changes the test fresh outside every")]
+    // Two items of one kind and name (cfg alternates) cannot be matched to the base's: never two edits of one place.
+    [InlineData("pub fn p() {}\n#[cfg(unix)] #[test] fn t() {}\n#[cfg(windows)] #[test] fn t() {}\n", "pub fn p() {}\n#[cfg(unix)] #[test] fn t() { p(); }\n#[cfg(windows)] #[test] fn t() { p(); }\n",
+        "src/lib.rs:2 has more than one fn t in one module at the base or the head (cfg alternates)")]
+    [InlineData("pub fn p() {}\n#[cfg(all(test, unix))] mod tests { #[test] fn a() {} }\n#[cfg(all(test, windows))] mod tests { #[test] fn a() {} }\n",
+        "pub fn p() {}\n#[cfg(all(test, unix))] mod tests { #[test] fn a() {} #[test] fn b() {} }\n#[cfg(all(test, windows))] mod tests { #[test] fn a() {} #[test] fn b() {} }\n",
+        "src/lib.rs:2 has more than one mod tests in one module at the base or the head (cfg alternates)")]
+    [InlineData("pub fn p() {}\n#[cfg(test)] mod tests { #[test] fn a() {} }\n", "pub fn p() {}\n#[cfg(all(test, unix))] mod tests { #[test] fn b() {} }\n#[cfg(all(test, windows))] mod tests { #[test] fn b() {} }\n",
+        "src/lib.rs:2 has more than one mod tests in one module")]
+    [InlineData("#[cfg(unix)] mod imp { pub fn p() {} }\n#[cfg(windows)] mod imp { pub fn p() {} }\n",
+        "#[cfg(unix)] mod imp { pub fn p() {} #[cfg(test)] mod tests { #[test] fn a() {} } }\n#[cfg(windows)] mod imp { pub fn p() {} }\n", "src/lib.rs:1 has more than one mod imp in one module")]
+    public void Test_code_the_graft_cannot_apply_faithfully_is_a_problem_and_the_base_file_is_left_as_it_is(string before, string head, string why)
+    {
+        var problems = new List<string>();
+
+        var grafted = Graft(before, head, problems);
+
+        Assert.Contains(why, Assert.Single(problems));
+        // Nothing half-applied: the production code is never rewritten (the check is unsupported anyway).
+        Assert.Equal(before, grafted);
+    }
+
     [Fact]
-    public void A_file_the_base_lacks_is_written_with_its_test_code_alone_and_the_declarations_it_needs()
+    public void Two_edits_of_one_place_are_refused_never_applied()
+    {
+        const string text = "0123456789";
+
+        Assert.Equal("0ab3456X789Y", CargoNewTests.ApplyEdits(text, [(1, 3, "ab"), (7, 7, "X"), (10, 10, "Y")]));
+        Assert.Equal("01[]3456789", CargoNewTests.ApplyEdits(text, [(2, 3, "]"), (2, 2, "[")])); // an insertion at the start of a replaced range is beside it
+        // What two items matched to one item of the base would give: both replace its range.
+        Assert.Contains("fall on one place", Assert.Throws<FormatException>(() => CargoNewTests.ApplyEdits(text, [(2, 5, "a"), (2, 5, "b")])).Message);
+        Assert.Throws<FormatException>(() => CargoNewTests.ApplyEdits(text, [(2, 5, "a"), (4, 8, "b")]));
+        Assert.Throws<FormatException>(() => CargoNewTests.ApplyEdits(text, [(2, 5, "a"), (3, 3, "b")]));
+        Assert.Throws<FormatException>(() => CargoNewTests.ApplyEdits(text, [(3, 3, "a"), (3, 3, "b")]));
+    }
+
+    [Fact]
+    public void Production_alternates_without_test_code_are_left_alone()
+    {
+        const string alternates = "#[cfg(unix)] mod imp { pub fn p() {} }\n#[cfg(windows)] mod imp { pub fn p() {} }\n";
+        var problems = new List<string>();
+
+        var grafted = Graft(alternates, alternates.Replace("pub fn p() {} }\n#[cfg(windows)]", "pub fn p() { } }\n#[cfg(windows)]") + "#[cfg(test)] mod tests { #[test] fn a() {} }\n", problems);
+
+        Assert.Empty(problems);
+        Assert.Equal(alternates + "\n#[cfg(test)] mod tests { #[test] fn a() {} }\n", grafted);
+    }
+
+    [Fact]
+    public void A_file_the_base_lacks_is_written_with_its_imports_and_test_code_alone_and_the_declarations_it_needs()
     {
         const string head = """
+            #![allow(unused)]
             use std::fmt;
+            use crate::{add, later::{self, Thing}};
+            extern crate alloc;
             pub fn production() -> u32 { 1 }
             #[cfg(test)] use std::collections::HashMap;
             fn main() { production(); }
-            mod inner { pub fn p() {} #[cfg(test)] mod tests { #[test] fn t() {} } }
+            mod inner { use super::fmt; pub fn p() {} #[cfg(test)] mod tests { #[test] fn t() {} } }
+            mod untested { use super::fmt; pub fn p() {} }
             #[cfg(test)]
             mod tests { use super::*; #[test] fn uses_production() { assert_eq!(production(), 1); } }
             """;
+        var added = new HashSet<string>();
 
-        var only = CargoNewTests.Graft(null, RustSource.Parse(head), [("child", "pub mod child;")], [], "src/main.rs", emptyMain: true);
+        var only = CargoNewTests.Graft(null, RustSource.Parse(head), [("child", "pub mod child;")], [], "src/main.rs", emptyMain: true, added);
 
+        // Every import, one statement each (a test reaches them through `use super::*`), and no production item.
         Assert.Equal("""
+            #![allow ( unused )]
+            use std::fmt;
+            use crate::add;
+            use crate::later::{self};
+            use crate::later::Thing;
+            extern crate alloc;
             #[cfg(test)] use std::collections::HashMap;
             mod inner {
+            use super::fmt;
             #[cfg(test)] mod tests { #[test] fn t() {} }
             }
             #[cfg(test)]
@@ -498,6 +661,14 @@ public class CargoIdentifyTests
             fn main() {}
 
             """, only);
+        Assert.Equal(6, added.Count);
+
+        // A test outside every #[cfg(test)] module of a new file cannot be told from the production code it is left without.
+        var problems = new List<string>();
+        CargoNewTests.Graft(null, RustSource.Parse("pub fn p() {}\n#[test] fn bare() { p(); }\nproptest! { #[test] fn q(x in 0..1u8) {} }\n"), [], problems, "src/new.rs");
+        Assert.Equal(2, problems.Count);
+        Assert.Contains("src/new.rs:2 adds or changes the test bare outside every #[cfg(test)] module", problems[0]);
+        Assert.Contains("src/new.rs:3 adds or changes tests inside proptest! outside every #[cfg(test)] module", problems[1]);
     }
 
     [Fact]
@@ -518,11 +689,35 @@ public class CargoIdentifyTests
         Assert.Equal(["words:lib:text::trim::tests::trims"], set.Tests);
         // The test module without the function it tests, reachable from the base's library: src/lib.rs → text → trim.
         Assert.Equal("#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn trims() { assert_eq!(trim(\" a \"), \"a\"); }\n}\n", set.BaseReplacements["src/text/trim.rs"]);
+        Assert.Empty(set.AddedUses);
         Assert.Equal("pub mod trim;\n", set.BaseReplacements["src/text/mod.rs"]);
         Assert.Equal(Lib + "\npub mod text;\n", set.BaseReplacements["src/lib.rs"]);
         Assert.Equal(["src/lib.rs", "src/text/mod.rs", "src/text/trim.rs"], set.TestFiles.Select(f => f.NewPath).Order(StringComparer.Ordinal));
         // Nothing of the base is deleted for it.
         Assert.All(set.TestFiles, f => Assert.True(f.OldPath is null || f.OldPath == f.NewPath));
+    }
+
+    [Fact]
+    public async Task A_renamed_production_file_with_new_tests_is_unsupported_and_a_renamed_test_file_is_applied()
+    {
+        const string count = "pub fn count(s: &str) -> usize { s.len() }\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test] fn counts() { assert_eq!(count(\"a\"), 1); }\n}\n";
+        var renamed = With(Runner(("Cargo.toml", Manifest), ("src/lib.rs", "pub mod count;\n"), ("src/count.rs", count)),
+            ("src/lib.rs", "pub mod counting;\n"), ("src/count.rs", null),
+            ("src/counting.rs", count.Replace("}\n}\n", "}\n    #[test] fn old_behaviour() { assert_eq!(count(\"ab\"), 2); }\n}\n")));
+        renamed.Changes = [new ChangedFile('M', "src/lib.rs", "src/lib.rs"), new ChangedFile('R', "src/count.rs", "src/counting.rs")];
+
+        var result = await Check(renamed);
+
+        // Written with its test code alone, old_behaviour would not compile and count as failing on a base where it passes.
+        Assert.Equal(NewTestsOutcome.Unsupported, result.Outcome);
+        Assert.Contains("src/counting.rs holds new tests and is src/count.rs renamed", result.Reason);
+        Assert.Empty(renamed.Runs);
+
+        var tests = With(Runner(("Cargo.toml", Manifest), ("src/lib.rs", "pub fn words() {}\n"), ("tests/old.rs", "#[test] fn kept() {}\n")),
+            ("tests/old.rs", null), ("tests/new.rs", "#[test] fn kept() {}\n#[test] fn fresh() {}\n"));
+        tests.Changes = [new ChangedFile('R', "tests/old.rs", "tests/new.rs")];
+        Assert.Equal(["words:test/new:fresh"], (await Identify(tests)).Tests);
+        Assert.Empty((await Identify(tests)).Unisolable);
     }
 
     [Fact]
@@ -581,17 +776,20 @@ public class CargoRunOutputTests
             "Toolchain: --version",
             "Restore: fetch --manifest-path ./rust/crates/tool/Cargo.toml",
             "Restore: fetch --manifest-path ./rust/crates/words/Cargo.toml",
-            "Build: test --manifest-path ./rust/crates/tool/Cargo.toml -p tool --no-run --message-format=json --bins",
-            "Build: test --manifest-path ./rust/crates/words/Cargo.toml -p words --no-run --message-format=json --lib --test api",
-            "Test: test --manifest-path ./rust/crates/tool/Cargo.toml -p tool --bins --color never --no-fail-fast -- --color never --exact tests::runs",
-            "Test: test --manifest-path ./rust/crates/words/Cargo.toml -p words --lib --color never --no-fail-fast -- --color never --exact count::tests::blank",
-            "Test: test --manifest-path ./rust/crates/words/Cargo.toml -p words --test api --color never --no-fail-fast -- --color never --exact deep::nested",
-            "Test: test --manifest-path ./rust/crates/words/Cargo.toml -p words --lib --color never --no-fail-fast -- --color never tests::sizes::",
+            "Build: test --manifest-path ./rust/crates/tool/Cargo.toml -p tool --offline --no-run --message-format=json --bins",
+            "Build: test --manifest-path ./rust/crates/words/Cargo.toml -p words --offline --no-run --message-format=json --lib --test api",
+            "Test: test --manifest-path ./rust/crates/tool/Cargo.toml -p tool --offline --bins --color never --no-fail-fast -- --color never --exact tests::runs",
+            "Test: test --manifest-path ./rust/crates/words/Cargo.toml -p words --offline --lib --color never --no-fail-fast -- --color never --exact count::tests::blank",
+            "Test: test --manifest-path ./rust/crates/words/Cargo.toml -p words --offline --test api --color never --no-fail-fast -- --color never --exact deep::nested",
+            "Test: test --manifest-path ./rust/crates/words/Cargo.toml -p words --offline --lib --color never --no-fail-fast -- --color never tests::sizes::",
         ], steps.Select(s => $"{s.Phase}: {string.Join(' ', s.Args)}"));
         // Every result comes from standard output, kept under the test's id; no file is read.
         Assert.Equal(["cargo-build-0", "cargo-build-1", "tool:bins:tests::runs", "words:lib:count::tests::blank", "words:test/api:deep::nested", "words:lib:tests::sizes::*"],
             steps.Select(s => s.CaptureOutput).OfType<string>());
         Assert.All(steps, s => Assert.Null(s.ResultFilePattern));
+        // Only the fetch may use the network: every build and test step is offline.
+        Assert.All(steps.Where(s => s.Phase is TestPhase.Build or TestPhase.Test), s => Assert.Contains("--offline", s.Args));
+        Assert.All(steps.Where(s => s.Phase is TestPhase.Toolchain or TestPhase.Restore), s => Assert.DoesNotContain("--offline", s.Args));
     }
 
     private static string Output(string lines, string summary) => $"\nrunning 1 test\n{lines}\n\n{summary}\n\n";
@@ -672,7 +870,11 @@ public class CargoRunOutputTests
     [Theory]
     // A passing test that prints a failure line (and even a summary) of its own: cargo's exit code says nothing failed.
     [InlineData("test tests::two ... FAILED\ntest tests::two ... ok", Ok, 0, "its test lines do not add up to its summaries")]
-    [InlineData("test tests::two ... FAILED\n" + Failed + "\ntest tests::two ... ok", Ok, 0, "it reports one test with two different results")]
+    [InlineData("test tests::two ... FAILED\n" + Failed + "\nrunning 1 test\ntest tests::two ... ok", Ok, 0, "it reports one test with two different results")]
+    // Lines that are not in libtest's blocks: a result after its summary, a second `running` line, a count that is not the lines'.
+    [InlineData("test tests::two ... FAILED\n" + Failed + "\ntest tests::two ... ok", Ok, 0, "it is not libtest's report")]
+    [InlineData("running 1 test\ntest tests::two ... ok", Ok, 0, "it is not libtest's report")]
+    [InlineData("test tests::two ... ok\ntest tests::two ... ok", "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.01s", 0, "it is not libtest's report")]
     [InlineData("test tests::two ... FAILED", Failed, 0, "it reports a failed test but cargo exited with code 0")]
     // cargo failed, but no test is reported failed (it did not build, or the harness died).
     [InlineData("test tests::two ... ok", Ok, 101, "cargo exited with code 101 but no test is reported as failed")]
@@ -691,6 +893,20 @@ public class CargoRunOutputTests
         var good = new TestRunReport(TestRunStatus.Ran, Parse("words:lib:tests::two", Panicked.Replace("tests::blank", "tests::two"), 101).Cases, "log");
         Assert.Equal(NewTestsOutcome.Error, NewTestsCheck.Judge("base0", "head1", "rust-cargo", ["words:lib:tests::two"], unreadable, good).Outcome);
         Assert.Equal(NewTestsOutcome.Error, NewTestsCheck.Judge("base0", "head1", "rust-cargo", ["words:lib:tests::two"], good, unreadable).Outcome);
+    }
+
+    [Fact]
+    public void Test_lines_and_a_summary_without_libtests_running_line_are_unreadable_and_a_whole_forged_report_is_the_accepted_residual()
+    {
+        const string lines = "test tests::two ... FAILED\n\n" + Failed + "\n";
+
+        // What a test that prints a failure and exits 101 by itself leaves when it forgets libtest's first line.
+        Assert.Contains("it is not libtest's report", Assert.Single(Parse("words:lib:tests::two", lines, 101).Unreadable));
+        Assert.Contains("it is not libtest's report", Assert.Single(Parse("words:lib:tests::two", "running 2 tests\n" + lines, 101).Unreadable));
+        Assert.Contains("it is not libtest's report", Assert.Single(Parse("words:lib:tests::two", "running 1 test\n" + lines + "running 1 test\n", 101).Unreadable));
+        // Accepted residual (the doc comment says so): the test process writes all of the output and picks its exit code,
+        // so a complete forged report cannot be told from libtest's.
+        Assert.Equal("failed", Parse("words:lib:tests::two", "running 1 test\n" + lines, 101).Cases["words:lib:tests::two"].Single().Outcome);
     }
 
     [Fact]
@@ -864,6 +1080,201 @@ public class CargoRunOutputTests
     }
 }
 
+/// <summary>
+/// sc-25875 review: a test counts as not building on the base only for what the base lacks, never for what the overlay or
+/// the retry left out — imports are kept and left out one by one, and the retries go on while each uncovers a new stage.
+/// </summary>
+public class CargoBuildExplanationTests
+{
+    private static readonly RepoRef Repo = new("acme", "words");
+    private const string Manifest = "[package]\nname = \"words\"\nversion = \"0.1.0\"\n";
+    private const string BaseLib = "use std::fmt;\npub fn words(s: &str) -> usize { s.split(' ').count() }\n";
+
+    private const string HeadLib = """
+        use std::fmt;
+        use crate::later::Thing;
+        pub fn words(s: &str) -> usize { s.split_whitespace().count() }
+        pub fn trim(s: &str) -> &str { s.trim() }
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            fn helper() -> &'static str { trim(" a ") }
+            #[test] fn trims() { assert_eq!(trim(" a "), "a"); }
+            #[test] fn helped() { assert_eq!(helper(), "a"); }
+            #[test] fn blank() { assert_eq!(words("  "), 0); }
+        }
+
+        """;
+
+    private static FakeTestRunner Words() =>
+        CargoIdentifyTests.With(CargoIdentifyTests.Runner(("Cargo.toml", Manifest), ("src/lib.rs", BaseLib)), ("src/lib.rs", HeadLib), ("src/later.rs", "pub struct Thing;\n"));
+
+    private static Task<NewTestsResult> Check(FakeTestRunner runner) =>
+        NewTestsCheck.RunAsync(runner, NewTestsCheck.Strategies, Repo, FakeTestRunner.BaseSha, "head1", "gate-sc-1", null, CancellationToken.None);
+
+    /// <summary>An error at <paramref name="text"/> in the file as the run was given it (column 12: inside the item).</summary>
+    private static BuildError At(TestRunSpec spec, string text, string code = "E0425", string path = "src/lib.rs", int column = 12)
+    {
+        var file = spec.Replacements[path];
+        var at = file.IndexOf(text, StringComparison.Ordinal);
+        Assert.True(at >= 0, $"'{text}' is not in {path} of {spec.Name}:\n{file}");
+        return new BuildError(path, file[..at].Count(c => c == '\n') + 1, column, code, "does not compile");
+    }
+
+    private static TestRunReport Passing(TestRunSpec spec) => CargoIdentifyTests.Report(spec, TestCaseResult.Passed);
+
+    private static TestRunReport Failing(TestRunSpec spec) => CargoIdentifyTests.Report(spec, TestCaseResult.Failed);
+
+    private static string Stage(TestRunSpec spec) => spec.Name["gate-sc-1-".Length..];
+
+    [Fact]
+    public async Task An_import_the_overlay_added_that_does_not_resolve_is_left_out_of_the_retry_and_an_error_in_the_bases_own_import_is_no_evidence()
+    {
+        var runner = Words();
+        runner.Answer = spec => Stage(spec) switch { "head" => Passing(spec), "base" => FakeTestRunner.NotBuilt(At(spec, "use crate::later::Thing;", "E0432")), _ => Passing(spec) };
+
+        var set = Assert.IsType<CargoNewTestSet>(await new CargoNewTests().IdentifyAsync(new TestSource(runner, Repo, FakeTestRunner.BaseSha, "head1"),
+            await runner.ChangesAsync(Repo, FakeTestRunner.BaseSha, "head1", CancellationToken.None), CancellationToken.None));
+        var result = await Check(runner);
+
+        // The head's import is in the base's file (a test reaches it through `use super::*`); the base has no such module,
+        // so the retry runs without it — and the tests, which never needed it, get their real results: they pass there.
+        Assert.Equal([RustSource.Normalize("use crate::later::Thing;")], set.AddedUses["src/lib.rs"]);
+        Assert.StartsWith(BaseLib + "\nuse crate::later::Thing;\n", set.BaseReplacements["src/lib.rs"]);
+        Assert.Equal(NewTestsOutcome.Rejected, result.Outcome);
+        Assert.Equal(["src/lib.rs:4 use crate::later::Thing;"], result.BaseRemoved);
+        var retry = runner.Runs.Single(r => Stage(r) == "base-retry");
+        Assert.DoesNotContain("later", retry.Replacements["src/lib.rs"]);
+        Assert.StartsWith(BaseLib, retry.Replacements["src/lib.rs"]);
+        Assert.All(result.Tests, t => Assert.Equal("passed", t.Base));
+
+        // The base's own import is its production code: an error there says nothing about the tests.
+        runner.Runs.Clear();
+        runner.Answer = spec => Stage(spec) == "head" ? Passing(spec) : FakeTestRunner.NotBuilt(At(spec, "use std::fmt;", "E0432"));
+        var own = await Check(runner);
+        Assert.Equal(NewTestsOutcome.Error, own.Outcome);
+        Assert.Contains("for a reason that says nothing about the new tests", own.Reason);
+        Assert.DoesNotContain(runner.Runs, r => Stage(r).StartsWith("base-retry", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Of_a_use_only_the_import_that_does_not_resolve_is_left_out_so_a_test_of_old_code_still_compiles_and_is_named()
+    {
+        const string api = "use words::{words, trim};\n#[test] fn one_word() { assert_eq!(words(\"a\"), 1); }\n";
+        var runner = CargoIdentifyTests.With(CargoIdentifyTests.Runner(("Cargo.toml", Manifest), ("src/lib.rs", BaseLib)), ("tests/api.rs", api));
+        // E0432 at `trim` (column 20), the name the base's library lacks.
+        runner.Answer = spec => Stage(spec) == "base" ? FakeTestRunner.NotBuilt(new BuildError("tests/api.rs", 1, 20, "E0432", "unresolved import `words::trim`")) : Passing(spec);
+
+        var result = await Check(runner);
+
+        var retry = runner.Runs.Single(r => Stage(r) == "base-retry");
+        Assert.Equal("use words::words;\n#[test] fn one_word() { assert_eq!(words(\"a\"), 1); }\n", retry.Replacements["tests/api.rs"]);
+        Assert.Equal(["tests/api.rs:1 use words::trim;"], result.BaseRemoved);
+        Assert.Equal(NewTestsOutcome.Rejected, result.Outcome);
+        Assert.EndsWith("so they check nothing: words:test/api:one_word", result.Reason);
+        Assert.Equal("passed", result.Tests.Single().Base);
+
+        // An error in the path both imports share leaves both out.
+        runner.Runs.Clear();
+        runner.Answer = spec => Stage(spec) == "base" ? FakeTestRunner.NotBuilt(new BuildError("tests/api.rs", 1, 5, "E0432", "unresolved import `words`")) : Passing(spec);
+        var both = await Check(runner);
+        Assert.StartsWith("\n#[test] fn one_word()", runner.Runs.Single(r => Stage(r) == "base-retry").Replacements["tests/api.rs"]);
+        Assert.Equal(["tests/api.rs:1 use words::{words, trim};"], both.BaseRemoved);
+    }
+
+    [Fact]
+    public async Task The_base_is_retried_while_each_retry_uncovers_a_later_stage_and_the_remaining_tests_get_their_real_results()
+    {
+        var runner = Words();
+        // rustc in stages: the import first, then the test that used its name, then a type error; blank builds throughout.
+        runner.Answer = spec => Stage(spec) switch
+        {
+            "head" => Passing(spec),
+            "base" => FakeTestRunner.NotBuilt(At(spec, "use crate::later::Thing;", "E0432")),
+            "base-retry" => FakeTestRunner.NotBuilt(At(spec, "#[test] fn trims")),
+            "base-retry-2" => FakeTestRunner.NotBuilt(At(spec, "#[test] fn helped", "E0308")),
+            _ => Failing(spec),
+        };
+
+        var result = await Check(runner);
+
+        Assert.True(result.Outcome == NewTestsOutcome.Pass, result.Reason);
+        Assert.Equal(["base", "head", "base-retry", "base-retry-2", "base-retry-3"], runner.Runs.Select(Stage));
+        Assert.Equal([("words:lib:tests::trims", "not-built"), ("words:lib:tests::helped", "not-built"), ("words:lib:tests::blank", "failed")], result.Tests.Select(t => (t.Test, t.Base)));
+        Assert.Equal(("build-failed", "ran"), (result.BaseRun, result.BaseRetry));
+        Assert.Equal(["src/lib.rs:4 use crate::later::Thing;", "src/lib.rs:10 fn trims", "src/lib.rs:11 fn helped"], result.BaseRemoved);
+        var last = runner.Runs[^1];
+        Assert.Equal(["words:lib:tests::blank"], last.Steps.Where(s => s.Phase == TestPhase.Test).Select(s => s.CaptureOutput));
+        Assert.DoesNotContain("fn trims", last.Replacements["src/lib.rs"]);
+        Assert.DoesNotContain("fn helped", last.Replacements["src/lib.rs"]);
+        Assert.Contains("#[test] fn blank()", last.Replacements["src/lib.rs"]);
+        Assert.Contains("s.split(' ').count()", last.Replacements["src/lib.rs"]); // still the base's production code
+    }
+
+    [Fact]
+    public async Task After_three_retries_a_base_that_still_does_not_build_leaves_the_remaining_tests_unproven_never_passed()
+    {
+        var runner = Words();
+        runner.Answer = spec => Stage(spec) switch
+        {
+            "head" => Passing(spec),
+            "base" => FakeTestRunner.NotBuilt(At(spec, "use crate::later::Thing;", "E0432")),
+            "base-retry" => FakeTestRunner.NotBuilt(At(spec, "#[test] fn trims")),
+            "base-retry-2" => FakeTestRunner.NotBuilt(At(spec, "fn helper()")),
+            _ => FakeTestRunner.NotBuilt(At(spec, "#[test] fn helped")),
+        };
+
+        var result = await Check(runner);
+
+        Assert.Equal(["base", "head", "base-retry", "base-retry-2", "base-retry-3"], runner.Runs.Select(Stage));
+        Assert.Equal(NewTestsOutcome.Rejected, result.Outcome);
+        Assert.Contains("could not be shown to fail on the base", result.Reason);
+        Assert.EndsWith(": words:lib:tests::blank", result.Reason);
+        Assert.Equal([("words:lib:tests::trims", "not-built"), ("words:lib:tests::helped", "not-built"), ("words:lib:tests::blank", "unproven")], result.Tests.Select(t => (t.Test, t.Base)));
+    }
+
+    [Theory]
+    // In the module's own header: nothing a test lacks on the base shows there (two modules of one name would).
+    [InlineData("mod tests {", 5, "E0428", NewTestsOutcome.Rejected, "could not be shown to fail on the base")]
+    // An ambiguous name: two imports give it, which is never something the base lacks.
+    [InlineData("#[test] fn trims", 30, "E0659", NewTestsOutcome.Error, "for a reason that says nothing about the new tests")]
+    public async Task An_error_that_cannot_come_from_what_the_base_lacks_never_makes_a_test_not_built(string at, int column, string code, string outcome, string why)
+    {
+        var runner = Words();
+        runner.Answer = spec => Stage(spec) == "head" ? Passing(spec) : FakeTestRunner.NotBuilt(At(spec, at, code, column: column));
+
+        var result = await Check(runner);
+
+        Assert.Equal(outcome, result.Outcome);
+        Assert.Contains(why, result.Reason);
+        Assert.All(result.Tests, t => Assert.NotEqual("not-built", t.Base));
+        Assert.DoesNotContain(runner.Runs, r => Stage(r).StartsWith("base-retry", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task An_error_in_the_bases_own_test_outside_a_test_module_is_no_evidence_about_the_new_tests()
+    {
+        const string bare = "#[test] fn bare() { assert_eq!(words(\"a\"), 1); }\n";
+        var runner = CargoIdentifyTests.With(CargoIdentifyTests.Runner(("Cargo.toml", Manifest), ("src/lib.rs", BaseLib + bare)),
+            ("src/lib.rs", BaseLib + bare + "#[cfg(test)]\nmod tests {\n    #[test] fn fresh() { assert_eq!(super::words(\"  \"), 0); }\n}\n"));
+        runner.Answer = spec => Stage(spec) == "head" ? Passing(spec) : FakeTestRunner.NotBuilt(At(spec, "#[test] fn bare"));
+
+        var result = await Check(runner);
+
+        // Not test code the overlay applied (it is the base's, unchanged): its error is the base's own.
+        Assert.Equal(NewTestsOutcome.Error, result.Outcome);
+        Assert.Contains("for a reason that says nothing about the new tests", result.Reason);
+        Assert.DoesNotContain(runner.Runs, r => Stage(r).StartsWith("base-retry", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void The_xunit_strategy_still_retries_the_base_once()
+    {
+        Assert.Equal(1, ((INewTestStrategy)new XunitNewTests()).BaseRetries);
+        Assert.Equal(3, new CargoNewTests().BaseRetries);
+    }
+}
+
 /// <summary>sc-25875: the runner's part — output kept in memory with its exit code, and a missing toolchain.</summary>
 public class CargoRunnerTests : IDisposable
 {
@@ -916,7 +1327,7 @@ public class CargoRunnerTests : IDisposable
     {
         var (runner, sha) = await ShRunner();
         const string ok = "printf 'running 1 test\\ntest tests::two ... ok\\n\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n'";
-        const string failed = "printf 'test tests::blank ... FAILED\\n\\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\\n'; echo 'test tests::blank ... ok' >&2; exit 101";
+        const string failed = "printf 'running 1 test\\ntest tests::blank ... FAILED\\n\\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\\n'; echo 'test tests::blank ... ok' >&2; exit 101";
 
         var report = await runner.RunAsync(Repo, Spec(sha, Sh(TestPhase.Toolchain, "exit 0"), Sh(TestPhase.Test, ok, "words:lib:tests::two"), Sh(TestPhase.Test, failed, "words:lib:tests::blank"),
             Sh(TestPhase.Test, ok + "; exit 3", "words:lib:tests::odd")), CancellationToken.None);
@@ -1107,5 +1518,169 @@ public class CargoRunnerTests : IDisposable
         Assert.True(result.Outcome == NewTestsOutcome.Error, $"{result.Outcome}: {result.Reason}");
         Assert.Contains("for a reason that says nothing about the new tests", result.Reason);
         Assert.Contains("src/other.rs(4,", result.Reason);
+    }
+
+    // ---- sc-25875 review: tests that pass on the real base must never count as failing there ------------------------------
+
+    private string Commit(string message, params (string Path, string Content)[] files)
+    {
+        foreach (var (path, content) in files)
+        {
+            Write(path, content);
+        }
+        return CommitAndPush(message, message == "base" ? "main" : "factory/sc-5");
+    }
+
+    private string Adds(params (string Path, string Content)[] moreFiles)
+    {
+        var sha = Commit("base", [("Cargo.toml", Manifest), ("src/lib.rs", AddLib), .. moreFiles]);
+        TestGit.Run(_seed, "checkout", "-q", "-b", "factory/sc-5");
+        return sha;
+    }
+
+    private const string AddLib = "pub fn add(a: i32, b: i32) -> i32 { a + b }\n";
+
+    private static string TestModule(string gate, string body) => $"{gate}\nmod tests {{\n    use super::*;\n{body}}}\n";
+
+    private static string TestFn(string name, string body) => $"    #[test]\n    fn {name}() {{ {body} }}\n";
+
+    [Fact]
+    public async Task With_cargo_a_new_module_file_keeps_its_imports_so_tests_of_old_code_in_it_pass_on_the_base_and_are_named()
+    {
+        Assert.SkipUnless(HasCargo.Value, "cargo is not installed");
+        var baseSha = Adds();
+        const string upper = "pub fn upper(s: &str) -> String { s.to_uppercase() }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn shouts() { assert_eq!(super::upper(\"a\"), \"A\"); }\n}\n";
+        const string extra = "use crate::add;\nuse std::collections::HashMap;\npub fn triple(x: i32) -> i32 { add(x, add(x, x)) }\npub fn none() -> HashMap<u8, u8> { HashMap::new() }\n";
+        var vacuous = Commit("a new module", ("src/lib.rs", "pub mod extra;\npub mod upper;\n" + AddLib), ("src/upper.rs", upper),
+            ("src/extra.rs", extra + TestModule("#[cfg(test)]", TestFn("old_add_still_adds", "assert_eq!(add(1, 2), 3);") + TestFn("maps_are_empty", "assert!(HashMap::<u8, u8>::new().is_empty());"))));
+
+        var rejected = await Check(baseSha, vacuous);
+
+        // Both tests reach only what the base has, through the file's own imports: they compile there and pass.
+        Assert.True(rejected.Outcome == NewTestsOutcome.Rejected, $"{rejected.Outcome}: {rejected.Reason}");
+        Assert.EndsWith("so they check nothing: words:lib:extra::tests::old_add_still_adds, words:lib:extra::tests::maps_are_empty", rejected.Reason);
+        Assert.Equal([("words:lib:extra::tests::maps_are_empty", "passed"), ("words:lib:extra::tests::old_add_still_adds", "passed"), ("words:lib:upper::tests::shouts", "not-built")],
+            rejected.Tests.Select(t => (t.Test, t.Base)).Order());
+
+        // A test of the new module's own function still cannot compile on the base, and that is what makes it pass.
+        var real = Commit("only tests of new code", ("src/extra.rs", extra + TestModule("#[cfg(test)]", TestFn("triples", "assert_eq!(triple(2), 6);"))));
+        var pass = await Check(baseSha, real);
+        Assert.True(pass.Outcome == NewTestsOutcome.Pass, $"{pass.Outcome}: {pass.Reason}");
+        Assert.Equal([("words:lib:extra::tests::triples", "not-built", "passed"), ("words:lib:upper::tests::shouts", "not-built", "passed")], pass.Tests.Select(t => (t.Test, t.Base, t.Head)).Order());
+    }
+
+    /// <summary>
+    /// Every shape in which the gate once counted a test of old code as not building on the base (the overlay left out its
+    /// module's imports or helpers), and the further probes of that family: each test here passes on the real base, so each
+    /// must get its real result there — passed — and be named.
+    /// </summary>
+    [Fact]
+    public async Task With_cargo_tests_that_exercise_only_code_the_base_has_pass_there_in_every_module_shape()
+    {
+        Assert.SkipUnless(HasCargo.Value, "cargo is not installed");
+        const string mods = "pub mod a;\npub mod b;\npub mod c;\npub mod d;\npub mod e;\npub mod f;\npub mod g;\npub mod h;\npub mod i;\npub mod j;\n";
+        const string a = "use crate::add;\npub fn inc(x: i32) -> i32 { add(x, 1) }\n";
+        const string b = "use crate::add;\npub fn dec(x: i32) -> i32 { add(x, -1) }\n";
+        const string c = "use crate::add;\npub fn twice(x: i32) -> i32 { add(x, x) }\n";
+        const string d = "use crate::add;\npub fn sum(v: &[i32]) -> i32 { v.iter().fold(0, |a, b| add(a, *b)) }\n";
+        const string e = "use crate::add;\npub fn zero() -> i32 { add(0, 0) }\n";
+        const string eHelpers = "    const ONE: i32 = 1;\n    struct Pair(i32, i32);\n    fn pair() -> Pair { Pair(ONE, 2) }\n";
+        const string f = "macro_rules! double { ($x:expr) => { $x * 2 }; }\n#[derive(Debug, PartialEq, Clone)]\npub struct Point { pub x: i32 }\npub fn origin() -> Point { Point { x: double!(0) } }\n";
+        const string g = "pub fn neg(x: i32) -> i32 { -x }\n";
+        const string h = "pub fn id(x: i32) -> i32 { x }\n";
+        const string i = "#[cfg(test)]\nuse std::collections::HashSet;\npub fn one() -> i32 { 1 }\n";
+        const string j = "pub fn four() -> i32 { add(2, 2) }\n";
+        const string notMiri = "#[cfg(all(test, not(miri)))]";
+        var baseSha = Adds(("src/lib.rs", mods + AddLib), ("src/a.rs", a + TestModule(notMiri, TestFn("incs", "assert_eq!(inc(1), 2);"))), ("src/b.rs", b), ("src/c.rs", c), ("src/d.rs", d),
+            ("src/e.rs", e + TestModule("#[cfg(test)]", eHelpers + TestFn("pairs", "assert_eq!(pair().0, ONE);"))), ("src/f.rs", f), ("src/g.rs", g), ("src/h.rs", h), ("src/i.rs", i), ("src/j.rs", "use crate::add;\n" + j));
+
+        var headSha = Commit("tests of old code",
+            // A module gated by cfg(all(test, not(miri))) that the base has: a new helper and a new test in it.
+            ("src/a.rs", a + TestModule(notMiri, "    fn three() -> i32 { 3 }\n" + TestFn("incs", "assert_eq!(inc(1), 2);") + TestFn("adds_again", "assert_eq!(add(1, 2), three());"))),
+            // The same gate on a module that is new.
+            ("src/b.rs", b + TestModule(notMiri, TestFn("adds", "assert_eq!(add(1, 2), 3);"))),
+            // Gated by an inner attribute.
+            ("src/c.rs", c + "mod tests {\n    #![cfg(test)]\n    use super::*;\n" + TestFn("adds", "assert_eq!(add(1, 2), 3);") + "}\n"),
+            // A file-level import the pull request adds, reached through `use super::*`.
+            ("src/d.rs", "use std::collections::HashMap;\n" + d + "pub fn none() -> HashMap<u8, u8> { HashMap::new() }\n"
+                + TestModule("#[cfg(test)]", TestFn("maps_are_empty", "assert!(HashMap::<u8, u8>::new().is_empty());"))),
+            // A helper function, constant and struct of the test module the base already has.
+            ("src/e.rs", e + TestModule("#[cfg(test)]", eHelpers + TestFn("pairs", "assert_eq!(pair().0, ONE);") + TestFn("uses_helpers", "let p = pair(); assert_eq!(add(p.0, p.1), 3);"))),
+            // A macro_rules! macro and a derived type of the parent module.
+            ("src/f.rs", f + TestModule("#[cfg(test)]", TestFn("doubles", "assert_eq!(double!(2), 4);") + TestFn("points_compare", "assert_eq!(origin().clone(), Point { x: 0 });"))),
+            // The test module in a file of its own.
+            ("src/g.rs", g + "#[cfg(test)]\nmod tests;\n"), ("src/g/tests.rs", "use super::*;\n#[test]\nfn negs() { assert_eq!(neg(1), -1); }\n"),
+            // A pub(crate) re-export the pull request adds, of a function the base has.
+            ("src/h.rs", "pub(crate) use crate::add as plus;\n" + h + TestModule("#[cfg(test)]", TestFn("plus_adds", "assert_eq!(plus(1, 2), 3);"))),
+            // A #[cfg(test)] import at file level that the base already has.
+            ("src/i.rs", i + TestModule("#[cfg(test)]", TestFn("sets_are_empty", "assert!(HashSet::<u8>::new().is_empty());"))),
+            // An import the pull request spells another way: the base's module already imports that name, and keeps its own.
+            ("src/j.rs", "use super::add;\n" + j + TestModule("#[cfg(test)]", TestFn("fours", "assert_eq!(add(four(), 0), 4);"))),
+            // An integration test of the public API the base has.
+            ("tests/api.rs", "use words::{add, a::inc};\n#[test]\nfn adds_and_incs() { assert_eq!(add(1, inc(1)), 3); }\n"));
+
+        var result = await Check(baseSha, headSha);
+
+        Assert.True(result.Outcome == NewTestsOutcome.Rejected, $"{result.Outcome}: {result.Reason}");
+        // The base builds with all of it at the first go: nothing was left out that a test needs.
+        Assert.Equal(("ran", (string?)null, "ran"), (result.BaseRun, result.BaseRetry, result.HeadRun));
+        Assert.Equal(
+        [
+            "words:lib:a::tests::adds_again", "words:lib:b::tests::adds", "words:lib:c::tests::adds", "words:lib:d::tests::maps_are_empty", "words:lib:e::tests::uses_helpers",
+            "words:lib:f::tests::doubles", "words:lib:f::tests::points_compare", "words:lib:g::tests::negs", "words:lib:h::tests::plus_adds", "words:lib:i::tests::sets_are_empty",
+            "words:lib:j::tests::fours",
+            "words:test/api:adds_and_incs",
+        ], result.Tests.Select(t => t.Test).Order(StringComparer.Ordinal));
+        Assert.All(result.Tests, t => Assert.True((t.Base, t.Head) == ("passed", "passed"), $"{t.Test}: {t.Base} on the base, {t.Head} on the head"));
+        Assert.Contains("already pass on the base", result.Reason);
+    }
+
+    [Fact]
+    public async Task With_cargo_one_import_that_does_not_resolve_on_the_base_hides_neither_a_test_of_old_code_nor_a_real_failure()
+    {
+        Assert.SkipUnless(HasCargo.Value, "cargo is not installed");
+        var baseSha = Base();
+        const string lib = FixedLib + "pub fn trim(s: &str) -> &str { s.trim() }\n";
+        const string api = "use words::{trim, words};\n#[test]\nfn trims() { assert_eq!(trim(\" a \"), \"a\"); }\n#[test]\nfn blank_has_no_words() { assert_eq!(words(\"  \"), 0); }\n";
+        var vacuous = Commit("trim", ("src/lib.rs", lib), ("tests/api.rs", api + "#[test]\nfn one_word() { assert_eq!(words(\"a\"), 1); }\n"));
+
+        var rejected = await Check(baseSha, vacuous);
+
+        // rustc names the import first (`trim`: the base lacks it), then trims, which used it; `words` stays imported, so
+        // the other two compile on the base and get their real results: one fails there, one passes and is named.
+        Assert.True(rejected.Outcome == NewTestsOutcome.Rejected, $"{rejected.Outcome}: {rejected.Reason}");
+        Assert.EndsWith("so they check nothing: words:test/api:one_word", rejected.Reason);
+        Assert.Equal([("words:test/api:blank_has_no_words", "failed"), ("words:test/api:one_word", "passed"), ("words:test/api:trims", "not-built")], rejected.Tests.Select(t => (t.Test, t.Base)).Order());
+        Assert.Equal("tests/api.rs:1 use words::trim;", rejected.BaseRemoved[0]);
+
+        var real = Commit("without the test that checks nothing", ("tests/api.rs", api));
+        var pass = await Check(baseSha, real);
+        Assert.True(pass.Outcome == NewTestsOutcome.Pass, $"{pass.Outcome}: {pass.Reason}");
+        Assert.Equal([("words:test/api:blank_has_no_words", "failed", "passed"), ("words:test/api:trims", "not-built", "passed")], pass.Tests.Select(t => (t.Test, t.Base, t.Head)).Order());
+    }
+
+    [Fact]
+    public async Task With_cargo_an_import_of_new_code_in_a_file_the_base_has_is_left_out_and_the_tests_beside_it_get_their_real_results()
+    {
+        Assert.SkipUnless(HasCargo.Value, "cargo is not installed");
+        var baseSha = Base();
+        string Lib(string tests) => "mod util;\nuse util::clean;\npub fn words(s: &str) -> usize { clean(s).split_whitespace().count() }\n"
+            + TestModule("#[cfg(test)]", TestFn("two", "assert_eq!(words(\"a b\"), 2);") + tests);
+        const string cleans = "    #[test]\n    fn cleans() { assert_eq!(clean(\" a \"), \"a\"); }\n    #[test]\n    fn blank_has_no_words() { assert_eq!(words(\"  \"), 0); }\n";
+        var headSha = Commit("clean", ("src/util.rs", "pub fn clean(s: &str) -> &str { s.trim() }\n"), ("src/lib.rs", Lib(cleans)));
+
+        var pass = await Check(baseSha, headSha);
+
+        // The base gets the head's `use util::clean;` (the tests reach it through `use super::*`), which does not resolve
+        // there: left out; then cleans, which needs it, does not compile; blank_has_no_words really fails on the base.
+        Assert.True(pass.Outcome == NewTestsOutcome.Pass, $"{pass.Outcome}: {pass.Reason}");
+        Assert.Equal([("words:lib:tests::blank_has_no_words", "failed", "passed"), ("words:lib:tests::cleans", "not-built", "passed")], pass.Tests.Select(t => (t.Test, t.Base, t.Head)).Order());
+        Assert.Equal(("build-failed", "ran"), (pass.BaseRun, pass.BaseRetry));
+        Assert.Contains(pass.BaseRemoved, r => r.EndsWith(" use util::clean;", StringComparison.Ordinal));
+
+        var vacuous = Commit("a test that checks nothing", ("src/lib.rs", Lib(cleans + TestFn("one_word", "assert_eq!(words(\"a\"), 1);"))));
+        var rejected = await Check(baseSha, vacuous);
+        Assert.True(rejected.Outcome == NewTestsOutcome.Rejected, $"{rejected.Outcome}: {rejected.Reason}");
+        Assert.EndsWith("so they check nothing: words:lib:tests::one_word", rejected.Reason);
     }
 }

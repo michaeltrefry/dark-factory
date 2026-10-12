@@ -16,6 +16,13 @@ public sealed record CargoNewTestSet(IReadOnlyList<ChangedFile> TestFiles, IRead
     public IReadOnlyDictionary<string, (string Path, string InFile)> Locations { get; init; } = new Dictionary<string, (string, string)>(StringComparer.Ordinal);
 
     public IReadOnlySet<string> WholeFiles { get; init; } = new HashSet<string>(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The imports the overlay wrote into each production file beyond the base's own (<see cref="CargoNewTests.Graft"/>),
+    /// by path, each statement normalized (<see cref="RustSource.Normalize"/>): one of these that does not compile on the
+    /// base is left out of the retry, where an error in any other production <c>use</c> is the base's own.
+    /// </summary>
+    public IReadOnlyDictionary<string, IReadOnlySet<string>> AddedUses { get; init; } = new Dictionary<string, IReadOnlySet<string>>(StringComparer.Ordinal);
 }
 
 /// <summary>
@@ -34,14 +41,16 @@ public sealed record CargoNewTestSet(IReadOnlyList<ChangedFile> TestFiles, IRead
 /// New cases on an existing parameterized test are unisolable, as new rows on an xUnit theory are.
 /// </para>
 /// <para>
-/// The base run's overlay (the PR's test code applied to the base). Integration tests and files of a
+/// The base run's overlay (the PR's test code applied to the base), under one rule: a new test may count as not building
+/// on the base only for something the base lacks, never for an import, helper or attribute the overlay left out; where
+/// the test code cannot be applied faithfully the check is unsupported. Integration tests and files of a
 /// <c>#[cfg(test)]</c> module are test code as a whole and come from the head. A production file with inline tests
-/// cannot: it is written (through owner-side git, as the retry's files are) as its <em>base</em> version with the head's
+/// cannot: it is written (through owner-side git, as the retries' files are) as its <em>base</em> version with the head's
 /// test code grafted in (<see cref="Graft"/>) — every <c>#[cfg(test)]</c> module replaced by the head's (or added,
-/// removed when the head has none), and every test function outside one replaced or added — so the production code under
-/// test stays the base's. A file the base lacks (added or renamed) holding new tests is written with its test code only
-/// (production items left out, an empty <c>fn main</c> kept for a binary) and its <c>mod</c> declaration added to the
-/// base's parent module, so a test of new code is compiled on the base and fails to there, in its own declaration. A
+/// removed when the head has none), and every import of the head the base's module lacks added — so the production code
+/// under test stays the base's. A file the base lacks (added) holding new tests is written with its imports and its test
+/// code only (production items left out, an empty <c>fn main</c> kept for a binary) and its <c>mod</c> declaration added
+/// to the base's parent module, so a test of new code is compiled on the base and fails to there, in its own function. A
 /// package manifest's <c>dev-dependencies</c> tables are test code too: the base's manifest gets the head's (a new
 /// package's manifest is applied whole).
 /// </para>
@@ -49,22 +58,23 @@ public sealed record CargoNewTestSet(IReadOnlyList<ChangedFile> TestFiles, IRead
 /// Unisolable (the check is <c>unsupported</c>): a changed <c>.rs</c> file the reader cannot read; a new test outside a
 /// package's <c>src/</c> and <c>tests/</c>, or in a module shared by integration tests (<c>tests/common/mod.rs</c>); a
 /// package with a custom target layout (<c>[[test]]</c>, <c>autotests</c>/<c>autobins</c>, a <c>path</c> that is not the
-/// default); a <c>#[cfg(test)]</c> item that is not a module, or a test inside a macro, outside every
-/// <c>#[cfg(test)]</c> module, that the base version lacks (it cannot be told from the production code beside it);
-/// <c>dev-dependencies</c> written as dotted keys; a new file whose <c>mod</c> declaration is not at the top of its
-/// parent module's file.
+/// default); a test function, or a test inside a macro, outside every <c>#[cfg(test)]</c> module that the base does not
+/// have unchanged, and a <c>#[cfg(test)]</c> item that is not a module which the base lacks (neither can be told from
+/// the production code beside it); two items of one kind and name in a module (cfg alternates); a renamed production
+/// file holding new tests; <c>dev-dependencies</c> written as dotted keys; a new file whose <c>mod</c> declaration is
+/// not at the top of its parent module's file.
 /// </para>
 /// <para>
 /// Runs, from the worktree root, per package holding a new test: <c>cargo --version</c> (a toolchain probe: failing,
 /// the run is <see cref="TestRunStatus.ToolchainMissing"/>, never a pass), <c>cargo fetch</c> (the restore: the only
-/// step that is meant to use the network, as <c>dotnet restore</c> is), <c>cargo test --no-run --message-format=json</c>
+/// step that may use the network, as <c>dotnet restore</c> is), <c>cargo test --offline --no-run --message-format=json</c>
 /// for the targets holding new tests (the build: cargo's JSON diagnostics, a stable format, on standard output), then
-/// one <c>cargo test … -- --exact &lt;path&gt;</c> per new test (<c>--lib</c>, <c>--bins</c> or <c>--test &lt;name&gt;</c>;
-/// a parameterized test by its <c>path::</c> prefix). Results: libtest's JSON output is nightly-only, so the stable
-/// human-readable lines are read (<c>test &lt;name&gt; ... ok|FAILED|ignored</c> and <c>test result: …</c>), and because
-/// a test can print such lines itself they are believed only when they agree with what it cannot forge
-/// (<see cref="ParseResults"/>: the process's exit code and the summary's counts); anything else is an unreadable
-/// report, an <c>error</c>.
+/// one <c>cargo test --offline … -- --exact &lt;path&gt;</c> per new test (<c>--lib</c>, <c>--bins</c> or
+/// <c>--test &lt;name&gt;</c>; a parameterized test by its <c>path::</c> prefix). Results: libtest's JSON output is
+/// nightly-only, so the stable human-readable lines are read (<c>running N tests</c>,
+/// <c>test &lt;name&gt; ... ok|FAILED|ignored</c> and <c>test result: …</c>), and only when they have libtest's shape and
+/// agree with the exit code (<see cref="ParseResults"/>, which also says what that cannot catch); anything else is an
+/// unreadable report, an <c>error</c>.
 /// </para>
 /// </summary>
 public sealed class CargoNewTests : INewTestStrategy
@@ -80,6 +90,13 @@ public sealed class CargoNewTests : INewTestStrategy
     public const string Cases = "::*";
 
     public bool Understands(string path) => path.EndsWith(".rs", StringComparison.Ordinal);
+
+    /// <summary>
+    /// Three: rustc reports in stages. An import that does not resolve on the base hides the errors of the code that uses
+    /// its name, and those may hide type errors: each retry leaves out what the one before could not compile, so a test
+    /// that does build still gets its real result after a test beside it failed in a later stage.
+    /// </summary>
+    public int BaseRetries => 3;
 
     /// <summary>Nothing: cargo's build output is kept from standard output (<see cref="TestStep.CaptureOutput"/>), no log file is read.</summary>
     public string BuildLogPattern => "cargo-build-*.none";
@@ -449,14 +466,16 @@ public sealed class CargoNewTests : INewTestStrategy
             return new CargoNewTestSet(testFiles, [], problems);
         }
 
+        var addedUses = new Dictionary<string, IReadOnlySet<string>>(StringComparer.Ordinal);
         var replacements = await OverlayAsync(head, @base, changes, added.Select(id => headTests[id].Package).Distinct().ToList(),
-            added.Select(id => headTests[id].Path).ToHashSet(StringComparer.Ordinal), testFiles, whole, problems, ct);
+            added.Select(id => headTests[id].Path).ToHashSet(StringComparer.Ordinal), testFiles, whole, problems, addedUses, ct);
         return new CargoNewTestSet(testFiles, added, problems)
         {
             Projects = added.ToDictionary(id => id, id => headTests[id].Package.ManifestPath, StringComparer.Ordinal),
             BaseReplacements = replacements,
             Locations = added.ToDictionary(id => id, id => (headTests[id].Path, headTests[id].InFile), StringComparer.Ordinal),
             WholeFiles = whole,
+            AddedUses = addedUses,
         };
     }
 
@@ -466,7 +485,8 @@ public sealed class CargoNewTests : INewTestStrategy
     /// the head's (grafted production files, files the base lacks with their test code only, manifests).
     /// </summary>
     private static async Task<Dictionary<string, string>> OverlayAsync(Tree head, Tree @base, IReadOnlyList<ChangedFile> changes, IReadOnlyList<Package> packages,
-        IReadOnlySet<string> withNewTests, List<ChangedFile> testFiles, HashSet<string> whole, List<string> problems, CancellationToken ct)
+        IReadOnlySet<string> withNewTests, List<ChangedFile> testFiles, HashSet<string> whole, List<string> problems,
+        Dictionary<string, IReadOnlySet<string>> addedUses, CancellationToken ct)
     {
         var replacements = new Dictionary<string, string>(StringComparer.Ordinal);
         // The mod declarations a base file must get so that a file the base lacks is compiled there.
@@ -527,6 +547,12 @@ public sealed class CargoNewTests : INewTestStrategy
                 {
                     grafted.TryAdd(path, package);
                 }
+                else if (withNewTests.Contains(path) && change.OldPath is { } old && old != path)
+                {
+                    // Its production code is the base's, under another name: written with its test code alone, a test of
+                    // that code would not compile, and count as failing on a base where it passes.
+                    problems.Add($"{path} holds new tests and is {old} renamed: the gate cannot apply its tests to the base apart from the production code that moved with it (rename the file in a pull request of its own)");
+                }
                 else if (withNewTests.Contains(path))
                 {
                     await EnsureAsync(package, path);
@@ -566,15 +592,20 @@ public sealed class CargoNewTests : INewTestStrategy
             }
             var before = absent.ContainsKey(path) ? null : await @base.ReadAsync(path, ct);
             string text;
+            var imports = new HashSet<string>(StringComparer.Ordinal);
             try
             {
                 text = Graft(before, file, declarations.GetValueOrDefault(path) ?? [], problems, path,
-                    emptyMain: before is null && Regex.IsMatch(path, @"(^|/)src/(main\.rs|bin/[^/]+\.rs|bin/[^/]+/main\.rs)$", RegexOptions.CultureInvariant));
+                    emptyMain: before is null && Regex.IsMatch(path, @"(^|/)src/(main\.rs|bin/[^/]+\.rs|bin/[^/]+/main\.rs)$", RegexOptions.CultureInvariant), imports);
             }
             catch (FormatException e)
             {
-                problems.Add($"{path} at the base cannot be read as Rust source ({e.Message}), so the PR's test code cannot be applied to it");
+                problems.Add($"the PR's test code cannot be applied to {path} at the base ({e.Message})");
                 continue;
+            }
+            if (imports.Count > 0)
+            {
+                addedUses[path] = imports;
             }
             if (text != before)
             {
@@ -587,35 +618,78 @@ public sealed class CargoNewTests : INewTestStrategy
 
     /// <summary>
     /// A production file for the base run: <paramref name="baseText"/> with the test code of <paramref name="head"/>
-    /// applied. In each module the two share (the file, then inline modules that are not <c>#[cfg(test)]</c>, by name),
-    /// every <c>#[cfg(test)]</c> module and every test function of the head replaces the base's item of that name or is
-    /// added at the module's end; a <c>#[cfg(test)]</c> module or item the head no longer has is removed; a module only
-    /// the head has is added with its test code alone. Everything else stays the base's. A <c>#[cfg(test)]</c> item that is not a
-    /// module, and a macro holding tests, are test code that cannot be matched to the base's: one the base lacks is a
-    /// problem (unisolable). With no base text (the base lacks the file) the result is the head's test code alone — there
-    /// every <c>#[cfg(test)]</c> item — plus an empty <c>fn main</c> when asked. <paramref name="declarations"/> are
-    /// added at the end unless the base already has a module of that name.
+    /// applied. Test code is what a <c>#[cfg(test)]</c> item holds (<see cref="RustItem.IsGated"/>); nothing else of the
+    /// head is, since the gate cannot tell a helper beside a test from production code. In each module the two share (the
+    /// file, then inline modules that are not <c>#[cfg(test)]</c>, by name), every <c>#[cfg(test)]</c> module of the head
+    /// replaces the base's module of that name or is added at the module's end, and one the head no longer has is removed.
+    /// Imports are not test code, but a test reaches them through <c>use super::*</c>: every single import of the head
+    /// (<see cref="RustSource.UseLeaves"/>) whose name the base's module does not import is added at the module's end and
+    /// recorded in <paramref name="addedUses"/>, so that a test never fails to compile on the base for an import the
+    /// overlay left out (one that does not resolve there is left out of the retry, <see cref="ExplainBuildFailure"/>). A
+    /// module only the head has is added with its imports and its test code alone. Everything else stays the base's.
+    /// <para>
+    /// A problem (the check is unsupported) wherever the test code cannot be applied faithfully: a test function, or a
+    /// macro holding tests, outside every <c>#[cfg(test)]</c> module that the base does not have unchanged (the items it
+    /// uses beside it would be left behind); a <c>#[cfg(test)]</c> item that is not a module which the base lacks; two
+    /// items of one kind and name in a module (cfg alternates), which cannot be matched to the base's.
+    /// </para>
+    /// With no base text (the base lacks the file) the result is the head's inner attributes, imports and
+    /// <c>#[cfg(test)]</c> items alone, plus an empty <c>fn main</c> when asked. <paramref name="declarations"/> are added
+    /// at the end unless the base already has a module of that name.
     /// </summary>
     public static string Graft(string? baseText, RustFile head, IReadOnlyList<(string Name, string Text)> declarations, List<string> problems, string path,
-        bool emptyMain = false)
+        bool emptyMain = false, ISet<string>? addedUses = null)
     {
-        static bool IsTestCode(RustItem item) => item.IsGated || item.IsTestFn;
-        static bool HoldsTests(RustItem item) => item is { Kind: RustItem.Macro, BodyOpen: >= 0 } && Flatten(item.Items).Any(i => i.IsTestFn);
         static IEnumerable<RustItem> Flatten(IEnumerable<RustItem> items) => items.SelectMany(i => Flatten(i.Items).Prepend(i));
+        static bool HoldsTests(RustItem item) => item is { Kind: RustItem.Macro, BodyOpen: >= 0 } && Flatten(item.Items).Any(i => i.IsTestFn);
+        static bool HasTestCode(IEnumerable<RustItem> items) => Flatten(items).Any(i => i.IsGated || i.IsTestFn);
+        int Line(RustItem item) => head.Text.AsSpan(0, item.Start).Count('\n') + 1;
 
-        // A module's test code alone: its #[cfg(test)] items, test functions, macros holding tests, and inner modules' likewise.
-        string Strip(IReadOnlyList<RustItem> items)
+        // A test outside every #[cfg(test)] module that the base does not have as it is.
+        void Outside(RustItem item) => problems.Add(item.Kind == RustItem.Macro
+            ? $"{path}:{Line(item)} adds or changes tests inside {item.Name}! outside every #[cfg(test)] module: the gate cannot apply them to the base apart from the production code beside them (move the macro into a #[cfg(test)] module)"
+            : $"{path}:{Line(item)} adds or changes the test {item.Name} outside every #[cfg(test)] module: the gate cannot apply it to the base apart from the production code beside it (move it into a #[cfg(test)] module)");
+
+        // The single imports of a use item that the base's module does not have, as statements.
+        string Imports(RustItem use, IReadOnlySet<string>? keys, IReadOnlySet<string>? names)
         {
             var text = new StringBuilder();
+            foreach (var leaf in RustSource.UseLeaves(head.TextOf(use)))
+            {
+                if (keys?.Contains(leaf.Key) != true && !(leaf.Name is { } name && names?.Contains(name) == true))
+                {
+                    text.Append(leaf.Statement).Append('\n');
+                    addedUses?.Add(RustSource.Normalize(leaf.Statement));
+                }
+            }
+            return text.ToString();
+        }
+
+        // A module the base lacks: its inner attributes, its imports and its test code (inner modules' likewise).
+        string Strip(IReadOnlyList<RustItem> items, IReadOnlyList<RustAttribute> inner)
+        {
+            var text = new StringBuilder();
+            foreach (var attribute in inner)
+            {
+                text.Append("#![").Append(attribute.Text).Append("]\n");
+            }
             foreach (var item in items)
             {
-                if (IsTestCode(item) || HoldsTests(item))
+                if (item.IsTestFn || (!item.IsGated && HoldsTests(item)))
+                {
+                    Outside(item);
+                }
+                else if (item.IsGated)
                 {
                     text.Append(head.TextOf(item)).Append('\n');
                 }
-                else if (item.IsInlineMod && Strip(item.Items) is { Length: > 0 } inner)
+                else if (item.Kind == RustItem.Use)
                 {
-                    text.Append(head.Text, item.Start, item.BodyOpen + 1 - item.Start).Append('\n').Append(inner).Append("}\n");
+                    text.Append(Imports(item, null, null));
+                }
+                else if (item.IsInlineMod && HasTestCode(item.Items))
+                {
+                    text.Append(head.Text, item.Start, item.BodyOpen + 1 - item.Start).Append('\n').Append(Strip(item.Items, item.InnerAttributes)).Append("}\n");
                 }
             }
             return text.ToString();
@@ -623,12 +697,12 @@ public sealed class CargoNewTests : INewTestStrategy
 
         if (baseText is null)
         {
-            var only = new StringBuilder(Strip(head.Items));
+            var only = new StringBuilder(Strip(head.Items, head.InnerAttributes));
             foreach (var (_, text) in declarations)
             {
                 only.Append(text).Append('\n');
             }
-            if (emptyMain && head.Items.Any(i => i is { Kind: RustItem.Fn, Name: "main" } && !IsTestCode(i)))
+            if (emptyMain && head.Items.Any(i => i is { Kind: RustItem.Fn, Name: "main", IsGated: false, IsTestFn: false }))
             {
                 only.Append("fn main() {}\n");
             }
@@ -643,11 +717,34 @@ public sealed class CargoNewTests : INewTestStrategy
             static bool IsLoose(RustItem i) => (i.IsGated && i.Kind != RustItem.Mod && !i.IsTestFn) || (!i.IsGated && HoldsTests(i));
             var loose = baseItems.Where(IsLoose).Select(i => RustSource.Normalize(@base.TextOf(i))).ToHashSet(StringComparer.Ordinal);
             var kept = headItems.Where(IsLoose).Select(i => RustSource.Normalize(head.TextOf(i))).ToHashSet(StringComparer.Ordinal);
+            var imported = baseItems.Where(i => i.Kind == RustItem.Use && !i.IsGated).SelectMany(i => RustSource.UseLeaves(@base.TextOf(i))).ToList();
+            var keys = imported.Select(l => l.Key).ToHashSet(StringComparer.Ordinal);
+            var names = imported.Select(l => l.Name).OfType<string>().ToHashSet(StringComparer.Ordinal);
+
+            // Items are matched to the base's by kind and name: with two of them on either side (cfg alternates) they cannot be.
+            var twice = new HashSet<(string, string?)>();
+            bool Twice(RustItem item)
+            {
+                if (baseItems.Count(i => i.Kind == item.Kind && i.Name == item.Name) < 2 && headItems.Count(i => i.Kind == item.Kind && i.Name == item.Name) < 2)
+                {
+                    return false;
+                }
+                if (twice.Add((item.Kind, item.Name)))
+                {
+                    problems.Add($"{path}:{Line(item)} has more than one {item.Kind} {item.Name} in one module at the base or the head (cfg alternates): the gate cannot match them to apply the PR's test code to the base");
+                }
+                return true;
+            }
+
             foreach (var item in headItems)
             {
-                if ((item.Kind == RustItem.Mod && item.IsGated) || item.IsTestFn)
+                if (item.Kind == RustItem.Mod && item.IsGated)
                 {
                     var text = head.TextOf(item);
+                    if (Twice(item))
+                    {
+                        continue;
+                    }
                     if (baseItems.FirstOrDefault(i => i.Kind == item.Kind && i.Name == item.Name) is not { } old)
                     {
                         add.Append('\n').Append(text).Append('\n');
@@ -657,25 +754,53 @@ public sealed class CargoNewTests : INewTestStrategy
                         edits.Add((old.Start, old.End, text));
                     }
                 }
+                else if (item.IsTestFn)
+                {
+                    if (!Twice(item) && (baseItems.FirstOrDefault(i => i.Kind == item.Kind && i.Name == item.Name) is not { } old
+                        || RustSource.Normalize(@base.TextOf(old)) != RustSource.Normalize(head.TextOf(item))))
+                    {
+                        Outside(item);
+                    }
+                }
                 else if (item.IsGated || HoldsTests(item))
                 {
                     if (!loose.Contains(RustSource.Normalize(head.TextOf(item))))
                     {
-                        var line = head.Text.AsSpan(0, item.Start).Count('\n') + 1;
-                        problems.Add(item.IsGated
-                            ? $"{path}:{line} adds or changes a #[cfg(test)] item that is not a module, outside every #[cfg(test)] module: the gate cannot apply it to the base apart from the production code beside it (move it into a #[cfg(test)] module)"
-                            : $"{path}:{line} adds or changes tests inside {item.Name}! outside every #[cfg(test)] module: the gate cannot apply them to the base apart from the production code beside them (move the macro into a #[cfg(test)] module)");
+                        if (item.IsGated)
+                        {
+                            problems.Add($"{path}:{Line(item)} adds or changes a #[cfg(test)] item that is not a module, outside every #[cfg(test)] module: the gate cannot apply it to the base apart from the production code beside it (move it into a #[cfg(test)] module)");
+                        }
+                        else
+                        {
+                            Outside(item);
+                        }
+                    }
+                }
+                else if (item.Kind == RustItem.Use)
+                {
+                    if (Imports(item, keys, names) is { Length: > 0 } imports)
+                    {
+                        add.Append('\n').Append(imports);
                     }
                 }
                 else if (item.IsInlineMod)
                 {
-                    if (baseItems.FirstOrDefault(i => i.IsInlineMod && i.Name == item.Name) is { } shared)
+                    var same = baseItems.Concat(headItems).Where(i => i.Kind == RustItem.Mod && i.Name == item.Name).ToList();
+                    if (baseItems.Count(i => i.Kind == RustItem.Mod && i.Name == item.Name) > 1 || headItems.Count(i => i.Kind == RustItem.Mod && i.Name == item.Name) > 1)
+                    {
+                        // Alternates without test code are production code: nothing to apply.
+                        if (same.Any(i => i.IsGated || HasTestCode(i.Items)))
+                        {
+                            Twice(item);
+                        }
+                    }
+                    else if (baseItems.FirstOrDefault(i => i.IsInlineMod && i.Name == item.Name) is { } shared)
                     {
                         Apply(shared.Items, item.Items, shared.BodyClose, []);
                     }
-                    else if (Strip([item]) is { Length: > 0 } alone)
+                    else if (HasTestCode(item.Items))
                     {
-                        add.Append('\n').Append(alone);
+                        add.Append('\n').Append(head.Text, item.Start, item.BodyOpen + 1 - item.Start).Append('\n').Append(Strip(item.Items, item.InnerAttributes)).Append("}\n");
                     }
                 }
             }
@@ -697,10 +822,29 @@ public sealed class CargoNewTests : INewTestStrategy
         Apply(@base.Items, head.Items, baseText.Length,
             declarations.Where(d => !@base.Items.Any(i => i.Kind == RustItem.Mod && i.Name == d.Name)).Select(d => d.Text));
 
-        var result = new StringBuilder(baseText);
-        foreach (var (start, end, text) in edits.OrderByDescending(e => e.Start).ThenByDescending(e => e.End))
+        return ApplyEdits(baseText, edits);
+    }
+
+    /// <summary>
+    /// <paramref name="text"/> with each edit's range replaced by its text. Two edits of one place (overlapping ranges, or
+    /// two insertions at one position) would corrupt the file silently, so they throw <see cref="FormatException"/>: the
+    /// file is then one the PR's test code cannot be applied to (unsupported), never a damaged base.
+    /// </summary>
+    public static string ApplyEdits(string text, IReadOnlyList<(int Start, int End, string Text)> edits)
+    {
+        // Applied from the end of the file backwards.
+        var ordered = edits.OrderByDescending(e => e.Start).ThenByDescending(e => e.End).ToList();
+        for (var n = 1; n < ordered.Count; n++)
         {
-            result.Remove(start, end - start).Insert(start, text);
+            if (ordered[n].End > ordered[n - 1].Start || (ordered[n].Start, ordered[n].End) == (ordered[n - 1].Start, ordered[n - 1].End))
+            {
+                throw new FormatException($"two changes of the PR's test code fall on one place of the file, at offsets {ordered[n].Start} and {ordered[n - 1].Start}");
+            }
+        }
+        var result = new StringBuilder(text);
+        foreach (var (start, end, replacement) in ordered)
+        {
+            result.Remove(start, end - start).Insert(start, replacement);
         }
         return result.ToString();
     }
@@ -710,10 +854,11 @@ public sealed class CargoNewTests : INewTestStrategy
     private static readonly Regex TestId = new(@"^(?<package>[^:]+):(?<target>lib|bins|test/[^:]+):(?<path>.+?)(?<cases>::\*)?$", RegexOptions.CultureInvariant);
 
     /// <summary>
-    /// <c>cargo --version</c>; then per package manifest holding a new test <c>cargo fetch</c>, then
-    /// <c>cargo test --no-run --message-format=json</c> for its targets with new tests (output kept as the build log), then
-    /// per new test one <c>cargo test … --no-fail-fast -- --exact path</c> (a parameterized one: <c>-- path::</c>), its
-    /// output kept under the test's id. Run from the worktree root with <c>--manifest-path</c>; nothing is written under
+    /// <c>cargo --version</c>; then per package manifest holding a new test <c>cargo fetch</c> (the only step that may
+    /// use the network), then <c>cargo test --offline --no-run --message-format=json</c> for its targets with new tests
+    /// (output kept as the build log), then per new test one <c>cargo test --offline … --no-fail-fast -- --exact path</c>
+    /// (a parameterized one: <c>-- path::</c>), its output kept under the test's id. <c>--offline</c>: the build and the
+    /// tests resolve and download nothing, they use what the fetch left. Run from the worktree root with <c>--manifest-path</c>; nothing is written under
     /// <paramref name="resultsDirectory"/>.
     /// </summary>
     public Task<IReadOnlyList<TestStep>> StepsAsync(TestSource source, string commit, IReadOnlyList<string> tests, IReadOnlyDictionary<string, string> projects,
@@ -728,7 +873,7 @@ public sealed class CargoNewTests : INewTestStrategy
         steps.AddRange(byManifest.Select(g => new TestStep(TestPhase.Restore, Cargo, ["fetch", "--manifest-path", $"./{g.Key}"])));
         steps.AddRange(byManifest.Select((g, n) => new TestStep(TestPhase.Build, Cargo,
         [
-            "test", "--manifest-path", $"./{g.Key}", "-p", g.First().Match.Groups["package"].Value, "--no-run", "--message-format=json",
+            "test", "--manifest-path", $"./{g.Key}", "-p", g.First().Match.Groups["package"].Value, "--offline", "--no-run", "--message-format=json",
             .. g.Select(t => t.Match.Groups["target"].Value).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).SelectMany(Target),
         ]) { CaptureOutput = $"cargo-build-{n}" }));
         foreach (var (id, match, manifest) in byManifest.SelectMany(g => g))
@@ -736,7 +881,7 @@ public sealed class CargoNewTests : INewTestStrategy
             var path = match.Groups["path"].Value;
             steps.Add(new TestStep(TestPhase.Test, Cargo,
             [
-                "test", "--manifest-path", $"./{manifest}", "-p", match.Groups["package"].Value, .. Target(match.Groups["target"].Value), "--color", "never",
+                "test", "--manifest-path", $"./{manifest}", "-p", match.Groups["package"].Value, "--offline", .. Target(match.Groups["target"].Value), "--color", "never",
                 "--no-fail-fast", "--", "--color", "never", .. match.Groups["cases"].Success ? new[] { $"{path}::" } : ["--exact", path],
             ]) { CaptureOutput = id });
         }
@@ -744,18 +889,26 @@ public sealed class CargoNewTests : INewTestStrategy
     }
 
     private static readonly Regex ResultLine = new(@"^test (?<name>\S+)(?: - should panic)? \.\.\. (?<result>ok|FAILED|ignored)(?:, .*)?$", RegexOptions.CultureInvariant);
+    private static readonly Regex RunningLine = new(@"^running (?<count>\d{1,9}) tests?$", RegexOptions.CultureInvariant);
     private static readonly Regex SummaryLine = new(
-        @"^test result: (?<result>ok|FAILED)\. (?<passed>\d{1,9}) passed; (?<failed>\d{1,9}) failed; (?<ignored>\d{1,9}) ignored; \d{1,9} measured; \d{1,9} filtered out",
+        @"^test result: (?<result>ok|FAILED)\. (?<passed>\d{1,9}) passed; (?<failed>\d{1,9}) failed; (?<ignored>\d{1,9}) ignored; (?<measured>\d{1,9}) measured; \d{1,9} filtered out",
         RegexOptions.CultureInvariant);
 
     /// <summary>
     /// Each new test's cases from its own <c>cargo test</c> run's standard output (the result named by the test's id, with
     /// the run's exit code): libtest's lines <c>test &lt;name&gt; ... ok|FAILED|ignored</c> whose name is the test's path
-    /// (a parameterized test: under it). A test can print such lines itself, so an output is read only when it agrees with
-    /// what the test cannot forge: at least one <c>test result:</c> summary, whose passed/failed/ignored counts add up to
-    /// the lines'; no test with two different results; exit code 0 with no failure anywhere, or a non-zero exit code with
-    /// a failed test. Anything else — no exit code, no summary (the harness crashed or was replaced), counts that differ,
-    /// a failure with exit code 0 or the reverse — is unreadable and named (never a result).
+    /// (a parameterized test: under it). The output is read only when it has libtest's shape and agrees with the exit
+    /// code: per test binary a <c>running N tests</c> line, then N result lines, then one <c>test result:</c> summary
+    /// whose passed/failed/ignored counts are those lines' (and add up to N); at least one such block; no result line
+    /// outside one; no test with two different results; exit code 0 with no failure anywhere, or a non-zero exit code
+    /// with a failed test. Anything else — no exit code, no summary (the harness crashed or was replaced), counts that
+    /// differ, a failure with exit code 0 or the reverse — is unreadable and named (never a result).
+    /// <para>
+    /// This catches a test that prints while it runs, not one that sets out to forge: the test process writes all of this
+    /// output and chooses its exit code, so a test that prints a whole libtest report and calls
+    /// <c>std::process::exit(101)</c> is read as failed on the base. Accepted: such a test is reviewed code that lies
+    /// about itself, as one that asserts on the source tree would be.
+    /// </para>
     /// </summary>
     public TestResults ParseResults(IEnumerable<ResultFile> resultFiles)
     {
@@ -782,6 +935,7 @@ public sealed class CargoNewTests : INewTestStrategy
             var why = summaries.Count == 0 ? $"cargo test printed no test result summary (exit code {exit}), so nothing shows which tests ran"
                 : (Sum("passed"), Sum("failed"), Sum("ignored")) != (Count("ok"), Count("FAILED"), Count("ignored"))
                     ? "its test lines do not add up to its summaries (a test wrote to standard output, or the output is not libtest's)"
+                : !Blocks(lines) ? "it is not libtest's report, in which each `running N tests` line is followed by N test lines and their summary (a test wrote to standard output, or the output is not libtest's)"
                 : tests.GroupBy(t => t.Name, StringComparer.Ordinal).Any(g => g.Select(t => t.Result).Distinct().Count() > 1)
                     ? "it reports one test with two different results"
                 : exit == 0 && failed ? "it reports a failed test but cargo exited with code 0"
@@ -801,6 +955,46 @@ public sealed class CargoNewTests : INewTestStrategy
             }
         }
         return new TestResults(results, unreadable);
+    }
+
+    /// <summary>
+    /// Whether the output is a sequence of libtest's blocks: <c>running N tests</c>, then exactly N test lines, then a
+    /// summary counting those lines (N = passed + failed + ignored + measured), with no test line or summary outside a block.
+    /// </summary>
+    private static bool Blocks(IReadOnlyList<string> lines)
+    {
+        static int Number(Match match, string group) => int.Parse(match.Groups[group].Value, System.Globalization.CultureInfo.InvariantCulture);
+        (int Running, int Passed, int Failed, int Ignored)? block = null;
+        foreach (var line in lines)
+        {
+            if (RunningLine.Match(line) is { Success: true } running)
+            {
+                if (block is not null)
+                {
+                    return false;
+                }
+                block = (Number(running, "count"), 0, 0, 0);
+            }
+            else if (ResultLine.Match(line) is { Success: true } test)
+            {
+                if (block is not var (count, passed, failed, ignored))
+                {
+                    return false;
+                }
+                var result = test.Groups["result"].Value;
+                block = (count, passed + (result == "ok" ? 1 : 0), failed + (result == "FAILED" ? 1 : 0), ignored + (result == "ignored" ? 1 : 0));
+            }
+            else if (SummaryLine.Match(line) is { Success: true } summary)
+            {
+                if (block is not var (count, passed, failed, ignored) || (passed, failed, ignored) != (Number(summary, "passed"), Number(summary, "failed"), Number(summary, "ignored"))
+                    || count != passed + failed + ignored + Number(summary, "measured"))
+                {
+                    return false;
+                }
+                block = null;
+            }
+        }
+        return block is null;
     }
 
     /// <summary>
@@ -899,27 +1093,30 @@ public sealed class CargoNewTests : INewTestStrategy
 
     /// <summary>
     /// Each error is placed, by <see cref="RustSource"/> on the applied file as it was built, in the innermost item at its
-    /// position (its unit). It says something about the new tests only inside test code: a file that is test code as a
-    /// whole (<see cref="CargoNewTestSet.WholeFiles"/>), or in a grafted production file a <c>#[cfg(test)]</c> item or a
-    /// test function; an error anywhere else (the base's production code, a file not applied, no file, a manifest or
-    /// linker error) is unattributable, and so is a build that names no error. A new test whose own function, or an item
-    /// containing it (a module whose own header holds the error), is a unit does not build on the base. The retry's files
-    /// leave every outermost unit out. An error in test code outside every item, or between a module's items, is
-    /// unremovable.
+    /// position (its unit). It says something about the new tests only inside what the overlay applied: a file that is
+    /// test code as a whole (<see cref="CargoNewTestSet.WholeFiles"/>), in a production file a <c>#[cfg(test)]</c> item, or
+    /// an import the overlay added (<see cref="CargoNewTestSet.AddedUses"/>); an error anywhere else (the base's
+    /// production code, its own imports, a file not applied, no file, a manifest or linker error) is unattributable, and
+    /// so is a build that names no error, and an ambiguous name (E0659: two imports, never something the base lacks). A
+    /// new test whose own function is a unit, or that is inside a macro that is one, does not build on the base. The
+    /// retry's files leave every outermost unit out; of a <c>use</c> only the single imports the error lies in
+    /// (<see cref="RustSource.UseLeaves"/>: the others stay, so a test that needs one of them still compiles). An error
+    /// in test code outside every item, between a module's items, or in a module's own header (nothing a test lacks on
+    /// the base shows there) is unremovable.
     /// </summary>
     public BuildFailure ExplainBuildFailure(NewTestSet set, IReadOnlyDictionary<string, string> applied, IReadOnlyList<BuildError> errors, IReadOnlyList<string> tests)
     {
         var cargo = set as CargoNewTestSet;
         var unattributable = new List<string>();
         var unremovable = new List<string>();
-        var files = new SortedDictionary<string, (RustFile File, HashSet<RustItem> Units)>(StringComparer.Ordinal);
+        var files = new SortedDictionary<string, (RustFile File, HashSet<RustItem> Units, Dictionary<RustItem, HashSet<int>> Imports)>(StringComparer.Ordinal);
         if (errors.Count == 0)
         {
             unattributable.Add("the build failed without naming a compiler error (see the build's output: a manifest, dependency or linker error, or no rustc)");
         }
         foreach (var error in errors)
         {
-            if (cargo is null || error.Path is not { } path || !Understands(path) || !applied.TryGetValue(path, out var text))
+            if (cargo is null || error.Path is not { } path || !Understands(path) || !applied.TryGetValue(path, out var text) || error.Code == Ambiguous)
             {
                 unattributable.Add(error.ToString());
                 continue;
@@ -928,7 +1125,7 @@ public sealed class CargoNewTests : INewTestStrategy
             {
                 try
                 {
-                    files[path] = file = (RustSource.Parse(text), new HashSet<RustItem>(ReferenceEqualityComparer.Instance));
+                    files[path] = file = (RustSource.Parse(text), new HashSet<RustItem>(ReferenceEqualityComparer.Instance), new Dictionary<RustItem, HashSet<int>>(ReferenceEqualityComparer.Instance));
                 }
                 catch (FormatException)
                 {
@@ -938,24 +1135,34 @@ public sealed class CargoNewTests : INewTestStrategy
             }
             var position = file.File.Position(error.Line, error.Column);
             var chain = position < 0 ? [] : file.File.ItemsAt(position);
-            if (position < 0 || !(cargo.WholeFiles.Contains(path) || chain.Any(i => i.IsGated || i.IsTestFn)))
+            var last = chain.Count > 0 ? chain[^1] : null;
+            var added = last is { Kind: RustItem.Use } && cargo.AddedUses.TryGetValue(path, out var imports) && imports.Contains(RustSource.Normalize(file.File.TextOf(last)));
+            if (position < 0 || !(cargo.WholeFiles.Contains(path) || chain.Any(i => i.IsGated) || added))
             {
                 unattributable.Add(error.ToString());
             }
-            else if (chain.Count == 0 || (chain[^1] is { BodyOpen: >= 0 } holder && position >= holder.BodyOpen))
+            else if (last is null || (last.BodyOpen >= 0 && position >= last.BodyOpen) || last.Kind == RustItem.Mod)
             {
                 unremovable.Add(error.ToString());
             }
             else
             {
-                file.Units.Add(chain[^1]);
+                file.Units.Add(last);
+                if (last.Kind == RustItem.Use)
+                {
+                    var leaves = RustSource.UseLeaves(file.File.TextOf(last));
+                    var hit = Enumerable.Range(0, leaves.Count).Where(n => leaves[n].Holds(position - last.Start)).ToList();
+                    var hits = file.Imports.TryGetValue(last, out var earlier) ? earlier : file.Imports[last] = [];
+                    // An error in none of its imports (its attributes, its keyword) is the whole item's.
+                    hits.UnionWith(hit.Count > 0 ? hit : Enumerable.Range(0, leaves.Count));
+                }
             }
         }
 
         var notBuilt = new HashSet<string>(StringComparer.Ordinal);
         var removed = new List<string>();
         var replacements = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var (path, (file, units)) in files.Where(f => f.Value.Units.Count > 0))
+        foreach (var (path, (file, units, imports)) in files.Where(f => f.Value.Units.Count > 0))
         {
             foreach (var (inFile, fn, ancestors) in file.TestFns())
             {
@@ -966,15 +1173,31 @@ public sealed class CargoNewTests : INewTestStrategy
             }
             var outermost = units.Where(u => !file.ItemsAt(u.Start).TakeWhile(i => !ReferenceEquals(i, u)).Any(units.Contains)).OrderByDescending(u => u.Start).ToList();
             var text = new StringBuilder(file.Text);
+            var described = new List<string>();
             foreach (var unit in outermost)
             {
+                var line = file.Text.AsSpan(0, unit.Start).Count('\n') + 1;
+                var leaves = unit.Kind == RustItem.Use ? RustSource.UseLeaves(file.TextOf(unit)) : [];
                 text.Remove(unit.Start, unit.End - unit.Start);
+                if (imports.TryGetValue(unit, out var hits) && hits.Count < leaves.Count)
+                {
+                    // The imports the error does not lie in stay, each as its own statement.
+                    text.Insert(unit.Start, string.Join('\n', leaves.Where((_, n) => !hits.Contains(n)).Select(l => l.Statement)));
+                    described.AddRange(leaves.Where((_, n) => hits.Contains(n)).Select(l => $"{path}:{line} {l.Statement}").Reverse());
+                }
+                else
+                {
+                    described.Add($"{path}:{line} {Describe(file, unit)}");
+                }
             }
-            removed.AddRange(outermost.AsEnumerable().Reverse().Select(u => $"{path}:{file.Text.AsSpan(0, u.Start).Count('\n') + 1} {Describe(file, u)}"));
+            removed.AddRange(described.AsEnumerable().Reverse());
             replacements[path] = text.ToString();
         }
         return new BuildFailure(tests.Where(notBuilt.Contains).ToList(), unattributable, unremovable, removed, replacements);
     }
+
+    /// <summary>rustc's code for a name two imports both give (an ambiguity, e.g. the base's glob import and one the overlay added).</summary>
+    private const string Ambiguous = "E0659";
 
     private static string Describe(RustFile file, RustItem item) => item.Kind switch
     {

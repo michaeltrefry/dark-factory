@@ -1,5 +1,4 @@
 using System.Text;
-using System.Text.RegularExpressions;
 
 namespace DarkFactory.Orchestrator.Gate;
 
@@ -9,15 +8,23 @@ public sealed record RustAttribute(string Path, string Text)
     /// <summary>The path's last segment (<c>test</c> of <c>tokio::test</c>).</summary>
     public string Name => Path[(Path.LastIndexOf(':') + 1)..];
 
-    private static readonly Regex Test = new(@"(?<![A-Za-z0-9_])test(?![A-Za-z0-9_])", RegexOptions.CultureInvariant);
-    private static readonly Regex Not = new(@"(?<![A-Za-z0-9_])not(?![A-Za-z0-9_])", RegexOptions.CultureInvariant);
-
     /// <summary>
-    /// A <c>cfg</c> that names <c>test</c> (<c>cfg(test)</c>, <c>cfg(all(test, …))</c>) and no <c>not</c>: the item is
-    /// compiled only into test builds. One with a <c>not</c> is read as production code (the stricter reading: it is never
-    /// applied to the base as test code).
+    /// A <c>cfg</c> whose predicate holds only in test builds, evaluated (never searched for the word): <c>test</c>;
+    /// <c>all(…)</c> with an operand that is test-only; <c>any(…)</c> whose operands are all test-only. <c>not(…)</c> and
+    /// every other predicate are not: <c>cfg(all(test, not(miri)))</c> is test-only, <c>cfg(any(test, feature = "x"))</c>
+    /// and <c>cfg(not(test))</c> are production code.
     /// </summary>
-    public bool IsCfgTest => Path == "cfg" && Test.IsMatch(Text) && !Not.IsMatch(Text);
+    public bool IsCfgTest => Path == "cfg" && RustSource.IsTestOnlyCfg(Text);
+}
+
+/// <summary>One import of a <c>use</c> item (<see cref="RustSource.UseLeaves"/>).</summary>
+public sealed record RustUseLeaf(string Statement, string Key, IReadOnlyList<(int Start, int End)> Spans)
+{
+    /// <summary>The name the import binds in its module (<c>b</c> of <c>a::b</c>, <c>c</c> of <c>a::b as c</c>, <c>a</c> of <c>a::{self}</c>); null for a glob, <c>as _</c> and an <c>extern crate</c>.</summary>
+    public string? Name { get; init; }
+
+    /// <summary>Whether a position inside the item's text lies in one of this import's tokens.</summary>
+    public bool Holds(int position) => Spans.Any(s => s.Start <= position && position < s.End);
 }
 
 /// <summary>
@@ -26,17 +33,20 @@ public sealed record RustAttribute(string Path, string Text)
 /// first attribute) to <see cref="End"/> is its text; an inline module's or a braced macro's body is between
 /// <see cref="BodyOpen"/> and <see cref="BodyClose"/> (the positions of its braces; -1 for <c>mod x;</c>) and holds
 /// <see cref="Items"/>. <see cref="ParameterAttributes"/> are the attributes on a function's parameters (rstest's
-/// <c>#[case]</c>, <c>#[values(…)]</c>).
+/// <c>#[case]</c>, <c>#[values(…)]</c>). An <c>extern crate x;</c> is a <c>use</c> too (an import).
 /// </summary>
 public sealed record RustItem(string Kind, string? Name, int Start, int End, int BodyOpen, int BodyClose,
     IReadOnlyList<RustAttribute> Attributes, IReadOnlyList<RustAttribute> ParameterAttributes, IReadOnlyList<RustItem> Items)
 {
     public const string Mod = "mod", Fn = "fn", Use = "use", Macro = "macro", Other = "item";
 
+    /// <summary>An inline module's inner attributes (<c>mod tests { #![cfg(test)] … }</c>).</summary>
+    public IReadOnlyList<RustAttribute> InnerAttributes { get; init; } = [];
+
     public bool IsInlineMod => Kind == Mod && BodyOpen >= 0;
 
-    /// <summary>Compiled only into test builds (<see cref="RustAttribute.IsCfgTest"/>).</summary>
-    public bool IsGated => Attributes.Any(a => a.IsCfgTest);
+    /// <summary>Compiled only into test builds (<see cref="RustAttribute.IsCfgTest"/>, on the item or as an inline module's inner attribute).</summary>
+    public bool IsGated => Attributes.Any(a => a.IsCfgTest) || InnerAttributes.Any(a => a.IsCfgTest);
 
     /// <summary>
     /// Attributes that make a function a test libtest runs: <c>#[test]</c> under any path (<c>tokio::test</c>,
@@ -156,6 +166,168 @@ public static class RustSource
     {
         var tokens = Lex(text);
         return string.Join(' ', tokens.Select(t => text[t.Start..t.End]));
+    }
+
+    /// <summary>Whether a <c>cfg(…)</c> attribute's text (<see cref="RustAttribute.Text"/>) holds only in test builds (<see cref="RustAttribute.IsCfgTest"/>).</summary>
+    public static bool IsTestOnlyCfg(string attribute)
+    {
+        List<Token> tokens;
+        try
+        {
+            tokens = Lex(attribute);
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+        string Word(int i) => attribute[tokens[i].Start..tokens[i].End];
+        var close = Pairs(tokens);
+        if (close is null || tokens.Count < 4 || Word(0) != "cfg" || Word(1) != "(" || close[1] != tokens.Count - 1)
+        {
+            return false;
+        }
+        // One predicate, the tokens from..to: a word, a word = "value", or all/any/not ( operands ).
+        bool TestOnly(int from, int to)
+        {
+            if (to - from == 1)
+            {
+                return tokens[from].Kind == Kind.Ident && Word(from) == "test";
+            }
+            if (to - from < 3 || tokens[from].Kind != Kind.Ident || Word(from + 1) != "(" || close[from + 1] != to - 1)
+            {
+                return false;
+            }
+            var operands = new List<bool>();
+            for (var start = from + 2; start < to - 1;)
+            {
+                var end = start;
+                while (end < to - 1 && Word(end) != ",")
+                {
+                    end = tokens[end].Kind == Kind.Open ? close[end] + 1 : end + 1;
+                }
+                if (end > start)
+                {
+                    operands.Add(TestOnly(start, end));
+                }
+                start = end + 1;
+            }
+            return Word(from) switch
+            {
+                "all" => operands.Any(o => o),
+                "any" => operands.Count > 0 && operands.All(o => o),
+                _ => false,
+            };
+        }
+        return TestOnly(2, tokens.Count - 1);
+    }
+
+    /// <summary>For each opening delimiter's token its closing token, or null when the delimiters do not balance.</summary>
+    private static Dictionary<int, int>? Pairs(List<Token> tokens)
+    {
+        var close = new Dictionary<int, int>();
+        var open = new Stack<int>();
+        for (var i = 0; i < tokens.Count; i++)
+        {
+            if (tokens[i].Kind == Kind.Open)
+            {
+                open.Push(i);
+            }
+            else if (tokens[i].Kind == Kind.Close)
+            {
+                if (open.Count == 0)
+                {
+                    return null;
+                }
+                close[open.Pop()] = i;
+            }
+        }
+        return open.Count == 0 ? close : null;
+    }
+
+    /// <summary>
+    /// The single imports of a <c>use</c> item's text (<see cref="RustFile.TextOf"/>), its tree flattened:
+    /// <c>pub use a::{b, c::{d as e, *}};</c> is <c>pub use a::b;</c>, <c>pub use a::c::d as e;</c> and
+    /// <c>pub use a::c::*;</c> — so that one import that does not resolve can be left out without the others. Each leaf
+    /// has its own statement (the item's attributes and visibility kept), its key (the path and alias alone) and the
+    /// spans, relative to the item's text, of the tokens it is made of (a prefix shared by several leaves is in each).
+    /// An <c>extern crate</c>, and a tree this reader does not follow, is one leaf: the item as written.
+    /// </summary>
+    public static IReadOnlyList<RustUseLeaf> UseLeaves(string item)
+    {
+        var tokens = Lex(item);
+        string Word(int i) => item[tokens[i].Start..tokens[i].End];
+        var whole = new RustUseLeaf(item.Trim(), Normalize(item), [(0, item.Length)]);
+        var close = Pairs(tokens);
+        var at = 0;
+        while (close is not null && at + 1 < tokens.Count && Word(at) == "#" && Word(at + 1) == "[")
+        {
+            at = close[at + 1] + 1;
+        }
+        if (close is not null && at < tokens.Count && Word(at) == "pub")
+        {
+            at = at + 1 < tokens.Count && Word(at + 1) == "(" ? close[at + 1] + 1 : at + 1;
+        }
+        if (close is null || at >= tokens.Count || Word(at) != "use" || Word(tokens.Count - 1) != ";")
+        {
+            return [whole];
+        }
+        var header = item[..tokens[at].End].Trim();
+        string Path(IEnumerable<int> path)
+        {
+            var text = new StringBuilder();
+            var word = false;
+            foreach (var t in path)
+            {
+                var isWord = tokens[t].Kind is Kind.Ident or Kind.Literal;
+                text.Append(word && isWord ? " " : "").Append(Word(t));
+                word = isWord;
+            }
+            return text.ToString();
+        }
+        var leaves = new List<RustUseLeaf>();
+        var followed = true;
+        void Expand(List<int> prefix, int from, int to)
+        {
+            var group = from;
+            while (group < to && tokens[group].Kind != Kind.Open)
+            {
+                group++;
+            }
+            if (group == to)
+            {
+                if (from == to)
+                {
+                    return;
+                }
+                var own = Enumerable.Range(from, to - from).ToList();
+                // `a::{self as b}`: the prefix itself, which only the braced form imports under that name.
+                var path = Word(from) == "self" && prefix.Count > 0 ? $"{Path(prefix)}{{{Path(own)}}}" : Path(prefix.Concat(own));
+                var last = Word(to - 1);
+                var name = last is "*" or "_" ? null
+                    : own.Count == 1 && last == "self" ? prefix.Where(t => tokens[t].Kind is Kind.Ident or Kind.Literal).Select(Word).LastOrDefault()
+                    : last;
+                leaves.Add(new RustUseLeaf($"{header} {path};", path, prefix.Concat(own).Select(t => (tokens[t].Start, tokens[t].End)).ToList()) { Name = name });
+                return;
+            }
+            if (Word(group) != "{" || close[group] != to - 1)
+            {
+                followed = false;
+                return;
+            }
+            var inner = prefix.Concat(Enumerable.Range(from, group - from)).ToList();
+            for (var start = group + 1; start < to - 1;)
+            {
+                var end = start;
+                while (end < to - 1 && Word(end) != ",")
+                {
+                    end = tokens[end].Kind == Kind.Open ? close[end] + 1 : end + 1;
+                }
+                Expand(inner, start, end);
+                start = end + 1;
+            }
+        }
+        Expand([], at + 1, tokens.Count - 1);
+        return followed && leaves.Count > 0 ? leaves : [whole];
     }
 
     private static bool IsIdentStart(char c) => c == '_' || char.IsLetter(c);
@@ -529,9 +701,10 @@ public static class RustSource
                 {
                     var open = i + 2;
                     var inside = open + 1;
-                    var items = Items(ref inside, _close[open], null);
+                    var inner = new List<RustAttribute>();
+                    var items = Items(ref inside, _close[open], inner);
                     i = _close[open] + 1;
-                    return Make(RustItem.Mod, name, i, open, items);
+                    return Make(RustItem.Mod, name, i, open, items) with { InnerAttributes = inner };
                 }
                 case "fn" when Name(i + 1) is { } name:
                 {
@@ -553,8 +726,11 @@ public static class RustSource
                     return Make(RustItem.Fn, name, i, parameters: parameters);
                 }
                 case "use" or "type" or "static" or "const" or "extern":
+                {
+                    var import = keyword == "use" || (keyword == "extern" && IsIdent(i + 1, "crate"));
                     i = Math.Min(Find(i + 1, end, t => Is(t, ';')) + 1, end);
-                    return Make(keyword == "use" ? RustItem.Use : RustItem.Other, null, i);
+                    return Make(import ? RustItem.Use : RustItem.Other, null, i);
+                }
                 case "struct" or "union" or "enum" or "trait" or "impl":
                 {
                     var name = Name(i + 1);

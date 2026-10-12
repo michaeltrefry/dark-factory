@@ -211,7 +211,13 @@ public sealed record BuildFailure(
     IReadOnlyList<string> Unattributable,
     IReadOnlyList<string> Unremovable,
     IReadOnlyList<string> Removed,
-    IReadOnlyDictionary<string, string> Replacements);
+    IReadOnlyDictionary<string, string> Replacements)
+{
+    /// <summary>This failure and a later retry's (<see cref="INewTestStrategy.BaseRetries"/>) as one: everything either found.</summary>
+    public BuildFailure With(BuildFailure later) => new(
+        NotBuilt.Concat(later.NotBuilt).Distinct(StringComparer.Ordinal).ToList(), [.. Unattributable, .. later.Unattributable], [.. Unremovable, .. later.Unremovable],
+        [.. Removed, .. later.Removed], later.Replacements);
+}
 
 /// <summary>
 /// The base side of one stack's check: the base run (<see cref="Run"/>), and when it did not build, its
@@ -242,6 +248,13 @@ public interface INewTestStrategy
 
     /// <summary>The build-error logs a run's build steps leave under its <see cref="TestRunSpec.ResultsDirectory"/>.</summary>
     string BuildLogPattern { get; }
+
+    /// <summary>
+    /// How many times a base that does not build with the PR's test files is retried, each time without what did not
+    /// compile in the run before (1 unless the stack's compiler reports its errors in stages, so that leaving one out
+    /// uncovers the next: rustc names an import that does not resolve before the uses of it).
+    /// </summary>
+    int BaseRetries => 1;
 
     Task<NewTestSet> IdentifyAsync(TestSource source, IReadOnlyList<ChangedFile> changes, CancellationToken ct);
 
@@ -359,9 +372,9 @@ public sealed record NewTestsResult(
 /// must fail on the base and pass on the head. A new test that already passes on the base checks nothing, and one skipped
 /// there proves nothing: rejected, naming it. A base that does not build with the PR's test files is evidence only for the
 /// new tests a compiler error lies in (<see cref="BuildFailure"/>: those cannot pass there, so they count as failing);
-/// the others get a real result from one retry of the base without every member that did not compile, and any the retry
-/// cannot run either stay unproven (rejected, named) — so no test that passes on the base hides behind another's compile
-/// error. A PR that adds no test fails the check (it is required only where a tier lists it: normal and protected by the
+/// the others get a real result from a retry of the base without every member that did not compile (one retry, or as
+/// many as the stack's compiler has stages, <see cref="INewTestStrategy.BaseRetries"/>), and any the last retry cannot run
+/// either stay unproven (rejected, named) — so no test that passes on the base hides behind another's compile error. A PR that adds no test fails the check (it is required only where a tier lists it: normal and protected by the
 /// floor); one whose tests no strategy can run (another stack, or new data rows on an existing theory) fails as
 /// unsupported (E2).
 /// </summary>
@@ -444,27 +457,37 @@ public static class NewTestsCheck
                         applied[path] = text;
                     }
                 }
-                var first = strategy.ExplainBuildFailure(set, applied, baseRun.BuildErrors, set.Tests);
-                evidence = evidence with { First = first };
-                var remaining = set.Tests.Except(first.NotBuilt, StringComparer.Ordinal).ToList();
-                if (first.Unattributable.Count == 0 && first.Unremovable.Count == 0 && remaining.Count > 0 && first.Replacements.Count > 0)
+                var failure = strategy.ExplainBuildFailure(set, applied, baseRun.BuildErrors, set.Tests);
+                evidence = evidence with { First = failure };
+                var remaining = set.Tests.Except(failure.NotBuilt, StringComparer.Ordinal).ToList();
+                var stripped = new Dictionary<string, string>(applied, StringComparer.Ordinal);
+                var rewritten = set.BaseReplacements.Keys.ToHashSet(StringComparer.Ordinal);
+                for (var attempt = 1; attempt <= Math.Max(strategy.BaseRetries, 1) && failure.Unattributable.Count == 0 && failure.Unremovable.Count == 0
+                    && remaining.Count > 0 && failure.Replacements.Count > 0; attempt++)
                 {
-                    log?.Invoke($"{strategy.Name}: the base does not build with the PR's test files; retrying it without {string.Join(", ", first.Removed)}");
-                    var stripped = new Dictionary<string, string>(applied, StringComparer.Ordinal);
-                    foreach (var (path, text) in first.Replacements)
+                    log?.Invoke($"{strategy.Name}: the base does not build with the PR's test files; retrying it without {string.Join(", ", failure.Removed)}");
+                    foreach (var (path, text) in failure.Replacements)
                     {
                         stripped[path] = text;
+                        rewritten.Add(path);
+                    }
+                    if (evidence.RetryFailure is { } earlier)
+                    {
+                        // A further retry: what the one before it found is kept with the base run's.
+                        evidence = evidence with { First = evidence.First!.With(earlier), RetryFailure = null };
                     }
                     // The retry's files: the base run's replacements, and over them the files without what did not compile.
-                    var replaced = set.BaseReplacements.Keys.Concat(first.Replacements.Keys).Distinct(StringComparer.Ordinal)
-                        .ToDictionary(p => p, p => stripped[p], StringComparer.Ordinal);
-                    var retrySpec = await Spec($"{runName}-base-retry", baseSha, headSha, remaining) with { Replacements = replaced };
+                    var replaced = rewritten.ToDictionary(p => p, p => stripped[p], StringComparer.Ordinal);
+                    var retrySpec = await Spec($"{runName}-base-retry{(attempt == 1 ? "" : $"-{attempt}")}", baseSha, headSha, remaining) with { Replacements = replaced };
                     var retry = await runner.RunAsync(repo, retrySpec, ct);
                     evidence = evidence with { Retry = retry };
-                    if (retry.Status == TestRunStatus.BuildFailed)
+                    if (retry.Status != TestRunStatus.BuildFailed)
                     {
-                        evidence = evidence with { RetryFailure = strategy.ExplainBuildFailure(set, stripped, retry.BuildErrors, remaining) };
+                        break;
                     }
+                    failure = strategy.ExplainBuildFailure(set, stripped, retry.BuildErrors, remaining);
+                    evidence = evidence with { RetryFailure = failure };
+                    remaining = remaining.Except(failure.NotBuilt, StringComparer.Ordinal).ToList();
                 }
             }
             results.Add(Judge(baseSha, headSha, strategy.Name, set.Tests, evidence, headRun));

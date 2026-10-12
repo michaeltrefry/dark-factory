@@ -364,6 +364,20 @@ cargo is installed (`CargoRunnerTests.With_cargo_a_new_package_is_applied_to_the
 `…a_new_inline_test_calling_code_the_pull_request_adds_does_not_build_on_the_base…`, `…in_a_workspace_below_the_repository_root…`
 and `…a_base_whose_other_tests_do_not_build_is_an_error_not_evidence`.
 
+A test that passes on the real base must never count as failing there (the review of sc-25875 reproduced five such false
+passes; the rule is in CLAUDE.md: `not-built` only for what the base lacks). With cargo installed these run too, each on real
+crates: `…a_new_module_file_keeps_its_imports_so_tests_of_old_code_in_it_pass_on_the_base_and_are_named` (a new `src/extra.rs`
+with `use crate::add;`: both tests of old code `rejected`, the test of the new module's own function still `not-built`),
+`…tests_that_exercise_only_code_the_base_has_pass_there_in_every_module_shape` (`#[cfg(all(test, not(miri)))]` modules old and
+new, `mod tests { #![cfg(test)] }`, a file-level `use` the PR adds, helpers of the test module, a `macro_rules!` macro and a
+derived type of the parent, `mod tests;` in its own file, a `pub(crate) use` re-export, a `#[cfg(test)] use`, an import spelt
+another way, an integration test of old API: every one `passed` on the base at the first build, the check `rejected`),
+`…one_import_that_does_not_resolve_on_the_base_hides_neither_a_test_of_old_code_nor_a_real_failure` and
+`…an_import_of_new_code_in_a_file_the_base_has_is_left_out_and_the_tests_beside_it_get_their_real_results` (the retries).
+`unsupported`, decided before any run (`CargoIdentifyTests`): a test function outside every `#[cfg(test)]` module that is new
+or changed (top of a production file, a production module, a module gated by `cfg(any(test, …))`), a new `#[cfg(test)]`
+`use`/`impl` outside one, cfg alternates of one name, a renamed production file with new tests.
+
 ### AT5 — freeze and stuck
 
 Automated: `FreezeAndStuckTests`. The freeze tests write only the throwaway ledger; their story is never claimed (it stays To Do
