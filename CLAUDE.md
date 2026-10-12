@@ -817,9 +817,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   neither commit is unreadable. Each answer is reused within one wait while the ready overlay's base is its index commit
   (`HotspotCache`, keyed by `indexCommitSha` — the commit the lookup names). The reader stops at the first input it cannot read. "The hotspot score" is CodeGraph's `riskScore`. The blast
   radius has a code floor (`GatePolicy.BlastRadiusFloor` =
-  high: a critical file always fails; seam `policy-floor:blast-radius`), `max_blast_radius` can only lower it. CodeGraph rates a
-  file critical only for a depth-1 dependent in another repo or a message consumer (`CONSUMES`, built only for repos in its
-  `TrustedDotnetRepositories`); in-repo callers rate high at most, so in practice the floor fires on cross-repo dependents and
+  high: a critical file always fails; seam `policy-floor:blast-radius`), `max_blast_radius` can only lower it. CodeGraph rates a file critical only for a non-test dependent in another repo (depth 1, or depth 2 over a message edge) or a non-test depth-1 message consumer (`CONSUMES`, built only for repos in its `TrustedDotnetRepositories`); in-repo callers rate high at most, so in practice the floor fires on cross-repo dependents and
   consumers (docs/acceptance.md, P3-AT4a); hotspots have no
   floor — recorded and reported, failing only above an opted-in `max_hotspot`. A file CodeGraph has no data for (`found: false`,
   e.g. a new file) counts as blast radius none / hotspot 0; a file read over a limit blocks at once, even when another could not be

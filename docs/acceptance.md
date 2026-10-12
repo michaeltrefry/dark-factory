@@ -424,8 +424,7 @@ waits then blocks).
 
 **Seeding a critical file (P3-AT4a).** CodeGraph's per-file `blastRadius` is the worst risk level among the nodes that depend on
 it. Inside one repo an ordinary depth-1 caller rates `high` at most, however many callers there are, so "a helper everything calls"
-never reaches `critical`. `critical` comes only from a depth-1 dependent in another repo (HTTP, package or consumer edges) or a
-non-test depth-1 class reached over a `CONSUMES` edge — which CodeGraph's C# extractor creates only for a class implementing
+never reaches `critical`. `critical` needs another repo or a message edge: a non-test depth-1 dependent in another repo, a non-test depth-2 cross-repo dependent over a `CONSUMES`/`PUBLISHES` edge, or (the only in-repo way) a non-test depth-1 class reached over a `CONSUMES` edge — which CodeGraph's C# extractor creates only for a class implementing
 `IConsumer<T>`/`Consumer<T>`, and only in a repo listed in CodeGraph's `TrustedDotnetRepositories` (production: the GitHub Actions
 variable `CODEGRAPH_TRUSTED_DOTNET_REPOSITORIES` on CodeGraph's `production` environment, an entry like
 `github:https://github.com/michaeltrefry/dark-factory-sandbox`; a trusted repo is restored and built with MSBuild + Roslyn on
