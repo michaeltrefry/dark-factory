@@ -318,20 +318,25 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   systems; `PlannerCrossRepoProxyTests` pins the reviewers', the triage's and the planner's lists and that none holds one). The
   reviewers' list (`ReviewTools.Names`) and `McpProfile.Triage` are unchanged, and no other profile holds a cross-repository tool.
   Their arguments are rebuilt by `PlannerCodeGraph.Arguments` (unknown ones dropped, strings cut at 300, depth 1–5, page 1–1000,
-  page size 1–100, paths `RepoPath`-normalised, never a `sha`: the default branch) and the project set by the proxy (as `repo` for
+  page size 1–100, paths `RepoPath`-normalised and at most `MaxPathChars` (1,000; a longer one is a usage error), never a `sha`: the default branch) and the project set by the proxy (as `repo` for
   the two per-file tools, CodeGraph's own name for it). `search_projects`, `get_service_clusters` and `get_cluster_detail`
   (`PlannerCodeGraph.Global`) are not about one project: they are sent with no project, labelled "CodeGraph's <tool>, across every
   project it indexes (default branches)", and their answers name every indexed project, private ones outside the plan's set
   included. Residual, accepted (the owner's Phase 3 rule): the planner reads the owner's own plan story and its output goes only to
   the owner's board; triage, driven by untrusted issue text and posting on the issue, never gets a cross-project answer.
+  Residual, accepted: "no stored model text" for `get_service_clusters`/`get_cluster_detail` depends on CodeGraph never writing
+  `repo_clusters.cluster_label` (its handlers print `cluster.Label ?? "Cluster N"`); checked at CodeGraph f95d231, and to be
+  re-checked — the two tools dropped if the label becomes model text — when CodeGraph gains a cluster labeller.
   Multi-repository grant: `McpProxy.Grant(repos, McpProfile.Planner)` pins CodeGraph to a set of repositories (any other profile
   with more than one is refused; duplicates, case-insensitively, collapse), each project resolved by exact repo URL match, once per
   session. With more than one repository every tool about one project lists a required `repo` argument (an enum of the set's
   `owner/name` values) and a call must name its repository — by `repo` (case-insensitive) or by a `project` that is exactly one of
   the set's CodeGraph projects; naming another repository or project, two that disagree, or none is refused with JSON-RPC -32602,
   nothing forwarded (the selector itself is never forwarded). `read_node_source` takes no `repo` and is shown only for a node of a
-  project of the set. With one repository nothing changed (no `repo` argument is listed, a `repo` sent anyway is dropped like any
-  unknown argument, the descriptions and labels are the same): triage's grant behaves as before. The call cap, the answer cap and
+  project of the set. With one repository nothing changed (no `repo` argument is listed and a `repo` sent anyway is dropped like any
+  unknown argument — except on `analyze_impact_file`/`file_hotspot`, where `repo` is CodeGraph's own project argument: there one
+  naming anything but the grant's repository (`owner/name`, case-insensitive) or its pinned project (exact), or not a string, is
+  refused -32602 with nothing forwarded, like another `project`; the descriptions and labels are the same): triage's grant behaves as before. The call cap, the answer cap and
   the commit label are per grant and per answer as before; the tool descriptions and the planner prompt (`PlanPrompt.McpNote`) say
   how to name a repository and which tools are not about one. The intake reads and writes the issue board only through the issue source's
   `IIssueIntakeSource` capability (E6): triage comment and route label, issues, comments, permissions and gate policy. The orchestrator — not
@@ -489,7 +494,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   an unsandboxed implementer — but as the owner, so its read-only confinement is then only Claude Code's own (`dontAsk`, the
   `ReadRule`, the denied tools): no `_factory` user and no ACL stand between it and the owner's files, and nothing is swept.
   Repository set (sc-25874): a plan item may name several repositories, one `Repo: owner/name` line each
-  (`RepoResolver.ResolveAll`: in order, repeats dropped; `RunPipeline.PlanRepositories`). The first stays the item's primary
+  (`RepoResolver.ResolveAll`: in order, repeats dropped, lines inside a ``` or ~~~ fence not read — a planner-created story
+  carries planner text in a tilde fence, which must not widen a later planner's set; `RunPipeline.PlanRepositories`). The first stays the item's primary
   repository — the ledger's `Repo`, the `Repo:` line of every created story, what the rest of the pipeline uses; non-plan items
   still read only the first line. With one line or none the planner is seated exactly as above. With several, each must be one of
   the factory's configured repositories (`FactoryOptions.ConfiguredRepos`: `Factory:DefaultRepo` and `GitHub:Watch:Repos`, passed

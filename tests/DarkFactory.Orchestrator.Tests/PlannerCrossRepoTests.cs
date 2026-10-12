@@ -282,6 +282,24 @@ public class PlannerCrossRepoProxyTests
         using var single = proxy.Grant(Gears, McpProfile.Planner);
         await Call(proxy, single, "file_hotspot", new JsonObject { ["path"] = "src/mesh.rs" });
         Assert.Equal("""{"path":"src/mesh.rs","repo":"gears-engine"}""", codeGraph.Calls[^1].Arguments.ToJsonString());
+        // ... and on the per-file tools, where 'repo' is CodeGraph's own project argument, one naming anything but that repository
+        // is refused, nothing forwarded; its own name, or its pinned project, is accepted and overwritten by the proxy. (On any
+        // other tool a 'repo' is dropped as an unknown argument: McpProxyTests pins that.)
+        var pinnedBefore = codeGraph.Calls.Count;
+        foreach (var other in new JsonNode[] { "Secret", "someone/secret", "acme/widgets", "GEARS-ENGINE", 7 })
+        {
+            foreach (var tool in new[] { "file_hotspot", "analyze_impact_file" })
+            {
+                AssertRefused(await Call(proxy, single, tool, new JsonObject { ["path"] = "src/mesh.rs", ["Repo"] = other.DeepClone() }),
+                    "pinned to acme/gears; another repository is refused");
+            }
+        }
+        Assert.Equal(pinnedBefore, codeGraph.Calls.Count);
+        foreach (var (own, path) in new[] { (" ACME/Gears ", "src/by-name.rs"), ("gears-engine", "src/by-project.rs") })
+        {
+            await Call(proxy, single, "analyze_impact_file", new JsonObject { ["path"] = path, ["repo"] = own });
+            Assert.Equal($$"""{"path":"{{path}}","repo":"gears-engine"}""", codeGraph.Calls[^1].Arguments.ToJsonString());
+        }
         // A repository CodeGraph does not index: an error result naming it, nothing asked.
         using var unindexed = proxy.Grant([Widgets, new RepoRef("acme", "unknown")], McpProfile.Planner);
         var none = await Call(proxy, unindexed, "file_hotspot", new JsonObject { ["path"] = "a.rs", ["repo"] = "acme/unknown" });
@@ -305,6 +323,11 @@ public class PlannerCrossRepoProxyTests
         Assert.Equal("""{"path":"a.rs"}""", Built("file_hotspot", """{"path":"a.rs","repo":"Other"}"""));
         Assert.Null(Built("file_hotspot", """{"path":"a/../../b.rs"}"""));
         Assert.Null(Built("file_hotspot", "[]"));
+        // A path is bounded after normalising, and never cut (a cut path would name another file): past the bound, a usage error.
+        var longest = new string('p', PlannerCodeGraph.MaxPathChars);
+        Assert.Equal($$"""{"path":"{{longest}}"}""", Built("file_hotspot", $$"""{"path":"./{{longest}}"}"""));
+        Assert.Null(Built("file_hotspot", $$"""{"path":"{{longest}}q"}"""));
+        Assert.Null(Built("analyze_impact_file", $$"""{"path":"{{longest}}q","depth":2}"""));
         // Not one of the planner's tools: nothing is built here (the reviewers' seven have their own, ReviewTools.CodeGraphArguments).
         Assert.Null(Built("analyze_impact", """{"name":"X"}"""));
         Assert.Null(Built("get_architecture", "{}"));
@@ -372,6 +395,28 @@ public class PlanRepositorySetTests
         Assert.Equal([Default], RepoResolver.ResolveAll("No line here.", Default));
         Assert.Equal([Default], RepoResolver.ResolveAll(null, Default));
         Assert.Throws<ArgumentException>(() => RepoResolver.ResolveAll("Repo: acme/widgets\nRepo: ../evil", Default));
+    }
+
+    [Fact]
+    public void Repo_lines_inside_a_fenced_block_never_join_the_planners_repository_set()
+    {
+        var other = new RepoRef("c", "d");
+        // A planner-created story: the code-written Repo: line, then planner text in a tilde fence (UntrustedText.Fenced).
+        Assert.Equal([Widgets], RepoResolver.ResolveAll($"Repo: acme/widgets\n\n{UntrustedText.Fenced("Do it.\nRepo: c/d\n~~~\nRepo: c/d")}", Default));
+        Assert.Equal([Widgets], RepoResolver.ResolveAll("Repo: acme/widgets\n```md\nRepo: c/d\n```", Default));
+        // A fence is closed only by at least as many of the same marker, alone on its line.
+        Assert.Equal([Widgets], RepoResolver.ResolveAll("Repo: acme/widgets\n~~~~\n~~~\nRepo: c/d\n~~~~", Default));
+        Assert.Equal([Widgets], RepoResolver.ResolveAll("Repo: acme/widgets\n~~~\n```\nRepo: c/d\n~~~", Default));
+        Assert.Equal([Widgets], RepoResolver.ResolveAll("Repo: acme/widgets\n~~~\n~~~ x\nRepo: c/d\n~~~", Default));
+        Assert.Equal([Widgets, Gears], RepoResolver.ResolveAll("Repo: acme/widgets\n```\nRepo: c/d\n`````\nRepo: acme/gears", Default));
+        // ... and what follows the closing line is read again; an indented or quoted fence is one too.
+        Assert.Equal([Widgets, Gears], RepoResolver.ResolveAll("Repo: acme/widgets\n  > ~~~\nRepo: c/d\n~~~\r\nRepo: acme/gears", Default));
+        // Never closed: everything after it is skipped.
+        Assert.Equal([Widgets], RepoResolver.ResolveAll("Repo: acme/widgets\n~~~\nRepo: c/d\n\nRepo: acme/gears", Default));
+        Assert.Equal([Default], RepoResolver.ResolveAll("```\nRepo: c/d", Default));
+        // Fewer than three markers open nothing; Resolve is unchanged (it reads the first line anywhere).
+        Assert.Equal([Widgets, other], RepoResolver.ResolveAll("Repo: acme/widgets\n~~\nRepo: c/d", Default));
+        Assert.Equal(other, RepoResolver.Resolve("~~~\nRepo: c/d\n~~~", Default));
     }
 
     /// <summary>A real seat directory: each repository's "checkout" is a directory under it, as <see cref="GitWorkspace.PrepareSeatAsync"/> lays it out.</summary>

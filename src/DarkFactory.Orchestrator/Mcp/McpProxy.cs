@@ -331,8 +331,8 @@ public sealed class McpProxy : IAsyncDisposable
             return Relayed(id, relayed.Text, relayed.IsError);
         }
         var codeGraph = _upstreams.CodeGraph!;
-        // Which of the grant's repositories the call is about. One repository: that one, and a call naming another project is
-        // refused. Several (a planner's, sc-25874): the one the call names, by 'repo' or by 'project'; naming any other is refused.
+        // Which of the grant's repositories the call is about. One repository: that one, and a call naming another project (by 'project',
+        // or by 'repo' where CodeGraph reads the project there) is refused. Several (a planner's, sc-25874): the one the call names, by 'repo' or by 'project'; naming any other is refused.
         var target = grant.Repo;
         if (grant.Repos.Count == 1)
         {
@@ -343,6 +343,14 @@ public sealed class McpProxy : IAsyncDisposable
                     && (pinned is null || value is not JsonValue p || !p.TryGetValue<string>(out var named) || named != pinned))
                 {
                     return Error(id, InvalidParams, $"Queries are pinned to {grant.Repo.FullName}'s CodeGraph project; another project is refused.");
+                }
+                // CodeGraph's per-file tools name the project in 'repo': there another one is refused like another 'project', not
+                // silently answered about the pinned one. For every other tool 'repo' is no CodeGraph argument and is dropped as before.
+                if (PlannerCodeGraph.ProjectInRepoArgument(tool) && string.Equals(key, PlannerCodeGraph.RepoArgument, StringComparison.OrdinalIgnoreCase)
+                    && (value is not JsonValue r || !r.TryGetValue<string>(out var repo)
+                        || !(string.Equals(repo.Trim(), grant.Repo.FullName, StringComparison.OrdinalIgnoreCase) || (pinned is not null && repo == pinned))))
+                {
+                    return Error(id, InvalidParams, $"Queries are pinned to {grant.Repo.FullName}; another repository is refused.");
                 }
             }
         }

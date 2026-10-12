@@ -37,7 +37,9 @@ public static class PlannerCodeGraph
     /// <item><c>get_service_clusters</c>, <c>get_cluster_detail</c>: <c>CommunityDetectionService</c> (<c>IGraphStore</c> + logger)
     /// reading the stored <c>repo_clusters</c> rows and the cross-repo edges. The clusters are computed by Louvain community
     /// detection and betweenness centrality over those edges (arithmetic, no model), and a cluster's label is never written by any
-    /// code on main (<c>DetectCommunitiesAsync</c> stores none), so the answer shows "Cluster N": no stored model text.</item>
+    /// code on main (<c>DetectCommunitiesAsync</c> stores none), so the answer shows "Cluster N": no stored model text. That holds only while nothing writes
+    /// <c>repo_clusters.cluster_label</c> (the handlers print <c>cluster.Label ?? "Cluster N"</c>): checked at CodeGraph f95d231, and to
+    /// be re-checked — these two tools dropped if the label becomes model text — when CodeGraph gains a cluster labeller.</item>
     /// <item><c>file_hotspot</c>: <c>store.GetFileMetricAsync</c> — one file's stored vitals (risk, concern, health, churn,
     /// complexity: numbers computed from git history and the parse) and the commit they describe.</item>
     /// </list>
@@ -100,6 +102,9 @@ public static class PlannerCodeGraph
         _ => null,
     };
 
+    /// <summary>The longest normalised <c>path</c> a per-file tool is sent; a longer one is a usage error (never cut: a cut path names another file).</summary>
+    public const int MaxPathChars = 1000;
+
     /// <summary>The largest <c>search_projects</c> page asked for.</summary>
     public const int MaxPage = 1000;
 
@@ -119,7 +124,8 @@ public static class PlannerCodeGraph
                 : null;
         int? Number(string name, int min, int max) =>
             input.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var n) ? Math.Clamp(n, min, max) : null;
-        string? File() => input.TryGetProperty("path", out var v) && v.ValueKind == JsonValueKind.String ? RepoPath.Normalize(v.GetString()!) : null;
+        string? File() => input.TryGetProperty("path", out var v) && v.ValueKind == JsonValueKind.String
+            && RepoPath.Normalize(v.GetString()!) is { Length: <= MaxPathChars } path ? path : null;
         JsonObject With(JsonObject o, string name, JsonNode? value)
         {
             if (value is not null)
