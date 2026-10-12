@@ -564,12 +564,65 @@ public class RouterReviewerTests
     {
         // The error arrives after a complete-looking findings line: the partial answer must not count.
         var events = SseAnswers.MessageStart("claude-opus-5-5") + SseAnswers.TextBlockStart(0) + SseAnswers.TextDelta(0, CleanFindings)
-            + SseAnswers.BlockStop(0) + SseAnswers.Error("api_error", "Internal server error") + SseAnswers.MessageDelta("end_turn") + SseAnswers.MessageStop;
-        var reviewer = new RouterReviewer(Router(events).Client("http://router.test/"), "rk");
+            + SseAnswers.BlockStop(0) + SseAnswers.Error("invalid_request_error", "Bad block") + SseAnswers.MessageDelta("end_turn") + SseAnswers.MessageStop;
+        var api = Router(events);
+        var reviewer = new RouterReviewer(api.Client("http://router.test/"), "rk", transientRetryDelay: TimeSpan.Zero);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => reviewer.ReviewAsync(Request, CancellationToken.None));
         Assert.Contains("failed mid-stream", ex.Message);
-        Assert.Contains("Internal server error", ex.Message);
+        Assert.Contains("Bad block", ex.Message);
+        Assert.Single(api.Requests); // not a transient type: never sent again
+    }
+
+    /// <summary>A router whose first <paramref name="failures"/> answers end in an <c>error</c> event of <paramref name="type"/>, then answer clean findings.</summary>
+    private static FakeApi FlakyRouter(string type, int failures)
+    {
+        var n = 0;
+        var broken = SseAnswers.MessageStart("claude-opus-5-5") + SseAnswers.TextBlockStart(0) + SseAnswers.TextDelta(0, "Partial")
+            + SseAnswers.Error(type, "The server had an error while processing your request.");
+        return new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(n++ < failures ? broken : SseAnswers.Answer(CleanFindings), modelClass: "high"));
+    }
+
+    [Theory]
+    [InlineData("server_error")]
+    [InlineData("api_error")]
+    public async Task A_transient_upstream_error_mid_stream_is_retried_with_the_same_request_and_recorded_on_the_turn(string type)
+    {
+        var api = FlakyRouter(type, failures: 1);
+        var reviewer = new RouterReviewer(api.Client("http://router.test/"), "rk", transientRetryDelay: TimeSpan.Zero);
+
+        var review = await reviewer.ReviewAsync(Request, CancellationToken.None);
+
+        Assert.True(review.Clean, review.Error);
+        Assert.Equal(2, api.Requests.Count);
+        // The same request: body, session id and class header.
+        Assert.Equal(api.Requests[0].Body, api.Requests[1].Body);
+        Assert.All(api.Requests, r => Assert.Equal((Request.Session, "high"), (r.Headers[RouterReviewer.SessionHeader], r.Headers[DarkFactory.Orchestrator.Router.ModelClass.Header])));
+        var turn = Assert.Single(review.Turns!);
+        Assert.Contains(type, Assert.Single(turn.Retried!));
+        Assert.Contains("\"retried\"", JsonSerializer.Serialize(turn));
+    }
+
+    [Fact]
+    public async Task A_transient_upstream_error_on_every_attempt_fails_the_call_as_before()
+    {
+        var api = FlakyRouter("server_error", failures: int.MaxValue);
+        var reviewer = new RouterReviewer(api.Client("http://router.test/"), "rk", transientRetryDelay: TimeSpan.Zero);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => reviewer.ReviewAsync(Request, CancellationToken.None));
+
+        Assert.Contains("failed mid-stream", ex.Message);
+        Assert.Equal(RouterReviewer.MaxTransientRetries + 1, api.Requests.Count);
+    }
+
+    [Fact]
+    public async Task A_usage_error_mid_stream_is_not_retried_and_still_pauses()
+    {
+        var api = FlakyRouter("overloaded_error", failures: 1);
+        var reviewer = new RouterReviewer(api.Client("http://router.test/"), "rk", transientRetryDelay: TimeSpan.Zero);
+
+        await Assert.ThrowsAsync<RouterUsageLimitedException>(() => reviewer.ReviewAsync(Request, CancellationToken.None));
+        Assert.Single(api.Requests);
     }
 
     [Fact]
@@ -672,7 +725,7 @@ public class RouterReviewerTests
 
         // Exactly one space after "data:" is stripped, a second one is the value's own.
         var error = await Assert.ThrowsAsync<InvalidOperationException>(() => MessageStream.ReadAsync(
-            new MemoryStream(System.Text.Encoding.UTF8.GetBytes("event: error\ndata:  {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"x\"}}\n\n")),
+            new MemoryStream(System.Text.Encoding.UTF8.GetBytes("event: error\ndata:  {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"x\"}}\n\n")),
             TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
         Assert.Contains("mid-stream:  {\"type\":\"error\"", error.Message);
     }

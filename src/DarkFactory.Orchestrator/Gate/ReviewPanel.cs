@@ -116,11 +116,14 @@ public sealed record ToolCall(
 /// <summary>
 /// One model turn of a panel session (E1): its number (1-based; the final-answer turn after the turn cap included) and the model and
 /// model class the router said served it. The session's last turn is also the review's or second opinion's own <c>served</c>/<c>class</c>.
+/// <see cref="Retried"/>: each earlier attempt of this turn that failed mid-stream with a transient upstream error and was sent again
+/// (sc-25710, <see cref="RouterReviewer.MaxTransientRetries"/>), its error as the stream gave it; null when the first attempt answered.
 /// </summary>
 public sealed record ServedTurn(
     [property: JsonPropertyName("turn")] int Turn,
     [property: JsonPropertyName("served")] string? ServedModel,
-    [property: JsonPropertyName("class")] string? ServedClass);
+    [property: JsonPropertyName("class")] string? ServedClass,
+    [property: JsonPropertyName("retried"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<string>? Retried = null);
 
 /// <summary>One finding of a panel role. <see cref="Downgraded"/>: it was blocking, and the second opinion did not confirm it.</summary>
 public sealed record Finding(

@@ -416,15 +416,15 @@ public class FactoryOptionsTests
             Assert.Contains("no Kanban token", log.ToString());
         }
         // With a token, the upstream asks Kanban:McpUrl with it.
-        var kanban = new FakeMcpServer("/kb/mcp", ["GetBoard", "CreateWorkItem"], (t, _) => FakeMcpServer.Text(t));
+        var kanban = new FakeMcpServer("/kb/mcp", ["get_board", "create_work_item"], (t, _) => FakeMcpServer.Text(t));
         var upstreams = FactoryRunner.CreateUpstreams(Options(new() { ["Kanban:Token"] = "kb_config" }), http,
             kanban.Client("https://kanban.test/kb/mcp"), TextWriter.Null);
         var upstream = Assert.IsType<Mcp.McpUpstream>(upstreams.Kanban);
         Assert.False(upstream.RepoScoped);
-        Assert.Equal(["GetBoard"], (await upstream.ListToolsAsync(CancellationToken.None)).Select(t => t.Name));
+        Assert.Equal(["get_board"], (await upstream.ListToolsAsync(CancellationToken.None)).Select(t => t.Name));
         Assert.All(kanban.Api.Requests, r => Assert.Equal("Bearer kb_config", r.Headers["Authorization"]));
         await Assert.ThrowsAsync<Mcp.ToolNotAllowedException>(() =>
-            upstream.CallAsync("CreateWorkItem", new System.Text.Json.Nodes.JsonObject(), CancellationToken.None));
+            upstream.CallAsync("create_work_item", new System.Text.Json.Nodes.JsonObject(), CancellationToken.None));
     }
 
     [Fact]

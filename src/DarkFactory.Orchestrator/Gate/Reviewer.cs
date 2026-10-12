@@ -38,6 +38,12 @@ public sealed record ConfirmRequest(WorkStory Story, string Repo, PullFacts Pull
 public sealed class RouterUsageLimitedException(string message) : Exception(message);
 
 /// <summary>
+/// A review turn's answer stream ended in an upstream's transient <c>error</c> event (<see cref="MessageStream.TransientErrorTypes"/>).
+/// An <see cref="InvalidOperationException"/>, so once the reviewer's retries are spent it fails the call exactly as any broken stream.
+/// </summary>
+public sealed class RouterTransientStreamException(string message) : InvalidOperationException(message);
+
+/// <summary>
 /// The router refused a review turn's request itself (400 or 413: for a later turn, most likely a conversation grown too long).
 /// On a session's first turn it is rethrown as a plain <see cref="InvalidOperationException"/>; on a later turn the answer is unusable.
 /// </summary>
@@ -82,8 +88,21 @@ public interface IReviewer
 /// (<see cref="MessageStream"/>): <c>Review:TimeoutMinutes</c> (the client's timeout) bounds the whole session, its turns and tool
 /// calls included, and a stream silent for the idle gap fails.
 /// </summary>
-public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? idleTimeout = null, ReviewTools? tools = null) : IReviewer
+public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? idleTimeout = null, ReviewTools? tools = null,
+    TimeSpan? transientRetryDelay = null) : IReviewer
 {
+    /// <summary>
+    /// A turn whose stream fails with a transient upstream error (<see cref="RouterTransientStreamException"/>) is sent again — the
+    /// same request, session id and class header — at most this many times, each failed attempt recorded on the turn
+    /// (<see cref="ServedTurn.Retried"/>); when every attempt fails, the call fails closed as before (sc-25710).
+    /// </summary>
+    public const int MaxTransientRetries = 2;
+
+    /// <summary>The wait before the first resend of a turn; the n-th resend waits n times it.</summary>
+    public static readonly TimeSpan DefaultTransientRetryDelay = TimeSpan.FromSeconds(2);
+
+    private readonly TimeSpan _transientRetryDelay = transientRetryDelay ?? DefaultTransientRetryDelay;
+
     /// <summary>The longest gap between two lines of an answer stream before the call fails as stalled.</summary>
     public static readonly TimeSpan DefaultIdleTimeout = TimeSpan.FromMinutes(2);
 
@@ -209,9 +228,10 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
                 var final = turn > MaxTurns;
                 StreamedAnswer answer;
                 string? servedClass;
+                IReadOnlyList<string>? retried;
                 try
                 {
-                    (answer, servedClass) = await TurnAsync(session, system, messages, definitions, final, deadline.Token);
+                    (answer, servedClass, retried) = await TurnWithRetriesAsync(session, system, messages, definitions, final, deadline.Token);
                 }
                 catch (RouterRefusedRequestException refused) when (turn > 1)
                 {
@@ -225,7 +245,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
                     // The first turn's refusal fails the call as any other refusal does, as before the tool loop.
                     throw new InvalidOperationException(refused.Message);
                 }
-                served.Add(new ServedTurn(turn, answer.Served, servedClass));
+                served.Add(new ServedTurn(turn, answer.Served, servedClass, retried));
                 if (ReviewModels.CallProblem(servedClass) is not null || answer.StopReason != "tool_use")
                 {
                     return new SessionEnd(answer.Served, servedClass, answer.StopReason, answer.Text, null, Calls(), final, Turns());
@@ -282,6 +302,34 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
             return new { type = AnswerBlock.ToolUse, id = block.Id, name = block.Name, input };
         }
         return string.IsNullOrEmpty(block.Text) ? null : new { type = AnswerBlock.TextType, text = block.Text };
+    }
+
+    /// <summary>
+    /// <see cref="TurnAsync"/>, sent again after a transient stream error up to <see cref="MaxTransientRetries"/> times (nothing of
+    /// the failed attempt is kept but its error). Every other failure, usage refusals included, is thrown at once as before.
+    /// </summary>
+    private async Task<(StreamedAnswer Answer, string? ServedClass, IReadOnlyList<string>? Retried)> TurnWithRetriesAsync(string session,
+        string system, List<object> messages, IReadOnlyList<object> definitions, bool final, CancellationToken deadline)
+    {
+        List<string>? failed = null;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                var (answer, servedClass) = await TurnAsync(session, system, messages, definitions, final, deadline);
+                return (answer, servedClass, failed);
+            }
+            catch (RouterTransientStreamException transient) when (attempt <= MaxTransientRetries)
+            {
+                (failed ??= []).Add(transient.Message);
+                await Task.Delay(_transientRetryDelay * attempt, deadline);
+            }
+            catch (RouterTransientStreamException transient)
+            {
+                throw new InvalidOperationException(
+                    $"{transient.Message} (attempt {attempt} of {MaxTransientRetries + 1}; every attempt failed with a transient upstream error)");
+            }
+        }
     }
 
     /// <summary>

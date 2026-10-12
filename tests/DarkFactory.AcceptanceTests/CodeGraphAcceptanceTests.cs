@@ -240,14 +240,22 @@ public class CodeGraphTriageTests
             var externalId = ItemNaming.GitHubIssue.Format(key);
             var item = await db.WorkItems.AsNoTracking().SingleAsync(i => i.Source == "github" && i.ExternalId == externalId, ct);
             var events = await db.SessionEvents.AsNoTracking().Where(e => e.WorkItemId == item.Id).OrderBy(e => e.Id).ToListAsync(ct);
-            var taints = await db.SessionTaints.AsNoTracking().Where(t => t.WorkItemId == item.Id).Select(t => t.Reason).ToListAsync(ct);
+            var taints = await db.SessionTaints.AsNoTracking().Where(t => t.WorkItemId == item.Id).ToListAsync(ct);
 
-            var used = events.Where(e => e.Type == "assistant").SelectMany(e => ToolUses(e.Payload)).Where(u => u.Name == SearchGraphRule).ToList();
+            var used = events.Where(e => e.Type == "assistant")
+                .SelectMany(e => ToolUses(e.Payload).Select(u => (u.Id, u.Name, e.WorkerSessionId)))
+                .Where(u => u.Name == SearchGraphRule).ToList();
             if (used.Count == 0)
             {
                 Assert.Fail($"INCONCLUSIVE: the triage session made no {SearchGraphRule} call (the issue asks for one; the model chooses): rerun.");
             }
-            Assert.Contains($"mcp:{SearchGraphRule}", taints);
+            // The session that made the call is tainted. session_taints keeps one row per session, its first reason, and a triage
+            // session is tainted `issue-text` before it starts, so the MCP use shows as that session's stored tool_use (above), not
+            // as a second taint reason.
+            var callers = used.Select(u => u.WorkerSessionId).Distinct().ToList();
+            var callerIds = await db.WorkerSessions.AsNoTracking().Where(w => callers.Contains(w.Id)).Select(w => w.ClaudeSessionId).ToListAsync(ct);
+            Assert.NotEmpty(callerIds);
+            Assert.All(callerIds, id => Assert.Contains(taints, t => t.ClaudeSessionId == id));
             // The proxy relayed CodeGraph's answer with the factory's commit label (E3).
             var results = events.Where(e => e.Type == "user").SelectMany(e => ToolResults(e.Payload)).ToList();
             Assert.Contains(results, r => used.Any(u => u.Id == r.Id) && r.Text.Contains("CodeGraph's index of", StringComparison.Ordinal));
@@ -276,7 +284,7 @@ public class CodeGraphTriageTests
             Assert.StartsWith("CodeGraph's index of", answered.Text);
             using var kanbanHttp = OutboundHttp.LoopbackMcp(proxy.Endpoint(McpServers.Kanban));
             var kanban = await Assert.ThrowsAsync<McpHttpException>(() => new McpHttpClient(kanbanHttp, grant.Credential, "proxy", "")
-                .CallToolAsync("ListProjects", new JsonObject(), ct));
+                .CallToolAsync("list_projects", new JsonObject(), ct));
             Assert.Equal(404, kanban.StatusCode);
         }
         finally
@@ -288,7 +296,7 @@ public class CodeGraphTriageTests
     /// <summary>
     /// Epic AT5's live Kanban check: with a Kanban token (keychain <c>kanban-token</c>), the reviewers' tool set — the production
     /// upstream registry and <see cref="ReviewTools"/> — offers Kanban's read tools and no write tool, a read tool
-    /// (<c>ListProjects</c>) answers through it and is recorded with its hash and size, and a write tool asked for anyway is refused
+    /// (<c>list_projects</c>) answers through it and is recorded with its hash and size, and a write tool asked for anyway is refused
     /// without being forwarded. No model is called: the test plays the reviewer's tool_use blocks itself.
     /// </summary>
     [Fact]
@@ -308,19 +316,19 @@ public class CodeGraphTriageTests
         var definitions = await tools.DefinitionsAsync(session, ct);
 
         var offered = definitions.Select(d => JsonSerializer.SerializeToElement(d).GetProperty("name").GetString()!).ToList();
-        Assert.Contains("ListProjects", session.KanbanTools);
+        Assert.Contains("list_projects", session.KanbanTools);
         Assert.All(session.KanbanTools, t => Assert.Contains(t, McpServers.KanbanTools));
-        string[] writes = ["CreateWorkItem", "UpdateWorkItem", "DeleteWorkItem", "MoveWorkItem", "AddWorkItemComment", "CreateEpic"];
+        string[] writes = ["create_work_item", "update_work_item", "delete_work_item", "move_work_item", "add_work_item_comment", "create_epic"];
         Assert.DoesNotContain(offered, writes.Contains);
 
-        var read = await tools.RunAsync(new AnswerBlock(AnswerBlock.ToolUse, null, "toolu_k1", "ListProjects", "{}"), session, ct);
+        var read = await tools.RunAsync(new AnswerBlock(AnswerBlock.ToolUse, null, "toolu_k1", "list_projects", "{}"), session, ct);
         Assert.False(read.IsError, read.Content);
-        Assert.StartsWith("Kanban's ListProjects:", read.Content);
+        Assert.StartsWith("Kanban's list_projects:", read.Content);
         Assert.Matches("^[0-9a-f]{64}$", read.Record.ResultSha256);
         Assert.True(read.Record.Bytes > 0);
-        var write = await tools.RunAsync(new AnswerBlock(AnswerBlock.ToolUse, null, "toolu_k2", "CreateWorkItem", """{"title":"x"}"""), session, ct);
+        var write = await tools.RunAsync(new AnswerBlock(AnswerBlock.ToolUse, null, "toolu_k2", "create_work_item", """{"title":"x"}"""), session, ct);
         Assert.True(write.IsError);
-        Assert.StartsWith("There is no tool named 'CreateWorkItem'", write.Content);
+        Assert.StartsWith("There is no tool named 'create_work_item'", write.Content);
     }
 
     /// <summary>The tool_use blocks (id, name) of one stream-json assistant event.</summary>

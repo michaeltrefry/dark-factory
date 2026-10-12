@@ -33,8 +33,8 @@ public class McpProxyTests
 
     /// <summary>Kanban's tools as KanbanBoard lists them: its read tools and its write tools.</summary>
     private static readonly string[] KanbanListed =
-        ["ListProjects", "GetBoard", "ListEpics", "GetEpic", "ListEpicDocuments", "GetEpicDocument", "ListWorkItems", "ListEpicWorkItems",
-            "GetIssues", "CreateWorkItem", "UpdateWorkItem", "DeleteWorkItem", "MoveWorkItem", "AddWorkItemComment", "CreateEpic"];
+        ["list_projects", "get_board", "list_epics", "get_epic", "list_epic_documents", "get_epic_document", "list_work_items", "list_epic_work_items",
+            "get_issues", "create_work_item", "update_work_item", "delete_work_item", "move_work_item", "add_work_item_comment", "create_epic"];
 
     private static FakeMcpServer CodeGraphServer(Func<string, JsonObject, JsonObject>? answer = null) =>
         new("/mcp", CodeGraphListed, (tool, args) => tool == "search_projects"
@@ -96,7 +96,7 @@ public class McpProxyTests
         var known = await Text(McpServers.CodeGraph, "search_graph", new JsonObject { ["namePattern"] = "X%" });
         var error = await Text(McpServers.CodeGraph, "get_code_snippet", new JsonObject { ["filePath"] = "src/Gone.cs" });
         var unknown = await Text(McpServers.CodeGraph, "find_consumers", new JsonObject { ["name"] = "Orders" });
-        var kanban = await Text(McpServers.Kanban, "GetBoard", new JsonObject { ["projectId"] = 3 });
+        var kanban = await Text(McpServers.Kanban, "get_board", new JsonObject { ["projectId"] = 3 });
 
         var asOf = $"CodeGraph's index of {Project}'s default branch as of {Index}";
         Assert.Equal(asOf, ReviewTools.DefaultBranchLabel(Project, Index));
@@ -108,7 +108,7 @@ public class McpProxyTests
         Assert.Equal($"{asOf}:\nCommit: {Index}\n\nX.Count (Method)", known);
         Assert.Equal($"{asOf} (CodeGraph answered with an error):\nCommit: {Index}\n\nno such file", error);
         Assert.Equal($"{Unknown}\nno commit named", unknown);
-        Assert.StartsWith("kanban GetBoard", kanban); // Kanban is not CodeGraph: no commit label
+        Assert.StartsWith("kanban get_board", kanban); // Kanban is not CodeGraph: no commit label
         // The tool descriptions say so too.
         var (_, list) = await Rpc(proxy, McpServers.CodeGraph, grant.Credential, "tools/list");
         Assert.All(list!["result"]!["tools"]!.AsArray(),
@@ -246,19 +246,19 @@ public class McpProxyTests
         Assert.Equal([McpServers.CodeGraph, McpServers.Kanban], grant.Servers);
 
         var listed = Listed((await Rpc(proxy, McpServers.Kanban, grant.Credential, "tools/list")).Body!);
-        // The read tools KanbanBoard has (GetWorkItem and SearchWorkItems, allowlisted, come with KanbanBoard sc-25711: not listed yet).
-        Assert.Equal(["ListProjects", "GetBoard", "ListEpics", "GetEpic", "ListEpicDocuments", "GetEpicDocument", "ListWorkItems",
-            "ListEpicWorkItems", "GetIssues"], listed);
+        // The read tools this fake KanbanBoard has (it lists no get_work_item or search_work_items: an allowlisted tool the upstream lacks is not listed).
+        Assert.Equal(["list_projects", "get_board", "list_epics", "get_epic", "list_epic_documents", "get_epic_document", "list_work_items",
+            "list_epic_work_items", "get_issues"], listed);
 
-        var (_, board) = await Call(proxy, McpServers.Kanban, grant.Credential, "GetBoard", new JsonObject { ["projectId"] = 3 });
-        Assert.Equal("kanban GetBoard {\"projectId\":3}", board!["result"]!["content"]![0]!["text"]!.GetValue<string>());
+        var (_, board) = await Call(proxy, McpServers.Kanban, grant.Credential, "get_board", new JsonObject { ["projectId"] = 3 });
+        Assert.Equal("kanban get_board {\"projectId\":3}", board!["result"]!["content"]![0]!["text"]!.GetValue<string>());
         var (tool, arguments) = Assert.Single(kanban.Calls);
-        Assert.Equal("GetBoard", tool);
+        Assert.Equal("get_board", tool);
         Assert.Null(arguments["project"]); // Kanban has no repository mapping: nothing pinned
         Assert.All(kanban.Api.Requests, r => Assert.Equal($"Bearer {KanbanToken}", r.Headers["Authorization"]));
         Assert.All(kanban.Api.Requests, r => Assert.Equal("/mcp", r.PathAndQuery)); // Kanban:McpUrl is the endpoint itself
 
-        foreach (var write in new[] { "CreateWorkItem", "UpdateWorkItem", "DeleteWorkItem", "MoveWorkItem", "AddWorkItemComment", "CreateEpic" })
+        foreach (var write in new[] { "create_work_item", "update_work_item", "delete_work_item", "move_work_item", "add_work_item_comment", "create_epic" })
         {
             Assert.Equal(McpProxy.InvalidParams,
                 (await Call(proxy, McpServers.Kanban, grant.Credential, write, new JsonObject { ["title"] = "x" })).Body!["error"]!["code"]!.GetValue<int>());
@@ -266,7 +266,7 @@ public class McpProxyTests
         Assert.Single(kanban.Calls); // no write was forwarded
         // The session's CodeGraph tools are still the CodeGraph allowlist, never Kanban's (each endpoint serves its own upstream).
         Assert.Equal(McpProxy.InvalidParams,
-            (await Call(proxy, McpServers.CodeGraph, grant.Credential, "GetBoard", new JsonObject())).Body!["error"]!["code"]!.GetValue<int>());
+            (await Call(proxy, McpServers.CodeGraph, grant.Credential, "get_board", new JsonObject())).Body!["error"]!["code"]!.GetValue<int>());
     }
 
     [Fact]
@@ -492,7 +492,7 @@ public class McpProxyTests
         Assert.False(own!["result"]!["isError"]!.GetValue<bool>());
         // Kanban is configured, but not served to a triage credential at all.
         Assert.Equal(HttpStatusCode.NotFound, (await Rpc(proxy, McpServers.Kanban, grant.Credential, "tools/list")).Status);
-        Assert.Equal(HttpStatusCode.NotFound, (await Call(proxy, McpServers.Kanban, grant.Credential, "GetBoard", new JsonObject())).Status);
+        Assert.Equal(HttpStatusCode.NotFound, (await Call(proxy, McpServers.Kanban, grant.Credential, "get_board", new JsonObject())).Status);
         Assert.Empty(kanban.Api.Requests);
         // The production triage worker's --allowedTools: exactly these MCP tools, even with Kanban configured.
         Assert.Equal(triageTools.Select(t => $"mcp__codegraph__{t}"), SandboxTriageRunner.TriageTools(upstreams, proxied: true).McpAllowed);
@@ -514,7 +514,7 @@ public class McpProxyTests
         foreach (var (server, tool, args) in new[]
         {
             (McpServers.CodeGraph, "search_graph", new JsonObject { ["namePattern"] = "X%" }),
-            (McpServers.Kanban, "GetBoard", new JsonObject { ["projectId"] = 3 }),
+            (McpServers.Kanban, "get_board", new JsonObject { ["projectId"] = 3 }),
         })
         {
             var text = (await Call(proxy, server, grant.Credential, tool, args)).Body!["result"]!["content"]![0]!["text"]!.GetValue<string>();
@@ -525,7 +525,7 @@ public class McpProxyTests
         // The budget: two calls made above; the rest up to the cap are served, the next is refused and not forwarded.
         for (var i = 2; i < McpProxy.MaxCallsPerGrant; i++)
         {
-            Assert.NotNull((await Call(proxy, McpServers.Kanban, grant.Credential, "GetBoard", new JsonObject())).Body!["result"]);
+            Assert.NotNull((await Call(proxy, McpServers.Kanban, grant.Credential, "get_board", new JsonObject())).Body!["result"]);
         }
         var forwarded = kanban.Calls.Count;
         var (_, over) = await Call(proxy, McpServers.CodeGraph, grant.Credential, "search_graph", new JsonObject { ["namePattern"] = "X%" });
@@ -534,7 +534,7 @@ public class McpProxyTests
         Assert.Single(codeGraph.Calls, c => c.Tool == "search_graph");
         // Another session's budget is its own.
         using var other = proxy.Grant(Repo, McpProfile.Planner);
-        Assert.NotNull((await Call(proxy, McpServers.Kanban, other.Credential, "GetBoard", new JsonObject())).Body!["result"]);
+        Assert.NotNull((await Call(proxy, McpServers.Kanban, other.Credential, "get_board", new JsonObject())).Body!["result"]);
     }
 
     [Fact]
@@ -613,8 +613,8 @@ public class McpProxyTests
         var codeGraph = new CodeGraphMcpClient(new HttpClient(), "t");
         Assert.Same(ReviewTools.CodeGraphTools, codeGraph.Upstream.Allowlist);
         Assert.True(codeGraph.Upstream.RepoScoped);
-        Assert.Equal(["ListProjects", "GetBoard", "ListEpics", "GetEpic", "ListEpicDocuments", "GetEpicDocument", "ListWorkItems",
-            "ListEpicWorkItems", "GetIssues", "GetWorkItem", "SearchWorkItems"], McpServers.KanbanTools);
+        Assert.Equal(["list_projects", "get_board", "list_epics", "get_epic", "list_epic_documents", "get_epic_document", "list_work_items",
+            "list_epic_work_items", "get_issues", "get_work_item", "search_work_items"], McpServers.KanbanTools);
         Assert.DoesNotContain(McpServers.KanbanTools, t => t.StartsWith("Create") || t.StartsWith("Update") || t.StartsWith("Delete")
             || t.StartsWith("Move") || t.EndsWith("Comment"));
         Assert.Equal(ReviewTools.CodeGraphTools.Count + McpServers.KanbanTools.Count, McpServers.AllToolRules.Count);
