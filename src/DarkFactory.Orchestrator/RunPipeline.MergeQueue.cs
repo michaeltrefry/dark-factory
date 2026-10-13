@@ -432,7 +432,7 @@ public sealed partial class RunPipeline
                 var fixRounds = TransitionContext.From(history.Where(e => e.Step is null).Select(e => e.State).ToList()).FixRounds;
                 var ci = await Gate.GitHub.GetCiAsync(run.Repo, pull.HeadSha, ct);
                 var newTests = await NewTestsAsync(run, pull, history, policy, diff, ct);
-                var change = new ChangeFacts(diff, diffError, fixRounds, IsChangesetPull(run, pull));
+                var change = new ChangeFacts(diff, diffError, fixRounds, IsChangesetPull(run.Changeset, pull));
                 // Everything but CodeGraph first: CodeGraph is asked only about a change nothing else blocks.
                 decision = MergeGate.Evaluate(policy, policyError, pull, change, ci, Verdicts(history), newTests, riskUnread: Gate.Risk is not null);
                 if (decision.Outcome == GateOutcome.Pending && Gate.Risk is { } reader && diff is not null)
@@ -475,7 +475,7 @@ public sealed partial class RunPipeline
             {
                 // The deadline fell inside a CodeGraph call or the overlay wait: blocked there, never later.
                 decision = TimedOut(waiting ?? new GateDecision(GateOutcome.Pending, pull.HeadSha,
-                    [$"risk threshold: CodeGraph's inputs for {Ci.Short(pull.HeadSha)} were still being read"]) { Changeset = IsChangesetPull(run, pull) });
+                    [$"risk threshold: CodeGraph's inputs for {Ci.Short(pull.HeadSha)} were still being read"]) { Changeset = IsChangesetPull(run.Changeset, pull) });
                 break;
             }
         }

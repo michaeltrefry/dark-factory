@@ -245,13 +245,16 @@ public partial class ChangesetPipelineTests
         /// <summary>How many times the workflow files were read.</summary>
         public int WorkflowReads { get; private set; }
 
-        public Task<IReadOnlyList<WorkflowFile>> GetWorkflowsAsync(RepoRef repo, CancellationToken ct)
+        /// <summary>The default branch GitHub names for the repository in the workflow read.</summary>
+        public string WorkflowsDefaultBranch { get; set; } = Main;
+
+        public Task<RepoWorkflows> GetWorkflowsAsync(RepoRef repo, CancellationToken ct)
         {
             lock (_gate)
             {
                 WorkflowReads++;
             }
-            return WorkflowsThrow is { } failure ? Task.FromException<IReadOnlyList<WorkflowFile>>(failure) : Task.FromResult(Workflows);
+            return WorkflowsThrow is { } failure ? Task.FromException<RepoWorkflows>(failure) : Task.FromResult(new RepoWorkflows(WorkflowsDefaultBranch, Workflows));
         }
 
         public Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct)

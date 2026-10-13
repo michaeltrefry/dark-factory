@@ -541,9 +541,12 @@ PR: the path is sealed). The `gate` row of a changeset pull request reads `Merge
 
 CI triggers (sc-25873): before the planner runs, the factory reads the sandbox's `.github/workflows/*.yml` on the default branch.
 If every workflow's `pull_request` trigger filters `branches` without `factory/**` (and none has a matching `push` trigger), the
-plan item escalates at once with a `ci-triggers` row (`blocked: …`) naming the workflow files and the fix — add `factory/**` to
-the `pull_request` `branches` filter — and no story or changeset branch is created. A workflow it cannot read or parse is a
-`ci-triggers` warning row and the plan goes on.
+plan item escalates at once with a `ci-triggers` row (`blocked: …`) naming the fix — add `factory/**` to the `pull_request`
+`branches` filter — and the workflow files, and no story or changeset branch is created. The same holds for the changeset pull
+request: workflows that run for `factory/**` bases but whose `branches` filter leaves out the default branch (and no `push`
+trigger matching `factory/changeset-*`) block the plan with the fix naming the default branch. A workflow it cannot read or
+parse, or a repository none of whose workflows has a `pull_request` trigger or a `push` trigger for branches (dispatch-only,
+scheduled, tag releases: its CI may be another service's), is a `ci-triggers` warning row and the plan goes on.
 
 In-process versions (every `dotnet test`): `ChangesetPolicyTests` (version 4 parsing, both limits for both kinds of pull request
 under versions 2, 3 and 4), `ChangesetPipelineTests` (the changeset fact from the ledger: a plan's changeset pull request against

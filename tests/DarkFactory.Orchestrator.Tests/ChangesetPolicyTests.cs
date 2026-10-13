@@ -367,8 +367,9 @@ public partial class ChangesetPipelineTests
         Assert.Equal(WorkState.Escalated, outcome.State);
         // The reason names the repository, the changeset branch, the workflow files read and the exact fix.
         Assert.Contains($"in {Sandbox}: no CI workflow runs for a pull request into {ChangesetBranch}", outcome.Error);
-        Assert.Contains($"Workflows read on the default branch: {CiFile} (its pull_request branches filter leaves out {ChangesetBranch})", outcome.Error);
-        Assert.Contains($"Fix: add `factory/**` to the pull_request branches filter of {CiFile}", outcome.Error);
+        Assert.Contains($"Fix: add `factory/**` to the pull_request branches filter of {CiFile}. Workflows read on the default branch: "
+            + $"{CiFile} (its pull_request branches filter leaves out {ChangesetBranch}). Every story of the plan would open its pull request "
+            + $"against {ChangesetBranch}, get no CI check", outcome.Error);
         // Nothing was spent or created: no planner session, no story, no changeset branch.
         Assert.Empty(h.Planner!.Calls);
         Assert.Empty(StoriesCreated(h));
@@ -431,6 +432,123 @@ public partial class ChangesetPipelineTests
 
         Assert.Equal((WorkState.Planned, (string?)null), (planned.State, planned.Error));
         Assert.DoesNotContain(await h.Rows(), r => r.Step == RunPipeline.Steps.CiTriggers);
+    }
+
+    [Theory]
+    [InlineData("name: deploy\non: workflow_dispatch\njobs: {}\n", "no pull_request or push trigger")]
+    [InlineData("on:\n  schedule:\n    - cron: '0 3 * * *'\n", "no pull_request or push trigger")]
+    [InlineData("on: [release, workflow_call]\n", "no pull_request or push trigger")]
+    [InlineData("on:\n  push:\n    tags: ['v*']\n", "its push trigger is for tags only")]
+    public async Task A_repository_whose_workflows_have_no_pull_request_or_push_branch_trigger_plans_normally_with_a_warning(string workflow, string why)
+    {
+        // A dispatch-only deploy, a scheduled bot, a tag release: nothing says its CI is GitHub Actions (it may be another
+        // service's), so the plan is not refused with a fix that would be wrong for it.
+        var h = new Harness();
+        h.Repo.Workflows = Workflow(workflow);
+
+        var planned = await PlanRun(h);
+
+        Assert.Equal((WorkState.Planned, (string?)null), (planned.State, planned.Error));
+        var row = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.CiTriggers);
+        Assert.Equal($"{CiTriggerCheck.WarningPrefix}{Sandbox}: whether any CI workflow runs for a pull request into {ChangesetBranch} cannot be told: "
+            + "no workflow has a pull_request trigger or a push trigger for branches, so CI may be another service's. "
+            + $"Workflows read on the default branch: {CiFile} ({why})", row.Detail);
+        Assert.Equal(StepOutcome.Failed, row.Outcome);
+        Assert.Contains($"[plan] warning: CI triggers of {Sandbox}: ", h.Logged);
+        Assert.Single(h.Planner!.Calls);
+        Assert.Equal(2, StoriesCreated(h).Count);
+        Assert.Contains(ChangesetBranch, h.Repo.Branches.Keys);
+        Assert.Empty(h.Comments(PlanId));
+    }
+
+    [Fact]
+    public async Task A_plan_whose_changeset_pull_request_could_get_no_ci_is_escalated_before_anything_is_spent_with_the_fix_naming_the_default_branch()
+    {
+        // Every story's pull request (base: the changeset branch) gets CI; the one that takes the changeset to the default branch
+        // does not. The default branch is the one GitHub names in the same read, not a guess.
+        var h = new Harness();
+        h.Repo.WorkflowsDefaultBranch = "trunk";
+        h.Repo.Workflows = Workflow("name: ci\non:\n  pull_request:\n    branches: ['factory/**']\njobs: {}\n");
+
+        var outcome = await PlanRun(h);
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains($"in {Sandbox}: no CI workflow runs for a pull request into trunk. Fix: add `trunk` to the pull_request branches filter of {CiFile}. "
+            + $"Workflows read on the default branch: {CiFile} (its pull_request branches filter leaves out trunk). "
+            + $"The plan's stories would be built and merged into {ChangesetBranch}, and then the changeset pull request", outcome.Error);
+        Assert.DoesNotContain("Every story of the plan would open", outcome.Error);
+        Assert.Empty(h.Planner!.Calls);
+        Assert.Empty(StoriesCreated(h));
+        Assert.Empty(h.Repo.BranchesCreated);
+        var rows = await h.Rows();
+        Assert.DoesNotContain(rows, r => r.Step is RunPipeline.Steps.Plan or RunPipeline.Steps.PlanCreating or RunPipeline.Steps.PlanStories or RunPipeline.Steps.Changeset);
+        var row = Assert.Single(rows, r => r.Step == RunPipeline.Steps.CiTriggers);
+        Assert.StartsWith($"{CiTriggerCheck.BlockedPrefix}{Sandbox}: no CI workflow runs for a pull request into trunk. Fix: add `trunk`", row.Detail);
+        Assert.Equal(StepOutcome.GateRejected, row.Outcome);
+        Assert.Contains("add `trunk` to the pull_request branches filter", Assert.Single(h.Comments(PlanId)));
+
+        // With the default branch in the filter too, the plan item's next run plans as usual.
+        h.Repo.Workflows = Workflow("name: ci\non:\n  pull_request:\n    branches: [trunk, 'factory/**']\njobs: {}\n");
+        var planned = await PlanRun(h);
+        Assert.Equal((WorkState.Planned, (string?)null), (planned.State, planned.Error));
+        Assert.Contains($"[plan] CI triggers of {Sandbox}: {CiFile} runs for a pull request into trunk", h.Logged);
+    }
+
+    [Fact]
+    public async Task A_changeset_pull_request_whose_ci_cannot_be_told_is_a_warning_when_the_stories_ci_runs()
+    {
+        var h = new Harness();
+        h.Repo.Workflows =
+        [
+            new WorkflowFile(CiFile, "on:\n  pull_request:\n    branches: ['factory/**']\n"),
+            new WorkflowFile(".github/workflows/odd.yml", "on:\n  pull_request:\n    branches: ['[main']\n"),
+        ];
+
+        var planned = await PlanRun(h);
+
+        Assert.Equal((WorkState.Planned, (string?)null), (planned.State, planned.Error));
+        Assert.StartsWith($"{CiTriggerCheck.WarningPrefix}{Sandbox}: whether any CI workflow runs for a pull request into {Main} cannot be told. "
+            + "Workflows read on the default branch: .github/workflows/odd.yml (its pull_request branches filter could not be read); ",
+            Assert.Single(await h.Steps(PlanId, RunPipeline.Steps.CiTriggers)));
+    }
+
+    [Fact]
+    public async Task The_board_comment_of_a_stop_keeps_the_fix_however_many_workflows_the_repository_has()
+    {
+        // 50 workflows, each named in full, would push a fix written after them past the comment's clip of the reason.
+        var h = new Harness();
+        h.Repo.Workflows = [.. Enumerable.Range(0, 50).Select(i =>
+            new WorkflowFile($".github/workflows/a-rather-long-workflow-file-name-for-deployment-stage-{i:00}.yml", "on:\n  pull_request:\n    branches: [main]\n"))];
+
+        var outcome = await PlanRun(h);
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        const string fix = "Fix: add `factory/**` to the pull_request branches filter of .github/workflows/a-rather-long-workflow-file-name-for-deployment-stage-00.yml";
+        var comment = Assert.Single(h.Comments(PlanId));
+        Assert.Contains(fix, comment);
+        Assert.Contains("(or likewise in 47 more). Workflows read on the default branch: ", comment);
+        Assert.Contains("; … 40 more. Every story of the plan would open its pull request", comment);
+        Assert.Contains("Fix the workflow on the default branch, then run the plan item again.", comment);
+        Assert.True(comment.IndexOf(fix, StringComparison.Ordinal) < comment.IndexOf("Workflows read on the default branch", StringComparison.Ordinal));
+        Assert.True(outcome.Error!.Length < LedgerReport.MaxReasonLength, outcome.Error.Length.ToString());
+    }
+
+    // ---- which pull request is a changeset's ----
+
+    [Fact]
+    public void A_pull_request_is_a_changesets_only_for_an_item_with_a_changeset_and_only_when_it_targets_the_base_that_changeset_recorded()
+    {
+        var changeset = new Plans.Changeset(Sandbox.ToString(), ChangesetBranch, Main, "base0");
+        var pull = new PullFacts(1, "https://github.com/o/r/pull/1", true, false, false, "head", Main, "base0", null);
+
+        Assert.True(RunPipeline.IsChangesetPull(changeset, pull with { BaseRef = Main }));
+        // Retargeted (or adopted with another base): not the changeset pull request the limits are for.
+        Assert.False(RunPipeline.IsChangesetPull(changeset, pull with { BaseRef = "release" }));
+        Assert.False(RunPipeline.IsChangesetPull(changeset, pull with { BaseRef = ChangesetBranch }));
+        Assert.False(RunPipeline.IsChangesetPull(changeset, pull with { BaseRef = "Main" }));
+        // No changeset in the ledger: whatever the base is called.
+        Assert.False(RunPipeline.IsChangesetPull(null, pull with { BaseRef = Main }));
+        Assert.False(RunPipeline.IsChangesetPull(null, pull with { BaseRef = ChangesetBranch }));
     }
 
     public static TheoryData<string, string> CannotTell() => new()

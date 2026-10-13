@@ -35,9 +35,10 @@ public interface IGateGitHub
     /// <summary>
     /// The GitHub Actions workflow files of the repository's default branch (sc-25873: <see cref="CiTriggers"/> reads their
     /// triggers before a plan is spent): every <c>.yml</c>/<c>.yaml</c> file directly in <see cref="CiTriggers.Directory"/>, each with
-    /// its text or why it could not be read. Empty when the directory does not exist. Throws when the listing itself cannot be read.
+    /// its text or why it could not be read (none when the directory does not exist), with the default branch's name as GitHub
+    /// names it for the repository (never guessed). Throws when the repository or the listing itself cannot be read.
     /// </summary>
-    Task<IReadOnlyList<WorkflowFile>> GetWorkflowsAsync(RepoRef repo, CancellationToken ct);
+    Task<RepoWorkflows> GetWorkflowsAsync(RepoRef repo, CancellationToken ct);
 
     /// <summary>
     /// The log of a failing check (sc-25383): for a check run of GitHub Actions its job's log (at most the last
@@ -153,15 +154,26 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
     /// <summary>A workflow file larger than this is not read.</summary>
     public const int MaxWorkflowBytes = 512 * 1024;
 
-    public async Task<IReadOnlyList<WorkflowFile>> GetWorkflowsAsync(RepoRef repo, CancellationToken ct)
+    public async Task<RepoWorkflows> GetWorkflowsAsync(RepoRef repo, CancellationToken ct)
     {
-        // No ref: the contents API answers for the default branch.
         var token = await ReadTokenAsync(repo, ct);
+        string? defaultBranch;
+        using (var repoRequest = GitHubApp.Request(HttpMethod.Get, $"repos/{repo.Owner}/{repo.Name}", "Bearer", token))
+        using (var repoResponse = await http.SendAsync(repoRequest, ct))
+        {
+            await GitHubApp.EnsureSuccess(repoResponse, $"read the repository {repo}", ct);
+            defaultBranch = (await repoResponse.Content.ReadFromJsonAsync<RefRepoDto>(ct))?.DefaultBranch;
+        }
+        if (string.IsNullOrEmpty(defaultBranch))
+        {
+            throw new InvalidOperationException($"GitHub read the repository {repo} failed: it names no default branch.");
+        }
+        // No ref: the contents API answers for the default branch.
         using var request = GitHubApp.Request(HttpMethod.Get, $"repos/{repo.Owner}/{repo.Name}/contents/{CiTriggers.Directory}", "Bearer", token);
         using var response = await http.SendAsync(request, ct);
         if (response.StatusCode == HttpStatusCode.NotFound)
         {
-            return [];
+            return new RepoWorkflows(defaultBranch, []);
         }
         await GitHubApp.EnsureSuccess(response, $"list {CiTriggers.Directory}", ct);
         List<ContentEntryDto> entries;
@@ -197,7 +209,7 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         {
             files.Add(new WorkflowFile(CiTriggers.Directory, null, $"more than {MaxWorkflows} workflow files, the first {MaxWorkflows} read"));
         }
-        return files;
+        return new RepoWorkflows(defaultBranch, files);
     }
 
     public async Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct)

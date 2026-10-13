@@ -95,12 +95,13 @@ public sealed partial class RunPipeline
     /// <summary>
     /// Whether the item's pull request is its plan's changeset pull request (sc-25873), the fact the merge gate sizes it by
     /// (<see cref="ChangeFacts.Changeset"/>): the ledger says so — the item is a plan item with a pushed changeset in this repository
-    /// (<see cref="Run.Changeset"/>, from its own <c>changeset</c> and <c>changeset-pushed</c> rows, so its branch is that changeset
-    /// branch) — and the pull request targets the base that changeset recorded. Never the branch's name: a story of a plan, or an item
-    /// of no plan, is not a changeset whatever its branch or its base is called.
+    /// (<paramref name="changeset"/>: <see cref="Run.Changeset"/>, from its own <c>changeset</c> and <c>changeset-pushed</c> rows, so
+    /// its branch is that changeset branch; null for every other item) — and the pull request targets the base that changeset
+    /// recorded. Never the branch's name: a story of a plan, or an item of no plan, is not a changeset whatever its branch or its
+    /// base is called.
     /// </summary>
-    private static bool IsChangesetPull(Run run, PullFacts pull) =>
-        run.Changeset is { } changeset && string.Equals(pull.BaseRef, changeset.Base, StringComparison.Ordinal);
+    internal static bool IsChangesetPull(Plans.Changeset? changeset, PullFacts pull) =>
+        changeset is not null && string.Equals(pull.BaseRef, changeset.Base, StringComparison.Ordinal);
 
     /// <summary>
     /// Review: the review panel judges the PR's current head commit — correctness and spec conformance always, security when

@@ -238,7 +238,7 @@ internal sealed class PolicyFromRef(IGateGitHub inner, string policyRef, Func<bo
 
     public Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct) => inner.GetCiAsync(repo, sha, ct);
 
-    public Task<IReadOnlyList<WorkflowFile>> GetWorkflowsAsync(RepoRef repo, CancellationToken ct) => inner.GetWorkflowsAsync(repo, ct);
+    public Task<RepoWorkflows> GetWorkflowsAsync(RepoRef repo, CancellationToken ct) => inner.GetWorkflowsAsync(repo, ct);
 
     public Task<string> GetCheckLogAsync(RepoRef repo, CheckFact check, CancellationToken ct) => inner.GetCheckLogAsync(repo, check, ct);
 

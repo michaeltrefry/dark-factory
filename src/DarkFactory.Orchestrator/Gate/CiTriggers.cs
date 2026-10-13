@@ -9,13 +9,25 @@ namespace DarkFactory.Orchestrator.Gate;
 /// </summary>
 public sealed record WorkflowFile(string Path, string? Text, string? Error = null);
 
+/// <summary>
+/// A repository's workflow files as one read found them (<see cref="GitHub.IGateGitHub.GetWorkflowsAsync"/>): the default branch
+/// GitHub names for the repository — the branch the files are on, and the base of a plan's changeset pull request — and the files.
+/// </summary>
+public sealed record RepoWorkflows(string DefaultBranch, IReadOnlyList<WorkflowFile> Files);
+
 public enum CiTriggerOutcome
 {
-    /// <summary>At least one workflow would run for a plan's story pull request.</summary>
+    /// <summary>At least one workflow would run for the pull request.</summary>
     Runs,
-    /// <summary>Every workflow was read and understood, and none would run: the stories' CI can never report.</summary>
+    /// <summary>
+    /// Every workflow was read and understood, none would run, and at least one has a pull request or push trigger whose branch
+    /// filter leaves the pull request out: the repository's CI is GitHub Actions and can never report on it.
+    /// </summary>
     Never,
-    /// <summary>It cannot be told (no workflow file, an unreadable or unparsable one, a trigger this check does not model).</summary>
+    /// <summary>
+    /// It cannot be told (no workflow file, an unreadable or unparsable one, a trigger this check does not model, or no workflow
+    /// with a pull request or push trigger for branches at all: CI may be another service's).
+    /// </summary>
     Unknown,
 }
 
@@ -51,10 +63,17 @@ public sealed record CiTriggerCheck(CiTriggerOutcome Outcome, string Reason)
 /// on the same commit the gate reads CI for). Branch filters follow GitHub's glob rules (<see cref="Matches"/>).
 /// </para>
 /// The answer is only ever <see cref="CiTriggerOutcome.Never"/> when every workflow file was read, parsed and made only of triggers
-/// this check knows cannot report on such a pull request. Anything else it cannot be sure of — no workflow file at all (CI may be
-/// another service's, which the factory cannot read), a file that is unreadable or not valid YAML, <c>branches</c> next to
+/// this check knows cannot report on such a pull request, and at least one of them is a pull request or push trigger whose
+/// <c>branches</c>/<c>branches-ignore</c> filter leaves the branch out — the evidence that the repository's CI is GitHub Actions
+/// and was told not to run there. Anything else it cannot be sure of — no workflow file at all, or none with a pull request or
+/// push trigger for branches (only <c>workflow_dispatch</c>, a schedule, a release, <c>push</c> for tags: CI may be another
+/// service's, which the factory cannot read), a file that is unreadable or not valid YAML, <c>branches</c> next to
 /// <c>branches-ignore</c>, a pattern it cannot translate, an event outside <see cref="NeverReports"/> — is
 /// <see cref="CiTriggerOutcome.Unknown"/>: a warning, never a stop. It weakens nothing: the gate still needs green CI on every head.
+/// <para>
+/// The same question is asked of the plan's changeset pull request (base: the default branch, head: the changeset branch), which
+/// delivers the plan: <see cref="Check"/> takes any base and head.
+/// </para>
 /// </summary>
 public static partial class CiTriggers
 {
@@ -66,6 +85,15 @@ public static partial class CiTriggers
 
     /// <summary>The most of a read error a reason repeats.</summary>
     public const int MaxErrorChars = 200;
+
+    /// <summary>
+    /// The most workflow files a reason lists (then "… N more"): a reason is clipped where it is posted
+    /// (<see cref="Ledger.LedgerReport.MaxReasonLength"/>), and a repository may have <see cref="GitHub.GitHubGate.MaxWorkflows"/>.
+    /// </summary>
+    public const int MaxListed = 10;
+
+    /// <summary>The most workflows a stop's fix names (any one of them is enough; then "or likewise in N more").</summary>
+    public const int MaxFixes = 3;
 
     /// <summary>The events that can put a check on a story's pull request head, each named as GitHub does (snake_case).</summary>
     private enum Trigger
@@ -98,8 +126,11 @@ public static partial class CiTriggers
         Unknown,
     }
 
-    /// <summary>One workflow's answer, why in fixed words (nothing of the file's text), and the fix when a branch filter is why.</summary>
-    private sealed record Workflow(string Path, Answer Answer, string Why, string? Fix = null);
+    /// <summary>
+    /// One workflow's answer, why in fixed words (nothing of the file's text), the fix when a pull request branch filter is why,
+    /// and whether a branch filter (pull request or push) leaving the branch out is why (<see cref="Filtered"/>).
+    /// </summary>
+    private sealed record Workflow(string Path, Answer Answer, string Why, string? Fix = null, bool Filtered = false);
 
     /// <summary>
     /// Whether any of <paramref name="workflows"/> (every workflow file of the default branch) would report on a pull request from
@@ -110,25 +141,47 @@ public static partial class CiTriggers
         if (workflows.Count == 0)
         {
             return new CiTriggerCheck(CiTriggerOutcome.Unknown,
-                $"no workflow file under {Directory}/ on the default branch, so whether any CI reports on a pull request into {baseBranch} cannot be told");
+                $"no workflow file under {Directory}/ on the default branch, so whether any CI reports on a pull request into {Branch(baseBranch)} cannot be told");
         }
         var read = workflows.Select(w => Read(w, baseBranch, headBranch)).ToList();
-        var files = string.Join("; ", read.Select(w => $"{Name(w.Path)} ({w.Why})"));
         if (read.FirstOrDefault(w => w.Answer == Answer.Runs) is { } runs)
         {
-            return new CiTriggerCheck(CiTriggerOutcome.Runs, $"{Name(runs.Path)} runs for a pull request into {baseBranch} ({runs.Why})");
+            return new CiTriggerCheck(CiTriggerOutcome.Runs, $"{Name(runs.Path)} runs for a pull request into {Branch(baseBranch)} ({runs.Why})");
         }
         if (read.Any(w => w.Answer == Answer.Unknown))
         {
+            // The files that could not be understood first: they are why.
             return new CiTriggerCheck(CiTriggerOutcome.Unknown,
-                $"whether any CI workflow runs for a pull request into {baseBranch} cannot be told. Workflows read on the default branch: {files}");
+                $"whether any CI workflow runs for a pull request into {Branch(baseBranch)} cannot be told. Workflows read on the default branch: "
+                + Listed([.. read.OrderBy(w => w.Answer == Answer.Unknown ? 0 : 1)]));
+        }
+        if (!read.Any(w => w.Filtered))
+        {
+            // Nothing says the repository's CI is GitHub Actions: the same as no workflow file at all.
+            return new CiTriggerCheck(CiTriggerOutcome.Unknown,
+                $"whether any CI workflow runs for a pull request into {Branch(baseBranch)} cannot be told: no workflow has a pull_request trigger or a "
+                + $"push trigger for branches, so CI may be another service's. Workflows read on the default branch: {Listed(read)}");
         }
         var fixes = read.Select(w => w.Fix).OfType<string>().ToList();
-        var fix = fixes.Count > 0 ? string.Join(", or ", fixes)
-            : $"add a pull_request trigger with no branches filter, or one whose branches list has `{FactoryPattern}`, to a CI workflow (e.g. {Name(read[0].Path)})";
+        var fix = fixes.Count > 0
+            ? string.Join(", or ", fixes.Take(MaxFixes)) + (fixes.Count > MaxFixes ? $" (or likewise in {fixes.Count - MaxFixes} more)" : "")
+            : $"add a pull_request trigger with no branches filter, or one whose branches list has `{Pattern(baseBranch)}`, to a CI workflow (e.g. {Name(read.First(w => w.Filtered).Path)})";
+        // The fix before the files: where a reason is clipped, the fix is what must survive.
         return new CiTriggerCheck(CiTriggerOutcome.Never,
-            $"no CI workflow runs for a pull request into {baseBranch}. Workflows read on the default branch: {files}. Fix: {fix}");
+            $"no CI workflow runs for a pull request into {Branch(baseBranch)}. Fix: {fix}. Workflows read on the default branch: "
+            + Listed([.. read.OrderBy(w => w.Filtered ? 0 : 1)]));
     }
+
+    /// <summary>The first <see cref="MaxListed"/> workflows, each with why, then how many more there are.</summary>
+    private static string Listed(IReadOnlyList<Workflow> read) =>
+        string.Join("; ", read.Take(MaxListed).Select(w => $"{Name(w.Path)} ({w.Why})")) + (read.Count > MaxListed ? $"; … {read.Count - MaxListed} more" : "");
+
+    /// <summary>
+    /// The pattern a pull request branch filter needs for <paramref name="baseBranch"/>, as a fix names it: <see cref="FactoryPattern"/>
+    /// for one of the factory's branches (a changeset branch), else the branch itself (the default branch).
+    /// </summary>
+    private static string Pattern(string baseBranch) =>
+        baseBranch.StartsWith("factory/", StringComparison.Ordinal) ? FactoryPattern : PlainBranch().IsMatch(baseBranch) ? baseBranch : "the default branch";
 
     private static Workflow Read(WorkflowFile file, string baseBranch, string headBranch)
     {
@@ -171,6 +224,7 @@ public static partial class CiTriggers
             ?? answers.FirstOrDefault(a => a.Answer == Answer.Unknown)
             // Of the triggers that do not fire, the one a person can fix (a branch filter) says why.
             ?? answers.FirstOrDefault(a => a.Fix is not null)
+            ?? answers.FirstOrDefault(a => a.Filtered)
             ?? answers[0];
     }
 
@@ -215,13 +269,13 @@ public static partial class CiTriggers
         }
         if (runs)
         {
-            return new Workflow(path, Answer.Runs, $"{name}, its {key} filter lets {branch} through");
+            return new Workflow(path, Answer.Runs, $"{name}, its {key} filter lets {Branch(branch)} through");
         }
-        return new Workflow(path, Answer.Never, $"its {name} {key} filter leaves out {branch}", pull
+        return new Workflow(path, Answer.Never, $"its {name} {key} filter leaves out {Branch(branch)}", pull
             ? include is not null
-                ? $"add `{FactoryPattern}` to the {name} branches filter of {Name(path)}"
-                : $"take the pattern that matches {branch} out of the {name} branches-ignore filter of {Name(path)}"
-            : null);
+                ? $"add `{Pattern(branch)}` to the {name} branches filter of {Name(path)}"
+                : $"take the pattern that matches {Branch(branch)} out of the {name} branches-ignore filter of {Name(path)}"
+            : null, Filtered: true);
     }
 
     /// <summary>
@@ -336,4 +390,10 @@ public static partial class CiTriggers
 
     [GeneratedRegex(@"^[A-Za-z0-9_./ -]{1,120}$", RegexOptions.CultureInvariant)]
     private static partial Regex PlainPath();
+
+    /// <summary>A branch as a reason shows it: the default branch's name is the repository's own text, so plain or not shown.</summary>
+    private static string Branch(string branch) => PlainBranch().IsMatch(branch) ? branch : "(a branch with an unusual name)";
+
+    [GeneratedRegex(@"^[A-Za-z0-9_./-]{1,120}$", RegexOptions.CultureInvariant)]
+    private static partial Regex PlainBranch();
 }

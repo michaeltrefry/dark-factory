@@ -48,7 +48,7 @@ public class FreezeTests
         public Task<PullFacts> GetPullAsync(RepoRef repo, int number, CancellationToken ct) => throw new NotSupportedException();
         public Task<string> GetDiffAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct) => throw new NotSupportedException();
         public Task<RepoFiles> GetFilesAsync(RepoRef repo, string sha, CancellationToken ct) => throw new NotSupportedException();
-        public Task<IReadOnlyList<WorkflowFile>> GetWorkflowsAsync(RepoRef repo, CancellationToken ct) => throw new NotSupportedException();
+        public Task<RepoWorkflows> GetWorkflowsAsync(RepoRef repo, CancellationToken ct) => throw new NotSupportedException();
         public Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct) => throw new NotSupportedException();
         public Task<string> GetCheckLogAsync(RepoRef repo, CheckFact check, CancellationToken ct) => throw new NotSupportedException();
         public Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct) => throw new NotSupportedException();

@@ -834,25 +834,38 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   filter `pull_request` `branches` without `factory/**` reports no check for story PRs (their base is `factory/changeset-*`), which
   would each wait out `Gate:CiTimeoutMinutes` and escalate — fail closed, and a whole plan wasted. So Plan, before the planner
   session (and before a recorded plan's stories are created; not once the repository's changeset branch is on origin), reads the
-  default branch's workflow files owner-side with the gate App's read-only token (`IGateGitHub.GetWorkflowsAsync`: the contents API
-  with no ref, every `.yml`/`.yaml` directly in `.github/workflows`, at most `GitHubGate.MaxWorkflows` 50 files of at most
-  `MaxWorkflowBytes` 512 KiB) and parses each `on:` with the policy's YAML parser — per repository, so a plan with stories in
-  several calls it for each. A workflow reports on a story PR when a `pull_request`/`pull_request_target` trigger's branch filter
-  matches the base (the changeset branch; no filter matches every base) or a `push` trigger's matches the head (the story's
-  `factory/<id>` branch: a push workflow's checks are on the commit the gate reads CI for; a push with only `tags` filters does
-  not run for a branch); `types`/`paths` filters are not read (such a trigger counts as running). Branch filters follow GitHub's
-  rules (`CiTriggers.Matches`: `*` stops at `/`, `**` does not, `?`/`+` repeat the character before, `[…]` sets, `\` escapes,
-  patterns in order with `!` excluding again, `branches-ignore` the opposite and without `!`; case-sensitive; translated to a
-  non-backtracking regex). Outcomes: a workflow runs → a log line only. Certain that none can (every workflow file read and parsed,
-  each made only of pull request/push triggers that do not match and events in `CiTriggers.NeverReports`, e.g. `schedule`,
-  `workflow_dispatch`, `workflow_call`) → BLOCK: a `ci-triggers` checkpoint (`blocked: <repo>: …`, outcome gate_rejected) and the
-  plan item escalates with the repository, each workflow file read with why, and the fix (``add `factory/**` to the pull_request
-  branches filter of <file>``; a workflow's text is never repeated, an unusual file name not shown) — no planner session, story
-  or changeset branch; the owner fixes the workflow on the default branch and re-runs the plan item. Blocking is chosen over a
-  warning there because every story would otherwise be guaranteed to time out. It cannot be told (no workflow file at all — CI may
-  be another service's —, a file unreadable, over the bounds or not valid YAML, `branches` beside `branches-ignore`, a pattern that
-  cannot be translated, an event outside the known lists such as `workflow_run`, GitHub not answering the listing) → a
-  `ci-triggers` checkpoint (`warning: <repo>: …`, outcome failed, written when it changes) and a `[plan] warning:` log line, and
+  default branch's name and workflow files owner-side with the gate App's read-only token (`IGateGitHub.GetWorkflowsAsync` →
+  `RepoWorkflows`: `GET /repos/<owner>/<name>` for `default_branch` — never guessed; an answer naming none throws — then the
+  contents API with no ref, every `.yml`/`.yaml` directly in `.github/workflows`, at most `GitHubGate.MaxWorkflows` 50 files of at
+  most `MaxWorkflowBytes` 512 KiB) and parses each `on:` with the policy's YAML parser. `EnsureCiTriggersAsync` takes the
+  repository as a parameter and is called once today, for the plan item's repository (a plan with stories in several repositories
+  will call it for each). `CiTriggers.Check(files, base, head)` is asked about both kinds of PR the plan opens there: a story's
+  (base the changeset branch, head the story's `factory/<id>` branch) and the changeset's (base the default branch, head the
+  changeset branch — a repository whose only trigger is `pull_request: branches: ['factory/**']` runs for every story and never
+  for the PR that delivers the plan). A workflow reports on a PR when a `pull_request`/`pull_request_target` trigger's branch
+  filter matches the base (no filter matches every base) or a `push` trigger's matches the head (a push workflow's checks are on
+  the commit the gate reads CI for; a push with only `tags` filters does not run for a branch); `types`/`paths` filters are not
+  read (such a trigger counts as running). Branch filters follow GitHub's rules (`CiTriggers.Matches`: `*` stops at `/`, `**` does
+  not, `?`/`+` repeat the character before, `[…]` sets, `\` escapes, patterns in order with `!` excluding again, `branches-ignore`
+  the opposite and without `!`; case-sensitive; translated to a non-backtracking regex). Outcomes, per PR kind: a workflow runs →
+  a log line only. Certain that none can — `Never`: every workflow file read and parsed, each made only of pull request/push
+  triggers that do not match and events in `CiTriggers.NeverReports` (e.g. `schedule`, `workflow_dispatch`, `workflow_call`), AND
+  at least one of them a pull request or push trigger whose `branches`/`branches-ignore` filter leaves the branch out (the evidence
+  that the repository's CI is GitHub Actions and was told not to run there). It cannot be told — `Unknown`: no workflow file at
+  all, or none with a pull request trigger or a push trigger for branches (only `workflow_dispatch`, a schedule, a release,
+  `push` for tags: CI may be another service's, and "add a pull_request trigger" would be the wrong fix), a file unreadable, over
+  the bounds or not valid YAML, `branches` beside `branches-ignore`, a pattern that cannot be translated, an event outside the
+  known lists such as `workflow_run`, GitHub not answering the repository or the listing. A `Never` for either kind (the stories'
+  first) → BLOCK: a `ci-triggers` checkpoint (`blocked: <repo>: …`, outcome gate_rejected) and the plan item escalates with the
+  repository, the fix, then the workflow files read with why — no planner session, story or changeset branch; the owner fixes the
+  workflow on the default branch and re-runs the plan item. Blocking is chosen over a warning because every story would otherwise
+  be guaranteed to time out, or — the changeset PR — every story be built and the plan then never delivered. The reason puts the
+  fix before the file list and bounds both (the escalation comment clips a reason at `LedgerReport.MaxReasonLength` 4,000): at
+  most `CiTriggers.MaxFixes` (3) workflows' fixes, any one being enough, then "(or likewise in N more)", and at most
+  `CiTriggers.MaxListed` (10) files, those that are why first, then "… N more". The fix names the pattern the base needs:
+  ``add `factory/**` to the pull_request branches filter of <file>`` for story PRs, ``add `<default branch>` …`` for the changeset
+  PR (a workflow's text is never repeated; an unusual file or default-branch name is not shown). Else an `Unknown` for either →
+  a `ci-triggers` checkpoint (`warning: <repo>: …`, outcome failed, written when it changes) and a `[plan] warning:` log line, and
   planning goes on. Nothing is weakened either way: the gate still needs green CI on every head. No start-up warning: `factory run`
   and `factory work` read nothing from GitHub at start-up, and one per configured repository would add a GitHub dependency that
   could fail start-up; the plan-time check is the only one. A pipeline with no gate stage (tests only) does not check.

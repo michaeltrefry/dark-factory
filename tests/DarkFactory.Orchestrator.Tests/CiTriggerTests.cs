@@ -18,6 +18,9 @@ public class CiTriggerTests
     private const string Head = "factory/sc-500";
     private const string File = ".github/workflows/ci.yml";
 
+    /// <summary>Why a repository with no pull request or push branch trigger in any workflow is "cannot tell".</summary>
+    private const string NoBranchTrigger = "cannot be told: no workflow has a pull_request trigger or a push trigger for branches, so CI may be another service's";
+
     private static CiTriggerCheck Check(params string[] workflows) =>
         CiTriggers.Check([.. workflows.Select((text, i) => new WorkflowFile(i == 0 ? File : $".github/workflows/w{i}.yml", text))], Base, Head);
 
@@ -61,13 +64,15 @@ public class CiTriggerTests
         { "on:\n  pull_request:\n    branches: [main]\n  push:\n    branches: [main]\n", CiTriggerOutcome.Never, "its pull_request branches filter leaves out" },
         { "on:\n  pull_request:\n    branches: [main]\n  push:\n    tags: ['v*']\n", CiTriggerOutcome.Never, "its pull_request branches filter leaves out" },
         { "on:\n  push:\n    branches: [main]\n", CiTriggerOutcome.Never, $"its push branches filter leaves out {Head}" },
-        { "on:\n  push:\n    tags: ['v*']\n", CiTriggerOutcome.Never, "its push trigger is for tags only" },
-        // No pull request or push trigger at all.
-        { "on: workflow_dispatch\n", CiTriggerOutcome.Never, "no pull_request or push trigger" },
-        { "on:\n  schedule:\n    - cron: '0 3 * * *'\n  workflow_dispatch:\n", CiTriggerOutcome.Never, "no pull_request or push trigger" },
-        { "on: [release, workflow_call]\n", CiTriggerOutcome.Never, "no pull_request or push trigger" },
 
         // ---- cannot tell ----
+        // No pull request trigger and no push trigger for branches at all: nothing says this repository's CI is GitHub Actions
+        // (the same as no workflow file), so it is never a stop.
+        { "on:\n  push:\n    tags: ['v*']\n", CiTriggerOutcome.Unknown, $"{File} (its push trigger is for tags only)" },
+        { "on: workflow_dispatch\n", CiTriggerOutcome.Unknown, NoBranchTrigger },
+        { "on: workflow_dispatch\n", CiTriggerOutcome.Unknown, $"{File} (no pull_request or push trigger)" },
+        { "on:\n  schedule:\n    - cron: '0 3 * * *'\n  workflow_dispatch:\n", CiTriggerOutcome.Unknown, NoBranchTrigger },
+        { "on: [release, workflow_call]\n", CiTriggerOutcome.Unknown, NoBranchTrigger },
         { "on: [push\n", CiTriggerOutcome.Unknown, "not valid YAML" },
         { "", CiTriggerOutcome.Unknown, "no `on:` key" },
         { "- a\n- b\n", CiTriggerOutcome.Unknown, "no `on:` key" },
@@ -166,7 +171,23 @@ public class CiTriggerTests
         const string broken = "on: [push\n";
         const string manual = "on: workflow_dispatch\n";
 
+        const string tags = "on:\n  push:\n    tags: ['v*']\n";
+        const string pushFiltered = "on:\n  push:\n    branches: [main]\n";
+
+        Assert.Equal(CiTriggerOutcome.Never, Check(filtered).Outcome);
         Assert.Equal(CiTriggerOutcome.Never, Check(filtered, manual).Outcome);
+        Assert.Equal(CiTriggerOutcome.Never, Check(manual, tags, filtered).Outcome);
+        // A push trigger's branch filter is that evidence too.
+        Assert.Equal(CiTriggerOutcome.Never, Check(manual, pushFiltered).Outcome);
+        // No workflow with a branch filter that leaves the pull request out: nothing says CI is GitHub Actions at all (a
+        // dispatch-only deploy, a scheduled bot, a tag release), so it is unknown however many such workflows there are.
+        foreach (var check in new[] { Check(manual), Check(tags), Check(manual, tags, "on: [release, workflow_call]\n") })
+        {
+            Assert.Equal(CiTriggerOutcome.Unknown, check.Outcome);
+            Assert.Contains(NoBranchTrigger, check.Reason);
+            Assert.DoesNotContain("Fix:", check.Reason);
+            Assert.StartsWith(CiTriggerCheck.WarningPrefix, check.ToDetail());
+        }
         // One workflow that runs is enough, whatever else there is.
         Assert.Equal(CiTriggerOutcome.Runs, Check(filtered, broken, runs).Outcome);
         // One that cannot be read leaves it unknown: it might be the one that runs.
@@ -179,22 +200,76 @@ public class CiTriggerTests
     }
 
     [Fact]
-    public void A_stop_names_every_file_read_and_the_exact_fix()
+    public void A_stop_names_the_exact_fix_and_then_every_file_read()
     {
         var check = Check("on:\n  pull_request:\n    branches: [main]\n", "on: workflow_dispatch\n", "on:\n  pull_request_target:\n    branches-ignore: ['factory/**']\n");
 
         Assert.Equal(CiTriggerOutcome.Never, check.Outcome);
-        Assert.Equal($"no CI workflow runs for a pull request into {Base}. Workflows read on the default branch: "
-            + $"{File} (its pull_request branches filter leaves out {Base}); .github/workflows/w1.yml (no pull_request or push trigger); "
-            + $".github/workflows/w2.yml (its pull_request_target branches-ignore filter leaves out {Base}). "
+        // The fix first, then the files — those a branch filter stopped before the others.
+        Assert.Equal($"no CI workflow runs for a pull request into {Base}. "
             + $"Fix: add `factory/**` to the pull_request branches filter of {File}, or take the pattern that matches {Base} out of the "
-            + "pull_request_target branches-ignore filter of .github/workflows/w2.yml", check.Reason);
+            + "pull_request_target branches-ignore filter of .github/workflows/w2.yml. Workflows read on the default branch: "
+            + $"{File} (its pull_request branches filter leaves out {Base}); "
+            + $".github/workflows/w2.yml (its pull_request_target branches-ignore filter leaves out {Base}); "
+            + ".github/workflows/w1.yml (no pull_request or push trigger)", check.Reason);
         Assert.Equal(CiTriggerCheck.BlockedPrefix + check.Reason, check.ToDetail());
 
-        // No workflow has a pull request trigger to widen: the fix is to add one.
-        var manual = Check("on: workflow_dispatch\n");
-        Assert.Equal(CiTriggerOutcome.Never, manual.Outcome);
-        Assert.Contains($"Fix: add a pull_request trigger with no branches filter, or one whose branches list has `factory/**`, to a CI workflow (e.g. {File})", manual.Reason);
+        // Only a push filter is why (no pull request trigger to widen): the fix is to add one, to that workflow.
+        var push = Check("on: workflow_dispatch\n", "on:\n  push:\n    branches: [main]\n");
+        Assert.Equal(CiTriggerOutcome.Never, push.Outcome);
+        Assert.Contains("Fix: add a pull_request trigger with no branches filter, or one whose branches list has `factory/**`, to a CI workflow (e.g. .github/workflows/w1.yml). Workflows read", push.Reason);
+    }
+
+    [Fact]
+    public void A_stop_of_a_repository_with_many_workflows_keeps_its_fix_first_and_bounds_the_files_it_lists()
+    {
+        var check = Check([.. Enumerable.Repeat("on:\n  pull_request:\n    branches: [main]\n", 50)]);
+
+        Assert.Equal(CiTriggerOutcome.Never, check.Outcome);
+        Assert.StartsWith($"no CI workflow runs for a pull request into {Base}. Fix: add `factory/**` to the pull_request branches filter of {File}, or add ", check.Reason);
+        // Any one fix is enough: three are named, the rest counted.
+        Assert.Equal(CiTriggers.MaxFixes, check.Reason.Split("add `factory/**` to the pull_request branches filter of ").Length - 1);
+        Assert.Contains($"of .github/workflows/w2.yml (or likewise in 47 more). Workflows read on the default branch: {File} (", check.Reason);
+        // Ten files are listed, the rest counted.
+        Assert.Equal(CiTriggers.MaxListed, check.Reason.Split("(its pull_request branches filter leaves out").Length - 1);
+        Assert.EndsWith($".github/workflows/w9.yml (its pull_request branches filter leaves out {Base}); … 40 more", check.Reason);
+        Assert.True(check.Reason.Length < 2000, check.Reason.Length.ToString());
+
+        // A "cannot tell" is bounded the same way, the files that are why first.
+        var unknown = Check([.. Enumerable.Repeat("on:\n  pull_request:\n    branches: [main]\n", 30), "on: [push\n"]);
+        Assert.Equal(CiTriggerOutcome.Unknown, unknown.Outcome);
+        Assert.Contains("Workflows read on the default branch: .github/workflows/w30.yml (not valid YAML); ", unknown.Reason);
+        Assert.EndsWith("; … 21 more", unknown.Reason);
+    }
+
+    [Fact]
+    public void The_changeset_pull_request_into_the_default_branch_is_answered_by_the_same_rules_and_its_fix_names_that_branch()
+    {
+        const string trunk = "trunk";
+        CiTriggerCheck Changeset(string workflow) => CiTriggers.Check([new WorkflowFile(File, workflow)], trunk, Base);
+
+        // Runs for every story (base factory/changeset-…), never for the pull request that takes the changeset to the default branch.
+        const string factoryOnly = "on:\n  pull_request:\n    branches: ['factory/**']\n";
+        Assert.Equal(CiTriggerOutcome.Runs, Check(factoryOnly).Outcome);
+        var never = Changeset(factoryOnly);
+        Assert.Equal(CiTriggerOutcome.Never, never.Outcome);
+        Assert.Equal($"no CI workflow runs for a pull request into {trunk}. Fix: add `{trunk}` to the pull_request branches filter of {File}. "
+            + $"Workflows read on the default branch: {File} (its pull_request branches filter leaves out {trunk})", never.Reason);
+        // A push workflow for the story branches only: the changeset branch is the head here.
+        var push = Changeset("on:\n  push:\n    branches: ['factory/sc-*']\n");
+        Assert.Equal(CiTriggerOutcome.Never, push.Outcome);
+        Assert.Contains($"Fix: add a pull_request trigger with no branches filter, or one whose branches list has `{trunk}`, to a CI workflow (e.g. {File})", push.Reason);
+        Assert.Contains($"its push branches filter leaves out {Base}", push.Reason);
+
+        Assert.Equal(CiTriggerOutcome.Runs, Changeset("on:\n  pull_request:\n    branches: [trunk]\n").Outcome);
+        Assert.Equal(CiTriggerOutcome.Runs, Changeset("on:\n  push:\n    branches: ['factory/**']\n").Outcome);
+        Assert.Equal(CiTriggerOutcome.Unknown, Changeset("on: workflow_dispatch\n").Outcome);
+
+        // The default branch's name is the repository's text: an unusual one is not repeated.
+        var odd = CiTriggers.Check([new WorkflowFile(File, factoryOnly)], "@everyone <b>", Base);
+        Assert.Equal(CiTriggerOutcome.Never, odd.Outcome);
+        Assert.DoesNotContain("@everyone", odd.Reason);
+        Assert.Contains("Fix: add `the default branch` to the pull_request branches filter", odd.Reason);
     }
 
     [Fact]
@@ -225,6 +300,11 @@ public class CiTriggerTests
     {
         Assert.StartsWith(CiTriggerCheck.BlockedPrefix, new CiTriggerCheck(CiTriggerOutcome.Never, "x").ToDetail());
         Assert.StartsWith(CiTriggerCheck.WarningPrefix, new CiTriggerCheck(CiTriggerOutcome.Unknown, "x").ToDetail());
+        Assert.StartsWith(CiTriggerCheck.WarningPrefix, new CiTriggerCheck(CiTriggerOutcome.Runs, "x").ToDetail());
+        // What the check itself answers: a branch filter leaving the pull request out is blocked, no branch trigger at all a warning.
+        Assert.True(CiTriggerCheck.IsBlocked(Check("on:\n  pull_request:\n    branches: [main]\n").ToDetail()));
+        Assert.False(CiTriggerCheck.IsBlocked(Check("on: workflow_dispatch\n").ToDetail()));
+        Assert.False(CiTriggerCheck.IsBlocked(Check("on:\n  push:\n    tags: ['v*']\n").ToDetail()));
     }
 
     // ---- the gate's GitHub client ----
@@ -236,6 +316,7 @@ public class CiTriggerTests
     private static (GitHubGate Gate, FakeApi Api) Gate(Action<FakeApi> routes)
     {
         var api = new FakeApi()
+            .On($"GET {Repo}", HttpStatusCode.OK, """{"name":"dark-factory-sandbox","default_branch":"trunk"}""")
             .On($"GET {Repo}/installation", HttpStatusCode.OK, """{"id":555}""")
             .On("POST /app/installations/555/access_tokens", _ => FakeApi.Json(HttpStatusCode.Created,
                 $$"""{"token":"ghs_gate","expires_at":"{{DateTimeOffset.UtcNow.AddMinutes(59):O}}"}"""));
@@ -260,8 +341,11 @@ public class CiTriggerTests
             .On($"GET {Repo}/contents/.github/workflows/release.yaml", _ => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("on: release\n") })
             .On($"GET {Repo}/contents/.github/workflows/gone.yml", _ => new HttpResponseMessage(HttpStatusCode.InternalServerError) { Content = new StringContent("boom") }));
 
-        var files = await gate.GetWorkflowsAsync(Sandbox, CancellationToken.None);
+        var read = await gate.GetWorkflowsAsync(Sandbox, CancellationToken.None);
+        var files = read.Files;
 
+        // The default branch is the one GitHub names for the repository.
+        Assert.Equal("trunk", read.DefaultBranch);
         Assert.Equal(
         [
             new WorkflowFile(".github/workflows/ci.yml", "on: pull_request\n"),
@@ -283,11 +367,18 @@ public class CiTriggerTests
     public async Task A_repository_with_no_workflow_directory_has_no_workflow_files_and_an_unreadable_listing_throws()
     {
         var (none, _) = Gate(a => a.On($"GET {Repo}/contents/.github/workflows", HttpStatusCode.NotFound, """{"message":"Not Found"}"""));
-        Assert.Empty(await none.GetWorkflowsAsync(Sandbox, CancellationToken.None));
+        Assert.Equal(new RepoWorkflows("trunk", []), await none.GetWorkflowsAsync(Sandbox, CancellationToken.None), (a, b) => a.DefaultBranch == b.DefaultBranch && a.Files.SequenceEqual(b.Files));
 
         var (refused, _) = Gate(a => a.On($"GET {Repo}/contents/.github/workflows", HttpStatusCode.Forbidden, """{"message":"Resource not accessible by integration"}"""));
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => refused.GetWorkflowsAsync(Sandbox, CancellationToken.None));
         Assert.Contains("403", ex.Message);
+
+        // The default branch is never guessed: a repository that cannot be read, or an answer naming none, throws.
+        var (hidden, _) = Gate(a => a.On($"GET {Repo}", HttpStatusCode.NotFound, """{"message":"Not Found"}"""));
+        Assert.Contains("404", (await Assert.ThrowsAnyAsync<InvalidOperationException>(() => hidden.GetWorkflowsAsync(Sandbox, CancellationToken.None))).Message);
+        var (unnamed, unnamedApi) = Gate(a => a.On($"GET {Repo}", HttpStatusCode.OK, """{"name":"dark-factory-sandbox"}"""));
+        Assert.Contains("names no default branch", (await Assert.ThrowsAsync<InvalidOperationException>(() => unnamed.GetWorkflowsAsync(Sandbox, CancellationToken.None))).Message);
+        Assert.DoesNotContain(unnamedApi.Requests, r => r.PathAndQuery.Contains("/contents/"));
 
         // `.github/workflows` that is a file, not a directory.
         var (file, _) = Gate(a => a.On($"GET {Repo}/contents/.github/workflows", HttpStatusCode.OK, """{"name":"workflows","type":"file","size":1}"""));
@@ -308,7 +399,7 @@ public class CiTriggerTests
             }
         });
 
-        var files = await gate.GetWorkflowsAsync(Sandbox, CancellationToken.None);
+        var files = (await gate.GetWorkflowsAsync(Sandbox, CancellationToken.None)).Files;
 
         Assert.Equal(GitHubGate.MaxWorkflows + 1, files.Count);
         Assert.Equal(new WorkflowFile(".github/workflows", null, $"more than {GitHubGate.MaxWorkflows} workflow files, the first {GitHubGate.MaxWorkflows} read"), files[^1]);

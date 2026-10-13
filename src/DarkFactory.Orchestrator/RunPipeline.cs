@@ -299,7 +299,7 @@ public sealed partial class RunPipeline(
         /// <summary>
         /// Plan: what the check of a repository's CI workflow triggers found (sc-25873, <see cref="Gate.CiTriggers"/>), when it is not
         /// "a workflow runs" — Detail is <see cref="Gate.CiTriggerCheck.ToDetail"/>, starting with the repository: <c>blocked: …</c>
-        /// (no workflow can run for a pull request into the plan's changeset branch: no story is created and the item escalates) or
+        /// (no workflow can run for the plan's story pull requests, or for its changeset pull request: no story is created and the item escalates) or
         /// <c>warning: …</c> (it could not be told; planning goes on). A warning is written when it changes, not every run.
         /// </summary>
         public const string CiTriggers = "ci-triggers";
