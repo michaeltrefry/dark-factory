@@ -120,6 +120,20 @@ public class SandboxReadinessTests
     public async Task Claude_login_mode_probes_only_the_variables_it_sends() =>
         await FactoryRunner.EnsureSandboxReadyAsync(Sandbox(StaleAllowlist), WorkerAuth.ClaudeLogin, Claude(), CancellationToken.None);
 
+    [Fact]
+    public async Task The_readiness_probe_and_the_claude_version_check_run_the_helper_under_the_sandbox_users_lock()
+    {
+        // Both are runs of the helper, whose exit kills every process of the worker user (sc-25988).
+        var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, "root")).FullName);
+        var log = Path.Combine(_dir, "lock-probes");
+        var sandbox = Sandbox(CurrentAllowlist) with { Lock = workerLock, SudoPath = SandboxSupport.LockProbingSudo(_dir, workerLock, log) };
+
+        await FactoryRunner.EnsureSandboxReadyAsync(sandbox, WorkerAuth.RouterKey, Claude(), CancellationToken.None);
+
+        Assert.Equal(["held", "held"], File.ReadAllLines(log));
+        Assert.False(workerLock.IsHeld);
+    }
+
     /// <summary>
     /// An installed helper that is not the repo's helper after setup's two edits fails start-up before it ever runs (an older
     /// one may lack the uid sweep's guards), naming the reinstall command.

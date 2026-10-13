@@ -44,8 +44,7 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
         if (runLock is null)
         {
             // A run that drives a worker or the gate watches the item's control and stops it at once. The run of a plan item that
-            // waits on its stories (sc-25876) only evaluates them: it sees the Stop when the evaluation ends, and a run started without
-            // the worker run lock leaves it to the next one. Until then nothing of the plan is stopped, and the answer says so.
+            // waits on its stories (sc-25876) only evaluates them: it sees the Stop when the evaluation ends. Until then nothing of the plan is stopped, and the answer says so.
             return (await ledger.HistoryAsync(item, ct)).Any(e => e.Step == RunPipeline.Steps.PlanStories)
                 ? new ControlResult(false,
                     $"{id}: stop NOT finished: it is a plan and a run of it is active. It stays Stopping; that run finishes the stop when its "

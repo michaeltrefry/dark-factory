@@ -8,8 +8,9 @@ opt-in: the tests skip, naming the missing prerequisite, unless their gate varia
 - **The `_factory` user is single-tenant.** Every exit of the sandbox launch helper kills *every* `_factory`
   process. Do not use an interactive `_factory` session (e.g. its Claude login) while any live test below runs.
 - **Stop your own `factory work` / `factory run` first.** The `factory work` tests (AT2–AT5) hold the configured
-  work root's run lock (`<Factory:WorkRoot>/.factory-run.lock`) for their whole run and skip if a real sandboxed run
-  holds it, so they never share `_factory` with one. They run against a **throwaway ledger database**
+  work root's sandbox lock (`<Factory:WorkRoot>/.factory-run.lock`) for their whole run and skip if a real run's worker
+  phase holds it at that moment, so they never share `_factory` with one (a real run started meanwhile waits at its
+  worker phases, sc-25988). They run against a **throwaway ledger database**
   (`df_e2e_at<N>_<guid>` on the configured Postgres, dropped afterwards) and their **own work root**
   (`<Factory:WorkRoot>/e2e/<db name>`), so they never read or change your real ledger, controls or worktrees.
   Clones left under `<Factory:WorkRoot>/e2e/` may be deleted by hand afterwards.
@@ -647,7 +648,7 @@ What the live test does not cover, and the unit tests do (`PlanReleasePipelineTe
 plan (held until the factory merges it or the board shows it finished), an archived story, a released story moved back to the
 Backlog, a plan whose stories were never recorded (a marked story is refused at claim), a plan that cannot be evaluated (one comment
 and one `plan-held` row after `Intake:MaxItemFailures` failures), a closeout the board keeps refusing (the item stays `Planned`,
-"post it by hand"), and a Stop landing on a waiting plan after its runner took no worker run lock (deferred to the next run).
+"post it by hand"), and a Stop landing on a waiting plan while it is evaluated (finished by that run, sc-25988).
 
 ## P4-AT2 — a plan across two repositories: a changeset in each, merged in the plan's order (sc-25873)
 

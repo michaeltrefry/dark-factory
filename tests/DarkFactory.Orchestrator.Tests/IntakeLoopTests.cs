@@ -577,7 +577,7 @@ public class IntakeLoopTests
     public async Task Factory_wide_failure_ends_the_poll_shows_one_factory_error_and_escalates_no_item()
     {
         var runner = new ThrowingRunner([5, 6], _ => new FactoryUnavailableException(
-            "the worker run lock: Another factory run is using /w", new InvalidOperationException("locked")));
+            "the worker sandbox: Stale helper: re-run setup", new InvalidOperationException("stale")));
         var status = new IntakeStatus(TimeProvider.System);
         var loop = Loop(new ScriptedSource(() => [7]), runner, status);
 
@@ -590,7 +590,7 @@ public class IntakeLoopTests
         Assert.Empty(runner.GaveUp);
         Assert.Empty(status.ItemErrors);
         Assert.Equal(4, status.FactoryError!.Count);
-        Assert.Contains("Another factory run", status.FactoryError.Message);
+        Assert.Contains("Stale helper", status.FactoryError.Message);
 
         runner.Throws = _ => null;
         await loop.PollOnceAsync(CancellationToken.None);
@@ -619,15 +619,19 @@ public class IntakeLoopTests
             ["GitHub:Gate:AppId"] = "2",
             ["GitHub:Gate:PrivateKeyPem"] = "gate-pem",
             ["Factory:WorkRoot"] = root,
-            // Never reached (the lock below is held), and never the real sandbox user or helper.
+            // The run's first set-up step: a ledger nothing listens on (never the compose Postgres).
+            ["ConnectionStrings:Ledger"] = "Host=127.0.0.1;Port=1;Database=none;Username=none;Password=none;Timeout=2",
+            // Never reached, and never the real sandbox user or helper.
             ["Worker:RunAs"] = "df-test-no-such-user",
             ["Worker:LaunchHelper"] = "/nonexistent/df-test-helper",
         }).Build(), new InMemorySecrets());
 
-        using var held = WorkerLock.Acquire(root); // another sandboxed run holds the work root
+        // Another run's worker phase holding the sandbox user is no failure any more (sc-25988: a run waits for it, at its own
+        // worker phase); what every item still shares is the set-up, e.g. the ledger.
+        using var held = WorkerLock.Acquire(root);
         var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
             FactoryRunner.RunAsync(options, GoneStory(), 101, ignoreScope: false, TextWriter.Null, CancellationToken.None));
-        Assert.Contains("only one worker may run at a time", ex.Message);
+        Assert.StartsWith("the ledger: ", ex.Message);
         Assert.True(IntakeLoop.IsFactoryWide(ex));
     }
 }

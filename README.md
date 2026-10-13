@@ -238,8 +238,10 @@ killing every `_factory` process, so close `_factory` sessions and stop `factory
   (all but the helper itself, which then exits with the worker's status), so nothing that forked and `setsid()`ed away survives the run.
   That sweep runs only as `_factory`'s own uid, which setup pins into the installed helper (`sandbox_uid`, in 400–499);
   setup refuses an existing `_factory` whose uid is outside that range.
-  That makes `_factory` single-tenant: **one sandboxed `factory run` at a time per machine**, enforced by
-  a lock on `<work root>/.factory-run.lock` (a second run fails fast).
+  That makes `_factory` single-tenant: **one worker phase at a time per machine** (a worker session, the gate's sandboxed
+  test runs, a deletion or stop through the helper), enforced by a lock on `<work root>/.factory-run.lock` that a run holds
+  for that phase only and waits for — so `factory run` beside `factory work`, or several items of `factory work`
+  (`Intake:MaxConcurrentRuns`), overlap while they wait on reviews, CI and the merge queue.
 - **`/opt/dark-factory/work`**: the work root (clones + worktrees), owned by you under a root-owned
   parent, readable by `_factory` (an inheritable ACL on the work root itself, never applied recursively).
   Each worktree directory is created empty and shared first (an inheritable read/write ACL for you and

@@ -445,9 +445,9 @@ public class SafeHelperTests
             ],
             ["CliAndConfigTests.cs"] =
             [
-                "Assert.Equal(new Worker.WorkerSandbox(\"_factory\", \"/usr/local/" + installedMarkers[1] + "/" + helperName + "\"), options.Worker" + "Sandbox);",
+                "Assert.Equal(new Worker.WorkerSandbox(\"_factory\", \"/usr/local/" + installedMarkers[1] + "/" + helperName + "\") { Lock = Locked(\"/opt/dark-factory/work\") }, options.Worker" + "Sandbox);",
                 "var custom = Options(new() { [\"Worker:RunAs\"] = \"_df2\", [\"Worker:Launch" + "Helper\"] = \"/opt/h\", [\"Factory:WorkRoot\"] = \"/w\" });",
-                "Assert.Equal(new Worker.WorkerSandbox(\"_df2\", \"/opt/h\"), custom.Worker" + "Sandbox);",
+                "Assert.Equal(new Worker.WorkerSandbox(\"_df2\", \"/opt/h\") { Lock = Locked(\"/w\") }, custom.Worker" + "Sandbox);",
                 "Assert.Null(options.Worker" + "Sandbox);",
                 "Assert.Throws<InvalidOperationException>(() => Options(new() { [\"Worker:RunAs\"] = \"\" }).Worker" + "Sandbox);",
             ],

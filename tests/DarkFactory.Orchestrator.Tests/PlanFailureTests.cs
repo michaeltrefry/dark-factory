@@ -299,9 +299,9 @@ public class PlanFailurePipelineTests
         public FakePullRequests Prs { get; } = new();
         public StringWriter Log { get; } = new();
 
-        public Task<RunOutcome> Run(int id = PlanId, IWorker? worker = null, bool workerless = false) =>
+        public Task<RunOutcome> Run(int id = PlanId, IWorker? worker = null) =>
             new RunPipeline(Source, Ledger, Locks, Workspaces, worker ?? new FakeWorker(Reports(Ok)), Prs, Sandbox, Log, controls: Controls,
-                controlPollInterval: TimeSpan.FromMilliseconds(10), workerless: workerless).RunAsync(id, CancellationToken.None);
+                controlPollInterval: TimeSpan.FromMilliseconds(10)).RunAsync(id, CancellationToken.None);
 
         public ControlActions Actions => new(Controls, Contexts, new Stops(this), Source, Locks);
 
@@ -1012,10 +1012,8 @@ public class PlanFailurePipelineTests
         }
     }
 
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task A_stop_that_lands_while_a_plan_is_evaluated_is_finished_by_that_run_or_deferred_by_one_without_the_worker_lock(bool workerless)
+    [Fact]
+    public async Task A_stop_that_lands_while_a_plan_is_evaluated_is_finished_by_that_run()
     {
         var h = new Harness();
         var ids = await h.Planned(Fork);
@@ -1033,19 +1031,10 @@ public class PlanFailurePipelineTests
             return null;
         };
 
-        var outcome = await h.Run(workerless: workerless);
+        var outcome = await h.Run();
 
         Assert.Equal(1, landed);
         h.Board.Intercept = null;
-        if (workerless)
-        {
-            // No worker run lock: said, and left to the next run, which the listing puts first.
-            Assert.Equal(WorkState.Planned, outcome.State);
-            Assert.Contains($"{Plan}: stop deferred to the next run", outcome.Error);
-            Assert.Equal((WorkState.Planned, WorkState.Review), (await h.ItemState(PlanId), await h.ItemState(ids[2])));
-            Assert.Equal(PlanId, (await h.InFlight())[0]);
-            outcome = await h.Run();
-        }
         // The plan item is not left Stopping with nobody acting on it: its stories are stopped and it is Cancelled.
         Assert.Equal((WorkState.Cancelled, (string?)null), (outcome.State, outcome.Error));
         Assert.Equal(WorkState.Cancelled, await h.ItemState(ids[2]));
@@ -1117,16 +1106,12 @@ public class PlanFailurePipelineTests
         Assert.Equal((WorkState.Review, WorkState.Cancelled, WorkState.Planned), (await h.ItemState(a), await h.ItemState(b), await h.ItemState(PlanId)));
         Assert.Contains(await h.Rows(a), r => r.Step == RunPipeline.Steps.PrsDrafted);
         Assert.Empty(h.Comments(PlanId));
-        // Both are listed as being stopped, the plan first; a workerless run of the plan defers the stop, touching nothing.
+        // Both are listed as being stopped, the plan first.
         Assert.Equal([PlanId, a], await h.InFlight());
         h.Board.Intercept = null;
         h.Board.Requests.Clear();
-        var deferred = await h.Run(workerless: true);
-        Assert.Contains("stop deferred to the next run", deferred.Error);
-        Assert.Empty(h.Board.Requests);
-        Assert.DoesNotContain(h.Workspaces.Calls, c => c.StartsWith("reopen ", StringComparison.Ordinal));
 
-        // The next run of the plan (built with the worker lock) finishes it: A's draft is not repeated, B is not stopped twice.
+        // The next run of the plan finishes it: A's draft is not repeated, B is not stopped twice.
         var finished = await h.Run();
 
         Assert.Equal((WorkState.Cancelled, (string?)null), (finished.State, finished.Error));
