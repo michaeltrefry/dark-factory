@@ -538,9 +538,12 @@ public sealed partial class RunPipeline(
     /// <c>user-paused</c>, <c>usage-paused</c>, <c>freeze-paused</c>, <c>controls-unreadable</c>) — WHATEVER the factory, epic,
     /// item, usage and freeze controls say now. Unlike <see cref="InFlightAsync"/>, which leaves out what a control pauses: a
     /// pause only holds an item for a while (a freeze until a human's Continue, however long that takes), and a claim that lapsed
-    /// meanwhile would leave the board showing nobody on an item the factory resumes. Not listed, so not renewed: an item being
-    /// stopped (its own Stop or its plan's; the stop gives the claim back), a parked one (a refused or a lost claim, a give-up),
-    /// an escalated one, a plan waiting on its stories, a merged or finished one. This is never a list of what to run.
+    /// meanwhile would leave the board showing nobody on an item the factory resumes. Also listed (sc-25984): a plan item waiting
+    /// on its stories (<see cref="WorkState.Planned"/>) — it has no handler, but the factory drives it for as long as its stories
+    /// take, often more than a claim's lifetime, and then takes its changeset pull request through the gate; a plan item whose
+    /// claim is lost is not paused for it (<see cref="ClaimLostAsync"/>: its evaluation works nothing). Not listed, so not
+    /// renewed: an item being stopped (its own Stop or its plan's; the stop gives the claim back), a parked one (a refused or a
+    /// lost claim, a give-up), an escalated one, a merged or finished one. This is never a list of what to run.
     /// The controls are read only to leave out an item being stopped: when they cannot be read the item is listed (a claim renewed
     /// on an item whose stop then releases it costs nothing; an unreadable control must not cost every item its claim), so this
     /// throws only when the ledger itself cannot be read.
@@ -555,7 +558,7 @@ public sealed partial class RunPipeline(
         var ids = new List<int>();
         foreach (var item in await ledger.ActiveItemsAsync(naming.Source, ct))
         {
-            var resumes = handled.Contains(item.State)
+            var resumes = handled.Contains(item.State) || item.State == WorkState.Planned
                 || (item.State == WorkState.Paused && ResumesAutomatically(await ledger.HistoryAsync(item, ct), handled));
             if (!resumes || !naming.TryParse(item.ExternalId, out var id))
             {
@@ -1447,9 +1450,12 @@ public sealed partial class RunPipeline(
         : result.UsageLimited ? UsagePause.WorkerRateLimited
         : null;
 
-    /// <summary>What the worker handed <paramref name="story"/> reads: the owner's story, or an issue item's approved triage (never the issue's text).</summary>
+    /// <summary>
+    /// What the worker handed <paramref name="story"/> reads: the owner's story (an item of a trusted source,
+    /// <see cref="ItemNaming.Trusted"/>), or an issue item's approved triage (never the issue's text).
+    /// </summary>
     private static WorkerInput SpecInput(WorkStory story) =>
-        story.Kind == ItemNaming.GitHubIssue ? WorkerInput.TriageSummary : WorkerInput.Story;
+        story.Kind.Trusted ? WorkerInput.Story : WorkerInput.TriageSummary;
 
     /// <summary>
     /// The push grant for the current worker attempt (E4): every session the attempt recorded (read fresh, so a session id that

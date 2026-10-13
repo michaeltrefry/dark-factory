@@ -43,6 +43,13 @@ public sealed class KanbanKeys(IDbContextFactory<LedgerDbContext> contexts, Time
         }
     }
 
+    /// <summary>The key of an item the ledger already knows, or null: nothing is allocated (for text that only names an item, sc-25984).</summary>
+    public async Task<int?> KnownAsync(Guid itemId, CancellationToken ct)
+    {
+        await using var db = await contexts.CreateDbContextAsync(ct);
+        return (await db.KanbanItems.AsNoTracking().SingleOrDefaultAsync(i => i.ItemId == itemId, ct))?.Id;
+    }
+
     /// <summary>The board id of the item with this key, or null for a key the ledger never gave out.</summary>
     public async Task<Guid?> ItemAsync(int key, CancellationToken ct)
     {

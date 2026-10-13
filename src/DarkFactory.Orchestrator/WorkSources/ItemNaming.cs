@@ -17,8 +17,18 @@ namespace DarkFactory.Orchestrator.WorkSources;
 /// </param>
 public sealed record ItemNaming(string Source, string Prefix, string Noun, bool NumberedEpics = false)
 {
+    /// <summary>
+    /// Whether the source's items are written on the owner's own board, by people the owner lets write there (sc-25984, E5): the one
+    /// place a source's trust is decided. A trusted source's item is the owner's text — its name and description are instructions
+    /// to a worker, unfenced, and its name is written on GitHub as it is — and only a trusted source may plan
+    /// (<see cref="IWorkSource.PlansItems"/>). An untrusted source's item (a GitHub issue: anyone may file one) is data everywhere
+    /// (<see cref="WorkStory.UntrustedName"/>). False unless the source says otherwise (fail closed). Whatever the source, text a
+    /// planning model wrote stays untrusted (<see cref="WorkStory.PlannerAuthored"/>).
+    /// </summary>
+    public bool Trusted { get; init; }
+
     /// <summary>Shortcut stories: <c>sc-&lt;story id&gt;</c>.</summary>
-    public static readonly ItemNaming Shortcut = new("shortcut", "sc", "Shortcut story", NumberedEpics: true);
+    public static readonly ItemNaming Shortcut = new("shortcut", "sc", "Shortcut story", NumberedEpics: true) { Trusted = true };
 
     /// <summary>GitHub issues: <c>gh-&lt;key&gt;</c>, the key the ledger gave the issue (<see cref="Ledger.GitHubIssue"/>), not its number.</summary>
     public static readonly ItemNaming GitHubIssue = new("github", "gh", "GitHub issue");
@@ -27,7 +37,7 @@ public sealed record ItemNaming(string Source, string Prefix, string Noun, bool 
     /// KanbanBoard work items (sc-25981): <c>kb-&lt;key&gt;</c>, the key the ledger gave the item (<see cref="Ledger.KanbanItem"/>) —
     /// its id on the board is a GUID, and a GUID names no branch or control scope a person types.
     /// </summary>
-    public static readonly ItemNaming Kanban = new("kanban", "kb", "Kanban item");
+    public static readonly ItemNaming Kanban = new("kanban", "kb", "Kanban item") { Trusted = true };
 
     /// <summary>Every source's naming.</summary>
     public static readonly IReadOnlyList<ItemNaming> All = [Shortcut, GitHubIssue, Kanban];

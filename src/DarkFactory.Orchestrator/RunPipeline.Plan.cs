@@ -96,10 +96,12 @@ public sealed partial class RunPipeline
         {
             await ledger.CheckpointAsync(item, Steps.PlanCreating, session, null, ct);
         }
+        // The stories name their plan item as its board does (E4: a marker and an idempotency key written onto a board derive
+        // from board ids, never from a key only this ledger knows); the ledger records their own names below (plan-stories).
         IReadOnlyList<int> ids;
         try
         {
-            ids = await source.CreateChildrenAsync(run.Story.Id, plan.Children(run.Story.Ref, run.Repo), ct);
+            ids = await source.CreateChildrenAsync(run.Story.Id, plan.Children(run.Story.BoardRef, run.Repo), ct);
         }
         catch (ChildrenRefusedException refused)
         {
@@ -293,7 +295,7 @@ public sealed partial class RunPipeline
             await ledger.LinkPlanAsync(item, plan, ct);
             return null;
         }
-        return PlanRelease.PlanUnfinishedRefusal(PlannedStory.ParentOf(story.Description));
+        return PlanRelease.PlanUnfinishedRefusal(story.PlannedFrom);
     }
 
     /// <summary>
@@ -304,7 +306,7 @@ public sealed partial class RunPipeline
         source.PlansItems && item.PlanItemId is null && story.PlannerAuthored
         && PlanRelease.IsPlanUnfinishedRefusal((await ledger.HistoryAsync(item, ct)).LastOrDefault(e => e.Step is null)?.Detail)
         && await ledger.PlanOfAsync(Naming.Source, item.ExternalId, ct) is null
-            ? PlanRelease.PlanUnfinishedRefusal(PlannedStory.ParentOf(story.Description))
+            ? PlanRelease.PlanUnfinishedRefusal(story.PlannedFrom)
             : null;
 
     /// <summary>Whether the item is a plan item waiting on its stories: its run needs no worker, so no worker run lock or sandbox.</summary>
@@ -447,7 +449,7 @@ public sealed partial class RunPipeline
             done.Add(story);
         }
         string[] holds = [unreadable && stories.Any(s => !Merged(s) && !released.Contains(s)) ? PlanRelease.HeldUnreadable : "",
-            PlanRelease.HeldByOutsiders(decision.Held),.. archived.Select(PlanRelease.HeldArchived), .. back.Select(PlanRelease.HeldBackInBacklog)];
+            PlanRelease.HeldByOutsiders(decision.Held),.. archived.Select(s => PlanRelease.HeldArchived(s, source.Shelved)), .. back.Select(PlanRelease.HeldBackInBacklog)];
         var held = string.Join("; ", holds.Where(h => h.Length > 0));
         if (held.Length > 0 && held != since.LastOrDefault(e => e.Step == Steps.PlanHeld
             && e.Detail?.StartsWith(PlanRelease.NotEvaluatedPrefix, StringComparison.Ordinal) != true

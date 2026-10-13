@@ -8,7 +8,7 @@ namespace DarkFactory.Orchestrator.Tests.Support;
 /// argument the tool does not have, or a required one missing, is <c>invalid_argument</c>), two tokens (<see cref="FullToken"/> and
 /// <see cref="ReadToken"/>: a write tool with the read token is <c>scope_denied</c> before anything else, an unknown token HTTP
 /// 401), identities by token, expiring claims (claim, renew, release), <c>version</c>/<c>expected_version</c>, comment and
-/// create idempotency keys, idempotent links, cursor paging, and answers in the contract's shapes (a field without a value left
+/// create idempotency keys, idempotent links, dependencies (idempotent; a cycle refused), cursor paging, and answers in the contract's shapes (a field without a value left
 /// out or null as the contract says). Every call is recorded with the token it carried. A test can make it answer <c>busy</c>
 /// (<see cref="Busy"/>) or lose an answer after the write happened (<see cref="LoseAnswer"/>), as the contract's "Errors" allow.
 /// </summary>
@@ -48,6 +48,7 @@ public sealed class FakeKanbanBoard
             "expected_version", "clear"]),
         ["add_work_item_comment"] = (["itemId", "body"], ["author", "idempotency_key"]),
         ["add_work_item_link"] = (["id", "kind", "url"], []),
+        ["add_work_item_dependency"] = (["id", "blocked_by_id"], []),
     };
 
     private static readonly Dictionary<string, (Guid Id, string Name)> Identities = new()
@@ -247,6 +248,14 @@ public sealed class FakeKanbanBoard
                 {
                     return Refusal("invalid_argument", "idempotency_key is 1 to 128 printable ASCII characters without spaces.");
                 }
+                if (arguments["type"]!.GetValue<string>() is not ("Story" or "Issue" or "Task"))
+                {
+                    return Refusal("invalid_argument", "type is Story, Issue or Task.");
+                }
+                if (arguments["epicId"] is not null && Epics.FirstOrDefault(e => e.Id == Id(arguments, "epicId"))?.ProjectId != project.Id)
+                {
+                    return Refusal("invalid_argument", $"Epic {arguments["epicId"]} is archived or belongs to another project.");
+                }
                 // A repeat of the key by the same identity in the project: nothing created, the item as it is now.
                 var earlier = key is null ? null : Items.FirstOrDefault(i => i.ProjectId == project.Id && i.CreatedWith == (identity.Id, key));
                 var made = earlier ?? new Item
@@ -264,7 +273,8 @@ public sealed class FakeKanbanBoard
                 return Ok(created);
             }
         }
-        var idArgument = tool is "claim_work_item" or "renew_work_item_claim" or "release_work_item_claim" or "add_work_item_link" ? "id" : "itemId";
+        var idArgument = tool is "claim_work_item" or "renew_work_item_claim" or "release_work_item_claim" or "add_work_item_link"
+            or "add_work_item_dependency" ? "id" : "itemId";
         if (Items.FirstOrDefault(i => i.Id == Id(arguments, idArgument)) is not { } item)
         {
             return Refusal("not_found", $"Work item {arguments[idArgument]} was not found.");
@@ -364,10 +374,31 @@ public sealed class FakeKanbanBoard
                 }
                 return Ok(ItemShape(item));
             }
+            case "add_work_item_dependency":
+            {
+                if (Items.FirstOrDefault(i => i.Id == Id(arguments, "blocked_by_id")) is not { } blocker)
+                {
+                    return Refusal("not_found", $"Work item {arguments["blocked_by_id"]} was not found.");
+                }
+                // An item may not block itself, directly or through other items.
+                if (blocker == item || WaitsOn(blocker, item))
+                {
+                    return Refusal("cycle", $"Work item {item.Id} would block itself through {blocker.Id}.");
+                }
+                // A dependency that exists changes nothing and succeeds; none moves the version.
+                if (!item.Blockers.Contains(blocker))
+                {
+                    item.Blockers.Add(blocker);
+                }
+                return Ok(ItemShape(item));
+            }
             default:
                 throw new InvalidOperationException($"The fake KanbanBoard does not answer {tool}.");
         }
     }
+
+    /// <summary>Whether <paramref name="item"/> is blocked by <paramref name="by"/>, directly or through other items.</summary>
+    private static bool WaitsOn(Item item, Item by) => item.Blockers.Any(b => b == by || WaitsOn(b, by));
 
     private JsonObject ListItems(JsonObject arguments)
     {

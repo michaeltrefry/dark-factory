@@ -876,6 +876,57 @@ fake MCP server that behaves as KanbanBoard's contract says, `FakeKanbanBoard`),
 pipeline with fakes, and the resume), `KanbanWriteIsolationTests` (E2) and `KanbanKeysPostgresTests` (the migration, and
 processes allocating one item's key at once).
 
+## P4b-AT2 — a `plan`-labelled Kanban item becomes items with dependencies, worked in order and merged by one changeset pull request (sc-25984)
+
+`KanbanPlanAcceptanceTests.P4b_AT2_a_plan_labelled_kanban_item_becomes_items_with_dependencies_worked_in_order_onto_a_changeset_branch_and_merged_by_one_gated_changeset_pull_request`:
+a real KanbanBoard item labelled `plan` through `FactoryRunner.RunAsync`, run by run like P4-AT1 (`factory run kb-N` for the
+plan item, then for each released item), against a throwaway ledger and work root: a real planner session, the real board, real
+workers, the real review panel and merge gate.
+
+Prerequisites: as P4b-AT1 (the router and an enrolled plan, both GitHub Apps on the target repository with its rulesets — the
+gate must be able to merge —, Claude Code for the worker user, `Kanban:WriteToken`, `FACTORY_E2E_P4B_KANBAN_PROJECT`; no
+Shortcut token), a target repository whose CI runs for pull requests into `factory/changeset-*` (as for P4-AT1), and
+
+- `FACTORY_E2E_P4B_PLAN_KANBAN_ITEM`: the id (GUID) of an item of that project that carries the label `plan`, is in an epic, in
+  `Ready`, unclaimed, with no open blocker, and describes three or more steps that build on one another (each step needing the
+  one before), all in the sandbox repository. Use a FRESH item for every run: the planned items' idempotency keys derive from
+  the plan item's GUID and their own text, so a second plan of the same item answers the first run's items again where the
+  planner repeats itself. No other `factory work` may watch the project while it runs.
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_P4B_KANBAN_PROJECT=<KEY> FACTORY_E2E_P4B_PLAN_KANBAN_ITEM=<GUID> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4b_AT2*"
+```
+
+What it checks. The first run ends Planned after one planner session. The plan has at least 3 stories with a dependency chain —
+otherwise the run fails INCONCLUSIVE (`PlanLive.ChainProblem`, as for P4-AT1): describe work whose steps build on one another.
+`plan-stories` names one `kb-<n>` per planned item, each a distinct item of the real board that is not the plan item: its title
+the plan's, its type the board's for the planner's (`Story`/`Issue`/`Task`), in the plan item's project and epic, in `Backlog`,
+unclaimed, its description led by the marker naming the plan item's GUID, and blocked by exactly the items the plan says (the
+board's own dependencies). The changeset branch is `factory/changeset-kb-<n>` (the plan item's ledger name) with no pull
+request yet. Then, until every item has merged: a run of the plan item stays Planned, plans nothing and creates nothing, and
+the released items are exactly those whose blockers have merged — `Ready` on the board, one `plan-released` row each, none
+saying "outside the watch scope" — while the others stay in `Backlog`; a second run with nothing newly merged adds no row; each
+released item's own run ends in Watch with its pull request merged into the changeset branch (`merge-files` names it), a
+verdict, a `gate-passed` row, typed outcomes on every row, a `claimed` row no earlier than its release, and the item `Done` on
+the board. Finally the plan item's runs take it Planned → Review → CI → MergeGate → Merge → Watch: exactly one pull request from
+the changeset branch, into its recorded base, merged, with `gate-passed`; one `plan-creating` row and the same `plan-stories`
+as at the start (nothing was created twice); the plan item `Done` on the board with that pull request as a `pr` link and one
+closeout comment equal to `LedgerReport.PlanCloseout`'s rendering of the throwaway ledger's rows.
+
+It leaves the planned items `Done` (merged) on the board; any a failed run left in `Backlog` or `Ready` are moved to `Closed`
+(best effort) so nothing picks them up afterwards. The changeset and item branches stay on the sandbox, as for P4-AT1.
+
+Not live (every `dotnet test`): `KanbanPlanSourceTests` (child creation — once, in the parent's project and epic, the key and
+the marker from board ids; a retry after a failure part-way at a create and at a dependency; a lost answer; a namesake never
+reused; a cycle refused before any call and by the board; blockers, with a `Closed` one still blocking; release, with a
+conflict; the return of an unstarted item; the type mapping), `SourceTrustTests` (the trust decision per source — prompt, commit
+and pull request name, pull request body — for Shortcut, Kanban, GitHub issues and planned items on each), and
+`KanbanPlanPipelineTests` (over the fake board and a simulated repository through the real pipeline and gate: a plan item
+planned into Backlog items with a changeset branch; a re-run after the board failed part-way; a chain released and worked in
+order, a hand-moved item refused at claim naming its blocker, the changeset pull request and the closeout; a blocker dragged to
+`Done` by hand; an outside blocker and a `Closed` planned item; Stop returning an unstarted item; a cycle the board refuses).
+
 ## P4b-AT3 — a held claim, its renewal, and a stale write (sc-25983)
 
 `KanbanAcceptanceTests.P4b_AT3_a_held_claim_refuses_a_second_caller_is_renewed_past_its_first_expiry_and_a_stale_write_changes_nothing`:

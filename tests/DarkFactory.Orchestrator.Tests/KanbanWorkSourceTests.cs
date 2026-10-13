@@ -494,7 +494,7 @@ public class KanbanWorkSourceTests
 
         var board = $"https://kanban.test/?project={h.Project.Id}&epic={epic.Id}";
         Assert.Equal(new WorkStory(id, "Count words", "Repo: acme/widgets\n\nWordCount(\"  \") returns 1.", "bug", $"{board}&item={item.Id}", ItemNaming.Kanban,
-            Labels: spec.Story.Labels, Estimate: 2), spec.Story);
+            Labels: spec.Story.Labels, Estimate: 2, BoardId: item.Id.ToString("D")), spec.Story);
         Assert.Equal(["simple", "parser"], spec.Story.Labels);
         Assert.Equal($"kb-{id}", spec.Story.Ref);
         // Written on the owner's board: trusted like a Shortcut story (E5), so its name and text are not fenced or made inert.
@@ -819,16 +819,18 @@ public class KanbanWorkSourceTests
     }
 
     [Fact]
-    public async Task The_kanban_source_names_its_items_kb_and_plans_nothing_yet()
+    public void The_kanban_source_names_its_items_kb_is_trusted_and_plans()
     {
         IWorkSource source = new Harness().Source();
 
         Assert.Equal(ItemNaming.Kanban, source.Naming);
         Assert.Equal(("kanban", "kb", "Kanban item"), (source.Naming.Source, source.Naming.Prefix, source.Naming.Noun));
-        Assert.False(source.PlansItems);
+        // The owner's board (E5): its items are trusted, so a `plan` label on one is the owner's and makes it a plan item (sc-25984).
+        Assert.True(source.Naming.Trusted);
+        Assert.True(source.PlansItems);
+        Assert.Equal(("Closed", "move it back to Backlog"), source.Shelved);
         Assert.Null(source.MaxClaimRefusals); // a refused item is listed again only once the board shows it ready again
         Assert.Equal("Add its project back to Kanban:Watch:Projects and move it to Ready", source.ScopeReturnHint);
-        await Assert.ThrowsAsync<NotSupportedException>(() => source.CreateChildrenAsync(1, [], None));
     }
 
     [Fact]

@@ -1,14 +1,22 @@
 namespace DarkFactory.Orchestrator.WorkSources;
 
-/// <summary>One work item (a Shortcut story, or a triaged GitHub issue) as the orchestrator sees it.</summary>
+/// <summary>One work item (a Shortcut story, a Kanban item, or a triaged GitHub issue) as the orchestrator sees it.</summary>
 /// <param name="Naming">The item's source naming; null is a Shortcut story.</param>
 /// <param name="Closes">
 /// The issue the item's PR closes on merge, as GitHub's closing keyword takes it (<c>owner/name#12</c>); null for none.
 /// </param>
 /// <param name="Labels">The item's labels on its board (none when the board has none).</param>
 /// <param name="Estimate">The item's estimate in points; null when it has none (a GitHub issue never has one).</param>
+/// <param name="BoardId">
+/// The item's id on its board, when that is not its ledger name (Kanban: the item's GUID; its <c>kb-&lt;n&gt;</c> is the ledger's
+/// own); null for a source whose ledger name is the board's id (<see cref="BoardRef"/>).
+/// </param>
+/// <param name="PlanRef">
+/// For an item a plan created: the plan item its marker names, as the ledger names it, when the source had to translate it
+/// (Kanban: the <c>kb-&lt;n&gt;</c> of the GUID in the marker); null otherwise (<see cref="PlannedFrom"/>).
+/// </param>
 public sealed record WorkStory(int Id, string Name, string? Description, string StoryType, string AppUrl, ItemNaming? Naming = null,
-    string? Closes = null, IReadOnlyList<string>? Labels = null, int? Estimate = null)
+    string? Closes = null, IReadOnlyList<string>? Labels = null, int? Estimate = null, string? BoardId = null, string? PlanRef = null)
 {
     public ItemNaming Kind => Naming ?? ItemNaming.Shortcut;
 
@@ -19,18 +27,34 @@ public sealed record WorkStory(int Id, string Name, string? Description, string 
     public string PublicName => UntrustedName ? UntrustedText.Inert(Name) : Name;
 
     /// <summary>
-    /// Whether <see cref="Name"/> and <see cref="Description"/> are a model's text rather than the owner's: a GitHub issue's item (its
-    /// name is the triage's title, derived from untrusted issue text), or a story the factory created from a plan
-    /// (<see cref="PlannerAuthored"/>, sc-25870). A Kanban item is written on the owner's board and is trusted like a Shortcut story
-    /// (sc-25981).
+    /// Whether <see cref="Name"/> and <see cref="Description"/> are data rather than the owner's instructions — the one trust
+    /// decision every prompt, commit message and pull request asks (sc-25984, E5). It has two halves and no third: the item's
+    /// source is not trusted (<see cref="ItemNaming.Trusted"/>, a property of the source: a Shortcut story and a Kanban item are
+    /// written on the owner's board, a GitHub issue's item is a triage of text anyone may file), or the factory created the item
+    /// from a plan (<see cref="PlannerAuthored"/>, sc-25870: a planning model's text, untrusted on every source).
     /// </summary>
-    public bool UntrustedName => Kind == ItemNaming.GitHubIssue || PlannerAuthored;
+    public bool UntrustedName => !Kind.Trusted || PlannerAuthored;
 
-    /// <summary>Whether the factory created this story from a plan: its description carries the plan's marker (<see cref="Plans.PlannedStory"/>).</summary>
+    /// <summary>
+    /// Whether the factory created this story from a plan: its description carries the plan's marker (<see cref="Plans.PlannedStory"/>),
+    /// which the code writes on every source, never the model.
+    /// </summary>
     public bool PlannerAuthored => Plans.PlannedStory.IsMarked(Description);
 
     /// <summary>The item's external id, e.g. <c>sc-12</c>.</summary>
     public string Ref => Kind.Format(Id);
+
+    /// <summary>
+    /// How the item is named in what the factory writes ONTO its board about it (E4: a marker, an idempotency key): its id on the
+    /// board (<see cref="BoardId"/>), which is the ledger name itself (<see cref="Ref"/>) for a source that has no other.
+    /// </summary>
+    public string BoardRef => BoardId ?? Ref;
+
+    /// <summary>
+    /// The plan item this story's marker names (<see cref="Plans.PlannedStory.ParentOf"/>), in the ledger's name when the source
+    /// gave one (<see cref="PlanRef"/>); null without a marker. Text anyone may write: only ever shown, never trusted.
+    /// </summary>
+    public string? PlannedFrom => PlanRef ?? Plans.PlannedStory.ParentOf(Description);
 }
 
 /// <param name="Id">
@@ -98,8 +122,8 @@ public sealed record ChildItem(string Name, string Description, string StoryType
     public const string KeyPrefix = "dark-factory:child:";
 
     /// <summary>
-    /// The idempotency key of this child under the parent <paramref name="parentRef"/> (the parent's ledger name, e.g.
-    /// <c>sc-12</c>; sc-25877): written by code, the same on every retry of the same plan — <see cref="KeyPrefix"/>, the parent,
+    /// The idempotency key of this child under the parent <paramref name="parentRef"/> (the parent as its board names it:
+    /// <c>sc-12</c>, a Kanban item's GUID — never a key only the ledger knows, E4; sc-25877): written by code, the same on every retry of the same plan — <see cref="KeyPrefix"/>, the parent,
     /// then the SHA-256 of the name and the description as sent (each UTF-8, the name's byte length first so no two pairs share
     /// a hash). A source stores it on the item it creates, in whatever field of its board holds an opaque id, and finds the child
     /// again by it (<see cref="IWorkSource.CreateChildrenAsync"/>), so it need not get the description back unchanged.
@@ -145,8 +169,9 @@ public interface IWorkSource
 
     /// <summary>
     /// Whether an item of this source labelled <see cref="Plans.PlanLabel.Name"/> is planned into child stories instead of implemented
-    /// (sc-25870): the source's labels are the owner's to set and <see cref="CreateChildrenAsync"/> works. False (the default) for a
-    /// source that creates no children or whose labels anyone may apply (a GitHub issue's): such an item is implemented like any other.
+    /// (sc-25870): the source is trusted (<see cref="ItemNaming.Trusted"/>: its labels are the owner's to set) and
+    /// <see cref="CreateChildrenAsync"/> works. False (the default) for a source that creates no children or whose labels anyone
+    /// may apply (a GitHub issue's): such an item is implemented like any other.
     /// </summary>
     bool PlansItems => false;
 
@@ -233,6 +258,12 @@ public interface IWorkSource
         throw new NotSupportedException("This work source creates no plan children, so it has none to make ready.");
 
     /// <summary>
+    /// How this board shelves an item for good and how a person undoes it (<see cref="ReadyResult.Archived"/>), in the board's own
+    /// words: what a plan says about a story it could not release (<see cref="Plans.PlanRelease.HeldArchived"/>).
+    /// </summary>
+    (string Is, string Undo) Shelved => ("archived", "unarchive it");
+
+    /// <summary>
     /// Whether the item waits in the source's backlog (not archived), where nothing picks it up (sc-25871): how a plan notices a
     /// story it released that a person moved back. Reads only. A source that creates no children has none there (the default).
     /// </summary>
@@ -312,6 +343,6 @@ public enum ReadyResult
     Moved,
     /// <summary>The item had already left the backlog (moved by hand, or being worked): nothing written.</summary>
     AlreadyLeft,
-    /// <summary>The item is archived: nothing written, and nothing will ever pick it up.</summary>
+    /// <summary>The item is archived (Kanban: <c>Closed</c>; <see cref="IWorkSource.Shelved"/>): nothing written, and nothing will ever pick it up.</summary>
     Archived,
 }
