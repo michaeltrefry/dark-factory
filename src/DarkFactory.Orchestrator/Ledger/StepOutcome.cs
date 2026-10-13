@@ -121,7 +121,8 @@ public static class StepOutcomes
         RunPipeline.Steps.PrReport or RunPipeline.Steps.Closeout or RunPipeline.Steps.PlanNotice =>
             detail?.StartsWith("failed", StringComparison.Ordinal) == true ? StepOutcome.Failed : StepOutcome.Passed,
         Issues.IssueSteps.ApprovalIgnored or RunPipeline.Steps.PlanRejected => StepOutcome.GateRejected,
-        RunPipeline.Steps.UsagePause or RunPipeline.Steps.Parked or RunPipeline.Steps.PlanHeld or RunPipeline.Steps.PlanStuck => StepOutcome.Deferred,
+        RunPipeline.Steps.UsagePause or RunPipeline.Steps.Parked or RunPipeline.Steps.PlanHeld or RunPipeline.Steps.PlanStuck
+            or RunPipeline.Steps.PlanDelivery => StepOutcome.Deferred,
         _ => StepOutcome.Passed,
     };
 }

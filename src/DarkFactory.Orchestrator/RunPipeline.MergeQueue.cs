@@ -506,7 +506,9 @@ public sealed partial class RunPipeline
         EnsureBase(run, pull);
         // What this merge changes, for the freeze (sc-25387): recorded before the merge, so every factory merge has it.
         var files = DiffPaths.Of(await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct));
-        await ledger.CheckpointAsync(run.Item, Steps.MergeFiles, null, new MergeFiles(pull.BaseRef, files).ToDetail(), ct);
+        // A plan item of several repositories names the one merged into (sc-25873): its own repository is the next changeset's later.
+        var several = run.Changeset is not null && Plans.Changeset.Ordered(await ledger.HistoryAsync(run.Item, ct), run.Repo).Count > 1;
+        await ledger.CheckpointAsync(run.Item, Steps.MergeFiles, null, new MergeFiles(pull.BaseRef, files, several ? run.Repo.FullName : null).ToDetail(), ct);
         await ledger.CheckpointAsync(run.Item, Steps.GatePassed, null, pull.HeadSha, ct);
         MergeResult merged;
         try

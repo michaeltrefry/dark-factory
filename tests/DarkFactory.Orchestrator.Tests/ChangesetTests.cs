@@ -49,6 +49,13 @@ public class ChangesetPipelineTests
         private readonly List<Pull> _pulls = [];
         private int _n;
 
+        /// <summary>The repository this is (sc-25873: a plan of several repositories has one of these each); its pull requests' URLs name it.</summary>
+        public string Name { get; init; } = "michaeltrefry/dark-factory-sandbox";
+        /// <summary>Where its worktrees are; two repositories have a branch of the same name each (the plan's changeset branch).</summary>
+        public string Worktree { get; init; } = "/wt";
+        /// <summary>Throws from the next <see cref="CreateBranchAsync"/> (the push of a new branch failed), once.</summary>
+        public bool FailCreateBranch { get; set; }
+
         public Dictionary<string, string> Branches { get; } = new() { [Main] = "base0" };
         public Dictionary<string, HashSet<string>> Changes { get; } = new() { ["base0"] = [] };
         public List<string> Calls { get; } = [];
@@ -164,7 +171,7 @@ public class ChangesetPipelineTests
 
         private string Resolve(string @ref) => Branches.GetValueOrDefault(@ref, @ref);
 
-        private static string Url(int number) => $"https://github.com/michaeltrefry/dark-factory-sandbox/pull/{number}";
+        private string Url(int number) => $"https://github.com/{Name}/pull/{number}";
 
         private string Diff(string @base, string head) => string.Concat(Changes[Resolve(head)].Except(Changes[Resolve(@base)])
             .Select(c => c.Split('|')).GroupBy(c => c[0], c => c[1]).OrderBy(g => g.Key, StringComparer.Ordinal)
@@ -289,7 +296,7 @@ public class ChangesetPipelineTests
 
         // ---- IRepoWorkspace ----
 
-        private static Workspace Ws(string branch, string? baseBranch) => new($"/wt/{branch}", branch, baseBranch ?? Main, $"/clone/.git/worktrees/{branch}");
+        private Workspace Ws(string branch, string? baseBranch) => new($"{Worktree}/{branch}", branch, baseBranch ?? Main, $"/clone/.git/worktrees/{branch}");
 
         public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null)
         {
@@ -332,6 +339,11 @@ public class ChangesetPipelineTests
         {
             lock (_gate)
             {
+                if (FailCreateBranch)
+                {
+                    FailCreateBranch = false;
+                    throw new HttpRequestException("the push of the new branch failed");
+                }
                 if (!Branches.ContainsKey(branch))
                 {
                     Branches[branch] = sha;

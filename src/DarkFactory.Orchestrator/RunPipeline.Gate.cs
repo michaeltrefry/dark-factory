@@ -270,9 +270,13 @@ public sealed partial class RunPipeline
         return cap;
     }
 
-    /// <summary>The fix-round cap in effect for the item: its latest <see cref="Steps.FixCap"/>, else <see cref="Lifecycle.MaxFixRounds"/>.</summary>
+    /// <summary>
+    /// The fix-round cap in effect for the item: its latest <see cref="Steps.FixCap"/>, else <see cref="Lifecycle.MaxFixRounds"/>.
+    /// A plan item of several repositories reads only its current changeset pull request's rows (sc-25873,
+    /// <see cref="Plans.Changeset.CurrentPass"/>): the cap an earlier repository's policy gave is not the next one's.
+    /// </summary>
     public static int FixCapOf(IReadOnlyList<LedgerEntry> history) =>
-        history.LastOrDefault(e => e.Step == Steps.FixCap)?.Detail is { } detail
+        Plans.Changeset.CurrentPass(history).LastOrDefault(e => e.Step == Steps.FixCap)?.Detail is { } detail
         && int.TryParse(detail.Split(' ')[0], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var cap)
             ? cap
             : Lifecycle.MaxFixRounds;
@@ -1002,7 +1006,8 @@ public sealed partial class RunPipeline
             var facts = await Gate.GitHub.GetCiAsync(run.Repo, pull.HeadSha, ct);
             var (state, why) = Ci.Evaluate(facts);
             if (state == CiState.Green
-                && CiHeal.Unreported(history.Where(e => e.Step == Steps.CiFailure).Select(e => CiTriage.FromDetail(e.Detail)).OfType<CiTriage>(), facts)
+                // Only this pull request's triages: an earlier repository's checks (sc-25873) are not expected on this one's head.
+                && CiHeal.Unreported(Plans.Changeset.CurrentPass(history).Where(e => e.Step == Steps.CiFailure).Select(e => CiTriage.FromDetail(e.Detail)).OfType<CiTriage>(), facts)
                     is { Count: > 0 } unreported)
             {
                 // A check a CI fix round was about (or one cancelled next to it) must run and pass, not just be absent.
@@ -1249,6 +1254,11 @@ public sealed partial class RunPipeline
     /// that cannot be posted is recorded (<see cref="Steps.Closeout"/> or <see cref="Steps.PrReport"/> <c>failed: …</c>), not escalated: the
     /// merge stands and the report is only a report. A failed closeout shows on the dashboard and is retried from Watch
     /// (<see cref="CloseoutPending"/>).
+    /// A plan item of several repositories (sc-25873) merges one changeset per repository: each merge is first recorded delivered
+    /// (<see cref="Steps.ChangesetDelivered"/>: the repository, its pull request and merge commit — the row that lets the stories
+    /// blocked by that changeset start); while another repository's changeset is still to go the plan is not finished, so only this
+    /// pull request's description is rewritten and the item waits again (Merge → Planned) for the next repository; the last merge
+    /// reports the plan merged and closes it out like a plan of one repository, listing every repository's changeset.
     /// </summary>
     private async Task MergeAsync(Run run, CancellationToken ct)
     {
@@ -1256,6 +1266,26 @@ public sealed partial class RunPipeline
         var entered = history.FindLastIndex(e => e.Step is null);
         var commit = history[entered].Detail;
         var done = history.Skip(entered + 1).Select(e => e.Step).ToHashSet();
+        if (run.Changeset is { } changeset && Plans.Changeset.Ordered(history, run.Repo) is { Count: > 1 } changesets)
+        {
+            var delivered = Plans.Changeset.Delivered(history).Select(d => d.Repo).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (delivered.Add(changeset.Repo))
+            {
+                await ledger.CheckpointAsync(run.Item, Steps.ChangesetDelivered, null,
+                    new Plans.ChangesetDelivery(changeset.Repo, Plans.ChangesetDelivery.Merged, LinkedPullRequestUrl(history), commit).ToDetail(), ct);
+                log.WriteLine($"[merge] {run.Item.ExternalId}: the changeset of {changeset.Repo} is on {changeset.Base} as {commit}");
+            }
+            if (changesets.Where(c => !delivered.Contains(c.Repo)).Select(c => c.Repo).ToList() is { Count: > 0 } left)
+            {
+                if (!done.Contains(Steps.PrReport) && LinkedPullRequestUrl(history) is { } url)
+                {
+                    await ledger.CheckpointAsync(run.Item, Steps.PrReport, null, await RewriteBodyAsync(run, url, ct), ct);
+                }
+                await ledger.RecordAsync(run.Item, WorkState.Planned, null,
+                    $"the changeset of {changeset.Repo} merged as {commit}; {left.Count} more to go, in order: {string.Join(", ", left)}", ct);
+                return;
+            }
+        }
         if (!done.Contains(Steps.MergedReported))
         {
             await source.ReportStateAsync(run.Story.Id, BoardState.Merged, null, ct);
@@ -1267,20 +1297,24 @@ public sealed partial class RunPipeline
         }
         if (!done.Contains(Steps.PrReport) && LinkedPullRequestUrl(history) is { } prUrl)
         {
-            string result;
-            try
-            {
-                await pullRequests.UpdateBodyAsync(run.Repo, prUrl, await PullRequestBodyAsync(run, ct), ct);
-                result = "merge";
-            }
-            catch (Exception ex) when (!ct.IsCancellationRequested)
-            {
-                log.WriteLine($"[merge] could not rewrite the description of {prUrl}: {ex.Message}");
-                result = $"failed: {ex.Message}";
-            }
-            await ledger.CheckpointAsync(run.Item, Steps.PrReport, null, result, ct);
+            await ledger.CheckpointAsync(run.Item, Steps.PrReport, null, await RewriteBodyAsync(run, prUrl, ct), ct);
         }
         await ledger.RecordAsync(run.Item, WorkState.Watch, null, commit, ct);
+    }
+
+    /// <summary>Rewrites the merged pull request's description from the ledger; returns the <see cref="Steps.PrReport"/> Detail.</summary>
+    private async Task<string> RewriteBodyAsync(Run run, string prUrl, CancellationToken ct)
+    {
+        try
+        {
+            await pullRequests.UpdateBodyAsync(run.Repo, prUrl, await PullRequestBodyAsync(run, ct), ct);
+            return "merge";
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            log.WriteLine($"[merge] could not rewrite the description of {prUrl}: {ex.Message}");
+            return $"failed: {ex.Message}";
+        }
     }
 
     /// <summary>One closeout attempt: posts the merged closeout on the item and records <c>posted</c> or <c>failed: &lt;why&gt;</c>.</summary>
@@ -1292,8 +1326,10 @@ public sealed partial class RunPipeline
             var history = await ledger.HistoryAsync(item, ct);
             var costs = await ledger.SessionCostsAsync(item, ct);
             // A plan item's merge is its changeset's (sc-25872): its closeout lists the plan's stories, then the changeset's own facts.
+            // A plan of several repositories (sc-25873): every repository's changeset, then the last pull request's own facts.
             var closeout = await PlanStoryReportsAsync(history, ct) is { Count: > 0 } stories
-                ? LedgerReport.PlanCloseout(item.ExternalId, stories, null, (history, costs))
+                ? LedgerReport.PlanCloseout(item.ExternalId, stories, null, (Plans.Changeset.CurrentPass(history), costs),
+                    Plans.Changeset.States(history, RepoRef.Parse(item.Repo), item.State))
                 : LedgerReport.MergedCloseout(item.ExternalId, history, costs);
             await source.CommentAsync(storyId, closeout, ct);
         }

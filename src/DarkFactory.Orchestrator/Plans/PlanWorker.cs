@@ -170,11 +170,14 @@ public static class PlanPrompt
     /// <summary>
     /// The prompt for a plan worked in <paramref name="repo"/>. With <paramref name="checkouts"/> (a plan naming several
     /// repositories, sc-25874) it says which directory of the seat is which repository; without, the seat is the one checkout.
+    /// With several <paramref name="repos"/> (the plan item's, sc-25873) it asks for a plan across them: one repository per story,
+    /// the order the repositories' changesets merge in, how the repositories interact, and the two kinds of blocker.
     /// </summary>
-    public static string Build(WorkSpec spec, RepoRef repo, IReadOnlyList<PlanCheckout>? checkouts = null)
+    public static string Build(WorkSpec spec, RepoRef repo, IReadOnlyList<PlanCheckout>? checkouts = null, IReadOnlyList<RepoRef>? repos = null)
     {
         var story = spec.Story;
         var several = checkouts is { Count: > 0 };
+        var across = repos is { Count: > 1 };
         var seat = several
             ? "The current directory holds a checkout of the default branch of each repository this plan may touch, each in its own directory:\n"
                 + string.Join("\n", checkouts!.Select(c => $"- {c.Directory}/ is {c.Repo}{(c.Repo == repo ? " (the plan's primary repository)" : "")}"))
@@ -182,9 +185,35 @@ public static class PlanPrompt
                 + "kept, committed or pushed."
             : $"The current directory is a checkout of {repo}'s default branch. You can only read and\n"
                 + "search it (Read, Glob, Grep): you cannot edit files or run commands, and nothing here is kept, committed or pushed.";
-        var scope = several
-            ? $". Every story is\nworked in {repo}; read the other repositories to see how it interacts with them"
-            : ", in this\nrepository only";
+        var scope = across
+            ? $". Each story is\nworked in exactly one of these repositories ({string.Join(", ", repos!.Select(r => r.FullName))}): a change "
+                + "that spans repositories is one story per repository. Read each repository, work out how they interact (which depends on "
+                + "which, the contracts they share, what must land first) and say so in \"interactions\""
+            : several
+                ? $". Every story is\nworked in {repo}; read the other repositories to see how it interacts with them"
+                : ", in this\nrepository only";
+        var schema = across
+            ? """{"stories": [{"key": "a-short-name", "repo": "owner/name", "title": "a short imperative title", "description": "what to change and why", "acceptance": ["an observable outcome"], "type": "feature | chore | bug", "blocked_by": [], "blocked_by_changesets": []}], "merge_order": ["owner/first", "owner/second"], "interactions": "how the repositories interact"}"""
+            : """{"stories": [{"key": "a-short-name", "title": "a short imperative title", "description": "what to change and why", "acceptance": ["an observable outcome"], "type": "feature | chore | bug", "blocked_by": []}]}""";
+        var rules = across
+            ? $"""
+
+                Several repositories: "repo" is required on every story and is one of {string.Join(", ", repos!.Select(r => r.FullName))}.
+                How the work is delivered: each repository gets its own changeset branch; a story merges into its repository's changeset
+                branch by its own reviewed pull request; then each repository's changeset merges into that repository's default branch
+                as a whole, one repository at a time in "merge_order". The merges across repositories are NOT atomic: an earlier
+                repository's changeset can be on its default branch while a later one is not (or never is), so order them so that every
+                intermediate state is safe — what others depend on first. "merge_order" lists every repository that has a story exactly
+                once (a repository with no story is left out). "interactions" is required, at most {PlanParser.MaxInteractions} characters:
+                how the repositories interact, in your own words; every implementer and reviewer of the plan is shown it.
+                Two kinds of blocker: "blocked_by" lists stories (of any repository of the plan) that must have merged into their
+                changeset branch first — their code is then on a changeset branch, not yet on a default branch. "blocked_by_changesets"
+                lists repositories whose whole changeset must be on its default branch before the story starts — use it for work that
+                needs the upstream change released, such as bumping a dependency pin. A story cannot be blocked by its own repository's
+                changeset, nor by the changeset of a repository that merges later than its own in "merge_order", and the two kinds
+                together must not form a cycle (a changeset waits on every story of its repository).
+                """
+            : "";
         var prompt = $$"""
             You are a Dark Factory planner. {{seat}}
 
@@ -196,14 +225,14 @@ public static class PlanPrompt
 
             End your answer with exactly one fenced json block, and nothing after it:
             ```json
-            {"stories": [{"key": "a-short-name", "title": "a short imperative title", "description": "what to change and why", "acceptance": ["an observable outcome"], "type": "feature | chore | bug", "blocked_by": []}]}
+            {{schema}}
             ```
             Rules: at most {{PlanParser.MaxStories}} stories; "key" is unique, lowercase letters, digits, '-' or '_', at most 32 characters;
             "title" is unique and at most {{PlanParser.MaxTitle}} characters; "description" at most {{PlanParser.MaxDescription}} characters; each
             acceptance entry one line of at most {{PlanParser.MaxAcceptanceLine}} characters; "type" is feature (a user-visible capability),
             chore (implementation, refactoring or test work) or bug; "blocked_by" lists keys of other stories of this plan, and the
             stories must not block each other in a cycle.
-            """;
+            """ + rules.TrimEnd();
         if (spec.Epic is { } epic)
         {
             prompt += $"\n\nThe story belongs to epic \"{epic.Name}\" ({epic.AppUrl}). Epic description, for context:\n{epic.Description}";

@@ -54,17 +54,31 @@ public static class LedgerReport
     /// <summary>
     /// The description of a plan's changeset pull request (sc-25872), written by code: what it merges where, one line per story of
     /// the plan (<see cref="PlanStoryLines"/>: a story's title is a planner's text, inert in a code span), then the plan item's own
-    /// ledger facts. Rendered when the pull request is opened and again at its merge.
+    /// ledger facts. Rendered when the pull request is opened and again at its merge. One of several changesets
+    /// (<paramref name="changesets"/>, sc-25873: every repository's, in merge order; <paramref name="stories"/> and
+    /// <paramref name="history"/> are then this repository's stories and this pull request's rows): it also lists where each
+    /// repository's changeset stands.
     /// </summary>
     public static string ChangesetPullRequestBody(string externalId, string? appUrl, Plans.Changeset changeset, IReadOnlyList<PlanStoryReport> stories,
-        IReadOnlyList<LedgerEntry> history, IReadOnlyList<decimal?> sessionCosts)
+        IReadOnlyList<LedgerEntry> history, IReadOnlyList<decimal?> sessionCosts, IReadOnlyList<Plans.ChangesetState>? changesets = null)
     {
         var text = new StringBuilder();
         text.Append(CultureInfo.InvariantCulture,
             $"Changeset of plan {(appUrl is null ? externalId : $"[{externalId}]({appUrl})")}: merges {Code(changeset.Branch)} into {Code(changeset.Base)}.\n\n");
-        text.Append(CultureInfo.InvariantCulture,
-            $"Each of the plan's {stories.Count} stories was reviewed and merged into {Code(changeset.Branch)} by its own pull request through the ");
-        text.Append("factory's merge gate; this pull request takes them to the default branch together, through the same review, CI and gate.\n\n");
+        if (changesets is { Count: > 1 })
+        {
+            text.Append(CultureInfo.InvariantCulture,
+                $"Each of the plan's {stories.Count} stories in {Code(changeset.Repo)} was reviewed and merged into {Code(changeset.Branch)} by its own pull request through the ");
+            text.Append("factory's merge gate; this pull request takes them to the default branch together, through the same review, CI and gate.\n\n");
+            ChangesetLines(text, changesets);
+            text.Append('\n');
+        }
+        else
+        {
+            text.Append(CultureInfo.InvariantCulture,
+                $"Each of the plan's {stories.Count} stories was reviewed and merged into {Code(changeset.Branch)} by its own pull request through the ");
+            text.Append("factory's merge gate; this pull request takes them to the default branch together, through the same review, CI and gate.\n\n");
+        }
         PlanStoryLines(text, stories);
         text.Append("\nOpened by Dark Factory.\n\n");
         text.Append(Facts(history, sessionCosts));
@@ -99,16 +113,25 @@ public static class LedgerReport
     /// comment is posted only once the changeset's own pull request has merged: <paramref name="changeset"/> is the plan item's own
     /// rows and session costs, and the comment says where the changeset merged and ends with those facts. <paramref name="note"/>
     /// says why the factory merged no changeset pull request (an empty changeset, or one a person merged:
-    /// <see cref="Plans.Changeset.MergedOutside"/>).
+    /// <see cref="Plans.Changeset.MergedOutside"/>). A plan of several repositories (<paramref name="changesets"/>, sc-25873): one
+    /// line per repository instead, in merge order — its changeset's pull request and merge commit, or why it had none — and
+    /// <paramref name="changeset"/> holds the last pull request's rows.
     /// </summary>
     public static string PlanCloseout(string externalId, IReadOnlyList<PlanStoryReport> stories, string? note = null,
-        (IReadOnlyList<LedgerEntry> History, IReadOnlyList<decimal?> SessionCosts)? changeset = null)
+        (IReadOnlyList<LedgerEntry> History, IReadOnlyList<decimal?> SessionCosts)? changeset = null,
+        IReadOnlyList<Plans.ChangesetState>? changesets = null)
     {
         var merged = stories.Count(s => s.History.Any(e => e.Step is null && e.State == WorkState.Merge));
+        var several = changesets is { Count: > 1 };
         var text = new StringBuilder();
         text.Append(CultureInfo.InvariantCulture,
             $"{WorkSourceComments.Author} {externalId}'s plan is complete: {merged} of its {stories.Count} stories merged through the factory's merge gate.\n\n");
-        if (changeset is { } own)
+        if (several)
+        {
+            ChangesetLines(text, changesets!);
+            text.Append('\n');
+        }
+        else if (changeset is { } own)
         {
             var commit = own.History.LastOrDefault(e => e.Step is null && e.State == WorkState.Merge)?.Detail;
             var into = Controls.MergeFiles.FromDetail(own.History.LastOrDefault(e => e.Step == RunPipeline.Steps.MergeFiles)?.Detail)?.Base;
@@ -116,7 +139,7 @@ public static class LedgerReport
                 .Append(" by the factory's merge gate")
                 .Append(RunPipeline.LinkedPullRequestUrl(own.History.ToList()) is { } pull ? $": {Link(pull)}" : "").Append(".\n\n");
         }
-        if (note is not null)
+        if (note is not null && !several)
         {
             text.Append(Plans.Changeset.IsMergedOutside(note) ? "The factory's merge gate did not merge its changeset: " : "No changeset pull request was opened: ")
                 .Append(Code(note)).Append(".\n\n");
@@ -125,9 +148,35 @@ public static class LedgerReport
         PlanStoryLines(text, stories);
         if (changeset is { } facts)
         {
-            text.Append("\nThe changeset's own pull request:\n\n").Append(Facts(facts.History, facts.SessionCosts));
+            text.Append(several ? "\nThe last changeset's own pull request:\n\n" : "\nThe changeset's own pull request:\n\n")
+                .Append(Facts(facts.History, facts.SessionCosts));
         }
         return Clip(text.ToString().TrimEnd(), changeset is null ? MaxFactsLength : MaxChangesetReportLength);
+    }
+
+    /// <summary>
+    /// One line per repository of a plan of several (sc-25873), in merge order, from the plan item's own rows: where its changeset
+    /// stands — merged (into which branch, as which commit, by which pull request), empty, merged by someone else, its pull request
+    /// open, or not opened.
+    /// </summary>
+    private static void ChangesetLines(StringBuilder text, IReadOnlyList<Plans.ChangesetState> changesets)
+    {
+        text.Append(CultureInfo.InvariantCulture, $"The plan changes {changesets.Count} repositories. ");
+        text.Append("Each one's changeset merges into its default branch by its own pull request, one repository at a time in this order; "
+            + "the merges are not atomic:\n\n");
+        foreach (var state in changesets)
+        {
+            text.Append("- ").Append(Code(state.Changeset.Repo)).Append(": ").Append(state.How switch
+            {
+                Plans.ChangesetDelivery.Merged => $"merged into {Code(state.Changeset.Base)}{(state.Commit is null ? "" : $" as {Code(state.Commit)}")} by the factory's merge gate"
+                    + (state.Pull is null ? "" : $": {Link(state.Pull)}"),
+                Plans.ChangesetDelivery.Empty => $"no pull request: {Code(state.Changeset.Branch)} did not differ from {Code(state.Changeset.Base)}",
+                Plans.ChangesetDelivery.MergedOutside => "not merged by the factory's merge gate: its pull request was merged outside the factory"
+                    + (state.Pull is null ? "" : $": {Link(state.Pull)}"),
+                _ when state.State is { } at => $"pull request {(state.Pull is null ? "(none recorded)" : Link(state.Pull))} ({at})",
+                _ => "not opened yet: it waits on its stories and on the repositories before it",
+            }).Append('\n');
+        }
     }
 
     /// <summary>A pull request URL as a report shows it: itself when it is a short https URL, else inert in a code span.</summary>

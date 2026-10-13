@@ -99,7 +99,7 @@ else
                                         <span class="@(story.Failing ? "error waits" : "muted waits")">@story.Waits</span>
                                     }
                                 </td>
-                                <td>@row.Repo</td>
+                                <td>@(story.Repo ?? row.Repo)</td>
                                 <td class="muted" colspan="5">—</td>
                             </tr>
                         }
@@ -168,6 +168,11 @@ else
                             else if (plan.Held)
                             {
                                 <span class="error plan-flag">held</span>
+                            }
+                            @* A plan of several repositories (sc-25873): where each repository's changeset stands, in merge order. *@
+                            @foreach (var changeset in plan.Changesets ?? [])
+                            {
+                                <span class="@(changeset.Delivered ? "muted plan-changeset" : "plan-changeset")" data-repo="@changeset.Changeset.Repo">changeset of @changeset.Changeset.Repo: @changeset.Describe</span>
                             }
                             @if (plan.Hold is { } hold)
                             {

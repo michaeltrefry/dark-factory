@@ -551,6 +551,49 @@ Backlog, a plan whose stories were never recorded (a marked story is refused at 
 and one `plan-held` row after `Intake:MaxItemFailures` failures), a closeout the board keeps refusing (the item stays `Planned`,
 "post it by hand"), and a Stop landing on a waiting plan after its runner took no worker run lock (deferred to the next run).
 
+## P4-AT2 — a plan across two repositories: a changeset in each, merged in the plan's order (sc-25873)
+
+`MultiRepoPlanAcceptanceTests.P4_AT2_a_plan_across_two_repositories_gets_a_changeset_in_each_and_merges_them_in_the_plans_order`:
+`factory run` on a `plan`-labelled story that names two repositories, with the real planner seated in both, a throwaway ledger
+and its own work root. The test then drives the plan item and every released story until the plan item is in `Watch`. It is more
+expensive than P4-AT1 (one implementer and one review per story, plus one changeset review per repository): keep the work small.
+
+Prerequisites: everything P4-AT1 needs, and
+- `FACTORY_E2E_P4_SECOND_REPO=owner/name`: a second sandbox repository with **both GitHub Apps installed** (the workers' App and
+  the gate App), protected with `factory github-repo protect owner/name`, a `factory/gate.yaml` on its default branch, CI that
+  runs for pull requests whose base is `factory/changeset-*`, and **indexed in CodeGraph** (the gate's `risk-threshold` and the
+  planner's tools read it). The test adds it to the factory's configured repositories for its own runs (`GitHub:Watch:Repos`);
+  for a real `factory work` it must be in `Factory:DefaultRepo`/`GitHub:Watch:Repos` too.
+- `FACTORY_E2E_P4_MULTI_PLAN_STORY=sc-<id>`: a **To Do** story carrying the `plan` label whose description has two lines,
+  `Repo: <the sandbox>` then `Repo: <the second repository>`, and describes work that needs a small change in each (e.g. a
+  documented format in the first and a reader of it in the second), each story able to pass its repository's gate on its own and
+  each repository's changeset inside that repository's `risk` limits.
+Stop any `factory work` whose watch scope covers the story's team or epic first, as for P4-AT1.
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_P4_MULTI_PLAN_STORY=sc-<id> FACTORY_E2E_P4_SECOND_REPO=owner/name \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-class "*MultiRepoPlanAcceptanceTests"
+```
+
+Expected evidence: the first run ends `Planned`; the `plan` checkpoint has a `repo` on every story, a `merge_order` of both
+repositories and a non-empty `interactions` (a planner that put every story in one repository makes the test INCONCLUSIVE);
+one `changeset` + `changeset-pushed` pair per repository, all before `plan-stories`, each naming `factory/changeset-sc-<id>`;
+every created story's first `Repo:` line is the repository its plan entry names. Each released story's own run ends in `Watch`
+with exactly one merged pull request in its own repository whose base is the changeset branch. No story with a
+`blocked_by_changesets` entry is released before that repository's `changeset-delivered` row; the second repository's changeset
+has no pull request while the first is not delivered. The plan item's transitions hold two `Merge` rows with a `Planned` row
+("the changeset of <first> merged as …") between them and end in `Watch`; `changeset-delivered` rows name the repositories in
+merge order, each `merged` with its pull request; each repository has exactly one merged changeset pull request whose description
+says `The plan changes 2 repositories.`; the two `merge-files` rows name their repositories; one `closeout` `posted` whose comment
+lists both repositories as `merged into`.
+
+Not run live yet (2026-10-12): written with sc-25873, to be run by the owner once a second sandbox repository exists. Not
+exercised live, covered by `MultiRepoPipelineTests` against two simulated repositories: an upstream changeset pull request that
+escalates (the downstream one is not opened; `plan-delivery` and the comment say what is delivered), a downstream one that
+escalates after the upstream merged (partial delivery, then fixed and re-run), Stop with one changeset merged and one open, a run
+that died after the first repository's branch or between the two changesets, an empty changeset skipped in the order, a
+hand-moved story refused while it waits on a changeset; and by `MultiRepoPlanTests`: every validation refusal.
+
 ## P4-AT3 (proxy part) — a planner grant over two repositories (sc-25874)
 
 `PlanAcceptanceTests.P4_AT3_a_planner_grant_over_two_repositories_answers_for_each_and_refuses_a_third_project_and_off_list_tools`:

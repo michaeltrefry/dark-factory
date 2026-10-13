@@ -329,6 +329,19 @@ public sealed partial class RunPipeline(
         /// </summary>
         public const string ChangesetEmpty = "changeset-empty";
         /// <summary>
+        /// A plan of several repositories (sc-25873): one repository's changeset is on its default branch, or needs no merge
+        /// (Detail: <see cref="Plans.ChangesetDelivery"/> JSON — the repository, how — merged by the gate with its pull request and
+        /// merge commit, empty, or merged outside the factory). From this row on the stories blocked by that changeset may start
+        /// and the next repository's changeset pull request may be opened. A plan with one changeset records none.
+        /// </summary>
+        public const string ChangesetDelivered = "changeset-delivered";
+        /// <summary>
+        /// A plan of several repositories that escalates or is stopped while some of its changesets are on their default branch and
+        /// others are not (sc-25873): which repositories are delivered and which are not (Detail:
+        /// <see cref="Plans.Changeset.DeliveryOf"/>), recorded before the Escalated row or the stop's report. Nothing is rolled back.
+        /// </summary>
+        public const string PlanDelivery = "plan-delivery";
+        /// <summary>
         /// Planned: every story of the plan that has not merged failed or is blocked behind a failed one (sc-25876): nothing of it
         /// moves until a person acts. Detail: the failed stories and what they block (<see cref="Plans.PlanRelease.HeldByFailed"/>).
         /// A failed story that still leaves other stories going is a <see cref="PlanHeld"/> row instead
@@ -590,6 +603,13 @@ public sealed partial class RunPipeline(
             return await OutcomeAsync(known, $"{known.ExternalId} parked: {unfinished}", ct);
         }
         var repo = RepoResolver.Resolve(story.Description, defaultRepo);
+        // A plan item taking one of its changesets through the gate (sc-25873) works in that changeset's repository until it has
+        // merged: the pull request, the gate policy, CI and the merge queue are that repository's. Any other item, and a plan item
+        // in any other state, works in the repository its story names.
+        if (known is not null && Plans.Changeset.PassRepo(await ledger.HistoryAsync(known, ct)) is { } pass)
+        {
+            repo = pass;
+        }
         var item = await ledger.GetOrCreateAsync(Naming.Source, Naming.Format(storyId), story.Name, repo.FullName, IntakeDetail(story), ct, spec.Epic?.Id);
 
         await using var runLock = await locks.TryAcquireAsync(item.Id, ct);
@@ -622,7 +642,8 @@ public sealed partial class RunPipeline(
         // so the story would merge into that repository's default branch, count as merged and be left out of the changeset pull
         // request. Only a plan recorded before changesets (no `changeset` row at all) has its stories target the default branch.
         var noChangeset = ofPlan is { Changeset: null, Recorded: [.., var recorded] }
-            ? $"{item.ExternalId} is a story of the plan whose changeset branch is {recorded.Branch} in {recorded.Repo}, and that plan has no changeset "
+            ? $"{item.ExternalId} is a story of the plan whose changeset branch is {recorded.Branch} in "
+                + $"{string.Join(", ", ofPlan.Recorded.Select(c => c.Repo).Distinct(StringComparer.OrdinalIgnoreCase))}, and that plan has no changeset "
                 + $"branch in {repo}: the story cannot merge into its plan's changeset. Its `Repo:` line must name the plan's repository."
             : null;
 
@@ -1890,6 +1911,18 @@ public sealed partial class RunPipeline(
         var (escalated, last) = (history[at], history[at - 1]);
         var (reason, session) = (escalated.Detail, escalated.ClaudeSessionId);
         var lastState = $"{last.State}{(last.Step is null ? "" : $" (after step {last.Step})")} at {last.RecordedAt:u}";
+        // A plan of several repositories (sc-25873) may be partly delivered: the record first, then the comment says the same.
+        var changesets = Plans.Changeset.States(history, RepoRef.Parse(item.Repo), item.State);
+        var delivery = "";
+        if (changesets.Count > 1)
+        {
+            var record = Plans.Changeset.DeliveryOf(changesets);
+            if (!history.Skip(at + 1).Any(e => e.Step == Steps.PlanDelivery))
+            {
+                await ledger.CheckpointAsync(item, Steps.PlanDelivery, session, record, CancellationToken.None);
+            }
+            delivery = $"\n{Plans.Changeset.DeliveryNote(source.Naming.Format(storyId), changesets)}\n";
+        }
 
         // The closeout on escalation (sc-25389): the reason (factory text that can quote model findings, so fenced as data) and the
         // ledger's facts, never a worker's summary.
@@ -1902,8 +1935,8 @@ public sealed partial class RunPipeline(
             Claude session: {session ?? "none"}
 
             Re-run with `factory run {source.Naming.Format(storyId)}` once resolved.
-
-            """ + "\n" + LedgerReport.Facts(history, await ledger.SessionCostsAsync(item, ct)).TrimEnd();
+            {delivery}
+            """ + "\n" + LedgerReport.Facts(Plans.Changeset.CurrentPass(history), await ledger.SessionCostsAsync(item, ct)).TrimEnd();
         try
         {
             await source.CommentAsync(storyId, comment, ct);
@@ -1967,8 +2000,20 @@ public sealed partial class RunPipeline(
     {
         var history = await ledger.HistoryAsync(run.Item, ct);
         var costs = await ledger.SessionCostsAsync(run.Item, ct);
-        return run.Changeset is { } changeset
-            ? LedgerReport.ChangesetPullRequestBody(run.Item.ExternalId, run.Story.AppUrl, changeset, await PlanStoryReportsAsync(history, ct), history, costs)
-            : LedgerReport.PullRequestBody(run.Story, history, costs, run.BaseBranch);
+        if (run.Changeset is not { } changeset)
+        {
+            return LedgerReport.PullRequestBody(run.Story, history, costs, run.BaseBranch);
+        }
+        // One of several changesets (sc-25873): this repository's stories, this pull request's rows, and where every changeset stands.
+        var states = Plans.Changeset.States(history, run.Repo, run.Item.State);
+        var stories = await PlanStoryReportsAsync(history, ct);
+        if (states.Count > 1 && Plans.PlanRelease.RecordedRepos(history.LastOrDefault(e => e.Step == Steps.Plan)?.Detail,
+                [.. stories.Select(s => s.ExternalId)], run.Repo) is { } repos)
+        {
+            var mine = repos.StoriesIn(changeset.Repo);
+            stories = [.. stories.Where(s => mine.Contains(s.ExternalId))];
+        }
+        return LedgerReport.ChangesetPullRequestBody(run.Item.ExternalId, run.Story.AppUrl, changeset, stories, Plans.Changeset.CurrentPass(history), costs,
+            states.Count > 1 ? states : null);
     }
 }

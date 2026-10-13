@@ -9,7 +9,8 @@ public enum WorkState
     /// A plan item whose stories are on the board (sc-25870): nothing implements it. Each poll releases the stories whose blockers
     /// have merged. Once every story has merged into the plan's changeset branch the item goes to <see cref="Review"/> with the
     /// changeset pull request as its own (sc-25872) and from there through the gate like any item; a plan with no changeset, or
-    /// an empty one, is closed out and goes to <see cref="Done"/> (sc-25871).
+    /// an empty one, is closed out and goes to <see cref="Done"/> (sc-25871). A plan of several repositories (sc-25873) does so
+    /// once per repository, in the plan's merge order, and comes back here from <see cref="Merge"/> after each but the last.
     /// </summary>
     Planned,
     Implement,
@@ -86,7 +87,9 @@ public static class Lifecycle
         [WorkState.CIHealing] = [WorkState.CI],
         // The merge queue (sc-25384): a conflict with the base goes to the fixer; the updated head's red CI goes to CI's triage.
         [WorkState.MergeGate] = [WorkState.Merge, WorkState.Review, WorkState.Fixing, WorkState.CI],
-        [WorkState.Merge] = [WorkState.Watch],
+        // A plan of several repositories (sc-25873) merges one changeset per repository, one at a time: after each but the last
+        // the plan item waits again (Planned) — on the next repository's stories, then on that changeset's own pull request.
+        [WorkState.Merge] = [WorkState.Watch, WorkState.Planned],
         // A reverted change reopens: back to Intake, or straight to Implement.
         [WorkState.Watch] = [WorkState.Done, WorkState.Intake, WorkState.Implement],
         // A human re-queues an escalated item.
