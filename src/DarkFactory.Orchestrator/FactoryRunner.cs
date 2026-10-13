@@ -201,10 +201,22 @@ public static class FactoryRunner
         var stuck = options.StuckDetection;
         var maxControlReadFailures = options.MaxControlReadFailures;
 
+        await FactoryWide("the ledger", async () => { await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct); return true; });
+        await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
+        var ledger = new WorkLedger(db, TimeProvider.System);
+        // A plan item waiting on its stories (sc-25871) only reads the ledger and moves stories on the board: its run starts no
+        // worker (a Planned item leaves that state only for Done or a Stop, and a Stop keeps the lock), so it takes no worker run
+        // lock, probes no sandbox and sweeps no worktree — every poll evaluates it.
+        var needsWorker = !await FactoryWide("the ledger", async () =>
+            await RunPipeline.WaitsOnStoriesAsync(ledger, source.Naming, storyId, ct)
+            && await Controls(options).EffectiveAsync(source.Naming.Format(storyId), null, ct) != ControlState.Stopping);
+
         // Sandboxed, the worker user is single-tenant (every helper exit kills all of its processes),
         // so one sandboxed run per machine, taken before anything runs through the helper.
-        using var sandboxLock = sandbox is null ? null : await FactoryWide("the worker run lock", () => Task.FromResult(WorkerLock.Acquire(options.WorkRoot)));
-        if (sandbox is not null)
+        using var sandboxLock = sandbox is null || !needsWorker
+            ? null
+            : await FactoryWide("the worker run lock", () => Task.FromResult(WorkerLock.Acquire(options.WorkRoot)));
+        if (sandbox is not null && needsWorker)
         {
             await EnsureSandboxReadyAsync(sandbox, options.WorkerAuth, options.ClaudePath, ct);
         }
@@ -216,18 +228,17 @@ public static class FactoryRunner
         var gateApp = new GitHubApp(githubHttp, gateAppId, gateAppKey, TimeProvider.System);
         using var reviewerHttp = ReviewerHttp(options);
 
-        await FactoryWide("the ledger", async () => { await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct); return true; });
-        await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
-        var ledger = new WorkLedger(db, TimeProvider.System);
-
         var workspaces = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
             async (repo, c) => (await app.CreateInstallationTokenAsync(repo, c)).Token, sandbox: sandbox);
         // Worktrees no run will resume (left by a killed cleanup or a worker that would not stop).
-        await FactoryWide("the worktree sweep", async () =>
+        if (needsWorker)
         {
-            await workspaces.SweepOrphansAsync((name, c) => RunPipeline.WorktreeIsResumableAsync(ledger, name, c), ct);
-            return true;
-        });
+            await FactoryWide("the worktree sweep", async () =>
+            {
+                await workspaces.SweepOrphansAsync((name, c) => RunPipeline.WorktreeIsResumableAsync(ledger, name, c), ct);
+                return true;
+            });
+        }
 
         var gateGitHub = new GitHubGate(githubHttp, gateApp);
         using var codeGraphHttp = OutboundHttp.CodeGraphApi(options.CodeGraphBaseUrl);
@@ -268,7 +279,9 @@ public static class FactoryRunner
             // A plan item's planner session (sc-25870): read-only, in its own throwaway worktree, CodeGraph and Kanban through the proxy.
             planner: new SandboxPlanRunner(options, sandbox, app, upstreams, log),
             // The only repositories a plan naming several may name (sc-25874).
-            configuredRepos: options.ConfiguredRepos.Select(RepoRef.Parse).ToList());
+            configuredRepos: options.ConfiguredRepos.Select(RepoRef.Parse).ToList(),
+            // Built without the worker run lock (a waiting plan item): the run does nothing that needs it.
+            workerless: !needsWorker);
 
         return await pipeline.RunAsync(storyId, ct);
     }

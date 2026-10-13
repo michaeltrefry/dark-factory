@@ -145,6 +145,31 @@ public interface IWorkSource
     /// (<see cref="ChildrenRefusedException"/>) when it could not find the children again after a failed attempt.
     /// </summary>
     Task<IReadOnlyList<int>> CreateChildrenAsync(int parentId, IReadOnlyList<ChildItem> children, CancellationToken ct);
+
+    /// <summary>
+    /// The items that block <paramref name="id"/> on the board (sc-25871): every item the board relates to it as its blocker, whoever
+    /// made the relation, inside a plan or not, each with whether the board shows it finished (<see cref="Blocker.Finished"/>: in the
+    /// source's done state and not archived). Reads only. Whether a blocker is satisfied is not the board's to say: the pipeline
+    /// decides it (<see cref="Plans.PlanRelease.Satisfied(IReadOnlyList{Ledger.LedgerEntry}?, bool, bool)"/>). A source without blocker
+    /// relations has none (the default).
+    /// </summary>
+    Task<IReadOnlyList<Blocker>> BlockersAsync(int id, CancellationToken ct) => Task.FromResult<IReadOnlyList<Blocker>>([]);
+
+    /// <summary>
+    /// Moves an item <see cref="CreateChildrenAsync"/> created out of the backlog into the source's ready state (Shortcut: To Do), where
+    /// <see cref="ListReadyAsync"/> finds it if it is in the watch scope (sc-25871). Idempotent, and it never moves an item back: it
+    /// writes only while the item still waits in the backlog (<see cref="ReadyResult.Moved"/>); otherwise it writes nothing and says
+    /// why — someone moved it already or it is being worked (<see cref="ReadyResult.AlreadyLeft"/>), or it is archived and so can
+    /// never be worked (<see cref="ReadyResult.Archived"/>). A source that creates no children does not support it (the default).
+    /// </summary>
+    Task<ReadyResult> MakeReadyAsync(int id, CancellationToken ct) =>
+        throw new NotSupportedException("This work source creates no plan children, so it has none to make ready.");
+
+    /// <summary>
+    /// Whether the item waits in the source's backlog (not archived), where nothing picks it up (sc-25871): how a plan notices a
+    /// story it released that a person moved back. Reads only. A source that creates no children has none there (the default).
+    /// </summary>
+    Task<bool> InBacklogAsync(int id, CancellationToken ct) => Task.FromResult(false);
 }
 
 /// <summary>
@@ -198,4 +223,19 @@ public static class WorkSourceComments
 
     public static string Attributed(string text) =>
         text.StartsWith(Author, StringComparison.Ordinal) ? text : $"{Author} {text}";
+}
+
+/// <summary>An item the board relates to another as its blocker (<see cref="IWorkSource.BlockersAsync"/>).</summary>
+/// <param name="Finished">The board shows it finished: in the source's done state (Shortcut: a workflow state of type <c>done</c>) and not archived.</param>
+public sealed record Blocker(int Id, bool Finished);
+
+/// <summary>What <see cref="IWorkSource.MakeReadyAsync"/> found and did.</summary>
+public enum ReadyResult
+{
+    /// <summary>The item waited in the backlog and was moved to the ready state.</summary>
+    Moved,
+    /// <summary>The item had already left the backlog (moved by hand, or being worked): nothing written.</summary>
+    AlreadyLeft,
+    /// <summary>The item is archived: nothing written, and nothing will ever pick it up.</summary>
+    Archived,
 }

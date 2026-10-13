@@ -285,6 +285,23 @@ public static class PlannedStory
 
     /// <summary>Whether <paramref name="description"/> carries a marker, anywhere in it.</summary>
     public static bool IsMarked(string? description) => description?.Contains(Prefix, StringComparison.Ordinal) == true;
+
+    /// <summary>
+    /// The plan item the first marker in <paramref name="description"/> names (e.g. <c>sc-12</c>), or null when it carries no marker or
+    /// the marker names nothing that looks like an item id. Text anyone may write: only ever shown, never trusted.
+    /// </summary>
+    public static string? ParentOf(string? description)
+    {
+        var at = description?.IndexOf(Prefix, StringComparison.Ordinal) ?? -1;
+        if (at < 0)
+        {
+            return null;
+        }
+        var rest = description![(at + Prefix.Length)..];
+        var end = rest.IndexOf(" -->", StringComparison.Ordinal);
+        var name = end < 0 ? "" : rest[..end];
+        return name.Length is > 0 and <= 32 && name.All(c => char.IsAsciiLetterOrDigit(c) || c == '-') ? name : null;
+    }
 }
 
 /// <summary>The label that makes an item a plan item (sc-25870): Intake sends it to Plan instead of Implement.</summary>

@@ -314,6 +314,50 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
         return ids;
     }
 
+    /// <summary>
+    /// The stories that block <paramref name="id"/>: the subject of every <c>blocks</c> relation whose object it is (the story's own
+    /// <c>story_links</c>; a relation is listed on both of its stories), each read for whether the board shows it finished — not
+    /// archived and in a workflow state whose <c>type</c> the API gives as <see cref="DoneStateType"/> (never a state id or name).
+    /// One GET for the story and one per blocker.
+    /// </summary>
+    public async Task<IReadOnlyList<Blocker>> BlockersAsync(int id, CancellationToken ct)
+    {
+        var blockers = new List<Blocker>();
+        foreach (var blocker in (await GetStoryAsync(id, ct)).StoryLinks.Where(l => l.Verb == "blocks" && l.ObjectId == id && l.SubjectId != id)
+            .Select(l => l.SubjectId).Distinct().Order())
+        {
+            var story = await GetStoryAsync(blocker, ct);
+            var done = (await WorkflowsAsync(ct)).SelectMany(w => w.States).Any(s => s.Id == story.WorkflowStateId && s.Type == DoneStateType);
+            blockers.Add(new Blocker(blocker, done && !story.Archived));
+        }
+        return blockers;
+    }
+
+    /// <summary>The <c>type</c> the Shortcut API gives a workflow state that means finished.</summary>
+    public const string DoneStateType = "done";
+
+    /// <summary>Backlog → <see cref="ReadyState"/>, only for a story still in its workflow's Backlog (state ids by name, from the API).</summary>
+    public async Task<ReadyResult> MakeReadyAsync(int id, CancellationToken ct)
+    {
+        var story = await GetStoryAsync(id, ct);
+        if (story.Archived)
+        {
+            return ReadyResult.Archived;
+        }
+        if (story.WorkflowStateId != await StateIdAsync(story.WorkflowId, BoardStateName(BoardState.Stopped), ct))
+        {
+            return ReadyResult.AlreadyLeft;
+        }
+        await UpdateAsync(id, new { workflow_state_id = await StateIdAsync(story.WorkflowId, ReadyState, ct) }, ct);
+        return ReadyResult.Moved;
+    }
+
+    public async Task<bool> InBacklogAsync(int id, CancellationToken ct)
+    {
+        var story = await GetStoryAsync(id, ct);
+        return !story.Archived && story.WorkflowStateId == await StateIdAsync(story.WorkflowId, BoardStateName(BoardState.Stopped), ct);
+    }
+
     /// <summary>Whether a stored description is the one that was sent (line endings and outer whitespace aside).</summary>
     private static bool SameText(string? stored, string sent) =>
         string.Equals((stored ?? "").ReplaceLineEndings("\n").Trim(), sent.ReplaceLineEndings("\n").Trim(), StringComparison.Ordinal);
@@ -465,7 +509,8 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
 
     private sealed record WorkflowState(
         [property: JsonPropertyName("id")] long Id,
-        [property: JsonPropertyName("name")] string Name);
+        [property: JsonPropertyName("name")] string Name,
+        [property: JsonPropertyName("type")] string? Type = null);
 
     private sealed record Workflow(
         [property: JsonPropertyName("id")] long Id,

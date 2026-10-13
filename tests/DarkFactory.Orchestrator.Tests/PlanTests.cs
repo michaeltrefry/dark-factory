@@ -341,7 +341,7 @@ public class PlanPipelineTests
     private static int StoryPosts(FakeShortcutBoard board) => board.Requests.Count(r => r.Method == HttpMethod.Post && r.PathAndQuery.EndsWith("/stories"));
 
     [Fact]
-    public async Task A_plan_item_is_planned_into_backlog_stories_with_their_blockers_and_a_second_run_creates_nothing_more()
+    public async Task A_plan_item_is_planned_into_backlog_stories_with_their_blockers_and_a_second_run_plans_and_creates_nothing_more()
     {
         var h = new Harness();
         var (board, source) = Board();
@@ -390,16 +390,25 @@ public class PlanPipelineTests
         Assert.Equal(Taint.Planner, (await h.Ledger.TaintOfAsync("plan-sess", CancellationToken.None))!.Reason);
         await Assert.ThrowsAsync<SessionTaintedException>(() => h.Ledger.GrantPushAsync(["plan-sess"], CancellationToken.None));
 
-        // The item waits on its stories: nothing resumes it, and a second run changes nothing anywhere.
-        Assert.Empty(await h.InFlight());
+        // The item waits on its stories: each poll evaluates it (sc-25871). A second run plans nothing and creates nothing: its
+        // one board write releases the story nothing blocks; a third run changes nothing anywhere.
+        Assert.Equal([500], await h.InFlight());
         var writes = board.Requests.Count(r => r.Method != HttpMethod.Get);
         var again = await h.Run(source, planner, 500);
 
         Assert.True(again.Succeeded, again.Error);
         Assert.Equal(WorkState.Planned, again.State);
         Assert.Single(planner.Calls);
-        Assert.Equal(writes, board.Requests.Count(r => r.Method != HttpMethod.Get)); // no story, link or comment
-        Assert.Equal(rows.Count, (await h.Rows()).Count);
+        Assert.Equal(3, StoryPosts(board));
+        Assert.Equal(writes + 1, board.Requests.Count(r => r.Method != HttpMethod.Get)); // no story, link or comment: A's move to To Do
+        Assert.Equal((FakeShortcutBoard.ToDo, FakeShortcutBoard.Backlog, FakeShortcutBoard.Backlog),
+            ((long)Named(board, "First story")["workflow_state_id"]!, (long)Named(board, "Second story")["workflow_state_id"]!,
+                (long)Named(board, "Third story")["workflow_state_id"]!));
+        Assert.Equal($"sc-{a["id"]}", (await h.Rows()).Last().Detail);
+        Assert.Equal(rows.Count + 1, (await h.Rows()).Count);
+        Assert.True((await h.Run(source, planner, 500)).Succeeded);
+        Assert.Equal(writes + 1, board.Requests.Count(r => r.Method != HttpMethod.Get));
+        Assert.Equal(rows.Count + 1, (await h.Rows()).Count);
         Assert.Empty(h.Implementer.Calls);
     }
 
@@ -946,7 +955,7 @@ public class PlanPipelineTests
     }
 
     [Fact]
-    public async Task A_waiting_plan_item_is_in_no_handled_state_and_gets_no_held_notice()
+    public async Task A_waiting_plan_item_is_in_no_handled_state_gets_no_held_notice_and_releases_what_nothing_blocks()
     {
         var h = new Harness();
         var source = new FakeWorkSource(PlanStory) { PlansItems = true };
@@ -959,6 +968,9 @@ public class PlanPipelineTests
         Assert.Equal((WorkState.Planned, (string?)null), (again.State, again.Error));
         Assert.Empty(source.Comments);
         Assert.DoesNotContain(RunPipeline.Steps.HeldNotice, await h.Steps());
+        // sc-25871: the run evaluated the plan instead — only the story nothing blocks left the backlog.
+        Assert.Equal([source.Children[0].Id], source.OutOfBacklog);
+        Assert.Equal([$"sc-{source.Children[0].Id}"], (await h.Rows()).Where(r => r.Step == RunPipeline.Steps.PlanReleased).Select(r => r.Detail));
     }
 }
 
