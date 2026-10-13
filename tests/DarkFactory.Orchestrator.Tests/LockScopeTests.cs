@@ -220,10 +220,13 @@ public class LockScopeTests
             return await ReportsModel(ImplementerModel)(call);
         }));
         bool? aWaitedOnReview = null;
-        var workerB = new FakeWorker(call => meter.InsideAsync(() =>
+        var workerB = new FakeWorker(call => meter.InsideAsync(async () =>
         {
-            aWaitedOnReview = aInReview.Task.IsCompleted && !aReviewEnds.Task.IsCompleted;
-            return ReportsModel(ImplementerModel)(call);
+            // B's session holds the sandbox user while A, past its own session, reaches its review and waits there: A needs no
+            // lock for that (it would never get there otherwise).
+            await aInReview.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            aWaitedOnReview = !aReviewEnds.Task.IsCompleted;
+            return await ReportsModel(ImplementerModel)(call);
         }));
 
         // A's implementer holds the sandbox user: B's run starts, and waits at its Implement step — it does not fail.
@@ -375,7 +378,7 @@ public class LockScopeTests
         var worker = new FakeWorker(ReportsModel(ImplementerModel)) { OrphanAlive = true };
         // An item at Review, with a worker a crashed run left on record, then stopped while no run drives it.
         Assert.Equal(WorkState.Review, (await Pipeline(h, probed, workerLock, worker, gate: false).RunAsync(77, CancellationToken.None)).State);
-        var item = (await h.Ledger.FindAsync(RunPipeline.Source, "sc-77", CancellationToken.None))!;
+        var item = (await h.Ledger.FindAsync(ItemNaming.Shortcut.Source, "sc-77", CancellationToken.None))!;
         await h.Ledger.CheckpointAsync(item, RunPipeline.Steps.WorkerStarted, null, WorkerPid.ToString(), CancellationToken.None);
         await h.Controls.SetAsync(ControlScope.Item("sc-77"), ControlState.Stopping, "tester", CancellationToken.None);
         var removedBefore = probed.Of("IRepoWorkspace.RemoveAsync").Count;

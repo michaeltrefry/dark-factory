@@ -36,7 +36,7 @@ public class IssueTriageTests
         Harness.RequireOptIn();
         Harness.RequireEnv("FACTORY_E2E_ISSUES", "set to 1 to open, triage and build real issues on the sandbox repo");
         Harness.RequireEnv("GH_TOKEN", "the owner's GitHub token: it opens and approves the test issues as a collaborator");
-        return await E2e.StartAsync(prefix);
+        return await E2e.StartAsync(prefix, ItemNaming.GitHubIssue);
     }
 
     /// <summary>A collaborator's issue with a confident fix becomes a work item, and its merged PR closes the issue.</summary>
@@ -112,7 +112,7 @@ public class IssueTriageTests
             await CommentAsync(owner, repo, number, "Approved", ct);
             using var github = OutboundHttp.GitHubApi();
             await PollUntil.SeenAsync(c => FactoryRunner.PollIssuesAsync(options, status, Console.Out, c),
-                async c => (await FactoryRunner.CreateIssueSource(options, github).ListReadyAsync(c)).Contains(key),
+                async c => (await WorkSourceRegistry.Issues(options, github).ListReadyAsync(c)).Contains(key),
                 $"{repo}#{number} ready after the owner's approval", ct);
         }
         finally

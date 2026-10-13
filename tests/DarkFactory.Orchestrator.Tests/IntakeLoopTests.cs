@@ -28,7 +28,7 @@ public class IntakeLoopTests
         public int Completed => Volatile.Read(ref _completed);
         public WorkLedger Ledger => new(Db, TimeProvider.System);
 
-        public Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct) => RunPipeline.InFlightAsync(Ledger, ct);
+        public Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct) => RunPipeline.InFlightAsync(Ledger, ItemNaming.Shortcut, ct);
 
         public async Task<RunOutcome> RunAsync(int id, CancellationToken ct)
         {
@@ -71,7 +71,7 @@ public class IntakeLoopTests
         var source = new ShortcutWorkSource(board.Client(), "tok", new WatchScope(["darkfactory"], []));
         var runner = new PipelineRunner(source);
         var time = new FakeTimeProvider();
-        var loop = new IntakeLoop(source, runner, new IntakeOptions(Interval), time, NullLogger<IntakeLoop>.Instance);
+        var loop = new IntakeLoop([new IntakeLane(source, runner)], new IntakeOptions(Interval), time, NullLogger<IntakeLoop>.Instance);
 
         await loop.StartAsync(CancellationToken.None);
         await Eventually(() => board.Requests.Any(r => r.PathAndQuery.StartsWith("/api/v3/groups/")));
@@ -348,17 +348,17 @@ public class IntakeLoopTests
     {
         var runner = new PipelineRunner(new ScriptedSource(() => []));
         var ledger = runner.Ledger;
-        var interrupted = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-1", "a", "o/r", null, CancellationToken.None);
+        var interrupted = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-1", "a", "o/r", null, CancellationToken.None);
         await ledger.RecordAsync(interrupted, WorkState.Implement, null, null, CancellationToken.None);
         await ledger.RecordAsync(interrupted, WorkState.Paused, null, RunPipeline.Interrupted, CancellationToken.None);
-        var byUser = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-2", "b", "o/r", null, CancellationToken.None);
+        var byUser = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-2", "b", "o/r", null, CancellationToken.None);
         await ledger.RecordAsync(byUser, WorkState.Implement, null, null, CancellationToken.None);
         await ledger.RecordAsync(byUser, WorkState.Paused, null, "paused by a user", CancellationToken.None);
-        var parked = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-3", "c", "o/r", null, CancellationToken.None);
+        var parked = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-3", "c", "o/r", null, CancellationToken.None);
         await ledger.RecordAsync(parked, WorkState.Implement, null, null, CancellationToken.None);
         await ledger.RecordAsync(parked, WorkState.Paused, null, RunPipeline.Interrupted, CancellationToken.None);
         await ledger.CheckpointAsync(parked, RunPipeline.Steps.Parked, null, "the story is outside the watch scope", CancellationToken.None);
-        var inImplement = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-4", "d", "o/r", null, CancellationToken.None);
+        var inImplement = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-4", "d", "o/r", null, CancellationToken.None);
         await ledger.RecordAsync(inImplement, WorkState.Implement, null, null, CancellationToken.None);
 
         Assert.Equal([1, 4], await runner.InFlightAsync(CancellationToken.None));
@@ -441,7 +441,7 @@ public class IntakeLoopTests
     }
 
     private static IntakeLoop Loop(IWorkSource source, IItemRunner runner) =>
-        new(source, runner, new IntakeOptions(Interval), TimeProvider.System, NullLogger<IntakeLoop>.Instance);
+        new([new IntakeLane(source, runner)], new IntakeOptions(Interval), TimeProvider.System, NullLogger<IntakeLoop>.Instance);
 
     [Fact]
     public async Task Poll_resumes_in_flight_items_first_then_ready_ones_once_each_and_a_failed_run_does_not_stop_the_rest()
@@ -464,13 +464,13 @@ public class IntakeLoopTests
     // ---- Runs that fail before the pipeline starts (E10): counted per item, given up on, shown on the dashboard. ----
 
     private static IntakeLoop Loop(IWorkSource source, IItemRunner runner, IntakeStatus status, int maxFailures = 3) =>
-        new(source, runner, new IntakeOptions(Interval, maxFailures), TimeProvider.System, NullLogger<IntakeLoop>.Instance, status: status);
+        new([new IntakeLane(source, runner)], new IntakeOptions(Interval, maxFailures), TimeProvider.System, NullLogger<IntakeLoop>.Instance, status: status);
 
     /// <summary>Story 101's item, left in <paramref name="state"/> (via Implement) by an earlier process.</summary>
     private static async Task<PipelineRunner> LeftIn(FakeWorkSource source, WorkState state)
     {
         var runner = new PipelineRunner(source);
-        var item = await runner.Ledger.GetOrCreateAsync(RunPipeline.Source, "sc-101", "s", Sandbox.FullName, null, CancellationToken.None);
+        var item = await runner.Ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-101", "s", Sandbox.FullName, null, CancellationToken.None);
         await runner.Ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
         if (state == WorkState.Paused)
         {

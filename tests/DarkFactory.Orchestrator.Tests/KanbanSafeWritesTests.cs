@@ -755,13 +755,13 @@ public class KanbanSafeWritesTests
         public async Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct)
         {
             await using var db = h.Db();
-            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ct, Controls(h), naming: ItemNaming.Kanban);
+            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Kanban, ct, Controls(h));
         }
 
         public async Task<IReadOnlyList<int>> RenewableAsync(CancellationToken ct)
         {
             await using var db = h.Db();
-            return await RunPipeline.RenewableAsync(new WorkLedger(db, TimeProvider.System), ct, Controls(h), naming: ItemNaming.Kanban);
+            return await RunPipeline.RenewableAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Kanban, ct, Controls(h));
         }
 
         public Task<RunOutcome> RunAsync(int id, CancellationToken ct)
@@ -783,8 +783,8 @@ public class KanbanSafeWritesTests
 
     private static IntakeLoop Loop(IWorkSource source, IItemRunner runner, IntakeStatus? status = null, IReadOnlyList<IntakeLane>? more = null,
         IControls? controls = null) =>
-        new(source, runner, new IntakeOptions(TimeSpan.FromSeconds(60)), TimeProvider.System, NullLogger<IntakeLoop>.Instance, controls, status: status,
-            moreLanes: more);
+        new([new IntakeLane(source, runner), .. more ?? []], new IntakeOptions(TimeSpan.FromSeconds(60)), TimeProvider.System,
+            NullLogger<IntakeLoop>.Instance, controls, status: status);
 
     /// <summary>
     /// A Kanban item in flight at Implement, as Intake leaves a claimed item (a <c>claimed</c> checkpoint, then Implement): claimed
@@ -1028,7 +1028,7 @@ public class KanbanSafeWritesTests
         async Task<IReadOnlyList<int>> Renewable(IControls? controls = null)
         {
             await using var db = h.Db();
-            return await RunPipeline.RenewableAsync(new WorkLedger(db, TimeProvider.System), None, controls ?? Controls(h), naming: ItemNaming.Kanban);
+            return await RunPipeline.RenewableAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Kanban, None, controls ?? Controls(h));
         }
         async Task Record(WorkState state, string? detail, string? step = null)
         {
@@ -1043,7 +1043,7 @@ public class KanbanSafeWritesTests
         // Another source's list does not hold it.
         await using (var db = h.Db())
         {
-            Assert.Empty(await RunPipeline.RenewableAsync(new WorkLedger(db, TimeProvider.System), None, Controls(h)));
+            Assert.Empty(await RunPipeline.RenewableAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Shortcut, None, Controls(h)));
         }
         // Being stopped: not listed (the stop gives the claim back).
         await Controls(h).SetAsync(ControlScope.Item("kb-1"), ControlState.Stopping, "michael", None);

@@ -191,9 +191,6 @@ public sealed partial class RunPipeline(
     /// </summary>
     public const int MaxStuckImplementSessions = 2;
 
-    /// <summary>The Shortcut source's ledger name (<see cref="ItemNaming.Shortcut"/>); a pipeline names items by its source's <see cref="Naming"/>.</summary>
-    public const string Source = "shortcut";
-
     /// <summary>How this pipeline's source names its items (ledger source, external id, branch).</summary>
     private ItemNaming Naming => source.Naming;
 
@@ -564,14 +561,13 @@ public sealed partial class RunPipeline(
     /// state and those paused in one in a way that resumes by itself (<see cref="ResumesAutomatically"/>, not parked), and plan items
     /// waiting on their stories (<see cref="WorkState.Planned"/>, sc-25871: each poll releases what is unblocked; no worker runs).
     /// </summary>
+    /// <param name="naming">The source whose items to list: each source's items are listed, and run, by its own intake lane (sc-25982).</param>
     /// <param name="handled">The states the runner's pipeline drives; default <see cref="HandledStates"/> (production).</param>
-    /// <param name="naming">The source whose items to list; default Shortcut stories.</param>
-    public static async Task<IReadOnlyList<int>> InFlightAsync(WorkLedger ledger, CancellationToken ct, IControls? controls = null,
-        IReadOnlySet<WorkState>? handled = null, ItemNaming? naming = null)
+    public static async Task<IReadOnlyList<int>> InFlightAsync(WorkLedger ledger, ItemNaming naming, CancellationToken ct, IControls? controls = null,
+        IReadOnlySet<WorkState>? handled = null)
     {
         controls ??= NoControls.Instance;
         handled ??= HandledStates;
-        naming ??= ItemNaming.Shortcut;
         var stopping = (await controls.ListAsync(ct)).Where(c => c.State == ControlState.Stopping).Select(c => c.Scope).ToHashSet();
         var stops = new List<int>();
         var ids = new List<int>();
@@ -620,14 +616,13 @@ public sealed partial class RunPipeline(
     /// on an item whose stop then releases it costs nothing; an unreadable control must not cost every item its claim), so this
     /// throws only when the ledger itself cannot be read.
     /// </summary>
+    /// <param name="naming">The source whose items to list: each lane renews its own source's claims (sc-25982; no default source).</param>
     /// <param name="handled">The states the runner's pipeline drives; default <see cref="HandledStates"/> (production).</param>
-    /// <param name="naming">The source whose items to list; default Shortcut stories.</param>
-    public static async Task<IReadOnlyList<int>> RenewableAsync(WorkLedger ledger, CancellationToken ct, IControls? controls = null,
-        IReadOnlySet<WorkState>? handled = null, ItemNaming? naming = null)
+    public static async Task<IReadOnlyList<int>> RenewableAsync(WorkLedger ledger, ItemNaming naming, CancellationToken ct, IControls? controls = null,
+        IReadOnlySet<WorkState>? handled = null)
     {
         controls ??= NoControls.Instance;
         handled ??= HandledStates;
-        naming ??= ItemNaming.Shortcut;
         var ids = new List<int>();
         foreach (var item in await ledger.ActiveItemsAsync(naming.Source, ct))
         {

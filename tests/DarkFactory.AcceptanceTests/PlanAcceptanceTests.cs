@@ -11,6 +11,7 @@ using DarkFactory.Orchestrator.Plans;
 using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 using Microsoft.EntityFrameworkCore;
+using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.AcceptanceTests;
 
@@ -86,7 +87,7 @@ public class PlanAcceptanceTests
         var parent = await PlanStoryAsync(shortcut, storyId, ct);
         var before = await PlanLive.SiblingsAsync(shortcut, parent, ct);
 
-        var outcome = await FactoryRunner.RunAsync(options, storyId, ignoreScope: true, Console.Out, ct);
+        var outcome = await FactoryRunner.RunAsync(options, new ItemRef(ItemNaming.Shortcut, storyId), ignoreScope: true, Console.Out, ct);
 
         var history = await AssertRefusedWithNothingCreatedAsync(e2e, shortcut, parent, storyId, outcome, before, ct);
         // One planner session ran (the stub, to its end), and its answer is what was refused: plan-rejected, a gate rejection.
@@ -139,7 +140,7 @@ public class PlanAcceptanceTests
         }
         var before = await PlanLive.SiblingsAsync(shortcut, parent, ct);
 
-        var outcome = await FactoryRunner.RunAsync(options, storyId, ignoreScope: true, Console.Out, ct);
+        var outcome = await FactoryRunner.RunAsync(options, new ItemRef(ItemNaming.Shortcut, storyId), ignoreScope: true, Console.Out, ct);
 
         var history = await AssertRefusedWithNothingCreatedAsync(e2e, shortcut, parent, storyId, outcome, before, ct);
         Assert.Contains($"{string.Join(", ", unconfigured)} {(unconfigured.Count == 1 ? "is" : "are")} not configured for this factory", outcome.Error);
@@ -175,7 +176,7 @@ public class PlanAcceptanceTests
         using var shortcut = Shortcut();
         await PlanStoryAsync(shortcut, storyId, ct);
         using var sourceHttp = OutboundHttp.ShortcutApi();
-        var source = FactoryRunner.CreateWorkSource(options, sourceHttp);
+        var source = WorkSourceRegistry.Shortcut(options, sourceHttp);
         Assert.Equal("To Do", (await E2e.StoryAsync(storyId, ct)).State);
         Assert.True(await source.InScopeAsync(storyId, ct), $"sc-{storyId} is not inside the watch scope: the intake loop would never see it");
         // The loop takes every ready story of the scope: this run must own all of them.
@@ -362,7 +363,7 @@ public class PlanAcceptanceTests
         try
         {
             // The story is named explicitly by FACTORY_E2E_P4_PLAN_STORY, like a manual `factory run --ignore-scope`.
-            var outcome = await FactoryRunner.RunAsync(options, storyId, ignoreScope: true, Console.Out, ct);
+            var outcome = await FactoryRunner.RunAsync(options, new ItemRef(ItemNaming.Shortcut, storyId), ignoreScope: true, Console.Out, ct);
             var history = await e2e.HistoryAsync(storyId, ct);
             created = StoryIds(history);
 
@@ -426,7 +427,7 @@ public class PlanAcceptanceTests
             var merged = new HashSet<string>(StringComparer.Ordinal);
             while (true)
             {
-                var run = await FactoryRunner.RunAsync(options, storyId, ignoreScope: true, Console.Out, ct);
+                var run = await FactoryRunner.RunAsync(options, new ItemRef(ItemNaming.Shortcut, storyId), ignoreScope: true, Console.Out, ct);
                 Assert.True(run.Succeeded, run.Error);
                 Assert.Equal(WorkState.Planned, run.State);
                 var now = await e2e.HistoryAsync(storyId, ct);
@@ -448,7 +449,7 @@ public class PlanAcceptanceTests
                 }
 
                 // Another run with nothing newly merged adds no row and moves no story.
-                Assert.True((await FactoryRunner.RunAsync(options, storyId, ignoreScope: true, Console.Out, ct)).Succeeded);
+                Assert.True((await FactoryRunner.RunAsync(options, new ItemRef(ItemNaming.Shortcut, storyId), ignoreScope: true, Console.Out, ct)).Succeeded);
                 Assert.Equal(now.Count, (await e2e.HistoryAsync(storyId, ct)).Count);
 
                 // The plan item is not reported merged while its changeset has not reached the default branch.
@@ -457,7 +458,7 @@ public class PlanAcceptanceTests
                 foreach (var i in tier)
                 {
                     // The story's own run: its pull request targets the changeset branch and the gate merges it there.
-                    var worked = await FactoryRunner.RunAsync(options, created[i], ignoreScope: true, Console.Out, ct);
+                    var worked = await FactoryRunner.RunAsync(options, new ItemRef(ItemNaming.Shortcut, created[i]), ignoreScope: true, Console.Out, ct);
                     Assert.True(worked.Succeeded, worked.Error);
                     Assert.Equal(WorkState.Watch, worked.State);
                     var pull = Assert.Single(await E2e.PullRequestsAsync(repo, created[i], ct));
@@ -486,7 +487,7 @@ public class PlanAcceptanceTests
             var runs = 0;
             do
             {
-                last = await FactoryRunner.RunAsync(options, storyId, ignoreScope: true, Console.Out, ct);
+                last = await FactoryRunner.RunAsync(options, new ItemRef(ItemNaming.Shortcut, storyId), ignoreScope: true, Console.Out, ct);
                 Assert.True(last.Succeeded, last.Error);
             }
             while (last.State != WorkState.Watch && ++runs < 4);

@@ -3,6 +3,7 @@ using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Dashboard;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Shortcut;
+using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -138,7 +139,7 @@ public class FactoryWorkTests
         }
 
         // Factory-scope Stop on a run nothing else drives (the host is gone).
-        var run = FactoryRunner.RunAsync(options, second, ignoreScope: true, Console.Out, ct);
+        var run = FactoryRunner.RunAsync(options, new ItemRef(ItemNaming.Shortcut, second), ignoreScope: true, Console.Out, ct);
         await WaitForWorkerAsync(e2e, second, after: 0, ct);
         var stop = await FactoryRunner.ControlAsync(options, "stop", ControlScope.Factory, "acceptance", Console.Out, ct);
         Console.WriteLine(stop.Message);

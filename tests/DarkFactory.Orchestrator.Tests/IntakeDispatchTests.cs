@@ -92,7 +92,7 @@ public class IntakeDispatchTests
     private static readonly RunOutcome Ok = new(1, WorkState.Review, null, null, null);
 
     private static IntakeLoop Loop(IWorkSource source, IItemRunner runner, int concurrent, IntakeStatus? status = null, int maxFailures = 3) =>
-        new(source, runner, new IntakeOptions(TimeSpan.FromSeconds(60), maxFailures, concurrent), TimeProvider.System, NullLogger<IntakeLoop>.Instance,
+        new([new IntakeLane(source, runner)], new IntakeOptions(TimeSpan.FromSeconds(60), maxFailures, concurrent), TimeProvider.System, NullLogger<IntakeLoop>.Instance,
             status: status);
 
     private static async Task Eventually(Func<bool> condition, string what)
@@ -139,7 +139,7 @@ public class IntakeDispatchTests
     {
         Assert.Equal(1, new IntakeOptions(TimeSpan.FromSeconds(60)).MaxConcurrentRuns);
         var runner = new GatedRunner(5, 3);
-        var loop = new IntakeLoop(ListingSource.Listing(3, 7), runner, new IntakeOptions(TimeSpan.FromSeconds(60)), TimeProvider.System, NullLogger<IntakeLoop>.Instance);
+        var loop = new IntakeLoop([new IntakeLane(ListingSource.Listing(3, 7), runner)], new IntakeOptions(TimeSpan.FromSeconds(60)), TimeProvider.System, NullLogger<IntakeLoop>.Instance);
         var poll = loop.PollOnceAsync(CancellationToken.None);
 
         foreach (var (id, started) in new[] { (5, 1), (3, 2), (7, 3) })

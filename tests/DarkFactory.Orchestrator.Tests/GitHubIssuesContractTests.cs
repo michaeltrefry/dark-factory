@@ -246,15 +246,12 @@ public class GitHubIssuesContractTests
         Assert.False(ItemNaming.GitHubIssue.TryParse("3", out _));
         Assert.Equal("factory/gh-3", ItemNaming.GitHubIssue.BranchName(3));
         Assert.Equal(new ItemRef(ItemNaming.GitHubIssue, 3), ControlScope.ItemOf("item:gh-3"));
-        Assert.Null(ControlScope.ItemStory("item:gh-3"));
         Assert.True(ControlScope.IsValid("item:gh-3"));
     }
 
     private sealed class RecordingStops : IItemStops
     {
         public List<string> Stopped { get; } = [];
-
-        public Task<ControlResult> StopAsync(int storyId, CancellationToken ct) => StopAsync(new ItemRef(ItemNaming.Shortcut, storyId), ct);
 
         public Task<ControlResult> StopAsync(ItemRef item, CancellationToken ct)
         {

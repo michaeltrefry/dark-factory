@@ -18,7 +18,7 @@ has a `Repo: owner/name` line.
 
 `factory work` is the long-running trigger: next to the session hub, the same process polls Shortcut every `Intake:PollSeconds`
 (default 60; there is no public webhook endpoint on the Mac) and runs each ready story through
-the pipeline, one at a time. Ready means a story in the `To Do` workflow state inside the watch
+the pipeline, one at a time (or up to `Intake:MaxConcurrentRuns` at once). Ready means a story in the `To Do` workflow state inside the watch
 scope: any team in `Shortcut:Watch:Teams` (mention names or ids) or epic in
 `Shortcut:Watch:Epics` (ids), each comma-separated. An empty scope watches nothing; an unknown
 team or epic stops `factory work` at start-up (exit 2). Teams are listed with the documented

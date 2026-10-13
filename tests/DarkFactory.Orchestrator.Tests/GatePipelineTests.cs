@@ -632,7 +632,7 @@ public class GatePipelineTests
             }
         };
         var ledger = h.Ledger;
-        var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
+        var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
         await ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
         await ledger.RecordAsync(item, WorkState.Review, null, PrUrl, CancellationToken.None);
         await ledger.CheckpointAsync(item, RunPipeline.Steps.ImplementerModel, null, ImplementerModel, CancellationToken.None);
@@ -688,7 +688,7 @@ public class GatePipelineTests
     {
         var h = new Harness();
         var ledger = h.Ledger;
-        var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
+        var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
         foreach (var state in new[] { WorkState.Implement, WorkState.Review })
         {
             await ledger.RecordAsync(item, state, null, state == WorkState.Review ? PrUrl : null, CancellationToken.None);

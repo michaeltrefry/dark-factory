@@ -441,7 +441,7 @@ public class PlanReleasePipelineTests
             var plan = PlanParser.Parse(answer);
             var ids = await Source.CreateChildrenAsync(PlanId, plan.Children($"sc-{PlanId}", Sandbox), CancellationToken.None);
             var ledger = Ledger;
-            var item = await ledger.GetOrCreateAsync(RunPipeline.Source, $"sc-{PlanId}", "Add CSV export", Sandbox.FullName, null, CancellationToken.None, 42);
+            var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, $"sc-{PlanId}", "Add CSV export", Sandbox.FullName, null, CancellationToken.None, 42);
             await ledger.RecordAsync(item, WorkState.Plan, null, null, CancellationToken.None);
             await ledger.CheckpointAsync(item, RunPipeline.Steps.Plan, "plan-sess", plan.ToDetail(), CancellationToken.None);
             await ledger.CheckpointAsync(item, RunPipeline.Steps.PlanCreating, "plan-sess", null, CancellationToken.None);
@@ -453,7 +453,7 @@ public class PlanReleasePipelineTests
         public async Task Recorded(IReadOnlyList<int> ids)
         {
             var ledger = Ledger;
-            var item = (await ledger.FindAsync(RunPipeline.Source, $"sc-{PlanId}", CancellationToken.None))!;
+            var item = (await ledger.FindAsync(ItemNaming.Shortcut.Source, $"sc-{PlanId}", CancellationToken.None))!;
             var stories = string.Join(' ', ids.Select(i => $"sc-{i}"));
             await ledger.CheckpointAsync(item, RunPipeline.Steps.PlanStories, "plan-sess", stories, CancellationToken.None);
             await ledger.RecordAsync(item, WorkState.Planned, "plan-sess", $"{ids.Count} stories: {stories}", CancellationToken.None);
@@ -466,7 +466,7 @@ public class PlanReleasePipelineTests
         public async Task Worked(int id, WorkState last = WorkState.Watch, string? title = null)
         {
             var ledger = Ledger;
-            var item = await ledger.GetOrCreateAsync(RunPipeline.Source, $"sc-{id}", title ?? $"Story {id}", Sandbox.FullName, null, CancellationToken.None, 42);
+            var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, $"sc-{id}", title ?? $"Story {id}", Sandbox.FullName, null, CancellationToken.None, 42);
             WorkState[] path = [WorkState.Implement, WorkState.Review, WorkState.CI, WorkState.MergeGate, WorkState.Merge, WorkState.Watch];
             foreach (var state in path.Skip(Array.IndexOf(path, item.State) + 1))
             {
@@ -502,7 +502,7 @@ public class PlanReleasePipelineTests
         public async Task<IReadOnlyList<int>> InFlight()
         {
             await using var db = new LedgerDbContext(_options);
-            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), CancellationToken.None, Controls);
+            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Shortcut, CancellationToken.None, Controls);
         }
 
         public async Task Link(int subject, int obj)
@@ -712,7 +712,7 @@ public class PlanReleasePipelineTests
         var ids = await h.Planned(Chain);
         await h.Run();
         await h.Worked(ids[0], WorkState.Review);
-        var item = await h.Ledger.FindAsync(RunPipeline.Source, $"sc-{ids[0]}", CancellationToken.None);
+        var item = await h.Ledger.FindAsync(ItemNaming.Shortcut.Source, $"sc-{ids[0]}", CancellationToken.None);
         await h.Ledger.RecordAsync(item!, ended, null, "gave up", CancellationToken.None);
 
         for (var poll = 0; poll < 3; poll++)
@@ -1194,10 +1194,10 @@ public class PlanReleasePipelineTests
         var ledger = h.Ledger;
         // A plan-stories row naming it turns up afterwards (a plan lists only stories it created, so it never does): the item was
         // claimed with no plan, so its later runs do not search the plans for it.
-        var plan = await ledger.GetOrCreateAsync(RunPipeline.Source, $"sc-{PlanId}", "Add CSV export", Sandbox.FullName, null, CancellationToken.None, 42);
+        var plan = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, $"sc-{PlanId}", "Add CSV export", Sandbox.FullName, null, CancellationToken.None, 42);
         await ledger.RecordAsync(plan, WorkState.Plan, null, null, CancellationToken.None);
         await ledger.CheckpointAsync(plan, RunPipeline.Steps.PlanStories, null, "sc-600", CancellationToken.None);
-        var item = (await ledger.FindAsync(RunPipeline.Source, "sc-600", CancellationToken.None))!;
+        var item = (await ledger.FindAsync(ItemNaming.Shortcut.Source, "sc-600", CancellationToken.None))!;
         await ledger.RecordAsync(item, WorkState.Escalated, null, "boom", CancellationToken.None);
 
         var again = await h.Run(600);
@@ -1213,7 +1213,7 @@ public class PlanReleasePipelineTests
         var h = new Harness();
         await h.Planned(Chain);
         // A planner a crashed run left behind is on record: finishing a stop goes and stops it.
-        var plan = (await h.Ledger.FindAsync(RunPipeline.Source, $"sc-{PlanId}", CancellationToken.None))!;
+        var plan = (await h.Ledger.FindAsync(ItemNaming.Shortcut.Source, $"sc-{PlanId}", CancellationToken.None))!;
         await h.Ledger.CheckpointAsync(plan, RunPipeline.Steps.WorkerStarted, null, WorkerPid.ToString(), CancellationToken.None);
         await h.Controls.SetAsync(ControlScope.Item($"sc-{PlanId}"), ControlState.Stopping, "test", CancellationToken.None);
 
@@ -1334,13 +1334,13 @@ public class PlanReleasePipelineTests
         var ids = await h.Planned(Chain);
         var plan = await h.Db.WorkItems.AsNoTracking().SingleAsync(i => i.ExternalId == $"sc-{PlanId}");
 
-        Assert.Equal(plan.Id, await h.Ledger.PlanOfAsync(RunPipeline.Source, $"sc-{ids[1]}", CancellationToken.None));
+        Assert.Equal(plan.Id, await h.Ledger.PlanOfAsync(ItemNaming.Shortcut.Source, $"sc-{ids[1]}", CancellationToken.None));
         // A prefix of a listed id is not that id, and another source's item with the same id is not the plan's story.
-        Assert.Null(await h.Ledger.PlanOfAsync(RunPipeline.Source, $"sc-{ids[1]}"[..^1], CancellationToken.None));
-        Assert.Null(await h.Ledger.PlanOfAsync(RunPipeline.Source, $"sc-{PlanId}", CancellationToken.None));
+        Assert.Null(await h.Ledger.PlanOfAsync(ItemNaming.Shortcut.Source, $"sc-{ids[1]}"[..^1], CancellationToken.None));
+        Assert.Null(await h.Ledger.PlanOfAsync(ItemNaming.Shortcut.Source, $"sc-{PlanId}", CancellationToken.None));
         Assert.Null(await h.Ledger.PlanOfAsync(ItemNaming.GitHubIssue.Source, $"sc-{ids[1]}", CancellationToken.None));
 
-        var known = await h.Ledger.ItemsByIdAsync(RunPipeline.Source, [$"sc-{PlanId}", "sc-1", $"sc-{PlanId}"], CancellationToken.None);
+        var known = await h.Ledger.ItemsByIdAsync(ItemNaming.Shortcut.Source, [$"sc-{PlanId}", "sc-1", $"sc-{PlanId}"], CancellationToken.None);
         Assert.Equal([$"sc-{PlanId}"], known.Keys);
         Assert.Equal(RunPipeline.Steps.PlanStories, known[$"sc-{PlanId}"].History.Last(r => r.Step is not null).Step);
     }
@@ -1384,7 +1384,7 @@ public class PlanRunnerLockTests
         await using (var db = contexts.CreateDbContext())
         {
             var ledger = new WorkLedger(db, TimeProvider.System);
-            var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-500", "Add CSV export", Sandbox.FullName, null, CancellationToken.None);
+            var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-500", "Add CSV export", Sandbox.FullName, null, CancellationToken.None);
             await ledger.RecordAsync(item, WorkState.Plan, null, null, CancellationToken.None);
             await ledger.CheckpointAsync(item, RunPipeline.Steps.PlanStories, null, "sc-9001 sc-9002", CancellationToken.None);
             await ledger.RecordAsync(item, WorkState.Planned, null, "2 stories: sc-9001 sc-9002", CancellationToken.None);

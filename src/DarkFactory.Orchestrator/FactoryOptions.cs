@@ -10,7 +10,11 @@ namespace DarkFactory.Orchestrator;
 /// macOS keychain (service <c>dark-factory</c>) — never from files in the repo.
 /// Secrets are resolved lazily so a command only fails on the credential it needs.
 /// </summary>
-public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
+/// <param name="environment">
+/// Tests: what stands in for the process environment when a secret's variable is read (<c>_ =&gt; null</c>: a test of a missing
+/// credential then does not depend on the machine it runs on); default <see cref="Environment.GetEnvironmentVariable(string)"/>.
+/// </param>
+public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, Func<string, string?>? environment = null)
 {
     public const string DefaultConnectionString =
         "Host=localhost;Port=5434;Database=factory;Username=factory;Password=factory";
@@ -482,7 +486,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         var value = config[configKey];
         if (string.IsNullOrWhiteSpace(value) && envVar is not null)
         {
-            value = Environment.GetEnvironmentVariable(envVar);
+            value = environment is null ? Environment.GetEnvironmentVariable(envVar) : environment(envVar);
         }
         if (string.IsNullOrWhiteSpace(value))
         {
