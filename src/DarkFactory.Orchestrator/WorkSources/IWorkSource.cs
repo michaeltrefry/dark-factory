@@ -170,6 +170,15 @@ public interface IWorkSource
     /// story it released that a person moved back. Reads only. A source that creates no children has none there (the default).
     /// </summary>
     Task<bool> InBacklogAsync(int id, CancellationToken ct) => Task.FromResult(false);
+
+    /// <summary>
+    /// Moves an item <see cref="MakeReadyAsync"/> released back to the backlog and posts <paramref name="comment"/> on it (sc-25876: its
+    /// plan was stopped before anything claimed it) — only while the board still shows it as the release left it: not archived, in
+    /// the ready state, and with no owner or claim but the factory's. Otherwise it writes nothing and returns false: someone took it,
+    /// finished it or moved it, and it is theirs. Re-reads the item first. A source that creates no children has none to return
+    /// (the default).
+    /// </summary>
+    Task<bool> ReturnUnstartedAsync(int id, string comment, CancellationToken ct) => Task.FromResult(false);
 }
 
 /// <summary>

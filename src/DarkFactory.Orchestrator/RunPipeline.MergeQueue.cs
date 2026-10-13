@@ -550,7 +550,7 @@ public sealed partial class RunPipeline
             await ledger.RecordAsync(run.Item, WorkState.Merge, null, commit, ct);
             return;
         }
-        throw new GateBlockedException($"{pull.HtmlUrl} was merged outside the gate.");
+        throw new GateBlockedException($"{pull.HtmlUrl} {Plans.PlanRelease.MergedOutsideGate}.");
     }
 
     /// <summary>

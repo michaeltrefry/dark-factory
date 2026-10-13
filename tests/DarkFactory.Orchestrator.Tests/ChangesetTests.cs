@@ -578,6 +578,9 @@ public class ChangesetPipelineTests
             return (await new WorkLedger(db, TimeProvider.System).TaintOfAsync(session, CancellationToken.None))?.Reason;
         }
 
+        public async Task<IReadOnlyList<Dashboard.PipelineRow>> Dashboard() =>
+            await new Dashboard.DashboardData(new LedgerDbContextFactory(_options), TimeProvider.System).ActiveItemsAsync(CancellationToken.None);
+
         public async Task<IReadOnlyList<int>> InFlight()
         {
             await using var db = new LedgerDbContext(_options);
@@ -1372,5 +1375,124 @@ public class ChangesetPipelineTests
         Assert.Equal(WorkState.Done, (await h.Run()).State);
         Assert.Equal(2, h.Comments(PlanId).Count);
         Assert.Single(await h.Steps(PlanId, RunPipeline.Steps.ChangesetEmpty));
+    }
+
+    [Fact]
+    public async Task Stopping_a_plan_item_with_an_open_changeset_pull_request_and_an_unfinished_story_stops_the_story_drafts_the_pull_request_and_cancels_the_plan_once()
+    {
+        var h = new Harness();
+        var ids = await h.ChangesetOpen();
+        var url = await ChangesetUrl(h);
+        // A story of the plan that is not finished though the changeset pull request is open (the plan's record of its stories
+        // gained one): the factory is implementing it, and its run was interrupted.
+        const int late = 900;
+        h.Board.Add(late, FakeShortcutBoard.FactoryTeam, epic: 42, name: "Late story");
+        await h.Seed((l, item) => l.CheckpointAsync(item, RunPipeline.Steps.PlanStories, null,
+            string.Join(' ', ids.Append(late).Select(i => $"sc-{i}")), CancellationToken.None));
+        using var interrupt = new CancellationTokenSource();
+        h.WorkerInstead = new InterruptedWorker(interrupt);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => h.Run(late, ct: interrupt.Token));
+        h.WorkerInstead = null;
+        Assert.NotNull(await h.PlanOf(late));
+        Assert.Equal(WorkState.Paused, (await h.Transitions(late))[^1]);
+        Assert.Equal(WorkState.Review, (await h.Transitions())[^1]);
+        await h.Controls.SetAsync(PlanItem, ControlState.Stopping, "test", CancellationToken.None);
+
+        var stopped = await h.Run();
+
+        // (b) the unfinished story is stopped with its plan, on its own rows; the merged ones are left as they are.
+        Assert.Equal(WorkState.Cancelled, (await h.Transitions(late))[^1]);
+        Assert.Contains(h.Comments(late), c => c.Contains($"sc-{late} was stopped by test (with its plan sc-{PlanId})"));
+        Assert.All(ids, id => Assert.Equal(WorkState.Watch, h.Transitions(id).Result[^1]));
+        // (a) the plan item's own pull request — its changeset branch's — is a draft again.
+        Assert.Equal([Branch(late), ChangesetBranch], h.Repo.Drafted);
+        Assert.Equal(url, (await h.Steps(PlanId, RunPipeline.Steps.PrsDrafted)).Single());
+        // (c) the plan item is cancelled once, with one comment that says all of it.
+        Assert.Equal(WorkState.Cancelled, stopped.State);
+        Assert.Single(await h.Transitions(), s => s == WorkState.Cancelled);
+        var comment = Assert.Single(h.Comments(PlanId));
+        Assert.Contains($"sc-{PlanId} was stopped by test: the factory cancelled the plan (was Review)", comment);
+        Assert.Contains($"Stories stopped with it: sc-{late}.", comment);
+        Assert.Contains($"Already merged (left as they are): sc-{ids[0]}, sc-{ids[1]}.", comment);
+        Assert.Contains($"Its pull request ({url}) is a draft again. Branch {ChangesetBranch} is kept; nothing was merged or deleted.", comment);
+        Assert.DoesNotContain(h.Repo.Merges, m => m.Head == ChangesetBranch);
+        Assert.Equal("base0", h.Repo.Tip(Main));
+        Assert.Equal(ControlState.Running, await h.Controls.EffectiveAsync($"sc-{PlanId}", 42, CancellationToken.None));
+
+        // A later run stops nothing again (it only says, once, that a Cancelled item is not moved on).
+        Assert.Equal(WorkState.Cancelled, (await h.Run()).State);
+        Assert.Single(h.Comments(PlanId), c => c.Contains("was stopped by"));
+        Assert.Single(await h.Transitions(), s => s == WorkState.Cancelled);
+        Assert.Equal(2, h.Repo.Drafted.Count);
+        Assert.Empty(await h.InFlight());
+    }
+
+    [Fact]
+    public async Task The_dashboard_still_groups_a_plans_stories_under_it_once_its_changeset_pull_request_is_open_and_when_it_escalates()
+    {
+        var h = new Harness();
+        var ids = await h.ChangesetOpen();
+
+        var rows = await h.Dashboard();
+
+        var plan = rows.Single(r => r.ExternalId == $"sc-{PlanId}");
+        Assert.Equal(WorkState.Review, plan.State);
+        Assert.Equal(ids.Select(i => ($"sc-{i}", PlanStoryState.Merged)), plan.Plan!.Stories.Select(s => (s.ExternalId, s.State)));
+        Assert.Equal(2, plan.Plan.Merged);
+        Assert.Null(plan.Plan.Hold);
+        Assert.All(ids, id => Assert.Equal(plan.Id, rows.Single(r => r.ExternalId == $"sc-{id}").PlanItemId));
+
+        h.Reviewer.Unusable = true;
+        Assert.Equal(WorkState.Escalated, (await h.Run()).State);
+
+        rows = await h.Dashboard();
+        plan = rows.Single(r => r.ExternalId == $"sc-{PlanId}");
+        Assert.Equal(WorkState.Escalated, plan.State);
+        Assert.Equal(2, plan.Plan!.Merged);
+        Assert.All(ids, id => Assert.Equal(plan.Id, rows.Single(r => r.ExternalId == $"sc-{id}").PlanItemId));
+    }
+
+    [Fact]
+    public async Task Stopping_a_plan_story_the_factory_never_claimed_says_the_factory_did_no_work_on_it()
+    {
+        var h = new Harness();
+        var ids = await h.Plan(Two);
+        var b = ids[1];
+        // Someone moves B to ready by hand while A, which blocks it, has not merged: its claim is refused and it is parked. The
+        // ledger knows it; the factory never claimed it.
+        h.Board.Story(b)["workflow_state_id"] = FakeShortcutBoard.ToDo;
+        var parked = await h.Run(b);
+        Assert.Equal(WorkState.Paused, parked.State);
+        Assert.Contains("blocked by", parked.Error);
+        Assert.Empty(await h.Steps(b, RunPipeline.Steps.Claimed));
+        await h.Controls.SetAsync(ControlScope.Item($"sc-{b}"), ControlState.Stopping, "test", CancellationToken.None);
+
+        var stopped = await h.Run(b);
+
+        Assert.Equal(WorkState.Cancelled, stopped.State);
+        var comment = Assert.Single(h.Comments(b), c => c.Contains("was stopped by test"));
+        Assert.Equal($"[author: dark-factory] sc-{b} was stopped by test before the factory started it: it is back in the backlog and the factory "
+            + "will not start it. The factory did no work on it; nothing was changed, merged or deleted.", comment);
+        Assert.DoesNotContain(h.Comments(b), c => c.Contains("cancelled its work") || c.Contains("released its claim"));
+        Assert.Equal(FakeShortcutBoard.Backlog, h.State(b));
+    }
+
+    [Fact]
+    public async Task Stopping_a_plan_story_the_factory_claimed_still_says_its_work_was_cancelled_and_its_claim_released()
+    {
+        var h = new Harness();
+        var ids = await h.Plan(Two);
+        var a = ids[0];
+        Assert.True((await h.Run()).Succeeded, h.Logged);
+        using var interrupt = new CancellationTokenSource();
+        h.WorkerInstead = new InterruptedWorker(interrupt);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => h.Run(a, ct: interrupt.Token));
+        h.WorkerInstead = null;
+        await h.Controls.SetAsync(ControlScope.Item($"sc-{a}"), ControlState.Stopping, "test", CancellationToken.None);
+
+        var stopped = await h.Run(a);
+
+        Assert.Equal(WorkState.Cancelled, stopped.State);
+        Assert.Contains(h.Comments(a), c => c.Contains($"sc-{a} was stopped by test: the factory cancelled its work on it") && c.Contains("released its claim"));
     }
 }

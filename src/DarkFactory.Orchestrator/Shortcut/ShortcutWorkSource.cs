@@ -358,6 +358,29 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
         return !story.Archived && story.WorkflowStateId == await StateIdAsync(story.WorkflowId, BoardStateName(BoardState.Stopped), ct);
     }
 
+    /// <summary>
+    /// <see cref="ReadyState"/> → Backlog with a comment, only for a story that is not archived, still in a ready state, and owned and
+    /// claimed by nobody but the factory; any other story is left as it is (false, nothing written).
+    /// </summary>
+    public async Task<bool> ReturnUnstartedAsync(int id, string comment, CancellationToken ct)
+    {
+        var me = await MeAsync(ct);
+        var story = await GetStoryAsync(id, ct);
+        if (story.Archived || !(await ReadyStateIdsAsync(ct)).Contains(story.WorkflowStateId)
+            || story.OwnerIds.Any(o => o != me) || HeldByAnother(story, me))
+        {
+            return false;
+        }
+        await UpdateAsync(id, new
+        {
+            workflow_state_id = await StateIdAsync(story.WorkflowId, BoardStateName(BoardState.Stopped), ct),
+            owner_ids = story.OwnerIds.Where(o => o != me),
+            labels = LabelParams(story.LabelNames.Where(l => l != ClaimLabel)),
+        }, ct);
+        await CommentAsync(id, comment, ct);
+        return true;
+    }
+
     /// <summary>Whether a stored description is the one that was sent (line endings and outer whitespace aside).</summary>
     private static bool SameText(string? stored, string sent) =>
         string.Equals((stored ?? "").ReplaceLineEndings("\n").Trim(), sent.ReplaceLineEndings("\n").Trim(), StringComparison.Ordinal);

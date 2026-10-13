@@ -16,7 +16,10 @@ public enum ControlState
     /// </summary>
     Paused,
 
-    /// <summary>Item scope only: the item is being stopped (worker killed, Cancelled, PR back to draft, story commented).</summary>
+    /// <summary>
+    /// Item scope only: the item is being stopped (worker killed, Cancelled, PR back to draft, story commented). On a plan item
+    /// (sc-25876) its unfinished stories are being stopped with it.
+    /// </summary>
     Stopping,
 }
 
@@ -42,7 +45,10 @@ public static class ControlScope
 
     public static string Epic(long epicId) => $"epic:{epicId}";
 
-    public static string Item(string externalId) => $"item:{externalId}";
+    /// <summary>What an item scope starts with, before the item's external id.</summary>
+    public const string ItemPrefix = "item:";
+
+    public static string Item(string externalId) => ItemPrefix + externalId;
 
     /// <summary>The Shortcut story id of an item scope, or null for another scope (or another source's item).</summary>
     public static int? ItemStory(string scope) => ItemOf(scope) is { } item && item.Naming == ItemNaming.Shortcut ? item.Id : null;
@@ -87,6 +93,9 @@ public interface IControls
     /// <summary>
     /// What applies to one item: <see cref="ControlState.Stopping"/> when the item is being stopped, else
     /// <see cref="ControlState.Paused"/> when the factory, the item's epic or the item is paused, else running.
+    /// A story of a plan (sc-25876, <see cref="WorkItem.PlanItemId"/>) is held to its plan item's control as well — the plan's own
+    /// <c>item:&lt;plan&gt;</c> scope, so a Pause, Continue or Stop on a plan item reaches its stories with no scope kind of its own:
+    /// paused while the plan item is, and being stopped while the plan item is unless the factory already merged it.
     /// </summary>
     Task<ControlState> EffectiveAsync(string externalId, long? epicId, CancellationToken ct);
 
@@ -152,17 +161,35 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
 {
     public async Task<ControlState> EffectiveAsync(string externalId, long? epicId, CancellationToken ct)
     {
-        var scopes = new List<string> { ControlScope.Factory, ControlScope.Usage, ControlScope.Freeze, ControlScope.Item(externalId) };
+        var own = ControlScope.Item(externalId);
+        var scopes = new List<string> { ControlScope.Factory, ControlScope.Usage, ControlScope.Freeze, own };
         if (epicId is { } epic)
         {
             scopes.Add(ControlScope.Epic(epic));
         }
         await using var db = await contexts.CreateDbContextAsync(ct);
-        var rows = await db.Controls.AsNoTracking().Where(c => scopes.Contains(c.Scope)).ToListAsync(ct);
+        // A story of a plan (sc-25876) is also held to the control on its plan item: no new scope kind, the plan's own item scope,
+        // found by a self-join on the ledger's (Source, ExternalId) index inside the one query that reads the rows — this runs every
+        // second for every running worker and test run. No part of it is optional: a read that fails throws, and the caller counts
+        // an unreadable control as a Pause (E2), never as "no plan".
+        var source = ItemNaming.ParseAny(externalId)?.Naming.Source;
+        var planScopes = db.WorkItems.Where(s => s.Source == source && s.ExternalId == externalId && s.PlanItemId != null)
+            .Join(db.WorkItems, s => s.PlanItemId, p => (long?)p.Id, (s, p) => ControlScope.ItemPrefix + p.ExternalId);
+        var rows = await db.Controls.AsNoTracking().Where(c => scopes.Contains(c.Scope) || planScopes.Contains(c.Scope)).ToListAsync(ct);
         var now = time.GetUtcNow();
-        return rows.Any(r => r.State == ControlState.Stopping && r.Scope == ControlScope.Item(externalId)) ? ControlState.Stopping
-            : rows.Any(r => r.PausesAt(now)) ? ControlState.Paused
-            : ControlState.Running;
+        if (rows.Any(r => r.State == ControlState.Stopping && r.Scope == own))
+        {
+            return ControlState.Stopping;
+        }
+        // A plan being stopped (a Stopping row that is none of the item's own scopes is its plan's) stops its unfinished stories;
+        // one the factory already merged is left as it is. Asked only then.
+        if (rows.Any(r => r.State == ControlState.Stopping && !scopes.Contains(r.Scope))
+            && !await db.LedgerEntries.AsNoTracking().AnyAsync(e => e.Step == null && e.State == WorkState.Merge
+                && db.WorkItems.Any(i => i.Id == e.WorkItemId && i.Source == source && i.ExternalId == externalId), ct))
+        {
+            return ControlState.Stopping;
+        }
+        return rows.Any(r => r.PausesAt(now)) ? ControlState.Paused : ControlState.Running;
     }
 
     public async Task<IReadOnlyList<Control>> ListAsync(CancellationToken ct)

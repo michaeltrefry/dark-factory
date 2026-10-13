@@ -5,6 +5,7 @@ using DarkFactory.Orchestrator.Dashboard;
 using DarkFactory.Orchestrator.Dashboard.Components;
 using DarkFactory.Orchestrator.Dashboard.Components.Pages;
 using DarkFactory.Orchestrator.Ledger;
+using DarkFactory.Orchestrator.Plans;
 using DarkFactory.Orchestrator.Router;
 using DarkFactory.Orchestrator.Sessions;
 using DarkFactory.Orchestrator.Tests.Support;
@@ -193,6 +194,80 @@ public class DashboardComponentTests : BunitContext
         Assert.Equal("https://github.com/acme/widgets/pull/9", cut.Find("td.pr a").GetAttribute("href"));
         Assert.Equal(["sessions/s-1", "sessions/s-2"], cut.FindAll("td.sessions a").Select(a => a.GetAttribute("href")));
         Assert.Equal("#2 (live)", cut.FindAll("td.sessions a")[1].TextContent);
+    }
+
+    /// <summary>The plan row's note about its hold comment, as the page renders it (whitespace collapsed).</summary>
+    private List<string> RenderPlanNotice(PlanView plan)
+    {
+        _data.Rows = [Row(500, WorkState.Planned) with { Plan = plan }];
+        using var cut = Render<Pipeline>();
+        return [.. cut.FindAll("tr[data-item='500'] .plan-notice").Select(n => string.Join(' ', n.TextContent.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)))];
+    }
+
+    [Fact]
+    public void A_plan_row_shows_its_counts_and_hold_with_its_stories_beneath_it_each_with_its_state_and_what_it_waits_on()
+    {
+        // sc-25876: sc-501 in flight, sc-502 escalated, sc-503 (not released: no work item) blocked behind it, sc-504 merged.
+        var status = new PlanStatus([
+            new PlanStoryStatus("sc-501", PlanStoryState.InFlight, [], [], null, WorkState.Review),
+            new PlanStoryStatus("sc-502", PlanStoryState.Failed, [], [], new StoryFailure(PlanRelease.AsEscalated, "CI is red", Now), WorkState.Escalated),
+            new PlanStoryStatus("sc-503", PlanStoryState.Blocked, ["sc-502"], ["sc-502"], null, null),
+            new PlanStoryStatus("sc-504", PlanStoryState.Merged, [], [], null, WorkState.Done),
+        ]);
+        string[] titles = ["Story 501", "Story 502", "Third <story>", "Story 504"];
+        var plan = new PlanView([.. status.Stories.Select((s, i) => new PlanStoryView(s.Id, titles[i], s.State, s.ItemState, PlanStoryView.WaitsOf(s, status)))],
+            status, PlanRelease.HeldByFailed(status));
+        Assert.Empty(RenderPlanNotice(plan)); // its hold comment was posted (or nothing is held): nothing said
+        Assert.Equal("hold comment not posted (attempt 1 of 3; tried again on the next poll)", Assert.Single(RenderPlanNotice(plan with { FailedNotices = 1 })));
+        Assert.Equal("hold comment not posted (attempt 3 of 3; not tried again: this page and the ledger have it)",
+            Assert.Single(RenderPlanNotice(plan with { FailedNotices = RunPipeline.MaxPlanNoticeAttempts })));
+        _data.Rows =
+        [
+            Row(500, WorkState.Planned) with { Plan = plan },
+            Row(501, WorkState.Review, "https://github.com/acme/widgets/pull/9") with { PlanItemId = 500 },
+            Row(502, WorkState.Escalated) with { PlanItemId = 500 },
+            Row(7, WorkState.Implement),
+        ];
+
+        var cut = Render<Pipeline>();
+
+        // The plan row, then its stories in plan order (with or without a work item of their own), then the item that is no plan's.
+        var rows = cut.FindAll("table.pipeline tbody tr");
+        Assert.Equal(["500", "501", "502", null, null, "7"], rows.Select(r => r.GetAttribute("data-item")));
+        Assert.Equal([null, "sc-501", "sc-502", "sc-503", "sc-504", null], rows.Select(r => r.GetAttribute("data-story")));
+        Assert.All(rows.Skip(1).Take(4), r => Assert.Equal(("plan-story", "500"), (r.ClassName, r.GetAttribute("data-plan"))));
+        Assert.Single(cut.FindAll("tr[data-item='501']")); // a story is not listed a second time as a row of its own
+        var planRow = cut.Find("tr[data-item='500']");
+        Assert.Equal("1 of 4 merged · 1 in flight · 1 waiting · 1 failed", planRow.QuerySelector(".plan-counts")!.TextContent);
+        Assert.Equal("held", planRow.QuerySelector(".plan-flag")!.TextContent);
+        Assert.Contains("sc-502 escalated at 2026-10-06 12:00:00Z: `CI is red`; not released because of them: sc-503 (behind sc-502)",
+            planRow.QuerySelector(".plan-hold")!.TextContent);
+        // Each story: its state and what it waits on; a story with a work item keeps its pull request and its own controls.
+        Assert.Equal("", cut.Find("tr[data-story='sc-501'] td.state").TextContent.Trim().Replace("Review", ""));
+        Assert.Equal("failed: escalated", cut.Find("tr[data-story='sc-502'] .waits").TextContent);
+        Assert.NotNull(cut.Find("tr[data-story='sc-501'] td.pr a"));
+        var unreleased = cut.Find("tr[data-story='sc-503']");
+        Assert.Contains("sc-503 Third <story>", unreleased.TextContent);
+        Assert.DoesNotContain("<story>", unreleased.InnerHtml); // rendered as text, never as markup
+        Assert.StartsWith("not released", unreleased.QuerySelector("td.state")!.TextContent.Trim());
+        Assert.Equal("held by sc-502 (escalated)", unreleased.QuerySelector(".waits")!.TextContent);
+        Assert.StartsWith("Done", cut.Find("tr[data-story='sc-504'] td.state").TextContent.Trim());
+        // The control form on the plan row posts the plan's own item scope: the control reaches its stories from there.
+        Assert.Equal(["item:sc-500", "item:sc-500"], planRow.QuerySelectorAll("td.control form").Select(f => f.GetAttribute("data-scope")));
+        Assert.Equal(["pause", "stop"], planRow.QuerySelectorAll("td.control form").Select(f => f.GetAttribute("data-action")));
+        Assert.Equal("item:sc-501", cut.Find("tr[data-story='sc-501'] td.control form").GetAttribute("data-scope"));
+
+        // Stuck, and being stopped: said on the plan row, and a stopping story offers no control.
+        var stuck = new PlanStatus([status.Stories[1], status.Stories[2], status.Stories[3]]);
+        _data.Rows =
+        [
+            Row(500, WorkState.Planned) with { Control = ControlState.Stopping, Plan = new PlanView(
+                [.. stuck.Stories.Select(s => new PlanStoryView(s.Id, s.Id, s.State, s.ItemState, PlanStoryView.WaitsOf(s, stuck)))], stuck, PlanRelease.HeldByFailed(stuck)) },
+            Row(502, WorkState.Escalated) with { PlanItemId = 500, Control = ControlState.Stopping },
+        ];
+        _changes.Notify(500);
+        cut.WaitForAssertion(() => Assert.Equal(["stopping", "stuck"], cut.FindAll("tr[data-item='500'] .plan-flag").Select(f => f.TextContent)));
+        Assert.Empty(cut.FindAll("tr[data-item='502'] td.control form"));
     }
 
     [Fact]

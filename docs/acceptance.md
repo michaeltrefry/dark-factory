@@ -527,6 +527,15 @@ class, a `gate-passed` row and a `merge-files` row whose base is the default bra
 of the plan item's Merge row; one `closeout` `posted`, and the plan story's comment says `sc-<id>'s plan is complete: n of its n
 stories merged` and `Its changeset merged into \`main\` as \`<merge commit>\``.
 
+Not exercised live, covered by `ChangesetPipelineTests` against the simulated repository (sc-25872): a pull request whose base is
+not the one the ledger expects (a story's PR switched to the default branch, an adopted PR with another base) escalates
+`<url> targets <base>, not <expected>` unreviewed and unmerged; a plan story whose `Repo:` line names a repository its plan has
+no changeset in escalates and opens no pull request; a changeset pull request someone merged by hand closes the plan out on its
+re-run (`changeset-empty`: `changeset pull request <url> was merged outside the factory`) instead of opening another; Stop on a
+plan item whose changeset pull request is open stops its unfinished stories, drafts that pull request and cancels the plan once.
+If the sandbox's default-branch policy has `risk.max_changed_lines`/`max_changed_files` sized for one story, the changeset pull
+request of this test escalates on `risk-threshold`: size them for the plan.
+
 Not run live yet (2026-10-12): written with sc-25870 and extended with sc-25871, to be run by the owner. The live run is also the
 first time the release's Shortcut requests meet the real API: `GET stories/{id}` returning a story with `story_links`, and
 `PUT stories/{id}` with only `workflow_state_id` (Backlog → To Do) have no recorded contract fixture yet (`Fixtures/shortcut`); the
@@ -563,6 +572,59 @@ project; and JSON-RPC -32602 for a `project` naming a third indexed project (alo
 outside the set, a call naming no repository, and `get_architecture`, `get_service_summary` and `rag_search`.
 
 Not run live yet (2026-10-12): written with sc-25874, to be run by the owner.
+
+## P4-AT5 — a failed story holds its dependents, and Stop on a plan stops its stories (sc-25876)
+
+`PlanFailureAcceptanceTests.P4_AT5_a_failed_story_holds_its_dependent_the_plan_item_says_so_once_and_stop_on_the_plan_stops_its_stories`:
+a fixed plan — A, B that needs A, C and D that need nothing — whose stories the test creates on the real board through the work
+source (no planner, no model, no worker), with a throwaway ledger seeded at `Planned`. The stories' own progress is seeded in that
+ledger, which is all the plan reads: A Escalated ("seeded by P4-AT5: CI is red"), C in flight (Review), D merged.
+
+Prerequisites: what `factory run` resolves before it starts (the router key, both GitHub Apps' ids and keys, the Shortcut token),
+though no router call is made; the workers' GitHub App installed on the default (sandbox) repo with pull-request read (the stop
+asks GitHub for open pull requests of `factory/sc-<story>`, and finds none); and `FACTORY_E2E_P4_HOLD_STORY=sc-<id>`: any story on
+the sandbox's board (it need not carry the `plan` label and is not planned or worked). The test writes to that story's board: it
+creates four stories `[dark-factory P4-AT5] …` in the Backlog of that story's team and epic, moves three to To Do, comments twice
+on the named story and moves it to the **Backlog** (the stop), moves A and C back to the Backlog with a comment each, and archives
+the four created stories when it ends (best effort). **Stop any `factory work` whose watch scope covers that team or epic first**:
+the released stories are ordinary To Do stories for the minute the test runs.
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_P4_HOLD_STORY=sc-<id> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4_AT5*"
+```
+
+Expected evidence: the first run releases A, C and D (To Do on the board; B in Backlog). After the seeding, three more runs leave
+the item `Planned` with exactly one `plan-held` row `held by a failed story: sc-<A> escalated at …: \`seeded by P4-AT5: CI is red
+…\`; not released because of them: sc-<B> (behind sc-<A>)` (outcome `deferred`), one `plan-notice` row `posted`, no Escalated row
+on the plan item, B still in Backlog, and exactly one new comment on the plan story ("… (plan) is held by a failed story", A, its
+reason, both remedies). `DashboardData` over that ledger shows the plan row with the four stories beneath it in plan order: A
+`Escalated` / `failed: escalated`, B `not released` / `held by sc-<A> (escalated)`, C `Review`, D `Watch`; counts 1 merged, 1 in
+flight, 1 waiting, 1 failed; held, not stuck. `factory stop --item sc-<plan>` (`FactoryRunner.ControlAsync`) answers Ok (exit 0):
+A and C are `Cancelled` with `prs-drafted` and `stop-reported` rows, in Backlog on the board, each commented "… was stopped by
+P4-AT5 (with its plan sc-<plan>)"; D is still `Watch`, uncommented and where it was; B has no ledger item, no comment, and is in
+Backlog; the plan item is `Cancelled`, its story in Backlog with one more comment listing `Stories stopped with it: sc-<A>,
+sc-<C>. Already merged (left as they are): sc-<D>. Never started (…): sc-<B>.`; its control row is gone; `InFlightAsync` lists
+nothing; a second stop writes nothing.
+
+Not run live yet (2026-10-12): written with sc-25876, to be run by the owner. The same class holds one test that is not live and
+always runs (the fixed plan passes every plan rule).
+
+What the live test does not cover, and the unit tests do (`PlanClassificationTests`, `PlanFailurePipelineTests`,
+`PlanControlsPostgresTests`, `DashboardComponentTests.A_plan_row_shows_…`): a pull request actually turned back into a draft by
+a plan's stop (the seeded stories have none; the unit test's story has one), a story whose run is going when the Stop lands
+(stopped by that run; the plan's stop unfinished, exit 1, finished by the next poll), a stop that fails half way, a story whose
+worker a crashed run left, a workerless run deferring the stop, a Stop that lands while the plan is evaluated (finished by that
+run, or deferred by a workerless one) and `factory stop` on a plan whose own run is active (unfinished, exit 1), a released story
+nobody claimed (moved back to the Backlog with a comment that does not say the factory worked on it), one a person took, finished,
+assigned or archived since its release (nothing written, no ledger item), one moved back to the Backlog (nothing written), a
+story merged outside the factory (left as it is and listed apart), a plan Pause with the usage pause also in force (`user-paused`),
+a plan Pause in the merge queue (`MergeQueueTests.An_idle_story_whose_plan_is_paused_…`), the control read's query count and its
+failing closed, the plan row's `hold comment not posted` note, Pause and Continue on a plan (an in-flight story paused at its
+next tool boundary and resumed in the same session; nothing claimed or released meanwhile), a transitive hold, a stuck plan, a
+story merged outside the factory, a cancelled story, a failed story that is re-run and merges (`plan-resumed`, its dependents
+released), a comment the board refuses (retried, bounded, never posted twice), a story of a stopped plan moved to ready by hand
+(claim refused), and the rendered pipeline page.
 
 ## Upgrading a Phase 1 ledger: items parked at Review
 
