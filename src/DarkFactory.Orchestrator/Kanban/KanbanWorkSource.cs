@@ -15,7 +15,8 @@ namespace DarkFactory.Orchestrator.Kanban;
 /// item's board id (<see cref="Marker"/>); a status change is conditional on the version just read; a comment carries an
 /// idempotency key derived from the item's board id, its version and the text (<see cref="CommentKey"/>); a link the item already
 /// carries changes nothing. No key written onto the board derives from a ledger key. What this source does not do yet: renew a
-/// claim (it claims for <see cref="ClaimTtlSeconds"/>), retry a <c>busy</c> answer or re-read after a <c>conflict</c> (the call
+/// claim (it claims for <see cref="ClaimTtlSeconds"/>; one that lapsed on an item the ledger records as claimed by this factory
+/// is taken again by <see cref="ClaimAsync"/>), retry a <c>busy</c> answer or re-read after a <c>conflict</c> (the call
 /// throws <see cref="KanbanException"/> and the run fails that step), and plans (it creates no children).
 /// </summary>
 public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanScope scope, Uri webUrl) : IWorkSource
@@ -29,8 +30,15 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
     /// <summary>The most pages of one project's ready items read in one listing (a board that answers a cursor forever is refused).</summary>
     public const int MaxPages = 50;
 
-    /// <summary>Page size of the ready listing (the board's maximum).</summary>
-    public int PageSize { get; init; } = KanbanBoard.MaxPageSize;
+    /// <summary>
+    /// The default <see cref="PageSize"/>: the contract's own default, not the board's maximum
+    /// (<see cref="KanbanBoard.MaxPageSize"/>) — an MCP answer over 1 MiB is refused by the client (<c>McpHttpClient.MaxAnswerBytes</c>),
+    /// and <see cref="MaxPages"/> pages of it still cover 2,500 ready items of one project.
+    /// </summary>
+    public const int DefaultPageSize = 50;
+
+    /// <summary>Page size of the ready listing.</summary>
+    public int PageSize { get; init; } = DefaultPageSize;
 
     private readonly KanbanLinks _links = new(webUrl);
 
@@ -47,7 +55,11 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
     /// <summary>
     /// The idempotency key of a comment (E3, E4): the SHA-256 of the item's board id, its version when the comment is written
     /// and the body. A retry of the same comment — after a crash or a failed answer — has the same key and adds nothing; the same
-    /// words said again after the item was moved or edited (its version went up) are a new comment.
+    /// words said again after the item was moved or edited (its version went up) are a new comment. Both halves are limits, since
+    /// the version moves only on an update or a move (a comment, a link and a claim leave it): (1) the same words said again on
+    /// purpose while the version is unchanged are dropped by the board — it answers the earlier comment — while the caller counts
+    /// them as posted; (2) a retry of one comment after the version moved in between posts it a second time. Intended: a key
+    /// written onto the board derives from board ids only, never from a ledger key or a counter of the factory's.
     /// </summary>
     public static string CommentKey(Guid itemId, long version, string body) =>
         $"dark-factory:comment:{Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes($"{itemId:D}\n{version}\n{body}")))}";
@@ -126,6 +138,11 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
     /// already the factory's and <c>InProgress</c>), and one a blocker still blocks. Else it claims the item
     /// (<c>claim_work_item</c>; another caller winning the race is a refusal too), reads the claim back, and moves the item to
     /// <c>InProgress</c>, on the version just read.
+    /// "Already the factory's and <c>InProgress</c>" is an item carrying the factory's live claim, or — a claim lasts
+    /// <see cref="ClaimTtlSeconds"/> and nothing renews it — one with no claim at all that the ledger records as claimed by this
+    /// factory (<see cref="KanbanKeys.ClaimedAsync"/>): its claim lapsed and is taken again, so an escalated item can be re-run
+    /// after a day. An <c>InProgress</c> item with no claim that the ledger does not record as the factory's is refused
+    /// (<see cref="LapsedRefusal"/>): it may be a person's work.
     /// </summary>
     public async Task<ClaimResult> ClaimAsync(int id, bool ignoreScope, CancellationToken ct)
     {
@@ -146,7 +163,15 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
         {
             return ClaimResult.Refused($"the item is claimed by {item.Claimant ?? "another caller"}");
         }
-        if (item.Status != KanbanStatus.Ready && !(item.Status == KanbanStatus.InProgress && item.ClaimMarker == marker))
+        if (item.Status == KanbanStatus.InProgress && item.ClaimMarker is null)
+        {
+            // No live claim: ours only if the ledger says this factory claimed it (the claim lapsed) — then it is claimed again below.
+            if (!await keys.ClaimedAsync(id, ct))
+            {
+                return ClaimResult.Refused(LapsedRefusal);
+            }
+        }
+        else if (item.Status != KanbanStatus.Ready && !(item.Status == KanbanStatus.InProgress && item.ClaimMarker == marker))
         {
             return ClaimResult.Refused($"the item is {item.Status}, not {KanbanStatus.Ready}");
         }
@@ -183,6 +208,16 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
         return ClaimResult.Ok;
     }
 
+    /// <summary>
+    /// Why an <c>InProgress</c> item with no claim, which the ledger does not record as claimed by this factory, is not taken: the
+    /// factory cannot tell its own lapsed claim (a run that died before its <c>claimed</c> checkpoint, more than
+    /// <see cref="ClaimTtlSeconds"/> ago) from a person's work.
+    /// </summary>
+    public static readonly string LapsedRefusal =
+        $"the item is {KanbanStatus.InProgress} with no claim, and the ledger records no claim of it by this factory (a claim lasts "
+        + $"{ClaimTtlSeconds / 3600} hours and is not renewed, so the factory's claim may have lapsed): move it back to {KanbanStatus.Ready} "
+        + "to hand it to the factory again";
+
     /// <summary>In scope while the item is on the board and its project is one of the watched ones.</summary>
     public async Task<bool> InScopeAsync(int id, CancellationToken ct) =>
         !scope.IsEmpty && await keys.ItemAsync(id, ct) is { } itemId && await FindAsync(itemId, ct) is { } item
@@ -205,7 +240,8 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
     /// description has a <c>Repo: owner/name</c> line (<see cref="RepoResolver"/>): without one, the description is led by a
     /// code-written <c>Repo:</c> line naming the project's repository, which is how every work source tells the pipeline where an
     /// item is worked. A project with no <c>repository_url</c> leaves the item to <c>Factory:DefaultRepo</c>; one whose
-    /// <c>repository_url</c> names no github.com repository, and a project that is archived or gone, is refused here.
+    /// <c>repository_url</c> names no github.com repository, and a project that is archived or gone, is refused here
+    /// (<see cref="KanbanItemException"/>, as is a key the ledger never gave out).
     /// </summary>
     public async Task<WorkSpec> ReadSpecAsync(int id, CancellationToken ct)
     {
@@ -214,12 +250,12 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
         if (RepoResolver.Named(description) is null)
         {
             var project = (await board.ListProjectsAsync(ct)).FirstOrDefault(p => p.Id == item.ProjectId)
-                ?? throw new InvalidOperationException($"{Naming.Format(id)}: its Kanban project is archived or gone, so its repository is "
+                ?? throw new KanbanItemException($"{Naming.Format(id)}: its Kanban project is archived or gone, so its repository is "
                     + "unknown; restore the project, or add a `Repo: owner/name` line to the item.");
             if (!string.IsNullOrWhiteSpace(project.RepositoryUrl))
             {
                 var repo = Gateway.GitRemoteReads.RepoOf(project.RepositoryUrl)
-                    ?? throw new InvalidOperationException($"{Naming.Format(id)}: the repository_url of its Kanban project {project.Key} "
+                    ?? throw new KanbanItemException($"{Naming.Format(id)}: the repository_url of its Kanban project {project.Key} "
                         + $"names no github.com repository ('{Cut(project.RepositoryUrl)}'); set it to one, or add a `Repo: owner/name` "
                         + "line to the item.");
                 description = string.IsNullOrWhiteSpace(description) ? $"Repo: {repo.FullName}" : $"Repo: {repo.FullName}\n\n{description}";
@@ -315,7 +351,8 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
     }
 
     private async Task<Guid> ItemIdAsync(int id, CancellationToken ct) =>
-        await keys.ItemAsync(id, ct) ?? throw new InvalidOperationException($"{Naming.Format(id)} is no Kanban item the factory knows.");
+        await keys.ItemAsync(id, ct) ?? throw new KanbanItemException($"{Naming.Format(id)} is no Kanban item the factory knows: the "
+            + "ledger never gave out that key. Run `factory kanban key <item GUID>` first; it prints the item's kb-<n>.");
 
     /// <summary>The item, or null when the board no longer has it.</summary>
     private async Task<KanbanWorkItem?> FindAsync(Guid itemId, CancellationToken ct)
@@ -359,3 +396,11 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
 
     private static string Cut(string s) => s.Length > 200 ? s[..200] : s;
 }
+
+/// <summary>
+/// A Kanban item the factory cannot work as it is named or set up (sc-25981): a <c>kb-&lt;n&gt;</c> the ledger never gave out, or an
+/// item whose repository is unknown (its project archived or gone, or a <c>repository_url</c> that names no github.com repository).
+/// The message says what to do. <c>factory run</c> prints it and exits 1 (<c>FactoryRunner.RunCommandAsync</c>): it is raised
+/// reading the item's spec, before the item has a ledger row to escalate.
+/// </summary>
+public sealed class KanbanItemException(string message) : InvalidOperationException(message);

@@ -1,4 +1,5 @@
 using DarkFactory.Orchestrator.Ledger;
+using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 
@@ -31,9 +32,14 @@ public sealed class KanbanKeys(IDbContextFactory<LedgerDbContext> contexts, Time
         }
         catch (DbUpdateException)
         {
-            // Another process allocated it meanwhile: its key is the item's.
+            // Another process may have allocated it meanwhile (the unique index on the GUID): its key is the item's. A save that
+            // failed for any other reason left no row, and that failure is what the caller must see.
             db.Entry(row).State = EntityState.Detached;
-            return (await db.KanbanItems.AsNoTracking().SingleAsync(i => i.ItemId == itemId, ct)).Id;
+            if (await db.KanbanItems.AsNoTracking().SingleOrDefaultAsync(i => i.ItemId == itemId, ct) is not { } winner)
+            {
+                throw;
+            }
+            return winner.Id;
         }
     }
 
@@ -42,6 +48,18 @@ public sealed class KanbanKeys(IDbContextFactory<LedgerDbContext> contexts, Time
     {
         await using var db = await contexts.CreateDbContextAsync(ct);
         return (await db.KanbanItems.AsNoTracking().SingleOrDefaultAsync(i => i.Id == key, ct))?.ItemId;
+    }
+
+    /// <summary>
+    /// Whether the ledger records that this factory claimed the item with this key: its work item (<c>kb-&lt;key&gt;</c>) has a
+    /// <c>claimed</c> checkpoint, at any time. What tells the factory's own item whose board claim lapsed from one it never held.
+    /// </summary>
+    public async Task<bool> ClaimedAsync(int key, CancellationToken ct)
+    {
+        await using var db = await contexts.CreateDbContextAsync(ct);
+        var (source, externalId) = (ItemNaming.Kanban.Source, ItemNaming.Kanban.Format(key));
+        return await db.WorkItems.AsNoTracking().AnyAsync(
+            w => w.Source == source && w.ExternalId == externalId && w.Entries.Any(e => e.Step == RunPipeline.Steps.Claimed), ct);
     }
 }
 

@@ -24,7 +24,7 @@ static async Task<int> KanbanKeyAsync(Guid itemId, CancellationToken ct)
         Console.Error.WriteLine(ex.Message);
         return 2;
     }
-    catch (Exception ex) when (ex is InvalidOperationException or HttpRequestException)
+    catch (Exception ex) when (FactoryRunner.IsKanbanKeyFailure(ex, ct))
     {
         Console.Error.WriteLine(ex.Message);
         return 1;

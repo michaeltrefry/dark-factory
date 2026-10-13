@@ -276,11 +276,16 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   Stop written for `item:kb-<n>` is honoured by the item's own run, which is the generic path). Contract: KanbanBoard's
   `docs/mcp-contract.md` (tool and argument names are compared exactly there, and an argument a tool does not have is refused).
   Identity (E4): the board names an item by a GUID; the ledger gives it a key once, in `kanban_items` (migration `KanbanItems`;
-  `KanbanKeys`: unique index on the GUID, the loser of a race reads the winner's key), before anything else is written for it —
+  `KanbanKeys`: unique index on the GUID, the loser of a race reads the winner's key; a save that failed and left no row rethrows
+  its own error), before anything else is written for it —
   when `ListReadyAsync` first lists it or `factory kanban key <GUID>` asks (which reads the item from the board first: an unknown
   id gets no key). Nothing written onto the board derives from that key: the claim marker is `dark-factory:<item GUID>`
   (`KanbanWorkSource.Marker`) and a comment's idempotency key the SHA-256 of the item's GUID, its `version` and the body
   (`CommentKey`: a retry of the same comment adds nothing; the same words after the item was moved or edited are a new comment).
+  Both halves are limits, accepted, because `version` moves only on an update or a move (a comment, a link and a claim leave it):
+  the same words said again on purpose at an unchanged version are dropped by the board (it answers the earlier comment) while the
+  pipeline records them as posted, and a retry of one comment after the version moved in between posts it twice. The key is not
+  changed for either: a key written onto the board derives from board ids, never from a ledger key or a counter of the factory's.
   Writes (E2): only the orchestrator writes the board, through its MCP, with its own full-scope token (`Kanban:WriteToken`) in the
   one client `Gateway/KanbanWrites.Client` builds for the typed caller `KanbanBoard` — which is no `McpUpstream`, so it is in no
   upstream registry, allowlist, profile or proxy grant; model sessions keep the read token and `McpServers.KanbanTools` (read tools
@@ -292,15 +297,26 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (it puts the item at the end of the column and changes nothing else), a comment carries its `idempotency_key`, and claim, release
   and link are idempotent on the board (`add_work_item_link` of a kind and URL the item carries changes nothing).
   Ready = `list_work_items(projectId, status: Ready, unblocked_only, claim_state: unclaimed, limit, include_comments: false)` per
-  watched project, paged by cursor (at most `KanbanWorkSource.MaxPages` pages of `KanbanBoard.MaxPageSize`), each listed item
+  watched project, paged by cursor (at most `KanbanWorkSource.MaxPages`, 50, pages of `KanbanWorkSource.DefaultPageSize`, 50 — the
+  contract's default, not the board's maximum of 200, `KanbanBoard.MaxPageSize`: `McpHttpClient` refuses an answer over 1 MiB,
+  `MaxAnswerBytes`; so at most 2,500 ready items of one project, more is refused), each listed item
   checked again (project, status, no claim, no open blocker). `ClaimAsync` re-reads the item and refuses, writing nothing: a key
   the ledger never gave out, an item gone from the board, a project outside `Kanban:Watch:Projects` (skipped by
   `--ignore-scope`), another caller's claim (`the item is claimed by <claimant>`), a status that is not `Ready` (or `InProgress`
-  under the factory's own marker), and an open blocker (only `Done` finishes one; a `Closed` blocker still blocks). Then
+  and the factory's, next), and an open blocker (only `Done` finishes one; a `Closed` blocker still blocks). An `InProgress` item
+  is the factory's when it carries the factory's live marker, or — a lapsed claim — when it carries no claim at all and the ledger
+  records that this factory claimed it (`KanbanKeys.ClaimedAsync`: a `claimed` checkpoint on `kb-<n>`, at any time): it is then
+  claimed again and read back like a fresh claim, so the escalation remedy `factory run kb-<n>` works more than a day later. An
+  `InProgress` item with no claim that the ledger does not record as claimed (a run that died between the board's claim and its
+  `claimed` checkpoint more than a day ago, or a person's work) is refused, nothing written (`KanbanWorkSource.LapsedRefusal`:
+  "… the factory's claim may have lapsed): move it back to Ready to hand it to the factory again"); one under another marker is
+  always refused. Residual, accepted: once a claim has lapsed the board shows no one on the item, so a person who took an
+  escalated item over without claiming it or moving it loses it to a later `factory run kb-<n>` of it. Then
   `claim_work_item(id, marker, ttl_seconds)` — `already_claimed` (another caller won the race, or holds the same marker under
   another identity) is a refusal too —, the claim read back (`claim_marker` and `claimant_id`), and the move to `InProgress`; an
   item someone moved away meanwhile gets the claim released again and a refusal. Claims are KanbanBoard's own, advisory and
-  expiring: nothing renews one yet, so the factory claims for the maximum, a day (`ClaimTtlSeconds`). `ReportStateAsync`:
+  expiring: nothing renews one yet, so the factory claims for the maximum, a day (`ClaimTtlSeconds`), and a run longer than that
+  goes on with a lapsed claim (the item stays `InProgress`; only a later `ClaimAsync` takes the claim again). `ReportStateAsync`:
   Claimed → `InProgress`, Merged → `Done`, Stopped → `Backlog` with the factory's claim released and the comment posted; an item
   already in the target column is not written. `LinkAsync` attaches each URL under its kind from the URL (`…/pull/<n>` `pr`,
   `…/tree/<branch>` `branch`, else `other`). Not handled yet: a `busy` answer is not retried and a `conflict` (stale
@@ -311,7 +327,11 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   the description with a code-written `Repo:` line when the item has none, which is how every source tells the pipeline where an
   item is worked. A project with no `repository_url` leaves the item to `Factory:DefaultRepo`; a `repository_url` that names no
   github.com repository, and a project that is archived or gone, is refused (no `Repo:` line to fall back on), never worked
-  somewhere else. The spec is the item, its epic and the epic's documents; links are built on `Kanban:WebUrl`.
+  somewhere else. Those two, and a `kb-<n>` the ledger never gave out ("… Run `factory kanban key <item GUID>` first"), are a
+  `KanbanItemException` from `ReadSpecAsync`, raised before the pipeline has an item to escalate: `factory run` prints the message
+  (as it does a `KanbanException` of that read) and exits 1, no stack trace (`FactoryRunner.RunCommandAsync`). `factory kanban
+  key` likewise prints and exits 1 on a board refusal, an HTTP failure or timeout, and a ledger failure
+  (`FactoryRunner.IsKanbanKeyFailure`). The spec is the item, its epic and the epic's documents; links are built on `Kanban:WebUrl`.
   Trust (E5): a Kanban item is written on the owner's board and is trusted like a Shortcut story — `WorkStory.UntrustedName` is
   true only for a GitHub issue's item and a planner-authored story — so its spec is unfenced instructions and its name goes on
   GitHub as written. A Kanban epic has no number (`WorkEpic.Id` null), so no `epic:<id>` control reaches a Kanban item.

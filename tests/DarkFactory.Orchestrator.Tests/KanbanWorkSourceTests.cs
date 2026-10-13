@@ -31,13 +31,27 @@ public class KanbanWorkSourceTests
         public KanbanKeys Keys => new(Contexts);
 
         /// <summary>A fresh source each time, as after a restart: what it knows comes from the ledger and the board.</summary>
-        public KanbanWorkSource Source(string token = FakeKanbanBoard.FullToken, string[]? watch = null, int pageSize = KanbanBoard.MaxPageSize) =>
-            new(new KanbanBoard(KanbanWrites.Client(Board.Client(), token)), Keys, new KanbanScope(watch ?? ["DF"]), new Uri("https://kanban.test/"))
-            {
-                PageSize = pageSize,
-            };
+        public KanbanWorkSource Source(string token = FakeKanbanBoard.FullToken, string[]? watch = null, int? pageSize = null)
+        {
+            var (board, scope, web) = (new KanbanBoard(KanbanWrites.Client(Board.Client(), token)), new KanbanScope(watch ?? ["DF"]), new Uri("https://kanban.test/"));
+            // No page size given: the source's own default.
+            return pageSize is { } size ? new(board, Keys, scope, web) { PageSize = size } : new(board, Keys, scope, web);
+        }
 
         public Task<int> Key(FakeKanbanBoard.Item item) => Keys.KeyAsync(item.Id, CancellationToken.None);
+
+        /// <summary>
+        /// The ledger's record that this factory claimed the item: its work item with a <c>claimed</c> checkpoint, as Intake leaves
+        /// it — or, not <paramref name="claimed"/>, a work item with another checkpoint only (an item parked on a refused claim).
+        /// </summary>
+        public async Task RecordClaimedAsync(int id, bool claimed = true)
+        {
+            await using var db = Db();
+            var ledger = new WorkLedger(db, TimeProvider.System);
+            var item = await ledger.GetOrCreateAsync(ItemNaming.Kanban.Source, ItemNaming.Kanban.Format(id), "Count words", "acme/widgets", null,
+                CancellationToken.None);
+            await ledger.CheckpointAsync(item, claimed ? RunPipeline.Steps.Claimed : RunPipeline.Steps.Parked, null, null, CancellationToken.None);
+        }
     }
 
     private static readonly CancellationToken None = CancellationToken.None;
@@ -85,7 +99,11 @@ public class KanbanWorkSourceTests
         });
         Assert.Empty(h.Board.Writes);
         // The same items have the same keys on the next listing, from a new source.
+        h.Board.Calls.Clear();
         Assert.Equal(listed, await h.Source().ListReadyAsync(None));
+        // The default page is the contract's default of 50, not the board's maximum of 200: an MCP answer over 1 MiB is refused.
+        Assert.Equal([50], h.Board.Calls.Where(c => c.Tool == "list_work_items").Select(c => c.Arguments["limit"]!.GetValue<int>()));
+        Assert.Equal((50, 50, 200), (KanbanWorkSource.DefaultPageSize, KanbanWorkSource.MaxPages, KanbanBoard.MaxPageSize));
     }
 
     [Fact]
@@ -192,11 +210,57 @@ public class KanbanWorkSourceTests
         Assert.Equal("InProgress", item.Status);
     }
 
+    [Fact]
+    public async Task A_lapsed_claim_is_taken_again_only_on_an_item_the_ledger_records_as_claimed_by_this_factory()
+    {
+        var h = new Harness();
+        var (ours, unrecorded, theirs) = (h.Board.AddItem(h.Project, "Ours"), h.Board.AddItem(h.Project, "Unrecorded"), h.Board.AddItem(h.Project, "Theirs"));
+        var (o, u, t) = (await h.Key(ours), await h.Key(unrecorded), await h.Key(theirs));
+        foreach (var id in new[] { o, u, t })
+        {
+            Assert.Equal(ClaimResult.Ok, await h.Source().ClaimAsync(id, ignoreScope: false, None));
+        }
+        // Intake checkpointed the claim of two of them; the run of the third died before its checkpoint.
+        await h.RecordClaimedAsync(o);
+        await h.RecordClaimedAsync(t);
+        // A fourth the ledger knows, but not as claimed (only a `claimed` checkpoint counts): someone moved it to InProgress.
+        var parked = h.Board.AddItem(h.Project, "Parked", status: "InProgress");
+        var p = await h.Key(parked);
+        await h.RecordClaimedAsync(p, claimed: false);
+        // More than a day later every claim has lapsed (nothing renews one), and someone else has claimed the third item.
+        h.Board.Time.Now = h.Board.Time.Now.AddHours(25);
+        h.Board.ClaimAsSomeoneElse(theirs);
+        var versions = (ours.Version, unrecorded.Version, theirs.Version);
+        h.Board.Calls.Clear();
+
+        // In progress, no claim, and the ledger does not say it is the factory's: refused with what to do, nothing written.
+        Assert.Equal(ClaimResult.Refused("the item is InProgress with no claim, and the ledger records no claim of it by this factory (a claim lasts 24 hours and is not renewed, so the factory's claim may have lapsed): move it back to Ready to hand it to the factory again"),
+            await h.Source().ClaimAsync(u, ignoreScope: false, None));
+        Assert.Equal(ClaimResult.Refused(KanbanWorkSource.LapsedRefusal), await h.Source().ClaimAsync(p, ignoreScope: false, None));
+        Assert.Null(parked.Claim);
+        // Claimed under another marker: always refused, whatever the ledger says.
+        Assert.Equal(ClaimResult.Refused("the item is claimed by someone"), await h.Source().ClaimAsync(t, ignoreScope: false, None));
+        Assert.Empty(h.Board.Writes);
+        Assert.Equal("their-run", theirs.Claim!.Value.Marker);
+        Assert.Equal(h.Board.Time.Now.AddHours(-1), unrecorded.Claim!.Value.Expires); // the lapsed claim, untouched
+
+        // In progress, no claim, and the ledger records the factory's claim: claimed again, read back, and not moved.
+        Assert.Equal(ClaimResult.Ok, await h.Source().ClaimAsync(o, ignoreScope: false, None));
+        Assert.Equal(["claim_work_item"], h.Board.Writes);
+        Assert.Equal("get_work_item", h.Board.Calls[^1].Tool); // the claim read back
+        Assert.Equal(("factory", KanbanWorkSource.Marker(ours.Id), h.Board.Time.Now.AddDays(1)),
+            (ours.Claim!.Value.Name, ours.Claim.Value.Marker, ours.Claim.Value.Expires));
+        Assert.Equal(("InProgress", "InProgress", "InProgress"), (ours.Status, unrecorded.Status, theirs.Status));
+        Assert.Equal(versions, (ours.Version, unrecorded.Version, theirs.Version));
+        Assert.Equal("the item is InProgress with no claim, and the ledger records no claim of it by this factory (a claim lasts 24 hours and is not renewed, so the factory's claim may have lapsed): move it back to Ready to hand it to the factory again", KanbanWorkSource.LapsedRefusal);
+    }
+
     public static TheoryData<string, string> Refusals => new()
     {
         { "claimed", "the item is claimed by someone" },
         { "backlog", "the item is Backlog, not Ready" },
-        { "in-progress", "the item is InProgress, not Ready" },
+        // In progress with no claim, and nothing in the ledger says the factory ever claimed it.
+        { "in-progress", "the item is InProgress with no claim, and the ledger records no claim of it by this factory (a claim lasts 24 hours and is not renewed, so the factory's claim may have lapsed): move it back to Ready to hand it to the factory again" },
         { "done", "the item is Done, not Ready" },
         { "blocked", "the item is blocked by \"Schema first\" (InProgress)" },
         { "closed-blocker", "the item is blocked by \"Schema first\" (Closed)" },
@@ -517,7 +581,7 @@ public class KanbanWorkSourceTests
         var item = h.Board.AddItem(h.Project, "Count words");
         var id = await h.Key(item);
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => h.Source().ReadSpecAsync(id, None));
+        var ex = await Assert.ThrowsAsync<KanbanItemException>(() => h.Source().ReadSpecAsync(id, None));
 
         Assert.Equal($"kb-{id}: the repository_url of its Kanban project DF names no github.com repository ('{url}'); set it to one, or add a "
             + "`Repo: owner/name` line to the item.", ex.Message);
@@ -531,11 +595,12 @@ public class KanbanWorkSourceTests
         var id = await h.Key(item);
         h.Project.Archived = true;
 
-        var archived = await Assert.ThrowsAsync<InvalidOperationException>(() => h.Source().ReadSpecAsync(id, None));
-        var unknown = await Assert.ThrowsAsync<InvalidOperationException>(() => h.Source().ReadSpecAsync(42, None));
+        var archived = await Assert.ThrowsAsync<KanbanItemException>(() => h.Source().ReadSpecAsync(id, None));
+        var unknown = await Assert.ThrowsAsync<KanbanItemException>(() => h.Source().ReadSpecAsync(42, None));
 
         Assert.Contains("its Kanban project is archived or gone", archived.Message);
-        Assert.Equal("kb-42 is no Kanban item the factory knows.", unknown.Message);
+        // The remedy is in the message: `factory run` prints it (KanbanPipelineTests).
+        Assert.Equal("kb-42 is no Kanban item the factory knows: the ledger never gave out that key. Run `factory kanban key <item GUID>` first; it prints the item's kb-<n>.", unknown.Message);
     }
 
     [Theory]
@@ -633,6 +698,12 @@ public class KanbanWorkSourceTests
         await h.Source().CommentAsync(id, "kb-1 escalated; a human needs to look.", None); // a retry of the same comment
         await h.Source().CommentAsync(id, "Something else.", None);
         await h.Source().CommentAsync(otherId, "kb-1 escalated; a human needs to look.", None);
+        // Intended, and a limit: the item's version moves only on an update or a move, so the same words said again later at the
+        // same version — not a retry — carry the same key and are dropped by the board too (the call still succeeds).
+        await h.Source().CommentAsync(id, "kb-1 escalated; a human needs to look.", None);
+        Assert.Equal((1L, 2), (item.Version, item.Comments.Count));
+        Assert.Equal(3, h.Board.Calls.Count(c => c.Tool == "add_work_item_comment"
+            && c.Arguments["idempotency_key"]!.GetValue<string>() == KanbanWorkSource.CommentKey(item.Id, 1, "[author: dark-factory] kb-1 escalated; a human needs to look.")));
 
         Assert.Equal(["[author: dark-factory] kb-1 escalated; a human needs to look.", "[author: dark-factory] Something else."],
             item.Comments.Select(c => c.Body));
@@ -696,6 +767,65 @@ public class KanbanWorkSourceTests
         await using var db = h.Db();
         Assert.Equal(item.Id, (await db.KanbanItems.SingleAsync()).ItemId);
         Assert.Empty(h.Board.Writes);
+    }
+
+    [Fact]
+    public async Task An_id_the_board_does_not_know_gets_no_key_and_nothing_is_written_to_the_board()
+    {
+        var h = new Harness();
+        h.Board.AddItem(h.Project, "Count words");
+
+        var unknown = await Assert.ThrowsAsync<KanbanException>(() => h.Source().KeyOfAsync(Guid.NewGuid(), None));
+
+        Assert.Equal((KanbanException.NotFound, "get_work_item"), (unknown.Code, unknown.Tool));
+        Assert.Equal(["get_work_item"], h.Board.Calls.Select(c => c.Tool));
+        Assert.Empty(h.Board.Writes);
+        await using var db = h.Db();
+        Assert.Empty(await db.KanbanItems.ToListAsync()); // no key row: the ledger never heard of the id
+    }
+
+    /// <summary>A ledger whose every save fails, for a reason that is no lost race.</summary>
+    private sealed class FailingSaves : Microsoft.EntityFrameworkCore.Diagnostics.SaveChangesInterceptor
+    {
+        public override ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int>> SavingChangesAsync(
+            Microsoft.EntityFrameworkCore.Diagnostics.DbContextEventData eventData,
+            Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int> result, CancellationToken cancellationToken = default) =>
+            throw new DbUpdateException("the ledger's disk is full");
+    }
+
+    [Fact]
+    public async Task A_key_that_could_not_be_saved_for_another_reason_than_a_lost_race_fails_with_that_reason()
+    {
+        var options = new DbContextOptionsBuilder<LedgerDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString())
+            .AddInterceptors(new FailingSaves()).Options;
+        var keys = new KanbanKeys(new LedgerDbContextFactory(options));
+
+        var ex = await Assert.ThrowsAsync<DbUpdateException>(() => keys.KeyAsync(Guid.NewGuid(), None));
+
+        Assert.Equal("the ledger's disk is full", ex.Message); // not "Sequence contains no elements"
+        await using var db = new LedgerDbContext(options);
+        Assert.Empty(await db.KanbanItems.ToListAsync());
+    }
+
+    [Fact]
+    public void Factory_kanban_key_reports_a_board_http_or_ledger_failure_by_its_message_and_leaves_a_requested_cancel_alone()
+    {
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        Exception[] reported =
+        [
+            new KanbanException("get_work_item", KanbanException.NotFound, "no such item"), new InvalidOperationException("Kanban:WebUrl ..."),
+            new HttpRequestException("connection refused"), new TaskCanceledException("the request timed out"),
+            new Npgsql.NpgsqlException("the ledger is down"), new DbUpdateException("could not save"),
+        ];
+
+        Assert.All(reported, ex => Assert.True(FactoryRunner.IsKanbanKeyFailure(ex, None), ex.GetType().Name));
+        Assert.IsAssignableFrom<System.Data.Common.DbException>(reported[4]);
+        // Ctrl-C is no failure to report, and neither is anything unexpected (a bug keeps its stack trace).
+        Assert.False(FactoryRunner.IsKanbanKeyFailure(new TaskCanceledException(), cancelled.Token));
+        Assert.False(FactoryRunner.IsKanbanKeyFailure(new OperationCanceledException(), cancelled.Token));
+        Assert.False(FactoryRunner.IsKanbanKeyFailure(new OperationCanceledException(), None));
+        Assert.False(FactoryRunner.IsKanbanKeyFailure(new NullReferenceException(), None));
     }
 
     [Fact]

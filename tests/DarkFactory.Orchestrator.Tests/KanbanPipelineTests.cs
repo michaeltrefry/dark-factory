@@ -109,6 +109,72 @@ public class KanbanPipelineTests
     }
 
     [Fact]
+    public async Task An_escalated_item_is_run_again_more_than_a_day_later_when_its_claim_has_lapsed()
+    {
+        var h = new KanbanWorkSourceTests.Harness();
+        var item = h.Board.AddItem(h.Project, "Count words");
+        var id = await h.Key(item);
+        var (workspaces, prs) = (new FakeWorkspaces(), new FakePullRequests());
+        var failed = await Run(h, id, new FakeWorker(Reports(new Worker.WorkerResult("sess-x", 1, true, "error_during_execution", "Not logged in", "boom"))),
+            workspaces, prs);
+        Assert.Equal((WorkState.Escalated, "InProgress"), (failed.State, item.Status));
+        var firstClaim = item.Claim!.Value.Expires;
+
+        // The escalation's remedy, a day and an hour later: the claim has lapsed and nothing renewed it.
+        h.Board.Time.Now = h.Board.Time.Now.AddHours(25);
+        Assert.True(firstClaim < h.Board.Time.Now);
+        var outcome = await Run(h, id, new FakeWorker(Reports(Ok)), workspaces, prs);
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(WorkState.Review, outcome.State);
+        Assert.Single(prs.Opened);
+        Assert.Equal(("InProgress", KanbanWorkSource.Marker(item.Id), h.Board.Time.Now.AddDays(1)),
+            (item.Status, item.Claim!.Value.Marker, item.Claim.Value.Expires));
+        await using var db = h.Db();
+        Assert.DoesNotContain(await db.LedgerEntries.ToListAsync(), e => RunPipeline.IsClaimRefused(e.Detail));
+    }
+
+    [Theory]
+    [InlineData("unknown-key")]
+    [InlineData("archived-project")]
+    [InlineData("no-github-repository")]
+    [InlineData("gone-from-the-board")]
+    public async Task Factory_run_on_a_kanban_item_that_cannot_be_read_prints_what_to_do_and_exits_1_without_a_stack_trace(string what)
+    {
+        var h = new KanbanWorkSourceTests.Harness();
+        var item = h.Board.AddItem(h.Project, "Count words");
+        var id = what == "unknown-key" ? 42 : await h.Key(item);
+        switch (what)
+        {
+            case "archived-project": h.Project.Archived = true; break;
+            case "no-github-repository": h.Project.RepositoryUrl = "https://gitlab.com/acme/widgets"; break;
+            case "gone-from-the-board": h.Board.Items.Remove(item); break;
+        }
+        var (worker, prs, stderr) = (new FakeWorker(Reports(Ok)), new FakePullRequests(), new StringWriter());
+        var options = new FactoryOptions(
+            new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?> { ["CodeGraph:Token"] = "cg_test" }).Build(), new InMemorySecrets());
+
+        var exit = await FactoryRunner.RunCommandAsync(options, _ => Task.FromResult<string?>(null),
+            _ => Run(h, id, worker, new FakeWorkspaces(), prs, ignoreScope: true), stderr, None);
+
+        Assert.Equal(1, exit);
+        Assert.Equal(what switch
+        {
+            "unknown-key" => "kb-42 is no Kanban item the factory knows: the ledger never gave out that key. Run `factory kanban key <item GUID>` first; it prints the item's kb-<n>.",
+            "archived-project" => "kb-1: its Kanban project is archived or gone, so its repository is unknown; restore the project, or add a "
+                + "`Repo: owner/name` line to the item.",
+            "no-github-repository" => "kb-1: the repository_url of its Kanban project DF names no github.com repository "
+                + "('https://gitlab.com/acme/widgets'); set it to one, or add a `Repo: owner/name` line to the item.",
+            _ => $"Kanban's get_work_item was refused (not_found): Work item {item.Id} was not found.",
+        } + Environment.NewLine, stderr.ToString());
+        Assert.Empty(h.Board.Writes);
+        Assert.Empty(worker.Calls);
+        Assert.Empty(prs.Opened);
+        await using var db = h.Db();
+        Assert.Empty(await db.WorkItems.ToListAsync()); // nothing was recorded for an item that could not be read
+    }
+
+    [Fact]
     public async Task Ignoring_the_scope_runs_an_item_of_a_project_that_is_not_watched()
     {
         var h = new KanbanWorkSourceTests.Harness();
@@ -327,13 +393,47 @@ public sealed class KanbanKeysPostgresTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task The_ledger_says_which_kanban_items_this_factory_claimed()
+    {
+        // KanbanKeys.ClaimedAsync as Postgres runs it: only a `claimed` checkpoint of that kb-<n> counts.
+        await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_cs)))
+        {
+            var ledger = new WorkLedger(db, TimeProvider.System);
+            var claimed = await ledger.GetOrCreateAsync(ItemNaming.Kanban.Source, "kb-1", "Claimed", "acme/widgets", null, CancellationToken.None);
+            await ledger.CheckpointAsync(claimed, RunPipeline.Steps.Claimed, null, null, CancellationToken.None);
+            var parked = await ledger.GetOrCreateAsync(ItemNaming.Kanban.Source, "kb-2", "Parked", "acme/widgets", null, CancellationToken.None);
+            await ledger.CheckpointAsync(parked, RunPipeline.Steps.Parked, null, null, CancellationToken.None);
+            // Another source's item 3 is not Kanban's kb-3.
+            var story = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-3", "Story", "acme/widgets", null, CancellationToken.None);
+            await ledger.CheckpointAsync(story, RunPipeline.Steps.Claimed, null, null, CancellationToken.None);
+        }
+
+        Assert.True(await Process().ClaimedAsync(1, CancellationToken.None));
+        Assert.False(await Process().ClaimedAsync(2, CancellationToken.None));
+        Assert.False(await Process().ClaimedAsync(3, CancellationToken.None));
+    }
+
+    [Fact]
     public async Task The_same_item_always_gets_the_same_key_across_restarts_and_processes_allocating_at_once()
     {
         var items = Enumerable.Range(0, 12).Select(_ => Guid.NewGuid()).ToList();
 
-        // Many processes ask for every item's key at the same moment.
-        var asked = await Task.WhenAll(Enumerable.Range(0, 8).SelectMany(_ => items.Select(item =>
-            Task.Run(async () => (Item: item, Key: await Process().KeyAsync(item, CancellationToken.None))))));
+        // Several processes ask for every item's key at the same moment: each goes through the items in the same order, started
+        // together, so they race for each one. One connection per process (8 at once, not one per question: the compose Postgres
+        // takes 100 connections, shared with every other test running).
+        using var start = new SemaphoreSlim(0);
+        var processes = Enumerable.Range(0, 8).Select(_ => Task.Run(async () =>
+        {
+            var answers = new List<(Guid Item, int Key)>();
+            await start.WaitAsync();
+            foreach (var item in items)
+            {
+                answers.Add((item, await Process().KeyAsync(item, CancellationToken.None)));
+            }
+            return answers;
+        })).ToList();
+        start.Release(processes.Count);
+        var asked = (await Task.WhenAll(processes)).SelectMany(a => a).ToList();
 
         var byItem = asked.GroupBy(a => a.Item).ToDictionary(g => g.Key, g => g.Select(a => a.Key).Distinct().ToList());
         Assert.All(byItem.Values, keys => Assert.Single(keys)); // one key per item, whoever asked
