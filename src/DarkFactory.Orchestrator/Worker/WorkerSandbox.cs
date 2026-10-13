@@ -13,6 +13,13 @@ public interface IWorkerSandbox
 
     /// <summary>Deletes <paramref name="path"/> as the worker user (best effort), so the owner never walks a worker-controlled tree first.</summary>
     Task DeleteAsWorkerAsync(string path, CancellationToken ct);
+
+    /// <summary>
+    /// Closes the owner's directory <paramref name="path"/> to the worker user and everyone else: owner-only mode and no ACL entry
+    /// (the work root's inherited one included), so nothing in it can be opened by anyone but the owner. Fails unless the
+    /// directory then reads back closed.
+    /// </summary>
+    Task CloseToWorkerAsync(string path, CancellationToken ct);
 }
 
 /// <summary>
@@ -323,25 +330,60 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         }
     }
 
+    /// <summary>
+    /// Owner-side and without root (the owner owns the directory): <c>chmod -N</c> removes every ACL entry — the work root's
+    /// inherited read entry for <see cref="User"/> among them, so nothing created in the directory later inherits one — and the
+    /// mode becomes <c>0700</c>. Then <c>/bin/ls -led</c> must show it closed (<see cref="IsClosed"/>), else this throws.
+    /// </summary>
+    public Task CloseToWorkerAsync(string path, CancellationToken ct) =>
+        CloseToWorkerAsync(path, (p, c) => RunChecked("/bin/ls", ["-led", "--", p], c, output: true), ct);
+
+    /// <summary><see cref="CloseToWorkerAsync(string, CancellationToken)"/>, the directory read back through <paramref name="list"/> (tests).</summary>
+    internal async Task CloseToWorkerAsync(string path, Func<string, CancellationToken, Task<string>> list, CancellationToken ct)
+    {
+        await RunChecked("/bin/chmod", ["-N", path], ct);
+        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var listing = await list(path, ct);
+        if (!IsClosed(listing))
+        {
+            throw new InvalidOperationException(
+                $"{path} is still open to others than its owner after `chmod -N` and mode 0700 (ls -led: {listing.Trim().ReplaceLineEndings("; ")}), so {User} could reach what is in it.");
+        }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="lsOutput"/> (macOS <c>ls -led</c> of one directory: its long listing line, then one line per ACL
+    /// entry, e.g. <c> 0: user:_factory inherited allow list,search</c>) shows a directory only its owner can enter: mode
+    /// <c>drwx------</c> and no ACL entry at all, of any user or kind.
+    /// </summary>
+    public static bool IsClosed(string lsOutput)
+    {
+        var lines = lsOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        return lines.Length == 1 && Regex.IsMatch(lines[0], @"^drwx------[@ ]");
+    }
+
     public async Task DeleteAsWorkerAsync(string path, CancellationToken ct)
     {
         // Best effort: whatever the worker user can't remove, the owner's retry reports.
         await RunAsync("/", "/bin/rm", ["-rf", "--", path], ct);
     }
 
-    private static async Task RunChecked(string program, IEnumerable<string> args, CancellationToken ct)
+    /// <summary>Runs a local program, failing on a non-zero exit; with <paramref name="output"/> its standard output is read and returned (else "").</summary>
+    private static async Task<string> RunChecked(string program, IEnumerable<string> args, CancellationToken ct, bool output = false)
     {
-        var psi = new ProcessStartInfo(program) { RedirectStandardError = true, UseShellExecute = false };
+        var psi = new ProcessStartInfo(program) { RedirectStandardError = true, RedirectStandardOutput = output, UseShellExecute = false };
         foreach (var arg in args)
         {
             psi.ArgumentList.Add(arg);
         }
         using var p = Process.Start(psi)!;
+        var stdout = output ? p.StandardOutput.ReadToEndAsync(ct) : Task.FromResult("");
         var stderr = p.StandardError.ReadToEndAsync(ct);
         await p.WaitForExitAsync(ct);
         if (p.ExitCode != 0)
         {
             throw new InvalidOperationException($"{program} failed ({p.ExitCode}): {(await stderr).Trim()}");
         }
+        return await stdout;
     }
 }

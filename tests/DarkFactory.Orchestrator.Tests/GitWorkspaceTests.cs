@@ -156,6 +156,7 @@ public class GitWorkspaceTests
     private sealed class FakeSandbox(bool deleteRemovesNothing = false) : DarkFactory.Orchestrator.Worker.IWorkerSandbox
     {
         public List<string> Calls { get; } = [];
+        public Task CloseToWorkerAsync(string path, CancellationToken ct) => Task.CompletedTask;
         public Task ShareAsync(string path, CancellationToken ct)
         {
             Calls.Add($"share {path} {(Directory.EnumerateFileSystemEntries(path).Any() ? "non-empty" : "empty")}");
@@ -755,7 +756,9 @@ public class GitWorkspaceTests
     public void Owner_git_isolation_adds_its_environment_and_config_ahead_of_every_call()
     {
         Assert.Equal(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "rerere.enabled=false", "-c", "filter.lfs.smudge=",
-            "-c", "filter.lfs.clean=", "-c", "filter.lfs.process=", "-c", "filter.lfs.required=false"], OwnerGit.ConfigArgs);
+            "-c", "filter.lfs.clean=", "-c", "filter.lfs.process=", "-c", "filter.lfs.required=false",
+            // No git call leaves a maintenance process behind to write the shared clone outside its lock (sc-25987).
+            "-c", "gc.autoDetach=false", "-c", "maintenance.autoDetach=false"], OwnerGit.ConfigArgs);
         var (env, args) = OwnerGit.Isolate(new Dictionary<string, string> { ["GIT_CONFIG_COUNT"] = "1" }, ["merge", "x"]);
         Assert.Equal(new Dictionary<string, string>
         {

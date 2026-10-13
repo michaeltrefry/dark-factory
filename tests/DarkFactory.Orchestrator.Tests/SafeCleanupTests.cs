@@ -4,13 +4,15 @@ using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Mcp;
 using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
+using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.Orchestrator.Tests;
 
 /// <summary>
 /// sc-25987: the start-of-run sweeps and the shared clone under overlapping runs. Real git against local bare "remotes", the ledger
-/// in memory, and a second live run simulated by holding its item's run lock. No worker, no sandbox helper and no process but git.
+/// in memory, and a second live run simulated by holding its item's run lock. No worker, no sandbox helper (a fake sandbox where
+/// one is needed) and no process but git.
 /// </summary>
 [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
 public class SafeCleanupTests
@@ -44,8 +46,52 @@ public class SafeCleanupTests
     private string WorkRoot => Path.Combine(_root, "work");
     private string Sessions => Path.Combine(WorkRoot, McpProxySessions.DirectoryName);
 
-    private GitWorkspace Workspaces(string directory = GitWorkspace.ItemWorktrees, GitCommand? git = null) =>
-        new(WorkRoot, r => _remotes[r], (_, _) => Task.FromResult<string?>(null), git, worktreesDirectory: directory, shareWithWorker: false);
+    private GitWorkspace Workspaces(string directory = GitWorkspace.ItemWorktrees, GitCommand? git = null,
+        Func<RepoRef, CancellationToken, Task<string?>>? token = null, IWorkerSandbox? sandbox = null) =>
+        new(WorkRoot, r => _remotes[r], token ?? ((_, _) => Task.FromResult<string?>(null)), git, sandbox, worktreesDirectory: directory,
+            shareWithWorker: false);
+
+    private string LockFile(RepoRef repo) => Path.Combine(WorkRoot, CloneLock.DirectoryName, repo.Owner, $"{repo.Name}.lock");
+
+    /// <summary>Whether someone holds the clone lock at <paramref name="path"/> right now (a second open of a held lock file is refused, in one process too).</summary>
+    private static bool Held(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+        try
+        {
+            using var probe = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            return false;
+        }
+        catch (IOException)
+        {
+            return true;
+        }
+    }
+
+    /// <summary>A sandbox that deletes like the owner, and records what it is asked with whether a clone lock was held at that moment.</summary>
+    private sealed class FakeSandbox(Func<bool> held, bool closeFails = false) : IWorkerSandbox
+    {
+        public List<(string Path, bool Held)> Deletes { get; } = [];
+        public List<(string Path, bool LockFiles)> Closes { get; } = [];
+
+        public Task ShareAsync(string path, CancellationToken ct) => Task.CompletedTask;
+
+        public Task DeleteAsWorkerAsync(string path, CancellationToken ct)
+        {
+            Deletes.Add((path, held()));
+            Directory.Delete(path, recursive: true);
+            return Task.CompletedTask;
+        }
+
+        public Task CloseToWorkerAsync(string path, CancellationToken ct)
+        {
+            Closes.Add((path, Directory.EnumerateFiles(path, "*.lock", SearchOption.AllDirectories).Any()));
+            return closeFails ? throw new InvalidOperationException($"{path} is still open to others than its owner") : Task.CompletedTask;
+        }
+    }
 
     private GitWorkspace Triage => Workspaces(SandboxTriageRunner.TriageWorktrees);
     private GitWorkspace Planner => Workspaces(SandboxPlanRunner.PlanWorktrees);
@@ -327,14 +373,16 @@ public class SafeCleanupTests
     [Fact]
     public async Task Overlapping_runs_fetch_add_worktrees_commit_and_push_on_one_clone_and_all_succeed_one_writer_at_a_time()
     {
-        var (writers, most, calls) = (0, 0, 0);
+        // Writers are counted per clone (a seat writes two clones, each under its own lock); "most" is the most any clone had at once.
+        var (writers, most, calls) = (new int[2], 0, 0);
         GitCommand counting = async (cwd, env, args, ct) =>
         {
             if (!Writes(args))
             {
                 return await GitWorkspace.RunGitAsync(cwd, env, args, ct);
             }
-            var now = Interlocked.Increment(ref writers);
+            var clone = $"{cwd} {string.Join(' ', args)}".Contains("/repos/acme/gears", StringComparison.Ordinal) ? 1 : 0;
+            var now = Interlocked.Increment(ref writers[clone]);
             InterlockedMax(ref most, now);
             Interlocked.Increment(ref calls);
             try
@@ -343,12 +391,32 @@ public class SafeCleanupTests
             }
             finally
             {
-                Interlocked.Decrement(ref writers);
+                Interlocked.Decrement(ref writers[clone]);
             }
         };
+        // Someone else's merges into main while the runs go on (one at a time: they are not the factory's git, and share one seed).
+        using var mainMoves = new SemaphoreSlim(1);
+        async Task MoveMain(int n)
+        {
+            await mainMoves.WaitAsync(None);
+            try
+            {
+                var seed = Path.Combine(_root, $"{Repo.Name}-seed");
+                File.WriteAllText(Path.Combine(seed, $"base-{n}.txt"), $"{n}\n");
+                Git(seed, "add", ".");
+                Git(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", $"base {n}");
+                Git(seed, "push", _remotes[Repo], "main");
+            }
+            finally
+            {
+                mainMoves.Release();
+            }
+        }
 
         // Each "run" has its own GitWorkspace, as each process and each run does. The first round races on a clone that does not
-        // exist yet; the second on fetches of one that does.
+        // exist yet; the later ones on fetches of one that does. Every operation that writes a clone is in the race: worktrees
+        // (item, gate, restored, a planner's seat over two clones), commit and push, the merge queue's base update (merge and
+        // fast-forward push), and a plan's changeset branch (the read of where it starts, and its creation on origin).
         async Task<string> Run(int n)
         {
             var workspaces = Workspaces(git: counting);
@@ -361,12 +429,33 @@ public class SafeCleanupTests
             var gate = await workspaces.PrepareCommitAsync(Repo, $"gate-sc-{n}-head", await workspaces.HeadAsync(ws, None), None);
             Assert.True(File.Exists(Path.Combine(gate.Path, $"run-{n}.txt")));
             await workspaces.RemoveAsync(Repo, gate, None);
-            return ws.Path;
+
+            await MoveMain(n);
+            var restored = await workspaces.RestoreAsync(Repo, $"factory/sc-{n}", None);
+            var merge = await workspaces.MergeBaseAsync(Repo, restored, None);
+            Assert.False(merge.UpToDate);
+            Assert.Empty(merge.Conflicts);
+            Assert.True(File.Exists(Path.Combine(restored.Path, $"base-{n}.txt")));
+            await workspaces.PushAsync(Repo, restored, None);
+            Assert.Equal(merge.Head, Git(_remotes[Repo], "rev-parse", $"factory/sc-{n}").Trim());
+
+            var changeset = $"{ItemNaming.ChangesetBranchPrefix}sc-{n}";
+            var start = await workspaces.BranchStartAsync(Repo, changeset, None);
+            Assert.Null(start.Existing);
+            Assert.Equal(start.BaseSha, await workspaces.CreateBranchAsync(Repo, changeset, start.BaseSha, None));
+            Assert.Equal(start.BaseSha, Git(_remotes[Repo], "rev-parse", changeset).Trim());
+
+            var seats = Workspaces(SandboxPlanRunner.PlanWorktrees, counting);
+            var seat = await seats.PrepareSeatAsync([Repo, Gears], $"factory/plan-sc-{n}", None);
+            Assert.All(seat.Checkouts, c => Assert.Equal("hello\n", File.ReadAllText(Path.Combine(c.Workspace.Path, "README.md"))));
+            await seats.RemoveSeatAsync(seat, None);
+            Assert.False(Directory.Exists(seat.Path));
+            return restored.Path;
         }
         var paths = await Task.WhenAll(Enumerable.Range(1, 6).Select(n => Task.Run(() => Run(n))));
 
         Assert.Equal(1, most);
-        Assert.True(calls >= 6 * 6, $"{calls} writes");
+        Assert.True(calls >= 6 * 16, $"{calls} writes");
         // Every run's worktree is there with its own work, and every branch reached origin.
         var registered = Git(Path.Combine(WorkRoot, "repos", "acme", "widgets"), "worktree", "list");
         var pushed = Git(_remotes[Repo], "for-each-ref", "--format=%(refname:short)", "refs/heads/factory");
@@ -376,6 +465,8 @@ public class SafeCleanupTests
             Assert.DoesNotContain(Directory.EnumerateFiles(paths[n - 1], "run-*.txt"), f => Path.GetFileName(f) != $"run-{n}.txt");
             Assert.Contains($"factory-sc-{n} ", registered.Replace("\n", " \n"));
             Assert.Contains($"factory/sc-{n}", pushed.Split('\n'));
+            Assert.Contains($"factory/changeset-sc-{n}", pushed.Split('\n'));
+            Assert.DoesNotContain($"factory-plan-sc-{n}", registered);
         }
     }
 
@@ -458,6 +549,186 @@ public class SafeCleanupTests
         {
         }
         Assert.True(Directory.Exists((await Workspaces().PrepareAsync(Repo, "factory/sc-1", None)).Path));
+    }
+
+    [Fact]
+    public async Task A_long_wait_for_the_clone_lock_is_reported_with_the_lock_files_path_and_again_while_it_lasts()
+    {
+        var path = LockFile(Repo);
+        Assert.Equal(TimeSpan.FromSeconds(30), CloneLock.ReportEvery);
+        var reports = new List<string>();
+        void Report(string line)
+        {
+            lock (reports)
+            {
+                reports.Add(line);
+            }
+        }
+        int Count()
+        {
+            lock (reports)
+            {
+                return reports.Count;
+            }
+        }
+        // Free, or held for less than the threshold: nothing is said.
+        var every = TimeSpan.FromMilliseconds(150);
+        var held = await CloneLock.AcquireAsync(path, None, every, Report);
+        var brief = CloneLock.AcquireAsync(path, None, TimeSpan.FromMinutes(5), Report);
+        await Task.Delay(120, None);
+        Assert.False(brief.IsCompleted);
+        Assert.Equal(0, Count());
+
+        // A wait with no cancellation (as clean-up waits) behind a holder that does not let go: reported, and reported again.
+        var clock = Stopwatch.StartNew();
+        var waiting = CloneLock.AcquireAsync(path, None, every, Report);
+        for (var tries = 0; Count() < 2 && tries < 400; tries++)
+        {
+            await Task.Delay(25, None);
+        }
+        var (count, elapsed) = (Count(), clock.Elapsed);
+        Assert.True(count >= 2, $"{count} reports after {elapsed}");
+        // Periodic, not once per 50 ms try: the first report comes a whole period in, each later one a period after the last.
+        Assert.True(count <= (int)(elapsed / every), $"{count} reports in {elapsed}");
+        Assert.False(waiting.IsCompleted);
+        lock (reports)
+        {
+            Assert.All(reports, line =>
+            {
+                Assert.StartsWith("[clone-lock] waited ", line);
+                Assert.Contains($" for {path} ", line);
+                Assert.Contains("still waiting", line);
+            });
+        }
+        // The line names why the last try failed (here: the file is in use), so an I/O error that is not a holder shows too.
+        Assert.Equal("[clone-lock] waited 61 s for /w/clone-locks/acme/widgets.lock and still waiting (another run's git holds the clone, "
+            + "or the lock file cannot be opened): disk error", CloneLock.WaitReport("/w/clone-locks/acme/widgets.lock", TimeSpan.FromSeconds(61.9), "disk error"));
+        lock (reports)
+        {
+            Assert.All(reports, line => Assert.Matches(@"\): \S", line));
+        }
+
+        // The holder lets go: both waiters get the lock in turn, and nothing more is reported.
+        held.Dispose();
+        (await await Task.WhenAny(brief, waiting)).Dispose(); // whichever got it first: the other waits for it
+        (await brief).Dispose();
+        (await waiting).Dispose();
+        var after = Count();
+        await Task.Delay(2 * every, None);
+        Assert.Equal(after, Count());
+    }
+
+    [Fact]
+    public async Task No_token_is_minted_and_no_directory_deleted_while_the_clone_lock_is_held()
+    {
+        // The token mint is a GitHub call and the delete, sandboxed, a run of the launch helper: neither may hold up other runs' git.
+        var minted = new List<(string Repo, bool Held)>();
+        Task<string?> Token(RepoRef repo, CancellationToken ct)
+        {
+            minted.Add((repo.FullName, Held(LockFile(repo))));
+            return Task.FromResult<string?>("ghs_token");
+        }
+        var sandbox = new FakeSandbox(() => Held(LockFile(Repo)) || Held(LockFile(Gears)));
+        var workspaces = Workspaces(token: Token, sandbox: sandbox);
+        async Task<int> Mints(Func<Task> operation)
+        {
+            var before = minted.Count;
+            await operation();
+            return minted.Count - before;
+        }
+
+        Workspace ws = null!;
+        Assert.Equal(1, await Mints(async () => ws = await workspaces.PrepareAsync(Repo, "factory/sc-1", None))); // the clone
+        Assert.Equal(1, await Mints(async () => ws = await workspaces.PrepareAsync(Repo, "factory/sc-1", None))); // a fetch, replacing the worktree
+        Assert.Equal([(ws.Path, false)], sandbox.Deletes);
+
+        // Nothing to push: no token at all. No grant: refused before anything.
+        Assert.Equal(0, await Mints(async () => Assert.False(await workspaces.CommitAndPushAsync(Repo, ws, "nothing", TestGrants.Untainted, None))));
+        File.WriteAllText(Path.Combine(ws.Path, "work.txt"), "x\n");
+        Assert.Equal(0, await Mints(() => Assert.ThrowsAsync<ArgumentNullException>(() => workspaces.CommitAndPushAsync(Repo, ws, "no grant", null!, None))));
+        Assert.Equal(1, await Mints(async () => Assert.True(await workspaces.CommitAndPushAsync(Repo, ws, "work", TestGrants.Untainted, None))));
+        var head = await workspaces.HeadAsync(ws, None);
+        Assert.Equal(head, Git(_remotes[Repo], "rev-parse", "factory/sc-1").Trim());
+
+        var seed = Path.Combine(_root, $"{Repo.Name}-seed");
+        File.WriteAllText(Path.Combine(seed, "base.txt"), "moved\n");
+        Git(seed, "add", ".");
+        Git(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "base");
+        Git(seed, "push", _remotes[Repo], "main");
+        Assert.Equal(1, await Mints(async () => ws = await workspaces.RestoreAsync(Repo, "factory/sc-1", None)));
+        Assert.Equal(0, await Mints(async () => Assert.False((await workspaces.MergeBaseAsync(Repo, ws, None)).UpToDate)));
+        Assert.Equal(1, await Mints(() => workspaces.PushAsync(Repo, ws, None)));
+        BranchStart start = null!;
+        Assert.Equal(1, await Mints(async () => start = await workspaces.BranchStartAsync(Repo, "factory/changeset-sc-1", None)));
+        // One token for the fetch and the push of the one call.
+        Assert.Equal(1, await Mints(() => workspaces.CreateBranchAsync(Repo, "factory/changeset-sc-1", start.BaseSha, None)));
+        Assert.Equal(start.BaseSha, Git(_remotes[Repo], "rev-parse", "factory/changeset-sc-1").Trim());
+        Assert.Equal(1, await Mints(() => workspaces.ChangedFilesAsync(Repo, start.BaseSha, head, None)));
+        Workspace gate = null!;
+        Assert.Equal(0, await Mints(async () => gate = await workspaces.PrepareCommitAsync(Repo, "gate-sc-1-head", head, None)));
+        Assert.Equal(0, await Mints(async () => gate = await workspaces.PrepareCommitAsync(Repo, "gate-sc-1-head", head, None)));
+        await workspaces.RemoveAsync(Repo, gate, None);
+        var seats = Workspaces(SandboxPlanRunner.PlanWorktrees, token: Token, sandbox: sandbox);
+        SeatWorkspace seat = null!;
+        Assert.Equal(2, await Mints(async () => seat = await seats.PrepareSeatAsync([Repo, Gears], "factory/plan-sc-1", None)));
+        Assert.Equal(2, await Mints(async () => seat = await seats.PrepareSeatAsync([Repo, Gears], "factory/plan-sc-1", None)));
+        await seats.RemoveSeatAsync(seat, None);
+
+        // A worktree that cannot be added (here: git refuses) is cleaned up once the lock is let go, not under it.
+        var failing = Workspaces(sandbox: sandbox, git: (cwd, env, args, ct) => args.Contains("add") && args.Contains("worktree")
+            ? throw new InvalidOperationException("git worktree failed (128): no")
+            : GitWorkspace.RunGitAsync(cwd, env, args, ct));
+        var doomed = Path.Combine(WorkRoot, GitWorkspace.ItemWorktrees, "acme", "widgets", "factory-sc-2");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => failing.PrepareAsync(Repo, "factory/sc-2", None));
+        Assert.False(Directory.Exists(doomed));
+        Assert.Contains((doomed, false), sandbox.Deletes);
+
+        Assert.Equal(12, minted.Count);
+        Assert.All(minted, mint => Assert.False(mint.Held, $"a token for {mint.Repo} was minted under the clone lock"));
+        // Deleted: the replaced item worktree (twice: the second Prepare and the Restore), the gate worktree (replaced, then
+        // removed), the seat (replaced, then its two checkouts and itself removed), and the failed worktree.
+        Assert.True(sandbox.Deletes.Count >= 9, $"{sandbox.Deletes.Count} deletes");
+        Assert.All(sandbox.Deletes, delete => Assert.False(delete.Held, $"{delete.Path} was deleted under a clone lock"));
+        Assert.False(Held(LockFile(Repo)));
+    }
+
+    [Fact]
+    public async Task Sandboxed_the_clone_locks_directory_is_closed_to_the_worker_before_any_lock_file_exists_and_failing_that_nothing_runs()
+    {
+        // flock takes an exclusive lock through a read-only descriptor, and the work root's ACL lets the worker user read all
+        // under it: left open, code a worker runs could hold a clone's lock against every run.
+        var locks = Path.Combine(WorkRoot, CloneLock.DirectoryName);
+        var sandbox = new FakeSandbox(() => false);
+        var workspaces = Workspaces(sandbox: sandbox);
+        var ws = await workspaces.PrepareAsync(Repo, "factory/sc-1", None);
+        await workspaces.RemoveAsync(Repo, ws, None);
+        await workspaces.BranchStartAsync(Gears, "factory/x", None);
+        // Once per workspace, on the directory of every clone's lock, before the first lock file was made in it.
+        Assert.Equal([(locks, false)], sandbox.Closes);
+        Assert.True(File.Exists(LockFile(Repo)));
+        // Each workspace (each run, each process) closes it again: it never trusts what it did not check.
+        await Workspaces(sandbox: sandbox).BranchStartAsync(Repo, "factory/x", None);
+        Assert.Equal([(locks, false), (locks, true)], sandbox.Closes);
+
+        // It cannot be closed: a broken set-up (factory-wide), and neither a lock nor git on any clone.
+        var open = new FakeSandbox(() => false, closeFails: true);
+        var git = 0;
+        var refused = Workspaces(sandbox: open, git: (cwd, env, args, ct) =>
+        {
+            git++;
+            return GitWorkspace.RunGitAsync(cwd, env, args, ct);
+        });
+        File.Delete(LockFile(Gears));
+        var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() => refused.BranchStartAsync(Gears, "factory/x", None));
+        Assert.StartsWith($"the clone locks: {locks} is still open", ex.Message);
+        await Assert.ThrowsAsync<FactoryUnavailableException>(() => refused.PrepareAsync(Repo, "factory/sc-1", None));
+        Assert.Equal(0, git);
+        Assert.False(File.Exists(LockFile(Gears)));
+        Assert.Equal(2, open.Closes.Count);
+
+        // Unsandboxed (Worker:RunAs=none) there is no worker user: nothing is closed.
+        await Workspaces().BranchStartAsync(Repo, "factory/x", None);
+        Assert.Equal(2, sandbox.Closes.Count);
     }
 
     private static void InterlockedMax(ref int target, int value)

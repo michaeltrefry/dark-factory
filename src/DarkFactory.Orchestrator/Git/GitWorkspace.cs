@@ -158,15 +158,18 @@ public sealed class GitWorkspace(
         EnsureFactoryBranch(branch);
         EnsureBase(branch, requestedBase);
         var clone = ClonePath(repo);
+        var auth = await AuthEnvironment(repo, ct);
         // One hold from the fetch to the worktree: the start point is the one this fetch brought, never another run's half-written refs.
-        using var cloneLock = await LockAsync(clone, ct);
-        await FetchLockedAsync(repo, ct);
-        var baseBranch = requestedBase ?? await BaseBranchAsync(clone, ct);
-        if (requestedBase is not null && await RemoteHeadAsync(clone, requestedBase, ct) is null)
+        return await ReplaceWorktreeAsync(clone, WorktreePath(repo, branch), ct, async () =>
         {
-            throw new InvalidOperationException($"{repo} has no branch '{requestedBase}' on origin, so {branch} cannot be based on it.");
-        }
-        return await AddWorktreeLockedAsync(clone, WorktreePath(repo, branch), branch, baseBranch, ["-B", branch], startPoint(baseBranch), ct);
+            await FetchLockedAsync(repo, auth, ct);
+            var baseBranch = requestedBase ?? await BaseBranchAsync(clone, ct);
+            if (requestedBase is not null && await RemoteHeadAsync(clone, requestedBase, ct) is null)
+            {
+                throw new InvalidOperationException($"{repo} has no branch '{requestedBase}' on origin, so {branch} cannot be based on it.");
+            }
+            return (branch, baseBranch, ["-B", branch], startPoint(baseBranch));
+        });
     }
 
     /// <summary>A base other than the default branch is only ever a changeset branch (sc-25872), and never the branch itself.</summary>
@@ -183,8 +186,9 @@ public sealed class GitWorkspace(
     {
         EnsureFactoryBranch(branch);
         var clone = ClonePath(repo);
+        var auth = await AuthEnvironment(repo, ct);
         using var cloneLock = await LockAsync(clone, ct);
-        await FetchLockedAsync(repo, ct);
+        await FetchLockedAsync(repo, auth, ct);
         var baseBranch = await BaseBranchAsync(clone, ct);
         var baseSha = await RemoteHeadAsync(clone, baseBranch, ct)
             ?? throw new InvalidOperationException($"{repo}'s default branch '{baseBranch}' has no commit on origin.");
@@ -195,16 +199,18 @@ public sealed class GitWorkspace(
     {
         EnsureFactoryBranch(branch);
         var clone = ClonePath(repo);
+        // One token for this call's fetch and push, minted before the lock (no GitHub call is made while the clone is held).
+        var auth = await AuthEnvironment(repo, ct);
         // The push writes the clone's remote-tracking ref too.
         using var cloneLock = await LockAsync(clone, ct);
-        await FetchLockedAsync(repo, ct);
+        await FetchLockedAsync(repo, auth, ct);
         if (await RemoteHeadAsync(clone, branch, ct) is { } existing)
         {
             // Adopted as it is: an earlier run created it, and stories may have merged into it since.
             return existing;
         }
         var commit = (await Git(clone, null, ct, "rev-parse", "--verify", "--end-of-options", $"{sha}^{{commit}}")).Trim();
-        await Git(clone, await AuthEnvironment(repo, ct), ct, GitRemoteWrites.CreateBranch(commit, branch));
+        await Git(clone, auth, ct, GitRemoteWrites.CreateBranch(commit, branch));
         return commit;
     }
 
@@ -215,7 +221,7 @@ public sealed class GitWorkspace(
     /// <summary>
     /// The seat's directory is where <paramref name="repos"/>' first repository's worktree of <paramref name="branch"/> would be
     /// (so <see cref="SweepOrphansAsync"/> finds a leftover one), each checkout a worktree at <c>&lt;owner&gt;/&lt;name&gt;</c> inside it,
-    /// created like any worktree (<see cref="AddWorktreeLockedAsync"/>: the clone fetched with that repository's own token, under
+    /// created like any worktree (<see cref="ReplaceWorktreeAsync"/>: the clone fetched with that repository's own token, under
     /// that clone's lock).
     /// </summary>
     public async Task<SeatWorkspace> PrepareSeatAsync(IReadOnlyList<RepoRef> repos, string branch, CancellationToken ct)
@@ -235,11 +241,13 @@ public sealed class GitWorkspace(
             foreach (var repo in repos)
             {
                 var clone = ClonePath(repo);
-                using var cloneLock = await LockAsync(clone, ct);
-                await FetchLockedAsync(repo, ct);
-                var baseBranch = await BaseBranchAsync(clone, ct);
-                checkouts.Add((repo, await AddWorktreeLockedAsync(clone, Path.Combine(path, repo.Owner, repo.Name), branch, baseBranch, ["-B", branch],
-                    $"origin/{baseBranch}", ct)));
+                var auth = await AuthEnvironment(repo, ct);
+                checkouts.Add((repo, await ReplaceWorktreeAsync(clone, Path.Combine(path, repo.Owner, repo.Name), ct, async () =>
+                {
+                    await FetchLockedAsync(repo, auth, ct);
+                    var baseBranch = await BaseBranchAsync(clone, ct);
+                    return (branch, baseBranch, ["-B", branch], $"origin/{baseBranch}");
+                })));
             }
             return new SeatWorkspace(path, checkouts);
         }
@@ -269,26 +277,52 @@ public sealed class GitWorkspace(
         }
     }
 
-    /// <summary>The lock of the clone at <paramref name="clone"/> (<see cref="CloneLock"/>), waited for.</summary>
-    private Task<CloneLock> LockAsync(string clone, CancellationToken ct) =>
-        CloneLock.AcquireAsync(Path.Combine(workRoot, CloneLock.DirectoryName, Path.GetFileName(Path.GetDirectoryName(clone))!,
-            Path.GetFileName(clone) + ".lock"), ct);
+    /// <summary>Whether this workspace has closed the lock files' directory to the worker user (once is enough: only the owner changes it).</summary>
+    private bool _locksClosed;
+
+    /// <summary>
+    /// The lock of the clone at <paramref name="clone"/> (<see cref="CloneLock"/>), waited for. Sandboxed, the lock files' directory
+    /// is first closed to the worker user (<see cref="IWorkerSandbox.CloseToWorkerAsync"/>): the work root's inherited ACL entry
+    /// would let that user read a lock file, and <c>flock</c> takes an exclusive lock through a read-only descriptor, so code a
+    /// worker runs could otherwise hold a clone's lock and stall every run's git on it. A directory that cannot be closed is a
+    /// broken set-up, not an item's failure (<see cref="FactoryUnavailableException"/>): nothing is locked and no git runs.
+    /// </summary>
+    private async Task<CloneLock> LockAsync(string clone, CancellationToken ct)
+    {
+        var locks = Path.Combine(workRoot, CloneLock.DirectoryName);
+        if (sandbox is not null && !_locksClosed)
+        {
+            try
+            {
+                Directory.CreateDirectory(locks);
+                await sandbox.CloseToWorkerAsync(locks, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                throw new FactoryUnavailableException($"the clone locks: {ex.Message}", ex);
+            }
+            _locksClosed = true;
+        }
+        return await CloneLock.AcquireAsync(Path.Combine(locks, Path.GetFileName(Path.GetDirectoryName(clone))!, Path.GetFileName(clone) + ".lock"), ct);
+    }
 
     /// <summary><see cref="FetchLockedAsync"/> under the clone's lock, for a caller that then only reads objects.</summary>
     private async Task<string> FetchAsync(RepoRef repo, CancellationToken ct)
     {
+        var auth = await AuthEnvironment(repo, ct);
         using var cloneLock = await LockAsync(ClonePath(repo), ct);
-        return await FetchLockedAsync(repo, ct);
+        return await FetchLockedAsync(repo, auth, ct);
     }
 
     /// <summary>
     /// Clones the repo on first use, else fetches (pruning) and refreshes <c>origin/HEAD</c>; returns the clone's path. The caller
     /// holds the clone's lock (<see cref="LockAsync"/>): a second run never finds a clone half made, nor refs half fetched.
+    /// <paramref name="auth"/> is this call's token (<see cref="AuthEnvironment"/>), minted by the caller before it took the lock:
+    /// no GitHub call is made while a clone is held.
     /// </summary>
-    private async Task<string> FetchLockedAsync(RepoRef repo, CancellationToken ct)
+    private async Task<string> FetchLockedAsync(RepoRef repo, Dictionary<string, string>? auth, CancellationToken ct)
     {
         var clone = ClonePath(repo);
-        var auth = await AuthEnvironment(repo, ct);
         if (!Directory.Exists(Path.Combine(clone, ".git")))
         {
             Directory.CreateDirectory(Path.GetDirectoryName(clone)!);
@@ -302,14 +336,29 @@ public sealed class GitWorkspace(
         return clone;
     }
 
-    /// <summary>Adds the worktree (replacing what is at <paramref name="worktree"/>); the caller holds the clone's lock.</summary>
-    private async Task<Workspace> AddWorktreeLockedAsync(string clone, string worktree, string branch, string baseBranch, string[] mode, string startPoint,
-        CancellationToken ct)
+    /// <summary>
+    /// A fresh worktree at <paramref name="worktree"/>, replacing what is there. The old directory is deleted first, before the
+    /// clone's lock is taken (a slow delete — sandboxed, a run of the launch helper — holds up no other run; the directory is this
+    /// item's, which only its own run, or a sweep under its run lock, touches). Then one hold of the lock: <paramref name="locked"/>
+    /// (the fetch and the reads that pick the start point; it answers the branch, its base, <c>worktree add</c>'s mode and the
+    /// start point), the prune of the old directory's registration, and <c>worktree add</c>. A failure under the lock is cleaned
+    /// up once the lock is released.
+    /// </summary>
+    private async Task<Workspace> ReplaceWorktreeAsync(string clone, string worktree, CancellationToken ct,
+        Func<Task<(string Branch, string BaseBranch, string[] Mode, string StartPoint)>> locked)
     {
-        await DeleteWorktreeLockedAsync(clone, worktree, ct);
-        Directory.CreateDirectory(worktree);
+        await DeleteDirectoryAsync(worktree, ct);
+        var held = false;
         try
         {
+            using var cloneLock = await LockAsync(clone, ct);
+            held = true;
+            var (branch, baseBranch, mode, startPoint) = await locked();
+            if (Directory.Exists(Path.Combine(clone, ".git")))
+            {
+                await Git(clone, null, ct, "worktree", "prune");
+            }
+            Directory.CreateDirectory(worktree);
             if (sandbox is not null && shareWithWorker)
             {
                 // Share the empty directory and let the checkout inherit the ACL; sharing afterwards
@@ -321,9 +370,11 @@ public sealed class GitWorkspace(
                 ?? throw new InvalidOperationException($"git worktree add left no admin dir for {worktree}.");
             return new Workspace(worktree, branch, baseBranch, gitDir);
         }
-        catch
+        catch when (held)
         {
-            await DeleteWorktreeLockedAsync(clone, worktree, CancellationToken.None);
+            // The lock is released by now (the using above ends before this runs), so the directory is again deleted outside it.
+            // A wait for the lock that was cancelled or failed made nothing to clean up (and must not wait for the lock here).
+            await DeleteWorktreeAsync(clone, worktree, CancellationToken.None);
             throw;
         }
     }
@@ -343,8 +394,8 @@ public sealed class GitWorkspace(
         }
         var clone = ClonePath(repo);
         var resolved = (await Git(clone, null, ct, "rev-parse", "--verify", "--end-of-options", $"{commit}^{{commit}}")).Trim();
-        using var cloneLock = await LockAsync(clone, ct);
-        return await AddWorktreeLockedAsync(clone, WorktreePath(repo, name), "(detached)", await BaseBranchAsync(clone, ct), ["--detach"], resolved, ct);
+        return await ReplaceWorktreeAsync(clone, WorktreePath(repo, name), ct,
+            async () => ("(detached)", await BaseBranchAsync(clone, ct), ["--detach"], resolved));
     }
 
     /// <summary>
@@ -803,21 +854,31 @@ public sealed class GitWorkspace(
         var dir = workspace.Path;
         string[] tree = [$"--git-dir={workspace.GitDir}", $"--work-tree={dir}"];
         await Git(dir, null, ct, [.. tree, "add", "-A"]);
+        async Task<bool> Dirty() => (await Git(dir, null, ct, [.. tree, "status", "--porcelain"])).Trim().Length > 0;
+        async Task<int> Ahead() =>
+            int.Parse((await Git(dir, null, ct, [.. tree, "rev-list", "--count", $"origin/{workspace.BaseBranch}..HEAD"])).Trim());
+        // Read before the lock (the worktree and its branch are this run's alone): with nothing to commit and nothing ahead of the
+        // base there is nothing to push, so no token is minted and the clone is not held. A base that another run's fetch moves
+        // meanwhile can only take commits out of "ahead", which the count under the lock sees.
+        if (!await Dirty() && await Ahead() == 0)
+        {
+            return false;
+        }
+        // The push token, minted before the lock: no GitHub call is made while the clone is held.
+        var auth = await AuthEnvironment(repo, ct);
         // The commit moves the branch in the clone's refs, and the push its remote-tracking ref.
         using var cloneLock = await LockAsync(ClonePath(repo), ct);
-        if ((await Git(dir, null, ct, [.. tree, "status", "--porcelain"])).Trim().Length > 0)
+        if (await Dirty())
         {
             await Git(dir, null, ct, [.. tree, "-c", $"user.name={CommitterName}", "-c", $"user.email={CommitterEmail}",
                 "commit", "-m", message]);
         }
-        var ahead = int.Parse((await Git(dir, null, ct, [.. tree, "rev-list", "--count", $"origin/{workspace.BaseBranch}..HEAD"])).Trim());
-        if (ahead == 0)
+        if (await Ahead() == 0)
         {
             return false;
         }
         // A changeset branch holds its plan's merged stories: a fix round on it only ever adds to what origin has.
-        await Git(dir, await AuthEnvironment(repo, ct), ct,
-            GitRemoteWrites.Push(tree, workspace.Branch, force: !ItemNaming.IsChangesetBranch(workspace.Branch)));
+        await Git(dir, auth, ct, GitRemoteWrites.Push(tree, workspace.Branch, force: !ItemNaming.IsChangesetBranch(workspace.Branch)));
         return true;
     }
 
@@ -855,8 +916,9 @@ public sealed class GitWorkspace(
     public async Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct)
     {
         EnsureFactoryBranch(workspace.Branch);
+        var auth = await AuthEnvironment(repo, ct);
         using var cloneLock = await LockAsync(ClonePath(repo), ct);
-        await Git(workspace.Path, await AuthEnvironment(repo, ct), ct,
+        await Git(workspace.Path, auth, ct,
             GitRemoteWrites.Push([$"--git-dir={workspace.GitDir}", $"--work-tree={workspace.Path}"], workspace.Branch, force: false));
     }
 
@@ -890,7 +952,8 @@ public sealed class GitWorkspace(
     /// <c>.git</c> file), then prunes the clone's worktree list. Sandboxed, the worker user deletes
     /// first (its processes are dead by then: the launch helper kills them all when a run ends), so the
     /// owner only removes what is left rather than walking a tree the worker controlled. The prune changes the clone's worktree
-    /// list, so it runs under the clone's lock, taken here (the directory is deleted before it: a slow delete holds up no other run).
+    /// list, so it runs under the clone's lock, taken here (the directory is deleted before it: a slow delete holds up no other run;
+    /// <see cref="ReplaceWorktreeAsync"/> deletes before its hold too, so no directory is ever deleted under a clone's lock).
     /// </summary>
     private async Task DeleteWorktreeAsync(string clone, string worktree, CancellationToken ct)
     {
@@ -898,16 +961,6 @@ public sealed class GitWorkspace(
         if (Directory.Exists(Path.Combine(clone, ".git")))
         {
             using var cloneLock = await LockAsync(clone, ct);
-            await Git(clone, null, ct, "worktree", "prune");
-        }
-    }
-
-    /// <summary><see cref="DeleteWorktreeAsync"/> for a caller that holds the clone's lock already.</summary>
-    private async Task DeleteWorktreeLockedAsync(string clone, string worktree, CancellationToken ct)
-    {
-        await DeleteDirectoryAsync(worktree, ct);
-        if (Directory.Exists(Path.Combine(clone, ".git")))
-        {
             await Git(clone, null, ct, "worktree", "prune");
         }
     }
