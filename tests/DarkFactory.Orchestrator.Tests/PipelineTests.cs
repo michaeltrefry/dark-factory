@@ -387,7 +387,7 @@ public class RunPipelineTests
         public async Task<WorkItem> Crashed(params string[] steps)
         {
             var ledger = Ledger;
-            var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
+            var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
             await ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
             foreach (var step in steps)
             {
@@ -431,7 +431,7 @@ public class RunPipelineTests
     {
         var h = new Harness();
         var ledger = h.Ledger;
-        var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
+        var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
         await ledger.CheckpointAsync(item, RunPipeline.Steps.Claimed, null, null, CancellationToken.None);
 
         await h.Run(new FakeWorker(Reports(Ok)));
@@ -623,7 +623,7 @@ public class RunPipelineTests
         var h = new Harness();
         var ledger = h.Ledger;
         Assert.False(await RunPipeline.WorktreeIsResumableAsync(ledger, "factory-changeset-sc-77", CancellationToken.None)); // no item
-        var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", "A plan", Sandbox.FullName, null, CancellationToken.None);
+        var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", "A plan", Sandbox.FullName, null, CancellationToken.None);
         foreach (var state in new[] { WorkState.Plan, WorkState.Planned, WorkState.Review })
         {
             await ledger.RecordAsync(item, state, null, null, CancellationToken.None);
@@ -993,7 +993,7 @@ public class RunPipelineTests
     {
         var h = new Harness();
         var ledger = h.Ledger;
-        var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
+        var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
 
         await ledger.TaintSessionAsync(item, "s-1", Taint.IssueText, CancellationToken.None);
         await ledger.TaintSessionAsync(item, "s-1", "web:WebFetch", CancellationToken.None);
@@ -1011,7 +1011,7 @@ public class RunPipelineTests
     {
         var h = new Harness();
         var ledger = h.Ledger;
-        var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
+        var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
         await ledger.RecordAsync(item, WorkState.Cancelled, null, "owner cancelled", CancellationToken.None);
         var worker = new FakeWorker();
 

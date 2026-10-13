@@ -11,10 +11,14 @@ namespace DarkFactory.Orchestrator.WorkSources;
 /// <param name="Source">The ledger's source column.</param>
 /// <param name="Prefix">The external id's prefix, e.g. <c>sc</c>.</param>
 /// <param name="Noun">What an item is called in prose (prompts, comments), e.g. <c>Shortcut story</c>.</param>
-public sealed record ItemNaming(string Source, string Prefix, string Noun)
+/// <param name="NumberedEpics">
+/// Whether the source's epics have a number an epic-scope control names (<c>epic:&lt;n&gt;</c>, <c>factory pause --epic N</c>): such a
+/// control reaches only the items of a source that has them.
+/// </param>
+public sealed record ItemNaming(string Source, string Prefix, string Noun, bool NumberedEpics = false)
 {
     /// <summary>Shortcut stories: <c>sc-&lt;story id&gt;</c>.</summary>
-    public static readonly ItemNaming Shortcut = new("shortcut", "sc", "Shortcut story");
+    public static readonly ItemNaming Shortcut = new("shortcut", "sc", "Shortcut story", NumberedEpics: true);
 
     /// <summary>GitHub issues: <c>gh-&lt;key&gt;</c>, the key the ledger gave the issue (<see cref="Ledger.GitHubIssue"/>), not its number.</summary>
     public static readonly ItemNaming GitHubIssue = new("github", "gh", "GitHub issue");

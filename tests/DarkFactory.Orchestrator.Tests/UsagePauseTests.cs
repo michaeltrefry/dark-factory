@@ -50,7 +50,7 @@ public class UsagePauseTests
         public async Task<IReadOnlyList<int>> InFlight()
         {
             await using var db = new LedgerDbContext(_options);
-            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), CancellationToken.None, Controls);
+            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Shortcut, CancellationToken.None, Controls);
         }
 
         public async Task<List<LedgerEntry>> Rows() => await Db.LedgerEntries.AsNoTracking().OrderBy(e => e.Id).ToListAsync();
@@ -157,7 +157,7 @@ public class UsagePauseTests
         var source = new ShortcutWorkSource(board.Client(), "tok", new WatchScope(["darkfactory"], []));
         var worker = new FakeWorker(Reports(Ok));
         var runner = new Runner(l, source, worker);
-        var loop = new IntakeLoop(source, runner, new IntakeOptions(Interval), l.Time, NullLogger<IntakeLoop>.Instance, l.Controls, Monitor(router, l));
+        var loop = new IntakeLoop([new IntakeLane(source, runner)], new IntakeOptions(Interval), l.Time, NullLogger<IntakeLoop>.Instance, l.Controls, Monitor(router, l));
 
         await loop.StartAsync(CancellationToken.None);
         // The clock moves only once the loop has finished the poll and armed its wake-up: a usage read that returned is
@@ -387,9 +387,9 @@ public class UsagePauseTests
     {
         var l = new Ledgers();
         var ledger = l.Ledger;
-        var costed = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-1", "One", Sandbox.FullName, null, CancellationToken.None);
-        var uncosted = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-2", "Two", Sandbox.FullName, null, CancellationToken.None);
-        var free = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-3", "Three", Sandbox.FullName, null, CancellationToken.None);
+        var costed = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-1", "One", Sandbox.FullName, null, CancellationToken.None);
+        var uncosted = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-2", "Two", Sandbox.FullName, null, CancellationToken.None);
+        var free = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-3", "Three", Sandbox.FullName, null, CancellationToken.None);
         l.Db.WorkerSessions.AddRange(
             new WorkerSession { WorkItemId = free.Id, ClaudeSessionId = "e", Attempt = 1, StartedAt = T0, CostUsd = 0m }, // served at $0
             new WorkerSession { WorkItemId = free.Id, ClaudeSessionId = "f", Attempt = 2, StartedAt = T0, CostUsd = null },
@@ -427,7 +427,7 @@ public class UsagePauseTests
         var monitor = Monitor(router, l);
         var (_, source) = ReadyBoard();
         var worker = new FakeWorker(Reports(Ok));
-        var loop = new IntakeLoop(source, new Runner(l, source, worker), new IntakeOptions(Interval), l.Time, NullLogger<IntakeLoop>.Instance,
+        var loop = new IntakeLoop([new IntakeLane(source, new Runner(l, source, worker))], new IntakeOptions(Interval), l.Time, NullLogger<IntakeLoop>.Instance,
             l.Controls, monitor);
         await monitor.CheckAsync(CancellationToken.None);
         Assert.Equal(resetAt, (await l.Controls.UsagePauseAsync(CancellationToken.None))?.ResumeAt);
@@ -490,7 +490,7 @@ public class UsagePauseTests
         var options = new UsageOptions(Interval);
         Assert.Equal(TimeSpan.FromSeconds(10), options.RequestTimeout);
         var monitor = new UsageMonitor(usage, l.Controls, options, l.Time, NullLogger<UsageMonitor>.Instance);
-        var loop = new IntakeLoop(source, new Runner(l, source, worker), new IntakeOptions(Interval), l.Time, NullLogger<IntakeLoop>.Instance,
+        var loop = new IntakeLoop([new IntakeLane(source, new Runner(l, source, worker))], new IntakeOptions(Interval), l.Time, NullLogger<IntakeLoop>.Instance,
             l.Controls, monitor);
 
         var poll = loop.PollOnceAsync(CancellationToken.None);

@@ -16,9 +16,9 @@ public static class FactoryCli
         Func<string, string, CancellationToken, Task<int>> control,
         Func<Guid, CancellationToken, Task<int>>? kanbanKey = null)
     {
-        var storyArgument = new Argument<WorkSources.ItemRef?>("story-id")
+        var storyArgument = new Argument<WorkSources.ItemRef?>("item-id")
         {
-            Description = "Shortcut story id, e.g. sc-1234 or 1234, a GitHub issue's work item, e.g. gh-12, or a Kanban item's, e.g. kb-7",
+            Description = "The work item's id: a Shortcut story, e.g. sc-1234 or 1234, a GitHub issue's work item, e.g. gh-12, or a Kanban item's, e.g. kb-7. The prefix names its work source, which must be configured",
             CustomParser = result =>
             {
                 var token = result.Tokens.Single().Value;
@@ -32,7 +32,7 @@ public static class FactoryCli
         };
         var ignoreScopeOption = new Option<bool>("--ignore-scope")
         {
-            Description = "Claim and resume the story even if it is outside the Shortcut watch scope (the other claim checks still apply)",
+            Description = "Claim and resume the item even if it is outside its work source's watch scope (the other claim checks still apply)",
         };
         var runCommand = new Command("run", "Run one work item (a Shortcut story, a released GitHub issue, or a Kanban item) through Intake → Implement → Review → CI → MergeGate → Merge, resuming from its last ledger state.")
         {
@@ -93,7 +93,7 @@ public static class FactoryCli
         };
         protectCommand.SetAction((parse, ct) => protectRepo(parse.GetValue(repoArgument)!, ct));
 
-        var workCommand = new Command("work", "Run the long-running factory host until Ctrl-C: the dashboard and session hub on 127.0.0.1:Factory:HostPort (plus Dashboard:BindAddress), and the intake loop that polls the watched Shortcut scope and runs each ready (To Do) story, one at a time.");
+        var workCommand = new Command("work", "Run the long-running factory host until Ctrl-C: the dashboard and session hub on 127.0.0.1:Factory:HostPort (plus Dashboard:BindAddress), and the intake loop that polls every configured work source in turn (Shortcut, KanbanBoard, GitHub issues: any of them, at least one) and runs each ready item, one at a time.");
         workCommand.SetAction((_, ct) => work(ct));
 
         var setPasswordCommand = new Command("set-password", "Set the dashboard login password (read without echo; its hash goes to the keychain).");
@@ -114,7 +114,7 @@ public static class FactoryCli
             },
         };
         var kanbanKeyCommand = new Command("key",
-            "Print the work item id (kb-<number>) of a KanbanBoard item, giving it one if the factory has not seen the item yet; `factory run kb-<number>` then runs it.")
+            "Print the work item id (kb-<number>) of a KanbanBoard item, giving it one if the factory has not seen the item yet; `factory run kb-<number>` then runs it. `factory work` gives every item it lists its id by itself: this is for an item it has not listed.")
         {
             kanbanItemArgument,
         };
@@ -127,14 +127,14 @@ public static class FactoryCli
             workCommand,
             ControlCommand("pause", "Pause a scope: nothing new is claimed or started there, and running workers stop after their current tool call (session and worktree kept).", control),
             ControlCommand("continue", "Continue a paused scope: paused items resume from the ledger (an interrupted worker resumes its own Claude session).", control),
-            ControlCommand("stop", "Stop every active item in a scope: kill its worker, mark it Cancelled, turn its open PR back into a draft and move its story to the Backlog with a comment. Nothing is merged or deleted.", control),
+            ControlCommand("stop", "Stop every active item in a scope: kill its worker, mark it Cancelled, turn its open PR back into a draft and move it back to its board's Backlog with a comment, releasing the claim. Nothing is merged or deleted.", control),
             new Command("github-app", "GitHub App management") { setupCommand },
             new Command("github-repo", "Target repository management") { protectCommand },
             new Command("dashboard", "Dashboard management") { setPasswordCommand },
         };
     }
 
-    /// <summary><c>factory &lt;action&gt; --item sc-N | --epic N | --factory</c>; the handler gets the action and the control scope.</summary>
+    /// <summary><c>factory &lt;action&gt; --item sc-N|gh-N|kb-N | --epic N | --factory</c>; the handler gets the action and the control scope.</summary>
     private static Command ControlCommand(string action, string description, Func<string, string, CancellationToken, Task<int>> control)
     {
         var item = new Option<WorkSources.ItemRef?>("--item")
@@ -169,8 +169,8 @@ public static class FactoryCli
             if (given != 1)
             {
                 result.AddError(action == "continue"
-                    ? "Give exactly one of --item sc-N, --epic N, --factory, --usage or --freeze."
-                    : "Give exactly one of --item sc-N, --epic N or --factory.");
+                    ? "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic N, --factory, --usage or --freeze."
+                    : "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic N or --factory.");
             }
             else if (result.GetValue(epic) is <= 0)
             {

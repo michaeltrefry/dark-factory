@@ -50,10 +50,7 @@ public static class ControlScope
 
     public static string Item(string externalId) => ItemPrefix + externalId;
 
-    /// <summary>The Shortcut story id of an item scope, or null for another scope (or another source's item).</summary>
-    public static int? ItemStory(string scope) => ItemOf(scope) is { } item && item.Naming == ItemNaming.Shortcut ? item.Id : null;
-
-    /// <summary>The item of an item scope (<c>item:sc-12</c>, <c>item:gh-3</c>), or null for another scope.</summary>
+    /// <summary>The item of an item scope (<c>item:sc-12</c>, <c>item:gh-3</c>, <c>item:kb-4</c>), or null for another scope.</summary>
     public static ItemRef? ItemOf(string scope) =>
         scope.StartsWith("item:", StringComparison.Ordinal) ? ItemNaming.ParseAny(scope["item:".Length..]) : null;
 

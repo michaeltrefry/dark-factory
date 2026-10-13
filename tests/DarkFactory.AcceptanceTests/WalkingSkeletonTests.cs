@@ -6,6 +6,7 @@ using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 using Microsoft.EntityFrameworkCore;
+using DarkFactory.Orchestrator.WorkSources;
 
 [assembly: CaptureConsole]
 
@@ -73,11 +74,11 @@ public class WalkingSkeletonTests
         var startedAt = DateTimeOffset.UtcNow;
 
         // The story is named explicitly by FACTORY_E2E_STORY, like a manual `factory run --ignore-scope`.
-        var outcome = await FactoryRunner.RunAsync(Harness.Options, storyId, ignoreScope: true, Console.Out, ct);
+        var outcome = await FactoryRunner.RunAsync(Harness.Options, new ItemRef(ItemNaming.Shortcut, storyId), ignoreScope: true, Console.Out, ct);
         Assert.True(outcome.Succeeded, outcome.Error);
 
         // Ledger: Intake → Implement → Review for this run, timestamped, carrying the session id.
-        var item = await db.WorkItems.SingleAsync(w => w.Source == RunPipeline.Source && w.ExternalId == StoryId.Format(storyId), ct);
+        var item = await db.WorkItems.SingleAsync(w => w.Source == ItemNaming.Shortcut.Source && w.ExternalId == StoryId.Format(storyId), ct);
         // Transition rows (Step null); the session id is checkpointed in Implement and carried on Review.
         var rows = await db.LedgerEntries.Where(e => e.WorkItemId == item.Id && e.RecordedAt >= startedAt && e.Step == null)
             .OrderBy(e => e.Id).ToListAsync(ct);

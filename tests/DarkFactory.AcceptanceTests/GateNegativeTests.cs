@@ -4,6 +4,7 @@ using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Shortcut;
+using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.AcceptanceTests;
 
@@ -57,7 +58,7 @@ public class GateNegativeTests
     private static async Task<RunOutcome> FactoryRunAsync(Run run, Func<GateStage, GateStage> adjust)
     {
         using var shortcutHttp = OutboundHttp.ShortcutApi();
-        return await FactoryRunner.RunAsync(run.Options, FactoryRunner.CreateWorkSource(run.Options, shortcutHttp), run.StoryId, ignoreScope: true,
+        return await FactoryRunner.RunAsync(run.Options, WorkSourceRegistry.Shortcut(run.Options, shortcutHttp), run.StoryId, ignoreScope: true,
             Console.Out, run.Ct, adjust);
     }
 

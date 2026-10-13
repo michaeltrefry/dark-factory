@@ -153,7 +153,7 @@ public class StepOutcomeTests
         var data = new DashboardData(h.Contexts, h.Time);
         var row = Assert.Single(await data.ActiveItemsAsync(CancellationToken.None));
         Assert.Equal((new CloseoutStatus(1, false, "failed: Shortcut down"), true), (row.FailedCloseout, row.CloseoutRetrying));
-        Assert.Equal([77], await RunPipeline.InFlightAsync(h.Ledger, CancellationToken.None, h.Controls));
+        Assert.Equal([77], await RunPipeline.InFlightAsync(h.Ledger, ItemNaming.Shortcut, CancellationToken.None, h.Controls));
         for (var attempt = 2; attempt <= RunPipeline.MaxCloseoutAttempts; attempt++)
         {
             var retry = await h.Run();
@@ -164,7 +164,7 @@ public class StepOutcomeTests
         Assert.All(attempts.Skip(1), a => Assert.Equal((WorkState.Watch, StepOutcome.Failed), (a.State, a.Outcome)));
 
         // Bounded: once the attempts are used up the poll leaves it, and the dashboard says a human must post it.
-        Assert.Empty(await RunPipeline.InFlightAsync(h.Ledger, CancellationToken.None, h.Controls));
+        Assert.Empty(await RunPipeline.InFlightAsync(h.Ledger, ItemNaming.Shortcut, CancellationToken.None, h.Controls));
         row = Assert.Single(await data.ActiveItemsAsync(CancellationToken.None));
         Assert.Equal((RunPipeline.MaxCloseoutAttempts, false), (row.FailedCloseout!.Attempts, row.CloseoutRetrying));
         await h.Run();
@@ -187,7 +187,7 @@ public class StepOutcomeTests
         Assert.StartsWith("[author: dark-factory] sc-77 merged as", closeout);
         Assert.Equal([StepOutcome.Failed, StepOutcome.Passed], (await h.Rows()).Where(r => r.Step == RunPipeline.Steps.Closeout).Select(r => r.Outcome));
         Assert.DoesNotContain(await h.Rows(), r => r.Step == RunPipeline.Steps.HeldNotice);
-        Assert.Empty(await RunPipeline.InFlightAsync(h.Ledger, CancellationToken.None, h.Controls));
+        Assert.Empty(await RunPipeline.InFlightAsync(h.Ledger, ItemNaming.Shortcut, CancellationToken.None, h.Controls));
         Assert.Null(Assert.Single(await new DashboardData(h.Contexts, h.Time).ActiveItemsAsync(CancellationToken.None)).FailedCloseout);
     }
 

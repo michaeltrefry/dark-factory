@@ -11,8 +11,10 @@ Claude Code headless workers through the Weave router.
   manifest setup (`GitHub/`), git worktrees (`Git/`), Claude worker and its sandbox (`Worker/`), router client,
   session capture + SignalR hub (`Sessions/`), the `factory work` host (`FactoryHost`) and its Blazor Server
   dashboard (`Dashboard/`: login, binding, ledger reads, transcript formatting; components in `Dashboard/Components`),
-  `IWorkSource` + the `factory work` intake loop (`WorkSources/`; registered on the `factory work` host by `FactoryHost.BuildWork` via `services.AddIntake(options)`)
-  and its Shortcut adapter (`Shortcut/ShortcutWorkSource.cs`), GitHub issues as a second source (`Issues/`: the intake
+  `IWorkSource` + the `factory work` intake loop (`WorkSources/`; registered on the `factory work` host by `FactoryHost.BuildWork` via `services.AddIntake(options)`),
+  the one registry of work sources `WorkSources/WorkSourceRegistry.cs` (sc-25982: which sources are configured, each built once; the
+  only file outside `Shortcut/` that names the Shortcut source's type)
+  and the Shortcut adapter (`Shortcut/ShortcutWorkSource.cs`), GitHub issues as a second source (`Issues/`: the intake
   `IssueIntake` — poll, triage, route, approvals — the routing rule `IssueTriage.cs`, the triage worker `TriageWorker.cs`,
   `GitHubIssueWorkSource`; GitHub side `GitHub/GitHubIssues.cs`), the Pause/Continue/Stop controls (`Controls/`), and the
   review and merge gate (`Gate/`: `ReviewModels` (which panel calls count), `ReviewPanel` (roles, prompts, findings),
@@ -142,10 +144,10 @@ dotnet test                                   # unit tests; acceptance tests ski
 dotnet ef database update --project src/DarkFactory.Orchestrator
 dotnet ef migrations add <Name> --project src/DarkFactory.Orchestrator -o Ledger/Migrations
 dotnet run --project src/DarkFactory.Orchestrator -- run sc-1234             # or gh-12 (a released GitHub issue), kb-7 (a Kanban item)
-dotnet run --project src/DarkFactory.Orchestrator -- kanban key <item GUID>   # prints the item's kb-<n> (given now if it has none)
-dotnet run --project src/DarkFactory.Orchestrator -- work          # long-running host: dashboard + session hub on 127.0.0.1 + the intake loop (polls the watch scope)
+dotnet run --project src/DarkFactory.Orchestrator -- kanban key <item GUID>   # prints the item's kb-<n> (given now if it has none); only for an item `factory work` has not listed
+dotnet run --project src/DarkFactory.Orchestrator -- work          # long-running host: dashboard + session hub on 127.0.0.1 + the intake loop (polls every configured work source)
 dotnet run --project src/DarkFactory.Orchestrator -- dashboard set-password   # dashboard login (hash → keychain)
-dotnet run --project src/DarkFactory.Orchestrator -- pause --factory          # also continue/stop; --epic N or --item sc-N
+dotnet run --project src/DarkFactory.Orchestrator -- pause --factory          # also continue/stop; --epic N or --item sc-N | gh-N | kb-N
 dotnet run --project src/DarkFactory.Orchestrator -- continue --freeze        # clear the automatic freeze (also --usage)
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup --gate   # the merge gate's own App (then re-run protect)
@@ -167,10 +169,10 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional: without it the factory starts and every CodeGraph tool answers the reviewer an error result (recorded), triage gets no CodeGraph, and the merge gate's `risk-threshold` fails wherever a tier requires it (sc-25709), so no normal or protected change merges (`factory run` and `factory work` warn at start-up) |
 | `Kanban:McpUrl` | `https://kanban-mcp.trefry.net/mcp` (`OutboundHttp.KanbanDefaultMcpUrl`; an absolute http(s) URL naming no model provider; MCP Streamable HTTP): the Kanban upstream (sc-25707), offered to reviewers through their tool loop and to a plan item's planner session through the loopback proxy (`McpProfile.Planner`, sc-25870); never to triage sessions, whose proxy is started without it (`McpProfile.Triage`: the issue text is untrusted and the triage's answer is posted on the issue) |
 | `Kanban:Token` | env `FACTORY_KANBAN_TOKEN`, or keychain account `kanban-token`: a KanbanBoard PAT (`Authorization: Bearer`), owner-side only (E5). Optional: without it there is no Kanban upstream (not an error) |
-| `Kanban:WriteToken` | env `FACTORY_KANBAN_WRITE_TOKEN`, or keychain account `kanban-write-token` (sc-25981): the orchestrator's own KanbanBoard PAT, scope `full`, with which the Kanban work source claims, moves, comments on and links items. Owner-side only and apart from `Kanban:Token` (E2): it is read in one place (`FactoryRunner.CreateKanbanSource`), held by one client (`Gateway/KanbanWrites`) and is in no MCP upstream, profile, allowlist or proxy grant. Needed only to work a Kanban item (`factory run kb-N`, `factory kanban key`): missing, those print the reason and exit 2 |
-| `Kanban:Watch:Projects` | empty = watch nothing; comma-separated KanbanBoard project keys (each ≤ 24 characters, no spaces; upper-cased, once each; else refused at start-up naming the key). An item is in scope when its project is one of them |
+| `Kanban:WriteToken` | env `FACTORY_KANBAN_WRITE_TOKEN`, or keychain account `kanban-write-token` (sc-25981): the orchestrator's own KanbanBoard PAT, scope `full`, with which the Kanban work source claims, moves, comments on and links items. Owner-side only and apart from `Kanban:Token` (E2): it is read in one place (`WorkSourceRegistry.Kanban`), held by one client (`Gateway/KanbanWrites`) and is in no MCP upstream, profile, allowlist or proxy grant. Needed only to work a Kanban item (`factory run kb-N`, `factory kanban key`): missing, those print the reason and exit 2 |
+| `Kanban:Watch:Projects` | empty = watch nothing; comma-separated KanbanBoard project keys (each ≤ 24 characters, no spaces; upper-cased, once each; else refused at start-up naming the key). An item is in scope when its project is one of them. Set, it makes KanbanBoard a configured work source that `factory work` polls (sc-25982) and then needs `Kanban:WriteToken` (else refused at start-up); each key is checked on the board at start-up |
 | `Kanban:WebUrl` | `https://kanban.trefry.net/` (`OutboundHttp.KanbanDefaultWebUrl`; an absolute http(s) URL without credentials, query or fragment, naming no model provider): what a Kanban item's, epic's and document's link is built on (`KanbanLinks`: `?project=<id>[&epic=<id>]&item=<id>`) — KanbanBoard's MCP returns no URL, and nothing is requested from this address |
-| `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
+| `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token`. Needed only to work Shortcut stories (sc-25982): with no Shortcut watch scope the factory starts without it, on its other work sources |
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
 | `GitHub:Gate:AppId`, `GitHub:Gate:PrivateKeyPem` | keychain `github-gate-app-id`, `github-gate-app-private-key` (written by `factory github-app setup --gate`): the merge gate's App, the only credential that merges |
 | `Review:Models`, `Review:Correctness:Models`, `Review:SpecConformance:Models`, `Review:Security:Models`, `Review:Confirm:Models` | retired (sc-25626, epic E8): no reviewer or second-opinion model is pinned — every panel call names the router's `high` model class. Any of them set (even empty) is refused at start-up (`FactoryOptions.RejectReviewModelSettings`, `ReviewConfigurationException`: `factory run` and `factory work` print the reason and exit 2, before any router call) rather than silently ignored |
@@ -179,7 +181,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Gate:TestTimeoutMinutes` | `20` (> 0: one sandboxed run — restore, build, the new tests — of the `new-tests-fail-on-base` check; still running at the timeout fails the check) |
 | `Factory:DefaultRepo` | `michaeltrefry/dark-factory-sandbox` (a story line `Repo: owner/name` overrides) |
 | `Factory:Repos` | empty; comma-separated `owner/name` (each well-formed, else refused at start-up naming the key): repositories the factory may plan and work in besides the default one (sc-25877). It only adds to the configured repositories (`FactoryOptions.ConfiguredRepos` = `Factory:DefaultRepo` ∪ `Factory:Repos` ∪ `GitHub:Watch:Repos`, case-insensitive, each once): a plan may name them and the freeze's main-red watches them. It turns on NO issue polling and works with `Worker:RunAs=none`. Both GitHub Apps must be installed there |
-| `Shortcut:Watch:Teams`, `Shortcut:Watch:Epics` | empty = watch nothing; comma-separated team mention names/ids, epic ids |
+| `Shortcut:Watch:Teams`, `Shortcut:Watch:Epics` | empty = watch nothing; comma-separated team mention names/ids, epic ids. Set, they make Shortcut a configured work source that `factory work` polls and then need `Shortcut:ApiToken` (else refused at start-up). `factory work` needs at least one configured work source — this, `Kanban:Watch:Projects` or `GitHub:Watch:Repos` — and exits 2 naming all three otherwise (sc-25982) |
 | `GitHub:Watch:Repos` | empty = triage no issues; comma-separated `owner/name` whose issues `factory work` polls and triages (the workers' App needs Issues read/write there; refused with `Worker:RunAs=none`). It is the issue-triage watch list, not the list of repositories the factory may work in: a repository named here is also a configured repository, but to let the factory plan and work in a repository WITHOUT triaging its issues name it in `Factory:Repos` |
 | `Intake:PollSeconds` | `60` (> 0) |
 | `Intake:MaxItemFailures` | `3` (runs of one item failing in a row before `factory work` escalates/parks it, E10) |
@@ -271,9 +273,47 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
 - Work sources are named by `ItemNaming` (`sc-<story>`, `gh-<key>`, `kb-<key>`: the ledger `Source`, external id, `factory/<id>` branch,
   `factory-<id>` worktree, `item:<id>` control scope); `factory run`/`--item` take any of them. The intake loop polls every source
   in turn (`IntakeLane`), so a triage and an item run never share the sandbox. The merge queue is per repo across sources.
-- KanbanBoard items (Phase 4b, sc-25981; `Kanban/`): a third work source behind `IWorkSource`, wired for `factory run kb-<n>` only
-  so far (the intake loop, `factory work`'s start-up, Stop from the CLI/dashboard and epic controls do not know it yet: a Pause or
-  Stop written for `item:kb-<n>` is honoured by the item's own run, which is the generic path). Contract: KanbanBoard's
+- Several work sources (Phase 4b, sc-25982; `WorkSources/WorkSourceRegistry.cs`, E1): every place that needs a source takes it from
+  ONE registry keyed by `ItemNaming` — `WorkSourceRegistry.Kinds`, one `WorkSourceKind` per `ItemNaming.All` entry (Shortcut,
+  GitHub issues, KanbanBoard, the order the lanes are polled in), each saying which settings configure it and how it is built
+  (its own `OutboundHttp` client, owned and disposed by the registry; a source is built once, on first use). It is the only file
+  outside `Shortcut/` that names `ShortcutWorkSource` (or the Shortcut namespace, bar `FactoryOptions` for the watch scope's
+  type): `WorkSourceRegistryTests.Only_the_registry_names_…` scans the source tree. Two questions, answered from the settings:
+  (1) `Configured` — the sources `factory work` polls: those whose watch scope is set (`Shortcut:Watch:Teams`/`Epics`;
+  `Kanban:Watch:Projects`; `GitHub:Watch:Repos`). A watched source whose credential is missing is refused
+  (`MissingCredentialException`), never left out. The factory starts with any non-empty set, KanbanBoard alone included, and with
+  no Kanban setting behaves as before. (2) `Of(naming)` — the source of one item named by id (`factory run`, `factory stop
+  --item`, an item's ledger row): it needs only that source's credential, no watch scope (`factory run sc-12 --ignore-scope`
+  with an empty scope works as it always did; the claim's own scope check is unchanged); without the credential it throws naming
+  the source's settings, and when no source is configured at all those of every source (`WorkSourceRegistry.NoneConfigured`).
+  `Find` is `Of` or null. Wiring, each through the registry:
+  `factory work` start-up (`FactoryRunner.CheckWorkStartAsync`, called by `Program`): settings, the credentials every run needs
+  (router key, both GitHub Apps, dashboard login — no longer the Shortcut token), then the sources — none configured → exit 2 with
+  `NoneConfigured` (a token with no watch scope is not a configured source: one `stderr` note per such source, none for a source no
+  setting names; decision: this is the one case where `factory work` used to start, with a warning and nothing to pick up, and now
+  refuses, as the story's acceptance says), then each configured source's `ValidateScopeAsync` on its board
+  (`CheckWatchScopeAsync`). The host (`AddIntake`) registers the registry as a singleton; the intake loop takes `registry.Lanes(…)`
+  — one `IntakeLane` per configured source with a `FactoryItemRunner` of its own, whose `InFlightAsync` lists only that source's
+  items (`RunPipeline.InFlightAsync(ledger, naming, …)`: the naming is required, there is no default source), and only the GitHub
+  issues lane has a `Prepare` (triage) — so with any number of sources the runs still never overlap. `factory run <id>`
+  (`Program` → `RunCommandAsync(requireSource: …)`): the item's source is resolved before the router is asked; not configured →
+  exit 2. `factory pause|continue --item <id>` only write the control (any id of `ItemNaming.All`); `factory stop`
+  (`FactoryRunner.ControlAsync`, `FactoryItemStops`) stops each item on the source its id names — for one item that source is
+  resolved before anything is written (exit 2 when it is not configured), and in a wider scope (the factory, an epic) each item's
+  id comes from its ledger row (`Source` + `ExternalId`) and an item whose source is not configured is reported `stop NOT
+  finished (…)` and keeps its Stopping control. A plan's Stop cascade runs on the plan item's own source (its stories are that
+  source's). The dashboard's controls use the same registry. `IItemStops` has one member, `StopAsync(ItemRef)`. Epic scopes
+  (`--epic N`): an epic is named by its number, so the scope reaches only the items of sources whose epics have one
+  (`ItemNaming.NumberedEpics`: Shortcut today; a Kanban epic is a GUID — K5), and an item whose epic the ledger lacks is looked up
+  on its own board (`ControlActions`' `sources`), one not configured being reported as unknown. Residual, accepted: the
+  dashboard's rows and links are still worded for Shortcut (K5).
+- KanbanBoard items (Phase 4b, sc-25981, sc-25982; `Kanban/`): a third work source behind `IWorkSource`. Polled by `factory work`
+  when `Kanban:Watch:Projects` is set (the registry above), run by `factory run kb-<n>`, and paused, continued and stopped by id
+  like any item (Stop: pull request to draft, item back to `Backlog` with a comment, the factory's claim released, Cancelled).
+  Not yet: claim renewal on each poll, `busy` retries and conflict handling (K3), plans (K4), epic-scope controls and the
+  dashboard's Kanban rows (K5). `factory kanban key <GUID>` stays: the intake loop gives every item it LISTS its key, but
+  `factory run kb-<n>` on an item no poll has listed — `factory work` not running, the item outside the watched projects (run
+  with `--ignore-scope`), or not `Ready` yet — still needs the key from somewhere. Contract: KanbanBoard's
   `docs/mcp-contract.md` (tool and argument names are compared exactly there, and an argument a tool does not have is refused).
   Identity (E4): the board names an item by a GUID; the ledger gives it a key once, in `kanban_items` (migration `KanbanItems`;
   `KanbanKeys`: unique index on the GUID, the loser of a race reads the winner's key; a save that failed and left no row rethrows
@@ -291,7 +331,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   upstream registry, allowlist, profile or proxy grant; model sessions keep the read token and `McpServers.KanbanTools` (read tools
   only). `KanbanWriteIsolationTests` hold each half: no contract write tool on an allowlist or in a profile, the upstream sending
   the read token and no write tool, a planner grant of the real proxy refusing each of the adapter's write tools with nothing
-  forwarded, and a source scan (the token read, the client and the caller built only in `FactoryRunner.CreateKanbanSource`; nothing
+  forwarded, and a source scan (the token read, the client and the caller built only in `WorkSources/WorkSourceRegistry.cs`; nothing
   under `Mcp/`, `Gate/`, `Plans/`, `Issues/`, `Worker/`, `CodeGraph/`, `Sessions/`, `Dashboard/` naming them). Every write is
   conditional or idempotent (E3): a status change is `update_work_item(itemId, status, expected_version)` on the version just read
   (it puts the item at the end of the column and changes nothing else), a comment carries its `idempotency_key`, and claim, release

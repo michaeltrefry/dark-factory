@@ -15,6 +15,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Time.Testing;
+using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.Orchestrator.Tests;
 
@@ -454,7 +455,7 @@ public sealed class DashboardHostTests : IAsyncLifetime
     {
         await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_db!.ConnectionString)))
         {
-            await new WorkLedger(db, TimeProvider.System).GetOrCreateAsync(RunPipeline.Source, "sc-12", "Story", "acme/widgets", null, CancellationToken.None, 5);
+            await new WorkLedger(db, TimeProvider.System).GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-12", "Story", "acme/widgets", null, CancellationToken.None, 5);
         }
         await using var app = await StartAsync();
         var cookies = await DashboardLogin.LoginAsync(app.Address());

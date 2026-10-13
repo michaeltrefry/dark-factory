@@ -617,13 +617,13 @@ public partial class ChangesetPipelineTests
         {
             await using var db = new LedgerDbContext(_options);
             var ledger = new WorkLedger(db, TimeProvider.System);
-            await rows(ledger, await ledger.GetOrCreateAsync(RunPipeline.Source, $"sc-{PlanId}", "Add CSV export", Sandbox.FullName, null, CancellationToken.None, 42));
+            await rows(ledger, await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, $"sc-{PlanId}", "Add CSV export", Sandbox.FullName, null, CancellationToken.None, 42));
         }
 
         public async Task<long?> PlanOf(int story)
         {
             await using var db = new LedgerDbContext(_options);
-            return await new WorkLedger(db, TimeProvider.System).PlanOfAsync(RunPipeline.Source, $"sc-{story}", CancellationToken.None);
+            return await new WorkLedger(db, TimeProvider.System).PlanOfAsync(ItemNaming.Shortcut.Source, $"sc-{story}", CancellationToken.None);
         }
 
         public async Task<string?> TaintOf(string session)
@@ -638,7 +638,7 @@ public partial class ChangesetPipelineTests
         public async Task<IReadOnlyList<int>> InFlight()
         {
             await using var db = new LedgerDbContext(_options);
-            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), CancellationToken.None, Controls);
+            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Shortcut, CancellationToken.None, Controls);
         }
     }
 

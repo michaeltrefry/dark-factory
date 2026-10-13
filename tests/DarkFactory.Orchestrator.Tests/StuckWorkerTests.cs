@@ -337,7 +337,7 @@ public class QuietSessionDataTests
         var options = new DbContextOptionsBuilder<LedgerDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options;
         await using var db = new LedgerDbContext(options);
         var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider(T0);
-        var item = await new WorkLedger(db, time).GetOrCreateAsync(RunPipeline.Source, "sc-1", "One", Sandbox.FullName, null, CancellationToken.None);
+        var item = await new WorkLedger(db, time).GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-1", "One", Sandbox.FullName, null, CancellationToken.None);
         var running = new WorkerSession { WorkItemId = item.Id, ClaudeSessionId = "live", Attempt = 2, StartedAt = T0 };
         var ended = new WorkerSession { WorkItemId = item.Id, ClaudeSessionId = "done", Attempt = 1, StartedAt = T0, EndedAt = T0 };
         db.WorkerSessions.AddRange(ended, running);

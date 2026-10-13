@@ -33,7 +33,7 @@ public class ReviewGateTests
         await RequireGateReadyAsync(options, ct);
 
         using var shortcutHttp = OutboundHttp.ShortcutApi();
-        var outcome = await FactoryRunner.RunAsync(options, FactoryRunner.CreateWorkSource(options, shortcutHttp), storyId, ignoreScope: true,
+        var outcome = await FactoryRunner.RunAsync(options, WorkSourceRegistry.Shortcut(options, shortcutHttp), storyId, ignoreScope: true,
             Console.Out, ct);
         Assert.True(outcome.Succeeded, outcome.Error);
 
@@ -80,7 +80,7 @@ public class ReviewGateTests
         using var shortcutHttp = OutboundHttp.ShortcutApi();
         using var sandbox = new SandboxRepo(options, options.DefaultRepo);
         var pusher = new PushAfterFirstVerdict(sandbox, StoryId.BranchName(storyId));
-        var outcome = await FactoryRunner.RunAsync(options, FactoryRunner.CreateWorkSource(options, shortcutHttp), storyId, ignoreScope: true,
+        var outcome = await FactoryRunner.RunAsync(options, WorkSourceRegistry.Shortcut(options, shortcutHttp), storyId, ignoreScope: true,
             Console.Out, ct, gate => gate with { Reviewer = pusher.Wrap(gate.Reviewer) });
         Assert.True(outcome.Succeeded, outcome.Error);
 
@@ -136,7 +136,7 @@ public class ReviewGateTests
 
         var costs = await e2e.SessionCostsAsync(storyId, ct);
         using var shortcutHttp = OutboundHttp.ShortcutApi();
-        var story = (await FactoryRunner.CreateWorkSource(options, shortcutHttp).ReadSpecAsync(storyId, ct)).Story;
+        var story = (await WorkSourceRegistry.Shortcut(options, shortcutHttp).ReadSpecAsync(storyId, ct)).Story;
         var report = Index(e => e.Step == RunPipeline.Steps.PrReport, "pr-report");
         Assert.Equal("merge", history[report].Detail);
         Assert.Equal(Lines(LedgerReport.PullRequestBody(story, history.Take(report).ToList(), costs)), Lines(mergedPr.GetProperty("body").GetString()));

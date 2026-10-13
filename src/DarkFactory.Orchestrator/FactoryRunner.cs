@@ -6,7 +6,6 @@ using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Router;
 using DarkFactory.Orchestrator.Sessions;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
@@ -16,21 +15,66 @@ namespace DarkFactory.Orchestrator;
 /// <summary>Production wiring for <c>factory run</c> and <c>factory work</c>; shared by the CLI and the acceptance harness.</summary>
 public static class FactoryRunner
 {
-    public static IWorkSource CreateWorkSource(FactoryOptions options, HttpClient shortcutHttp) =>
-        new ShortcutWorkSource(shortcutHttp, options.ShortcutApiToken, options.WatchScope);
+    /// <summary>
+    /// <c>factory work</c>'s start-up check (E10: fail fast on a missing credential or a bad scope rather than on the first ready
+    /// item). Every setting with a rule; the credentials every run needs (session costs come from the router, pushes and pull
+    /// requests need the GitHub App, the merge gate its own App, the dashboard its login); no retired review-model setting; then
+    /// the work sources (sc-25982): at least one must be configured (<see cref="WorkSourceRegistry.Configured"/> — any non-empty
+    /// set, KanbanBoard alone included; none is refused with <see cref="WorkSourceRegistry.NoneConfigured"/>), a watched source
+    /// must have its credential, and each configured source's scope is checked on its board (<see cref="CheckWatchScopeAsync"/>).
+    /// A source that has a credential and watches nothing is a note on <paramref name="stderr"/>. Returns why the factory cannot
+    /// start (exit code 2), or null.
+    /// </summary>
+    public static async Task<string?> CheckWorkStartAsync(FactoryOptions options, WorkSourceRegistry sources, TextWriter stderr, CancellationToken ct)
+    {
+        IReadOnlyList<IWorkSource> configured;
+        try
+        {
+            options.ValidateSettings();
+            _ = (options.RouterKey, options.GitHubAppId, options.GitHubAppPrivateKeyPem, options.DashboardPasswordHash);
+            _ = (options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem);
+            options.RejectReviewModelSettings();
+            if (CodeGraphTokenWarning(options) is { } codeGraphWarning)
+            {
+                stderr.WriteLine(codeGraphWarning);
+            }
+            _ = Dashboard.DashboardBinding.Addresses(options.DashboardBindAddress);
+            configured = sources.Configured;
+            foreach (var note in sources.Unwatched)
+            {
+                stderr.WriteLine(note);
+            }
+            if (configured.Count == 0)
+            {
+                return WorkSourceRegistry.NoneConfigured;
+            }
+            if (Issues.IssueIntake.UnsandboxedRefusal(options.WorkerSandbox, options.WatchedIssueRepos) is { } unsandboxed)
+            {
+                return unsandboxed;
+            }
+        }
+        catch (Exception ex) when (ex is MissingCredentialException or ReviewConfigurationException or InvalidOperationException)
+        {
+            return ex.Message;
+        }
+        foreach (var source in configured)
+        {
+            if (await CheckWatchScopeAsync(source, ct) is { } scopeError)
+            {
+                return scopeError;
+            }
+        }
+        return null;
+    }
 
     /// <summary>
-    /// <c>factory work</c>'s start-up check, through the work source (E6): its credentials resolve and every watched
-    /// team and epic exists. Returns what is wrong, or null.
+    /// The start-up check of one configured work source, through the source (E6): its credentials resolve and every part of its
+    /// watch scope exists on its board. Returns what is wrong, or null.
     /// </summary>
-    public static async Task<string?> CheckWatchScopeAsync(FactoryOptions options, IWorkSource source, CancellationToken ct)
+    public static async Task<string?> CheckWatchScopeAsync(IWorkSource source, CancellationToken ct)
     {
         try
         {
-            if (source.Naming == ItemNaming.Shortcut ? options.WatchScope.IsEmpty : options.WatchedIssueRepos.Count == 0)
-            {
-                return null;
-            }
             await source.ValidateScopeAsync(ct);
             return null;
         }
@@ -86,11 +130,14 @@ public static class FactoryRunner
     /// <c>factory run</c>'s exit code: 0 the run succeeded, 1 it did not (also a Kanban item that could not be read or is no
     /// item the factory can work, <see cref="Kanban.KanbanItemException"/>/<see cref="Kanban.KanbanException"/>: its message on
     /// <paramref name="stderr"/>, no stack trace), 2 it could not start — a retired review-model
-    /// setting is set (checked first, before any network call), a credential is missing, or
+    /// setting is set (checked first, before any network call), the item's work source is not configured
+    /// (<paramref name="requireSource"/>, sc-25982: before any network call too; the reason names the settings that configure it,
+    /// and with no source configured at all those of every source), a credential is missing, or
     /// <paramref name="checkEnrollment"/> found the router unusable — with the reason on <paramref name="stderr"/>.
     /// </summary>
+    /// <param name="requireSource">Throws <see cref="MissingCredentialException"/> unless the item's source can be reached (<see cref="WorkSourceRegistry.Of"/>).</param>
     public static async Task<int> RunCommandAsync(FactoryOptions options, Func<CancellationToken, Task<string?>> checkEnrollment,
-        Func<CancellationToken, Task<RunOutcome>> run, TextWriter stderr, CancellationToken ct)
+        Func<CancellationToken, Task<RunOutcome>> run, TextWriter stderr, CancellationToken ct, Action? requireSource = null)
     {
         try
         {
@@ -104,6 +151,7 @@ public static class FactoryRunner
         try
         {
             options.RejectReviewModelSettings();
+            requireSource?.Invoke();
             if (CodeGraphTokenWarning(options) is { } warning)
             {
                 stderr.WriteLine(warning);
@@ -138,48 +186,29 @@ public static class FactoryRunner
         options.TryGet(o => o.CodeGraphToken, out _) ? null
             : $"no CodeGraph token ({MergeGate.CodeGraphTokenSources}): the merge gate will merge no change whose tier requires risk-threshold";
 
-    /// <param name="ignoreScope"><c>factory run --ignore-scope</c>: claim and resume the story even outside the watch scope.</param>
-    public static async Task<RunOutcome> RunAsync(FactoryOptions options, int storyId, bool ignoreScope, TextWriter log, CancellationToken ct)
-    {
-        using var shortcutHttp = OutboundHttp.ShortcutApi();
-        return await RunAsync(options, CreateWorkSource(options, shortcutHttp), storyId, ignoreScope, log, ct);
-    }
-
-    /// <summary><c>factory run &lt;item&gt;</c> for an item of any source: a Shortcut story (<c>sc-N</c>), a GitHub issue (<c>gh-N</c>) or a Kanban item (<c>kb-N</c>).</summary>
+    /// <summary>
+    /// <c>factory run &lt;item&gt;</c> for an item of any source — a Shortcut story (<c>sc-N</c>), a GitHub issue (<c>gh-N</c>) or a
+    /// Kanban item (<c>kb-N</c>) — on the source its id names (<see cref="WorkSourceRegistry.Of"/>, sc-25982).
+    /// </summary>
+    /// <param name="ignoreScope"><c>factory run --ignore-scope</c>: claim and resume the item even outside its source's watch scope.</param>
+    /// <exception cref="MissingCredentialException">The item's source is not configured.</exception>
     public static async Task<RunOutcome> RunAsync(FactoryOptions options, ItemRef item, bool ignoreScope, TextWriter log, CancellationToken ct)
     {
-        if (item.Naming == ItemNaming.Shortcut)
-        {
-            return await RunAsync(options, item.Id, ignoreScope, log, ct);
-        }
-        if (item.Naming == ItemNaming.Kanban)
-        {
-            using var kanbanHttp = OutboundHttp.KanbanApi(options.KanbanMcpUrl);
-            return await RunAsync(options, CreateKanbanSource(options, kanbanHttp), item.Id, ignoreScope, log, ct);
-        }
-        using var githubHttp = OutboundHttp.GitHubApi();
-        return await RunAsync(options, CreateIssueSource(options, githubHttp), item.Id, ignoreScope, log, ct);
+        using var sources = new WorkSourceRegistry(options);
+        return await RunAsync(options, sources.Of(item.Naming), item.Id, ignoreScope, log, ct);
     }
-
-    /// <summary>
-    /// The Kanban work source over the watched projects (<c>Kanban:Watch:Projects</c>; sc-25981), with the orchestrator's own
-    /// full-scope token (<c>Kanban:WriteToken</c>) in the one client built for it (<see cref="KanbanWrites.Client"/>) over
-    /// <paramref name="kanbanHttp"/> (<see cref="OutboundHttp.KanbanApi"/>). That client is apart from the Kanban upstream of
-    /// <see cref="CreateUpstreams"/>, which holds the read token and is all a model session reaches (E2).
-    /// </summary>
-    public static Kanban.KanbanWorkSource CreateKanbanSource(FactoryOptions options, HttpClient kanbanHttp) =>
-        new(new Kanban.KanbanBoard(KanbanWrites.Client(kanbanHttp, options.KanbanWriteToken)), new Kanban.KanbanKeys(Contexts(options)),
-            options.KanbanWatchScope, options.KanbanWebUrl);
 
     /// <summary>
     /// <c>factory kanban key &lt;item id&gt;</c>: the <c>kb-&lt;n&gt;</c> of a KanbanBoard item by its board id, given to it now if the
     /// factory has not seen the item before (<see cref="Kanban.KanbanWorkSource.KeyOfAsync"/>: the item must be on the board; nothing
-    /// is written to it) — what <c>factory run kb-&lt;n&gt;</c> then takes.
+    /// is written to it) — what <c>factory run kb-&lt;n&gt;</c> then takes. <c>factory work</c>'s intake loop gives every item it
+    /// lists its key by itself (sc-25982); this is for an item no poll has listed: one run by hand before the loop saw it, or one
+    /// the loop never lists (outside the watched projects, run with <c>--ignore-scope</c>; not <c>Ready</c> yet).
     /// </summary>
     public static async Task<string> KanbanKeyAsync(FactoryOptions options, Guid itemId, CancellationToken ct)
     {
         using var kanbanHttp = OutboundHttp.KanbanApi(options.KanbanMcpUrl);
-        var source = CreateKanbanSource(options, kanbanHttp);
+        var source = WorkSourceRegistry.Kanban(options, kanbanHttp);
         await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
         return ItemNaming.Kanban.Format(await source.KeyOfAsync(itemId, ct));
     }
@@ -198,13 +227,6 @@ public static class FactoryRunner
         _ => ex is InvalidOperationException or HttpRequestException or System.Data.Common.DbException
             or Microsoft.EntityFrameworkCore.DbUpdateException,
     };
-
-    /// <summary>The GitHub issue work source over the watched repos (<c>GitHub:Watch:Repos</c>), as the workers' App.</summary>
-    public static Issues.GitHubIssueWorkSource CreateIssueSource(FactoryOptions options, HttpClient githubHttp) =>
-        new(IssuesClient(options, githubHttp), Contexts(options), options.WatchedIssueRepos);
-
-    private static GitHubIssuesClient IssuesClient(FactoryOptions options, HttpClient githubHttp) =>
-        new(githubHttp, new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System));
 
     /// <summary>
     /// A freeze evaluator over the ledger and the gate App's view of GitHub (main-red), for the intake loop's per-poll check. Its
@@ -228,7 +250,7 @@ public static class FactoryRunner
     public static async Task PollIssuesAsync(FactoryOptions options, IntakeStatus status, TextWriter log, CancellationToken ct)
     {
         using var githubHttp = OutboundHttp.GitHubApi();
-        var intake = new Issues.IssueIntake(CreateIssueSource(options, githubHttp), options.WatchedIssueRepos, Contexts(options),
+        var intake = new Issues.IssueIntake(WorkSourceRegistry.Issues(options, githubHttp), options.WatchedIssueRepos, Contexts(options),
             new PostgresRunLocks(options.LedgerConnectionString), Controls(options), new SandboxTriageRunner(options, log), status,
             options.MaxItemFailures, TimeProvider.System, log);
         await intake.PollAsync(ct);
@@ -424,19 +446,28 @@ public static class FactoryRunner
 
     /// <summary>
     /// <c>factory pause|continue|stop</c>: writes the scope's control, and for Stop finishes each item's stop
-    /// at once when no run holds it (a running item is stopped by its own run within about a second).
+    /// at once when no run holds it (a running item is stopped by its own run within about a second). An item of any source
+    /// (sc-25982): Pause and Continue only write its control; Stop needs the item's own board (its source, from the registry) and
+    /// GitHub, and an epic scope the board of each item whose epic the ledger does not have.
     /// </summary>
-    public static async Task<ControlResult> ControlAsync(FactoryOptions options, string action, string scope, string by, TextWriter log, CancellationToken ct)
+    /// <param name="sources">Tests: the registry, in place of one over <paramref name="options"/>.</param>
+    /// <exception cref="MissingCredentialException">
+    /// Stop of one item whose source is not configured: nothing is written (a wider Stop reports such an item as not stopped).
+    /// </exception>
+    public static async Task<ControlResult> ControlAsync(FactoryOptions options, string action, string scope, string by, TextWriter log, CancellationToken ct,
+        WorkSourceRegistry? sources = null)
     {
+        using var own = sources is null ? new WorkSourceRegistry(options) : null;
+        sources ??= own!;
+        if (action == "stop" && ControlScope.ItemOf(scope) is { } item)
+        {
+            // Before anything is written: a stop that could not reach the item's board would leave it Stopping with nothing to finish it.
+            _ = sources.Of(item.Naming);
+        }
         await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
         var contexts = new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
-        using var shortcutHttp = OutboundHttp.ShortcutApi();
-        // Stop needs the board and GitHub, and an epic scope the board (for items with no epic in the ledger);
-        // Pause and Continue otherwise only write the control.
-        var source = action == "stop" || ControlScope.EpicOf(scope) is not null ? CreateWorkSource(options, shortcutHttp) : null;
-        using var githubHttp = OutboundHttp.GitHubApi();
-        var stops = action == "stop" ? new FactoryItemStops(options, source!, log, CreateIssueSource(options, githubHttp)) : null;
-        var actions = new ControlActions(Controls(options), contexts, stops, source, new PostgresRunLocks(options.LedgerConnectionString));
+        var stops = action == "stop" ? new FactoryItemStops(options, sources, log) : null;
+        var actions = new ControlActions(Controls(options), contexts, stops, sources.Find, new PostgresRunLocks(options.LedgerConnectionString));
         return action switch
         {
             "pause" => await actions.PauseAsync(scope, by, ct),
@@ -448,17 +479,14 @@ public static class FactoryRunner
 }
 
 /// <summary>
-/// Production <see cref="IItemStops"/>: an <see cref="ItemStopper"/> over the Postgres ledger, the item's work source (Shortcut, or
-/// <paramref name="issues"/> for a GitHub issue) and GitHub, per call.
+/// Production <see cref="IItemStops"/>: an <see cref="ItemStopper"/> over the Postgres ledger, the item's own work source
+/// (<paramref name="sources"/>, by the naming of its id — an id taken from its ledger row or typed by a person; sc-25982) and GitHub,
+/// per call. An item whose source is not configured throws (<see cref="MissingCredentialException"/>, naming the settings): it
+/// keeps its Stopping control, and <see cref="ControlActions.StopAsync"/> reports it as not stopped.
 /// </summary>
-public sealed class FactoryItemStops(FactoryOptions options, IWorkSource source, TextWriter log, IWorkSource? issues = null) : IItemStops
+public sealed class FactoryItemStops(FactoryOptions options, WorkSourceRegistry sources, TextWriter log) : IItemStops
 {
-    public Task<ControlResult> StopAsync(int storyId, CancellationToken ct) => StopAsync(source, storyId, ct);
-
-    public Task<ControlResult> StopAsync(ItemRef item, CancellationToken ct) =>
-        new[] { source, issues }.OfType<IWorkSource>().FirstOrDefault(s => s.Naming == item.Naming) is { } owner
-            ? StopAsync(owner, item.Id, ct)
-            : Task.FromResult(new ControlResult(true, $"{item}: stop requested; its next run stops it."));
+    public Task<ControlResult> StopAsync(ItemRef item, CancellationToken ct) => StopAsync(sources.Of(item.Naming), item.Id, ct);
 
     private async Task<ControlResult> StopAsync(IWorkSource owner, int id, CancellationToken ct)
     {
@@ -635,7 +663,7 @@ public sealed class FactoryItemRunner(FactoryOptions options, IWorkSource source
     {
         // `factory work` migrated the ledger (LedgerMigrations) before the host started.
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
-        return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ct, FactoryRunner.Controls(options), naming: source.Naming);
+        return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), source.Naming, ct, FactoryRunner.Controls(options));
     }
 
     public Task<RunOutcome> RunAsync(int id, CancellationToken ct) => FactoryRunner.RunAsync(options, source, id, ignoreScope: false, log, ct);

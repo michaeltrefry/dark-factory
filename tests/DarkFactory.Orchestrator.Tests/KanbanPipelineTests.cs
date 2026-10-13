@@ -264,7 +264,7 @@ public class KanbanWriteIsolationTests
             ["Kanban:Token"] = FakeKanbanBoard.ReadToken, ["Kanban:WriteToken"] = FakeKanbanBoard.FullToken, ["Kanban:Watch:Projects"] = "df",
         });
 
-        var source = FactoryRunner.CreateKanbanSource(options, board.Client());
+        var source = WorkSourceRegistry.Kanban(options, board.Client());
         await source.ValidateScopeAsync(None);
 
         Assert.All(board.Server.Api.Requests, r => Assert.Equal($"Bearer {FakeKanbanBoard.FullToken}", r.Headers["Authorization"]));
@@ -273,7 +273,7 @@ public class KanbanWriteIsolationTests
         if (Environment.GetEnvironmentVariable("FACTORY_KANBAN_WRITE_TOKEN") is null)
         {
             var missing = Assert.Throws<MissingCredentialException>(() =>
-                FactoryRunner.CreateKanbanSource(Options(new() { ["Kanban:Token"] = FakeKanbanBoard.ReadToken }), board.Client()));
+                WorkSourceRegistry.Kanban(Options(new() { ["Kanban:Token"] = FakeKanbanBoard.ReadToken }), board.Client()));
             Assert.Contains("Kanban:WriteToken", missing.Message);
         }
     }
@@ -328,12 +328,14 @@ public class KanbanWriteIsolationTests
             .Where(f => f.Value.Replace("SecretAccounts.KanbanWriteToken", "", StringComparison.Ordinal).Contains(text, StringComparison.Ordinal))
             .Select(f => f.Key).Order().ToList();
 
-        // The token is read from the options in one place, and the client that holds it is built in one place: the work source's factory.
-        Assert.Equal(["FactoryRunner.cs"], Naming(".KanbanWriteToken"));
-        Assert.Equal(["FactoryRunner.cs"], Naming("KanbanWrites.Client("));
+        // The token is read from the options in one place, and the client that holds it is built in one place: the work source's
+        // factory, in the registry of work sources (sc-25982).
+        const string registry = "WorkSources/WorkSourceRegistry.cs";
+        Assert.Equal([registry], Naming(".KanbanWriteToken"));
+        Assert.Equal([registry], Naming("KanbanWrites.Client("));
         // The typed caller is made there and nowhere else, and nothing that serves a model session names it or the work source.
-        Assert.Equal(["FactoryRunner.cs"], Naming("new Kanban.KanbanBoard("));
-        Assert.Empty(Naming("new KanbanBoard("));
+        Assert.Equal([registry], Naming("new KanbanBoard("));
+        Assert.Empty(Naming("new Kanban.KanbanBoard("));
         foreach (var folder in new[] { "Mcp/", "Gate/", "Plans/", "Issues/", "Worker/", "CodeGraph/", "Sessions/", "Dashboard/" })
         {
             Assert.DoesNotContain(files, f => f.Key.StartsWith(folder, StringComparison.Ordinal)
