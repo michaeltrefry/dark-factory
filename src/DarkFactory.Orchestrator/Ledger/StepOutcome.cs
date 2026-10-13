@@ -46,7 +46,8 @@ public enum StepOutcome
 /// <c>github-refused</c> → failed; <c>routed-to-human</c> (a triage routed an issue to a human) → escalated; <c>escalation-comment</c> posted → passed, else failed; <c>pr-report</c> or <c>closeout</c> failed → failed; <c>approval-ignored</c>, <c>plan-rejected</c> (the planner's answer broke a rule, sc-25870) → gate_rejected;
 /// <c>ci-triggers</c> (sc-25873: whether the repository's CI can report on a plan's story pull requests) blocked — no workflow can run, the
 /// plan is stopped — → gate_rejected, a warning — it could not be told — → failed (the check could not produce an answer; planning goes on);
-/// <c>usage-pause</c>, <c>parked</c>, <c>plan-held</c> (a plan's stories wait on a blocker outside the plan, sc-25871, or behind a failed
+/// <c>usage-pause</c>, <c>parked</c> (also on an item paused because another caller took its claim, sc-25983: its Paused row,
+/// <c>claim lost: …</c>, is deferred like every pause), <c>plan-held</c> (a plan's stories wait on a blocker outside the plan, sc-25871, or behind a failed
 /// story of it, sc-25876), <c>plan-stuck</c> (every remaining story of a plan failed or is blocked behind one) → deferred — the plan item
 /// itself never escalates for a story's failure, which that story's own Escalated row already records; <c>plan-delivery</c> (sc-25873:
 /// which of a plan's changesets are on their default branch when it escalates or is stopped — a record, judged by nothing) → deferred;

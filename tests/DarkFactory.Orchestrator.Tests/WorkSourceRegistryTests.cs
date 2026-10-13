@@ -89,6 +89,13 @@ public class WorkSourceRegistryTests
                 return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), source.Naming, ct, b.Controls, RunPipeline.ImplementStates);
             }
 
+            /// <summary>The claims a poll keeps (sc-25983), as <c>FactoryItemRunner</c> lists them: this source's, over the production states.</summary>
+            public async Task<IReadOnlyList<int>> RenewableAsync(CancellationToken ct)
+            {
+                await using var db = b.Kanban.Db();
+                return await RunPipeline.RenewableAsync(new WorkLedger(db, TimeProvider.System), source.Naming, ct, b.Controls);
+            }
+
             public async Task<RunOutcome> RunAsync(int id, CancellationToken ct)
             {
                 await using var db = b.Kanban.Db();
@@ -479,6 +486,35 @@ public class WorkSourceRegistryTests
         Assert.Equal(WorkState.Cancelled, (await b.Item("kb-1"))!.State);
         Assert.Equal(("Backlog", null), (item.Status, item.Claim?.Marker));
         Assert.DoesNotContain(b.Kanban.Board.Calls, c => c.Tool is "list_projects" or "list_work_items");
+    }
+
+    [Fact]
+    public async Task A_poll_renews_the_claim_of_an_in_flight_item_on_the_lane_of_a_source_that_is_no_longer_watched()
+    {
+        var b = new Boards();
+        var item = b.Kanban.Board.AddItem(b.Kanban.Project, "Count words");
+        using (var watched = b.Registry(Options(Core, Kanban)))
+        {
+            await b.Loop(watched).PollOnceAsync(None);
+        }
+        Assert.Equal((WorkState.Review, "InProgress"), ((await b.Item("kb-1"))!.State, item.Status));
+
+        // The watched projects are cleared with kb-1 in flight (the token stays): its claim is still renewed (sc-25983), by the
+        // lane the registry builds for a source that only has its credential — and nothing is listed.
+        b.Kanban.Board.Calls.Clear();
+        using (var cleared = b.Registry(Options(Core, Shortcut, KanbanToken)))
+        {
+            await b.Loop(cleared).PollOnceAsync(None);
+        }
+        Assert.Equal(["renew_work_item_claim"], b.Kanban.Board.Calls.Select(c => c.Tool));
+        Assert.Equal(KanbanWorkSource.Marker(item.Id), item.Claim!.Value.Marker);
+
+        // Without the token there is no lane, so nothing renews it (the start-up warning says so).
+        b.Kanban.Board.Calls.Clear();
+        using var tokenless = b.Registry(Options(Core, Shortcut));
+        await b.Loop(tokenless).PollOnceAsync(None);
+        Assert.Empty(b.Kanban.Board.Calls);
+        Assert.Single(await tokenless.UnreachableAsync(None));
     }
 
     [Fact]

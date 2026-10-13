@@ -66,6 +66,26 @@ public sealed record ClaimResult(bool Claimed, string? Refusal)
 }
 
 /// <summary>
+/// The result of <see cref="IWorkSource.RenewClaimAsync"/>. <see cref="Held"/> (both reasons null): nothing shows anyone else
+/// holds the item — its claim was renewed, or taken again, or there was nothing to renew. <see cref="Lost"/>: why the factory no
+/// longer holds it, in words that name whoever holds it now. <see cref="NotRenewed"/>: the board answered and refused this
+/// renewal for a reason that says nothing about who holds the item (the call's or the item's own: a revoked token, an item the
+/// source does not know) — the claim is neither confirmed nor lost. A board that does not answer at all (down, hanging,
+/// overloaded) is not a result: the source throws.
+/// </summary>
+public sealed record ClaimRenewal(string? Lost, string? NotRenewed = null)
+{
+    public static readonly ClaimRenewal Held = new((string?)null);
+
+    /// <summary>Whether nothing stands in the way of working the item: neither lost nor refused.</summary>
+    public bool IsHeld => Lost is null && NotRenewed is null;
+
+    public static ClaimRenewal LostBecause(string reason) => new(reason);
+
+    public static ClaimRenewal NotRenewedBecause(string reason) => new(null, reason);
+}
+
+/// <summary>
 /// The work source will not create children under this parent and has written nothing (<see cref="IWorkSource.CreateChildrenAsync"/>):
 /// the message says why, in words the item's owner can act on.
 /// </summary>
@@ -140,6 +160,19 @@ public interface IWorkSource
     /// claim back and refuses if it did not stick.
     /// </summary>
     Task<ClaimResult> ClaimAsync(int id, bool ignoreScope, CancellationToken ct);
+
+    /// <summary>
+    /// Keeps the factory's claim on an item it is working (sc-25983), for a source whose claims expire unless renewed: asked once
+    /// per intake poll for every item of the source the ledger would resume by itself (<see cref="IItemRunner.RenewableAsync"/>,
+    /// <see cref="IntakeLoop"/>), and by a run before it resumes an item that was paused because its claim was lost.
+    /// <see cref="ClaimRenewal.Held"/> when nothing shows anyone else holds the item (renewed, or taken again after it lapsed with
+    /// nobody else holding it); <see cref="ClaimRenewal.Lost"/> — naming who holds the item — when another caller has it, which
+    /// pauses the item (<see cref="IItemRunner.ClaimLostAsync"/>); <see cref="ClaimRenewal.NotRenewed"/> when the board answered
+    /// with a refusal that is this call's or this item's own. It throws only when the board does not answer (down, hanging,
+    /// overloaded): the poll then asks it nothing more for the source's other items. Optional: a source whose claims do not expire
+    /// (Shortcut's owner and label, a GitHub issue's assignment) has nothing to renew and always holds (the default).
+    /// </summary>
+    Task<ClaimRenewal> RenewClaimAsync(int id, CancellationToken ct) => Task.FromResult(ClaimRenewal.Held);
 
     /// <summary>Whether the item is (still) inside the configured watch scope.</summary>
     Task<bool> InScopeAsync(int id, CancellationToken ct);

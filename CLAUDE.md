@@ -133,6 +133,12 @@ Claude Code headless workers through the Weave router.
   `factory run kb-N` on a Ready item of a watched KanbanBoard project — its key given once, the item claimed on the real board
   (the factory's marker, read back) and moved out of Ready, the pull request opened from `factory/kb-N` and it and the branch
   linked on the item under their kinds; a second run writes neither claim nor link again. Checked up to "pull request opened".
+  P4b-AT3 (sc-25983, `KanbanAcceptanceTests.P4b_AT3_…`, `FACTORY_E2E_P4B_KANBAN_PROJECT` + `FACTORY_E2E_P4B_KANBAN_OTHER_TOKEN`,
+  a second identity's full-scope token; no model): on a throwaway Backlog item the test creates (once, by its idempotency key),
+  in flight only in the throwaway ledger — a second caller's claim on the item the factory holds is refused; one intake poll
+  renews the claim past its first (20 s) expiry; a write on a stale version is refused `conflict` and writes nothing; and once
+  the second caller holds the item the next poll pauses it (``claim lost: … claimed by `<them>` ``, `parked`), their claim, column
+  and version untouched.
 
 ## Commands
 
@@ -335,8 +341,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
 - KanbanBoard items (Phase 4b, sc-25981, sc-25982; `Kanban/`): a third work source behind `IWorkSource`. Polled by `factory work`
   when `Kanban:Watch:Projects` is set (the registry above), run by `factory run kb-<n>`, and paused, continued and stopped by id
   like any item (Stop: pull request to draft, item back to `Backlog` with a comment, the factory's claim released, Cancelled).
-  Not yet: claim renewal on each poll, `busy` retries and conflict handling (K3), plans (K4), epic-scope controls and the
-  dashboard's Kanban rows (K5). `factory kanban key <GUID>` stays: the intake loop gives every item it LISTS its key, but
+  The intake loop's claim renewal (sc-25983, below) asks every lane the registry builds — a watched source's and the lane of a
+  source that only has its credential alike (`WorkSourceRegistry.Lanes`) — so a Kanban item in flight keeps its claim after
+  `Kanban:Watch:Projects` is cleared, for as long as the write token is set; with no token there is no lane, nothing renews it,
+  and the start-up warning says so. Not yet: plans (K4), epic-scope controls and the dashboard's Kanban rows (K5). `factory kanban key <GUID>` stays: the intake loop gives every item it LISTS its key, but
   `factory run kb-<n>` on an item no poll has listed — `factory work` not running, the item outside the watched projects (run
   with `--ignore-scope`), or not `Ready` yet — still needs the key from somewhere. Contract: KanbanBoard's
   `docs/mcp-contract.md` (tool and argument names are compared exactly there, and an argument a tool does not have is refused).
@@ -359,7 +367,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   forwarded, and a source scan (the token read, the client and the caller built only in `WorkSources/WorkSourceRegistry.cs`; nothing
   under `Mcp/`, `Gate/`, `Plans/`, `Issues/`, `Worker/`, `CodeGraph/`, `Sessions/`, `Dashboard/` naming them). Every write is
   conditional or idempotent (E3): a status change is `update_work_item(itemId, status, expected_version)` on the version just read
-  (it puts the item at the end of the column and changes nothing else), a comment carries its `idempotency_key`, and claim, release
+  (it puts the item at the end of the column and changes nothing else), a comment carries its `idempotency_key`, and claim, renew, release
   and link are idempotent on the board (`add_work_item_link` of a kind and URL the item carries changes nothing).
   Ready = `list_work_items(projectId, status: Ready, unblocked_only, claim_state: unclaimed, limit, include_comments: false)` per
   watched project, paged by cursor (at most `KanbanWorkSource.MaxPages`, 50, pages of `KanbanWorkSource.DefaultPageSize`, 50 — the
@@ -367,7 +375,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `MaxAnswerBytes`; so at most 2,500 ready items of one project, more is refused), each listed item
   checked again (project, status, no claim, no open blocker). `ClaimAsync` re-reads the item and refuses, writing nothing: a key
   the ledger never gave out, an item gone from the board, a project outside `Kanban:Watch:Projects` (skipped by
-  `--ignore-scope`), another caller's claim (`the item is claimed by <claimant>`), a status that is not `Ready` (or `InProgress`
+  `--ignore-scope`), another caller's claim (``the item is claimed by `<claimant>` ``: a claimant's name and a marker are another
+  caller's text, so wherever a refusal or a lost claim names them each is cut at 200 characters and made one inert code span,
+  `UntrustedText.CodeSpan`), a status that is not `Ready` (or `InProgress`
   and the factory's, next), and an open blocker (only `Done` finishes one; a `Closed` blocker still blocks). An `InProgress` item
   is the factory's when it carries the factory's live marker, or — a lapsed claim — when it carries no claim at all and the ledger
   records that this factory claimed it (`KanbanKeys.ClaimedAsync`: a `claimed` checkpoint on `kb-<n>`, at any time): it is then
@@ -378,15 +388,93 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   always refused. Residual, accepted: once a claim has lapsed the board shows no one on the item, so a person who took an
   escalated item over without claiming it or moving it loses it to a later `factory run kb-<n>` of it. Then
   `claim_work_item(id, marker, ttl_seconds)` — `already_claimed` (another caller won the race, or holds the same marker under
-  another identity) is a refusal too —, the claim read back (`claim_marker` and `claimant_id`), and the move to `InProgress`; an
-  item someone moved away meanwhile gets the claim released again and a refusal. Claims are KanbanBoard's own, advisory and
-  expiring: nothing renews one yet, so the factory claims for the maximum, a day (`ClaimTtlSeconds`), and a run longer than that
-  goes on with a lapsed claim (the item stays `InProgress`; only a later `ClaimAsync` takes the claim again). `ReportStateAsync`:
+  another identity) is a refusal too, naming the claimant (the item is read once more for the name) —, the claim read back
+  (`claim_marker` and `claimant_id`), and the move to `InProgress`; an item someone moved away meanwhile gets the claim released
+  again and a refusal, and a move that keeps conflicting past `MaxConflictRereads` gets the claim released again before the
+  conflict is thrown (a claim left on a still-`Ready` item would hide it from every ready listing for a day). `ReportStateAsync`:
   Claimed → `InProgress`, Merged → `Done`, Stopped → `Backlog` with the factory's claim released and the comment posted; an item
   already in the target column is not written. `LinkAsync` attaches each URL under its kind from the URL (`…/pull/<n>` `pr`,
-  `…/tree/<branch>` `branch`, else `other`). Not handled yet: a `busy` answer is not retried and a `conflict` (stale
-  `expected_version`) not re-read — the call throws `KanbanException` (the contract's code) and the run fails that step —, and
-  plans (`PlansItems` false, no children).
+  `…/tree/<branch>` `branch`, else `other`). Not handled yet: plans (`PlansItems` false, no children).
+  Safe writes (sc-25983, E3; `KanbanBoard`, the typed caller, so every write has them). Typed refusals: a refused call's
+  `{code, message}` is a `KanbanException` with the contract's code (`KanbanException.Codes`: `scope_denied`, `not_found`,
+  `conflict`, `already_claimed`, `cycle`, `invalid_argument`, `busy`; `Refused` true: it changed nothing — true only for those
+  seven: an error object carrying any other code promises nothing and is handled as an error that may have written, below);
+  only `busy` is ever sent again. Busy: the same call — the same arguments, so the same idempotency key and expected version — at most
+  `KanbanBoard.MaxBusyRetries` (4) more times, after `BusyBackoff` (1 s, 2 s, 4 s, 8 s; the board answers `busy` only after
+  waiting 10 s itself), then `busy` is thrown and the run fails that step. Read before repeat: an error that is no typed refusal
+  (a plain MCP error without `{code, message}`, one with a code the contract does not name, an HTTP error, a timeout, an answer
+  that is not the contract's JSON —
+  `MayHaveWritten`; never the caller's own cancellation) may have written, so a write without an idempotency key reads the item
+  (`get_work_item`) before it is sent again, and is sent again at most once (`MaxRepeatsAfterLostAnswer`); a read that fails is
+  thrown, never a blind repeat. What the read decides, per write: a status change is done when the version moved and the item is
+  in the target column (else it is repeated on the same `expected_version`, which the board refuses `conflict` if anyone wrote
+  in between); a link when the item carries that kind and URL; a release when the item no longer carries the marker (the board
+  would refuse a release that happened); a claim and a renewal are read and then sent again whatever the read shows (the same
+  caller's claim is idempotent by the contract, and only its own answer tells this identity's claim from another's under the
+  same marker). A write that carries an idempotency key — a comment, and `KanbanBoard.CreateItemAsync` (`create_work_item`,
+  key required; the typed caller's create, which plans will use: `KanbanWorkSource` still creates no children) — is sent again
+  with the same key and no read: the board answers the object the key already made (`comment_created`/`created` false).
+  Status changes stay `update_work_item(itemId, status, expected_version)`, not `move_work_item`: a status change has no
+  position to ask for, `update_work_item` puts the item at the end of its new column by itself, while `move_work_item` takes an
+  `order` (left out: 0, the top of the column, ahead of everything waiting there) and renumbers the column's other items; both
+  check `expected_version` alike. Conflicts (`KanbanWorkSource.MoveAsync`): the board's claims are advisory (an update or move
+  by anyone ignores them), so a `conflict` on a status change means someone else wrote the item since it was read. It is never
+  written over: the item is read again and the move decided again, at most `MaxConflictRereads` (3) times, then the conflict is
+  thrown (by `ClaimAsync` after it gave its claim back). Still in the column the move was decided from (they edited something else): the move is made on the new version and
+  their edit is kept (only the status is ever sent). In another column (they moved it): their column stands and no move is made
+  — `ClaimAsync` gives the claim back and refuses (`the item was moved to <status> while it was being claimed`), and
+  `ReportStateAsync` says so on the item (`KanbanWorkSource.NotMoved`, after the caller's comment when there is one; a stop still
+  releases the claim). A later report (a re-run) decides afresh on what it then reads.
+  Claims (sc-25983): KanbanBoard's own, advisory and expiring. Taken for the maximum lifetime, a day (`ClaimTtlSeconds`), and
+  renewed on each intake poll through the optional `IWorkSource.RenewClaimAsync` (default: `Held`, no call — Shortcut's and
+  GitHub issues' claims do not expire). Which items (`IItemRunner.RenewableAsync` → `RunPipeline.RenewableAsync`; the
+  interface's default is `InFlightAsync`, for a runner with no controls): every item the ledger would resume by itself — in a
+  handled state, or Paused from one in a way that resumes by itself (`interrupted`, `user-paused`, `usage-paused`,
+  `freeze-paused`, `controls-unreadable`) — WHATEVER the factory, epic, item, usage and freeze controls say now, so a Pause, a
+  usage pause or a freeze of any length (a freeze lasts until a human's Continue) costs no item its claim. NOT renewed: an item
+  being stopped (its stop releases the claim), a parked one (a refused claim, a lost claim, a give-up), an Escalated one, a plan
+  waiting on its stories, a merged or terminal one. The controls are read there only to leave out an item being stopped; when
+  they cannot be read the item is renewed all the same (the list throws only when the ledger itself cannot be read). The
+  renewal list runs nothing: what a poll runs is still `InFlightAsync`'s list (which leaves out what a control pauses), read
+  after the renewals. `IntakeLoop.RenewClaimsAsync` asks per lane, whatever the lane's source, before anything is listed ready
+  or run. A `ClaimRenewal` is `Held`, `Lost` (why, naming the holder) or `NotRenewed` (why: the board answered with a refusal
+  that is the call's or the item's own — the Kanban source: any typed refusal but `busy`, e.g. `scope_denied`, and a key the
+  ledger never gave out — logged, and the next item is asked). A renewal that THROWS (the board down or hanging, `busy` past
+  its retries, a lost answer: each further call could wait out its whole timeout, inline in the poll) ends that lane's renewals
+  for this poll — the rest are tried next poll — and holds up no other lane and no run. The Kanban source sends
+  `renew_work_item_claim(id, marker, 86400)`; refused (`conflict`: lapsed or released; `already_claimed`), it reads the item.
+  Under another marker it is lost, the reason naming the holder (``the item is claimed by `<claimant>` (marker `<marker>`)``,
+  both cut and inert as above; an item gone from the board is lost too). With no claim, or reading as carrying the factory's
+  marker, it is claimed again ONLY when it is `InProgress` and the ledger records that this factory claimed it
+  (`KanbanKeys.ClaimedAsync`: `ClaimAsync`'s own rule for an unclaimed item; a claim the board then refuses is lost to whoever
+  holds it). Otherwise nothing is written and the answer is `Held`: an item in flight at Intake whose run died before its
+  `claimed` checkpoint is left to its run's `ClaimAsync` (which still refuses an unclaimed `InProgress` item, `LapsedRefusal` —
+  a renewal never takes what `ClaimAsync` would refuse), and an item a person moved out of `InProgress` gets no stray claim that
+  would hide it from `claim_state: unclaimed`. A lost claim pauses the item
+  (`IItemRunner.ClaimLostAsync` → `RunPipeline.ClaimLostAsync`, under the item's run lock): Paused `claim lost: <reason>` from a
+  handled state (an item already paused in a way that resumes by itself stays Paused), one comment on the item saying who holds
+  it and what resumes it, then `parked` with the same reason — the comment is posted before the `parked` row, whose Detail ends
+  `; comment NOT posted: <error>` when the board would not take it (the item is never listed again, so nothing would post it
+  later) — and the dashboard's intake row; the item is left out of that poll's runs. Deliberately not one of the pauses that
+  resume by themselves: someone else is working the item, so nothing lists, renews or runs it again until a person's
+  `factory run kb-<n>` or `factory stop --item kb-<n>`. That run resumes it only once the item is the factory's again: for an
+  item paused for a lost claim (`RunPipeline.ParkedForLostClaim`: its Paused row, or a `parked` row after it, says
+  `claim lost`) the run asks `IWorkSource.RenewClaimAsync` before it records `unpaused` (through `IWorkSource`, so for any
+  source; the Kanban source takes a released or lapsed claim back by the rule above). `Lost` or `NotRenewed`: the item stays
+  Paused, no ledger row and nothing written to the board, and the run's error says who holds it and to run again once the other
+  claim is released or has lapsed. `Held`: `unpaused`, and on from where it paused. Typed outcome `deferred`, by the rule for every
+  pause and every `parked` row (`StepOutcomes`). Nothing is paused when the item's run is active (its run lock is held — that
+  run goes on, claims being advisory, and the next poll finds the claim lost again), when it is being stopped (the stop gives it
+  back), or when it is a plan waiting on its stories or a merged item. An item that is not renewed (parked, escalated) loses its
+  claim a day after its last renewal, and from then on
+  only its `InProgress` column keeps it out of the ready list — the factory's own (`ListReadyAsync` asks for `Ready` only) and
+  any other caller's that polls as the contract says; the board shows it unclaimed, so another caller that claims `InProgress`
+  items can take it (the residual above). Re-run (`factory run kb-<n>`), its lapsed claim is taken again by `ClaimAsync` (an
+  escalated item re-enters Intake) or by the resume's renewal (a claim-lost item); if someone holds it by then, that is a
+  refused claim or a claim still lost, as above. A single run that holds the
+  intake loop for more than a day (no poll in between), and `factory work` being down that long, also leave a lapsed claim until
+  the next poll, whose renewal takes it again if nobody else has. `factory run`
+  alone renews nothing: only `factory work` polls.
   Repository: the item's project's `repository_url` (`GitRemoteReads.RepoOf`: the https and ssh forms of a github.com
   repository, with or without `.git`), overridden by a `Repo: owner/name` line in the item's description — `ReadSpecAsync` leads
   the description with a code-written `Repo:` line when the item has none, which is how every source tells the pipeline where an
@@ -472,7 +560,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   scripts/setup-worker-user.sh`"; not checked with `Worker:RunAs=none`; outside the triage
   worktree, so the confined session cannot Read it into its transcript) after checkout and before launch, and when the session
   ends deletes it and revokes the credential (`McpProxyGrant.Dispose`: refused from then on); leftover files are swept before
-  each triage. Residual, accepted: while the session runs, a process that can read that file — the owner, root, or another
+  each triage (a live run's are kept, sc-25987: "Clean-up under overlapping runs"). Residual, accepted: while the session runs, a process that can read that file — the owner, root, or another
   `_factory` process (none runs then: the triage holds the worker run lock) — could call the session's granted tools through
   the proxy. Upstream tokens are only in the owner process (never in the worker's env, argv, worktree, prompt or transcript;
   `McpProxyTests`). Every MCP tool use still taints the session (`mcp:<tool>`; triage is already tainted by the issue text and
@@ -1253,6 +1341,67 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   changeset is on the default branch.
 - One run per item: `RunPipeline` holds a Postgres advisory lock on the item id (`PostgresRunLocks`) for the whole
   run, and `WorkItem.Version` is an optimistic concurrency token, so a stale writer's save throws.
+- Clean-up under overlapping runs (Phase 4b, sc-25987; `Ledger/LiveRuns.cs`, `Git/CloneLock.cs`; the factory is still
+  single-worker — `WorkerLock` is unchanged — so today this changes no behaviour): no sweep decides from "no other run exists".
+  Whose a leftover is: it carries its item in its name — a worktree directory by `ItemNaming.OwnerOfLeftover` (`factory-<item>`,
+  the changeset worktree `factory-changeset-<item>`, a triage's `factory-triage-<item>`, a planner's worktree or seat
+  `factory-plan-<item>`, the gate's test worktrees `gate-<item>[-base|-head|-base-retry[-N]]`; the merge queue's base-update
+  worktree is the item's own `factory-<item>`), an MCP session file by `ItemNaming.OwnerOfSessionFile` (`<item>.<guid>.json`:
+  `McpProxySessions` is given its `owner`, the item whose run opens the sessions) — and it is a live run's exactly while that
+  item's run lock is held. Each sweep asks `LiveRuns.TryClaimAsync(owner)`: null (another run holds the item's lock) → nothing
+  of it is touched; otherwise a `LeftoverClaim`, for another item that item's run lock itself, held until the deletion (the
+  directory and the clone's `worktree prune`) is done, so no run of it starts in between. A name of no item, an item the ledger
+  never saw (nothing can run it; so also a session file written before files were named) and the asking session's own item
+  (`self`: its run already holds that lock, and what an earlier, dead run of it left is its to delete) are claimed without a
+  lock. The three sweeps: the start-of-run worktree sweep (`FactoryRunner.RunAsync` → `GitWorkspace.SweepOrphansAsync(keep,
+  live, ct)`: the ledger's rule `RunPipeline.WorktreeIsResumableAsync` is asked first and a kept worktree takes no lock; one it
+  would delete is claimed, the rule asked again under the lock — the item's run may have ended as the lock was taken — and only
+  then deleted; no `self`, since the pipeline has not taken its item's lock yet), the triage's and the planner's seat sweeps
+  (`SandboxTriageRunner`, `SandboxPlanRunner`: nothing is resumed, `self` = the session's item, `SandboxTriageRunner.Leftovers`)
+  and the MCP session-file sweep (`McpProxySessions.SweepAsync(directory, live, ct)`, by both). A single run sweeps exactly what
+  it did before, in the same places: with no other run every lock is free. A swept item's run lock is held only for the
+  deletion, so a `factory stop` of that item landing in that moment answers "is running" and is finished by the next poll.
+  The shared clone: `<WorkRoot>/repos/<owner>/<name>` has one writer at a time, `CloneLock` — a lock file
+  `<WorkRoot>/clone-locks/<owner>/<name>.lock` held exclusively while open (between processes too; the OS frees it if its holder
+  dies), waited for with a 50 ms retry until the caller's token is cancelled. A wait is never silent (clean-up waits with no
+  cancellation): once it has lasted `CloneLock.ReportEvery` (30 s), and every 30 s after, a line goes to standard error —
+  `[clone-lock] waited N s for <lock file> and still waiting (…): <why the last try failed>` (`CloneLock.WaitReport`) — so a
+  stuck holder, or an I/O error on the lock file that does not go away (.NET reports both alike, so both are retried), shows.
+  `GitWorkspace` holds it around every git
+  operation that changes the clone's refs or worktree list, together with the ref reads that depend on what it just wrote:
+  clone/fetch/`remote set-head` through the start-point read, the prune of the replaced worktree's registration and `worktree
+  add` in one hold (`ReplaceWorktreeAsync`: `PrepareAsync`, `RestoreAsync`, each checkout of `PrepareSeatAsync`, and
+  `PrepareCommitAsync`, which fetches nothing), `BranchStartAsync`, `CreateBranchAsync` with its push, every other `worktree
+  prune` (`RemoveAsync`, `RemoveSeatAsync`, the sweeps), `CommitAndPushAsync`'s commit and push (not its `add -A`),
+  `MergeBaseAsync`'s merge, `PushAsync`, and the fetch of
+  `ChangedFilesAsync` and of a reviewer's read of a commit the clone lacks. What is slow and needs no lock is done before it
+  is taken, never under it: a worktree directory is always deleted first (sandboxed, that is a run of the launch helper; also
+  the directory a fresh worktree replaces, and what a failed `worktree add` left, deleted once the lock is released — the
+  directory is its item's, which only that item's run or a sweep under its run lock touches, so nothing else can act on it
+  half deleted; its stale registration is pruned under the lock), and the installation token of a fetch or push is minted
+  first (a GitHub call) and passed in — still one fresh token per operation, never cached (`CreateBranchAsync` uses one for
+  its fetch and its push), none without a `PushGrant`, and none when `CommitAndPushAsync` finds nothing to commit and nothing
+  ahead of the base (read before the lock). A token minted before a wait of an hour would have expired; the push then fails
+  and the run with it. No git call leaves a process behind to write the clone outside the lock: `OwnerGit` sets
+  `gc.autoDetach=false` and `maintenance.autoDetach=false`, so the automatic maintenance that ends a `fetch`, `commit` or
+  `merge` (`gc --auto`: `pack-refs`, `worktree prune`) runs inside the call, under the lock, not detached.
+  The lock is an advisory `flock`, which any process that can open the file — read-only is enough — can take, and the work
+  root's inheritable ACL entry lets the worker user read everything made under it. So, sandboxed, a `GitWorkspace` closes
+  `<WorkRoot>/clone-locks` to the worker user before it takes its first lock (`IWorkerSandbox.CloseToWorkerAsync`, owner-side,
+  no root and no change to the set-up script or the launch helper: `/bin/chmod -N` removes every ACL entry of the directory,
+  the inherited one included, so nothing made in it later inherits one; mode `0700`; then `/bin/ls -led` must show
+  `drwx------` and no ACL entry at all, `WorkerSandbox.IsClosed`) — code a worker runs (`dotnet test`, `cargo test`) cannot
+  open a lock file, so it cannot hold a clone's lock against other runs. Fail closed: a directory that cannot be closed or
+  does not read back closed is a broken set-up, `FactoryUnavailableException` (`the clone locks: …`, factory-wide: no lock is
+  taken, no git runs, nothing is recorded against the item). Each `GitWorkspace` (each run) closes and checks it once; with
+  `Worker:RunAs=none` there is no worker user and nothing is closed. Reads by object take no lock (a commit's tree, files,
+  diff and grep, `ReopenAsync`, `HeadAsync`, `OverlayAsync`, which writes only its worktree's index and files). Private
+  `…LockedAsync` helpers expect the lock; it is never taken twice by one call chain (a second open would wait for ever). The
+  lock is per clone path, so on a case-insensitive volume two spellings of one repository share it, as they share the clone.
+  Two seats at once each hold a checkout at `…/<owner>/<name>`, so git numbers the second one's admin dir (`widgets1`):
+  `AdminDirAsync` finds a worktree's admin dir by its `gitdir` file, not only by name. Not changed here (later Phase 4b
+  stories): the worker run lock's scope, the intake loop's dispatch, the sandbox user (`DeleteAsWorkerAsync` and every helper
+  exit still kill every `_factory` process) and settings.
 - Workers lead their own process group (launched via `/usr/bin/perl` `setpgrp` + `exec`); the pid is checkpointed
   (`worker-started`) as soon as the process exists, and a resumed Implement stops a still-running orphan's group
   (`ClaudeWorker.StopOrphanAsync`, only if it is still a group leader running `Worker:ClaudePath`) before going on.
@@ -1388,12 +1537,14 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `--git-dir`/`--work-tree`, with the admin dir found from the clone's side (never the worker-writable `.git`
   file, also on resume), and every owner-side git call (all go through `GitWorkspace`) is isolated from the
   owner's own git config by `Git/OwnerGit.cs` (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_LFS_SKIP_SMUDGE=1`;
-  `-c core.hooksPath=/dev/null`, `core.fsmonitor=false`, `rerere.enabled=false`, LFS filters emptied), so no hook, filter or
+  `-c core.hooksPath=/dev/null`, `core.fsmonitor=false`, `rerere.enabled=false`, LFS filters emptied, `gc.autoDetach=false` and
+  `maintenance.autoDetach=false` — no detached maintenance outside the clone's lock, sc-25987), so no hook, filter or
   merge driver a PR's files or `.gitattributes` select runs as the owner; worktrees live under the owner-owned work root (root-owned parent), are shared with
   `_factory` by an inheritable ACL set on the empty directory before checkout (never `chmod -R`, which follows
   symlinks), and are deleted (as `_factory` first) once the PR is open or the item escalates. Only a paused or
   crashed Implement or fix round keeps its worktree for resume; a worker that won't stop marks its exception
-  (`WorkerStillRunning`) so nothing deletes under it. Each run sweeps worktrees no run will resume.
+  (`WorkerStillRunning`) so nothing deletes under it. Each run sweeps worktrees no run will resume, never one a
+  live run owns (sc-25987, above).
   The App private key never reaches a worker's env, argv or worktree (`ClaudeWorkerTests`).
 - Every worker stdout line is a `session_events` row (E7): `ClaudeWorker` taps each line (`WorkerCallbacks.OnLine`) into a
   bounded channel that `SessionRecorder` drains into Postgres in order (gapless `Sequence`, non-JSON lines kept as `raw`);

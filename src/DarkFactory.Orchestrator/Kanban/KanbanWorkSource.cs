@@ -14,18 +14,37 @@ namespace DarkFactory.Orchestrator.Kanban;
 /// Writes (E3, E4): the claim is KanbanBoard's own (<c>claim_work_item</c>, advisory and expiring) under a marker derived from the
 /// item's board id (<see cref="Marker"/>); a status change is conditional on the version just read; a comment carries an
 /// idempotency key derived from the item's board id, its version and the text (<see cref="CommentKey"/>); a link the item already
-/// carries changes nothing. No key written onto the board derives from a ledger key. What this source does not do yet: renew a
-/// claim (it claims for <see cref="ClaimTtlSeconds"/>; one that lapsed on an item the ledger records as claimed by this factory
-/// is taken again by <see cref="ClaimAsync"/>), retry a <c>busy</c> answer or re-read after a <c>conflict</c> (the call
-/// throws <see cref="KanbanException"/> and the run fails that step), and plans (it creates no children).
+/// carries changes nothing. No key written onto the board derives from a ledger key. A <c>busy</c> answer is retried and a
+/// write whose answer was lost is read before it is repeated by the typed caller (<see cref="KanbanBoard"/>, sc-25983).
+/// Conflicts (sc-25983): the board's claims are advisory — an update or a move does not look at them — so every status change is
+/// conditional on the version read, and a <c>conflict</c> means someone else wrote the item in between: it is read again and the
+/// move decided again (<see cref="MoveAsync"/>), never written over. Their edit of another field is kept and the move is made on
+/// the new version; a status THEY gave the item stands, the factory's move is not made, and the caller says so (a refused claim,
+/// or a comment on the item: <see cref="NotMoved"/>).
+/// Claims expire (sc-25983): a claim is taken for <see cref="ClaimTtlSeconds"/>, the longest the board allows, and renewed on
+/// each intake poll (<see cref="RenewClaimAsync"/>) for every item the ledger would resume by itself — one in a state the
+/// pipeline drives, or paused in a way that resumes by itself — whatever a Pause, the usage pause or the freeze says now
+/// (<c>RunPipeline.RenewableAsync</c>): a pause of any length does not cost the item its claim. An item that is parked,
+/// escalated or being stopped is not renewed: its claim lapses after a day and what keeps it out of everyone's ready list is its
+/// <c>InProgress</c> column alone (this source lists only <c>Ready</c> items, and so does the contract's "polling for ready
+/// work"); a lapsed claim of an <c>InProgress</c> item the ledger records as claimed by this factory is taken again, by a
+/// renewal or by <see cref="ClaimAsync"/> on a re-run. What this source does not do yet: plans (it creates no children).
 /// </summary>
 public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanScope scope, Uri webUrl) : IWorkSource
 {
     /// <summary>
-    /// How long a claim lasts: the longest KanbanBoard allows (a day), since nothing renews it yet. An item whose run died
-    /// between the claim and the move to <c>InProgress</c> stays claimed that long.
+    /// How long a claim lasts unless renewed: the longest KanbanBoard allows (a day). <c>factory work</c> polls every
+    /// <c>Intake:PollSeconds</c> and renews then (<see cref="RenewClaimAsync"/>), so a claim lapses only on an item that is
+    /// parked or escalated, or whose single run holds the intake loop, for a whole day. An item whose run died between the claim and the
+    /// move to <c>InProgress</c> stays claimed that long.
     /// </summary>
     public const int ClaimTtlSeconds = 86400;
+
+    /// <summary>
+    /// How often one move is decided again after a <c>conflict</c> (the item read again each time) before the conflict is thrown:
+    /// someone who edits the item between every read and write is not waited out.
+    /// </summary>
+    public const int MaxConflictRereads = 3;
 
     /// <summary>The most pages of one project's ready items read in one listing (a board that answers a cursor forever is refused).</summary>
     public const int MaxPages = 50;
@@ -137,9 +156,10 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
     /// the watched projects (unless <paramref name="ignoreScope"/>), one another caller holds, one that is not <c>Ready</c> (or
     /// already the factory's and <c>InProgress</c>), and one a blocker still blocks. Else it claims the item
     /// (<c>claim_work_item</c>; another caller winning the race is a refusal too), reads the claim back, and moves the item to
-    /// <c>InProgress</c>, on the version just read.
+    /// <c>InProgress</c>, on the version just read (a <c>conflict</c> there: <see cref="MoveAsync"/>; an item someone moved out
+    /// of <c>Ready</c> meanwhile is theirs to place — the claim is given back and the claim refused).
     /// "Already the factory's and <c>InProgress</c>" is an item carrying the factory's live claim, or — a claim lasts
-    /// <see cref="ClaimTtlSeconds"/> and nothing renews it — one with no claim at all that the ledger records as claimed by this
+    /// <see cref="ClaimTtlSeconds"/> and a parked or escalated item's is not renewed — one with no claim at all that the ledger records as claimed by this
     /// factory (<see cref="KanbanKeys.ClaimedAsync"/>): its claim lapsed and is taken again, so an escalated item can be re-run
     /// after a day. An <c>InProgress</c> item with no claim that the ledger does not record as the factory's is refused
     /// (<see cref="LapsedRefusal"/>): it may be a person's work.
@@ -161,7 +181,7 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
         var marker = Marker(itemId);
         if (item.ClaimMarker is { } held && held != marker)
         {
-            return ClaimResult.Refused($"the item is claimed by {item.Claimant ?? "another caller"}");
+            return ClaimResult.Refused($"the item is claimed by {Holder(item)}");
         }
         if (item.Status == KanbanStatus.InProgress && item.ClaimMarker is null)
         {
@@ -187,17 +207,35 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
         }
         catch (KanbanException ex) when (ex.Code == KanbanException.AlreadyClaimed)
         {
-            return ClaimResult.Refused("the item is claimed by another caller");
+            // Another caller won the race since the read: the item is read once more, only to name them.
+            return ClaimResult.Refused($"the item is claimed by {Holder(await FindAsync(itemId, ct))}");
         }
         var after = await board.GetItemAsync(itemId, ct);
         if (after.ClaimMarker != marker || after.ClaimantId is null || after.ClaimantId != claimed.ClaimantId)
         {
             return ClaimResult.Refused(
-                $"the claim did not stick (read back claimant {after.Claimant ?? "none"}, marker {after.ClaimMarker ?? "none"})");
+                $"the claim did not stick (read back claimant {Quoted(after.Claimant) ?? "none"}, marker {Quoted(after.ClaimMarker) ?? "none"})");
         }
         if (after.Status == KanbanStatus.Ready)
         {
-            after = await board.SetStatusAsync(itemId, KanbanStatus.InProgress, after.Version, ct);
+            try
+            {
+                after = await MoveAsync(after, KanbanStatus.InProgress, ct);
+            }
+            catch (KanbanException ex) when (ex.Code == KanbanException.Conflict)
+            {
+                // The move kept conflicting (MaxConflictRereads): the item is still Ready, and a claim left on it would hide it
+                // from every ready listing (claim_state: unclaimed) for a day. The claim is given back; the conflict is thrown.
+                try
+                {
+                    await ReleaseOursAsync(after, ct);
+                }
+                catch (Exception release) when (release is not OperationCanceledException)
+                {
+                    throw new AggregateException(ex, release);
+                }
+                throw;
+            }
         }
         if (after.Status != KanbanStatus.InProgress)
         {
@@ -215,8 +253,99 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
     /// </summary>
     public static readonly string LapsedRefusal =
         $"the item is {KanbanStatus.InProgress} with no claim, and the ledger records no claim of it by this factory (a claim lasts "
-        + $"{ClaimTtlSeconds / 3600} hours and is not renewed, so the factory's claim may have lapsed): move it back to {KanbanStatus.Ready} "
-        + "to hand it to the factory again";
+        + $"{ClaimTtlSeconds / 3600} hours and is renewed only while the item is in flight, so the factory's claim may have lapsed): move it "
+        + $"back to {KanbanStatus.Ready} to hand it to the factory again";
+
+    /// <summary>
+    /// Keeps the factory's claim on an item for another <see cref="ClaimTtlSeconds"/> (sc-25983; asked once per intake poll, and
+    /// before a claim-lost item is resumed): <c>renew_work_item_claim</c> under the item's marker. A renewal the board refuses —
+    /// <c>conflict</c>: the claim lapsed or was released; <c>already_claimed</c>: someone else holds the item — is decided on a
+    /// fresh read. An item that carries another marker is lost — the reason names the claimant — and so is one that is gone from
+    /// the board. An item with no claim, or one that reads as carrying the factory's marker, is claimed again
+    /// (<c>claim_work_item</c>; the board tells the factory's own claim from another identity's under the same marker, and a claim
+    /// another caller wins is lost to them) ONLY when it is the factory's by <see cref="ClaimAsync"/>'s own rule for an item with
+    /// no claim: it is <c>InProgress</c> and the ledger records that this factory claimed it
+    /// (<see cref="KanbanKeys.ClaimedAsync"/>). Any other item is left as it is, nothing written, and reported
+    /// <see cref="ClaimRenewal.Held"/> — nothing shows the factory lost it to anyone: an item whose run died before its
+    /// <c>claimed</c> checkpoint (in flight at Intake, never recorded as claimed: taking it here would skip every check of
+    /// <see cref="ClaimAsync"/>, which that item's run makes next, <see cref="LapsedRefusal"/> included), and one a person moved
+    /// out of <c>InProgress</c> (theirs to place; a claim on it would only hide it from the ready listings). Nothing but the claim
+    /// is ever written: the item's column, version and content are left alone.
+    /// A typed refusal that says nothing about who holds the item (<c>scope_denied</c>, <c>invalid_argument</c>; a key the ledger
+    /// never gave out) is <see cref="ClaimRenewal.NotRenewed"/>: the board answered, and the next item can be asked. Anything
+    /// thrown — <c>busy</c> after its retries, a lost answer, a board that is down — is the board not answering.
+    /// </summary>
+    public async Task<ClaimRenewal> RenewClaimAsync(int id, CancellationToken ct)
+    {
+        if (await keys.ItemAsync(id, ct) is not { } itemId)
+        {
+            return ClaimRenewal.NotRenewedBecause($"{Naming.Format(id)} is no Kanban item the factory knows");
+        }
+        try
+        {
+            return await RenewAsync(id, itemId, ct);
+        }
+        catch (KanbanException ex) when (ex.Refused && ex.Code != KanbanException.Busy)
+        {
+            return ClaimRenewal.NotRenewedBecause(ex.Message);
+        }
+    }
+
+    private async Task<ClaimRenewal> RenewAsync(int id, Guid itemId, CancellationToken ct)
+    {
+        var marker = Marker(itemId);
+        try
+        {
+            await board.RenewClaimAsync(itemId, marker, ClaimTtlSeconds, ct);
+            return ClaimRenewal.Held;
+        }
+        catch (KanbanException ex) when (ex.Code is KanbanException.Conflict or KanbanException.AlreadyClaimed or KanbanException.NotFound)
+        {
+        }
+        if (await FindAsync(itemId, ct) is not { } item)
+        {
+            return ClaimRenewal.LostBecause(GoneFromBoard);
+        }
+        if (item.ClaimMarker is null || item.ClaimMarker == marker)
+        {
+            if (item.Status != KanbanStatus.InProgress || !await keys.ClaimedAsync(id, ct))
+            {
+                // Not the factory's to take here: left as it is, for ClaimAsync (the item's run) or a person to decide.
+                return ClaimRenewal.Held;
+            }
+            try
+            {
+                await board.ClaimAsync(itemId, marker, ClaimTtlSeconds, ct);
+                return ClaimRenewal.Held;
+            }
+            catch (KanbanException ex) when (ex.Code is KanbanException.AlreadyClaimed or KanbanException.NotFound)
+            {
+            }
+            if (await FindAsync(itemId, ct) is not { } taken)
+            {
+                return ClaimRenewal.LostBecause(GoneFromBoard);
+            }
+            item = taken;
+        }
+        return ClaimRenewal.LostBecause(ClaimedBy(item));
+    }
+
+    private const string GoneFromBoard = "the item is no longer on the board";
+
+    /// <summary>
+    /// Why a claim is lost to whoever holds the item now, naming them. The claimant's name and the marker are another caller's
+    /// text (a marker is up to 200 characters of their choosing), and the reason goes into a board comment and the ledger: each is
+    /// cut and made one inert code span (<see cref="UntrustedText.CodeSpan"/>).
+    /// </summary>
+    private static string ClaimedBy(KanbanWorkItem item) => item.ClaimMarker is null
+        ? "the board refused the factory's claim, and the item now reads as unclaimed"
+        : $"the item is claimed by {Holder(item)} (marker {Quoted(item.ClaimMarker)})";
+
+    /// <summary>Who holds the item, for a refusal: the claimant's name, cut and inert in a code span, or "another caller".</summary>
+    private static string Holder(KanbanWorkItem? item) => Quoted(item?.Claimant) ?? "another caller";
+
+    /// <summary>Another caller's text (a claimant's name, a marker), cut and inert in a code span; null for none.</summary>
+    private static string? Quoted(string? theirs) => string.IsNullOrEmpty(theirs) ? null : UntrustedText.CodeSpan(Cut(theirs));
 
     /// <summary>In scope while the item is on the board and its project is one of the watched ones.</summary>
     public async Task<bool> InScopeAsync(int id, CancellationToken ct) =>
@@ -278,7 +407,11 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
 
     /// <summary>
     /// Claimed: <c>InProgress</c>. Merged: <c>Done</c>. Stopped: <c>Backlog</c>, the factory's claim released, and the comment
-    /// posted. An item already in the target column is not written; a move is conditional on the version just read.
+    /// posted. An item already in the target column is not written; a move is conditional on the version just read
+    /// (<see cref="MoveAsync"/>). An item someone else moved to another column between that read and the write stays where they
+    /// put it: the factory's move is not made, and the item is told so in the comment (<see cref="NotMoved"/>, after
+    /// <paramref name="comment"/> when there is one) — the claim is still released on a stop. A later report (a re-run) decides
+    /// afresh on what it then reads.
     /// </summary>
     public async Task ReportStateAsync(int id, BoardState state, string? comment, CancellationToken ct)
     {
@@ -296,16 +429,50 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
         var item = await board.GetItemAsync(await ItemIdAsync(id, ct), ct);
         if (item.Status != target)
         {
-            item = await board.SetStatusAsync(item.Id, target, item.Version, ct);
+            item = await MoveAsync(item, target, ct);
         }
         if (state == BoardState.Stopped)
         {
             await ReleaseOursAsync(item, ct);
         }
+        if (item.Status != target)
+        {
+            comment = comment is null ? NotMoved(target, item.Status) : $"{comment}\n\n{NotMoved(target, item.Status)}";
+        }
         if (comment is not null)
         {
             await CommentOnAsync(item, comment, ct);
         }
+    }
+
+    /// <summary>What the item is told when someone else moved it while the factory was moving it: their column stands.</summary>
+    public static string NotMoved(string target, string status) =>
+        $"The factory was moving this item to {target} when someone else moved it to {status}; it is left in {status}, where they put it.";
+
+    /// <summary>
+    /// Moves <paramref name="item"/> to <paramref name="target"/> on the version it was read at. A <c>conflict</c> — someone
+    /// else updated or moved the item since — is never written over: the item is read again and the move decided again, on what
+    /// it now is. Still in the column the move was decided from (they changed something else: a title, a label, the order): the
+    /// move is made on the new version, and their change is kept (a status change writes nothing else). In any other column:
+    /// they moved it, and it is returned as they left it, unmoved — the caller compares its status with
+    /// <paramref name="target"/>. At most <see cref="MaxConflictRereads"/> re-reads; the conflict after the last is thrown
+    /// (<see cref="ClaimAsync"/> then gives its claim back before it rethrows).
+    /// </summary>
+    private async Task<KanbanWorkItem> MoveAsync(KanbanWorkItem item, string target, CancellationToken ct)
+    {
+        var from = item.Status;
+        for (var reread = 0; item.Status == from && item.Status != target; reread++)
+        {
+            try
+            {
+                return await board.SetStatusAsync(item.Id, target, item.Version, ct);
+            }
+            catch (KanbanException ex) when (ex.Code == KanbanException.Conflict && reread < MaxConflictRereads)
+            {
+                item = await board.GetItemAsync(item.Id, ct);
+            }
+        }
+        return item;
     }
 
     public async Task CommentAsync(int id, string text, CancellationToken ct) =>

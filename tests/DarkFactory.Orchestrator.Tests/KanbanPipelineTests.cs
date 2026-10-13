@@ -84,7 +84,7 @@ public class KanbanPipelineTests
     }
 
     [Theory]
-    [InlineData("claimed", "claim refused: the item is claimed by someone")]
+    [InlineData("claimed", "claim refused: the item is claimed by `someone`")]
     [InlineData("backlog", "claim refused: the item is Backlog, not Ready")]
     [InlineData("unwatched", "claim refused: the item's project is outside the watched projects (Kanban:Watch:Projects)")]
     public async Task An_item_that_is_not_the_factorys_to_take_is_parked_with_the_reason_and_the_board_is_not_written(string what, string reason)
