@@ -1535,4 +1535,116 @@ public partial class ChangesetPipelineTests
         Assert.Equal(WorkState.Cancelled, stopped.State);
         Assert.Contains(h.Comments(a), c => c.Contains($"sc-{a} was stopped by test: the factory cancelled its work on it") && c.Contains("released its claim"));
     }
+
+    private const string OutsideNote = "merged outside the factory into the changeset branch; reviewed as part of the changeset pull request";
+
+    /// <summary>Story <paramref name="story"/>'s run with someone merging its pull request by hand while its CI is read; the run's outcome and the pull request.</summary>
+    private static async Task<(RunOutcome Outcome, string Url)> MergedByHandDuringCi(Harness h, int story)
+    {
+        string? url = null;
+        h.Repo.OnCiRead = sha =>
+        {
+            if (url is null && sha.StartsWith($"{Branch(story)}-c", StringComparison.Ordinal))
+            {
+                url = h.Repo.SquashOutside(Branch(story));
+            }
+        };
+        var outcome = await h.Run(story);
+        h.Repo.OnCiRead = null;
+        return (outcome, url!);
+    }
+
+    [Fact]
+    public async Task A_plan_story_merged_outside_the_factory_into_its_changeset_branch_counts_as_merged_and_the_changeset_is_still_gated_as_a_whole()
+    {
+        var h = new Harness();
+        var ids = await h.Plan(Two);
+        var (a, b) = (ids[0], ids[1]);
+        Assert.True((await h.Run()).Succeeded, h.Logged); // releases A
+
+        // A person merges A's pull request by hand while the factory has it in flight: into its base, the plan's changeset branch.
+        var (found, url) = await MergedByHandDuringCi(h, a);
+
+        // The story still escalates — the factory's gate did not merge it — and says what that means for its plan.
+        Assert.Equal(WorkState.Escalated, found.State);
+        Assert.Contains($"{url} ", found.Error);
+        Assert.Contains("merged outside the", found.Error);
+        Assert.Contains($"It was merged into {ChangesetBranch}, its plan's changeset branch: {OutsideNote}.", found.Error);
+        // The fact is recorded on the story from GitHub's answer (the pull request, its base, its head), with a typed outcome.
+        var row = Assert.Single(await h.Rows(a), r => r.Step == RunPipeline.Steps.MergedIntoChangeset);
+        Assert.StartsWith($"{url} into {ChangesetBranch} at {Branch(a)}-c", row.Detail);
+        Assert.Equal(StepOutcome.Deferred, row.Outcome);
+        Assert.DoesNotContain(await h.Transitions(a), s => s == WorkState.Merge);
+        Assert.DoesNotContain(h.Repo.Merges, m => m.Head == Branch(a));
+
+        // For its plan it counts as merged: B, which needs A, is released, and the plan is not held by a failed story.
+        Ended(h, await h.Run(), WorkState.Planned);
+        Assert.Equal(FakeShortcutBoard.ToDo, h.State(b));
+        Assert.Empty(await h.Steps(PlanId, RunPipeline.Steps.PlanHeld));
+        Assert.Empty(await h.Steps(PlanId, RunPipeline.Steps.PlanStuck));
+        var view = Assert.Single(await h.Dashboard(), r => r.ExternalId == $"sc-{PlanId}").Plan!;
+        Assert.Equal((PlanStoryState.Merged, OutsideNote), (view.Stories[0].State, view.Stories[0].Waits));
+        Assert.Equal(0, view.Failed);
+        // B's claim is not refused either (the claim check and the release are one rule), and B merges through its own gate.
+        var mergedB = await h.Run(b);
+        Assert.Equal((WorkState.Watch, (string?)null), (mergedB.State, mergedB.Error));
+
+        // The plan is complete: its changeset pull request is opened and says which story the gate did not merge …
+        Ended(h, await h.Run(), WorkState.Review);
+        var opened = h.Repo.Opened.Single(o => o.Head == ChangesetBranch);
+        Assert.Contains($"Not sc-{a}, which was {OutsideNote} (the factory's merge gate did not merge its pull request", opened.Body);
+        Assert.Contains($"- sc-{a} `First story`: **escalated** Escalated, {OutsideNote}, {url}", opened.Body);
+        // … and goes through the full panel and gate before anything reaches the default branch (E6).
+        var reviewsBefore = h.Reviewer.Snapshot().Count;
+        Ended(h, await h.Run(), WorkState.Watch);
+        Assert.True(h.Reviewer.Snapshot().Count > reviewsBefore);
+        Assert.Contains(await h.Steps(PlanId, RunPipeline.Steps.GateDecision), d => d!.StartsWith("Merge ", StringComparison.Ordinal));
+        Assert.Single(h.Repo.Merges, m => m.Head == ChangesetBranch && m.Base == Main);
+        var closeout = h.Comments(PlanId)[^1];
+        Assert.Contains($"sc-{PlanId}'s plan is complete: 1 of its 2 stories merged through the factory's merge gate. 1 more (sc-{a}) was {OutsideNote}", closeout);
+        Assert.Contains($"- sc-{a} `First story`: **escalated** Escalated, {OutsideNote}, {url}", closeout);
+
+        // A re-run of the story changes nothing for the plan and records the fact once.
+        await h.Run(a);
+        Assert.Single(await h.Rows(a), r => r.Step == RunPipeline.Steps.MergedIntoChangeset);
+    }
+
+    [Fact]
+    public async Task A_plan_story_merged_outside_the_factory_into_another_base_stays_failed_and_only_stopping_the_plan_ends_what_depends_on_it()
+    {
+        var h = new Harness();
+        var ids = await h.Plan(Two);
+        var (a, b) = (ids[0], ids[1]);
+        Assert.True((await h.Run()).Succeeded, h.Logged);
+        // Someone retargets A's pull request to the default branch and merges it there by hand: past the changeset, ungated.
+        string? url = null;
+        h.Repo.OnCiRead = sha =>
+        {
+            if (url is null && sha.StartsWith($"{Branch(a)}-c", StringComparison.Ordinal))
+            {
+                h.Repo.Retarget(Branch(a), Main);
+                url = h.Repo.SquashOutside(Branch(a));
+            }
+        };
+
+        var found = await h.Run(a);
+        h.Repo.OnCiRead = null;
+
+        Assert.Equal(WorkState.Escalated, found.State);
+        Assert.Contains("merged outside the", found.Error);
+        Assert.DoesNotContain("counts as merged", found.Error);
+        Assert.DoesNotContain(await h.Rows(a), r => r.Step == RunPipeline.Steps.MergedIntoChangeset);
+
+        // It satisfies nothing: B stays in the backlog, the plan is stuck behind it, and the remedy does not offer a re-run.
+        Ended(h, await h.Run(), WorkState.Planned);
+        Assert.Equal(FakeShortcutBoard.Backlog, h.State(b));
+        var stuck = Assert.Single(await h.Steps(PlanId, RunPipeline.Steps.PlanStuck));
+        Assert.Contains($"sc-{a} merged outside the factory at ", stuck);
+        var comment = h.Comments(PlanId)[^1];
+        Assert.DoesNotContain($"`factory run sc-{a}`", comment);
+        Assert.Contains($"Remedies: stop the plan (`factory stop --item sc-{PlanId}`", comment);
+        Assert.Contains($"A story whose pull request was merged outside the factory into another branch than the plan's changeset branch (sc-{a}) "
+            + "cannot be re-run either (a re-run finds the merged pull request and escalates again): only stopping the plan ends what depends on it", comment);
+        Assert.Empty(h.Repo.Opened.Where(o => o.Head == ChangesetBranch).ToList());
+    }
 }

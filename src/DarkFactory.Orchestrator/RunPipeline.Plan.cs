@@ -156,7 +156,9 @@ public sealed partial class RunPipeline
     }
 
     /// <summary>
-    /// Why a story of a plan may not start yet (sc-25871, E7), or null when it may: the blockers the board relates to it
+    /// Why a story of a plan may not start yet (sc-25871, E7), or null when it may: the blockers its plan recorded for it
+    /// (<see cref="PlanRelease.RecordedBlockers"/>, its plan item's <c>plan</c> checkpoint: they hold it whatever the board says
+    /// now, sc-25877 — the release's rule) and those the board relates to it
     /// (<see cref="IWorkSource.BlockersAsync"/>: stories of its plan or not) that are not satisfied
     /// (<see cref="PlanRelease.Satisfied(IReadOnlyList{LedgerEntry}?, bool, bool)"/>: a story of its plan by the factory's merge only,
     /// any other also once the board shows it finished), named in a claim refusal (<see cref="PlanRelease.Refusal"/>). Only a plan's
@@ -181,15 +183,20 @@ public sealed partial class RunPipeline
         {
             return PlanRelease.PlanUnreadableRefusal(planItem.ExternalId);
         }
-        var blockers = await source.BlockersAsync(storyId, ct);
+        // One rule with the release (sc-25877): the blockers the plan itself recorded for the story (its `plan` checkpoint) hold it
+        // whatever the board says now — a person who removed an in-plan `blocks` relation and moved the story to ready has not
+        // made its blocker's code exist — and the board's relations are added to them (a relation a person added since).
+        var onBoard = (await source.BlockersAsync(storyId, ct)).Select(b => (Id: Naming.Format(b.Id), b.Finished)).ToList();
+        var recorded = await PlanRecordAsync(plan, ct) is { Blockers: { } own } && own.TryGetValue(item.ExternalId, out var mine) ? mine : [];
+        var blockers = onBoard.Concat(recorded.Where(r => onBoard.All(b => b.Id != r)).Select(r => (Id: r, Finished: false))).ToList();
         var changesets = await AwaitedChangesetsAsync(item, plan, ct);
         if (blockers.Count == 0 && changesets.Count == 0)
         {
             return null;
         }
         var ofPlan = await ledger.PlanStoriesAsync(plan, ct);
-        var known = await ledger.ItemsByIdAsync(Naming.Source, blockers.Select(b => Naming.Format(b.Id)).ToList(), ct);
-        var open = blockers.Select(b => (Id: Naming.Format(b.Id), b.Finished))
+        var known = await ledger.ItemsByIdAsync(Naming.Source, blockers.Select(b => b.Id).ToList(), ct);
+        var open = blockers
             .Where(b => !PlanRelease.Satisfied(known.TryGetValue(b.Id, out var k) ? k.History : null, ofPlan.Contains(b.Id), b.Finished))
             .Select(b => b.Id).ToList();
         return open.Count + changesets.Count == 0 ? null
@@ -216,11 +223,13 @@ public sealed partial class RunPipeline
 
     /// <summary>
     /// What the plan item <paramref name="plan"/> recorded (sc-25873), read fresh from its own rows: the rows, its changesets on
-    /// origin, and each story's repository and changeset blockers (<see cref="PlanRelease.RecordedRepos"/>) — <c>Repos</c> null
-    /// when its <c>plan</c> checkpoint no longer reads back as a plan of its recorded stories. Null when the ledger has no such
-    /// item or it recorded no stories.
+    /// origin, each story's repository and changeset blockers (<see cref="PlanRelease.RecordedRepos"/>) and each story's blockers
+    /// among the plan's stories (<see cref="PlanRelease.RecordedBlockers"/>) — <c>Repos</c> and <c>Blockers</c> null when its
+    /// <c>plan</c> checkpoint no longer reads back as a plan of its recorded stories. Null when the ledger has no such item or it
+    /// recorded no stories.
     /// </summary>
-    private async Task<(List<LedgerEntry> Rows, IReadOnlyList<Plans.Changeset> Changesets, RecordedRepositories? Repos)?> PlanRecordAsync(long plan, CancellationToken ct)
+    private async Task<(List<LedgerEntry> Rows, IReadOnlyList<Plans.Changeset> Changesets, RecordedRepositories? Repos,
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? Blockers)?> PlanRecordAsync(long plan, CancellationToken ct)
     {
         if (await ledger.ItemAsync(plan, ct) is not { } planItem)
         {
@@ -228,10 +237,16 @@ public sealed partial class RunPipeline
         }
         var rows = await ledger.HistoryAsync(planItem, ct);
         var recorded = rows.FindLastIndex(e => e.Step == Steps.PlanStories);
+        if (recorded < 0)
+        {
+            return null;
+        }
+        var planDetail = rows.Take(recorded).LastOrDefault(e => e.Step == Steps.Plan)?.Detail;
+        var stories = PlanRelease.StoriesOf(rows[recorded].Detail);
         // The plan item's own repository is read only for a story that names none: a plan of one repository, whose item never
         // works anywhere else.
-        return recorded < 0 ? null : (rows, Plans.Changeset.All(rows), PlanRelease.RecordedRepos(rows.Take(recorded).LastOrDefault(e => e.Step == Steps.Plan)?.Detail,
-            PlanRelease.StoriesOf(rows[recorded].Detail), RepoRef.Parse(planItem.Repo)));
+        return (rows, Plans.Changeset.All(rows), PlanRelease.RecordedRepos(planDetail, stories, RepoRef.Parse(planItem.Repo)),
+            PlanRelease.RecordedBlockers(planDetail, stories));
     }
 
     /// <summary>
@@ -307,7 +322,8 @@ public sealed partial class RunPipeline
     /// (<see cref="IWorkSource.BlockersAsync"/>: the plan's relations and any a person added since) in the evaluation that could
     /// release it — only once every blocker the plan itself gave it (<see cref="PlanRelease.RecordedBlockers"/>, from the <c>plan</c>
     /// checkpoint) has merged; until then it is held by those and the board is not read for it (so removing an in-plan relation on
-    /// the board does not release it early: move it to ready by hand, where the claim check reads the board). A released story that
+    /// the board does not release it early — nor does moving it to ready by hand: the claim check holds it to the same recorded
+    /// blockers, <see cref="BlockedAsync"/>, sc-25877). A released story that
     /// has not merged and that nothing works (the ledger does not know it, or it is Paused) is asked for once per evaluation
     /// (<see cref="IWorkSource.InBacklogAsync"/>): back in the backlog, a person moved it there, and the plan does not release it
     /// again. A control that pauses the plan item (the factory, its epic, the freeze) releases nothing. What holds the plan beyond
@@ -560,13 +576,13 @@ public sealed partial class RunPipeline
             && (await Gate.GitHub.GetPullAsync(repo, GitHubGate.ParsePullUrl(linked).Number, ct)).Merged)
         {
             (empty, how) = (Plans.Changeset.MergedOutside(linked), ChangesetDelivery.MergedOutside);
-            await ledger.CheckpointAsync(item, Steps.ChangesetEmpty, null, empty, ct);
+            await RecordEmptyAsync(item, since, empty, ct);
         }
         // Without a gate stage nothing can read the difference (nor review the pull request: the item parks at Review).
         if (empty is null && gate is not null && string.IsNullOrWhiteSpace(await Gate.GitHub.GetDiffAsync(repo, changeset.Base, changeset.Branch, ct)))
         {
             empty = $"{(several ? $"{repo}: " : "")}{changeset.Branch} does not differ from {changeset.Base}: no changeset pull request";
-            await ledger.CheckpointAsync(item, Steps.ChangesetEmpty, null, empty, ct);
+            await RecordEmptyAsync(item, since, empty, ct);
         }
         if (empty is not null && several)
         {
@@ -599,6 +615,19 @@ public sealed partial class RunPipeline
         await ledger.RecordAsync(item, WorkState.Review, null, prUrl, ct);
         log.WriteLine($"[{item.State}] {item.ExternalId}: every story of the plan{(several ? $" in {repo}" : "")} merged into {changeset.Branch}; its changeset pull request is {prUrl}");
         return await OutcomeAsync(item, null, ct);
+    }
+
+    /// <summary>
+    /// Records that a changeset needs no pull request (<see cref="Steps.ChangesetEmpty"/>), once: a run of a plan of several
+    /// repositories that died between this row and its <see cref="Steps.ChangesetDelivered"/> row decides the same again (its
+    /// Detail names the repository, or the pull request someone merged) and must not write the row a second time (sc-25877).
+    /// </summary>
+    private async Task RecordEmptyAsync(WorkItem item, List<LedgerEntry> since, string empty, CancellationToken ct)
+    {
+        if (!since.Any(e => e.Step == Steps.ChangesetEmpty && e.Detail == empty))
+        {
+            await ledger.CheckpointAsync(item, Steps.ChangesetEmpty, null, empty, ct);
+        }
     }
 
     private static IReadOnlyList<PlanStoryReport> PlanStoryReports(IReadOnlyList<string> stories,
@@ -750,31 +779,30 @@ public sealed partial class RunPipeline
     /// <summary>
     /// The planner's repository set (sc-25874): every <c>Repo: owner/name</c> line of the plan item (<see cref="RepoResolver.ResolveAll"/>),
     /// the item's primary repository (<see cref="Run.Repo"/>, what the rest of the pipeline uses) first. With one line or none it is
-    /// that repository alone, as before. A set of several is what the planner's checkouts and its CodeGraph grant cover, so each
-    /// must be one of the factory's configured repositories: one that is not fails the item before any session starts
-    /// (<see cref="WorkerFailedException"/>: escalated with the reason, nothing created).
+    /// that repository alone. The set is what the planner's checkouts and its CodeGraph grant cover and where the plan's stories and
+    /// changesets land, so every repository of it — one line, several, or none (the default repository, configured by definition) —
+    /// must be one of the factory's configured repositories (epic E1, sc-25877): one that is not fails the item before any session
+    /// starts (<see cref="WorkerFailedException"/>: escalated with the reason, nothing created).
     /// </summary>
     /// <param name="progress">What an earlier run of this plan left, which the refusal says instead of claiming nothing exists.</param>
     private IReadOnlyList<RepoRef> PlanRepositories(Run run, PlanProgress progress = PlanProgress.Fresh)
     {
         var repos = RepoResolver.ResolveAll(run.Story.Description, run.Repo);
-        if (repos.Count > 1)
+        var unconfigured = repos.Where(r => !_configuredRepos.Any(c => c.Is(r)))
+            .Select(r => r.FullName).ToList();
+        if (unconfigured.Count > 0)
         {
-            var unconfigured = repos.Where(r => !_configuredRepos.Any(c => string.Equals(c.FullName, r.FullName, StringComparison.OrdinalIgnoreCase)))
-                .Select(r => r.FullName).ToList();
-            if (unconfigured.Count > 0)
-            {
-                throw new WorkerFailedException($"The plan names {repos.Count} repositories ({string.Join(", ", repos.Select(r => r.FullName))}), "
-                    + $"but {string.Join(", ", unconfigured)} {(unconfigured.Count == 1 ? "is" : "are")} not configured for this factory "
-                    + $"(Factory:DefaultRepo, GitHub:Watch:Repos: {string.Join(", ", _configuredRepos.Select(r => r.FullName))}), so "
-                    + progress switch
-                    {
-                        PlanProgress.Fresh => "no planner session was started and no story was created.",
-                        PlanProgress.Recorded => "the plan an earlier run recorded was not taken further: no story of it was created.",
-                        _ => $"the plan an earlier run recorded was not taken further. {StoriesMayExist}",
-                    }
-                    + " Configure it, or remove its Repo: line.");
-            }
+            throw new WorkerFailedException($"The plan names {repos.Count} {(repos.Count == 1 ? "repository" : "repositories")} "
+                + $"({string.Join(", ", repos.Select(r => r.FullName))}), "
+                + $"but {string.Join(", ", unconfigured)} {(unconfigured.Count == 1 ? "is" : "are")} not configured for this factory "
+                + $"(Factory:DefaultRepo, GitHub:Watch:Repos: {string.Join(", ", _configuredRepos.Select(r => r.FullName))}), so "
+                + progress switch
+                {
+                    PlanProgress.Fresh => "no planner session was started and no story was created.",
+                    PlanProgress.Recorded => "the plan an earlier run recorded was not taken further: no story of it was created.",
+                    _ => $"the plan an earlier run recorded was not taken further. {StoriesMayExist}",
+                }
+                + " Configure it, or remove its Repo: line.");
         }
         return repos;
     }

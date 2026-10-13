@@ -149,8 +149,13 @@ public sealed class McpProfile
     /// A plan item's planner session (sc-25870, sc-25874): every allowlisted CodeGraph tool — the reviewers' seven and the
     /// cross-repository ones (<see cref="PlannerCodeGraph.Tools"/>) — and Kanban's read tools. The only profile granted the
     /// cross-repository tools, or more than one repository (<see cref="McpProxy.Grant(IReadOnlyList{Shortcut.RepoRef}, McpProfile)"/>):
-    /// its input is the owner's own plan story and its output goes only to the owner's board, so answers that name other indexed
-    /// (private) projects are accepted for it, as they never are for triage.
+    /// its input is the owner's own plan story, not an outsider's text as a triage's is, so answers that name other indexed
+    /// (private) projects are accepted for it, as they never are for triage. Where its output goes (sc-25877): the stories it
+    /// writes land on the owner's board, and their titles and the plan's <c>interactions</c> note also reach GitHub — pull request
+    /// titles and bodies and commit messages of the plan's repositories, always inert or fenced (E3). Accepted residual: a planner
+    /// can restate what a cross-project answer named (another private project's name, a symbol of it) into such text, so it can
+    /// show in a pull request body of the plan's repositories; a plan should not be run on a public repository whose readers
+    /// must not learn the other indexed projects' names.
     /// </summary>
     public static readonly McpProfile Planner = new("planner", new Dictionary<string, IReadOnlyList<string>>
     {

@@ -49,8 +49,9 @@ public enum WorkerInput
 /// </para>
 /// <para>
 /// The target repo's own Claude settings (<see cref="OfRepoSettings"/>) taint the session up front, and again if the worker wrote
-/// them during its run. Deliberate, accepted residual: the worker's allowed <c>dotnet build/test/restore</c> run code the repo and
-/// its packages supply (MSBuild targets, analyzers, test code, package restore), and the worker reads their output. That code
+/// them during its run. Deliberate, accepted residual: the worker's allowed <c>dotnet build/test/restore</c> and (sc-25877)
+/// <c>cargo build/check/test/fetch</c> (<see cref="ClaudeWorker.CargoTools"/>) run code the repo and its packages supply (MSBuild
+/// targets, analyzers, cargo build scripts and procedural macros, test code, package restore), and the worker reads their output. That code
 /// runs in the sandbox (no credential but the router key), is the code under review or a dependency the repo already pins, goes
 /// back through the review panel and CI, and the factory cannot build or test anything without it; tainting every session that
 /// builds would leave no worker able to push.

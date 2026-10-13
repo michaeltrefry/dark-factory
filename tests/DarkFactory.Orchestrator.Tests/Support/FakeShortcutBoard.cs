@@ -72,7 +72,18 @@ public sealed class FakeShortcutBoard : HttpMessageHandler
             ["labels"] = new JsonArray(),
             ["external_links"] = new JsonArray(),
             ["story_links"] = new JsonArray(),
+            // Like the real API (the recorded listings carry it): null unless the story was created with one.
+            ["external_id"] = null,
         };
+
+    /// <summary>A person removes the <c>blocks</c> relation between two stories on the board.</summary>
+    public void Unlink(int subject, int obj)
+    {
+        lock (_links)
+        {
+            _links.RemoveAll(l => (int)l["subject_id"]! == subject && (int)l["object_id"]! == obj);
+        }
+    }
 
     public HttpClient Client() => new(this) { BaseAddress = ShortcutWorkSource.DefaultBaseAddress };
 
@@ -152,6 +163,7 @@ public sealed class FakeShortcutBoard : HttpMessageHandler
         // Like the real API, the story keeps the description and type it was created with.
         _stories[id]["description"] = (string?)body["description"];
         _stories[id]["story_type"] = (string?)body["story_type"] ?? "feature";
+        _stories[id]["external_id"] = (string?)body["external_id"];
         return Ok(new JsonObject { ["id"] = id }, HttpStatusCode.Created);
     }
 

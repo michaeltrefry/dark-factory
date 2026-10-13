@@ -7,6 +7,7 @@ using DarkFactory.Orchestrator.Gateway;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Plans;
 using DarkFactory.Orchestrator.Shortcut;
+using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
 
 namespace DarkFactory.AcceptanceTests;
@@ -63,6 +64,8 @@ public class PlanFailureAcceptanceTests
             await LedgerMigrations.MigrateAsync(e2e.Ledger, ct);
             created = [.. await source.CreateChildrenAsync(planId, plan.Children(planRef, repo), ct)];
             var (a, b, c, d) = (created[0], created[1], created[2], created[3]);
+            var changeset = new Changeset(repo.FullName, ItemNaming.Shortcut.ChangesetBranchName(planId), "main", SeededBaseSha);
+            Assert.Empty(await E2e.PullRequestsAsync(repo, changeset.Branch, ct));
             await using (var db = e2e.Db())
             {
                 var ledger = new WorkLedger(db, TimeProvider.System);
@@ -70,6 +73,11 @@ public class PlanFailureAcceptanceTests
                 await ledger.RecordAsync(item, WorkState.Plan, null, "seeded by P4-AT5", ct);
                 await ledger.CheckpointAsync(item, RunPipeline.Steps.Plan, null, plan.ToDetail(), ct);
                 await ledger.CheckpointAsync(item, RunPipeline.Steps.PlanCreating, null, null, ct);
+                // The production shape (sc-25872, sc-25877): the plan's changeset is recorded, then pushed, before its stories are
+                // recorded as its own. Only the rows are seeded — nothing is pushed to the sandbox, so the branch has no pull
+                // request — which is what the stop of a plan item reads: it drafts the changeset branch's pull requests.
+                await ledger.CheckpointAsync(item, RunPipeline.Steps.Changeset, null, changeset.ToDetail(), ct);
+                await ledger.CheckpointAsync(item, RunPipeline.Steps.ChangesetPushed, null, Changeset.PushedDetail(changeset.Branch, changeset.BaseSha, adopted: false), ct);
                 var stories = string.Join(' ', created.Select(i => $"sc-{i}"));
                 await ledger.CheckpointAsync(item, RunPipeline.Steps.PlanStories, null, stories, ct);
                 await ledger.RecordAsync(item, WorkState.Planned, null, $"{created.Count} stories: {stories}", ct);
@@ -130,6 +138,13 @@ public class PlanFailureAcceptanceTests
                     (states[$"sc-{a}"], states[$"sc-{c}"], states[$"sc-{d}"], states[planRef]));
                 Assert.False(states.ContainsKey($"sc-{b}"));
                 Assert.Null(await db.Controls.AsNoTracking().SingleOrDefaultAsync(x => x.Scope == ControlScope.Item(planRef), ct));
+                // The plan item itself was stopped as a plan with a changeset is: its changeset branch's pull requests asked for in
+                // the changeset's repository (there are none: nothing was drafted), then the board told.
+                var planRows = await e2e.HistoryAsync(planId, ct);
+                Assert.Equal(changeset, Changeset.Of(planRows, repo));
+                var drafted = Assert.Single(planRows, e => e.Step == RunPipeline.Steps.PrsDrafted);
+                Assert.Equal("none", drafted.Detail);
+                Assert.Single(planRows, e => e.Step == RunPipeline.Steps.StopReported);
                 foreach (var stopped in new[] { a, c })
                 {
                     var item = await db.WorkItems.AsNoTracking().SingleAsync(i => i.ExternalId == $"sc-{stopped}", ct);
@@ -146,6 +161,8 @@ public class PlanFailureAcceptanceTests
             Assert.Equal("Backlog", (await E2e.StoryAsync(planId, ct)).State);
             var after = (await E2e.StoryCommentsAsync(planId, ct)).Skip(commentsBefore).ToList();
             Assert.Equal(2, after.Count);
+            // As a plan with a changeset is stopped: its changeset branch is named as kept, with no pull request of it open.
+            Assert.Contains($"It had no open pull request. Branch {changeset.Branch} is kept; nothing was merged or deleted.", after[1]);
             Assert.Contains($"Stories stopped with it: sc-{a}, sc-{c}. Already merged (left as they are): sc-{d}. "
                 + $"Never started (left in the backlog; the factory will not release or start them): sc-{b}.", after[1]);
 
@@ -175,6 +192,9 @@ public class PlanFailureAcceptanceTests
             }
         }
     }
+
+    /// <summary>The commit the seeded <c>changeset</c> row names as the default branch's head: no commit of the sandbox (nothing reads it there).</summary>
+    private const string SeededBaseSha = "0000000000000000000000000000000000000000";
 
     /// <summary>The workflow state name of each story, read straight from the Shortcut API.</summary>
     private static async Task<List<string>> StatesAsync(IReadOnlyList<int> stories, CancellationToken ct)

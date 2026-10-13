@@ -135,7 +135,7 @@ else
 }
 
 @code {
-    /// <summary>Whether the row is a story listed beneath its (active) plan item: its plan's row lists it.</summary>
+    /// <summary>Whether the row is a story listed beneath its plan item (active, or finished and listed for its stories): its plan's row lists it.</summary>
     private bool Grouped(PipelineRow row) =>
         _rows?.FirstOrDefault(r => r.Id == row.PlanItemId)?.Plan?.Stories.Any(s => s.ExternalId == row.ExternalId) == true;
 
@@ -215,7 +215,7 @@ else
                         {
                             <span class="control-state">@(row.Control == ControlState.Stopping ? "stopping" : "paused")</span>
                         }
-                        @if (row.Control != ControlState.Stopping)
+                        @if (row.Control != ControlState.Stopping && !row.Finished)
                         {
                             var scope = ControlScope.Item(row.ExternalId);
                             <ControlButton Action="@(Paused(scope) ? "continue" : "pause")" Scope="@scope" />

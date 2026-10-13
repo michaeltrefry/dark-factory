@@ -63,8 +63,11 @@ public sealed class IllegalTransitionException(WorkState from, WorkState to, str
 }
 
 /// <summary>
-/// The transition table (E2: code decides every transition). Later phases register
-/// handlers for states; they do not add rows here.
+/// The transition table (E2: code decides every transition). A new phase normally registers handlers for the states it drives
+/// and adds no row here. Phase 4a (plans) is the exception, with four rows: <c>Plan → Planned</c> (a plan item waiting on its
+/// stories, sc-25870), <c>Planned → Done</c> (its plan finished with no changeset to merge, sc-25871), <c>Planned → Review</c>
+/// (the plan item taking its changeset's pull request through the gate, sc-25872) and <c>Merge → Planned</c> (a plan of several
+/// repositories waiting again after each changeset but the last, sc-25873).
 /// </summary>
 public static class Lifecycle
 {

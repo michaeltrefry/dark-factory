@@ -166,7 +166,7 @@ public sealed partial class RunPipeline
                     await RecordFoundMergedAsync(run, history, pull, ct);
                     return;
                 }
-                EnsureOpen(pull);
+                await EnsureOpenAsync(run, pull, ct);
             }
             // Before anything is merged into the head or the head into anything: the base is the one the ledger expects (sc-25872).
             EnsureBase(run, pull);
@@ -462,7 +462,7 @@ public sealed partial class RunPipeline
                     await RecordFoundMergedAsync(run, nowHistory, now, ct);
                     return null;
                 }
-                EnsureOpen(now);
+                await EnsureOpenAsync(run, now, ct);
                 if (now.HeadSha != pull.HeadSha)
                 {
                     await ledger.RecordAsync(run.Item, WorkState.Review, null,
@@ -556,7 +556,7 @@ public sealed partial class RunPipeline
             await ledger.RecordAsync(run.Item, WorkState.Merge, null, commit, ct);
             return;
         }
-        throw new GateBlockedException($"{pull.HtmlUrl} {Plans.PlanRelease.MergedOutsideGate}.");
+        throw new GateBlockedException($"{pull.HtmlUrl} {Plans.PlanRelease.MergedOutsideGate}.{await MergedIntoChangesetAsync(run, pull, ct)}");
     }
 
     /// <summary>
@@ -618,7 +618,7 @@ public sealed partial class RunPipeline
             {files}
 
             Resolve every conflict: edit each file so it keeps both the story's change and what the base changed, with no
-            conflict markers left, and make sure `dotnet build` and `dotnet test` pass. Do not commit, push, or open pull
+            conflict markers left, and make sure {BuildsAndPasses}. Do not commit, push, or open pull
             requests; the orchestrator does that.
             """;
     }

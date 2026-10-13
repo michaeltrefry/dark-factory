@@ -32,7 +32,10 @@ public sealed record ReleaseDecision(IReadOnlyList<string> Release, IReadOnlyLis
 /// <summary>Where one story of a plan stands (sc-25876), from the ledger: <see cref="PlanRelease.Classify"/>.</summary>
 public enum PlanStoryState
 {
-    /// <summary>The factory merged it (its ledger has a Merge row).</summary>
+    /// <summary>
+    /// The factory merged it (its ledger has a Merge row) — or its pull request was merged outside the factory into the plan's
+    /// changeset branch (<see cref="PlanStoryStatus.MergedOutside"/>): either way its work is on the changeset branch.
+    /// </summary>
     Merged,
     /// <summary>Released by the plan, or known to the ledger and neither merged nor failed: it is being worked or about to be.</summary>
     InFlight,
@@ -52,8 +55,12 @@ public sealed record StoryFailure(string As, string? Reason, DateTimeOffset At);
 /// <param name="WaitsOn">Its blockers that are not satisfied (empty for a merged, failed or in-flight story).</param>
 /// <param name="HeldBy">The failed stories of the plan it is blocked behind, directly or through others (<see cref="PlanStoryState.Blocked"/>).</param>
 /// <param name="ItemState">Its work item's state, null when the ledger does not know it.</param>
+/// <param name="MergedOutside">
+/// A <see cref="PlanStoryState.Merged"/> story the factory's gate did not merge: its pull request was merged outside the factory
+/// into the plan's changeset branch (<see cref="PlanRelease.MergedOutsideChangeset"/>, sc-25877).
+/// </param>
 public sealed record PlanStoryStatus(string Id, PlanStoryState State, IReadOnlyList<string> WaitsOn, IReadOnlyList<string> HeldBy,
-    StoryFailure? Failure, WorkState? ItemState);
+    StoryFailure? Failure, WorkState? ItemState, bool MergedOutside = false);
 
 /// <summary>Every story of a plan, classified (sc-25876).</summary>
 public sealed record PlanStatus(IReadOnlyList<PlanStoryStatus> Stories)
@@ -103,11 +110,36 @@ public static class PlanRelease
         (detail ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
     /// <summary>
-    /// Whether the factory merged an item: its ledger has a Merge row — its change went through the merge gate, into whatever base
-    /// its pull request targets. <paramref name="history"/> is the item's ledger rows, null when the ledger does not know it.
+    /// Whether an item's work is where its pull request's base is: its ledger has a Merge row — the factory merged it, its change
+    /// went through the merge gate, into whatever base its pull request targets — or (sc-25877, a plan's story only) a
+    /// <see cref="RunPipeline.Steps.MergedIntoChangeset"/> row: someone merged its pull request outside the factory into its
+    /// plan's changeset branch (<see cref="MergedOutsideChangeset"/>). <paramref name="history"/> is the item's ledger rows, null
+    /// when the ledger does not know it.
     /// </summary>
-    public static bool Satisfied(IReadOnlyList<LedgerEntry>? history) =>
+    public static bool Satisfied(IReadOnlyList<LedgerEntry>? history) => MergedByFactory(history) || MergedOutsideChangeset(history);
+
+    /// <summary>Whether the factory's merge gate merged the item: its ledger has a Merge row.</summary>
+    public static bool MergedByFactory(IReadOnlyList<LedgerEntry>? history) =>
         history?.Any(e => e.Step is null && e.State == WorkState.Merge) == true;
+
+    /// <summary>
+    /// Whether a plan's story was merged outside the factory into its plan's changeset branch and not by the factory (sc-25877):
+    /// its ledger has a <see cref="RunPipeline.Steps.MergedIntoChangeset"/> row — written by the story's own run from GitHub's
+    /// answer, never from text (<see cref="RunPipeline"/>'s <c>MergedIntoChangesetAsync</c>) — and no Merge row. Such a story
+    /// satisfies its dependents and counts for its plan's completion like a merged one: its change is on the changeset branch and
+    /// passes the full review and gate as part of the changeset pull request before it reaches a default branch (E6). A merged
+    /// pull request stays merged, so the row holds whatever the item does afterwards.
+    /// </summary>
+    public static bool MergedOutsideChangeset(IReadOnlyList<LedgerEntry>? history) =>
+        !MergedByFactory(history) && history?.Any(e => e.Step == RunPipeline.Steps.MergedIntoChangeset) == true;
+
+    /// <summary>What every report says of a story <see cref="MergedOutsideChangeset"/> counts as merged.</summary>
+    public const string MergedOutsideIntoChangeset =
+        "merged outside the factory into the changeset branch; reviewed as part of the changeset pull request";
+
+    /// <summary>The Detail of a <see cref="RunPipeline.Steps.MergedIntoChangeset"/> row: the pull request, the changeset branch it merged into, its head.</summary>
+    public static string MergedIntoChangesetDetail(string pullUrl, string changesetBranch, string headSha) =>
+        $"{pullUrl} into {changesetBranch} at {headSha}";
 
     /// <summary>
     /// The one place a blocker counts as satisfied. A blocker that is a story of the plan (<paramref name="ofPlan"/>) is satisfied
@@ -217,7 +249,9 @@ public static class PlanRelease
     /// <summary>
     /// How the story failed, or null when it did not: its ledger rows (<paramref name="history"/>) have no Merge row and its last
     /// transition is Escalated or Cancelled. A story a person re-queued after an escalation is no longer failed (its last transition is
-    /// Intake or later), and one that merged never is.
+    /// Intake or later), and one that merged never is — nor one whose pull request was merged outside the factory into its plan's
+    /// changeset branch (<see cref="MergedOutsideChangeset"/>, sc-25877: Escalated, yet counted as merged). A story merged outside
+    /// the factory into any other base is failed, <see cref="AsMergedOutside"/>.
     /// </summary>
     public static StoryFailure? FailureOf(IReadOnlyList<LedgerEntry>? history)
     {
@@ -283,7 +317,7 @@ public static class PlanRelease
             var state = last?.State;
             if (Merged(story))
             {
-                return new PlanStoryStatus(story, PlanStoryState.Merged, [], [], null, state);
+                return new PlanStoryStatus(story, PlanStoryState.Merged, [], [], null, state, MergedOutsideChangeset(rows[story]));
             }
             if (failures[story] is { } failure)
             {
@@ -332,11 +366,17 @@ public static class PlanRelease
     /// <summary>What a person can do about a held or stuck plan, as its comment says it.</summary>
     public static string FailedRemedy(string plan, PlanStatus status)
     {
-        var rerun = status.Failed.Where(f => f.Failure!.As != AsCancelled).Select(f => $"`factory run {f.Id}`").ToList();
+        var rerun = status.Failed.Where(f => f.Failure!.As is not (AsCancelled or AsMergedOutside)).Select(f => $"`factory run {f.Id}`").ToList();
         var cancelled = status.Failed.Where(f => f.Failure!.As == AsCancelled).Select(f => f.Id).ToList();
+        // A failed story merged outside the factory was merged into another base than its plan's changeset branch (one merged
+        // into the changeset branch is not failed: MergedOutsideChangeset). A re-run finds the merged pull request and escalates again.
+        var outside = status.Failed.Where(f => f.Failure!.As == AsMergedOutside).Select(f => f.Id).ToList();
         return (rerun.Count == 0 ? "" : $"fix what failed and re-run the story ({string.Join(", ", rerun)}): once it has merged its dependents are released; or ")
             + $"stop the plan (`factory stop --item {plan}`: its unfinished stories are stopped, merged ones stay)"
-            + (cancelled.Count == 0 ? "" : $". A cancelled story ({string.Join(", ", cancelled)}) cannot be re-run: what depends on it is only ever ended by stopping the plan");
+            + (cancelled.Count == 0 ? "" : $". A cancelled story ({string.Join(", ", cancelled)}) cannot be re-run: what depends on it is only ever ended by stopping the plan")
+            + (outside.Count == 0 ? "" : $". A story whose pull request was merged outside the factory into another branch than the plan's changeset branch "
+                + $"({string.Join(", ", outside)}) cannot be re-run either (a re-run finds the merged pull request and escalates again): "
+                + "only stopping the plan ends what depends on it");
     }
 
     /// <summary>The comment the plan item gets when a failed story starts to hold it, when which do changes, and once when it is stuck.</summary>
@@ -372,9 +412,17 @@ public static class PlanRelease
         $"{WorkSourceComments.Author} {plan} (plan) is no longer held: no story of it is failed any more ({Counts(status)}). "
         + "The stories that waited behind the failed one are released as their blockers merge.";
 
+    /// <summary>
+    /// " (sc-5 merged outside …)" after the merged count when stories of the plan count as merged without the factory's gate
+    /// having merged them (<see cref="MergedOutsideChangeset"/>); nothing otherwise.
+    /// </summary>
+    private static string OutsideCount(PlanStatus status) =>
+        status.Stories.Where(s => s.MergedOutside).Select(s => s.Id).ToList() is { Count: > 0 } outside
+            ? $" ({string.Join(", ", outside)} {MergedOutsideIntoChangeset})" : "";
+
     /// <summary>The plan's stories by state, as its records and the dashboard say it.</summary>
     public static string Counts(PlanStatus status) =>
-        $"{status.Count(PlanStoryState.Merged)} of {status.Stories.Count} merged, {status.Count(PlanStoryState.InFlight)} in flight, "
+        $"{status.Count(PlanStoryState.Merged)} of {status.Stories.Count} merged{OutsideCount(status)}, {status.Count(PlanStoryState.InFlight)} in flight, "
         + $"{status.Count(PlanStoryState.Waiting)} waiting, {status.Count(PlanStoryState.Failed)} failed, "
         + $"{status.Count(PlanStoryState.Blocked)} blocked behind a failed story";
 

@@ -193,11 +193,44 @@ internal sealed class StubClaude : IDisposable
     private readonly string _dir;
     private readonly string _log;
 
-    public StubClaude(string fixture, int? silenceBeforeSecondResult = null)
+    public StubClaude(string fixture, int? silenceBeforeSecondResult = null) : this(fixture, null, silenceBeforeSecondResult)
+    {
+    }
+
+    /// <summary>
+    /// A stub that answers <paramref name="answer"/> and ends (sc-25877, P4-AT3): one session of one assistant turn with no tool
+    /// call, whose result text is the answer — a planner whose plan is fixed, so a refusal by the code is what the test sees.
+    /// </summary>
+    public static StubClaude Answering(string answer) => new("a fixed answer", answer, null);
+
+    /// <summary>The session id the fixed-answer transcript is written with; each run replaces it with a fresh one.</summary>
+    private const string AnswerSession = "5d1c0a7e-aaaa-4a51-9c11-0000000000aa";
+
+    /// <summary>
+    /// The stream-json of a session that says <paramref name="answer"/> and ends, in the shape the recorded fixtures have
+    /// (<c>"key": value</c> with a space, which the script's session-id match needs).
+    /// </summary>
+    internal static string[] AnswerTranscript(string answer)
+    {
+        var text = System.Text.Json.JsonSerializer.Serialize(answer);
+        return
+        [
+            $$"""{"type": "system", "subtype": "init", "cwd": "/plan", "session_id": "{{AnswerSession}}", "tools": ["Glob", "Grep", "Read"], "mcp_servers": [], "model": "dark-factory-e2e-stub", "permissionMode": "dontAsk", "apiKeySource": "none", "claude_code_version": "0.0.0"}""",
+            $$"""{"type": "assistant", "message": {"id": "msg_e2e_stub_answer_1", "type": "message", "role": "assistant", "model": "dark-factory-e2e-stub", "content": [{"type": "text", "text": {{text}}}]}, "session_id": "{{AnswerSession}}"}""",
+            $$"""{"type": "result", "subtype": "success", "is_error": false, "duration_ms": 1, "num_turns": 1, "result": {{text}}, "stop_reason": "end_turn", "session_id": "{{AnswerSession}}", "total_cost_usd": 0, "terminal_reason": "completed"}""",
+        ];
+    }
+
+    private StubClaude(string fixture, string? answer, int? silenceBeforeSecondResult)
     {
         _dir = Directory.CreateTempSubdirectory("df-e2e-stub-claude-").FullName;
         _log = Path.Combine(_dir, "runs.log");
         var transcript = Path.Combine(AppContext.BaseDirectory, "Fixtures", fixture);
+        if (answer is not null)
+        {
+            transcript = Path.Combine(_dir, "answer.jsonl");
+            File.WriteAllLines(transcript, AnswerTranscript(answer));
+        }
         var lines = File.ReadAllLines(transcript);
         // The silence comes before the second tool result (the slow test run's), as the unit test replays it.
         var silenceAt = silenceBeforeSecondResult is null ? -1

@@ -565,6 +565,11 @@ public class PlanRepositorySetTests
         var one = PlanPrompt.Build(spec, Widgets);
 
         Assert.Contains("- acme/widgets/ is acme/widgets (the plan's primary repository)\n- acme/gears/ is acme/gears\n", prompt);
+        // sc-25877: one repository whatever case each side spells it in (GitHub's names are case-insensitive).
+        Assert.Contains("- acme/widgets/ is acme/widgets (the plan's primary repository)\n", PlanPrompt.Build(spec, new RepoRef("Acme", "Widgets"), checkouts));
+        Assert.True(new RepoRef("Acme", "Widgets").Is(Widgets));
+        Assert.Equal("acme/widgets", new RepoRef("Acme", "Widgets").Key);
+        Assert.False(Widgets.Is(Gears));
         Assert.Contains("you cannot edit files or run commands", prompt);
         Assert.Contains("Every story is\nworked in acme/widgets", prompt);
         Assert.DoesNotContain("in this\nrepository only", prompt);

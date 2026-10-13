@@ -550,6 +550,32 @@ public class MultiRepoPipelineTests
             return item is null ? [] : await db.LedgerEntries.Where(e => e.WorkItemId == item.Id).OrderBy(e => e.Id).ToListAsync();
         }
 
+        /// <summary>
+        /// The plan item as a run that died right before its last transition's row left it: that row gone (it must be the item's
+        /// last row), the item in <paramref name="state"/> again, everything written before it — <see cref="WorkItem.Repo"/> too — kept.
+        /// </summary>
+        public async Task DiedBeforeLastTransition(WorkState state)
+        {
+            await using var db = new LedgerDbContext(_options);
+            var item = await db.WorkItems.SingleAsync(i => i.ExternalId == $"sc-{PlanId}");
+            var last = await db.LedgerEntries.Where(e => e.WorkItemId == item.Id).OrderBy(e => e.Id).LastAsync();
+            Assert.Null(last.Step);
+            db.LedgerEntries.Remove(last);
+            item.State = state;
+            await db.SaveChangesAsync();
+        }
+
+        /// <summary>The plan item as a run that died right before its last row (a checkpoint <paramref name="step"/>) left it.</summary>
+        public async Task DiedBeforeLastStep(string step)
+        {
+            await using var db = new LedgerDbContext(_options);
+            var item = await db.WorkItems.SingleAsync(i => i.ExternalId == $"sc-{PlanId}");
+            var last = await db.LedgerEntries.Where(e => e.WorkItemId == item.Id).OrderBy(e => e.Id).LastAsync();
+            Assert.Equal(step, last.Step);
+            db.LedgerEntries.Remove(last);
+            await db.SaveChangesAsync();
+        }
+
         public async Task<WorkItem> Item(int id = PlanId)
         {
             await using var db = new LedgerDbContext(_options);
@@ -895,7 +921,7 @@ public class MultiRepoPipelineTests
 
         Assert.Equal(WorkState.Escalated, failed.State);
         Assert.Equal(0, ChangesetPulls(h.DownRepo));
-        Assert.Empty(h.UpRepo.Merges.Where(m => m.Head == ChangesetBranch));
+        Assert.DoesNotContain(h.UpRepo.Merges, m => m.Head == ChangesetBranch);
         var record = (await h.Steps(RunPipeline.Steps.PlanDelivery)).Single()!;
         Assert.Equal($"delivered: none; not delivered: {Up} (its changeset pull request https://github.com/{Up}/pull/2 is Escalated), "
             + $"{Down} (its changeset pull request is not opened)", record);
@@ -959,7 +985,7 @@ public class MultiRepoPipelineTests
         Assert.Contains(ChangesetBranch, h.UpRepo.Drafted);
         Assert.Contains(ChangesetBranch, h.DownRepo.Drafted);
         Assert.Equal($"https://github.com/{Down}/pull/3", (await h.Steps(RunPipeline.Steps.PrsDrafted)).Single());
-        Assert.Empty(h.DownRepo.Merges.Where(m => m.Head == ChangesetBranch));
+        Assert.DoesNotContain(h.DownRepo.Merges, m => m.Head == ChangesetBranch);
         Assert.Equal(upstream.Commit, h.UpRepo.Tip(Main));
         var record = (await h.Steps(RunPipeline.Steps.PlanDelivery)).Single()!;
         Assert.StartsWith($"delivered: {Up} (merged into main as {upstream.Commit}", record);
@@ -995,6 +1021,106 @@ public class MultiRepoPipelineTests
         Assert.Single(h.UpRepo.BranchesCreated);
         Assert.Single(h.DownRepo.BranchesCreated);
         Assert.Single(await h.Steps(RunPipeline.Steps.Plan));
+    }
+
+    [Fact]
+    public async Task A_run_that_died_after_restoring_the_primary_repository_and_before_leaving_merge_finishes_the_pass_once()
+    {
+        // The downstream changeset merges first; the plan item's own (first) repository is the upstream one.
+        var h = new Harness();
+        var ids = await h.Plan(Independent(Down, Up));
+        Assert.Equal(WorkState.Planned, await h.Step());
+        await h.Merge(ids[0]);
+        await h.Merge(ids[1]);
+        Assert.Equal(WorkState.Review, await h.Step());
+        Assert.Equal(WorkState.Planned, await h.Step()); // the downstream pass merged
+        // As a run that died after EndPassAsync and before Merge → Planned left it: in Merge, its repository the primary again.
+        await h.DiedBeforeLastTransition(WorkState.Merge);
+        Assert.Equal((WorkState.Merge, Up), ((await h.Item()).State, (await h.Item()).Repo));
+        var (merges, upReads) = (h.DownRepo.Merges.Count, h.UpRepo.PullReads);
+
+        Assert.Equal(WorkState.Planned, await h.Step());
+
+        // The pass is the downstream repository's again (from the ledger), and nothing of it is done twice.
+        Assert.Equal([WorkState.MergeGate, WorkState.Merge, WorkState.Planned], (await h.Transitions())[^3..]);
+        Assert.Equal(new ChangesetDelivery(Down, ChangesetDelivery.Merged, $"https://github.com/{Down}/pull/2", h.DownRepo.Merges[^1].Commit),
+            ChangesetDelivery.FromDetail((await h.Steps(RunPipeline.Steps.ChangesetDelivered)).Single()));
+        Assert.Single(await h.Steps(RunPipeline.Steps.PrReport));
+        Assert.Equal(merges, h.DownRepo.Merges.Count);
+        Assert.Equal(upReads, h.UpRepo.PullReads); // the downstream pull request was not looked for in the upstream repository
+        Assert.Equal(Up, (await h.Item()).Repo);
+        Assert.Empty(await h.Steps(RunPipeline.Steps.MergedReported));
+
+        // The last pass, the same window before Merge → Watch: one report to the board, one closeout, one description.
+        Assert.Equal(WorkState.Review, await h.Step());
+        Assert.Equal(WorkState.Watch, await h.Step());
+        var comments = h.Comments(PlanId).Count;
+        await h.DiedBeforeLastTransition(WorkState.Merge);
+
+        Assert.Equal(WorkState.Watch, await h.Step());
+
+        Assert.Single(await h.Steps(RunPipeline.Steps.MergedReported));
+        Assert.Single(await h.Steps(RunPipeline.Steps.Closeout));
+        Assert.Equal(2, (await h.Steps(RunPipeline.Steps.PrReport)).Count); // one per pass
+        Assert.Equal(comments, h.Comments(PlanId).Count);
+        Assert.Equal([Down, Up], (await h.Steps(RunPipeline.Steps.ChangesetDelivered)).Select(d => ChangesetDelivery.FromDetail(d)!.Repo));
+        Assert.Single(h.UpRepo.Merges, m => m.Head == ChangesetBranch);
+        Assert.Single(h.DownRepo.Merges, m => m.Head == ChangesetBranch);
+    }
+
+    [Fact]
+    public async Task A_run_that_died_after_taking_the_changesets_repository_and_before_entering_review_opens_no_second_pull_request()
+    {
+        var h = new Harness();
+        var ids = await h.Plan(Independent(Down, Up));
+        Assert.Equal(WorkState.Planned, await h.Step());
+        await h.Merge(ids[0]);
+        await h.Merge(ids[1]);
+        Assert.Equal(WorkState.Review, await h.Step());
+        // As a run that died after RefreshAsync (the item is the changeset's repository's) and before Planned → Review left it.
+        await h.DiedBeforeLastTransition(WorkState.Planned);
+        Assert.Equal((WorkState.Planned, Down), ((await h.Item()).State, (await h.Item()).Repo));
+
+        Assert.Equal(WorkState.Review, await h.Step());
+
+        Assert.Equal(1, ChangesetPulls(h.DownRepo));
+        Assert.Equal(0, ChangesetPulls(h.UpRepo));
+        Assert.Single(await h.Steps(RunPipeline.Steps.Linked));
+        Assert.Equal(Down, (await h.Item()).Repo);
+        // And the plan goes on to the end, each changeset merged once, in order, in its own repository.
+        Assert.Equal(WorkState.Planned, await h.Step());
+        Assert.Equal(Up, (await h.Item()).Repo);
+        Assert.Equal(WorkState.Review, await h.Step());
+        Assert.Equal(WorkState.Watch, await h.Step());
+        Assert.Equal([Down, Up], (await h.Steps(RunPipeline.Steps.ChangesetDelivered)).Select(d => ChangesetDelivery.FromDetail(d)!.Repo));
+        Assert.Single(h.UpRepo.Merges, m => m.Head == ChangesetBranch);
+        Assert.Single(h.DownRepo.Merges, m => m.Head == ChangesetBranch);
+        Assert.DoesNotContain(await h.Transitions(), s => s == WorkState.Escalated);
+    }
+
+    [Fact]
+    public async Task A_run_that_died_between_an_empty_changesets_record_and_its_delivery_records_the_delivery_and_no_second_empty_row()
+    {
+        var h = new Harness();
+        var ids = await h.Plan();
+        await h.Step();
+        await h.Merge(ids[0]);
+        h.UpRepo.Advance(Main, [.. h.UpRepo.At(h.UpRepo.Tip(ChangesetBranch))]);
+        Assert.Equal(WorkState.Planned, await h.Step());
+        Assert.Single(await h.Steps(RunPipeline.Steps.ChangesetDelivered));
+        // As a run that died after changeset-empty and before changeset-delivered left it.
+        await h.DiedBeforeLastStep(RunPipeline.Steps.ChangesetDelivered);
+        Assert.Equal(RunPipeline.Steps.ChangesetEmpty, (await h.Rows())[^1].Step);
+
+        Assert.Equal(WorkState.Planned, await h.Step());
+
+        Assert.Equal($"{Up}: {ChangesetBranch} does not differ from main: no changeset pull request", (await h.Steps(RunPipeline.Steps.ChangesetEmpty)).Single());
+        Assert.Equal(new ChangesetDelivery(Up, ChangesetDelivery.Empty), ChangesetDelivery.FromDetail((await h.Steps(RunPipeline.Steps.ChangesetDelivered)).Single()));
+        Assert.Equal(0, ChangesetPulls(h.UpRepo));
+        // Delivered: the story that waits on the upstream changeset is released by the evaluations that follow.
+        await h.Merge(ids[1]);
+        Assert.Equal(WorkState.Planned, await h.Step());
+        Assert.Contains($"sc-{ids[2]}", (await h.Steps(RunPipeline.Steps.PlanReleased)).Select(d => d!.Split(' ')[0]));
     }
 
     [Fact]
@@ -1196,6 +1322,9 @@ public class MultiRepoPipelineTests
 
         Assert.Equal(WorkState.Escalated, outcome.State);
         Assert.Contains($"sc-{Lone}'s pull request https://github.com/{Up}/pull/1 is in {Up}, but the item works in {Down}", outcome.Error);
+        // sc-25877: the guard's other cause — a repository renamed or transferred on GitHub — and what the owner does about it.
+        Assert.Contains("If the repository was renamed or transferred on GitHub, update the item's `Repo:` line / `Factory:DefaultRepo` to the new name and re-run.",
+            outcome.Error);
         // Pull request 1 of the other repository was never read, reviewed or merged; nor was the item's own read as that repository's.
         Assert.Equal(0, h.DownRepo.PullReads);
         Assert.Equal(upReads, h.UpRepo.PullReads);

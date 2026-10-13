@@ -69,7 +69,8 @@ public static class LedgerReport
         {
             text.Append(CultureInfo.InvariantCulture,
                 $"Each of the plan's {stories.Count} stories in {Code(changeset.Repo)} was reviewed and merged into {Code(changeset.Branch)} by its own pull request through the ");
-            text.Append("factory's merge gate; this pull request takes them to the default branch together, through the same review, CI and gate.\n\n");
+            text.Append("factory's merge gate; this pull request takes them to the default branch together, through the same review, CI and gate.")
+                .Append(OutsideStories(stories, "Not {1}, which")).Append("\n\n");
             ChangesetLines(text, changesets);
             text.Append('\n');
         }
@@ -77,7 +78,8 @@ public static class LedgerReport
         {
             text.Append(CultureInfo.InvariantCulture,
                 $"Each of the plan's {stories.Count} stories was reviewed and merged into {Code(changeset.Branch)} by its own pull request through the ");
-            text.Append("factory's merge gate; this pull request takes them to the default branch together, through the same review, CI and gate.\n\n");
+            text.Append("factory's merge gate; this pull request takes them to the default branch together, through the same review, CI and gate.")
+                .Append(OutsideStories(stories, "Not {1}, which")).Append("\n\n");
         }
         PlanStoryLines(text, stories);
         text.Append("\nOpened by Dark Factory.\n\n");
@@ -125,7 +127,7 @@ public static class LedgerReport
         var several = changesets is { Count: > 1 };
         var text = new StringBuilder();
         text.Append(CultureInfo.InvariantCulture,
-            $"{WorkSourceComments.Author} {externalId}'s plan is complete: {merged} of its {stories.Count} stories merged through the factory's merge gate.\n\n");
+            $"{WorkSourceComments.Author} {externalId}'s plan is complete: {merged} of its {stories.Count} stories merged through the factory's merge gate.{OutsideStories(stories, "{0} more ({1})")}\n\n");
         if (several)
         {
             ChangesetLines(text, changesets!);
@@ -179,6 +181,22 @@ public static class LedgerReport
         }
     }
 
+    /// <summary>
+    /// The sentence a plan's report adds when stories of it were merged outside the factory into its changeset branch (sc-25877,
+    /// <see cref="Plans.PlanRelease.MergedOutsideChangeset"/>): which, and that the changeset pull request's review and gate are
+    /// the only ones their change gets. <paramref name="lead"/>: how the sentence names them after the report's own count
+    /// ("{0} more ({1})" in a closeout, "Not {1}:" after "each story was merged by the gate"). Nothing when there is none.
+    /// </summary>
+    private static string OutsideStories(IReadOnlyList<PlanStoryReport> stories, string lead)
+    {
+        var outside = stories.Where(s => Plans.PlanRelease.MergedOutsideChangeset(s.History)).Select(s => s.ExternalId).ToList();
+        return outside.Count == 0 ? ""
+            : " " + string.Format(CultureInfo.InvariantCulture, lead, outside.Count, string.Join(", ", outside))
+                + $" {(outside.Count == 1 ? "was" : "were")} {Plans.PlanRelease.MergedOutsideIntoChangeset} (the factory's merge gate did not merge "
+                + (outside.Count == 1 ? "its pull request" : "their pull requests")
+                + ", so the changeset pull request's review and gate are the only ones that change gets).";
+    }
+
     /// <summary>A pull request URL as a report shows it: itself when it is a short https URL, else inert in a code span.</summary>
     private static string Link(string url) =>
         url.Length <= MaxFragment && Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme == Uri.UriSchemeHttps ? url : Code(url);
@@ -194,7 +212,8 @@ public static class LedgerReport
             var pull = RunPipeline.LinkedPullRequestUrl(history);
             text.Append(CultureInfo.InvariantCulture, $"- {story.ExternalId} {Code(story.Title)}: ");
             text.Append(state is null ? "no ledger row" : $"{Outcome(state)} {state.State}");
-            text.Append(commit is null ? ", not merged" : $", merged as {Code(commit)}");
+            text.Append(commit is not null ? $", merged as {Code(commit)}"
+                : Plans.PlanRelease.MergedOutsideChangeset(history) ? $", {Plans.PlanRelease.MergedOutsideIntoChangeset}" : ", not merged");
             text.Append(pull is null ? ", no pull request recorded" : $", {Link(pull)}");
             text.Append('\n');
         }

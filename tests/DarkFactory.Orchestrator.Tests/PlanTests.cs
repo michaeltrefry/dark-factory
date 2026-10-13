@@ -961,10 +961,34 @@ public class PlanPipelineTests
     }
 
     [Fact]
-    public async Task A_plan_with_one_repo_line_or_none_is_planned_in_that_repository_as_before()
+    public async Task A_plan_whose_single_repo_line_names_an_unconfigured_repository_escalates_before_any_session_and_creates_nothing()
     {
-        // One line, naming a repository that is not in the configured list: as before sc-25874, the planner runs in it.
-        var h = new Harness { Configured = [Sandbox] };
+        // Epic E1 (sc-25877): "only repositories the factory is configured for" holds for every plan item, not only one naming several.
+        var h = new Harness { Configured = [Sandbox, Widgets] };
+        var source = new FakeWorkSource(PlanStory with { Description = "Reports need a CSV download.\n\nRepo: acme/gears" }) { PlansItems = true };
+        var planner = Planner(Reports(Planned));
+
+        var outcome = await h.Run(source, planner);
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains("The plan names 1 repository (acme/gears), but acme/gears is not configured for this factory", outcome.Error);
+        Assert.Contains("no planner session was started and no story was created", outcome.Error);
+        Assert.Empty(h.Planner!.Seats);
+        Assert.Empty(planner.Calls);
+        Assert.Empty(source.Children);
+        var steps = await h.Steps();
+        Assert.DoesNotContain(RunPipeline.Steps.Session, steps);
+        Assert.DoesNotContain(RunPipeline.Steps.Plan, steps);
+        Assert.DoesNotContain(RunPipeline.Steps.PlanCreating, steps);
+        Assert.DoesNotContain(RunPipeline.Steps.PlanStories, steps);
+        Assert.Contains(source.Comments, c => c.Contains("acme/gears is not configured"));
+    }
+
+    [Fact]
+    public async Task A_plan_with_one_repo_line_or_none_is_planned_in_that_repository_when_it_is_configured()
+    {
+        // One line naming a configured repository (in another spelling): the planner runs in it, seated as a one-repository plan.
+        var h = new Harness { Configured = [Sandbox, new RepoRef("Acme", "Gears")] };
         var one = new FakeWorkSource(PlanStory with { Description = "Reports need a CSV download.\n\nRepo: acme/gears" }) { PlansItems = true };
         var planner = Planner(Reports(Planned));
 
