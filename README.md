@@ -93,7 +93,7 @@ dashboard or the CLI, which write the same control rows in the ledger (`controls
 second and the dashboard redraws on `NOTIFY`.
 
 ```sh
-dotnet run --project src/DarkFactory.Orchestrator -- pause --factory       # or --epic 123 / --item sc-1234
+dotnet run --project src/DarkFactory.Orchestrator -- pause --factory       # or --epic 123 (a Shortcut epic) / --epic kb-3 (a Kanban epic) / --item sc-1234
 dotnet run --project src/DarkFactory.Orchestrator -- continue --factory
 dotnet run --project src/DarkFactory.Orchestrator -- stop --item sc-1234   # --epic / --factory stop every active item there
 ```

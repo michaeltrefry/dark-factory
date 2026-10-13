@@ -573,7 +573,7 @@ public class UsagePauseTests
 
         if (userScope is not null)
         {
-            var scope = userScope switch { "factory" => ControlScope.Factory, "epic" => ControlScope.Epic(5), _ => ControlScope.Item("sc-77") };
+            var scope = userScope switch { "factory" => ControlScope.Factory, "epic" => ControlScope.Epic(ItemNaming.Shortcut.Epic(5)), _ => ControlScope.Item("sc-77") };
             await l.Controls.SetAsync(scope, ControlState.Paused, "tester", CancellationToken.None);
         }
         await l.Controls.PauseForUsageAsync(T0 + TimeSpan.FromHours(2), UsagePause.UsageExhausted, CancellationToken.None);

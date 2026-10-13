@@ -134,7 +134,7 @@ public static class FactoryCli
         };
     }
 
-    /// <summary><c>factory &lt;action&gt; --item sc-N|gh-N|kb-N | --epic N | --factory</c>; the handler gets the action and the control scope.</summary>
+    /// <summary><c>factory &lt;action&gt; --item sc-N|gh-N|kb-N | --epic N|kb-N | --factory</c>; the handler gets the action and the control scope.</summary>
     private static Command ControlCommand(string action, string description, Func<string, string, CancellationToken, Task<int>> control)
     {
         var item = new Option<WorkSources.ItemRef?>("--item")
@@ -151,7 +151,20 @@ public static class FactoryCli
                 return null;
             },
         };
-        var epic = new Option<long?>("--epic") { Description = "Every story of one Shortcut epic (its id)" };
+        var epic = new Option<WorkSources.EpicRef?>("--epic")
+        {
+            Description = "Every item of one epic: a Shortcut epic by its id, e.g. 12, or a Kanban epic by the key the factory gave it, e.g. kb-3 (the dashboard shows it)",
+            CustomParser = result =>
+            {
+                var token = result.Tokens.Single().Value;
+                if (WorkSources.ItemNaming.ParseEpic(token) is { } parsed)
+                {
+                    return parsed;
+                }
+                result.AddError($"'{token}' is not an epic (expected a Shortcut epic's id, <number>, or a Kanban epic's key, kb-<number>).");
+                return null;
+            },
+        };
         var factory = new Option<bool>("--factory") { Description = "The whole factory" };
         var usage = new Option<bool>("--usage") { Description = "The factory's usage pause (plans exhausted): lift it before its reset time" };
         var freeze = new Option<bool>("--freeze") { Description = "The factory's automatic freeze: clear it (only later events can freeze it again)" };
@@ -169,18 +182,14 @@ public static class FactoryCli
             if (given != 1)
             {
                 result.AddError(action == "continue"
-                    ? "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic N, --factory, --usage or --freeze."
-                    : "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic N or --factory.");
-            }
-            else if (result.GetValue(epic) is <= 0)
-            {
-                result.AddError("--epic must be a positive epic id.");
+                    ? "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N), --factory, --usage or --freeze."
+                    : "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N) or --factory.");
             }
         });
         command.SetAction((parse, ct) =>
         {
             var scope = parse.GetValue(item) is { } story ? Controls.ControlScope.Item(story.ToString())
-                : parse.GetValue(epic) is { } epicId ? Controls.ControlScope.Epic(epicId)
+                : parse.GetValue(epic) is { } named ? Controls.ControlScope.Epic(named)
                 : parse.GetValue(usage) ? Controls.ControlScope.Usage
                 : parse.GetValue(freeze) ? Controls.ControlScope.Freeze
                 : Controls.ControlScope.Factory;

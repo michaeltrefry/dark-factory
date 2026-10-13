@@ -29,6 +29,10 @@ namespace DarkFactory.Orchestrator.WorkSources;
 /// What <c>factory work</c> runs before each listing of the source while the factory is not paused (<see cref="IntakeLane.Prepare"/>),
 /// or null. Only a watched source is prepared.
 /// </param>
+/// <param name="Links">
+/// The source's links to its items for the dashboard, built from the ledger alone (<see cref="IBoardLinks"/>, sc-25985), or null
+/// for a source whose items the dashboard shows without one.
+/// </param>
 public sealed record WorkSourceKind(
     ItemNaming Naming,
     string Name,
@@ -39,7 +43,8 @@ public sealed record WorkSourceKind(
     Func<FactoryOptions, HttpClient> Http,
     Func<FactoryOptions, HttpClient, IDbContextFactory<LedgerDbContext>, IWorkSource> Create,
     Func<FactoryOptions, string?> Unwatched,
-    Func<FactoryOptions, IntakeStatus, TextWriter, Func<CancellationToken, Task>>? Prepare = null);
+    Func<FactoryOptions, IntakeStatus, TextWriter, Func<CancellationToken, Task>>? Prepare = null,
+    Func<FactoryOptions, IBoardLinks>? Links = null);
 
 /// <summary>
 /// The factory's work sources (sc-25982), keyed by <see cref="ItemNaming"/>: the one registry <c>factory work</c>'s intake loop and
@@ -102,8 +107,17 @@ public sealed class WorkSourceRegistry(FactoryOptions options, Func<ItemNaming, 
             o => o.TryGet(x => x.KanbanWriteToken, out _)
                 ? $"KanbanBoard: no project is watched (set {KanbanScope.Setting}); no Kanban item will be picked up "
                     + "(those already in flight are still finished)."
-                : null),
+                : null,
+            // Needs no credential: the links are built on Kanban:WebUrl from what the ledger recorded.
+            Links: o => new KanbanLedgerLinks(o.KanbanWebUrl)),
     ];
+
+    /// <summary>
+    /// Every source's links for the dashboard (<see cref="WorkSourceKind.Links"/>), whether or not the source is configured: the
+    /// dashboard lists the ledger's items of any source.
+    /// </summary>
+    public static IReadOnlyList<IBoardLinks> BoardLinks(FactoryOptions options) =>
+        Kinds.Select(k => k.Links?.Invoke(options)).OfType<IBoardLinks>().ToList();
 
     private readonly Dictionary<ItemNaming, IWorkSource> _sources = [];
     private readonly List<HttpClient> _clients = [];

@@ -1,3 +1,4 @@
+using DarkFactory.Orchestrator.Controls;
 using System.Text.Json.Nodes;
 using DarkFactory.Orchestrator.Gateway;
 using DarkFactory.Orchestrator.Kanban;
@@ -48,7 +49,7 @@ public class KanbanWorkSourceTests
             return Task.CompletedTask;
         });
 
-        public Task<int> Key(FakeKanbanBoard.Item item) => Keys.KeyAsync(item.Id, CancellationToken.None);
+        public Task<int> Key(FakeKanbanBoard.Item item) => Keys.KeyAsync(item.Id, item.ProjectId, CancellationToken.None);
 
         /// <summary>
         /// The ledger's record that this factory claimed the item: its work item with a <c>claimed</c> checkpoint, as Intake leaves
@@ -500,8 +501,8 @@ public class KanbanWorkSourceTests
         // Written on the owner's board: trusted like a Shortcut story (E5), so its name and text are not fenced or made inert.
         Assert.False(spec.Story.UntrustedName);
         Assert.Equal("Count words", spec.Story.PublicName);
-        // A Kanban epic has no number an epic-scope control addresses.
-        Assert.Equal(new WorkEpic(null, "Word counting", "Counts words.", board), spec.Epic);
+        // The epic is named by the key the ledger gave it (sc-25985), recorded before the spec names it.
+        Assert.Equal(new WorkEpic(1, "Word counting", "Counts words.", board), spec.Epic);
         Assert.Equal([new WorkDocument("Requirements", "E1: whitespace is no word.", $"{board}&document={doc}")], spec.Documents);
         Assert.Empty(h.Board.Writes);
         Assert.Equal(["get_work_item", "list_projects", "get_epic", "list_epic_documents"], h.Board.Calls.Select(c => c.Tool));
@@ -783,6 +784,137 @@ public class KanbanWorkSourceTests
             throw new DbUpdateException("the ledger's disk is full");
     }
 
+    // ---- Epics (sc-25985) ----
+
+    [Fact]
+    public async Task An_epic_gets_one_ledger_key_recorded_before_the_spec_names_it_and_keeps_it()
+    {
+        var h = new Harness();
+        var (counting, trimming) = (h.Board.AddEpic(h.Project, "Word counting"), h.Board.AddEpic(h.Project, "Trimming"));
+        var first = await h.Key(h.Board.AddItem(h.Project, "Count words", epic: counting));
+        var second = await h.Key(h.Board.AddItem(h.Project, "Count lines", epic: counting));
+        var third = await h.Key(h.Board.AddItem(h.Project, "Trim words", epic: trimming));
+        var loose = await h.Key(h.Board.AddItem(h.Project, "Split words"));
+        await using (var db = h.Db())
+        {
+            Assert.Empty(await db.KanbanEpics.ToListAsync()); // listing an item gives its epic no key: nothing names it yet
+        }
+
+        var epics = new List<long?>();
+        foreach (var id in new[] { first, second, third, loose, first })
+        {
+            // A fresh source each time, as after a restart.
+            epics.Add((await h.Source().ReadSpecAsync(id, None)).Epic?.Id);
+        }
+
+        // Keys of their own, apart from the items' (item 1 is in epic 1), one per epic for good; no epic, no key.
+        Assert.Equal([1, 1, 2, null, 1], epics);
+        await using (var db = h.Db())
+        {
+            Assert.Equal([(1, counting.Id, h.Project.Id), (2, trimming.Id, h.Project.Id)],
+                (await db.KanbanEpics.OrderBy(e => e.Id).ToListAsync()).Select(e => (e.Id, e.EpicId, e.ProjectId)));
+        }
+        Assert.Empty(h.Board.Writes); // a key is the ledger's: nothing of it is written onto the board
+        Assert.True(await h.Source().KnowsEpicAsync(2, None));
+        Assert.False(await h.Source().KnowsEpicAsync(3, None));
+    }
+
+    [Fact]
+    public async Task The_dashboards_links_are_built_from_the_ledger_alone_on_the_web_url()
+    {
+        var h = new Harness();
+        var epic = h.Board.AddEpic(h.Project, "Word counting");
+        var (inEpic, loose) = (h.Board.AddItem(h.Project, "Count words", epic: epic), h.Board.AddItem(h.Project, "Split words"));
+        var old = Guid.NewGuid();
+        await using (var db = h.Db())
+        {
+            var ledger = new WorkLedger(db, TimeProvider.System);
+            await ledger.GetOrCreateAsync("kanban", $"kb-{await h.Key(inEpic)}", "Count words", "acme/widgets", null, None,
+                (await h.Source().ReadSpecAsync(1, None)).Epic!.Id);
+            await ledger.GetOrCreateAsync("kanban", $"kb-{await h.Key(loose)}", "Split words", "acme/widgets", null, None);
+            // A key row from before projects were recorded, and a Shortcut story with the same numbers.
+            db.KanbanItems.Add(new KanbanItem { ItemId = old, FirstSeenAt = DateTimeOffset.UtcNow });
+            await db.SaveChangesAsync();
+            await ledger.GetOrCreateAsync("kanban", "kb-3", "Old", "acme/widgets", null, None);
+            await ledger.GetOrCreateAsync("shortcut", "sc-1", "Story", "acme/widgets", null, None, 1);
+        }
+        h.Board.Calls.Clear();
+        var links = new KanbanLedgerLinks(new Uri("https://kanban.test/"));
+
+        IReadOnlyDictionary<string, BoardLink> found;
+        await using (var db = h.Db())
+        {
+            var items = await db.WorkItems.AsNoTracking().OrderBy(i => i.Id).ToListAsync();
+            var byId = await links.OfAsync(db, items, None);
+            found = items.Where(i => byId.ContainsKey(i.Id)).ToDictionary(i => i.ExternalId, i => byId[i.Id]);
+        }
+
+        // The same links the work source builds (one builder); the web UI opens the item's board — its epic's when it has one.
+        var board = $"https://kanban.test/?project={h.Project.Id}";
+        Assert.Equal(new BoardLink($"{board}&epic={epic.Id}&item={inEpic.Id}", $"{board}&epic={epic.Id}"), found["kb-1"]);
+        Assert.Equal((await h.Source().ReadSpecAsync(1, None)).Story.AppUrl, found["kb-1"].Item);
+        Assert.Equal((await h.Source().ReadSpecAsync(1, None)).Epic!.AppUrl, found["kb-1"].Epic);
+        Assert.Equal(new BoardLink($"{board}&item={loose.Id}", null), found["kb-2"]);
+        Assert.Equal(new BoardLink(null, null), found["kb-3"]); // no project recorded yet: no link, until the item is next read
+        Assert.DoesNotContain("sc-1", found.Keys); // not Kanban's to link
+        Assert.Equal(["get_work_item", "list_projects", "get_epic", "list_epic_documents", "get_work_item", "list_projects", "get_epic",
+            "list_epic_documents"], h.Board.Calls.Select(c => c.Tool)); // the two specs read above; the links asked the board nothing
+    }
+
+    [Fact]
+    public async Task The_dashboards_data_gives_a_kanban_item_its_links_its_epic_and_the_control_of_its_own_epic()
+    {
+        var h = new Harness();
+        var epic = h.Board.AddEpic(h.Project, "Word counting");
+        var item = h.Board.AddItem(h.Project, "Count words", epic: epic);
+        var controls = new LedgerControls(h.Contexts, TimeProvider.System);
+        await using (var db = h.Db())
+        {
+            var ledger = new WorkLedger(db, TimeProvider.System);
+            var key = await h.Key(item);
+            await ledger.GetOrCreateAsync("kanban", $"kb-{key}", "Count words", "acme/widgets", null, None, (await h.Source().ReadSpecAsync(key, None)).Epic!.Id);
+            await ledger.GetOrCreateAsync("shortcut", "sc-1", "Story", "acme/widgets", null, None, 1); // Shortcut epic 1
+        }
+        h.Board.Calls.Clear();
+        var data = new Dashboard.DashboardData(h.Contexts, TimeProvider.System, boardLinks: [new KanbanLedgerLinks(new Uri("https://kanban.test/"))]);
+
+        await controls.SetAsync("epic:kb-1", ControlState.Paused, "michael", None);
+        var rows = (await data.ActiveItemsAsync(None)).ToDictionary(r => r.ExternalId);
+
+        var board = $"https://kanban.test/?project={h.Project.Id}&epic={epic.Id}";
+        Assert.Equal((ItemNaming.Kanban.Epic(1), new BoardLink($"{board}&item={item.Id}", board), ControlState.Paused),
+            (rows["kb-1"].Epic, rows["kb-1"].Links, rows["kb-1"].Control));
+        // The Shortcut story in Shortcut epic 1 is not paused by the Kanban epic's row, and has no link of this kind.
+        Assert.Equal((ItemNaming.Shortcut.Epic(1), null, ControlState.Running), (rows["sc-1"].Epic, rows["sc-1"].Links, rows["sc-1"].Control));
+
+        await controls.SetAsync("epic:kb-1", ControlState.Running, "michael", None);
+        await controls.SetAsync("epic:1", ControlState.Paused, "michael", None);
+        rows = (await data.ActiveItemsAsync(None)).ToDictionary(r => r.ExternalId);
+        Assert.Equal((ControlState.Running, ControlState.Paused), (rows["kb-1"].Control, rows["sc-1"].Control));
+
+        Assert.Empty(h.Board.Calls); // the dashboard reads the ledger only
+        // Without a source's links (a host that has none) the item is listed all the same.
+        Assert.Null(Assert.Single(await new Dashboard.DashboardData(h.Contexts, TimeProvider.System).ActiveItemsAsync(None), r => r.ExternalId == "kb-1").Links);
+    }
+
+    [Fact]
+    public async Task An_item_seen_again_has_its_project_recorded_and_keeps_its_key()
+    {
+        var h = new Harness();
+        var item = h.Board.AddItem(h.Project, "Count words");
+        await using (var db = h.Db())
+        {
+            db.KanbanItems.Add(new KanbanItem { ItemId = item.Id, FirstSeenAt = DateTimeOffset.UtcNow }); // as before sc-25985
+            await db.SaveChangesAsync();
+        }
+
+        Assert.Equal([1], await h.Source().ListReadyAsync(None));
+
+        await using var after = h.Db();
+        var row = await after.KanbanItems.SingleAsync();
+        Assert.Equal((1, item.Id, (Guid?)h.Project.Id), (row.Id, row.ItemId, row.ProjectId));
+    }
+
     [Fact]
     public async Task A_key_that_could_not_be_saved_for_another_reason_than_a_lost_race_fails_with_that_reason()
     {
@@ -790,7 +922,7 @@ public class KanbanWorkSourceTests
             .AddInterceptors(new FailingSaves()).Options;
         var keys = new KanbanKeys(new LedgerDbContextFactory(options));
 
-        var ex = await Assert.ThrowsAsync<DbUpdateException>(() => keys.KeyAsync(Guid.NewGuid(), None));
+        var ex = await Assert.ThrowsAsync<DbUpdateException>(() => keys.KeyAsync(Guid.NewGuid(), Guid.NewGuid(), None));
 
         Assert.Equal("the ledger's disk is full", ex.Message); // not "Sequence contains no elements"
         await using var db = new LedgerDbContext(options);

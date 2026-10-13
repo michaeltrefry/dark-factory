@@ -262,7 +262,10 @@ public class GatePipelineTests
         public CodeGraphRiskReader? RiskReader { get; init; }
         /// <summary><c>Gate:CiTimeoutMinutes</c> for the run.</summary>
         public TimeSpan CiTimeout { get; init; } = TimeSpan.FromSeconds(5);
-        /// <summary>When set, the gate's waits run on <see cref="Time"/> (which only moves when the test advances it).</summary>
+        /// <summary>
+        /// When set, the gate's waits run on <see cref="Time"/> (which only moves when the test advances it), and the default
+        /// CodeGraph reader's overlay wait is bounded for a fake clock (<see cref="FakeCodeGraphRisk.FakeClockOverlayTimeout"/>).
+        /// </summary>
         public bool GateOnFakeClock { get; init; }
         /// <summary>How often a run's controls are polled while a worker or the gate's test runs execute (the pipeline's default when null).</summary>
         public TimeSpan? ControlPoll { get; init; }
@@ -284,7 +287,7 @@ public class GatePipelineTests
                     controls: RunControls ?? Controls,
                     controlPollInterval: ControlPoll,
                     gate: new GateStage(GitHub, Panel ?? Reviewer, TimeSpan.FromMilliseconds(1), CiTimeout, GateOnFakeClock ? Time : null,
-                        TestRunner, Overlays, NoCodeGraph ? null : RiskReader ?? FakeCodeGraphRisk.Reader(CodeGraph)),
+                        TestRunner, Overlays, NoCodeGraph ? null : RiskReader ?? FakeCodeGraphRisk.Reader(CodeGraph, GateOnFakeClock)),
                     freeze: Freeze is null ? null : new FactoryFreeze(Contexts, Controls, Freeze, TimeProvider.System, GitHub),
                     maxControlReadFailures: MaxControlReadFailures)
                 .RunAsync(77, ct);
