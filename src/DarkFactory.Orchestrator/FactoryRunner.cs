@@ -20,10 +20,12 @@ public static class FactoryRunner
     /// item). Every setting with a rule; the credentials every run needs (session costs come from the router, pushes and pull
     /// requests need the GitHub App, the merge gate its own App, the dashboard its login); no retired review-model setting; then
     /// the work sources (sc-25982): at least one must be configured (<see cref="WorkSourceRegistry.Configured"/> — any non-empty
-    /// set, KanbanBoard alone included; none is refused with <see cref="WorkSourceRegistry.NoneConfigured"/>), a watched source
+    /// set, KanbanBoard alone included; none is refused with <see cref="WorkSourceRegistry.NothingWatched"/>, which names every
+    /// source's settings and how work already in flight is finished by id meanwhile), a watched source
     /// must have its credential, and each configured source's scope is checked on its board (<see cref="CheckWatchScopeAsync"/>).
-    /// A source that has a credential and watches nothing is a note on <paramref name="stderr"/>. Returns why the factory cannot
-    /// start (exit code 2), or null.
+    /// A source that has a credential and watches nothing is a note on <paramref name="stderr"/>: it is not polled for new work
+    /// and its scope is not checked (no board request), but the loop still finishes its items already in flight
+    /// (<see cref="WorkSourceRegistry.Lanes"/>). Returns why the factory cannot start (exit code 2), or null.
     /// </summary>
     public static async Task<string?> CheckWorkStartAsync(FactoryOptions options, WorkSourceRegistry sources, TextWriter stderr, CancellationToken ct)
     {
@@ -46,7 +48,7 @@ public static class FactoryRunner
             }
             if (configured.Count == 0)
             {
-                return WorkSourceRegistry.NoneConfigured;
+                return WorkSourceRegistry.NothingWatched;
             }
             if (Issues.IssueIntake.UnsandboxedRefusal(options.WorkerSandbox, options.WatchedIssueRepos) is { } unsandboxed)
             {

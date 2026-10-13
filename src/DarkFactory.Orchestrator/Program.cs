@@ -74,6 +74,14 @@ static async Task<int> WorkAsync(CancellationToken ct)
         return 2;
     }
     await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
+    using (var sources = new WorkSourceRegistry(options))
+    {
+        // Active items of a source that has no credential: no lane runs them, so say so once rather than leave them silently.
+        foreach (var warning in await sources.UnreachableAsync(ct))
+        {
+            Console.Error.WriteLine(warning);
+        }
+    }
     // One process: the session hub and its relay, plus the intake loop polling every configured work source.
     await using var app = FactoryHost.BuildWork(options);
     await app.StartAsync(ct);

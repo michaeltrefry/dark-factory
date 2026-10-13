@@ -38,8 +38,9 @@ public interface IItemRunner
 /// (<see cref="FactoryUnavailableException"/>, a ledger database error, or the poll itself) ends the poll and escalates
 /// nothing; any other failure counts against its item, and after <see cref="IntakeOptions.MaxItemFailures"/> in a row
 /// the loop gives up on the item (<see cref="IItemRunner.GiveUpAsync"/>) instead of retrying it every poll.
-/// <paramref name="lanes"/> holds one lane per configured work source (sc-25982: any non-empty set of them, in
-/// <see cref="WorkSourceRegistry.Kinds"/> order; none polls nothing), polled in turn by the same loop, so
+/// <paramref name="lanes"/> holds one lane per work source that is watched or has its credential (sc-25982,
+/// <see cref="WorkSourceRegistry.Lanes"/>: any set of them, in <see cref="WorkSourceRegistry.Kinds"/> order; an unwatched one
+/// lists nothing ready and only has its in-flight items finished; none polls nothing), polled in turn by the same loop, so
 /// their runs never overlap; a source whose listing fails is skipped for that poll without holding up the others. Items are
 /// keyed by their external id (<c>sc-12</c>, <c>gh-3</c>, <c>kb-4</c>) on the dashboard. A run deferred by the freeze evaluator
 /// (<see cref="RunOutcome.Deferred"/>) is shown on the dashboard and ends the poll's new work: no ready item of any lane is run,

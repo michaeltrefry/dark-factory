@@ -905,14 +905,19 @@ the gate merges the item before the stop lands, the stop is printed as not check
 
 Not live (every `dotnet test`): `WorkSourceRegistryTests` — the registry (one kind per naming; the configured set for every
 combination of sources; a watched source without its credential refused; an item by id needing only its source's credential),
-each wiring point (a lane per configured source and only the issues lane prepared; one poll running a Shortcut story and a
-Kanban item; the in-flight listing per source; Stop by id of a Kanban item on the fake board — pull request drafted, `Backlog`,
+each wiring point (a lane per source that is watched or has its credential, and only a watched issues lane prepared; a source
+with its credential and no watch scope asked nothing — no listing, no scope check, nothing claimed — while a poll still finishes
+the pending Stop of its in-flight item; the start-up warning per source with active ledger items and no credential; one poll
+running a Shortcut story and a Kanban item; the in-flight listing per source; Stop by id of a Kanban item on the fake board — pull request drafted, `Backlog`,
 claim released, comment, Cancelled — with a same-numbered Shortcut story untouched; a factory-scope Stop over both sources and
-an item whose source is not configured reported as not stopped; Pause and Continue by id; the epic scope asking each item's own
+an item whose source is not configured reported as not stopped; Stop of one item whose source has no credential refused
+before any control is written; Pause and Continue by id; the epic scope asking each item's own
 board), the start-up check (KanbanBoard alone with no Shortcut token; Shortcut alone asking nothing of KanbanBoard; no source →
-the refusal naming every source's settings; a bad scope or missing credential of either source), `factory run` exiting 2
+the refusal naming every source's settings and how to finish leftover work by id; a bad scope or missing credential of either source), `factory run` exiting 2
 before the router is asked when the item's source is not configured, the work host built with KanbanBoard alone, the help
-text, and a scan that no file outside `Shortcut/` but the registry names the Shortcut source's type.
+text, and a scan that no file outside `Shortcut/` but the registry names the Shortcut source's type. These tests build their
+options with no keychain and no process environment, so they run (never skip) on a machine whose shell carries
+`SHORTCUT_API_TOKEN` or `FACTORY_KANBAN_WRITE_TOKEN`.
 
 ## Upgrading a Phase 1 ledger: items parked at Review
 

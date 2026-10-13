@@ -23,10 +23,6 @@ public class WorkSourceRegistryTests
 {
     private static readonly CancellationToken None = CancellationToken.None;
 
-    /// <summary>Whether the environment supplies a source's token (a developer's shell): what "not configured" tests cannot then show.</summary>
-    private static bool EnvironmentConfiguresASource =>
-        Environment.GetEnvironmentVariable("SHORTCUT_API_TOKEN") is not null || Environment.GetEnvironmentVariable("FACTORY_KANBAN_WRITE_TOKEN") is not null;
-
     private static readonly Dictionary<string, string?> Shortcut = new() { ["Shortcut:ApiToken"] = "tok", ["Shortcut:Watch:Teams"] = "darkfactory" };
 
     private static readonly Dictionary<string, string?> Kanban = new()
@@ -43,15 +39,26 @@ public class WorkSourceRegistryTests
         ["Dashboard:PasswordHash"] = "hash", ["CodeGraph:Token"] = "cg",
     };
 
+    /// <summary>A source's token and no watch scope: enough to reach its items by id and to finish those in flight, not to be polled.</summary>
+    private static readonly Dictionary<string, string?> ShortcutToken = new() { ["Shortcut:ApiToken"] = "tok" };
+
+    private static readonly Dictionary<string, string?> KanbanToken = new() { ["Kanban:WriteToken"] = FakeKanbanBoard.FullToken, ["Kanban:WebUrl"] = "https://kanban.test/" };
+
+    /// <summary>
+    /// Options from these settings alone: no keychain (<see cref="InMemorySecrets"/>) and no process environment, so what is "not
+    /// configured" here is so on any machine — a developer's <c>SHORTCUT_API_TOKEN</c> or <c>FACTORY_KANBAN_WRITE_TOKEN</c> included.
+    /// </summary>
     private static FactoryOptions Options(params Dictionary<string, string?>[] settings) =>
         new(new ConfigurationBuilder().AddInMemoryCollection(
-                settings.SelectMany(s => s).GroupBy(kv => kv.Key).ToDictionary(g => g.Key, g => g.Last().Value)).Build(), new InMemorySecrets()); // a later one wins
+                settings.SelectMany(s => s).GroupBy(kv => kv.Key).ToDictionary(g => g.Key, g => g.Last().Value)).Build(), new InMemorySecrets(), // a later one wins
+            environment: _ => null);
 
     /// <summary>Both fake boards and one in-memory ledger, behind a registry over the given settings.</summary>
     private sealed class Boards
     {
         public KanbanWorkSourceTests.Harness Kanban { get; } = new();
         public FakeShortcutBoard Shortcut { get; } = new();
+        public FakeApi GitHub { get; } = new();
         public List<ItemNaming> Built { get; } = [];
         public InProcessRunLocks Locks { get; } = new();
         public FakePullRequests Prs { get; } = new();
@@ -62,7 +69,7 @@ public class WorkSourceRegistryTests
             Built.Add(naming);
             return naming == ItemNaming.Kanban ? Kanban.Board.Client()
                 : naming == ItemNaming.Shortcut ? Shortcut.Client()
-                : new HttpClient(new FakeApi()) { BaseAddress = new Uri("https://github.test/") };
+                : GitHub.Client("https://github.test/");
         }, Kanban.Contexts);
 
         /// <summary>A lane's runner: the pipeline without a gate stage, over the shared ledger, like <c>FactoryItemRunner</c> over Postgres.</summary>
@@ -120,8 +127,20 @@ public class WorkSourceRegistryTests
         Assert.Contains("Kanban:WriteToken", WorkSourceRegistry.KindOf(ItemNaming.Kanban).Settings);
         Assert.Contains("Kanban:Watch:Projects", WorkSourceRegistry.KindOf(ItemNaming.Kanban).Settings);
         Assert.Contains("GitHub:Watch:Repos", WorkSourceRegistry.KindOf(ItemNaming.GitHubIssue).Settings);
-        // The refusal with no source names all of them.
+        // The refusal with no source names all of them, and how work already in flight is finished by id.
         Assert.All(WorkSourceRegistry.Kinds, k => Assert.Contains(k.Settings, WorkSourceRegistry.NoneConfigured));
+        Assert.Equal(WorkSourceRegistry.NoneConfigured + " An item the factory already works needs no watch scope to be finished by hand: "
+            + "`factory stop --item <id>` cancels it, `factory run <id> --ignore-scope` runs it on.", WorkSourceRegistry.NothingWatched);
+        // The credential alone is what an item named by id needs: it names no watch scope.
+        Assert.All(WorkSourceRegistry.Kinds, k => Assert.DoesNotContain("Watch", k.Credential));
+        Assert.Equal("a Shortcut API token (env SHORTCUT_API_TOKEN, config 'Shortcut:ApiToken' or keychain account 'shortcut-api-token')",
+            WorkSourceRegistry.KindOf(ItemNaming.Shortcut).Credential);
+        Assert.Equal("a KanbanBoard write token (env FACTORY_KANBAN_WRITE_TOKEN, config 'Kanban:WriteToken' or keychain account 'kanban-write-token')",
+            WorkSourceRegistry.KindOf(ItemNaming.Kanban).Credential);
+        Assert.Equal("the factory's GitHub App (config 'GitHub:AppId' and 'GitHub:PrivateKeyPem', or keychain accounts 'github-app-id' and "
+            + "'github-app-private-key': `factory github-app setup`)", WorkSourceRegistry.KindOf(ItemNaming.GitHubIssue).Credential);
+        Assert.StartsWith(WorkSourceRegistry.KindOf(ItemNaming.Shortcut).Credential + " and a watch scope", WorkSourceRegistry.KindOf(ItemNaming.Shortcut).Settings);
+        Assert.StartsWith(WorkSourceRegistry.KindOf(ItemNaming.Kanban).Credential + " and the watched projects", WorkSourceRegistry.KindOf(ItemNaming.Kanban).Settings);
         Assert.Throws<ArgumentException>(() => WorkSourceRegistry.KindOf(new ItemNaming("jira", "jr", "Jira issue")));
     }
 
@@ -139,10 +158,6 @@ public class WorkSourceRegistryTests
     [MemberData(nameof(Sets))]
     public void The_configured_sources_are_exactly_those_whose_watch_scope_is_set_in_a_fixed_order(string[] set, string[] expected)
     {
-        if (EnvironmentConfiguresASource)
-        {
-            return;
-        }
         var b = new Boards();
         var settings = new List<Dictionary<string, string?>> { Core };
         settings.AddRange(set.Select(s => s switch { "shortcut" => Shortcut, "kanban" => Kanban, _ => Issues }));
@@ -159,10 +174,6 @@ public class WorkSourceRegistryTests
     [Fact]
     public void A_watched_source_without_its_credential_is_refused_naming_the_credential_never_left_out()
     {
-        if (EnvironmentConfiguresASource)
-        {
-            return;
-        }
         var b = new Boards();
         using var kanban = b.Registry(Options(Core, Shortcut, new() { ["Kanban:Watch:Projects"] = "DF" }));
         Assert.Contains("Kanban:WriteToken", Assert.Throws<MissingCredentialException>(() => kanban.Configured).Message);
@@ -176,29 +187,26 @@ public class WorkSourceRegistryTests
     [Fact]
     public void An_item_named_by_id_needs_its_sources_credential_and_no_watch_scope()
     {
-        if (EnvironmentConfiguresASource)
-        {
-            return;
-        }
         var b = new Boards();
         // Shortcut's token and no scope (what `factory run sc-12 --ignore-scope` always worked with); nothing of KanbanBoard.
-        using var sources = b.Registry(Options(Core, Issues, new() { ["Shortcut:ApiToken"] = "tok" }));
+        using var sources = b.Registry(Options(Core, Issues, ShortcutToken));
 
         Assert.IsType<ShortcutWorkSource>(sources.Of(ItemNaming.Shortcut));
         Assert.Same(sources.Of(ItemNaming.Shortcut), sources.Find(ItemNaming.Shortcut));
         Assert.Equal(["github"], sources.Configured.Select(s => s.Naming.Source));
         Assert.Null(sources.Find(ItemNaming.Kanban));
         var missing = Assert.Throws<MissingCredentialException>(() => sources.Of(ItemNaming.Kanban));
+        // The credential, which is all an item named by id needs: no watch scope is asked for.
         Assert.Equal("The KanbanBoard work source is not configured (kb-<n> names a Kanban item): it needs a KanbanBoard write token "
-            + "(env FACTORY_KANBAN_WRITE_TOKEN, config 'Kanban:WriteToken' or keychain account 'kanban-write-token') and the watched projects "
-            + "(Kanban:Watch:Projects).", missing.Message);
+            + "(env FACTORY_KANBAN_WRITE_TOKEN, config 'Kanban:WriteToken' or keychain account 'kanban-write-token').", missing.Message);
+        Assert.Equal(missing.Message, WorkSourceRegistry.NeedsCredential(ItemNaming.Kanban));
         Assert.DoesNotContain(ItemNaming.Kanban, b.Built);
 
         // With no source configured at all, the refusal names what would configure each one.
         using var none = b.Registry(Options(Core));
         var nothing = Assert.Throws<MissingCredentialException>(() => none.Of(ItemNaming.Shortcut));
-        Assert.StartsWith("The Shortcut work source is not configured (sc-<n> names a Shortcut story). No work source is configured", nothing.Message);
-        Assert.EndsWith(WorkSourceRegistry.NoneConfigured, nothing.Message);
+        Assert.Equal("The Shortcut work source is not configured (sc-<n> names a Shortcut story): it needs a Shortcut API token "
+            + "(env SHORTCUT_API_TOKEN, config 'Shortcut:ApiToken' or keychain account 'shortcut-api-token'). " + WorkSourceRegistry.NoneConfigured, nothing.Message);
     }
 
     [Fact]
@@ -232,10 +240,6 @@ public class WorkSourceRegistryTests
     [Fact]
     public async Task Factory_work_starts_with_kanban_configured_and_no_shortcut_token_and_validates_the_kanban_scope()
     {
-        if (EnvironmentConfiguresASource)
-        {
-            return;
-        }
         var b = new Boards();
         var stderr = new StringWriter();
         using var sources = b.Registry(Options(Core, Kanban));
@@ -254,10 +258,6 @@ public class WorkSourceRegistryTests
     [Fact]
     public async Task Factory_work_with_only_shortcut_configured_checks_the_shortcut_scope_and_nothing_of_kanban()
     {
-        if (EnvironmentConfiguresASource)
-        {
-            return;
-        }
         var b = new Boards();
         var stderr = new StringWriter();
         using var sources = b.Registry(Options(Core, Shortcut));
@@ -273,29 +273,29 @@ public class WorkSourceRegistryTests
     [Fact]
     public async Task Factory_work_with_no_source_configured_is_refused_naming_the_settings_that_would_configure_one()
     {
-        if (EnvironmentConfiguresASource)
-        {
-            return;
-        }
         var b = new Boards();
         var stderr = new StringWriter();
         // A token alone watches nothing: that is no configured source either, and each such source says so.
-        var options = Options(Core, new() { ["Shortcut:ApiToken"] = "tok", ["Kanban:WriteToken"] = FakeKanbanBoard.FullToken });
+        var options = Options(Core, ShortcutToken, KanbanToken);
         using var sources = b.Registry(options);
 
         var refusal = await FactoryRunner.CheckWorkStartAsync(options, sources, stderr, None);
 
-        Assert.Equal(WorkSourceRegistry.NoneConfigured, refusal);
+        Assert.Equal(WorkSourceRegistry.NothingWatched, refusal);
         Assert.StartsWith("No work source is configured", refusal);
+        // What is left in flight can still be finished by id, which needs no watch scope.
+        Assert.Contains("`factory stop --item <id>`", refusal);
+        Assert.Contains("`factory run <id> --ignore-scope`", refusal);
         foreach (var setting in new[] { "Shortcut:ApiToken", "Shortcut:Watch:Teams", "Shortcut:Watch:Epics", "Kanban:WriteToken", "Kanban:Watch:Projects", "GitHub:Watch:Repos" })
         {
             Assert.Contains(setting, refusal);
         }
         Assert.Equal(
         [
-            "Shortcut: the watch scope is empty (set Shortcut:Watch:Teams and/or Shortcut:Watch:Epics); no Shortcut story will be picked up.",
+            "Shortcut: the watch scope is empty (set Shortcut:Watch:Teams and/or Shortcut:Watch:Epics); no Shortcut story will be picked up "
+                + "(those already in flight are still finished).",
             "No GitHub issues are watched (set GitHub:Watch:Repos to triage a repo's issues).",
-            "KanbanBoard: no project is watched (set Kanban:Watch:Projects); no Kanban item will be picked up.",
+            "KanbanBoard: no project is watched (set Kanban:Watch:Projects); no Kanban item will be picked up (those already in flight are still finished).",
         ], stderr.ToString().Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries));
         Assert.Empty(b.Built);
         Assert.Empty(b.Kanban.Board.Calls);
@@ -305,10 +305,6 @@ public class WorkSourceRegistryTests
     [Fact]
     public async Task Factory_work_reports_each_configured_sources_bad_scope_or_missing_credential_before_polling()
     {
-        if (EnvironmentConfiguresASource)
-        {
-            return;
-        }
         var b = new Boards();
         // Both sources configured; the Kanban one watches a project the board does not have.
         var unknown = Options(Core, Shortcut, Kanban, new() { ["Kanban:Watch:Projects"] = "DF,NOPE" });
@@ -330,9 +326,8 @@ public class WorkSourceRegistryTests
         }
         // And what every run needs is still required with any source.
         var keyless = Options(Kanban, new() { ["GitHub:AppId"] = "1", ["GitHub:PrivateKeyPem"] = "pem" });
-        if (Environment.GetEnvironmentVariable("FACTORY_ROUTER_KEY") is null)
+        using (var sources = b.Registry(keyless))
         {
-            using var sources = b.Registry(keyless);
             Assert.Contains("router key", await FactoryRunner.CheckWorkStartAsync(keyless, sources, TextWriter.Null, None));
         }
     }
@@ -340,10 +335,6 @@ public class WorkSourceRegistryTests
     [Fact]
     public async Task Factory_run_of_an_item_whose_source_is_not_configured_exits_2_naming_the_settings_before_anything_is_asked()
     {
-        if (EnvironmentConfiguresASource)
-        {
-            return;
-        }
         var b = new Boards();
         var calls = new List<string>();
         var stderr = new StringWriter();
@@ -357,7 +348,7 @@ public class WorkSourceRegistryTests
 
         Assert.Equal(2, exit);
         Assert.Empty(calls);
-        Assert.StartsWith("The KanbanBoard work source is not configured (kb-<n> names a Kanban item). No work source is configured", stderr.ToString());
+        Assert.StartsWith(WorkSourceRegistry.NeedsCredential(ItemNaming.Kanban) + " No work source is configured", stderr.ToString());
         Assert.Contains("Kanban:WriteToken", stderr.ToString());
         Assert.Contains("Shortcut:Watch:Teams", stderr.ToString());
         Assert.DoesNotContain("   at ", stderr.ToString()); // the message, not a stack trace
@@ -381,12 +372,8 @@ public class WorkSourceRegistryTests
     // ---- The intake loop ----
 
     [Fact]
-    public void The_intake_loop_gets_one_lane_per_configured_source_and_only_issues_are_prepared()
+    public void The_intake_loop_gets_one_lane_per_source_that_is_watched_or_has_its_credential_and_only_watched_issues_are_prepared()
     {
-        if (EnvironmentConfiguresASource)
-        {
-            return;
-        }
         var b = new Boards();
         using var sources = b.Registry(Options(Core, Kanban, Issues, Shortcut));
         var runners = new List<IWorkSource>();
@@ -397,19 +384,144 @@ public class WorkSourceRegistryTests
         Assert.Equal(lanes.Select(l => l.Source), runners);
         // GitHub issues are triaged before they are listed; a board's ready items are listed as they are.
         Assert.Equal([false, true, false], lanes.Select(l => l.Prepare is not null));
-        using var kanbanOnly = b.Registry(Options(Core, Kanban));
-        Assert.Equal(["kanban"], kanbanOnly.Lanes(b.Runner, new IntakeStatus(TimeProvider.System), TextWriter.Null).Select(l => l.Source.Naming.Source));
-        using var none = b.Registry(Options(Core));
-        Assert.Empty(none.Lanes(b.Runner, new IntakeStatus(TimeProvider.System), TextWriter.Null));
+
+        static List<(string Source, bool Prepared)> Of(Boards b, WorkSourceRegistry registry) =>
+            [.. registry.Lanes(b.Runner, new IntakeStatus(TimeProvider.System), TextWriter.Null).Select(l => (l.Source.Naming.Source, l.Prepare is not null))];
+
+        // A source with its credential and no watch scope still has a lane — the ledger may hold its items from before the scope
+        // was emptied — but it is not prepared: no issue is triaged for an issues source that watches no repository. (The
+        // workers' GitHub App, which every run needs, is the issues source's credential.)
+        using var kanbanWatched = b.Registry(Options(Core, Kanban));
+        Assert.Equal([("github", false), ("kanban", false)], Of(b, kanbanWatched));
+        using var tokensOnly = b.Registry(Options(Core, Kanban, ShortcutToken));
+        Assert.Equal([("shortcut", false), ("github", false), ("kanban", false)], Of(b, tokensOnly));
+        using var kanbanCleared = b.Registry(Options(Core, Shortcut, KanbanToken));
+        Assert.Equal([("shortcut", false), ("github", false), ("kanban", false)], Of(b, kanbanCleared));
+        // No credential, no lane; and nothing at all gives no lane.
+        using var kanbanAlone = b.Registry(Options(Kanban));
+        Assert.Equal([("kanban", false)], Of(b, kanbanAlone));
+        using var none = b.Registry(Options());
+        Assert.Empty(Of(b, none));
+        // A watched source without its credential is refused, not given a lane that cannot work.
+        using var tokenless = b.Registry(Options(Core, Kanban, new() { ["Shortcut:Watch:Epics"] = "7" }));
+        Assert.Contains("Shortcut:ApiToken", Assert.Throws<MissingCredentialException>(() => Of(b, tokenless)).Message);
+    }
+
+    [Fact]
+    public async Task A_source_with_its_credential_and_no_watch_scope_is_never_asked_for_ready_work_and_its_scope_is_not_checked()
+    {
+        var b = new Boards();
+        // Ready work on every board, none of it watched.
+        b.Shortcut.Add(101, FakeShortcutBoard.FactoryTeam);
+        var item = b.Kanban.Board.AddItem(b.Kanban.Project, "Count words");
+        var options = Options(Core, ShortcutToken, KanbanToken);
+        using var sources = b.Registry(options);
+        Assert.Equal(["shortcut", "github", "kanban"], sources.Lanes(b.Runner, new IntakeStatus(TimeProvider.System), TextWriter.Null).Select(l => l.Source.Naming.Source));
+
+        await b.Loop(sources).PollOnceAsync(None);
+
+        // Each lane listed nothing, without one request to its board: nothing was claimed, worked or given a key.
+        Assert.Empty(b.Shortcut.Requests);
+        Assert.Empty(b.Kanban.Board.Calls);
+        Assert.Empty(b.GitHub.Requests);
+        Assert.Empty(b.Prs.Opened);
+        Assert.Equal(FakeShortcutBoard.ToDo, (long)b.Shortcut.Story(101)["workflow_state_id"]!);
+        Assert.Equal(("Ready", null), (item.Status, item.Claim?.Marker));
+        await using (var db = b.Kanban.Db())
+        {
+            Assert.Empty(await db.WorkItems.ToListAsync(None));
+        }
+
+        // Start-up checks the scope of the watched sources only: beside a watched KanbanBoard, the Shortcut token alone asks Shortcut nothing.
+        var watched = Options(Core, Kanban, ShortcutToken);
+        using var beside = b.Registry(watched);
+        Assert.Null(await FactoryRunner.CheckWorkStartAsync(watched, beside, TextWriter.Null, None));
+        Assert.Empty(b.Shortcut.Requests);
+        Assert.Equal("list_projects", Assert.Single(b.Kanban.Board.Calls).Tool);
+    }
+
+    [Fact]
+    public async Task A_poll_finishes_the_pending_stop_of_an_item_whose_source_is_no_longer_watched()
+    {
+        var b = new Boards();
+        b.Shortcut.Add(101, FakeShortcutBoard.FactoryTeam);
+        var item = b.Kanban.Board.AddItem(b.Kanban.Project, "Count words");
+        using (var both = b.Registry(Options(Core, Shortcut, Kanban)))
+        {
+            await b.Loop(both).PollOnceAsync(None);
+        }
+        Assert.Equal((WorkState.Review, WorkState.Review), ((await b.Item("sc-101"))!.State, (await b.Item("kb-1"))!.State));
+
+        // The Shortcut watch scope is emptied with sc-101 in flight (the token stays), and a Stop is pending on it.
+        await b.Controls.SetAsync(ControlScope.Item("sc-101"), ControlState.Stopping, "tester", None);
+        b.Shortcut.Requests.Clear();
+        using (var kanbanWatched = b.Registry(Options(Core, Kanban, ShortcutToken)))
+        {
+            await b.Loop(kanbanWatched).PollOnceAsync(None);
+        }
+
+        // The Shortcut lane finished the stop — on the Shortcut board — and listed nothing: no team or epic was read.
+        Assert.Equal(WorkState.Cancelled, (await b.Item("sc-101"))!.State);
+        Assert.Equal(FakeShortcutBoard.Backlog, (long)b.Shortcut.Story(101)["workflow_state_id"]!);
+        Assert.Null(await b.Controls.GetAsync(ControlScope.Item("sc-101"), None));
+        Assert.NotEmpty(b.Shortcut.Requests);
+        Assert.DoesNotContain(b.Shortcut.Requests, r => Regex.IsMatch(r.PathAndQuery, @"/(groups|epics)\b"));
+        Assert.Equal(WorkState.Review, (await b.Item("kb-1"))!.State);
+
+        // The same for KanbanBoard when its watched projects are cleared with work in flight.
+        await b.Controls.SetAsync(ControlScope.Item("kb-1"), ControlState.Stopping, "tester", None);
+        b.Kanban.Board.Calls.Clear();
+        using (var shortcutWatched = b.Registry(Options(Core, Shortcut, KanbanToken)))
+        {
+            await b.Loop(shortcutWatched).PollOnceAsync(None);
+        }
+
+        Assert.Equal(WorkState.Cancelled, (await b.Item("kb-1"))!.State);
+        Assert.Equal(("Backlog", null), (item.Status, item.Claim?.Marker));
+        Assert.DoesNotContain(b.Kanban.Board.Calls, c => c.Tool is "list_projects" or "list_work_items");
+    }
+
+    [Fact]
+    public async Task Start_up_warns_once_per_source_that_has_active_items_in_the_ledger_and_no_credential()
+    {
+        var b = new Boards();
+        await using (var db = b.Kanban.Db())
+        {
+            var ledger = new WorkLedger(db, TimeProvider.System);
+            // KanbanBoard: two active items (one being implemented, one escalated) and a cancelled one; Shortcut: one active story.
+            foreach (var (source, id, states) in new (string, string, WorkState[])[]
+            {
+                ("kanban", "kb-1", [WorkState.Implement]),
+                ("kanban", "kb-2", [WorkState.Implement, WorkState.Escalated]),
+                ("kanban", "kb-3", [WorkState.Implement, WorkState.Cancelled]),
+                ("shortcut", "sc-9", [WorkState.Implement]),
+            })
+            {
+                var row = await ledger.GetOrCreateAsync(source, id, "t", "acme/widgets", null, None);
+                foreach (var state in states)
+                {
+                    await ledger.RecordAsync(row, state, null, null, None);
+                }
+            }
+        }
+
+        using var noKanban = b.Registry(Options(Core, Shortcut));
+        Assert.Equal(["warning: KanbanBoard: the ledger holds 2 active item(s) of it (kb-<n>) and this source has no credential, so the factory "
+            + "cannot finish, stop or resume them (the dashboard still lists them). To bring them back, set a KanbanBoard write token "
+            + "(env FACTORY_KANBAN_WRITE_TOKEN, config 'Kanban:WriteToken' or keychain account 'kanban-write-token')."], await noKanban.UnreachableAsync(None));
+        using var noShortcut = b.Registry(Options(Core, Kanban));
+        Assert.Equal(["warning: Shortcut: the ledger holds 1 active item(s) of it (sc-<n>) and this source has no credential, so the factory "
+            + "cannot finish, stop or resume them (the dashboard still lists them). To bring them back, set a Shortcut API token "
+            + "(env SHORTCUT_API_TOKEN, config 'Shortcut:ApiToken' or keychain account 'shortcut-api-token')."], await noShortcut.UnreachableAsync(None));
+        // A credential with no watch scope is enough: its lane finishes them, so there is nothing to warn about.
+        using var tokens = b.Registry(Options(Core, ShortcutToken, KanbanToken));
+        Assert.Empty(await tokens.UnreachableAsync(None));
+        Assert.Empty(b.Built);
     }
 
     [Fact]
     public async Task With_kanban_alone_the_intake_loop_claims_and_runs_a_ready_kanban_item()
     {
-        if (EnvironmentConfiguresASource)
-        {
-            return;
-        }
         var b = new Boards();
         var item = b.Kanban.Board.AddItem(b.Kanban.Project, "Count whitespace-only input as zero words");
         using var sources = b.Registry(Options(Core, Kanban));
@@ -427,10 +539,6 @@ public class WorkSourceRegistryTests
     [Fact]
     public async Task One_poll_runs_every_configured_sources_ready_items_and_each_lane_lists_only_its_own_in_flight_items()
     {
-        if (EnvironmentConfiguresASource)
-        {
-            return;
-        }
         var b = new Boards();
         b.Shortcut.Add(101, FakeShortcutBoard.FactoryTeam);
         var item = b.Kanban.Board.AddItem(b.Kanban.Project, "Count words");
@@ -455,10 +563,6 @@ public class WorkSourceRegistryTests
     [Fact]
     public async Task Stop_by_id_stops_a_kanban_item_on_its_own_board_pr_to_draft_item_back_to_backlog_with_a_comment_claim_released_cancelled()
     {
-        if (EnvironmentConfiguresASource)
-        {
-            return;
-        }
         var b = new Boards();
         var item = b.Kanban.Board.AddItem(b.Kanban.Project, "Count words");
         // A Shortcut story with the same number, also in flight: the Stop must not reach it.
@@ -487,10 +591,6 @@ public class WorkSourceRegistryTests
     [Fact]
     public async Task The_factory_scope_stops_every_sources_items_each_on_its_own_board_found_from_its_ledger_row()
     {
-        if (EnvironmentConfiguresASource)
-        {
-            return;
-        }
         var b = new Boards();
         var item = b.Kanban.Board.AddItem(b.Kanban.Project, "Count words");
         b.Shortcut.Add(101, FakeShortcutBoard.FactoryTeam);
@@ -511,18 +611,45 @@ public class WorkSourceRegistryTests
         using var shortcutOnly = b.Registry(Options(Core, Shortcut));
         var unreachable = await b.Actions(shortcutOnly).StopAsync(ControlScope.Factory, "tester", None);
         Assert.False(unreachable.Ok);
-        Assert.Contains("kb-2: stop NOT finished (The KanbanBoard work source is not configured", unreachable.Message);
+        // No lane runs a source without its credential, so the message does not promise that a poll retries it.
+        Assert.Equal($"kb-2: stop NOT finished ({WorkSourceRegistry.NeedsCredential(ItemNaming.Kanban)}); it stays Stopping, and nothing finishes "
+            + "the stop until that credential is set (then the next poll or `factory stop` does).", unreachable.Message);
         Assert.Equal(ControlState.Stopping, (await b.Controls.GetAsync(ControlScope.Item("kb-2"), None))!.State);
         Assert.Equal("InProgress", other.Status);
     }
 
     [Fact]
+    public async Task Stop_of_one_item_whose_source_has_no_credential_is_refused_before_anything_is_written()
+    {
+        var b = new Boards();
+        var item = b.Kanban.Board.AddItem(b.Kanban.Project, "Count words");
+        using (var both = b.Registry(Options(Core, Shortcut, Kanban)))
+        {
+            await b.Loop(both).PollOnceAsync(None);
+        }
+        Assert.Equal(WorkState.Review, (await b.Item("kb-1"))!.State);
+        b.Kanban.Board.Calls.Clear();
+        // The dashboard's Stop (ControlActions over the host's registry), with the Kanban token gone.
+        using var shortcutOnly = b.Registry(Options(Core, Shortcut));
+
+        var refused = await b.Actions(shortcutOnly).StopAsync(ControlScope.Item("kb-1"), "tester", None);
+
+        Assert.False(refused.Ok);
+        Assert.Equal("kb-1: NOT stopped, and nothing was written. The KanbanBoard work source is not configured (kb-<n> names a Kanban item): it needs "
+            + "a KanbanBoard write token (env FACTORY_KANBAN_WRITE_TOKEN, config 'Kanban:WriteToken' or keychain account 'kanban-write-token').", refused.Message);
+        // No Stopping control: one would stay for good (no lane to finish it, and a Stopping scope cannot be continued).
+        Assert.Null(await b.Controls.GetAsync(ControlScope.Item("kb-1"), None));
+        Assert.Equal(WorkState.Review, (await b.Item("kb-1"))!.State);
+        Assert.Empty(b.Kanban.Board.Calls);
+        Assert.Equal("InProgress", item.Status);
+        // An item the ledger does not know is refused the same way.
+        Assert.False((await b.Actions(shortcutOnly).StopAsync(ControlScope.Item("kb-7"), "tester", None)).Ok);
+        Assert.Null(await b.Controls.GetAsync(ControlScope.Item("kb-7"), None));
+    }
+
+    [Fact]
     public async Task Pause_and_continue_by_id_hold_and_release_a_kanban_item_as_they_do_a_shortcut_story()
     {
-        if (EnvironmentConfiguresASource)
-        {
-            return;
-        }
         var b = new Boards();
         var item = b.Kanban.Board.AddItem(b.Kanban.Project, "Count words");
         using var sources = b.Registry(Options(Core, Kanban));
@@ -591,10 +718,6 @@ public class WorkSourceRegistryTests
     [Fact]
     public async Task The_work_host_builds_its_lanes_and_its_stop_from_the_registry_with_kanban_alone()
     {
-        if (EnvironmentConfiguresASource)
-        {
-            return;
-        }
         await using var app = FactoryHost.BuildWork(Options(Core, Kanban, new() { ["Factory:HostPort"] = "0" }));
 
         // The intake loop is built without a Shortcut token, over the one registry the dashboard's Stop also uses.

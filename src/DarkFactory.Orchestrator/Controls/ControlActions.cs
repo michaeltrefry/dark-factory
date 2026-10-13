@@ -105,6 +105,12 @@ public sealed class ControlActions(
         var unknown = new List<string>();
         if (ControlScope.ItemOf(scope) is { } story)
         {
+            if (stops is not null && sources is not null && sources(story.Naming) is null)
+            {
+                // Before anything is written: a stop that cannot reach the item's board would leave it Stopping with nothing to
+                // finish it (no lane runs a source without its credential) and no Continue to take it back.
+                return new ControlResult(false, $"{story}: NOT stopped, and nothing was written. {WorkSourceRegistry.NeedsCredential(story.Naming)}");
+            }
             stories.Add(story);
         }
         else
@@ -146,9 +152,13 @@ public sealed class ControlActions(
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                // The item keeps its Stopping control: the intake loop's next poll (or a retry) finishes the stop.
+                // The item keeps its Stopping control: the intake loop's next poll (or a retry) finishes the stop — unless its
+                // source has no credential: no lane runs that source's items, so nothing retries until the credential is back.
                 ok = false;
-                results.Add($"{item}: stop NOT finished ({ex.Message}); it stays Stopping and the next poll or `factory stop` retries it.");
+                results.Add(ex is MissingCredentialException
+                    ? $"{item}: stop NOT finished ({ex.Message}); it stays Stopping, and nothing finishes the stop until that credential is set "
+                        + "(then the next poll or `factory stop` does)."
+                    : $"{item}: stop NOT finished ({ex.Message}); it stays Stopping and the next poll or `factory stop` retries it.");
             }
         }
         if (unknown.Count > 0)

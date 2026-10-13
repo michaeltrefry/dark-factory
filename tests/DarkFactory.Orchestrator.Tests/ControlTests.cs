@@ -679,6 +679,8 @@ public class ControlTests
         // Refused before the ledger is opened, so no database is needed.
         var controls = new LedgerControls(null!, TimeProvider.System);
         var ex = await Assert.ThrowsAsync<ArgumentException>(() => controls.SetAsync("everything", ControlState.Paused, "tester", CancellationToken.None));
-        Assert.Contains("(factory, usage, freeze, epic:<id>, item:sc-<id> or item:gh-<key>)", ex.Message);
+        Assert.Contains("(factory, usage, freeze, epic:<id>, item:sc-<id>, item:gh-<key> or item:kb-<n>)", ex.Message);
+        // Every source's items have a scope (sc-25982): a new source's must be named here too.
+        Assert.All(ItemNaming.All, naming => Assert.Contains($"item:{naming.Prefix}-<", ex.Message));
     }
 }
