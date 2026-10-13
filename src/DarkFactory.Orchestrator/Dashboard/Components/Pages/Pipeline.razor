@@ -77,15 +77,106 @@ else
             <tr><th>Item</th><th>State</th><th>Repo</th><th>PR</th><th>Elapsed</th><th>Cost</th><th>Sessions</th><th>Control</th></tr>
         </thead>
         <tbody>
-            @foreach (var row in _rows)
+            @* A plan's stories are listed beneath their plan item (sc-25876), not as rows of their own. *@
+            @foreach (var row in _rows.Where(r => r.PlanItemId is null || !Grouped(r)))
             {
-                <tr @key="row.Id" data-item="@row.Id">
-                    <td><span class="id">@row.ExternalId</span> @row.Title</td>
+                @ItemRow(row, null, null)
+                @if (row.Plan is { } plan)
+                {
+                    @foreach (var story in plan.Stories)
+                    {
+                        @if (_rows.FirstOrDefault(r => r.PlanItemId == row.Id && r.ExternalId == story.ExternalId) is { } storyRow)
+                        {
+                            @ItemRow(storyRow, story, row)
+                        }
+                        else
+                        {
+                            <tr @key="@($"{row.Id}/{story.ExternalId}")" class="plan-story" data-plan="@row.Id" data-story="@story.ExternalId">
+                                <td><span class="plan-indent">↳</span> <span class="id">@story.ExternalId</span> @story.Title</td>
+                                <td class="state">@story.Shown
+                                    @if (story.Waits.Length > 0)
+                                    {
+                                        <span class="@(story.Failing ? "error waits" : "muted waits")">@story.Waits</span>
+                                    }
+                                </td>
+                                <td>@row.Repo</td>
+                                <td class="muted" colspan="5">—</td>
+                            </tr>
+                        }
+                    }
+                }
+            }
+        </tbody>
+    </table>
+}
+@if (_metricsStale)
+{
+    <p class="error metrics-error">Could not compute the metrics; showing the last known values.</p>
+}
+@if (_metrics is { Count: > 0 } metrics)
+{
+    <h2>Metrics</h2>
+    <table class="metrics">
+        <thead>
+            <tr><th>Metric</th><th>Value</th><th>Over</th></tr>
+        </thead>
+        <tbody>
+            @foreach (var metric in metrics)
+            {
+                <tr data-metric="@metric.Name">
+                    <td>@metric.Name</td>
+                    <td class="@(metric.Value is null ? "value muted" : "value")">@metric.Display</td>
+                    <td class="muted">@metric.Note</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+    <p class="muted">From the ledger's executed results only; sandbox and demo items are left out.</p>
+}
+
+@code {
+    /// <summary>Whether the row is a story listed beneath its (active) plan item: its plan's row lists it.</summary>
+    private bool Grouped(PipelineRow row) =>
+        _rows?.FirstOrDefault(r => r.Id == row.PlanItemId)?.Plan?.Stories.Any(s => s.ExternalId == row.ExternalId) == true;
+
+    /// <summary>One work item's row; <paramref name="story"/> and <paramref name="planRow"/> when it is listed beneath its plan item.</summary>
+    private RenderFragment ItemRow(PipelineRow row, PlanStoryView? story, PipelineRow? planRow) => __builder =>
+    {
+                <tr @key="row.Id" data-item="@row.Id" class="@(story is null ? null : "plan-story")" data-plan="@planRow?.Id" data-story="@story?.ExternalId">
+                    <td>@if (story is not null) { <span class="plan-indent">↳</span> } <span class="id">@row.ExternalId</span> @row.Title</td>
                     <td class="state">@row.State
                         @if (row.FailedCloseout is { } closeout)
                         {
                             <span class="error closeout-failed">closeout not posted (attempt @closeout.Attempts of @RunPipeline.MaxCloseoutAttempts;
                                 @(row.CloseoutRetrying ? "retried on the next poll" : "not retried again: post it by hand")): @closeout.LastFailure</span>
+                        }
+                        @if (story is { Waits.Length: > 0 })
+                        {
+                            <span class="@(story.Failing ? "error waits" : "muted waits")">@story.Waits</span>
+                        }
+                        @if (row.Plan is { } plan)
+                        {
+                            <span class="plan-counts">@plan.Merged of @plan.Stories.Count merged · @plan.InFlight in flight · @plan.Waiting waiting · @plan.Failed failed</span>
+                            @if (row.Control == ControlState.Stopping)
+                            {
+                                <span class="error plan-flag">stopping</span>
+                            }
+                            @if (plan.Stuck)
+                            {
+                                <span class="error plan-flag">stuck</span>
+                            }
+                            else if (plan.Held)
+                            {
+                                <span class="error plan-flag">held</span>
+                            }
+                            @if (plan.Hold is { } hold)
+                            {
+                                <span class="error plan-hold">@hold</span>
+                            }
+                            @if (plan.LastHeld is { } lastHeld)
+                            {
+                                <span class="muted plan-last-held">last hold recorded (@lastHeld.At.ToString("u")): @lastHeld.Detail</span>
+                            }
                         }
                     </td>
                     <td>@row.Repo</td>
@@ -122,36 +213,8 @@ else
                         }
                     </td>
                 </tr>
-            }
-        </tbody>
-    </table>
-}
-@if (_metricsStale)
-{
-    <p class="error metrics-error">Could not compute the metrics; showing the last known values.</p>
-}
-@if (_metrics is { Count: > 0 } metrics)
-{
-    <h2>Metrics</h2>
-    <table class="metrics">
-        <thead>
-            <tr><th>Metric</th><th>Value</th><th>Over</th></tr>
-        </thead>
-        <tbody>
-            @foreach (var metric in metrics)
-            {
-                <tr data-metric="@metric.Name">
-                    <td>@metric.Name</td>
-                    <td class="@(metric.Value is null ? "value muted" : "value")">@metric.Display</td>
-                    <td class="muted">@metric.Note</td>
-                </tr>
-            }
-        </tbody>
-    </table>
-    <p class="muted">From the ledger's executed results only; sandbox and demo items are left out.</p>
-}
+    };
 
-@code {
     private readonly CancellationTokenSource _cts = new();
     private IReadOnlyList<PipelineRow>? _rows;
     private IReadOnlyList<Metric>? _metrics;

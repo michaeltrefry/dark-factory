@@ -16,7 +16,10 @@ public enum ControlState
     /// </summary>
     Paused,
 
-    /// <summary>Item scope only: the item is being stopped (worker killed, Cancelled, PR back to draft, story commented).</summary>
+    /// <summary>
+    /// Item scope only: the item is being stopped (worker killed, Cancelled, PR back to draft, story commented). On a plan item
+    /// (sc-25876) its unfinished stories are being stopped with it.
+    /// </summary>
     Stopping,
 }
 
@@ -87,6 +90,9 @@ public interface IControls
     /// <summary>
     /// What applies to one item: <see cref="ControlState.Stopping"/> when the item is being stopped, else
     /// <see cref="ControlState.Paused"/> when the factory, the item's epic or the item is paused, else running.
+    /// A story of a plan (sc-25876, <see cref="WorkItem.PlanItemId"/>) is held to its plan item's control as well — the plan's own
+    /// <c>item:&lt;plan&gt;</c> scope, so a Pause, Continue or Stop on a plan item reaches its stories with no scope kind of its own:
+    /// paused while the plan item is, and being stopped while the plan item is unless the factory already merged it.
     /// </summary>
     Task<ControlState> EffectiveAsync(string externalId, long? epicId, CancellationToken ct);
 
@@ -158,11 +164,38 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
             scopes.Add(ControlScope.Epic(epic));
         }
         await using var db = await contexts.CreateDbContextAsync(ct);
+        // A story of a plan (sc-25876) is also held to the control on its plan item: no new scope kind, the plan's own item scope.
+        var plan = await PlanOfAsync(db, externalId, ct);
+        if (plan is not null)
+        {
+            scopes.Add(ControlScope.Item(plan.Value.Plan));
+        }
         var rows = await db.Controls.AsNoTracking().Where(c => scopes.Contains(c.Scope)).ToListAsync(ct);
         var now = time.GetUtcNow();
-        return rows.Any(r => r.State == ControlState.Stopping && r.Scope == ControlScope.Item(externalId)) ? ControlState.Stopping
-            : rows.Any(r => r.PausesAt(now)) ? ControlState.Paused
-            : ControlState.Running;
+        if (rows.Any(r => r.State == ControlState.Stopping && r.Scope == ControlScope.Item(externalId)))
+        {
+            return ControlState.Stopping;
+        }
+        // A plan being stopped stops its unfinished stories; one the factory already merged is left as it is.
+        if (plan is { } of && rows.Any(r => r.State == ControlState.Stopping && r.Scope == ControlScope.Item(of.Plan))
+            && !await db.LedgerEntries.AsNoTracking().AnyAsync(e => e.WorkItemId == of.Story && e.Step == null && e.State == WorkState.Merge, ct))
+        {
+            return ControlState.Stopping;
+        }
+        return rows.Any(r => r.PausesAt(now)) ? ControlState.Paused : ControlState.Running;
+    }
+
+    /// <summary>The plan item (its external id) the ledger links the item to (<see cref="WorkItem.PlanItemId"/>), with the item's own ledger id; null for any other item.</summary>
+    internal static async Task<(long Story, string Plan)?> PlanOfAsync(LedgerDbContext db, string externalId, CancellationToken ct)
+    {
+        var story = await db.WorkItems.AsNoTracking().Where(i => i.ExternalId == externalId && i.PlanItemId != null)
+            .Select(i => new { i.Id, i.PlanItemId }).FirstOrDefaultAsync(ct);
+        if (story is null)
+        {
+            return null;
+        }
+        var plan = await db.WorkItems.AsNoTracking().Where(p => p.Id == story.PlanItemId).Select(p => p.ExternalId).FirstOrDefaultAsync(ct);
+        return plan is null ? null : (story.Id, plan);
     }
 
     public async Task<IReadOnlyList<Control>> ListAsync(CancellationToken ct)

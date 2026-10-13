@@ -156,6 +156,10 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
         return null;
     }
 
+    /// <summary>The item with that ledger id as stored (a story's plan item, <see cref="WorkItem.PlanItemId"/>), or null. Read fresh, untracked.</summary>
+    public Task<WorkItem?> ItemAsync(long id, CancellationToken ct) =>
+        db.WorkItems.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, ct);
+
     /// <summary>The stories the plan item's newest <c>plan-stories</c> checkpoint lists (sc-25871); none when it has no such row.</summary>
     public async Task<IReadOnlySet<string>> PlanStoriesAsync(long planItemId, CancellationToken ct) =>
         Plans.PlanRelease.StoriesOf(await db.LedgerEntries.AsNoTracking()

@@ -44,7 +44,11 @@ public enum StepOutcome
 /// passed, ReviewHead/Blocked → gate_rejected; <c>new-tests</c> pass → passed, rejected/no-tests → gate_rejected, unsupported/error (the check
 /// could not produce evidence) → failed; <c>ci-failure</c>, <c>merge-conflict</c>, <c>stuck</c>, <c>stuck-retry</c>, <c>worktree-lost</c>,
 /// <c>github-refused</c> → failed; <c>routed-to-human</c> (a triage routed an issue to a human) → escalated; <c>escalation-comment</c> posted → passed, else failed; <c>pr-report</c> or <c>closeout</c> failed → failed; <c>approval-ignored</c>, <c>plan-rejected</c> (the planner's answer broke a rule, sc-25870) → gate_rejected;
-/// <c>usage-pause</c>, <c>parked</c>, <c>plan-held</c> (a plan's stories wait on a blocker outside the plan, sc-25871) → deferred; every other checkpoint (a completed sub-step) → passed.</item>
+/// <c>usage-pause</c>, <c>parked</c>, <c>plan-held</c> (a plan's stories wait on a blocker outside the plan, sc-25871, or behind a failed
+/// story of it, sc-25876), <c>plan-stuck</c> (every remaining story of a plan failed or is blocked behind one) → deferred — the plan item
+/// itself never escalates for a story's failure, which that story's own Escalated row already records; <c>plan-notice</c> (the plan
+/// item's comment for a hold) posted → passed, failed → failed; every other checkpoint (a completed sub-step, <c>plan-resumed</c> among
+/// them) → passed.</item>
 /// </list>
 /// A run deferred by the freeze before it starts (<see cref="RunOutcome.Deferred"/>) writes no row, so it has no outcome to record.
 /// </remarks>
@@ -114,10 +118,10 @@ public static class StepOutcomes
         RunPipeline.Steps.CodeGraphOverlay => Gate.CodeGraphOverlay.FromDetail(detail) is { IsReady: true } ? StepOutcome.Passed : StepOutcome.Failed,
         RunPipeline.Steps.EscalationComment =>detail == "posted" ? StepOutcome.Passed : StepOutcome.Failed,
         Issues.IssueSteps.RoutedToHuman => StepOutcome.Escalated,
-        RunPipeline.Steps.PrReport or RunPipeline.Steps.Closeout =>
+        RunPipeline.Steps.PrReport or RunPipeline.Steps.Closeout or RunPipeline.Steps.PlanNotice =>
             detail?.StartsWith("failed", StringComparison.Ordinal) == true ? StepOutcome.Failed : StepOutcome.Passed,
         Issues.IssueSteps.ApprovalIgnored or RunPipeline.Steps.PlanRejected => StepOutcome.GateRejected,
-        RunPipeline.Steps.UsagePause or RunPipeline.Steps.Parked or RunPipeline.Steps.PlanHeld => StepOutcome.Deferred,
+        RunPipeline.Steps.UsagePause or RunPipeline.Steps.Parked or RunPipeline.Steps.PlanHeld or RunPipeline.Steps.PlanStuck => StepOutcome.Deferred,
         _ => StepOutcome.Passed,
     };
 }

@@ -111,6 +111,11 @@ public sealed partial class RunPipeline
         {
             return null;
         }
+        // A story of a plan that was stopped (sc-25876) is never started, whoever moves it to ready afterwards.
+        if (await ledger.ItemAsync(plan, ct) is { State: WorkState.Cancelled } stopped)
+        {
+            return PlanRelease.PlanStoppedRefusal(stopped.ExternalId);
+        }
         var blockers = await source.BlockersAsync(storyId, ct);
         if (blockers.Count == 0)
         {
@@ -123,6 +128,16 @@ public sealed partial class RunPipeline
             .Select(b => b.Id).ToList();
         return open.Count == 0 ? null : PlanRelease.Refusal(open, open.Where(b => !ofPlan.Contains(b)).ToList());
     }
+
+    /// <summary>
+    /// The control on the plan of a story the ledger does not know yet (sc-25876: released by its plan, not claimed): a Pause or Stop
+    /// on the plan item holds its stories too, and for an item the ledger knows <see cref="IControls.EffectiveAsync"/> says so itself
+    /// (through <see cref="WorkItem.PlanItemId"/>). Read from the ledger's own record of what the plan created.
+    /// </summary>
+    private async Task<ControlState> PlanControlAsync(string externalId, CancellationToken ct) =>
+        source.PlansItems && await ledger.PlanOfAsync(Naming.Source, externalId, ct) is { } plan && await ledger.ItemAsync(plan, ct) is { } planItem
+            ? (await _controls.GetAsync(ControlScope.Item(planItem.ExternalId), ct))?.State ?? ControlState.Running
+            : ControlState.Running;
 
     /// <summary>
     /// For an item parked on a claim refused for a blocker (<see cref="PlanRelease.IsBlockedRefusal"/>): the refusal as it stands
@@ -186,7 +201,10 @@ public sealed partial class RunPipeline
     /// its own order — a story held by a blocker outside the plan, an archived story, a released story back in the backlog — is
     /// recorded on the plan item when it changes (<see cref="Steps.PlanHeld"/>), not every poll. Once every story has merged
     /// (<see cref="ReleaseDecision.Complete"/>) the plan is closed out (<see cref="ClosePlanAsync"/>). A story that escalated or was
-    /// cancelled never satisfies its dependents: they stay in the backlog and the plan item stays here. A board that cannot be read
+    /// cancelled never satisfies its dependents: they stay in the backlog and the plan item stays here, saying which story holds it
+    /// and, once nothing else of it can move, that it is stuck (sc-25876, <see cref="RecordFailedHoldAsync"/>). A Pause on the plan
+    /// item holds its stories too and a Stop stops them with it (<see cref="IControls.EffectiveAsync"/>, <see cref="ItemStopper"/>):
+    /// neither reaches this evaluation, which a paused or stopping plan item is not given. A board that cannot be read
     /// or written throws: nothing is recorded, the next run evaluates again, and the intake loop gives up on a plan that keeps
     /// failing (<see cref="GiveUpAsync"/>: one comment and one <c>plan-held</c> row; the item stays Planned).
     /// </summary>
@@ -223,9 +241,15 @@ public sealed partial class RunPipeline
         }
         var outside = blockers.Values.SelectMany(b => b).Where(b => !ofPlan.Contains(b)).ToList();
         var outsiders = outside.Count == 0 ? [] : await ledger.ItemsByIdAsync(Naming.Source, outside, ct);
-        var decision = PlanRelease.Decide(stories, released, blockers, id => ofPlan.Contains(id)
+        bool Satisfied(string id) => ofPlan.Contains(id)
             ? Merged(id)
-            : PlanRelease.Satisfied(outsiders.TryGetValue(id, out var o) ? o.History : null, ofPlan: false, finished.Contains(id)));
+            : PlanRelease.Satisfied(outsiders.TryGetValue(id, out var o) ? o.History : null, ofPlan: false, finished.Contains(id));
+        var decision = PlanRelease.Decide(stories, released, blockers, Satisfied);
+        // Which stories failed and what they hold (sc-25876), recorded when it changes: apart from the release decision (a failed
+        // story has no Merge row, so it already satisfies nothing) and from how a complete plan is finished.
+        var status = PlanRelease.Classify(stories, released, s => blockers.TryGetValue(s, out var by) ? by : own?[s] ?? [],
+            id => known.TryGetValue(id, out var k) ? k.History : null, Satisfied);
+        await RecordFailedHoldAsync(item, storyId, since, status, ct);
         if (decision.Complete)
         {
             return await ClosePlanAsync(item, storyId, stories, known, since, ct);
@@ -270,11 +294,13 @@ public sealed partial class RunPipeline
         string[] holds = [PlanRelease.HeldByOutsiders(decision.Held), .. archived.Select(PlanRelease.HeldArchived), .. back.Select(PlanRelease.HeldBackInBacklog)];
         var held = string.Join("; ", holds.Where(h => h.Length > 0));
         if (held.Length > 0 && held != since.LastOrDefault(e => e.Step == Steps.PlanHeld
-            && e.Detail?.StartsWith(PlanRelease.NotEvaluatedPrefix, StringComparison.Ordinal) != true)?.Detail)
+            && e.Detail?.StartsWith(PlanRelease.NotEvaluatedPrefix, StringComparison.Ordinal) != true
+            && e.Detail?.StartsWith(PlanRelease.FailedPrefix, StringComparison.Ordinal) != true)?.Detail)
         {
             await ledger.CheckpointAsync(item, Steps.PlanHeld, null, held, ct);
         }
-        var waiting = decision.Held.Select(h => $"{h.Id} on {string.Join(", ", h.By)}")
+        var waiting = status.Failed.Select(f => $"{f.Id} {f.Failure!.As}")
+            .Concat(decision.Held.Select(h => $"{h.Id} on {string.Join(", ", h.By)}"))
             .Concat(archived.Select(s => $"{s} archived"))
             .Concat(inFlight.Select(s => back.Contains(s) ? $"{s} released, back in the backlog" : $"{s} released, not merged")).ToList();
         log.WriteLine($"[{item.State}] {item.ExternalId}: {stories.Count(Merged)} of {stories.Count} stories merged"
@@ -285,6 +311,56 @@ public sealed partial class RunPipeline
         int IdOf(string story) => Naming.TryParse(story, out var id)
             ? id
             : throw new InvalidOperationException($"{item.ExternalId}'s plan records '{story}', which is not a {Naming.Noun} id.");
+    }
+
+    /// <summary>Whether a row of a waiting plan item records a failed story's hold on it, or the lifting of one (sc-25876).</summary>
+    internal static bool IsFailedHoldRow(LedgerEntry row) =>
+        row.Step is Steps.PlanStuck or Steps.PlanResumed
+        || (row.Step == Steps.PlanHeld && row.Detail?.StartsWith(PlanRelease.FailedPrefix, StringComparison.Ordinal) == true);
+
+    /// <summary>
+    /// Held by a failed story (sc-25876): a story of the plan whose item ended Escalated or Cancelled (<see cref="PlanRelease.FailureOf"/>,
+    /// a pull request merged outside the factory among them) satisfies no blocker, so what depends on it is never released while it
+    /// stays so; the rest of the plan goes on. The plan item says so — a <see cref="Steps.PlanHeld"/> row naming each failed story, how
+    /// it failed and its reason, or <see cref="Steps.PlanStuck"/> once every story left is failed or blocked behind one — only when
+    /// that changes (<see cref="PlanRelease.HeldByFailed"/>), never every poll, and it never escalates for it: the story's own
+    /// Escalated row is the failure. Once no story is failed any more (a person re-ran it) a <see cref="Steps.PlanResumed"/> row lifts
+    /// it. Each such row gets one comment on the plan item, after the row (E4): its result is a <see cref="Steps.PlanNotice"/> row, a
+    /// failed one is tried again by the next evaluations up to <see cref="MaxPlanNoticeAttempts"/>, and a posted one is never repeated.
+    /// </summary>
+    private async Task RecordFailedHoldAsync(WorkItem item, int storyId, List<LedgerEntry> since, PlanStatus status, CancellationToken ct)
+    {
+        var at = since.FindLastIndex(IsFailedHoldRow);
+        var last = at < 0 ? null : since[at];
+        var (step, detail) = !status.Held ? (Steps.PlanResumed, PlanRelease.Resumed(status))
+            : status.Stuck ? (Steps.PlanStuck, PlanRelease.HeldByFailed(status))
+            : (Steps.PlanHeld, PlanRelease.FailedPrefix + PlanRelease.HeldByFailed(status));
+        // A lifted hold is said once, whatever the plan's counts do afterwards; a hold whenever its record differs.
+        var changed = status.Held ? last?.Step != step || last.Detail != detail : last is { Step: not Steps.PlanResumed };
+        var notices = at < 0 || changed ? [] : since.Skip(at + 1).Where(e => e.Step == Steps.PlanNotice).ToList();
+        if (changed)
+        {
+            await ledger.CheckpointAsync(item, step, null, detail, ct);
+            log.WriteLine($"[{item.State}] {item.ExternalId}: {(status.Held ? status.Stuck ? "stuck" : "held by a failed story" : "no longer held")}: {detail}");
+        }
+        else if (last is null || notices.Any(n => n.Detail == Posted) || notices.Count >= MaxPlanNoticeAttempts)
+        {
+            return;
+        }
+        string result;
+        try
+        {
+            await source.CommentAsync(storyId,
+                status.Held ? PlanRelease.HeldComment(item.ExternalId, status) : PlanRelease.ResumedComment(item.ExternalId, status), ct);
+            result = Posted;
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            result = $"failed: {ex.Message}";
+            log.WriteLine($"[{item.State}] could not comment on {item.ExternalId}: {ex.Message}; "
+                + (notices.Count + 1 < MaxPlanNoticeAttempts ? "the next evaluation tries again" : "not tried again: the ledger and the dashboard have it"));
+        }
+        await ledger.CheckpointAsync(item, Steps.PlanNotice, null, result, ct);
     }
 
     /// <summary>
