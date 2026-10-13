@@ -1,5 +1,7 @@
 using System.Diagnostics;
+using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Ledger;
+using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 
 namespace DarkFactory.AcceptanceTests;
@@ -122,6 +124,44 @@ public class LiveHelperTests
         Assert.Equal(new Uri("http://127.0.0.1:4711/mcp/codegraph"), loopback.BaseAddress);
         Assert.Throws<ArgumentException>(() => OutboundHttp.LoopbackMcp(new Uri("https://codegraph.example/mcp")));
         Assert.Throws<ArgumentException>(() => OutboundHttp.LoopbackMcp(new Uri("http://10.0.0.5:4711/mcp/codegraph")));
+    }
+
+    /// <summary>A repository whose base has no file and whose head has <paramref name="head"/>: what a pull request adding a package looks like.</summary>
+    private sealed class AddedFiles(IReadOnlyDictionary<string, string> head) : IGateTestRunner
+    {
+        public Task<IReadOnlyList<ChangedFile>> ChangesAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ChangedFile>>([.. head.Keys.Order(StringComparer.Ordinal).Select(p => new ChangedFile('A', null, p))]);
+
+        public Task<IReadOnlyList<string>> FilesAsync(RepoRef repo, string sha, CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<string>>(sha == "head" ? [.. head.Keys.Order(StringComparer.Ordinal)] : []);
+
+        public Task<string?> ReadAsync(RepoRef repo, string sha, string path, CancellationToken ct) =>
+            Task.FromResult(sha == "head" && head.TryGetValue(path, out var text) ? text : null);
+
+        public Task<TestRunReport> RunAsync(RepoRef repo, TestRunSpec spec, CancellationToken ct) =>
+            throw new NotSupportedException("identification runs nothing");
+    }
+
+    /// <summary>
+    /// P4-AT4's merging test (sc-25877) seeds a crate the cargo strategy can judge: exactly one new test, named as the live test
+    /// looks it up, nothing unisolable — and a crate of its own per run, under the directory the runbook says the sandbox then holds.
+    /// </summary>
+    [Fact]
+    public async Task The_crate_the_merging_cargo_test_seeds_has_one_new_test_the_cargo_strategy_names_as_the_live_test_expects()
+    {
+        var crate = GateNegativeTests.MergingCrate("1a2b3c4d");
+        Assert.Equal($"{GateNegativeTests.MergedCrates}/p1a2b3c4d", crate.Directory);
+        Assert.NotEqual(crate, GateNegativeTests.MergingCrate("5e6f7a8b"));
+        var files = new Dictionary<string, string> { [$"{crate.Directory}/Cargo.toml"] = crate.Manifest, [$"{crate.Directory}/src/lib.rs"] = crate.Library };
+        var runner = new AddedFiles(files);
+        var ct = TestContext.Current.CancellationToken;
+        var repo = new RepoRef("o", "r");
+
+        var set = await new CargoNewTests().IdentifyAsync(new TestSource(runner, repo, "base", "head"), await runner.ChangesAsync(repo, "base", "head", ct), ct);
+
+        Assert.Equal([crate.Test], set.Tests);
+        Assert.Equal("df-e2e-p1a2b3c4d:lib:tests::doubles", crate.Test);
+        Assert.Empty(set.Unisolable);
     }
 
     private const string Policy = """

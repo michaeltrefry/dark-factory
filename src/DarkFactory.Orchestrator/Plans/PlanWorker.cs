@@ -180,7 +180,7 @@ public static class PlanPrompt
         var across = repos is { Count: > 1 };
         var seat = several
             ? "The current directory holds a checkout of the default branch of each repository this plan may touch, each in its own directory:\n"
-                + string.Join("\n", checkouts!.Select(c => $"- {c.Directory}/ is {c.Repo}{(c.Repo == repo ? " (the plan's primary repository)" : "")}"))
+                + string.Join("\n", checkouts!.Select(c => $"- {c.Directory}/ is {c.Repo}{(c.Repo.Is(repo) ? " (the plan's primary repository)" : "")}"))
                 + "\nYou can only read and search them (Read, Glob, Grep): you cannot edit files or run commands, and nothing here is "
                 + "kept, committed or pushed."
             : $"The current directory is a checkout of {repo}'s default branch. You can only read and\n"

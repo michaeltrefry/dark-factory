@@ -24,7 +24,8 @@ public class MultiRepoPlanAcceptanceTests
     {
         Harness.RequireOptIn();
         var storyId = E2e.Story("FACTORY_E2E_P4_MULTI_PLAN_STORY",
-            "a To Do story labelled `plan` (sc-<id>) with two `Repo:` lines (the sandbox, then FACTORY_E2E_P4_SECOND_REPO), describing work in both");
+            "a To Do story labelled `plan` (sc-<id>) with two `Repo:` lines (the sandbox, then FACTORY_E2E_P4_SECOND_REPO), describing work in both "
+                + "where the second repository needs what the first one's changeset puts on its default branch");
         var second = RepoRef.Parse(Harness.RequireEnv("FACTORY_E2E_P4_SECOND_REPO",
             "a second sandbox repository (owner/name) with both GitHub Apps installed, a factory/gate.yaml, CI on factory/changeset-*, indexed in CodeGraph"));
         await using var e2e = await E2e.StartAsync("df_e2e_plan2");
@@ -56,6 +57,11 @@ public class MultiRepoPlanAcceptanceTests
                     + "describe work that needs a change in both.");
             }
             Assert.False(string.IsNullOrWhiteSpace(plan.Interactions));
+            // Without a story that waits on a changeset, the "released only after that changeset's merge" check below checks nothing.
+            if (PlanLive.ChangesetBlockerProblem(plan) is { } inconclusive)
+            {
+                Assert.Fail(inconclusive);
+            }
 
             // A changeset branch in each repository, recorded and pushed before the stories were recorded as the plan's.
             var changesets = Changeset.Ordered(history, first);

@@ -2563,6 +2563,7 @@
         "description": "First step of the plan.",
         "story_type": "chore",
         "workflow_state_id": 500000006,
+        "external_id": "dark-factory:child:sc-25196:6784c89c3d21cb6b3bde0818521abd95d3aa3f4e6b351da4c41cf4b1f08165bf",
         "group_id": "6ac526c4-f2b5-4903-958f-d2d529d8bc8a"
       },
       "status": 201,
@@ -2634,6 +2635,7 @@
         "description": "Second step; needs the first.",
         "story_type": "chore",
         "workflow_state_id": 500000006,
+        "external_id": "dark-factory:child:sc-25196:3f2fde15267bbc5ccaa95089d455391f0f555f1f59184ee1c799c77f7a40b832",
         "group_id": "6ac526c4-f2b5-4903-958f-d2d529d8bc8a"
       },
       "status": 201,

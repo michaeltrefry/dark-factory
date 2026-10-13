@@ -99,6 +99,68 @@ public class TaintRuleTests
 
         Assert.Null(Taint.OfRepoSettings(dir));
     }
+
+    /// <summary>
+    /// sc-25877: an implementing worker may build and test a cargo repository — exactly four cargo built-ins, as prefix rules — and
+    /// nothing else of cargo; a session that only reads (triage, the planner) gains none of it.
+    /// </summary>
+    [Fact]
+    public void An_implementing_worker_may_run_exactly_four_cargo_commands_and_a_read_only_session_none()
+    {
+        Assert.Equal(["Bash(cargo build:*)", "Bash(cargo check:*)", "Bash(cargo test:*)", "Bash(cargo fetch:*)"], ClaudeWorker.CargoTools);
+        Assert.Equal(
+            ["Read", "Edit", "Write", "Glob", "Grep", "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(dotnet restore:*)", .. ClaudeWorker.CargoTools],
+            ClaudeWorker.AllowedTools);
+        // The implementer's command line carries them.
+        var args = ClaudeWorker.BuildArguments("p").ToList();
+        var allowed = args.Skip(args.IndexOf("--allowedTools") + 1).TakeWhile(a => !a.StartsWith("--", StringComparison.Ordinal)).ToList();
+        Assert.Equal(ClaudeWorker.AllowedTools, allowed);
+        // No rule is wider than a subcommand prefix: no bare cargo, and none of the commands that run, install or publish.
+        Assert.All(allowed.Where(a => a.Contains("cargo", StringComparison.Ordinal)), a => Assert.Matches(@"^Bash\(cargo (build|check|test|fetch):\*\)$", a));
+
+        // Triage and the planner stay read-only: no allow rule but the read rule, Bash denied by name.
+        Assert.Empty(WorkerTools.ReadOnly.Allowed);
+        Assert.Contains("Bash", WorkerTools.ReadOnly.Denied);
+        var readOnly = ClaudeWorker.BuildArguments("p", null, null, WorkerTools.ReadOnly, "/wt/triage").ToList();
+        Assert.DoesNotContain(readOnly, a => a.Contains("cargo", StringComparison.Ordinal));
+        Assert.DoesNotContain(readOnly, a => a.Contains("dotnet", StringComparison.Ordinal));
+        // The prompts name the commands a worker now has.
+        Assert.Contains("`cargo build` and `cargo test`", RunPipeline.BuildsAndPasses);
+    }
+
+    [Theory]
+    [InlineData("Bash(cargo build:*)")]
+    [InlineData("Bash(cargo check:*)")]
+    [InlineData("Bash(cargo test:*)")]
+    [InlineData("Bash(cargo fetch:*)")]
+    public void A_repos_allow_rule_for_a_cargo_command_the_worker_already_has_does_not_taint(string rule)
+    {
+        var dir = Directory.CreateTempSubdirectory("df-settings-").FullName;
+        Directory.CreateDirectory(Path.Combine(dir, ".claude"));
+        File.WriteAllText(Path.Combine(dir, ".claude/settings.json"), """{"permissions":{"allow":["RULE"]}}""".Replace("RULE", rule));
+
+        Assert.Null(Taint.OfRepoSettings(dir));
+    }
+
+    [Theory]
+    [InlineData("Bash(cargo:*)")]
+    [InlineData("Bash(cargo run:*)")]
+    [InlineData("Bash(cargo install:*)")]
+    [InlineData("Bash(cargo publish:*)")]
+    [InlineData("Bash(cargo login:*)")]
+    [InlineData("Bash(cargo owner:*)")]
+    [InlineData("Bash(cargo yank:*)")]
+    [InlineData("Bash(cargo test*)")]
+    [InlineData("Bash(cargo +nightly test:*)")]
+    [InlineData("Bash(cargo t:*)")]
+    public void A_repos_allow_rule_for_any_other_cargo_command_taints(string rule)
+    {
+        var dir = Directory.CreateTempSubdirectory("df-settings-").FullName;
+        Directory.CreateDirectory(Path.Combine(dir, ".claude"));
+        File.WriteAllText(Path.Combine(dir, ".claude/settings.json"), """{"permissions":{"allow":["Read","RULE"]}}""".Replace("RULE", rule));
+
+        Assert.Equal(Taint.RepoSettings, Taint.OfRepoSettings(dir));
+    }
 }
 
 [Collection(ProcessEnvironmentCollection.Name)]

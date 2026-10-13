@@ -18,11 +18,258 @@ namespace DarkFactory.AcceptanceTests;
 /// Phase 4a's epic acceptance test P4-AT1 (sc-25870, extended by sc-25871 and sc-25872): a real planner session plans a
 /// <c>plan</c>-labelled story into stories on the board, the waiting plan item releases them in dependency order, each released story
 /// is really worked and merged by the gate into the plan's changeset branch, and the changeset then goes to the default branch by
-/// one pull request of the plan item's own, through the same review, CI and gate. Runbook: <c>docs/acceptance.md</c>.
+/// one pull request of the plan item's own, through the same review, CI and gate — once driven run by run
+/// (<c>factory run</c>), and once by the real intake loop of <c>factory work</c> (sc-25877). Also P4-AT3 (sc-25874, sc-25877):
+/// the planner's cross-repository proxy grant, and the three plans the code refuses with nothing created — a cycle, an oversized
+/// plan (both a stub Claude CLI answering a fixed plan) and a repository the factory is not configured for. Runbook:
+/// <c>docs/acceptance.md</c>.
 /// </summary>
 public class PlanAcceptanceTests
 {
     private static readonly TimeSpan RunTimeout = TimeSpan.FromMinutes(45);
+
+    /// <summary>A whole plan — planner, every story, the changeset pull request — through the intake loop's polls.</summary>
+    private static readonly TimeSpan WorkTimeout = TimeSpan.FromMinutes(120);
+
+    private static HttpClient Shortcut()
+    {
+        var shortcut = OutboundHttp.ShortcutApi();
+        shortcut.DefaultRequestHeaders.Add("Shortcut-Token", Harness.Options.ShortcutApiToken);
+        return shortcut;
+    }
+
+    private static async Task<JsonElement> PlanStoryAsync(HttpClient shortcut, int storyId, CancellationToken ct)
+    {
+        var parent = await shortcut.GetFromJsonAsync<JsonElement>($"stories/{storyId}", ct);
+        Assert.True(parent.GetProperty("labels").EnumerateArray().Any(l => string.Equals(l.GetProperty("name").GetString(), PlanLabel.Name,
+            StringComparison.OrdinalIgnoreCase)), $"sc-{storyId} does not carry the `{PlanLabel.Name}` label");
+        return parent;
+    }
+
+    /// <summary>
+    /// P4-AT3 (sc-25877): the item escalated on a plan the code refused, and nothing of a plan exists — no <c>plan</c>,
+    /// <c>plan-creating</c>, <c>plan-stories</c> or <c>changeset</c> row, and not one story more in the parent's epic and team on
+    /// the real board than before the run.
+    /// </summary>
+    private static async Task<List<LedgerEntry>> AssertRefusedWithNothingCreatedAsync(E2e e2e, HttpClient shortcut, JsonElement parent, int storyId,
+        RunOutcome outcome, HashSet<int> before, CancellationToken ct)
+    {
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        var history = await e2e.HistoryAsync(storyId, ct);
+        ReviewGateTests.AssertTypedOutcomes(history);
+        Assert.Equal([WorkState.Intake, WorkState.Plan, WorkState.Escalated], history.Where(e => e.Step is null).Select(e => e.State));
+        Assert.DoesNotContain(history, e => e.Step is RunPipeline.Steps.Plan or RunPipeline.Steps.PlanCreating or RunPipeline.Steps.PlanStories
+            or RunPipeline.Steps.Changeset or RunPipeline.Steps.ChangesetPushed or RunPipeline.Steps.PlanReleased);
+        var after = await PlanLive.SiblingsAsync(shortcut, parent, ct);
+        Assert.True(after.SetEquals(before), $"stories appeared in or left the plan story's epic/team during the run: "
+            + $"new {string.Join(", ", after.Except(before).Order())}; gone {string.Join(", ", before.Except(after).Order())}");
+        Assert.Empty(await E2e.PullRequestsAsync(Harness.Options.DefaultRepo, $"factory/changeset-sc-{storyId}", ct));
+        return history;
+    }
+
+    /// <summary>
+    /// A plan-labelled story run through <c>factory run</c> with a stub Claude CLI as the planner, answering <paramref name="answer"/>
+    /// (a plan <see cref="PlanParser"/> refuses): the session really runs — through the production planner seat, as the owner
+    /// (<c>Worker:RunAs=none</c>: the stub reads and writes nothing but its own files) — and the code refuses its plan.
+    /// </summary>
+    private static async Task AssertPlannerAnswerRefusedAsync(string variable, string prefix, string answer, string reason)
+    {
+        Harness.RequireOptIn();
+        var storyId = E2e.Story(variable, "a To Do story labelled `plan` (sc-<id>) on the sandbox repo; it escalates and nothing is created from it");
+        await using var e2e = await E2e.StartAsync(prefix);
+        using var stub = StubClaude.Answering(answer);
+        var options = e2e.Options(stub.Settings());
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        timeout.CancelAfter(RunTimeout);
+        var ct = timeout.Token;
+        using var shortcut = Shortcut();
+        var parent = await PlanStoryAsync(shortcut, storyId, ct);
+        var before = await PlanLive.SiblingsAsync(shortcut, parent, ct);
+
+        var outcome = await FactoryRunner.RunAsync(options, storyId, ignoreScope: true, Console.Out, ct);
+
+        var history = await AssertRefusedWithNothingCreatedAsync(e2e, shortcut, parent, storyId, outcome, before, ct);
+        // One planner session ran (the stub, to its end), and its answer is what was refused: plan-rejected, a gate rejection.
+        var session = Assert.Single(history, e => e.Step == RunPipeline.Steps.Session).ClaudeSessionId;
+        var run = Assert.Single(stub.Runs());
+        Assert.Equal((session, StubClaude.Completed), (run.Session, run.Ending));
+        var rejected = Assert.Single(history, e => e.Step == RunPipeline.Steps.PlanRejected);
+        Assert.Contains(reason, rejected.Detail);
+        Assert.Equal(StepOutcome.GateRejected, rejected.Outcome);
+        Assert.Contains("The planner's answer is not a valid plan, so no story was created", outcome.Error);
+        Assert.Contains(reason, outcome.Error);
+    }
+
+    /// <summary>P4-AT3: a plan whose stories block each other in a cycle is refused by the code; the item escalates, nothing is created.</summary>
+    [Fact]
+    public Task P4_AT3_a_plan_with_a_dependency_cycle_is_rejected_and_nothing_is_created() =>
+        AssertPlannerAnswerRefusedAsync("FACTORY_E2E_P4_CYCLE_STORY", "df_e2e_p4at3_cycle", PlanLive.CyclicAnswer, "the stories block each other in a cycle");
+
+    /// <summary>P4-AT3: a plan of more stories than <see cref="PlanParser.MaxStories"/> is refused whole — never cut; nothing is created.</summary>
+    [Fact]
+    public Task P4_AT3_an_oversized_plan_is_rejected_and_nothing_is_created() =>
+        AssertPlannerAnswerRefusedAsync("FACTORY_E2E_P4_OVERSIZED_STORY", "df_e2e_p4at3_oversized", PlanLive.OversizedAnswer,
+            $"the plan has {PlanParser.MaxStories + 1} stories; at most {PlanParser.MaxStories} are allowed");
+
+    /// <summary>
+    /// P4-AT3 (epic E1): a plan item whose <c>Repo:</c> line names a repository the factory is not configured for
+    /// (<c>Factory:DefaultRepo</c>, <c>GitHub:Watch:Repos</c>) escalates before any planner session — also when it names only that
+    /// one repository (sc-25877) — and nothing is created. The story's own description decides: one <c>Repo:</c> line (the form
+    /// this covers; several lines with an unconfigured one among them pass too).
+    /// </summary>
+    [Fact]
+    public async Task P4_AT3_a_plan_naming_an_unconfigured_repository_escalates_before_any_planner_session_and_nothing_is_created()
+    {
+        Harness.RequireOptIn();
+        var storyId = E2e.Story("FACTORY_E2E_P4_UNCONFIGURED_STORY",
+            "a To Do story labelled `plan` (sc-<id>) whose description has one line `Repo: owner/name` naming a repository the factory is NOT configured for");
+        await using var e2e = await E2e.StartAsync("df_e2e_p4at3_unconfigured");
+        var options = e2e.Options();
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        timeout.CancelAfter(RunTimeout);
+        var ct = timeout.Token;
+        using var shortcut = Shortcut();
+        var parent = await PlanStoryAsync(shortcut, storyId, ct);
+        var named = RepoResolver.ResolveAll(parent.GetProperty("description").GetString(), options.DefaultRepo);
+        var unconfigured = named.Where(r => !options.ConfiguredRepos.Contains(r.FullName, StringComparer.OrdinalIgnoreCase)).Select(r => r.FullName).ToList();
+        if (unconfigured.Count == 0)
+        {
+            Assert.Fail($"{PlanLive.Inconclusive}: sc-{storyId} names only configured repositories ({string.Join(", ", named)}; configured: "
+                + $"{string.Join(", ", options.ConfiguredRepos)}). Give it a `Repo:` line naming one the factory is not configured for.");
+        }
+        var before = await PlanLive.SiblingsAsync(shortcut, parent, ct);
+
+        var outcome = await FactoryRunner.RunAsync(options, storyId, ignoreScope: true, Console.Out, ct);
+
+        var history = await AssertRefusedWithNothingCreatedAsync(e2e, shortcut, parent, storyId, outcome, before, ct);
+        Assert.Contains($"{string.Join(", ", unconfigured)} {(unconfigured.Count == 1 ? "is" : "are")} not configured for this factory", outcome.Error);
+        Assert.Contains("no planner session was started and no story was created", outcome.Error);
+        // No planner: no session, no worker process, no rejected plan (there was no plan to reject).
+        Assert.DoesNotContain(history, e => e.Step is RunPipeline.Steps.Session or RunPipeline.Steps.WorkerStarted or RunPipeline.Steps.ModelClass
+            or RunPipeline.Steps.PlanRejected);
+        await using var db = e2e.Db();
+        Assert.Empty(await db.WorkerSessions.AsNoTracking().ToListAsync(ct));
+        Assert.Contains(await E2e.StoryCommentsAsync(storyId, ct), c => c.Contains("not configured for this factory", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// P4-AT1 through the real intake loop (sc-25877): <c>factory work</c> (<see cref="FactoryHost.BuildWork"/>, in process, a
+    /// throwaway ledger and work root) watching the plan story's scope picks the plan item up itself, plans it, releases its stories
+    /// into that watch scope and picks each of them up from <c>ListReadyAsync</c> — no run of the plan item or of a story is started
+    /// by the test — until the plan's changeset is on the default branch. The scope (FACTORY_E2E_WATCH_TEAM / FACTORY_E2E_WATCH_EPIC)
+    /// must hold no other To Do story, and no other <c>factory work</c> may watch it: the host claims every ready story it sees.
+    /// </summary>
+    [Fact]
+    public async Task P4_AT1_factory_work_picks_up_a_plan_item_in_its_watch_scope_releases_its_stories_into_it_and_picks_them_up()
+    {
+        Harness.RequireOptIn();
+        var storyId = E2e.Story("FACTORY_E2E_P4_WORK_PLAN_STORY",
+            "a To Do story labelled `plan` (sc-<id>) INSIDE the watch scope, on the sandbox repo, describing three steps that build on one another");
+        var scope = E2e.WatchScope();
+        await using var e2e = await E2e.StartAsync("df_e2e_plan_work");
+        var options = e2e.Options(scope);
+        await ReviewGateTests.RequireGateReadyAsync(options, TestContext.Current.CancellationToken);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        timeout.CancelAfter(WorkTimeout);
+        var ct = timeout.Token;
+        using var shortcut = Shortcut();
+        await PlanStoryAsync(shortcut, storyId, ct);
+        using var sourceHttp = OutboundHttp.ShortcutApi();
+        var source = FactoryRunner.CreateWorkSource(options, sourceHttp);
+        Assert.Equal("To Do", (await E2e.StoryAsync(storyId, ct)).State);
+        Assert.True(await source.InScopeAsync(storyId, ct), $"sc-{storyId} is not inside the watch scope: the intake loop would never see it");
+        // The loop takes every ready story of the scope: this run must own all of them.
+        var ready = await source.ListReadyAsync(ct);
+        Assert.True(ready.SequenceEqual([storyId]), $"the watch scope's ready stories must be exactly sc-{storyId} (the host claims every one it sees), "
+            + $"but they are: {string.Join(", ", ready.Select(StoryId.Format))}");
+        List<int> created = [];
+
+        await using var app = FactoryHost.BuildWork(options);
+        await app.StartAsync(ct);
+        try
+        {
+            // Picked up in the watch scope and planned, by the loop.
+            await FactoryWorkTests.WaitForStateAsync(e2e, storyId, WorkState.Planned, RunTimeout, ct);
+            created = StoryIds(await e2e.HistoryAsync(storyId, ct));
+            var plan = Plan.FromDetail(Assert.Single(await e2e.HistoryAsync(storyId, ct), e => e.Step == RunPipeline.Steps.Plan).Detail);
+            if (PlanLive.ChainProblem(plan) is { } inconclusive)
+            {
+                Assert.Fail(inconclusive);
+            }
+            // Its stories are created inside the same watch scope (the parent's team and epic), so a release makes them the loop's.
+            foreach (var id in created)
+            {
+                Assert.True(await source.InScopeAsync(id, ct), $"sc-{id} was created outside the watch scope");
+            }
+
+            // The loop alone takes the plan to its end: every story released, picked up, merged; then the changeset pull request.
+            await E2e.WaitForAsync($"sc-{storyId}'s plan to be delivered by the intake loop", WorkTimeout, async () =>
+            {
+                foreach (var id in created)
+                {
+                    var last = (await e2e.TransitionsAsync(id, ct)).LastOrDefault();
+                    Assert.False(last?.State == WorkState.Escalated, $"sc-{id} escalated: {last?.Detail}");
+                }
+                var transitions = await e2e.TransitionsAsync(storyId, ct);
+                Assert.False(transitions[^1].State == WorkState.Escalated, $"sc-{storyId} escalated: {transitions[^1].Detail}");
+                return transitions.Any(t => t.State == WorkState.Watch);
+            }, ct);
+
+            var history = await e2e.HistoryAsync(storyId, ct);
+            Assert.Single(history, e => e.Step == RunPipeline.Steps.Session); // planned once
+            var released = history.Where(e => e.Step == RunPipeline.Steps.PlanReleased).ToList();
+            Assert.Equal(created.Select(StoryId.Format).Order(), released.Select(e => PlanRelease.StoriesOf(e.Detail)[0]).Order());
+            // Released into the watch scope: no release says nothing would pick the story up.
+            Assert.All(released, e => Assert.DoesNotContain("outside the watch scope", e.Detail));
+            await using var db = e2e.Db();
+            var planItem = await db.WorkItems.AsNoTracking().SingleAsync(i => i.ExternalId == StoryId.Format(storyId), ct);
+            for (var i = 0; i < created.Count; i++)
+            {
+                var rows = await e2e.HistoryAsync(created[i], ct);
+                var releasedAt = released.Single(e => PlanRelease.StoriesOf(e.Detail)[0] == StoryId.Format(created[i])).RecordedAt;
+                // Picked up by the loop from the ready listing (nothing else ran it): claimed after its release, as the plan's story.
+                var claimed = rows.FirstOrDefault(e => e.Step == RunPipeline.Steps.Claimed);
+                Assert.True(claimed is not null, $"sc-{created[i]} was never claimed by the intake loop");
+                Assert.True(claimed.RecordedAt >= releasedAt, $"sc-{created[i]} was claimed at {claimed.RecordedAt:O}, before its release at {releasedAt:O}");
+                Assert.Equal(planItem.Id, (await db.WorkItems.AsNoTracking().SingleAsync(w => w.ExternalId == StoryId.Format(created[i]), ct)).PlanItemId);
+                Assert.Contains(rows, e => e.Step is null && e.State == WorkState.Merge);
+                // In dependency order: released only after each of its blockers' Merge row.
+                foreach (var blocker in plan.Stories[i].BlockedBy.Select(key => created[plan.Stories.ToList().FindIndex(s => s.Key == key)]))
+                {
+                    var merged = (await e2e.HistoryAsync(blocker, ct)).First(e => e.Step is null && e.State == WorkState.Merge).RecordedAt;
+                    Assert.True(releasedAt >= merged, $"sc-{created[i]} was released at {releasedAt:O}, before its blocker sc-{blocker} merged at {merged:O}");
+                }
+            }
+            // And the changeset reached the default branch through the plan item's own gated pull request.
+            var changeset = Changeset.Of(history, options.DefaultRepo)!;
+            var pull = Assert.Single(await E2e.PullRequestsAsync(options.DefaultRepo, changeset.Branch, ct));
+            Assert.Equal(changeset.Base, pull.GetProperty("base").GetProperty("ref").GetString());
+            Assert.NotEqual(JsonValueKind.Null, pull.GetProperty("merged_at").ValueKind);
+            Assert.Contains(history, e => e.Step == RunPipeline.Steps.GatePassed);
+            Assert.Equal(RunPipeline.Posted, Assert.Single(history, e => e.Step == RunPipeline.Steps.Closeout).Detail);
+        }
+        finally
+        {
+            await app.StopAsync(CancellationToken.None);
+            await ArchiveAsync(shortcut, created);
+        }
+    }
+
+    /// <summary>The created stories are a test's own: archived so a rerun on the same plan story starts clean (best effort).</summary>
+    private static async Task ArchiveAsync(HttpClient shortcut, IEnumerable<int> created)
+    {
+        foreach (var id in created)
+        {
+            try
+            {
+                using var response = await shortcut.PutAsJsonAsync($"stories/{id}", new { archived = true }, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[cleanup] could not archive sc-{id}: {ex.Message}");
+            }
+        }
+    }
 
     /// <summary>
     /// P4-AT3's proxy part (sc-25874): the production loopback proxy with a planner grant over two repositories
@@ -99,7 +346,7 @@ public class PlanAcceptanceTests
     {
         Harness.RequireOptIn();
         var storyId = E2e.Story("FACTORY_E2E_P4_PLAN_STORY",
-            "a To Do story labelled `plan` (sc-<id>) on the sandbox repo, describing work worth two or more stories");
+            "a To Do story labelled `plan` (sc-<id>) on the sandbox repo, describing three or more steps that build on one another");
         await using var e2e = await E2e.StartAsync("df_e2e_plan");
         var options = e2e.Options();
         await ReviewGateTests.RequireGateReadyAsync(options, TestContext.Current.CancellationToken);
@@ -150,6 +397,11 @@ public class PlanAcceptanceTests
 
             // The ledger's plan passes every rule, and the board holds exactly its stories: Backlog, marked, blocked as planned.
             var plan = Plan.FromDetail(Assert.Single(history, e => e.Step == RunPipeline.Steps.Plan).Detail);
+            // The epic's scenario: at least 3 stories with a dependency chain. A plan without one proves nothing about release order.
+            if (PlanLive.ChainProblem(plan) is { } inconclusive)
+            {
+                Assert.Fail(inconclusive);
+            }
             Assert.Equal(plan.Stories.Count, created.Count);
             Assert.Equal(created.Count, created.Distinct().Count());
             var backlog = await BacklogStateAsync(shortcut, parent, ct);
@@ -214,6 +466,10 @@ public class PlanAcceptanceTests
                     var rows = await e2e.HistoryAsync(created[i], ct);
                     Assert.Equal(changeset.Branch, DarkFactory.Orchestrator.Controls.MergeFiles.FromDetail(rows.Last(e => e.Step == RunPipeline.Steps.MergeFiles).Detail)!.Base);
                     Assert.Contains(rows, e => e.Step == RunPipeline.Steps.Verdict);
+                    // Its closeout on the real board is exactly the one rendered from its own ledger rows, every row typed (E7).
+                    ReviewGateTests.AssertTypedOutcomes(rows);
+                    Assert.Contains(PlanLive.Lines(await PlanLive.ExpectedStoryCloseoutAsync(e2e, created[i], ct)),
+                        (await E2e.StoryCommentsAsync(created[i], ct)).Select(PlanLive.Lines));
                     merged.Add(plan.Stories[i].Key);
                 }
                 // Nothing of the plan is on the default branch yet: it has not moved because of these merges.
@@ -253,23 +509,17 @@ public class PlanAcceptanceTests
             var mergeCommit = final.Last(e => e.Step is null && e.State == WorkState.Merge).Detail!;
             Assert.Equal(0, (await gate.CompareAsync(repo, changeset.Base, mergeCommit, ct)).BehindBy);
             Assert.Equal(RunPipeline.Posted, Assert.Single(final, e => e.Step == RunPipeline.Steps.Closeout).Detail);
-            Assert.Contains(await E2e.StoryCommentsAsync(storyId, ct), c => c.Contains($"sc-{storyId}'s plan is complete: {created.Count} of its {created.Count} stories merged")
-                && c.Contains($"Its changeset merged into `{changeset.Base}` as `{mergeCommit}`"));
+            ReviewGateTests.AssertTypedOutcomes(final);
+            // The closeout on the real board equals the ledger's (E5): exactly the comment rendered from the throwaway ledger's
+            // rows — the plan item's before it was posted, and each story's own — not merely a comment that mentions the merge.
+            var closeout = await PlanLive.ExpectedPlanCloseoutAsync(e2e, storyId, created, repo, ct);
+            Assert.Contains($"sc-{storyId}'s plan is complete: {created.Count} of its {created.Count} stories merged", closeout);
+            Assert.Contains($"Its changeset merged into `{changeset.Base}` as `{mergeCommit}`", closeout);
+            Assert.Contains(PlanLive.Lines(closeout), (await E2e.StoryCommentsAsync(storyId, ct)).Select(PlanLive.Lines));
         }
         finally
         {
-            // The created stories are this test's own: archived so a rerun on the same plan story starts clean (best effort).
-            foreach (var id in created)
-            {
-                try
-                {
-                    using var response = await shortcut.PutAsJsonAsync($"stories/{id}", new { archived = true }, CancellationToken.None);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[cleanup] could not archive sc-{id}: {ex.Message}");
-                }
-            }
+            await ArchiveAsync(shortcut, created);
         }
     }
 

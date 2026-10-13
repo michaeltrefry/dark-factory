@@ -67,7 +67,29 @@ public sealed record ClaimResult(bool Claimed, string? Refusal)
 public sealed class ChildrenRefusedException(string reason) : Exception(reason);
 
 /// <summary>A story to create from a plan. <see cref="BlockedBy"/> holds indices of earlier children.</summary>
-public sealed record ChildItem(string Name, string Description, string StoryType, IReadOnlyList<int> BlockedBy);
+public sealed record ChildItem(string Name, string Description, string StoryType, IReadOnlyList<int> BlockedBy)
+{
+    /// <summary>What every idempotency key starts with: only the factory's code writes one.</summary>
+    public const string KeyPrefix = "dark-factory:child:";
+
+    /// <summary>
+    /// The idempotency key of this child under the parent <paramref name="parentRef"/> (the parent's ledger name, e.g.
+    /// <c>sc-12</c>; sc-25877): written by code, the same on every retry of the same plan — <see cref="KeyPrefix"/>, the parent,
+    /// then the SHA-256 of the name and the description as sent (each UTF-8, the name's byte length first so no two pairs share
+    /// a hash). A source stores it on the item it creates, in whatever field of its board holds an opaque id, and finds the child
+    /// again by it (<see cref="IWorkSource.CreateChildrenAsync"/>), so it need not get the description back unchanged.
+    /// </summary>
+    public string Key(string parentRef)
+    {
+        var name = System.Text.Encoding.UTF8.GetBytes(Name);
+        var description = System.Text.Encoding.UTF8.GetBytes(Description);
+        using var hash = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
+        hash.AppendData(BitConverter.GetBytes(System.Net.IPAddress.HostToNetworkOrder(name.Length)));
+        hash.AppendData(name);
+        hash.AppendData(description);
+        return $"{KeyPrefix}{parentRef}:{Convert.ToHexStringLower(hash.GetHashAndReset())}";
+    }
+}
 
 /// <summary>
 /// The only way the orchestrator touches a board (E6): the spec's work-sources table.
@@ -139,9 +161,11 @@ public interface IWorkSource
     /// <summary>
     /// Creates stories from a plan in <paramref name="parentId"/>'s team and epic, waiting in the backlog,
     /// joined by blocker relations. Returns their ids in order. Idempotent: a retry reuses the children
-    /// (and blocker relations) an earlier, partly failed call already created. A child is found again only by its name and
-    /// description together — never by name alone: the name may be a model's text, and a namesake someone else wrote is not
-    /// this call's child — so a caller leads each description with text only it writes. Refuses before any board write
+    /// (and blocker relations) an earlier, partly failed call already created. A child is found again by its idempotency key
+    /// (<see cref="ChildItem.Key"/>, which the source stores on the item it creates; sc-25877) — never by name alone: the name
+    /// may be a model's text, and a namesake someone else wrote is not this call's child. A child created before items carried
+    /// a key is still found by its name and description together, so a caller leads each description with text only it
+    /// writes. Refuses before any board write
     /// (<see cref="ChildrenRefusedException"/>) when it could not find the children again after a failed attempt.
     /// </summary>
     Task<IReadOnlyList<int>> CreateChildrenAsync(int parentId, IReadOnlyList<ChildItem> children, CancellationToken ct);

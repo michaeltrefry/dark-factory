@@ -271,6 +271,37 @@ public class DashboardComponentTests : BunitContext
     }
 
     [Fact]
+    public void A_finished_plan_row_groups_its_listed_stories_says_it_is_finished_and_offers_no_control()
+    {
+        // sc-25877: the plan closed (Done); its merged stories are still in Watch and are listed beneath it, not on their own.
+        var status = new PlanStatus([
+            new PlanStoryStatus("sc-501", PlanStoryState.Merged, [], [], null, WorkState.Watch),
+            new PlanStoryStatus("sc-502", PlanStoryState.Merged, [], [], null, WorkState.Watch, MergedOutside: true),
+        ]);
+        var plan = new PlanView([.. status.Stories.Select(s => new PlanStoryView(s.Id, s.Id, s.State, s.ItemState, PlanStoryView.WaitsOf(s, status)))], status, null);
+        _data.Rows =
+        [
+            Row(500, WorkState.Done) with { Plan = plan },
+            Row(501, WorkState.Watch) with { PlanItemId = 500 },
+            Row(502, WorkState.Escalated) with { PlanItemId = 500 },
+        ];
+
+        var cut = Render<Pipeline>();
+
+        var rows = cut.FindAll("table.pipeline tbody tr");
+        Assert.Equal(["500", "501", "502"], rows.Select(r => r.GetAttribute("data-item")));
+        Assert.Equal([null, "500", "500"], rows.Select(r => r.GetAttribute("data-plan")));
+        var planRow = cut.Find("tr[data-item='500']");
+        Assert.StartsWith("Done", planRow.QuerySelector("td.state")!.TextContent.Trim());
+        Assert.Equal("2 of 2 merged · 0 in flight · 0 waiting · 0 failed", planRow.QuerySelector(".plan-counts")!.TextContent);
+        Assert.Empty(planRow.QuerySelectorAll("td.control form")); // nothing of a finished item can be paused or stopped
+        Assert.NotEmpty(cut.FindAll("tr[data-item='501'] td.control form")); // its story keeps its own
+        // A story counted as merged though the factory's gate did not merge it says so.
+        Assert.Equal("merged outside the factory into the changeset branch; reviewed as part of the changeset pull request",
+            cut.Find("tr[data-story='sc-502'] .waits").TextContent);
+    }
+
+    [Fact]
     public void A_running_session_silent_for_the_quiet_threshold_is_marked_quiet_and_unmarked_once_it_speaks_again()
     {
         var time = (FakeTimeProvider)Services.GetRequiredService<TimeProvider>();

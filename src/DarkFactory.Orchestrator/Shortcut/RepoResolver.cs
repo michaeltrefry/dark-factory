@@ -6,6 +6,16 @@ public sealed record RepoRef(string Owner, string Name)
 {
     public string FullName => $"{Owner}/{Name}";
 
+    /// <summary>
+    /// What two spellings of one repository share (sc-25877): GitHub's owner and repository names are case-insensitive, and each
+    /// item carries its own <c>Repo:</c> line's spelling. Lower-case <c>owner/name</c>, for comparing and keying only — never for a
+    /// path on disk (existing clones and worktrees are under the literal spelling) nor for anything shown or sent to GitHub.
+    /// </summary>
+    public string Key => FullName.ToLowerInvariant();
+
+    /// <summary>Whether <paramref name="other"/> names the same repository, whatever case either is spelled in.</summary>
+    public bool Is(RepoRef other) => string.Equals(Key, other.Key, StringComparison.Ordinal);
+
     public static RepoRef Parse(string fullName)
     {
         var parts = fullName.Trim().Split('/');

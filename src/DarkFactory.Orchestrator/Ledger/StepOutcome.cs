@@ -48,7 +48,10 @@ public enum StepOutcome
 /// plan is stopped — → gate_rejected, a warning — it could not be told — → failed (the check could not produce an answer; planning goes on);
 /// <c>usage-pause</c>, <c>parked</c>, <c>plan-held</c> (a plan's stories wait on a blocker outside the plan, sc-25871, or behind a failed
 /// story of it, sc-25876), <c>plan-stuck</c> (every remaining story of a plan failed or is blocked behind one) → deferred — the plan item
-/// itself never escalates for a story's failure, which that story's own Escalated row already records; <c>plan-notice</c> (the plan
+/// itself never escalates for a story's failure, which that story's own Escalated row already records; <c>plan-delivery</c> (sc-25873:
+/// which of a plan's changesets are on their default branch when it escalates or is stopped — a record, judged by nothing) → deferred;
+/// <c>merged-into-changeset</c> (sc-25877: a plan story's pull request was merged outside the factory into its plan's changeset branch
+/// — its own gate never judged it; the changeset pull request's review and gate do) → deferred; <c>plan-notice</c> (the plan
 /// item's comment for a hold) posted → passed, failed → failed; every other checkpoint (a completed sub-step, <c>plan-resumed</c> among
 /// them) → passed.</item>
 /// </list>
@@ -125,7 +128,7 @@ public static class StepOutcomes
         Issues.IssueSteps.ApprovalIgnored or RunPipeline.Steps.PlanRejected => StepOutcome.GateRejected,
         RunPipeline.Steps.CiTriggers => CiTriggerCheck.IsBlocked(detail) ? StepOutcome.GateRejected : StepOutcome.Failed,
         RunPipeline.Steps.UsagePause or RunPipeline.Steps.Parked or RunPipeline.Steps.PlanHeld or RunPipeline.Steps.PlanStuck
-            or RunPipeline.Steps.PlanDelivery => StepOutcome.Deferred,
+            or RunPipeline.Steps.PlanDelivery or RunPipeline.Steps.MergedIntoChangeset => StepOutcome.Deferred,
         _ => StepOutcome.Passed,
     };
 }

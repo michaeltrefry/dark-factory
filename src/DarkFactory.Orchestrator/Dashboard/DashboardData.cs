@@ -26,6 +26,12 @@ public sealed record PipelineRow(
 {
     /// <summary>Whether the factory will try the failed closeout again (the next poll), or has left it to a human.</summary>
     public bool CloseoutRetrying => FailedCloseout is { Attempts: < RunPipeline.MaxCloseoutAttempts };
+
+    /// <summary>
+    /// Done or Cancelled: only a plan item is ever listed so (sc-25877), for as long as one of its stories is — a row that groups
+    /// them and offers no control (nothing of a finished item can be paused or stopped).
+    /// </summary>
+    public bool Finished => State is WorkState.Done or WorkState.Cancelled;
 }
 
 /// <summary>
@@ -60,7 +66,9 @@ public sealed record PlanView(IReadOnlyList<PlanStoryView> Stories, PlanStatus S
 /// <param name="Title">The story's title: its work item's, or — not released yet, so with no work item — the one its plan recorded,
 /// made inert (<see cref="WorkSources.UntrustedText.Inert"/>: a planner wrote it).</param>
 /// <param name="ItemState">Its work item's state; null while the ledger does not know it.</param>
-/// <param name="Waits">What it waits on, in words: its unmerged blockers, <c>held by sc-N (escalated)</c>, or how it failed; empty when nothing.</param>
+/// <param name="Waits">What it waits on, in words: its unmerged blockers, <c>held by sc-N (escalated)</c>, how it failed, or — for a
+/// story that counts as merged though the factory's gate did not merge it — that it was merged outside the factory into the changeset
+/// branch; empty when nothing.</param>
 /// <param name="Repo">The repository the plan worked it in (sc-25873); null when the plan's record no longer reads back.</param>
 public sealed record PlanStoryView(string ExternalId, string Title, PlanStoryState State, WorkState? ItemState, string Waits, string? Repo = null)
 {
@@ -78,6 +86,8 @@ public sealed record PlanStoryView(string ExternalId, string Title, PlanStorySta
         PlanStoryState.Waiting when story.WaitsOn.Count > 0 => $"waits on {string.Join(", ", story.WaitsOn)}",
         PlanStoryState.Waiting => "nothing: released at the next evaluation",
         PlanStoryState.InFlight when story.ItemState is null => "to be picked up",
+        // Escalated, yet counted as merged (sc-25877): the row says why.
+        PlanStoryState.Merged when story.MergedOutside => PlanRelease.MergedOutsideIntoChangeset,
         _ => "",
     };
 }
@@ -175,6 +185,14 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
     {
         await using var db = await contexts.CreateDbContextAsync(ct);
         var items = await db.WorkItems.AsNoTracking().Where(i => !Finished.Contains(i.State)).OrderBy(i => i.Id).ToListAsync(ct);
+        // A finished plan item (Done, Cancelled) is listed for as long as one of its stories is (sc-25877): a merged story stays in
+        // Watch after its plan closed, and is still shown beneath its plan, not as a row of its own.
+        var listed = items.Select(i => i.Id).ToHashSet();
+        var finishedPlans = items.Select(i => i.PlanItemId).OfType<long>().Where(p => !listed.Contains(p)).Distinct().ToList();
+        if (finishedPlans.Count > 0)
+        {
+            items = [.. items.Concat(await db.WorkItems.AsNoTracking().Where(i => finishedPlans.Contains(i.Id)).ToListAsync(ct)).OrderBy(i => i.Id)];
+        }
         var controls = (await db.Controls.AsNoTracking().ToListAsync(ct)).ToDictionary(c => c.Scope);
         var now = time.GetUtcNow();
         var ids = items.Select(i => i.Id).ToList();
@@ -215,7 +233,7 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
                 ControlOf(i),
                 // A merged item's closeout, or a finished plan's (sc-25871: a plan item has no Merge row, so every closeout row is its own).
                 i.State is WorkState.Watch or WorkState.Planned && RunPipeline.CloseoutOf(closeouts[i.Id]) is { Posted: false, Attempts: > 0 } failed ? failed : null,
-                // A story of a plan is shown under its plan item while that is active (sc-25876).
+                // A story of a plan is shown under its plan item (sc-25876), which is listed while any story of it is (sc-25877).
                 i.PlanItemId is { } p && byId.ContainsKey(p) ? p : null,
                 plans.GetValueOrDefault(i.Id)))
             .ToList();
@@ -253,7 +271,9 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
         var wanted = planned.SelectMany(p => p.Stories).Distinct(StringComparer.Ordinal).ToList();
         var stories = await db.WorkItems.AsNoTracking().Where(i => wanted.Contains(i.ExternalId)).ToListAsync(ct);
         var storyIds = stories.Select(s => s.Id).ToList();
-        var transitions = (await db.LedgerEntries.AsNoTracking().Where(e => storyIds.Contains(e.WorkItemId) && e.Step == null).OrderBy(e => e.Id).ToListAsync(ct))
+        // Each story's transitions, and the one checkpoint that counts a story as merged without a Merge row (sc-25877).
+        var transitions = (await db.LedgerEntries.AsNoTracking()
+                .Where(e => storyIds.Contains(e.WorkItemId) && (e.Step == null || e.Step == RunPipeline.Steps.MergedIntoChangeset)).OrderBy(e => e.Id).ToListAsync(ct))
             .ToLookup(e => e.WorkItemId);
         var plannedIds = planned.Select(p => p.Item.Id).ToList();
         var ownTransitions = (await db.LedgerEntries.AsNoTracking().Where(e => plannedIds.Contains(e.WorkItemId) && e.Step == null).OrderBy(e => e.Id).ToListAsync(ct))

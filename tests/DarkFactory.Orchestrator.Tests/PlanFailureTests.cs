@@ -872,6 +872,67 @@ public class PlanFailurePipelineTests
     }
 
     [Fact]
+    public async Task A_plan_stop_cut_short_after_moving_a_story_back_and_before_its_record_is_finished_by_the_next_attempt_with_no_second_move()
+    {
+        var h = new Harness();
+        var ids = await h.Planned(PlanAnswers.Answer(PlanAnswers.Story("a", "Only story")));
+        await h.Run(); // released, never claimed
+        Assert.Equal(FakeShortcutBoard.ToDo, h.State(ids[0]));
+        // The stop moves the story back to the backlog; its comment — and so everything after it: the story's Cancelled item — fails.
+        h.Board.Intercept = Failing(HttpMethod.Post, $"/stories/{ids[0]}/comments");
+        h.Board.Requests.Clear();
+
+        var cut = await h.Actions.StopAsync(ControlScope.Item(Plan), "tester", CancellationToken.None);
+
+        Assert.False(cut.Ok);
+        Assert.Contains($"sc-{ids[0]}", cut.Message);
+        Assert.Equal(FakeShortcutBoard.Backlog, h.State(ids[0])); // the board was written first
+        Assert.Empty(await h.Rows(ids[0]));
+        Assert.Equal(WorkState.Planned, await h.ItemState(PlanId));
+        Assert.Equal(ControlState.Stopping, (await h.Controls.GetAsync(ControlScope.Item(Plan), CancellationToken.None))!.State);
+
+        // The next attempt finds the story in the backlog: nothing more is written to it, and the plan is cancelled saying where it is.
+        h.Board.Intercept = null;
+        h.Board.Requests.Clear();
+        var done = await h.Actions.StopAsync(ControlScope.Item(Plan), "tester", CancellationToken.None);
+
+        Assert.True(done.Ok, done.Message);
+        Assert.Empty(h.Writes(ids[0]));
+        Assert.Empty(await h.Rows(ids[0]));
+        Assert.Equal(FakeShortcutBoard.Backlog, h.State(ids[0]));
+        Assert.Equal(WorkState.Cancelled, await h.ItemState(PlanId));
+        Assert.Contains($"Never started (left in the backlog; the factory will not release or start them): sc-{ids[0]}.", Assert.Single(h.Comments(PlanId)));
+        // Moved to ready by hand afterwards, it is refused: the plan was stopped.
+        h.Board.Story(ids[0])["workflow_state_id"] = FakeShortcutBoard.ToDo;
+        Assert.Contains("which was stopped", (await h.Run(ids[0])).Error);
+    }
+
+    [Fact]
+    public async Task A_finished_plan_item_is_still_listed_with_its_stories_beneath_it_while_any_of_them_is_listed()
+    {
+        var h = new Harness();
+        var ids = await h.Planned(PlanAnswers.Answer(PlanAnswers.Story("a", "First story"), PlanAnswers.Story("b", "Second story")));
+        var plan = (await h.Ledger.FindAsync(RunPipeline.Source, Plan, CancellationToken.None))!;
+        await h.Ledger.RecordAsync(plan, WorkState.Done, null, "2 stories merged", CancellationToken.None);
+
+        // A finished plan none of whose stories is listed is not listed either.
+        Assert.Empty(await h.Dashboard());
+
+        // Its merged stories stay in Watch: each is shown beneath the plan row, which says the plan is finished (sc-25877).
+        await h.Worked(ids[0]);
+        await h.Worked(ids[1]);
+        var rows = await h.Dashboard();
+
+        var row = Assert.Single(rows, r => r.ExternalId == Plan);
+        Assert.Equal((WorkState.Done, true), (row.State, row.Finished));
+        Assert.Equal(ids.Select(i => $"sc-{i}"), row.Plan!.Stories.Select(s => s.ExternalId));
+        Assert.Equal(2, row.Plan.Merged);
+        Assert.All(ids, id => Assert.Equal(row.Id, rows.Single(r => r.ExternalId == $"sc-{id}").PlanItemId));
+        Assert.Equal(3, rows.Count);
+        Assert.False(rows.Single(r => r.ExternalId == $"sc-{ids[0]}").Finished);
+    }
+
+    [Fact]
     public async Task A_story_this_stop_returned_unstarted_whose_record_was_cut_short_is_only_recorded_cancelled_by_the_next_attempt()
     {
         var h = new Harness();

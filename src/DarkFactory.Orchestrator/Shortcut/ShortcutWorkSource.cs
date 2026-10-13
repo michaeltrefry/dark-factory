@@ -257,20 +257,34 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
         // Plan output waits in Backlog: nothing picks a child up until it is moved to To Do.
         var backlog = await StateIdAsync(parent.WorkflowId, BoardStateName(BoardState.Stopped), ct);
         // A retry after a partial failure reuses what the earlier call created: an unarchived story in the parent's epic and team
-        // with the child's exact name and description, and its blocker relations. The name alone never decides: a namesake
-        // someone else wrote is not this call's child.
+        // carrying the child's idempotency key as its external id (sc-25877: written by code, sent at creation, so finding it
+        // again does not depend on the board returning a Markdown description unchanged), and its blocker relations. The name
+        // alone never decides: a namesake someone else wrote is not this call's child.
         var existing = (await SiblingsAsync(parent, ct))
             .Where(s => !s.Archived && s.Id != parentId && s.EpicId == parent.EpicId && s.GroupId == parent.GroupId)
             .ToList();
+        var parentRef = ItemNaming.Shortcut.Format(parentId);
         var ids = new List<int>();
         foreach (var child in children)
         {
+            var key = child.Key(parentRef);
             Story? reused = null;
-            foreach (var namesake in existing.Where(s => s.Name == child.Name && !ids.Contains(s.Id)))
+            // The listings carry each story's external id; the story is then read in full for its relations (and the key again).
+            foreach (var keyed in existing.Where(s => s.ExternalId == key && !ids.Contains(s.Id)))
             {
-                // The listings carry no description: each namesake is read in full.
+                var full = await GetStoryAsync(keyed.Id, ct);
+                if (!full.Archived && full.ExternalId == key)
+                {
+                    reused = full;
+                    break;
+                }
+            }
+            // Fallback, only for a child created before stories carried a key (no external id at all): its exact name and
+            // description. The listings carry no description, so each such namesake is read in full.
+            foreach (var namesake in reused is not null ? [] : existing.Where(s => s.Name == child.Name && string.IsNullOrEmpty(s.ExternalId) && !ids.Contains(s.Id)))
+            {
                 var full = await GetStoryAsync(namesake.Id, ct);
-                if (!full.Archived && SameText(full.Description, child.Description))
+                if (!full.Archived && string.IsNullOrEmpty(full.ExternalId) && SameText(full.Description, child.Description))
                 {
                     reused = full;
                     break;
@@ -289,6 +303,7 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
                     ["description"] = child.Description,
                     ["story_type"] = child.StoryType,
                     ["workflow_state_id"] = backlog,
+                    ["external_id"] = key,
                 };
                 if (parent.GroupId is { } group)
                 {
@@ -562,7 +577,8 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
         [property: JsonPropertyName("labels")] List<Label>? Labels,
         [property: JsonPropertyName("external_links")] List<string>? Links,
         [property: JsonPropertyName("story_links")] List<StoryLink>? Relations,
-        [property: JsonPropertyName("estimate")] int? Estimate = null)
+        [property: JsonPropertyName("estimate")] int? Estimate = null,
+        [property: JsonPropertyName("external_id")] string? ExternalId = null)
     {
         public List<string> OwnerIds => Owners ?? [];
         public List<string> LabelNames => Labels?.Select(l => l.Name).ToList() ?? [];

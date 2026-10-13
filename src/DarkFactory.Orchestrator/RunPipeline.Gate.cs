@@ -57,6 +57,15 @@ public sealed partial class RunPipeline
         history.LastOrDefault(e => e.Step == Steps.Linked)?.Detail?.Split(' ')[0]
         ?? history.LastOrDefault(e => e.Step is null && e.State == WorkState.Review && e.Detail?.StartsWith("https://", StringComparison.Ordinal) == true)?.Detail;
 
+    /// <summary>
+    /// What the repository guard of <see cref="ReadPullAsync"/> adds for its other cause (sc-25877): GitHub goes on answering a
+    /// renamed or transferred repository under its old name (a redirect), but a pull request opened since carries the new one in
+    /// its URL, which then no longer matches the item's. The guard cannot tell that from a wrong repository and never follows
+    /// the redirect; the owner updates the name.
+    /// </summary>
+    internal const string RenamedRemedy = "If the repository was renamed or transferred on GitHub, update the item's `Repo:` line / "
+        + "`Factory:DefaultRepo` to the new name and re-run.";
+
     private async Task<(List<LedgerEntry> History, PullFacts Pull)> ReadPullAsync(Run run, CancellationToken ct)
     {
         var history = await ledger.HistoryAsync(run.Item, ct);
@@ -68,20 +77,48 @@ public sealed partial class RunPipeline
         if (!string.Equals(linked.FullName, run.Repo.FullName, StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException($"{run.Item.ExternalId}'s pull request {url} is in {linked}, but the item works in {run.Repo}: "
-                + $"nothing was read or merged in {run.Repo}. An item's pull request must be in the item's repository.");
+                + $"nothing was read or merged in {run.Repo}. An item's pull request must be in the item's repository. {RenamedRemedy}");
         }
         var pull = await Gate.GitHub.GetPullAsync(run.Repo, number, ct);
         return (history, pull);
     }
 
-    private static void EnsureOpen(PullFacts pull)
+    private async Task EnsureOpenAsync(Run run, PullFacts pull, CancellationToken ct)
     {
         if (!pull.Open)
         {
             throw new InvalidOperationException(pull.Merged
-                ? $"{pull.HtmlUrl} {Plans.PlanRelease.MergedOutsideFactory}."
+                ? $"{pull.HtmlUrl} {Plans.PlanRelease.MergedOutsideFactory}.{await MergedIntoChangesetAsync(run, pull, ct)}"
                 : $"{pull.HtmlUrl} is closed outside the factory.");
         }
+    }
+
+    /// <summary>
+    /// A pull request found merged that the factory's gate did not merge (sc-25877; the caller escalates the item with it): when
+    /// the item is a plan's story and GitHub's answer — this run's own read through the gate client, never a model's or a
+    /// person's text — shows it merged into the base the ledger expects for it, its plan's changeset branch
+    /// (<see cref="Run.BaseBranch"/>), that fact is recorded on the story (<see cref="Steps.MergedIntoChangeset"/>, once per pull
+    /// request) and the words the escalation adds are returned. The story is still Escalated — its own gate never passed it —
+    /// but for its plan it counts as merged: the work is on the changeset branch, and nothing reaches a default branch except
+    /// through the changeset pull request's full review and gate (E6). Empty, and nothing recorded, for any other item and for a
+    /// pull request merged into any other base (such a story stays failed: its change is somewhere no gate will judge it).
+    /// </summary>
+    private async Task<string> MergedIntoChangesetAsync(Run run, PullFacts pull, CancellationToken ct)
+    {
+        if (!pull.Merged || run.Item.PlanItemId is null || run.Changeset is not null || run.BaseBranch is not { } expected
+            || !ItemNaming.IsChangesetBranch(expected) || !string.Equals(pull.BaseRef, expected, StringComparison.Ordinal))
+        {
+            return "";
+        }
+        var detail = Plans.PlanRelease.MergedIntoChangesetDetail(pull.HtmlUrl, expected, pull.HeadSha);
+        if (!(await ledger.HistoryAsync(run.Item, ct)).Any(e => e.Step == Steps.MergedIntoChangeset && e.Detail == detail))
+        {
+            await ledger.CheckpointAsync(run.Item, Steps.MergedIntoChangeset, null, detail, ct);
+        }
+        log.WriteLine($"[{run.Item.State}] {run.Item.ExternalId}: {pull.HtmlUrl} was merged outside the factory into {expected}, its plan's changeset branch; "
+            + "it counts as merged for the plan");
+        return $" It was merged into {expected}, its plan's changeset branch: {Plans.PlanRelease.MergedOutsideIntoChangeset}. "
+            + "For its plan it counts as merged (what depends on it is released); re-running this story changes nothing.";
     }
 
     /// <summary>
@@ -134,7 +171,7 @@ public sealed partial class RunPipeline
     private async Task ReviewAsync(Run run, CancellationToken ct)
     {
         var (history, pull) = await ReadPullAsync(run, ct);
-        EnsureOpen(pull);
+        await EnsureOpenAsync(run, pull, ct);
         EnsureBase(run, pull);
         var fix = PendingFixRound(history);
         if (fix is { Stuck: { } stuckReason })
@@ -426,7 +463,7 @@ public sealed partial class RunPipeline
             await Task.Delay(Gate.CiPollInterval, GateTime, ct);
             await ThrowIfControlledAsync(run.Item, ct);
             (_, pull) = await ReadPullAsync(run, ct);
-            EnsureOpen(pull);
+            await EnsureOpenAsync(run, pull, ct);
         }
     }
 
@@ -900,7 +937,7 @@ public sealed partial class RunPipeline
             {blocks}
 
             Find and fix the cause of each failure with the smallest change that keeps the story satisfied, and make sure
-            `dotnet build` and `dotnet test` pass. Do not delete, skip or weaken tests to make CI pass, and do not change CI
+            {BuildsAndPasses}. Do not delete, skip or weaken tests to make CI pass, and do not change CI
             configuration. Do not commit, push, or open pull requests; the orchestrator does that.
             """;
     }
@@ -931,8 +968,8 @@ public sealed partial class RunPipeline
 
             {blocks}
 
-            Fix every finding with the smallest change that keeps the story satisfied, and make sure `dotnet build` and
-            `dotnet test` pass. Do not commit, push, or open pull requests; the orchestrator does that.
+            Fix every finding with the smallest change that keeps the story satisfied, and make sure
+            {BuildsAndPasses}. Do not commit, push, or open pull requests; the orchestrator does that.
             """;
     }
 
@@ -1008,7 +1045,7 @@ public sealed partial class RunPipeline
         while (true)
         {
             var (history, pull) = await ReadPullAsync(run, ct);
-            EnsureOpen(pull);
+            await EnsureOpenAsync(run, pull, ct);
             var verdicts = Verdicts(history);
             if (PendingCiFixRound(history) is { } ciFix && ciFix.PushedHead != ciFix.FixedHead && pull.HeadSha == ciFix.FixedHead
                 && !verdicts.Any(v => v.HeadSha == ciFix.PushedHead))

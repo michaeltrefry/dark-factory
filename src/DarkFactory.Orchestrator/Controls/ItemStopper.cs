@@ -231,13 +231,14 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
 
     /// <summary>
     /// What a story of a plan being stopped already is, when the stop has nothing to do to it: merged by the factory (or Done),
-    /// Cancelled, or Escalated because its pull request was merged outside the factory (<see cref="PlanRelease.AsMergedOutside"/>:
-    /// its change is on the base branch, so neither its board story nor its item is touched). Null for a story still to be stopped.
+    /// Cancelled, or Escalated because its pull request was merged outside the factory (<see cref="PlanRelease.AsMergedOutside"/>,
+    /// or into its plan's changeset branch, <see cref="PlanRelease.MergedOutsideChangeset"/>: its change is on the base branch, so
+    /// neither its board story nor its item is touched). Null for a story still to be stopped.
     /// </summary>
     private static StoryStop? Settled(WorkItem item, IReadOnlyList<LedgerEntry> rows) =>
-        PlanRelease.Satisfied(rows) || item.State == WorkState.Done ? StoryStop.Merged
+        PlanRelease.MergedByFactory(rows) || item.State == WorkState.Done ? StoryStop.Merged
         : item.State == WorkState.Cancelled ? PlanRelease.IsReturnedUnstarted(rows) ? StoryStop.Returned : StoryStop.Stopped
-        : PlanRelease.FailureOf(rows)?.As == PlanRelease.AsMergedOutside ? StoryStop.MergedOutside
+        : PlanRelease.MergedOutsideChangeset(rows) || PlanRelease.FailureOf(rows)?.As == PlanRelease.AsMergedOutside ? StoryStop.MergedOutside
         : null;
 
     /// <summary>

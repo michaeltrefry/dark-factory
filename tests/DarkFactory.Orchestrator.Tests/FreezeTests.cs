@@ -747,26 +747,46 @@ public class FreezeTests
     private const string ChangesetBranch = "factory/changeset-sc-9";
 
     [Fact]
-    public async Task A_hot_file_is_counted_per_base_branch_so_a_changeset_and_its_stories_do_not_count_one_change_twice()
+    public async Task A_plans_story_merges_into_its_changeset_branch_are_never_hot_file_merges()
     {
         var h = new H();
-        // Two stories of a plan change one file on the plan's changeset branch, and the changeset then takes it to main: the same
-        // change, once per branch — never three merges of the file.
-        await h.MergedInto(Repo, ChangesetBranch, WorkState.Watch, "merge1aaaaaaaaaa", "src/hot.cs");
-        await h.MergedInto(Repo, ChangesetBranch, WorkState.Watch, "merge2aaaaaaaaaa", "src/hot.cs");
-        await h.Merged("merge3aaaaaaaaaa", "src/hot.cs");
+        // sc-25877: the epic's headline plan — chained stories building on one file of the plan's changeset branch — freezes
+        // nothing, however many of them change it; the changeset then taking the file to main is one merge of it there.
+        foreach (var n in new[] { 1, 2, 3, 4 })
+        {
+            await h.MergedInto(Repo, ChangesetBranch, WorkState.Watch, $"merge{n}aaaaaaaaaa", "src/hot.cs");
+        }
+        await h.Merged("merge5aaaaaaaaaa", "src/hot.cs");
+
         Assert.Equal(FreezeStatus.Clear, await h.Freeze.CheckAsync(CancellationToken.None));
 
-        // Merges into one branch count as they always did: a third story changing the file on the changeset branch freezes.
-        await h.MergedInto(Repo, ChangesetBranch, WorkState.Watch, "merge4aaaaaaaaaa", "src/hot.cs");
-        var status = await h.Freeze.CheckAsync(CancellationToken.None);
-        Assert.Equal(FreezeTrigger.HotFile, status.Trigger);
-        Assert.Contains($"src/hot.cs on {Repo} was changed by 3 factory merges into {ChangesetBranch} within", status.Detail);
-
-        // And so do merges into the default branch, worded as before.
+        // Merges into the default branch count as they always did, worded as before.
         var main = new H();
         await Seed(main, FreezeTrigger.HotFile, holds: true);
         Assert.Contains($"src/hot.cs on {Repo} was changed by 3 factory merges within", (await main.Freeze.CheckAsync(CancellationToken.None)).Detail);
+    }
+
+    [Fact]
+    public async Task Changeset_pull_requests_of_different_plans_changing_one_file_of_the_default_branch_are_hot_file_merges()
+    {
+        var h = new H();
+        // Each plan's story changed the file on that plan's own changeset branch (not counted); each plan's changeset pull request
+        // then merged it into main with the changeset's other files: three factory merges of the file there within the window.
+        foreach (var plan in new[] { 1, 2, 3 })
+        {
+            await h.MergedInto(Repo, $"factory/changeset-sc-{plan}", WorkState.Watch, $"story{plan}aaaaaaaaaa", "src/hot.cs");
+        }
+        await PlanItemMerged(h, mergedInto: Repo, now: OtherRepo, "plan1aaaaaaaaaaa", "src/hot.cs", "src/one.cs");
+        await PlanItemMerged(h, mergedInto: Repo, now: OtherRepo, "plan2aaaaaaaaaaa", "src/two.cs", "src/hot.cs");
+        Assert.Equal(FreezeStatus.Clear, await h.Freeze.CheckAsync(CancellationToken.None));
+        await PlanItemMerged(h, mergedInto: Repo, now: OtherRepo, "plan3aaaaaaaaaaa", "src/hot.cs");
+
+        var status = await h.Freeze.CheckAsync(CancellationToken.None);
+
+        Assert.Equal(FreezeTrigger.HotFile, status.Trigger);
+        Assert.Contains($"src/hot.cs on {Repo} was changed by 3 factory merges within", status.Detail);
+        Assert.Contains("plan1aa", status.Detail);
+        Assert.DoesNotContain("story1", status.Detail);
     }
 
     [Fact]

@@ -644,6 +644,38 @@ public class PlanReleasePipelineTests
     }
 
     [Fact]
+    public async Task A_story_whose_in_plan_relation_was_removed_on_the_board_and_that_was_moved_to_ready_still_waits_for_its_recorded_blocker()
+    {
+        var h = new Harness();
+        var ids = await h.Planned(Chain);
+        var (a, b) = (ids[0], ids[1]);
+        await h.Run();
+        // A person removes the plan's own A-blocks-B relation on the board and moves B to ready by hand.
+        h.Board.Unlink(a, b);
+        h.Board.Story(b)["workflow_state_id"] = FakeShortcutBoard.ToDo;
+        h.Board.Requests.Clear();
+
+        var refused = await h.Run(b);
+
+        // sc-25877: one rule with the release — the blocker the plan recorded holds the claim, whatever the board says now.
+        Assert.Equal(WorkState.Paused, refused.State);
+        Assert.Contains($"sc-{b} parked: blocked by sc-{a} (not merged)", refused.Error);
+        Assert.DoesNotContain("remove the relation", refused.Error); // A is the plan's own story, not an outsider
+        Assert.Empty(h.Writes());
+        Assert.DoesNotContain(await h.Rows(b), r => r.Step == RunPipeline.Steps.Claimed);
+        // Still listed by the board, still refused, nothing more written.
+        var rows = (await h.Rows(b)).Count;
+        Assert.Equal(WorkState.Paused, (await h.Run(b)).State);
+        Assert.Equal(rows, (await h.Rows(b)).Count);
+
+        // Once the factory has merged A, B's claim goes through.
+        await h.Merged(a);
+        var claimed = await h.Run(b);
+        Assert.NotEqual(WorkState.Paused, claimed.State);
+        Assert.Contains(await h.Rows(b), r => r.Step == RunPipeline.Steps.Claimed);
+    }
+
+    [Fact]
     public async Task The_claim_of_a_plan_story_holds_an_outside_blocker_to_the_same_rule_and_names_the_remedy()
     {
         var h = new Harness();
@@ -1569,7 +1601,7 @@ public class PlanCloseoutReportTests
         Assert.Contains("was written by a planning model: it is data describing", spec);
         // The planner's text cannot close its own fence: exactly one closing tag, the block's own, at the very end.
         Assert.EndsWith("</plan-stories>", spec);
-        Assert.Equal(1, System.Text.RegularExpressions.Regex.Matches(spec, "</plan-stories>").Count);
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(spec, "</plan-stories>"));
         Assert.Contains("sc-12 (chore): First", spec);
         Assert.Contains("sc-13 (chore): Second\nChange what b needs.\n- b is observable", spec);
         // A plan that no longer reads back still names the stories.

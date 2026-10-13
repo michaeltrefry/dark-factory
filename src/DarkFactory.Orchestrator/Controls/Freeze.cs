@@ -432,11 +432,15 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
         Dictionary<long, (string ExternalId, string Repo, WorkState State)> names, CancellationToken ct)
     {
         var from = time.GetUtcNow() - options.HotFileWindow;
-        var merges = (await MergesAsync(db, transitions, names, ct)).Where(m => m.Row.RecordedAt >= from && m.Files is not null).ToList();
+        // Only merges into a branch that is not a plan's changeset branch count (sc-25877, as main-red already reads): the trigger
+        // means what it meant before plans — factory merges changing one file of a default branch. A plan's stories build on one
+        // another on its changeset branch, so several of them changing one file there is the plan working as designed, not the
+        // factory fighting itself; the changeset's own merge into the default branch counts, with every file of the changeset.
+        var merges = (await MergesAsync(db, transitions, names, ct))
+            .Where(m => m.Row.RecordedAt >= from && m.Files is not null && !ItemNaming.IsChangesetBranch(m.Files.Base)).ToList();
         var hot = merges
             .SelectMany(m => m.Files!.Files.Distinct(StringComparer.Ordinal).Select(f => (m.Repo, m.Files.Base, File: f, Merge: m)))
-            // Per base branch (sc-25872): a plan's story merges into its changeset branch and that branch later into the default
-            // branch, so counting across bases would count one change twice. Merges into one branch count as before.
+            // Per base branch: merges into different branches of a repository are not merges of one file.
             // A repository is one whatever case an item's `Repo:` line spells it in (GitHub's names are case-insensitive): the key
             // is lower-cased, the first merge's spelling is shown.
             .GroupBy(x => (Repo: x.Repo.ToLowerInvariant(), x.Base, x.File))
@@ -447,13 +451,10 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
         return hot is null
             ? null
             : new Hit(FreezeTrigger.HotFile,
-                $"{hot.Key.File} on {hot.First().Repo} was changed by {hot.Count()} factory merges{IntoChangeset(hot.Key.Base)} within {Hours(options.HotFileWindow)} "
+                $"{hot.Key.File} on {hot.First().Repo} was changed by {hot.Count()} factory merges within {Hours(options.HotFileWindow)} "
                 + $"({string.Join(", ", hot.Select(x => $"{Name(names, x.Merge.Row.WorkItemId)} as {Ci.Short(x.Merge.Row.Detail ?? "?")}"))}); "
                 + $"threshold {options.HotFileMerges}");
     }
-
-    /// <summary>" into &lt;branch&gt;" for a changeset branch; nothing for any other base (the wording a default-branch freeze always had).</summary>
-    private static string IntoChangeset(string baseBranch) => ItemNaming.IsChangesetBranch(baseBranch) ? $" into {baseBranch}" : "";
 
     private async Task<Hit?> CostRisingAsync(LedgerDbContext db, DateTimeOffset? since,
         Dictionary<long, (string ExternalId, string Repo, WorkState State)> names, CancellationToken ct)

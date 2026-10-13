@@ -100,7 +100,7 @@ public sealed partial class RunPipeline(
 
     /// <summary>
     /// The factory's configured repositories (<c>FactoryOptions.ConfiguredRepos</c>; the default repository alone when not given): the
-    /// only ones a plan naming several repositories may name (sc-25874, <see cref="PlanRepositories"/>).
+    /// only ones a plan item may name, whether it names one or several (sc-25874, sc-25877, <see cref="PlanRepositories"/>).
     /// </summary>
     private readonly IReadOnlyList<RepoRef> _configuredRepos = configuredRepos ?? [defaultRepo];
 
@@ -348,6 +348,15 @@ public sealed partial class RunPipeline(
         /// <see cref="Plans.Changeset.DeliveryOf"/>), recorded before the Escalated row or the stop's report. Nothing is rolled back.
         /// </summary>
         public const string PlanDelivery = "plan-delivery";
+        /// <summary>
+        /// A plan's story whose pull request someone merged outside the factory INTO ITS PLAN'S CHANGESET BRANCH (sc-25877; Detail:
+        /// <c>&lt;pull request&gt; into &lt;changeset branch&gt; at &lt;head&gt;</c>), written by the story's own run when the gate
+        /// client's read of the pull request shows it merged with that base — before the Escalated row that still follows (the
+        /// factory's gate did not merge it). From this row on the story counts as merged for its plan
+        /// (<see cref="Plans.PlanRelease.Satisfied(IReadOnlyList{LedgerEntry}?)"/>): its work is on the changeset branch, which is
+        /// reviewed and gated as a whole before it reaches a default branch. A pull request merged into any other base writes none.
+        /// </summary>
+        public const string MergedIntoChangeset = "merged-into-changeset";
         /// <summary>
         /// Planned: every story of the plan that has not merged failed or is blocked behind a failed one (sc-25876): nothing of it
         /// moves until a person acts. Detail: the failed stories and what they block (<see cref="Plans.PlanRelease.HeldByFailed"/>).
@@ -1986,6 +1995,13 @@ public sealed partial class RunPipeline(
 
     public static string BranchUrl(RepoRef repo, string branch) => $"https://github.com/{repo}/tree/{branch}";
 
+    /// <summary>
+    /// What every implementing prompt (implement, review fix, CI fix, conflict fix) asks before the worker stops, naming the
+    /// build-and-test commands the worker is allowed (<see cref="ClaudeWorker.AllowedTools"/>: .NET's, and cargo's since sc-25877).
+    /// </summary>
+    internal const string BuildsAndPasses =
+        "the build and the tests pass (`dotnet build` and `dotnet test`; in a Rust package `cargo build` and `cargo test`)";
+
     public static string BuildPrompt(WorkSpec spec, RepoRef repo)
     {
         var story = spec.Story;
@@ -1994,7 +2010,7 @@ public sealed partial class RunPipeline(
             Implement {story.Kind.Noun} {story.Ref} ({story.StoryType}): {PromptFence.Spec(story)}
 
             Make the smallest change that satisfies the story, including a test when the
-            project has tests, and make sure `dotnet build` and `dotnet test` pass.
+            project has tests, and make sure {BuildsAndPasses}.
             Do not commit, push, or open pull requests; the orchestrator does that.
             """;
         if (spec.Epic is { } epic)
