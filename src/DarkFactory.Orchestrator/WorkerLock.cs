@@ -2,9 +2,9 @@ namespace DarkFactory.Orchestrator;
 
 /// <summary>
 /// One factory run per work root at a time. The sandbox launch helper kills every process of the
-/// worker user when it exits, and the startup sweep deletes every worktree, so a second concurrent
-/// run would destroy the first one's worker and worktree. Held for the whole run; the OS releases
-/// it if the orchestrator dies.
+/// worker user when it exits, so a second concurrent run would destroy the first one's worker.
+/// (The start-of-run sweeps no longer depend on it: they keep what a live run owns, sc-25987.)
+/// Held for the whole run; the OS releases it if the orchestrator dies.
 /// </summary>
 public sealed class WorkerLock : IDisposable
 {

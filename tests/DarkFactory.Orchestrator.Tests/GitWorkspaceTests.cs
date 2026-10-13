@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using DarkFactory.Orchestrator.Git;
+using DarkFactory.Orchestrator.Ledger;
 
 namespace DarkFactory.Orchestrator.Tests;
 
@@ -154,6 +155,7 @@ public class GitWorkspaceTests
     private sealed class FakeSandbox(bool deleteRemovesNothing = false) : DarkFactory.Orchestrator.Worker.IWorkerSandbox
     {
         public List<string> Calls { get; } = [];
+        public Task CloseToWorkerAsync(string path, CancellationToken ct) => Task.CompletedTask;
         public Task ShareAsync(string path, CancellationToken ct)
         {
             Calls.Add($"share {path} {(Directory.EnumerateFileSystemEntries(path).Any() ? "non-empty" : "empty")}");
@@ -299,7 +301,7 @@ public class GitWorkspaceTests
         {
             asked.Add(name);
             return Task.FromResult(name == "factory-sc-13");
-        }, CancellationToken.None);
+        }, LiveRuns.None, CancellationToken.None);
 
         Assert.Equal(["factory-sc-12", "factory-sc-13"], asked.Order());
         Assert.False(Directory.Exists(orphan.Path));
@@ -324,9 +326,9 @@ public class GitWorkspaceTests
         Assert.DoesNotContain(sandbox.Calls, c => c.StartsWith("share", StringComparison.Ordinal));
         // Each sweep sees only its own root: the items' sweep never asks about the triage worktree, and the triage sweep keeps no item's.
         var asked = new List<string>();
-        await Workspace(sandbox).SweepOrphansAsync((name, _) => { asked.Add(name); return Task.FromResult(true); }, CancellationToken.None);
+        await Workspace(sandbox).SweepOrphansAsync((name, _) => { asked.Add(name); return Task.FromResult(true); }, LiveRuns.None, CancellationToken.None);
         Assert.Equal(["factory-sc-15"], asked);
-        await triage.SweepOrphansAsync((_, _) => Task.FromResult(false), CancellationToken.None);
+        await triage.SweepOrphansAsync((_, _) => Task.FromResult(false), LiveRuns.None, CancellationToken.None);
         Assert.False(Directory.Exists(ws.Path));
         Assert.True(File.Exists(Path.Combine(item.Path, "README.md")));
     }
@@ -380,7 +382,7 @@ public class GitWorkspaceTests
         var again = await Planner().PrepareSeatAsync([Repo, gears], "factory/plan-sc-9", CancellationToken.None);
         Assert.False(File.Exists(Path.Combine(again.Path, "acme", "widgets", "stale.txt")));
         Assert.True(File.Exists(Path.Combine(again.Path, "acme", "gears", "Cargo.toml")));
-        await Planner().SweepOrphansAsync((_, _) => Task.FromResult(false), CancellationToken.None);
+        await Planner().SweepOrphansAsync((_, _) => Task.FromResult(false), LiveRuns.None, CancellationToken.None);
         Assert.False(Directory.Exists(again.Path));
 
         // Removing a seat deletes every checkout and the directory, and leaves neither clone a registered worktree.
@@ -395,7 +397,7 @@ public class GitWorkspaceTests
     [Fact]
     public async Task Sweep_without_any_worktrees_does_nothing()
     {
-        await Workspace().SweepOrphansAsync((_, _) => throw new InvalidOperationException("no worktree to ask about"), CancellationToken.None);
+        await Workspace().SweepOrphansAsync((_, _) => throw new InvalidOperationException("no worktree to ask about"), LiveRuns.None, CancellationToken.None);
     }
 
     [Fact]
@@ -753,7 +755,9 @@ public class GitWorkspaceTests
     public void Owner_git_isolation_adds_its_environment_and_config_ahead_of_every_call()
     {
         Assert.Equal(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "rerere.enabled=false", "-c", "filter.lfs.smudge=",
-            "-c", "filter.lfs.clean=", "-c", "filter.lfs.process=", "-c", "filter.lfs.required=false"], OwnerGit.ConfigArgs);
+            "-c", "filter.lfs.clean=", "-c", "filter.lfs.process=", "-c", "filter.lfs.required=false",
+            // No git call leaves a maintenance process behind to write the shared clone outside its lock (sc-25987).
+            "-c", "gc.autoDetach=false", "-c", "maintenance.autoDetach=false"], OwnerGit.ConfigArgs);
         var (env, args) = OwnerGit.Isolate(new Dictionary<string, string> { ["GIT_CONFIG_COUNT"] = "1" }, ["merge", "x"]);
         Assert.Equal(new Dictionary<string, string>
         {
@@ -784,7 +788,7 @@ public class GitWorkspaceTests
         await workspace.OverlayAsync(run, merge.Head, ["README.md"], ["other.txt"], CancellationToken.None,
             new Dictionary<string, string> { ["README.md"] = "replaced\n" });
         await workspace.RemoveAsync(Repo, run, CancellationToken.None);
-        await workspace.SweepOrphansAsync((_, _) => Task.FromResult(false), CancellationToken.None);
+        await workspace.SweepOrphansAsync((_, _) => Task.FromResult(false), LiveRuns.None, CancellationToken.None);
 
         Assert.Superset(new HashSet<string> { "clone", "fetch", "remote", "worktree", "rev-parse", "symbolic-ref", "add", "status", "commit", "rev-list",
             "push", "merge", "diff", "ls-tree", "cat-file", "checkout", "rm", "hash-object", "update-index", "checkout-index" },

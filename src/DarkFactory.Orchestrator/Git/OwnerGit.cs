@@ -5,7 +5,12 @@ namespace DarkFactory.Orchestrator.Git;
 /// merge, commit, push). Git then reads only the clone's own config, which the factory alone writes: not the owner's system or
 /// global config (whose hooks path, filter or merge drivers, rerere or fsmonitor a PR's <c>.gitattributes</c> or files could
 /// otherwise select or reach), no hooks (a relative <c>core.hooksPath</c> would resolve inside the worktree), no fsmonitor,
-/// no rerere, and no LFS filter (nothing a PR names is run to smudge or clean a file). <see cref="GitWorkspace"/> applies it
+/// no rerere, and no LFS filter (nothing a PR names is run to smudge or clean a file). Nor does any call leave a process behind
+/// (sc-25987): <c>fetch</c>, <c>commit</c> and <c>merge</c> end with automatic maintenance (<c>gc --auto</c>: <c>pack-refs</c>,
+/// <c>worktree prune</c>), which git by default detaches — it would outlive the call, and so the holder of the clone's
+/// <see cref="CloneLock"/>, and write the shared clone's refs and worktree list with no lock held. <c>gc.autoDetach=false</c> and
+/// <c>maintenance.autoDetach=false</c> (git 2.47+, which otherwise falls back to the former) keep it inside the call, under
+/// the lock; maintenance still runs. <see cref="GitWorkspace"/> applies it
 /// to every git call it makes; nothing else in the factory runs git as the owner.
 /// </summary>
 public static class OwnerGit
@@ -28,6 +33,8 @@ public static class OwnerGit
         "-c", "filter.lfs.clean=",
         "-c", "filter.lfs.process=",
         "-c", "filter.lfs.required=false",
+        "-c", "gc.autoDetach=false",
+        "-c", "maintenance.autoDetach=false",
     ];
 
     /// <summary><paramref name="env"/> added to <see cref="Environment"/> (it may not override it), and <see cref="ConfigArgs"/> ahead of <paramref name="args"/>.</summary>

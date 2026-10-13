@@ -755,6 +755,70 @@ public class WorkerSandboxTests
         Assert.Contains("delete_child", listing);
     }
 
+    [Fact]
+    public void A_directory_reads_back_closed_only_with_owner_only_mode_and_no_acl_entry()
+    {
+        Assert.True(WorkerSandbox.IsClosed("drwx------  3 michael  staff  96 Oct 13 17:53 /opt/dark-factory/work/clone-locks\n"));
+        Assert.True(WorkerSandbox.IsClosed("drwx------@ 3 michael  staff  96 Oct 13 17:53 /opt/dark-factory/work/clone-locks\n"));
+        // The work root's inherited entry, as a directory made under it carries it (macOS prints "@" or "+" beside the mode).
+        const string entry = " 0: user:_factory inherited allow list,search,readattr,readextattr,readsecurity,file_inherit,directory_inherit\n";
+        Assert.False(WorkerSandbox.IsClosed("drwx------+ 3 michael  staff  96 Oct 13 17:53 /w/clone-locks\n" + entry));
+        Assert.False(WorkerSandbox.IsClosed("drwx------@ 3 michael  staff  96 Oct 13 17:53 /w/clone-locks\n" + entry));
+        Assert.False(WorkerSandbox.IsClosed("drwx------  3 michael  staff  96 Oct 13 17:53 /w/clone-locks\n 0: group:everyone deny delete\n"));
+        Assert.False(WorkerSandbox.IsClosed("drwxr-xr-x  3 michael  staff  96 Oct 13 17:53 /w/clone-locks\n"));
+        Assert.False(WorkerSandbox.IsClosed("drwx---r-x  3 michael  staff  96 Oct 13 17:53 /w/clone-locks\n"));
+        Assert.False(WorkerSandbox.IsClosed("-rwx------  1 michael  staff  96 Oct 13 17:53 /w/clone-locks\n"));
+        Assert.False(WorkerSandbox.IsClosed(""));
+    }
+
+    [Fact]
+    public async Task Close_to_worker_strips_the_inherited_acl_entry_and_leaves_an_owner_only_directory_on_macos()
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            Assert.Skip("ACLs via chmod are macOS-only.");
+        }
+        // A work root as setup-worker-user.sh leaves it: 0700 with an inheritable read entry for the worker user (here: this user).
+        var root = Directory.CreateDirectory(Path.Combine(_dir, "work")).FullName;
+        File.SetUnixFileMode(root, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        using (var chmod = Process.Start(new ProcessStartInfo("/bin/chmod",
+            ["+a", $"user:{Environment.UserName} allow list,search,read,readattr,readextattr,readsecurity,file_inherit,directory_inherit", root]))!)
+        {
+            await chmod.WaitForExitAsync(TestContext.Current.CancellationToken);
+            Assert.Equal(0, chmod.ExitCode);
+        }
+        var locks = Directory.CreateDirectory(Path.Combine(root, "clone-locks")).FullName;
+        Assert.Contains($"user:{Environment.UserName} inherited allow list,search", await Listing(locks));
+        Assert.False(WorkerSandbox.IsClosed(await Listing(locks)));
+        var sandbox = LocalSandbox(); // no helper runs: closing is the owner's own chmod and ls
+
+        await sandbox.CloseToWorkerAsync(locks, CancellationToken.None);
+
+        var closed = await Listing(locks);
+        Assert.StartsWith("drwx------", closed);
+        Assert.DoesNotContain("allow", closed);
+        Assert.True(WorkerSandbox.IsClosed(closed));
+        // Nothing made in it later inherits an entry: a lock file is the owner's alone, whatever its own mode.
+        var file = Path.Combine(Directory.CreateDirectory(Path.Combine(locks, "acme")).FullName, "widgets.lock");
+        File.WriteAllText(file, "");
+        Assert.DoesNotContain("allow", await Listing(Path.GetDirectoryName(file)!));
+        Assert.DoesNotContain("allow", await Listing(file));
+        // The work root itself keeps its entry (clones and worktrees still inherit it), and closing again changes nothing.
+        Assert.Contains($"user:{Environment.UserName} allow list,search", await Listing(root));
+        await sandbox.CloseToWorkerAsync(locks, CancellationToken.None);
+        // What cannot be closed, or does not read back closed, is an error, never a silent pass.
+        var open = await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.CloseToWorkerAsync(locks,
+            (_, _) => Task.FromResult($"drwx------+ 3 me  staff  96 Oct 13 17:53 {locks}\n 0: user:_factory inherited allow list,search\n"), CancellationToken.None));
+        Assert.Contains($"{locks} is still open to others than its owner", open.Message);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.CloseToWorkerAsync(Path.Combine(root, "missing"), CancellationToken.None));
+    }
+
+    private static async Task<string> Listing(string path)
+    {
+        using var p = Process.Start(new ProcessStartInfo("/bin/ls", ["-led", path]) { RedirectStandardOutput = true })!;
+        return await p.StandardOutput.ReadToEndAsync();
+    }
+
     private WorkerSandbox LocalSandbox() => SandboxSupport.LocalSandbox(_dir);
 }
 
