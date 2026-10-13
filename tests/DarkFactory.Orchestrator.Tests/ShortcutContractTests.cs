@@ -30,14 +30,33 @@ public class ShortcutContractTests
         await source.CommentAsync(parent, "contract test comment", ct);
         await source.LinkAsync(parent, [PrUrl, BranchUrl], ct);
         await source.LinkAsync(parent, [PrUrl], ct); // already linked: read only
-        var children = await source.CreateChildrenAsync(parent,
-        [
-            new("[dark-factory fixture] child 1", "First step of the plan.", "chore", []),
-            new("[dark-factory fixture] child 2", "Second step; needs the first.", "chore", [0]),
-        ], ct);
+        var children = await source.CreateChildrenAsync(parent, Children, ct);
         await source.ReportStateAsync(parent, BoardState.Merged, null, ct);
         await source.ReportStateAsync(parent, BoardState.Stopped, "stopped by the contract test", ct);
         return children;
+    }
+
+    /// <summary>The two stories <see cref="WriteLifecycle"/> creates from its parent: the second is blocked by the first.</summary>
+    internal static readonly IReadOnlyList<ChildItem> Children =
+    [
+        new("[dark-factory fixture] child 1", "First step of the plan.", "chore", []),
+        new("[dark-factory fixture] child 2", "Second step; needs the first.", "chore", [0]),
+    ];
+
+    /// <summary>
+    /// What a plan's retry and release ask of the board (sc-25877), on the <paramref name="children"/> <see cref="WriteLifecycle"/>
+    /// left in the Backlog: a second <see cref="ShortcutWorkSource.CreateChildrenAsync"/> finds both by their external id in the
+    /// listing and creates nothing; the second child's blockers are read from its <c>story_links</c>; it is moved Backlog → To Do
+    /// by a <c>PUT</c> of <c>workflow_state_id</c> alone, and is then no longer in the Backlog.
+    /// </summary>
+    internal static async Task ReleaseLifecycle(ShortcutWorkSource source, int parent, IReadOnlyList<int> children)
+    {
+        var ct = CancellationToken.None;
+        Assert.Equal(children, await source.CreateChildrenAsync(parent, Children, ct));
+        Assert.Equal([new Blocker(children[0], false)], await source.BlockersAsync(children[1], ct));
+        Assert.Equal(ReadyResult.Moved, await source.MakeReadyAsync(children[1], ct));
+        Assert.False(await source.InBacklogAsync(children[1], ct));
+        Assert.Equal(ReadyResult.AlreadyLeft, await source.MakeReadyAsync(children[1], ct));
     }
 
     private static (ShortcutWorkSource Source, ReplayHandler Replay) Replay(ShortcutFixture fixture, WatchScope? scope = null)
@@ -190,11 +209,54 @@ public class ShortcutContractTests
         // first for children an earlier attempt created; none exist, so both are created.
         Assert.Equal(fixture.Parameters["children"]!.AsArray().Select(c => c!.GetValue<int>()), children);
         var siblings = Assert.Single(fixture.Interactions, i => i.Method == "GET" && i.Path.StartsWith("/api/v3/groups/"));
-        Assert.DoesNotContain(siblings.Response!.AsArray(), s => ((string?)s!["name"])!.Contains("child"));
-        Assert.Equal(2, Calls(fixture, "POST", "/api/v3/stories").Count);
+        // The listing holds an archived story with the first child's name, which is never reused: the child is created anew.
+        Assert.Contains(siblings.Response!.AsArray(), s => s!["archived"]!.GetValue<bool>() && (string?)s["name"] == Children[0].Name);
+        Assert.DoesNotContain(siblings.Response!.AsArray(), s => !s!["archived"]!.GetValue<bool>() && ((string?)s["name"])!.Contains("child"));
+        var posts = Calls(fixture, "POST", "/api/v3/stories");
+        Assert.Equal(2, posts.Count);
+        // Each is created with its idempotency key as the external id, which the API accepted and returned unchanged (sc-25877).
+        Assert.Equal(Children.Select(c => c.Key($"sc-{parent}")), posts.Select(p => p.Request!["external_id"]!.GetValue<string>()));
+        Assert.All(posts, p => Assert.Equal(p.Request!["external_id"]!.GetValue<string>(), p.Response!["external_id"]!.GetValue<string>()));
+        Assert.All(posts, p => Assert.True(p.Request!["external_id"]!.GetValue<string>().Length >= 92));
         var link = Assert.Single(Calls(fixture, "POST", "/api/v3/story-links"));
         Assert.Equal((children[0], "blocks", children[1]),
             (link.Response!["subject_id"]!.GetValue<int>(), link.Response["verb"]!.GetValue<string>(), link.Response["object_id"]!.GetValue<int>()));
+    }
+
+    /// <summary>
+    /// A plan's retry and release against the recorded API (sc-25877, <c>release.json</c>, recorded right after
+    /// <c>write-lifecycle.json</c> on the same throwaway stories): the listing the retry reads carries each child's external id,
+    /// so both are found and none is created; a story read back carries its <c>story_links</c>; the release is one <c>PUT</c>
+    /// holding only <c>workflow_state_id</c>.
+    /// </summary>
+    [Fact]
+    public async Task A_retry_finds_its_children_by_external_id_and_a_release_reads_blockers_and_moves_backlog_to_to_do()
+    {
+        var fixture = ShortcutFixture.Load("release.json");
+        var (source, replay) = Replay(fixture);
+        var parent = fixture.Int("parent");
+        var children = fixture.Parameters["children"]!.AsArray().Select(c => c!.GetValue<int>()).ToList();
+
+        await ReleaseLifecycle(source, parent, children);
+
+        Assert.True(replay.AllReplayed);
+        // The retry created nothing and linked nothing: it found its children in the listing, by the key the API returned there.
+        Assert.DoesNotContain(fixture.Interactions, i => i.Method == "POST");
+        var listing = Assert.Single(fixture.Interactions, i => i.Method == "GET" && i.Path.StartsWith("/api/v3/groups/")).Response!.AsArray();
+        for (var i = 0; i < children.Count; i++)
+        {
+            var listed = Assert.Single(listing, s => s!["id"]!.GetValue<int>() == children[i]);
+            Assert.Equal(Children[i].Key($"sc-{parent}"), listed!["external_id"]!.GetValue<string>());
+        }
+        // A story read back carries its relations: child 1 blocks child 2.
+        var blocked = fixture.Interactions.First(i => i.Method == "GET" && i.Path == $"/api/v3/stories/{children[1]}").Response!;
+        Assert.Contains(blocked["story_links"]!.AsArray(), l => (string?)l!["verb"] == "blocks"
+            && l["subject_id"]!.GetValue<int>() == children[0] && l["object_id"]!.GetValue<int>() == children[1]);
+        // The release: one PUT, nothing in it but the To Do state, answered with the story in that state.
+        var put = Assert.Single(fixture.Interactions, i => i.Method == "PUT");
+        Assert.Equal($"/api/v3/stories/{children[1]}", put.Path);
+        Assert.True(JsonNode.DeepEquals(new JsonObject { ["workflow_state_id"] = StateId(fixture, "To Do") }, put.Request), put.Request!.ToJsonString());
+        Assert.Equal(StateId(fixture, "To Do"), put.Response!["workflow_state_id"]!.GetValue<long>());
     }
 
     [Fact]
@@ -233,13 +295,104 @@ public class ShortcutContractTests
             Assert.DoesNotMatch(@"[A-Za-z0-9._%+-]+@(?!example\.com)[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text);
         }
     }
+
+    /// <summary>
+    /// The repository is public: no fixture holds a board listing. Every recorded list response (a team's or an epic's stories
+    /// above all) holds at most <see cref="RecordingHandler.MaxListedStories"/> entries, and a story listing's entries are the
+    /// recorder's own throwaway stories with only the fields the adapter reads — the recorder drops the rest (2026-10-13: a
+    /// re-recording had put the team's 155 stories in three fixtures).
+    /// </summary>
+    [Fact]
+    public void Fixtures_hold_no_board_listing_only_the_recordings_own_stories()
+    {
+        foreach (var file in Directory.GetFiles(Path.Combine(AppContext.BaseDirectory, "Fixtures", "shortcut")))
+        {
+            var fixture = ShortcutFixture.Load(Path.GetFileName(file));
+            foreach (var call in fixture.Interactions.Where(i => i.Response is JsonArray))
+            {
+                var list = call.Response!.AsArray();
+                Assert.True(list.Count <= RecordingHandler.MaxListedStories,
+                    $"{Path.GetFileName(file)}: {call.Method} {call.Path} holds {list.Count} entries (at most {RecordingHandler.MaxListedStories}): trim the recording");
+                if (RecordingHandler.IsStoryListing(call.Path))
+                {
+                    Assert.All(list, s => Assert.All(s!.AsObject(), field => Assert.Contains(field.Key, RecordingHandler.ListedStoryFields)));
+                    Assert.All(list, s => Assert.StartsWith("[dark-factory fixture]", (string?)s!["name"]));
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void A_recorded_listing_keeps_only_the_recordings_own_stories_and_the_fields_the_adapter_reads()
+    {
+        JsonObject Story(int id, string name) => new()
+        {
+            ["id"] = id, ["name"] = name, ["archived"] = false, ["workflow_state_id"] = 7, ["external_id"] = null,
+            ["story_links"] = new JsonArray(), ["labels"] = new JsonArray(), ["owner_ids"] = new JsonArray("someone"),
+            ["requested_by_id"] = "someone", ["follower_ids"] = new JsonArray("someone"), ["position"] = 123, ["stats"] = new JsonObject(),
+        };
+        var listing = new JsonArray([.. Enumerable.Range(1, 150).Select(i => (JsonNode)Story(i, $"someone else's story {i}"))]);
+        listing.Insert(40, Story(1001, "[dark-factory fixture] parent"));
+        listing.Add(Story(1002, "[dark-factory fixture] child 1"));
+
+        var trimmed = RecordingHandler.TrimListing(listing, new HashSet<int> { 1002, 1001, 5000 });
+
+        Assert.Equal([1001, 1002], trimmed.Select(s => s!["id"]!.GetValue<int>()));
+        Assert.DoesNotContain("someone", trimmed[0]!["name"]!.GetValue<string>() + trimmed[1]!["name"]!.GetValue<string>());
+        Assert.All(trimmed, s => Assert.Equal(new[] { "id", "name", "archived", "workflow_state_id", "owner_ids", "labels", "story_links", "external_id" }.Order(),
+            s!.AsObject().Select(f => f.Key).Order()));
+        Assert.Empty(RecordingHandler.TrimListing(listing, new HashSet<int>()));
+        // Which responses are listings: a team's and an epic's stories; one story, or a story's comments, is not.
+        Assert.True(RecordingHandler.IsStoryListing("/api/v3/groups/6ac526c4/stories"));
+        Assert.True(RecordingHandler.IsStoryListing("/api/v3/epics/25171/stories"));
+        Assert.False(RecordingHandler.IsStoryListing("/api/v3/stories/12"));
+        Assert.False(RecordingHandler.IsStoryListing("/api/v3/stories"));
+        Assert.False(RecordingHandler.IsStoryListing("/api/v3/stories/12/comments"));
+    }
+
+    private sealed class Canned(string json) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) =>
+            Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK) { Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json") });
+    }
+
+    /// <summary>
+    /// The recording handler trims a listing as it records it, and hands the adapter under recording the trimmed one: the
+    /// recording and its replay see the same board. With no story of its own named, a listing is recorded empty.
+    /// </summary>
+    [Fact]
+    public async Task The_recording_handler_stores_and_serves_a_listing_trimmed_to_the_recordings_own_stories()
+    {
+        const string board = """[{"id":1,"name":"someone else's","position":9},{"id":2,"name":"[dark-factory fixture] parent","position":8}]""";
+        var ct = TestContext.Current.CancellationToken;
+        foreach (var (path, keep, expected) in new (string, HashSet<int>, string)[]
+        {
+            ("groups/g/stories", [2], """[{"id":2,"name":"[dark-factory fixture] parent"}]"""),
+            ("epics/7/stories", [2], """[{"id":2,"name":"[dark-factory fixture] parent"}]"""),
+            ("groups/g/stories", [], "[]"),
+        })
+        {
+            var fixture = new ShortcutFixture();
+            using var http = new HttpClient(new RecordingHandler(fixture) { KeepStories = keep, InnerHandler = new Canned(board) })
+            {
+                BaseAddress = ShortcutWorkSource.DefaultBaseAddress,
+            };
+
+            var served = JsonNode.Parse(await http.GetStringAsync(path, ct))!.ToJsonString();
+
+            Assert.Equal(expected, served);
+            Assert.Equal(expected, Assert.Single(fixture.Interactions).Response!.ToJsonString());
+        }
+    }
 }
 
 /// <summary>
 /// Re-records the contract fixtures against the live Shortcut API. Reads touch team DarkFactory,
 /// epic 25171 and story 25185; writes go only to throwaway "[dark-factory fixture]" stories in team
 /// DarkFactory with no epic, archived afterwards. Run with SHORTCUT_RECORD=1 and the token in
-/// SHORTCUT_API_TOKEN or the keychain.
+/// SHORTCUT_API_TOKEN or the keychain. The repository is public: a recorded story listing keeps only the recording's own
+/// throwaway stories (<see cref="RecordingHandler.KeepStories"/>, <see cref="RecordingHandler.TrimListing"/>) — the parent, an
+/// archived namesake of the first child, and the children — never another story of the board.
 /// </summary>
 public class ShortcutFixtureRecorder
 {
@@ -254,17 +407,18 @@ public class ShortcutFixtureRecorder
         return new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain()).ShortcutApiToken;
     }
 
-    private static ShortcutWorkSource Recording(ShortcutFixture fixture, string token) =>
-        new(new HttpClient(new RecordingHandler(fixture) { KeepTeam = Team }) { BaseAddress = ShortcutWorkSource.DefaultBaseAddress },
+    private static ShortcutWorkSource Recording(ShortcutFixture fixture, string token, HashSet<int> keep) =>
+        new(new HttpClient(new RecordingHandler(fixture) { KeepTeam = Team, KeepStories = keep }) { BaseAddress = ShortcutWorkSource.DefaultBaseAddress },
             token, ShortcutContractTests.Scope);
 
-    /// <summary>Read-only: lists the ready stories of team DarkFactory and epic 25171.</summary>
-    [Fact]
-    public async Task RecordListReady()
+    /// <summary>
+    /// Read-only: lists the ready stories of team DarkFactory and epic 25171, of which the recording keeps the recorder's own
+    /// (<paramref name="keep"/>): the To Do parent, which is ready, and the archived namesake, which is not.
+    /// </summary>
+    private static async Task RecordListReady(string token, HashSet<int> keep)
     {
-        var token = Token();
-        var ready = new ShortcutFixture { Source = "recorded live" };
-        var ids = await Recording(ready, token).ListReadyAsync(CancellationToken.None);
+        var ready = new ShortcutFixture { Source = "recorded live; the listings keep only the recorder's own throwaway stories" };
+        var ids = await Recording(ready, token, keep).ListReadyAsync(CancellationToken.None);
         ready.Parameters["expected"] = new JsonArray(ids.Select(i => (JsonNode)i).ToArray());
         ready.Save("list-ready.json");
     }
@@ -275,9 +429,9 @@ public class ShortcutFixtureRecorder
         var token = Token();
         var ct = CancellationToken.None;
 
-        ShortcutWorkSource Recording(ShortcutFixture fixture) => ShortcutFixtureRecorder.Recording(fixture, token);
-
-        await RecordListReady();
+        // The recording's own stories: all a recorded listing keeps.
+        var keep = new HashSet<int>();
+        ShortcutWorkSource Recording(ShortcutFixture fixture) => ShortcutFixtureRecorder.Recording(fixture, token, keep);
 
         var spec = new ShortcutFixture { Source = "recorded live" };
         await Recording(spec).ReadSpecAsync(25185, ct);
@@ -314,8 +468,9 @@ public class ShortcutFixtureRecorder
         // Writes: a throwaway parent in To Do, team DarkFactory, no epic.
         var raw = new HttpClient { BaseAddress = ShortcutWorkSource.DefaultBaseAddress };
         var group = (await Raw(raw, token, HttpMethod.Get, "groups", null))!.AsArray().Single(g => (string?)g!["mention_name"] == Team)!["id"]!.GetValue<string>();
-        var toDo = (await Raw(raw, token, HttpMethod.Get, "workflows", null))!.AsArray()
-            .SelectMany(w => w!["states"]!.AsArray()).First(s => (string?)s!["name"] == "To Do")!["id"]!.GetValue<long>();
+        var states = (await Raw(raw, token, HttpMethod.Get, "workflows", null))!.AsArray().SelectMany(w => w!["states"]!.AsArray()).ToList();
+        long State(string name) => states.First(s => (string?)s!["name"] == name)!["id"]!.GetValue<long>();
+        var toDo = State("To Do");
         var parent = (await Raw(raw, token, HttpMethod.Post, "stories", new
         {
             name = "[dark-factory fixture] parent",
@@ -325,18 +480,45 @@ public class ShortcutFixtureRecorder
             workflow_state_id = toDo,
         }))!["id"]!.GetValue<int>();
         var created = new List<int> { parent };
+        keep.Add(parent);
         try
         {
+            // An archived story with the first child's name, in the Backlog: the listing's one story that is not ready, and the
+            // namesake a retry must never reuse (the board's real ones — earlier recordings' children — are not recorded).
+            var namesake = (await Raw(raw, token, HttpMethod.Post, "stories", new
+            {
+                name = ShortcutContractTests.Children[0].Name,
+                description = "Throwaway archived namesake for the dark-factory Shortcut contract fixtures.",
+                story_type = "chore",
+                group_id = group,
+                workflow_state_id = State("Backlog"),
+            }))!["id"]!.GetValue<int>();
+            created.Add(namesake);
+            keep.Add(namesake);
+            await Raw(raw, token, HttpMethod.Put, $"stories/{namesake}", new { archived = true });
+
+            // Listed while the throwaway parent waits in To Do, so the recording always holds a ready story (on 2026-10-13 the
+            // team and the epic had none, and the replay's "the listing is not empty" failed on the fresh recording).
+            await RecordListReady(token, keep);
+
             var writes = new ShortcutFixture { Source = "recorded live on throwaway stories, archived afterwards" };
             writes.Parameters["parent"] = parent;
             var children = await ShortcutContractTests.WriteLifecycle(Recording(writes), parent);
             created.AddRange(children);
+            keep.UnionWith(children);
             writes.Parameters["children"] = new JsonArray(children.Select(c => (JsonNode)c).ToArray());
 
             // Read back: the second child is blocked by the first.
             var child2 = await Raw(raw, token, HttpMethod.Get, $"stories/{children[1]}", null);
             Assert.Contains(child2!["story_links"]!.AsArray(), l => (string?)l!["verb"] == "blocks" && l["subject_id"]!.GetValue<int>() == children[0]);
             writes.Save("write-lifecycle.json");
+
+            // The retry and the release of those children (sc-25877), with a source of its own (no cached read).
+            var release = new ShortcutFixture { Source = "recorded live on the throwaway stories of write-lifecycle.json, archived afterwards" };
+            release.Parameters["parent"] = parent;
+            release.Parameters["children"] = new JsonArray(children.Select(c => (JsonNode)c).ToArray());
+            await ShortcutContractTests.ReleaseLifecycle(Recording(release), parent, children);
+            release.Save("release.json");
         }
         finally
         {

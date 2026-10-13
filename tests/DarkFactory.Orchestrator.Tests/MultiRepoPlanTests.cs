@@ -236,6 +236,26 @@ public class MultiRepoPlanTests
         Assert.Equal(one, PlanPrompt.Build(spec, TwoRepoAnswers.Both[0], null, [TwoRepoAnswers.Both[0]]));
     }
 
+    /// <summary>
+    /// Live P4-AT2, 2026-10-13 (sc-25877): the planner wrote a downstream story telling its worker to read the method "from
+    /// upstream main"; that worker, seated in its own repository alone, changed nothing and the story escalated. The planner of
+    /// several repositories is told what a story's worker can see, so each story carries what it needs from the others.
+    /// </summary>
+    [Fact]
+    public void The_planner_of_several_repositories_is_told_a_storys_worker_sees_only_its_own_repository()
+    {
+        var spec = new WorkSpec(new WorkStory(77, "Share the mesh format", "Both repositories.", "feature", "https://app.shortcut.com/x/story/77"), null, []);
+
+        var prompt = PlanPrompt.Build(spec, TwoRepoAnswers.Both[0], null, TwoRepoAnswers.Both);
+
+        Assert.Contains("only a checkout of the story's own repository", prompt);
+        Assert.Contains("cannot read another repository of the plan", prompt);
+        Assert.Contains("never write a story that tells its worker to read, copy from or look up anything in another", prompt);
+        Assert.Contains("A blocker only orders the work; it shows the worker nothing.", prompt);
+        // One repository: every story is worked in the checkout the planner itself read; nothing to say.
+        Assert.DoesNotContain("cannot read another repository", PlanPrompt.Build(spec, TwoRepoAnswers.Both[0]));
+    }
+
     // ---- release ----
 
     private static LedgerEntry Row(WorkState state, string? step = null, string? detail = null) => new()
