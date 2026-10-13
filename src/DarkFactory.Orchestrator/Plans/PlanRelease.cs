@@ -523,7 +523,7 @@ public static class PlanRelease
     /// repositories whose changeset each story waits on, and the merge order. Null when the <c>plan</c> checkpoint does not read
     /// back as a plan of those stories.
     /// </summary>
-    public static RecordedRepositories? RecordedRepos(string? planDetail, IReadOnlyList<string> stories, Shortcut.RepoRef primary)
+    public static RecordedRepositories? RecordedRepos(string? planDetail, IReadOnlyList<string> stories, RepoRef primary)
     {
         try
         {

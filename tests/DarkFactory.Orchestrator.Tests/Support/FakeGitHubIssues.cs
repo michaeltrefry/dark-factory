@@ -1,5 +1,4 @@
 using DarkFactory.Orchestrator.GitHub;
-using DarkFactory.Orchestrator.Shortcut;
 
 namespace DarkFactory.Orchestrator.Tests.Support;
 

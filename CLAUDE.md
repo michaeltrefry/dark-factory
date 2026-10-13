@@ -30,8 +30,12 @@ Claude Code headless workers through the Weave router.
   sc-25870),
   and the outbound gateway (`Gateway/`: `OutboundHttp` builds every GitHub, Shortcut, router, CodeGraph and Kanban `HttpClient` (and the
   acceptance tests' dashboard client and their loopback-only client of the MCP proxy, `LoopbackMcp`); `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token
-  credentials; `GitRemoteReads` the github.com remote URL and every clone/fetch's arguments (sc-25391); `GitHubCli` is the only
-  `gh` run).
+  credentials; `GitRemoteReads` the github.com remote URL, every clone/fetch's arguments (sc-25391) and the repository a github.com
+  remote URL names (`RepoOf`, sc-25981); `KanbanWrites` builds the one MCP client that holds the orchestrator's full-scope Kanban
+  token (sc-25981); `GitHubCli` is the only `gh` run),
+  and KanbanBoard as a third work source (`Kanban/`, sc-25981: `KanbanWorkSource`, its typed MCP caller `KanbanBoard.cs`, and
+  `KanbanKeys.cs` — the ledger's `kb-<n>` keys, the watch scope `KanbanScope`, the web links `KanbanLinks`). `RepoRef` and
+  `RepoResolver` (`RepoRef.cs`) are in the root namespace: every source and the pipeline use them.
 - `src/DarkFactory.Analyzers` — the gateway lint (sc-25390), a Roslyn analyzer every build of the orchestrator and of
   `tests/DarkFactory.AcceptanceTests` runs (CI's `build-test` included), all errors: DF0001 an HTTP client/handler (made,
   subclassed, in `typeof` or an explicit type argument like `Activator.CreateInstance<HttpClient>()`), socket, web socket,
@@ -123,6 +127,10 @@ Claude Code headless workers through the Weave router.
   the merge (sc-25877, `FACTORY_E2E_P4_CARGO_MERGE_STORY`: a test of new code, `not-built` on the base and passing on the head,
   `new-tests` `pass`, a `Merge` gate row, `gate-passed`, the pull request merged; it leaves a crate per run under the sandbox's
   `e2e-rust-merged/`).
+  Phase 4b's P4b-AT1, first version (sc-25981, `KanbanAcceptanceTests`, `FACTORY_E2E_P4B_KANBAN_ITEM` + `FACTORY_E2E_P4B_KANBAN_PROJECT`):
+  `factory run kb-N` on a Ready item of a watched KanbanBoard project — its key given once, the item claimed on the real board
+  (the factory's marker, read back) and moved out of Ready, the pull request opened from `factory/kb-N` and it and the branch
+  linked on the item under their kinds; a second run writes neither claim nor link again. Checked up to "pull request opened".
 
 ## Commands
 
@@ -133,7 +141,8 @@ dotnet build
 dotnet test                                   # unit tests; acceptance tests skip
 dotnet ef database update --project src/DarkFactory.Orchestrator
 dotnet ef migrations add <Name> --project src/DarkFactory.Orchestrator -o Ledger/Migrations
-dotnet run --project src/DarkFactory.Orchestrator -- run sc-1234
+dotnet run --project src/DarkFactory.Orchestrator -- run sc-1234             # or gh-12 (a released GitHub issue), kb-7 (a Kanban item)
+dotnet run --project src/DarkFactory.Orchestrator -- kanban key <item GUID>   # prints the item's kb-<n> (given now if it has none)
 dotnet run --project src/DarkFactory.Orchestrator -- work          # long-running host: dashboard + session hub on 127.0.0.1 + the intake loop (polls the watch scope)
 dotnet run --project src/DarkFactory.Orchestrator -- dashboard set-password   # dashboard login (hash → keychain)
 dotnet run --project src/DarkFactory.Orchestrator -- pause --factory          # also continue/stop; --epic N or --item sc-N
@@ -158,6 +167,9 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional: without it the factory starts and every CodeGraph tool answers the reviewer an error result (recorded), triage gets no CodeGraph, and the merge gate's `risk-threshold` fails wherever a tier requires it (sc-25709), so no normal or protected change merges (`factory run` and `factory work` warn at start-up) |
 | `Kanban:McpUrl` | `https://kanban-mcp.trefry.net/mcp` (`OutboundHttp.KanbanDefaultMcpUrl`; an absolute http(s) URL naming no model provider; MCP Streamable HTTP): the Kanban upstream (sc-25707), offered to reviewers through their tool loop and to a plan item's planner session through the loopback proxy (`McpProfile.Planner`, sc-25870); never to triage sessions, whose proxy is started without it (`McpProfile.Triage`: the issue text is untrusted and the triage's answer is posted on the issue) |
 | `Kanban:Token` | env `FACTORY_KANBAN_TOKEN`, or keychain account `kanban-token`: a KanbanBoard PAT (`Authorization: Bearer`), owner-side only (E5). Optional: without it there is no Kanban upstream (not an error) |
+| `Kanban:WriteToken` | env `FACTORY_KANBAN_WRITE_TOKEN`, or keychain account `kanban-write-token` (sc-25981): the orchestrator's own KanbanBoard PAT, scope `full`, with which the Kanban work source claims, moves, comments on and links items. Owner-side only and apart from `Kanban:Token` (E2): it is read in one place (`FactoryRunner.CreateKanbanSource`), held by one client (`Gateway/KanbanWrites`) and is in no MCP upstream, profile, allowlist or proxy grant. Needed only to work a Kanban item (`factory run kb-N`, `factory kanban key`): missing, those print the reason and exit 2 |
+| `Kanban:Watch:Projects` | empty = watch nothing; comma-separated KanbanBoard project keys (each ≤ 24 characters, no spaces; upper-cased, once each; else refused at start-up naming the key). An item is in scope when its project is one of them |
+| `Kanban:WebUrl` | `https://kanban.trefry.net/` (`OutboundHttp.KanbanDefaultWebUrl`; an absolute http(s) URL without credentials, query or fragment, naming no model provider): what a Kanban item's, epic's and document's link is built on (`KanbanLinks`: `?project=<id>[&epic=<id>]&item=<id>`) — KanbanBoard's MCP returns no URL, and nothing is requested from this address |
 | `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
 | `GitHub:Gate:AppId`, `GitHub:Gate:PrivateKeyPem` | keychain `github-gate-app-id`, `github-gate-app-private-key` (written by `factory github-app setup --gate`): the merge gate's App, the only credential that merges |
@@ -256,9 +268,53 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (the usage pause lifts at its `ResumeAt`, the freeze at a human's Continue); a parked item never does. The same pauses keep a
   queued item's merge-queue place (`MergeQueue.Member`). `InFlightAsync` lists the items being stopped first. Resumes re-check
   the scope.
-- Work sources are named by `ItemNaming` (`sc-<story>`, `gh-<key>`: the ledger `Source`, external id, `factory/<id>` branch,
-  `factory-<id>` worktree, `item:<id>` control scope); `factory run`/`--item` take either. The intake loop polls every source
+- Work sources are named by `ItemNaming` (`sc-<story>`, `gh-<key>`, `kb-<key>`: the ledger `Source`, external id, `factory/<id>` branch,
+  `factory-<id>` worktree, `item:<id>` control scope); `factory run`/`--item` take any of them. The intake loop polls every source
   in turn (`IntakeLane`), so a triage and an item run never share the sandbox. The merge queue is per repo across sources.
+- KanbanBoard items (Phase 4b, sc-25981; `Kanban/`): a third work source behind `IWorkSource`, wired for `factory run kb-<n>` only
+  so far (the intake loop, `factory work`'s start-up, Stop from the CLI/dashboard and epic controls do not know it yet: a Pause or
+  Stop written for `item:kb-<n>` is honoured by the item's own run, which is the generic path). Contract: KanbanBoard's
+  `docs/mcp-contract.md` (tool and argument names are compared exactly there, and an argument a tool does not have is refused).
+  Identity (E4): the board names an item by a GUID; the ledger gives it a key once, in `kanban_items` (migration `KanbanItems`;
+  `KanbanKeys`: unique index on the GUID, the loser of a race reads the winner's key), before anything else is written for it —
+  when `ListReadyAsync` first lists it or `factory kanban key <GUID>` asks (which reads the item from the board first: an unknown
+  id gets no key). Nothing written onto the board derives from that key: the claim marker is `dark-factory:<item GUID>`
+  (`KanbanWorkSource.Marker`) and a comment's idempotency key the SHA-256 of the item's GUID, its `version` and the body
+  (`CommentKey`: a retry of the same comment adds nothing; the same words after the item was moved or edited are a new comment).
+  Writes (E2): only the orchestrator writes the board, through its MCP, with its own full-scope token (`Kanban:WriteToken`) in the
+  one client `Gateway/KanbanWrites.Client` builds for the typed caller `KanbanBoard` — which is no `McpUpstream`, so it is in no
+  upstream registry, allowlist, profile or proxy grant; model sessions keep the read token and `McpServers.KanbanTools` (read tools
+  only). `KanbanWriteIsolationTests` hold each half: no contract write tool on an allowlist or in a profile, the upstream sending
+  the read token and no write tool, a planner grant of the real proxy refusing each of the adapter's write tools with nothing
+  forwarded, and a source scan (the token read, the client and the caller built only in `FactoryRunner.CreateKanbanSource`; nothing
+  under `Mcp/`, `Gate/`, `Plans/`, `Issues/`, `Worker/`, `CodeGraph/`, `Sessions/`, `Dashboard/` naming them). Every write is
+  conditional or idempotent (E3): a status change is `update_work_item(itemId, status, expected_version)` on the version just read
+  (it puts the item at the end of the column and changes nothing else), a comment carries its `idempotency_key`, and claim, release
+  and link are idempotent on the board (`add_work_item_link` of a kind and URL the item carries changes nothing).
+  Ready = `list_work_items(projectId, status: Ready, unblocked_only, claim_state: unclaimed, limit, include_comments: false)` per
+  watched project, paged by cursor (at most `KanbanWorkSource.MaxPages` pages of `KanbanBoard.MaxPageSize`), each listed item
+  checked again (project, status, no claim, no open blocker). `ClaimAsync` re-reads the item and refuses, writing nothing: a key
+  the ledger never gave out, an item gone from the board, a project outside `Kanban:Watch:Projects` (skipped by
+  `--ignore-scope`), another caller's claim (`the item is claimed by <claimant>`), a status that is not `Ready` (or `InProgress`
+  under the factory's own marker), and an open blocker (only `Done` finishes one; a `Closed` blocker still blocks). Then
+  `claim_work_item(id, marker, ttl_seconds)` — `already_claimed` (another caller won the race, or holds the same marker under
+  another identity) is a refusal too —, the claim read back (`claim_marker` and `claimant_id`), and the move to `InProgress`; an
+  item someone moved away meanwhile gets the claim released again and a refusal. Claims are KanbanBoard's own, advisory and
+  expiring: nothing renews one yet, so the factory claims for the maximum, a day (`ClaimTtlSeconds`). `ReportStateAsync`:
+  Claimed → `InProgress`, Merged → `Done`, Stopped → `Backlog` with the factory's claim released and the comment posted; an item
+  already in the target column is not written. `LinkAsync` attaches each URL under its kind from the URL (`…/pull/<n>` `pr`,
+  `…/tree/<branch>` `branch`, else `other`). Not handled yet: a `busy` answer is not retried and a `conflict` (stale
+  `expected_version`) not re-read — the call throws `KanbanException` (the contract's code) and the run fails that step —, and
+  plans (`PlansItems` false, no children).
+  Repository: the item's project's `repository_url` (`GitRemoteReads.RepoOf`: the https and ssh forms of a github.com
+  repository, with or without `.git`), overridden by a `Repo: owner/name` line in the item's description — `ReadSpecAsync` leads
+  the description with a code-written `Repo:` line when the item has none, which is how every source tells the pipeline where an
+  item is worked. A project with no `repository_url` leaves the item to `Factory:DefaultRepo`; a `repository_url` that names no
+  github.com repository, and a project that is archived or gone, is refused (no `Repo:` line to fall back on), never worked
+  somewhere else. The spec is the item, its epic and the epic's documents; links are built on `Kanban:WebUrl`.
+  Trust (E5): a Kanban item is written on the owner's board and is trusted like a Shortcut story — `WorkStory.UntrustedName` is
+  true only for a GitHub issue's item and a planner-authored story — so its spec is unfenced instructions and its name goes on
+  GitHub as written. A Kanban epic has no number (`WorkEpic.Id` null), so no `epic:<id>` control reaches a Kanban item.
 - GitHub issues (sc-25385, `Issues/`): `IssueIntake` polls each watched repo's open issues updated since its ledger cursor
   (`github_issue_cursors`; the first poll of a repo starts from now, no backfill). Each issue gets a key (`github_issues`) and a
   work item `gh-<key>` that waits Paused/parked (`awaiting triage`) until released. Each issue version (sha of title+body) is

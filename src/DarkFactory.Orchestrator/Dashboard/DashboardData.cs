@@ -287,7 +287,7 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
             var released = since.Where(e => e.Step == RunPipeline.Steps.PlanReleased)
                 .Select(e => PlanRelease.StoriesOf(e.Detail).FirstOrDefault() ?? "").ToHashSet(StringComparer.Ordinal);
             // Several repositories (sc-25873): the changesets a story waits on, and where each repository's changeset stands.
-            var primary = Shortcut.RepoRef.Parse(item.Repo);
+            var primary = RepoRef.Parse(item.Repo);
             var repos = PlanRelease.RecordedRepos(plan, ofPlan, primary);
             var all = rows[item.Id].Concat(ownTransitions[item.Id]).OrderBy(e => e.Id).ToList();
             var changesets = Changeset.States(all, primary, item.State);

@@ -841,7 +841,7 @@ public sealed class GatewayLintTests
     public void Push_arguments_and_git_credentials_come_from_the_gateway_unchanged()
     {
         // sc-25391: the github.com remote, clone and fetch are the gateway's too; GitWorkspace runs them as before.
-        var repo = new DarkFactory.Orchestrator.Shortcut.RepoRef("acme", "widgets");
+        var repo = new RepoRef("acme", "widgets");
         Assert.Equal("https://github.com/acme/widgets.git", GitRemoteReads.GitHubRemote(repo));
         Assert.Equal(GitRemoteReads.GitHubRemote(repo), DarkFactory.Orchestrator.Git.GitWorkspace.GitHubRemote(repo));
         Assert.Equal(["clone", "r", "d"], GitRemoteReads.Clone("r", "d"));

@@ -1,6 +1,6 @@
 using System.Text.RegularExpressions;
 
-namespace DarkFactory.Orchestrator.Shortcut;
+namespace DarkFactory.Orchestrator;
 
 public sealed record RepoRef(string Owner, string Name)
 {
@@ -44,10 +44,16 @@ public static partial class RepoResolver
         RegexOptions.IgnoreCase | RegexOptions.Multiline)]
     private static partial Regex RepoLine();
 
-    public static RepoRef Resolve(string? storyDescription, RepoRef defaultRepo)
+    public static RepoRef Resolve(string? storyDescription, RepoRef defaultRepo) => Named(storyDescription) ?? defaultRepo;
+
+    /// <summary>
+    /// The repository the description's first <c>Repo: owner/name</c> line names, or null when it has none: what a work source
+    /// with a repository of its own for the item (a Kanban project's <c>repository_url</c>) lets the item override.
+    /// </summary>
+    public static RepoRef? Named(string? storyDescription)
     {
         var match = RepoLine().Match(storyDescription ?? "");
-        return match.Success ? RepoRef.Parse(match.Groups[1].Value) : defaultRepo;
+        return match.Success ? RepoRef.Parse(match.Groups[1].Value) : null;
     }
 
     /// <summary>

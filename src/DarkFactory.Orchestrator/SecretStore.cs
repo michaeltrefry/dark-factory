@@ -29,6 +29,11 @@ public static class SecretAccounts
     public const string CodeGraphToken = "codegraph-token";
     /// <summary>The Kanban upstream's personal access token (sc-25707): owner-side only, optional.</summary>
     public const string KanbanToken = "kanban-token";
+    /// <summary>
+    /// The orchestrator's own full-scope Kanban token (sc-25981): owner-side only, used by the Kanban work source alone and never by
+    /// an MCP upstream (model sessions keep <see cref="KanbanToken"/>).
+    /// </summary>
+    public const string KanbanWriteToken = "kanban-write-token";
 }
 
 /// <summary>Generic passwords in the login keychain under service <c>dark-factory</c>, via <c>/usr/bin/security</c>.</summary>

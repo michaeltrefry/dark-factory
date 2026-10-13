@@ -135,15 +135,43 @@ public static class FactoryRunner
         return await RunAsync(options, CreateWorkSource(options, shortcutHttp), storyId, ignoreScope, log, ct);
     }
 
-    /// <summary><c>factory run &lt;item&gt;</c> for an item of any source: a Shortcut story (<c>sc-N</c>) or a GitHub issue (<c>gh-N</c>).</summary>
+    /// <summary><c>factory run &lt;item&gt;</c> for an item of any source: a Shortcut story (<c>sc-N</c>), a GitHub issue (<c>gh-N</c>) or a Kanban item (<c>kb-N</c>).</summary>
     public static async Task<RunOutcome> RunAsync(FactoryOptions options, ItemRef item, bool ignoreScope, TextWriter log, CancellationToken ct)
     {
         if (item.Naming == ItemNaming.Shortcut)
         {
             return await RunAsync(options, item.Id, ignoreScope, log, ct);
         }
+        if (item.Naming == ItemNaming.Kanban)
+        {
+            using var kanbanHttp = OutboundHttp.KanbanApi(options.KanbanMcpUrl);
+            return await RunAsync(options, CreateKanbanSource(options, kanbanHttp), item.Id, ignoreScope, log, ct);
+        }
         using var githubHttp = OutboundHttp.GitHubApi();
         return await RunAsync(options, CreateIssueSource(options, githubHttp), item.Id, ignoreScope, log, ct);
+    }
+
+    /// <summary>
+    /// The Kanban work source over the watched projects (<c>Kanban:Watch:Projects</c>; sc-25981), with the orchestrator's own
+    /// full-scope token (<c>Kanban:WriteToken</c>) in the one client built for it (<see cref="KanbanWrites.Client"/>) over
+    /// <paramref name="kanbanHttp"/> (<see cref="OutboundHttp.KanbanApi"/>). That client is apart from the Kanban upstream of
+    /// <see cref="CreateUpstreams"/>, which holds the read token and is all a model session reaches (E2).
+    /// </summary>
+    public static Kanban.KanbanWorkSource CreateKanbanSource(FactoryOptions options, HttpClient kanbanHttp) =>
+        new(new Kanban.KanbanBoard(KanbanWrites.Client(kanbanHttp, options.KanbanWriteToken)), new Kanban.KanbanKeys(Contexts(options)),
+            options.KanbanWatchScope, options.KanbanWebUrl);
+
+    /// <summary>
+    /// <c>factory kanban key &lt;item id&gt;</c>: the <c>kb-&lt;n&gt;</c> of a KanbanBoard item by its board id, given to it now if the
+    /// factory has not seen the item before (<see cref="Kanban.KanbanWorkSource.KeyOfAsync"/>: the item must be on the board; nothing
+    /// is written to it) — what <c>factory run kb-&lt;n&gt;</c> then takes.
+    /// </summary>
+    public static async Task<string> KanbanKeyAsync(FactoryOptions options, Guid itemId, CancellationToken ct)
+    {
+        using var kanbanHttp = OutboundHttp.KanbanApi(options.KanbanMcpUrl);
+        var source = CreateKanbanSource(options, kanbanHttp);
+        await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
+        return ItemNaming.Kanban.Format(await source.KeyOfAsync(itemId, ct));
     }
 
     /// <summary>The GitHub issue work source over the watched repos (<c>GitHub:Watch:Repos</c>), as the workers' App.</summary>

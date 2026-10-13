@@ -1,5 +1,4 @@
 using System.CommandLine;
-using DarkFactory.Orchestrator.Shortcut;
 
 namespace DarkFactory.Orchestrator;
 
@@ -14,11 +13,12 @@ public static class FactoryCli
         Func<RepoRef, CancellationToken, Task<int>> protectRepo,
         Func<CancellationToken, Task<int>> work,
         Func<CancellationToken, Task<int>> setDashboardPassword,
-        Func<string, string, CancellationToken, Task<int>> control)
+        Func<string, string, CancellationToken, Task<int>> control,
+        Func<Guid, CancellationToken, Task<int>>? kanbanKey = null)
     {
         var storyArgument = new Argument<WorkSources.ItemRef?>("story-id")
         {
-            Description = "Shortcut story id, e.g. sc-1234 or 1234, or a GitHub issue's work item, e.g. gh-12",
+            Description = "Shortcut story id, e.g. sc-1234 or 1234, a GitHub issue's work item, e.g. gh-12, or a Kanban item's, e.g. kb-7",
             CustomParser = result =>
             {
                 var token = result.Tokens.Single().Value;
@@ -26,7 +26,7 @@ public static class FactoryCli
                 {
                     return item;
                 }
-                result.AddError($"'{token}' is not a work item id (expected sc-<number>, <number> or gh-<number>).");
+                result.AddError($"'{token}' is not a work item id (expected sc-<number>, <number>, gh-<number> or kb-<number>).");
                 return null;
             },
         };
@@ -34,7 +34,7 @@ public static class FactoryCli
         {
             Description = "Claim and resume the story even if it is outside the Shortcut watch scope (the other claim checks still apply)",
         };
-        var runCommand = new Command("run", "Run one work item (a Shortcut story, or a released GitHub issue) through Intake → Implement → Review → CI → MergeGate → Merge, resuming from its last ledger state.")
+        var runCommand = new Command("run", "Run one work item (a Shortcut story, a released GitHub issue, or a Kanban item) through Intake → Implement → Review → CI → MergeGate → Merge, resuming from its last ledger state.")
         {
             storyArgument,
             ignoreScopeOption,
@@ -99,9 +99,31 @@ public static class FactoryCli
         var setPasswordCommand = new Command("set-password", "Set the dashboard login password (read without echo; its hash goes to the keychain).");
         setPasswordCommand.SetAction((_, ct) => setDashboardPassword(ct));
 
+        var kanbanItemArgument = new Argument<Guid>("item-id")
+        {
+            Description = "The item's id on KanbanBoard (a GUID)",
+            CustomParser = result =>
+            {
+                var token = result.Tokens.Single().Value;
+                if (Guid.TryParse(token, out var id))
+                {
+                    return id;
+                }
+                result.AddError($"'{token}' is not a KanbanBoard item id (expected a GUID).");
+                return default;
+            },
+        };
+        var kanbanKeyCommand = new Command("key",
+            "Print the work item id (kb-<number>) of a KanbanBoard item, giving it one if the factory has not seen the item yet; `factory run kb-<number>` then runs it.")
+        {
+            kanbanItemArgument,
+        };
+        kanbanKeyCommand.SetAction((parse, ct) => kanbanKey is null ? Task.FromResult(1) : kanbanKey(parse.GetValue(kanbanItemArgument), ct));
+
         return new RootCommand("Dark Factory orchestrator")
         {
             runCommand,
+            new Command("kanban", "KanbanBoard work items") { kanbanKeyCommand },
             workCommand,
             ControlCommand("pause", "Pause a scope: nothing new is claimed or started there, and running workers stop after their current tool call (session and worktree kept).", control),
             ControlCommand("continue", "Continue a paused scope: paused items resume from the ledger (an interrupted worker resumes its own Claude session).", control),
@@ -117,7 +139,7 @@ public static class FactoryCli
     {
         var item = new Option<WorkSources.ItemRef?>("--item")
         {
-            Description = "One work item: a Shortcut story, e.g. sc-1234, or a GitHub issue's, e.g. gh-12. A plan item's control applies to the plan and its stories",
+            Description = "One work item: a Shortcut story, e.g. sc-1234, a GitHub issue's, e.g. gh-12, or a Kanban item's, e.g. kb-7. A plan item's control applies to the plan and its stories",
             CustomParser = result =>
             {
                 var token = result.Tokens.Single().Value;
@@ -125,7 +147,7 @@ public static class FactoryCli
                 {
                     return parsed;
                 }
-                result.AddError($"'{token}' is not a work item id (expected sc-<number>, <number> or gh-<number>).");
+                result.AddError($"'{token}' is not a work item id (expected sc-<number>, <number>, gh-<number> or kb-<number>).");
                 return null;
             },
         };
