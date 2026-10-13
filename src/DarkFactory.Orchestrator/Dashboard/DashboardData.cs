@@ -36,8 +36,14 @@ public sealed record PipelineRow(
 /// <param name="Hold">What a failed story holds, as the plan item records it (<see cref="PlanRelease.HeldByFailed"/>); null when none is failed.</param>
 /// <param name="LastHeld">The plan item's newest <c>plan-held</c> row that names something else (a blocker outside the plan, an archived
 /// story, …), with when it was recorded: such a hold has no record of its end, so it is shown as the last one recorded.</param>
-public sealed record PlanView(IReadOnlyList<PlanStoryView> Stories, PlanStatus Status, string? Hold, (string Detail, DateTimeOffset At)? LastHeld = null)
+/// <param name="FailedNotices">How often the plan item's comment for its latest hold by a failed story (or its lifting) was tried and
+/// refused by the board (its <c>plan-notice</c> rows since that record); 0 once it is posted, or when there is none to post.</param>
+public sealed record PlanView(IReadOnlyList<PlanStoryView> Stories, PlanStatus Status, string? Hold, (string Detail, DateTimeOffset At)? LastHeld = null,
+    int FailedNotices = 0)
 {
+    /// <summary>Whether the factory will try the refused comment again (the next evaluation), or has left it to the ledger and this page.</summary>
+    public bool NoticeRetrying => FailedNotices < RunPipeline.MaxPlanNoticeAttempts;
+
     public int Merged => Status.Count(PlanStoryState.Merged);
     public int InFlight => Status.Count(PlanStoryState.InFlight);
     /// <summary>Not released yet: waiting on blockers, or blocked behind a failed story.</summary>
@@ -212,7 +218,8 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
     }
 
     private static readonly string[] PlanSteps =
-        [RunPipeline.Steps.Plan, RunPipeline.Steps.PlanStories, RunPipeline.Steps.PlanReleased, RunPipeline.Steps.PlanHeld];
+        [RunPipeline.Steps.Plan, RunPipeline.Steps.PlanStories, RunPipeline.Steps.PlanReleased, RunPipeline.Steps.PlanHeld,
+            RunPipeline.Steps.PlanStuck, RunPipeline.Steps.PlanResumed, RunPipeline.Steps.PlanNotice];
 
     /// <summary>
     /// The plan of each active item that has one (sc-25876; keyed by the plan item's id): its stories from its <c>plan-stories</c>
@@ -253,12 +260,15 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
                 id => known.TryGetValue(id, out var story) ? transitions[story.Id].ToList() : null);
             var lastHeld = since.LastOrDefault(e => e.Step == RunPipeline.Steps.PlanHeld
                 && e.Detail?.StartsWith(PlanRelease.FailedPrefix, StringComparison.Ordinal) != true);
+            // The comment for the latest hold by a failed story (or its lifting): tried and refused so far, unless it was posted since.
+            var notices = since.Skip(since.FindLastIndex(RunPipeline.IsFailedHoldRow) + 1).Where(e => e.Step == RunPipeline.Steps.PlanNotice).ToList();
+            var failedNotices = since.Any(RunPipeline.IsFailedHoldRow) && !notices.Any(n => n.Detail == RunPipeline.Posted) ? notices.Count : 0;
             views[item.Id] = new PlanView(
                 [.. status.Stories.Select(s => new PlanStoryView(s.Id,
                     known.TryGetValue(s.Id, out var story) ? story.Title : UntrustedText.Inert(titles?.GetValueOrDefault(s.Id) ?? ""),
                     s.State, s.ItemState, PlanStoryView.WaitsOf(s, status)))],
                 status, status.Held ? PlanRelease.HeldByFailed(status) : null,
-                lastHeld?.Detail is { } detail ? (detail, lastHeld.RecordedAt) : null);
+                lastHeld?.Detail is { } detail ? (detail, lastHeld.RecordedAt) : null, failedNotices);
         }
         return views;
     }

@@ -163,8 +163,16 @@ public static class PlanRelease
     /// <summary>Escalated because its pull request was merged by someone else (the review or the merge queue found it merged).</summary>
     public const string AsMergedOutside = "merged outside the factory";
 
-    /// <summary>What the pipeline's escalation reason says when it found the item's pull request merged by someone else.</summary>
-    private static readonly string[] MergedOutsideMarkers = ["is merged outside the factory", "was merged outside the gate"];
+    /// <summary>
+    /// What the review's escalation reason says, after the pull request's URL, when it found the pull request merged by someone else
+    /// (<see cref="RunPipeline"/>'s <c>EnsureOpen</c> throws with it; <see cref="FailureOf"/> reads it back).
+    /// </summary>
+    public const string MergedOutsideFactory = "is merged outside the factory";
+
+    /// <summary>The same from the merge queue: the pull request was found merged at a head no <c>gate-passed</c> names.</summary>
+    public const string MergedOutsideGate = "was merged outside the gate";
+
+    private static readonly string[] MergedOutsideMarkers = [MergedOutsideFactory, MergedOutsideGate];
 
     /// <summary>The most of a failed story's reason a <c>plan-held</c> row and the plan item's comment repeat (the story's own ledger has it all).</summary>
     public const int MaxFailureReason = 300;
@@ -325,6 +333,29 @@ public static class PlanRelease
     public static string PlanStoppedRefusal(string plan) =>
         $"{BlockedPrefix}its plan {plan}, which was stopped: a story of a stopped plan is not started (write a story of your own for the work if it is still wanted)";
 
+    /// <summary>
+    /// The Intake detail of the ledger item a stopped plan gives a story it had released that nothing ever claimed (sc-25876,
+    /// <see cref="Controls.ItemStopper"/>): the board story was moved back to the backlog before the item was created, and the factory did
+    /// no work on it.
+    /// </summary>
+    public static string ReturnedUnstarted(string plan) => $"{ReturnedUnstartedPrefix}{plan}; never started: moved back to the backlog when the plan was stopped";
+
+    private const string ReturnedUnstartedPrefix = "released by its plan ";
+
+    /// <summary>Whether an item's rows are those of a story a stopped plan returned unstarted (<see cref="ReturnedUnstarted"/>): it never left Intake.</summary>
+    public static bool IsReturnedUnstarted(IReadOnlyList<LedgerEntry> history) =>
+        history.Where(e => e.Step is null).ToList() is [{ State: WorkState.Intake, Detail: { } detail }, ..] transitions
+        && detail.StartsWith(ReturnedUnstartedPrefix, StringComparison.Ordinal)
+        && transitions.Skip(1).All(e => e.State == WorkState.Cancelled);
+
+    /// <summary>
+    /// The comment a released, never-claimed story gets when its plan is stopped and it is moved back to the backlog: the factory did
+    /// no work on it, and the comment does not say it did.
+    /// </summary>
+    public static string ReturnedComment(string story, string plan, string by) =>
+        $"{WorkSourceComments.Author} {story} was released by its plan {plan}, which {by} stopped before the factory started this story: "
+        + "it is back in the backlog and the factory will not start it. The factory did no work on it; nothing was changed, merged or deleted.";
+
     /// <summary>The words a <c>plan-held</c> row starts with when the plan could not be evaluated at all (<see cref="RunPipeline.GiveUpAsync"/>).</summary>
     public const string NotEvaluatedPrefix = "not evaluated: ";
 
@@ -333,24 +364,6 @@ public static class PlanRelease
     /// plan its <c>plan</c> checkpoint holds; null when that checkpoint does not read back as a plan of those stories (then
     /// nothing is known and the board is asked about every story).
     /// </summary>
-    /// <summary>
-    /// The title the plan gave each story (<paramref name="stories"/> as for <see cref="RecordedBlockers"/>), from its <c>plan</c>
-    /// checkpoint; null when that does not read back as a plan of those stories. Planner-written text: render it inert.
-    /// </summary>
-    public static IReadOnlyDictionary<string, string>? RecordedTitles(string? planDetail, IReadOnlyList<string> stories)
-    {
-        try
-        {
-            var plan = Plan.FromDetail(planDetail);
-            return plan.Stories.Count != stories.Count ? null
-                : plan.Stories.Select((s, i) => (Id: stories[i], s.Title)).ToDictionary(x => x.Id, x => x.Title, StringComparer.Ordinal);
-        }
-        catch (Exception ex) when (ex is PlanFormatException or ArgumentException)
-        {
-            return null;
-        }
-    }
-
     public static IReadOnlyDictionary<string, IReadOnlyList<string>>? RecordedBlockers(string? planDetail, IReadOnlyList<string> stories)
     {
         Plan plan;
@@ -369,5 +382,23 @@ public static class PlanRelease
         var id = plan.Stories.Select((s, i) => (s.Key, Id: stories[i])).ToDictionary(x => x.Key, x => x.Id, StringComparer.Ordinal);
         return plan.Stories.ToDictionary(s => id[s.Key],
             s => (IReadOnlyList<string>)s.BlockedBy.Where(id.ContainsKey).Select(b => id[b]).ToList(), StringComparer.Ordinal);
+    }
+
+    /// <summary>
+    /// The title the plan gave each story (<paramref name="stories"/> as for <see cref="RecordedBlockers"/>), from its <c>plan</c>
+    /// checkpoint; null when that does not read back as a plan of those stories. Planner-written text: render it inert.
+    /// </summary>
+    public static IReadOnlyDictionary<string, string>? RecordedTitles(string? planDetail, IReadOnlyList<string> stories)
+    {
+        try
+        {
+            var plan = Plan.FromDetail(planDetail);
+            return plan.Stories.Count != stories.Count ? null
+                : plan.Stories.Select((s, i) => (Id: stories[i], s.Title)).ToDictionary(x => x.Id, x => x.Title, StringComparer.Ordinal);
+        }
+        catch (Exception ex) when (ex is PlanFormatException or ArgumentException)
+        {
+            return null;
+        }
     }
 }

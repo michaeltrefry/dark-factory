@@ -45,7 +45,10 @@ public static class ControlScope
 
     public static string Epic(long epicId) => $"epic:{epicId}";
 
-    public static string Item(string externalId) => $"item:{externalId}";
+    /// <summary>What an item scope starts with, before the item's external id.</summary>
+    public const string ItemPrefix = "item:";
+
+    public static string Item(string externalId) => ItemPrefix + externalId;
 
     /// <summary>The Shortcut story id of an item scope, or null for another scope (or another source's item).</summary>
     public static int? ItemStory(string scope) => ItemOf(scope) is { } item && item.Naming == ItemNaming.Shortcut ? item.Id : null;
@@ -158,44 +161,35 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
 {
     public async Task<ControlState> EffectiveAsync(string externalId, long? epicId, CancellationToken ct)
     {
-        var scopes = new List<string> { ControlScope.Factory, ControlScope.Usage, ControlScope.Freeze, ControlScope.Item(externalId) };
+        var own = ControlScope.Item(externalId);
+        var scopes = new List<string> { ControlScope.Factory, ControlScope.Usage, ControlScope.Freeze, own };
         if (epicId is { } epic)
         {
             scopes.Add(ControlScope.Epic(epic));
         }
         await using var db = await contexts.CreateDbContextAsync(ct);
-        // A story of a plan (sc-25876) is also held to the control on its plan item: no new scope kind, the plan's own item scope.
-        var plan = await PlanOfAsync(db, externalId, ct);
-        if (plan is not null)
-        {
-            scopes.Add(ControlScope.Item(plan.Value.Plan));
-        }
-        var rows = await db.Controls.AsNoTracking().Where(c => scopes.Contains(c.Scope)).ToListAsync(ct);
+        // A story of a plan (sc-25876) is also held to the control on its plan item: no new scope kind, the plan's own item scope,
+        // found by a self-join on the ledger's (Source, ExternalId) index inside the one query that reads the rows — this runs every
+        // second for every running worker and test run. No part of it is optional: a read that fails throws, and the caller counts
+        // an unreadable control as a Pause (E2), never as "no plan".
+        var source = ItemNaming.ParseAny(externalId)?.Naming.Source;
+        var planScopes = db.WorkItems.Where(s => s.Source == source && s.ExternalId == externalId && s.PlanItemId != null)
+            .Join(db.WorkItems, s => s.PlanItemId, p => (long?)p.Id, (s, p) => ControlScope.ItemPrefix + p.ExternalId);
+        var rows = await db.Controls.AsNoTracking().Where(c => scopes.Contains(c.Scope) || planScopes.Contains(c.Scope)).ToListAsync(ct);
         var now = time.GetUtcNow();
-        if (rows.Any(r => r.State == ControlState.Stopping && r.Scope == ControlScope.Item(externalId)))
+        if (rows.Any(r => r.State == ControlState.Stopping && r.Scope == own))
         {
             return ControlState.Stopping;
         }
-        // A plan being stopped stops its unfinished stories; one the factory already merged is left as it is.
-        if (plan is { } of && rows.Any(r => r.State == ControlState.Stopping && r.Scope == ControlScope.Item(of.Plan))
-            && !await db.LedgerEntries.AsNoTracking().AnyAsync(e => e.WorkItemId == of.Story && e.Step == null && e.State == WorkState.Merge, ct))
+        // A plan being stopped (a Stopping row that is none of the item's own scopes is its plan's) stops its unfinished stories;
+        // one the factory already merged is left as it is. Asked only then.
+        if (rows.Any(r => r.State == ControlState.Stopping && !scopes.Contains(r.Scope))
+            && !await db.LedgerEntries.AsNoTracking().AnyAsync(e => e.Step == null && e.State == WorkState.Merge
+                && db.WorkItems.Any(i => i.Id == e.WorkItemId && i.Source == source && i.ExternalId == externalId), ct))
         {
             return ControlState.Stopping;
         }
         return rows.Any(r => r.PausesAt(now)) ? ControlState.Paused : ControlState.Running;
-    }
-
-    /// <summary>The plan item (its external id) the ledger links the item to (<see cref="WorkItem.PlanItemId"/>), with the item's own ledger id; null for any other item.</summary>
-    internal static async Task<(long Story, string Plan)?> PlanOfAsync(LedgerDbContext db, string externalId, CancellationToken ct)
-    {
-        var story = await db.WorkItems.AsNoTracking().Where(i => i.ExternalId == externalId && i.PlanItemId != null)
-            .Select(i => new { i.Id, i.PlanItemId }).FirstOrDefaultAsync(ct);
-        if (story is null)
-        {
-            return null;
-        }
-        var plan = await db.WorkItems.AsNoTracking().Where(p => p.Id == story.PlanItemId).Select(p => p.ExternalId).FirstOrDefaultAsync(ct);
-        return plan is null ? null : (story.Id, plan);
     }
 
     public async Task<IReadOnlyList<Control>> ListAsync(CancellationToken ct)

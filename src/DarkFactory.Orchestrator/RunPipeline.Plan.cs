@@ -358,7 +358,7 @@ public sealed partial class RunPipeline
         {
             result = $"failed: {ex.Message}";
             log.WriteLine($"[{item.State}] could not comment on {item.ExternalId}: {ex.Message}; "
-                + (notices.Count + 1 < MaxPlanNoticeAttempts ? "the next evaluation tries again" : "not tried again: the ledger and the dashboard have it"));
+                + (notices.Count + 1 < MaxPlanNoticeAttempts ? "the next evaluation tries again" : "not tried again: the ledger has it and the dashboard's plan row says so"));
         }
         await ledger.CheckpointAsync(item, Steps.PlanNotice, null, result, ct);
     }

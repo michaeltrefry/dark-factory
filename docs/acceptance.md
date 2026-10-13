@@ -586,7 +586,13 @@ What the live test does not cover, and the unit tests do (`PlanClassificationTes
 `PlanControlsPostgresTests`, `DashboardComponentTests.A_plan_row_shows_…`): a pull request actually turned back into a draft by
 a plan's stop (the seeded stories have none; the unit test's story has one), a story whose run is going when the Stop lands
 (stopped by that run; the plan's stop unfinished, exit 1, finished by the next poll), a stop that fails half way, a story whose
-worker a crashed run left, a workerless run deferring the stop, Pause and Continue on a plan (an in-flight story paused at its
+worker a crashed run left, a workerless run deferring the stop, a Stop that lands while the plan is evaluated (finished by that
+run, or deferred by a workerless one) and `factory stop` on a plan whose own run is active (unfinished, exit 1), a released story
+nobody claimed (moved back to the Backlog with a comment that does not say the factory worked on it), one a person took, finished,
+assigned or archived since its release (nothing written, no ledger item), one moved back to the Backlog (nothing written), a
+story merged outside the factory (left as it is and listed apart), a plan Pause with the usage pause also in force (`user-paused`),
+a plan Pause in the merge queue (`MergeQueueTests.An_idle_story_whose_plan_is_paused_…`), the control read's query count and its
+failing closed, the plan row's `hold comment not posted` note, Pause and Continue on a plan (an in-flight story paused at its
 next tool boundary and resumed in the same session; nothing claimed or released meanwhile), a transitive hold, a stuck plan, a
 story merged outside the factory, a cancelled story, a failed story that is re-run and merges (`plan-resumed`, its dependents
 released), a comment the board refuses (retried, bounded, never posted twice), a story of a stopped plan moved to ready by hand

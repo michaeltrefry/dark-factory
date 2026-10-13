@@ -743,7 +743,20 @@ public sealed partial class RunPipeline(
         if (item.State == WorkState.Planned)
         {
             // A plan item waiting on its stories (sc-25871): release what is unblocked, or close the plan out.
-            return await PlannedAsync(item, storyId, history, ct);
+            var evaluated = await PlannedAsync(item, storyId, history, ct);
+            // A Stop that landed while the plan was evaluated (sc-25876): nothing watches a control during the evaluation, so this
+            // run finishes the stop now, under the run lock it holds — the plan item is not left Stopping with nobody acting on it.
+            // A run started without the worker run lock defers it, as it does a Stop it finds at its start.
+            if (!Lifecycle.IsTerminal(item.State) && await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) == ControlState.Stopping)
+            {
+                if (_workerless)
+                {
+                    log.WriteLine($"[{item.State}] {item.ExternalId}: stop deferred to the next run (this run was started without the worker run lock)");
+                    return evaluated with { Error = $"{item.ExternalId}: stop deferred to the next run; this run was started without the worker run lock" };
+                }
+                return await FinishStopAsync(item, storyId, RepoRef.Parse(item.Repo), null, workerStillRunning: false);
+            }
+            return evaluated;
         }
         var entered = history.FindLastIndex(e => e.Step is null);
         // A finished plan item (sc-25871) was told so by its closeout: no notice on top of it.

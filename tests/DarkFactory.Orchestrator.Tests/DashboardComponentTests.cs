@@ -196,6 +196,14 @@ public class DashboardComponentTests : BunitContext
         Assert.Equal("#2 (live)", cut.FindAll("td.sessions a")[1].TextContent);
     }
 
+    /// <summary>The plan row's note about its hold comment, as the page renders it (whitespace collapsed).</summary>
+    private List<string> RenderPlanNotice(PlanView plan)
+    {
+        _data.Rows = [Row(500, WorkState.Planned) with { Plan = plan }];
+        using var cut = Render<Pipeline>();
+        return [.. cut.FindAll("tr[data-item='500'] .plan-notice").Select(n => string.Join(' ', n.TextContent.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)))];
+    }
+
     [Fact]
     public void A_plan_row_shows_its_counts_and_hold_with_its_stories_beneath_it_each_with_its_state_and_what_it_waits_on()
     {
@@ -209,6 +217,10 @@ public class DashboardComponentTests : BunitContext
         string[] titles = ["Story 501", "Story 502", "Third <story>", "Story 504"];
         var plan = new PlanView([.. status.Stories.Select((s, i) => new PlanStoryView(s.Id, titles[i], s.State, s.ItemState, PlanStoryView.WaitsOf(s, status)))],
             status, PlanRelease.HeldByFailed(status));
+        Assert.Empty(RenderPlanNotice(plan)); // its hold comment was posted (or nothing is held): nothing said
+        Assert.Equal("hold comment not posted (attempt 1 of 3; tried again on the next poll)", Assert.Single(RenderPlanNotice(plan with { FailedNotices = 1 })));
+        Assert.Equal("hold comment not posted (attempt 3 of 3; not tried again: this page and the ledger have it)",
+            Assert.Single(RenderPlanNotice(plan with { FailedNotices = RunPipeline.MaxPlanNoticeAttempts })));
         _data.Rows =
         [
             Row(500, WorkState.Planned) with { Plan = plan },

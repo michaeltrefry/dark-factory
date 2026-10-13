@@ -631,7 +631,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   Classification: every evaluation of a waiting plan classifies its stories from ledger rows alone (`PlanRelease.Classify`, pure;
   the dashboard calls the same function): `Merged` (a Merge row), `Failed` (`PlanRelease.FailureOf`: no Merge row and the item's
   last transition is Escalated or Cancelled — `escalated`, `cancelled`, or `merged outside the factory` when the escalation reason
-  is the review's "is merged outside the factory" or the merge queue's "was merged outside the gate"), `InFlight` (released, or
+  is the review's "is merged outside the factory" or the merge queue's "was merged outside the gate" — `PlanRelease.MergedOutsideFactory`
+  and `MergedOutsideGate`, the constants the two throw sites build their message from), `InFlight` (released, or
   known to the ledger and neither), `Blocked` (unreleased, and a failed story is among its unmerged plan blockers, directly or
   through others; `HeldBy` names the failed roots) and `Waiting` (unreleased, waiting on anything else or on nothing). A story a
   person re-queued after an escalation (Escalated → Intake) is in flight again, not failed; a story parked on a blocked claim still
@@ -651,12 +652,16 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   time and reason; the stories blocked behind them; the counts; both remedies — fix and `factory run sc-N`, or
   `factory stop --item <plan>`; a cancelled story cannot be re-run) or `ResumedComment`. Its result is a `plan-notice` row (`posted`,
   or `failed: …` with outcome failed); a row with no posted notice is tried again by the next evaluations up to
-  `RunPipeline.MaxPlanNoticeAttempts` (3) and then left to the ledger and the dashboard; a posted one is never repeated (a run that
-  died between row and comment posts it on the next evaluation). Hold bookkeeping runs before the completion check and does not
+  `RunPipeline.MaxPlanNoticeAttempts` (3) and then left to the ledger and the dashboard, whose plan row says `hold comment not posted
+  (attempt n of 3; tried again on the next poll | not tried again: …)` from those rows (`PlanView.FailedNotices`); a posted one is
+  never repeated (a run that died between row and comment posts it on the next evaluation). Hold bookkeeping runs before the completion check and does not
   depend on how a complete plan is finished.
   Plan-scope controls use NO new scope kind: a plan is controlled at its own `item:<plan id>` scope (`factory pause|continue|stop
   --item <plan>`, the dashboard's control form on the plan row), and `LedgerControls.EffectiveAsync` also consults, for an item with
-  a `PlanItemId`, its plan item's row — so every existing consumer (the pipeline's step check, `ControlWatch`, the gate's test
+  a `PlanItemId`, its plan item's row — inside its one query (the plan's scope comes from a self-join on the ledger's
+  `(Source, ExternalId)` index; a second query, for the story's Merge row, runs only while the plan's row is Stopping), since it is
+  read every second for every running worker and test run; a read that fails throws, so a failed plan lookup is an unreadable
+  control (a Pause after `Controls:MaxReadFailures`, E2), never "no plan" — so every existing consumer (the pipeline's step check, `ControlWatch`, the gate's test
   watch, `InFlightAsync`, the merge queue's `HeldIdleByControlAsync`) honours it unchanged. Pause on a plan: its row pauses the
   plan item (nothing released: a paused plan item is not evaluated) and every story of it — an in-flight one stops at its next tool
   boundary, Paused `user-paused` (`UserPausedAsync` counts the plan's row as a user pause), auto-resumed on Continue; a released
@@ -669,13 +674,31 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   stop (`prs-drafted`, board Stopped + comment `… was stopped by <who> (with its plan sc-N)`, `stop-reported`, Cancelled): a story
   whose run holds its lock is left to that run (which sees the Stop within a second), one whose worker a crashed run may have left
   to its own next run (which holds the worker lock and stops the worker first), and one whose stop failed to the next attempt — all
-  "pending". A story the plan released that nothing had started (To Do, no ledger item) gets its ledger item there and is stopped
-  the same way; one never released, or back in the Backlog, is left with nothing written. While any story is pending the stop
+  "pending". A story the plan released that the ledger does not know was never claimed: the factory did no work on it, and the
+  board is asked before anything is written (through `IWorkSource`, E6). Still as the release left it — not archived, in the ready
+  state, no owner or claim but the factory's — it is moved back to the Backlog with a comment that says its plan was stopped before
+  the factory started it (`IWorkSource.ReturnUnstartedAsync`, which re-reads and writes only then; `PlanRelease.ReturnedComment`:
+  never "cancelled its work" or "released its claim"), and then gets a ledger item recorded Intake (`PlanRelease.ReturnedUnstarted`)
+  → Cancelled, with no `prs-drafted`/`stop-reported` rows; the board is written first, so an attempt cut short finds it in the
+  Backlog (or its item at Intake, which is then only recorded Cancelled). One that a person took (another owner, In Progress),
+  finished (Done), assigned to themselves or archived since its release is theirs: nothing is written to it — no move, no comment,
+  no ledger item — and the plan's comment lists it as left as it is. One never released, or back in the Backlog
+  (`IWorkSource.InBacklogAsync`), is left with nothing written. A story Escalated because its pull request was merged outside the
+  factory (`PlanRelease.AsMergedOutside`) has its change on the base branch: it is not stopped, drafted, moved or commented — its
+  item stays Escalated — whether the plan's stop or the story's own run (listed as being stopped while the plan's row is Stopping)
+  reaches it (`ItemStopper.Settled`). While any story is pending the stop
   throws `StopPendingException`: the plan item is unchanged, keeps its Stopping row, `ControlActions.StopAsync` answers not Ok (the
   CLI exits 1) naming each pending story, and later polls finish it. Only then is the plan item itself stopped like any item —
   its own pull requests back to draft, board Stopped with one comment listing `Stories stopped with it: …. Already merged (left as
-  they are): …. Never started (left in the backlog; the factory will not release or start them): ….`, Cancelled, its control
-  cleared. A workerless run (no worker run lock) still defers a plan's stop to the next run. After the stop, a story of the plan
+  they are): …. Never started (left in the backlog; the factory will not release or start them): ….` and, only when there are
+  any, `Released but never started (moved back to the backlog; the factory did no work on them): ….`, `Merged outside the factory
+  (left as they are: their change is on the base branch): ….` and `Taken, finished or archived by someone else since their release
+  (left as they are): ….`, Cancelled, its control cleared. A workerless run (no worker run lock) still defers a plan's stop to the
+  next run. A waiting plan item's run only evaluates its stories and watches no control meanwhile, so: a Stop that lands during
+  the evaluation is seen when it ends (`HoldAsync` re-reads the control after `PlannedAsync`) and finished by that run under the
+  lock it holds, or — workerless — reported `stop deferred to the next run`; and `factory stop --item <plan>` while a run of the
+  plan holds its lock answers `stop NOT finished: it is a plan and a run of it is active …`, not Ok (exit 1), instead of the
+  ordinary item's "is running; its run stops it at once" (exit 0), which stays true only for a run that watches its control. After the stop, a story of the plan
   that reaches the ready state anyway (moved by hand) is refused at claim, once and with no board write: Paused
   `claim refused: blocked by its plan sc-N, which was stopped: …` (`PlanRelease.PlanStoppedRefusal`; `BlockedAsync` checks the plan
   item's state first). A Pause or Stop on one story of a plan works as on any item; a stopped story is then a failed story.

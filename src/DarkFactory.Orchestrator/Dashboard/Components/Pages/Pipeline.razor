@@ -173,6 +173,11 @@ else
                             {
                                 <span class="error plan-hold">@hold</span>
                             }
+                            @if (plan.FailedNotices > 0)
+                            {
+                                <span class="error plan-notice">hold comment not posted (attempt @plan.FailedNotices of @RunPipeline.MaxPlanNoticeAttempts;
+                                    @(plan.NoticeRetrying ? "tried again on the next poll" : "not tried again: this page and the ledger have it"))</span>
+                            }
                             @if (plan.LastHeld is { } lastHeld)
                             {
                                 <span class="muted plan-last-held">last hold recorded (@lastHeld.At.ToString("u")): @lastHeld.Detail</span>

@@ -39,9 +39,12 @@ public class PlanClassificationTests
         Assert.Equal(PlanRelease.AsCancelled, PlanRelease.FailureOf([Row(WorkState.Intake), Row(WorkState.Cancelled, "stopped by tester")])!.As);
         // Its pull request was merged by someone else: the review, or the merge queue, found it merged and escalated.
         Assert.Equal(PlanRelease.AsMergedOutside, PlanRelease.FailureOf(
-            Escalated("InvalidOperationException: https://github.com/acme/widgets/pull/9 is merged outside the factory."))!.As);
+            Escalated($"InvalidOperationException: https://github.com/acme/widgets/pull/9 {PlanRelease.MergedOutsideFactory}."))!.As);
         Assert.Equal(PlanRelease.AsMergedOutside, PlanRelease.FailureOf(
-            Escalated("GateBlockedException: https://github.com/acme/widgets/pull/9 was merged outside the gate."))!.As);
+            Escalated($"GateBlockedException: https://github.com/acme/widgets/pull/9 {PlanRelease.MergedOutsideGate}."))!.As);
+        // The wording is the pipeline's own (its throw sites use the same constants); anything else is an ordinary escalation.
+        Assert.Equal(("is merged outside the factory", "was merged outside the gate"), (PlanRelease.MergedOutsideFactory, PlanRelease.MergedOutsideGate));
+        Assert.Equal(PlanRelease.AsEscalated, PlanRelease.FailureOf(Escalated("https://github.com/acme/widgets/pull/9 is closed outside the factory."))!.As);
         // A checkpoint after the escalation (its comment) changes nothing.
         Assert.NotNull(PlanRelease.FailureOf([.. Escalated(), Row(WorkState.Escalated, "posted", RunPipeline.Steps.EscalationComment)]));
 
@@ -223,7 +226,8 @@ public class PlanFailurePipelineTests
         PlanAnswers.Story("c", "Third story", "b"));
 
     /// <summary>Works in tool calls until cancelled or, honouring a pause, until the call after the request; a resumed session finishes at once.</summary>
-    private sealed class ToolWorker(TaskCompletionSource? holdCancel = null) : IWorker
+    /// <param name="holdWork">When given, the worker makes no tool call (so sees no pause) until it completes.</param>
+    private sealed class ToolWorker(TaskCompletionSource? holdCancel = null, TaskCompletionSource? holdWork = null) : IWorker
     {
         private int _pause;
         public List<string?> Resumes { get; } = [];
@@ -242,6 +246,10 @@ public class PlanFailurePipelineTests
             Working.TrySetResult();
             try
             {
+                if (holdWork is not null)
+                {
+                    await holdWork.Task.WaitAsync(ct);
+                }
                 while (true)
                 {
                     if (Volatile.Read(ref _pause) == 1)
@@ -537,7 +545,8 @@ public class PlanFailurePipelineTests
             PlanAnswers.Story("c", "Third story"), PlanAnswers.Story("d", "Fourth story", "c"), PlanAnswers.Story("e", "Fifth story")));
         await h.Run();
         await h.Worked(ids[4], WorkState.Review);
-        await h.Ends(ids[0], WorkState.Escalated, "InvalidOperationException: https://github.com/michaeltrefry/dark-factory-sandbox/pull/7 is merged outside the factory.");
+        await h.Ends(ids[0], WorkState.Escalated,
+            $"InvalidOperationException: https://github.com/michaeltrefry/dark-factory-sandbox/pull/7 {PlanRelease.MergedOutsideFactory}.");
         // A person's Stop on one story of the plan works as on any item; the stopped story then holds its dependents.
         await h.Worked(ids[2], WorkState.Review);
         Assert.True((await h.Actions.StopAsync(ControlScope.Item($"sc-{ids[2]}"), "tester", CancellationToken.None)).Ok);
@@ -557,6 +566,27 @@ public class PlanFailurePipelineTests
         var plan = Assert.Single(await h.Dashboard(), r => r.ExternalId == Plan).Plan!;
         Assert.Equal($"held by sc-{ids[0]} (merged outside the factory)", plan.Stories[1].Waits);
         Assert.Equal(("Cancelled", "failed: cancelled"), (plan.Stories[2].Shown, plan.Stories[2].Waits));
+
+        // Stop on the plan: the story merged outside the factory has its change on the base branch, so it is left exactly as it is
+        // (board, pull request, ledger) and named apart — by its own run while the plan is being stopped, and by the plan's stop.
+        await h.Controls.SetAsync(ControlScope.Item(Plan), ControlState.Stopping, "tester", CancellationToken.None);
+        var before = h.State(ids[0]);
+        h.Board.Requests.Clear();
+        Assert.Contains(ids[0], await h.InFlight());
+        var own = await h.Run(ids[0]);
+        Assert.Equal((WorkState.Escalated, (string?)null), (own.State, own.Error));
+        Assert.Contains($"sc-{ids[0]}: its pull request was merged outside the factory; its plan {Plan} is being stopped and leaves it as it is", h.Log.ToString());
+        var stopped = await h.Actions.StopAsync(ControlScope.Item(Plan), "tester", CancellationToken.None);
+        Assert.True(stopped.Ok, stopped.Message);
+        Assert.Equal(WorkState.Cancelled, await h.ItemState(PlanId));
+        Assert.Empty(h.Writes(ids[0]));
+        Assert.Equal((before, WorkState.Escalated), (h.State(ids[0]), await h.ItemState(ids[0])));
+        Assert.DoesNotContain(await h.Rows(ids[0]), r => r.Step is RunPipeline.Steps.PrsDrafted or RunPipeline.Steps.StopReported);
+        Assert.DoesNotContain($"factory/sc-{ids[0]}", h.Prs.Drafted);
+        var said = h.Comments(PlanId)[^1];
+        Assert.Contains($"Stories stopped with it: sc-{ids[2]}, sc-{ids[4]}. Already merged (left as they are): none. "
+            + $"Merged outside the factory (left as they are: their change is on the base branch): sc-{ids[0]}. "
+            + $"Never started (left in the backlog; the factory will not release or start them): sc-{ids[1]}, sc-{ids[3]}.", said);
     }
 
     [Fact]
@@ -577,6 +607,9 @@ public class PlanFailurePipelineTests
         Assert.Equal([RunPipeline.Steps.PlanHeld, RunPipeline.Steps.PlanNotice], steps.Select(s => s.Step));
         Assert.StartsWith("failed: ", steps[1].Detail);
         Assert.Equal(StepOutcome.Failed, (await h.Rows()).Single(r => r.Step == RunPipeline.Steps.PlanNotice).Outcome);
+        // The dashboard's plan row says the comment is not posted, and that it is tried again.
+        var notPosted = Assert.Single(await h.Dashboard(), r => r.ExternalId == Plan).Plan!;
+        Assert.Equal((1, true), (notPosted.FailedNotices, notPosted.NoticeRetrying));
 
         // The next evaluation posts it, once; later ones do nothing.
         h.Board.Intercept = null;
@@ -587,6 +620,7 @@ public class PlanFailurePipelineTests
         Assert.Single(h.Comments(PlanId));
         Assert.Equal(["failed", RunPipeline.Posted], (await h.Steps(RunPipeline.Steps.PlanNotice)).Select(s => s.Detail!.Split(':')[0]));
         Assert.Single(await h.Steps(RunPipeline.Steps.PlanHeld));
+        Assert.Equal(0, Assert.Single(await h.Dashboard(), r => r.ExternalId == Plan).Plan!.FailedNotices); // posted since
 
         // A board that keeps refusing: tried a bounded number of times, then left to the ledger and the dashboard.
         var stuck = new Harness();
@@ -601,6 +635,8 @@ public class PlanFailurePipelineTests
         Assert.Equal(RunPipeline.MaxPlanNoticeAttempts, (await stuck.Steps(RunPipeline.Steps.PlanNotice)).Count);
         Assert.Single(await stuck.Steps(RunPipeline.Steps.PlanStuck));
         Assert.Contains("not tried again", stuck.Log.ToString());
+        var left = Assert.Single(await stuck.Dashboard(), r => r.ExternalId == Plan).Plan!;
+        Assert.Equal((RunPipeline.MaxPlanNoticeAttempts, false), (left.FailedNotices, left.NoticeRetrying));
     }
 
     [Fact]
@@ -714,10 +750,19 @@ public class PlanFailurePipelineTests
         Assert.Contains($"factory/sc-{c}", h.Prs.Drafted);
         Assert.Equal(FakeShortcutBoard.Backlog, h.State(c));
         Assert.Contains($"sc-{c} was stopped by tester (with its plan {Plan})", Assert.Single(h.Comments(c)));
-        // D, released and never started: stopped the same way, on a ledger item of its own.
-        Assert.Equal([WorkState.Intake, WorkState.Cancelled], (await h.Rows(d)).Where(r => r.Step is null).Select(r => r.State));
+        // D, released and never claimed: the factory did no work on it, so it is only moved back to the backlog — with a comment
+        // that says its plan was stopped and does not say the factory worked on it — and recorded Cancelled on an item of its own.
+        var dRows = await h.Rows(d);
+        Assert.Equal([WorkState.Intake, WorkState.Cancelled], dRows.Where(r => r.Step is null).Select(r => r.State));
+        Assert.Equal((PlanRelease.ReturnedUnstarted(Plan), $"stopped by tester (with its plan {Plan})"), (dRows[0].Detail, dRows[^1].Detail));
+        Assert.DoesNotContain(dRows, r => r.Step is RunPipeline.Steps.PrsDrafted or RunPipeline.Steps.StopReported);
         Assert.Equal(FakeShortcutBoard.Backlog, h.State(d));
-        Assert.Single(h.Comments(d));
+        var dComment = Assert.Single(h.Comments(d));
+        Assert.Equal($"[author: dark-factory] sc-{d} was released by its plan {Plan}, which tester stopped before the factory started this story: "
+            + "it is back in the backlog and the factory will not start it. The factory did no work on it; nothing was changed, merged or deleted.", dComment);
+        Assert.DoesNotContain("cancelled its work", dComment);
+        Assert.DoesNotContain("claim", dComment);
+        Assert.DoesNotContain($"factory/sc-{d}", h.Prs.Drafted);
         // A, merged, is untouched; B, never released, is left in the Backlog with nothing written anywhere.
         Assert.Equal(WorkState.Watch, await h.ItemState(a));
         Assert.Empty(h.Writes(a));
@@ -730,11 +775,12 @@ public class PlanFailurePipelineTests
         Assert.Equal(FakeShortcutBoard.Backlog, h.State(PlanId));
         var comment = Assert.Single(h.Comments(PlanId));
         Assert.StartsWith($"[author: dark-factory] {Plan} was stopped by tester: the factory cancelled the plan (was Planned)", comment);
-        Assert.Contains($"Stories stopped with it: sc-{c}, sc-{d}. Already merged (left as they are): sc-{a}. "
+        Assert.Contains($"Stories stopped with it: sc-{c}. Released but never started (moved back to the backlog; the factory did no work on them): sc-{d}. "
+            + $"Already merged (left as they are): sc-{a}. "
             + $"Never started (left in the backlog; the factory will not release or start them): sc-{b}.", comment);
         Assert.Null(await h.Controls.GetAsync(ControlScope.Item(Plan), CancellationToken.None));
         Assert.Empty(await h.InFlight());
-        Assert.Contains($"Stories stopped with it: sc-{c}, sc-{d}", stopped.Message);
+        Assert.Contains($"Stories stopped with it: sc-{c}. Released but never started", stopped.Message);
 
         // Stopping it again changes nothing.
         h.Board.Requests.Clear();
@@ -752,6 +798,200 @@ public class PlanFailurePipelineTests
         Assert.Equal(parked, (await h.Rows(b)).Count);
         Assert.Empty(worker.Calls);
         Assert.DoesNotContain(h.Board.Requests, r => r.Method != HttpMethod.Get);
+    }
+
+    [Fact]
+    public async Task Stop_on_a_plan_leaves_a_released_story_that_someone_else_took_or_finished_exactly_as_it_is()
+    {
+        var h = new Harness();
+        var ids = await h.Planned(PlanAnswers.Answer(PlanAnswers.Story("a", "First story"), PlanAnswers.Story("b", "Second story"),
+            PlanAnswers.Story("c", "Third story"), PlanAnswers.Story("d", "Fourth story"), PlanAnswers.Story("e", "Fifth story")));
+        var (a, b, c, d, e) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+        await h.Run(); // all five released; the factory claimed none of them
+        // Since the release: a person took A (In Progress, their owner), finished B by hand (Done), assigned C to themselves while it
+        // is still ready, and archived D. E is as the release left it.
+        (h.Board.Story(a)["workflow_state_id"], h.Board.Story(a)["owner_ids"]) = (FakeShortcutBoard.InProgress, new JsonArray("someone-else"));
+        h.Board.Story(b)["workflow_state_id"] = FakeShortcutBoard.Done;
+        h.Board.Story(c)["owner_ids"] = new JsonArray("someone-else");
+        h.Board.Story(d)["archived"] = true;
+        var before = ids.Select(i => h.Board.Story(i).ToJsonString()).ToList();
+        h.Board.Requests.Clear();
+
+        var stopped = await h.Actions.StopAsync(ControlScope.Item(Plan), "tester", CancellationToken.None);
+
+        // Theirs: no write of any kind (no move back to the backlog, no comment saying the factory worked on it), no ledger item.
+        Assert.True(stopped.Ok, stopped.Message);
+        foreach (var theirs in new[] { a, b, c, d })
+        {
+            Assert.Empty(h.Writes(theirs));
+            Assert.Empty(await h.Rows(theirs));
+            Assert.Null(await h.ItemState(theirs));
+            Assert.Equal(before[Array.IndexOf(ids, theirs)], h.Board.Story(theirs).ToJsonString());
+        }
+        Assert.DoesNotContain(h.Board.Requests, r => r.Method != HttpMethod.Get && !r.PathAndQuery.StartsWith($"/api/v3/stories/{e}", StringComparison.Ordinal)
+            && !r.PathAndQuery.StartsWith($"/api/v3/stories/{PlanId}", StringComparison.Ordinal));
+        // The plan is still Cancelled, and its comment names them as left alone; E, untouched since its release, went back to the backlog.
+        Assert.Equal(WorkState.Cancelled, await h.ItemState(PlanId));
+        Assert.Null(await h.Controls.GetAsync(ControlScope.Item(Plan), CancellationToken.None));
+        var comment = Assert.Single(h.Comments(PlanId));
+        Assert.Contains($"Stories stopped with it: none. Released but never started (moved back to the backlog; the factory did no work on them): sc-{e}. "
+            + "Already merged (left as they are): none. "
+            + $"Taken, finished or archived by someone else since their release (left as they are): sc-{a}, sc-{b}, sc-{c}, sc-{d}. "
+            + "Never started (left in the backlog; the factory will not release or start them): none.", comment);
+        Assert.Equal((FakeShortcutBoard.Backlog, WorkState.Cancelled), (h.State(e), await h.ItemState(e)));
+        Assert.Contains("The factory did no work on it", Assert.Single(h.Comments(e)));
+
+        // None of them is started afterwards: the claim of a story of a stopped plan is refused.
+        var worker = new FakeWorker(Reports(Ok));
+        Assert.Contains("which was stopped", (await h.Run(c, worker)).Error);
+        Assert.Empty(worker.Calls);
+    }
+
+    [Fact]
+    public async Task Stop_on_a_plan_leaves_a_released_story_that_was_moved_back_to_the_backlog_there_with_nothing_written()
+    {
+        var h = new Harness();
+        var ids = await h.Planned(PlanAnswers.Answer(PlanAnswers.Story("a", "First story"), PlanAnswers.Story("b", "Second story", "a")));
+        await h.Run(); // A released
+        Assert.Equal(FakeShortcutBoard.ToDo, h.State(ids[0]));
+        h.Board.Story(ids[0])["workflow_state_id"] = FakeShortcutBoard.Backlog; // a person moved it back
+        h.Board.Requests.Clear();
+
+        var stopped = await h.Actions.StopAsync(ControlScope.Item(Plan), "tester", CancellationToken.None);
+
+        Assert.True(stopped.Ok, stopped.Message);
+        Assert.Equal(WorkState.Cancelled, await h.ItemState(PlanId));
+        Assert.Contains($"Stories stopped with it: none. Already merged (left as they are): none. "
+            + $"Never started (left in the backlog; the factory will not release or start them): sc-{ids[0]}, sc-{ids[1]}.", Assert.Single(h.Comments(PlanId)));
+        foreach (var story in ids)
+        {
+            Assert.Empty(h.Writes(story));
+            Assert.Empty(await h.Rows(story));
+            Assert.Equal(FakeShortcutBoard.Backlog, h.State(story));
+        }
+    }
+
+    [Fact]
+    public async Task A_story_this_stop_returned_unstarted_whose_record_was_cut_short_is_only_recorded_cancelled_by_the_next_attempt()
+    {
+        var h = new Harness();
+        var ids = await h.Planned(PlanAnswers.Answer(PlanAnswers.Story("a", "Only story")));
+        await h.Run();
+        // As a stop that died after moving the story back and creating its item left it: in the backlog, its item at Intake.
+        h.Board.Story(ids[0])["workflow_state_id"] = FakeShortcutBoard.Backlog;
+        var plan = (await h.Ledger.FindAsync(RunPipeline.Source, Plan, CancellationToken.None))!;
+        var item = await h.Ledger.GetOrCreateAsync(RunPipeline.Source, $"sc-{ids[0]}", "Only story", Sandbox.FullName, PlanRelease.ReturnedUnstarted(Plan),
+            CancellationToken.None, 42);
+        await h.Ledger.LinkPlanAsync(item, plan.Id, CancellationToken.None);
+        h.Board.Requests.Clear();
+
+        Assert.True((await h.Actions.StopAsync(ControlScope.Item(Plan), "tester", CancellationToken.None)).Ok);
+
+        // No second move and no comment claiming the factory worked on it: only the record.
+        Assert.Empty(h.Writes(ids[0]));
+        Assert.Equal([WorkState.Intake, WorkState.Cancelled], (await h.Rows(ids[0])).Where(r => r.Step is null).Select(r => r.State));
+        Assert.Contains($"Released but never started (moved back to the backlog; the factory did no work on them): sc-{ids[0]}.", Assert.Single(h.Comments(PlanId)));
+        Assert.True(PlanRelease.IsReturnedUnstarted(await h.Rows(ids[0])));
+        Assert.False(PlanRelease.IsReturnedUnstarted(await h.Rows())); // an ordinary item's rows are not
+    }
+
+    [Fact]
+    public async Task A_story_paused_with_its_plan_while_the_usage_pause_also_holds_is_recorded_user_paused_so_only_continue_resumes_it()
+    {
+        var h = new Harness();
+        var ids = await h.Planned(Fork);
+        await h.Run();
+        var work = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var worker = new ToolWorker(holdWork: work);
+        var run = h.Run(ids[0], worker);
+        await worker.Working.Task.WaitAsync(TimeSpan.FromSeconds(60));
+        // Both hold before the worker reaches its next tool call: the usage pause, and a person's Pause on the story's plan.
+        await h.Controls.PauseForUsageAsync(DateTimeOffset.UtcNow.AddHours(1), UsagePause.UsageExhausted, CancellationToken.None);
+        await h.Controls.SetAsync(ControlScope.Item(Plan), ControlState.Paused, "tester", CancellationToken.None);
+        work.SetResult();
+
+        var outcome = await run.WaitAsync(TimeSpan.FromSeconds(60));
+
+        // The person's Pause outranks the usage pause, as on the factory, an epic or the item itself: the reset does not resume it.
+        Assert.Equal(WorkState.Paused, outcome.State);
+        var rows = await h.Rows(ids[0]);
+        Assert.Equal((WorkState.Paused, RunPipeline.UserPaused), rows.Where(r => r.Step is null).Select(r => (r.State, r.Detail)).Last());
+        Assert.DoesNotContain(rows, r => r.Step == RunPipeline.Steps.UsagePause);
+    }
+
+    [Fact]
+    public async Task Stop_on_a_plan_whose_own_run_is_active_is_unfinished_and_says_so_with_a_non_zero_exit()
+    {
+        var h = new Harness();
+        var ids = await h.Planned(Fork);
+        await h.Run();
+        Assert.Null((await h.Run(ids[2])).Error); // C at Review
+        var plan = (await h.Ledger.FindAsync(RunPipeline.Source, Plan, CancellationToken.None))!;
+        var story = (await h.Ledger.FindAsync(RunPipeline.Source, $"sc-{ids[2]}", CancellationToken.None))!;
+        ControlResult result;
+        await using (await h.Locks.TryAcquireAsync(plan.Id, CancellationToken.None)) // the plan's evaluation run holds its lock
+        {
+            h.Board.Requests.Clear();
+            result = await h.Actions.StopAsync(ControlScope.Item(Plan), "tester", CancellationToken.None);
+
+            // That run watches no control while it evaluates: nothing is stopped yet, and the answer does not say it is.
+            Assert.Equal((false, 1), (result.Ok, result.ExitCode));
+            Assert.Contains($"{Plan}: stop NOT finished: it is a plan and a run of it is active. It stays Stopping", result.Message);
+            Assert.DoesNotContain("stops it at once", result.Message);
+            Assert.Equal((WorkState.Planned, WorkState.Review), (await h.ItemState(PlanId), await h.ItemState(ids[2])));
+            Assert.Equal(ControlState.Stopping, (await h.Controls.GetAsync(ControlScope.Item(Plan), CancellationToken.None))!.State);
+            Assert.DoesNotContain(h.Board.Requests, r => r.Method != HttpMethod.Get);
+        }
+        // An item that is no plan and whose run is active is stopped by that run, which watches its control: still exit 0.
+        await h.Controls.ClearAsync(ControlScope.Item(Plan), CancellationToken.None);
+        await using (await h.Locks.TryAcquireAsync(story.Id, CancellationToken.None))
+        {
+            var running = await h.Actions.StopAsync(ControlScope.Item($"sc-{ids[2]}"), "tester", CancellationToken.None);
+            Assert.Equal((true, 0, $"sc-{ids[2]} is running; its run stops it at once."), (running.Ok, running.ExitCode, running.Message));
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_stop_that_lands_while_a_plan_is_evaluated_is_finished_by_that_run_or_deferred_by_one_without_the_worker_lock(bool workerless)
+    {
+        var h = new Harness();
+        var ids = await h.Planned(Fork);
+        await h.Run(); // A and C released
+        Assert.Null((await h.Run(ids[2])).Error); // C at Review
+        h.Board.Requests.Clear();
+        // The Stop lands during the evaluation's first read of the board, after the run decided to evaluate.
+        var landed = 0;
+        h.Board.Intercept = _ =>
+        {
+            if (Interlocked.Exchange(ref landed, 1) == 0)
+            {
+                h.Controls.SetAsync(ControlScope.Item(Plan), ControlState.Stopping, "tester", CancellationToken.None).GetAwaiter().GetResult();
+            }
+            return null;
+        };
+
+        var outcome = await h.Run(workerless: workerless);
+
+        Assert.Equal(1, landed);
+        h.Board.Intercept = null;
+        if (workerless)
+        {
+            // No worker run lock: said, and left to the next run, which the listing puts first.
+            Assert.Equal(WorkState.Planned, outcome.State);
+            Assert.Contains($"{Plan}: stop deferred to the next run", outcome.Error);
+            Assert.Equal((WorkState.Planned, WorkState.Review), (await h.ItemState(PlanId), await h.ItemState(ids[2])));
+            Assert.Equal(PlanId, (await h.InFlight())[0]);
+            outcome = await h.Run();
+        }
+        // The plan item is not left Stopping with nobody acting on it: its stories are stopped and it is Cancelled.
+        Assert.Equal((WorkState.Cancelled, (string?)null), (outcome.State, outcome.Error));
+        Assert.Equal(WorkState.Cancelled, await h.ItemState(ids[2]));
+        Assert.Contains($"factory/sc-{ids[2]}", h.Prs.Drafted);
+        Assert.Contains($"Stories stopped with it: sc-{ids[2]}.", Assert.Single(h.Comments(PlanId)));
+        Assert.Null(await h.Controls.GetAsync(ControlScope.Item(Plan), CancellationToken.None));
+        Assert.Empty(await h.InFlight());
     }
 
     [Fact]
@@ -790,7 +1030,8 @@ public class PlanFailurePipelineTests
         Assert.Equal([PlanId], await h.InFlight());
         var finished = await h.Run();
         Assert.Equal((WorkState.Cancelled, (string?)null), (finished.State, finished.Error));
-        Assert.Contains($"Stories stopped with it: sc-{a}, sc-{ids[2]}.", Assert.Single(h.Comments(PlanId)));
+        Assert.Contains($"Stories stopped with it: sc-{a}. Released but never started (moved back to the backlog; the factory did no work on them): sc-{ids[2]}.",
+            Assert.Single(h.Comments(PlanId)));
         Assert.Contains($"Never started (left in the backlog; the factory will not release or start them): sc-{b}.", h.Comments(PlanId)[0]);
         Assert.Null(await h.Controls.GetAsync(ControlScope.Item(Plan), CancellationToken.None));
         Assert.Empty(await h.InFlight());
@@ -832,8 +1073,9 @@ public class PlanFailurePipelineTests
         Assert.Single(h.Prs.Drafted, head => head == $"factory/sc-{a}");
         Assert.Single(await h.Rows(a), r => r.Step == RunPipeline.Steps.PrsDrafted);
         Assert.Empty(h.Writes(b));
-        Assert.Single(await h.Rows(b), r => r.Step == RunPipeline.Steps.StopReported);
-        Assert.Single(h.Comments(PlanId));
+        Assert.Equal([WorkState.Intake, WorkState.Cancelled], (await h.Rows(b)).Where(r => r.Step is null).Select(r => r.State));
+        Assert.Contains($"Stories stopped with it: sc-{a}. Released but never started (moved back to the backlog; the factory did no work on them): sc-{b}.",
+            Assert.Single(h.Comments(PlanId)));
         Assert.Empty(await h.InFlight());
 
         // The plan item's own board write failing leaves it Stopping too, its stories already stopped; a retry tells the board once.
@@ -1012,5 +1254,81 @@ public class PlanControlsPostgresTests
         Assert.Equal(["First story", "Second story"], view.Stories.Select(s => s.Title));
         Assert.True(view.Stuck);
         Assert.Equal((planId, ControlState.Stopping), (rows.Single(r => r.ExternalId == "sc-9001").PlanItemId, rows.Single(r => r.ExternalId == "sc-9001").Control));
+    }
+
+    /// <summary>Counts the SQL commands a context sends, and fails those <see cref="Fail"/> picks.</summary>
+    private sealed class Commands : Microsoft.EntityFrameworkCore.Diagnostics.DbCommandInterceptor
+    {
+        public List<string> Sent { get; } = [];
+        public Func<string, bool>? Fail { get; set; }
+
+        public override ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<System.Data.Common.DbDataReader>> ReaderExecutingAsync(
+            System.Data.Common.DbCommand command, Microsoft.EntityFrameworkCore.Diagnostics.CommandEventData eventData,
+            Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<System.Data.Common.DbDataReader> result, CancellationToken cancellationToken = default)
+        {
+            lock (Sent)
+            {
+                Sent.Add(command.CommandText);
+            }
+            return Fail?.Invoke(command.CommandText) == true
+                ? throw new InvalidOperationException("the ledger could not be read")
+                : base.ReaderExecutingAsync(command, eventData, result, cancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task The_control_read_is_one_query_two_while_a_plan_is_stopping_and_a_plan_lookup_that_fails_is_never_read_as_no_plan()
+    {
+        await using var temp = await TempPostgresDatabase.CreateAsync("df_planctl_q");
+        await LedgerMigrations.MigrateAsync(temp.ConnectionString, CancellationToken.None);
+        var seed = new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(temp.ConnectionString));
+        await using (var db = seed.CreateDbContext())
+        {
+            var ledger = new WorkLedger(db, TimeProvider.System);
+            var plan = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-500", "Add CSV export", Sandbox.FullName, null, CancellationToken.None);
+            foreach (var (id, merged) in new[] { ("sc-9001", false), ("sc-9002", true) })
+            {
+                var story = await ledger.GetOrCreateAsync(RunPipeline.Source, id, id, Sandbox.FullName, null, CancellationToken.None);
+                await ledger.LinkPlanAsync(story, plan.Id, CancellationToken.None);
+                foreach (var state in merged ? new[] { WorkState.Implement, WorkState.Review, WorkState.CI, WorkState.MergeGate, WorkState.Merge } : [WorkState.Implement])
+                {
+                    await ledger.RecordAsync(story, state, null, null, CancellationToken.None);
+                }
+            }
+            await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", "No plan's", Sandbox.FullName, null, CancellationToken.None);
+        }
+        var commands = new Commands();
+        var controls = new LedgerControls(new LedgerDbContextFactory(new DbContextOptionsBuilder<LedgerDbContext>(LedgerDbContext.PostgresOptions(temp.ConnectionString))
+            .AddInterceptors(commands).Options), TimeProvider.System);
+        async Task<(ControlState State, int Queries)> Read(string id)
+        {
+            commands.Sent.Clear();
+            var state = await controls.EffectiveAsync(id, 42, CancellationToken.None);
+            return (state, commands.Sent.Count);
+        }
+
+        // Read every second for every running worker: one query, for an item of no plan and for a plan's story alike.
+        Assert.Equal((ControlState.Running, 1), await Read("sc-77"));
+        Assert.Equal((ControlState.Running, 1), await Read("sc-9001"));
+        commands.Sent.Clear();
+        await controls.SetAsync(ControlScope.Item("sc-500"), ControlState.Paused, "tester", CancellationToken.None);
+        Assert.Equal((ControlState.Paused, 1), await Read("sc-9001"));
+        Assert.Equal((ControlState.Paused, 1), await Read("sc-9002"));
+        Assert.Equal((ControlState.Running, 1), await Read("sc-77"));
+        // The plan lookup uses the ledger's (Source, ExternalId) index: both columns are in its filter.
+        Assert.Contains("\"Source\" = ", commands.Sent[0]);
+        Assert.Contains("\"ExternalId\" = ", commands.Sent[0]);
+        // Only while the plan is being stopped is the story's Merge row asked for: one more query.
+        await controls.SetAsync(ControlScope.Item("sc-500"), ControlState.Stopping, "tester", CancellationToken.None);
+        Assert.Equal((ControlState.Stopping, 2), await Read("sc-9001"));
+        Assert.Equal((ControlState.Running, 2), await Read("sc-9002")); // merged: spared
+        Assert.Equal((ControlState.Running, 1), await Read("sc-77"));
+
+        // Fail closed (E2): a control read whose plan lookup fails throws — the caller counts it as unreadable, never as "no plan,
+        // so running" while the plan is paused or being stopped.
+        commands.Fail = sql => sql.Contains("work_items", StringComparison.Ordinal);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => controls.EffectiveAsync("sc-9001", 42, CancellationToken.None));
+        commands.Fail = null;
+        Assert.Equal(ControlState.Stopping, await controls.EffectiveAsync("sc-9001", 42, CancellationToken.None));
     }
 }
