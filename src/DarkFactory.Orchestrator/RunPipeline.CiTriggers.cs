@@ -18,8 +18,11 @@ public sealed partial class RunPipeline
     /// trigger is, say, <c>pull_request: branches: ['factory/**']</c> runs for every story and then never for the pull request that
     /// delivers the plan, which would time out after every story was built.</item>
     /// </list>
-    /// It takes the repository as a parameter and is called once today, for the plan item's repository (a plan with stories in
-    /// several repositories will call it for each). What follows from the two answers, the stories' first:
+    /// It takes the repository as a parameter: <see cref="PlanAsync"/> calls it for every repository the plan item names
+    /// (<see cref="PlanRepositories"/>, the planner's set — one call for a plan of one repository), in that order, before the planner
+    /// session, so the first repository that blocks stops the plan with nothing spent in any of them. Every reason starts with the
+    /// repository it is about, and a repository's row is compared with that repository's last row only. What follows from the two
+    /// answers, the stories' first:
     /// <list type="bullet">
     /// <item>certain that no workflow can run for one of them → a <see cref="Steps.CiTriggers"/> row (<c>blocked: …</c>) and the plan
     /// item escalates with the repository, the fix and the workflow files read; no planner session, story or changeset branch comes
@@ -30,7 +33,8 @@ public sealed partial class RunPipeline
     /// weakened either way;</item>
     /// <item>a workflow runs for both → log lines only.</item>
     /// </list>
-    /// Not checked once the repository's changeset branch is on origin (the plan's stories are already running there), nor in a
+    /// Not checked once the repository's changeset branch is on origin (the plan's stories are already running there; per
+    /// repository, so a run resumed between two repositories' branches still checks the one without), nor in a
     /// pipeline with no gate stage (it has no GitHub read client and merges nothing).
     /// </summary>
     private async Task EnsureCiTriggersAsync(Run run, RepoRef repo, CancellationToken ct)
@@ -81,7 +85,8 @@ public sealed partial class RunPipeline
         }
         var (check, wasted) = found[0];
         var detail = check.ToDetail();
-        if (history.LastOrDefault(e => e.Step == Steps.CiTriggers)?.Detail != detail)
+        // This repository's last row: another repository's warning in between is not a change of this one's.
+        if (history.LastOrDefault(e => e.Step == Steps.CiTriggers && CiTriggerCheck.IsAbout(e.Detail, repo.FullName))?.Detail != detail)
         {
             await ledger.CheckpointAsync(item, Steps.CiTriggers, null, detail, ct);
         }

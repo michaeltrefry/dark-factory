@@ -1,6 +1,7 @@
 using DarkFactory.Orchestrator.WorkSources;
 using System.Globalization;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
@@ -150,7 +151,12 @@ public sealed record FreezeStatus(bool Frozen, string? Trigger, string? Detail)
 /// What the merge gate recorded about a merge before making it (<see cref="RunPipeline.Steps.MergeFiles"/>): the PR's base branch
 /// and the files its diff changes, which the freeze's hot-file and main-red triggers read.
 /// </summary>
-public sealed record MergeFiles(string Base, IReadOnlyList<string> Files)
+/// <param name="Repo">
+/// The repository merged into, when it may not be the item's own later (sc-25873): a plan item of several repositories merges one
+/// changeset per repository, and its <see cref="WorkItem.Repo"/> is the one it is working in now. Null for every other merge: the item's.
+/// </param>
+public sealed record MergeFiles(string Base, IReadOnlyList<string> Files,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Repo = null)
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
@@ -414,8 +420,11 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
             .Where(e => e.Step == RunPipeline.Steps.MergeFiles && ids.Contains(e.WorkItemId))
             .OrderBy(e => e.Id)
             .ToListAsync(ct);
-        return merges.Select(m => new Merge(m, names.TryGetValue(m.WorkItemId, out var n) ? n.Repo : "",
-                MergeFiles.FromDetail(recorded.LastOrDefault(r => r.WorkItemId == m.WorkItemId && r.Id < m.Id)?.Detail)))
+        return merges.Select(m =>
+            {
+                var files = MergeFiles.FromDetail(recorded.LastOrDefault(r => r.WorkItemId == m.WorkItemId && r.Id < m.Id)?.Detail);
+                return new Merge(m, files?.Repo ?? (names.TryGetValue(m.WorkItemId, out var n) ? n.Repo : ""), files);
+            })
             .ToList();
     }
 

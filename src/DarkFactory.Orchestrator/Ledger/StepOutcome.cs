@@ -124,7 +124,8 @@ public static class StepOutcomes
             detail?.StartsWith("failed", StringComparison.Ordinal) == true ? StepOutcome.Failed : StepOutcome.Passed,
         Issues.IssueSteps.ApprovalIgnored or RunPipeline.Steps.PlanRejected => StepOutcome.GateRejected,
         RunPipeline.Steps.CiTriggers => CiTriggerCheck.IsBlocked(detail) ? StepOutcome.GateRejected : StepOutcome.Failed,
-        RunPipeline.Steps.UsagePause or RunPipeline.Steps.Parked or RunPipeline.Steps.PlanHeld or RunPipeline.Steps.PlanStuck => StepOutcome.Deferred,
+        RunPipeline.Steps.UsagePause or RunPipeline.Steps.Parked or RunPipeline.Steps.PlanHeld or RunPipeline.Steps.PlanStuck
+            or RunPipeline.Steps.PlanDelivery => StepOutcome.Deferred,
         _ => StepOutcome.Passed,
     };
 }

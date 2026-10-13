@@ -47,6 +47,13 @@ public sealed record CiTriggerCheck(CiTriggerOutcome Outcome, string Reason)
 
     /// <summary>Whether a <c>ci-triggers</c> Detail records a plan stopped (<see cref="CiTriggerOutcome.Never"/>), not a warning.</summary>
     public static bool IsBlocked(string? detail) => detail?.StartsWith(BlockedPrefix, StringComparison.Ordinal) == true;
+
+    /// <summary>
+    /// Whether a <c>ci-triggers</c> Detail is about <paramref name="repo"/> (<c>owner/name</c>): its reason starts with that
+    /// repository, as every recorded one does (a plan of several repositories has rows for each).
+    /// </summary>
+    public static bool IsAbout(string? detail, string repo) =>
+        detail is not null && new[] { BlockedPrefix, WarningPrefix }.Any(p => detail.StartsWith($"{p}{repo}: ", StringComparison.Ordinal));
 }
 
 /// <summary>

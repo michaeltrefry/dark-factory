@@ -20,7 +20,9 @@ public sealed class StopPendingException(string message) : Exception(message);
 /// poll honours first. Nothing is merged, closed or deleted: the branch and PR stay.
 /// A plan item (sc-25876: its ledger records the stories of its plan) is stopped with its unfinished stories, each stopped the same
 /// way on its own rows first (<see cref="StopStoriesAsync"/>); the plan item is cancelled, and its control cleared, only once
-/// every one of them is.
+/// every one of them is. A plan of several repositories (sc-25873) has a changeset in each: the open pull request of every one is
+/// drafted, and its record (<c>plan-delivery</c>) and comment say which repositories' changesets are on their default branch and
+/// which are not — those merged stay merged.
 /// </summary>
 public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks locks, IPullRequests pullRequests, IControls controls, TextWriter log)
 {
@@ -159,6 +161,7 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
         var released = history.Where(e => e.Step == RunPipeline.Steps.PlanReleased)
             .Select(e => PlanRelease.StoriesOf(e.Detail).FirstOrDefault() ?? "").ToHashSet(StringComparer.Ordinal);
         var titles = PlanRelease.RecordedTitles(history.LastOrDefault(e => e.Step == RunPipeline.Steps.Plan)?.Detail, stories);
+        var repos = PlanRelease.RecordedRepos(history.LastOrDefault(e => e.Step == RunPipeline.Steps.Plan)?.Detail, stories, RepoRef.Parse(plan.Repo));
         var known = await ledger.ItemsByIdAsync(source.Naming.Source, stories, ct);
         foreach (var story in stories)
         {
@@ -188,7 +191,7 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
                     {
                         // The board first, then the record: a stop that dies between the two finds the story in the backlog again.
                         var returned = await ledger.GetOrCreateAsync(source.Naming.Source, story, titles?.GetValueOrDefault(story) ?? $"Story of plan {plan.ExternalId}",
-                            plan.Repo, PlanRelease.ReturnedUnstarted(plan.ExternalId), ct, plan.EpicId);
+                            repos?.RepoOf(story) ?? plan.Repo, PlanRelease.ReturnedUnstarted(plan.ExternalId), ct, plan.EpicId);
                         await using var held = await locks.TryAcquireAsync(returned.Id, ct);
                         await ledger.LinkPlanAsync(returned, plan.Id, ct);
                         result.Of(await StopStoryAsync(returned, storyId, StoppedWith(by, plan), await ledger.HistoryAsync(returned, ct), ct)).Add(story);
@@ -272,10 +275,17 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
         // merged): there is no work, claim or branch of it, and its comment does not say there was.
         var unclaimed = plan is null && item.PlanItemId is not null && !history.Any(e => e.Step == RunPipeline.Steps.Claimed);
 
+        // A plan of several repositories (sc-25873) has a changeset branch in each: the open pull request of every one is drafted.
+        var changesets = Plans.Changeset.All(history);
+        var several = changesets.Count > 1 ? Plans.Changeset.States(history, RepoRef.Parse(item.Repo), item.State) : null;
         var drafted = steps.LastOrDefault(e => e.Step == RunPipeline.Steps.PrsDrafted)?.Detail;
         if (drafted is null)
         {
-            var prs = await pullRequests.ConvertOpenToDraftAsync(RepoRef.Parse(item.Repo), branch, ct);
+            var prs = new List<string>();
+            foreach (var (repo, head) in several is null ? [(RepoRef.Parse(item.Repo), branch)] : changesets.Select(c => (RepoRef.Parse(c.Repo), c.Branch)))
+            {
+                prs.AddRange(await pullRequests.ConvertOpenToDraftAsync(repo, head, ct));
+            }
             drafted = prs.Count == 0 ? "none" : string.Join(' ', prs);
             await ledger.CheckpointAsync(item, RunPipeline.Steps.PrsDrafted, session, drafted, ct);
         }
@@ -285,10 +295,18 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
             var what = plan is null
                 ? $"the factory cancelled its work on it (was {item.State}) and released its claim."
                 : $"the factory cancelled the plan (was {item.State}) and released its claim. {Stories(plan)}";
+            // Which repositories have the change and which do not: on the record before the board is told (E4).
+            if (several is not null && !steps.Any(e => e.Step == RunPipeline.Steps.PlanDelivery))
+            {
+                await ledger.CheckpointAsync(item, RunPipeline.Steps.PlanDelivery, session, Plans.Changeset.DeliveryOf(several), ct);
+            }
+            var kept = several is null ? $"Branch {branch} is kept; nothing was merged or deleted."
+                : $"Branch {branch} is kept in each of {string.Join(", ", changesets.Select(c => c.Repo))}; the stop merged and deleted nothing. "
+                    + Plans.Changeset.DeliveryNote(id, several, stopped: true);
             await source.ReportStateAsync(storyId, BoardState.Stopped, unclaimed
                 ? PlanRelease.NeverClaimedComment(id, by)
                 : $"{WorkSourceComments.Author} {id} was stopped by {by}: {what} "
-                    + $"{prs} Branch {branch} is kept; nothing was merged or deleted.", ct);
+                    + $"{prs} {kept}", ct);
             await ledger.CheckpointAsync(item, RunPipeline.Steps.StopReported, session, by, ct);
         }
         await ledger.RecordAsync(item, WorkState.Cancelled, session, $"stopped by {by}", ct);

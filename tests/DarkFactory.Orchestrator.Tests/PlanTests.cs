@@ -890,11 +890,16 @@ public class PlanPipelineTests
     private static readonly WorkStory TwoRepoStory = PlanStory with { Description = "Share the mesh format.\n\nRepo: acme/widgets\nRepo: acme/gears" };
 
     [Fact]
-    public async Task A_plan_naming_several_configured_repositories_seats_the_planner_in_all_of_them_and_its_stories_stay_in_the_first()
+    public async Task A_plan_naming_several_configured_repositories_seats_the_planner_in_all_of_them_and_each_story_is_pinned_to_the_one_it_names()
     {
         var h = new Harness { Configured = [Sandbox, Gears, new RepoRef("Acme", "Widgets")] };
         var source = new FakeWorkSource(TwoRepoStory) { PlansItems = true };
-        var planner = Planner(Reports(Planned));
+        // sc-25873: in a plan of several repositories every story names its own.
+        var planner = Planner(Reports(Planned with
+        {
+            ResultText = TwoRepoAnswers.Answer(["acme/widgets", "acme/gears"], "gears reads the format widgets writes",
+                TwoRepoAnswers.In("acme/widgets", PlanAnswers.Story("a", "First story")), TwoRepoAnswers.In("acme/gears", PlanAnswers.Story("b", "Second story", "a"))),
+        }));
 
         var outcome = await h.Run(source, planner);
 
@@ -908,8 +913,23 @@ public class PlanPipelineTests
         Assert.Contains("a required \"repo\" argument naming it: one of acme/widgets, acme/gears", prompt);
         // The rest of the pipeline still uses the primary repository alone.
         Assert.Equal("acme/widgets", (await h.Db.WorkItems.AsNoTracking().SingleAsync()).Repo);
-        Assert.NotEmpty(source.Children);
-        Assert.All(source.Children, c => Assert.Equal(Widgets, RepoResolver.Resolve(c.Child.Description, Sandbox)));
+        Assert.Equal([Widgets, Gears], source.Children.Select(c => RepoResolver.Resolve(c.Child.Description, Sandbox)));
+        Assert.Contains("exactly one of these repositories (acme/widgets, acme/gears)", prompt);
+    }
+
+    [Fact]
+    public async Task A_plan_of_several_repositories_whose_story_names_none_is_rejected_and_creates_nothing()
+    {
+        var h = new Harness { Configured = [Sandbox, Gears, Widgets] };
+        var source = new FakeWorkSource(TwoRepoStory) { PlansItems = true };
+
+        var outcome = await h.Run(source, Planner(Reports(Planned)));
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Contains("stories[0].repo is missing: this plan has 2 repositories (acme/widgets, acme/gears)", outcome.Error);
+        Assert.Empty(source.Children);
+        Assert.Contains(RunPipeline.Steps.PlanRejected, await h.Steps());
+        Assert.DoesNotContain(RunPipeline.Steps.PlanCreating, await h.Steps());
     }
 
     [Fact]

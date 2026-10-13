@@ -17,7 +17,9 @@ public sealed partial class RunPipeline
     /// breaks a rule is recorded (<see cref="Steps.PlanRejected"/>) and escalates the item with no story created; a valid one is
     /// recorded (<see cref="Steps.Plan"/>), then <see cref="Steps.PlanCreating"/> right before its stories are created on the board
     /// through the work source (<see cref="IWorkSource.CreateChildrenAsync"/>, idempotent: a retry reuses what an earlier call
-    /// created); then the plan's changeset branch is created (sc-25872, <see cref="EnsureChangesetAsync"/>) and only then are the
+    /// created); then the plan's changeset branch is created (sc-25872, <see cref="EnsureChangesetAsync"/>) — one in every
+    /// repository of the plan that has a story (sc-25873), in the plan's merge order, a failure for one failing the step, to be
+    /// resumed — and only then are the
     /// stories' ids recorded (<see cref="Steps.PlanStories"/>) — the row that makes them the plan's, without which none of them is
     /// claimed (<see cref="WithoutPlanAsync"/>), so no story of the plan ever starts before the branch it starts from exists — and
     /// the item moves to <see cref="WorkState.Planned"/>, where it waits on them and releases them in dependency order
@@ -39,8 +41,13 @@ public sealed partial class RunPipeline
             return;
         }
         // Before the planner is spent, or a recorded plan's stories are created (sc-25873): a repository whose CI cannot report on
-        // the plan's story pull requests stops the plan here.
-        await EnsureCiTriggersAsync(run, run.Repo, ct);
+        // the plan's story pull requests, or on its changeset pull request, stops the plan here — every repository the plan item
+        // names (the planner's set), the item's own first, so no session, story or branch in any of them is spent on a plan one of
+        // them refuses.
+        foreach (var repo in PlanRepositories(run))
+        {
+            await EnsureCiTriggersAsync(run, repo, ct);
+        }
         Plan plan;
         string? session;
         var reused = ReusesRecordedPlan(history);
@@ -64,10 +71,11 @@ public sealed partial class RunPipeline
         }
         else
         {
-            (var answer, session) = await PlanSessionAsync(run, history, ct);
+            (var answer, session, var repos) = await PlanSessionAsync(run, history, ct);
             try
             {
-                plan = PlanParser.Parse(answer);
+                // Against the plan item's own repositories (sc-25873): a story may be worked in no other.
+                plan = PlanParser.Parse(answer, repos);
             }
             catch (PlanFormatException ex)
             {
@@ -98,7 +106,10 @@ public sealed partial class RunPipeline
         {
             throw new InvalidOperationException($"The board returned {ids.Count} stories for a plan of {plan.Stories.Count}.");
         }
-        await EnsureChangesetAsync(run, session, ct);
+        foreach (var repo in plan.Repositories(run.Repo))
+        {
+            await EnsureChangesetAsync(run, session, ct, RepoRef.Parse(repo));
+        }
         var stories = string.Join(' ', ids.Select(Naming.Format));
         await ledger.CheckpointAsync(item, Steps.PlanStories, session, stories, ct);
         log.WriteLine($"[plan] stories on the board: {stories}");
@@ -113,7 +124,8 @@ public sealed partial class RunPipeline
     /// that App write nowhere else and only the gate App merges), then <see cref="Steps.ChangesetPushed"/>. Idempotent (E4): a
     /// recorded changeset is pushed again from its recorded commit by a run resumed before the push, a branch origin already has is
     /// adopted as it is (never reset or force-pushed), and one recorded as pushed is left alone. Which repository is a parameter:
-    /// a plan has one changeset per repository it changes, and today every story of a plan is in the plan item's repository.
+    /// a plan has one changeset per repository it has a story in (sc-25873), each with its own rows, so a run that died after the
+    /// first repository's branch creates only the others.
     /// </summary>
     private async Task<Plans.Changeset> EnsureChangesetAsync(Run run, string? session, CancellationToken ct, RepoRef? repo = null)
     {
@@ -159,7 +171,8 @@ public sealed partial class RunPipeline
             return PlanRelease.PlanStoppedRefusal(stopped.ExternalId);
         }
         var blockers = await source.BlockersAsync(storyId, ct);
-        if (blockers.Count == 0)
+        var changesets = await AwaitedChangesetsAsync(item, plan, ct);
+        if (blockers.Count == 0 && changesets.Count == 0)
         {
             return null;
         }
@@ -168,7 +181,32 @@ public sealed partial class RunPipeline
         var open = blockers.Select(b => (Id: Naming.Format(b.Id), b.Finished))
             .Where(b => !PlanRelease.Satisfied(known.TryGetValue(b.Id, out var k) ? k.History : null, ofPlan.Contains(b.Id), b.Finished))
             .Select(b => b.Id).ToList();
-        return open.Count == 0 ? null : PlanRelease.Refusal(open, open.Where(b => !ofPlan.Contains(b)).ToList());
+        return open.Count + changesets.Count == 0 ? null
+            : PlanRelease.Refusal([.. open, .. changesets], open.Where(b => !ofPlan.Contains(b)).ToList());
+    }
+
+    /// <summary>
+    /// The second kind of blocker of a plan's story (sc-25873), from the plan item's ledger alone (the board has no relation for
+    /// it): the repositories the plan says it waits on (<see cref="PlanStory.BlockedByChangesets"/>, its <c>plan</c> checkpoint)
+    /// whose changeset is not on its default branch yet (no <see cref="Steps.ChangesetDelivered"/> row), each as
+    /// <see cref="PlanRelease.ChangesetBlocker"/>.
+    /// </summary>
+    private async Task<IReadOnlyList<string>> AwaitedChangesetsAsync(WorkItem item, long plan, CancellationToken ct)
+    {
+        if (await ledger.ItemAsync(plan, ct) is not { } planItem)
+        {
+            return [];
+        }
+        var rows = await ledger.HistoryAsync(planItem, ct);
+        var recorded = rows.FindLastIndex(e => e.Step == Steps.PlanStories);
+        if (recorded < 0 || PlanRelease.RecordedRepos(rows.Take(recorded).LastOrDefault(e => e.Step == Steps.Plan)?.Detail,
+                PlanRelease.StoriesOf(rows[recorded].Detail), RepoRef.Parse(planItem.Repo)) is not { } repos
+            || !repos.ChangesetBlockers.TryGetValue(item.ExternalId, out var waits))
+        {
+            return [];
+        }
+        var delivered = Plans.Changeset.Delivered(rows);
+        return [.. waits.Where(r => !delivered.Any(d => string.Equals(d.Repo, r, StringComparison.OrdinalIgnoreCase))).Select(PlanRelease.ChangesetBlocker)];
     }
 
     /// <summary>
@@ -244,7 +282,14 @@ public sealed partial class RunPipeline
     /// recorded on the plan item when it changes (<see cref="Steps.PlanHeld"/>), not every poll. Once every story has merged
     /// (<see cref="ReleaseDecision.Complete"/>: into the plan's changeset branch, each by its own gated pull request) the changeset
     /// goes to the default branch by one pull request of the plan item's own (sc-25872, <see cref="ChangesetPullRequestAsync"/>);
-    /// a plan with no changeset branch (recorded before there were any) is closed out at once (<see cref="ClosePlanAsync"/>). A story that escalated or was
+    /// a plan with no changeset branch (recorded before there were any) is closed out at once (<see cref="ClosePlanAsync"/>).
+    /// Several repositories (sc-25873): a story is also held by the changesets the plan says it waits on
+    /// (<see cref="PlanStory.BlockedByChangesets"/>) until each is on its default branch (<see cref="Steps.ChangesetDelivered"/>),
+    /// and the changesets go to their default branches one repository at a time, in the plan's merge order
+    /// (<see cref="Plans.Changeset.Ordered"/>): the first one not delivered gets its pull request once every story of its repository
+    /// has merged, the plan item takes it through Review → … → Merge in that repository and comes back here (Merge → Planned) for
+    /// the next; the merges are not atomic. While it does, this evaluation does not run: stories released before go on, the rest
+    /// wait for it. A story that escalated or was
     /// cancelled never satisfies its dependents: they stay in the backlog and the plan item stays here, saying which story holds it
     /// and, once nothing else of it can move, that it is stuck (sc-25876, <see cref="RecordFailedHoldAsync"/>). A Pause on the plan
     /// item holds its stories too and a Stop stops them with it (<see cref="IControls.EffectiveAsync"/>, <see cref="ItemStopper"/>):
@@ -267,37 +312,50 @@ public sealed partial class RunPipeline
         var ofPlan = stories.ToHashSet(StringComparer.Ordinal);
         bool Merged(string id) => PlanRelease.Satisfied(known.TryGetValue(id, out var k) ? k.History : null);
 
-        // What blocks each story still waiting. The plan's own order first, from the ledger; the board (the plan's relations and
-        // any a person added since) only for a story that order no longer holds.
-        var own = PlanRelease.RecordedBlockers(history.Take(recorded).LastOrDefault(e => e.Step == Steps.Plan)?.Detail, stories);
+        // What blocks each story still waiting. The plan's own order first, from the ledger — the stories that block it and
+        // (sc-25873) the repositories whose changeset it waits on; the board (the plan's relations and any a person added since)
+        // only for a story that order no longer holds.
+        var planDetail = history.Take(recorded).LastOrDefault(e => e.Step == Steps.Plan)?.Detail;
+        var own = PlanRelease.RecordedBlockers(planDetail, stories);
+        // The plan item's own repository: only a plan of one repository reads it, and that one's never changes.
+        var primary = RepoRef.Parse(item.Repo);
+        var repos = PlanRelease.RecordedRepos(planDetail, stories, primary);
+        var changesets = Plans.Changeset.Ordered(history, primary);
+        var delivered = Plans.Changeset.Delivered(since).Select(d => d.Repo).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        IReadOnlyList<string> Awaited(string story) => repos is null || !repos.ChangesetBlockers.TryGetValue(story, out var waits) ? []
+            : [.. waits.Where(r => !delivered.Contains(r)).Select(PlanRelease.ChangesetBlocker)];
         var blockers = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
         var finished = new HashSet<string>(StringComparer.Ordinal);
         foreach (var story in stories.Where(s => !Merged(s) && !released.Contains(s)))
         {
-            if (own is not null && own[story].Where(b => !Merged(b)).ToList() is { Count: > 0 } unmerged)
+            var unmerged = own is null ? [] : own[story].Where(b => !Merged(b)).ToList();
+            if (unmerged.Count > 0 || Awaited(story).Count > 0)
             {
-                blockers[story] = unmerged;
+                blockers[story] = [.. unmerged, .. Awaited(story)];
                 continue;
             }
             var onBoard = await source.BlockersAsync(IdOf(story), ct);
             blockers[story] = onBoard.Select(b => Naming.Format(b.Id)).ToList();
             finished.UnionWith(onBoard.Where(b => b.Finished).Select(b => Naming.Format(b.Id)));
         }
-        var outside = blockers.Values.SelectMany(b => b).Where(b => !ofPlan.Contains(b)).ToList();
+        var outside = blockers.Values.SelectMany(b => b).Where(b => !ofPlan.Contains(b) && !PlanRelease.IsChangesetBlocker(b)).ToList();
         var outsiders = outside.Count == 0 ? [] : await ledger.ItemsByIdAsync(Naming.Source, outside, ct);
-        bool Satisfied(string id) => ofPlan.Contains(id)
-            ? Merged(id)
+        bool Satisfied(string id) => PlanRelease.IsChangesetBlocker(id) ? delivered.Contains(PlanRelease.RepoOfChangesetBlocker(id))
+            : ofPlan.Contains(id) ? Merged(id)
             : PlanRelease.Satisfied(outsiders.TryGetValue(id, out var o) ? o.History : null, ofPlan: false, finished.Contains(id));
         var decision = PlanRelease.Decide(stories, released, blockers, Satisfied);
         // Which stories failed and what they hold (sc-25876), recorded when it changes: apart from the release decision (a failed
         // story has no Merge row, so it already satisfies nothing) and from how a complete plan is finished.
-        var status = PlanRelease.Classify(stories, released, s => blockers.TryGetValue(s, out var by) ? by : own?[s] ?? [],
-            id => known.TryGetValue(id, out var k) ? k.History : null, Satisfied);
+        var status = PlanRelease.Classify(stories, released, s => blockers.TryGetValue(s, out var by) ? by : [.. own?[s] ?? [], .. Awaited(s)],
+            id => known.TryGetValue(id, out var k) ? k.History : null, Satisfied,
+            blocker => repos?.StoriesIn(PlanRelease.RepoOfChangesetBlocker(blocker)) ?? []);
         await RecordFailedHoldAsync(item, storyId, since, status, ct);
-        if (decision.Complete)
+        // One changeset (or none): once every story has merged it goes to the default branch, exactly as before there were several.
+        if (decision.Complete && changesets.Count <= 1)
         {
-            return Plans.Changeset.Of(history, RepoRef.Parse(item.Repo)) is { } changeset
-                ? await ChangesetPullRequestAsync(item, storyId, changeset, stories, known, history, since, ct)
+            return changesets.Count == 1
+                ? await ChangesetPullRequestAsync(item, storyId, changesets[0], stories, stories, known, history, since, several: false, ct)
+                    ?? await OutcomeAsync(item, null, ct)
                 : await ClosePlanAsync(item, storyId, stories, known, since, null, ct);
         }
 
@@ -352,6 +410,29 @@ public sealed partial class RunPipeline
         log.WriteLine($"[{item.State}] {item.ExternalId}: {stories.Count(Merged)} of {stories.Count} stories merged"
             + (done.Count == 0 ? "" : $"; released {string.Join(", ", done)}")
             + (waiting.Count == 0 ? "" : $"; waiting: {string.Join("; ", waiting)}"));
+        // Several changesets (sc-25873), one repository at a time in the plan's merge order: the first one not delivered goes to
+        // its default branch once every story of its repository has merged — after the releases above, so the stories of the
+        // other repositories that are unblocked are already on their way. A later repository's is not opened before it.
+        foreach (var changeset in changesets.Count > 1 ? changesets.Where(c => !delivered.Contains(c.Repo)).ToList() : [])
+        {
+            var mine = repos?.StoriesIn(changeset.Repo) ?? stories;
+            if (mine.Count == 0 || !mine.All(Merged))
+            {
+                break;
+            }
+            if (await ChangesetPullRequestAsync(item, storyId, changeset, stories, mine, known, history, since, several: true, ct) is { } opened)
+            {
+                return opened;
+            }
+            // Nothing to merge there (recorded): the next repository's turn.
+            delivered.Add(changeset.Repo);
+        }
+        if (changesets.Count > 1 && decision.Complete && changesets.All(c => delivered.Contains(c.Repo)))
+        {
+            // Every changeset is delivered and the last needed no pull request: the plan is closed out from here.
+            var rows = await ledger.HistoryAsync(item, ct);
+            return await ClosePlanAsync(item, storyId, stories, known, since, null, ct, Plans.Changeset.States(rows, primary, item.State));
+        }
         return await OutcomeAsync(item, null, ct);
 
         int IdOf(string story) => Naming.TryParse(story, out var id)
@@ -420,26 +501,42 @@ public sealed partial class RunPipeline
     /// Merge (<see cref="MergeAsync"/>). An empty changeset — the branch does not differ from the default branch (GitHub's compare,
     /// read now) — gets no pull request: recorded (<see cref="Steps.ChangesetEmpty"/>), and the plan is closed out saying so. A
     /// control that holds the plan item opens nothing. Needs no worker: it runs in the waiting plan's run.
+    /// One of several changesets (<paramref name="several"/>, sc-25873; <paramref name="mine"/>: the plan's stories in its
+    /// repository): the same, in that repository — the plan item's <see cref="WorkItem.Repo"/> becomes the changeset's for as long
+    /// as it takes the pull request through the gate, so the merge queue, the gate policy, CI and the freeze are that repository's —
+    /// and an empty one (or one merged by someone else) is recorded delivered (<see cref="Steps.ChangesetDelivered"/>) instead of
+    /// closing the plan: null is returned, and the caller goes on to the next repository.
     /// </summary>
-    private async Task<RunOutcome> ChangesetPullRequestAsync(WorkItem item, int storyId, Plans.Changeset changeset, IReadOnlyList<string> stories,
-        Dictionary<string, (WorkItem Item, List<LedgerEntry> History)> known, List<LedgerEntry> history, List<LedgerEntry> since, CancellationToken ct)
+    private async Task<RunOutcome?> ChangesetPullRequestAsync(WorkItem item, int storyId, Plans.Changeset changeset, IReadOnlyList<string> stories,
+        IReadOnlyList<string> mine, Dictionary<string, (WorkItem Item, List<LedgerEntry> History)> known, List<LedgerEntry> history,
+        List<LedgerEntry> since, bool several, CancellationToken ct)
     {
         var repo = RepoRef.Parse(changeset.Repo);
-        var empty = since.LastOrDefault(e => e.Step == Steps.ChangesetEmpty)?.Detail;
+        var empty = several ? null : since.LastOrDefault(e => e.Step == Steps.ChangesetEmpty)?.Detail;
+        var how = ChangesetDelivery.Empty;
         // A changeset pull request of this plan that someone merged by hand (an escalated one, say): the changeset is delivered.
         // GitHub's three-dot compare below would still show a difference after a squash or rebase merge, and every run would open
         // another pull request for changes the default branch already has.
-        if (empty is null && gate is not null && since.LastOrDefault(e => e.Step == Steps.Linked)?.Detail?.Split(' ')[0] is { } linked
+        var linked = since.LastOrDefault(e => e.Step == Steps.Linked && Plans.Changeset.RepoOfPull(e.Detail) is { } of
+            && string.Equals(of.FullName, repo.FullName, StringComparison.OrdinalIgnoreCase))?.Detail?.Split(' ')[0];
+        if (empty is null && gate is not null && linked is not null
             && (await Gate.GitHub.GetPullAsync(repo, GitHubGate.ParsePullUrl(linked).Number, ct)).Merged)
         {
-            empty = Plans.Changeset.MergedOutside(linked);
+            (empty, how) = (Plans.Changeset.MergedOutside(linked), ChangesetDelivery.MergedOutside);
             await ledger.CheckpointAsync(item, Steps.ChangesetEmpty, null, empty, ct);
         }
         // Without a gate stage nothing can read the difference (nor review the pull request: the item parks at Review).
         if (empty is null && gate is not null && string.IsNullOrWhiteSpace(await Gate.GitHub.GetDiffAsync(repo, changeset.Base, changeset.Branch, ct)))
         {
-            empty = $"{changeset.Branch} does not differ from {changeset.Base}: no changeset pull request";
+            empty = $"{(several ? $"{repo}: " : "")}{changeset.Branch} does not differ from {changeset.Base}: no changeset pull request";
             await ledger.CheckpointAsync(item, Steps.ChangesetEmpty, null, empty, ct);
+        }
+        if (empty is not null && several)
+        {
+            await ledger.CheckpointAsync(item, Steps.ChangesetDelivered, null,
+                new ChangesetDelivery(repo.FullName, how, how == ChangesetDelivery.MergedOutside ? linked : null).ToDetail(), ct);
+            log.WriteLine($"[{item.State}] {item.ExternalId}: the changeset of {repo} needs no merge ({empty}); skipped in the plan's merge order");
+            return null;
         }
         if (empty is not null)
         {
@@ -451,17 +548,19 @@ public sealed partial class RunPipeline
             return await OutcomeAsync(item, null, ct);
         }
         var prUrl = await pullRequests.OpenAsync(repo, changeset.Branch, changeset.Base, 
-            $"{item.ExternalId}: {UntrustedText.Inert(item.Title)} (changeset of {stories.Count} stories)",
-            LedgerReport.ChangesetPullRequestBody(item.ExternalId, null, changeset, PlanStoryReports(stories, known), history,
-                await ledger.SessionCostsAsync(item, ct)), ct);
+            $"{item.ExternalId}: {UntrustedText.Inert(item.Title)} (changeset of {mine.Count} stories{(several ? $" in {repo}" : "")})",
+            LedgerReport.ChangesetPullRequestBody(item.ExternalId, null, changeset, PlanStoryReports(mine, known), Plans.Changeset.CurrentPass(history),
+                await ledger.SessionCostsAsync(item, ct), several ? Plans.Changeset.States(history, repo, item.State) : null), ct);
         var links = $"{prUrl} {BranchUrl(repo, changeset.Branch)}";
         if (!since.Any(e => e.Step == Steps.Linked && e.Detail == links))
         {
             await source.LinkAsync(storyId, links.Split(' '), ct);
             await ledger.CheckpointAsync(item, Steps.Linked, null, links, ct);
         }
+        // The item works in the changeset's repository from here to its merge (a plan of one repository: it already is).
+        await ledger.RefreshAsync(item, item.Title, repo.FullName, item.EpicId, ct);
         await ledger.RecordAsync(item, WorkState.Review, null, prUrl, ct);
-        log.WriteLine($"[{item.State}] {item.ExternalId}: every story of the plan merged into {changeset.Branch}; its changeset pull request is {prUrl}");
+        log.WriteLine($"[{item.State}] {item.ExternalId}: every story of the plan{(several ? $" in {repo}" : "")} merged into {changeset.Branch}; its changeset pull request is {prUrl}");
         return await OutcomeAsync(item, null, ct);
     }
 
@@ -491,7 +590,7 @@ public sealed partial class RunPipeline
         return recorded < 0 ? run.Story : run.Story with
         {
             Description = Plans.Changeset.ReviewSpec(run.Story.Description, history.Take(recorded).LastOrDefault(e => e.Step == Steps.Plan)?.Detail,
-                PlanRelease.StoriesOf(history[recorded].Detail)),
+                PlanRelease.StoriesOf(history[recorded].Detail), run.Changeset.Repo),
         };
     }
 
@@ -505,8 +604,10 @@ public sealed partial class RunPipeline
     /// any more (<see cref="PlanCloseoutAbandoned"/>), nothing is written, and the dashboard keeps saying the closeout is left to post
     /// by hand. It reaches Done only by a posted closeout.
     /// </summary>
+    /// <param name="changesets">A plan of several repositories (sc-25873): where each one's changeset stands, for the closeout to list.</param>
     private async Task<RunOutcome> ClosePlanAsync(WorkItem item, int storyId, IReadOnlyList<string> stories,
-        Dictionary<string, (WorkItem Item, List<LedgerEntry> History)> known, List<LedgerEntry> since, string? note, CancellationToken ct)
+        Dictionary<string, (WorkItem Item, List<LedgerEntry> History)> known, List<LedgerEntry> since, string? note, CancellationToken ct,
+        IReadOnlyList<ChangesetState>? changesets = null)
     {
         if (!since.Any(e => e.Step == Steps.MergedReported))
         {
@@ -522,7 +623,7 @@ public sealed partial class RunPipeline
             try
             {
                 await source.CommentAsync(storyId, LedgerReport.PlanCloseout(item.ExternalId,
-                    [.. stories.Select(s => new PlanStoryReport(s, known[s].Item.Title, known[s].History))], note), ct);
+                    [.. stories.Select(s => new PlanStoryReport(s, known[s].Item.Title, known[s].History))], note, null, changesets), ct);
                 posted = true;
             }
             catch (Exception ex) when (!ct.IsCancellationRequested)
@@ -576,7 +677,7 @@ public sealed partial class RunPipeline
     /// behind (<see cref="Steps.WorkerStarted"/> with no <see cref="Steps.WorkerDone"/>) is stopped first, like Implement's orphan.
     /// Returns its answer and its id.
     /// </summary>
-    private async Task<(string? Answer, string? Session)> PlanSessionAsync(Run run, List<LedgerEntry> history, CancellationToken ct)
+    private async Task<(string? Answer, string? Session, IReadOnlyList<RepoRef> Repos)> PlanSessionAsync(Run run, List<LedgerEntry> history, CancellationToken ct)
     {
         if (planner is null)
         {
@@ -597,9 +698,9 @@ public sealed partial class RunPipeline
             try
             {
                 var (session, result) = await RunSessionAsync(run, seat.Worker, seat.Path, seat.McpConfig, implementing: false, null,
-                    _ => PlanPrompt.Build(run.Spec, run.Repo, seat.Checkouts) + PlanPrompt.McpNote(seat.ToolRules, repos), [], [Taint.Planner], "plan",
+                    _ => PlanPrompt.Build(run.Spec, run.Repo, seat.Checkouts, repos) + PlanPrompt.McpNote(seat.ToolRules, repos), [], [Taint.Planner], "plan",
                     WorkerModelClass.Planner, c);
-                return (result.ResultText, session);
+                return (result.ResultText, session, repos);
             }
             catch (ControlRequestedException request) when (request.WorkerStillRunning)
             {

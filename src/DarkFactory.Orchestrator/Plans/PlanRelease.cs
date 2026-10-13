@@ -7,6 +7,22 @@ namespace DarkFactory.Orchestrator.Plans;
 /// <param name="Outside">Those of <paramref name="By"/> that are not stories of the plan (someone related them on the board).</param>
 public sealed record HeldStory(string Id, IReadOnlyList<string> By, IReadOnlyList<string> Outside);
 
+/// <summary>The repositories of a recorded plan (<see cref="PlanRelease.RecordedRepos"/>), keyed by the stories' board ids.</summary>
+/// <param name="Order">The repositories that have a story, in the order their changesets merge.</param>
+/// <param name="Stories">The plan's stories with their repositories, in plan order.</param>
+/// <param name="ChangesetBlockers">The repositories whose changeset each story waits on.</param>
+/// <param name="Interactions">The planner's note on how the repositories interact (untrusted text); empty when it gave none.</param>
+public sealed record RecordedRepositories(IReadOnlyList<string> Order, IReadOnlyList<(string Id, string Repo)> Stories,
+    IReadOnlyDictionary<string, IReadOnlyList<string>> ChangesetBlockers, string Interactions)
+{
+    /// <summary>The plan's stories in <paramref name="repo"/>, in plan order.</summary>
+    public IReadOnlyList<string> StoriesIn(string repo) =>
+        [.. Stories.Where(s => string.Equals(s.Repo, repo, StringComparison.OrdinalIgnoreCase)).Select(s => s.Id)];
+
+    /// <summary>The repository of the story <paramref name="id"/>, or null when it is no story of the plan.</summary>
+    public string? RepoOf(string id) => Stories.FirstOrDefault(s => s.Id == id).Repo;
+}
+
 /// <summary>What one evaluation of a waiting plan decided (<see cref="PlanRelease.Decide"/>).</summary>
 /// <param name="Release">The stories to move to ready now, in plan order.</param>
 /// <param name="Held">The stories that stay in the backlog, each with the blockers holding it.</param>
@@ -68,6 +84,20 @@ public static class PlanRelease
     /// <summary>The words a blocked story's claim refusal starts with (after <see cref="RunPipeline.ClaimRefused"/>).</summary>
     public const string BlockedPrefix = "blocked by ";
 
+    private const string ChangesetBlockerPrefix = "the changeset of ";
+
+    /// <summary>
+    /// The second kind of blocker (sc-25873), named like a story's id wherever blockers are listed: the changeset of
+    /// <paramref name="repo"/>, satisfied once it is on that repository's default branch (the plan item's
+    /// <c>changeset-delivered</c> row). No story id starts with these words.
+    /// </summary>
+    public static string ChangesetBlocker(string repo) => ChangesetBlockerPrefix + repo;
+
+    public static bool IsChangesetBlocker(string blocker) => blocker.StartsWith(ChangesetBlockerPrefix, StringComparison.Ordinal);
+
+    /// <summary>The repository of a <see cref="ChangesetBlocker"/>.</summary>
+    public static string RepoOfChangesetBlocker(string blocker) => blocker[ChangesetBlockerPrefix.Length..];
+
     /// <summary>The story ids a <c>plan-stories</c> (or <c>plan-released</c>) checkpoint lists, in its order.</summary>
     public static IReadOnlyList<string> StoriesOf(string? detail) =>
         (detail ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -94,7 +124,8 @@ public static class PlanRelease
     /// <c>plan-released</c> checkpoint already names (never released twice); <paramref name="blockers"/> what the board says blocks
     /// each story that is neither merged nor released (a story missing from it has none); <paramref name="satisfied"/> answers
     /// <see cref="Satisfied"/> for any id, a story of the plan or not. A blocker outside the plan holds a story exactly like one
-    /// inside it.
+    /// inside it, and so does a changeset blocker (<see cref="ChangesetBlocker"/>, sc-25873: <paramref name="satisfied"/> answers
+    /// whether that repository's changeset is on its default branch), which is the plan's own order, not an outsider.
     /// </summary>
     public static ReleaseDecision Decide(IReadOnlyList<string> stories, IReadOnlySet<string> released,
         IReadOnlyDictionary<string, IReadOnlyList<string>> blockers, Func<string, bool> satisfied)
@@ -110,7 +141,7 @@ public static class PlanRelease
             }
             else
             {
-                held.Add(new HeldStory(story, open, open.Where(b => !stories.Contains(b, StringComparer.Ordinal)).ToList()));
+                held.Add(new HeldStory(story, open, open.Where(b => !stories.Contains(b, StringComparer.Ordinal) && !IsChangesetBlocker(b)).ToList()));
             }
         }
         return new ReleaseDecision(release, held, stories.Count > 0 && stories.All(satisfied));
@@ -122,7 +153,13 @@ public static class PlanRelease
     /// </summary>
     public static string Refusal(IReadOnlyList<string> unsatisfied, IReadOnlyList<string>? outside = null) =>
         $"{BlockedPrefix}{string.Join(", ", unsatisfied)} (not merged): a story of a plan starts only once the factory has merged every story of the plan that blocks it"
+        + (unsatisfied.Where(IsChangesetBlocker).ToList() is { Count: > 0 } changesets
+            ? $"; {string.Join(", ", changesets)}: {ChangesetRemedy}" : "")
         + (outside is { Count: > 0 } ? $"; {string.Join(", ", outside)}: {OutsideRemedy}" : "");
+
+    /// <summary>What a changeset blocker is and what satisfies it, as a claim refusal says it (sc-25873).</summary>
+    public const string ChangesetRemedy = "not on its default branch yet: the plan opens that repository's changeset pull request once "
+        + "every story of the plan in it has merged, and this story starts once the factory's merge gate has merged it";
 
     /// <summary>What a blocker outside the plan is and what releases its dependent, as a held story's record and a claim refusal say it.</summary>
     public const string OutsideRemedy = "not a story of this plan, and neither merged by the factory nor finished on the board: finish it or remove the relation on the board";
@@ -203,9 +240,14 @@ public static class PlanRelease
     /// blocker that is not a story of the plan is satisfied (a story of the plan is satisfied by its Merge row only).
     /// A failed story (<see cref="FailureOf"/>) satisfies nothing, so every story that depends on it, directly or through others, is
     /// <see cref="PlanStoryState.Blocked"/>; the stories that do not depend on it are classified as if it were not there.
+    /// A changeset blocker (<see cref="ChangesetBlocker"/>, sc-25873) that is not satisfied is a dependency on every unmerged story
+    /// of its repository (<paramref name="changesetStories"/>: the stories of the plan in a changeset blocker's repository), since
+    /// the changeset reaches its default branch only after they all merged: a story waiting on it is blocked behind each failed one
+    /// of them, and its <see cref="PlanStoryStatus.WaitsOn"/> names the changeset.
     /// </summary>
     public static PlanStatus Classify(IReadOnlyList<string> stories, IReadOnlySet<string> released,
-        Func<string, IReadOnlyList<string>> blockers, Func<string, IReadOnlyList<LedgerEntry>?> history, Func<string, bool>? satisfied = null)
+        Func<string, IReadOnlyList<string>> blockers, Func<string, IReadOnlyList<LedgerEntry>?> history, Func<string, bool>? satisfied = null,
+        Func<string, IReadOnlyList<string>>? changesetStories = null)
     {
         var ofPlan = stories.ToHashSet(StringComparer.Ordinal);
         var rows = stories.Distinct(StringComparer.Ordinal).ToDictionary(s => s, history, StringComparer.Ordinal);
@@ -226,7 +268,8 @@ public static class PlanRelease
                 return []; // a cycle (only relations a person added on the board can make one): not followed
             }
             var by = new List<string>();
-            foreach (var blocker in blockers(story).Where(b => ofPlan.Contains(b) && !Merged(b)))
+            var through = blockers(story).Where(b => IsChangesetBlocker(b) && Open(b)).SelectMany(b => changesetStories?.Invoke(b) ?? []);
+            foreach (var blocker in blockers(story).Concat(through).Where(b => ofPlan.Contains(b) && !Merged(b)).Distinct(StringComparer.Ordinal).ToList())
             {
                 by.AddRange(failures[blocker] is not null ? [blocker] : Behind(blocker, path));
             }
@@ -271,7 +314,16 @@ public static class PlanRelease
         !status.Held ? "" : string.Join("; ", status.Failed.Select(f =>
                 $"{f.Id} {f.Failure!.As} at {f.Failure.At.UtcDateTime:u}: {FailureReason(f.Failure)}"))
             + (status.Blocked.Count == 0 ? "" : "; not released because of them: "
-                + string.Join(", ", status.Blocked.Select(b => $"{b.Id} (behind {string.Join(", ", b.HeldBy)})")));
+                + string.Join(", ", status.Blocked.Select(b => $"{b.Id} ({BehindOf(b)})")));
+
+    /// <summary>
+    /// "behind sc-5" — and, for a story that waits on a repository's changeset which a failed story keeps from completing
+    /// (sc-25873), "behind sc-5, through the changeset of owner/name".
+    /// </summary>
+    public static string BehindOf(PlanStoryStatus blocked) =>
+        $"behind {string.Join(", ", blocked.HeldBy)}"
+        + (blocked.WaitsOn.Where(IsChangesetBlocker).ToList() is { Count: > 0 } changesets
+            ? $", through {string.Join(", ", changesets)}, which cannot reach its default branch until every story of its repository has merged" : "");
 
     /// <summary>A failure's reason as a record and a comment repeat it: clipped, one inert line in a code span (model and repo text may be in it).</summary>
     public static string FailureReason(StoryFailure failure) =>
@@ -304,7 +356,7 @@ public static class PlanRelease
             text.Append("\nBlocked behind them (not released):\n");
             foreach (var blocked in status.Blocked)
             {
-                text.Append($"- {blocked.Id} (behind {string.Join(", ", blocked.HeldBy)})\n");
+                text.Append($"- {blocked.Id} ({BehindOf(blocked)})\n");
             }
         }
         text.Append($"\n{Counts(status)}.\n\nRemedies: {FailedRemedy(plan, status)}.\n");
@@ -390,6 +442,28 @@ public static class PlanRelease
         var id = plan.Stories.Select((s, i) => (s.Key, Id: stories[i])).ToDictionary(x => x.Key, x => x.Id, StringComparer.Ordinal);
         return plan.Stories.ToDictionary(s => id[s.Key],
             s => (IReadOnlyList<string>)s.BlockedBy.Where(id.ContainsKey).Select(b => id[b]).ToList(), StringComparer.Ordinal);
+    }
+
+    /// <summary>
+    /// The repositories of a recorded plan (sc-25873; <paramref name="stories"/> as for <see cref="RecordedBlockers"/>,
+    /// <paramref name="primary"/>: the plan item's repository, a story's when the plan names none): each story's repository, the
+    /// repositories whose changeset each story waits on, and the merge order. Null when the <c>plan</c> checkpoint does not read
+    /// back as a plan of those stories.
+    /// </summary>
+    public static RecordedRepositories? RecordedRepos(string? planDetail, IReadOnlyList<string> stories, Shortcut.RepoRef primary)
+    {
+        try
+        {
+            var plan = Plan.FromDetail(planDetail);
+            return plan.Stories.Count != stories.Count ? null : new RecordedRepositories(plan.Repositories(primary),
+                [.. plan.Stories.Select((s, i) => (stories[i], Plan.RepoOf(s, primary)))],
+                plan.Stories.Select((s, i) => (Id: stories[i], s.BlockedByChangesets)).ToDictionary(x => x.Id, x => x.BlockedByChangesets, StringComparer.Ordinal),
+                plan.Interactions);
+        }
+        catch (Exception ex) when (ex is PlanFormatException or ArgumentException)
+        {
+            return null;
+        }
     }
 
     /// <summary>

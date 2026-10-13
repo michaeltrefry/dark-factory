@@ -38,9 +38,12 @@ public sealed record PipelineRow(
 /// story, …), with when it was recorded: such a hold has no record of its end, so it is shown as the last one recorded.</param>
 /// <param name="FailedNotices">How often the plan item's comment for its latest hold by a failed story (or its lifting) was tried and
 /// refused by the board (its <c>plan-notice</c> rows since that record); 0 once it is posted, or when there is none to post.</param>
+/// <param name="Changesets">A plan of several repositories (sc-25873): where each repository's changeset stands, in merge order
+/// (<see cref="Changeset.States"/>, from the plan item's own rows); empty for a plan with one changeset or none.</param>
 public sealed record PlanView(IReadOnlyList<PlanStoryView> Stories, PlanStatus Status, string? Hold, (string Detail, DateTimeOffset At)? LastHeld = null,
-    int FailedNotices = 0)
+    int FailedNotices = 0, IReadOnlyList<ChangesetState>? Changesets = null)
 {
+
     /// <summary>Whether the factory will try the refused comment again (the next evaluation), or has left it to the ledger and this page.</summary>
     public bool NoticeRetrying => FailedNotices < RunPipeline.MaxPlanNoticeAttempts;
 
@@ -58,7 +61,8 @@ public sealed record PlanView(IReadOnlyList<PlanStoryView> Stories, PlanStatus S
 /// made inert (<see cref="WorkSources.UntrustedText.Inert"/>: a planner wrote it).</param>
 /// <param name="ItemState">Its work item's state; null while the ledger does not know it.</param>
 /// <param name="Waits">What it waits on, in words: its unmerged blockers, <c>held by sc-N (escalated)</c>, or how it failed; empty when nothing.</param>
-public sealed record PlanStoryView(string ExternalId, string Title, PlanStoryState State, WorkState? ItemState, string Waits)
+/// <param name="Repo">The repository the plan worked it in (sc-25873); null when the plan's record no longer reads back.</param>
+public sealed record PlanStoryView(string ExternalId, string Title, PlanStoryState State, WorkState? ItemState, string Waits, string? Repo = null)
 {
     /// <summary>The state the page shows: the work item's, or what the plan says of a story with none.</summary>
     public string Shown => ItemState?.ToString() ?? (State == PlanStoryState.InFlight ? "released" : "not released");
@@ -219,7 +223,10 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
 
     private static readonly string[] PlanSteps =
         [RunPipeline.Steps.Plan, RunPipeline.Steps.PlanStories, RunPipeline.Steps.PlanReleased, RunPipeline.Steps.PlanHeld,
-            RunPipeline.Steps.PlanStuck, RunPipeline.Steps.PlanResumed, RunPipeline.Steps.PlanNotice];
+            RunPipeline.Steps.PlanStuck, RunPipeline.Steps.PlanResumed, RunPipeline.Steps.PlanNotice,
+            // What its changesets' states are read from (sc-25873).
+            RunPipeline.Steps.Changeset, RunPipeline.Steps.ChangesetPushed, RunPipeline.Steps.ChangesetDelivered, RunPipeline.Steps.ChangesetEmpty,
+            RunPipeline.Steps.Linked];
 
     /// <summary>
     /// The plan of each active item that has one (sc-25876; keyed by the plan item's id): its stories from its <c>plan-stories</c>
@@ -248,6 +255,9 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
         var storyIds = stories.Select(s => s.Id).ToList();
         var transitions = (await db.LedgerEntries.AsNoTracking().Where(e => storyIds.Contains(e.WorkItemId) && e.Step == null).OrderBy(e => e.Id).ToListAsync(ct))
             .ToLookup(e => e.WorkItemId);
+        var plannedIds = planned.Select(p => p.Item.Id).ToList();
+        var ownTransitions = (await db.LedgerEntries.AsNoTracking().Where(e => plannedIds.Contains(e.WorkItemId) && e.Step == null).OrderBy(e => e.Id).ToListAsync(ct))
+            .ToLookup(e => e.WorkItemId);
         var views = new Dictionary<long, PlanView>();
         foreach (var (item, ofPlan, plan, since) in planned)
         {
@@ -256,8 +266,17 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
             var titles = PlanRelease.RecordedTitles(plan, ofPlan);
             var released = since.Where(e => e.Step == RunPipeline.Steps.PlanReleased)
                 .Select(e => PlanRelease.StoriesOf(e.Detail).FirstOrDefault() ?? "").ToHashSet(StringComparer.Ordinal);
-            var status = PlanRelease.Classify(ofPlan, released, s => blockers?.GetValueOrDefault(s) ?? [],
-                id => known.TryGetValue(id, out var story) ? transitions[story.Id].ToList() : null);
+            // Several repositories (sc-25873): the changesets a story waits on, and where each repository's changeset stands.
+            var primary = Shortcut.RepoRef.Parse(item.Repo);
+            var repos = PlanRelease.RecordedRepos(plan, ofPlan, primary);
+            var all = rows[item.Id].Concat(ownTransitions[item.Id]).OrderBy(e => e.Id).ToList();
+            var changesets = Changeset.States(all, primary, item.State);
+            var delivered = changesets.Where(c => c.Delivered).Select(c => c.Changeset.Repo).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            IReadOnlyList<string> Blockers(string s) => [.. blockers?.GetValueOrDefault(s) ?? [],
+                .. (repos?.ChangesetBlockers.GetValueOrDefault(s) ?? []).Where(r => !delivered.Contains(r)).Select(PlanRelease.ChangesetBlocker)];
+            var status = PlanRelease.Classify(ofPlan, released, Blockers,
+                id => known.TryGetValue(id, out var story) ? transitions[story.Id].ToList() : null,
+                changesetStories: blocker => repos?.StoriesIn(PlanRelease.RepoOfChangesetBlocker(blocker)) ?? []);
             var lastHeld = since.LastOrDefault(e => e.Step == RunPipeline.Steps.PlanHeld
                 && e.Detail?.StartsWith(PlanRelease.FailedPrefix, StringComparison.Ordinal) != true);
             // The comment for the latest hold by a failed story (or its lifting): tried and refused so far, unless it was posted since.
@@ -266,9 +285,9 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
             views[item.Id] = new PlanView(
                 [.. status.Stories.Select(s => new PlanStoryView(s.Id,
                     known.TryGetValue(s.Id, out var story) ? story.Title : UntrustedText.Inert(titles?.GetValueOrDefault(s.Id) ?? ""),
-                    s.State, s.ItemState, PlanStoryView.WaitsOf(s, status)))],
+                    s.State, s.ItemState, PlanStoryView.WaitsOf(s, status), repos?.RepoOf(s.Id)))],
                 status, status.Held ? PlanRelease.HeldByFailed(status) : null,
-                lastHeld?.Detail is { } detail ? (detail, lastHeld.RecordedAt) : null, failedNotices);
+                lastHeld?.Detail is { } detail ? (detail, lastHeld.RecordedAt) : null, failedNotices, changesets.Count > 1 ? changesets : []);
         }
         return views;
     }
