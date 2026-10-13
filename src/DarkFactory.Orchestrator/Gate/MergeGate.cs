@@ -6,9 +6,11 @@ namespace DarkFactory.Orchestrator.Gate;
 /// <summary>
 /// A pull request as the gate sees it, read fresh from GitHub. <see cref="ChangedFiles"/>: GitHub's <c>changed_files</c>
 /// (null when not read), which the gate holds the diff's file count to so a diff missing files cannot pass.
+/// <see cref="DefaultBranch"/>: the base repository's default branch as the same answer names it (null when it names none), which
+/// an item of no plan must target (sc-25872).
 /// </summary>
 public sealed record PullFacts(int Number, string HtmlUrl, bool Open, bool Merged, bool Draft, string HeadSha, string BaseRef, string BaseSha,
-    string? MergeCommitSha, int? ChangedFiles = null);
+    string? MergeCommitSha, int? ChangedFiles = null, string? DefaultBranch = null);
 
 /// <summary>
 /// One CI check of a commit: a check run, or a commit status mapped onto the same shape. <see cref="Id"/>: the check run's id

@@ -312,6 +312,23 @@ public sealed partial class RunPipeline(
         /// </summary>
         public const string PlanHeld = "plan-held";
         /// <summary>
+        /// Plan: the plan's changeset branch in one repository is about to be created (sc-25872); Detail is the
+        /// <see cref="Plans.Changeset"/> JSON — the repository, the branch (<c>factory/changeset-&lt;plan item&gt;</c>), the default
+        /// branch and its head the branch starts from — recorded before anything is pushed.
+        /// </summary>
+        public const string Changeset = "changeset";
+        /// <summary>
+        /// Plan: the changeset branch is on origin (Detail: <see cref="Plans.Changeset.PushedDetail"/>: the branch, its head, and
+        /// whether origin already had it). From this row on the plan's stories in that repository branch from it and merge into it.
+        /// </summary>
+        public const string ChangesetPushed = "changeset-pushed";
+        /// <summary>
+        /// Planned: every story merged but the factory has no changeset to merge — the changeset branch does not differ from the
+        /// default branch (Detail: both), or the plan's changeset pull request was merged outside the factory
+        /// (<see cref="Plans.Changeset.MergedOutside"/>) — so no changeset pull request is opened and the plan is closed out saying so.
+        /// </summary>
+        public const string ChangesetEmpty = "changeset-empty";
+        /// <summary>
         /// Planned: every story of the plan that has not merged failed or is blocked behind a failed one (sc-25876): nothing of it
         /// moves until a person acts. Detail: the failed stories and what they block (<see cref="Plans.PlanRelease.HeldByFailed"/>).
         /// A failed story that still leaves other stories going is a <see cref="PlanHeld"/> row instead
@@ -379,6 +396,21 @@ public sealed partial class RunPipeline(
     private sealed record Run(WorkSpec Spec, RepoRef Repo, WorkItem Item)
     {
         public WorkStory Story => Spec.Story;
+
+        /// <summary>
+        /// The item's branch, whose pull request is the item's: its own <c>factory/&lt;id&gt;</c> branch, or — a plan item taking its
+        /// changeset to the default branch (sc-25872) — the plan's changeset branch.
+        /// </summary>
+        public required string Branch { get; init; }
+
+        /// <summary>
+        /// The branch the item's branch starts from and its pull request targets: the changeset branch of the item's plan
+        /// (sc-25872), or null for the repository's default branch (an item of no plan, and a plan item's own changeset).
+        /// </summary>
+        public string? BaseBranch { get; init; }
+
+        /// <summary>A plan item's changeset (the item's branch is then the changeset branch); null for every other item.</summary>
+        public Plans.Changeset? Changeset { get; init; }
 
         /// <summary>The worktree this run is using, once Implement has one.</summary>
         public Workspace? Workspace { get; set; }
@@ -576,7 +608,23 @@ public sealed partial class RunPipeline(
         {
             await ledger.LinkPlanAsync(item, planItem, ct);
         }
-        var run = new Run(spec, repo, item);
+        // Where the item's work goes (sc-25872), from the ledger: a plan's story branches from its plan's changeset branch and
+        // merges into it; a plan item whose stories have all merged works on the changeset branch itself, against the default branch.
+        var changeset = Plans.Changeset.Of(await ledger.HistoryAsync(item, ct), repo);
+        var ofPlan = item.PlanItemId is { } plan ? await ledger.ChangesetOfAsync(plan, repo, ct) : (null, []);
+        var run = new Run(spec, repo, item)
+        {
+            Branch = changeset?.Branch ?? story.Kind.BranchName(story.Id),
+            BaseBranch = ofPlan.Changeset?.Branch,
+            Changeset = changeset,
+        };
+        // Fail closed: a plan with a changeset has none on origin for this repository (the story's `Repo:` line names another one),
+        // so the story would merge into that repository's default branch, count as merged and be left out of the changeset pull
+        // request. Only a plan recorded before changesets (no `changeset` row at all) has its stories target the default branch.
+        var noChangeset = ofPlan is { Changeset: null, Recorded: [.., var recorded] }
+            ? $"{item.ExternalId} is a story of the plan whose changeset branch is {recorded.Branch} in {recorded.Repo}, and that plan has no changeset "
+                + $"branch in {repo}: the story cannot merge into its plan's changeset. Its `Repo:` line must name the plan's repository."
+            : null;
 
         if (Lifecycle.IsTerminal(item.State))
         {
@@ -603,6 +651,10 @@ public sealed partial class RunPipeline(
 
         try
         {
+            if (noChangeset is not null)
+            {
+                throw new WorkerFailedException(noChangeset);
+            }
             while (Handlers.TryGetValue(item.State, out var handler))
             {
                 // Pause/Stop: no new step starts once a control says so.
@@ -890,7 +942,7 @@ public sealed partial class RunPipeline(
     {
         var (spec, repo, item) = run;
         var story = spec.Story;
-        var branch = story.Kind.BranchName(story.Id);
+        var (branch, baseBranch) = (run.Branch, run.BaseBranch);
         var fullHistory = await ledger.HistoryAsync(item, ct);
         var attempt = CurrentWorkerAttempt(fullHistory);
         var stuckHint = StuckRetryHint(fullHistory);
@@ -908,7 +960,7 @@ public sealed partial class RunPipeline(
         // A session found looping is never resumed (a run that stopped after the detection left only its checkpoint).
         if (StuckSession(attempt) is { } found)
         {
-            run.Workspace = await workspaces.ReopenAsync(repo, branch, ct);
+            run.Workspace = await workspaces.ReopenAsync(repo, branch, ct, baseBranch);
             await StuckImplementAsync(run, found, ct);
             return;
         }
@@ -916,11 +968,11 @@ public sealed partial class RunPipeline(
         Workspace? workspace = null;
         if (attempt.Any(e => e.Step is not null))
         {
-            workspace = await workspaces.ReopenAsync(repo, branch, ct);
+            workspace = await workspaces.ReopenAsync(repo, branch, ct, baseBranch);
             if (workspace is null && attempt.Any(e => e.Step == Steps.Pushed))
             {
                 // The work is on origin: rebuild the worktree from it rather than redo it and force-push over it.
-                workspace = await workspaces.RestoreAsync(repo, branch, ct);
+                workspace = await workspaces.RestoreAsync(repo, branch, ct, baseBranch);
                 await ledger.CheckpointAsync(item, Steps.WorktreeRestored, session, $"worktree missing on resume; re-created from origin/{branch}", ct);
             }
             else if (workspace is null)
@@ -932,10 +984,11 @@ public sealed partial class RunPipeline(
         }
         if (workspace is null)
         {
-            workspace = await workspaces.PrepareAsync(repo, branch, ct);
+            // A plan's story starts from its plan's changeset branch (sc-25872), so it sees the stories that blocked it.
+            workspace = await workspaces.PrepareAsync(repo, branch, ct, baseBranch);
         }
         run.Workspace = workspace;
-        log.WriteLine($"[implement] worktree {workspace.Path} on {workspace.Branch}");
+        log.WriteLine($"[implement] worktree {workspace.Path} on {workspace.Branch}{(baseBranch is null ? "" : $" from {baseBranch}")}");
 
         if (!attempt.Any(e => e.Step == Steps.WorkerDone))
         {
@@ -1426,12 +1479,14 @@ public sealed partial class RunPipeline(
         Workspace? workspace = null;
         if (!Lifecycle.IsTerminal(item.State))
         {
-            var attempt = CurrentWorkerAttempt(await ledger.HistoryAsync(item, ct));
+            var history = await ledger.HistoryAsync(item, ct);
+            var attempt = CurrentWorkerAttempt(history);
             if (OrphanedWorkerPid(attempt) is { } pid && await worker.StopOrphanAsync(pid, ct))
             {
                 await ledger.CheckpointAsync(item, Steps.OrphanKilled, null, $"pid {pid}", ct);
             }
-            workspace = await workspaces.ReopenAsync(repo, Naming.BranchName(storyId), ct);
+            // A plan item's worktree is its changeset branch's (sc-25872); only the worktree is removed, the branch stays.
+            workspace = await workspaces.ReopenAsync(repo, Plans.Changeset.Of(history, repo)?.Branch ?? Naming.BranchName(storyId), ct);
         }
         return await FinishStopAsync(item, storyId, repo, workspace, workerStillRunning: false);
     }
@@ -1649,14 +1704,14 @@ public sealed partial class RunPipeline(
     }
 
     /// <summary>
-    /// Whether a worktree directory (<c>factory-sc-&lt;id&gt;</c>, <c>factory-gh-&lt;id&gt;</c>) belongs to an item a re-run would resume
+    /// Whether a worktree directory (<c>factory-sc-&lt;id&gt;</c>, <c>factory-gh-&lt;id&gt;</c>, or a plan item's changeset worktree
+    /// <c>factory-changeset-sc-&lt;id&gt;</c>, sc-25872) belongs to an item a re-run would resume
     /// in it (Implement, a fix round in Fixing or CIHealing, or Paused), so the startup sweep must keep it. Everything else is an orphan
     /// (a triage worktree, <c>factory-triage-gh-&lt;id&gt;</c>, never is).
     /// </summary>
     public static async Task<bool> WorktreeIsResumableAsync(WorkLedger ledger, string worktreeName, CancellationToken ct)
     {
-        const string prefix = "factory-";
-        if (!worktreeName.StartsWith(prefix, StringComparison.Ordinal) || ItemNaming.ParseAny(worktreeName[prefix.Length..]) is not { } item)
+        if (ItemNaming.OfWorktree(worktreeName) is not { } item)
         {
             return false;
         }
@@ -1908,6 +1963,12 @@ public sealed partial class RunPipeline(
     /// The PR's description, rendered from the item's ledger rows and recorded session costs (<see cref="LedgerReport.PullRequestBody"/>): it
     /// links back to the item and, for an item that closes an issue (<see cref="WorkStory.Closes"/>), carries GitHub's closing keyword.
     /// </summary>
-    private async Task<string> PullRequestBodyAsync(Run run, CancellationToken ct) =>
-        LedgerReport.PullRequestBody(run.Story, await ledger.HistoryAsync(run.Item, ct), await ledger.SessionCostsAsync(run.Item, ct));
+    private async Task<string> PullRequestBodyAsync(Run run, CancellationToken ct)
+    {
+        var history = await ledger.HistoryAsync(run.Item, ct);
+        var costs = await ledger.SessionCostsAsync(run.Item, ct);
+        return run.Changeset is { } changeset
+            ? LedgerReport.ChangesetPullRequestBody(run.Item.ExternalId, run.Story.AppUrl, changeset, await PlanStoryReportsAsync(history, ct), history, costs)
+            : LedgerReport.PullRequestBody(run.Story, history, costs, run.BaseBranch);
+    }
 }

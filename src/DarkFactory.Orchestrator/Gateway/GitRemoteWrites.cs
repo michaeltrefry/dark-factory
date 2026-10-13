@@ -4,7 +4,7 @@ namespace DarkFactory.Orchestrator.Gateway;
 
 /// <summary>
 /// The factory's only git remote writes and git credentials (E2, sc-25390): the arguments of every <c>git push</c> (a
-/// worker's branch, the merge queue's base-update push) and the environment that authenticates git to GitHub with an
+/// worker's branch, the merge queue's base-update push, a plan's new changeset branch) and the environment that authenticates git to GitHub with an
 /// installation token (through git's environment-based config, so the token never appears in argv, remotes or files).
 /// <c>GitWorkspace</c> runs them; the gateway lint (DF0002) fails the build on a <c>push</c> or <c>remote set-url</c>
 /// argument anywhere else in the orchestrator or the acceptance tests.
@@ -17,6 +17,13 @@ public static class GitRemoteWrites
     /// </summary>
     public static string[] Push(IReadOnlyList<string> tree, string branch, bool force) =>
         [.. tree, "push", .. (force ? ["--force"] : Array.Empty<string>()), "origin", $"HEAD:refs/heads/{branch}"];
+
+    /// <summary>
+    /// <c>git push origin &lt;sha&gt;:refs/heads/&lt;branch&gt;</c>, never forced: creates <paramref name="branch"/> at a commit the
+    /// clone already has (a plan's changeset branch at the default branch's head, sc-25872). A branch that exists on origin and is
+    /// not an ancestor of the commit refuses it, so nothing is ever reset.
+    /// </summary>
+    public static string[] CreateBranch(string sha, string branch) => ["push", "origin", $"{sha}:refs/heads/{branch}"];
 
     /// <summary>
     /// <c>push &lt;remote&gt; &lt;refspec&gt;</c>: the live acceptance test's probe pushes (and deletes, <c>:&lt;ref&gt;</c>) of an

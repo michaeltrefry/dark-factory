@@ -356,6 +356,14 @@ public static class PlanRelease
         $"{WorkSourceComments.Author} {story} was released by its plan {plan}, which {by} stopped before the factory started this story: "
         + "it is back in the backlog and the factory will not start it. The factory did no work on it; nothing was changed, merged or deleted.";
 
+    /// <summary>
+    /// The comment a plan's story gets when it is stopped though the factory never claimed it (the ledger knows it only as parked on
+    /// a refused claim, e.g. a blocker that had not merged): the factory did no work on it, and the comment does not say it did.
+    /// </summary>
+    public static string NeverClaimedComment(string story, string by) =>
+        $"{WorkSourceComments.Author} {story} was stopped by {by} before the factory started it: it is back in the backlog and the factory "
+        + "will not start it. The factory did no work on it; nothing was changed, merged or deleted.";
+
     /// <summary>The words a <c>plan-held</c> row starts with when the plan could not be evaluated at all (<see cref="RunPipeline.GiveUpAsync"/>).</summary>
     public const string NotEvaluatedPrefix = "not evaluated: ";
 

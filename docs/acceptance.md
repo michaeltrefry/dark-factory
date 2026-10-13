@@ -477,20 +477,30 @@ CodeGraph story sc-25846).
 #46 merged; #47 (P3-AT4a, critical file) escalated on risk-threshold, not merged; #42 (P3-AT4b) blocked at the timeout, not merged;
 issue #45 was P3-AT3's fixture.
 
-## P4-AT1 — a plan item is planned into stories and releases them in dependency order (sc-25870, sc-25871)
+## P4-AT1 — a plan item is planned into stories, released in dependency order, merged into its changeset branch and then into the default branch (sc-25870, sc-25871, sc-25872)
 
-`PlanAcceptanceTests.A_plan_item_is_planned_by_a_real_planner_into_backlog_stories_created_once_and_released_in_dependency_order`:
+`PlanAcceptanceTests.A_plan_item_is_planned_by_a_real_planner_into_stories_released_in_dependency_order_merged_into_its_changeset_branch_and_then_into_the_default_branch`:
 `factory run` on a `plan`-labelled story with the real planner (a sandboxed read-only session on the `high` class, CodeGraph and
-Kanban through the loopback proxy when their tokens are configured), a throwaway ledger and its own work root. It goes as far as
-"stories released in order": the stories are not worked (each released tier's Merge rows are seeded in the throwaway ledger, which
-is all the release reads) and the last tier is left unmerged, so the plan is never closed out on the real board. Later stories of
-the epic extend it.
+Kanban through the loopback proxy when their tokens are configured), a throwaway ledger and its own work root. Since sc-25872 it
+goes all the way: each released story is really worked (`factory run` on it: implemented from the plan's changeset branch,
+reviewed by the panel, merged by the gate into `factory/changeset-sc-<plan>`), and once every story has merged the plan item's own
+runs open one pull request from the changeset branch to the default branch and take it through Review → CI → MergeGate → Merge.
+It is the most expensive acceptance test (one implementer and one review per story, plus the changeset's review): keep the plan
+story small.
 
-Prerequisites: everything AT2 needs (router with an enrolled plan, both GitHub Apps, the Shortcut token, the sandbox set up), and
-`FACTORY_E2E_P4_PLAN_STORY=sc-<id>`: a **To Do** story carrying the `plan` label whose repository is the sandbox (the default
-repo, or a `Repo:` line) and whose description is work worth two or more stories. The test writes to that story's board: it claims
-the plan story (In Progress) and creates the plan's stories in the Backlog of its team and epic, then moves them to To Do as
-they are released; it archives the created stories when it ends (best effort), and leaves the plan story claimed. **Stop any
+Prerequisites: everything AT2 needs (router with an enrolled plan, both GitHub Apps, the Shortcut token, the sandbox set up, a
+`factory/gate.yaml` on the sandbox's default branch), and `FACTORY_E2E_P4_PLAN_STORY=sc-<id>`: a **To Do** story carrying the
+`plan` label whose repository is the sandbox (the default repo, or a `Repo:` line) and whose description is work worth two or
+three small stories, each of which can pass the sandbox's gate on its own (e.g. each a documentation change under the policy's
+free tier, or a code change with a test that fails on its base) and which together stay inside the policy's `risk` limits — the
+changeset pull request is gated as a whole. The sandbox's CI must run for pull requests whose base is `factory/changeset-*` (a
+workflow whose `pull_request` trigger is limited to `branches: [main]` reports nothing there, and the story's CI wait times out).
+The test writes to that story's board: it claims the plan story (In Progress) and creates the plan's stories in the Backlog of
+its team and epic, moves them to To Do as they are released, works them (claimed, then Done as each merges into the changeset
+branch), and finally reports the plan story Done with its closeout; it archives the created stories when it ends (best effort).
+On GitHub it creates `factory/changeset-sc-<id>`, one pull request per story into it and one from it into the default branch,
+all merged by the gate App; the changeset branch is left on the sandbox (delete it by hand, or let GitHub's "automatically
+delete head branches" do it). **Stop any
 `factory work` whose watch scope covers that team or epic first** (or use a team and epic nothing watches): a released story is an
 ordinary To Do story, and a running factory would claim and implement it.
 
@@ -499,14 +509,32 @@ FACTORY_E2E=1 FACTORY_E2E_P4_PLAN_STORY=sc-<id> \
   dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-class "*PlanAcceptanceTests"
 ```
 
-Expected evidence: the run succeeds with the item `Planned` (transitions Intake → Plan → Planned, no PR); one `session` row whose
+Expected evidence: the first run succeeds with the item `Planned` (transitions Intake → Plan → Planned, no PR); `changeset` then
+`changeset-pushed` rows between `plan-creating` and `plan-stories`, naming `factory/changeset-sc-<id>` in the sandbox, the branch on
+GitHub at the recorded commit and no pull request for it yet; one `session` row whose
 `worker-model-class` is `high` and whose `session_taints` hold `planner`; the `plan` checkpoint parses under every rule
 (`Plan.FromDetail`); `plan-stories` lists one distinct id per plan story, and each of those stories, read back from Shortcut, has the
 plan's title, is in Backlog, carries the planned-story marker and is blocked (`blocks` links) by exactly the stories its plan entry
 names. Every later `factory run` runs no planner and creates no story: the first releases exactly the stories nothing blocks (To Do
-on the board, one `plan-released` row each, the rest still in Backlog); after each released tier's Merge rows are seeded, the next
-run releases exactly the stories whose blockers are all merged, until every story is released; a run with nothing newly merged adds
-no ledger row and moves no story; no `closeout` row is written.
+on the board, one `plan-released` row each, the rest still in Backlog); a run with nothing newly merged adds no ledger row and
+moves no story. Each released story's own run ends in `Watch` with exactly one pull request whose base is the changeset branch,
+merged, a `verdict` row and a `merge-files` row naming the changeset branch as its base; after each tier the next plan run
+releases exactly the stories whose blockers are all merged; while any story is unmerged the plan item has no `merged-reported`
+or `closeout` row and the default branch has not moved. Once every story has merged, the plan item's next runs end in `Watch`
+(… Planned → Review → CI → MergeGate → Merge → Watch): exactly one pull request from `factory/changeset-sc-<id>` into the default
+branch, merged, its description starting `Changeset of plan`; a passing `verdict` on its head with every review on the `high`
+class, a `gate-passed` row and a `merge-files` row whose base is the default branch; the default branch's head is the merge commit
+of the plan item's Merge row; one `closeout` `posted`, and the plan story's comment says `sc-<id>'s plan is complete: n of its n
+stories merged` and `Its changeset merged into \`main\` as \`<merge commit>\``.
+
+Not exercised live, covered by `ChangesetPipelineTests` against the simulated repository (sc-25872): a pull request whose base is
+not the one the ledger expects (a story's PR switched to the default branch, an adopted PR with another base) escalates
+`<url> targets <base>, not <expected>` unreviewed and unmerged; a plan story whose `Repo:` line names a repository its plan has
+no changeset in escalates and opens no pull request; a changeset pull request someone merged by hand closes the plan out on its
+re-run (`changeset-empty`: `changeset pull request <url> was merged outside the factory`) instead of opening another; Stop on a
+plan item whose changeset pull request is open stops its unfinished stories, drafts that pull request and cancels the plan once.
+If the sandbox's default-branch policy has `risk.max_changed_lines`/`max_changed_files` sized for one story, the changeset pull
+request of this test escalates on `risk-threshold`: size them for the plan.
 
 Not run live yet (2026-10-12): written with sc-25870 and extended with sc-25871, to be run by the owner. The live run is also the
 first time the release's Shortcut requests meet the real API: `GET stories/{id}` returning a story with `story_links`, and

@@ -203,7 +203,7 @@ public class MergeQueueTests
 
         private static Workspace Ws(string branch) => new($"/wt/{branch}", branch, "main", $"/clone/.git/worktrees/{branch}");
 
-        public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct)
+        public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null)
         {
             lock (_gate)
             {
@@ -212,7 +212,7 @@ public class MergeQueueTests
             }
         }
 
-        public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct)
+        public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null)
         {
             lock (_gate)
             {
@@ -223,13 +223,17 @@ public class MergeQueueTests
             }
         }
 
-        public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct)
+        public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null)
         {
             lock (_gate)
             {
                 return Task.FromResult(_local.ContainsKey(branch) ? Ws(branch) : null);
             }
         }
+
+        // This repository has one branch to merge into (a plan's changeset branch: ChangesetPipelineTests.BranchRepo).
+        public Task<BranchStart> BranchStartAsync(RepoRef repo, string branch, CancellationToken ct) => throw new NotSupportedException();
+        public Task<string> CreateBranchAsync(RepoRef repo, string branch, string sha, CancellationToken ct) => throw new NotSupportedException();
 
         public Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, PushGrant grant, CancellationToken ct)
         {

@@ -77,6 +77,22 @@ public sealed partial class RunPipeline
     }
 
     /// <summary>
+    /// Fails closed unless the pull request targets the base the ledger expects (sc-25872): the changeset branch of the item's plan,
+    /// or the repository's default branch — the one a plan item's changeset recorded, else the one GitHub names in the same answer
+    /// (no further call; an answer naming none is not checked). A pull request can be retargeted by a person, or by GitHub when its
+    /// base branch is deleted, and an open one of the head is adopted whatever its base: reviewing or merging it would put the work
+    /// on a branch the gate did not judge it for. The item escalates.
+    /// </summary>
+    private static void EnsureBase(Run run, PullFacts pull)
+    {
+        var expected = run.BaseBranch ?? run.Changeset?.Base ?? pull.DefaultBranch;
+        if (expected is not null && !string.Equals(pull.BaseRef, expected, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException($"{pull.HtmlUrl} targets {pull.BaseRef}, not {expected}.");
+        }
+    }
+
+    /// <summary>
     /// Review: the review panel judges the PR's current head commit — correctness and spec conformance always, security when
     /// the diff touches a path whose tier in the base branch's <c>factory/gate.yaml</c> requires it
     /// or that the code floor <see cref="RiskyPaths"/> matches (<see cref="GatePolicy.SecurityReviewReasons"/>; a missing or invalid
@@ -100,6 +116,7 @@ public sealed partial class RunPipeline
     {
         var (history, pull) = await ReadPullAsync(run, ct);
         EnsureOpen(pull);
+        EnsureBase(run, pull);
         var fix = PendingFixRound(history);
         if (fix is { Stuck: { } stuckReason })
         {
@@ -147,6 +164,13 @@ public sealed partial class RunPipeline
                 + $"({string.Join("; ", verdict.Reviews.SelectMany(ReviewModels.Problems))}); reviewing it again");
             verdict = null;
         }
+        if (verdict is { Passed: false } && run.Changeset is not null && fix is null && FailedBeforeThisAttempt(history, verdict))
+        {
+            // A re-run of an escalated changeset pull request (sc-25872) has no Implement to make a new head, so the failed
+            // verdict the escalation left on this head would only fail it again: the panel reviews the head afresh, once.
+            log.WriteLine($"[review] {Ci.Short(pull.HeadSha)}: its failed verdict is from before this run of the changeset pull request; reviewing it again");
+            verdict = null;
+        }
         if (verdict is null)
         {
             verdict = await ReviewPanelAsync(run, pull, previous, ciFix is null ? null : (ciFix.FixedHead, ciFix.PushedHead!), ct);
@@ -178,6 +202,17 @@ public sealed partial class RunPipeline
         }
         log.WriteLine($"[review] {open.Count} confirmed blocking finding(s); fix round {rounds + 1} of {cap.Rounds}");
         await ledger.RecordAsync(run.Item, WorkState.Fixing, null, pull.HeadSha, ct);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="verdict"/>'s row — the latest for its head — was recorded before the plan item last entered Review
+    /// from Planned, i.e. by an earlier run of its changeset pull request that has since escalated and been re-queued.
+    /// </summary>
+    private static bool FailedBeforeThisAttempt(List<LedgerEntry> history, ReviewVerdict verdict)
+    {
+        var planned = history.FindLastIndex(e => e.Step is null && e.State == WorkState.Planned);
+        var recorded = history.FindLastIndex(e => e.Step == Steps.Verdict && ReviewVerdict.FromDetail(e.Detail)?.HeadSha == verdict.HeadSha);
+        return planned >= 0 && recorded < planned;
     }
 
     /// <summary>
@@ -259,7 +294,7 @@ public sealed partial class RunPipeline
     internal static string StuckRounds(IReadOnlyList<LedgerEntry> history)
     {
         var transitions = history.Where(e => e.Step is null).ToList();
-        var implemented = transitions.FindLastIndex(e => e.State == WorkState.Implement && e.Detail != "unpaused");
+        var implemented = transitions.FindLastIndex(e => TransitionContext.StartsAttempt(e.State) && e.Detail != "unpaused");
         var (round, kind) = (0, "");
         var stuck = new List<string>();
         for (var i = Math.Max(implemented, 0) + 1; i < transitions.Count; i++)
@@ -289,7 +324,7 @@ public sealed partial class RunPipeline
                 continue;
             }
             var state = history[i].State;
-            if (state == WorkState.Implement)
+            if (TransitionContext.StartsAttempt(state))
             {
                 (at, round) = (-1, 0);
             }
@@ -466,6 +501,7 @@ public sealed partial class RunPipeline
 
         // CodeGraph's overlay of the head (sc-25708), asked for once, before the first panel call, only when a role is reviewed here.
         var overlay = toReview.Count > 0 ? await OverlayForReviewAsync(run, pull, ct) : null;
+        var story = await ReviewStoryAsync(run, ct);
         var reviews = new List<RoleReview>();
         foreach (var role in roles)
         {
@@ -477,7 +513,7 @@ public sealed partial class RunPipeline
             var prompt = ReviewPrompts.For(role);
             var session = await NameReviewSessionAsync(run, pull, role, prompt, ct);
             var review = await RouterCallAsync(() => Gate.Reviewer.ReviewAsync(
-                new ReviewRequest(run.Story, run.Repo.FullName, pull, diff, files, role, prompt, session, overlay), ct), ct);
+                new ReviewRequest(story, run.Repo.FullName, pull, diff, files, role, prompt, session, overlay), ct), ct);
             if (review.Clean)
             {
                 var findings = new List<Finding>();
@@ -642,7 +678,8 @@ public sealed partial class RunPipeline
         var attempt = CurrentWorkerAttempt(history);
         var session = attempt.LastOrDefault(e => e.Step == Steps.Session)?.ClaudeSessionId;
         var models = ImplementerModels(history).ToHashSet(StringComparer.Ordinal);
-        var branch = spec.Story.Kind.BranchName(spec.Story.Id);
+        // The PR's branch: the item's own, or a plan item's changeset branch (sc-25872), which is only ever fast-forwarded.
+        var (branch, baseBranch) = (run.Branch, run.BaseBranch);
 
         if (OrphanedWorkerPid(attempt) is { } pid && await worker.StopOrphanAsync(pid, ct))
         {
@@ -654,7 +691,7 @@ public sealed partial class RunPipeline
         // A fixer found looping is never resumed (a run that stopped after the detection left only its checkpoint): the round failed.
         if (pushed is null && StuckSession(attempt) is { } found)
         {
-            run.Workspace = await workspaces.ReopenAsync(repo, branch, ct);
+            run.Workspace = await workspaces.ReopenAsync(repo, branch, ct, baseBranch);
             await StuckFixRoundAsync(run, found, next, name, ct);
             return;
         }
@@ -663,7 +700,7 @@ public sealed partial class RunPipeline
             Workspace? workspace = null;
             if (attempt.Any(e => e.Step is not null))
             {
-                workspace = await workspaces.ReopenAsync(repo, branch, ct);
+                workspace = await workspaces.ReopenAsync(repo, branch, ct, baseBranch);
                 if (workspace is null)
                 {
                     await ledger.CheckpointAsync(item, Steps.WorktreeLost, session, $"worktree missing on resume; starting {name} over", ct);
@@ -674,7 +711,7 @@ public sealed partial class RunPipeline
             // The fixer works on the PR's branch as pushed (the commit under review), not on the base branch.
             if (workspace is null)
             {
-                workspace = await workspaces.RestoreAsync(repo, branch, ct);
+                workspace = await workspaces.RestoreAsync(repo, branch, ct, baseBranch);
                 run.Workspace = workspace;
                 if (prepare is not null)
                 {
@@ -711,7 +748,7 @@ public sealed partial class RunPipeline
         }
         else
         {
-            run.Workspace = await workspaces.ReopenAsync(repo, branch, ct);
+            run.Workspace = await workspaces.ReopenAsync(repo, branch, ct, baseBranch);
         }
         await ThrowIfControlledAsync(item, ct);
         if (afterPush is not null)
@@ -891,8 +928,9 @@ public sealed partial class RunPipeline
     {
         var prompt = ReviewPrompts.Confirm;
         var session = await NameReviewSessionAsync(run, pull, $"confirm-{review.Role}", prompt, ct);
+        var story = await ReviewStoryAsync(run, ct);
         var confirmation = await RouterCallAsync(() => Gate.Reviewer.ConfirmAsync(
-            new ConfirmRequest(run.Story, run.Repo.FullName, pull, diff, files, review.Role, finding, prompt, session, overlay), ct), ct);
+            new ConfirmRequest(story, run.Repo.FullName, pull, diff, files, review.Role, finding, prompt, session, overlay), ct), ct);
         log.WriteLine($"[review] {review.Role} finding '{finding.Title}': {confirmation.Outcome} by {confirmation.ServedName} ({confirmation.ServedClass ?? "no class named"})");
         return finding.ConfirmedBy(confirmation);
     }
@@ -1251,7 +1289,12 @@ public sealed partial class RunPipeline
         string? error = null;
         try
         {
-            var closeout = LedgerReport.MergedCloseout(item.ExternalId, await ledger.HistoryAsync(item, ct), await ledger.SessionCostsAsync(item, ct));
+            var history = await ledger.HistoryAsync(item, ct);
+            var costs = await ledger.SessionCostsAsync(item, ct);
+            // A plan item's merge is its changeset's (sc-25872): its closeout lists the plan's stories, then the changeset's own facts.
+            var closeout = await PlanStoryReportsAsync(history, ct) is { Count: > 0 } stories
+                ? LedgerReport.PlanCloseout(item.ExternalId, stories, null, (history, costs))
+                : LedgerReport.MergedCloseout(item.ExternalId, history, costs);
             await source.CommentAsync(storyId, closeout, ct);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)

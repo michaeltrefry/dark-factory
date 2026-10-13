@@ -606,6 +606,148 @@ public class GitWorkspaceTests
         Assert.Equal(moved, Git(_remote, "rev-parse", "factory/sc-22").Trim());
     }
 
+    // ---- a plan's changeset branch (sc-25872): created once, a base for the plan's stories, only ever fast-forwarded ----
+
+    private const string Changeset = "factory/changeset-sc-5";
+
+    /// <summary>A commit on the remote's <paramref name="branch"/> from outside the factory's clone; returns its sha.</summary>
+    private string AdvanceBranch(string branch, string file, string content)
+    {
+        var other = Path.Combine(_root, $"other-{Guid.NewGuid():N}");
+        Git(_root, "clone", "-q", "-b", branch, _remote, other);
+        File.WriteAllText(Path.Combine(other, file), content);
+        Git(other, "add", ".");
+        Git(other, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", $"{branch}: {file}");
+        Git(other, "push", "-q", "origin", branch);
+        return Git(other, "rev-parse", "HEAD").Trim();
+    }
+
+    [Fact]
+    public async Task A_changeset_branch_is_created_at_the_default_branchs_head_with_the_app_token_and_one_origin_has_is_adopted_as_it_is()
+    {
+        var workspace = Workspace();
+        var main = Git(_remote, "rev-parse", "main").Trim();
+
+        var start = await workspace.BranchStartAsync(Repo, Changeset, CancellationToken.None);
+
+        Assert.Equal(new BranchStart("main", main, null), start);
+        Assert.DoesNotContain(_gitCalls, c => Subcommand(c.Args) == "push"); // reading where it would start pushes nothing
+        _gitCalls.Clear();
+        Assert.Equal(main, await workspace.CreateBranchAsync(Repo, Changeset, start.BaseSha, CancellationToken.None));
+        Assert.Equal(main, Git(_remote, "rev-parse", Changeset).Trim());
+        // One plain push of that commit to the new ref: never forced, the App token in git's environment, no worktree involved.
+        var push = Assert.Single(_gitCalls, c => Subcommand(c.Args) == "push");
+        Assert.Equal(["push", "origin", $"{main}:refs/heads/{Changeset}"], push.Args.SkipWhile(a => a != "push"));
+        Assert.DoesNotContain("--force", push.Args);
+        Assert.Equal($"AUTHORIZATION: basic {BasicAuth}", push.Env!["GIT_CONFIG_VALUE_0"]);
+        Assert.False(Directory.Exists(Path.Combine(_root, "work", "worktrees")));
+
+        // Stories merge into it and the default branch moves on: asked again, it is adopted where it is, not reset to either commit.
+        var merged = AdvanceBranch(Changeset, "story.txt", "a story\n");
+        var moved = AdvanceMain("other.txt", "x\n");
+        _gitCalls.Clear();
+        Assert.Equal(new BranchStart("main", moved, merged), await workspace.BranchStartAsync(Repo, Changeset, CancellationToken.None));
+        Assert.Equal(merged, await workspace.CreateBranchAsync(Repo, Changeset, moved, CancellationToken.None));
+        Assert.Equal(merged, await workspace.CreateBranchAsync(Repo, Changeset, main, CancellationToken.None));
+        Assert.Equal(merged, Git(_remote, "rev-parse", Changeset).Trim());
+        Assert.DoesNotContain(_gitCalls, c => Subcommand(c.Args) == "push");
+
+        // Only under factory/: the rulesets let the factory's App write nowhere else.
+        await Assert.ThrowsAsync<InvalidOperationException>(() => workspace.CreateBranchAsync(Repo, "release/1", main, CancellationToken.None));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => workspace.BranchStartAsync(Repo, "main", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task A_plan_storys_worktree_starts_from_its_changeset_branch_which_is_the_base_it_is_pushed_and_updated_against()
+    {
+        var workspace = Workspace();
+        var main = Git(_remote, "rev-parse", "main").Trim();
+        await workspace.CreateBranchAsync(Repo, Changeset, main, CancellationToken.None);
+        AdvanceBranch(Changeset, "first.txt", "the story that blocked this one\n");
+
+        // Nothing of its own yet: not ahead of its base, though the changeset branch is ahead of the default branch.
+        var ws = await workspace.PrepareAsync(Repo, "factory/sc-9", CancellationToken.None, Changeset);
+        Assert.Equal(Changeset, ws.BaseBranch);
+        Assert.True(File.Exists(Path.Combine(ws.Path, "first.txt"))); // it sees its blocker's merged code
+        Assert.False(await workspace.CommitAndPushAsync(Repo, ws, "sc-9: nothing", TestGrants.Untainted, CancellationToken.None));
+
+        File.WriteAllText(Path.Combine(ws.Path, "second.txt"), "this story\n");
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-9: second", TestGrants.Untainted, CancellationToken.None));
+        Assert.Equal(Changeset, (await workspace.ReopenAsync(Repo, "factory/sc-9", CancellationToken.None, Changeset))!.BaseBranch);
+        await workspace.RemoveAsync(Repo, ws, CancellationToken.None);
+
+        // Both branches move; the story's branch is updated from its own base, the changeset branch, and gets nothing of main's.
+        var changeset = AdvanceBranch(Changeset, "third.txt", "another story\n");
+        AdvanceMain("main-only.txt", "not this plan's\n");
+        var restored = await workspace.RestoreAsync(Repo, "factory/sc-9", CancellationToken.None, Changeset);
+        var merge = await workspace.MergeBaseAsync(Repo, restored, CancellationToken.None);
+        Assert.Equal((changeset, false, false), (merge.BaseSha, merge.Conflicted, merge.UpToDate));
+        Assert.True(File.Exists(Path.Combine(restored.Path, "third.txt")));
+        Assert.False(File.Exists(Path.Combine(restored.Path, "main-only.txt")));
+
+        // A base is the default branch or a changeset branch that exists on origin: nothing else.
+        var notChangeset = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => workspace.PrepareAsync(Repo, "factory/sc-10", CancellationToken.None, "factory/sc-9"));
+        Assert.Contains("Refusing to base 'factory/sc-10' on 'factory/sc-9'", notChangeset.Message);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => workspace.PrepareAsync(Repo, Changeset, CancellationToken.None, Changeset));
+        var missing = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => workspace.PrepareAsync(Repo, "factory/sc-10", CancellationToken.None, "factory/changeset-sc-404"));
+        Assert.Contains("has no branch 'factory/changeset-sc-404' on origin", missing.Message);
+    }
+
+    [Fact]
+    public async Task A_fix_rounds_push_to_a_changeset_branch_is_never_forced_so_one_that_would_lose_a_commit_is_refused()
+    {
+        var workspace = Workspace();
+        await workspace.CreateBranchAsync(Repo, Changeset, Git(_remote, "rev-parse", "main").Trim(), CancellationToken.None);
+        AdvanceBranch(Changeset, "story.txt", "a merged story\n");
+
+        // The changeset pull request's fixer works on the changeset branch itself, against the default branch.
+        var ws = await workspace.RestoreAsync(Repo, Changeset, CancellationToken.None);
+        Assert.Equal("main", ws.BaseBranch);
+        File.WriteAllText(Path.Combine(ws.Path, "fix.txt"), "fixed\n");
+        _gitCalls.Clear();
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "sc-5: fix review findings", TestGrants.Untainted, CancellationToken.None));
+        Assert.DoesNotContain("--force", Assert.Single(_gitCalls, c => Subcommand(c.Args) == "push").Args);
+        var pushed = Git(_remote, "rev-parse", Changeset).Trim();
+        Assert.Equal(pushed, await workspace.HeadAsync(ws, CancellationToken.None));
+
+        // Origin's changeset branch moved after the worktree was made: the push fails and origin keeps what it has.
+        var moved = AdvanceBranch(Changeset, "late.txt", "merged meanwhile\n");
+        File.WriteAllText(Path.Combine(ws.Path, "fix2.txt"), "fixed again\n");
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => workspace.CommitAndPushAsync(Repo, ws, "sc-5: fix again", TestGrants.Untainted, CancellationToken.None));
+        Assert.Equal(moved, Git(_remote, "rev-parse", Changeset).Trim());
+
+        // An item's own branch is still overwritten (a re-run after an escalation starts over from the base).
+        var own = await workspace.PrepareAsync(Repo, "factory/sc-9", CancellationToken.None);
+        File.WriteAllText(Path.Combine(own.Path, "own.txt"), "x\n");
+        _gitCalls.Clear();
+        Assert.True(await workspace.CommitAndPushAsync(Repo, own, "sc-9: own", TestGrants.Untainted, CancellationToken.None));
+        Assert.Contains("--force", Assert.Single(_gitCalls, c => Subcommand(c.Args) == "push").Args);
+    }
+
+    [Fact]
+    public async Task A_changesets_changed_files_are_its_stories_files_even_after_the_default_branch_was_merged_into_it()
+    {
+        // What the new-tests check reads for the changeset pull request (git diff base...head): everything the stories added,
+        // and nothing the default branch brought in when the merge queue updated the changeset branch from it.
+        var workspace = Workspace();
+        await workspace.CreateBranchAsync(Repo, Changeset, Git(_remote, "rev-parse", "main").Trim(), CancellationToken.None);
+        AdvanceBranch(Changeset, "a_tests.rs", "#[test] fn a() {}\n");
+        AdvanceBranch(Changeset, "b_tests.cs", "[Fact] void B() {}\n");
+        var main = AdvanceMain("main-only.txt", "not this plan's\n");
+        var ws = await workspace.RestoreAsync(Repo, Changeset, CancellationToken.None);
+        var merge = await workspace.MergeBaseAsync(Repo, ws, CancellationToken.None);
+        await workspace.PushAsync(Repo, ws, CancellationToken.None);
+        Assert.Equal(merge.Head, Git(_remote, "rev-parse", Changeset).Trim());
+
+        var changes = await workspace.ChangedFilesAsync(Repo, main, merge.Head, CancellationToken.None);
+
+        Assert.Equal([new Gate.ChangedFile('A', null, "a_tests.rs"), new Gate.ChangedFile('A', null, "b_tests.cs")],
+            changes.OrderBy(c => c.NewPath, StringComparer.Ordinal));
+    }
+
     // ---- owner-side git isolated from the owner's own git config (OwnerGit) ----
 
     [Fact]

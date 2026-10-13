@@ -440,13 +440,15 @@ public class PlanRepositorySetTests
             return Task.CompletedTask;
         }
 
-        public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct) => throw new NotSupportedException();
+        public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) => throw new NotSupportedException();
         public Task RemoveAsync(RepoRef repo, Workspace workspace, CancellationToken ct) => throw new NotSupportedException();
         public Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, PushGrant grant, CancellationToken ct) =>
             throw new NotSupportedException();
         public Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct) => throw new NotSupportedException();
-        public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct) => throw new NotSupportedException();
-        public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct) => throw new NotSupportedException();
+        public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) => throw new NotSupportedException();
+        public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) => throw new NotSupportedException();
+        public Task<BranchStart> BranchStartAsync(RepoRef repo, string branch, CancellationToken ct) => Task.FromResult(new BranchStart("main", "base0", null));
+        public Task<string> CreateBranchAsync(RepoRef repo, string branch, string sha, CancellationToken ct) => Task.FromResult(sha);
         public Task<string> HeadAsync(Workspace workspace, CancellationToken ct) => throw new NotSupportedException();
         public Task<BaseMerge> MergeBaseAsync(RepoRef repo, Workspace workspace, CancellationToken ct) => throw new NotSupportedException();
         public Task<IReadOnlyList<string>> ConflictMarkersAsync(RepoRef repo, string sha, IReadOnlyList<string> paths, CancellationToken ct) =>

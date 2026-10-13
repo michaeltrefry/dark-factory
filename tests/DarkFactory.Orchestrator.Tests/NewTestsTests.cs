@@ -284,6 +284,42 @@ public class NewTestsCheckTests
     }
 
     [Fact]
+    public async Task A_changesets_new_tests_are_the_union_of_its_stories_tests_each_judged_on_the_default_branch_base()
+    {
+        // sc-25872: the changeset pull request's head holds every story's tests; against the default-branch base each of them is
+        // new, in whichever test project its story put it, and each must fail there and pass on the changeset head.
+        const string second = "tests/Widgets.Tests/TrimTests.cs";
+        const string other = "tests/Gadgets.Tests/Gadgets.Tests.csproj";
+        var runner = WithHead(
+            (FakeTestRunner.NewTestFile, FakeTestRunner.NewTestSource), // story A
+            (second, "namespace Widgets.Tests; public class TrimTests { [Fact] public void Trims() { } }"), // story B, the same project
+            (other, FakeTestRunner.XunitProject), // story C, a test project of its own
+            ("tests/Gadgets.Tests/GadgetTests.cs", "namespace Gadgets.Tests; public class GadgetTests { [Fact] public void Spins() { } }"),
+            ("src/Widgets/TextTools.cs", "namespace Widgets; public static class TextTools { public static int WordCount(string s) => 0; }"));
+
+        var result = await Check(runner);
+
+        Assert.Equal(NewTestsOutcome.Pass, result.Outcome);
+        string[] all = ["Gadgets.Tests.GadgetTests.Spins", "Widgets.Tests.TrimTests.Trims", FakeTestRunner.NewTest];
+        Assert.Equal(all, result.Tests.Select(t => t.Test).Order(StringComparer.Ordinal));
+        // The base run is the default-branch base with every story's test files applied (production code stays the base's).
+        var onBase = runner.Runs[0];
+        Assert.Equal(Head, onBase.OverlayFrom);
+        Assert.Equal(["tests/Gadgets.Tests/GadgetTests.cs", other, second, FakeTestRunner.NewTestFile], onBase.OverlayPaths.Order(StringComparer.Ordinal));
+        Assert.Equal(all, FakeTestRunner.Filtered(onBase.Steps).Order(StringComparer.Ordinal));
+
+        // One story's test that passes on the default branch already checks nothing there: the changeset is rejected, naming it.
+        runner.Runs.Clear();
+        runner.Answer = spec => new TestRunReport(TestRunStatus.Ran, FakeTestRunner.Filtered(spec.Steps).ToDictionary(t => t,
+            t => (IReadOnlyList<TestCaseResult>)[new TestCaseResult(t, spec.OverlayFrom is null || t.EndsWith("Trims", StringComparison.Ordinal)
+                ? TestCaseResult.Passed : TestCaseResult.Failed)]), "ran");
+        var rejected = await Check(runner);
+        Assert.Equal(NewTestsOutcome.Rejected, rejected.Outcome);
+        Assert.Contains("Widgets.Tests.TrimTests.Trims", rejected.Reason);
+        Assert.DoesNotContain("GadgetTests.Spins", rejected.Reason);
+    }
+
+    [Fact]
     public async Task New_facts_and_theories_are_named_as_xunit_names_them_and_existing_ones_are_not_new()
     {
         var runner = WithHead((FakeTestRunner.NewTestFile, """

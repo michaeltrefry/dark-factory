@@ -168,6 +168,8 @@ public sealed partial class RunPipeline
                 }
                 EnsureOpen(pull);
             }
+            // Before anything is merged into the head or the head into anything: the base is the one the ledger expects (sc-25872).
+            EnsureBase(run, pull);
             var verdicts = Verdicts(history);
             if (!verdicts.Any(v => v.HeadSha == pull.HeadSha))
             {
@@ -253,7 +255,9 @@ public sealed partial class RunPipeline
     /// shows, merges the base into it owner-side (<see cref="Git.IRepoWorkspace.MergeBaseAsync"/>: no worker runs git), records
     /// the update (<see cref="Steps.BaseUpdate"/>: old head, base commit, merge commit) and only then pushes it to the
     /// <c>factory/*</c> branch with the factory App's token as a fast-forward (never forced; the factory/** rulesets let that App
-    /// write those branches and nothing else, and only the gate App merges into the base). A crash before the push leaves the
+    /// write those branches and nothing else, and only the gate App merges into the base). The base is the PR's own: the default
+    /// branch, or for a plan's story its plan's changeset branch (sc-25872), which the stories of the plan merged before it moved;
+    /// a plan item's changeset branch is itself updated from the default branch this way. A crash before the push leaves the
     /// PR at the old head, which is simply updated again. A conflict is checkpointed (<see cref="Steps.MergeConflict"/>, with the
     /// files) and sends the item to the fixer: MergeGate → Fixing, a fix round sharing the count and cap of review and CI
     /// rounds; with the cap used it escalates. The worktree is removed either way.
@@ -261,7 +265,7 @@ public sealed partial class RunPipeline
     private async Task<UpdateOutcome> UpdateFromBaseAsync(Run run, PullFacts pull, CancellationToken ct)
     {
         var (_, repo, item) = run;
-        var workspace = await workspaces.RestoreAsync(repo, run.Story.Kind.BranchName(run.Story.Id), ct);
+        var workspace = await workspaces.RestoreAsync(repo, run.Branch, ct, run.BaseBranch);
         run.Workspace = workspace;
         try
         {
@@ -499,6 +503,7 @@ public sealed partial class RunPipeline
         // Never merge into a frozen factory: main may have turned red (or another trigger tripped) while this run waited for
         // CI or its turn in the queue. Main-red is read fresh here, not from the evaluator's short cache.
         await ThrowIfFrozenAsync(run.Item, ct, fresh: true);
+        EnsureBase(run, pull);
         // What this merge changes, for the freeze (sc-25387): recorded before the merge, so every factory merge has it.
         var files = DiffPaths.Of(await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct));
         await ledger.CheckpointAsync(run.Item, Steps.MergeFiles, null, new MergeFiles(pull.BaseRef, files).ToDetail(), ct);

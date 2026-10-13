@@ -1,3 +1,4 @@
+using DarkFactory.Orchestrator.WorkSources;
 using System.Globalization;
 using System.Text.Json;
 using DarkFactory.Orchestrator.Gate;
@@ -424,18 +425,24 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
         var from = time.GetUtcNow() - options.HotFileWindow;
         var merges = (await MergesAsync(db, transitions, names, ct)).Where(m => m.Row.RecordedAt >= from && m.Files is not null).ToList();
         var hot = merges
-            .SelectMany(m => m.Files!.Files.Distinct(StringComparer.Ordinal).Select(f => (m.Repo, File: f, Merge: m)))
-            .GroupBy(x => (x.Repo, x.File))
+            .SelectMany(m => m.Files!.Files.Distinct(StringComparer.Ordinal).Select(f => (m.Repo, m.Files.Base, File: f, Merge: m)))
+            // Per base branch (sc-25872): a plan's story merges into its changeset branch and that branch later into the default
+            // branch, so counting across bases would count one change twice. Merges into one branch count as before.
+            .GroupBy(x => (x.Repo, x.Base, x.File))
             .Where(g => g.Count() >= options.HotFileMerges)
             .OrderByDescending(g => g.Count()).ThenBy(g => g.Key.Repo, StringComparer.Ordinal).ThenBy(g => g.Key.File, StringComparer.Ordinal)
+            .ThenBy(g => g.Key.Base, StringComparer.Ordinal)
             .FirstOrDefault();
         return hot is null
             ? null
             : new Hit(FreezeTrigger.HotFile,
-                $"{hot.Key.File} on {hot.Key.Repo} was changed by {hot.Count()} factory merges within {Hours(options.HotFileWindow)} "
+                $"{hot.Key.File} on {hot.Key.Repo} was changed by {hot.Count()} factory merges{IntoChangeset(hot.Key.Base)} within {Hours(options.HotFileWindow)} "
                 + $"({string.Join(", ", hot.Select(x => $"{Name(names, x.Merge.Row.WorkItemId)} as {Ci.Short(x.Merge.Row.Detail ?? "?")}"))}); "
                 + $"threshold {options.HotFileMerges}");
     }
+
+    /// <summary>" into &lt;branch&gt;" for a changeset branch; nothing for any other base (the wording a default-branch freeze always had).</summary>
+    private static string IntoChangeset(string baseBranch) => ItemNaming.IsChangesetBranch(baseBranch) ? $" into {baseBranch}" : "";
 
     private async Task<Hit?> CostRisingAsync(LedgerDbContext db, DateTimeOffset? since,
         Dictionary<long, (string ExternalId, string Repo, WorkState State)> names, CancellationToken ct)
@@ -451,7 +458,8 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
             var transitions = rows[id].ToList();
             // The round starts where the item entered Implement, not where a pause returned it there ("unpaused"): a resumed
             // session keeps its original start, which would fall outside a round begun at the return.
-            var implement = transitions.FindLastIndex(e => e.State == WorkState.Implement && e.Detail != "unpaused");
+            // A plan item's changeset pull request has no Implement (sc-25872): its rounds start where it last waited on its stories.
+            var implement = transitions.FindLastIndex(e => TransitionContext.StartsAttempt(e.State) && e.Detail != "unpaused");
             if (implement < 0)
             {
                 continue;
@@ -507,7 +515,12 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
         current.UnionWith(names.Values.Where(n => !Lifecycle.IsTerminal(n.State)).Select(n => n.Repo));
         var allMerges = await db.LedgerEntries.AsNoTracking().Where(e => e.Step == null && e.State == WorkState.Merge).OrderBy(e => e.Id).ToListAsync(ct);
         return (await MergesAsync(db, allMerges, names, ct))
-            .Where(m => m.Files is not null && m.Row.Detail is not null && m.Repo.Length > 0 && current.Contains(m.Repo))
+            // Main-red is about the branches the factory's changes end up on. A plan's changeset branch (sc-25872) is not one: red
+            // there freezes nothing — the next story's CI triage sees a base that is red and escalates that story, and the
+            // changeset's own pull request needs green CI on its head before the gate merges it into the default branch. Left out
+            // before the latest merge is picked, so a story merging into a changeset never hides the default branch's state.
+            .Where(m => m.Files is not null && m.Row.Detail is not null && m.Repo.Length > 0 && current.Contains(m.Repo)
+                && !ItemNaming.IsChangesetBranch(m.Files.Base))
             .GroupBy(m => m.Repo, StringComparer.OrdinalIgnoreCase)
             .Select(g => g.MaxBy(m => m.Row.Id)!)
             .OrderBy(m => m.Row.Id)

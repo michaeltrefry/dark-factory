@@ -266,7 +266,11 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
         var id = source.Naming.Format(storyId);
         var steps = history.Skip(history.FindLastIndex(e => e.Step is null) + 1).ToList();
         var session = history.LastOrDefault(e => e.ClaudeSessionId is not null)?.ClaudeSessionId;
-        var branch = source.Naming.BranchName(storyId);
+        // The item's pull request is its own branch's, or — a plan item's — its changeset branch's (sc-25872).
+        var branch = Plans.Changeset.Of(history, RepoRef.Parse(item.Repo))?.Branch ?? source.Naming.BranchName(storyId);
+        // A plan's story the ledger knows but the factory never claimed (parked on a refused claim, e.g. a blocker that had not
+        // merged): there is no work, claim or branch of it, and its comment does not say there was.
+        var unclaimed = plan is null && item.PlanItemId is not null && !history.Any(e => e.Step == RunPipeline.Steps.Claimed);
 
         var drafted = steps.LastOrDefault(e => e.Step == RunPipeline.Steps.PrsDrafted)?.Detail;
         if (drafted is null)
@@ -281,15 +285,18 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
             var what = plan is null
                 ? $"the factory cancelled its work on it (was {item.State}) and released its claim."
                 : $"the factory cancelled the plan (was {item.State}) and released its claim. {Stories(plan)}";
-            await source.ReportStateAsync(storyId, BoardState.Stopped,
-                $"{WorkSourceComments.Author} {id} was stopped by {by}: {what} "
-                + $"{prs} Branch {branch} is kept; nothing was merged or deleted.", ct);
+            await source.ReportStateAsync(storyId, BoardState.Stopped, unclaimed
+                ? PlanRelease.NeverClaimedComment(id, by)
+                : $"{WorkSourceComments.Author} {id} was stopped by {by}: {what} "
+                    + $"{prs} Branch {branch} is kept; nothing was merged or deleted.", ct);
             await ledger.CheckpointAsync(item, RunPipeline.Steps.StopReported, session, by, ct);
         }
         await ledger.RecordAsync(item, WorkState.Cancelled, session, $"stopped by {by}", ct);
         await controls.ClearAsync(ControlScope.Item(item.ExternalId), ct);
         log.WriteLine($"[cancelled] {id} stopped by {by}; PRs drafted: {drafted}");
-        return $"{id} stopped: Cancelled, PRs drafted: {drafted}, claim released." + (plan is null ? "" : $" {Stories(plan)}");
+        return unclaimed
+            ? $"{id} stopped: Cancelled; the factory never claimed it and did no work on it."
+            : $"{id} stopped: Cancelled, PRs drafted: {drafted}, claim released." + (plan is null ? "" : $" {Stories(plan)}");
     }
 
     /// <summary>What became of a stopped plan's stories, as its comment and the stop's result say it (ids only).</summary>

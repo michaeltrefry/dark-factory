@@ -138,8 +138,11 @@ public class FreezeTests
         public Task MergedIn(string repo, string commit, params string[] files) => MergedIn(repo, WorkState.Watch, commit, files);
 
         /// <summary>A factory merge into <paramref name="repo"/>'s main by an item now in <paramref name="final"/>.</summary>
-        public Task MergedIn(string repo, WorkState final, string commit, params string[] files) => ItemIn(repo, final,
-            (WorkState.MergeGate, RunPipeline.Steps.MergeFiles, new MergeFiles("main", files).ToDetail()),
+        public Task MergedIn(string repo, WorkState final, string commit, params string[] files) => MergedInto(repo, "main", final, commit, files);
+
+        /// <summary>A factory merge into <paramref name="baseBranch"/> of <paramref name="repo"/> (a plan's story merges into its changeset branch, sc-25872).</summary>
+        public Task MergedInto(string repo, string baseBranch, WorkState final, string commit, params string[] files) => ItemIn(repo, final,
+            (WorkState.MergeGate, RunPipeline.Steps.MergeFiles, new MergeFiles(baseBranch, files).ToDetail()),
             (WorkState.Merge, null, commit),
             (WorkState.Watch, null, commit));
 
@@ -681,6 +684,70 @@ public class FreezeTests
         await h.MergedIn("michaeltrefry/other-repo", "merge3aaaaaaaaaa", "src/hot.cs");
 
         Assert.Equal(FreezeStatus.Clear, await h.Freeze.CheckAsync(CancellationToken.None));
+    }
+
+    private const string ChangesetBranch = "factory/changeset-sc-9";
+
+    [Fact]
+    public async Task A_hot_file_is_counted_per_base_branch_so_a_changeset_and_its_stories_do_not_count_one_change_twice()
+    {
+        var h = new H();
+        // Two stories of a plan change one file on the plan's changeset branch, and the changeset then takes it to main: the same
+        // change, once per branch — never three merges of the file.
+        await h.MergedInto(Repo, ChangesetBranch, WorkState.Watch, "merge1aaaaaaaaaa", "src/hot.cs");
+        await h.MergedInto(Repo, ChangesetBranch, WorkState.Watch, "merge2aaaaaaaaaa", "src/hot.cs");
+        await h.Merged("merge3aaaaaaaaaa", "src/hot.cs");
+        Assert.Equal(FreezeStatus.Clear, await h.Freeze.CheckAsync(CancellationToken.None));
+
+        // Merges into one branch count as they always did: a third story changing the file on the changeset branch freezes.
+        await h.MergedInto(Repo, ChangesetBranch, WorkState.Watch, "merge4aaaaaaaaaa", "src/hot.cs");
+        var status = await h.Freeze.CheckAsync(CancellationToken.None);
+        Assert.Equal(FreezeTrigger.HotFile, status.Trigger);
+        Assert.Contains($"src/hot.cs on {Repo} was changed by 3 factory merges into {ChangesetBranch} within", status.Detail);
+
+        // And so do merges into the default branch, worded as before.
+        var main = new H();
+        await Seed(main, FreezeTrigger.HotFile, holds: true);
+        Assert.Contains($"src/hot.cs on {Repo} was changed by 3 factory merges within", (await main.Freeze.CheckAsync(CancellationToken.None)).Detail);
+    }
+
+    [Fact]
+    public async Task Main_red_reads_the_default_branch_after_its_latest_merge_and_never_a_changeset_branch()
+    {
+        var h = new H();
+        h.GitHub.Ci = new CiFacts(h.GitHub.Tip, [new CheckFact("build-test", true, "failure")]);
+
+        // A red changeset branch freezes nothing: only a story merged into it, so there is no default-branch merge to look at.
+        await h.MergedInto(Repo, ChangesetBranch, WorkState.Watch, "story1aaaaaaaaaa", "src/a.cs");
+        Assert.Equal(FreezeStatus.Clear, await h.Freeze.CheckAsync(CancellationToken.None));
+        Assert.Empty(h.GitHub.Calls);
+
+        // A later story merge into a changeset branch does not hide the default branch's own latest merge: main is still read.
+        await h.Merged("main1aaaaaaaaaaa", "src/b.cs");
+        await h.MergedInto(Repo, ChangesetBranch, WorkState.Watch, "story2aaaaaaaaaa", "src/c.cs");
+        var status = await h.Freeze.CheckAsync(CancellationToken.None);
+        Assert.Equal(FreezeTrigger.MainRed, status.Trigger);
+        Assert.Contains($"main of {Repo} is red", status.Detail);
+        Assert.Equal([$"compare {Repo} main main1aaaaaaaaaaa", $"ci {h.GitHub.Tip}"], h.GitHub.Calls);
+    }
+
+    [Fact]
+    public async Task A_plan_items_changeset_rounds_whose_cost_keeps_rising_freeze_like_any_items()
+    {
+        var h = new H();
+        // A plan item has no Implement: its changeset pull request's rounds start where it last waited on its stories.
+        var item = await h.Item(WorkState.Review, (WorkState.Intake, null, null), (WorkState.Plan, null, null));
+        await h.Session(item, 9.00m); // the planner's session, before the changeset: no round's cost
+        await h.Row(item, WorkState.Planned);
+        foreach (var cost in new[] { 0.40m, 0.55m, 0.80m })
+        {
+            await h.Row(item, WorkState.Review);
+            await h.Row(item, WorkState.Fixing);
+            await h.Session(item, cost);
+        }
+        await h.Row(item, WorkState.Review);
+
+        Assert.Equal(FreezeTrigger.CostRising, (await h.Freeze.CheckAsync(CancellationToken.None)).Trigger);
     }
 
     [Fact]

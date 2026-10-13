@@ -205,8 +205,9 @@ public static class FactoryRunner
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
         var ledger = new WorkLedger(db, TimeProvider.System);
         // A plan item waiting on its stories (sc-25871) only reads the ledger and moves stories on the board: its run starts no
-        // worker (a Planned item leaves that state only for Done or a Stop, and a Stop keeps the lock), so it takes no worker run
-        // lock, probes no sandbox and sweeps no worktree — every poll evaluates it.
+        // worker (a Planned item leaves that state only for Done, for Review once its changeset pull request is opened — sc-25872,
+        // GitHub's API only; the handlers that review it run in a later run, which takes the lock — or a Stop, and a Stop keeps the
+        // lock), so it takes no worker run lock, probes no sandbox and sweeps no worktree — every poll evaluates it.
         var needsWorker = !await FactoryWide("the ledger", async () =>
             await RunPipeline.WaitsOnStoriesAsync(ledger, source.Naming, storyId, ct)
             && await Controls(options).EffectiveAsync(source.Naming.Format(storyId), null, ct) != ControlState.Stopping);
