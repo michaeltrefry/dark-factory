@@ -380,7 +380,8 @@ cargo is installed (`CargoRunnerTests.With_cargo_a_new_package_is_applied_to_the
 and `…a_base_whose_other_tests_do_not_build_is_an_error_not_evidence`. The merging test's crate is checked in every `dotnet
 test` too, without cargo: `LiveHelperTests.The_crate_the_merging_cargo_test_seeds_has_one_new_test_the_cargo_strategy_names_as_the_live_test_expects`.
 
-Not run live yet (2026-10-13): the merging test was written with sc-25877, to be run by the owner.
+**Live results (2026-10-13): both PASS.** The rejection passed on its second attempt (story sc-25936, sandbox PR #49, closed unmerged by the test; `new-tests` `rejected`, strategy `rust-cargo`). The merge passed first time (story sc-25923, sandbox PR #50 merged by the gate as `3f4cc9e28ac6`; main holds `e2e-rust-merged/p5211b98a/`).
+**Write the story so that every new xUnit test fails on main.** The first attempt of the rejection (sc-25922, PR #48) failed on the fixture, not the product: the story text listed assertions that already pass on main (`CountLines("a\u0085")` == 1), the implementer added them, the story's own xUnit tests were `rejected`, and the result named the `dotnet-xunit` strategy alone — `NewTestsCheck.RunAsync` returns the first strategy's failing result, so the Rust test was not in it and the test's `rust-cargo` assertion failed. Name in the story exactly the `[Fact]` methods to add, each asserting a value that is wrong on main, and say that no other test (no "still works" test) may be added.
 
 A test that passes on the real base must never count as failing there (the review of sc-25875 reproduced five such false
 passes; the rule is in CLAUDE.md: `not-built` only for what the base lacks). With cargo installed these run too, each on real
@@ -591,7 +592,7 @@ own pickup), is linked to the plan (`PlanItemId`) and has a Merge row; every sto
 of its blockers' Merge row; exactly one changeset pull request, merged into the default branch, with a `gate-passed` row and one
 `closeout` `posted`. The created stories are archived at the end (best effort); the host is stopped first.
 
-Not run live yet (2026-10-13): written with sc-25877, to be run by the owner.
+**Live result (2026-10-13): PASS**, first attempt, 10 minutes (plan sc-25949 in a throwaway epic, 25948, as the whole watch scope): stories sc-25950 → sc-25951 → sc-25952 picked up by the loop, sandbox PRs #55 (`0c8091fa`), #56 (`149a3b43`), #57 (`d448b3b3`) into `factory/changeset-sc-25949`, changeset PR #58 merged into main as `1b4172468565`.
 
 Not exercised live, covered by `ChangesetPipelineTests` against the simulated repository (sc-25872): a pull request whose base is
 not the one the ledger expects (a story's PR switched to the default branch, an adopted PR with another base) escalates
@@ -633,7 +634,7 @@ their 201 responses return it unchanged; `release.json` (recorded right after, o
 — the team's listing carries each child's `external_id`, both are found, nothing is created — and the live P4-AT1 stories
 show it in the epic's listing (`GET epics/{id}/stories`) too.
 
-Not run live yet (2026-10-12): written with sc-25870 and extended with sc-25871, to be run by the owner. The live run is also the
+**Live result (2026-10-13): PASS**, first attempt, 11 minutes (plan sc-25939: three `TextTools` helpers, each calling the one before, the story text saying "plan exactly these three stories, the second blocked by the first, the third blocked by the second"): stories sc-25941 → sc-25942 → sc-25943, sandbox PRs #51 (`c0f15801`), #52 (`bb572c7c`), #53 (`3f791318`) into `factory/changeset-sc-25939`, changeset PR #54 merged into main as `344a199ffd28`. A code plan works as well as the documentation one suggested above. Written with sc-25870 and extended with sc-25871. The live run was also the
 first time the release's Shortcut requests meet the real API: `GET stories/{id}` returning a story with `story_links`, and
 `PUT stories/{id}` with only `workflow_state_id` (Backlog → To Do) had no recorded contract fixture then; since 2026-10-13 `release.json` records both (`ShortcutContractTests.A_retry_finds_its_children_by_external_id_and_a_release_reads_blockers_and_moves_backlog_to_to_do`); the
 unit tests cover them against the fake board and against the story shape the `list-ready.json` recording holds. Two more reads
@@ -696,7 +697,8 @@ merge order, each `merged` with its pull request; each repository has exactly on
 says `The plan changes 2 repositories.`; the two `merge-files` rows name their repositories; one `closeout` `posted` whose comment
 lists both repositories as `merged into`.
 
-Not run live yet (2026-10-12): written with sc-25873, to be run by the owner once a second sandbox repository exists. Not
+**Live result (2026-10-13): PASS on the second attempt** (plan sc-25971, second repository `michaeltrefry/dark-factory-sandbox-2`): sandbox PR #61 (`a824de0b`) into its changeset branch, changeset PR #62 merged into main as `9ad869946ac8`; only then the downstream story, dark-factory-sandbox-2 PR #1 (`26be3a1c`), and its changeset PR #2 merged into main as `b7e1d51fcf53`.
+**Do not ask a downstream worker to read the upstream repository.** The first attempt (plan sc-25940) failed after the upstream half was delivered (sandbox PRs #59 and #60, main `20b0c5eed669`, which therefore holds `IsPalindrome` and the second sandbox does not): the story text said the downstream change must be "written against the method as released on" the first repository's default branch, the planner wrote a story telling its worker to read the method "from upstream main", and that worker — seated in its own repository alone — ended `Worker finished without changing the repository; nothing to review` (Escalated at Implement). The planner of several repositories is now told what a story's worker sees (sc-25877, `PlanPrompt`), and the second attempt's story text gave the shared contract in full and stated the order as a release rule only. Not
 exercised live, covered by `MultiRepoPipelineTests` against two simulated repositories: an upstream changeset pull request that
 escalates (the downstream one is not opened; `plan-delivery` and the comment say what is delivered), a downstream one that
 escalates after the upstream merged (partial delivery, then fixed and re-run), Stop with one changeset merged and one open, a run
@@ -736,7 +738,7 @@ Expected evidence: `tools/list` shows only planner-profile tools, the six cross-
 project; and JSON-RPC -32602 for a `project` naming a third indexed project (alone, and against a `repo` of the set), a `repo`
 outside the set, a call naming no repository, and `get_architecture`, `get_service_summary` and `rag_search`.
 
-Not run live yet (2026-10-12): written with sc-25874, to be run by the owner.
+**Live result (2026-10-13): PASS**, first attempt, with `FACTORY_E2E_P4_PLAN_REPOS=michaeltrefry/dark-factory-sandbox,michaeltrefry/dark-factory-sandbox-2` (both indexed in the hosted CodeGraph).
 
 ## P4-AT3 (the refusals) — a cycle, an oversized plan, an unconfigured repository (sc-25877)
 
@@ -779,7 +781,7 @@ In-process versions (every `dotnet test`): `PlanPipelineTests.A_planner_answer_t
 — the live tests' own fixtures — `PlanLiveTests` (the two fixed answers are refused for exactly the reasons above; the stub CLI
 hands its fixed answer to the pipeline as a session's result under a fresh session id).
 
-Not run live yet (2026-10-13): written with sc-25877, to be run by the owner.
+**Live results (2026-10-13): all three PASS**, first attempt, each on its own story (cycle sc-25917, oversized sc-25919, unconfigured repository sc-25920 with `Repo: michaeltrefry/p4a-live-not-configured`): each left Escalated on the board with one escalation comment carrying the reason above, and nothing created.
 
 ## P4-AT5 — a failed story holds its dependents, and Stop on a plan stops its stories (sc-25876)
 
@@ -821,7 +823,7 @@ ending `It had no open pull request. Branch factory/changeset-sc-<plan> is kept;
 row is gone; `InFlightAsync` lists
 nothing; a second stop writes nothing.
 
-Not run live yet (2026-10-12): written with sc-25876, to be run by the owner. The same class holds one test that is not live and
+**Live result (2026-10-13): PASS**, first attempt, 13 seconds (hold story sc-25921; the four seeded stories sc-25927 to sc-25930 archived by the test). The same class holds one test that is not live and
 always runs (the fixed plan passes every plan rule).
 
 What the live test does not cover, and the unit tests do (`PlanClassificationTests`, `PlanFailurePipelineTests`,
