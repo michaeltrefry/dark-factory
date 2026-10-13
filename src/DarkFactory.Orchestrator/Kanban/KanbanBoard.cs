@@ -8,7 +8,8 @@ namespace DarkFactory.Orchestrator.Kanban;
 /// <summary>
 /// KanbanBoard refused a call, or answered something that is no answer (sc-25981, sc-25983). <see cref="Code"/> is the contract's
 /// error code (<c>docs/mcp-contract.md</c> of KanbanBoard, <see cref="Codes"/>) — a typed refusal: the call changed nothing — or
-/// null for a plain MCP error (no <c>{code, message}</c>), after which the call may have written.
+/// null for a plain MCP error (no <c>{code, message}</c>), after which the call may have written. A code that is not one of the
+/// contract's is kept as it came but promises nothing (<see cref="Refused"/> false): the call may have written.
 /// </summary>
 public sealed class KanbanException(string tool, string? code, string message)
     : InvalidOperationException($"Kanban's {tool} {(code is null ? "failed" : $"was refused ({code})")}: {message}")
@@ -41,8 +42,12 @@ public sealed class KanbanException(string tool, string? code, string message)
 
     public string? Code { get; } = code;
 
-    /// <summary>Whether the board refused the call with a code, so it changed nothing. False for an error after which it may have written.</summary>
-    public bool Refused => Code is not null;
+    /// <summary>
+    /// Whether the board refused the call with one of the contract's codes (<see cref="Codes"/>), so it changed nothing. False for
+    /// an error after which it may have written: one with no code, and one whose code the contract does not name (only the
+    /// contract's codes are known to mean "nothing written").
+    /// </summary>
+    public bool Refused => Code is not null && Codes.Contains(Code);
 }
 
 /// <summary>A KanbanBoard project (the contract's Project shape; only the fields the factory reads).</summary>

@@ -249,7 +249,7 @@ public class KanbanWorkSourceTests
         Assert.Equal(ClaimResult.Refused(KanbanWorkSource.LapsedRefusal), await h.Source().ClaimAsync(p, ignoreScope: false, None));
         Assert.Null(parked.Claim);
         // Claimed under another marker: always refused, whatever the ledger says.
-        Assert.Equal(ClaimResult.Refused("the item is claimed by someone"), await h.Source().ClaimAsync(t, ignoreScope: false, None));
+        Assert.Equal(ClaimResult.Refused("the item is claimed by `someone`"), await h.Source().ClaimAsync(t, ignoreScope: false, None));
         Assert.Empty(h.Board.Writes);
         Assert.Equal("their-run", theirs.Claim!.Value.Marker);
         Assert.Equal(h.Board.Time.Now.AddHours(-1), unrecorded.Claim!.Value.Expires); // the lapsed claim, untouched
@@ -267,7 +267,7 @@ public class KanbanWorkSourceTests
 
     public static TheoryData<string, string> Refusals => new()
     {
-        { "claimed", "the item is claimed by someone" },
+        { "claimed", "the item is claimed by `someone`" },
         { "backlog", "the item is Backlog, not Ready" },
         // In progress with no claim, and nothing in the ledger says the factory ever claimed it.
         { "in-progress", "the item is InProgress with no claim, and the ledger records no claim of it by this factory (a claim lasts 24 hours and is renewed only while the item is in flight, so the factory's claim may have lapsed): move it back to Ready to hand it to the factory again" },
@@ -324,7 +324,7 @@ public class KanbanWorkSourceTests
         h.Board.ClaimAsSomeoneElse(held);
 
         Assert.Equal(ClaimResult.Ok, await h.Source().ClaimAsync(await h.Key(item), ignoreScope: true, None));
-        Assert.Equal(ClaimResult.Refused("the item is claimed by someone"), await h.Source().ClaimAsync(await h.Key(held), ignoreScope: true, None));
+        Assert.Equal(ClaimResult.Refused("the item is claimed by `someone`"), await h.Source().ClaimAsync(await h.Key(held), ignoreScope: true, None));
         Assert.Equal("InProgress", item.Status);
     }
 
@@ -346,7 +346,7 @@ public class KanbanWorkSourceTests
         var result = await h.Source().ClaimAsync(id, ignoreScope: false, None);
 
         // The refusal names the claimant: the item is read once more for that, and nothing else is written.
-        Assert.Equal(ClaimResult.Refused("the item is claimed by someone"), result);
+        Assert.Equal(ClaimResult.Refused("the item is claimed by `someone`"), result);
         Assert.Equal(["claim_work_item"], h.Board.Writes); // the one call the board refused: a refused call changes nothing
         Assert.Equal(("Ready", 1L, "someone"), (item.Status, item.Version, item.Claim!.Value.Name));
     }
@@ -361,7 +361,7 @@ public class KanbanWorkSourceTests
 
         var result = await h.Source().ClaimAsync(id, ignoreScope: false, None);
 
-        Assert.Equal(ClaimResult.Refused("the item is claimed by someone"), result);
+        Assert.Equal(ClaimResult.Refused("the item is claimed by `someone`"), result);
         Assert.Equal("someone", item.Claim!.Value.Name);
     }
 

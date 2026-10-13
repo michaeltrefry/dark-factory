@@ -535,6 +535,53 @@ public sealed partial class RunPipeline(
         return [.. stops, .. ids];
     }
 
+    /// <summary>
+    /// Story ids of the items whose claim an intake poll keeps (sc-25983; <see cref="IItemRunner.RenewableAsync"/>,
+    /// <see cref="IWorkSource.RenewClaimAsync"/>), oldest first: every item the ledger would resume by itself — in a handled state,
+    /// or paused from one in a way that resumes by itself (<see cref="ResumesAutomatically"/>: <c>interrupted</c>,
+    /// <c>user-paused</c>, <c>usage-paused</c>, <c>freeze-paused</c>, <c>controls-unreadable</c>) — WHATEVER the factory, epic,
+    /// item, usage and freeze controls say now. Unlike <see cref="InFlightAsync"/>, which leaves out what a control pauses: a
+    /// pause only holds an item for a while (a freeze until a human's Continue, however long that takes), and a claim that lapsed
+    /// meanwhile would leave the board showing nobody on an item the factory resumes. Not listed, so not renewed: an item being
+    /// stopped (its own Stop or its plan's; the stop gives the claim back), a parked one (a refused or a lost claim, a give-up),
+    /// an escalated one, a plan waiting on its stories, a merged or finished one. This is never a list of what to run.
+    /// The controls are read only to leave out an item being stopped: when they cannot be read the item is listed (a claim renewed
+    /// on an item whose stop then releases it costs nothing; an unreadable control must not cost every item its claim), so this
+    /// throws only when the ledger itself cannot be read.
+    /// </summary>
+    /// <param name="handled">The states the runner's pipeline drives; default <see cref="HandledStates"/> (production).</param>
+    /// <param name="naming">The source whose items to list; default Shortcut stories.</param>
+    public static async Task<IReadOnlyList<int>> RenewableAsync(WorkLedger ledger, CancellationToken ct, IControls? controls = null,
+        IReadOnlySet<WorkState>? handled = null, ItemNaming? naming = null)
+    {
+        controls ??= NoControls.Instance;
+        handled ??= HandledStates;
+        naming ??= ItemNaming.Shortcut;
+        var ids = new List<int>();
+        foreach (var item in await ledger.ActiveItemsAsync(naming.Source, ct))
+        {
+            var resumes = handled.Contains(item.State)
+                || (item.State == WorkState.Paused && ResumesAutomatically(await ledger.HistoryAsync(item, ct), handled));
+            if (!resumes || !naming.TryParse(item.ExternalId, out var id))
+            {
+                continue;
+            }
+            try
+            {
+                if (await controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) == ControlState.Stopping)
+                {
+                    continue;
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                // Unreadable controls: renewed all the same (see above).
+            }
+            ids.Add(id);
+        }
+        return ids;
+    }
+
     private static bool ResumesAutomatically(List<LedgerEntry> history, IReadOnlySet<WorkState> handled)
     {
         var paused = history.FindLastIndex(e => e.Step is null);
@@ -705,6 +752,22 @@ public sealed partial class RunPipeline(
         {
             var pausedFrom = (await ledger.ContextAsync(item, ct)).PausedFrom
                 ?? throw new InvalidOperationException($"{item.ExternalId} is paused but its ledger has no state to return to.");
+            // Paused because another caller took its claim (sc-25983): it is resumed only once the item is the factory's again.
+            // The source is asked before anything is recorded — it takes a lapsed or released claim back — and while someone
+            // else still holds the item (or the board will not say) the item stays as it is: no row, nothing written to the board.
+            if (ParkedForLostClaim(await ledger.HistoryAsync(item, ct)))
+            {
+                var renewal = await source.RenewClaimAsync(storyId, ct);
+                if (!renewal.IsHeld)
+                {
+                    var why = renewal.Lost is { } lost
+                        ? $"{item.ExternalId} is still not the factory's to work ({ClaimLost}: {lost}); it stays paused"
+                        : $"{item.ExternalId} stays paused: its claim was lost and the board would not confirm it is the factory's again ({renewal.NotRenewed})";
+                    log.WriteLine($"[paused] {why}");
+                    return await OutcomeAsync(item, $"{why}. Run `factory run {item.ExternalId}` again once the other claim is released or "
+                        + $"has lapsed, or `factory stop --item {item.ExternalId}` to give the item up.", ct);
+                }
+            }
             await ledger.RecordAsync(item, pausedFrom, null, "unpaused", ct);
         }
         log.WriteLine($"[{item.State}] {item.ExternalId} \"{story.Name}\" -> {repo}");
@@ -1922,13 +1985,29 @@ public sealed partial class RunPipeline(
     public static bool IsClaimLost(string? detail) => detail?.StartsWith(ClaimLost, StringComparison.Ordinal) == true;
 
     /// <summary>
-    /// The intake poll's claim renewal found an in-flight item held by another caller (sc-25983; see
+    /// Whether the item is paused because its claim was lost (<see cref="ClaimLostAsync"/>): its last transition is Paused and
+    /// that row, or a <c>parked</c> row after it (an item already paused when the claim was lost), says so.
+    /// </summary>
+    private static bool ParkedForLostClaim(List<LedgerEntry> history)
+    {
+        var paused = history.FindLastIndex(e => e.Step is null);
+        return paused >= 0 && history[paused].State == WorkState.Paused
+            && history.Skip(paused).Any(e => (e.Step is null || e.Step == Steps.Parked) && IsClaimLost(e.Detail));
+    }
+
+    /// <summary>
+    /// The intake poll's claim renewal found an item held by another caller (sc-25983; see
     /// <see cref="IItemRunner.ClaimLostAsync"/>, <see cref="IWorkSource.RenewClaimAsync"/>): under the item's run lock the item is
     /// paused — Paused <c>claim lost: &lt;reason&gt;</c> from a handled state, then <c>parked</c> with the reason, which names
     /// the other claimant; an item already paused (one that resumes by itself) is parked where it is — and the item is told once,
-    /// with what resumes it. Deliberately parked, so it is not one of the pauses that resume by themselves
+    /// with what resumes it. The comment is posted before the <c>parked</c> row, so a comment the board would not take is on
+    /// record (<c>…; comment NOT posted: &lt;error&gt;</c>): the item is never listed again, so nothing would post it later.
+    /// Deliberately parked, so it is not one of the pauses that resume by themselves
     /// (<see cref="ResumesAutomatically"/>): someone else is working the item, the factory writes nothing more to it, no poll lists
-    /// it (so its claim is not renewed either), and only a person's <c>factory run</c> takes it up again, from where it paused.
+    /// it (so its claim is not renewed either), and only a person's <c>factory run</c> takes it up again, from where it paused —
+    /// and only once the item is the factory's again: that run asks the source first (<see cref="IWorkSource.RenewClaimAsync"/>,
+    /// which takes a released or lapsed claim back) and, while someone else still holds the item, records nothing and writes
+    /// nothing to the board (<see cref="ParkedForLostClaim"/>).
     /// Typed outcome: deferred (set aside, not judged), like every pause. Returns what was done, or null when nothing was: the
     /// ledger does not know the item, it is being stopped (the stop gives the item back anyway), its run is active (that run goes
     /// on — the board's claims are advisory — and the next poll finds the claim lost again), or it is in a state a lost claim does
@@ -1962,8 +2041,7 @@ public sealed partial class RunPipeline(
         {
             await ledger.RecordAsync(known, WorkState.Paused, null, $"{ClaimLost}: {reason}", ct);
         }
-        await ledger.CheckpointAsync(known, Steps.Parked, null, $"{ClaimLost}: {reason}", ct);
-        log.WriteLine($"[paused] {id} parked: {ClaimLost}: {reason}");
+        string? notPosted = null;
         try
         {
             await source.CommentAsync(storyId,
@@ -1974,9 +2052,11 @@ public sealed partial class RunPipeline(
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             log.WriteLine($"[paused] could not comment on {id}: {ex.Message}");
-            return $"paused ({ClaimLost}: {reason}); comment NOT posted: {ex.Message}";
+            notPosted = $"; comment NOT posted: {ex.Message}";
         }
-        return $"paused ({ClaimLost}: {reason})";
+        await ledger.CheckpointAsync(known, Steps.Parked, null, $"{ClaimLost}: {reason}{notPosted}", ct);
+        log.WriteLine($"[paused] {id} parked: {ClaimLost}: {reason}{notPosted}");
+        return $"paused ({ClaimLost}: {reason}){notPosted}";
     }
 
     /// <summary>Records Escalated and comments on the story. Returns why the comment failed, or null.</summary>

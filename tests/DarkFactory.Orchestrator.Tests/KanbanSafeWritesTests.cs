@@ -433,6 +433,28 @@ public class KanbanSafeWritesTests
         Assert.Equal((KanbanException.Conflict, "update_work_item"), (ex.Code, ex.Tool));
         Assert.Equal(1 + KanbanWorkSource.MaxConflictRereads, h.Board.Writes.Count(t => t == "update_work_item"));
         Assert.Equal("Ready", item.Status);
+        // The claim is given back: left on a Ready item it would hide it from every ready listing for a day.
+        Assert.Null(item.Claim);
+        Assert.Equal("release_work_item_claim", h.Board.Writes[^1]);
+        Assert.Equal([id], await h.Source().ListReadyAsync(None));
+    }
+
+    [Fact]
+    public async Task An_error_code_the_contract_does_not_name_is_no_typed_refusal_so_the_item_is_read_before_the_repeat()
+    {
+        var h = new KanbanWorkSourceTests.Harness();
+        var item = h.Board.AddItem(h.Project, "Count words");
+        var unknown = 1;
+        h.Board.Instead = (tool, _) => tool == "update_work_item" && unknown-- > 0 ? FakeKanbanBoard.Refusal("teapot", "short and stout") : null;
+
+        var moved = await h.Caller().SetStatusAsync(item.Id, "InProgress", 1, None);
+
+        // Only the contract's seven codes promise that nothing was written: after any other, the write may have happened.
+        Assert.Equal(["update_work_item", "get_work_item", "update_work_item"], Tools(h.Board));
+        Assert.Equal(("InProgress", 2L), (moved.Status, item.Version));
+        Assert.False(new KanbanException("update_work_item", "teapot", "short and stout").Refused);
+        Assert.False(new KanbanException("update_work_item", null, "plain").Refused);
+        Assert.All(KanbanException.Codes, code => Assert.True(new KanbanException("update_work_item", code, "refused").Refused));
     }
 
     [Fact]
@@ -505,12 +527,14 @@ public class KanbanSafeWritesTests
 
     // ---- Claim renewal ----
 
+    /// <summary>An item the factory claimed, as Intake leaves it: claimed and InProgress on the board, a <c>claimed</c> row in the ledger.</summary>
     private static async Task<(KanbanWorkSourceTests.Harness H, FakeKanbanBoard.Item Item, int Id)> ClaimedAsync()
     {
         var h = new KanbanWorkSourceTests.Harness();
         var item = h.Board.AddItem(h.Project, "Count words");
         var id = await h.Key(item);
         Assert.Equal(ClaimResult.Ok, await h.Source().ClaimAsync(id, ignoreScope: false, None));
+        await h.RecordClaimedAsync(id);
         h.Board.Calls.Clear();
         return (h, item, id);
     }
@@ -555,6 +579,69 @@ public class KanbanSafeWritesTests
     }
 
     [Fact]
+    public async Task An_unclaimed_item_the_ledger_never_recorded_as_claimed_is_not_claimed_by_a_renewal_and_its_claim_stays_refused()
+    {
+        // In flight at Intake with no `claimed` row (a run that died between the Intake row and the claim), and on the board
+        // InProgress with no claim: it may be a person's work. The renewal must not take what ClaimAsync refuses.
+        var h = new KanbanWorkSourceTests.Harness();
+        var item = h.Board.AddItem(h.Project, "Count words", status: "InProgress");
+        var id = await h.Key(item);
+        await h.RecordClaimedAsync(id, claimed: false);
+
+        Assert.Equal(ClaimRenewal.Held, await h.Source().RenewClaimAsync(id, None));
+
+        Assert.Equal(["renew_work_item_claim", "get_work_item"], Tools(h.Board));
+        Assert.Null(item.Claim);
+        Assert.Equal(ClaimResult.Refused(KanbanWorkSource.LapsedRefusal), await h.Source().ClaimAsync(id, ignoreScope: false, None));
+        Assert.DoesNotContain("claim_work_item", Tools(h.Board));
+    }
+
+    [Theory]
+    [InlineData("Backlog")]
+    [InlineData("Ready")]
+    [InlineData("Done")]
+    public async Task A_lapsed_claim_on_an_item_someone_moved_out_of_in_progress_is_not_taken_again(string column)
+    {
+        var (h, item, id) = await ClaimedAsync();
+        h.Board.Time.Now = h.Board.Time.Now.AddHours(25);
+        (item.Status, item.Version) = (column, item.Version + 1);
+
+        Assert.Equal(ClaimRenewal.Held, await h.Source().RenewClaimAsync(id, None));
+
+        // Theirs to place: no stray claim that would hide it from `claim_state: unclaimed` if it is made ready again.
+        Assert.Equal(["renew_work_item_claim", "get_work_item"], Tools(h.Board));
+        Assert.Null((await h.Caller().GetItemAsync(item.Id, None)).ClaimMarker);
+        Assert.Equal((column, 3L), (item.Status, item.Version));
+    }
+
+    [Fact]
+    public async Task Another_callers_name_and_marker_are_cut_and_inert_wherever_a_refusal_or_a_lost_claim_names_them()
+    {
+        var (h, item, id) = await ClaimedAsync();
+        // A claimant's name and a marker are the other caller's text; the reason goes into a board comment and the ledger.
+        var (name, marker) = ("@everyone [x](https://evil.test) `" + new string('n', 300), "run`\n# <b>@you</b> https://evil.test/" + new string('m', 300));
+        item.Claim = (Guid.NewGuid(), name, marker, h.Board.Time.Now.AddHours(1));
+
+        var lost = (await h.Source().RenewClaimAsync(id, None)).Lost!;
+        var refused = (await h.Source().ClaimAsync(id, ignoreScope: false, None)).Refusal!;
+
+        var (inertName, inertMarker) = (UntrustedText.CodeSpan(name[..200]), UntrustedText.CodeSpan(marker[..200]));
+        Assert.Equal($"the item is claimed by {inertName} (marker {inertMarker})", lost);
+        Assert.Equal($"the item is claimed by {inertName}", refused);
+        Assert.Equal(202, inertName.Length); // cut at 200, in one code span
+        foreach (var text in new[] { lost, refused })
+        {
+            Assert.DoesNotContain('@', text);
+            Assert.DoesNotContain("://", text);
+            Assert.DoesNotContain('\n', text);
+            Assert.DoesNotContain('[', text);
+            Assert.DoesNotContain('<', text);
+            Assert.Equal(0, text.Count(c => c == '`') % 2);
+        }
+        Assert.Equal(2, refused.Count(c => c == '`'));
+    }
+
+    [Fact]
     public async Task A_claim_another_caller_took_is_lost_with_a_reason_naming_them_and_nothing_is_written()
     {
         var (h, item, id) = await ClaimedAsync();
@@ -564,7 +651,7 @@ public class KanbanSafeWritesTests
 
         var renewal = await h.Source().RenewClaimAsync(id, None);
 
-        Assert.Equal(ClaimRenewal.LostBecause("the item is claimed by someone (marker their-run)"), renewal);
+        Assert.Equal(ClaimRenewal.LostBecause("the item is claimed by `someone` (marker `their-run`)"), renewal);
         Assert.Equal(["renew_work_item_claim", "get_work_item"], Tools(h.Board)); // the renewal was refused already_claimed
         Assert.Equal(("someone", "their-run", "InProgress", 2L), (item.Claim!.Value.Name, item.Claim.Value.Marker, item.Status, item.Version));
     }
@@ -584,7 +671,7 @@ public class KanbanSafeWritesTests
 
         var renewal = await h.Source().RenewClaimAsync(id, None);
 
-        Assert.Equal(ClaimRenewal.LostBecause("the item is claimed by someone (marker their-run)"), renewal);
+        Assert.Equal(ClaimRenewal.LostBecause("the item is claimed by `someone` (marker `their-run`)"), renewal);
         Assert.Equal(["renew_work_item_claim", "get_work_item", "claim_work_item", "get_work_item"], Tools(h.Board));
     }
 
@@ -599,7 +686,7 @@ public class KanbanSafeWritesTests
         var renewal = await h.Source().RenewClaimAsync(id, None);
 
         // The marker alone does not make it the factory's: the board tells the identities apart and refuses the claim.
-        Assert.Equal(ClaimRenewal.LostBecause($"the item is claimed by someone (marker {KanbanWorkSource.Marker(item.Id)})"), renewal);
+        Assert.Equal(ClaimRenewal.LostBecause($"the item is claimed by `someone` (marker `{KanbanWorkSource.Marker(item.Id)}`)"), renewal);
         Assert.Equal("someone", item.Claim!.Value.Name);
     }
 
@@ -613,14 +700,36 @@ public class KanbanSafeWritesTests
     }
 
     [Fact]
-    public async Task A_renewal_the_board_cannot_take_is_an_error_not_a_lost_claim()
+    public async Task A_renewal_the_board_refuses_for_the_calls_own_reason_is_not_renewed_and_not_a_lost_claim()
     {
-        var (h, _, id) = await ClaimedAsync();
+        var (h, item, id) = await ClaimedAsync();
         h.Board.Instead = (tool, _) => tool == "renew_work_item_claim" ? FakeKanbanBoard.Refusal("scope_denied", "the token was revoked") : null;
 
-        var ex = await Assert.ThrowsAsync<KanbanException>(() => h.Source().RenewClaimAsync(id, None));
+        var renewal = await h.Source().RenewClaimAsync(id, None);
 
-        Assert.Equal(KanbanException.ScopeDenied, ex.Code);
+        // The board answered: nothing about who holds the item, so neither held nor lost — and the next item can be asked.
+        Assert.Equal(ClaimRenewal.NotRenewedBecause("Kanban's renew_work_item_claim was refused (scope_denied): the token was revoked"), renewal);
+        Assert.Equal((false, (string?)null), (renewal.IsHeld, renewal.Lost));
+        Assert.Equal(["renew_work_item_claim"], Tools(h.Board));
+        Assert.Equal("factory", item.Claim!.Value.Name);
+        // A key the ledger never gave out is the item's own trouble too, and asks the board nothing.
+        Assert.Equal(ClaimRenewal.NotRenewedBecause("kb-99 is no Kanban item the factory knows"), await h.Source().RenewClaimAsync(99, None));
+        Assert.Equal(["renew_work_item_claim"], Tools(h.Board));
+    }
+
+    [Fact]
+    public async Task A_renewal_the_board_does_not_answer_is_thrown_busy_after_its_retries_and_a_lost_answer_alike()
+    {
+        var (h, _, id) = await ClaimedAsync();
+        // Busy past the retry bound: the board is overloaded, which is no answer about this item.
+        h.Board.Busy["renew_work_item_claim"] = 100;
+        var busy = await Assert.ThrowsAsync<KanbanException>(() => h.Source().RenewClaimAsync(id, None));
+        Assert.Equal(KanbanException.Busy, busy.Code);
+
+        h.Board.Busy.Clear();
+        h.Board.Lost = () => throw new FakeMcpServer.HttpAnswer(new HttpResponseMessage(HttpStatusCode.BadGateway));
+        h.Board.LoseAnswer = (_, _) => true;
+        await Assert.ThrowsAnyAsync<Exception>(() => h.Source().RenewClaimAsync(id, None));
     }
 
     [Fact]
@@ -637,7 +746,7 @@ public class KanbanSafeWritesTests
 
     // ---- Renewal on each intake poll, and a lost claim pausing the item ----
 
-    /// <summary>The production runner's three members over the test's ledger: what <c>FactoryItemRunner</c> does.</summary>
+    /// <summary>The production runner's members over the test's ledger and its controls: what <c>FactoryItemRunner</c> does.</summary>
     private sealed class Runner(KanbanWorkSourceTests.Harness h, InProcessRunLocks locks) : IItemRunner
     {
         public List<int> Runs { get; } = [];
@@ -647,6 +756,12 @@ public class KanbanSafeWritesTests
         {
             await using var db = h.Db();
             return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ct, Controls(h), naming: ItemNaming.Kanban);
+        }
+
+        public async Task<IReadOnlyList<int>> RenewableAsync(CancellationToken ct)
+        {
+            await using var db = h.Db();
+            return await RunPipeline.RenewableAsync(new WorkLedger(db, TimeProvider.System), ct, Controls(h), naming: ItemNaming.Kanban);
         }
 
         public Task<RunOutcome> RunAsync(int id, CancellationToken ct)
@@ -666,8 +781,32 @@ public class KanbanSafeWritesTests
 
     private static IControls Controls(KanbanWorkSourceTests.Harness h) => new LedgerControls(h.Contexts, TimeProvider.System);
 
-    private static IntakeLoop Loop(IWorkSource source, IItemRunner runner, IntakeStatus? status = null, IReadOnlyList<IntakeLane>? more = null) =>
-        new(source, runner, new IntakeOptions(TimeSpan.FromSeconds(60)), TimeProvider.System, NullLogger<IntakeLoop>.Instance, status: status, moreLanes: more);
+    private static IntakeLoop Loop(IWorkSource source, IItemRunner runner, IntakeStatus? status = null, IReadOnlyList<IntakeLane>? more = null,
+        IControls? controls = null) =>
+        new(source, runner, new IntakeOptions(TimeSpan.FromSeconds(60)), TimeProvider.System, NullLogger<IntakeLoop>.Instance, controls, status: status,
+            moreLanes: more);
+
+    /// <summary>
+    /// A Kanban item in flight at Implement, as Intake leaves a claimed item (a <c>claimed</c> checkpoint, then Implement): claimed
+    /// and <c>InProgress</c> on the board. A state the gateless test pipeline drives, so a run of it resumes it.
+    /// </summary>
+    private static async Task<(KanbanWorkSourceTests.Harness H, FakeKanbanBoard.Item Item, int Id, InProcessRunLocks Locks)> ImplementingAsync()
+    {
+        var (h, item, id) = await ClaimedAsync();
+        await using (var db = h.Db())
+        {
+            await new WorkLedger(db, TimeProvider.System).RecordAsync(await db.WorkItems.SingleAsync(), WorkState.Implement, null, null, None);
+        }
+        return (h, item, id, new InProcessRunLocks());
+    }
+
+    /// <summary>A real run of the item (<c>factory run kb-N</c>) over the test's ledger; no gate stage, so it ends at Review.</summary>
+    private static async Task<RunOutcome> RunAsync(KanbanWorkSourceTests.Harness h, int id, InProcessRunLocks locks)
+    {
+        await using var db = h.Db();
+        return await new RunPipeline(h.Source(), new WorkLedger(db, TimeProvider.System), locks, new FakeWorkspaces(), new FakeWorker(Reports(Ok)),
+            new FakePullRequests(), Sandbox, TextWriter.Null).RunAsync(id, None);
+    }
 
     /// <summary>A Kanban item the pipeline took to Review (pull request open): in flight, claimed, <c>InProgress</c>.</summary>
     private static async Task<(KanbanWorkSourceTests.Harness H, FakeKanbanBoard.Item Item, int Id, InProcessRunLocks Locks)> InFlightAsync(
@@ -719,7 +858,7 @@ public class KanbanSafeWritesTests
         h.Board.Time.Now = h.Board.Time.Now.AddHours(25);
         h.Board.ClaimAsSomeoneElse(item);
         var (runner, status) = (new Runner(h, locks), new IntakeStatus(TimeProvider.System));
-        const string reason = "claim lost: the item is claimed by someone (marker their-run)";
+        const string reason = "claim lost: the item is claimed by `someone` (marker `their-run`)";
 
         await Loop(h.Source(), runner, status).PollOnceAsync(None);
 
@@ -732,7 +871,7 @@ public class KanbanSafeWritesTests
         Assert.True(RunPipeline.IsClaimLost(history[^2].Detail));
         // The item is told once, and nothing else of it is written: their claim, its column and its version stand.
         Assert.Equal(["renew_work_item_claim", "add_work_item_comment"], h.Board.Writes); // the renewal was refused: it wrote nothing
-        Assert.Equal("[author: dark-factory] kb-1: the factory lost its claim on this Kanban item — the item is claimed by someone (marker their-run) — "
+        Assert.Equal("[author: dark-factory] kb-1: the factory lost its claim on this Kanban item — the item is claimed by `someone` (marker `their-run`) — "
             + "so it paused its work on it (at Review) and writes nothing more to it. Once the item is the factory's to work again (the other "
             + "claim released or lapsed), run `factory run kb-1` to resume it where it paused, or `factory stop --item kb-1` to give it up.",
             Assert.Single(item.Comments).Body);
@@ -770,24 +909,280 @@ public class KanbanSafeWritesTests
     }
 
     [Fact]
-    public async Task A_paused_item_is_not_renewed_while_it_is_paused_and_takes_its_lapsed_claim_again_once_it_is_in_flight()
+    public async Task An_item_a_control_pauses_keeps_its_claim_renewed_and_is_not_run_until_the_continue()
     {
         var (h, item, id, locks) = await InFlightAsync();
+        var claimedAt = h.Board.Time.Now;
         var runner = new Runner(h, locks);
         await Controls(h).SetAsync(ControlScope.Item("kb-1"), ControlState.Paused, "michael", None);
 
-        h.Board.Time.Now = h.Board.Time.Now.AddHours(25);
-        await Loop(h.Source(), runner).PollOnceAsync(None);
-        Assert.Empty(h.Board.Writes);
-        Assert.Null((await h.Caller().GetItemAsync(item.Id, None)).ClaimMarker);
+        // Paused for 40 hours, polled meanwhile: renewed each time, never run.
+        foreach (var hours in new[] { 20, 40 })
+        {
+            h.Board.Time.Now = claimedAt.AddHours(hours);
+            await Loop(h.Source(), runner, controls: Controls(h)).PollOnceAsync(None);
+        }
+        Assert.Equal(["renew_work_item_claim", "renew_work_item_claim"], h.Board.Writes);
+        Assert.Equal(("factory", claimedAt.AddHours(64)), (item.Claim!.Value.Name, item.Claim.Value.Expires));
+        Assert.Empty(runner.Runs);
+        Assert.Empty(await runner.InFlightAsync(None));
+        Assert.Equal([id], await runner.RenewableAsync(None));
 
-        // Continue: in flight again, and nobody took it meanwhile, so the poll's renewal claims it again before it is run.
         await Controls(h).SetAsync(ControlScope.Item("kb-1"), ControlState.Running, "michael", None);
+        await Loop(h.Source(), runner, controls: Controls(h)).PollOnceAsync(None);
+
+        Assert.Equal([id], runner.Runs);
+        Assert.Equal("factory", (await h.Caller().GetItemAsync(item.Id, None)).Claimant);
+    }
+
+    [Fact]
+    public async Task A_claim_that_lapsed_while_no_poll_ran_is_taken_again_by_the_next_polls_renewal_before_the_item_is_run()
+    {
+        var (h, item, id, locks) = await InFlightAsync();
+        var runner = new Runner(h, locks);
+
+        // `factory work` was down for more than a day; nobody took the item meanwhile.
+        h.Board.Time.Now = h.Board.Time.Now.AddHours(25);
         await Loop(h.Source(), runner).PollOnceAsync(None);
 
         Assert.Equal(["renew_work_item_claim", "claim_work_item"], h.Board.Writes);
         Assert.Equal("factory", item.Claim!.Value.Name);
         Assert.Equal([id], runner.Runs);
+    }
+
+    public static TheoryData<string> Holds => ["factory", "epic", "item", "freeze", "usage"];
+
+    [Theory]
+    [MemberData(nameof(Holds))]
+    public async Task Claims_are_renewed_and_nothing_is_run_while_a_control_the_freeze_or_the_usage_pause_holds_the_item(string hold)
+    {
+        var (h, item, id, locks) = await InFlightAsync();
+        var claimedAt = h.Board.Time.Now;
+        var (runner, controls) = (new Runner(h, locks), Controls(h));
+        await using (var db = h.Db())
+        {
+            (await db.WorkItems.SingleAsync()).EpicId = 7;
+            await db.SaveChangesAsync();
+        }
+        switch (hold)
+        {
+            case "factory": await controls.SetAsync(ControlScope.Factory, ControlState.Paused, "michael", None); break;
+            case "epic": await controls.SetAsync(ControlScope.Epic(7), ControlState.Paused, "michael", None); break;
+            case "item": await controls.SetAsync(ControlScope.Item("kb-1"), ControlState.Paused, "michael", None); break;
+            case "freeze": await controls.FreezeAsync("hot-file", "one file, three merges", null, None); break;
+            default: await controls.PauseForUsageAsync(DateTimeOffset.UtcNow.AddDays(3), "all_exhausted", None); break;
+        }
+        // The production in-flight list leaves the item out (nothing runs it); the renewal list does not.
+        Assert.Equal(ControlState.Paused, await controls.EffectiveAsync("kb-1", 7, None));
+        Assert.Empty(await runner.InFlightAsync(None));
+
+        // Held for two days — a freeze lasts until a human's Continue — and polled meanwhile.
+        foreach (var hours in new[] { 20, 40, 48 })
+        {
+            h.Board.Time.Now = claimedAt.AddHours(hours);
+            await Loop(h.Source(), runner, controls: controls).PollOnceAsync(None);
+        }
+
+        Assert.Equal(["renew_work_item_claim", "renew_work_item_claim", "renew_work_item_claim"], h.Board.Writes);
+        Assert.Equal(("factory", claimedAt.AddHours(72)), (item.Claim!.Value.Name, item.Claim.Value.Expires));
+        Assert.Empty(runner.Runs);
+        Assert.Empty(runner.Lost);
+        Assert.Equal(("InProgress", 2L), (item.Status, item.Version));
+    }
+
+    [Fact]
+    public async Task A_claim_lost_while_the_factory_is_frozen_still_pauses_the_item_and_runs_nothing()
+    {
+        var (h, item, _, locks) = await InFlightAsync();
+        var (runner, controls) = (new Runner(h, locks), Controls(h));
+        await controls.FreezeAsync("hot-file", "one file, three merges", null, None);
+        h.Board.Time.Now = h.Board.Time.Now.AddHours(25);
+        h.Board.ClaimAsSomeoneElse(item);
+
+        await Loop(h.Source(), runner, controls: controls).PollOnceAsync(None);
+
+        Assert.Equal(["paused (claim lost: the item is claimed by `someone` (marker `their-run`))"], runner.Lost);
+        Assert.Equal("parked", (await History(h))[^1].Step);
+        Assert.Empty(runner.Runs);
+        Assert.Empty(await runner.RenewableAsync(None));
+    }
+
+    /// <summary>Controls that cannot be read (the ledger's control table unreachable).</summary>
+    private sealed class UnreadableControls : IControls
+    {
+        private static InvalidOperationException Down() => new("controls unreadable");
+        public Task<ControlState> EffectiveAsync(string externalId, long? epicId, CancellationToken ct) => throw Down();
+        public Task<IReadOnlyList<Control>> ListAsync(CancellationToken ct) => throw Down();
+        public Task<Control?> UsagePauseAsync(CancellationToken ct) => throw Down();
+        public Task<Control> PauseForUsageAsync(DateTimeOffset? resumeAt, string reason, CancellationToken ct) => throw Down();
+        public Task<Control> FreezeAsync(string trigger, string detail, DateTimeOffset? readChangedAt, CancellationToken ct) => throw Down();
+        public Task<Control?> GetAsync(string scope, CancellationToken ct) => throw Down();
+        public Task SetAsync(string scope, ControlState state, string by, CancellationToken ct) => throw Down();
+        public Task ClearAsync(string scope, CancellationToken ct) => throw Down();
+    }
+
+    [Fact]
+    public async Task The_renewal_list_is_what_the_ledger_resumes_by_itself_whatever_the_controls_say_and_never_what_is_parked_escalated_or_being_stopped()
+    {
+        var (h, _, id, locks) = await InFlightAsync();
+        async Task<IReadOnlyList<int>> Renewable(IControls? controls = null)
+        {
+            await using var db = h.Db();
+            return await RunPipeline.RenewableAsync(new WorkLedger(db, TimeProvider.System), None, controls ?? Controls(h), naming: ItemNaming.Kanban);
+        }
+        async Task Record(WorkState state, string? detail, string? step = null)
+        {
+            await using var db = h.Db();
+            var (ledger, row) = (new WorkLedger(db, TimeProvider.System), await db.WorkItems.SingleAsync());
+            await (step is null ? ledger.RecordAsync(row, state, null, detail, None) : ledger.CheckpointAsync(row, step, null, detail, None));
+        }
+
+        // In a handled state (Review): listed, also when the controls cannot be read (an unreadable control costs no claim).
+        Assert.Equal([id], await Renewable());
+        Assert.Equal([id], await Renewable(new UnreadableControls()));
+        // Another source's list does not hold it.
+        await using (var db = h.Db())
+        {
+            Assert.Empty(await RunPipeline.RenewableAsync(new WorkLedger(db, TimeProvider.System), None, Controls(h)));
+        }
+        // Being stopped: not listed (the stop gives the claim back).
+        await Controls(h).SetAsync(ControlScope.Item("kb-1"), ControlState.Stopping, "michael", None);
+        Assert.Empty(await Renewable());
+        await Controls(h).ClearAsync(ControlScope.Item("kb-1"), None);
+        // Every pause that resumes by itself: listed.
+        foreach (var pause in new[] { RunPipeline.Interrupted, RunPipeline.UserPaused, RunPipeline.UsagePaused, RunPipeline.FreezePaused,
+            RunPipeline.ControlsUnreadablePaused })
+        {
+            await Record(WorkState.Paused, pause);
+            Assert.Equal([id], await Renewable());
+            await Record(WorkState.Review, "unpaused");
+        }
+        // Parked (a give-up, a refused or a lost claim): not listed.
+        await Record(WorkState.Paused, RunPipeline.Interrupted);
+        await Record(WorkState.Paused, "3 runs in a row failed", RunPipeline.Steps.Parked);
+        Assert.Empty(await Renewable());
+        await Record(WorkState.Review, "unpaused");
+        await Record(WorkState.Paused, "claim refused: the item is Backlog, not Ready");
+        Assert.Empty(await Renewable());
+        await Record(WorkState.Review, "unpaused");
+        Assert.Equal([id], await Renewable());
+        // Escalated: not listed.
+        await Record(WorkState.Escalated, "boom");
+        Assert.Empty(await Renewable());
+        // The production runner has its own list (the interface's default is the in-flight list, which a control empties).
+        Assert.Equal(typeof(FactoryItemRunner), typeof(FactoryItemRunner).GetMethod(nameof(IItemRunner.RenewableAsync))?.DeclaringType);
+    }
+
+    [Fact]
+    public async Task A_run_does_not_resume_a_claim_lost_item_while_the_other_claim_stands_and_resumes_it_once_it_is_released()
+    {
+        var (h, item, id, locks) = await ImplementingAsync();
+        h.Board.Time.Now = h.Board.Time.Now.AddHours(25);
+        h.Board.ClaimAsSomeoneElse(item);
+        await Loop(h.Source(), new Runner(h, locks)).PollOnceAsync(None);
+        var parked = await History(h);
+        Assert.Equal((WorkState.Paused, "parked"), (parked[^1].State, parked[^1].Step));
+        var comments = item.Comments.Count;
+        h.Board.Calls.Clear();
+
+        // `factory run kb-1` while they still hold it: nothing recorded, nothing written (the renewal is refused).
+        var refused = await RunAsync(h, id, locks);
+
+        Assert.Equal(WorkState.Paused, refused.State);
+        Assert.Equal("kb-1 is still not the factory's to work (claim lost: the item is claimed by `someone` (marker `their-run`)); it stays paused. "
+            + "Run `factory run kb-1` again once the other claim is released or has lapsed, or `factory stop --item kb-1` to give the item up.",
+            refused.Error);
+        Assert.Equal(parked.Select(e => e.Id), (await History(h)).Select(e => e.Id));
+        Assert.Equal(["renew_work_item_claim"], h.Board.Writes);
+        Assert.Equal(("someone", "InProgress", 2L, comments), (item.Claim!.Value.Name, item.Status, item.Version, item.Comments.Count));
+
+        // They release it: the run takes the claim back (the ledger records the item as claimed, and it is InProgress) and
+        // resumes the item where it paused.
+        item.Claim = null;
+        h.Board.Calls.Clear();
+        var resumed = await RunAsync(h, id, locks);
+
+        Assert.Equal((WorkState.Review, (string?)null), (resumed.State, resumed.Error));
+        var after = await History(h);
+        Assert.Equal((WorkState.Implement, (string?)null, "unpaused"), (after[parked.Count].State, after[parked.Count].Step, after[parked.Count].Detail));
+        Assert.Equal(["renew_work_item_claim", "claim_work_item"], h.Board.Writes.Take(2));
+        Assert.Equal(("factory", KanbanWorkSource.Marker(item.Id)), (item.Claim!.Value.Name, item.Claim.Value.Marker));
+    }
+
+    [Fact]
+    public async Task A_run_does_not_resume_an_item_parked_for_a_lost_claim_while_it_was_already_paused()
+    {
+        var (h, item, id, locks) = await ImplementingAsync();
+        await using (var db = h.Db())
+        {
+            await new WorkLedger(db, TimeProvider.System).RecordAsync(await db.WorkItems.SingleAsync(), WorkState.Paused, null, RunPipeline.Interrupted, None);
+        }
+        h.Board.ClaimAsSomeoneElse(item);
+        Assert.NotNull(await new Runner(h, locks).ClaimLostAsync(id, "the item is claimed by someone", None));
+        var parked = await History(h);
+        // Its Paused row says `interrupted`; the `parked` row after it is what holds a run back while they have the item.
+        Assert.Equal((RunPipeline.Interrupted, "parked"), (parked[^2].Detail, parked[^1].Step));
+
+        var outcome = await RunAsync(h, id, locks);
+
+        Assert.Equal(WorkState.Paused, outcome.State);
+        Assert.Contains("is still not the factory's to work", outcome.Error);
+        Assert.Equal(parked.Count, (await History(h)).Count);
+    }
+
+    [Fact]
+    public async Task A_run_does_not_resume_a_claim_lost_item_whose_claim_the_board_will_not_confirm()
+    {
+        var (h, item, id, locks) = await ImplementingAsync();
+        h.Board.ClaimAsSomeoneElse(item);
+        await Loop(h.Source(), new Runner(h, locks)).PollOnceAsync(None);
+        var parked = (await History(h)).Count;
+        item.Claim = null;
+        h.Board.Instead = (tool, _) => tool == "renew_work_item_claim" ? FakeKanbanBoard.Refusal("scope_denied", "the token was revoked") : null;
+
+        var outcome = await RunAsync(h, id, locks);
+
+        Assert.Equal(WorkState.Paused, outcome.State);
+        Assert.StartsWith("kb-1 stays paused: its claim was lost and the board would not confirm it is the factory's again (Kanban's "
+            + "renew_work_item_claim was refused (scope_denied): the token was revoked).", outcome.Error);
+        Assert.Equal(parked, (await History(h)).Count);
+    }
+
+    [Fact]
+    public async Task An_ordinary_paused_item_is_resumed_without_asking_the_board_about_its_claim()
+    {
+        var (h, _, id, locks) = await ImplementingAsync();
+        await using (var db = h.Db())
+        {
+            await new WorkLedger(db, TimeProvider.System).RecordAsync(await db.WorkItems.SingleAsync(), WorkState.Paused, null, RunPipeline.Interrupted, None);
+        }
+
+        var outcome = await RunAsync(h, id, locks);
+
+        Assert.Equal(WorkState.Review, outcome.State);
+        Assert.DoesNotContain("renew_work_item_claim", h.Board.Writes);
+    }
+
+    [Fact]
+    public async Task A_lost_claims_comment_the_board_refuses_is_on_record_in_the_parked_row()
+    {
+        var (h, item, _, locks) = await InFlightAsync();
+        h.Board.Time.Now = h.Board.Time.Now.AddHours(25);
+        h.Board.ClaimAsSomeoneElse(item);
+        h.Board.Instead = (tool, _) => tool == "add_work_item_comment" ? FakeKanbanBoard.Refusal("scope_denied", "the token was revoked") : null;
+        var runner = new Runner(h, locks);
+        const string reason = "claim lost: the item is claimed by `someone` (marker `their-run`)";
+        const string notPosted = "; comment NOT posted: Kanban's add_work_item_comment was refused (scope_denied): the token was revoked";
+
+        await Loop(h.Source(), runner).PollOnceAsync(None);
+
+        // The item is parked and never listed again, so nothing would post the comment later: the ledger says it was not posted.
+        var history = await History(h);
+        Assert.Equal(new[] { (WorkState.Paused, (string?)null, reason), (WorkState.Paused, "parked", reason + notPosted) },
+            history.TakeLast(2).Select(e => (e.State, e.Step, e.Detail!)));
+        Assert.Equal([$"paused ({reason}){notPosted}"], runner.Lost);
+        Assert.Empty(item.Comments);
+        Assert.Empty(await runner.RenewableAsync(None));
     }
 
     [Fact]
@@ -865,7 +1260,10 @@ public class KanbanSafeWritesTests
     {
         public List<int> Runs { get; } = [];
         public List<(int Id, string Reason)> Lost { get; } = [];
+        /// <summary>The renewal list when it is not the in-flight list.</summary>
+        public IReadOnlyList<int>? Renewable { get; init; }
         public Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct) => Task.FromResult(inFlight);
+        public Task<IReadOnlyList<int>> RenewableAsync(CancellationToken ct) => Task.FromResult(Renewable ?? inFlight);
         public Task<RunOutcome> RunAsync(int id, CancellationToken ct)
         {
             Runs.Add(id);
@@ -879,45 +1277,45 @@ public class KanbanSafeWritesTests
     }
 
     [Fact]
-    public async Task The_poll_renews_every_lanes_in_flight_items_whatever_its_sources_and_one_failed_renewal_holds_up_nothing()
+    public async Task The_poll_renews_every_lanes_items_whatever_its_sources_and_a_board_that_does_not_answer_ends_only_its_own_lanes_renewals()
     {
-        // Lane 1: item 2's claim is lost (paused: not run), item 3's renewal fails (the board is down: logged, run all the same),
-        // item 4's claim is lost but its run is active (nothing paused: left to its run). Lane 2: another source, renewed too.
+        // Lane 1: item 2's claim is lost (paused: not run); item 4's is lost but its run is active (nothing paused: left to its
+        // run); item 5's renewal is refused for its own reason (the board answered: the next is asked); item 3's renewal throws
+        // (the board is down or hanging: each further call could wait out its timeout), so item 6 is not asked this poll — and
+        // every item not paused is run all the same. Lane 2: another source, renewed and run whatever happened to lane 1.
         var first = new RenewingSource(ItemNaming.Kanban, id => id switch
         {
             2 or 4 => ClaimRenewal.LostBecause("the item is claimed by someone"),
+            5 => ClaimRenewal.NotRenewedBecause("the token was revoked"),
             3 => throw new HttpRequestException("Kanban down"),
             _ => ClaimRenewal.Held,
         });
         var second = new RenewingSource(ItemNaming.Shortcut, _ => ClaimRenewal.Held);
-        var (firstRunner, secondRunner) = (new ScriptedRunner([1, 2, 3, 4], id => id == 4 ? null : "paused"), new ScriptedRunner([7]));
+        var (firstRunner, secondRunner) = (new ScriptedRunner([1, 2, 4, 5, 3, 6], id => id == 4 ? null : "paused"), new ScriptedRunner([7]));
         var status = new IntakeStatus(TimeProvider.System);
 
         await Loop(first, firstRunner, status, [new IntakeLane(second, secondRunner)]).PollOnceAsync(None);
 
-        Assert.Equal([1, 2, 3, 4], first.Renewed);
+        Assert.Equal([1, 2, 4, 5, 3], first.Renewed);
         Assert.Equal([7], second.Renewed);
         Assert.Equal([(2, "the item is claimed by someone"), (4, "the item is claimed by someone")], firstRunner.Lost);
-        Assert.Equal([1, 3, 4], firstRunner.Runs);
+        Assert.Equal([1, 4, 5, 3, 6], firstRunner.Runs);
         Assert.Equal([7], secondRunner.Runs);
         Assert.Equal("kb-2", Assert.Single(status.ItemErrors).Key);
         Assert.Null(status.FactoryError);
     }
 
     [Fact]
-    public async Task Claims_are_renewed_while_the_factory_is_paused_too()
+    public async Task The_renewal_list_runs_nothing_only_the_in_flight_list_does()
     {
-        var h = new KanbanWorkSourceTests.Harness();
+        // A runner whose renewal list is longer than its in-flight list (items a control holds): renewed, not run.
         var source = new RenewingSource(ItemNaming.Kanban, _ => ClaimRenewal.Held);
-        var controls = Controls(h);
-        await controls.SetAsync(ControlScope.Factory, ControlState.Paused, "michael", None);
-        var loop = new IntakeLoop(source, new ScriptedRunner([1]), new IntakeOptions(TimeSpan.FromSeconds(60)), TimeProvider.System,
-            NullLogger<IntakeLoop>.Instance, controls);
+        var runner = new ScriptedRunner([1]) { Renewable = [1, 2, 3] };
 
-        await loop.PollOnceAsync(None);
+        await Loop(source, runner).PollOnceAsync(None);
 
-        // Whatever the runner lists as in flight is renewed (the production runner leaves out what a control pauses).
-        Assert.Equal([1], source.Renewed);
+        Assert.Equal([1, 2, 3], source.Renewed);
+        Assert.Equal([1], runner.Runs);
     }
 
     [Fact]

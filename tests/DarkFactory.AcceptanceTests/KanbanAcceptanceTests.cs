@@ -190,7 +190,7 @@ public class KanbanAcceptanceTests
             Assert.Equal(WorkState.Paused, item.State);
             var paused = history.Last(e => e.Step is null);
             Assert.True(RunPipeline.IsClaimLost(paused.Detail), paused.Detail);
-            Assert.Contains($"claimed by {taken.Claimant}", paused.Detail);
+            Assert.Contains($"claimed by {UntrustedText.CodeSpan(taken.Claimant!)}", paused.Detail);
             Assert.Equal(StepOutcome.Deferred, paused.Outcome);
             Assert.Equal(RunPipeline.Steps.Parked, history[^1].Step);
             // Their claim, their column and the version stand: the factory wrote nothing but its comment.
@@ -235,6 +235,12 @@ public class KanbanAcceptanceTests
         {
             await using var db = e2e.Db();
             return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ct, naming: ItemNaming.Kanban);
+        }
+
+        public async Task<IReadOnlyList<int>> RenewableAsync(CancellationToken ct)
+        {
+            await using var db = e2e.Db();
+            return await RunPipeline.RenewableAsync(new WorkLedger(db, TimeProvider.System), ct, naming: ItemNaming.Kanban);
         }
 
         public Task<RunOutcome> RunAsync(int id, CancellationToken ct)
