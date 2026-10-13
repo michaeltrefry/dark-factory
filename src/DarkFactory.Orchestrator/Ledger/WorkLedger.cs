@@ -105,6 +105,14 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
     /// <summary>The item's current state as stored, or null when there is no such item. Reads only.</summary>
     public async Task<WorkState?> StateOfAsync(string source, string externalId, CancellationToken ct) =>
         (await db.WorkItems.AsNoTracking().SingleOrDefaultAsync(x => x.Source == source && x.ExternalId == externalId, ct))?.State;
+
+    /// <summary>The id of an item's row (the key of its run lock, <see cref="IRunLocks"/>), or null when there is no such item. Reads only.</summary>
+    public async Task<long?> IdOfAsync(WorkSources.ItemRef item, CancellationToken ct)
+    {
+        var (source, externalId) = (item.Naming.Source, item.ToString());
+        return (await db.WorkItems.AsNoTracking().SingleOrDefaultAsync(x => x.Source == source && x.ExternalId == externalId, ct))?.Id;
+    }
+
     /// <summary>The item, or null if the ledger has never seen it. Nothing is written.</summary>
     public Task<WorkItem?> FindAsync(string source, string externalId, CancellationToken ct) =>
         db.WorkItems.SingleOrDefaultAsync(x => x.Source == source && x.ExternalId == externalId, ct);

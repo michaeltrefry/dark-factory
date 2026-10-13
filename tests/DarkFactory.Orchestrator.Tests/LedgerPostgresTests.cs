@@ -114,6 +114,40 @@ public sealed class LedgerPostgresTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task A_sweep_leaves_what_another_processes_live_run_owns_and_deletes_it_once_that_run_is_gone()
+    {
+        // sc-25987: the live run is another process's — its own PostgresRunLocks, its own connection — and the sweeper's context
+        // has never loaded the item.
+        await using var dbA = Context();
+        var item = await new WorkLedger(dbA, TimeProvider.System).GetOrCreateAsync("shortcut", "sc-1", "Fix", "o/r", null, CancellationToken.None);
+        var directory = Directory.CreateTempSubdirectory("df-mcp-live-").FullName;
+        var file = Path.Combine(directory, $"sc-1.{Guid.NewGuid():N}.json");
+        File.WriteAllText(file, "{}");
+        await using var dbB = Context();
+        var sweeper = new LiveRuns(new WorkLedger(dbB, TimeProvider.System), new PostgresRunLocks(_cs));
+        var sc1 = WorkSources.ItemNaming.ParseAny("sc-1");
+
+        await using (var running = await new PostgresRunLocks(_cs).TryAcquireAsync(item.Id, CancellationToken.None))
+        {
+            Assert.NotNull(running);
+            Assert.Null(await sweeper.TryClaimAsync(sc1, CancellationToken.None));
+            await Mcp.McpProxySessions.SweepAsync(directory, sweeper, CancellationToken.None);
+            Assert.True(File.Exists(file));
+        }
+
+        // The run is gone: its leftovers are claimed under the item's run lock (no run of it starts meanwhile), then the lock is given back.
+        await using (var claim = await sweeper.TryClaimAsync(sc1, CancellationToken.None))
+        {
+            Assert.True(claim!.UnderRunLock);
+            Assert.Null(await new PostgresRunLocks(_cs).TryAcquireAsync(item.Id, CancellationToken.None));
+        }
+        await Mcp.McpProxySessions.SweepAsync(directory, sweeper, CancellationToken.None);
+        Assert.False(File.Exists(file));
+        await using var free = await new PostgresRunLocks(_cs).TryAcquireAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(free);
+    }
+
+    [Fact]
     public async Task Stale_writer_cannot_overwrite_another_runs_state_and_writes_nothing()
     {
         await using var dbA = Context();

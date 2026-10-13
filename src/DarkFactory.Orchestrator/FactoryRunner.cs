@@ -231,12 +231,16 @@ public static class FactoryRunner
 
         var workspaces = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
             async (repo, c) => (await app.CreateInstallationTokenAsync(repo, c)).Token, sandbox: sandbox);
-        // Worktrees no run will resume (left by a killed cleanup or a worker that would not stop).
+        var runLocks = new PostgresRunLocks(options.LedgerConnectionString);
+        // Worktrees no run will resume (left by a killed cleanup or a worker that would not stop) — and none a live run owns
+        // (sc-25987): another run's gate test worktrees or base-update worktree are its item's, guarded by that item's run lock.
+        // This run holds no item's lock yet (its pipeline takes its own), so no item is exempt.
         if (needsWorker)
         {
             await FactoryWide("the worktree sweep", async () =>
             {
-                await workspaces.SweepOrphansAsync((name, c) => RunPipeline.WorktreeIsResumableAsync(ledger, name, c), ct);
+                await workspaces.SweepOrphansAsync((name, c) => RunPipeline.WorktreeIsResumableAsync(ledger, name, c),
+                    new LiveRuns(ledger, runLocks), ct);
                 return true;
             });
         }
@@ -256,7 +260,7 @@ public static class FactoryRunner
         var pipeline = new RunPipeline(
             source,
             ledger,
-            new PostgresRunLocks(options.LedgerConnectionString),
+            runLocks,
             workspaces,
             new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, sandbox,
                 pauseFlagDirectory: options.PauseFlagDirectory),
@@ -424,8 +428,9 @@ public sealed class FactoryItemStops(FactoryOptions options, IWorkSource source,
 /// owner-side git holds a contents-read token only (<see cref="Issues.WorkerTriageRunner.TriageWorkspaceToken"/>). The worker is
 /// read-only and reads only its own worktree (<see cref="WorkerTools.ReadOnly"/>: Read, Glob, Grep inside it; E4), and never runs unsandboxed (refused, factory-wide). Its
 /// worktree lives under its own root (<see cref="TriageWorktrees"/>) that no item's run uses, swept of leftovers before each triage
-/// (triages run one at a time, under the worker run lock), and is not shared for writing: the worker user reads it through the work
-/// root's inherited read entry (<c>setup-worker-user.sh</c>) and cannot write it.
+/// (nothing resumes a triage; what another live triage owns — its issue item's run lock is held — is kept, sc-25987), and is not
+/// shared for writing: the worker user reads it through the work root's inherited read entry (<c>setup-worker-user.sh</c>) and
+/// cannot write it.
 /// </summary>
 public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) : Issues.ITriageRunner
 {
@@ -454,10 +459,13 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         var workspaces = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
             async (r, c) => (await app.CreateInstallationTokenAsync(r, c, Issues.WorkerTriageRunner.TriageWorkspaceToken)).Token, sandbox: sandbox,
             worktreesDirectory: TriageWorktrees, shareWithWorker: false);
-        // Under the worker run lock no other triage runs: whatever a crashed or unstoppable one left is swept (nothing resumes a triage).
+        // Whatever a crashed or unstoppable triage left is swept (nothing resumes a triage), this issue's own included: the intake
+        // holds its item's run lock around this call. Another live triage's worktree and session file are its item's and are kept.
+        await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
+        var live = Leftovers(db, options, item);
         try
         {
-            await workspaces.SweepOrphansAsync((_, _) => Task.FromResult(false), ct);
+            await workspaces.SweepOrphansAsync((_, _) => Task.FromResult(false), live, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -470,15 +478,23 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         using var codeGraphHttp = OutboundHttp.CodeGraphApi(options.CodeGraphBaseUrl);
         var upstreams = FactoryRunner.CreateUpstreams(options, codeGraphHttp, kanbanHttp: null, log);
         var configs = Path.Combine(options.WorkRoot, Mcp.McpProxySessions.DirectoryName);
-        await using var proxy = await StartMcpProxyAsync(upstreams, configs, ct);
+        await using var proxy = await StartMcpProxyAsync(upstreams, configs, live, ct);
         var tools = TriageTools(upstreams, proxy is not null);
         var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, sandbox,
             pauseFlagDirectory: options.PauseFlagDirectory, tools: tools);
         var sessions = new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)),
             new RouterClient(routerHttp, routerKey), TimeProvider.System, log, costSettleDelay: options.CostSettleDelay);
         return await new Issues.WorkerTriageRunner(workspaces, worker, sessions, log,
-            proxy is null ? null : new Mcp.McpProxySessions(proxy, configs, sandbox!.User)).RunAsync(item, repo, prompt, onSession, onTaint, ct);
+            proxy is null ? null : new Mcp.McpProxySessions(proxy, configs, sandbox!.User, owner: ItemNaming.ParseAny(item.ExternalId)))
+            .RunAsync(item, repo, prompt, onSession, onTaint, ct);
     }
+
+    /// <summary>
+    /// Whose leftovers a seat's sweep may delete (sc-25987), asked by a session of <paramref name="item"/> whose run holds that
+    /// item's run lock: its own (an earlier, dead run's), and any other item's that no live run holds the run lock of.
+    /// </summary>
+    internal static LiveRuns Leftovers(LedgerDbContext db, FactoryOptions options, WorkItem item) =>
+        new(new WorkLedger(db, TimeProvider.System), new PostgresRunLocks(options.LedgerConnectionString), ItemNaming.ParseAny(item.ExternalId));
 
     /// <summary>
     /// The triage worker's tools: <see cref="WorkerTools.ReadOnly"/>, plus (with the proxy) exactly the triage profile's MCP tools
@@ -488,16 +504,16 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         proxied ? WorkerTools.ReadOnly.WithMcp(Mcp.McpProfile.Triage.ToolRules(upstreams)) : WorkerTools.ReadOnly;
 
     /// <summary>
-    /// Sweeps <paramref name="configs"/> of a crashed process's session files (under the worker run lock: no other triage's file is
-    /// live) and starts the loopback MCP proxy when CodeGraph is configured (else null). Either failing is factory-wide
+    /// Sweeps <paramref name="configs"/> of a crashed process's session files (a live run's are kept: <paramref name="live"/>) and
+    /// starts the loopback MCP proxy when CodeGraph is configured (else null). Either failing is factory-wide
     /// (<see cref="FactoryUnavailableException"/>, E10), never the issue's.
     /// </summary>
-    internal static async Task<Mcp.McpProxy?> StartMcpProxyAsync(Mcp.McpUpstreams upstreams, string configs, CancellationToken ct,
+    internal static async Task<Mcp.McpProxy?> StartMcpProxyAsync(Mcp.McpUpstreams upstreams, string configs, LiveRuns live, CancellationToken ct,
         Func<Mcp.McpUpstreams, CancellationToken, Task<Mcp.McpProxy>>? start = null)
     {
         try
         {
-            Mcp.McpProxySessions.Sweep(configs);
+            await Mcp.McpProxySessions.SweepAsync(configs, live, ct);
             return upstreams.CodeGraph is null ? null : await (start ?? Mcp.McpProxy.StartAsync)(upstreams, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -527,9 +543,10 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
 /// is not shared with the worker user for writing; and, when an upstream is configured, the loopback MCP proxy this process hosts for
 /// the session, granted exactly <see cref="Mcp.McpProfile.Planner"/> (the allowlisted CodeGraph tools and Kanban read tools) over the
 /// plan's repository set (sc-25874: several repositories give a seat of one checkout each and a grant over them all). The
-/// upstream tokens stay here; the session gets a credential revoked when it ends, in a file (never argv). Sandboxed, the run holds the
-/// worker run lock, so leftovers of a crashed run (plan worktrees, session files) are swept first; unsandboxed
-/// (<c>Worker:RunAs=none</c>, development only) nothing is swept, since another run's may be live.
+/// upstream tokens stay here; the session gets a credential revoked when it ends, in a file (never argv). Sandboxed, leftovers of a
+/// crashed run (plan worktrees and seats, session files) are swept first — this plan item's own, and any other item's whose run
+/// lock no live run holds (sc-25987: another live planner's seat or a live triage's session file is kept); unsandboxed
+/// (<c>Worker:RunAs=none</c>, development only) nothing is swept, as before.
 /// </summary>
 public sealed class SandboxPlanRunner(FactoryOptions options, WorkerSandbox? sandbox, GitHubApp app, Mcp.McpUpstreams upstreams, TextWriter log)
     : Plans.IPlanRunner
@@ -550,9 +567,11 @@ public sealed class SandboxPlanRunner(FactoryOptions options, WorkerSandbox? san
         {
             if (sandbox is not null)
             {
-                // Nothing resumes a planner session: whatever a crashed or unstoppable one left is swept.
-                await workspaces.SweepOrphansAsync((_, _) => Task.FromResult(false), ct);
-                Mcp.McpProxySessions.Sweep(configs);
+                // Nothing resumes a planner session: whatever a crashed or unstoppable one left is swept, unless a live run owns it.
+                await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
+                var live = SandboxTriageRunner.Leftovers(db, options, item);
+                await workspaces.SweepOrphansAsync((_, _) => Task.FromResult(false), live, ct);
+                await Mcp.McpProxySessions.SweepAsync(configs, live, ct);
             }
             started = upstreams.All.Count == 0 ? null : await Mcp.McpProxy.StartAsync(upstreams, ct);
         }
@@ -564,7 +583,8 @@ public sealed class SandboxPlanRunner(FactoryOptions options, WorkerSandbox? san
         var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, options.RouterKey, options.WorkerAuth, options.WorkerTimeout, sandbox,
             pauseFlagDirectory: options.PauseFlagDirectory, tools: PlannerTools(upstreams, proxy is not null));
         return await new Plans.WorkerPlanRunner(workspaces, worker, log,
-            proxy is null ? null : new Mcp.McpProxySessions(proxy, configs, sandbox?.User)).RunAsync(item, repos, session, ct);
+            proxy is null ? null : new Mcp.McpProxySessions(proxy, configs, sandbox?.User, owner: ItemNaming.ParseAny(item.ExternalId)))
+            .RunAsync(item, repos, session, ct);
     }
 
     /// <summary>

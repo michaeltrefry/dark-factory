@@ -316,9 +316,18 @@ public class McpProxyTests
         Assert.False(File.Exists(path));
         Assert.Equal(HttpStatusCode.Unauthorized, (await Rpc(proxy, McpServers.CodeGraph, credential, "tools/list")).Status);
 
+        // A session opened by an item's run is named for the item, so another run's sweep knows whose run lock guards it (sc-25987).
+        await using (var owned = await new McpProxySessions(proxy, directory, owner: WorkSources.ItemNaming.ParseAny("gh-5"))
+            .OpenAsync(Repo, McpProfile.Triage, CancellationToken.None))
+        {
+            Assert.Equal("gh-5", WorkSources.ItemNaming.OwnerOfSessionFile(Path.GetFileName(owned.ConfigPath))?.ToString());
+            Assert.Matches(@"^gh-5\.[0-9a-f]{32}\.json$", Path.GetFileName(owned.ConfigPath));
+        }
+        Assert.Null(WorkSources.ItemNaming.OwnerOfSessionFile(Path.GetFileName(path)));
+
         // A crashed process's leftover files are swept (their credentials died with that process's proxy).
         File.WriteAllText(Path.Combine(directory, "left.json"), "{}");
-        McpProxySessions.Sweep(directory);
+        await McpProxySessions.SweepAsync(directory, Ledger.LiveRuns.None, CancellationToken.None);
         Assert.Empty(Directory.EnumerateFiles(directory));
     }
 
@@ -613,7 +622,7 @@ public class McpProxyTests
         try
         {
             var swept = await Assert.ThrowsAsync<WorkSources.FactoryUnavailableException>(() =>
-                SandboxTriageRunner.StartMcpProxyAsync(upstreams, configs, CancellationToken.None));
+                SandboxTriageRunner.StartMcpProxyAsync(upstreams, configs, Ledger.LiveRuns.None, CancellationToken.None));
             Assert.StartsWith("the MCP proxy: ", swept.Message);
         }
         finally
@@ -621,11 +630,11 @@ public class McpProxyTests
             File.SetUnixFileMode(configs, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
         var started = await Assert.ThrowsAsync<WorkSources.FactoryUnavailableException>(() =>
-            SandboxTriageRunner.StartMcpProxyAsync(upstreams, configs, CancellationToken.None,
+            SandboxTriageRunner.StartMcpProxyAsync(upstreams, configs, Ledger.LiveRuns.None, CancellationToken.None,
                 (_, _) => throw new IOException("address in use")));
         Assert.Contains("address in use", started.Message);
         // Without CodeGraph no proxy is started.
-        Assert.Null(await SandboxTriageRunner.StartMcpProxyAsync(McpUpstreams.None, configs, CancellationToken.None,
+        Assert.Null(await SandboxTriageRunner.StartMcpProxyAsync(McpUpstreams.None, configs, Ledger.LiveRuns.None, CancellationToken.None,
             (_, _) => throw new InvalidOperationException("not started")));
     }
 
