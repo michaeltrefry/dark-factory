@@ -326,18 +326,18 @@ public class ShortcutReleaseTests
     }
 
     /// <summary>
-    /// The recorded API's own shape (Fixtures/shortcut/list-ready.json holds two stories joined by a real <c>blocks</c> relation, and
-    /// the workspace's workflow): <c>story_links</c> entries carry <c>verb</c>, <c>subject_id</c> (the blocker) and <c>object_id</c>,
-    /// and a relation is listed on both of its stories. <c>GET stories/{id}</c> itself and the release's <c>PUT</c> have no recording
-    /// with a relation or a Backlog → To Do move yet: the stories here are the listing's.
+    /// The recorded API's own shape (Fixtures/shortcut/release.json: <c>GET stories/{id}</c> of two stories joined by a real
+    /// <c>blocks</c> relation, each as first read — in the Backlog, not archived — and the workspace's workflow):
+    /// <c>story_links</c> entries carry <c>verb</c>, <c>subject_id</c> (the blocker) and <c>object_id</c>, and a relation is listed
+    /// on both of its stories. The recorded conversation itself — the release's <c>PUT</c> included — is replayed strictly by
+    /// <c>ShortcutContractTests</c>; here the recorded stories are served by path so their state can be varied.
     /// </summary>
     [Fact]
     public async Task The_recorded_story_shape_reads_its_blocker_and_is_released_to_the_recorded_to_do_state()
     {
-        var fixture = ShortcutFixture.Load("list-ready.json");
-        var linked = fixture.Interactions.Where(i => i.Path.EndsWith("/stories", StringComparison.Ordinal)).SelectMany(i => i.Response!.AsArray())
-            .Where(s => s!["story_links"]!.AsArray().Any(l => (string?)l!["verb"] == "blocks"))
-            .GroupBy(s => s!["id"]!.GetValue<int>()).Select(g => g.First()!.DeepClone().AsObject()).ToList();
+        var fixture = ShortcutFixture.Load("release.json");
+        var linked = fixture.Parameters["children"]!.AsArray().Select(c => c!.GetValue<int>())
+            .Select(id => fixture.Interactions.First(i => i.Method == "GET" && i.Path == $"/api/v3/stories/{id}").Response!.DeepClone().AsObject()).ToList();
         var relation = linked[0]["story_links"]!.AsArray().First(l => (string?)l!["verb"] == "blocks")!;
         var (blocker, blocked) = (relation["subject_id"]!.GetValue<int>(), relation["object_id"]!.GetValue<int>());
         Assert.Equal(new[] { blocker, blocked }.Order(), linked.Select(s => s["id"]!.GetValue<int>()).Order());
@@ -348,7 +348,7 @@ public class ShortcutReleaseTests
         var handler = new Recorded(responses);
         var source = new ShortcutWorkSource(new HttpClient(handler) { BaseAddress = ShortcutWorkSource.DefaultBaseAddress }, "tok", WatchScope.None);
 
-        // The recorded blocker waits in the Backlog (and was archived after recording): not finished.
+        // The recorded blocker waits in the Backlog: not finished.
         Assert.Equal([new Blocker(blocker, false)], await source.BlockersAsync(blocked, CancellationToken.None));
         Assert.Empty(await source.BlockersAsync(blocker, CancellationToken.None));
         // The recorded workflow's own state types: in its state of type "done" and not archived, it is finished.
@@ -362,7 +362,6 @@ public class ShortcutReleaseTests
         // Both recorded stories wait in the Backlog; the fixture's own stories were archived after recording, which release leaves alone.
         var story = responses[$"/api/v3/stories/{blocker}"].AsObject();
         Assert.Equal(State("Backlog"), story["workflow_state_id"]!.GetValue<long>());
-        Assert.True(story["archived"]!.GetValue<bool>());
         Assert.Equal(ReadyResult.Archived, await source.MakeReadyAsync(blocker, CancellationToken.None));
         story["archived"] = false;
         // The PUT answers the story; the fake serves the same one back.

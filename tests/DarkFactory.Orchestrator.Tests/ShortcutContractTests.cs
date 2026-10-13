@@ -30,14 +30,33 @@ public class ShortcutContractTests
         await source.CommentAsync(parent, "contract test comment", ct);
         await source.LinkAsync(parent, [PrUrl, BranchUrl], ct);
         await source.LinkAsync(parent, [PrUrl], ct); // already linked: read only
-        var children = await source.CreateChildrenAsync(parent,
-        [
-            new("[dark-factory fixture] child 1", "First step of the plan.", "chore", []),
-            new("[dark-factory fixture] child 2", "Second step; needs the first.", "chore", [0]),
-        ], ct);
+        var children = await source.CreateChildrenAsync(parent, Children, ct);
         await source.ReportStateAsync(parent, BoardState.Merged, null, ct);
         await source.ReportStateAsync(parent, BoardState.Stopped, "stopped by the contract test", ct);
         return children;
+    }
+
+    /// <summary>The two stories <see cref="WriteLifecycle"/> creates from its parent: the second is blocked by the first.</summary>
+    internal static readonly IReadOnlyList<ChildItem> Children =
+    [
+        new("[dark-factory fixture] child 1", "First step of the plan.", "chore", []),
+        new("[dark-factory fixture] child 2", "Second step; needs the first.", "chore", [0]),
+    ];
+
+    /// <summary>
+    /// What a plan's retry and release ask of the board (sc-25877), on the <paramref name="children"/> <see cref="WriteLifecycle"/>
+    /// left in the Backlog: a second <see cref="ShortcutWorkSource.CreateChildrenAsync"/> finds both by their external id in the
+    /// listing and creates nothing; the second child's blockers are read from its <c>story_links</c>; it is moved Backlog → To Do
+    /// by a <c>PUT</c> of <c>workflow_state_id</c> alone, and is then no longer in the Backlog.
+    /// </summary>
+    internal static async Task ReleaseLifecycle(ShortcutWorkSource source, int parent, IReadOnlyList<int> children)
+    {
+        var ct = CancellationToken.None;
+        Assert.Equal(children, await source.CreateChildrenAsync(parent, Children, ct));
+        Assert.Equal([new Blocker(children[0], false)], await source.BlockersAsync(children[1], ct));
+        Assert.Equal(ReadyResult.Moved, await source.MakeReadyAsync(children[1], ct));
+        Assert.False(await source.InBacklogAsync(children[1], ct));
+        Assert.Equal(ReadyResult.AlreadyLeft, await source.MakeReadyAsync(children[1], ct));
     }
 
     private static (ShortcutWorkSource Source, ReplayHandler Replay) Replay(ShortcutFixture fixture, WatchScope? scope = null)
@@ -190,11 +209,53 @@ public class ShortcutContractTests
         // first for children an earlier attempt created; none exist, so both are created.
         Assert.Equal(fixture.Parameters["children"]!.AsArray().Select(c => c!.GetValue<int>()), children);
         var siblings = Assert.Single(fixture.Interactions, i => i.Method == "GET" && i.Path.StartsWith("/api/v3/groups/"));
-        Assert.DoesNotContain(siblings.Response!.AsArray(), s => ((string?)s!["name"])!.Contains("child"));
-        Assert.Equal(2, Calls(fixture, "POST", "/api/v3/stories").Count);
+        // (The listing also holds the archived children of earlier recordings; an archived story is never reused.)
+        Assert.DoesNotContain(siblings.Response!.AsArray(), s => !s!["archived"]!.GetValue<bool>() && ((string?)s["name"])!.Contains("child"));
+        var posts = Calls(fixture, "POST", "/api/v3/stories");
+        Assert.Equal(2, posts.Count);
+        // Each is created with its idempotency key as the external id, which the API accepted and returned unchanged (sc-25877).
+        Assert.Equal(Children.Select(c => c.Key($"sc-{parent}")), posts.Select(p => p.Request!["external_id"]!.GetValue<string>()));
+        Assert.All(posts, p => Assert.Equal(p.Request!["external_id"]!.GetValue<string>(), p.Response!["external_id"]!.GetValue<string>()));
+        Assert.All(posts, p => Assert.True(p.Request!["external_id"]!.GetValue<string>().Length >= 92));
         var link = Assert.Single(Calls(fixture, "POST", "/api/v3/story-links"));
         Assert.Equal((children[0], "blocks", children[1]),
             (link.Response!["subject_id"]!.GetValue<int>(), link.Response["verb"]!.GetValue<string>(), link.Response["object_id"]!.GetValue<int>()));
+    }
+
+    /// <summary>
+    /// A plan's retry and release against the recorded API (sc-25877, <c>release.json</c>, recorded right after
+    /// <c>write-lifecycle.json</c> on the same throwaway stories): the listing the retry reads carries each child's external id,
+    /// so both are found and none is created; a story read back carries its <c>story_links</c>; the release is one <c>PUT</c>
+    /// holding only <c>workflow_state_id</c>.
+    /// </summary>
+    [Fact]
+    public async Task A_retry_finds_its_children_by_external_id_and_a_release_reads_blockers_and_moves_backlog_to_to_do()
+    {
+        var fixture = ShortcutFixture.Load("release.json");
+        var (source, replay) = Replay(fixture);
+        var parent = fixture.Int("parent");
+        var children = fixture.Parameters["children"]!.AsArray().Select(c => c!.GetValue<int>()).ToList();
+
+        await ReleaseLifecycle(source, parent, children);
+
+        Assert.True(replay.AllReplayed);
+        // The retry created nothing and linked nothing: it found its children in the listing, by the key the API returned there.
+        Assert.DoesNotContain(fixture.Interactions, i => i.Method == "POST");
+        var listing = Assert.Single(fixture.Interactions, i => i.Method == "GET" && i.Path.StartsWith("/api/v3/groups/")).Response!.AsArray();
+        for (var i = 0; i < children.Count; i++)
+        {
+            var listed = Assert.Single(listing, s => s!["id"]!.GetValue<int>() == children[i]);
+            Assert.Equal(Children[i].Key($"sc-{parent}"), listed!["external_id"]!.GetValue<string>());
+        }
+        // A story read back carries its relations: child 1 blocks child 2.
+        var blocked = fixture.Interactions.First(i => i.Method == "GET" && i.Path == $"/api/v3/stories/{children[1]}").Response!;
+        Assert.Contains(blocked["story_links"]!.AsArray(), l => (string?)l!["verb"] == "blocks"
+            && l["subject_id"]!.GetValue<int>() == children[0] && l["object_id"]!.GetValue<int>() == children[1]);
+        // The release: one PUT, nothing in it but the To Do state, answered with the story in that state.
+        var put = Assert.Single(fixture.Interactions, i => i.Method == "PUT");
+        Assert.Equal($"/api/v3/stories/{children[1]}", put.Path);
+        Assert.True(JsonNode.DeepEquals(new JsonObject { ["workflow_state_id"] = StateId(fixture, "To Do") }, put.Request), put.Request!.ToJsonString());
+        Assert.Equal(StateId(fixture, "To Do"), put.Response!["workflow_state_id"]!.GetValue<long>());
     }
 
     [Fact]
@@ -277,8 +338,6 @@ public class ShortcutFixtureRecorder
 
         ShortcutWorkSource Recording(ShortcutFixture fixture) => ShortcutFixtureRecorder.Recording(fixture, token);
 
-        await RecordListReady();
-
         var spec = new ShortcutFixture { Source = "recorded live" };
         await Recording(spec).ReadSpecAsync(25185, ct);
         spec.Save("read-spec.json");
@@ -327,6 +386,10 @@ public class ShortcutFixtureRecorder
         var created = new List<int> { parent };
         try
         {
+            // Listed while the throwaway parent waits in To Do, so the recording always holds a ready story (on 2026-10-13 the
+            // team and the epic had none, and the replay's "the listing is not empty" failed on the fresh recording).
+            await RecordListReady();
+
             var writes = new ShortcutFixture { Source = "recorded live on throwaway stories, archived afterwards" };
             writes.Parameters["parent"] = parent;
             var children = await ShortcutContractTests.WriteLifecycle(Recording(writes), parent);
@@ -337,6 +400,13 @@ public class ShortcutFixtureRecorder
             var child2 = await Raw(raw, token, HttpMethod.Get, $"stories/{children[1]}", null);
             Assert.Contains(child2!["story_links"]!.AsArray(), l => (string?)l!["verb"] == "blocks" && l["subject_id"]!.GetValue<int>() == children[0]);
             writes.Save("write-lifecycle.json");
+
+            // The retry and the release of those children (sc-25877), with a source of its own (no cached read).
+            var release = new ShortcutFixture { Source = "recorded live on the throwaway stories of write-lifecycle.json, archived afterwards" };
+            release.Parameters["parent"] = parent;
+            release.Parameters["children"] = new JsonArray(children.Select(c => (JsonNode)c).ToArray());
+            await ShortcutContractTests.ReleaseLifecycle(Recording(release), parent, children);
+            release.Save("release.json");
         }
         finally
         {

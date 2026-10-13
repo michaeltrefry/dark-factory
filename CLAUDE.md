@@ -580,11 +580,11 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   no external id at all (a child created before the key existed): name and description together (the description starts with the
   code-written marker below; the listings carry no description, so each such namesake is read in full; line endings and outer
   whitespace aside). Either way a story someone else wrote with a plan story's title — or one carrying another key (the same plan
-  text under another parent) — is never reused, recorded or linked: the plan's own story is created beside it. Not verified
-  against the real API yet: the recorded `write-lifecycle.json` fixture's two `POST stories` requests carry the key by hand-edit
-  (their responses are the old recording); the terminal story's live run re-records it, and must confirm then that Shortcut
-  takes an `external_id` of the key's length (19 + the parent's name + 1 + 64 characters: 92 for `sc-25858`) and returns it in
-  the listings (docs/acceptance.md). A source that could not find the children
+  text under another parent) — is never reused, recorded or linked: the plan's own story is created beside it. Verified
+  against the real API (2026-10-13, sc-25877): `write-lifecycle.json` is recorded with the key (Shortcut takes an `external_id`
+  of the key's length — 19 + the parent's name + 1 + 64 characters: 92 for `sc-25858` — and returns it unchanged), and
+  `release.json` records the retry finding both children by it in the team's listing, creating nothing (the epic's listing
+  carries it too: seen on the live P4-AT1's stories; docs/acceptance.md). A source that could not find the children
   again refuses before any write (`ChildrenRefusedException`: a Shortcut parent with neither epic nor team, possible only with
   `--ignore-scope`), and the item escalates with no story created. Which plan a later run uses (`RunPipeline.ReusesRecordedPlan`;
   the newest `plan` row is the one considered): a recorded plan is reused — no planner session — when a `plan-creating` or

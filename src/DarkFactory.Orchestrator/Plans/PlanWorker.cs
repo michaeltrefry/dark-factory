@@ -212,6 +212,11 @@ public static class PlanPrompt
                 needs the upstream change released, such as bumping a dependency pin. A story cannot be blocked by its own repository's
                 changeset, nor by the changeset of a repository that merges later than its own in "merge_order", and the two kinds
                 together must not form a cycle (a changeset waits on every story of its repository).
+                What a story's worker sees: only a checkout of the story's own repository, on that repository's changeset branch. It
+                cannot read another repository of the plan (not its default branch, not its changeset branch, not a released commit),
+                nor the web. So never write a story that tells its worker to read, copy from or look up anything in another
+                repository: put what it needs from there — signatures, behaviour, formats, names, values — into that story's own
+                "description" and "acceptance", in full. A blocker only orders the work; it shows the worker nothing.
                 """
             : "";
         var prompt = $$"""

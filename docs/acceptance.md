@@ -628,12 +628,14 @@ the factory sends as each created story's `external_id` (sc-25877; `dark-factory
 characters for a parent such as `sc-25858`, one more per extra digit of the parent's id): that `POST stories` accepts an
 `external_id` of that length and returns it unchanged (not cut, not refused), and that the story listings the factory reads
 (the epic's and the team's stories) carry `external_id` for such a story — a retry finds its children from the listing by it.
-Neither is recorded yet: the fixture's two `POST stories` requests carry the key by hand-edit and their responses are the old
-recording.
+Both confirmed on 2026-10-13 (sc-25877): `write-lifecycle.json`'s two `POST stories` carry a 92-character key and
+their 201 responses return it unchanged; `release.json` (recorded right after, on the same throwaway stories) holds the retry
+— the team's listing carries each child's `external_id`, both are found, nothing is created — and the live P4-AT1 stories
+show it in the epic's listing (`GET epics/{id}/stories`) too.
 
 Not run live yet (2026-10-12): written with sc-25870 and extended with sc-25871, to be run by the owner. The live run is also the
 first time the release's Shortcut requests meet the real API: `GET stories/{id}` returning a story with `story_links`, and
-`PUT stories/{id}` with only `workflow_state_id` (Backlog → To Do) have no recorded contract fixture yet (`Fixtures/shortcut`); the
+`PUT stories/{id}` with only `workflow_state_id` (Backlog → To Do) had no recorded contract fixture then; since 2026-10-13 `release.json` records both (`ShortcutContractTests.A_retry_finds_its_children_by_external_id_and_a_release_reads_blockers_and_moves_backlog_to_to_do`); the
 unit tests cover them against the fake board and against the story shape the `list-ready.json` recording holds. Two more reads
 first meet the real API there: a story's blockers are each read with their own `GET stories/{id}` and judged finished by the
 `type` (`done`) of their workflow state in `GET workflows` (the recording's workflow carries those types), and a released story
@@ -667,8 +669,11 @@ Prerequisites: everything P4-AT1 needs, and
   documented format in the first and a reader of it in the second), each story able to pass its repository's gate on its own and
   each repository's changeset inside that repository's `risk` limits. **At least one story must wait on the first repository's
   changeset** (`blocked_by_changesets` in the plan): say in the story that the second repository's change must only start once
-  the first repository's change is on its default branch — e.g. "the reader in `<second>` must be written against the format as
-  released on `<first>`'s default branch, not against the branch it is being built on". A plan in which no story waits on a
+  the first repository's change is on its default branch — e.g. "the change in `<second>` must only start after the change in
+  `<first>` is on `<first>`'s default branch". State the order as a release rule and spell the shared contract out in the story
+  itself; do **not** ask for the second repository's change to be "written against" or "read from" the first repository: a
+  story's worker sees only its own repository's checkout, and a story that tells it to read the other one ends `Worker finished
+  without changing the repository` (the first live run, 2026-10-13; the planner is now told so, sc-25877). A plan in which no story waits on a
   changeset fails the test as `INCONCLUSIVE: …` right after planning (sc-25877): the check "released only after that changeset's
   merge" would otherwise check nothing.
 Stop any `factory work` whose watch scope covers the story's team or epic first, as for P4-AT1.
