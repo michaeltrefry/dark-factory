@@ -402,6 +402,7 @@ public class MultiRepoPipelineTests
         public Task<string> GetDiffAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct) => Of(repo).GetDiffAsync(repo, baseSha, headSha, ct);
         public Task<RepoFiles> GetFilesAsync(RepoRef repo, string sha, CancellationToken ct) => Of(repo).GetFilesAsync(repo, sha, ct);
         public Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct) => Of(repo).GetPolicyAsync(repo, baseRef, ct);
+        public Task<RepoWorkflows> GetWorkflowsAsync(RepoRef repo, CancellationToken ct) => Of(repo).GetWorkflowsAsync(repo, ct);
         public Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct) => Of(repo).GetCiAsync(repo, sha, ct);
         public Task<string> GetCheckLogAsync(RepoRef repo, CheckFact check, CancellationToken ct) => Of(repo).GetCheckLogAsync(repo, check, ct);
         public Task<BaseComparison> CompareAsync(RepoRef repo, string baseRef, string headSha, CancellationToken ct) => Of(repo).CompareAsync(repo, baseRef, headSha, ct);
@@ -447,6 +448,10 @@ public class MultiRepoPipelineTests
         public BranchRepo UpRepo { get; } = new() { Name = Up, Worktree = "/wt-up" };
         public BranchRepo DownRepo { get; } = new() { Name = Down, Worktree = "/wt-down" };
         public ChangesetPipelineTests.PanelReviewer Reviewer { get; } = new();
+        /// <summary>CodeGraph as the gate's <c>risk-threshold</c> reads it.</summary>
+        public FakeCodeGraphRisk CodeGraph { get; } = new();
+        /// <summary>The planner, once <see cref="Answer"/> gave it its answer.</summary>
+        public FakeWorker? Planner => _planner;
         public MergeQueueTests.SimWorker Worker { get; } = new();
         public FakeShortcutBoard Board { get; } = new();
         public ShortcutWorkSource Source { get; }
@@ -457,7 +462,7 @@ public class MultiRepoPipelineTests
         public Task<RunOutcome> Run(int id = PlanId) =>
             new RunPipeline(Source, new WorkLedger(new LedgerDbContext(_options), TimeProvider.System), Locks, _repos, Worker, _repos, Sandbox, _log,
                 controls: Controls, controlPollInterval: TimeSpan.FromMilliseconds(10),
-                gate: new GateStage(_repos, Reviewer, TimeSpan.FromMilliseconds(5), TimeSpan.FromSeconds(30), Risk: FakeCodeGraphRisk.Reader()),
+                gate: new GateStage(_repos, Reviewer, TimeSpan.FromMilliseconds(5), TimeSpan.FromSeconds(30), Risk: FakeCodeGraphRisk.Reader(CodeGraph)),
                 planner: _planner is null ? null : new Seat(_planner), configuredRepos: TwoRepoAnswers.Both).RunAsync(id, CancellationToken.None);
 
         public void Answer(string answer) =>
@@ -537,6 +542,192 @@ public class MultiRepoPipelineTests
     private static string Branch(int id) => $"factory/sc-{id}";
 
     private static int ChangesetPulls(BranchRepo repo) => repo.Opened.Count(o => o.Head == ChangesetBranch);
+
+    // ---- the CI-trigger check, in every repository of the plan (sc-25873) ----
+
+    private const string CiFile = ".github/workflows/ci.yml";
+    private const string MainOnly = "name: ci\non:\n  pull_request:\n    branches: [main]\njobs: {}\n";
+    private const string DispatchOnly = "name: deploy\non: workflow_dispatch\njobs: {}\n";
+
+    private static IReadOnlyList<WorkflowFile> Workflow(string text) => [new WorkflowFile(CiFile, text)];
+
+    private static List<JsonNode?> StoriesCreated(Harness h) =>
+        [.. h.Board.Requests.Where(r => r.Method == HttpMethod.Post && r.PathAndQuery.StartsWith("/api/v3/stories", StringComparison.Ordinal)
+            && !r.PathAndQuery.Contains("/comments", StringComparison.Ordinal)).Select(r => JsonNode.Parse(r.Body!))];
+
+    [Fact]
+    public async Task A_plan_whose_second_repository_runs_no_ci_for_its_stories_is_escalated_before_the_planner_with_nothing_created_in_either()
+    {
+        var h = new Harness();
+        h.DownRepo.Workflows = Workflow(MainOnly);
+        h.Answer(TwoRepoAnswers.Three);
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        // The reason names the second repository, not the first.
+        Assert.Contains($"in {Down}: no CI workflow runs for a pull request into {ChangesetBranch}", outcome.Error);
+        Assert.Contains($"add `factory/**` to the pull_request branches filter of {CiFile}", outcome.Error);
+        Assert.DoesNotContain($"in {Up}:", outcome.Error);
+        // Nothing was spent or created, in either repository: no planner session, no story, no branch.
+        Assert.Empty(h.Planner!.Calls);
+        Assert.Empty(StoriesCreated(h));
+        Assert.All([h.UpRepo, h.DownRepo], r =>
+        {
+            Assert.Empty(r.BranchesCreated);
+            Assert.DoesNotContain(ChangesetBranch, r.Branches.Keys);
+            Assert.Equal(1, r.WorkflowReads);
+        });
+        var rows = await h.Rows();
+        Assert.DoesNotContain(rows, r => r.Step is RunPipeline.Steps.Plan or RunPipeline.Steps.PlanCreating or RunPipeline.Steps.PlanStories or RunPipeline.Steps.Changeset);
+        var row = Assert.Single(rows, r => r.Step == RunPipeline.Steps.CiTriggers);
+        Assert.StartsWith($"{CiTriggerCheck.BlockedPrefix}{Down}: no CI workflow runs", row.Detail);
+        Assert.Equal(StepOutcome.GateRejected, row.Outcome);
+
+        // Fixed on its default branch, the next run plans in both.
+        h.DownRepo.Workflows = Workflow("name: ci\non:\n  pull_request:\n    branches: [main, 'factory/**']\njobs: {}\n");
+        var planned = await h.Run();
+        Assert.Equal((WorkState.Planned, (string?)null), (planned.State, planned.Error));
+        Assert.Single(h.Planner.Calls);
+        Assert.Equal(3, StoriesCreated(h).Count);
+        Assert.All([h.UpRepo, h.DownRepo], r => Assert.Contains(ChangesetBranch, r.Branches.Keys));
+    }
+
+    [Fact]
+    public async Task A_plan_whose_repositories_all_run_ci_plans_normally_and_reads_each_repositorys_workflows_once()
+    {
+        var h = new Harness();
+
+        await h.Plan();
+
+        Assert.Empty(await h.Steps(RunPipeline.Steps.CiTriggers));
+        Assert.Equal((1, 1), (h.UpRepo.WorkflowReads, h.DownRepo.WorkflowReads));
+        Assert.All([Up, Down], repo => Assert.Contains($"[plan] CI triggers of {repo}: {CiFile} runs for a pull request into {ChangesetBranch}", h.Logged));
+        // Later runs (each repository's changeset branch is on origin) read no workflow again.
+        Assert.Equal(WorkState.Planned, await h.Step());
+        Assert.Equal((1, 1), (h.UpRepo.WorkflowReads, h.DownRepo.WorkflowReads));
+    }
+
+    [Fact]
+    public async Task A_second_repository_whose_ci_cannot_be_told_is_a_warning_naming_it_and_the_plan_goes_on()
+    {
+        var h = new Harness();
+        h.DownRepo.Workflows = Workflow(DispatchOnly);
+
+        var ids = await h.Plan();
+
+        Assert.Equal(3, ids.Length);
+        var row = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.CiTriggers);
+        Assert.StartsWith($"{CiTriggerCheck.WarningPrefix}{Down}: ", row.Detail);
+        Assert.Equal(StepOutcome.Failed, row.Outcome);
+        Assert.Contains($"[plan] warning: CI triggers of {Down}: ", h.Logged);
+        Assert.Single(h.Planner!.Calls);
+        Assert.All([h.UpRepo, h.DownRepo], r => Assert.Contains(ChangesetBranch, r.Branches.Keys));
+    }
+
+    [Fact]
+    public async Task Each_repositorys_ci_trigger_row_is_written_when_that_repositorys_answer_changes_not_when_anothers_comes_between()
+    {
+        var h = new Harness();
+        h.UpRepo.Workflows = Workflow(DispatchOnly);
+        h.DownRepo.Workflows = Workflow(MainOnly);
+        h.Answer(TwoRepoAnswers.Three);
+
+        Assert.Equal(WorkState.Escalated, (await h.Run()).State);
+        Assert.Equal(WorkState.Escalated, (await h.Run()).State);
+
+        // The first repository's warning, then the second's block: once each, though the plan item ran twice.
+        var rows = await h.Steps(RunPipeline.Steps.CiTriggers);
+        Assert.Equal(2, rows.Count);
+        Assert.StartsWith($"{CiTriggerCheck.WarningPrefix}{Up}: ", rows[0]);
+        Assert.StartsWith($"{CiTriggerCheck.BlockedPrefix}{Down}: ", rows[1]);
+        Assert.Empty(h.Planner!.Calls);
+        Assert.Empty(StoriesCreated(h));
+    }
+
+    // ---- each repository's changeset pull request is a changeset pull request in its own pass (sc-25873, version 4) ----
+
+    /// <summary>
+    /// Version 4, the free tier (the simulated stories change <c>docs/</c>) also requiring <c>risk-threshold</c>: the ordinary
+    /// limits one line / one file, a changeset pull request's ten of each.
+    /// </summary>
+    private static string SizedPolicy()
+    {
+        const string free = "    paths: [docs/, tests/]\n    checks: [ci-green, review-pass]";
+        var policy = TestPolicies.V4(maxChangesetLines: 10, maxChangesetFiles: 10, maxLines: 1, maxFiles: 1);
+        Assert.Contains(free, policy);
+        return policy.Replace(free, "    paths: [docs/, tests/]\n    checks: [ci-green, review-pass, risk-threshold]", StringComparison.Ordinal);
+    }
+
+    private static Harness Sized()
+    {
+        var h = new Harness();
+        h.UpRepo.PolicyText = h.DownRepo.PolicyText = SizedPolicy();
+        // The simulated commits are names, not SHAs: CodeGraph names the one it is asked about, so risk-threshold judges the size.
+        h.CodeGraph.Impact = (path, sha) => C7Answers.ParsedImpactFile("Sandbox", path, sha, false, "none") with { CommitSha = sha };
+        return h;
+    }
+
+    private static string FourStories => TwoRepoAnswers.Answer([Up, Down], TwoRepoAnswers.Note,
+        TwoRepoAnswers.In(Up, PlanAnswers.Story("a", "Add the mesh format")),
+        TwoRepoAnswers.In(Up, PlanAnswers.Story("a2", "Document the mesh format")),
+        TwoRepoAnswers.In(Down, PlanAnswers.Story("b", "Read the mesh format")),
+        TwoRepoAnswers.In(Down, PlanAnswers.Story("b2", "Show the mesh format")));
+
+    [Fact]
+    public async Task Each_repositorys_changeset_pull_request_is_sized_by_the_changeset_limits_in_its_own_pass()
+    {
+        var h = Sized();
+        var ids = await h.Plan(FourStories);
+        Assert.Equal(WorkState.Planned, await h.Step()); // releases all four
+        foreach (var id in ids)
+        {
+            await h.Merge(id);
+            // A story: one line in one file, within the ordinary limits, and never a changeset pull request.
+            var story = (await h.Steps(RunPipeline.Steps.GateDecision, id))[^1]!;
+            Assert.StartsWith("Merge ", story);
+            Assert.DoesNotContain("changeset", story);
+            Assert.Contains("risk within threshold (1 changed lines, 1 files, ", story);
+        }
+
+        // The plan item takes each repository's changeset through the gate in turn.
+        var state = WorkState.Planned;
+        for (var i = 0; i < 8 && state != WorkState.Watch; i++)
+        {
+            state = await h.Step();
+        }
+
+        Assert.Equal(WorkState.Watch, state);
+        // Two lines in two files each: over max_changed_lines/files (1), within max_changeset_lines/files (10) — in both repositories.
+        var gates = (await h.Steps(RunPipeline.Steps.GateDecision)).Where(g => g!.StartsWith("Merge ", StringComparison.Ordinal)).ToList();
+        Assert.Equal(2, gates.Count);
+        Assert.All(gates, gate =>
+        {
+            Assert.Contains(GateDecision.ChangesetMark, gate);
+            Assert.Contains("2 changed lines within max_changeset_lines 10, 2 files within max_changeset_files 10", gate);
+        });
+        Assert.All([h.UpRepo, h.DownRepo], r => Assert.Equal((ChangesetBranch, Main), (r.Merges[^1].Head, r.Merges[^1].Base)));
+        Assert.Equal([Up, Down], (await h.Steps(RunPipeline.Steps.ChangesetDelivered)).Select(d => ChangesetDelivery.FromDetail(d)!.Repo));
+    }
+
+    [Fact]
+    public async Task A_story_of_a_two_repository_plan_over_the_ordinary_limit_is_blocked_whatever_the_changeset_limits_allow()
+    {
+        var h = Sized();
+        // The downstream stories change two lines each: within max_changeset_lines, over max_changed_lines.
+        h.DownRepo.Work = branch => [$"docs/{branch.Replace('/', '-')}.md|one", $"docs/{branch.Replace('/', '-')}.md|two"];
+        var ids = await h.Plan(FourStories);
+        Assert.Equal(WorkState.Planned, await h.Step());
+
+        var blocked = await h.Run(ids[2]);
+
+        Assert.Equal(WorkState.Escalated, blocked.State);
+        Assert.Contains("risk threshold: 2 changed lines exceed max_changed_lines 1", blocked.Error);
+        Assert.DoesNotContain("changeset pull request", blocked.Error);
+        Assert.DoesNotContain("max_changeset_lines", blocked.Error);
+        Assert.Empty(h.DownRepo.Merges);
+        Assert.Equal(StepOutcome.GateRejected, (await h.Rows(ids[2])).Last(r => r.Step == RunPipeline.Steps.GateDecision).Outcome);
+    }
 
     [Fact]
     public async Task A_changeset_branch_is_created_in_each_repository_and_each_story_is_pinned_to_its_own_before_the_stories_are_recorded()

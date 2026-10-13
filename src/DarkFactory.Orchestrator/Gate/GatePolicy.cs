@@ -13,9 +13,22 @@ public sealed record TierRule(Tier Tier, IReadOnlyList<PathPattern> Paths, IRead
 /// head (null: the policy sets none, version 2); the code floor (<see cref="GatePolicy.BlastRadiusFloor"/>) applies whatever it says.
 /// <see cref="MaxHotspot"/>: version 3's <c>max_hotspot</c>, the highest hotspot score (CodeGraph's <c>riskScore</c>) a touched file
 /// may have on the default branch (null: <c>off</c>, or version 2; there is no code floor for hotspots).
+/// <see cref="MaxChangesetLines"/> and <see cref="MaxChangesetFiles"/>: version 4's <c>max_changeset_lines</c> and
+/// <c>max_changeset_files</c>, the size limits of a plan's changeset pull request (sc-25873), which <see cref="LinesLimit"/> and
+/// <see cref="FilesLimit"/> apply in place of <see cref="MaxChangedLines"/> and <see cref="MaxChangedFiles"/> (null: versions 2 and
+/// 3, where a changeset pull request is held to the ordinary limits like any other).
 /// </summary>
 public sealed record RiskThreshold(int MaxChangedLines, int MaxChangedFiles, int MaxFixRounds, BlastRadius? MaxBlastRadius = null,
-    double? MaxHotspot = null);
+    double? MaxHotspot = null, int? MaxChangesetLines = null, int? MaxChangesetFiles = null)
+{
+    /// <summary>The changed-lines limit of a pull request and the policy key that sets it: a changeset's own limit when the policy has one.</summary>
+    public (int Max, string Key) LinesLimit(bool changeset) =>
+        changeset && MaxChangesetLines is { } max ? (max, "max_changeset_lines") : (MaxChangedLines, "max_changed_lines");
+
+    /// <summary>The changed-files limit of a pull request and the policy key that sets it: a changeset's own limit when the policy has one.</summary>
+    public (int Max, string Key) FilesLimit(bool changeset) =>
+        changeset && MaxChangesetFiles is { } max ? (max, "max_changeset_files") : (MaxChangedFiles, "max_changed_files");
+}
 
 /// <summary>
 /// A target repository's merge policy, <c>factory/gate.yaml</c> on the PR's base branch (never the PR's own head, which
@@ -52,6 +65,21 @@ public sealed record RiskThreshold(int MaxChangedLines, int MaxChangedFiles, int
 /// tighten it; <c>critical</c> — which would allow a critical file — is looser than the floor and invalid. <c>max_hotspot</c> is
 /// required too (every key is), and <c>off</c> is its explicit opt-out: hotspots have no code floor, they are recorded and
 /// reported, and fail only a repository that sets a limit. Version 2 parses as before and runs at the floor with no hotspot limit.
+/// Version 4 (sc-25873) is version 3 plus two required risk keys, the size limits of a plan's changeset pull request:
+/// <code>
+/// risk:
+///   ...
+///   max_changeset_lines: 4000     # a whole number >= 1: the most changed lines a changeset pull request may have
+///   max_changeset_files: 150      # a whole number >= 1: the most changed files a changeset pull request may have
+/// </code>
+/// A changeset pull request (a plan item's, from its changeset branch into the default branch: the sum of the plan's stories) is
+/// held to these two in place of <c>max_changed_lines</c> and <c>max_changed_files</c>, which are sized for one story; every other
+/// pull request — a plan's story into its changeset branch included — keeps the ordinary two. Which pull request is a changeset's is
+/// a ledger fact the pipeline passes in (<see cref="ChangeFacts.Changeset"/>), never read from a branch name. The four limits are
+/// independent whole numbers of at least 1: no rule ties a changeset limit to the per-story one (a smaller one only tightens the
+/// gate, which a policy may always do). There is no code floor on size, so none is loosened: the check is not skipped for a
+/// changeset, and under versions 2 and 3 — which have no changeset keys, each version's key set being strict — a changeset pull
+/// request is held to the ordinary limits as before.
 /// A path is in the first of sealed, protected, free whose patterns match it (<see cref="PathPattern"/>: anchored at the
 /// root; sealed and protected patterns match case-insensitively, free ones case-sensitively, so a path's case can only
 /// move it to a stricter tier), else normal. Every tier and every risk field is required.
@@ -79,10 +107,18 @@ public sealed class GatePolicy
     public const string Path = "factory/gate.yaml";
 
     /// <summary>The newest policy version; <see cref="Versions"/> are all the gate accepts.</summary>
-    public const int Version = 3;
+    public const int Version = 4;
 
-    /// <summary>The versions the gate accepts: 2 (runs at the code floor of every CodeGraph input) and 3.</summary>
-    public static readonly IReadOnlyList<int> Versions = [2, 3];
+    /// <summary>
+    /// The versions the gate accepts: 2 (runs at the code floor of every CodeGraph input), 3 (CodeGraph's limits) and 4 (a
+    /// changeset pull request's own size limits).
+    /// </summary>
+    public static readonly IReadOnlyList<int> Versions = [2, 3, 4];
+
+    /// <summary>The risk keys of every version; each later version requires its own on top, and no version accepts a later one's.</summary>
+    private static readonly string[] RiskKeys = ["max_changed_lines", "max_changed_files", "max_fix_rounds"];
+    private static readonly string[] CodeGraphRiskKeys = ["max_blast_radius", "max_hotspot"];
+    private static readonly string[] ChangesetRiskKeys = ["max_changeset_lines", "max_changeset_files"];
 
     /// <summary>
     /// The code floor of <c>risk-threshold</c>'s CodeGraph blast radius (sc-25709, E7): the worst blast radius a touched file may
@@ -205,7 +241,7 @@ public sealed class GatePolicy
         }
         if (Versions.FirstOrDefault(v => version == v.ToString(CultureInfo.InvariantCulture)) is not (> 0 and var number))
         {
-            throw new GatePolicyException($"{Path}: version must be {string.Join(" or ", Versions)}.");
+            throw new GatePolicyException($"{Path}: version must be {string.Join(", ", Versions.SkipLast(1))} or {Versions[^1]}.");
         }
         Expect(root, ["version", "tiers", "risk"], "the top level");
 
@@ -218,12 +254,12 @@ public sealed class GatePolicy
         }
 
         var riskNode = Mapping(root, "risk", "the top level");
-        Expect(riskNode, number == 2 ? ["max_changed_lines", "max_changed_files", "max_fix_rounds"]
-            : ["max_changed_lines", "max_changed_files", "max_fix_rounds", "max_blast_radius", "max_hotspot"], "risk");
+        Expect(riskNode, [.. RiskKeys, .. number >= 3 ? CodeGraphRiskKeys : [], .. number >= 4 ? ChangesetRiskKeys : []], "risk");
         // max_fix_rounds can only lower the factory's hard cap (Lifecycle.MaxFixRounds), never raise it: 1 to that cap.
         var risk = new RiskThreshold(Int(riskNode, "max_changed_lines", 1), Int(riskNode, "max_changed_files", 1),
             Int(riskNode, "max_fix_rounds", 1, Ledger.Lifecycle.MaxFixRounds),
-            number == 2 ? null : MaxBlastRadius(riskNode), number == 2 ? null : MaxHotspot(riskNode));
+            number == 2 ? null : MaxBlastRadius(riskNode), number == 2 ? null : MaxHotspot(riskNode),
+            number >= 4 ? Int(riskNode, "max_changeset_lines", 1) : null, number >= 4 ? Int(riskNode, "max_changeset_files", 1) : null);
 
         var policy = new GatePolicy(tiers, risk);
         var uncovered = MustBeSealedFiles.Where(f => policy.TierOf(f).Tier != Tier.Sealed)

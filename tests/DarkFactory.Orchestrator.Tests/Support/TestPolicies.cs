@@ -33,6 +33,17 @@ internal static class TestPolicies
         + $"\n  max_blast_radius: {maxBlastRadius}\n  max_hotspot: {maxHotspot}";
 
     /// <summary>
+    /// The standard policy as version 4 (sc-25873): version 3's keys (blast radius at the floor, no hotspot limit) and a changeset
+    /// pull request's own size limits.
+    /// </summary>
+    public static string V4(int maxChangesetLines, int maxChangesetFiles, int maxLines = 400, int maxFiles = 20) =>
+        Standard(maxLines, maxFiles).Replace("version: 2", "version: 4", StringComparison.Ordinal)
+        + $"\n  max_blast_radius: high\n  max_hotspot: off\n  max_changeset_lines: {maxChangesetLines}\n  max_changeset_files: {maxChangesetFiles}";
+
+    /// <summary>A repository's workflow files whose CI runs for every pull request and push (sc-25873): what the fakes answer by default.</summary>
+    public static IReadOnlyList<WorkflowFile> Workflows { get; } = [new(".github/workflows/ci.yml", "name: ci\non: [push, pull_request]\njobs: {}\n")];
+
+    /// <summary>
     /// <paramref name="pull"/> with GitHub's <c>changed_files</c> set to what <paramref name="change"/>'s diff holds, unless the
     /// test set it (e.g. to a different count, to show an incomplete diff blocks).
     /// </summary>

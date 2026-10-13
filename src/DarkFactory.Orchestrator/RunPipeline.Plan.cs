@@ -40,6 +40,14 @@ public sealed partial class RunPipeline
                 $"{recorded.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length} stories: {recorded}", ct);
             return;
         }
+        // Before the planner is spent, or a recorded plan's stories are created (sc-25873): a repository whose CI cannot report on
+        // the plan's story pull requests, or on its changeset pull request, stops the plan here — every repository the plan item
+        // names (the planner's set), the item's own first, so no session, story or branch in any of them is spent on a plan one of
+        // them refuses.
+        foreach (var repo in PlanRepositories(run))
+        {
+            await EnsureCiTriggersAsync(run, repo, ct);
+        }
         Plan plan;
         string? session;
         var reused = ReusesRecordedPlan(history);

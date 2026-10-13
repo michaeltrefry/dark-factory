@@ -18,7 +18,8 @@ Claude Code headless workers through the Weave router.
   review and merge gate (`Gate/`: `ReviewModels` (which panel calls count), `ReviewPanel` (roles, prompts, findings),
   `Reviewer.cs` (`IReviewer`/`RouterReviewer`) reading the router's stream with `MessageStream`, `GatePolicy` (+ `RiskyPaths`)
   and the path tiers `PathTiers`, `MergeGate`, `FixLoop`, `CiHeal`, `MergeQueue`, the test-only `GateCheckSeam`, the new-tests
-  check `NewTests.cs` (`NewTestsCheck`)/`XunitNewTests`/`CargoNewTests` (Rust, over the lexer-level `RustSource`)/`SandboxTestRunner`;
+  check `NewTests.cs` (`NewTestsCheck`)/`XunitNewTests`/`CargoNewTests` (Rust, over the lexer-level `RustSource`)/`SandboxTestRunner`,
+  the plan-time check of a repository's CI workflow triggers `CiTriggers.cs` (sc-25873; pipeline side `RunPipeline.CiTriggers.cs`);
   reviewer prompts in `factory/prompts/`; GitHub side
   `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`, the merge gate and queue `RunPipeline.MergeQueue.cs`),
   the MCP upstreams and the loopback MCP proxy (`Mcp/`: `McpHttpClient`, `McpUpstream`/`McpUpstreams`/`McpServers`
@@ -793,8 +794,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   the full panel on the whole diff (spec for the reviewers: the plan item's own text, then the plan's story list in a
   `<plan-stories>` fence as a planning model's data, `Changeset.ReviewSpec`), CI and CI self-heal, the merge gate at the default
   branch's policy (every tier check, `new-tests-fail-on-base` included: the changeset's new tests are the union of its stories',
-  each must fail on the default-branch base and pass on the changeset head, xUnit and cargo alike; the `risk` limits apply to the
-  whole changeset, so a policy's `max_changed_lines`/`max_changed_files` must be sized for a plan or the gate escalates it),
+  each must fail on the default-branch base and pass on the changeset head, xUnit and cargo alike; the `risk` size limits apply
+  to the whole changeset — under a version 4 policy its own `max_changeset_lines`/`max_changeset_files`, under versions 2 and 3 the
+  ordinary `max_changed_lines`/`max_changed_files`, which must then be sized for a plan or the gate escalates it; "Changeset size"
+  below),
   CodeGraph risk (unchanged for both kinds of PR: blast radius is read at the PR head through its overlay, the hotspot from the
   default-branch index by path — a file that exists only on the changeset branch has no metrics and counts 0, like any new
   file), the merge queue's turn against the default branch (a changeset behind it is updated from it, fast-forward push), fix
@@ -815,12 +818,67 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   before); main-red skips merges into a changeset branch before picking each repository's latest merge, so a red changeset branch
   freezes nothing (the next story's CI triage finds its base red and escalates that story; the changeset PR needs green CI on its
   own head) and a later story merge never hides the default branch's state; cost-rising reads a plan item's rounds since Planned.
-  Known consequences, accepted (review of sc-25872; no behaviour softens them): (a) the default branch's
-  `risk.max_changed_lines`/`max_changed_files` apply to the whole changeset PR and fail closed — a policy sized for one story
-  escalates most changesets, so size it for a plan; (b) a target repository whose CI workflow filters `pull_request` `branches`
-  without `factory/**` reports no checks for story PRs (their base is `factory/changeset-*`), which wait out
-  `Gate:CiTimeoutMinutes` and escalate; (c) the hot-file freeze counts a plan's stories changing one file on the changeset
-  branch: `Freeze:HotFileMerges` stories of one plan touching the same file within the window freeze the factory.
+  Changeset size (sc-25873): `risk.max_changed_lines`/`max_changed_files` are sized for one story, and a changeset PR is the sum
+  of a plan's stories. The limit is never skipped or loosened in code for a changeset (what is on a changeset branch — adopted
+  branches, fix-round and base-update commits — did not all pass a story's gate); the policy sets a separate one: `version: 4`
+  requires `risk.max_changeset_lines` and `max_changeset_files` (whole numbers ≥ 1, independent of the per-story two — no rule ties
+  them, since a smaller changeset limit only tightens the gate, which a policy may always do). `risk-threshold` holds a changeset
+  PR to those two (`RiskThreshold.LinesLimit`/`FilesLimit`) and every other PR — a plan's story into its changeset branch included
+  — to `max_changed_*`; under versions 2 and 3 (no changeset keys: unknown there, and invalid) a changeset PR is held to
+  `max_changed_*` as before, and its reason says so. Fix rounds, CodeGraph's blast radius floor and hotspot limit, and every other
+  check are the same for both kinds. Which PR is a changeset's is an input fact from the ledger, `ChangeFacts.Changeset`
+  (`RunPipeline.IsChangesetPull`: the item has a pushed changeset in the repository by its own `changeset`/`changeset-pushed` rows
+  — `Run.Changeset` — and the PR targets the base that row recorded), never the branch's name, which an adopted or worker-chosen
+  name could imitate; the `gate` checkpoint's Detail records it (`Merge <sha> (changeset pull request): …`,
+  `GateDecision.ChangesetMark`), a failure names the limit that applied (`… exceed max_changeset_lines N (a changeset pull
+  request)`) and a pass both (`N changed lines within max_changeset_lines M, …`). This repository has no `factory/gate.yaml` of its
+  own; a target repository's policy moves to version 4 by an owner's PR (the path is sealed).
+  CI that cannot run (sc-25873, `Gate/CiTriggers.cs`, `RunPipeline.EnsureCiTriggersAsync`): a target repository whose workflows
+  filter `pull_request` `branches` without `factory/**` reports no check for story PRs (their base is `factory/changeset-*`), which
+  would each wait out `Gate:CiTimeoutMinutes` and escalate — fail closed, and a whole plan wasted. So Plan, before the planner
+  session (and before a recorded plan's stories are created; not once the repository's changeset branch is on origin), reads the
+  default branch's name and workflow files owner-side with the gate App's read-only token (`IGateGitHub.GetWorkflowsAsync` →
+  `RepoWorkflows`: `GET /repos/<owner>/<name>` for `default_branch` — never guessed; an answer naming none throws — then the
+  contents API with no ref, every `.yml`/`.yaml` directly in `.github/workflows`, at most `GitHubGate.MaxWorkflows` 50 files of at
+  most `MaxWorkflowBytes` 512 KiB) and parses each `on:` with the policy's YAML parser. `EnsureCiTriggersAsync` takes the
+  repository as a parameter and `PlanAsync` calls it for every repository the plan item names (`PlanRepositories`, the planner's
+  set — every `Repo:` line, the item's own first; one call for a plan of one repository), in that order, all before the planner
+  session: the first repository that blocks stops the plan (its reason starts with that repository), so no planner session, story
+  or changeset branch is spent in any repository; a warning is a row per repository (compared with that repository's last
+  `ci-triggers` row only, `CiTriggerCheck.IsAbout`); the "changeset branch on origin" skip is per repository too. A repository the
+  plan item names is checked even if the plan then puts no story in it (not known before the planner runs). `CiTriggers.Check(files, base, head)` is asked about both kinds of PR the plan opens there: a story's
+  (base the changeset branch, head the story's `factory/<id>` branch) and the changeset's (base the default branch, head the
+  changeset branch — a repository whose only trigger is `pull_request: branches: ['factory/**']` runs for every story and never
+  for the PR that delivers the plan). A workflow reports on a PR when a `pull_request`/`pull_request_target` trigger's branch
+  filter matches the base (no filter matches every base) or a `push` trigger's matches the head (a push workflow's checks are on
+  the commit the gate reads CI for; a push with only `tags` filters does not run for a branch); `types`/`paths` filters are not
+  read (such a trigger counts as running). Branch filters follow GitHub's rules (`CiTriggers.Matches`: `*` stops at `/`, `**` does
+  not, `?`/`+` repeat the character before, `[…]` sets, `\` escapes, patterns in order with `!` excluding again, `branches-ignore`
+  the opposite and without `!`; case-sensitive; translated to a non-backtracking regex). Outcomes, per PR kind: a workflow runs →
+  a log line only. Certain that none can — `Never`: every workflow file read and parsed, each made only of pull request/push
+  triggers that do not match and events in `CiTriggers.NeverReports` (e.g. `schedule`, `workflow_dispatch`, `workflow_call`), AND
+  at least one of them a pull request or push trigger whose `branches`/`branches-ignore` filter leaves the branch out (the evidence
+  that the repository's CI is GitHub Actions and was told not to run there). It cannot be told — `Unknown`: no workflow file at
+  all, or none with a pull request trigger or a push trigger for branches (only `workflow_dispatch`, a schedule, a release,
+  `push` for tags: CI may be another service's, and "add a pull_request trigger" would be the wrong fix), a file unreadable, over
+  the bounds or not valid YAML, `branches` beside `branches-ignore`, a pattern that cannot be translated, an event outside the
+  known lists such as `workflow_run`, GitHub not answering the repository or the listing. A `Never` for either kind (the stories'
+  first) → BLOCK: a `ci-triggers` checkpoint (`blocked: <repo>: …`, outcome gate_rejected) and the plan item escalates with the
+  repository, the fix, then the workflow files read with why — no planner session, story or changeset branch; the owner fixes the
+  workflow on the default branch and re-runs the plan item. Blocking is chosen over a warning because every story would otherwise
+  be guaranteed to time out, or — the changeset PR — every story be built and the plan then never delivered. The reason puts the
+  fix before the file list and bounds both (the escalation comment clips a reason at `LedgerReport.MaxReasonLength` 4,000): at
+  most `CiTriggers.MaxFixes` (3) workflows' fixes, any one being enough, then "(or likewise in N more)", and at most
+  `CiTriggers.MaxListed` (10) files, those that are why first, then "… N more". The fix names the pattern the base needs:
+  ``add `factory/**` to the pull_request branches filter of <file>`` for story PRs, ``add `<default branch>` …`` for the changeset
+  PR (a workflow's text is never repeated; an unusual file or default-branch name is not shown). Else an `Unknown` for either →
+  a `ci-triggers` checkpoint (`warning: <repo>: …`, outcome failed, written when it changes) and a `[plan] warning:` log line, and
+  planning goes on. Nothing is weakened either way: the gate still needs green CI on every head. No start-up warning: `factory run`
+  and `factory work` read nothing from GitHub at start-up, and one per configured repository would add a GitHub dependency that
+  could fail start-up; the plan-time check is the only one. A pipeline with no gate stage (tests only) does not check.
+  Known consequence, accepted (review of sc-25872; no behaviour softens it): the hot-file freeze counts a plan's stories changing
+  one file on the changeset branch: `Freeze:HotFileMerges` stories of one plan touching the same file within the window freeze
+  the factory.
   Cleanup: the factory never deletes a changeset branch (after the merge it is fully contained in the default branch; GitHub
   deletes it when the repository's "automatically delete head branches" is on).
 - Multi-repository plans (Phase 4a, sc-25873; owner decisions: a multi-repository change is one work item per repository — every
@@ -889,9 +947,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   request's body lists its repository's stories and every repository's changeset; the closeout lists each repository's changeset
   pull request and merge commit (`LedgerReport.ChangesetLines`); a changeset review lists that repository's stories, the order
   and the note inside the `plan-stories` fence (`Changeset.ReviewSpec`). Tests: `MultiRepoPlanTests`, `MultiRepoPipelineTests`
-  (two `BranchRepo`s behind one router). Not wired yet (PR #69, not on the base when this landed): `EnsureCiTriggersAsync` must
-  run for every repository of the plan item's set before the planner session; `IsChangesetPull` already holds per pass
-  (`Run.Changeset` is the pass repository's changeset, a story's is null).
+  (two `BranchRepo`s behind one router). With PR #69's two checks: `EnsureCiTriggersAsync` runs for every repository of the plan
+  item's set before the planner session (above), and `IsChangesetPull` holds per pass (`Run.Changeset` is the pass repository's
+  changeset, whose recorded base is that repository's default branch; a story's is null), so each repository's changeset PR is
+  sized by its own version 4 `max_changeset_*` and its stories by the ordinary limits (`MultiRepoPipelineTests`).
   Rulesets (`RepoProtection`, unchanged): the `~ALL` ruleset excludes `refs/heads/factory/**`, so the factory App creates and
   pushes `factory/changeset-*` and the gate App merges a PR into it with its ordinary write permission (no rule applies there, so
   no bypass is needed); the changeset PR into the default branch is a PR like any other, merged through the gate App's existing
@@ -1238,12 +1297,14 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   of a non-Actions App with no check runs is ignored (GitHub creates one per App with checks access; the Claude App's stays
   queued forever). A workflow GitHub has not registered at all yet is still invisible. MergeGate (`MergeGate.Evaluate`, E1–E3) is deterministic code over
   facts read fresh each time: `factory/gate.yaml` at the PR's **base** commit (`pull.BaseSha`, the commit the diff is read
-  against; `GatePolicy`, `version: 2` or `3`, sc-25381: path tiers `sealed`/`protected`/`free` with `paths` and `checks`, `normal`
+  against; `GatePolicy`, `version: 2`, `3` or `4`, sc-25381: path tiers `sealed`/`protected`/`free` with `paths` and `checks`, `normal`
   with `checks` only, and `risk: {max_changed_lines, max_changed_files, max_fix_rounds}` — version 3 (sc-25709) adds two required
   risk keys, `max_blast_radius` (`low`|`medium`|`high`: a maximum, a file over it fails; `critical` would allow a critical file, is
   looser than the code floor and invalid) and `max_hotspot` (`off`, or a number ≥ 0: the opt-in limit on the hotspot score; `off`
   is the explicit opt-out, chosen over an optional key so every key stays required); each version's key set is strict, so a CodeGraph
-  key in a version 2 policy is unknown; version 2 still parses and runs at the floor with no hotspot limit; every key required;
+  key in a version 2 policy is unknown; version 2 still parses and runs at the floor with no hotspot limit; version 4 (sc-25873)
+  adds two more required risk keys, `max_changeset_lines` and `max_changeset_files` (whole numbers ≥ 1: the size limits of a plan's
+  changeset pull request, unknown and so invalid in versions 2 and 3; "Changeset size" above); every key required;
   version 1 is rejected; missing/invalid/unreadable → no merge, escalate; no bypass key exists). The policy can tighten the gate but not
   loosen it below floors in code (E2; described once on `GatePolicy`): checks — every tier lists `ci-green` and
   `review-pass`, sealed/protected also `security-review`, protected/normal also `risk-threshold` and
@@ -1264,8 +1325,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   needs the union of its tiers' checks: `ci-green`, `review-pass` (the head's verdict passes, holds every required role, and
   every review and second opinion was served on the router's `high` model class — its recorded `class`, a missing one
   failing closed — `ReviewModels.Problems`; which model served, and the implementer's models, are not consulted), `security-review` (the verdict has the
-  security review), `risk-threshold` (changed lines, files — renames count both paths — and fix rounds within `risk`, and
-  CodeGraph's inputs, below), `new-tests-fail-on-base` (sc-25382, below). Risk score (sc-25709, `Gate/CodeGraphRisk.cs`; CodeGraph
+  security review), `risk-threshold` (changed lines, files — renames count both paths; a changeset PR under a version 4 policy
+  against `max_changeset_*` instead of `max_changed_*` — and fix rounds within `risk`, and CodeGraph's inputs, below), `new-tests-fail-on-base` (sc-25382, below). Risk score (sc-25709, `Gate/CodeGraphRisk.cs`; CodeGraph
   C7, sc-25735, not deployed yet — the fakes follow its contract and C4's `CommitAnswer` shape, PR #71): `EvaluateGateAsync` first
   evaluates the gate without CodeGraph (`MergeGate.Evaluate(…, riskUnread: true)`: a change that needs `risk-threshold` and that
   nothing else blocks is `Pending`, never Merge), so a change another rule blocks (sealed path, failed verdict, new tests, size)
