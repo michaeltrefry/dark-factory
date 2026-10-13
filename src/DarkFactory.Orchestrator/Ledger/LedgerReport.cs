@@ -98,7 +98,8 @@ public static class LedgerReport
     /// <c>linked</c> checkpoint). A story's title is a planner's text: inert, in a code span. With a changeset (sc-25872) the
     /// comment is posted only once the changeset's own pull request has merged: <paramref name="changeset"/> is the plan item's own
     /// rows and session costs, and the comment says where the changeset merged and ends with those facts. <paramref name="note"/>
-    /// says why there was no changeset pull request (an empty changeset).
+    /// says why the factory merged no changeset pull request (an empty changeset, or one a person merged:
+    /// <see cref="Plans.Changeset.MergedOutside"/>).
     /// </summary>
     public static string PlanCloseout(string externalId, IReadOnlyList<PlanStoryReport> stories, string? note = null,
         (IReadOnlyList<LedgerEntry> History, IReadOnlyList<decimal?> SessionCosts)? changeset = null)
@@ -117,7 +118,8 @@ public static class LedgerReport
         }
         if (note is not null)
         {
-            text.Append(CultureInfo.InvariantCulture, $"No changeset pull request was opened: {Code(note)}.\n\n");
+            text.Append(Plans.Changeset.IsMergedOutside(note) ? "The factory's merge gate did not merge its changeset: " : "No changeset pull request was opened: ")
+                .Append(Code(note)).Append(".\n\n");
         }
         text.Append("**From the factory ledger** (results the orchestrator executed and recorded, never a worker's own report):\n\n");
         PlanStoryLines(text, stories);

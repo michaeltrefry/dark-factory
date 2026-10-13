@@ -63,6 +63,19 @@ public sealed record Changeset(
         return null;
     }
 
+    /// <summary>
+    /// The <c>changeset-empty</c> checkpoint's Detail when the plan's changeset pull request <paramref name="url"/> was found merged
+    /// by someone else: nothing is left for the factory to merge, and no further pull request is opened.
+    /// </summary>
+    public static string MergedOutside(string url) => $"{MergedOutsidePrefix}{url}{MergedOutsideSuffix}";
+
+    private const string MergedOutsidePrefix = "changeset pull request ";
+    private const string MergedOutsideSuffix = " was merged outside the factory";
+
+    /// <summary>Whether a <c>changeset-empty</c> Detail is <see cref="MergedOutside"/>'s.</summary>
+    public static bool IsMergedOutside(string? detail) =>
+        detail?.StartsWith(MergedOutsidePrefix, StringComparison.Ordinal) == true && detail.EndsWith(MergedOutsideSuffix, StringComparison.Ordinal);
+
     /// <summary>The tag of the block a changeset review's story list is fenced in.</summary>
     public const string StoriesTag = "plan-stories";
 

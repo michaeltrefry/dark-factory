@@ -164,12 +164,19 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
 
     /// <summary>
     /// The changeset branch of the plan item <paramref name="planItemId"/> in <paramref name="repo"/> (sc-25872,
-    /// <see cref="Plans.Changeset.Of"/>), read fresh from its <c>changeset</c> rows; null when it has none there.
+    /// <see cref="Plans.Changeset.Of"/>), read fresh from its <c>changeset</c> rows; null when it has none pushed there.
+    /// <c>Recorded</c>: every changeset the plan item recorded, for any repository, pushed or not — empty only for a plan recorded
+    /// before there were changesets, whose stories target the default branch.
     /// </summary>
-    public async Task<Plans.Changeset?> ChangesetOfAsync(long planItemId, Shortcut.RepoRef repo, CancellationToken ct) =>
-        Plans.Changeset.Of(await db.LedgerEntries.AsNoTracking()
+    public async Task<(Plans.Changeset? Changeset, IReadOnlyList<Plans.Changeset> Recorded)> ChangesetOfAsync(long planItemId, Shortcut.RepoRef repo,
+        CancellationToken ct)
+    {
+        var rows = await db.LedgerEntries.AsNoTracking()
             .Where(e => e.WorkItemId == planItemId && (e.Step == RunPipeline.Steps.Changeset || e.Step == RunPipeline.Steps.ChangesetPushed))
-            .OrderBy(e => e.Id).ToListAsync(ct), repo);
+            .OrderBy(e => e.Id).ToListAsync(ct);
+        return (Plans.Changeset.Of(rows, repo),
+            [.. rows.Where(e => e.Step == RunPipeline.Steps.Changeset).Select(e => Plans.Changeset.FromDetail(e.Detail)).OfType<Plans.Changeset>()]);
+    }
 
     /// <summary>Records that <paramref name="item"/> is a story of the plan item <paramref name="planItemId"/>. Call under the item's run lock.</summary>
     public async Task LinkPlanAsync(WorkItem item, long planItemId, CancellationToken ct)

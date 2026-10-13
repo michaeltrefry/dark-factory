@@ -347,6 +347,15 @@ public sealed partial class RunPipeline
     {
         var repo = RepoRef.Parse(changeset.Repo);
         var empty = since.LastOrDefault(e => e.Step == Steps.ChangesetEmpty)?.Detail;
+        // A changeset pull request of this plan that someone merged by hand (an escalated one, say): the changeset is delivered.
+        // GitHub's three-dot compare below would still show a difference after a squash or rebase merge, and every run would open
+        // another pull request for changes the default branch already has.
+        if (empty is null && gate is not null && since.LastOrDefault(e => e.Step == Steps.Linked)?.Detail?.Split(' ')[0] is { } linked
+            && (await Gate.GitHub.GetPullAsync(repo, GitHubGate.ParsePullUrl(linked).Number, ct)).Merged)
+        {
+            empty = Plans.Changeset.MergedOutside(linked);
+            await ledger.CheckpointAsync(item, Steps.ChangesetEmpty, null, empty, ct);
+        }
         // Without a gate stage nothing can read the difference (nor review the pull request: the item parks at Review).
         if (empty is null && gate is not null && string.IsNullOrWhiteSpace(await Gate.GitHub.GetDiffAsync(repo, changeset.Base, changeset.Branch, ct)))
         {
@@ -362,7 +371,8 @@ public sealed partial class RunPipeline
             log.WriteLine($"[{item.State}] {item.ExternalId} is {control} by a control; its changeset pull request is not opened");
             return await OutcomeAsync(item, null, ct);
         }
-        var prUrl = await pullRequests.OpenAsync(repo, changeset.Branch, changeset.Base, $"{item.ExternalId}: {item.Title} (changeset of {stories.Count} stories)",
+        var prUrl = await pullRequests.OpenAsync(repo, changeset.Branch, changeset.Base, 
+            $"{item.ExternalId}: {UntrustedText.Inert(item.Title)} (changeset of {stories.Count} stories)",
             LedgerReport.ChangesetPullRequestBody(item.ExternalId, null, changeset, PlanStoryReports(stories, known), history,
                 await ledger.SessionCostsAsync(item, ct)), ct);
         var links = $"{prUrl} {BranchUrl(repo, changeset.Branch)}";

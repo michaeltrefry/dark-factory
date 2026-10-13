@@ -75,6 +75,22 @@ public sealed partial class RunPipeline
     }
 
     /// <summary>
+    /// Fails closed unless the pull request targets the base the ledger expects (sc-25872): the changeset branch of the item's plan,
+    /// or the repository's default branch — the one a plan item's changeset recorded, else the one GitHub names in the same answer
+    /// (no further call; an answer naming none is not checked). A pull request can be retargeted by a person, or by GitHub when its
+    /// base branch is deleted, and an open one of the head is adopted whatever its base: reviewing or merging it would put the work
+    /// on a branch the gate did not judge it for. The item escalates.
+    /// </summary>
+    private static void EnsureBase(Run run, PullFacts pull)
+    {
+        var expected = run.BaseBranch ?? run.Changeset?.Base ?? pull.DefaultBranch;
+        if (expected is not null && !string.Equals(pull.BaseRef, expected, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException($"{pull.HtmlUrl} targets {pull.BaseRef}, not {expected}.");
+        }
+    }
+
+    /// <summary>
     /// Review: the review panel judges the PR's current head commit — correctness and spec conformance always, security when
     /// the diff touches a path whose tier in the base branch's <c>factory/gate.yaml</c> requires it
     /// or that the code floor <see cref="RiskyPaths"/> matches (<see cref="GatePolicy.SecurityReviewReasons"/>; a missing or invalid
@@ -98,6 +114,7 @@ public sealed partial class RunPipeline
     {
         var (history, pull) = await ReadPullAsync(run, ct);
         EnsureOpen(pull);
+        EnsureBase(run, pull);
         var fix = PendingFixRound(history);
         if (fix is { Stuck: { } stuckReason })
         {

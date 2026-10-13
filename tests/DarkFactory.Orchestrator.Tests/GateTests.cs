@@ -991,11 +991,12 @@ public class GitHubGateTests
     public async Task Reads_the_pull_request_with_a_read_only_token()
     {
         var (gate, api) = Gate(a => a.On($"GET {Repo}/pulls/7", HttpStatusCode.OK,
-            $$$"""{"number":7,"html_url":"https://github.com/michaeltrefry/dark-factory-sandbox/pull/7","state":"open","merged":false,"draft":false,"merge_commit_sha":null,"changed_files":3,"head":{"ref":"factory/sc-1","sha":"{{{Head}}}"},"base":{"ref":"main","sha":"b0"}}"""));
+            $$$"""{"number":7,"html_url":"https://github.com/michaeltrefry/dark-factory-sandbox/pull/7","state":"open","merged":false,"draft":false,"merge_commit_sha":null,"changed_files":3,"head":{"ref":"factory/sc-1","sha":"{{{Head}}}"},"base":{"repo":{"default_branch":"trunk"},"ref":"main","sha":"b0"}}"""));
 
         var pull = await gate.GetPullAsync(Sandbox, 7, CancellationToken.None);
 
-        Assert.Equal(new PullFacts(7, "https://github.com/michaeltrefry/dark-factory-sandbox/pull/7", true, false, false, Head, "main", "b0", null, 3), pull);
+        // The base repository's default branch comes with the same answer (sc-25872): no second call.
+        Assert.Equal(new PullFacts(7, "https://github.com/michaeltrefry/dark-factory-sandbox/pull/7", true, false, false, Head, "main", "b0", null, 3, "trunk"), pull);
         var permissions = TokenPermissions(api).Single();
         Assert.All(permissions.EnumerateObject(), p => Assert.Equal("read", p.Value.GetString()));
         Assert.Equal(["contents", "pull_requests", "checks", "statuses"], permissions.EnumerateObject().Select(p => p.Name));

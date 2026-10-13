@@ -321,8 +321,9 @@ public sealed partial class RunPipeline(
         /// </summary>
         public const string ChangesetPushed = "changeset-pushed";
         /// <summary>
-        /// Planned: every story merged but the changeset branch does not differ from the default branch (Detail: both), so no
-        /// changeset pull request is opened and the plan is closed out saying so.
+        /// Planned: every story merged but the factory has no changeset to merge — the changeset branch does not differ from the
+        /// default branch (Detail: both), or the plan's changeset pull request was merged outside the factory
+        /// (<see cref="Plans.Changeset.MergedOutside"/>) — so no changeset pull request is opened and the plan is closed out saying so.
         /// </summary>
         public const string ChangesetEmpty = "changeset-empty";
     }
@@ -580,12 +581,20 @@ public sealed partial class RunPipeline(
         // Where the item's work goes (sc-25872), from the ledger: a plan's story branches from its plan's changeset branch and
         // merges into it; a plan item whose stories have all merged works on the changeset branch itself, against the default branch.
         var changeset = Plans.Changeset.Of(await ledger.HistoryAsync(item, ct), repo);
+        var ofPlan = item.PlanItemId is { } plan ? await ledger.ChangesetOfAsync(plan, repo, ct) : (null, []);
         var run = new Run(spec, repo, item)
         {
             Branch = changeset?.Branch ?? story.Kind.BranchName(story.Id),
-            BaseBranch = item.PlanItemId is { } ofPlan ? (await ledger.ChangesetOfAsync(ofPlan, repo, ct))?.Branch : null,
+            BaseBranch = ofPlan.Changeset?.Branch,
             Changeset = changeset,
         };
+        // Fail closed: a plan with a changeset has none on origin for this repository (the story's `Repo:` line names another one),
+        // so the story would merge into that repository's default branch, count as merged and be left out of the changeset pull
+        // request. Only a plan recorded before changesets (no `changeset` row at all) has its stories target the default branch.
+        var noChangeset = ofPlan is { Changeset: null, Recorded: [.., var recorded] }
+            ? $"{item.ExternalId} is a story of the plan whose changeset branch is {recorded.Branch} in {recorded.Repo}, and that plan has no changeset "
+                + $"branch in {repo}: the story cannot merge into its plan's changeset. Its `Repo:` line must name the plan's repository."
+            : null;
 
         if (Lifecycle.IsTerminal(item.State))
         {
@@ -612,6 +621,10 @@ public sealed partial class RunPipeline(
 
         try
         {
+            if (noChangeset is not null)
+            {
+                throw new WorkerFailedException(noChangeset);
+            }
             while (Handlers.TryGetValue(item.State, out var handler))
             {
                 // Pause/Stop: no new step starts once a control says so.

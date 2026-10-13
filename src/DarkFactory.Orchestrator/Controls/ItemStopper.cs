@@ -57,7 +57,8 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
         var history = await ledger.HistoryAsync(item, ct);
         var steps = history.Skip(history.FindLastIndex(e => e.Step is null) + 1).ToList();
         var session = history.LastOrDefault(e => e.ClaudeSessionId is not null)?.ClaudeSessionId;
-        var branch = source.Naming.BranchName(storyId);
+        // The item's pull request is its own branch's, or — a plan item's — its changeset branch's (sc-25872).
+        var branch = Plans.Changeset.Of(history, RepoRef.Parse(item.Repo))?.Branch ?? source.Naming.BranchName(storyId);
 
         var drafted = steps.LastOrDefault(e => e.Step == RunPipeline.Steps.PrsDrafted)?.Detail;
         if (drafted is null)

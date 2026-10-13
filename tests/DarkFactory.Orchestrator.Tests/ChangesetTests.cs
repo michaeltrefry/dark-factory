@@ -36,8 +36,9 @@ public class ChangesetPipelineTests
     /// </summary>
     internal sealed class BranchRepo : IGateGitHub, IRepoWorkspace, IPullRequests
     {
-        private sealed record Pull(int Number, string Head, string Base)
+        private sealed record Pull(int Number, string Head)
         {
+            public required string Base { get; set; }
             public string? MergedHead { get; set; }
             public string? MergeCommit { get; set; }
         }
@@ -70,6 +71,21 @@ public class ChangesetPipelineTests
         public List<string> PolicyReads { get; } = [];
         /// <summary>Throws from the next <see cref="OpenAsync"/> after GitHub has the pull request (a run that died there), once.</summary>
         public bool FailAfterOpen { get; set; }
+        /// <summary>Called (outside the lock) with the base and head of every diff read, before it is answered.</summary>
+        public Action<string, string>? OnDiffRead { get; set; }
+        /// <summary>The head branch of every <see cref="ConvertOpenToDraftAsync"/> call.</summary>
+        public List<string> Drafted { get; } = [];
+        /// <summary>The branches that have a worktree now.</summary>
+        public IReadOnlyList<string> Worktrees
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return [.. _local.Keys];
+                }
+            }
+        }
         public Dictionary<string, string> BranchesCreated { get; } = new();
 
         public string Tip(string branch)
@@ -94,6 +110,41 @@ public class ChangesetPipelineTests
             lock (_gate)
             {
                 return Branches[branch] = Commit($"{branch}-x{++_n}", [.. Changes[Branches[branch]], .. changes]);
+            }
+        }
+
+        /// <summary>An open pull request of <paramref name="head"/> that the factory did not open (it adopts it), into <paramref name="baseBranch"/>.</summary>
+        public void OpenedOutside(string head, string baseBranch)
+        {
+            lock (_gate)
+            {
+                _pulls.Add(new Pull(_pulls.Count + 1, head) { Base = baseBranch });
+            }
+        }
+
+        /// <summary>Someone switches the base of <paramref name="head"/>'s open pull request.</summary>
+        public void Retarget(string head, string baseBranch)
+        {
+            lock (_gate)
+            {
+                _pulls.Single(p => p.Head == head && p.MergeCommit is null).Base = baseBranch;
+            }
+        }
+
+        /// <summary>
+        /// Someone squash-merges <paramref name="head"/>'s open pull request by hand: its base gets one new commit with the same
+        /// files, which is not an ancestor of the head — so the head still differs from the base. Returns the pull request's URL.
+        /// </summary>
+        public string SquashOutside(string head)
+        {
+            lock (_gate)
+            {
+                var pull = _pulls.Single(p => p.Head == head && p.MergeCommit is null);
+                var squashed = Changes[Branches[head]].Select(c => $"{c.Split('|')[0]}|squashed");
+                var commit = Commit($"squash-{pull.Number}", [.. Changes[Branches[pull.Base]], .. squashed]);
+                Branches[pull.Base] = commit;
+                (pull.MergedHead, pull.MergeCommit) = (Branches[head], commit);
+                return Url(pull.Number);
             }
         }
 
@@ -127,7 +178,7 @@ public class ChangesetPipelineTests
             {
                 if (_pulls.FirstOrDefault(p => p.Head == head && p.MergeCommit is null) is not { } pull)
                 {
-                    pull = new Pull(_pulls.Count + 1, head, baseBranch);
+                    pull = new Pull(_pulls.Count + 1, head) { Base = baseBranch };
                     _pulls.Add(pull);
                     Opened.Add((pull.Number, head, baseBranch, title, body));
                     if (FailAfterOpen)
@@ -140,8 +191,14 @@ public class ChangesetPipelineTests
             }
         }
 
-        public Task<IReadOnlyList<string>> ConvertOpenToDraftAsync(RepoRef repo, string head, CancellationToken ct) =>
-            Task.FromResult<IReadOnlyList<string>>([]);
+        public Task<IReadOnlyList<string>> ConvertOpenToDraftAsync(RepoRef repo, string head, CancellationToken ct)
+        {
+            lock (_gate)
+            {
+                Drafted.Add(head);
+                return Task.FromResult<IReadOnlyList<string>>([.. _pulls.Where(p => p.Head == head && p.MergeCommit is null).Select(p => Url(p.Number))]);
+            }
+        }
 
         /// <summary>The description each pull request was last given at its merge.</summary>
         public Dictionary<string, string> Bodies { get; } = new();
@@ -165,12 +222,13 @@ public class ChangesetPipelineTests
                 var head = pull.MergedHead ?? Branches[pull.Head];
                 var merged = pull.MergeCommit is not null;
                 return Task.FromResult(new PullFacts(number, Url(number), !merged, merged, false, head, pull.Base, Branches[pull.Base], pull.MergeCommit,
-                    merged ? null : DiffPaths.Parse(Diff(pull.Base, head)).Files));
+                    merged ? null : DiffPaths.Parse(Diff(pull.Base, head)).Files, DefaultBranch: Main));
             }
         }
 
         public Task<string> GetDiffAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct)
         {
+            OnDiffRead?.Invoke(baseSha, headSha);
             lock (_gate)
             {
                 Calls.Add($"diff {baseSha}...{headSha}");
@@ -422,6 +480,8 @@ public class ChangesetPipelineTests
         public BranchRepo Repo { get; } = new();
         public PanelReviewer Reviewer { get; } = new();
         public MergeQueueTests.SimWorker Worker { get; } = new();
+        /// <summary>The worker the next pipelines run instead of <see cref="Worker"/>, when a test needs one that does not finish.</summary>
+        public IWorker? WorkerInstead { get; set; }
         public FakeShortcutBoard Board { get; } = new();
         public ShortcutWorkSource Source { get; }
         public InProcessRunLocks Locks { get; } = new();
@@ -442,7 +502,7 @@ public class ChangesetPipelineTests
         }
 
         public RunPipeline Pipeline(bool workerless = false) =>
-            new(Source, new WorkLedger(new LedgerDbContext(_options), TimeProvider.System), Locks, Repo, Worker, Repo, Sandbox, Log, controls: Controls,
+            new(Source, new WorkLedger(new LedgerDbContext(_options), TimeProvider.System), Locks, Repo, WorkerInstead ?? Worker, Repo, Sandbox, Log, controls: Controls,
                 controlPollInterval: TimeSpan.FromMilliseconds(10),
                 gate: new GateStage(Repo, Reviewer, TimeSpan.FromMilliseconds(5), TimeSpan.FromSeconds(30), Risk: FakeCodeGraphRisk.Reader()),
                 planner: Planner is null ? null : new Seat(Planner), workerless: workerless);
@@ -943,6 +1003,8 @@ public class ChangesetPipelineTests
         Assert.Equal(3, h.Board.Stories.Count);
         Assert.Single(await h.Steps(PlanId, RunPipeline.Steps.Changeset));
         Assert.Single(h.Repo.Opened, o => o.Head == ChangesetBranch);
+        // Found again, it is linked once: one `linked` row across both runs.
+        Assert.Single(await h.Steps(PlanId, RunPipeline.Steps.Linked));
         Assert.Equal(reviews + 2, h.Reviewer.Snapshot().Count);
         Assert.Contains("its failed verdict is from before this run of the changeset pull request", h.Logged);
         Assert.Equal((ChangesetBranch, Main), (h.Repo.Merges[^1].Head, h.Repo.Merges[^1].Base));
@@ -996,5 +1058,319 @@ public class ChangesetPipelineTests
         await h.Controls.SetAsync(ControlScope.Item($"sc-{PlanId}"), ControlState.Running, "test", CancellationToken.None);
         Assert.Equal(WorkState.Review, (await h.Run()).State);
         Assert.Single(h.Repo.Opened, o => o.Head == ChangesetBranch);
+    }
+
+    private static string PlanItem => ControlScope.Item($"sc-{PlanId}");
+
+    private static async Task<string> ChangesetUrl(Harness h) => (await h.Steps(PlanId, RunPipeline.Steps.Linked))[^1]!.Split(' ')[0];
+
+    [Fact]
+    public async Task A_pause_that_lands_after_the_changeset_was_compared_opens_no_pull_request_until_continue()
+    {
+        var h = new Harness();
+        var ids = await h.Plan(Two);
+        foreach (var id in ids)
+        {
+            await h.Merge(id);
+        }
+        // The Pause arrives while the run reads whether the changeset differs from the default branch: after the run's own
+        // start-of-run control check, before the pull request is opened.
+        var compared = 0;
+        h.Repo.OnDiffRead = (@base, head) =>
+        {
+            if ((@base, head) == (Main, ChangesetBranch) && compared++ == 0)
+            {
+                h.Controls.SetAsync(PlanItem, ControlState.Paused, "test", CancellationToken.None).GetAwaiter().GetResult();
+            }
+        };
+
+        var held = await h.Run();
+
+        Assert.Equal(1, compared);
+        Assert.Equal(WorkState.Planned, held.State);
+        Assert.DoesNotContain(h.Repo.Opened, o => o.Head == ChangesetBranch);
+        Assert.Empty(await h.Steps(PlanId, RunPipeline.Steps.Linked));
+        Assert.Contains("its changeset pull request is not opened", h.Logged);
+
+        await h.Controls.SetAsync(PlanItem, ControlState.Running, "test", CancellationToken.None);
+        Assert.Equal(WorkState.Review, (await h.Run()).State);
+        Assert.Single(h.Repo.Opened, o => o.Head == ChangesetBranch);
+    }
+
+    [Fact]
+    public async Task The_changeset_pull_requests_title_carries_the_plan_items_title_inert()
+    {
+        var h = new Harness();
+        h.Board.Story(PlanId)["name"] = "Export for @octocat, closes #12";
+
+        await h.ChangesetOpen();
+
+        var title = h.Repo.Opened.Single(o => o.Head == ChangesetBranch).Title;
+        Assert.Equal($"sc-500: {UntrustedText.Inert("Export for @octocat, closes #12")} (changeset of 2 stories)", title);
+        Assert.DoesNotContain("@octocat", title);
+        Assert.DoesNotContain("#12", title);
+    }
+
+    [Fact]
+    public async Task Stopping_a_plan_item_whose_changeset_pull_request_is_open_drafts_that_pull_request_and_merges_nothing()
+    {
+        var h = new Harness();
+        await h.ChangesetOpen();
+        var url = await ChangesetUrl(h);
+        await h.Controls.SetAsync(PlanItem, ControlState.Stopping, "test", CancellationToken.None);
+
+        var stopped = await h.Run();
+
+        Assert.Equal(WorkState.Cancelled, stopped.State);
+        // The plan item's pull request is its changeset branch's, not one of a `factory/sc-500` branch that never existed.
+        Assert.Equal([ChangesetBranch], h.Repo.Drafted);
+        Assert.Equal(url, (await h.Steps(PlanId, RunPipeline.Steps.PrsDrafted)).Single());
+        Assert.Contains(h.Comments(PlanId), c => c.Contains($"Its pull request ({url}) is a draft again. Branch {ChangesetBranch} is kept"));
+        Assert.DoesNotContain(h.Repo.Merges, m => m.Head == ChangesetBranch);
+        Assert.Equal("base0", h.Repo.Tip(Main));
+        Assert.Empty(await h.InFlight());
+    }
+
+    /// <summary>A worker whose session is cut off (Ctrl-C) as it starts: its run pauses with the worktree kept.</summary>
+    private sealed class InterruptedWorker(CancellationTokenSource interrupt) : IWorker
+    {
+        public Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass, WorkerCallbacks? callbacks,
+            CancellationToken ct)
+        {
+            interrupt.Cancel();
+            throw new OperationCanceledException(interrupt.Token);
+        }
+
+        public Task<bool> StopOrphanAsync(int pid, CancellationToken ct) => Task.FromResult(false);
+    }
+
+    [Fact]
+    public async Task Stopping_an_idle_plan_item_in_a_fix_round_removes_its_changeset_worktree_and_keeps_the_branch()
+    {
+        var h = new Harness();
+        await h.ChangesetOpen();
+        var reviewed = h.Repo.Tip(ChangesetBranch);
+        h.Reviewer.Blocking = r => r.Pull.HeadSha == reviewed;
+        // The fix round's run is interrupted while its fixer works: the item is left in its fix round with its worktree.
+        using var interrupt = new CancellationTokenSource();
+        h.WorkerInstead = new InterruptedWorker(interrupt);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => h.Run(ct: interrupt.Token));
+        Assert.Equal([WorkState.Fixing, WorkState.Paused], (await h.Transitions())[^2..]);
+        Assert.Contains(ChangesetBranch, h.Repo.Worktrees);
+        h.WorkerInstead = null;
+        await h.Controls.SetAsync(PlanItem, ControlState.Stopping, "test", CancellationToken.None);
+
+        var stopped = await h.Run();
+
+        Assert.Equal(WorkState.Cancelled, stopped.State);
+        // The worktree of the changeset branch is removed; the branch and its pull request (a draft now) stay.
+        Assert.DoesNotContain(ChangesetBranch, h.Repo.Worktrees);
+        Assert.Equal(reviewed, h.Repo.Tip(ChangesetBranch));
+        Assert.Equal([ChangesetBranch], h.Repo.Drafted);
+        Assert.DoesNotContain(h.Repo.Merges, m => m.Head == ChangesetBranch);
+    }
+
+    [Fact]
+    public async Task A_plan_story_whose_repository_is_not_its_plans_changeset_repository_escalates_and_opens_no_pull_request()
+    {
+        var h = new Harness();
+        var ids = await h.Plan(Two);
+        var a = ids[0];
+        // Someone edits the story's `Repo:` line: the plan has no changeset branch in that repository.
+        var description = (string)h.Board.Story(a)["description"]!;
+        Assert.Contains($"Repo: {Sandbox.FullName}", description);
+        h.Board.Story(a)["description"] = description.Replace($"Repo: {Sandbox.FullName}", "Repo: michaeltrefry/elsewhere");
+        Assert.True((await h.Run()).Succeeded, h.Logged); // the plan releases it
+
+        var refused = await h.Run(a);
+
+        // It does not fall back to that repository's default branch (where it would merge, count as merged and miss the changeset).
+        Assert.Equal(WorkState.Escalated, refused.State);
+        Assert.Contains($"sc-{a} is a story of the plan whose changeset branch is {ChangesetBranch} in {Sandbox.FullName}", refused.Error);
+        Assert.Contains("no changeset branch in michaeltrefry/elsewhere", refused.Error);
+        Assert.Empty(h.Repo.Prepared);
+        Assert.Empty(h.Repo.Opened);
+        Assert.Empty(h.Repo.Merges);
+        Assert.DoesNotContain(h.Worker.Prompts, p => p.Contains("First story"));
+        Assert.Contains(h.Comments(a), c => c.Contains($"sc-{a} escalated") && c.Contains("no changeset branch in michaeltrefry/elsewhere"));
+        // The plan goes on waiting: the story did not merge.
+        Assert.Equal(WorkState.Planned, (await h.Run()).State);
+        Assert.DoesNotContain(h.Repo.Opened, o => o.Head == ChangesetBranch);
+    }
+
+    [Fact]
+    public async Task A_plan_recorded_before_changesets_still_sends_its_stories_to_the_default_branch()
+    {
+        var h = new Harness();
+        // A plan from before sc-25872: planned and its stories recorded, with no `changeset` row at all.
+        var plan = PlanParser.Parse(Two);
+        var created = await h.Source.CreateChildrenAsync(PlanId, plan.Children($"sc-{PlanId}", Sandbox), CancellationToken.None);
+        await h.Seed(async (l, item) =>
+        {
+            await l.RecordAsync(item, WorkState.Plan, null, null, CancellationToken.None);
+            await l.CheckpointAsync(item, RunPipeline.Steps.Claimed, null, null, CancellationToken.None);
+            await l.CheckpointAsync(item, RunPipeline.Steps.Plan, "plan-sess", plan.ToDetail(), CancellationToken.None);
+            await l.CheckpointAsync(item, RunPipeline.Steps.PlanCreating, "plan-sess", null, CancellationToken.None);
+            await l.CheckpointAsync(item, RunPipeline.Steps.PlanStories, "plan-sess", string.Join(' ', created.Select(i => $"sc-{i}")), CancellationToken.None);
+            await l.RecordAsync(item, WorkState.Planned, null, null, CancellationToken.None);
+        });
+
+        await h.Merge(created[0]);
+
+        Assert.NotNull(await h.PlanOf(created[0]));
+        Assert.Equal((Branch(created[0]), Main), h.Repo.Merges.Select(m => (m.Head, m.Base)).Single());
+    }
+
+    [Fact]
+    public async Task A_story_pull_request_that_targets_another_branch_than_its_plans_changeset_is_not_reviewed_and_escalates()
+    {
+        var h = new Harness();
+        var ids = await h.Plan(Two);
+        var a = ids[0];
+        // An open pull request of the story's branch into the default branch already exists: opening one finds and adopts it.
+        h.Repo.OpenedOutside(Branch(a), Main);
+        Assert.True((await h.Run()).Succeeded, h.Logged);
+
+        var refused = await h.Run(a);
+
+        Assert.Equal(WorkState.Escalated, refused.State);
+        Assert.Contains($"{refused.PullRequestUrl} targets main, not {ChangesetBranch}.", refused.Error);
+        Assert.Empty(h.Reviewer.Snapshot());
+        Assert.Empty(h.Repo.Merges);
+        Assert.Equal("base0", h.Repo.Tip(Main));
+        Assert.Equal(WorkState.Review, (await h.Transitions(a))[^2]);
+    }
+
+    [Fact]
+    public async Task A_story_pull_request_switched_to_the_default_branch_after_its_review_is_not_updated_or_merged_and_escalates()
+    {
+        var h = new Harness();
+        var ids = await h.Plan(Two);
+        var a = ids[0];
+        Assert.True((await h.Run()).Succeeded, h.Logged);
+        // Reviewed against the changeset branch; while CI runs someone switches the pull request's base to the default branch,
+        // which has moved on (so the head is behind it).
+        var switched = false;
+        h.Repo.OnCiRead = sha =>
+        {
+            if (!switched && sha.StartsWith($"{Branch(a)}-c", StringComparison.Ordinal))
+            {
+                switched = true;
+                h.Repo.Advance(Main, "README.md|someone else's merge");
+                h.Repo.Retarget(Branch(a), Main);
+            }
+        };
+
+        var refused = await h.Run(a);
+
+        Assert.True(switched);
+        Assert.Equal(WorkState.Escalated, refused.State);
+        Assert.Contains($"{refused.PullRequestUrl} targets main, not {ChangesetBranch}.", refused.Error);
+        Assert.Equal(WorkState.MergeGate, (await h.Transitions(a))[^2]);
+        // Nothing was merged into the head from either base, and the head was merged nowhere.
+        var calls = h.Repo.CallsSnapshot();
+        Assert.DoesNotContain(calls, c => c.StartsWith("restore ", StringComparison.Ordinal) || c.StartsWith("merge-base ", StringComparison.Ordinal)
+            || c.StartsWith("fast-forward ", StringComparison.Ordinal));
+        Assert.Empty(h.Repo.Merges);
+        Assert.Empty(await h.Steps(a, RunPipeline.Steps.GatePassed));
+        Assert.DoesNotContain(Doc(a), h.Repo.At(h.Repo.Tip(Main)));
+    }
+
+    [Fact]
+    public async Task A_story_pull_request_switched_to_the_default_branch_while_the_merge_queue_waits_for_ci_is_not_merged()
+    {
+        var h = new Harness();
+        var (_, b, runB, release) = await BWaitsWhileAMerges(h);
+        // B is behind the changeset branch: in its turn the queue updates it and waits for CI on the updated head. Then — after
+        // the turn's own check of the base — someone switches B's pull request to the default branch.
+        var waits = h.Repo.OnCiRead!;
+        var switched = false;
+        h.Repo.OnCiRead = sha =>
+        {
+            waits(sha);
+            if (!switched && sha.StartsWith($"{Branch(b)}-u", StringComparison.Ordinal))
+            {
+                switched = true;
+                h.Repo.Retarget(Branch(b), Main);
+            }
+        };
+
+        release.SetResult();
+        var refused = await runB.WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.True(switched);
+        Assert.Equal(WorkState.Escalated, refused.State);
+        Assert.Contains($"{refused.PullRequestUrl} targets main, not {ChangesetBranch}.", refused.Error);
+        Assert.DoesNotContain(h.Repo.Merges, m => m.Head == Branch(b));
+        Assert.Empty(await h.Steps(b, RunPipeline.Steps.GatePassed));
+        Assert.Equal("base0", h.Repo.Tip(Main));
+    }
+
+    [Fact]
+    public async Task A_pull_request_of_an_item_of_no_plan_that_targets_another_branch_than_the_default_branch_escalates()
+    {
+        var h = new Harness();
+        h.Board.Add(77, FakeShortcutBoard.FactoryTeam, epic: 42, name: "A story a person wrote");
+        h.Repo.Branches["release"] = "base0";
+        h.Repo.OpenedOutside(Branch(77), "release");
+
+        var refused = await h.Run(77);
+
+        // The default branch is the one GitHub names with the pull request itself.
+        Assert.Equal(WorkState.Escalated, refused.State);
+        Assert.Contains($"{refused.PullRequestUrl} targets release, not main.", refused.Error);
+        Assert.Empty(h.Reviewer.Snapshot());
+        Assert.Empty(h.Repo.Merges);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_changeset_pull_request_merged_by_hand_closes_the_plan_out_and_no_second_pull_request_is_opened(bool escalatedFirst)
+    {
+        var h = new Harness();
+        await h.ChangesetOpen();
+        var url = await ChangesetUrl(h);
+        if (escalatedFirst)
+        {
+            // The changeset escalates for its own reasons; the owner then squash-merges its pull request by hand.
+            h.Reviewer.Unusable = true;
+            Assert.Equal(WorkState.Escalated, (await h.Run()).State);
+            h.Reviewer.Unusable = false;
+            Assert.Equal(url, h.Repo.SquashOutside(ChangesetBranch));
+        }
+        else
+        {
+            // Merged by hand while the factory still has it in Review: that escalates, once, saying so.
+            Assert.Equal(url, h.Repo.SquashOutside(ChangesetBranch));
+            var found = await h.Run();
+            Assert.Equal(WorkState.Escalated, found.State);
+            Assert.Contains($"{url} is merged outside the factory", found.Error);
+        }
+        Assert.Contains("sc-500 escalated", Assert.Single(h.Comments(PlanId)));
+        // A squash is a new commit: the changeset branch still differs from the default branch.
+        Assert.NotEmpty(h.Repo.At(h.Repo.Tip(ChangesetBranch)).Except(h.Repo.At(h.Repo.Tip(Main))));
+
+        // The owner re-queues the plan item: it finds its pull request merged, and closes the plan out instead of opening another.
+        Ended(h, await h.Run(), WorkState.Planned);
+        var closed = await h.Run();
+
+        Assert.Equal((WorkState.Done, (string?)null), (closed.State, closed.Error));
+        Assert.Single(h.Repo.Opened, o => o.Head == ChangesetBranch);
+        var note = $"changeset pull request {url} was merged outside the factory";
+        Assert.Equal(note, (await h.Steps(PlanId, RunPipeline.Steps.ChangesetEmpty)).Single());
+        Assert.DoesNotContain(h.Repo.Merges, m => m.Head == ChangesetBranch);
+        Assert.Equal(FakeShortcutBoard.Done, h.State(PlanId));
+        // One escalation, then one closeout that says who merged it; nothing after.
+        var comments = h.Comments(PlanId);
+        Assert.Equal(2, comments.Count);
+        Assert.StartsWith("[author: dark-factory] sc-500's plan is complete: 2 of its 2 stories merged", comments[1]);
+        Assert.Contains($"The factory's merge gate did not merge its changeset: {UntrustedText.CodeSpan(note)}.", comments[1]);
+        Assert.Contains("/pull/3", comments[1]);
+        Assert.DoesNotContain("No changeset pull request was opened", comments[1]);
+        Assert.Empty(await h.InFlight());
+        Assert.Equal(WorkState.Done, (await h.Run()).State);
+        Assert.Equal(2, h.Comments(PlanId).Count);
+        Assert.Single(await h.Steps(PlanId, RunPipeline.Steps.ChangesetEmpty));
     }
 }

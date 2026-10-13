@@ -168,6 +168,8 @@ public sealed partial class RunPipeline
                 }
                 EnsureOpen(pull);
             }
+            // Before anything is merged into the head or the head into anything: the base is the one the ledger expects (sc-25872).
+            EnsureBase(run, pull);
             var verdicts = Verdicts(history);
             if (!verdicts.Any(v => v.HeadSha == pull.HeadSha))
             {
@@ -501,6 +503,7 @@ public sealed partial class RunPipeline
         // Never merge into a frozen factory: main may have turned red (or another trigger tripped) while this run waited for
         // CI or its turn in the queue. Main-red is read fresh here, not from the evaluator's short cache.
         await ThrowIfFrozenAsync(run.Item, ct, fresh: true);
+        EnsureBase(run, pull);
         // What this merge changes, for the freeze (sc-25387): recorded before the merge, so every factory merge has it.
         var files = DiffPaths.Of(await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct));
         await ledger.CheckpointAsync(run.Item, Steps.MergeFiles, null, new MergeFiles(pull.BaseRef, files).ToDetail(), ct);
