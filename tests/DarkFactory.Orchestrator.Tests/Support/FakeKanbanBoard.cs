@@ -7,9 +7,10 @@ namespace DarkFactory.Orchestrator.Tests.Support;
 /// contract says (<c>docs/mcp-contract.md</c> there) for the tools the factory's adapter sends: exact tool and argument names (an
 /// argument the tool does not have, or a required one missing, is <c>invalid_argument</c>), two tokens (<see cref="FullToken"/> and
 /// <see cref="ReadToken"/>: a write tool with the read token is <c>scope_denied</c> before anything else, an unknown token HTTP
-/// 401), identities by token, expiring claims, <c>version</c>/<c>expected_version</c>, comment idempotency keys, idempotent links,
-/// cursor paging, and answers in the contract's shapes (a field without a value left out or null as the contract says). Every
-/// call is recorded with the token it carried.
+/// 401), identities by token, expiring claims (claim, renew, release), <c>version</c>/<c>expected_version</c>, comment and
+/// create idempotency keys, idempotent links, cursor paging, and answers in the contract's shapes (a field without a value left
+/// out or null as the contract says). Every call is recorded with the token it carried. A test can make it answer <c>busy</c>
+/// (<see cref="Busy"/>) or lose an answer after the write happened (<see cref="LoseAnswer"/>), as the contract's "Errors" allow.
 /// </summary>
 public sealed class FakeKanbanBoard
 {
@@ -39,7 +40,10 @@ public sealed class FakeKanbanBoard
         ["get_epic"] = (["epicId"], []),
         ["list_epic_documents"] = (["epicId"], []),
         ["claim_work_item"] = (["id", "marker", "ttl_seconds"], []),
+        ["renew_work_item_claim"] = (["id", "marker", "ttl_seconds"], []),
         ["release_work_item_claim"] = (["id", "marker"], []),
+        ["create_work_item"] = (["projectId", "title", "type"], ["status", "priority", "epicId", "description", "estimate", "labels", "label_list",
+            "idempotency_key"]),
         ["update_work_item"] = (["itemId"], ["title", "type", "status", "priority", "epicId", "description", "estimate", "labels", "label_list",
             "expected_version", "clear"]),
         ["add_work_item_comment"] = (["itemId", "body"], ["author", "idempotency_key"]),
@@ -88,6 +92,8 @@ public sealed class FakeKanbanBoard
         public List<Item> Blockers { get; } = [];
         public List<(string Kind, string Url)> Links { get; } = [];
         public List<Comment> Comments { get; } = [];
+        /// <summary>The identity and idempotency key that created it through <c>create_work_item</c>.</summary>
+        public (Guid Identity, string Key)? CreatedWith { get; set; }
     }
 
     public sealed record Call(string Tool, JsonObject Arguments, string Token);
@@ -113,6 +119,24 @@ public sealed class FakeKanbanBoard
 
     /// <summary>When it answers a result for a call, that is the call's answer and the board does nothing.</summary>
     public Func<string, JsonObject, JsonObject?>? Instead { get; set; }
+
+    /// <summary>
+    /// When true for a call, the board does the call and then loses its answer: the caller gets what <see cref="Lost"/> makes
+    /// (default: a plain MCP error — <c>isError</c> with no <c>structuredContent</c>, the contract's "anything else that goes
+    /// wrong"). Asked once per call, after <see cref="Before"/>.
+    /// </summary>
+    public Func<string, JsonObject, bool>? LoseAnswer { get; set; }
+
+    /// <summary>What a lost answer looks like to the caller; throw <see cref="FakeMcpServer.HttpAnswer"/> for an HTTP error.</summary>
+    public Func<JsonObject> Lost { get; set; } = () =>
+    {
+        var result = FakeMcpServer.Text("An error occurred invoking the tool.");
+        result["isError"] = true;
+        return result;
+    };
+
+    /// <summary>How many of the next calls of each tool named here are refused <c>busy</c> (changing nothing) before the tool answers.</summary>
+    public Dictionary<string, int> Busy { get; } = [];
 
     public HttpClient Client() => Server.Client(Url);
 
@@ -183,6 +207,17 @@ public sealed class FakeKanbanBoard
         {
             return instead;
         }
+        if (Busy.GetValueOrDefault(tool) is > 0 and var left)
+        {
+            Busy[tool] = left - 1;
+            return Refusal("busy", $"{tool} waited 10 seconds for other writers; retry.");
+        }
+        var answer = Apply(tool, arguments, identity);
+        return LoseAnswer?.Invoke(tool, arguments) == true ? Lost() : answer;
+    }
+
+    private JsonObject Apply(string tool, JsonObject arguments, (Guid Id, string Name) identity)
+    {
         switch (tool)
         {
             case "list_projects":
@@ -201,8 +236,35 @@ public sealed class FakeKanbanBoard
                         ["createdAtUtc"] = Stamp(Time.Now), ["updatedAtUtc"] = Stamp(Time.Now),
                     }).ToArray()))
                     : Refusal("not_found", $"Epic {arguments["epicId"]} was not found.");
+            case "create_work_item":
+            {
+                if (Projects.FirstOrDefault(p => p.Id == Id(arguments, "projectId")) is not { } project)
+                {
+                    return Refusal("not_found", $"Project {arguments["projectId"]} was not found.");
+                }
+                var key = arguments["idempotency_key"]?.GetValue<string>();
+                if (key is not null && (key.Length is 0 or > 128 || key.Any(ch => ch is <= ' ' or > '~')))
+                {
+                    return Refusal("invalid_argument", "idempotency_key is 1 to 128 printable ASCII characters without spaces.");
+                }
+                // A repeat of the key by the same identity in the project: nothing created, the item as it is now.
+                var earlier = key is null ? null : Items.FirstOrDefault(i => i.ProjectId == project.Id && i.CreatedWith == (identity.Id, key));
+                var made = earlier ?? new Item
+                {
+                    ProjectId = project.Id, Title = arguments["title"]!.GetValue<string>(), Type = arguments["type"]!.GetValue<string>(),
+                    Status = arguments["status"]?.GetValue<string>() ?? "Backlog", Description = arguments["description"]?.GetValue<string>(),
+                    EpicId = arguments["epicId"] is null ? null : Id(arguments, "epicId"), CreatedWith = key is null ? null : (identity.Id, key),
+                };
+                if (earlier is null)
+                {
+                    Items.Add(made);
+                }
+                var created = ItemShape(made);
+                created["created"] = earlier is null;
+                return Ok(created);
+            }
         }
-        var idArgument = tool is "claim_work_item" or "release_work_item_claim" or "add_work_item_link" ? "id" : "itemId";
+        var idArgument = tool is "claim_work_item" or "renew_work_item_claim" or "release_work_item_claim" or "add_work_item_link" ? "id" : "itemId";
         if (Items.FirstOrDefault(i => i.Id == Id(arguments, idArgument)) is not { } item)
         {
             return Refusal("not_found", $"Work item {arguments[idArgument]} was not found.");
@@ -225,6 +287,22 @@ public sealed class FakeKanbanBoard
                 }
                 item.Claim = (identity.Id, identity.Name, marker, Time.Now.AddSeconds(ttl));
                 return Ok(ItemShape(item));
+            }
+            case "renew_work_item_claim":
+            {
+                var (marker, ttl) = (arguments["marker"]!.GetValue<string>(), arguments["ttl_seconds"]!.GetValue<int>());
+                if (ttl is < 1 or > 86400)
+                {
+                    return Refusal("invalid_argument", "ttl_seconds is 1 to 86400.");
+                }
+                if (live is { } held && held.Identity == identity.Id && held.Marker == marker)
+                {
+                    item.Claim = (identity.Id, identity.Name, marker, Time.Now.AddSeconds(ttl));
+                    return Ok(ItemShape(item));
+                }
+                return live is not null
+                    ? Refusal("already_claimed", $"Work item {item.Id} is claimed by someone else.")
+                    : Refusal("conflict", $"The caller holds no live claim on work item {item.Id} under this marker.");
             }
             case "release_work_item_claim":
             {
