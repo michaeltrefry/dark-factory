@@ -875,6 +875,55 @@ fake MCP server that behaves as KanbanBoard's contract says, `FakeKanbanBoard`),
 pipeline with fakes, and the resume), `KanbanWriteIsolationTests` (E2) and `KanbanKeysPostgresTests` (the migration, and
 processes allocating one item's key at once).
 
+## P4b-AT3 — a held claim, its renewal, and a stale write (sc-25983)
+
+`KanbanAcceptanceTests.P4b_AT3_a_held_claim_refuses_a_second_caller_is_renewed_past_its_first_expiry_and_a_stale_write_changes_nothing`:
+the real board with two callers — the factory's identity (`Kanban:WriteToken`) and a second one — against a throwaway ledger.
+No model runs and no pull request is opened: the item is a throwaway one the test creates in the `Backlog` (never `Ready`, so
+no factory takes it), it is in flight only in the throwaway ledger (seeded as Intake leaves a claimed item: a `claimed`
+checkpoint, then Implement), and the intake loop's runs are recorded, not started (`SeededRunner`: the production
+`RunPipeline.InFlightAsync`, `RunPipeline.RenewableAsync` and `RunPipeline.ClaimLostAsync`, a no-op `RunAsync`).
+
+Prerequisites: the shared harness's (as P4b-AT1), `Kanban:WriteToken`, and
+
+- `FACTORY_E2E_P4B_KANBAN_PROJECT`: the key of a KanbanBoard project the test may create an item in (P4b-AT1's will do);
+- `FACTORY_E2E_P4B_KANBAN_OTHER_TOKEN`: a `full`-scope KanbanBoard personal access token of ANOTHER identity than the factory's
+  service identity (a person's, or a second service identity's). The same identity would not be a second caller: its claim under
+  another marker is refused too, but a lost claim would not name anyone else.
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_P4B_KANBAN_PROJECT=<KEY> FACTORY_E2E_P4B_KANBAN_OTHER_TOKEN=<token> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4b_AT3*"
+```
+
+What it checks, in order (it takes about half a minute — it waits out a 20-second claim):
+
+| Step | Expected |
+| --- | --- |
+| `create_work_item` twice with one idempotency key | one item (`created` true, then false with the same id), in `Backlog` |
+| the factory claims the item for 20 s under `dark-factory:<item GUID>`; the second caller claims it | the second caller's claim is refused `already_claimed` |
+| one intake poll (`IntakeLoop.PollOnceAsync` over the real Kanban source) | the claim still carries the factory's marker and identity, and now expires more than 23 hours after its first expiry; nothing reported lost |
+| 25 s later (past the first expiry) | still the factory's; the second caller is still refused `already_claimed` |
+| the second caller moves the item to `InProgress` on the version the factory read; the factory then writes `Done` on that version | refused `conflict`; the item is `InProgress` at the second caller's version: nothing was written |
+| the factory's claim is released, the second caller claims the item, one more poll | the ledger item is Paused, its last transition ``claim lost: the item is claimed by `<their name>` (marker `p4b-at3-second-caller`)`` (outcome `deferred`; the name and the marker are the other caller's text, each an inert code span), then a `parked` row; on the board their claim, the column and the version are unchanged; the item is no longer listed in flight |
+
+Cleanup (best effort, in a `finally`): both claims released and the item moved to `Closed`, which hides it from the board. The
+factory's comment on the item (who holds it, what resumes it) stays on it.
+
+Not live (every `dotnet test`): `KanbanSafeWritesTests` against `FakeKanbanBoard` — each error code as a typed refusal for
+every write the caller sends (and a code the contract does not name as no typed refusal), `busy` retried with the same call
+and its bound, the read before a repeat for each write (a lost
+answer as a plain MCP error, an HTTP error and a broken answer; a write that did not happen; a second failure; a read that
+fails), conflicts on the claim's move and on a reported state (an edit kept, someone else's move left standing, the re-read
+bound, after which the claim is given back), renewal across polls with the board's clock moved (held past the first lifetime,
+a lapsed claim taken again — but not on an item the ledger never recorded as claimed, nor on one moved out of `InProgress` —, a
+claim lost to another caller, to a race, to another identity under the same marker, an item gone; a hostile claimant name and
+marker cut and inert), the pause and its one comment (and a comment the board refuses, on record in the `parked` row), what is
+renewed (every item the ledger resumes by itself, also under a factory, epic or item Pause, the freeze and the usage pause, and
+with unreadable controls — and nothing is run then) and what is not (a parked, an escalated and a stopping item), a
+`factory run` of a claim-lost item (refused while the other claim stands or the board will not confirm it, resumed once it is
+released), and the poll's renewal over several lanes (a board that does not answer ends only its own lane's renewals).
+
 ## Upgrading a Phase 1 ledger: items parked at Review
 
 Phase 1 parked every finished item at Review; since sc-25378 Review is a state the factory drives, so the first

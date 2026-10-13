@@ -658,6 +658,12 @@ public sealed class FactoryItemRunner(FactoryOptions options, IWorkSource source
         return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ct, FactoryRunner.Controls(options), naming: source.Naming);
     }
 
+    public async Task<IReadOnlyList<int>> RenewableAsync(CancellationToken ct)
+    {
+        await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
+        return await RunPipeline.RenewableAsync(new WorkLedger(db, TimeProvider.System), ct, FactoryRunner.Controls(options), naming: source.Naming);
+    }
+
     public Task<RunOutcome> RunAsync(int id, CancellationToken ct) => FactoryRunner.RunAsync(options, source, id, ignoreScope: false, log, ct);
 
     public async Task<string?> GiveUpAsync(int id, string reason, CancellationToken ct)
@@ -665,5 +671,12 @@ public sealed class FactoryItemRunner(FactoryOptions options, IWorkSource source
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
         return await RunPipeline.GiveUpAsync(source, new WorkLedger(db, TimeProvider.System), new PostgresRunLocks(options.LedgerConnectionString),
             id, reason, log, ct);
+    }
+
+    public async Task<string?> ClaimLostAsync(int id, string reason, CancellationToken ct)
+    {
+        await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
+        return await RunPipeline.ClaimLostAsync(source, new WorkLedger(db, TimeProvider.System), new PostgresRunLocks(options.LedgerConnectionString),
+            id, reason, log, ct, FactoryRunner.Controls(options));
     }
 }
