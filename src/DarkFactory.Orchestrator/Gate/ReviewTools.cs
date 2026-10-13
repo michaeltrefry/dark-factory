@@ -244,8 +244,9 @@ public sealed partial class ReviewTools(IReviewFiles? files, ICodeGraph? codeGra
     /// analysis/review tools, whose text a model wrote or writes), <c>rag_search</c> and <c>search_conventions</c> (the convention
     /// embedding service, and conventions are not the PR's code), <c>trace_data_lineage</c>, cluster, health, architecture,
     /// schema, memory, queue and tracker tools (not about the code under review, or writes), and <c>search_projects</c>/
-    /// <c>list_projects</c> (only the orchestrator resolves the project). <see cref="CodeGraph.CodeGraphMcpClient"/> refuses any
-    /// tool not on this list before it sends anything.
+    /// <c>list_projects</c> (only the orchestrator resolves the project). <see cref="CodeGraph.CodeGraphMcpClient.CallAsync"/> refuses
+    /// any tool not on this list before it sends anything. A plan item's planner — never a reviewer — also has six model-free
+    /// cross-repository tools (sc-25874, <see cref="Mcp.PlannerCodeGraph.Tools"/>), through the loopback proxy only.
     /// </summary>
     public static readonly IReadOnlyList<string> CodeGraphTools =
         [AnalyzeImpact, SearchGraph, TraceCallPath, FindConsumers, FindPublishers, GetCodeSnippet, ReadNodeSource];

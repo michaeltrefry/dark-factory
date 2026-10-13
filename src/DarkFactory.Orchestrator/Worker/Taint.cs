@@ -49,8 +49,9 @@ public enum WorkerInput
 /// </para>
 /// <para>
 /// The target repo's own Claude settings (<see cref="OfRepoSettings"/>) taint the session up front, and again if the worker wrote
-/// them during its run. Deliberate, accepted residual: the worker's allowed <c>dotnet build/test/restore</c> run code the repo and
-/// its packages supply (MSBuild targets, analyzers, test code, package restore), and the worker reads their output. That code
+/// them during its run. Deliberate, accepted residual: the worker's allowed <c>dotnet build/test/restore</c> and (sc-25877)
+/// <c>cargo build/check/test/fetch</c> (<see cref="ClaudeWorker.CargoTools"/>) run code the repo and its packages supply (MSBuild
+/// targets, analyzers, cargo build scripts and procedural macros, test code, package restore), and the worker reads their output. That code
 /// runs in the sandbox (no credential but the router key), is the code under review or a dependency the repo already pins, goes
 /// back through the review panel and CI, and the factory cannot build or test anything without it; tainting every session that
 /// builds would leave no worker able to push.
@@ -80,6 +81,12 @@ public static class Taint
 {
     public const string IssueText = "issue-text";
     public const string OutsiderComment = "outsider-comment";
+
+    /// <summary>
+    /// A planner session (sc-25870): it exists to read — the repository, CodeGraph's answers about other projects, the owner's Kanban
+    /// board — and to answer, so it is tainted from its start whether or not it calls a tool, and never gets a push token.
+    /// </summary>
+    public const string Planner = "planner";
 
     /// <summary>The target repo's own Claude settings can bring content in outside the tool stream (<see cref="OfRepoSettings"/>).</summary>
     public const string RepoSettings = "repo-settings";

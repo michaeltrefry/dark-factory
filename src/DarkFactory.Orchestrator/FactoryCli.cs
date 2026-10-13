@@ -117,7 +117,7 @@ public static class FactoryCli
     {
         var item = new Option<WorkSources.ItemRef?>("--item")
         {
-            Description = "One work item: a Shortcut story, e.g. sc-1234, or a GitHub issue's, e.g. gh-12",
+            Description = "One work item: a Shortcut story, e.g. sc-1234, or a GitHub issue's, e.g. gh-12. A plan item's control applies to the plan and its stories",
             CustomParser = result =>
             {
                 var token = result.Tokens.Single().Value;

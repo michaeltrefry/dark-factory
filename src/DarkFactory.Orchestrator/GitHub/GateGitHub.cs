@@ -33,6 +33,14 @@ public interface IGateGitHub
     Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct);
 
     /// <summary>
+    /// The GitHub Actions workflow files of the repository's default branch (sc-25873: <see cref="CiTriggers"/> reads their
+    /// triggers before a plan is spent): every <c>.yml</c>/<c>.yaml</c> file directly in <see cref="CiTriggers.Directory"/>, each with
+    /// its text or why it could not be read (none when the directory does not exist), with the default branch's name as GitHub
+    /// names it for the repository (never guessed). Throws when the repository or the listing itself cannot be read.
+    /// </summary>
+    Task<RepoWorkflows> GetWorkflowsAsync(RepoRef repo, CancellationToken ct);
+
+    /// <summary>
     /// The log of a failing check (sc-25383): for a check run of GitHub Actions its job's log (at most the last
     /// <see cref="GitHubGate.MaxLogBytes"/>, unprocessed: the caller cleans, redacts and bounds it, <see cref="CiHeal.Excerpt"/>);
     /// when that cannot be read, the check run's own output and annotations, saying why. A commit status has no log.
@@ -101,7 +109,7 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         await GitHubApp.EnsureSuccess(response, $"read pull request #{number}", ct);
         var pull = (await response.Content.ReadFromJsonAsync<PullDto>(ct))!;
         return new PullFacts(pull.Number, pull.HtmlUrl, pull.State == "open", pull.Merged, pull.Draft, pull.Head.Sha, pull.Base.Ref, pull.Base.Sha,
-            pull.MergeCommitSha, pull.ChangedFiles);
+            pull.MergeCommitSha, pull.ChangedFiles, pull.Base.Repo?.DefaultBranch);
     }
 
     public async Task<string> GetDiffAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct)
@@ -138,6 +146,70 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         }
         await GitHubApp.EnsureSuccess(response, $"read {GatePolicy.Path} on {baseRef}", ct);
         return await response.Content.ReadAsStringAsync(ct);
+    }
+
+    /// <summary>At most this many workflow files are read; a repository with more is reported as not read in full.</summary>
+    public const int MaxWorkflows = 50;
+
+    /// <summary>A workflow file larger than this is not read.</summary>
+    public const int MaxWorkflowBytes = 512 * 1024;
+
+    public async Task<RepoWorkflows> GetWorkflowsAsync(RepoRef repo, CancellationToken ct)
+    {
+        var token = await ReadTokenAsync(repo, ct);
+        string? defaultBranch;
+        using (var repoRequest = GitHubApp.Request(HttpMethod.Get, $"repos/{repo.Owner}/{repo.Name}", "Bearer", token))
+        using (var repoResponse = await http.SendAsync(repoRequest, ct))
+        {
+            await GitHubApp.EnsureSuccess(repoResponse, $"read the repository {repo}", ct);
+            defaultBranch = (await repoResponse.Content.ReadFromJsonAsync<RefRepoDto>(ct))?.DefaultBranch;
+        }
+        if (string.IsNullOrEmpty(defaultBranch))
+        {
+            throw new InvalidOperationException($"GitHub read the repository {repo} failed: it names no default branch.");
+        }
+        // No ref: the contents API answers for the default branch.
+        using var request = GitHubApp.Request(HttpMethod.Get, $"repos/{repo.Owner}/{repo.Name}/contents/{CiTriggers.Directory}", "Bearer", token);
+        using var response = await http.SendAsync(request, ct);
+        if (response.StatusCode == HttpStatusCode.NotFound)
+        {
+            return new RepoWorkflows(defaultBranch, []);
+        }
+        await GitHubApp.EnsureSuccess(response, $"list {CiTriggers.Directory}", ct);
+        List<ContentEntryDto> entries;
+        try
+        {
+            entries = (await response.Content.ReadFromJsonAsync<List<ContentEntryDto>>(ct))!;
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            throw new InvalidOperationException($"GitHub list {CiTriggers.Directory} failed: it is not a directory.");
+        }
+        var found = entries.Where(e => e.Type == "file" && (e.Name.EndsWith(".yml", StringComparison.Ordinal) || e.Name.EndsWith(".yaml", StringComparison.Ordinal)))
+            .OrderBy(e => e.Name, StringComparer.Ordinal).ToList();
+        var files = new List<WorkflowFile>();
+        foreach (var entry in found.Take(MaxWorkflows))
+        {
+            var path = $"{CiTriggers.Directory}/{entry.Name}";
+            if (entry.Size > MaxWorkflowBytes)
+            {
+                files.Add(new WorkflowFile(path, null, $"larger than {MaxWorkflowBytes} bytes"));
+                continue;
+            }
+            using var fileRequest = GitHubApp.Request(HttpMethod.Get,
+                $"repos/{repo.Owner}/{repo.Name}/contents/{CiTriggers.Directory}/{Uri.EscapeDataString(entry.Name)}", "Bearer", token);
+            fileRequest.Headers.Accept.Clear();
+            fileRequest.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github.raw+json"));
+            using var fileResponse = await http.SendAsync(fileRequest, ct);
+            files.Add(fileResponse.IsSuccessStatusCode
+                ? new WorkflowFile(path, await fileResponse.Content.ReadAsStringAsync(ct))
+                : new WorkflowFile(path, null, $"GitHub answered {(int)fileResponse.StatusCode}"));
+        }
+        if (found.Count > MaxWorkflows)
+        {
+            files.Add(new WorkflowFile(CiTriggers.Directory, null, $"more than {MaxWorkflows} workflow files, the first {MaxWorkflows} read"));
+        }
+        return new RepoWorkflows(defaultBranch, files);
     }
 
     public async Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct)
@@ -309,7 +381,10 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
 
     private sealed record RefDto(
         [property: JsonPropertyName("ref")] string Ref,
-        [property: JsonPropertyName("sha")] string Sha);
+        [property: JsonPropertyName("sha")] string Sha,
+        [property: JsonPropertyName("repo")] RefRepoDto? Repo = null);
+
+    private sealed record RefRepoDto([property: JsonPropertyName("default_branch")] string? DefaultBranch);
 
     private sealed record CheckRunsDto(
         [property: JsonPropertyName("total_count")] int TotalCount,
@@ -352,6 +427,11 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
     private sealed record StatusDto(
         [property: JsonPropertyName("context")] string Context,
         [property: JsonPropertyName("state")] string State);
+
+    private sealed record ContentEntryDto(
+        [property: JsonPropertyName("name")] string Name,
+        [property: JsonPropertyName("type")] string Type,
+        [property: JsonPropertyName("size")] long Size);
 
     private sealed record TreeDto(
         [property: JsonPropertyName("tree")] List<TreeEntryDto> Tree,

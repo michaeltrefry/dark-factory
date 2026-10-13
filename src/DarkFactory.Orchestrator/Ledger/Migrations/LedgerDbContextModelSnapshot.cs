@@ -237,6 +237,9 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                         .HasMaxLength(64)
                         .HasColumnType("character varying(64)");
 
+                    b.Property<long?>("PlanItemId")
+                        .HasColumnType("bigint");
+
                     b.Property<string>("Repo")
                         .IsRequired()
                         .HasMaxLength(200)
@@ -264,6 +267,8 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                         .HasColumnType("bigint");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("PlanItemId");
 
                     b.HasIndex("Source", "ExternalId")
                         .IsUnique();
@@ -348,6 +353,14 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                     b.HasOne("DarkFactory.Orchestrator.Ledger.WorkItem", null)
                         .WithMany()
                         .HasForeignKey("WorkItemId");
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.WorkItem", b =>
+                {
+                    b.HasOne("DarkFactory.Orchestrator.Ledger.WorkItem", null)
+                        .WithMany()
+                        .HasForeignKey("PlanItemId")
+                        .OnDelete(DeleteBehavior.Restrict);
                 });
 
             modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.WorkerSession", b =>

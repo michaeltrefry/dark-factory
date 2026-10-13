@@ -77,51 +77,34 @@ else
             <tr><th>Item</th><th>State</th><th>Repo</th><th>PR</th><th>Elapsed</th><th>Cost</th><th>Sessions</th><th>Control</th></tr>
         </thead>
         <tbody>
-            @foreach (var row in _rows)
+            @* A plan's stories are listed beneath their plan item (sc-25876), not as rows of their own. *@
+            @foreach (var row in _rows.Where(r => r.PlanItemId is null || !Grouped(r)))
             {
-                <tr @key="row.Id" data-item="@row.Id">
-                    <td><span class="id">@row.ExternalId</span> @row.Title</td>
-                    <td class="state">@row.State
-                        @if (row.FailedCloseout is { } closeout)
+                @ItemRow(row, null, null)
+                @if (row.Plan is { } plan)
+                {
+                    @foreach (var story in plan.Stories)
+                    {
+                        @if (_rows.FirstOrDefault(r => r.PlanItemId == row.Id && r.ExternalId == story.ExternalId) is { } storyRow)
                         {
-                            <span class="error closeout-failed">closeout not posted (attempt @closeout.Attempts of @RunPipeline.MaxCloseoutAttempts;
-                                @(row.CloseoutRetrying ? "retried on the next poll" : "not retried again: post it by hand")): @closeout.LastFailure</span>
-                        }
-                    </td>
-                    <td>@row.Repo</td>
-                    <td class="pr">
-                        @if (row.PullRequestUrl is { } pr)
-                        {
-                            <a href="@pr" target="_blank" rel="noopener noreferrer">PR</a>
+                            @ItemRow(storyRow, story, row)
                         }
                         else
                         {
-                            <span class="muted">—</span>
+                            <tr @key="@($"{row.Id}/{story.ExternalId}")" class="plan-story" data-plan="@row.Id" data-story="@story.ExternalId">
+                                <td><span class="plan-indent">↳</span> <span class="id">@story.ExternalId</span> @story.Title</td>
+                                <td class="state">@story.Shown
+                                    @if (story.Waits.Length > 0)
+                                    {
+                                        <span class="@(story.Failing ? "error waits" : "muted waits")">@story.Waits</span>
+                                    }
+                                </td>
+                                <td>@(story.Repo ?? row.Repo)</td>
+                                <td class="muted" colspan="5">—</td>
+                            </tr>
                         }
-                    </td>
-                    <td class="elapsed">@Format.Elapsed(Time.GetUtcNow() - row.CreatedAt)</td>
-                    <td class="cost">@Format.ItemCost(row.CostUsd, row.Sessions)</td>
-                    <td class="sessions">
-                        @foreach (var s in row.Sessions.Where(s => s.ClaudeSessionId is not null))
-                        {
-                            var quiet = s.QuietAt(Time.GetUtcNow(), Data.QuietThreshold);
-                            <a href="sessions/@Uri.EscapeDataString(s.ClaudeSessionId!)" class="@(quiet ? "quiet" : null)"
-                               title="@(quiet ? $"no event for {Format.Elapsed(Time.GetUtcNow() - (s.LastEventAt ?? s.StartedAt))}" : null)">#@s.Attempt@(s.Running ? (quiet ? " (live, quiet)" : " (live)") : "")</a>
-                        }
-                    </td>
-                    <td class="control">
-                        @if (row.Control != ControlState.Running)
-                        {
-                            <span class="control-state">@(row.Control == ControlState.Stopping ? "stopping" : "paused")</span>
-                        }
-                        @if (row.Control != ControlState.Stopping)
-                        {
-                            var scope = ControlScope.Item(row.ExternalId);
-                            <ControlButton Action="@(Paused(scope) ? "continue" : "pause")" Scope="@scope" />
-                            <ControlButton Action="stop" Scope="@scope" />
-                        }
-                    </td>
-                </tr>
+                    }
+                }
             }
         </tbody>
     </table>
@@ -152,6 +135,96 @@ else
 }
 
 @code {
+    /// <summary>Whether the row is a story listed beneath its plan item (active, or finished and listed for its stories): its plan's row lists it.</summary>
+    private bool Grouped(PipelineRow row) =>
+        _rows?.FirstOrDefault(r => r.Id == row.PlanItemId)?.Plan?.Stories.Any(s => s.ExternalId == row.ExternalId) == true;
+
+    /// <summary>One work item's row; <paramref name="story"/> and <paramref name="planRow"/> when it is listed beneath its plan item.</summary>
+    private RenderFragment ItemRow(PipelineRow row, PlanStoryView? story, PipelineRow? planRow) => __builder =>
+    {
+                <tr @key="row.Id" data-item="@row.Id" class="@(story is null ? null : "plan-story")" data-plan="@planRow?.Id" data-story="@story?.ExternalId">
+                    <td>@if (story is not null) { <span class="plan-indent">↳</span> } <span class="id">@row.ExternalId</span> @row.Title</td>
+                    <td class="state">@row.State
+                        @if (row.FailedCloseout is { } closeout)
+                        {
+                            <span class="error closeout-failed">closeout not posted (attempt @closeout.Attempts of @RunPipeline.MaxCloseoutAttempts;
+                                @(row.CloseoutRetrying ? "retried on the next poll" : "not retried again: post it by hand")): @closeout.LastFailure</span>
+                        }
+                        @if (story is { Waits.Length: > 0 })
+                        {
+                            <span class="@(story.Failing ? "error waits" : "muted waits")">@story.Waits</span>
+                        }
+                        @if (row.Plan is { } plan)
+                        {
+                            <span class="plan-counts">@plan.Merged of @plan.Stories.Count merged · @plan.InFlight in flight · @plan.Waiting waiting · @plan.Failed failed</span>
+                            @if (row.Control == ControlState.Stopping)
+                            {
+                                <span class="error plan-flag">stopping</span>
+                            }
+                            @if (plan.Stuck)
+                            {
+                                <span class="error plan-flag">stuck</span>
+                            }
+                            else if (plan.Held)
+                            {
+                                <span class="error plan-flag">held</span>
+                            }
+                            @* A plan of several repositories (sc-25873): where each repository's changeset stands, in merge order. *@
+                            @foreach (var changeset in plan.Changesets ?? [])
+                            {
+                                <span class="@(changeset.Delivered ? "muted plan-changeset" : "plan-changeset")" data-repo="@changeset.Changeset.Repo">changeset of @changeset.Changeset.Repo: @changeset.Describe</span>
+                            }
+                            @if (plan.Hold is { } hold)
+                            {
+                                <span class="error plan-hold">@hold</span>
+                            }
+                            @if (plan.FailedNotices > 0)
+                            {
+                                <span class="error plan-notice">hold comment not posted (attempt @plan.FailedNotices of @RunPipeline.MaxPlanNoticeAttempts;
+                                    @(plan.NoticeRetrying ? "tried again on the next poll" : "not tried again: this page and the ledger have it"))</span>
+                            }
+                            @if (plan.LastHeld is { } lastHeld)
+                            {
+                                <span class="muted plan-last-held">last hold recorded (@lastHeld.At.ToString("u")): @lastHeld.Detail</span>
+                            }
+                        }
+                    </td>
+                    <td>@row.Repo</td>
+                    <td class="pr">
+                        @if (row.PullRequestUrl is { } pr)
+                        {
+                            <a href="@pr" target="_blank" rel="noopener noreferrer">PR</a>
+                        }
+                        else
+                        {
+                            <span class="muted">—</span>
+                        }
+                    </td>
+                    <td class="elapsed">@Format.Elapsed(Time.GetUtcNow() - row.CreatedAt)</td>
+                    <td class="cost">@Format.ItemCost(row.CostUsd, row.Sessions)</td>
+                    <td class="sessions">
+                        @foreach (var s in row.Sessions.Where(s => s.ClaudeSessionId is not null))
+                        {
+                            var quiet = s.QuietAt(Time.GetUtcNow(), Data.QuietThreshold);
+                            <a href="sessions/@Uri.EscapeDataString(s.ClaudeSessionId!)" class="@(quiet ? "quiet" : null)"
+                               title="@(quiet ? $"no event for {Format.Elapsed(Time.GetUtcNow() - (s.LastEventAt ?? s.StartedAt))}" : null)">#@s.Attempt@(s.Running ? (quiet ? " (live, quiet)" : " (live)") : "")</a>
+                        }
+                    </td>
+                    <td class="control">
+                        @if (row.Control != ControlState.Running)
+                        {
+                            <span class="control-state">@(row.Control == ControlState.Stopping ? "stopping" : "paused")</span>
+                        }
+                        @if (row.Control != ControlState.Stopping && !row.Finished)
+                        {
+                            var scope = ControlScope.Item(row.ExternalId);
+                            <ControlButton Action="@(Paused(scope) ? "continue" : "pause")" Scope="@scope" />
+                            <ControlButton Action="stop" Scope="@scope" />
+                        }
+                    </td>
+                </tr>
+    };
+
     private readonly CancellationTokenSource _cts = new();
     private IReadOnlyList<PipelineRow>? _rows;
     private IReadOnlyList<Metric>? _metrics;

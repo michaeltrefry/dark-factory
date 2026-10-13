@@ -341,6 +341,62 @@ The in-process versions, which run in every `dotnet test`: `GatePipelineTests.A_
 `NewTestsTests.A_new_test_that_already_passes_on_the_base_is_rejected_with_the_test_named`,
 `FixLoopTests.A_fourth_round_escalates_with_the_open_findings_attached`.
 
+### P4-AT4 — the new-tests check on a Rust pull request (sc-25875)
+
+Two automated tests in `GateNegativeTests`, each with `FACTORY_E2E=1` and its own To Do bug story like AT4's (same harness and
+seeding as the AT4 negatives above):
+
+- the rejection — `P4_AT4_a_rust_test_that_already_passes_on_the_base_is_gate_rejected_and_one_calling_new_code_does_not_build_there`
+  (`FACTORY_E2E_P4_CARGO_STORY`): nothing merges and the sandbox's main is not written;
+- the merge (sc-25877) — `P4_AT4_a_rust_test_that_fails_on_the_base_and_passes_on_the_head_merges`
+  (`FACTORY_E2E_P4_CARGO_MERGE_STORY`): a Rust pull request whose new test fails on the base and passes on the head goes through
+  the gate and **merges**. Unlike every other test of the class it writes the sandbox's main: **the sandbox then holds the
+  crate**, one directory per run under `e2e-rust-merged/` (`e2e-rust-merged/p<8 hex>/Cargo.toml` and `src/lib.rs`, each marked
+  `[dark-factory e2e] … Safe to delete`). They are inert — the sandbox's own CI and .NET build do not read them — and may be
+  deleted by an owner's pull request whenever; a new directory per run is what keeps the package new on every base, so the test
+  can be re-run. Besides cargo it needs everything P2-AT1 needs for a merge (the gate App, a `factory/gate.yaml` on main, the
+  CodeGraph token for `risk-threshold`), and the story's own fix must pass the gate like P2-AT1's (its xUnit test failing on the
+  base): the two stacks are judged by their two strategies in one `new-tests` result.
+
+**Prerequisite (once, the owner):** cargo and rustc for the worker user, on the launch helper's fixed PATH — `/opt/homebrew/bin`
+or `/usr/local/bin` (`brew install rust`; or rustup installed as `_factory`, with its `cargo` and `rustc` linked into
+`/usr/local/bin`: `~_factory/.cargo/bin` itself is not on that PATH). `sudo scripts/setup-worker-user.sh` reports both
+(`ok    cargo --version: …`, or `none  cargo --version … not available to _factory`); the helper itself did not change. The first
+run also needs the network for `cargo fetch` (the seeded package has no dependency, so nothing is downloaded). Both tests need
+this: **cargo and rustc must be on the sandbox user's fixed PATH**, or the check is an `error` and neither a rejection nor a
+merge is decided. The same PATH is what an implementing worker's `cargo build`/`cargo test` use (sc-25877: workers may run
+`cargo build`, `check`, `test` and `fetch`).
+
+| Setup it does | Expected on the ledger |
+| --- | --- |
+| before the first review, commits to the PR branch `e2e-rust/Cargo.toml` (package `df-e2e-rust`) and `e2e-rust/src/lib.rs`: `pub fn double`, and an inline `#[cfg(test)] mod tests` with `doubles` (calls `double`) and `already_passes_on_the_base` (asserts `1 + 1 == 2`) | the last `new-tests` row is `rejected` (`gate_rejected`), strategy `rust-cargo`, `base_run` `build-failed`, `base_retry` `ran`, `head_run` `ran`; `df-e2e-rust:lib:tests::doubles` is `not-built` on the base (it calls code the pull request adds: the base gets the package with its test code alone) and `passed` on the head; `df-e2e-rust:lib:tests::already_passes_on_the_base` is `passed` on both and named in the reason; the last `gate` row is `Blocked …new-tests-fail-on-base (rejected)…`; MergeGate → Escalated; nothing merged |
+| (the merging test) before the first review, commits to the PR branch `e2e-rust-merged/p<run>/Cargo.toml` (package `df-e2e-p<run>`) and `src/lib.rs`: `pub fn double`, and an inline `#[cfg(test)] mod tests` with only `doubles` (calls `double`) | the last `new-tests` row is `pass` (`passed`), its strategy list holding `rust-cargo` (beside `dotnet-xunit` for the story's own tests); `df-e2e-p<run>:lib:tests::doubles` is `not-built` on the base — how a test of code the pull request adds fails there: the base gets the package with its test code alone, so the test's own function does not compile — and `passed` on the head; the last `gate` row is `Merge …` (`passed`) listing `new-tests-fail-on-base` among its checks; a `gate-passed` row naming the head the check judged; … MergeGate → Merge → Watch; the pull request is merged at that head, its merge commit the Merge row's; the base branch's tree holds both files |
+
+Without cargo for the worker user the `new-tests` row is `error` (`…(toolchain-missing): cargo is not available to the gate's test
+runs as _factory…`) and the test fails on its first assertion, quoting that reason. The same seed runs in every `dotnet test` where
+cargo is installed (`CargoRunnerTests.With_cargo_a_new_package_is_applied_to_the_base_with_its_test_code_alone`, unsandboxed), with
+`With_cargo_a_new_test_failing_on_the_base_passes_and_one_already_passing_there_is_named` (the `pass` outcome),
+`…a_new_inline_test_calling_code_the_pull_request_adds_does_not_build_on_the_base…`, `…in_a_workspace_below_the_repository_root…`
+and `…a_base_whose_other_tests_do_not_build_is_an_error_not_evidence`. The merging test's crate is checked in every `dotnet
+test` too, without cargo: `LiveHelperTests.The_crate_the_merging_cargo_test_seeds_has_one_new_test_the_cargo_strategy_names_as_the_live_test_expects`.
+
+**Live results (2026-10-13): both PASS.** The rejection passed on its second attempt (story sc-25936, sandbox PR #49, closed unmerged by the test; `new-tests` `rejected`, strategy `rust-cargo`). The merge passed first time (story sc-25923, sandbox PR #50 merged by the gate as `3f4cc9e28ac6`; main holds `e2e-rust-merged/p5211b98a/`).
+**Write the story so that every new xUnit test fails on main.** The first attempt of the rejection (sc-25922, PR #48) failed on the fixture, not the product: the story text listed assertions that already pass on main (`CountLines("a\u0085")` == 1), the implementer added them, the story's own xUnit tests were `rejected`, and the result named the `dotnet-xunit` strategy alone — `NewTestsCheck.RunAsync` returns the first strategy's failing result, so the Rust test was not in it and the test's `rust-cargo` assertion failed. Name in the story exactly the `[Fact]` methods to add, each asserting a value that is wrong on main, and say that no other test (no "still works" test) may be added.
+
+A test that passes on the real base must never count as failing there (the review of sc-25875 reproduced five such false
+passes; the rule is in CLAUDE.md: `not-built` only for what the base lacks). With cargo installed these run too, each on real
+crates: `…a_new_module_file_keeps_its_imports_so_tests_of_old_code_in_it_pass_on_the_base_and_are_named` (a new `src/extra.rs`
+with `use crate::add;`: both tests of old code `rejected`, the test of the new module's own function still `not-built`),
+`…tests_that_exercise_only_code_the_base_has_pass_there_in_every_module_shape` (`#[cfg(all(test, not(miri)))]` modules old and
+new, `mod tests { #![cfg(test)] }`, a file-level `use` the PR adds, helpers of the test module, a `macro_rules!` macro and a
+derived type of the parent, `mod tests;` in its own file, a `pub(crate) use` re-export, a `#[cfg(test)] use`, an import spelt
+another way, an integration test of old API: every one `passed` on the base at the first build, the check `rejected`),
+`…one_import_that_does_not_resolve_on_the_base_hides_neither_a_test_of_old_code_nor_a_real_failure` and
+`…an_import_of_new_code_in_a_file_the_base_has_is_left_out_and_the_tests_beside_it_get_their_real_results` (the retries).
+`unsupported`, decided before any run (`CargoIdentifyTests`): a test function outside every `#[cfg(test)]` module that is new
+or changed (top of a production file, a production module, a module gated by `cfg(any(test, …))`), a new `#[cfg(test)]`
+`use`/`impl` outside one, cfg alternates of one name, a renamed production file with new tests.
+
 ### AT5 — freeze and stuck
 
 Automated: `FreezeAndStuckTests`. The freeze tests write only the throwaway ledger; their story is never claimed (it stays To Do
@@ -439,6 +495,352 @@ CodeGraph story sc-25846).
 **Live results (2026-10-12): all PASS** — P3-AT1, P3-AT2, P3-AT3, the Kanban check, P3-AT4a and P3-AT4b. Sandbox PRs #43, #44 and
 #46 merged; #47 (P3-AT4a, critical file) escalated on risk-threshold, not merged; #42 (P3-AT4b) blocked at the timeout, not merged;
 issue #45 was P3-AT3's fixture.
+
+## P4-AT1 — a plan item is planned into stories, released in dependency order, merged into its changeset branch and then into the default branch (sc-25870, sc-25871, sc-25872)
+
+`PlanAcceptanceTests.A_plan_item_is_planned_by_a_real_planner_into_stories_released_in_dependency_order_merged_into_its_changeset_branch_and_then_into_the_default_branch`:
+`factory run` on a `plan`-labelled story with the real planner (a sandboxed read-only session on the `high` class, CodeGraph and
+Kanban through the loopback proxy when their tokens are configured), a throwaway ledger and its own work root. Since sc-25872 it
+goes all the way: each released story is really worked (`factory run` on it: implemented from the plan's changeset branch,
+reviewed by the panel, merged by the gate into `factory/changeset-sc-<plan>`), and once every story has merged the plan item's own
+runs open one pull request from the changeset branch to the default branch and take it through Review → CI → MergeGate → Merge.
+It is the most expensive acceptance test (one implementer and one review per story, plus the changeset's review): keep the plan
+story small.
+
+Prerequisites: everything AT2 needs (router with an enrolled plan, both GitHub Apps, the Shortcut token, the sandbox set up, a
+`factory/gate.yaml` on the sandbox's default branch), and `FACTORY_E2E_P4_PLAN_STORY=sc-<id>`: a **To Do** story carrying the
+`plan` label whose repository is the sandbox (the default repo, or a `Repo:` line) and whose description is work of **at least
+three small stories with a dependency chain** — the epic's scenario: a story that needs a story that itself needs another (A,
+then B on top of A, then C on top of B) — each of which can pass the sandbox's gate on its own (e.g. each a documentation change
+under the policy's free tier, or a code change with a test that fails on its base) and which together stay inside the policy's
+`risk` limits — the changeset pull request is gated as a whole. The planner decides the plan, so lead it there: say in the story
+that the work is three steps and that each builds on the one before. A suggested text (not yet tried on a live planner;
+adapt the file names to the sandbox):
+
+> Add a short glossary to the docs, in three steps that build on one another. First add `docs/glossary.md` with two terms. Then,
+> once that file exists, add a "See also" section to it linking each term to the page that uses it. Then, once the section
+> exists, link the glossary from `docs/README.md` and add one more term with its link. Each step is its own story; the second
+> needs the first and the third needs the second.
+
+A plan of fewer than three stories, or with no chain of three (three independent stories, or two that each need only the first),
+fails the test as `INCONCLUSIVE: …` right after the plan is recorded and before any story is released — it proves nothing about
+release in dependency order; archive the created stories (the test does) and re-run on a story worded more firmly. The sandbox's CI must run for pull requests whose base is `factory/changeset-*` (a
+workflow whose `pull_request` trigger is limited to `branches: [main]` reports nothing there, and the story's CI wait times out).
+The test writes to that story's board: it claims the plan story (In Progress) and creates the plan's stories in the Backlog of
+its team and epic, moves them to To Do as they are released, works them (claimed, then Done as each merges into the changeset
+branch), and finally reports the plan story Done with its closeout; it archives the created stories when it ends (best effort).
+On GitHub it creates `factory/changeset-sc-<id>`, one pull request per story into it and one from it into the default branch,
+all merged by the gate App; the changeset branch is left on the sandbox (delete it by hand, or let GitHub's "automatically
+delete head branches" do it). **Stop any
+`factory work` whose watch scope covers that team or epic first** (or use a team and epic nothing watches): a released story is an
+ordinary To Do story, and a running factory would claim and implement it.
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_P4_PLAN_STORY=sc-<id> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-class "*PlanAcceptanceTests"
+```
+
+Expected evidence: the first run succeeds with the item `Planned` (transitions Intake → Plan → Planned, no PR); `changeset` then
+`changeset-pushed` rows between `plan-creating` and `plan-stories`, naming `factory/changeset-sc-<id>` in the sandbox, the branch on
+GitHub at the recorded commit and no pull request for it yet; one `session` row whose
+`worker-model-class` is `high` and whose `session_taints` hold `planner`; the `plan` checkpoint parses under every rule
+(`Plan.FromDetail`); `plan-stories` lists one distinct id per plan story, and each of those stories, read back from Shortcut, has the
+plan's title, is in Backlog, carries the planned-story marker and is blocked (`blocks` links) by exactly the stories its plan entry
+names. Every later `factory run` runs no planner and creates no story: the first releases exactly the stories nothing blocks (To Do
+on the board, one `plan-released` row each, the rest still in Backlog); a run with nothing newly merged adds no ledger row and
+moves no story. Each released story's own run ends in `Watch` with exactly one pull request whose base is the changeset branch,
+merged, a `verdict` row and a `merge-files` row naming the changeset branch as its base; after each tier the next plan run
+releases exactly the stories whose blockers are all merged; while any story is unmerged the plan item has no `merged-reported`
+or `closeout` row and the default branch has not moved. Once every story has merged, the plan item's next runs end in `Watch`
+(… Planned → Review → CI → MergeGate → Merge → Watch): exactly one pull request from `factory/changeset-sc-<id>` into the default
+branch, merged, its description starting `Changeset of plan`; a passing `verdict` on its head with every review on the `high`
+class, a `gate-passed` row and a `merge-files` row whose base is the default branch; the default branch's head is the merge commit
+of the plan item's Merge row; one `closeout` `posted`. **The closeouts equal the ledger's** (sc-25877, as P2-AT2 checks an item's):
+each story's closeout comment on the real board is exactly `LedgerReport.MergedCloseout` rendered from that story's own rows in
+the throwaway ledger (those before its posted `closeout` row), and the plan story's comment is exactly
+`LedgerReport.PlanCloseout` rendered from the plan item's rows before its posted `closeout` row and each story's rows — it says
+`sc-<id>'s plan is complete: n of its n stories merged` and `Its changeset merged into \`main\` as \`<merge commit>\``. A
+mismatch prints both texts; a session cost the router reported after the comment was posted would show as one (rare: re-run).
+Every row of the plan item and of each story carries the typed outcome `StepOutcomes.Of` gives it.
+
+### P4-AT1 through the intake loop (`factory work`, sc-25877)
+
+The test above drives every run itself (`factory run … --ignore-scope`), so it never shows the intake loop picking a plan up.
+`PlanAcceptanceTests.P4_AT1_factory_work_picks_up_a_plan_item_in_its_watch_scope_releases_its_stories_into_it_and_picks_them_up`
+does: it hosts the real `factory work` (`FactoryHost.BuildWork`, in process, a throwaway ledger and work root, the same way as
+AT2's `FactoryWorkTests`) watching the plan story's scope, and starts no run of its own. The loop picks the plan item up from
+the watch scope, plans it (real planner), releases its stories — created in the plan story's team and epic, so **inside the
+watch scope** — and picks each released story up from `ListReadyAsync` like any ready story, until the plan's changeset pull
+request has merged. It is as expensive as P4-AT1 itself (a second whole plan); run it on its own.
+
+Prerequisites: everything P4-AT1 needs, `FACTORY_E2E_WATCH_TEAM` and/or `FACTORY_E2E_WATCH_EPIC` (the test host's watch scope,
+as for AT2), and `FACTORY_E2E_P4_WORK_PLAN_STORY=sc-<id>`: a **To Do** story carrying the `plan` label, **inside that watch
+scope**, worded like P4-AT1's (three steps that build on one another: the test is INCONCLUSIVE without a chain of three).
+**The watch scope must hold no other To Do story, and no other `factory work` may watch it** — the host claims every ready
+story it sees, and a second factory would claim this plan's released stories. The test refuses to start (before the host does)
+unless the scope's ready stories are exactly the plan story.
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_WATCH_EPIC=<epic id> FACTORY_E2E_P4_WORK_PLAN_STORY=sc-<id> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4_AT1_factory_work*"
+```
+
+Expected evidence: the plan item reaches `Planned` with no run started by the test; every created story is inside the watch
+scope (`InScopeAsync`); the plan item reaches `Watch`; it has one `session` row (planned once) and one `plan-released` row per
+story, none saying `outside the watch scope`; every story has a `claimed` row recorded after its `plan-released` row (the loop's
+own pickup), is linked to the plan (`PlanItemId`) and has a Merge row; every story's `plan-released` row is recorded after each
+of its blockers' Merge row; exactly one changeset pull request, merged into the default branch, with a `gate-passed` row and one
+`closeout` `posted`. The created stories are archived at the end (best effort); the host is stopped first.
+
+**Live result (2026-10-13): PASS**, first attempt, 10 minutes (plan sc-25949 in a throwaway epic, 25948, as the whole watch scope): stories sc-25950 → sc-25951 → sc-25952 picked up by the loop, sandbox PRs #55 (`0c8091fa`), #56 (`149a3b43`), #57 (`d448b3b3`) into `factory/changeset-sc-25949`, changeset PR #58 merged into main as `1b4172468565`.
+
+Not exercised live, covered by `ChangesetPipelineTests` against the simulated repository (sc-25872): a pull request whose base is
+not the one the ledger expects (a story's PR switched to the default branch, an adopted PR with another base) escalates
+`<url> targets <base>, not <expected>` unreviewed and unmerged; a plan story whose `Repo:` line names a repository its plan has
+no changeset in escalates and opens no pull request; a changeset pull request someone merged by hand closes the plan out on its
+re-run (`changeset-empty`: `changeset pull request <url> was merged outside the factory`) instead of opening another; Stop on a
+plan item whose changeset pull request is open stops its unfinished stories, drafts that pull request and cancels the plan once.
+Changeset size (sc-25873): a `version: 4` policy gives the changeset pull request its own limits, `risk.max_changeset_lines` and
+`max_changeset_files` (both required there; the per-story `max_changed_lines`/`max_changed_files` keep judging every story's pull
+request). If the sandbox's default-branch policy is still version 2 or 3, the changeset pull request of this test is held to
+`max_changed_*` and escalates on `risk-threshold` unless those are sized for the plan: move the policy to version 4 (an owner's
+PR: the path is sealed). The `gate` row of a changeset pull request reads `Merge <sha> (changeset pull request): …`.
+
+CI triggers (sc-25873): before the planner runs, the factory reads the sandbox's `.github/workflows/*.yml` on the default branch.
+If every workflow's `pull_request` trigger filters `branches` without `factory/**` (and none has a matching `push` trigger), the
+plan item escalates at once with a `ci-triggers` row (`blocked: …`) naming the fix — add `factory/**` to the `pull_request`
+`branches` filter — and the workflow files, and no story or changeset branch is created. The same holds for the changeset pull
+request: workflows that run for `factory/**` bases but whose `branches` filter leaves out the default branch (and no `push`
+trigger matching `factory/changeset-*`) block the plan with the fix naming the default branch. A workflow it cannot read or
+parse, or a repository none of whose workflows has a `pull_request` trigger or a `push` trigger for branches (dispatch-only,
+scheduled, tag releases: its CI may be another service's), is a `ci-triggers` warning row and the plan goes on.
+A plan item naming several repositories (`Repo:` lines) is checked in each of them, before the planner runs: one that blocks
+stops the whole plan (the reason starts with that repository; no story or changeset branch in any of them), and a warning is
+recorded per repository.
+
+In-process versions (every `dotnet test`): `ChangesetPolicyTests` (version 4 parsing, both limits for both kinds of pull request
+under versions 2, 3 and 4), `ChangesetPipelineTests` (the changeset fact from the ledger: a plan's changeset pull request against
+`max_changeset_*`, a story whose base is a `factory/changeset-*` branch and an item of no plan against `max_changed_*`; a plan
+blocked, warned or planned by its repository's workflows), `CiTriggerTests` (every `on:` shape, GitHub's branch filter matching,
+the GitHub read).
+
+When `write-lifecycle.json` is re-recorded (`SHORTCUT_RECORD=1`, the owner's run), confirm two things about the idempotency key
+the factory sends as each created story's `external_id` (sc-25877; `dark-factory:child:<parent>:<64 hex characters>`, 92
+characters for a parent such as `sc-25858`, one more per extra digit of the parent's id): that `POST stories` accepts an
+`external_id` of that length and returns it unchanged (not cut, not refused), and that the story listings the factory reads
+(the epic's and the team's stories) carry `external_id` for such a story — a retry finds its children from the listing by it.
+Both confirmed on 2026-10-13 (sc-25877): `write-lifecycle.json`'s two `POST stories` carry a 92-character key and
+their 201 responses return it unchanged; `release.json` (recorded right after, on the same throwaway stories) holds the retry
+— the team's listing carries each child's `external_id`, both are found, nothing is created — and the live P4-AT1 stories
+show it in the epic's listing (`GET epics/{id}/stories`) too.
+
+**Live result (2026-10-13): PASS**, first attempt, 11 minutes (plan sc-25939: three `TextTools` helpers, each calling the one before, the story text saying "plan exactly these three stories, the second blocked by the first, the third blocked by the second"): stories sc-25941 → sc-25942 → sc-25943, sandbox PRs #51 (`c0f15801`), #52 (`bb572c7c`), #53 (`3f791318`) into `factory/changeset-sc-25939`, changeset PR #54 merged into main as `344a199ffd28`. A code plan works as well as the documentation one suggested above. Written with sc-25870 and extended with sc-25871. The live run was also the
+first time the release's Shortcut requests meet the real API: `GET stories/{id}` returning a story with `story_links`, and
+`PUT stories/{id}` with only `workflow_state_id` (Backlog → To Do) had no recorded contract fixture then; since 2026-10-13 `release.json` records both (`ShortcutContractTests.A_retry_finds_its_children_by_external_id_and_a_release_reads_blockers_and_moves_backlog_to_to_do`); the
+unit tests cover them against the fake board and against the story shape the `list-ready.json` recording holds. Two more reads
+first meet the real API there: a story's blockers are each read with their own `GET stories/{id}` and judged finished by the
+`type` (`done`) of their workflow state in `GET workflows` (the recording's workflow carries those types), and a released story
+the ledger does not know yet is asked for once per run (`GET stories/{id}`: is it back in the Backlog?). The test's runs between
+tiers therefore read the released stories; they still add no ledger row and move no story.
+
+What the live test does not cover, and the unit tests do (`PlanReleasePipelineTests`, `PlanRunnerLockTests`): a blocker outside the
+plan (held until the factory merges it or the board shows it finished), an archived story, a released story moved back to the
+Backlog, a plan whose stories were never recorded (a marked story is refused at claim), a plan that cannot be evaluated (one comment
+and one `plan-held` row after `Intake:MaxItemFailures` failures), a closeout the board keeps refusing (the item stays `Planned`,
+"post it by hand"), and a Stop landing on a waiting plan after its runner took no worker run lock (deferred to the next run).
+
+## P4-AT2 — a plan across two repositories: a changeset in each, merged in the plan's order (sc-25873)
+
+`MultiRepoPlanAcceptanceTests.P4_AT2_a_plan_across_two_repositories_gets_a_changeset_in_each_and_merges_them_in_the_plans_order`:
+`factory run` on a `plan`-labelled story that names two repositories, with the real planner seated in both, a throwaway ledger
+and its own work root. The test then drives the plan item and every released story until the plan item is in `Watch`. It is more
+expensive than P4-AT1 (one implementer and one review per story, plus one changeset review per repository): keep the work small.
+
+Prerequisites: everything P4-AT1 needs, and
+- `FACTORY_E2E_P4_SECOND_REPO=owner/name`: a second sandbox repository with **both GitHub Apps installed** (the workers' App and
+  the gate App), protected with `factory github-repo protect owner/name`, a `factory/gate.yaml` on its default branch, CI that
+  runs for pull requests whose base is `factory/changeset-*`, and **indexed in CodeGraph** (the gate's `risk-threshold` and the
+  planner's tools read it). The test adds it to the factory's configured repositories for its own runs (`Factory:Repos`);
+  for a real `factory work` set `Factory__Repos=owner/name` too (comma-separated for several). `Factory:Repos` is the setting
+  for this: it lets the factory plan and work there and turns on no issue polling. `GitHub:Watch:Repos` also makes a
+  repository configured, but it is the issue-triage watch list — it starts polling and triaging that repository's issues, and
+  `factory work` refuses it with `Worker:RunAs=none` — so use it only when issue triage there is wanted.
+- `FACTORY_E2E_P4_MULTI_PLAN_STORY=sc-<id>`: a **To Do** story carrying the `plan` label whose description has two lines,
+  `Repo: <the sandbox>` then `Repo: <the second repository>`, and describes work that needs a small change in each (e.g. a
+  documented format in the first and a reader of it in the second), each story able to pass its repository's gate on its own and
+  each repository's changeset inside that repository's `risk` limits. **At least one story must wait on the first repository's
+  changeset** (`blocked_by_changesets` in the plan): say in the story that the second repository's change must only start once
+  the first repository's change is on its default branch — e.g. "the change in `<second>` must only start after the change in
+  `<first>` is on `<first>`'s default branch". State the order as a release rule and spell the shared contract out in the story
+  itself; do **not** ask for the second repository's change to be "written against" or "read from" the first repository: a
+  story's worker sees only its own repository's checkout, and a story that tells it to read the other one ends `Worker finished
+  without changing the repository` (the first live run, 2026-10-13; the planner is now told so, sc-25877). A plan in which no story waits on a
+  changeset fails the test as `INCONCLUSIVE: …` right after planning (sc-25877): the check "released only after that changeset's
+  merge" would otherwise check nothing.
+Stop any `factory work` whose watch scope covers the story's team or epic first, as for P4-AT1.
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_P4_MULTI_PLAN_STORY=sc-<id> FACTORY_E2E_P4_SECOND_REPO=owner/name \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-class "*MultiRepoPlanAcceptanceTests"
+```
+
+Expected evidence: the first run ends `Planned`; the `plan` checkpoint has a `repo` on every story, a `merge_order` of both
+repositories and a non-empty `interactions` (a planner that put every story in one repository makes the test INCONCLUSIVE, and
+so does a plan with no story that has a `blocked_by_changesets` entry);
+one `changeset` + `changeset-pushed` pair per repository, all before `plan-stories`, each naming `factory/changeset-sc-<id>`;
+every created story's first `Repo:` line is the repository its plan entry names. Each released story's own run ends in `Watch`
+with exactly one merged pull request in its own repository whose base is the changeset branch. No story with a
+`blocked_by_changesets` entry is released before that repository's `changeset-delivered` row; the second repository's changeset
+has no pull request while the first is not delivered. The plan item's transitions hold two `Merge` rows with a `Planned` row
+("the changeset of <first> merged as …") between them and end in `Watch`; `changeset-delivered` rows name the repositories in
+merge order, each `merged` with its pull request; each repository has exactly one merged changeset pull request whose description
+says `The plan changes 2 repositories.`; the two `merge-files` rows name their repositories; one `closeout` `posted` whose comment
+lists both repositories as `merged into`.
+
+**Live result (2026-10-13): PASS on the second attempt** (plan sc-25971, second repository `michaeltrefry/dark-factory-sandbox-2`): sandbox PR #61 (`a824de0b`) into its changeset branch, changeset PR #62 merged into main as `9ad869946ac8`; only then the downstream story, dark-factory-sandbox-2 PR #1 (`26be3a1c`), and its changeset PR #2 merged into main as `b7e1d51fcf53`.
+**Do not ask a downstream worker to read the upstream repository.** The first attempt (plan sc-25940) failed after the upstream half was delivered (sandbox PRs #59 and #60, main `20b0c5eed669`, which therefore holds `IsPalindrome` and the second sandbox does not): the story text said the downstream change must be "written against the method as released on" the first repository's default branch, the planner wrote a story telling its worker to read the method "from upstream main", and that worker — seated in its own repository alone — ended `Worker finished without changing the repository; nothing to review` (Escalated at Implement). The planner of several repositories is now told what a story's worker sees (sc-25877, `PlanPrompt`), and the second attempt's story text gave the shared contract in full and stated the order as a release rule only. Not
+exercised live, covered by `MultiRepoPipelineTests` against two simulated repositories: an upstream changeset pull request that
+escalates (the downstream one is not opened; `plan-delivery` and the comment say what is delivered), a downstream one that
+escalates after the upstream merged (partial delivery, then fixed and re-run), Stop with one changeset merged and one open, a run
+that died after the first repository's branch or between the two changesets, an empty changeset skipped in the order, a
+hand-moved story refused while it waits on a changeset; and by `MultiRepoPlanTests`: every validation refusal.
+
+Also covered only by `MultiRepoPipelineTests` (review fixes, 2026-10-13), none exercised live: the merge order when a later
+repository's stories merge first (its changeset pull request is not opened before the earlier one's `changeset-delivered`); a run
+that loaded the plan item before another process moved it to the next repository (the pass's repository is decided under the run
+lock); an item whose linked pull request is in another repository than the run's (escalates; nothing read or merged there); a
+second pass not held by the first one's CI triage, fix-round cap or `gate-passed` (a changeset pull request found merged counts
+only by a `gate-passed` of its own pass naming that head); the plan item carrying the recorded spelling of the pass's repository
+and its primary repository again outside a pass; a plan whose stories are all in its second repository (gated and merged there,
+`merge-files` names it, Stop drafts its pull request); a `plan` checkpoint that no longer reads back (nothing released, claims
+refused); a plan story whose `Repo:` line was edited to the plan's other repository (escalates); and the wording of a CI-trigger
+block or "not configured" refusal on a run that continues a plan whose stories already exist. When P4-AT2 is run live, check on
+the plan item's row that `Repo` is the first `Repo:` line's repository once it is back in `Planned` and in `Watch`, and the
+second repository's only between its changeset pull request opening and merging.
+
+## P4-AT3 (proxy part) — a planner grant over two repositories (sc-25874)
+
+`PlanAcceptanceTests.P4_AT3_a_planner_grant_over_two_repositories_answers_for_each_and_refuses_a_third_project_and_off_list_tools`:
+the production upstream registry and loopback proxy with a planner grant over two repositories; the test plays the planner's MCP
+client itself, so no model is called and nothing is written anywhere.
+
+Prerequisites: a CodeGraph token (`CodeGraph:Token`) and `FACTORY_E2E_P4_PLAN_REPOS=owner/a,owner/b`: two repositories the hosted
+CodeGraph indexes (each project's repository URL exactly `https://github.com/<owner>/<name>`), e.g. SceneWorks and inference;
+CodeGraph must index at least one more project (the "third").
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_P4_PLAN_REPOS=owner/a,owner/b \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4_AT3*"
+```
+
+Expected evidence: `tools/list` shows only planner-profile tools, the six cross-repository ones among them, `search_graph` with a
+`repo` enum of the two repositories; a `search_graph` answer for each repository, labelled with that repository's CodeGraph
+project; and JSON-RPC -32602 for a `project` naming a third indexed project (alone, and against a `repo` of the set), a `repo`
+outside the set, a call naming no repository, and `get_architecture`, `get_service_summary` and `rag_search`.
+
+**Live result (2026-10-13): PASS**, first attempt, with `FACTORY_E2E_P4_PLAN_REPOS=michaeltrefry/dark-factory-sandbox,michaeltrefry/dark-factory-sandbox-2` (both indexed in the hosted CodeGraph).
+
+## P4-AT3 (the refusals) — a cycle, an oversized plan, an unconfigured repository (sc-25877)
+
+Three tests in `PlanAcceptanceTests`, each `factory run` on a real `plan`-labelled story with a throwaway ledger and its own work
+root. In each the code refuses the plan, the item is `Escalated`, and **nothing is created**: no `plan`, `plan-creating`,
+`plan-stories`, `changeset` or `plan-released` row, no `factory/changeset-sc-<id>` pull request, and not one story more in the
+plan story's epic and team on the real board than before the run (the test lists both before and after through the Shortcut
+API; do not add stories there while it runs).
+
+| Test | Variable (a **To Do** story carrying the `plan` label) | What it does | Expected on the ledger |
+| --- | --- | --- | --- |
+| `P4_AT3_a_plan_with_a_dependency_cycle_is_rejected_and_nothing_is_created` | `FACTORY_E2E_P4_CYCLE_STORY` — on the sandbox repo; its text does not matter | the planner is a **stub Claude CLI** (as P2-AT5's stuck worker: `Worker:ClaudePath` = a script the test writes, `Worker:RunAs=none`) that answers a fixed plan — `a` needs `b`, `b` needs `a` — through the production planner seat (real checkout, real proxy grant when CodeGraph/Kanban are configured) | Intake → Plan → Escalated; one `session` row, the stub's, run to its end; one `plan-rejected` row (`gate_rejected`) saying `the stories block each other in a cycle: …`; the escalation reason `The planner's answer is not a valid plan, so no story was created: …` |
+| `P4_AT3_an_oversized_plan_is_rejected_and_nothing_is_created` | `FACTORY_E2E_P4_OVERSIZED_STORY` — likewise | the stub answers a plan of 21 stories (`PlanParser.MaxStories` + 1) | the same, the `plan-rejected` row saying `the plan has 21 stories; at most 20 are allowed` (refused whole, never cut to 20) |
+| `P4_AT3_a_plan_naming_an_unconfigured_repository_escalates_before_any_planner_session_and_nothing_is_created` | `FACTORY_E2E_P4_UNCONFIGURED_STORY` — its description has **one line `Repo: owner/name`** naming a repository the factory is not configured for (not `Factory:DefaultRepo`, not in `Factory:Repos`, not in `GitHub:Watch:Repos`); the repository need not exist | the real, sandboxed set-up; no stub. Since sc-25877 a single unconfigured `Repo:` line is refused like one among several (epic E1) — the single-line form is the one to use here; a story with several lines of which one is unconfigured passes too | Intake → Plan → Escalated; the reason `The plan names 1 repository (owner/name), but owner/name is not configured for this factory (Factory:DefaultRepo, Factory:Repos, GitHub:Watch:Repos: …), so no planner session was started and no story was created. Add it to Factory:Repos (GitHub:Watch:Repos would also turn on the triage of its issues), or remove its Repo: line.`; **no** `session`, `worker-started`, `worker-model-class` or `plan-rejected` row and no `worker_sessions` row; the escalation comment on the story says so. A story naming only configured repositories is INCONCLUSIVE |
+
+Prerequisites: what `factory run` needs (router with an enrolled plan — the usage check runs at start-up even with the stub —
+the Shortcut token, both GitHub Apps, the sandbox set up with CI that runs for `factory/changeset-*` bases: the CI-trigger
+check runs before the planner for the two stub tests). The stub tests run the planner **as the owner** (`Worker:RunAs=none`): the
+only process started is the test's own script, which reads its fixed transcript and writes its own log. Each test leaves its
+story Escalated on the board (In Progress, claimed by the factory, one escalation comment). Read from the code (not confirmed
+at a live run yet), the story need NOT be moved back to To Do before that test runs again: each run has a throwaway ledger, so
+the item is new and is claimed again, and `ShortcutWorkSource.ClaimAsync` accepts a story that is already the factory's — its
+owner and the `factory-claimed` label, which an escalation leaves on it — whatever its state (`ClaimRefusalAsync` asks for To Do
+only of a story the factory does not hold; these tests run with `--ignore-scope`). Each further run adds one more escalation
+comment (the tests look for theirs among them). Moving it back to **To Do** is needed only if someone took the factory off as
+owner or removed the label — the claim is then refused, "the story is no longer in To Do" — and is harmless otherwise. Give
+each test its own story, or run them one at a time on one story (the unconfigured-repository test needs a `Repo:` line the other two must not have).
+**Stop any `factory work` whose watch scope covers those stories first**, as for P4-AT1.
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_P4_CYCLE_STORY=sc-<id> FACTORY_E2E_P4_OVERSIZED_STORY=sc-<id> FACTORY_E2E_P4_UNCONFIGURED_STORY=sc-<id> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4_AT3*"
+```
+
+(The filter also runs the proxy part above, which skips without `FACTORY_E2E_P4_PLAN_REPOS`.)
+
+In-process versions (every `dotnet test`): `PlanPipelineTests.A_planner_answer_that_is_not_a_valid_plan_escalates_the_item_and_creates_no_story`
+(every rule), `A_plan_naming_an_unconfigured_repository_escalates_before_any_session_and_creates_nothing` (several lines),
+`A_plan_whose_single_repo_line_names_an_unconfigured_repository_escalates_before_any_session_and_creates_nothing` (one line), and
+— the live tests' own fixtures — `PlanLiveTests` (the two fixed answers are refused for exactly the reasons above; the stub CLI
+hands its fixed answer to the pipeline as a session's result under a fresh session id).
+
+**Live results (2026-10-13): all three PASS**, first attempt, each on its own story (cycle sc-25917, oversized sc-25919, unconfigured repository sc-25920 with `Repo: michaeltrefry/p4a-live-not-configured`): each left Escalated on the board with one escalation comment carrying the reason above, and nothing created.
+
+## P4-AT5 — a failed story holds its dependents, and Stop on a plan stops its stories (sc-25876)
+
+`PlanFailureAcceptanceTests.P4_AT5_a_failed_story_holds_its_dependent_the_plan_item_says_so_once_and_stop_on_the_plan_stops_its_stories`:
+a fixed plan — A, B that needs A, C and D that need nothing — whose stories the test creates on the real board through the work
+source (no planner, no model, no worker), with a throwaway ledger seeded at `Planned` in the shape production leaves it
+(sc-25877): `plan`, `plan-creating`, then the plan's `changeset` and `changeset-pushed` rows (`factory/changeset-sc-<plan>`;
+only the rows — nothing is pushed to the sandbox), then `plan-stories`. The stories' own progress is seeded in that
+ledger, which is all the plan reads: A Escalated ("seeded by P4-AT5: CI is red"), C in flight (Review), D merged.
+
+Prerequisites: what `factory run` resolves before it starts (the router key, both GitHub Apps' ids and keys, the Shortcut token),
+though no router call is made; the workers' GitHub App installed on the default (sandbox) repo with pull-request read (the stop
+asks GitHub for open pull requests of `factory/sc-<story>` and, for the plan item, of its changeset branch
+`factory/changeset-sc-<plan>`, and finds none — the test checks first that the sandbox has no pull request of that branch); and `FACTORY_E2E_P4_HOLD_STORY=sc-<id>`: any story on
+the sandbox's board (it need not carry the `plan` label and is not planned or worked). The test writes to that story's board: it
+creates four stories `[dark-factory P4-AT5] …` in the Backlog of that story's team and epic, moves three to To Do, comments twice
+on the named story and moves it to the **Backlog** (the stop), moves A and C back to the Backlog with a comment each, and archives
+the four created stories when it ends (best effort). **Stop any `factory work` whose watch scope covers that team or epic first**:
+the released stories are ordinary To Do stories for the minute the test runs.
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_P4_HOLD_STORY=sc-<id> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4_AT5*"
+```
+
+Expected evidence: the first run releases A, C and D (To Do on the board; B in Backlog). After the seeding, three more runs leave
+the item `Planned` with exactly one `plan-held` row `held by a failed story: sc-<A> escalated at …: \`seeded by P4-AT5: CI is red
+…\`; not released because of them: sc-<B> (behind sc-<A>)` (outcome `deferred`), one `plan-notice` row `posted`, no Escalated row
+on the plan item, B still in Backlog, and exactly one new comment on the plan story ("… (plan) is held by a failed story", A, its
+reason, both remedies). `DashboardData` over that ledger shows the plan row with the four stories beneath it in plan order: A
+`Escalated` / `failed: escalated`, B `not released` / `held by sc-<A> (escalated)`, C `Review`, D `Watch`; counts 1 merged, 1 in
+flight, 1 waiting, 1 failed; held, not stuck. `factory stop --item sc-<plan>` (`FactoryRunner.ControlAsync`) answers Ok (exit 0):
+A and C are `Cancelled` with `prs-drafted` and `stop-reported` rows, in Backlog on the board, each commented "… was stopped by
+P4-AT5 (with its plan sc-<plan>)"; D is still `Watch`, uncommented and where it was; B has no ledger item, no comment, and is in
+Backlog; the plan item is `Cancelled` — stopped as a plan with a changeset is: its recorded changeset read back, one `prs-drafted`
+row `none` (its changeset branch has no pull request), one `stop-reported` row — its story in Backlog with one more comment
+listing `Stories stopped with it: sc-<A>, sc-<C>. Already merged (left as they are): sc-<D>. Never started (…): sc-<B>.` and
+ending `It had no open pull request. Branch factory/changeset-sc-<plan> is kept; nothing was merged or deleted.`; its control
+row is gone; `InFlightAsync` lists
+nothing; a second stop writes nothing.
+
+**Live result (2026-10-13): PASS**, first attempt, 13 seconds (hold story sc-25921; the four seeded stories sc-25927 to sc-25930 archived by the test). The same class holds one test that is not live and
+always runs (the fixed plan passes every plan rule).
+
+What the live test does not cover, and the unit tests do (`PlanClassificationTests`, `PlanFailurePipelineTests`,
+`PlanControlsPostgresTests`, `DashboardComponentTests.A_plan_row_shows_…`): a pull request actually turned back into a draft by
+a plan's stop (the seeded stories have none; the unit test's story has one), a story whose run is going when the Stop lands
+(stopped by that run; the plan's stop unfinished, exit 1, finished by the next poll), a stop that fails half way, a story whose
+worker a crashed run left, a workerless run deferring the stop, a Stop that lands while the plan is evaluated (finished by that
+run, or deferred by a workerless one) and `factory stop` on a plan whose own run is active (unfinished, exit 1), a released story
+nobody claimed (moved back to the Backlog with a comment that does not say the factory worked on it), one a person took, finished,
+assigned or archived since its release (nothing written, no ledger item), one moved back to the Backlog (nothing written), a
+story merged outside the factory (left as it is and listed apart), a plan Pause with the usage pause also in force (`user-paused`),
+a plan Pause in the merge queue (`MergeQueueTests.An_idle_story_whose_plan_is_paused_…`), the control read's query count and its
+failing closed, the plan row's `hold comment not posted` note, Pause and Continue on a plan (an in-flight story paused at its
+next tool boundary and resumed in the same session; nothing claimed or released meanwhile), a transitive hold, a stuck plan, a
+story merged outside the factory, a cancelled story, a failed story that is re-run and merges (`plan-resumed`, its dependents
+released), a comment the board refuses (retried, bounded, never posted twice), a story of a stopped plan moved to ready by hand
+(claim refused), and the rendered pipeline page.
 
 ## Upgrading a Phase 1 ledger: items parked at Review
 

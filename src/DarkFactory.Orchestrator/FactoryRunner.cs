@@ -201,10 +201,23 @@ public static class FactoryRunner
         var stuck = options.StuckDetection;
         var maxControlReadFailures = options.MaxControlReadFailures;
 
+        await FactoryWide("the ledger", async () => { await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct); return true; });
+        await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
+        var ledger = new WorkLedger(db, TimeProvider.System);
+        // A plan item waiting on its stories (sc-25871) only reads the ledger and moves stories on the board: its run starts no
+        // worker (a Planned item leaves that state only for Done, for Review once its changeset pull request is opened — sc-25872,
+        // GitHub's API only; the handlers that review it run in a later run, which takes the lock — or a Stop, and a Stop keeps the
+        // lock), so it takes no worker run lock, probes no sandbox and sweeps no worktree — every poll evaluates it.
+        var needsWorker = !await FactoryWide("the ledger", async () =>
+            await RunPipeline.WaitsOnStoriesAsync(ledger, source.Naming, storyId, ct)
+            && await Controls(options).EffectiveAsync(source.Naming.Format(storyId), null, ct) != ControlState.Stopping);
+
         // Sandboxed, the worker user is single-tenant (every helper exit kills all of its processes),
         // so one sandboxed run per machine, taken before anything runs through the helper.
-        using var sandboxLock = sandbox is null ? null : await FactoryWide("the worker run lock", () => Task.FromResult(WorkerLock.Acquire(options.WorkRoot)));
-        if (sandbox is not null)
+        using var sandboxLock = sandbox is null || !needsWorker
+            ? null
+            : await FactoryWide("the worker run lock", () => Task.FromResult(WorkerLock.Acquire(options.WorkRoot)));
+        if (sandbox is not null && needsWorker)
         {
             await EnsureSandboxReadyAsync(sandbox, options.WorkerAuth, options.ClaudePath, ct);
         }
@@ -216,18 +229,17 @@ public static class FactoryRunner
         var gateApp = new GitHubApp(githubHttp, gateAppId, gateAppKey, TimeProvider.System);
         using var reviewerHttp = ReviewerHttp(options);
 
-        await FactoryWide("the ledger", async () => { await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct); return true; });
-        await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
-        var ledger = new WorkLedger(db, TimeProvider.System);
-
         var workspaces = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
             async (repo, c) => (await app.CreateInstallationTokenAsync(repo, c)).Token, sandbox: sandbox);
         // Worktrees no run will resume (left by a killed cleanup or a worker that would not stop).
-        await FactoryWide("the worktree sweep", async () =>
+        if (needsWorker)
         {
-            await workspaces.SweepOrphansAsync((name, c) => RunPipeline.WorktreeIsResumableAsync(ledger, name, c), ct);
-            return true;
-        });
+            await FactoryWide("the worktree sweep", async () =>
+            {
+                await workspaces.SweepOrphansAsync((name, c) => RunPipeline.WorktreeIsResumableAsync(ledger, name, c), ct);
+                return true;
+            });
+        }
 
         var gateGitHub = new GitHubGate(githubHttp, gateApp);
         using var codeGraphHttp = OutboundHttp.CodeGraphApi(options.CodeGraphBaseUrl);
@@ -264,7 +276,13 @@ public static class FactoryRunner
                 FreezeCheckFailures.Process),
             // A looping worker is interrupted at its next tool boundary and its round fails (sc-25388).
             stuck: stuck,
-            maxControlReadFailures: maxControlReadFailures);
+            maxControlReadFailures: maxControlReadFailures,
+            // A plan item's planner session (sc-25870): read-only, in its own throwaway worktree, CodeGraph and Kanban through the proxy.
+            planner: new SandboxPlanRunner(options, sandbox, app, upstreams, log),
+            // The only repositories a plan naming several may name (sc-25874).
+            configuredRepos: options.ConfiguredRepos.Select(RepoRef.Parse).ToList(),
+            // Built without the worker run lock (a waiting plan item): the run does nothing that needs it.
+            workerless: !needsWorker);
 
         return await pipeline.RunAsync(storyId, ct);
     }
@@ -499,6 +517,62 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
             throw new FactoryUnavailableException($"{what}: {ex.Message}", ex);
         }
     }
+}
+
+/// <summary>
+/// Production <see cref="Plans.IPlanRunner"/> (sc-25870, E2): the planner's seat inside an item's run, which already holds the worker run
+/// lock and has checked the sandbox. Confined like the triage worker (<see cref="SandboxTriageRunner"/>): a read-only worker
+/// (<see cref="WorkerTools.ReadOnly"/>: Read, Glob, Grep inside its own worktree, no settings file loaded) in a worktree under its own
+/// root (<see cref="PlanWorktrees"/>, never the items' <c>worktrees</c>) whose owner-side git holds a contents-read token only and which
+/// is not shared with the worker user for writing; and, when an upstream is configured, the loopback MCP proxy this process hosts for
+/// the session, granted exactly <see cref="Mcp.McpProfile.Planner"/> (the allowlisted CodeGraph tools and Kanban read tools) over the
+/// plan's repository set (sc-25874: several repositories give a seat of one checkout each and a grant over them all). The
+/// upstream tokens stay here; the session gets a credential revoked when it ends, in a file (never argv). Sandboxed, the run holds the
+/// worker run lock, so leftovers of a crashed run (plan worktrees, session files) are swept first; unsandboxed
+/// (<c>Worker:RunAs=none</c>, development only) nothing is swept, since another run's may be live.
+/// </summary>
+public sealed class SandboxPlanRunner(FactoryOptions options, WorkerSandbox? sandbox, GitHubApp app, Mcp.McpUpstreams upstreams, TextWriter log)
+    : Plans.IPlanRunner
+{
+    /// <summary>The work root's directory of plan worktrees, apart from the items' <c>worktrees</c> and the triage's.</summary>
+    public const string PlanWorktrees = "plan-worktrees";
+
+    public async Task<T> RunAsync<T>(WorkItem item, IReadOnlyList<RepoRef> repos, Func<Plans.PlannerSeat, CancellationToken, Task<T>> session,
+        CancellationToken ct)
+    {
+        // The token is minted per repository, contents-read only: a seat of several repositories fetches each with its own.
+        var workspaces = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
+            async (r, c) => (await app.CreateInstallationTokenAsync(r, c, Issues.WorkerTriageRunner.TriageWorkspaceToken)).Token, sandbox: sandbox,
+            worktreesDirectory: PlanWorktrees, shareWithWorker: false);
+        var configs = Path.Combine(options.WorkRoot, Mcp.McpProxySessions.DirectoryName);
+        Mcp.McpProxy? started;
+        try
+        {
+            if (sandbox is not null)
+            {
+                // Nothing resumes a planner session: whatever a crashed or unstoppable one left is swept.
+                await workspaces.SweepOrphansAsync((_, _) => Task.FromResult(false), ct);
+                Mcp.McpProxySessions.Sweep(configs);
+            }
+            started = upstreams.All.Count == 0 ? null : await Mcp.McpProxy.StartAsync(upstreams, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new FactoryUnavailableException($"the planner's set-up: {ex.Message}", ex);
+        }
+        await using var proxy = started;
+        var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, options.RouterKey, options.WorkerAuth, options.WorkerTimeout, sandbox,
+            pauseFlagDirectory: options.PauseFlagDirectory, tools: PlannerTools(upstreams, proxy is not null));
+        return await new Plans.WorkerPlanRunner(workspaces, worker, log,
+            proxy is null ? null : new Mcp.McpProxySessions(proxy, configs, sandbox?.User)).RunAsync(item, repos, session, ct);
+    }
+
+    /// <summary>
+    /// The planner's tools: <see cref="WorkerTools.ReadOnly"/>, plus (with the proxy) exactly the planner profile's MCP tools on the
+    /// configured upstreams (<see cref="Mcp.McpProfile.Planner"/>) — its <c>--allowedTools</c> names no other MCP tool.
+    /// </summary>
+    internal static WorkerTools PlannerTools(Mcp.McpUpstreams upstreams, bool proxied) =>
+        proxied ? WorkerTools.ReadOnly.WithMcp(Mcp.McpProfile.Planner.ToolRules(upstreams)) : WorkerTools.ReadOnly;
 }
 
 /// <summary>The intake loop's runner: the production pipeline over the Postgres ledger, for one work source's items.</summary>

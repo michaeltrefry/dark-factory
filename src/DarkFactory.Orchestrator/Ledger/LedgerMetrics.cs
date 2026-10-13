@@ -46,6 +46,14 @@ public sealed record MetricsOptions(IReadOnlyList<string> SandboxRepos, IReadOnl
     public bool Excludes(WorkItem item) =>
         SandboxRepos.Contains(item.Repo, StringComparer.OrdinalIgnoreCase)
         || DemoMarkers.Any(m => item.Title.Contains(m, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// The same for an item with its rows: also a plan item any of whose changesets is in a sandbox repository (sc-25873) — its
+    /// own <see cref="WorkItem.Repo"/> is only one of the repositories it changes, so it alone would let the exclusion depend on
+    /// which one the plan item names first.
+    /// </summary>
+    public bool Excludes(MetricItem item) =>
+        Excludes(item.Item) || Plans.Changeset.All(item.History).Any(c => SandboxRepos.Contains(c.Repo, StringComparer.OrdinalIgnoreCase));
 }
 
 /// <summary>One item as the metrics see it: the item, every ledger row (oldest first) and each worker session's recorded cost.</summary>
@@ -78,8 +86,8 @@ public sealed class LedgerMetrics(IDbContextFactory<LedgerDbContext> contexts, M
 
     public static IReadOnlyList<Metric> Compute(IEnumerable<MetricItem> all, MetricsOptions options)
     {
-        var items = all.Where(i => !options.Excludes(i.Item)).ToList();
-        var merged = items.Select(i => (i, Merge: i.History.FirstOrDefault(e => e.Step is null && e.State == WorkState.Merge))).Where(x => x.Merge is not null).ToList();
+        var items = all.Where(i => !options.Excludes(i)).ToList();
+        var merged = items.Select(i => (i, Merge: MergeOf(i.History))).Where(x => x.Merge is not null).ToList();
         var started = items.Where(i => i.History.Any(e => e.Step is null && e.State == WorkState.Implement)).ToList();
 
         // A merged item's cost is measured only when every one of its worker sessions has a recorded cost.
@@ -102,6 +110,24 @@ public sealed class LedgerMetrics(IDbContextFactory<LedgerDbContext> contexts, M
             new(IntakeToMerge, Mean(merged.Select(m => (m.Merge!.RecordedAt - m.i.Item.CreatedAt).TotalHours).ToList()), MetricUnit.Hours, merged.Count,
                 $"mean from intake to the merge row over {merged.Count} merged item(s)"),
         ];
+    }
+
+    /// <summary>
+    /// The row an item counts as merged at, or null while it does not: its first Merge row — and for a plan item with changesets in
+    /// several repositories (sc-25873), which has a Merge row per changeset pull request, its last one, and only once every
+    /// changeset is delivered (<see cref="Plans.Changeset.Delivered"/>): one repository's merge is not the plan's.
+    /// </summary>
+    internal static LedgerEntry? MergeOf(IReadOnlyList<LedgerEntry> history)
+    {
+        var changesets = Plans.Changeset.All(history);
+        if (changesets.Count <= 1)
+        {
+            return history.FirstOrDefault(e => e.Step is null && e.State == WorkState.Merge);
+        }
+        var delivered = Plans.Changeset.Delivered(history);
+        return changesets.All(c => delivered.Any(d => string.Equals(d.Repo, c.Repo, StringComparison.OrdinalIgnoreCase)))
+            ? history.LastOrDefault(e => e.Step is null && e.State == WorkState.Merge)
+            : null;
     }
 
     private static double? Mean(IReadOnlyList<double> values) => values.Count == 0 ? null : values.Average();

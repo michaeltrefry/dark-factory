@@ -185,6 +185,37 @@ public class FactoryOptionsTests
     }
 
     [Fact]
+    public void Factory_repos_default_to_none_are_read_and_validated_and_turn_on_no_issue_polling()
+    {
+        Assert.Empty(Options([]).Repos);
+        Assert.Equal(["michaeltrefry/dark-factory-sandbox"], Options([]).ConfiguredRepos);
+        var extra = Options(new() { ["Factory:Repos"] = " acme/widgets, acme/gadgets ,ACME/widgets" });
+        Assert.Equal(["acme/widgets", "acme/gadgets"], extra.Repos.Select(r => r.FullName));
+        Assert.Equal(["acme/widgets"], Options(new() { ["Factory:Repos:0"] = "acme/widgets" }).Repos.Select(r => r.FullName));
+        // A repository named there is one the factory plans and works in (and whose main the freeze watches) …
+        Assert.Equal(["michaeltrefry/dark-factory-sandbox", "acme/widgets", "acme/gadgets"], extra.ConfiguredRepos);
+        // … and its issues are not polled: that is GitHub:Watch:Repos alone, so the setting needs no sandboxed triage worker.
+        Assert.Empty(extra.WatchedIssueRepos);
+        Assert.Null(Issues.IssueIntake.UnsandboxedRefusal(sandbox: null, extra.WatchedIssueRepos)); // sandbox: null is Worker:RunAs=none
+        extra.ValidateSettings();
+
+        // The configured repositories are the three settings together, each repository once whatever its case.
+        var all = Options(new()
+        {
+            ["Factory:DefaultRepo"] = "acme/main", ["Factory:Repos"] = "ACME/Main,acme/widgets,acme/both", ["GitHub:Watch:Repos"] = "acme/issues,Acme/Both",
+        });
+        Assert.Equal(["acme/main", "acme/widgets", "acme/both", "acme/issues"], all.ConfiguredRepos);
+        Assert.Equal(["acme/issues", "Acme/Both"], all.WatchedIssueRepos.Select(r => r.FullName));
+
+        // A malformed entry is refused at start-up, naming the key.
+        foreach (var bad in new[] { "acme", "acme/widgets,acme/", "acme/../x", "a/b/c" })
+        {
+            var refused = Assert.Throws<InvalidOperationException>(() => Options(new() { ["Factory:Repos"] = bad }).ValidateSettings());
+            Assert.StartsWith("Factory:Repos: ", refused.Message);
+        }
+    }
+
+    [Fact]
     public void Pause_grace_outlasts_the_longest_tool_call_and_is_validated()
     {
         Assert.Equal(TimeSpan.FromSeconds(660), Options([]).PauseGrace); // a 600 s Bash call (e.g. dotnet test) is never cut off

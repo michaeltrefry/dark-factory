@@ -64,8 +64,75 @@ public sealed class FakeWorkSource(WorkStory story, bool commentFails = false) :
 
     public Task LinkAsync(int id, IReadOnlyList<string> urls, CancellationToken ct) => Write($"link {id} {string.Join(" ", urls)}");
 
-    public Task<IReadOnlyList<int>> CreateChildrenAsync(int parentId, IReadOnlyList<ChildItem> children, CancellationToken ct) =>
-        throw new NotSupportedException();
+    /// <summary>Whether a story labelled <c>plan</c> is planned into children (default: no, like a source that creates none).</summary>
+    public bool PlansItems { get; set; }
+
+    /// <summary>When set, child creation is refused with this reason and nothing is created.</summary>
+    public string? RefuseChildren { get; set; }
+
+    /// <summary>The children created so far, each once (by name and description, like the Shortcut adapter).</summary>
+    public List<(int Id, ChildItem Child)> Children { get; } = [];
+
+    public Task<IReadOnlyList<int>> CreateChildrenAsync(int parentId, IReadOnlyList<ChildItem> children, CancellationToken ct)
+    {
+        if (!PlansItems)
+        {
+            throw new NotSupportedException();
+        }
+        if (RefuseChildren is { } refusal)
+        {
+            throw new ChildrenRefusedException(refusal);
+        }
+        var ids = new List<int>();
+        foreach (var child in children)
+        {
+            if (Children.FirstOrDefault(c => c.Child.Name == child.Name && c.Child.Description == child.Description) is { Id: > 0 } known)
+            {
+                ids.Add(known.Id);
+                continue;
+            }
+            ids.Add(9000 + Children.Count);
+            Children.Add((ids[^1], child));
+            Writes.Add($"child {ids[^1]} of {parentId}");
+        }
+        return Task.FromResult<IReadOnlyList<int>>(ids);
+    }
+
+    /// <summary>Blockers someone related on the board beside the plan's own (story id → the ids blocking it).</summary>
+    public Dictionary<int, List<int>> ExtraBlockers { get; } = [];
+
+    /// <summary>A created child's blockers (its plan's, as created) and any <see cref="ExtraBlockers"/>.</summary>
+    public Task<IReadOnlyList<Blocker>> BlockersAsync(int id, CancellationToken ct)
+    {
+        var blockers = Children.Where(c => c.Id == id).SelectMany(c => c.Child.BlockedBy.Select(b => Children[b].Id))
+            .Concat(ExtraBlockers.GetValueOrDefault(id) ?? []).Distinct().Order().Select(b => new Blocker(b, FinishedOnBoard.Contains(b))).ToList();
+        return Task.FromResult<IReadOnlyList<Blocker>>(blockers);
+    }
+
+    /// <summary>The stories the board shows finished (done, not archived).</summary>
+    public HashSet<int> FinishedOnBoard { get; } = [];
+
+    /// <summary>The children that left the backlog (released, or moved by hand: add one here).</summary>
+    public HashSet<int> OutOfBacklog { get; } = [];
+
+    /// <summary>When set, moving a child to ready throws this (the board is unreachable).</summary>
+    public Exception? MakeReadyFails { get; set; }
+
+    public Task<ReadyResult> MakeReadyAsync(int id, CancellationToken ct)
+    {
+        if (MakeReadyFails is { } fails)
+        {
+            return Task.FromException<ReadyResult>(fails);
+        }
+        if (!OutOfBacklog.Add(id))
+        {
+            return Task.FromResult(ReadyResult.AlreadyLeft);
+        }
+        Writes.Add($"ready {id}");
+        return Task.FromResult(ReadyResult.Moved);
+    }
+
+    public Task<bool> InBacklogAsync(int id, CancellationToken ct) => Task.FromResult(Children.Any(c => c.Id == id) && !OutOfBacklog.Contains(id));
 
     private Task Write(string write)
     {

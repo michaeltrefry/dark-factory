@@ -1,5 +1,7 @@
+using DarkFactory.Orchestrator.WorkSources;
 using System.Globalization;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
@@ -149,7 +151,12 @@ public sealed record FreezeStatus(bool Frozen, string? Trigger, string? Detail)
 /// What the merge gate recorded about a merge before making it (<see cref="RunPipeline.Steps.MergeFiles"/>): the PR's base branch
 /// and the files its diff changes, which the freeze's hot-file and main-red triggers read.
 /// </summary>
-public sealed record MergeFiles(string Base, IReadOnlyList<string> Files)
+/// <param name="Repo">
+/// The repository merged into, when it may not be the item's own later (sc-25873): a plan item of several repositories merges one
+/// changeset per repository, and its <see cref="WorkItem.Repo"/> is the one it is working in now. Null for every other merge: the item's.
+/// </param>
+public sealed record MergeFiles(string Base, IReadOnlyList<string> Files,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Repo = null)
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
@@ -413,8 +420,11 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
             .Where(e => e.Step == RunPipeline.Steps.MergeFiles && ids.Contains(e.WorkItemId))
             .OrderBy(e => e.Id)
             .ToListAsync(ct);
-        return merges.Select(m => new Merge(m, names.TryGetValue(m.WorkItemId, out var n) ? n.Repo : "",
-                MergeFiles.FromDetail(recorded.LastOrDefault(r => r.WorkItemId == m.WorkItemId && r.Id < m.Id)?.Detail)))
+        return merges.Select(m =>
+            {
+                var files = MergeFiles.FromDetail(recorded.LastOrDefault(r => r.WorkItemId == m.WorkItemId && r.Id < m.Id)?.Detail);
+                return new Merge(m, files?.Repo ?? (names.TryGetValue(m.WorkItemId, out var n) ? n.Repo : ""), files);
+            })
             .ToList();
     }
 
@@ -422,17 +432,26 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
         Dictionary<long, (string ExternalId, string Repo, WorkState State)> names, CancellationToken ct)
     {
         var from = time.GetUtcNow() - options.HotFileWindow;
-        var merges = (await MergesAsync(db, transitions, names, ct)).Where(m => m.Row.RecordedAt >= from && m.Files is not null).ToList();
+        // Only merges into a branch that is not a plan's changeset branch count (sc-25877, as main-red already reads): the trigger
+        // means what it meant before plans — factory merges changing one file of a default branch. A plan's stories build on one
+        // another on its changeset branch, so several of them changing one file there is the plan working as designed, not the
+        // factory fighting itself; the changeset's own merge into the default branch counts, with every file of the changeset.
+        var merges = (await MergesAsync(db, transitions, names, ct))
+            .Where(m => m.Row.RecordedAt >= from && m.Files is not null && !ItemNaming.IsChangesetBranch(m.Files.Base)).ToList();
         var hot = merges
-            .SelectMany(m => m.Files!.Files.Distinct(StringComparer.Ordinal).Select(f => (m.Repo, File: f, Merge: m)))
-            .GroupBy(x => (x.Repo, x.File))
+            .SelectMany(m => m.Files!.Files.Distinct(StringComparer.Ordinal).Select(f => (m.Repo, m.Files.Base, File: f, Merge: m)))
+            // Per base branch: merges into different branches of a repository are not merges of one file.
+            // A repository is one whatever case an item's `Repo:` line spells it in (GitHub's names are case-insensitive): the key
+            // is lower-cased, the first merge's spelling is shown.
+            .GroupBy(x => (Repo: x.Repo.ToLowerInvariant(), x.Base, x.File))
             .Where(g => g.Count() >= options.HotFileMerges)
             .OrderByDescending(g => g.Count()).ThenBy(g => g.Key.Repo, StringComparer.Ordinal).ThenBy(g => g.Key.File, StringComparer.Ordinal)
+            .ThenBy(g => g.Key.Base, StringComparer.Ordinal)
             .FirstOrDefault();
         return hot is null
             ? null
             : new Hit(FreezeTrigger.HotFile,
-                $"{hot.Key.File} on {hot.Key.Repo} was changed by {hot.Count()} factory merges within {Hours(options.HotFileWindow)} "
+                $"{hot.Key.File} on {hot.First().Repo} was changed by {hot.Count()} factory merges within {Hours(options.HotFileWindow)} "
                 + $"({string.Join(", ", hot.Select(x => $"{Name(names, x.Merge.Row.WorkItemId)} as {Ci.Short(x.Merge.Row.Detail ?? "?")}"))}); "
                 + $"threshold {options.HotFileMerges}");
     }
@@ -451,7 +470,8 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
             var transitions = rows[id].ToList();
             // The round starts where the item entered Implement, not where a pause returned it there ("unpaused"): a resumed
             // session keeps its original start, which would fall outside a round begun at the return.
-            var implement = transitions.FindLastIndex(e => e.State == WorkState.Implement && e.Detail != "unpaused");
+            // A plan item's changeset pull request has no Implement (sc-25872): its rounds start where it last waited on its stories.
+            var implement = transitions.FindLastIndex(e => TransitionContext.StartsAttempt(e.State) && e.Detail != "unpaused");
             if (implement < 0)
             {
                 continue;
@@ -507,7 +527,12 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
         current.UnionWith(names.Values.Where(n => !Lifecycle.IsTerminal(n.State)).Select(n => n.Repo));
         var allMerges = await db.LedgerEntries.AsNoTracking().Where(e => e.Step == null && e.State == WorkState.Merge).OrderBy(e => e.Id).ToListAsync(ct);
         return (await MergesAsync(db, allMerges, names, ct))
-            .Where(m => m.Files is not null && m.Row.Detail is not null && m.Repo.Length > 0 && current.Contains(m.Repo))
+            // Main-red is about the branches the factory's changes end up on. A plan's changeset branch (sc-25872) is not one: red
+            // there freezes nothing — the next story's CI triage sees a base that is red and escalates that story, and the
+            // changeset's own pull request needs green CI on its head before the gate merges it into the default branch. Left out
+            // before the latest merge is picked, so a story merging into a changeset never hides the default branch's state.
+            .Where(m => m.Files is not null && m.Row.Detail is not null && m.Repo.Length > 0 && current.Contains(m.Repo)
+                && !ItemNaming.IsChangesetBranch(m.Files.Base))
             .GroupBy(m => m.Repo, StringComparer.OrdinalIgnoreCase)
             .Select(g => g.MaxBy(m => m.Row.Id)!)
             .OrderBy(m => m.Row.Id)

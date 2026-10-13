@@ -27,9 +27,15 @@ public class McpProxyTests
         + "- **R Service** [csharp] (indexed: 2026-10-03)\n  Repo: https://github.com/O/R.git\n"
         + "- **Other** [csharp] (indexed: 2026-10-03)\n  Repo: https://github.com/someone/else\n";
 
+    /// <summary>CodeGraph tools no session is ever listed or forwarded: model output (stored or live), embeddings, memory, writes, external hubs.</summary>
+    private static readonly string[] OffEveryList =
+        ["ask", "project_report", "rag_search", "memory_store", "store_memory_v2", "codegraph_search", "get_architecture", "get_service_summary",
+            "get_project_health", "get_fleet_health", "search_conventions", "list_conventions", "get_convention", "list_projects", "get_graph_schema",
+            "request_overlay", "get_overlay_status", "stories-search", "list_schemas", "get_schema_catalog"];
+
     /// <summary>CodeGraph's tools as its server lists them: the allowlist plus model-running and other tools no session may see.</summary>
     private static readonly string[] CodeGraphListed =
-        [.. ReviewTools.CodeGraphTools, "ask", "project_report", "rag_search", "search_projects", "memory_store", "codegraph_search"];
+        [.. McpServers.CodeGraphTools, .. OffEveryList];
 
     /// <summary>Kanban's tools as KanbanBoard lists them: its read tools and its write tools.</summary>
     private static readonly string[] KanbanListed =
@@ -111,7 +117,7 @@ public class McpProxyTests
         Assert.StartsWith("kanban get_board", kanban); // Kanban is not CodeGraph: no commit label
         // The tool descriptions say so too.
         var (_, list) = await Rpc(proxy, McpServers.CodeGraph, grant.Credential, "tools/list");
-        Assert.All(list!["result"]!["tools"]!.AsArray(),
+        Assert.All(list!["result"]!["tools"]!.AsArray().Where(t => !PlannerCodeGraph.Global(t!["name"]!.GetValue<string>())),
             t => Assert.Contains("each answer starts with the commit of that index it describes", t!["description"]!.GetValue<string>()));
     }
 
@@ -132,7 +138,7 @@ public class McpProxyTests
         Assert.NotNull(init!["result"]!["capabilities"]!["tools"]);
 
         var (_, list) = await Rpc(proxy, McpServers.CodeGraph, grant.Credential, "tools/list");
-        Assert.Equal(ReviewTools.CodeGraphTools.Order(), Listed(list!).Order());
+        Assert.Equal(McpServers.CodeGraphTools.Order(), Listed(list!).Order());
         // No listed tool takes a project: the proxy pins it.
         Assert.All(list!["result"]!["tools"]!.AsArray(), t => Assert.Null(t!["inputSchema"]!["properties"]?["project"]));
 
@@ -160,7 +166,13 @@ public class McpProxyTests
     [InlineData("ask")]
     [InlineData("project_report")]
     [InlineData("rag_search")]
-    [InlineData("search_projects")]
+    [InlineData("get_architecture")]
+    [InlineData("get_service_summary")]
+    [InlineData("get_project_health")]
+    [InlineData("search_conventions")]
+    [InlineData("list_projects")]
+    [InlineData("request_overlay")]
+    [InlineData("stories-search")]
     [InlineData("memory_store")]
     [InlineData("codegraph_search")]
     [InlineData("Analyze_Impact")]
@@ -482,9 +494,12 @@ public class McpProxyTests
         Assert.Equal([McpServers.CodeGraph], JsonNode.Parse(grant.McpConfigJson())!["mcpServers"]!.AsObject().Select(s => s.Key));
         Assert.Equal(triageTools.Select(t => $"mcp__codegraph__{t}"), McpProfile.Triage.ToolRules(upstreams));
         Assert.Equal(triageTools.Order(), Listed((await Rpc(proxy, McpServers.CodeGraph, grant.Credential, "tools/list")).Body!).Order());
-        foreach (var crossProject in new[] { "analyze_impact", "trace_call_path", "find_consumers", "find_publishers" })
+        // Nor any of the planner's cross-repository tools (sc-25874), whatever arguments it sends.
+        string[] offProfile = ["analyze_impact", "trace_call_path", "find_consumers", "find_publishers", .. PlannerCodeGraph.Tools];
+        foreach (var crossProject in offProfile)
         {
-            var (_, body) = await Call(proxy, McpServers.CodeGraph, grant.Credential, crossProject, new JsonObject { ["name"] = "X" });
+            var (_, body) = await Call(proxy, McpServers.CodeGraph, grant.Credential, crossProject,
+                new JsonObject { ["name"] = "X", ["path"] = "src/a.cs", ["modelName"] = "M", ["clusterId"] = 1 });
             Assert.Equal(McpProxy.InvalidParams, body!["error"]!["code"]!.GetValue<int>());
         }
         Assert.Empty(codeGraph.Calls); // nothing forwarded, not even the project lookup
@@ -500,6 +515,13 @@ public class McpProxyTests
         // The planner profile (Phase 4) keeps every allowlisted tool of both.
         using var planner = proxy.Grant(Repo, McpProfile.Planner);
         Assert.Equal(McpServers.AllToolRules, planner.ToolRules);
+        // The production planner's --allowedTools (sc-25870): read-only and confined, plus exactly the profile's tools on the configured upstreams.
+        var plannerTools = SandboxPlanRunner.PlannerTools(upstreams, proxied: true);
+        Assert.True(plannerTools.IsReadOnly);
+        Assert.Equal(McpServers.AllToolRules, plannerTools.McpAllowed);
+        Assert.Empty(SandboxPlanRunner.PlannerTools(upstreams, proxied: false).McpAllowed);
+        Assert.Equal(McpServers.CodeGraphTools.Select(t => $"mcp__codegraph__{t}"),
+            SandboxPlanRunner.PlannerTools(Upstreams(codeGraph, null), proxied: true).McpAllowed);
     }
 
     [Fact]
@@ -611,26 +633,30 @@ public class McpProxyTests
     public void Each_upstream_has_one_read_only_allowlist_shared_by_the_proxy_and_the_reviewers()
     {
         var codeGraph = new CodeGraphMcpClient(new HttpClient(), "t");
-        Assert.Same(ReviewTools.CodeGraphTools, codeGraph.Upstream.Allowlist);
+        // CodeGraph's: the reviewers' seven, then the planner's cross-repository six (sc-25874).
+        Assert.Same(McpServers.CodeGraphTools, codeGraph.Upstream.Allowlist);
+        Assert.Equal([.. ReviewTools.CodeGraphTools, .. PlannerCodeGraph.Tools], McpServers.CodeGraphTools);
         Assert.True(codeGraph.Upstream.RepoScoped);
         Assert.Equal(["list_projects", "get_board", "list_epics", "get_epic", "list_epic_documents", "get_epic_document", "list_work_items",
             "list_epic_work_items", "get_issues", "get_work_item", "search_work_items"], McpServers.KanbanTools);
         Assert.DoesNotContain(McpServers.KanbanTools, t => t.StartsWith("create_") || t.StartsWith("update_") || t.StartsWith("delete_")
             || t.StartsWith("move_") || (t.StartsWith("add_") && t.EndsWith("_comment")));
-        Assert.Equal(ReviewTools.CodeGraphTools.Count + McpServers.KanbanTools.Count, McpServers.AllToolRules.Count);
+        Assert.Equal(McpServers.CodeGraphTools.Count + McpServers.KanbanTools.Count, McpServers.AllToolRules.Count);
     }
 
     /// <summary>A triage checkout that is a fixed local directory (left in place, so the test can read it after the run).</summary>
     private sealed class DirWorkspaces(string dir) : Git.IRepoWorkspace
     {
-        public Task<Git.Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct) =>
+        public Task<Git.Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) =>
             Task.FromResult(new Git.Workspace(dir, branch, "main", Path.Combine(dir, ".admin")));
         public Task RemoveAsync(RepoRef repo, Git.Workspace workspace, CancellationToken ct) => Task.CompletedTask;
         public Task<bool> CommitAndPushAsync(RepoRef repo, Git.Workspace workspace, string message, PushGrant grant, CancellationToken ct) =>
             throw new NotSupportedException();
         public Task PushAsync(RepoRef repo, Git.Workspace workspace, CancellationToken ct) => throw new NotSupportedException();
-        public Task<Git.Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct) => throw new NotSupportedException();
-        public Task<Git.Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct) => throw new NotSupportedException();
+        public Task<Git.Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) => throw new NotSupportedException();
+        public Task<Git.Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) => throw new NotSupportedException();
+        public Task<Git.BranchStart> BranchStartAsync(RepoRef repo, string branch, CancellationToken ct) => throw new NotSupportedException();
+        public Task<string> CreateBranchAsync(RepoRef repo, string branch, string sha, CancellationToken ct) => throw new NotSupportedException();
         public Task<string> HeadAsync(Git.Workspace workspace, CancellationToken ct) => throw new NotSupportedException();
         public Task<BaseMerge> MergeBaseAsync(RepoRef repo, Git.Workspace workspace, CancellationToken ct) => throw new NotSupportedException();
         public Task<IReadOnlyList<string>> ConflictMarkersAsync(RepoRef repo, string sha, IReadOnlyList<string> paths, CancellationToken ct) =>

@@ -34,6 +34,9 @@ public interface IItemStops
 /// second, and the intake loop resumes a user-paused item once nothing pauses it. Stop marks each non-terminal
 /// item in the scope Stopping, then stops it at once if no run holds it (with <paramref name="stops"/>); a running
 /// item is stopped by its own run. Without <paramref name="stops"/> the next run or poll of the item stops it.
+/// A plan item's scope (sc-25876) is its own <c>item:&lt;id&gt;</c>, and reaches its stories: Pause and Continue through
+/// <see cref="IControls.EffectiveAsync"/>, Stop through <see cref="ItemStopper"/>, which stops the plan's unfinished stories before the
+/// plan item and leaves the stop unfinished (not <see cref="ControlResult.Ok"/>) while one of them is still running.
 /// At epic scope, active items the ledger has no epic for (recorded before epics were) are looked up on the board
 /// (<paramref name="source"/>) and their epic recorded under their run lock (<paramref name="locks"/>); any that
 /// cannot be resolved are reported, never silently skipped (E10).
@@ -55,7 +58,9 @@ public sealed class ControlActions(
         var message = $"{scope} paused: nothing new starts there, and running workers stop at their next tool call.";
         if (ControlScope.EpicOf(scope) is not { } epic)
         {
-            return new ControlResult(true, message);
+            return new ControlResult(true, ControlScope.ItemOf(scope) is { } item && await IsPlanAsync(item, ct)
+                ? $"{message} {item} is a plan: none of its stories is released or claimed, and those in flight pause too, until it is continued."
+                : message);
         }
         var resolved = await ResolveUnknownEpicsAsync(epic, ct);
         // A running item's run watches the epic it read when it started, so one recorded only now is not paused by this.
@@ -160,6 +165,18 @@ public sealed class ControlActions(
             return new ControlResult(true, $"{scope}: no active items to stop.");
         }
         return new ControlResult(ok, string.Join('\n', results));
+    }
+
+    /// <summary>
+    /// Whether the item is a plan item whose stories are on the board (sc-25876: its ledger has a <c>plan-stories</c> row): a control
+    /// on it applies to those stories too (<see cref="IControls.EffectiveAsync"/>), and its Stop stops them (<see cref="ItemStopper"/>).
+    /// </summary>
+    private async Task<bool> IsPlanAsync(ItemRef item, CancellationToken ct)
+    {
+        await using var db = await contexts.CreateDbContextAsync(ct);
+        var id = item.ToString();
+        return await db.LedgerEntries.AsNoTracking().AnyAsync(e => e.Step == RunPipeline.Steps.PlanStories
+            && db.WorkItems.Any(i => i.Id == e.WorkItemId && i.ExternalId == id && i.Source == item.Naming.Source), ct);
     }
 
     /// <summary>The usage pause is set by the factory itself (<see cref="UsagePause"/>); a user may only lift it early.</summary>

@@ -6,9 +6,11 @@ namespace DarkFactory.Orchestrator.Gate;
 /// <summary>
 /// A pull request as the gate sees it, read fresh from GitHub. <see cref="ChangedFiles"/>: GitHub's <c>changed_files</c>
 /// (null when not read), which the gate holds the diff's file count to so a diff missing files cannot pass.
+/// <see cref="DefaultBranch"/>: the base repository's default branch as the same answer names it (null when it names none), which
+/// an item of no plan must target (sc-25872).
 /// </summary>
 public sealed record PullFacts(int Number, string HtmlUrl, bool Open, bool Merged, bool Draft, string HeadSha, string BaseRef, string BaseSha,
-    string? MergeCommitSha, int? ChangedFiles = null);
+    string? MergeCommitSha, int? ChangedFiles = null, string? DefaultBranch = null);
 
 /// <summary>
 /// One CI check of a commit: a check run, or a commit status mapped onto the same shape. <see cref="Id"/>: the check run's id
@@ -158,15 +160,25 @@ public enum GateOutcome
 /// </summary>
 public sealed record GateDecision(GateOutcome Outcome, string HeadSha, IReadOnlyList<string> Reasons, string? Inputs = null)
 {
-    public string Detail => $"{Outcome} {Ci.Short(HeadSha)}: {string.Join("; ", Reasons)}{(Inputs is null ? "" : $" | {Inputs}")}";
+    /// <summary>The pull request was judged as a plan's changeset (<see cref="ChangeFacts.Changeset"/>): an input fact, recorded with the decision.</summary>
+    public bool Changeset { get; init; }
+
+    /// <summary>How <see cref="Detail"/> marks a decision on a changeset pull request, after the head.</summary>
+    public const string ChangesetMark = " (changeset pull request)";
+
+    public string Detail =>
+        $"{Outcome} {Ci.Short(HeadSha)}{(Changeset ? ChangesetMark : "")}: {string.Join("; ", Reasons)}{(Inputs is null ? "" : $" | {Inputs}")}";
 }
 
 /// <summary>
 /// The change the gate judges, read for this evaluation: the unified diff of the candidate head against the base
 /// (<see cref="Diff"/>, or <see cref="DiffError"/> when it could not be read) and the fix rounds the ledger records since
-/// the last Implement.
+/// the last Implement. <see cref="Changeset"/>: the pull request is a plan's changeset pull request (sc-25873) — the ledger's fact
+/// (the item is a plan item whose recorded changeset branch is the pull request's head), never a reading of the branch's name, which
+/// an adopted or worker-chosen name could imitate. It only selects which size limits <c>risk-threshold</c> applies
+/// (<see cref="RiskThreshold.LinesLimit"/>); no check is skipped for it.
 /// </summary>
-public sealed record ChangeFacts(string? Diff, string? DiffError, int FixRounds);
+public sealed record ChangeFacts(string? Diff, string? DiffError, int FixRounds, bool Changeset = false);
 
 /// <summary>
 /// The merge gate (E1): deterministic code over facts read fresh for this evaluation — the policy text from the base
@@ -197,7 +209,11 @@ public static class MergeGate
     /// nothing else blocks is <see cref="GateOutcome.Pending"/> (never Merge) until it is evaluated again with the inputs.
     /// </param>
     public static GateDecision Evaluate(string? policyText, string? policyError, PullFacts pull, ChangeFacts change, CiFacts ci,
-        IReadOnlyList<ReviewVerdict> verdicts, NewTestsResult? newTests = null, CodeGraphRisk? risk = null, bool riskUnread = false)
+        IReadOnlyList<ReviewVerdict> verdicts, NewTestsResult? newTests = null, CodeGraphRisk? risk = null, bool riskUnread = false) =>
+        Decide(policyText, policyError, pull, change, ci, verdicts, newTests, risk, riskUnread) with { Changeset = change.Changeset };
+
+    private static GateDecision Decide(string? policyText, string? policyError, PullFacts pull, ChangeFacts change, CiFacts ci,
+        IReadOnlyList<ReviewVerdict> verdicts, NewTestsResult? newTests, CodeGraphRisk? risk, bool riskUnread)
     {
         var head = pull.HeadSha;
         var reasons = new List<string>();
@@ -288,21 +304,29 @@ public static class MergeGate
             reasons.Add(why);
         }
 
-        // risk-threshold — diff size, fix rounds and CodeGraph's inputs (sc-25709), when a touched tier requires it.
+        // risk-threshold — diff size (a changeset pull request against the policy's changeset limits when it has them, sc-25873),
+        // fix rounds and CodeGraph's inputs (sc-25709), when a touched tier requires it.
         var riskRequired = classified.Requires(GateChecks.RiskThreshold) && !GateCheckSeam.Off(GateChecks.RiskThreshold);
         var pending = new List<string>();
         var (limit, limitBy) = BlastRadiusLimit(policy.Risk);
         var unread = riskRequired && risk is null && riskUnread;
+        var (maxLines, linesKey) = policy.Risk.LinesLimit(change.Changeset);
+        var (maxFiles, filesKey) = policy.Risk.FilesLimit(change.Changeset);
+        // Which limit judged a changeset pull request, said with it: its own, or the ordinary one where the policy has no other.
+        var sized = !change.Changeset ? ""
+            : policy.Risk.MaxChangesetLines is null
+                ? " (a changeset pull request, held to the ordinary limits: this policy's version has no max_changeset_lines/max_changeset_files)"
+                : " (a changeset pull request)";
         if (riskRequired)
         {
             var threshold = policy.Risk;
-            if (classified.ChangedLines > threshold.MaxChangedLines)
+            if (classified.ChangedLines > maxLines)
             {
-                reasons.Add($"risk threshold: {classified.ChangedLines} changed lines exceed max_changed_lines {threshold.MaxChangedLines}");
+                reasons.Add($"risk threshold: {classified.ChangedLines} changed lines exceed {linesKey} {maxLines}{sized}");
             }
-            if (classified.ChangedFiles > threshold.MaxChangedFiles)
+            if (classified.ChangedFiles > maxFiles)
             {
-                reasons.Add($"risk threshold: {classified.ChangedFiles} changed files exceed max_changed_files {threshold.MaxChangedFiles}");
+                reasons.Add($"risk threshold: {classified.ChangedFiles} changed files exceed {filesKey} {maxFiles}{sized}");
             }
             if (change.FixRounds > threshold.MaxFixRounds)
             {
@@ -374,7 +398,10 @@ public static class MergeGate
         {
             var worst = risk!.Worst;
             var hottest = risk.Hottest;
-            passed.Add($"risk within threshold ({classified.ChangedLines} changed lines, {classified.ChangedFiles} files, {change.FixRounds} fix rounds, "
+            var size = change.Changeset
+                ? $"{classified.ChangedLines} changed lines within {linesKey} {maxLines}, {classified.ChangedFiles} files within {filesKey} {maxFiles}"
+                : $"{classified.ChangedLines} changed lines, {classified.ChangedFiles} files";
+            passed.Add($"risk within threshold ({size}, {change.FixRounds} fix rounds, "
                 + $"worst blast radius {(worst is null ? "none (no file)" : $"{BlastRadii.Name(worst.Radius)} ({worst.Path})")}, "
                 + $"highest hotspot score {(hottest is null ? "none (no file)" : $"{CodeGraphRisk.Score(hottest.Score)} ({hottest.Path})")}"
                 + $"{(policy.Risk.MaxHotspot is { } max ? $" within max_hotspot {CodeGraphRisk.Score(max)}" : ", max_hotspot off")})");

@@ -205,4 +205,109 @@ public class ShortcutWorkSourceTests
         Assert.Single(board.Links);
         Assert.Contains(board.Requests, r => r.PathAndQuery == "/api/v3/epics/77/stories");
     }
+
+    [Fact]
+    public async Task A_child_is_found_again_by_its_idempotency_key_whatever_the_board_did_to_its_description_and_never_by_name_alone()
+    {
+        var board = new FakeShortcutBoard();
+        board.Add(500, FakeShortcutBoard.FactoryTeam);
+        board.Add(501, FakeShortcutBoard.FactoryTeam, name: "child 1"); // someone else's story of that name
+        var source = new ShortcutWorkSource(board.Client(), "tok", Team);
+
+        var first = await source.CreateChildrenAsync(500, Plan, CancellationToken.None);
+
+        Assert.DoesNotContain(501, first);
+        Assert.Equal(2, Named(board, "child 1").Count);
+        // sc-25877: each story is created with the child's code-written key as its external id, the same on every attempt.
+        var creates = board.Requests.Where(r => r.Method == HttpMethod.Post && r.PathAndQuery == "/api/v3/stories")
+            .Select(r => (string?)JsonNode.Parse(r.Body!)!["external_id"]).ToList();
+        Assert.Equal([Plan[0].Key("sc-500"), Plan[1].Key("sc-500")], creates);
+        Assert.Equal(Plan[0].Key("sc-500"), (string?)board.Story(first[0])["external_id"]);
+
+        // A board that returns the Markdown description normalised — re-wrapped, re-escaped, anything — still shows the child:
+        // nothing is created a second time.
+        ChildItem[] lines = [new("lines", "<!-- marker -->\nRepo: o/r\n\n~~~\nFirst.\nSecond.\n~~~", "chore", [])];
+        var created = Assert.Single(await source.CreateChildrenAsync(500, lines, CancellationToken.None));
+        board.Story(created)["description"] = "Repo: o/r\n\n```\nFirst. Second.\n```\n";
+        foreach (var id in first)
+        {
+            board.Story(id)["description"] = "rewritten by the board";
+        }
+        var posts = board.Requests.Count(r => r.Method == HttpMethod.Post);
+
+        Assert.Equal([created], await source.CreateChildrenAsync(500, lines, CancellationToken.None));
+        Assert.Equal(first, await source.CreateChildrenAsync(500, Plan, CancellationToken.None));
+        Assert.Equal(posts, board.Requests.Count(r => r.Method == HttpMethod.Post));
+        Assert.Single(board.Links);
+    }
+
+    [Fact]
+    public async Task A_story_with_a_childs_name_and_description_but_another_external_id_is_not_the_child()
+    {
+        var board = new FakeShortcutBoard();
+        board.Add(500, FakeShortcutBoard.FactoryTeam);
+        // The same plan text created under another parent (or anything else that carries an id of its own): never this call's.
+        board.Add(501, FakeShortcutBoard.FactoryTeam, state: FakeShortcutBoard.Backlog, name: "child 1");
+        board.Story(501)["description"] = "First.";
+        board.Story(501)["external_id"] = Plan[0].Key("sc-499");
+        var source = new ShortcutWorkSource(board.Client(), "tok", Team);
+
+        var ids = await source.CreateChildrenAsync(500, Plan, CancellationToken.None);
+
+        Assert.DoesNotContain(501, ids);
+        Assert.Equal(2, Named(board, "child 1").Count);
+        Assert.DoesNotContain(board.Links, l => (int)l["subject_id"]! == 501);
+    }
+
+    [Fact]
+    public async Task A_child_created_before_stories_carried_a_key_is_still_found_by_name_and_description_together()
+    {
+        var board = new FakeShortcutBoard();
+        board.Add(500, FakeShortcutBoard.FactoryTeam);
+        var source = new ShortcutWorkSource(board.Client(), "tok", Team);
+        ChildItem[] lines = [new("lines", "First.\nSecond.", "chore", [])];
+        var created = Assert.Single(await source.CreateChildrenAsync(500, lines, CancellationToken.None));
+        // As an earlier version of the factory left it: no external id; the board stored other line endings and outer whitespace.
+        board.Story(created)["external_id"] = null;
+        board.Story(created)["description"] = "First.\r\nSecond.\n";
+        var posts = board.Requests.Count(r => r.Method == HttpMethod.Post);
+
+        Assert.Equal([created], await source.CreateChildrenAsync(500, lines, CancellationToken.None));
+        Assert.Equal(posts, board.Requests.Count(r => r.Method == HttpMethod.Post));
+
+        // Without a key the description decides: a changed one is not the child, and the child is created (with its key).
+        board.Story(created)["description"] = "Something else.";
+        var second = Assert.Single(await source.CreateChildrenAsync(500, lines, CancellationToken.None));
+        Assert.NotEqual(created, second);
+        Assert.Equal(lines[0].Key("sc-500"), (string?)board.Story(second)["external_id"]);
+    }
+
+    [Fact]
+    public void A_childs_idempotency_key_is_the_same_on_every_attempt_and_differs_with_the_parent_the_name_or_the_description()
+    {
+        var child = new ChildItem("child 1", "First.", "chore", []);
+
+        Assert.Equal(child.Key("sc-500"), new ChildItem("child 1", "First.", "bug", [0]).Key("sc-500")); // type and blockers are not identity
+        Assert.Matches("^dark-factory:child:sc-500:[0-9a-f]{64}$", child.Key("sc-500"));
+        Assert.NotEqual(child.Key("sc-500"), child.Key("sc-501"));
+        Assert.NotEqual(child.Key("sc-500"), (child with { Name = "child 2" }).Key("sc-500"));
+        Assert.NotEqual(child.Key("sc-500"), (child with { Description = "First" }).Key("sc-500"));
+        // Where the name ends is part of the key: the same characters split differently are another child.
+        Assert.NotEqual(new ChildItem("ab", "c", "chore", []).Key("sc-1"), new ChildItem("a", "bc", "chore", []).Key("sc-1"));
+    }
+
+    [Fact]
+    public async Task Children_of_a_story_with_neither_an_epic_nor_a_team_are_refused_before_any_write()
+    {
+        var board = new FakeShortcutBoard();
+        board.Add(500, FakeShortcutBoard.FactoryTeam);
+        board.Story(500)["group_id"] = null;
+        var source = new ShortcutWorkSource(board.Client(), "tok", Team);
+
+        var ex = await Assert.ThrowsAsync<ChildrenRefusedException>(() => source.CreateChildrenAsync(500, Plan, CancellationToken.None));
+
+        Assert.Contains("sc-500 has neither an epic nor a team", ex.Message);
+        Assert.DoesNotContain(board.Requests, r => r.Method != HttpMethod.Get);
+        Assert.Single(board.Stories);
+    }
 }

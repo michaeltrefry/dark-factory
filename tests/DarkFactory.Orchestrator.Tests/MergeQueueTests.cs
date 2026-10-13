@@ -162,6 +162,8 @@ public class MergeQueueTests
 
         public Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct) => Task.FromResult<string?>(PolicyText);
 
+        public Task<RepoWorkflows> GetWorkflowsAsync(RepoRef repo, CancellationToken ct) => Task.FromResult(new RepoWorkflows("main", TestPolicies.Workflows));
+
         public Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct)
         {
             Call($"ci {sha}");
@@ -203,7 +205,7 @@ public class MergeQueueTests
 
         private static Workspace Ws(string branch) => new($"/wt/{branch}", branch, "main", $"/clone/.git/worktrees/{branch}");
 
-        public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct)
+        public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null)
         {
             lock (_gate)
             {
@@ -212,7 +214,7 @@ public class MergeQueueTests
             }
         }
 
-        public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct)
+        public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null)
         {
             lock (_gate)
             {
@@ -223,13 +225,17 @@ public class MergeQueueTests
             }
         }
 
-        public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct)
+        public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null)
         {
             lock (_gate)
             {
                 return Task.FromResult(_local.ContainsKey(branch) ? Ws(branch) : null);
             }
         }
+
+        // This repository has one branch to merge into (a plan's changeset branch: ChangesetPipelineTests.BranchRepo).
+        public Task<BranchStart> BranchStartAsync(RepoRef repo, string branch, CancellationToken ct) => throw new NotSupportedException();
+        public Task<string> CreateBranchAsync(RepoRef repo, string branch, string sha, CancellationToken ct) => throw new NotSupportedException();
 
         public Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, PushGrant grant, CancellationToken ct)
         {
@@ -436,6 +442,9 @@ public class MergeQueueTests
                 controls: Controls, gate: new GateStage(Repo, Reviewer, CiPoll, TimeSpan.FromSeconds(30), Risk: FakeCodeGraphRisk.Reader()));
 
         public Task<RunOutcome> Run(int story, CancellationToken ct = default) => Pipeline().RunAsync(story, ct);
+
+        /// <summary>A context of its own over the shared ledger.</summary>
+        public LedgerDbContext Db() => new(_options);
 
         public async Task<List<LedgerEntry>> Rows(int story)
         {
@@ -853,6 +862,61 @@ public class MergeQueueTests
         // Continue: B keeps its approval-time place (its queued row is unchanged) and merges on a head containing C's merge.
         var queued = (await h.Rows(B)).Single(r => r.Step == RunPipeline.Steps.Queued).Id;
         await Set(h, ControlScope.Epic(epic), ControlState.Running);
+        Assert.Equal(WorkState.Watch, (await h.Run(B)).State);
+        Assert.Equal([Branch(A), Branch(C), Branch(B)], h.Repo.Merges.Select(m => m.Branch));
+        Assert.All(h.Repo.Merges, m => Assert.Equal(m.MainCount, m.Contained));
+        Assert.Equal(queued, (await h.Rows(B)).Single(r => r.Step == RunPipeline.Steps.Queued).Id);
+    }
+
+    [Fact]
+    public async Task An_idle_story_whose_plan_is_paused_is_skipped_and_on_continue_keeps_its_approval_time_place_without_preempting()
+    {
+        // sc-25876: a Pause on a plan item reaches its stories through the plan's own item scope, in the merge queue too.
+        var h = new Harness();
+        // A holds the turn (CI pending on its updated head); B, a story of plan sc-900, is queued behind it, C behind B.
+        var (runA, release) = await ABehindAWaitingForCi(h);
+        Assert.Equal(WorkState.MergeGate, (await h.Run(C)).State);
+        const string plan = "sc-900";
+        await using (var db = h.Db())
+        {
+            var ledger = new WorkLedger(db, TimeProvider.System);
+            var planItem = await ledger.GetOrCreateAsync(RunPipeline.Source, plan, "A plan", Sandbox.FullName, null, CancellationToken.None);
+            await ledger.LinkPlanAsync((await ledger.FindAsync(RunPipeline.Source, StoryId.Format(B), CancellationToken.None))!, planItem.Id, CancellationToken.None);
+        }
+
+        // B's plan is paused while B waits between runs: no run of B is active, so nothing is written to its ledger.
+        await Set(h, ControlScope.Item(plan), ControlState.Paused);
+        release.SetResult();
+        Assert.Equal(WorkState.Watch, (await runA).State);
+        var rowsB = (await h.Rows(B)).Count;
+        Assert.Equal(WorkState.MergeGate, (await h.Run(B)).State); // paused: nothing to do
+        Assert.Equal(rowsB, (await h.Rows(B)).Count);
+
+        // C does not wait for B: B is held by its plan's control and idle, so C is the head of the queue and takes the turn.
+        var cInCi = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        h.Repo.CiFor = sha => sha.StartsWith(Branch(C), StringComparison.Ordinal) && !cRelease.Task.IsCompleted ? Pending(sha) : null;
+        h.Repo.OnCiRead = sha =>
+        {
+            if (sha.StartsWith(Branch(C), StringComparison.Ordinal))
+            {
+                cInCi.TrySetResult();
+            }
+        };
+        var runC = Task.Run(() => h.Run(C));
+        Assert.Same(cInCi.Task, await Task.WhenAny(cInCi.Task, runC).WaitAsync(TimeSpan.FromSeconds(30)));
+        Assert.Single(await h.Steps(C, RunPipeline.Steps.QueueTurn));
+        Assert.Empty(await h.Steps(B, RunPipeline.Steps.QueueTurn));
+
+        // Continue on the plan while C holds the turn: B, ahead of C by approval, keeps its place but does not preempt C.
+        var queued = (await h.Rows(B)).Single(r => r.Step == RunPipeline.Steps.Queued).Id;
+        await Set(h, ControlScope.Item(plan), ControlState.Running);
+        Assert.Equal(WorkState.MergeGate, (await h.Run(B)).State);
+        Assert.Contains($"waiting for {StoryId.Format(C)}, which holds the queue's turn", h.Logged);
+        Assert.Equal([Branch(A)], h.Repo.Merges.Select(m => m.Branch));
+
+        cRelease.SetResult();
+        Assert.Equal(WorkState.Watch, (await runC).State);
         Assert.Equal(WorkState.Watch, (await h.Run(B)).State);
         Assert.Equal([Branch(A), Branch(C), Branch(B)], h.Repo.Merges.Select(m => m.Branch));
         Assert.All(h.Repo.Merges, m => Assert.Equal(m.MainCount, m.Contained));

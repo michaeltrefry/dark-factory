@@ -9,8 +9,8 @@ namespace DarkFactory.Orchestrator.Tests.Support;
 
 /// <summary>
 /// A stateful in-memory Shortcut API (the subset <see cref="ShortcutWorkSource"/> uses): stories
-/// change when PUT, team listings page by limit/offset and epic listings return every story, like the
-/// real API. Every request is recorded.
+/// change when PUT, team listings page by limit/offset and epic listings return every story (both without
+/// descriptions), like the real API. Every request is recorded.
 /// </summary>
 public sealed class FakeShortcutBoard : HttpMessageHandler
 {
@@ -36,6 +36,9 @@ public sealed class FakeShortcutBoard : HttpMessageHandler
 
     /// <summary>Called with each request before it is served; may return a response to send instead.</summary>
     public Func<HttpRequestMessage, HttpResponseMessage?>? Intercept { get; set; }
+
+    /// <summary>What the workflow calls its state of type <c>done</c> (a workspace may rename it).</summary>
+    public string DoneName { get; set; } = "Done";
 
     public JsonObject Story(int id) => _stories[id];
 
@@ -69,7 +72,18 @@ public sealed class FakeShortcutBoard : HttpMessageHandler
             ["labels"] = new JsonArray(),
             ["external_links"] = new JsonArray(),
             ["story_links"] = new JsonArray(),
+            // Like the real API (the recorded listings carry it): null unless the story was created with one.
+            ["external_id"] = null,
         };
+
+    /// <summary>A person removes the <c>blocks</c> relation between two stories on the board.</summary>
+    public void Unlink(int subject, int obj)
+    {
+        lock (_links)
+        {
+            _links.RemoveAll(l => (int)l["subject_id"]! == subject && (int)l["object_id"]! == obj);
+        }
+    }
 
     public HttpClient Client() => new(this) { BaseAddress = ShortcutWorkSource.DefaultBaseAddress };
 
@@ -90,14 +104,15 @@ public sealed class FakeShortcutBoard : HttpMessageHandler
             ("GET", ["member"]) => Ok(new JsonObject { ["id"] = Me }),
             ("GET", ["groups"]) => Ok(JsonNode.Parse($$"""[{"id":"{{FactoryTeam}}","mention_name":"darkfactory"},{"id":"{{OtherTeam}}","mention_name":"other"}]""")),
             ("GET", ["workflows"]) => Ok(JsonNode.Parse($$"""
-                [{"id":{{Workflow}},"name":"Standard","states":[{"id":{{Backlog}},"name":"Backlog"},{"id":{{ToDo}},"name":"To Do"},
-                  {"id":{{InProgress}},"name":"In Progress"},{"id":500000009,"name":"In Review"},{"id":{{Done}},"name":"Done"}]}]
+                [{"id":{{Workflow}},"name":"Standard","states":[{"id":{{Backlog}},"name":"Backlog","type":"backlog"},
+                  {"id":{{ToDo}},"name":"To Do","type":"unstarted"},{"id":{{InProgress}},"name":"In Progress","type":"started"},
+                  {"id":500000009,"name":"In Review","type":"started"},{"id":{{Done}},"name":"{{DoneName}}","type":"done"}]}]
                 """)),
             ("GET", ["groups", var team, "stories"]) => Ok(Page(
                 Sorted().Where(s => IgnoreListingFilter || (string?)s["group_id"] == team),
                 int.Parse(query["offset"] ?? "0"), int.Parse(query["limit"] ?? "1000"))),
             ("GET", ["epics", var epic, "stories"]) => Ok(new JsonArray(
-                Sorted().Where(s => IgnoreListingFilter || (int?)s["epic_id"] == int.Parse(epic)).Select(WithLinks).ToArray())),
+                Sorted().Where(s => IgnoreListingFilter || (int?)s["epic_id"] == int.Parse(epic)).Select(Slim).ToArray())),
             ("GET", ["epics", var epic]) when int.Parse(epic) < 1000 => Ok(new JsonObject
             {
                 ["id"] = int.Parse(epic),
@@ -118,7 +133,15 @@ public sealed class FakeShortcutBoard : HttpMessageHandler
     private IEnumerable<JsonObject> Sorted() => _stories.Values.OrderBy(s => (int)s["id"]!);
 
     private JsonArray Page(IEnumerable<JsonObject> stories, int offset, int limit) =>
-        new(stories.Skip(offset).Take(limit).Select(WithLinks).ToArray());
+        new(stories.Skip(offset).Take(limit).Select(Slim).ToArray());
+
+    /// <summary>A story as a team or epic listing returns it: like the real API's, without its description.</summary>
+    private JsonNode Slim(JsonObject story)
+    {
+        var slim = WithLinks(story).AsObject();
+        slim.Remove("description");
+        return slim;
+    }
 
     private JsonNode WithLinks(JsonObject story)
     {
@@ -137,6 +160,10 @@ public sealed class FakeShortcutBoard : HttpMessageHandler
         }
         var id = Interlocked.Increment(ref _nextId);
         Add(id, (string?)body["group_id"] ?? "", (long)body["workflow_state_id"]!, (int?)body["epic_id"], (string)body["name"]!);
+        // Like the real API, the story keeps the description and type it was created with.
+        _stories[id]["description"] = (string?)body["description"];
+        _stories[id]["story_type"] = (string?)body["story_type"] ?? "feature";
+        _stories[id]["external_id"] = (string?)body["external_id"];
         return Ok(new JsonObject { ["id"] = id }, HttpStatusCode.Created);
     }
 

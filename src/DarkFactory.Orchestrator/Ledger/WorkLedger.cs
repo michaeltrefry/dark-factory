@@ -129,12 +129,96 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
         CancellationToken ct)
     {
         var wanted = states.ToList();
-        var items = await db.WorkItems.AsNoTracking().Where(x => (source == null || x.Source == source) && x.Repo == repo && wanted.Contains(x.State))
+        // One repository whatever case an item's `Repo:` line spells it in (GitHub's names are case-insensitive, and the queue's
+        // lock key is lower-cased too): two spellings must never make two merge queues of one repository.
+        var lower = repo.ToLowerInvariant();
+        var items = await db.WorkItems.AsNoTracking().Where(x => (source == null || x.Source == source) && x.Repo.ToLower() == lower && wanted.Contains(x.State))
             .OrderBy(x => x.Id)
             .ToListAsync(ct);
         var ids = items.Select(i => i.Id).ToList();
         var rows = await db.LedgerEntries.AsNoTracking().Where(e => ids.Contains(e.WorkItemId)).OrderBy(e => e.Id).ToListAsync(ct);
         return items.Select(i => (i, rows.Where(r => r.WorkItemId == i.Id).ToList())).ToList();
+    }
+
+    /// <summary>
+    /// The plan item whose newest <c>plan-stories</c> checkpoint lists <paramref name="externalId"/> (sc-25871), or null when no plan of
+    /// this source created it. Read from the ledger alone: the board's marker on a story is text anyone may write or remove.
+    /// </summary>
+    public async Task<long?> PlanOfAsync(string source, string externalId, CancellationToken ct)
+    {
+        var rows = await db.LedgerEntries.AsNoTracking()
+            .Where(e => e.Step == RunPipeline.Steps.PlanStories && e.Detail != null && e.Detail.Contains(externalId))
+            .OrderByDescending(e => e.Id).Select(e => new { e.WorkItemId, e.Detail }).ToListAsync(ct);
+        foreach (var row in rows.Where(r => Plans.PlanRelease.StoriesOf(r.Detail).Contains(externalId, StringComparer.Ordinal)))
+        {
+            if (await db.WorkItems.AsNoTracking().AnyAsync(i => i.Id == row.WorkItemId && i.Source == source, ct))
+            {
+                return row.WorkItemId;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>The item with that ledger id as stored (a story's plan item, <see cref="WorkItem.PlanItemId"/>), or null. Read fresh, untracked.</summary>
+    public Task<WorkItem?> ItemAsync(long id, CancellationToken ct) =>
+        db.WorkItems.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, ct);
+
+    /// <summary>The stories the plan item's newest <c>plan-stories</c> checkpoint lists (sc-25871); none when it has no such row.</summary>
+    public async Task<IReadOnlySet<string>> PlanStoriesAsync(long planItemId, CancellationToken ct) =>
+        Plans.PlanRelease.StoriesOf(await db.LedgerEntries.AsNoTracking()
+            .Where(e => e.WorkItemId == planItemId && e.Step == RunPipeline.Steps.PlanStories)
+            .OrderByDescending(e => e.Id).Select(e => e.Detail).FirstOrDefaultAsync(ct)).ToHashSet(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The changeset branch of the plan item <paramref name="planItemId"/> in <paramref name="repo"/> (sc-25872,
+    /// <see cref="Plans.Changeset.Of"/>), read fresh from its <c>changeset</c> rows; null when it has none pushed there.
+    /// <c>Recorded</c>: every changeset the plan item recorded, for any repository, pushed or not — empty only for a plan recorded
+    /// before there were changesets, whose stories target the default branch.
+    /// </summary>
+    public async Task<(Plans.Changeset? Changeset, IReadOnlyList<Plans.Changeset> Recorded)> ChangesetOfAsync(long planItemId, Shortcut.RepoRef repo,
+        CancellationToken ct)
+    {
+        var rows = await db.LedgerEntries.AsNoTracking()
+            .Where(e => e.WorkItemId == planItemId && (e.Step == RunPipeline.Steps.Changeset || e.Step == RunPipeline.Steps.ChangesetPushed))
+            .OrderBy(e => e.Id).ToListAsync(ct);
+        return (Plans.Changeset.Of(rows, repo),
+            [.. rows.Where(e => e.Step == RunPipeline.Steps.Changeset).Select(e => Plans.Changeset.FromDetail(e.Detail)).OfType<Plans.Changeset>()]);
+    }
+
+    /// <summary>Records that <paramref name="item"/> is a story of the plan item <paramref name="planItemId"/>. Call under the item's run lock.</summary>
+    public async Task LinkPlanAsync(WorkItem item, long planItemId, CancellationToken ct)
+    {
+        if (item.PlanItemId == planItemId)
+        {
+            return;
+        }
+        var (oldPlan, oldUpdated, oldVersion) = (item.PlanItemId, item.UpdatedAt, item.Version);
+        item.PlanItemId = planItemId;
+        item.UpdatedAt = time.GetUtcNow();
+        item.Version++;
+        try
+        {
+            await db.SaveChangesAsync(ct);
+        }
+        catch
+        {
+            (item.PlanItemId, item.UpdatedAt, item.Version) = (oldPlan, oldUpdated, oldVersion);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// The source's items named <paramref name="externalIds"/> that the ledger knows, each with every row, read fresh and untracked
+    /// (their own runs write them): what a plan's release and closeout are decided and rendered from (sc-25871).
+    /// </summary>
+    public async Task<Dictionary<string, (WorkItem Item, List<LedgerEntry> History)>> ItemsByIdAsync(string source,
+        IReadOnlyCollection<string> externalIds, CancellationToken ct)
+    {
+        var wanted = externalIds.Distinct(StringComparer.Ordinal).ToList();
+        var items = await db.WorkItems.AsNoTracking().Where(x => x.Source == source && wanted.Contains(x.ExternalId)).ToListAsync(ct);
+        var ids = items.Select(i => i.Id).ToList();
+        var rows = await db.LedgerEntries.AsNoTracking().Where(e => ids.Contains(e.WorkItemId)).OrderBy(e => e.Id).ToListAsync(ct);
+        return items.ToDictionary(i => i.ExternalId, i => (i, rows.Where(r => r.WorkItemId == i.Id).ToList()), StringComparer.Ordinal);
     }
 
     /// <summary>Every row of the item, oldest first.</summary>

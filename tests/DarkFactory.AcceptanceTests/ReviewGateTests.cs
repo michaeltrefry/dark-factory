@@ -166,7 +166,7 @@ public class ReviewGateTests
     private static string Lines(string? text) => (text ?? "").Replace("\r\n", "\n", StringComparison.Ordinal);
 
     /// <summary>Every review and second opinion served on the router's high model class (whichever model the router picked).</summary>
-    private static void AssertHighClassPanel(ReviewVerdict verdict)
+    internal static void AssertHighClassPanel(ReviewVerdict verdict)
     {
         Assert.NotEmpty(verdict.Reviews);
         Assert.All(verdict.Reviews, r => Assert.True(r.ServedClass == ReviewModels.Class, $"{r.Role} reviewed by {r.ServedName} on class {r.ServedClass ?? "(none)"}"));

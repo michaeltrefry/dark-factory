@@ -57,22 +57,100 @@ public sealed partial class RunPipeline
         history.LastOrDefault(e => e.Step == Steps.Linked)?.Detail?.Split(' ')[0]
         ?? history.LastOrDefault(e => e.Step is null && e.State == WorkState.Review && e.Detail?.StartsWith("https://", StringComparison.Ordinal) == true)?.Detail;
 
+    /// <summary>
+    /// What the repository guard of <see cref="ReadPullAsync"/> adds for its other cause (sc-25877): GitHub goes on answering a
+    /// renamed or transferred repository under its old name (a redirect), but a pull request opened since carries the new one in
+    /// its URL, which then no longer matches the item's. The guard cannot tell that from a wrong repository and never follows
+    /// the redirect; the owner updates the name.
+    /// </summary>
+    internal const string RenamedRemedy = "If the repository was renamed or transferred on GitHub, update the item's `Repo:` line / "
+        + "`Factory:DefaultRepo` to the new name and re-run.";
+
     private async Task<(List<LedgerEntry> History, PullFacts Pull)> ReadPullAsync(Run run, CancellationToken ct)
     {
         var history = await ledger.HistoryAsync(run.Item, ct);
         var url = LinkedPullRequestUrl(history) ?? throw new InvalidOperationException($"{run.Item.ExternalId} has no pull request in its ledger.");
-        var (_, number) = GitHubGate.ParsePullUrl(url);
+        var (linked, number) = GitHubGate.ParsePullUrl(url);
+        // An item's pull request is in the item's repository (sc-25873). The number alone names a different pull request in any
+        // other one, so a run whose repository is not the linked one's — a story whose `Repo:` line was edited, a plan item's
+        // run that took another repository's pass for its own — reads, reviews and merges nothing there: the item escalates.
+        if (!string.Equals(linked.FullName, run.Repo.FullName, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException($"{run.Item.ExternalId}'s pull request {url} is in {linked}, but the item works in {run.Repo}: "
+                + $"nothing was read or merged in {run.Repo}. An item's pull request must be in the item's repository. {RenamedRemedy}");
+        }
         var pull = await Gate.GitHub.GetPullAsync(run.Repo, number, ct);
         return (history, pull);
     }
 
-    private static void EnsureOpen(PullFacts pull)
+    private async Task EnsureOpenAsync(Run run, PullFacts pull, CancellationToken ct)
     {
         if (!pull.Open)
         {
-            throw new InvalidOperationException($"{pull.HtmlUrl} is {(pull.Merged ? "merged" : "closed")} outside the factory.");
+            throw new InvalidOperationException(pull.Merged
+                ? $"{pull.HtmlUrl} {Plans.PlanRelease.MergedOutsideFactory}.{await MergedIntoChangesetAsync(run, pull, ct)}"
+                : $"{pull.HtmlUrl} is closed outside the factory.");
         }
     }
+
+    /// <summary>
+    /// A pull request found merged that the factory's gate did not merge (sc-25877; the caller escalates the item with it): when
+    /// the item is a plan's story and GitHub's answer — this run's own read through the gate client, never a model's or a
+    /// person's text — shows it merged into the base the ledger expects for it, its plan's changeset branch
+    /// (<see cref="Run.BaseBranch"/>), that fact is recorded on the story (<see cref="Steps.MergedIntoChangeset"/>, once per pull
+    /// request) and the words the escalation adds are returned. The story is still Escalated — its own gate never passed it —
+    /// but for its plan it counts as merged: the work is on the changeset branch, and nothing reaches a default branch except
+    /// through the changeset pull request's full review and gate (E6). Empty, and nothing recorded, for any other item and for a
+    /// pull request merged into any other base (such a story stays failed: its change is somewhere no gate will judge it).
+    /// The once-per-pull-request guard is for a run interrupted between this row and the Escalated row (Ctrl-C, a crash): the
+    /// run that resumes it finds the same merged pull request again. A re-run after the escalation never gets here
+    /// (<see cref="RunAsync"/> refuses it: the item stays Escalated). The reason ends by telling the owner to tidy the board story
+    /// (<see cref="Plans.PlanRelease.BoardStoryStillClaimed"/>): the item stays Escalated, so the factory never moves it.
+    /// </summary>
+    private async Task<string> MergedIntoChangesetAsync(Run run, PullFacts pull, CancellationToken ct)
+    {
+        if (!pull.Merged || run.Item.PlanItemId is null || run.Changeset is not null || run.BaseBranch is not { } expected
+            || !ItemNaming.IsChangesetBranch(expected) || !string.Equals(pull.BaseRef, expected, StringComparison.Ordinal))
+        {
+            return "";
+        }
+        var detail = Plans.PlanRelease.MergedIntoChangesetDetail(pull.HtmlUrl, expected, pull.HeadSha);
+        if (!(await ledger.HistoryAsync(run.Item, ct)).Any(e => e.Step == Steps.MergedIntoChangeset && e.Detail == detail))
+        {
+            await ledger.CheckpointAsync(run.Item, Steps.MergedIntoChangeset, null, detail, ct);
+        }
+        log.WriteLine($"[{run.Item.State}] {run.Item.ExternalId}: {pull.HtmlUrl} was merged outside the factory into {expected}, its plan's changeset branch; "
+            + "it counts as merged for the plan");
+        return $" It was merged into {expected}, its plan's changeset branch: {Plans.PlanRelease.MergedOutsideIntoChangeset}. "
+            + $"For its plan it counts as merged (what depends on it is released), and a re-run of this story does nothing: {Plans.PlanRelease.BoardStoryStillClaimed}.";
+    }
+
+    /// <summary>
+    /// Fails closed unless the pull request targets the base the ledger expects (sc-25872): the changeset branch of the item's plan,
+    /// or the repository's default branch — the one a plan item's changeset recorded, else the one GitHub names in the same answer
+    /// (no further call; an answer naming none is not checked). A pull request can be retargeted by a person, or by GitHub when its
+    /// base branch is deleted, and an open one of the head is adopted whatever its base: reviewing or merging it would put the work
+    /// on a branch the gate did not judge it for. The item escalates.
+    /// </summary>
+    private static void EnsureBase(Run run, PullFacts pull)
+    {
+        var expected = run.BaseBranch ?? run.Changeset?.Base ?? pull.DefaultBranch;
+        if (expected is not null && !string.Equals(pull.BaseRef, expected, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException($"{pull.HtmlUrl} targets {pull.BaseRef}, not {expected}.");
+        }
+    }
+
+    /// <summary>
+    /// Whether the item's pull request is its plan's changeset pull request (sc-25873), the fact the merge gate sizes it by
+    /// (<see cref="ChangeFacts.Changeset"/>): the ledger says so — the item is a plan item with a pushed changeset in this repository
+    /// (<paramref name="changeset"/>: <see cref="Run.Changeset"/>, from its own <c>changeset</c> and <c>changeset-pushed</c> rows, so
+    /// its branch is that changeset branch; null for every other item) — and the pull request targets the base that changeset
+    /// recorded. Never the branch's name: a story of a plan, or an item of no plan, is not a changeset whatever its branch or its
+    /// base is called.
+    /// </summary>
+    internal static bool IsChangesetPull(Plans.Changeset? changeset, PullFacts pull) =>
+        changeset is not null && string.Equals(pull.BaseRef, changeset.Base, StringComparison.Ordinal);
 
     /// <summary>
     /// Review: the review panel judges the PR's current head commit — correctness and spec conformance always, security when
@@ -97,7 +175,8 @@ public sealed partial class RunPipeline
     private async Task ReviewAsync(Run run, CancellationToken ct)
     {
         var (history, pull) = await ReadPullAsync(run, ct);
-        EnsureOpen(pull);
+        await EnsureOpenAsync(run, pull, ct);
+        EnsureBase(run, pull);
         var fix = PendingFixRound(history);
         if (fix is { Stuck: { } stuckReason })
         {
@@ -145,6 +224,13 @@ public sealed partial class RunPipeline
                 + $"({string.Join("; ", verdict.Reviews.SelectMany(ReviewModels.Problems))}); reviewing it again");
             verdict = null;
         }
+        if (verdict is { Passed: false } && run.Changeset is not null && fix is null && FailedBeforeThisAttempt(history, verdict))
+        {
+            // A re-run of an escalated changeset pull request (sc-25872) has no Implement to make a new head, so the failed
+            // verdict the escalation left on this head would only fail it again: the panel reviews the head afresh, once.
+            log.WriteLine($"[review] {Ci.Short(pull.HeadSha)}: its failed verdict is from before this run of the changeset pull request; reviewing it again");
+            verdict = null;
+        }
         if (verdict is null)
         {
             verdict = await ReviewPanelAsync(run, pull, previous, ciFix is null ? null : (ciFix.FixedHead, ciFix.PushedHead!), ct);
@@ -176,6 +262,17 @@ public sealed partial class RunPipeline
         }
         log.WriteLine($"[review] {open.Count} confirmed blocking finding(s); fix round {rounds + 1} of {cap.Rounds}");
         await ledger.RecordAsync(run.Item, WorkState.Fixing, null, pull.HeadSha, ct);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="verdict"/>'s row — the latest for its head — was recorded before the plan item last entered Review
+    /// from Planned, i.e. by an earlier run of its changeset pull request that has since escalated and been re-queued.
+    /// </summary>
+    private static bool FailedBeforeThisAttempt(List<LedgerEntry> history, ReviewVerdict verdict)
+    {
+        var planned = history.FindLastIndex(e => e.Step is null && e.State == WorkState.Planned);
+        var recorded = history.FindLastIndex(e => e.Step == Steps.Verdict && ReviewVerdict.FromDetail(e.Detail)?.HeadSha == verdict.HeadSha);
+        return planned >= 0 && recorded < planned;
     }
 
     /// <summary>
@@ -233,9 +330,13 @@ public sealed partial class RunPipeline
         return cap;
     }
 
-    /// <summary>The fix-round cap in effect for the item: its latest <see cref="Steps.FixCap"/>, else <see cref="Lifecycle.MaxFixRounds"/>.</summary>
+    /// <summary>
+    /// The fix-round cap in effect for the item: its latest <see cref="Steps.FixCap"/>, else <see cref="Lifecycle.MaxFixRounds"/>.
+    /// A plan item of several repositories reads only its current changeset pull request's rows (sc-25873,
+    /// <see cref="Plans.Changeset.CurrentPass"/>): the cap an earlier repository's policy gave is not the next one's.
+    /// </summary>
     public static int FixCapOf(IReadOnlyList<LedgerEntry> history) =>
-        history.LastOrDefault(e => e.Step == Steps.FixCap)?.Detail is { } detail
+        Plans.Changeset.CurrentPass(history).LastOrDefault(e => e.Step == Steps.FixCap)?.Detail is { } detail
         && int.TryParse(detail.Split(' ')[0], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var cap)
             ? cap
             : Lifecycle.MaxFixRounds;
@@ -257,7 +358,7 @@ public sealed partial class RunPipeline
     internal static string StuckRounds(IReadOnlyList<LedgerEntry> history)
     {
         var transitions = history.Where(e => e.Step is null).ToList();
-        var implemented = transitions.FindLastIndex(e => e.State == WorkState.Implement && e.Detail != "unpaused");
+        var implemented = transitions.FindLastIndex(e => TransitionContext.StartsAttempt(e.State) && e.Detail != "unpaused");
         var (round, kind) = (0, "");
         var stuck = new List<string>();
         for (var i = Math.Max(implemented, 0) + 1; i < transitions.Count; i++)
@@ -287,7 +388,7 @@ public sealed partial class RunPipeline
                 continue;
             }
             var state = history[i].State;
-            if (state == WorkState.Implement)
+            if (TransitionContext.StartsAttempt(state))
             {
                 (at, round) = (-1, 0);
             }
@@ -366,7 +467,7 @@ public sealed partial class RunPipeline
             await Task.Delay(Gate.CiPollInterval, GateTime, ct);
             await ThrowIfControlledAsync(run.Item, ct);
             (_, pull) = await ReadPullAsync(run, ct);
-            EnsureOpen(pull);
+            await EnsureOpenAsync(run, pull, ct);
         }
     }
 
@@ -464,6 +565,7 @@ public sealed partial class RunPipeline
 
         // CodeGraph's overlay of the head (sc-25708), asked for once, before the first panel call, only when a role is reviewed here.
         var overlay = toReview.Count > 0 ? await OverlayForReviewAsync(run, pull, ct) : null;
+        var story = await ReviewStoryAsync(run, ct);
         var reviews = new List<RoleReview>();
         foreach (var role in roles)
         {
@@ -475,7 +577,7 @@ public sealed partial class RunPipeline
             var prompt = ReviewPrompts.For(role);
             var session = await NameReviewSessionAsync(run, pull, role, prompt, ct);
             var review = await RouterCallAsync(() => Gate.Reviewer.ReviewAsync(
-                new ReviewRequest(run.Story, run.Repo.FullName, pull, diff, files, role, prompt, session, overlay), ct), ct);
+                new ReviewRequest(story, run.Repo.FullName, pull, diff, files, role, prompt, session, overlay), ct), ct);
             if (review.Clean)
             {
                 var findings = new List<Finding>();
@@ -640,7 +742,8 @@ public sealed partial class RunPipeline
         var attempt = CurrentWorkerAttempt(history);
         var session = attempt.LastOrDefault(e => e.Step == Steps.Session)?.ClaudeSessionId;
         var models = ImplementerModels(history).ToHashSet(StringComparer.Ordinal);
-        var branch = spec.Story.Kind.BranchName(spec.Story.Id);
+        // The PR's branch: the item's own, or a plan item's changeset branch (sc-25872), which is only ever fast-forwarded.
+        var (branch, baseBranch) = (run.Branch, run.BaseBranch);
 
         if (OrphanedWorkerPid(attempt) is { } pid && await worker.StopOrphanAsync(pid, ct))
         {
@@ -652,7 +755,7 @@ public sealed partial class RunPipeline
         // A fixer found looping is never resumed (a run that stopped after the detection left only its checkpoint): the round failed.
         if (pushed is null && StuckSession(attempt) is { } found)
         {
-            run.Workspace = await workspaces.ReopenAsync(repo, branch, ct);
+            run.Workspace = await workspaces.ReopenAsync(repo, branch, ct, baseBranch);
             await StuckFixRoundAsync(run, found, next, name, ct);
             return;
         }
@@ -661,7 +764,7 @@ public sealed partial class RunPipeline
             Workspace? workspace = null;
             if (attempt.Any(e => e.Step is not null))
             {
-                workspace = await workspaces.ReopenAsync(repo, branch, ct);
+                workspace = await workspaces.ReopenAsync(repo, branch, ct, baseBranch);
                 if (workspace is null)
                 {
                     await ledger.CheckpointAsync(item, Steps.WorktreeLost, session, $"worktree missing on resume; starting {name} over", ct);
@@ -672,7 +775,7 @@ public sealed partial class RunPipeline
             // The fixer works on the PR's branch as pushed (the commit under review), not on the base branch.
             if (workspace is null)
             {
-                workspace = await workspaces.RestoreAsync(repo, branch, ct);
+                workspace = await workspaces.RestoreAsync(repo, branch, ct, baseBranch);
                 run.Workspace = workspace;
                 if (prepare is not null)
                 {
@@ -709,7 +812,7 @@ public sealed partial class RunPipeline
         }
         else
         {
-            run.Workspace = await workspaces.ReopenAsync(repo, branch, ct);
+            run.Workspace = await workspaces.ReopenAsync(repo, branch, ct, baseBranch);
         }
         await ThrowIfControlledAsync(item, ct);
         if (afterPush is not null)
@@ -838,7 +941,7 @@ public sealed partial class RunPipeline
             {blocks}
 
             Find and fix the cause of each failure with the smallest change that keeps the story satisfied, and make sure
-            `dotnet build` and `dotnet test` pass. Do not delete, skip or weaken tests to make CI pass, and do not change CI
+            {BuildsAndPasses}. Do not delete, skip or weaken tests to make CI pass, and do not change CI
             configuration. Do not commit, push, or open pull requests; the orchestrator does that.
             """;
     }
@@ -869,8 +972,8 @@ public sealed partial class RunPipeline
 
             {blocks}
 
-            Fix every finding with the smallest change that keeps the story satisfied, and make sure `dotnet build` and
-            `dotnet test` pass. Do not commit, push, or open pull requests; the orchestrator does that.
+            Fix every finding with the smallest change that keeps the story satisfied, and make sure
+            {BuildsAndPasses}. Do not commit, push, or open pull requests; the orchestrator does that.
             """;
     }
 
@@ -889,8 +992,9 @@ public sealed partial class RunPipeline
     {
         var prompt = ReviewPrompts.Confirm;
         var session = await NameReviewSessionAsync(run, pull, $"confirm-{review.Role}", prompt, ct);
+        var story = await ReviewStoryAsync(run, ct);
         var confirmation = await RouterCallAsync(() => Gate.Reviewer.ConfirmAsync(
-            new ConfirmRequest(run.Story, run.Repo.FullName, pull, diff, files, review.Role, finding, prompt, session, overlay), ct), ct);
+            new ConfirmRequest(story, run.Repo.FullName, pull, diff, files, review.Role, finding, prompt, session, overlay), ct), ct);
         log.WriteLine($"[review] {review.Role} finding '{finding.Title}': {confirmation.Outcome} by {confirmation.ServedName} ({confirmation.ServedClass ?? "no class named"})");
         return finding.ConfirmedBy(confirmation);
     }
@@ -945,7 +1049,7 @@ public sealed partial class RunPipeline
         while (true)
         {
             var (history, pull) = await ReadPullAsync(run, ct);
-            EnsureOpen(pull);
+            await EnsureOpenAsync(run, pull, ct);
             var verdicts = Verdicts(history);
             if (PendingCiFixRound(history) is { } ciFix && ciFix.PushedHead != ciFix.FixedHead && pull.HeadSha == ciFix.FixedHead
                 && !verdicts.Any(v => v.HeadSha == ciFix.PushedHead))
@@ -962,7 +1066,8 @@ public sealed partial class RunPipeline
             var facts = await Gate.GitHub.GetCiAsync(run.Repo, pull.HeadSha, ct);
             var (state, why) = Ci.Evaluate(facts);
             if (state == CiState.Green
-                && CiHeal.Unreported(history.Where(e => e.Step == Steps.CiFailure).Select(e => CiTriage.FromDetail(e.Detail)).OfType<CiTriage>(), facts)
+                // Only this pull request's triages: an earlier repository's checks (sc-25873) are not expected on this one's head.
+                && CiHeal.Unreported(Plans.Changeset.CurrentPass(history).Where(e => e.Step == Steps.CiFailure).Select(e => CiTriage.FromDetail(e.Detail)).OfType<CiTriage>(), facts)
                     is { Count: > 0 } unreported)
             {
                 // A check a CI fix round was about (or one cancelled next to it) must run and pass, not just be absent.
@@ -1181,9 +1286,13 @@ public sealed partial class RunPipeline
         }
     }
 
-    /// <summary>The merge commit of <paramref name="pull"/> when it is merged at a head a <see cref="Steps.GatePassed"/> names, else null.</summary>
-    private static string? GatePassedAt(List<LedgerEntry> history, PullFacts pull) =>
-        pull.Merged && history.Any(e => e.Step == Steps.GatePassed && e.Detail == pull.HeadSha) ? pull.MergeCommitSha : null;
+    /// <summary>
+    /// The merge commit of <paramref name="pull"/> when it is merged at a head a <see cref="Steps.GatePassed"/> names, else null.
+    /// A plan item of several repositories (sc-25873) counts only its current pull request's rows
+    /// (<see cref="Plans.Changeset.CurrentPass"/>): the gate passing an earlier repository's changeset says nothing about this one.
+    /// </summary>
+    internal static string? GatePassedAt(IReadOnlyList<LedgerEntry> history, PullFacts pull) =>
+        pull.Merged && Plans.Changeset.CurrentPass(history).Any(e => e.Step == Steps.GatePassed && e.Detail == pull.HeadSha) ? pull.MergeCommitSha : null;
 
     /// <summary>
     /// After a merge call failed: re-reads the PR and returns its merge commit when GitHub merged it at the gated head;
@@ -1209,6 +1318,11 @@ public sealed partial class RunPipeline
     /// that cannot be posted is recorded (<see cref="Steps.Closeout"/> or <see cref="Steps.PrReport"/> <c>failed: …</c>), not escalated: the
     /// merge stands and the report is only a report. A failed closeout shows on the dashboard and is retried from Watch
     /// (<see cref="CloseoutPending"/>).
+    /// A plan item of several repositories (sc-25873) merges one changeset per repository: each merge is first recorded delivered
+    /// (<see cref="Steps.ChangesetDelivered"/>: the repository, its pull request and merge commit — the row that lets the stories
+    /// blocked by that changeset start); while another repository's changeset is still to go the plan is not finished, so only this
+    /// pull request's description is rewritten and the item waits again (Merge → Planned) for the next repository; the last merge
+    /// reports the plan merged and closes it out like a plan of one repository, listing every repository's changeset.
     /// </summary>
     private async Task MergeAsync(Run run, CancellationToken ct)
     {
@@ -1216,6 +1330,27 @@ public sealed partial class RunPipeline
         var entered = history.FindLastIndex(e => e.Step is null);
         var commit = history[entered].Detail;
         var done = history.Skip(entered + 1).Select(e => e.Step).ToHashSet();
+        if (run.Changeset is { } changeset && Plans.Changeset.Ordered(history, run.Repo) is { Count: > 1 } changesets)
+        {
+            var delivered = Plans.Changeset.Delivered(history).Select(d => d.Repo).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (delivered.Add(changeset.Repo))
+            {
+                await ledger.CheckpointAsync(run.Item, Steps.ChangesetDelivered, null,
+                    new Plans.ChangesetDelivery(changeset.Repo, Plans.ChangesetDelivery.Merged, LinkedPullRequestUrl(history), commit).ToDetail(), ct);
+                log.WriteLine($"[merge] {run.Item.ExternalId}: the changeset of {changeset.Repo} is on {changeset.Base} as {commit}");
+            }
+            if (changesets.Where(c => !delivered.Contains(c.Repo)).Select(c => c.Repo).ToList() is { Count: > 0 } left)
+            {
+                if (!done.Contains(Steps.PrReport) && LinkedPullRequestUrl(history) is { } url)
+                {
+                    await ledger.CheckpointAsync(run.Item, Steps.PrReport, null, await RewriteBodyAsync(run, url, ct), ct);
+                }
+                await EndPassAsync(run, ct);
+                await ledger.RecordAsync(run.Item, WorkState.Planned, null,
+                    $"the changeset of {changeset.Repo} merged as {commit}; {left.Count} more to go, in order: {string.Join(", ", left)}", ct);
+                return;
+            }
+        }
         if (!done.Contains(Steps.MergedReported))
         {
             await source.ReportStateAsync(run.Story.Id, BoardState.Merged, null, ct);
@@ -1227,20 +1362,38 @@ public sealed partial class RunPipeline
         }
         if (!done.Contains(Steps.PrReport) && LinkedPullRequestUrl(history) is { } prUrl)
         {
-            string result;
-            try
-            {
-                await pullRequests.UpdateBodyAsync(run.Repo, prUrl, await PullRequestBodyAsync(run, ct), ct);
-                result = "merge";
-            }
-            catch (Exception ex) when (!ct.IsCancellationRequested)
-            {
-                log.WriteLine($"[merge] could not rewrite the description of {prUrl}: {ex.Message}");
-                result = $"failed: {ex.Message}";
-            }
-            await ledger.CheckpointAsync(run.Item, Steps.PrReport, null, result, ct);
+            await ledger.CheckpointAsync(run.Item, Steps.PrReport, null, await RewriteBodyAsync(run, prUrl, ct), ct);
         }
+        await EndPassAsync(run, ct);
         await ledger.RecordAsync(run.Item, WorkState.Watch, null, commit, ct);
+    }
+
+    /// <summary>
+    /// A plan item's changeset pull request has merged and everything that needed its repository is recorded (sc-25873): outside
+    /// a pass <see cref="WorkItem.Repo"/> is the plan item's primary repository again (<see cref="Run.Primary"/>) — while it waits
+    /// for the next repository, in Watch and Done — so what reads it there (the metrics' sandbox exclusion, the freeze's list of
+    /// repositories in work, the plan's own evaluation) does not depend on which repository happened to merge last. Written
+    /// right before the transition that ends the pass, under the same run lock: a run that dies between the two finds the item
+    /// still in Merge, where <see cref="Plans.Changeset.PassRepo"/> names the pass's repository again from the ledger, and redoes
+    /// both. What a later reader needs of the merged repository is on its rows (<see cref="MergeFiles.Repo"/>,
+    /// <see cref="Steps.ChangesetDelivered"/>, the linked pull request). Nothing to do for any other item.
+    /// </summary>
+    private Task EndPassAsync(Run run, CancellationToken ct) =>
+        run.Changeset is null ? Task.CompletedTask : ledger.RefreshAsync(run.Item, run.Item.Title, run.Primary.FullName, run.Item.EpicId, ct);
+
+    /// <summary>Rewrites the merged pull request's description from the ledger; returns the <see cref="Steps.PrReport"/> Detail.</summary>
+    private async Task<string> RewriteBodyAsync(Run run, string prUrl, CancellationToken ct)
+    {
+        try
+        {
+            await pullRequests.UpdateBodyAsync(run.Repo, prUrl, await PullRequestBodyAsync(run, ct), ct);
+            return "merge";
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            log.WriteLine($"[merge] could not rewrite the description of {prUrl}: {ex.Message}");
+            return $"failed: {ex.Message}";
+        }
     }
 
     /// <summary>One closeout attempt: posts the merged closeout on the item and records <c>posted</c> or <c>failed: &lt;why&gt;</c>.</summary>
@@ -1249,7 +1402,14 @@ public sealed partial class RunPipeline
         string? error = null;
         try
         {
-            var closeout = LedgerReport.MergedCloseout(item.ExternalId, await ledger.HistoryAsync(item, ct), await ledger.SessionCostsAsync(item, ct));
+            var history = await ledger.HistoryAsync(item, ct);
+            var costs = await ledger.SessionCostsAsync(item, ct);
+            // A plan item's merge is its changeset's (sc-25872): its closeout lists the plan's stories, then the changeset's own facts.
+            // A plan of several repositories (sc-25873): every repository's changeset, then the last pull request's own facts.
+            var closeout = await PlanStoryReportsAsync(history, ct) is { Count: > 0 } stories
+                ? LedgerReport.PlanCloseout(item.ExternalId, stories, null, (Plans.Changeset.CurrentPass(history), costs),
+                    Plans.Changeset.States(history, RepoRef.Parse(item.Repo), item.State))
+                : LedgerReport.MergedCloseout(item.ExternalId, history, costs);
             await source.CommentAsync(storyId, closeout, ct);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)

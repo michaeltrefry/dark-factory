@@ -50,9 +50,14 @@ public sealed class WorkerStuckException(string reason, string? session)
 /// Worktrees are throwaway (E5): removed once the PR is open or the item escalates; only a
 /// paused (Ctrl-C) or crashed Implement keeps its worktree, for the re-run to resume in.
 /// The board is touched only through <see cref="IWorkSource"/> (E6): Intake claims the item and
-/// reports it In Progress; Implement links the PR and branch before the item reaches Review.
+/// reports it In Progress; Implement links the PR and branch before the item reaches Review. An item labelled <c>plan</c> on a
+/// source that plans (<see cref="IWorkSource.PlansItems"/>) goes to Plan instead (sc-25870, <see cref="PlanAsync"/>): a read-only
+/// planner session proposes stories, the code checks the plan and creates them, and the item waits on them in
+/// <see cref="WorkState.Planned"/>, never implemented itself: each run of it releases the stories whose blockers have merged and,
+/// once every story has merged, closes the plan out (sc-25871, <see cref="PlannedAsync"/>).
 /// A claim the work source refuses (the story left To Do or the watch scope, or another claimant holds
-/// it) parks the item in Paused with no board write; it is picked up again when it is ready again.
+/// it) parks the item in Paused with no board write; it is picked up again when it is ready again. So does the claim of a plan's
+/// story while a story that blocks it has not merged (<see cref="BlockedAsync"/>): it starts once they have.
 /// Resuming an item already in the ledger first checks the story is still in the watch scope, and parks
 /// it with one comment if not. <c>ignoreScope</c> (<c>factory run --ignore-scope</c>) skips only the
 /// scope checks. An item in a state nothing in this phase drives (e.g. parked at Review) is not read at
@@ -80,8 +85,25 @@ public sealed partial class RunPipeline(
     GateStage? gate = null,
     FactoryFreeze? freeze = null,
     StuckDetection? stuck = null,
-    int? maxControlReadFailures = null)
+    int? maxControlReadFailures = null,
+    Plans.IPlanRunner? planner = null,
+    IReadOnlyList<RepoRef>? configuredRepos = null,
+    bool workerless = false)
 {
+    /// <summary>
+    /// Whether this run was built without the worker run lock and the sandbox probe (sc-25871: <see cref="FactoryRunner"/> does so for a
+    /// plan item waiting on its stories). Such a run only evaluates a waiting plan (<see cref="PlannedAsync"/>): anything that could
+    /// reach a worker, the sandbox helper or a worktree — a Stop, or an item that is no longer waiting — is left to the next run,
+    /// which takes the lock.
+    /// </summary>
+    private readonly bool _workerless = workerless;
+
+    /// <summary>
+    /// The factory's configured repositories (<c>FactoryOptions.ConfiguredRepos</c>; the default repository alone when not given): the
+    /// only ones a plan item may name, whether it names one or several (sc-25874, sc-25877, <see cref="PlanRepositories"/>).
+    /// </summary>
+    private readonly IReadOnlyList<RepoRef> _configuredRepos = configuredRepos ?? [defaultRepo];
+
     /// <summary>
     /// Reads of an item's controls in a row that may fail while a worker or the gate's test runs go on (<c>Controls:MaxReadFailures</c>);
     /// the next failure counts as a Pause (E2: a check that cannot run counts as failed), recorded as <see cref="ControlsUnreadablePaused"/>.
@@ -261,7 +283,99 @@ public sealed partial class RunPipeline(
         /// <c>failed: &lt;why&gt;</c> (the description is a report only: a failure is recorded, not escalated).
         /// </summary>
         public const string PrReport = "pr-report";
+        /// <summary>
+        /// Plan: the planner's answer passed every rule (<see cref="Plans.PlanParser"/>); Detail is the plan
+        /// (<see cref="Plans.Plan.ToDetail"/>), recorded before any story is created (sc-25870). Whether a later run creates this
+        /// plan's stories or plans afresh: <see cref="ReusesRecordedPlan"/>.
+        /// </summary>
+        public const string Plan = "plan";
+        /// <summary>
+        /// Plan: written right before the work source is first asked to create the newest plan's stories. From this row on a story
+        /// of that plan may be on the board, so no later run replaces the plan.
+        /// </summary>
+        public const string PlanCreating = "plan-creating";
+        /// <summary>Plan: the planner's answer broke a rule (Detail: which); no story is created and the item escalates.</summary>
+        public const string PlanRejected = "plan-rejected";
+        /// <summary>
+        /// Plan: what the check of a repository's CI workflow triggers found (sc-25873, <see cref="Gate.CiTriggers"/>), when it is not
+        /// "a workflow runs" — Detail is <see cref="Gate.CiTriggerCheck.ToDetail"/>, starting with the repository: <c>blocked: …</c>
+        /// (no workflow can run for the plan's story pull requests, or for its changeset pull request: no story is created and the item escalates) or
+        /// <c>warning: …</c> (it could not be told; planning goes on). A warning is written when it changes, not every run.
+        /// </summary>
+        public const string CiTriggers = "ci-triggers";
+        /// <summary>Plan: the plan's stories are on the board; Detail is their ids, in the plan's order (e.g. <c>sc-12 sc-13</c>).</summary>
+        public const string PlanStories = "plan-stories";
+        /// <summary>
+        /// Planned: one story of the plan was moved to its board's ready state because every story that blocks it has merged
+        /// (sc-25871); Detail starts with its id (e.g. <c>sc-13</c>), then anything worth saying about it. A story named by one is
+        /// never released again.
+        /// </summary>
+        public const string PlanReleased = "plan-released";
+        /// <summary>
+        /// Planned: stories of the plan are held by blockers that are not stories of the plan and that the factory has not merged
+        /// (Detail: which story by which, <see cref="Plans.PlanRelease.HeldByOutsiders"/>); recorded when that changes, not every poll.
+        /// Also (sc-25876), after <see cref="Plans.PlanRelease.FailedPrefix"/>: a failed story of the plan (Escalated, Cancelled,
+        /// merged outside the factory) holds what depends on it — which story, how and when it failed, its reason, what it blocks.
+        /// </summary>
+        public const string PlanHeld = "plan-held";
+        /// <summary>
+        /// Plan: the plan's changeset branch in one repository is about to be created (sc-25872); Detail is the
+        /// <see cref="Plans.Changeset"/> JSON — the repository, the branch (<c>factory/changeset-&lt;plan item&gt;</c>), the default
+        /// branch and its head the branch starts from — recorded before anything is pushed.
+        /// </summary>
+        public const string Changeset = "changeset";
+        /// <summary>
+        /// Plan: the changeset branch is on origin (Detail: <see cref="Plans.Changeset.PushedDetail"/>: the branch, its head, and
+        /// whether origin already had it). From this row on the plan's stories in that repository branch from it and merge into it.
+        /// </summary>
+        public const string ChangesetPushed = "changeset-pushed";
+        /// <summary>
+        /// Planned: every story merged but the factory has no changeset to merge — the changeset branch does not differ from the
+        /// default branch (Detail: both), or the plan's changeset pull request was merged outside the factory
+        /// (<see cref="Plans.Changeset.MergedOutside"/>) — so no changeset pull request is opened and the plan is closed out saying so.
+        /// </summary>
+        public const string ChangesetEmpty = "changeset-empty";
+        /// <summary>
+        /// A plan of several repositories (sc-25873): one repository's changeset is on its default branch, or needs no merge
+        /// (Detail: <see cref="Plans.ChangesetDelivery"/> JSON — the repository, how — merged by the gate with its pull request and
+        /// merge commit, empty, or merged outside the factory). From this row on the stories blocked by that changeset may start
+        /// and the next repository's changeset pull request may be opened. A plan with one changeset records none.
+        /// </summary>
+        public const string ChangesetDelivered = "changeset-delivered";
+        /// <summary>
+        /// A plan of several repositories that escalates or is stopped while some of its changesets are on their default branch and
+        /// others are not (sc-25873): which repositories are delivered and which are not (Detail:
+        /// <see cref="Plans.Changeset.DeliveryOf"/>), recorded before the Escalated row or the stop's report. Nothing is rolled back.
+        /// </summary>
+        public const string PlanDelivery = "plan-delivery";
+        /// <summary>
+        /// A plan's story whose pull request someone merged outside the factory INTO ITS PLAN'S CHANGESET BRANCH (sc-25877; Detail:
+        /// <c>&lt;pull request&gt; into &lt;changeset branch&gt; at &lt;head&gt;</c>), written by the story's own run when the gate
+        /// client's read of the pull request shows it merged with that base — before the Escalated row that still follows (the
+        /// factory's gate did not merge it). From this row on the story counts as merged for its plan
+        /// (<see cref="Plans.PlanRelease.Satisfied(IReadOnlyList{LedgerEntry}?)"/>): its work is on the changeset branch, which is
+        /// reviewed and gated as a whole before it reaches a default branch. A pull request merged into any other base writes none.
+        /// </summary>
+        public const string MergedIntoChangeset = "merged-into-changeset";
+        /// <summary>
+        /// Planned: every story of the plan that has not merged failed or is blocked behind a failed one (sc-25876): nothing of it
+        /// moves until a person acts. Detail: the failed stories and what they block (<see cref="Plans.PlanRelease.HeldByFailed"/>).
+        /// A failed story that still leaves other stories going is a <see cref="PlanHeld"/> row instead
+        /// (after <see cref="Plans.PlanRelease.FailedPrefix"/>). Either is written when it changes, not every poll.
+        /// </summary>
+        public const string PlanStuck = "plan-stuck";
+        /// <summary>Planned: no story of the plan is failed any more (a person re-ran the failed one); the hold a failed story put on it is lifted.</summary>
+        public const string PlanResumed = "plan-resumed";
+        /// <summary>
+        /// Planned: the plan item's comment for the latest <see cref="PlanHeld"/> (failed story), <see cref="PlanStuck"/> or
+        /// <see cref="PlanResumed"/> row; Detail is <c>posted</c> or <c>failed: …</c> (tried again by the next evaluations, up to
+        /// <see cref="MaxPlanNoticeAttempts"/>).
+        /// </summary>
+        public const string PlanNotice = "plan-notice";
     }
+
+    /// <summary>How often the plan item's comment for one hold (or its lifting) is tried before it is left to the ledger and the dashboard.</summary>
+    public const int MaxPlanNoticeAttempts = MaxCloseoutAttempts;
 
     /// <summary>
     /// Detail of the Paused row recorded when a Pause control stopped the run. Such an item resumes (its
@@ -312,6 +426,28 @@ public sealed partial class RunPipeline(
     {
         public WorkStory Story => Spec.Story;
 
+        /// <summary>
+        /// The repository the item's story names (sc-25873). <see cref="Repo"/> for every item but a plan item taking a changeset
+        /// pull request through the gate in another repository: the item is that repository's only for that pass, and this
+        /// one's again once the pass has ended (<see cref="MergeAsync"/>).
+        /// </summary>
+        public required RepoRef Primary { get; init; }
+
+        /// <summary>
+        /// The item's branch, whose pull request is the item's: its own <c>factory/&lt;id&gt;</c> branch, or — a plan item taking its
+        /// changeset to the default branch (sc-25872) — the plan's changeset branch.
+        /// </summary>
+        public required string Branch { get; init; }
+
+        /// <summary>
+        /// The branch the item's branch starts from and its pull request targets: the changeset branch of the item's plan
+        /// (sc-25872), or null for the repository's default branch (an item of no plan, and a plan item's own changeset).
+        /// </summary>
+        public string? BaseBranch { get; init; }
+
+        /// <summary>A plan item's changeset (the item's branch is then the changeset branch); null for every other item.</summary>
+        public Plans.Changeset? Changeset { get; init; }
+
         /// <summary>The worktree this run is using, once Implement has one.</summary>
         public Workspace? Workspace { get; set; }
     }
@@ -323,6 +459,7 @@ public sealed partial class RunPipeline(
             var handlers = new Dictionary<WorkState, Func<Run, CancellationToken, Task>>
             {
                 [WorkState.Intake] = IntakeAsync,
+                [WorkState.Plan] = PlanAsync,
                 [WorkState.Implement] = ImplementAsync,
             };
             if (gate is not null)
@@ -339,13 +476,13 @@ public sealed partial class RunPipeline(
     }
 
     /// <summary>States the implement stage drives (all a pipeline without a <see cref="GateStage"/> drives).</summary>
-    public static readonly IReadOnlySet<WorkState> ImplementStates = new HashSet<WorkState> { WorkState.Intake, WorkState.Implement };
+    public static readonly IReadOnlySet<WorkState> ImplementStates = new HashSet<WorkState> { WorkState.Intake, WorkState.Plan, WorkState.Implement };
 
     /// <summary>States the factory's handlers drive (the production pipeline has a <see cref="GateStage"/>); an item in one is in flight.</summary>
     public static readonly IReadOnlySet<WorkState> HandledStates = new HashSet<WorkState>
     {
-        WorkState.Intake, WorkState.Implement, WorkState.Review, WorkState.Fixing, WorkState.CI, WorkState.CIHealing, WorkState.MergeGate,
-        WorkState.Merge,
+        WorkState.Intake, WorkState.Plan, WorkState.Implement, WorkState.Review, WorkState.Fixing, WorkState.CI, WorkState.CIHealing,
+        WorkState.MergeGate, WorkState.Merge,
     };
 
     /// <summary>The states this pipeline drives.</summary>
@@ -354,7 +491,8 @@ public sealed partial class RunPipeline(
     /// <summary>
     /// Story ids of items a run should pick up: first the items being stopped (whatever their state; a stop is finished even in a
     /// frozen factory, before anything is deferred), then, oldest first and unless a control pauses them, those in a handled
-    /// state and those paused in one in a way that resumes by itself (<see cref="ResumesAutomatically"/>, not parked).
+    /// state and those paused in one in a way that resumes by itself (<see cref="ResumesAutomatically"/>, not parked), and plan items
+    /// waiting on their stories (<see cref="WorkState.Planned"/>, sc-25871: each poll releases what is unblocked; no worker runs).
     /// </summary>
     /// <param name="handled">The states the runner's pipeline drives; default <see cref="HandledStates"/> (production).</param>
     /// <param name="naming">The source whose items to list; default Shortcut stories.</param>
@@ -368,16 +506,21 @@ public sealed partial class RunPipeline(
         var stops = new List<int>();
         var ids = new List<int>();
         var active = await ledger.ActiveItemsAsync(naming.Source, ct);
-        // A merged item whose closeout failed is listed until it is posted or its attempts are used up (a run retries it from Watch).
-        var closeouts = handled.Contains(WorkState.Merge)
-            ? await ledger.CloseoutRowsAsync(active.Where(i => i.State == WorkState.Watch).Select(i => i.Id).ToList(), ct)
-            : Array.Empty<LedgerEntry>().ToLookup(e => e.WorkItemId);
+        // A merged item whose closeout failed is listed until it is posted or its attempts are used up (a run retries it from Watch);
+        // a finished plan whose closeout failed likewise (it waits in Planned).
+        var closeouts = await ledger.CloseoutRowsAsync(active.Where(i => i.State == WorkState.Planned
+            || (i.State == WorkState.Watch && handled.Contains(WorkState.Merge))).Select(i => i.Id).ToList(), ct);
+        var byId = active.ToDictionary(i => i.Id);
         foreach (var item in active)
         {
-            var beingStopped = stopping.Contains(ControlScope.Item(item.ExternalId));
+            // Its own Stop, or its plan's (sc-25876: a story of a plan being stopped, unless it already merged — the controls say which).
+            var beingStopped = stopping.Contains(ControlScope.Item(item.ExternalId))
+                || (item.PlanItemId is { } plan && byId.TryGetValue(plan, out var planItem) && stopping.Contains(ControlScope.Item(planItem.ExternalId))
+                    && await controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) == ControlState.Stopping);
             if (!beingStopped)
             {
                 var resumable = handled.Contains(item.State)
+                    || (item.State == WorkState.Planned && !PlanCloseoutAbandoned(item.State, closeouts[item.Id]))
                     || CloseoutPending(item.State, closeouts[item.Id])
                     || (item.State == WorkState.Paused && ResumesAutomatically(await ledger.HistoryAsync(item, ct), handled));
                 if (!resumable || await controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) != ControlState.Running)
@@ -413,6 +556,15 @@ public sealed partial class RunPipeline(
         // Decide from the ledger (and the controls) before reading anything from the board.
         var known = await ledger.FindAsync(Naming.Source, Naming.Format(storyId), ct);
         var knownControl = known is null ? ControlState.Running : await _controls.EffectiveAsync(known.ExternalId, known.EpicId, ct);
+        if (_workerless && (known?.State != WorkState.Planned || knownControl == ControlState.Stopping))
+        {
+            // Decided since the runner looked (a Stop landed, or the item moved): this run holds no worker run lock, so it must not
+            // stop an orphaned worker (sandboxed: every worker-user process) or touch a worktree while another process's worker runs.
+            var why = knownControl == ControlState.Stopping ? "stop deferred to the next run" : "deferred to the next run";
+            log.WriteLine($"[{known?.State.ToString() ?? "intake"}] {Naming.Format(storyId)}: {why} (this run was started without the worker run lock)");
+            return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null,
+                $"{Naming.Format(storyId)}: {why}; this run was started without the worker run lock");
+        }
         if (known is not null && knownControl == ControlState.Stopping)
         {
             // A stop is finished even while the factory is frozen: it starts no new work.
@@ -439,6 +591,13 @@ public sealed partial class RunPipeline(
             {
                 return await HoldAsync(known, storyId, ct);
             }
+            // A plan story parked because a blocker had not merged (sc-25871) and still listed ready: nothing is written until
+            // the blocker has merged, however often the board lists it.
+            if (known.State == WorkState.Paused && await StillBlockedAsync(known, storyId, ct) is { } blocked)
+            {
+                log.WriteLine($"[paused] {known.ExternalId} parked: {blocked}");
+                return await OutcomeAsync(known, $"{known.ExternalId} parked: {blocked}", ct);
+            }
             // Resuming (an escalated item re-enters Intake, whose claim checks the scope itself).
             if (known.State != WorkState.Escalated && !ignoreScope && !await source.InScopeAsync(storyId, ct))
             {
@@ -448,14 +607,27 @@ public sealed partial class RunPipeline(
 
         var spec = await source.ReadSpecAsync(storyId, ct);
         var story = spec.Story;
-        if (known is null && await _controls.EffectiveAsync(Naming.Format(storyId), spec.Epic?.Id, ct) is not ControlState.Running and var control)
+        var control = known is not null ? ControlState.Running : await _controls.EffectiveAsync(Naming.Format(storyId), spec.Epic?.Id, ct);
+        if (known is null && control == ControlState.Running)
         {
-            // A paused factory or epic claims nothing new: the story stays as it is on the board.
+            control = await PlanControlAsync(Naming.Format(storyId), ct);
+        }
+        if (control != ControlState.Running)
+        {
+            // A paused factory or epic claims nothing new, nor does a paused or stopping plan for its stories (sc-25876): the story
+            // stays as it is on the board.
             log.WriteLine($"[intake] {Naming.Format(storyId)} is {control} by a control; not claiming it.");
             return new RunOutcome(0, WorkState.Intake, null, null, $"{Naming.Format(storyId)} is {control} by a control; not claimed.");
         }
-        var repo = RepoResolver.Resolve(story.Description, defaultRepo);
-        var item = await ledger.GetOrCreateAsync(Naming.Source, Naming.Format(storyId), story.Name, repo.FullName, IntakeDetail(story), ct, spec.Epic?.Id);
+        // A story parked because its plan never recorded it (sc-25871) and still listed ready: nothing is written while that holds.
+        if (known is { State: WorkState.Paused } && await StillWithoutPlanAsync(known, story, ct) is { } unfinished)
+        {
+            log.WriteLine($"[paused] {known.ExternalId} parked: {unfinished}");
+            return await OutcomeAsync(known, $"{known.ExternalId} parked: {unfinished}", ct);
+        }
+        // The repository the item's story names: every item's own, and a plan item's primary one (sc-25873).
+        var primary = RepoResolver.Resolve(story.Description, defaultRepo);
+        var item = await ledger.GetOrCreateAsync(Naming.Source, Naming.Format(storyId), story.Name, primary.FullName, IntakeDetail(story), ct, spec.Epic?.Id);
 
         await using var runLock = await locks.TryAcquireAsync(item.Id, ct);
         if (runLock is null)
@@ -463,9 +635,48 @@ public sealed partial class RunPipeline(
             log.WriteLine($"[{item.State}] {item.ExternalId} is already running; not touching it.");
             return new RunOutcome(item.Id, item.State, null, null, $"{item.ExternalId} is already running.");
         }
+        // A plan item taking one of its changesets through the gate (sc-25873) works in that changeset's repository until it has
+        // merged: the pull request, the gate policy, CI and the merge queue are that repository's. Any other item, and a plan item
+        // in any other state, works in the repository its story names. Decided from the rows read under the run lock, never from
+        // what was loaded before it: another process may have finished one repository's pull request and opened the next one's
+        // meanwhile, and this run would take that one through the gate as the earlier repository's.
+        var repo = Plans.Changeset.PassRepo(await ledger.HistoryAsync(item, ct)) ?? primary;
         // Re-read under the lock: another run may have moved the item since it was loaded.
         await ledger.RefreshAsync(item, story.Name, repo.FullName, spec.Epic?.Id, ct);
-        var run = new Run(spec, repo, item);
+        // A story a plan created records its plan (sc-25871), from the ledger's own record of what the plan created. Looked up
+        // until the item is first claimed: a plan's story is linked before its claim (WithoutPlanAsync refuses one that is not),
+        // so an item that was ever claimed without a link is no plan's story and is not looked up on every later run.
+        if (item.PlanItemId is null && source.PlansItems && !(await ledger.HistoryAsync(item, ct)).Any(e => e.Step == Steps.Claimed)
+            && await ledger.PlanOfAsync(Naming.Source, item.ExternalId, ct) is { } planItem)
+        {
+            await ledger.LinkPlanAsync(item, planItem, ct);
+        }
+        // Where the item's work goes (sc-25872), from the ledger: a plan's story branches from its plan's changeset branch and
+        // merges into it; a plan item whose stories have all merged works on the changeset branch itself, against the default branch.
+        var changeset = Plans.Changeset.Of(await ledger.HistoryAsync(item, ct), repo);
+        var ofPlan = item.PlanItemId is { } plan ? await ledger.ChangesetOfAsync(plan, repo, ct) : (null, []);
+        var run = new Run(spec, repo, item)
+        {
+            Primary = primary,
+            Branch = changeset?.Branch ?? story.Kind.BranchName(story.Id),
+            BaseBranch = ofPlan.Changeset?.Branch,
+            Changeset = changeset,
+        };
+        // Fail closed: a plan with a changeset has none on origin for this repository (the story's `Repo:` line names another one),
+        // so the story would merge into that repository's default branch, count as merged and be left out of the changeset pull
+        // request. Only a plan recorded before changesets (no `changeset` row at all) has its stories target the default branch.
+        var noChangeset = ofPlan is { Changeset: null, Recorded: [.., var recorded] }
+            ? $"{item.ExternalId} is a story of the plan whose changeset branch is {recorded.Branch} in "
+                + $"{string.Join(", ", ofPlan.Recorded.Select(c => c.Repo).Distinct(StringComparer.OrdinalIgnoreCase))}, and that plan has no changeset "
+                + $"branch in {repo}: the story cannot merge into its plan's changeset. Its `Repo:` line must name the plan's repository."
+            // Nor into another repository's changeset of its plan (sc-25873): the plan counts the story for the repository it
+            // recorded it in, and that repository's changeset would go to its default branch without the story's work.
+            : item.PlanItemId is { } owner && await RecordedRepoAsync(owner, item.ExternalId, ct) is { } planned
+                && !string.Equals(planned, repo.FullName, StringComparison.OrdinalIgnoreCase)
+            ? $"{item.ExternalId} is a story of a plan that recorded it in {planned}, but its `Repo:` line now names {repo}: there it "
+                + $"would merge into another repository's changeset of the plan, while the plan still waits for it in {planned}. "
+                + $"Its `Repo:` line must name {planned}."
+            : null;
 
         if (Lifecycle.IsTerminal(item.State))
         {
@@ -480,6 +691,15 @@ public sealed partial class RunPipeline(
             {
                 return await OutcomeAsync(item, EscalationCommentNotPosted(commentError), ct);
             }
+            // A plan's story whose pull request someone merged into its plan's changeset branch (sc-25877) counts as merged for
+            // its plan: its work is on that branch already. A re-run would implement it a second time, so there is none.
+            if (item.PlanItemId is not null && Plans.PlanRelease.MergedOutsideChangeset(await ledger.HistoryAsync(item, ct)))
+            {
+                var done = $"{item.ExternalId} was {Plans.PlanRelease.MergedOutsideIntoChangeset}: for its plan it counts as merged, "
+                    + $"and a re-run does nothing. {char.ToUpperInvariant(Plans.PlanRelease.BoardStoryStillClaimed[0])}{Plans.PlanRelease.BoardStoryStillClaimed[1..]}.";
+                log.WriteLine($"[{item.State}] {done}");
+                return await OutcomeAsync(item, done, ct);
+            }
             await ledger.RecordAsync(item, WorkState.Intake, null, $"re-run after escalation; {IntakeDetail(story)}", ct);
         }
         else if (item.State == WorkState.Paused)
@@ -492,6 +712,10 @@ public sealed partial class RunPipeline(
 
         try
         {
+            if (noChangeset is not null)
+            {
+                throw new WorkerFailedException(noChangeset);
+            }
             while (Handlers.TryGetValue(item.State, out var handler))
             {
                 // Pause/Stop: no new step starts once a control says so.
@@ -576,7 +800,10 @@ public sealed partial class RunPipeline(
             log.WriteLine($"[paused] interrupted; `factory run {item.ExternalId}` resumes");
             throw;
         }
-        catch (Exception ex)
+        // The factory's own failure (the planner's seat: its sweep, the MCP proxy, the session file's ACL) is not the item's: it
+        // reaches the caller, which treats it as factory-wide (IntakeLoop.IsFactoryWide). The item stays where it is, nothing is
+        // recorded against it, and the next run takes the step again; whatever threw it has already cleaned up after itself.
+        catch (Exception ex) when (ex is not FactoryUnavailableException)
         {
             // Includes an OperationCanceledException nobody asked for, e.g. an HttpClient timeout.
             var commentError = await EscalateAsync(run, ex is WorkerFailedException ? ex.Message : $"{ex.GetType().Name}: {ex.Message}");
@@ -600,7 +827,9 @@ public sealed partial class RunPipeline(
             log.WriteLine($"[paused] {item.ExternalId} parked: {reason}");
             return await OutcomeAsync(item, $"{item.ExternalId} parked: {reason}", ct);
         }
-        log.WriteLine($"[{item.State}] parked; no handler for {item.State} in this phase");
+        log.WriteLine(item.State == WorkState.Planned
+            ? $"[{item.State}] {item.ExternalId} waits on its plan's stories; the next run or poll releases the unblocked ones"
+            : $"[{item.State}] parked; no handler for {item.State} in this phase");
         return await OutcomeAsync(item, null, ct);
     }
 
@@ -624,8 +853,29 @@ public sealed partial class RunPipeline(
             var error = await PostCloseoutAsync(item, storyId, ct);
             return await OutcomeAsync(item, error is null ? null : $"{item.ExternalId}: closeout NOT posted: {error}", ct);
         }
+        if (item.State == WorkState.Planned)
+        {
+            // A plan item waiting on its stories (sc-25871): release what is unblocked, or close the plan out.
+            var evaluated = await PlannedAsync(item, storyId, history, ct);
+            // A Stop that landed while the plan was evaluated (sc-25876): nothing watches a control during the evaluation, so this
+            // run finishes the stop now, under the run lock it holds — the plan item is not left Stopping with nobody acting on it.
+            // A run started without the worker run lock defers it, as it does a Stop it finds at its start.
+            if (!Lifecycle.IsTerminal(item.State) && await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) == ControlState.Stopping)
+            {
+                if (_workerless)
+                {
+                    log.WriteLine($"[{item.State}] {item.ExternalId}: stop deferred to the next run (this run was started without the worker run lock)");
+                    return evaluated with { Error = $"{item.ExternalId}: stop deferred to the next run; this run was started without the worker run lock" };
+                }
+                return await FinishStopAsync(item, storyId, RepoRef.Parse(item.Repo), null, workerStillRunning: false);
+            }
+            return evaluated;
+        }
         var entered = history.FindLastIndex(e => e.Step is null);
-        if (!Runnable(item, await ledger.ContextAsync(item, ct)) && !history.Skip(entered + 1).Any(e => e.Step == Steps.HeldNotice))
+        // A finished plan item (sc-25871) was told so by its closeout: no notice on top of it.
+        var finishedPlan = item.State == WorkState.Done && history.Any(e => e.Step == Steps.PlanStories);
+        if (!finishedPlan && !Runnable(item, await ledger.ContextAsync(item, ct))
+            && !history.Skip(entered + 1).Any(e => e.Step == Steps.HeldNotice))
         {
             var id = Naming.Format(storyId);
             try
@@ -688,6 +938,15 @@ public sealed partial class RunPipeline(
         var intake = history.FindLastIndex(e => e.Step is null && e.State == WorkState.Intake);
         if (!history.Skip(intake + 1).Any(e => e.Step == Steps.Claimed))
         {
+            // A story of a plan is not started before its blockers have merged (sc-25871, E7), whoever moved it to ready: the
+            // claim is refused before the board is asked for it, the refusal naming the blockers.
+            // Nor is a story that says a plan created it but that the ledger links to no plan: its blockers cannot be checked.
+            if ((await WithoutPlanAsync(run.Item, run.Story, ct) ?? await BlockedAsync(run.Item, run.Story.Id, ct)) is { } blocked)
+            {
+                await ledger.RecordAsync(run.Item, WorkState.Paused, null, $"{ClaimRefused}: {blocked}", ct);
+                await ledger.CheckpointAsync(run.Item, Steps.Parked, null, blocked, ct);
+                return;
+            }
             var claim = await source.ClaimAsync(run.Story.Id, ignoreScope, ct);
             if (!claim.Claimed)
             {
@@ -705,7 +964,12 @@ public sealed partial class RunPipeline(
             await ledger.CheckpointAsync(run.Item, Steps.Claimed, null, null, ct);
             log.WriteLine($"[intake] claimed {run.Item.ExternalId}");
         }
-        // Phase 1 has no Plan step: the worker implements straight from the story.
+        // A plan item (sc-25870) is planned into stories, never implemented itself; any other item is implemented straight from its story.
+        if (source.PlansItems && Plans.PlanLabel.IsOn(run.Story))
+        {
+            await ledger.RecordAsync(run.Item, WorkState.Plan, null, $"label {Plans.PlanLabel.Name}", ct);
+            return;
+        }
         await ledger.RecordAsync(run.Item, WorkState.Implement, null, null, ct);
     }
 
@@ -739,7 +1003,7 @@ public sealed partial class RunPipeline(
     {
         var (spec, repo, item) = run;
         var story = spec.Story;
-        var branch = story.Kind.BranchName(story.Id);
+        var (branch, baseBranch) = (run.Branch, run.BaseBranch);
         var fullHistory = await ledger.HistoryAsync(item, ct);
         var attempt = CurrentWorkerAttempt(fullHistory);
         var stuckHint = StuckRetryHint(fullHistory);
@@ -757,7 +1021,7 @@ public sealed partial class RunPipeline(
         // A session found looping is never resumed (a run that stopped after the detection left only its checkpoint).
         if (StuckSession(attempt) is { } found)
         {
-            run.Workspace = await workspaces.ReopenAsync(repo, branch, ct);
+            run.Workspace = await workspaces.ReopenAsync(repo, branch, ct, baseBranch);
             await StuckImplementAsync(run, found, ct);
             return;
         }
@@ -765,11 +1029,11 @@ public sealed partial class RunPipeline(
         Workspace? workspace = null;
         if (attempt.Any(e => e.Step is not null))
         {
-            workspace = await workspaces.ReopenAsync(repo, branch, ct);
+            workspace = await workspaces.ReopenAsync(repo, branch, ct, baseBranch);
             if (workspace is null && attempt.Any(e => e.Step == Steps.Pushed))
             {
                 // The work is on origin: rebuild the worktree from it rather than redo it and force-push over it.
-                workspace = await workspaces.RestoreAsync(repo, branch, ct);
+                workspace = await workspaces.RestoreAsync(repo, branch, ct, baseBranch);
                 await ledger.CheckpointAsync(item, Steps.WorktreeRestored, session, $"worktree missing on resume; re-created from origin/{branch}", ct);
             }
             else if (workspace is null)
@@ -781,10 +1045,11 @@ public sealed partial class RunPipeline(
         }
         if (workspace is null)
         {
-            workspace = await workspaces.PrepareAsync(repo, branch, ct);
+            // A plan's story starts from its plan's changeset branch (sc-25872), so it sees the stories that blocked it.
+            workspace = await workspaces.PrepareAsync(repo, branch, ct, baseBranch);
         }
         run.Workspace = workspace;
-        log.WriteLine($"[implement] worktree {workspace.Path} on {workspace.Branch}");
+        log.WriteLine($"[implement] worktree {workspace.Path} on {workspace.Branch}{(baseBranch is null ? "" : $" from {baseBranch}")}");
 
         if (!attempt.Any(e => e.Step == Steps.WorkerDone))
         {
@@ -903,12 +1168,25 @@ public sealed partial class RunPipeline(
     /// On success it checkpoints <see cref="Steps.WorkerDone"/> and returns the session id.
     /// </summary>
     private async Task<string?> RunWorkerSessionAsync(Run run, Workspace workspace, string? session, Func<string?, string> prompt,
-        HashSet<string> models, IReadOnlyCollection<WorkerInput> inputs, string label, string modelClass, CancellationToken ct)
+        HashSet<string> models, IReadOnlyCollection<WorkerInput> inputs, string label, string modelClass, CancellationToken ct) =>
+        (await RunSessionAsync(run, worker, workspace.Path, null, implementing: true, session, prompt, models,
+            inputs.Select(Taint.Of).OfType<string>().ToList(), label, modelClass, ct)).Session;
+
+    /// <summary>
+    /// <see cref="RunWorkerSessionAsync"/> for any session of the item: <paramref name="runner"/> in <paramref name="path"/>, tainted from
+    /// its start by <paramref name="inputTaints"/>. An <paramref name="implementing"/> session (the implementer, a fixer) loads the
+    /// worktree's Claude settings — which taint and are guarded (<see cref="RepoSettingsGuard"/>) —, has its models recorded and is
+    /// watched by the stuck detector; a planner session (sc-25870: read-only, no settings file loaded, no round to fail, reaching the
+    /// loopback MCP proxy through <paramref name="mcpConfig"/>) is not. Returns the session id and the worker's result.
+    /// </summary>
+    private async Task<(string? Session, WorkerResult Result)> RunSessionAsync(Run run, IWorker runner, string path, string? mcpConfig, bool implementing,
+        string? session, Func<string?, string> prompt, HashSet<string> models, IReadOnlyList<string> inputTaints, string label, string modelClass,
+        CancellationToken ct)
     {
         var item = run.Item;
         var resume = session;
         // The target repo's own Claude settings may feed the session content its stream would not show (hooks, MCP, extra allow rules).
-        var taints = inputs.Select(Taint.Of).Append(Taint.OfRepoSettings(workspace.Path)).OfType<string>().ToList();
+        var taints = implementing ? inputTaints.Append(Taint.OfRepoSettings(path)).OfType<string>().ToList() : inputTaints;
         // Every worker this runs exists to push its work: a tainted session would only be refused its push token after spending
         // the model's time, so it is not resumed at all (E4). Its stored stream is replayed first: a run stopped between storing
         // a web tool's line and committing its taint left the use only there.
@@ -925,14 +1203,17 @@ public sealed partial class RunPipeline(
             }
         }
         // The worktree's Claude settings must not replace the router variables or pin a model (E8): the session does not start.
-        ThrowIfUnsafeRepoSettings(workspace, starting: true);
+        if (implementing)
+        {
+            ThrowIfUnsafeRepoSettings(path, starting: true);
+        }
         // No worker session starts into a frozen factory (implement, a fix round, a CI fix).
         await ThrowIfFrozenAsync(item, ct);
         log.WriteLine(resume is null ? $"[{label}] starting worker" : $"[{label}] resuming claude session {resume}");
         // Every stdout line is stored (and pushed to live viewers) as it streams (E7).
         await using var capture = sessions is null ? null : await sessions.StartAsync(item.Id, resume, ct);
         // Pause asks the worker to stop at its next tool boundary (and stops it if it doesn't); Stop stops it now.
-        await using var watch = new ControlWatch(_controls, worker, log, _controlPoll, _pauseGrace, item.ExternalId, item.EpicId, workspace.Path,
+        await using var watch = new ControlWatch(_controls, runner, log, _controlPoll, _pauseGrace, item.ExternalId, item.EpicId, path,
             _maxControlReadFailures, ct);
         // A looping session is interrupted at its next tool boundary like a Pause, but never resumed (sc-25388).
         var detector = new StuckDetector(_stuck);
@@ -942,7 +1223,7 @@ public sealed partial class RunPipeline(
         WorkerResult result;
         try
         {
-            result = await worker.RunAsync(workspace.Path, prompt(resume), resume, modelClass,
+            result = await runner.RunAsync(path, prompt(resume), resume, modelClass,
                 new WorkerCallbacks(
                     OnStarted: (pid, c) => ledger.CheckpointAsync(item, Steps.WorkerStarted, session, pid.ToString(), c),
                     OnSession: async (sid, c) =>
@@ -976,7 +1257,7 @@ public sealed partial class RunPipeline(
                         {
                             await capture.OnLineAsync(line, c);
                         }
-                        if (detector.Accept(line) is { } reason)
+                        if (implementing && detector.Accept(line) is { } reason)
                         {
                             // On the ledger before the interrupt (and on a token nothing cancels): a run that stops now must not
                             // resume the looping session.
@@ -988,7 +1269,7 @@ public sealed partial class RunPipeline(
                     },
                     OnModel: async (model, c) =>
                     {
-                        if (models.Add(model))
+                        if (implementing && models.Add(model))
                         {
                             await ledger.CheckpointAsync(item, Steps.ImplementerModel, session, model, c);
                         }
@@ -997,7 +1278,7 @@ public sealed partial class RunPipeline(
                     {
                         await ledger.TaintSessionAsync(item, sid, reason, c);
                         log.WriteLine($"[{label}] session {sid} used {reason}: tainted, it gets no push token");
-                    }), watch.Token);
+                    }), mcpConfig, watch.Token);
         }
         catch (Exception ex) when (watch.Requested is { } requested && !ct.IsCancellationRequested)
         {
@@ -1074,20 +1355,23 @@ public sealed partial class RunPipeline(
                 $"Worker failed (exit {result.ExitCode}, result {result.ResultSubtype ?? "none"}): {result.ResultText} {result.StderrTail}".Trim());
         }
         // The worker can write the repo's settings itself (a hook it added may have run in-session): checked again before it is done.
-        if (session is not null && Taint.OfRepoSettings(workspace.Path) is { } changed)
+        if (implementing && session is not null && Taint.OfRepoSettings(path) is { } changed)
         {
             await ledger.TaintSessionAsync(item, session, changed, ct);
         }
         // Nor may the worker leave such settings for a later session (or push them): its round fails instead.
-        ThrowIfUnsafeRepoSettings(workspace, starting: false);
+        if (implementing)
+        {
+            ThrowIfUnsafeRepoSettings(path, starting: false);
+        }
         await ledger.CheckpointAsync(item, Steps.WorkerDone, session, $"worker exit {result.ExitCode}", ct);
-        return session;
+        return (session, result);
     }
 
     /// <summary>Fails the worker round (escalates) when the worktree's Claude settings are not safe (<see cref="RepoSettingsGuard"/>).</summary>
-    private static void ThrowIfUnsafeRepoSettings(Workspace workspace, bool starting)
+    private static void ThrowIfUnsafeRepoSettings(string worktree, bool starting)
     {
-        if (RepoSettingsGuard.Refusal(workspace.Path) is { } refusal)
+        if (RepoSettingsGuard.Refusal(worktree) is { } refusal)
         {
             throw new WorkerFailedException(starting
                 ? $"The worker session was not started: the worktree's Claude settings are refused ({refusal}). Only keys that cannot "
@@ -1217,12 +1501,16 @@ public sealed partial class RunPipeline(
         }
     }
 
-    /// <summary>Whether a user's Pause holds the item: on the factory, its epic or the item itself.</summary>
+    /// <summary>Whether a user's Pause holds the item: on the factory, its epic, the item itself or the plan it is a story of (sc-25876).</summary>
     private async Task<bool> UserPausedAsync(WorkItem item)
     {
-        string[] scopes = item.EpicId is { } epic
+        List<string> scopes = item.EpicId is { } epic
             ? [ControlScope.Factory, ControlScope.Epic(epic), ControlScope.Item(item.ExternalId)]
             : [ControlScope.Factory, ControlScope.Item(item.ExternalId)];
+        if (item.PlanItemId is { } plan && await ledger.ItemAsync(plan, CancellationToken.None) is { } planItem)
+        {
+            scopes.Add(ControlScope.Item(planItem.ExternalId));
+        }
         foreach (var scope in scopes)
         {
             if ((await _controls.GetAsync(scope, CancellationToken.None))?.State == ControlState.Paused)
@@ -1252,12 +1540,14 @@ public sealed partial class RunPipeline(
         Workspace? workspace = null;
         if (!Lifecycle.IsTerminal(item.State))
         {
-            var attempt = CurrentWorkerAttempt(await ledger.HistoryAsync(item, ct));
+            var history = await ledger.HistoryAsync(item, ct);
+            var attempt = CurrentWorkerAttempt(history);
             if (OrphanedWorkerPid(attempt) is { } pid && await worker.StopOrphanAsync(pid, ct))
             {
                 await ledger.CheckpointAsync(item, Steps.OrphanKilled, null, $"pid {pid}", ct);
             }
-            workspace = await workspaces.ReopenAsync(repo, Naming.BranchName(storyId), ct);
+            // A plan item's worktree is its changeset branch's (sc-25872); only the worktree is removed, the branch stays.
+            workspace = await workspaces.ReopenAsync(repo, Plans.Changeset.Of(history, repo)?.Branch ?? Naming.BranchName(storyId), ct);
         }
         return await FinishStopAsync(item, storyId, repo, workspace, workerStillRunning: false);
     }
@@ -1475,14 +1765,14 @@ public sealed partial class RunPipeline(
     }
 
     /// <summary>
-    /// Whether a worktree directory (<c>factory-sc-&lt;id&gt;</c>, <c>factory-gh-&lt;id&gt;</c>) belongs to an item a re-run would resume
+    /// Whether a worktree directory (<c>factory-sc-&lt;id&gt;</c>, <c>factory-gh-&lt;id&gt;</c>, or a plan item's changeset worktree
+    /// <c>factory-changeset-sc-&lt;id&gt;</c>, sc-25872) belongs to an item a re-run would resume
     /// in it (Implement, a fix round in Fixing or CIHealing, or Paused), so the startup sweep must keep it. Everything else is an orphan
     /// (a triage worktree, <c>factory-triage-gh-&lt;id&gt;</c>, never is).
     /// </summary>
     public static async Task<bool> WorktreeIsResumableAsync(WorkLedger ledger, string worktreeName, CancellationToken ct)
     {
-        const string prefix = "factory-";
-        if (!worktreeName.StartsWith(prefix, StringComparison.Ordinal) || ItemNaming.ParseAny(worktreeName[prefix.Length..]) is not { } item)
+        if (ItemNaming.OfWorktree(worktreeName) is not { } item)
         {
             return false;
         }
@@ -1491,8 +1781,8 @@ public sealed partial class RunPipeline(
     }
 
     /// <summary>
-    /// Rows of the current worker attempt: from the last entry into Implement, Fixing or CIHealing (a fix round; a return
-    /// from Paused continues the attempt) or the last lost-worktree restart.
+    /// Rows of the current worker attempt: from the last entry into Implement, Fixing or CIHealing (a fix round), or Plan (a plan
+    /// item's planner; a return from Paused continues the attempt) or the last lost-worktree restart.
     /// </summary>
     private static List<LedgerEntry> CurrentWorkerAttempt(List<LedgerEntry> history)
     {
@@ -1503,7 +1793,7 @@ public sealed partial class RunPipeline(
             var e = history[i];
             if (e.Step is null)
             {
-                if (e.State is WorkState.Implement or WorkState.Fixing or WorkState.CIHealing && previous != WorkState.Paused)
+                if (e.State is WorkState.Implement or WorkState.Fixing or WorkState.CIHealing or WorkState.Plan && previous != WorkState.Paused)
                 {
                     start = i;
                 }
@@ -1548,7 +1838,8 @@ public sealed partial class RunPipeline(
     /// <c>factory work</c> gives up on an item whose runs keep failing before the pipeline starts (E10; see
     /// <see cref="IItemRunner.GiveUpAsync"/>): under the item's run lock, an item in a handled state is escalated with
     /// the usual escalation comment; a paused one (which may not escalate) is parked with a comment, so it no longer
-    /// resumes by itself; an item the ledger does not know gets only the comment. Returns what was done, or null.
+    /// resumes by itself; a plan item waiting on its stories (Planned, sc-25871) gets one comment and one <c>plan-held</c> row per
+    /// reason and stays Planned; an item the ledger does not know gets only the comment. Returns what was done, or null.
     /// </summary>
     public static async Task<string?> GiveUpAsync(IWorkSource source, WorkLedger ledger, IRunLocks locks, int storyId, string reason,
         TextWriter log, CancellationToken ct)
@@ -1576,6 +1867,35 @@ public sealed partial class RunPipeline(
             log.WriteLine($"[escalated] {id}: {reason}");
             var commentError = await PostEscalationCommentAsync(source, ledger, log, known, storyId, ct);
             return commentError is null ? "escalated" : $"escalated; {EscalationCommentNotPosted(commentError)}";
+        }
+        if (known.State == WorkState.Planned)
+        {
+            // A plan waiting on its stories that cannot be evaluated (sc-25871: a story of it deleted on the board, a board read
+            // that keeps failing): it may not escalate (it stays Planned and goes on by itself once the cause is gone), so it is
+            // told once per reason — one comment, one row — and not again while that row is still its last.
+            var detail = Plans.PlanRelease.NotEvaluatedPrefix + reason;
+            if ((await ledger.HistoryAsync(known, ct)).LastOrDefault() is { Step: Steps.PlanHeld } last && last.Detail == detail)
+            {
+                log.WriteLine($"[{known.State}] {id} still cannot be evaluated: {reason}; already commented");
+                return "held; already commented for this reason";
+            }
+            log.WriteLine($"[{known.State}] {id} cannot be evaluated: {reason}");
+            try
+            {
+                await source.CommentAsync(storyId,
+                    $"{id} is a plan waiting on its stories and the factory could not evaluate it, so none of its stories is released "
+                    + "until this is resolved; a human needs to look. Reason:\n"
+                    + UntrustedText.Fenced(LedgerReport.Clip(reason, LedgerReport.MaxReasonLength))
+                    + $"\n{id} stays Planned: the factory evaluates it again every poll and goes on by itself once the cause is gone.", ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                log.WriteLine($"[{known.State}] could not comment on {id}: {ex.Message}");
+                await ledger.CheckpointAsync(known, Steps.PlanHeld, null, $"{detail}; comment NOT posted: {ex.Message}", ct);
+                return $"held; comment NOT posted: {ex.Message}";
+            }
+            await ledger.CheckpointAsync(known, Steps.PlanHeld, null, detail, ct);
+            return "commented";
         }
         if (known.State == WorkState.Paused)
         {
@@ -1631,6 +1951,18 @@ public sealed partial class RunPipeline(
         var (escalated, last) = (history[at], history[at - 1]);
         var (reason, session) = (escalated.Detail, escalated.ClaudeSessionId);
         var lastState = $"{last.State}{(last.Step is null ? "" : $" (after step {last.Step})")} at {last.RecordedAt:u}";
+        // A plan of several repositories (sc-25873) may be partly delivered: the record first, then the comment says the same.
+        var changesets = Plans.Changeset.States(history, RepoRef.Parse(item.Repo), item.State);
+        var delivery = "";
+        if (changesets.Count > 1)
+        {
+            var record = Plans.Changeset.DeliveryOf(changesets);
+            if (!history.Skip(at + 1).Any(e => e.Step == Steps.PlanDelivery))
+            {
+                await ledger.CheckpointAsync(item, Steps.PlanDelivery, session, record, CancellationToken.None);
+            }
+            delivery = $"\n{Plans.Changeset.DeliveryNote(source.Naming.Format(storyId), changesets)}\n";
+        }
 
         // The closeout on escalation (sc-25389): the reason (factory text that can quote model findings, so fenced as data) and the
         // ledger's facts, never a worker's summary.
@@ -1643,8 +1975,8 @@ public sealed partial class RunPipeline(
             Claude session: {session ?? "none"}
 
             Re-run with `factory run {source.Naming.Format(storyId)}` once resolved.
-
-            """ + "\n" + LedgerReport.Facts(history, await ledger.SessionCostsAsync(item, ct)).TrimEnd();
+            {delivery}
+            """ + "\n" + LedgerReport.Facts(Plans.Changeset.CurrentPass(history), await ledger.SessionCostsAsync(item, ct)).TrimEnd();
         try
         {
             await source.CommentAsync(storyId, comment, ct);
@@ -1672,6 +2004,13 @@ public sealed partial class RunPipeline(
 
     public static string BranchUrl(RepoRef repo, string branch) => $"https://github.com/{repo}/tree/{branch}";
 
+    /// <summary>
+    /// What every implementing prompt (implement, review fix, CI fix, conflict fix) asks before the worker stops, naming the
+    /// build-and-test commands the worker is allowed (<see cref="ClaudeWorker.AllowedTools"/>: .NET's, and cargo's since sc-25877).
+    /// </summary>
+    internal const string BuildsAndPasses =
+        "the build and the tests pass (`dotnet build` and `dotnet test`; in a Rust package `cargo build` and `cargo test`)";
+
     public static string BuildPrompt(WorkSpec spec, RepoRef repo)
     {
         var story = spec.Story;
@@ -1680,7 +2019,7 @@ public sealed partial class RunPipeline(
             Implement {story.Kind.Noun} {story.Ref} ({story.StoryType}): {PromptFence.Spec(story)}
 
             Make the smallest change that satisfies the story, including a test when the
-            project has tests, and make sure `dotnet build` and `dotnet test` pass.
+            project has tests, and make sure {BuildsAndPasses}.
             Do not commit, push, or open pull requests; the orchestrator does that.
             """;
         if (spec.Epic is { } epic)
@@ -1704,6 +2043,24 @@ public sealed partial class RunPipeline(
     /// The PR's description, rendered from the item's ledger rows and recorded session costs (<see cref="LedgerReport.PullRequestBody"/>): it
     /// links back to the item and, for an item that closes an issue (<see cref="WorkStory.Closes"/>), carries GitHub's closing keyword.
     /// </summary>
-    private async Task<string> PullRequestBodyAsync(Run run, CancellationToken ct) =>
-        LedgerReport.PullRequestBody(run.Story, await ledger.HistoryAsync(run.Item, ct), await ledger.SessionCostsAsync(run.Item, ct));
+    private async Task<string> PullRequestBodyAsync(Run run, CancellationToken ct)
+    {
+        var history = await ledger.HistoryAsync(run.Item, ct);
+        var costs = await ledger.SessionCostsAsync(run.Item, ct);
+        if (run.Changeset is not { } changeset)
+        {
+            return LedgerReport.PullRequestBody(run.Story, history, costs, run.BaseBranch);
+        }
+        // One of several changesets (sc-25873): this repository's stories, this pull request's rows, and where every changeset stands.
+        var states = Plans.Changeset.States(history, run.Repo, run.Item.State);
+        var stories = await PlanStoryReportsAsync(history, ct);
+        if (states.Count > 1 && Plans.PlanRelease.RecordedRepos(history.LastOrDefault(e => e.Step == Steps.Plan)?.Detail,
+                [.. stories.Select(s => s.ExternalId)], run.Repo) is { } repos)
+        {
+            var mine = repos.StoriesIn(changeset.Repo);
+            stories = [.. stories.Where(s => mine.Contains(s.ExternalId))];
+        }
+        return LedgerReport.ChangesetPullRequestBody(run.Item.ExternalId, run.Story.AppUrl, changeset, stories, Plans.Changeset.CurrentPass(history), costs,
+            states.Count > 1 ? states : null);
+    }
 }

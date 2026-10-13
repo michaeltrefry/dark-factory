@@ -235,6 +235,8 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
         }
     }
 
+    public bool PlansItems => true;
+
     public async Task<IReadOnlyList<int>> CreateChildrenAsync(int parentId, IReadOnlyList<ChildItem> children, CancellationToken ct)
     {
         for (var i = 0; i < children.Count; i++)
@@ -245,17 +247,49 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
             }
         }
         var parent = await GetStoryAsync(parentId, ct);
+        // The children are found again among the stories of the parent's epic or team: with neither, a retry after a failure part
+        // way would create every child a second time, so nothing is created at all.
+        if (parent.EpicId is null && parent.GroupId is null)
+        {
+            throw new ChildrenRefusedException($"{ItemNaming.Shortcut.Format(parentId)} has neither an epic nor a team, so stories created from it could "
+                + "not be found again after a failed attempt; put it in an epic or a team first");
+        }
         // Plan output waits in Backlog: nothing picks a child up until it is moved to To Do.
         var backlog = await StateIdAsync(parent.WorkflowId, BoardStateName(BoardState.Stopped), ct);
-        // A retry after a partial failure reuses what the earlier call created: an unarchived story with
-        // the child's exact name in the parent's epic and team, and its blocker relations.
+        // A retry after a partial failure reuses what the earlier call created: an unarchived story in the parent's epic and team
+        // carrying the child's idempotency key as its external id (sc-25877: written by code, sent at creation, so finding it
+        // again does not depend on the board returning a Markdown description unchanged), and its blocker relations. The name
+        // alone never decides: a namesake someone else wrote is not this call's child.
         var existing = (await SiblingsAsync(parent, ct))
             .Where(s => !s.Archived && s.Id != parentId && s.EpicId == parent.EpicId && s.GroupId == parent.GroupId)
             .ToList();
+        var parentRef = ItemNaming.Shortcut.Format(parentId);
         var ids = new List<int>();
         foreach (var child in children)
         {
-            var reused = existing.FirstOrDefault(s => s.Name == child.Name && !ids.Contains(s.Id));
+            var key = child.Key(parentRef);
+            Story? reused = null;
+            // The listings carry each story's external id; the story is then read in full for its relations (and the key again).
+            foreach (var keyed in existing.Where(s => s.ExternalId == key && !ids.Contains(s.Id)))
+            {
+                var full = await GetStoryAsync(keyed.Id, ct);
+                if (!full.Archived && full.ExternalId == key)
+                {
+                    reused = full;
+                    break;
+                }
+            }
+            // Fallback, only for a child created before stories carried a key (no external id at all): its exact name and
+            // description. The listings carry no description, so each such namesake is read in full.
+            foreach (var namesake in reused is not null ? [] : existing.Where(s => s.Name == child.Name && string.IsNullOrEmpty(s.ExternalId) && !ids.Contains(s.Id)))
+            {
+                var full = await GetStoryAsync(namesake.Id, ct);
+                if (!full.Archived && string.IsNullOrEmpty(full.ExternalId) && SameText(full.Description, child.Description))
+                {
+                    reused = full;
+                    break;
+                }
+            }
             int id;
             if (reused is not null)
             {
@@ -269,6 +303,7 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
                     ["description"] = child.Description,
                     ["story_type"] = child.StoryType,
                     ["workflow_state_id"] = backlog,
+                    ["external_id"] = key,
                 };
                 if (parent.GroupId is { } group)
                 {
@@ -293,6 +328,77 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
         }
         return ids;
     }
+
+    /// <summary>
+    /// The stories that block <paramref name="id"/>: the subject of every <c>blocks</c> relation whose object it is (the story's own
+    /// <c>story_links</c>; a relation is listed on both of its stories), each read for whether the board shows it finished — not
+    /// archived and in a workflow state whose <c>type</c> the API gives as <see cref="DoneStateType"/> (never a state id or name).
+    /// One GET for the story and one per blocker.
+    /// </summary>
+    public async Task<IReadOnlyList<Blocker>> BlockersAsync(int id, CancellationToken ct)
+    {
+        var blockers = new List<Blocker>();
+        foreach (var blocker in (await GetStoryAsync(id, ct)).StoryLinks.Where(l => l.Verb == "blocks" && l.ObjectId == id && l.SubjectId != id)
+            .Select(l => l.SubjectId).Distinct().Order())
+        {
+            var story = await GetStoryAsync(blocker, ct);
+            var done = (await WorkflowsAsync(ct)).SelectMany(w => w.States).Any(s => s.Id == story.WorkflowStateId && s.Type == DoneStateType);
+            blockers.Add(new Blocker(blocker, done && !story.Archived));
+        }
+        return blockers;
+    }
+
+    /// <summary>The <c>type</c> the Shortcut API gives a workflow state that means finished.</summary>
+    public const string DoneStateType = "done";
+
+    /// <summary>Backlog → <see cref="ReadyState"/>, only for a story still in its workflow's Backlog (state ids by name, from the API).</summary>
+    public async Task<ReadyResult> MakeReadyAsync(int id, CancellationToken ct)
+    {
+        var story = await GetStoryAsync(id, ct);
+        if (story.Archived)
+        {
+            return ReadyResult.Archived;
+        }
+        if (story.WorkflowStateId != await StateIdAsync(story.WorkflowId, BoardStateName(BoardState.Stopped), ct))
+        {
+            return ReadyResult.AlreadyLeft;
+        }
+        await UpdateAsync(id, new { workflow_state_id = await StateIdAsync(story.WorkflowId, ReadyState, ct) }, ct);
+        return ReadyResult.Moved;
+    }
+
+    public async Task<bool> InBacklogAsync(int id, CancellationToken ct)
+    {
+        var story = await GetStoryAsync(id, ct);
+        return !story.Archived && story.WorkflowStateId == await StateIdAsync(story.WorkflowId, BoardStateName(BoardState.Stopped), ct);
+    }
+
+    /// <summary>
+    /// <see cref="ReadyState"/> → Backlog with a comment, only for a story that is not archived, still in a ready state, and owned and
+    /// claimed by nobody but the factory; any other story is left as it is (false, nothing written).
+    /// </summary>
+    public async Task<bool> ReturnUnstartedAsync(int id, string comment, CancellationToken ct)
+    {
+        var me = await MeAsync(ct);
+        var story = await GetStoryAsync(id, ct);
+        if (story.Archived || !(await ReadyStateIdsAsync(ct)).Contains(story.WorkflowStateId)
+            || story.OwnerIds.Any(o => o != me) || HeldByAnother(story, me))
+        {
+            return false;
+        }
+        await UpdateAsync(id, new
+        {
+            workflow_state_id = await StateIdAsync(story.WorkflowId, BoardStateName(BoardState.Stopped), ct),
+            owner_ids = story.OwnerIds.Where(o => o != me),
+            labels = LabelParams(story.LabelNames.Where(l => l != ClaimLabel)),
+        }, ct);
+        await CommentAsync(id, comment, ct);
+        return true;
+    }
+
+    /// <summary>Whether a stored description is the one that was sent (line endings and outer whitespace aside).</summary>
+    private static bool SameText(string? stored, string sent) =>
+        string.Equals((stored ?? "").ReplaceLineEndings("\n").Trim(), sent.ReplaceLineEndings("\n").Trim(), StringComparison.Ordinal);
 
     /// <summary>The stories that share the parent's epic (or, without one, its team); none if it has neither.</summary>
     private async Task<List<Story>> SiblingsAsync(Story parent, CancellationToken ct) =>
@@ -441,7 +547,8 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
 
     private sealed record WorkflowState(
         [property: JsonPropertyName("id")] long Id,
-        [property: JsonPropertyName("name")] string Name);
+        [property: JsonPropertyName("name")] string Name,
+        [property: JsonPropertyName("type")] string? Type = null);
 
     private sealed record Workflow(
         [property: JsonPropertyName("id")] long Id,
@@ -470,7 +577,8 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
         [property: JsonPropertyName("labels")] List<Label>? Labels,
         [property: JsonPropertyName("external_links")] List<string>? Links,
         [property: JsonPropertyName("story_links")] List<StoryLink>? Relations,
-        [property: JsonPropertyName("estimate")] int? Estimate = null)
+        [property: JsonPropertyName("estimate")] int? Estimate = null,
+        [property: JsonPropertyName("external_id")] string? ExternalId = null)
     {
         public List<string> OwnerIds => Owners ?? [];
         public List<string> LabelNames => Labels?.Select(l => l.Name).ToList() ?? [];

@@ -6,7 +6,7 @@ namespace DarkFactory.Orchestrator.Worker;
 /// The router model class every worker session names (E8, sc-25659): the router picks the model inside the class
 /// (<c>x-weave-model-class</c>), the worker never pins a model, and the factory never falls back to another class. The choice is
 /// this deterministic code, never a model's: the implementer and its fix rounds run on the item's coding class
-/// (<see cref="Coding"/>), the CI fixer on <see cref="CiFix"/>, issue triage on <see cref="Triage"/>.
+/// (<see cref="Coding"/>), the CI fixer on <see cref="CiFix"/>, issue triage on <see cref="Triage"/>, the planner on <see cref="Planner"/>.
 /// </summary>
 public static class WorkerModelClass
 {
@@ -25,6 +25,9 @@ public static class WorkerModelClass
 
     /// <summary>The issue triage worker's class.</summary>
     public const string Triage = Low;
+
+    /// <summary>The planner's class (sc-25870): a plan decides what every story after it builds.</summary>
+    public const string Planner = High;
 
     /// <summary>Whether <paramref name="modelClass"/> is one the router takes (exactly <c>high</c>, <c>mid</c> or <c>low</c>).</summary>
     public static bool IsValid(string? modelClass) => modelClass is High or Mid or Low;

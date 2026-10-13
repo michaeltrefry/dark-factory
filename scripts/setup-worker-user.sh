@@ -244,10 +244,36 @@ EOF
     return 1
 }
 
+# check_optional_toolchain <what needs it> <command line>... - like check_toolchain for tools only
+# some target repositories need: reports each one's version, or that it is missing and what
+# needs it. Never fails the setup.
+check_optional_toolchain() {
+    local needs=$1 tool out status
+    shift
+    for tool in "$@"; do
+        # shellcheck disable=SC2086 # tool is a command line
+        if out=$(with_open_stdin sudo -u "$owner" sudo -n -u "$worker" "$helper" $tool 2>&1); then
+            echo "    ok    $tool: $out"
+        else
+            status=$?
+            echo "    none  $tool (exit $status): not available to $worker ($needs)"
+        fi
+    done
+    return 0
+}
+
 echo "warning: the toolchain check runs commands as $worker through the helper, and each helper exit KILLS EVERY" >&2
 echo "         $worker process (a running factory work worker, any sudo -u $worker session). Close those first." >&2
 say "Checking the toolchain as $worker through the helper"
 check_toolchain "/usr/local/share/dotnet/dotnet --version" "git --version" "claude --version" || exit 1
+
+# Rust target repositories only (sc-25875): the merge gate's new-tests check runs cargo as the
+# worker. cargo and rustc must be on the helper's fixed PATH - /opt/homebrew/bin or
+# /usr/local/bin (e.g. `brew install rust`, or rustup installed as $worker with its cargo and
+# rustc linked into /usr/local/bin). Without them every Rust pull request's check is an error
+# (toolchain-missing), never a pass; a factory that builds only .NET needs neither.
+say "Checking the optional Rust toolchain as $worker through the helper"
+check_optional_toolchain "Rust repos only: the new-tests check of a Rust pull request fails without it" "cargo --version" "rustc --version"
 
 say "Done. Worker user: $worker  Helper: $helper  Work root: $work_root"
 cat <<EOF

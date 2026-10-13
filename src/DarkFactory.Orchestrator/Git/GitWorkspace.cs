@@ -2,33 +2,81 @@ using System.Diagnostics;
 using DarkFactory.Orchestrator.Gateway;
 using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
+using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.Orchestrator.Git;
 
 /// <param name="GitDir">The worktree's git admin dir in the owner's clone, recorded before the worker runs.</param>
 public sealed record Workspace(string Path, string Branch, string BaseBranch, string GitDir);
 
+/// <summary>A throwaway directory (<paramref name="Path"/>) holding a checkout of each of several repositories, each in its own directory under it.</summary>
+public sealed record SeatWorkspace(string Path, IReadOnlyList<(RepoRef Repo, Workspace Workspace)> Checkouts);
+
+/// <summary>
+/// Checkouts of several repositories under one directory (sc-25874): a plan item's planner reads every repository its plan may
+/// touch, and its one <c>Read</c> rule allows one directory.
+/// </summary>
+public interface ISeatWorkspace
+{
+    /// <summary>
+    /// A fresh directory holding, for each of <paramref name="repos"/>, a worktree of its default branch on <paramref name="branch"/>
+    /// (a local <c>factory/*</c> name, never pushed) at <c>&lt;owner&gt;/&lt;name&gt;</c> under it.
+    /// </summary>
+    Task<SeatWorkspace> PrepareSeatAsync(IReadOnlyList<RepoRef> repos, string branch, CancellationToken ct);
+
+    /// <summary>Deletes the seat: every checkout, then the directory.</summary>
+    Task RemoveSeatAsync(SeatWorkspace seat, CancellationToken ct);
+}
+
+/// <summary>
+/// Where a new branch would start (<see cref="IRepoWorkspace.BranchStartAsync"/>): the repository's default branch and its head as
+/// fetched now, and the branch's own head on origin when it already exists there (null otherwise).
+/// </summary>
+public sealed record BranchStart(string BaseBranch, string BaseSha, string? Existing);
+
 public interface IRepoWorkspace
 {
-    Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct);
+    /// <summary>
+    /// A fresh worktree on <paramref name="branch"/> started from the item's base branch as fetched now:
+    /// <paramref name="baseBranch"/> (a plan story's changeset branch, sc-25872), or the repository's default branch when null.
+    /// The base is the worktree's <see cref="Workspace.BaseBranch"/>, which its pull request targets.
+    /// </summary>
+    Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null);
 
     /// <summary>
     /// Re-creates a story's worktree from its already-pushed branch (<c>origin/&lt;branch&gt;</c>)
     /// instead of the base branch, so pushed work is continued rather than redone.
     /// </summary>
-    Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct);
+    Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null);
 
     /// <summary>
     /// Returns a story's existing worktree as left behind by an interrupted run, without
     /// touching it, or null when it is gone or no longer on <paramref name="branch"/>.
     /// </summary>
-    Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct);
+    Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null);
+
+    /// <summary>
+    /// Fetches, and says where <paramref name="branch"/> (a <c>factory/*</c> name) would start: the default branch and its head,
+    /// and the branch's head on origin when it exists already. Reads only.
+    /// </summary>
+    Task<BranchStart> BranchStartAsync(RepoRef repo, string branch, CancellationToken ct);
+
+    /// <summary>
+    /// Makes <paramref name="branch"/> exist on origin and returns its head there: a branch origin already has is adopted as it is
+    /// (never reset, never force-pushed); otherwise it is created at <paramref name="sha"/>, a commit the clone has, with the
+    /// factory App's token. No worktree and no worker are involved.
+    /// </summary>
+    Task<string> CreateBranchAsync(RepoRef repo, string branch, string sha, CancellationToken ct);
 
     /// <summary>
     /// Commits any worker changes and pushes the branch. Returns false when there is nothing to push. The push token is minted only
     /// with a <paramref name="grant"/> (<see cref="Ledger.WorkLedger.GrantPushAsync"/>: the worker sessions whose work this publishes
     /// are untainted, E4).
     /// </summary>
+    /// <remarks>
+    /// An item's own branch is overwritten (a re-run after an escalation starts over from the base). A changeset branch
+    /// (<see cref="ItemNaming.IsChangesetBranch"/>) holds its plan's merged stories and is only ever fast-forwarded.
+    /// </remarks>
     Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, PushGrant grant, CancellationToken ct);
 
     /// <summary>The commit the worktree's HEAD is at (after <see cref="CommitAndPushAsync"/>: the commit it pushed).</summary>
@@ -82,7 +130,7 @@ public sealed class GitWorkspace(
     string worktreesDirectory = GitWorkspace.ItemWorktrees,
     bool shareWithWorker = true,
     GitStreamCommand? gitStream = null)
-    : IRepoWorkspace, Gate.IReviewFiles
+    : IRepoWorkspace, ISeatWorkspace, Gate.IReviewFiles
 {
     private readonly GitCommand _git = git ?? RunGitAsync;
     private readonly GitStreamCommand _gitStream = gitStream ?? RunGitStreamAsync;
@@ -97,18 +145,116 @@ public sealed class GitWorkspace(
     /// <summary>The repository's github.com remote (<see cref="GitRemoteReads.GitHubRemote"/>: the gateway owns it).</summary>
     public static string GitHubRemote(RepoRef repo) => GitRemoteReads.GitHubRemote(repo);
 
-    public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct) =>
-        CreateWorktreeAsync(repo, branch, baseBranch => $"origin/{baseBranch}", ct);
+    public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) =>
+        CreateWorktreeAsync(repo, branch, baseBranch, @base => $"origin/{@base}", ct);
 
-    public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct) =>
-        CreateWorktreeAsync(repo, branch, _ => $"origin/{branch}", ct);
+    public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) =>
+        CreateWorktreeAsync(repo, branch, baseBranch, _ => $"origin/{branch}", ct);
 
-    private async Task<Workspace> CreateWorktreeAsync(RepoRef repo, string branch, Func<string, string> startPoint, CancellationToken ct)
+    private async Task<Workspace> CreateWorktreeAsync(RepoRef repo, string branch, string? requestedBase, Func<string, string> startPoint,
+        CancellationToken ct)
+    {
+        EnsureFactoryBranch(branch);
+        EnsureBase(branch, requestedBase);
+        var clone = await FetchAsync(repo, ct);
+        var baseBranch = requestedBase ?? await BaseBranchAsync(clone, ct);
+        if (requestedBase is not null && await RemoteHeadAsync(clone, requestedBase, ct) is null)
+        {
+            throw new InvalidOperationException($"{repo} has no branch '{requestedBase}' on origin, so {branch} cannot be based on it.");
+        }
+        return await AddWorktreeAsync(clone, WorktreePath(repo, branch), branch, baseBranch, ["-B", branch], startPoint(baseBranch), ct);
+    }
+
+    /// <summary>A base other than the default branch is only ever a changeset branch (sc-25872), and never the branch itself.</summary>
+    private static void EnsureBase(string branch, string? baseBranch)
+    {
+        if (baseBranch is not null && (!ItemNaming.IsChangesetBranch(baseBranch) || baseBranch == branch))
+        {
+            throw new InvalidOperationException(
+                $"Refusing to base '{branch}' on '{baseBranch}': an item's base is its repository's default branch or its plan's {ItemNaming.ChangesetBranchPrefix}* branch.");
+        }
+    }
+
+    public async Task<BranchStart> BranchStartAsync(RepoRef repo, string branch, CancellationToken ct)
     {
         EnsureFactoryBranch(branch);
         var clone = await FetchAsync(repo, ct);
         var baseBranch = await BaseBranchAsync(clone, ct);
-        return await AddWorktreeAsync(clone, WorktreePath(repo, branch), branch, baseBranch, ["-B", branch], startPoint(baseBranch), ct);
+        var baseSha = await RemoteHeadAsync(clone, baseBranch, ct)
+            ?? throw new InvalidOperationException($"{repo}'s default branch '{baseBranch}' has no commit on origin.");
+        return new BranchStart(baseBranch, baseSha, await RemoteHeadAsync(clone, branch, ct));
+    }
+
+    public async Task<string> CreateBranchAsync(RepoRef repo, string branch, string sha, CancellationToken ct)
+    {
+        EnsureFactoryBranch(branch);
+        var clone = await FetchAsync(repo, ct);
+        if (await RemoteHeadAsync(clone, branch, ct) is { } existing)
+        {
+            // Adopted as it is: an earlier run created it, and stories may have merged into it since.
+            return existing;
+        }
+        var commit = (await Git(clone, null, ct, "rev-parse", "--verify", "--end-of-options", $"{sha}^{{commit}}")).Trim();
+        await Git(clone, await AuthEnvironment(repo, ct), ct, GitRemoteWrites.CreateBranch(commit, branch));
+        return commit;
+    }
+
+    /// <summary>The head of <paramref name="branch"/> on origin as last fetched, or null when origin has no such branch.</summary>
+    private async Task<string?> RemoteHeadAsync(string clone, string branch, CancellationToken ct) =>
+        (await Git(clone, null, ct, "for-each-ref", "--format=%(objectname)", $"refs/remotes/origin/{branch}")).Trim() is { Length: > 0 } sha ? sha : null;
+
+    /// <summary>
+    /// The seat's directory is where <paramref name="repos"/>' first repository's worktree of <paramref name="branch"/> would be
+    /// (so <see cref="SweepOrphansAsync"/> finds a leftover one), each checkout a worktree at <c>&lt;owner&gt;/&lt;name&gt;</c> inside it,
+    /// created like any worktree (<see cref="AddWorktreeAsync"/>: the clone fetched with that repository's own token).
+    /// </summary>
+    public async Task<SeatWorkspace> PrepareSeatAsync(IReadOnlyList<RepoRef> repos, string branch, CancellationToken ct)
+    {
+        EnsureFactoryBranch(branch);
+        if (repos.Count == 0 || repos.DistinctBy(r => r.FullName, StringComparer.OrdinalIgnoreCase).Count() != repos.Count)
+        {
+            throw new ArgumentException("A seat holds at least one repository, each once.", nameof(repos));
+        }
+        var path = WorktreePath(repos[0], branch);
+        // Whatever an earlier run left there (a seat, or the single worktree of the same name), and its registration in the clone.
+        await DeleteWorktreeAsync(ClonePath(repos[0]), path, ct);
+        Directory.CreateDirectory(path);
+        var checkouts = new List<(RepoRef, Workspace)>();
+        try
+        {
+            foreach (var repo in repos)
+            {
+                var clone = await FetchAsync(repo, ct);
+                var baseBranch = await BaseBranchAsync(clone, ct);
+                checkouts.Add((repo, await AddWorktreeAsync(clone, Path.Combine(path, repo.Owner, repo.Name), branch, baseBranch, ["-B", branch],
+                    $"origin/{baseBranch}", ct)));
+            }
+            return new SeatWorkspace(path, checkouts);
+        }
+        catch
+        {
+            await RemoveSeatAsync(new SeatWorkspace(path, checkouts), CancellationToken.None);
+            throw;
+        }
+    }
+
+    public async Task RemoveSeatAsync(SeatWorkspace seat, CancellationToken ct)
+    {
+        foreach (var (repo, workspace) in seat.Checkouts)
+        {
+            await DeleteWorktreeAsync(ClonePath(repo), workspace.Path, ct);
+        }
+        if (Directory.Exists(seat.Path))
+        {
+            if (sandbox is not null)
+            {
+                await sandbox.DeleteAsWorkerAsync(seat.Path, ct);
+            }
+            if (Directory.Exists(seat.Path))
+            {
+                Directory.Delete(seat.Path, recursive: true);
+            }
+        }
     }
 
     /// <summary>Clones the repo on first use, else fetches (pruning) and refreshes <c>origin/HEAD</c>; returns the clone's path.</summary>
@@ -536,9 +682,10 @@ public sealed class GitWorkspace(
     }
 
     /// <summary>Reads the branch through the clone-side admin dir, never the worktree's worker-writable <c>.git</c> file.</summary>
-    public async Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct)
+    public async Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null)
     {
         EnsureFactoryBranch(branch);
+        EnsureBase(branch, baseBranch);
         var clone = ClonePath(repo);
         var worktree = WorktreePath(repo, branch);
         if (!Directory.Exists(worktree) || await AdminDirAsync(clone, worktree, ct) is not { } gitDir)
@@ -546,7 +693,7 @@ public sealed class GitWorkspace(
             return null;
         }
         var head = (await Git(clone, null, ct, $"--git-dir={gitDir}", "symbolic-ref", "--quiet", "--short", "HEAD")).Trim();
-        return head == branch ? new Workspace(worktree, branch, await BaseBranchAsync(clone, ct), gitDir) : null;
+        return head == branch ? new Workspace(worktree, branch, baseBranch ?? await BaseBranchAsync(clone, ct), gitDir) : null;
     }
 
     /// <summary>
@@ -624,7 +771,9 @@ public sealed class GitWorkspace(
         {
             return false;
         }
-        await Git(dir, await AuthEnvironment(repo, ct), ct, GitRemoteWrites.Push(tree, workspace.Branch, force: true));
+        // A changeset branch holds its plan's merged stories: a fix round on it only ever adds to what origin has.
+        await Git(dir, await AuthEnvironment(repo, ct), ct,
+            GitRemoteWrites.Push(tree, workspace.Branch, force: !ItemNaming.IsChangesetBranch(workspace.Branch)));
         return true;
     }
 

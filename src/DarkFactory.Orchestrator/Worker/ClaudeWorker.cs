@@ -324,9 +324,28 @@ public sealed class ClaudeWorker(
 
     public const string RouterKeyHeader = "X-Weave-Router-Key";
 
-    /// <summary>Tools a skeleton worker may use; no git/gh so it cannot push or merge on its own.</summary>
+    /// <summary>
+    /// The build-and-test commands of the Rust stack (sc-25877, a coordinator decision of 2026-10-13 pending the owner's
+    /// confirmation): without them a worker on a cargo repository could never compile or run a test. Exactly these four cargo
+    /// built-ins, each a Claude Code prefix rule (<c>:*</c>: the command must start with the words before it), like the
+    /// <c>dotnet</c> three. What the prefix leaves out, so what a headless worker is denied: <c>cargo run</c>, <c>install</c>,
+    /// <c>publish</c>, <c>login</c>, <c>owner</c>, <c>yank</c>, every other subcommand, and any form whose second word is not
+    /// the subcommand (<c>cargo +nightly test</c>, <c>cargo --config … build</c>). An alias in a repository's
+    /// <c>.cargo/config.toml</c> cannot rebind these four names (cargo ignores an alias that shadows a built-in command).
+    /// Accepted residual, the same as the <c>dotnet</c> rules' (<see cref="Taint"/>): what follows the prefix is the worker's
+    /// (<c>--manifest-path</c>, <c>--config</c>, <c>-- &lt;test arguments&gt;</c>), and these commands run code the repository and
+    /// its dependencies supply — build scripts, procedural macros, tests, a configured runner or rustc wrapper — as the sandbox
+    /// user with no credential but the router key; the result goes back through review, CI and the gate.
+    /// </summary>
+    public static readonly string[] CargoTools =
+        ["Bash(cargo build:*)", "Bash(cargo check:*)", "Bash(cargo test:*)", "Bash(cargo fetch:*)"];
+
+    /// <summary>
+    /// Tools an implementing worker may use: file tools and the build-and-test commands of the stacks the gate reads (.NET, and
+    /// cargo: <see cref="CargoTools"/>); no git/gh so it cannot push or merge on its own.
+    /// </summary>
     public static readonly string[] AllowedTools =
-        ["Read", "Edit", "Write", "Glob", "Grep", "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(dotnet restore:*)"];
+        ["Read", "Edit", "Write", "Glob", "Grep", "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(dotnet restore:*)", .. CargoTools];
 
     /// <summary>
     /// Tools a worker is denied (<c>--disallowedTools</c>, which beats any allow rule, the target repo's own settings included): the

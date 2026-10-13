@@ -18,11 +18,16 @@ Claude Code headless workers through the Weave router.
   review and merge gate (`Gate/`: `ReviewModels` (which panel calls count), `ReviewPanel` (roles, prompts, findings),
   `Reviewer.cs` (`IReviewer`/`RouterReviewer`) reading the router's stream with `MessageStream`, `GatePolicy` (+ `RiskyPaths`)
   and the path tiers `PathTiers`, `MergeGate`, `FixLoop`, `CiHeal`, `MergeQueue`, the test-only `GateCheckSeam`, the new-tests
-  check `NewTests.cs` (`NewTestsCheck`)/`XunitNewTests`/`SandboxTestRunner`;
+  check `NewTests.cs` (`NewTestsCheck`)/`XunitNewTests`/`CargoNewTests` (Rust, over the lexer-level `RustSource`)/`SandboxTestRunner`,
+  the plan-time check of a repository's CI workflow triggers `CiTriggers.cs` (sc-25873; pipeline side `RunPipeline.CiTriggers.cs`);
   reviewer prompts in `factory/prompts/`; GitHub side
   `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`, the merge gate and queue `RunPipeline.MergeQueue.cs`),
   the MCP upstreams and the loopback MCP proxy (`Mcp/`: `McpHttpClient`, `McpUpstream`/`McpUpstreams`/`McpServers`
   (allowlists), `McpProxy`, `McpProxySessions`; CodeGraph's client `CodeGraph/CodeGraphMcpClient.cs`; sc-25707),
+  plan items (`Plans/`: `Plan.cs` — the typed plan, `PlanParser`, the `plan` label and the planned-story marker — and
+  `PlanWorker.cs` — `IPlanRunner`, `WorkerPlanRunner`, `PlanPrompt`; `PlanRelease.cs` — the release decision and the one "blocker
+  satisfied" rule (sc-25871), and the classification of a plan's stories with what a failed one holds (sc-25876); `Changeset.cs` — a plan's changeset branch and the changeset review's spec (sc-25872); pipeline handler `RunPipeline.Plan.cs`; the production seat `SandboxPlanRunner` in `FactoryRunner.cs`;
+  sc-25870),
   and the outbound gateway (`Gateway/`: `OutboundHttp` builds every GitHub, Shortcut, router, CodeGraph and Kanban `HttpClient` (and the
   acceptance tests' dashboard client and their loopback-only client of the MCP proxy, `LoopbackMcp`); `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token
   credentials; `GitRemoteReads` the github.com remote URL and every clone/fetch's arguments (sc-25391); `GitHubCli` is the only
@@ -73,6 +78,12 @@ Claude Code headless workers through the Weave router.
   A test signals a process only through `OwnProcess` (pid + start time, recorded where the pid cannot have been reused;
   `KillIfStillRunning` signals only while the start time still matches); `OwnProcessTests` fails on any other kill in
   `tests/` (`Process.Kill`, a kill(2) import, a `kill`/`pkill`/`killall` in a script).
+  Known flake, cause in the helper itself (sc-25877; about 1 in 100 runs of `WorkerSandboxTests`, any test asserting the helper's
+  stderr is empty, seen on `Uid_sweep_ignores_its_own_machinery_and_settles_at_once`): the helper ends its watcher with
+  `send_signal "$watcher"` and reaps it on the next line with `wait "$watcher" 2>/dev/null`; bash 3.2 also reports a signal-killed
+  job when it reads the next script line, so a watcher reaped between the two lines puts `… Terminated: 15 ( while … )` on the
+  helper's real stderr. The fix is one redirected group in `scripts/factory-worker-launch` (`{ send_signal "$watcher" || true;
+  wait "$watcher" || true; } 2>/dev/null`) and needs the owner's re-install; do not loosen the tests' assertion instead.
   `CrashResumeTests` also needs the compose Postgres (skips locally without it, fails under `CI`): it
   SIGKILLs `tests/DarkFactory.CrashHost` (the real pipeline with a fake `claude` script) and restarts it.
   `ShortcutContractTests` replay recorded Shortcut API fixtures (`Fixtures/shortcut`, strict request matching);
@@ -83,10 +94,35 @@ Claude Code headless workers through the Weave router.
   `GateNegativeTests` (sealed path, corrupt policy on a throwaway branch, a new test passing on the base, a 4th fix round; review
   panel replaced by `SeededReviewer`, seeding through `SandboxRepo`), `FreezeAndStuckTests` (freeze seeded in the throwaway
   ledger; a stub Claude CLI replaying the stuck/silent fixtures), `IssueTriageTests.A_triage_session_that_read_issue_text_is_tainted_and_cannot_push`.
+  Phase 4a's P4-AT1 (sc-25870, sc-25871, sc-25872, `PlanAcceptanceTests`): a real planner plans a `plan`-labelled story into Backlog
+  stories — at least 3 with a dependency chain, else the run fails INCONCLUSIVE (`PlanLive.ChainProblem`) — created once, then
+  released in dependency order; each released story is really worked and merged by the gate into the plan's changeset branch, and
+  the plan item then takes the changeset to the default branch by one gated pull request and is closed out, the plan's and each
+  story's closeout on the board equal to `LedgerReport`'s rendering of the throwaway ledger's rows; a sibling test
+  (`P4_AT1_factory_work_…`, `FACTORY_E2E_P4_WORK_PLAN_STORY` + the watch scope) runs a whole plan through the real intake loop
+  (`FactoryHost.BuildWork`): the plan item picked up in the watch scope, its stories released into it and picked up from
+  `ListReadyAsync` (sc-25877). P4-AT2 (sc-25873, `MultiRepoPlanAcceptanceTests`, `FACTORY_E2E_P4_MULTI_PLAN_STORY` + `FACTORY_E2E_P4_SECOND_REPO`):
+  a plan across two repositories — a changeset branch in each, each story's pull request in its own repository, the changesets
+  merged in the plan's order; INCONCLUSIVE unless a story waits on a changeset (`PlanLive.ChangesetBlockerProblem`). P4-AT3
+  (`PlanAcceptanceTests`): the proxy part (sc-25874) — the production proxy with a planner
+  grant over two repositories (`FACTORY_E2E_P4_PLAN_REPOS`) answers for each and refuses a third project, a call naming no
+  repository and off-list tools — and the three refusals (sc-25877), each Escalated with nothing created on the ledger or the real
+  board: a plan with a cycle and an oversized plan (`FACTORY_E2E_P4_CYCLE_STORY`, `FACTORY_E2E_P4_OVERSIZED_STORY`; a stub Claude
+  CLI answering a fixed plan, `StubClaude.Answering`, through the production planner seat) and a `Repo:` line naming an
+  unconfigured repository (`FACTORY_E2E_P4_UNCONFIGURED_STORY`; no session at all). `PlanLiveTests` (not live) check those
+  fixtures and the INCONCLUSIVE rules in every `dotnet test`. P4-AT5 (sc-25876, `PlanFailureAcceptanceTests`, `FACTORY_E2E_P4_HOLD_STORY`): a fixed plan's
+  stories on the real board, their progress seeded in the throwaway ledger (the plan item with its `changeset`/`changeset-pushed`
+  rows, as production leaves it) — an escalated story holds its dependent, the plan item
+  is commented once, the dashboard data groups the stories, and Stop on the plan item stops its stories and cancels it; no model.
   Phase 3's epic AT1–AT5 (sc-25710, `CodeGraphAcceptanceTests.cs`): `CodeGraphReviewTests` (the real panel's tool calls, turns and
   overlay-bound CodeGraph answers), `CodeGraphTriageTests` (a triage session through the proxy, scanned for the CodeGraph token by a
   wrapper Claude Code path, `ScanWrapper`; the production proxy refusing off-profile tools; a live Kanban read through the reviewers'
   tools), `CodeGraphGateTests` (a critical file escalating on risk-threshold; CodeGraph unreachable blocking at the CI timeout).
+  Phase 4a's P4-AT4 (sc-25875): `GateNegativeTests.P4_AT4_…` (a seeded cargo package on the PR branch: the new-tests check run by
+  cargo as the worker user; needs cargo and rustc for `_factory`) — the rejection (a test that already passes on the base) and
+  the merge (sc-25877, `FACTORY_E2E_P4_CARGO_MERGE_STORY`: a test of new code, `not-built` on the base and passing on the head,
+  `new-tests` `pass`, a `Merge` gate row, `gate-passed`, the pull request merged; it leaves a crate per run under the sandbox's
+  `e2e-rust-merged/`).
 
 ## Commands
 
@@ -120,7 +156,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `CodeGraph:BaseUrl` | the hosted CodeGraph (`OutboundHttp.CodeGraphDefaultBase`; an absolute http(s) URL naming no model provider): reviewers' CodeGraph tools (`ReviewTools.CodeGraphTools`) go to its `mcp` endpoint |
 | `CodeGraph:OverlayTimeoutMinutes` | `10` (> 0: how long a review waits, before its first panel call, for CodeGraph's overlay of the PR head; not ready by then, reviewers' CodeGraph calls read the default-branch index, labelled not the PR head; sc-25708) |
 | `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional: without it the factory starts and every CodeGraph tool answers the reviewer an error result (recorded), triage gets no CodeGraph, and the merge gate's `risk-threshold` fails wherever a tier requires it (sc-25709), so no normal or protected change merges (`factory run` and `factory work` warn at start-up) |
-| `Kanban:McpUrl` | `https://kanban-mcp.trefry.net/mcp` (`OutboundHttp.KanbanDefaultMcpUrl`; an absolute http(s) URL naming no model provider; MCP Streamable HTTP): the Kanban upstream (sc-25707), offered to reviewers through their tool loop (and kept for Phase 4's planner, `McpProfile.Planner`); never to triage sessions, whose proxy is started without it (`McpProfile.Triage`: the issue text is untrusted and the triage's answer is posted on the issue) |
+| `Kanban:McpUrl` | `https://kanban-mcp.trefry.net/mcp` (`OutboundHttp.KanbanDefaultMcpUrl`; an absolute http(s) URL naming no model provider; MCP Streamable HTTP): the Kanban upstream (sc-25707), offered to reviewers through their tool loop and to a plan item's planner session through the loopback proxy (`McpProfile.Planner`, sc-25870); never to triage sessions, whose proxy is started without it (`McpProfile.Triage`: the issue text is untrusted and the triage's answer is posted on the issue) |
 | `Kanban:Token` | env `FACTORY_KANBAN_TOKEN`, or keychain account `kanban-token`: a KanbanBoard PAT (`Authorization: Bearer`), owner-side only (E5). Optional: without it there is no Kanban upstream (not an error) |
 | `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
@@ -130,8 +166,9 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Gate:CiPollSeconds`, `Gate:CiTimeoutMinutes` | `30`, `30` (each > 0: CI on the PR head is polled until it finishes; still running at the timeout escalates) |
 | `Gate:TestTimeoutMinutes` | `20` (> 0: one sandboxed run — restore, build, the new tests — of the `new-tests-fail-on-base` check; still running at the timeout fails the check) |
 | `Factory:DefaultRepo` | `michaeltrefry/dark-factory-sandbox` (a story line `Repo: owner/name` overrides) |
+| `Factory:Repos` | empty; comma-separated `owner/name` (each well-formed, else refused at start-up naming the key): repositories the factory may plan and work in besides the default one (sc-25877). It only adds to the configured repositories (`FactoryOptions.ConfiguredRepos` = `Factory:DefaultRepo` ∪ `Factory:Repos` ∪ `GitHub:Watch:Repos`, case-insensitive, each once): a plan may name them and the freeze's main-red watches them. It turns on NO issue polling and works with `Worker:RunAs=none`. Both GitHub Apps must be installed there |
 | `Shortcut:Watch:Teams`, `Shortcut:Watch:Epics` | empty = watch nothing; comma-separated team mention names/ids, epic ids |
-| `GitHub:Watch:Repos` | empty = triage no issues; comma-separated `owner/name` whose issues `factory work` polls (the workers' App needs Issues read/write there) |
+| `GitHub:Watch:Repos` | empty = triage no issues; comma-separated `owner/name` whose issues `factory work` polls and triages (the workers' App needs Issues read/write there; refused with `Worker:RunAs=none`). It is the issue-triage watch list, not the list of repositories the factory may work in: a repository named here is also a configured repository, but to let the factory plan and work in a repository WITHOUT triaging its issues name it in `Factory:Repos` |
 | `Intake:PollSeconds` | `60` (> 0) |
 | `Intake:MaxItemFailures` | `3` (runs of one item failing in a row before `factory work` escalates/parks it, E10) |
 | `Usage:PollSeconds` | `60` (> 0: `factory work` reads the router's subscription usage; also read at each intake poll) |
@@ -186,7 +223,9 @@ stdin lines, one header each, which the helper joins with line breaks — helper
 has a uid-sweep refusal; last it runs `<Worker:ClaudePath> --version` as `_factory` through the helper and fails start-up with
 `Upgrade _factory's claude: …` (and the `claude update` command) below `WorkerSandbox.MinClaudeVersion` (2.1.291, the release
 the triage confinement — `--setting-sources ""`, `blockReadsOutsideWorkingDirectories`, `dontAsk` — was checked against; an
-older CLI may silently ignore a setting it does not know). Every normal (re)run kills every `_factory`
+older CLI may silently ignore a setting it does not know). Setup also reports, without failing, whether `cargo` and `rustc`
+answer `_factory` through the helper (Rust target repos only: the new-tests check of a Rust pull request is an `error` without
+them, sc-25875). Every normal (re)run kills every `_factory`
 process (its toolchain check runs through the helper): close `_factory` sessions and stop `factory work` first.
 `--remove-worker-login` (opt-in) is a standalone mode: it runs none of the setup (no helper, no toolchain check, no
 installs) and only deletes `_factory`'s own Claude login (`~/.claude/.credentials.json`, keychain item
@@ -259,7 +298,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   exactly one `127.0.0.1` address). It holds the upstream tokens (`McpUpstreams`, the one registry it shares with the
   reviewers' tool loop: `CodeGraphMcpClient.Upstream` and the Kanban `McpUpstream`, both over the generic `McpHttpClient`);
   each grant is a per-session tool set, `McpProxy.Grant(repo, McpProfile)`: `McpProfile.Triage` (above) or
-  `McpProfile.Planner` (every allowlisted CodeGraph tool and Kanban read tool; for Phase 4, unused yet), each a subset of the
+  `McpProfile.Planner` (every allowlisted CodeGraph tool and Kanban read tool; a plan item's planner session, sc-25870; the only
+  profile granted several repositories, `McpProxy.Grant(repos, McpProfile)`, below), each a subset of the
   upstreams' allowlists (checked when the profile is made). The session gets `--mcp-config <file>` naming
   `http://127.0.0.1:<port>/mcp/<server>` for each server its profile grants a tool of, with a
   per-session bearer credential (32 random bytes, kept hashed), plus `--allowedTools` rules
@@ -273,7 +313,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   with the commit it describes as the reviewers' are ("CodeGraph's index of <project>'s default branch as of <sha>", or "…, commit
   unknown"; a review adds ", not the PR head <head>", a proxy session has no PR head; `ReviewTools.DefaultBranchLabel`, E3), which
   the CodeGraph tools' descriptions and the triage prompt say. One allowlist per
-  upstream: CodeGraph's is `ReviewTools.CodeGraphTools` (7 model-free tools), Kanban's `McpServers.KanbanTools` (the hosted
+  upstream: CodeGraph's is `McpServers.CodeGraphTools` — the reviewers' `ReviewTools.CodeGraphTools` (7 model-free tools: all the
+  reviewers' tool loop offers and all `CodeGraphMcpClient.CallAsync` sends) plus the planner's cross-repository
+  `PlannerCodeGraph.Tools` (6, below; the proxy sends them with `CodeGraphMcpClient.CallProxiedAsync`) —, Kanban's `McpServers.KanbanTools` (the hosted
   server's exact snake_case names, read from its `tools/list` on 2026-10-12, sc-25710: list_projects, get_board, list_epics,
   get_epic, list_epic_documents, get_epic_document, list_work_items, list_epic_work_items, get_issues, get_work_item,
   search_work_items; names match exactly, so a PascalCase spelling is never offered; no create_*/update_*/delete_*/move_*/
@@ -294,7 +336,43 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   the proxy. Upstream tokens are only in the owner process (never in the worker's env, argv, worktree, prompt or transcript;
   `McpProxyTests`). Every MCP tool use still taints the session (`mcp:<tool>`; triage is already tainted by the issue text and
   never pushes). Implementers and fixers get no MCP: their tools allow none, and `ClaudeWorker.BuildArguments`/`RunAsync` refuse
-  an MCP config for them (`--strict-mcp-config` and no `--mcp-config`). Phase 4's planner reuses `McpProxy`/`McpProxySessions`. The intake reads and writes the issue board only through the issue source's
+  an MCP config for them (`--strict-mcp-config` and no `--mcp-config`). A plan item's planner session (below) uses the same `McpProxy`/`McpProxySessions` under `McpProfile.Planner`.
+  Planner cross-repository tools (sc-25874, `Mcp/PlannerCodeGraph.cs`): the planner is the one agent that sees every repository of a
+  plan. Its profile's CodeGraph tools are the reviewers' seven plus `search_projects`, `analyze_impact_file`, `trace_data_lineage`,
+  `get_service_clusters`, `get_cluster_detail`, `file_hotspot`, each checked against CodeGraph's source (main at f95d231) to reach
+  no LLM and no embedding model at call time and to return no stored model text (graph store, `cross_repo_edges`, `repo_clusters`
+  — Louvain arithmetic, labels never written — and file metrics only; the reason per tool is the comment on the list; none was
+  dropped). `get_architecture`, `get_service_summary`, `get_project_health`, `project_report`, `search_conventions`, `rag_search`,
+  every memory tool and the Shortcut/RabbitMQ/MySQL hub tools stay off every list (stored or live model output, or external
+  systems; `PlannerCrossRepoProxyTests` pins the reviewers', the triage's and the planner's lists and that none holds one). The
+  reviewers' list (`ReviewTools.Names`) and `McpProfile.Triage` are unchanged, and no other profile holds a cross-repository tool.
+  Their arguments are rebuilt by `PlannerCodeGraph.Arguments` (unknown ones dropped, strings cut at 300, depth 1–5, page 1–1000,
+  page size 1–100, paths `RepoPath`-normalised and at most `MaxPathChars` (1,000; a longer one is a usage error), never a `sha`: the default branch) and the project set by the proxy (as `repo` for
+  the two per-file tools, CodeGraph's own name for it). `search_projects`, `get_service_clusters` and `get_cluster_detail`
+  (`PlannerCodeGraph.Global`) are not about one project: they are sent with no project, labelled "CodeGraph's <tool>, across every
+  project it indexes (default branches)", and their answers name every indexed project, private ones outside the plan's set
+  included. Residual, accepted (the owner's Phase 3 rule): the planner reads the owner's own plan story, not an outsider's text;
+  triage, driven by untrusted issue text and posting on the issue, never gets a cross-project answer. Where the planner's output
+  goes, said plainly (sc-25877): not only to the owner's board — the titles of the stories it writes and the plan's `interactions`
+  note also reach GitHub, in pull request titles and bodies and commit messages of the plan's repositories (always inert or
+  fenced, E3). So a planner can restate what a cross-project answer named — another private indexed project's name, a symbol of
+  it — into a pull request body of the plan's repositories. That is the accepted residual: do not run a plan on a public
+  repository whose readers must not learn the other indexed projects' names.
+  Residual, accepted: "no stored model text" for `get_service_clusters`/`get_cluster_detail` depends on CodeGraph never writing
+  `repo_clusters.cluster_label` (its handlers print `cluster.Label ?? "Cluster N"`); checked at CodeGraph f95d231, and to be
+  re-checked — the two tools dropped if the label becomes model text — when CodeGraph gains a cluster labeller.
+  Multi-repository grant: `McpProxy.Grant(repos, McpProfile.Planner)` pins CodeGraph to a set of repositories (any other profile
+  with more than one is refused; duplicates, case-insensitively, collapse), each project resolved by exact repo URL match, once per
+  session. With more than one repository every tool about one project lists a required `repo` argument (an enum of the set's
+  `owner/name` values) and a call must name its repository — by `repo` (case-insensitive) or by a `project` that is exactly one of
+  the set's CodeGraph projects; naming another repository or project, two that disagree, or none is refused with JSON-RPC -32602,
+  nothing forwarded (the selector itself is never forwarded). `read_node_source` takes no `repo` and is shown only for a node of a
+  project of the set. With one repository nothing changed (no `repo` argument is listed and a `repo` sent anyway is dropped like any
+  unknown argument — except on `analyze_impact_file`/`file_hotspot`, where `repo` is CodeGraph's own project argument: there one
+  naming anything but the grant's repository (`owner/name`, case-insensitive) or its pinned project (exact), or not a string, is
+  refused -32602 with nothing forwarded, like another `project`; the descriptions and labels are the same): triage's grant behaves as before. The call cap, the answer cap and
+  the commit label are per grant and per answer as before; the tool descriptions and the planner prompt (`PlanPrompt.McpNote`) say
+  how to name a repository and which tools are not about one. The intake reads and writes the issue board only through the issue source's
   `IIssueIntakeSource` capability (E6): triage comment and route label, issues, comments, permissions and gate policy. The orchestrator — not
   the model — routes (`IssueRouting`): question/duplicate → comment only; author without write/maintain/admin
   (`RepoPermission.IsCollaborator`; read and triage count as outsiders) on the issue's repo, or on the target repo when the
@@ -319,7 +397,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   a rate limit, 401 or 408) is recorded `github-refused` on the item and the dashboard and does not hold the repo's cursor; the
   issue is taken up again when it next changes.
 - Controls (`Controls/`): Pause/Continue/Stop rows in the ledger's `controls` table (scope `factory` | `epic:<id>` |
-  `item:sc-<id>`; `WorkItem.EpicId` maps items to epics), written by `factory pause|continue|stop` and the dashboard
+  `item:sc-<id>`; `WorkItem.EpicId` maps items to epics; a plan item's `item:` scope also holds its stories, through
+  `WorkItem.PlanItemId` — plan failures and controls, sc-25876, below), written by `factory pause|continue|stop` and the dashboard
   (`ControlActions`), read by every process. `RunPipeline` checks them before every step and, while a worker runs,
   polls them every second (`ControlWatch`): Pause → `IWorker.RequestPause` (a flag file under `<work root>/controls`
   that the worker's PreToolUse hook, passed by `--settings`, turns into deny + `continue: false`, ending the session at
@@ -371,8 +450,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   within `Freeze:HotFileWindowHours`; the gate records the PR's base branch and diff files as `merge-files` before every merge),
   `cost-rising` (an active item's — not Merge/Watch/terminal — rounds — its last Implement, then each fix round — whose worker sessions' router costs rise
   strictly `Freeze:CostRisingRounds` times in a row; a round with no session or an unrecorded cost is no evidence), `main-red`
-  (a state: per repo the factory works on now — the configured repos, `FactoryOptions.ConfiguredRepos` = `Factory:DefaultRepo` and
-  `GitHub:Watch:Repos`, and the repos of non-terminal items — the base branch's head after its latest factory merge over all history
+  (a state: per repo the factory works on now — the configured repos, `FactoryOptions.ConfiguredRepos` = `Factory:DefaultRepo`,
+  `Factory:Repos` and `GitHub:Watch:Repos`, and the repos of non-terminal items — the base branch's head after its latest factory merge over all history
   is `Ci.Evaluate` Failed; pending is not red; a base the compare answers 404 for under a working installation
   (`GitHubNotFoundException`: the branch or merge commit is gone) has no tip, so nothing to be red; a gate App that is not
   installed on the repo or cannot see it (`GitHubAppNotInstalledException`: the installation lookup's or token mint's 404)
@@ -404,12 +483,16 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
 - Intake failures (E10, `WorkSources/IntakeLoop.cs`, `IntakeStatus`): a run that throws before its pipeline's try block
   counts against its item; after `Intake:MaxItemFailures` in a row `IItemRunner.GiveUpAsync` (`RunPipeline.GiveUpAsync`)
   escalates it (Intake/Implement, escalation comment) or parks it (Paused, with a comment) — an unknown item only gets the
-  comment. Factory-wide failures (`FactoryUnavailableException` from `FactoryRunner`'s shared set-up: worker lock, sandbox,
+  comment, and a plan item waiting on its stories (`Planned`) one comment and one `plan-held` row per reason, staying `Planned`
+  (sc-25871). Factory-wide failures (`FactoryUnavailableException` from `FactoryRunner`'s shared set-up: worker lock, sandbox,
   migration, worktree sweep; a `DbException`; `MissingCredentialException`; a failed poll) end the poll and escalate
   nothing. Both show on the pipeline page (`IntakeStatus`, in memory in the `factory work` process).
 - Every state change is a committed ledger row before the next step (`WorkLedger.RecordAsync`), checked
   against the transition table in `Ledger/Lifecycle.cs` first; an illegal transition throws and writes nothing.
-  New phases add handlers in `RunPipeline.Handlers`, not table rows. Sub-steps inside a state are checkpoint
+  New phases add handlers in `RunPipeline.Handlers`, not table rows (the exceptions, all Phase 4a's: `Plan → Planned`, a plan item
+  waiting on its stories, sc-25870, `Planned → Done`, its plan finished, sc-25871, `Planned → Review`, a plan item taking its
+  changeset's pull request through the gate, sc-25872, and `Merge → Planned`, a plan of several repositories waiting again after
+  each changeset but the last, sc-25873). Sub-steps inside a state are checkpoint
   rows (`LedgerEntry.Step`, `WorkLedger.CheckpointAsync`); `factory run` on an existing item resumes from
   its last row and skips recorded steps (the Claude session id is checkpointed as soon as it streams, so an
   interrupted Implement continues with `claude --resume`). Ctrl-C → Paused; a failure (including an
@@ -418,7 +501,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
 - Typed step outcomes (E7, sc-25389): every ledger row has `Outcome` (`passed`, `failed`, `gate_rejected`, `deferred`,
   `escalated`; NOT NULL + a check constraint), decided in one place — `StepOutcomes.Of(from, state, step, detail)`, called by
   `WorkLedger` for every row it writes (`LedgerEntry.Outcome` is `required`). The rules map earlier stories' typed results (verdict,
-  fix-progress, gate decision, new-tests outcome, stuck rounds, pauses, issue routes); migration `StepOutcomes` backfilled older rows
+  fix-progress, gate decision, new-tests outcome, stuck rounds, pauses, issue routes; of Phase 4a's rows `plan-held`, `plan-stuck`, `plan-delivery` and `merged-into-changeset` are `deferred`); migration `StepOutcomes` backfilled older rows
   with the rules as they stood, as frozen SQL (a Postgres test checks it against a frozen literal corpus; never edit the shipped
   migration — a later rule change only affects new rows). Reports are rendered only from the ledger (`LedgerReport`, E5): the
   PR description at open and again at merge (`pr-report`), the board closeout on merge (`closeout`) and the escalation comment list
@@ -435,6 +518,598 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   stale) computes cost per merged PR, 14-day revert rate (N/A: no revert
   data yet), escalation rate, fix rounds per merged PR, reviewer precision (blocking findings a second opinion confirmed / those it
   answered) and intake-to-merge time; N/A over zero matching items; sandbox/demo items are excluded (`Metrics:*`).
+- Plan items (Phase 4a, sc-25870; `Plans/`, `RunPipeline.Plan.cs`): an item labelled `plan` (`PlanLabel`, any case) on a source that
+  plans (`IWorkSource.PlansItems`: Shortcut; false by default, so a GitHub issue's label — which anyone may apply — plans nothing)
+  goes Intake → Plan instead of Implement, and is never implemented itself. Plan runs one planner session (E2): a fresh one every
+  time (never resumed: its checkout is throwaway), on the `high` class (`WorkerModelClass.Planner`), confined like the triage worker
+  — `WorkerTools.ReadOnly` (`ReadRule` of its own worktree, `dontAsk`, `--setting-sources ""`; `WorkerPlanRunner` refuses any other
+  tools before checkout), in a throwaway `factory/plan-sc-<id>` worktree under its own root (`<WorkRoot>/plan-worktrees`,
+  `SandboxPlanRunner.PlanWorktrees`; contents-read token only, not shared for writing, out-of-tree symlinks removed first, swept
+  with the leftover MCP session files before each planner session when sandboxed, i.e. under the worker run lock) — and reaching
+  CodeGraph and Kanban only through the loopback MCP proxy under `McpProfile.Planner` (started per session by `SandboxPlanRunner`
+  when an upstream is configured; its `--allowedTools` name exactly that profile's tools, `PlannerTools`). With `Worker:RunAs=none`
+  (development only) the planner still runs — unlike triage, which refuses: its input is the owner's own story, the same trust as
+  an unsandboxed implementer — but as the owner, so its read-only confinement is then only Claude Code's own (`dontAsk`, the
+  `ReadRule`, the denied tools): no `_factory` user and no ACL stand between it and the owner's files, and nothing is swept.
+  Repository set (sc-25874): a plan item may name several repositories, one `Repo: owner/name` line each
+  (`RepoResolver.ResolveAll`: in order, repeats dropped, lines inside a ``` or ~~~ fence not read — a planner-created story
+  carries planner text in a tilde fence, which must not widen a later planner's set; `RunPipeline.PlanRepositories`). The first stays the item's primary
+  repository — the ledger's `Repo` (except while the plan item takes another repository's changeset through the gate, restored
+  when that pass ends: the `WorkItem.Repo` rule under sc-25873 below), the repository of a created story that names none; non-plan items
+  still read only the first line. Every repository a plan item names — one line, several, or none (the default repository,
+  configured by definition) — must be one of the factory's configured repositories (`FactoryOptions.ConfiguredRepos`:
+  `Factory:DefaultRepo`, `Factory:Repos` — the setting for a repository the factory plans and works in without triaging its
+  issues — and `GitHub:Watch:Repos`, passed to the pipeline as `configuredRepos`; matched case-insensitively,
+  `RepoRef.Is`), else the item escalates before any session, seat or grant, naming the unconfigured ones ("The plan names 1
+  repository (o/r), but o/r is not configured for this factory … Add it to Factory:Repos (GitHub:Watch:Repos would also turn on
+  the triage of its issues), or remove its Repo: line."), with nothing created (epic E1: "only repositories the factory
+  is configured for"; sc-25877 — before it only a plan naming several was checked; a non-plan item is unchanged and may name any
+  repository). With one line or none the planner is seated exactly as above; with several the seat is one directory — where the primary repository's plan worktree would be, so the same sweep
+  finds it — holding a `factory/plan-sc-<id>` worktree of each repository's default branch at `<owner>/<name>` under it
+  (`ISeatWorkspace`, `GitWorkspace.PrepareSeatAsync`/`RemoveSeatAsync`; each clone fetched with a contents-read token minted for
+  that repository, nothing shared for writing, nothing ever pushed), the worker's single `ReadRule` being that directory; the
+  out-of-tree symlink removal runs per checkout (a link into another repository's checkout counts as outside and is removed); the
+  proxy grant is over the whole set (above); and the prompt lists which directory is which repository (`PlanPrompt.Build`,
+  `PlannerSeat.Checkouts`) and says every story is worked in the primary one. A
+  seat the factory cannot set up (the sweep, the proxy start, the session file's ACL check: `FactoryUnavailableException`) is
+  factory-wide, as for triage: the exception leaves `RunPipeline.RunAsync` (the only exception its catch-all lets through), the
+  item stays in Plan with nothing recorded against it — no Escalated row, no comment — and the intake loop ends the poll
+  (`IntakeLoop.IsFactoryWide`). A planner a crashed run left behind (`worker-started` with no `worker-done` since the item last
+  entered Plan; `CurrentWorkerAttempt` starts at Plan too) is stopped before the next seat is set up (`StopOrphanAsync`,
+  `orphan-killed`), like Implement's. The pipeline runs it like
+  any worker session of the item (`RunSessionAsync`: pid, `session` and `worker-model-class` checkpoints, every line stored,
+  Pause/Stop and the freeze watched, a usage-limited or `model_class_unavailable` session pausing the factory, never escalating)
+  but without the repo-settings guard and the stuck detector (it loads no settings file and has no round), and taints it from its
+  start (`Taint.Planner`), so nothing it did can be pushed. Models propose, code decides (E1): the answer's last fenced `json`
+  block (`{"stories": [{key, title, description, acceptance[], type, blocked_by[]}]}`) is read by `PlanParser`, which refuses — never
+  cuts — anything off the rules: 1–`MaxStories` (20) stories, unique `key`s (a-z, 0-9, `-`, `_`; ≤ 32) and unique titles (≤ 120),
+  description ≤ 2,000, 1–5 one-line acceptance entries ≤ 300, type
+  feature/chore/bug, `blocked_by` naming other stories of the plan, never itself, no cycle; text is cleaned of control and format
+  characters, and the stories are ordered blockers-first; JSON that cannot be read — also a property named twice or a lone
+  surrogate escape, which System.Text.Json reports only when the node is used — is refused the same way. Invalid → a
+  `plan-rejected` checkpoint (why; outcome `gate_rejected`), the item escalates and no story is created. Valid → the `plan`
+  checkpoint (the plan as JSON), then `plan-creating` right before the board is asked for anything, then
+  `IWorkSource.CreateChildrenAsync` (the parent's team and epic, Backlog, `blocks` links), then `plan-stories` (the ids in plan
+  order, e.g. `sc-12 sc-13`), then Plan → `Planned`. `CreateChildrenAsync` is idempotent, and finds a child again by its
+  idempotency key (sc-25877, `ChildItem.Key(parentRef)`: `dark-factory:child:<parent>:<SHA-256 of the name and the description as
+  sent>`, written by code, the same on every retry of the same plan; Shortcut stores it as the story's `external_id`, sent on
+  `POST stories`, and the listings carry it, so a child is matched from the listing and then read in full for its relations) —
+  so a retry does not depend on the board returning a multi-line Markdown description unchanged. Two stories of one plan never
+  share a key: `PlanParser` refuses a plan whose stories share a title, and the title is the hashed name (the rule that makes
+  the key unique within a plan; `PlanParserTests.Unique_titles_are_what_keeps_…`). Fallback, only for a story with
+  no external id at all (a child created before the key existed): name and description together (the description starts with the
+  code-written marker below; the listings carry no description, so each such namesake is read in full; line endings and outer
+  whitespace aside). Either way a story someone else wrote with a plan story's title — or one carrying another key (the same plan
+  text under another parent) — is never reused, recorded or linked: the plan's own story is created beside it. Verified
+  against the real API (2026-10-13, sc-25877): `write-lifecycle.json` is recorded with the key (Shortcut takes an `external_id`
+  of the key's length — 19 + the parent's name + 1 + 64 characters: 92 for `sc-25858` — and returns it unchanged), and
+  `release.json` records the retry finding both children by it in the team's listing, creating nothing (the epic's listing
+  carries it too: seen on the live P4-AT1's stories; docs/acceptance.md). A source that could not find the children
+  again refuses before any write (`ChildrenRefusedException`: a Shortcut parent with neither epic nor team, possible only with
+  `--ignore-scope`), and the item escalates with no story created. Which plan a later run uses (`RunPipeline.ReusesRecordedPlan`;
+  the newest `plan` row is the one considered): a recorded plan is reused — no planner session — when a `plan-creating` or
+  `plan-stories` row follows it (a story of it may be on the board: no second plan's stories land beside the first's, E4, also
+  after an escalation because the board was down), or when no Escalated row follows it (a crash, a pause, an interrupted run).
+  A plan the item escalated on before `plan-creating` is dropped (the owner may have edited the story before re-queuing it, and
+  nothing of the plan exists): the re-run plans afresh with a new session and records a new `plan`. A recorded plan that no
+  longer passes `PlanParser` escalates saying so ("no longer validates"): before `plan-creating` the next run therefore plans
+  afresh; after it every run says the same, and its stories are finished or archived by hand. With `plan-stories` recorded only
+  the transition is left and the plan is not read again. `Planned` (a new state; table rows `Plan → Planned`, `Planned → Done`, `Planned → Review` and `Merge → Planned`) has no entry in `Handlers`: the
+  item waits on its stories and is evaluated without a worker (dependency-aware release, below); waiting is not a failure
+  (outcome `passed`) and gets no held notice. Planner text is untrusted (E3): each created story's description starts with the
+  marker `<!-- dark-factory:planned-from sc-<parent> -->` (`PlannedStory`), then a `Repo:` line naming the plan item's repository
+  (the first such line decides, `RepoResolver`: the planner's text cannot send a story to another repo; one repository per plan),
+  then the planner's text in a tilde fence (no mention, link or image renders). A story whose description carries the marker is
+  `WorkStory.PlannerAuthored`, so `UntrustedName`: its spec is fenced as data in every worker prompt (`PromptFence.Spec`) and its
+  name is inert in commit messages and PR titles and a code span in PR bodies, like an approved triage. The marker is written by
+  code, never by the model; a person who removes it has taken the story over. (Changeset branches, multi-repository plans,
+  plan-scope controls and "held by" reporting are the bullets below.)
+  Owner decisions pending confirmation (coordinator, 2026-10-13; each is implemented as described where it is documented, and each
+  is the owner's to confirm or reverse):
+  1. Hot-file excludes merges into a changeset branch (sc-25877, D): a plan's story merges never count, the changeset pull
+     request's merge into the default branch does ("Freeze", under the changeset bullet).
+  2. Cargo tools for implementing workers (sc-25877, E): `cargo build/check/test/fetch` in `ClaudeWorker.AllowedTools`, with the
+     `dotnet` rules' residual ("Worker tools", under the taint bullet).
+  3. A plan story merged outside the factory into its plan's changeset branch counts as merged for the plan (sc-25877, F4):
+     `merged-into-changeset`; one merged into any other base stays failed ("Plan failures and controls").
+  4. Every plan item's repositories must be configured (sc-25877, C): also a plan naming one repository ("Repository set").
+  5. A blocker outside the plan is satisfied once the board shows it finished, without a factory merge (sc-25871,
+     `PlanRelease.Satisfied`; "Dependency-aware release").
+  6. Gate policy version 4: a changeset pull request has its own size limits, `risk.max_changeset_lines`/`max_changeset_files`
+     (sc-25873; "Changeset size").
+  7. The plan-time CI-trigger block: a repository whose workflows certainly cannot report on a plan's pull requests stops the
+     plan before the planner runs, rather than warn (sc-25873; "CI that cannot run").
+  8. `Factory:Repos` (sc-25877, round 2): a setting of its own for the repositories the factory may plan and work in besides the
+     default one, so that decision 4 does not force issue triage on (`GitHub:Watch:Repos`) for a second repository
+     (configuration table; "Repository set").
+  9. A re-run of a plan story counted by `merged-into-changeset` does nothing (sc-25877, round 2; part of decision 3): before,
+     `factory run` on it implemented the story a second time and opened a second pull request into the changeset branch, while
+     the escalation said a re-run changes nothing ("Plan failures and controls").
+  10. A plan story merged outside the factory into another base than its plan's changeset branch can be re-run (sc-25877, round
+      2): the behaviour is unchanged — the re-run implements it again onto the changeset branch — and the hold comment now
+      offers it instead of denying it; the outside merge on the other branch is left to the owner ("Plan failures and controls").
+- Dependency-aware release (Phase 4a, sc-25871; `Plans/PlanRelease.cs`, `RunPipeline.Plan.cs` `PlannedAsync`/`ClosePlanAsync`): the
+  orchestrator, not a person, releases a plan's stories. `RunPipeline.InFlightAsync` lists every `Planned` plan item (unless a
+  control pauses it, or its closeout was given up on, below), so each intake poll — and a `factory run` on it — evaluates it
+  through `HoldAsync` → `PlannedAsync`, under the item's run lock and with no worker: `FactoryRunner.RunAsync` reads the ledger
+  first and, for a `Planned` item that is not being stopped (`RunPipeline.WaitsOnStoriesAsync`), takes no worker run lock, probes no
+  sandbox and sweeps no worktree (the ledger migration now runs before the lock), and tells its pipeline so (`workerless`). A
+  workerless pipeline only evaluates a waiting plan: a Stop that landed after the runner's check (`RunAsync` reads the control
+  again), or an item that is not `Planned`, is left alone — `stop deferred to the next run`, no `StopIdleAsync`, so no
+  `StopOrphanAsync` (sandboxed: a kill of every `_factory` process) and no worktree call while another process's worker runs — and
+  the next run's runner sees the Stop and takes the lock (`PlanRunnerLockTests`, against Postgres).
+  The plan's stories are the ids of its newest `plan-stories` row. Blockers read (cost rule): a story with no Merge row and no
+  `plan-released` row is held, without a board read, while a blocker the plan itself gave it (`PlanRelease.RecordedBlockers`, from
+  the `plan` checkpoint) has no Merge row; only once those have all merged — the evaluation that could release it — are its
+  blockers read from the board (`IWorkSource.BlockersAsync`: Shortcut — the subjects of the story's `story_links` with `verb:
+  blocks` and `object_id` the story, one GET for the story and one per blocker), so a relation a person added since is still seen
+  before the release. Consequence: removing an in-plan relation on the board does not release a story early, and neither does
+  moving it to ready by hand — the claim check holds it to the same recorded blockers (one rule, sc-25877; below). A `plan` checkpoint that does not read back as a plan of those stories skips
+  nothing (every unreleased story is read). `PlanRelease.Decide` (pure) releases those whose blockers are all satisfied, and its
+  `Complete` is the one definition of "every story merged" (`PlannedAsync` closes the plan on it).
+  "Blocker satisfied" is decided in one place, `PlanRelease.Satisfied(history, ofPlan, finishedOnBoard)` (owner decision
+  2026-10-12): a blocker that is a story of the plan is satisfied only by its ledger Merge row (a merge into whatever base its PR
+  targets; a later story changes the base to a changeset branch there) — not one still in flight, one that escalated or was
+  cancelled, nor one a person dragged to Done; a blocker that is not a story of the plan is satisfied by its Merge row or once the
+  board shows it finished (`Blocker.Finished`: for Shortcut a workflow state whose `type` the API gives as `done` — never a state
+  id or name — and not archived), since it is work the factory may never do. A release is `IWorkSource.MakeReadyAsync` (Shortcut:
+  Backlog → `To Do`, state ids by name; typed result `ReadyResult`: `Moved`; `AlreadyLeft` — not in its workflow's Backlog,
+  nothing written, so a claimed or finished story is never moved back; `Archived` — nothing written), then a `plan-released`
+  checkpoint whose Detail starts with the story id (E4: board write, then the row; a run that died between the two asks again and
+  the source writes nothing the second time; a story with a `plan-released` row is never released again). An archived story gets
+  no `plan-released` row: it is asked for again every evaluation (unarchiving it releases it) and recorded as held. Before each
+  release the plan item's effective control is read again: a paused factory, epic or plan item and the freeze row release nothing
+  (and `RunAsync` defers on the freeze evaluator before any of it). A released story is an ordinary ready story: `ListReadyAsync`
+  finds it if it is in the watch scope. One outside it (possible only when the plan item was run with `--ignore-scope`, since
+  stories are created in the plan item's team and epic) is released all the same, its `plan-released` Detail and the log saying
+  "outside the watch scope" and how to run it (`factory run sc-N --ignore-scope`); nothing lists it.
+  What holds a plan beyond its own order is a `plan-held` checkpoint (outcome `deferred`), one row holding every such hold, written
+  only when its text changes, not every poll: a story held by a blocker outside the plan (`sc-13 held by sc-99 (not a story of this
+  plan, and neither merged by the factory nor finished on the board: finish it or remove the relation on the board)`); an archived
+  story (`… is archived on the board, so it was not released and the plan cannot complete: unarchive it`); and a released story a
+  person moved back to the Backlog (`… was released and is back in the backlog: …; moving it to the board's ready state restarts
+  it` — it is not released again: a person moved it back on purpose). The last is detected by `IWorkSource.InBacklogAsync`, asked
+  once per evaluation only about a released, unmerged story that nothing works — the ledger does not know it, or its item is
+  Paused; a story in flight is never read. The `[Planned] … waiting:` log line names the held stories, the archived ones and every
+  released, unmerged story (`released, not merged` / `released, back in the backlog`). A plan story that escalates or is cancelled
+  never satisfies its dependents: they stay in the Backlog and the plan item stays `Planned`, saying which story holds it (plan
+  failures and controls, sc-25876, below). A board that cannot be read or written during an evaluation (a story deleted on the
+  board, a 500) throws out of the run: nothing is recorded for that step, the intake loop shows the item's failure and polls again,
+  and after `Intake:MaxItemFailures` in a row `RunPipeline.GiveUpAsync` (E10) comments once on the plan item (the reason fenced) and
+  writes one `plan-held` row `not evaluated: <reason>`; the item stays `Planned`, is evaluated again every poll and goes on by
+  itself once the cause is gone. The same reason is not commented again while that row is the item's last (a comment the board
+  refuses is recorded `…; comment NOT posted: …` and posted by the next give-up).
+  The plan link: a work item of a plan's story records its plan in `WorkItem.PlanItemId` (migration `PlanItems`: a nullable
+  self-reference to the plan item's row, indexed), set once from the ledger alone (`WorkLedger.PlanOfAsync`: the plan item of this
+  source whose newest matching `plan-stories` row lists exactly that id; never from the board's marker, which is text anyone may
+  write or remove), looked up on each run until the item is first claimed (an item that has a `claimed` row and no link is no
+  plan's story: its later runs do not scan the plans). Unfinished plan: a story whose description carries the planned-story marker
+  but which the ledger links to no plan — its plan's run failed or died before `plan-stories` — is refused at claim
+  (`RunPipeline.WithoutPlanAsync`): Paused `claim refused: its plan sc-N has not finished creating its stories: …` plus `parked`, no
+  board write, and while the board keeps listing it nothing more is written (`StillWithoutPlanAsync`); once the plan's re-run has
+  recorded `plan-stories` it is linked and held to its blockers like any plan story. The marker is only ever used to refuse (fail
+  closed), never to grant: a story without it is a hand-written story. Blocked claim: Intake refuses the claim of a story with a
+  `PlanItemId` while a blocker is unsatisfied by the same rule (`RunPipeline.BlockedAsync`: the blockers its plan recorded for it,
+  `PlanRelease.RecordedBlockers` from the plan item's `plan` checkpoint — which hold it whatever the board says now, so a story
+  whose `blocks` relation a person removed and that was moved to ready still waits for its recorded blocker's merge — united with
+  the board's relations, `IWorkSource.BlockersAsync`, for one a person added since; which blockers are the plan's comes from
+  the plan item's `plan-stories`, `WorkLedger.PlanStoriesAsync`), before the source is asked and with no board write, whoever moved
+  the story to ready and also under `--ignore-scope`: Paused `claim refused: blocked by sc-12 (not merged): …` — for a blocker
+  outside the plan ending `; sc-99: not a story of this plan, … finish it or remove the relation on the board` — plus the `parked`
+  checkpoint, the same pattern as any refused claim. While the board keeps listing it, each run re-reads the blockers first
+  (`StillBlockedAsync`) and, still blocked, returns the same refusal and writes nothing to the board or the ledger; once the
+  blockers are satisfied the next run goes on (unpaused → Intake → claim). A blockers read that fails inside the claim check fails
+  the run like any failed Intake step (no claim; Escalated, re-run when the board next lists it). Only a plan's stories are held to
+  their blockers: a hand-written story's `blocks` relations stay the owner's own business, as before.
+- Plan failures and controls (Phase 4a, sc-25876; `Plans/PlanRelease.cs` `Classify`, `RunPipeline.Plan.cs` `RecordFailedHoldAsync`,
+  `Controls/ItemStopper.cs`, `Controls/Controls.cs` `LedgerControls.EffectiveAsync`, `Dashboard/DashboardData.cs` `PlansAsync`).
+  Classification: every evaluation of a waiting plan classifies its stories from ledger rows alone (`PlanRelease.Classify`, pure;
+  the dashboard calls the same function): `Merged` (`PlanRelease.Satisfied`: a Merge row, or a `merged-into-changeset` row — below),
+  `Failed` (`PlanRelease.FailureOf`: not merged and the item's
+  last transition is Escalated or Cancelled — `escalated`, `cancelled`, or `merged outside the factory` when the escalation reason
+  is the review's "is merged outside the factory" or the merge queue's "was merged outside the gate" — `PlanRelease.MergedOutsideFactory`
+  and `MergedOutsideGate`, the constants the two throw sites build their message from), `InFlight` (released, or
+  known to the ledger and neither), `Blocked` (unreleased, and a failed story is among its unmerged plan blockers, directly or
+  through others; `HeldBy` names the failed roots) and `Waiting` (unreleased, waiting on anything else or on nothing). A story a
+  person re-queued after an escalation (Escalated → Intake) is in flight again, not failed; a story parked on a blocked claim still
+  only waits. The release decision is unchanged and independent: a failed story has no Merge row, so `PlanRelease.Satisfied` already
+  never releases its dependents, and the stories that do not depend on it are released and worked as before.
+  A story merged outside the factory INTO ITS PLAN'S CHANGESET BRANCH counts (sc-25877; a coordinator decision pending the owner's
+  confirmation, list below): when a plan story's run finds its pull request merged by someone else (`EnsureOpenAsync`, the merge
+  queue's `RecordFoundMergedAsync`) and GitHub's answer — that run's own read through the gate client, never text — shows it
+  merged into the base the ledger expects for it, the plan's changeset branch (`Run.BaseBranch`), the run records
+  `merged-into-changeset` on the story (`RunPipeline.MergedIntoChangesetAsync`; Detail `<pull request> into <branch> at <head>`,
+  once per pull request; typed outcome `deferred`: its own gate never judged it) before the Escalated row that still follows, whose
+  reason then ends "It was merged into <branch>, its plan's changeset branch: merged outside the factory into the changeset
+  branch; reviewed as part of the changeset pull request. For its plan it counts as merged …". From that row on
+  `PlanRelease.Satisfied` holds for the story (`MergedOutsideChangeset`): its dependents are released, their claims go through,
+  and the plan can complete — the work is on the changeset branch, and nothing reaches a default branch except through the
+  changeset pull request's full panel and gate (E6 holds). It is said wherever the plan reports: the counts (`2 of 3 merged (sc-12
+  merged outside the factory into the changeset branch; reviewed as part of the changeset pull request), …` in the hold and
+  resume records and comments, `PlanRelease.Counts`), the dashboard's story row, the changeset pull request's body ("Not sc-12,
+  which was merged outside …") and the plan's closeout ("1 of its 2 stories merged through the factory's merge gate. 1 more
+  (sc-12) was merged outside …"), each story line saying it instead of "not merged". The story's item stays Escalated (the
+  escalation metric counts it), a plan's Stop leaves it as it is (`ItemStopper.Settled`), and a re-run of it does nothing:
+  `RunPipeline.RunAsync` leaves an Escalated plan story that `PlanRelease.MergedOutsideChangeset` holds for where it is (no row,
+  no claim, no session; the run's error says why) instead of the usual Escalated → Intake re-run, which would implement the
+  story a second time and open a second pull request into the changeset branch. The once-per-pull-request guard on the row is
+  for a run interrupted between the row and the Escalated row (Ctrl-C, a crash): the run that resumes it finds the same merged
+  pull request again. Since the item stays Escalated the factory never moves its board story, which stays In Progress and
+  claimed: the escalation reason (so the escalation comment, rendered from the ledger) ends "… and a re-run of this story does
+  nothing: its board story is still claimed by the factory: move it to Done by hand.", and the story's line in the changeset
+  pull request's body and in the plan's closeout ends "; its board story is still claimed by the factory: move it to Done by
+  hand" (`PlanRelease.BoardStoryStillClaimed`; code-written words, the planner's title stays in its code span). A
+  pull request merged outside the factory into ANY OTHER base (retargeted to the default branch, say: past the changeset, ungated)
+  writes no such row: that story stays failed — `merged outside the factory` — until it is re-run or its plan is stopped. A re-run
+  is a remedy (sc-25877, round 2; before, the hold comment wrongly said it "cannot be re-run"): `factory run <story>` takes the
+  Escalated item back to Intake like any re-run, implements the story again from the plan's changeset branch and opens a second
+  pull request into that branch, which the gate merges — a Merge row, so the story is merged for its plan and its dependents
+  are released. The hold comment says so apart from the other failed stories (`PlanRelease.FailedRemedy`: "… can be re-run too
+  (`factory run sc-12`): the re-run implements it again onto the plan's changeset branch through the gate … Its earlier pull
+  request is not part of the changeset, and what that put on the other branch is yours to deal with"); only a cancelled story
+  cannot be brought back by a re-run. A story of a plan with no changeset (recorded before
+  changesets) has the default branch as its base and never counts this way.
+  Held by a failed story: when the record changes — never every poll — the plan item gets one row: `plan-held` whose Detail starts
+  `held by a failed story: ` (`PlanRelease.FailedPrefix`; told apart from the outside-blocker and `not evaluated:` `plan-held` rows
+  by that prefix) then, per failed story, `sc-12 escalated at <utc>: \`<reason>\`` — the reason from the story's own Escalated or
+  Cancelled row, cut at `PlanRelease.MaxFailureReason` (300) and made one inert code span (`UntrustedText.CodeSpan`) — and
+  `; not released because of them: sc-13 (behind sc-12), …`; or `plan-stuck` with the same Detail once the plan is stuck
+  (`PlanStatus.Stuck`: every story that has not merged is failed or blocked behind one). Both have outcome `deferred`: the plan
+  item never escalates for a story's failure, stays `Planned` and polled, and adds nothing to the freeze's consecutive-failures
+  trigger beyond the story's own Escalated row. The record changes when the failed stories do, when one fails again (the time is in
+  it), when what they block does, or when held becomes stuck. Once no story is failed any more, one `plan-resumed` row (outcome
+  passed) lifts it; the dependents are then released as their blockers merge, by the ordinary rule. Each such row gets ONE comment
+  on the plan item through `IWorkSource.CommentAsync`, after the row (E4): `PlanRelease.HeldComment` (failed stories with state,
+  time and reason; the stories blocked behind them; the counts; both remedies — fix and `factory run sc-N`, or
+  `factory stop --item <plan>`; a cancelled story cannot be re-run) or `ResumedComment`. Its result is a `plan-notice` row (`posted`,
+  or `failed: …` with outcome failed); a row with no posted notice is tried again by the next evaluations up to
+  `RunPipeline.MaxPlanNoticeAttempts` (3) and then left to the ledger and the dashboard, whose plan row says `hold comment not posted
+  (attempt n of 3; tried again on the next poll | not tried again: …)` from those rows (`PlanView.FailedNotices`); a posted one is
+  never repeated (a run that died between row and comment posts it on the next evaluation). Hold bookkeeping runs before the completion check and does not
+  depend on how a complete plan is finished.
+  Plan-scope controls use NO new scope kind: a plan is controlled at its own `item:<plan id>` scope (`factory pause|continue|stop
+  --item <plan>`, the dashboard's control form on the plan row), and `LedgerControls.EffectiveAsync` also consults, for an item with
+  a `PlanItemId`, its plan item's row — inside its one query (the plan's scope comes from a self-join on the ledger's
+  `(Source, ExternalId)` index; a second query, for the story's Merge row, runs only while the plan's row is Stopping), since it is
+  read every second for every running worker and test run; a read that fails throws, so a failed plan lookup is an unreadable
+  control (a Pause after `Controls:MaxReadFailures`, E2), never "no plan" — so every existing consumer (the pipeline's step check, `ControlWatch`, the gate's test
+  watch, `InFlightAsync`, the merge queue's `HeldIdleByControlAsync`) honours it unchanged. Pause on a plan: its row pauses the
+  plan item (nothing released: a paused plan item is not evaluated) and every story of it — an in-flight one stops at its next tool
+  boundary, Paused `user-paused` (`UserPausedAsync` counts the plan's row as a user pause), auto-resumed on Continue; a released
+  story the ledger does not know yet is not claimed (`RunPipeline.PlanControlAsync`, from `WorkLedger.PlanOfAsync`). Continue lifts
+  it. Stop on a plan: `EffectiveAsync` answers Stopping for each story of it that has no Merge row (a merged story is untouched —
+  for it the plan's Stop is nothing, though a plan's Pause still pauses its bookkeeping), `InFlightAsync` lists the plan item and
+  those stories as being stopped, plan first, and `ItemStopper.StopLockedAsync` on a plan item (one whose ledger has `plan-stories`;
+  the same path whether the CLI, the dashboard or the plan's own run calls it, and whether or not the plan item has a pull request
+  of its own) stops the stories first (`StopStoriesAsync`), each under its own run lock and on its own rows by the ordinary item
+  stop (`prs-drafted`, board Stopped + comment `… was stopped by <who> (with its plan sc-N)`, `stop-reported`, Cancelled): a story
+  whose run holds its lock is left to that run (which sees the Stop within a second), one whose worker a crashed run may have left
+  to its own next run (which holds the worker lock and stops the worker first), and one whose stop failed to the next attempt — all
+  "pending". A story the plan released that the ledger does not know was never claimed: the factory did no work on it, and the
+  board is asked before anything is written (through `IWorkSource`, E6). Still as the release left it — not archived, in the ready
+  state, no owner or claim but the factory's — it is moved back to the Backlog with a comment that says its plan was stopped before
+  the factory started it (`IWorkSource.ReturnUnstartedAsync`, which re-reads and writes only then; `PlanRelease.ReturnedComment`:
+  never "cancelled its work" or "released its claim"), and then gets a ledger item recorded Intake (`PlanRelease.ReturnedUnstarted`)
+  → Cancelled, with no `prs-drafted`/`stop-reported` rows; the board is written first, so an attempt cut short finds it in the
+  Backlog (or its item at Intake, which is then only recorded Cancelled). One that a person took (another owner, In Progress),
+  finished (Done), assigned to themselves or archived since its release is theirs: nothing is written to it — no move, no comment,
+  no ledger item — and the plan's comment lists it as left as it is. One never released, or back in the Backlog
+  (`IWorkSource.InBacklogAsync`), is left with nothing written. A story Escalated because its pull request was merged outside the
+  factory (`PlanRelease.AsMergedOutside`) has its change on the base branch: it is not stopped, drafted, moved or commented — its
+  item stays Escalated — whether the plan's stop or the story's own run (listed as being stopped while the plan's row is Stopping)
+  reaches it (`ItemStopper.Settled`). While any story is pending the stop
+  throws `StopPendingException`: the plan item is unchanged, keeps its Stopping row, `ControlActions.StopAsync` answers not Ok (the
+  CLI exits 1) naming each pending story, and later polls finish it. Only then is the plan item itself stopped like any item —
+  its own pull requests back to draft, board Stopped with one comment listing `Stories stopped with it: …. Already merged (left as
+  they are): …. Never started (left in the backlog; the factory will not release or start them): ….` and, only when there are
+  any, `Released but never started (moved back to the backlog; the factory did no work on them): ….`, `Merged outside the factory
+  (left as they are: their change is on the base branch): ….` and `Taken, finished or archived by someone else since their release
+  (left as they are): ….`, Cancelled, its control cleared. A workerless run (no worker run lock) still defers a plan's stop to the
+  next run. A waiting plan item's run only evaluates its stories and watches no control meanwhile, so: a Stop that lands during
+  the evaluation is seen when it ends (`HoldAsync` re-reads the control after `PlannedAsync`) and finished by that run under the
+  lock it holds, or — workerless — reported `stop deferred to the next run`; and `factory stop --item <plan>` while a run of the
+  plan holds its lock answers `stop NOT finished: it is a plan and a run of it is active …`, not Ok (exit 1), instead of the
+  ordinary item's "is running; its run stops it at once" (exit 0), which stays true only for a run that watches its control. After the stop, a story of the plan
+  that reaches the ready state anyway (moved by hand) is refused at claim, once and with no board write: Paused
+  `claim refused: blocked by its plan sc-N, which was stopped: …` (`PlanRelease.PlanStoppedRefusal`; `BlockedAsync` checks the plan
+  item's state first). A Pause or Stop on one story of a plan works as on any item; a stopped story is then a failed story.
+  Lifecycle: no table row was added — `Planned → Cancelled` (via the Stopping control) and `Planned → Paused` were already legal by
+  the general rules; a paused plan item is simply not evaluated and never needs a Paused row.
+  Dashboard: `PipelineRow.Plan` (`PlanView`) is read from the ledger alone — the plan item's `plan`, `plan-stories`, `plan-released`
+  and `plan-held` rows and its stories' items and transitions; the board is never asked — and `PipelineRow.PlanItemId` marks a
+  story of a listed plan. A finished plan item (Done, Cancelled) is still listed — a row that says so and offers no control
+  (`PipelineRow.Finished`) — for as long as one of its stories is listed (merged stories stay in Watch), so they stay grouped
+  beneath it instead of becoming rows of their own (sc-25877). The pipeline page lists a plan's stories beneath the plan row, in plan order (`tr.plan-story`,
+  `data-plan`, `data-story`): one with a work item as its full row (state, PR, sessions, its own controls), one without (not
+  released, not picked up, or finished) from `plan-stories` with the title its `plan` checkpoint recorded, made inert
+  (`UntrustedText.Inert`, and Razor encodes it); each with its state and what it waits on (`PlanStoryView.Waits`: `waits on sc-12`,
+  `held by sc-12 (escalated)`, `failed: escalated`). The plan row shows `m of n merged · i in flight · w waiting · f failed`,
+  `held`/`stuck`/`stopping`, the failed-story hold (computed from the ledger, so never stale) and the last other `plan-held` row
+  recorded. Story rows show the control their plan puts on them. The refresh is unchanged (`NOTIFY work_items` → `PipelineChanges`).
+  A plan's story the ledger knows but the factory never claimed (parked on a refused claim, e.g. `claim refused: blocked by …`;
+  no `claimed` row) is stopped — by its own Stop or its plan's — with a comment that says so (`PlanRelease.NeverClaimedComment`:
+  "The factory did no work on it"), never "cancelled its work … released its claim".
+  Closeout of a plan with no changeset to merge (a plan recorded before changeset branches, or an empty changeset — otherwise see
+  the changeset bullet below): once every story of the plan has a Merge row, the plan item is reported `BoardState.Merged` (`merged-reported`, Detail
+  `n stories merged`), gets one comment rendered from the ledger (`LedgerReport.PlanCloseout`: per story its id, its title inert in
+  a code span, its last transition's typed outcome and state, the merge commit of its Merge row and the PR of its `linked`
+  checkpoint — an https URL as is, anything else as a code span; at most `MaxPlanStoriesShown` (40) stories, the rest counted;
+  `closeout` `posted`), and goes `Planned → Done` (terminal; Detail `n stories merged`), each step a row before the next. A closeout
+  the board refuses is recorded `failed: …` (outcome failed) and tried again by the next runs, shown on the dashboard like a merged
+  item's, up to `RunPipeline.MaxCloseoutAttempts` (3). After the last the item stays `Planned`, as a merged item stays in Watch:
+  no poll lists it any more (`RunPipeline.PlanCloseoutAbandoned`), a run by hand tries and writes nothing, and the dashboard row
+  keeps saying `not retried again: post it by hand`; it reaches Done only by a posted closeout. A run on a finished plan item
+  changes nothing (no held notice). As for every closeout, a run that dies after the comment is accepted and before its `closeout`
+  row posts it once more.
+  GitHub issues (E5): `GitHubIssueWorkSource.BlockersAsync` answers none, `InBacklogAsync` false, and `MakeReadyAsync` throws
+  `NotSupportedException`, like its `CreateChildrenAsync` (the interface defaults do the same for any source that creates no
+  children).
+- Changeset branch (Phase 4a, sc-25872, owner decision 2026-10-12: a multi-PR change set is built on a feature branch — its
+  stories merge to it independently and it is then merged as a whole; no atomicity; `Plans/Changeset.cs`, `RunPipeline.Plan.cs`
+  `EnsureChangesetAsync`/`ChangesetPullRequestAsync`). One changeset per plan and repository (which repository is a parameter of
+  everything here; today every story of a plan is in the plan item's repository).
+  Branch: `factory/changeset-<plan item>` (`ItemNaming.ChangesetBranchName`, e.g. `factory/changeset-sc-123`; under `factory/`
+  because the rulesets let the factory App write nowhere else). Created in Plan, after the stories are on the board and before the
+  `plan-stories` row that makes them the plan's (no story is claimed without that row, `WithoutPlanAsync`, so none can start before
+  its base exists): `IRepoWorkspace.BranchStartAsync` reads the default branch and its head (and the branch's head if origin has
+  it); the `changeset` checkpoint (`Changeset` JSON: repo, branch, base, base_sha) is written first; then
+  `IRepoWorkspace.CreateBranchAsync` pushes that commit to the new ref from the clone — the orchestrator, the factory App's token,
+  `GitRemoteWrites.CreateBranch` (`push origin <sha>:refs/heads/<branch>`, never forced), no worktree, no worker, no `PushGrant`
+  (it publishes no worker work) — then `changeset-pushed` (`<branch> at <sha>`, `(adopted: origin already had it)` when so).
+  Idempotent: a recorded changeset is pushed from its recorded commit by a run resumed before the push; a branch origin already
+  has is adopted as it is, never reset; one recorded as pushed is left alone. A plan's changeset is the newest `changeset` row
+  for the repository that a `changeset-pushed` row follows (`Changeset.Of`, `WorkLedger.ChangesetOfAsync`).
+  Story base: an item whose plan (`WorkItem.PlanItemId`) has a changeset in its repository branches from it and opens its pull
+  request against it (`Run.BaseBranch`, read from the plan item's ledger each run; `IRepoWorkspace.PrepareAsync`/`RestoreAsync`/
+  `ReopenAsync` take the base, null = the default branch; `GitWorkspace` refuses a base that is not a `factory/changeset-*`
+  branch on origin). Fail closed on the repository: a story whose plan recorded a changeset (any `changeset` row) but has none
+  pushed in the story's own repository — its `Repo:` line was edited to another one — escalates before any step
+  (`WorkerFailedException` naming the plan's changeset branch and both repositories; no worktree, no PR), rather than merge into
+  that repository's default branch, count as merged and miss the changeset; only a plan with no `changeset` row at all (recorded
+  before changesets) sends its stories to the default branch. Fail closed on the PR's base (`RunPipeline.EnsureBase`, in Review,
+  at the top of every merge-queue pass and right before the merge): the PR must target the base the ledger expects — the plan's
+  changeset branch for a plan's story, the changeset's recorded base for a plan item, else the repository's default branch as
+  GitHub names it in the same pull answer (`PullFacts.DefaultBranch`, `base.repo.default_branch`: no extra call; an answer naming
+  none is not checked) — otherwise the item escalates `<url> targets <base>, not <expected>` with nothing reviewed, updated or
+  merged (a PR can be retargeted by a person or by GitHub when its base branch is deleted, and `OpenAsync` adopts an open PR of
+  the head whatever its base). Everything downstream already reads the PR's own base (`PullFacts.BaseRef`/`BaseSha`): the review's diff and
+  file list, `factory/gate.yaml` at the PR's base commit (the changeset branch carries the default branch's; the path is sealed, so
+  no story can change it there), CI and its base-CI triage, the new-tests base/head runs, the merge queue's compare, base update
+  (`MergeBaseAsync` merges `origin/<Workspace.BaseBranch>`) and conflict fix rounds, `merge-files`. So a plan story's PR gets the
+  full panel and gate, no weaker for the changeset's own review later (E6). Its closeout says `merged into its plan's changeset
+  branch …`, its PR body `Base: …`. An item of no plan, and a story of a plan with no changeset, targets the default branch,
+  unchanged. Blocker satisfied is still the blocker's Merge row (`PlanRelease.Satisfied`): merged into the changeset branch, so a
+  dependent story's worktree holds its blockers' code.
+  Merge queue: stays one queue per repository (not per repository and base): stories of one plan must serialise their merges into
+  the changeset branch, which one queue gives; a queue per base would only let a plan's stories and default-branch items merge at
+  once, which the single-tenant worker sandbox (one run per machine) would not use, and would change the ledger-derived order and
+  the repo-keyed lock for nothing.
+  Changeset pull request: when `PlanRelease.Decide` is `Complete`, `PlannedAsync` (the waiting plan's run, GitHub's API only, no
+  worker) reads GitHub's compare of the default branch and the changeset branch. Empty (no difference): `changeset-empty`, no pull
+  request, and the plan is closed out as above saying so (`Planned → Done`). Before that compare, the plan item's newest `linked`
+  pull request is read: found merged (a person merged an escalated changeset PR by hand — after a squash or rebase GitHub's
+  three-dot compare still shows a difference, and every re-run would open another PR), it is recorded the same way
+  (`changeset-empty`, Detail `changeset pull request <url> was merged outside the factory`, `Changeset.MergedOutside`) and the plan
+  is closed out saying the factory's gate did not merge its changeset. A changeset PR found merged while the item is in Review, CI
+  or MergeGate (no `gate-passed` for that head) escalates once as any item's does ("merged outside the factory"); the owner's
+  re-run then takes this path to Done. Otherwise it opens ONE pull request from the
+  changeset branch into the default branch (`IPullRequests.OpenAsync` finds an open one rather than opening a second; a control
+  that holds the plan item, checked again after the compare, opens nothing; title — the plan item's title through
+  `UntrustedText.Inert` — and body written by code, `LedgerReport.ChangesetPullRequestBody`: the stories from their own ledger rows, planner titles inert),
+  links it (`linked`) and records `Planned → Review` — the plan item itself is the work item of the changeset, with the changeset
+  branch as its branch (`Run.Branch`/`Run.Changeset`) and no Implement. From there the existing handlers drive it like any item:
+  the full panel on the whole diff (spec for the reviewers: the plan item's own text, then the plan's story list in a
+  `<plan-stories>` fence as a planning model's data, `Changeset.ReviewSpec`), CI and CI self-heal, the merge gate at the default
+  branch's policy (every tier check, `new-tests-fail-on-base` included: the changeset's new tests are the union of its stories',
+  each must fail on the default-branch base and pass on the changeset head, xUnit and cargo alike; the `risk` size limits apply
+  to the whole changeset — under a version 4 policy its own `max_changeset_lines`/`max_changeset_files`, under versions 2 and 3 the
+  ordinary `max_changed_lines`/`max_changed_files`, which must then be sized for a plan or the gate escalates it; "Changeset size"
+  below),
+  CodeGraph risk (unchanged for both kinds of PR: blast radius is read at the PR head through its overlay, the hotspot from the
+  default-branch index by path — a file that exists only on the changeset branch has no metrics and counts 0, like any new
+  file), the merge queue's turn against the default branch (a changeset behind it is updated from it, fast-forward push), fix
+  rounds — a fixer in a worktree of the changeset branch (`factory-changeset-<item>`, kept by the sweep while resumable), its push
+  going to the changeset branch, which `GitWorkspace.CommitAndPushAsync` never forces (`ItemNaming.IsChangesetBranch`: a push that
+  would lose a merged story fails) — on a `PushGrant` for the fixer's sessions (the plan item's planner session is tainted and is
+  not in a fix round's attempt), typed outcomes, Stop (`ItemStopper` drafts the changeset branch's pull request — the plan item
+  has no `factory/<id>` branch — after stopping the plan's unfinished stories, and `StopIdleAsync` removes the changeset
+  worktree; the branch stays), escalation. Fix rounds are counted since the item last entered Planned
+  (`TransitionContext.StartsAttempt`: Implement or Planned), so a re-run starts the count again as an Implement does. Merge
+  (`MergeAsync`): the plan item is reported `BoardState.Merged` and gets its closeout (`LedgerReport.PlanCloseout` with the
+  changeset's merge, each story, then the plan item's own facts) only now, then Watch. If the changeset PR escalates, the plan
+  item is Escalated with the reason and the usual comment; its stories stay merged on the changeset branch. A re-run
+  (Escalated → Intake → Plan → Planned, no planner, no new story or branch) finds the same pull request, and a failed verdict
+  recorded for its head before the re-run is not reused (there is no Implement to make a new head): the panel reviews it again.
+  Freeze: hot-file counts only merges into a branch that is not a changeset branch (`!ItemNaming.IsChangesetBranch(base)`, as
+  main-red reads), per repository, base branch and file — the trigger's meaning before plans: factory merges changing one file of
+  a default branch. A plan's story merges into its changeset branch never count (chained stories building on one file there are
+  the plan working as designed, however many there are); the changeset pull request's own merge into the default branch counts,
+  with every file of the changeset, so changeset merges of different plans (or ordinary items) changing one file within the
+  window still freeze. A coordinator decision of 2026-10-13 (sc-25877), pending the owner's confirmation (list below); main-red skips merges into a changeset branch before picking each repository's latest merge, so a red changeset branch
+  freezes nothing (the next story's CI triage finds its base red and escalates that story; the changeset PR needs green CI on its
+  own head) and a later story merge never hides the default branch's state; cost-rising reads a plan item's rounds since Planned.
+  Changeset size (sc-25873): `risk.max_changed_lines`/`max_changed_files` are sized for one story, and a changeset PR is the sum
+  of a plan's stories. The limit is never skipped or loosened in code for a changeset (what is on a changeset branch — adopted
+  branches, fix-round and base-update commits — did not all pass a story's gate); the policy sets a separate one: `version: 4`
+  requires `risk.max_changeset_lines` and `max_changeset_files` (whole numbers ≥ 1, independent of the per-story two — no rule ties
+  them, since a smaller changeset limit only tightens the gate, which a policy may always do). `risk-threshold` holds a changeset
+  PR to those two (`RiskThreshold.LinesLimit`/`FilesLimit`) and every other PR — a plan's story into its changeset branch included
+  — to `max_changed_*`; under versions 2 and 3 (no changeset keys: unknown there, and invalid) a changeset PR is held to
+  `max_changed_*` as before, and its reason says so. Fix rounds, CodeGraph's blast radius floor and hotspot limit, and every other
+  check are the same for both kinds. Which PR is a changeset's is an input fact from the ledger, `ChangeFacts.Changeset`
+  (`RunPipeline.IsChangesetPull`: the item has a pushed changeset in the repository by its own `changeset`/`changeset-pushed` rows
+  — `Run.Changeset` — and the PR targets the base that row recorded), never the branch's name, which an adopted or worker-chosen
+  name could imitate; the `gate` checkpoint's Detail records it (`Merge <sha> (changeset pull request): …`,
+  `GateDecision.ChangesetMark`), a failure names the limit that applied (`… exceed max_changeset_lines N (a changeset pull
+  request)`) and a pass both (`N changed lines within max_changeset_lines M, …`). This repository has no `factory/gate.yaml` of its
+  own; a target repository's policy moves to version 4 by an owner's PR (the path is sealed).
+  CI that cannot run (sc-25873, `Gate/CiTriggers.cs`, `RunPipeline.EnsureCiTriggersAsync`): a target repository whose workflows
+  filter `pull_request` `branches` without `factory/**` reports no check for story PRs (their base is `factory/changeset-*`), which
+  would each wait out `Gate:CiTimeoutMinutes` and escalate — fail closed, and a whole plan wasted. So Plan, before the planner
+  session (and before a recorded plan's stories are created; not once the repository's changeset branch is on origin), reads the
+  default branch's name and workflow files owner-side with the gate App's read-only token (`IGateGitHub.GetWorkflowsAsync` →
+  `RepoWorkflows`: `GET /repos/<owner>/<name>` for `default_branch` — never guessed; an answer naming none throws — then the
+  contents API with no ref, every `.yml`/`.yaml` directly in `.github/workflows`, at most `GitHubGate.MaxWorkflows` 50 files of at
+  most `MaxWorkflowBytes` 512 KiB) and parses each `on:` with the policy's YAML parser. `EnsureCiTriggersAsync` takes the
+  repository as a parameter and `PlanAsync` calls it for every repository the plan item names (`PlanRepositories`, the planner's
+  set — every `Repo:` line, the item's own first; one call for a plan of one repository), in that order, all before the planner
+  session: the first repository that blocks stops the plan (its reason starts with that repository), so no planner session, story
+  or changeset branch is spent in any repository; a warning is a row per repository (compared with that repository's last
+  `ci-triggers` row only, `CiTriggerCheck.IsAbout`); the "changeset branch on origin" skip is per repository too. A repository the
+  plan item names is checked even if the plan then puts no story in it (not known before the planner runs): a block for a plan
+  item of several repositories says so and names both ways out ("remove its `Repo:` line from the plan item if the plan should not
+  touch it, or fix the workflow …"; on a run continuing a recorded plan it says whether that plan has a story there). A stop says
+  what the ledger says an earlier run left (`PlanProgress`, also for `PlanRepositories`' "not configured" refusal): only a run
+  that plans afresh says "before it was planned or any story of it created" / "no story was created"; one continuing a recorded
+  plan with a `plan-creating` row says stories may already be on the board and are not released and cannot start (they are not
+  the plan's until `plan-stories`). `CiTriggers.Check(files, base, head)` is asked about both kinds of PR the plan opens there: a story's
+  (base the changeset branch, head the story's `factory/<id>` branch) and the changeset's (base the default branch, head the
+  changeset branch — a repository whose only trigger is `pull_request: branches: ['factory/**']` runs for every story and never
+  for the PR that delivers the plan). A workflow reports on a PR when a `pull_request`/`pull_request_target` trigger's branch
+  filter matches the base (no filter matches every base) or a `push` trigger's matches the head (a push workflow's checks are on
+  the commit the gate reads CI for; a push with only `tags` filters does not run for a branch); `types`/`paths` filters are not
+  read (such a trigger counts as running). Branch filters follow GitHub's rules (`CiTriggers.Matches`: `*` stops at `/`, `**` does
+  not, `?`/`+` repeat the character before, `[…]` sets, `\` escapes, patterns in order with `!` excluding again, `branches-ignore`
+  the opposite and without `!`; case-sensitive; translated to a non-backtracking regex). Outcomes, per PR kind: a workflow runs →
+  a log line only. Certain that none can — `Never`: every workflow file read and parsed, each made only of pull request/push
+  triggers that do not match and events in `CiTriggers.NeverReports` (e.g. `schedule`, `workflow_dispatch`, `workflow_call`), AND
+  at least one of them a pull request or push trigger whose `branches`/`branches-ignore` filter leaves the branch out (the evidence
+  that the repository's CI is GitHub Actions and was told not to run there). It cannot be told — `Unknown`: no workflow file at
+  all, or none with a pull request trigger or a push trigger for branches (only `workflow_dispatch`, a schedule, a release,
+  `push` for tags: CI may be another service's, and "add a pull_request trigger" would be the wrong fix), a file unreadable, over
+  the bounds or not valid YAML, `branches` beside `branches-ignore`, a pattern that cannot be translated, an event outside the
+  known lists such as `workflow_run`, GitHub not answering the repository or the listing. A `Never` for either kind (the stories'
+  first) → BLOCK: a `ci-triggers` checkpoint (`blocked: <repo>: …`, outcome gate_rejected) and the plan item escalates with the
+  repository, the fix, then the workflow files read with why — no planner session, story or changeset branch; the owner fixes the
+  workflow on the default branch and re-runs the plan item. Blocking is chosen over a warning because every story would otherwise
+  be guaranteed to time out, or — the changeset PR — every story be built and the plan then never delivered. The reason puts the
+  fix before the file list and bounds both (the escalation comment clips a reason at `LedgerReport.MaxReasonLength` 4,000): at
+  most `CiTriggers.MaxFixes` (3) workflows' fixes, any one being enough, then "(or likewise in N more)", and at most
+  `CiTriggers.MaxListed` (10) files, those that are why first, then "… N more". The fix names the pattern the base needs:
+  ``add `factory/**` to the pull_request branches filter of <file>`` for story PRs, ``add `<default branch>` …`` for the changeset
+  PR (a workflow's text is never repeated; an unusual file or default-branch name is not shown). Else an `Unknown` for either →
+  a `ci-triggers` checkpoint (`warning: <repo>: …`, outcome failed, written when it changes) and a `[plan] warning:` log line, and
+  planning goes on. Nothing is weakened either way: the gate still needs green CI on every head. No start-up warning: `factory run`
+  and `factory work` read nothing from GitHub at start-up, and one per configured repository would add a GitHub dependency that
+  could fail start-up; the plan-time check is the only one. A pipeline with no gate stage (tests only) does not check.
+  Hot-file and a plan's stories (the rule above; a coordinator decision of 2026-10-13, sc-25877, pending the owner's confirmation):
+  story merges into a changeset branch are not hot-file merges, so `Freeze:HotFileMerges` or more stories of one plan changing the
+  same file do not freeze the factory. What the trigger no longer sees: one file fought over inside a single plan — that plan's
+  changeset pull request, its size limits and the fix-round cap are what bound it.
+  Cleanup: the factory never deletes a changeset branch (after the merge it is fully contained in the default branch; GitHub
+  deletes it when the repository's "automatically delete head branches" is on).
+- Multi-repository plans (Phase 4a, sc-25873; owner decisions: a multi-repository change is one work item per repository — every
+  story stays a one-repository item — grouped by the plan; the planner is the agent that sees every repository; each repository's
+  changeset is built on its own branch and merged to that repository's default branch as a whole, one repository at a time in the
+  plan's order; merges across repositories are NOT atomic and nothing is rolled back).
+  Schema (`Plans/Plan.cs`, `PlanParser.Parse(answer, repos)`; `repos` = the plan item's `Repo:` set): each story has `repo`
+  (`owner/name`, one of the set, matched case-insensitively and recorded as the item spells it; required when the set has several;
+  with one it is optional, may only name that one, and is recorded as none — a one-repository plan's `plan` checkpoint is
+  byte-for-byte what it was); the plan has `merge_order` (the repositories that have a story, once each, in the order their
+  changesets merge; required once stories are in more than one; a listed repository no story uses is dropped: it gets no
+  changeset), `interactions` (the planner's note on how the repositories interact, ≤ `PlanParser.MaxInteractions` 1,500 chars,
+  cleaned like every planner text, required with more than one repository; untrusted, E3) and per story
+  `blocked_by_changesets` (repositories of the plan whose changeset must be on its default branch before the story starts, e.g. a
+  dependency pin). Refused (`plan-rejected`, escalated, nothing created): an unknown repository anywhere, a story with no
+  repository in a several-repository plan, a repository in `merge_order` twice or one with a story missing from it, a missing
+  `merge_order`/`interactions`, a story blocked by its own repository's changeset (it could never start), by one that merges later
+  than its own, or by one with no story, and any cycle across the two kinds (`Ordered`: a story blocked by a changeset comes after
+  every story of that repository). The planner prompt (`PlanPrompt.Build(…, repos)`) explains all of it only when the set has several.
+  Stories (`Plan.Children`): the code-written `Repo:` line (first, outside every fence) names the story's own repository; a
+  second tilde fence (`Plan.Context`) carries the plan's repositories, the merge order, what the story waits on and the note —
+  planner-authored stories are fenced as data in every worker prompt, so the implementer sees it as data. Story blockers stay
+  board `blocks` links; a changeset blocker has no board relation — the `plan` checkpoint and that fence are its record.
+  Changesets: `PlanAsync` creates `factory/changeset-<plan item>` in every repository of `Plan.Repositories` (merge order), each
+  with its own `changeset`/`changeset-pushed` rows, all before `plan-stories`; a failure for one fails the step and a re-run
+  creates only the missing ones (`EnsureChangesetAsync` per repository). `Changeset.Of(history, repo)` is per repository; a story's
+  base is its own repository's changeset (`ledger.ChangesetOfAsync(plan, repo)`); `Changeset.All`/`Ordered` list them.
+  Release (`PlannedAsync`, `PlanRelease`): a changeset blocker is a blocker id (`PlanRelease.ChangesetBlocker(repo)`: "the
+  changeset of owner/name"), satisfied by the plan item's `changeset-delivered` row for that repository
+  (`Changeset.Delivered`); `Decide` never counts it an outsider; `Classify` treats an undelivered one as a dependency on every
+  unmerged story of its repository, so a story behind a failed one through a changeset is Blocked and `plan-held`/`plan-stuck` and
+  the comment say "behind sc-N, through the changeset of owner/name"; the claim check (`BlockedAsync` → `AwaitedChangesetsAsync`,
+  from the plan item's ledger) refuses a hand-moved story naming the changeset. Fail closed: the `plan` checkpoint is the only
+  record of changeset blockers, so when a plan item with more than one changeset has a `plan` row that no longer reads back
+  (`PlanRelease.RecordedRepos` null) the evaluation releases nothing (`plan-held`: `PlanRelease.HeldUnreadable`, written once) and
+  every story's claim is refused (`PlanRelease.PlanUnreadableRefusal`, a blocker-style refusal: parked once). A plan story's
+  repository at run time is its board `Repo:` line; `RunAsync` compares it with the repository the plan recorded for that story
+  (`RecordedRepoAsync`) and a mismatch escalates the story before any work ("recorded it in A, but its `Repo:` line now names B"),
+  as a story naming a repository with no changeset of the plan already did — it never merges into another repository's changeset.
+  Ordered changeset pull requests — design (i), the plan item drives them in turn: with several changesets the plan item takes
+  the first undelivered repository's changeset (in `Changeset.Ordered`) to its default branch once every story of that repository
+  has merged (after that evaluation's releases), exactly as a one-repository plan does — Planned → Review → CI → MergeGate →
+  Merge in THAT repository (`ChangesetPullRequestAsync` sets `WorkItem.Repo` to the changeset's repository; `RunAsync` resolves a
+  plan item's repository from `Changeset.PassRepo` — its last `linked` pull request's repository, in the spelling its `changeset`
+  row recorded (the plan item's `Repo:` line, like its stories'; not the URL's case), while its state, or the state it paused
+  from, is a gate state — so the gate policy, CI, CodeGraph risk, new-tests check, merge queue and worktrees are that
+  repository's). `PassRepo` is decided from the rows read UNDER the item's run lock, never from what was loaded before it (another
+  process may have finished one pass and opened the next meanwhile). `WorkItem.Repo` rule: it is the pass's repository from
+  Planned → Review until the pass ends — `MergeAsync` restores the plan item's primary repository (`Run.Primary`: the first
+  `Repo:` line) right before Merge → Planned and before the final Merge → Watch (`EndPassAsync`; a run that dies between the two
+  writes finds the item in Merge, where `PassRepo` names the pass again), and a pass that escalated keeps the pass's repository
+  until the item is re-run (the run's start restores the primary) or stopped. So outside a pass — Plan, Planned, Watch, Done —
+  it is the primary repository; whatever must know where a merge went reads the rows (`MergeFiles.Repo`, `changeset-delivered`,
+  `linked`). Every item, plan or not: `ReadPullAsync` refuses (escalates, nothing read or merged) a linked pull request whose
+  URL names another repository than the run's — a number alone names a different pull request there. Residual, accepted (sc-25877):
+  a repository renamed or transferred on GitHub trips the same guard — GitHub answers the old name by redirect, a pull request
+  opened since carries the new name in its URL, and the guard cannot tell that from a wrong repository — so the escalation ends
+  "If the repository was renamed or transferred on GitHub, update the item's `Repo:` line / `Factory:DefaultRepo` to the new
+  name and re-run." (`RunPipeline.RenamedRemedy`); nothing follows the redirect by itself. Then `MergeAsync` records `changeset-delivered` (`ChangesetDelivery`: repo, how — `merged` with pull request and
+  commit, `empty`, `merged-outside`), rewrites that pull request's description and, while another changeset is left, records
+  Merge → Planned (the one new table row; Planned starts an attempt, so fix rounds restart) instead of reporting the plan merged.
+  The last merge takes the old path (merged-reported, closeout, pr-report, Watch). A plan with ONE changeset writes none of the
+  new rows and behaves exactly as before. Why (i) and not a ledger item per changeset: every board write of the pipeline is keyed
+  by the item's board id and the ledger already scoped a plan item's attempt by Planned (`TransitionContext.StartsAttempt`);
+  per-changeset items with no board item would need a second identity through intake, controls, the stopper and the dashboard.
+  What keeps passes apart (checkpoints carry no repository): verdicts, overlays and new-tests results are bound to
+  commit SHAs; `gate-passed` is bound to its head SHA AND read per pass (a pull request found merged counts only when a
+  `gate-passed` of `Changeset.CurrentPass` names that head, `GatePassedAt`: an earlier repository's gate pass never vouches for
+  this one's); fix rounds, stuck rounds and cost rounds restart at Planned; the queue's `queued`/`queue-turn` are read per
+  MergeGate stint; `linked` and the item's pull request are the last one; `Changeset.CurrentPass` (rows since the last Merge →
+  Planned) scopes what is not — the fix-round cap (`FixCapOf`), the CI triages a head must report (`CiHeal.Unreported`), and the
+  facts in the pull request body, closeout and escalation comment; `merge-files` names the repository merged into
+  (`MergeFiles.Repo`, for every plan item's changeset merge — also a plan with one changeset, which may be in another repository
+  than the plan item's first), which the freeze's hot-file and main-red read instead of the item's current repository.
+  Repository spelling: GitHub's names are case-insensitive and each item carries its own `Repo:` line's spelling, so the merge
+  queue (`WorkLedger.ItemsOnRepoAsync`, like `MergeQueue.LockKey`) and the freeze's hot-file key match repositories
+  case-insensitively — two spellings never make two queues of one repository. `RepoRef.Key` (lower-case `owner/name`) and
+  `RepoRef.Is` are the one comparison for new code (the planner prompt's primary-repository mark, the configured-repositories
+  check; sc-25877). Deliberately NOT used for paths on disk: clones and worktrees stay under the literal spelling
+  (`<WorkRoot>/repos/<Owner>/<Name>`), because lower-casing them would orphan a running installation's existing directories on
+  a case-sensitive volume; the ledger's `Repo` columns and the issue cursors keep the literal spelling too. Metrics (`LedgerMetrics`): a plan item with
+  several changesets counts as merged only at its LAST Merge row and only once every changeset is delivered
+  (`LedgerMetrics.MergeOf`), and is left out as sandbox work when ANY of its changesets is in a `Metrics:SandboxRepos` repository. Consequence, accepted: while the plan item takes a changeset through the gate it is not Planned, so no
+  story is released until it comes back (stories released before go on); an escalated changeset pull request therefore also
+  holds the stories not yet released.
+  Empty and unused: a repository of the plan item no story uses gets no changeset; an empty changeset (or one a person merged)
+  in a several-changeset plan is `changeset-empty` (Detail led by the repository; written once — a run that died before the
+  `changeset-delivered` row decides the same again and adds only that row, sc-25877) + `changeset-delivered` and the next repository
+  goes on; when the last one needs no pull request the plan closes from Planned (`ClosePlanAsync`).
+  Partial delivery: an escalation of a several-changeset plan writes `plan-delivery` (`Changeset.DeliveryOf`: "delivered: a
+  (merged into main as …, url); not delivered: b (its changeset pull request url is Escalated), c (… not opened)") after the
+  Escalated row and the comment repeats it with the remedies (`Changeset.DeliveryNote`: fix and `factory run`, which goes on with
+  the first repository not delivered, or `factory stop --item`); later repositories' changesets are not opened; merged ones stay
+  merged. Stop (`ItemStopper`): the open pull request of every changeset is drafted in the changeset's own repository — every
+  `Changeset.All(history)` whenever the plan has at least one, never "the item's repository" (a plan whose stories are all in
+  another repository than its first has its one changeset there) — `plan-delivery` is recorded before the
+  board is told, and the comment says what is delivered. Dashboard: `PlanView.Changesets` (`Changeset.States`, from the plan
+  item's rows) shows each repository's changeset; an unreleased story's row shows its own repository. Reports: a changeset pull
+  request's body lists its repository's stories and every repository's changeset; the closeout lists each repository's changeset
+  pull request and merge commit (`LedgerReport.ChangesetLines`); a changeset review lists that repository's stories, the order
+  and the note inside the `plan-stories` fence (`Changeset.ReviewSpec`). Tests: `MultiRepoPlanTests`, `MultiRepoPipelineTests`
+  (two `BranchRepo`s behind one router). With PR #69's two checks: `EnsureCiTriggersAsync` runs for every repository of the plan
+  item's set before the planner session (above), and `IsChangesetPull` holds per pass (`Run.Changeset` is the pass repository's
+  changeset, whose recorded base is that repository's default branch; a story's is null), so each repository's changeset PR is
+  sized by its own version 4 `max_changeset_*` and its stories by the ordinary limits (`MultiRepoPipelineTests`).
+  Rulesets (`RepoProtection`, unchanged): the `~ALL` ruleset excludes `refs/heads/factory/**`, so the factory App creates and
+  pushes `factory/changeset-*` and the gate App merges a PR into it with its ordinary write permission (no rule applies there, so
+  no bypass is needed); the changeset PR into the default branch is a PR like any other, merged through the gate App's existing
+  `pull_request`-mode bypass. Residuals, accepted: nothing server-side requires a pull request on a changeset branch — whoever
+  holds the factory App's token (the orchestrator alone; workers get no git) or an admin can push to it directly — which is why
+  the changeset is gated again as a whole before it reaches the default branch; a target repository's CI must run for pull
+  requests whose base is `factory/changeset-*` (a workflow limited to `pull_request: branches: [main]` reports nothing, and CI
+  then times out and escalates); the board shows a plan's story Done once it merged into the changeset branch, before the plan's
+  changeset is on the default branch.
 - One run per item: `RunPipeline` holds a Postgres advisory lock on the item id (`PostgresRunLocks`) for the whole
   run, and `WorkItem.Version` is an optimistic concurrency token, so a stale writer's save throws.
 - Workers lead their own process group (launched via `/usr/bin/perl` `setpgrp` + `exec`); the pid is checkpointed
@@ -451,7 +1126,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   on line breaks; no new variable, no `--model`, no `ANTHROPIC_MODEL`, no `x-weave-force-model`). Roles, decided in code, never by a
   model: the implementer and its review and conflict fix rounds run on the item's coding class (`WorkerModelClass.Coding`: `low`
   when the story is simple — the `simple` label, any case, or an estimate of 1 or 2 points — else `mid`, no estimate included); the
-  CI fixer on `mid` (`CiFix`); issue triage on `low` (`Triage`). Labels and estimate come through `IWorkSource.ReadSpecAsync`
+  CI fixer on `mid` (`CiFix`); issue triage on `low` (`Triage`); a plan item's planner on `high` (`Planner`, sc-25870). Labels and estimate come through `IWorkSource.ReadSpecAsync`
   (`WorkStory.Labels`/`Estimate`: Shortcut's story `labels` and `estimate`; a GitHub issue item has no estimate and its labels are
   read from the issue at spec time — they only pick the class, and need not come from a collaborator, since an issue template can
   apply one; a failed read logs a warning and counts as no labels, i.e. `mid`, never an item failure). Each run of a worker session checkpoints `worker-model-class` (Detail: the class), right after
@@ -523,11 +1198,34 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `awsCredentialExport`, `otelHeadersHelper`, `statusLine`), any `permissions.allow` rule not in `ClaudeWorker.AllowedTools`, or a
   `.mcp.json` naming a server taints the session (a new one from its start; a resumed one is refused). Unreadable or unparseable
   settings taint too. Residuals: an orchestrator SIGKILLed after the worker wrote a tool_use line but before the line was stored
-  (pipe buffer / capture queue) leaves nothing to replay. Accepted: the allowed `dotnet build/test/restore` run repo and package
-  code (MSBuild targets, analyzers, tests, restore) whose output the worker reads; it runs sandboxed with no credential but the
+  (pipe buffer / capture queue) leaves nothing to replay. Accepted: the allowed `dotnet build/test/restore` and `cargo
+  build/check/test/fetch` (below) run repo and package code (MSBuild targets, analyzers, cargo build scripts and procedural
+  macros, tests, restore) whose output the worker reads; it runs sandboxed with no credential but the
   router key, is the code under review or a pinned dependency, goes back through review and CI, and tainting it would leave no
   worker able to push.
-- The orchestrator pushes only to `factory/*`, with a repo-scoped GitHub App installation token passed
+  Worker tools (`ClaudeWorker.AllowedTools`, what an implementer, review fixer, CI fixer and conflict fixer may use): `Read`,
+  `Edit`, `Write`, `Glob`, `Grep`, `Bash(dotnet build:*)`, `Bash(dotnet test:*)`, `Bash(dotnet restore:*)` and — sc-25877, a
+  coordinator decision of 2026-10-13 pending the owner's confirmation (list below): without them a worker on a Rust repository
+  could never compile or run a test, and "plan → merged code" there depended on blind code plus CI fix rounds —
+  `Bash(cargo build:*)`, `Bash(cargo check:*)`, `Bash(cargo test:*)`, `Bash(cargo fetch:*)` (`ClaudeWorker.CargoTools`). The
+  prompts name both stacks (`RunPipeline.BuildsAndPasses`). Each is a Claude Code prefix rule: the command must start with the
+  words before `:*`. So a headless worker is denied `cargo run`, `install`, `publish`, `login`, `owner`, `yank`, every other
+  subcommand, and any form whose second word is not the subcommand (`cargo +nightly test`, `cargo --config … build`); a target
+  repository whose settings allow one of those (`Bash(cargo:*)`, `Bash(cargo run:*)`, `Bash(cargo test*)` …) taints the session
+  as before, while the four exact rules no longer do (they are in `AllowedTools`). Aliases: an `[alias]` in a repository's
+  `.cargo/config.toml` cannot rebind `build`, `check`, `test` or `fetch` (cargo ignores an alias that shadows a built-in command,
+  with a warning), so the four names mean cargo's own commands. Residuals, accepted, the same as the `dotnet` rules': (a) what
+  follows the prefix is the worker's — `--manifest-path` or `--target-dir` outside the worktree, `--config key=value`, `-- <test
+  arguments>` — as `dotnet build <any project>` and `-p:` properties are; (b) the four commands run code the repository and its
+  dependencies supply (build scripts, procedural macros, tests, a `runner`, `rustc-wrapper` or `[env]` from the repository's or
+  `~_factory/.cargo`'s config), as the sandbox user with no credential but the router key, with the network `cargo fetch` and
+  that code have; (c) the word boundary after the prefix is Claude Code's own matching: if a release matched `cargo testx` under
+  `cargo test:*`, a repository alias or an external `cargo-testx` on the worker's PATH would run — still only repository code in
+  the same sandbox, the residual of (b), no more; (d) cargo must be on the worker's PATH (the launch helper's fixed one,
+  unchanged: `/opt/homebrew/bin` or `/usr/local/bin`) — where it is not, the commands fail and the worker is where it was before.
+  The result goes back through review, CI and the gate. Triage and the planner gain none of this: `WorkerTools.ReadOnly` has no
+  allow rule but its read rule and denies `Bash` by name.
+- The orchestrator pushes only to `factory/*` (items' branches, and a plan's `factory/changeset-*` branch, sc-25872), with a repo-scoped GitHub App installation token passed
   via git env config (never argv/remote URLs/.git/config) on every network git call. Only the merge gate merges (below).
   Tokens are minted fresh per call (never cached) and refused if they outlive 1 hour (`GitHubApp`).
   Server-side, `github-repo protect` (`RepoProtection`) applies rulesets: default branch needs a PR, and only
@@ -600,6 +1298,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `DashboardControls`: login + antiforgery). Pipeline rows refresh on `NOTIFY work_items` (triggers on
   `work_items`/`worker_sessions`/`controls`, relayed by `SessionEventRelay` → `PipelineChanges`); session pages join the same
   `SessionBroadcaster` as hub viewers (`ISessionViewers`), so backlog-then-live holds there too. Never log transcript content.
+  A plan item's stories are listed beneath its row, from the ledger alone (sc-25876, above).
 - Review → CI → MergeGate → Merge (sc-25378; `RunPipeline.Gate.cs`, only in a pipeline built with a `GateStage`, which
   production always is): Implement records every model that answers the implementer (`implementer-model` checkpoints, from
   each assistant message's `model`; a record only — the panel does not depend on it). Review is a panel (sc-25379, `Gate/ReviewPanel.cs`): `correctness` and
@@ -771,12 +1470,14 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   of a non-Actions App with no check runs is ignored (GitHub creates one per App with checks access; the Claude App's stays
   queued forever). A workflow GitHub has not registered at all yet is still invisible. MergeGate (`MergeGate.Evaluate`, E1–E3) is deterministic code over
   facts read fresh each time: `factory/gate.yaml` at the PR's **base** commit (`pull.BaseSha`, the commit the diff is read
-  against; `GatePolicy`, `version: 2` or `3`, sc-25381: path tiers `sealed`/`protected`/`free` with `paths` and `checks`, `normal`
+  against; `GatePolicy`, `version: 2`, `3` or `4`, sc-25381: path tiers `sealed`/`protected`/`free` with `paths` and `checks`, `normal`
   with `checks` only, and `risk: {max_changed_lines, max_changed_files, max_fix_rounds}` — version 3 (sc-25709) adds two required
   risk keys, `max_blast_radius` (`low`|`medium`|`high`: a maximum, a file over it fails; `critical` would allow a critical file, is
   looser than the code floor and invalid) and `max_hotspot` (`off`, or a number ≥ 0: the opt-in limit on the hotspot score; `off`
   is the explicit opt-out, chosen over an optional key so every key stays required); each version's key set is strict, so a CodeGraph
-  key in a version 2 policy is unknown; version 2 still parses and runs at the floor with no hotspot limit; every key required;
+  key in a version 2 policy is unknown; version 2 still parses and runs at the floor with no hotspot limit; version 4 (sc-25873)
+  adds two more required risk keys, `max_changeset_lines` and `max_changeset_files` (whole numbers ≥ 1: the size limits of a plan's
+  changeset pull request, unknown and so invalid in versions 2 and 3; "Changeset size" above); every key required;
   version 1 is rejected; missing/invalid/unreadable → no merge, escalate; no bypass key exists). The policy can tighten the gate but not
   loosen it below floors in code (E2; described once on `GatePolicy`): checks — every tier lists `ci-green` and
   `review-pass`, sealed/protected also `security-review`, protected/normal also `risk-threshold` and
@@ -784,7 +1485,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   sealed — the tier must match the policy and CODEOWNERS (root, `.github/`, `docs/`) and cover `.github/workflows/` and
   `factory/prompts/` with a pattern matching everything under them (`PathPattern.CoversEverythingUnder`: a directory
   pattern or trailing `**` naming the directory or an ancestor; naming files in it is invalid); security review — a path
-  whose tier lists `security-review` or that `RiskyPaths` matches (scripts, build/container files, dependency manifests,
+  whose tier lists `security-review` or that `RiskyPaths` matches (scripts, build/container files, dependency manifests, Rust's
+  `build.rs`, `rust-toolchain*` and `.cargo/config*`,
   keys/.env, security-sensitive names; case-insensitive) needs it, so the policy can add security-review paths but not
   remove the floor. The gate also reads the PR, the diff of the head against the base (`IGateGitHub.GetDiffAsync`;
   unreadable → blocked; a file count — one per `diff --git` header, a rename once — other than the PR's `changed_files` →
@@ -796,8 +1498,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   needs the union of its tiers' checks: `ci-green`, `review-pass` (the head's verdict passes, holds every required role, and
   every review and second opinion was served on the router's `high` model class — its recorded `class`, a missing one
   failing closed — `ReviewModels.Problems`; which model served, and the implementer's models, are not consulted), `security-review` (the verdict has the
-  security review), `risk-threshold` (changed lines, files — renames count both paths — and fix rounds within `risk`, and
-  CodeGraph's inputs, below), `new-tests-fail-on-base` (sc-25382, below). Risk score (sc-25709, `Gate/CodeGraphRisk.cs`; CodeGraph
+  security review), `risk-threshold` (changed lines, files — renames count both paths; a changeset PR under a version 4 policy
+  against `max_changeset_*` instead of `max_changed_*` — and fix rounds within `risk`, and CodeGraph's inputs, below), `new-tests-fail-on-base` (sc-25382, below). Risk score (sc-25709, `Gate/CodeGraphRisk.cs`; CodeGraph
   C7, sc-25735, not deployed yet — the fakes follow its contract and C4's `CommitAnswer` shape, PR #71): `EvaluateGateAsync` first
   evaluates the gate without CodeGraph (`MergeGate.Evaluate(…, riskUnread: true)`: a change that needs `risk-threshold` and that
   nothing else blocks is `Pending`, never Merge), so a change another rule blocks (sealed path, failed verdict, new tests, size)
@@ -835,8 +1537,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   then the first `CodeGraphRisk.MaxListed` (20) others with "… N more", each hotspot with its commit, and what could not be read
   (capped likewise), so one row stays inside the reports' budget; a failure's
   reason names each file over the limit with its blast radius (or hotspot score), so the escalation comment and the PR report (both
-  from the ledger) name it. `analyze_impact_file`/`file_hotspot` (`CodeGraphMcpClient.RiskTools`) are sent straight through the MCP
-  client and are on no allowlist, profile or tool list (a test asserts it). A sealed path always escalates (even with no verdict); a protected one escalates after its checks instead of merging; each
+  from the ledger) name it. The gate sends `analyze_impact_file`/`file_hotspot` (`CodeGraphMcpClient.RiskTools`) straight through the MCP
+  client. They are on no reviewers' tool list and not in the triage profile; since sc-25874 they are on the planner profile's
+  list (`PlannerCodeGraph.Tools`), reachable by a planner session through the loopback proxy only, without a `sha` (a test asserts
+  each half: `CodeGraphRiskTests.The_risk_tools_are_on_no_reviewer_or_triage_tool_list_only_the_planners`). A sealed path always escalates (even with no verdict); a protected one escalates after its checks instead of merging; each
   evaluation is a `gate` checkpoint. A head without a verdict (a push after the review) goes back
   to Review (CI/MergeGate → Review are table rows); otherwise any failed rule escalates. A pass checkpoints `gate-passed`
   with the head SHA and merges with the gate App's write token and `sha` = that head (GitHub refuses a moved head: 409 →
@@ -910,6 +1614,87 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   gate uses it (E5); a recorded non-error result for the same base and head is reused, never re-run. Anything but `pass`
   blocks (`gate_rejected` for the typed outcome). Pause/Stop are watched while the runs execute (polled like a worker's
   watch): either cancels them (the runner stops the sandboxed commands) and records nothing, so Continue runs the check again.
+  Rust/cargo (sc-25875, `Gate/CargoNewTests.cs`, a second `INewTestStrategy` beside `XunitNewTests`; `NewTestsCheck.Strategies`
+  runs both, each for its own files, so a .NET change is judged exactly as before and a repo with both stacks by both). Found
+  by syntax, nothing compiled: `Gate/RustSource.cs` is a lexer-level reader (no Rust parser ships with .NET) that knows line and
+  nested block comments, string/byte/C strings, raw strings (`r#"…"#`), character literals as against lifetimes and raw
+  identifiers, and reads module bodies only — inline modules and braced item macros (`proptest! { … }`) are read, function,
+  `impl`, `trait` and `macro_rules!` bodies skipped; unbalanced source throws and the file is unisolable (never "no tests"). New
+  tests: functions with a test attribute (`#[test]` under any path — `#[tokio::test]`, `#[sqlx::test]` — `#[rstest]`,
+  `#[test_case(…)]`, `#[test_matrix]`, `#[quickcheck]`, `#[proptest]`) in the head versions of a cargo package's changed `.rs`
+  files (the nearest `Cargo.toml` with `[package]`; workspaces at any depth), in `tests/` or `src/`, whose id no base version of a
+  changed file has. Id = `package:target:path` as libtest names it: `words:lib:count::tests::blank`, `tool:bins:tests::runs`,
+  `words:test/api:deep::nested` (`tests/api.rs`, or `tests/api/main.rs` and its modules); a module file is the library's when
+  `src/lib.rs` declares its top module (or is all there is), else the binary's. A function with cases (`#[test_case]`, rstest
+  `#[case]`/`#[values]`) is one test `…::name::*` (every case under it; new cases on an existing one are unisolable, like a
+  theory's rows). Not new: a renamed file's test the old file had, and a test moved unchanged from where the PR removes it (ids are
+  path-based, so a pure move would otherwise look new). Overlay (the PR's test code applied to the base), under one rule: a new
+  test may count as not building on the base (`not-built`) only for something the base lacks, never for an import, helper or
+  attribute the overlay left out — where the gate cannot apply test code faithfully the check is `unsupported`. Test code is
+  what a test-only `cfg` gates, the predicate evaluated, not searched for the word (`RustSource.IsTestOnlyCfg`: `test`, `all(…)`
+  with a test-only operand, `any(…)` whose operands are all test-only, never `not(…)` — so `cfg(all(test, not(miri)))` is test
+  code and `cfg(any(test, feature = "x"))` production code), on the item or as an inline module's inner `#![cfg(test)]`.
+  Everything changed under a package's `tests/` and every file of a `#[cfg(test)]` module (`#![cfg(test)]`, or declared
+  `#[cfg(test)] mod x;` at any level above) comes whole from the head; a production file with inline tests is written — through
+  owner-side git, as the retries' files are (`NewTestSet.BaseReplacements`) — as its **base** version with the head's test code
+  grafted in (`CargoNewTests.Graft`): per module the two share, every `#[cfg(test)]` module replaced by the head's or added
+  (removed when the head has none), whole, so its helpers and `use`s come along and the production code stays the base's.
+  Imports are not test code but a test reaches them through `use super::*`: every single import of the head's `use` and
+  `extern crate` items (`RustSource.UseLeaves`: `use a::{b, c}` is `use a::b;` and `use a::c;`, attributes and visibility kept)
+  whose name the base's module does not already import is added at the module's end (`CargoNewTestSet.AddedUses`), `pub use`
+  re-exports included. A file the base lacks (added) that holds new tests is written with its inner attributes, its imports and
+  its `#[cfg(test)]` items alone (an empty `fn main` kept for a binary) and its `mod` declaration added to the base's parent
+  module file, so a test of the file's new code is compiled on the base and fails there in its own function, while one that
+  only reaches what the base has compiles and gets its real result; a manifest's `dev-dependencies` tables are the head's (a
+  new package's manifest is applied whole, its new crate roots as any new file). Unisolable (`unsupported`): a changed `.rs`
+  file the reader cannot read; a new test outside `src/` and `tests/`, in no package, or in a module shared by integration
+  tests (`tests/common/mod.rs`); a custom target layout (`[[test]]`, `autotests`/`autobins`/`autolib`, a non-default `path`); a
+  test function, or tests inside a macro, outside every `#[cfg(test)]` module that the base does not have unchanged (also at
+  the top of a new file, or in a module gated by `cfg(any(test, …))`: the items it uses beside it cannot be told from
+  production code — "move it into a #[cfg(test)] module"); a `#[cfg(test)]` item that is not a module (a `use`, an `impl`, a
+  helper) outside every `#[cfg(test)]` module, that the base lacks; two items of one kind and name in a module at the base or
+  the head that the graft would match (cfg alternates: two `mod tests`, two `#[test] fn t`; never two edits of one place —
+  `Graft` also refuses overlapping edits); a renamed production file that holds new tests (its production code is the base's
+  under another name); dotted `dev-dependencies` keys; a new file whose `mod` declaration is not at the top of its parent's
+  file. Runs, from the worktree root per package with a new test, all through `SandboxTestRunner` like xUnit's (as `_factory`,
+  no variables): `cargo --version` (`TestPhase.Toolchain`: failing, the run is `ToolchainMissing` → `error` naming cargo, never
+  a pass — cargo is needed only where a Rust check runs, so a .NET-only factory needs none; `setup-worker-user.sh` reports
+  `cargo`/`rustc` as an optional check; they must be on the launch helper's fixed PATH, `/opt/homebrew/bin` or
+  `/usr/local/bin`: the helper did not change; the same PATH serves an implementing worker's own `cargo build/check/test/fetch`,
+  `ClaudeWorker.CargoTools`, sc-25877), `cargo fetch` (the restore, the only step that may use the network, as `dotnet
+  restore` is; `cargo` reaches the lint only through `TestStep.Program`, the same known local program), `cargo test --offline
+  --no-run --message-format=json` for the targets with new tests (the build: cargo's JSON diagnostics, stable), then one `cargo
+  test --offline … --no-fail-fast -- --exact <path>` per new test (`--lib`, `--bins` or `--test <name>`; a parameterized one by
+  its `path::` prefix); `--offline`: the build and the tests resolve and download nothing. cargo reports on standard output, so
+  such a step's output is kept by the runner in memory with its exit code (`TestStep.CaptureOutput`, `ResultFile.ExitCode`;
+  nothing the run writes is read as a result). Results: libtest's JSON is nightly-only, so the stable lines are parsed
+  (`running N tests`, `test <name> ... ok|FAILED|ignored`, `test result: …`) and read only when they have libtest's shape and
+  agree with the exit code — per test binary a `running N tests` line, then N test lines, then a summary counting them; no test
+  line outside such a block; no test with two results; exit code 0 with no failure or non-zero with one; anything else (no
+  summary: a crashed or custom harness; a mismatch: a test that printed) is an unreadable report, `error`. `ignored` is skipped;
+  a run of 0 tests gives no case (`not-run`: `error` on the base, not passing on the head). A base that does not build: each
+  `compiler-message` error (file placed from rustc's workspace-relative name and the package's manifest path) is put in the
+  innermost item at its position; only what the overlay applied counts (a whole test file; in a grafted file a `#[cfg(test)]`
+  item, or an import the overlay added): in a new test's own function → `not-built`; another item of the test code (a helper)
+  is left out of the retry, and of a `use` only the single imports the error lies in (the others stay, so `use words::{words,
+  trim}` with a new `trim` still imports `words`); an error in a module's own header or between its items is unremovable (the
+  tests stay `unproven`); anywhere else — the base's production code or its own imports, a file not applied (e.g. another
+  module's test the base cannot build), no file (manifest, dependency, linker, no rustc), an ambiguous name (E0659), or no
+  error named — is unattributable, `error`. Retries: `INewTestStrategy.BaseRetries` is 1 for xUnit and 3 for cargo, since rustc
+  reports in stages (an import that does not resolve hides the errors of the code using its name, which may hide type
+  errors): each retry (`gate-sc-<id>-base-retry`, `-base-retry-2`, `-base-retry-3`) leaves out what the run before could not
+  compile, the last one that ran judges the remaining tests, and a base that still does not build after them leaves those
+  `unproven` (rejected). Residuals, accepted: (a) the test process writes all of its output and picks its exit code, so a test
+  that prints a complete libtest report and calls `std::process::exit(101)` is read as failed on the base — reviewed code that
+  lies about itself, as a test that asserts on the source tree would be; (b) `~_factory/.cargo` (a global `config.toml` with
+  `runner`, `rustc-wrapper` or `[env]`, and the registry cache `cargo fetch` fills) persists across items and is writable by
+  every worker session, so an implementer can influence later gate runs, on both commits — the analogue of `_factory`'s NuGet
+  cache and config for dotnet; (c) production code is the base's by file: code the PR moves into a new file, a new non-test
+  helper, macro or dependency, and a re-export in another package are things the base lacks, so a test that needs one is
+  `not-built` even if it otherwise exercises old code (as a test calling a new helper outside the test projects is for xUnit);
+  (d) by design, not a gap: a file-level import is production code, so an import the PR rebinds (the same name from another
+  path) keeps the base's binding in a grafted file — what the real base has; a test that only passes with the new binding
+  fails on the base, as it should.
   Upgrading from Phase 1: Review is now a handled state, so the first `factory work` picks up every item parked at Review:
   an open PR is reviewed by the panel like any other (Phase 1's missing `implementer-model` no longer matters, sc-25379),
   and one the owner merged or closed escalates once with a story comment ("merged outside the factory"). An item whose

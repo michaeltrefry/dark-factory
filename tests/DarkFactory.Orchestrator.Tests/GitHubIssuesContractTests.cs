@@ -227,6 +227,10 @@ public class GitHubIssuesContractTests
         Assert.Equal(ItemNaming.GitHubIssue, source.Naming);
         await Assert.ThrowsAsync<ArgumentException>(() => source.ReportStateAsync(1, BoardState.Stopped, null, CancellationToken.None));
         await Assert.ThrowsAsync<NotSupportedException>(() => source.CreateChildrenAsync(1, [], CancellationToken.None));
+        // sc-25871: no plan children, so none to release; and no blocker relation the factory reads.
+        await Assert.ThrowsAsync<NotSupportedException>(() => source.MakeReadyAsync(1, CancellationToken.None));
+        Assert.Empty(await source.BlockersAsync(1, CancellationToken.None));
+        Assert.False(source.PlansItems);
         Assert.True(await source.InScopeAsync(1, CancellationToken.None));
         Assert.False(await source.InScopeAsync(2, CancellationToken.None));
     }

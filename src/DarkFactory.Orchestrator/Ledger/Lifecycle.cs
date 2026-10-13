@@ -5,6 +5,14 @@ public enum WorkState
 {
     Intake,
     Plan,
+    /// <summary>
+    /// A plan item whose stories are on the board (sc-25870): nothing implements it. Each poll releases the stories whose blockers
+    /// have merged. Once every story has merged into the plan's changeset branch the item goes to <see cref="Review"/> with the
+    /// changeset pull request as its own (sc-25872) and from there through the gate like any item; a plan with no changeset, or
+    /// an empty one, is closed out and goes to <see cref="Done"/> (sc-25871). A plan of several repositories (sc-25873) does so
+    /// once per repository, in the plan's merge order, and comes back here from <see cref="Merge"/> after each but the last.
+    /// </summary>
+    Planned,
     Implement,
     Review,
     Fixing,
@@ -28,12 +36,19 @@ public sealed record TransitionContext(WorkState? PausedFrom = null, int FixRoun
         WorkState? pausedFrom = transitions.Count >= 2 && transitions[^1] == WorkState.Paused ? transitions[^2] : null;
         // A fix round is a Review → Fixing step (review findings), a CI → CIHealing step (red CI, sc-25383) or a MergeGate →
         // Fixing step (the merge queue's update to the base conflicted, sc-25384) since the last Implement: every kind shares one
-        // count and one cap. Returning from Paused is not a new round.
-        var lastImplement = transitions.ToList().FindLastIndex(s => s == WorkState.Implement);
+        // count and one cap. Returning from Paused is not a new round. A plan item has no Implement: its changeset pull request's
+        // rounds are counted since it last waited on its stories (Planned, sc-25872).
+        var lastImplement = transitions.ToList().FindLastIndex(StartsAttempt);
         var fixRounds = Enumerable.Range(lastImplement + 1, transitions.Count - lastImplement - 1)
             .Count(i => i > 0 && IsFixRound(transitions[i - 1], transitions[i]));
         return new TransitionContext(pausedFrom, fixRounds);
     }
+
+    /// <summary>
+    /// Whether entering <paramref name="state"/> starts an item's attempt at a change afresh, so the fix rounds before it no longer
+    /// count: Implement (a fresh branch from the base), or Planned (a plan item, whose changeset pull request has no Implement).
+    /// </summary>
+    public static bool StartsAttempt(WorkState state) => state is WorkState.Implement or WorkState.Planned;
 
     /// <summary>Whether <paramref name="from"/> → <paramref name="to"/> starts a fix round (counted against <see cref="Lifecycle.MaxFixRounds"/>).</summary>
     public static bool IsFixRound(WorkState from, WorkState to) =>
@@ -48,8 +63,11 @@ public sealed class IllegalTransitionException(WorkState from, WorkState to, str
 }
 
 /// <summary>
-/// The transition table (E2: code decides every transition). Later phases register
-/// handlers for states; they do not add rows here.
+/// The transition table (E2: code decides every transition). A new phase normally registers handlers for the states it drives
+/// and adds no row here. Phase 4a (plans) is the exception, with four rows: <c>Plan → Planned</c> (a plan item waiting on its
+/// stories, sc-25870), <c>Planned → Done</c> (its plan finished with no changeset to merge, sc-25871), <c>Planned → Review</c>
+/// (the plan item taking its changeset's pull request through the gate, sc-25872) and <c>Merge → Planned</c> (a plan of several
+/// repositories waiting again after each changeset but the last, sc-25873).
 /// </summary>
 public static class Lifecycle
 {
@@ -58,7 +76,12 @@ public static class Lifecycle
     private static readonly Dictionary<WorkState, WorkState[]> Forward = new()
     {
         [WorkState.Intake] = [WorkState.Plan, WorkState.Implement],
-        [WorkState.Plan] = [WorkState.Implement],
+        // A plan item's stories were created: it waits on them (sc-25870) and never goes on to Implement itself.
+        [WorkState.Plan] = [WorkState.Implement, WorkState.Planned],
+        // Every story of the plan merged. With a changeset branch (sc-25872) the plan item takes the changeset's one pull request
+        // to the default branch through Review → CI → MergeGate → Merge like any item's; without one, or with an empty one, the
+        // plan item was reported and closed out on its board (sc-25871) and is finished.
+        [WorkState.Planned] = [WorkState.Done, WorkState.Review],
         [WorkState.Implement] = [WorkState.Review],
         [WorkState.Review] = [WorkState.Fixing, WorkState.CI],
         [WorkState.Fixing] = [WorkState.Review],
@@ -67,7 +90,9 @@ public static class Lifecycle
         [WorkState.CIHealing] = [WorkState.CI],
         // The merge queue (sc-25384): a conflict with the base goes to the fixer; the updated head's red CI goes to CI's triage.
         [WorkState.MergeGate] = [WorkState.Merge, WorkState.Review, WorkState.Fixing, WorkState.CI],
-        [WorkState.Merge] = [WorkState.Watch],
+        // A plan of several repositories (sc-25873) merges one changeset per repository, one at a time: after each but the last
+        // the plan item waits again (Planned) — on the next repository's stories, then on that changeset's own pull request.
+        [WorkState.Merge] = [WorkState.Watch, WorkState.Planned],
         // A reverted change reopens: back to Intake, or straight to Implement.
         [WorkState.Watch] = [WorkState.Done, WorkState.Intake, WorkState.Implement],
         // A human re-queues an escalated item.

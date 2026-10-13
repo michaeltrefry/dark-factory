@@ -129,7 +129,8 @@ public sealed class GatewayAnalyzer : DiagnosticAnalyzer
     /// as a launcher's (<see cref="NetworkWord"/>).
     /// </summary>
     public static readonly ImmutableArray<string> KnownLocalPrograms = ImmutableArray.Create(
-        // The new-tests check's sandboxed steps: dotnet restore/build/test (XunitNewTests).
+        // The new-tests check's sandboxed steps: dotnet restore/build/test (XunitNewTests) and cargo fetch/test (CargoNewTests,
+        // sc-25875). Both restore steps fetch packages, as the worker user in the sandbox and never with a factory credential.
         "DarkFactory.Orchestrator.Gate.TestStep.Program",
         // sudo, through which every sandboxed run starts (WorkerSandbox.DefaultSudoPath).
         "DarkFactory.Orchestrator.Worker.WorkerSandbox.SudoPath",

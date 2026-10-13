@@ -26,6 +26,34 @@ public sealed record ItemNaming(string Source, string Prefix, string Noun)
 
     public string BranchName(int id) => $"factory/{Format(id)}";
 
+    /// <summary>The prefix of every changeset branch (<see cref="ChangesetBranchName"/>).</summary>
+    public const string ChangesetBranchPrefix = "factory/changeset-";
+
+    /// <summary>
+    /// A plan item's changeset branch (sc-25872), <c>factory/changeset-&lt;id&gt;</c>: under <c>factory/</c>, the only place the
+    /// factory's App may write, and never an item's own branch (no id starts with <c>changeset-</c>).
+    /// </summary>
+    public string ChangesetBranchName(int id) => $"{ChangesetBranchPrefix}{Format(id)}";
+
+    /// <summary>Whether <paramref name="branch"/> is a changeset branch: stories merge into it, so it is never force-pushed.</summary>
+    public static bool IsChangesetBranch(string? branch) => branch?.StartsWith(ChangesetBranchPrefix, StringComparison.Ordinal) == true;
+
+    /// <summary>
+    /// The item a worktree directory belongs to: <c>factory-sc-7</c> (the item's own branch) or <c>factory-changeset-sc-7</c> (the
+    /// plan item's changeset branch, which its changeset pull request's fix rounds work in); null for any other name.
+    /// </summary>
+    public static ItemRef? OfWorktree(string worktreeName)
+    {
+        const string prefix = "factory-";
+        const string changeset = "changeset-";
+        if (!worktreeName.StartsWith(prefix, StringComparison.Ordinal))
+        {
+            return null;
+        }
+        var name = worktreeName[prefix.Length..];
+        return ParseAny(name.StartsWith(changeset, StringComparison.Ordinal) ? name[changeset.Length..] : name);
+    }
+
     /// <summary>
     /// Parses <c>&lt;prefix&gt;-&lt;n&gt;</c> (any case). A bare number is a Shortcut story id (what <c>factory run 1234</c>
     /// always meant); other sources need their prefix.

@@ -166,8 +166,10 @@ public sealed partial class RunPipeline
                     await RecordFoundMergedAsync(run, history, pull, ct);
                     return;
                 }
-                EnsureOpen(pull);
+                await EnsureOpenAsync(run, pull, ct);
             }
+            // Before anything is merged into the head or the head into anything: the base is the one the ledger expects (sc-25872).
+            EnsureBase(run, pull);
             var verdicts = Verdicts(history);
             if (!verdicts.Any(v => v.HeadSha == pull.HeadSha))
             {
@@ -253,7 +255,9 @@ public sealed partial class RunPipeline
     /// shows, merges the base into it owner-side (<see cref="Git.IRepoWorkspace.MergeBaseAsync"/>: no worker runs git), records
     /// the update (<see cref="Steps.BaseUpdate"/>: old head, base commit, merge commit) and only then pushes it to the
     /// <c>factory/*</c> branch with the factory App's token as a fast-forward (never forced; the factory/** rulesets let that App
-    /// write those branches and nothing else, and only the gate App merges into the base). A crash before the push leaves the
+    /// write those branches and nothing else, and only the gate App merges into the base). The base is the PR's own: the default
+    /// branch, or for a plan's story its plan's changeset branch (sc-25872), which the stories of the plan merged before it moved;
+    /// a plan item's changeset branch is itself updated from the default branch this way. A crash before the push leaves the
     /// PR at the old head, which is simply updated again. A conflict is checkpointed (<see cref="Steps.MergeConflict"/>, with the
     /// files) and sends the item to the fixer: MergeGate → Fixing, a fix round sharing the count and cap of review and CI
     /// rounds; with the cap used it escalates. The worktree is removed either way.
@@ -261,7 +265,7 @@ public sealed partial class RunPipeline
     private async Task<UpdateOutcome> UpdateFromBaseAsync(Run run, PullFacts pull, CancellationToken ct)
     {
         var (_, repo, item) = run;
-        var workspace = await workspaces.RestoreAsync(repo, run.Story.Kind.BranchName(run.Story.Id), ct);
+        var workspace = await workspaces.RestoreAsync(repo, run.Branch, ct, run.BaseBranch);
         run.Workspace = workspace;
         try
         {
@@ -428,7 +432,7 @@ public sealed partial class RunPipeline
                 var fixRounds = TransitionContext.From(history.Where(e => e.Step is null).Select(e => e.State).ToList()).FixRounds;
                 var ci = await Gate.GitHub.GetCiAsync(run.Repo, pull.HeadSha, ct);
                 var newTests = await NewTestsAsync(run, pull, history, policy, diff, ct);
-                var change = new ChangeFacts(diff, diffError, fixRounds);
+                var change = new ChangeFacts(diff, diffError, fixRounds, IsChangesetPull(run.Changeset, pull));
                 // Everything but CodeGraph first: CodeGraph is asked only about a change nothing else blocks.
                 decision = MergeGate.Evaluate(policy, policyError, pull, change, ci, Verdicts(history), newTests, riskUnread: Gate.Risk is not null);
                 if (decision.Outcome == GateOutcome.Pending && Gate.Risk is { } reader && diff is not null)
@@ -458,7 +462,7 @@ public sealed partial class RunPipeline
                     await RecordFoundMergedAsync(run, nowHistory, now, ct);
                     return null;
                 }
-                EnsureOpen(now);
+                await EnsureOpenAsync(run, now, ct);
                 if (now.HeadSha != pull.HeadSha)
                 {
                     await ledger.RecordAsync(run.Item, WorkState.Review, null,
@@ -471,7 +475,7 @@ public sealed partial class RunPipeline
             {
                 // The deadline fell inside a CodeGraph call or the overlay wait: blocked there, never later.
                 decision = TimedOut(waiting ?? new GateDecision(GateOutcome.Pending, pull.HeadSha,
-                    [$"risk threshold: CodeGraph's inputs for {Ci.Short(pull.HeadSha)} were still being read"]));
+                    [$"risk threshold: CodeGraph's inputs for {Ci.Short(pull.HeadSha)} were still being read"]) { Changeset = IsChangesetPull(run.Changeset, pull) });
                 break;
             }
         }
@@ -499,9 +503,14 @@ public sealed partial class RunPipeline
         // Never merge into a frozen factory: main may have turned red (or another trigger tripped) while this run waited for
         // CI or its turn in the queue. Main-red is read fresh here, not from the evaluator's short cache.
         await ThrowIfFrozenAsync(run.Item, ct, fresh: true);
+        EnsureBase(run, pull);
         // What this merge changes, for the freeze (sc-25387): recorded before the merge, so every factory merge has it.
         var files = DiffPaths.Of(await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct));
-        await ledger.CheckpointAsync(run.Item, Steps.MergeFiles, null, new MergeFiles(pull.BaseRef, files).ToDetail(), ct);
+        // A plan item's changeset merge names the repository merged into (sc-25873): the item's own is that repository only while
+        // it takes this pull request through the gate — afterwards its primary one again, which need not be this one (the next
+        // changeset's repository, or a plan whose stories are all in another repository than the plan item's first).
+        await ledger.CheckpointAsync(run.Item, Steps.MergeFiles, null,
+            new MergeFiles(pull.BaseRef, files, run.Changeset is not null ? run.Repo.FullName : null).ToDetail(), ct);
         await ledger.CheckpointAsync(run.Item, Steps.GatePassed, null, pull.HeadSha, ct);
         MergeResult merged;
         try
@@ -535,7 +544,9 @@ public sealed partial class RunPipeline
     /// <summary>
     /// A run that stopped after GitHub merged but before the ledger said so (a crash, Ctrl-C during the merge call, then an
     /// "unpaused" row): only a commit this gate passed counts. gate-passed is bound to its head SHA, so one anywhere in the
-    /// item's history proves the merged head is a commit the gate let through.
+    /// item's history proves the merged head is a commit the gate let through — for a plan item of several repositories
+    /// (sc-25873) anywhere in its current pull request's rows (<see cref="GatePassedAt"/>): an earlier repository's gate pass
+    /// never vouches for this one's pull request.
     /// </summary>
     private async Task RecordFoundMergedAsync(Run run, List<LedgerEntry> history, PullFacts pull, CancellationToken ct)
     {
@@ -545,7 +556,7 @@ public sealed partial class RunPipeline
             await ledger.RecordAsync(run.Item, WorkState.Merge, null, commit, ct);
             return;
         }
-        throw new GateBlockedException($"{pull.HtmlUrl} was merged outside the gate.");
+        throw new GateBlockedException($"{pull.HtmlUrl} {Plans.PlanRelease.MergedOutsideGate}.{await MergedIntoChangesetAsync(run, pull, ct)}");
     }
 
     /// <summary>
@@ -607,7 +618,7 @@ public sealed partial class RunPipeline
             {files}
 
             Resolve every conflict: edit each file so it keeps both the story's change and what the base changed, with no
-            conflict markers left, and make sure `dotnet build` and `dotnet test` pass. Do not commit, push, or open pull
+            conflict markers left, and make sure {BuildsAndPasses}. Do not commit, push, or open pull
             requests; the orchestrator does that.
             """;
     }

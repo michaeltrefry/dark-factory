@@ -233,13 +233,17 @@ internal sealed class E2e : IAsyncDisposable
     }
 
     /// <summary>Every PR (any state) whose head is the item's <c>factory/sc-&lt;id&gt;</c> branch.</summary>
-    public static async Task<List<JsonElement>> PullRequestsAsync(RepoRef repo, int storyId, CancellationToken ct)
+    public static Task<List<JsonElement>> PullRequestsAsync(RepoRef repo, int storyId, CancellationToken ct) =>
+        PullRequestsAsync(repo, StoryId.BranchName(storyId), ct);
+
+    /// <summary>Every PR (any state) whose head is <paramref name="branch"/> (e.g. a plan's changeset branch).</summary>
+    public static async Task<List<JsonElement>> PullRequestsAsync(RepoRef repo, string branch, CancellationToken ct)
     {
         using var github = OutboundHttp.GitHubApi();
         var app = new GitHubApp(github, Harness.Options.GitHubAppId, Harness.Options.GitHubAppPrivateKeyPem, TimeProvider.System);
         var token = (await app.CreateInstallationTokenAsync(repo, ct)).Token;
         using var request = GitHubApp.Request(HttpMethod.Get,
-            $"repos/{repo.Owner}/{repo.Name}/pulls?state=all&head={Uri.EscapeDataString($"{repo.Owner}:{StoryId.BranchName(storyId)}")}",
+            $"repos/{repo.Owner}/{repo.Name}/pulls?state=all&head={Uri.EscapeDataString($"{repo.Owner}:{branch}")}",
             "Bearer", token);
         using var response = await github.SendAsync(request, ct);
         response.EnsureSuccessStatusCode();

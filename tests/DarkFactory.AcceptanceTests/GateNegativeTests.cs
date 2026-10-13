@@ -194,6 +194,142 @@ public class GateNegativeTests
     }
 
     /// <summary>
+    /// P4-AT4 (sc-25875): the new-tests check judges a Rust pull request with cargo, as the worker user. Before the first review
+    /// the test pushes a small cargo package, <c>e2e-rust/</c>, to the PR branch: a function and an inline <c>#[cfg(test)]</c>
+    /// module with one test that calls it and one that asserts nothing the change does. On the base the package does not exist: it
+    /// is applied with its test code alone, so the first test does not compile there (<c>not-built</c>: it calls code the pull
+    /// request adds), the second passes in the retry, and the gate rejects it by name. Nothing merges, so the sandbox's main
+    /// never gets the package. Needs cargo and rustc for the worker user (<c>sudo scripts/setup-worker-user.sh</c> reports them);
+    /// without them the check is an <c>error</c> (toolchain-missing) and this test fails saying so.
+    /// </summary>
+    [Fact]
+    public async Task P4_AT4_a_rust_test_that_already_passes_on_the_base_is_gate_rejected_and_one_calling_new_code_does_not_build_there()
+    {
+        await using var run = await StartAsync("FACTORY_E2E_P4_CARGO_STORY", "df_e2e_p4at4_cargo");
+        const string vacuous = "df-e2e-rust:lib:tests::already_passes_on_the_base";
+        const string real = "df-e2e-rust:lib:tests::doubles";
+        var reviewer = new SeededReviewer(beforeFirst: async (request, ct) =>
+        {
+            var token = await run.Sandbox.AppTokenAsync(ct);
+            var branch = StoryId.BranchName(run.StoryId);
+            await run.Sandbox.PutFileAsync(token, branch, "e2e-rust/Cargo.toml", "[package]\nname = \"df-e2e-rust\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                "acceptance: a cargo package (manifest)", ct);
+            await run.Sandbox.PutFileAsync(token, branch, "e2e-rust/src/lib.rs", """
+                // [dark-factory e2e] seeded by the acceptance test P4-AT4: one test calls the function this file adds, the
+                // other passes on the base, so the gate must reject it.
+                pub fn double(x: u32) -> u32 { x * 2 }
+
+                #[cfg(test)]
+                mod tests {
+                    #[test]
+                    fn doubles() { assert_eq!(super::double(2), 4); }
+
+                    #[test]
+                    fn already_passes_on_the_base() { assert_eq!(1 + 1, 2); }
+                }
+
+                """, "acceptance: a cargo package with a test that already passes on the base", ct);
+        });
+
+        var outcome = await FactoryRunAsync(run, gate => gate with { Reviewer = reviewer });
+
+        var (history, _) = await AssertBlockedAtTheGateAsync(run, outcome, $"{GateChecks.NewTestsFailOnBase} ({NewTestsOutcome.Rejected})");
+        var newTests = history.Last(e => e.Step == RunPipeline.Steps.NewTests);
+        Assert.Equal(StepOutcome.GateRejected, newTests.Outcome);
+        var result = Assert.IsType<NewTestsResult>(NewTestsResult.FromDetail(newTests.Detail));
+        Assert.True(result.Outcome == NewTestsOutcome.Rejected, $"{result.Outcome}: {result.Reason}");
+        Assert.Equal(new CargoNewTests().Name, result.Strategy);
+        // The base did not build with the new test of new code; the retry without it ran, and so did the head.
+        Assert.Equal(("build-failed", "ran", "ran"), (result.BaseRun, result.BaseRetry, result.HeadRun));
+        var passing = Assert.Single(result.Tests, t => t.Test == vacuous);
+        Assert.Equal((TestCaseResult.Passed, TestCaseResult.Passed), (passing.Base, passing.Head));
+        var failing = Assert.Single(result.Tests, t => t.Test == real);
+        Assert.Equal((NewTestsCheck.NotBuilt, TestCaseResult.Passed), (failing.Base, failing.Head));
+        Assert.Contains(vacuous, result.Reason);
+        Assert.DoesNotContain($"{real},", result.Reason);
+    }
+
+    /// <summary>The directory on the sandbox's main that holds the crates P4-AT4's merging test leaves there, one per run.</summary>
+    internal const string MergedCrates = "e2e-rust-merged";
+
+    /// <summary>
+    /// The cargo package P4-AT4's merging test seeds (<paramref name="id"/>: this run's own, so the package is new on every base):
+    /// its directory, its manifest, its library — one function and one <c>#[cfg(test)]</c> test that calls it — and that test's id
+    /// as the cargo strategy names it. On the base the package does not exist, so the test cannot build there
+    /// (<see cref="NewTestsCheck.NotBuilt"/>: it fails on the base); on the head it passes.
+    /// </summary>
+    internal static (string Directory, string Manifest, string Library, string Test) MergingCrate(string id) =>
+        ($"{MergedCrates}/p{id}",
+            $"[package]\nname = \"df-e2e-p{id}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            $$"""
+            // [dark-factory e2e] seeded by the acceptance test P4-AT4 (run {{id}}): the test below calls the function this file
+            // adds, so it cannot pass on the base and passes on the head. Safe to delete.
+            pub fn double(x: u32) -> u32 { x * 2 }
+
+            #[cfg(test)]
+            mod tests {
+                #[test]
+                fn doubles() { assert_eq!(super::double(2), 4); }
+            }
+
+            """,
+            $"df-e2e-p{id}:lib:tests::doubles");
+
+    /// <summary>
+    /// P4-AT4, the merging half (sc-25875, sc-25877): a Rust pull request whose new test fails on the base and passes on the head
+    /// goes through the gate and merges. Before the first review the test pushes a small cargo package of this run's own,
+    /// <c>e2e-rust-merged/p&lt;run&gt;/</c>, to the PR branch (<see cref="MergingCrate"/>); the new-tests check, run by cargo as the
+    /// worker user on the base and on the head, passes (with the story's own xUnit tests, judged by the xUnit strategy as ever), the
+    /// gate decides Merge, and GitHub merges the pull request. Unlike every other test of this class it MERGES: the sandbox's main
+    /// then holds the crate (one directory per run under <c>e2e-rust-merged/</c>; delete them whenever). Needs cargo and rustc on
+    /// the worker user's fixed PATH, and everything P2-AT1 needs for a merge (the gate App, a policy on main, CodeGraph).
+    /// </summary>
+    [Fact]
+    public async Task P4_AT4_a_rust_test_that_fails_on_the_base_and_passes_on_the_head_merges()
+    {
+        await using var run = await StartAsync("FACTORY_E2E_P4_CARGO_MERGE_STORY", "df_e2e_p4at4_merge");
+        var crate = MergingCrate(Guid.NewGuid().ToString("N")[..8]);
+        var reviewer = new SeededReviewer(beforeFirst: async (request, ct) =>
+        {
+            var token = await run.Sandbox.AppTokenAsync(ct);
+            var branch = StoryId.BranchName(run.StoryId);
+            await run.Sandbox.PutFileAsync(token, branch, $"{crate.Directory}/Cargo.toml", crate.Manifest, "acceptance: a cargo package (manifest)", ct);
+            await run.Sandbox.PutFileAsync(token, branch, $"{crate.Directory}/src/lib.rs", crate.Library,
+                "acceptance: a cargo package with a test that fails on the base and passes on the head", ct);
+        });
+
+        var outcome = await FactoryRunAsync(run, gate => gate with { Reviewer = reviewer });
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(WorkState.Watch, outcome.State);
+        var history = await run.E2e.HistoryAsync(run.StoryId, run.Ct);
+        ReviewGateTests.AssertTypedOutcomes(history);
+        // The check passed, and cargo judged the seeded test: not built on the base (it calls code the pull request adds), passed on the head.
+        var newTests = history.Last(e => e.Step == RunPipeline.Steps.NewTests);
+        Assert.Equal(StepOutcome.Passed, newTests.Outcome);
+        var result = Assert.IsType<NewTestsResult>(NewTestsResult.FromDetail(newTests.Detail));
+        Assert.True(result.Outcome == NewTestsOutcome.Pass, $"{result.Outcome}: {result.Reason}");
+        Assert.Contains(new CargoNewTests().Name, (result.Strategy ?? "").Split(", "));
+        var seeded = Assert.Single(result.Tests, t => t.Test == crate.Test);
+        Assert.Equal((NewTestsCheck.NotBuilt, TestCaseResult.Passed), (seeded.Base, seeded.Head));
+        // The gate's own decision, then the merge of exactly the head it passed.
+        var gate = history.Last(e => e.Step == RunPipeline.Steps.GateDecision);
+        Assert.StartsWith($"{GateOutcome.Merge} ", gate.Detail);
+        Assert.Equal(StepOutcome.Passed, gate.Outcome);
+        Assert.Contains(GateChecks.NewTestsFailOnBase, gate.Detail);
+        var passed = history.Last(e => e.Step == RunPipeline.Steps.GatePassed);
+        Assert.Equal(result.HeadSha, passed.Detail);
+        Assert.Equal([WorkState.MergeGate, WorkState.Merge, WorkState.Watch], history.Where(e => e.Step is null).Select(e => e.State).TakeLast(3));
+        var pr = await ReviewGateTests.MergedPullRequestAsync(run.Sandbox.Repo, run.StoryId, outcome.PullRequestUrl!, run.Ct);
+        Assert.Equal(passed.Detail, pr.GetProperty("head").GetProperty("sha").GetString());
+        Assert.Equal(history.Last(e => e.Step is null && e.State == WorkState.Merge).Detail, pr.GetProperty("merge_commit_sha").GetString());
+        // The sandbox's default branch now holds the crate.
+        var files = await run.Sandbox.TreeFilesAsync(await run.Sandbox.AppTokenAsync(run.Ct), pr.GetProperty("base").GetProperty("ref").GetString()!, run.Ct);
+        Assert.Contains($"{crate.Directory}/Cargo.toml", files);
+        Assert.Contains($"{crate.Directory}/src/lib.rs", files);
+    }
+
+    /// <summary>
     /// The fix-round cap a PR whose base has <paramref name="policy"/> (<see cref="GatePolicy.Path"/>; null: none) runs under: the
     /// policy's <c>risk.max_fix_rounds</c>, never above the hard cap <see cref="Lifecycle.MaxFixRounds"/> (what the pipeline's
     /// <c>fix-cap</c> row records). The sandbox's policy sets 2.

@@ -144,29 +144,38 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
 
     /// <summary>
     /// <c>GitHub:Watch:Repos</c>: the repos whose issues <c>factory work</c> triages (sc-25385), comma-separated <c>owner/name</c>
-    /// (or an array section). Empty (the default) watches no issues.
+    /// (or an array section). Empty (the default) watches no issues. It is the issue-triage watch list — a repository named here
+    /// has its issues polled — and such a repository is also one of the <see cref="ConfiguredRepos"/>; to let the factory plan
+    /// and work in a repository without triaging its issues, name it in <see cref="Repos"/> instead.
     /// </summary>
-    public IReadOnlyList<RepoRef> WatchedIssueRepos
+    public IReadOnlyList<RepoRef> WatchedIssueRepos => RepoList("GitHub:Watch:Repos");
+
+    /// <summary>
+    /// <c>Factory:Repos</c> (sc-25877): repositories the factory may plan and work in besides <see cref="DefaultRepo"/>,
+    /// comma-separated <c>owner/name</c> (or an array section); empty by default. Unlike <see cref="WatchedIssueRepos"/> it
+    /// turns on no issue polling: it only adds to <see cref="ConfiguredRepos"/>.
+    /// </summary>
+    public IReadOnlyList<RepoRef> Repos => RepoList("Factory:Repos");
+
+    /// <summary>A setting listing repositories: each entry a well-formed <c>owner/name</c> (else refused, naming <paramref name="key"/>), once each whatever its case.</summary>
+    private List<RepoRef> RepoList(string key)
     {
-        get
-        {
-            var section = config.GetSection("GitHub:Watch:Repos");
-            var raw = section.Value is { } single ? single.Split(',') : section.GetChildren().Select(c => c.Value ?? "");
-            return raw.Select(v => v.Trim()).Where(v => v.Length > 0)
-                .Select(v =>
+        var section = config.GetSection(key);
+        var raw = section.Value is { } single ? single.Split(',') : section.GetChildren().Select(c => c.Value ?? "");
+        return raw.Select(v => v.Trim()).Where(v => v.Length > 0)
+            .Select(v =>
+            {
+                try
                 {
-                    try
-                    {
-                        return RepoRef.Parse(v);
-                    }
-                    catch (ArgumentException ex)
-                    {
-                        throw new InvalidOperationException($"GitHub:Watch:Repos: {ex.Message}", ex);
-                    }
-                })
-                .DistinctBy(r => r.FullName, StringComparer.OrdinalIgnoreCase)
-                .ToList();
-        }
+                    return RepoRef.Parse(v);
+                }
+                catch (ArgumentException ex)
+                {
+                    throw new InvalidOperationException($"{key}: {ex.Message}", ex);
+                }
+            })
+            .DistinctBy(r => r.FullName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
     }
 
     /// <summary><c>Intake:PollSeconds</c> (&gt; 0, default 60): how often <c>factory work</c> polls the board.</summary>
@@ -196,10 +205,12 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     };
 
     /// <summary>
-    /// The repos the factory is configured to work on (<see cref="DefaultRepo"/> and <see cref="WatchedIssueRepos"/>): the
-    /// freeze's main-red trigger reads these and the repos of non-terminal items.
+    /// The repos the factory is configured to work on: <see cref="DefaultRepo"/>, <see cref="Repos"/> and
+    /// <see cref="WatchedIssueRepos"/>, once each whatever its case. The freeze's main-red trigger reads these and the repos of
+    /// non-terminal items, and they are the only repositories a plan may name (<see cref="RunPipeline"/>'s <c>configuredRepos</c>).
     /// </summary>
-    public IReadOnlyList<string> ConfiguredRepos => [DefaultRepo.FullName, .. WatchedIssueRepos.Select(r => r.FullName)];
+    public IReadOnlyList<string> ConfiguredRepos =>
+        [.. new[] { DefaultRepo }.Concat(Repos).Concat(WatchedIssueRepos).Select(r => r.FullName).Distinct(StringComparer.OrdinalIgnoreCase)];
 
     private int AtLeast(string key, int fallback, int min) =>
         config.GetValue(key, fallback) is var n && n >= min ? n : throw new InvalidOperationException($"{key} must be at least {min}, not {n}.");
@@ -385,7 +396,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     /// </summary>
     public void ValidateSettings()
     {
-        _ = (RouterBaseUrl, DefaultRepo, WorkerSandbox, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures);
+        _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSandbox, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures);
         _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
         _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl, KanbanMcpUrl);
         _ = CodeGraphOverlayTimeout;
