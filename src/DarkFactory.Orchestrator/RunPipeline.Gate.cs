@@ -70,7 +70,9 @@ public sealed partial class RunPipeline
     {
         if (!pull.Open)
         {
-            throw new InvalidOperationException($"{pull.HtmlUrl} is {(pull.Merged ? "merged" : "closed")} outside the factory.");
+            throw new InvalidOperationException(pull.Merged
+                ? $"{pull.HtmlUrl} {Plans.PlanRelease.MergedOutsideFactory}."
+                : $"{pull.HtmlUrl} is closed outside the factory.");
         }
     }
 

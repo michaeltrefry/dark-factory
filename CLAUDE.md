@@ -25,7 +25,7 @@ Claude Code headless workers through the Weave router.
   (allowlists), `McpProxy`, `McpProxySessions`; CodeGraph's client `CodeGraph/CodeGraphMcpClient.cs`; sc-25707),
   plan items (`Plans/`: `Plan.cs` — the typed plan, `PlanParser`, the `plan` label and the planned-story marker — and
   `PlanWorker.cs` — `IPlanRunner`, `WorkerPlanRunner`, `PlanPrompt`; `PlanRelease.cs` — the release decision and the one "blocker
-  satisfied" rule (sc-25871); pipeline handler `RunPipeline.Plan.cs`; the production seat `SandboxPlanRunner` in `FactoryRunner.cs`;
+  satisfied" rule (sc-25871), and the classification of a plan's stories with what a failed one holds (sc-25876); pipeline handler `RunPipeline.Plan.cs`; the production seat `SandboxPlanRunner` in `FactoryRunner.cs`;
   sc-25870),
   and the outbound gateway (`Gateway/`: `OutboundHttp` builds every GitHub, Shortcut, router, CodeGraph and Kanban `HttpClient` (and the
   acceptance tests' dashboard client and their loopback-only client of the MCP proxy, `LoopbackMcp`); `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token
@@ -91,7 +91,9 @@ Claude Code headless workers through the Weave router.
   stories, created once, then released in dependency order (each tier's Merge rows seeded in the throwaway ledger; the stories are
   not worked and the plan is not closed out). P4-AT3's proxy part (sc-25874, same class): the production proxy with a planner
   grant over two repositories (`FACTORY_E2E_P4_PLAN_REPOS`) answers for each and refuses a third project, a call naming no
-  repository and off-list tools.
+  repository and off-list tools. P4-AT5 (sc-25876, `PlanFailureAcceptanceTests`, `FACTORY_E2E_P4_HOLD_STORY`): a fixed plan's
+  stories on the real board, their progress seeded in the throwaway ledger — an escalated story holds its dependent, the plan item
+  is commented once, the dashboard data groups the stories, and Stop on the plan item stops its stories and cancels it; no model.
   Phase 3's epic AT1–AT5 (sc-25710, `CodeGraphAcceptanceTests.cs`): `CodeGraphReviewTests` (the real panel's tool calls, turns and
   overlay-bound CodeGraph answers), `CodeGraphTriageTests` (a triage session through the proxy, scanned for the CodeGraph token by a
   wrapper Claude Code path, `ScanWrapper`; the production proxy refusing off-profile tools; a live Kanban read through the reviewers'
@@ -366,7 +368,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   a rate limit, 401 or 408) is recorded `github-refused` on the item and the dashboard and does not hold the repo's cursor; the
   issue is taken up again when it next changes.
 - Controls (`Controls/`): Pause/Continue/Stop rows in the ledger's `controls` table (scope `factory` | `epic:<id>` |
-  `item:sc-<id>`; `WorkItem.EpicId` maps items to epics), written by `factory pause|continue|stop` and the dashboard
+  `item:sc-<id>`; `WorkItem.EpicId` maps items to epics; a plan item's `item:` scope also holds its stories, through
+  `WorkItem.PlanItemId` — plan failures and controls, sc-25876, below), written by `factory pause|continue|stop` and the dashboard
   (`ControlActions`), read by every process. `RunPipeline` checks them before every step and, while a worker runs,
   polls them every second (`ControlWatch`): Pause → `IWorker.RequestPause` (a flag file under `<work root>/controls`
   that the worker's PreToolUse hook, passed by `--settings`, turns into deny + `continue: false`, ending the session at
@@ -597,8 +600,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   once per evaluation only about a released, unmerged story that nothing works — the ledger does not know it, or its item is
   Paused; a story in flight is never read. The `[Planned] … waiting:` log line names the held stories, the archived ones and every
   released, unmerged story (`released, not merged` / `released, back in the backlog`). A plan story that escalates or is cancelled
-  never satisfies its dependents: they stay in the Backlog and the plan item stays `Planned` (held-by reporting, plan-scope Stop
-  and dashboard grouping are a later story). A board that cannot be read or written during an evaluation (a story deleted on the
+  never satisfies its dependents: they stay in the Backlog and the plan item stays `Planned`, saying which story holds it (plan
+  failures and controls, sc-25876, below). A board that cannot be read or written during an evaluation (a story deleted on the
   board, a 500) throws out of the run: nothing is recorded for that step, the intake loop shows the item's failure and polls again,
   and after `Intake:MaxItemFailures` in a row `RunPipeline.GiveUpAsync` (E10) comments once on the plan item (the reason fenced) and
   writes one `plan-held` row `not evaluated: <reason>`; the item stays `Planned`, is evaluated again every poll and goes on by
@@ -623,6 +626,93 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   blockers are satisfied the next run goes on (unpaused → Intake → claim). A blockers read that fails inside the claim check fails
   the run like any failed Intake step (no claim; Escalated, re-run when the board next lists it). Only a plan's stories are held to
   their blockers: a hand-written story's `blocks` relations stay the owner's own business, as before.
+- Plan failures and controls (Phase 4a, sc-25876; `Plans/PlanRelease.cs` `Classify`, `RunPipeline.Plan.cs` `RecordFailedHoldAsync`,
+  `Controls/ItemStopper.cs`, `Controls/Controls.cs` `LedgerControls.EffectiveAsync`, `Dashboard/DashboardData.cs` `PlansAsync`).
+  Classification: every evaluation of a waiting plan classifies its stories from ledger rows alone (`PlanRelease.Classify`, pure;
+  the dashboard calls the same function): `Merged` (a Merge row), `Failed` (`PlanRelease.FailureOf`: no Merge row and the item's
+  last transition is Escalated or Cancelled — `escalated`, `cancelled`, or `merged outside the factory` when the escalation reason
+  is the review's "is merged outside the factory" or the merge queue's "was merged outside the gate" — `PlanRelease.MergedOutsideFactory`
+  and `MergedOutsideGate`, the constants the two throw sites build their message from), `InFlight` (released, or
+  known to the ledger and neither), `Blocked` (unreleased, and a failed story is among its unmerged plan blockers, directly or
+  through others; `HeldBy` names the failed roots) and `Waiting` (unreleased, waiting on anything else or on nothing). A story a
+  person re-queued after an escalation (Escalated → Intake) is in flight again, not failed; a story parked on a blocked claim still
+  only waits. The release decision is unchanged and independent: a failed story has no Merge row, so `PlanRelease.Satisfied` already
+  never releases its dependents, and the stories that do not depend on it are released and worked as before.
+  Held by a failed story: when the record changes — never every poll — the plan item gets one row: `plan-held` whose Detail starts
+  `held by a failed story: ` (`PlanRelease.FailedPrefix`; told apart from the outside-blocker and `not evaluated:` `plan-held` rows
+  by that prefix) then, per failed story, `sc-12 escalated at <utc>: \`<reason>\`` — the reason from the story's own Escalated or
+  Cancelled row, cut at `PlanRelease.MaxFailureReason` (300) and made one inert code span (`UntrustedText.CodeSpan`) — and
+  `; not released because of them: sc-13 (behind sc-12), …`; or `plan-stuck` with the same Detail once the plan is stuck
+  (`PlanStatus.Stuck`: every story that has not merged is failed or blocked behind one). Both have outcome `deferred`: the plan
+  item never escalates for a story's failure, stays `Planned` and polled, and adds nothing to the freeze's consecutive-failures
+  trigger beyond the story's own Escalated row. The record changes when the failed stories do, when one fails again (the time is in
+  it), when what they block does, or when held becomes stuck. Once no story is failed any more, one `plan-resumed` row (outcome
+  passed) lifts it; the dependents are then released as their blockers merge, by the ordinary rule. Each such row gets ONE comment
+  on the plan item through `IWorkSource.CommentAsync`, after the row (E4): `PlanRelease.HeldComment` (failed stories with state,
+  time and reason; the stories blocked behind them; the counts; both remedies — fix and `factory run sc-N`, or
+  `factory stop --item <plan>`; a cancelled story cannot be re-run) or `ResumedComment`. Its result is a `plan-notice` row (`posted`,
+  or `failed: …` with outcome failed); a row with no posted notice is tried again by the next evaluations up to
+  `RunPipeline.MaxPlanNoticeAttempts` (3) and then left to the ledger and the dashboard, whose plan row says `hold comment not posted
+  (attempt n of 3; tried again on the next poll | not tried again: …)` from those rows (`PlanView.FailedNotices`); a posted one is
+  never repeated (a run that died between row and comment posts it on the next evaluation). Hold bookkeeping runs before the completion check and does not
+  depend on how a complete plan is finished.
+  Plan-scope controls use NO new scope kind: a plan is controlled at its own `item:<plan id>` scope (`factory pause|continue|stop
+  --item <plan>`, the dashboard's control form on the plan row), and `LedgerControls.EffectiveAsync` also consults, for an item with
+  a `PlanItemId`, its plan item's row — inside its one query (the plan's scope comes from a self-join on the ledger's
+  `(Source, ExternalId)` index; a second query, for the story's Merge row, runs only while the plan's row is Stopping), since it is
+  read every second for every running worker and test run; a read that fails throws, so a failed plan lookup is an unreadable
+  control (a Pause after `Controls:MaxReadFailures`, E2), never "no plan" — so every existing consumer (the pipeline's step check, `ControlWatch`, the gate's test
+  watch, `InFlightAsync`, the merge queue's `HeldIdleByControlAsync`) honours it unchanged. Pause on a plan: its row pauses the
+  plan item (nothing released: a paused plan item is not evaluated) and every story of it — an in-flight one stops at its next tool
+  boundary, Paused `user-paused` (`UserPausedAsync` counts the plan's row as a user pause), auto-resumed on Continue; a released
+  story the ledger does not know yet is not claimed (`RunPipeline.PlanControlAsync`, from `WorkLedger.PlanOfAsync`). Continue lifts
+  it. Stop on a plan: `EffectiveAsync` answers Stopping for each story of it that has no Merge row (a merged story is untouched —
+  for it the plan's Stop is nothing, though a plan's Pause still pauses its bookkeeping), `InFlightAsync` lists the plan item and
+  those stories as being stopped, plan first, and `ItemStopper.StopLockedAsync` on a plan item (one whose ledger has `plan-stories`;
+  the same path whether the CLI, the dashboard or the plan's own run calls it, and whether or not the plan item has a pull request
+  of its own) stops the stories first (`StopStoriesAsync`), each under its own run lock and on its own rows by the ordinary item
+  stop (`prs-drafted`, board Stopped + comment `… was stopped by <who> (with its plan sc-N)`, `stop-reported`, Cancelled): a story
+  whose run holds its lock is left to that run (which sees the Stop within a second), one whose worker a crashed run may have left
+  to its own next run (which holds the worker lock and stops the worker first), and one whose stop failed to the next attempt — all
+  "pending". A story the plan released that the ledger does not know was never claimed: the factory did no work on it, and the
+  board is asked before anything is written (through `IWorkSource`, E6). Still as the release left it — not archived, in the ready
+  state, no owner or claim but the factory's — it is moved back to the Backlog with a comment that says its plan was stopped before
+  the factory started it (`IWorkSource.ReturnUnstartedAsync`, which re-reads and writes only then; `PlanRelease.ReturnedComment`:
+  never "cancelled its work" or "released its claim"), and then gets a ledger item recorded Intake (`PlanRelease.ReturnedUnstarted`)
+  → Cancelled, with no `prs-drafted`/`stop-reported` rows; the board is written first, so an attempt cut short finds it in the
+  Backlog (or its item at Intake, which is then only recorded Cancelled). One that a person took (another owner, In Progress),
+  finished (Done), assigned to themselves or archived since its release is theirs: nothing is written to it — no move, no comment,
+  no ledger item — and the plan's comment lists it as left as it is. One never released, or back in the Backlog
+  (`IWorkSource.InBacklogAsync`), is left with nothing written. A story Escalated because its pull request was merged outside the
+  factory (`PlanRelease.AsMergedOutside`) has its change on the base branch: it is not stopped, drafted, moved or commented — its
+  item stays Escalated — whether the plan's stop or the story's own run (listed as being stopped while the plan's row is Stopping)
+  reaches it (`ItemStopper.Settled`). While any story is pending the stop
+  throws `StopPendingException`: the plan item is unchanged, keeps its Stopping row, `ControlActions.StopAsync` answers not Ok (the
+  CLI exits 1) naming each pending story, and later polls finish it. Only then is the plan item itself stopped like any item —
+  its own pull requests back to draft, board Stopped with one comment listing `Stories stopped with it: …. Already merged (left as
+  they are): …. Never started (left in the backlog; the factory will not release or start them): ….` and, only when there are
+  any, `Released but never started (moved back to the backlog; the factory did no work on them): ….`, `Merged outside the factory
+  (left as they are: their change is on the base branch): ….` and `Taken, finished or archived by someone else since their release
+  (left as they are): ….`, Cancelled, its control cleared. A workerless run (no worker run lock) still defers a plan's stop to the
+  next run. A waiting plan item's run only evaluates its stories and watches no control meanwhile, so: a Stop that lands during
+  the evaluation is seen when it ends (`HoldAsync` re-reads the control after `PlannedAsync`) and finished by that run under the
+  lock it holds, or — workerless — reported `stop deferred to the next run`; and `factory stop --item <plan>` while a run of the
+  plan holds its lock answers `stop NOT finished: it is a plan and a run of it is active …`, not Ok (exit 1), instead of the
+  ordinary item's "is running; its run stops it at once" (exit 0), which stays true only for a run that watches its control. After the stop, a story of the plan
+  that reaches the ready state anyway (moved by hand) is refused at claim, once and with no board write: Paused
+  `claim refused: blocked by its plan sc-N, which was stopped: …` (`PlanRelease.PlanStoppedRefusal`; `BlockedAsync` checks the plan
+  item's state first). A Pause or Stop on one story of a plan works as on any item; a stopped story is then a failed story.
+  Lifecycle: no table row was added — `Planned → Cancelled` (via the Stopping control) and `Planned → Paused` were already legal by
+  the general rules; a paused plan item is simply not evaluated and never needs a Paused row.
+  Dashboard: `PipelineRow.Plan` (`PlanView`) is read from the ledger alone — the plan item's `plan`, `plan-stories`, `plan-released`
+  and `plan-held` rows and its stories' items and transitions; the board is never asked — and `PipelineRow.PlanItemId` marks a
+  story of an active plan. The pipeline page lists a plan's stories beneath the plan row, in plan order (`tr.plan-story`,
+  `data-plan`, `data-story`): one with a work item as its full row (state, PR, sessions, its own controls), one without (not
+  released, not picked up, or finished) from `plan-stories` with the title its `plan` checkpoint recorded, made inert
+  (`UntrustedText.Inert`, and Razor encodes it); each with its state and what it waits on (`PlanStoryView.Waits`: `waits on sc-12`,
+  `held by sc-12 (escalated)`, `failed: escalated`). The plan row shows `m of n merged · i in flight · w waiting · f failed`,
+  `held`/`stuck`/`stopping`, the failed-story hold (computed from the ledger, so never stale) and the last other `plan-held` row
+  recorded. Story rows show the control their plan puts on them. The refresh is unchanged (`NOTIFY work_items` → `PipelineChanges`).
   Closeout: once every story of the plan has a Merge row, the plan item is reported `BoardState.Merged` (`merged-reported`, Detail
   `n stories merged`), gets one comment rendered from the ledger (`LedgerReport.PlanCloseout`: per story its id, its title inert in
   a code span, its last transition's typed outcome and state, the merge commit of its Merge row and the PR of its `linked`
@@ -802,6 +892,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `DashboardControls`: login + antiforgery). Pipeline rows refresh on `NOTIFY work_items` (triggers on
   `work_items`/`worker_sessions`/`controls`, relayed by `SessionEventRelay` → `PipelineChanges`); session pages join the same
   `SessionBroadcaster` as hub viewers (`ISessionViewers`), so backlog-then-live holds there too. Never log transcript content.
+  A plan item's stories are listed beneath its row, from the ledger alone (sc-25876, above).
 - Review → CI → MergeGate → Merge (sc-25378; `RunPipeline.Gate.cs`, only in a pipeline built with a `GateStage`, which
   production always is): Implement records every model that answers the implementer (`implementer-model` checkpoints, from
   each assistant message's `model`; a record only — the panel does not depend on it). Review is a panel (sc-25379, `Gate/ReviewPanel.cs`): `correctness` and

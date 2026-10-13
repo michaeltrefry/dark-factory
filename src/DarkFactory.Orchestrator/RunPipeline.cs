@@ -307,9 +307,29 @@ public sealed partial class RunPipeline(
         /// <summary>
         /// Planned: stories of the plan are held by blockers that are not stories of the plan and that the factory has not merged
         /// (Detail: which story by which, <see cref="Plans.PlanRelease.HeldByOutsiders"/>); recorded when that changes, not every poll.
+        /// Also (sc-25876), after <see cref="Plans.PlanRelease.FailedPrefix"/>: a failed story of the plan (Escalated, Cancelled,
+        /// merged outside the factory) holds what depends on it — which story, how and when it failed, its reason, what it blocks.
         /// </summary>
         public const string PlanHeld = "plan-held";
+        /// <summary>
+        /// Planned: every story of the plan that has not merged failed or is blocked behind a failed one (sc-25876): nothing of it
+        /// moves until a person acts. Detail: the failed stories and what they block (<see cref="Plans.PlanRelease.HeldByFailed"/>).
+        /// A failed story that still leaves other stories going is a <see cref="PlanHeld"/> row instead
+        /// (after <see cref="Plans.PlanRelease.FailedPrefix"/>). Either is written when it changes, not every poll.
+        /// </summary>
+        public const string PlanStuck = "plan-stuck";
+        /// <summary>Planned: no story of the plan is failed any more (a person re-ran the failed one); the hold a failed story put on it is lifted.</summary>
+        public const string PlanResumed = "plan-resumed";
+        /// <summary>
+        /// Planned: the plan item's comment for the latest <see cref="PlanHeld"/> (failed story), <see cref="PlanStuck"/> or
+        /// <see cref="PlanResumed"/> row; Detail is <c>posted</c> or <c>failed: …</c> (tried again by the next evaluations, up to
+        /// <see cref="MaxPlanNoticeAttempts"/>).
+        /// </summary>
+        public const string PlanNotice = "plan-notice";
     }
+
+    /// <summary>How often the plan item's comment for one hold (or its lifting) is tried before it is left to the ledger and the dashboard.</summary>
+    public const int MaxPlanNoticeAttempts = MaxCloseoutAttempts;
 
     /// <summary>
     /// Detail of the Paused row recorded when a Pause control stopped the run. Such an item resumes (its
@@ -422,9 +442,13 @@ public sealed partial class RunPipeline(
         // a finished plan whose closeout failed likewise (it waits in Planned).
         var closeouts = await ledger.CloseoutRowsAsync(active.Where(i => i.State == WorkState.Planned
             || (i.State == WorkState.Watch && handled.Contains(WorkState.Merge))).Select(i => i.Id).ToList(), ct);
+        var byId = active.ToDictionary(i => i.Id);
         foreach (var item in active)
         {
-            var beingStopped = stopping.Contains(ControlScope.Item(item.ExternalId));
+            // Its own Stop, or its plan's (sc-25876: a story of a plan being stopped, unless it already merged — the controls say which).
+            var beingStopped = stopping.Contains(ControlScope.Item(item.ExternalId))
+                || (item.PlanItemId is { } plan && byId.TryGetValue(plan, out var planItem) && stopping.Contains(ControlScope.Item(planItem.ExternalId))
+                    && await controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) == ControlState.Stopping);
             if (!beingStopped)
             {
                 var resumable = handled.Contains(item.State)
@@ -515,9 +539,15 @@ public sealed partial class RunPipeline(
 
         var spec = await source.ReadSpecAsync(storyId, ct);
         var story = spec.Story;
-        if (known is null && await _controls.EffectiveAsync(Naming.Format(storyId), spec.Epic?.Id, ct) is not ControlState.Running and var control)
+        var control = known is not null ? ControlState.Running : await _controls.EffectiveAsync(Naming.Format(storyId), spec.Epic?.Id, ct);
+        if (known is null && control == ControlState.Running)
         {
-            // A paused factory or epic claims nothing new: the story stays as it is on the board.
+            control = await PlanControlAsync(Naming.Format(storyId), ct);
+        }
+        if (control != ControlState.Running)
+        {
+            // A paused factory or epic claims nothing new, nor does a paused or stopping plan for its stories (sc-25876): the story
+            // stays as it is on the board.
             log.WriteLine($"[intake] {Naming.Format(storyId)} is {control} by a control; not claiming it.");
             return new RunOutcome(0, WorkState.Intake, null, null, $"{Naming.Format(storyId)} is {control} by a control; not claimed.");
         }
@@ -713,7 +743,20 @@ public sealed partial class RunPipeline(
         if (item.State == WorkState.Planned)
         {
             // A plan item waiting on its stories (sc-25871): release what is unblocked, or close the plan out.
-            return await PlannedAsync(item, storyId, history, ct);
+            var evaluated = await PlannedAsync(item, storyId, history, ct);
+            // A Stop that landed while the plan was evaluated (sc-25876): nothing watches a control during the evaluation, so this
+            // run finishes the stop now, under the run lock it holds — the plan item is not left Stopping with nobody acting on it.
+            // A run started without the worker run lock defers it, as it does a Stop it finds at its start.
+            if (!Lifecycle.IsTerminal(item.State) && await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) == ControlState.Stopping)
+            {
+                if (_workerless)
+                {
+                    log.WriteLine($"[{item.State}] {item.ExternalId}: stop deferred to the next run (this run was started without the worker run lock)");
+                    return evaluated with { Error = $"{item.ExternalId}: stop deferred to the next run; this run was started without the worker run lock" };
+                }
+                return await FinishStopAsync(item, storyId, RepoRef.Parse(item.Repo), null, workerStillRunning: false);
+            }
+            return evaluated;
         }
         var entered = history.FindLastIndex(e => e.Step is null);
         // A finished plan item (sc-25871) was told so by its closeout: no notice on top of it.
@@ -1344,12 +1387,16 @@ public sealed partial class RunPipeline(
         }
     }
 
-    /// <summary>Whether a user's Pause holds the item: on the factory, its epic or the item itself.</summary>
+    /// <summary>Whether a user's Pause holds the item: on the factory, its epic, the item itself or the plan it is a story of (sc-25876).</summary>
     private async Task<bool> UserPausedAsync(WorkItem item)
     {
-        string[] scopes = item.EpicId is { } epic
+        List<string> scopes = item.EpicId is { } epic
             ? [ControlScope.Factory, ControlScope.Epic(epic), ControlScope.Item(item.ExternalId)]
             : [ControlScope.Factory, ControlScope.Item(item.ExternalId)];
+        if (item.PlanItemId is { } plan && await ledger.ItemAsync(plan, CancellationToken.None) is { } planItem)
+        {
+            scopes.Add(ControlScope.Item(planItem.ExternalId));
+        }
         foreach (var scope in scopes)
         {
             if ((await _controls.GetAsync(scope, CancellationToken.None))?.State == ControlState.Paused)
