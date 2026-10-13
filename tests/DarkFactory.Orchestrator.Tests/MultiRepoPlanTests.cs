@@ -477,7 +477,7 @@ public class MultiRepoPipelineTests
         public HookedLocks Locks { get; } = new();
         public IControls Controls => new LedgerControls(new LedgerDbContextFactory(_options), TimeProvider.System);
         public string Logged => _log.ToString();
-        /// <summary>The repositories the factory is configured for (<c>Factory:DefaultRepo</c>, <c>GitHub:Watch:Repos</c>).</summary>
+        /// <summary>The repositories the factory is configured for (<c>Factory:DefaultRepo</c>, <c>Factory:Repos</c>, <c>GitHub:Watch:Repos</c>).</summary>
         public IReadOnlyList<RepoRef> Configured { get; set; } = TwoRepoAnswers.Both;
         /// <summary>How long the gate waits for CI on a head (<c>Gate:CiTimeoutMinutes</c>).</summary>
         public TimeSpan CiTimeout { get; set; } = TimeSpan.FromSeconds(30);

@@ -113,7 +113,7 @@ public class PlanAcceptanceTests
 
     /// <summary>
     /// P4-AT3 (epic E1): a plan item whose <c>Repo:</c> line names a repository the factory is not configured for
-    /// (<c>Factory:DefaultRepo</c>, <c>GitHub:Watch:Repos</c>) escalates before any planner session — also when it names only that
+    /// (<c>Factory:DefaultRepo</c>, <c>Factory:Repos</c>, <c>GitHub:Watch:Repos</c>) escalates before any planner session — also when it names only that
     /// one repository (sc-25877) — and nothing is created. The story's own description decides: one <c>Repo:</c> line (the form
     /// this covers; several lines with an unconfigured one among them pass too).
     /// </summary>

@@ -102,6 +102,10 @@ public sealed partial class RunPipeline
     /// but for its plan it counts as merged: the work is on the changeset branch, and nothing reaches a default branch except
     /// through the changeset pull request's full review and gate (E6). Empty, and nothing recorded, for any other item and for a
     /// pull request merged into any other base (such a story stays failed: its change is somewhere no gate will judge it).
+    /// The once-per-pull-request guard is for a run interrupted between this row and the Escalated row (Ctrl-C, a crash): the
+    /// run that resumes it finds the same merged pull request again. A re-run after the escalation never gets here
+    /// (<see cref="RunAsync"/> refuses it: the item stays Escalated). The reason ends by telling the owner to tidy the board story
+    /// (<see cref="Plans.PlanRelease.BoardStoryStillClaimed"/>): the item stays Escalated, so the factory never moves it.
     /// </summary>
     private async Task<string> MergedIntoChangesetAsync(Run run, PullFacts pull, CancellationToken ct)
     {
@@ -118,7 +122,7 @@ public sealed partial class RunPipeline
         log.WriteLine($"[{run.Item.State}] {run.Item.ExternalId}: {pull.HtmlUrl} was merged outside the factory into {expected}, its plan's changeset branch; "
             + "it counts as merged for the plan");
         return $" It was merged into {expected}, its plan's changeset branch: {Plans.PlanRelease.MergedOutsideIntoChangeset}. "
-            + "For its plan it counts as merged (what depends on it is released); re-running this story changes nothing.";
+            + $"For its plan it counts as merged (what depends on it is released), and a re-run of this story does nothing: {Plans.PlanRelease.BoardStoryStillClaimed}.";
     }
 
     /// <summary>

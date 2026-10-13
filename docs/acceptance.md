@@ -623,6 +623,14 @@ under versions 2, 3 and 4), `ChangesetPipelineTests` (the changeset fact from th
 blocked, warned or planned by its repository's workflows), `CiTriggerTests` (every `on:` shape, GitHub's branch filter matching,
 the GitHub read).
 
+When `write-lifecycle.json` is re-recorded (`SHORTCUT_RECORD=1`, the owner's run), confirm two things about the idempotency key
+the factory sends as each created story's `external_id` (sc-25877; `dark-factory:child:<parent>:<64 hex characters>`, 92
+characters for a parent such as `sc-25858`, one more per extra digit of the parent's id): that `POST stories` accepts an
+`external_id` of that length and returns it unchanged (not cut, not refused), and that the story listings the factory reads
+(the epic's and the team's stories) carry `external_id` for such a story — a retry finds its children from the listing by it.
+Neither is recorded yet: the fixture's two `POST stories` requests carry the key by hand-edit and their responses are the old
+recording.
+
 Not run live yet (2026-10-12): written with sc-25870 and extended with sc-25871, to be run by the owner. The live run is also the
 first time the release's Shortcut requests meet the real API: `GET stories/{id}` returning a story with `story_links`, and
 `PUT stories/{id}` with only `workflow_state_id` (Backlog → To Do) have no recorded contract fixture yet (`Fixtures/shortcut`); the
@@ -649,8 +657,11 @@ Prerequisites: everything P4-AT1 needs, and
 - `FACTORY_E2E_P4_SECOND_REPO=owner/name`: a second sandbox repository with **both GitHub Apps installed** (the workers' App and
   the gate App), protected with `factory github-repo protect owner/name`, a `factory/gate.yaml` on its default branch, CI that
   runs for pull requests whose base is `factory/changeset-*`, and **indexed in CodeGraph** (the gate's `risk-threshold` and the
-  planner's tools read it). The test adds it to the factory's configured repositories for its own runs (`GitHub:Watch:Repos`);
-  for a real `factory work` it must be in `Factory:DefaultRepo`/`GitHub:Watch:Repos` too.
+  planner's tools read it). The test adds it to the factory's configured repositories for its own runs (`Factory:Repos`);
+  for a real `factory work` set `Factory__Repos=owner/name` too (comma-separated for several). `Factory:Repos` is the setting
+  for this: it lets the factory plan and work there and turns on no issue polling. `GitHub:Watch:Repos` also makes a
+  repository configured, but it is the issue-triage watch list — it starts polling and triaging that repository's issues, and
+  `factory work` refuses it with `Worker:RunAs=none` — so use it only when issue triage there is wanted.
 - `FACTORY_E2E_P4_MULTI_PLAN_STORY=sc-<id>`: a **To Do** story carrying the `plan` label whose description has two lines,
   `Repo: <the sandbox>` then `Repo: <the second repository>`, and describes work that needs a small change in each (e.g. a
   documented format in the first and a reader of it in the second), each story able to pass its repository's gate on its own and
@@ -734,14 +745,20 @@ API; do not add stories there while it runs).
 | --- | --- | --- | --- |
 | `P4_AT3_a_plan_with_a_dependency_cycle_is_rejected_and_nothing_is_created` | `FACTORY_E2E_P4_CYCLE_STORY` — on the sandbox repo; its text does not matter | the planner is a **stub Claude CLI** (as P2-AT5's stuck worker: `Worker:ClaudePath` = a script the test writes, `Worker:RunAs=none`) that answers a fixed plan — `a` needs `b`, `b` needs `a` — through the production planner seat (real checkout, real proxy grant when CodeGraph/Kanban are configured) | Intake → Plan → Escalated; one `session` row, the stub's, run to its end; one `plan-rejected` row (`gate_rejected`) saying `the stories block each other in a cycle: …`; the escalation reason `The planner's answer is not a valid plan, so no story was created: …` |
 | `P4_AT3_an_oversized_plan_is_rejected_and_nothing_is_created` | `FACTORY_E2E_P4_OVERSIZED_STORY` — likewise | the stub answers a plan of 21 stories (`PlanParser.MaxStories` + 1) | the same, the `plan-rejected` row saying `the plan has 21 stories; at most 20 are allowed` (refused whole, never cut to 20) |
-| `P4_AT3_a_plan_naming_an_unconfigured_repository_escalates_before_any_planner_session_and_nothing_is_created` | `FACTORY_E2E_P4_UNCONFIGURED_STORY` — its description has **one line `Repo: owner/name`** naming a repository the factory is not configured for (not `Factory:DefaultRepo`, not in `GitHub:Watch:Repos`); the repository need not exist | the real, sandboxed set-up; no stub. Since sc-25877 a single unconfigured `Repo:` line is refused like one among several (epic E1) — the single-line form is the one to use here; a story with several lines of which one is unconfigured passes too | Intake → Plan → Escalated; the reason `The plan names 1 repository (owner/name), but owner/name is not configured for this factory (…), so no planner session was started and no story was created.`; **no** `session`, `worker-started`, `worker-model-class` or `plan-rejected` row and no `worker_sessions` row; the escalation comment on the story says so. A story naming only configured repositories is INCONCLUSIVE |
+| `P4_AT3_a_plan_naming_an_unconfigured_repository_escalates_before_any_planner_session_and_nothing_is_created` | `FACTORY_E2E_P4_UNCONFIGURED_STORY` — its description has **one line `Repo: owner/name`** naming a repository the factory is not configured for (not `Factory:DefaultRepo`, not in `Factory:Repos`, not in `GitHub:Watch:Repos`); the repository need not exist | the real, sandboxed set-up; no stub. Since sc-25877 a single unconfigured `Repo:` line is refused like one among several (epic E1) — the single-line form is the one to use here; a story with several lines of which one is unconfigured passes too | Intake → Plan → Escalated; the reason `The plan names 1 repository (owner/name), but owner/name is not configured for this factory (Factory:DefaultRepo, Factory:Repos, GitHub:Watch:Repos: …), so no planner session was started and no story was created. Add it to Factory:Repos (GitHub:Watch:Repos would also turn on the triage of its issues), or remove its Repo: line.`; **no** `session`, `worker-started`, `worker-model-class` or `plan-rejected` row and no `worker_sessions` row; the escalation comment on the story says so. A story naming only configured repositories is INCONCLUSIVE |
 
 Prerequisites: what `factory run` needs (router with an enrolled plan — the usage check runs at start-up even with the stub —
 the Shortcut token, both GitHub Apps, the sandbox set up with CI that runs for `factory/changeset-*` bases: the CI-trigger
 check runs before the planner for the two stub tests). The stub tests run the planner **as the owner** (`Worker:RunAs=none`): the
 only process started is the test's own script, which reads its fixed transcript and writes its own log. Each test leaves its
-story Escalated on the board (In Progress, claimed by the factory, one escalation comment): move it back to **To Do** before
-running that test again. Give each test its own story, or run them one at a time on one story moved back in between.
+story Escalated on the board (In Progress, claimed by the factory, one escalation comment). Read from the code (not confirmed
+at a live run yet), the story need NOT be moved back to To Do before that test runs again: each run has a throwaway ledger, so
+the item is new and is claimed again, and `ShortcutWorkSource.ClaimAsync` accepts a story that is already the factory's — its
+owner and the `factory-claimed` label, which an escalation leaves on it — whatever its state (`ClaimRefusalAsync` asks for To Do
+only of a story the factory does not hold; these tests run with `--ignore-scope`). Each further run adds one more escalation
+comment (the tests look for theirs among them). Moving it back to **To Do** is needed only if someone took the factory off as
+owner or removed the label — the claim is then refused, "the story is no longer in To Do" — and is harmless otherwise. Give
+each test its own story, or run them one at a time on one story (the unconfigured-repository test needs a `Repo:` line the other two must not have).
 **Stop any `factory work` whose watch scope covers those stories first**, as for P4-AT1.
 
 ```sh

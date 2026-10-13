@@ -291,8 +291,10 @@ public static partial class PlanParser
             }
             var title = Whitespace().Replace(Clean(String(node, "title", at), multiline: false), " ").Trim();
             Bound(title, MaxTitle, $"{at}.title");
-            // The board finds a story it already created by its exact name and description (IWorkSource.CreateChildrenAsync), and a
-            // person tells the plan's stories apart by name: names are unique.
+            // Names are unique. The board finds a story it already created by its idempotency key (ChildItem.Key: the parent,
+            // then a hash of the name and the description), so two stories of a plan with one title and one description would
+            // share a key and a retry could take one board story for both: this rule is what makes the key unique within a plan.
+            // And a person tells the plan's stories apart by name.
             if (stories.Any(s => s.Title == title))
             {
                 throw new PlanFormatException($"{at}.title '{Cut(title, 80)}' is used twice");

@@ -125,6 +125,26 @@ public class PlanParserTests
     }
 
     [Fact]
+    public void Unique_titles_are_what_keeps_two_stories_of_a_plan_from_sharing_an_idempotency_key()
+    {
+        var repo = new RepoRef("acme", "widgets");
+        static JsonObject Twin(string key, string title) => With(With(PlanAnswers.Story(key, title), "description", "The same change."), "acceptance", new JsonArray("it works"));
+
+        // Two children of one parent with one name and one description have one key: a retry could take one board story for both.
+        var twin = new ChildItem("Same", "The same text.", "chore", []);
+        Assert.Equal(twin.Key("sc-12"), (twin with { StoryType = "bug", BlockedBy = [0] }).Key("sc-12"));
+        // So a plan holding such a pair is refused before any board is written: its titles must differ …
+        var refused = Assert.Throws<PlanFormatException>(() => PlanParser.Parse(PlanAnswers.Answer(Twin("a", "Same"), Twin("b", " Same  "))));
+        Assert.Contains("stories[1].title 'Same' is used twice", refused.Message);
+        // … and every plan that parses gives each story its own key, whatever else the stories share: here everything but the title.
+        var children = PlanParser.Parse(PlanAnswers.Answer(Twin("a", "Same A"), Twin("b", "Same B"))).Children("sc-12", repo);
+        Assert.Equal(children[0].Description, children[1].Description);
+        Assert.NotEqual(children[0].Key("sc-12"), children[1].Key("sc-12"));
+        // The key Shortcut stores as a story's external id: the prefix, the parent, a SHA-256 in hex.
+        Assert.Equal(ChildItem.KeyPrefix.Length + "sc-12:".Length + 64, children[0].Key("sc-12").Length);
+    }
+
+    [Fact]
     public void The_bound_itself_is_allowed_and_refusals_quote_model_text_only_cut_short()
     {
         var most = PlanParser.Parse(PlanAnswers.Answer(
@@ -971,7 +991,10 @@ public class PlanPipelineTests
         var outcome = await h.Run(source, planner);
 
         Assert.Equal(WorkState.Escalated, outcome.State);
-        Assert.Contains("The plan names 1 repository (acme/gears), but acme/gears is not configured for this factory", outcome.Error);
+        Assert.Contains("The plan names 1 repository (acme/gears), but acme/gears is not configured for this factory "
+            + $"(Factory:DefaultRepo, Factory:Repos, GitHub:Watch:Repos: {Sandbox}, {Widgets}), so no planner session", outcome.Error);
+        // The fix it names is the setting that adds a repository without turning on the triage of its issues.
+        Assert.Contains(" Add it to Factory:Repos (GitHub:Watch:Repos would also turn on the triage of its issues), or remove its Repo: line.", outcome.Error);
         Assert.Contains("no planner session was started and no story was created", outcome.Error);
         Assert.Empty(h.Planner!.Seats);
         Assert.Empty(planner.Calls);

@@ -691,6 +691,15 @@ public sealed partial class RunPipeline(
             {
                 return await OutcomeAsync(item, EscalationCommentNotPosted(commentError), ct);
             }
+            // A plan's story whose pull request someone merged into its plan's changeset branch (sc-25877) counts as merged for
+            // its plan: its work is on that branch already. A re-run would implement it a second time, so there is none.
+            if (item.PlanItemId is not null && Plans.PlanRelease.MergedOutsideChangeset(await ledger.HistoryAsync(item, ct)))
+            {
+                var done = $"{item.ExternalId} was {Plans.PlanRelease.MergedOutsideIntoChangeset}: for its plan it counts as merged, "
+                    + $"and a re-run does nothing. {char.ToUpperInvariant(Plans.PlanRelease.BoardStoryStillClaimed[0])}{Plans.PlanRelease.BoardStoryStillClaimed[1..]}.";
+                log.WriteLine($"[{item.State}] {done}");
+                return await OutcomeAsync(item, done, ct);
+            }
             await ledger.RecordAsync(item, WorkState.Intake, null, $"re-run after escalation; {IntakeDetail(story)}", ct);
         }
         else if (item.State == WorkState.Paused)
