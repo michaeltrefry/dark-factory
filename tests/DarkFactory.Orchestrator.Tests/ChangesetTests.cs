@@ -20,7 +20,7 @@ namespace DarkFactory.Orchestrator.Tests;
 /// repository with any number of branches, so "the second story starts from the first one's merge" and "the changeset pull request
 /// carries both" are facts about commits.
 /// </summary>
-public class ChangesetPipelineTests
+public partial class ChangesetPipelineTests
 {
     private const int PlanId = 500;
     private const string Main = "main";
@@ -237,6 +237,25 @@ public class ChangesetPipelineTests
         }
 
         public Task<RepoFiles> GetFilesAsync(RepoRef repo, string sha, CancellationToken ct) => Task.FromResult(new RepoFiles(["README.md"], false));
+
+        /// <summary>The default branch's workflow files (sc-25873); by default one that runs for every pull request.</summary>
+        public IReadOnlyList<WorkflowFile> Workflows { get; set; } = TestPolicies.Workflows;
+        /// <summary>Makes reading the workflow files fail.</summary>
+        public Exception? WorkflowsThrow { get; set; }
+        /// <summary>How many times the workflow files were read.</summary>
+        public int WorkflowReads { get; private set; }
+
+        /// <summary>The default branch GitHub names for the repository in the workflow read.</summary>
+        public string WorkflowsDefaultBranch { get; set; } = Main;
+
+        public Task<RepoWorkflows> GetWorkflowsAsync(RepoRef repo, CancellationToken ct)
+        {
+            lock (_gate)
+            {
+                WorkflowReads++;
+            }
+            return WorkflowsThrow is { } failure ? Task.FromException<RepoWorkflows>(failure) : Task.FromResult(new RepoWorkflows(WorkflowsDefaultBranch, Workflows));
+        }
 
         public Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct)
         {
@@ -479,6 +498,8 @@ public class ChangesetPipelineTests
 
         public BranchRepo Repo { get; } = new();
         public PanelReviewer Reviewer { get; } = new();
+        /// <summary>CodeGraph as the gate's <c>risk-threshold</c> reads it.</summary>
+        public FakeCodeGraphRisk CodeGraph { get; } = new();
         public MergeQueueTests.SimWorker Worker { get; } = new();
         /// <summary>The worker the next pipelines run instead of <see cref="Worker"/>, when a test needs one that does not finish.</summary>
         public IWorker? WorkerInstead { get; set; }
@@ -488,7 +509,7 @@ public class ChangesetPipelineTests
         public IControls Controls => new LedgerControls(new LedgerDbContextFactory(_options), TimeProvider.System);
         public TextWriter Log => LazyInitializer.EnsureInitialized(ref _writer, () => TextWriter.Synchronized(_log));
         /// <summary>The planner's answers, one per planner session.</summary>
-        public FakeWorker? Planner { get; private set; }
+        public FakeWorker? Planner { get; set; }
 
         public string Logged
         {
@@ -504,7 +525,7 @@ public class ChangesetPipelineTests
         public RunPipeline Pipeline(bool workerless = false) =>
             new(Source, new WorkLedger(new LedgerDbContext(_options), TimeProvider.System), Locks, Repo, WorkerInstead ?? Worker, Repo, Sandbox, Log, controls: Controls,
                 controlPollInterval: TimeSpan.FromMilliseconds(10),
-                gate: new GateStage(Repo, Reviewer, TimeSpan.FromMilliseconds(5), TimeSpan.FromSeconds(30), Risk: FakeCodeGraphRisk.Reader()),
+                gate: new GateStage(Repo, Reviewer, TimeSpan.FromMilliseconds(5), TimeSpan.FromSeconds(30), Risk: FakeCodeGraphRisk.Reader(CodeGraph)),
                 planner: Planner is null ? null : new Seat(Planner), workerless: workerless);
 
         public Task<RunOutcome> Run(int id = PlanId, bool workerless = false, CancellationToken ct = default) => Pipeline(workerless).RunAsync(id, ct);

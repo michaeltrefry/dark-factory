@@ -533,8 +533,26 @@ not the one the ledger expects (a story's PR switched to the default branch, an 
 no changeset in escalates and opens no pull request; a changeset pull request someone merged by hand closes the plan out on its
 re-run (`changeset-empty`: `changeset pull request <url> was merged outside the factory`) instead of opening another; Stop on a
 plan item whose changeset pull request is open stops its unfinished stories, drafts that pull request and cancels the plan once.
-If the sandbox's default-branch policy has `risk.max_changed_lines`/`max_changed_files` sized for one story, the changeset pull
-request of this test escalates on `risk-threshold`: size them for the plan.
+Changeset size (sc-25873): a `version: 4` policy gives the changeset pull request its own limits, `risk.max_changeset_lines` and
+`max_changeset_files` (both required there; the per-story `max_changed_lines`/`max_changed_files` keep judging every story's pull
+request). If the sandbox's default-branch policy is still version 2 or 3, the changeset pull request of this test is held to
+`max_changed_*` and escalates on `risk-threshold` unless those are sized for the plan: move the policy to version 4 (an owner's
+PR: the path is sealed). The `gate` row of a changeset pull request reads `Merge <sha> (changeset pull request): …`.
+
+CI triggers (sc-25873): before the planner runs, the factory reads the sandbox's `.github/workflows/*.yml` on the default branch.
+If every workflow's `pull_request` trigger filters `branches` without `factory/**` (and none has a matching `push` trigger), the
+plan item escalates at once with a `ci-triggers` row (`blocked: …`) naming the fix — add `factory/**` to the `pull_request`
+`branches` filter — and the workflow files, and no story or changeset branch is created. The same holds for the changeset pull
+request: workflows that run for `factory/**` bases but whose `branches` filter leaves out the default branch (and no `push`
+trigger matching `factory/changeset-*`) block the plan with the fix naming the default branch. A workflow it cannot read or
+parse, or a repository none of whose workflows has a `pull_request` trigger or a `push` trigger for branches (dispatch-only,
+scheduled, tag releases: its CI may be another service's), is a `ci-triggers` warning row and the plan goes on.
+
+In-process versions (every `dotnet test`): `ChangesetPolicyTests` (version 4 parsing, both limits for both kinds of pull request
+under versions 2, 3 and 4), `ChangesetPipelineTests` (the changeset fact from the ledger: a plan's changeset pull request against
+`max_changeset_*`, a story whose base is a `factory/changeset-*` branch and an item of no plan against `max_changed_*`; a plan
+blocked, warned or planned by its repository's workflows), `CiTriggerTests` (every `on:` shape, GitHub's branch filter matching,
+the GitHub read).
 
 Not run live yet (2026-10-12): written with sc-25870 and extended with sc-25871, to be run by the owner. The live run is also the
 first time the release's Shortcut requests meet the real API: `GET stories/{id}` returning a story with `story_links`, and

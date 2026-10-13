@@ -35,7 +35,7 @@ public class GatePolicyTests
             { "- a\n- b\n", "one YAML mapping" },
             { "version: [1\n", "not valid YAML" },
             { "version: 1\nrequire:\n  ci: green\n  review: pass\n", "version 1, which this gate no longer accepts" },
-            { Replace("version: 2", "version: 4"), "version must be 2 or 3" },
+            { Replace("version: 2", "version: 5"), "version must be 2, 3 or 4" },
             { Without("version: 2"), "the top level is missing 'version'" },
             { ok + "\nbypass: true\n", "unknown key 'bypass' in the top level" },
             { ok[..ok.IndexOf("risk:", StringComparison.Ordinal)], "the top level is missing 'risk'" },
