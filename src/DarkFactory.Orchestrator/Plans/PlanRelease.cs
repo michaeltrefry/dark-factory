@@ -375,14 +375,17 @@ public static class PlanRelease
         var rerun = status.Failed.Where(f => f.Failure!.As is not (AsCancelled or AsMergedOutside)).Select(f => $"`factory run {f.Id}`").ToList();
         var cancelled = status.Failed.Where(f => f.Failure!.As == AsCancelled).Select(f => f.Id).ToList();
         // A failed story merged outside the factory was merged into another base than its plan's changeset branch (one merged
-        // into the changeset branch is not failed: MergedOutsideChangeset). A re-run finds the merged pull request and escalates again.
+        // into the changeset branch is not failed: MergedOutsideChangeset). A re-run is a remedy for it too: an Escalated item
+        // restarts at Intake, so the story is implemented again from the changeset branch and a second pull request goes into
+        // that branch through the gate. Said apart from the others, since nothing "failed" that the owner could fix first.
         var outside = status.Failed.Where(f => f.Failure!.As == AsMergedOutside).Select(f => f.Id).ToList();
         return (rerun.Count == 0 ? "" : $"fix what failed and re-run the story ({string.Join(", ", rerun)}): once it has merged its dependents are released; or ")
             + $"stop the plan (`factory stop --item {plan}`: its unfinished stories are stopped, merged ones stay)"
             + (cancelled.Count == 0 ? "" : $". A cancelled story ({string.Join(", ", cancelled)}) cannot be re-run: what depends on it is only ever ended by stopping the plan")
             + (outside.Count == 0 ? "" : $". A story whose pull request was merged outside the factory into another branch than the plan's changeset branch "
-                + $"({string.Join(", ", outside)}) cannot be re-run either (a re-run finds the merged pull request and escalates again): "
-                + "only stopping the plan ends what depends on it");
+                + $"can be re-run too ({string.Join(", ", outside.Select(id => $"`factory run {id}`"))}): the re-run implements it again onto the plan's "
+                + "changeset branch through the gate, and its dependents are released once that has merged. Its earlier pull request is not part "
+                + "of the changeset, and what that put on the other branch is yours to deal with");
     }
 
     /// <summary>The comment the plan item gets when a failed story starts to hold it, when which do changes, and once when it is stuck.</summary>

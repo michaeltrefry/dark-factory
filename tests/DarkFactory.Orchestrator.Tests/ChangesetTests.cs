@@ -1681,7 +1681,7 @@ public partial class ChangesetPipelineTests
     }
 
     [Fact]
-    public async Task A_plan_story_merged_outside_the_factory_into_another_base_stays_failed_and_only_stopping_the_plan_ends_what_depends_on_it()
+    public async Task A_plan_story_merged_outside_the_factory_into_another_base_stays_failed_until_a_rerun_implements_it_onto_the_changeset_branch()
     {
         var h = new Harness();
         var ids = await h.Plan(Two);
@@ -1706,16 +1706,38 @@ public partial class ChangesetPipelineTests
         Assert.DoesNotContain("counts as merged", found.Error);
         Assert.DoesNotContain(await h.Rows(a), r => r.Step == RunPipeline.Steps.MergedIntoChangeset);
 
-        // It satisfies nothing: B stays in the backlog, the plan is stuck behind it, and the remedy does not offer a re-run.
+        // It satisfies nothing: B stays in the backlog, the plan is stuck behind it, and the remedies are a re-run or a stop.
         Ended(h, await h.Run(), WorkState.Planned);
         Assert.Equal(FakeShortcutBoard.Backlog, h.State(b));
         var stuck = Assert.Single(await h.Steps(PlanId, RunPipeline.Steps.PlanStuck));
         Assert.Contains($"sc-{a} merged outside the factory at ", stuck);
         var comment = h.Comments(PlanId)[^1];
-        Assert.DoesNotContain($"`factory run sc-{a}`", comment);
-        Assert.Contains($"Remedies: stop the plan (`factory stop --item sc-{PlanId}`", comment);
-        Assert.Contains($"A story whose pull request was merged outside the factory into another branch than the plan's changeset branch (sc-{a}) "
-            + "cannot be re-run either (a re-run finds the merged pull request and escalates again): only stopping the plan ends what depends on it", comment);
+        Assert.Contains($"Remedies: stop the plan (`factory stop --item sc-{PlanId}`: its unfinished stories are stopped, merged ones stay). "
+            + "A story whose pull request was merged outside the factory into another branch than the plan's changeset branch "
+            + $"can be re-run too (`factory run sc-{a}`): the re-run implements it again onto the plan's changeset branch through the gate, "
+            + "and its dependents are released once that has merged. Its earlier pull request is not part of the changeset, and what that "
+            + "put on the other branch is yours to deal with.", comment);
+        Assert.DoesNotContain("fix what failed and re-run the story", comment); // nothing of it failed that could be fixed first
+        Assert.DoesNotContain("cannot be re-run", comment);
         Assert.Empty(h.Repo.Opened.Where(o => o.Head == ChangesetBranch).ToList());
+
+        // The re-run the comment offers: the story is implemented again, a second pull request of its branch is opened and the
+        // factory's gate merges that one into the plan's changeset branch.
+        var opensBefore = h.Repo.Opened.Count(o => o.Head == Branch(a));
+        var rerun = await h.Run(a);
+        Assert.Equal((WorkState.Watch, (string?)null), (rerun.State, rerun.Error));
+        Assert.NotEqual(url, rerun.PullRequestUrl);
+        Assert.Equal(opensBefore + 1, h.Repo.Opened.Count(o => o.Head == Branch(a)));
+        Assert.Equal([WorkState.Escalated, WorkState.Intake, WorkState.Implement, WorkState.Review, WorkState.CI, WorkState.MergeGate, WorkState.Merge, WorkState.Watch],
+            (await h.Transitions(a))[^8..]);
+        Assert.Single(h.Repo.Merges, m => m.Head == Branch(a) && m.Base == ChangesetBranch);
+        Assert.DoesNotContain(await h.Rows(a), r => r.Step == RunPipeline.Steps.MergedIntoChangeset);
+
+        // The story is merged for its plan and no longer failed: B is released, and the plan says it is no longer held.
+        Ended(h, await h.Run(), WorkState.Planned);
+        Assert.Equal(FakeShortcutBoard.ToDo, h.State(b));
+        var view = Assert.Single(await h.Dashboard(), r => r.ExternalId == $"sc-{PlanId}").Plan!;
+        Assert.Equal((PlanStoryState.Merged, 0), (view.Stories[0].State, view.Failed));
+        Assert.Single(await h.Steps(PlanId, RunPipeline.Steps.PlanResumed));
     }
 }

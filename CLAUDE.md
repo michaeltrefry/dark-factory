@@ -625,6 +625,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   9. A re-run of a plan story counted by `merged-into-changeset` does nothing (sc-25877, round 2; part of decision 3): before,
      `factory run` on it implemented the story a second time and opened a second pull request into the changeset branch, while
      the escalation said a re-run changes nothing ("Plan failures and controls").
+  10. A plan story merged outside the factory into another base than its plan's changeset branch can be re-run (sc-25877, round
+      2): the behaviour is unchanged — the re-run implements it again onto the changeset branch — and the hold comment now
+      offers it instead of denying it; the outside merge on the other branch is left to the owner ("Plan failures and controls").
 - Dependency-aware release (Phase 4a, sc-25871; `Plans/PlanRelease.cs`, `RunPipeline.Plan.cs` `PlannedAsync`/`ClosePlanAsync`): the
   orchestrator, not a person, releases a plan's stories. `RunPipeline.InFlightAsync` lists every `Planned` plan item (unless a
   control pauses it, or its closeout was given up on, below), so each intake poll — and a `factory run` on it — evaluates it
@@ -737,9 +740,14 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   pull request's body and in the plan's closeout ends "; its board story is still claimed by the factory: move it to Done by
   hand" (`PlanRelease.BoardStoryStillClaimed`; code-written words, the planner's title stays in its code span). A
   pull request merged outside the factory into ANY OTHER base (retargeted to the default branch, say: past the changeset, ungated)
-  writes no such row: that story stays failed — `merged outside the factory` — and since a re-run would only find the merged pull
-  request and escalate again, the hold comment's remedies offer no `factory run` for it and say so, like a cancelled story: "only
-  stopping the plan ends what depends on it" (`PlanRelease.FailedRemedy`). A story of a plan with no changeset (recorded before
+  writes no such row: that story stays failed — `merged outside the factory` — until it is re-run or its plan is stopped. A re-run
+  is a remedy (sc-25877, round 2; before, the hold comment wrongly said it "cannot be re-run"): `factory run <story>` takes the
+  Escalated item back to Intake like any re-run, implements the story again from the plan's changeset branch and opens a second
+  pull request into that branch, which the gate merges — a Merge row, so the story is merged for its plan and its dependents
+  are released. The hold comment says so apart from the other failed stories (`PlanRelease.FailedRemedy`: "… can be re-run too
+  (`factory run sc-12`): the re-run implements it again onto the plan's changeset branch through the gate … Its earlier pull
+  request is not part of the changeset, and what that put on the other branch is yours to deal with"); only a cancelled story
+  cannot be brought back by a re-run. A story of a plan with no changeset (recorded before
   changesets) has the default branch as its base and never counts this way.
   Held by a failed story: when the record changes — never every poll — the plan item gets one row: `plan-held` whose Detail starts
   `held by a failed story: ` (`PlanRelease.FailedPrefix`; told apart from the outside-blocker and `not evaluated:` `plan-held` rows
