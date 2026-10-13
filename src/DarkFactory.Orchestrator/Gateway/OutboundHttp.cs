@@ -49,6 +49,9 @@ public static class OutboundHttp
     /// <summary>The hosted KanbanBoard's MCP endpoint (<c>Kanban:McpUrl</c>'s default; sc-25707).</summary>
     public static readonly Uri KanbanDefaultMcpUrl = new("https://kanban-mcp.trefry.net/mcp");
 
+    /// <summary>The hosted KanbanBoard's web UI (<c>Kanban:WebUrl</c>'s default; sc-25981): only links are built on it, nothing is requested from it.</summary>
+    public static readonly Uri KanbanDefaultWebUrl = new("https://kanban.trefry.net/");
+
     /// <summary>How long one request to Kanban may take.</summary>
     public static readonly TimeSpan KanbanTimeout = TimeSpan.FromSeconds(60);
 

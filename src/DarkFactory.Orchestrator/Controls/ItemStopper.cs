@@ -1,7 +1,6 @@
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Plans;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.Orchestrator.Controls;

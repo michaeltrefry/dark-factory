@@ -21,9 +21,10 @@ public sealed record WorkStory(int Id, string Name, string? Description, string 
     /// <summary>
     /// Whether <see cref="Name"/> and <see cref="Description"/> are a model's text rather than the owner's: a GitHub issue's item (its
     /// name is the triage's title, derived from untrusted issue text), or a story the factory created from a plan
-    /// (<see cref="PlannerAuthored"/>, sc-25870).
+    /// (<see cref="PlannerAuthored"/>, sc-25870). A Kanban item is written on the owner's board and is trusted like a Shortcut story
+    /// (sc-25981).
     /// </summary>
-    public bool UntrustedName => Kind != ItemNaming.Shortcut || PlannerAuthored;
+    public bool UntrustedName => Kind == ItemNaming.GitHubIssue || PlannerAuthored;
 
     /// <summary>Whether the factory created this story from a plan: its description carries the plan's marker (<see cref="Plans.PlannedStory"/>).</summary>
     public bool PlannerAuthored => Plans.PlannedStory.IsMarked(Description);
@@ -32,7 +33,11 @@ public sealed record WorkStory(int Id, string Name, string? Description, string 
     public string Ref => Kind.Format(Id);
 }
 
-public sealed record WorkEpic(int Id, string Name, string? Description, string AppUrl);
+/// <param name="Id">
+/// The epic's number on its board, which an epic-scope control addresses (<c>epic:&lt;id&gt;</c>); null for a board whose epics have
+/// none (Kanban: its epics are GUIDs), so no epic control reaches the item.
+/// </param>
+public sealed record WorkEpic(int? Id, string Name, string? Description, string AppUrl);
 
 public sealed record WorkDocument(string Title, string? Markdown, string AppUrl);
 

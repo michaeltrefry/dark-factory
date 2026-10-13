@@ -2,7 +2,6 @@ using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Sessions;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 
 namespace DarkFactory.Orchestrator.Issues;

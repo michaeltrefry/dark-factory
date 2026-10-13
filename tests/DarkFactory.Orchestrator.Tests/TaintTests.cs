@@ -1,7 +1,6 @@
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.Issues;
 using DarkFactory.Orchestrator.Ledger;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.Worker;
 

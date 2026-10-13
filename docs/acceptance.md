@@ -842,6 +842,39 @@ story merged outside the factory, a cancelled story, a failed story that is re-r
 released), a comment the board refuses (retried, bounded, never posted twice), a story of a stopped plan moved to ready by hand
 (claim refused), and the rendered pipeline page.
 
+## P4b-AT1 (first version) — `factory run kb-N` takes a Ready Kanban item to an opened pull request (sc-25981)
+
+`KanbanAcceptanceTests.P4b_AT1_factory_run_takes_a_ready_kanban_item_to_an_opened_pull_request_linked_on_the_item`: a real
+KanbanBoard item through `FactoryRunner.RunAsync` (what `factory run kb-N` calls), against a throwaway ledger and work root.
+This first version checks up to "pull request opened"; what the review and the merge gate then decide is printed, not asserted.
+
+Prerequisites: everything `factory run` needs (router key and an enrolled plan, both GitHub Apps installed on the target
+repository, Claude Code for the worker user), the Shortcut token (the shared harness still asks for it), and
+
+- `Kanban:WriteToken` (env `FACTORY_KANBAN_WRITE_TOKEN` or keychain account `kanban-write-token`): a `full`-scope KanbanBoard
+  personal access token of the factory's service identity (KanbanBoard's `docs/deployment.md`, "Factory service identity");
+- `FACTORY_E2E_P4B_KANBAN_PROJECT`: the key of a KanbanBoard project whose `repository_url` names the sandbox repository
+  (`https://github.com/<owner>/<name>.git`), or whose items carry a `Repo: owner/name` line;
+- `FACTORY_E2E_P4B_KANBAN_ITEM`: the id (GUID) of an item of that project in `Ready`, unclaimed, with no open blocker, describing
+  a small change to the sandbox (a bug the sandbox's tests can show). The item is used up: the run claims it and moves it.
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_P4B_KANBAN_PROJECT=<KEY> FACTORY_E2E_P4B_KANBAN_ITEM=<GUID> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4b_AT1*"
+```
+
+What it checks: the item gets one `kb-<n>` however often it is asked for and is listed ready under it; after the run the
+throwaway ledger has one `claimed` row and one `linked` row (`<pull request> <branch>`) and a Review transition for
+`kanban`/`kb-<n>`; GitHub has the pull request from `factory/kb-<n>`; the board shows the factory's claim under the marker
+`dark-factory:<item GUID>`, the item in `InProgress` (or `Done` if the gate went on to merge it), and the pull request and the
+branch as links of kind `pr` and `branch`; and a second run (unless the first escalated — a re-run is an escalated item's remedy)
+adds no second `claimed` or `linked` row and no link.
+
+Not live (every `dotnet test`): `KanbanWorkSourceTests` (each member, each refusal, paging, what every write sends — against a
+fake MCP server that behaves as KanbanBoard's contract says, `FakeKanbanBoard`), `KanbanPipelineTests` (the same run through the
+pipeline with fakes, and the resume), `KanbanWriteIsolationTests` (E2) and `KanbanKeysPostgresTests` (the migration, and
+processes allocating one item's key at once).
+
 ## Upgrading a Phase 1 ledger: items parked at Review
 
 Phase 1 parked every finished item at Review; since sc-25378 Review is a state the factory drives, so the first

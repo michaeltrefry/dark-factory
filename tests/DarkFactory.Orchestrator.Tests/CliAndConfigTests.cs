@@ -17,7 +17,8 @@ public class FactoryCliTests
             (repo, _) => { calls.Add($"protect {repo}"); return Task.FromResult(0); },
             _ => { calls.Add("work"); return Task.FromResult(0); },
             _ => { calls.Add("dashboard set-password"); return Task.FromResult(0); },
-            (action, scope, _) => { calls.Add($"{action} {scope}"); return Task.FromResult(0); });
+            (action, scope, _) => { calls.Add($"{action} {scope}"); return Task.FromResult(0); },
+            (item, _) => { calls.Add($"kanban key {item}"); return Task.FromResult(0); });
         return (root, calls);
     }
 
@@ -27,6 +28,8 @@ public class FactoryCliTests
     [InlineData("stop --item sc-77", "stop item:sc-77")]
     [InlineData("stop --item gh-4", "stop item:gh-4")]
     [InlineData("pause --item GH-4", "pause item:gh-4")]
+    [InlineData("pause --item kb-7", "pause item:kb-7")]
+    [InlineData("stop --item KB-7", "stop item:kb-7")]
     [InlineData("pause --epic 12", "pause epic:12")]
     [InlineData("stop --epic 12", "stop epic:12")]
     [InlineData("pause --factory", "pause factory")]
@@ -62,6 +65,8 @@ public class FactoryCliTests
     [InlineData("42", "sc-42")]
     [InlineData("gh-12", "gh-12")]
     [InlineData("GH-3", "gh-3")]
+    [InlineData("kb-7", "kb-7")]
+    [InlineData("KB-7", "kb-7")]
     public async Task Run_passes_the_parsed_work_item(string arg, string expected)
     {
         var (root, calls) = Cli();
@@ -84,6 +89,12 @@ public class FactoryCliTests
     [InlineData("run", "gh-")]
     [InlineData("run", "gh-0")]
     [InlineData("run", "gh-1x")]
+    [InlineData("run", "kb-")]
+    [InlineData("run", "kb-0")]
+    [InlineData("run", "e0865c06-7b9a-4f0f-9a1e-3a8f3c0f2d11")] // a board id is not a work item id: `factory kanban key` gives it one
+    [InlineData("kanban", "key")]
+    [InlineData("kanban", "key", "kb-7")]
+    [InlineData("kanban", "key", "not-a-guid")]
     public async Task Invalid_run_arguments_fail_without_running(params string[] args)
     {
         var (root, calls) = Cli();
@@ -91,6 +102,14 @@ public class FactoryCliTests
         Assert.NotEmpty(parse.Errors);
         Assert.NotEqual(0, await parse.InvokeAsync(new() { Output = TextWriter.Null, Error = TextWriter.Null }));
         Assert.Empty(calls);
+    }
+
+    [Fact]
+    public async Task Kanban_key_passes_the_items_board_id()
+    {
+        var (root, calls) = Cli();
+        Assert.Equal(0, await root.Parse(["kanban", "key", "E0865C06-7B9A-4F0F-9A1E-3A8F3C0F2D11"]).InvokeAsync());
+        Assert.Equal(["kanban key e0865c06-7b9a-4f0f-9a1e-3a8f3c0f2d11"], calls);
     }
 
     [Fact]
@@ -399,7 +418,7 @@ public class FactoryOptionsTests
             var tools = FactoryRunner.CreateReviewTools(none, new FakeReviewFiles("head", []), http, log);
             Assert.Contains("no CodeGraph token", log.ToString());
             var outcome = await tools.RunAsync(new AnswerBlock(AnswerBlock.ToolUse, null, "toolu_1", ReviewTools.AnalyzeImpact, "{\"name\":\"X\"}"),
-                ReviewTools.Session(new Shortcut.RepoRef("o", "r"), "head", "base", 0), CancellationToken.None);
+                ReviewTools.Session(new RepoRef("o", "r"), "head", "base", 0), CancellationToken.None);
             Assert.True(outcome.IsError);
             Assert.Contains("CodeGraph is not configured", outcome.Content);
         }
@@ -408,7 +427,7 @@ public class FactoryOptionsTests
         var configured = FactoryRunner.CreateReviewTools(Options(new() { ["CodeGraph:Token"] = "cg_config" }), new FakeReviewFiles("head", []),
             codeGraph.Client("https://codegraph.test/"), TextWriter.Null);
         await configured.RunAsync(new AnswerBlock(AnswerBlock.ToolUse, null, "toolu_1", ReviewTools.AnalyzeImpact, "{\"name\":\"X\"}"),
-            ReviewTools.Session(new Shortcut.RepoRef("o", "r"), "head", "base", 0), CancellationToken.None);
+            ReviewTools.Session(new RepoRef("o", "r"), "head", "base", 0), CancellationToken.None);
         Assert.Equal("Bearer cg_config", codeGraph.Requests.First().Headers["Authorization"]);
     }
 
@@ -456,6 +475,100 @@ public class FactoryOptionsTests
         Assert.All(kanban.Api.Requests, r => Assert.Equal("Bearer kb_config", r.Headers["Authorization"]));
         await Assert.ThrowsAsync<Mcp.ToolNotAllowedException>(() =>
             upstream.CallAsync("create_work_item", new System.Text.Json.Nodes.JsonObject(), CancellationToken.None));
+    }
+
+    [Fact]
+    public void Watched_kanban_projects_default_to_none_are_read_as_project_keys_and_a_malformed_key_is_refused_at_start_up()
+    {
+        // sc-25981, E10.
+        Assert.True(Options([]).KanbanWatchScope.IsEmpty);
+        Assert.Equal(["DF", "SCENE-WORKS"], Options(new() { ["Kanban:Watch:Projects"] = " df, Scene-Works ,DF" }).KanbanWatchScope.Projects);
+        Assert.Equal(["DF"], Options(new() { ["Kanban:Watch:Projects:0"] = "df" }).KanbanWatchScope.Projects);
+        Options(new() { ["Kanban:Watch:Projects"] = "df" }).ValidateSettings();
+        foreach (var bad in new[] { "two words", "df,a-key-that-is-longer-than-24", "df\tx" })
+        {
+            var refused = Assert.Throws<InvalidOperationException>(() => Options(new() { ["Kanban:Watch:Projects"] = bad }).ValidateSettings());
+            Assert.StartsWith("Kanban:Watch:Projects: ", refused.Message);
+        }
+    }
+
+    [Fact]
+    public void Kanban_web_url_defaults_to_the_hosted_kanbanboard_is_read_from_config_and_an_invalid_one_is_refused_at_start_up()
+    {
+        // sc-25981, E10: what a Kanban item's link is built on.
+        Assert.Equal(new Uri("https://kanban.trefry" + ".net/"), Options([]).KanbanWebUrl);
+        Assert.Equal(Gateway.OutboundHttp.KanbanDefaultWebUrl, Options([]).KanbanWebUrl);
+        var configured = Options(new() { ["Kanban:WebUrl"] = "http://127.0.0.1:5005/board/" });
+        Assert.Equal(new Uri("http://127.0.0.1:5005/board/"), configured.KanbanWebUrl);
+        configured.ValidateSettings();
+        var item = new Kanban.KanbanWorkItem(Guid.Parse("e0865c06-7b9a-4f0f-9a1e-3a8f3c0f2d11"), Guid.Parse("a0000000-0000-0000-0000-000000000001"),
+            "T", "Story", "Ready", 1);
+        Assert.Equal("http://127.0.0.1:5005/board/?project=a0000000-0000-0000-0000-000000000001&item=e0865c06-7b9a-4f0f-9a1e-3a8f3c0f2d11",
+            new Kanban.KanbanLinks(configured.KanbanWebUrl).Item(item));
+        foreach (var bad in new[] { "kanban.local", "ftp://kanban.local/", "https://user:pw@kanban.local/", "https://kanban.local/?project=1",
+            "https://kanban.local/#x", "https://api.anthropic.com/" })
+        {
+            Assert.Contains("Kanban:WebUrl",
+                Assert.Throws<InvalidOperationException>(() => Options(new() { ["Kanban:WebUrl"] = bad }).ValidateSettings()).Message);
+        }
+    }
+
+    [Fact]
+    public void The_kanban_write_token_is_its_own_credential_from_config_or_keychain_and_never_the_read_token()
+    {
+        // sc-25981, E2.
+        Assert.Equal("kanban-write-token", SecretAccounts.KanbanWriteToken);
+        var secrets = new InMemorySecrets();
+        secrets.Set(SecretAccounts.KanbanWriteToken, "kbw_keychain");
+        Assert.Equal("kbw_config", Options(new() { ["Kanban:WriteToken"] = "kbw_config" }, secrets).KanbanWriteToken);
+        if (Environment.GetEnvironmentVariable("FACTORY_KANBAN_WRITE_TOKEN") is not null)
+        {
+            return; // the environment supplies a token
+        }
+        Assert.Equal("kbw_keychain", Options([], secrets).KanbanWriteToken);
+        // The read token is no write token: with only it set, the write token is missing (and start-up is unaffected: it is
+        // needed only to work a Kanban item).
+        var readOnly = Options(new() { ["Kanban:Token"] = "kb_read" });
+        readOnly.ValidateSettings();
+        var missing = Assert.Throws<MissingCredentialException>(() => readOnly.KanbanWriteToken);
+        Assert.Contains("env FACTORY_KANBAN_WRITE_TOKEN, config 'Kanban:WriteToken', or keychain account 'kanban-write-token'", missing.Message);
+        if (Environment.GetEnvironmentVariable("FACTORY_KANBAN_TOKEN") is null)
+        {
+            Assert.False(Options(new() { ["Kanban:WriteToken"] = "kbw_config" }).TryGet(o => o.KanbanToken, out _));
+        }
+    }
+
+    [Theory]
+    [InlineData("https://github.com/acme/widgets.git", "acme/widgets")]
+    [InlineData("https://github.com/acme/widgets", "acme/widgets")]
+    [InlineData("https://github.com/acme/widgets/", "acme/widgets")]
+    [InlineData("http://GitHub.com/acme/widgets.git", "acme/widgets")]
+    [InlineData("ssh://git@github.com/acme/widgets.git", "acme/widgets")]
+    [InlineData("ssh://git@github.com:22/acme/widgets", "acme/widgets")]
+    [InlineData("git@github.com:acme/widgets.git", "acme/widgets")]
+    [InlineData("git@github.com:acme/widgets", "acme/widgets")]
+    [InlineData(" git@github.com:Acme/Wid.gets.git ", "Acme/Wid.gets")]
+    [InlineData("https://gitlab.com/acme/widgets.git", null)]
+    [InlineData("https://github.com.evil.example/acme/widgets.git", null)]
+    [InlineData("https://evil.example/github.com/acme/widgets", null)]
+    [InlineData("https://user:pw@github.com/acme/widgets.git", null)]
+    [InlineData("https://github.com/acme", null)]
+    [InlineData("https://github.com/acme/widgets/pull/1", null)]
+    [InlineData("git@github.com:acme/.git", null)]
+    [InlineData("git@github.com:../widgets.git", null)]
+    [InlineData("acme/widgets", null)]
+    [InlineData("", null)]
+    [InlineData(null, null)]
+    public void A_repository_url_names_a_github_repository_in_its_https_and_ssh_forms_or_none(string? url, string? repo) =>
+        Assert.Equal(repo, Gateway.GitRemoteReads.RepoOf(url)?.FullName);
+
+    [Fact]
+    public void A_repo_line_is_found_in_an_items_text_or_not_at_all()
+    {
+        Assert.Equal(new RepoRef("acme", "widgets"), RepoResolver.Named("Do it.\n\nRepo: acme/widgets\nRepo: acme/other"));
+        Assert.Null(RepoResolver.Named("Do it in the repo: somewhere."));
+        Assert.Null(RepoResolver.Named(null));
+        Assert.Equal(new RepoRef("o", "d"), RepoResolver.Resolve(null, new RepoRef("o", "d")));
     }
 
     [Fact]

@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using DarkFactory.Orchestrator.Git;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 
 namespace DarkFactory.Orchestrator.Tests;

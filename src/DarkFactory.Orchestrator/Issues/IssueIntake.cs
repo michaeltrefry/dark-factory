@@ -3,7 +3,6 @@ using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
