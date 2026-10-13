@@ -4,7 +4,7 @@ namespace DarkFactory.Orchestrator.WorkSources;
 
 /// <summary>
 /// How one work source's items are named in the ledger and on git: the ledger's <see cref="Ledger.WorkItem.Source"/>, the
-/// external id (<c>sc-12</c>, <c>gh-3</c>), the item's <c>factory/&lt;id&gt;</c> branch and its worktree. Ids are numbers
+/// external id (<c>sc-12</c>, <c>gh-3</c>, <c>kb-4</c>), the item's <c>factory/&lt;id&gt;</c> branch and its worktree. Ids are numbers
 /// within their source; the prefix keeps two sources' items apart everywhere a name is shared (control scopes, branches,
 /// worktree directories, the dashboard).
 /// </summary>
@@ -19,8 +19,14 @@ public sealed record ItemNaming(string Source, string Prefix, string Noun)
     /// <summary>GitHub issues: <c>gh-&lt;key&gt;</c>, the key the ledger gave the issue (<see cref="Ledger.GitHubIssue"/>), not its number.</summary>
     public static readonly ItemNaming GitHubIssue = new("github", "gh", "GitHub issue");
 
+    /// <summary>
+    /// KanbanBoard work items (sc-25981): <c>kb-&lt;key&gt;</c>, the key the ledger gave the item (<see cref="Ledger.KanbanItem"/>) —
+    /// its id on the board is a GUID, and a GUID names no branch or control scope a person types.
+    /// </summary>
+    public static readonly ItemNaming Kanban = new("kanban", "kb", "Kanban item");
+
     /// <summary>Every source's naming.</summary>
-    public static readonly IReadOnlyList<ItemNaming> All = [Shortcut, GitHubIssue];
+    public static readonly IReadOnlyList<ItemNaming> All = [Shortcut, GitHubIssue, Kanban];
 
     public string Format(int id) => $"{Prefix}-{id}";
 

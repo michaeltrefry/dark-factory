@@ -185,6 +185,21 @@ public sealed class GitHubIssue
     public DateTimeOffset FirstSeenAt { get; set; }
 }
 
+/// <summary>
+/// A KanbanBoard work item the factory has seen, and the key (<see cref="Id"/>) its work item is named by (<c>kb-&lt;Id&gt;</c>,
+/// <see cref="WorkSources.ItemNaming.Kanban"/>; sc-25981): the board's own id is a GUID. One row per item for good — the key is
+/// never reused or changed — written before anything else is written for the item (<see cref="Kanban.KanbanKeys"/>).
+/// </summary>
+public sealed class KanbanItem
+{
+    public int Id { get; set; }
+
+    /// <summary>The item's id on the board.</summary>
+    public Guid ItemId { get; set; }
+
+    public DateTimeOffset FirstSeenAt { get; set; }
+}
+
 /// <summary>How far the issue poll of one watched repo has read (issues updated at or after <see cref="Since"/> are read again).</summary>
 public sealed class GitHubIssueCursor
 {
@@ -197,6 +212,7 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
 {
     public DbSet<GitHubIssue> GitHubIssues => Set<GitHubIssue>();
     public DbSet<GitHubIssueCursor> GitHubIssueCursors => Set<GitHubIssueCursor>();
+    public DbSet<KanbanItem> KanbanItems => Set<KanbanItem>();
     public DbSet<WorkItem> WorkItems => Set<WorkItem>();
     public DbSet<LedgerEntry> LedgerEntries => Set<LedgerEntry>();
     public DbSet<WorkerSession> WorkerSessions => Set<WorkerSession>();
@@ -264,6 +280,11 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
             e.ToTable("github_issues");
             e.Property(x => x.Repo).HasMaxLength(200);
             e.HasIndex(x => new { x.Repo, x.Number }).IsUnique();
+        });
+        modelBuilder.Entity<KanbanItem>(e =>
+        {
+            e.ToTable("kanban_items");
+            e.HasIndex(x => x.ItemId).IsUnique();
         });
         modelBuilder.Entity<SessionTaint>(e =>
         {

@@ -5,7 +5,6 @@ using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Issues;
 using DarkFactory.Orchestrator.Ledger;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;

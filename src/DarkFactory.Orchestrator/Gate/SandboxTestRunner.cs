@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Text;
 using DarkFactory.Orchestrator.Git;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 
 namespace DarkFactory.Orchestrator.Gate;

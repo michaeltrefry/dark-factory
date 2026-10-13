@@ -83,7 +83,9 @@ public static class FactoryRunner
     }
 
     /// <summary>
-    /// <c>factory run</c>'s exit code: 0 the run succeeded, 1 it did not, 2 it could not start — a retired review-model
+    /// <c>factory run</c>'s exit code: 0 the run succeeded, 1 it did not (also a Kanban item that could not be read or is no
+    /// item the factory can work, <see cref="Kanban.KanbanItemException"/>/<see cref="Kanban.KanbanException"/>: its message on
+    /// <paramref name="stderr"/>, no stack trace), 2 it could not start — a retired review-model
     /// setting is set (checked first, before any network call), a credential is missing, or
     /// <paramref name="checkEnrollment"/> found the router unusable — with the reason on <paramref name="stderr"/>.
     /// </summary>
@@ -118,6 +120,14 @@ public static class FactoryRunner
             stderr.WriteLine(ex.Message);
             return 2;
         }
+        catch (Exception ex) when (ex is Kanban.KanbanItemException or Kanban.KanbanException)
+        {
+            // Raised reading a Kanban item's spec, before the pipeline's own handling (inside it, a failed step escalates the item
+            // and the run returns an outcome): an unknown kb-<n>, an item with no known repository, or the board refusing the read.
+            // The message says what to do.
+            stderr.WriteLine(ex.Message);
+            return 1;
+        }
     }
 
     /// <summary>
@@ -135,16 +145,59 @@ public static class FactoryRunner
         return await RunAsync(options, CreateWorkSource(options, shortcutHttp), storyId, ignoreScope, log, ct);
     }
 
-    /// <summary><c>factory run &lt;item&gt;</c> for an item of any source: a Shortcut story (<c>sc-N</c>) or a GitHub issue (<c>gh-N</c>).</summary>
+    /// <summary><c>factory run &lt;item&gt;</c> for an item of any source: a Shortcut story (<c>sc-N</c>), a GitHub issue (<c>gh-N</c>) or a Kanban item (<c>kb-N</c>).</summary>
     public static async Task<RunOutcome> RunAsync(FactoryOptions options, ItemRef item, bool ignoreScope, TextWriter log, CancellationToken ct)
     {
         if (item.Naming == ItemNaming.Shortcut)
         {
             return await RunAsync(options, item.Id, ignoreScope, log, ct);
         }
+        if (item.Naming == ItemNaming.Kanban)
+        {
+            using var kanbanHttp = OutboundHttp.KanbanApi(options.KanbanMcpUrl);
+            return await RunAsync(options, CreateKanbanSource(options, kanbanHttp), item.Id, ignoreScope, log, ct);
+        }
         using var githubHttp = OutboundHttp.GitHubApi();
         return await RunAsync(options, CreateIssueSource(options, githubHttp), item.Id, ignoreScope, log, ct);
     }
+
+    /// <summary>
+    /// The Kanban work source over the watched projects (<c>Kanban:Watch:Projects</c>; sc-25981), with the orchestrator's own
+    /// full-scope token (<c>Kanban:WriteToken</c>) in the one client built for it (<see cref="KanbanWrites.Client"/>) over
+    /// <paramref name="kanbanHttp"/> (<see cref="OutboundHttp.KanbanApi"/>). That client is apart from the Kanban upstream of
+    /// <see cref="CreateUpstreams"/>, which holds the read token and is all a model session reaches (E2).
+    /// </summary>
+    public static Kanban.KanbanWorkSource CreateKanbanSource(FactoryOptions options, HttpClient kanbanHttp) =>
+        new(new Kanban.KanbanBoard(KanbanWrites.Client(kanbanHttp, options.KanbanWriteToken)), new Kanban.KanbanKeys(Contexts(options)),
+            options.KanbanWatchScope, options.KanbanWebUrl);
+
+    /// <summary>
+    /// <c>factory kanban key &lt;item id&gt;</c>: the <c>kb-&lt;n&gt;</c> of a KanbanBoard item by its board id, given to it now if the
+    /// factory has not seen the item before (<see cref="Kanban.KanbanWorkSource.KeyOfAsync"/>: the item must be on the board; nothing
+    /// is written to it) — what <c>factory run kb-&lt;n&gt;</c> then takes.
+    /// </summary>
+    public static async Task<string> KanbanKeyAsync(FactoryOptions options, Guid itemId, CancellationToken ct)
+    {
+        using var kanbanHttp = OutboundHttp.KanbanApi(options.KanbanMcpUrl);
+        var source = CreateKanbanSource(options, kanbanHttp);
+        await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
+        return ItemNaming.Kanban.Format(await source.KeyOfAsync(itemId, ct));
+    }
+
+    /// <summary>
+    /// Whether <paramref name="ex"/> is a failure <c>factory kanban key</c> reports by its message with exit code 1, rather than
+    /// a stack trace: the board refusing or not answering (<see cref="Kanban.KanbanException"/> and any other
+    /// <see cref="InvalidOperationException"/>, <see cref="HttpRequestException"/>, an HTTP timeout — a
+    /// <see cref="TaskCanceledException"/> the caller did not ask for), or the ledger failing (<see cref="System.Data.Common.DbException"/>,
+    /// Npgsql's included, and EF's <see cref="Microsoft.EntityFrameworkCore.DbUpdateException"/>). A cancellation the caller asked
+    /// for (Ctrl-C: <paramref name="ct"/>) is not one.
+    /// </summary>
+    public static bool IsKanbanKeyFailure(Exception ex, CancellationToken ct) => ex switch
+    {
+        OperationCanceledException => ex is TaskCanceledException && !ct.IsCancellationRequested,
+        _ => ex is InvalidOperationException or HttpRequestException or System.Data.Common.DbException
+            or Microsoft.EntityFrameworkCore.DbUpdateException,
+    };
 
     /// <summary>The GitHub issue work source over the watched repos (<c>GitHub:Watch:Repos</c>), as the workers' App.</summary>
     public static Issues.GitHubIssueWorkSource CreateIssueSource(FactoryOptions options, HttpClient githubHttp) =>

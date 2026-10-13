@@ -175,7 +175,7 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
     /// <c>Recorded</c>: every changeset the plan item recorded, for any repository, pushed or not — empty only for a plan recorded
     /// before there were changesets, whose stories target the default branch.
     /// </summary>
-    public async Task<(Plans.Changeset? Changeset, IReadOnlyList<Plans.Changeset> Recorded)> ChangesetOfAsync(long planItemId, Shortcut.RepoRef repo,
+    public async Task<(Plans.Changeset? Changeset, IReadOnlyList<Plans.Changeset> Recorded)> ChangesetOfAsync(long planItemId, RepoRef repo,
         CancellationToken ct)
     {
         var rows = await db.LedgerEntries.AsNoTracking()

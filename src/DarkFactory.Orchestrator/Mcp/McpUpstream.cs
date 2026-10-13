@@ -148,7 +148,7 @@ public sealed class McpProfile
     /// <summary>
     /// A plan item's planner session (sc-25870, sc-25874): every allowlisted CodeGraph tool — the reviewers' seven and the
     /// cross-repository ones (<see cref="PlannerCodeGraph.Tools"/>) — and Kanban's read tools. The only profile granted the
-    /// cross-repository tools, or more than one repository (<see cref="McpProxy.Grant(IReadOnlyList{Shortcut.RepoRef}, McpProfile)"/>):
+    /// cross-repository tools, or more than one repository (<see cref="McpProxy.Grant(IReadOnlyList{RepoRef}, McpProfile)"/>):
     /// its input is the owner's own plan story, not an outsider's text as a triage's is, so answers that name other indexed
     /// (private) projects are accepted for it, as they never are for triage. Where its output goes (sc-25877): the stories it
     /// writes land on the owner's board, and their titles and the plan's <c>interactions</c> note also reach GitHub — pull request

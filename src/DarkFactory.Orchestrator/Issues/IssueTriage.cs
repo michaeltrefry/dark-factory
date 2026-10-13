@@ -7,7 +7,6 @@ using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.GitHub;
-using DarkFactory.Orchestrator.Shortcut;
 
 namespace DarkFactory.Orchestrator.Issues;
 

@@ -89,6 +89,40 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         }
     }
 
+    /// <summary>
+    /// <c>Kanban:Watch:Projects</c> (sc-25981): the keys of the KanbanBoard projects whose items the factory takes, comma-separated
+    /// (or an array section); empty (the default) watches nothing. A malformed key throws (the factory refuses to start).
+    /// </summary>
+    public Kanban.KanbanScope KanbanWatchScope => Kanban.KanbanScope.From(config);
+
+    /// <summary>
+    /// <c>Kanban:WebUrl</c> (default the hosted KanbanBoard's web UI, <see cref="Gateway.OutboundHttp.KanbanDefaultWebUrl"/>; sc-25981):
+    /// what a Kanban item's, epic's and document's link is built on (<see cref="Kanban.KanbanLinks"/>) — the board's MCP returns no
+    /// URL. An absolute http(s) URL without credentials, query or fragment, naming no model provider, else the factory refuses to start.
+    /// </summary>
+    public Uri KanbanWebUrl
+    {
+        get
+        {
+            var text = config["Kanban:WebUrl"];
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return Gateway.OutboundHttp.KanbanDefaultWebUrl;
+            }
+            if (!Uri.TryCreate(text.Trim(), UriKind.Absolute, out var url) || url.Scheme is not ("http" or "https")
+                || url.UserInfo.Length > 0 || url.Query.Length > 0 || url.Fragment.Length > 0)
+            {
+                throw new InvalidOperationException(
+                    $"Kanban:WebUrl must be an absolute http(s) URL without credentials, query or fragment, not '{text}'.");
+            }
+            if (Gateway.ProviderMarkers.In(text) is { } provider)
+            {
+                throw new InvalidOperationException($"Kanban:WebUrl names a model provider ('{provider}'); it must be KanbanBoard's web address.");
+            }
+            return url;
+        }
+    }
+
     /// <summary><c>Factory:DefaultRepo</c> (default the sandbox repo): an <c>owner/name</c>, else the factory refuses to start.</summary>
     public RepoRef DefaultRepo
     {
@@ -321,6 +355,16 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     /// </summary>
     public string KanbanToken => Secret("Kanban:Token", "FACTORY_KANBAN_TOKEN", SecretAccounts.KanbanToken, "Kanban token");
 
+    /// <summary>
+    /// The orchestrator's own Kanban token (<c>Kanban:WriteToken</c>, env <c>FACTORY_KANBAN_WRITE_TOKEN</c>, or keychain account
+    /// <c>kanban-write-token</c>; sc-25981): a KanbanBoard personal access token of scope <c>full</c>, with which the Kanban work
+    /// source claims, moves, comments on and links items. Owner-side only and apart from <see cref="KanbanToken"/> (E2): it is
+    /// read only to build that work source's client (<see cref="Gateway.KanbanWrites"/>) and is in no MCP upstream, profile or
+    /// proxy grant, so no model session can reach a write tool with it. Needed only to work a Kanban item.
+    /// </summary>
+    public string KanbanWriteToken => Secret("Kanban:WriteToken", "FACTORY_KANBAN_WRITE_TOKEN", SecretAccounts.KanbanWriteToken,
+        "Kanban write token (a full-scope KanbanBoard personal access token)");
+
     public string ShortcutApiToken =>
         Secret("Shortcut:ApiToken", "SHORTCUT_API_TOKEN", SecretAccounts.ShortcutApiToken, "Shortcut API token");
 
@@ -399,7 +443,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSandbox, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures);
         _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
         _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl, KanbanMcpUrl);
-        _ = CodeGraphOverlayTimeout;
+        _ = (CodeGraphOverlayTimeout, KanbanWatchScope, KanbanWebUrl);
     }
 
     public bool TryGet(Func<FactoryOptions, string> secret, out string? value)

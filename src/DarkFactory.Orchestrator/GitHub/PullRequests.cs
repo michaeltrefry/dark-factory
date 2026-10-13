@@ -2,7 +2,6 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using DarkFactory.Orchestrator.Shortcut;
 
 namespace DarkFactory.Orchestrator.GitHub;
 

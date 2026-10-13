@@ -2,7 +2,6 @@ using System.Net;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using DarkFactory.Orchestrator.GitHub;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 
 namespace DarkFactory.Orchestrator.Tests;
