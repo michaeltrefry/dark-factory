@@ -66,6 +66,17 @@ public sealed record ClaimResult(bool Claimed, string? Refusal)
 }
 
 /// <summary>
+/// The result of <see cref="IWorkSource.RenewClaimAsync"/>: the factory still holds the item (<see cref="Lost"/> null), or why it no
+/// longer does, in words that name whoever holds it now.
+/// </summary>
+public sealed record ClaimRenewal(string? Lost)
+{
+    public static readonly ClaimRenewal Held = new((string?)null);
+
+    public static ClaimRenewal LostBecause(string reason) => new(reason);
+}
+
+/// <summary>
 /// The work source will not create children under this parent and has written nothing (<see cref="IWorkSource.CreateChildrenAsync"/>):
 /// the message says why, in words the item's owner can act on.
 /// </summary>
@@ -140,6 +151,16 @@ public interface IWorkSource
     /// claim back and refuses if it did not stick.
     /// </summary>
     Task<ClaimResult> ClaimAsync(int id, bool ignoreScope, CancellationToken ct);
+
+    /// <summary>
+    /// Keeps the factory's claim on an item it is working (sc-25983): asked once per intake poll for every in-flight item of the
+    /// source (<see cref="IntakeLoop"/>), for a source whose claims expire unless renewed. <see cref="ClaimRenewal.Held"/> when the
+    /// claim is the factory's for another lifetime (renewed, or taken again after it lapsed with nobody else holding the item);
+    /// <see cref="ClaimRenewal.Lost"/> — naming who holds the item — when another caller has it, which pauses the item
+    /// (<see cref="IItemRunner.ClaimLostAsync"/>). Optional: a source whose claims do not expire (Shortcut's owner and label,
+    /// a GitHub issue's assignment) has nothing to renew and always holds (the default).
+    /// </summary>
+    Task<ClaimRenewal> RenewClaimAsync(int id, CancellationToken ct) => Task.FromResult(ClaimRenewal.Held);
 
     /// <summary>Whether the item is (still) inside the configured watch scope.</summary>
     Task<bool> InScopeAsync(int id, CancellationToken ct);

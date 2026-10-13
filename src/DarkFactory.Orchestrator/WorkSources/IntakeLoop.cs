@@ -23,6 +23,14 @@ public interface IItemRunner
     /// is running or already finished). The default records nothing.
     /// </summary>
     Task<string?> GiveUpAsync(int id, string reason, CancellationToken ct) => Task.FromResult<string?>(null);
+
+    /// <summary>
+    /// Pauses an in-flight item whose claim the poll's renewal found held by another caller (sc-25983;
+    /// <see cref="IWorkSource.RenewClaimAsync"/>): parked with <paramref name="reason"/>, which names the other claimant, and told so
+    /// on its board. Returns what was done, or null when nothing was (the item is running, being stopped, or in a state a lost
+    /// claim does not matter in). The default records nothing.
+    /// </summary>
+    Task<string?> ClaimLostAsync(int id, string reason, CancellationToken ct) => Task.FromResult<string?>(null);
 }
 
 /// <summary>
@@ -149,7 +157,7 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
         {
             try
             {
-                var inFlight = await lane.Runner.InFlightAsync(ct);
+                var inFlight = await RenewClaimsAsync(lane, await lane.Runner.InFlightAsync(ct), ct);
                 IReadOnlyList<int> ready = [];
                 if (!factoryPaused)
                 {
@@ -229,6 +237,43 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
             logger.LogError(ex, "Could not read the usage pause; polling again next interval");
             return null;
         }
+    }
+
+    /// <summary>
+    /// Keeps the factory's claims (sc-25983): each poll, before anything is run, every in-flight item of the lane has its claim
+    /// renewed by its source (<see cref="IWorkSource.RenewClaimAsync"/>; nothing for a source whose claims do not expire) — whatever
+    /// the lane's source is, and also while the factory is paused or frozen, so a claim outlives its first lifetime however long
+    /// the item is in flight. An item the runner does not list (one a control pauses, a parked or an escalated one) is not
+    /// renewed. A claim lost to another caller pauses the item (<see cref="IItemRunner.ClaimLostAsync"/>) and is shown on the
+    /// dashboard; the item is then left out of this poll's runs. A renewal that fails (the board is down) is logged and tried
+    /// again next poll: a claim lasts far longer than a poll, and the item's own run reports a board that stays down.
+    /// </summary>
+    private async Task<IReadOnlyList<int>> RenewClaimsAsync(IntakeLane lane, IReadOnlyList<int> inFlight, CancellationToken ct)
+    {
+        var held = new List<int>();
+        foreach (var id in inFlight)
+        {
+            var name = lane.Source.Naming.Format(id);
+            try
+            {
+                if ((await lane.Source.RenewClaimAsync(id, ct)).Lost is { } reason)
+                {
+                    logger.LogWarning("{Item}: claim lost: {Reason}", name, reason);
+                    if (await lane.Runner.ClaimLostAsync(id, reason, ct) is { } what)
+                    {
+                        _status.ItemFailed(name, $"claim lost: {reason}");
+                        _status.ItemGaveUp(name, what);
+                        continue;
+                    }
+                }
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                logger.LogError(ex, "Could not renew the claim of {Item}; trying again next poll", name);
+            }
+            held.Add(id);
+        }
+        return held;
     }
 
     private async Task GiveUpAsync(IntakeLane lane, int id, string reason, CancellationToken ct)

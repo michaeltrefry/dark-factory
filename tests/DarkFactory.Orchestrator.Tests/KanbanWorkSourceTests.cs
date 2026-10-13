@@ -33,10 +33,20 @@ public class KanbanWorkSourceTests
         /// <summary>A fresh source each time, as after a restart: what it knows comes from the ledger and the board.</summary>
         public KanbanWorkSource Source(string token = FakeKanbanBoard.FullToken, string[]? watch = null, int? pageSize = null)
         {
-            var (board, scope, web) = (new KanbanBoard(KanbanWrites.Client(Board.Client(), token)), new KanbanScope(watch ?? ["DF"]), new Uri("https://kanban.test/"));
+            var (board, scope, web) = (Caller(token), new KanbanScope(watch ?? ["DF"]), new Uri("https://kanban.test/"));
             // No page size given: the source's own default.
             return pageSize is { } size ? new(board, Keys, scope, web) { PageSize = size } : new(board, Keys, scope, web);
         }
+
+        /// <summary>The backoffs the typed caller waited (it does not sleep here), in order.</summary>
+        public List<TimeSpan> Waits { get; } = [];
+
+        /// <summary>The typed caller alone, over the fake board.</summary>
+        public KanbanBoard Caller(string token = FakeKanbanBoard.FullToken) => new(KanbanWrites.Client(Board.Client(), token), (wait, _) =>
+        {
+            Waits.Add(wait);
+            return Task.CompletedTask;
+        });
 
         public Task<int> Key(FakeKanbanBoard.Item item) => Keys.KeyAsync(item.Id, CancellationToken.None);
 
@@ -234,7 +244,7 @@ public class KanbanWorkSourceTests
         h.Board.Calls.Clear();
 
         // In progress, no claim, and the ledger does not say it is the factory's: refused with what to do, nothing written.
-        Assert.Equal(ClaimResult.Refused("the item is InProgress with no claim, and the ledger records no claim of it by this factory (a claim lasts 24 hours and is not renewed, so the factory's claim may have lapsed): move it back to Ready to hand it to the factory again"),
+        Assert.Equal(ClaimResult.Refused("the item is InProgress with no claim, and the ledger records no claim of it by this factory (a claim lasts 24 hours and is renewed only while the item is in flight, so the factory's claim may have lapsed): move it back to Ready to hand it to the factory again"),
             await h.Source().ClaimAsync(u, ignoreScope: false, None));
         Assert.Equal(ClaimResult.Refused(KanbanWorkSource.LapsedRefusal), await h.Source().ClaimAsync(p, ignoreScope: false, None));
         Assert.Null(parked.Claim);
@@ -252,7 +262,7 @@ public class KanbanWorkSourceTests
             (ours.Claim!.Value.Name, ours.Claim.Value.Marker, ours.Claim.Value.Expires));
         Assert.Equal(("InProgress", "InProgress", "InProgress"), (ours.Status, unrecorded.Status, theirs.Status));
         Assert.Equal(versions, (ours.Version, unrecorded.Version, theirs.Version));
-        Assert.Equal("the item is InProgress with no claim, and the ledger records no claim of it by this factory (a claim lasts 24 hours and is not renewed, so the factory's claim may have lapsed): move it back to Ready to hand it to the factory again", KanbanWorkSource.LapsedRefusal);
+        Assert.Equal("the item is InProgress with no claim, and the ledger records no claim of it by this factory (a claim lasts 24 hours and is renewed only while the item is in flight, so the factory's claim may have lapsed): move it back to Ready to hand it to the factory again", KanbanWorkSource.LapsedRefusal);
     }
 
     public static TheoryData<string, string> Refusals => new()
@@ -260,7 +270,7 @@ public class KanbanWorkSourceTests
         { "claimed", "the item is claimed by someone" },
         { "backlog", "the item is Backlog, not Ready" },
         // In progress with no claim, and nothing in the ledger says the factory ever claimed it.
-        { "in-progress", "the item is InProgress with no claim, and the ledger records no claim of it by this factory (a claim lasts 24 hours and is not renewed, so the factory's claim may have lapsed): move it back to Ready to hand it to the factory again" },
+        { "in-progress", "the item is InProgress with no claim, and the ledger records no claim of it by this factory (a claim lasts 24 hours and is renewed only while the item is in flight, so the factory's claim may have lapsed): move it back to Ready to hand it to the factory again" },
         { "done", "the item is Done, not Ready" },
         { "blocked", "the item is blocked by \"Schema first\" (InProgress)" },
         { "closed-blocker", "the item is blocked by \"Schema first\" (Closed)" },
@@ -335,7 +345,8 @@ public class KanbanWorkSourceTests
 
         var result = await h.Source().ClaimAsync(id, ignoreScope: false, None);
 
-        Assert.Equal(ClaimResult.Refused("the item is claimed by another caller"), result);
+        // The refusal names the claimant: the item is read once more for that, and nothing else is written.
+        Assert.Equal(ClaimResult.Refused("the item is claimed by someone"), result);
         Assert.Equal(["claim_work_item"], h.Board.Writes); // the one call the board refused: a refused call changes nothing
         Assert.Equal(("Ready", 1L, "someone"), (item.Status, item.Version, item.Claim!.Value.Name));
     }
@@ -350,7 +361,7 @@ public class KanbanWorkSourceTests
 
         var result = await h.Source().ClaimAsync(id, ignoreScope: false, None);
 
-        Assert.Equal(ClaimResult.Refused("the item is claimed by another caller"), result);
+        Assert.Equal(ClaimResult.Refused("the item is claimed by someone"), result);
         Assert.Equal("someone", item.Claim!.Value.Name);
     }
 
@@ -395,27 +406,6 @@ public class KanbanWorkSourceTests
         Assert.Equal(ClaimResult.Refused("the item was moved to Done while it was being claimed"), result);
         Assert.Equal(["claim_work_item", "release_work_item_claim"], h.Board.Writes);
         Assert.Equal(("Done", (string?)null), (item.Status, item.Claim?.Name));
-    }
-
-    [Fact]
-    public async Task A_move_the_board_refuses_for_a_stale_version_throws_the_contracts_conflict_and_changes_nothing()
-    {
-        var h = new Harness();
-        var item = h.Board.AddItem(h.Project, "Count words");
-        var id = await h.Key(item);
-        // Edited by someone between the read-back and the move: expected_version no longer holds.
-        h.Board.Before = (tool, _) =>
-        {
-            if (tool == "update_work_item")
-            {
-                item.Version++;
-            }
-        };
-
-        var ex = await Assert.ThrowsAsync<KanbanException>(() => h.Source().ClaimAsync(id, ignoreScope: false, None));
-
-        Assert.Equal((KanbanException.Conflict, "update_work_item"), (ex.Code, ex.Tool));
-        Assert.Equal("Ready", item.Status);
     }
 
     [Fact]

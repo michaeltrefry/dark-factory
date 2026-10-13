@@ -1916,6 +1916,69 @@ public sealed partial class RunPipeline(
         return null;
     }
 
+    /// <summary>The Paused row's detail prefix when the factory lost its claim on an item it was working (sc-25983).</summary>
+    public const string ClaimLost = "claim lost";
+
+    public static bool IsClaimLost(string? detail) => detail?.StartsWith(ClaimLost, StringComparison.Ordinal) == true;
+
+    /// <summary>
+    /// The intake poll's claim renewal found an in-flight item held by another caller (sc-25983; see
+    /// <see cref="IItemRunner.ClaimLostAsync"/>, <see cref="IWorkSource.RenewClaimAsync"/>): under the item's run lock the item is
+    /// paused — Paused <c>claim lost: &lt;reason&gt;</c> from a handled state, then <c>parked</c> with the reason, which names
+    /// the other claimant; an item already paused (one that resumes by itself) is parked where it is — and the item is told once,
+    /// with what resumes it. Deliberately parked, so it is not one of the pauses that resume by themselves
+    /// (<see cref="ResumesAutomatically"/>): someone else is working the item, the factory writes nothing more to it, no poll lists
+    /// it (so its claim is not renewed either), and only a person's <c>factory run</c> takes it up again, from where it paused.
+    /// Typed outcome: deferred (set aside, not judged), like every pause. Returns what was done, or null when nothing was: the
+    /// ledger does not know the item, it is being stopped (the stop gives the item back anyway), its run is active (that run goes
+    /// on — the board's claims are advisory — and the next poll finds the claim lost again), or it is in a state a lost claim does
+    /// not matter in (a plan waiting on its stories, a merged item).
+    /// </summary>
+    public static async Task<string?> ClaimLostAsync(IWorkSource source, WorkLedger ledger, IRunLocks locks, int storyId, string reason,
+        TextWriter log, CancellationToken ct, IControls? controls = null)
+    {
+        var id = source.Naming.Format(storyId);
+        if (await ledger.FindAsync(source.Naming.Source, id, ct) is not { } known)
+        {
+            return null;
+        }
+        if (await (controls ?? NoControls.Instance).EffectiveAsync(known.ExternalId, known.EpicId, ct) == ControlState.Stopping)
+        {
+            return null;
+        }
+        await using var runLock = await locks.TryAcquireAsync(known.Id, ct);
+        if (runLock is null)
+        {
+            log.WriteLine($"[{known.State}] {id} lost its claim ({reason}) while a run of it is active; not touching it.");
+            return null;
+        }
+        await ledger.RefreshAsync(known, known.Title, known.Repo, known.EpicId, ct);
+        var from = known.State == WorkState.Paused ? (await ledger.ContextAsync(known, ct)).PausedFrom : known.State;
+        if (from is not { } pausedAt || !HandledStates.Contains(pausedAt))
+        {
+            return null;
+        }
+        if (known.State != WorkState.Paused)
+        {
+            await ledger.RecordAsync(known, WorkState.Paused, null, $"{ClaimLost}: {reason}", ct);
+        }
+        await ledger.CheckpointAsync(known, Steps.Parked, null, $"{ClaimLost}: {reason}", ct);
+        log.WriteLine($"[paused] {id} parked: {ClaimLost}: {reason}");
+        try
+        {
+            await source.CommentAsync(storyId,
+                $"{id}: the factory lost its claim on this {source.Naming.Noun} — {reason} — so it paused its work on it (at {pausedAt}) "
+                + "and writes nothing more to it. Once the item is the factory's to work again (the other claim released or lapsed), "
+                + $"run `factory run {id}` to resume it where it paused, or `factory stop --item {id}` to give it up.", ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            log.WriteLine($"[paused] could not comment on {id}: {ex.Message}");
+            return $"paused ({ClaimLost}: {reason}); comment NOT posted: {ex.Message}";
+        }
+        return $"paused ({ClaimLost}: {reason})";
+    }
+
     /// <summary>Records Escalated and comments on the story. Returns why the comment failed, or null.</summary>
     private async Task<string?> EscalateAsync(Run run, string reason)
     {
