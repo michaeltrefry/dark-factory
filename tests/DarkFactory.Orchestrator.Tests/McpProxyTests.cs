@@ -647,14 +647,16 @@ public class McpProxyTests
     /// <summary>A triage checkout that is a fixed local directory (left in place, so the test can read it after the run).</summary>
     private sealed class DirWorkspaces(string dir) : Git.IRepoWorkspace
     {
-        public Task<Git.Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct) =>
+        public Task<Git.Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) =>
             Task.FromResult(new Git.Workspace(dir, branch, "main", Path.Combine(dir, ".admin")));
         public Task RemoveAsync(RepoRef repo, Git.Workspace workspace, CancellationToken ct) => Task.CompletedTask;
         public Task<bool> CommitAndPushAsync(RepoRef repo, Git.Workspace workspace, string message, PushGrant grant, CancellationToken ct) =>
             throw new NotSupportedException();
         public Task PushAsync(RepoRef repo, Git.Workspace workspace, CancellationToken ct) => throw new NotSupportedException();
-        public Task<Git.Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct) => throw new NotSupportedException();
-        public Task<Git.Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct) => throw new NotSupportedException();
+        public Task<Git.Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) => throw new NotSupportedException();
+        public Task<Git.Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) => throw new NotSupportedException();
+        public Task<Git.BranchStart> BranchStartAsync(RepoRef repo, string branch, CancellationToken ct) => throw new NotSupportedException();
+        public Task<string> CreateBranchAsync(RepoRef repo, string branch, string sha, CancellationToken ct) => throw new NotSupportedException();
         public Task<string> HeadAsync(Git.Workspace workspace, CancellationToken ct) => throw new NotSupportedException();
         public Task<BaseMerge> MergeBaseAsync(RepoRef repo, Git.Workspace workspace, CancellationToken ct) => throw new NotSupportedException();
         public Task<IReadOnlyList<string>> ConflictMarkersAsync(RepoRef repo, string sha, IReadOnlyList<string> paths, CancellationToken ct) =>

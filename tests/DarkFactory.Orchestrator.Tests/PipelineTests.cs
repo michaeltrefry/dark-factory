@@ -161,21 +161,46 @@ public class RunPipelineTests
         public Func<Task>? OnPush { get; set; }
         /// <summary>Runs on each restore of a branch's worktree (e.g. as a fix round starts), before it returns.</summary>
         public Action? OnRestore { get; set; }
-        public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct)
+        /// <summary>The base each worktree was asked for (sc-25872): the branch, then its base (null: the default branch).</summary>
+        public List<(string Branch, string? Base)> Bases { get; } = [];
+        public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null)
         {
             Calls.Add($"restore {repo} {branch}");
+            Bases.Add((branch, baseBranch));
             OnRestore?.Invoke();
-            return Task.FromResult(new Workspace($"{Root}/{branch}", branch, "main", $"/clone/.git/worktrees/{branch}"));
+            return Task.FromResult(new Workspace($"{Root}/{branch}", branch, baseBranch ?? "main", $"/clone/.git/worktrees/{branch}"));
         }
-        public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct)
+        public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null)
         {
             Calls.Add($"prepare {repo} {branch}");
-            return Task.FromResult(new Workspace($"{Root}/{branch}", branch, "main", $"/clone/.git/worktrees/{branch}"));
+            Bases.Add((branch, baseBranch));
+            return Task.FromResult(new Workspace($"{Root}/{branch}", branch, baseBranch ?? "main", $"/clone/.git/worktrees/{branch}"));
         }
-        public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct)
+        public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null)
         {
             Calls.Add($"reopen {repo} {branch}");
-            return Task.FromResult(worktreeExists ? new Workspace($"{Root}/{branch}", branch, "main", $"/clone/.git/worktrees/{branch}") : null);
+            return Task.FromResult(worktreeExists ? new Workspace($"{Root}/{branch}", branch, baseBranch ?? "main", $"/clone/.git/worktrees/{branch}") : null);
+        }
+        /// <summary>Origin's branches other than the default (a plan's changeset branch, sc-25872), each with its head.</summary>
+        public Dictionary<string, string> RemoteBranches { get; } = new(StringComparer.Ordinal);
+        /// <summary>The default branch's head as the next fetch finds it.</summary>
+        public string DefaultHead { get; set; } = "base0";
+        /// <summary>Every branch creation asked for: the branch and the commit (whether or not origin already had the branch).</summary>
+        public List<(string Branch, string Sha)> BranchCreations { get; } = [];
+        /// <summary>Throws from the next branch creation (a push that failed), once.</summary>
+        public Exception? FailBranchCreation { get; set; }
+        public Task<BranchStart> BranchStartAsync(RepoRef repo, string branch, CancellationToken ct) =>
+            Task.FromResult(new BranchStart("main", DefaultHead, RemoteBranches.GetValueOrDefault(branch)));
+        public Task<string> CreateBranchAsync(RepoRef repo, string branch, string sha, CancellationToken ct)
+        {
+            BranchCreations.Add((branch, sha));
+            if (FailBranchCreation is { } failure)
+            {
+                FailBranchCreation = null;
+                throw failure;
+            }
+            RemoteBranches.TryAdd(branch, sha);
+            return Task.FromResult(RemoteBranches[branch]);
         }
         /// <summary>The grant of each push: the worker sessions it publishes (E4).</summary>
         public List<PushGrant> Grants { get; } = [];
@@ -574,6 +599,33 @@ public class RunPipelineTests
         await ledger.RecordAsync(item, WorkState.Escalated, null, "boom", CancellationToken.None);
         Assert.False(await RunPipeline.WorktreeIsResumableAsync(ledger, "factory-sc-77", CancellationToken.None)); // Escalated
         Assert.False(await RunPipeline.WorktreeIsResumableAsync(ledger, "not-ours", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Startup_sweep_keeps_a_plan_items_changeset_worktree_while_a_fix_round_on_it_can_resume()
+    {
+        // sc-25872: the changeset pull request's fix rounds work in the changeset branch's worktree, factory-changeset-<plan item>.
+        var h = new Harness();
+        var ledger = h.Ledger;
+        Assert.False(await RunPipeline.WorktreeIsResumableAsync(ledger, "factory-changeset-sc-77", CancellationToken.None)); // no item
+        var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", "A plan", Sandbox.FullName, null, CancellationToken.None);
+        foreach (var state in new[] { WorkState.Plan, WorkState.Planned, WorkState.Review })
+        {
+            await ledger.RecordAsync(item, state, null, null, CancellationToken.None);
+        }
+        Assert.False(await RunPipeline.WorktreeIsResumableAsync(ledger, "factory-changeset-sc-77", CancellationToken.None)); // Review: no worktree in use
+        await ledger.RecordAsync(item, WorkState.Fixing, null, "abc", CancellationToken.None);
+        Assert.True(await RunPipeline.WorktreeIsResumableAsync(ledger, "factory-changeset-sc-77", CancellationToken.None));
+        await ledger.RecordAsync(item, WorkState.Paused, null, "interrupted", CancellationToken.None);
+        Assert.True(await RunPipeline.WorktreeIsResumableAsync(ledger, "factory-changeset-sc-77", CancellationToken.None));
+        Assert.False(await RunPipeline.WorktreeIsResumableAsync(ledger, "factory-changeset-sc-78", CancellationToken.None));
+        Assert.False(await RunPipeline.WorktreeIsResumableAsync(ledger, "factory-changeset-triage-gh-77", CancellationToken.None));
+        // The names: a changeset branch is under factory/, and is never an item's own branch.
+        Assert.Equal("factory/changeset-sc-77", ItemNaming.Shortcut.ChangesetBranchName(77));
+        Assert.True(ItemNaming.IsChangesetBranch("factory/changeset-sc-77"));
+        Assert.False(ItemNaming.IsChangesetBranch(ItemNaming.Shortcut.BranchName(77)));
+        Assert.False(ItemNaming.IsChangesetBranch("main"));
+        Assert.False(ItemNaming.IsChangesetBranch(null));
     }
 
     [Theory]

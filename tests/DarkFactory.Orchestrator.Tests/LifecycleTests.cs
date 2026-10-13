@@ -18,6 +18,7 @@ public class LifecycleTests
     [InlineData(Plan, Implement)]
     [InlineData(Plan, Planned)] // sc-25870: a plan item's stories are on the board; it waits on them
     [InlineData(Planned, Done)] // sc-25871: every story of the plan merged and the plan was closed out
+    [InlineData(Planned, Review)] // sc-25872: every story merged; the plan item takes its changeset's pull request through the gate
     [InlineData(Implement, Review)]
     [InlineData(Review, Fixing)]
     [InlineData(Fixing, Review)]
@@ -127,6 +128,20 @@ public class LifecycleTests
             TransitionContext.From([Intake, Implement, Review, Fixing, Paused, Fixing, Review, Paused]));
         Assert.Equal(new TransitionContext(null, 0),
             TransitionContext.From([Intake, Implement, Review, Fixing, Review, CI, MergeGate, Merge, Watch, Implement]));
+    }
+
+    [Fact]
+    public void A_plan_items_changeset_rounds_are_counted_since_it_last_waited_on_its_stories()
+    {
+        // sc-25872: a plan item has no Implement. Its changeset pull request's fix rounds share the one count and cap, and a re-run
+        // after an escalation (Intake → Plan → Planned → Review) starts the count again, as a re-run's Implement does.
+        WorkState[] history = [Intake, Plan, Planned, Review, Fixing, Review, CI, CIHealing, CI, MergeGate, Fixing, Review];
+        Assert.Equal(3, TransitionContext.From(history).FixRounds);
+        Assert.False(Legal(Review, Fixing, TransitionContext.From(history)));
+        Assert.Equal(0, TransitionContext.From([.. history, Escalated, Intake, Plan, Planned, Review]).FixRounds);
+        Assert.Equal(1, TransitionContext.From([.. history, Escalated, Intake, Plan, Planned, Review, Fixing]).FixRounds);
+        // A plan item goes nowhere else from Planned: nothing implements it.
+        Assert.All(new[] { Implement, Fixing, CI, MergeGate, Merge, Watch, Intake }, to => Assert.False(Legal(Planned, to)));
     }
 
     [Fact]

@@ -284,6 +284,40 @@ public class CargoIdentifyTests
     }
 
     [Fact]
+    public async Task A_changesets_new_cargo_tests_are_the_union_of_its_stories_tests_each_judged_on_the_default_branch_base()
+    {
+        // sc-25872: two stories of a plan each added a test (an inline one, an integration one); the changeset pull request's head
+        // holds both, and against the default-branch base both are new and both are run there.
+        var inline = Lib.Replace("split(' ')", "split_whitespace()").Replace("}\n}\n", "}\n    #[test]\n    fn blank() { assert_eq!(words(\"  \"), 0); }\n}\n");
+        var runner = With(Runner(("Cargo.toml", Manifest), ("src/lib.rs", Lib)),
+            ("src/lib.rs", inline), // story A
+            ("tests/api.rs", "#[test] fn counts_tabs() { assert_eq!(words::words(\"a\\tb\"), 2); }\n")); // story B
+
+        var set = await Identify(runner);
+        var result = await Check(runner);
+
+        Assert.Equal(["words:lib:tests::blank", "words:test/api:counts_tabs"], set.Tests.Order(StringComparer.Ordinal));
+        Assert.Equal(NewTestsOutcome.Pass, result.Outcome);
+        Assert.Equal("rust-cargo", result.Strategy);
+        Assert.Equal(["words:lib:tests::blank", "words:test/api:counts_tabs"], result.Tests.Select(t => t.Test).Order(StringComparer.Ordinal));
+        // On the base: story A's test grafted into the base's own file, story B's new test file applied whole.
+        var onBase = runner.Runs[0];
+        Assert.Equal(Head, onBase.OverlayFrom);
+        Assert.Equal(["src/lib.rs", "tests/api.rs"], onBase.OverlayPaths.Order(StringComparer.Ordinal));
+        Assert.Contains("s.split(' ').count()", onBase.Replacements["src/lib.rs"]);
+
+        // A story's test that already passes on the default branch is named, and the changeset is rejected.
+        runner.Runs.Clear();
+        runner.Answer = spec => new TestRunReport(TestRunStatus.Ran, spec.Steps.Where(s => s.Phase == TestPhase.Test).ToDictionary(s => s.CaptureOutput!,
+            s => (IReadOnlyList<TestCaseResult>)[new TestCaseResult(s.CaptureOutput!, spec.OverlayFrom is null || s.CaptureOutput!.EndsWith("counts_tabs", StringComparison.Ordinal)
+                ? TestCaseResult.Passed : TestCaseResult.Failed)]), "ran");
+        var rejected = await Check(runner);
+        Assert.Equal(NewTestsOutcome.Rejected, rejected.Outcome);
+        Assert.Contains("words:test/api:counts_tabs", rejected.Reason);
+        Assert.DoesNotContain("tests::blank", rejected.Reason);
+    }
+
+    [Fact]
     public async Task Tests_are_named_per_package_and_target_in_a_workspace()
     {
         var runner = With(Runner(

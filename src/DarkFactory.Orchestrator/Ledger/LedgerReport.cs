@@ -30,7 +30,9 @@ public static class LedgerReport
     /// The PR's description: the item it implements (and, for an issue, GitHub's closing keyword), then the ledger's facts. Rendered when the
     /// PR is opened and again as the item moves on (at merge).
     /// </summary>
-    public static string PullRequestBody(WorkStory story, IReadOnlyList<LedgerEntry> history, IReadOnlyList<decimal?> sessionCosts)
+    /// <param name="baseBranch">The changeset branch the PR targets when the item is a plan's story (sc-25872); null for the default branch.</param>
+    public static string PullRequestBody(WorkStory story, IReadOnlyList<LedgerEntry> history, IReadOnlyList<decimal?> sessionCosts,
+        string? baseBranch = null)
     {
         var text = new StringBuilder();
         text.Append(CultureInfo.InvariantCulture,
@@ -39,18 +41,53 @@ public static class LedgerReport
         {
             text.Append(CultureInfo.InvariantCulture, $"\nCloses {closes}\n");
         }
+        if (baseBranch is not null)
+        {
+            text.Append("\nBase: ").Append(Code(baseBranch)).Append(", its plan's changeset branch. It reaches the default branch with the rest "
+                + "of the plan, by the changeset's own pull request through the same merge gate.\n");
+        }
         text.Append("\nOpened by Dark Factory.\n\n");
         text.Append(Facts(history, sessionCosts));
         return text.ToString().TrimEnd() + "\n";
+    }
+
+    /// <summary>
+    /// The description of a plan's changeset pull request (sc-25872), written by code: what it merges where, one line per story of
+    /// the plan (<see cref="PlanStoryLines"/>: a story's title is a planner's text, inert in a code span), then the plan item's own
+    /// ledger facts. Rendered when the pull request is opened and again at its merge.
+    /// </summary>
+    public static string ChangesetPullRequestBody(string externalId, string? appUrl, Plans.Changeset changeset, IReadOnlyList<PlanStoryReport> stories,
+        IReadOnlyList<LedgerEntry> history, IReadOnlyList<decimal?> sessionCosts)
+    {
+        var text = new StringBuilder();
+        text.Append(CultureInfo.InvariantCulture,
+            $"Changeset of plan {(appUrl is null ? externalId : $"[{externalId}]({appUrl})")}: merges {Code(changeset.Branch)} into {Code(changeset.Base)}.\n\n");
+        text.Append(CultureInfo.InvariantCulture,
+            $"Each of the plan's {stories.Count} stories was reviewed and merged into {Code(changeset.Branch)} by its own pull request through the ");
+        text.Append("factory's merge gate; this pull request takes them to the default branch together, through the same review, CI and gate.\n\n");
+        PlanStoryLines(text, stories);
+        text.Append("\nOpened by Dark Factory.\n\n");
+        text.Append(Facts(history, sessionCosts));
+        return Clip(text.ToString().TrimEnd(), MaxChangesetReportLength) + "\n";
     }
 
     /// <summary>The board comment that closes an item out once it merged: the merge commit and the ledger's facts.</summary>
     public static string MergedCloseout(string externalId, IReadOnlyList<LedgerEntry> history, IReadOnlyList<decimal?> sessionCosts)
     {
         var merged = history.LastOrDefault(e => e.Step is null && e.State == WorkState.Merge)?.Detail;
-        return $"{WorkSourceComments.Author} {externalId} merged{(merged is null ? "" : $" as {Code(merged)}")} by the factory's merge gate.\n\n"
+        return $"{WorkSourceComments.Author} {externalId} merged{IntoChangeset(history)}{(merged is null ? "" : $" as {Code(merged)}")} by the factory's merge gate.\n\n"
             + Facts(history, sessionCosts).TrimEnd();
     }
+
+    /// <summary>
+    /// " into its plan's changeset branch `…`" when the base the gate recorded for the item's latest merge (<c>merge-files</c>) is a
+    /// changeset branch (sc-25872): such a change is not on the default branch yet. Nothing otherwise.
+    /// </summary>
+    private static string IntoChangeset(IReadOnlyList<LedgerEntry> history) =>
+        Controls.MergeFiles.FromDetail(history.LastOrDefault(e => e.Step == RunPipeline.Steps.MergeFiles)?.Detail) is { } files
+        && ItemNaming.IsChangesetBranch(files.Base)
+            ? $" into its plan's changeset branch {Code(files.Base)}"
+            : "";
 
     /// <summary>The most stories a plan's closeout lists; the rest are counted (a plan holds at most <see cref="Plans.PlanParser.MaxStories"/>).</summary>
     public const int MaxPlanStoriesShown = 40;
@@ -58,15 +95,46 @@ public static class LedgerReport
     /// <summary>
     /// The board comment that closes a plan item out once every story of its plan has merged (sc-25871): one line per story, from
     /// that story's own ledger rows — its typed outcome and state, the merge commit its Merge row holds and its pull request (the
-    /// <c>linked</c> checkpoint). A story's title is a planner's text: inert, in a code span.
+    /// <c>linked</c> checkpoint). A story's title is a planner's text: inert, in a code span. With a changeset (sc-25872) the
+    /// comment is posted only once the changeset's own pull request has merged: <paramref name="changeset"/> is the plan item's own
+    /// rows and session costs, and the comment says where the changeset merged and ends with those facts. <paramref name="note"/>
+    /// says why there was no changeset pull request (an empty changeset).
     /// </summary>
-    public static string PlanCloseout(string externalId, IReadOnlyList<PlanStoryReport> stories)
+    public static string PlanCloseout(string externalId, IReadOnlyList<PlanStoryReport> stories, string? note = null,
+        (IReadOnlyList<LedgerEntry> History, IReadOnlyList<decimal?> SessionCosts)? changeset = null)
     {
         var merged = stories.Count(s => s.History.Any(e => e.Step is null && e.State == WorkState.Merge));
         var text = new StringBuilder();
         text.Append(CultureInfo.InvariantCulture,
             $"{WorkSourceComments.Author} {externalId}'s plan is complete: {merged} of its {stories.Count} stories merged through the factory's merge gate.\n\n");
+        if (changeset is { } own)
+        {
+            var commit = own.History.LastOrDefault(e => e.Step is null && e.State == WorkState.Merge)?.Detail;
+            var into = Controls.MergeFiles.FromDetail(own.History.LastOrDefault(e => e.Step == RunPipeline.Steps.MergeFiles)?.Detail)?.Base;
+            text.Append("Its changeset merged").Append(into is null ? "" : $" into {Code(into)}").Append(commit is null ? "" : $" as {Code(commit)}")
+                .Append(" by the factory's merge gate")
+                .Append(RunPipeline.LinkedPullRequestUrl(own.History.ToList()) is { } pull ? $": {Link(pull)}" : "").Append(".\n\n");
+        }
+        if (note is not null)
+        {
+            text.Append(CultureInfo.InvariantCulture, $"No changeset pull request was opened: {Code(note)}.\n\n");
+        }
         text.Append("**From the factory ledger** (results the orchestrator executed and recorded, never a worker's own report):\n\n");
+        PlanStoryLines(text, stories);
+        if (changeset is { } facts)
+        {
+            text.Append("\nThe changeset's own pull request:\n\n").Append(Facts(facts.History, facts.SessionCosts));
+        }
+        return Clip(text.ToString().TrimEnd(), changeset is null ? MaxFactsLength : MaxChangesetReportLength);
+    }
+
+    /// <summary>A pull request URL as a report shows it: itself when it is a short https URL, else inert in a code span.</summary>
+    private static string Link(string url) =>
+        url.Length <= MaxFragment && Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme == Uri.UriSchemeHttps ? url : Code(url);
+
+    /// <summary>One line per story of a plan, from that story's own ledger rows (at most <see cref="MaxPlanStoriesShown"/>, the rest counted).</summary>
+    private static void PlanStoryLines(StringBuilder text, IReadOnlyList<PlanStoryReport> stories)
+    {
         foreach (var story in stories.Take(MaxPlanStoriesShown))
         {
             var history = story.History.ToList();
@@ -76,16 +144,13 @@ public static class LedgerReport
             text.Append(CultureInfo.InvariantCulture, $"- {story.ExternalId} {Code(story.Title)}: ");
             text.Append(state is null ? "no ledger row" : $"{Outcome(state)} {state.State}");
             text.Append(commit is null ? ", not merged" : $", merged as {Code(commit)}");
-            text.Append(pull is null ? ", no pull request recorded"
-                : pull.Length <= MaxFragment && Uri.TryCreate(pull, UriKind.Absolute, out var uri) && uri.Scheme == Uri.UriSchemeHttps ? $", {pull}"
-                : $", {Code(pull)}");
+            text.Append(pull is null ? ", no pull request recorded" : $", {Link(pull)}");
             text.Append('\n');
         }
         if (stories.Count > MaxPlanStoriesShown)
         {
             text.Append(CultureInfo.InvariantCulture, $"- … and {stories.Count - MaxPlanStoriesShown} more (the ledger has them)\n");
         }
-        return Clip(text.ToString().TrimEnd(), MaxFactsLength);
     }
 
     /// <summary>
@@ -149,6 +214,9 @@ public static class LedgerReport
 
     /// <summary>The longest <see cref="Facts"/> renders (characters; plus a short cut-short line in the worst case).</summary>
     public const int MaxFactsLength = 60_000;
+
+    /// <summary>The most characters of a changeset report (its story lines, then <see cref="Facts"/>): under GitHub's 65,536.</summary>
+    public const int MaxChangesetReportLength = 64_000;
 
     /// <summary>The blocking findings listed per verdict; the rest are counted.</summary>
     public const int MaxBlockingFindingsShown = 10;
@@ -283,7 +351,7 @@ public static class LedgerReport
         var used = TransitionContext.From(transitions.Select(e => e.State).ToList()).FixRounds;
         var text = new StringBuilder();
         text.Append(CultureInfo.InvariantCulture, $"Fix rounds: {used} of {RunPipeline.FixCapOf(history)}\n");
-        var implemented = transitions.FindLastIndex(e => e.State == WorkState.Implement);
+        var implemented = transitions.FindLastIndex(e => TransitionContext.StartsAttempt(e.State));
         var progress = history.Where(e => e.Step == RunPipeline.Steps.FixProgress).Select(e => (Row: e, Progress: FixProgress.FromDetail(e.Detail)))
             .Where(p => p.Progress is not null).ToList();
         var round = 0;

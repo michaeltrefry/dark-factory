@@ -377,8 +377,11 @@ public class PlanPipelineTests
         var rows = await h.Rows();
         Assert.Equal(
             [RunPipeline.Steps.Claimed, RunPipeline.Steps.WorkerStarted, RunPipeline.Steps.Session, RunPipeline.Steps.ModelClass,
-                RunPipeline.Steps.WorkerDone, RunPipeline.Steps.Plan, RunPipeline.Steps.PlanCreating, RunPipeline.Steps.PlanStories],
+                RunPipeline.Steps.WorkerDone, RunPipeline.Steps.Plan, RunPipeline.Steps.PlanCreating, RunPipeline.Steps.Changeset,
+                RunPipeline.Steps.ChangesetPushed, RunPipeline.Steps.PlanStories],
             await h.Steps());
+        // The plan's changeset branch (sc-25872), created from the default branch's head by the orchestrator: no worktree, no worker.
+        Assert.Equal(("factory/changeset-sc-500", "base0"), Assert.Single(h.Workspaces.BranchCreations));
         Assert.Empty(h.Implementer.OrphanStops); // its only session finished: no orphan is looked for
         Assert.Equal(WorkerModelClass.High, rows.Single(r => r.Step == RunPipeline.Steps.ModelClass).Detail);
         Assert.Equal(["a", "b", "c"], Plan.FromDetail(rows.Single(r => r.Step == RunPipeline.Steps.Plan).Detail).Stories.Select(s => s.Key));
@@ -530,7 +533,9 @@ public class PlanPipelineTests
         Assert.Empty(h.Planner!.Seats);
         Assert.Equal(["First story", "Second story", "Third story"], source.Children.Select(c => c.Child.Name));
         var steps = await h.Steps();
-        Assert.Equal([RunPipeline.Steps.Plan, RunPipeline.Steps.PlanCreating, RunPipeline.Steps.PlanStories], steps);
+        // The changeset branch (sc-25872) comes after the stories are on the board and before the row that makes them the plan's.
+        Assert.Equal([RunPipeline.Steps.Plan, RunPipeline.Steps.PlanCreating, RunPipeline.Steps.Changeset, RunPipeline.Steps.ChangesetPushed,
+            RunPipeline.Steps.PlanStories], steps);
         Assert.Equal("sc-9000 sc-9001 sc-9002", (await h.Rows()).Single(r => r.Step == RunPipeline.Steps.PlanStories).Detail);
     }
 

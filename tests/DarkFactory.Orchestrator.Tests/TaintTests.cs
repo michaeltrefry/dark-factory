@@ -119,7 +119,7 @@ public class WorkerTaintTests
     {
         public List<string> Calls { get; } = [];
         private Workspace Ws(string branch) => new(dir, branch, "main", Path.Combine(dir, ".admin"));
-        public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct) { Calls.Add($"prepare {branch}"); return Task.FromResult(Ws(branch)); }
+        public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) { Calls.Add($"prepare {branch}"); return Task.FromResult(Ws(branch)); }
         public Task RemoveAsync(RepoRef repo, Workspace workspace, CancellationToken ct) { Calls.Add("remove"); return Task.CompletedTask; }
         public Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, PushGrant grant, CancellationToken ct)
         {
@@ -127,8 +127,10 @@ public class WorkerTaintTests
             return Task.FromResult(true);
         }
         public Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct) { Calls.Add("push"); return Task.CompletedTask; }
-        public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct) => throw new NotSupportedException();
-        public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct) => throw new NotSupportedException();
+        public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) => throw new NotSupportedException();
+        public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) => throw new NotSupportedException();
+        public Task<BranchStart> BranchStartAsync(RepoRef repo, string branch, CancellationToken ct) => throw new NotSupportedException();
+        public Task<string> CreateBranchAsync(RepoRef repo, string branch, string sha, CancellationToken ct) => throw new NotSupportedException();
         public Task<string> HeadAsync(Workspace workspace, CancellationToken ct) => throw new NotSupportedException();
         public Task<Gate.BaseMerge> MergeBaseAsync(RepoRef repo, Workspace workspace, CancellationToken ct) => throw new NotSupportedException();
         public Task<IReadOnlyList<string>> ConflictMarkersAsync(RepoRef repo, string sha, IReadOnlyList<string> paths, CancellationToken ct) =>

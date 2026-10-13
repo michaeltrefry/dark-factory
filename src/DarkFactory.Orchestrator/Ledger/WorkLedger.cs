@@ -162,6 +162,15 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
             .Where(e => e.WorkItemId == planItemId && e.Step == RunPipeline.Steps.PlanStories)
             .OrderByDescending(e => e.Id).Select(e => e.Detail).FirstOrDefaultAsync(ct)).ToHashSet(StringComparer.Ordinal);
 
+    /// <summary>
+    /// The changeset branch of the plan item <paramref name="planItemId"/> in <paramref name="repo"/> (sc-25872,
+    /// <see cref="Plans.Changeset.Of"/>), read fresh from its <c>changeset</c> rows; null when it has none there.
+    /// </summary>
+    public async Task<Plans.Changeset?> ChangesetOfAsync(long planItemId, Shortcut.RepoRef repo, CancellationToken ct) =>
+        Plans.Changeset.Of(await db.LedgerEntries.AsNoTracking()
+            .Where(e => e.WorkItemId == planItemId && (e.Step == RunPipeline.Steps.Changeset || e.Step == RunPipeline.Steps.ChangesetPushed))
+            .OrderBy(e => e.Id).ToListAsync(ct), repo);
+
     /// <summary>Records that <paramref name="item"/> is a story of the plan item <paramref name="planItemId"/>. Call under the item's run lock.</summary>
     public async Task LinkPlanAsync(WorkItem item, long planItemId, CancellationToken ct)
     {
