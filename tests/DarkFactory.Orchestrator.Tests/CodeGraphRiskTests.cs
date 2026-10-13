@@ -75,7 +75,7 @@ public class CodeGraphRiskTests
         { TestPolicies.V3("medium", "1e3"), "risk.max_hotspot must be off or a number of at least 0" },
         // Version 2 has no CodeGraph keys: one there is unknown (strict per-version key sets).
         { TestPolicies.Standard() + "\n  max_blast_radius: medium", "unknown key 'max_blast_radius' in risk" },
-        { TestPolicies.V3("medium", "off").Replace("version: 3", "version: 4", StringComparison.Ordinal), "version must be 2 or 3" },
+        { TestPolicies.V3("medium", "off").Replace("version: 3", "version: 5", StringComparison.Ordinal), "version must be 2, 3 or 4" },
     };
 
     [Theory]

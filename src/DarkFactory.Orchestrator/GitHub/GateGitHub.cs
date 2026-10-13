@@ -33,6 +33,13 @@ public interface IGateGitHub
     Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct);
 
     /// <summary>
+    /// The GitHub Actions workflow files of the repository's default branch (sc-25873: <see cref="CiTriggers"/> reads their
+    /// triggers before a plan is spent): every <c>.yml</c>/<c>.yaml</c> file directly in <see cref="CiTriggers.Directory"/>, each with
+    /// its text or why it could not be read. Empty when the directory does not exist. Throws when the listing itself cannot be read.
+    /// </summary>
+    Task<IReadOnlyList<WorkflowFile>> GetWorkflowsAsync(RepoRef repo, CancellationToken ct);
+
+    /// <summary>
     /// The log of a failing check (sc-25383): for a check run of GitHub Actions its job's log (at most the last
     /// <see cref="GitHubGate.MaxLogBytes"/>, unprocessed: the caller cleans, redacts and bounds it, <see cref="CiHeal.Excerpt"/>);
     /// when that cannot be read, the check run's own output and annotations, saying why. A commit status has no log.
@@ -138,6 +145,59 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         }
         await GitHubApp.EnsureSuccess(response, $"read {GatePolicy.Path} on {baseRef}", ct);
         return await response.Content.ReadAsStringAsync(ct);
+    }
+
+    /// <summary>At most this many workflow files are read; a repository with more is reported as not read in full.</summary>
+    public const int MaxWorkflows = 50;
+
+    /// <summary>A workflow file larger than this is not read.</summary>
+    public const int MaxWorkflowBytes = 512 * 1024;
+
+    public async Task<IReadOnlyList<WorkflowFile>> GetWorkflowsAsync(RepoRef repo, CancellationToken ct)
+    {
+        // No ref: the contents API answers for the default branch.
+        var token = await ReadTokenAsync(repo, ct);
+        using var request = GitHubApp.Request(HttpMethod.Get, $"repos/{repo.Owner}/{repo.Name}/contents/{CiTriggers.Directory}", "Bearer", token);
+        using var response = await http.SendAsync(request, ct);
+        if (response.StatusCode == HttpStatusCode.NotFound)
+        {
+            return [];
+        }
+        await GitHubApp.EnsureSuccess(response, $"list {CiTriggers.Directory}", ct);
+        List<ContentEntryDto> entries;
+        try
+        {
+            entries = (await response.Content.ReadFromJsonAsync<List<ContentEntryDto>>(ct))!;
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            throw new InvalidOperationException($"GitHub list {CiTriggers.Directory} failed: it is not a directory.");
+        }
+        var found = entries.Where(e => e.Type == "file" && (e.Name.EndsWith(".yml", StringComparison.Ordinal) || e.Name.EndsWith(".yaml", StringComparison.Ordinal)))
+            .OrderBy(e => e.Name, StringComparer.Ordinal).ToList();
+        var files = new List<WorkflowFile>();
+        foreach (var entry in found.Take(MaxWorkflows))
+        {
+            var path = $"{CiTriggers.Directory}/{entry.Name}";
+            if (entry.Size > MaxWorkflowBytes)
+            {
+                files.Add(new WorkflowFile(path, null, $"larger than {MaxWorkflowBytes} bytes"));
+                continue;
+            }
+            using var fileRequest = GitHubApp.Request(HttpMethod.Get,
+                $"repos/{repo.Owner}/{repo.Name}/contents/{CiTriggers.Directory}/{Uri.EscapeDataString(entry.Name)}", "Bearer", token);
+            fileRequest.Headers.Accept.Clear();
+            fileRequest.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github.raw+json"));
+            using var fileResponse = await http.SendAsync(fileRequest, ct);
+            files.Add(fileResponse.IsSuccessStatusCode
+                ? new WorkflowFile(path, await fileResponse.Content.ReadAsStringAsync(ct))
+                : new WorkflowFile(path, null, $"GitHub answered {(int)fileResponse.StatusCode}"));
+        }
+        if (found.Count > MaxWorkflows)
+        {
+            files.Add(new WorkflowFile(CiTriggers.Directory, null, $"more than {MaxWorkflows} workflow files, the first {MaxWorkflows} read"));
+        }
+        return files;
     }
 
     public async Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct)
@@ -355,6 +415,11 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
     private sealed record StatusDto(
         [property: JsonPropertyName("context")] string Context,
         [property: JsonPropertyName("state")] string State);
+
+    private sealed record ContentEntryDto(
+        [property: JsonPropertyName("name")] string Name,
+        [property: JsonPropertyName("type")] string Type,
+        [property: JsonPropertyName("size")] long Size);
 
     private sealed record TreeDto(
         [property: JsonPropertyName("tree")] List<TreeEntryDto> Tree,

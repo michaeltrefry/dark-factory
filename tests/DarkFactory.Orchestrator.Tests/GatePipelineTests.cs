@@ -83,6 +83,8 @@ public class GatePipelineTests
                 : Task.FromResult(Logs.TryGetValue(check.Name, out var log) ? log : $"##[error]{check.Name} failed");
         }
 
+        public Task<IReadOnlyList<WorkflowFile>> GetWorkflowsAsync(RepoRef repo, CancellationToken ct) => Task.FromResult(TestPolicies.Workflows);
+
         public Task<RepoFiles> GetFilesAsync(RepoRef repo, string sha, CancellationToken ct)
         {
             Calls.Add($"files {sha}");

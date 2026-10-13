@@ -296,6 +296,13 @@ public sealed partial class RunPipeline(
         public const string PlanCreating = "plan-creating";
         /// <summary>Plan: the planner's answer broke a rule (Detail: which); no story is created and the item escalates.</summary>
         public const string PlanRejected = "plan-rejected";
+        /// <summary>
+        /// Plan: what the check of a repository's CI workflow triggers found (sc-25873, <see cref="Gate.CiTriggers"/>), when it is not
+        /// "a workflow runs" — Detail is <see cref="Gate.CiTriggerCheck.ToDetail"/>, starting with the repository: <c>blocked: …</c>
+        /// (no workflow can run for a pull request into the plan's changeset branch: no story is created and the item escalates) or
+        /// <c>warning: …</c> (it could not be told; planning goes on). A warning is written when it changes, not every run.
+        /// </summary>
+        public const string CiTriggers = "ci-triggers";
         /// <summary>Plan: the plan's stories are on the board; Detail is their ids, in the plan's order (e.g. <c>sc-12 sc-13</c>).</summary>
         public const string PlanStories = "plan-stories";
         /// <summary>

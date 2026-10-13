@@ -38,6 +38,9 @@ public sealed partial class RunPipeline
                 $"{recorded.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length} stories: {recorded}", ct);
             return;
         }
+        // Before the planner is spent, or a recorded plan's stories are created (sc-25873): a repository whose CI cannot report on
+        // the plan's story pull requests stops the plan here.
+        await EnsureCiTriggersAsync(run, run.Repo, ct);
         Plan plan;
         string? session;
         var reused = ReusesRecordedPlan(history);

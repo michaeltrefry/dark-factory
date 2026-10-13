@@ -162,6 +162,8 @@ public class MergeQueueTests
 
         public Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct) => Task.FromResult<string?>(PolicyText);
 
+        public Task<IReadOnlyList<WorkflowFile>> GetWorkflowsAsync(RepoRef repo, CancellationToken ct) => Task.FromResult(TestPolicies.Workflows);
+
         public Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct)
         {
             Call($"ci {sha}");
