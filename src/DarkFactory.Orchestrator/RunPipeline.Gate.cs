@@ -61,7 +61,15 @@ public sealed partial class RunPipeline
     {
         var history = await ledger.HistoryAsync(run.Item, ct);
         var url = LinkedPullRequestUrl(history) ?? throw new InvalidOperationException($"{run.Item.ExternalId} has no pull request in its ledger.");
-        var (_, number) = GitHubGate.ParsePullUrl(url);
+        var (linked, number) = GitHubGate.ParsePullUrl(url);
+        // An item's pull request is in the item's repository (sc-25873). The number alone names a different pull request in any
+        // other one, so a run whose repository is not the linked one's — a story whose `Repo:` line was edited, a plan item's
+        // run that took another repository's pass for its own — reads, reviews and merges nothing there: the item escalates.
+        if (!string.Equals(linked.FullName, run.Repo.FullName, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException($"{run.Item.ExternalId}'s pull request {url} is in {linked}, but the item works in {run.Repo}: "
+                + $"nothing was read or merged in {run.Repo}. An item's pull request must be in the item's repository.");
+        }
         var pull = await Gate.GitHub.GetPullAsync(run.Repo, number, ct);
         return (history, pull);
     }
@@ -1237,9 +1245,13 @@ public sealed partial class RunPipeline
         }
     }
 
-    /// <summary>The merge commit of <paramref name="pull"/> when it is merged at a head a <see cref="Steps.GatePassed"/> names, else null.</summary>
-    private static string? GatePassedAt(List<LedgerEntry> history, PullFacts pull) =>
-        pull.Merged && history.Any(e => e.Step == Steps.GatePassed && e.Detail == pull.HeadSha) ? pull.MergeCommitSha : null;
+    /// <summary>
+    /// The merge commit of <paramref name="pull"/> when it is merged at a head a <see cref="Steps.GatePassed"/> names, else null.
+    /// A plan item of several repositories (sc-25873) counts only its current pull request's rows
+    /// (<see cref="Plans.Changeset.CurrentPass"/>): the gate passing an earlier repository's changeset says nothing about this one.
+    /// </summary>
+    internal static string? GatePassedAt(IReadOnlyList<LedgerEntry> history, PullFacts pull) =>
+        pull.Merged && Plans.Changeset.CurrentPass(history).Any(e => e.Step == Steps.GatePassed && e.Detail == pull.HeadSha) ? pull.MergeCommitSha : null;
 
     /// <summary>
     /// After a merge call failed: re-reads the PR and returns its merge commit when GitHub merged it at the gated head;
@@ -1292,6 +1304,7 @@ public sealed partial class RunPipeline
                 {
                     await ledger.CheckpointAsync(run.Item, Steps.PrReport, null, await RewriteBodyAsync(run, url, ct), ct);
                 }
+                await EndPassAsync(run, ct);
                 await ledger.RecordAsync(run.Item, WorkState.Planned, null,
                     $"the changeset of {changeset.Repo} merged as {commit}; {left.Count} more to go, in order: {string.Join(", ", left)}", ct);
                 return;
@@ -1310,8 +1323,22 @@ public sealed partial class RunPipeline
         {
             await ledger.CheckpointAsync(run.Item, Steps.PrReport, null, await RewriteBodyAsync(run, prUrl, ct), ct);
         }
+        await EndPassAsync(run, ct);
         await ledger.RecordAsync(run.Item, WorkState.Watch, null, commit, ct);
     }
+
+    /// <summary>
+    /// A plan item's changeset pull request has merged and everything that needed its repository is recorded (sc-25873): outside
+    /// a pass <see cref="WorkItem.Repo"/> is the plan item's primary repository again (<see cref="Run.Primary"/>) — while it waits
+    /// for the next repository, in Watch and Done — so what reads it there (the metrics' sandbox exclusion, the freeze's list of
+    /// repositories in work, the plan's own evaluation) does not depend on which repository happened to merge last. Written
+    /// right before the transition that ends the pass, under the same run lock: a run that dies between the two finds the item
+    /// still in Merge, where <see cref="Plans.Changeset.PassRepo"/> names the pass's repository again from the ledger, and redoes
+    /// both. What a later reader needs of the merged repository is on its rows (<see cref="MergeFiles.Repo"/>,
+    /// <see cref="Steps.ChangesetDelivered"/>, the linked pull request). Nothing to do for any other item.
+    /// </summary>
+    private Task EndPassAsync(Run run, CancellationToken ct) =>
+        run.Changeset is null ? Task.CompletedTask : ledger.RefreshAsync(run.Item, run.Item.Title, run.Primary.FullName, run.Item.EpicId, ct);
 
     /// <summary>Rewrites the merged pull request's description from the ledger; returns the <see cref="Steps.PrReport"/> Detail.</summary>
     private async Task<string> RewriteBodyAsync(Run run, string prUrl, CancellationToken ct)

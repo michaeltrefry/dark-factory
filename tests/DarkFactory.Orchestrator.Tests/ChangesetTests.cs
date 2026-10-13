@@ -221,10 +221,16 @@ public partial class ChangesetPipelineTests
 
         // ---- IGateGitHub ----
 
+        /// <summary>How many times a pull request of this repository was read.</summary>
+        public int PullReads { get; private set; }
+        /// <summary>Called (outside the lock) with the pull request's number and the head asked for, before every merge call is answered.</summary>
+        public Action<int, string>? OnMerge { get; set; }
+
         public Task<PullFacts> GetPullAsync(RepoRef repo, int number, CancellationToken ct)
         {
             lock (_gate)
             {
+                PullReads++;
                 var pull = _pulls[number - 1];
                 var head = pull.MergedHead ?? Branches[pull.Head];
                 var merged = pull.MergeCommit is not null;
@@ -297,6 +303,7 @@ public partial class ChangesetPipelineTests
 
         public Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct)
         {
+            OnMerge?.Invoke(number, headSha);
             lock (_gate)
             {
                 var pull = _pulls[number - 1];

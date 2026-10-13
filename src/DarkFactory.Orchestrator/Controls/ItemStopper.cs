@@ -270,19 +270,22 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
         var steps = history.Skip(history.FindLastIndex(e => e.Step is null) + 1).ToList();
         var session = history.LastOrDefault(e => e.ClaudeSessionId is not null)?.ClaudeSessionId;
         // The item's pull request is its own branch's, or — a plan item's — its changeset branch's (sc-25872).
-        var branch = Plans.Changeset.Of(history, RepoRef.Parse(item.Repo))?.Branch ?? source.Naming.BranchName(storyId);
+        // Every changeset of the plan, wherever it is: the item's own repository is the one it works in now, which need not hold
+        // one (sc-25873: a plan whose stories are all in another repository than the plan item's first, stopped outside a pass).
+        var changesets = Plans.Changeset.All(history);
+        var branch = changesets.FirstOrDefault()?.Branch ?? source.Naming.BranchName(storyId);
         // A plan's story the ledger knows but the factory never claimed (parked on a refused claim, e.g. a blocker that had not
         // merged): there is no work, claim or branch of it, and its comment does not say there was.
         var unclaimed = plan is null && item.PlanItemId is not null && !history.Any(e => e.Step == RunPipeline.Steps.Claimed);
 
-        // A plan of several repositories (sc-25873) has a changeset branch in each: the open pull request of every one is drafted.
-        var changesets = Plans.Changeset.All(history);
+        // A plan has a changeset branch in each repository it has a story in (sc-25873): the open pull request of every one is
+        // drafted, in the changeset's own repository. An item with no changeset: its own branch's, in its own repository.
         var several = changesets.Count > 1 ? Plans.Changeset.States(history, RepoRef.Parse(item.Repo), item.State) : null;
         var drafted = steps.LastOrDefault(e => e.Step == RunPipeline.Steps.PrsDrafted)?.Detail;
         if (drafted is null)
         {
             var prs = new List<string>();
-            foreach (var (repo, head) in several is null ? [(RepoRef.Parse(item.Repo), branch)] : changesets.Select(c => (RepoRef.Parse(c.Repo), c.Branch)))
+            foreach (var (repo, head) in changesets.Count == 0 ? [(RepoRef.Parse(item.Repo), branch)] : changesets.Select(c => (RepoRef.Parse(c.Repo), c.Branch)))
             {
                 prs.AddRange(await pullRequests.ConvertOpenToDraftAsync(repo, head, ct));
             }

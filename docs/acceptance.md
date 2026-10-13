@@ -615,6 +615,19 @@ escalates after the upstream merged (partial delivery, then fixed and re-run), S
 that died after the first repository's branch or between the two changesets, an empty changeset skipped in the order, a
 hand-moved story refused while it waits on a changeset; and by `MultiRepoPlanTests`: every validation refusal.
 
+Also covered only by `MultiRepoPipelineTests` (review fixes, 2026-10-13), none exercised live: the merge order when a later
+repository's stories merge first (its changeset pull request is not opened before the earlier one's `changeset-delivered`); a run
+that loaded the plan item before another process moved it to the next repository (the pass's repository is decided under the run
+lock); an item whose linked pull request is in another repository than the run's (escalates; nothing read or merged there); a
+second pass not held by the first one's CI triage, fix-round cap or `gate-passed` (a changeset pull request found merged counts
+only by a `gate-passed` of its own pass naming that head); the plan item carrying the recorded spelling of the pass's repository
+and its primary repository again outside a pass; a plan whose stories are all in its second repository (gated and merged there,
+`merge-files` names it, Stop drafts its pull request); a `plan` checkpoint that no longer reads back (nothing released, claims
+refused); a plan story whose `Repo:` line was edited to the plan's other repository (escalates); and the wording of a CI-trigger
+block or "not configured" refusal on a run that continues a plan whose stories already exist. When P4-AT2 is run live, check on
+the plan item's row that `Repo` is the first `Repo:` line's repository once it is back in `Planned` and in `Watch`, and the
+second repository's only between its changeset pull request opening and merging.
+
 ## P4-AT3 (proxy part) — a planner grant over two repositories (sc-25874)
 
 `PlanAcceptanceTests.P4_AT3_a_planner_grant_over_two_repositories_answers_for_each_and_refuses_a_third_project_and_off_list_tools`:

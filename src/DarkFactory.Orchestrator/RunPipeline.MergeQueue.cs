@@ -506,9 +506,11 @@ public sealed partial class RunPipeline
         EnsureBase(run, pull);
         // What this merge changes, for the freeze (sc-25387): recorded before the merge, so every factory merge has it.
         var files = DiffPaths.Of(await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct));
-        // A plan item of several repositories names the one merged into (sc-25873): its own repository is the next changeset's later.
-        var several = run.Changeset is not null && Plans.Changeset.Ordered(await ledger.HistoryAsync(run.Item, ct), run.Repo).Count > 1;
-        await ledger.CheckpointAsync(run.Item, Steps.MergeFiles, null, new MergeFiles(pull.BaseRef, files, several ? run.Repo.FullName : null).ToDetail(), ct);
+        // A plan item's changeset merge names the repository merged into (sc-25873): the item's own is that repository only while
+        // it takes this pull request through the gate — afterwards its primary one again, which need not be this one (the next
+        // changeset's repository, or a plan whose stories are all in another repository than the plan item's first).
+        await ledger.CheckpointAsync(run.Item, Steps.MergeFiles, null,
+            new MergeFiles(pull.BaseRef, files, run.Changeset is not null ? run.Repo.FullName : null).ToDetail(), ct);
         await ledger.CheckpointAsync(run.Item, Steps.GatePassed, null, pull.HeadSha, ct);
         MergeResult merged;
         try
@@ -542,7 +544,9 @@ public sealed partial class RunPipeline
     /// <summary>
     /// A run that stopped after GitHub merged but before the ledger said so (a crash, Ctrl-C during the merge call, then an
     /// "unpaused" row): only a commit this gate passed counts. gate-passed is bound to its head SHA, so one anywhere in the
-    /// item's history proves the merged head is a commit the gate let through.
+    /// item's history proves the merged head is a commit the gate let through — for a plan item of several repositories
+    /// (sc-25873) anywhere in its current pull request's rows (<see cref="GatePassedAt"/>): an earlier repository's gate pass
+    /// never vouches for this one's pull request.
     /// </summary>
     private async Task RecordFoundMergedAsync(Run run, List<LedgerEntry> history, PullFacts pull, CancellationToken ct)
     {

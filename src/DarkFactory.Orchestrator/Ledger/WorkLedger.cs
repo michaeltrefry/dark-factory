@@ -129,7 +129,10 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
         CancellationToken ct)
     {
         var wanted = states.ToList();
-        var items = await db.WorkItems.AsNoTracking().Where(x => (source == null || x.Source == source) && x.Repo == repo && wanted.Contains(x.State))
+        // One repository whatever case an item's `Repo:` line spells it in (GitHub's names are case-insensitive, and the queue's
+        // lock key is lower-cased too): two spellings must never make two merge queues of one repository.
+        var lower = repo.ToLowerInvariant();
+        var items = await db.WorkItems.AsNoTracking().Where(x => (source == null || x.Source == source) && x.Repo.ToLower() == lower && wanted.Contains(x.State))
             .OrderBy(x => x.Id)
             .ToListAsync(ct);
         var ids = items.Select(i => i.Id).ToList();
