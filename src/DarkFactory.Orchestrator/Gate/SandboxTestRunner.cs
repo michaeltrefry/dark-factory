@@ -38,7 +38,15 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
 
     public Task<string?> ReadAsync(RepoRef repo, string sha, string path, CancellationToken ct) => git.ReadFileAsync(repo, sha, path, ct);
 
-    public async Task<TestRunReport> RunAsync(RepoRef repo, TestRunSpec spec, CancellationToken ct)
+    /// <summary>
+    /// Sandboxed, the whole run — its worktree, every step and the worktree's deletion as the worker user — happens under the
+    /// sandbox user's lock (<see cref="WorkerSandbox.Lock"/>, sc-25988): the gate's test phase holds it already (and waited for it
+    /// honouring Pause and Stop); a caller that holds none waits for it here.
+    /// </summary>
+    public Task<TestRunReport> RunAsync(RepoRef repo, TestRunSpec spec, CancellationToken ct) =>
+        sandbox?.Lock is { } held ? held.HoldAsync(() => RunLockedAsync(repo, spec, ct), ct) : RunLockedAsync(repo, spec, ct);
+
+    private async Task<TestRunReport> RunLockedAsync(RepoRef repo, TestRunSpec spec, CancellationToken ct)
     {
         if (spec.ResultsDirectory is not { Length: > 0 } name || name.Contains('/') || name.Contains('\\') || name is "." or "..")
         {

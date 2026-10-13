@@ -307,10 +307,6 @@ public sealed partial class RunPipeline
             ? PlanRelease.PlanUnfinishedRefusal(PlannedStory.ParentOf(story.Description))
             : null;
 
-    /// <summary>Whether the item is a plan item waiting on its stories: its run needs no worker, so no worker run lock or sandbox.</summary>
-    public static async Task<bool> WaitsOnStoriesAsync(WorkLedger ledger, ItemNaming naming, int storyId, CancellationToken ct) =>
-        await ledger.StateOfAsync(naming.Source, naming.Format(storyId), ct) == WorkState.Planned;
-
     /// <summary>
     /// Planned (sc-25871): one evaluation of a plan item waiting on its stories, under its run lock, with no worker. The orchestrator,
     /// not a person, releases the plan's stories: each one whose blockers are all satisfied (<see cref="PlanRelease.Decide"/>) is moved
@@ -742,12 +738,19 @@ public sealed partial class RunPipeline
     /// behind (<see cref="Steps.WorkerStarted"/> with no <see cref="Steps.WorkerDone"/>) is stopped first, like Implement's orphan.
     /// Returns its answer and its id.
     /// </summary>
-    private async Task<(string? Answer, string? Session, IReadOnlyList<RepoRef> Repos)> PlanSessionAsync(Run run, List<LedgerEntry> history, CancellationToken ct)
+    private Task<(string? Answer, string? Session, IReadOnlyList<RepoRef> Repos)> PlanSessionAsync(Run run, List<LedgerEntry> history, CancellationToken ct)
     {
         if (planner is null)
         {
             throw new InvalidOperationException($"{run.Item.ExternalId} is a plan item, but this pipeline has no planner.");
         }
+        // A worker phase (sc-25988): the orphan's stop, the seat's sweeps and checkouts, the session and the seat's removal.
+        return InWorkerPhaseAsync(run.Item, "plan", () => PlanSeatAsync(run, history, planner, ct), ct);
+    }
+
+    private async Task<(string? Answer, string? Session, IReadOnlyList<RepoRef> Repos)> PlanSeatAsync(Run run, List<LedgerEntry> history,
+        Plans.IPlanRunner planner, CancellationToken ct)
+    {
         // Before the seat is set up: its sweep removes the checkout a crashed run's planner would still be reading.
         var attempt = CurrentWorkerAttempt(history);
         if (OrphanedWorkerPid(attempt) is { } pid && await worker.StopOrphanAsync(pid, ct))

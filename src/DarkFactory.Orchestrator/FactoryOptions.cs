@@ -145,7 +145,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     /// owner's git), so the default is the root-anchored dir <c>setup-worker-user.sh</c> creates.
     /// </summary>
     public string WorkRoot => config["Factory:WorkRoot"]
-        ?? (WorkerSandbox is null
+        ?? (WorkerUser is null
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dark-factory")
             : DefaultSandboxWorkRoot);
 
@@ -156,13 +156,19 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
 
     /// <summary>
     /// <c>Worker:RunAs</c> (default <c>_factory</c>) runs workers as that macOS user through
-    /// <c>Worker:LaunchHelper</c>; <c>none</c> runs them as the owner (development only).
+    /// <c>Worker:LaunchHelper</c>; <c>none</c> runs them as the owner (development only). The sandbox carries the work root's
+    /// <see cref="WorkerLock"/> (sc-25988): every run of the helper, by any run of this process or another, happens under it.
     /// </summary>
-    public Worker.WorkerSandbox? WorkerSandbox => (config["Worker:RunAs"] ?? Worker.WorkerSandbox.DefaultUser) switch
+    public Worker.WorkerSandbox? WorkerSandbox => WorkerUser is { } user
+        ? new Worker.WorkerSandbox(user, config["Worker:LaunchHelper"] ?? Worker.WorkerSandbox.DefaultHelperPath) { Lock = WorkerLock.For(WorkRoot) }
+        : null;
+
+    /// <summary><c>Worker:RunAs</c>: the sandbox user, or null for <c>none</c>.</summary>
+    private string? WorkerUser => (config["Worker:RunAs"] ?? Worker.WorkerSandbox.DefaultUser) switch
     {
         "none" => null,
         "" => throw new InvalidOperationException("Worker:RunAs must be a macOS user name or 'none'."),
-        var user => new Worker.WorkerSandbox(user, config["Worker:LaunchHelper"] ?? Worker.WorkerSandbox.DefaultHelperPath),
+        var user => user,
     };
 
     /// <summary><c>Worker:Auth</c> = <c>router-key</c> (default) or <c>claude-login</c> (weaker, violates E5); see <see cref="Worker.WorkerAuth"/>.</summary>
@@ -219,6 +225,17 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     public int MaxItemFailures => config.GetValue("Intake:MaxItemFailures", WorkSources.IntakeOptions.DefaultMaxItemFailures) is var n && n > 0
         ? n
         : throw new InvalidOperationException("Intake:MaxItemFailures must be at least 1.");
+
+    /// <summary>
+    /// <c>Intake:MaxConcurrentRuns</c> (sc-25988): how many items <c>factory work</c> runs at once, 1 (the default: one after
+    /// another) to <see cref="WorkSources.IntakeOptions.MaxConcurrentRunsLimit"/>. Runs overlap only outside the phases that use
+    /// the sandbox user (<see cref="WorkerLock"/>).
+    /// </summary>
+    public int MaxConcurrentRuns => config.GetValue("Intake:MaxConcurrentRuns", WorkSources.IntakeOptions.DefaultMaxConcurrentRuns) is var n
+        && n is >= 1 and <= WorkSources.IntakeOptions.MaxConcurrentRunsLimit
+        ? n
+        : throw new InvalidOperationException(
+            $"Intake:MaxConcurrentRuns must be a whole number from 1 to {WorkSources.IntakeOptions.MaxConcurrentRunsLimit}.");
 
     /// <summary>
     /// The automatic freeze's thresholds (<see cref="Controls.FreezeOptions"/>): <c>Freeze:MaxConsecutiveFailures</c> (≥ 1),
@@ -440,7 +457,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     /// </summary>
     public void ValidateSettings()
     {
-        _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSandbox, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures);
+        _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSandbox, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures, MaxConcurrentRuns);
         _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
         _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl, KanbanMcpUrl);
         _ = (CodeGraphOverlayTimeout, KanbanWatchScope, KanbanWebUrl);

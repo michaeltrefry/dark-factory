@@ -514,7 +514,17 @@ public sealed class ClaudeWorker(
         WorkerCallbacks? callbacks, CancellationToken ct) =>
         RunAsync(workingDirectory, prompt, resumeSessionId, modelClass, callbacks, null, ct);
 
-    public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
+    /// <summary>
+    /// Sandboxed, the whole session runs under the sandbox user's lock (<see cref="WorkerSandbox.Lock"/>, sc-25988): the run's
+    /// worker phase holds it already (and waited for it honouring Pause and Stop); a caller that holds none waits for it here.
+    /// </summary>
+    public Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
+        WorkerCallbacks? callbacks, string? mcpConfigPath, CancellationToken ct) =>
+        sandbox?.Lock is { } held
+            ? held.HoldAsync(() => RunLockedAsync(workingDirectory, prompt, resumeSessionId, modelClass, callbacks, mcpConfigPath, ct), ct)
+            : RunLockedAsync(workingDirectory, prompt, resumeSessionId, modelClass, callbacks, mcpConfigPath, ct);
+
+    private async Task<WorkerResult> RunLockedAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
         WorkerCallbacks? callbacks, string? mcpConfigPath, CancellationToken ct)
     {
         if (!WorkerModelClass.IsValid(modelClass))
