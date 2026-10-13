@@ -277,7 +277,9 @@ public static class FactoryRunner
             stuck: stuck,
             maxControlReadFailures: maxControlReadFailures,
             // A plan item's planner session (sc-25870): read-only, in its own throwaway worktree, CodeGraph and Kanban through the proxy.
-            planner: new SandboxPlanRunner(options, sandbox, app, upstreams, log));
+            planner: new SandboxPlanRunner(options, sandbox, app, upstreams, log),
+            // Built without the worker run lock (a waiting plan item): the run does nothing that needs it.
+            workerless: !needsWorker);
 
         return await pipeline.RunAsync(storyId, ct);
     }

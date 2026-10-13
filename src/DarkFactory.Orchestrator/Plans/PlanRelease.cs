@@ -27,13 +27,21 @@ public static class PlanRelease
         (detail ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
     /// <summary>
-    /// The one place a blocker counts as satisfied: the factory's ledger has its Merge row — its change went through the merge gate,
-    /// into whatever base its pull request targets. A blocker the ledger has never seen, one still in flight, one that escalated or
-    /// was cancelled, and one a person finished by hand on the board are all unsatisfied: nothing but a recorded merge releases a
-    /// dependent. <paramref name="history"/> is the blocker's ledger rows, null when the ledger does not know it.
+    /// Whether the factory merged an item: its ledger has a Merge row — its change went through the merge gate, into whatever base
+    /// its pull request targets. <paramref name="history"/> is the item's ledger rows, null when the ledger does not know it.
     /// </summary>
     public static bool Satisfied(IReadOnlyList<LedgerEntry>? history) =>
         history?.Any(e => e.Step is null && e.State == WorkState.Merge) == true;
+
+    /// <summary>
+    /// The one place a blocker counts as satisfied. A blocker that is a story of the plan (<paramref name="ofPlan"/>) is satisfied
+    /// only by its ledger Merge row: one still in flight, one that escalated or was cancelled, and one a person finished by hand on
+    /// the board are all unsatisfied. A blocker outside the plan is satisfied by its Merge row or once the board shows it finished
+    /// (<paramref name="finishedOnBoard"/>, <see cref="WorkSources.Blocker.Finished"/>: done, not archived): it is work the factory
+    /// may never do, and a person finishing it is the natural release.
+    /// </summary>
+    public static bool Satisfied(IReadOnlyList<LedgerEntry>? history, bool ofPlan, bool finishedOnBoard) =>
+        Satisfied(history) || (!ofPlan && finishedOnBoard);
 
     /// <summary>
     /// Decides a waiting plan. <paramref name="stories"/> are the plan's, in plan order; <paramref name="released"/> those a
@@ -62,9 +70,26 @@ public static class PlanRelease
         return new ReleaseDecision(release, held, stories.Count > 0 && stories.All(satisfied));
     }
 
-    /// <summary>Why a story's claim is refused while <paramref name="unsatisfied"/> block it: it names each blocker.</summary>
-    public static string Refusal(IReadOnlyList<string> unsatisfied) =>
-        $"{BlockedPrefix}{string.Join(", ", unsatisfied)} (not merged): a story of a plan starts only once the factory has merged every story that blocks it";
+    /// <summary>
+    /// Why a story's claim is refused while <paramref name="unsatisfied"/> block it: it names each blocker, and for those of them
+    /// that are not stories of its plan (<paramref name="outside"/>) what a person can do about it.
+    /// </summary>
+    public static string Refusal(IReadOnlyList<string> unsatisfied, IReadOnlyList<string>? outside = null) =>
+        $"{BlockedPrefix}{string.Join(", ", unsatisfied)} (not merged): a story of a plan starts only once the factory has merged every story of the plan that blocks it"
+        + (outside is { Count: > 0 } ? $"; {string.Join(", ", outside)}: {OutsideRemedy}" : "");
+
+    /// <summary>What a blocker outside the plan is and what releases its dependent, as a held story's record and a claim refusal say it.</summary>
+    public const string OutsideRemedy = "not a story of this plan, and neither merged by the factory nor finished on the board: finish it or remove the relation on the board";
+
+    /// <summary>The claim refusal of a planner-authored story the ledger links to no plan (<see cref="RunPipeline.ClaimRefused"/> precedes it).</summary>
+    public static string PlanUnfinishedRefusal(string? plan) =>
+        $"{PlanUnfinishedPrefix}{plan ?? "(not named)"} has not finished creating its stories: the story starts once the plan's run has recorded them";
+
+    private const string PlanUnfinishedPrefix = "its plan ";
+
+    /// <summary>Whether a Paused row's detail is a claim refused because the story's plan is unfinished (<see cref="PlanUnfinishedRefusal"/>).</summary>
+    public static bool IsPlanUnfinishedRefusal(string? detail) =>
+        detail?.StartsWith($"{RunPipeline.ClaimRefused}: {PlanUnfinishedPrefix}", StringComparison.Ordinal) == true;
 
     /// <summary>Whether a Paused row's detail is a claim refused for an unsatisfied blocker (<see cref="Refusal"/>).</summary>
     public static bool IsBlockedRefusal(string? detail) =>
@@ -76,5 +101,41 @@ public static class PlanRelease
     /// </summary>
     public static string HeldByOutsiders(IEnumerable<HeldStory> held) =>
         string.Join("; ", held.Where(h => h.Outside.Count > 0)
-            .Select(h => $"{h.Id} held by {string.Join(", ", h.Outside)} (not a story of this plan, not merged by the factory)"));
+            .Select(h => $"{h.Id} held by {string.Join(", ", h.Outside)} ({OutsideRemedy})"));
+
+    /// <summary>The <c>plan-held</c> record of a story that cannot be released because it is archived on its board.</summary>
+    public static string HeldArchived(string story) =>
+        $"{story} is archived on the board, so it was not released and the plan cannot complete: unarchive it";
+
+    /// <summary>The <c>plan-held</c> record of a story the plan released that waits in the backlog again (a person moved it back).</summary>
+    public static string HeldBackInBacklog(string story) =>
+        $"{story} was released and is back in the backlog: nothing picks it up there and the plan does not release it again; moving it to the board's ready state restarts it";
+
+    /// <summary>The words a <c>plan-held</c> row starts with when the plan could not be evaluated at all (<see cref="RunPipeline.GiveUpAsync"/>).</summary>
+    public const string NotEvaluatedPrefix = "not evaluated: ";
+
+    /// <summary>
+    /// The plan's own blockers of each story (<paramref name="stories"/>: the ids <c>plan-stories</c> lists, in plan order), from the
+    /// plan its <c>plan</c> checkpoint holds; null when that checkpoint does not read back as a plan of those stories (then
+    /// nothing is known and the board is asked about every story).
+    /// </summary>
+    public static IReadOnlyDictionary<string, IReadOnlyList<string>>? RecordedBlockers(string? planDetail, IReadOnlyList<string> stories)
+    {
+        Plan plan;
+        try
+        {
+            plan = Plan.FromDetail(planDetail);
+        }
+        catch (PlanFormatException)
+        {
+            return null;
+        }
+        if (plan.Stories.Count != stories.Count)
+        {
+            return null;
+        }
+        var id = plan.Stories.Select((s, i) => (s.Key, Id: stories[i])).ToDictionary(x => x.Key, x => x.Id, StringComparer.Ordinal);
+        return plan.Stories.ToDictionary(s => id[s.Key],
+            s => (IReadOnlyList<string>)s.BlockedBy.Where(id.ContainsKey).Select(b => id[b]).ToList(), StringComparer.Ordinal);
+    }
 }

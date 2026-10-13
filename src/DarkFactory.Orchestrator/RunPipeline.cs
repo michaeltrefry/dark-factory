@@ -86,8 +86,17 @@ public sealed partial class RunPipeline(
     FactoryFreeze? freeze = null,
     StuckDetection? stuck = null,
     int? maxControlReadFailures = null,
-    Plans.IPlanRunner? planner = null)
+    Plans.IPlanRunner? planner = null,
+    bool workerless = false)
 {
+    /// <summary>
+    /// Whether this run was built without the worker run lock and the sandbox probe (sc-25871: <see cref="FactoryRunner"/> does so for a
+    /// plan item waiting on its stories). Such a run only evaluates a waiting plan (<see cref="PlannedAsync"/>): anything that could
+    /// reach a worker, the sandbox helper or a worktree — a Stop, or an item that is no longer waiting — is left to the next run,
+    /// which takes the lock.
+    /// </summary>
+    private readonly bool _workerless = workerless;
+
     /// <summary>
     /// Reads of an item's controls in a row that may fail while a worker or the gate's test runs go on (<c>Controls:MaxReadFailures</c>);
     /// the next failure counts as a Pause (E2: a check that cannot run counts as failed), recorded as <see cref="ControlsUnreadablePaused"/>.
@@ -402,17 +411,17 @@ public sealed partial class RunPipeline(
         var stops = new List<int>();
         var ids = new List<int>();
         var active = await ledger.ActiveItemsAsync(naming.Source, ct);
-        // A merged item whose closeout failed is listed until it is posted or its attempts are used up (a run retries it from Watch).
-        var closeouts = handled.Contains(WorkState.Merge)
-            ? await ledger.CloseoutRowsAsync(active.Where(i => i.State == WorkState.Watch).Select(i => i.Id).ToList(), ct)
-            : Array.Empty<LedgerEntry>().ToLookup(e => e.WorkItemId);
+        // A merged item whose closeout failed is listed until it is posted or its attempts are used up (a run retries it from Watch);
+        // a finished plan whose closeout failed likewise (it waits in Planned).
+        var closeouts = await ledger.CloseoutRowsAsync(active.Where(i => i.State == WorkState.Planned
+            || (i.State == WorkState.Watch && handled.Contains(WorkState.Merge))).Select(i => i.Id).ToList(), ct);
         foreach (var item in active)
         {
             var beingStopped = stopping.Contains(ControlScope.Item(item.ExternalId));
             if (!beingStopped)
             {
                 var resumable = handled.Contains(item.State)
-                    || item.State == WorkState.Planned
+                    || (item.State == WorkState.Planned && !PlanCloseoutAbandoned(item.State, closeouts[item.Id]))
                     || CloseoutPending(item.State, closeouts[item.Id])
                     || (item.State == WorkState.Paused && ResumesAutomatically(await ledger.HistoryAsync(item, ct), handled));
                 if (!resumable || await controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) != ControlState.Running)
@@ -448,6 +457,15 @@ public sealed partial class RunPipeline(
         // Decide from the ledger (and the controls) before reading anything from the board.
         var known = await ledger.FindAsync(Naming.Source, Naming.Format(storyId), ct);
         var knownControl = known is null ? ControlState.Running : await _controls.EffectiveAsync(known.ExternalId, known.EpicId, ct);
+        if (_workerless && (known?.State != WorkState.Planned || knownControl == ControlState.Stopping))
+        {
+            // Decided since the runner looked (a Stop landed, or the item moved): this run holds no worker run lock, so it must not
+            // stop an orphaned worker (sandboxed: every worker-user process) or touch a worktree while another process's worker runs.
+            var why = knownControl == ControlState.Stopping ? "stop deferred to the next run" : "deferred to the next run";
+            log.WriteLine($"[{known?.State.ToString() ?? "intake"}] {Naming.Format(storyId)}: {why} (this run was started without the worker run lock)");
+            return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null,
+                $"{Naming.Format(storyId)}: {why}; this run was started without the worker run lock");
+        }
         if (known is not null && knownControl == ControlState.Stopping)
         {
             // A stop is finished even while the factory is frozen: it starts no new work.
@@ -496,6 +514,12 @@ public sealed partial class RunPipeline(
             log.WriteLine($"[intake] {Naming.Format(storyId)} is {control} by a control; not claiming it.");
             return new RunOutcome(0, WorkState.Intake, null, null, $"{Naming.Format(storyId)} is {control} by a control; not claimed.");
         }
+        // A story parked because its plan never recorded it (sc-25871) and still listed ready: nothing is written while that holds.
+        if (known is { State: WorkState.Paused } && await StillWithoutPlanAsync(known, story, ct) is { } unfinished)
+        {
+            log.WriteLine($"[paused] {known.ExternalId} parked: {unfinished}");
+            return await OutcomeAsync(known, $"{known.ExternalId} parked: {unfinished}", ct);
+        }
         var repo = RepoResolver.Resolve(story.Description, defaultRepo);
         var item = await ledger.GetOrCreateAsync(Naming.Source, Naming.Format(storyId), story.Name, repo.FullName, IntakeDetail(story), ct, spec.Epic?.Id);
 
@@ -507,8 +531,11 @@ public sealed partial class RunPipeline(
         }
         // Re-read under the lock: another run may have moved the item since it was loaded.
         await ledger.RefreshAsync(item, story.Name, repo.FullName, spec.Epic?.Id, ct);
-        // A story a plan created records its plan (sc-25871), from the ledger's own record of what the plan created.
-        if (item.PlanItemId is null && source.PlansItems && await ledger.PlanOfAsync(Naming.Source, item.ExternalId, ct) is { } planItem)
+        // A story a plan created records its plan (sc-25871), from the ledger's own record of what the plan created. Looked up
+        // until the item is first claimed: a plan's story is linked before its claim (WithoutPlanAsync refuses one that is not),
+        // so an item that was ever claimed without a link is no plan's story and is not looked up on every later run.
+        if (item.PlanItemId is null && source.PlansItems && !(await ledger.HistoryAsync(item, ct)).Any(e => e.Step == Steps.Claimed)
+            && await ledger.PlanOfAsync(Naming.Source, item.ExternalId, ct) is { } planItem)
         {
             await ledger.LinkPlanAsync(item, planItem, ct);
         }
@@ -750,7 +777,8 @@ public sealed partial class RunPipeline(
         {
             // A story of a plan is not started before its blockers have merged (sc-25871, E7), whoever moved it to ready: the
             // claim is refused before the board is asked for it, the refusal naming the blockers.
-            if (await BlockedAsync(run.Item, run.Story.Id, ct) is { } blocked)
+            // Nor is a story that says a plan created it but that the ledger links to no plan: its blockers cannot be checked.
+            if ((await WithoutPlanAsync(run.Item, run.Story, ct) ?? await BlockedAsync(run.Item, run.Story.Id, ct)) is { } blocked)
             {
                 await ledger.RecordAsync(run.Item, WorkState.Paused, null, $"{ClaimRefused}: {blocked}", ct);
                 await ledger.CheckpointAsync(run.Item, Steps.Parked, null, blocked, ct);
@@ -1640,7 +1668,8 @@ public sealed partial class RunPipeline(
     /// <c>factory work</c> gives up on an item whose runs keep failing before the pipeline starts (E10; see
     /// <see cref="IItemRunner.GiveUpAsync"/>): under the item's run lock, an item in a handled state is escalated with
     /// the usual escalation comment; a paused one (which may not escalate) is parked with a comment, so it no longer
-    /// resumes by itself; an item the ledger does not know gets only the comment. Returns what was done, or null.
+    /// resumes by itself; a plan item waiting on its stories (Planned, sc-25871) gets one comment and one <c>plan-held</c> row per
+    /// reason and stays Planned; an item the ledger does not know gets only the comment. Returns what was done, or null.
     /// </summary>
     public static async Task<string?> GiveUpAsync(IWorkSource source, WorkLedger ledger, IRunLocks locks, int storyId, string reason,
         TextWriter log, CancellationToken ct)
@@ -1668,6 +1697,35 @@ public sealed partial class RunPipeline(
             log.WriteLine($"[escalated] {id}: {reason}");
             var commentError = await PostEscalationCommentAsync(source, ledger, log, known, storyId, ct);
             return commentError is null ? "escalated" : $"escalated; {EscalationCommentNotPosted(commentError)}";
+        }
+        if (known.State == WorkState.Planned)
+        {
+            // A plan waiting on its stories that cannot be evaluated (sc-25871: a story of it deleted on the board, a board read
+            // that keeps failing): it may not escalate (it stays Planned and goes on by itself once the cause is gone), so it is
+            // told once per reason — one comment, one row — and not again while that row is still its last.
+            var detail = Plans.PlanRelease.NotEvaluatedPrefix + reason;
+            if ((await ledger.HistoryAsync(known, ct)).LastOrDefault() is { Step: Steps.PlanHeld } last && last.Detail == detail)
+            {
+                log.WriteLine($"[{known.State}] {id} still cannot be evaluated: {reason}; already commented");
+                return "held; already commented for this reason";
+            }
+            log.WriteLine($"[{known.State}] {id} cannot be evaluated: {reason}");
+            try
+            {
+                await source.CommentAsync(storyId,
+                    $"{id} is a plan waiting on its stories and the factory could not evaluate it, so none of its stories is released "
+                    + "until this is resolved; a human needs to look. Reason:\n"
+                    + UntrustedText.Fenced(LedgerReport.Clip(reason, LedgerReport.MaxReasonLength))
+                    + $"\n{id} stays Planned: the factory evaluates it again every poll and goes on by itself once the cause is gone.", ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                log.WriteLine($"[{known.State}] could not comment on {id}: {ex.Message}");
+                await ledger.CheckpointAsync(known, Steps.PlanHeld, null, $"{detail}; comment NOT posted: {ex.Message}", ct);
+                return $"held; comment NOT posted: {ex.Message}";
+            }
+            await ledger.CheckpointAsync(known, Steps.PlanHeld, null, detail, ct);
+            return "commented";
         }
         if (known.State == WorkState.Paused)
         {

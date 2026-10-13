@@ -102,12 +102,15 @@ public sealed class FakeWorkSource(WorkStory story, bool commentFails = false) :
     public Dictionary<int, List<int>> ExtraBlockers { get; } = [];
 
     /// <summary>A created child's blockers (its plan's, as created) and any <see cref="ExtraBlockers"/>.</summary>
-    public Task<IReadOnlyList<int>> BlockersAsync(int id, CancellationToken ct)
+    public Task<IReadOnlyList<Blocker>> BlockersAsync(int id, CancellationToken ct)
     {
         var blockers = Children.Where(c => c.Id == id).SelectMany(c => c.Child.BlockedBy.Select(b => Children[b].Id))
-            .Concat(ExtraBlockers.GetValueOrDefault(id) ?? []).Distinct().Order().ToList();
-        return Task.FromResult<IReadOnlyList<int>>(blockers);
+            .Concat(ExtraBlockers.GetValueOrDefault(id) ?? []).Distinct().Order().Select(b => new Blocker(b, FinishedOnBoard.Contains(b))).ToList();
+        return Task.FromResult<IReadOnlyList<Blocker>>(blockers);
     }
+
+    /// <summary>The stories the board shows finished (done, not archived).</summary>
+    public HashSet<int> FinishedOnBoard { get; } = [];
 
     /// <summary>The children that left the backlog (released, or moved by hand: add one here).</summary>
     public HashSet<int> OutOfBacklog { get; } = [];
@@ -115,19 +118,21 @@ public sealed class FakeWorkSource(WorkStory story, bool commentFails = false) :
     /// <summary>When set, moving a child to ready throws this (the board is unreachable).</summary>
     public Exception? MakeReadyFails { get; set; }
 
-    public Task<bool> MakeReadyAsync(int id, CancellationToken ct)
+    public Task<ReadyResult> MakeReadyAsync(int id, CancellationToken ct)
     {
         if (MakeReadyFails is { } fails)
         {
-            return Task.FromException<bool>(fails);
+            return Task.FromException<ReadyResult>(fails);
         }
         if (!OutOfBacklog.Add(id))
         {
-            return Task.FromResult(false);
+            return Task.FromResult(ReadyResult.AlreadyLeft);
         }
         Writes.Add($"ready {id}");
-        return Task.FromResult(true);
+        return Task.FromResult(ReadyResult.Moved);
     }
+
+    public Task<bool> InBacklogAsync(int id, CancellationToken ct) => Task.FromResult(Children.Any(c => c.Id == id) && !OutOfBacklog.Contains(id));
 
     private Task Write(string write)
     {

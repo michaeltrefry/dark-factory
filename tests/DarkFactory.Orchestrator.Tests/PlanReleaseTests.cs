@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Reflection;
 using System.Text;
 using System.Text.Json.Nodes;
 using DarkFactory.Orchestrator.Controls;
@@ -9,6 +10,7 @@ using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Time.Testing;
 using static DarkFactory.Orchestrator.Tests.RunPipelineTests;
 
@@ -27,7 +29,59 @@ public class PlanReleaseDecisionTests
             blockers.ToDictionary(b => b.Key, b => (IReadOnlyList<string>)b.Value), merged.Contains);
 
     [Fact]
-    public void Only_a_recorded_merge_satisfies_a_blocker()
+    public void A_story_of_the_plan_is_satisfied_only_by_its_merge_row_and_an_outside_blocker_also_by_the_board_showing_it_finished()
+    {
+        LedgerEntry[] inFlight = [Row(WorkState.Intake), Row(WorkState.Implement), Row(WorkState.Review)];
+        LedgerEntry[] merged = [Row(WorkState.MergeGate), Row(WorkState.Merge), Row(WorkState.Watch)];
+
+        // A story of the plan finished by hand on the board: not satisfied, whatever the board says.
+        Assert.False(PlanRelease.Satisfied(null, ofPlan: true, finishedOnBoard: true));
+        Assert.False(PlanRelease.Satisfied(inFlight, ofPlan: true, finishedOnBoard: true));
+        Assert.True(PlanRelease.Satisfied(merged, ofPlan: true, finishedOnBoard: false));
+        // An outside blocker: the factory's merge, or the board showing it finished.
+        Assert.True(PlanRelease.Satisfied(null, ofPlan: false, finishedOnBoard: true));
+        Assert.True(PlanRelease.Satisfied(inFlight, ofPlan: false, finishedOnBoard: true));
+        Assert.True(PlanRelease.Satisfied(merged, ofPlan: false, finishedOnBoard: false));
+        Assert.False(PlanRelease.Satisfied(null, ofPlan: false, finishedOnBoard: false));
+        Assert.False(PlanRelease.Satisfied(inFlight, ofPlan: false, finishedOnBoard: false));
+    }
+
+    [Fact]
+    public void The_plans_own_blockers_are_read_from_its_plan_checkpoint_by_the_stories_ids()
+    {
+        var plan = PlanParser.Parse(PlanAnswers.Valid); // a; b needs a; c needs a and b
+
+        var own = PlanRelease.RecordedBlockers(plan.ToDetail(), ["sc-1", "sc-2", "sc-3"])!;
+
+        Assert.Empty(own["sc-1"]);
+        Assert.Equal(["sc-1"], own["sc-2"]);
+        Assert.Equal(["sc-1", "sc-2"], own["sc-3"].Order());
+        // A checkpoint that is not a plan of those stories tells nothing: the board is asked instead.
+        Assert.Null(PlanRelease.RecordedBlockers(plan.ToDetail(), ["sc-1", "sc-2"]));
+        Assert.Null(PlanRelease.RecordedBlockers("not a plan", ["sc-1", "sc-2", "sc-3"]));
+        Assert.Null(PlanRelease.RecordedBlockers(null, ["sc-1"]));
+    }
+
+    [Fact]
+    public void The_refusal_of_a_marked_story_without_a_plan_names_the_plan_its_marker_names_and_is_told_from_other_refusals()
+    {
+        Assert.Equal("sc-12", PlannedStory.ParentOf($"Text.\n\n{PlannedStory.Marker("sc-12")}\nMore."));
+        Assert.Null(PlannedStory.ParentOf("No marker."));
+        Assert.Null(PlannedStory.ParentOf(null));
+        // The marker is text anyone may write: a name that is not a plain id is not repeated.
+        Assert.Null(PlannedStory.ParentOf(PlannedStory.Marker("sc-12 [x](http://evil.example)")));
+        Assert.Null(PlannedStory.ParentOf("<!-- dark-factory:planned-from sc-12"));
+
+        var refusal = PlanRelease.PlanUnfinishedRefusal("sc-12");
+        Assert.StartsWith("its plan sc-12 has not finished creating its stories", refusal);
+        Assert.StartsWith("its plan (not named) has not finished creating its stories", PlanRelease.PlanUnfinishedRefusal(null));
+        Assert.True(PlanRelease.IsPlanUnfinishedRefusal($"{RunPipeline.ClaimRefused}: {refusal}"));
+        Assert.False(PlanRelease.IsPlanUnfinishedRefusal($"{RunPipeline.ClaimRefused}: {PlanRelease.Refusal(["sc-12"])}"));
+        Assert.False(PlanRelease.IsPlanUnfinishedRefusal(null));
+    }
+
+    [Fact]
+    public void Only_a_recorded_merge_counts_as_merged()
     {
         Assert.False(PlanRelease.Satisfied(null)); // the ledger has never seen it (e.g. a person finished it by hand)
         Assert.False(PlanRelease.Satisfied([Row(WorkState.Intake), Row(WorkState.Implement), Row(WorkState.Review)]));
@@ -80,7 +134,8 @@ public class PlanReleaseDecisionTests
 
         var held = Assert.Single(Decide(stories, blockers, ["a"], "a").Held);
         Assert.Equal(("b", "sc-777", "sc-777"), (held.Id, string.Join(",", held.By), string.Join(",", held.Outside)));
-        Assert.Equal("b held by sc-777 (not a story of this plan, not merged by the factory)", PlanRelease.HeldByOutsiders([held]));
+        Assert.Equal("b held by sc-777 (not a story of this plan, and neither merged by the factory nor finished on the board: "
+            + "finish it or remove the relation on the board)", PlanRelease.HeldByOutsiders([held]));
         // Only the outsiders are the plan item's to report; the plan's own order is not.
         Assert.Equal("", PlanRelease.HeldByOutsiders(Decide(stories, new() { ["b"] = ["a"] }, []).Held));
 
@@ -113,6 +168,10 @@ public class PlanReleaseDecisionTests
         var refusal = PlanRelease.Refusal(["sc-12", "sc-13"]);
 
         Assert.StartsWith("blocked by sc-12, sc-13 (not merged)", refusal);
+        Assert.DoesNotContain("remove the relation", refusal);
+        // A blocker outside the plan comes with what a person can do about it.
+        Assert.EndsWith("; sc-13: not a story of this plan, and neither merged by the factory nor finished on the board: "
+            + "finish it or remove the relation on the board", PlanRelease.Refusal(["sc-12", "sc-13"], ["sc-13"]));
         Assert.True(PlanRelease.IsBlockedRefusal($"{RunPipeline.ClaimRefused}: {refusal}"));
         Assert.True(RunPipeline.IsClaimRefused($"{RunPipeline.ClaimRefused}: {refusal}"));
         Assert.False(PlanRelease.IsBlockedRefusal($"{RunPipeline.ClaimRefused}: the story is no longer in To Do"));
@@ -155,12 +214,55 @@ public class ShortcutReleaseTests
         await Link(board, 13, "duplicates", 12);
         board.Requests.Clear();
 
-        Assert.Equal([10, 11], await source.BlockersAsync(12, CancellationToken.None));
-        Assert.Equal([12], await source.BlockersAsync(13, CancellationToken.None));
+        Assert.Equal([new Blocker(10, false), new Blocker(11, false)], await source.BlockersAsync(12, CancellationToken.None));
+        Assert.Equal([new Blocker(12, false)], await source.BlockersAsync(13, CancellationToken.None));
         Assert.Empty(await source.BlockersAsync(10, CancellationToken.None));
-        // Reads only: one GET per story.
-        Assert.Equal(["/api/v3/stories/12", "/api/v3/stories/13", "/api/v3/stories/10"], board.Requests.Select(r => r.PathAndQuery));
+        // Reads only: one GET for the story and one per blocker (the workflows once, for the states' types).
+        Assert.Equal(["/api/v3/stories/12", "/api/v3/stories/10", "/api/v3/workflows", "/api/v3/stories/11", "/api/v3/stories/13", "/api/v3/stories/12",
+            "/api/v3/stories/10"], board.Requests.Select(r => r.PathAndQuery));
         Assert.All(board.Requests, r => Assert.Equal(HttpMethod.Get, r.Method));
+    }
+
+    [Fact]
+    public async Task A_blocker_is_finished_when_its_state_is_of_the_type_done_whatever_it_is_called_and_it_is_not_archived()
+    {
+        var board = new FakeShortcutBoard { DoneName = "Shipped" };
+        var source = new ShortcutWorkSource(board.Client(), "tok", new WatchScope(["darkfactory"], []));
+        board.Add(12, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.Backlog);
+        board.Add(10, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.Done);
+        board.Add(11, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.Done);
+        board.Story(11)["archived"] = true;
+        foreach (var (id, state) in new[] { (13, FakeShortcutBoard.Backlog), (14, FakeShortcutBoard.ToDo), (15, FakeShortcutBoard.InProgress), (16, 500000009L) })
+        {
+            board.Add(id, FakeShortcutBoard.FactoryTeam, state);
+        }
+        foreach (var blocker in new[] { 10, 11, 13, 14, 15, 16 })
+        {
+            await Link(board, blocker, "blocks", 12);
+        }
+        board.Requests.Clear();
+
+        var blockers = await source.BlockersAsync(12, CancellationToken.None);
+
+        // Only the story in the state of type "done" that is not archived: no state id or name is compared.
+        Assert.Equal([new Blocker(10, true), new Blocker(11, false), new Blocker(13, false), new Blocker(14, false), new Blocker(15, false),
+            new Blocker(16, false)], blockers);
+        Assert.Empty(Writes(board));
+    }
+
+    [Fact]
+    public async Task A_story_waits_in_the_backlog_only_while_it_is_there_and_not_archived()
+    {
+        var (board, source) = Board();
+        board.Add(20, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.Backlog);
+
+        Assert.True(await source.InBacklogAsync(20, CancellationToken.None));
+        board.Story(20)["workflow_state_id"] = FakeShortcutBoard.ToDo;
+        Assert.False(await source.InBacklogAsync(20, CancellationToken.None));
+        board.Story(20)["workflow_state_id"] = FakeShortcutBoard.Backlog;
+        board.Story(20)["archived"] = true;
+        Assert.False(await source.InBacklogAsync(20, CancellationToken.None));
+        Assert.Empty(Writes(board));
     }
 
     [Fact]
@@ -169,7 +271,7 @@ public class ShortcutReleaseTests
         var (board, source) = Board();
         board.Add(20, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.Backlog);
 
-        Assert.True(await source.MakeReadyAsync(20, CancellationToken.None));
+        Assert.Equal(ReadyResult.Moved, await source.MakeReadyAsync(20, CancellationToken.None));
 
         Assert.Equal(FakeShortcutBoard.ToDo, (long)board.Story(20)["workflow_state_id"]!);
         var put = Assert.Single(Writes(board));
@@ -182,12 +284,16 @@ public class ShortcutReleaseTests
         foreach (var state in new[] { FakeShortcutBoard.ToDo, FakeShortcutBoard.InProgress, FakeShortcutBoard.Done })
         {
             board.Story(20)["workflow_state_id"] = state;
-            Assert.False(await source.MakeReadyAsync(20, CancellationToken.None));
+            Assert.Equal(ReadyResult.AlreadyLeft, await source.MakeReadyAsync(20, CancellationToken.None));
             Assert.Equal(state, (long)board.Story(20)["workflow_state_id"]!);
         }
-        board.Story(20)["workflow_state_id"] = FakeShortcutBoard.Backlog;
-        board.Story(20)["archived"] = true;
-        Assert.False(await source.MakeReadyAsync(20, CancellationToken.None));
+        // An archived story is told apart from one that left the backlog, wherever it is: nothing will ever pick it up.
+        foreach (var state in new[] { FakeShortcutBoard.Backlog, FakeShortcutBoard.ToDo })
+        {
+            board.Story(20)["workflow_state_id"] = state;
+            board.Story(20)["archived"] = true;
+            Assert.Equal(ReadyResult.Archived, await source.MakeReadyAsync(20, CancellationToken.None));
+        }
         Assert.Single(Writes(board));
     }
 
@@ -197,7 +303,7 @@ public class ShortcutReleaseTests
         var (board, source) = Board();
         board.Add(30, FakeShortcutBoard.OtherTeam, FakeShortcutBoard.Backlog);
 
-        Assert.True(await source.MakeReadyAsync(30, CancellationToken.None));
+        Assert.Equal(ReadyResult.Moved, await source.MakeReadyAsync(30, CancellationToken.None));
 
         Assert.Equal(FakeShortcutBoard.ToDo, (long)board.Story(30)["workflow_state_id"]!);
         Assert.False(await source.InScopeAsync(30, CancellationToken.None));
@@ -242,17 +348,25 @@ public class ShortcutReleaseTests
         var handler = new Recorded(responses);
         var source = new ShortcutWorkSource(new HttpClient(handler) { BaseAddress = ShortcutWorkSource.DefaultBaseAddress }, "tok", WatchScope.None);
 
-        Assert.Equal([blocker], await source.BlockersAsync(blocked, CancellationToken.None));
+        // The recorded blocker waits in the Backlog (and was archived after recording): not finished.
+        Assert.Equal([new Blocker(blocker, false)], await source.BlockersAsync(blocked, CancellationToken.None));
         Assert.Empty(await source.BlockersAsync(blocker, CancellationToken.None));
+        // The recorded workflow's own state types: in its state of type "done" and not archived, it is finished.
+        var done = workflows.AsArray().SelectMany(w => w!["states"]!.AsArray()).Single(s => (string?)s!["type"] == "done")!["id"]!.GetValue<long>();
+        var recorded = responses[$"/api/v3/stories/{blocker}"].AsObject();
+        var was = recorded["workflow_state_id"]!.GetValue<long>();
+        (recorded["workflow_state_id"], recorded["archived"]) = (done, false);
+        Assert.Equal([new Blocker(blocker, true)], await source.BlockersAsync(blocked, CancellationToken.None));
+        (recorded["workflow_state_id"], recorded["archived"]) = (was, true);
 
         // Both recorded stories wait in the Backlog; the fixture's own stories were archived after recording, which release leaves alone.
         var story = responses[$"/api/v3/stories/{blocker}"].AsObject();
         Assert.Equal(State("Backlog"), story["workflow_state_id"]!.GetValue<long>());
         Assert.True(story["archived"]!.GetValue<bool>());
-        Assert.False(await source.MakeReadyAsync(blocker, CancellationToken.None));
+        Assert.Equal(ReadyResult.Archived, await source.MakeReadyAsync(blocker, CancellationToken.None));
         story["archived"] = false;
         // The PUT answers the story; the fake serves the same one back.
-        Assert.True(await source.MakeReadyAsync(blocker, CancellationToken.None));
+        Assert.Equal(ReadyResult.Moved, await source.MakeReadyAsync(blocker, CancellationToken.None));
         var put = Assert.Single(handler.Sent, s => s.Method == HttpMethod.Put);
         Assert.Equal($"/api/v3/stories/{blocker}", put.Path);
         Assert.True(JsonNode.DeepEquals(JsonNode.Parse(put.Body!), new JsonObject { ["workflow_state_id"] = State("To Do") }), put.Body);
@@ -294,15 +408,36 @@ public class PlanReleasePipelineTests
         public FakeWorker Implementer { get; } = new(Reports(Ok), Reports(Ok with { SessionId = "sess-78" }));
         public StringWriter Log { get; } = new();
 
-        public Task<RunOutcome> Run(int id = PlanId, bool ignoreScope = false) =>
+        public Task<RunOutcome> Run(int id = PlanId, bool ignoreScope = false, bool workerless = false) =>
             new RunPipeline(Source, Ledger, Locks, Workspaces, Implementer, Prs, Sandbox, Log, controls: Controls,
-                controlPollInterval: TimeSpan.FromMilliseconds(10), ignoreScope: ignoreScope).RunAsync(id, CancellationToken.None);
+                controlPollInterval: TimeSpan.FromMilliseconds(10), ignoreScope: ignoreScope, workerless: workerless).RunAsync(id, CancellationToken.None);
+
+        public Task<string?> GiveUp(string reason) =>
+            RunPipeline.GiveUpAsync(Source, Ledger, Locks, PlanId, reason, Log, CancellationToken.None);
+
+        /// <summary>The board's GETs of one story since the requests were last cleared.</summary>
+        public int Reads(int story) => Board.Requests.Count(r => r.Method == HttpMethod.Get && r.PathAndQuery == $"/api/v3/stories/{story}");
+
+        public async Task<List<string?>> Held() =>
+            (await Rows()).Where(r => r.Step == RunPipeline.Steps.PlanHeld).Select(r => r.Detail).ToList();
+
+        public List<string> Comments(int story) => Board.Requests
+            .Where(r => r.Method == HttpMethod.Post && r.PathAndQuery == $"/api/v3/stories/{story}/comments")
+            .Select(r => (string)JsonNode.Parse(r.Body!)!["text"]!).ToList();
 
         /// <summary>
         /// The plan item as its Plan step leaves it (sc-25870): the plan's stories on the board in the Backlog with their blockers, the
         /// ledger at Planned with <c>plan-stories</c> recorded. Returns the stories' ids in plan order.
         /// </summary>
         public async Task<int[]> Planned(string answer)
+        {
+            var ids = await Creating(answer);
+            await Recorded(ids);
+            return ids;
+        }
+
+        /// <summary>The plan item as a Plan step that died while creating leaves it: its stories on the board, no <c>plan-stories</c> row.</summary>
+        public async Task<int[]> Creating(string answer)
         {
             var plan = PlanParser.Parse(answer);
             var ids = await Source.CreateChildrenAsync(PlanId, plan.Children($"sc-{PlanId}", Sandbox), CancellationToken.None);
@@ -311,11 +446,19 @@ public class PlanReleasePipelineTests
             await ledger.RecordAsync(item, WorkState.Plan, null, null, CancellationToken.None);
             await ledger.CheckpointAsync(item, RunPipeline.Steps.Plan, "plan-sess", plan.ToDetail(), CancellationToken.None);
             await ledger.CheckpointAsync(item, RunPipeline.Steps.PlanCreating, "plan-sess", null, CancellationToken.None);
+            Board.Requests.Clear();
+            return [.. ids];
+        }
+
+        /// <summary>The Plan step's last two rows: the created stories recorded, and the item waiting on them.</summary>
+        public async Task Recorded(IReadOnlyList<int> ids)
+        {
+            var ledger = Ledger;
+            var item = (await ledger.FindAsync(RunPipeline.Source, $"sc-{PlanId}", CancellationToken.None))!;
             var stories = string.Join(' ', ids.Select(i => $"sc-{i}"));
             await ledger.CheckpointAsync(item, RunPipeline.Steps.PlanStories, "plan-sess", stories, CancellationToken.None);
             await ledger.RecordAsync(item, WorkState.Planned, "plan-sess", $"{ids.Count} stories: {stories}", CancellationToken.None);
             Board.Requests.Clear();
-            return [.. ids];
         }
 
         public static string Pr(int id) => $"https://github.com/michaeltrefry/dark-factory-sandbox/pull/{id}";
@@ -415,33 +558,118 @@ public class PlanReleasePipelineTests
         Assert.Empty(h.Writes(PlanId));
     }
 
+    private const string OutsideRemedy =
+        "not a story of this plan, and neither merged by the factory nor finished on the board: finish it or remove the relation on the board";
+
     [Fact]
-    public async Task A_blocker_outside_the_plan_holds_the_story_and_the_plan_item_says_which_once()
+    public async Task A_blocker_outside_the_plan_holds_the_story_until_the_board_shows_it_finished_and_the_plan_item_says_which_once()
     {
         var h = new Harness();
         var ids = await h.Planned(PlanAnswers.Answer(PlanAnswers.Story("a", "First story"), PlanAnswers.Story("b", "Second story")));
         var (a, b) = (ids[0], ids[1]);
-        h.Board.Add(777, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.Done, name: "Someone else's story, finished by hand");
+        h.Board.Add(777, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.InProgress, name: "Someone else's story");
         await h.Link(777, b);
 
         await h.Run();
 
-        // The outside blocker is done on the board, but the factory never merged it: it holds B, and the plan item names it.
+        // The outside blocker is neither merged by the factory nor finished on the board: it holds B, and the plan item names it
+        // with what a person can do about it.
         Assert.Equal((FakeShortcutBoard.ToDo, FakeShortcutBoard.Backlog), (h.State(a), h.State(b)));
         var held = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.PlanHeld);
-        Assert.Equal(($"sc-{b} held by sc-777 (not a story of this plan, not merged by the factory)", StepOutcome.Deferred), (held.Detail, held.Outcome));
+        Assert.Equal(($"sc-{b} held by sc-777 ({OutsideRemedy})", StepOutcome.Deferred), (held.Detail, held.Outcome));
 
         // Said once, not every poll.
         await h.Run();
         await h.Run();
-        Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.PlanHeld);
+        Assert.Single(await h.Held());
         Assert.Equal(FakeShortcutBoard.Backlog, h.State(b));
 
-        // The factory merges it (or someone removes the relation): B is released.
-        await h.Merged(777);
+        // Archived in its done state is not finished: it still holds B.
+        h.Board.Story(777)["workflow_state_id"] = FakeShortcutBoard.Done;
+        h.Board.Story(777)["archived"] = true;
+        await h.Run();
+        Assert.Equal(FakeShortcutBoard.Backlog, h.State(b));
+        Assert.Single(await h.Held());
+
+        // A person finishes it on the board: B is released, though the factory's ledger never saw the blocker.
+        h.Board.Story(777)["archived"] = false;
         await h.Run();
         Assert.Equal(FakeShortcutBoard.ToDo, h.State(b));
         Assert.Equal([$"sc-{a}", $"sc-{b}"], await h.Released());
+    }
+
+    [Fact]
+    public async Task A_blocker_outside_the_plan_that_the_factory_merged_releases_the_story_whatever_the_board_shows()
+    {
+        var h = new Harness();
+        var ids = await h.Planned(PlanAnswers.Answer(PlanAnswers.Story("a", "Only story")));
+        h.Board.Add(777, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.InProgress, name: "Someone else's story");
+        await h.Link(777, ids[0]);
+        await h.Run();
+        Assert.Empty(await h.Released());
+
+        await h.Merged(777);
+        await h.Run();
+
+        Assert.Equal([$"sc-{ids[0]}"], await h.Released());
+    }
+
+    [Fact]
+    public async Task A_story_of_the_plan_finished_by_hand_on_the_board_without_a_merge_row_satisfies_nothing()
+    {
+        var h = new Harness();
+        var ids = await h.Planned(Chain);
+        var (a, b) = (ids[0], ids[1]);
+        await h.Run();
+        // Someone drags A to Done: the factory never merged it.
+        h.Board.Story(a)["workflow_state_id"] = FakeShortcutBoard.Done;
+
+        for (var poll = 0; poll < 3; poll++)
+        {
+            Assert.Equal(WorkState.Planned, (await h.Run()).State);
+        }
+
+        Assert.Equal(FakeShortcutBoard.Backlog, h.State(b));
+        Assert.Equal([$"sc-{a}"], await h.Released());
+
+        // Moved to ready by hand, B's claim is refused by the same rule: the board's Done does not stand in for A's merge.
+        h.Board.Story(b)["workflow_state_id"] = FakeShortcutBoard.ToDo;
+        h.Board.Requests.Clear();
+        var refused = await h.Run(b);
+
+        Assert.Equal(WorkState.Paused, refused.State);
+        Assert.Contains($"sc-{b} parked: blocked by sc-{a} (not merged)", refused.Error);
+        Assert.DoesNotContain("remove the relation", refused.Error);
+        Assert.Empty(h.Writes());
+    }
+
+    [Fact]
+    public async Task The_claim_of_a_plan_story_holds_an_outside_blocker_to_the_same_rule_and_names_the_remedy()
+    {
+        var h = new Harness();
+        var ids = await h.Planned(PlanAnswers.Answer(PlanAnswers.Story("a", "First story"), PlanAnswers.Story("b", "Second story")));
+        var b = ids[1];
+        await h.Run();
+        Assert.Equal(FakeShortcutBoard.ToDo, h.State(b));
+        // Someone relates an unfinished story of their own to B after its release.
+        h.Board.Add(777, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.ToDo, name: "Someone else's story");
+        await h.Link(777, b);
+
+        var refused = await h.Run(b);
+
+        Assert.Equal(WorkState.Paused, refused.State);
+        Assert.Contains($"sc-{b} parked: blocked by sc-777 (not merged)", refused.Error);
+        Assert.EndsWith($"; sc-777: {OutsideRemedy}", refused.Error);
+        Assert.Empty(h.Writes());
+        Assert.Empty(h.Implementer.Calls);
+
+        // Finished on the board: the claim goes through.
+        h.Board.Story(777)["workflow_state_id"] = FakeShortcutBoard.Done;
+        var started = await h.Run(b);
+
+        Assert.Null(started.Error);
+        Assert.Equal(FakeShortcutBoard.InProgress, h.State(b));
+        Assert.Single(h.Implementer.Calls);
     }
 
     [Theory]
@@ -637,7 +865,7 @@ public class PlanReleasePipelineTests
     }
 
     [Fact]
-    public async Task A_closeout_the_board_keeps_refusing_is_tried_a_bounded_number_of_times_and_the_plan_still_finishes_saying_so()
+    public async Task A_closeout_the_board_keeps_refusing_is_tried_a_bounded_number_of_times_then_left_to_a_person_with_the_plan_still_shown()
     {
         var h = new Harness();
         var ids = await h.Planned(PlanAnswers.Answer(PlanAnswers.Story("a", "Only story")));
@@ -646,18 +874,32 @@ public class PlanReleasePipelineTests
             ? new HttpResponseMessage(HttpStatusCode.InternalServerError)
             : null;
 
-        for (var attempt = 1; attempt < RunPipeline.MaxCloseoutAttempts; attempt++)
+        RunOutcome last = null!;
+        for (var attempt = 1; attempt <= RunPipeline.MaxCloseoutAttempts; attempt++)
         {
-            Assert.Equal(WorkState.Planned, (await h.Run()).State);
+            Assert.Equal([PlanId], await h.InFlight());
+            last = await h.Run();
+            Assert.Equal(WorkState.Planned, last.State);
         }
-        var last = await h.Run();
 
-        Assert.Equal(WorkState.Done, last.State);
+        // Like a merged item in Watch: the item stays where it is, saying the closeout is left to a person.
+        Assert.Contains($"{RunPipeline.MaxCloseoutAttempts} attempts made: post it by hand", last.Error);
         var rows = await h.Rows();
         Assert.Equal(RunPipeline.MaxCloseoutAttempts, rows.Count(r => r.Step == RunPipeline.Steps.Closeout));
-        Assert.Equal($"1 stories merged; closeout NOT posted after {RunPipeline.MaxCloseoutAttempts} attempts: post it by hand", rows.Last().Detail);
-        await h.Run();
-        Assert.Equal(RunPipeline.MaxCloseoutAttempts, h.Writes(PlanId).Count(w => w.Method == HttpMethod.Post));
+        Assert.DoesNotContain(rows, r => r.Step is null && r.State == WorkState.Done);
+        // The dashboard keeps showing it, no longer as being retried.
+        var shown = Assert.Single(await new Dashboard.DashboardData(h.Contexts, h.Time).ActiveItemsAsync(CancellationToken.None), r => r.ExternalId == $"sc-{PlanId}");
+        Assert.Equal((RunPipeline.MaxCloseoutAttempts, false), (shown.FailedCloseout!.Attempts, shown.CloseoutRetrying));
+
+        // No poll lists it any more, and a run by hand tries nothing and writes nothing, even once the board answers again.
+        Assert.Empty(await h.InFlight());
+        h.Board.Intercept = null;
+        h.Board.Requests.Clear();
+        var again = await h.Run();
+        Assert.Equal(WorkState.Planned, again.State);
+        Assert.Contains("post it by hand", again.Error);
+        Assert.Empty(h.Writes());
+        Assert.Equal(rows.Count, (await h.Rows()).Count);
     }
 
     [Fact]
@@ -666,7 +908,7 @@ public class PlanReleasePipelineTests
         var h = new Harness();
         var ids = await h.Planned(Chain);
         // The earlier run moved A on the board and died before recording it; A's own run has claimed it since.
-        Assert.True(await h.Source.MakeReadyAsync(ids[0], CancellationToken.None));
+        Assert.Equal(ReadyResult.Moved, await h.Source.MakeReadyAsync(ids[0], CancellationToken.None));
         h.Board.Story(ids[0])["workflow_state_id"] = FakeShortcutBoard.InProgress;
         h.Board.Requests.Clear();
 
@@ -694,12 +936,348 @@ public class PlanReleasePipelineTests
 
         Assert.Equal([$"sc-{ids[0]}"], await h.Released());
         Assert.Equal(WorkState.Planned, (await h.Db.WorkItems.AsNoTracking().SingleAsync(i => i.ExternalId == $"sc-{PlanId}")).State);
-        Assert.Null(await RunPipeline.GiveUpAsync(h.Source, h.Ledger, h.Locks, PlanId, "3 runs failed", TextWriter.Null, CancellationToken.None));
 
         h.Board.Intercept = null;
         await h.Run();
         Assert.Equal([$"sc-{ids[0]}", $"sc-{ids[1]}"], await h.Released());
         Assert.Equal(1, h.Board.Requests.Count(r => r.Method == HttpMethod.Put && r.PathAndQuery.EndsWith($"/stories/{ids[0]}", StringComparison.Ordinal)));
+    }
+
+    private static Func<HttpRequestMessage, HttpResponseMessage?> Failing(HttpMethod method, string pathEnd) => r =>
+        r.Method == method && r.RequestUri!.AbsolutePath.EndsWith(pathEnd, StringComparison.Ordinal)
+            ? new HttpResponseMessage(HttpStatusCode.InternalServerError)
+            : null;
+
+    [Fact]
+    public async Task A_plan_that_cannot_be_evaluated_is_given_up_on_with_one_comment_and_one_row_per_reason_stays_planned_and_recovers()
+    {
+        var h = new Harness();
+        var ids = await h.Planned(PlanAnswers.Answer(PlanAnswers.Story("a", "First story"), PlanAnswers.Story("b", "Second story")));
+        // Shortcut answers 500 for A: its blockers cannot be read.
+        h.Board.Intercept = Failing(HttpMethod.Get, $"/stories/{ids[0]}");
+        var before = (await h.Rows()).Count;
+        var reason = "";
+        // Two streaks of failing polls, each ending in the intake loop giving up on the item for the same reason.
+        foreach (var expected in new[] { "commented", "held; already commented for this reason" })
+        {
+            for (var run = 0; run < IntakeOptions.DefaultMaxItemFailures; run++)
+            {
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => h.Run());
+                reason = $"{IntakeOptions.DefaultMaxItemFailures} runs in a row failed before the pipeline could start; last error: {ex.GetType().Name}: {ex.Message}";
+            }
+            // The failing evaluations released nothing — not even B, whose own read works — and recorded nothing.
+            Assert.Empty(await h.Released());
+            Assert.Equal(FakeShortcutBoard.Backlog, h.State(ids[1]));
+            Assert.DoesNotContain(h.Board.Requests, r => r.Method == HttpMethod.Put);
+
+            Assert.Equal(expected, await h.GiveUp(reason));
+        }
+
+        var comment = Assert.Single(h.Comments(PlanId));
+        Assert.Contains($"sc-{PlanId} is a plan waiting on its stories and the factory could not evaluate it", comment);
+        Assert.Contains($"stories/{ids[0]} failed: 500", comment);
+        Assert.Contains($"sc-{PlanId} stays Planned", comment);
+        var held = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.PlanHeld);
+        Assert.Equal(($"not evaluated: {reason}", StepOutcome.Deferred), (held.Detail, held.Outcome));
+        Assert.Equal(before + 1, (await h.Rows()).Count);
+        Assert.Equal(WorkState.Planned, (await h.Db.WorkItems.AsNoTracking().SingleAsync(i => i.ExternalId == $"sc-{PlanId}")).State);
+        Assert.Equal([PlanId], await h.InFlight());
+
+        // Another reason is said too.
+        Assert.Equal("commented", await h.GiveUp("another reason"));
+        Assert.Equal(2, h.Comments(PlanId).Count);
+
+        // The board answers again: the plan goes on by itself.
+        h.Board.Intercept = null;
+        var ok = await h.Run();
+        Assert.Null(ok.Error);
+        Assert.Equal([$"sc-{ids[0]}", $"sc-{ids[1]}"], await h.Released());
+    }
+
+    [Fact]
+    public async Task A_give_up_comment_the_board_refuses_is_recorded_as_not_posted_and_posted_by_the_next_give_up()
+    {
+        var h = new Harness();
+        await h.Planned(PlanAnswers.Answer(PlanAnswers.Story("a", "Only story")));
+        h.Board.Intercept = Failing(HttpMethod.Post, "/comments");
+
+        var failed = await h.GiveUp("boom");
+
+        Assert.StartsWith("held; comment NOT posted: ", failed);
+        Assert.StartsWith("not evaluated: boom; comment NOT posted: ", Assert.Single(await h.Held()));
+
+        h.Board.Intercept = null;
+        h.Board.Requests.Clear();
+        Assert.Equal("commented", await h.GiveUp("boom"));
+        Assert.Single(h.Comments(PlanId));
+        Assert.Equal("not evaluated: boom", (await h.Held()).Last());
+    }
+
+    [Fact]
+    public async Task A_plan_story_whose_blockers_cannot_be_read_is_not_claimed()
+    {
+        var h = new Harness();
+        var ids = await h.Planned(Chain);
+        var (a, b) = (ids[0], ids[1]);
+        await h.Run();
+        await h.Merged(a);
+        await h.Run();
+        Assert.Equal(FakeShortcutBoard.ToDo, h.State(b));
+        h.Board.Requests.Clear();
+
+        // The story's own read fails: the run fails before the pipeline starts, and nothing is written anywhere.
+        h.Board.Intercept = Failing(HttpMethod.Get, $"/stories/{b}");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => h.Run(b));
+        Assert.Empty(await h.Rows(b));
+        Assert.Empty(h.Writes());
+
+        // The read of its blocker, inside the claim check, fails: the claim is not made — the run fails like any failed step.
+        h.Board.Intercept = Failing(HttpMethod.Get, $"/stories/{a}");
+        var failed = await h.Run(b);
+
+        Assert.Equal(WorkState.Escalated, failed.State);
+        Assert.DoesNotContain(RunPipeline.Steps.Claimed, (await h.Rows(b)).Select(r => r.Step));
+        Assert.DoesNotContain(h.Writes(), w => w.Method == HttpMethod.Put);
+        Assert.Equal(FakeShortcutBoard.ToDo, h.State(b));
+        Assert.Empty(h.Implementer.Calls);
+
+        // The board answers again: the next run claims it.
+        h.Board.Intercept = null;
+        Assert.Null((await h.Run(b)).Error);
+        Assert.Equal(FakeShortcutBoard.InProgress, h.State(b));
+    }
+
+    [Fact]
+    public async Task An_archived_story_is_not_recorded_as_released_and_the_plan_item_says_so_once_until_it_is_unarchived()
+    {
+        var h = new Harness();
+        var ids = await h.Planned(PlanAnswers.Answer(PlanAnswers.Story("a", "First story"), PlanAnswers.Story("b", "Second story")));
+        var (a, b) = (ids[0], ids[1]);
+        h.Board.Story(a)["archived"] = true;
+
+        await h.Run();
+
+        Assert.Equal([$"sc-{b}"], await h.Released());
+        Assert.Equal(FakeShortcutBoard.Backlog, h.State(a));
+        Assert.Empty(h.Writes(a));
+        var held = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.PlanHeld);
+        Assert.Equal(($"sc-{a} is archived on the board, so it was not released and the plan cannot complete: unarchive it", StepOutcome.Deferred),
+            (held.Detail, held.Outcome));
+        Assert.Contains($"waiting: sc-{a} archived", h.Log.ToString());
+
+        // Said once; asked for again every poll, so unarchiving it releases it.
+        await h.Run();
+        await h.Run();
+        Assert.Single(await h.Held());
+        Assert.Single(await h.Released());
+        h.Board.Story(a)["archived"] = false;
+        await h.Run();
+        Assert.Equal([$"sc-{b}", $"sc-{a}"], await h.Released());
+        Assert.Equal(FakeShortcutBoard.ToDo, h.State(a));
+    }
+
+    [Fact]
+    public async Task A_released_story_a_person_moved_back_to_the_backlog_is_recorded_once_never_released_again_and_restarts_when_moved_to_ready()
+    {
+        var h = new Harness();
+        var ids = await h.Planned(Chain);
+        var a = ids[0];
+        await h.Run();
+        await h.Run();
+        // Released and not merged: the log's waiting line names it; nothing holds the plan beyond its own order.
+        Assert.Contains($"sc-{a} released, not merged", h.Log.ToString());
+        Assert.Empty(await h.Held());
+
+        // A person moves it back to the Backlog.
+        h.Board.Story(a)["workflow_state_id"] = FakeShortcutBoard.Backlog;
+        h.Board.Requests.Clear();
+        for (var poll = 0; poll < 3; poll++)
+        {
+            Assert.Null((await h.Run()).Error);
+        }
+
+        var held = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.PlanHeld);
+        Assert.Equal(($"sc-{a} was released and is back in the backlog: nothing picks it up there and the plan does not release it again; "
+            + "moving it to the board's ready state restarts it", StepOutcome.Deferred), (held.Detail, held.Outcome));
+        Assert.Contains($"sc-{a} released, back in the backlog", h.Log.ToString());
+        // Not released again: a person moved it back on purpose.
+        Assert.Equal(FakeShortcutBoard.Backlog, h.State(a));
+        Assert.Empty(h.Writes());
+        Assert.Single(await h.Released());
+
+        // Moved to ready, it starts like any ready story.
+        h.Board.Story(a)["workflow_state_id"] = FakeShortcutBoard.ToDo;
+        Assert.Null((await h.Run(a)).Error);
+        Assert.Equal(FakeShortcutBoard.InProgress, h.State(a));
+
+        // In flight (the ledger knows it and it is not paused), the board is not asked about it.
+        h.Board.Requests.Clear();
+        await h.Run();
+        Assert.Equal(0, h.Reads(a));
+        Assert.Single(await h.Held());
+    }
+
+    [Fact]
+    public async Task The_board_is_asked_only_about_a_story_the_plans_own_order_no_longer_holds_and_a_blocker_added_since_is_still_seen()
+    {
+        var h = new Harness();
+        var ids = await h.Planned(Chain);
+        var (a, b, c) = (ids[0], ids[1], ids[2]);
+
+        await h.Run();
+
+        // A, which nothing blocks, was read and released; B and C, which the plan's own order holds, were not read at all.
+        Assert.Equal(FakeShortcutBoard.ToDo, h.State(a));
+        Assert.Equal((0, 0), (h.Reads(b), h.Reads(c)));
+
+        // While A is in flight a poll asks the board nothing at all.
+        await h.Worked(a, WorkState.MergeGate);
+        h.Board.Requests.Clear();
+        for (var poll = 0; poll < 3; poll++)
+        {
+            Assert.Null((await h.Run()).Error);
+        }
+        Assert.Empty(h.Board.Requests);
+
+        // Someone adds a blocker outside the plan to B meanwhile: once A has merged, B's blockers are read before it is released,
+        // so the new one is seen and holds it. C is still not read.
+        h.Board.Add(777, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.ToDo, name: "Someone else's story");
+        await h.Link(777, b);
+        await h.Merged(a);
+        await h.Run();
+
+        Assert.Equal(FakeShortcutBoard.Backlog, h.State(b));
+        Assert.StartsWith($"sc-{b} held by sc-777 (", Assert.Single(await h.Held()));
+        Assert.Equal(0, h.Reads(c));
+    }
+
+    [Fact]
+    public async Task An_item_claimed_without_a_plan_is_not_looked_up_in_the_plans_on_its_later_runs()
+    {
+        var h = new Harness();
+        h.Board.Add(600, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.ToDo, name: "Hand-written");
+        Assert.Null((await h.Run(600)).Error);
+        var ledger = h.Ledger;
+        // A plan-stories row naming it turns up afterwards (a plan lists only stories it created, so it never does): the item was
+        // claimed with no plan, so its later runs do not search the plans for it.
+        var plan = await ledger.GetOrCreateAsync(RunPipeline.Source, $"sc-{PlanId}", "Add CSV export", Sandbox.FullName, null, CancellationToken.None, 42);
+        await ledger.RecordAsync(plan, WorkState.Plan, null, null, CancellationToken.None);
+        await ledger.CheckpointAsync(plan, RunPipeline.Steps.PlanStories, null, "sc-600", CancellationToken.None);
+        var item = (await ledger.FindAsync(RunPipeline.Source, "sc-600", CancellationToken.None))!;
+        await ledger.RecordAsync(item, WorkState.Escalated, null, "boom", CancellationToken.None);
+
+        var again = await h.Run(600);
+
+        Assert.Null(again.Error);
+        Assert.Equal(2, (await h.Rows(600)).Count(r => r.Step == RunPipeline.Steps.Claimed));
+        Assert.Null((await h.Db.WorkItems.AsNoTracking().SingleAsync(i => i.ExternalId == "sc-600")).PlanItemId);
+    }
+
+    [Fact]
+    public async Task A_stop_that_lands_on_a_waiting_plan_after_the_runner_took_no_worker_lock_is_left_to_the_next_run()
+    {
+        var h = new Harness();
+        await h.Planned(Chain);
+        // A planner a crashed run left behind is on record: finishing a stop goes and stops it.
+        var plan = (await h.Ledger.FindAsync(RunPipeline.Source, $"sc-{PlanId}", CancellationToken.None))!;
+        await h.Ledger.CheckpointAsync(plan, RunPipeline.Steps.WorkerStarted, null, WorkerPid.ToString(), CancellationToken.None);
+        // The runner saw a waiting plan and no Stop, so it took no worker run lock; the Stop lands before the pipeline reads the control.
+        await h.Controls.SetAsync(ControlScope.Item($"sc-{PlanId}"), ControlState.Stopping, "test", CancellationToken.None);
+
+        var deferred = await h.Run(workerless: true);
+
+        Assert.Equal(WorkState.Planned, deferred.State);
+        Assert.Contains("stop deferred to the next run", deferred.Error);
+        Assert.Empty(h.Implementer.OrphanStops);
+        Assert.Empty(h.Workspaces.Calls);
+        Assert.Empty(h.Board.Requests);
+        Assert.Empty(await h.Released());
+        Assert.Equal(ControlState.Stopping, await h.Controls.EffectiveAsync($"sc-{PlanId}", 42, CancellationToken.None));
+        Assert.Equal([PlanId], await h.InFlight());
+
+        // The next run is built with the lock (its runner sees the Stop) and finishes the stop.
+        var stopped = await h.Run();
+
+        Assert.Equal(WorkState.Cancelled, stopped.State);
+        Assert.Equal([WorkerPid], h.Implementer.OrphanStops);
+        Assert.Contains(h.Workspaces.Calls, c => c.StartsWith("reopen ", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task A_run_built_without_the_worker_lock_touches_nothing_but_a_waiting_plan()
+    {
+        var h = new Harness();
+        h.Board.Add(600, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.ToDo, name: "Hand-written");
+
+        var deferred = await h.Run(600, workerless: true);
+
+        Assert.Contains("sc-600: deferred to the next run", deferred.Error);
+        Assert.Empty(await h.Rows(600));
+        Assert.Empty(h.Board.Requests);
+        Assert.Empty(h.Implementer.Calls);
+        Assert.Empty(h.Workspaces.Calls);
+
+        // A waiting plan is evaluated all the same.
+        var ids = await h.Planned(Chain);
+        Assert.Null((await h.Run(workerless: true)).Error);
+        Assert.Equal([$"sc-{ids[0]}"], await h.Released());
+    }
+
+    [Fact]
+    public async Task A_story_carrying_the_plan_marker_whose_plan_never_recorded_its_stories_is_refused_until_the_plan_has()
+    {
+        var h = new Harness();
+        var ids = await h.Creating(Chain);
+        var (a, b) = (ids[0], ids[1]);
+        // The plan's run died before recording its stories; someone moves B to To Do in that window.
+        h.Board.Story(b)["workflow_state_id"] = FakeShortcutBoard.ToDo;
+
+        var refused = await h.Run(b);
+
+        // Not started: the ledger cannot say what blocks it. Parked like any refused claim, with no board write.
+        Assert.Equal(WorkState.Paused, refused.State);
+        Assert.Contains($"sc-{b} parked: its plan sc-{PlanId} has not finished creating its stories", refused.Error);
+        var rows = await h.Rows(b);
+        Assert.Equal([WorkState.Intake, WorkState.Paused], rows.Where(r => r.Step is null).Select(r => r.State));
+        Assert.StartsWith($"{RunPipeline.ClaimRefused}: its plan sc-{PlanId} has not finished creating its stories", rows.Last(r => r.Step is null).Detail);
+        Assert.Equal(RunPipeline.Steps.Parked, Assert.Single(rows, r => r.Step is not null).Step);
+        Assert.Empty(h.Writes());
+        Assert.Empty(h.Implementer.Calls);
+
+        // The board keeps listing it: every poll's run says the same and writes nothing, to the board or the ledger.
+        for (var poll = 0; poll < 3; poll++)
+        {
+            var again = await h.Run(b);
+            Assert.Equal(WorkState.Paused, again.State);
+            Assert.Contains("has not finished creating its stories", again.Error);
+        }
+        Assert.Equal(rows.Count, (await h.Rows(b)).Count);
+        Assert.Empty(h.Writes());
+
+        // The plan's re-run records its stories: B is a story of the plan now, held to its blocker like any other...
+        await h.Recorded(ids);
+        var blocked = await h.Run(b);
+        Assert.Contains($"sc-{b} parked: blocked by sc-{a} (not merged)", blocked.Error);
+        Assert.Empty(h.Writes());
+
+        // ...and claimed normally once that has merged.
+        await h.Merged(a);
+        Assert.Null((await h.Run(b)).Error);
+        Assert.Equal(FakeShortcutBoard.InProgress, h.State(b));
+    }
+
+    [Fact]
+    public async Task The_plan_marker_only_ever_refuses_a_story_whose_owner_removed_it_is_a_hand_written_story()
+    {
+        var h = new Harness();
+        var ids = await h.Creating(Chain);
+        var b = ids[1];
+        h.Board.Story(b)["workflow_state_id"] = FakeShortcutBoard.ToDo;
+        h.Board.Story(b)["description"] = "Rewritten by its owner.";
+
+        Assert.Null((await h.Run(b)).Error);
+
+        Assert.Equal(FakeShortcutBoard.InProgress, h.State(b));
     }
 
     public static TheoryData<string> PausingScopes => [ControlScope.Factory, ControlScope.Epic(42), ControlScope.Item($"sc-{PlanId}"), ControlScope.Freeze];
@@ -762,6 +1340,110 @@ public class PlanReleasePipelineTests
         var known = await h.Ledger.ItemsByIdAsync(RunPipeline.Source, [$"sc-{PlanId}", "sc-1", $"sc-{PlanId}"], CancellationToken.None);
         Assert.Equal([$"sc-{PlanId}"], known.Keys);
         Assert.Equal(RunPipeline.Steps.PlanStories, known[$"sc-{PlanId}"].History.Last(r => r.Step is not null).Step);
+    }
+}
+
+/// <summary>
+/// sc-25871: the production runner (<see cref="FactoryRunner"/>) runs a waiting plan item without the worker run lock, and tells its
+/// pipeline so. Against the compose Postgres (skips locally without it); a sandboxed configuration whose worker user and helper do
+/// not exist, so nothing here could reach the real sandbox.
+/// </summary>
+public class PlanRunnerLockTests
+{
+    /// <summary>The work source with a callback on every read of <see cref="IWorkSource.Naming"/>, everything else forwarded.</summary>
+    public class NamingHook : DispatchProxy
+    {
+        public IWorkSource Target { get; set; } = null!;
+        public Action? OnNaming { get; set; }
+
+        protected override object? Invoke(MethodInfo? method, object?[]? args)
+        {
+            if (method!.Name == $"get_{nameof(IWorkSource.Naming)}")
+            {
+                OnNaming?.Invoke();
+            }
+            return method.Invoke(Target, args);
+        }
+    }
+
+    [Fact]
+    public async Task A_waiting_plan_runs_without_the_worker_lock_and_a_stop_landing_after_the_runners_check_is_deferred_by_its_pipeline()
+    {
+        await using var temp = await TempPostgresDatabase.CreateAsync("df_plan");
+        await LedgerMigrations.MigrateAsync(temp.ConnectionString, CancellationToken.None);
+        var root = Directory.CreateTempSubdirectory("df-plan-lock-").FullName;
+        var options = new FactoryOptions(new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Router:Key"] = "rk",
+            ["GitHub:AppId"] = "1",
+            ["GitHub:PrivateKeyPem"] = "pem",
+            ["GitHub:Gate:AppId"] = "2",
+            ["GitHub:Gate:PrivateKeyPem"] = "gate-pem",
+            ["Factory:WorkRoot"] = root,
+            ["ConnectionStrings:Ledger"] = temp.ConnectionString,
+            // Never the real sandbox user or helper; a waiting plan's run reaches neither.
+            ["Worker:RunAs"] = "df-test-no-such-user",
+            ["Worker:LaunchHelper"] = "/nonexistent/df-test-helper",
+        }).Build(), new InMemorySecrets());
+        var contexts = new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(temp.ConnectionString));
+        var board = new FakeShortcutBoard();
+        board.Add(500, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.InProgress, name: "Add CSV export");
+        board.Add(9001, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.Backlog, name: "First story");
+        board.Add(9002, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.Backlog, name: "Second story");
+        using (var response = await board.Client().PostAsJsonAsync("story-links", new { subject_id = 9001, verb = "blocks", object_id = 9002 }))
+        {
+            response.EnsureSuccessStatusCode();
+        }
+        await using (var db = contexts.CreateDbContext())
+        {
+            var ledger = new WorkLedger(db, TimeProvider.System);
+            var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-500", "Add CSV export", Sandbox.FullName, null, CancellationToken.None);
+            await ledger.RecordAsync(item, WorkState.Plan, null, null, CancellationToken.None);
+            await ledger.CheckpointAsync(item, RunPipeline.Steps.PlanStories, null, "sc-9001 sc-9002", CancellationToken.None);
+            await ledger.RecordAsync(item, WorkState.Planned, null, "2 stories: sc-9001 sc-9002", CancellationToken.None);
+        }
+        var source = DispatchProxy.Create<IWorkSource, NamingHook>();
+        var hook = (NamingHook)(object)source;
+        hook.Target = new ShortcutWorkSource(board.Client(), "tok", new WatchScope(["darkfactory"], []));
+        // Another sandboxed run holds the worker run lock for the whole test: a run that needed it would fail (FactoryUnavailable).
+        using var held = WorkerLock.Acquire(root);
+
+        var evaluated = await FactoryRunner.RunAsync(options, source, 500, ignoreScope: false, TextWriter.Null, CancellationToken.None);
+
+        // Evaluated without the lock: the story nothing blocks was released.
+        Assert.Equal((WorkState.Planned, (string?)null), (evaluated.State, evaluated.Error));
+        Assert.Equal(FakeShortcutBoard.ToDo, (long)board.Story(9001)["workflow_state_id"]!);
+
+        // A Stop lands after the runner's check and before the pipeline reads the control. The runner reads the source's naming
+        // twice for its check (the state lookup, then the control's scope) and the pipeline reads it next, right before it reads
+        // the control: the Stop is written on that third read.
+        var controls = new LedgerControls(contexts, TimeProvider.System);
+        var reads = 0;
+        hook.OnNaming = () =>
+        {
+            if (++reads == 3)
+            {
+                controls.SetAsync(ControlScope.Item("sc-500"), ControlState.Stopping, "test", CancellationToken.None).GetAwaiter().GetResult();
+            }
+        };
+        board.Requests.Clear();
+
+        var deferred = await FactoryRunner.RunAsync(options, source, 500, ignoreScope: false, TextWriter.Null, CancellationToken.None);
+
+        // The pipeline was told it holds no lock: it finishes no stop (which could stop every worker-user process and remove a
+        // worktree under another run's worker) and leaves it to the next run, which sees the Stop and takes the lock.
+        Assert.True(reads >= 3, $"{reads} reads");
+        Assert.Equal(WorkState.Planned, deferred.State);
+        Assert.Contains("stop deferred to the next run", deferred.Error);
+        Assert.Empty(board.Requests);
+        Assert.Equal(ControlState.Stopping, await controls.EffectiveAsync("sc-500", null, CancellationToken.None));
+        await using var after = contexts.CreateDbContext();
+        Assert.Equal(WorkState.Planned, (await after.WorkItems.AsNoTracking().SingleAsync(i => i.ExternalId == "sc-500")).State);
+        // With the Stop on record, the next run's runner asks for the lock (held here, so it says so) before anything else.
+        hook.OnNaming = null;
+        var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
+            FactoryRunner.RunAsync(options, source, 500, ignoreScope: false, TextWriter.Null, CancellationToken.None));
+        Assert.Contains("only one worker may run at a time", ex.Message);
     }
 }
 

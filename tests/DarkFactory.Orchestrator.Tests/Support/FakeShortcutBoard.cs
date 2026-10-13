@@ -37,6 +37,9 @@ public sealed class FakeShortcutBoard : HttpMessageHandler
     /// <summary>Called with each request before it is served; may return a response to send instead.</summary>
     public Func<HttpRequestMessage, HttpResponseMessage?>? Intercept { get; set; }
 
+    /// <summary>What the workflow calls its state of type <c>done</c> (a workspace may rename it).</summary>
+    public string DoneName { get; set; } = "Done";
+
     public JsonObject Story(int id) => _stories[id];
 
     public IReadOnlyCollection<JsonObject> Stories => _stories.Values.ToList();
@@ -90,8 +93,9 @@ public sealed class FakeShortcutBoard : HttpMessageHandler
             ("GET", ["member"]) => Ok(new JsonObject { ["id"] = Me }),
             ("GET", ["groups"]) => Ok(JsonNode.Parse($$"""[{"id":"{{FactoryTeam}}","mention_name":"darkfactory"},{"id":"{{OtherTeam}}","mention_name":"other"}]""")),
             ("GET", ["workflows"]) => Ok(JsonNode.Parse($$"""
-                [{"id":{{Workflow}},"name":"Standard","states":[{"id":{{Backlog}},"name":"Backlog"},{"id":{{ToDo}},"name":"To Do"},
-                  {"id":{{InProgress}},"name":"In Progress"},{"id":500000009,"name":"In Review"},{"id":{{Done}},"name":"Done"}]}]
+                [{"id":{{Workflow}},"name":"Standard","states":[{"id":{{Backlog}},"name":"Backlog","type":"backlog"},
+                  {"id":{{ToDo}},"name":"To Do","type":"unstarted"},{"id":{{InProgress}},"name":"In Progress","type":"started"},
+                  {"id":500000009,"name":"In Review","type":"started"},{"id":{{Done}},"name":"{{DoneName}}","type":"done"}]}]
                 """)),
             ("GET", ["groups", var team, "stories"]) => Ok(Page(
                 Sorted().Where(s => IgnoreListingFilter || (string?)s["group_id"] == team),

@@ -287,9 +287,9 @@ public sealed class GitHubIssueWorkSource(IGitHubIssues issues, IDbContextFactor
         throw new NotSupportedException("A GitHub issue has no plan children: plans are Shortcut stories.");
 
     /// <summary>A GitHub issue item has no blocker relation the factory reads: none (sc-25871).</summary>
-    public Task<IReadOnlyList<int>> BlockersAsync(int id, CancellationToken ct) => Task.FromResult<IReadOnlyList<int>>([]);
+    public Task<IReadOnlyList<Blocker>> BlockersAsync(int id, CancellationToken ct) => Task.FromResult<IReadOnlyList<Blocker>>([]);
 
-    public Task<bool> MakeReadyAsync(int id, CancellationToken ct) =>
+    public Task<ReadyResult> MakeReadyAsync(int id, CancellationToken ct) =>
         throw new NotSupportedException("A GitHub issue has no plan children to make ready: plans are Shortcut stories.");
 
     private bool Watched(string repo) => watched.Any(r => string.Equals(r.FullName, repo, StringComparison.OrdinalIgnoreCase));

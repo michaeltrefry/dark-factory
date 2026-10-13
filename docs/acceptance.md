@@ -474,7 +474,17 @@ no ledger row and moves no story; no `closeout` row is written.
 Not run live yet (2026-10-12): written with sc-25870 and extended with sc-25871, to be run by the owner. The live run is also the
 first time the release's Shortcut requests meet the real API: `GET stories/{id}` returning a story with `story_links`, and
 `PUT stories/{id}` with only `workflow_state_id` (Backlog → To Do) have no recorded contract fixture yet (`Fixtures/shortcut`); the
-unit tests cover them against the fake board and against the story shape the `list-ready.json` recording holds.
+unit tests cover them against the fake board and against the story shape the `list-ready.json` recording holds. Two more reads
+first meet the real API there: a story's blockers are each read with their own `GET stories/{id}` and judged finished by the
+`type` (`done`) of their workflow state in `GET workflows` (the recording's workflow carries those types), and a released story
+the ledger does not know yet is asked for once per run (`GET stories/{id}`: is it back in the Backlog?). The test's runs between
+tiers therefore read the released stories; they still add no ledger row and move no story.
+
+What the live test does not cover, and the unit tests do (`PlanReleasePipelineTests`, `PlanRunnerLockTests`): a blocker outside the
+plan (held until the factory merges it or the board shows it finished), an archived story, a released story moved back to the
+Backlog, a plan whose stories were never recorded (a marked story is refused at claim), a plan that cannot be evaluated (one comment
+and one `plan-held` row after `Intake:MaxItemFailures` failures), a closeout the board keeps refusing (the item stays `Planned`,
+"post it by hand"), and a Stop landing on a waiting plan after its runner took no worker run lock (deferred to the next run).
 
 ## Upgrading a Phase 1 ledger: items parked at Review
 

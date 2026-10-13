@@ -98,34 +98,70 @@ public sealed partial class RunPipeline
 
     /// <summary>
     /// Why a story of a plan may not start yet (sc-25871, E7), or null when it may: the blockers the board relates to it
-    /// (<see cref="IWorkSource.BlockersAsync"/>: stories of its plan or not) that the factory has not merged
-    /// (<see cref="PlanRelease.Satisfied"/>), named in a claim refusal (<see cref="PlanRelease.Refusal"/>). Only a plan's story
-    /// (<see cref="WorkItem.PlanItemId"/>) is held to its blockers: a story a person wrote keeps the board's relations as the owner's
-    /// own business, as before. Reads only.
+    /// (<see cref="IWorkSource.BlockersAsync"/>: stories of its plan or not) that are not satisfied
+    /// (<see cref="PlanRelease.Satisfied(IReadOnlyList{LedgerEntry}?, bool, bool)"/>: a story of its plan by the factory's merge only,
+    /// any other also once the board shows it finished), named in a claim refusal (<see cref="PlanRelease.Refusal"/>). Only a plan's
+    /// story (<see cref="WorkItem.PlanItemId"/>) is held to its blockers: a story a person wrote keeps the board's relations as the
+    /// owner's own business, as before. Reads only.
     /// </summary>
     private async Task<string?> BlockedAsync(WorkItem item, int storyId, CancellationToken ct)
     {
-        if (item.PlanItemId is null)
+        if (item.PlanItemId is not { } plan)
         {
             return null;
         }
-        var blockers = (await source.BlockersAsync(storyId, ct)).Select(Naming.Format).ToList();
+        var blockers = await source.BlockersAsync(storyId, ct);
         if (blockers.Count == 0)
         {
             return null;
         }
-        var known = await ledger.ItemsByIdAsync(Naming.Source, blockers, ct);
-        var open = blockers.Where(b => !PlanRelease.Satisfied(known.TryGetValue(b, out var k) ? k.History : null)).ToList();
-        return open.Count == 0 ? null : PlanRelease.Refusal(open);
+        var ofPlan = await ledger.PlanStoriesAsync(plan, ct);
+        var known = await ledger.ItemsByIdAsync(Naming.Source, blockers.Select(b => Naming.Format(b.Id)).ToList(), ct);
+        var open = blockers.Select(b => (Id: Naming.Format(b.Id), b.Finished))
+            .Where(b => !PlanRelease.Satisfied(known.TryGetValue(b.Id, out var k) ? k.History : null, ofPlan.Contains(b.Id), b.Finished))
+            .Select(b => b.Id).ToList();
+        return open.Count == 0 ? null : PlanRelease.Refusal(open, open.Where(b => !ofPlan.Contains(b)).ToList());
     }
 
     /// <summary>
     /// For an item parked on a claim refused for a blocker (<see cref="PlanRelease.IsBlockedRefusal"/>): the refusal as it stands
-    /// now, or null once every blocker has merged (or the item was parked for something else) and the run may go on.
+    /// now, or null once every blocker is satisfied (or the item was parked for something else) and the run may go on.
     /// </summary>
     private async Task<string?> StillBlockedAsync(WorkItem item, int storyId, CancellationToken ct) =>
         PlanRelease.IsBlockedRefusal((await ledger.HistoryAsync(item, ct)).LastOrDefault(e => e.Step is null)?.Detail)
             ? await BlockedAsync(item, storyId, ct)
+            : null;
+
+    /// <summary>
+    /// Why a story that says a plan created it may not start (sc-25871), or null when it may: its description carries the plan marker
+    /// (<see cref="WorkStory.PlannerAuthored"/>) but the ledger links it to no plan — no <c>plan-stories</c> row lists it, because its
+    /// plan's run failed or died part-way through creating the stories — so its blockers cannot be checked. The marker is text anyone
+    /// may write; it is only ever used here to refuse (fail closed), never to grant: a story without it is a hand-written story, held to
+    /// nothing. Links the item when the ledger does know its plan. Call under the item's run lock.
+    /// </summary>
+    private async Task<string?> WithoutPlanAsync(WorkItem item, WorkStory story, CancellationToken ct)
+    {
+        if (!source.PlansItems || item.PlanItemId is not null || !story.PlannerAuthored)
+        {
+            return null;
+        }
+        if (await ledger.PlanOfAsync(Naming.Source, item.ExternalId, ct) is { } plan)
+        {
+            await ledger.LinkPlanAsync(item, plan, ct);
+            return null;
+        }
+        return PlanRelease.PlanUnfinishedRefusal(PlannedStory.ParentOf(story.Description));
+    }
+
+    /// <summary>
+    /// For an item parked on <see cref="WithoutPlanAsync"/>'s refusal and still listed ready: the refusal as it stands now (nothing
+    /// is written while it holds), or null once its plan has recorded its stories or the marker is gone. Reads only.
+    /// </summary>
+    private async Task<string?> StillWithoutPlanAsync(WorkItem item, WorkStory story, CancellationToken ct) =>
+        source.PlansItems && item.PlanItemId is null && story.PlannerAuthored
+        && PlanRelease.IsPlanUnfinishedRefusal((await ledger.HistoryAsync(item, ct)).LastOrDefault(e => e.Step is null)?.Detail)
+        && await ledger.PlanOfAsync(Naming.Source, item.ExternalId, ct) is null
+            ? PlanRelease.PlanUnfinishedRefusal(PlannedStory.ParentOf(story.Description))
             : null;
 
     /// <summary>Whether the item is a plan item waiting on its stories: its run needs no worker, so no worker run lock or sandbox.</summary>
@@ -134,16 +170,24 @@ public sealed partial class RunPipeline
 
     /// <summary>
     /// Planned (sc-25871): one evaluation of a plan item waiting on its stories, under its run lock, with no worker. The orchestrator,
-    /// not a person, releases the plan's stories: every story that has not merged and was not released yet has its blockers read from
-    /// the board, and each one whose blockers have all merged (<see cref="PlanRelease.Decide"/>) is moved to the source's ready state
-    /// (<see cref="IWorkSource.MakeReadyAsync"/>) and recorded (<see cref="Steps.PlanReleased"/>) — the board write first, then its
-    /// row: a run that died between the two asks again, and the source writes nothing for a story that already left the backlog,
-    /// so nothing is released twice (E4). A released story is then picked up like any ready story. A control that pauses the plan
-    /// item (the factory, its epic, the freeze) releases nothing. Stories a blocker outside the plan holds are recorded on the plan
-    /// item when that changes (<see cref="Steps.PlanHeld"/>). Once every story has merged the plan is closed out
-    /// (<see cref="ClosePlanAsync"/>). A story that escalated or was cancelled never satisfies its dependents: they stay in the
-    /// backlog and the plan item stays here. A board that cannot be read or written throws: nothing is recorded and the next run
-    /// evaluates again.
+    /// not a person, releases the plan's stories: each one whose blockers are all satisfied (<see cref="PlanRelease.Decide"/>) is moved
+    /// to the source's ready state (<see cref="IWorkSource.MakeReadyAsync"/>) and recorded (<see cref="Steps.PlanReleased"/>) — the
+    /// board write first, then its row: a run that died between the two asks again, and the source writes nothing for a story that
+    /// already left the backlog, so nothing is released twice (E4). A released story is then picked up like any ready story.
+    /// What the board is asked: a story that has not merged and was not released has its blockers read from the board
+    /// (<see cref="IWorkSource.BlockersAsync"/>: the plan's relations and any a person added since) in the evaluation that could
+    /// release it — only once every blocker the plan itself gave it (<see cref="PlanRelease.RecordedBlockers"/>, from the <c>plan</c>
+    /// checkpoint) has merged; until then it is held by those and the board is not read for it (so removing an in-plan relation on
+    /// the board does not release it early: move it to ready by hand, where the claim check reads the board). A released story that
+    /// has not merged and that nothing works (the ledger does not know it, or it is Paused) is asked for once per evaluation
+    /// (<see cref="IWorkSource.InBacklogAsync"/>): back in the backlog, a person moved it there, and the plan does not release it
+    /// again. A control that pauses the plan item (the factory, its epic, the freeze) releases nothing. What holds the plan beyond
+    /// its own order — a story held by a blocker outside the plan, an archived story, a released story back in the backlog — is
+    /// recorded on the plan item when it changes (<see cref="Steps.PlanHeld"/>), not every poll. Once every story has merged
+    /// (<see cref="ReleaseDecision.Complete"/>) the plan is closed out (<see cref="ClosePlanAsync"/>). A story that escalated or was
+    /// cancelled never satisfies its dependents: they stay in the backlog and the plan item stays here. A board that cannot be read
+    /// or written throws: nothing is recorded, the next run evaluates again, and the intake loop gives up on a plan that keeps
+    /// failing (<see cref="GiveUpAsync"/>: one comment and one <c>plan-held</c> row; the item stays Planned).
     /// </summary>
     private async Task<RunOutcome> PlannedAsync(WorkItem item, int storyId, List<LedgerEntry> history, CancellationToken ct)
     {
@@ -157,24 +201,48 @@ public sealed partial class RunPipeline
         var known = await ledger.ItemsByIdAsync(Naming.Source, stories, ct);
         var released = since.Where(e => e.Step == Steps.PlanReleased).Select(e => PlanRelease.StoriesOf(e.Detail).FirstOrDefault() ?? "")
             .ToHashSet(StringComparer.Ordinal);
+        var ofPlan = stories.ToHashSet(StringComparer.Ordinal);
         bool Merged(string id) => PlanRelease.Satisfied(known.TryGetValue(id, out var k) ? k.History : null);
-        if (stories.All(Merged))
+
+        // What blocks each story still waiting. The plan's own order first, from the ledger; the board (the plan's relations and
+        // any a person added since) only for a story that order no longer holds.
+        var own = PlanRelease.RecordedBlockers(history.Take(recorded).LastOrDefault(e => e.Step == Steps.Plan)?.Detail, stories);
+        var blockers = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
+        var finished = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var story in stories.Where(s => !Merged(s) && !released.Contains(s)))
+        {
+            if (own is not null && own[story].Where(b => !Merged(b)).ToList() is { Count: > 0 } unmerged)
+            {
+                blockers[story] = unmerged;
+                continue;
+            }
+            var onBoard = await source.BlockersAsync(IdOf(story), ct);
+            blockers[story] = onBoard.Select(b => Naming.Format(b.Id)).ToList();
+            finished.UnionWith(onBoard.Where(b => b.Finished).Select(b => Naming.Format(b.Id)));
+        }
+        var outside = blockers.Values.SelectMany(b => b).Where(b => !ofPlan.Contains(b)).ToList();
+        var outsiders = outside.Count == 0 ? [] : await ledger.ItemsByIdAsync(Naming.Source, outside, ct);
+        var decision = PlanRelease.Decide(stories, released, blockers, id => ofPlan.Contains(id)
+            ? Merged(id)
+            : PlanRelease.Satisfied(outsiders.TryGetValue(id, out var o) ? o.History : null, ofPlan: false, finished.Contains(id)));
+        if (decision.Complete)
         {
             return await ClosePlanAsync(item, storyId, stories, known, since, ct);
         }
 
-        // What blocks each story still waiting, from the board: the plan's own relations and any a person added since.
-        var blockers = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
-        foreach (var story in stories.Where(s => !Merged(s) && !released.Contains(s)))
+        // A story the plan released that nothing works and that waits in the backlog again: a person moved it back.
+        var inFlight = stories.Where(s => released.Contains(s) && !Merged(s)).ToList();
+        var back = new List<string>();
+        foreach (var story in inFlight.Where(s => !known.TryGetValue(s, out var k) || k.Item.State == WorkState.Paused))
         {
-            blockers[story] = (await source.BlockersAsync(IdOf(story), ct)).Select(Naming.Format).ToList();
+            if (await source.InBacklogAsync(IdOf(story), ct))
+            {
+                back.Add(story);
+            }
         }
-        var outside = blockers.Values.SelectMany(b => b).Where(b => !stories.Contains(b, StringComparer.Ordinal)).ToList();
-        var outsiders = outside.Count == 0 ? [] : await ledger.ItemsByIdAsync(Naming.Source, outside, ct);
-        var decision = PlanRelease.Decide(stories, released, blockers,
-            id => Merged(id) || PlanRelease.Satisfied(outsiders.TryGetValue(id, out var o) ? o.History : null));
 
         var done = new List<string>();
+        var archived = new List<string>();
         foreach (var story in decision.Release)
         {
             // A Pause (the factory's, the epic's, the item's, the freeze) that arrived meanwhile: nothing more is released.
@@ -184,22 +252,33 @@ public sealed partial class RunPipeline
                 break;
             }
             var moved = await source.MakeReadyAsync(IdOf(story), ct);
+            if (moved == ReadyResult.Archived)
+            {
+                // Not released, and not recorded as released: it is asked for again every evaluation, so unarchiving it releases it.
+                archived.Add(story);
+                continue;
+            }
             // Released all the same when it is outside the watch scope: the listing will not find it, so say so.
             var listed = ignoreScope || await source.InScopeAsync(IdOf(story), ct);
             await ledger.CheckpointAsync(item, Steps.PlanReleased, null,
-                story + (moved ? "" : " (it had already left the backlog; left where it is)")
+                story + (moved == ReadyResult.Moved ? "" : " (it had already left the backlog; left where it is)")
                     + (listed ? "" : $" (outside the watch scope: {source.ScopeReturnHint}, or run `factory run {story} --ignore-scope`)"), ct);
             log.WriteLine($"[{item.State}] {item.ExternalId}: released {story}{(listed ? "" : " (outside the watch scope: nothing will pick it up)")}");
             done.Add(story);
         }
-        var heldByOutsiders = PlanRelease.HeldByOutsiders(decision.Held);
-        if (heldByOutsiders.Length > 0 && heldByOutsiders != since.LastOrDefault(e => e.Step == Steps.PlanHeld)?.Detail)
+        string[] holds = [PlanRelease.HeldByOutsiders(decision.Held), .. archived.Select(PlanRelease.HeldArchived), .. back.Select(PlanRelease.HeldBackInBacklog)];
+        var held = string.Join("; ", holds.Where(h => h.Length > 0));
+        if (held.Length > 0 && held != since.LastOrDefault(e => e.Step == Steps.PlanHeld
+            && e.Detail?.StartsWith(PlanRelease.NotEvaluatedPrefix, StringComparison.Ordinal) != true)?.Detail)
         {
-            await ledger.CheckpointAsync(item, Steps.PlanHeld, null, heldByOutsiders, ct);
+            await ledger.CheckpointAsync(item, Steps.PlanHeld, null, held, ct);
         }
+        var waiting = decision.Held.Select(h => $"{h.Id} on {string.Join(", ", h.By)}")
+            .Concat(archived.Select(s => $"{s} archived"))
+            .Concat(inFlight.Select(s => back.Contains(s) ? $"{s} released, back in the backlog" : $"{s} released, not merged")).ToList();
         log.WriteLine($"[{item.State}] {item.ExternalId}: {stories.Count(Merged)} of {stories.Count} stories merged"
             + (done.Count == 0 ? "" : $"; released {string.Join(", ", done)}")
-            + (decision.Held.Count == 0 ? "" : $"; waiting: {string.Join("; ", decision.Held.Select(h => $"{h.Id} on {string.Join(", ", h.By)}"))}"));
+            + (waiting.Count == 0 ? "" : $"; waiting: {string.Join("; ", waiting)}"));
         return await OutcomeAsync(item, null, ct);
 
         int IdOf(string story) => Naming.TryParse(story, out var id)
@@ -212,8 +291,9 @@ public sealed partial class RunPipeline
     /// gets a closeout rendered from the ledger (<see cref="LedgerReport.PlanCloseout"/>: each story, its pull request, its outcome;
     /// <see cref="Steps.Closeout"/>) and goes to Done, each step recorded before the next so a resumed run redoes none. A closeout the
     /// board refuses is recorded <c>failed: …</c> and tried again by the next runs, like a merged item's, up to
-    /// <see cref="MaxCloseoutAttempts"/>; after the last the item goes to Done all the same, the row saying the closeout is left to
-    /// post by hand (the plan is finished either way).
+    /// <see cref="MaxCloseoutAttempts"/>. After the last the item stays Planned, as a merged item stays in Watch: no poll lists it
+    /// any more (<see cref="PlanCloseoutAbandoned"/>), nothing is written, and the dashboard keeps saying the closeout is left to post
+    /// by hand. It reaches Done only by a posted closeout.
     /// </summary>
     private async Task<RunOutcome> ClosePlanAsync(WorkItem item, int storyId, IReadOnlyList<string> stories,
         Dictionary<string, (WorkItem Item, List<LedgerEntry> History)> known, List<LedgerEntry> since, CancellationToken ct)
@@ -226,7 +306,7 @@ public sealed partial class RunPipeline
         var attempts = since.Where(e => e.Step == Steps.Closeout).ToList();
         var posted = attempts.Any(a => a.Detail == Posted);
         var tried = attempts.Count;
-        string? error = null;
+        var error = attempts.LastOrDefault()?.Detail;
         if (!posted && tried < MaxCloseoutAttempts)
         {
             try
@@ -237,21 +317,29 @@ public sealed partial class RunPipeline
             }
             catch (Exception ex) when (!ct.IsCancellationRequested)
             {
-                error = ex.Message;
+                error = $"failed: {ex.Message}";
                 log.WriteLine($"[{item.State}] could not post the plan closeout on {item.ExternalId}: {ex.Message}");
             }
-            await ledger.CheckpointAsync(item, Steps.Closeout, null, posted ? Posted : $"failed: {error}", ct);
+            await ledger.CheckpointAsync(item, Steps.Closeout, null, posted ? Posted : error, ct);
             tried++;
         }
-        if (!posted && tried < MaxCloseoutAttempts)
+        if (!posted)
         {
-            return await OutcomeAsync(item, $"{item.ExternalId}: closeout NOT posted: {error}; the next run tries again", ct);
+            return await OutcomeAsync(item, $"{item.ExternalId}: closeout NOT posted ({error}); "
+                + (tried < MaxCloseoutAttempts ? "the next run tries again" : $"{tried} attempts made: post it by hand"), ct);
         }
-        await ledger.RecordAsync(item, WorkState.Done, null, $"{stories.Count} stories merged"
-            + (posted ? "" : $"; closeout NOT posted after {tried} attempts: post it by hand"), ct);
+        await ledger.RecordAsync(item, WorkState.Done, null, $"{stories.Count} stories merged", ct);
         log.WriteLine($"[{item.State}] {item.ExternalId}: every story of the plan merged; the plan is closed out");
         return await OutcomeAsync(item, null, ct);
     }
+
+    /// <summary>
+    /// Whether a waiting plan item's closeout failed <see cref="MaxCloseoutAttempts"/> times (<paramref name="rows"/>: its
+    /// <see cref="Steps.Closeout"/> rows; a plan item has no Merge row): every story merged and the board was told, only the closeout
+    /// is left, to a person. No poll lists it (<see cref="InFlightAsync"/>).
+    /// </summary>
+    public static bool PlanCloseoutAbandoned(WorkState state, IEnumerable<LedgerEntry> rows) =>
+        state == WorkState.Planned && CloseoutOf(rows) is { Posted: false, Attempts: >= MaxCloseoutAttempts };
 
     /// <summary>
     /// Whether the newest recorded plan (<see cref="Steps.Plan"/>) is the one this run creates, rather than planning afresh. It is

@@ -156,6 +156,12 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
         return null;
     }
 
+    /// <summary>The stories the plan item's newest <c>plan-stories</c> checkpoint lists (sc-25871); none when it has no such row.</summary>
+    public async Task<IReadOnlySet<string>> PlanStoriesAsync(long planItemId, CancellationToken ct) =>
+        Plans.PlanRelease.StoriesOf(await db.LedgerEntries.AsNoTracking()
+            .Where(e => e.WorkItemId == planItemId && e.Step == RunPipeline.Steps.PlanStories)
+            .OrderByDescending(e => e.Id).Select(e => e.Detail).FirstOrDefaultAsync(ct)).ToHashSet(StringComparer.Ordinal);
+
     /// <summary>Records that <paramref name="item"/> is a story of the plan item <paramref name="planItemId"/>. Call under the item's run lock.</summary>
     public async Task LinkPlanAsync(WorkItem item, long planItemId, CancellationToken ct)
     {
