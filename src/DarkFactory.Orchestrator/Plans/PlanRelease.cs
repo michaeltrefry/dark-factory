@@ -386,6 +386,22 @@ public static class PlanRelease
         $"{BlockedPrefix}its plan {plan}, which was stopped: a story of a stopped plan is not started (write a story of your own for the work if it is still wanted)";
 
     /// <summary>
+    /// The claim refusal of a story of a plan with changesets in several repositories whose <c>plan</c> record no longer reads
+    /// back (sc-25873): which changesets the story waits on is only in that record (the board has no relation for it), so the
+    /// story is not started (fail closed). It starts like a blocker's refusal, so the item is parked once
+    /// (<see cref="IsBlockedRefusal"/>).
+    /// </summary>
+    public static string PlanUnreadableRefusal(string plan) =>
+        $"{BlockedPrefix}its plan {plan}, whose recorded plan no longer reads back: {UnreadableWhy}";
+
+    private const string UnreadableWhy = "the plan has changesets in several repositories, and only that record says which of them "
+        + "each story waits on, so no story of the plan is started or released until a person has looked (finish the plan's remaining "
+        + "stories by hand in the plan's merge order, or stop the plan)";
+
+    /// <summary>The <c>plan-held</c> record of a plan that releases nothing for the same reason as <see cref="PlanUnreadableRefusal"/>.</summary>
+    public const string HeldUnreadable = "the recorded plan no longer reads back: " + UnreadableWhy;
+
+    /// <summary>
     /// The Intake detail of the ledger item a stopped plan gives a story it had released that nothing ever claimed (sc-25876,
     /// <see cref="Controls.ItemStopper"/>): the board story was moved back to the backlog before the item was created, and the factory did
     /// no work on it.

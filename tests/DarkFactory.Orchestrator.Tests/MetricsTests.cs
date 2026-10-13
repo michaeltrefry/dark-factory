@@ -52,6 +52,61 @@ public class MetricsTests
         WorkState.Merge, WorkState.Watch,
     ];
 
+    // ---- a plan item of several repositories (sc-25873): one Merge row per changeset pull request ----
+
+    private static string[] ChangesetIn(string repo) =>
+    [
+        $"{RunPipeline.Steps.Changeset}:{new Plans.Changeset(repo, "factory/changeset-sc-9", "main", "b0").ToDetail()}",
+        $"{RunPipeline.Steps.ChangesetPushed}:{Plans.Changeset.PushedDetail("factory/changeset-sc-9", "b0", false)}",
+    ];
+
+    private static object[] Pass(string repo) =>
+    [
+        WorkState.Review, WorkState.CI, WorkState.MergeGate, WorkState.Merge,
+        $"{RunPipeline.Steps.ChangesetDelivered}:{new Plans.ChangesetDelivery(repo, Plans.ChangesetDelivery.Merged).ToDetail()}",
+    ];
+
+    private static object[] PlanOf(params string[] repos) => [WorkState.Intake, WorkState.Plan, .. repos.SelectMany(ChangesetIn), WorkState.Planned];
+
+    [Fact]
+    public void A_plan_of_several_repositories_is_merged_only_at_its_last_changesets_merge()
+    {
+        var half = Item("acme/up", "Share the format", [], [.. PlanOf("acme/up", "acme/down"), .. Pass("acme/up"), WorkState.Planned]);
+
+        var metrics = LedgerMetrics.Compute([half], Options);
+
+        // One repository's changeset is on its default branch; the plan is not merged, and may never be.
+        Assert.Equal(0, Get(metrics, LedgerMetrics.FixRoundsPerPr).Sample);
+        Assert.Equal("N/A", Get(metrics, LedgerMetrics.IntakeToMerge).Display);
+
+        object[] rows = [.. PlanOf("acme/up", "acme/down"), .. Pass("acme/up"), WorkState.Planned, .. Pass("acme/down"), WorkState.Watch];
+        var whole = Item("acme/up", "Share the format", [], rows);
+
+        metrics = LedgerMetrics.Compute([whole], Options);
+
+        Assert.Equal(1, Get(metrics, LedgerMetrics.FixRoundsPerPr).Sample);
+        // Measured to the second repository's Merge row, not the first's.
+        var last = Array.FindLastIndex(rows, r => r is WorkState.Merge);
+        Assert.NotEqual(last, Array.FindIndex(rows, r => r is WorkState.Merge));
+        Assert.Equal((double)last, Get(metrics, LedgerMetrics.IntakeToMerge).Value);
+    }
+
+    [Fact]
+    public void A_plan_with_a_changeset_in_a_sandbox_repository_is_left_out_whichever_repository_the_item_names()
+    {
+        // The plan item's own repository is not the sandbox; one of the repositories it changes is.
+        var plan = Item("acme/widgets", "Share the format", [],
+            [.. PlanOf("acme/widgets", "ACME/Sandbox"), .. Pass("acme/widgets"), WorkState.Planned, .. Pass("ACME/Sandbox"), WorkState.Watch]);
+
+        var metrics = LedgerMetrics.Compute([plan], Options);
+
+        Assert.All(metrics, m => Assert.Equal("N/A", m.Display));
+        // The same plan in no sandbox repository is measured.
+        var real = Item("acme/widgets", "Share the format", [],
+            [.. PlanOf("acme/widgets", "acme/other"), .. Pass("acme/widgets"), WorkState.Planned, .. Pass("acme/other"), WorkState.Watch]);
+        Assert.Equal(1, Get(LedgerMetrics.Compute([real], Options), LedgerMetrics.FixRoundsPerPr).Sample);
+    }
+
     [Fact]
     public void Every_metric_over_no_items_is_not_available()
     {

@@ -37,7 +37,10 @@ public sealed partial class RunPipeline
     /// repository, so a run resumed between two repositories' branches still checks the one without), nor in a
     /// pipeline with no gate stage (it has no GitHub read client and merges nothing).
     /// </summary>
-    private async Task EnsureCiTriggersAsync(Run run, RepoRef repo, CancellationToken ct)
+    /// <param name="progress">What an earlier run of this plan left: a stop says that, never that nothing exists when stories do.</param>
+    /// <param name="several">The plan item names several repositories: a stop names the way out for one the plan should not touch.</param>
+    /// <param name="hasStory">Whether the recorded plan this run continues has a story in <paramref name="repo"/>; null when no plan is known yet.</param>
+    private async Task EnsureCiTriggersAsync(Run run, RepoRef repo, PlanProgress progress, bool several, bool? hasStory, CancellationToken ct)
     {
         if (gate is null)
         {
@@ -95,7 +98,26 @@ public sealed partial class RunPipeline
             log.WriteLine($"[plan] warning: CI triggers of {check.Reason}; planning goes on");
             return;
         }
-        throw new WorkerFailedException($"The plan was stopped before it was planned or any story of it created: in {check.Reason}. "
-            + $"{wasted} Fix the workflow on the default branch, then run the plan item again.");
+        // What the stop left, from the ledger: a plan this run continues may already have stories on the board.
+        var stopped = progress switch
+        {
+            PlanProgress.Fresh => "The plan was stopped before it was planned or any story of it created",
+            PlanProgress.Recorded => "The plan an earlier run recorded was stopped before any story of it was created",
+            _ => "The plan was stopped before its stories were recorded as its own",
+        };
+        // Every repository the plan item names is checked, before the planner says which of them get a story: one the plan should
+        // not change at all blocks it too, and the way out of that is the plan item's own `Repo:` line.
+        var fix = !several ? "Fix the workflow on the default branch, then run the plan item again."
+            : hasStory switch
+            {
+                true => $"Fix the workflow on the default branch of {repo}, then run the plan item again (the recorded plan has a story in {repo}).",
+                false => $"The recorded plan has no story in {repo}: remove its `Repo:` line from the plan item if the plan should not touch it, "
+                    + $"or fix the workflow on the default branch of {repo}; then run the plan item again.",
+                null => $"The plan item names {repo}, so it is checked before the planner runs, whether or not the plan would give it a story: "
+                    + $"remove its `Repo:` line from the plan item if the plan should not touch it, or fix the workflow on the default branch of {repo}; "
+                    + "then run the plan item again.",
+            };
+        throw new WorkerFailedException($"{stopped}: in {check.Reason}. {wasted} "
+            + (progress == PlanProgress.StoriesMayExist ? $"{StoriesMayExist} " : "") + fix);
     }
 }

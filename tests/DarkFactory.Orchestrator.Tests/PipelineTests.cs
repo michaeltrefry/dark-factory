@@ -22,6 +22,21 @@ public class WorkLedgerTests
     }
 
     [Fact]
+    public async Task One_repository_spelled_in_two_cases_has_one_merge_queue()
+    {
+        // Each item carries its own `Repo:` line's spelling; GitHub's names are case-insensitive.
+        var db = TestDb.Create();
+        var ledger = new WorkLedger(db, TimeProvider.System);
+        await ledger.GetOrCreateAsync("shortcut", "sc-1", "One", "Acme/Widgets", null, CancellationToken.None);
+        await ledger.GetOrCreateAsync("shortcut", "sc-2", "Two", "acme/widgets", null, CancellationToken.None);
+        await ledger.GetOrCreateAsync("shortcut", "sc-3", "Elsewhere", "acme/gadgets", null, CancellationToken.None);
+
+        var queue = await ledger.ItemsOnRepoAsync(null, "ACME/widgets", new HashSet<WorkState> { WorkState.Intake }, CancellationToken.None);
+
+        Assert.Equal(["sc-1", "sc-2"], queue.Select(q => q.Item.ExternalId));
+    }
+
+    [Fact]
     public async Task New_item_starts_with_an_intake_row_and_transitions_are_timestamped_rows()
     {
         var time = new FixedTime(DateTimeOffset.Parse("2026-10-06T10:00:00Z"));
@@ -316,7 +331,8 @@ public class RunPipelineTests
             {
                 await OnOpen();
             }
-            return PrUrl;
+            // In the repository it was opened in (PrUrl for the sandbox): an item's pull request is in the item's repository.
+            return $"https://github.com/{repo.FullName}/pull/1";
         }
 
         /// <summary>Heads whose open PRs were turned back into drafts.</summary>

@@ -139,7 +139,8 @@ public sealed record Changeset(
 
     /// <summary>
     /// The repository whose changeset pull request the plan item is taking through the gate now (sc-25873): the repository of the
-    /// pull request its last <c>linked</c> row names, while its state (or the state it paused from) is one the gate drives. Null for
+    /// pull request its last <c>linked</c> row names — in the spelling its <c>changeset</c> row recorded, whatever case the URL
+    /// has — while its state (or the state it paused from) is one the gate drives. Null for
     /// an item that is no plan item, and for a plan item that waits on its stories, is being planned or has escalated — those work
     /// in the plan item's own repository.
     /// </summary>
@@ -161,7 +162,11 @@ public sealed record Changeset(
         {
             return null;
         }
-        return RepoOfPull(rows.LastOrDefault(e => e.Step == RunPipeline.Steps.Linked)?.Detail);
+        // Spelled as the plan recorded that repository's changeset (the plan item's own `Repo:` line, like its stories'), not as
+        // GitHub's URL spells it: the item's repository is matched against other items' (the merge queue, the freeze).
+        return RepoOfPull(rows.LastOrDefault(e => e.Step == RunPipeline.Steps.Linked)?.Detail) is not { } linked ? null
+            : All(rows).FirstOrDefault(c => Same(c.Repo, linked.FullName)) is { } changeset && Parsed(changeset.Repo) is { } recorded ? recorded
+            : linked;
     }
 
     /// <summary>The repository of the pull request a <c>linked</c> row's Detail names first, or null when it names none.</summary>

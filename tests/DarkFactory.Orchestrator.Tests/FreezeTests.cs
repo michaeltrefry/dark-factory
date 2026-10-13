@@ -687,6 +687,63 @@ public class FreezeTests
         Assert.Equal(FreezeStatus.Clear, await h.Freeze.CheckAsync(CancellationToken.None));
     }
 
+    [Fact]
+    public async Task One_repository_spelled_in_two_cases_is_one_repository_to_the_hot_file_count()
+    {
+        // GitHub's names are case-insensitive, and each item carries its own `Repo:` line's spelling.
+        var h = new H();
+        await h.MergedIn(Repo, "merge1aaaaaaaaaa", "src/hot.cs");
+        await h.MergedIn(Repo.ToUpperInvariant(), "merge2aaaaaaaaaa", "src/hot.cs");
+        await h.MergedIn(Repo, "merge3aaaaaaaaaa", "src/hot.cs");
+
+        var status = await h.Freeze.CheckAsync(CancellationToken.None);
+
+        Assert.Equal(FreezeTrigger.HotFile, status.Trigger);
+        Assert.Contains($"src/hot.cs on {Repo} was changed by 3 factory merges within", status.Detail);
+    }
+
+    private const string OtherRepo = "michaeltrefry/other-repo";
+
+    /// <summary>
+    /// A plan item of several repositories (sc-25873) that merged its changeset into <paramref name="mergedInto"/> and is the
+    /// repository <paramref name="now"/>'s by now: the merge's own record (<see cref="MergeFiles.Repo"/>) says where it went.
+    /// </summary>
+    private static Task<WorkItem> PlanItemMerged(H h, string mergedInto, string now, string commit, params string[] files) => h.ItemIn(now, WorkState.Planned,
+        (WorkState.MergeGate, RunPipeline.Steps.MergeFiles, new MergeFiles("main", files, mergedInto).ToDetail()),
+        (WorkState.Merge, null, commit),
+        (WorkState.Planned, null, $"the changeset of {mergedInto} merged as {commit}; 1 more to go"));
+
+    [Fact]
+    public async Task Main_red_reads_the_repository_a_plan_items_changeset_merged_into_not_the_one_the_item_works_in_now()
+    {
+        var h = new H { Repos = [Repo, OtherRepo] };
+        h.GitHub.Ci = new CiFacts(h.GitHub.Tip, [new CheckFact("build-test", true, "failure")]);
+        await PlanItemMerged(h, mergedInto: Repo, now: OtherRepo, "mergeAaaaaaaaaaa", "src/a.cs");
+
+        var status = await h.Freeze.CheckAsync(CancellationToken.None);
+
+        // The merge commit is the first repository's: asked there (asked in the other one, GitHub answers 404 and nothing is red).
+        Assert.Equal(FreezeTrigger.MainRed, status.Trigger);
+        Assert.Contains($"main of {Repo} is red", status.Detail);
+        Assert.Equal([$"compare {Repo} main mergeAaaaaaaaaaa", $"ci {h.GitHub.Tip}"], h.GitHub.Calls);
+    }
+
+    [Fact]
+    public async Task A_plan_items_changeset_merge_counts_as_a_hot_file_merge_of_the_repository_it_merged_into()
+    {
+        var h = new H();
+        await h.MergedIn(Repo, "merge1aaaaaaaaaa", "src/hot.cs");
+        await h.MergedIn(Repo, "merge2aaaaaaaaaa", "src/hot.cs");
+        Assert.Equal(FreezeStatus.Clear, await h.Freeze.CheckAsync(CancellationToken.None));
+        // The third merge of the file into the first repository is a plan item's, which works in another repository by now.
+        await PlanItemMerged(h, mergedInto: Repo, now: OtherRepo, "merge3aaaaaaaaaa", "src/hot.cs");
+
+        var status = await h.Freeze.CheckAsync(CancellationToken.None);
+
+        Assert.Equal(FreezeTrigger.HotFile, status.Trigger);
+        Assert.Contains($"src/hot.cs on {Repo} was changed by 3 factory merges within", status.Detail);
+    }
+
     private const string ChangesetBranch = "factory/changeset-sc-9";
 
     [Fact]

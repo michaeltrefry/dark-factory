@@ -437,7 +437,9 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
             .SelectMany(m => m.Files!.Files.Distinct(StringComparer.Ordinal).Select(f => (m.Repo, m.Files.Base, File: f, Merge: m)))
             // Per base branch (sc-25872): a plan's story merges into its changeset branch and that branch later into the default
             // branch, so counting across bases would count one change twice. Merges into one branch count as before.
-            .GroupBy(x => (x.Repo, x.Base, x.File))
+            // A repository is one whatever case an item's `Repo:` line spells it in (GitHub's names are case-insensitive): the key
+            // is lower-cased, the first merge's spelling is shown.
+            .GroupBy(x => (Repo: x.Repo.ToLowerInvariant(), x.Base, x.File))
             .Where(g => g.Count() >= options.HotFileMerges)
             .OrderByDescending(g => g.Count()).ThenBy(g => g.Key.Repo, StringComparer.Ordinal).ThenBy(g => g.Key.File, StringComparer.Ordinal)
             .ThenBy(g => g.Key.Base, StringComparer.Ordinal)
@@ -445,7 +447,7 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
         return hot is null
             ? null
             : new Hit(FreezeTrigger.HotFile,
-                $"{hot.Key.File} on {hot.Key.Repo} was changed by {hot.Count()} factory merges{IntoChangeset(hot.Key.Base)} within {Hours(options.HotFileWindow)} "
+                $"{hot.Key.File} on {hot.First().Repo} was changed by {hot.Count()} factory merges{IntoChangeset(hot.Key.Base)} within {Hours(options.HotFileWindow)} "
                 + $"({string.Join(", ", hot.Select(x => $"{Name(names, x.Merge.Row.WorkItemId)} as {Ci.Short(x.Merge.Row.Detail ?? "?")}"))}); "
                 + $"threshold {options.HotFileMerges}");
     }

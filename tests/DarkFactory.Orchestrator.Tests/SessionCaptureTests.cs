@@ -220,12 +220,22 @@ public sealed class SessionCaptureTests : IAsyncLifetime
     {
         // The failed/stopped end paths give the session end a time limit; it can run out during the settle wait.
         var item = await ItemAsync();
-        var costs = new FakeCosts(FixtureCost);
-        await using var capture = await Recorder(costs, settle: TimeSpan.FromMinutes(5)).StartAsync(item.Id, StreamJsonFixture.SessionId, CancellationToken.None);
-        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+        // A slow session end (here the router's answer; on a loaded machine the database writes too): slower than the 500 ms
+        // this test once waited before giving up, which then landed before the cost was stored.
+        var costs = new FakeCosts(FixtureCost) { Delay = TimeSpan.FromMilliseconds(750) };
+        var settle = TimeSpan.FromMinutes(5);
+        var time = new SettleSignal(settle);
+        var recorder = new SessionRecorder(Contexts(), costs, time, TextWriter.Null, costRetryDelays: [TimeSpan.Zero, TimeSpan.Zero], costSettleDelay: settle);
+        await using var capture = await recorder.StartAsync(item.Id, StreamJsonFixture.SessionId, CancellationToken.None);
+        using var cts = new CancellationTokenSource();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => capture.CompleteAsync(0, "error", fetchCost: true, cts.Token).WaitAsync(TimeSpan.FromSeconds(20)));
+        var completing = capture.CompleteAsync(0, "error", fetchCost: true, cts.Token);
+        // The caller gives up once the settle wait has begun — not after a guessed delay: on a loaded machine the session end's
+        // database writes and cost read can take longer than any fixed delay, and a caller that gives up before the cost is
+        // stored is a different case (the cost is then not kept, by design: the end paths are bounded).
+        await time.Waiting.Task.WaitAsync(TimeSpan.FromSeconds(60), TestContext.Current.CancellationToken);
+        await cts.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => completing.WaitAsync(TimeSpan.FromSeconds(60)));
 
         await using var db = Context();
         var session = await db.WorkerSessions.SingleAsync();
@@ -681,10 +691,33 @@ public sealed class SessionCaptureTests : IAsyncLifetime
 
         public DateTimeOffset[] CalledAt => [.. CallTimes];
 
-        public Task<SessionCost?> GetSessionCostAsync(string sessionId, CancellationToken ct)
+        /// <summary>How long each answer takes.</summary>
+        public TimeSpan Delay { get; init; }
+
+        public async Task<SessionCost?> GetSessionCostAsync(string sessionId, CancellationToken ct)
         {
             CallTimes.Enqueue(DateTimeOffset.UtcNow);
-            return Task.FromResult(answers[Math.Min(Interlocked.Increment(ref Calls), answers.Length) - 1]);
+            var answer = answers[Math.Min(Interlocked.Increment(ref Calls), answers.Length) - 1];
+            if (Delay > TimeSpan.Zero)
+            {
+                await Task.Delay(Delay, ct);
+            }
+            return answer;
+        }
+    }
+
+    /// <summary>The system clock, saying when a wait of <paramref name="settle"/> starts on it: the recorder's settle wait has begun.</summary>
+    private sealed class SettleSignal(TimeSpan settle) : TimeProvider
+    {
+        public TaskCompletionSource Waiting { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            if (dueTime == settle)
+            {
+                Waiting.TrySetResult();
+            }
+            return base.CreateTimer(callback, state, dueTime, period);
         }
     }
 

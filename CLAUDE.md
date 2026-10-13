@@ -508,8 +508,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   Repository set (sc-25874): a plan item may name several repositories, one `Repo: owner/name` line each
   (`RepoResolver.ResolveAll`: in order, repeats dropped, lines inside a ``` or ~~~ fence not read — a planner-created story
   carries planner text in a tilde fence, which must not widen a later planner's set; `RunPipeline.PlanRepositories`). The first stays the item's primary
-  repository — the ledger's `Repo` (except while the plan item takes another repository's changeset through the gate, sc-25873
-  below), the repository of a created story that names none; non-plan items
+  repository — the ledger's `Repo` (except while the plan item takes another repository's changeset through the gate, restored
+  when that pass ends: the `WorkItem.Repo` rule under sc-25873 below), the repository of a created story that names none; non-plan items
   still read only the first line. With one line or none the planner is seated exactly as above. With several, each must be one of
   the factory's configured repositories (`FactoryOptions.ConfiguredRepos`: `Factory:DefaultRepo` and `GitHub:Watch:Repos`, passed
   to the pipeline as `configuredRepos`), else the item escalates before any session, seat or grant, naming the unconfigured ones,
@@ -846,7 +846,13 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   session: the first repository that blocks stops the plan (its reason starts with that repository), so no planner session, story
   or changeset branch is spent in any repository; a warning is a row per repository (compared with that repository's last
   `ci-triggers` row only, `CiTriggerCheck.IsAbout`); the "changeset branch on origin" skip is per repository too. A repository the
-  plan item names is checked even if the plan then puts no story in it (not known before the planner runs). `CiTriggers.Check(files, base, head)` is asked about both kinds of PR the plan opens there: a story's
+  plan item names is checked even if the plan then puts no story in it (not known before the planner runs): a block for a plan
+  item of several repositories says so and names both ways out ("remove its `Repo:` line from the plan item if the plan should not
+  touch it, or fix the workflow …"; on a run continuing a recorded plan it says whether that plan has a story there). A stop says
+  what the ledger says an earlier run left (`PlanProgress`, also for `PlanRepositories`' "not configured" refusal): only a run
+  that plans afresh says "before it was planned or any story of it created" / "no story was created"; one continuing a recorded
+  plan with a `plan-creating` row says stories may already be on the board and are not released and cannot start (they are not
+  the plan's until `plan-stories`). `CiTriggers.Check(files, base, head)` is asked about both kinds of PR the plan opens there: a story's
   (base the changeset branch, head the story's `factory/<id>` branch) and the changeset's (base the default branch, head the
   changeset branch — a repository whose only trigger is `pull_request: branches: ['factory/**']` runs for every story and never
   for the PR that delivers the plan). A workflow reports on a PR when a `pull_request`/`pull_request_target` trigger's branch
@@ -911,27 +917,49 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (`Changeset.Delivered`); `Decide` never counts it an outsider; `Classify` treats an undelivered one as a dependency on every
   unmerged story of its repository, so a story behind a failed one through a changeset is Blocked and `plan-held`/`plan-stuck` and
   the comment say "behind sc-N, through the changeset of owner/name"; the claim check (`BlockedAsync` → `AwaitedChangesetsAsync`,
-  from the plan item's ledger) refuses a hand-moved story naming the changeset.
+  from the plan item's ledger) refuses a hand-moved story naming the changeset. Fail closed: the `plan` checkpoint is the only
+  record of changeset blockers, so when a plan item with more than one changeset has a `plan` row that no longer reads back
+  (`PlanRelease.RecordedRepos` null) the evaluation releases nothing (`plan-held`: `PlanRelease.HeldUnreadable`, written once) and
+  every story's claim is refused (`PlanRelease.PlanUnreadableRefusal`, a blocker-style refusal: parked once). A plan story's
+  repository at run time is its board `Repo:` line; `RunAsync` compares it with the repository the plan recorded for that story
+  (`RecordedRepoAsync`) and a mismatch escalates the story before any work ("recorded it in A, but its `Repo:` line now names B"),
+  as a story naming a repository with no changeset of the plan already did — it never merges into another repository's changeset.
   Ordered changeset pull requests — design (i), the plan item drives them in turn: with several changesets the plan item takes
   the first undelivered repository's changeset (in `Changeset.Ordered`) to its default branch once every story of that repository
   has merged (after that evaluation's releases), exactly as a one-repository plan does — Planned → Review → CI → MergeGate →
   Merge in THAT repository (`ChangesetPullRequestAsync` sets `WorkItem.Repo` to the changeset's repository; `RunAsync` resolves a
-  plan item's repository from `Changeset.PassRepo` — its last `linked` pull request's repository while its state, or the state it
-  paused from, is a gate state — so the gate policy, CI, CodeGraph risk, new-tests check, merge queue and worktrees are that
-  repository's) — then `MergeAsync` records `changeset-delivered` (`ChangesetDelivery`: repo, how — `merged` with pull request and
+  plan item's repository from `Changeset.PassRepo` — its last `linked` pull request's repository, in the spelling its `changeset`
+  row recorded (the plan item's `Repo:` line, like its stories'; not the URL's case), while its state, or the state it paused
+  from, is a gate state — so the gate policy, CI, CodeGraph risk, new-tests check, merge queue and worktrees are that
+  repository's). `PassRepo` is decided from the rows read UNDER the item's run lock, never from what was loaded before it (another
+  process may have finished one pass and opened the next meanwhile). `WorkItem.Repo` rule: it is the pass's repository from
+  Planned → Review until the pass ends — `MergeAsync` restores the plan item's primary repository (`Run.Primary`: the first
+  `Repo:` line) right before Merge → Planned and before the final Merge → Watch (`EndPassAsync`; a run that dies between the two
+  writes finds the item in Merge, where `PassRepo` names the pass again), and a pass that escalated keeps the pass's repository
+  until the item is re-run (the run's start restores the primary) or stopped. So outside a pass — Plan, Planned, Watch, Done —
+  it is the primary repository; whatever must know where a merge went reads the rows (`MergeFiles.Repo`, `changeset-delivered`,
+  `linked`). Every item, plan or not: `ReadPullAsync` refuses (escalates, nothing read or merged) a linked pull request whose
+  URL names another repository than the run's — a number alone names a different pull request there. Then `MergeAsync` records `changeset-delivered` (`ChangesetDelivery`: repo, how — `merged` with pull request and
   commit, `empty`, `merged-outside`), rewrites that pull request's description and, while another changeset is left, records
   Merge → Planned (the one new table row; Planned starts an attempt, so fix rounds restart) instead of reporting the plan merged.
   The last merge takes the old path (merged-reported, closeout, pr-report, Watch). A plan with ONE changeset writes none of the
   new rows and behaves exactly as before. Why (i) and not a ledger item per changeset: every board write of the pipeline is keyed
   by the item's board id and the ledger already scoped a plan item's attempt by Planned (`TransitionContext.StartsAttempt`);
   per-changeset items with no board item would need a second identity through intake, controls, the stopper and the dashboard.
-  What keeps passes apart (checkpoints carry no repository): verdicts, overlays, new-tests results and `gate-passed` are bound to
-  commit SHAs; fix rounds, stuck rounds and cost rounds restart at Planned; the queue's `queued`/`queue-turn` are read per
+  What keeps passes apart (checkpoints carry no repository): verdicts, overlays and new-tests results are bound to
+  commit SHAs; `gate-passed` is bound to its head SHA AND read per pass (a pull request found merged counts only when a
+  `gate-passed` of `Changeset.CurrentPass` names that head, `GatePassedAt`: an earlier repository's gate pass never vouches for
+  this one's); fix rounds, stuck rounds and cost rounds restart at Planned; the queue's `queued`/`queue-turn` are read per
   MergeGate stint; `linked` and the item's pull request are the last one; `Changeset.CurrentPass` (rows since the last Merge →
   Planned) scopes what is not — the fix-round cap (`FixCapOf`), the CI triages a head must report (`CiHeal.Unreported`), and the
   facts in the pull request body, closeout and escalation comment; `merge-files` names the repository merged into
-  (`MergeFiles.Repo`, only for a several-changeset plan), which the freeze's hot-file and main-red read instead of the item's
-  current repository. Consequence, accepted: while the plan item takes a changeset through the gate it is not Planned, so no
+  (`MergeFiles.Repo`, for every plan item's changeset merge — also a plan with one changeset, which may be in another repository
+  than the plan item's first), which the freeze's hot-file and main-red read instead of the item's current repository.
+  Repository spelling: GitHub's names are case-insensitive and each item carries its own `Repo:` line's spelling, so the merge
+  queue (`WorkLedger.ItemsOnRepoAsync`, like `MergeQueue.LockKey`) and the freeze's hot-file key match repositories
+  case-insensitively — two spellings never make two queues of one repository. Metrics (`LedgerMetrics`): a plan item with
+  several changesets counts as merged only at its LAST Merge row and only once every changeset is delivered
+  (`LedgerMetrics.MergeOf`), and is left out as sandbox work when ANY of its changesets is in a `Metrics:SandboxRepos` repository. Consequence, accepted: while the plan item takes a changeset through the gate it is not Planned, so no
   story is released until it comes back (stories released before go on); an escalated changeset pull request therefore also
   holds the stories not yet released.
   Empty and unused: a repository of the plan item no story uses gets no changeset; an empty changeset (or one a person merged)
@@ -941,7 +969,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (merged into main as …, url); not delivered: b (its changeset pull request url is Escalated), c (… not opened)") after the
   Escalated row and the comment repeats it with the remedies (`Changeset.DeliveryNote`: fix and `factory run`, which goes on with
   the first repository not delivered, or `factory stop --item`); later repositories' changesets are not opened; merged ones stay
-  merged. Stop (`ItemStopper`): the open pull request of every changeset is drafted, `plan-delivery` is recorded before the
+  merged. Stop (`ItemStopper`): the open pull request of every changeset is drafted in the changeset's own repository — every
+  `Changeset.All(history)` whenever the plan has at least one, never "the item's repository" (a plan whose stories are all in
+  another repository than its first has its one changeset there) — `plan-delivery` is recorded before the
   board is told, and the comment says what is delivered. Dashboard: `PlanView.Changesets` (`Changeset.States`, from the plan
   item's rows) shows each repository's changeset; an unreleased story's row shows its own repository. Reports: a changeset pull
   request's body lists its repository's stories and every repository's changeset; the closeout lists each repository's changeset

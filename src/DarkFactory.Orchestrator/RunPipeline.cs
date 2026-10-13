@@ -418,6 +418,13 @@ public sealed partial class RunPipeline(
         public WorkStory Story => Spec.Story;
 
         /// <summary>
+        /// The repository the item's story names (sc-25873). <see cref="Repo"/> for every item but a plan item taking a changeset
+        /// pull request through the gate in another repository: the item is that repository's only for that pass, and this
+        /// one's again once the pass has ended (<see cref="MergeAsync"/>).
+        /// </summary>
+        public required RepoRef Primary { get; init; }
+
+        /// <summary>
         /// The item's branch, whose pull request is the item's: its own <c>factory/&lt;id&gt;</c> branch, or — a plan item taking its
         /// changeset to the default branch (sc-25872) — the plan's changeset branch.
         /// </summary>
@@ -609,15 +616,9 @@ public sealed partial class RunPipeline(
             log.WriteLine($"[paused] {known.ExternalId} parked: {unfinished}");
             return await OutcomeAsync(known, $"{known.ExternalId} parked: {unfinished}", ct);
         }
-        var repo = RepoResolver.Resolve(story.Description, defaultRepo);
-        // A plan item taking one of its changesets through the gate (sc-25873) works in that changeset's repository until it has
-        // merged: the pull request, the gate policy, CI and the merge queue are that repository's. Any other item, and a plan item
-        // in any other state, works in the repository its story names.
-        if (known is not null && Plans.Changeset.PassRepo(await ledger.HistoryAsync(known, ct)) is { } pass)
-        {
-            repo = pass;
-        }
-        var item = await ledger.GetOrCreateAsync(Naming.Source, Naming.Format(storyId), story.Name, repo.FullName, IntakeDetail(story), ct, spec.Epic?.Id);
+        // The repository the item's story names: every item's own, and a plan item's primary one (sc-25873).
+        var primary = RepoResolver.Resolve(story.Description, defaultRepo);
+        var item = await ledger.GetOrCreateAsync(Naming.Source, Naming.Format(storyId), story.Name, primary.FullName, IntakeDetail(story), ct, spec.Epic?.Id);
 
         await using var runLock = await locks.TryAcquireAsync(item.Id, ct);
         if (runLock is null)
@@ -625,6 +626,12 @@ public sealed partial class RunPipeline(
             log.WriteLine($"[{item.State}] {item.ExternalId} is already running; not touching it.");
             return new RunOutcome(item.Id, item.State, null, null, $"{item.ExternalId} is already running.");
         }
+        // A plan item taking one of its changesets through the gate (sc-25873) works in that changeset's repository until it has
+        // merged: the pull request, the gate policy, CI and the merge queue are that repository's. Any other item, and a plan item
+        // in any other state, works in the repository its story names. Decided from the rows read under the run lock, never from
+        // what was loaded before it: another process may have finished one repository's pull request and opened the next one's
+        // meanwhile, and this run would take that one through the gate as the earlier repository's.
+        var repo = Plans.Changeset.PassRepo(await ledger.HistoryAsync(item, ct)) ?? primary;
         // Re-read under the lock: another run may have moved the item since it was loaded.
         await ledger.RefreshAsync(item, story.Name, repo.FullName, spec.Epic?.Id, ct);
         // A story a plan created records its plan (sc-25871), from the ledger's own record of what the plan created. Looked up
@@ -641,6 +648,7 @@ public sealed partial class RunPipeline(
         var ofPlan = item.PlanItemId is { } plan ? await ledger.ChangesetOfAsync(plan, repo, ct) : (null, []);
         var run = new Run(spec, repo, item)
         {
+            Primary = primary,
             Branch = changeset?.Branch ?? story.Kind.BranchName(story.Id),
             BaseBranch = ofPlan.Changeset?.Branch,
             Changeset = changeset,
@@ -652,6 +660,13 @@ public sealed partial class RunPipeline(
             ? $"{item.ExternalId} is a story of the plan whose changeset branch is {recorded.Branch} in "
                 + $"{string.Join(", ", ofPlan.Recorded.Select(c => c.Repo).Distinct(StringComparer.OrdinalIgnoreCase))}, and that plan has no changeset "
                 + $"branch in {repo}: the story cannot merge into its plan's changeset. Its `Repo:` line must name the plan's repository."
+            // Nor into another repository's changeset of its plan (sc-25873): the plan counts the story for the repository it
+            // recorded it in, and that repository's changeset would go to its default branch without the story's work.
+            : item.PlanItemId is { } owner && await RecordedRepoAsync(owner, item.ExternalId, ct) is { } planned
+                && !string.Equals(planned, repo.FullName, StringComparison.OrdinalIgnoreCase)
+            ? $"{item.ExternalId} is a story of a plan that recorded it in {planned}, but its `Repo:` line now names {repo}: there it "
+                + $"would merge into another repository's changeset of the plan, while the plan still waits for it in {planned}. "
+                + $"Its `Repo:` line must name {planned}."
             : null;
 
         if (Lifecycle.IsTerminal(item.State))

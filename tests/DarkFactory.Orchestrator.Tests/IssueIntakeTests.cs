@@ -567,7 +567,7 @@ public class IssueIntakeTests
         Assert.False(h.GitHub.IsOpen(Repo, Number));
         Assert.Empty(h.GitHub.LabelsOf(Repo, Number));
         Assert.Contains($"close {Repo}#{Number}", h.GitHub.Writes);
-        Assert.Contains(h.GitHub.FactoryComments(Repo, Number), c => c.Body.Contains(PrUrl));
+        Assert.Contains(h.GitHub.FactoryComments(Repo, Number), c => c.Body.Contains("https://github.com/acme/widgets/pull/1"));
         var item = await h.Item();
         Assert.Equal(("github", "acme/widgets", "Count whitespace-only input as zero words"), (item.Source, item.Repo, item.Title));
     }
