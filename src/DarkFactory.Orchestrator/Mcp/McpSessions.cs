@@ -43,10 +43,12 @@ public interface IMcpSessions
 /// <c>/bin/ls -led</c>), else the session is not started (<see cref="FactoryUnavailableException"/>: re-run the setup). The file is
 /// deleted and the credential revoked when the session ends: afterwards it opens nothing. Residual: while the session runs, a
 /// process that can read the file (the owner, root, or another process of the worker user — none runs then, under the worker run
-/// lock) could use the session's granted tools through the proxy.
+/// lock) could use the session's granted tools through the proxy. With <paramref name="owner"/> (the item whose run opens the
+/// sessions, e.g. <c>sc-7</c>) each file is named <c>&lt;owner&gt;.&lt;guid&gt;.json</c>, so another run's <see cref="SweepAsync"/>
+/// knows whose run lock guards it (sc-25987); without one the file is nobody's and any sweep deletes it.
 /// </summary>
 public sealed partial class McpProxySessions(McpProxy proxy, string directory, string? workerUser = null,
-    Func<string, CancellationToken, Task<string>>? readAcl = null) : IMcpSessions
+    Func<string, CancellationToken, Task<string>>? readAcl = null, ItemRef? owner = null) : IMcpSessions
 {
     /// <summary>The work root's directory of session <c>--mcp-config</c> files.</summary>
     public const string DirectoryName = "mcp-sessions";
@@ -55,14 +57,20 @@ public sealed partial class McpProxySessions(McpProxy proxy, string directory, s
     private const UnixFileMode ConfigFileMode = UnixFileMode.UserRead | UnixFileMode.UserWrite; // 0600
 
     /// <summary>
-    /// Deletes every file a crashed process left in <paramref name="directory"/> (its credentials died with that process's proxy). Run
-    /// only while no session of this kind runs (the triage holds the worker run lock).
+    /// Deletes every file a crashed process left in <paramref name="directory"/> (its credentials died with that process's proxy),
+    /// and none a live run's session is using (sc-25987, E6): a file is deleted only under <paramref name="live"/>'s claim on the
+    /// item it is named for (<see cref="ItemNaming.OwnerOfSessionFile"/>), and left alone while another run holds that item's run lock.
     /// </summary>
-    public static void Sweep(string directory)
+    public static async Task SweepAsync(string directory, Ledger.LiveRuns live, CancellationToken ct)
     {
-        if (Directory.Exists(directory))
+        if (!Directory.Exists(directory))
         {
-            foreach (var file in Directory.EnumerateFiles(directory))
+            return;
+        }
+        foreach (var file in Directory.EnumerateFiles(directory).ToList())
+        {
+            await using var claim = await live.TryClaimAsync(ItemNaming.OwnerOfSessionFile(Path.GetFileName(file)), ct);
+            if (claim is not null)
             {
                 File.Delete(file);
             }
@@ -83,7 +91,7 @@ public sealed partial class McpProxySessions(McpProxy proxy, string directory, s
             Directory.CreateDirectory(directory);
         }
         var grant = proxy.Grant(repos, profile);
-        var path = Path.Combine(Path.GetFullPath(directory), $"{Guid.NewGuid():N}.json");
+        var path = Path.Combine(Path.GetFullPath(directory), $"{(owner is null ? "" : $"{owner}.")}{Guid.NewGuid():N}.json");
         try
         {
             var options = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };

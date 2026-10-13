@@ -494,7 +494,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   scripts/setup-worker-user.sh`"; not checked with `Worker:RunAs=none`; outside the triage
   worktree, so the confined session cannot Read it into its transcript) after checkout and before launch, and when the session
   ends deletes it and revokes the credential (`McpProxyGrant.Dispose`: refused from then on); leftover files are swept before
-  each triage. Residual, accepted: while the session runs, a process that can read that file — the owner, root, or another
+  each triage (a live run's are kept, sc-25987: "Clean-up under overlapping runs"). Residual, accepted: while the session runs, a process that can read that file — the owner, root, or another
   `_factory` process (none runs then: the triage holds the worker run lock) — could call the session's granted tools through
   the proxy. Upstream tokens are only in the owner process (never in the worker's env, argv, worktree, prompt or transcript;
   `McpProxyTests`). Every MCP tool use still taints the session (`mcp:<tool>`; triage is already tainted by the issue text and
@@ -1275,6 +1275,67 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   changeset is on the default branch.
 - One run per item: `RunPipeline` holds a Postgres advisory lock on the item id (`PostgresRunLocks`) for the whole
   run, and `WorkItem.Version` is an optimistic concurrency token, so a stale writer's save throws.
+- Clean-up under overlapping runs (Phase 4b, sc-25987; `Ledger/LiveRuns.cs`, `Git/CloneLock.cs`; the factory is still
+  single-worker — `WorkerLock` is unchanged — so today this changes no behaviour): no sweep decides from "no other run exists".
+  Whose a leftover is: it carries its item in its name — a worktree directory by `ItemNaming.OwnerOfLeftover` (`factory-<item>`,
+  the changeset worktree `factory-changeset-<item>`, a triage's `factory-triage-<item>`, a planner's worktree or seat
+  `factory-plan-<item>`, the gate's test worktrees `gate-<item>[-base|-head|-base-retry[-N]]`; the merge queue's base-update
+  worktree is the item's own `factory-<item>`), an MCP session file by `ItemNaming.OwnerOfSessionFile` (`<item>.<guid>.json`:
+  `McpProxySessions` is given its `owner`, the item whose run opens the sessions) — and it is a live run's exactly while that
+  item's run lock is held. Each sweep asks `LiveRuns.TryClaimAsync(owner)`: null (another run holds the item's lock) → nothing
+  of it is touched; otherwise a `LeftoverClaim`, for another item that item's run lock itself, held until the deletion (the
+  directory and the clone's `worktree prune`) is done, so no run of it starts in between. A name of no item, an item the ledger
+  never saw (nothing can run it; so also a session file written before files were named) and the asking session's own item
+  (`self`: its run already holds that lock, and what an earlier, dead run of it left is its to delete) are claimed without a
+  lock. The three sweeps: the start-of-run worktree sweep (`FactoryRunner.RunAsync` → `GitWorkspace.SweepOrphansAsync(keep,
+  live, ct)`: the ledger's rule `RunPipeline.WorktreeIsResumableAsync` is asked first and a kept worktree takes no lock; one it
+  would delete is claimed, the rule asked again under the lock — the item's run may have ended as the lock was taken — and only
+  then deleted; no `self`, since the pipeline has not taken its item's lock yet), the triage's and the planner's seat sweeps
+  (`SandboxTriageRunner`, `SandboxPlanRunner`: nothing is resumed, `self` = the session's item, `SandboxTriageRunner.Leftovers`)
+  and the MCP session-file sweep (`McpProxySessions.SweepAsync(directory, live, ct)`, by both). A single run sweeps exactly what
+  it did before, in the same places: with no other run every lock is free. A swept item's run lock is held only for the
+  deletion, so a `factory stop` of that item landing in that moment answers "is running" and is finished by the next poll.
+  The shared clone: `<WorkRoot>/repos/<owner>/<name>` has one writer at a time, `CloneLock` — a lock file
+  `<WorkRoot>/clone-locks/<owner>/<name>.lock` held exclusively while open (between processes too; the OS frees it if its holder
+  dies), waited for with a 50 ms retry until the caller's token is cancelled. A wait is never silent (clean-up waits with no
+  cancellation): once it has lasted `CloneLock.ReportEvery` (30 s), and every 30 s after, a line goes to standard error —
+  `[clone-lock] waited N s for <lock file> and still waiting (…): <why the last try failed>` (`CloneLock.WaitReport`) — so a
+  stuck holder, or an I/O error on the lock file that does not go away (.NET reports both alike, so both are retried), shows.
+  `GitWorkspace` holds it around every git
+  operation that changes the clone's refs or worktree list, together with the ref reads that depend on what it just wrote:
+  clone/fetch/`remote set-head` through the start-point read, the prune of the replaced worktree's registration and `worktree
+  add` in one hold (`ReplaceWorktreeAsync`: `PrepareAsync`, `RestoreAsync`, each checkout of `PrepareSeatAsync`, and
+  `PrepareCommitAsync`, which fetches nothing), `BranchStartAsync`, `CreateBranchAsync` with its push, every other `worktree
+  prune` (`RemoveAsync`, `RemoveSeatAsync`, the sweeps), `CommitAndPushAsync`'s commit and push (not its `add -A`),
+  `MergeBaseAsync`'s merge, `PushAsync`, and the fetch of
+  `ChangedFilesAsync` and of a reviewer's read of a commit the clone lacks. What is slow and needs no lock is done before it
+  is taken, never under it: a worktree directory is always deleted first (sandboxed, that is a run of the launch helper; also
+  the directory a fresh worktree replaces, and what a failed `worktree add` left, deleted once the lock is released — the
+  directory is its item's, which only that item's run or a sweep under its run lock touches, so nothing else can act on it
+  half deleted; its stale registration is pruned under the lock), and the installation token of a fetch or push is minted
+  first (a GitHub call) and passed in — still one fresh token per operation, never cached (`CreateBranchAsync` uses one for
+  its fetch and its push), none without a `PushGrant`, and none when `CommitAndPushAsync` finds nothing to commit and nothing
+  ahead of the base (read before the lock). A token minted before a wait of an hour would have expired; the push then fails
+  and the run with it. No git call leaves a process behind to write the clone outside the lock: `OwnerGit` sets
+  `gc.autoDetach=false` and `maintenance.autoDetach=false`, so the automatic maintenance that ends a `fetch`, `commit` or
+  `merge` (`gc --auto`: `pack-refs`, `worktree prune`) runs inside the call, under the lock, not detached.
+  The lock is an advisory `flock`, which any process that can open the file — read-only is enough — can take, and the work
+  root's inheritable ACL entry lets the worker user read everything made under it. So, sandboxed, a `GitWorkspace` closes
+  `<WorkRoot>/clone-locks` to the worker user before it takes its first lock (`IWorkerSandbox.CloseToWorkerAsync`, owner-side,
+  no root and no change to the set-up script or the launch helper: `/bin/chmod -N` removes every ACL entry of the directory,
+  the inherited one included, so nothing made in it later inherits one; mode `0700`; then `/bin/ls -led` must show
+  `drwx------` and no ACL entry at all, `WorkerSandbox.IsClosed`) — code a worker runs (`dotnet test`, `cargo test`) cannot
+  open a lock file, so it cannot hold a clone's lock against other runs. Fail closed: a directory that cannot be closed or
+  does not read back closed is a broken set-up, `FactoryUnavailableException` (`the clone locks: …`, factory-wide: no lock is
+  taken, no git runs, nothing is recorded against the item). Each `GitWorkspace` (each run) closes and checks it once; with
+  `Worker:RunAs=none` there is no worker user and nothing is closed. Reads by object take no lock (a commit's tree, files,
+  diff and grep, `ReopenAsync`, `HeadAsync`, `OverlayAsync`, which writes only its worktree's index and files). Private
+  `…LockedAsync` helpers expect the lock; it is never taken twice by one call chain (a second open would wait for ever). The
+  lock is per clone path, so on a case-insensitive volume two spellings of one repository share it, as they share the clone.
+  Two seats at once each hold a checkout at `…/<owner>/<name>`, so git numbers the second one's admin dir (`widgets1`):
+  `AdminDirAsync` finds a worktree's admin dir by its `gitdir` file, not only by name. Not changed here (later Phase 4b
+  stories): the worker run lock's scope, the intake loop's dispatch, the sandbox user (`DeleteAsWorkerAsync` and every helper
+  exit still kill every `_factory` process) and settings.
 - Workers lead their own process group (launched via `/usr/bin/perl` `setpgrp` + `exec`); the pid is checkpointed
   (`worker-started`) as soon as the process exists, and a resumed Implement stops a still-running orphan's group
   (`ClaudeWorker.StopOrphanAsync`, only if it is still a group leader running `Worker:ClaudePath`) before going on.
@@ -1410,12 +1471,14 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `--git-dir`/`--work-tree`, with the admin dir found from the clone's side (never the worker-writable `.git`
   file, also on resume), and every owner-side git call (all go through `GitWorkspace`) is isolated from the
   owner's own git config by `Git/OwnerGit.cs` (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_LFS_SKIP_SMUDGE=1`;
-  `-c core.hooksPath=/dev/null`, `core.fsmonitor=false`, `rerere.enabled=false`, LFS filters emptied), so no hook, filter or
+  `-c core.hooksPath=/dev/null`, `core.fsmonitor=false`, `rerere.enabled=false`, LFS filters emptied, `gc.autoDetach=false` and
+  `maintenance.autoDetach=false` — no detached maintenance outside the clone's lock, sc-25987), so no hook, filter or
   merge driver a PR's files or `.gitattributes` select runs as the owner; worktrees live under the owner-owned work root (root-owned parent), are shared with
   `_factory` by an inheritable ACL set on the empty directory before checkout (never `chmod -R`, which follows
   symlinks), and are deleted (as `_factory` first) once the PR is open or the item escalates. Only a paused or
   crashed Implement or fix round keeps its worktree for resume; a worker that won't stop marks its exception
-  (`WorkerStillRunning`) so nothing deletes under it. Each run sweeps worktrees no run will resume.
+  (`WorkerStillRunning`) so nothing deletes under it. Each run sweeps worktrees no run will resume, never one a
+  live run owns (sc-25987, above).
   The App private key never reaches a worker's env, argv or worktree (`ClaudeWorkerTests`).
 - Every worker stdout line is a `session_events` row (E7): `ClaudeWorker` taps each line (`WorkerCallbacks.OnLine`) into a
   bounded channel that `SessionRecorder` drains into Postgres in order (gapless `Sequence`, non-JSON lines kept as `raw`);

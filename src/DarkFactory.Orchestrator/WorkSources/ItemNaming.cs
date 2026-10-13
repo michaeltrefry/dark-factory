@@ -60,6 +60,44 @@ public sealed record ItemNaming(string Source, string Prefix, string Noun)
         return ParseAny(name.StartsWith(changeset, StringComparison.Ordinal) ? name[changeset.Length..] : name);
     }
 
+    /// <summary>What follows <c>factory-</c> in the name of a triage's worktree and of a planner's seat, before the item.</summary>
+    private static readonly string[] SeatPrefixes = ["triage-", "plan-"];
+
+    private static readonly System.Text.RegularExpressions.Regex GateRun = new("^gate-(?<item>[a-z]+-[0-9]+)(-[a-z0-9-]*)?$");
+
+    /// <summary>
+    /// The item whose run made a directory under a worktrees root (sc-25987): what <see cref="OfWorktree"/> names, a triage's
+    /// worktree (<c>factory-triage-gh-3</c>), a planner's seat (<c>factory-plan-sc-7</c>) or one of the gate's test worktrees
+    /// (<c>gate-sc-7-base</c>, <c>-head</c>, <c>-base-retry</c>, <c>-base-retry-2</c>: <see cref="Gate.NewTestsCheck.RunName"/>);
+    /// null for any other name. It says whose run lock guards the directory, never whether a run would resume in it.
+    /// </summary>
+    public static ItemRef? OwnerOfLeftover(string worktreeName)
+    {
+        const string prefix = "factory-";
+        if (OfWorktree(worktreeName) is { } item)
+        {
+            return item;
+        }
+        if (GateRun.Match(worktreeName) is { Success: true } gate)
+        {
+            return Exact(gate.Groups["item"].Value);
+        }
+        return worktreeName.StartsWith(prefix, StringComparison.Ordinal)
+            && SeatPrefixes.FirstOrDefault(p => worktreeName.AsSpan(prefix.Length).StartsWith(p, StringComparison.Ordinal)) is { } seat
+            ? Exact(worktreeName[(prefix.Length + seat.Length)..])
+            : null;
+    }
+
+    /// <summary>
+    /// The item an MCP session file is named for, <c>&lt;item&gt;.&lt;guid&gt;.json</c> (<see cref="Mcp.McpProxySessions"/>); null for
+    /// any other name (a file written before sessions were named for their item is nobody's).
+    /// </summary>
+    public static ItemRef? OwnerOfSessionFile(string fileName) =>
+        fileName.Split('.') is [var item, _, "json"] ? Exact(item) : null;
+
+    /// <summary>An external id exactly as <see cref="Format"/> writes it (<c>sc-7</c>): never a bare number, another case or padding.</summary>
+    private static ItemRef? Exact(string value) => ParseAny(value) is { } item && item.ToString() == value ? item : null;
+
     /// <summary>
     /// Parses <c>&lt;prefix&gt;-&lt;n&gt;</c> (any case). A bare number is a Shortcut story id (what <c>factory run 1234</c>
     /// always meant); other sources need their prefix.
