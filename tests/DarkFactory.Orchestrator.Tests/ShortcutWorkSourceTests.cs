@@ -140,10 +140,10 @@ public class ShortcutWorkSourceTests
     public async Task Work_start_up_check_reports_a_bad_scope_before_polling()
     {
         var board = new FakeShortcutBoard();
-        Assert.Null(await FactoryRunner.CheckWatchScopeAsync(Options("darkfactory"),
-            FactoryRunner.CreateWorkSource(Options("darkfactory"), board.Client()), CancellationToken.None));
-        Assert.Contains("no Shortcut team 'nope'", await FactoryRunner.CheckWatchScopeAsync(Options("darkfactory,nope"),
-            FactoryRunner.CreateWorkSource(Options("darkfactory,nope"), board.Client()), CancellationToken.None));
+        Assert.Null(await FactoryRunner.CheckWatchScopeAsync(
+            WorkSourceRegistry.Shortcut(Options("darkfactory"), board.Client()), CancellationToken.None));
+        Assert.Contains("no Shortcut team 'nope'", await FactoryRunner.CheckWatchScopeAsync(
+            WorkSourceRegistry.Shortcut(Options("darkfactory,nope"), board.Client()), CancellationToken.None));
     }
 
     [Fact]
@@ -154,9 +154,9 @@ public class ShortcutWorkSourceTests
         {
             ValidateScopeFails = new InvalidOperationException("board says no"),
         };
-        Assert.Equal("board says no", await FactoryRunner.CheckWatchScopeAsync(Options("darkfactory"), source, CancellationToken.None));
+        Assert.Equal("board says no", await FactoryRunner.CheckWatchScopeAsync(source, CancellationToken.None));
         source.ValidateScopeFails = null;
-        Assert.Null(await FactoryRunner.CheckWatchScopeAsync(Options("darkfactory"), source, CancellationToken.None));
+        Assert.Null(await FactoryRunner.CheckWatchScopeAsync(source, CancellationToken.None));
     }
 
     private static readonly ChildItem[] Plan =

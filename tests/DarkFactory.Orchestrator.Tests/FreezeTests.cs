@@ -110,7 +110,7 @@ public class FreezeTests
         {
             var item = new WorkItem
             {
-                Source = RunPipeline.Source, ExternalId = $"sc-{500 + ++_items}", Title = "seeded", Repo = repo, State = final,
+                Source = ItemNaming.Shortcut.Source, ExternalId = $"sc-{500 + ++_items}", Title = "seeded", Repo = repo, State = final,
                 CreatedAt = Time.GetUtcNow(), UpdatedAt = Time.GetUtcNow(),
             };
             Db.WorkItems.Add(item);
@@ -295,7 +295,7 @@ public class FreezeTests
         var h = new H();
         var runner = new CountingRunner();
         var status = new IntakeStatus(h.Time);
-        var unreadable = new IntakeLoop(new Ready(1), runner, new IntakeOptions(TimeSpan.FromMinutes(1)), h.Time,
+        var unreadable = new IntakeLoop([new IntakeLane(new Ready(1), runner)], new IntakeOptions(TimeSpan.FromMinutes(1)), h.Time,
             NullLogger<IntakeLoop>.Instance, new UnreadableFreeze(h.Ledger), status: status);
 
         await unreadable.PollOnceAsync(CancellationToken.None);
@@ -303,7 +303,7 @@ public class FreezeTests
         Assert.Contains("Poll failed", status.FactoryError!.Message);
 
         await h.Ledger.FreezeAsync(FreezeTrigger.MainRed, "main is red", null, CancellationToken.None);
-        var frozen = new IntakeLoop(new Ready(1), runner, new IntakeOptions(TimeSpan.FromMinutes(1)), h.Time,
+        var frozen = new IntakeLoop([new IntakeLane(new Ready(1), runner)], new IntakeOptions(TimeSpan.FromMinutes(1)), h.Time,
             NullLogger<IntakeLoop>.Instance, h.Ledger, status: status);
         await frozen.PollOnceAsync(CancellationToken.None);
         Assert.Equal(0, runner.Runs); // no ready story is even listed
@@ -319,7 +319,7 @@ public class FreezeTests
         var h = new H();
         var status = new IntakeStatus(h.Time);
         var runner = new CountingRunner { Deferred = "factory frozen (main-red): main is red" };
-        var loop = new IntakeLoop(new Ready(1, 2), runner, new IntakeOptions(TimeSpan.FromMinutes(1)), h.Time, NullLogger<IntakeLoop>.Instance,
+        var loop = new IntakeLoop([new IntakeLane(new Ready(1, 2), runner)], new IntakeOptions(TimeSpan.FromMinutes(1)), h.Time, NullLogger<IntakeLoop>.Instance,
             h.Ledger, status: status);
 
         await loop.PollOnceAsync(CancellationToken.None);
@@ -453,7 +453,7 @@ public class FreezeTests
         await h.Item(WorkState.Review, (WorkState.Intake, null, null), (WorkState.Implement, null, null), (WorkState.Review, null, null)); // sc-502
         await h.Ledger.SetAsync(ControlScope.Item("sc-502"), ControlState.Stopping, "tester", CancellationToken.None);
 
-        Assert.Equal([502, 501], await RunPipeline.InFlightAsync(new WorkLedger(h.Db, h.Time), CancellationToken.None, h.Ledger));
+        Assert.Equal([502, 501], await RunPipeline.InFlightAsync(new WorkLedger(h.Db, h.Time), ItemNaming.Shortcut, CancellationToken.None, h.Ledger));
     }
 
     [Fact]
@@ -465,8 +465,8 @@ public class FreezeTests
         // stopped; gh-9 ready.
         var shortcut = new DeferringRunner([5, 6], deferred: 6);
         var issues = new DeferringRunner([8]);
-        var loop = new IntakeLoop(new Ready(7), shortcut, new IntakeOptions(TimeSpan.FromMinutes(1)), h.Time, NullLogger<IntakeLoop>.Instance,
-            h.Ledger, status: status, moreLanes: [new IntakeLane(new Ready(9), issues)]);
+        var loop = new IntakeLoop([new IntakeLane(new Ready(7), shortcut), new IntakeLane(new Ready(9), issues)], new IntakeOptions(TimeSpan.FromMinutes(1)), h.Time,
+            NullLogger<IntakeLoop>.Instance, h.Ledger, status: status);
 
         await loop.PollOnceAsync(CancellationToken.None);
 
@@ -919,8 +919,8 @@ public class FreezeTests
         var status = new IntakeStatus(h.Time);
         var prepares = 0;
         var issues = new IntakeLane(new Ready(2), runner, _ => { prepares++; return Task.CompletedTask; });
-        var loop = new IntakeLoop(new Ready(1), runner, new IntakeOptions(TimeSpan.FromMinutes(1)), h.Time, NullLogger<IntakeLoop>.Instance,
-            h.Ledger, status: status, moreLanes: [issues], freeze: ct => h.Freeze.CheckAsync(ct));
+        var loop = new IntakeLoop([new IntakeLane(new Ready(1), runner), issues], new IntakeOptions(TimeSpan.FromMinutes(1)), h.Time, NullLogger<IntakeLoop>.Instance,
+            h.Ledger, status: status, freeze: ct => h.Freeze.CheckAsync(ct));
 
         await loop.PollOnceAsync(CancellationToken.None);
 
@@ -938,7 +938,7 @@ public class FreezeTests
         {
             var item = new WorkItem
             {
-                Source = RunPipeline.Source, ExternalId = $"sc-{900 + i}", Title = "seeded", Repo = Repo, State = WorkState.Escalated,
+                Source = ItemNaming.Shortcut.Source, ExternalId = $"sc-{900 + i}", Title = "seeded", Repo = Repo, State = WorkState.Escalated,
                 CreatedAt = DateTimeOffset.UtcNow, UpdatedAt = DateTimeOffset.UtcNow,
             };
             db.WorkItems.Add(item);
@@ -1053,7 +1053,7 @@ public class FreezeTests
         {
             var earlier = new WorkItem
             {
-                Source = RunPipeline.Source, ExternalId = "sc-600", Title = "earlier", Repo = Repo, State = WorkState.Watch,
+                Source = ItemNaming.Shortcut.Source, ExternalId = "sc-600", Title = "earlier", Repo = Repo, State = WorkState.Watch,
                 CreatedAt = DateTimeOffset.UtcNow, UpdatedAt = DateTimeOffset.UtcNow,
             };
             db.WorkItems.Add(earlier);

@@ -43,7 +43,7 @@ public interface IItemRunner
 }
 
 /// <summary>
-/// <c>factory work</c>: polls the work source at a fixed interval (the Mac exposes no webhook
+/// <c>factory work</c>: polls the work sources at a fixed interval (the Mac exposes no webhook
 /// endpoint) and runs each in-flight or ready item through the pipeline, one at a time. The
 /// pipeline's Intake claims the item; its run lock stops a second process running the same item.
 /// While the factory is paused (<see cref="Controls.ControlScope.Factory"/>, the usage pause
@@ -55,17 +55,19 @@ public interface IItemRunner
 /// (<see cref="FactoryUnavailableException"/>, a ledger database error, or the poll itself) ends the poll and escalates
 /// nothing; any other failure counts against its item, and after <see cref="IntakeOptions.MaxItemFailures"/> in a row
 /// the loop gives up on the item (<see cref="IItemRunner.GiveUpAsync"/>) instead of retrying it every poll.
-/// <paramref name="moreLanes"/> adds work sources after the first (GitHub issues, sc-25385), polled in turn by the same loop, so
+/// <paramref name="lanes"/> holds one lane per work source that is watched or has its credential (sc-25982,
+/// <see cref="WorkSourceRegistry.Lanes"/>: any set of them, in <see cref="WorkSourceRegistry.Kinds"/> order; an unwatched one
+/// lists nothing ready and only has its in-flight items finished; none polls nothing), polled in turn by the same loop, so
 /// their runs never overlap; a source whose listing fails is skipped for that poll without holding up the others. Items are
-/// keyed by their external id (<c>sc-12</c>, <c>gh-3</c>) on the dashboard. A run deferred by the freeze evaluator
+/// keyed by their external id (<c>sc-12</c>, <c>gh-3</c>, <c>kb-4</c>) on the dashboard. A run deferred by the freeze evaluator
 /// (<see cref="RunOutcome.Deferred"/>) is shown on the dashboard and ends the poll's new work: no ready item of any lane is run,
 /// and a lane's in-flight items stop at its first deferral — but every lane's in-flight items are run up to then, and those
 /// being stopped come first (<see cref="IItemRunner.InFlightAsync"/>), so a pending Stop is finished in a frozen factory too.
 /// <paramref name="freeze"/>, when set, is the
 /// freeze evaluator run at the start of each poll: frozen (or unable to check), no lane is prepared (no triage) or listed.
 /// </summary>
-public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOptions options, TimeProvider time, ILogger<IntakeLoop> logger,
-    Controls.IControls? controls = null, Router.UsageMonitor? usage = null, IntakeStatus? status = null, IReadOnlyList<IntakeLane>? moreLanes = null,
+public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions options, TimeProvider time, ILogger<IntakeLoop> logger,
+    Controls.IControls? controls = null, Router.UsageMonitor? usage = null, IntakeStatus? status = null,
     Func<CancellationToken, Task<Controls.FreezeStatus>>? freeze = null)
     : BackgroundService
 {
@@ -124,7 +126,6 @@ public sealed class IntakeLoop(IWorkSource source, IItemRunner runner, IntakeOpt
     /// <summary>One poll: resume in-flight items first, then run newly ready ones. Returns when a usage pause in effect lifts, if one is.</summary>
     public async Task<DateTimeOffset?> PollOnceAsync(CancellationToken ct)
     {
-        IReadOnlyList<IntakeLane> lanes = [new IntakeLane(source, runner), .. moreLanes ?? []];
         var work = new List<(IntakeLane Lane, IReadOnlyList<int> InFlight, IReadOnlyList<int> Ready)>();
         DateTimeOffset? resumeAt = null;
         bool factoryPaused;
@@ -344,7 +345,7 @@ public sealed record IntakeOptions(TimeSpan PollInterval, int MaxItemFailures = 
 
 public static class IntakeServiceCollectionExtensions
 {
-    /// <summary>Registers the intake loop and its Shortcut work source on any host.</summary>
+    /// <summary>Registers the intake loop and the registry of work sources (<see cref="WorkSourceRegistry"/>) on any host.</summary>
     public static IServiceCollection AddIntake(this IServiceCollection services, FactoryOptions options)
     {
         services.TryAddSingleton(TimeProvider.System);
@@ -359,33 +360,23 @@ public static class IntakeServiceCollectionExtensions
             sp.GetRequiredService<Router.UsageOptions>(), sp.GetRequiredService<TimeProvider>(), sp.GetRequiredService<ILogger<Router.UsageMonitor>>()));
         // Watches usage while a long item run holds up the intake loop, so running workers pause too.
         services.AddHostedService(sp => sp.GetRequiredService<Router.UsageMonitor>());
-        services.AddSingleton<IWorkSource>(_ =>
-            FactoryRunner.CreateWorkSource(options, Gateway.OutboundHttp.ShortcutApi()));
-        services.AddSingleton<IItemRunner>(sp => new FactoryItemRunner(options, sp.GetRequiredService<IWorkSource>(), Console.Out));
-        // GitHub issues (sc-25385): a second source, registered by its own type so IWorkSource stays the Shortcut board.
-        var issueRepos = options.WatchedIssueRepos;
-        if (issueRepos.Count > 0)
-        {
-            services.AddSingleton(_ => FactoryRunner.CreateIssueSource(options, Gateway.OutboundHttp.GitHubApi()));
-        }
-        // The dashboard's Stop finishes a stop itself when no run holds the item.
-        services.AddSingleton<Controls.IItemStops>(sp => new FactoryItemStops(options, sp.GetRequiredService<IWorkSource>(), Console.Out,
-            sp.GetService<Issues.GitHubIssueWorkSource>()));
+        // Every source the host reaches comes from this one registry (sc-25982): the loop's lanes, the dashboard's controls and Stop.
+        services.AddSingleton(_ => new WorkSourceRegistry(options));
+        // The dashboard's Stop finishes a stop itself when no run holds the item, on the item's own source.
+        services.AddSingleton<Controls.IItemStops>(sp => new FactoryItemStops(options, sp.GetRequiredService<WorkSourceRegistry>(), Console.Out));
         services.AddHostedService(sp =>
         {
-            // One loop polls both sources in turn, so a triage and an item run never hold the single-tenant worker sandbox at once.
-            var issues = sp.GetService<Issues.GitHubIssueWorkSource>();
+            // One loop polls every configured source in turn, so a triage and an item run, or two sources' runs, never hold the
+            // single-tenant worker sandbox at once. A watched source without its credential fails the host's start here.
             var status = sp.GetRequiredService<IntakeStatus>();
-            IReadOnlyList<IntakeLane> lanes = issues is null
-                ? []
-                : [new IntakeLane(issues, new FactoryItemRunner(options, issues, Console.Out), ct => FactoryRunner.PollIssuesAsync(options, status, Console.Out, ct))];
+            var lanes = sp.GetRequiredService<WorkSourceRegistry>().Lanes(source => new FactoryItemRunner(options, source, Console.Out), status, Console.Out);
             // One evaluator for the loop's life, so its main-red reads are reused within FactoryFreeze.MainRedCacheTtl; built on the
             // first poll, so a missing credential fails that poll (counted as frozen) rather than the host's start.
             Controls.FactoryFreeze? evaluator = null;
             return new IntakeLoop(
-                sp.GetRequiredService<IWorkSource>(), sp.GetRequiredService<IItemRunner>(), sp.GetRequiredService<IntakeOptions>(),
+                lanes, sp.GetRequiredService<IntakeOptions>(),
                 sp.GetRequiredService<TimeProvider>(), sp.GetRequiredService<ILogger<IntakeLoop>>(), sp.GetRequiredService<Controls.IControls>(),
-                sp.GetRequiredService<Router.UsageMonitor>(), status, lanes,
+                sp.GetRequiredService<Router.UsageMonitor>(), status,
                 ct => (evaluator ??= FactoryRunner.CreateFreeze(options)).CheckAsync(ct));
         });
         return services;

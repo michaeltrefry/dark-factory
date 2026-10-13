@@ -8,6 +8,7 @@ using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Sessions;
 using DarkFactory.Orchestrator.Shortcut;
+using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
@@ -44,11 +45,29 @@ internal sealed class E2e : IAsyncDisposable
     /// <summary>The dashboard password hash the throwaway host logs in with (never the owner's keychain entry).</summary>
     public static readonly Lazy<string> PasswordHash = new(() => DashboardAuth.HashPassword(TestPassword));
 
+    /// <summary>
+    /// The credential of the work source a test works an item of, and nothing of the other sources (sc-25982): a Kanban test
+    /// runs on a machine with no Shortcut token, and the reverse.
+    /// </summary>
+    public static void RequireSource(ItemNaming source)
+    {
+        if (source == ItemNaming.Shortcut)
+        {
+            Harness.RequireSecret(o => o.ShortcutApiToken);
+        }
+        else if (source == ItemNaming.Kanban)
+        {
+            Harness.RequireSecret(o => o.KanbanWriteToken);
+        }
+        // A GitHub issue's item needs the workers' GitHub App, which every test needs.
+    }
+
     /// <summary>Checks the live prerequisites, takes the configured work root's run lock and creates the throwaway ledger.</summary>
-    public static async Task<E2e> StartAsync(string prefix)
+    /// <param name="source">The work source the test's item is of (default: a Shortcut story): only its credential is asked for.</param>
+    public static async Task<E2e> StartAsync(string prefix, ItemNaming? source = null)
     {
         Harness.RequireOptIn();
-        Harness.RequireSecret(o => o.ShortcutApiToken);
+        RequireSource(source ?? ItemNaming.Shortcut);
         Harness.RequireSecret(o => o.RouterKey);
         Harness.RequireSecret(o => o.GitHubAppId);
         Harness.RequireSecret(o => o.GitHubAppPrivateKeyPem);
@@ -118,7 +137,8 @@ internal sealed class E2e : IAsyncDisposable
     /// The configured options (env, user secrets, the owner's keychain for router/Shortcut/GitHub) with this test's
     /// ledger, work root, a free dashboard port, a short poll, and the test dashboard password hash layered on top.
     /// </summary>
-    public FactoryOptions Options(IDictionary<string, string?>? overrides = null)
+    /// <param name="without">Keychain accounts the options must not find (e.g. the Shortcut token, for a host that must start without one).</param>
+    public FactoryOptions Options(IDictionary<string, string?>? overrides = null, params string[] without)
     {
         var values = new Dictionary<string, string?>
         {
@@ -138,8 +158,12 @@ internal sealed class E2e : IAsyncDisposable
             .AddConfiguration(FactoryOptions.LoadConfiguration())
             .AddInMemoryCollection(values)
             .Build();
-        return new FactoryOptions(config, new OverlaySecrets(new MacKeychain(),
-            new Dictionary<string, string> { [SecretAccounts.DashboardPasswordHash] = PasswordHash.Value }));
+        var secrets = new Dictionary<string, string> { [SecretAccounts.DashboardPasswordHash] = PasswordHash.Value };
+        foreach (var account in without)
+        {
+            secrets[account] = ""; // blank is missing
+        }
+        return new FactoryOptions(config, new OverlaySecrets(new MacKeychain(), secrets));
     }
 
     /// <summary>The env a child <c>factory work</c> needs for the same settings (<c>__</c> separators).</summary>

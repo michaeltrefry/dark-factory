@@ -6,6 +6,7 @@ using DarkFactory.Orchestrator.Gateway;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Plans;
 using DarkFactory.Orchestrator.Shortcut;
+using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.AcceptanceTests;
 
@@ -44,7 +45,7 @@ public class MultiRepoPlanAcceptanceTests
         List<int> created = [];
         try
         {
-            var planned = await FactoryRunner.RunAsync(options, storyId, ignoreScope: true, Console.Out, ct);
+            var planned = await FactoryRunner.RunAsync(options, new ItemRef(ItemNaming.Shortcut, storyId), ignoreScope: true, Console.Out, ct);
             Assert.True(planned.Succeeded, planned.Error);
             Assert.Equal(WorkState.Planned, planned.State);
             var history = await e2e.HistoryAsync(storyId, ct);
@@ -81,7 +82,7 @@ public class MultiRepoPlanAcceptanceTests
             RunOutcome last = planned;
             for (var round = 0; round < 4 * created.Count + 12 && last.State != WorkState.Watch; round++)
             {
-                last = await FactoryRunner.RunAsync(options, storyId, ignoreScope: true, Console.Out, ct);
+                last = await FactoryRunner.RunAsync(options, new ItemRef(ItemNaming.Shortcut, storyId), ignoreScope: true, Console.Out, ct);
                 Assert.True(last.Succeeded, last.Error);
                 var now = await e2e.HistoryAsync(storyId, ct);
                 var delivered = Changeset.Delivered(now).Select(d => d.Repo).ToList();
@@ -102,7 +103,7 @@ public class MultiRepoPlanAcceptanceTests
                     {
                         continue;
                     }
-                    var worked = await FactoryRunner.RunAsync(options, created[i], ignoreScope: true, Console.Out, ct);
+                    var worked = await FactoryRunner.RunAsync(options, new ItemRef(ItemNaming.Shortcut, created[i]), ignoreScope: true, Console.Out, ct);
                     Assert.True(worked.Succeeded, worked.Error);
                     Assert.Equal(WorkState.Watch, worked.State);
                     // Its pull request is in its own repository, against that repository's changeset branch.

@@ -4,7 +4,6 @@ using DarkFactory.Orchestrator.Gateway;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Sessions;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.Extensions.Hosting;
 
@@ -50,59 +49,22 @@ static async Task<int> ControlAsync(string action, string scope, CancellationTok
 static async Task<int> RunAsync(ItemRef item, bool ignoreScope, CancellationToken ct)
 {
     var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
+    // The item's own source, from the registry: one that is not configured is refused before anything else is asked.
+    using var sources = new WorkSourceRegistry(options);
     return await FactoryRunner.RunCommandAsync(options, c => CheckRouterEnrollmentAsync(options, c),
-        c => FactoryRunner.RunAsync(options, item, ignoreScope, Console.Out, c), Console.Error, ct);
+        c => FactoryRunner.RunAsync(options, sources.Of(item.Naming), item.Id, ignoreScope, Console.Out, c), Console.Error, ct,
+        requireSource: () => sources.Of(item.Naming));
 }
 
 static async Task<int> WorkAsync(CancellationToken ct)
 {
     var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
-    try
+    // Fail fast on a missing credential, no work source at all, or a bad scope, rather than on the first ready item.
+    using (var sources = new WorkSourceRegistry(options))
     {
-        // Fail fast on a missing credential or a bad scope rather than on the first ready item.
-        // Session costs come from the router; intake needs Shortcut and the GitHub App; the dashboard its login.
-        // The merge gate needs its own App, and no retired review-model setting may be set. Every setting with a rule is checked first.
-        options.ValidateSettings();
-        _ = (options.ShortcutApiToken, options.RouterKey, options.GitHubAppId, options.GitHubAppPrivateKeyPem, options.DashboardPasswordHash);
-        _ = (options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem);
-        options.RejectReviewModelSettings();
-        if (FactoryRunner.CodeGraphTokenWarning(options) is { } codeGraphWarning)
+        if (await FactoryRunner.CheckWorkStartAsync(options, sources, Console.Error, ct) is { } startError)
         {
-            Console.Error.WriteLine(codeGraphWarning);
-        }
-        _ = DashboardBinding.Addresses(options.DashboardBindAddress);
-        if (options.WatchScope.IsEmpty)
-        {
-            Console.Error.WriteLine("Watch scope is empty (set Shortcut:Watch:Teams and/or Shortcut:Watch:Epics); nothing will be picked up.");
-        }
-        if (options.WatchedIssueRepos.Count == 0)
-        {
-            Console.Error.WriteLine("No GitHub issues are watched (set GitHub:Watch:Repos to triage a repo's issues).");
-        }
-        if (DarkFactory.Orchestrator.Issues.IssueIntake.UnsandboxedRefusal(options.WorkerSandbox, options.WatchedIssueRepos) is { } unsandboxed)
-        {
-            Console.Error.WriteLine(unsandboxed);
-            return 2;
-        }
-    }
-    catch (Exception ex) when (ex is MissingCredentialException or ReviewConfigurationException or InvalidOperationException)
-    {
-        Console.Error.WriteLine(ex.Message);
-        return 2;
-    }
-    using (var shortcutHttp = OutboundHttp.ShortcutApi())
-    {
-        if (await FactoryRunner.CheckWatchScopeAsync(options, FactoryRunner.CreateWorkSource(options, shortcutHttp), ct) is { } scopeError)
-        {
-            Console.Error.WriteLine(scopeError);
-            return 2;
-        }
-    }
-    using (var githubHttp = OutboundHttp.GitHubApi())
-    {
-        if (await FactoryRunner.CheckWatchScopeAsync(options, FactoryRunner.CreateIssueSource(options, githubHttp), ct) is { } scopeError)
-        {
-            Console.Error.WriteLine(scopeError);
+            Console.Error.WriteLine(startError);
             return 2;
         }
     }
@@ -112,7 +74,15 @@ static async Task<int> WorkAsync(CancellationToken ct)
         return 2;
     }
     await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
-    // One process: the session hub and its relay, plus the intake loop polling the watch scope.
+    using (var sources = new WorkSourceRegistry(options))
+    {
+        // Active items of a source that has no credential: no lane runs them, so say so once rather than leave them silently.
+        foreach (var warning in await sources.UnreachableAsync(ct))
+        {
+            Console.Error.WriteLine(warning);
+        }
+    }
+    // One process: the session hub and its relay, plus the intake loop polling every configured work source.
     await using var app = FactoryHost.BuildWork(options);
     await app.StartAsync(ct);
     Console.WriteLine($"factory work: dashboard on {string.Join(", ", app.Addresses())} (session hub {SessionHub.Path}); intake polling every {options.PollInterval}; Ctrl-C stops");

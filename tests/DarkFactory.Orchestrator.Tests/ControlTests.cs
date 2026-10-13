@@ -160,7 +160,7 @@ public class ControlTests
         public Task<RunOutcome> Run(IWorker worker, int story = 77) => Pipeline(worker).RunAsync(story, CancellationToken.None);
 
         public ControlActions Actions(bool stops = true) =>
-            new(Controls, Contexts, stops ? new Stops(this) : null, Stories, Locks);
+            new(Controls, Contexts, stops ? new Stops(this) : null, naming => naming == ItemNaming.Shortcut ? Stories : null, Locks);
 
         public async Task<List<LedgerEntry>> Rows() => await Db.LedgerEntries.AsNoTracking().OrderBy(e => e.Id).ToListAsync();
         public async Task<List<(WorkState, string?)>> Transitions() => (await Rows()).Where(r => r.Step is null).Select(r => (r.State, r.Detail)).ToList();
@@ -170,14 +170,14 @@ public class ControlTests
         public async Task<IReadOnlyList<int>> InFlight()
         {
             await using var db = new LedgerDbContext(_options);
-            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), CancellationToken.None, Controls);
+            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Shortcut, CancellationToken.None, Controls);
         }
 
         private sealed class Stops(Harness h) : IItemStops
         {
-            public Task<ControlResult> StopAsync(int storyId, CancellationToken ct) =>
+            public Task<ControlResult> StopAsync(ItemRef item, CancellationToken ct) =>
                 new ItemStopper(h.Stories, new WorkLedger(new LedgerDbContext(h._options), TimeProvider.System), h.Locks, h.Prs, h.Controls, TextWriter.Null)
-                    .StopAsync(storyId, ct);
+                    .StopAsync(item.Id, ct);
         }
     }
 
@@ -325,7 +325,7 @@ public class ControlTests
     {
         var failing = new FakePullRequests(new HttpRequestException("GitHub down"));
         var h = new Harness { Prs = failing };
-        var item = await h.Ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", Story.Name, RunPipelineTests.Sandbox.FullName, null, CancellationToken.None);
+        var item = await h.Ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", Story.Name, RunPipelineTests.Sandbox.FullName, null, CancellationToken.None);
         await h.Ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
 
         var result = await h.Actions().StopAsync(ControlScope.Item("sc-77"), "tester", CancellationToken.None);
@@ -355,7 +355,7 @@ public class ControlTests
         var ledger = h.Ledger;
         foreach (var (id, epic) in new[] { (1, 5L), (2, 5L), (3, 6L) })
         {
-            var item = await ledger.GetOrCreateAsync(RunPipeline.Source, $"sc-{id}", "s", RunPipelineTests.Sandbox.FullName, null, CancellationToken.None, epic);
+            var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, $"sc-{id}", "s", RunPipelineTests.Sandbox.FullName, null, CancellationToken.None, epic);
             await ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
         }
 
@@ -397,7 +397,7 @@ public class ControlTests
         var source = new ShortcutWorkSource(board.Client(), "tok", new WatchScope(["darkfactory"], []));
         var h = new Harness();
         var runner = new Runner(h, source);
-        var loop = new IntakeLoop(source, runner, new IntakeOptions(TimeSpan.FromMinutes(1)), TimeProvider.System, NullLogger<IntakeLoop>.Instance, h.Controls);
+        var loop = new IntakeLoop([new IntakeLane(source, runner)], new IntakeOptions(TimeSpan.FromMinutes(1)), TimeProvider.System, NullLogger<IntakeLoop>.Instance, h.Controls);
         await h.Actions().PauseAsync(ControlScope.Factory, "tester", CancellationToken.None);
 
         await loop.PollOnceAsync(CancellationToken.None);
@@ -574,7 +574,7 @@ public class ControlTests
 
     private static async Task<WorkItem> SeedImplementing(Harness h, string id, long? epic = null)
     {
-        var item = await h.Ledger.GetOrCreateAsync(RunPipeline.Source, id, Story.Name, RunPipelineTests.Sandbox.FullName, null, CancellationToken.None, epic);
+        var item = await h.Ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, id, Story.Name, RunPipelineTests.Sandbox.FullName, null, CancellationToken.None, epic);
         await h.Ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
         return item;
     }
@@ -679,6 +679,8 @@ public class ControlTests
         // Refused before the ledger is opened, so no database is needed.
         var controls = new LedgerControls(null!, TimeProvider.System);
         var ex = await Assert.ThrowsAsync<ArgumentException>(() => controls.SetAsync("everything", ControlState.Paused, "tester", CancellationToken.None));
-        Assert.Contains("(factory, usage, freeze, epic:<id>, item:sc-<id> or item:gh-<key>)", ex.Message);
+        Assert.Contains("(factory, usage, freeze, epic:<id>, item:sc-<id>, item:gh-<key> or item:kb-<n>)", ex.Message);
+        // Every source's items have a scope (sc-25982): a new source's must be named here too.
+        Assert.All(ItemNaming.All, naming => Assert.Contains($"item:{naming.Prefix}-<", ex.Message));
     }
 }

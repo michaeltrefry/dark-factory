@@ -849,7 +849,8 @@ KanbanBoard item through `FactoryRunner.RunAsync` (what `factory run kb-N` calls
 This first version checks up to "pull request opened"; what the review and the merge gate then decide is printed, not asserted.
 
 Prerequisites: everything `factory run` needs (router key and an enrolled plan, both GitHub Apps installed on the target
-repository, Claude Code for the worker user), the Shortcut token (the shared harness still asks for it), and
+repository, Claude Code for the worker user) — no Shortcut token: since sc-25982 the shared harness asks only for the
+credential of the test's own work source (`E2e.StartAsync(prefix, ItemNaming.Kanban)`) — and
 
 - `Kanban:WriteToken` (env `FACTORY_KANBAN_WRITE_TOKEN` or keychain account `kanban-write-token`): a `full`-scope KanbanBoard
   personal access token of the factory's service identity (KanbanBoard's `docs/deployment.md`, "Factory service identity");
@@ -923,6 +924,49 @@ renewed (every item the ledger resumes by itself, also under a factory, epic or 
 with unreadable controls — and nothing is run then) and what is not (a parked, an escalated and a stopping item), a
 `factory run` of a claim-lost item (refused while the other claim stands or the board will not confirm it, resumed once it is
 released), and the poll's renewal over several lanes (a board that does not answer ends only its own lane's renewals).
+
+## P4b-AT4 — `factory work` starts with no Shortcut token and works a Kanban item (sc-25982)
+
+`KanbanAcceptanceTests.P4b_AT4_factory_work_starts_with_no_shortcut_token_and_works_a_kanban_item`: the real `factory work`
+host (`FactoryHost.BuildWork`, in process) with KanbanBoard as its only work source, against a throwaway ledger and work root.
+The test's options hide the keychain's Shortcut token and blank the Shortcut watch scope and `GitHub:Watch:Repos`, so nothing
+of Shortcut is configured; it skips if the environment itself carries `SHORTCUT_API_TOKEN` (unset it for this test).
+
+Prerequisites: as P4b-AT1 (the router, both GitHub Apps, Claude Code for the worker user, `Kanban:WriteToken`,
+`FACTORY_E2E_P4B_KANBAN_PROJECT`), no Shortcut token, and
+
+- `FACTORY_E2E_P4B_WORK_KANBAN_ITEM`: the id (GUID) of an item of that project in `Ready`, unclaimed, with no open blocker,
+  describing a small change to the sandbox. It must be the project's ONLY `Ready` item: the host claims every ready item it
+  sees. The test leaves it in `Backlog` (stopped), or `Done` if the gate merged it first.
+
+```sh
+env -u SHORTCUT_API_TOKEN FACTORY_E2E=1 FACTORY_E2E_P4B_KANBAN_PROJECT=<KEY> FACTORY_E2E_P4B_WORK_KANBAN_ITEM=<GUID> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4b_AT4*"
+```
+
+What it checks: the options find no Shortcut token; `factory work`'s start-up check (`FactoryRunner.CheckWorkStartAsync`, what
+`Program` runs) passes with the Kanban source as the only configured one, its watched project validated on the real board; the
+host starts and its intake loop lists the item (its `kb-<n>` is given then — no `factory kanban key`), claims it under the
+marker `dark-factory:<item GUID>` and works it to Review, with one `claimed` and one `linked` row and the pull request a `pr`
+link on the item. Then `factory stop --item kb-<n>` (`FactoryRunner.ControlAsync`, the CLI's code path) while the host runs: the
+item's ledger state becomes Cancelled, the board item is back in `Backlog` with no claim, and the pull request is a draft. If
+the gate merges the item before the stop lands, the stop is printed as not checked rather than failed.
+
+Not live (every `dotnet test`): `WorkSourceRegistryTests` — the registry (one kind per naming; the configured set for every
+combination of sources; a watched source without its credential refused; an item by id needing only its source's credential),
+each wiring point (a lane per source that is watched or has its credential, and only a watched issues lane prepared; a source
+with its credential and no watch scope asked nothing — no listing, no scope check, nothing claimed — while a poll still finishes
+the pending Stop of its in-flight item; the start-up warning per source with active ledger items and no credential; one poll
+running a Shortcut story and a Kanban item; the in-flight listing per source; Stop by id of a Kanban item on the fake board — pull request drafted, `Backlog`,
+claim released, comment, Cancelled — with a same-numbered Shortcut story untouched; a factory-scope Stop over both sources and
+an item whose source is not configured reported as not stopped; Stop of one item whose source has no credential refused
+before any control is written; Pause and Continue by id; the epic scope asking each item's own
+board), the start-up check (KanbanBoard alone with no Shortcut token; Shortcut alone asking nothing of KanbanBoard; no source →
+the refusal naming every source's settings and how to finish leftover work by id; a bad scope or missing credential of either source), `factory run` exiting 2
+before the router is asked when the item's source is not configured, the work host built with KanbanBoard alone, the help
+text, and a scan that no file outside `Shortcut/` but the registry names the Shortcut source's type. These tests build their
+options with no keychain and no process environment, so they run (never skip) on a machine whose shell carries
+`SHORTCUT_API_TOKEN` or `FACTORY_KANBAN_WRITE_TOKEN`.
 
 ## Upgrading a Phase 1 ledger: items parked at Review
 

@@ -880,8 +880,8 @@ public class MergeQueueTests
         await using (var db = h.Db())
         {
             var ledger = new WorkLedger(db, TimeProvider.System);
-            var planItem = await ledger.GetOrCreateAsync(RunPipeline.Source, plan, "A plan", Sandbox.FullName, null, CancellationToken.None);
-            await ledger.LinkPlanAsync((await ledger.FindAsync(RunPipeline.Source, StoryId.Format(B), CancellationToken.None))!, planItem.Id, CancellationToken.None);
+            var planItem = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, plan, "A plan", Sandbox.FullName, null, CancellationToken.None);
+            await ledger.LinkPlanAsync((await ledger.FindAsync(ItemNaming.Shortcut.Source, StoryId.Format(B), CancellationToken.None))!, planItem.Id, CancellationToken.None);
         }
 
         // B's plan is paused while B waits between runs: no run of B is active, so nothing is written to its ledger.

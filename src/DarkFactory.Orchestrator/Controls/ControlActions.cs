@@ -1,5 +1,4 @@
 using DarkFactory.Orchestrator.Ledger;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
 
@@ -15,17 +14,8 @@ public sealed record ControlResult(bool Ok, string Message)
 /// <summary>Stops one item now if no run holds it (<see cref="ItemStopper.StopAsync"/>); returns what happened.</summary>
 public interface IItemStops
 {
-    /// <summary>Stops one Shortcut story.</summary>
-    Task<ControlResult> StopAsync(int storyId, CancellationToken ct);
-
-    /// <summary>
-    /// Stops one item of any source. The default stops a Shortcut story with <see cref="StopAsync(int, CancellationToken)"/> and
-    /// leaves another source's item to its next run (its Stopping control is already set), saying so.
-    /// </summary>
-    Task<ControlResult> StopAsync(ItemRef item, CancellationToken ct) =>
-        item.Naming == ItemNaming.Shortcut
-            ? StopAsync(item.Id, ct)
-            : Task.FromResult(new ControlResult(true, $"{item}: stop requested; its next run stops it."));
+    /// <summary>Stops one item of any source (sc-25982), on the source its id names.</summary>
+    Task<ControlResult> StopAsync(ItemRef item, CancellationToken ct);
 }
 
 /// <summary>
@@ -37,13 +27,19 @@ public interface IItemStops
 /// A plan item's scope (sc-25876) is its own <c>item:&lt;id&gt;</c>, and reaches its stories: Pause and Continue through
 /// <see cref="IControls.EffectiveAsync"/>, Stop through <see cref="ItemStopper"/>, which stops the plan's unfinished stories before the
 /// plan item and leaves the stop unfinished (not <see cref="ControlResult.Ok"/>) while one of them is still running.
-/// At epic scope, active items the ledger has no epic for (recorded before epics were) are looked up on the board
-/// (<paramref name="source"/>) and their epic recorded under their run lock (<paramref name="locks"/>); any that
-/// cannot be resolved are reported, never silently skipped (E10).
+/// An epic scope names an epic by its number, so it reaches the items of the sources whose epics have one
+/// (<see cref="ItemNaming.NumberedEpics"/>). There, active items the ledger has no epic for (recorded before epics were) are looked
+/// up on their own board (<paramref name="sources"/>: the source of a naming, or null when it is not configured; sc-25982) and
+/// their epic recorded under their run lock (<paramref name="locks"/>); any that cannot be resolved are reported, never
+/// silently skipped (E10).
 /// </summary>
 public sealed class ControlActions(
-    IControls controls, IDbContextFactory<LedgerDbContext> contexts, IItemStops? stops = null, IWorkSource? source = null, IRunLocks? locks = null)
+    IControls controls, IDbContextFactory<LedgerDbContext> contexts, IItemStops? stops = null, Func<ItemNaming, IWorkSource?>? sources = null,
+    IRunLocks? locks = null)
 {
+    /// <summary>The ledger names of the sources an epic scope reaches.</summary>
+    private static readonly List<string> EpicSources = [.. ItemNaming.All.Where(n => n.NumberedEpics).Select(n => n.Source)];
+
     public async Task<ControlResult> PauseAsync(string scope, string by, CancellationToken ct)
     {
         if (scope == ControlScope.Usage)
@@ -109,15 +105,21 @@ public sealed class ControlActions(
         var unknown = new List<string>();
         if (ControlScope.ItemOf(scope) is { } story)
         {
+            if (stops is not null && sources is not null && sources(story.Naming) is null)
+            {
+                // Before anything is written: a stop that cannot reach the item's board would leave it Stopping with nothing to
+                // finish it (no lane runs a source without its credential) and no Continue to take it back.
+                return new ControlResult(false, $"{story}: NOT stopped, and nothing was written. {WorkSourceRegistry.NeedsCredential(story.Naming)}");
+            }
             stories.Add(story);
         }
         else
         {
             var epic = ControlScope.EpicOf(scope);
             await using var db = await contexts.CreateDbContextAsync(ct);
-            // The factory scope stops every source's items; an epic is a Shortcut epic, so only stories are in one.
+            // The factory scope stops every source's items; an epic scope only those of a source whose epics have numbers.
             var items = await db.WorkItems.AsNoTracking()
-                .Where(i => (epic == null || i.Source == RunPipeline.Source) && i.State != WorkState.Done && i.State != WorkState.Cancelled
+                .Where(i => (epic == null || EpicSources.Contains(i.Source)) && i.State != WorkState.Done && i.State != WorkState.Cancelled
                     && (epic == null || i.EpicId == epic))
                 .OrderBy(i => i.Id)
                 .Select(i => new { i.Source, i.ExternalId })
@@ -127,7 +129,7 @@ public sealed class ControlActions(
             {
                 // An item is stopped through its own control, so one in the epic is stopped whether or not its epic could be recorded.
                 var resolved = await ResolveUnknownEpicsAsync(epicId, ct);
-                found.AddRange(resolved.InEpic.Select(e => ItemNaming.Shortcut.TryParse(e, out var id) ? new ItemRef(ItemNaming.Shortcut, id) : null));
+                found.AddRange(resolved.InEpic.Select(ItemNaming.ParseAny));
                 unknown = resolved.Unknown;
             }
             stories.AddRange(found.OfType<ItemRef>().Distinct());
@@ -150,9 +152,13 @@ public sealed class ControlActions(
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                // The item keeps its Stopping control: the intake loop's next poll (or a retry) finishes the stop.
+                // The item keeps its Stopping control: the intake loop's next poll (or a retry) finishes the stop — unless its
+                // source has no credential: no lane runs that source's items, so nothing retries until the credential is back.
                 ok = false;
-                results.Add($"{item}: stop NOT finished ({ex.Message}); it stays Stopping and the next poll or `factory stop` retries it.");
+                results.Add(ex is MissingCredentialException
+                    ? $"{item}: stop NOT finished ({ex.Message}); it stays Stopping, and nothing finishes the stop until that credential is set "
+                        + "(then the next poll or `factory stop` does)."
+                    : $"{item}: stop NOT finished ({ex.Message}); it stays Stopping and the next poll or `factory stop` retries it.");
             }
         }
         if (unknown.Count > 0)
@@ -200,12 +206,13 @@ public sealed class ControlActions(
         await using var db = await contexts.CreateDbContextAsync(ct);
         var ledger = new WorkLedger(db, TimeProvider.System);
         var items = await db.WorkItems
-            .Where(i => i.Source == RunPipeline.Source && i.State != WorkState.Done && i.State != WorkState.Cancelled && i.EpicId == null)
+            .Where(i => EpicSources.Contains(i.Source) && i.State != WorkState.Done && i.State != WorkState.Cancelled && i.EpicId == null)
             .OrderBy(i => i.Id)
             .ToListAsync(ct);
         foreach (var item in items)
         {
-            if (source is null || !StoryId.TryParse(item.ExternalId, out var id))
+            // The item's own board, found from its ledger row; one that is not configured cannot be asked.
+            if (ItemNaming.ParseAny(item.ExternalId) is not { } named || named.Naming.Source != item.Source || sources?.Invoke(named.Naming) is not { } source)
             {
                 resolution.Unknown.Add(item.ExternalId);
                 continue;
@@ -213,7 +220,7 @@ public sealed class ControlActions(
             long? itemEpic;
             try
             {
-                itemEpic = (await source.ReadSpecAsync(id, ct)).Epic?.Id;
+                itemEpic = (await source.ReadSpecAsync(named.Id, ct)).Epic?.Id;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {

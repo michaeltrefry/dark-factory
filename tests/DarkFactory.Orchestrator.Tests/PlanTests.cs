@@ -317,7 +317,7 @@ public class PlanPipelineTests
         public async Task Left(params (string? Step, WorkState State, string? Detail)[] rows)
         {
             var ledger = Ledger;
-            var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", PlanStory.Name, Sandbox.FullName, null, CancellationToken.None);
+            var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", PlanStory.Name, Sandbox.FullName, null, CancellationToken.None);
             await ledger.RecordAsync(item, WorkState.Plan, null, null, CancellationToken.None);
             foreach (var (step, state, detail) in rows)
             {
@@ -335,7 +335,7 @@ public class PlanPipelineTests
         public async Task<IReadOnlyList<int>> InFlight()
         {
             await using var db = new LedgerDbContext(_options);
-            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), CancellationToken.None, Controls);
+            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Shortcut, CancellationToken.None, Controls);
         }
 
         public async Task<List<LedgerEntry>> Rows() => await Db.LedgerEntries.AsNoTracking().OrderBy(e => e.Id).ToListAsync();

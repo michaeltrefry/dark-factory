@@ -154,7 +154,7 @@ public class IssueIntakeTests
         Assert.DoesNotContain(IssueSteps.Released, await h.Steps());
         Assert.Empty(await h.Ready());
         await using var db = h.Db();
-        Assert.Empty(await RunPipeline.InFlightAsync(new WorkLedger(db, h.Time), CancellationToken.None, naming: ItemNaming.GitHubIssue));
+        Assert.Empty(await RunPipeline.InFlightAsync(new WorkLedger(db, h.Time), ItemNaming.GitHubIssue, CancellationToken.None));
         var claim = await h.Source().ClaimAsync(1, ignoreScope: false, CancellationToken.None);
         Assert.False(claim.Claimed);
         Assert.Contains("not released", claim.Refusal);
@@ -794,9 +794,8 @@ public class IssueIntakeTests
         var shortcut = new FakeWorkSource(new WorkStory(77, "s", "d", "bug", "u"));
         var shortcutRuns = new Runner();
         var issueRuns = new Runner();
-        var loop = new IntakeLoop(shortcut, shortcutRuns, new IntakeOptions(TimeSpan.FromMinutes(1)), h.Time,
-            Microsoft.Extensions.Logging.Abstractions.NullLogger<IntakeLoop>.Instance, status: h.Status,
-            moreLanes: [new IntakeLane(h.Source(), issueRuns, h.Intake().PollAsync)]);
+        var loop = new IntakeLoop([new IntakeLane(shortcut, shortcutRuns), new IntakeLane(h.Source(), issueRuns, h.Intake().PollAsync)],
+            new IntakeOptions(TimeSpan.FromMinutes(1)), h.Time, Microsoft.Extensions.Logging.Abstractions.NullLogger<IntakeLoop>.Instance, status: h.Status);
         shortcutRuns.InFlight.Add(77);
 
         await loop.PollOnceAsync(CancellationToken.None);

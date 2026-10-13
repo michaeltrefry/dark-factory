@@ -50,7 +50,7 @@ public class PlanFailureAcceptanceTests
         var options = e2e.Options();
         var ct = TestContext.Current.CancellationToken;
         using var shortcutHttp = OutboundHttp.ShortcutApi();
-        var source = FactoryRunner.CreateWorkSource(options, shortcutHttp);
+        var source = WorkSourceRegistry.Shortcut(options, shortcutHttp);
         var plan = Plan.FromDetail(Fixed);
         var planRef = $"sc-{planId}";
         var repo = options.DefaultRepo;
@@ -68,7 +68,7 @@ public class PlanFailureAcceptanceTests
             await using (var db = e2e.Db())
             {
                 var ledger = new WorkLedger(db, TimeProvider.System);
-                var item = await ledger.GetOrCreateAsync(RunPipeline.Source, planRef, "P4-AT5 plan", repo.FullName, "seeded by P4-AT5", ct);
+                var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, planRef, "P4-AT5 plan", repo.FullName, "seeded by P4-AT5", ct);
                 await ledger.RecordAsync(item, WorkState.Plan, null, "seeded by P4-AT5", ct);
                 await ledger.CheckpointAsync(item, RunPipeline.Steps.Plan, null, plan.ToDetail(), ct);
                 await ledger.CheckpointAsync(item, RunPipeline.Steps.PlanCreating, null, null, ct);
@@ -168,7 +168,7 @@ public class PlanFailureAcceptanceTests
             // A stopped plan is not polled any more, and stopping it again does nothing.
             await using (var db = e2e.Db())
             {
-                Assert.Empty(await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ct, FactoryRunner.Controls(options)));
+                Assert.Empty(await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Shortcut, ct, FactoryRunner.Controls(options)));
             }
             Assert.True((await FactoryRunner.ControlAsync(options, "stop", ControlScope.Item(planRef), "P4-AT5", Console.Out, ct)).Ok);
             Assert.Equal(2, (await E2e.StoryCommentsAsync(planId, ct)).Count - commentsBefore);
@@ -214,8 +214,8 @@ public class PlanFailureAcceptanceTests
     {
         await using var db = e2e.Db();
         var ledger = new WorkLedger(db, TimeProvider.System);
-        var item = await ledger.GetOrCreateAsync(RunPipeline.Source, externalId, externalId, repo, "seeded by P4-AT5", ct);
-        await ledger.LinkPlanAsync(item, (await ledger.FindAsync(RunPipeline.Source, plan, ct))!.Id, ct);
+        var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, externalId, externalId, repo, "seeded by P4-AT5", ct);
+        await ledger.LinkPlanAsync(item, (await ledger.FindAsync(ItemNaming.Shortcut.Source, plan, ct))!.Id, ct);
         foreach (var state in states)
         {
             await ledger.RecordAsync(item, state, null, state == WorkState.Escalated ? "seeded by P4-AT5: CI is red (not a real failure)" : "seeded by P4-AT5", ct);
