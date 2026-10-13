@@ -971,8 +971,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   they are): …. Never started (left in the backlog; the factory will not release or start them): ….` and, only when there are
   any, `Released but never started (moved back to the backlog; the factory did no work on them): ….`, `Merged outside the factory
   (left as they are: their change is on the base branch): ….` and `Taken, finished or archived by someone else since their release
-  (left as they are): ….`, Cancelled, its control cleared. A workerless run (no worker run lock) still defers a plan's stop to the
-  next run. A waiting plan item's run only evaluates its stories and watches no control meanwhile, so: a Stop that lands during
+  (left as they are): ….`, Cancelled, its control cleared. A waiting plan item's run only evaluates its stories and watches no control meanwhile, so: a Stop that lands during
   the evaluation is seen when it ends (`HoldAsync` re-reads the control after `PlannedAsync`) and finished by that run under the
   run lock it holds; and `factory stop --item <plan>` while a run of the
   plan holds its lock answers `stop NOT finished: it is a plan and a run of it is active …`, not Ok (exit 1), instead of the
@@ -1313,7 +1312,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   busy …`), it is deleted by the sweep the next worker phase of any run starts with, or replaced by the item's next worktree.
   Dispatch (`IntakeLoop`): a poll lists every lane, then runs its items — each lane's in-flight ones (stops first), then its
   ready ones, each once — with up to `Intake:MaxConcurrentRuns` dispatchers, and ends when its runs have; with 1 (the default)
-  it is the serial loop it was. Still one run per item (the item's run lock) and one turn per repository (the merge queue).
+  it is the serial loop it was. Claims are renewed in the listing, once per poll and lane, before any run of the poll starts
+  (`RenewClaimsAsync`, sc-25983), never per dispatched run. Still one run per item (the item's run lock) and one turn per repository (the merge queue).
   What stops a poll's new work still does with several runs in flight: after a run the freeze deferred no ready item of any
   lane and no further in-flight item of its lane is started; after a factory-wide failure nothing is; runs already started
   finish by themselves, each checking the freeze, the usage pause and its controls before every step. Residuals, accepted until the sandbox has several users (later Phase 4b stories): (a) one

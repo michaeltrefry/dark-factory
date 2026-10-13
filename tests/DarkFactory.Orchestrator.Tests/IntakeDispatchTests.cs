@@ -25,6 +25,7 @@ public class IntakeDispatchTests
         {
             nameof(IWorkSource.ListReadyAsync) => Task.FromResult(Ready),
             $"get_{nameof(IWorkSource.Naming)}" => ItemNaming.Shortcut,
+            nameof(IWorkSource.RenewClaimAsync) => Task.FromResult(ClaimRenewal.Held),
             _ => throw new NotSupportedException(method.Name),
         };
 

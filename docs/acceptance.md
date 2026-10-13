@@ -831,8 +831,8 @@ What the live test does not cover, and the unit tests do (`PlanClassificationTes
 `PlanControlsPostgresTests`, `DashboardComponentTests.A_plan_row_shows_…`): a pull request actually turned back into a draft by
 a plan's stop (the seeded stories have none; the unit test's story has one), a story whose run is going when the Stop lands
 (stopped by that run; the plan's stop unfinished, exit 1, finished by the next poll), a stop that fails half way, a story whose
-worker a crashed run left, a workerless run deferring the stop, a Stop that lands while the plan is evaluated (finished by that
-run, or deferred by a workerless one) and `factory stop` on a plan whose own run is active (unfinished, exit 1), a released story
+worker a crashed run left, a Stop that lands while the plan is evaluated (finished by that
+run) and `factory stop` on a plan whose own run is active (unfinished, exit 1), a released story
 nobody claimed (moved back to the Backlog with a comment that does not say the factory worked on it), one a person took, finished,
 assigned or archived since its release (nothing written, no ledger item), one moved back to the Backlog (nothing written), a
 story merged outside the factory (left as it is and listed apart), a plan Pause with the usage pause also in force (`user-paused`),
