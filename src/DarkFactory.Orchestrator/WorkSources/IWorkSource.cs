@@ -78,6 +78,11 @@ public sealed record ChildItem(string Name, string Description, string StoryType
     /// then the SHA-256 of the name and the description as sent (each UTF-8, the name's byte length first so no two pairs share
     /// a hash). A source stores it on the item it creates, in whatever field of its board holds an opaque id, and finds the child
     /// again by it (<see cref="IWorkSource.CreateChildrenAsync"/>), so it need not get the description back unchanged.
+    /// Two children of one parent with the same name and the same description would have the same key, and a retry could take
+    /// one board story for both. What rules that out is the plan's validation, not the key: <see cref="Plans.PlanParser"/>
+    /// refuses a plan in which two stories share a title ("title … is used twice"), a child's name is its story's title, and the
+    /// name is hashed (length first) — so within one plan the name alone makes every key unique, whatever the stories share
+    /// otherwise. A caller that builds children any other way must keep their names unique itself.
     /// </summary>
     public string Key(string parentRef)
     {

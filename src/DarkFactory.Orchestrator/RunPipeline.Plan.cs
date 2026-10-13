@@ -795,14 +795,14 @@ public sealed partial class RunPipeline
             throw new WorkerFailedException($"The plan names {repos.Count} {(repos.Count == 1 ? "repository" : "repositories")} "
                 + $"({string.Join(", ", repos.Select(r => r.FullName))}), "
                 + $"but {string.Join(", ", unconfigured)} {(unconfigured.Count == 1 ? "is" : "are")} not configured for this factory "
-                + $"(Factory:DefaultRepo, GitHub:Watch:Repos: {string.Join(", ", _configuredRepos.Select(r => r.FullName))}), so "
+                + $"(Factory:DefaultRepo, Factory:Repos, GitHub:Watch:Repos: {string.Join(", ", _configuredRepos.Select(r => r.FullName))}), so "
                 + progress switch
                 {
                     PlanProgress.Fresh => "no planner session was started and no story was created.",
                     PlanProgress.Recorded => "the plan an earlier run recorded was not taken further: no story of it was created.",
                     _ => $"the plan an earlier run recorded was not taken further. {StoriesMayExist}",
                 }
-                + " Configure it, or remove its Repo: line.");
+                + " Add it to Factory:Repos (GitHub:Watch:Repos would also turn on the triage of its issues), or remove its Repo: line.");
         }
         return repos;
     }

@@ -29,8 +29,8 @@ public class MultiRepoPlanAcceptanceTests
         var second = RepoRef.Parse(Harness.RequireEnv("FACTORY_E2E_P4_SECOND_REPO",
             "a second sandbox repository (owner/name) with both GitHub Apps installed, a factory/gate.yaml, CI on factory/changeset-*, indexed in CodeGraph"));
         await using var e2e = await E2e.StartAsync("df_e2e_plan2");
-        // The second repository is one of the factory's configured repositories for this run.
-        var options = e2e.Options(new Dictionary<string, string?> { ["GitHub:Watch:Repos"] = second.FullName });
+        // The second repository is one of the factory's configured repositories for this run (no issue triage there: Factory:Repos).
+        var options = e2e.Options(new Dictionary<string, string?> { ["Factory:Repos"] = second.FullName });
         await ReviewGateTests.RequireGateReadyAsync(options, TestContext.Current.CancellationToken);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         timeout.CancelAfter(RunTimeout);

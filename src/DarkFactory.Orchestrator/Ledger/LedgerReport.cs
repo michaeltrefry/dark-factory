@@ -215,6 +215,8 @@ public static class LedgerReport
             text.Append(commit is not null ? $", merged as {Code(commit)}"
                 : Plans.PlanRelease.MergedOutsideChangeset(history) ? $", {Plans.PlanRelease.MergedOutsideIntoChangeset}" : ", not merged");
             text.Append(pull is null ? ", no pull request recorded" : $", {Link(pull)}");
+            // Such a story's item stays Escalated: nothing the factory does moves its board story, so the report says who must.
+            text.Append(commit is null && Plans.PlanRelease.MergedOutsideChangeset(history) ? $"; {Plans.PlanRelease.BoardStoryStillClaimed}" : "");
             text.Append('\n');
         }
         if (stories.Count > MaxPlanStoriesShown)

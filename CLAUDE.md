@@ -78,6 +78,12 @@ Claude Code headless workers through the Weave router.
   A test signals a process only through `OwnProcess` (pid + start time, recorded where the pid cannot have been reused;
   `KillIfStillRunning` signals only while the start time still matches); `OwnProcessTests` fails on any other kill in
   `tests/` (`Process.Kill`, a kill(2) import, a `kill`/`pkill`/`killall` in a script).
+  Known flake, cause in the helper itself (sc-25877; about 1 in 100 runs of `WorkerSandboxTests`, any test asserting the helper's
+  stderr is empty, seen on `Uid_sweep_ignores_its_own_machinery_and_settles_at_once`): the helper ends its watcher with
+  `send_signal "$watcher"` and reaps it on the next line with `wait "$watcher" 2>/dev/null`; bash 3.2 also reports a signal-killed
+  job when it reads the next script line, so a watcher reaped between the two lines puts `… Terminated: 15 ( while … )` on the
+  helper's real stderr. The fix is one redirected group in `scripts/factory-worker-launch` (`{ send_signal "$watcher" || true;
+  wait "$watcher" || true; } 2>/dev/null`) and needs the owner's re-install; do not loosen the tests' assertion instead.
   `CrashResumeTests` also needs the compose Postgres (skips locally without it, fails under `CI`): it
   SIGKILLs `tests/DarkFactory.CrashHost` (the real pipeline with a fake `claude` script) and restarts it.
   `ShortcutContractTests` replay recorded Shortcut API fixtures (`Fixtures/shortcut`, strict request matching);
@@ -160,8 +166,9 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Gate:CiPollSeconds`, `Gate:CiTimeoutMinutes` | `30`, `30` (each > 0: CI on the PR head is polled until it finishes; still running at the timeout escalates) |
 | `Gate:TestTimeoutMinutes` | `20` (> 0: one sandboxed run — restore, build, the new tests — of the `new-tests-fail-on-base` check; still running at the timeout fails the check) |
 | `Factory:DefaultRepo` | `michaeltrefry/dark-factory-sandbox` (a story line `Repo: owner/name` overrides) |
+| `Factory:Repos` | empty; comma-separated `owner/name` (each well-formed, else refused at start-up naming the key): repositories the factory may plan and work in besides the default one (sc-25877). It only adds to the configured repositories (`FactoryOptions.ConfiguredRepos` = `Factory:DefaultRepo` ∪ `Factory:Repos` ∪ `GitHub:Watch:Repos`, case-insensitive, each once): a plan may name them and the freeze's main-red watches them. It turns on NO issue polling and works with `Worker:RunAs=none`. Both GitHub Apps must be installed there |
 | `Shortcut:Watch:Teams`, `Shortcut:Watch:Epics` | empty = watch nothing; comma-separated team mention names/ids, epic ids |
-| `GitHub:Watch:Repos` | empty = triage no issues; comma-separated `owner/name` whose issues `factory work` polls (the workers' App needs Issues read/write there) |
+| `GitHub:Watch:Repos` | empty = triage no issues; comma-separated `owner/name` whose issues `factory work` polls and triages (the workers' App needs Issues read/write there; refused with `Worker:RunAs=none`). It is the issue-triage watch list, not the list of repositories the factory may work in: a repository named here is also a configured repository, but to let the factory plan and work in a repository WITHOUT triaging its issues name it in `Factory:Repos` |
 | `Intake:PollSeconds` | `60` (> 0) |
 | `Intake:MaxItemFailures` | `3` (runs of one item failing in a row before `factory work` escalates/parks it, E10) |
 | `Usage:PollSeconds` | `60` (> 0: `factory work` reads the router's subscription usage; also read at each intake poll) |
@@ -443,8 +450,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   within `Freeze:HotFileWindowHours`; the gate records the PR's base branch and diff files as `merge-files` before every merge),
   `cost-rising` (an active item's — not Merge/Watch/terminal — rounds — its last Implement, then each fix round — whose worker sessions' router costs rise
   strictly `Freeze:CostRisingRounds` times in a row; a round with no session or an unrecorded cost is no evidence), `main-red`
-  (a state: per repo the factory works on now — the configured repos, `FactoryOptions.ConfiguredRepos` = `Factory:DefaultRepo` and
-  `GitHub:Watch:Repos`, and the repos of non-terminal items — the base branch's head after its latest factory merge over all history
+  (a state: per repo the factory works on now — the configured repos, `FactoryOptions.ConfiguredRepos` = `Factory:DefaultRepo`,
+  `Factory:Repos` and `GitHub:Watch:Repos`, and the repos of non-terminal items — the base branch's head after its latest factory merge over all history
   is `Ci.Evaluate` Failed; pending is not red; a base the compare answers 404 for under a working installation
   (`GitHubNotFoundException`: the branch or merge commit is gone) has no tip, so nothing to be red; a gate App that is not
   installed on the repo or cannot see it (`GitHubAppNotInstalledException`: the installation lookup's or token mint's 404)
@@ -531,9 +538,11 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   when that pass ends: the `WorkItem.Repo` rule under sc-25873 below), the repository of a created story that names none; non-plan items
   still read only the first line. Every repository a plan item names — one line, several, or none (the default repository,
   configured by definition) — must be one of the factory's configured repositories (`FactoryOptions.ConfiguredRepos`:
-  `Factory:DefaultRepo` and `GitHub:Watch:Repos`, passed to the pipeline as `configuredRepos`; matched case-insensitively,
+  `Factory:DefaultRepo`, `Factory:Repos` — the setting for a repository the factory plans and works in without triaging its
+  issues — and `GitHub:Watch:Repos`, passed to the pipeline as `configuredRepos`; matched case-insensitively,
   `RepoRef.Is`), else the item escalates before any session, seat or grant, naming the unconfigured ones ("The plan names 1
-  repository (o/r), but o/r is not configured for this factory …"), with nothing created (epic E1: "only repositories the factory
+  repository (o/r), but o/r is not configured for this factory … Add it to Factory:Repos (GitHub:Watch:Repos would also turn on
+  the triage of its issues), or remove its Repo: line."), with nothing created (epic E1: "only repositories the factory
   is configured for"; sc-25877 — before it only a plan naming several was checked; a non-plan item is unchanged and may name any
   repository). With one line or none the planner is seated exactly as above; with several the seat is one directory — where the primary repository's plan worktree would be, so the same sweep
   finds it — holding a `factory/plan-sc-<id>` worktree of each repository's default branch at `<owner>/<name>` under it
@@ -565,13 +574,17 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   idempotency key (sc-25877, `ChildItem.Key(parentRef)`: `dark-factory:child:<parent>:<SHA-256 of the name and the description as
   sent>`, written by code, the same on every retry of the same plan; Shortcut stores it as the story's `external_id`, sent on
   `POST stories`, and the listings carry it, so a child is matched from the listing and then read in full for its relations) —
-  so a retry does not depend on the board returning a multi-line Markdown description unchanged. Fallback, only for a story with
+  so a retry does not depend on the board returning a multi-line Markdown description unchanged. Two stories of one plan never
+  share a key: `PlanParser` refuses a plan whose stories share a title, and the title is the hashed name (the rule that makes
+  the key unique within a plan; `PlanParserTests.Unique_titles_are_what_keeps_…`). Fallback, only for a story with
   no external id at all (a child created before the key existed): name and description together (the description starts with the
   code-written marker below; the listings carry no description, so each such namesake is read in full; line endings and outer
   whitespace aside). Either way a story someone else wrote with a plan story's title — or one carrying another key (the same plan
   text under another parent) — is never reused, recorded or linked: the plan's own story is created beside it. Not verified
   against the real API yet: the recorded `write-lifecycle.json` fixture's two `POST stories` requests carry the key by hand-edit
-  (their responses are the old recording); the terminal story's live run re-records it. A source that could not find the children
+  (their responses are the old recording); the terminal story's live run re-records it, and must confirm then that Shortcut
+  takes an `external_id` of the key's length (19 + the parent's name + 1 + 64 characters: 92 for `sc-25858`) and returns it in
+  the listings (docs/acceptance.md). A source that could not find the children
   again refuses before any write (`ChildrenRefusedException`: a Shortcut parent with neither epic nor team, possible only with
   `--ignore-scope`), and the item escalates with no story created. Which plan a later run uses (`RunPipeline.ReusesRecordedPlan`;
   the newest `plan` row is the one considered): a recorded plan is reused — no planner session — when a `plan-creating` or
@@ -606,6 +619,12 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
      (sc-25873; "Changeset size").
   7. The plan-time CI-trigger block: a repository whose workflows certainly cannot report on a plan's pull requests stops the
      plan before the planner runs, rather than warn (sc-25873; "CI that cannot run").
+  8. `Factory:Repos` (sc-25877, round 2): a setting of its own for the repositories the factory may plan and work in besides the
+     default one, so that decision 4 does not force issue triage on (`GitHub:Watch:Repos`) for a second repository
+     (configuration table; "Repository set").
+  9. A re-run of a plan story counted by `merged-into-changeset` does nothing (sc-25877, round 2; part of decision 3): before,
+     `factory run` on it implemented the story a second time and opened a second pull request into the changeset branch, while
+     the escalation said a re-run changes nothing ("Plan failures and controls").
 - Dependency-aware release (Phase 4a, sc-25871; `Plans/PlanRelease.cs`, `RunPipeline.Plan.cs` `PlannedAsync`/`ClosePlanAsync`): the
   orchestrator, not a person, releases a plan's stories. `RunPipeline.InFlightAsync` lists every `Planned` plan item (unless a
   control pauses it, or its closeout was given up on, below), so each intake poll — and a `factory run` on it — evaluates it
@@ -707,7 +726,16 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   resume records and comments, `PlanRelease.Counts`), the dashboard's story row, the changeset pull request's body ("Not sc-12,
   which was merged outside …") and the plan's closeout ("1 of its 2 stories merged through the factory's merge gate. 1 more
   (sc-12) was merged outside …"), each story line saying it instead of "not merged". The story's item stays Escalated (the
-  escalation metric counts it), a plan's Stop leaves it as it is (`ItemStopper.Settled`), and re-running it changes nothing. A
+  escalation metric counts it), a plan's Stop leaves it as it is (`ItemStopper.Settled`), and a re-run of it does nothing:
+  `RunPipeline.RunAsync` leaves an Escalated plan story that `PlanRelease.MergedOutsideChangeset` holds for where it is (no row,
+  no claim, no session; the run's error says why) instead of the usual Escalated → Intake re-run, which would implement the
+  story a second time and open a second pull request into the changeset branch. The once-per-pull-request guard on the row is
+  for a run interrupted between the row and the Escalated row (Ctrl-C, a crash): the run that resumes it finds the same merged
+  pull request again. Since the item stays Escalated the factory never moves its board story, which stays In Progress and
+  claimed: the escalation reason (so the escalation comment, rendered from the ledger) ends "… and a re-run of this story does
+  nothing: its board story is still claimed by the factory: move it to Done by hand.", and the story's line in the changeset
+  pull request's body and in the plan's closeout ends "; its board story is still claimed by the factory: move it to Done by
+  hand" (`PlanRelease.BoardStoryStillClaimed`; code-written words, the planner's title stays in its code span). A
   pull request merged outside the factory into ANY OTHER base (retargeted to the default branch, say: past the changeset, ungated)
   writes no such row: that story stays failed — `merged outside the factory` — and since a re-run would only find the merged pull
   request and escalate again, the hold comment's remedies offer no `factory run` for it and say so, like a cancelled story: "only

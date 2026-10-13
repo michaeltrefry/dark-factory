@@ -137,6 +137,12 @@ public static class PlanRelease
     public const string MergedOutsideIntoChangeset =
         "merged outside the factory into the changeset branch; reviewed as part of the changeset pull request";
 
+    /// <summary>
+    /// What the story's escalation and its line in the plan's reports tell the owner of a story <see cref="MergedOutsideChangeset"/>
+    /// counts as merged: its item stays Escalated, so the factory never moves its board story out of the claimed, in-progress state.
+    /// </summary>
+    public const string BoardStoryStillClaimed = "its board story is still claimed by the factory: move it to Done by hand";
+
     /// <summary>The Detail of a <see cref="RunPipeline.Steps.MergedIntoChangeset"/> row: the pull request, the changeset branch it merged into, its head.</summary>
     public static string MergedIntoChangesetDetail(string pullUrl, string changesetBranch, string headSha) =>
         $"{pullUrl} into {changesetBranch} at {headSha}";
