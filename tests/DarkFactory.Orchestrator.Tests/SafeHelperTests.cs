@@ -452,7 +452,9 @@ public class SafeHelperTests
                 "Assert.Throws<InvalidOperationException>(() => Options(new() { [\"Worker:RunAs\"] = \"\" }).Worker" + "Sandbox);",
             ],
             ["IntakeLoopTests.cs"] = ["[\"Worker:Launch" + "Helper\"] = \"/nonexistent/df-test-helper\","],
-            ["Harness.cs"] = ["if (Options.Worker" + "Sandbox is { } sandbox)"],
+            // sc-25871 (PlanRunnerLockTests): the same nonexistent helper, for a run that must reach neither the lock nor the helper.
+            ["PlanReleaseTests.cs"] = ["[\"Worker:Launch" + "Helper\"] = \"/nonexistent/df-test-helper\","],
+            ["Harness.cs"] =["if (Options.Worker" + "Sandbox is { } sandbox)"],
             ["E2e.cs"] = ["if (Harness.Options.Worker" + "Sandbox is not null)"],
             ["WalkingSkeletonTests.cs"] = ["var sandbox = Harness.Options.Worker" + "Sandbox;"],
             ["SetupScriptTests.cs"] =

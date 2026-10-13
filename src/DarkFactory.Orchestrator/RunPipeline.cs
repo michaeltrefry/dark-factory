@@ -87,6 +87,7 @@ public sealed partial class RunPipeline(
     StuckDetection? stuck = null,
     int? maxControlReadFailures = null,
     Plans.IPlanRunner? planner = null,
+    IReadOnlyList<RepoRef>? configuredRepos = null,
     bool workerless = false)
 {
     /// <summary>
@@ -96,6 +97,12 @@ public sealed partial class RunPipeline(
     /// which takes the lock.
     /// </summary>
     private readonly bool _workerless = workerless;
+
+    /// <summary>
+    /// The factory's configured repositories (<c>FactoryOptions.ConfiguredRepos</c>; the default repository alone when not given): the
+    /// only ones a plan naming several repositories may name (sc-25874, <see cref="PlanRepositories"/>).
+    /// </summary>
+    private readonly IReadOnlyList<RepoRef> _configuredRepos = configuredRepos ?? [defaultRepo];
 
     /// <summary>
     /// Reads of an item's controls in a row that may fail while a worker or the gate's test runs go on (<c>Controls:MaxReadFailures</c>);

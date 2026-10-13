@@ -18,7 +18,7 @@ Claude Code headless workers through the Weave router.
   review and merge gate (`Gate/`: `ReviewModels` (which panel calls count), `ReviewPanel` (roles, prompts, findings),
   `Reviewer.cs` (`IReviewer`/`RouterReviewer`) reading the router's stream with `MessageStream`, `GatePolicy` (+ `RiskyPaths`)
   and the path tiers `PathTiers`, `MergeGate`, `FixLoop`, `CiHeal`, `MergeQueue`, the test-only `GateCheckSeam`, the new-tests
-  check `NewTests.cs` (`NewTestsCheck`)/`XunitNewTests`/`SandboxTestRunner`;
+  check `NewTests.cs` (`NewTestsCheck`)/`XunitNewTests`/`CargoNewTests` (Rust, over the lexer-level `RustSource`)/`SandboxTestRunner`;
   reviewer prompts in `factory/prompts/`; GitHub side
   `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`, the merge gate and queue `RunPipeline.MergeQueue.cs`),
   the MCP upstreams and the loopback MCP proxy (`Mcp/`: `McpHttpClient`, `McpUpstream`/`McpUpstreams`/`McpServers`
@@ -89,11 +89,15 @@ Claude Code headless workers through the Weave router.
   ledger; a stub Claude CLI replaying the stuck/silent fixtures), `IssueTriageTests.A_triage_session_that_read_issue_text_is_tainted_and_cannot_push`.
   Phase 4a's P4-AT1 (sc-25870, sc-25871, `PlanAcceptanceTests`): a real planner plans a `plan`-labelled story into Backlog
   stories, created once, then released in dependency order (each tier's Merge rows seeded in the throwaway ledger; the stories are
-  not worked and the plan is not closed out).
+  not worked and the plan is not closed out). P4-AT3's proxy part (sc-25874, same class): the production proxy with a planner
+  grant over two repositories (`FACTORY_E2E_P4_PLAN_REPOS`) answers for each and refuses a third project, a call naming no
+  repository and off-list tools.
   Phase 3's epic AT1–AT5 (sc-25710, `CodeGraphAcceptanceTests.cs`): `CodeGraphReviewTests` (the real panel's tool calls, turns and
   overlay-bound CodeGraph answers), `CodeGraphTriageTests` (a triage session through the proxy, scanned for the CodeGraph token by a
   wrapper Claude Code path, `ScanWrapper`; the production proxy refusing off-profile tools; a live Kanban read through the reviewers'
   tools), `CodeGraphGateTests` (a critical file escalating on risk-threshold; CodeGraph unreachable blocking at the CI timeout).
+  Phase 4a's P4-AT4 (sc-25875): `GateNegativeTests.P4_AT4_…` (a seeded cargo package on the PR branch: the new-tests check run by
+  cargo as the worker user; needs cargo and rustc for `_factory`).
 
 ## Commands
 
@@ -193,7 +197,9 @@ stdin lines, one header each, which the helper joins with line breaks — helper
 has a uid-sweep refusal; last it runs `<Worker:ClaudePath> --version` as `_factory` through the helper and fails start-up with
 `Upgrade _factory's claude: …` (and the `claude update` command) below `WorkerSandbox.MinClaudeVersion` (2.1.291, the release
 the triage confinement — `--setting-sources ""`, `blockReadsOutsideWorkingDirectories`, `dontAsk` — was checked against; an
-older CLI may silently ignore a setting it does not know). Every normal (re)run kills every `_factory`
+older CLI may silently ignore a setting it does not know). Setup also reports, without failing, whether `cargo` and `rustc`
+answer `_factory` through the helper (Rust target repos only: the new-tests check of a Rust pull request is an `error` without
+them, sc-25875). Every normal (re)run kills every `_factory`
 process (its toolchain check runs through the helper): close `_factory` sessions and stop `factory work` first.
 `--remove-worker-login` (opt-in) is a standalone mode: it runs none of the setup (no helper, no toolchain check, no
 installs) and only deletes `_factory`'s own Claude login (`~/.claude/.credentials.json`, keychain item
@@ -266,7 +272,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   exactly one `127.0.0.1` address). It holds the upstream tokens (`McpUpstreams`, the one registry it shares with the
   reviewers' tool loop: `CodeGraphMcpClient.Upstream` and the Kanban `McpUpstream`, both over the generic `McpHttpClient`);
   each grant is a per-session tool set, `McpProxy.Grant(repo, McpProfile)`: `McpProfile.Triage` (above) or
-  `McpProfile.Planner` (every allowlisted CodeGraph tool and Kanban read tool; a plan item's planner session, sc-25870), each a subset of the
+  `McpProfile.Planner` (every allowlisted CodeGraph tool and Kanban read tool; a plan item's planner session, sc-25870; the only
+  profile granted several repositories, `McpProxy.Grant(repos, McpProfile)`, below), each a subset of the
   upstreams' allowlists (checked when the profile is made). The session gets `--mcp-config <file>` naming
   `http://127.0.0.1:<port>/mcp/<server>` for each server its profile grants a tool of, with a
   per-session bearer credential (32 random bytes, kept hashed), plus `--allowedTools` rules
@@ -280,7 +287,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   with the commit it describes as the reviewers' are ("CodeGraph's index of <project>'s default branch as of <sha>", or "…, commit
   unknown"; a review adds ", not the PR head <head>", a proxy session has no PR head; `ReviewTools.DefaultBranchLabel`, E3), which
   the CodeGraph tools' descriptions and the triage prompt say. One allowlist per
-  upstream: CodeGraph's is `ReviewTools.CodeGraphTools` (7 model-free tools), Kanban's `McpServers.KanbanTools` (the hosted
+  upstream: CodeGraph's is `McpServers.CodeGraphTools` — the reviewers' `ReviewTools.CodeGraphTools` (7 model-free tools: all the
+  reviewers' tool loop offers and all `CodeGraphMcpClient.CallAsync` sends) plus the planner's cross-repository
+  `PlannerCodeGraph.Tools` (6, below; the proxy sends them with `CodeGraphMcpClient.CallProxiedAsync`) —, Kanban's `McpServers.KanbanTools` (the hosted
   server's exact snake_case names, read from its `tools/list` on 2026-10-12, sc-25710: list_projects, get_board, list_epics,
   get_epic, list_epic_documents, get_epic_document, list_work_items, list_epic_work_items, get_issues, get_work_item,
   search_work_items; names match exactly, so a PascalCase spelling is never offered; no create_*/update_*/delete_*/move_*/
@@ -301,7 +310,38 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   the proxy. Upstream tokens are only in the owner process (never in the worker's env, argv, worktree, prompt or transcript;
   `McpProxyTests`). Every MCP tool use still taints the session (`mcp:<tool>`; triage is already tainted by the issue text and
   never pushes). Implementers and fixers get no MCP: their tools allow none, and `ClaudeWorker.BuildArguments`/`RunAsync` refuse
-  an MCP config for them (`--strict-mcp-config` and no `--mcp-config`). A plan item's planner session (below) uses the same `McpProxy`/`McpProxySessions` under `McpProfile.Planner`. The intake reads and writes the issue board only through the issue source's
+  an MCP config for them (`--strict-mcp-config` and no `--mcp-config`). A plan item's planner session (below) uses the same `McpProxy`/`McpProxySessions` under `McpProfile.Planner`.
+  Planner cross-repository tools (sc-25874, `Mcp/PlannerCodeGraph.cs`): the planner is the one agent that sees every repository of a
+  plan. Its profile's CodeGraph tools are the reviewers' seven plus `search_projects`, `analyze_impact_file`, `trace_data_lineage`,
+  `get_service_clusters`, `get_cluster_detail`, `file_hotspot`, each checked against CodeGraph's source (main at f95d231) to reach
+  no LLM and no embedding model at call time and to return no stored model text (graph store, `cross_repo_edges`, `repo_clusters`
+  — Louvain arithmetic, labels never written — and file metrics only; the reason per tool is the comment on the list; none was
+  dropped). `get_architecture`, `get_service_summary`, `get_project_health`, `project_report`, `search_conventions`, `rag_search`,
+  every memory tool and the Shortcut/RabbitMQ/MySQL hub tools stay off every list (stored or live model output, or external
+  systems; `PlannerCrossRepoProxyTests` pins the reviewers', the triage's and the planner's lists and that none holds one). The
+  reviewers' list (`ReviewTools.Names`) and `McpProfile.Triage` are unchanged, and no other profile holds a cross-repository tool.
+  Their arguments are rebuilt by `PlannerCodeGraph.Arguments` (unknown ones dropped, strings cut at 300, depth 1–5, page 1–1000,
+  page size 1–100, paths `RepoPath`-normalised and at most `MaxPathChars` (1,000; a longer one is a usage error), never a `sha`: the default branch) and the project set by the proxy (as `repo` for
+  the two per-file tools, CodeGraph's own name for it). `search_projects`, `get_service_clusters` and `get_cluster_detail`
+  (`PlannerCodeGraph.Global`) are not about one project: they are sent with no project, labelled "CodeGraph's <tool>, across every
+  project it indexes (default branches)", and their answers name every indexed project, private ones outside the plan's set
+  included. Residual, accepted (the owner's Phase 3 rule): the planner reads the owner's own plan story and its output goes only to
+  the owner's board; triage, driven by untrusted issue text and posting on the issue, never gets a cross-project answer.
+  Residual, accepted: "no stored model text" for `get_service_clusters`/`get_cluster_detail` depends on CodeGraph never writing
+  `repo_clusters.cluster_label` (its handlers print `cluster.Label ?? "Cluster N"`); checked at CodeGraph f95d231, and to be
+  re-checked — the two tools dropped if the label becomes model text — when CodeGraph gains a cluster labeller.
+  Multi-repository grant: `McpProxy.Grant(repos, McpProfile.Planner)` pins CodeGraph to a set of repositories (any other profile
+  with more than one is refused; duplicates, case-insensitively, collapse), each project resolved by exact repo URL match, once per
+  session. With more than one repository every tool about one project lists a required `repo` argument (an enum of the set's
+  `owner/name` values) and a call must name its repository — by `repo` (case-insensitive) or by a `project` that is exactly one of
+  the set's CodeGraph projects; naming another repository or project, two that disagree, or none is refused with JSON-RPC -32602,
+  nothing forwarded (the selector itself is never forwarded). `read_node_source` takes no `repo` and is shown only for a node of a
+  project of the set. With one repository nothing changed (no `repo` argument is listed and a `repo` sent anyway is dropped like any
+  unknown argument — except on `analyze_impact_file`/`file_hotspot`, where `repo` is CodeGraph's own project argument: there one
+  naming anything but the grant's repository (`owner/name`, case-insensitive) or its pinned project (exact), or not a string, is
+  refused -32602 with nothing forwarded, like another `project`; the descriptions and labels are the same): triage's grant behaves as before. The call cap, the answer cap and
+  the commit label are per grant and per answer as before; the tool descriptions and the planner prompt (`PlanPrompt.McpNote`) say
+  how to name a repository and which tools are not about one. The intake reads and writes the issue board only through the issue source's
   `IIssueIntakeSource` capability (E6): triage comment and route label, issues, comments, permissions and gate policy. The orchestrator — not
   the model — routes (`IssueRouting`): question/duplicate → comment only; author without write/maintain/admin
   (`RepoPermission.IsCollaborator`; read and triage count as outsiders) on the issue's repo, or on the target repo when the
@@ -456,7 +496,21 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   when an upstream is configured; its `--allowedTools` name exactly that profile's tools, `PlannerTools`). With `Worker:RunAs=none`
   (development only) the planner still runs — unlike triage, which refuses: its input is the owner's own story, the same trust as
   an unsandboxed implementer — but as the owner, so its read-only confinement is then only Claude Code's own (`dontAsk`, the
-  `ReadRule`, the denied tools): no `_factory` user and no ACL stand between it and the owner's files, and nothing is swept. A
+  `ReadRule`, the denied tools): no `_factory` user and no ACL stand between it and the owner's files, and nothing is swept.
+  Repository set (sc-25874): a plan item may name several repositories, one `Repo: owner/name` line each
+  (`RepoResolver.ResolveAll`: in order, repeats dropped, lines inside a ``` or ~~~ fence not read — a planner-created story
+  carries planner text in a tilde fence, which must not widen a later planner's set; `RunPipeline.PlanRepositories`). The first stays the item's primary
+  repository — the ledger's `Repo`, the `Repo:` line of every created story, what the rest of the pipeline uses; non-plan items
+  still read only the first line. With one line or none the planner is seated exactly as above. With several, each must be one of
+  the factory's configured repositories (`FactoryOptions.ConfiguredRepos`: `Factory:DefaultRepo` and `GitHub:Watch:Repos`, passed
+  to the pipeline as `configuredRepos`), else the item escalates before any session, seat or grant, naming the unconfigured ones,
+  with nothing created; the seat is then one directory — where the primary repository's plan worktree would be, so the same sweep
+  finds it — holding a `factory/plan-sc-<id>` worktree of each repository's default branch at `<owner>/<name>` under it
+  (`ISeatWorkspace`, `GitWorkspace.PrepareSeatAsync`/`RemoveSeatAsync`; each clone fetched with a contents-read token minted for
+  that repository, nothing shared for writing, nothing ever pushed), the worker's single `ReadRule` being that directory; the
+  out-of-tree symlink removal runs per checkout (a link into another repository's checkout counts as outside and is removed); the
+  proxy grant is over the whole set (above); and the prompt lists which directory is which repository (`PlanPrompt.Build`,
+  `PlannerSeat.Checkouts`) and says every story is worked in the primary one. A
   seat the factory cannot set up (the sweep, the proxy start, the session file's ACL check: `FactoryUnavailableException`) is
   factory-wide, as for triage: the exception leaves `RunPipeline.RunAsync` (the only exception its catch-all lets through), the
   item stays in Plan with nothing recorded against it — no Escalated row, no comment — and the intake loop ends the poll
@@ -932,7 +986,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   sealed — the tier must match the policy and CODEOWNERS (root, `.github/`, `docs/`) and cover `.github/workflows/` and
   `factory/prompts/` with a pattern matching everything under them (`PathPattern.CoversEverythingUnder`: a directory
   pattern or trailing `**` naming the directory or an ancestor; naming files in it is invalid); security review — a path
-  whose tier lists `security-review` or that `RiskyPaths` matches (scripts, build/container files, dependency manifests,
+  whose tier lists `security-review` or that `RiskyPaths` matches (scripts, build/container files, dependency manifests, Rust's
+  `build.rs`, `rust-toolchain*` and `.cargo/config*`,
   keys/.env, security-sensitive names; case-insensitive) needs it, so the policy can add security-review paths but not
   remove the floor. The gate also reads the PR, the diff of the head against the base (`IGateGitHub.GetDiffAsync`;
   unreadable → blocked; a file count — one per `diff --git` header, a rename once — other than the PR's `changed_files` →
@@ -983,8 +1038,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   then the first `CodeGraphRisk.MaxListed` (20) others with "… N more", each hotspot with its commit, and what could not be read
   (capped likewise), so one row stays inside the reports' budget; a failure's
   reason names each file over the limit with its blast radius (or hotspot score), so the escalation comment and the PR report (both
-  from the ledger) name it. `analyze_impact_file`/`file_hotspot` (`CodeGraphMcpClient.RiskTools`) are sent straight through the MCP
-  client and are on no allowlist, profile or tool list (a test asserts it). A sealed path always escalates (even with no verdict); a protected one escalates after its checks instead of merging; each
+  from the ledger) name it. The gate sends `analyze_impact_file`/`file_hotspot` (`CodeGraphMcpClient.RiskTools`) straight through the MCP
+  client. They are on no reviewers' tool list and not in the triage profile; since sc-25874 they are on the planner profile's
+  list (`PlannerCodeGraph.Tools`), reachable by a planner session through the loopback proxy only, without a `sha` (a test asserts
+  each half: `CodeGraphRiskTests.The_risk_tools_are_on_no_reviewer_or_triage_tool_list_only_the_planners`). A sealed path always escalates (even with no verdict); a protected one escalates after its checks instead of merging; each
   evaluation is a `gate` checkpoint. A head without a verdict (a push after the review) goes back
   to Review (CI/MergeGate → Review are table rows); otherwise any failed rule escalates. A pass checkpoints `gate-passed`
   with the head SHA and merges with the gate App's write token and `sha` = that head (GitHub refuses a moved head: 409 →
@@ -1058,6 +1115,84 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   gate uses it (E5); a recorded non-error result for the same base and head is reused, never re-run. Anything but `pass`
   blocks (`gate_rejected` for the typed outcome). Pause/Stop are watched while the runs execute (polled like a worker's
   watch): either cancels them (the runner stops the sandboxed commands) and records nothing, so Continue runs the check again.
+  Rust/cargo (sc-25875, `Gate/CargoNewTests.cs`, a second `INewTestStrategy` beside `XunitNewTests`; `NewTestsCheck.Strategies`
+  runs both, each for its own files, so a .NET change is judged exactly as before and a repo with both stacks by both). Found
+  by syntax, nothing compiled: `Gate/RustSource.cs` is a lexer-level reader (no Rust parser ships with .NET) that knows line and
+  nested block comments, string/byte/C strings, raw strings (`r#"…"#`), character literals as against lifetimes and raw
+  identifiers, and reads module bodies only — inline modules and braced item macros (`proptest! { … }`) are read, function,
+  `impl`, `trait` and `macro_rules!` bodies skipped; unbalanced source throws and the file is unisolable (never "no tests"). New
+  tests: functions with a test attribute (`#[test]` under any path — `#[tokio::test]`, `#[sqlx::test]` — `#[rstest]`,
+  `#[test_case(…)]`, `#[test_matrix]`, `#[quickcheck]`, `#[proptest]`) in the head versions of a cargo package's changed `.rs`
+  files (the nearest `Cargo.toml` with `[package]`; workspaces at any depth), in `tests/` or `src/`, whose id no base version of a
+  changed file has. Id = `package:target:path` as libtest names it: `words:lib:count::tests::blank`, `tool:bins:tests::runs`,
+  `words:test/api:deep::nested` (`tests/api.rs`, or `tests/api/main.rs` and its modules); a module file is the library's when
+  `src/lib.rs` declares its top module (or is all there is), else the binary's. A function with cases (`#[test_case]`, rstest
+  `#[case]`/`#[values]`) is one test `…::name::*` (every case under it; new cases on an existing one are unisolable, like a
+  theory's rows). Not new: a renamed file's test the old file had, and a test moved unchanged from where the PR removes it (ids are
+  path-based, so a pure move would otherwise look new). Overlay (the PR's test code applied to the base), under one rule: a new
+  test may count as not building on the base (`not-built`) only for something the base lacks, never for an import, helper or
+  attribute the overlay left out — where the gate cannot apply test code faithfully the check is `unsupported`. Test code is
+  what a test-only `cfg` gates, the predicate evaluated, not searched for the word (`RustSource.IsTestOnlyCfg`: `test`, `all(…)`
+  with a test-only operand, `any(…)` whose operands are all test-only, never `not(…)` — so `cfg(all(test, not(miri)))` is test
+  code and `cfg(any(test, feature = "x"))` production code), on the item or as an inline module's inner `#![cfg(test)]`.
+  Everything changed under a package's `tests/` and every file of a `#[cfg(test)]` module (`#![cfg(test)]`, or declared
+  `#[cfg(test)] mod x;` at any level above) comes whole from the head; a production file with inline tests is written — through
+  owner-side git, as the retries' files are (`NewTestSet.BaseReplacements`) — as its **base** version with the head's test code
+  grafted in (`CargoNewTests.Graft`): per module the two share, every `#[cfg(test)]` module replaced by the head's or added
+  (removed when the head has none), whole, so its helpers and `use`s come along and the production code stays the base's.
+  Imports are not test code but a test reaches them through `use super::*`: every single import of the head's `use` and
+  `extern crate` items (`RustSource.UseLeaves`: `use a::{b, c}` is `use a::b;` and `use a::c;`, attributes and visibility kept)
+  whose name the base's module does not already import is added at the module's end (`CargoNewTestSet.AddedUses`), `pub use`
+  re-exports included. A file the base lacks (added) that holds new tests is written with its inner attributes, its imports and
+  its `#[cfg(test)]` items alone (an empty `fn main` kept for a binary) and its `mod` declaration added to the base's parent
+  module file, so a test of the file's new code is compiled on the base and fails there in its own function, while one that
+  only reaches what the base has compiles and gets its real result; a manifest's `dev-dependencies` tables are the head's (a
+  new package's manifest is applied whole, its new crate roots as any new file). Unisolable (`unsupported`): a changed `.rs`
+  file the reader cannot read; a new test outside `src/` and `tests/`, in no package, or in a module shared by integration
+  tests (`tests/common/mod.rs`); a custom target layout (`[[test]]`, `autotests`/`autobins`/`autolib`, a non-default `path`); a
+  test function, or tests inside a macro, outside every `#[cfg(test)]` module that the base does not have unchanged (also at
+  the top of a new file, or in a module gated by `cfg(any(test, …))`: the items it uses beside it cannot be told from
+  production code — "move it into a #[cfg(test)] module"); a `#[cfg(test)]` item that is not a module (a `use`, an `impl`, a
+  helper) outside every `#[cfg(test)]` module, that the base lacks; two items of one kind and name in a module at the base or
+  the head that the graft would match (cfg alternates: two `mod tests`, two `#[test] fn t`; never two edits of one place —
+  `Graft` also refuses overlapping edits); a renamed production file that holds new tests (its production code is the base's
+  under another name); dotted `dev-dependencies` keys; a new file whose `mod` declaration is not at the top of its parent's
+  file. Runs, from the worktree root per package with a new test, all through `SandboxTestRunner` like xUnit's (as `_factory`,
+  no variables): `cargo --version` (`TestPhase.Toolchain`: failing, the run is `ToolchainMissing` → `error` naming cargo, never
+  a pass — cargo is needed only where a Rust check runs, so a .NET-only factory needs none; `setup-worker-user.sh` reports
+  `cargo`/`rustc` as an optional check; they must be on the launch helper's fixed PATH, `/opt/homebrew/bin` or
+  `/usr/local/bin`: the helper did not change), `cargo fetch` (the restore, the only step that may use the network, as `dotnet
+  restore` is; `cargo` reaches the lint only through `TestStep.Program`, the same known local program), `cargo test --offline
+  --no-run --message-format=json` for the targets with new tests (the build: cargo's JSON diagnostics, stable), then one `cargo
+  test --offline … --no-fail-fast -- --exact <path>` per new test (`--lib`, `--bins` or `--test <name>`; a parameterized one by
+  its `path::` prefix); `--offline`: the build and the tests resolve and download nothing. cargo reports on standard output, so
+  such a step's output is kept by the runner in memory with its exit code (`TestStep.CaptureOutput`, `ResultFile.ExitCode`;
+  nothing the run writes is read as a result). Results: libtest's JSON is nightly-only, so the stable lines are parsed
+  (`running N tests`, `test <name> ... ok|FAILED|ignored`, `test result: …`) and read only when they have libtest's shape and
+  agree with the exit code — per test binary a `running N tests` line, then N test lines, then a summary counting them; no test
+  line outside such a block; no test with two results; exit code 0 with no failure or non-zero with one; anything else (no
+  summary: a crashed or custom harness; a mismatch: a test that printed) is an unreadable report, `error`. `ignored` is skipped;
+  a run of 0 tests gives no case (`not-run`: `error` on the base, not passing on the head). A base that does not build: each
+  `compiler-message` error (file placed from rustc's workspace-relative name and the package's manifest path) is put in the
+  innermost item at its position; only what the overlay applied counts (a whole test file; in a grafted file a `#[cfg(test)]`
+  item, or an import the overlay added): in a new test's own function → `not-built`; another item of the test code (a helper)
+  is left out of the retry, and of a `use` only the single imports the error lies in (the others stay, so `use words::{words,
+  trim}` with a new `trim` still imports `words`); an error in a module's own header or between its items is unremovable (the
+  tests stay `unproven`); anywhere else — the base's production code or its own imports, a file not applied (e.g. another
+  module's test the base cannot build), no file (manifest, dependency, linker, no rustc), an ambiguous name (E0659), or no
+  error named — is unattributable, `error`. Retries: `INewTestStrategy.BaseRetries` is 1 for xUnit and 3 for cargo, since rustc
+  reports in stages (an import that does not resolve hides the errors of the code using its name, which may hide type
+  errors): each retry (`gate-sc-<id>-base-retry`, `-base-retry-2`, `-base-retry-3`) leaves out what the run before could not
+  compile, the last one that ran judges the remaining tests, and a base that still does not build after them leaves those
+  `unproven` (rejected). Residuals, accepted: (a) the test process writes all of its output and picks its exit code, so a test
+  that prints a complete libtest report and calls `std::process::exit(101)` is read as failed on the base — reviewed code that
+  lies about itself, as a test that asserts on the source tree would be; (b) `~_factory/.cargo` (a global `config.toml` with
+  `runner`, `rustc-wrapper` or `[env]`, and the registry cache `cargo fetch` fills) persists across items and is writable by
+  every worker session, so an implementer can influence later gate runs, on both commits — the analogue of `_factory`'s NuGet
+  cache and config for dotnet; (c) production code is the base's by file: code the PR moves into a new file, a new non-test
+  helper, macro or dependency, and a re-export in another package are things the base lacks, so a test that needs one is
+  `not-built` even if it otherwise exercises old code (as a test calling a new helper outside the test projects is for xUnit);
+  (d) an import the PR rebinds (the same name from another path) stays the base's in a grafted file.
   Upgrading from Phase 1: Review is now a handled state, so the first `factory work` picks up every item parked at Review:
   an open PR is reviewed by the panel like any other (Phase 1's missing `implementer-model` no longer matters, sc-25379),
   and one the owner merged or closed escalates once with a story comment ("merged outside the factory"). An item whose

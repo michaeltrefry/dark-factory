@@ -1,6 +1,10 @@
 using System.Net.Http.Json;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using DarkFactory.Orchestrator;
+using DarkFactory.Orchestrator.Gate;
+using DarkFactory.Orchestrator.Gateway;
+using DarkFactory.Orchestrator.Mcp;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Plans;
 using DarkFactory.Orchestrator.Shortcut;
@@ -18,6 +22,76 @@ namespace DarkFactory.AcceptanceTests;
 public class PlanAcceptanceTests
 {
     private static readonly TimeSpan RunTimeout = TimeSpan.FromMinutes(45);
+
+    /// <summary>
+    /// P4-AT3's proxy part (sc-25874): the production loopback proxy with a planner grant over two repositories
+    /// (<c>FACTORY_E2E_P4_PLAN_REPOS=owner/a,owner/b</c>, both indexed in the hosted CodeGraph) answers for each one, lists the
+    /// planner's cross-repository tools, and refuses a third project, a call naming no repository, and tools off the planner's
+    /// allowlist (<c>get_architecture</c>), nothing forwarded. No model is called: the test plays the planner's MCP client itself.
+    /// </summary>
+    [Fact]
+    public async Task P4_AT3_a_planner_grant_over_two_repositories_answers_for_each_and_refuses_a_third_project_and_off_list_tools()
+    {
+        Harness.RequireOptIn();
+        var options = Harness.Options;
+        CodeGraphLive.RequireToken(options);
+        var repos = Harness.RequireEnv("FACTORY_E2E_P4_PLAN_REPOS", "two repositories indexed in CodeGraph, comma-separated owner/name")
+            .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).Select(RepoRef.Parse).ToList();
+        Assert.True(repos.Count == 2, "FACTORY_E2E_P4_PLAN_REPOS names exactly two repositories");
+        var ct = TestContext.Current.CancellationToken;
+        using var codeGraphHttp = OutboundHttp.CodeGraphApi(options.CodeGraphBaseUrl);
+        var upstreams = FactoryRunner.CreateUpstreams(options, codeGraphHttp, kanbanHttp: null, Console.Out);
+        var projects = new List<string>();
+        foreach (var repo in repos)
+        {
+            projects.Add(await CodeGraphLive.RequireProjectAsync(upstreams.CodeGraph!, repo, ct));
+        }
+        await using var proxy = await McpProxy.StartAsync(upstreams, ct);
+        using var grant = proxy.Grant(repos, McpProfile.Planner);
+        using var proxyHttp = OutboundHttp.LoopbackMcp(proxy.Endpoint(McpServers.CodeGraph));
+        var client = new McpHttpClient(proxyHttp, grant.Credential, "proxy", "");
+        var refusedCode = McpProxy.InvalidParams.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+        // tools/list: only the planner's tools, the cross-repository ones among them, each tool about one project taking `repo`.
+        var listed = await client.ListToolsAsync(ct);
+        Assert.All(listed, t => Assert.Contains(t.Name, McpProfile.Planner.ToolsOf(McpServers.CodeGraph)));
+        Assert.All(PlannerCodeGraph.Tools, t => Assert.Contains(listed, l => l.Name == t));
+        Assert.DoesNotContain(listed, t => t.Name is "get_architecture" or "get_service_summary" or "get_project_health" or "rag_search");
+        Assert.Equal(repos.Select(r => r.FullName), listed.Single(t => t.Name == ReviewTools.SearchGraph).InputSchema["properties"]!["repo"]!["enum"]!
+            .AsArray().Select(e => e!.GetValue<string>()));
+
+        // An answer for each repository's project, labelled with it.
+        foreach (var (repo, project) in repos.Zip(projects))
+        {
+            var answer = await client.CallToolAsync(ReviewTools.SearchGraph, new JsonObject { ["namePattern"] = "%", ["limit"] = 1, ["repo"] = repo.FullName }, ct);
+            Assert.StartsWith($"CodeGraph's index of {project}'s default branch", answer.Text);
+        }
+
+        // A third project (any other one CodeGraph indexes), by name or as a repository; no repository at all; a tool off the list.
+        var all = await client.CallToolAsync(PlannerCodeGraph.SearchProjects, new JsonObject { ["pageSize"] = 100 }, ct);
+        Assert.StartsWith("CodeGraph's search_projects, across every project it indexes", all.Text);
+        var third = System.Text.RegularExpressions.Regex.Matches(all.Text, @"^\s*-\s+\*\*(?<name>[^*\r\n]+)\*\*", System.Text.RegularExpressions.RegexOptions.Multiline)
+            .Select(m => m.Groups["name"].Value.Trim()).FirstOrDefault(name => !projects.Contains(name));
+        if (third is null)
+        {
+            Assert.Fail("INCONCLUSIVE: CodeGraph indexes no project outside FACTORY_E2E_P4_PLAN_REPOS to name as the third.");
+        }
+        foreach (var (tool, arguments) in new (string, JsonObject)[]
+        {
+            (ReviewTools.SearchGraph, new JsonObject { ["namePattern"] = "%", ["project"] = third }),
+            (ReviewTools.SearchGraph, new JsonObject { ["namePattern"] = "%", ["repo"] = "someone/else" }),
+            (ReviewTools.SearchGraph, new JsonObject { ["namePattern"] = "%" }),
+            (PlannerCodeGraph.FileHotspot, new JsonObject { ["path"] = "README.md", ["repo"] = repos[0].FullName, ["project"] = third }),
+            ("get_architecture", new JsonObject { ["project"] = projects[0] }),
+            ("get_service_summary", new JsonObject { ["project"] = projects[0] }),
+            ("rag_search", new JsonObject { ["query"] = "anything" }),
+        })
+        {
+            var refused = await client.CallToolAsync(tool, arguments, ct);
+            Assert.True(refused.IsError, $"{tool} {arguments.ToJsonString()} was answered: {refused.Text}");
+            Assert.Contains(refusedCode, refused.Text);
+        }
+    }
 
     [Fact]
     public async Task A_plan_item_is_planned_by_a_real_planner_into_backlog_stories_created_once_and_released_in_dependency_order()

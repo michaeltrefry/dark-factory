@@ -953,8 +953,10 @@ public class PlanReleasePipelineTests
     {
         var h = new Harness();
         var ids = await h.Planned(PlanAnswers.Answer(PlanAnswers.Story("a", "First story"), PlanAnswers.Story("b", "Second story")));
-        // Shortcut answers 500 for A: its blockers cannot be read.
-        h.Board.Intercept = Failing(HttpMethod.Get, $"/stories/{ids[0]}");
+        // A is blocked by a finished story outside the plan, and Shortcut answers 500 for that story: A's blockers cannot be read.
+        h.Board.Add(777, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.Done, name: "Someone else's story");
+        await h.Link(777, ids[0]);
+        h.Board.Intercept = Failing(HttpMethod.Get, "/stories/777");
         var before = (await h.Rows()).Count;
         var reason = "";
         // Two streaks of failing polls, each ending in the intake loop giving up on the item for the same reason.
@@ -965,9 +967,10 @@ public class PlanReleasePipelineTests
                 var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => h.Run());
                 reason = $"{IntakeOptions.DefaultMaxItemFailures} runs in a row failed before the pipeline could start; last error: {ex.GetType().Name}: {ex.Message}";
             }
-            // The failing evaluations released nothing — not even B, whose own read works — and recorded nothing.
+            // The failing evaluations released nothing — neither A, whose blockers are unknown, nor B, whose own read works — and
+            // recorded nothing.
             Assert.Empty(await h.Released());
-            Assert.Equal(FakeShortcutBoard.Backlog, h.State(ids[1]));
+            Assert.Equal((FakeShortcutBoard.Backlog, FakeShortcutBoard.Backlog), (h.State(ids[0]), h.State(ids[1])));
             Assert.DoesNotContain(h.Board.Requests, r => r.Method == HttpMethod.Put);
 
             Assert.Equal(expected, await h.GiveUp(reason));
@@ -975,7 +978,7 @@ public class PlanReleasePipelineTests
 
         var comment = Assert.Single(h.Comments(PlanId));
         Assert.Contains($"sc-{PlanId} is a plan waiting on its stories and the factory could not evaluate it", comment);
-        Assert.Contains($"stories/{ids[0]} failed: 500", comment);
+        Assert.Contains("stories/777 failed: 500", comment);
         Assert.Contains($"sc-{PlanId} stays Planned", comment);
         var held = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.PlanHeld);
         Assert.Equal(($"not evaluated: {reason}", StepOutcome.Deferred), (held.Detail, held.Outcome));

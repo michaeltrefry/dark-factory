@@ -61,8 +61,16 @@ public sealed record McpUpstreams(CodeGraphMcpClient? CodeGraph, McpUpstream? Ka
 /// <summary>The MCP server names sessions see, and the per-upstream allowlists not kept elsewhere.</summary>
 public static class McpServers
 {
-    /// <summary>CodeGraph's name (its allowlist is <see cref="Gate.ReviewTools.CodeGraphTools"/>, repo-scoped).</summary>
+    /// <summary>CodeGraph's name (its allowlist is <see cref="CodeGraphTools"/>, repo-scoped).</summary>
     public const string CodeGraph = "codegraph";
+
+    /// <summary>
+    /// CodeGraph's allowlist as an upstream (sc-25874): the reviewers' tools (<see cref="Gate.ReviewTools.CodeGraphTools"/>, the only
+    /// ones the reviewers' tool loop offers and <see cref="DarkFactory.Orchestrator.CodeGraph.CodeGraphMcpClient.CallAsync"/> sends) and
+    /// the planner's cross-repository tools (<see cref="PlannerCodeGraph.Tools"/>, which only <see cref="McpProfile.Planner"/> grants).
+    /// All model-free; nothing else of CodeGraph is listed to or forwarded for any session.
+    /// </summary>
+    public static readonly IReadOnlyList<string> CodeGraphTools = [.. Gate.ReviewTools.CodeGraphTools, .. PlannerCodeGraph.Tools];
 
     /// <summary>Kanban's name (its allowlist is <see cref="KanbanTools"/>; not repo-scoped: Kanban has no repository mapping).</summary>
     public const string Kanban = "kanban";
@@ -87,14 +95,14 @@ public static class McpServers
     /// </summary>
     public static readonly IReadOnlyList<string> AllToolRules =
     [
-        .. Gate.ReviewTools.CodeGraphTools.Select(t => ToolRule(CodeGraph, t)),
+        .. CodeGraphTools.Select(t => ToolRule(CodeGraph, t)),
         .. KanbanTools.Select(t => ToolRule(Kanban, t)),
     ];
 
     /// <summary>The upstream allowlist of <paramref name="server"/> (empty for a server the factory does not know).</summary>
     public static IReadOnlyList<string> AllowlistOf(string server) => server switch
     {
-        CodeGraph => Gate.ReviewTools.CodeGraphTools,
+        CodeGraph => CodeGraphTools,
         Kanban => KanbanTools,
         _ => [],
     };
@@ -137,10 +145,16 @@ public sealed class McpProfile
         [McpServers.CodeGraph] = [Gate.ReviewTools.SearchGraph, Gate.ReviewTools.GetCodeSnippet, Gate.ReviewTools.ReadNodeSource],
     });
 
-    /// <summary>Planning sessions (Phase 4; not used yet): every allowlisted CodeGraph tool and Kanban read tool.</summary>
+    /// <summary>
+    /// A plan item's planner session (sc-25870, sc-25874): every allowlisted CodeGraph tool — the reviewers' seven and the
+    /// cross-repository ones (<see cref="PlannerCodeGraph.Tools"/>) — and Kanban's read tools. The only profile granted the
+    /// cross-repository tools, or more than one repository (<see cref="McpProxy.Grant(IReadOnlyList{Shortcut.RepoRef}, McpProfile)"/>):
+    /// its input is the owner's own plan story and its output goes only to the owner's board, so answers that name other indexed
+    /// (private) projects are accepted for it, as they never are for triage.
+    /// </summary>
     public static readonly McpProfile Planner = new("planner", new Dictionary<string, IReadOnlyList<string>>
     {
-        [McpServers.CodeGraph] = Gate.ReviewTools.CodeGraphTools,
+        [McpServers.CodeGraph] = McpServers.CodeGraphTools,
         [McpServers.Kanban] = McpServers.KanbanTools,
     });
 

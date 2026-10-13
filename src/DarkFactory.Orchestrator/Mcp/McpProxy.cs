@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using DarkFactory.Orchestrator.CodeGraph;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Shortcut;
 using Microsoft.AspNetCore.Builder;
@@ -35,6 +36,16 @@ namespace DarkFactory.Orchestrator.Mcp;
 /// naming any other <c>project</c> is refused, the arguments are rebuilt by <see cref="ReviewTools.CodeGraphArguments"/> (anything
 /// else is dropped) with the project set, and <c>read_node_source</c> is shown only for a node of that project. Kanban has no
 /// repository mapping, so its (allowlisted, read-only) calls are not repository-scoped; their arguments are forwarded as sent.
+/// </para>
+/// <para>
+/// A planner's grant may hold several repositories (sc-25874, <see cref="Grant(IReadOnlyList{RepoRef}, McpProfile)"/>; every other
+/// profile exactly one): each CodeGraph call about one project then names its repository in a required <c>repo</c> argument
+/// (<see cref="PlannerCodeGraph.RepoArgument"/>: one of the grant's <c>owner/name</c> values; a <c>project</c> naming one of their
+/// CodeGraph projects is accepted too), and a call naming any other repository or project, or none, is refused
+/// (<see cref="InvalidParams"/>, nothing forwarded); <c>read_node_source</c> is shown only for a node of one of their projects. With
+/// one repository nothing changes: no <c>repo</c> argument is listed or needed. The planner's cross-repository tools
+/// (<see cref="PlannerCodeGraph.Tools"/>) have their arguments rebuilt by <see cref="PlannerCodeGraph.Arguments"/>; those not about
+/// one project (<see cref="PlannerCodeGraph.Global"/>) are sent with no project and answer about every indexed project.
 /// </para>
 /// </summary>
 public sealed class McpProxy : IAsyncDisposable
@@ -119,14 +130,30 @@ public sealed class McpProxy : IAsyncDisposable
     /// upstreams (an upstream the profile grants no tool of is not served to it): valid until the grant is disposed (the session
     /// ended), then refused.
     /// </summary>
-    public McpProxyGrant Grant(RepoRef repo, McpProfile profile)
+    public McpProxyGrant Grant(RepoRef repo, McpProfile profile) => Grant([repo], profile);
+
+    /// <summary>
+    /// A credential for one session about <paramref name="repos"/> (sc-25874): as <see cref="Grant(RepoRef, McpProfile)"/>, with
+    /// CodeGraph pinned to that set of repositories instead of one. Only <see cref="McpProfile.Planner"/> is granted more than one
+    /// (anything else is refused here): the planner is the one agent that sees every repository of a plan.
+    /// </summary>
+    public McpProxyGrant Grant(IReadOnlyList<RepoRef> repos, McpProfile profile)
     {
+        var set = repos.DistinctBy(r => r.FullName, StringComparer.OrdinalIgnoreCase).ToList();
+        if (set.Count == 0)
+        {
+            throw new ArgumentException("A grant is about at least one repository.", nameof(repos));
+        }
+        if (set.Count > 1 && !ReferenceEquals(profile, McpProfile.Planner))
+        {
+            throw new ArgumentException($"Only the planner profile is granted more than one repository, not '{profile.Name}'.", nameof(profile));
+        }
         var credential = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
         var tools = _upstreams.All
             .Select(u => (u.Name, Tools: (IReadOnlyList<string>)profile.ToolsOf(u.Name).Where(u.Allows).ToList()))
             .Where(s => s.Tools.Count > 0)
             .ToList();
-        var grant = new McpProxyGrant(this, credential, repo, tools);
+        var grant = new McpProxyGrant(this, credential, set, tools);
         _grants[Hash(credential)] = grant;
         return grant;
     }
@@ -241,19 +268,51 @@ public sealed class McpProxy : IAsyncDisposable
         foreach (var tool in (await upstream.ListToolsAsync(ct)).Where(t => grant.Allows(upstream.Name, t.Name)))
         {
             var schema = upstream.RepoScoped && CodeGraphSchema(tool.Name) is { } own ? own : tool.InputSchema;
-            var description = upstream.RepoScoped
-                ? $"{tool.Description} (Asked about {grant.Repo.FullName} only; CodeGraph indexes its default branch, and each answer starts "
-                    + "with the commit of that index it describes, or says the commit is unknown.)"
-                : tool.Description;
+            var description = upstream.RepoScoped ? $"{tool.Description} {CodeGraphNote(tool.Name, grant)}" : tool.Description;
+            if (upstream.RepoScoped && grant.Repos.Count > 1 && NamesRepository(tool.Name))
+            {
+                schema = PlannerCodeGraph.WithRepo(schema, grant.Repos);
+            }
             tools.Add(new JsonObject { ["name"] = tool.Name, ["description"] = description, ["inputSchema"] = schema.DeepClone() });
         }
         return new JsonObject { ["tools"] = tools };
     }
 
-    /// <summary>The reviewers' input schema of a CodeGraph tool (the arguments <see cref="ReviewTools.CodeGraphArguments"/> keeps).</summary>
+    /// <summary>
+    /// The input schema of a CodeGraph tool as the proxy accepts it: the reviewers' (the arguments
+    /// <see cref="ReviewTools.CodeGraphArguments"/> keeps) or, for a planner's cross-repository tool, <see cref="PlannerCodeGraph.InputSchema"/>.
+    /// </summary>
     private static JsonObject? CodeGraphSchema(string tool) =>
-        ReviewTools.Definitions.Select(d => JsonSerializer.SerializeToNode(d) as JsonObject)
+        PlannerCodeGraph.InputSchema(tool)
+        ?? ReviewTools.Definitions.Select(d => JsonSerializer.SerializeToNode(d) as JsonObject)
             .FirstOrDefault(d => d?["name"]?.GetValue<string>() == tool)?["input_schema"]?.DeepClone() as JsonObject;
+
+    /// <summary>Whether a call of <paramref name="tool"/> is about one project, which a session granted several repositories must name.</summary>
+    private static bool NamesRepository(string tool) => tool != ReviewTools.ReadNodeSource && !PlannerCodeGraph.Global(tool);
+
+    private static string RepoList(McpProxyGrant grant) => string.Join(", ", grant.Repos.Select(r => r.FullName));
+
+    /// <summary>
+    /// What the proxy adds to a CodeGraph tool's description: which repositories its answers are about and how they name their commit.
+    /// A single-repository grant's is the same for every tool about one project (as before sc-25874).
+    /// </summary>
+    private static string CodeGraphNote(string tool, McpProxyGrant grant)
+    {
+        const string Commit = "and each answer starts with the commit of that index it describes, or says the commit is unknown.)";
+        if (PlannerCodeGraph.Global(tool))
+        {
+            return $"(Not limited to {RepoList(grant)}: the answer is about every project CodeGraph indexes, each from its default branch, "
+                + "and may name projects outside this plan.)";
+        }
+        if (grant.Repos.Count == 1)
+        {
+            return $"(Asked about {grant.Repo.FullName} only; CodeGraph indexes its default branch, {Commit}";
+        }
+        return tool == ReviewTools.ReadNodeSource
+            ? $"(Shown only for a node of {RepoList(grant)}; CodeGraph indexes each one's default branch, {Commit}"
+            : $"(Asked about one of this plan's repositories, named by the required '{PlannerCodeGraph.RepoArgument}' argument: "
+                + $"{RepoList(grant)}. CodeGraph indexes each one's default branch, {Commit}";
+    }
 
     private async Task<JsonObject> CallAsync(JsonNode id, JsonObject parameters, McpUpstream upstream, McpProxyGrant grant, CancellationToken ct)
     {
@@ -272,35 +331,144 @@ public sealed class McpProxy : IAsyncDisposable
             return Relayed(id, relayed.Text, relayed.IsError);
         }
         var codeGraph = _upstreams.CodeGraph!;
-        var resolved = await grant.ProjectAsync(codeGraph, ct);
-        foreach (var (key, value) in arguments)
+        // Which of the grant's repositories the call is about. One repository: that one, and a call naming another project (by 'project',
+        // or by 'repo' where CodeGraph reads the project there) is refused. Several (a planner's, sc-25874): the one the call names, by 'repo' or by 'project'; naming any other is refused.
+        var target = grant.Repo;
+        if (grant.Repos.Count == 1)
         {
-            if (string.Equals(key, "project", StringComparison.OrdinalIgnoreCase)
-                && (resolved is null || value is not JsonValue p || !p.TryGetValue<string>(out var named) || named != resolved))
+            var pinned = await grant.ProjectAsync(codeGraph, target, ct);
+            foreach (var (key, value) in arguments)
             {
-                return Error(id, InvalidParams, $"Queries are pinned to {grant.Repo.FullName}'s CodeGraph project; another project is refused.");
+                if (string.Equals(key, "project", StringComparison.OrdinalIgnoreCase)
+                    && (pinned is null || value is not JsonValue p || !p.TryGetValue<string>(out var named) || named != pinned))
+                {
+                    return Error(id, InvalidParams, $"Queries are pinned to {grant.Repo.FullName}'s CodeGraph project; another project is refused.");
+                }
+                // CodeGraph's per-file tools name the project in 'repo': there another one is refused like another 'project', not
+                // silently answered about the pinned one. For every other tool 'repo' is no CodeGraph argument and is dropped as before.
+                if (PlannerCodeGraph.ProjectInRepoArgument(tool) && string.Equals(key, PlannerCodeGraph.RepoArgument, StringComparison.OrdinalIgnoreCase)
+                    && (value is not JsonValue r || !r.TryGetValue<string>(out var repo)
+                        || !(string.Equals(repo.Trim(), grant.Repo.FullName, StringComparison.OrdinalIgnoreCase) || (pinned is not null && repo == pinned))))
+                {
+                    return Error(id, InvalidParams, $"Queries are pinned to {grant.Repo.FullName}; another repository is refused.");
+                }
             }
         }
-        if (resolved is null)
+        else
         {
-            return Result(id, McpHttpClient.ErrorResult($"{grant.Repo.FullName}: {ReviewTools.NotIndexed}; {tool} cannot answer."));
+            var (named, refusal) = await NamedRepositoryAsync(grant, codeGraph, arguments, ct);
+            if (refusal is not null)
+            {
+                return Error(id, InvalidParams, refusal);
+            }
+            if (named is null && NamesRepository(tool))
+            {
+                return Error(id, InvalidParams,
+                    $"{tool} needs '{PlannerCodeGraph.RepoArgument}': which of this session's repositories to ask about ({RepoList(grant)}).");
+            }
+            target = named ?? target;
         }
         using var doc = JsonDocument.Parse(arguments.ToJsonString());
-        if (ReviewTools.CodeGraphArguments(tool, doc.RootElement) is not { } built)
+        if (PlannerCodeGraph.Global(tool))
         {
-            return Result(id, McpHttpClient.ErrorResult(ReviewTools.CodeGraphUsage(tool)));
+            // Not about one project (search_projects, the clusters): no project is set, and the answer names every indexed project.
+            if (PlannerCodeGraph.Arguments(tool, doc.RootElement) is not { } global)
+            {
+                return Result(id, McpHttpClient.ErrorResult(PlannerCodeGraph.Usage(tool)));
+            }
+            var listing = await codeGraph.CallProxiedAsync(tool, global, ct);
+            return Relayed(id, $"{PlannerCodeGraph.GlobalLabel(tool)}{ErrorNote(listing)}:\n{listing.Text}", listing.IsError);
+        }
+        if (tool == ReviewTools.ReadNodeSource && grant.Repos.Count > 1)
+        {
+            return await ReadNodeAsync(id, grant, codeGraph, doc.RootElement, ct);
+        }
+        var resolved = await grant.ProjectAsync(codeGraph, target, ct);
+        if (resolved is null)
+        {
+            return Result(id, McpHttpClient.ErrorResult($"{target.FullName}: {ReviewTools.NotIndexed}; {tool} cannot answer."));
+        }
+        var planner = PlannerCodeGraph.Tools.Contains(tool);
+        if ((planner ? PlannerCodeGraph.Arguments(tool, doc.RootElement) : ReviewTools.CodeGraphArguments(tool, doc.RootElement)) is not { } built)
+        {
+            return Result(id, McpHttpClient.ErrorResult(planner ? PlannerCodeGraph.Usage(tool) : ReviewTools.CodeGraphUsage(tool)));
         }
         if (tool != ReviewTools.ReadNodeSource)
         {
-            built["project"] = resolved;
+            // CodeGraph's per-file tools name the project in 'repo'; the session's own 'repo' (owner/name) was never copied into built.
+            built[PlannerCodeGraph.ProjectInRepoArgument(tool) ? "repo" : "project"] = resolved;
         }
-        var answer = await codeGraph.CallAsync(tool, built, ct);
+        var answer = await codeGraph.CallProxiedAsync(tool, built, ct);
         if (tool == ReviewTools.ReadNodeSource && !answer.IsError && ReviewTools.NodeProject(answer.Text) != resolved)
         {
             return Result(id, McpHttpClient.ErrorResult($"Node {built["nodeId"]} is not a node of {resolved} with readable source; not shown."));
         }
         // E3: the same label as the reviewers' tool loop (the proxy never pins a commit: CodeGraph answers from its default branch).
-        var label = $"{ReviewTools.DefaultBranchLabel(resolved, answer.Commit)}{(answer.IsError ? " (CodeGraph answered with an error)" : "")}:";
+        var label = $"{ReviewTools.DefaultBranchLabel(resolved, answer.Commit)}{ErrorNote(answer)}:";
+        return Relayed(id, $"{label}\n{answer.Text}", answer.IsError);
+    }
+
+    private static string ErrorNote(CodeGraphAnswer answer) => answer.IsError ? " (CodeGraph answered with an error)" : "";
+
+    /// <summary>
+    /// The repository a call of a session granted several names, by <c>repo</c> (<c>owner/name</c>, case-insensitive like GitHub's
+    /// names) or by <c>project</c> (the CodeGraph project of one of them, exactly); null when it names none. A refusal when it names
+    /// anything else, or two different ones: nothing is forwarded.
+    /// </summary>
+    private static async Task<(RepoRef? Repo, string? Refusal)> NamedRepositoryAsync(McpProxyGrant grant, ICodeGraph codeGraph, JsonObject arguments,
+        CancellationToken ct)
+    {
+        RepoRef? byRepo = null, byProject = null;
+        foreach (var (key, value) in arguments)
+        {
+            var named = value is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
+            if (string.Equals(key, PlannerCodeGraph.RepoArgument, StringComparison.OrdinalIgnoreCase))
+            {
+                byRepo = named is null ? null : grant.Repos.FirstOrDefault(r => string.Equals(r.FullName, named.Trim(), StringComparison.OrdinalIgnoreCase));
+                if (byRepo is null)
+                {
+                    return (null, $"'{PlannerCodeGraph.RepoArgument}' must be one of this session's repositories ({RepoList(grant)}); another is refused.");
+                }
+            }
+            else if (string.Equals(key, "project", StringComparison.OrdinalIgnoreCase))
+            {
+                byProject = named is null ? null : (await grant.ProjectsAsync(codeGraph, ct)).FirstOrDefault(p => p.Project == named).Repo;
+                if (byProject is null)
+                {
+                    return (null, $"Queries are pinned to the CodeGraph projects of {RepoList(grant)}; another project is refused.");
+                }
+            }
+        }
+        return byRepo is not null && byProject is not null && byRepo != byProject
+            ? (null, $"'{PlannerCodeGraph.RepoArgument}' and 'project' name different repositories; name one.")
+            : (byRepo ?? byProject, null);
+    }
+
+    /// <summary>
+    /// <c>read_node_source</c> for a session granted several repositories: a node id names a node of any project, so the answer is
+    /// shown only when its header names the project of one of the grant's repositories.
+    /// </summary>
+    private static async Task<JsonObject> ReadNodeAsync(JsonNode id, McpProxyGrant grant, CodeGraphMcpClient codeGraph, JsonElement input, CancellationToken ct)
+    {
+        var projects = (await grant.ProjectsAsync(codeGraph, ct)).Select(p => p.Project).OfType<string>().ToList();
+        if (projects.Count == 0)
+        {
+            return Result(id, McpHttpClient.ErrorResult($"{RepoList(grant)}: {ReviewTools.NotIndexed}; {ReviewTools.ReadNodeSource} cannot answer."));
+        }
+        if (ReviewTools.CodeGraphArguments(ReviewTools.ReadNodeSource, input) is not { } built)
+        {
+            return Result(id, McpHttpClient.ErrorResult(ReviewTools.CodeGraphUsage(ReviewTools.ReadNodeSource)));
+        }
+        var answer = await codeGraph.CallProxiedAsync(ReviewTools.ReadNodeSource, built, ct);
+        var project = answer.IsError ? null : ReviewTools.NodeProject(answer.Text);
+        if (!answer.IsError && !projects.Contains(project, StringComparer.Ordinal))
+        {
+            return Result(id, McpHttpClient.ErrorResult(
+                $"Node {built["nodeId"]} is not a node of {string.Join(" or ", projects)} with readable source; not shown."));
+        }
+        var label = project is null
+            ? $"CodeGraph's {ReviewTools.ReadNodeSource}{ErrorNote(answer)}:"
+            : $"{ReviewTools.DefaultBranchLabel(project, answer.Commit)}:";
         return Relayed(id, $"{label}\n{answer.Text}", answer.IsError);
     }
 
@@ -327,7 +495,8 @@ public sealed class McpProxy : IAsyncDisposable
 }
 
 /// <summary>
-/// One session's credential for the <see cref="McpProxy"/>: the bearer token, the repository its CodeGraph queries are pinned to, the
+/// One session's credential for the <see cref="McpProxy"/>: the bearer token, the repositories its CodeGraph queries are pinned to
+/// (one; several only for a planner's, sc-25874), the
 /// upstream tools it may use (its <see cref="McpProfile"/> on the configured upstreams), and its <c>--mcp-config</c> JSON. Disposed
 /// when the session ends: the proxy then refuses the credential.
 /// </summary>
@@ -336,17 +505,20 @@ public sealed class McpProxyGrant : IDisposable
     private readonly McpProxy _proxy;
     private readonly SemaphoreSlim _resolve = new(1, 1);
     private readonly IReadOnlyList<(string Server, IReadOnlyList<string> Tools)> _tools;
-    private bool _projectResolved;
-    private string? _project;
+    private readonly Dictionary<RepoRef, string?> _projects = [];
     private int _calls;
 
-    internal McpProxyGrant(McpProxy proxy, string credential, RepoRef repo, IReadOnlyList<(string Server, IReadOnlyList<string> Tools)> tools) =>
-        (_proxy, Credential, Repo, _tools) = (proxy, credential, repo, tools);
+    internal McpProxyGrant(McpProxy proxy, string credential, IReadOnlyList<RepoRef> repos, IReadOnlyList<(string Server, IReadOnlyList<string> Tools)> tools) =>
+        (_proxy, Credential, Repos, _tools) = (proxy, credential, repos, tools);
 
     /// <summary>The session's bearer credential (never in argv; only in its <c>--mcp-config</c> file).</summary>
     public string Credential { get; }
 
-    public RepoRef Repo { get; }
+    /// <summary>The repositories the session's CodeGraph queries are pinned to (at least one, no duplicate).</summary>
+    public IReadOnlyList<RepoRef> Repos { get; }
+
+    /// <summary>The session's (first) repository.</summary>
+    public RepoRef Repo => Repos[0];
 
     /// <summary>The MCP server names the session is given (<see cref="McpServers"/>).</summary>
     public IReadOnlyList<string> Servers => _tools.Select(t => t.Server).ToList();
@@ -383,23 +555,33 @@ public sealed class McpProxyGrant : IDisposable
         return new JsonObject { ["mcpServers"] = servers }.ToJsonString();
     }
 
-    /// <summary>The CodeGraph project of <see cref="Repo"/>, resolved once for the session (null: not indexed).</summary>
-    internal async Task<string?> ProjectAsync(ICodeGraph codeGraph, CancellationToken ct)
+    /// <summary>The CodeGraph project of <paramref name="repo"/> (one of <see cref="Repos"/>), resolved once for the session (null: not indexed).</summary>
+    internal async Task<string?> ProjectAsync(ICodeGraph codeGraph, RepoRef repo, CancellationToken ct)
     {
         await _resolve.WaitAsync(ct);
         try
         {
-            if (!_projectResolved)
+            if (!_projects.TryGetValue(repo, out var project))
             {
-                _project = await codeGraph.FindProjectAsync(Repo, ct);
-                _projectResolved = true;
+                _projects[repo] = project = await codeGraph.FindProjectAsync(repo, ct);
             }
-            return _project;
+            return project;
         }
         finally
         {
             _resolve.Release();
         }
+    }
+
+    /// <summary>Every repository of <see cref="Repos"/> with its CodeGraph project (null: not indexed), each resolved once.</summary>
+    internal async Task<IReadOnlyList<(RepoRef Repo, string? Project)>> ProjectsAsync(ICodeGraph codeGraph, CancellationToken ct)
+    {
+        var projects = new List<(RepoRef, string?)>();
+        foreach (var repo in Repos)
+        {
+            projects.Add((repo, await ProjectAsync(codeGraph, repo, ct)));
+        }
+        return projects;
     }
 
     /// <summary>Revokes the credential: the proxy refuses it from now on.</summary>

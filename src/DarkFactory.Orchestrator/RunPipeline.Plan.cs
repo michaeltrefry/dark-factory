@@ -1,6 +1,7 @@
 using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Plans;
+using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
 
@@ -380,12 +381,14 @@ public sealed partial class RunPipeline
                 $"pid {pid}", ct);
             log.WriteLine($"[plan] stopped planner pid {pid} left running by an earlier run");
         }
-        return await planner.RunAsync(run.Item, run.Repo, async (seat, c) =>
+        // Before the seat too: a plan naming a repository the factory is not configured for starts no session (sc-25874).
+        var repos = PlanRepositories(run);
+        return await planner.RunAsync(run.Item, repos, async (seat, c) =>
         {
             try
             {
                 var (session, result) = await RunSessionAsync(run, seat.Worker, seat.Path, seat.McpConfig, implementing: false, null,
-                    _ => PlanPrompt.Build(run.Spec, run.Repo) + PlanPrompt.McpNote(seat.ToolRules), [], [Taint.Planner], "plan",
+                    _ => PlanPrompt.Build(run.Spec, run.Repo, seat.Checkouts) + PlanPrompt.McpNote(seat.ToolRules, repos), [], [Taint.Planner], "plan",
                     WorkerModelClass.Planner, c);
                 return (result.ResultText, session);
             }
@@ -395,5 +398,30 @@ public sealed partial class RunPipeline
                 throw WorkerStillRunning.Mark(request);
             }
         }, ct);
+    }
+
+    /// <summary>
+    /// The planner's repository set (sc-25874): every <c>Repo: owner/name</c> line of the plan item (<see cref="RepoResolver.ResolveAll"/>),
+    /// the item's primary repository (<see cref="Run.Repo"/>, what the rest of the pipeline uses) first. With one line or none it is
+    /// that repository alone, as before. A set of several is what the planner's checkouts and its CodeGraph grant cover, so each
+    /// must be one of the factory's configured repositories: one that is not fails the item before any session starts
+    /// (<see cref="WorkerFailedException"/>: escalated with the reason, nothing created).
+    /// </summary>
+    private IReadOnlyList<RepoRef> PlanRepositories(Run run)
+    {
+        var repos = RepoResolver.ResolveAll(run.Story.Description, run.Repo);
+        if (repos.Count > 1)
+        {
+            var unconfigured = repos.Where(r => !_configuredRepos.Any(c => string.Equals(c.FullName, r.FullName, StringComparison.OrdinalIgnoreCase)))
+                .Select(r => r.FullName).ToList();
+            if (unconfigured.Count > 0)
+            {
+                throw new WorkerFailedException($"The plan names {repos.Count} repositories ({string.Join(", ", repos.Select(r => r.FullName))}), "
+                    + $"but {string.Join(", ", unconfigured)} {(unconfigured.Count == 1 ? "is" : "are")} not configured for this factory "
+                    + $"(Factory:DefaultRepo, GitHub:Watch:Repos: {string.Join(", ", _configuredRepos.Select(r => r.FullName))}), so no planner "
+                    + "session was started and no story was created. Configure it, or remove its Repo: line.");
+            }
+        }
+        return repos;
     }
 }

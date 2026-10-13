@@ -12,7 +12,8 @@ namespace DarkFactory.Orchestrator.CodeGraph;
 /// <see cref="McpHttpClient"/> (sc-25705; generalised in sc-25707): one MCP session per request, the token (<c>CodeGraph:Token</c>)
 /// only in its <c>Authorization: Bearer</c> header (E5: never in a worker's env, argv, worktree or a prompt). Its
 /// <see cref="Upstream"/> is CodeGraph as the upstream registry (<see cref="McpUpstreams"/>) holds it: the allowlist
-/// <see cref="ReviewTools.CodeGraphTools"/>, repo-scoped.
+/// <see cref="McpServers.CodeGraphTools"/> (the reviewers' tools and the planner's cross-repository ones, sc-25874), repo-scoped.
+/// The reviewers' own entry, <see cref="CallAsync"/>, sends only <see cref="ReviewTools.CodeGraphTools"/>.
 /// <para>
 /// The commit (E3): CodeGraph indexes the default branch, and by its contract (CodeGraph sc-25702) every answer names the commit
 /// its index describes: <c>structuredContent.commitSha</c>, or a first text line <c>Commit: &lt;40-hex sha&gt;</c>
@@ -32,7 +33,9 @@ namespace DarkFactory.Orchestrator.CodeGraph;
 /// </para>
 /// <para>
 /// Risk tools (sc-25709, <see cref="ICodeGraphRisk"/>; CodeGraph C7, sc-25735): <see cref="AnalyzeImpactFileTool"/> and
-/// <see cref="FileHotspotTool"/> are likewise sent by the orchestrator only (the merge gate's <c>risk-threshold</c>), on no allowlist.
+/// <see cref="FileHotspotTool"/> are sent by the orchestrator (the merge gate's <c>risk-threshold</c>) straight through the MCP
+/// client, with a commit and a project the orchestrator sets. Since sc-25874 they are also on the planner's list
+/// (<see cref="PlannerCodeGraph.Tools"/>, through the loopback proxy only); they stay off the reviewers' and the triage's.
 /// </para>
 /// </summary>
 public sealed partial class CodeGraphMcpClient : ICodeGraph, ICodeGraphRisk
@@ -46,7 +49,7 @@ public sealed partial class CodeGraphMcpClient : ICodeGraph, ICodeGraphRisk
     public CodeGraphMcpClient(HttpClient http, string token)
     {
         _client = new McpHttpClient(http, token, "CodeGraph", "mcp");
-        Upstream = new McpUpstream(McpServers.CodeGraph, _client, ReviewTools.CodeGraphTools, repoScoped: true);
+        Upstream = new McpUpstream(McpServers.CodeGraph, _client, McpServers.CodeGraphTools, repoScoped: true);
     }
 
     /// <summary>CodeGraph as an upstream: its allowlisted tools only, repo-scoped.</summary>
@@ -74,6 +77,16 @@ public sealed partial class CodeGraphMcpClient : ICodeGraph, ICodeGraphRisk
         {
             throw new ArgumentException($"'{tool}' is not one of the reviewers' CodeGraph tools; it is never sent.", nameof(tool));
         }
+        return await CallProxiedAsync(tool, arguments, ct);
+    }
+
+    /// <summary>
+    /// Calls a tool of the upstream allowlist (<see cref="McpServers.CodeGraphTools"/>; any other is refused before anything is sent,
+    /// <see cref="ToolNotAllowedException"/>): the loopback proxy's entry, which has already checked the tool against the session's
+    /// profile (sc-25874: only the planner's holds a tool the reviewers' list lacks).
+    /// </summary>
+    public async Task<CodeGraphAnswer> CallProxiedAsync(string tool, JsonObject arguments, CancellationToken ct)
+    {
         var answer = await Upstream.CallAsync(tool, arguments, ct);
         return new CodeGraphAnswer(answer.Text, answer.IsError, Commit(answer.Structured, answer.Text), NotIndexedOf(answer.Structured));
     }
@@ -123,21 +136,25 @@ public sealed partial class CodeGraphMcpClient : ICodeGraph, ICodeGraphRisk
 
     private static string? Str(JsonObject? o, string name) => o?[name] is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
 
-    /// <summary>CodeGraph's per-file blast radius tool (C7, sc-25735): orchestrator only, for the merge gate's risk-threshold.</summary>
+    /// <summary>CodeGraph's per-file blast radius tool (C7, sc-25735): the merge gate's risk-threshold; also a planner tool (sc-25874).</summary>
     public const string AnalyzeImpactFileTool = "analyze_impact_file";
 
-    /// <summary>CodeGraph's per-file hotspot tool (C7): orchestrator only, for the merge gate's risk-threshold.</summary>
+    /// <summary>CodeGraph's per-file hotspot tool (C7): the merge gate's risk-threshold; also a planner tool (sc-25874).</summary>
     public const string FileHotspotTool = "file_hotspot";
 
-    /// <summary>The risk tools (sc-25709), which no model-facing surface may list or forward.</summary>
+    /// <summary>
+    /// The risk tools (sc-25709). The gate's calls go straight through the MCP client. No reviewer or triage session is listed or
+    /// forwarded them; a planner session is (sc-25874, <see cref="PlannerCodeGraph.Tools"/>), through the loopback proxy, which
+    /// rebuilds the arguments (no <c>sha</c>: the default branch).
+    /// </summary>
     public static readonly IReadOnlyList<string> RiskTools = [AnalyzeImpactFileTool, FileHotspotTool];
 
-    /// <summary><c>analyze_impact_file(repo, path, sha, depth)</c>, straight through the MCP client (on no allowlist).</summary>
+    /// <summary><c>analyze_impact_file(repo, path, sha, depth)</c>, straight through the MCP client (the gate's own call).</summary>
     public async Task<ImpactFileAnswer> AnalyzeImpactFileAsync(string project, string path, string sha, int depth, CancellationToken ct) =>
         ImpactFile(await _client.CallToolAsync(AnalyzeImpactFileTool,
             new JsonObject { ["repo"] = project, ["path"] = path, ["sha"] = sha, ["depth"] = depth }, ct));
 
-    /// <summary><c>file_hotspot(repo, path)</c>, straight through the MCP client (on no allowlist).</summary>
+    /// <summary><c>file_hotspot(repo, path)</c>, straight through the MCP client (the gate's own call).</summary>
     public async Task<HotspotAnswer> FileHotspotAsync(string project, string path, CancellationToken ct) =>
         Hotspot(await _client.CallToolAsync(FileHotspotTool, new JsonObject { ["repo"] = project, ["path"] = path }, ct));
 
@@ -173,8 +190,9 @@ public sealed partial class CodeGraphMcpClient : ICodeGraph, ICodeGraphRisk
     private static bool? Bool(JsonObject? o, string name) => o?[name] is JsonValue v && v.TryGetValue<bool>(out var b) ? b : null;
 
     /// <summary>
-    /// The CodeGraph project indexing <paramref name="repo"/>, from <c>search_projects</c>: only the orchestrator calls it (it is on no
-    /// allowlist, so no session or reviewer can).
+    /// The CodeGraph project indexing <paramref name="repo"/>, from <c>search_projects</c>, straight through the MCP client: the
+    /// orchestrator's own call (no reviewer or triage session can make one; a planner session may list projects, sc-25874, but the
+    /// project its queries are pinned to is always resolved here).
     /// </summary>
     public async Task<string?> FindProjectAsync(RepoRef repo, CancellationToken ct)
     {

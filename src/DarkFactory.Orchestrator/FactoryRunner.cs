@@ -278,6 +278,8 @@ public static class FactoryRunner
             maxControlReadFailures: maxControlReadFailures,
             // A plan item's planner session (sc-25870): read-only, in its own throwaway worktree, CodeGraph and Kanban through the proxy.
             planner: new SandboxPlanRunner(options, sandbox, app, upstreams, log),
+            // The only repositories a plan naming several may name (sc-25874).
+            configuredRepos: options.ConfiguredRepos.Select(RepoRef.Parse).ToList(),
             // Built without the worker run lock (a waiting plan item): the run does nothing that needs it.
             workerless: !needsWorker);
 
@@ -522,7 +524,8 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
 /// (<see cref="WorkerTools.ReadOnly"/>: Read, Glob, Grep inside its own worktree, no settings file loaded) in a worktree under its own
 /// root (<see cref="PlanWorktrees"/>, never the items' <c>worktrees</c>) whose owner-side git holds a contents-read token only and which
 /// is not shared with the worker user for writing; and, when an upstream is configured, the loopback MCP proxy this process hosts for
-/// the session, granted exactly <see cref="Mcp.McpProfile.Planner"/> (the allowlisted CodeGraph tools and Kanban read tools). The
+/// the session, granted exactly <see cref="Mcp.McpProfile.Planner"/> (the allowlisted CodeGraph tools and Kanban read tools) over the
+/// plan's repository set (sc-25874: several repositories give a seat of one checkout each and a grant over them all). The
 /// upstream tokens stay here; the session gets a credential revoked when it ends, in a file (never argv). Sandboxed, the run holds the
 /// worker run lock, so leftovers of a crashed run (plan worktrees, session files) are swept first; unsandboxed
 /// (<c>Worker:RunAs=none</c>, development only) nothing is swept, since another run's may be live.
@@ -533,8 +536,10 @@ public sealed class SandboxPlanRunner(FactoryOptions options, WorkerSandbox? san
     /// <summary>The work root's directory of plan worktrees, apart from the items' <c>worktrees</c> and the triage's.</summary>
     public const string PlanWorktrees = "plan-worktrees";
 
-    public async Task<T> RunAsync<T>(WorkItem item, RepoRef repo, Func<Plans.PlannerSeat, CancellationToken, Task<T>> session, CancellationToken ct)
+    public async Task<T> RunAsync<T>(WorkItem item, IReadOnlyList<RepoRef> repos, Func<Plans.PlannerSeat, CancellationToken, Task<T>> session,
+        CancellationToken ct)
     {
+        // The token is minted per repository, contents-read only: a seat of several repositories fetches each with its own.
         var workspaces = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
             async (r, c) => (await app.CreateInstallationTokenAsync(r, c, Issues.WorkerTriageRunner.TriageWorkspaceToken)).Token, sandbox: sandbox,
             worktreesDirectory: PlanWorktrees, shareWithWorker: false);
@@ -558,7 +563,7 @@ public sealed class SandboxPlanRunner(FactoryOptions options, WorkerSandbox? san
         var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, options.RouterKey, options.WorkerAuth, options.WorkerTimeout, sandbox,
             pauseFlagDirectory: options.PauseFlagDirectory, tools: PlannerTools(upstreams, proxy is not null));
         return await new Plans.WorkerPlanRunner(workspaces, worker, log,
-            proxy is null ? null : new Mcp.McpProxySessions(proxy, configs, sandbox?.User)).RunAsync(item, repo, session, ct);
+            proxy is null ? null : new Mcp.McpProxySessions(proxy, configs, sandbox?.User)).RunAsync(item, repos, session, ct);
     }
 
     /// <summary>

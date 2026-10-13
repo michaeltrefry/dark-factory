@@ -341,6 +341,43 @@ The in-process versions, which run in every `dotnet test`: `GatePipelineTests.A_
 `NewTestsTests.A_new_test_that_already_passes_on_the_base_is_rejected_with_the_test_named`,
 `FixLoopTests.A_fourth_round_escalates_with_the_open_findings_attached`.
 
+### P4-AT4 — the new-tests check on a Rust pull request (sc-25875)
+
+Automated: `GateNegativeTests.P4_AT4_a_rust_test_that_already_passes_on_the_base_is_gate_rejected_and_one_calling_new_code_does_not_build_there`
+(`FACTORY_E2E=1` and `FACTORY_E2E_P4_CARGO_STORY` = a To Do bug story like AT4's). Same harness, seeding and cleanup as the AT4
+negatives above: nothing merges and **the sandbox's main is never written**, so the sandbox needs no Rust of its own.
+
+**Prerequisite (once, the owner):** cargo and rustc for the worker user, on the launch helper's fixed PATH — `/opt/homebrew/bin`
+or `/usr/local/bin` (`brew install rust`; or rustup installed as `_factory`, with its `cargo` and `rustc` linked into
+`/usr/local/bin`: `~_factory/.cargo/bin` itself is not on that PATH). `sudo scripts/setup-worker-user.sh` reports both
+(`ok    cargo --version: …`, or `none  cargo --version … not available to _factory`); the helper itself did not change. The first
+run also needs the network for `cargo fetch` (the seeded package has no dependency, so nothing is downloaded).
+
+| Setup it does | Expected on the ledger |
+| --- | --- |
+| before the first review, commits to the PR branch `e2e-rust/Cargo.toml` (package `df-e2e-rust`) and `e2e-rust/src/lib.rs`: `pub fn double`, and an inline `#[cfg(test)] mod tests` with `doubles` (calls `double`) and `already_passes_on_the_base` (asserts `1 + 1 == 2`) | the last `new-tests` row is `rejected` (`gate_rejected`), strategy `rust-cargo`, `base_run` `build-failed`, `base_retry` `ran`, `head_run` `ran`; `df-e2e-rust:lib:tests::doubles` is `not-built` on the base (it calls code the pull request adds: the base gets the package with its test code alone) and `passed` on the head; `df-e2e-rust:lib:tests::already_passes_on_the_base` is `passed` on both and named in the reason; the last `gate` row is `Blocked …new-tests-fail-on-base (rejected)…`; MergeGate → Escalated; nothing merged |
+
+Without cargo for the worker user the `new-tests` row is `error` (`…(toolchain-missing): cargo is not available to the gate's test
+runs as _factory…`) and the test fails on its first assertion, quoting that reason. The same seed runs in every `dotnet test` where
+cargo is installed (`CargoRunnerTests.With_cargo_a_new_package_is_applied_to_the_base_with_its_test_code_alone`, unsandboxed), with
+`With_cargo_a_new_test_failing_on_the_base_passes_and_one_already_passing_there_is_named` (the `pass` outcome),
+`…a_new_inline_test_calling_code_the_pull_request_adds_does_not_build_on_the_base…`, `…in_a_workspace_below_the_repository_root…`
+and `…a_base_whose_other_tests_do_not_build_is_an_error_not_evidence`.
+
+A test that passes on the real base must never count as failing there (the review of sc-25875 reproduced five such false
+passes; the rule is in CLAUDE.md: `not-built` only for what the base lacks). With cargo installed these run too, each on real
+crates: `…a_new_module_file_keeps_its_imports_so_tests_of_old_code_in_it_pass_on_the_base_and_are_named` (a new `src/extra.rs`
+with `use crate::add;`: both tests of old code `rejected`, the test of the new module's own function still `not-built`),
+`…tests_that_exercise_only_code_the_base_has_pass_there_in_every_module_shape` (`#[cfg(all(test, not(miri)))]` modules old and
+new, `mod tests { #![cfg(test)] }`, a file-level `use` the PR adds, helpers of the test module, a `macro_rules!` macro and a
+derived type of the parent, `mod tests;` in its own file, a `pub(crate) use` re-export, a `#[cfg(test)] use`, an import spelt
+another way, an integration test of old API: every one `passed` on the base at the first build, the check `rejected`),
+`…one_import_that_does_not_resolve_on_the_base_hides_neither_a_test_of_old_code_nor_a_real_failure` and
+`…an_import_of_new_code_in_a_file_the_base_has_is_left_out_and_the_tests_beside_it_get_their_real_results` (the retries).
+`unsupported`, decided before any run (`CargoIdentifyTests`): a test function outside every `#[cfg(test)]` module that is new
+or changed (top of a production file, a production module, a module gated by `cfg(any(test, …))`), a new `#[cfg(test)]`
+`use`/`impl` outside one, cfg alternates of one name, a renamed production file with new tests.
+
 ### AT5 — freeze and stuck
 
 Automated: `FreezeAndStuckTests`. The freeze tests write only the throwaway ledger; their story is never claimed (it stays To Do
@@ -485,6 +522,28 @@ plan (held until the factory merges it or the board shows it finished), an archi
 Backlog, a plan whose stories were never recorded (a marked story is refused at claim), a plan that cannot be evaluated (one comment
 and one `plan-held` row after `Intake:MaxItemFailures` failures), a closeout the board keeps refusing (the item stays `Planned`,
 "post it by hand"), and a Stop landing on a waiting plan after its runner took no worker run lock (deferred to the next run).
+
+## P4-AT3 (proxy part) — a planner grant over two repositories (sc-25874)
+
+`PlanAcceptanceTests.P4_AT3_a_planner_grant_over_two_repositories_answers_for_each_and_refuses_a_third_project_and_off_list_tools`:
+the production upstream registry and loopback proxy with a planner grant over two repositories; the test plays the planner's MCP
+client itself, so no model is called and nothing is written anywhere.
+
+Prerequisites: a CodeGraph token (`CodeGraph:Token`) and `FACTORY_E2E_P4_PLAN_REPOS=owner/a,owner/b`: two repositories the hosted
+CodeGraph indexes (each project's repository URL exactly `https://github.com/<owner>/<name>`), e.g. SceneWorks and inference;
+CodeGraph must index at least one more project (the "third").
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_P4_PLAN_REPOS=owner/a,owner/b \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4_AT3*"
+```
+
+Expected evidence: `tools/list` shows only planner-profile tools, the six cross-repository ones among them, `search_graph` with a
+`repo` enum of the two repositories; a `search_graph` answer for each repository, labelled with that repository's CodeGraph
+project; and JSON-RPC -32602 for a `project` naming a third indexed project (alone, and against a `repo` of the set), a `repo`
+outside the set, a call naming no repository, and `get_architecture`, `get_service_summary` and `rag_search`.
+
+Not run live yet (2026-10-12): written with sc-25874, to be run by the owner.
 
 ## Upgrading a Phase 1 ledger: items parked at Review
 
