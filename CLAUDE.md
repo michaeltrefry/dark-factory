@@ -89,7 +89,16 @@ Claude Code headless workers through the Weave router.
   asserting that stderr is empty) is fixed in the helper itself (sc-25989, `helper_version` 4): bash 3.2 also reports a
   signal-killed job when it reads the next script line, so the watcher is now killed and reaped in one redirected group
   (`{ send_signal "$watcher" || true; wait "$watcher" || true; } 2>/dev/null`; `WorkerSandboxTests` asserts that text and runs
-  the helper 200 times with an empty stderr). Never loosen those tests' assertion.
+  the helper 200 times with an empty stderr). That 200-run test then caught two more lines that are bash's, not the worker's
+  (same `helper_version` 4, never installed without them): under load (8 of 32 loaded runs of the test, about 1 in 650
+  helper runs) `child setpgid (N to N): Operation not permitted` — under `set -m` bash and the child it forks both call
+  setpgid for the child, the child's call can lose on macOS, and bash 3.2's child reports it before the command's own
+  redirections apply (the group is set all the same) — so the worker is forked with stderr on `/dev/null` and its own
+  redirection gives it the helper's real stderr back before the exec (`{ … "$@" </dev/null 2>&3 3>&- & } 3>&2 2>/dev/null`:
+  the worker's stderr and a failed exec's message still arrive, fd 3 is closed for the worker); and, on every Stop,
+  `… Killed: 9 /usr/bin/env -i …` from the wait for a signal-killed worker, now `wait "$worker" 2>/dev/null` (the exit
+  status 137 says it). So the helper's stderr holds only the worker's own output and the helper's `factory-worker-launch: …`
+  messages. Never loosen those tests' assertion.
   `CrashResumeTests` also needs the compose Postgres (skips locally without it, fails under `CI`): it
   SIGKILLs `tests/DarkFactory.CrashHost` (the real pipeline with a fake `claude` script) and restarts it.
   `ShortcutContractTests` replay recorded Shortcut API fixtures (`Fixtures/shortcut`, strict request matching);

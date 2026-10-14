@@ -599,6 +599,44 @@ public class WorkerSandboxTests
     }
 
     [Fact]
+    public void The_worker_is_forked_with_stderr_on_dev_null_and_given_the_helpers_stderr_back_before_its_exec()
+    {
+        // The line that test caught under load (8 of 32 loaded runs of it): "child setpgid (N to N): Operation not permitted",
+        // from bash 3.2's forked child under set -m, written before the command's own redirections are applied.
+        Assert.True(SafeHelper.SourceContains("\"$@\" </dev/null 2>&3 3>&- &\n} 3>&2 2>/dev/null\nworker=$!\nset +m\n"));
+        // A worker a Stop killed: bash's "Killed: 9 /usr/bin/env …" job report comes from this wait.
+        Assert.True(SafeHelper.SourceContains("\nwait \"$worker\" 2>/dev/null || status=$?\n"));
+        Assert.False(SafeHelper.SourceContains("\nwait \"$worker\" ||"));
+    }
+
+    [Fact]
+    public async Task The_workers_own_stderr_still_reaches_the_helpers_and_the_saved_descriptor_is_closed_for_it()
+    {
+        var (exitCode, stderr) = await RunHelperAsync(
+            ["/bin/sh", "-c", "echo from-the-worker >&2; if [ -e /dev/fd/3 ]; then echo fd-3-open >&2; fi; exit 7"], "\n", closeStdin: false);
+
+        Assert.Equal((7, "from-the-worker\n"), (exitCode, stderr));
+    }
+
+    [Fact]
+    public async Task A_program_that_cannot_be_run_is_still_reported_on_the_helpers_stderr()
+    {
+        var (exitCode, stderr) = await RunHelperAsync([Path.Combine(_dir, "no-such-program")], "\n", closeStdin: false);
+
+        Assert.Equal(127, exitCode);
+        Assert.Contains("no-such-program: No such file or directory", stderr);
+    }
+
+    [Fact]
+    public async Task A_stopped_workers_helper_reports_137_and_writes_no_job_report()
+    {
+        // Before: "…/factory-worker-launch: line N: <pid> Killed: 9  /usr/bin/env -i …" on every Stop.
+        var (exitCode, stderr) = await RunHelperAsync(["/bin/sleep", "600"], "\n");
+
+        Assert.Equal((137, ""), (exitCode, stderr));
+    }
+
+    [Fact]
     public async Task Uid_sweep_runs_as_the_sandbox_role_account_invoked_through_sudo_by_the_owner()
     {
         // The control for the refusals above: the production case (owner 501 sudo's to the role account 450).

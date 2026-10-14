@@ -212,8 +212,17 @@ kill_sandbox_user() {
 }
 
 set -m # the worker gets its own process group
-/usr/bin/env -i "HOME=$home" "PATH=$path" MSBUILDDISABLENODEREUSE=1 DOTNET_CLI_USE_MSBUILD_SERVER=0 \
-    ${vars[@]+"${vars[@]}"} "$@" </dev/null &
+# Under set -m both bash and the child it forks call setpgid for the child. On macOS, under load, the
+# child's own call can lose to the parent's and fail, and bash 3.2's child then reports "child setpgid
+# (N to N): Operation not permitted" on its stderr before it applies the command's redirections (the
+# group is set all the same, by the parent's call). So the fork happens with stderr on /dev/null and the
+# worker's own redirection puts the helper's real stderr (saved as fd 3, closed for the worker) back
+# before the exec: the worker's stderr, and a failed exec's message, still reach it. (Only bash's own
+# report of a fork that fails right here is lost with it; the helper then exits non-zero.)
+{
+    /usr/bin/env -i "HOME=$home" "PATH=$path" MSBUILDDISABLENODEREUSE=1 DOTNET_CLI_USE_MSBUILD_SERVER=0 \
+        ${vars[@]+"${vars[@]}"} "$@" </dev/null 2>&3 3>&- &
+} 3>&2 2>/dev/null
 worker=$!
 set +m
 
@@ -228,7 +237,9 @@ set +m
 watcher=$!
 
 status=0
-wait "$worker" || status=$?
+# Redirected: for a worker a signal ended (a Stop's SIGKILL) this wait also prints bash's job report
+# ("Killed: 9 /usr/bin/env ..."). The exit status says it; the worker's own stderr is not this wait's.
+wait "$worker" 2>/dev/null || status=$?
 # The watcher is gone before the sweep, which then spares only $$. Killed and reaped in one
 # redirected group: bash 3.2 also reports a signal-killed job ("Terminated: 15 ( while ... )")
 # when it reads the next script line, so a watcher that died between a kill on one line and a
