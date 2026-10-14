@@ -35,7 +35,8 @@ namespace DarkFactory.Orchestrator.Gate;
 /// writes no report into a directory that does not exist), <c>swift package resolve</c> (the restore: the only step that
 /// may use the network), <c>swift build --build-tests</c> (the build, its standard output kept as the build log), then
 /// one <c>swift test --skip-build --disable-xctest --filter ^&lt;id&gt;(/|$) --xunit-output …</c> per new test (Swift
-/// Testing matches the filter against the test's id followed by its source location). Results: Swift Testing's xUnit XML
+/// Testing matches the filter against the test's id followed by its source location), each reading only its own report
+/// and keeping its exit code, which the report must agree with. Results: Swift Testing's xUnit XML
 /// report (<see cref="ParseResults"/>). A base that does not build with the PR's test files is not attributed to the new
 /// tests yet: it is an <c>error</c>, never a pass.
 /// </para>
@@ -54,6 +55,18 @@ public sealed class SwiftNewTests : INewTestStrategy
 
     /// <summary>The prefix of each test step's report under the results directory.</summary>
     public const string ReportPrefix = "swift-test-";
+
+    /// <summary>
+    /// The one report a test's step asks for and reads: <c>swift-test-&lt;the first 16 hex digits of the id's SHA-256&gt;.xml</c>,
+    /// so <see cref="ParseResults"/> knows from a report's name which test it may speak of.
+    /// </summary>
+    public static string ReportName(string id) =>
+        $"{ReportPrefix}{Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(id)))[..16]}.xml";
+
+    /// <summary>The name a test step's standard output and exit code are kept under (<see cref="TestStep.CaptureOutput"/>), beside its report.</summary>
+    public static string OutputName(string id) => ReportName(id)[..^".xml".Length] + ".out";
+
+    private static readonly Regex ReportFileName = new(@"^swift-test-[0-9a-f]{16}\.xml$", RegexOptions.CultureInvariant);
 
     public bool Understands(string path) => path.EndsWith(".swift", StringComparison.Ordinal);
 
@@ -315,7 +328,8 @@ public sealed class SwiftNewTests : INewTestStrategy
     /// <summary>
     /// <c>swift --version</c>; <c>/bin/mkdir -p</c> of the results directory; per package <c>swift package resolve</c> (the
     /// only step that may use the network) and <c>swift build --build-tests</c> (output kept as the build log); then per new
-    /// test one <c>swift test --skip-build --disable-xctest --filter … --xunit-output &lt;results&gt;/swift-test-N.xml</c>.
+    /// test one <c>swift test --skip-build --disable-xctest --filter … --xunit-output &lt;results&gt;/</c><see cref="ReportName"/>,
+    /// reading that report alone and keeping the step's exit code (<see cref="OutputName"/>).
     /// Run from the worktree root with <c>--package-path</c>.
     /// </summary>
     public Task<IReadOnlyList<TestStep>> StepsAsync(TestSource source, string commit, IReadOnlyList<string> tests, IReadOnlyDictionary<string, string> projects,
@@ -334,14 +348,14 @@ public sealed class SwiftNewTests : INewTestStrategy
         };
         steps.AddRange(byPackage.Select(g => new TestStep(TestPhase.Restore, Swift, ["package", "--package-path", g.Key, "resolve"])));
         steps.AddRange(byPackage.Select((g, n) => new TestStep(TestPhase.Build, Swift, ["build", "--package-path", g.Key, "--build-tests"]) { CaptureOutput = $"swift-build-{n}" }));
-        var count = 0;
         foreach (var id in byPackage.SelectMany(g => g.Select(id => (Id: id, Package: g.Key))))
         {
+            // Its own report only (a pattern naming exactly it), and its exit code, which the report must agree with.
             steps.Add(new TestStep(TestPhase.Test, Swift,
             [
                 "test", "--package-path", id.Package, "--skip-build", "--disable-xctest", "--filter", Filter(id.Id),
-                "--xunit-output", $"{resultsDirectory}/{ReportPrefix}{count++}.xml",
-            ]) { ResultFilePattern = $"{ReportPrefix}*.xml" });
+                "--xunit-output", $"{resultsDirectory}/{ReportName(id.Id)}",
+            ]) { ResultFilePattern = ReportName(id.Id), CaptureOutput = OutputName(id.Id) });
         }
         return Task.FromResult<IReadOnlyList<TestStep>>(steps);
     }
@@ -353,17 +367,30 @@ public sealed class SwiftNewTests : INewTestStrategy
     /// <c>failure</c> or <c>error</c> child fails it, a <c>skipped</c> one skips it. A report is read only when it is
     /// well-formed (no DTD), Swift Testing's shape, and each suite's counts agree with its cases (the cases are its
     /// <c>tests</c>, with or without its <c>skipped</c>; failed ones its <c>failures</c> plus <c>errors</c>; skipped ones
-    /// its <c>skipped</c>); anything else is unreadable and named, never a result.
+    /// its <c>skipped</c>); anything else is unreadable and named, never a result. A report is also unreadable unless it
+    /// is one a step asked for (<see cref="ReportName"/>, at the results directory's top), every case in it is the test
+    /// that step ran (its name is that test's), and the step's exit code is known and agrees with it (0 exactly when no
+    /// case failed): a test that writes another test's report, or a report of its own, is never read as a result. A
+    /// step whose report is missing is unreadable too.
     /// </summary>
     public TestResults ParseResults(IEnumerable<ResultFile> resultFiles)
     {
         var results = new Dictionary<string, List<TestCaseResult>>(StringComparer.Ordinal);
         var unreadable = new List<string>();
-        foreach (var (name, content) in resultFiles)
+        var all = resultFiles.ToList();
+        var exits = all.Where(f => f.ExitCode is not null).ToDictionary(f => f.Name, f => f.ExitCode!.Value, StringComparer.Ordinal);
+        var reported = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var (name, content) in all.Where(f => f.ExitCode is null))
         {
             var cases = new List<(string, TestCaseResult)>();
             try
             {
+                if (!ReportFileName.IsMatch(name))
+                {
+                    throw new InvalidDataException("it is not a report a test step asked for");
+                }
+                var output = name[..^".xml".Length] + ".out";
+                reported.Add(output);
                 if (string.IsNullOrWhiteSpace(content))
                 {
                     throw new InvalidDataException("it is empty (the test runner could not write it)");
@@ -397,8 +424,21 @@ public sealed class SwiftNewTests : INewTestStrategy
                         }
                         var types = classname.Split('.');
                         var id = Id(types[0], types[1..], function);
+                        if (ReportName(id) != name)
+                        {
+                            throw new InvalidDataException($"it holds {id}, which is not the test its step ran");
+                        }
                         cases.Add((id, new TestCaseResult(id, outcome)));
                     }
+                }
+                if (!exits.TryGetValue(output, out var exit))
+                {
+                    throw new InvalidDataException("its step's exit code is not known");
+                }
+                var failed = cases.Count(c => c.Item2.Outcome == TestCaseResult.Failed);
+                if ((exit == 0) != (failed == 0))
+                {
+                    throw new InvalidDataException($"swift test exited {exit}, which does not agree with its {failed} failing case(s)");
                 }
             }
             catch (Exception e) when (e is XmlException or InvalidDataException)
@@ -411,6 +451,8 @@ public sealed class SwiftNewTests : INewTestStrategy
                 (results.TryGetValue(test, out var list) ? list : results[test] = []).Add(result);
             }
         }
+        unreadable.AddRange(exits.Where(e => !reported.Contains(e.Key)).OrderBy(e => e.Key, StringComparer.Ordinal)
+            .Select(e => $"{e.Key[..^".out".Length]}.xml: the test step (exit {e.Value}) wrote no report"));
         return new TestResults(results.ToDictionary(kv => kv.Key, kv => (IReadOnlyList<TestCaseResult>)kv.Value, StringComparer.Ordinal), unreadable);
     }
 

@@ -2755,7 +2755,11 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   Swift/SwiftPM with Swift Testing (Phase 5 S1, sc-26127, `Gate/SwiftNewTests.cs`, a third `INewTestStrategy`, over the
   lexer-level `Gate/SwiftSource.cs`: line and nested block comments, single-line, multi-line and raw strings with their
   interpolations, `#/…/#` regexes, backticked names; function, property, initializer and closure bodies skipped, type and
-  extension bodies read; unbalanced source throws and the file is unreadable). New tests: `@Test` functions in the head
+  extension bodies read; `actor` read as a type only when a name and `{`/`:`/`<`/`where` follow it, since it is also an
+  identifier; unbalanced source throws and the file is unreadable, and so does any `@Test` the reader does not put on a
+  function it records — one dropped before a declaration it does not understand (`#if` between attribute and `func`, a
+  generic clause holding a bracket), and, by a file-wide count of `@Test`/`@Testing.Test` tokens against the recorded test
+  functions' attributes, one in a skipped body (Swift Testing refuses a local test function anyway)). New tests: `@Test` functions in the head
   versions of changed files under `Tests/<target>/` of the nearest `Package.swift` whose `testTarget(name: "<target>")` has no
   `path:` (at the base and the head), whose id no base version of a changed file has; the id is Swift Testing's own
   (`WordsTests.blank()`, `WordsTests.Outer/Inner/deep()`, what `swift test list` prints). Overlay: every changed file under a
@@ -2766,13 +2770,22 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   that may hold tests. Runs (`SandboxTestRunner`, as `_factory`): `swift --version` (toolchain), `/bin/mkdir -p` of the
   results directory (SwiftPM writes no report into a missing one), `swift package resolve` (the restore, the only network
   step), `swift build --build-tests` (stdout kept as the build log), then per test `swift test --skip-build --disable-xctest
-  --filter '^<id escaped>(/|$)' --xunit-output <results>/swift-test-N.xml` (Swift Testing matches the filter against the id
-  followed by `/<file>:<line>:<col>`; verified against Swift 6.3.2, whose report for Swift Testing names a case by `classname`
-  `<target>.<Type>.<Nested>` and `name` `f()`, with `<failure>`/`<skipped>` children and suite counts that are checked). A
+  --filter '^<id escaped>(/|$)' --xunit-output <results>/swift-test-<16 hex of the id's SHA-256>.xml` (Swift Testing matches
+  the filter against the id followed by `/<file>:<line>:<col>`; verified against Swift 6.3.2, whose report for Swift Testing
+  names a case by `classname` `<target>.<Type>.<Nested>` and `name` `f()`, with `<failure>`/`<skipped>` children and suite
+  counts that are checked). Each step reads only its own report (`ResultFilePattern` = `SwiftNewTests.ReportName(id)`, no
+  wildcard) and keeps its exit code (`CaptureOutput`, `ResultFile.ExitCode`); a report is unreadable (never a result) when no
+  step asked for its name (`swift-test-99.xml`, a subdirectory), when it holds a case that is not its step's test (one test's
+  code writing another's report), when its step's exit code is unknown or disagrees with it (0 exactly when no case failed),
+  and a step with no report is unreadable too. A
   base that does not build with the PR's test files is not attributed yet (S2): every error unattributable, `error`, never
   a pass. Workers get `swift build` and `swift test` only (`ClaudeWorker.SwiftTools`, prefix rules like cargo's; `swift run`,
   `swift package`, `swift <script>` taint as an allow rule and are not offered); `Package.swift`, `Package@swift-*.swift` and
-  `Package.resolved` are `RiskyPaths` dependency manifests (a manifest is code SwiftPM runs). Tests: `SwiftNewTestsTests.cs`
+  `Package.resolved` are `RiskyPaths` dependency manifests (a manifest is code SwiftPM runs). Residual, accepted (the Swift
+  counterpart of cargo's (b)): `~_factory/.swiftpm` (its `configuration` — mirrors, registries — and security state) and
+  `~_factory/Library/Caches/org.swift.swiftpm` (the repository and manifest caches) persist across items and are writable by
+  every worker session and by the test code a gate run executes, so an implementer, or a PR's tests, can influence later
+  resolves, builds and gate runs on both commits — as `_factory`'s NuGet cache and `~/.cargo` can. Tests: `SwiftNewTestsTests.cs`
   (reader, identification, steps/report/build-error parsing, the pipeline to Merge and the rejection, and the real toolchain,
   skipped without `swift`).
   Upgrading from Phase 1: Review is now a handled state, so the first `factory work` picks up every item parked at Review:

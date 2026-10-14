@@ -57,7 +57,9 @@ public sealed record SwiftFile(string Text, IReadOnlyList<string> Imports, IRead
 /// (<c>struct</c>, <c>class</c>, <c>enum</c>, <c>actor</c>, <c>extension</c>, <c>protocol</c>) only: function, property,
 /// initializer and closure bodies are skipped whole (Swift Testing runs no test declared in one). Unbalanced delimiters
 /// or an unterminated literal throw <see cref="FormatException"/>: the caller then treats the file as one it cannot read,
-/// never as holding no tests. Not read, accepted: a bare regex literal (<c>/…/</c>, which the language tells from division
+/// never as holding no tests. So does an <c>@Test</c> the reader does not put on a function it records (one before a
+/// declaration it does not understand, or in a body it skips): the file's test attributes are counted from its tokens and
+/// must all be on recorded functions. Not read, accepted: a bare regex literal (<c>/…/</c>, which the language tells from division
 /// by context) holding a quote or a brace can mis-lex; that fails as unbalanced far more often than it hides a test.
 /// </summary>
 public static class SwiftSource
@@ -73,7 +75,30 @@ public static class SwiftSource
         var funcs = new List<SwiftFunc>();
         var imports = new List<string>();
         new Reader(text, tokens, close, funcs, imports).Scope(0, tokens.Count, []);
+        // The safety net: every @Test the lexer saw must be on a function the reader recorded. One it lost (in a body it
+        // skipped, swallowed by a declaration it did not understand) would otherwise be a test the gate never sees.
+        var written = TestAttributeTokens(text, tokens);
+        var recorded = funcs.Sum(f => f.Attributes.Count(a => a.IsTest));
+        if (written != recorded)
+        {
+            throw new FormatException($"it has {written} @Test attribute(s) but {recorded} on the test functions this reader found");
+        }
         return new SwiftFile(text, imports, funcs);
+    }
+
+    /// <summary>How many <c>@Test</c> and <c>@Testing.Test</c> attributes the tokens hold, however they are spaced.</summary>
+    private static int TestAttributeTokens(string text, List<Token> tokens)
+    {
+        string Word(int i) => i < tokens.Count ? text[tokens[i].Start..tokens[i].End] : "";
+        var count = 0;
+        for (var i = 0; i + 1 < tokens.Count; i++)
+        {
+            if (Word(i) == "@" && (Word(i + 1) == "Test" || (Word(i + 1) == "Testing" && Word(i + 2) == "." && Word(i + 3) == "Test")))
+            {
+                count++;
+            }
+        }
+        return count;
     }
 
     /// <summary>
@@ -501,14 +526,15 @@ public static class SwiftSource
                 }
                 if (word == "func" && tokens[i].Kind == Kind.Ident)
                 {
+                    var recorded = funcs.Count;
                     i = Func(i, to, types, pending);
-                    pending = [];
+                    pending = funcs.Count > recorded ? [] : Drop(pending, at: i);
                     continue;
                 }
                 if (tokens[i].Kind == Kind.Ident && TypeKeywords.Contains(word))
                 {
                     i = Type(i, to, types);
-                    pending = [];
+                    pending = Drop(pending, at: i);
                     continue;
                 }
                 if (word == "import" && types.Count == 0)
@@ -523,13 +549,27 @@ public static class SwiftSource
                     {
                         imports.Add(Word(j));
                     }
-                    pending = [];
+                    pending = Drop(pending, at: i);
                     i = j + 1;
                     continue;
                 }
-                pending = [];
+                pending = Drop(pending, at: i);
                 i = tokens[i].Kind == Kind.Open ? close[i] + 1 : i + 1;
             }
+            Drop(pending, at: to);
+        }
+
+        /// <summary>
+        /// Attributes that belong to no function the reader recorded are dropped; a test attribute among them throws (the
+        /// file is then one the gate cannot read): a lost <c>@Test</c> would be a test the gate never sees.
+        /// </summary>
+        private List<SwiftAttribute> Drop(List<SwiftAttribute> pending, int at)
+        {
+            if (pending.Any(a => a.IsTest))
+            {
+                throw new FormatException($"an @Test attribute near offset {(at < tokens.Count ? tokens[at].Start : text.Length)} is on no function this reader understands");
+            }
+            return [];
         }
 
         /// <summary>A function: its name (an identifier, or an operator's characters) up to its parameter list. Its body is left to the scope, which skips it.</summary>
@@ -567,15 +607,24 @@ public static class SwiftSource
         {
             var j = at + 1;
             var names = new List<string>();
-            if (j < to && tokens[j].Kind == Kind.Ident)
+            // No name right after the keyword: not a declaration (actor is a contextual keyword, so also an identifier:
+            // `let actor = 1`, `var actor: A`). Read on from the next token, never scanning ahead to a brace.
+            if (j >= to || tokens[j].Kind != Kind.Ident)
             {
-                names.Add(Word(j));
-                j++;
-                while (j + 1 < to && Word(j) == "." && tokens[j + 1].Kind == Kind.Ident)
-                {
-                    names.Add(Word(j + 1));
-                    j += 2;
-                }
+                return at + 1;
+            }
+            names.Add(Word(j));
+            j++;
+            while (j + 1 < to && Word(j) == "." && tokens[j + 1].Kind == Kind.Ident)
+            {
+                names.Add(Word(j + 1));
+                j += 2;
+            }
+            // An actor declaration's name is followed by its body, an inheritance clause, generic parameters or a where
+            // clause; anything else is `actor` used as an identifier.
+            if (Word(at) == "actor" && (j >= to || Word(j) is not ("{" or ":" or "<" or "where")))
+            {
+                return at + 1;
             }
             while (j < to && Word(j) != "{")
             {

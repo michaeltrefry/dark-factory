@@ -73,10 +73,10 @@ public class SwiftSourceTests
     {
         const string source = """
             struct S {
-                var computed: Int { @Test func notInAGetter() {}; return 1 }
-                init() { struct Local { @Test func local() {} } }
-                func helper() { @Test func nested() {} }
-                let closure = { @Test func inClosure() {} }
+                var computed: Int { func notInAGetter() {}; return 1 }
+                init() { struct Local { func local() {} } }
+                func helper() { func nested() {} }
+                let closure = { func inClosure() {} }
                 #if os(Linux)
                 @Test func linuxOnly() {}
                 #endif
@@ -86,7 +86,56 @@ public class SwiftSourceTests
             """;
 
         Assert.Equal(["S/linuxOnly()", "S/after()"], Tests(source));
+        Assert.Equal(["helper", "linuxOnly", "after"], SwiftSource.Parse(source).Funcs.Select(f => f.Name));
     }
+
+    /// <summary>
+    /// An @Test the reader does not put on a function it records is never dropped silently: the file is unreadable (so the
+    /// check is unsupported). Swift Testing refuses a local @Test function anyway; the rest is what the reader cannot follow.
+    /// </summary>
+    [Theory]
+    [InlineData("@Test\n#if os(macOS)\nfunc mac() {}\n#endif\n")]
+    [InlineData("@Test func f<C: Collection<[Int]>>() {}\n@Test func g() {}")]
+    [InlineData("@Test struct NotAFunction {}")]
+    [InlineData("struct S { @Test }")]
+    [InlineData("@Test let notAFunction = 1")]
+    [InlineData("@Testing.Test\nimport Foundation")]
+    public void An_at_test_dropped_before_a_function_the_reader_records_makes_the_file_unreadable(string source)
+    {
+        var e = Assert.Throws<FormatException>(() => SwiftSource.Parse(source));
+
+        Assert.Contains("is on no function this reader understands", e.Message);
+    }
+
+    /// <summary>
+    /// A body the reader skips whole (a getter, an initializer, a function, a closure) is walked by no scope, so an @Test in
+    /// it reaches no reset of pending attributes: only the file-wide count sees it. Swift Testing refuses a local @Test
+    /// function anyway; the file is unreadable (so the check is unsupported), never one with fewer tests.
+    /// </summary>
+    [Theory]
+    [InlineData("struct S { var computed: Int { @Test func notInAGetter() {}; return 1 } }")]
+    [InlineData("struct S { var x: Int { get { @Test func lost() {}; return 1 } } }")]
+    [InlineData("struct S { init() { struct Local { @Test func local() {} } } }")]
+    [InlineData("struct S { func helper() { @Test func nested() {} } }")]
+    [InlineData("let closure = { @Testing.Test func inClosure() {} }")]
+    public void An_at_test_in_a_skipped_body_fails_the_files_attribute_count(string source)
+    {
+        var e = Assert.Throws<FormatException>(() => SwiftSource.Parse(source));
+
+        Assert.Contains("1 @Test attribute(s) but 0 on the test functions", e.Message);
+    }
+
+    [Theory]
+    [InlineData("struct O {\n    let actor = 1\n    @Test func named() {}\n}\n", "O/named()")]
+    [InlineData("struct O {\n    var actor: A!\n    @Test func named() {}\n}\n", "O/named()")]
+    [InlineData("let actor = 3\n@Test func g() {}\n", "g()")]
+    [InlineData("var actor: A\n@Test func g() {}\n", "g()")]
+    [InlineData("let a = actor\nhelper()\n@Test func g() {}\n", "g()")]
+    [InlineData("let a = actor\nstruct S { @Test func t() {} }\n", "S/t()")]
+    [InlineData("actor Counter: Base { @Test func isolated() {} }\n", "Counter/isolated()")]
+    [InlineData("actor Box<T> where T: Sendable { @Test func held() {} }\n", "Box/held()")]
+    public void Actor_used_as_an_identifier_is_no_type_and_hides_no_test(string source, string test) =>
+        Assert.Equal([test], Tests(source));
 
     [Theory]
     [InlineData("@Test(arguments: [1, 2]) func f(x: Int) {}", true, "f(x:)")]
@@ -261,6 +310,10 @@ public class SwiftIdentifyTests
     [InlineData(TestFile, BaseTests + "#if os(Linux)\n@Test func twice() {}\n#else\n@Test func twice() {}\n#endif\n", "WordsTests.twice() is declared more than once at the head")]
     [InlineData(TestFile, BaseTests + "@Test func `adds two words`() {}\n", "has a backticked name")]
     [InlineData(TestFile, BaseTests + "@Test func broken() { let s = \"open }\n", "Tests/WordsTests/WordsTests.swift cannot be read as Swift source")]
+    [InlineData(TestFile, BaseTests + "@Test\n#if os(macOS)\nfunc mac() {}\n#endif\n",
+        "Tests/WordsTests/WordsTests.swift cannot be read as Swift source (an @Test attribute near offset")]
+    [InlineData(TestFile, BaseTests + "struct S { func helper() { @Test func nested() {} } }\n",
+        "Tests/WordsTests/WordsTests.swift cannot be read as Swift source (it has 2 @Test attribute(s) but 1 on the test functions")]
     public async Task Tests_the_gate_cannot_isolate_yet_fail_the_check_as_unsupported_never_pass(string path, string content, string why)
     {
         var runner = Runner((path, content));
@@ -270,6 +323,47 @@ public class SwiftIdentifyTests
         Assert.Equal(NewTestsOutcome.Unsupported, result.Outcome);
         Assert.Contains(why, result.Reason);
         Assert.Empty(runner.Runs);
+    }
+
+    [Theory]
+    [InlineData("struct Names {\n    let actor = 1\n    @Test func named() {}\n}\n", "WordsTests.Names/named()")]
+    [InlineData("struct Names {\n    var actor: Actor!\n    @Test func named() {}\n}\n", "WordsTests.Names/named()")]
+    [InlineData("let actor = 3\n@Test func afterLet() {}\n", "WordsTests.afterLet()")]
+    [InlineData("var actor: Actor? = nil\n@Test func afterVar() {}\n", "WordsTests.afterVar()")]
+    public async Task A_test_after_actor_used_as_an_identifier_is_found(string added, string test)
+    {
+        var set = await Identify(Runner((TestFile, BaseTests + added)));
+
+        Assert.Equal([test], set.Tests);
+        Assert.Empty(set.Unisolable);
+    }
+
+    [Fact]
+    public async Task A_test_in_an_extension_of_a_nested_type_is_named_by_every_type()
+    {
+        var set = await Identify(Runner((TestFile, BaseTests + "struct Outer { struct Inner {} }\nextension Outer.Inner { @Test func deep() {} }\n")));
+
+        Assert.Equal(["WordsTests.Outer/Inner/deep()"], set.Tests);
+        Assert.Empty(set.Unisolable);
+    }
+
+    [Fact]
+    public async Task A_test_of_a_package_in_a_subdirectory_belongs_to_that_package_and_runs_there()
+    {
+        var runner = Runner(("sub/Tests/WordsTests/x.swift", "import Testing\n@Test func nested() {}\n"));
+        runner.BaseFiles["sub/Package.swift"] = Manifest;
+        runner.BaseFiles["sub/Sources/Words/Words.swift"] = BaseLibrary;
+
+        var set = await Identify(runner);
+        var steps = await new SwiftNewTests().StepsAsync(null!, Head, set.Tests, set.Projects, ".results", CancellationToken.None);
+
+        Assert.Equal(["WordsTests.nested()"], set.Tests);
+        Assert.Equal("sub/Package.swift", set.Projects["WordsTests.nested()"]);
+        Assert.Empty(set.Unisolable);
+        Assert.Equal([new ChangedFile('A', null, "sub/Tests/WordsTests/x.swift")], set.TestFiles);
+        Assert.All(steps.Where(s => s.Program == SwiftNewTests.Swift && s.Phase != TestPhase.Toolchain),
+            s => Assert.Equal("./sub", s.Args[s.Args.ToList().IndexOf("--package-path") + 1]));
+        Assert.Equal(3, steps.Count(s => s.Args.Contains("--package-path")));
     }
 
     [Fact]
@@ -335,25 +429,48 @@ public class SwiftRunOutputTests
             "Restore swift package --package-path ./tools/cli resolve",
             "Build swift build --package-path . --build-tests",
             "Build swift build --package-path ./tools/cli --build-tests",
-            @"Test swift test --package-path . --skip-build --disable-xctest --filter ^WordsTests\.blank\(\)(/|$) --xunit-output .results/swift-test-0.xml",
-            @"Test swift test --package-path . --skip-build --disable-xctest --filter ^WordsTests\.Spaces\/double\(\)(/|$) --xunit-output .results/swift-test-1.xml",
-            @"Test swift test --package-path ./tools/cli --skip-build --disable-xctest --filter ^ToolTests\.runs\(\)(/|$) --xunit-output .results/swift-test-2.xml",
+            @$"Test swift test --package-path . --skip-build --disable-xctest --filter ^WordsTests\.blank\(\)(/|$) --xunit-output .results/{SwiftNewTests.ReportName("WordsTests.blank()")}",
+            @$"Test swift test --package-path . --skip-build --disable-xctest --filter ^WordsTests\.Spaces\/double\(\)(/|$) --xunit-output .results/{SwiftNewTests.ReportName("WordsTests.Spaces/double()")}",
+            @$"Test swift test --package-path ./tools/cli --skip-build --disable-xctest --filter ^ToolTests\.runs\(\)(/|$) --xunit-output .results/{SwiftNewTests.ReportName("ToolTests.runs()")}",
         ], steps.Select(s => $"{s.Phase} {s.Program} {string.Join(' ', s.Args)}"));
         Assert.Equal(["swift-build-0", "swift-build-1"], steps.Where(s => s.Phase == TestPhase.Build).Select(s => s.CaptureOutput));
-        Assert.All(steps.Where(s => s.Phase == TestPhase.Test), s => Assert.Equal("swift-test-*.xml", s.ResultFilePattern));
+        // Each test step reads exactly its own report (no wildcard another test's file could match) and keeps its exit code.
+        Assert.Equal(new[] { "WordsTests.blank()", "WordsTests.Spaces/double()", "ToolTests.runs()" }.Select(id => ((string?)SwiftNewTests.ReportName(id), (string?)SwiftNewTests.OutputName(id))),
+            steps.Where(s => s.Phase == TestPhase.Test).Select(s => (s.ResultFilePattern, s.CaptureOutput)));
+        Assert.Matches(@"^swift-test-[0-9a-f]{16}\.xml$", SwiftNewTests.ReportName("WordsTests.blank()"));
+        Assert.Equal(3, steps.Where(s => s.Phase == TestPhase.Test).Select(s => s.ResultFilePattern).Distinct().Count());
         // No step runs anything but swift and the one mkdir: the gateway lint's known local program is TestStep.Program.
         Assert.All(steps, s => Assert.Contains(s.Program, new[] { SwiftNewTests.Swift, SwiftNewTests.MakeDirectory }));
     }
 
-    /// <summary>What swift test --xunit-output wrote with Swift 6.3.2 (Swift Testing), for one passing, one failing and one skipped test.</summary>
-    internal const string Report = """
+    /// <summary>
+    /// What swift test --xunit-output wrote with Swift 6.3.2 (Swift Testing), one report per step: a passing, a failing
+    /// and a skipped test.
+    /// </summary>
+    internal const string Passing = """
         <?xml version="1.0" encoding="UTF-8"?>
         <testsuites>
-          <testsuite name="TestResults" errors="0" tests="2" failures="1" skipped="1" time="0.000658667">
+          <testsuite name="TestResults" errors="0" tests="1" failures="0" skipped="0" time="0.000256125">
             <testcase classname="WordsTests" name="blank()" time="0.000256125" />
+          </testsuite>
+        </testsuites>
+        """;
+
+    internal const string Failing = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <testsuites>
+          <testsuite name="TestResults" errors="0" tests="1" failures="1" skipped="0" time="0.000361291">
             <testcase classname="WordsTests.Outer.Inner" name="deep()" time="0.000361291" >
               <failure message="Expectation failed: (count(&quot;a b&quot;) &#8594; 2) == 3 (error)" />
             </testcase>
+          </testsuite>
+        </testsuites>
+        """;
+
+    internal const string Skipped = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <testsuites>
+          <testsuite name="TestResults" errors="0" tests="0" failures="0" skipped="1" time="0.0001">
             <testcase classname="WordsTests" name="off()" >
               <skipped>not yet</skipped>
             </testcase>
@@ -361,10 +478,15 @@ public class SwiftRunOutputTests
         </testsuites>
         """;
 
+    /// <summary>A test step's report and its kept exit code, as the runner hands them to <see cref="SwiftNewTests.ParseResults"/>.</summary>
+    private static ResultFile[] Step(string id, string report, int exit) =>
+        [new ResultFile(SwiftNewTests.ReportName(id), report), new ResultFile(SwiftNewTests.OutputName(id), "") { ExitCode = exit }];
+
     [Fact]
     public void Swift_testings_report_gives_each_test_its_outcome_under_its_swift_testing_id()
     {
-        var results = Strategy.ParseResults([new ResultFile("swift-test-0.xml", Report)]);
+        var results = Strategy.ParseResults([.. Step("WordsTests.blank()", Passing, 0), .. Step("WordsTests.Outer/Inner/deep()", Failing, 1),
+            .. Step("WordsTests.off()", Skipped, 0)]);
 
         Assert.Empty(results.Unreadable);
         Assert.Equal(TestCaseResult.Passed, results.Cases["WordsTests.blank()"].Single().Outcome);
@@ -385,10 +507,63 @@ public class SwiftRunOutputTests
     [InlineData("<testsuites><testsuite tests=\"1\" failures=\"0\" errors=\"0\" skipped=\"0\"><testcase name=\"a()\"/></testsuite></testsuites>", "names no classname and name")]
     public void A_report_that_cannot_be_trusted_is_unreadable_never_a_result(string content, string why)
     {
-        var results = Strategy.ParseResults([new ResultFile("swift-test-0.xml", content)]);
+        var results = Strategy.ParseResults(Step("T.a()", content, 0));
 
         Assert.Empty(results.Cases);
         Assert.Contains(why, Assert.Single(results.Unreadable));
+    }
+
+    /// <summary>
+    /// The base run runs the PR's test code, which can write files: a report one test writes for another, under a name no
+    /// step asked for, or in a subdirectory, and a report its own step's exit code contradicts, are never results.
+    /// </summary>
+    [Fact]
+    public void A_report_holding_another_tests_id_is_unreadable_never_that_tests_result()
+    {
+        // blank()'s step's report says deep() passed: deep() gets no result from it, and neither does blank().
+        const string forged = """
+            <testsuites><testsuite tests="1" failures="0" errors="0" skipped="0"><testcase classname="WordsTests.Outer.Inner" name="deep()"/></testsuite></testsuites>
+            """;
+
+        var results = Strategy.ParseResults(Step("WordsTests.blank()", forged, 0));
+
+        Assert.Empty(results.Cases);
+        Assert.Contains("it holds WordsTests.Outer/Inner/deep(), which is not the test its step ran", Assert.Single(results.Unreadable));
+    }
+
+    [Theory]
+    [InlineData("swift-test-99.xml")]
+    [InlineData("swift-test-0.xml")]
+    [InlineData("sub/swift-test-0123456789abcdef.xml")]
+    public void A_report_no_step_asked_for_is_unreadable(string name)
+    {
+        var results = Strategy.ParseResults([new ResultFile(name, Passing)]);
+
+        Assert.Empty(results.Cases);
+        Assert.Contains("it is not a report a test step asked for", Assert.Single(results.Unreadable));
+    }
+
+    [Theory]
+    [InlineData("WordsTests.blank()", Passing, 1, "swift test exited 1, which does not agree with its 0 failing case(s)")]
+    [InlineData("WordsTests.Outer/Inner/deep()", Failing, 0, "swift test exited 0, which does not agree with its 1 failing case(s)")]
+    public void A_report_its_steps_exit_code_contradicts_is_unreadable(string id, string report, int exit, string why)
+    {
+        var results = Strategy.ParseResults(Step(id, report, exit));
+
+        Assert.Empty(results.Cases);
+        Assert.Contains(why, Assert.Single(results.Unreadable));
+    }
+
+    [Fact]
+    public void A_report_whose_steps_exit_code_is_unknown_and_a_step_with_no_report_are_unreadable()
+    {
+        var withoutExit = Strategy.ParseResults([new ResultFile(SwiftNewTests.ReportName("WordsTests.blank()"), Passing)]);
+        var withoutReport = Strategy.ParseResults([new ResultFile(SwiftNewTests.OutputName("WordsTests.blank()"), "") { ExitCode = 0 }]);
+
+        Assert.Empty(withoutExit.Cases);
+        Assert.Contains("its step's exit code is not known", Assert.Single(withoutExit.Unreadable));
+        Assert.Empty(withoutReport.Cases);
+        Assert.Equal($"{SwiftNewTests.ReportName("WordsTests.blank()")}: the test step (exit 0) wrote no report", Assert.Single(withoutReport.Unreadable));
     }
 
     [Fact]
