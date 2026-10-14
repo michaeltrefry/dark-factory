@@ -386,8 +386,9 @@ them, sc-25875). Every normal (re)run kills every process of every sandbox user 
 `--remove-worker-login` (opt-in) is a standalone mode: it runs none of the setup (no helper, no toolchain check, no
 installs) and only deletes each sandbox user's own Claude login (`~/.claude/.credentials.json`, keychain item
 `Claude Code-credentials`; with `--slots n`, of each of the n users), as that user, signalling nothing. The live probe tests
-(`LiveWorkerSandboxTests`) run only with `FACTORY_SANDBOX_LIVE=1`, since they kill every `_factory` process (including an
-interactive `_factory` login).
+(`LiveWorkerSandboxTests`) run only with `FACTORY_SANDBOX_LIVE=1`, since they kill every process of every configured sandbox
+user (including an interactive `_factory` login); they probe every configured slot (`Worker:Slots`, e.g. `Worker__Slots=2`),
+each slot's `TMPDIR` checked to be its own user's (sc-25992).
 
 Secrets in the keychain: `security add-generic-password -w` at its interactive prompt truncates at 128 chars
 (Shortcut tokens are longer → 401). Copy the secret, then

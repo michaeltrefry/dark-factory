@@ -134,11 +134,22 @@ for its sessions.
 
 The env probe runs `/usr/bin/env` through the installed helper exactly as `ClaudeWorker` launches a sandboxed worker
 (`WorkerSandbox.Start` with `ClaudeWorker.BuildRouterVariables` for the configured router URL and auth mode, a probe
-router key, and `GH_TOKEN` set in the test process to show nothing of the owner's leaks). The `FACTORY_SANDBOX_LIVE`
-tests kill every `_factory` process: run them only when no `_factory` session is in use:
+router key, and `GH_TOKEN` set in the test process to show nothing of the owner's leaks). Every probe runs once per configured
+worker slot (`Worker:Slots`: each slot's own user and installed helper, `_factory`, `_factory2`, …; sc-25992), a failure naming
+its slot; slot 1 not ready (the machine not set up) skips them, a further configured slot not ready fails. The env probe also
+checks that each slot's `TMPDIR` is under `/var/folders/`, owned by that slot's own uid (run as it: `stat -f %u "$TMPDIR"` equals
+`id -u`, and `id -un` is the slot's user), not the owner's, and that no two slots share a `TMPDIR` or a `HOME`. The
+`FACTORY_SANDBOX_LIVE` tests kill every process of every configured sandbox user: run them only when no sandbox user's session
+is in use and `factory work` is stopped. One slot (the default):
 
 ```sh
-FACTORY_SANDBOX_LIVE=1 dotnet test --project tests/DarkFactory.Orchestrator.Tests -- --filter-class "*LiveWorkerSandboxTests"
+FACTORY_SANDBOX_LIVE=1 dotnet test --project tests/DarkFactory.Orchestrator.Tests --filter-class "*LiveWorkerSandboxTests"
+```
+
+Two slots (after `sudo scripts/setup-worker-user.sh --slots 2`):
+
+```sh
+FACTORY_SANDBOX_LIVE=1 Worker__Slots=2 dotnet test --project tests/DarkFactory.Orchestrator.Tests --filter-class "*LiveWorkerSandboxTests"
 ```
 
 ## AT7 — the router accounts for every model call
@@ -1088,8 +1099,8 @@ Not live (every `dotnet test`): `SlotPoolTests`, `LockScopeTests`, `WorkerSandbo
 `SetupScriptTests` and `FactoryOptionsTests` — the pool, the slot recorded per item and kept (resume, the stop of a leftover
 worker, the worktree's deletion, each waiting for the item's slot), each slot's helper sweeping only its own user's processes,
 start-up naming the slot whose installed helper is missing, stale or pinned to another user, the set-up script for n users, and
-the setting's validation. The live sandbox probes (`LiveWorkerSandboxTests`, `FACTORY_SANDBOX_LIVE=1`) still probe slot 1's
-user only.
+the setting's validation. The live sandbox probes (`LiveWorkerSandboxTests`, `FACTORY_SANDBOX_LIVE=1`) probe every configured
+slot's user (AT6 above: `Worker__Slots=2` for two), including that each slot's `TMPDIR` is its own user's.
 
 ## P4b-AT7 — defaults: one live test per earlier phase behaves as before (sc-25992)
 

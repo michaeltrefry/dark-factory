@@ -377,7 +377,7 @@ public class WorkerSandboxTests
 
         Assert.True(exitCode == 0, stderr);
         Assert.Equal(Path.Combine(home, ".tmp"), tmpdir);
-        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(tmpdir));
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(Path.Combine(home, ".tmp")));
     }
 
     [Fact]
@@ -1530,28 +1530,61 @@ public class LiveWorkerSandboxTests
 {
     private static readonly RepoRef Repo = new("acme", "widgets");
 
-    private static async Task<WorkerSandbox> RequireSandboxAsync()
+    /// <summary>
+    /// Every configured worker slot (<c>Worker:Slots</c>, each slot's own user and installed helper as the factory would use them,
+    /// sc-25992), each probed ready. The machine not set up at all (slot 1 not ready) skips; a further configured slot that is not
+    /// ready fails, naming it. Taken without the slots' run locks, as these probes always were: run them with no factory running.
+    /// </summary>
+    private static async Task<IReadOnlyList<WorkerSlot>> RequireSlotsAsync()
     {
-        // Before anything touches the helper: even the readiness probe ends in its uid-wide kill.
+        // Before anything touches a helper: even the readiness probe ends in its uid-wide kill.
         if (Environment.GetEnvironmentVariable("FACTORY_SANDBOX_LIVE") != "1")
         {
-            Assert.Skip("Live sandbox test: set FACTORY_SANDBOX_LIVE=1 to run (kills every _factory process).");
+            Assert.Skip("Live sandbox test: set FACTORY_SANDBOX_LIVE=1 to run (kills every process of every configured sandbox user).");
         }
         if (!OperatingSystem.IsMacOS())
         {
             Assert.Skip("The worker sandbox is macOS-only.");
         }
-        var sandbox = new WorkerSandbox(WorkerSandbox.DefaultUser, WorkerSandbox.DefaultHelperPath);
-        try
+        var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets());
+        if (options.WorkerSlots is not { } pool)
         {
-            var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets());
-            await sandbox.EnsureReadyAsync(options.WorkerAuth, options.ClaudePath, CancellationToken.None);
+            Assert.Skip("Worker:RunAs=none: there is no sandbox user to probe.");
+            throw new UnreachableException();
         }
-        catch (InvalidOperationException ex)
+        var slots = pool.All.Select(s => s with { Sandbox = s.Sandbox with { Lock = null } }).ToList();
+        foreach (var slot in slots)
         {
-            Assert.Skip(ex.Message);
+            try
+            {
+                await slot.Sandbox.EnsureReadyAsync(options.WorkerAuth, options.ClaudePath, CancellationToken.None);
+            }
+            catch (InvalidOperationException ex) when (slot.Number == 1)
+            {
+                Assert.Skip(ex.Message);
+            }
+            catch (InvalidOperationException ex)
+            {
+                Assert.Fail($"Worker {slot} (Worker:Slots is {slots.Count}) is not ready: {ex.Message}");
+            }
         }
-        return sandbox;
+        return slots;
+    }
+
+    /// <summary>Runs <paramref name="probe"/> for every configured slot (<see cref="RequireSlotsAsync"/>); a failure names its slot.</summary>
+    private static async Task ForEachSlotAsync(Func<WorkerSlot, Task> probe)
+    {
+        foreach (var slot in await RequireSlotsAsync())
+        {
+            try
+            {
+                await probe(slot);
+            }
+            catch (Exception ex) when (ex is not Xunit.Sdk.SkipException)
+            {
+                throw new Xunit.Sdk.XunitException($"Worker {slot}: {ex.Message}", ex);
+            }
+        }
     }
 
     private static readonly string OwnerHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
@@ -1561,56 +1594,77 @@ public class LiveWorkerSandboxTests
     [InlineData("/bin/ls", ".ssh")]
     [InlineData("/bin/ls", ".config/gh")]
     [InlineData("/bin/cat", "Library/Keychains/login.keychain-db")]
-    public async Task Worker_is_denied_the_owners_home_ssh_keys_gh_config_and_login_keychain(string program, string relative)
-    {
-        var sandbox = await RequireSandboxAsync();
+    public async Task Worker_is_denied_the_owners_home_ssh_keys_gh_config_and_login_keychain(string program, string relative) =>
+        await ForEachSlotAsync(async slot =>
+        {
+            var (exitCode, _, stderr) = await slot.Sandbox.RunAsync("/", program, [Path.Combine(OwnerHome, relative)], CancellationToken.None);
 
-        var (exitCode, _, stderr) = await sandbox.RunAsync("/", program, [Path.Combine(OwnerHome, relative)], CancellationToken.None);
-
-        Assert.NotEqual(0, exitCode);
-        Assert.Contains("Permission denied", stderr);
-    }
+            Assert.NotEqual(0, exitCode);
+            Assert.Contains("Permission denied", stderr);
+        });
 
     /// <summary>
     /// AT6 (docs/acceptance.md): the installed helper, launched exactly as <see cref="ClaudeWorker"/> launches a sandboxed
     /// worker (<see cref="WorkerSandbox.Start"/> with <see cref="ClaudeWorker.BuildRouterVariables"/> for the configured
     /// router URL and <c>Worker:Auth</c>), gives the worker exactly the allowlisted environment, and nothing of the owner's.
-    /// The router key is a probe value: the real key never needs to appear in test output.
+    /// The router key is a probe value: the real key never needs to appear in test output. Every configured slot is probed, and
+    /// each slot's TMPDIR and HOME must be its own user's: a directory that user owns, the owner's and every other slot's apart
+    /// (sc-25992: in a shared temporary directory one sandbox user's NuGet locks refused another's restore).
     /// </summary>
     [Fact]
     public async Task Live_worker_environment_is_exactly_the_allowlist_for_the_configured_auth_mode()
     {
-        var sandbox = await RequireSandboxAsync();
         var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets());
         var auth = options.WorkerAuth;
         string[] expected = auth == WorkerAuth.RouterKey
             ? ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR"]
             : ["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR"];
         const string probeKey = "rk_live_env_probe";
+        var tempDirs = new List<string>();
+        var homes = new List<string>();
         Environment.SetEnvironmentVariable("GH_TOKEN", "ghp_owner_should_not_leak");
         try
         {
-            using var p = sandbox.Start("/", "/usr/bin/env", [], ClaudeWorker.BuildRouterVariables(options.RouterBaseUrl, probeKey, auth, WorkerModelClass.Mid));
-            var output = await p.StandardOutput.ReadToEndAsync();
-            await p.WaitForExitAsync();
-            WorkerSandbox.Stop(p);
-
-            Assert.Equal(0, p.ExitCode);
-            var env = SandboxSupport.ParseEnv(output);
-            Assert.Equal(expected, env.Keys.Order());
-            Assert.Equal(options.RouterBaseUrl.ToString().TrimEnd('/'), env["ANTHROPIC_BASE_URL"].TrimEnd('/'));
-            Assert.Equal($"{ClaudeWorker.RouterKeyHeader}: {probeKey}\n{WorkerModelClass.Header}: {WorkerModelClass.Mid}", env["ANTHROPIC_CUSTOM_HEADERS"]);
-            if (auth == WorkerAuth.RouterKey)
+            await ForEachSlotAsync(async slot =>
             {
-                Assert.Equal(probeKey, env["ANTHROPIC_AUTH_TOKEN"]);
-            }
-            Assert.DoesNotContain(OwnerHome, env["HOME"]);
-            Assert.StartsWith(env["HOME"] + "/.local/bin:", env["PATH"]);
-            Assert.DoesNotContain(OwnerHome, env["PATH"]);
-            Assert.Equal(("1", "0"), (env["MSBUILDDISABLENODEREUSE"], env["DOTNET_CLI_USE_MSBUILD_SERVER"]));
-            // The sandbox user's own temporary directory: neither the shared /tmp nor the owner's (sc-25992).
-            Assert.StartsWith("/var/folders/", env["TMPDIR"]);
-            Assert.NotEqual(SandboxSupport.UserTempDir(), env["TMPDIR"]);
+                var sandbox = slot.Sandbox;
+                using var p = sandbox.Start("/", "/usr/bin/env", [], ClaudeWorker.BuildRouterVariables(options.RouterBaseUrl, probeKey, auth, WorkerModelClass.Mid));
+                var output = await p.StandardOutput.ReadToEndAsync();
+                await p.WaitForExitAsync();
+                WorkerSandbox.Stop(p);
+
+                Assert.Equal(0, p.ExitCode);
+                var env = SandboxSupport.ParseEnv(output);
+                Assert.Equal(expected, env.Keys.Order());
+                Assert.Equal(options.RouterBaseUrl.ToString().TrimEnd('/'), env["ANTHROPIC_BASE_URL"].TrimEnd('/'));
+                Assert.Equal($"{ClaudeWorker.RouterKeyHeader}: {probeKey}\n{WorkerModelClass.Header}: {WorkerModelClass.Mid}", env["ANTHROPIC_CUSTOM_HEADERS"]);
+                if (auth == WorkerAuth.RouterKey)
+                {
+                    Assert.Equal(probeKey, env["ANTHROPIC_AUTH_TOKEN"]);
+                }
+                Assert.DoesNotContain(OwnerHome, env["HOME"]);
+                Assert.StartsWith(env["HOME"] + "/.local/bin:", env["PATH"]);
+                Assert.DoesNotContain(OwnerHome, env["PATH"]);
+                Assert.Equal(("1", "0"), (env["MSBUILDDISABLENODEREUSE"], env["DOTNET_CLI_USE_MSBUILD_SERVER"]));
+                // The sandbox user's own temporary directory: macOS's per-user one, never the shared /tmp nor the owner's.
+                Assert.StartsWith("/var/folders/", env["TMPDIR"]);
+                Assert.NotEqual(SandboxSupport.UserTempDir(), env["TMPDIR"]);
+
+                // ... and that user's: the directory's owner is the uid the worker runs as.
+                var (code, owned, stderr) = await sandbox.RunAsync("/", "/bin/sh",
+                    ["-c", "printf '%s\\n' \"$TMPDIR\"; /usr/bin/stat -f %u \"$TMPDIR\"; /usr/bin/id -u; /usr/bin/id -un"], CancellationToken.None);
+                Assert.True(code == 0, stderr);
+                var lines = owned.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                Assert.Equal(4, lines.Length);
+                Assert.Equal(env["TMPDIR"], lines[0]);
+                Assert.Equal(lines[2], lines[1]);
+                Assert.Equal(slot.User, lines[3]);
+                tempDirs.Add(env["TMPDIR"]);
+                homes.Add(env["HOME"]);
+            });
+            // No two slots share a temporary directory or a home.
+            Assert.Equal(tempDirs.Count, tempDirs.Distinct().Count());
+            Assert.Equal(homes.Count, homes.Distinct().Count());
         }
         finally
         {
@@ -1619,17 +1673,16 @@ public class LiveWorkerSandboxTests
     }
 
     [Fact]
-    public async Task Worker_cannot_read_the_owners_keychain_items()
-    {
-        var sandbox = await RequireSandboxAsync();
+    public async Task Worker_cannot_read_the_owners_keychain_items() =>
+        await ForEachSlotAsync(async slot =>
+        {
+            var (exitCode, stdout, _) = await slot.Sandbox.RunAsync("/", "/usr/bin/security",
+                ["find-generic-password", "-s", SecretAccounts.Service, "-w", Path.Combine(OwnerHome, "Library/Keychains/login.keychain-db")],
+                CancellationToken.None);
 
-        var (exitCode, stdout, _) = await sandbox.RunAsync("/", "/usr/bin/security",
-            ["find-generic-password", "-s", SecretAccounts.Service, "-w", Path.Combine(OwnerHome, "Library/Keychains/login.keychain-db")],
-            CancellationToken.None);
-
-        Assert.NotEqual(0, exitCode);
-        Assert.Empty(stdout.Trim());
-    }
+            Assert.NotEqual(0, exitCode);
+            Assert.Empty(stdout.Trim());
+        });
 
     /// <summary>
     /// AT6, <c>Worker:Auth=router-key</c> (E5): the worker user holds no Claude credential of its own — neither Claude
@@ -1639,35 +1692,38 @@ public class LiveWorkerSandboxTests
     [Fact]
     public async Task Worker_user_holds_no_claude_credential_in_router_key_mode()
     {
-        var sandbox = await RequireSandboxAsync();
         if (new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets()).WorkerAuth != WorkerAuth.RouterKey)
         {
             Assert.Skip("Worker:Auth=claude-login: the worker user is expected to hold its own Claude login.");
         }
+        await ForEachSlotAsync(async slot =>
+        {
+            var (exitCode, stdout, stderr) = await slot.Sandbox.RunAsync("/", "/bin/sh",
+                ["-c", """
+                    found=
+                    if test -e "$HOME/.claude/.credentials.json"; then found="$found $HOME/.claude/.credentials.json"; fi
+                    kc="$HOME/Library/Keychains/login.keychain-db"
+                    if test -e "$kc" && /usr/bin/security find-generic-password -s 'Claude Code-credentials' "$kc" >/dev/null 2>&1; then
+                        found="$found keychain:Claude Code-credentials"
+                    fi
+                    echo "found:$found"
+                    """],
+                CancellationToken.None);
 
-        var (exitCode, stdout, stderr) = await sandbox.RunAsync("/", "/bin/sh",
-            ["-c", """
-                found=
-                if test -e "$HOME/.claude/.credentials.json"; then found="$found $HOME/.claude/.credentials.json"; fi
-                kc="$HOME/Library/Keychains/login.keychain-db"
-                if test -e "$kc" && /usr/bin/security find-generic-password -s 'Claude Code-credentials' "$kc" >/dev/null 2>&1; then
-                    found="$found keychain:Claude Code-credentials"
-                fi
-                echo "found:$found"
-                """],
-            CancellationToken.None);
-
-        Assert.True(exitCode == 0, stderr);
-        Assert.Equal("found:", stdout.Trim());
+            Assert.True(exitCode == 0, stderr);
+            Assert.Equal("found:", stdout.Trim());
+        });
     }
 
     [Theory]
     [InlineData("success")]
     [InlineData("failure")]
     [InlineData("stop")]
-    public async Task Worktree_written_by_the_worker_is_gone_after_the_run_ends(string ending)
+    public async Task Worktree_written_by_the_worker_is_gone_after_the_run_ends(string ending) =>
+        await ForEachSlotAsync(slot => WorktreeIsGoneAsync(slot.Sandbox, ending));
+
+    private static async Task WorktreeIsGoneAsync(WorkerSandbox sandbox, string ending)
     {
-        var sandbox = await RequireSandboxAsync();
         var ct = CancellationToken.None;
         var workRoot = Path.Combine(FactoryOptions.DefaultSandboxWorkRoot, $"test-{Guid.NewGuid():N}");
         var remote = Path.Combine(workRoot, "remote.git");
@@ -1714,9 +1770,11 @@ public class LiveWorkerSandboxTests
     }
 
     [Fact]
-    public async Task A_setsid_grandchild_of_the_worker_is_dead_once_the_helper_exits()
+    public async Task A_setsid_grandchild_of_the_worker_is_dead_once_the_helper_exits() =>
+        await ForEachSlotAsync(slot => SetsidGrandchildIsDeadAsync(slot.Sandbox));
+
+    private static async Task SetsidGrandchildIsDeadAsync(WorkerSandbox sandbox)
     {
-        var sandbox = await RequireSandboxAsync();
         var ct = CancellationToken.None;
 
         using var p = sandbox.Start("/", "/usr/bin/perl",
