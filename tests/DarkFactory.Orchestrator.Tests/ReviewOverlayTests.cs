@@ -213,19 +213,28 @@ public class ReviewOverlayTests
     [Fact]
     public async Task A_status_read_that_times_out_in_the_http_client_is_read_again()
     {
+        // Fake time (every wait moves the clock on by itself, and nothing else does): the deadline is reached in polls, never while
+        // the project lookup or the request is still being answered, however loaded the machine is. On the wall clock (a 300 ms
+        // deadline) a starved thread pool could spend the whole wait before the first status read, which then never failed.
+        static SteppingClock Clock() => new(new DateTimeOffset(2026, 10, 8, 12, 0, 0, TimeSpan.Zero), TimeSpan.FromMinutes(1));
+        ReviewOverlays Waits(FakeMcpServer server) => new(Client(server), TimeSpan.FromMinutes(10), TimeSpan.FromMinutes(1));
+
         var reads = 0;
         var recovers = FakeMcpServer.CodeGraph(Listing, (tool, _) => tool == CodeGraphMcpClient.RequestOverlayTool
             ? FakeMcpServer.Overlay(41, "queued", Head, IndexCommit)
             : ++reads == 1 ? throw new TaskCanceledException("timeout") : FakeMcpServer.Overlay(41, "ready", Head, IndexCommit));
         Assert.Equal(new CodeGraphOverlay(CodeGraphOverlay.Ready, Head, 41, IndexCommit),
-            await Overlays(recovers).WaitAsync(Repo, Head, NoControls, TimeProvider.System, CancellationToken.None));
+            await Waits(recovers).WaitAsync(Repo, Head, NoControls, Clock(), CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(30)));
+        Assert.Equal(2, reads);
 
         var never = FakeMcpServer.CodeGraph(Listing, (tool, _) => tool == CodeGraphMcpClient.RequestOverlayTool
             ? FakeMcpServer.Overlay(41, "queued", Head, IndexCommit)
             : throw new TaskCanceledException("timeout"));
-        var overlay = await Overlays(never, TimeSpan.FromMilliseconds(300)).WaitAsync(Repo, Head, NoControls, TimeProvider.System, CancellationToken.None);
+        var overlay = await Waits(never).WaitAsync(Repo, Head, NoControls, Clock(), CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(30));
         Assert.Equal((CodeGraphOverlay.TimedOut, 41L), (overlay.Outcome, overlay.OverlayId));
         Assert.Contains("last status read failed", overlay.Reason);
+        // Read again after each failed read, until the timeout: more than once, and not past it.
+        Assert.InRange(never.Calls.Count(c => c.Tool == CodeGraphMcpClient.OverlayStatusTool), 2, 10);
     }
 
     [Fact]

@@ -22,6 +22,9 @@ internal sealed class TranscriptReplay(string[] lines, Func<bool> paused)
     /// <summary>Silence before the line with this index (the session streams nothing meanwhile).</summary>
     public Dictionary<int, TimeSpan> Silences { get; init; } = [];
 
+    /// <summary>Before the line with this index the session streams nothing until the task completes (a turn held open).</summary>
+    public Dictionary<int, Func<Task>> Holds { get; init; } = [];
+
     /// <summary>A worker that ignores the pause hook (e.g. a repo setting turned hooks off): it never stops on its own.</summary>
     public bool IgnoresPause { get; init; }
 
@@ -40,6 +43,10 @@ internal sealed class TranscriptReplay(string[] lines, Func<bool> paused)
             if (Silences.TryGetValue(i, out var silence))
             {
                 await Task.Delay(silence, ct);
+            }
+            if (Holds.TryGetValue(i, out var hold))
+            {
+                await hold().WaitAsync(ct);
             }
             await callbacks.OnLine!(line, ct);
             Streamed++;
@@ -116,9 +123,12 @@ public class StuckWorkerTests
         public TimeSpan PauseGrace { get; init; } = TimeSpan.FromSeconds(30);
         public StuckDetection? Stuck { get; init; }
 
+        /// <summary>When set, every control read the run makes is recorded here (what it answered), in order.</summary>
+        public System.Collections.Concurrent.ConcurrentQueue<ControlState>? Reads { get; init; }
+
         public Task<RunOutcome> Run(IWorker worker, CancellationToken ct = default) =>
             new RunPipeline(Stories, new WorkLedger(Db, TimeProvider.System), Locks, Workspaces, worker, Prs, Sandbox, TextWriter.Null,
-                    controls: Controls, pauseGrace: PauseGrace, controlPollInterval: TimeSpan.FromMilliseconds(10), stuck: Stuck)
+                    controls: Reads is null ? Controls : new RecordedControls(Controls, Reads), pauseGrace: PauseGrace, controlPollInterval: TimeSpan.FromMilliseconds(10), stuck: Stuck)
                 .RunAsync(77, ct);
 
         public async Task<List<LedgerEntry>> Rows() => await Db.LedgerEntries.AsNoTracking().OrderBy(e => e.Id).ToListAsync();
@@ -291,19 +301,26 @@ public class StuckWorkerTests
     [Fact]
     public async Task A_pause_and_continue_while_the_stuck_worker_is_still_mid_turn_do_not_withdraw_the_interrupt()
     {
-        var h = new Harness();
         ReplayWorker worker = null!;
         var lines = StuckFixtures.Loop;
-        // The model takes its time over the turn after the fifth repetition: a Pause and a Continue land meanwhile.
-        var looping = new TranscriptReplay(lines, () => worker.Paused) { Silences = { [StuckFixtures.ToolUseLines(lines)[6]] = TimeSpan.FromMilliseconds(600) } };
+        var reads = new System.Collections.Concurrent.ConcurrentQueue<ControlState>();
+        var h = new Harness { Reads = reads };
+        Task meddle = null!;
+        // The model takes its time over the turn after the fifth repetition: it is held open until a Pause and a Continue have
+        // landed AND the watch has acted on both (on a timer alone, a loaded machine could end the turn before either was seen).
+        var looping = new TranscriptReplay(lines, () => worker.Paused) { Holds = { [StuckFixtures.ToolUseLines(lines)[6]] = () => meddle } };
         worker = new ReplayWorker(looping, new TranscriptReplay(StuckFixtures.EditTestCycle, () => worker.Paused));
         var controls = h.Controls;
-        var meddle = Task.Run(async () =>
+        meddle = Task.Run(async () =>
         {
             await Until(() => worker.PauseRequests >= 1);                 // the stuck interrupt
             await controls.SetAsync(ControlScope.Item("sc-77"), ControlState.Paused, "tester", CancellationToken.None);
             await Until(() => worker.PauseRequests >= 2);                 // the Pause, seen by the watch
+            var mark = reads.Count;
             await controls.SetAsync(ControlScope.Item("sc-77"), ControlState.Running, "tester", CancellationToken.None);
+            // The Continue, seen by the watch: while the worker runs only the watch reads the controls, one read per loop, so a
+            // second read answering Running means it has finished acting on the first.
+            await Until(() => reads.Skip(mark).Count(r => r == ControlState.Running) >= 2);
         });
 
         var outcome = await h.Run(worker);
@@ -313,6 +330,26 @@ public class StuckWorkerTests
         Assert.Contains(RunPipeline.Steps.StuckRetry, await h.Steps());
         Assert.True(outcome.Succeeded, outcome.Error);
         Assert.Equal(WorkState.Review, outcome.State);
+    }
+
+    /// <summary>The run's controls, recording what each <see cref="IControls.EffectiveAsync"/> answered.</summary>
+    private sealed class RecordedControls(IControls inner, System.Collections.Concurrent.ConcurrentQueue<ControlState> reads) : IControls
+    {
+        public async Task<ControlState> EffectiveAsync(string externalId, long? epicId, CancellationToken ct)
+        {
+            var state = await inner.EffectiveAsync(externalId, epicId, ct);
+            reads.Enqueue(state);
+            return state;
+        }
+
+        public Task<IReadOnlyList<Control>> ListAsync(CancellationToken ct) => inner.ListAsync(ct);
+        public Task<Control?> UsagePauseAsync(CancellationToken ct) => inner.UsagePauseAsync(ct);
+        public Task<Control> PauseForUsageAsync(DateTimeOffset? resumeAt, string reason, CancellationToken ct) => inner.PauseForUsageAsync(resumeAt, reason, ct);
+        public Task<Control> FreezeAsync(string trigger, string detail, DateTimeOffset? readChangedAt, CancellationToken ct) =>
+            inner.FreezeAsync(trigger, detail, readChangedAt, ct);
+        public Task<Control?> GetAsync(string scope, CancellationToken ct) => inner.GetAsync(scope, ct);
+        public Task SetAsync(string scope, ControlState state, string by, CancellationToken ct) => inner.SetAsync(scope, state, by, ct);
+        public Task ClearAsync(string scope, CancellationToken ct) => inner.ClearAsync(scope, ct);
     }
 
     private static async Task Until(Func<bool> condition)
