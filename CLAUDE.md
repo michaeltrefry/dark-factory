@@ -84,7 +84,7 @@ Claude Code headless workers through the Weave router.
   Tests run `scripts/factory-worker-launch` only through `SafeHelper` (a checked copy whose every signal goes through a
   seam that signals only the test's own processes, and whose uid-sweep listing names only the helper's tree and the test's
   registered pids; `SafeHelper.Source` is private); `SafeHelperTests` fails if a test
-  reaches the real helper another way (a repo path, the installed path, `Worker:LaunchHelper`/`options.WorkerSandbox`).
+  reaches the real helper another way (a repo path, the installed path, `Worker:LaunchHelper`/`options.WorkerSandbox`/`options.WorkerSlots`, sc-25992).
   A test signals a process only through `OwnProcess` (pid + start time, recorded where the pid cannot have been reused;
   `KillIfStillRunning` signals only while the start time still matches); `OwnProcessTests` fails on any other kill in
   `tests/` (`Process.Kill`, a kill(2) import, a `kill`/`pkill`/`killall` in a script).
