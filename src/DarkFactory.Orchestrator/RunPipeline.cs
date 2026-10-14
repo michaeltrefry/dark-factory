@@ -87,35 +87,57 @@ public sealed partial class RunPipeline(
     int? maxControlReadFailures = null,
     Plans.IPlanRunner? planner = null,
     IReadOnlyList<RepoRef>? configuredRepos = null,
-    WorkerLock? workerLock = null,
+    Worker.WorkerSlots? slots = null,
     Func<CancellationToken, Task>? enterSandbox = null)
 {
     /// <summary>
-    /// The sandbox user's lock (sc-25988, E6; null unsandboxed: workers then run as the owner and share no user). A run holds it
-    /// only for its worker phases (<see cref="InWorkerPhaseAsync"/>) — a worker session with its worktree's set-up, push and
-    /// removal (implement, a review, CI or conflict fix round, a planner's seat), the gate's sandboxed test runs, the stop of a
-    /// worker a crashed run left — and waits on reviews, CI, CodeGraph and the merge queue without it, so other runs' workers run
-    /// meanwhile.
+    /// The worker slots (sc-25989, E6/E7; null unsandboxed: workers then run as the owner and share no user): one sandbox user
+    /// each, with its own lock (sc-25988). A run holds a slot only for its worker phases (<see cref="InWorkerPhaseAsync"/>) — a
+    /// worker session with its worktree's set-up, push and removal (implement, a review, CI or conflict fix round, a planner's
+    /// seat), the gate's sandboxed test runs, the stop of a worker a crashed run left — and waits on reviews, CI, CodeGraph and the
+    /// merge queue without one, so other runs' workers run meanwhile; with several slots, also during its worker phases.
     /// </summary>
-    private readonly WorkerLock? _workerLock = workerLock;
+    private readonly Worker.WorkerSlots? _slots = slots;
 
     /// <summary>Whether this run has done its sandbox set-up (<c>enterSandbox</c>): once, in its first worker phase.</summary>
     private bool _sandboxEntered;
 
+    /// <summary>The slot this run has read or recorded for an item (by item id), so a later phase of the run reads no history for it.</summary>
+    private readonly Dictionary<long, int> _slotOf = [];
+
     /// <summary>
-    /// Runs <paramref name="phase"/> as a worker phase: holding the sandbox user's lock, waited for (never failed on) while another
-    /// run — of this process or another, e.g. a <c>factory run</c> beside <c>factory work</c> — has it. While the run waits it
+    /// The slot the ledger has for an item with <paramref name="history"/> (sc-25989, E7), or null when it has had no worker
+    /// phase: its last <see cref="Steps.Slot"/> row; or slot 1 for an item with a <see cref="Steps.WorkerStarted"/> row and no
+    /// slot row — a worker ran for it before the factory had slots, or while it had one (a one-slot factory records none), and
+    /// that worker was the first sandbox user's.
+    /// </summary>
+    internal static int? SlotOf(IReadOnlyList<LedgerEntry> history) =>
+        history.LastOrDefault(e => e.Step == Steps.Slot)?.Detail?.Split(' ')[0] is { } text && int.TryParse(text, out var slot) && slot >= 1
+            ? slot
+            : history.Any(e => e.Step == Steps.WorkerStarted) ? 1 : null;
+
+    /// <summary>
+    /// Runs <paramref name="phase"/> as a worker phase: holding a worker slot's lock, waited for (never failed on) while another
+    /// run — of this process or another, e.g. a <c>factory run</c> beside <c>factory work</c> — has it. Which slot (sc-25989, E7):
+    /// the one the ledger recorded for the item (<see cref="SlotOf"/>; <paramref name="slotOf"/> names the item when
+    /// <paramref name="item"/> is null) — only that one, however long it is busy, since the item's session lives in that sandbox
+    /// user's home, its worktrees are shared with that user, and a worker a crashed run left is that user's process; an item
+    /// with none yet takes the first free slot, the one with the fewest unfinished items first, and that slot is recorded
+    /// (<see cref="Steps.Slot"/>) under its lock before anything is created in it. A recorded slot that is no longer configured
+    /// (<c>Worker:Slots</c> lowered) is the item's failure, saying so. A one-slot factory records nothing: every item is slot 1's.
+    /// While the run waits it
     /// reads <paramref name="item"/>'s controls every control poll (null: a stop, which no control holds up): a Pause — the usage
     /// pause and the freeze's row included — or a Stop ends the wait as it ends a step, and controls that cannot be read more than
     /// <c>Controls:MaxReadFailures</c> times in a row count as a Pause (E2). After a wait the controls and the freeze evaluator are
     /// asked once more before the phase starts. The run's first worker phase starts with the sandbox set-up every run shares
-    /// (<c>enterSandbox</c>: the readiness probe and the sweep of leftover worktrees, both through the launch helper and so under
-    /// the lock; a failure there is the factory's, <see cref="FactoryUnavailableException"/>). A phase inside a phase runs at once.
+    /// (<c>enterSandbox</c>: the readiness probe of the held slot and the sweep of leftover worktrees, both through the launch
+    /// helper and so under the lock; a failure there is the factory's, <see cref="FactoryUnavailableException"/>). A phase inside
+    /// a phase runs at once, in the same slot.
     /// The wait is logged when it starts and again every <see cref="WorkerLock.ReportEvery"/> (with why the lock could not be
     /// had), and a lock file that cannot be opened at all is the factory's failure too (<see cref="WorkerLock.HoldAsync{T}"/>:
     /// the item, already claimed, is left where it is, E10).
     /// </summary>
-    private async Task<T> InWorkerPhaseAsync<T>(WorkItem? item, string what, Func<Task<T>> phase, CancellationToken ct)
+    private async Task<T> InWorkerPhaseAsync<T>(WorkItem? item, string what, Func<Task<T>> phase, CancellationToken ct, WorkItem? slotOf = null)
     {
         async Task<T> EnteredAsync()
         {
@@ -126,26 +148,54 @@ public sealed partial class RunPipeline(
             _sandboxEntered = true;
             return await phase();
         }
-        if (_workerLock is null || _workerLock.IsHeld)
+        if (_slots is null)
         {
             return await EnteredAsync();
         }
+        var owner = item ?? slotOf;
+        var recorded = owner is null ? null : await RecordedSlotAsync(owner, ct);
+        async Task<T> InSlotAsync(Worker.WorkerSlot slot)
+        {
+            if (owner is not null && recorded is null)
+            {
+                // Under the slot's lock, before the set-up or the phase makes anything in it: the record is what resumes it there.
+                await RecordSlotAsync(owner, slot, ct);
+            }
+            return await EnteredAsync();
+        }
+        if (_slots.Held is { } held)
+        {
+            return recorded is { } other && other != held.Number
+                ? throw new InvalidOperationException(
+                    $"Refusing to {what} in worker {held}: {owner!.ExternalId} is worker slot {other}'s, and a phase is one sandbox user's.")
+                : await InSlotAsync(held);
+        }
+        // An item with no slot yet goes where the fewest unfinished items are, so the slots fill evenly rather than in number order.
+        var order = recorded is null && _slots.Count > 1 ? await ledger.SlotsByLoadAsync(_slots.Count, ct) : null;
+        var waitsFor = recorded is { } own && _slots.Count > 1
+            ? $"worker {_slots.Slot(own)} (another run's worker phase holds {_slots.Slot(own).Lock?.Path})"
+            : _slots.Count > 1 ? $"a free worker slot (other runs' worker phases hold all {_slots.Count})"
+            : $"the sandbox user (another run's worker phase holds {_slots.All[0].Lock?.Path})";
         var (waited, unreadable) = (false, 0);
-        return await _workerLock.HoldAsync(async () =>
+        return await _slots.HoldAsync(recorded, async slot =>
         {
             if (waited && item is not null)
             {
-                log.WriteLine($"[lock] {item.ExternalId}: the sandbox user is free; going on to {what}");
+                log.WriteLine(_slots.Count > 1
+                    ? $"[lock] {item.ExternalId}: worker {slot} is free; going on to {what}"
+                    : $"[lock] {item.ExternalId}: the sandbox user is free; going on to {what}");
                 await ThrowIfControlledAsync(item, ct);
                 await ThrowIfFrozenAsync(item, ct);
             }
-            return await EnteredAsync();
+            return await InSlotAsync(slot);
         }, ct, async c =>
         {
             if (!waited)
             {
                 waited = true;
-                log.WriteLine($"[lock] {item?.ExternalId ?? "a stop"}: waiting for the sandbox user to {what} (another run's worker phase holds {_workerLock.Path})");
+                log.WriteLine(_slots.Count > 1
+                    ? $"[lock] {item?.ExternalId ?? "a stop"}: waiting for {waitsFor} to {what}"
+                    : $"[lock] {item?.ExternalId ?? "a stop"}: waiting for the sandbox user to {what} (another run's worker phase holds {_slots.All[0].Lock?.Path})");
             }
             if (item is null)
             {
@@ -163,11 +213,65 @@ public sealed partial class RunPipeline(
                     throw new ControlRequestedException(ControlState.Paused) { ControlsUnreadable = $"{ex.GetType().Name}: {ex.Message}" };
                 }
             }
-        }, _controlPoll, report: log.WriteLine);
+        }, _controlPoll, report: log.WriteLine, order: order);
+    }
+
+    /// <summary>
+    /// The slot the ledger has for <paramref name="item"/> (<see cref="SlotOf"/>; read once per run), or null when it has none.
+    /// </summary>
+    /// <exception cref="Worker.SlotUnavailableException">It is not one of the configured slots (<c>Worker:Slots</c> was lowered).</exception>
+    private async Task<int?> RecordedSlotAsync(WorkItem item, CancellationToken ct)
+    {
+        if (!_slotOf.TryGetValue(item.Id, out var slot))
+        {
+            if (SlotOf(await ledger.HistoryAsync(item, ct)) is not { } recorded)
+            {
+                return null;
+            }
+            _slotOf[item.Id] = slot = recorded;
+        }
+        return slot <= _slots!.Count
+            ? slot
+            : throw new Worker.SlotUnavailableException(
+                $"{item.ExternalId} was started in worker slot {slot} ({Worker.WorkerSlots.UserOf(_slots.All[0].User, slot)}), but Worker:Slots is "
+                + $"{_slots.Count}: its session and worktree are that sandbox user's, and nothing of it is run as another. Set Worker:Slots to at "
+                + $"least {slot} again and re-run it, or stop it.");
+    }
+
+    /// <summary>Records <paramref name="slot"/> as <paramref name="item"/>'s (<see cref="Steps.Slot"/>); a one-slot factory writes no row.</summary>
+    private async Task RecordSlotAsync(WorkItem item, Worker.WorkerSlot slot, CancellationToken ct)
+    {
+        if (_slots!.Count > 1)
+        {
+            await ledger.CheckpointAsync(item, Steps.Slot, null, $"{slot.Number} {slot.User}", ct);
+            log.WriteLine($"[slot] {item.ExternalId}: worker {slot}");
+        }
+        _slotOf[item.Id] = slot.Number;
+    }
+
+    /// <summary>
+    /// Runs <paramref name="work"/> — owner-side work that makes a worktree of <paramref name="item"/> and runs no launch helper,
+    /// so no worker phase (the merge queue's base update) — with the worktree shared with the item's slot's user
+    /// (<see cref="Worker.WorkerSlots.AssignedAsync{T}"/>): its recorded slot, or for an item that has none yet (a plan item that
+    /// never needed a planner in this factory) the one with the fewest unfinished items, recorded now. Nothing is waited for: the
+    /// share is the owner's own <c>chmod</c>. With one slot, or inside a worker phase, <paramref name="work"/> just runs.
+    /// </summary>
+    private async Task<T> InItemSlotAsync<T>(WorkItem item, Func<Task<T>> work, CancellationToken ct)
+    {
+        if (_slots is null || _slots.Count == 1 || _slots.Held is not null)
+        {
+            return await work();
+        }
+        if (await RecordedSlotAsync(item, ct) is not { } slot)
+        {
+            slot = (await ledger.SlotsByLoadAsync(_slots.Count, ct))[0];
+            await RecordSlotAsync(item, _slots.Slot(slot), ct);
+        }
+        return await _slots.AssignedAsync(slot, work);
     }
 
     private Task InWorkerPhaseAsync(WorkItem? item, string what, Func<Task> phase, CancellationToken ct) =>
-        InWorkerPhaseAsync(item, what, async () => { await phase(); return true; }, ct);
+        InWorkerPhaseAsync(item, what, async () => { await phase(); return true; }, ct, null);
 
     /// <summary>
     /// The factory's configured repositories (<c>FactoryOptions.ConfiguredRepos</c>; the default repository alone when not given): the
@@ -223,6 +327,13 @@ public sealed partial class RunPipeline(
     {
         /// <summary>The worker process exists; Detail is its pid.</summary>
         public const string WorkerStarted = "worker-started";
+        /// <summary>
+        /// The worker slot the item is in (sc-25989, E7), written under that slot's lock at the item's first worker phase, before
+        /// its first worktree or session exists; Detail is the slot's number, then its sandbox user (<c>2 _factory2</c>). Every
+        /// later worker phase of the item — a resume, a fix round, the gate's test runs, the stop of a leftover worker — waits
+        /// for that slot (<see cref="SlotOf"/>). A one-slot factory writes none.
+        /// </summary>
+        public const string Slot = "slot";
         public const string Session = "session";
         public const string WorkerDone = "worker-done";
         public const string Pushed = "pushed";
@@ -1553,12 +1664,13 @@ public sealed partial class RunPipeline(
     {
         try
         {
-            if (_workerLock is null)
+            if (_slots is null)
             {
                 await workspaces.RemoveAsync(repo, workspace, CancellationToken.None);
                 return true;
             }
-            if (await _workerLock.TryHoldAsync(() => workspaces.RemoveAsync(repo, workspace, CancellationToken.None)))
+            // The slot whose user the worktree was shared with (sc-25989): the item's own, which a worker phase holds already.
+            if (await _slots.TryHoldForAsync(workspace.Path, _ => workspaces.RemoveAsync(repo, workspace, CancellationToken.None), CancellationToken.None))
             {
                 return true;
             }
@@ -1690,7 +1802,7 @@ public sealed partial class RunPipeline(
             // Sandboxed, the stop of a leftover worker is a run of the launch helper (it kills every process of the sandbox user):
             // a worker phase, waited for, so it never lands under another run's worker.
             if (OrphanedWorkerPid(attempt) is { } pid
-                && await InWorkerPhaseAsync(null, $"stop {item.ExternalId}'s leftover worker", () => worker.StopOrphanAsync(pid, ct), ct))
+                && await InWorkerPhaseAsync(null, $"stop {item.ExternalId}'s leftover worker", () => worker.StopOrphanAsync(pid, ct), ct, slotOf: item))
             {
                 await ledger.CheckpointAsync(item, Steps.OrphanKilled, null, $"pid {pid}", ct);
             }

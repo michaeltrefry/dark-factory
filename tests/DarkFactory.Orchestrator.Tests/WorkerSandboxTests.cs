@@ -498,6 +498,106 @@ public class WorkerSandboxTests
         Assert.Empty(helper.Refusals);
     }
 
+    // ---- Worker slots (sc-25989): several sandbox users, one helper copy each, pinned to its own user and uid ----
+
+    /// <summary>
+    /// A machine with two sandbox users, each with a leftover process: 400001 is slot 1's (uid 450), 400002 slot 2's (uid 451).
+    /// Synthetic pids, above macOS's pid limit: the seam can only log them.
+    /// </summary>
+    private static string TwoUsersTable => SafeHelper.ListingByUid(Machinery,
+        new Dictionary<string, string[]> { [FakeIdentity.SlotUid(1)] = ["400001 1"], [FakeIdentity.SlotUid(2)] = ["400002 1"] });
+
+    [Theory]
+    [InlineData(1, 400001)]
+    [InlineData(2, 400002)]
+    public async Task Each_slots_helper_sweeps_only_its_own_users_processes_and_leaves_the_other_slots_alone(int slot, int own)
+    {
+        var helper = HelperWithFakeListing(TwoUsersTable, identity: FakeIdentity.Slot(slot));
+
+        var (exitCode, stderr, passes, targets) = await RunFakeListingHelperAsync(helper);
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal("", stderr);
+        Assert.Equal([own], targets); // the other slot's process is never a target
+        Assert.Equal(2, passes);
+        Assert.Empty(helper.Refusals);
+    }
+
+    [Fact]
+    public async Task A_slots_helper_started_as_another_slots_user_sweeps_nothing()
+    {
+        // Slot 2's helper (pinned to _dftest2, uid 451) run as slot 1's user: the sudoers rules forbid it (each helper only as its
+        // own user); were it to happen, the name check fails and no process of either user is listed or signalled.
+        var slot1 = FakeIdentity.Slot(1);
+        var helper = SafeHelper.Create(_dir, new SafeHelperOptions
+        {
+            Identity = slot1,
+            FakeListing = TwoUsersTable,
+            Mutate = copy => copy
+                .Replace($"\nsandbox_user={slot1.User}\n", $"\nsandbox_user={FakeIdentity.SlotUser(2)}\n")
+                .Replace($"\nsandbox_uid={slot1.PinnedUid}\n", $"\nsandbox_uid={FakeIdentity.SlotUid(2)}\n"),
+        });
+
+        var (exitCode, stderr, passes, targets) = await RunFakeListingHelperAsync(helper);
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal("", stderr);
+        Assert.Equal(0, passes); // the process table was never read
+        Assert.Empty(targets);
+    }
+
+    [Fact]
+    public async Task A_slots_helper_pinned_to_another_slots_uid_refuses_its_sweep()
+    {
+        // Slot 2's user running a copy that setup pinned to slot 1's uid (a helper installed over the wrong path).
+        var identity = FakeIdentity.Slot(2) with { PinnedUid = FakeIdentity.SlotUid(1) };
+
+        var (exitCode, stderr, passes, targets) = await RunFakeListingHelperAsync(HelperWithFakeListing(TwoUsersTable, identity: identity));
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("refusing the _dftest2 uid sweep: _dftest2's uid 451 is not the pinned 450", stderr);
+        Assert.Equal(0, passes);
+        Assert.Empty(targets);
+    }
+
+    [Fact]
+    public void The_helper_is_version_4_and_an_installed_version_3_is_stale()
+    {
+        Assert.Equal(4, WorkerSandbox.HelperVersion);
+        Assert.True(SafeHelper.SourceContains($"\nhelper_version={WorkerSandbox.HelperVersion}\n"));
+        const string repo = "#!/bin/bash\nsandbox_user=_factory\nsandbox_uid=\nhelper_version=4\n";
+        var installedV3 = repo.Replace("sandbox_uid=", "sandbox_uid=450").Replace("helper_version=4", "helper_version=3");
+        Assert.Equal("its helper_version 3 is older than 4", WorkerSandbox.StaleHelperReason(installedV3, "_factory", repo));
+        Assert.Null(WorkerSandbox.StaleHelperReason(repo.Replace("sandbox_uid=", "sandbox_uid=450"), "_factory", repo));
+        // A slot's copy is the same text pinned to its own user: current for that user, and for no other.
+        var second = repo.Replace("sandbox_user=_factory", "sandbox_user=_factory2").Replace("sandbox_uid=", "sandbox_uid=451");
+        Assert.Null(WorkerSandbox.StaleHelperReason(second, "_factory2", repo));
+        Assert.Equal("its sandbox_user is not _factory", WorkerSandbox.StaleHelperReason(second, "_factory", repo));
+    }
+
+    [Fact]
+    public void The_watcher_is_killed_and_reaped_in_one_redirected_group()
+    {
+        // sc-25877's flake: bash 3.2 also reports a signal-killed job when it reads the next script line, so a watcher that died
+        // between a kill on one line and a redirected wait on the next put "Terminated: 15" on the helper's real stderr.
+        Assert.True(SafeHelper.SourceContains("\n{ send_signal \"$watcher\" || true; wait \"$watcher\" || true; } 2>/dev/null\n"));
+        Assert.False(SafeHelper.SourceContains("\nsend_signal \"$watcher\""));
+        Assert.False(SafeHelper.SourceContains("\nwait \"$watcher\""));
+    }
+
+    [Fact]
+    public async Task The_helpers_stderr_stays_empty_run_after_run()
+    {
+        // The stray "Terminated: 15" line showed about once in a hundred runs; none here in 200, each a whole helper run and sweep.
+        var helper = HelperWithFakeListing(Machinery);
+        for (var run = 1; run <= 200; run++)
+        {
+            var (exitCode, stderr, _, targets) = await RunFakeListingHelperAsync(helper);
+
+            Assert.True(exitCode == 0 && stderr == "" && targets.Length == 0, $"run {run}: exit {exitCode}, stderr '{stderr}'");
+        }
+    }
+
     [Fact]
     public async Task Uid_sweep_runs_as_the_sandbox_role_account_invoked_through_sudo_by_the_owner()
     {

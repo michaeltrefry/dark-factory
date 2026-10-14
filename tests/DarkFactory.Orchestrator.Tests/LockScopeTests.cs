@@ -132,7 +132,7 @@ public class LockScopeTests
                 ? new GateStage(probed.Wrap<IGateGitHub>(h.GitHub), probed.Wrap(h.Panel ?? h.Reviewer), TimeSpan.FromMilliseconds(1), h.CiTimeout, null,
                     probed.Wrap<IGateTestRunner>(h.TestRunner), null, FakeCodeGraphRisk.Reader(h.CodeGraph))
                 : null,
-            maxControlReadFailures: 2, workerLock: workerLock, enterSandbox: enterSandbox);
+            maxControlReadFailures: 2, slots: TestSlots.Of(workerLock), enterSandbox: enterSandbox);
 
     private static async Task Eventually(Func<bool> condition, string what)
     {
@@ -499,10 +499,13 @@ public class LockScopeTests
     private static readonly string QueuedId = StoryId.Format(Queued);
 
     private static RunPipeline QueuePipeline(MergeQueueTests.Harness h, Probed probed, WorkerLock workerLock) =>
+        QueuePipeline(h, probed, TestSlots.Of(workerLock)!);
+
+    private static RunPipeline QueuePipeline(MergeQueueTests.Harness h, Probed probed, WorkerSlots slots) =>
         new(h.Stories, new WorkLedger(h.Db(), TimeProvider.System), h.Locks, probed.Wrap<IRepoWorkspace>(h.Repo), probed.Wrap<IWorker>(h.Worker), h.Repo, Sandbox,
             probed.Log, controls: h.Controls, controlPollInterval: Poll,
             gate: new GateStage(probed.Wrap<IGateGitHub>(h.Repo), probed.Wrap<IReviewer>(h.Reviewer), h.CiPoll, TimeSpan.FromSeconds(30), Risk: FakeCodeGraphRisk.Reader()),
-            maxControlReadFailures: 2, workerLock: workerLock);
+            maxControlReadFailures: 2, slots: slots);
 
     /// <summary>
     /// Every <c>RestoreAsync</c> of a run, in order: whether the lock was held, and whether something was where the worktree goes
@@ -549,6 +552,39 @@ public class LockScopeTests
         AssertEverySandboxCallButRestoreHeld(probed);
         Assert.All(probed.Of(WaitingCalls), c => Assert.False(c.Held, $"{c.Call} held the sandbox user's lock"));
         Assert.False(probed.Logged("[lock]")); // never waited
+    }
+
+    [Fact]
+    public async Task With_several_slots_a_base_updates_fresh_worktree_is_the_items_slots_users_though_the_run_holds_no_slot_for_it()
+    {
+        // sc-25989: the item's first worker phase finds slot 1 busy and takes slot 2. Its base update later makes a fresh worktree
+        // outside any worker phase (no helper runs): that worktree is still shared with slot 2's user, the item's, and no other's.
+        var root = Directory.CreateTempSubdirectory("df-lock-scope-").FullName;
+        var slots = TestSlots.Pool(root, 2);
+        var h = new MergeQueueTests.Harness();
+        var probed = new Probed(slots.All[1].Lock);
+        var restoredAs = new ConcurrentQueue<(string User, int? Held)>();
+        IDisposable? busy = WorkerLock.Acquire(root, 1);
+        probed.OnCall = (call, _) =>
+        {
+            if (call == "IRepoWorkspace.RestoreAsync")
+            {
+                restoredAs.Enqueue((slots.Current.User, slots.Held?.Number));
+            }
+            else if (call == "IRepoWorkspace.RemoveAsync")
+            {
+                Interlocked.Exchange(ref busy, null)?.Dispose(); // slot 1 is free from the implementer's end on: it is still not used
+            }
+        };
+        h.Repo.OnOpen = _ => h.Repo.AdvanceMain("m1");
+
+        var outcome = await QueuePipeline(h, probed, slots).RunAsync(Queued, CancellationToken.None);
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Single(await h.Steps(Queued, RunPipeline.Steps.BaseUpdate));
+        Assert.Equal([("_dftest2", (int?)null)], restoredAs);
+        Assert.Equal(["2 _dftest2"], await h.Steps(Queued, RunPipeline.Steps.Slot));
+        Assert.All(probed.Of("IWorker.RunAsync", "IGateTestRunner.RunAsync"), c => Assert.True(c.Held, $"{c.Call} ran outside slot 2"));
     }
 
     /// <summary>
@@ -704,8 +740,9 @@ public class LockScopeTests
 
     /// <summary>
     /// The one way production code runs the launch helper is <see cref="WorkerSandbox.Start"/>, which refuses without the lock
-    /// — provided the sandbox has one. So: production builds a sandbox in one place only, with the work root's lock, and nothing
-    /// but the sandbox, the worker and the gate's test runner starts a process through it.
+    /// — provided the sandbox has one. So: production builds a sandbox in one place only — the slot pool (sc-25989), each slot's
+    /// with its own lock in the work root — and nothing but the sandbox, the worker and the gate's test runner starts a process
+    /// through it.
     /// </summary>
     [Fact]
     public void Production_builds_the_sandbox_in_one_place_with_its_lock_and_starts_the_helper_only_through_it()
@@ -719,16 +756,22 @@ public class LockScopeTests
             .SelectMany(f => f.Value.Where(l => System.Text.RegularExpressions.Regex.IsMatch(l, pattern) && !l.TrimStart().StartsWith("//")).Select(l => $"{f.Key}: {l.Trim()}"));
 
         var built = Assert.Single(Lines(@"new (Worker\.)?WorkerSandbox\("));
-        Assert.StartsWith("FactoryOptions.cs: ", built);
-        Assert.EndsWith("{ Lock = WorkerLock.For(WorkRoot) }", built);
+        Assert.StartsWith("Worker" + separator + "WorkerSlots.cs: ", built);
+        Assert.Contains("{ Lock = WorkerLock.For(workRoot, n), ", built);
+        // And the configured pool is made in one place, from the settings.
+        Assert.StartsWith("FactoryOptions.cs: ", Assert.Single(Lines(@"WorkerSlots\.Create\(")));
+        Assert.DoesNotContain(Lines(@"WorkerSlots\.Single\("), l => !l.StartsWith("FactoryRunner.cs: var slots = testSandbox is null", StringComparison.Ordinal));
         Assert.Equal(["Gate/SandboxTestRunner.cs", "Worker/ClaudeWorker.cs"],
-            Lines(@"\bsandbox\.Start\(").Select(l => l.Split(": ")[0].Replace(separator, '/')).Order());
+            Lines(@"\bSandbox\.Start\(").Select(l => l.Split(": ")[0].Replace(separator, '/')).Order());
         // Whoever starts a helper process ends it with EndAsync: waited for, and the lock kept for it while it is alive.
         Assert.Equal(["Gate/SandboxTestRunner.cs", "Worker/ClaudeWorker.cs"],
-            Lines(@"\bsandbox\.EndAsync\(").Select(l => l.Split(": ")[0].Replace(separator, '/')).Order());
+            Lines(@"\bSandbox\.EndAsync\(").Select(l => l.Split(": ")[0].Replace(separator, '/')).Order());
+        // In both, the sandbox is the slot the calling flow holds: never one chosen another way.
+        Assert.Equal(["Gate/SandboxTestRunner.cs", "Worker/ClaudeWorker.cs"],
+            Lines(@"private WorkerSandbox\? Sandbox => slots\?\.Current;").Select(l => l.Split(": ")[0].Replace(separator, '/')).Order());
         Assert.StartsWith("Worker" + separator + "WorkerSandbox.cs: ", Assert.Single(Lines(@"await EndAsync\(process\)")));
         // `factory run` and `factory work` both check the installed helper at start-up (read, not run), before anything is claimed.
-        Assert.Equal(2, Lines(@"FactoryRunner\.CheckHelperAsync\(options\.Worker" + "Sandbox").Count(l => l.StartsWith("Program.cs: ", StringComparison.Ordinal)));
+        Assert.Equal(2, Lines(@"FactoryRunner\.CheckHelperAsync\(options\.WorkerSlots").Count(l => l.StartsWith("Program.cs: ", StringComparison.Ordinal)));
         // Whoever else names the launch helper only compares or reports it; sudo is started in one method.
         Assert.Equal(["Worker/WorkerSandbox.cs"], Lines(@"new ProcessStartInfo\(SudoPath\)").Select(l => l.Split(": ")[0].Replace(separator, '/')));
         // And the lock the sandbox requires there is real: nothing starts without it.

@@ -74,8 +74,9 @@ Claude Code headless workers through the Weave router.
   (internal, per async flow, set only by `Disable`, which no production code calls and which reads no config/env/CLI — a test
   checks both: no runtime bypass, E2), fails an assertion while passing with every check on (an empty or unrelated tagged test is
   reported).
-- `scripts/` — `setup-worker-user.sh` (one-time root setup of the `_factory` sandbox user) and
-  `factory-worker-launch` (the root-installed helper every sandboxed worker runs through).
+- `scripts/` — `setup-worker-user.sh` (one-time root setup of the sandbox users: `_factory`, and with `--slots n` also
+  `_factory2` … `_factoryn`, one per worker slot, sc-25989) and `factory-worker-launch` (the helper every sandboxed worker runs
+  through, installed root-owned once per sandbox user, each copy pinned to its own user and uid).
 - `tests/DarkFactory.Orchestrator.Tests` — unit tests (no network; fake HTTP APIs, InMemory EF, local git).
   Tests run `scripts/factory-worker-launch` only through `SafeHelper` (a checked copy whose every signal goes through a
   seam that signals only the test's own processes, and whose uid-sweep listing names only the helper's tree and the test's
@@ -84,12 +85,11 @@ Claude Code headless workers through the Weave router.
   A test signals a process only through `OwnProcess` (pid + start time, recorded where the pid cannot have been reused;
   `KillIfStillRunning` signals only while the start time still matches); `OwnProcessTests` fails on any other kill in
   `tests/` (`Process.Kill`, a kill(2) import, a `kill`/`pkill`/`killall` in a script).
-  Known flake, cause in the helper itself (sc-25877; about 1 in 100 runs of `WorkerSandboxTests`, any test asserting the helper's
-  stderr is empty, seen on `Uid_sweep_ignores_its_own_machinery_and_settles_at_once`): the helper ends its watcher with
-  `send_signal "$watcher"` and reaps it on the next line with `wait "$watcher" 2>/dev/null`; bash 3.2 also reports a signal-killed
-  job when it reads the next script line, so a watcher reaped between the two lines puts `… Terminated: 15 ( while … )` on the
-  helper's real stderr. The fix is one redirected group in `scripts/factory-worker-launch` (`{ send_signal "$watcher" || true;
-  wait "$watcher" || true; } 2>/dev/null`) and needs the owner's re-install; do not loosen the tests' assertion instead.
+  The stray `… Terminated: 15 ( while … )` line on the helper's stderr (sc-25877's flake: about 1 in 100 runs of any test
+  asserting that stderr is empty) is fixed in the helper itself (sc-25989, `helper_version` 4): bash 3.2 also reports a
+  signal-killed job when it reads the next script line, so the watcher is now killed and reaped in one redirected group
+  (`{ send_signal "$watcher" || true; wait "$watcher" || true; } 2>/dev/null`; `WorkerSandboxTests` asserts that text and runs
+  the helper 200 times with an empty stderr). Never loosen those tests' assertion.
   `CrashResumeTests` also needs the compose Postgres (skips locally without it, fails under `CI`): it
   SIGKILLs `tests/DarkFactory.CrashHost` (the real pipeline with a fake `claude` script) and restarts it.
   `ShortcutContractTests` replay recorded Shortcut API fixtures (`Fixtures/shortcut`, strict request matching);
@@ -139,6 +139,11 @@ Claude Code headless workers through the Weave router.
   from the plan item's GUID, with the board's own dependencies — released in order (`Ready` only after its blockers' Merge rows),
   each worked and merged by the gate into `factory/changeset-kb-<n>`, the changeset then merged by one gated pull request, the
   plan item `Done` with a closeout equal to `LedgerReport`'s rendering of the throwaway ledger's rows.
+  P4b-AT5 and P4b-AT6 (sc-25989, `SlotAcceptanceTests`; a machine set up with `--slots 2` and `Worker__Slots=2`): two items of
+  one `factory work` in a worker session at the same time, each in its own slot (overlapping `worker_sessions` rows), both merged
+  (`FACTORY_E2E_P4B_SLOT_STORIES` + the watch scope); and two `factory run` children in different slots, the first SIGKILLed
+  (its own pid only) during Implement and started again — the same session in the same slot, the other item's session,
+  worktree and worker untouched (`FACTORY_E2E_P4B_AFFINITY_STORIES`).
   P4b-AT3 (sc-25983, `KanbanAcceptanceTests.P4b_AT3_…`, `FACTORY_E2E_P4B_KANBAN_PROJECT` + `FACTORY_E2E_P4B_KANBAN_OTHER_TOKEN`,
   a second identity's full-scope token; no model): on a throwaway Backlog item the test creates (once, by its idempotency key),
   in flight only in the throwaway ledger — a second caller's claim on the item the factory holds is refused; one intake poll
@@ -165,6 +170,8 @@ dotnet run --project src/DarkFactory.Orchestrator -- continue --freeze        # 
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup --gate   # the merge gate's own App (then re-run protect)
 dotnet run --project src/DarkFactory.Orchestrator -- github-repo protect owner/name   # rulesets; owner's GH_TOKEN / `gh auth token`
+sudo scripts/setup-worker-user.sh             # the owner, once and after any change to scripts/factory-worker-launch: the sandbox user and its helper
+sudo scripts/setup-worker-user.sh --slots 2   # the same for 2 worker slots (_factory, _factory2), then Worker__Slots=2
 ```
 
 ## Configuration
@@ -198,7 +205,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `GitHub:Watch:Repos` | empty = triage no issues; comma-separated `owner/name` whose issues `factory work` polls and triages (the workers' App needs Issues read/write there; refused with `Worker:RunAs=none`). It is the issue-triage watch list, not the list of repositories the factory may work in: a repository named here is also a configured repository, but to let the factory plan and work in a repository WITHOUT triaging its issues name it in `Factory:Repos` |
 | `Intake:PollSeconds` | `60` (> 0) |
 | `Intake:MaxItemFailures` | `3` (runs of one item failing in a row before `factory work` escalates/parks it, E10) |
-| `Intake:MaxConcurrentRuns` | `1` (a whole number 1–8, `IntakeOptions.MaxConcurrentRunsLimit`: how many items `factory work` runs at once; 1 runs them one after another. Runs overlap only outside the worker phases — the sandbox user's lock, "Worker phases" below; sc-25988) |
+| `Intake:MaxConcurrentRuns` | `1` (a whole number 1–8, `IntakeOptions.MaxConcurrentRunsLimit`: how many items `factory work` runs at once; 1 runs them one after another. Runs overlap outside the worker phases — "Worker phases" below; sc-25988 — and, with `Worker:Slots` above 1, inside them too, one per slot) |
 | `Usage:PollSeconds` | `60` (> 0: `factory work` reads the router's subscription usage; also read at each intake poll) |
 | `Freeze:MaxConsecutiveFailures` | `3` (≥ 1: distinct items escalated in a row, no factory merge between, that freeze the factory) |
 | `Freeze:HotFileMerges`, `Freeze:HotFileWindowHours` | `3` (≥ 2), `24` (> 0): factory merges changing one file within the window that freeze it |
@@ -209,8 +216,9 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Factory:WorkRoot` | `/opt/dark-factory/work` (clones + worktrees; `~/.dark-factory` when `Worker:RunAs=none`) |
 | `ConnectionStrings:Ledger` | `Host=localhost;Port=5434;Database=factory;Username=factory;Password=factory` |
 | `Worker:ClaudePath` | `claude` (as the worker user sees it: `~_factory/.local/bin` is first on its PATH) |
-| `Worker:RunAs` | `_factory` (sandbox user); `none` runs workers as the owner (development only) |
-| `Worker:LaunchHelper` | `/usr/local/libexec/dark-factory/factory-worker-launch` |
+| `Worker:RunAs` | `_factory` (the sandbox user, slot 1's; slot n's is this name with n appended: `_factory2`, …); `none` runs workers as the owner (development only) |
+| `Worker:LaunchHelper` | `/usr/local/libexec/dark-factory/factory-worker-launch` (slot 1's installed helper; slot n's is this path with `-n` appended) |
+| `Worker:Slots` | `1` (a whole number 1–8, `WorkerSlots.MaxSlots`; sc-25989): how many sandbox users run workers side by side — worker sessions at a time. 1 is the one user `_factory`, one helper, one lock file, as before slots. Each slot above 1 needs its user and helper set up first (`sudo scripts/setup-worker-user.sh --slots n`), or start-up fails naming the slot. Independent of `Intake:MaxConcurrentRuns`: more runs than slots is the ordinary case (runs also overlap outside worker phases); more slots than runs is allowed (the others serve a `factory run` beside `factory work`; `factory work` says so at start-up). Refused, not ignored, with `Worker:RunAs=none` unless 1 ("Worker slots" below) |
 | `Worker:Auth` | `router-key` (default: the worker holds only the router key, in `X-Weave-Router-Key` and as `ANTHROPIC_AUTH_TOKEN`; the router serves it from plans enrolled with `router login claude` / `router login codex`; `factory run`/`work` refuse to start unless `GET /v1/subscriptions/usage` lists an enabled `managed`/`shared` credential) or `claude-login` (weaker, violates E5: the worker's own Claude login, passed through by the router) |
 | `Worker:TimeoutMinutes` | `30` (> 0) |
 | `Worker:PauseGraceSeconds` | `660` (a paused worker that has not stopped at a tool boundary by then is stopped; must exceed the 600 s longest tool call) |
@@ -228,45 +236,64 @@ Every setting with a rule is checked at start-up (`FactoryOptions.ValidateSettin
 `factory work` print the key and why and exit 2 (E6: each key has a consumer and a test that a non-default value is read and an
 out-of-range one refused, `FactoryOptionsTests`).
 
-Worker sandbox (E5): workers run as the hidden `_factory` user via
-`sudo -n -u _factory factory-worker-launch claude …` (one NOPASSWD sudoers rule for that helper only).
-The owner's home is ACL-denied to `_factory`, so `~/.ssh`, `~/.config/gh` and the login keychain are
+Worker sandbox (E5): workers run as a hidden sandbox user — `_factory`, or with several worker slots (`Worker:Slots`, sc-25989;
+"Worker slots" under the invariants) one of `_factory`, `_factory2`, … — via
+`sudo -n -u _factory factory-worker-launch claude …` (one NOPASSWD sudoers rule per sandbox user: that user's own copy of the
+helper, as that user only). Everything in this paragraph holds per sandbox user.
+The owner's home is ACL-denied to it, so `~/.ssh`, `~/.config/gh` and the login keychain are
 unreachable. Router variables go to the helper on stdin; the helper builds the worker env from scratch
 (PATH, HOME from the password database, MSBuild node reuse/build server off, router vars), refuses any
 other variable or a program that isn't an absolute path/plain name, and when the worker exits or its stdin
-closes kills the tree, the process group and then every other `_factory` process (a `pgrep -U` sweep that
-spares the helper's own pid and its descendants — never `kill -1`, which on macOS kills the sender too), then exits
-with the worker's status. The sweep runs only when the helper's user name is `sandbox_user` and its uid is
-`sandbox_uid`, which setup pins (it must be in 400-499, the range setup allocates, still `sandbox_user`'s uid, and not
-the sudo caller's); otherwise the helper prints `refusing the _factory uid sweep: <why>` and skips it. `send_signal`
-never signals pid or group 0 or 1 or an empty target. So `_factory` is
-single-tenant: whatever runs through the helper holds the sandbox user's lock (`WorkerLock`, `<work root>/.factory-run.lock`) for
-that phase — one worker phase per machine at a time, not one run ("Worker phases", sc-25988, under the invariants). Run
-`sudo scripts/setup-worker-user.sh` once, and again after any change to `scripts/factory-worker-launch`: it installs
-the helper with `sandbox_user` and `sandbox_uid` set (setup refuses a worker uid outside 400-499). The readiness check has
-two parts (sc-25988), because a run of the helper kills every `_factory` process and so belongs under the sandbox user's lock.
-What start-up checks, running nothing and taking no lock (`WorkerSandbox.EnsureHelperCurrentAsync`): the installed helper is
-read and must have `helper_version` ≥ `WorkerSandbox.HelperVersion` (3) and, with those two lines undone, the SHA-256 of the
+closes kills the tree, the process group and then every other process of its own user (a sweep of `ps -U "$self_uid"`, the
+helper's own uid and no other, that spares the helper's own pid and its descendants — never `kill -1`, which on macOS kills the
+sender too), then exits with the worker's status. The sweep runs only when the helper's user name is `sandbox_user` and its uid is
+`sandbox_uid`, which setup pins in each installed copy to that copy's own user (the uid must be in 400-499, the range setup
+allocates, still `sandbox_user`'s uid, and not the sudo caller's); otherwise the helper prints `refusing the _factory uid sweep:
+<why>` and skips it — so a copy run as another slot's user sweeps nothing, and one pinned to another slot's uid refuses.
+`send_signal` never signals pid or group 0 or 1 or an empty target. So each sandbox user is
+single-tenant: whatever runs through its helper holds that slot's lock (`WorkerLock`: `<work root>/.factory-run.lock` for slot 1,
+`.factory-run-n.lock` for slot n) for that phase — one worker phase per sandbox user at a time, not one run ("Worker phases",
+sc-25988, under the invariants), and one per slot side by side. Setup, the owner's, once and again after any change to
+`scripts/factory-worker-launch`: `sudo scripts/setup-worker-user.sh [--slots n]` (n = `Worker:Slots`, 1–8, default 1). Per
+slot it creates the hidden role account (slot 1 `_factory`, slot n `_factoryn`; own group; a uid of its own in 400-499 — setup
+refuses one outside the range, and two slots sharing one, before installing anything; home `/Users/<user>`, mode 0700, so no
+sandbox user enters another's), denies it the owner's home, gives it the work root's inherited read entry, installs its own
+Claude Code (`~<user>/.local/bin`), and installs ONE copy of the helper for it — `factory-worker-launch` for slot 1, at the path
+it always had, `factory-worker-launch-n` for slot n — with `sandbox_user` and `sandbox_uid` set to that user, and its sudoers
+line. A re-run with a smaller n leaves the higher slots' accounts in place and drops their sudoers lines. The readiness check has
+two parts (sc-25988), because a run of a helper kills every process of its user and so belongs under that slot's lock.
+What start-up checks, running nothing and taking no lock (`WorkerSlots.EnsureHelpersCurrentAsync` →
+`WorkerSandbox.EnsureHelperCurrentAsync` per slot): EVERY slot's installed helper is
+read and must have `helper_version` ≥ `WorkerSandbox.HelperVersion` (4), name its own slot's user as `sandbox_user`, pin a uid,
+and, with those two lines undone, have the SHA-256 of the
 repo's helper (compiled into the orchestrator as a resource) — else `Stale helper: … re-run \`sudo scripts/setup-worker-user.sh\``
-(or `cannot read the launch helper …`). `factory work` and `factory run` refuse to start on it (`FactoryRunner.CheckHelperAsync`,
+(or `cannot read the launch helper …`), led with several slots by the slot that failed (`Worker slot 2 (_factory2): Stale
+helper: …`) and naming the command with the slot count (`sudo scripts/setup-worker-user.sh --slots 2`:
+`WorkerSlots.ReinstallCommand`). `factory work` and `factory run` refuse to start on it (`FactoryRunner.CheckHelperAsync`,
 in `Program`: the reason, exit 2, before the router check and before the first poll), and every run checks it again first of all
 (`FactoryRunner.RunAsync`, a `FactoryUnavailableException` before the ledger is opened or the board asked: nothing is claimed
 or recorded, and the intake loop ends the poll). What is deferred to a run's first worker phase, and to each triage, under the
-lock (`EnsureReadyAsync`, which starts with the same read): the probe with the real router variable names
+lock of the slot it holds (`WorkerSlots.EnsureReadyAsync` → that slot's `EnsureReadyAsync`, which starts with the same read; so
+each slot is probed before a worker runs in it, by the runs that land there, and a failure names the slot): the probe with the
+real router variable names
 (allowlist `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_AUTH_TOKEN`; `ANTHROPIC_CUSTOM_HEADERS` may come on several
-stdin lines, one header each, which the helper joins with line breaks — helper_version 3, sc-25659), which fails if the helper
-refuses a variable, the user is not usable or the probe's stderr has a uid-sweep refusal; and last `<Worker:ClaudePath> --version`
-as `_factory` through the helper, failing with
+stdin lines, one header each, which the helper joins with line breaks — since helper_version 3, sc-25659), which fails if the
+helper refuses a variable, the user is not usable or the probe's stderr has a uid-sweep refusal; and last `<Worker:ClaudePath>
+--version` as that slot's user through its helper, failing with
 `Upgrade _factory's claude: …` (and the `claude update` command) below `WorkerSandbox.MinClaudeVersion` (2.1.291, the release
 the triage confinement — `--setting-sources ""`, `blockReadsOutsideWorkingDirectories`, `dontAsk` — was checked against; an
-older CLI may silently ignore a setting it does not know). Setup also reports, without failing, whether `cargo` and `rustc`
-answer `_factory` through the helper (Rust target repos only: the new-tests check of a Rust pull request is an `error` without
-them, sc-25875). Every normal (re)run kills every `_factory`
-process (its toolchain check runs through the helper): close `_factory` sessions and stop `factory work` first.
+older CLI may silently ignore a setting it does not know). Each sandbox user has its own PATH head (`~<user>/.local/bin`, its
+own Claude Code) and the helper's fixed tail (`/usr/local/share/dotnet`, `/opt/homebrew/bin`, `/usr/local/bin`, …), so dotnet,
+git, cargo and rustc are the machine's for every slot, while `~<user>/.claude`, `~<user>/.cargo` and the NuGet cache are per
+user. Setup checks dotnet, git and claude per user through that user's helper, and reports, without failing, whether `cargo` and
+`rustc` answer it (Rust target repos only: the new-tests check of a Rust pull request is an `error` without
+them, sc-25875). Every normal (re)run kills every process of every sandbox user it sets up
+(its toolchain check runs through each helper): close their sessions and stop `factory work` first.
 `--remove-worker-login` (opt-in) is a standalone mode: it runs none of the setup (no helper, no toolchain check, no
-installs) and only deletes `_factory`'s own Claude login (`~/.claude/.credentials.json`, keychain item
-`Claude Code-credentials`), as `_factory`, signalling nothing. The live probe tests (`LiveWorkerSandboxTests`) run only with
-`FACTORY_SANDBOX_LIVE=1`, since they kill every `_factory` process (including an interactive `_factory` login).
+installs) and only deletes each sandbox user's own Claude login (`~/.claude/.credentials.json`, keychain item
+`Claude Code-credentials`; with `--slots n`, of each of the n users), as that user, signalling nothing. The live probe tests
+(`LiveWorkerSandboxTests`) run only with `FACTORY_SANDBOX_LIVE=1`, since they kill every `_factory` process (including an
+interactive `_factory` login).
 
 Secrets in the keychain: `security add-generic-password -w` at its interactive prompt truncates at 128 chars
 (Shortcut tokens are longer → 401). Copy the secret, then
@@ -1475,14 +1502,16 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   changeset is on the default branch.
 - One run per item: `RunPipeline` holds a Postgres advisory lock on the item id (`PostgresRunLocks`) for the whole
   run, and `WorkItem.Version` is an optimistic concurrency token, so a stale writer's save throws.
-- Worker phases (Phase 4b, sc-25988, E6; `WorkerLock.cs`, `RunPipeline.InWorkerPhaseAsync`): the sandbox is still ONE user
-  (`_factory`), and every exit of the launch helper kills every process of it — so every run of the helper happens under the
-  sandbox user's lock, and a run holds that lock only for its worker phases, not for its whole life (as before sc-25988).
-  The lock: `WorkerLock` = the file `<WorkRoot>/.factory-run.lock`, held exclusively while open (between processes too; the OS
+- Worker phases (Phase 4b, sc-25988, E6; `WorkerLock.cs`, `RunPipeline.InWorkerPhaseAsync`): a sandbox user is single-tenant
+  — every exit of its launch helper kills every process of it — so every run of a helper happens under that sandbox user's
+  lock, and a run holds that lock only for its worker phases, not for its whole life (as before sc-25988). This bullet is
+  written for the one sandbox user of the default (`Worker:Slots` 1); with several, read "the sandbox user" as "the slot the
+  phase holds" throughout — which slot that is, is the next bullet's ("Worker slots").
+  The lock: `WorkerLock` = the file `<WorkRoot>/.factory-run.lock` (slot n's: `.factory-run-n.lock`), held exclusively while open (between processes too; the OS
   releases it if the holder dies), waited for — never failed on — and re-entrant per async flow (`HoldAsync`; `IsHeld` is the
   flow's own, and a task that outlives the hold it started in no longer holds it). The sandbox carries it
-  (`WorkerSandbox.Lock`, set by `FactoryOptions.WorkerSandbox`, the only place production builds a sandbox; unsandboxed there is
-  none). Enforcement, at the one place a helper process starts: `WorkerSandbox.Start` throws unless the calling flow holds the
+  (`WorkerSandbox.Lock`, set by `WorkerSlots.Create` for `FactoryOptions.WorkerSlots`, the only place production builds a
+  sandbox; unsandboxed there is none). Enforcement, at the one place a helper process starts: `WorkerSandbox.Start` throws unless the calling flow holds the
   lock (nothing is started). Every user of it holds it: the sandbox's own short commands take it themselves (`RunAsync`,
   `EnsureReadyAsync` — the probe and `claude --version` —, `StopAllAsync`, the pgrep included, and `DeleteAsWorkerAsync`, so every
   worktree, seat and sweep deletion of `GitWorkspace`; never under a clone's lock, so no lock-order cycle), as do
@@ -1551,16 +1580,18 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (`RenewClaimsAsync`, sc-25983), never per dispatched run. Still one run per item (the item's run lock) and one turn per repository (the merge queue).
   What stops a poll's new work still does with several runs in flight: after a run the freeze deferred no ready item of any
   lane and no further in-flight item of its lane is started; after a factory-wide failure nothing is; runs already started
-  finish by themselves, each checking the freeze, the usage pause and its controls before every step. Residuals, accepted until the sandbox has several users (later Phase 4b stories): (a) one
-  sandbox user means one worker phase at a time — a run whose turn in a repository's merge queue needs the new-tests runs, or
-  finds a leftover of its own worktree to replace, waits for another run's session and holds that turn meanwhile (both waits
-  honour Pause, Stop and the freeze); (b) a helper that never exits (wedged in sudo, say, where the second helper run cannot
+  finish by themselves, each checking the freeze, the usage pause and its controls before every step. Residuals, accepted: (a) one
+  sandbox user means one worker phase at a time — with `Worker:Slots` 1, or for the items of one slot — so a run whose turn in
+  a repository's merge queue needs the new-tests runs, or
+  finds a leftover of its own worktree to replace, waits for another run's session in its slot and holds that turn meanwhile
+  (both waits honour Pause, Stop and the freeze); (b) a helper that never exits (wedged in sudo, say, where the second helper run cannot
   reach it) keeps the lock, and so every worker phase of every run, until someone kills it — by design: its exit would kill
   whatever ran as `_factory` then; the periodic `[lock] … stays held … (sudo pid P)` line names it, and waiting runs can be
-  paused or stopped; (c) worktrees are still shared with the one user by ACL, so a worker can
-  write another item's kept worktree, as it could between runs before (per-slot directories are a later story); (d) the
-  acceptance harness (`E2e`) still takes the configured work root's lock for its whole life (`WorkerLock.Acquire`, the one
-  fail-fast taker), so a real `factory work` beside it waits at its worker phases rather than failing; (e) the CI fixer's
+  paused or stopped; (c) a worktree is shared by ACL with one sandbox user — its item's slot's — so a worker can
+  write another item's kept worktree of the same slot, as it could between runs before, and never one of another slot
+  (per-slot directories and the cross-slot checks are a later story); (d) the
+  acceptance harness (`E2e`) still takes the configured work root's locks — every slot's — for its whole life
+  (`WorkerLock.Acquire`, the one fail-fast taker), so a real `factory work` beside it waits at its worker phases rather than failing; (e) the CI fixer's
   prompt reads the failing checks from GitHub once inside its phase (one bounded read under the lock, not CI's polling).
   Tests: `WorkerLockTests` (also: a kept lock, its reports, a wait's report, a lock that cannot be opened);
   `LockScopeTests` (a probe on every call the pipeline makes of its worker, workspaces, test runner, reviewers and GitHub: the
@@ -1574,6 +1605,79 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   will not exit keeping the lock until it does, a cancelled command waited for while it sweeps; the start-up check reading the
   helper with the lock held elsewhere); `GitWorkspaceTests` (the failed worktree's clean-up never waiting); `IntakeLoopTests`
   (a run's stale-helper refusal before the ledger; a triage's wait); `PlanTests` (the planner's seat); `IntakeDispatchTests`.
+- Worker slots (Phase 4b, sc-25989, E6/E7; `Worker/WorkerSlots.cs`, `RunPipeline.InWorkerPhaseAsync`): `Worker:Slots`
+  (1–8, default 1) sandbox users run workers side by side. A slot = a sandbox user + its own installed launch helper + its own
+  lock file (`WorkerSlot`: a number and a `WorkerSandbox`): slot 1 is `Worker:RunAs` through `Worker:LaunchHelper` under
+  `<WorkRoot>/.factory-run.lock` — exactly the sandbox before slots — and slot n is `<Worker:RunAs>n` through
+  `<Worker:LaunchHelper>-n` under `.factory-run-n.lock` (`WorkerSlots.UserOf`/`HelperOf`, `WorkerLock.For(root, n)`: the names
+  `setup-worker-user.sh --slots n` creates and installs). Each helper's sweep is of its own uid only, so two runs are in a
+  worker phase at once exactly when they hold different slots, and nothing one slot's helper does reaches another slot's
+  processes. The pool (`WorkerSlots.HoldAsync`) hands out a slot, waiting like the single lock did (control-aware through the
+  pipeline's `whileWaiting`, reported every `WorkerLock.ReportEvery`: `[lock] waited N s for a free worker slot …`): a named
+  slot — only that one, however long it is busy — or the first free one in a given order. A flow inside a slot runs any nested
+  phase in it and is refused another (a phase is one sandbox user's). Everything done as a sandbox user is done by the slot the
+  calling flow holds (`WorkerSlots.Current`): the pool is the `IWorkerSandbox` of every `GitWorkspace` and the sandbox of
+  `ClaudeWorker` and `SandboxTestRunner`, resolved per call; with several slots a flow that holds none has no sandbox user and
+  `Current` throws, and `WorkerSandbox.Start` still refuses without that slot's lock.
+  An item's slot (E7): its first worker phase takes a free slot — tried in the order of fewest unfinished items first
+  (`WorkLedger.SlotsByLoadAsync`: items not Done, Cancelled or in Watch, by their last `slot` row; ties by number), so slots
+  fill evenly rather than in number order — and records it as a `slot` checkpoint (Detail `2 _factory2`; outcome passed) under
+  that slot's lock, before the run's sandbox set-up or the phase creates anything. From then on EVERY worker phase of the item
+  waits for that slot and no other, for the item's whole life (`RunPipeline.SlotOf`, read once per run): a resumed or paused
+  session (its transcript is in that user's home, so `claude --resume` works nowhere else), a fix round (review, CI, conflict)
+  and a changeset's fix round, the gate's new-tests runs, a plan item's planner seat, the stop of a worker a crashed run left
+  (`ClaudeWorker.StopOrphanAsync` → that slot's `StopAllAsync`: only that slot's helper runs, so only that user's processes are
+  killed; `StopIdleAsync` waits for the slot, logged `[lock] a stop: waiting for worker slot 2 (_factory2) …`), and its
+  worktrees' deletion. The wait is the worker phase's (`[lock] sc-N: waiting for worker slot 2 (_factory2) (another run's
+  worker phase holds …) to implement`, ended by a Pause, a Stop or the freeze). An item with a `worker-started` row and no
+  `slot` row was worked before slots, or by a one-slot factory (which writes no `slot` row: its ledger is as before, E9): it is
+  slot 1's. An item whose recorded slot is above `Worker:Slots` (the setting was lowered) fails with the reason — `sc-N was
+  started in worker slot 3 (_factory3), but Worker:Slots is 2 … Set Worker:Slots to at least 3 again and re-run it, or stop it`
+  (`SlotUnavailableException`; Escalated) — and nothing of it is run or deleted as another user.
+  Which slot the work with no item of its own uses: a triage — any free slot, in number order, recorded nowhere (nothing
+  resumes a triage and its worktree is shared with no one for writing; `SandboxTriageRunner`); a run's sandbox set-up
+  (`enterSandbox`, in its first worker phase) — the slot that phase holds: the readiness probe is of that slot's helper, and
+  the sweep runs there; the merge queue's base update, which makes a fresh worktree outside any worker phase and runs no helper
+  — no slot is held, and the worktree is shared with the item's slot's user by the owner's own `chmod`
+  (`RunPipeline.InItemSlotAsync` → `WorkerSlots.AssignedAsync`; an item with no slot yet, e.g. a plan item that never needed a
+  planner here, is given the least-loaded one, recorded then).
+  Deletions: a directory is deleted as the user it was shared with for writing, under that slot's lock — read from the
+  directory's own ACL (`WorkerSlots.SharedWith`, the `ls -led` listing; the directory is the owner's, so only
+  `WorkerSandbox.ShareAsync` wrote the entry, and for an item's worktree it is the item's recorded slot), never chosen another
+  way. A flow that holds no slot waits for it (`DeleteAsWorkerAsync`), or tries it (`TryDeleteAsWorkerAsync`,
+  `WorkerSlots.TryHoldForAsync`: the pipeline's clean-up outside a phase); a flow that holds another slot — a sweep in another
+  item's worker phase — never waits for a second slot (two such runs would wait on each other): every sweep deletes with the
+  try (`GitWorkspace.SweepOrphansAsync`), so a leftover of a busy slot is left to a sweep that finds it free. A directory shared
+  with no slot (a triage's or a planner's read-only worktree, a seat) was written by no worker: the held slot deletes it, or
+  any free one. Fail closed: a directory writable by a principal that is no slot's user — a slot above `Worker:Slots`, two
+  slots' users, a group, an entry `ls` printed as a UUID (it does that while the directory service does not answer: the listing
+  is read up to 3 times first) — is not deleted as anyone and the deletion throws, naming it.
+  `Worker:RunAs=none` (development): no sandbox user, no lock, no slot — `Worker:Slots` other than 1 is refused at start-up
+  (`FactoryOptions.WorkerSlotCount`) rather than ignored. With `Worker:Slots` unset nothing changed: one user `_factory`, one
+  helper at the same installed path, one lock file, no `slot` row, the same log lines (`… waiting for the sandbox user …`).
+  Not this story (W4): per-slot MCP session directories and seat roots (both still shared under the work root; the session
+  file's ACL check already names the slot's user), the cross-slot write-denial checks, and the documentation of the cross-slot
+  read residual. Residuals, accepted: (a) the slot is the item's for life, so an item waits for its own slot while another is
+  free — the price of never running or deleting anything of an item as a user that did not write it; the first-phase order by
+  load keeps the slots even; (b) sandbox users can read each other's worktrees through the work root's inherited read entry
+  (E7: accepted, written up with W4's checks); (c) lowering `Worker:Slots` with items still in a higher slot escalates those
+  items when they next need a worker (raise it again, or stop them), and their leftover worktrees stay until then; (d) a
+  directory's slot is read from an ACL listing, so a wrong answer from `ls` is a loud failed deletion, not a deletion as the
+  wrong user.
+  Tests: `SlotPoolTests` (the pool: names, the refusals of a shared user/helper/lock, two flows in two slots with a third
+  waiting, a named slot waited for beside a free one, the order, `Current` and `AssignedAsync`; which slot a directory is
+  deleted in, through fake helpers that record which ran; the share on macOS; start-up naming the slot whose helper is missing,
+  stale, edited, pinned to another user or unpinned, and the probe of the held slot only; the pipeline: two items in a session
+  at once as two users, the `slot` row written before the set-up, an item interrupted in slot 2 resuming its session there
+  while slot 1 is free, a leftover worker stopped through slot 2 only, a slot no longer configured, a one-slot factory
+  recording nothing and a pre-slots item being slot 1's, the order by load), `LockScopeTests` (the base update's worktree is
+  the item's slot's user's with no slot held; production builds sandboxes only in the pool), `WorkerSandboxTests` (through
+  `SafeHelper` only: each slot's helper copy sweeps its own uid's processes and never the other's, a copy run as another slot's
+  user sweeps nothing, one pinned to another slot's uid refuses; version 4; the watcher's one redirected group and 200 runs with
+  an empty stderr), `SetupScriptTests` (`--slots 2`: two users, uids, homes, ACLs, per-user helper pins the orchestrator accepts
+  for that user only, one sudoers line each, the toolchain checked through each user's own helper; a shared uid and a count
+  outside 1–8 refused; `--remove-worker-login` per user), `FactoryOptionsTests` (`Worker:Slots` read, bounded, refused with
+  `Worker:RunAs=none`). Live, not run here: P4b-AT5 and P4b-AT6 (`SlotAcceptanceTests`; docs/acceptance.md).
 - Clean-up under overlapping runs (Phase 4b, sc-25987; `Ledger/LiveRuns.cs`, `Git/CloneLock.cs`): no sweep decides from "no other run exists".
   Whose a leftover is: it carries its item in its name — a worktree directory by `ItemNaming.OwnerOfLeftover` (`factory-<item>`,
   the changeset worktree `factory-changeset-<item>`, a triage's `factory-triage-<item>`, a planner's worktree or seat

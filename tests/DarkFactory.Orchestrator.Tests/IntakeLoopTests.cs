@@ -652,6 +652,40 @@ public class IntakeLoopTests
     }
 
     /// <summary>
+    /// sc-25989: a triage needs no slot of its own (nothing resumes it, and its worktree is shared with no one for writing), so the
+    /// production triage runner takes any free slot instead of waiting for a busy one. The sandbox users and helpers do not exist
+    /// and nothing is run: the slot it took shows in the readiness check that fails there, the factory's failure.
+    /// </summary>
+    [Fact]
+    public async Task With_several_slots_a_triage_takes_a_free_slot_rather_than_wait_for_a_busy_one()
+    {
+        var root = Directory.CreateTempSubdirectory("df-triage-slots-").FullName;
+        var options = new FactoryOptions(new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Router:Key"] = "rk",
+            ["Factory:WorkRoot"] = root,
+            // A ledger nothing listens on (never the compose Postgres): nothing reads it before the readiness check.
+            ["ConnectionStrings:Ledger"] = "Host=127.0.0.1;Port=1;Database=none;Username=none;Password=none;Timeout=2",
+            ["Worker:Slots"] = "2",
+            // Never run, and never the real sandbox user or helper.
+            ["Worker:RunAs"] = "df-test-no-such-user",
+            ["Worker:LaunchHelper"] = "/nonexistent/df-test-helper",
+        }).Build(), new InMemorySecrets());
+        var item = new WorkItem { Source = ItemNaming.GitHubIssue.Source, ExternalId = "gh-1", Title = "acme/widgets#7", Repo = "acme/widgets" };
+        var log = new StringWriter();
+        using var held = WorkerLock.Acquire(root); // another run's worker session in slot 1, for the whole test
+
+        var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() => new SandboxTriageRunner(options, log).RunAsync(item, new RepoRef("acme", "widgets"),
+            "prompt", (_, _) => Task.CompletedTask, (_, _, _) => Task.CompletedTask, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken));
+
+        // It went on at once, in slot 2: that slot's user and helper are the ones its readiness check names.
+        Assert.StartsWith("the worker sandbox: Worker slot 2 (df-test-no-such-user2): Worker sandbox unavailable: cannot read the launch helper "
+            + "/nonexistent/df-test-helper-2", ex.Message);
+        Assert.Contains("`sudo scripts/setup-worker-user.sh --slots 2`", ex.Message);
+        Assert.DoesNotContain("[lock]", log.ToString()); // it never waited
+    }
+
+    /// <summary>
     /// sc-25988: the production triage runner waits for the sandbox user like a run's worker phase — never blind. Against the
     /// compose Postgres (its controls; skips locally without it); the worker user and helper do not exist and nothing is run:
     /// the sandbox user's lock is held by another run for the whole test.

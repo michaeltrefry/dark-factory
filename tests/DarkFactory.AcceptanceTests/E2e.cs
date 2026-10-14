@@ -19,9 +19,9 @@ namespace DarkFactory.AcceptanceTests;
 /// <summary>
 /// Shared plumbing of the live <c>factory work</c> acceptance tests (AT2–AT5, AT7; docs/acceptance.md). Each test runs
 /// against a throwaway ledger database and its own work root under the configured one, so it never reads or writes the
-/// owner's real ledger, controls or worktrees; it holds the configured work root's <see cref="WorkerLock"/> for its whole
-/// run, so no real run's worker phase can share the single-tenant <c>_factory</c> user with it (a real run waits at its worker
-/// phases meanwhile; the test skips if one holds the lock when it starts).
+/// owner's real ledger, controls or worktrees; it holds the configured work root's <see cref="WorkerLock"/> — every worker
+/// slot's (sc-25989) — for its whole run, so no real run's worker phase can share a single-tenant sandbox user with it (a real
+/// run waits at its worker phases meanwhile; the test skips if one holds a lock when it starts).
 /// </summary>
 internal sealed class E2e : IAsyncDisposable
 {
@@ -80,15 +80,20 @@ internal sealed class E2e : IAsyncDisposable
         await Harness.RequireRouterAsync();
 
         var realRoot = Harness.Options.WorkRoot;
-        IDisposable? realLock = null;
+        RealLocks? realLock = null;
         if (Harness.Options.WorkerSandbox is not null)
         {
+            realLock = new RealLocks();
             try
             {
-                realLock = WorkerLock.Acquire(realRoot);
+                foreach (var slot in Harness.Options.WorkerSlots!.All)
+                {
+                    realLock.Add(WorkerLock.Acquire(realRoot, slot.Number));
+                }
             }
             catch (InvalidOperationException ex)
             {
+                realLock.Dispose();
                 Assert.Skip($"A real factory run's worker phase holds the work root: stop `factory work`/`factory run` first. {ex.Message}");
             }
         }
@@ -360,6 +365,16 @@ internal sealed class E2e : IAsyncDisposable
             return [.. received];
         }
     }
+}
+
+/// <summary>The configured work root's lock of every worker slot, held together for a live test's whole run.</summary>
+internal sealed class RealLocks : IDisposable
+{
+    private readonly List<IDisposable> _held = [];
+
+    public void Add(IDisposable held) => _held.Add(held);
+
+    public void Dispose() => _held.ForEach(held => held.Dispose());
 }
 
 /// <summary>Secrets from <paramref name="inner"/> (the owner's keychain) except the accounts overridden here; writes go nowhere.</summary>

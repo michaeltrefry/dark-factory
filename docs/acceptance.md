@@ -5,11 +5,13 @@ opt-in: the tests skip, naming the missing prerequisite, unless their gate varia
 
 ## Safety first (read before any live run)
 
-- **The `_factory` user is single-tenant.** Every exit of the sandbox launch helper kills *every* `_factory`
-  process. Do not use an interactive `_factory` session (e.g. its Claude login) while any live test below runs.
+- **The `_factory` user is single-tenant** — and so is each further sandbox user of a machine set up with worker slots
+  (`_factory2`, …; `Worker:Slots`, sc-25989). Every exit of a sandbox launch helper kills *every* process of its user.
+  Do not use an interactive `_factory` session (e.g. its Claude login) while any live test below runs.
 - **Stop your own `factory work` / `factory run` first.** The `factory work` tests (AT2–AT5) hold the configured
-  work root's sandbox lock (`<Factory:WorkRoot>/.factory-run.lock`) for their whole run and skip if a real run's worker
-  phase holds it at that moment, so they never share `_factory` with one (a real run started meanwhile waits at its
+  work root's sandbox lock (`<Factory:WorkRoot>/.factory-run.lock`, and `.factory-run-<n>.lock` of every further slot) for
+  their whole run and skip if a real run's worker
+  phase holds one at that moment, so they never share a sandbox user with one (a real run started meanwhile waits at its
   worker phases, sc-25988). They run against a **throwaway ledger database**
   (`df_e2e_at<N>_<guid>` on the configured Postgres, dropped afterwards) and their **own work root**
   (`<Factory:WorkRoot>/e2e/<db name>`), so they never read or change your real ledger, controls or worktrees.
@@ -1019,6 +1021,66 @@ before the router is asked when the item's source is not configured, the work ho
 text, and a scan that no file outside `Shortcut/` but the registry names the Shortcut source's type. These tests build their
 options with no keychain and no process environment, so they run (never skip) on a machine whose shell carries
 `SHORTCUT_API_TOKEN` or `FACTORY_KANBAN_WRITE_TOKEN`.
+
+## P4b-AT5 — two at once: two items in a worker session at the same time, each in its own slot, both merged (sc-25989)
+
+`SlotAcceptanceTests.P4b_AT5_two_items_are_in_a_worker_session_at_the_same_time_each_in_its_own_slot_and_both_merge`: the real
+`factory work` as a child process (the built CLI) with `Worker:Slots=2` and `Intake:MaxConcurrentRuns=2`, against a throwaway
+ledger and work root. Written with sc-25989 and run by the epic's terminal story; it skips unless two slots are configured.
+
+Prerequisites: the shared harness's (the router and an enrolled plan, both GitHub Apps on the target repository with its
+rulesets, the Shortcut token and watch scope: `FACTORY_E2E_WATCH_TEAM` and/or `FACTORY_E2E_WATCH_EPIC`), and
+
+- a machine set up for two worker slots — `sudo scripts/setup-worker-user.sh --slots 2` (it creates `_factory2` with its own
+  helper, sudoers line, home and Claude Code; a run kills every process of both sandbox users) — and `Worker__Slots=2` in the
+  environment the test runs in (the harness then holds both slots' locks of the real work root and probes both helpers);
+- `FACTORY_E2E_P4B_SLOT_STORIES`: two To Do stories in the watch scope, `sc-<a>,sc-<b>`, each a small fix to the sandbox
+  repository that takes the worker a few minutes and that the gate can merge (a new test that fails on the base). They must be
+  the only ready stories of the scope: the host claims every one it sees. Both end `Done`, merged.
+
+```sh
+FACTORY_E2E=1 Worker__Slots=2 FACTORY_E2E_WATCH_EPIC=<id> FACTORY_E2E_P4B_SLOT_STORIES=sc-<a>,sc-<b> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4b_AT5*"
+```
+
+What it checks, from the throwaway ledger and GitHub: both items reach Merge with no Escalated or Cancelled row; each has
+exactly one `slot` row and the two differ (`1 _factory` and `2 _factory2`); a `worker_sessions` row of one item overlaps in
+time one of the other (two worker sessions at once); each item has one pull request for its branch, merged. INCONCLUSIVE (the
+overlap assertion fails, listing every session's times) if the two fixes are so quick that the sessions never overlap: use
+stories whose fix takes minutes.
+
+## P4b-AT6 — slot affinity: a run killed during Implement resumes in the same slot while another item runs in the other (sc-25989)
+
+`SlotAcceptanceTests.P4b_AT6_a_run_killed_during_implement_resumes_in_the_same_slot_while_another_item_runs_in_the_other`: two
+`factory run sc-N --ignore-scope` child processes (the built CLI), one item each, with `Worker:Slots=2`, against a throwaway
+ledger and work root. Once both ledgers name a Claude session — both items are in a worker session, in different slots — the
+test SIGKILLs the first child (its own pid only, `OwnProcess`; never a process tree, never a sandbox user's process) and starts
+it again. Written with sc-25989 and run by the epic's terminal story.
+
+Prerequisites: as P4b-AT5 (two slots set up, `Worker__Slots=2`; no watch scope is needed), and
+
+- `FACTORY_E2E_P4B_AFFINITY_STORIES`: two To Do stories, `sc-<killed>,sc-<other>`, each a fix that takes the worker several
+  minutes (the second must still be in its session, or have finished it by itself, when the first is killed and resumed).
+  Both end In Progress with an open pull request (the test stops at Review), or `Done` if the gate merges them.
+
+```sh
+FACTORY_E2E=1 Worker__Slots=2 FACTORY_E2E_P4B_AFFINITY_STORIES=sc-<killed>,sc-<other> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4b_AT6*"
+```
+
+What it checks. The killed item: every `session` row before and after the kill names the same Claude session, its
+`worker_sessions` rows hold that one session id, and it has exactly one `slot` row, the same before and after — the resumed
+run waited for (or found free) the slot that started it and resumed there, stopping the first run's leftover worker through
+that slot's helper only. The other item, in the other slot: its worker was still running or had finished by itself after the
+kill and the resume; it has one `worker-started` row, one session id, one `slot` row (the other slot), no `orphan-killed`, no
+`worktree-lost`, no Paused or Escalated row, and it reaches Review. Each item has exactly one pull request for its branch.
+
+Not live (every `dotnet test`): `SlotPoolTests`, `LockScopeTests`, `WorkerSandboxTests` (the helper only through `SafeHelper`),
+`SetupScriptTests` and `FactoryOptionsTests` — the pool, the slot recorded per item and kept (resume, the stop of a leftover
+worker, the worktree's deletion, each waiting for the item's slot), each slot's helper sweeping only its own user's processes,
+start-up naming the slot whose installed helper is missing, stale or pinned to another user, the set-up script for n users, and
+the setting's validation. The live sandbox probes (`LiveWorkerSandboxTests`, `FACTORY_SANDBOX_LIVE=1`) still probe slot 1's
+user only.
 
 ## Upgrading a Phase 1 ledger: items parked at Review
 

@@ -425,7 +425,8 @@ public static class IntakeServiceCollectionExtensions
         services.AddHostedService(sp =>
         {
             // One loop lists every configured source in turn; a triage and the items' worker phases, of whatever source, share the
-            // single-tenant worker sandbox one at a time through its lock (WorkerLock). A watched source without its credential
+            // worker slots — each a single-tenant sandbox user, one worker phase at a time through its lock (WorkerLock; WorkerSlots,
+            // sc-25989). A watched source without its credential
             // fails the host's start here.
             var status = sp.GetRequiredService<IntakeStatus>();
             var lanes = sp.GetRequiredService<WorkSourceRegistry>().Lanes(source => new FactoryItemRunner(options, source, Console.Out), status, Console.Out);

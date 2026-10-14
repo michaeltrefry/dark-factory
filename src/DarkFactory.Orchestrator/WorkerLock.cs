@@ -3,8 +3,9 @@ using DarkFactory.Orchestrator.WorkSources;
 namespace DarkFactory.Orchestrator;
 
 /// <summary>
-/// The sandbox user's lock (sc-25988, E6): the launch helper kills every process of the worker user when it exits, so a second
-/// helper run beside a worker would destroy that worker. Whatever runs as the worker user therefore holds this lock for as long
+/// A sandbox user's lock (sc-25988, E6) — one per worker slot (sc-25989: <see cref="Worker.WorkerSlots"/> hands the slots out;
+/// what is said here of "the sandbox user" holds for each slot's): the launch helper kills every process of its worker user when
+/// it exits, so a second run of that helper beside a worker would destroy that worker. Whatever runs as the worker user therefore holds this lock for as long
 /// as it does: a worker session (implement, a fix round, a CI or conflict fix, a triage, a planner), the gate's sandboxed test
 /// runs, and every deletion or stop done through the helper. It is held for such a phase only — not for a whole run, which waits
 /// on reviews, CI and the merge queue without it — and it is waited for, never failed on, so runs overlap outside those phases.
@@ -56,8 +57,15 @@ public sealed record WorkerLock(string Path)
     /// <summary>Something a hold started that outlives it: the lock stays until <paramref name="Gone"/> completes.</summary>
     private sealed record Kept(Task Gone, string What, Action<string> Report, TimeSpan Every);
 
-    /// <summary>The lock of the work root <paramref name="workRoot"/>.</summary>
-    public static WorkerLock For(string workRoot) => new(System.IO.Path.Combine(System.IO.Path.GetFullPath(workRoot), FileName));
+    /// <summary>The lock of the work root <paramref name="workRoot"/>: its first (or only) sandbox user's, slot 1's.</summary>
+    public static WorkerLock For(string workRoot) => For(workRoot, 1);
+
+    /// <summary>
+    /// The lock of slot <paramref name="slot"/>'s sandbox user in the work root <paramref name="workRoot"/> (sc-25989): slot 1's is
+    /// <see cref="FileName"/>, the file it was before slots; slot n's is <c>.factory-run-n.lock</c>.
+    /// </summary>
+    public static WorkerLock For(string workRoot, int slot) => new(System.IO.Path.Combine(System.IO.Path.GetFullPath(workRoot),
+        slot == 1 ? FileName : $".factory-run-{slot}.lock"));
 
     /// <summary>
     /// Whether the current async flow holds the lock: it is inside a <see cref="HoldAsync{T}"/> of it that has not ended. A task
@@ -209,28 +217,34 @@ public sealed record WorkerLock(string Path)
     /// Runs <paramref name="phase"/> holding the lock if it is free now (or this flow holds it already) and answers true; answers
     /// false, running nothing, when another run or process has it — for clean-up that a later sweep does as well.
     /// </summary>
-    public async Task<bool> TryHoldAsync(Func<Task> phase)
+    public async Task<bool> TryHoldAsync(Func<Task> phase) =>
+        (await TryHoldAsync(async () => { await phase(); return true; })).Held;
+
+    /// <summary>
+    /// <see cref="TryHoldAsync(Func{Task})"/> for a phase with a result: whether the lock was had (<c>Why</c>: the error that
+    /// says it is held, when not), and then what <paramref name="phase"/> answered.
+    /// </summary>
+    public async Task<(bool Held, T? Result, string Why)> TryHoldAsync<T>(Func<Task<T>> phase)
     {
         if (IsHeld)
         {
-            await phase();
-            return true;
+            return (true, await phase(), "");
         }
-        if (TryOpen(out _) is not { } file)
+        if (TryOpen(out var why) is not { } file)
         {
-            return false;
+            return (false, default, why);
         }
-        await HeldAsync(file, async () => { await phase(); return true; });
-        return true;
+        return (true, await HeldAsync(file, phase), "");
     }
 
     /// <summary>
     /// Takes the lock for as long as the answer is not disposed, or fails at once when it is held: for a process that must keep
-    /// every sandboxed run out for its whole life (the acceptance harness), not for a run.
+    /// every sandboxed run out for its whole life (the acceptance harness), not for a run. <paramref name="slot"/>: which slot's
+    /// sandbox user (sc-25989; a process that must keep out every slot takes each).
     /// </summary>
-    public static IDisposable Acquire(string workRoot)
+    public static IDisposable Acquire(string workRoot, int slot = 1)
     {
-        var workerLock = For(workRoot);
+        var workerLock = For(workRoot, slot);
         return workerLock.TryOpen(out _) ?? throw new InvalidOperationException(
             $"Another factory run is using {workRoot} ({workerLock.Path} is locked): a worker phase of it holds the sandbox user.");
     }

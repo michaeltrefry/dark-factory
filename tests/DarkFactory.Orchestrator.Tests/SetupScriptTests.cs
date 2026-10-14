@@ -112,6 +112,112 @@ public class SetupScriptTests
         Assert.Null(Worker.WorkerSandbox.StaleHelperReason(installed, "_dftest"));
     }
 
+    // ---- Worker slots (sc-25989): --slots <n> sets up n users, each with a helper copy pinned to itself ----
+
+    [Fact]
+    public async Task Setup_with_two_slots_creates_two_users_each_with_its_own_uid_home_acls_claude_and_pinned_helper()
+    {
+        var run = new WholeScriptRun(_dir);
+
+        var (exitCode, output) = await run.RunAsync("--slots", "2");
+
+        Assert.True(exitCode == 0, output);
+        var calls = run.Calls;
+        // Each slot's helper is installed at its own path, pinned to its own user and uid, and is the one the orchestrator accepts for that user only.
+        var first = File.ReadAllText(run.InstalledHelperOf(1)); // only read: never run
+        var second = File.ReadAllText(run.InstalledHelperOf(2));
+        Assert.Contains("\nsandbox_user=_dftest\n", first);
+        Assert.Contains("\nsandbox_uid=450\n", first);
+        Assert.Contains("\nsandbox_user=_dftest2\n", second);
+        Assert.Contains("\nsandbox_uid=451\n", second);
+        Assert.Null(Worker.WorkerSandbox.StaleHelperReason(first, "_dftest"));
+        Assert.Null(Worker.WorkerSandbox.StaleHelperReason(second, "_dftest2"));
+        Assert.NotNull(Worker.WorkerSandbox.StaleHelperReason(first, "_dftest2"));
+        // The paths are the ones the orchestrator derives for the slots.
+        Assert.Contains(calls, c => c.StartsWith("install ") && c.EndsWith(" " + Worker.WorkerSlots.HelperOf(WholeScriptRun.HelperPath, 1)));
+        Assert.Contains(calls, c => c.StartsWith("install ") && c.EndsWith(" " + Worker.WorkerSlots.HelperOf(WholeScriptRun.HelperPath, 2)));
+        // One sudoers rule per slot: that slot's helper, as that slot's user only.
+        Assert.Equal(
+            [$"owner ALL=(_dftest) NOPASSWD: {WholeScriptRun.HelperPath}", $"owner ALL=(_dftest2) NOPASSWD: {WholeScriptRun.HelperPath}-2"],
+            run.Sudoers.Split('\n').Where(l => l.Contains("NOPASSWD")));
+        // Each user: its home made its own and closed, the owner's home denied, the work root readable.
+        foreach (var user in new[] { "_dftest", "_dftest2" })
+        {
+            Assert.Contains($"chown {user}:{user} /Users/{user}", calls);
+            Assert.Contains($"chmod 0700 /Users/{user}", calls);
+            Assert.Contains(calls, c => c.StartsWith($"chmod +a user:{user} deny list,search,read,") && c.EndsWith($" {_dir}/ownerhome"));
+            Assert.Contains(calls, c => c.StartsWith($"chmod +a user:{user} allow list,search,read,") && c.EndsWith($" {_dir}/work/root"));
+            // Its own Claude Code install, and the toolchain checked through its own helper as itself.
+            Assert.Contains(calls, c => c.StartsWith($"sudo -u {user} env -i HOME=/Users/{user} ") && c.Contains("claude.ai/install.sh"));
+        }
+        Assert.Contains(calls, c => c.StartsWith($"sudo -u owner sudo -n -u _dftest {WholeScriptRun.HelperPath} "));
+        Assert.Contains(calls, c => c.StartsWith($"sudo -u owner sudo -n -u _dftest2 {WholeScriptRun.HelperPath}-2 "));
+        // Never one slot's helper as the other slot's user.
+        Assert.DoesNotContain(calls, c => c.Contains($"-u _dftest2 {WholeScriptRun.HelperPath} ") || c.Contains($"-u _dftest {WholeScriptRun.HelperPath}-2 "));
+        Assert.Contains("Set Worker__Slots=2", output);
+        Assert.Contains("--slots 2 --remove-worker-login", output);
+    }
+
+    [Fact]
+    public async Task Setup_without_slots_is_the_one_user_the_one_helper_at_the_same_path_and_the_one_rule()
+    {
+        var run = new WholeScriptRun(_dir);
+
+        var (exitCode, output) = await run.RunAsync();
+
+        Assert.True(exitCode == 0, output);
+        Assert.Single(run.Calls, c => c.StartsWith("install ") && c.Contains("factory-worker-launch"));
+        Assert.Contains(run.Calls, c => c.StartsWith("install ") && c.EndsWith(" " + WholeScriptRun.HelperPath));
+        Assert.Equal([$"owner ALL=(_dftest) NOPASSWD: {WholeScriptRun.HelperPath}"], run.Sudoers.Split('\n').Where(l => l.Contains("NOPASSWD")));
+        Assert.DoesNotContain(run.Calls, c => c.Contains("_dftest2"));
+        Assert.DoesNotContain("Worker__Slots", output);
+    }
+
+    [Fact]
+    public async Task Setup_refuses_two_slots_whose_users_share_a_uid_before_installing_anything()
+    {
+        // Each helper sweeps by its pinned uid: two slots on one uid would kill each other's workers.
+        var run = new WholeScriptRun(_dir, secondUid: "450");
+
+        var (exitCode, output) = await run.RunAsync("--slots", "2");
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains("_dftest2 has uid 450, which another slot's worker user already has", output);
+        Assert.DoesNotContain(run.Calls, c => c.StartsWith("install ") || c.StartsWith("visudo ") || c.StartsWith("sudo "));
+    }
+
+    [Theory]
+    [InlineData("0")]
+    [InlineData("9")]
+    [InlineData("two")]
+    public async Task Setup_refuses_a_slot_count_outside_1_to_8(string slots)
+    {
+        var run = new WholeScriptRun(_dir);
+
+        var (exitCode, output) = await run.RunAsync("--slots", slots);
+
+        Assert.Equal(64, exitCode);
+        Assert.Contains("--slots must be a whole number from 1 to 8", output);
+        Assert.DoesNotContain(run.Calls, c => !c.StartsWith("dscl ")); // nothing but (at most) reads
+    }
+
+    [Fact]
+    public async Task Remove_worker_login_with_slots_removes_each_users_login_and_still_runs_no_helper()
+    {
+        var run = new WholeScriptRun(_dir);
+
+        var (exitCode, output) = await run.RunAsync("--slots", "2", "--remove-worker-login");
+
+        Assert.True(exitCode == 0, output);
+        Assert.Contains("ok    _dftest holds no Claude login", output);
+        Assert.Contains("ok    _dftest2 holds no Claude login", output);
+        Assert.False(File.Exists(run.CredentialsFile) || File.Exists(run.CredentialsFileOf(2)), "a credentials file was not removed");
+        Assert.DoesNotContain(run.Calls, c => c.Contains("factory-worker-launch"));
+        Assert.DoesNotContain(run.Calls, c => c.StartsWith("KILL "));
+        Assert.All(run.Calls.Where(c => c.StartsWith("sudo ")), c =>
+            Assert.Matches(@"^sudo -u (_dftest|_dftest2) env -i HOME=/Users/\1 PATH=\S+ (/bin/rm|/bin/test|/usr/bin/security) ", c));
+    }
+
     [Theory]
     [InlineData("89")] // an existing role account outside the range setup allocates (e.g. _spotlight's)
     [InlineData("501")] // a login account
@@ -133,23 +239,34 @@ public class SetupScriptTests
     /// <c>/Users/_dftest</c> the fake sudo maps to a temp dir holding a Claude credentials file and a keychain with two
     /// <c>Claude Code-credentials</c> items, and uid <paramref name="uid"/> (dscl). The fake sudo answers a helper invocation
     /// itself; nothing ever execs a helper. The fake install keeps a copy of the installed helper (<see cref="InstalledHelper"/>).
+    /// With <c>--slots 2</c> the second worker is <c>_dftest2</c> (uid <paramref name="secondUid"/>), with a home and a login of
+    /// its own; each installed helper copy is kept (<see cref="InstalledHelperOf"/>), and the sudoers file (<see cref="Sudoers"/>).
     /// </summary>
     private sealed class WholeScriptRun
     {
         private readonly string _dir;
         private readonly string _log;
         private readonly string _items;
+        private readonly string _sudoers;
 
-        public WholeScriptRun(string dir, string uid = "450")
+        /// <summary>Where setup installs slot 1's helper (its default).</summary>
+        public const string HelperPath = "/usr/local/libexec/dark-factory/factory-worker-launch";
+
+        public WholeScriptRun(string dir, string uid = "450", string secondUid = "451")
         {
             _dir = dir;
             InstalledHelper = Path.Combine(dir, "installed-helper");
             var bin = Directory.CreateDirectory(Path.Combine(dir, "bin")).FullName;
             var home = Path.Combine(dir, "home");
-            Directory.CreateDirectory(Path.Combine(home, ".claude"));
-            Directory.CreateDirectory(Path.Combine(home, "Library", "Keychains"));
-            File.WriteAllText(CredentialsFile = Path.Combine(home, ".claude", ".credentials.json"), "{}");
-            File.WriteAllText(Path.Combine(home, "Library", "Keychains", "login.keychain-db"), "");
+            foreach (var each in new[] { home, home + "2" })
+            {
+                Directory.CreateDirectory(Path.Combine(each, ".claude"));
+                Directory.CreateDirectory(Path.Combine(each, "Library", "Keychains"));
+                File.WriteAllText(Path.Combine(each, ".claude", ".credentials.json"), "{}");
+                File.WriteAllText(Path.Combine(each, "Library", "Keychains", "login.keychain-db"), "");
+            }
+            CredentialsFile = CredentialsFileOf(1);
+            _sudoers = Path.Combine(dir, "installed-sudoers");
             _log = Path.Combine(dir, "calls.log");
             _items = Path.Combine(dir, "keychain-items");
             File.WriteAllText(_items, "2");
@@ -160,14 +277,17 @@ public class SetupScriptTests
                 echo "sudo $*" >>'{{_log}}'
                 for a in "$@"; do
                     case "$a" in
-                        */factory-worker-launch) IFS= read -r _; echo "fake 1.0"; exit 0 ;;
+                        */factory-worker-launch | */factory-worker-launch-[0-9]) IFS= read -r _; echo "fake 1.0"; exit 0 ;;
                     esac
                 done
-                [ "$1" = -u ] && [ "$2" = _dftest ] && [ "$3" = env ] || exit 0
+                [ "$1" = -u ] && { [ "$2" = _dftest ] || [ "$2" = _dftest2 ]; } && [ "$3" = env ] || exit 0
+                home='{{home}}'
+                [ "$2" = _dftest ] || home='{{home}}2'
+                user=$2
                 shift 3
                 while [ "$1" = -i ] || [[ $1 == *=* ]]; do shift; done
                 args=()
-                for a in "$@"; do args+=("${a//\/Users\/_dftest/{{home}}}"); done
+                for a in "$@"; do args+=("${a//\/Users\/$user/$home}"); done
                 case "${args[0]}" in
                     /bin/rm) args[0]=rm ;;
                     /bin/test) args[0]=test ;;
@@ -193,13 +313,18 @@ public class SetupScriptTests
                 case "$*" in
                     *NFSHomeDirectory*) echo "NFSHomeDirectory: {{dir}}/ownerhome" ;;
                     *PrimaryGroupID*) echo "PrimaryGroupID: 450" ;;
+                    */Users/_dftest2\ UniqueID*) echo "UniqueID: {{secondUid}}" ;;
                     *UniqueID*) echo "UniqueID: {{uid}}" ;;
                 esac
                 """);
             SandboxSupport.Executable(bin, "install", $$"""
                 #!/bin/bash
                 echo "install $*" >>'{{_log}}'
-                case "${@: -1}" in */factory-worker-launch) cp "${@: -2:1}" '{{InstalledHelper}}' ;; esac
+                case "${@: -1}" in
+                    */factory-worker-launch) cp "${@: -2:1}" '{{InstalledHelper}}' ;;
+                    */factory-worker-launch-[0-9]) dest="${@: -1}"; cp "${@: -2:1}" '{{InstalledHelper}}'"-${dest##*-}" ;;
+                    */sudoers.d/dark-factory) cp "${@: -2:1}" '{{_sudoers}}' ;;
+                esac
                 """);
             foreach (var name in new[] { "chown", "chmod", "visudo", "mkdir", "curl" })
             {
@@ -214,6 +339,15 @@ public class SetupScriptTests
         public string CredentialsFile { get; }
 
         public string InstalledHelper { get; }
+
+        /// <summary>The copy the fake install kept of slot <paramref name="slot"/>'s installed helper.</summary>
+        public string InstalledHelperOf(int slot) => slot == 1 ? InstalledHelper : $"{InstalledHelper}-{slot}";
+
+        /// <summary>Slot <paramref name="slot"/>'s worker's Claude credentials file, in its fake home.</summary>
+        public string CredentialsFileOf(int slot) => Path.Combine(_dir, slot == 1 ? "home" : $"home{slot}", ".claude", ".credentials.json");
+
+        /// <summary>The sudoers file setup installed (the fake install's copy).</summary>
+        public string Sudoers => File.ReadAllText(_sudoers);
 
         public int KeychainItems => int.Parse(File.ReadAllText(_items).Trim());
 

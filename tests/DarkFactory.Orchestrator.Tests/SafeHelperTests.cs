@@ -450,6 +450,9 @@ public class SafeHelperTests
                 "Assert.Equal(new Worker.WorkerSandbox(\"_df2\", \"/opt/h\") { Lock = Locked(\"/w\") }, custom.Worker" + "Sandbox);",
                 "Assert.Null(options.Worker" + "Sandbox);",
                 "Assert.Throws<InvalidOperationException>(() => Options(new() { [\"Worker:RunAs\"] = \"\" }).Worker" + "Sandbox);",
+                // sc-25989: the configured slots (names, paths and lock files only; nothing is run).
+                "Assert.Equal(unset.Worker" + "Sandbox, Assert.Single(unset.WorkerSlots!.All).Sandbox);",
+                "var three = Options(new() { [\"Worker:Slots\"] = \"3\", [\"Worker:RunAs\"] = \"_df\", [\"Worker:Launch" + "Helper\"] = \"/opt/h\", [\"Factory:WorkRoot\"] = \"/w\" });",
             ],
             ["IntakeLoopTests.cs"] = ["[\"Worker:Launch" + "Helper\"] = \"/nonexistent/df-test-helper\","],
             // sc-25871 (PlanRunnerLockTests): the same nonexistent helper, for a run that must reach neither the lock nor the helper.
@@ -461,6 +464,10 @@ public class SafeHelperTests
             [
                 "Assert.DoesNotContain(calls, c => c.Contains(\"" + helperName + "\")); // the helper (whose exit kills every worker process) never runs",
                 "Assert.Contains(run.Calls, c => c.Contains(\"" + helperName + "\"));",
+                // sc-25989: what setup installs per slot (the fake install's record; no helper is ever run).
+                "Assert.Single(run.Calls, c => c.StartsWith(\"install \") && c.Contains(\"" + helperName + "\"));",
+                "Assert.DoesNotContain(run.Calls, c => c.Contains(\"" + helperName + "\"));",
+                "public const string HelperPath = \"/usr/local/" + installedMarkers[1] + "/" + helperName + "\";",
             ],
         };
 

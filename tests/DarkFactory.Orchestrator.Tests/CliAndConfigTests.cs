@@ -389,6 +389,59 @@ public class FactoryOptionsTests
     private static WorkerLock Locked(string workRoot) => new(Path.Combine(workRoot, ".factory-run.lock"));
 
     [Fact]
+    public void Worker_slots_default_to_the_one_sandbox_user_and_a_configured_count_adds_a_user_a_helper_and_a_lock_each()
+    {
+        // Unset (E9): one slot, which is exactly the sandbox before slots — one user, the same helper path, one lock file.
+        var unset = Options([]);
+        Assert.Equal(1, unset.WorkerSlotCount);
+        Assert.Equal(unset.WorkerSandbox, Assert.Single(unset.WorkerSlots!.All).Sandbox);
+        Assert.Equal("sudo scripts/setup-worker-user.sh", unset.WorkerSlots.All[0].Sandbox.Reinstall);
+
+        // A non-default value is read: slot n is the configured user with n appended, through the configured helper path with -n
+        // appended, under its own lock file.
+        var three = Options(new() { ["Worker:Slots"] = "3", ["Worker:RunAs"] = "_df", ["Worker:LaunchHelper"] = "/opt/h", ["Factory:WorkRoot"] = "/w" });
+        Assert.Equal(3, three.WorkerSlotCount);
+        Assert.Equal([(1, "_df", "/opt/h", "/w/.factory-run.lock"), (2, "_df2", "/opt/h-2", "/w/.factory-run-2.lock"), (3, "_df3", "/opt/h-3", "/w/.factory-run-3.lock")],
+            three.WorkerSlots!.All.Select(s => (s.Number, s.User, s.Sandbox.HelperPath, s.Lock!.Path)));
+        Assert.All(three.WorkerSlots.All, s => Assert.Equal("sudo scripts/setup-worker-user.sh --slots 3", s.Sandbox.Reinstall));
+        Assert.Equal(Worker.WorkerSlots.MaxSlots, Options(new() { ["Worker:Slots"] = "8" }).WorkerSlots!.Count);
+        three.ValidateSettings();
+
+        // Out of range is refused at start-up, naming the key.
+        foreach (var refused in new[] { "0", "-1", "9" })
+        {
+            Assert.Contains("Worker:Slots must be a whole number from 1 to 8",
+                Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:Slots"] = refused }).ValidateSettings()).Message);
+        }
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:Slots"] = "two" }).ValidateSettings());
+    }
+
+    [Fact]
+    public void Worker_slots_with_run_as_none_are_refused_rather_than_ignored()
+    {
+        // Unsandboxed there is no sandbox user and no lock: a slot count would have no consumer (E10).
+        var ex = Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:Slots"] = "2", ["Worker:RunAs"] = "none" }).ValidateSettings());
+        Assert.Contains("Worker:Slots is 2, but Worker:RunAs=none", ex.Message);
+        // 1 (or unset) is today's unsandboxed development mode.
+        var none = Options(new() { ["Worker:Slots"] = "1", ["Worker:RunAs"] = "none" });
+        none.ValidateSettings();
+        Assert.Null(none.WorkerSlots);
+    }
+
+    [Fact]
+    public void More_slots_than_concurrent_runs_is_allowed_and_noted_and_more_runs_than_slots_is_the_ordinary_case()
+    {
+        Options(new() { ["Worker:Slots"] = "3", ["Intake:MaxConcurrentRuns"] = "1" }).ValidateSettings();
+        Options(new() { ["Worker:Slots"] = "1", ["Intake:MaxConcurrentRuns"] = "4" }).ValidateSettings();
+        Assert.Null(FactoryRunner.SlotsNote(slots: 1, runs: 1));
+        Assert.Null(FactoryRunner.SlotsNote(slots: 2, runs: 4));
+        Assert.Null(FactoryRunner.SlotsNote(slots: 2, runs: 2));
+        var note = FactoryRunner.SlotsNote(slots: 3, runs: 2);
+        Assert.Contains("Worker:Slots is 3 but Intake:MaxConcurrentRuns is 2", note);
+        Assert.Contains("raise Intake:MaxConcurrentRuns", note);
+    }
+
+    [Fact]
     public void Run_as_none_runs_workers_as_the_owner_under_the_owners_work_root()
     {
         var options = Options(new() { ["Worker:RunAs"] = "none" });
@@ -660,20 +713,20 @@ public class FactoryOptionsTests
         var workspaces = new Git.GitWorkspace(Path.GetTempPath(), r => $"https://example.invalid/{r.FullName}", (_, _) => Task.FromResult<string?>(null));
 
         var gate = FactoryRunner.CreateGate(options, new GatePipelineTests.FakeGateGitHub(), new GatePipelineTests.FakeReviewer(),
-            workspaces, sandbox: null);
+            workspaces, slots: null);
         using var reviewer = FactoryRunner.ReviewerHttp(options);
 
         Assert.Equal((TimeSpan.FromSeconds(7), TimeSpan.FromMinutes(8)), (gate.CiPollInterval, gate.CiTimeout));
         Assert.Equal(TimeSpan.FromMinutes(9), Assert.IsType<SandboxTestRunner>(gate.Tests).Timeout);
         Assert.Equal((TimeSpan.FromMinutes(12), ReviewOverlays.DefaultPollInterval), (gate.Overlays!.Timeout, gate.Overlays.PollInterval));
         Assert.Equal(ReviewOverlays.DefaultTimeout, FactoryRunner.CreateGate(Options([]), new GatePipelineTests.FakeGateGitHub(),
-            new GatePipelineTests.FakeReviewer(), workspaces, sandbox: null).Overlays!.Timeout);
+            new GatePipelineTests.FakeReviewer(), workspaces, slots: null).Overlays!.Timeout);
         Assert.Equal(TimeSpan.FromMinutes(11), reviewer.Timeout);
         // sc-25709: risk-threshold reads CodeGraph through the same client, its overlay wait on the same timeout; no client, no reader.
         Assert.Null(gate.Risk);
         using var codeGraphHttp = new HttpClient();
         var withCodeGraph = FactoryRunner.CreateGate(options, new GatePipelineTests.FakeGateGitHub(), new GatePipelineTests.FakeReviewer(),
-            workspaces, sandbox: null, new CodeGraph.CodeGraphMcpClient(codeGraphHttp, "cg_test_token"));
+            workspaces, slots: null, new CodeGraph.CodeGraphMcpClient(codeGraphHttp, "cg_test_token"));
         Assert.Equal(TimeSpan.FromMinutes(12), withCodeGraph.Risk!.Overlays.Timeout);
     }
 

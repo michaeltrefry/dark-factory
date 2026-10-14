@@ -12,6 +12,18 @@ internal sealed record FakeIdentity(string User, string Uid, IReadOnlyDictionary
 {
     /// <summary>The sandbox role account as the helper's sweep checks expect it (name <c>_dftest</c>, uid 450, pinned): lets a copy's uid sweep run.</summary>
     public static FakeIdentity SandboxRole { get; } = new("_dftest", "450", new Dictionary<string, string> { ["_dftest"] = "450" }, "450");
+
+    /// <summary>
+    /// Worker slot <paramref name="slot"/>'s role account as setup makes it (sc-25989): <c>_dftest</c> with uid 450 for slot 1,
+    /// <c>_dftest2</c> with 451 for slot 2, …, each helper copy pinned to its own. Every slot's account is known to <c>id</c>, as
+    /// on a machine set up with several.
+    /// </summary>
+    public static FakeIdentity Slot(int slot, int slots = 2) => new(SlotUser(slot), SlotUid(slot),
+        Enumerable.Range(1, slots).ToDictionary(SlotUser, SlotUid), SlotUid(slot));
+
+    public static string SlotUser(int slot) => slot == 1 ? "_dftest" : $"_dftest{slot}";
+
+    public static string SlotUid(int slot) => (449 + slot).ToString();
 }
 
 internal sealed record SafeHelperOptions
@@ -124,6 +136,23 @@ internal sealed class SafeHelper
     public int Passes => int.Parse(File.ReadAllText(PassesFile ?? throw new InvalidOperationException("no fake listing")).Trim());
 
     private static string[] Lines(string file) => File.Exists(file) ? File.ReadAllLines(file) : [];
+
+    /// <summary>
+    /// A <see cref="SafeHelperOptions.FakeListing"/> for a machine with several sandbox users (sc-25989): a process table of
+    /// "pid ppid" rows per uid, of which a copy lists only its own uid's (<c>$self_uid</c>, the helper's own variable) after
+    /// <paramref name="machinery"/> — as the production listing asks <c>ps</c> for <c>-U "$self_uid"</c> and nothing else
+    /// (<see cref="ListPrimitive"/>, which every copy is checked to have had). So what a slot's copy targets is what a real
+    /// helper pinned to that slot's user would be handed.
+    /// </summary>
+    public static string ListingByUid(string machinery, IReadOnlyDictionary<string, string[]> rowsByUid)
+    {
+        Assert.Contains("-U \"$self_uid\"", ListPrimitive);
+        Assert.Contains("-u \"$self_uid\"", ListPrimitive);
+        Assert.All(rowsByUid, kv => Assert.Matches("^[0-9]+$", kv.Key));
+        Assert.All(rowsByUid.Values.SelectMany(rows => rows), row => Assert.Matches("^[0-9]+ [0-9]+$", row));
+        var cases = string.Concat(rowsByUid.Select(kv => $" {kv.Key}) {string.Concat(kv.Value.Select(row => $"echo '{row}'; "))};;"));
+        return $"{machinery}; case \"$self_uid\" in{cases} esac";
+    }
 
     /// <summary>Whether the production helper's text contains <paramref name="value"/> (for assertions about it).</summary>
     public static bool SourceContains(string value) => Source.Contains(value, StringComparison.Ordinal);

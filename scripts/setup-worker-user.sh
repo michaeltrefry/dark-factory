@@ -1,29 +1,37 @@
 #!/bin/bash
 # setup-worker-user.sh — one-time, idempotent setup of the Dark Factory worker sandbox (E5).
 #
-#   sudo scripts/setup-worker-user.sh [--owner <user>] [--worker <user>] [--work-root <dir>] [--remove-worker-login]
+#   sudo scripts/setup-worker-user.sh [--owner <user>] [--worker <user>] [--slots <n>] [--work-root <dir>] [--remove-worker-login]
 #
-# --remove-worker-login (opt-in, standalone): deletes only the worker user's own Claude Code login — its
+# --slots <n> (1-8, default 1; the orchestrator's Worker:Slots, which must not be larger): how many sandbox
+# users to set up, one per worker slot. The first is the worker user itself (default _factory, helper
+# factory-worker-launch); slot 2 is <worker>2 (_factory2, helper factory-worker-launch-2), slot 3 <worker>3,
+# and so on. Each gets everything below for itself, and its own copy of the launch helper pinned to its own
+# name and uid. A re-run with a smaller <n> leaves the higher slots' accounts in place but drops their
+# sudoers rules, so their helpers can no longer be run.
+#
+# --remove-worker-login (opt-in, standalone): deletes only each worker user's own Claude Code login — its
 # ~/.claude/.credentials.json and its 'Claude Code-credentials' keychain item — so the worker holds no
 # provider credential (E5; Worker:Auth=router-key, the default). It skips the setup entirely (no installs,
-# no helper, no toolchain check), so it signals no process.
+# no helper, no toolchain check), so it signals no process. With --slots <n> it does so for each of the n users.
 #
-# A normal (re)run KILLS EVERY PROCESS OF THE WORKER USER: its toolchain check runs commands through the
-# launch helper, and each helper exit kills all of that user's processes (a running `factory work` worker,
+# A normal (re)run KILLS EVERY PROCESS OF EVERY WORKER USER: its toolchain check runs commands through each
+# launch helper, and each helper exit kills all of its user's processes (a running `factory work` worker,
 # an interactive `sudo -u _factory` session). Close those sessions and stop `factory work` first.
 #
-# Creates a hidden role account (default _factory) whose workers:
+# Creates a hidden role account per slot (default _factory, _factory2, …) whose workers:
 #   - cannot traverse the owner's home (so no ~/.ssh, ~/.config/gh or login keychain),
 #   - get dotnet, git and their own Claude Code install,
-#   - run only through the root-owned launch helper, which the owner may start as the
-#     worker user without a password (one sudoers.d rule, nothing else).
+#   - run only through their own root-owned launch helper, which the owner may start as that
+#     worker user without a password (one sudoers.d rule per slot, nothing else).
 # The work root (clones + worktrees) is owned by the owner under a root-owned parent and is
-# readable by the worker; the orchestrator grants write access per worktree.
+# readable by every worker user; the orchestrator grants write access per worktree, to one slot's user.
 # Re-running it changes nothing that is already in place.
 set -euo pipefail
 
 owner=${SUDO_USER:-}
 worker=_factory
+slots=1
 work_root=/opt/dark-factory/work
 helper_dir=/usr/local/libexec/dark-factory
 helper=$helper_dir/factory-worker-launch
@@ -35,16 +43,31 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --owner) owner=$2; shift 2 ;;
         --worker) worker=$2; shift 2 ;;
+        --slots) slots=$2; shift 2 ;;
         --work-root) work_root=$2; shift 2 ;;
         --remove-worker-login) remove_worker_login=1; shift ;;
-        *) echo "usage: sudo $0 [--owner <user>] [--worker <user>] [--work-root <dir>] [--remove-worker-login]" >&2; exit 64 ;;
+        *) echo "usage: sudo $0 [--owner <user>] [--worker <user>] [--slots <n>] [--work-root <dir>] [--remove-worker-login]" >&2; exit 64 ;;
     esac
 done
 
 [ "$(uname -s)" = Darwin ] || { echo "macOS only." >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || { echo "Run with sudo." >&2; exit 1; }
 [[ $worker =~ ^_?[a-z][a-z0-9_-]*$ ]] || { echo "Invalid worker user name: $worker" >&2; exit 64; }
-worker_home=/Users/$worker
+[[ $slots =~ ^[1-8]$ ]] || { echo "--slots must be a whole number from 1 to 8 (got '$slots')." >&2; exit 64; }
+
+# The slots: slot 1 is the worker user and the helper as they were before slots; slot n adds n to both names
+# (as the orchestrator does: WorkerSlots.UserOf, WorkerSlots.HelperOf).
+first_worker=$worker
+first_helper=$helper
+slot_worker() { if [ "$1" -eq 1 ]; then echo "$first_worker"; else echo "$first_worker$1"; fi; }
+slot_helper() { if [ "$1" -eq 1 ]; then echo "$first_helper"; else echo "$first_helper-$1"; fi; }
+# Everything below works on one slot at a time, through these three.
+use_slot() {
+    worker=$(slot_worker "$1")
+    helper=$(slot_helper "$1")
+    worker_home=/Users/$worker
+}
+use_slot 1
 
 say() { echo "==> $*"; }
 
@@ -53,10 +76,11 @@ say() { echo "==> $*"; }
 cd /
 as_worker() { sudo -u "$worker" env -i "HOME=$worker_home" PATH=/usr/bin:/bin:/usr/sbin:/sbin "$@"; }
 
-# --remove-worker-login: delete the worker's own Claude login and nothing else. Never through the
+# --remove-worker-login: delete each worker's own Claude login and nothing else. Never through the
 # launch helper (its exit kills every process of the worker user), and done as the worker, never as
 # root (root following a symlink the worker planted in its home could delete anything).
-if [ "$remove_worker_login" -eq 1 ]; then
+remove_login() {
+    local kc status
     id "$worker" >/dev/null 2>&1 || { echo "No such worker user: $worker" >&2; exit 1; }
     say "Removing $worker's own Claude login (nothing else runs; no process is signalled)"
     as_worker /bin/rm -f "$worker_home/.claude/.credentials.json"
@@ -78,6 +102,12 @@ if [ "$remove_worker_login" -eq 1 ]; then
         exit 1
     fi
     echo "    ok    $worker holds no Claude login"
+}
+if [ "$remove_worker_login" -eq 1 ]; then
+    for slot in $(seq 1 "$slots"); do
+        use_slot "$slot"
+        remove_login
+    done
     exit 0
 fi
 
@@ -88,11 +118,14 @@ case "$work_root/" in
     /*) ;;
     *) echo "--work-root must be absolute." >&2; exit 64 ;;
 esac
-case "$work_root/" in
-    "$owner_home"/* | "$worker_home"/*)
-        echo "--work-root must be outside both homes (the worker can't enter the owner's; it could swap paths in its own)." >&2
-        exit 64 ;;
-esac
+for slot in $(seq 1 "$slots"); do
+    use_slot "$slot"
+    case "$work_root/" in
+        "$owner_home"/* | "$worker_home"/*)
+            echo "--work-root must be outside every home (a worker can't enter the owner's; it could swap paths in its own)." >&2
+            exit 64 ;;
+    esac
+done
 
 # Removes then adds an ACL entry so re-runs don't stack duplicates. Never recursive: chmod -R
 # applies ACLs to symlink targets, and this runs as root over trees the worker can write.
@@ -101,7 +134,6 @@ set_acl() { # set_acl <entry> <path>
     chmod +a "$1" "$2"
 }
 
-# --- 1. Hidden role account with its own group (not staff) ---------------------------
 free_id() { # lowest id in 400-499 unused as both a UID and a GID
     local used id
     used=$( (dscl . -list /Users UniqueID; dscl . -list /Groups PrimaryGroupID) | awk '{print $2}')
@@ -111,46 +143,70 @@ free_id() { # lowest id in 400-499 unused as both a UID and a GID
     echo "No free id in 400-499" >&2; exit 1
 }
 
-if ! dscl . -read "/Groups/$worker" >/dev/null 2>&1; then
-    gid=$(free_id)
-    say "Creating group $worker ($gid)"
-    dscl . -create "/Groups/$worker"
-    dscl . -create "/Groups/$worker" PrimaryGroupID "$gid"
-    dscl . -create "/Groups/$worker" RealName "Dark Factory worker"
-    dscl . -create "/Groups/$worker" Password '*'
-fi
-gid=$(dscl . -read "/Groups/$worker" PrimaryGroupID | awk '{print $2}')
+# --- 1. Hidden role account with its own group (not staff), one per slot ---------------
+# Sets uid to the slot's worker's.
+create_account() {
+    local gid
+    if ! dscl . -read "/Groups/$worker" >/dev/null 2>&1; then
+        gid=$(free_id)
+        say "Creating group $worker ($gid)"
+        dscl . -create "/Groups/$worker"
+        dscl . -create "/Groups/$worker" PrimaryGroupID "$gid"
+        dscl . -create "/Groups/$worker" RealName "Dark Factory worker"
+        dscl . -create "/Groups/$worker" Password '*'
+    fi
+    gid=$(dscl . -read "/Groups/$worker" PrimaryGroupID | awk '{print $2}')
 
-if ! dscl . -read "/Users/$worker" >/dev/null 2>&1; then
-    uid=$(free_id)
-    say "Creating hidden user $worker ($uid)"
-    dscl . -create "/Users/$worker"
-    dscl . -create "/Users/$worker" UniqueID "$uid"
-    dscl . -create "/Users/$worker" PrimaryGroupID "$gid"
-    dscl . -create "/Users/$worker" RealName "Dark Factory worker"
-    dscl . -create "/Users/$worker" NFSHomeDirectory "$worker_home"
-    dscl . -create "/Users/$worker" UserShell /usr/bin/false
-    dscl . -create "/Users/$worker" Password '*'
-    dscl . -create "/Users/$worker" IsHidden 1
-fi
-# The helper's uid sweep runs only as this uid, which it pins (step 4): it must be one this script allocates.
-uid=$(dscl . -read "/Users/$worker" UniqueID | awk '{print $2}')
-if ! [[ $uid =~ ^[0-9]+$ ]] || [ "$uid" -lt 400 ] || [ "$uid" -gt 499 ]; then
-    echo "$worker has uid '$uid', outside 400-499: not a role account this script created. Pick another --worker." >&2
-    exit 1
-fi
+    if ! dscl . -read "/Users/$worker" >/dev/null 2>&1; then
+        uid=$(free_id)
+        say "Creating hidden user $worker ($uid)"
+        dscl . -create "/Users/$worker"
+        dscl . -create "/Users/$worker" UniqueID "$uid"
+        dscl . -create "/Users/$worker" PrimaryGroupID "$gid"
+        dscl . -create "/Users/$worker" RealName "Dark Factory worker"
+        dscl . -create "/Users/$worker" NFSHomeDirectory "$worker_home"
+        dscl . -create "/Users/$worker" UserShell /usr/bin/false
+        dscl . -create "/Users/$worker" Password '*'
+        dscl . -create "/Users/$worker" IsHidden 1
+    fi
+    # The helper's uid sweep runs only as this uid, which it pins (step 4): it must be one this script allocates.
+    uid=$(dscl . -read "/Users/$worker" UniqueID | awk '{print $2}')
+    if ! [[ $uid =~ ^[0-9]+$ ]] || [ "$uid" -lt 400 ] || [ "$uid" -gt 499 ]; then
+        echo "$worker has uid '$uid', outside 400-499: not a role account this script created. Pick another --worker." >&2
+        exit 1
+    fi
 
-if [ ! -d "$worker_home" ]; then
-    say "Creating $worker_home"
-    mkdir -p "$worker_home"
-fi
-chown "$worker:$worker" "$worker_home"
-chmod 0700 "$worker_home"
+    if [ ! -d "$worker_home" ]; then
+        say "Creating $worker_home"
+        mkdir -p "$worker_home"
+    fi
+    chown "$worker:$worker" "$worker_home"
+    chmod 0700 "$worker_home"
+}
 
-# --- 2. Close the owner's home to the worker ------------------------------------------
+# Before anything is installed or changed for any slot: every slot's account exists with a uid of its own
+# in the range. Each helper sweeps by its pinned uid, so two slots sharing one would kill each other's workers.
+uids=()
+for slot in $(seq 1 "$slots"); do
+    use_slot "$slot"
+    create_account
+    for other in ${uids[@]+"${uids[@]}"}; do
+        if [ "$other" = "$uid" ]; then
+            echo "$worker has uid $uid, which another slot's worker user already has: each slot needs a uid of its own." >&2
+            exit 1
+        fi
+    done
+    uids+=("$uid")
+done
+
+# --- 2. Close the owner's home to each worker -----------------------------------------
 # Denying traversal at the top covers ~/.ssh, ~/.config/gh, ~/Library/Keychains and the rest.
-say "Denying $worker access to $owner_home"
-set_acl "user:$worker deny list,search,read,add_file,add_subdirectory,delete_child,readattr,readextattr,readsecurity" "$owner_home"
+# (Each worker's own home is 0700, so no worker enters another's.)
+for slot in $(seq 1 "$slots"); do
+    use_slot "$slot"
+    say "Denying $worker access to $owner_home"
+    set_acl "user:$worker deny list,search,read,add_file,add_subdirectory,delete_child,readattr,readextattr,readsecurity" "$owner_home"
+done
 
 # --- 3. Work root: owner-owned, worker-readable, under a root-owned parent -------------
 say "Preparing work root $work_root"
@@ -164,27 +220,34 @@ chown "$owner:staff" "$work_root"
 chmod 0700 "$work_root"
 # Only the work root itself: clones and worktrees created under it later inherit the entry.
 # (A clone made before this ran stays unreadable to the worker; delete $work_root/repos to re-clone.)
-set_acl "user:$worker allow list,search,read,readattr,readextattr,readsecurity,file_inherit,directory_inherit" "$work_root"
+for slot in $(seq 1 "$slots"); do
+    use_slot "$slot"
+    set_acl "user:$worker allow list,search,read,readattr,readextattr,readsecurity,file_inherit,directory_inherit" "$work_root"
+done
 
-# --- 4. Launch helper (root-owned) and the one sudoers rule ---------------------------
-say "Installing $helper"
+# --- 4. Launch helpers (root-owned, one per slot) and one sudoers rule each ------------
 install -d -o root -g wheel -m 0755 "$helper_dir"
-# The helper kills every process of sandbox_user when a run ends, so it must name this worker and pin
-# its uid. The orchestrator compares the installed file with the repo's after these same two edits.
-helper_src=$(mktemp)
-sed -e "s/^sandbox_user=.*/sandbox_user=$worker/" -e "s/^sandbox_uid=.*/sandbox_uid=$uid/" \
-    "$script_dir/factory-worker-launch" >"$helper_src"
-grep -qx "sandbox_user=$worker" "$helper_src" || { echo "Could not set sandbox_user in the helper." >&2; exit 1; }
-grep -qx "sandbox_uid=$uid" "$helper_src" || { echo "Could not set sandbox_uid in the helper." >&2; exit 1; }
-install -o root -g wheel -m 0755 "$helper_src" "$helper"
-rm -f "$helper_src"
-
 rule=$(mktemp)
-cat >"$rule" <<EOF
-# Dark Factory: $owner may run only the worker launch helper, only as $worker.
+for slot in $(seq 1 "$slots"); do
+    use_slot "$slot"
+    uid=${uids[$((slot - 1))]}
+    say "Installing $helper"
+    # The helper kills every process of sandbox_user when a run ends, so each copy must name its own worker and
+    # pin its uid. The orchestrator compares each installed file with the repo's after these same two edits.
+    helper_src=$(mktemp)
+    sed -e "s/^sandbox_user=.*/sandbox_user=$worker/" -e "s/^sandbox_uid=.*/sandbox_uid=$uid/" \
+        "$script_dir/factory-worker-launch" >"$helper_src"
+    grep -qx "sandbox_user=$worker" "$helper_src" || { echo "Could not set sandbox_user in the helper." >&2; exit 1; }
+    grep -qx "sandbox_uid=$uid" "$helper_src" || { echo "Could not set sandbox_uid in the helper." >&2; exit 1; }
+    install -o root -g wheel -m 0755 "$helper_src" "$helper"
+    rm -f "$helper_src"
+    # One rule per slot: this helper, as this worker only (never another slot's helper as this user).
+    cat >>"$rule" <<EOF
+# Dark Factory: $owner may run only the worker launch helper $helper, only as $worker.
 Defaults!$helper !use_pty, !log_output
 $owner ALL=($worker) NOPASSWD: $helper
 EOF
+done
 visudo -cqf "$rule"
 install -o root -g wheel -m 0440 "$rule" "$sudoers"
 rm -f "$rule"
@@ -192,10 +255,13 @@ grep -q '^#includedir /private/etc/sudoers.d' /etc/sudoers \
     || echo "warning: /etc/sudoers has no '#includedir /private/etc/sudoers.d'; the rule is inactive." >&2
 
 # --- 5. Toolchain: dotnet and git are system-wide; Claude Code installs per user ------
-if [ ! -x "$worker_home/.local/bin/claude" ]; then
-    say "Installing Claude Code for $worker (native installer)"
-    as_worker /bin/bash -c 'cd ~ && curl -fsSL https://claude.ai/install.sh | bash'
-fi
+for slot in $(seq 1 "$slots"); do
+    use_slot "$slot"
+    if [ ! -x "$worker_home/.local/bin/claude" ]; then
+        say "Installing Claude Code for $worker (native installer)"
+        as_worker /bin/bash -c 'cd ~ && curl -fsSL https://claude.ai/install.sh | bash'
+    fi
+done
 
 # Runs <command...> (the helper) the way the orchestrator does: the empty variable block on
 # stdin, then stdin held open until the command exits. The helper takes stdin EOF as Stop and
@@ -262,27 +328,38 @@ check_optional_toolchain() {
     return 0
 }
 
-echo "warning: the toolchain check runs commands as $worker through the helper, and each helper exit KILLS EVERY" >&2
-echo "         $worker process (a running factory work worker, any sudo -u $worker session). Close those first." >&2
-say "Checking the toolchain as $worker through the helper"
-check_toolchain "/usr/local/share/dotnet/dotnet --version" "git --version" "claude --version" || exit 1
+for slot in $(seq 1 "$slots"); do
+    use_slot "$slot"
+    echo "warning: the toolchain check runs commands as $worker through the helper, and each helper exit KILLS EVERY" >&2
+    echo "         $worker process (a running factory work worker, any sudo -u $worker session). Close those first." >&2
+    say "Checking the toolchain as $worker through the helper"
+    check_toolchain "/usr/local/share/dotnet/dotnet --version" "git --version" "claude --version" || exit 1
 
-# Rust target repositories only (sc-25875): the merge gate's new-tests check runs cargo as the
-# worker. cargo and rustc must be on the helper's fixed PATH - /opt/homebrew/bin or
-# /usr/local/bin (e.g. `brew install rust`, or rustup installed as $worker with its cargo and
-# rustc linked into /usr/local/bin). Without them every Rust pull request's check is an error
-# (toolchain-missing), never a pass; a factory that builds only .NET needs neither.
-say "Checking the optional Rust toolchain as $worker through the helper"
-check_optional_toolchain "Rust repos only: the new-tests check of a Rust pull request fails without it" "cargo --version" "rustc --version"
+    # Rust target repositories only (sc-25875): the merge gate's new-tests check runs cargo as the
+    # worker. cargo and rustc must be on the helper's fixed PATH - /opt/homebrew/bin or
+    # /usr/local/bin (e.g. `brew install rust`, or rustup installed as $worker with its cargo and
+    # rustc linked into /usr/local/bin). Without them every Rust pull request's check is an error
+    # (toolchain-missing), never a pass; a factory that builds only .NET needs neither.
+    say "Checking the optional Rust toolchain as $worker through the helper"
+    check_optional_toolchain "Rust repos only: the new-tests check of a Rust pull request fails without it" "cargo --version" "rustc --version"
 
-say "Done. Worker user: $worker  Helper: $helper  Work root: $work_root"
+    say "Done. Worker user: $worker  Helper: $helper  Work root: $work_root"
+done
+
+slots_flag=
+[ "$slots" -eq 1 ] || slots_flag=" --slots $slots"
+use_slot 1
 cat <<EOF
 
 Workers use Worker:Auth=router-key (the default) and hold only the router key: enroll your plans on the
-router instead (router login claude, router login codex). If $worker still has a Claude login of its
+router instead (router login claude, router login codex). If a worker user still has a Claude login of its
 own, remove it (that runs nothing else and signals no process):
-    sudo $0 --remove-worker-login
-Worker:Auth=claude-login (weaker: the worker holds a Claude login, which E5 forbids) needs the worker's
-own login instead:
+    sudo $0$slots_flag --remove-worker-login
+Worker:Auth=claude-login (weaker: the worker holds a Claude login, which E5 forbids) needs each worker's
+own login instead (once per worker user):
     sudo -u $worker -H $worker_home/.local/bin/claude      # then /login, then /exit
 EOF
+if [ "$slots" -gt 1 ]; then
+    echo
+    echo "Set Worker__Slots=$slots for the factory (a Worker:Slots larger than the slots set up here fails start-up)."
+fi

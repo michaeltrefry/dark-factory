@@ -858,7 +858,9 @@ public sealed class GitWorkspace(
                 {
                     continue;
                 }
-                await DeleteWorktreeAsync(clone, worktree, ct);
+                // Not waited for: the sweep runs inside a worker phase, which has its own slot's user at once; a leftover another
+                // slot's user wrote (sc-25989) is deleted only if that slot is free now, and is otherwise left to a later sweep.
+                await DeleteWorktreeAsync(clone, worktree, ct, waitForWorker: false);
             }
         }
     }

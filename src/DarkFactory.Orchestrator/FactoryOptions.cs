@@ -162,10 +162,45 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
     /// <c>Worker:RunAs</c> (default <c>_factory</c>) runs workers as that macOS user through
     /// <c>Worker:LaunchHelper</c>; <c>none</c> runs them as the owner (development only). The sandbox carries the work root's
     /// <see cref="WorkerLock"/> (sc-25988): every run of the helper, by any run of this process or another, happens under it.
+    /// This is slot 1's sandbox, the only one unless <c>Worker:Slots</c> says more (<see cref="WorkerSlots"/>).
     /// </summary>
-    public Worker.WorkerSandbox? WorkerSandbox => WorkerUser is { } user
-        ? new Worker.WorkerSandbox(user, config["Worker:LaunchHelper"] ?? Worker.WorkerSandbox.DefaultHelperPath) { Lock = WorkerLock.For(WorkRoot) }
+    public Worker.WorkerSandbox? WorkerSandbox => WorkerSlots?.All[0].Sandbox;
+
+    /// <summary>
+    /// The worker slots (sc-25989), or null for <c>Worker:RunAs=none</c>: <see cref="WorkerSlotCount"/> sandbox users, each with its
+    /// own launch helper and its own lock in the work root. Slot 1 is <c>Worker:RunAs</c> through <c>Worker:LaunchHelper</c> under
+    /// <see cref="WorkerLock.FileName"/>, exactly the sandbox before slots; slot n is <c>&lt;Worker:RunAs&gt;n</c> through
+    /// <c>&lt;Worker:LaunchHelper&gt;-n</c> (<see cref="Worker.WorkerSlots.UserOf"/>, <see cref="Worker.WorkerSlots.HelperOf"/>: the
+    /// names <c>setup-worker-user.sh --slots n</c> creates and installs).
+    /// </summary>
+    public Worker.WorkerSlots? WorkerSlots => WorkerSlotCount is var count && WorkerUser is { } user
+        ? Worker.WorkerSlots.Create(user, config["Worker:LaunchHelper"] ?? Worker.WorkerSandbox.DefaultHelperPath, WorkRoot, count)
         : null;
+
+    /// <summary>
+    /// <c>Worker:Slots</c> (sc-25989): how many sandbox users run workers side by side, 1 (the default: the one sandbox user, as
+    /// before slots) to <see cref="Worker.WorkerSlots.MaxSlots"/>. Two runs are in a worker phase at once only in different slots,
+    /// so it bounds the worker sessions at a time; it is independent of <c>Intake:MaxConcurrentRuns</c>, which may be larger (runs
+    /// also overlap outside worker phases — reviews, CI, the merge queue) or smaller (the other slots then serve a
+    /// <c>factory run</c> beside <c>factory work</c>). With <c>Worker:RunAs=none</c> there is no sandbox user and no slot: any
+    /// value but 1 is refused rather than ignored.
+    /// </summary>
+    public int WorkerSlotCount
+    {
+        get
+        {
+            var slots = config.GetValue("Worker:Slots", 1);
+            if (slots is < 1 or > Worker.WorkerSlots.MaxSlots)
+            {
+                throw new InvalidOperationException($"Worker:Slots must be a whole number from 1 to {Worker.WorkerSlots.MaxSlots}.");
+            }
+            return slots == 1 || WorkerUser is not null
+                ? slots
+                : throw new InvalidOperationException(
+                    $"Worker:Slots is {slots}, but Worker:RunAs=none runs workers as the owner, with no sandbox user and so no slot: "
+                    + "remove Worker:Slots (or set it to 1), or set Worker:RunAs to the worker user.");
+        }
+    }
 
     /// <summary><c>Worker:RunAs</c>: the sandbox user, or null for <c>none</c>.</summary>
     private string? WorkerUser => (config["Worker:RunAs"] ?? Worker.WorkerSandbox.DefaultUser) switch
@@ -461,7 +496,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
     /// </summary>
     public void ValidateSettings()
     {
-        _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSandbox, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures, MaxConcurrentRuns);
+        _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSlotCount, WorkerSlots, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures, MaxConcurrentRuns);
         _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
         _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl, KanbanMcpUrl);
         _ = (CodeGraphOverlayTimeout, KanbanWatchScope, KanbanWebUrl);

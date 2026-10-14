@@ -319,7 +319,7 @@ public class PlanPipelineTests
 
         public Task<RunOutcome> RunWith(IWorkSource source, IPlanRunner? runner, int id = 77, CancellationToken ct = default) =>
             new RunPipeline(source, Ledger, Locks, Workspaces, Implementer, Prs, Sandbox, TextWriter.Null, controls: Controls,
-                controlPollInterval: TimeSpan.FromMilliseconds(10), planner: runner, configuredRepos: Configured, workerLock: Lock).RunAsync(id, ct);
+                controlPollInterval: TimeSpan.FromMilliseconds(10), planner: runner, configuredRepos: Configured, slots: TestSlots.Of(Lock)).RunAsync(id, ct);
 
         /// <summary>Puts sc-77 in the ledger as an earlier run left it: in Plan, then each row (a null step is a transition to that state).</summary>
         public async Task Left(params (string? Step, WorkState State, string? Detail)[] rows)

@@ -94,6 +94,11 @@ internal static class Harness
             try
             {
                 sandbox.EnsureReadyAsync(Options.WorkerAuth, Options.ClaudePath, CancellationToken.None).GetAwaiter().GetResult();
+                // Every further worker slot (sc-25989), each probed through its own helper under its own lock.
+                foreach (var slot in Options.WorkerSlots!.All.Skip(1))
+                {
+                    slot.Sandbox.EnsureReadyAsync(Options.WorkerAuth, Options.ClaudePath, CancellationToken.None).GetAwaiter().GetResult();
+                }
             }
             catch (InvalidOperationException ex)
             {
