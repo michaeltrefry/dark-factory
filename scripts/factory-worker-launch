@@ -16,8 +16,10 @@
 #   orchestrator died) the worker is killed.
 #
 # The worker gets a fresh environment: HOME (from the password database, never the
-# caller's), a fixed PATH, MSBuild/dotnet settings that keep build servers from
-# lingering, and only the allowlisted router variables (E1/E5).
+# caller's), a fixed PATH, TMPDIR (the user's own temporary directory, so no two sandbox
+# users share one: dotnet's NuGet keeps its locks under $TMPDIR/NuGetScratch, and one in
+# /tmp made by _factory refuses _factory2's restore, sc-25992), MSBuild/dotnet settings that
+# keep build servers from lingering, and only the allowlisted router variables (E1/E5).
 #
 # Killing: the worker's process tree and process group, and then — when running as the
 # sandbox user — every other process of that user, which also catches anything that
@@ -44,7 +46,7 @@ sandbox_uid=
 # The orchestrator refuses to start unless the installed helper is this file (EnsureReadyAsync):
 # re-run setup-worker-user.sh after any change here.
 # shellcheck disable=SC2034 # read by the orchestrator, not by this script
-helper_version=4
+helper_version=5
 
 usage() {
     echo "usage: factory-worker-launch <program> [args...] (router variables on stdin)" >&2
@@ -97,6 +99,16 @@ fi
 unset HOME
 home=~
 path="$home/.local/bin:/usr/local/share/dotnet:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# The running user's own temporary directory (macOS's per-user /var/folders/…/T/, made 0700 for
+# that user if it is missing); with none the worker would fall back to the shared /tmp.
+tmpdir=$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)
+case "$tmpdir" in
+    /*) ;;
+    *)
+        echo "factory-worker-launch: no per-user temporary directory (getconf DARWIN_USER_TEMP_DIR)" >&2
+        exit 70
+        ;;
+esac
 
 # Stops a process and all of its descendants: freeze top-down so nothing can fork
 # away, then kill everything collected.
@@ -229,7 +241,7 @@ kill_sandbox_user() {
 # non-zero.
 exec 3>&2 2>/dev/null
 set -m # the worker gets its own process group
-/usr/bin/env -i "HOME=$home" "PATH=$path" MSBUILDDISABLENODEREUSE=1 DOTNET_CLI_USE_MSBUILD_SERVER=0 \
+/usr/bin/env -i "HOME=$home" "PATH=$path" "TMPDIR=$tmpdir" MSBUILDDISABLENODEREUSE=1 DOTNET_CLI_USE_MSBUILD_SERVER=0 \
     ${vars[@]+"${vars[@]}"} "$@" </dev/null 2>&3 3>&- &
 worker=$!
 set +m

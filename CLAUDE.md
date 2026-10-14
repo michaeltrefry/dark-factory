@@ -322,7 +322,9 @@ Worker sandbox (E5): workers run as a hidden sandbox user — `_factory`, or wit
 helper, as that user only). Everything in this paragraph holds per sandbox user.
 The owner's home is ACL-denied to it, so `~/.ssh`, `~/.config/gh` and the login keychain are
 unreachable. Router variables go to the helper on stdin; the helper builds the worker env from scratch
-(PATH, HOME from the password database, MSBuild node reuse/build server off, router vars), refuses any
+(PATH, HOME from the password database, TMPDIR the user's own `getconf DARWIN_USER_TEMP_DIR` — never the shared `/tmp`,
+where one sandbox user's NuGet locks refuse another's restore, helper_version 5, sc-25992 — MSBuild node reuse/build server off,
+router vars), refuses any
 other variable or a program that isn't an absolute path/plain name, and when the worker exits or its stdin
 closes kills the tree, the process group and then every other process of its own user (a sweep of `ps -U "$self_uid"`, the
 helper's own uid and no other, that spares the helper's own pid and its descendants — never `kill -1`, which on macOS kills the
@@ -353,7 +355,7 @@ worker phase with sudo's "a password is required". The readiness check has
 two parts (sc-25988), because a run of a helper kills every process of its user and so belongs under that slot's lock.
 What start-up checks, running nothing and taking no lock (`WorkerSlots.EnsureHelpersCurrentAsync` →
 `WorkerSandbox.EnsureHelperCurrentAsync` per slot): EVERY slot's installed helper is
-read and must have `helper_version` ≥ `WorkerSandbox.HelperVersion` (4), name its own slot's user as `sandbox_user`, pin a uid,
+read and must have `helper_version` ≥ `WorkerSandbox.HelperVersion` (5), name its own slot's user as `sandbox_user`, pin a uid,
 and, with those two lines undone, have the SHA-256 of the
 repo's helper (compiled into the orchestrator as a resource) — else `Stale helper: … re-run \`sudo scripts/setup-worker-user.sh\``
 (or `cannot read the launch helper …`), led with several slots by the slot that failed (`Worker slot 2 (_factory2): Stale

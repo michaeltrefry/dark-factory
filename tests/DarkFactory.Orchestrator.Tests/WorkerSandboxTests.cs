@@ -123,6 +123,16 @@ internal static class SandboxSupport
         return home;
     }
 
+    /// <summary>The current user's own temporary directory (what the helper must give the worker as TMPDIR, sc-25992).</summary>
+    public static string UserTempDir()
+    {
+        var psi = new ProcessStartInfo("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"]) { RedirectStandardOutput = true };
+        using var p = Process.Start(psi)!;
+        var dir = p.StandardOutput.ReadToEnd().Trim();
+        p.WaitForExit();
+        return dir;
+    }
+
     /// <summary>
     /// The process whose "pid|start" record (<see cref="OwnProcess.ShellRecord"/>) a worker script wrote to
     /// <paramref name="pidFile"/>. Startup through the launch helper can take seconds on a loaded machine, so this waits up
@@ -171,8 +181,8 @@ public class WorkerSandboxTests
     }
 
     [Theory]
-    [InlineData(WorkerAuth.ClaudeLogin, new[] { "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH" })]
-    [InlineData(WorkerAuth.RouterKey, new[] { "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH" })]
+    [InlineData(WorkerAuth.ClaudeLogin, new[] { "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR" })]
+    [InlineData(WorkerAuth.RouterKey, new[] { "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR" })]
     public async Task Helper_gives_the_worker_exactly_the_allowlisted_environment(WorkerAuth auth, string[] expected)
     {
         Environment.SetEnvironmentVariable("GH_TOKEN", "ghp_owner_should_not_leak");
@@ -192,6 +202,8 @@ public class WorkerSandboxTests
             Assert.StartsWith(env["HOME"] + "/.local/bin:", env["PATH"]);
             // Build servers would otherwise detach and outlive the run.
             Assert.Equal(("1", "0"), (env["MSBUILDDISABLENODEREUSE"], env["DOTNET_CLI_USE_MSBUILD_SERVER"]));
+            // The running user's own temporary directory, never the shared /tmp (sc-25992: NuGet's locks live under it).
+            Assert.Equal(SandboxSupport.UserTempDir(), env["TMPDIR"]);
         }
         finally
         {
@@ -561,13 +573,13 @@ public class WorkerSandboxTests
     }
 
     [Fact]
-    public void The_helper_is_version_4_and_an_installed_version_3_is_stale()
+    public void The_helper_is_version_5_and_an_installed_version_4_is_stale()
     {
-        Assert.Equal(4, WorkerSandbox.HelperVersion);
+        Assert.Equal(5, WorkerSandbox.HelperVersion);
         Assert.True(SafeHelper.SourceContains($"\nhelper_version={WorkerSandbox.HelperVersion}\n"));
-        const string repo = "#!/bin/bash\nsandbox_user=_factory\nsandbox_uid=\nhelper_version=4\n";
-        var installedV3 = repo.Replace("sandbox_uid=", "sandbox_uid=450").Replace("helper_version=4", "helper_version=3");
-        Assert.Equal("its helper_version 3 is older than 4", WorkerSandbox.StaleHelperReason(installedV3, "_factory", repo));
+        const string repo = "#!/bin/bash\nsandbox_user=_factory\nsandbox_uid=\nhelper_version=5\n";
+        var installedV4 = repo.Replace("sandbox_uid=", "sandbox_uid=450").Replace("helper_version=5", "helper_version=4");
+        Assert.Equal("its helper_version 4 is older than 5", WorkerSandbox.StaleHelperReason(installedV4, "_factory", repo));
         Assert.Null(WorkerSandbox.StaleHelperReason(repo.Replace("sandbox_uid=", "sandbox_uid=450"), "_factory", repo));
         // A slot's copy is the same text pinned to its own user: current for that user, and for no other.
         var second = repo.Replace("sandbox_user=_factory", "sandbox_user=_factory2").Replace("sandbox_uid=", "sandbox_uid=451");
@@ -974,7 +986,7 @@ public class WorkerSandboxTests
 
             Assert.True(result.Succeeded, result.StderrTail);
             Assert.Equal("sess-sbx", result.SessionId);
-            Assert.Equal(["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH"], File.ReadAllText(envDump).Split('\n'));
+            Assert.Equal(["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR"], File.ReadAllText(envDump).Split('\n'));
         }
         finally
         {
@@ -1440,8 +1452,8 @@ public class LiveWorkerSandboxTests
         var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets());
         var auth = options.WorkerAuth;
         string[] expected = auth == WorkerAuth.RouterKey
-            ? ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH"]
-            : ["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH"];
+            ? ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR"]
+            : ["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR"];
         const string probeKey = "rk_live_env_probe";
         Environment.SetEnvironmentVariable("GH_TOKEN", "ghp_owner_should_not_leak");
         try
@@ -1464,6 +1476,9 @@ public class LiveWorkerSandboxTests
             Assert.StartsWith(env["HOME"] + "/.local/bin:", env["PATH"]);
             Assert.DoesNotContain(OwnerHome, env["PATH"]);
             Assert.Equal(("1", "0"), (env["MSBUILDDISABLENODEREUSE"], env["DOTNET_CLI_USE_MSBUILD_SERVER"]));
+            // The sandbox user's own temporary directory: neither the shared /tmp nor the owner's (sc-25992).
+            Assert.StartsWith("/var/folders/", env["TMPDIR"]);
+            Assert.NotEqual(SandboxSupport.UserTempDir(), env["TMPDIR"]);
         }
         finally
         {

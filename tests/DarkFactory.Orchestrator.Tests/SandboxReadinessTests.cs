@@ -140,7 +140,7 @@ public class SandboxReadinessTests
     /// </summary>
     [Theory]
     [InlineData("no-version", "no helper_version line")] // installed before this check existed
-    [InlineData("old-version", "helper_version 1 is older than 4")]
+    [InlineData("old-version", "helper_version 1 is older than 5")]
     [InlineData("edited", "its text differs from the repo")]
     [InlineData("other-user", "sandbox_user is not")]
     [InlineData("unpinned", "no pinned sandbox_uid")]
@@ -180,7 +180,7 @@ public class SandboxReadinessTests
         var stale = await FactoryRunner.CheckHelperAsync(Sandbox(CurrentAllowlist,
             installed: t => Installed(t).Replace($"helper_version={WorkerSandbox.HelperVersion}\n", "helper_version=1\n")) with { Lock = workerLock }, none).WaitAsync(wait, none);
         Assert.StartsWith("Stale helper: the installed launch helper ", stale);
-        Assert.Contains("helper_version 1 is older than 4", stale);
+        Assert.Contains("helper_version 1 is older than 5", stale);
         Assert.Contains("re-run `sudo scripts/setup-worker-user.sh`", stale);
         var missing = await FactoryRunner.CheckHelperAsync(
             new WorkerSandbox(Environment.UserName, Path.Combine(_dir, "no-such-helper"), SandboxSupport.FakeSudo(_dir), "x") { Lock = workerLock }, none).WaitAsync(wait, none);

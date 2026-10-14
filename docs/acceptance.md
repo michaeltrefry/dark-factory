@@ -127,7 +127,7 @@ for its sessions.
 | Check | Test | Gate |
 | --- | --- | --- |
 | Worker token pushes `factory/*` only on its own repo; push to `main` and to another repo rejected | `AppTokenPushTests.Worker_token_pushes_factory_branches_only_on_its_own_repo` | `FACTORY_E2E=1` (`FACTORY_E2E_OTHER_REPO` optional) |
-| Worker env is exactly the allowlist for the configured `Worker:Auth` (`router-key`: `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `HOME`, `MSBUILDDISABLENODEREUSE`, `PATH`; `claude-login`: the same without `ANTHROPIC_AUTH_TOKEN`); `ANTHROPIC_CUSTOM_HEADERS` is two lines, the router key and `x-weave-model-class` (sc-25659) | `LiveWorkerSandboxTests.Live_worker_environment_is_exactly_the_allowlist_for_the_configured_auth_mode` | `FACTORY_SANDBOX_LIVE=1` |
+| Worker env is exactly the allowlist for the configured `Worker:Auth` (`router-key`: `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `HOME`, `MSBUILDDISABLENODEREUSE`, `PATH`, `TMPDIR` — the sandbox user's own temporary directory, sc-25992; `claude-login`: the same without `ANTHROPIC_AUTH_TOKEN`); `ANTHROPIC_CUSTOM_HEADERS` is two lines, the router key and `x-weave-model-class` (sc-25659) | `LiveWorkerSandboxTests.Live_worker_environment_is_exactly_the_allowlist_for_the_configured_auth_mode` | `FACTORY_SANDBOX_LIVE=1` |
 | `router-key`: `_factory` holds no Claude credential (no `~/.claude/.credentials.json`, no `Claude Code-credentials` keychain item) | `LiveWorkerSandboxTests.Worker_user_holds_no_claude_credential_in_router_key_mode` (skips for `claude-login`) | `FACTORY_SANDBOX_LIVE=1` |
 | `router-key`: `factory run`/`work` refuse to start without an enrolled plan | `RouterEnrollmentCheckTests` (unit, fake router) | none |
 | `~michael`, `.ssh`, `.config/gh`, login keychain unreachable | `LiveWorkerSandboxTests.Worker_is_denied_the_owners_home_ssh_keys_gh_config_and_login_keychain`, `Worker_cannot_read_the_owners_keychain_items` | `FACTORY_SANDBOX_LIVE=1` |
@@ -1140,7 +1140,7 @@ meaningless (the AT7 guard) or that the harness already had.
 
 ## Upgrading to Phase 4b (sc-25980)
 
-`sudo scripts/setup-worker-user.sh` once after pulling Phase 4b: the launch helper is version 4, and until it is re-installed
+`sudo scripts/setup-worker-user.sh` once after pulling Phase 4b: the launch helper is version 5 (version 4 added the slots; version 5, sc-25992, gives each sandbox user its own `TMPDIR`: in the shared `/tmp`, `_factory`'s NuGet lock directory refused `_factory2`'s `dotnet restore`, found by the live P4b-AT5), and until it is re-installed
 every `factory run` and `factory work` fails start-up with "Stale helper … re-run `sudo scripts/setup-worker-user.sh`" (close
 any `_factory` session and stop `factory work` first: a setup run kills every `_factory` process). With default settings (no
 Kanban settings, `Worker:Slots` and `Intake:MaxConcurrentRuns` unset) Phase 4b differs from `main` before it only in these,
