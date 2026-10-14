@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Text;
 using DarkFactory.Orchestrator.Git;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 
 namespace DarkFactory.Orchestrator.Gate;
@@ -18,7 +17,7 @@ namespace DarkFactory.Orchestrator.Gate;
 /// <see cref="TestPhase.Toolchain"/> step (the stack's tool is not installed for the run's user, or not on the helper's
 /// fixed PATH) ends the run as <see cref="TestRunStatus.ToolchainMissing"/>, naming the program.
 /// </summary>
-public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, TimeSpan timeout, long maxResultFileBytes = SandboxTestRunner.MaxResultFileBytes)
+public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, TimeSpan timeout, long maxResultFileBytes = SandboxTestRunner.MaxResultFileBytes)
     : IGateTestRunner
 {
     public static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(20);
@@ -39,7 +38,18 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
 
     public Task<string?> ReadAsync(RepoRef repo, string sha, string path, CancellationToken ct) => git.ReadFileAsync(repo, sha, path, ct);
 
-    public async Task<TestRunReport> RunAsync(RepoRef repo, TestRunSpec spec, CancellationToken ct)
+    /// <summary>
+    /// Sandboxed, the whole run — its worktree, every step and the worktree's deletion as the worker user — happens under the
+    /// sandbox user's lock (<see cref="WorkerSandbox.Lock"/>, sc-25988): the gate's test phase holds it already (and waited for it
+    /// honouring Pause and Stop); a caller that holds none waits for it here.
+    /// </summary>
+    public Task<TestRunReport> RunAsync(RepoRef repo, TestRunSpec spec, CancellationToken ct) =>
+        slots is null ? RunLockedAsync(repo, spec, ct) : slots.HoldAsync(null, _ => RunLockedAsync(repo, spec, ct), ct);
+
+    /// <summary>The sandbox the steps run in: the slot the calling flow holds (<see cref="WorkerSlots.Current"/>, sc-25989: the item's), or null unsandboxed.</summary>
+    private WorkerSandbox? Sandbox => slots?.Current;
+
+    private async Task<TestRunReport> RunLockedAsync(RepoRef repo, TestRunSpec spec, CancellationToken ct)
     {
         if (spec.ResultsDirectory is not { Length: > 0 } name || name.Contains('/') || name.Contains('\\') || name is "." or "..")
         {
@@ -83,8 +93,8 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
                 }
                 if (exit != 0 && step.Phase == TestPhase.Toolchain)
                 {
-                    log.AppendLine($"{step.Program} is not available to the gate's test runs{(sandbox is null ? "" : $" as {sandbox.User}")} (`{step.Program} {string.Join(' ', step.Args)}` exited {exit}): "
-                        + $"install it where the test runs' PATH finds it{(sandbox is null ? "" : " (the launch helper's fixed PATH: /opt/homebrew/bin, /usr/local/bin, …)")}.");
+                    log.AppendLine($"{step.Program} is not available to the gate's test runs{(Sandbox is null ? "" : $" as {Sandbox.User}")} (`{step.Program} {string.Join(' ', step.Args)}` exited {exit}): "
+                        + $"install it where the test runs' PATH finds it{(Sandbox is null ? "" : " (the launch helper's fixed PATH: /opt/homebrew/bin, /usr/local/bin, …)")}.");
                     return TestRunReport.Failed(TestRunStatus.ToolchainMissing, log.ToString());
                 }
                 if (step.CaptureOutput is { } capture)
@@ -183,14 +193,34 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
         Process started;
         try
         {
-            started = sandbox is null ? StartDirect(worktree, step) : sandbox.Start(worktree, step.Program, step.Args, new Dictionary<string, string>());
+            started = Sandbox is null ? StartDirect(worktree, step) : Sandbox.Start(worktree, step.Program, step.Args, new Dictionary<string, string>());
         }
-        catch (System.ComponentModel.Win32Exception e) when (sandbox is null)
+        catch (System.ComponentModel.Win32Exception e) when (Sandbox is null)
         {
             // Unsandboxed, a program that is not installed fails at start; sandboxed, the helper exits 127 for it.
             return (127, $"{step.Program} could not be started: {e.Message}", false, null);
         }
-        using var process = started;
+        try
+        {
+            return await RunStartedAsync(started, step, remaining, ct);
+        }
+        finally
+        {
+            if (Sandbox is null)
+            {
+                started.Dispose();
+            }
+            else
+            {
+                // Exited, or stopped and waited for (StopAsync): disposed now. A helper still alive keeps the sandbox user's lock
+                // until it is gone (sc-25988): its exit still kills every process of the worker user.
+                await Sandbox.EndAsync(started, TimeSpan.Zero);
+            }
+        }
+    }
+
+    private async Task<(int ExitCode, string Output, bool TimedOut, string? Captured)> RunStartedAsync(Process process, TestStep step, TimeSpan remaining, CancellationToken ct)
+    {
         var output = new Tail();
         var capture = step.CaptureOutput is null ? null : new Capture(maxResultFileBytes);
         var stdout = PumpAsync(process.StandardOutput, output, capture);
@@ -212,7 +242,7 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
         }
         finally
         {
-            if (sandbox is not null)
+            if (Sandbox is not null)
             {
                 WorkerSandbox.Stop(process); // the helper then kills whatever the step left running
             }
@@ -240,21 +270,15 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
 
     private async Task StopAsync(Process process)
     {
-        if (sandbox is null)
+        if (Sandbox is null)
         {
             process.Kill(entireProcessTree: true);
             return;
         }
         WorkerSandbox.Stop(process);
-        using var grace = new CancellationTokenSource(StopGrace);
-        try
-        {
-            await process.WaitForExitAsync(grace.Token);
-        }
-        catch (OperationCanceledException)
-        {
-            // Still running as the worker user: the next helper exit (the worktree's deletion) kills it.
-        }
+        // If it is still running as the worker user after the grace: the next helper exit (the worktree's deletion, under the same
+        // hold of the lock) kills it, and until it is gone the lock is kept (WorkerSandbox.EndAsync).
+        await WorkerSandbox.ExitsWithinAsync(process, StopGrace);
     }
 
     private static async Task PumpAsync(StreamReader reader, Tail tail, Capture? capture = null)

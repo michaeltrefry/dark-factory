@@ -8,6 +8,7 @@ using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Sessions;
 using DarkFactory.Orchestrator.Shortcut;
+using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
@@ -18,8 +19,9 @@ namespace DarkFactory.AcceptanceTests;
 /// <summary>
 /// Shared plumbing of the live <c>factory work</c> acceptance tests (AT2–AT5, AT7; docs/acceptance.md). Each test runs
 /// against a throwaway ledger database and its own work root under the configured one, so it never reads or writes the
-/// owner's real ledger, controls or worktrees; it holds the configured work root's <see cref="WorkerLock"/> for its whole
-/// run, so no real sandboxed run can share the single-tenant <c>_factory</c> user with it (it skips if one is running).
+/// owner's real ledger, controls or worktrees; it holds the configured work root's <see cref="WorkerLock"/> — every worker
+/// slot's (sc-25989) — for its whole run, so no real run's worker phase can share a single-tenant sandbox user with it (a real
+/// run waits at its worker phases meanwhile; the test skips if one holds a lock when it starts).
 /// </summary>
 internal sealed class E2e : IAsyncDisposable
 {
@@ -27,9 +29,9 @@ internal sealed class E2e : IAsyncDisposable
 
     private readonly NpgsqlConnectionStringBuilder _admin;
     private readonly string _database;
-    private readonly WorkerLock? _realRootLock;
+    private readonly IDisposable? _realRootLock;
 
-    private E2e(NpgsqlConnectionStringBuilder admin, string database, WorkerLock? realRootLock, string workRoot)
+    private E2e(NpgsqlConnectionStringBuilder admin, string database, IDisposable? realRootLock, string workRoot)
     {
         (_admin, _database, _realRootLock, WorkRoot) = (admin, database, realRootLock, workRoot);
         Ledger = new NpgsqlConnectionStringBuilder(admin.ConnectionString) { Database = database }.ConnectionString;
@@ -44,11 +46,29 @@ internal sealed class E2e : IAsyncDisposable
     /// <summary>The dashboard password hash the throwaway host logs in with (never the owner's keychain entry).</summary>
     public static readonly Lazy<string> PasswordHash = new(() => DashboardAuth.HashPassword(TestPassword));
 
+    /// <summary>
+    /// The credential of the work source a test works an item of, and nothing of the other sources (sc-25982): a Kanban test
+    /// runs on a machine with no Shortcut token, and the reverse.
+    /// </summary>
+    public static void RequireSource(ItemNaming source)
+    {
+        if (source == ItemNaming.Shortcut)
+        {
+            Harness.RequireSecret(o => o.ShortcutApiToken);
+        }
+        else if (source == ItemNaming.Kanban)
+        {
+            Harness.RequireSecret(o => o.KanbanWriteToken);
+        }
+        // A GitHub issue's item needs the workers' GitHub App, which every test needs.
+    }
+
     /// <summary>Checks the live prerequisites, takes the configured work root's run lock and creates the throwaway ledger.</summary>
-    public static async Task<E2e> StartAsync(string prefix)
+    /// <param name="source">The work source the test's item is of (default: a Shortcut story): only its credential is asked for.</param>
+    public static async Task<E2e> StartAsync(string prefix, ItemNaming? source = null)
     {
         Harness.RequireOptIn();
-        Harness.RequireSecret(o => o.ShortcutApiToken);
+        RequireSource(source ?? ItemNaming.Shortcut);
         Harness.RequireSecret(o => o.RouterKey);
         Harness.RequireSecret(o => o.GitHubAppId);
         Harness.RequireSecret(o => o.GitHubAppPrivateKeyPem);
@@ -58,18 +78,27 @@ internal sealed class E2e : IAsyncDisposable
         Harness.RequireReviewSettings();
         Harness.RequireClaude();
         await Harness.RequireRouterAsync();
+        // P4b-AT7: the machine's own settings (config and env) are the defaults before any test overrides them. The keychain's
+        // write token is not read here: an AT7 run's options hide it (Options).
+        var configured = FactoryOptions.LoadConfiguration();
+        RequireDefaultsWhenAsked(configured, new FactoryOptions(configured, new OverlaySecrets(new NoSecrets(), new Dictionary<string, string>())));
 
         var realRoot = Harness.Options.WorkRoot;
-        WorkerLock? realLock = null;
+        RealLocks? realLock = null;
         if (Harness.Options.WorkerSandbox is not null)
         {
+            realLock = new RealLocks();
             try
             {
-                realLock = WorkerLock.Acquire(realRoot);
+                foreach (var slot in Harness.Options.WorkerSlots!.All)
+                {
+                    realLock.Add(WorkerLock.Acquire(realRoot, slot.Number));
+                }
             }
             catch (InvalidOperationException ex)
             {
-                Assert.Skip($"A real sandboxed factory run holds the work root: stop `factory work`/`factory run` first. {ex.Message}");
+                realLock.Dispose();
+                Assert.Skip($"A real factory run's worker phase holds the work root: stop `factory work`/`factory run` first. {ex.Message}");
             }
         }
         var admin = new NpgsqlConnectionStringBuilder(Harness.Options.LedgerConnectionString);
@@ -89,8 +118,24 @@ internal sealed class E2e : IAsyncDisposable
         var workRoot = Path.Combine(realRoot, "e2e", database);
         var e2e = new E2e(admin, database, realLock, workRoot);
         await LedgerMigrations.MigrateAsync(e2e.Ledger, CancellationToken.None);
+        await using (var ledger = new NpgsqlConnection(e2e.Ledger))
+        {
+            await ledger.OpenAsync();
+            await using var restart = new NpgsqlCommand(
+                $"ALTER TABLE kanban_items ALTER COLUMN \"Id\" RESTART WITH {KanbanKeyStart(DateTimeOffset.UtcNow)}", ledger);
+            await restart.ExecuteNonQueryAsync();
+        }
         return e2e;
     }
+
+    /// <summary>
+    /// The first Kanban key of a throwaway ledger (sc-25992). A Kanban item's branch is <c>factory/kb-&lt;key&gt;</c>, and keys are
+    /// per ledger: started at 1, every live run would name its first item <c>kb-1</c> and push to the branch, and adopt the open
+    /// pull request, that an earlier run left on the sandbox (P4b-AT4 leaves a draft). So each throwaway ledger starts its keys
+    /// at the seconds since 2026-01-01 UTC — distinct for runs started a second apart, and an int until 2094.
+    /// </summary>
+    internal static int KanbanKeyStart(DateTimeOffset now) =>
+        checked((int)Math.Max(1, (now - new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)).Ticks / TimeSpan.TicksPerSecond));
 
     /// <summary>
     /// The watch scope from <c>FACTORY_E2E_WATCH_TEAM</c> / <c>FACTORY_E2E_WATCH_EPIC</c> (at least one), as config keys.
@@ -118,7 +163,8 @@ internal sealed class E2e : IAsyncDisposable
     /// The configured options (env, user secrets, the owner's keychain for router/Shortcut/GitHub) with this test's
     /// ledger, work root, a free dashboard port, a short poll, and the test dashboard password hash layered on top.
     /// </summary>
-    public FactoryOptions Options(IDictionary<string, string?>? overrides = null)
+    /// <param name="without">Keychain accounts the options must not find (e.g. the Shortcut token, for a host that must start without one).</param>
+    public FactoryOptions Options(IDictionary<string, string?>? overrides = null, params string[] without)
     {
         var values = new Dictionary<string, string?>
         {
@@ -138,8 +184,74 @@ internal sealed class E2e : IAsyncDisposable
             .AddConfiguration(FactoryOptions.LoadConfiguration())
             .AddInMemoryCollection(values)
             .Build();
-        return new FactoryOptions(config, new OverlaySecrets(new MacKeychain(),
-            new Dictionary<string, string> { [SecretAccounts.DashboardPasswordHash] = PasswordHash.Value }));
+        var secrets = new Dictionary<string, string> { [SecretAccounts.DashboardPasswordHash] = PasswordHash.Value };
+        foreach (var account in without)
+        {
+            secrets[account] = ""; // blank is missing
+        }
+        if (AskedForDefaults())
+        {
+            // P4b-AT7: a Kanban write token in the keychain would give the Kanban source an intake lane; the run hides it, as a
+            // Kanban test hides the Shortcut token. One from config or the environment still fails the guard below.
+            secrets[SecretAccounts.KanbanWriteToken] = "";
+        }
+        var options = new FactoryOptions(config, new OverlaySecrets(new MacKeychain(), secrets));
+        RequireDefaultsWhenAsked(config, options);
+        return options;
+    }
+
+    /// <summary>
+    /// The environment variable that makes a run a P4b-AT7 run (docs/acceptance.md, "P4b-AT7 — defaults"): set to <c>1</c>, every
+    /// live test's options must carry Phase 4b's defaults (<see cref="DefaultsProblems"/>), or the test fails before it starts.
+    /// </summary>
+    public const string DefaultsVariable = "FACTORY_E2E_P4B_DEFAULTS";
+
+    /// <summary>
+    /// What makes <paramref name="options"/> differ from Phase 4b's defaults (sc-25992, P4b-AT7: "With default settings the Phase
+    /// 1–4a live tests behave as before"): a watched Kanban project, a Kanban web URL, a Kanban write token (from config, env or
+    /// keychain: with one the Kanban source has an intake lane), <c>Worker:Slots</c> other than 1, <c>Intake:MaxConcurrentRuns</c>
+    /// other than 1. <c>Kanban:Token</c> and <c>Kanban:McpUrl</c> are Phase 3's (the reviewers' Kanban reads), not Phase 4b's, and
+    /// stay allowed. Empty when the options are the defaults.
+    /// </summary>
+    public static List<string> DefaultsProblems(IConfiguration config, FactoryOptions options)
+    {
+        var problems = new List<string>();
+        foreach (var key in new[] { "Kanban:Watch:Projects", "Kanban:WebUrl" })
+        {
+            if (!string.IsNullOrWhiteSpace(config[key]))
+            {
+                problems.Add($"{key} is set");
+            }
+        }
+        if (options.TryGet(o => o.KanbanWriteToken, out _))
+        {
+            problems.Add("a Kanban write token is configured (Kanban:WriteToken, FACTORY_KANBAN_WRITE_TOKEN or keychain account kanban-write-token)");
+        }
+        if (options.WorkerSlotCount != 1)
+        {
+            problems.Add($"Worker:Slots is {options.WorkerSlotCount}, not 1");
+        }
+        if (options.MaxConcurrentRuns != 1)
+        {
+            problems.Add($"Intake:MaxConcurrentRuns is {options.MaxConcurrentRuns}, not 1");
+        }
+        return problems;
+    }
+
+    private static bool AskedForDefaults(Func<string, string?>? environment = null) =>
+        (environment ?? Environment.GetEnvironmentVariable)(DefaultsVariable) == "1";
+
+    /// <summary>Under <see cref="DefaultsVariable"/>=1, fails the test unless its options are the defaults (<see cref="DefaultsProblems"/>).</summary>
+    public static void RequireDefaultsWhenAsked(IConfiguration config, FactoryOptions options,
+        Func<string, string?>? environment = null)
+    {
+        if (!AskedForDefaults(environment))
+        {
+            return;
+        }
+        var problems = DefaultsProblems(config, options);
+        Assert.True(problems.Count == 0,
+            $"{DefaultsVariable}=1 is a P4b-AT7 run, which must use the default settings, but {string.Join("; ", problems)}. Unset them for this run.");
     }
 
     /// <summary>The env a child <c>factory work</c> needs for the same settings (<c>__</c> separators).</summary>
@@ -337,7 +449,25 @@ internal sealed class E2e : IAsyncDisposable
     }
 }
 
+/// <summary>The configured work root's lock of every worker slot, held together for a live test's whole run.</summary>
+internal sealed class RealLocks : IDisposable
+{
+    private readonly List<IDisposable> _held = [];
+
+    public void Add(IDisposable held) => _held.Add(held);
+
+    public void Dispose() => _held.ForEach(held => held.Dispose());
+}
+
 /// <summary>Secrets from <paramref name="inner"/> (the owner's keychain) except the accounts overridden here; writes go nowhere.</summary>
+/// <summary>A secret store that holds nothing (the AT7 guard's look at config and env alone).</summary>
+internal sealed class NoSecrets : ISecretStore
+{
+    public string? Get(string account) => null;
+
+    public void Set(string account, string value) => throw new NotSupportedException("The acceptance harness never writes the keychain.");
+}
+
 internal sealed class OverlaySecrets(ISecretStore inner, IReadOnlyDictionary<string, string> overrides) : ISecretStore
 {
     public string? Get(string account) => overrides.TryGetValue(account, out var value) ? value : inner.Get(account);

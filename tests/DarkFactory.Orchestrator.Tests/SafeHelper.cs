@@ -12,6 +12,18 @@ internal sealed record FakeIdentity(string User, string Uid, IReadOnlyDictionary
 {
     /// <summary>The sandbox role account as the helper's sweep checks expect it (name <c>_dftest</c>, uid 450, pinned): lets a copy's uid sweep run.</summary>
     public static FakeIdentity SandboxRole { get; } = new("_dftest", "450", new Dictionary<string, string> { ["_dftest"] = "450" }, "450");
+
+    /// <summary>
+    /// Worker slot <paramref name="slot"/>'s role account as setup makes it (sc-25989): <c>_dftest</c> with uid 450 for slot 1,
+    /// <c>_dftest2</c> with 451 for slot 2, …, each helper copy pinned to its own. Every slot's account is known to <c>id</c>, as
+    /// on a machine set up with several.
+    /// </summary>
+    public static FakeIdentity Slot(int slot, int slots = 2) => new(SlotUser(slot), SlotUid(slot),
+        Enumerable.Range(1, slots).ToDictionary(SlotUser, SlotUid), SlotUid(slot));
+
+    public static string SlotUser(int slot) => slot == 1 ? "_dftest" : $"_dftest{slot}";
+
+    public static string SlotUid(int slot) => (449 + slot).ToString();
 }
 
 internal sealed record SafeHelperOptions
@@ -48,10 +60,15 @@ internal sealed record SafeHelperOptions
 /// (<see cref="BuildCopy"/>) or <see cref="SourceContains"/>.
 /// <para>The seam (<c>send_signal</c>) logs every target to <see cref="Targets"/> and, per target: signals it if it is the
 /// helper itself, in the helper's process tree, a <see cref="SafeHelperOptions.Registry"/> pid whose start time still matches
-/// (so a reused pid is never hit), or the group of the worker the helper started while every member of that group is one of
-/// those or this test host's own; skips it (no signal) if it is not the current user's or is another process of this test
-/// host's; and otherwise — pid or group 0 or 1 included — refuses: logs it to <see cref="Refusals"/> and exits 99 before
-/// signalling anything in that call.</para>
+/// (so a reused pid is never hit), or the group of the worker the helper started while every live member of that group is one
+/// of those or this test host's own; skips it (no signal) if it is not the current user's, is another process of this test
+/// host's, or is dead; and otherwise — pid or group 0 or 1 included — refuses: logs it to <see cref="Refusals"/> and exits 99
+/// before signalling anything in that call.</para>
+/// <para>Dead is what <c>ps</c> lists in state <c>Z</c> (a zombie) or <c>X</c> (being reaped): nothing a signal can reach. On
+/// Linux a process its parent is reaping at the moment <c>ps</c> reads it is listed with parent 0 and group -1 (the kernel's
+/// <c>/proc/&lt;pid&gt;/stat</c> once the task has lost its signal handlers), so it is in no one's tree: the helper's own
+/// watcher, reaped by the helper's shell while that shell's seam listed the processes for its <c>send_signal "$watcher"</c>,
+/// was refused that way (exit 99, seen once on ubuntu CI). A live process is judged as before.</para>
 /// </summary>
 [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
 internal sealed class SafeHelper
@@ -125,8 +142,36 @@ internal sealed class SafeHelper
 
     private static string[] Lines(string file) => File.Exists(file) ? File.ReadAllLines(file) : [];
 
+    /// <summary>
+    /// A <see cref="SafeHelperOptions.FakeListing"/> for a machine with several sandbox users (sc-25989): a process table of
+    /// "pid ppid" rows per uid, of which a copy lists only its own uid's (<c>$self_uid</c>, the helper's own variable) after
+    /// <paramref name="machinery"/> — as the production listing asks <c>ps</c> for <c>-U "$self_uid"</c> and nothing else
+    /// (<see cref="ListPrimitive"/>, which every copy is checked to have had). So what a slot's copy targets is what a real
+    /// helper pinned to that slot's user would be handed.
+    /// </summary>
+    public static string ListingByUid(string machinery, IReadOnlyDictionary<string, string[]> rowsByUid)
+    {
+        Assert.Contains("-U \"$self_uid\"", ListPrimitive);
+        Assert.Contains("-u \"$self_uid\"", ListPrimitive);
+        Assert.All(rowsByUid, kv => Assert.Matches("^[0-9]+$", kv.Key));
+        Assert.All(rowsByUid.Values.SelectMany(rows => rows), row => Assert.Matches("^[0-9]+ [0-9]+$", row));
+        var cases = string.Concat(rowsByUid.Select(kv => $" {kv.Key}) {string.Concat(kv.Value.Select(row => $"echo '{row}'; "))};;"));
+        return $"{machinery}; case \"$self_uid\" in{cases} esac";
+    }
+
     /// <summary>Whether the production helper's text contains <paramref name="value"/> (for assertions about it).</summary>
     public static bool SourceContains(string value) => Source.Contains(value, StringComparison.Ordinal);
+
+    /// <summary>Whether the production helper's text has <paramref name="value"/> anywhere after its one <paramref name="marker"/>.</summary>
+    public static bool SourceContainsAfter(string marker, string value)
+    {
+        var source = Source;
+        Assert.Equal(1, Count(source, marker));
+        return source[(source.IndexOf(marker, StringComparison.Ordinal) + marker.Length)..].Contains(value, StringComparison.Ordinal);
+    }
+
+    /// <summary>How many times the production helper's text has <paramref name="value"/>.</summary>
+    public static int SourceCount(string value) => Count(Source, value);
 
     /// <summary>Records a process the test made (outside the helper's tree) as one the seam may kill, with its start time.</summary>
     public static void Register(string registry, OwnProcess process) =>
@@ -211,16 +256,17 @@ internal sealed class SafeHelper
             __seam_classify() {
                 local reg
                 reg=" $(__seam_registry | /usr/bin/tr '\n' ' ') "
-                /bin/ps -A -o pid=,ppid=,uid=,pgid= 2>/dev/null | /usr/bin/awk -v self="$$" -v host={{host}} -v uid={{uid}} -v reg="$reg" -v worker="${worker:-}" -v logonly={{(options.LogOnly ? 1 : 0)}} -v targets="$*" '
+                /bin/ps -A -o pid=,ppid=,uid=,pgid=,stat= 2>/dev/null | /usr/bin/awk -v self="$$" -v host={{host}} -v uid={{uid}} -v reg="$reg" -v worker="${worker:-}" -v logonly={{(options.LogOnly ? 1 : 0)}} -v targets="$*" '
                     function under(p, root,   n) { n = 0; while (p != root && (p in up) && n++ < 100000) p = up[p]; return p == root }
                     function own(p) { return p == self || under(p, self) || under(p, host) || index(reg, " " p " ") }
+                    function dead(p) { return state[p] ~ /^[XZ]/ }
                     function out(c, x) { if (c == "kill" && logonly && !(x == self || under(x, self))) c = "log"; print c, x }
                     function group_ok(g,   p) {
                         if (worker !~ /^[0-9]+$/ || g != worker + 0 || g <= 1) return 0
-                        for (p in grp) if (grp[p] + 0 == g && !own(p)) return 0
+                        for (p in grp) if (grp[p] + 0 == g && !own(p) && !dead(p)) return 0
                         return 1
                     }
-                    { up[$1] = $2; owner[$1] = $3; grp[$1] = $4 }
+                    { up[$1] = $2; owner[$1] = $3; grp[$1] = $4; state[$1] = $5 }
                     END {
                         nt = split(targets, t, " ")
                         for (i = 1; i <= nt; i++) {
@@ -228,7 +274,7 @@ internal sealed class SafeHelper
                             if (x ~ /^-[0-9]+$/) out(group_ok(substr(x, 2) + 0) ? "kill" : "refuse", x)
                             else if (x !~ /^[0-9]+$/ || x + 0 <= 1) out("refuse", x)
                             else if (x == self || under(x, self) || index(reg, " " x " ")) out("kill", x)
-                            else if (!(x in up) || owner[x] != uid || under(x, host)) out("skip", x)
+                            else if (!(x in up) || owner[x] != uid || under(x, host) || dead(x)) out("skip", x)
                             else out("refuse", x)
                         }
                     }'
@@ -246,7 +292,13 @@ internal sealed class SafeHelper
                     esac
                 done < <(__seam_classify "$@")
                 if [ "$refused" -ne 0 ]; then
-                    echo "factory-worker-launch test seam: refusing to signal a process that is not the test's own" >&2
+                    # The helper's real stderr is fd 3 once it has launched its worker (its own is /dev/null from then on);
+                    # the watcher has neither.
+                    if { : >&3; } 2>/dev/null; then
+                        echo "factory-worker-launch test seam: refusing to signal a process that is not the test's own" >&3
+                    else
+                        echo "factory-worker-launch test seam: refusing to signal a process that is not the test's own" >&2
+                    fi
                     exit 99
                 fi
                 [ ${#kills[@]} -gt 0 ] || return 1

@@ -1,16 +1,27 @@
 namespace DarkFactory.Orchestrator.WorkSources;
 
-/// <summary>One work item (a Shortcut story, or a triaged GitHub issue) as the orchestrator sees it.</summary>
-/// <param name="Naming">The item's source naming; null is a Shortcut story.</param>
+/// <summary>One work item (a Shortcut story, a Kanban item, or a triaged GitHub issue) as the orchestrator sees it.</summary>
+/// <param name="Naming">
+/// The item's source naming, always given by the source that read it (sc-25992, E5): trust is decided from it
+/// (<see cref="UntrustedName"/>), so no story is trusted by a default.
+/// </param>
 /// <param name="Closes">
 /// The issue the item's PR closes on merge, as GitHub's closing keyword takes it (<c>owner/name#12</c>); null for none.
 /// </param>
 /// <param name="Labels">The item's labels on its board (none when the board has none).</param>
 /// <param name="Estimate">The item's estimate in points; null when it has none (a GitHub issue never has one).</param>
-public sealed record WorkStory(int Id, string Name, string? Description, string StoryType, string AppUrl, ItemNaming? Naming = null,
-    string? Closes = null, IReadOnlyList<string>? Labels = null, int? Estimate = null)
+/// <param name="BoardId">
+/// The item's id on its board, when that is not its ledger name (Kanban: the item's GUID; its <c>kb-&lt;n&gt;</c> is the ledger's
+/// own); null for a source whose ledger name is the board's id (<see cref="BoardRef"/>).
+/// </param>
+/// <param name="PlanRef">
+/// For an item a plan created: the plan item its marker names, as the ledger names it, when the source had to translate it
+/// (Kanban: the <c>kb-&lt;n&gt;</c> of the GUID in the marker); null otherwise (<see cref="PlannedFrom"/>).
+/// </param>
+public sealed record WorkStory(int Id, string Name, string? Description, string StoryType, string AppUrl, ItemNaming Naming,
+    string? Closes = null, IReadOnlyList<string>? Labels = null, int? Estimate = null, string? BoardId = null, string? PlanRef = null)
 {
-    public ItemNaming Kind => Naming ?? ItemNaming.Shortcut;
+    public ItemNaming Kind => Naming;
 
     /// <summary>
     /// The name as the factory writes it on GitHub (commit message, pull request title and description): an untrusted name
@@ -19,20 +30,42 @@ public sealed record WorkStory(int Id, string Name, string? Description, string 
     public string PublicName => UntrustedName ? UntrustedText.Inert(Name) : Name;
 
     /// <summary>
-    /// Whether <see cref="Name"/> and <see cref="Description"/> are a model's text rather than the owner's: a GitHub issue's item (its
-    /// name is the triage's title, derived from untrusted issue text), or a story the factory created from a plan
-    /// (<see cref="PlannerAuthored"/>, sc-25870).
+    /// Whether <see cref="Name"/> and <see cref="Description"/> are data rather than the owner's instructions — the one trust
+    /// decision every prompt, commit message and pull request asks (sc-25984, E5). It has two halves and no third: the item's
+    /// source is not trusted (<see cref="ItemNaming.Trusted"/>, a property of the source: a Shortcut story and a Kanban item are
+    /// written on the owner's board, a GitHub issue's item is a triage of text anyone may file), or the factory created the item
+    /// from a plan (<see cref="PlannerAuthored"/>, sc-25870: a planning model's text, untrusted on every source).
     /// </summary>
-    public bool UntrustedName => Kind != ItemNaming.Shortcut || PlannerAuthored;
+    public bool UntrustedName => !Kind.Trusted || PlannerAuthored;
 
-    /// <summary>Whether the factory created this story from a plan: its description carries the plan's marker (<see cref="Plans.PlannedStory"/>).</summary>
+    /// <summary>
+    /// Whether the factory created this story from a plan: its description carries the plan's marker (<see cref="Plans.PlannedStory"/>),
+    /// which the code writes on every source, never the model.
+    /// </summary>
     public bool PlannerAuthored => Plans.PlannedStory.IsMarked(Description);
 
     /// <summary>The item's external id, e.g. <c>sc-12</c>.</summary>
     public string Ref => Kind.Format(Id);
+
+    /// <summary>
+    /// How the item is named in what the factory writes ONTO its board about it (E4: a marker, an idempotency key): its id on the
+    /// board (<see cref="BoardId"/>), which is the ledger name itself (<see cref="Ref"/>) for a source that has no other.
+    /// </summary>
+    public string BoardRef => BoardId ?? Ref;
+
+    /// <summary>
+    /// The plan item this story's marker names (<see cref="Plans.PlannedStory.ParentOf"/>), in the ledger's name when the source
+    /// gave one (<see cref="PlanRef"/>); null without a marker. Text anyone may write: only ever shown, never trusted.
+    /// </summary>
+    public string? PlannedFrom => PlanRef ?? Plans.PlannedStory.ParentOf(Description);
 }
 
-public sealed record WorkEpic(int Id, string Name, string? Description, string AppUrl);
+/// <param name="Id">
+/// The epic's id as the ledger holds it (<see cref="Ledger.WorkItem.EpicId"/>) and an epic-scope control names it, within the
+/// item's source (<see cref="ItemNaming.Epic"/>): a Shortcut epic's own number (<c>epic:12</c>), or the key the ledger gave a Kanban
+/// epic, whose board id is a GUID (<c>epic:kb-3</c>; sc-25985) — recorded before the source answers with it (E4).
+/// </param>
+public sealed record WorkEpic(long Id, string Name, string? Description, string AppUrl);
 
 public sealed record WorkDocument(string Title, string? Markdown, string AppUrl);
 
@@ -61,6 +94,26 @@ public sealed record ClaimResult(bool Claimed, string? Refusal)
 }
 
 /// <summary>
+/// The result of <see cref="IWorkSource.RenewClaimAsync"/>. <see cref="Held"/> (both reasons null): nothing shows anyone else
+/// holds the item — its claim was renewed, or taken again, or there was nothing to renew. <see cref="Lost"/>: why the factory no
+/// longer holds it, in words that name whoever holds it now. <see cref="NotRenewed"/>: the board answered and refused this
+/// renewal for a reason that says nothing about who holds the item (the call's or the item's own: a revoked token, an item the
+/// source does not know) — the claim is neither confirmed nor lost. A board that does not answer at all (down, hanging,
+/// overloaded) is not a result: the source throws.
+/// </summary>
+public sealed record ClaimRenewal(string? Lost, string? NotRenewed = null)
+{
+    public static readonly ClaimRenewal Held = new((string?)null);
+
+    /// <summary>Whether nothing stands in the way of working the item: neither lost nor refused.</summary>
+    public bool IsHeld => Lost is null && NotRenewed is null;
+
+    public static ClaimRenewal LostBecause(string reason) => new(reason);
+
+    public static ClaimRenewal NotRenewedBecause(string reason) => new(null, reason);
+}
+
+/// <summary>
 /// The work source will not create children under this parent and has written nothing (<see cref="IWorkSource.CreateChildrenAsync"/>):
 /// the message says why, in words the item's owner can act on.
 /// </summary>
@@ -73,8 +126,8 @@ public sealed record ChildItem(string Name, string Description, string StoryType
     public const string KeyPrefix = "dark-factory:child:";
 
     /// <summary>
-    /// The idempotency key of this child under the parent <paramref name="parentRef"/> (the parent's ledger name, e.g.
-    /// <c>sc-12</c>; sc-25877): written by code, the same on every retry of the same plan — <see cref="KeyPrefix"/>, the parent,
+    /// The idempotency key of this child under the parent <paramref name="parentRef"/> (the parent as its board names it:
+    /// <c>sc-12</c>, a Kanban item's GUID — never a key only the ledger knows, E4; sc-25877): written by code, the same on every retry of the same plan — <see cref="KeyPrefix"/>, the parent,
     /// then the SHA-256 of the name and the description as sent (each UTF-8, the name's byte length first so no two pairs share
     /// a hash). A source stores it on the item it creates, in whatever field of its board holds an opaque id, and finds the child
     /// again by it (<see cref="IWorkSource.CreateChildrenAsync"/>), so it need not get the description back unchanged.
@@ -102,8 +155,11 @@ public sealed record ChildItem(string Name, string Description, string StoryType
 /// </summary>
 public interface IWorkSource
 {
-    /// <summary>How this source's items are named in the ledger and on git (default: Shortcut stories).</summary>
-    ItemNaming Naming => ItemNaming.Shortcut;
+    /// <summary>
+    /// How this source's items are named in the ledger and on git, and whether they are trusted (<see cref="ItemNaming.Trusted"/>).
+    /// No default (sc-25992, E1/E5): every source declares its own, so none is trusted, or named like another, by omission.
+    /// </summary>
+    ItemNaming Naming { get; }
 
     /// <summary>
     /// How many claim refusals in a row an item may get before its run escalates it instead of parking it again (E10), for a source
@@ -120,8 +176,9 @@ public interface IWorkSource
 
     /// <summary>
     /// Whether an item of this source labelled <see cref="Plans.PlanLabel.Name"/> is planned into child stories instead of implemented
-    /// (sc-25870): the source's labels are the owner's to set and <see cref="CreateChildrenAsync"/> works. False (the default) for a
-    /// source that creates no children or whose labels anyone may apply (a GitHub issue's): such an item is implemented like any other.
+    /// (sc-25870): the source is trusted (<see cref="ItemNaming.Trusted"/>: its labels are the owner's to set) and
+    /// <see cref="CreateChildrenAsync"/> works. False (the default) for a source that creates no children or whose labels anyone
+    /// may apply (a GitHub issue's): such an item is implemented like any other.
     /// </summary>
     bool PlansItems => false;
 
@@ -135,6 +192,19 @@ public interface IWorkSource
     /// claim back and refuses if it did not stick.
     /// </summary>
     Task<ClaimResult> ClaimAsync(int id, bool ignoreScope, CancellationToken ct);
+
+    /// <summary>
+    /// Keeps the factory's claim on an item it is working (sc-25983), for a source whose claims expire unless renewed: asked once
+    /// per intake poll for every item of the source the ledger would resume by itself (<see cref="IItemRunner.RenewableAsync"/>,
+    /// <see cref="IntakeLoop"/>), and by a run before it resumes an item that was paused because its claim was lost.
+    /// <see cref="ClaimRenewal.Held"/> when nothing shows anyone else holds the item (renewed, or taken again after it lapsed with
+    /// nobody else holding it); <see cref="ClaimRenewal.Lost"/> — naming who holds the item — when another caller has it, which
+    /// pauses the item (<see cref="IItemRunner.ClaimLostAsync"/>); <see cref="ClaimRenewal.NotRenewed"/> when the board answered
+    /// with a refusal that is this call's or this item's own. It throws only when the board does not answer (down, hanging,
+    /// overloaded): the poll then asks it nothing more for the source's other items. Optional: a source whose claims do not expire
+    /// (Shortcut's owner and label, a GitHub issue's assignment) has nothing to renew and always holds (the default).
+    /// </summary>
+    Task<ClaimRenewal> RenewClaimAsync(int id, CancellationToken ct) => Task.FromResult(ClaimRenewal.Held);
 
     /// <summary>Whether the item is (still) inside the configured watch scope.</summary>
     Task<bool> InScopeAsync(int id, CancellationToken ct);
@@ -195,6 +265,14 @@ public interface IWorkSource
         throw new NotSupportedException("This work source creates no plan children, so it has none to make ready.");
 
     /// <summary>
+    /// How this board shelves an item for good (what such an item is, and the verb for doing it) and how a person undoes it
+    /// (<see cref="ReadyResult.Archived"/>), in the board's own words: what a plan says about a story it could not release
+    /// (<see cref="Plans.PlanRelease.HeldArchived"/>), a stopped plan's comment about a released story someone shelved, and the
+    /// escalation that tells a person to finish or shelve a broken plan's stories.
+    /// </summary>
+    (string Is, string Undo, string Do) Shelved => ("archived", "unarchive it", "archive");
+
+    /// <summary>
     /// Whether the item waits in the source's backlog (not archived), where nothing picks it up (sc-25871): how a plan notices a
     /// story it released that a person moved back. Reads only. A source that creates no children has none there (the default).
     /// </summary>
@@ -208,6 +286,28 @@ public interface IWorkSource
     /// (the default).
     /// </summary>
     Task<bool> ReturnUnstartedAsync(int id, string comment, CancellationToken ct) => Task.FromResult(false);
+
+    /// <summary>
+    /// Whether <paramref name="epic"/> can be an epic of this source (sc-25985), asked before an epic-scope Pause or Stop writes
+    /// anything. True (the default) for a source whose epics are named by their own number on the board (Shortcut: any number may
+    /// be an epic, and one may be paused before the factory has seen it); a source whose epics are named by a ledger key answers
+    /// whether the ledger gave that key out — a control on any other key names nothing today and would land on whichever epic is
+    /// given the key later. Reads the ledger only, never the board.
+    /// </summary>
+    Task<bool> KnowsEpicAsync(long epic, CancellationToken ct) => Task.FromResult(true);
+}
+
+/// <summary>Links to one item on its board (<see cref="IBoardLinks"/>); null where the ledger does not hold what the link needs.</summary>
+public sealed record BoardLink(string? Item, string? Epic);
+
+/// <summary>
+/// A source's links to its items for the dashboard (sc-25985), built from the ledger alone: the dashboard reads the ledger and
+/// never asks a board (E8). <see cref="OfAsync"/> answers for the items of its own source among those given, by the work
+/// item's ledger id; an item it leaves out is shown without a link.
+/// </summary>
+public interface IBoardLinks
+{
+    Task<IReadOnlyDictionary<long, BoardLink>> OfAsync(Ledger.LedgerDbContext db, IReadOnlyList<Ledger.WorkItem> items, CancellationToken ct);
 }
 
 /// <summary>
@@ -274,6 +374,6 @@ public enum ReadyResult
     Moved,
     /// <summary>The item had already left the backlog (moved by hand, or being worked): nothing written.</summary>
     AlreadyLeft,
-    /// <summary>The item is archived: nothing written, and nothing will ever pick it up.</summary>
+    /// <summary>The item is archived (Kanban: <c>Closed</c>; <see cref="IWorkSource.Shelved"/>): nothing written, and nothing will ever pick it up.</summary>
     Archived,
 }

@@ -1,7 +1,6 @@
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Plans;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.Orchestrator.Controls;
@@ -45,8 +44,7 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
         if (runLock is null)
         {
             // A run that drives a worker or the gate watches the item's control and stops it at once. The run of a plan item that
-            // waits on its stories (sc-25876) only evaluates them: it sees the Stop when the evaluation ends, and a run started without
-            // the worker run lock leaves it to the next one. Until then nothing of the plan is stopped, and the answer says so.
+            // waits on its stories (sc-25876) only evaluates them: it sees the Stop when the evaluation ends. Until then nothing of the plan is stopped, and the answer says so.
             return (await ledger.HistoryAsync(item, ct)).Any(e => e.Step == RunPipeline.Steps.PlanStories)
                 ? new ControlResult(false,
                     $"{id}: stop NOT finished: it is a plan and a run of it is active. It stays Stopping; that run finishes the stop when its "
@@ -307,10 +305,12 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
             var kept = several is null ? $"Branch {branch} is kept; nothing was merged or deleted."
                 : $"Branch {branch} is kept in each of {string.Join(", ", changesets.Select(c => c.Repo))}; the stop merged and deleted nothing. "
                     + Plans.Changeset.DeliveryNote(id, several, stopped: true);
+            // What the stop could not stop or remove (sc-25989: the item's worker slot is no longer configured), from its own row.
+            var left = steps.LastOrDefault(e => e.Step == RunPipeline.Steps.SlotLeft)?.Detail is { } stays ? $" {stays}" : "";
             await source.ReportStateAsync(storyId, BoardState.Stopped, unclaimed
                 ? PlanRelease.NeverClaimedComment(id, by)
                 : $"{WorkSourceComments.Author} {id} was stopped by {by}: {what} "
-                    + $"{prs} {kept}", ct);
+                    + $"{prs} {kept}{left}", ct);
             await ledger.CheckpointAsync(item, RunPipeline.Steps.StopReported, session, by, ct);
         }
         await ledger.RecordAsync(item, WorkState.Cancelled, session, $"stopped by {by}", ct);
@@ -321,8 +321,11 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
             : $"{id} stopped: Cancelled, PRs drafted: {drafted}, claim released." + (plan is null ? "" : $" {Stories(plan)}");
     }
 
-    /// <summary>What became of a stopped plan's stories, as its comment and the stop's result say it (ids only).</summary>
-    private static string Stories(PlanStop plan)
+    /// <summary>
+    /// What became of a stopped plan's stories, as its comment and the stop's result say it (ids only; a shelved story in the
+    /// board's own word, <see cref="IWorkSource.Shelved"/>: archived on Shortcut, Closed on Kanban).
+    /// </summary>
+    private string Stories(PlanStop plan)
     {
         static string List(List<string> ids) => ids.Count == 0 ? "none" : string.Join(", ", ids);
         static string Some(string what, List<string> ids) => ids.Count == 0 ? "" : $"{what}: {List(ids)}. ";
@@ -330,7 +333,7 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
             + Some("Released but never started (moved back to the backlog; the factory did no work on them)", plan.Returned)
             + $"Already merged (left as they are): {List(plan.Merged)}. "
             + Some("Merged outside the factory (left as they are: their change is on the base branch)", plan.MergedOutside)
-            + Some("Taken, finished or archived by someone else since their release (left as they are)", plan.Left)
+            + Some($"Taken, finished or {source.Shelved.Is} by someone else since their release (left as they are)", plan.Left)
             + $"Never started (left in the backlog; the factory will not release or start them): {List(plan.Unstarted)}.";
     }
 }

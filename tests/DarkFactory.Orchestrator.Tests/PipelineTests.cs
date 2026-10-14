@@ -2,7 +2,6 @@ using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
@@ -164,7 +163,7 @@ public class RunPipelineTests
 {
     internal static readonly RepoRef Sandbox = new("michaeltrefry", "dark-factory-sandbox");
     private static readonly WorkStory Story =
-        new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77");
+        new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77", ItemNaming.Shortcut);
     internal const string PrUrl = "https://github.com/michaeltrefry/dark-factory-sandbox/pull/1";
 
     internal sealed class FakeWorkspaces(bool hasChanges = true, bool worktreeExists = true) : IRepoWorkspace
@@ -375,9 +374,11 @@ public class RunPipelineTests
         public FakePullRequests Prs { get; init; } = new();
         public InProcessRunLocks Locks { get; } = new();
         public WorkLedger Ledger => new(Db, TimeProvider.System);
+        /// <summary>The worker slots (sc-25989), as every sandboxed factory has; none by default.</summary>
+        public WorkerSlots? Slots { get; init; }
 
         public Task<RunOutcome> Run(FakeWorker worker, CancellationToken ct = default) =>
-            new RunPipeline(Stories, Ledger, Locks, Workspaces, worker, Prs, Sandbox, TextWriter.Null).RunAsync(77, ct);
+            new RunPipeline(Stories, Ledger, Locks, Workspaces, worker, Prs, Sandbox, TextWriter.Null, slots: Slots).RunAsync(77, ct);
 
         public async Task<WorkItem> Item() => await Db.WorkItems.SingleAsync();
         public async Task<List<LedgerEntry>> Rows() => await Db.LedgerEntries.OrderBy(e => e.Id).ToListAsync();
@@ -388,7 +389,7 @@ public class RunPipelineTests
         public async Task<WorkItem> Crashed(params string[] steps)
         {
             var ledger = Ledger;
-            var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
+            var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
             await ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
             foreach (var step in steps)
             {
@@ -432,7 +433,7 @@ public class RunPipelineTests
     {
         var h = new Harness();
         var ledger = h.Ledger;
-        var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
+        var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
         await ledger.CheckpointAsync(item, RunPipeline.Steps.Claimed, null, null, CancellationToken.None);
 
         await h.Run(new FakeWorker(Reports(Ok)));
@@ -581,6 +582,19 @@ public class RunPipelineTests
     }
 
     [Fact]
+    public async Task With_a_worker_slot_the_escalation_comment_names_the_step_reached_not_the_slots_release()
+    {
+        // A sandboxed factory (one slot, the default): the Implement phase's end writes slot-released before the Escalated row.
+        var h = new Harness { Workspaces = new(hasChanges: false), Slots = TestSlots.Pool(Directory.CreateTempSubdirectory("df-escalation-slot-").FullName, 1) };
+        var outcome = await h.Run(new FakeWorker(Reports(Ok)));
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        var rows = await h.Rows();
+        Assert.Equal(RunPipeline.Steps.SlotReleased, rows[rows.FindIndex(r => r.Step is null && r.State == WorkState.Escalated) - 1].Step);
+        Assert.Contains("Last ledger state: Implement (after step worker-done)", Assert.Single(h.Stories.Comments));
+    }
+
+    [Fact]
     public async Task Interrupt_pauses_keeps_the_worktree_and_a_rerun_resumes_the_same_session()
     {
         var h = new Harness();
@@ -624,7 +638,7 @@ public class RunPipelineTests
         var h = new Harness();
         var ledger = h.Ledger;
         Assert.False(await RunPipeline.WorktreeIsResumableAsync(ledger, "factory-changeset-sc-77", CancellationToken.None)); // no item
-        var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", "A plan", Sandbox.FullName, null, CancellationToken.None);
+        var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", "A plan", Sandbox.FullName, null, CancellationToken.None);
         foreach (var state in new[] { WorkState.Plan, WorkState.Planned, WorkState.Review })
         {
             await ledger.RecordAsync(item, state, null, null, CancellationToken.None);
@@ -994,7 +1008,7 @@ public class RunPipelineTests
     {
         var h = new Harness();
         var ledger = h.Ledger;
-        var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
+        var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
 
         await ledger.TaintSessionAsync(item, "s-1", Taint.IssueText, CancellationToken.None);
         await ledger.TaintSessionAsync(item, "s-1", "web:WebFetch", CancellationToken.None);
@@ -1012,7 +1026,7 @@ public class RunPipelineTests
     {
         var h = new Harness();
         var ledger = h.Ledger;
-        var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
+        var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
         await ledger.RecordAsync(item, WorkState.Cancelled, null, "owner cancelled", CancellationToken.None);
         var worker = new FakeWorker();
 

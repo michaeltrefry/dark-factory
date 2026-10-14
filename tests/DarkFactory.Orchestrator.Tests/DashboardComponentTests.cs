@@ -181,6 +181,59 @@ public class DashboardComponentTests : BunitContext
         new(id, $"sc-{id}", $"Story {id}", "acme/widgets", state, Now.AddMinutes(-65), Now, pr, cost, sessions);
 
     [Fact]
+    public void Pipeline_lists_a_kanban_item_with_its_id_a_link_to_it_its_epic_and_controls_on_the_kanban_scopes()
+    {
+        const string board = "https://kanban.test/?project=7f0c5a52-3b0e-4b6f-9a51-0d8a8a1f2c11";
+        _data.Rows =
+        [
+            // Kanban item 4 in the Kanban epic with ledger key 5, and a Shortcut story in Shortcut epic 5: the same number.
+            new(1, "kb-4", "Count words", "acme/widgets", WorkState.Implement, Now.AddMinutes(-5), Now, null, null, [], EpicId: 5,
+                Links: new BoardLink($"{board}&epic=e1&item=i1", $"{board}&epic=e1")),
+            Row(77, WorkState.Implement) with { EpicId = 5 },
+            // A Kanban item in no epic, and one whose project the ledger has not recorded yet (no link to build).
+            new(3, "kb-6", "Split words", "acme/widgets", WorkState.Review, Now, Now, null, null, [], Links: new BoardLink($"{board}&item=i3", null)),
+            new(4, "kb-7", "Old", "acme/widgets", WorkState.Review, Now, Now, null, null, [], EpicId: 5, Links: new BoardLink(null, null)),
+        ];
+        _data.Controls = [new Control { Scope = "epic:kb-5", State = ControlState.Paused, ChangedBy = "michael" }];
+
+        var cut = Render<Pipeline>();
+
+        var row = cut.Find("tr[data-item='1']");
+        var id = row.QuerySelector("a.id")!;
+        Assert.Equal(("kb-4", $"{board}&epic=e1&item=i1", "noopener noreferrer"), (id.TextContent, id.GetAttribute("href"), id.GetAttribute("rel")));
+        Assert.Contains("Count words", row.TextContent);
+        var epic = row.QuerySelector(".epic")!;
+        Assert.Equal(("kb-5", "kb-5", $"{board}&epic=e1"),
+            (epic.GetAttribute("data-epic"), epic.QuerySelector("a")!.TextContent, epic.QuerySelector("a")!.GetAttribute("href")));
+        // Its own controls post the item's scope.
+        Assert.Equal(["item:kb-4", "item:kb-4"], row.QuerySelectorAll("td.control form").Select(f => f.GetAttribute("data-scope")));
+        Assert.Equal(["pause", "stop"], row.QuerySelectorAll("td.control form").Select(f => f.GetAttribute("data-action")));
+
+        // Two epic control rows, one per source: the Kanban epic's posts `epic:kb-5` (paused: Continue), the Shortcut epic's `epic:5`.
+        Assert.Equal(["factory", "epic:5", "epic:kb-5"], cut.FindAll("div.controls").Select(d => d.GetAttribute("data-scope")));
+        var kanban = cut.Find("div.controls[data-scope='epic:kb-5']");
+        Assert.Contains("Epic kb-5: paused", kanban.TextContent);
+        Assert.Equal([("continue", "epic:kb-5"), ("stop", "epic:kb-5")],
+            kanban.QuerySelectorAll("form").Select(f => (f.GetAttribute("data-action"), f.GetAttribute("data-scope"))));
+        Assert.Equal(["epic:kb-5", "epic:kb-5"], kanban.QuerySelectorAll("input[name='scope']").Select(i => i.GetAttribute("value")));
+        var shortcut = cut.Find("div.controls[data-scope='epic:5']");
+        Assert.Contains("Epic 5: running", shortcut.TextContent);
+        Assert.Equal([("pause", "epic:5"), ("stop", "epic:5")],
+            shortcut.QuerySelectorAll("form").Select(f => (f.GetAttribute("data-action"), f.GetAttribute("data-scope"))));
+
+        // A Shortcut story's row is what it was: its id as text, no link and no epic beside it.
+        var story = cut.Find("tr[data-item='77']");
+        Assert.Equal("sc-77", story.QuerySelector("span.id")!.TextContent);
+        Assert.Empty(story.QuerySelectorAll("a.id, .epic"));
+        // No epic: none shown. No project in the ledger yet: the id as text, the epic without a link.
+        Assert.NotNull(cut.Find("tr[data-item='3'] a.id"));
+        Assert.Empty(cut.FindAll("tr[data-item='3'] .epic"));
+        Assert.Equal("kb-7", cut.Find("tr[data-item='4'] span.id").TextContent);
+        Assert.Equal("epic kb-5", System.Text.RegularExpressions.Regex.Replace(cut.Find("tr[data-item='4'] .epic").TextContent.Trim(), @"\s+", " "));
+        Assert.Empty(cut.FindAll("tr[data-item='4'] .epic a"));
+    }
+
+    [Fact]
     public void Pipeline_lists_each_active_item_with_state_repo_pr_elapsed_cost_and_session_links()
     {
         _data.Rows = [Row(1, WorkState.Review, "https://github.com/acme/widgets/pull/9", 1.5m,
@@ -190,10 +243,76 @@ public class DashboardComponentTests : BunitContext
 
         var cells = cut.FindAll("tr[data-item='1'] td").Select(td => td.TextContent.Trim()).ToList();
         // s-2 is running and its cost not measured yet: the sum says it covers one of the two sessions (E5).
-        Assert.Equal(["sc-1 Story 1", "Review", "acme/widgets", "PR", "1h 05m", "$1.50 of 1/2 measured"], cells.Take(6));
+        // The Run cell (sc-25991) is empty for a row with no run view; the others are where and what they were.
+        Assert.Equal(["sc-1 Story 1", "Review", "—", "acme/widgets", "PR", "1h 05m", "$1.50 of 1/2 measured"], cells.Take(7));
+        Assert.Equal(["Item", "State", "Run", "Repo", "PR", "Elapsed", "Cost", "Sessions", "Control"], cut.FindAll("table.pipeline th").Select(th => th.TextContent));
         Assert.Equal("https://github.com/acme/widgets/pull/9", cut.Find("td.pr a").GetAttribute("href"));
         Assert.Equal(["sessions/s-1", "sessions/s-2"], cut.FindAll("td.sessions a").Select(a => a.GetAttribute("href")));
         Assert.Equal("#2 (live)", cut.FindAll("td.sessions a")[1].TextContent);
+    }
+
+    private static string Words(AngleSharp.Dom.IElement element) => string.Join(' ', element.TextContent.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+    [Fact]
+    public void Two_running_items_each_show_their_phase_and_their_slot_or_that_they_wait_for_one()
+    {
+        // sc-25991: two runs in flight at once (Intake:MaxConcurrentRuns 2) — one in a worker phase in slot 2, one waiting for a
+        // free slot; a third item in the merge queue with no run now; a fourth whose run died holding its slot.
+        var live = new SessionLink("s-1", 1, Now, null, null, null);
+        _data.Rows =
+        [
+            Row(1, WorkState.Implement, null, null, live) with { Run = new RunView(true, "implementing", new SlotUse(SlotUseKind.Holding, 2, "_factory2", "implement"), 2, "_factory2") },
+            Row(2, WorkState.Implement) with { Run = new RunView(true, "implementing", new SlotUse(SlotUseKind.Waiting, null, null, "implement")) },
+            Row(3, WorkState.MergeGate) with { Run = new RunView(false, "merge queue: waiting for its turn", new SlotUse(SlotUseKind.None, 1, "_factory", "run the new tests"), 1, "_factory") },
+            Row(4, WorkState.Fixing) with { Run = new RunView(false, "fix round", new SlotUse(SlotUseKind.Holding, 1, "_factory", "run the review fix"), 1, "_factory") },
+            Row(5, WorkState.Review) with { Run = new RunView(null, "review", SlotUse.None) },
+        ];
+
+        var cut = Render<Pipeline>();
+
+        Assert.Equal("running: implementing · holds slot 2 (_factory2) to implement", Words(cut.Find("tr[data-item='1'] td.run")));
+        Assert.Equal(("true", "held"), (cut.Find("tr[data-item='1'] td.run").GetAttribute("data-live"), cut.Find("tr[data-item='1'] .slot").GetAttribute("data-slot")));
+        Assert.Equal("running: implementing · waiting for a slot to implement", Words(cut.Find("tr[data-item='2'] td.run")));
+        Assert.Equal(("true", "waiting"), (cut.Find("tr[data-item='2'] td.run").GetAttribute("data-live"), cut.Find("tr[data-item='2'] .slot").GetAttribute("data-slot")));
+        // Both at once: two rows say "running".
+        Assert.Equal(2, cut.FindAll("td.run[data-live='true']").Count);
+        Assert.Equal("no run now: merge queue: waiting for its turn · slot 1 (_factory), not held", Words(cut.Find("tr[data-item='3'] td.run")));
+        Assert.Equal("idle", cut.Find("tr[data-item='3'] .slot").GetAttribute("data-slot"));
+        // A dead run's last word is not shown as a hold.
+        var stale = cut.Find("tr[data-item='4'] .slot");
+        Assert.Equal("stale", stale.GetAttribute("data-slot"));
+        Assert.Contains("error", stale.ClassList);
+        Assert.StartsWith("no run now: the last one ended holding slot 1 (_factory) without recording it", Words(stale));
+        // Liveness not known (a reader with no lock reader): the phase alone, nothing claimed either way.
+        Assert.Equal("review", Words(cut.Find("tr[data-item='5'] td.run")));
+        Assert.Null(cut.Find("tr[data-item='5'] td.run").GetAttribute("data-live"));
+    }
+
+    [Fact]
+    public void Each_deferral_is_listed_with_what_lifts_it_and_one_deferred_run_reads_as_before()
+    {
+        _data.Rows = [];
+        var cut = Render<Pipeline>();
+        Assert.Empty(cut.FindAll(".deferred, .deferrals"));
+
+        // One run deferred: the line it always was.
+        _intake.Deferred("sc-2", "factory frozen (main-red): main is red; `factory continue --freeze` clears it");
+        cut.WaitForAssertion(() => Assert.Equal(
+            $"Deferred (last at {Now:u}): sc-2 deferred: factory frozen (main-red): main is red; `factory continue --freeze` clears it", Words(cut.Find("p.deferred"))));
+        Assert.Empty(cut.FindAll(".deferrals"));
+
+        // A second run of the poll deferred, and a factory-wide control the loop found in effect: each on its own line.
+        _intake.Deferred("sc-3", "factory frozen (main-red): main is red; `factory continue --freeze` clears it");
+        _intake.Holding([(ControlScope.Usage, "the factory is paused for usage (worker-rate-limited)", "it lifts by itself at 2026-10-06 13:00:00Z, or with `factory continue --usage`")]);
+        cut.WaitForAssertion(() => Assert.Equal([ControlScope.Usage, "sc-2", "sc-3"], cut.FindAll(".deferrals li").Select(li => li.GetAttribute("data-deferral"))));
+        Assert.Empty(cut.FindAll("p.deferred"));
+        Assert.Equal($"Deferred (last at {Now:u}): new work held: the factory is paused for usage (worker-rate-limited); it lifts by itself at 2026-10-06 13:00:00Z, or with `factory continue --usage`",
+            Words(cut.Find(".deferrals li.hold")));
+        Assert.All(cut.FindAll(".deferrals li.deferred"), li => Assert.Contains("factory continue --freeze", li.TextContent));
+
+        _intake.NotDeferred();
+        _intake.Holding([]);
+        cut.WaitForAssertion(() => Assert.Empty(cut.FindAll(".deferred, .deferrals")));
     }
 
     /// <summary>The plan row's note about its hold comment, as the page renders it (whitespace collapsed).</summary>

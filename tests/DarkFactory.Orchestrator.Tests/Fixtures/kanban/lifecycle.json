@@ -1,0 +1,1529 @@
+{
+  "recorded_from": "hosted KanbanBoard",
+  "parameters": {
+    "project": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+    "projectKey": "DFFIX16A87D2D",
+    "item": "ea396935-c84c-4bfb-940c-c3b102b59ba2"
+  },
+  "interactions": [
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 5,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:48.848307+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 1,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 5,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:48.848307+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 1,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "list_projects",
+      "arguments": {},
+      "isError": false,
+      "answer": [
+        {
+          "id": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+          "name": "[dark-factory fixture] contract recording",
+          "key": "DFFIX16A87D2D",
+          "description": "Throwaway project of the dark-factory Kanban contract fixtures; deleted after recording.",
+          "isArchived": false,
+          "createdAtUtc": "2026-10-14T11:42:45.433287+00:00",
+          "totalItems": 7,
+          "openItems": 7,
+          "repository_url": "https://github.com/michaeltrefry/dark-factory-sandbox.git",
+          "default_branch": null
+        }
+      ]
+    },
+    {
+      "tool": "claim_work_item",
+      "arguments": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "ttl_seconds": 86400
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 5,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:48.848307+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:49.71288+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 1,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 5,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:48.848307+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:49.71288+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 1,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "update_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "status": "InProgress",
+        "expected_version": 1
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "InProgress",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:50.142393+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:49.71288+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 2,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "InProgress",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:50.142393+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:49.71288+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 2,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "list_projects",
+      "arguments": {},
+      "isError": false,
+      "answer": [
+        {
+          "id": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+          "name": "[dark-factory fixture] contract recording",
+          "key": "DFFIX16A87D2D",
+          "description": "Throwaway project of the dark-factory Kanban contract fixtures; deleted after recording.",
+          "isArchived": false,
+          "createdAtUtc": "2026-10-14T11:42:45.433287+00:00",
+          "totalItems": 7,
+          "openItems": 7,
+          "repository_url": "https://github.com/michaeltrefry/dark-factory-sandbox.git",
+          "default_branch": null
+        }
+      ]
+    },
+    {
+      "tool": "claim_work_item",
+      "arguments": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "ttl_seconds": 86400
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "InProgress",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:50.142393+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:50.830138+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 2,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "InProgress",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:50.142393+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:50.830138+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 2,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "InProgress",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:50.142393+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:50.830138+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 2,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "list_projects",
+      "arguments": {},
+      "isError": false,
+      "answer": [
+        {
+          "id": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+          "name": "[dark-factory fixture] contract recording",
+          "key": "DFFIX16A87D2D",
+          "description": "Throwaway project of the dark-factory Kanban contract fixtures; deleted after recording.",
+          "isArchived": false,
+          "createdAtUtc": "2026-10-14T11:42:45.433287+00:00",
+          "totalItems": 7,
+          "openItems": 7,
+          "repository_url": "https://github.com/michaeltrefry/dark-factory-sandbox.git",
+          "default_branch": null
+        }
+      ]
+    },
+    {
+      "tool": "renew_work_item_claim",
+      "arguments": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "ttl_seconds": 86400
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "InProgress",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:50.142393+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:51.671215+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 2,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "InProgress",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:50.142393+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:51.671215+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 2,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "InProgress",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:50.142393+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:51.671215+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 2,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "add_work_item_comment",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "body": "[author: dark-factory] contract test comment",
+        "idempotency_key": "dark-factory:comment:7bc3b4713ad179c2b97cd185a6e924c9454a40438b1f4b56d19437eddeaf1d6b"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "InProgress",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:52.30489+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:51.671215+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 2,
+        "label_list": [],
+        "comment_id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+        "comment_created": true
+      }
+    },
+    {
+      "tool": "add_work_item_link",
+      "arguments": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "kind": "pr",
+        "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "InProgress",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:52.527793+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:51.671215+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          }
+        ],
+        "version": 2,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "add_work_item_link",
+      "arguments": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "kind": "branch",
+        "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "InProgress",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:52.75074+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:51.671215+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          },
+          {
+            "id": "96a83b85-3050-44fc-b793-1b38d9a1a180",
+            "kind": "branch",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999",
+            "created_at_utc": "2026-10-14T11:42:52.75074+00:00"
+          }
+        ],
+        "version": 2,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "add_work_item_link",
+      "arguments": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "kind": "pr",
+        "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "InProgress",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:52.75074+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:51.671215+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          },
+          {
+            "id": "96a83b85-3050-44fc-b793-1b38d9a1a180",
+            "kind": "branch",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999",
+            "created_at_utc": "2026-10-14T11:42:52.75074+00:00"
+          }
+        ],
+        "version": 2,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "InProgress",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:52.75074+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:51.671215+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          },
+          {
+            "id": "96a83b85-3050-44fc-b793-1b38d9a1a180",
+            "kind": "branch",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999",
+            "created_at_utc": "2026-10-14T11:42:52.75074+00:00"
+          }
+        ],
+        "version": 2,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "update_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "status": "Done",
+        "expected_version": 2
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Done",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:53.435403+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:51.671215+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          },
+          {
+            "id": "96a83b85-3050-44fc-b793-1b38d9a1a180",
+            "kind": "branch",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999",
+            "created_at_utc": "2026-10-14T11:42:52.75074+00:00"
+          }
+        ],
+        "version": 3,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Done",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:53.435403+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:51.671215+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          },
+          {
+            "id": "96a83b85-3050-44fc-b793-1b38d9a1a180",
+            "kind": "branch",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999",
+            "created_at_utc": "2026-10-14T11:42:52.75074+00:00"
+          }
+        ],
+        "version": 3,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "update_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "status": "Backlog",
+        "expected_version": 3
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 1,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:53.866756+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:51.671215+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          },
+          {
+            "id": "96a83b85-3050-44fc-b793-1b38d9a1a180",
+            "kind": "branch",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999",
+            "created_at_utc": "2026-10-14T11:42:52.75074+00:00"
+          }
+        ],
+        "version": 4,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "release_work_item_claim",
+      "arguments": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 1,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:53.866756+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          },
+          {
+            "id": "96a83b85-3050-44fc-b793-1b38d9a1a180",
+            "kind": "branch",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999",
+            "created_at_utc": "2026-10-14T11:42:52.75074+00:00"
+          }
+        ],
+        "version": 4,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "add_work_item_comment",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "body": "[author: dark-factory] stopped by the contract test",
+        "idempotency_key": "dark-factory:comment:14245c7b24e3b3ddc6433e085425045a293137817bd6f89e90c6bc54f250b551"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 1,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          },
+          {
+            "id": "7bcfe112-4b37-4875-aeec-5ee5adb06978",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] stopped by the contract test",
+            "createdAtUtc": "2026-10-14T11:42:54.300324+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:54.300324+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          },
+          {
+            "id": "96a83b85-3050-44fc-b793-1b38d9a1a180",
+            "kind": "branch",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999",
+            "created_at_utc": "2026-10-14T11:42:52.75074+00:00"
+          }
+        ],
+        "version": 4,
+        "label_list": [],
+        "comment_id": "7bcfe112-4b37-4875-aeec-5ee5adb06978",
+        "comment_created": true
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 1,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          },
+          {
+            "id": "7bcfe112-4b37-4875-aeec-5ee5adb06978",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] stopped by the contract test",
+            "createdAtUtc": "2026-10-14T11:42:54.300324+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:54.300324+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          },
+          {
+            "id": "96a83b85-3050-44fc-b793-1b38d9a1a180",
+            "kind": "branch",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999",
+            "created_at_utc": "2026-10-14T11:42:52.75074+00:00"
+          }
+        ],
+        "version": 4,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 1,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          },
+          {
+            "id": "7bcfe112-4b37-4875-aeec-5ee5adb06978",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] stopped by the contract test",
+            "createdAtUtc": "2026-10-14T11:42:54.300324+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:54.300324+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          },
+          {
+            "id": "96a83b85-3050-44fc-b793-1b38d9a1a180",
+            "kind": "branch",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999",
+            "created_at_utc": "2026-10-14T11:42:52.75074+00:00"
+          }
+        ],
+        "version": 4,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "update_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "status": "Ready",
+        "expected_version": 4
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 5,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          },
+          {
+            "id": "7bcfe112-4b37-4875-aeec-5ee5adb06978",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] stopped by the contract test",
+            "createdAtUtc": "2026-10-14T11:42:54.300324+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:54.948278+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          },
+          {
+            "id": "96a83b85-3050-44fc-b793-1b38d9a1a180",
+            "kind": "branch",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999",
+            "created_at_utc": "2026-10-14T11:42:52.75074+00:00"
+          }
+        ],
+        "version": 5,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 5,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          },
+          {
+            "id": "7bcfe112-4b37-4875-aeec-5ee5adb06978",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] stopped by the contract test",
+            "createdAtUtc": "2026-10-14T11:42:54.300324+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:54.948278+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          },
+          {
+            "id": "96a83b85-3050-44fc-b793-1b38d9a1a180",
+            "kind": "branch",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999",
+            "created_at_utc": "2026-10-14T11:42:52.75074+00:00"
+          }
+        ],
+        "version": 5,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "list_projects",
+      "arguments": {},
+      "isError": false,
+      "answer": [
+        {
+          "id": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+          "name": "[dark-factory fixture] contract recording",
+          "key": "DFFIX16A87D2D",
+          "description": "Throwaway project of the dark-factory Kanban contract fixtures; deleted after recording.",
+          "isArchived": false,
+          "createdAtUtc": "2026-10-14T11:42:45.433287+00:00",
+          "totalItems": 7,
+          "openItems": 7,
+          "repository_url": "https://github.com/michaeltrefry/dark-factory-sandbox.git",
+          "default_branch": null
+        }
+      ]
+    },
+    {
+      "tool": "claim_work_item",
+      "arguments": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "ttl_seconds": 86400
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 5,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          },
+          {
+            "id": "7bcfe112-4b37-4875-aeec-5ee5adb06978",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] stopped by the contract test",
+            "createdAtUtc": "2026-10-14T11:42:54.300324+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:54.948278+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:55.580978+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          },
+          {
+            "id": "96a83b85-3050-44fc-b793-1b38d9a1a180",
+            "kind": "branch",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999",
+            "created_at_utc": "2026-10-14T11:42:52.75074+00:00"
+          }
+        ],
+        "version": 5,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 5,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          },
+          {
+            "id": "7bcfe112-4b37-4875-aeec-5ee5adb06978",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] stopped by the contract test",
+            "createdAtUtc": "2026-10-14T11:42:54.300324+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:54.948278+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:55.580978+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          },
+          {
+            "id": "96a83b85-3050-44fc-b793-1b38d9a1a180",
+            "kind": "branch",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999",
+            "created_at_utc": "2026-10-14T11:42:52.75074+00:00"
+          }
+        ],
+        "version": 5,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "update_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "status": "InProgress",
+        "expected_version": 5
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "InProgress",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          },
+          {
+            "id": "7bcfe112-4b37-4875-aeec-5ee5adb06978",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] stopped by the contract test",
+            "createdAtUtc": "2026-10-14T11:42:54.300324+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:56.016438+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:55.580978+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          },
+          {
+            "id": "96a83b85-3050-44fc-b793-1b38d9a1a180",
+            "kind": "branch",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999",
+            "created_at_utc": "2026-10-14T11:42:52.75074+00:00"
+          }
+        ],
+        "version": 6,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "InProgress",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          },
+          {
+            "id": "7bcfe112-4b37-4875-aeec-5ee5adb06978",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] stopped by the contract test",
+            "createdAtUtc": "2026-10-14T11:42:54.300324+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:56.016438+00:00",
+        "claimant": "fixture-recorder",
+        "claimant_id": "f0000000-0000-0000-0000-000000000001",
+        "claim_marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "claim_expires_at_utc": "2026-10-15T11:42:55.580978+00:00",
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          },
+          {
+            "id": "96a83b85-3050-44fc-b793-1b38d9a1a180",
+            "kind": "branch",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999",
+            "created_at_utc": "2026-10-14T11:42:52.75074+00:00"
+          }
+        ],
+        "version": 6,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "release_work_item_claim",
+      "arguments": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "marker": "dark-factory:ea396935-c84c-4bfb-940c-c3b102b59ba2"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] lifecycle",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "InProgress",
+        "priority": "Medium",
+        "order": 0,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "fe993672-b2a5-49f3-8ed0-1a694fa763c0",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] contract test comment",
+            "createdAtUtc": "2026-10-14T11:42:52.30489+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          },
+          {
+            "id": "7bcfe112-4b37-4875-aeec-5ee5adb06978",
+            "workItemId": "ea396935-c84c-4bfb-940c-c3b102b59ba2",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] stopped by the contract test",
+            "createdAtUtc": "2026-10-14T11:42:54.300324+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:42:48.848305+00:00",
+        "updatedAtUtc": "2026-10-14T11:42:56.016438+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [
+          {
+            "id": "da55dce2-15b4-4134-937b-7e3344e54974",
+            "kind": "pr",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/pull/999",
+            "created_at_utc": "2026-10-14T11:42:52.527793+00:00"
+          },
+          {
+            "id": "96a83b85-3050-44fc-b793-1b38d9a1a180",
+            "kind": "branch",
+            "url": "https://github.com/michaeltrefry/dark-factory-sandbox/tree/factory/kb-999",
+            "created_at_utc": "2026-10-14T11:42:52.75074+00:00"
+          }
+        ],
+        "version": 6,
+        "label_list": []
+      }
+    }
+  ]
+}

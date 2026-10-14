@@ -195,8 +195,8 @@ public class PlanParserTests
         var child = PlanParser.Parse(PlanAnswers.Answer(story)).Children("sc-12", new RepoRef("acme", "widgets"))[0];
         // The plan item's repository is the story's, whatever the planner's text names.
         Assert.Equal(new RepoRef("acme", "widgets"), RepoResolver.Resolve(child.Description, new RepoRef("o", "default")));
-        var planned = new WorkStory(13, child.Name, child.Description, child.StoryType, "https://app.shortcut.com/t/story/13");
-        var owners = new WorkStory(14, child.Name, "Written by the owner.", "chore", "https://app.shortcut.com/t/story/14");
+        var planned = new WorkStory(13, child.Name, child.Description, child.StoryType, "https://app.shortcut.com/t/story/13", ItemNaming.Shortcut);
+        var owners = new WorkStory(14, child.Name, "Written by the owner.", "chore", "https://app.shortcut.com/t/story/14", ItemNaming.Shortcut);
 
         Assert.True(planned.PlannerAuthored);
         Assert.True(planned.UntrustedName);
@@ -219,18 +219,18 @@ public class PlanParserTests
     [Fact]
     public void The_plan_label_is_read_in_any_case_and_the_planner_runs_on_the_high_class()
     {
-        WorkStory Labelled(params string[] labels) => new(1, "n", null, "feature", "u", Labels: labels);
+        WorkStory Labelled(params string[] labels) => new(1, "n", null, "feature", "u", ItemNaming.Shortcut, Labels: labels);
 
         Assert.True(PlanLabel.IsOn(Labelled("simple", "Plan")));
         Assert.False(PlanLabel.IsOn(Labelled("planning", "simple")));
-        Assert.False(PlanLabel.IsOn(new WorkStory(1, "n", null, "feature", "u")));
+        Assert.False(PlanLabel.IsOn(new WorkStory(1, "n", null, "feature", "u", ItemNaming.Shortcut)));
         Assert.Equal(WorkerModelClass.High, WorkerModelClass.Planner);
     }
 
     [Fact]
     public void The_prompt_states_the_story_the_rules_and_only_the_tools_the_session_was_granted()
     {
-        var story = new WorkStory(12, "Add CSV export", "Reports need a CSV download.", "feature", "u", Labels: ["plan"]);
+        var story = new WorkStory(12, "Add CSV export", "Reports need a CSV download.", "feature", "u", ItemNaming.Shortcut, Labels: ["plan"]);
         var prompt = PlanPrompt.Build(new WorkSpec(story, new WorkEpic(3, "Reports", "All reporting work.", "e"), [new WorkDocument("Spec", "CSV columns", "d")]),
             new RepoRef("acme", "widgets"));
 
@@ -257,7 +257,7 @@ public class PlanPipelineTests
 {
     private static readonly DateTimeOffset T0 = new(2026, 10, 12, 12, 0, 0, TimeSpan.Zero);
     private static readonly WorkStory PlanStory =
-        new(77, "Add CSV export", "Reports need a CSV download.", "feature", "https://app.shortcut.com/trefry/story/77", Labels: ["plan"]);
+        new(77, "Add CSV export", "Reports need a CSV download.", "feature", "https://app.shortcut.com/trefry/story/77", ItemNaming.Shortcut, Labels: ["plan"]);
 
     private static readonly WorkerResult Planned = new("plan-sess", 0, false, "success", PlanAnswers.Valid, "");
 
@@ -266,11 +266,15 @@ public class PlanPipelineTests
     {
         public List<string> Seats { get; } = [];
         public int Closed { get; private set; }
+        /// <summary>Asked as each seat is set up and as it is closed (e.g. whether the sandbox user's lock is held then).</summary>
+        public Func<bool>? Probe { get; init; }
+        public List<bool> Probed { get; } = [];
 
         public async Task<T> RunAsync<T>(WorkItem item, IReadOnlyList<RepoRef> repos, Func<PlannerSeat, CancellationToken, Task<T>> session,
             CancellationToken ct)
         {
             Seats.Add($"{item.ExternalId} {string.Join(' ', repos)}");
+            Probed.Add(Probe?.Invoke() ?? false);
             try
             {
                 return await session(new PlannerSeat(worker, "/plan-wt", null, ["mcp__codegraph__search_graph"],
@@ -279,6 +283,7 @@ public class PlanPipelineTests
             finally
             {
                 Closed++;
+                Probed.Add(Probe?.Invoke() ?? false);
             }
         }
     }
@@ -309,15 +314,18 @@ public class PlanPipelineTests
             return RunWith(source, Planner, id, ct);
         }
 
+        /// <summary>The sandbox user's lock the run takes for its worker phases (sc-25988; null: unsandboxed).</summary>
+        public WorkerLock? Lock { get; init; }
+
         public Task<RunOutcome> RunWith(IWorkSource source, IPlanRunner? runner, int id = 77, CancellationToken ct = default) =>
             new RunPipeline(source, Ledger, Locks, Workspaces, Implementer, Prs, Sandbox, TextWriter.Null, controls: Controls,
-                controlPollInterval: TimeSpan.FromMilliseconds(10), planner: runner, configuredRepos: Configured).RunAsync(id, ct);
+                controlPollInterval: TimeSpan.FromMilliseconds(10), planner: runner, configuredRepos: Configured, slots: TestSlots.Of(Lock)).RunAsync(id, ct);
 
         /// <summary>Puts sc-77 in the ledger as an earlier run left it: in Plan, then each row (a null step is a transition to that state).</summary>
         public async Task Left(params (string? Step, WorkState State, string? Detail)[] rows)
         {
             var ledger = Ledger;
-            var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", PlanStory.Name, Sandbox.FullName, null, CancellationToken.None);
+            var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", PlanStory.Name, Sandbox.FullName, null, CancellationToken.None);
             await ledger.RecordAsync(item, WorkState.Plan, null, null, CancellationToken.None);
             foreach (var (step, state, detail) in rows)
             {
@@ -335,7 +343,7 @@ public class PlanPipelineTests
         public async Task<IReadOnlyList<int>> InFlight()
         {
             await using var db = new LedgerDbContext(_options);
-            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), CancellationToken.None, Controls);
+            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Shortcut, CancellationToken.None, Controls);
         }
 
         public async Task<List<LedgerEntry>> Rows() => await Db.LedgerEntries.AsNoTracking().OrderBy(e => e.Id).ToListAsync();
@@ -359,6 +367,36 @@ public class PlanPipelineTests
     private static JsonObject Named(FakeShortcutBoard board, string name) => board.Stories.Single(s => (string?)s["name"] == name);
 
     private static int StoryPosts(FakeShortcutBoard board) => board.Requests.Count(r => r.Method == HttpMethod.Post && r.PathAndQuery.EndsWith("/stories"));
+
+    [Fact]
+    public async Task The_planners_seat_its_session_and_a_leftover_planners_stop_hold_the_sandbox_users_lock()
+    {
+        // sc-25988: the seat (its sweeps, checkouts, session and removal) and the orphan's stop run as the sandbox user.
+        var workerLock = WorkerLock.For(Directory.CreateTempSubdirectory("df-plan-lock-").FullName);
+        var held = new List<(string What, bool Held)>();
+        var h = new Harness
+        {
+            Lock = workerLock,
+            Implementer = new FakeWorker(Reports(Ok)) { OrphanAlive = true, OnStopOrphan = () => held.Add(("orphan stop", workerLock.IsHeld)) },
+        };
+        var source = new FakeWorkSource(PlanStory) { PlansItems = true };
+        // A crashed run left a planner on record.
+        await h.Left((RunPipeline.Steps.WorkerStarted, WorkState.Plan, "999"));
+        var runner = new FakePlanRunner(Planner(async call =>
+        {
+            held.Add(("session", workerLock.IsHeld));
+            return await Reports(Planned)(call);
+        }))
+        { Probe = () => workerLock.IsHeld };
+
+        var outcome = await h.RunWith(source, runner);
+
+        Assert.Equal((WorkState.Planned, (string?)null), (outcome.State, outcome.Error));
+        Assert.Equal([true, true], runner.Probed); // as the seat is set up, and as it is closed
+        Assert.Equal([("orphan stop", true), ("session", true)], held);
+        Assert.NotEmpty(source.Children);
+        Assert.False(workerLock.IsHeld);
+    }
 
     [Fact]
     public async Task A_plan_item_is_planned_into_backlog_stories_with_their_blockers_and_a_second_run_plans_and_creates_nothing_more()
@@ -688,6 +726,7 @@ public class PlanPipelineTests
     /// <summary>A work source whose child creation succeeds on the board and is then cut off by a cancelled run.</summary>
     private sealed class CancelOnCreate(FakeWorkSource inner, CancellationTokenSource stop) : IWorkSource
     {
+        public ItemNaming Naming => inner.Naming;
         public bool PlansItems => true;
         public Task<IReadOnlyList<int>> ListReadyAsync(CancellationToken ct) => inner.ListReadyAsync(ct);
         public Task<ClaimResult> ClaimAsync(int id, bool ignoreScope, CancellationToken ct) => inner.ClaimAsync(id, ignoreScope, ct);

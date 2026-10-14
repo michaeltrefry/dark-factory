@@ -1,7 +1,6 @@
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
@@ -85,7 +84,7 @@ public sealed class LedgerPostgresTests : IAsyncLifetime
         var prs = new CountingPullRequests();
         await using var dbA = Context();
         await using var dbB = Context();
-        RunPipeline Pipeline(LedgerDbContext db) => new(new FakeWorkSource(new WorkStory(1, "Fix", "Fix it.", "bug", "https://app.shortcut.com/t/story/1")), new WorkLedger(db, TimeProvider.System),
+        RunPipeline Pipeline(LedgerDbContext db) => new(new FakeWorkSource(new WorkStory(1, "Fix", "Fix it.", "bug", "https://app.shortcut.com/t/story/1", ItemNaming.Shortcut)), new WorkLedger(db, TimeProvider.System),
             new PostgresRunLocks(_cs), new Workspaces(), worker, prs, new RepoRef("acme", "widgets"), TextWriter.Null);
 
         var first = Task.Run(() => Pipeline(dbA).RunAsync(77, CancellationToken.None));
@@ -111,6 +110,81 @@ public sealed class LedgerPostgresTests : IAsyncLifetime
         Assert.Equal(WorkState.Review, third.State);
         Assert.Equal(1, worker.Calls);
         Assert.Equal(1, prs.Opened);
+    }
+
+    [Fact]
+    public async Task The_run_locks_held_are_read_without_taking_any_whoever_holds_them_and_a_dead_runs_is_gone()
+    {
+        // sc-25991: the dashboard asks which items' runs are alive — in its own process or another (a `factory run` beside
+        // `factory work`: its own PostgresRunLocks, its own connections).
+        await using var db = Context();
+        var ledger = new WorkLedger(db, TimeProvider.System);
+        var one = await ledger.GetOrCreateAsync("shortcut", "sc-1", "One", "o/r", null, CancellationToken.None);
+        var two = await ledger.GetOrCreateAsync("shortcut", "sc-2", "Two", "o/r", null, CancellationToken.None);
+        var reader = new PostgresRunLocks(_cs);
+        Assert.Empty(await reader.HeldAsync(CancellationToken.None));
+
+        var running = await new PostgresRunLocks(_cs).TryAcquireAsync(one.Id, CancellationToken.None);
+        // The merge queue's per-repository lock is no item's (a negative key), and the migration's is a two-key one.
+        await using var queue = await new PostgresRunLocks(_cs).TryAcquireAsync(Gate.MergeQueue.LockKey(new RepoRef("o", "r")), CancellationToken.None);
+        Assert.NotNull(queue);
+        Assert.Equal([one.Id], await reader.HeldAsync(CancellationToken.None));
+        // Asking took nothing: another run of sc-2 gets its lock, and sc-1's holder still has its own.
+        await using (var other = await new PostgresRunLocks(_cs).TryAcquireAsync(two.Id, CancellationToken.None))
+        {
+            Assert.NotNull(other);
+            Assert.Null(await new PostgresRunLocks(_cs).TryAcquireAsync(one.Id, CancellationToken.None));
+            Assert.Equal([one.Id, two.Id], (await reader.HeldAsync(CancellationToken.None)).Order());
+        }
+
+        // The run ends (or its process dies: the session ends either way), and the item is no longer alive.
+        await running!.DisposeAsync();
+        Assert.Empty(await reader.HeldAsync(CancellationToken.None));
+
+        // The dashboard's data over this ledger: the rows' word "holds" counts only under a live run.
+        await ledger.RecordAsync(one, WorkState.Implement, null, null, CancellationToken.None);
+        await ledger.CheckpointAsync(one, RunPipeline.Steps.SlotHeld, null, SlotUse.Detail(1, "_factory", "implement"), CancellationToken.None);
+        var data = new Dashboard.DashboardData(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(_cs)), TimeProvider.System,
+            liveRuns: reader.HeldAsync);
+        var dead = (await data.ActiveItemsAsync(CancellationToken.None)).Single(r => r.ExternalId == "sc-1").Run!;
+        Assert.Equal((false, false, true), (dead.Live, dead.Holds, dead.Stale));
+        await using var again = await new PostgresRunLocks(_cs).TryAcquireAsync(one.Id, CancellationToken.None);
+        var alive = (await data.ActiveItemsAsync(CancellationToken.None)).Single(r => r.ExternalId == "sc-1").Run!;
+        Assert.Equal((true, true, "holds slot 1 (_factory) to implement"), (alive.Live, alive.Holds, alive.SlotText));
+    }
+
+    [Fact]
+    public async Task A_sweep_leaves_what_another_processes_live_run_owns_and_deletes_it_once_that_run_is_gone()
+    {
+        // sc-25987: the live run is another process's — its own PostgresRunLocks, its own connection — and the sweeper's context
+        // has never loaded the item.
+        await using var dbA = Context();
+        var item = await new WorkLedger(dbA, TimeProvider.System).GetOrCreateAsync("shortcut", "sc-1", "Fix", "o/r", null, CancellationToken.None);
+        var directory = Directory.CreateTempSubdirectory("df-mcp-live-").FullName;
+        var file = Path.Combine(directory, $"sc-1.{Guid.NewGuid():N}.json");
+        File.WriteAllText(file, "{}");
+        await using var dbB = Context();
+        var sweeper = new LiveRuns(new WorkLedger(dbB, TimeProvider.System), new PostgresRunLocks(_cs));
+        var sc1 = WorkSources.ItemNaming.ParseAny("sc-1");
+
+        await using (var running = await new PostgresRunLocks(_cs).TryAcquireAsync(item.Id, CancellationToken.None))
+        {
+            Assert.NotNull(running);
+            Assert.Null(await sweeper.TryClaimAsync(sc1, CancellationToken.None));
+            await Mcp.McpProxySessions.SweepAsync(directory, sweeper, CancellationToken.None);
+            Assert.True(File.Exists(file));
+        }
+
+        // The run is gone: its leftovers are claimed under the item's run lock (no run of it starts meanwhile), then the lock is given back.
+        await using (var claim = await sweeper.TryClaimAsync(sc1, CancellationToken.None))
+        {
+            Assert.True(claim!.UnderRunLock);
+            Assert.Null(await new PostgresRunLocks(_cs).TryAcquireAsync(item.Id, CancellationToken.None));
+        }
+        await Mcp.McpProxySessions.SweepAsync(directory, sweeper, CancellationToken.None);
+        Assert.False(File.Exists(file));
+        await using var free = await new PostgresRunLocks(_cs).TryAcquireAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(free);
     }
 
     [Fact]

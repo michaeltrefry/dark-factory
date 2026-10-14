@@ -380,6 +380,7 @@ public class MergeQueueTests
     /// <summary>The board, serialised: two runs may write to it at once.</summary>
     internal sealed class LockedSource(IWorkSource inner) : IWorkSource
     {
+        public ItemNaming Naming => inner.Naming;
         private readonly SemaphoreSlim _gate = new(1, 1);
 
         private async Task<T> One<T>(Func<Task<T>> call)
@@ -425,7 +426,7 @@ public class MergeQueueTests
         public IRunLocks Locks { get; set; } = locks ?? new InProcessRunLocks();
         /// <summary>The board behind <see cref="Stories"/> (every story id is the same story; its epic can be changed between runs).</summary>
         public FakeWorkSource Board { get; init; } =
-            new(new WorkStory(0, "Queue me", "Change one file.", "feature", "https://app.shortcut.com/trefry/story/0"));
+            new(new WorkStory(0, "Queue me", "Change one file.", "feature", "https://app.shortcut.com/trefry/story/0", ItemNaming.Shortcut));
         public IWorkSource Stories => LazyInitializer.EnsureInitialized(ref _stories, () => new LockedSource(Board));
         private IWorkSource? _stories;
         /// <summary>The factory's controls (Pause/Continue/Stop), kept in the shared ledger.</summary>
@@ -594,7 +595,7 @@ public class MergeQueueTests
         // A simple story: its conflict fix round runs on its coding class (low), not the CI fixer's (mid) (E8).
         var h = new Harness
         {
-            Board = new(new WorkStory(0, "Queue me", "Change one file.", "feature", "https://app.shortcut.com/trefry/story/0", Labels: ["simple"])),
+            Board = new(new WorkStory(0, "Queue me", "Change one file.", "feature", "https://app.shortcut.com/trefry/story/0", ItemNaming.Shortcut, Labels: ["simple"])),
         };
         Assert.Equal(WorkState.Watch, (await h.Run(A)).State);
         h.Repo.Conflicting.Add(Branch(B));
@@ -848,7 +849,7 @@ public class MergeQueueTests
         Assert.Contains($"{StoryId.Format(C)} is 3 of 3 in the merge queue", h.Logged);
 
         // B's epic is paused while B waits between runs: no run of B is active, so nothing is written to its ledger.
-        await Set(h, ControlScope.Epic(epic), ControlState.Paused);
+        await Set(h, ControlScope.Epic(ItemNaming.Shortcut.Epic(epic)), ControlState.Paused);
         release.SetResult();
         Assert.Equal(WorkState.Watch, (await runA).State);
         Assert.Equal(WorkState.MergeGate, (await h.Run(B)).State); // paused: nothing to do
@@ -861,7 +862,7 @@ public class MergeQueueTests
 
         // Continue: B keeps its approval-time place (its queued row is unchanged) and merges on a head containing C's merge.
         var queued = (await h.Rows(B)).Single(r => r.Step == RunPipeline.Steps.Queued).Id;
-        await Set(h, ControlScope.Epic(epic), ControlState.Running);
+        await Set(h, ControlScope.Epic(ItemNaming.Shortcut.Epic(epic)), ControlState.Running);
         Assert.Equal(WorkState.Watch, (await h.Run(B)).State);
         Assert.Equal([Branch(A), Branch(C), Branch(B)], h.Repo.Merges.Select(m => m.Branch));
         Assert.All(h.Repo.Merges, m => Assert.Equal(m.MainCount, m.Contained));
@@ -880,8 +881,8 @@ public class MergeQueueTests
         await using (var db = h.Db())
         {
             var ledger = new WorkLedger(db, TimeProvider.System);
-            var planItem = await ledger.GetOrCreateAsync(RunPipeline.Source, plan, "A plan", Sandbox.FullName, null, CancellationToken.None);
-            await ledger.LinkPlanAsync((await ledger.FindAsync(RunPipeline.Source, StoryId.Format(B), CancellationToken.None))!, planItem.Id, CancellationToken.None);
+            var planItem = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, plan, "A plan", Sandbox.FullName, null, CancellationToken.None);
+            await ledger.LinkPlanAsync((await ledger.FindAsync(ItemNaming.Shortcut.Source, StoryId.Format(B), CancellationToken.None))!, planItem.Id, CancellationToken.None);
         }
 
         // B's plan is paused while B waits between runs: no run of B is active, so nothing is written to its ledger.

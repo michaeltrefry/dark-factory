@@ -43,16 +43,18 @@ public enum StepOutcome
 /// <item>Checkpoints: <c>verdict</c> pass → passed, fail → failed; <c>fix-progress</c> progress → passed, failed → failed; <c>gate</c> Merge →
 /// passed, ReviewHead/Blocked → gate_rejected; <c>new-tests</c> pass → passed, rejected/no-tests → gate_rejected, unsupported/error (the check
 /// could not produce evidence) → failed; <c>ci-failure</c>, <c>merge-conflict</c>, <c>stuck</c>, <c>stuck-retry</c>, <c>worktree-lost</c>,
-/// <c>github-refused</c> → failed; <c>routed-to-human</c> (a triage routed an issue to a human) → escalated; <c>escalation-comment</c> posted → passed, else failed; <c>pr-report</c> or <c>closeout</c> failed → failed; <c>approval-ignored</c>, <c>plan-rejected</c> (the planner's answer broke a rule, sc-25870) → gate_rejected;
+/// <c>github-refused</c>, <c>slot-left</c> (sc-25989: a stop could not stop the leftover worker or remove the worktree of an item whose worker
+/// slot is no longer configured — it ran nothing as another user; the stop itself went on) → failed; <c>routed-to-human</c> (a triage routed an issue to a human) → escalated; <c>escalation-comment</c> posted → passed, else failed; <c>pr-report</c> or <c>closeout</c> failed → failed; <c>approval-ignored</c>, <c>plan-rejected</c> (the planner's answer broke a rule, sc-25870) → gate_rejected;
 /// <c>ci-triggers</c> (sc-25873: whether the repository's CI can report on a plan's story pull requests) blocked — no workflow can run, the
 /// plan is stopped — → gate_rejected, a warning — it could not be told — → failed (the check could not produce an answer; planning goes on);
-/// <c>usage-pause</c>, <c>parked</c>, <c>plan-held</c> (a plan's stories wait on a blocker outside the plan, sc-25871, or behind a failed
-/// story of it, sc-25876), <c>plan-stuck</c> (every remaining story of a plan failed or is blocked behind one) → deferred — the plan item
+/// <c>usage-pause</c>, <c>parked</c> (also on an item paused because another caller took its claim, sc-25983: its Paused row,
+/// <c>claim lost: …</c>, is deferred like every pause), <c>plan-held</c> (a plan's stories wait on a blocker outside the plan, sc-25871, or behind a failed
+/// story of it, sc-25876, or the waiting plan item's claim is someone else's, <c>claim lost: …</c>, sc-25984), <c>plan-stuck</c> (every remaining story of a plan failed or is blocked behind one) → deferred — the plan item
 /// itself never escalates for a story's failure, which that story's own Escalated row already records; <c>plan-delivery</c> (sc-25873:
 /// which of a plan's changesets are on their default branch when it escalates or is stopped — a record, judged by nothing) → deferred;
 /// <c>merged-into-changeset</c> (sc-25877: a plan story's pull request was merged outside the factory into its plan's changeset branch
 /// — its own gate never judged it; the changeset pull request's review and gate do) → deferred; <c>plan-notice</c> (the plan
-/// item's comment for a hold) posted → passed, failed → failed; every other checkpoint (a completed sub-step, <c>plan-resumed</c> among
+/// item's comment for a hold) posted → passed, failed → failed; every other checkpoint (a completed sub-step, <c>plan-resumed</c> and <c>plan-claim-regained</c> among
 /// them) → passed.</item>
 /// </list>
 /// A run deferred by the freeze before it starts (<see cref="RunOutcome.Deferred"/>) writes no row, so it has no outcome to record.
@@ -119,7 +121,8 @@ public static class StepOutcomes
             _ => StepOutcome.Failed,
         },
         RunPipeline.Steps.CiFailure or RunPipeline.Steps.MergeConflict or RunPipeline.Steps.Stuck or RunPipeline.Steps.StuckRetry
-            or RunPipeline.Steps.WorktreeLost or RunPipeline.Steps.ControlsUnreadable or Issues.IssueSteps.Refused => StepOutcome.Failed,
+            or RunPipeline.Steps.WorktreeLost or RunPipeline.Steps.ControlsUnreadable or RunPipeline.Steps.SlotLeft
+            or Issues.IssueSteps.Refused => StepOutcome.Failed,
         RunPipeline.Steps.CodeGraphOverlay => Gate.CodeGraphOverlay.FromDetail(detail) is { IsReady: true } ? StepOutcome.Passed : StepOutcome.Failed,
         RunPipeline.Steps.EscalationComment =>detail == "posted" ? StepOutcome.Passed : StepOutcome.Failed,
         Issues.IssueSteps.RoutedToHuman => StepOutcome.Escalated,
@@ -129,6 +132,8 @@ public static class StepOutcomes
         RunPipeline.Steps.CiTriggers => CiTriggerCheck.IsBlocked(detail) ? StepOutcome.GateRejected : StepOutcome.Failed,
         RunPipeline.Steps.UsagePause or RunPipeline.Steps.Parked or RunPipeline.Steps.PlanHeld or RunPipeline.Steps.PlanStuck
             or RunPipeline.Steps.PlanDelivery or RunPipeline.Steps.MergedIntoChangeset => StepOutcome.Deferred,
+        // A run's use of a worker slot (sc-25991): a wait for one is no failure and defers nothing — the run goes on by itself.
+        RunPipeline.Steps.SlotWait or RunPipeline.Steps.SlotHeld or RunPipeline.Steps.SlotReleased => StepOutcome.Passed,
         _ => StepOutcome.Passed,
     };
 }

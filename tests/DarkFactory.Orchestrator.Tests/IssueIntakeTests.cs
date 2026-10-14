@@ -3,7 +3,6 @@ using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Issues;
 using DarkFactory.Orchestrator.Ledger;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
@@ -155,7 +154,7 @@ public class IssueIntakeTests
         Assert.DoesNotContain(IssueSteps.Released, await h.Steps());
         Assert.Empty(await h.Ready());
         await using var db = h.Db();
-        Assert.Empty(await RunPipeline.InFlightAsync(new WorkLedger(db, h.Time), CancellationToken.None, naming: ItemNaming.GitHubIssue));
+        Assert.Empty(await RunPipeline.InFlightAsync(new WorkLedger(db, h.Time), ItemNaming.GitHubIssue, CancellationToken.None));
         var claim = await h.Source().ClaimAsync(1, ignoreScope: false, CancellationToken.None);
         Assert.False(claim.Claimed);
         Assert.Contains("not released", claim.Refusal);
@@ -447,6 +446,34 @@ public class IssueIntakeTests
         Assert.Contains("the triage failed 3 times in a row", Assert.Single(h.GitHub.FactoryComments(Repo, Number)).Body);
         await h.Poll();
         Assert.Equal(3, h.Triage.Prompts.Count); // that version is not triaged again; an edit would be
+    }
+
+    [Fact]
+    public async Task A_triage_put_off_while_it_waited_for_the_sandbox_user_is_no_failure_however_often_and_is_taken_up_again()
+    {
+        var h = new Harness(Answer());
+        h.Triage.Answers.Clear();
+        h.Triage.Answers.Add(() => throw new TriageDeferredException("the triage of gh-1 was waiting for the sandbox user when a control (Paused) held it"));
+        await h.Watch();
+        h.Open("maintainer");
+
+        // More often than the failures that would route it to a human (3): put off is not failed.
+        for (var poll = 0; poll < 5; poll++)
+        {
+            await h.Poll();
+        }
+
+        Assert.Equal(5, h.Triage.Prompts.Count);
+        Assert.Empty(h.GitHub.Writes);
+        Assert.Empty(h.Status.ItemErrors);
+        Assert.DoesNotContain(IssueSteps.Triaged, await h.Steps());
+
+        // The sandbox user is free on a later poll: the same version is triaged, as if for the first time.
+        h.Triage.Answers.Add(() => FakeTriage.Says(Answer()));
+        await h.Poll();
+
+        Assert.Contains(IssueSteps.Triaged, await h.Steps());
+        Assert.Empty(h.Status.ItemErrors);
     }
 
     [Fact]
@@ -792,12 +819,11 @@ public class IssueIntakeTests
         var h = new Harness(Answer());
         await h.Watch();
         h.Open("maintainer");
-        var shortcut = new FakeWorkSource(new WorkStory(77, "s", "d", "bug", "u"));
+        var shortcut = new FakeWorkSource(new WorkStory(77, "s", "d", "bug", "u", ItemNaming.Shortcut));
         var shortcutRuns = new Runner();
         var issueRuns = new Runner();
-        var loop = new IntakeLoop(shortcut, shortcutRuns, new IntakeOptions(TimeSpan.FromMinutes(1)), h.Time,
-            Microsoft.Extensions.Logging.Abstractions.NullLogger<IntakeLoop>.Instance, status: h.Status,
-            moreLanes: [new IntakeLane(h.Source(), issueRuns, h.Intake().PollAsync)]);
+        var loop = new IntakeLoop([new IntakeLane(shortcut, shortcutRuns), new IntakeLane(h.Source(), issueRuns, h.Intake().PollAsync)],
+            new IntakeOptions(TimeSpan.FromMinutes(1)), h.Time, Microsoft.Extensions.Logging.Abstractions.NullLogger<IntakeLoop>.Instance, status: h.Status);
         shortcutRuns.InFlight.Add(77);
 
         await loop.PollOnceAsync(CancellationToken.None);

@@ -3,7 +3,6 @@ using System.Security.Cryptography;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 
 namespace DarkFactory.Orchestrator.Tests;

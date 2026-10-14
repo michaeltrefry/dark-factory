@@ -3,7 +3,6 @@ using DarkFactory.Orchestrator.Dashboard;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Sessions;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
@@ -70,7 +69,7 @@ internal sealed class TranscriptReplay(string[] lines, Func<bool> paused)
 /// </summary>
 public class StuckWorkerTests
 {
-    private static readonly WorkStory Story = new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77");
+    private static readonly WorkStory Story = new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77", ItemNaming.Shortcut);
 
     /// <summary>A worker that replays one transcript per session, in order; the pause flag is per run, as ClaudeWorker's is.</summary>
     private sealed class ReplayWorker(params TranscriptReplay[] sessions) : IWorker
@@ -338,7 +337,7 @@ public class QuietSessionDataTests
         var options = new DbContextOptionsBuilder<LedgerDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options;
         await using var db = new LedgerDbContext(options);
         var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider(T0);
-        var item = await new WorkLedger(db, time).GetOrCreateAsync(RunPipeline.Source, "sc-1", "One", Sandbox.FullName, null, CancellationToken.None);
+        var item = await new WorkLedger(db, time).GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-1", "One", Sandbox.FullName, null, CancellationToken.None);
         var running = new WorkerSession { WorkItemId = item.Id, ClaudeSessionId = "live", Attempt = 2, StartedAt = T0 };
         var ended = new WorkerSession { WorkItemId = item.Id, ClaudeSessionId = "done", Attempt = 1, StartedAt = T0, EndedAt = T0 };
         db.WorkerSessions.AddRange(ended, running);

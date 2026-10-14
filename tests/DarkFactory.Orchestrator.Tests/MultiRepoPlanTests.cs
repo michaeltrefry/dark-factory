@@ -216,7 +216,7 @@ public class MultiRepoPlanTests
     [Fact]
     public void The_planner_is_told_the_schema_the_two_blocker_kinds_and_the_ordered_non_atomic_merge_only_for_several_repositories()
     {
-        var story = new WorkStory(77, "Share the mesh format", "Both repositories.", "feature", "https://app.shortcut.com/x/story/77");
+        var story = new WorkStory(77, "Share the mesh format", "Both repositories.", "feature", "https://app.shortcut.com/x/story/77", ItemNaming.Shortcut);
         var spec = new WorkSpec(story, null, []);
 
         var prompt = PlanPrompt.Build(spec, TwoRepoAnswers.Both[0], null, TwoRepoAnswers.Both);
@@ -244,7 +244,7 @@ public class MultiRepoPlanTests
     [Fact]
     public void The_planner_of_several_repositories_is_told_a_storys_worker_sees_only_its_own_repository()
     {
-        var spec = new WorkSpec(new WorkStory(77, "Share the mesh format", "Both repositories.", "feature", "https://app.shortcut.com/x/story/77"), null, []);
+        var spec = new WorkSpec(new WorkStory(77, "Share the mesh format", "Both repositories.", "feature", "https://app.shortcut.com/x/story/77", ItemNaming.Shortcut), null, []);
 
         var prompt = PlanPrompt.Build(spec, TwoRepoAnswers.Both[0], null, TwoRepoAnswers.Both);
 

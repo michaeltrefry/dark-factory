@@ -389,6 +389,64 @@ public class SafeHelperTests
         }
     }
 
+    [Fact]
+    public async Task Seam_skips_a_dead_process_outside_the_test_rather_than_refusing()
+    {
+        // A dead process (a zombie; on Linux also one its parent is reaping right then, listed with parent 0) is in no one's
+        // tree, yet nothing a signal can reach: the helper's own watcher, reaped by its shell while that shell's seam listed the
+        // processes, was refused that way on CI (sc-25992). Skipped, never signalled, never a refusal.
+        var (detached, zombie) = OwnProcess.StartDetachedWithZombie(_dir);
+        try
+        {
+            var helper = GroupKillOf("400001", extra: $"send_signal -KILL -- {zombie} || true; ");
+
+            var (exitCode, stderr) = await RunAsync(helper);
+
+            Assert.True(exitCode == 0, $"exit {exitCode}: {stderr}");
+            Assert.Empty(helper.Refusals);
+            Assert.Contains($"skip KILL {zombie}", helper.TargetLog);
+            Assert.True(detached.IsAlive);
+        }
+        finally
+        {
+            detached.KillIfStillRunning();
+        }
+    }
+
+    [Fact]
+    public async Task Seam_allows_the_worker_group_when_its_only_member_outside_the_test_is_dead()
+    {
+        // The group's live member is the test's own (registered); its other member is a zombie whose parent is outside the test.
+        var (detached, zombie) = OwnProcess.StartDetachedWithZombie(_dir);
+        try
+        {
+            var registry = Path.Combine(_dir, "reg");
+            SafeHelper.Register(registry, detached);
+            var group = ProcessGroupOf(detached);
+            Assert.Equal(group, Pgid(zombie));
+            var helper = GroupKillOf(group, registry);
+
+            var (exitCode, stderr) = await RunAsync(helper);
+
+            Assert.True(exitCode == 0, $"exit {exitCode}: {stderr}");
+            Assert.Empty(helper.Refusals);
+            Assert.Contains($"log KILL -{group}", helper.TargetLog); // allowed; log-only, so not signalled
+            Assert.True(detached.IsAlive);
+        }
+        finally
+        {
+            detached.KillIfStillRunning();
+        }
+    }
+
+    private static string Pgid(int pid)
+    {
+        using var ps = Process.Start(new ProcessStartInfo("/bin/ps", ["-o", "pgid=", "-p", pid.ToString()]) { RedirectStandardOutput = true })!;
+        var group = ps.StandardOutput.ReadToEnd().Trim();
+        ps.WaitForExit();
+        return group;
+    }
+
     [Theory]
     [InlineData("0", "", "-0")]
     [InlineData("1", "", "-1")]
@@ -427,7 +485,9 @@ public class SafeHelperTests
         var scriptsPathLiteral = new Regex("\"[^\"\\n]*scripts/" + Regex.Escape(helperName));
         var helperLiteral = new Regex("\"[^\"\\n]*" + Regex.Escape(helperName) + "[\"/]");
         string[] installedMarkers = ["Default" + "HelperPath", "libexec/" + "dark-factory"];
-        var configured = new Regex(@"Worker(:|__)Launch" + "Helper|\\.Worker" + @"Sandbox\b(?![(.])");
+        // The configured pool (options' property, sc-25989) reaches every slot's installed helper too: any use of it counts
+        // (sc-25992); the type's static members (Worker.WorkerSlots.X) do not.
+        var configured = new Regex(@"Worker(:|__)Launch" + "Helper|\\.Worker" + @"Sandbox\b(?![(.])|(?<!Worker)\.Worker" + @"Slots\b");
         var sourceLeaks = new Regex(@"\bSafeHelper\.Sour" + @"ce\b|\bBuild" + @"Copy\b|GetManifest" + "Resource");
         const string entryPoint = "SafeHelper.cs";
         const string selfFile = "SafeHelperTests.cs";
@@ -440,27 +500,42 @@ public class SafeHelperTests
                 "Assert.Equal([\"-n\", \"-u\", \"_factory\", \"/usr/local/" + installedMarkers[1] + "/" + helperName + "\", \"claude\", \"-p\", \"x\"],",
                 "() => new WorkerSandbox(Environment.UserName, WorkerSandbox." + installedMarkers[0] + ").ShareAsync(path, CancellationToken.None));",
                 "await new WorkerSandbox(Environment.UserName, WorkerSandbox." + installedMarkers[0] + ").ShareAsync(path, CancellationToken.None);",
-                "var sandbox = new WorkerSandbox(WorkerSandbox.DefaultUser, WorkerSandbox." + installedMarkers[0] + ");",
+                // The live probes' configured slots (sc-25992), only behind their FACTORY_SANDBOX_LIVE gate (checked below).
+                "if (options.Worker" + "Slots is not { } pool)",
                 "Assert.Contains(\"usage: " + helperName + "\", stderr);",
             ],
             ["CliAndConfigTests.cs"] =
             [
-                "Assert.Equal(new Worker.WorkerSandbox(\"_factory\", \"/usr/local/" + installedMarkers[1] + "/" + helperName + "\"), options.Worker" + "Sandbox);",
+                "Assert.Equal(new Worker.WorkerSandbox(\"_factory\", \"/usr/local/" + installedMarkers[1] + "/" + helperName + "\") { Lock = Locked(\"/opt/dark-factory/work\") }, options.Worker" + "Sandbox);",
                 "var custom = Options(new() { [\"Worker:RunAs\"] = \"_df2\", [\"Worker:Launch" + "Helper\"] = \"/opt/h\", [\"Factory:WorkRoot\"] = \"/w\" });",
-                "Assert.Equal(new Worker.WorkerSandbox(\"_df2\", \"/opt/h\"), custom.Worker" + "Sandbox);",
+                "Assert.Equal(new Worker.WorkerSandbox(\"_df2\", \"/opt/h\") { Lock = Locked(\"/w\") }, custom.Worker" + "Sandbox);",
                 "Assert.Null(options.Worker" + "Sandbox);",
                 "Assert.Throws<InvalidOperationException>(() => Options(new() { [\"Worker:RunAs\"] = \"\" }).Worker" + "Sandbox);",
+                // sc-25989: the configured slots (names, paths and lock files only; nothing is run).
+                "Assert.Equal(unset.Worker" + "Sandbox, Assert.Single(unset.WorkerSlots!.All).Sandbox);",
+                "var three = Options(new() { [\"Worker:Slots\"] = \"3\", [\"Worker:RunAs\"] = \"_df\", [\"Worker:Launch" + "Helper\"] = \"/opt/h\", [\"Factory:WorkRoot\"] = \"/w\" });",
+                "Assert.Equal(\"sudo scripts/setup-worker-user.sh\", unset.Worker" + "Slots.All[0].Sandbox.Reinstall);",
+                "three.Worker" + "Slots!.All.Select(s => (s.Number, s.User, s.Sandbox.HelperPath, s.Lock!.Path)));",
+                "Assert.All(three.Worker" + "Slots.All, s => Assert.Equal(\"sudo scripts/setup-worker-user.sh --slots 3\", s.Sandbox.Reinstall));",
+                "Assert.Null(none.Worker" + "Slots);",
+                "Assert.Equal(Worker.WorkerSlots.MaxSlots, Options(new() { [\"Worker:Slots\"] = \"8\" }).Worker" + "Slots!.Count);",
             ],
+            // A source scan's pattern (the text names the property; nothing is run).
+            ["LockScopeTests.cs"] = ["Assert.Equal(2, Lines(@\"FactoryRunner\\.CheckHelperAsync\\(options\\.Worker" + "Slots\").Count(l => l.StartsWith(\"Program.cs: \", StringComparison.Ordinal)));"],
             ["IntakeLoopTests.cs"] = ["[\"Worker:Launch" + "Helper\"] = \"/nonexistent/df-test-helper\","],
             // sc-25871 (PlanRunnerLockTests): the same nonexistent helper, for a run that must reach neither the lock nor the helper.
             ["PlanReleaseTests.cs"] = ["[\"Worker:Launch" + "Helper\"] = \"/nonexistent/df-test-helper\","],
-            ["Harness.cs"] =["if (Options.Worker" + "Sandbox is { } sandbox)"],
-            ["E2e.cs"] = ["if (Harness.Options.Worker" + "Sandbox is not null)"],
+            ["Harness.cs"] =["if (Options.Worker" + "Sandbox is { } sandbox)", "foreach (var slot in Options.Worker" + "Slots!.All.Skip(1))"],
+            ["E2e.cs"] = ["if (Harness.Options.Worker" + "Sandbox is not null)", "foreach (var slot in Harness.Options.Worker" + "Slots!.All)"],
             ["WalkingSkeletonTests.cs"] = ["var sandbox = Harness.Options.Worker" + "Sandbox;"],
             ["SetupScriptTests.cs"] =
             [
                 "Assert.DoesNotContain(calls, c => c.Contains(\"" + helperName + "\")); // the helper (whose exit kills every worker process) never runs",
                 "Assert.Contains(run.Calls, c => c.Contains(\"" + helperName + "\"));",
+                // sc-25989: what setup installs per slot (the fake install's record; no helper is ever run).
+                "Assert.Single(run.Calls, c => c.StartsWith(\"install \") && c.Contains(\"" + helperName + "\"));",
+                "Assert.DoesNotContain(run.Calls, c => c.Contains(\"" + helperName + "\"));",
+                "public const string HelperPath = \"/usr/local/" + installedMarkers[1] + "/" + helperName + "\";",
             ],
         };
 
@@ -517,7 +592,7 @@ public class SafeHelperTests
                 }
                 var ok = allowed.TryGetValue(name, out var lineAllowList) && lineAllowList.Contains(trimmed);
                 // The live probes' sandbox only behind their FACTORY_SANDBOX_LIVE gate.
-                if (ok && trimmed.StartsWith("var sandbox = new WorkerSandbox(WorkerSandbox.DefaultUser", StringComparison.Ordinal))
+                if (ok && trimmed.StartsWith("if (options.Worker" + "Slots is not", StringComparison.Ordinal))
                 {
                     var before = string.Join('\n', lines[Math.Max(liveClass, 0)..i]);
                     ok = liveClass >= 0 && i > liveClass && before.Contains("\"FACTORY_SANDBOX_LIVE\") != \"1\"", StringComparison.Ordinal);

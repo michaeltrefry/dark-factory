@@ -28,7 +28,7 @@ public class IntakeLoopTests
         public int Completed => Volatile.Read(ref _completed);
         public WorkLedger Ledger => new(Db, TimeProvider.System);
 
-        public Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct) => RunPipeline.InFlightAsync(Ledger, ct);
+        public Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct) => RunPipeline.InFlightAsync(Ledger, ItemNaming.Shortcut, ct);
 
         public async Task<RunOutcome> RunAsync(int id, CancellationToken ct)
         {
@@ -71,7 +71,7 @@ public class IntakeLoopTests
         var source = new ShortcutWorkSource(board.Client(), "tok", new WatchScope(["darkfactory"], []));
         var runner = new PipelineRunner(source);
         var time = new FakeTimeProvider();
-        var loop = new IntakeLoop(source, runner, new IntakeOptions(Interval), time, NullLogger<IntakeLoop>.Instance);
+        var loop = new IntakeLoop([new IntakeLane(source, runner)], new IntakeOptions(Interval), time, NullLogger<IntakeLoop>.Instance);
 
         await loop.StartAsync(CancellationToken.None);
         await Eventually(() => board.Requests.Any(r => r.PathAndQuery.StartsWith("/api/v3/groups/")));
@@ -116,7 +116,7 @@ public class IntakeLoopTests
         var hosted = app.Services.GetServices<Microsoft.Extensions.Hosting.IHostedService>().ToList();
         Assert.Contains(hosted, s => s is DarkFactory.Orchestrator.Sessions.SessionEventRelay);
         Assert.Contains(hosted, s => s is IntakeLoop);
-        // Watches usage while a long item run holds up the intake loop: the same instance the loop reads at each poll.
+        // Watches usage between polls, so running workers pause too: the same instance the loop reads at each poll.
         Assert.Contains(hosted, s => ReferenceEquals(s, app.Services.GetRequiredService<DarkFactory.Orchestrator.Router.UsageMonitor>()));
     }
 
@@ -348,17 +348,17 @@ public class IntakeLoopTests
     {
         var runner = new PipelineRunner(new ScriptedSource(() => []));
         var ledger = runner.Ledger;
-        var interrupted = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-1", "a", "o/r", null, CancellationToken.None);
+        var interrupted = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-1", "a", "o/r", null, CancellationToken.None);
         await ledger.RecordAsync(interrupted, WorkState.Implement, null, null, CancellationToken.None);
         await ledger.RecordAsync(interrupted, WorkState.Paused, null, RunPipeline.Interrupted, CancellationToken.None);
-        var byUser = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-2", "b", "o/r", null, CancellationToken.None);
+        var byUser = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-2", "b", "o/r", null, CancellationToken.None);
         await ledger.RecordAsync(byUser, WorkState.Implement, null, null, CancellationToken.None);
         await ledger.RecordAsync(byUser, WorkState.Paused, null, "paused by a user", CancellationToken.None);
-        var parked = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-3", "c", "o/r", null, CancellationToken.None);
+        var parked = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-3", "c", "o/r", null, CancellationToken.None);
         await ledger.RecordAsync(parked, WorkState.Implement, null, null, CancellationToken.None);
         await ledger.RecordAsync(parked, WorkState.Paused, null, RunPipeline.Interrupted, CancellationToken.None);
         await ledger.CheckpointAsync(parked, RunPipeline.Steps.Parked, null, "the story is outside the watch scope", CancellationToken.None);
-        var inImplement = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-4", "d", "o/r", null, CancellationToken.None);
+        var inImplement = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-4", "d", "o/r", null, CancellationToken.None);
         await ledger.RecordAsync(inImplement, WorkState.Implement, null, null, CancellationToken.None);
 
         Assert.Equal([1, 4], await runner.InFlightAsync(CancellationToken.None));
@@ -428,6 +428,7 @@ public class IntakeLoopTests
 
     private sealed class ScriptedSource(Func<IReadOnlyList<int>> ready) : IWorkSource
     {
+        public ItemNaming Naming => ItemNaming.Shortcut;
         public Task<IReadOnlyList<int>> ListReadyAsync(CancellationToken ct) => Task.FromResult(ready());
         public Task<ClaimResult> ClaimAsync(int id, bool ignoreScope, CancellationToken ct) => throw new NotSupportedException();
         public Task<bool> InScopeAsync(int id, CancellationToken ct) => throw new NotSupportedException();
@@ -441,7 +442,7 @@ public class IntakeLoopTests
     }
 
     private static IntakeLoop Loop(IWorkSource source, IItemRunner runner) =>
-        new(source, runner, new IntakeOptions(Interval), TimeProvider.System, NullLogger<IntakeLoop>.Instance);
+        new([new IntakeLane(source, runner)], new IntakeOptions(Interval), TimeProvider.System, NullLogger<IntakeLoop>.Instance);
 
     [Fact]
     public async Task Poll_resumes_in_flight_items_first_then_ready_ones_once_each_and_a_failed_run_does_not_stop_the_rest()
@@ -464,13 +465,13 @@ public class IntakeLoopTests
     // ---- Runs that fail before the pipeline starts (E10): counted per item, given up on, shown on the dashboard. ----
 
     private static IntakeLoop Loop(IWorkSource source, IItemRunner runner, IntakeStatus status, int maxFailures = 3) =>
-        new(source, runner, new IntakeOptions(Interval, maxFailures), TimeProvider.System, NullLogger<IntakeLoop>.Instance, status: status);
+        new([new IntakeLane(source, runner)], new IntakeOptions(Interval, maxFailures), TimeProvider.System, NullLogger<IntakeLoop>.Instance, status: status);
 
     /// <summary>Story 101's item, left in <paramref name="state"/> (via Implement) by an earlier process.</summary>
     private static async Task<PipelineRunner> LeftIn(FakeWorkSource source, WorkState state)
     {
         var runner = new PipelineRunner(source);
-        var item = await runner.Ledger.GetOrCreateAsync(RunPipeline.Source, "sc-101", "s", Sandbox.FullName, null, CancellationToken.None);
+        var item = await runner.Ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-101", "s", Sandbox.FullName, null, CancellationToken.None);
         await runner.Ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
         if (state == WorkState.Paused)
         {
@@ -479,7 +480,7 @@ public class IntakeLoopTests
         return runner;
     }
 
-    private static FakeWorkSource GoneStory() => new(new WorkStory(101, "s", null, "chore", "https://app.shortcut.com/t/story/101"))
+    private static FakeWorkSource GoneStory() => new(new WorkStory(101, "s", null, "chore", "https://app.shortcut.com/t/story/101", ItemNaming.Shortcut))
     {
         ReadSpecFails = new InvalidOperationException("Shortcut GET stories/101 failed: 404 Not Found"),
     };
@@ -577,7 +578,7 @@ public class IntakeLoopTests
     public async Task Factory_wide_failure_ends_the_poll_shows_one_factory_error_and_escalates_no_item()
     {
         var runner = new ThrowingRunner([5, 6], _ => new FactoryUnavailableException(
-            "the worker run lock: Another factory run is using /w", new InvalidOperationException("locked")));
+            "the worker sandbox: Stale helper: re-run setup", new InvalidOperationException("stale")));
         var status = new IntakeStatus(TimeProvider.System);
         var loop = Loop(new ScriptedSource(() => [7]), runner, status);
 
@@ -590,7 +591,7 @@ public class IntakeLoopTests
         Assert.Empty(runner.GaveUp);
         Assert.Empty(status.ItemErrors);
         Assert.Equal(4, status.FactoryError!.Count);
-        Assert.Contains("Another factory run", status.FactoryError.Message);
+        Assert.Contains("Stale helper", status.FactoryError.Message);
 
         runner.Throws = _ => null;
         await loop.PollOnceAsync(CancellationToken.None);
@@ -619,15 +620,129 @@ public class IntakeLoopTests
             ["GitHub:Gate:AppId"] = "2",
             ["GitHub:Gate:PrivateKeyPem"] = "gate-pem",
             ["Factory:WorkRoot"] = root,
-            // Never reached (the lock below is held), and never the real sandbox user or helper.
+            // A ledger nothing listens on (never the compose Postgres).
+            ["ConnectionStrings:Ledger"] = "Host=127.0.0.1;Port=1;Database=none;Username=none;Password=none;Timeout=2",
+            // Never run, and never the real sandbox user or helper.
             ["Worker:RunAs"] = "df-test-no-such-user",
             ["Worker:LaunchHelper"] = "/nonexistent/df-test-helper",
         }).Build(), new InMemorySecrets());
 
-        using var held = WorkerLock.Acquire(root); // another sandboxed run holds the work root
+        // Another run's worker phase holding the sandbox user is no failure any more (sc-25988: a run waits for it, at its own
+        // worker phase); what every item still shares is the set-up.
+        using var held = WorkerLock.Acquire(root);
+        var source = GoneStory();
+        // First, the installed launch helper — read, never run, and with no lock (it is held here): one that is missing or not the
+        // current one fails the factory before the ledger is opened or the board asked for anything, so nothing is claimed.
+        var noHelper = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
+            FactoryRunner.RunAsync(options, source, 101, ignoreScope: false, TextWriter.Null, CancellationToken.None));
+        Assert.StartsWith("the worker sandbox: Worker sandbox unavailable: cannot read the launch helper /nonexistent/df-test-helper", noHelper.Message);
+        Assert.True(IntakeLoop.IsFactoryWide(noHelper));
+        var stale = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
+            FactoryRunner.RunAsync(options, source, 101, ignoreScope: false, TextWriter.Null, CancellationToken.None, adjustGate: null,
+                testSandbox: SandboxSupport.StubSandbox(root, WorkerLock.For(root), installed: t => t.Replace($"helper_version={Worker.WorkerSandbox.HelperVersion}", "helper_version=1"))));
+        Assert.StartsWith("the worker sandbox: Stale helper: ", stale.Message);
+        Assert.Contains("re-run `sudo scripts/setup-worker-user.sh`", stale.Message);
+        Assert.Equal((0, 0), (source.Writes.Count, source.Comments.Count));
+
+        // With the current helper installed: the ledger.
         var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
-            FactoryRunner.RunAsync(options, GoneStory(), 101, ignoreScope: false, TextWriter.Null, CancellationToken.None));
-        Assert.Contains("only one worker may run at a time", ex.Message);
+            FactoryRunner.RunAsync(options, source, 101, ignoreScope: false, TextWriter.Null, CancellationToken.None, adjustGate: null,
+                testSandbox: SandboxSupport.StubSandbox(root, WorkerLock.For(root))));
+        Assert.StartsWith("the ledger: ", ex.Message);
         Assert.True(IntakeLoop.IsFactoryWide(ex));
+    }
+
+    /// <summary>
+    /// sc-25989: a triage needs no slot of its own (nothing resumes it, and its worktree is shared with no one for writing), so the
+    /// production triage runner takes any free slot instead of waiting for a busy one. The sandbox users and helpers do not exist
+    /// and nothing is run: the slot it took shows in the readiness check that fails there, the factory's failure.
+    /// </summary>
+    [Fact]
+    public async Task With_several_slots_a_triage_takes_a_free_slot_rather_than_wait_for_a_busy_one()
+    {
+        var root = Directory.CreateTempSubdirectory("df-triage-slots-").FullName;
+        var options = new FactoryOptions(new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Router:Key"] = "rk",
+            ["Factory:WorkRoot"] = root,
+            // A ledger nothing listens on (never the compose Postgres): nothing reads it before the readiness check.
+            ["ConnectionStrings:Ledger"] = "Host=127.0.0.1;Port=1;Database=none;Username=none;Password=none;Timeout=2",
+            ["Worker:Slots"] = "2",
+            // Never run, and never the real sandbox user or helper.
+            ["Worker:RunAs"] = "df-test-no-such-user",
+            ["Worker:LaunchHelper"] = "/nonexistent/df-test-helper",
+        }).Build(), new InMemorySecrets());
+        var item = new WorkItem { Source = ItemNaming.GitHubIssue.Source, ExternalId = "gh-1", Title = "acme/widgets#7", Repo = "acme/widgets" };
+        var log = new StringWriter();
+        using var held = WorkerLock.Acquire(root); // another run's worker session in slot 1, for the whole test
+
+        var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() => new SandboxTriageRunner(options, log).RunAsync(item, new RepoRef("acme", "widgets"),
+            "prompt", (_, _) => Task.CompletedTask, (_, _, _) => Task.CompletedTask, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken));
+
+        // It went on at once, in slot 2: that slot's user and helper are the ones its readiness check names.
+        Assert.StartsWith("the worker sandbox: Worker slot 2 (df-test-no-such-user2): Worker sandbox unavailable: cannot read the launch helper "
+            + "/nonexistent/df-test-helper-2", ex.Message);
+        Assert.Contains("`sudo scripts/setup-worker-user.sh --slots 2`", ex.Message);
+        Assert.DoesNotContain("[lock]", log.ToString()); // it never waited
+    }
+
+    /// <summary>
+    /// sc-25988: the production triage runner waits for the sandbox user like a run's worker phase — never blind. Against the
+    /// compose Postgres (its controls; skips locally without it); the worker user and helper do not exist and nothing is run:
+    /// the sandbox user's lock is held by another run for the whole test.
+    /// </summary>
+    [Fact]
+    public async Task A_triage_waiting_for_the_sandbox_user_says_so_and_is_put_off_once_a_control_holds_its_item_or_ends_with_the_host()
+    {
+        await using var temp = await TempPostgresDatabase.CreateAsync("df_triage");
+        await LedgerMigrations.MigrateAsync(temp.ConnectionString, CancellationToken.None);
+        var root = Directory.CreateTempSubdirectory("df-triage-lock-").FullName;
+        var options = new FactoryOptions(new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Router:Key"] = "rk",
+            ["Factory:WorkRoot"] = root,
+            ["ConnectionStrings:Ledger"] = temp.ConnectionString,
+            // Never run, and never the real sandbox user or helper.
+            ["Worker:RunAs"] = "df-test-no-such-user",
+            ["Worker:LaunchHelper"] = "/nonexistent/df-test-helper",
+        }).Build(), new InMemorySecrets());
+        var item = new WorkItem { Source = ItemNaming.GitHubIssue.Source, ExternalId = "gh-1", Title = "acme/widgets#7", Repo = "acme/widgets" };
+        var text = new StringWriter();
+        var log = TextWriter.Synchronized(text); // its methods lock the writer itself
+        string Logged()
+        {
+            lock (log)
+            {
+                return text.ToString();
+            }
+        }
+        Task<Worker.WorkerResult> Triage(CancellationToken ct) => new SandboxTriageRunner(options, log).RunAsync(item, new RepoRef("acme", "widgets"),
+            "prompt", (_, _) => Task.CompletedTask, (_, _, _) => Task.CompletedTask, ct);
+        async Task WaitsAsync(Task triage, int times)
+        {
+            var line = $"[lock] gh-1: its triage is waiting for the sandbox user (another run's worker phase holds {WorkerLock.For(root).Path})";
+            for (var i = 0; i < 2000 && Logged().Split(line).Length - 1 < times; i++)
+            {
+                await Task.Delay(5, TestContext.Current.CancellationToken);
+            }
+            Assert.Equal(times, Logged().Split(line).Length - 1);
+            Assert.False(triage.IsCompleted);
+        }
+        using var held = WorkerLock.Acquire(root); // another run's worker session, for the whole test
+
+        // The host shuts down: the wait ends.
+        using var shutdown = new CancellationTokenSource();
+        var stopped = Triage(shutdown.Token);
+        await WaitsAsync(stopped, 1);
+        await shutdown.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => stopped);
+
+        // A Pause on the item: the triage is put off — not failed, and nothing ran.
+        var paused = Triage(CancellationToken.None);
+        await WaitsAsync(paused, 2);
+        await FactoryRunner.Controls(options).SetAsync(Controls.ControlScope.Item("gh-1"), Controls.ControlState.Paused, "tester", CancellationToken.None);
+        var deferred = await Assert.ThrowsAsync<Issues.TriageDeferredException>(() => paused.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken));
+        Assert.Contains("the triage of gh-1 was waiting for the sandbox user when a control (Paused) held it", deferred.Message);
+        Assert.False(IntakeLoop.IsFactoryWide(deferred));
     }
 }

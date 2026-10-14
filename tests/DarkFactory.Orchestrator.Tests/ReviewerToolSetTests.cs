@@ -4,7 +4,6 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using DarkFactory.Orchestrator.CodeGraph;
 using DarkFactory.Orchestrator.Gate;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.WorkSources;
 
@@ -27,7 +26,7 @@ public class ReviewerToolSetTests
         "- **r-tools** [csharp] (indexed: 2026-10-01)\n  Repo: https://github.com/o/r-tools\n"
         + "- **R Service** [csharp] (indexed: 2026-10-03)\n  Repo: https://github.com/O/R.git\n";
 
-    private static readonly WorkStory Story = new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77");
+    private static readonly WorkStory Story = new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77", ItemNaming.Shortcut);
     private static readonly PullFacts Pull = new(1, "https://github.com/o/r/pull/1", true, false, false, Head, "main", Base, null);
     private static readonly RepoFiles Files = new(["README.md", "src/X.cs"], false);
 

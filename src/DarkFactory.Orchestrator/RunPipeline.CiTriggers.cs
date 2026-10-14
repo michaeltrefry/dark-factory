@@ -1,5 +1,4 @@
 using DarkFactory.Orchestrator.Gate;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 
 namespace DarkFactory.Orchestrator;

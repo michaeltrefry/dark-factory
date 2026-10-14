@@ -4,7 +4,6 @@ using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.Ledger;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 using static DarkFactory.Orchestrator.Tests.GatePipelineTests;
 
@@ -971,7 +970,7 @@ public class GateCloneTests : IDisposable
         TestGit.Run(_seed, "push", "-q", _remote, "main");
         var git = Workspace();
         await git.ChangedFilesAsync(Repo, sha, sha, CancellationToken.None); // fetches the commit into the clone
-        var runner = new SandboxTestRunner(git, sandbox: null, TimeSpan.FromMinutes(1));
+        var runner = new SandboxTestRunner(git, slots: null, TimeSpan.FromMinutes(1));
         TestRunSpec Spec(string results) => new("gate-sc-1-head", sha, null, [], [], [], new XunitNewTests(), results);
 
         // No steps run: anything read would be the commit's.
@@ -1000,7 +999,7 @@ public class GateCloneTests : IDisposable
         TestGit.Run(_seed, "push", "-q", _remote, "main");
         var git = Workspace();
         await git.ChangedFilesAsync(Repo, sha, sha, CancellationToken.None);
-        return (new SandboxTestRunner(git, sandbox: null, TimeSpan.FromMinutes(1), maxResultFileBytes), sha);
+        return (new SandboxTestRunner(git, slots: null, TimeSpan.FromMinutes(1), maxResultFileBytes), sha);
     }
 
     /// <summary>A shell step that writes each (path, content) under the results directory (contents passed as arguments).</summary>
@@ -1143,7 +1142,7 @@ public class SandboxTestRunnerTests : IDisposable
     private Task<NewTestsResult> Check(string baseSha, string headSha)
     {
         var git = new GitWorkspace(Path.Combine(_root, "work"), _ => _remote, (_, _) => Task.FromResult<string?>(null));
-        var runner = new SandboxTestRunner(git, sandbox: null, TimeSpan.FromMinutes(10));
+        var runner = new SandboxTestRunner(git, slots: null, TimeSpan.FromMinutes(10));
         return NewTestsCheck.RunAsync(runner, NewTestsCheck.Strategies, Repo, baseSha, headSha, "gate-sc-5", null, CancellationToken.None);
     }
 

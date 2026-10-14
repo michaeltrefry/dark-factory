@@ -1,6 +1,6 @@
 using System.Diagnostics;
 using DarkFactory.Orchestrator.Git;
-using DarkFactory.Orchestrator.Shortcut;
+using DarkFactory.Orchestrator.Ledger;
 
 namespace DarkFactory.Orchestrator.Tests;
 
@@ -155,6 +155,21 @@ public class GitWorkspaceTests
     private sealed class FakeSandbox(bool deleteRemovesNothing = false) : DarkFactory.Orchestrator.Worker.IWorkerSandbox
     {
         public List<string> Calls { get; } = [];
+        public Task CloseToWorkerAsync(string path, CancellationToken ct) => Task.CompletedTask;
+
+        /// <summary>The worktree's <c>ls -led</c> as the push check reads it (null: it cannot be read); the check is the production one, for the user <c>_dftest2</c>.</summary>
+        public Func<string, string?> Listing { get; init; } = path => $"drwxr-xr-x+ 3 owner staff 96 Oct 13 12:00 {path}\n 0: user:_dftest2 allow list,add_file,search,delete\n";
+
+        /// <summary>Several worker slots: what is inside the worktree is judged too, each entry's ACL read through <see cref="EntryAcl"/> (null: one slot, the root alone).</summary>
+        public Func<string, string?>? EntryAcl { get; init; }
+
+        public Task EnsureOnlyWorkerWritesAsync(string path, CancellationToken ct)
+        {
+            Calls.Add($"writers {path}");
+            return DarkFactory.Orchestrator.Worker.WorkerSlots.EnsureOnlyWriterAsync(path, "_dftest2",
+                (p, _) => Task.FromResult(Listing(p) ?? throw new InvalidOperationException("/bin/ls failed (1): no such file")), TimeSpan.Zero, ct,
+                inside: EntryAcl);
+        }
         public Task ShareAsync(string path, CancellationToken ct)
         {
             Calls.Add($"share {path} {(Directory.EnumerateFileSystemEntries(path).Any() ? "non-empty" : "empty")}");
@@ -176,8 +191,230 @@ public class GitWorkspaceTests
         }
     }
 
+    /// <summary>
+    /// sc-25990 (E4/E7): the push of worker work is refused — nothing staged, committed or pushed, no token minted — when the
+    /// worktree's write grants name anyone but its own slot's user and the owner, or cannot be read.
+    /// </summary>
+    [Theory]
+    [InlineData(" 0: user:_dftest2 allow list,add_file,search,delete\n 1: user:_dftest allow list,add_file,search", "user:_dftest")]
+    [InlineData(" 0: user:_dftest allow list,add_file,search,delete,add_subdirectory", "user:_dftest")]
+    [InlineData(" 0: user:_dftest2 allow list,add_file,search\n 1: group:staff allow add_file", "group:staff")]
+    [InlineData(" 0: user:_dftest2 allow list,add_file,search\n 1: ABCDEF01-2345-6789-ABCD-EF0123456789 allow delete_child", "ABCDEF01-2345-6789-ABCD-EF0123456789")]
+    [InlineData(null, "could not be read")]
+    public async Task The_push_of_worker_work_is_refused_when_another_user_may_write_the_worktree(string? acl, string names)
+    {
+        var listing = acl;
+        var sandbox = new FakeSandbox { Listing = path => listing is null ? null : $"drwxr-xr-x+ 3 owner staff 96 Oct 13 12:00 {path}\n{listing}\n" };
+        var tokens = 0;
+        var workspace = new GitWorkspace(Path.Combine(_root, "work"), _ => _remote, (_, _) => { tokens++; return Task.FromResult<string?>(Token); },
+            sandbox: sandbox);
+        var story = await workspace.PrepareAsync(Repo, "factory/sc-9", CancellationToken.None);
+        File.WriteAllText(Path.Combine(story.Path, "work.txt"), "the worker's\n");
+        (var before, tokens) = (await workspace.HeadAsync(story, CancellationToken.None), 0);
+
+        var refused = await Assert.ThrowsAsync<DarkFactory.Orchestrator.Worker.WorktreeWritersException>(
+            () => workspace.CommitAndPushAsync(Repo, story, "sc-9: work", TestGrants.Untainted, CancellationToken.None));
+
+        Assert.Contains(names, refused.Message);
+        Assert.Contains("Refusing to push", refused.Message);
+        Assert.Contains("_dftest2", refused.Message); // whose worktree it is
+        Assert.Equal(story.Path, refused.Path);
+        Assert.Equal(0, tokens); // no push token was minted
+        Assert.Equal(before, await workspace.HeadAsync(story, CancellationToken.None)); // nothing committed
+        Assert.Equal("", Git(_root, "--git-dir", _remote, "branch", "--list", "factory/sc-9").Trim()); // nothing pushed
+        Assert.Contains("?? work.txt", Git(story.Path, "status", "--porcelain")); // and nothing staged
+
+        // With only its own slot's user (and the owner) writing it, the same work is pushed.
+        listing = " 0: user:_dftest2 allow list,add_file,search,delete\n 1: user:_dftest inherited allow list,search,readattr\n";
+        Assert.True(await workspace.CommitAndPushAsync(Repo, story, "sc-9: work", TestGrants.Untainted, CancellationToken.None));
+        Assert.NotEqual("", Git(_root, "--git-dir", _remote, "branch", "--list", "factory/sc-9").Trim());
+    }
+
+    /// <summary>
+    /// sc-25990 (E4/E7), several worker slots: what a worker made inside its worktree is that sandbox user's own, so code it ran
+    /// can have opened it to another slot's user without touching the worktree's root. The push is refused — nothing staged,
+    /// committed or pushed, no token — for the first entry inside whose mode lets its group or everyone write it, whose ACL
+    /// lets another principal write it, or that cannot be read; once it is closed again the same work is pushed.
+    /// </summary>
+    [Theory]
+    [InlineData("other-file", "src/deep/work.txt in it has a mode (0646) that lets every user write it")]
+    [InlineData("group-file", "src/deep/work.txt in it has a mode (0664) that lets its group write it")]
+    [InlineData("other-directory", "src/deep in it has a mode (0757) that lets every user write it")]
+    [InlineData("acl", "the ACL of src/deep/work.txt in it lets user:_dftest write it (write)")]
+    [InlineData("acl-unreadable", "src/deep/work.txt in it could not be read (its ACL could not be read (errno 13)), so who may write it is not known")]
+    [InlineData("unreadable-directory", "src/deep in it could not be read (")]
+    public async Task With_several_slots_the_push_is_refused_when_something_inside_the_worktree_is_open_to_another_user(string how, string names)
+    {
+        const UnixFileMode File644 = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead;
+        const UnixFileMode Directory755 = File644 | UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute;
+        var open = true;
+        var acls = new List<string>();
+        var sandbox = new FakeSandbox
+        {
+            EntryAcl = path =>
+            {
+                acls.Add(path);
+                return !open || !path.EndsWith("work.txt", StringComparison.Ordinal) ? null : how switch
+                {
+                    "acl" => "!#acl 1\nuser:FFFFEEEE-DDDD-CCCC-BBBB-AAAA000001C2:_dftest:450:allow:read,write\n",
+                    "acl-unreadable" => throw new IOException("its ACL could not be read (errno 13)"),
+                    _ => null,
+                };
+            },
+        };
+        var tokens = 0;
+        var workspace = new GitWorkspace(Path.Combine(_root, "work"), _ => _remote, (_, _) => { tokens++; return Task.FromResult<string?>(Token); },
+            sandbox: sandbox);
+        var story = await workspace.PrepareAsync(Repo, "factory/sc-9", CancellationToken.None);
+        var deep = Directory.CreateDirectory(Path.Combine(story.Path, "src", "deep")).FullName;
+        var file = Path.Combine(deep, "work.txt");
+        File.WriteAllText(file, "the worker's\n");
+        File.SetUnixFileMode(file, File644);
+        File.SetUnixFileMode(deep, Directory755);
+        switch (how)
+        {
+            case "other-file": File.SetUnixFileMode(file, File644 | UnixFileMode.OtherWrite); break;
+            case "group-file": File.SetUnixFileMode(file, File644 | UnixFileMode.GroupWrite); break;
+            case "other-directory": File.SetUnixFileMode(deep, Directory755 | UnixFileMode.OtherWrite); break;
+            case "unreadable-directory": File.SetUnixFileMode(deep, UnixFileMode.None); break;
+        }
+        (var before, tokens) = (await workspace.HeadAsync(story, CancellationToken.None), 0);
+
+        var refused = await Assert.ThrowsAsync<DarkFactory.Orchestrator.Worker.WorktreeWritersException>(
+            () => workspace.CommitAndPushAsync(Repo, story, "sc-9: work", TestGrants.Untainted, CancellationToken.None));
+
+        Assert.Contains($"Refusing to push the work in {story.Path}: {names}", refused.Message);
+        Assert.Contains("the session's work is discarded with the worktree", refused.Message);
+        Assert.Equal(0, tokens); // no push token was minted
+        Assert.Equal(before, await workspace.HeadAsync(story, CancellationToken.None)); // nothing committed
+        Assert.Equal("", Git(_root, "--git-dir", _remote, "branch", "--list", "factory/sc-9").Trim()); // nothing pushed
+        File.SetUnixFileMode(deep, Directory755);
+        Assert.Contains("?? src/", Git(story.Path, "status", "--porcelain")); // and nothing staged
+
+        // Closed again (the modes a worker's files have under the usual umask; no such ACL entry): the same work is pushed.
+        File.SetUnixFileMode(file, File644);
+        (open, _) = (false, acls.Remove(file));
+        Assert.True(await workspace.CommitAndPushAsync(Repo, story, "sc-9: work", TestGrants.Untainted, CancellationToken.None));
+        Assert.NotEqual("", Git(_root, "--git-dir", _remote, "branch", "--list", "factory/sc-9").Trim());
+        // Every entry inside was asked about, the worktree's `.git` file and the nested ones included.
+        Assert.Contains(file, acls);
+        Assert.Contains(deep, acls);
+        Assert.Contains(Path.Combine(story.Path, ".git"), acls);
+    }
+
+    [Fact]
+    public async Task With_several_slots_ordinary_modes_inside_the_worktree_push_and_a_symbolic_link_is_neither_followed_nor_judged()
+    {
+        var outside = Directory.CreateDirectory(Path.Combine(_root, "outside-world-writable")).FullName;
+        File.WriteAllText(Path.Combine(outside, "theirs.txt"), "not the worktree's\n");
+        File.SetUnixFileMode(outside, (UnixFileMode)0b111_111_111);
+        File.SetUnixFileMode(Path.Combine(outside, "theirs.txt"), (UnixFileMode)0b110_110_110);
+        var asked = new List<string>();
+        var sandbox = new FakeSandbox { EntryAcl = path => { asked.Add(path); return null; } };
+        var workspace = Workspace(sandbox);
+        var story = await workspace.PrepareAsync(Repo, "factory/sc-9", CancellationToken.None);
+        var deep = Directory.CreateDirectory(Path.Combine(story.Path, "src", "deep")).FullName;
+        File.WriteAllText(Path.Combine(deep, "work.txt"), "the worker's\n");
+        File.SetUnixFileMode(Path.Combine(deep, "work.txt"), (UnixFileMode)0b110_100_100); // 0644
+        File.SetUnixFileMode(deep, (UnixFileMode)0b111_101_101); // 0755
+        // Links out of the worktree, to a world-writable directory and to a world-writable file in it (a link's own mode says
+        // nothing, and changing a link takes write on its directory, which is judged).
+        Directory.CreateSymbolicLink(Path.Combine(deep, "to-directory"), outside);
+        File.CreateSymbolicLink(Path.Combine(deep, "to-file"), Path.Combine(outside, "theirs.txt"));
+
+        Assert.True(await workspace.CommitAndPushAsync(Repo, story, "sc-9: work", TestGrants.Untainted, CancellationToken.None));
+
+        Assert.Contains(Path.Combine(deep, "work.txt"), asked);
+        Assert.DoesNotContain(asked, path => path.Contains("to-directory", StringComparison.Ordinal) || path.Contains("to-file", StringComparison.Ordinal)
+            || path.StartsWith(outside, StringComparison.Ordinal));
+        Assert.Equal("120000", Git(_remote, "ls-tree", "factory/sc-9", "src/deep/to-directory").Split(' ')[0]); // pushed as the link it is
+    }
+
+    [Fact]
+    public async Task With_one_slot_only_the_worktrees_root_is_judged_so_a_group_writable_file_inside_still_pushes()
+    {
+        // E9: with one sandbox user there is no other slot's user to open a file to; nothing inside is read (FakeSandbox's
+        // EntryAcl is null, as WorkerSlots passes none with one slot) and the root's group bit is not judged.
+        var sandbox = new FakeSandbox { Listing = path => $"drwxrwxr-x+ 3 owner staff 96 Oct 13 12:00 {path}\n 0: user:_dftest2 allow list,add_file,search,delete\n" };
+        var workspace = Workspace(sandbox);
+        var story = await workspace.PrepareAsync(Repo, "factory/sc-9", CancellationToken.None);
+        var file = Path.Combine(story.Path, "work.txt");
+        File.WriteAllText(file, "the worker's\n");
+        File.SetUnixFileMode(file, (UnixFileMode)0b110_110_110); // 0666
+
+        Assert.True(await workspace.CommitAndPushAsync(Repo, story, "sc-9: work", TestGrants.Untainted, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task A_worktree_shared_with_no_worker_for_writing_is_not_asked_who_writes_it()
+    {
+        // A read-only seat (triage, planner) is never pushed with a grant in production; the check belongs to shared worktrees.
+        var sandbox = new FakeSandbox { Listing = _ => null };
+        var workspace = new GitWorkspace(Path.Combine(_root, "work"), _ => _remote, (_, _) => Task.FromResult<string?>(Token), sandbox: sandbox,
+            shareWithWorker: false);
+        var story = await workspace.PrepareAsync(Repo, "factory/sc-9", CancellationToken.None);
+
+        Assert.False(await workspace.CommitAndPushAsync(Repo, story, "nothing", TestGrants.Untainted, CancellationToken.None));
+        Assert.DoesNotContain(sandbox.Calls, c => c.StartsWith("writers ", StringComparison.Ordinal));
+    }
+
     private GitWorkspace Workspace(DarkFactory.Orchestrator.Worker.IWorkerSandbox sandbox, GitCommand? git = null) =>
         new(Path.Combine(_root, "work"), _ => _remote, (_, _) => Task.FromResult<string?>(Token), git, sandbox);
+
+    /// <summary>A sandbox whose worker user another run's worker phase may hold (<see cref="Busy"/>): a deletion that does not wait then deletes nothing.</summary>
+    private sealed class BusySandbox : DarkFactory.Orchestrator.Worker.IWorkerSandbox
+    {
+        public bool Busy { get; set; } = true;
+        public List<string> Calls { get; } = [];
+        public Task CloseToWorkerAsync(string path, CancellationToken ct) => Task.CompletedTask;
+        public Task EnsureOnlyWorkerWritesAsync(string path, CancellationToken ct) => Task.CompletedTask;
+        public Task ShareAsync(string path, CancellationToken ct) => Task.CompletedTask;
+
+        public Task DeleteAsWorkerAsync(string path, CancellationToken ct)
+        {
+            Calls.Add($"delete {path}");
+            Assert.False(Busy, "waited for a busy sandbox user"); // the real one would wait here, on no cancellation token
+            Directory.Delete(path, recursive: true);
+            return Task.CompletedTask;
+        }
+
+        public Task<bool> TryDeleteAsWorkerAsync(string path, CancellationToken ct)
+        {
+            Calls.Add($"try-delete {path}");
+            if (!Busy)
+            {
+                Directory.Delete(path, recursive: true);
+            }
+            return Task.FromResult(!Busy);
+        }
+    }
+
+    [Fact]
+    public async Task The_clean_up_of_a_worktree_that_failed_never_waits_for_a_busy_sandbox_user_and_leaves_the_directory_as_a_leftover()
+    {
+        var sandbox = new BusySandbox();
+        var workspace = Workspace(sandbox);
+        var path = Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name, "factory-sc-404");
+        Assert.False(await workspace.HasLeftoverAsync(Repo, "factory/sc-404", CancellationToken.None));
+
+        // origin has no such branch: `git worktree add` fails under the clone's lock, after the directory was made. Outside a
+        // worker phase (the merge queue's base update) the sandbox user is another run's: the clean-up asks once and leaves it.
+        await Assert.ThrowsAsync<InvalidOperationException>(() => workspace.RestoreAsync(Repo, "factory/sc-404", CancellationToken.None));
+
+        Assert.Equal([$"try-delete {path}"], sandbox.Calls);
+        Assert.True(Directory.Exists(path));
+        // Not a worktree any run could reopen — and still a leftover: replacing it is a deletion as the worker user.
+        Assert.Null(await workspace.ReopenAsync(Repo, "factory/sc-404", CancellationToken.None));
+        Assert.True(await workspace.HasLeftoverAsync(Repo, "factory/sc-404", CancellationToken.None));
+
+        // With the sandbox user free (inside a worker phase) the same failure cleans up after itself.
+        sandbox.Busy = false;
+        sandbox.Calls.Clear();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => workspace.RestoreAsync(Repo, "factory/sc-404", CancellationToken.None));
+        Assert.Equal([$"delete {path}", $"try-delete {path}"], sandbox.Calls);
+        Assert.False(Directory.Exists(path));
+        Assert.False(await workspace.HasLeftoverAsync(Repo, "factory/sc-404", CancellationToken.None));
+    }
 
     private string ClonePath => Path.Combine(_root, "work", "repos", Repo.Owner, Repo.Name);
 
@@ -300,7 +537,7 @@ public class GitWorkspaceTests
         {
             asked.Add(name);
             return Task.FromResult(name == "factory-sc-13");
-        }, CancellationToken.None);
+        }, LiveRuns.None, CancellationToken.None);
 
         Assert.Equal(["factory-sc-12", "factory-sc-13"], asked.Order());
         Assert.False(Directory.Exists(orphan.Path));
@@ -325,9 +562,9 @@ public class GitWorkspaceTests
         Assert.DoesNotContain(sandbox.Calls, c => c.StartsWith("share", StringComparison.Ordinal));
         // Each sweep sees only its own root: the items' sweep never asks about the triage worktree, and the triage sweep keeps no item's.
         var asked = new List<string>();
-        await Workspace(sandbox).SweepOrphansAsync((name, _) => { asked.Add(name); return Task.FromResult(true); }, CancellationToken.None);
+        await Workspace(sandbox).SweepOrphansAsync((name, _) => { asked.Add(name); return Task.FromResult(true); }, LiveRuns.None, CancellationToken.None);
         Assert.Equal(["factory-sc-15"], asked);
-        await triage.SweepOrphansAsync((_, _) => Task.FromResult(false), CancellationToken.None);
+        await triage.SweepOrphansAsync((_, _) => Task.FromResult(false), LiveRuns.None, CancellationToken.None);
         Assert.False(Directory.Exists(ws.Path));
         Assert.True(File.Exists(Path.Combine(item.Path, "README.md")));
     }
@@ -381,7 +618,7 @@ public class GitWorkspaceTests
         var again = await Planner().PrepareSeatAsync([Repo, gears], "factory/plan-sc-9", CancellationToken.None);
         Assert.False(File.Exists(Path.Combine(again.Path, "acme", "widgets", "stale.txt")));
         Assert.True(File.Exists(Path.Combine(again.Path, "acme", "gears", "Cargo.toml")));
-        await Planner().SweepOrphansAsync((_, _) => Task.FromResult(false), CancellationToken.None);
+        await Planner().SweepOrphansAsync((_, _) => Task.FromResult(false), LiveRuns.None, CancellationToken.None);
         Assert.False(Directory.Exists(again.Path));
 
         // Removing a seat deletes every checkout and the directory, and leaves neither clone a registered worktree.
@@ -396,7 +633,7 @@ public class GitWorkspaceTests
     [Fact]
     public async Task Sweep_without_any_worktrees_does_nothing()
     {
-        await Workspace().SweepOrphansAsync((_, _) => throw new InvalidOperationException("no worktree to ask about"), CancellationToken.None);
+        await Workspace().SweepOrphansAsync((_, _) => throw new InvalidOperationException("no worktree to ask about"), LiveRuns.None, CancellationToken.None);
     }
 
     [Fact]
@@ -754,7 +991,9 @@ public class GitWorkspaceTests
     public void Owner_git_isolation_adds_its_environment_and_config_ahead_of_every_call()
     {
         Assert.Equal(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "rerere.enabled=false", "-c", "filter.lfs.smudge=",
-            "-c", "filter.lfs.clean=", "-c", "filter.lfs.process=", "-c", "filter.lfs.required=false"], OwnerGit.ConfigArgs);
+            "-c", "filter.lfs.clean=", "-c", "filter.lfs.process=", "-c", "filter.lfs.required=false",
+            // No git call leaves a maintenance process behind to write the shared clone outside its lock (sc-25987).
+            "-c", "gc.autoDetach=false", "-c", "maintenance.autoDetach=false"], OwnerGit.ConfigArgs);
         var (env, args) = OwnerGit.Isolate(new Dictionary<string, string> { ["GIT_CONFIG_COUNT"] = "1" }, ["merge", "x"]);
         Assert.Equal(new Dictionary<string, string>
         {
@@ -785,7 +1024,7 @@ public class GitWorkspaceTests
         await workspace.OverlayAsync(run, merge.Head, ["README.md"], ["other.txt"], CancellationToken.None,
             new Dictionary<string, string> { ["README.md"] = "replaced\n" });
         await workspace.RemoveAsync(Repo, run, CancellationToken.None);
-        await workspace.SweepOrphansAsync((_, _) => Task.FromResult(false), CancellationToken.None);
+        await workspace.SweepOrphansAsync((_, _) => Task.FromResult(false), LiveRuns.None, CancellationToken.None);
 
         Assert.Superset(new HashSet<string> { "clone", "fetch", "remote", "worktree", "rev-parse", "symbolic-ref", "add", "status", "commit", "rev-list",
             "push", "merge", "diff", "ls-tree", "cat-file", "checkout", "rm", "hash-object", "update-index", "checkout-index" },

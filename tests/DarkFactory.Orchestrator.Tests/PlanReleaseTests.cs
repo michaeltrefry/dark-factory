@@ -407,9 +407,9 @@ public class PlanReleasePipelineTests
         public FakeWorker Implementer { get; } = new(Reports(Ok), Reports(Ok with { SessionId = "sess-78" }));
         public StringWriter Log { get; } = new();
 
-        public Task<RunOutcome> Run(int id = PlanId, bool ignoreScope = false, bool workerless = false) =>
+        public Task<RunOutcome> Run(int id = PlanId, bool ignoreScope = false) =>
             new RunPipeline(Source, Ledger, Locks, Workspaces, Implementer, Prs, Sandbox, Log, controls: Controls,
-                controlPollInterval: TimeSpan.FromMilliseconds(10), ignoreScope: ignoreScope, workerless: workerless).RunAsync(id, CancellationToken.None);
+                controlPollInterval: TimeSpan.FromMilliseconds(10), ignoreScope: ignoreScope).RunAsync(id, CancellationToken.None);
 
         public Task<string?> GiveUp(string reason) =>
             RunPipeline.GiveUpAsync(Source, Ledger, Locks, PlanId, reason, Log, CancellationToken.None);
@@ -441,7 +441,7 @@ public class PlanReleasePipelineTests
             var plan = PlanParser.Parse(answer);
             var ids = await Source.CreateChildrenAsync(PlanId, plan.Children($"sc-{PlanId}", Sandbox), CancellationToken.None);
             var ledger = Ledger;
-            var item = await ledger.GetOrCreateAsync(RunPipeline.Source, $"sc-{PlanId}", "Add CSV export", Sandbox.FullName, null, CancellationToken.None, 42);
+            var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, $"sc-{PlanId}", "Add CSV export", Sandbox.FullName, null, CancellationToken.None, 42);
             await ledger.RecordAsync(item, WorkState.Plan, null, null, CancellationToken.None);
             await ledger.CheckpointAsync(item, RunPipeline.Steps.Plan, "plan-sess", plan.ToDetail(), CancellationToken.None);
             await ledger.CheckpointAsync(item, RunPipeline.Steps.PlanCreating, "plan-sess", null, CancellationToken.None);
@@ -453,7 +453,7 @@ public class PlanReleasePipelineTests
         public async Task Recorded(IReadOnlyList<int> ids)
         {
             var ledger = Ledger;
-            var item = (await ledger.FindAsync(RunPipeline.Source, $"sc-{PlanId}", CancellationToken.None))!;
+            var item = (await ledger.FindAsync(ItemNaming.Shortcut.Source, $"sc-{PlanId}", CancellationToken.None))!;
             var stories = string.Join(' ', ids.Select(i => $"sc-{i}"));
             await ledger.CheckpointAsync(item, RunPipeline.Steps.PlanStories, "plan-sess", stories, CancellationToken.None);
             await ledger.RecordAsync(item, WorkState.Planned, "plan-sess", $"{ids.Count} stories: {stories}", CancellationToken.None);
@@ -466,7 +466,7 @@ public class PlanReleasePipelineTests
         public async Task Worked(int id, WorkState last = WorkState.Watch, string? title = null)
         {
             var ledger = Ledger;
-            var item = await ledger.GetOrCreateAsync(RunPipeline.Source, $"sc-{id}", title ?? $"Story {id}", Sandbox.FullName, null, CancellationToken.None, 42);
+            var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, $"sc-{id}", title ?? $"Story {id}", Sandbox.FullName, null, CancellationToken.None, 42);
             WorkState[] path = [WorkState.Implement, WorkState.Review, WorkState.CI, WorkState.MergeGate, WorkState.Merge, WorkState.Watch];
             foreach (var state in path.Skip(Array.IndexOf(path, item.State) + 1))
             {
@@ -502,7 +502,7 @@ public class PlanReleasePipelineTests
         public async Task<IReadOnlyList<int>> InFlight()
         {
             await using var db = new LedgerDbContext(_options);
-            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), CancellationToken.None, Controls);
+            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Shortcut, CancellationToken.None, Controls);
         }
 
         public async Task Link(int subject, int obj)
@@ -712,7 +712,7 @@ public class PlanReleasePipelineTests
         var ids = await h.Planned(Chain);
         await h.Run();
         await h.Worked(ids[0], WorkState.Review);
-        var item = await h.Ledger.FindAsync(RunPipeline.Source, $"sc-{ids[0]}", CancellationToken.None);
+        var item = await h.Ledger.FindAsync(ItemNaming.Shortcut.Source, $"sc-{ids[0]}", CancellationToken.None);
         await h.Ledger.RecordAsync(item!, ended, null, "gave up", CancellationToken.None);
 
         for (var poll = 0; poll < 3; poll++)
@@ -980,6 +980,22 @@ public class PlanReleasePipelineTests
             : null;
 
     [Fact]
+    public async Task A_slot_bookkeeping_row_after_the_not_evaluated_row_does_not_make_the_same_reason_commented_again()
+    {
+        var h = new Harness();
+        await h.Planned(PlanAnswers.Answer(PlanAnswers.Story("a", "First story"), PlanAnswers.Story("b", "Second story")));
+        Assert.Equal("commented", await h.GiveUp("the board is down"));
+        // A run of the plan item ended an earlier run's slot use on the record (sc-25991): the item's last row is now that
+        // bookkeeping, not a step the item reached, and the not-evaluated row is still its last word.
+        var plan = await h.Db.WorkItems.SingleAsync(i => i.ExternalId == $"sc-{PlanId}");
+        await h.Ledger.CheckpointAsync(plan, RunPipeline.Steps.SlotReleased, null,
+            SlotUse.Detail(1, "_factory", "plan not recorded: ended with an earlier run"), CancellationToken.None);
+
+        Assert.Equal("held; already commented for this reason", await h.GiveUp("the board is down"));
+        Assert.Single(h.Comments(PlanId), c => c.Contains("could not evaluate it", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task A_plan_that_cannot_be_evaluated_is_given_up_on_with_one_comment_and_one_row_per_reason_stays_planned_and_recovers()
     {
         var h = new Harness();
@@ -1194,10 +1210,10 @@ public class PlanReleasePipelineTests
         var ledger = h.Ledger;
         // A plan-stories row naming it turns up afterwards (a plan lists only stories it created, so it never does): the item was
         // claimed with no plan, so its later runs do not search the plans for it.
-        var plan = await ledger.GetOrCreateAsync(RunPipeline.Source, $"sc-{PlanId}", "Add CSV export", Sandbox.FullName, null, CancellationToken.None, 42);
+        var plan = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, $"sc-{PlanId}", "Add CSV export", Sandbox.FullName, null, CancellationToken.None, 42);
         await ledger.RecordAsync(plan, WorkState.Plan, null, null, CancellationToken.None);
         await ledger.CheckpointAsync(plan, RunPipeline.Steps.PlanStories, null, "sc-600", CancellationToken.None);
-        var item = (await ledger.FindAsync(RunPipeline.Source, "sc-600", CancellationToken.None))!;
+        var item = (await ledger.FindAsync(ItemNaming.Shortcut.Source, "sc-600", CancellationToken.None))!;
         await ledger.RecordAsync(item, WorkState.Escalated, null, "boom", CancellationToken.None);
 
         var again = await h.Run(600);
@@ -1208,53 +1224,22 @@ public class PlanReleasePipelineTests
     }
 
     [Fact]
-    public async Task A_stop_that_lands_on_a_waiting_plan_after_the_runner_took_no_worker_lock_is_left_to_the_next_run()
+    public async Task A_stop_that_lands_on_a_waiting_plan_is_finished_by_the_run_that_finds_it()
     {
         var h = new Harness();
         await h.Planned(Chain);
         // A planner a crashed run left behind is on record: finishing a stop goes and stops it.
-        var plan = (await h.Ledger.FindAsync(RunPipeline.Source, $"sc-{PlanId}", CancellationToken.None))!;
+        var plan = (await h.Ledger.FindAsync(ItemNaming.Shortcut.Source, $"sc-{PlanId}", CancellationToken.None))!;
         await h.Ledger.CheckpointAsync(plan, RunPipeline.Steps.WorkerStarted, null, WorkerPid.ToString(), CancellationToken.None);
-        // The runner saw a waiting plan and no Stop, so it took no worker run lock; the Stop lands before the pipeline reads the control.
         await h.Controls.SetAsync(ControlScope.Item($"sc-{PlanId}"), ControlState.Stopping, "test", CancellationToken.None);
 
-        var deferred = await h.Run(workerless: true);
-
-        Assert.Equal(WorkState.Planned, deferred.State);
-        Assert.Contains("stop deferred to the next run", deferred.Error);
-        Assert.Empty(h.Implementer.OrphanStops);
-        Assert.Empty(h.Workspaces.Calls);
-        Assert.Empty(h.Board.Requests);
-        Assert.Empty(await h.Released());
-        Assert.Equal(ControlState.Stopping, await h.Controls.EffectiveAsync($"sc-{PlanId}", 42, CancellationToken.None));
-        Assert.Equal([PlanId], await h.InFlight());
-
-        // The next run is built with the lock (its runner sees the Stop) and finishes the stop.
+        // Any run takes the sandbox user's lock for the phase that needs it (sc-25988; LockScopeTests): none is left to a later run.
         var stopped = await h.Run();
 
         Assert.Equal(WorkState.Cancelled, stopped.State);
         Assert.Equal([WorkerPid], h.Implementer.OrphanStops);
         Assert.Contains(h.Workspaces.Calls, c => c.StartsWith("reopen ", StringComparison.Ordinal));
-    }
-
-    [Fact]
-    public async Task A_run_built_without_the_worker_lock_touches_nothing_but_a_waiting_plan()
-    {
-        var h = new Harness();
-        h.Board.Add(600, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.ToDo, name: "Hand-written");
-
-        var deferred = await h.Run(600, workerless: true);
-
-        Assert.Contains("sc-600: deferred to the next run", deferred.Error);
-        Assert.Empty(await h.Rows(600));
-        Assert.Empty(h.Board.Requests);
-        Assert.Empty(h.Implementer.Calls);
-        Assert.Empty(h.Workspaces.Calls);
-
-        // A waiting plan is evaluated all the same.
-        var ids = await h.Planned(Chain);
-        Assert.Null((await h.Run(workerless: true)).Error);
-        Assert.Equal([$"sc-{ids[0]}"], await h.Released());
+        Assert.Empty(await h.Released());
     }
 
     [Fact]
@@ -1314,7 +1299,7 @@ public class PlanReleasePipelineTests
         Assert.Equal(FakeShortcutBoard.InProgress, h.State(b));
     }
 
-    public static TheoryData<string> PausingScopes => [ControlScope.Factory, ControlScope.Epic(42), ControlScope.Item($"sc-{PlanId}"), ControlScope.Freeze];
+    public static TheoryData<string> PausingScopes => [ControlScope.Factory, ControlScope.Epic(ItemNaming.Shortcut.Epic(42)), ControlScope.Item($"sc-{PlanId}"), ControlScope.Freeze];
 
     [Theory]
     [MemberData(nameof(PausingScopes))]
@@ -1365,43 +1350,27 @@ public class PlanReleasePipelineTests
         var ids = await h.Planned(Chain);
         var plan = await h.Db.WorkItems.AsNoTracking().SingleAsync(i => i.ExternalId == $"sc-{PlanId}");
 
-        Assert.Equal(plan.Id, await h.Ledger.PlanOfAsync(RunPipeline.Source, $"sc-{ids[1]}", CancellationToken.None));
+        Assert.Equal(plan.Id, await h.Ledger.PlanOfAsync(ItemNaming.Shortcut.Source, $"sc-{ids[1]}", CancellationToken.None));
         // A prefix of a listed id is not that id, and another source's item with the same id is not the plan's story.
-        Assert.Null(await h.Ledger.PlanOfAsync(RunPipeline.Source, $"sc-{ids[1]}"[..^1], CancellationToken.None));
-        Assert.Null(await h.Ledger.PlanOfAsync(RunPipeline.Source, $"sc-{PlanId}", CancellationToken.None));
+        Assert.Null(await h.Ledger.PlanOfAsync(ItemNaming.Shortcut.Source, $"sc-{ids[1]}"[..^1], CancellationToken.None));
+        Assert.Null(await h.Ledger.PlanOfAsync(ItemNaming.Shortcut.Source, $"sc-{PlanId}", CancellationToken.None));
         Assert.Null(await h.Ledger.PlanOfAsync(ItemNaming.GitHubIssue.Source, $"sc-{ids[1]}", CancellationToken.None));
 
-        var known = await h.Ledger.ItemsByIdAsync(RunPipeline.Source, [$"sc-{PlanId}", "sc-1", $"sc-{PlanId}"], CancellationToken.None);
+        var known = await h.Ledger.ItemsByIdAsync(ItemNaming.Shortcut.Source, [$"sc-{PlanId}", "sc-1", $"sc-{PlanId}"], CancellationToken.None);
         Assert.Equal([$"sc-{PlanId}"], known.Keys);
         Assert.Equal(RunPipeline.Steps.PlanStories, known[$"sc-{PlanId}"].History.Last(r => r.Step is not null).Step);
     }
 }
 
 /// <summary>
-/// sc-25871: the production runner (<see cref="FactoryRunner"/>) runs a waiting plan item without the worker run lock, and tells its
-/// pipeline so. Against the compose Postgres (skips locally without it); a sandboxed configuration whose worker user and helper do
-/// not exist, so nothing here could reach the real sandbox.
+/// sc-25871, sc-25988: the production runner (<see cref="FactoryRunner"/>) runs a waiting plan item without the sandbox user's lock —
+/// like every run outside its worker phases. Against the compose Postgres (skips locally without it); a sandboxed configuration
+/// whose worker user and helper do not exist, so nothing here could reach the real sandbox.
 /// </summary>
 public class PlanRunnerLockTests
 {
-    /// <summary>The work source with a callback on every read of <see cref="IWorkSource.Naming"/>, everything else forwarded.</summary>
-    public class NamingHook : DispatchProxy
-    {
-        public IWorkSource Target { get; set; } = null!;
-        public Action? OnNaming { get; set; }
-
-        protected override object? Invoke(MethodInfo? method, object?[]? args)
-        {
-            if (method!.Name == $"get_{nameof(IWorkSource.Naming)}")
-            {
-                OnNaming?.Invoke();
-            }
-            return method.Invoke(Target, args);
-        }
-    }
-
     [Fact]
-    public async Task A_waiting_plan_runs_without_the_worker_lock_and_a_stop_landing_after_the_runners_check_is_deferred_by_its_pipeline()
+    public async Task A_waiting_plan_is_evaluated_while_another_runs_worker_phase_holds_the_sandbox_user()
     {
         await using var temp = await TempPostgresDatabase.CreateAsync("df_plan");
         await LedgerMigrations.MigrateAsync(temp.ConnectionString, CancellationToken.None);
@@ -1431,53 +1400,23 @@ public class PlanRunnerLockTests
         await using (var db = contexts.CreateDbContext())
         {
             var ledger = new WorkLedger(db, TimeProvider.System);
-            var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-500", "Add CSV export", Sandbox.FullName, null, CancellationToken.None);
+            var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-500", "Add CSV export", Sandbox.FullName, null, CancellationToken.None);
             await ledger.RecordAsync(item, WorkState.Plan, null, null, CancellationToken.None);
             await ledger.CheckpointAsync(item, RunPipeline.Steps.PlanStories, null, "sc-9001 sc-9002", CancellationToken.None);
             await ledger.RecordAsync(item, WorkState.Planned, null, "2 stories: sc-9001 sc-9002", CancellationToken.None);
         }
-        var source = DispatchProxy.Create<IWorkSource, NamingHook>();
-        var hook = (NamingHook)(object)source;
-        hook.Target = new ShortcutWorkSource(board.Client(), "tok", new WatchScope(["darkfactory"], []));
-        // Another sandboxed run holds the worker run lock for the whole test: a run that needed it would fail (FactoryUnavailable).
+        var source = new ShortcutWorkSource(board.Client(), "tok", new WatchScope(["darkfactory"], []));
+        // Another run's worker phase holds the sandbox user's lock for the whole test: a run that needed it would wait for ever.
         using var held = WorkerLock.Acquire(root);
 
-        var evaluated = await FactoryRunner.RunAsync(options, source, 500, ignoreScope: false, TextWriter.Null, CancellationToken.None);
+        // The installed helper is the current one (every run's start checks that, reading it; a stub that could run nothing): the
+        // run's lock is the work root's, held by the other run throughout.
+        var evaluated = await FactoryRunner.RunAsync(options, source, 500, ignoreScope: false, TextWriter.Null, CancellationToken.None, adjustGate: null,
+            testSandbox: SandboxSupport.StubSandbox(root, WorkerLock.For(root)));
 
         // Evaluated without the lock: the story nothing blocks was released.
         Assert.Equal((WorkState.Planned, (string?)null), (evaluated.State, evaluated.Error));
         Assert.Equal(FakeShortcutBoard.ToDo, (long)board.Story(9001)["workflow_state_id"]!);
-
-        // A Stop lands after the runner's check and before the pipeline reads the control. The runner reads the source's naming
-        // twice for its check (the state lookup, then the control's scope) and the pipeline reads it next, right before it reads
-        // the control: the Stop is written on that third read.
-        var controls = new LedgerControls(contexts, TimeProvider.System);
-        var reads = 0;
-        hook.OnNaming = () =>
-        {
-            if (++reads == 3)
-            {
-                controls.SetAsync(ControlScope.Item("sc-500"), ControlState.Stopping, "test", CancellationToken.None).GetAwaiter().GetResult();
-            }
-        };
-        board.Requests.Clear();
-
-        var deferred = await FactoryRunner.RunAsync(options, source, 500, ignoreScope: false, TextWriter.Null, CancellationToken.None);
-
-        // The pipeline was told it holds no lock: it finishes no stop (which could stop every worker-user process and remove a
-        // worktree under another run's worker) and leaves it to the next run, which sees the Stop and takes the lock.
-        Assert.True(reads >= 3, $"{reads} reads");
-        Assert.Equal(WorkState.Planned, deferred.State);
-        Assert.Contains("stop deferred to the next run", deferred.Error);
-        Assert.Empty(board.Requests);
-        Assert.Equal(ControlState.Stopping, await controls.EffectiveAsync("sc-500", null, CancellationToken.None));
-        await using var after = contexts.CreateDbContext();
-        Assert.Equal(WorkState.Planned, (await after.WorkItems.AsNoTracking().SingleAsync(i => i.ExternalId == "sc-500")).State);
-        // With the Stop on record, the next run's runner asks for the lock (held here, so it says so) before anything else.
-        hook.OnNaming = null;
-        var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
-            FactoryRunner.RunAsync(options, source, 500, ignoreScope: false, TextWriter.Null, CancellationToken.None));
-        Assert.Contains("only one worker may run at a time", ex.Message);
     }
 }
 
@@ -1554,7 +1493,7 @@ public class PlanCloseoutReportTests
     [Fact]
     public void A_plan_storys_pull_request_and_closeout_say_it_went_to_its_plans_changeset_branch_and_any_other_items_say_nothing_new()
     {
-        var story = new WorkStory(12, "First story", "…", "chore", "https://app.shortcut.com/trefry/story/12");
+        var story = new WorkStory(12, "First story", "…", "chore", "https://app.shortcut.com/trefry/story/12", ItemNaming.Shortcut);
         List<LedgerEntry> rows = [Row(WorkState.Implement), Row(WorkState.MergeGate, RunPipeline.Steps.MergeFiles, new MergeFiles("factory/changeset-sc-9", ["a.cs"]).ToDetail()),
             Row(WorkState.Merge, detail: "abc123")];
 

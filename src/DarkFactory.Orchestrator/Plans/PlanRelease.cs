@@ -224,9 +224,12 @@ public static class PlanRelease
         string.Join("; ", held.Where(h => h.Outside.Count > 0)
             .Select(h => $"{h.Id} held by {string.Join(", ", h.Outside)} ({OutsideRemedy})"));
 
-    /// <summary>The <c>plan-held</c> record of a story that cannot be released because it is archived on its board.</summary>
-    public static string HeldArchived(string story) =>
-        $"{story} is archived on the board, so it was not released and the plan cannot complete: unarchive it";
+    /// <summary>
+    /// The <c>plan-held</c> record of a story that cannot be released because it is archived on its board, in that board's words
+    /// (<paramref name="shelved"/>, <see cref="IWorkSource.Shelved"/>; default: archived, unarchive it).
+    /// </summary>
+    public static string HeldArchived(string story, (string Is, string Undo, string Do)? shelved = null) =>
+        $"{story} is {shelved?.Is ?? "archived"} on the board, so it was not released and the plan cannot complete: {shelved?.Undo ?? "unarchive it"}";
 
     /// <summary>The <c>plan-held</c> record of a story the plan released that waits in the backlog again (a person moved it back).</summary>
     public static string HeldBackInBacklog(string story) =>
@@ -523,7 +526,7 @@ public static class PlanRelease
     /// repositories whose changeset each story waits on, and the merge order. Null when the <c>plan</c> checkpoint does not read
     /// back as a plan of those stories.
     /// </summary>
-    public static RecordedRepositories? RecordedRepos(string? planDetail, IReadOnlyList<string> stories, Shortcut.RepoRef primary)
+    public static RecordedRepositories? RecordedRepos(string? planDetail, IReadOnlyList<string> stories, RepoRef primary)
     {
         try
         {

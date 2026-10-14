@@ -555,13 +555,13 @@ public partial class ChangesetPipelineTests
             }
         }
 
-        public RunPipeline Pipeline(bool workerless = false) =>
+        public RunPipeline Pipeline() =>
             new(Source, new WorkLedger(new LedgerDbContext(_options), TimeProvider.System), Locks, Repo, WorkerInstead ?? Worker, Repo, Sandbox, Log, controls: Controls,
                 controlPollInterval: TimeSpan.FromMilliseconds(10),
                 gate: new GateStage(Repo, Reviewer, TimeSpan.FromMilliseconds(5), TimeSpan.FromSeconds(30), Risk: FakeCodeGraphRisk.Reader(CodeGraph)),
-                planner: Planner is null ? null : new Seat(Planner), workerless: workerless);
+                planner: Planner is null ? null : new Seat(Planner));
 
-        public Task<RunOutcome> Run(int id = PlanId, bool workerless = false, CancellationToken ct = default) => Pipeline(workerless).RunAsync(id, ct);
+        public Task<RunOutcome> Run(int id = PlanId, CancellationToken ct = default) => Pipeline().RunAsync(id, ct);
 
         /// <summary>Runs the plan item through its planner: its stories on the board, its changeset branch on origin, the item Planned.</summary>
         public async Task<int[]> Plan(string answer)
@@ -617,13 +617,13 @@ public partial class ChangesetPipelineTests
         {
             await using var db = new LedgerDbContext(_options);
             var ledger = new WorkLedger(db, TimeProvider.System);
-            await rows(ledger, await ledger.GetOrCreateAsync(RunPipeline.Source, $"sc-{PlanId}", "Add CSV export", Sandbox.FullName, null, CancellationToken.None, 42));
+            await rows(ledger, await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, $"sc-{PlanId}", "Add CSV export", Sandbox.FullName, null, CancellationToken.None, 42));
         }
 
         public async Task<long?> PlanOf(int story)
         {
             await using var db = new LedgerDbContext(_options);
-            return await new WorkLedger(db, TimeProvider.System).PlanOfAsync(RunPipeline.Source, $"sc-{story}", CancellationToken.None);
+            return await new WorkLedger(db, TimeProvider.System).PlanOfAsync(ItemNaming.Shortcut.Source, $"sc-{story}", CancellationToken.None);
         }
 
         public async Task<string?> TaintOf(string session)
@@ -638,7 +638,7 @@ public partial class ChangesetPipelineTests
         public async Task<IReadOnlyList<int>> InFlight()
         {
             await using var db = new LedgerDbContext(_options);
-            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), CancellationToken.None, Controls);
+            return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Shortcut, CancellationToken.None, Controls);
         }
     }
 
@@ -769,7 +769,7 @@ public partial class ChangesetPipelineTests
 
         // Every story merged: exactly one pull request from the changeset branch to the default branch, the plan item's own.
         var reviewsBefore = h.Reviewer.Snapshot().Count;
-        var opened = await h.Run(workerless: true);
+        var opened = await h.Run();
 
         Assert.Equal((WorkState.Review, (string?)null), (opened.State, opened.Error));
         var changeset = h.Repo.Opened.Single(o => o.Head == ChangesetBranch);

@@ -2,7 +2,6 @@ using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
@@ -29,7 +28,7 @@ public class GatePipelineTests
     private static readonly string Policy = TestPolicies.Standard();
 
     private static readonly WorkStory Story =
-        new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77");
+        new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77", ItemNaming.Shortcut);
 
     /// <summary>GitHub as the gate sees it: one PR whose head the test can move, CI per commit, the base branch's policy.</summary>
     internal sealed class FakeGateGitHub : IGateGitHub
@@ -263,7 +262,10 @@ public class GatePipelineTests
         public CodeGraphRiskReader? RiskReader { get; init; }
         /// <summary><c>Gate:CiTimeoutMinutes</c> for the run.</summary>
         public TimeSpan CiTimeout { get; init; } = TimeSpan.FromSeconds(5);
-        /// <summary>When set, the gate's waits run on <see cref="Time"/> (which only moves when the test advances it).</summary>
+        /// <summary>
+        /// When set, the gate's waits run on <see cref="Time"/> (which only moves when the test advances it), and the default
+        /// CodeGraph reader's overlay wait is bounded for a fake clock (<see cref="FakeCodeGraphRisk.FakeClockOverlayTimeout"/>).
+        /// </summary>
         public bool GateOnFakeClock { get; init; }
         /// <summary>How often a run's controls are polled while a worker or the gate's test runs execute (the pipeline's default when null).</summary>
         public TimeSpan? ControlPoll { get; init; }
@@ -285,7 +287,7 @@ public class GatePipelineTests
                     controls: RunControls ?? Controls,
                     controlPollInterval: ControlPoll,
                     gate: new GateStage(GitHub, Panel ?? Reviewer, TimeSpan.FromMilliseconds(1), CiTimeout, GateOnFakeClock ? Time : null,
-                        TestRunner, Overlays, NoCodeGraph ? null : RiskReader ?? FakeCodeGraphRisk.Reader(CodeGraph)),
+                        TestRunner, Overlays, NoCodeGraph ? null : RiskReader ?? FakeCodeGraphRisk.Reader(CodeGraph, GateOnFakeClock)),
                     freeze: Freeze is null ? null : new FactoryFreeze(Contexts, Controls, Freeze, TimeProvider.System, GitHub),
                     maxControlReadFailures: MaxControlReadFailures)
                 .RunAsync(77, ct);
@@ -633,7 +635,7 @@ public class GatePipelineTests
             }
         };
         var ledger = h.Ledger;
-        var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
+        var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
         await ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
         await ledger.RecordAsync(item, WorkState.Review, null, PrUrl, CancellationToken.None);
         await ledger.CheckpointAsync(item, RunPipeline.Steps.ImplementerModel, null, ImplementerModel, CancellationToken.None);
@@ -689,7 +691,7 @@ public class GatePipelineTests
     {
         var h = new Harness();
         var ledger = h.Ledger;
-        var item = await ledger.GetOrCreateAsync(RunPipeline.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
+        var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", Story.Name, Sandbox.FullName, null, CancellationToken.None);
         foreach (var state in new[] { WorkState.Implement, WorkState.Review })
         {
             await ledger.RecordAsync(item, state, null, state == WorkState.Review ? PrUrl : null, CancellationToken.None);

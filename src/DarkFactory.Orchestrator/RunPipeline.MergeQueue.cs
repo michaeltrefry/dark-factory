@@ -2,7 +2,6 @@ using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
 
@@ -260,12 +259,19 @@ public sealed partial class RunPipeline
     /// a plan item's changeset branch is itself updated from the default branch this way. A crash before the push leaves the
     /// PR at the old head, which is simply updated again. A conflict is checkpointed (<see cref="Steps.MergeConflict"/>, with the
     /// files) and sends the item to the fixer: MergeGate → Fixing, a fix round sharing the count and cap of review and CI
-    /// rounds; with the cap used it escalates. The worktree is removed either way.
+    /// rounds; with the cap used it escalates. The worktree is removed either way — unless the sandbox user is busy then
+    /// (<see cref="RemoveWorktreeAsync(Run)"/>: its deletion is a run of the launch helper, never waited for here).
+    /// The sandbox user's lock (sc-25988): a fresh worktree where no directory is runs no helper, so the update happens without
+    /// the lock while other runs' workers go on. A leftover there (an earlier pass's worktree, kept because the sandbox user was
+    /// busy) must be deleted as the worker user first, so replacing it is a worker phase: waited for like any, the wait logged
+    /// and ended by a Pause, a Stop or the freeze — the run holds its item's lock and the repository's queue turn meanwhile.
     /// </summary>
     private async Task<UpdateOutcome> UpdateFromBaseAsync(Run run, PullFacts pull, CancellationToken ct)
     {
         var (_, repo, item) = run;
-        var workspace = await workspaces.RestoreAsync(repo, run.Branch, ct, run.BaseBranch);
+        var workspace = await workspaces.HasLeftoverAsync(repo, run.Branch, ct, run.BaseBranch)
+            ? await InWorkerPhaseAsync(item, "replace its leftover worktree", () => workspaces.RestoreAsync(repo, run.Branch, ct, run.BaseBranch), ct)
+            : await InItemSlotAsync(item, () => workspaces.RestoreAsync(repo, run.Branch, ct, run.BaseBranch), ct);
         run.Workspace = workspace;
         try
         {

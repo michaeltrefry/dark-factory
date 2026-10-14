@@ -48,7 +48,7 @@ public sealed class ControlProcessTests : IAsyncLifetime
     private string Origin => Path.Combine(_dir, "origin.git");
     private LedgerDbContextFactory Contexts => new(LedgerDbContext.PostgresOptions(_ledger));
     private IControls Controls => new LedgerControls(Contexts, TimeProvider.System);
-    private readonly FakeWorkSource _stories = new(new WorkStory(StoryId, "Add files", "Add tool files.", "feature", $"https://app.shortcut.com/test/story/{StoryId}"));
+    private readonly FakeWorkSource _stories = new(new WorkStory(StoryId, "Add files", "Add tool files.", "feature", $"https://app.shortcut.com/test/story/{StoryId}", ItemNaming.Shortcut));
     private readonly FakePullRequests _prs = new();
 
     private async Task<RunOutcome> RunAsync(LedgerDbContext db, CancellationToken ct)
@@ -73,11 +73,11 @@ public sealed class ControlProcessTests : IAsyncLifetime
 
     private sealed class Stops(ControlProcessTests t) : IItemStops
     {
-        public async Task<ControlResult> StopAsync(int storyId, CancellationToken ct)
+        public async Task<ControlResult> StopAsync(ItemRef item, CancellationToken ct)
         {
             await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(t._ledger));
             return await new ItemStopper(t._stories, new WorkLedger(db, TimeProvider.System), new PostgresRunLocks(t._ledger), t._prs, t.Controls, TextWriter.Null)
-                .StopAsync(storyId, ct);
+                .StopAsync(item.Id, ct);
         }
     }
 
@@ -111,14 +111,14 @@ public sealed class ControlProcessTests : IAsyncLifetime
             var last = await db.LedgerEntries.Where(e => e.Step == null).OrderBy(e => e.Id).LastAsync(ct);
             Assert.Equal((WorkState.Paused, RunPipeline.UserPaused), (last.State, last.Detail));
             Assert.Equal("paused", (await db.WorkerSessions.SingleAsync(ct)).ExitStatus);
-            Assert.Empty(await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ct, Controls));
+            Assert.Empty(await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Shortcut, ct, Controls));
         }
 
         // Continue: the intake loop picks it up and the worker resumes its own session.
         await Actions().ContinueAsync(scope, "tester", ct);
         await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_ledger)))
         {
-            Assert.Equal([StoryId], await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ct, Controls));
+            Assert.Equal([StoryId], await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Shortcut, ct, Controls));
             var resumed = await RunAsync(db, ct);
             Assert.True(resumed.Succeeded, resumed.Error);
             Assert.Equal(WorkState.Review, resumed.State);

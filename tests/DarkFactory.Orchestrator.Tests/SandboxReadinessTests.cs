@@ -120,13 +120,27 @@ public class SandboxReadinessTests
     public async Task Claude_login_mode_probes_only_the_variables_it_sends() =>
         await FactoryRunner.EnsureSandboxReadyAsync(Sandbox(StaleAllowlist), WorkerAuth.ClaudeLogin, Claude(), CancellationToken.None);
 
+    [Fact]
+    public async Task The_readiness_probe_and_the_claude_version_check_run_the_helper_under_the_sandbox_users_lock()
+    {
+        // Both are runs of the helper, whose exit kills every process of the worker user (sc-25988).
+        var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, "root")).FullName);
+        var log = Path.Combine(_dir, "lock-probes");
+        var sandbox = Sandbox(CurrentAllowlist) with { Lock = workerLock, SudoPath = SandboxSupport.LockProbingSudo(_dir, workerLock, log) };
+
+        await FactoryRunner.EnsureSandboxReadyAsync(sandbox, WorkerAuth.RouterKey, Claude(), CancellationToken.None);
+
+        Assert.Equal(["held", "held"], File.ReadAllLines(log));
+        Assert.False(workerLock.IsHeld);
+    }
+
     /// <summary>
     /// An installed helper that is not the repo's helper after setup's two edits fails start-up before it ever runs (an older
     /// one may lack the uid sweep's guards), naming the reinstall command.
     /// </summary>
     [Theory]
     [InlineData("no-version", "no helper_version line")] // installed before this check existed
-    [InlineData("old-version", "helper_version 1 is older than 3")]
+    [InlineData("old-version", "helper_version 1 is older than 5")]
     [InlineData("edited", "its text differs from the repo")]
     [InlineData("other-user", "sandbox_user is not")]
     [InlineData("unpinned", "no pinned sandbox_uid")]
@@ -149,6 +163,32 @@ public class SandboxReadinessTests
         Assert.Contains(reason, ex.Message);
         Assert.Contains("re-run `sudo scripts/setup-worker-user.sh`", ex.Message);
         Assert.False(File.Exists(Ran), "a stale helper ran");
+    }
+
+    [Fact]
+    public async Task Start_up_checks_the_installed_helper_by_reading_it_running_nothing_and_needing_no_lock()
+    {
+        // Another run's worker phase has the sandbox user for the whole test: a check that ran the helper would wait for it.
+        var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, "root")).FullName);
+        using var held = WorkerLock.Acquire(Path.GetDirectoryName(workerLock.Path)!);
+        var none = CancellationToken.None;
+        var wait = TimeSpan.FromSeconds(30);
+
+        // The current helper: nothing to say. `factory work` starts, and the probe waits for the first worker phase.
+        Assert.Null(await FactoryRunner.CheckHelperAsync(Sandbox(CurrentAllowlist) with { Lock = workerLock }, none).WaitAsync(wait, none));
+        // Not the current one, or not there: the reason `factory work` and `factory run` refuse to start with (exit 2).
+        var stale = await FactoryRunner.CheckHelperAsync(Sandbox(CurrentAllowlist,
+            installed: t => Installed(t).Replace($"helper_version={WorkerSandbox.HelperVersion}\n", "helper_version=1\n")) with { Lock = workerLock }, none).WaitAsync(wait, none);
+        Assert.StartsWith("Stale helper: the installed launch helper ", stale);
+        Assert.Contains("helper_version 1 is older than 5", stale);
+        Assert.Contains("re-run `sudo scripts/setup-worker-user.sh`", stale);
+        var missing = await FactoryRunner.CheckHelperAsync(
+            new WorkerSandbox(Environment.UserName, Path.Combine(_dir, "no-such-helper"), SandboxSupport.FakeSudo(_dir), "x") { Lock = workerLock }, none).WaitAsync(wait, none);
+        Assert.Contains("cannot read the launch helper", missing);
+        // Unsandboxed (Worker:RunAs=none) there is no helper to check.
+        Assert.Null(await FactoryRunner.CheckHelperAsync(null, none));
+
+        Assert.False(File.Exists(Ran), "the start-up check ran the helper");
     }
 
     [Fact]

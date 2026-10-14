@@ -1,5 +1,4 @@
 using DarkFactory.Orchestrator.Ledger;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
 
@@ -15,17 +14,8 @@ public sealed record ControlResult(bool Ok, string Message)
 /// <summary>Stops one item now if no run holds it (<see cref="ItemStopper.StopAsync"/>); returns what happened.</summary>
 public interface IItemStops
 {
-    /// <summary>Stops one Shortcut story.</summary>
-    Task<ControlResult> StopAsync(int storyId, CancellationToken ct);
-
-    /// <summary>
-    /// Stops one item of any source. The default stops a Shortcut story with <see cref="StopAsync(int, CancellationToken)"/> and
-    /// leaves another source's item to its next run (its Stopping control is already set), saying so.
-    /// </summary>
-    Task<ControlResult> StopAsync(ItemRef item, CancellationToken ct) =>
-        item.Naming == ItemNaming.Shortcut
-            ? StopAsync(item.Id, ct)
-            : Task.FromResult(new ControlResult(true, $"{item}: stop requested; its next run stops it."));
+    /// <summary>Stops one item of any source (sc-25982), on the source its id names.</summary>
+    Task<ControlResult> StopAsync(ItemRef item, CancellationToken ct);
 }
 
 /// <summary>
@@ -37,12 +27,17 @@ public interface IItemStops
 /// A plan item's scope (sc-25876) is its own <c>item:&lt;id&gt;</c>, and reaches its stories: Pause and Continue through
 /// <see cref="IControls.EffectiveAsync"/>, Stop through <see cref="ItemStopper"/>, which stops the plan's unfinished stories before the
 /// plan item and leaves the stop unfinished (not <see cref="ControlResult.Ok"/>) while one of them is still running.
-/// At epic scope, active items the ledger has no epic for (recorded before epics were) are looked up on the board
-/// (<paramref name="source"/>) and their epic recorded under their run lock (<paramref name="locks"/>); any that
-/// cannot be resolved are reported, never silently skipped (E10).
+/// An epic scope names an epic of one source (<see cref="EpicRef"/>, sc-25985: <c>epic:12</c> a Shortcut epic, <c>epic:kb-3</c> a
+/// Kanban epic) and reaches that source's items only. Active items of that source the ledger has no epic for (recorded before
+/// epics were) are looked up on their own board (<paramref name="sources"/>: the source of a naming, or null when it is not
+/// configured; sc-25982) and their epic recorded under their run lock (<paramref name="locks"/>); any that cannot be resolved are
+/// reported, never silently skipped (E10). An epic its source says cannot exist (<see cref="IWorkSource.KnowsEpicAsync"/>: a Kanban
+/// key the ledger never gave out) is refused before anything is written — also when that source is not configured, from the
+/// ledger alone (<see cref="WorkSourceKind.KnowsEpic"/>).
 /// </summary>
 public sealed class ControlActions(
-    IControls controls, IDbContextFactory<LedgerDbContext> contexts, IItemStops? stops = null, IWorkSource? source = null, IRunLocks? locks = null)
+    IControls controls, IDbContextFactory<LedgerDbContext> contexts, IItemStops? stops = null, Func<ItemNaming, IWorkSource?>? sources = null,
+    IRunLocks? locks = null)
 {
     public async Task<ControlResult> PauseAsync(string scope, string by, CancellationToken ct)
     {
@@ -53,6 +48,10 @@ public sealed class ControlActions(
         if (scope == ControlScope.Freeze)
         {
             return FreezeOnlyContinues;
+        }
+        if (ControlScope.EpicOf(scope) is { } named && await UnknownEpicAsync(named, "paused", ct) is { } refusal)
+        {
+            return refusal;
         }
         await controls.SetAsync(scope, ControlState.Paused, by, ct);
         var message = $"{scope} paused: nothing new starts there, and running workers stop at their next tool call.";
@@ -109,25 +108,37 @@ public sealed class ControlActions(
         var unknown = new List<string>();
         if (ControlScope.ItemOf(scope) is { } story)
         {
+            if (stops is not null && sources is not null && sources(story.Naming) is null)
+            {
+                // Before anything is written: a stop that cannot reach the item's board would leave it Stopping with nothing to
+                // finish it (no lane runs a source without its credential) and no Continue to take it back.
+                return new ControlResult(false, $"{story}: NOT stopped, and nothing was written. {WorkSourceRegistry.NeedsCredential(story.Naming)}");
+            }
             stories.Add(story);
         }
         else
         {
             var epic = ControlScope.EpicOf(scope);
+            if (epic is not null && await UnknownEpicAsync(epic, "stopped", ct) is { } refusal)
+            {
+                return refusal;
+            }
             await using var db = await contexts.CreateDbContextAsync(ct);
-            // The factory scope stops every source's items; an epic is a Shortcut epic, so only stories are in one.
+            // The factory scope stops every source's items; an epic scope only those of the epic's own source (the same number
+            // is another epic in another source).
+            var (epicSource, epicNumber) = (epic?.Naming.Source, epic?.Id);
             var items = await db.WorkItems.AsNoTracking()
-                .Where(i => (epic == null || i.Source == RunPipeline.Source) && i.State != WorkState.Done && i.State != WorkState.Cancelled
-                    && (epic == null || i.EpicId == epic))
+                .Where(i => i.State != WorkState.Done && i.State != WorkState.Cancelled
+                    && (epicSource == null || (i.Source == epicSource && i.EpicId == epicNumber)))
                 .OrderBy(i => i.Id)
                 .Select(i => new { i.Source, i.ExternalId })
                 .ToListAsync(ct);
             var found = items.Select(i => ItemNaming.ParseAny(i.ExternalId) is { } r && r.Naming.Source == i.Source ? r : null).ToList();
-            if (epic is { } epicId)
+            if (epic is not null)
             {
                 // An item is stopped through its own control, so one in the epic is stopped whether or not its epic could be recorded.
-                var resolved = await ResolveUnknownEpicsAsync(epicId, ct);
-                found.AddRange(resolved.InEpic.Select(e => ItemNaming.Shortcut.TryParse(e, out var id) ? new ItemRef(ItemNaming.Shortcut, id) : null));
+                var resolved = await ResolveUnknownEpicsAsync(epic, ct);
+                found.AddRange(resolved.InEpic.Select(ItemNaming.ParseAny));
                 unknown = resolved.Unknown;
             }
             stories.AddRange(found.OfType<ItemRef>().Distinct());
@@ -150,9 +161,13 @@ public sealed class ControlActions(
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                // The item keeps its Stopping control: the intake loop's next poll (or a retry) finishes the stop.
+                // The item keeps its Stopping control: the intake loop's next poll (or a retry) finishes the stop — unless its
+                // source has no credential: no lane runs that source's items, so nothing retries until the credential is back.
                 ok = false;
-                results.Add($"{item}: stop NOT finished ({ex.Message}); it stays Stopping and the next poll or `factory stop` retries it.");
+                results.Add(ex is MissingCredentialException
+                    ? $"{item}: stop NOT finished ({ex.Message}); it stays Stopping, and nothing finishes the stop until that credential is set "
+                        + "(then the next poll or `factory stop` does)."
+                    : $"{item}: stop NOT finished ({ex.Message}); it stays Stopping and the next poll or `factory stop` retries it.");
             }
         }
         if (unknown.Count > 0)
@@ -187,25 +202,47 @@ public sealed class ControlActions(
     private static readonly ControlResult FreezeOnlyContinues =
         new(false, "The freeze is set by the factory when a trigger holds; it can only be cleared (`factory continue --freeze`). Use --factory to pause or stop the whole factory.");
 
+    /// <summary>
+    /// The refusal of an epic scope whose epic its source says cannot exist (<see cref="IWorkSource.KnowsEpicAsync"/>), or null:
+    /// nothing is written for it. A source that is not configured is not asked; its kind answers from the ledger alone
+    /// (<see cref="WorkSourceKind.KnowsEpic"/>: no credential needed), so a key the ledger never gave out is refused there too,
+    /// while a known epic's scope is written whether or not its board can be reached (its items are reported as unknown as before).
+    /// </summary>
+    private async Task<ControlResult?> UnknownEpicAsync(EpicRef epic, string done, CancellationToken ct)
+    {
+        var kind = WorkSourceRegistry.KindOf(epic.Naming);
+        var known = sources?.Invoke(epic.Naming) is { } source
+            ? await source.KnowsEpicAsync(epic.Id, ct)
+            : kind.KnowsEpic is null || await kind.KnowsEpic(contexts, epic.Id, ct);
+        return known
+            ? null
+            : new ControlResult(false, $"{ControlScope.Epic(epic)}: NOT {done}, and nothing was written. The factory has seen no "
+                + $"{kind.Name} epic {epic}: an epic gets its key when the factory first reads an item of it "
+                + "(the dashboard's pipeline page shows it beside the item), or ahead of that from "
+                + "`factory kanban key --epic <epic GUID>`.");
+    }
+
     private sealed record EpicResolution(List<string> InEpic, List<string> Unknown, List<string> Running);
 
     /// <summary>
-    /// Looks up the epic of every active item the ledger has none for and records it (under the item's run lock;
-    /// a running item's own run records it when it starts). Returns the items found in <paramref name="epic"/>,
+    /// Looks up the epic of every active item of the epic's source the ledger has none for and records it (under the item's run
+    /// lock; a running item's own run records it when it starts). Returns the items found in <paramref name="epic"/>,
     /// those whose epic could not be read, and those in the epic that are running with no epic recorded.
     /// </summary>
-    private async Task<EpicResolution> ResolveUnknownEpicsAsync(long epic, CancellationToken ct)
+    private async Task<EpicResolution> ResolveUnknownEpicsAsync(EpicRef epic, CancellationToken ct)
     {
         var resolution = new EpicResolution([], [], []);
         await using var db = await contexts.CreateDbContextAsync(ct);
         var ledger = new WorkLedger(db, TimeProvider.System);
+        var epicSource = epic.Naming.Source;
         var items = await db.WorkItems
-            .Where(i => i.Source == RunPipeline.Source && i.State != WorkState.Done && i.State != WorkState.Cancelled && i.EpicId == null)
+            .Where(i => i.Source == epicSource && i.State != WorkState.Done && i.State != WorkState.Cancelled && i.EpicId == null)
             .OrderBy(i => i.Id)
             .ToListAsync(ct);
         foreach (var item in items)
         {
-            if (source is null || !StoryId.TryParse(item.ExternalId, out var id))
+            // The item's own board, found from its ledger row; one that is not configured cannot be asked.
+            if (ItemNaming.ParseAny(item.ExternalId) is not { } named || named.Naming.Source != item.Source || sources?.Invoke(named.Naming) is not { } source)
             {
                 resolution.Unknown.Add(item.ExternalId);
                 continue;
@@ -213,7 +250,7 @@ public sealed class ControlActions(
             long? itemEpic;
             try
             {
-                itemEpic = (await source.ReadSpecAsync(id, ct)).Epic?.Id;
+                itemEpic = (await source.ReadSpecAsync(named.Id, ct)).Epic?.Id;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -238,7 +275,7 @@ public sealed class ControlActions(
                     recorded = true;
                 }
             }
-            if (itemEpic == epic)
+            if (itemEpic == epic.Id)
             {
                 resolution.InEpic.Add(item.ExternalId);
                 if (!recorded)

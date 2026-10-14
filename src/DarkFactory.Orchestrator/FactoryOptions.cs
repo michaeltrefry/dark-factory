@@ -10,7 +10,11 @@ namespace DarkFactory.Orchestrator;
 /// macOS keychain (service <c>dark-factory</c>) — never from files in the repo.
 /// Secrets are resolved lazily so a command only fails on the credential it needs.
 /// </summary>
-public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
+/// <param name="environment">
+/// Tests: what stands in for the process environment when a secret's variable is read (<c>_ =&gt; null</c>: a test of a missing
+/// credential then does not depend on the machine it runs on); default <see cref="Environment.GetEnvironmentVariable(string)"/>.
+/// </param>
+public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, Func<string, string?>? environment = null)
 {
     public const string DefaultConnectionString =
         "Host=localhost;Port=5434;Database=factory;Username=factory;Password=factory";
@@ -89,6 +93,40 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         }
     }
 
+    /// <summary>
+    /// <c>Kanban:Watch:Projects</c> (sc-25981): the keys of the KanbanBoard projects whose items the factory takes, comma-separated
+    /// (or an array section); empty (the default) watches nothing. A malformed key throws (the factory refuses to start).
+    /// </summary>
+    public Kanban.KanbanScope KanbanWatchScope => Kanban.KanbanScope.From(config);
+
+    /// <summary>
+    /// <c>Kanban:WebUrl</c> (default the hosted KanbanBoard's web UI, <see cref="Gateway.OutboundHttp.KanbanDefaultWebUrl"/>; sc-25981):
+    /// what a Kanban item's, epic's and document's link is built on (<see cref="Kanban.KanbanLinks"/>) — the board's MCP returns no
+    /// URL. An absolute http(s) URL without credentials, query or fragment, naming no model provider, else the factory refuses to start.
+    /// </summary>
+    public Uri KanbanWebUrl
+    {
+        get
+        {
+            var text = config["Kanban:WebUrl"];
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return Gateway.OutboundHttp.KanbanDefaultWebUrl;
+            }
+            if (!Uri.TryCreate(text.Trim(), UriKind.Absolute, out var url) || url.Scheme is not ("http" or "https")
+                || url.UserInfo.Length > 0 || url.Query.Length > 0 || url.Fragment.Length > 0)
+            {
+                throw new InvalidOperationException(
+                    $"Kanban:WebUrl must be an absolute http(s) URL without credentials, query or fragment, not '{text}'.");
+            }
+            if (Gateway.ProviderMarkers.In(text) is { } provider)
+            {
+                throw new InvalidOperationException($"Kanban:WebUrl names a model provider ('{provider}'); it must be KanbanBoard's web address.");
+            }
+            return url;
+        }
+    }
+
     /// <summary><c>Factory:DefaultRepo</c> (default the sandbox repo): an <c>owner/name</c>, else the factory refuses to start.</summary>
     public RepoRef DefaultRepo
     {
@@ -111,7 +149,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     /// owner's git), so the default is the root-anchored dir <c>setup-worker-user.sh</c> creates.
     /// </summary>
     public string WorkRoot => config["Factory:WorkRoot"]
-        ?? (WorkerSandbox is null
+        ?? (WorkerUser is null
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dark-factory")
             : DefaultSandboxWorkRoot);
 
@@ -122,13 +160,54 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
 
     /// <summary>
     /// <c>Worker:RunAs</c> (default <c>_factory</c>) runs workers as that macOS user through
-    /// <c>Worker:LaunchHelper</c>; <c>none</c> runs them as the owner (development only).
+    /// <c>Worker:LaunchHelper</c>; <c>none</c> runs them as the owner (development only). The sandbox carries the work root's
+    /// <see cref="WorkerLock"/> (sc-25988): every run of the helper, by any run of this process or another, happens under it.
+    /// This is slot 1's sandbox, the only one unless <c>Worker:Slots</c> says more (<see cref="WorkerSlots"/>).
     /// </summary>
-    public Worker.WorkerSandbox? WorkerSandbox => (config["Worker:RunAs"] ?? Worker.WorkerSandbox.DefaultUser) switch
+    public Worker.WorkerSandbox? WorkerSandbox => WorkerSlots?.All[0].Sandbox;
+
+    /// <summary>
+    /// The worker slots (sc-25989), or null for <c>Worker:RunAs=none</c>: <see cref="WorkerSlotCount"/> sandbox users, each with its
+    /// own launch helper and its own lock in the work root. Slot 1 is <c>Worker:RunAs</c> through <c>Worker:LaunchHelper</c> under
+    /// <see cref="WorkerLock.FileName"/>, exactly the sandbox before slots; slot n is <c>&lt;Worker:RunAs&gt;n</c> through
+    /// <c>&lt;Worker:LaunchHelper&gt;-n</c> (<see cref="Worker.WorkerSlots.UserOf"/>, <see cref="Worker.WorkerSlots.HelperOf"/>: the
+    /// names <c>setup-worker-user.sh --slots n</c> creates and installs).
+    /// </summary>
+    public Worker.WorkerSlots? WorkerSlots => WorkerSlotCount is var count && WorkerUser is { } user
+        ? Worker.WorkerSlots.Create(user, config["Worker:LaunchHelper"] ?? Worker.WorkerSandbox.DefaultHelperPath, WorkRoot, count)
+        : null;
+
+    /// <summary>
+    /// <c>Worker:Slots</c> (sc-25989): how many sandbox users run workers side by side, 1 (the default: the one sandbox user, as
+    /// before slots) to <see cref="Worker.WorkerSlots.MaxSlots"/>. Two runs are in a worker phase at once only in different slots,
+    /// so it bounds the worker sessions at a time; it is independent of <c>Intake:MaxConcurrentRuns</c>, which may be larger (runs
+    /// also overlap outside worker phases — reviews, CI, the merge queue) or smaller (the other slots then serve a
+    /// <c>factory run</c> beside <c>factory work</c>). With <c>Worker:RunAs=none</c> there is no sandbox user and no slot: any
+    /// value but 1 is refused rather than ignored.
+    /// </summary>
+    public int WorkerSlotCount
+    {
+        get
+        {
+            var slots = config.GetValue("Worker:Slots", 1);
+            if (slots is < 1 or > Worker.WorkerSlots.MaxSlots)
+            {
+                throw new InvalidOperationException($"Worker:Slots must be a whole number from 1 to {Worker.WorkerSlots.MaxSlots}.");
+            }
+            return slots == 1 || WorkerUser is not null
+                ? slots
+                : throw new InvalidOperationException(
+                    $"Worker:Slots is {slots}, but Worker:RunAs=none runs workers as the owner, with no sandbox user and so no slot: "
+                    + "remove Worker:Slots (or set it to 1), or set Worker:RunAs to the worker user.");
+        }
+    }
+
+    /// <summary><c>Worker:RunAs</c>: the sandbox user, or null for <c>none</c>.</summary>
+    private string? WorkerUser => (config["Worker:RunAs"] ?? Worker.WorkerSandbox.DefaultUser) switch
     {
         "none" => null,
         "" => throw new InvalidOperationException("Worker:RunAs must be a macOS user name or 'none'."),
-        var user => new Worker.WorkerSandbox(user, config["Worker:LaunchHelper"] ?? Worker.WorkerSandbox.DefaultHelperPath),
+        var user => user,
     };
 
     /// <summary><c>Worker:Auth</c> = <c>router-key</c> (default) or <c>claude-login</c> (weaker, violates E5); see <see cref="Worker.WorkerAuth"/>.</summary>
@@ -185,6 +264,17 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     public int MaxItemFailures => config.GetValue("Intake:MaxItemFailures", WorkSources.IntakeOptions.DefaultMaxItemFailures) is var n && n > 0
         ? n
         : throw new InvalidOperationException("Intake:MaxItemFailures must be at least 1.");
+
+    /// <summary>
+    /// <c>Intake:MaxConcurrentRuns</c> (sc-25988): how many items <c>factory work</c> runs at once, 1 (the default: one after
+    /// another) to <see cref="WorkSources.IntakeOptions.MaxConcurrentRunsLimit"/>. Runs overlap only outside the phases that use
+    /// the sandbox user (<see cref="WorkerLock"/>).
+    /// </summary>
+    public int MaxConcurrentRuns => config.GetValue("Intake:MaxConcurrentRuns", WorkSources.IntakeOptions.DefaultMaxConcurrentRuns) is var n
+        && n is >= 1 and <= WorkSources.IntakeOptions.MaxConcurrentRunsLimit
+        ? n
+        : throw new InvalidOperationException(
+            $"Intake:MaxConcurrentRuns must be a whole number from 1 to {WorkSources.IntakeOptions.MaxConcurrentRunsLimit}.");
 
     /// <summary>
     /// The automatic freeze's thresholds (<see cref="Controls.FreezeOptions"/>): <c>Freeze:MaxConsecutiveFailures</c> (≥ 1),
@@ -321,6 +411,16 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     /// </summary>
     public string KanbanToken => Secret("Kanban:Token", "FACTORY_KANBAN_TOKEN", SecretAccounts.KanbanToken, "Kanban token");
 
+    /// <summary>
+    /// The orchestrator's own Kanban token (<c>Kanban:WriteToken</c>, env <c>FACTORY_KANBAN_WRITE_TOKEN</c>, or keychain account
+    /// <c>kanban-write-token</c>; sc-25981): a KanbanBoard personal access token of scope <c>full</c>, with which the Kanban work
+    /// source claims, moves, comments on and links items. Owner-side only and apart from <see cref="KanbanToken"/> (E2): it is
+    /// read only to build that work source's client (<see cref="Gateway.KanbanWrites"/>) and is in no MCP upstream, profile or
+    /// proxy grant, so no model session can reach a write tool with it. Needed only to work a Kanban item.
+    /// </summary>
+    public string KanbanWriteToken => Secret("Kanban:WriteToken", "FACTORY_KANBAN_WRITE_TOKEN", SecretAccounts.KanbanWriteToken,
+        "Kanban write token (a full-scope KanbanBoard personal access token)");
+
     public string ShortcutApiToken =>
         Secret("Shortcut:ApiToken", "SHORTCUT_API_TOKEN", SecretAccounts.ShortcutApiToken, "Shortcut API token");
 
@@ -396,10 +496,12 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
     /// </summary>
     public void ValidateSettings()
     {
-        _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSandbox, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures);
+        _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSlotCount, WorkerSlots, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures, MaxConcurrentRuns);
         _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
         _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl, KanbanMcpUrl);
-        _ = CodeGraphOverlayTimeout;
+        _ = (CodeGraphOverlayTimeout, KanbanWatchScope, KanbanWebUrl);
+        // Kanban:WriteToken must not be Kanban:Token (E2, sc-25992); compared where the write token is read, the registry.
+        WorkSources.WorkSourceRegistry.EnsureKanbanTokensApart(this);
     }
 
     public bool TryGet(Func<FactoryOptions, string> secret, out string? value)
@@ -421,7 +523,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets)
         var value = config[configKey];
         if (string.IsNullOrWhiteSpace(value) && envVar is not null)
         {
-            value = Environment.GetEnvironmentVariable(envVar);
+            value = environment is null ? Environment.GetEnvironmentVariable(envVar) : environment(envVar);
         }
         if (string.IsNullOrWhiteSpace(value))
         {

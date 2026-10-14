@@ -1,4 +1,3 @@
-using DarkFactory.Orchestrator.Shortcut;
 
 namespace DarkFactory.Orchestrator.Gateway;
 
@@ -11,6 +10,34 @@ namespace DarkFactory.Orchestrator.Gateway;
 /// </summary>
 public static class GitRemoteReads
 {
+    // Not a generated regex: the generator's code would repeat the remote's host outside this folder, where the lint refuses it.
+    private static readonly System.Text.RegularExpressions.Regex GitHubRemoteUrl = new(
+        @"^(?:https?://github\.com/|ssh://git@github\.com(?::\d+)?/|git@github\.com:)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// The repository a github.com remote URL names (sc-25981: a Kanban project's <c>repository_url</c>), in the forms KanbanBoard
+    /// stores — <c>https://github.com/owner/repo.git</c>, <c>ssh://git@github.com/owner/repo.git</c>, <c>git@github.com:owner/repo.git</c>,
+    /// each with or without <c>.git</c> — or null for anything else (another host, credentials, a path that is no <c>owner/repo</c>).
+    /// Only the name is taken from it: the factory clones and fetches with <see cref="GitHubRemote"/>, never with this URL.
+    /// </summary>
+    public static RepoRef? RepoOf(string? remoteUrl)
+    {
+        var match = GitHubRemoteUrl.Match(remoteUrl?.Trim() ?? "");
+        if (!match.Success)
+        {
+            return null;
+        }
+        try
+        {
+            return RepoRef.Parse($"{match.Groups[1].Value}/{match.Groups[2].Value}");
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+    }
+
     /// <summary><c>https://github.com/&lt;owner&gt;/&lt;name&gt;.git</c>.</summary>
     public static string GitHubRemote(RepoRef repo) => $"https://github.com/{repo.Owner}/{repo.Name}.git";
 

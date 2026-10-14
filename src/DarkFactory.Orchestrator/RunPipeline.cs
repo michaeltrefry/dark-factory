@@ -3,7 +3,6 @@ using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Sessions;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
 
@@ -88,15 +87,301 @@ public sealed partial class RunPipeline(
     int? maxControlReadFailures = null,
     Plans.IPlanRunner? planner = null,
     IReadOnlyList<RepoRef>? configuredRepos = null,
-    bool workerless = false)
+    Worker.WorkerSlots? slots = null,
+    Func<CancellationToken, Task>? enterSandbox = null)
 {
     /// <summary>
-    /// Whether this run was built without the worker run lock and the sandbox probe (sc-25871: <see cref="FactoryRunner"/> does so for a
-    /// plan item waiting on its stories). Such a run only evaluates a waiting plan (<see cref="PlannedAsync"/>): anything that could
-    /// reach a worker, the sandbox helper or a worktree — a Stop, or an item that is no longer waiting — is left to the next run,
-    /// which takes the lock.
+    /// The worker slots (sc-25989, E6/E7; null unsandboxed: workers then run as the owner and share no user): one sandbox user
+    /// each, with its own lock (sc-25988). A run holds a slot only for its worker phases (<see cref="InWorkerPhaseAsync"/>) — a
+    /// worker session with its worktree's set-up, push and removal (implement, a review, CI or conflict fix round, a planner's
+    /// seat), the gate's sandboxed test runs, the stop of a worker a crashed run left — and waits on reviews, CI, CodeGraph and the
+    /// merge queue without one, so other runs' workers run meanwhile; with several slots, also during its worker phases.
     /// </summary>
-    private readonly bool _workerless = workerless;
+    private readonly Worker.WorkerSlots? _slots = slots;
+
+    /// <summary>Whether this run has done its sandbox set-up (<c>enterSandbox</c>): once, in its first worker phase.</summary>
+    private bool _sandboxEntered;
+
+    /// <summary>The slot this run has read or recorded for an item (by item id), so a later phase of the run reads no history for it.</summary>
+    private readonly Dictionary<long, int> _slotOf = [];
+
+    /// <summary>
+    /// The slot the ledger has for an item with <paramref name="history"/> (sc-25989, E7), or null when it has had no worker
+    /// phase: its last <see cref="Steps.Slot"/> row; or slot 1 for an item with a <see cref="Steps.WorkerStarted"/> row and no
+    /// slot row — a worker ran for it before the factory had slots, or while it had one (a one-slot factory records none), and
+    /// that worker was the first sandbox user's.
+    /// </summary>
+    internal static int? SlotOf(IReadOnlyList<LedgerEntry> history) =>
+        history.LastOrDefault(e => e.Step == Steps.Slot)?.Detail?.Split(' ')[0] is { } text && int.TryParse(text, out var slot) && slot >= 1
+            ? slot
+            : history.Any(e => e.Step == Steps.WorkerStarted) ? 1 : null;
+
+    /// <summary>
+    /// Runs <paramref name="phase"/> as a worker phase: holding a worker slot's lock, waited for (never failed on) while another
+    /// run — of this process or another, e.g. a <c>factory run</c> beside <c>factory work</c> — has it. Which slot (sc-25989, E7):
+    /// the one the ledger recorded for the item (<see cref="SlotOf"/>; <paramref name="slotOf"/> names the item when
+    /// <paramref name="item"/> is null) — only that one, however long it is busy, since the item's session lives in that sandbox
+    /// user's home, its worktrees are shared with that user, and a worker a crashed run left is that user's process; an item
+    /// with none yet takes the first free slot, the one with the fewest unfinished items first, and that slot is recorded
+    /// (<see cref="Steps.Slot"/>) under its lock before anything is created in it. A recorded slot that is no longer configured
+    /// (<c>Worker:Slots</c> lowered) is the item's failure, saying so. A one-slot factory records nothing: every item is slot 1's.
+    /// While the run waits it
+    /// reads <paramref name="item"/>'s controls every control poll (null: a stop, which no control holds up): a Pause — the usage
+    /// pause and the freeze's row included — or a Stop ends the wait as it ends a step, and controls that cannot be read more than
+    /// <c>Controls:MaxReadFailures</c> times in a row count as a Pause (E2). After a wait the controls and the freeze evaluator are
+    /// asked once more before the phase starts. The run's first worker phase starts with the sandbox set-up every run shares
+    /// (<c>enterSandbox</c>: the readiness probe of the held slot and the sweep of leftover worktrees, both through the launch
+    /// helper and so under the lock; a failure there is the factory's, <see cref="FactoryUnavailableException"/>). A phase inside
+    /// a phase runs at once, in the same slot.
+    /// The wait is logged when it starts and again every <see cref="WorkerLock.ReportEvery"/> (with why the lock could not be
+    /// had), and a lock file that cannot be opened at all is the factory's failure too (<see cref="WorkerLock.HoldAsync{T}"/>:
+    /// the item, already claimed, is left where it is, E10).
+    /// </summary>
+    private async Task<T> InWorkerPhaseAsync<T>(WorkItem? item, string what, Func<Task<T>> phase, CancellationToken ct, WorkItem? slotOf = null)
+    {
+        async Task<T> EnteredAsync()
+        {
+            if (!_sandboxEntered && enterSandbox is not null)
+            {
+                await enterSandbox(ct);
+            }
+            _sandboxEntered = true;
+            return await phase();
+        }
+        if (_slots is null)
+        {
+            return await EnteredAsync();
+        }
+        var owner = item ?? slotOf;
+        var recorded = owner is null ? null : await RecordedSlotAsync(owner, ct);
+        // What the run last put on the record of its use of a slot (sc-25991, the pipeline page's "holds slot n" / "waiting for a
+        // slot"): a wait's start, the slot's taking, and — whatever ends the phase or the wait — its end, below. A phase inside
+        // a phase records none: the outer one's hold is the run's.
+        Worker.WorkerSlot? took = null;
+        var onRecord = false;
+        async Task<T> InSlotAsync(Worker.WorkerSlot slot, bool outermost)
+        {
+            if (owner is not null && recorded is null)
+            {
+                // Under the slot's lock, before the set-up or the phase makes anything in it: the record is what resumes it there.
+                await RecordSlotAsync(owner, slot, ct);
+            }
+            if (outermost && item is not null)
+            {
+                await ledger.CheckpointAsync(item, Steps.SlotHeld, null, SlotUse.Detail(slot.Number, slot.User, what), ct);
+                (took, onRecord) = (slot, true);
+            }
+            return await EnteredAsync();
+        }
+        if (_slots.Held is { } held)
+        {
+            return recorded is { } other && other != held.Number
+                ? throw new InvalidOperationException(
+                    $"Refusing to {what} in worker {held}: {owner!.ExternalId} is worker slot {other}'s, and a phase is one sandbox user's.")
+                : await InSlotAsync(held, outermost: false);
+        }
+        // An item with no slot yet goes where the fewest unfinished items are, so the slots fill evenly rather than in number order.
+        var order = recorded is null && _slots.Count > 1 ? await ledger.SlotsByLoadAsync(_slots.Count, ct) : null;
+        var waitsFor = recorded is { } own && _slots.Count > 1
+            ? $"worker {_slots.Slot(own)} (another run's worker phase holds {_slots.Slot(own).Lock?.Path})"
+            : _slots.Count > 1 ? $"a free worker slot (other runs' worker phases hold all {_slots.Count})"
+            : $"the sandbox user (another run's worker phase holds {_slots.All[0].Lock?.Path})";
+        var (waited, unreadable) = (false, 0);
+        // The slot the item waits for by name: its recorded one, or the only one there is; null: any free one.
+        var wanted = recorded ?? (_slots.Count == 1 ? 1 : (int?)null);
+        try
+        {
+            return await _slots.HoldAsync(recorded, async slot =>
+            {
+                if (waited && item is not null)
+                {
+                    log.WriteLine(_slots.Count > 1
+                        ? $"[lock] {item.ExternalId}: worker {slot} is free; going on to {what}"
+                        : $"[lock] {item.ExternalId}: the sandbox user is free; going on to {what}");
+                    await ThrowIfControlledAsync(item, ct);
+                    await ThrowIfFrozenAsync(item, ct);
+                }
+                return await InSlotAsync(slot, outermost: true);
+            }, ct, async c =>
+            {
+                if (!waited)
+                {
+                    waited = true;
+                    log.WriteLine(_slots.Count > 1
+                        ? $"[lock] {item?.ExternalId ?? "a stop"}: waiting for {waitsFor} to {what}"
+                        : $"[lock] {item?.ExternalId ?? "a stop"}: waiting for the sandbox user to {what} (another run's worker phase holds {_slots.All[0].Lock?.Path})");
+                    if (item is not null)
+                    {
+                        // Once per wait, never per poll of it.
+                        await ledger.CheckpointAsync(item, Steps.SlotWait, null,
+                            SlotUse.Detail(wanted, wanted is { } n ? _slots.Slot(n).User : null, what), c);
+                        onRecord = true;
+                    }
+                }
+                if (item is null)
+                {
+                    return;
+                }
+                try
+                {
+                    await ThrowIfControlledAsync(item, c);
+                    unreadable = 0;
+                }
+                catch (Exception ex) when (ex is not ControlRequestedException and not OperationCanceledException)
+                {
+                    if (++unreadable > _maxControlReadFailures)
+                    {
+                        throw new ControlRequestedException(ControlState.Paused) { ControlsUnreadable = $"{ex.GetType().Name}: {ex.Message}" };
+                    }
+                }
+            }, _controlPoll, report: log.WriteLine, order: order);
+        }
+        finally
+        {
+            if (onRecord)
+            {
+                await SlotReleasedAsync(item!, took, wanted, what);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Records that <paramref name="item"/>'s run no longer holds (<paramref name="took"/>) or waits for (<paramref name="wanted"/>;
+    /// null: any) a worker slot (<see cref="Steps.SlotReleased"/>), however the phase or the wait ended — so on no cancellation
+    /// token, but bounded. A record that cannot be written is logged and left: the phase's own outcome stands, and the stale
+    /// "holds" it leaves is told from a live one by the item's run lock (<see cref="SlotUse"/>).
+    /// </summary>
+    private async Task SlotReleasedAsync(WorkItem item, Worker.WorkerSlot? took, int? wanted, string what)
+    {
+        var slot = took?.Number ?? wanted;
+        using var bounded = new CancellationTokenSource(_failedSessionEndTimeout);
+        try
+        {
+            await ledger.CheckpointAsync(item, Steps.SlotReleased, null,
+                SlotUse.Detail(slot, took?.User ?? (slot is { } n && n <= _slots!.Count ? _slots.Slot(n).User : null), took is null ? $"not taken: the wait to {what} ended" : what),
+                bounded.Token);
+        }
+        catch (Exception ex)
+        {
+            log.WriteLine($"[slot] {item.ExternalId}: could not record that it no longer {(took is null ? "waits for" : "holds")} a worker slot ({ex.GetType().Name}: {ex.Message})");
+        }
+    }
+
+    /// <summary>
+    /// At a run's start, under the item's run lock (so no other run of it is alive): a slot-use row an earlier run left as the
+    /// item's last — <see cref="Steps.SlotHeld"/> or <see cref="Steps.SlotWait"/> with no <see cref="Steps.SlotReleased"/> after
+    /// it, from a run that crashed or was killed inside a worker phase or a wait, or whose release could not be written — is
+    /// ended on the record (<see cref="Steps.SlotReleased"/>, Detail <c>… not recorded: ended with an earlier run</c>), so the
+    /// pipeline page does not show this live run as holding or waiting for that slot until its next worker phase (sc-25991).
+    /// Like <see cref="SlotReleasedAsync"/>: on no cancellation token but bounded, and a failure is only logged (the page then
+    /// still tells the row from a current one, <see cref="Dashboard.RunView"/>).
+    /// </summary>
+    private async Task EndEarlierSlotUseAsync(WorkItem item, IReadOnlyList<LedgerEntry> history)
+    {
+        if (SlotUse.Of(history) is not { Kind: not SlotUseKind.None } use)
+        {
+            return;
+        }
+        using var bounded = new CancellationTokenSource(_failedSessionEndTimeout);
+        try
+        {
+            await ledger.CheckpointAsync(item, Steps.SlotReleased, null,
+                SlotUse.Detail(use.Slot, use.User, $"{use.What} not recorded: ended with an earlier run"), bounded.Token);
+            log.WriteLine($"[slot] {item.ExternalId}: an earlier run ended {(use.Kind == SlotUseKind.Holding ? "holding" : "waiting for")} {use.Named} without recording it; recorded now");
+        }
+        catch (Exception ex)
+        {
+            log.WriteLine($"[slot] {item.ExternalId}: could not record that an earlier run's use of {use.Named} ended ({ex.GetType().Name}: {ex.Message})");
+        }
+    }
+
+    /// <summary>
+    /// The slot the ledger has for <paramref name="item"/> (<see cref="SlotOf"/>; read once per run), or null when it has none.
+    /// </summary>
+    /// <exception cref="Worker.SlotUnavailableException">It is not one of the configured slots (<c>Worker:Slots</c> was lowered).</exception>
+    private async Task<int?> RecordedSlotAsync(WorkItem item, CancellationToken ct)
+    {
+        if (!_slotOf.TryGetValue(item.Id, out var slot))
+        {
+            if (SlotOf(await ledger.HistoryAsync(item, ct)) is not { } recorded)
+            {
+                return null;
+            }
+            _slotOf[item.Id] = slot = recorded;
+        }
+        return slot <= _slots!.Count
+            ? slot
+            : throw new Worker.SlotUnavailableException(
+                $"{item.ExternalId} was started in worker slot {slot} ({Worker.WorkerSlots.UserOf(_slots.All[0].User, slot)}), but Worker:Slots is "
+                + $"{_slots.Count}: its session and worktree are that sandbox user's, and nothing of it is run or deleted as another. Set Worker:Slots to at "
+                + $"least {slot} again (with that user set up: `{Worker.WorkerSlots.ReinstallCommand(slot)}`) and re-run it: it then goes on in slot {slot}. "
+                + $"A re-run without that fails again with this reason, running nothing. Or stop it (`factory stop --item {item.ExternalId}`): it is cancelled, "
+                + "and whatever it left as that user stays on this machine — its worktree, and a worker a crashed run left, which is not stopped.");
+    }
+
+    /// <summary>
+    /// For a stop (<see cref="StopIdleAsync"/>): whether <paramref name="item"/>'s recorded slot is no longer configured
+    /// (<c>Worker:Slots</c> was lowered). Then nothing of it is run or deleted as another user — a worker a crashed run left
+    /// (<paramref name="orphan"/>: its pid) is not stopped, its worktree is not touched — and that is put on the record
+    /// (<see cref="Steps.SlotLeft"/>, once per wording) so the stop goes on to Cancelled and its comment says what stays.
+    /// </summary>
+    private async Task<bool> SlotLeftAsync(WorkItem item, List<LedgerEntry> history, int? orphan, CancellationToken ct)
+    {
+        if (_slots is null || SlotOf(history) is not { } slot || slot <= _slots.Count)
+        {
+            return false;
+        }
+        var detail = SlotLeftDetail(slot, Worker.WorkerSlots.UserOf(_slots.All[0].User, slot), _slots.Count, orphan);
+        if (history.LastOrDefault(e => e.Step == Steps.SlotLeft)?.Detail != detail)
+        {
+            await ledger.CheckpointAsync(item, Steps.SlotLeft, null, detail, ct);
+        }
+        log.WriteLine($"[stopping] {item.ExternalId}: {detail}");
+        return true;
+    }
+
+    /// <summary>What a stop leaves of an item of worker slot <paramref name="slot"/> (<paramref name="user"/>) that is not configured (<see cref="Steps.SlotLeft"/>'s Detail, and the stop comment's last sentences).</summary>
+    internal static string SlotLeftDetail(int slot, string user, int slots, int? orphan) =>
+        $"It was worked in worker slot {slot} ({user}), which is not one of this factory's (Worker:Slots is {slots}), so the stop ran and deleted "
+        + $"nothing as that user: its worktree stays on this machine"
+        + (orphan is { } pid ? $", and the worker a crashed run left (pid {pid}) was NOT stopped and may still be running" : "")
+        + $". Remove them by hand as root, or set Worker:Slots to at least {slot} again: the next worker phase in that slot ends every process of {user} "
+        + "and its worktree sweep deletes the worktree.";
+
+    /// <summary>Records <paramref name="slot"/> as <paramref name="item"/>'s (<see cref="Steps.Slot"/>); a one-slot factory writes no row.</summary>
+    private async Task RecordSlotAsync(WorkItem item, Worker.WorkerSlot slot, CancellationToken ct)
+    {
+        if (_slots!.Count > 1)
+        {
+            await ledger.CheckpointAsync(item, Steps.Slot, null, $"{slot.Number} {slot.User}", ct);
+            log.WriteLine($"[slot] {item.ExternalId}: worker {slot}");
+        }
+        _slotOf[item.Id] = slot.Number;
+    }
+
+    /// <summary>
+    /// Runs <paramref name="work"/> — owner-side work that makes a worktree of <paramref name="item"/> and runs no launch helper,
+    /// so no worker phase (the merge queue's base update) — with the worktree shared with the item's slot's user
+    /// (<see cref="Worker.WorkerSlots.AssignedAsync{T}"/>): its recorded slot, or for an item that has none yet (a plan item that
+    /// never needed a planner in this factory) the one with the fewest unfinished items, recorded now. Nothing is waited for: the
+    /// share is the owner's own <c>chmod</c>. With one slot, or inside a worker phase, <paramref name="work"/> just runs.
+    /// </summary>
+    private async Task<T> InItemSlotAsync<T>(WorkItem item, Func<Task<T>> work, CancellationToken ct)
+    {
+        if (_slots is null || _slots.Count == 1 || _slots.Held is not null)
+        {
+            return await work();
+        }
+        if (await RecordedSlotAsync(item, ct) is not { } slot)
+        {
+            slot = (await ledger.SlotsByLoadAsync(_slots.Count, ct))[0];
+            await RecordSlotAsync(item, _slots.Slot(slot), ct);
+        }
+        return await _slots.AssignedAsync(slot, work);
+    }
+
+    private Task InWorkerPhaseAsync(WorkItem? item, string what, Func<Task> phase, CancellationToken ct) =>
+        InWorkerPhaseAsync(item, what, async () => { await phase(); return true; }, ct, null);
 
     /// <summary>
     /// The factory's configured repositories (<c>FactoryOptions.ConfiguredRepos</c>; the default repository alone when not given): the
@@ -122,9 +407,6 @@ public sealed partial class RunPipeline(
     /// attempt fails and one fresh session (in a fresh worktree) retries Implement; a second escalates.
     /// </summary>
     public const int MaxStuckImplementSessions = 2;
-
-    /// <summary>The Shortcut source's ledger name (<see cref="ItemNaming.Shortcut"/>); a pipeline names items by its source's <see cref="Naming"/>.</summary>
-    public const string Source = "shortcut";
 
     /// <summary>How this pipeline's source names its items (ledger source, external id, branch).</summary>
     private ItemNaming Naming => source.Naming;
@@ -155,6 +437,33 @@ public sealed partial class RunPipeline(
     {
         /// <summary>The worker process exists; Detail is its pid.</summary>
         public const string WorkerStarted = "worker-started";
+        /// <summary>
+        /// The worker slot the item is in (sc-25989, E7), written under that slot's lock at the item's first worker phase, before
+        /// its first worktree or session exists; Detail is the slot's number, then its sandbox user (<c>2 _factory2</c>). Every
+        /// later worker phase of the item — a resume, a fix round, the gate's test runs, the stop of a leftover worker — waits
+        /// for that slot (<see cref="SlotOf"/>). A one-slot factory writes none.
+        /// </summary>
+        public const string Slot = "slot";
+        /// <summary>
+        /// A stop found the item's recorded slot no longer configured (sc-25989: <c>Worker:Slots</c> was lowered), so it stopped no
+        /// leftover worker and removed no worktree — nothing is run or deleted as another user; Detail (<see cref="SlotLeftDetail"/>)
+        /// says what stays on the machine, and the stop comment repeats it. The stop itself goes on to Cancelled. Outcome failed.
+        /// </summary>
+        public const string SlotLeft = "slot-left";
+        /// <summary>
+        /// The run started waiting for a worker slot another run's worker phase holds (sc-25991; <see cref="SlotUse"/>): written
+        /// once per wait, Detail the slot waited for (<c>any -</c> for a free one) and what the phase will do. Outcome passed: a
+        /// wait is no failure.
+        /// </summary>
+        public const string SlotWait = "slot-wait";
+        /// <summary>The run's worker phase has its slot (sc-25991): Detail the slot, its user and what the phase does (<c>2 _factory2 implement</c>).</summary>
+        public const string SlotHeld = "slot-held";
+        /// <summary>
+        /// The run no longer holds or waits for a slot (sc-25991): its worker phase ended, however it ended, or its wait did
+        /// without the slot (a Pause, a Stop, the freeze; Detail then says <c>not taken</c>). A run that died writes none — the
+        /// item's run lock tells its stale <see cref="SlotHeld"/> from a live one.
+        /// </summary>
+        public const string SlotReleased = "slot-released";
         public const string Session = "session";
         public const string WorkerDone = "worker-done";
         public const string Pushed = "pushed";
@@ -367,6 +676,11 @@ public sealed partial class RunPipeline(
         /// <summary>Planned: no story of the plan is failed any more (a person re-ran the failed one); the hold a failed story put on it is lifted.</summary>
         public const string PlanResumed = "plan-resumed";
         /// <summary>
+        /// Planned (sc-25984): the plan item's claim, which a <see cref="PlanHeld"/> row <c>claim lost: …</c> recorded as someone
+        /// else's (<see cref="ClaimLostAsync"/>), is the factory's again; the plan is evaluated again from this row on.
+        /// </summary>
+        public const string PlanClaimRegained = "plan-claim-regained";
+        /// <summary>
         /// Planned: the plan item's comment for the latest <see cref="PlanHeld"/> (failed story), <see cref="PlanStuck"/> or
         /// <see cref="PlanResumed"/> row; Detail is <c>posted</c> or <c>failed: …</c> (tried again by the next evaluations, up to
         /// <see cref="MaxPlanNoticeAttempts"/>).
@@ -460,7 +774,9 @@ public sealed partial class RunPipeline(
             {
                 [WorkState.Intake] = IntakeAsync,
                 [WorkState.Plan] = PlanAsync,
-                [WorkState.Implement] = ImplementAsync,
+                // A worker phase from the orphan's stop to the worktree's removal (sc-25988): nothing else may run as the sandbox user
+                // between the session and its push.
+                [WorkState.Implement] = (run, ct) => InWorkerPhaseAsync(run.Item, "implement", () => ImplementAsync(run, ct), ct),
             };
             if (gate is not null)
             {
@@ -494,17 +810,26 @@ public sealed partial class RunPipeline(
     /// state and those paused in one in a way that resumes by itself (<see cref="ResumesAutomatically"/>, not parked), and plan items
     /// waiting on their stories (<see cref="WorkState.Planned"/>, sc-25871: each poll releases what is unblocked; no worker runs).
     /// </summary>
+    /// <param name="naming">The source whose items to list: each source's items are listed, and run, by its own intake lane (sc-25982).</param>
     /// <param name="handled">The states the runner's pipeline drives; default <see cref="HandledStates"/> (production).</param>
-    /// <param name="naming">The source whose items to list; default Shortcut stories.</param>
-    public static async Task<IReadOnlyList<int>> InFlightAsync(WorkLedger ledger, CancellationToken ct, IControls? controls = null,
-        IReadOnlySet<WorkState>? handled = null, ItemNaming? naming = null)
+    public static async Task<IReadOnlyList<int>> InFlightAsync(WorkLedger ledger, ItemNaming naming, CancellationToken ct, IControls? controls = null,
+        IReadOnlySet<WorkState>? handled = null) =>
+        [.. (await InFlightItemsAsync(ledger, naming, ct, controls, handled)).Select(i => i.Id)];
+
+    /// <summary>
+    /// <see cref="InFlightAsync"/>, each item with what its run does (sc-25992, <see cref="IItemRunner.InFlightItemsAsync"/>): an item
+    /// being stopped (<see cref="InFlightItem.Stopping"/>) and a plan item waiting on its stories (<see cref="InFlightItem.WaitingPlan"/>,
+    /// <see cref="WorkState.Planned"/>: its run evaluates the plan and ends, <see cref="HoldAsync"/>) are run by the intake loop
+    /// outside its run capacity.
+    /// </summary>
+    public static async Task<IReadOnlyList<InFlightItem>> InFlightItemsAsync(WorkLedger ledger, ItemNaming naming, CancellationToken ct,
+        IControls? controls = null, IReadOnlySet<WorkState>? handled = null)
     {
         controls ??= NoControls.Instance;
         handled ??= HandledStates;
-        naming ??= ItemNaming.Shortcut;
         var stopping = (await controls.ListAsync(ct)).Where(c => c.State == ControlState.Stopping).Select(c => c.Scope).ToHashSet();
-        var stops = new List<int>();
-        var ids = new List<int>();
+        var stops = new List<InFlightItem>();
+        var ids = new List<InFlightItem>();
         var active = await ledger.ActiveItemsAsync(naming.Source, ct);
         // A merged item whose closeout failed is listed until it is posted or its attempts are used up (a run retries it from Watch);
         // a finished plan whose closeout failed likewise (it waits in Planned).
@@ -530,10 +855,62 @@ public sealed partial class RunPipeline(
             }
             if (naming.TryParse(item.ExternalId, out var id))
             {
-                (beingStopped ? stops : ids).Add(id);
+                (beingStopped ? stops : ids).Add(new InFlightItem(id, Stopping: beingStopped,
+                    WaitingPlan: !beingStopped && item.State == WorkState.Planned));
             }
         }
         return [.. stops, .. ids];
+    }
+
+    /// <summary>
+    /// Story ids of the items whose claim an intake poll keeps (sc-25983; <see cref="IItemRunner.RenewableAsync"/>,
+    /// <see cref="IWorkSource.RenewClaimAsync"/>), oldest first: every item the ledger would resume by itself — in a handled state,
+    /// or paused from one in a way that resumes by itself (<see cref="ResumesAutomatically"/>: <c>interrupted</c>,
+    /// <c>user-paused</c>, <c>usage-paused</c>, <c>freeze-paused</c>, <c>controls-unreadable</c>) — WHATEVER the factory, epic,
+    /// item, usage and freeze controls say now. Unlike <see cref="InFlightAsync"/>, which leaves out what a control pauses: a
+    /// pause only holds an item for a while (a freeze until a human's Continue, however long that takes), and a claim that lapsed
+    /// meanwhile would leave the board showing nobody on an item the factory resumes. Also listed (sc-25984): a plan item waiting
+    /// on its stories (<see cref="WorkState.Planned"/>) — it has no handler, but the factory drives it for as long as its stories
+    /// take, often more than a claim's lifetime, and then takes its changeset pull request through the gate; a plan item whose
+    /// claim is lost stays listed and is not paused — it has no state to pause from — but is not evaluated while the claim is
+    /// someone else's (<see cref="ClaimLostAsync"/>: one <c>plan-held</c> row <c>claim lost: …</c>; nothing of it is released and
+    /// no changeset pull request opened until a renewal holds again). Not listed, so not
+    /// renewed: an item being stopped (its own Stop or its plan's; the stop gives the claim back), a parked one (a refused or a
+    /// lost claim, a give-up), an escalated one, a merged or finished one. This is never a list of what to run.
+    /// The controls are read only to leave out an item being stopped: when they cannot be read the item is listed (a claim renewed
+    /// on an item whose stop then releases it costs nothing; an unreadable control must not cost every item its claim), so this
+    /// throws only when the ledger itself cannot be read.
+    /// </summary>
+    /// <param name="naming">The source whose items to list: each lane renews its own source's claims (sc-25982; no default source).</param>
+    /// <param name="handled">The states the runner's pipeline drives; default <see cref="HandledStates"/> (production).</param>
+    public static async Task<IReadOnlyList<int>> RenewableAsync(WorkLedger ledger, ItemNaming naming, CancellationToken ct, IControls? controls = null,
+        IReadOnlySet<WorkState>? handled = null)
+    {
+        controls ??= NoControls.Instance;
+        handled ??= HandledStates;
+        var ids = new List<int>();
+        foreach (var item in await ledger.ActiveItemsAsync(naming.Source, ct))
+        {
+            var resumes = handled.Contains(item.State) || item.State == WorkState.Planned
+                || (item.State == WorkState.Paused && ResumesAutomatically(await ledger.HistoryAsync(item, ct), handled));
+            if (!resumes || !naming.TryParse(item.ExternalId, out var id))
+            {
+                continue;
+            }
+            try
+            {
+                if (await controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) == ControlState.Stopping)
+                {
+                    continue;
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                // Unreadable controls: renewed all the same (see above).
+            }
+            ids.Add(id);
+        }
+        return ids;
     }
 
     private static bool ResumesAutomatically(List<LedgerEntry> history, IReadOnlySet<WorkState> handled)
@@ -556,15 +933,6 @@ public sealed partial class RunPipeline(
         // Decide from the ledger (and the controls) before reading anything from the board.
         var known = await ledger.FindAsync(Naming.Source, Naming.Format(storyId), ct);
         var knownControl = known is null ? ControlState.Running : await _controls.EffectiveAsync(known.ExternalId, known.EpicId, ct);
-        if (_workerless && (known?.State != WorkState.Planned || knownControl == ControlState.Stopping))
-        {
-            // Decided since the runner looked (a Stop landed, or the item moved): this run holds no worker run lock, so it must not
-            // stop an orphaned worker (sandboxed: every worker-user process) or touch a worktree while another process's worker runs.
-            var why = knownControl == ControlState.Stopping ? "stop deferred to the next run" : "deferred to the next run";
-            log.WriteLine($"[{known?.State.ToString() ?? "intake"}] {Naming.Format(storyId)}: {why} (this run was started without the worker run lock)");
-            return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null,
-                $"{Naming.Format(storyId)}: {why}; this run was started without the worker run lock");
-        }
         if (known is not null && knownControl == ControlState.Stopping)
         {
             // A stop is finished even while the factory is frozen: it starts no new work.
@@ -635,6 +1003,7 @@ public sealed partial class RunPipeline(
             log.WriteLine($"[{item.State}] {item.ExternalId} is already running; not touching it.");
             return new RunOutcome(item.Id, item.State, null, null, $"{item.ExternalId} is already running.");
         }
+        await EndEarlierSlotUseAsync(item, await ledger.HistoryAsync(item, ct));
         // A plan item taking one of its changesets through the gate (sc-25873) works in that changeset's repository until it has
         // merged: the pull request, the gate policy, CI and the merge queue are that repository's. Any other item, and a plan item
         // in any other state, works in the repository its story names. Decided from the rows read under the run lock, never from
@@ -706,6 +1075,22 @@ public sealed partial class RunPipeline(
         {
             var pausedFrom = (await ledger.ContextAsync(item, ct)).PausedFrom
                 ?? throw new InvalidOperationException($"{item.ExternalId} is paused but its ledger has no state to return to.");
+            // Paused because another caller took its claim (sc-25983): it is resumed only once the item is the factory's again.
+            // The source is asked before anything is recorded — it takes a lapsed or released claim back — and while someone
+            // else still holds the item (or the board will not say) the item stays as it is: no row, nothing written to the board.
+            if (ParkedForLostClaim(await ledger.HistoryAsync(item, ct)))
+            {
+                var renewal = await source.RenewClaimAsync(storyId, ct);
+                if (!renewal.IsHeld)
+                {
+                    var why = renewal.Lost is { } lost
+                        ? $"{item.ExternalId} is still not the factory's to work ({ClaimLost}: {lost}); it stays paused"
+                        : $"{item.ExternalId} stays paused: its claim was lost and the board would not confirm it is the factory's again ({renewal.NotRenewed})";
+                    log.WriteLine($"[paused] {why}");
+                    return await OutcomeAsync(item, $"{why}. Run `factory run {item.ExternalId}` again once the other claim is released or "
+                        + $"has lapsed, or `factory stop --item {item.ExternalId}` to give the item up.", ct);
+                }
+            }
             await ledger.RecordAsync(item, pausedFrom, null, "unpaused", ct);
         }
         log.WriteLine($"[{item.State}] {item.ExternalId} \"{story.Name}\" -> {repo}");
@@ -846,6 +1231,7 @@ public sealed partial class RunPipeline(
             return new RunOutcome(item.Id, item.State, null, null, $"{item.ExternalId} is already running.");
         }
         await ledger.RefreshAsync(item, item.Title, item.Repo, item.EpicId, ct);
+        await EndEarlierSlotUseAsync(item, await ledger.HistoryAsync(item, ct));
         var history = await ledger.HistoryAsync(item, ct);
         if (gate is not null && CloseoutPending(item.State, history))
         {
@@ -859,14 +1245,8 @@ public sealed partial class RunPipeline(
             var evaluated = await PlannedAsync(item, storyId, history, ct);
             // A Stop that landed while the plan was evaluated (sc-25876): nothing watches a control during the evaluation, so this
             // run finishes the stop now, under the run lock it holds — the plan item is not left Stopping with nobody acting on it.
-            // A run started without the worker run lock defers it, as it does a Stop it finds at its start.
             if (!Lifecycle.IsTerminal(item.State) && await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) == ControlState.Stopping)
             {
-                if (_workerless)
-                {
-                    log.WriteLine($"[{item.State}] {item.ExternalId}: stop deferred to the next run (this run was started without the worker run lock)");
-                    return evaluated with { Error = $"{item.ExternalId}: stop deferred to the next run; this run was started without the worker run lock" };
-                }
                 return await FinishStopAsync(item, storyId, RepoRef.Parse(item.Repo), null, workerStillRunning: false);
             }
             return evaluated;
@@ -880,9 +1260,7 @@ public sealed partial class RunPipeline(
             var id = Naming.Format(storyId);
             try
             {
-                await source.CommentAsync(storyId,
-                    $"{id} is {item.State} in the factory ledger and nothing in this phase of the factory moves it on from there, "
-                    + "so the factory is not working on it whatever its board state.", ct);
+                await source.CommentAsync(storyId, HeldNoticeText(id, item.State), ct);
                 await ledger.CheckpointAsync(item, Steps.HeldNotice, null, "posted", ct);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -893,6 +1271,14 @@ public sealed partial class RunPipeline(
         log.WriteLine($"[{item.State}] {item.ExternalId} is {item.State}; nothing to do.");
         return await OutcomeAsync(item, item.State == WorkState.Cancelled ? $"{item.ExternalId} is Cancelled." : null, ct);
     }
+
+    /// <summary>
+    /// The once-only notice (a <see cref="Steps.HeldNotice"/> row) a run posts on an item that nothing in this phase of the factory
+    /// moves on from <paramref name="state"/> — e.g. a merged item in Watch, run again.
+    /// </summary>
+    internal static string HeldNoticeText(string id, WorkState state) =>
+        $"{id} is {state} in the factory ledger and nothing in this phase of the factory moves it on from there, "
+        + "so the factory is not working on it whatever its board state.";
 
     /// <summary>The story left the watch scope while the item was in flight: park it, comment once, and stop.</summary>
     private async Task<RunOutcome> ParkOutOfScopeAsync(WorkItem item, int storyId, CancellationToken ct)
@@ -1390,9 +1776,12 @@ public sealed partial class RunPipeline(
         : result.UsageLimited ? UsagePause.WorkerRateLimited
         : null;
 
-    /// <summary>What the worker handed <paramref name="story"/> reads: the owner's story, or an issue item's approved triage (never the issue's text).</summary>
+    /// <summary>
+    /// What the worker handed <paramref name="story"/> reads: the owner's story (an item of a trusted source,
+    /// <see cref="ItemNaming.Trusted"/>), or an issue item's approved triage (never the issue's text).
+    /// </summary>
     private static WorkerInput SpecInput(WorkStory story) =>
-        story.Kind == ItemNaming.GitHubIssue ? WorkerInput.TriageSummary : WorkerInput.Story;
+        story.Kind.Trusted ? WorkerInput.Story : WorkerInput.TriageSummary;
 
     /// <summary>
     /// The push grant for the current worker attempt (E4): every session the attempt recorded (read fresh, so a session id that
@@ -1413,12 +1802,31 @@ public sealed partial class RunPipeline(
         }
     }
 
+    /// <summary>
+    /// Removes a worktree. Sandboxed, the worker user deletes it first, through the launch helper, so it happens under the sandbox
+    /// user's lock (sc-25988): inside a worker phase at once; outside one (an escalation's or a stop's clean-up, the merge queue's
+    /// base-update worktree) only if the lock is free now — a run does not hold its item, or its repository's queue turn, for
+    /// another run's whole worker session to throw a directory away. Left behind, it is deleted by the sweep the next worker phase
+    /// of any run starts with, or replaced by this item's next worktree. False when it is still there.
+    /// </summary>
     private async Task<bool> RemoveWorktreeAsync(RepoRef repo, Workspace workspace)
     {
         try
         {
-            await workspaces.RemoveAsync(repo, workspace, CancellationToken.None);
-            return true;
+            if (_slots is null)
+            {
+                await workspaces.RemoveAsync(repo, workspace, CancellationToken.None);
+                return true;
+            }
+            // The slot whose user the worktree was shared with (sc-25989): the item's own, which a worker phase holds already.
+            if (await _slots.TryHoldForAsync(workspace.Path, _ => workspaces.RemoveAsync(repo, workspace, CancellationToken.None), CancellationToken.None))
+            {
+                return true;
+            }
+            log.WriteLine(Worker.WorkerSlots.LeftForeign(workspace.Path) is { } foreign
+                ? Worker.WorkerSlots.LeftReport(workspace.Path, foreign)
+                : $"[cleanup] the sandbox user is busy (another run's worker phase); leaving {workspace.Path} for the next worker phase's sweep");
+            return false;
         }
         catch (Exception ex)
         {
@@ -1504,7 +1912,7 @@ public sealed partial class RunPipeline(
     /// <summary>Whether a user's Pause holds the item: on the factory, its epic, the item itself or the plan it is a story of (sc-25876).</summary>
     private async Task<bool> UserPausedAsync(WorkItem item)
     {
-        List<string> scopes = item.EpicId is { } epic
+        List<string> scopes = ItemNaming.EpicOf(item.ExternalId, item.EpicId) is { } epic
             ? [ControlScope.Factory, ControlScope.Epic(epic), ControlScope.Item(item.ExternalId)]
             : [ControlScope.Factory, ControlScope.Item(item.ExternalId)];
         if (item.PlanItemId is { } plan && await ledger.ItemAsync(plan, CancellationToken.None) is { } planItem)
@@ -1542,7 +1950,16 @@ public sealed partial class RunPipeline(
         {
             var history = await ledger.HistoryAsync(item, ct);
             var attempt = CurrentWorkerAttempt(history);
-            if (OrphanedWorkerPid(attempt) is { } pid && await worker.StopOrphanAsync(pid, ct))
+            // An item of a slot that is no longer configured (sc-25989) is still stopped — "stop it" is the remedy its failure
+            // names — but with nothing run or deleted as another user: no helper for its leftover worker, its worktree untouched.
+            if (await SlotLeftAsync(item, history, OrphanedWorkerPid(attempt), ct))
+            {
+                return await FinishStopAsync(item, storyId, repo, null, workerStillRunning: false);
+            }
+            // Sandboxed, the stop of a leftover worker is a run of the launch helper (it kills every process of the sandbox user):
+            // a worker phase, waited for, so it never lands under another run's worker.
+            if (OrphanedWorkerPid(attempt) is { } pid
+                && await InWorkerPhaseAsync(null, $"stop {item.ExternalId}'s leftover worker", () => worker.StopOrphanAsync(pid, ct), ct, slotOf: item))
             {
                 await ledger.CheckpointAsync(item, Steps.OrphanKilled, null, $"pid {pid}", ct);
             }
@@ -1809,7 +2226,10 @@ public sealed partial class RunPipeline(
                 start = i + 1;
             }
         }
-        return history.Skip(start).ToList();
+        // Not the slot's bookkeeping (the item's slot, sc-25989, and the run's use of it, sc-25991): those rows are written as a
+        // worker phase starts, before the attempt has made anything, so an attempt holding only them is a fresh one — not a
+        // resume that would look for a worktree and record it lost.
+        return history.Skip(start).Where(e => !SlotUse.IsBookkeeping(e.Step)).ToList();
     }
 
     /// <summary>
@@ -1874,7 +2294,7 @@ public sealed partial class RunPipeline(
             // that keeps failing): it may not escalate (it stays Planned and goes on by itself once the cause is gone), so it is
             // told once per reason — one comment, one row — and not again while that row is still its last.
             var detail = Plans.PlanRelease.NotEvaluatedPrefix + reason;
-            if ((await ledger.HistoryAsync(known, ct)).LastOrDefault() is { Step: Steps.PlanHeld } last && last.Detail == detail)
+            if ((await ledger.HistoryAsync(known, ct)).LastOrDefault(e => !SlotUse.IsBookkeeping(e.Step)) is { Step: Steps.PlanHeld } last && last.Detail == detail)
             {
                 log.WriteLine($"[{known.State}] {id} still cannot be evaluated: {reason}; already commented");
                 return "held; already commented for this reason";
@@ -1917,6 +2337,112 @@ public sealed partial class RunPipeline(
         return null;
     }
 
+    /// <summary>The Paused row's detail prefix when the factory lost its claim on an item it was working (sc-25983).</summary>
+    public const string ClaimLost = "claim lost";
+
+    public static bool IsClaimLost(string? detail) => detail?.StartsWith(ClaimLost, StringComparison.Ordinal) == true;
+
+    /// <summary>
+    /// Whether the item is paused because its claim was lost (<see cref="ClaimLostAsync"/>): its last transition is Paused and
+    /// that row, or a <c>parked</c> row after it (an item already paused when the claim was lost), says so.
+    /// </summary>
+    private static bool ParkedForLostClaim(List<LedgerEntry> history)
+    {
+        var paused = history.FindLastIndex(e => e.Step is null);
+        return paused >= 0 && history[paused].State == WorkState.Paused
+            && history.Skip(paused).Any(e => (e.Step is null || e.Step == Steps.Parked) && IsClaimLost(e.Detail));
+    }
+
+    /// <summary>
+    /// How a waiting plan item's claim is recorded as lost (sc-25984): the Detail of its <c>plan-held</c> row <c>claim lost: …</c>
+    /// when no <c>plan-claim-regained</c> row follows it, else null. Told apart from the other <c>plan-held</c> rows by its prefix
+    /// (<see cref="ClaimLost"/>; the others: a blocker outside the plan, <c>not evaluated: </c>, <c>held by a failed story: </c>).
+    /// </summary>
+    internal static string? PlanClaimLost(IReadOnlyList<LedgerEntry> history) =>
+        history.LastOrDefault(e => e.Step == Steps.PlanClaimRegained || (e.Step == Steps.PlanHeld && IsClaimLost(e.Detail)))
+            is { Step: Steps.PlanHeld } lost ? lost.Detail : null;
+
+    /// <summary>
+    /// The intake poll's claim renewal found an item held by another caller (sc-25983; see
+    /// <see cref="IItemRunner.ClaimLostAsync"/>, <see cref="IWorkSource.RenewClaimAsync"/>): under the item's run lock the item is
+    /// paused — Paused <c>claim lost: &lt;reason&gt;</c> from a handled state, then <c>parked</c> with the reason, which names
+    /// the other claimant; an item already paused (one that resumes by itself) is parked where it is — and the item is told once,
+    /// with what resumes it. The comment is posted before the <c>parked</c> row, so a comment the board would not take is on
+    /// record (<c>…; comment NOT posted: &lt;error&gt;</c>): the item is never listed again, so nothing would post it later.
+    /// Deliberately parked, so it is not one of the pauses that resume by themselves
+    /// (<see cref="ResumesAutomatically"/>): someone else is working the item, the factory writes nothing more to it, no poll lists
+    /// it (so its claim is not renewed either), and only a person's <c>factory run</c> takes it up again, from where it paused —
+    /// and only once the item is the factory's again: that run asks the source first (<see cref="IWorkSource.RenewClaimAsync"/>,
+    /// which takes a released or lapsed claim back) and, while someone else still holds the item, records nothing and writes
+    /// nothing to the board (<see cref="ParkedForLostClaim"/>).
+    /// Typed outcome: deferred (set aside, not judged), like every pause. Returns what was done, or null when nothing was: the
+    /// ledger does not know the item, it is being stopped (the stop gives the item back anyway), its run is active (that run goes
+    /// on — the board's claims are advisory — and the next poll finds the claim lost again), or it is in a state a lost claim does
+    /// not matter in (a merged item).
+    /// A plan item waiting on its stories (Planned, sc-25984) has no state to pause from and resumes by itself, so it is neither
+    /// paused nor parked nor commented on (the item is someone else's): it gets one <c>plan-held</c> row <c>claim lost:
+    /// &lt;reason&gt;</c> — not again while that is how its claim is recorded (<see cref="PlanClaimLost"/>) — and what was done is
+    /// returned, so the poll leaves it out of its runs and shows it. While the claim is recorded lost no evaluation releases a
+    /// story, opens or links a changeset pull request (<see cref="PlannedAsync"/> asks the source first, also on a
+    /// <c>factory run</c> by hand); the item stays listed for renewal, and the first evaluation after a renewal that holds
+    /// records <c>plan-claim-regained</c> and goes on.
+    /// </summary>
+    public static async Task<string?> ClaimLostAsync(IWorkSource source, WorkLedger ledger, IRunLocks locks, int storyId, string reason,
+        TextWriter log, CancellationToken ct, IControls? controls = null)
+    {
+        var id = source.Naming.Format(storyId);
+        if (await ledger.FindAsync(source.Naming.Source, id, ct) is not { } known)
+        {
+            return null;
+        }
+        if (await (controls ?? NoControls.Instance).EffectiveAsync(known.ExternalId, known.EpicId, ct) == ControlState.Stopping)
+        {
+            return null;
+        }
+        await using var runLock = await locks.TryAcquireAsync(known.Id, ct);
+        if (runLock is null)
+        {
+            log.WriteLine($"[{known.State}] {id} lost its claim ({reason}) while a run of it is active; not touching it.");
+            return null;
+        }
+        await ledger.RefreshAsync(known, known.Title, known.Repo, known.EpicId, ct);
+        if (known.State == WorkState.Planned)
+        {
+            var detail = $"{ClaimLost}: {reason}";
+            if (PlanClaimLost(await ledger.HistoryAsync(known, ct)) != detail)
+            {
+                await ledger.CheckpointAsync(known, Steps.PlanHeld, null, detail, ct);
+            }
+            log.WriteLine($"[{known.State}] {id} held: {detail}; not evaluated until its claim is the factory's again");
+            return $"held ({detail}); not evaluated, nothing of the plan released, until its claim is the factory's again";
+        }
+        var from = known.State == WorkState.Paused ? (await ledger.ContextAsync(known, ct)).PausedFrom : known.State;
+        if (from is not { } pausedAt || !HandledStates.Contains(pausedAt))
+        {
+            return null;
+        }
+        if (known.State != WorkState.Paused)
+        {
+            await ledger.RecordAsync(known, WorkState.Paused, null, $"{ClaimLost}: {reason}", ct);
+        }
+        string? notPosted = null;
+        try
+        {
+            await source.CommentAsync(storyId,
+                $"{id}: the factory lost its claim on this {source.Naming.Noun} — {reason} — so it paused its work on it (at {pausedAt}) "
+                + "and writes nothing more to it. Once the item is the factory's to work again (the other claim released or lapsed), "
+                + $"run `factory run {id}` to resume it where it paused, or `factory stop --item {id}` to give it up.", ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            log.WriteLine($"[paused] could not comment on {id}: {ex.Message}");
+            notPosted = $"; comment NOT posted: {ex.Message}";
+        }
+        await ledger.CheckpointAsync(known, Steps.Parked, null, $"{ClaimLost}: {reason}{notPosted}", ct);
+        log.WriteLine($"[paused] {id} parked: {ClaimLost}: {reason}{notPosted}");
+        return $"paused ({ClaimLost}: {reason}){notPosted}";
+    }
+
     /// <summary>Records Escalated and comments on the story. Returns why the comment failed, or null.</summary>
     private async Task<string?> EscalateAsync(Run run, string reason)
     {
@@ -1948,7 +2474,8 @@ public sealed partial class RunPipeline(
     {
         var history = await ledger.HistoryAsync(item, ct);
         var at = history.FindLastIndex(e => e.Step is null && e.State == WorkState.Escalated);
-        var (escalated, last) = (history[at], history[at - 1]);
+        // The step the run reached: not a slot's bookkeeping (sc-25991), which a worker phase's end writes before the Escalated row.
+        var (escalated, last) = (history[at], history.Take(at).Last(e => !SlotUse.IsBookkeeping(e.Step)));
         var (reason, session) = (escalated.Detail, escalated.ClaudeSessionId);
         var lastState = $"{last.State}{(last.Step is null ? "" : $" (after step {last.Step})")} at {last.RecordedAt:u}";
         // A plan of several repositories (sc-25873) may be partly delivered: the record first, then the comment says the same.

@@ -4,6 +4,7 @@ using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 using Microsoft.EntityFrameworkCore;
+using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.AcceptanceTests;
 
@@ -34,7 +35,7 @@ public class FreezeAndStuckTests
     private static async Task<RunOutcome> FactoryRunAsync(FactoryOptions options, int storyId, CancellationToken ct)
     {
         using var shortcutHttp = OutboundHttp.ShortcutApi();
-        return await FactoryRunner.RunAsync(options, FactoryRunner.CreateWorkSource(options, shortcutHttp), storyId, ignoreScope: true, Console.Out, ct);
+        return await FactoryRunner.RunAsync(options, WorkSourceRegistry.Shortcut(options, shortcutHttp), storyId, ignoreScope: true, Console.Out, ct);
     }
 
     /// <summary>The run was deferred by the freeze with <paramref name="trigger"/>: no ledger row for the story, the story untouched.</summary>
@@ -67,7 +68,7 @@ public class FreezeAndStuckTests
             var ledger = new WorkLedger(db, TimeProvider.System);
             for (var i = 1; i <= n; i++)
             {
-                var item = await ledger.GetOrCreateAsync(RunPipeline.Source, StoryId.Format(900_000_000 + i), $"[dark-factory e2e] seeded escalation {i}",
+                var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, StoryId.Format(900_000_000 + i), $"[dark-factory e2e] seeded escalation {i}",
                     options.DefaultRepo.FullName, null, ct);
                 await ledger.RecordAsync(item, WorkState.Implement, null, null, ct);
                 await ledger.RecordAsync(item, WorkState.Escalated, null, "seeded by the acceptance test: the run failed", ct);

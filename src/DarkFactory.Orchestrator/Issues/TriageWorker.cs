@@ -2,14 +2,21 @@ using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Sessions;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 
 namespace DarkFactory.Orchestrator.Issues;
 
 /// <summary>
+/// A triage that did not start (sc-25988): while it waited for the sandbox user — another run's worker phase had it — a control came
+/// to hold its item (a Pause, the usage pause, the freeze, a Stop). Not a failure of the issue or of the factory: nothing ran, nothing
+/// is recorded or counted, and the intake reads the issue again on a later poll (where the same control keeps it from starting).
+/// </summary>
+public sealed class TriageDeferredException(string message) : Exception(message);
+
+/// <summary>
 /// Runs the triage worker for one issue (a read-only worker session through the router, unpinned, on
-/// <see cref="WorkerModelClass.Triage"/>, E8).
+/// <see cref="WorkerModelClass.Triage"/>, E8). <see cref="ITriageRunner.RunAsync"/> throws <see cref="TriageDeferredException"/>
+/// when nothing ran because a control came to hold the item while the triage waited for the sandbox user.
 /// </summary>
 public interface ITriageRunner
 {

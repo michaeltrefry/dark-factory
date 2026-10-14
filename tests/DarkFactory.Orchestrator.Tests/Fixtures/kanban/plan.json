@@ -1,0 +1,703 @@
+{
+  "recorded_from": "hosted KanbanBoard",
+  "parameters": {
+    "project": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+    "projectKey": "DFFIX16A87D2D",
+    "parent": "b10af0ce-def6-4135-870a-4764314fcdbb",
+    "children": [
+      "b986bffb-f228-452e-b19a-67034c5bf0b7",
+      "c4633fc6-9721-430a-a27d-1cf203860290"
+    ]
+  },
+  "interactions": [
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "b10af0ce-def6-4135-870a-4764314fcdbb"
+      },
+      "isError": false,
+      "answer": {
+        "id": "b10af0ce-def6-4135-870a-4764314fcdbb",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
+        "epic": {
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
+          "name": "[dark-factory fixture] epic"
+        },
+        "title": "[dark-factory fixture] plan item",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Story",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 7,
+        "estimate": null,
+        "labels": "plan",
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:43:03.861375+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:03.861377+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 1,
+        "label_list": [
+          "plan"
+        ]
+      }
+    },
+    {
+      "tool": "create_work_item",
+      "arguments": {
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] child 1",
+        "type": "Task",
+        "idempotency_key": "dark-factory:child:b10af0ce-def6-4135-870a-4764314fcdbb:6784c89c3d21cb6b3bde0818521abd95d3aa3f4e6b351da4c41cf4b1f08165bf",
+        "description": "First step of the plan.",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535"
+      },
+      "isError": false,
+      "answer": {
+        "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
+        "epic": {
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
+          "name": "[dark-factory fixture] epic"
+        },
+        "title": "[dark-factory fixture] child 1",
+        "description": "First step of the plan.",
+        "type": "Task",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 1,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:43:04.35415+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:04.354152+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 1,
+        "label_list": [],
+        "created": true
+      }
+    },
+    {
+      "tool": "create_work_item",
+      "arguments": {
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] child 2",
+        "type": "Story",
+        "idempotency_key": "dark-factory:child:b10af0ce-def6-4135-870a-4764314fcdbb:3f2fde15267bbc5ccaa95089d455391f0f555f1f59184ee1c799c77f7a40b832",
+        "description": "Second step; needs the first.",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535"
+      },
+      "isError": false,
+      "answer": {
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
+        "epic": {
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
+          "name": "[dark-factory fixture] epic"
+        },
+        "title": "[dark-factory fixture] child 2",
+        "description": "Second step; needs the first.",
+        "type": "Story",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 2,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:04.570565+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 1,
+        "label_list": [],
+        "created": true
+      }
+    },
+    {
+      "tool": "add_work_item_dependency",
+      "arguments": {
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "blocked_by_id": "b986bffb-f228-452e-b19a-67034c5bf0b7"
+      },
+      "isError": false,
+      "answer": {
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
+        "epic": {
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
+          "name": "[dark-factory fixture] epic"
+        },
+        "title": "[dark-factory fixture] child 2",
+        "description": "Second step; needs the first.",
+        "type": "Story",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 2,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:04.570565+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [
+          {
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
+            "title": "[dark-factory fixture] child 1",
+            "status": "Backlog"
+          }
+        ],
+        "dependents": [],
+        "links": [],
+        "version": 1,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "b10af0ce-def6-4135-870a-4764314fcdbb"
+      },
+      "isError": false,
+      "answer": {
+        "id": "b10af0ce-def6-4135-870a-4764314fcdbb",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
+        "epic": {
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
+          "name": "[dark-factory fixture] epic"
+        },
+        "title": "[dark-factory fixture] plan item",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Story",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 7,
+        "estimate": null,
+        "labels": "plan",
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:43:03.861375+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:03.861377+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 1,
+        "label_list": [
+          "plan"
+        ]
+      }
+    },
+    {
+      "tool": "create_work_item",
+      "arguments": {
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] child 1",
+        "type": "Task",
+        "idempotency_key": "dark-factory:child:b10af0ce-def6-4135-870a-4764314fcdbb:6784c89c3d21cb6b3bde0818521abd95d3aa3f4e6b351da4c41cf4b1f08165bf",
+        "description": "First step of the plan.",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535"
+      },
+      "isError": false,
+      "answer": {
+        "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
+        "epic": {
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
+          "name": "[dark-factory fixture] epic"
+        },
+        "title": "[dark-factory fixture] child 1",
+        "description": "First step of the plan.",
+        "type": "Task",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 1,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:43:04.35415+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:04.354152+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [
+          {
+            "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+            "title": "[dark-factory fixture] child 2",
+            "status": "Backlog"
+          }
+        ],
+        "links": [],
+        "version": 1,
+        "label_list": [],
+        "created": false
+      }
+    },
+    {
+      "tool": "create_work_item",
+      "arguments": {
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] child 2",
+        "type": "Story",
+        "idempotency_key": "dark-factory:child:b10af0ce-def6-4135-870a-4764314fcdbb:3f2fde15267bbc5ccaa95089d455391f0f555f1f59184ee1c799c77f7a40b832",
+        "description": "Second step; needs the first.",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535"
+      },
+      "isError": false,
+      "answer": {
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
+        "epic": {
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
+          "name": "[dark-factory fixture] epic"
+        },
+        "title": "[dark-factory fixture] child 2",
+        "description": "Second step; needs the first.",
+        "type": "Story",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 2,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:04.570565+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [
+          {
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
+            "title": "[dark-factory fixture] child 1",
+            "status": "Backlog"
+          }
+        ],
+        "dependents": [],
+        "links": [],
+        "version": 1,
+        "label_list": [],
+        "created": false
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290"
+      },
+      "isError": false,
+      "answer": {
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
+        "epic": {
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
+          "name": "[dark-factory fixture] epic"
+        },
+        "title": "[dark-factory fixture] child 2",
+        "description": "Second step; needs the first.",
+        "type": "Story",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 2,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:04.570565+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [
+          {
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
+            "title": "[dark-factory fixture] child 1",
+            "status": "Backlog"
+          }
+        ],
+        "dependents": [],
+        "links": [],
+        "version": 1,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290"
+      },
+      "isError": false,
+      "answer": {
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
+        "epic": {
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
+          "name": "[dark-factory fixture] epic"
+        },
+        "title": "[dark-factory fixture] child 2",
+        "description": "Second step; needs the first.",
+        "type": "Story",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 2,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:04.570565+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [
+          {
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
+            "title": "[dark-factory fixture] child 1",
+            "status": "Backlog"
+          }
+        ],
+        "dependents": [],
+        "links": [],
+        "version": 1,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "update_work_item",
+      "arguments": {
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "status": "Ready",
+        "expected_version": 1
+      },
+      "isError": false,
+      "answer": {
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
+        "epic": {
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
+          "name": "[dark-factory fixture] epic"
+        },
+        "title": "[dark-factory fixture] child 2",
+        "description": "Second step; needs the first.",
+        "type": "Story",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 8,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:06.077794+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [
+          {
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
+            "title": "[dark-factory fixture] child 1",
+            "status": "Backlog"
+          }
+        ],
+        "dependents": [],
+        "links": [],
+        "version": 2,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290"
+      },
+      "isError": false,
+      "answer": {
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
+        "epic": {
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
+          "name": "[dark-factory fixture] epic"
+        },
+        "title": "[dark-factory fixture] child 2",
+        "description": "Second step; needs the first.",
+        "type": "Story",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 8,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:06.077794+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [
+          {
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
+            "title": "[dark-factory fixture] child 1",
+            "status": "Backlog"
+          }
+        ],
+        "dependents": [],
+        "links": [],
+        "version": 2,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290"
+      },
+      "isError": false,
+      "answer": {
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
+        "epic": {
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
+          "name": "[dark-factory fixture] epic"
+        },
+        "title": "[dark-factory fixture] child 2",
+        "description": "Second step; needs the first.",
+        "type": "Story",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 8,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:06.077794+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [
+          {
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
+            "title": "[dark-factory fixture] child 1",
+            "status": "Backlog"
+          }
+        ],
+        "dependents": [],
+        "links": [],
+        "version": 2,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290"
+      },
+      "isError": false,
+      "answer": {
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
+        "epic": {
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
+          "name": "[dark-factory fixture] epic"
+        },
+        "title": "[dark-factory fixture] child 2",
+        "description": "Second step; needs the first.",
+        "type": "Story",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 8,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:06.077794+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [
+          {
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
+            "title": "[dark-factory fixture] child 1",
+            "status": "Backlog"
+          }
+        ],
+        "dependents": [],
+        "links": [],
+        "version": 2,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "update_work_item",
+      "arguments": {
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "status": "Backlog",
+        "expected_version": 2
+      },
+      "isError": false,
+      "answer": {
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
+        "epic": {
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
+          "name": "[dark-factory fixture] epic"
+        },
+        "title": "[dark-factory fixture] child 2",
+        "description": "Second step; needs the first.",
+        "type": "Story",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 2,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:06.945497+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [
+          {
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
+            "title": "[dark-factory fixture] child 1",
+            "status": "Backlog"
+          }
+        ],
+        "dependents": [],
+        "links": [],
+        "version": 3,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "add_work_item_comment",
+      "arguments": {
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "body": "[author: dark-factory] returned by the contract test",
+        "idempotency_key": "dark-factory:comment:e5adb565df10c394874d620047931ea17bba2c39f44fefa5f0979f8508a718af"
+      },
+      "isError": false,
+      "answer": {
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
+        "epic": {
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
+          "name": "[dark-factory fixture] epic"
+        },
+        "title": "[dark-factory fixture] child 2",
+        "description": "Second step; needs the first.",
+        "type": "Story",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 2,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "7597a1e5-7c47-4047-ae87-4c5ff5a6f08c",
+            "workItemId": "c4633fc6-9721-430a-a27d-1cf203860290",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] returned by the contract test",
+            "createdAtUtc": "2026-10-14T11:43:07.162841+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:07.162841+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [
+          {
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
+            "title": "[dark-factory fixture] child 1",
+            "status": "Backlog"
+          }
+        ],
+        "dependents": [],
+        "links": [],
+        "version": 3,
+        "label_list": [],
+        "comment_id": "7597a1e5-7c47-4047-ae87-4c5ff5a6f08c",
+        "comment_created": true
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290"
+      },
+      "isError": false,
+      "answer": {
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
+        "epic": {
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
+          "name": "[dark-factory fixture] epic"
+        },
+        "title": "[dark-factory fixture] child 2",
+        "description": "Second step; needs the first.",
+        "type": "Story",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 2,
+        "estimate": null,
+        "comments": [
+          {
+            "id": "7597a1e5-7c47-4047-ae87-4c5ff5a6f08c",
+            "workItemId": "c4633fc6-9721-430a-a27d-1cf203860290",
+            "author": "fixture-recorder",
+            "body": "[author: dark-factory] returned by the contract test",
+            "createdAtUtc": "2026-10-14T11:43:07.162841+00:00",
+            "author_id": "f0000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:07.162841+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [
+          {
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
+            "title": "[dark-factory fixture] child 1",
+            "status": "Backlog"
+          }
+        ],
+        "dependents": [],
+        "links": [],
+        "version": 3,
+        "label_list": []
+      }
+    }
+  ]
+}

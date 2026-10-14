@@ -3,7 +3,6 @@ using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
 
@@ -733,10 +732,18 @@ public sealed partial class RunPipeline
     /// recorded (it runs again on a resumed run that had already pushed). The fixer runs on <paramref name="modelClass"/> (E8: a
     /// review or conflict fix round on the item's coding class, a CI fix on <see cref="WorkerModelClass.CiFix"/>).
     /// </summary>
-    private async Task RunFixRoundAsync(Run run, List<LedgerEntry> history, int round, string fixedHead, string what,
+    private Task RunFixRoundAsync(Run run, List<LedgerEntry> history, int round, string fixedHead, string what,
         IReadOnlyCollection<WorkerInput> inputs, Func<CancellationToken, Task<string>> prompt, string resumePrompt, string commitMessage, WorkState next, string name, string modelClass,
         CancellationToken ct,
-        Func<Workspace, CancellationToken, Task>? prepare = null, Func<string, CancellationToken, Task>? afterPush = null)
+        Func<Workspace, CancellationToken, Task>? prepare = null, Func<string, CancellationToken, Task>? afterPush = null) =>
+        // A worker phase from the orphan's stop to the worktree's removal (sc-25988), like Implement.
+        InWorkerPhaseAsync(run.Item, $"run {name}",
+            () => FixRoundAsync(run, history, round, fixedHead, what, inputs, prompt, resumePrompt, commitMessage, next, name, modelClass, ct, prepare, afterPush), ct);
+
+    private async Task FixRoundAsync(Run run, List<LedgerEntry> history, int round, string fixedHead, string what,
+        IReadOnlyCollection<WorkerInput> inputs, Func<CancellationToken, Task<string>> prompt, string resumePrompt, string commitMessage, WorkState next, string name, string modelClass,
+        CancellationToken ct,
+        Func<Workspace, CancellationToken, Task>? prepare, Func<string, CancellationToken, Task>? afterPush)
     {
         var (spec, repo, item) = run;
         var attempt = CurrentWorkerAttempt(history);
@@ -1182,30 +1189,40 @@ public sealed partial class RunPipeline
         }
         else
         {
-            // The runs execute model-written code for up to Gate:TestTimeoutMinutes each: a Pause or Stop cancels them (the
-            // runner stops the sandboxed commands) and nothing is recorded, so Continue runs the check again.
-            await using var watch = new TestRunWatch(_controls, _controlPoll, run.Item, log, _maxControlReadFailures, ct);
-            try
-            {
-                result = await NewTestsCheck.RunAsync(runner, NewTestsCheck.Strategies, run.Repo, pull.BaseSha, pull.HeadSha,
-                    NewTestsCheck.RunName(run.Story), line => log.WriteLine($"[gate] {line}"), watch.Token);
-            }
-            catch (Exception) when (watch.Requested is { } requested && !ct.IsCancellationRequested)
-            {
-                throw new ControlRequestedException(requested) { ControlsUnreadable = watch.ControlsUnreadable };
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                result = NewTestsResult.Without(pull.BaseSha, pull.HeadSha, NewTestsOutcome.Error, $"the new tests could not be run: {ex.Message}");
-            }
-            if (watch.Requested is { } late && !ct.IsCancellationRequested)
-            {
-                // The control arrived as the runs ended: the result may be from cancelled runs, so it is not recorded either.
-                throw new ControlRequestedException(late) { ControlsUnreadable = watch.ControlsUnreadable };
-            }
+            // The runs are the sandbox user's (their worktrees, every step, the worktrees' deletion): one worker phase (sc-25988),
+            // waited for while another run's worker has the sandbox user, the merge gate's other facts read without it.
+            result = await InWorkerPhaseAsync(run.Item, "run the new tests", () => RunNewTestsAsync(run, pull, runner, ct), ct);
         }
         await ledger.CheckpointAsync(run.Item, Steps.NewTests, null, result.ToDetail(), ct);
         log.WriteLine($"[gate] new tests ({result.Outcome}): {result.Reason}");
+        return result;
+    }
+
+    /// <summary>The sandboxed runs of <see cref="NewTestsAsync"/>, watched for a Pause or Stop; the caller holds the sandbox user's lock.</summary>
+    private async Task<NewTestsResult> RunNewTestsAsync(Run run, PullFacts pull, IGateTestRunner runner, CancellationToken ct)
+    {
+        NewTestsResult result;
+        // The runs execute model-written code for up to Gate:TestTimeoutMinutes each: a Pause or Stop cancels them (the
+        // runner stops the sandboxed commands) and nothing is recorded, so Continue runs the check again.
+        await using var watch = new TestRunWatch(_controls, _controlPoll, run.Item, log, _maxControlReadFailures, ct);
+        try
+        {
+            result = await NewTestsCheck.RunAsync(runner, NewTestsCheck.Strategies, run.Repo, pull.BaseSha, pull.HeadSha,
+                NewTestsCheck.RunName(run.Story), line => log.WriteLine($"[gate] {line}"), watch.Token);
+        }
+        catch (Exception) when (watch.Requested is { } requested && !ct.IsCancellationRequested)
+        {
+            throw new ControlRequestedException(requested) { ControlsUnreadable = watch.ControlsUnreadable };
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            result = NewTestsResult.Without(pull.BaseSha, pull.HeadSha, NewTestsOutcome.Error, $"the new tests could not be run: {ex.Message}");
+        }
+        if (watch.Requested is { } late && !ct.IsCancellationRequested)
+        {
+            // The control arrived as the runs ended: the result may be from cancelled runs, so it is not recorded either.
+            throw new ControlRequestedException(late) { ControlsUnreadable = watch.ControlsUnreadable };
+        }
         return result;
     }
 

@@ -1,8 +1,11 @@
 #!/bin/bash
-# factory-worker-launch — runs one Dark Factory worker command as the sandbox user.
+# factory-worker-launch — runs one Dark Factory worker command as a sandbox user.
 #
-# Installed root-owned at /usr/local/libexec/dark-factory/factory-worker-launch by
-# scripts/setup-worker-user.sh (which sets sandbox_user and sandbox_uid below); the orchestrator runs it with
+# Installed root-owned by scripts/setup-worker-user.sh, one copy per sandbox user (a worker slot,
+# Worker:Slots): /usr/local/libexec/dark-factory/factory-worker-launch for the first (_factory),
+# factory-worker-launch-2 for _factory2, and so on. Setup sets sandbox_user and sandbox_uid below in
+# each copy to that copy's own user, and the sudoers rules let the owner run each copy only as its
+# user. The orchestrator runs it with
 #   sudo -n -u _factory factory-worker-launch <program> [args...]
 #
 # Protocol (stdin):
@@ -13,14 +16,17 @@
 #   orchestrator died) the worker is killed.
 #
 # The worker gets a fresh environment: HOME (from the password database, never the
-# caller's), a fixed PATH, MSBuild/dotnet settings that keep build servers from
-# lingering, and only the allowlisted router variables (E1/E5).
+# caller's), a fixed PATH, TMPDIR (the user's own temporary directory, so no two sandbox
+# users share one: dotnet's NuGet keeps its locks under $TMPDIR/NuGetScratch, and one in
+# /tmp made by _factory refuses _factory2's restore, sc-25992), MSBuild/dotnet settings that
+# keep build servers from lingering, and only the allowlisted router variables (E1/E5).
 #
 # Killing: the worker's process tree and process group, and then — when running as the
 # sandbox user — every other process of that user, which also catches anything that
 # forked and setsid()'d away (MSBuild node reuse, the dotnet build server, a hostile
-# worker). That makes the sandbox user single-tenant: only one helper may run at a time,
-# which the orchestrator enforces with its work-root lock (WorkerLock).
+# worker). That makes each sandbox user single-tenant: only one helper may run as it at a time,
+# which the orchestrator enforces with that slot's work-root lock (WorkerLock). The sweep is by
+# this helper's own uid only, so it never reaches another slot's user: slots run side by side.
 #
 # That uid-wide sweep needs two independent checks to run: this helper's user name is
 # sandbox_user, and its effective uid is sandbox_uid — the uid setup-worker-user.sh created or
@@ -40,7 +46,7 @@ sandbox_uid=
 # The orchestrator refuses to start unless the installed helper is this file (EnsureReadyAsync):
 # re-run setup-worker-user.sh after any change here.
 # shellcheck disable=SC2034 # read by the orchestrator, not by this script
-helper_version=3
+helper_version=5
 
 usage() {
     echo "usage: factory-worker-launch <program> [args...] (router variables on stdin)" >&2
@@ -93,6 +99,28 @@ fi
 unset HOME
 home=~
 path="$home/.local/bin:/usr/local/share/dotnet:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# The running user's own temporary directory (macOS's per-user /var/folders/…/T/); where the system
+# has none (Linux CI), a 0700 one in the user's home. Without TMPDIR the worker would fall back to
+# the shared /tmp. Either is used only if it is the user's own: a real directory (the last component
+# not a symlink) that the running user owns; the home one is then made 0700 (an existing one may
+# have been made with a looser mode).
+own_dir() {
+    local dir=${1%/}
+    [ -n "$dir" ] && [ ! -L "$dir" ] && [ -d "$dir" ] && [ -O "$dir" ]
+}
+tmpdir=$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)
+case "$tmpdir" in
+    /*) own_dir "$tmpdir" || tmpdir= ;;
+    *) tmpdir= ;;
+esac
+if [ -z "$tmpdir" ]; then
+    tmpdir="$home/.tmp"
+    [ -e "$tmpdir" ] || [ -L "$tmpdir" ] || mkdir -m 700 "$tmpdir" || true
+    if ! own_dir "$tmpdir" || ! chmod 700 "$tmpdir"; then
+        echo "factory-worker-launch: no per-user temporary directory: $tmpdir must be a directory (not a symlink) owned by the running user" >&2
+        exit 70
+    fi
+fi
 
 # Stops a process and all of its descendants: freeze top-down so nothing can fork
 # away, then kill everything collected.
@@ -195,7 +223,7 @@ kill_sandbox_user() {
     local pass pid fresh signalled=" "
     for pass in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
         fresh=()
-        for pid in $(list_uid_procs | outside_tree "$$"); do
+        for pid in $(list_uid_procs 3>&- | outside_tree "$$" 3>&-); do
             [ "$pid" != "$$" ] || continue
             case "$signalled" in *" $pid "*) continue ;; esac
             signalled="$signalled$pid "
@@ -204,12 +232,29 @@ kill_sandbox_user() {
         [ ${#fresh[@]} -gt 0 ] || return 0
         kill_pids "${fresh[@]}"
     done
-    echo "factory-worker-launch: $sandbox_user processes still appearing after $pass sweeps" >&2
+    # To fd 3: this runs after the launch, where the helper's stderr is /dev/null (see there).
+    echo "factory-worker-launch: $sandbox_user processes still appearing after $pass sweeps" >&3
 }
 
+# From here on the helper's own stderr is /dev/null and its real stderr is fd 3. bash 3.2 writes reports of its
+# own on stderr that are not the worker's and not this helper's messages, and they would otherwise land on the
+# stderr the orchestrator reads:
+#   - "child setpgid (N to N): Operation not permitted": under set -m both bash and the child it forks call
+#     setpgid for the child; on macOS, under load, the child's own call can lose to the parent's and fail, and
+#     bash's child reports it before it applies the command's redirections (the group is set all the same);
+#   - "<pid> Killed: 9 /usr/bin/env ..." / "Terminated: 15 ( while ... )": a job a signal ended is reported
+#     when bash next reads a script line or waits — also for a worker a Stop killed before this shell reached
+#     its wait, which no redirection on the wait itself can catch.
+# So: the worker's own redirection gives it the real stderr back before the exec (2>&3) and closes fd 3 for it
+# (the worker's stderr, and a failed exec's message, still arrive); every message this helper prints after this
+# line goes to fd 3 explicitly (>&3); and fd 3 is closed for everything else the helper starts (the watcher, the
+# sweep's listing), so nothing but the worker's own tree can hold the orchestrator's stderr open. What is lost
+# with it: bash's own diagnostics after this line (a fork that fails, a set -e exit); the helper then exits
+# non-zero.
+exec 3>&2 2>/dev/null
 set -m # the worker gets its own process group
-/usr/bin/env -i "HOME=$home" "PATH=$path" MSBUILDDISABLENODEREUSE=1 DOTNET_CLI_USE_MSBUILD_SERVER=0 \
-    ${vars[@]+"${vars[@]}"} "$@" </dev/null &
+/usr/bin/env -i "HOME=$home" "PATH=$path" "TMPDIR=$tmpdir" MSBUILDDISABLENODEREUSE=1 DOTNET_CLI_USE_MSBUILD_SERVER=0 \
+    ${vars[@]+"${vars[@]}"} "$@" </dev/null 2>&3 3>&- &
 worker=$!
 set +m
 
@@ -220,13 +265,19 @@ set +m
     send_signal -KILL -- "-$worker" || true
     # The uid sweep is the main shell's, after the worker is reaped; from here it would race
     # (and could kill) the main shell's own commands.
-) <&0 & # explicit, or bash gives background jobs /dev/null as stdin
+) <&0 3>&- & # stdin explicit, or bash gives background jobs /dev/null; never the helper's real stderr
 watcher=$!
 
 status=0
-wait "$worker" || status=$?
-send_signal "$watcher" || true
-wait "$watcher" 2>/dev/null || true # gone before the sweep, which then spares only $$
+# A worker a signal ended (a Stop's SIGKILL) makes bash print a job report ("Killed: 9 /usr/bin/env ...") here,
+# or at an earlier line if it died before this one: on the helper's own stderr, which is /dev/null since the
+# launch (the redirections below are from before that and are kept). The exit status says it.
+wait "$worker" 2>/dev/null || status=$?
+# The watcher is gone before the sweep, which then spares only $$. Killed and reaped in one
+# redirected group: bash 3.2 also reports a signal-killed job ("Terminated: 15 ( while ... )")
+# when it reads the next script line, so a watcher that died between a kill on one line and a
+# redirected wait on the next put that report on the helper's real stderr.
+{ send_signal "$watcher" || true; wait "$watcher" || true; } 2>/dev/null
 send_signal -KILL -- "-$worker" || true # nothing the worker started outlives the run
 kill_sandbox_user
 exit "$status"

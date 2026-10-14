@@ -7,7 +7,6 @@ using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Router;
 using DarkFactory.Orchestrator.Sessions;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.Worker;
 using Microsoft.AspNetCore.Builder;
@@ -783,7 +782,7 @@ public sealed class SessionCaptureTests : IAsyncLifetime
     }
 
     private static FakeWorkSource Stories() =>
-        new(new WorkStory(1, "List files", "List the files.", "feature", "https://app.shortcut.com/t/story/1"));
+        new(new WorkStory(1, "List files", "List the files.", "feature", "https://app.shortcut.com/t/story/1", ItemNaming.Shortcut));
 
     private sealed class Workspaces : IRepoWorkspace
     {

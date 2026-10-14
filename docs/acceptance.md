@@ -5,11 +5,14 @@ opt-in: the tests skip, naming the missing prerequisite, unless their gate varia
 
 ## Safety first (read before any live run)
 
-- **The `_factory` user is single-tenant.** Every exit of the sandbox launch helper kills *every* `_factory`
-  process. Do not use an interactive `_factory` session (e.g. its Claude login) while any live test below runs.
+- **The `_factory` user is single-tenant** — and so is each further sandbox user of a machine set up with worker slots
+  (`_factory2`, …; `Worker:Slots`, sc-25989). Every exit of a sandbox launch helper kills *every* process of its user.
+  Do not use an interactive `_factory` session (e.g. its Claude login) while any live test below runs.
 - **Stop your own `factory work` / `factory run` first.** The `factory work` tests (AT2–AT5) hold the configured
-  work root's run lock (`<Factory:WorkRoot>/.factory-run.lock`) for their whole run and skip if a real sandboxed run
-  holds it, so they never share `_factory` with one. They run against a **throwaway ledger database**
+  work root's sandbox lock (`<Factory:WorkRoot>/.factory-run.lock`, and `slot-locks/.factory-run-<n>.lock` of every further slot) for
+  their whole run and skip if a real run's worker
+  phase holds one at that moment, so they never share a sandbox user with one (a real run started meanwhile waits at its
+  worker phases, sc-25988). They run against a **throwaway ledger database**
   (`df_e2e_at<N>_<guid>` on the configured Postgres, dropped afterwards) and their **own work root**
   (`<Factory:WorkRoot>/e2e/<db name>`), so they never read or change your real ledger, controls or worktrees.
   Clones left under `<Factory:WorkRoot>/e2e/` may be deleted by hand afterwards.
@@ -124,18 +127,29 @@ for its sessions.
 | Check | Test | Gate |
 | --- | --- | --- |
 | Worker token pushes `factory/*` only on its own repo; push to `main` and to another repo rejected | `AppTokenPushTests.Worker_token_pushes_factory_branches_only_on_its_own_repo` | `FACTORY_E2E=1` (`FACTORY_E2E_OTHER_REPO` optional) |
-| Worker env is exactly the allowlist for the configured `Worker:Auth` (`router-key`: `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `HOME`, `MSBUILDDISABLENODEREUSE`, `PATH`; `claude-login`: the same without `ANTHROPIC_AUTH_TOKEN`); `ANTHROPIC_CUSTOM_HEADERS` is two lines, the router key and `x-weave-model-class` (sc-25659) | `LiveWorkerSandboxTests.Live_worker_environment_is_exactly_the_allowlist_for_the_configured_auth_mode` | `FACTORY_SANDBOX_LIVE=1` |
+| Worker env is exactly the allowlist for the configured `Worker:Auth` (`router-key`: `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `HOME`, `MSBUILDDISABLENODEREUSE`, `PATH`, `TMPDIR` — the sandbox user's own temporary directory, sc-25992; `claude-login`: the same without `ANTHROPIC_AUTH_TOKEN`); `ANTHROPIC_CUSTOM_HEADERS` is two lines, the router key and `x-weave-model-class` (sc-25659) | `LiveWorkerSandboxTests.Live_worker_environment_is_exactly_the_allowlist_for_the_configured_auth_mode` | `FACTORY_SANDBOX_LIVE=1` |
 | `router-key`: `_factory` holds no Claude credential (no `~/.claude/.credentials.json`, no `Claude Code-credentials` keychain item) | `LiveWorkerSandboxTests.Worker_user_holds_no_claude_credential_in_router_key_mode` (skips for `claude-login`) | `FACTORY_SANDBOX_LIVE=1` |
 | `router-key`: `factory run`/`work` refuse to start without an enrolled plan | `RouterEnrollmentCheckTests` (unit, fake router) | none |
 | `~michael`, `.ssh`, `.config/gh`, login keychain unreachable | `LiveWorkerSandboxTests.Worker_is_denied_the_owners_home_ssh_keys_gh_config_and_login_keychain`, `Worker_cannot_read_the_owners_keychain_items` | `FACTORY_SANDBOX_LIVE=1` |
 
 The env probe runs `/usr/bin/env` through the installed helper exactly as `ClaudeWorker` launches a sandboxed worker
 (`WorkerSandbox.Start` with `ClaudeWorker.BuildRouterVariables` for the configured router URL and auth mode, a probe
-router key, and `GH_TOKEN` set in the test process to show nothing of the owner's leaks). The `FACTORY_SANDBOX_LIVE`
-tests kill every `_factory` process: run them only when no `_factory` session is in use:
+router key, and `GH_TOKEN` set in the test process to show nothing of the owner's leaks). Every probe runs once per configured
+worker slot (`Worker:Slots`: each slot's own user and installed helper, `_factory`, `_factory2`, …; sc-25992), a failure naming
+its slot; slot 1 not ready (the machine not set up) skips them, a further configured slot not ready fails. The env probe also
+checks that each slot's `TMPDIR` is under `/var/folders/`, owned by that slot's own uid (run as it: `stat -f %u "$TMPDIR"` equals
+`id -u`, and `id -un` is the slot's user), not the owner's, and that no two slots share a `TMPDIR` or a `HOME`. The
+`FACTORY_SANDBOX_LIVE` tests kill every process of every configured sandbox user: run them only when no sandbox user's session
+is in use and `factory work` is stopped. One slot (the default):
 
 ```sh
-FACTORY_SANDBOX_LIVE=1 dotnet test --project tests/DarkFactory.Orchestrator.Tests -- --filter-class "*LiveWorkerSandboxTests"
+FACTORY_SANDBOX_LIVE=1 dotnet test --project tests/DarkFactory.Orchestrator.Tests --filter-class "*LiveWorkerSandboxTests"
+```
+
+Two slots (after `sudo scripts/setup-worker-user.sh --slots 2`):
+
+```sh
+FACTORY_SANDBOX_LIVE=1 Worker__Slots=2 dotnet test --project tests/DarkFactory.Orchestrator.Tests --filter-class "*LiveWorkerSandboxTests"
 ```
 
 ## AT7 — the router accounts for every model call
@@ -647,7 +661,7 @@ What the live test does not cover, and the unit tests do (`PlanReleasePipelineTe
 plan (held until the factory merges it or the board shows it finished), an archived story, a released story moved back to the
 Backlog, a plan whose stories were never recorded (a marked story is refused at claim), a plan that cannot be evaluated (one comment
 and one `plan-held` row after `Intake:MaxItemFailures` failures), a closeout the board keeps refusing (the item stays `Planned`,
-"post it by hand"), and a Stop landing on a waiting plan after its runner took no worker run lock (deferred to the next run).
+"post it by hand"), and a Stop landing on a waiting plan while it is evaluated (finished by that run, sc-25988).
 
 ## P4-AT2 — a plan across two repositories: a changeset in each, merged in the plan's order (sc-25873)
 
@@ -830,8 +844,8 @@ What the live test does not cover, and the unit tests do (`PlanClassificationTes
 `PlanControlsPostgresTests`, `DashboardComponentTests.A_plan_row_shows_…`): a pull request actually turned back into a draft by
 a plan's stop (the seeded stories have none; the unit test's story has one), a story whose run is going when the Stop lands
 (stopped by that run; the plan's stop unfinished, exit 1, finished by the next poll), a stop that fails half way, a story whose
-worker a crashed run left, a workerless run deferring the stop, a Stop that lands while the plan is evaluated (finished by that
-run, or deferred by a workerless one) and `factory stop` on a plan whose own run is active (unfinished, exit 1), a released story
+worker a crashed run left, a Stop that lands while the plan is evaluated (finished by that
+run) and `factory stop` on a plan whose own run is active (unfinished, exit 1), a released story
 nobody claimed (moved back to the Backlog with a comment that does not say the factory worked on it), one a person took, finished,
 assigned or archived since its release (nothing written, no ledger item), one moved back to the Backlog (nothing written), a
 story merged outside the factory (left as it is and listed apart), a plan Pause with the usage pause also in force (`user-paused`),
@@ -841,6 +855,454 @@ next tool boundary and resumed in the same session; nothing claimed or released 
 story merged outside the factory, a cancelled story, a failed story that is re-run and merges (`plan-resumed`, its dependents
 released), a comment the board refuses (retried, bounded, never posted twice), a story of a stopped plan moved to ready by hand
 (claim refused), and the rendered pipeline page.
+
+## P4b-AT1 — a Ready Kanban item becomes a merged pull request with no human (sc-25981, sc-25992)
+
+`KanbanAcceptanceTests.P4b_AT1_a_ready_kanban_item_becomes_a_merged_pull_request_with_no_human_and_its_closeout_is_the_ledgers`:
+the epic's P4b-AT1 — "A Ready item in a watched Kanban project becomes a merged pull request with no human: claimed, InProgress,
+PR and branch links on the item, Done, a closeout comment equal to the ledger's." A real KanbanBoard item goes through
+`FactoryRunner.RunAsync` (what `factory run kb-N` calls) in ONE run — implement, the real review panel, CI, the merge gate and
+the merge queue — to Watch, against a throwaway ledger and work root, as Phase 2's P2-AT1 (`ReviewGateTests`) does for a
+Shortcut story.
+
+Prerequisites: everything `factory run` needs (router key and an enrolled plan, both GitHub Apps installed on the target
+repository with its rulesets — the gate must be able to merge — and the sandbox's `factory/gate.yaml` on `main`, Claude Code for
+the worker user) — no Shortcut token: since sc-25982 the shared harness asks only for the credential of the test's own work
+source (`E2e.StartAsync(prefix, ItemNaming.Kanban)`) — and
+
+- `Kanban:WriteToken` (env `FACTORY_KANBAN_WRITE_TOKEN` or keychain account `kanban-write-token`): a `full`-scope KanbanBoard
+  personal access token of the factory's service identity (KanbanBoard's `docs/deployment.md`, "Factory service identity");
+- `FACTORY_E2E_P4B_KANBAN_PROJECT`: the key of a KanbanBoard project whose `repository_url` names the sandbox repository
+  (`https://github.com/<owner>/<name>.git`), or whose items carry a `Repo: owner/name` line;
+- `FACTORY_E2E_P4B_KANBAN_ITEM`: the id (GUID) of an item of that project in `Ready`, unclaimed, with no open blocker, describing
+  a SMALL bug fix in normal code of the sandbox (one the gate will merge, as for P2-AT1: a one-line fix the sandbox's tests can
+  show, with a new test). The item is used up: use a fresh one each run.
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_P4B_KANBAN_PROJECT=<KEY> FACTORY_E2E_P4B_KANBAN_ITEM=<GUID> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4b_AT1*"
+```
+
+What it checks: the item gets one `kb-<n>` however often it is asked for and is listed ready under it in the watched project;
+the run succeeds and the throwaway ledger's transitions start Intake → Implement (claimed, then InProgress on the board) and end
+MergeGate → Merge → Watch (fix rounds between are the panel's call), every row with its typed outcome; one `claimed` and one
+`linked` row (`<pull request> <branch>`, the branch `factory/kb-<n>`; a throwaway ledger starts its Kanban keys at the seconds
+since 2026-01-01, `E2e.KanbanKeyStart`, so no two runs share an item's branch — sc-25992) and a `merged-reported` row; on GitHub the pull request
+from `factory/kb-<n>` is merged at the commit the Merge row records; on the board the item is `Done`, with the pull request and
+the branch as links of kind `pr` and `branch`, and EXACTLY ONE comment equal to `LedgerReport.MergedCloseout`'s rendering of
+the rows written before the `closeout` `posted` row (attributed, as the pipeline posts it); a second run adds no second
+`claimed`, `linked` or posted `closeout` row and no link, and the closeout stays the item's only closeout. Its one board write
+is the factory's once-only notice on an item nothing in this phase moves on (`RunPipeline.HeldNoticeText` for Watch, with a
+`held-notice` row): the second run must not be deferred and must succeed, and the test asserts exactly one posted
+`held-notice` row, exactly one such comment and no other comment. The notice is deterministic: Watch is no handled state, so the
+run goes to `HoldAsync`, which posts it once per state entry (the first run enters Watch without one); it would be missing only if
+the freeze deferred the run or the board refused the comment (logged, no row, retried by the next run) — both reported as
+failures.
+
+Not live (every `dotnet test`): `KanbanWorkSourceTests` (each member, each refusal, paging, what every write sends — against a
+fake MCP server that behaves as KanbanBoard's contract says, `FakeKanbanBoard`), `KanbanPipelineTests` (the same run through the
+pipeline with fakes, and the resume), `KanbanWriteIsolationTests` (E2) and `KanbanKeysPostgresTests` (the migration, and
+processes allocating one item's key at once).
+
+## P4b-AT2 — a `plan`-labelled Kanban item becomes items with dependencies, worked in order and merged by one changeset pull request (sc-25984)
+
+`KanbanPlanAcceptanceTests.P4b_AT2_a_plan_labelled_kanban_item_becomes_items_with_dependencies_worked_in_order_onto_a_changeset_branch_and_merged_by_one_gated_changeset_pull_request`:
+a real KanbanBoard item labelled `plan` through `FactoryRunner.RunAsync`, run by run like P4-AT1 (`factory run kb-N` for the
+plan item, then for each released item), against a throwaway ledger and work root: a real planner session, the real board, real
+workers, the real review panel and merge gate.
+
+Prerequisites: as P4b-AT1 (the router and an enrolled plan, both GitHub Apps on the target repository with its rulesets — the
+gate must be able to merge —, Claude Code for the worker user, `Kanban:WriteToken`, `FACTORY_E2E_P4B_KANBAN_PROJECT`; no
+Shortcut token), a target repository whose CI runs for pull requests into `factory/changeset-*` (as for P4-AT1), and
+
+- `FACTORY_E2E_P4B_PLAN_KANBAN_ITEM`: the id (GUID) of an item of that project that carries the label `plan`, is in an epic, in
+  `Ready`, unclaimed, with no open blocker, and describes three or more steps that build on one another (each step needing the
+  one before), all in the sandbox repository. Use a FRESH item for every run: the planned items' idempotency keys derive from
+  the plan item's GUID and their own text, so a second plan of the same item answers the first run's items again where the
+  planner repeats itself. No other `factory work` may watch the project while it runs.
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_P4B_KANBAN_PROJECT=<KEY> FACTORY_E2E_P4B_PLAN_KANBAN_ITEM=<GUID> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4b_AT2*"
+```
+
+What it checks. The first run ends Planned after one planner session. The plan has at least 3 stories with a dependency chain —
+otherwise the run fails INCONCLUSIVE (`PlanLive.ChainProblem`, as for P4-AT1): describe work whose steps build on one another.
+`plan-stories` names one `kb-<n>` per planned item, each a distinct item of the real board that is not the plan item: its title
+the plan's, its type the board's for the planner's (`Story`/`Issue`/`Task`), in the plan item's project and epic, in `Backlog`,
+unclaimed, its description led by the marker naming the plan item's GUID, and blocked by exactly the items the plan says (the
+board's own dependencies). The changeset branch is `factory/changeset-kb-<n>` (the plan item's ledger name) with no pull
+request yet. Then, until every item has merged: a run of the plan item stays Planned, plans nothing and creates nothing, and
+the released items are exactly those whose blockers have merged — `Ready` on the board, one `plan-released` row each, none
+saying "outside the watch scope" — while the others stay in `Backlog`; a second run with nothing newly merged adds no row; each
+released item's own run ends in Watch with its pull request merged into the changeset branch (`merge-files` names it), a
+verdict, a `gate-passed` row, typed outcomes on every row, a `claimed` row no earlier than its release, and the item `Done` on
+the board. Finally the plan item's runs take it Planned → Review → CI → MergeGate → Merge → Watch: exactly one pull request from
+the changeset branch, into its recorded base, merged, with `gate-passed`; one `plan-creating` row and the same `plan-stories`
+as at the start (nothing was created twice); the plan item `Done` on the board with that pull request as a `pr` link and one
+closeout comment equal to `LedgerReport.PlanCloseout`'s rendering of the throwaway ledger's rows.
+
+It leaves the planned items `Done` (merged) on the board; any a failed run left in `Backlog` or `Ready` are moved to `Closed`
+(best effort) so nothing picks them up afterwards. The changeset and item branches stay on the sandbox, as for P4-AT1.
+
+Not live (every `dotnet test`): `KanbanPlanSourceTests` (child creation — once, in the parent's project and epic, the key and
+the marker from board ids; a retry after a failure part-way at a create and at a dependency; a lost answer; a namesake never
+reused; a cycle refused before any call and by the board; blockers, with a `Closed` one still blocking; release, with a
+conflict; the return of an unstarted item; the type mapping), `SourceTrustTests` (the trust decision per source — prompt, commit
+and pull request name, pull request body — for Shortcut, Kanban, GitHub issues and planned items on each), and
+`KanbanPlanPipelineTests` (over the fake board and a simulated repository through the real pipeline and gate: a plan item
+planned into Backlog items with a changeset branch; a re-run after the board failed part-way; a chain released and worked in
+order, a hand-moved item refused at claim naming its blocker, the changeset pull request and the closeout; a blocker dragged to
+`Done` by hand; an outside blocker and a `Closed` planned item; Stop returning an unstarted item; a cycle the board refuses).
+
+## P4b-AT3 — a held claim, its renewal, and a stale write (sc-25983)
+
+`KanbanAcceptanceTests.P4b_AT3_a_held_claim_refuses_a_second_caller_is_renewed_past_its_first_expiry_and_a_stale_write_changes_nothing`:
+the real board with two callers — the factory's identity (`Kanban:WriteToken`) and a second one — against a throwaway ledger.
+No model runs and no pull request is opened: the item is a throwaway one the test creates in the `Backlog` (never `Ready`, so
+no factory takes it), it is in flight only in the throwaway ledger (seeded as Intake leaves a claimed item: a `claimed`
+checkpoint, then Implement), and the intake loop's runs are recorded, not started (`SeededRunner`: the production
+`RunPipeline.InFlightAsync`, `RunPipeline.RenewableAsync` and `RunPipeline.ClaimLostAsync`, a no-op `RunAsync`).
+
+Prerequisites: the shared harness's (as P4b-AT1), `Kanban:WriteToken`, and
+
+- `FACTORY_E2E_P4B_KANBAN_PROJECT`: the key of a KanbanBoard project the test may create an item in (P4b-AT1's will do);
+- `FACTORY_E2E_P4B_KANBAN_OTHER_TOKEN`: a `full`-scope KanbanBoard personal access token of ANOTHER identity than the factory's
+  service identity (a person's, or a second service identity's). The same identity would not be a second caller: its claim under
+  another marker is refused too, but a lost claim would not name anyone else.
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_P4B_KANBAN_PROJECT=<KEY> FACTORY_E2E_P4B_KANBAN_OTHER_TOKEN=<token> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4b_AT3*"
+```
+
+What it checks, in order (it takes about half a minute — it waits out a 20-second claim):
+
+| Step | Expected |
+| --- | --- |
+| `create_work_item` twice with one idempotency key | one item (`created` true, then false with the same id), in `Backlog` |
+| the factory claims the item for 20 s under `dark-factory:<item GUID>`; the second caller claims it | the second caller's claim is refused `already_claimed` |
+| one intake poll (`IntakeLoop.PollOnceAsync` over the real Kanban source) | the claim still carries the factory's marker and identity, and now expires more than 23 hours after its first expiry; nothing reported lost |
+| 25 s later (past the first expiry) | still the factory's; the second caller is still refused `already_claimed` |
+| the second caller moves the item to `InProgress` on the version the factory read; the factory then writes `Done` on that version | refused `conflict`; the item is `InProgress` at the second caller's version: nothing was written |
+| the factory's claim is released, the second caller claims the item, one more poll | the ledger item is Paused, its last transition ``claim lost: the item is claimed by `<their name>` (marker `p4b-at3-second-caller`)`` (outcome `deferred`; the name and the marker are the other caller's text, each an inert code span), then a `parked` row; on the board their claim, the column and the version are unchanged; the item is no longer listed in flight |
+
+Cleanup (best effort, in a `finally`): both claims released and the item moved to `Closed`, which hides it from the board. The
+factory's comment on the item (who holds it, what resumes it) stays on it.
+
+Not live (every `dotnet test`): `KanbanSafeWritesTests` against `FakeKanbanBoard` — each error code as a typed refusal for
+every write the caller sends (and a code the contract does not name as no typed refusal), `busy` retried with the same call
+and its bound, the read before a repeat for each write (a lost
+answer as a plain MCP error, an HTTP error and a broken answer; a write that did not happen; a second failure; a read that
+fails), conflicts on the claim's move and on a reported state (an edit kept, someone else's move left standing, the re-read
+bound, after which the claim is given back), renewal across polls with the board's clock moved (held past the first lifetime,
+a lapsed claim taken again — but not on an item the ledger never recorded as claimed, nor on one moved out of `InProgress` —, a
+claim lost to another caller, to a race, to another identity under the same marker, an item gone; a hostile claimant name and
+marker cut and inert), the pause and its one comment (and a comment the board refuses, on record in the `parked` row), what is
+renewed (every item the ledger resumes by itself, also under a factory, epic or item Pause, the freeze and the usage pause, and
+with unreadable controls — and nothing is run then) and what is not (a parked, an escalated and a stopping item), a
+`factory run` of a claim-lost item (refused while the other claim stands or the board will not confirm it, resumed once it is
+released), and the poll's renewal over several lanes (a board that does not answer ends only its own lane's renewals).
+
+## P4b-AT4 — `factory work` starts with no Shortcut token and works a Kanban item (sc-25982)
+
+`KanbanAcceptanceTests.P4b_AT4_factory_work_starts_with_no_shortcut_token_and_works_a_kanban_item`: the real `factory work`
+host (`FactoryHost.BuildWork`, in process) with KanbanBoard as its only work source, against a throwaway ledger and work root.
+The test's options hide the keychain's Shortcut token and blank the Shortcut watch scope and `GitHub:Watch:Repos`, so nothing
+of Shortcut is configured; it skips if the environment itself carries `SHORTCUT_API_TOKEN` (unset it for this test).
+
+Prerequisites: as P4b-AT1 (the router, both GitHub Apps, Claude Code for the worker user, `Kanban:WriteToken`,
+`FACTORY_E2E_P4B_KANBAN_PROJECT`), no Shortcut token, and
+
+- `FACTORY_E2E_P4B_WORK_KANBAN_ITEM`: the id (GUID) of an item of that project in `Ready`, unclaimed, with no open blocker,
+  describing a small change to the sandbox. It must be the project's ONLY `Ready` item: the host claims every ready item it
+  sees. The test leaves it in `Backlog` (stopped), or `Done` if the gate merged it first.
+
+```sh
+env -u SHORTCUT_API_TOKEN FACTORY_E2E=1 FACTORY_E2E_P4B_KANBAN_PROJECT=<KEY> FACTORY_E2E_P4B_WORK_KANBAN_ITEM=<GUID> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4b_AT4*"
+```
+
+What it checks: the options find no Shortcut token; `factory work`'s start-up check (`FactoryRunner.CheckWorkStartAsync`, what
+`Program` runs) passes with the Kanban source as the only configured one, its watched project validated on the real board; the
+host starts and its intake loop lists the item (its `kb-<n>` is given then — no `factory kanban key`), claims it under the
+marker `dark-factory:<item GUID>` and works it to Review, with one `claimed` and one `linked` row, its pull request opened on
+GitHub from `factory/kb-<n>`, and the pull request and the branch `pr` and `branch` links on the item (sc-25992: "works a
+Kanban item" is asserted as claimed and a pull request opened). Then `factory stop --item kb-<n>` (`FactoryRunner.ControlAsync`, the CLI's code path) while the host runs: the
+item's ledger state becomes Cancelled, the board item is back in `Backlog` with no claim, and the pull request is a draft. If
+the gate merges the item before the stop lands, the stop is printed as not checked rather than failed.
+
+Not live (every `dotnet test`): `WorkSourceRegistryTests` — the registry (one kind per naming; the configured set for every
+combination of sources; a watched source without its credential refused; an item by id needing only its source's credential),
+each wiring point (a lane per source that is watched or has its credential, and only a watched issues lane prepared; a source
+with its credential and no watch scope asked nothing — no listing, no scope check, nothing claimed — while a poll still finishes
+the pending Stop of its in-flight item; the start-up warning per source with active ledger items and no credential; one poll
+running a Shortcut story and a Kanban item; the in-flight listing per source; Stop by id of a Kanban item on the fake board — pull request drafted, `Backlog`,
+claim released, comment, Cancelled — with a same-numbered Shortcut story untouched; a factory-scope Stop over both sources and
+an item whose source is not configured reported as not stopped; Stop of one item whose source has no credential refused
+before any control is written; Pause and Continue by id; the epic scope asking each item's own
+board), the start-up check (KanbanBoard alone with no Shortcut token; Shortcut alone asking nothing of KanbanBoard; no source →
+the refusal naming every source's settings and how to finish leftover work by id; a bad scope or missing credential of either source), `factory run` exiting 2
+before the router is asked when the item's source is not configured, the work host built with KanbanBoard alone, the help
+text, and a scan that no file outside `Shortcut/` but the registry names the Shortcut source's type. These tests build their
+options with no keychain and no process environment, so they run (never skip) on a machine whose shell carries
+`SHORTCUT_API_TOKEN` or `FACTORY_KANBAN_WRITE_TOKEN`.
+
+## P4b-AT5 — two at once: two items in a worker session at the same time, each in its own slot, both merged (sc-25989)
+
+`SlotAcceptanceTests.P4b_AT5_two_items_are_in_a_worker_session_at_the_same_time_each_in_its_own_slot_and_both_merge`: the real
+`factory work` as a child process (the built CLI) with `Worker:Slots=2` and `Intake:MaxConcurrentRuns=2`, against a throwaway
+ledger and work root. Written with sc-25989 and run by the epic's terminal story; it skips unless two slots are configured.
+
+Prerequisites: the shared harness's (the router and an enrolled plan, both GitHub Apps on the target repository with its
+rulesets, the Shortcut token and watch scope: `FACTORY_E2E_WATCH_TEAM` and/or `FACTORY_E2E_WATCH_EPIC`), and
+
+- a machine set up for two worker slots — `sudo scripts/setup-worker-user.sh --slots 2` (it creates `_factory2` with its own
+  helper, sudoers line, home and Claude Code; a run kills every process of both sandbox users) — and `Worker__Slots=2` in the
+  environment the test runs in (the harness then holds both slots' locks of the real work root and probes both helpers);
+- `FACTORY_E2E_P4B_SLOT_STORIES`: two To Do stories in the watch scope, `sc-<a>,sc-<b>`, each a small fix to the sandbox
+  repository that takes the worker a few minutes and that the gate can merge (a new test that fails on the base). They must be
+  the only ready stories of the scope: the host claims every one it sees. Both end `Done`, merged.
+
+```sh
+FACTORY_E2E=1 Worker__Slots=2 FACTORY_E2E_WATCH_EPIC=<id> FACTORY_E2E_P4B_SLOT_STORIES=sc-<a>,sc-<b> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4b_AT5*"
+```
+
+What it checks, from the throwaway ledger and GitHub: both items reach Merge with no Escalated or Cancelled row; each has
+exactly one `slot` row and the two differ (`1 _factory` and `2 _factory2`); a `worker_sessions` row of one item overlaps in
+time one of the other (two worker sessions at once); each item has one pull request for its branch, merged. INCONCLUSIVE (the
+overlap assertion fails, listing every session's times) if the two fixes are so quick that the sessions never overlap: use
+stories whose fix takes minutes.
+
+## P4b-AT6 — slot affinity: a run killed during Implement resumes in the same slot while another item runs in the other (sc-25989)
+
+`SlotAcceptanceTests.P4b_AT6_a_run_killed_during_implement_resumes_in_the_same_slot_while_another_item_runs_in_the_other`: two
+`factory run sc-N --ignore-scope` child processes (the built CLI), one item each, with `Worker:Slots=2`, against a throwaway
+ledger and work root. Once both ledgers name a Claude session — both items are in a worker session, in different slots — the
+test SIGKILLs the first child (its own pid only, `OwnProcess`; never a process tree, never a sandbox user's process) and starts
+it again. Written with sc-25989 and run by the epic's terminal story.
+
+Prerequisites: as P4b-AT5 (two slots set up, `Worker__Slots=2`; no watch scope is needed), and
+
+- `FACTORY_E2E_P4B_AFFINITY_STORIES`: two To Do stories, `sc-<killed>,sc-<other>`, each a fix that takes the worker several
+  minutes (the second must still be in its session, or have finished it by itself, when the first is killed and resumed).
+  Both end In Progress with an open pull request (the test stops at Review), or `Done` if the gate merges them.
+
+```sh
+FACTORY_E2E=1 Worker__Slots=2 FACTORY_E2E_P4B_AFFINITY_STORIES=sc-<killed>,sc-<other> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4b_AT6*"
+```
+
+What it checks. The killed item: every `session` row before and after the kill names the same Claude session, its
+`worker_sessions` rows hold that one session id, and it has exactly one `slot` row, the same before and after — the resumed
+run waited for (or found free) the slot that started it and resumed there, stopping the first run's leftover worker through
+that slot's helper only. The other item, in the other slot: its worker was still running or had finished by itself after the
+kill and the resume; it has one `worker-started` row, one session id, one `slot` row (the other slot), no `orphan-killed`, no
+`worktree-lost`, no Paused or Escalated row, and it reaches Review. Each item has exactly one pull request for its branch.
+
+Not live (every `dotnet test`): `SlotPoolTests`, `LockScopeTests`, `WorkerSandboxTests` (the helper only through `SafeHelper`),
+`SetupScriptTests` and `FactoryOptionsTests` — the pool, the slot recorded per item and kept (resume, the stop of a leftover
+worker, the worktree's deletion, each waiting for the item's slot), each slot's helper sweeping only its own user's processes,
+start-up naming the slot whose installed helper is missing, stale or pinned to another user, the set-up script for n users, and
+the setting's validation. The live sandbox probes (`LiveWorkerSandboxTests`, `FACTORY_SANDBOX_LIVE=1`) probe every configured
+slot's user (AT6 above: `Worker__Slots=2` for two), including that each slot's `TMPDIR` is its own user's.
+
+## P4b-AT7 — defaults: one live test per earlier phase behaves as before (sc-25992)
+
+The epic's P4b-AT7: "With default settings the Phase 1–4a live tests behave as before (one of each phase re-run)." Run each of
+the four below on a machine whose settings are Phase 4b's defaults — no `Kanban:Watch:Projects`, no `Kanban:WebUrl`, no Kanban
+write token in config or the environment (`Kanban:WriteToken`, `FACTORY_KANBAN_WRITE_TOKEN`: with one, the Kanban source gets an
+intake lane; one in the keychain, account `kanban-write-token`, is hidden from the run's options by the harness, so it need not
+be removed), `Worker:Slots` unset (1) and `Intake:MaxConcurrentRuns` unset (1). `Kanban:Token` and `Kanban:McpUrl` are
+Phase 3's (the reviewers' Kanban reads) and may stay. The machine must be set up for Phase 4b first (`sudo
+scripts/setup-worker-user.sh`, "Upgrading to Phase 4b" below), or every test fails at start-up with "Stale helper".
+
+`FACTORY_E2E_P4B_DEFAULTS=1` marks the run as AT7: the shared harness (`E2e.StartAsync` and every `E2e.Options`) then FAILS the
+test before it starts if any of the settings above is not the default (`E2e.DefaultsProblems`; unit-tested, not live, by
+`DefaultsGuardTests` in every `dotnet test`), so an AT7 run cannot pass with Kanban or slots configured. Each test needs its own
+fresh story, as in its own section.
+
+| Phase | Test | Section |
+| --- | --- | --- |
+| 1 | `FactoryWorkTests.Factory_work_takes_a_ready_story_to_review_with_links_ledger_replay_and_cost` | AT2 |
+| 2 | `ReviewGateTests.Gate_merges_a_green_pr_a_high_class_panel_passed_and_the_ledger_records_the_merge_commit` | P2-AT1 |
+| 3 | `CodeGraphReviewTests.A_review_reads_the_code_and_asks_codegraph_and_the_verdict_and_pr_body_record_it` | Phase 3 (P3-AT1) |
+| 4a | `PlanAcceptanceTests.A_plan_item_is_planned_by_a_real_planner_into_stories_released_in_dependency_order_merged_into_its_changeset_branch_and_then_into_the_default_branch` | P4-AT1 |
+
+```sh
+# Every Phase 4b setting unset in this shell (the keychain's write token is hidden by the harness under FACTORY_E2E_P4B_DEFAULTS=1):
+unset Kanban__Watch__Projects Kanban__WebUrl Kanban__WriteToken FACTORY_KANBAN_WRITE_TOKEN Worker__Slots Intake__MaxConcurrentRuns
+export FACTORY_E2E=1 FACTORY_E2E_P4B_DEFAULTS=1
+FACTORY_E2E_WATCH_EPIC=<test epic id> FACTORY_E2E_STORY=sc-<id> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*Factory_work_takes_a_ready_story_to_review*"
+FACTORY_E2E_GATE_STORY=sc-<id> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*Gate_merges_a_green_pr_a_high_class_panel_passed*"
+FACTORY_E2E_P3_REVIEW_STORY=sc-<id> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*A_review_reads_the_code_and_asks_codegraph*"
+FACTORY_E2E_P4_PLAN_STORY=sc-<id> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*A_plan_item_is_planned_by_a_real_planner*"
+```
+
+(Each test's further prerequisites — the watch scope, the gate App, CodeGraph — are in its own section.)
+Pass: each test passes as it did before Phase 4b, and the summary shows four passed, none skipped.
+
+### Skipped is not passed
+
+Every live test SKIPS — never fails — when its opt-in (`FACTORY_E2E=1`), a credential or one of its variables is missing
+(`Harness.RequireOptIn`/`RequireSecret`/`RequireEnv`, the convention since Phase 1), so `dotnet test` stays green on a machine
+with none of them. The Phase 4b tests keep that convention. An acceptance run therefore reads the summary: a test reported
+skipped did not run, whatever the exit code. The only failures before a test starts are the ones above that make a run
+meaningless (the AT7 guard) or that the harness already had.
+
+## Upgrading to Phase 4b (sc-25980)
+
+`sudo scripts/setup-worker-user.sh` once after pulling Phase 4b: the launch helper is version 5 (version 4 added the slots; version 5, sc-25992, gives each sandbox user its own `TMPDIR`: in the shared `/tmp`, `_factory`'s NuGet lock directory refused `_factory2`'s `dotnet restore`, found by the live P4b-AT5), and until it is re-installed
+every `factory run` and `factory work` fails start-up with "Stale helper … re-run `sudo scripts/setup-worker-user.sh`" (close
+any `_factory` session and stop `factory work` first: a setup run kills every `_factory` process). With default settings (no
+Kanban settings, `Worker:Slots` and `Intake:MaxConcurrentRuns` unset) Phase 4b differs from `main` before it only in these,
+each deliberate:
+
+- `factory work` with nothing watched (no Shortcut scope, no `Kanban:Watch:Projects`, no `GitHub:Watch:Repos`) exits 2 naming
+  the three settings; before, it started with a warning and picked nothing up (owner decision, confirmed 2026-10-14: kept).
+- `factory run` beside a running `factory work` waits at its worker phases for the sandbox user (`[lock] … waiting`), instead of
+  failing at start because the work root's lock was held.
+- The ledger gets `slot-wait`, `slot-held` and `slot-released` rows (outcome `passed`) and the dashboard a Run column, also on a
+  one-slot install.
+- The help, the start-up and the readiness checks run before the router check, so a bad setting or a stale helper exits 2
+  without a router call.
+- The GitHub-issues intake lane is present whenever the workers' GitHub App is configured (it triages only watched
+  repositories), so in-flight issue items are finished even with `GitHub:Watch:Repos` cleared.
+- A ready item is not dispatched when the factory was paused, paused for usage or frozen after the poll began, and the
+  pipeline page's deferral list says what holds new work.
+- MCP session files are named `<owner>.<guid>.json` (the owner is the item whose run opened the session).
+- `factory work` polls on its interval while runs are in flight (sc-25992): every poll renews claims, and lists and starts work
+  only into the run capacity left free; with `Intake:MaxConcurrentRuns` 1 a poll during a run starts no ordinary item, and the
+  run order is unchanged. When a run ends after such a poll the next poll comes at once (as the old loop's did), not at the next
+  interval.
+- So during a long run every `Intake:PollSeconds` also brings the poll's reads, where the old loop made none until the run
+  ended: claim renewals, the router's usage read and the freeze evaluator — its main-red check's GitHub reads (each repository's
+  base tip and CI), cached 30 s as before.
+- An item being stopped and a plan item waiting on its stories are started every poll whatever runs are in flight (outside
+  `Intake:MaxConcurrentRuns`; their sandbox work still takes a worker slot), so a pending Stop or a plan's releases no longer
+  wait for another item's run to end.
+- The GitHub issues triage runs in the background of the loop (one at a time), beside item runs; its end lists what it
+  released at once. A triage waiting for the sandbox user no longer delays the next poll.
+
+## Phase 4b — Kanban contract fixtures: recording against the hosted board (sc-25986)
+
+`KanbanContractTests` replay `tests/DarkFactory.Orchestrator.Tests/Fixtures/kanban/*.json` in every `dotnet test`: the Kanban
+work source's whole lifecycle, each `tools/call` matched strictly by tool name and arguments. **The committed fixtures are
+hosted recordings** (sc-25992, 2026-10-14): each says `"recorded_from": "hosted KanbanBoard"`, and CI sets
+`KANBAN_FIXTURES_REQUIRE_HOSTED=1`, so a provisional one (`"in-repo fake (provisional; …)"`, what `KANBAN_RECORD=fake` writes)
+fails the build. The first hosted recording found that the scrubbing of a refusal's message also rewrote claim markers
+(the factory's identity is called `factory`, so `dark-factory:<id>` became `dark-fixture-recorder:<id>`): a name is now
+scrubbed, and guarded, only where it stands on its own (`KanbanIdentities.Mention`).
+
+Prerequisites:
+
+- a KanbanBoard personal access token of scope `full` — the factory's service identity will do, or a throwaway identity of
+  its own (KanbanBoard's `docs/deployment.md`, "Factory service identity"). It needs to create and delete a project;
+- nothing else: no ledger, no Postgres, no GitHub, no model, no `FACTORY_E2E`.
+
+Run (the token is read from the environment of this one command and from nowhere else — not the keychain, not user-secrets,
+not a file; it is sent as the bearer header and is never written to a fixture or printed):
+
+```sh
+dotnet build
+KANBAN_RECORD=1 KANBAN_RECORD_TOKEN="$(pbpaste)" \
+  tests/DarkFactory.Orchestrator.Tests/bin/Debug/net10.0/DarkFactory.Orchestrator.Tests -method "*KanbanFixtureRecording.Record"
+```
+
+| Variable | Meaning |
+| --- | --- |
+| `KANBAN_RECORD` | `1`: record against a real KanbanBoard. `fake`: record against the in-repo fake (how the provisional fixtures were made). Unset: the recorder is skipped |
+| `KANBAN_RECORD_TOKEN` | the `full`-scope token; required with `KANBAN_RECORD=1`, the environment only |
+| `KANBAN_RECORD_URL` | the MCP endpoint; default the hosted one (`Kanban:McpUrl`'s default). It must be an absolute `https` URL — the full-scope token is sent to it — or `http` on a loopback host (`localhost`, `127.0.0.1`, `[::1]`: a KanbanBoard on this machine); anything else is refused before any request |
+| `KANBAN_FIXTURES_REQUIRE_HOSTED` | `1`: `dotnet test` fails while any committed fixture is still provisional (`KanbanContractTests.The_committed_fixtures_say_where_they_were_recorded_…`). Set it for the run that checks the re-recording, and in CI once the hosted recordings are committed |
+
+What it creates, all its own: one project named `[dark-factory fixture] contract recording` with the key `DFFIX<8 hex>`
+(created under the idempotency key `dark-factory:fixture:<run id>`, `repository_url` the sandbox repository), in it one epic
+(`[dark-factory fixture] epic`), one epic document and sixteen work items titled `[dark-factory fixture] …` — the
+scenarios' items and the two a plan creates. It claims, moves, comments on, links and makes dependencies between those items
+only. Besides that it reads `list_projects` (every project is listed; only its own enters a fixture) and writes nothing
+outside its project.
+
+What it leaves: nothing but archived or deleted throwaways. When the scenarios are done — or one failed, or the run was
+cancelled (Ctrl-C, a test timeout: the clean-up runs on a token of its own, two Kanban timeouts long) — it deletes the
+project (`delete_project` takes the epic, the document and every item). That is the only hard delete the recorder ever sends,
+and it names the id the board returned to this run for the project this run created. If the board refuses the delete it
+archives the project instead (`update_project is_archived: true`). Then it reads the board again and fails the run, naming
+what is left (project id and key), unless its project is deleted or archived and every item it made is gone or inside its
+archived project; a delete whose answer was lost after it happened is found deleted by that read and is not a failure. If
+the clean-up itself fails (the board cannot be reached), the run fails saying the project may still be there, with its key
+and id.
+
+What an earlier run that died left is never deleted by a later run — that run did not create it. Each run starts by listing
+the projects (archived ones too) whose name starts `[dark-factory fixture]` AND whose key starts `DFFIX`, and looks into
+those only:
+
+- one that is exactly a recording's — the name is `[dark-factory fixture] contract recording`, the key is `DFFIX` and 8
+  upper-case hex digits, and every work item (closed ones and those of archived epics included), every epic and every epic
+  document in it is titled `[dark-factory fixture] …` — is archived if it is not yet (`update_project is_archived: true`,
+  reversible: the only write of this step) and printed with its key and id, as a `[kanban fixtures] …` line on standard
+  error and in the test's output, every run until it is gone. Delete it by hand in the web UI when you have looked at it;
+- one that is not exactly that (another name or key shape, or anything inside it that is not a throwaway) is someone's: it
+  is left untouched, nothing at all is written, and the run fails before it creates anything, naming the project (key, id,
+  and what is off — counted, not quoted). Rename or remove it by hand, then run again.
+
+KanbanBoard's contract gives a project no creator or owner, so "created by this token" cannot be part of that test; that is
+why a leftover is only ever archived.
+
+The fixtures are written only after the board was cleaned up and checked, and only after every check on them passed: the
+literal token is in none of them (searched for as text, whatever its shape), the guards find nothing (below; with the names
+and ids of the identities this run met), and each replays strictly in every framing. The seven files are then replaced
+together — written to a staging folder beside `Fixtures/kanban`, read back, and swapped in — so a failed run leaves the
+committed set as it was.
+
+Identities: the token's identity is recorded as the name `fixture-recorder` and the id
+`f0000000-0000-0000-0000-000000000001` (each further id met gets the next number; the same id is always the same
+placeholder) in `claimant`/`claimant_id`, `author`/`author_id` and a change's `actor`; its real name and id, learnt from the
+recorder's own first claim, are also replaced in every refusal's `message`. An e-mail address in any text becomes
+`redacted@example.com`. The contract's other shapes carry no identity (no creator, owner, e-mail or avatar field), and the
+change feed (`list_changes`), which the adapter does not read, is refused rather than recorded.
+
+`busy` and `conflict`: the `conflict` in `conflict.json` is the board's own — the recorder edits the item (as another
+caller would) between the adapter's read and its conditional move, so the board refuses the stale `expected_version`. A
+`busy` cannot be provoked on demand through the contract (the board answers it only after a write waited 10 s for other
+writers), so the first `update_work_item` of `busy.json` is authored from the contract's Error shape by the recording
+handler and not forwarded; it carries a `note` saying so, and the adapter's resend after it is the board's own answer.
+
+Verify afterwards:
+
+1. the command printed `Failed: 0, Skipped: 0`, and no `[kanban fixtures] …` line (one names a leftover project of an earlier
+   run, archived and not deleted: look at it on the board and delete it by hand);
+2. `git diff --stat tests/DarkFactory.Orchestrator.Tests/Fixtures/kanban` shows all seven files, and
+   `grep -L '"recorded_from": "hosted KanbanBoard"' tests/DarkFactory.Orchestrator.Tests/Fixtures/kanban/*.json` prints nothing;
+3. `dotnet build && KANBAN_FIXTURES_REQUIRE_HOSTED=1 dotnet test` passes: the adapter replays the hosted recordings, and the
+   guard tests find no token, e-mail address, identity's name or id, or anything that is not a `[dark-factory fixture]`
+   throwaway of the recording's own project (read the diff before committing all the same — the repository is public; in
+   particular `grep -h '"message"' tests/DarkFactory.Orchestrator.Tests/Fixtures/kanban/*.json`: a refusal's message is the
+   board's free text, and the guard can only know the names the run itself met);
+4. on the board (web UI, archived projects shown): no project named `[dark-factory fixture] …`, or only archived ones.
+
+If the replay fails on a hosted recording, the adapter and the hosted server disagree about the contract: that is the finding
+the recording exists for — fix the adapter (or KanbanBoard), never the fixture by hand.
+
+Not live (every `dotnet test`): `KanbanContractTests` — the replay of each fixture in each framing, what each recording holds,
+strict matching (a tool or argument the recording does not have, a missing or changed one, an extra call, a call never made),
+the handshake checks, normalisation of both framings, trimming, the scrubbing of names, ids and e-mail addresses (on the
+answer's strings, never its JSON text; one set of identities for the whole run), the guards on mutated fixtures (a token in
+six shapes, an e-mail, a foreign item, project, epic, document, blocker, listing entry, an identity's name, an id that is not
+the placeholder, a refusal message naming an identity, an over-long listing), and the provisional check — and
+`KanbanFixtureRecording`: the recorder end to end against the fake board (its fixtures pass every check `Record` makes before
+saving; someone else's project on the same board is neither recorded nor written; the board is left as found), a scenario
+that fails and a run that is cancelled (the project is still removed), a clean-up that itself fails (the run names the
+project), a delete the board refuses (archived; left archived and named by the next run), a delete whose answer is lost (not
+a leftover), a project that can be neither deleted nor archived (the run fails naming it), a project whose create answer
+never arrived (reported; archived by the next run), the sweep (an exact leftover archived and named, nothing deleted; seven
+kinds of look-alike left untouched and failing the run with nothing written), the recording URL rule, the pre-save checks
+(the literal token, a replay, the whole set, the guards) and the all-or-none save.
 
 ## Upgrading a Phase 1 ledger: items parked at Review
 

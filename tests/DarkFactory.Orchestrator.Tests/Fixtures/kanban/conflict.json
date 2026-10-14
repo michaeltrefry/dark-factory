@@ -1,0 +1,115 @@
+{
+  "recorded_from": "hosted KanbanBoard",
+  "parameters": {
+    "project": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+    "projectKey": "DFFIX16A87D2D",
+    "item": "9531d935-63ac-47c3-8d70-b4d6c3d69cdc"
+  },
+  "interactions": [
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "9531d935-63ac-47c3-8d70-b4d6c3d69cdc"
+      },
+      "isError": false,
+      "answer": {
+        "id": "9531d935-63ac-47c3-8d70-b4d6c3d69cdc",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] edited under the factory",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 3,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:43:07.58616+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:07.586163+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 1,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "update_work_item",
+      "arguments": {
+        "itemId": "9531d935-63ac-47c3-8d70-b4d6c3d69cdc",
+        "status": "Ready",
+        "expected_version": 1
+      },
+      "isError": true,
+      "answer": {
+        "code": "conflict",
+        "message": "Work item 9531d935-63ac-47c3-8d70-b4d6c3d69cdc is at version 2, not 1: it was changed after it was read. Nothing was changed; read it again and repeat the call."
+      }
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "9531d935-63ac-47c3-8d70-b4d6c3d69cdc"
+      },
+      "isError": false,
+      "answer": {
+        "id": "9531d935-63ac-47c3-8d70-b4d6c3d69cdc",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] edited by someone else",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 3,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:43:07.58616+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:08.120788+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 2,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "update_work_item",
+      "arguments": {
+        "itemId": "9531d935-63ac-47c3-8d70-b4d6c3d69cdc",
+        "status": "Ready",
+        "expected_version": 2
+      },
+      "isError": false,
+      "answer": {
+        "id": "9531d935-63ac-47c3-8d70-b4d6c3d69cdc",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "title": "[dark-factory fixture] edited by someone else",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 8,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-14T11:43:07.58616+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:08.699032+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 3,
+        "label_list": []
+      }
+    }
+  ]
+}

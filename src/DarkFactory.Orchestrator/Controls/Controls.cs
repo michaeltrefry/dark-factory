@@ -23,7 +23,10 @@ public enum ControlState
     Stopping,
 }
 
-/// <summary>Control scopes: <c>factory</c>, <c>usage</c>, <c>freeze</c>, <c>epic:&lt;id&gt;</c>, <c>item:sc-&lt;id&gt;</c> or <c>item:gh-&lt;key&gt;</c>.</summary>
+/// <summary>
+/// Control scopes: <c>factory</c>, <c>usage</c>, <c>freeze</c>, an epic's — <c>epic:&lt;id&gt;</c> for a Shortcut epic, <c>epic:kb-&lt;key&gt;</c>
+/// for a Kanban epic (sc-25985) — or an item's: <c>item:sc-&lt;id&gt;</c>, <c>item:gh-&lt;key&gt;</c>, <c>item:kb-&lt;key&gt;</c>.
+/// </summary>
 public static class ControlScope
 {
     public const string Factory = "factory";
@@ -43,23 +46,33 @@ public static class ControlScope
     /// </summary>
     public const string Freeze = "freeze";
 
-    public static string Epic(long epicId) => $"epic:{epicId}";
+    /// <summary>What an epic scope starts with, before the epic (<see cref="EpicRef.ToString"/>).</summary>
+    public const string EpicPrefix = "epic:";
+
+    /// <summary>
+    /// An epic's scope. It carries the epic's source (sc-25985): <c>epic:12</c> is Shortcut epic 12 — as it always was, so rows
+    /// written before Kanban epics had scopes still apply to Shortcut items, and only to them — and <c>epic:kb-12</c> the Kanban
+    /// epic with ledger key 12.
+    /// </summary>
+    public static string Epic(EpicRef epic) => EpicPrefix + epic;
 
     /// <summary>What an item scope starts with, before the item's external id.</summary>
     public const string ItemPrefix = "item:";
 
     public static string Item(string externalId) => ItemPrefix + externalId;
 
-    /// <summary>The Shortcut story id of an item scope, or null for another scope (or another source's item).</summary>
-    public static int? ItemStory(string scope) => ItemOf(scope) is { } item && item.Naming == ItemNaming.Shortcut ? item.Id : null;
-
-    /// <summary>The item of an item scope (<c>item:sc-12</c>, <c>item:gh-3</c>), or null for another scope.</summary>
+    /// <summary>The item of an item scope (<c>item:sc-12</c>, <c>item:gh-3</c>, <c>item:kb-4</c>), or null for another scope.</summary>
     public static ItemRef? ItemOf(string scope) =>
         scope.StartsWith("item:", StringComparison.Ordinal) ? ItemNaming.ParseAny(scope["item:".Length..]) : null;
 
-    /// <summary>The epic id of an epic scope, or null for another scope.</summary>
-    public static long? EpicOf(string scope) =>
-        scope.StartsWith("epic:", StringComparison.Ordinal) && long.TryParse(scope["epic:".Length..], out var id) && id > 0 ? id : null;
+    /// <summary>
+    /// The epic of an epic scope exactly as <see cref="Epic"/> writes it, or null for anything else (another scope; <c>epic:KB-3</c>
+    /// or <c>epic:012</c>, which no item's control would ever read).
+    /// </summary>
+    public static EpicRef? EpicOf(string scope) =>
+        scope.StartsWith(EpicPrefix, StringComparison.Ordinal) && ItemNaming.ParseEpic(scope[EpicPrefix.Length..]) is { } epic && Epic(epic) == scope
+            ? epic
+            : null;
 
     /// <summary>Whether <paramref name="scope"/> is a well-formed scope.</summary>
     public static bool IsValid(string scope) => scope == Factory || scope == Usage || scope == Freeze || ItemOf(scope) is not null || EpicOf(scope) is not null;
@@ -92,7 +105,8 @@ public interface IControls
 {
     /// <summary>
     /// What applies to one item: <see cref="ControlState.Stopping"/> when the item is being stopped, else
-    /// <see cref="ControlState.Paused"/> when the factory, the item's epic or the item is paused, else running.
+    /// <see cref="ControlState.Paused"/> when the factory, the item's epic or the item is paused, else running. The epic is
+    /// <paramref name="epicId"/> in the item's own source (<see cref="ItemNaming.EpicOf"/>, sc-25985).
     /// A story of a plan (sc-25876, <see cref="WorkItem.PlanItemId"/>) is held to its plan item's control as well — the plan's own
     /// <c>item:&lt;plan&gt;</c> scope, so a Pause, Continue or Stop on a plan item reaches its stories with no scope kind of its own:
     /// paused while the plan item is, and being stopped while the plan item is unless the factory already merged it.
@@ -163,7 +177,9 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
     {
         var own = ControlScope.Item(externalId);
         var scopes = new List<string> { ControlScope.Factory, ControlScope.Usage, ControlScope.Freeze, own };
-        if (epicId is { } epic)
+        // The epic of the item's own source (sc-25985): a Kanban item is held to `epic:kb-<key>`, never to the Shortcut epic whose
+        // number its epic's key happens to be. One more scope in the one query.
+        if (ItemNaming.EpicOf(externalId, epicId) is { } epic)
         {
             scopes.Add(ControlScope.Epic(epic));
         }
@@ -299,7 +315,7 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
     {
         if (!ControlScope.IsValid(scope))
         {
-            throw new ArgumentException($"'{scope}' is not a control scope (factory, usage, freeze, epic:<id>, item:sc-<id> or item:gh-<key>).", nameof(scope));
+            throw new ArgumentException($"'{scope}' is not a control scope (factory, usage, freeze, epic:<id>, epic:kb-<n>, item:sc-<id>, item:gh-<key> or item:kb-<n>).", nameof(scope));
         }
         if (state == ControlState.Stopping && ControlScope.ItemOf(scope) is null)
         {

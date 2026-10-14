@@ -16,9 +16,11 @@ has a `Repo: owner/name` line.
 
 ### Intake: `factory work`
 
-`factory work` is the long-running trigger: next to the session hub, the same process polls Shortcut every `Intake:PollSeconds`
-(default 60; there is no public webhook endpoint on the Mac) and runs each ready story through
-the pipeline, one at a time. Ready means a story in the `To Do` workflow state inside the watch
+`factory work` is the long-running trigger: next to the session hub, the same process polls its work sources — Shortcut,
+KanbanBoard (`Kanban:Watch:Projects`) and GitHub issues (`GitHub:Watch:Repos`), at least one watched — every `Intake:PollSeconds`
+(default 60; there is no public webhook endpoint on the Mac) and runs each ready item through
+the pipeline, one at a time (or up to `Intake:MaxConcurrentRuns` at once). A poll does not wait for its runs: the next one
+renews claims and starts new items into whatever run capacity is free. For Shortcut, ready means a story in the `To Do` workflow state inside the watch
 scope: any team in `Shortcut:Watch:Teams` (mention names or ids) or epic in
 `Shortcut:Watch:Epics` (ids), each comma-separated. An empty scope watches nothing; an unknown
 team or epic stops `factory work` at start-up (exit 2). Teams are listed with the documented
@@ -33,8 +35,8 @@ resume time (or `factory continue --usage`); items paused any other way (parked)
 A run that fails before its pipeline starts (the story was deleted, the board read fails) is retried at the next
 poll; after `Intake:MaxItemFailures` (default 3) such failures in a row the loop gives up on the item: one in Intake or
 Implement is escalated with a story comment, a paused one is parked with a comment (so it no longer auto-resumes).
-A failure every item shares (another sandboxed run holds the work root, the worker sandbox is not ready, the ledger
-or the worktree sweep fails, a missing credential) escalates nothing: it ends the poll and shows as a factory error
+A failure every item shares (the worker sandbox is not ready, the ledger or the worktree sweep fails, a missing
+credential) escalates nothing — another run in a worker phase is no failure: a run waits for its sandbox user: it ends the poll and shows as a factory error
 banner on the dashboard's pipeline page, next to each item's repeated failures, until a poll gets past it.
 
 The board is touched only through `IWorkSource` (`WorkSources/`; Shortcut adapter in
@@ -46,8 +48,8 @@ in `To Do` (or already the factory's), in scope, and not labelled `factory-claim
 owner; the claim is read back after writing. A refused claim parks the item in Paused with no board
 write until the story is ready again. A story whose item sits in a state this phase does not drive
 (e.g. parked at Review) and is dragged back to `To Do` is not re-read: it gets one comment saying so.
-`factory run sc-<id>` goes through the same path and checks for one story; `--ignore-scope` skips
-only the scope checks.
+`factory run sc-<id>` (or `kb-<n>`, a Kanban item; `gh-<n>`, a released GitHub issue) goes through the same path and checks for
+one item; `--ignore-scope` skips only the scope checks.
 
 ```sh
 export Shortcut__Watch__Teams=darkfactory
@@ -93,10 +95,16 @@ dashboard or the CLI, which write the same control rows in the ledger (`controls
 second and the dashboard redraws on `NOTIFY`.
 
 ```sh
-dotnet run --project src/DarkFactory.Orchestrator -- pause --factory       # or --epic 123 / --item sc-1234
+dotnet run --project src/DarkFactory.Orchestrator -- pause --factory       # or --epic 123 (a Shortcut epic) / --epic kb-3 (a Kanban epic) / --item sc-1234
 dotnet run --project src/DarkFactory.Orchestrator -- continue --factory
 dotnet run --project src/DarkFactory.Orchestrator -- stop --item sc-1234   # --epic / --factory stop every active item there
+dotnet run --project src/DarkFactory.Orchestrator -- kanban key --epic <epic GUID>   # a Kanban epic's key (kb-<n>), given now if it has none
 ```
+
+A Kanban epic is named by a key the ledger gives it (`kb-<n>`; the pipeline page shows it beside the epic's items). It gets
+one when the factory first reads an item of it, or ahead of that from `factory kanban key --epic <epic GUID>` (the epic is
+read from the board, nothing is written to it), so the epic can be paused or stopped before its first item is claimed.
+`factory kanban key <item GUID>` does the same for an item (`factory run kb-<n>`). A key the ledger never gave out is refused.
 
 - **Pause**: nothing new is claimed (a paused factory lists no ready stories; a story in a paused epic
   is not claimed) and no next step starts. A running worker stops after its current tool call: every
@@ -191,11 +199,17 @@ printf 'add-generic-password -U -s dark-factory -a router-key -w %s\n' "$(pbpast
 #    _factory PROCESS (its toolchain check runs through the helper, whose exit kills them all): close any
 #    `sudo -u _factory` session and stop `factory work` first. Re-run it after pulling any change to
 #    scripts/factory-worker-launch: `factory run`/`work` refuse to start unless the installed helper is the
-#    repo's (same SHA-256 once setup's sandbox_user/sandbox_uid lines are undone, helper_version >= 3):
+#    repo's (same SHA-256 once setup's sandbox_user/sandbox_uid lines are undone, helper_version >= 4):
 #    "Stale helper: the installed launch helper ... is not the current scripts/factory-worker-launch (...);
-#    re-run `sudo scripts/setup-worker-user.sh` to install it". They also refuse a helper that skips its
-#    _factory uid sweep ("... refuses its _factory uid sweep ...").
+#    re-run `sudo scripts/setup-worker-user.sh` to install it" (the file is read, not run, at start-up). A
+#    helper that skips its _factory uid sweep ("... refuses its _factory uid sweep ...") is found by the probe
+#    that runs it, in a run's first worker phase: it fails the factory there, not the item.
 sudo scripts/setup-worker-user.sh
+#    Several worker sessions at once (optional): one sandbox user per worker slot. `--slots 2` also sets up
+#    _factory2 with its own helper (factory-worker-launch-2), sudoers line, home and Claude Code; then set
+#    Worker__Slots=2 (and Intake__MaxConcurrentRuns=2 for `factory work` to use both). Start-up names the
+#    slot whose helper is missing or stale and the command to run, with the slot count.
+#      sudo scripts/setup-worker-user.sh --slots 2
 
 # 5. Worker model auth. Default Worker__Auth=router-key: the worker holds no Anthropic/OpenAI credential,
 #    only the router key; the router serves it from your plans, enrolled on the local router
@@ -203,7 +217,8 @@ sudo scripts/setup-worker-user.sh
 router login claude     # your Claude Pro/Max plan
 router login codex      # your ChatGPT/Codex plan
 #    then delete any Claude login _factory still has (opt-in, standalone: runs none of the setup, no helper,
-#    no toolchain check; deletes only its credentials file and keychain item, as _factory; signals no process):
+#    no toolchain check; deletes only its credentials file and keychain item, as _factory; signals no process;
+#    with --slots <n>, for each of the n sandbox users):
 sudo scripts/setup-worker-user.sh --remove-worker-login
 #    `factory run` / `factory work` refuse to start until the router's GET /v1/subscriptions/usage lists
 #    an enabled, routable, enrolled (managed or shared) plan for the key. A plan in reconnect_required is
@@ -238,8 +253,29 @@ killing every `_factory` process, so close `_factory` sessions and stop `factory
   (all but the helper itself, which then exits with the worker's status), so nothing that forked and `setsid()`ed away survives the run.
   That sweep runs only as `_factory`'s own uid, which setup pins into the installed helper (`sandbox_uid`, in 400–499);
   setup refuses an existing `_factory` whose uid is outside that range.
-  That makes `_factory` single-tenant: **one sandboxed `factory run` at a time per machine**, enforced by
-  a lock on `<work root>/.factory-run.lock` (a second run fails fast).
+  That makes `_factory` single-tenant: **one worker phase at a time per sandbox user** (a worker session, the gate's sandboxed
+  test runs, a deletion or stop through the helper), enforced by a lock on `<work root>/.factory-run.lock` that a run holds
+  for that phase only and waits for — so `factory run` beside `factory work`, or several items of `factory work`
+  (`Intake:MaxConcurrentRuns`), overlap while they wait on reviews, CI and the merge queue.
+- **Worker slots** (optional, `--slots <n>`, 1–8): n sandbox users — `_factory`, `_factory2`, … — each with everything above
+  for itself: its own uid, home, Claude Code, deny entry on your home, read entry on the work root, its own copy of the helper
+  (`factory-worker-launch-2`, …, pinned to its own user and uid, so it sweeps only that user's processes) and its own sudoers
+  line (that helper, as that user only). With `Worker__Slots=<n>` the factory runs one worker phase per slot side by side,
+  each under its own lock file (`slot-locks/.factory-run-2.lock`, …, in a directory the factory closes to every sandbox user). An item keeps the slot its first worker phase took (recorded in the
+  ledger): its session, its fix rounds, the gate's test runs and its worktrees are that user's, and it waits for that slot
+  even if another is free. A worktree is shared for writing with its item's slot's user only, and the factory refuses to
+  push from one any other user may write — with several slots also from one holding a file or directory another user may
+  write (it reads the mode and ACL of everything in the worktree before each push; a group- or world-writable file there
+  escalates the item, so run the factory and its builds under the usual umask 022). Each slot above 1 has its own `mcp-sessions-<n>`, `triage-worktrees-<n>` and
+  `plan-worktrees-<n>` under the work root (slot 1 keeps the plain names), and with several slots a session's MCP
+  credential file is readable by its own slot's user and the owner only (the factory sets and checks that itself; no extra
+  setup). Sandbox users can read each other's worktrees (accepted: isolation between slots is for writing). Without `--slots` and `Worker__Slots` nothing changes: one user, one helper, one lock.
+  Lowering the count: re-run setup with the smaller `--slots` (it removes the higher slots' sudoers lines and installed
+  helpers and names the accounts it leaves) and lower `Worker__Slots` to match — a larger `Worker__Slots` fails start-up. An
+  item already worked in a removed slot escalates saying so when it next needs a worker: raise both again and re-run it, or
+  stop it (`factory stop --item <id>`). The factory runs and deletes nothing as a user it no longer has: such an item's
+  worktree (and a worker a crashed run left) stays, reported as `[cleanup] leaving <path>: …`, until the count is raised
+  again or you remove it as root.
 - **`/opt/dark-factory/work`**: the work root (clones + worktrees), owned by you under a root-owned
   parent, readable by `_factory` (an inheritable ACL on the work root itself, never applied recursively).
   Each worktree directory is created empty and shared first (an inheritable read/write ACL for you and

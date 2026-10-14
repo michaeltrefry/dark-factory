@@ -37,9 +37,21 @@
         <ControlButton Action="continue" Scope="@ControlScope.Freeze" />
     </div>
 }
-@if (Intake.DeferredRun is { } deferredRun)
+@* What holds new work, each with what lifts it (sc-25991): one deferred run reads as it always did; several runs deferred in
+   one poll, or a factory-wide control the intake loop found in effect (as of its last read: the banners above and below are the
+   ledger's, current), are listed. *@
+@if (Intake.Deferrals is [{ Hold: false } deferredRun])
 {
-    <p class="error deferred">Deferred (last at @deferredRun.At.ToString("u")): @deferredRun.Message</p>
+    <p class="error deferred" data-deferral="@deferredRun.Id">Deferred (last at @deferredRun.At.ToString("u")): @deferredRun.Message</p>
+}
+else if (Intake.Deferrals is { Count: > 0 } deferrals)
+{
+    <ul class="error deferrals">
+        @foreach (var deferral in deferrals)
+        {
+            <li class="@(deferral.Hold ? "hold" : "deferred")" data-deferral="@deferral.Id">Deferred (last at @deferral.At.ToString("u")): @deferral.Message</li>
+        }
+    </ul>
 }
 @if (UsagePause is { } usage)
 {
@@ -56,10 +68,12 @@
 </div>
 @foreach (var epic in Epics)
 {
-    <div class="controls" data-scope="@ControlScope.Epic(epic)">
-        <span>Epic @epic: <span class="control-state">@(Paused(ControlScope.Epic(epic)) ? "paused" : "running")</span></span>
-        <ControlButton Action="@(Paused(ControlScope.Epic(epic)) ? "continue" : "pause")" Scope="@ControlScope.Epic(epic)" />
-        <ControlButton Action="stop" Scope="@ControlScope.Epic(epic)" />
+    @* An epic's scope carries its source (sc-25985): `epic:12` a Shortcut epic, `epic:kb-3` a Kanban epic. *@
+    var epicScope = ControlScope.Epic(epic);
+    <div class="controls" data-scope="@epicScope">
+        <span>Epic @epic: <span class="control-state">@(Paused(epicScope) ? "paused" : "running")</span></span>
+        <ControlButton Action="@(Paused(epicScope) ? "continue" : "pause")" Scope="@epicScope" />
+        <ControlButton Action="stop" Scope="@epicScope" />
     </div>
 }
 @if (_rows is null)
@@ -74,7 +88,7 @@ else
 {
     <table class="pipeline">
         <thead>
-            <tr><th>Item</th><th>State</th><th>Repo</th><th>PR</th><th>Elapsed</th><th>Cost</th><th>Sessions</th><th>Control</th></tr>
+            <tr><th>Item</th><th>State</th><th>Run</th><th>Repo</th><th>PR</th><th>Elapsed</th><th>Cost</th><th>Sessions</th><th>Control</th></tr>
         </thead>
         <tbody>
             @* A plan's stories are listed beneath their plan item (sc-25876), not as rows of their own. *@
@@ -99,6 +113,7 @@ else
                                         <span class="@(story.Failing ? "error waits" : "muted waits")">@story.Waits</span>
                                     }
                                 </td>
+                                <td class="muted run">—</td>
                                 <td>@(story.Repo ?? row.Repo)</td>
                                 <td class="muted" colspan="5">—</td>
                             </tr>
@@ -143,7 +158,31 @@ else
     private RenderFragment ItemRow(PipelineRow row, PlanStoryView? story, PipelineRow? planRow) => __builder =>
     {
                 <tr @key="row.Id" data-item="@row.Id" class="@(story is null ? null : "plan-story")" data-plan="@planRow?.Id" data-story="@story?.ExternalId">
-                    <td>@if (story is not null) { <span class="plan-indent">↳</span> } <span class="id">@row.ExternalId</span> @row.Title</td>
+                    <td>@if (story is not null) { <span class="plan-indent">↳</span> }
+                        @* The item on its board, where the ledger holds what the link needs (sc-25985: a Kanban item's opens its board). *@
+                        @if (row.Links?.Item is { } itemUrl)
+                        {
+                            <a class="id" href="@itemUrl" target="_blank" rel="noopener noreferrer">@row.ExternalId</a>
+                        }
+                        else
+                        {
+                            <span class="id">@row.ExternalId</span>
+                        }
+                        @($" {row.Title}")
+                        @if (row.Links is not null && row.Epic is { } rowEpic)
+                        {
+                            @(" ")<span class="muted epic" data-epic="@rowEpic">epic
+                                @if (row.Links.Epic is { } epicUrl)
+                                {
+                                    <a href="@epicUrl" target="_blank" rel="noopener noreferrer">@rowEpic</a>
+                                }
+                                else
+                                {
+                                    @rowEpic
+                                }
+                            </span>
+                        }
+                    </td>
                     <td class="state">@row.State
                         @if (row.FailedCloseout is { } closeout)
                         {
@@ -187,6 +226,27 @@ else
                             {
                                 <span class="muted plan-last-held">last hold recorded (@lastHeld.At.ToString("u")): @lastHeld.Detail</span>
                             }
+                        }
+                    </td>
+                    @* Every run in flight, of this process or another (sc-25991), from the ledger: whether one is alive (the item's
+                       run lock), its phase, and its worker slot — held, waited for, or only the item's. *@
+                    <td class="run" data-live="@(row.Run?.Live is { } alive ? (alive ? "true" : "false") : null)">
+                        @if (row.Run is { } run && !row.Finished)
+                        {
+                            @if (run.Live is { } live)
+                            {
+                                <span class="@(live ? "run-live" : "muted run-live")">@(live ? "running" : "no run now")</span>@(": ")
+                            }
+                            <span class="phase">@run.Phase</span>
+                            @if (run.SlotText is { Length: > 0 } slotText)
+                            {
+                                @(" · ")<span class="@(run.Stale ? "error slot" : run.Holds || run.Waits ? "slot" : "muted slot")"
+                                    data-slot="@(run.Holds ? "held" : run.Waits ? "waiting" : run.Stale ? "stale" : "idle")">@slotText</span>
+                            }
+                        }
+                        else
+                        {
+                            <span class="muted">—</span>
                         }
                     </td>
                     <td>@row.Repo</td>
@@ -239,9 +299,10 @@ else
     /// <summary>The factory's usage pause while it is in effect (it lifts by itself at its resume time).</summary>
     private Control? UsagePause => _controls.GetValueOrDefault(ControlScope.Usage) is { } c && c.PausesAt(Time.GetUtcNow()) ? c : null;
 
-    private IEnumerable<long> Epics => (_rows ?? []).Select(r => r.EpicId).OfType<long>()
-        .Concat(_controls.Keys.Select(ControlScope.EpicOf).OfType<long>())
-        .Distinct().Order();
+    /// <summary>The epics of the listed items and of every epic control, each source's apart (Shortcut's by number first).</summary>
+    private IEnumerable<EpicRef> Epics => (_rows ?? []).Select(r => r.Epic).OfType<EpicRef>()
+        .Concat(_controls.Keys.Select(ControlScope.EpicOf).OfType<EpicRef>())
+        .Distinct().OrderBy(e => e.Naming.Epics).ThenBy(e => e.Id);
     private ITimer? _tick;
     private bool _loading;
     private bool _again;
@@ -263,7 +324,8 @@ else
 
     private Task OnTickAsync()
     {
-        if (_rows?.Any(r => r.Sessions.Any(s => s.Running)) == true)
+        // A run shown alive is asked about again too (sc-25991): one that died wrote no row, so no change announces it.
+        if (_rows?.Any(r => r.Sessions.Any(s => s.Running) || r.Run?.Live == true) == true)
         {
             return ReloadAsync();
         }

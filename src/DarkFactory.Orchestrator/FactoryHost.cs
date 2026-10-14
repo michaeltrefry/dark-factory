@@ -102,14 +102,18 @@ public static class FactoryHost
         services.TryAddSingleton(TimeProvider.System);
         var quiet = options.QuietThreshold; // read now: an invalid Worker:QuietMinutes refuses to start the host
         var metrics = options.Metrics;
+        var links = WorkSourceRegistry.BoardLinks(options); // read now too: an invalid Kanban:WebUrl refuses to start the host
         services.AddSingleton<IDashboardData>(sp =>
-            new DashboardData(sp.GetRequiredService<IDbContextFactory<LedgerDbContext>>(), sp.GetRequiredService<TimeProvider>(), quiet, metrics));
+            new DashboardData(sp.GetRequiredService<IDbContextFactory<LedgerDbContext>>(), sp.GetRequiredService<TimeProvider>(), quiet, metrics,
+                boardLinks: links,
+                // Which items' runs are alive, in this process or another (sc-25991): the run locks, read without taking any.
+                liveRuns: new PostgresRunLocks(options.LedgerConnectionString).HeldAsync));
         // The intake loop's last errors (E10); empty on a host without one.
         services.TryAddSingleton(sp => new IntakeStatus(sp.GetRequiredService<TimeProvider>()));
         // The dashboard's only writes besides login/logout (E8): Pause, Continue and Stop.
         services.AddSingleton(sp => new Controls.ControlActions(
             sp.GetRequiredService<Controls.IControls>(), sp.GetRequiredService<IDbContextFactory<LedgerDbContext>>(), sp.GetService<Controls.IItemStops>(),
-            sp.GetService<WorkSources.IWorkSource>(), new PostgresRunLocks(options.LedgerConnectionString)));
+            sp.GetService<WorkSourceRegistry>() is { } sources ? sources.Find : null, new PostgresRunLocks(options.LedgerConnectionString)));
         services.AddSingleton<ISessionViewers>(sp => sp.GetRequiredService<SessionBroadcaster>());
         return services;
     }

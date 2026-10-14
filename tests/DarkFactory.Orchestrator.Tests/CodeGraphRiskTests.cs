@@ -4,7 +4,6 @@ using DarkFactory.Orchestrator.CodeGraph;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Mcp;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 using static DarkFactory.Orchestrator.Tests.GatePipelineTests;
 
@@ -609,12 +608,21 @@ public class CodeGraphRiskTests
 
     private static readonly DateTimeOffset Start = new(2026, 10, 8, 12, 0, 0, TimeSpan.Zero);
 
+    /// <summary>
+    /// A gate whose waits run on a <see cref="SteppingClock"/> of one-minute steps, with a CI timeout of five. The harness bounds
+    /// the default reader's overlay wait for the fake clock (<see cref="FakeCodeGraphRisk.FakeClockOverlayTimeout"/>), so the CI
+    /// timeout is what ends the wait.
+    /// </summary>
+    private static Harness OnSteppingClock(FakeCodeGraphRisk codeGraph) => new()
+    {
+        GateOnFakeClock = true, Time = new SteppingClock(Start, TimeSpan.FromMinutes(1)), CiTimeout = TimeSpan.FromMinutes(5), CodeGraph = codeGraph,
+    };
+
     [Fact]
     public async Task CodeGraph_still_unreadable_at_the_ci_timeout_escalates()
     {
         // Fake time: every wait moves the clock on by itself, so the timeout is reached in steps, whatever the load.
-        var h = new Harness { GateOnFakeClock = true, Time = new SteppingClock(Start, TimeSpan.FromMinutes(1)), CiTimeout = TimeSpan.FromMinutes(5) };
-        h.CodeGraph.Impact = (_, sha) => FakeCodeGraphRisk.NotIndexed(sha, "indexing");
+        var h = OnSteppingClock(new FakeCodeGraphRisk { Impact = (_, sha) => FakeCodeGraphRisk.NotIndexed(sha, "indexing") });
 
         var outcome = await h.Run().WaitAsync(TimeSpan.FromSeconds(60));
 
@@ -640,7 +648,7 @@ public class CodeGraphRiskTests
         var h = new Harness
         {
             GateOnFakeClock = true, Time = clock, CiTimeout = TimeSpan.FromMinutes(5), CodeGraph = codeGraph,
-            RiskReader = new CodeGraphRiskReader(codeGraph, TimeSpan.FromHours(1), TimeSpan.FromMinutes(1)),
+            RiskReader = new CodeGraphRiskReader(codeGraph, FakeCodeGraphRisk.FakeClockOverlayTimeout, TimeSpan.FromMinutes(1)),
         };
 
         var outcome = await h.Run().WaitAsync(TimeSpan.FromSeconds(60));
@@ -657,9 +665,11 @@ public class CodeGraphRiskTests
     [Fact]
     public async Task No_ready_overlay_of_the_head_keeps_the_gate_pending_until_the_ci_timeout()
     {
-        var h = new Harness { GateOnFakeClock = true, Time = new SteppingClock(Start, TimeSpan.FromMinutes(1)), CiTimeout = TimeSpan.FromMinutes(5) };
-        h.CodeGraph.Overlay = _ => new OverlayAnswer(true, "Error (overlays_unavailable): overlays are off", null, null, null, null, null,
-            ErrorCode: "overlays_unavailable");
+        var h = OnSteppingClock(new FakeCodeGraphRisk
+        {
+            Overlay = _ => new OverlayAnswer(true, "Error (overlays_unavailable): overlays are off", null, null, null, null, null,
+                ErrorCode: "overlays_unavailable"),
+        });
 
         var outcome = await h.Run().WaitAsync(TimeSpan.FromSeconds(60));
 

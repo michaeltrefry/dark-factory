@@ -1,5 +1,4 @@
 using System.CommandLine;
-using DarkFactory.Orchestrator.Shortcut;
 
 namespace DarkFactory.Orchestrator;
 
@@ -14,11 +13,12 @@ public static class FactoryCli
         Func<RepoRef, CancellationToken, Task<int>> protectRepo,
         Func<CancellationToken, Task<int>> work,
         Func<CancellationToken, Task<int>> setDashboardPassword,
-        Func<string, string, CancellationToken, Task<int>> control)
+        Func<string, string, CancellationToken, Task<int>> control,
+        Func<Guid, bool, CancellationToken, Task<int>>? kanbanKey = null)
     {
-        var storyArgument = new Argument<WorkSources.ItemRef?>("story-id")
+        var storyArgument = new Argument<WorkSources.ItemRef?>("item-id")
         {
-            Description = "Shortcut story id, e.g. sc-1234 or 1234, or a GitHub issue's work item, e.g. gh-12",
+            Description = "The work item's id: a Shortcut story, e.g. sc-1234 or 1234, a GitHub issue's work item, e.g. gh-12, or a Kanban item's, e.g. kb-7. The prefix names its work source, which must be configured",
             CustomParser = result =>
             {
                 var token = result.Tokens.Single().Value;
@@ -26,15 +26,15 @@ public static class FactoryCli
                 {
                     return item;
                 }
-                result.AddError($"'{token}' is not a work item id (expected sc-<number>, <number> or gh-<number>).");
+                result.AddError($"'{token}' is not a work item id (expected sc-<number>, <number>, gh-<number> or kb-<number>).");
                 return null;
             },
         };
         var ignoreScopeOption = new Option<bool>("--ignore-scope")
         {
-            Description = "Claim and resume the story even if it is outside the Shortcut watch scope (the other claim checks still apply)",
+            Description = "Claim and resume the item even if it is outside its work source's watch scope (the other claim checks still apply)",
         };
-        var runCommand = new Command("run", "Run one work item (a Shortcut story, or a released GitHub issue) through Intake → Implement → Review → CI → MergeGate → Merge, resuming from its last ledger state.")
+        var runCommand = new Command("run", "Run one work item (a Shortcut story, a released GitHub issue, or a Kanban item) through Intake → Implement → Review → CI → MergeGate → Merge, resuming from its last ledger state.")
         {
             storyArgument,
             ignoreScopeOption,
@@ -93,31 +93,81 @@ public static class FactoryCli
         };
         protectCommand.SetAction((parse, ct) => protectRepo(parse.GetValue(repoArgument)!, ct));
 
-        var workCommand = new Command("work", "Run the long-running factory host until Ctrl-C: the dashboard and session hub on 127.0.0.1:Factory:HostPort (plus Dashboard:BindAddress), and the intake loop that polls the watched Shortcut scope and runs each ready (To Do) story, one at a time.");
+        var workCommand = new Command("work", "Run the long-running factory host until Ctrl-C: the dashboard and session hub on 127.0.0.1:Factory:HostPort (plus Dashboard:BindAddress), and the intake loop that polls every configured work source in turn (Shortcut, KanbanBoard, GitHub issues: any of them, at least one) and runs each ready item, one at a time unless Intake:MaxConcurrentRuns says more.");
         workCommand.SetAction((_, ct) => work(ct));
 
         var setPasswordCommand = new Command("set-password", "Set the dashboard login password (read without echo; its hash goes to the keychain).");
         setPasswordCommand.SetAction((_, ct) => setDashboardPassword(ct));
 
+        var kanbanItemArgument = new Argument<Guid>("item-id")
+        {
+            Description = "The item's id on KanbanBoard (a GUID); left out with --epic",
+            Arity = ArgumentArity.ZeroOrOne,
+            CustomParser = result =>
+            {
+                var token = result.Tokens.Single().Value;
+                if (Guid.TryParse(token, out var id))
+                {
+                    return id;
+                }
+                result.AddError($"'{token}' is not a KanbanBoard item id (expected a GUID).");
+                return default;
+            },
+        };
+        var kanbanEpicOption = new Option<Guid?>("--epic")
+        {
+            Description = "An epic's id on KanbanBoard (a GUID), in place of an item's: print the epic's key (kb-<number>), giving it one if the factory has read no item of the epic yet; `factory pause|stop --epic kb-<number>` then takes it",
+            CustomParser = result =>
+            {
+                var token = result.Tokens.Single().Value;
+                if (Guid.TryParse(token, out var id))
+                {
+                    return id;
+                }
+                result.AddError($"'{token}' is not a KanbanBoard epic id (expected a GUID).");
+                return null;
+            },
+        };
+        var kanbanKeyCommand = new Command("key",
+            "Print the work item id (kb-<number>) of a KanbanBoard item, giving it one if the factory has not seen the item yet; `factory run kb-<number>` then runs it. `factory work` gives every item it lists its id by itself: this is for an item it has not listed. With --epic <epic id> instead of an item: print the key of a KanbanBoard epic (also kb-<number>, a number space of its own), giving it one if the factory has read no item of the epic yet, so that the epic can be paused or stopped (`factory pause --epic kb-<number>`) before its first item runs.")
+        {
+            kanbanItemArgument,
+            kanbanEpicOption,
+        };
+        kanbanKeyCommand.Validators.Add(result =>
+        {
+            // Exactly one of the two: an item id, or --epic with an epic id.
+            var item = result.GetResult(kanbanItemArgument) is { Tokens.Count: > 0 };
+            var epic = result.GetResult(kanbanEpicOption) is not null;
+            if (item == epic)
+            {
+                result.AddError("Give exactly one of an item id (a GUID) or --epic <epic id>.");
+            }
+        });
+        kanbanKeyCommand.SetAction((parse, ct) => kanbanKey is null ? Task.FromResult(1)
+            : parse.GetValue(kanbanEpicOption) is { } epic ? kanbanKey(epic, true, ct)
+            : kanbanKey(parse.GetValue(kanbanItemArgument), false, ct));
+
         return new RootCommand("Dark Factory orchestrator")
         {
             runCommand,
+            new Command("kanban", "KanbanBoard work items") { kanbanKeyCommand },
             workCommand,
             ControlCommand("pause", "Pause a scope: nothing new is claimed or started there, and running workers stop after their current tool call (session and worktree kept).", control),
             ControlCommand("continue", "Continue a paused scope: paused items resume from the ledger (an interrupted worker resumes its own Claude session).", control),
-            ControlCommand("stop", "Stop every active item in a scope: kill its worker, mark it Cancelled, turn its open PR back into a draft and move its story to the Backlog with a comment. Nothing is merged or deleted.", control),
+            ControlCommand("stop", "Stop every active item in a scope: kill its worker, mark it Cancelled, turn its open PR back into a draft and move it back to its board's Backlog with a comment, releasing the claim. Nothing is merged or deleted.", control),
             new Command("github-app", "GitHub App management") { setupCommand },
             new Command("github-repo", "Target repository management") { protectCommand },
             new Command("dashboard", "Dashboard management") { setPasswordCommand },
         };
     }
 
-    /// <summary><c>factory &lt;action&gt; --item sc-N | --epic N | --factory</c>; the handler gets the action and the control scope.</summary>
+    /// <summary><c>factory &lt;action&gt; --item sc-N|gh-N|kb-N | --epic N|kb-N | --factory</c>; the handler gets the action and the control scope.</summary>
     private static Command ControlCommand(string action, string description, Func<string, string, CancellationToken, Task<int>> control)
     {
         var item = new Option<WorkSources.ItemRef?>("--item")
         {
-            Description = "One work item: a Shortcut story, e.g. sc-1234, or a GitHub issue's, e.g. gh-12. A plan item's control applies to the plan and its stories",
+            Description = "One work item: a Shortcut story, e.g. sc-1234, a GitHub issue's, e.g. gh-12, or a Kanban item's, e.g. kb-7. A plan item's control applies to the plan and its stories",
             CustomParser = result =>
             {
                 var token = result.Tokens.Single().Value;
@@ -125,11 +175,24 @@ public static class FactoryCli
                 {
                     return parsed;
                 }
-                result.AddError($"'{token}' is not a work item id (expected sc-<number>, <number> or gh-<number>).");
+                result.AddError($"'{token}' is not a work item id (expected sc-<number>, <number>, gh-<number> or kb-<number>).");
                 return null;
             },
         };
-        var epic = new Option<long?>("--epic") { Description = "Every story of one Shortcut epic (its id)" };
+        var epic = new Option<WorkSources.EpicRef?>("--epic")
+        {
+            Description = "Every item of one epic: a Shortcut epic by its id, e.g. 12, or a Kanban epic by the key the factory gave it, e.g. kb-3 (the dashboard shows it)",
+            CustomParser = result =>
+            {
+                var token = result.Tokens.Single().Value;
+                if (WorkSources.ItemNaming.ParseEpic(token) is { } parsed)
+                {
+                    return parsed;
+                }
+                result.AddError($"'{token}' is not an epic (expected a Shortcut epic's id, <number>, or a Kanban epic's key, kb-<number>).");
+                return null;
+            },
+        };
         var factory = new Option<bool>("--factory") { Description = "The whole factory" };
         var usage = new Option<bool>("--usage") { Description = "The factory's usage pause (plans exhausted): lift it before its reset time" };
         var freeze = new Option<bool>("--freeze") { Description = "The factory's automatic freeze: clear it (only later events can freeze it again)" };
@@ -147,18 +210,14 @@ public static class FactoryCli
             if (given != 1)
             {
                 result.AddError(action == "continue"
-                    ? "Give exactly one of --item sc-N, --epic N, --factory, --usage or --freeze."
-                    : "Give exactly one of --item sc-N, --epic N or --factory.");
-            }
-            else if (result.GetValue(epic) is <= 0)
-            {
-                result.AddError("--epic must be a positive epic id.");
+                    ? "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N), --factory, --usage or --freeze."
+                    : "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N) or --factory.");
             }
         });
         command.SetAction((parse, ct) =>
         {
             var scope = parse.GetValue(item) is { } story ? Controls.ControlScope.Item(story.ToString())
-                : parse.GetValue(epic) is { } epicId ? Controls.ControlScope.Epic(epicId)
+                : parse.GetValue(epic) is { } named ? Controls.ControlScope.Epic(named)
                 : parse.GetValue(usage) ? Controls.ControlScope.Usage
                 : parse.GetValue(freeze) ? Controls.ControlScope.Freeze
                 : Controls.ControlScope.Factory;

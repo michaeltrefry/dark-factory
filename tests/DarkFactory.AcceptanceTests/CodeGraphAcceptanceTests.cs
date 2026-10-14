@@ -81,7 +81,7 @@ public class CodeGraphReviewTests
             }
             await ReviewGateTests.RequireGateReadyAsync(options, ct);
             using var shortcutHttp = OutboundHttp.ShortcutApi();
-            var outcome = await FactoryRunner.RunAsync(options, FactoryRunner.CreateWorkSource(options, shortcutHttp), storyId, ignoreScope: true,
+            var outcome = await FactoryRunner.RunAsync(options, WorkSourceRegistry.Shortcut(options, shortcutHttp), storyId, ignoreScope: true,
                 Console.Out, ct);
             var history = await e2e.HistoryAsync(storyId, ct);
             Assert.True(RunPipeline.Verdicts(history).Any(), $"sc-{storyId} was never reviewed: {outcome.State} {outcome.Error}");
@@ -141,7 +141,7 @@ public class CodeGraphReviewTests
         Assert.Contains(" tool call", body);
         // The body is the ledger's report (E8), tool use included.
         using var shortcutHttp = OutboundHttp.ShortcutApi();
-        var story = (await FactoryRunner.CreateWorkSource(options, shortcutHttp).ReadSpecAsync(storyId, ct)).Story;
+        var story = (await WorkSourceRegistry.Shortcut(options, shortcutHttp).ReadSpecAsync(storyId, ct)).Story;
         Assert.Equal(LedgerReport.PullRequestBody(story, latest.Take(report).ToList(), await e2e.SessionCostsAsync(storyId, ct)).ReplaceLineEndings("\n"),
             body.ReplaceLineEndings("\n"));
     }
@@ -403,7 +403,7 @@ public class CodeGraphGateTests
             });
 
             using var shortcutHttp = OutboundHttp.ShortcutApi();
-            var outcome = await FactoryRunner.RunAsync(options, FactoryRunner.CreateWorkSource(options, shortcutHttp), storyId, ignoreScope: true,
+            var outcome = await FactoryRunner.RunAsync(options, WorkSourceRegistry.Shortcut(options, shortcutHttp), storyId, ignoreScope: true,
                 Console.Out, ct, gate => gate with { Reviewer = reviewer });
 
             // The limit's wording depends on the sandbox's policy version (the code floor, or a v3 max_blast_radius): not asserted.
@@ -446,7 +446,7 @@ public class CodeGraphGateTests
         try
         {
             using var shortcutHttp = OutboundHttp.ShortcutApi();
-            var outcome = await FactoryRunner.RunAsync(options, FactoryRunner.CreateWorkSource(options, shortcutHttp), storyId, ignoreScope: true,
+            var outcome = await FactoryRunner.RunAsync(options, WorkSourceRegistry.Shortcut(options, shortcutHttp), storyId, ignoreScope: true,
                 Console.Out, ct, gate => gate with { Reviewer = new SeededReviewer() });
 
             await AssertEscalatedAtTheGateAsync(e2e, options, storyId, outcome, "CodeGraph could still not be read after 00:10:00 (Gate:CiTimeoutMinutes)", ct);

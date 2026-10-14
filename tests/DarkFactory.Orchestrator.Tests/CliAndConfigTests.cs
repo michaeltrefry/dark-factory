@@ -17,7 +17,8 @@ public class FactoryCliTests
             (repo, _) => { calls.Add($"protect {repo}"); return Task.FromResult(0); },
             _ => { calls.Add("work"); return Task.FromResult(0); },
             _ => { calls.Add("dashboard set-password"); return Task.FromResult(0); },
-            (action, scope, _) => { calls.Add($"{action} {scope}"); return Task.FromResult(0); });
+            (action, scope, _) => { calls.Add($"{action} {scope}"); return Task.FromResult(0); },
+            (id, epic, _) => { calls.Add(epic ? $"kanban key --epic {id}" : $"kanban key {id}"); return Task.FromResult(0); });
         return (root, calls);
     }
 
@@ -27,8 +28,13 @@ public class FactoryCliTests
     [InlineData("stop --item sc-77", "stop item:sc-77")]
     [InlineData("stop --item gh-4", "stop item:gh-4")]
     [InlineData("pause --item GH-4", "pause item:gh-4")]
+    [InlineData("pause --item kb-7", "pause item:kb-7")]
+    [InlineData("stop --item KB-7", "stop item:kb-7")]
     [InlineData("pause --epic 12", "pause epic:12")]
     [InlineData("stop --epic 12", "stop epic:12")]
+    [InlineData("pause --epic kb-3", "pause epic:kb-3")]
+    [InlineData("continue --epic kb-3", "continue epic:kb-3")]
+    [InlineData("stop --epic KB-3", "stop epic:kb-3")]
     [InlineData("pause --factory", "pause factory")]
     [InlineData("continue --factory", "continue factory")]
     [InlineData("continue --usage", "continue usage")]
@@ -45,6 +51,11 @@ public class FactoryCliTests
     [InlineData("pause --factory --item sc-1")]
     [InlineData("stop --item nope")]
     [InlineData("continue --epic 0")]
+    [InlineData("pause --epic kb-0")]
+    [InlineData("pause --epic gh-3")]
+    [InlineData("stop --epic sc-3")]
+    [InlineData("stop --epic nope")]
+    [InlineData("pause --epic kb-3 --item kb-3")]
     [InlineData("continue --usage --factory")]
     [InlineData("pause --usage")]
     [InlineData("stop --usage")]
@@ -62,6 +73,8 @@ public class FactoryCliTests
     [InlineData("42", "sc-42")]
     [InlineData("gh-12", "gh-12")]
     [InlineData("GH-3", "gh-3")]
+    [InlineData("kb-7", "kb-7")]
+    [InlineData("KB-7", "kb-7")]
     public async Task Run_passes_the_parsed_work_item(string arg, string expected)
     {
         var (root, calls) = Cli();
@@ -84,6 +97,16 @@ public class FactoryCliTests
     [InlineData("run", "gh-")]
     [InlineData("run", "gh-0")]
     [InlineData("run", "gh-1x")]
+    [InlineData("run", "kb-")]
+    [InlineData("run", "kb-0")]
+    [InlineData("run", "e0865c06-7b9a-4f0f-9a1e-3a8f3c0f2d11")] // a board id is not a work item id: `factory kanban key` gives it one
+    [InlineData("kanban", "key")]
+    [InlineData("kanban", "key", "kb-7")]
+    [InlineData("kanban", "key", "not-a-guid")]
+    [InlineData("kanban", "key", "--epic")]
+    [InlineData("kanban", "key", "--epic", "kb-3")]
+    [InlineData("kanban", "key", "--epic", "not-a-guid")]
+    [InlineData("kanban", "key", "e0865c06-7b9a-4f0f-9a1e-3a8f3c0f2d11", "--epic", "a1865c06-7b9a-4f0f-9a1e-3a8f3c0f2d22")] // one or the other
     public async Task Invalid_run_arguments_fail_without_running(params string[] args)
     {
         var (root, calls) = Cli();
@@ -91,6 +114,22 @@ public class FactoryCliTests
         Assert.NotEmpty(parse.Errors);
         Assert.NotEqual(0, await parse.InvokeAsync(new() { Output = TextWriter.Null, Error = TextWriter.Null }));
         Assert.Empty(calls);
+    }
+
+    [Fact]
+    public async Task Kanban_key_passes_the_items_board_id()
+    {
+        var (root, calls) = Cli();
+        Assert.Equal(0, await root.Parse(["kanban", "key", "E0865C06-7B9A-4F0F-9A1E-3A8F3C0F2D11"]).InvokeAsync());
+        Assert.Equal(["kanban key e0865c06-7b9a-4f0f-9a1e-3a8f3c0f2d11"], calls);
+    }
+
+    [Fact]
+    public async Task Kanban_key_with_epic_passes_the_epics_board_id_as_an_epic()
+    {
+        var (root, calls) = Cli();
+        Assert.Equal(0, await root.Parse(["kanban", "key", "--epic", "A1865C06-7B9A-4F0F-9A1E-3A8F3C0F2D22"]).InvokeAsync());
+        Assert.Equal(["kanban key --epic a1865c06-7b9a-4f0f-9a1e-3a8f3c0f2d22"], calls);
     }
 
     [Fact]
@@ -337,12 +376,69 @@ public class FactoryOptionsTests
     public void Workers_run_as_the_sandbox_user_by_default_with_a_work_root_outside_both_homes()
     {
         var options = Options([]);
-        Assert.Equal(new Worker.WorkerSandbox("_factory", "/usr/local/libexec/dark-factory/factory-worker-launch"), options.WorkerSandbox);
+        // The sandbox carries its work root's lock (sc-25988): every run of the helper happens under it.
+        Assert.Equal(new Worker.WorkerSandbox("_factory", "/usr/local/libexec/dark-factory/factory-worker-launch") { Lock = Locked("/opt/dark-factory/work") }, options.WorkerSandbox);
         Assert.Equal("/opt/dark-factory/work", options.WorkRoot);
 
         var custom = Options(new() { ["Worker:RunAs"] = "_df2", ["Worker:LaunchHelper"] = "/opt/h", ["Factory:WorkRoot"] = "/w" });
-        Assert.Equal(new Worker.WorkerSandbox("_df2", "/opt/h"), custom.WorkerSandbox);
+        Assert.Equal(new Worker.WorkerSandbox("_df2", "/opt/h") { Lock = Locked("/w") }, custom.WorkerSandbox);
         Assert.Equal("/w", custom.WorkRoot);
+    }
+
+    /// <summary>The lock of a work root: its <c>.factory-run.lock</c>.</summary>
+    private static WorkerLock Locked(string workRoot) => new(Path.Combine(workRoot, ".factory-run.lock"));
+
+    [Fact]
+    public void Worker_slots_default_to_the_one_sandbox_user_and_a_configured_count_adds_a_user_a_helper_and_a_lock_each()
+    {
+        // Unset (E9): one slot, which is exactly the sandbox before slots — one user, the same helper path, one lock file.
+        var unset = Options([]);
+        Assert.Equal(1, unset.WorkerSlotCount);
+        Assert.Equal(unset.WorkerSandbox, Assert.Single(unset.WorkerSlots!.All).Sandbox);
+        Assert.Equal("sudo scripts/setup-worker-user.sh", unset.WorkerSlots.All[0].Sandbox.Reinstall);
+
+        // A non-default value is read: slot n is the configured user with n appended, through the configured helper path with -n
+        // appended, under its own lock file.
+        var three = Options(new() { ["Worker:Slots"] = "3", ["Worker:RunAs"] = "_df", ["Worker:LaunchHelper"] = "/opt/h", ["Factory:WorkRoot"] = "/w" });
+        Assert.Equal(3, three.WorkerSlotCount);
+        Assert.Equal([(1, "_df", "/opt/h", "/w/.factory-run.lock"), (2, "_df2", "/opt/h-2", "/w/slot-locks/.factory-run-2.lock"), (3, "_df3", "/opt/h-3", "/w/slot-locks/.factory-run-3.lock")],
+            three.WorkerSlots!.All.Select(s => (s.Number, s.User, s.Sandbox.HelperPath, s.Lock!.Path)));
+        Assert.All(three.WorkerSlots.All, s => Assert.Equal("sudo scripts/setup-worker-user.sh --slots 3", s.Sandbox.Reinstall));
+        Assert.Equal(Worker.WorkerSlots.MaxSlots, Options(new() { ["Worker:Slots"] = "8" }).WorkerSlots!.Count);
+        three.ValidateSettings();
+
+        // Out of range is refused at start-up, naming the key.
+        foreach (var refused in new[] { "0", "-1", "9" })
+        {
+            Assert.Contains("Worker:Slots must be a whole number from 1 to 8",
+                Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:Slots"] = refused }).ValidateSettings()).Message);
+        }
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:Slots"] = "two" }).ValidateSettings());
+    }
+
+    [Fact]
+    public void Worker_slots_with_run_as_none_are_refused_rather_than_ignored()
+    {
+        // Unsandboxed there is no sandbox user and no lock: a slot count would have no consumer (E10).
+        var ex = Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:Slots"] = "2", ["Worker:RunAs"] = "none" }).ValidateSettings());
+        Assert.Contains("Worker:Slots is 2, but Worker:RunAs=none", ex.Message);
+        // 1 (or unset) is today's unsandboxed development mode.
+        var none = Options(new() { ["Worker:Slots"] = "1", ["Worker:RunAs"] = "none" });
+        none.ValidateSettings();
+        Assert.Null(none.WorkerSlots);
+    }
+
+    [Fact]
+    public void More_slots_than_concurrent_runs_is_allowed_and_noted_and_more_runs_than_slots_is_the_ordinary_case()
+    {
+        Options(new() { ["Worker:Slots"] = "3", ["Intake:MaxConcurrentRuns"] = "1" }).ValidateSettings();
+        Options(new() { ["Worker:Slots"] = "1", ["Intake:MaxConcurrentRuns"] = "4" }).ValidateSettings();
+        Assert.Null(FactoryRunner.SlotsNote(slots: 1, runs: 1));
+        Assert.Null(FactoryRunner.SlotsNote(slots: 2, runs: 4));
+        Assert.Null(FactoryRunner.SlotsNote(slots: 2, runs: 2));
+        var note = FactoryRunner.SlotsNote(slots: 3, runs: 2);
+        Assert.Contains("Worker:Slots is 3 but Intake:MaxConcurrentRuns is 2", note);
+        Assert.Contains("raise Intake:MaxConcurrentRuns", note);
     }
 
     [Fact]
@@ -399,7 +495,7 @@ public class FactoryOptionsTests
             var tools = FactoryRunner.CreateReviewTools(none, new FakeReviewFiles("head", []), http, log);
             Assert.Contains("no CodeGraph token", log.ToString());
             var outcome = await tools.RunAsync(new AnswerBlock(AnswerBlock.ToolUse, null, "toolu_1", ReviewTools.AnalyzeImpact, "{\"name\":\"X\"}"),
-                ReviewTools.Session(new Shortcut.RepoRef("o", "r"), "head", "base", 0), CancellationToken.None);
+                ReviewTools.Session(new RepoRef("o", "r"), "head", "base", 0), CancellationToken.None);
             Assert.True(outcome.IsError);
             Assert.Contains("CodeGraph is not configured", outcome.Content);
         }
@@ -408,7 +504,7 @@ public class FactoryOptionsTests
         var configured = FactoryRunner.CreateReviewTools(Options(new() { ["CodeGraph:Token"] = "cg_config" }), new FakeReviewFiles("head", []),
             codeGraph.Client("https://codegraph.test/"), TextWriter.Null);
         await configured.RunAsync(new AnswerBlock(AnswerBlock.ToolUse, null, "toolu_1", ReviewTools.AnalyzeImpact, "{\"name\":\"X\"}"),
-            ReviewTools.Session(new Shortcut.RepoRef("o", "r"), "head", "base", 0), CancellationToken.None);
+            ReviewTools.Session(new RepoRef("o", "r"), "head", "base", 0), CancellationToken.None);
         Assert.Equal("Bearer cg_config", codeGraph.Requests.First().Headers["Authorization"]);
     }
 
@@ -424,6 +520,22 @@ public class FactoryOptionsTests
             Assert.Contains("Kanban:McpUrl",
                 Assert.Throws<InvalidOperationException>(() => Options(new() { ["Kanban:McpUrl"] = bad }).ValidateSettings()).Message);
         }
+    }
+
+    [Fact]
+    public void A_kanban_write_token_equal_to_the_read_token_is_refused_at_start_up_without_printing_either()
+    {
+        // sc-25992 (E2): the read token reaches model sessions through the MCP proxy; the full-scope one must never be it.
+        const string token = "kb_same_full_scope_token_value";
+        var secrets = new InMemorySecrets();
+        secrets.Set(SecretAccounts.KanbanWriteToken, token);
+        var refused = Assert.Throws<InvalidOperationException>(() => Options(new() { ["Kanban:Token"] = token }, secrets).ValidateSettings());
+        Assert.Contains("Kanban:WriteToken must not be the same token as Kanban:Token", refused.Message);
+        Assert.DoesNotContain(token, refused.Message);
+
+        // Apart, or only one of them set, start-up goes on.
+        Options(new() { ["Kanban:Token"] = "kb_read_scope_token" }, secrets).ValidateSettings();
+        Options(new() { ["Kanban:WriteToken"] = "kb_other_full_scope" }).ValidateSettings();
     }
 
     [Fact]
@@ -456,6 +568,100 @@ public class FactoryOptionsTests
         Assert.All(kanban.Api.Requests, r => Assert.Equal("Bearer kb_config", r.Headers["Authorization"]));
         await Assert.ThrowsAsync<Mcp.ToolNotAllowedException>(() =>
             upstream.CallAsync("create_work_item", new System.Text.Json.Nodes.JsonObject(), CancellationToken.None));
+    }
+
+    [Fact]
+    public void Watched_kanban_projects_default_to_none_are_read_as_project_keys_and_a_malformed_key_is_refused_at_start_up()
+    {
+        // sc-25981, E10.
+        Assert.True(Options([]).KanbanWatchScope.IsEmpty);
+        Assert.Equal(["DF", "SCENE-WORKS"], Options(new() { ["Kanban:Watch:Projects"] = " df, Scene-Works ,DF" }).KanbanWatchScope.Projects);
+        Assert.Equal(["DF"], Options(new() { ["Kanban:Watch:Projects:0"] = "df" }).KanbanWatchScope.Projects);
+        Options(new() { ["Kanban:Watch:Projects"] = "df" }).ValidateSettings();
+        foreach (var bad in new[] { "two words", "df,a-key-that-is-longer-than-24", "df\tx" })
+        {
+            var refused = Assert.Throws<InvalidOperationException>(() => Options(new() { ["Kanban:Watch:Projects"] = bad }).ValidateSettings());
+            Assert.StartsWith("Kanban:Watch:Projects: ", refused.Message);
+        }
+    }
+
+    [Fact]
+    public void Kanban_web_url_defaults_to_the_hosted_kanbanboard_is_read_from_config_and_an_invalid_one_is_refused_at_start_up()
+    {
+        // sc-25981, E10: what a Kanban item's link is built on.
+        Assert.Equal(new Uri("https://kanban.trefry" + ".net/"), Options([]).KanbanWebUrl);
+        Assert.Equal(Gateway.OutboundHttp.KanbanDefaultWebUrl, Options([]).KanbanWebUrl);
+        var configured = Options(new() { ["Kanban:WebUrl"] = "http://127.0.0.1:5005/board/" });
+        Assert.Equal(new Uri("http://127.0.0.1:5005/board/"), configured.KanbanWebUrl);
+        configured.ValidateSettings();
+        var item = new Kanban.KanbanWorkItem(Guid.Parse("e0865c06-7b9a-4f0f-9a1e-3a8f3c0f2d11"), Guid.Parse("a0000000-0000-0000-0000-000000000001"),
+            "T", "Story", "Ready", 1);
+        Assert.Equal("http://127.0.0.1:5005/board/?project=a0000000-0000-0000-0000-000000000001&item=e0865c06-7b9a-4f0f-9a1e-3a8f3c0f2d11",
+            new Kanban.KanbanLinks(configured.KanbanWebUrl).Item(item));
+        foreach (var bad in new[] { "kanban.local", "ftp://kanban.local/", "https://user:pw@kanban.local/", "https://kanban.local/?project=1",
+            "https://kanban.local/#x", "https://api.anthropic.com/" })
+        {
+            Assert.Contains("Kanban:WebUrl",
+                Assert.Throws<InvalidOperationException>(() => Options(new() { ["Kanban:WebUrl"] = bad }).ValidateSettings()).Message);
+        }
+    }
+
+    [Fact]
+    public void The_kanban_write_token_is_its_own_credential_from_config_or_keychain_and_never_the_read_token()
+    {
+        // sc-25981, E2.
+        Assert.Equal("kanban-write-token", SecretAccounts.KanbanWriteToken);
+        var secrets = new InMemorySecrets();
+        secrets.Set(SecretAccounts.KanbanWriteToken, "kbw_keychain");
+        Assert.Equal("kbw_config", Options(new() { ["Kanban:WriteToken"] = "kbw_config" }, secrets).KanbanWriteToken);
+        if (Environment.GetEnvironmentVariable("FACTORY_KANBAN_WRITE_TOKEN") is not null)
+        {
+            return; // the environment supplies a token
+        }
+        Assert.Equal("kbw_keychain", Options([], secrets).KanbanWriteToken);
+        // The read token is no write token: with only it set, the write token is missing (and start-up is unaffected: it is
+        // needed only to work a Kanban item).
+        var readOnly = Options(new() { ["Kanban:Token"] = "kb_read" });
+        readOnly.ValidateSettings();
+        var missing = Assert.Throws<MissingCredentialException>(() => readOnly.KanbanWriteToken);
+        Assert.Contains("env FACTORY_KANBAN_WRITE_TOKEN, config 'Kanban:WriteToken', or keychain account 'kanban-write-token'", missing.Message);
+        if (Environment.GetEnvironmentVariable("FACTORY_KANBAN_TOKEN") is null)
+        {
+            Assert.False(Options(new() { ["Kanban:WriteToken"] = "kbw_config" }).TryGet(o => o.KanbanToken, out _));
+        }
+    }
+
+    [Theory]
+    [InlineData("https://github.com/acme/widgets.git", "acme/widgets")]
+    [InlineData("https://github.com/acme/widgets", "acme/widgets")]
+    [InlineData("https://github.com/acme/widgets/", "acme/widgets")]
+    [InlineData("http://GitHub.com/acme/widgets.git", "acme/widgets")]
+    [InlineData("ssh://git@github.com/acme/widgets.git", "acme/widgets")]
+    [InlineData("ssh://git@github.com:22/acme/widgets", "acme/widgets")]
+    [InlineData("git@github.com:acme/widgets.git", "acme/widgets")]
+    [InlineData("git@github.com:acme/widgets", "acme/widgets")]
+    [InlineData(" git@github.com:Acme/Wid.gets.git ", "Acme/Wid.gets")]
+    [InlineData("https://gitlab.com/acme/widgets.git", null)]
+    [InlineData("https://github.com.evil.example/acme/widgets.git", null)]
+    [InlineData("https://evil.example/github.com/acme/widgets", null)]
+    [InlineData("https://user:pw@github.com/acme/widgets.git", null)]
+    [InlineData("https://github.com/acme", null)]
+    [InlineData("https://github.com/acme/widgets/pull/1", null)]
+    [InlineData("git@github.com:acme/.git", null)]
+    [InlineData("git@github.com:../widgets.git", null)]
+    [InlineData("acme/widgets", null)]
+    [InlineData("", null)]
+    [InlineData(null, null)]
+    public void A_repository_url_names_a_github_repository_in_its_https_and_ssh_forms_or_none(string? url, string? repo) =>
+        Assert.Equal(repo, Gateway.GitRemoteReads.RepoOf(url)?.FullName);
+
+    [Fact]
+    public void A_repo_line_is_found_in_an_items_text_or_not_at_all()
+    {
+        Assert.Equal(new RepoRef("acme", "widgets"), RepoResolver.Named("Do it.\n\nRepo: acme/widgets\nRepo: acme/other"));
+        Assert.Null(RepoResolver.Named("Do it in the repo: somewhere."));
+        Assert.Null(RepoResolver.Named(null));
+        Assert.Equal(new RepoRef("o", "d"), RepoResolver.Resolve(null, new RepoRef("o", "d")));
     }
 
     [Fact]
@@ -523,20 +729,20 @@ public class FactoryOptionsTests
         var workspaces = new Git.GitWorkspace(Path.GetTempPath(), r => $"https://example.invalid/{r.FullName}", (_, _) => Task.FromResult<string?>(null));
 
         var gate = FactoryRunner.CreateGate(options, new GatePipelineTests.FakeGateGitHub(), new GatePipelineTests.FakeReviewer(),
-            workspaces, sandbox: null);
+            workspaces, slots: null);
         using var reviewer = FactoryRunner.ReviewerHttp(options);
 
         Assert.Equal((TimeSpan.FromSeconds(7), TimeSpan.FromMinutes(8)), (gate.CiPollInterval, gate.CiTimeout));
         Assert.Equal(TimeSpan.FromMinutes(9), Assert.IsType<SandboxTestRunner>(gate.Tests).Timeout);
         Assert.Equal((TimeSpan.FromMinutes(12), ReviewOverlays.DefaultPollInterval), (gate.Overlays!.Timeout, gate.Overlays.PollInterval));
         Assert.Equal(ReviewOverlays.DefaultTimeout, FactoryRunner.CreateGate(Options([]), new GatePipelineTests.FakeGateGitHub(),
-            new GatePipelineTests.FakeReviewer(), workspaces, sandbox: null).Overlays!.Timeout);
+            new GatePipelineTests.FakeReviewer(), workspaces, slots: null).Overlays!.Timeout);
         Assert.Equal(TimeSpan.FromMinutes(11), reviewer.Timeout);
         // sc-25709: risk-threshold reads CodeGraph through the same client, its overlay wait on the same timeout; no client, no reader.
         Assert.Null(gate.Risk);
         using var codeGraphHttp = new HttpClient();
         var withCodeGraph = FactoryRunner.CreateGate(options, new GatePipelineTests.FakeGateGitHub(), new GatePipelineTests.FakeReviewer(),
-            workspaces, sandbox: null, new CodeGraph.CodeGraphMcpClient(codeGraphHttp, "cg_test_token"));
+            workspaces, slots: null, new CodeGraph.CodeGraphMcpClient(codeGraphHttp, "cg_test_token"));
         Assert.Equal(TimeSpan.FromMinutes(12), withCodeGraph.Risk!.Overlays.Timeout);
     }
 
@@ -549,6 +755,17 @@ public class FactoryOptionsTests
 
         Assert.Equal(5, Options(new() { ["Intake:MaxItemFailures"] = "5" }).MaxItemFailures);
         Assert.Throws<InvalidOperationException>(() => Options(new() { ["Intake:MaxItemFailures"] = "0" }).MaxItemFailures);
+
+        // sc-25988: one run at a time unless configured; a value outside 1..8 is refused at start-up, naming the key.
+        Assert.Equal(1, Options([]).MaxConcurrentRuns);
+        Assert.Equal(3, Options(new() { ["Intake:MaxConcurrentRuns"] = "3" }).MaxConcurrentRuns);
+        Assert.Equal(WorkSources.IntakeOptions.MaxConcurrentRunsLimit, Options(new() { ["Intake:MaxConcurrentRuns"] = "8" }).MaxConcurrentRuns);
+        foreach (var refused in new[] { "0", "-1", "9" })
+        {
+            Assert.Contains("Intake:MaxConcurrentRuns must be a whole number from 1 to 8",
+                Assert.Throws<InvalidOperationException>(() => Options(new() { ["Intake:MaxConcurrentRuns"] = refused }).ValidateSettings()).Message);
+        }
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Intake:MaxConcurrentRuns"] = "two" }).ValidateSettings());
 
         Assert.Equal(DarkFactory.Orchestrator.RunPipeline.DefaultMaxControlReadFailures, Options([]).MaxControlReadFailures);
         Assert.Equal(4, Options(new() { ["Controls:MaxReadFailures"] = "4" }).MaxControlReadFailures);

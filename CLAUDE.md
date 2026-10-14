@@ -11,8 +11,10 @@ Claude Code headless workers through the Weave router.
   manifest setup (`GitHub/`), git worktrees (`Git/`), Claude worker and its sandbox (`Worker/`), router client,
   session capture + SignalR hub (`Sessions/`), the `factory work` host (`FactoryHost`) and its Blazor Server
   dashboard (`Dashboard/`: login, binding, ledger reads, transcript formatting; components in `Dashboard/Components`),
-  `IWorkSource` + the `factory work` intake loop (`WorkSources/`; registered on the `factory work` host by `FactoryHost.BuildWork` via `services.AddIntake(options)`)
-  and its Shortcut adapter (`Shortcut/ShortcutWorkSource.cs`), GitHub issues as a second source (`Issues/`: the intake
+  `IWorkSource` + the `factory work` intake loop (`WorkSources/`; registered on the `factory work` host by `FactoryHost.BuildWork` via `services.AddIntake(options)`),
+  the one registry of work sources `WorkSources/WorkSourceRegistry.cs` (sc-25982: which sources are configured, each built once; the
+  only file outside `Shortcut/` that names the Shortcut source's type)
+  and the Shortcut adapter (`Shortcut/ShortcutWorkSource.cs`), GitHub issues as a second source (`Issues/`: the intake
   `IssueIntake` — poll, triage, route, approvals — the routing rule `IssueTriage.cs`, the triage worker `TriageWorker.cs`,
   `GitHubIssueWorkSource`; GitHub side `GitHub/GitHubIssues.cs`), the Pause/Continue/Stop controls (`Controls/`), and the
   review and merge gate (`Gate/`: `ReviewModels` (which panel calls count), `ReviewPanel` (roles, prompts, findings),
@@ -29,9 +31,16 @@ Claude Code headless workers through the Weave router.
   satisfied" rule (sc-25871), and the classification of a plan's stories with what a failed one holds (sc-25876); `Changeset.cs` — a plan's changeset branch and the changeset review's spec (sc-25872); pipeline handler `RunPipeline.Plan.cs`; the production seat `SandboxPlanRunner` in `FactoryRunner.cs`;
   sc-25870),
   and the outbound gateway (`Gateway/`: `OutboundHttp` builds every GitHub, Shortcut, router, CodeGraph and Kanban `HttpClient` (and the
-  acceptance tests' dashboard client and their loopback-only client of the MCP proxy, `LoopbackMcp`); `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token
-  credentials; `GitRemoteReads` the github.com remote URL and every clone/fetch's arguments (sc-25391); `GitHubCli` is the only
-  `gh` run).
+  acceptance tests' dashboard client and their loopback-only client of the MCP proxy, `LoopbackMcp`); the GitHub client's reads
+  (GET/HEAD) answered 502/503/504, failed in the network or with no headers within 30 s are sent again, at most 3 attempts with a
+  1 s then 2 s backoff, the last attempt's answer the caller's as before — writes are never resent (`GitHubReadRetry`, sc-25992: a
+  single 503 on a pull request read escalated an item live); `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token
+  credentials; `GitRemoteReads` the github.com remote URL, every clone/fetch's arguments (sc-25391) and the repository a github.com
+  remote URL names (`RepoOf`, sc-25981); `KanbanWrites` builds the one MCP client that holds the orchestrator's full-scope Kanban
+  token (sc-25981); `GitHubCli` is the only `gh` run),
+  and KanbanBoard as a third work source (`Kanban/`, sc-25981: `KanbanWorkSource`, its typed MCP caller `KanbanBoard.cs`, and
+  `KanbanKeys.cs` — the ledger's `kb-<n>` keys of items and of epics, the watch scope `KanbanScope`, the web links `KanbanLinks` and the dashboard's `KanbanLedgerLinks`). `RepoRef` and
+  `RepoResolver` (`RepoRef.cs`) are in the root namespace: every source and the pipeline use them.
 - `src/DarkFactory.Analyzers` — the gateway lint (sc-25390), a Roslyn analyzer every build of the orchestrator and of
   `tests/DarkFactory.AcceptanceTests` runs (CI's `build-test` included), all errors: DF0001 an HTTP client/handler (made,
   subclassed, in `typeof` or an explicit type argument like `Activator.CreateInstance<HttpClient>()`), socket, web socket,
@@ -68,26 +77,100 @@ Claude Code headless workers through the Weave router.
   (internal, per async flow, set only by `Disable`, which no production code calls and which reads no config/env/CLI — a test
   checks both: no runtime bypass, E2), fails an assertion while passing with every check on (an empty or unrelated tagged test is
   reported).
-- `scripts/` — `setup-worker-user.sh` (one-time root setup of the `_factory` sandbox user) and
-  `factory-worker-launch` (the root-installed helper every sandboxed worker runs through).
+- `scripts/` — `setup-worker-user.sh` (one-time root setup of the sandbox users: `_factory`, and with `--slots n` also
+  `_factory2` … `_factoryn`, one per worker slot, sc-25989) and `factory-worker-launch` (the helper every sandboxed worker runs
+  through, installed root-owned once per sandbox user, each copy pinned to its own user and uid).
 - `tests/DarkFactory.Orchestrator.Tests` — unit tests (no network; fake HTTP APIs, InMemory EF, local git).
   Tests run `scripts/factory-worker-launch` only through `SafeHelper` (a checked copy whose every signal goes through a
   seam that signals only the test's own processes, and whose uid-sweep listing names only the helper's tree and the test's
-  registered pids; `SafeHelper.Source` is private); `SafeHelperTests` fails if a test
-  reaches the real helper another way (a repo path, the installed path, `Worker:LaunchHelper`/`options.WorkerSandbox`).
+  registered pids; a dead target — `ps` state `Z`, or `X`: on Linux a process its parent is reaping right then is listed with
+  parent 0, which once refused the helper's own watcher, exit 99, sc-25992 — is skipped, never signalled, and a dead group
+  member does not count; `SafeHelper.Source` is private); `SafeHelperTests` fails if a test
+  reaches the real helper another way (a repo path, the installed path, `Worker:LaunchHelper`/`options.WorkerSandbox`/`options.WorkerSlots`, sc-25992).
   A test signals a process only through `OwnProcess` (pid + start time, recorded where the pid cannot have been reused;
   `KillIfStillRunning` signals only while the start time still matches); `OwnProcessTests` fails on any other kill in
   `tests/` (`Process.Kill`, a kill(2) import, a `kill`/`pkill`/`killall` in a script).
-  Known flake, cause in the helper itself (sc-25877; about 1 in 100 runs of `WorkerSandboxTests`, any test asserting the helper's
-  stderr is empty, seen on `Uid_sweep_ignores_its_own_machinery_and_settles_at_once`): the helper ends its watcher with
-  `send_signal "$watcher"` and reaps it on the next line with `wait "$watcher" 2>/dev/null`; bash 3.2 also reports a signal-killed
-  job when it reads the next script line, so a watcher reaped between the two lines puts `… Terminated: 15 ( while … )` on the
-  helper's real stderr. The fix is one redirected group in `scripts/factory-worker-launch` (`{ send_signal "$watcher" || true;
-  wait "$watcher" || true; } 2>/dev/null`) and needs the owner's re-install; do not loosen the tests' assertion instead.
+  The helper's stderr (sc-25877's flake, then sc-25989 and sc-25990; all `helper_version` 4, which was never installed without
+  them): it holds only the worker's own output and the helper's `factory-worker-launch: …` messages, never a report of bash's
+  own. bash 3.2 writes three of those on its stderr: `… Terminated: 15 ( while … )` and `… Killed: 9 /usr/bin/env -i …`, the
+  job report of a job a signal ended (the watcher at the end of every run; the worker on every Stop), written when it next
+  reads a script line or finishes a command — about 1 in 100 runs of any test asserting an empty stderr, and for a worker a
+  signal ended BEFORE the helper's main shell had reached its `wait` no redirection on that `wait` can catch it; and, under
+  load (about 1 in 650 helper runs), `child setpgid (N to N): Operation not permitted` — under `set -m` bash and the child it
+  forks both call setpgid for the child, the child's call can lose on macOS, and bash's child reports it before the command's
+  own redirections apply (the group is set all the same). The design (sc-25990): right before the launch the helper moves its
+  own stderr away for the rest of the script — `exec 3>&2 2>/dev/null` — so everything bash itself reports from then on goes
+  nowhere; the worker's own redirection gives it the real stderr back before its exec and closes the saved descriptor for it
+  (`"$@" </dev/null 2>&3 3>&- &`: the worker's stderr and a failed exec's message still arrive, and the worker holds
+  descriptors 0, 1 and 2 only); the one message the helper prints after the launch (`… processes still appearing after N
+  sweeps`) goes to the saved descriptor by name (`>&3`); and fd 3 is closed for everything else the helper starts — the watcher
+  (`) <&0 3>&- &`, whose own stderr is now `/dev/null` too) and the sweep's listing and its awk (`list_uid_procs 3>&- |
+  outside_tree "$$" 3>&-`) — so nothing but the worker's own tree can hold the stderr the orchestrator reads to its end.
+  Everything printed BEFORE the launch (usage, a refused variable, `refusing the _factory uid sweep: …`) is on the real stderr
+  as before. The earlier redirections (`{ send_signal "$watcher" || true; wait "$watcher" || true; } 2>/dev/null`, `wait
+  "$worker" 2>/dev/null`) stay. What is lost with it: bash's own diagnostics after the launch (a fork that fails, a `set -e`
+  exit); the helper then exits non-zero. No safety property changed: the `sandbox_user`/`sandbox_uid` checks, `send_signal`,
+  the sweep and its self-exclusion, the environment, the program check and the exit status are the same lines as before.
+  `WorkerSandboxTests` pins that text; runs the helper 200 times with an empty stderr; stops a worker at once and later (exit
+  137, empty stderr, the stderr ending with the helper) and at once 200 times; holds the main shell 0.3 s in front of its
+  `wait` (a mutation of the test copy) while the worker ends itself by a signal (a file size limit of 0: SIGXFSZ, exit 153) or
+  is killed by a Stop — the early report made certain: with the helper's stderr still its own both print bash's report every
+  time, now neither does; and checks that the worker, the watcher and the sweep's listing hold no descriptor a plain child of
+  the test host does not, and that the helper's own late message still arrives next to a killed worker. Measured (sc-25990,
+  under CPU load the measurement started and stopped itself): the new helper 6,000 stop-at-once runs, 6,000 whole runs with
+  a sweep and 6,000 self-signalled workers, no line on stderr. The helper as it was: the early report did not show by timing
+  alone (0 in 6,000 stop-at-once runs with its watcher's stderr silenced, 0 in 6,200 self-signalled workers, the latter up to
+  36 load generators on 18 cores) — the window is a few script lines wide — and shows in every run once the main shell is
+  held in front of its `wait`; what did fail every stop-at-once loop within 18 runs was the TEST seam's own `awk: i/o error`
+  from a watcher killed mid-`send_signal` (the seam classifies targets with awk; the production `send_signal` is the `kill`
+  builtin and prints nothing), on the watcher's stderr, which was the helper's real one. Never loosen those tests' assertion.
   `CrashResumeTests` also needs the compose Postgres (skips locally without it, fails under `CI`): it
   SIGKILLs `tests/DarkFactory.CrashHost` (the real pipeline with a fake `claude` script) and restarts it.
   `ShortcutContractTests` replay recorded Shortcut API fixtures (`Fixtures/shortcut`, strict request matching);
   re-record with `SHORTCUT_RECORD=1` (writes only throwaway `[dark-factory fixture]` stories, archived after).
+  `KanbanContractTests` (sc-25986) do the same for KanbanBoard's MCP: the Kanban work source's whole lifecycle — list ready,
+  claim and read back, spec with epic and documents, the status changes, comment, links, release, claim renewal, a lost claim,
+  a plan's items with a dependency and their retry, blockers, make-ready, the return of an unstarted item, the epic key read,
+  a `busy` retried and a `conflict` re-read — as seven scenarios (`KanbanContractTests.Scenarios`), each replayed against its
+  fixture in `Fixtures/kanban` by `KanbanReplayHandler` (`Support/KanbanFixtures.cs`) under `McpHttpClient`. Matching is strict
+  per `tools/call`: the tool name and deep-equal arguments, in order (a tool or argument the recording does not have, a missing
+  one, another value, an extra call, a recorded call never made: each fails, naming the call). The transport is normalised,
+  not recorded: no JSON-RPC envelope, no session id (the replay hands out a fresh one per session and checks the handshake —
+  bearer token on every request, `initialize`, `notifications/initialized`, the closing `DELETE`, no other method), no framing
+  (every fixture is replayed answered as JSON, as an event stream, and alternating). A `KanbanInteraction` is
+  `{tool, arguments, isError, answer}`: the answer is the text block's one JSON document, a refusal's `{code, message}`, or a
+  plain MCP error's text. Recording: `KanbanRecordingHandler` (same file) under the adapter, `KanbanFixtureRecorder`
+  (`Support/KanbanFixtureRecorder.cs`) around it — one throwaway project created under an idempotency key
+  (`[dark-factory fixture] contract recording`, key `DFFIX<8 hex>`) with an epic, a document and the scenarios' items, deleted
+  afterwards (`delete_project`, by the id the board returned to this run: the recorder's only hard delete; archived when the
+  delete is refused), on a token of its own (`KanbanFixtureRecorder.CleanupTimeout`, so a cancelled run still cleans up), then
+  the board read again and anything of its own neither deleted nor archived fails the run naming it (a delete whose answer was
+  lost is found gone by that read; a clean-up that itself fails names the project). What an earlier run that died left is
+  never deleted (`SweepAsync`): a project with BOTH prefixes that is exactly a recording's (`NotARecordingAsync`: that name,
+  the key `DFFIX` + 8 upper-case hex, every item, epic and epic document in it prefixed; the contract gives a project no
+  creator to check) is archived — reversible — and named (key, id) in `Notes`, which `Record` prints as `[kanban fixtures] …`
+  for the owner to delete by hand; one that is not exactly that is left untouched and fails the run before anything is
+  written. The repository is public: a recorded listing keeps only the recording's own projects, items and documents, an
+  answer about anyone else's object (and the change feed) is refused, an identity's name becomes `fixture-recorder` and its id
+  a fixed placeholder (`f0000000-0000-0000-0000-00000000000N`; `KanbanIdentities`, one set for the whole run, seeded from the
+  recorder's own first claim, so a refusal's message naming the identity is scrubbed in every scenario), an e-mail a
+  placeholder (replaced in string values, never in JSON text), and no request header (the token) is ever read into a fixture;
+  `KanbanFixtureGuard` fails a committed fixture that holds a token (`Authorization`, a bearer value, `kbp_…`, a JWT), an
+  e-mail, an identity's name, an identity's id that is not the placeholder, a refusal message naming an identity the set or
+  the run knows (`SetProblems`), or an item/project/epic/document/listing entry that is not a throwaway of the fixture's own
+  project. Before `Record` saves, `KanbanFixtureRecording.VerifiedAsync` also searches every file for the literal token and
+  replays every fixture in every framing, and `KanbanFixture.SaveAll` replaces the set whole or not at all. The `conflict` is real (the recorder edits the item between the adapter's read and its
+  conditional move); a `busy` cannot be provoked on demand (the board answers it only after a write waited 10 s for other
+  writers), so that one interaction is authored from the contract's Error shape by the recording handler, not forwarded, and
+  marked (`note`, `KanbanRecordingHandler.SyntheticBusyNote`) — the resend after it is the board's own answer.
+  HOSTED (sc-25992, 2026-10-14): the committed fixtures say `"recorded_from": "hosted KanbanBoard"`; before, they were
+  provisional recordings against `FakeKanbanBoard` (`KANBAN_RECORD=fake`, which `KanbanFixtureRecording` still proves end to
+  end in every `dotnet test`). A refusal's message is scrubbed of an identity's name only where the name stands on its own
+  (`KanbanIdentities.Mention`: the factory's identity is called `factory`, and a plain replace rewrote `dark-factory:<id>`
+  markers). Re-record against the hosted board with `KANBAN_RECORD=1` and a full-scope token in `KANBAN_RECORD_TOKEN` (the environment
+  only: never the keychain, never a file; `KANBAN_RECORD_URL` for another instance: absolute https, or http on a loopback
+  host, else refused — `KanbanFixtureRecording.Endpoint`) — docs/acceptance.md, "Kanban contract
+  fixtures". `KANBAN_FIXTURES_REQUIRE_HOSTED=1` (set in CI) makes a provisional fixture fail `dotnet test`.
 - `tests/DarkFactory.AcceptanceTests` — live epic acceptance harness; skips unless `FACTORY_E2E=1`. AT1–AT8 runbook:
   `docs/acceptance.md` (the `factory work` tests use a throwaway ledger DB and their own work root, `E2e.cs`). Phase 2's epic
   AT2/AT4/AT5/AT6 (sc-25391): `ReviewGateTests` (typed outcome per row, merge queue, PR body and closeout equal to the ledger's),
@@ -123,6 +206,36 @@ Claude Code headless workers through the Weave router.
   the merge (sc-25877, `FACTORY_E2E_P4_CARGO_MERGE_STORY`: a test of new code, `not-built` on the base and passing on the head,
   `new-tests` `pass`, a `Merge` gate row, `gate-passed`, the pull request merged; it leaves a crate per run under the sandbox's
   `e2e-rust-merged/`).
+  Phase 4b's P4b-AT1 (sc-25981, sc-25992, `KanbanAcceptanceTests`, `FACTORY_E2E_P4B_KANBAN_ITEM` + `FACTORY_E2E_P4B_KANBAN_PROJECT`):
+  one `factory run kb-N` takes a Ready item of a watched KanbanBoard project to a merged pull request with no human — its key
+  given once, claimed on the real board (the factory's marker), Intake → Implement … MergeGate → Merge → Watch with typed
+  outcomes, the pull request from `factory/kb-N` merged at the Merge row's commit, the item `Done` with the pull request and the
+  branch linked under their kinds and exactly one comment equal to `LedgerReport.MergedCloseout`'s rendering of the rows before
+  the posted `closeout`; a second run writes no claim, link or closeout again. P4b-AT4 (`KanbanAcceptanceTests.P4b_AT4_…`):
+  `factory work` with KanbanBoard alone claims the item and opens its pull request (on GitHub, linked with the branch), then
+  `factory stop --item kb-N` stops it. P4b-AT7 (sc-25992, docs/acceptance.md "P4b-AT7 — defaults"): one live test per earlier
+  phase re-run with default settings; `FACTORY_E2E_P4B_DEFAULTS=1` makes the shared harness (`E2e.StartAsync`, `E2e.Options`)
+  fail a test before it starts unless `Kanban:Watch:Projects`, `Kanban:WebUrl` and a Kanban write token from config or env are
+  unset (a keychain write token is hidden from the run's options) and `Worker:Slots` and `Intake:MaxConcurrentRuns` are 1
+  (`E2e.DefaultsProblems`; `DefaultsGuardTests`, not live). Every live test SKIPS when its opt-in, a credential or a variable is
+  missing (the convention since Phase 1, kept): skipped is not passed.
+  P4b-AT2 (sc-25984, `KanbanPlanAcceptanceTests`, `FACTORY_E2E_P4B_PLAN_KANBAN_ITEM` + `FACTORY_E2E_P4B_KANBAN_PROJECT`): a real
+  planner plans a `plan`-labelled Kanban item into at least 3 items with a dependency chain (else INCONCLUSIVE,
+  `PlanLive.ChainProblem`) — each one item of the real board, in the plan item's project and epic, in `Backlog`, marked as planned
+  from the plan item's GUID, with the board's own dependencies — released in order (`Ready` only after its blockers' Merge rows),
+  each worked and merged by the gate into `factory/changeset-kb-<n>`, the changeset then merged by one gated pull request, the
+  plan item `Done` with a closeout equal to `LedgerReport`'s rendering of the throwaway ledger's rows.
+  P4b-AT5 and P4b-AT6 (sc-25989, `SlotAcceptanceTests`; a machine set up with `--slots 2` and `Worker__Slots=2`): two items of
+  one `factory work` in a worker session at the same time, each in its own slot (overlapping `worker_sessions` rows), both merged
+  (`FACTORY_E2E_P4B_SLOT_STORIES` + the watch scope); and two `factory run` children in different slots, the first SIGKILLed
+  (its own pid only) during Implement and started again — the same session in the same slot, the other item's session,
+  worktree and worker untouched (`FACTORY_E2E_P4B_AFFINITY_STORIES`).
+  P4b-AT3 (sc-25983, `KanbanAcceptanceTests.P4b_AT3_…`, `FACTORY_E2E_P4B_KANBAN_PROJECT` + `FACTORY_E2E_P4B_KANBAN_OTHER_TOKEN`,
+  a second identity's full-scope token; no model): on a throwaway Backlog item the test creates (once, by its idempotency key),
+  in flight only in the throwaway ledger — a second caller's claim on the item the factory holds is refused; one intake poll
+  renews the claim past its first (20 s) expiry; a write on a stale version is refused `conflict` and writes nothing; and once
+  the second caller holds the item the next poll pauses it (``claim lost: … claimed by `<them>` ``, `parked`), their claim, column
+  and version untouched.
 
 ## Commands
 
@@ -133,14 +246,18 @@ dotnet build
 dotnet test                                   # unit tests; acceptance tests skip
 dotnet ef database update --project src/DarkFactory.Orchestrator
 dotnet ef migrations add <Name> --project src/DarkFactory.Orchestrator -o Ledger/Migrations
-dotnet run --project src/DarkFactory.Orchestrator -- run sc-1234
-dotnet run --project src/DarkFactory.Orchestrator -- work          # long-running host: dashboard + session hub on 127.0.0.1 + the intake loop (polls the watch scope)
+dotnet run --project src/DarkFactory.Orchestrator -- run sc-1234             # or gh-12 (a released GitHub issue), kb-7 (a Kanban item)
+dotnet run --project src/DarkFactory.Orchestrator -- kanban key <item GUID>   # prints the item's kb-<n> (given now if it has none); only for an item `factory work` has not listed
+dotnet run --project src/DarkFactory.Orchestrator -- kanban key --epic <epic GUID>   # prints the epic's key kb-<n> (given now if it has none), so `pause|stop --epic kb-<n>` works before any item of the epic was read
+dotnet run --project src/DarkFactory.Orchestrator -- work          # long-running host: dashboard + session hub on 127.0.0.1 + the intake loop (polls every configured work source)
 dotnet run --project src/DarkFactory.Orchestrator -- dashboard set-password   # dashboard login (hash → keychain)
-dotnet run --project src/DarkFactory.Orchestrator -- pause --factory          # also continue/stop; --epic N or --item sc-N
+dotnet run --project src/DarkFactory.Orchestrator -- pause --factory          # also continue/stop; --epic N (a Shortcut epic) | kb-N (a Kanban epic's key), or --item sc-N | gh-N | kb-N
 dotnet run --project src/DarkFactory.Orchestrator -- continue --freeze        # clear the automatic freeze (also --usage)
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup --gate   # the merge gate's own App (then re-run protect)
 dotnet run --project src/DarkFactory.Orchestrator -- github-repo protect owner/name   # rulesets; owner's GH_TOKEN / `gh auth token`
+sudo scripts/setup-worker-user.sh             # the owner, once and after any change to scripts/factory-worker-launch: the sandbox user and its helper
+sudo scripts/setup-worker-user.sh --slots 2   # the same for 2 worker slots (_factory, _factory2), then Worker__Slots=2
 ```
 
 ## Configuration
@@ -158,7 +275,10 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional: without it the factory starts and every CodeGraph tool answers the reviewer an error result (recorded), triage gets no CodeGraph, and the merge gate's `risk-threshold` fails wherever a tier requires it (sc-25709), so no normal or protected change merges (`factory run` and `factory work` warn at start-up) |
 | `Kanban:McpUrl` | `https://kanban-mcp.trefry.net/mcp` (`OutboundHttp.KanbanDefaultMcpUrl`; an absolute http(s) URL naming no model provider; MCP Streamable HTTP): the Kanban upstream (sc-25707), offered to reviewers through their tool loop and to a plan item's planner session through the loopback proxy (`McpProfile.Planner`, sc-25870); never to triage sessions, whose proxy is started without it (`McpProfile.Triage`: the issue text is untrusted and the triage's answer is posted on the issue) |
 | `Kanban:Token` | env `FACTORY_KANBAN_TOKEN`, or keychain account `kanban-token`: a KanbanBoard PAT (`Authorization: Bearer`), owner-side only (E5). Optional: without it there is no Kanban upstream (not an error) |
-| `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token` |
+| `Kanban:WriteToken` | env `FACTORY_KANBAN_WRITE_TOKEN`, or keychain account `kanban-write-token` (sc-25981): the orchestrator's own KanbanBoard PAT, scope `full`, with which the Kanban work source claims, moves, comments on and links items. Owner-side only and apart from `Kanban:Token` (E2): equal to it is refused at start-up (`WorkSourceRegistry.EnsureKanbanTokensApart`, from `FactoryOptions.ValidateSettings` and again where the source is built; exit 2, naming the keys and neither token, sc-25992 — the read token reaches model sessions through the MCP proxy); it is read in one place (`WorkSourceRegistry.Kanban`), held by one client (`Gateway/KanbanWrites`) and is in no MCP upstream, profile, allowlist or proxy grant. Needed only to work a Kanban item (`factory run kb-N`, `factory kanban key`): missing, those print the reason and exit 2 |
+| `Kanban:Watch:Projects` | empty = watch nothing; comma-separated KanbanBoard project keys (each ≤ 24 characters, no spaces; upper-cased, once each; else refused at start-up naming the key). An item is in scope when its project is one of them. Set, it makes KanbanBoard a configured work source that `factory work` polls (sc-25982) and then needs `Kanban:WriteToken` (else refused at start-up); each key is checked on the board at start-up |
+| `Kanban:WebUrl` | `https://kanban.trefry.net/` (`OutboundHttp.KanbanDefaultWebUrl`; an absolute http(s) URL without credentials, query or fragment, naming no model provider): what a Kanban item's, epic's and document's link is built on (`KanbanLinks`: `?project=<id>[&epic=<id>]&item=<id>`) — KanbanBoard's MCP returns no URL, and nothing is requested from this address |
+| `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token`. Needed only to work Shortcut stories (sc-25982): with no Shortcut watch scope the factory starts without it, on its other work sources. With the token and no watch scope, `factory work` picks up no Shortcut story but still finishes the Shortcut items already in its ledger (a lane of its own); without the token it cannot, and warns at start-up when the ledger holds active ones |
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
 | `GitHub:Gate:AppId`, `GitHub:Gate:PrivateKeyPem` | keychain `github-gate-app-id`, `github-gate-app-private-key` (written by `factory github-app setup --gate`): the merge gate's App, the only credential that merges |
 | `Review:Models`, `Review:Correctness:Models`, `Review:SpecConformance:Models`, `Review:Security:Models`, `Review:Confirm:Models` | retired (sc-25626, epic E8): no reviewer or second-opinion model is pinned — every panel call names the router's `high` model class. Any of them set (even empty) is refused at start-up (`FactoryOptions.RejectReviewModelSettings`, `ReviewConfigurationException`: `factory run` and `factory work` print the reason and exit 2, before any router call) rather than silently ignored |
@@ -167,10 +287,11 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Gate:TestTimeoutMinutes` | `20` (> 0: one sandboxed run — restore, build, the new tests — of the `new-tests-fail-on-base` check; still running at the timeout fails the check) |
 | `Factory:DefaultRepo` | `michaeltrefry/dark-factory-sandbox` (a story line `Repo: owner/name` overrides) |
 | `Factory:Repos` | empty; comma-separated `owner/name` (each well-formed, else refused at start-up naming the key): repositories the factory may plan and work in besides the default one (sc-25877). It only adds to the configured repositories (`FactoryOptions.ConfiguredRepos` = `Factory:DefaultRepo` ∪ `Factory:Repos` ∪ `GitHub:Watch:Repos`, case-insensitive, each once): a plan may name them and the freeze's main-red watches them. It turns on NO issue polling and works with `Worker:RunAs=none`. Both GitHub Apps must be installed there |
-| `Shortcut:Watch:Teams`, `Shortcut:Watch:Epics` | empty = watch nothing; comma-separated team mention names/ids, epic ids |
+| `Shortcut:Watch:Teams`, `Shortcut:Watch:Epics` | empty = watch nothing; comma-separated team mention names/ids, epic ids. Set, they make Shortcut a configured work source that `factory work` polls and then need `Shortcut:ApiToken` (else refused at start-up). `factory work` needs at least one configured (watched) work source — this, `Kanban:Watch:Projects` or `GitHub:Watch:Repos` — and exits 2 naming all three otherwise (sc-25982; a deliberate change from `main`, where a Shortcut token with an empty scope started the host with a warning and nothing to pick up; owner decision, confirmed 2026-10-14: kept) |
 | `GitHub:Watch:Repos` | empty = triage no issues; comma-separated `owner/name` whose issues `factory work` polls and triages (the workers' App needs Issues read/write there; refused with `Worker:RunAs=none`). It is the issue-triage watch list, not the list of repositories the factory may work in: a repository named here is also a configured repository, but to let the factory plan and work in a repository WITHOUT triaging its issues name it in `Factory:Repos` |
 | `Intake:PollSeconds` | `60` (> 0) |
 | `Intake:MaxItemFailures` | `3` (runs of one item failing in a row before `factory work` escalates/parks it, E10) |
+| `Intake:MaxConcurrentRuns` | `1` (a whole number 1–8, `IntakeOptions.MaxConcurrentRunsLimit`: how many items `factory work` runs at once; 1 runs them one after another. Runs overlap outside the worker phases — "Worker phases" below; sc-25988 — and, with `Worker:Slots` above 1, inside them too, one per slot) |
 | `Usage:PollSeconds` | `60` (> 0: `factory work` reads the router's subscription usage; also read at each intake poll) |
 | `Freeze:MaxConsecutiveFailures` | `3` (≥ 1: distinct items escalated in a row, no factory merge between, that freeze the factory) |
 | `Freeze:HotFileMerges`, `Freeze:HotFileWindowHours` | `3` (≥ 2), `24` (> 0): factory merges changing one file within the window that freeze it |
@@ -181,8 +302,9 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Factory:WorkRoot` | `/opt/dark-factory/work` (clones + worktrees; `~/.dark-factory` when `Worker:RunAs=none`) |
 | `ConnectionStrings:Ledger` | `Host=localhost;Port=5434;Database=factory;Username=factory;Password=factory` |
 | `Worker:ClaudePath` | `claude` (as the worker user sees it: `~_factory/.local/bin` is first on its PATH) |
-| `Worker:RunAs` | `_factory` (sandbox user); `none` runs workers as the owner (development only) |
-| `Worker:LaunchHelper` | `/usr/local/libexec/dark-factory/factory-worker-launch` |
+| `Worker:RunAs` | `_factory` (the sandbox user, slot 1's; slot n's is this name with n appended: `_factory2`, …); `none` runs workers as the owner (development only) |
+| `Worker:LaunchHelper` | `/usr/local/libexec/dark-factory/factory-worker-launch` (slot 1's installed helper; slot n's is this path with `-n` appended) |
+| `Worker:Slots` | `1` (a whole number 1–8, `WorkerSlots.MaxSlots`; sc-25989): how many sandbox users run workers side by side — worker sessions at a time. 1 is the one user `_factory`, one helper, one lock file, as before slots. Each slot above 1 needs its user and helper set up first (`sudo scripts/setup-worker-user.sh --slots n`), or start-up fails naming the slot (a slot above the count setup was last run with has no installed helper: setup removes the higher slots' helpers). Independent of `Intake:MaxConcurrentRuns`: more runs than slots is the ordinary case (runs also overlap outside worker phases); more slots than runs is allowed (the others serve a `factory run` beside `factory work`; `factory work` says so at start-up). Refused, not ignored, with `Worker:RunAs=none` unless 1 ("Worker slots" below) |
 | `Worker:Auth` | `router-key` (default: the worker holds only the router key, in `X-Weave-Router-Key` and as `ANTHROPIC_AUTH_TOKEN`; the router serves it from plans enrolled with `router login claude` / `router login codex`; `factory run`/`work` refuse to start unless `GET /v1/subscriptions/usage` lists an enabled `managed`/`shared` credential) or `claude-login` (weaker, violates E5: the worker's own Claude login, passed through by the router) |
 | `Worker:TimeoutMinutes` | `30` (> 0) |
 | `Worker:PauseGraceSeconds` | `660` (a paused worker that has not stopped at a tool boundary by then is stopped; must exceed the 600 s longest tool call) |
@@ -200,37 +322,83 @@ Every setting with a rule is checked at start-up (`FactoryOptions.ValidateSettin
 `factory work` print the key and why and exit 2 (E6: each key has a consumer and a test that a non-default value is read and an
 out-of-range one refused, `FactoryOptionsTests`).
 
-Worker sandbox (E5): workers run as the hidden `_factory` user via
-`sudo -n -u _factory factory-worker-launch claude …` (one NOPASSWD sudoers rule for that helper only).
-The owner's home is ACL-denied to `_factory`, so `~/.ssh`, `~/.config/gh` and the login keychain are
+Worker sandbox (E5): workers run as a hidden sandbox user — `_factory`, or with several worker slots (`Worker:Slots`, sc-25989;
+"Worker slots" under the invariants) one of `_factory`, `_factory2`, … — via
+`sudo -n -u _factory factory-worker-launch claude …` (one NOPASSWD sudoers rule per sandbox user: that user's own copy of the
+helper, as that user only). Everything in this paragraph holds per sandbox user.
+The owner's home is ACL-denied to it, so `~/.ssh`, `~/.config/gh` and the login keychain are
 unreachable. Router variables go to the helper on stdin; the helper builds the worker env from scratch
-(PATH, HOME from the password database, MSBuild node reuse/build server off, router vars), refuses any
+(PATH, HOME from the password database, TMPDIR the user's own `getconf DARWIN_USER_TEMP_DIR` (else a 0700 `~/.tmp`; either only if
+it is a real directory, not a symlink, owned by the running user — an unusable getconf answer falls back to `~/.tmp`, an unusable
+`~/.tmp` makes the helper refuse to run, exit 70) — never the shared `/tmp`,
+where one sandbox user's NuGet locks refuse another's restore, helper_version 5, sc-25992. Residual, accepted: a worker session
+can replace its own user's `~/.tmp` with a symlink (on macOS that bites only once it has also replaced its own `getconf
+DARWIN_USER_TEMP_DIR` directory, `…/T`, with one: the helper falls back from that to `~/.tmp`); the helper then refuses that
+slot's later runs with exit 70 until someone removes it — it fails closed and concerns only that user's own files, the same class
+as `~/.cargo`. Recover by removing the symlink(s) as root or as that sandbox user (the helper makes `~/.tmp` again, 0700; macOS
+recreates its `…/T` directory) — MSBuild node reuse/build server off,
+router vars), refuses any
 other variable or a program that isn't an absolute path/plain name, and when the worker exits or its stdin
-closes kills the tree, the process group and then every other `_factory` process (a `pgrep -U` sweep that
-spares the helper's own pid and its descendants — never `kill -1`, which on macOS kills the sender too), then exits
-with the worker's status. The sweep runs only when the helper's user name is `sandbox_user` and its uid is
-`sandbox_uid`, which setup pins (it must be in 400-499, the range setup allocates, still `sandbox_user`'s uid, and not
-the sudo caller's); otherwise the helper prints `refusing the _factory uid sweep: <why>` and skips it. `send_signal`
-never signals pid or group 0 or 1 or an empty target. So `_factory` is
-single-tenant: one sandboxed `factory run` per machine (`WorkerLock`, `<work root>/.factory-run.lock`). Run
-`sudo scripts/setup-worker-user.sh` once, and again after any change to `scripts/factory-worker-launch`: it installs
-the helper with `sandbox_user` and `sandbox_uid` set (setup refuses a worker uid outside 400-499). `EnsureReadyAsync`
-reads the installed helper first and fails start-up with `Stale helper: … re-run \`sudo scripts/setup-worker-user.sh\``
-unless it has `helper_version` ≥ `WorkerSandbox.HelperVersion` (3) and, with those two lines undone, the SHA-256 of the
-repo's helper (compiled into the orchestrator as a resource); then it probes with the real router variable names
+closes kills the tree, the process group and then every other process of its own user (a sweep of `ps -U "$self_uid"`, the
+helper's own uid and no other, that spares the helper's own pid and its descendants — never `kill -1`, which on macOS kills the
+sender too), then exits with the worker's status. The sweep runs only when the helper's user name is `sandbox_user` and its uid is
+`sandbox_uid`, which setup pins in each installed copy to that copy's own user (the uid must be in 400-499, the range setup
+allocates, still `sandbox_user`'s uid, and not the sudo caller's); otherwise the helper prints `refusing the _factory uid sweep:
+<why>` and skips it — so a copy run as another slot's user sweeps nothing, and one pinned to another slot's uid refuses.
+`send_signal` never signals pid or group 0 or 1 or an empty target. So each sandbox user is
+single-tenant: whatever runs through its helper holds that slot's lock (`WorkerLock`: `<work root>/.factory-run.lock` for slot 1,
+`slot-locks/.factory-run-n.lock` for slot n, a directory closed to every sandbox user) for that phase — one worker phase per sandbox user at a time, not one run ("Worker phases",
+sc-25988, under the invariants), and one per slot side by side. Between slots the sandbox users are isolated for writing, not
+for reading ("Slot isolation", sc-25990, under the invariants): a worktree is written by its own slot's user and the owner
+only (checked before every push of worker work), each slot's MCP session directory is read by its own user and the owner only,
+and every slot's user reads everything else under the work root — other slots' worktrees included — through the work root's
+inherited read entry (accepted). Setup, the owner's, once and again after any change to
+`scripts/factory-worker-launch`: `sudo scripts/setup-worker-user.sh [--slots n]` (n = `Worker:Slots`, 1–8, default 1). Per
+slot it creates the hidden role account (slot 1 `_factory`, slot n `_factoryn`; own group; a uid of its own in 400-499 — setup
+refuses one outside the range, and two slots sharing one, before installing anything; home `/Users/<user>`, mode 0700, so no
+sandbox user enters another's), denies it the owner's home, gives it the work root's inherited read entry, installs its own
+Claude Code (`~<user>/.local/bin`), and installs ONE copy of the helper for it — `factory-worker-launch` for slot 1, at the path
+it always had, `factory-worker-launch-n` for slot n — with `sandbox_user` and `sandbox_uid` set to that user, and its sudoers
+line. A re-run with a smaller n leaves the higher slots' accounts (and homes) in place, drops their sudoers lines and
+removes their installed helpers — `rm -f --` of exactly the fixed paths `factory-worker-launch-<m>` for m = n+1…8 in the
+root-owned helper directory, each checked against the path setup itself derives; never slot 1's helper, a glob or a directory —
+and prints which of those users still exist (`No longer set up (more slots than --slots n): _factory2 …`). So a factory whose
+`Worker:Slots` is still above n fails at start-up (`Worker slot m (…): … cannot read the launch helper …`), not in its first
+worker phase with sudo's "a password is required". The readiness check has
+two parts (sc-25988), because a run of a helper kills every process of its user and so belongs under that slot's lock.
+What start-up checks, running nothing and taking no lock (`WorkerSlots.EnsureHelpersCurrentAsync` →
+`WorkerSandbox.EnsureHelperCurrentAsync` per slot): EVERY slot's installed helper is
+read and must have `helper_version` ≥ `WorkerSandbox.HelperVersion` (5), name its own slot's user as `sandbox_user`, pin a uid,
+and, with those two lines undone, have the SHA-256 of the
+repo's helper (compiled into the orchestrator as a resource) — else `Stale helper: … re-run \`sudo scripts/setup-worker-user.sh\``
+(or `cannot read the launch helper …`), led with several slots by the slot that failed (`Worker slot 2 (_factory2): Stale
+helper: …`) and naming the command with the slot count (`sudo scripts/setup-worker-user.sh --slots 2`:
+`WorkerSlots.ReinstallCommand`). `factory work` and `factory run` refuse to start on it (`FactoryRunner.CheckHelperAsync`,
+in `Program`: the reason, exit 2, before the router check and before the first poll), and every run checks it again first of all
+(`FactoryRunner.RunAsync`, a `FactoryUnavailableException` before the ledger is opened or the board asked: nothing is claimed
+or recorded, and the intake loop ends the poll). What is deferred to a run's first worker phase, and to each triage, under the
+lock of the slot it holds (`WorkerSlots.EnsureReadyAsync` → that slot's `EnsureReadyAsync`, which starts with the same read; so
+each slot is probed before a worker runs in it, by the runs that land there, and a failure names the slot): the probe with the
+real router variable names
 (allowlist `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_AUTH_TOKEN`; `ANTHROPIC_CUSTOM_HEADERS` may come on several
-stdin lines, one header each, which the helper joins with line breaks — helper_version 3, sc-25659) and fails if the probe's stderr
-has a uid-sweep refusal; last it runs `<Worker:ClaudePath> --version` as `_factory` through the helper and fails start-up with
+stdin lines, one header each, which the helper joins with line breaks — since helper_version 3, sc-25659), which fails if the
+helper refuses a variable, the user is not usable or the probe's stderr has a uid-sweep refusal; and last `<Worker:ClaudePath>
+--version` as that slot's user through its helper, failing with
 `Upgrade _factory's claude: …` (and the `claude update` command) below `WorkerSandbox.MinClaudeVersion` (2.1.291, the release
 the triage confinement — `--setting-sources ""`, `blockReadsOutsideWorkingDirectories`, `dontAsk` — was checked against; an
-older CLI may silently ignore a setting it does not know). Setup also reports, without failing, whether `cargo` and `rustc`
-answer `_factory` through the helper (Rust target repos only: the new-tests check of a Rust pull request is an `error` without
-them, sc-25875). Every normal (re)run kills every `_factory`
-process (its toolchain check runs through the helper): close `_factory` sessions and stop `factory work` first.
+older CLI may silently ignore a setting it does not know). Each sandbox user has its own PATH head (`~<user>/.local/bin`, its
+own Claude Code) and the helper's fixed tail (`/usr/local/share/dotnet`, `/opt/homebrew/bin`, `/usr/local/bin`, …), so dotnet,
+git, cargo and rustc are the machine's for every slot, while `~<user>/.claude`, `~<user>/.cargo` and the NuGet cache are per
+user. Setup checks dotnet, git and claude per user through that user's helper, and reports, without failing, whether `cargo` and
+`rustc` answer it (Rust target repos only: the new-tests check of a Rust pull request is an `error` without
+them, sc-25875). Every normal (re)run kills every process of every sandbox user it sets up
+(its toolchain check runs through each helper): close their sessions and stop `factory work` first.
 `--remove-worker-login` (opt-in) is a standalone mode: it runs none of the setup (no helper, no toolchain check, no
-installs) and only deletes `_factory`'s own Claude login (`~/.claude/.credentials.json`, keychain item
-`Claude Code-credentials`), as `_factory`, signalling nothing. The live probe tests (`LiveWorkerSandboxTests`) run only with
-`FACTORY_SANDBOX_LIVE=1`, since they kill every `_factory` process (including an interactive `_factory` login).
+installs) and only deletes each sandbox user's own Claude login (`~/.claude/.credentials.json`, keychain item
+`Claude Code-credentials`; with `--slots n`, of each of the n users), as that user, signalling nothing. The live probe tests
+(`LiveWorkerSandboxTests`) run only with `FACTORY_SANDBOX_LIVE=1`, since they kill every process of every configured sandbox
+user (including an interactive `_factory` login); they probe every configured slot (`Worker:Slots`, e.g. `Worker__Slots=2`),
+each slot's `TMPDIR` checked to be its own user's (sc-25992).
 
 Secrets in the keychain: `security add-generic-password -w` at its interactive prompt truncates at 128 chars
 (Shortcut tokens are longer → 401). Copy the secret, then
@@ -256,9 +424,324 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (the usage pause lifts at its `ResumeAt`, the freeze at a human's Continue); a parked item never does. The same pauses keep a
   queued item's merge-queue place (`MergeQueue.Member`). `InFlightAsync` lists the items being stopped first. Resumes re-check
   the scope.
-- Work sources are named by `ItemNaming` (`sc-<story>`, `gh-<key>`: the ledger `Source`, external id, `factory/<id>` branch,
-  `factory-<id>` worktree, `item:<id>` control scope); `factory run`/`--item` take either. The intake loop polls every source
-  in turn (`IntakeLane`), so a triage and an item run never share the sandbox. The merge queue is per repo across sources.
+- Work sources are named by `ItemNaming` (`sc-<story>`, `gh-<key>`, `kb-<key>`: the ledger `Source`, external id, `factory/<id>` branch,
+  `factory-<id>` worktree, `item:<id>` control scope); `factory run`/`--item` take any of them. The intake loop lists every source
+  in turn (`IntakeLane`: a lane's preparation, the issue triage, runs before any item the poll starts), then starts the poll's
+  items into the run capacity left by runs still in flight from earlier polls, up to `Intake:MaxConcurrentRuns` at once (a poll
+  does not wait for its runs, sc-25992: "Runs across polls" under "Intake failures"); a triage and the items' worker phases share each sandbox user (worker slot) one at a time through its lock
+  ("Worker phases"). The merge queue is per repo across sources.
+- Several work sources (Phase 4b, sc-25982; `WorkSources/WorkSourceRegistry.cs`, E1): every place that needs a source takes it from
+  ONE registry keyed by `ItemNaming` — `WorkSourceRegistry.Kinds`, one `WorkSourceKind` per `ItemNaming.All` entry (Shortcut,
+  GitHub issues, KanbanBoard, the order the lanes are polled in), each saying which settings configure it and how it is built
+  (its own `OutboundHttp` client, owned and disposed by the registry; a source is built once, on first use). It is the only file
+  outside `Shortcut/` that names `ShortcutWorkSource` (or the Shortcut namespace, bar `FactoryOptions` for the watch scope's
+  type): `WorkSourceRegistryTests.Only_the_registry_names_…` scans the source tree. Two questions, answered from the settings:
+  (1) `Configured` — the sources `factory work` polls: those whose watch scope is set (`Shortcut:Watch:Teams`/`Epics`;
+  `Kanban:Watch:Projects`; `GitHub:Watch:Repos`). A watched source whose credential is missing is refused
+  (`MissingCredentialException`), never left out. The factory starts with any non-empty set, KanbanBoard alone included, and with
+  no Kanban setting behaves as before — with ONE deliberate exception, below: no watched source at all is now exit 2. (2) `Of(naming)` — the source of one item named by id (`factory run`, `factory stop
+  --item`, an item's ledger row): it needs only that source's credential, no watch scope (`factory run sc-12 --ignore-scope`
+  with an empty scope works as it always did; the claim's own scope check is unchanged); without the credential it throws naming
+  that credential alone (`WorkSourceKind.Credential`, `WorkSourceRegistry.NeedsCredential`: no watch scope is asked for, since
+  none is needed), and when no source is configured at all it adds those of every source (`WorkSourceRegistry.NoneConfigured`,
+  built from each kind's `Settings`: credential and watch scope).
+  `Find` is `Of` or null. A third, wider set is the intake loop's lanes (`Lanes`, below): watched OR has its credential.
+  Wiring, each through the registry:
+  `factory work` start-up (`FactoryRunner.CheckWorkStartAsync`, called by `Program`): settings, the credentials every run needs
+  (router key, both GitHub Apps, dashboard login — no longer the Shortcut token), then the sources — none watched → exit 2 with
+  `WorkSourceRegistry.NothingWatched`: `NoneConfigured` (every source's credential and watch scope) plus how work already in
+  flight is finished meanwhile, by id (`factory stop --item <id>`, `factory run <id> --ignore-scope`: both need the source's
+  credential and no watch scope). A token with no watch scope is not a configured source: one `stderr` note per such source, none
+  for a source no setting names. This is a DELIBERATE CHANGE FROM `main`, stated plainly: there, a Shortcut token with an empty
+  watch scope started `factory work` with a warning and nothing to pick up (and it went on finishing in-flight stories); now
+  `factory work` exits 2 unless at least one source is watched, as the story's acceptance says — so an owner who empties every
+  watch scope to drain the factory must keep one scope set (the lanes below then finish every source's in-flight items) or finish
+  the leftovers by id (owner decision, confirmed 2026-10-14: kept). Then each configured source's `ValidateScopeAsync` on its board (`CheckWatchScopeAsync`; an unwatched
+  source's scope is not checked: no board request). The host (`AddIntake`) registers the registry as a singleton; the intake
+  loop takes `registry.Lanes(…)` — one `IntakeLane` per source that is watched OR has its credential (coordinator decision,
+  sc-25982 review), each with a `FactoryItemRunner` of its own, whose `InFlightAsync` lists only that source's items
+  (`RunPipeline.InFlightAsync(ledger, naming, …)`: the naming is required, there is no default source). Why wider than
+  `Configured`: the ledger may hold items of a source whose watch scope was emptied since (or, for Shortcut, never set — `main`
+  always had a Shortcut lane), and without a lane no poll would finish their pending Stop, retry a failed closeout from Watch,
+  evaluate a `Planned` plan item or resume a pause. An unwatched source's lane picks up nothing new and asks its board nothing
+  for it: each source's `ListReadyAsync` answers an empty scope with no board request (`ShortcutWorkSource` and `KanbanWorkSource`
+  return at once; `GitHubIssueWorkSource` reads only the ledger and lists items of watched repositories), nothing is claimed, and
+  the lane has no `Prepare` — only a WATCHED GitHub issues lane triages (`Prepare`), so no issue is triaged for an issues source
+  that watches no repository (its lane exists whenever the workers' GitHub App is configured, i.e. always in `factory work`).
+  With any number of lanes the runs overlap only as `Intake:MaxConcurrentRuns` allows, and in the sandbox only one worker phase per worker slot ("Worker phases", "Worker slots"). A source WITHOUT its credential gets no lane: after the ledger
+  migration `factory work` prints one `warning:` per such source whose ledger still holds active (not Done, not Cancelled)
+  items (`WorkSourceRegistry.UnreachableAsync`: the source, the count, the credential that brings it back) — those items
+  cannot be finished, stopped or resumed until then, and the dashboard still lists them. `factory run <id>`
+  (`Program` → `RunCommandAsync(requireSource: …)`): the item's source is resolved before the router is asked; not configured →
+  exit 2. `factory pause|continue --item <id>` only write the control (any id of `ItemNaming.All`); `factory stop`
+  (`FactoryRunner.ControlAsync`, `FactoryItemStops`) stops each item on the source its id names — for one item that source is
+  resolved before anything is written, on both paths: the CLI exits 2 when it has no credential, and `ControlActions.StopAsync`
+  itself (so the dashboard's Stop too) answers not Ok, `<id>: NOT stopped, and nothing was written. …`, before the Stopping
+  control is set (a Stopping item with no lane could never be finished, and a Stopping scope cannot be continued). In a wider
+  scope (the factory, an epic) each item's id comes from its ledger row (`Source` + `ExternalId`) and an item whose source has
+  no credential is reported `stop NOT finished (…); it stays Stopping, and nothing finishes the stop until that credential is
+  set` — never "the next poll retries it", which holds only for other failures — and keeps its Stopping control. A plan's Stop
+  cascade runs on the plan item's own source (its stories are that source's). The dashboard's controls use the same registry.
+  An invalid scope's message names every source's item scope (`item:sc-<id>, item:gh-<key> or item:kb-<n>`).
+  Tests (`WorkSourceRegistryTests`) build their options from explicit settings with no keychain and no process environment
+  (`FactoryOptions`' `environment` parameter, tests only), so none is skipped on a machine whose shell carries a source's token. `IItemStops` has one member, `StopAsync(ItemRef)`. Epic scopes
+  carry their source (sc-25985, under Controls below): `--epic N` is a Shortcut epic, `--epic kb-N` a Kanban epic, each reaching
+  only its own source's items, and an item whose epic the ledger lacks is looked up
+  on its own board (`ControlActions`' `sources`), one not configured being reported as unknown.
+- KanbanBoard items (Phase 4b, sc-25981, sc-25982; `Kanban/`): a third work source behind `IWorkSource`. Polled by `factory work`
+  when `Kanban:Watch:Projects` is set (the registry above), run by `factory run kb-<n>`, and paused, continued and stopped by id
+  like any item (Stop: pull request to draft, item back to `Backlog` with a comment, the factory's claim released, Cancelled).
+  The intake loop's claim renewal (sc-25983, below) asks every lane the registry builds — a watched source's and the lane of a
+  source that only has its credential alike (`WorkSourceRegistry.Lanes`) — so a Kanban item in flight keeps its claim after
+  `Kanban:Watch:Projects` is cleared, for as long as the write token is set; with no token there is no lane, nothing renews it,
+  and the start-up warning says so. Plans: "Plans on Kanban" below (sc-25984). `factory kanban key <GUID>` stays: the intake loop gives every item it LISTS its key, but
+  `factory run kb-<n>` on an item no poll has listed — `factory work` not running, the item outside the watched projects (run
+  with `--ignore-scope`), or not `Ready` yet — still needs the key from somewhere. Contract: KanbanBoard's
+  `docs/mcp-contract.md` (tool and argument names are compared exactly there, and an argument a tool does not have is refused).
+  Identity (E4): the board names an item by a GUID; the ledger gives it a key once, in `kanban_items` (migration `KanbanItems`;
+  `KanbanKeys`: unique index on the GUID, the loser of a race reads the winner's key; a save that failed and left no row rethrows
+  its own error), before anything else is written for it —
+  when `ListReadyAsync` first lists it or `factory kanban key <GUID>` asks (which reads the item from the board first: an unknown
+  id gets no key). Nothing written onto the board derives from that key: the claim marker is `dark-factory:<item GUID>`
+  (`KanbanWorkSource.Marker`) and a comment's idempotency key the SHA-256 of the item's GUID, its `version` and the body
+  (`CommentKey`: a retry of the same comment adds nothing; the same words after the item was moved or edited are a new comment).
+  Both halves are limits, accepted, because `version` moves only on an update or a move (a comment, a link and a claim leave it):
+  the same words said again on purpose at an unchanged version are dropped by the board (it answers the earlier comment) while the
+  pipeline records them as posted, and a retry of one comment after the version moved in between posts it twice. The key is not
+  changed for either: a key written onto the board derives from board ids, never from a ledger key or a counter of the factory's.
+  Writes (E2): only the orchestrator writes the board, through its MCP, with its own full-scope token (`Kanban:WriteToken`) in the
+  one client `Gateway/KanbanWrites.Client` builds for the typed caller `KanbanBoard` — which is no `McpUpstream`, so it is in no
+  upstream registry, allowlist, profile or proxy grant; model sessions keep the read token and `McpServers.KanbanTools` (read tools
+  only). `KanbanWriteIsolationTests` hold each half: no contract write tool on an allowlist or in a profile, the upstream sending
+  the read token and no write tool, a planner grant of the real proxy refusing each of the adapter's write tools with nothing
+  forwarded, and a source scan (the token read, the client and the caller built only in `WorkSources/WorkSourceRegistry.cs`; nothing
+  under `Mcp/`, `Gate/`, `Plans/`, `Issues/`, `Worker/`, `CodeGraph/`, `Sessions/`, `Dashboard/` naming them). Every write is
+  conditional or idempotent (E3): a status change is `update_work_item(itemId, status, expected_version)` on the version just read
+  (it puts the item at the end of the column and changes nothing else), a comment carries its `idempotency_key`, and claim, renew, release
+  and link are idempotent on the board (`add_work_item_link` of a kind and URL the item carries changes nothing).
+  Ready = `list_work_items(projectId, status: Ready, unblocked_only, claim_state: unclaimed, limit, include_comments: false)` per
+  watched project, paged by cursor (at most `KanbanWorkSource.MaxPages`, 50, pages of `KanbanWorkSource.DefaultPageSize`, 50 — the
+  contract's default, not the board's maximum of 200, `KanbanBoard.MaxPageSize`: `McpHttpClient` refuses an answer over 1 MiB,
+  `MaxAnswerBytes`; so at most 2,500 ready items of one project, more is refused), each listed item
+  checked again (project, status, no claim, no open blocker). `ClaimAsync` re-reads the item and refuses, writing nothing: a key
+  the ledger never gave out, an item gone from the board, a project outside `Kanban:Watch:Projects` (skipped by
+  `--ignore-scope`), another caller's claim (``the item is claimed by `<claimant>` ``: a claimant's name and a marker are another
+  caller's text, so wherever a refusal or a lost claim names them each is cut at 200 characters and made one inert code span,
+  `UntrustedText.CodeSpan`), a status that is not `Ready` (or `InProgress`
+  and the factory's, next), and an open blocker (only `Done` finishes one; a `Closed` blocker still blocks). An `InProgress` item
+  is the factory's when it carries the factory's live marker, or — a lapsed claim — when it carries no claim at all and the ledger
+  records that this factory claimed it (`KanbanKeys.ClaimedAsync`: a `claimed` checkpoint on `kb-<n>`, at any time): it is then
+  claimed again and read back like a fresh claim, so the escalation remedy `factory run kb-<n>` works more than a day later. An
+  `InProgress` item with no claim that the ledger does not record as claimed (a run that died between the board's claim and its
+  `claimed` checkpoint more than a day ago, or a person's work) is refused, nothing written (`KanbanWorkSource.LapsedRefusal`:
+  "… the factory's claim may have lapsed): move it back to Ready to hand it to the factory again"); one under another marker is
+  always refused. Residual, accepted: once a claim has lapsed the board shows no one on the item, so a person who took an
+  escalated item over without claiming it or moving it loses it to a later `factory run kb-<n>` of it. Then
+  `claim_work_item(id, marker, ttl_seconds)` — `already_claimed` (another caller won the race, or holds the same marker under
+  another identity) is a refusal too, naming the claimant (the item is read once more for the name) —, the claim read back
+  (`claim_marker` and `claimant_id`), and the move to `InProgress`; an item someone moved away meanwhile gets the claim released
+  again and a refusal, and a move that keeps conflicting past `MaxConflictRereads` gets the claim released again before the
+  conflict is thrown (a claim left on a still-`Ready` item would hide it from every ready listing for a day). `ReportStateAsync`:
+  Claimed → `InProgress`, Merged → `Done`, Stopped → `Backlog` with the factory's claim released and the comment posted; an item
+  already in the target column is not written. `LinkAsync` attaches each URL under its kind from the URL (`…/pull/<n>` `pr`,
+  `…/tree/<branch>` `branch`, else `other`).
+  Plans on Kanban (sc-25984; `KanbanWorkSource`'s plan members, the pipeline unchanged in kind: it reaches the board only through
+  `IWorkSource`, E1). A Kanban item carrying the label `plan` — the board's own labels, read from `label_list` — is a plan item
+  (`PlansItems` true: the board is the owner's, `ItemNaming.Trusted`), planned, released and delivered exactly as "Plan items",
+  "Dependency-aware release", "Plan failures and controls" and "Changeset branch" say for a Shortcut story; what differs is only
+  how the board is written. `CreateChildrenAsync`: each planned item is ONE `create_work_item` in the plan item's project and —
+  when it has one — its epic (no epic: the project alone; nothing is refused, since the items are found again by key, not by
+  where they are), status left to the board's default `Backlog`, type by `KanbanWorkSource.ItemType` (the planner's `feature`,
+  `bug`, `chore` → the board's `Story`, `Issue`, `Task`; `StoryType` is the way back, so a planned item reads back with the type
+  it was planned as; any other type is refused before any write), under the idempotency key `KanbanWorkSource.ChildKey` =
+  `ChildItem.Key(<plan item's GUID>)`: `dark-factory:child:<GUID>:<SHA-256 of the name and the description as sent>`, 120
+  characters (the board takes 128 printable ASCII ones, per identity and project). The board creates once per key and answers
+  the same item on every repeat (`created` false), so a retry after a failure part-way, a restart, or a lost answer (the typed
+  caller sends a keyed create again as it is) creates nothing twice and needs no search for what an earlier attempt made — and a
+  namesake someone else wrote, having no such key, is never taken for a planned item. Residuals of the board's own key rules,
+  accepted: a key belongs to the calling identity, so a retry under ANOTHER identity's `Kanban:WriteToken` would create the
+  items a second time (keep the factory's service identity while a plan's items are being created); a repeat answers the item
+  "as it is now", so one a person edited, moved or closed since is reused as they left it; and deleting an item frees its key,
+  so a retry creates a deleted one again. `import_epic_plan` is NOT used: it always creates a new epic. Identity (E4): the item's GUID is the board's to give, so the board is written first; its ledger key is
+  allocated the moment the create answers — with its project, like any Kanban item's (`KeyAsync(item, project)`, sc-25985), and its epic is recorded when it is first read for work (`ReadSpecAsync` → `EpicKeyAsync`: `WorkItem.EpicId` is the plan item's epic's key, so an `epic:kb-<n>` control holds it) — before its dependencies are written, and `plan-stories`, blockers, branches and every
+  ledger row name it `kb-<n>` from then on. Everything written ONTO the board names GUIDs instead: the idempotency key, and the
+  planned-item marker `<!-- dark-factory:planned-from <plan item's GUID> -->` with the sentence after it (`Plan.Children` is
+  given `WorkStory.BoardRef` — the item's id on its board, `WorkStory.BoardId`, which is its ledger name for a source that has no
+  other, so a Shortcut child's marker and key are byte-for-byte what they were). Where a person reads the marker's plan item the
+  ledger's name stands in (`WorkStory.PlannedFrom`: the Kanban source translates the GUID through `KanbanKeys.KnownAsync`,
+  allocating nothing; `PlannedStory.ParentOf` reads ids up to `MaxParentLength`, 36), so the refusal of a planned item whose plan
+  has not recorded it says "its plan kb-1 has not finished creating its stories". Dependencies: `add_work_item_dependency(id,
+  blocked_by_id)` per blocker (`KanbanBoard.AddDependencyAsync`: no idempotency key and no version — a dependency moves neither —
+  so after a lost answer the blocked item is read and one that lists the blocker is not sent it again; the board treats an
+  existing dependency as success anyway); one the create's own answer already lists is not sent. Cycles: a child blocked by
+  itself or by a later child is refused before any board call (`ArgumentException`; `PlanParser` has already refused a cyclic
+  plan); a dependency the board refuses `cycle` — someone made the blocker depend on the item since — fails the step naming both
+  items (`KanbanItemException`: "kb-3 could not be made to wait for kb-2 … Remove it on the board and re-run the plan item"), the
+  plan item escalates with no `plan-stories` row, and the re-run creates nothing twice. `BlockersAsync`: `get_work_item`'s
+  `blockers`, one read, each by its ledger key (allocated now for an item the factory never saw — with no project, `KanbanKeys.KeyAsync(item)`: a blocker is named by its GUID alone, and its project is recorded when the item itself is next listed or read; a project the row has is kept), finished only in `Done` — a
+  `Closed` blocker still blocks. `MakeReadyAsync`: `Backlog` → `Ready` on the version read (`MoveAsync`: a `conflict` is decided
+  again on a fresh read, their edit kept, their move left standing); `Closed` is the board's archived (`ReadyResult.Archived`,
+  reported in the board's words through `IWorkSource.Shelved` — what a shelved item is, how to undo it, and the verb:
+  Shortcut `archived`/`unarchive it`/`archive`, Kanban `Closed`/`move it back to Backlog`/`close` — wherever a plan speaks of
+  one: the hold "kb-3 is Closed on the board … move it back to Backlog", the waiting log line, a stopped plan's comment ("Taken,
+  finished or Closed by someone else since their release") and the no-longer-validates escalation ("finish or close those
+  stories by hand"); Shortcut's texts are unchanged); any other
+  column has left the backlog. `InBacklogAsync`: the `Backlog` column. `ReturnUnstartedAsync` (a stopped plan's released,
+  never-claimed item): `Ready` → `Backlog` on the version read, the comment, and a claim of the factory's own left on it released
+  — only while it is still `Ready` and carries no claim but the factory's; one someone claimed, moved, finished or closed is
+  theirs, nothing written. A `conflict` on the move is decided again on a fresh read by that same rule — status AND claim, in
+  the method's own loop, not `MoveAsync` (which looks at the status alone) — so an item still `Ready` that gained another
+  caller's claim since the first read is left alone too. One difference from Shortcut, the board's own rule, accepted: the board's ready listing
+  (`unblocked_only`) leaves out an item whose blocker is not `Done`, so a released item is listed once every blocker is `Done`
+  on the board — which the factory's merge of a blocker makes it (`BoardState.Merged`). Any blocker the plan counts as merged
+  that is not `Done` on the board — `merged-into-changeset` (the item stays Escalated and `InProgress`; that escalation already
+  says to move it to `Done`), one a person moved out of `Done` again, one whose move to `Done` the board refused — therefore
+  keeps its released dependents out of the listing until a person moves it to `Done`; and `factory run kb-<n>` on such a
+  dependent is refused by the source, naming the blocker (``claim refused: the item is blocked by `<title>` (<status>)``, the
+  title cut and inert in a code span: a blocker may be a planned item, so its title a planner's text). The
+  pipeline's own check is unchanged and comes before the board's: a planned item moved to `Ready` by hand while a blocker is
+  unmerged is refused at claim naming the blocker (`claim refused: blocked by kb-2 (not merged): …`), also when someone dragged
+  the blocker to `Done` (a story of the plan is satisfied only by the factory's merge). Tests: `KanbanPlanSourceTests`,
+  `SourceTrustTests`, `KanbanPlanPipelineTests` (a whole plan over the fake board through the real gate), `KanbanSafeWritesTests`.
+  Safe writes (sc-25983, E3; `KanbanBoard`, the typed caller, so every write has them). Typed refusals: a refused call's
+  `{code, message}` is a `KanbanException` with the contract's code (`KanbanException.Codes`: `scope_denied`, `not_found`,
+  `conflict`, `already_claimed`, `cycle`, `invalid_argument`, `busy`; `Refused` true: it changed nothing — true only for those
+  seven: an error object carrying any other code promises nothing and is handled as an error that may have written, below);
+  only `busy` is ever sent again. Busy: the same call — the same arguments, so the same idempotency key and expected version — at most
+  `KanbanBoard.MaxBusyRetries` (4) more times, after `BusyBackoff` (1 s, 2 s, 4 s, 8 s; the board answers `busy` only after
+  waiting 10 s itself), then `busy` is thrown and the run fails that step. Read before repeat: an error that is no typed refusal
+  (a plain MCP error without `{code, message}`, one with a code the contract does not name, an HTTP error, a timeout, an answer
+  that is not the contract's JSON —
+  `MayHaveWritten`; never the caller's own cancellation) may have written, so a write without an idempotency key reads the item
+  (`get_work_item`) before it is sent again, and is sent again at most once (`MaxRepeatsAfterLostAnswer`); a read that fails is
+  thrown, never a blind repeat. What the read decides, per write: a status change is done when the version moved and the item is
+  in the target column (else it is repeated on the same `expected_version`, which the board refuses `conflict` if anyone wrote
+  in between); a link when the item carries that kind and URL; a release when the item no longer carries the marker (the board
+  would refuse a release that happened); a claim and a renewal are read and then sent again whatever the read shows (the same
+  caller's claim is idempotent by the contract, and only its own answer tells this identity's claim from another's under the
+  same marker). A write that carries an idempotency key — a comment, and `KanbanBoard.CreateItemAsync` (`create_work_item`,
+  key required; the typed caller's create, which a plan's items are made with, sc-25984) — is sent again
+  with the same key and no read: the board answers the object the key already made (`comment_created`/`created` false).
+  Status changes stay `update_work_item(itemId, status, expected_version)`, not `move_work_item`: a status change has no
+  position to ask for, `update_work_item` puts the item at the end of its new column by itself, while `move_work_item` takes an
+  `order` (left out: 0, the top of the column, ahead of everything waiting there) and renumbers the column's other items; both
+  check `expected_version` alike. Conflicts (`KanbanWorkSource.MoveAsync`): the board's claims are advisory (an update or move
+  by anyone ignores them), so a `conflict` on a status change means someone else wrote the item since it was read. It is never
+  written over: the item is read again and the move decided again, at most `MaxConflictRereads` (3) times, then the conflict is
+  thrown (by `ClaimAsync` after it gave its claim back). Still in the column the move was decided from (they edited something else): the move is made on the new version and
+  their edit is kept (only the status is ever sent). In another column (they moved it): their column stands and no move is made
+  — `ClaimAsync` gives the claim back and refuses (`the item was moved to <status> while it was being claimed`), and
+  `ReportStateAsync` says so on the item (`KanbanWorkSource.NotMoved`, after the caller's comment when there is one; a stop still
+  releases the claim). A later report (a re-run) decides afresh on what it then reads.
+  Claims (sc-25983): KanbanBoard's own, advisory and expiring. Taken for the maximum lifetime, a day (`ClaimTtlSeconds`), and
+  renewed on each intake poll through the optional `IWorkSource.RenewClaimAsync` (default: `Held`, no call — Shortcut's and
+  GitHub issues' claims do not expire). Which items (`IItemRunner.RenewableAsync` → `RunPipeline.RenewableAsync`; the
+  interface's default is `InFlightAsync`, for a runner with no controls): every item the ledger would resume by itself — in a
+  handled state, or Paused from one in a way that resumes by itself (`interrupted`, `user-paused`, `usage-paused`,
+  `freeze-paused`, `controls-unreadable`) — WHATEVER the factory, epic, item, usage and freeze controls say now, so a Pause, a
+  usage pause or a freeze of any length (a freeze lasts until a human's Continue) costs no item its claim; and (sc-25984) a plan
+  item waiting on its stories (`Planned`: no handler, but the factory drives it for as long as its stories take — often longer
+  than a claim lives — and then takes its changeset pull request through the gate; a lost claim does not pause it — it has no state to pause from — but holds it: one `plan-held` row and no evaluation while the claim is someone else's, below). NOT renewed: an item
+  being stopped (its stop releases the claim), a parked one (a refused claim, a lost claim, a give-up), an Escalated one, a
+  merged or terminal one. The controls are read there only to leave out an item being stopped; when
+  they cannot be read the item is renewed all the same (the list throws only when the ledger itself cannot be read). The
+  renewal list runs nothing: what a poll runs is still `InFlightAsync`'s list (which leaves out what a control pauses), read
+  after the renewals. `IntakeLoop.RenewClaimsAsync` asks per lane, whatever the lane's source, before anything is listed ready
+  or run. A `ClaimRenewal` is `Held`, `Lost` (why, naming the holder) or `NotRenewed` (why: the board answered with a refusal
+  that is the call's or the item's own — the Kanban source: any typed refusal but `busy`, e.g. `scope_denied`, and a key the
+  ledger never gave out — logged, and the next item is asked). A renewal that THROWS (the board down or hanging, `busy` past
+  its retries, a lost answer: each further call could wait out its whole timeout, inline in the poll) ends that lane's renewals
+  for this poll — the rest are tried next poll — and holds up no other lane and no run. The Kanban source sends
+  `renew_work_item_claim(id, marker, 86400)`; refused (`conflict`: lapsed or released; `already_claimed`), it reads the item.
+  Under another marker it is lost, the reason naming the holder (``the item is claimed by `<claimant>` (marker `<marker>`)``,
+  both cut and inert as above; an item gone from the board is lost too). With no claim, or reading as carrying the factory's
+  marker, it is claimed again ONLY when it is `InProgress` and the ledger records that this factory claimed it
+  (`KanbanKeys.ClaimedAsync`: `ClaimAsync`'s own rule for an unclaimed item; a claim the board then refuses is lost to whoever
+  holds it). Otherwise nothing is written and the answer is `Held`: an item in flight at Intake whose run died before its
+  `claimed` checkpoint is left to its run's `ClaimAsync` (which still refuses an unclaimed `InProgress` item, `LapsedRefusal` —
+  a renewal never takes what `ClaimAsync` would refuse), and an item a person moved out of `InProgress` gets no stray claim that
+  would hide it from `claim_state: unclaimed`. A lost claim pauses the item
+  (`IItemRunner.ClaimLostAsync` → `RunPipeline.ClaimLostAsync`, under the item's run lock): Paused `claim lost: <reason>` from a
+  handled state (an item already paused in a way that resumes by itself stays Paused), one comment on the item saying who holds
+  it and what resumes it, then `parked` with the same reason — the comment is posted before the `parked` row, whose Detail ends
+  `; comment NOT posted: <error>` when the board would not take it (the item is never listed again, so nothing would post it
+  later) — and the dashboard's intake row; the item is left out of that poll's runs. Deliberately not one of the pauses that
+  resume by themselves: someone else is working the item, so nothing lists, renews or runs it again until a person's
+  `factory run kb-<n>` or `factory stop --item kb-<n>`. That run resumes it only once the item is the factory's again: for an
+  item paused for a lost claim (`RunPipeline.ParkedForLostClaim`: its Paused row, or a `parked` row after it, says
+  `claim lost`) the run asks `IWorkSource.RenewClaimAsync` before it records `unpaused` (through `IWorkSource`, so for any
+  source; the Kanban source takes a released or lapsed claim back by the rule above). `Lost` or `NotRenewed`: the item stays
+  Paused, no ledger row and nothing written to the board, and the run's error says who holds it and to run again once the other
+  claim is released or has lapsed. `Held`: `unpaused`, and on from where it paused. Typed outcome `deferred`, by the rule for every
+  pause and every `parked` row (`StepOutcomes`). Nothing is paused when the item's run is active (its run lock is held — that
+  run goes on, claims being advisory, and the next poll finds the claim lost again), when it is being stopped (the stop gives it
+  back), or when it is a merged item. A plan item waiting on its stories (`Planned`, sc-25984) is not paused, parked or
+  commented on (it has no state to pause from, resumes by itself, and the item is someone else's to write) but HELD: under its
+  run lock it gets one `plan-held` row `claim lost: <reason>` (outcome `deferred`; told apart from the other `plan-held` rows —
+  a blocker outside the plan, `not evaluated: `, `held by a failed story: ` — by that prefix; not written again while that is
+  how its claim is recorded, `RunPipeline.PlanClaimLost`), and `ClaimLostAsync` returns what was done, so the poll leaves the
+  plan out of its runs and shows it on the dashboard's intake row; the dashboard's plan row shows the row too. While the claim
+  is recorded lost nothing of the plan is evaluated — no story released, no changeset pull request opened or linked — whoever
+  runs it: `PlannedAsync` asks `IWorkSource.RenewClaimAsync` first, so a `factory run kb-<n>` by hand answers "is still not the
+  factory's to work (claim lost: …); its plan is not evaluated and nothing of it is released" and writes nothing (a different
+  holder is a new `plan-held` row). The plan item stays in the renewal list, so it resumes by itself: the first evaluation
+  after a renewal that holds (the other claim released or lapsed; the Kanban source takes it back) records
+  `plan-claim-regained` (`was claim lost: …`; outcome passed) and goes on; a later loss is a new `plan-held` row. Stories
+  released before the loss go on (they are their own items, with their own claims). Residual, accepted: between the other
+  caller's claim and the poll that notices it (at most one `Intake:PollSeconds`), an evaluation may still release a story. An item that is not renewed (parked, escalated) loses its
+  claim a day after its last renewal, and from then on
+  only its `InProgress` column keeps it out of the ready list — the factory's own (`ListReadyAsync` asks for `Ready` only) and
+  any other caller's that polls as the contract says; the board shows it unclaimed, so another caller that claims `InProgress`
+  items can take it (the residual above). Re-run (`factory run kb-<n>`), its lapsed claim is taken again by `ClaimAsync` (an
+  escalated item re-enters Intake) or by the resume's renewal (a claim-lost item); if someone holds it by then, that is a
+  refused claim or a claim still lost, as above. A single run that holds the
+  intake loop for more than a day (no poll in between), and `factory work` being down that long, also leave a lapsed claim until
+  the next poll, whose renewal takes it again if nobody else has. `factory run`
+  alone renews nothing: only `factory work` polls.
+  Repository: the item's project's `repository_url` (`GitRemoteReads.RepoOf`: the https and ssh forms of a github.com
+  repository, with or without `.git`), overridden by a `Repo: owner/name` line in the item's description — `ReadSpecAsync` leads
+  the description with a code-written `Repo:` line when the item has none, which is how every source tells the pipeline where an
+  item is worked. A project with no `repository_url` leaves the item to `Factory:DefaultRepo`; a `repository_url` that names no
+  github.com repository, and a project that is archived or gone, is refused (no `Repo:` line to fall back on), never worked
+  somewhere else. Those two, and a `kb-<n>` the ledger never gave out ("… Run `factory kanban key <item GUID>` first"), are a
+  `KanbanItemException` from `ReadSpecAsync`, raised before the pipeline has an item to escalate: `factory run` prints the message
+  (as it does a `KanbanException` of that read) and exits 1, no stack trace (`FactoryRunner.RunCommandAsync`). `factory kanban
+  key` likewise prints and exits 1 on a board refusal, an HTTP failure or timeout, and a ledger failure
+  (`FactoryRunner.IsKanbanKeyFailure`). The spec is the item, its epic and the epic's documents; links are built on `Kanban:WebUrl`.
+  Comments (E3, E4; `KanbanWorkSource.CommentKey`): a comment's idempotency key is the SHA-256 of the item's board id, the item's
+  version when the comment is written and the body — board data only, never a ledger key or a factory counter. Two limits,
+  accepted and unlike Shortcut (whose comments carry no key): (1) the same words said again while the item's version has not
+  moved (a comment, a link and a claim leave it; a move or an edit bumps it) are dropped by the board, which answers the earlier
+  comment, and the factory counts them as posted — e.g. an identical escalation comment after a re-run that moved nothing; (2) a
+  retry of one comment after the version moved in between posts it a second time. No other board datum fixes (1) without
+  breaking the retry: the board's latest comment (a cursor of its comment list) moves with the factory's own comment, so a retry
+  after a lost answer would post again, and leaving the factory's own comments out of the cursor makes a repeat map to the
+  same key once more (sc-25992).
+  Trust (E5, sc-25984): trust is a property of the SOURCE, declared once on its naming (`ItemNaming.Trusted`: Shortcut and Kanban
+  true — the owner's boards — GitHub issues false, and false for any source that does not say, fail closed) and asked in one
+  place, `WorkStory.UntrustedName` = the source is not trusted, or the item is planner-authored (`PlannerAuthored`: its
+  description carries the planned-item marker, which the code writes on every source — planner text is data on every source,
+  and a person who rewrites the item without the marker has taken it over). Everything that states an item reads that one
+  answer: the spec in every worker prompt (`PromptFence.Spec`), the name in commit messages and pull request titles
+  (`WorkStory.PublicName`) and bodies (`LedgerReport`), and what a worker's input counts as (`RunPipeline.SpecInput`). So a
+  Kanban item's spec is unfenced instructions and its name goes on GitHub as written, like a Shortcut story's; only a trusted
+  source plans (`IWorkSource.PlansItems`). No default can trust (sc-25992): `IWorkSource.Naming` has no default implementation
+  and `WorkStory.Naming` is a required, non-nullable parameter, so a source or a story that does not name its source does not
+  compile (`SourceTrustTests.A_source_and_a_story_must_name_their_source_…`), and no Shortcut default sits outside `Shortcut/`.
+  Epics (sc-25985, E4): a Kanban epic is a GUID too, and gets a ledger key of its own the same way — table `kanban_epics`
+  (migration `KanbanEpics`; `KanbanEpicKey`: key, the epic's GUID under a unique index, its project's GUID), allocated by
+  `KanbanKeys.EpicKeyAsync` when `ReadSpecAsync` first reads an item of the epic, so before the spec, the item's ledger row
+  (`WorkItem.EpicId` = that key) or any control names it. Item keys and epic keys are two number spaces (`kb-1` the item and
+  `kb-1` the epic may both exist); nothing of an epic key is written onto the board. `WorkEpic.Id` is that key (for Shortcut the
+  epic's own number), never null. The same migration adds `kanban_items.ProjectId` (nullable: the item's project GUID, recorded
+  with the key and again whenever the item is listed with none or another), which with `kanban_epics` is all the dashboard's links
+  need (below); an epic's project is recorded again likewise when its row has another. An epic no item of which the factory has
+  read yet gets its key ahead from `factory kanban key --epic <epic GUID>` (`FactoryRunner.KanbanEpicKeyAsync` →
+  `KanbanWorkSource.EpicKeyOfAsync`: like the item form it reads the epic from the board first — `get_epic`, read only; one the
+  board does not know or will not show the token gets no key row, exit 1 with the message, `FactoryRunner.IsKanbanKeyFailure` —
+  records GUID → key and project, prints `kb-<n>`, and is idempotent, the unique index deciding a race), so `factory pause|stop
+  --epic kb-<n>` works before its first item is claimed: an item of it read later gets the same key and is held by the row. The
+  command takes exactly one of an item GUID and `--epic <GUID>`. The pipeline page shows the key beside the item once one is read.
 - GitHub issues (sc-25385, `Issues/`): `IssueIntake` polls each watched repo's open issues updated since its ledger cursor
   (`github_issue_cursors`; the first poll of a repo starts from now, no backfill). Each issue gets a key (`github_issues`) and a
   work item `gh-<key>` that waits Paused/parked (`awaiting triage`) until released. Each issue version (sha of title+body) is
@@ -277,7 +760,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   the issue text is untrusted, possibly an outsider's, and the triage's summary and fix are posted on the issue, possibly
   public), and its prompt names them, `TriagePrompt.McpNote`; its `--allowedTools` names exactly those three,
   `SandboxTriageRunner.TriageTools`) in a throwaway `factory/triage-gh-<key>`
-  worktree under its own root (`<WorkRoot>/triage-worktrees`, `SandboxTriageRunner.TriageWorktrees`: never the items'
+  worktree under its own root (`<WorkRoot>/triage-worktrees`, `SandboxTriageRunner.TriageWorktrees` — with several worker slots
+  the root of the slot the triage runs in, `triage-worktrees-n` for slot n, `TriageWorktreesOf`, sc-25990: "Slot isolation" —: never the items'
   `worktrees`, swept before each triage, not ACL-shared for writing — the worker user reads it through the work root's
   inherited read entry) whose git holds a contents-read token; nothing is committed or pushed; the issue text is fenced as
   untrusted. After checkout and before the session starts, the owner removes every symlink in that worktree whose `realpath`
@@ -324,15 +808,19 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   refused (-32602), the arguments rebuilt by `ReviewTools.CodeGraphArguments` (unknown ones dropped) with the project set,
   `read_node_source` shown only for a node of that project, schemas listed without a project argument. Kanban has no repository
   mapping, so it is NOT repo-scoped: its read calls go through with the session's arguments. The credential never goes in argv
-  (every local user can read `ps`): `McpProxySessions` writes the config to `<WorkRoot>/mcp-sessions/<guid>.json` (directory
+  (every local user can read `ps`): `McpProxySessions` writes the config to `<WorkRoot>/mcp-sessions/<guid>.json` (slot n's
+  directory with several worker slots: `mcp-sessions-n`, made that slot's user's alone to read and checked so, sc-25990: "Slot
+  isolation"; directory
   `0700`, file created `0600`; the worker user reads it through the work root's inherited read ACL, which the owner checks
   with `/bin/ls -led` once the file is written — a `search` entry for `Worker:RunAs` on the directory and a `read` entry on the
-  file (`McpProxySessions.AclGrants`; no deny), else the session is not started, factory-wide, "re-run `sudo
+  file (`WorkerSandbox.Grants` over `WorkerSandbox.ListAclAsync`, the one ACL reader and parser, read up to
+  `WorkerSandbox.AclReads` times as every sandbox ACL check is, sc-25992; no deny), else the session is not started, factory-wide, "re-run `sudo
   scripts/setup-worker-user.sh`"; not checked with `Worker:RunAs=none`; outside the triage
   worktree, so the confined session cannot Read it into its transcript) after checkout and before launch, and when the session
   ends deletes it and revokes the credential (`McpProxyGrant.Dispose`: refused from then on); leftover files are swept before
-  each triage. Residual, accepted: while the session runs, a process that can read that file — the owner, root, or another
-  `_factory` process (none runs then: the triage holds the worker run lock) — could call the session's granted tools through
+  each triage (a live run's are kept, sc-25987: "Clean-up under overlapping runs"). Residual, accepted: while the session runs, a process that can read that file — the owner, root, or another
+  process of the same sandbox user (none runs then: the session holds that user's lock, `WorkerLock`; with several worker slots that
+  is the session's own slot's user and lock, and no other slot's user can read the file, sc-25990) — could call the session's granted tools through
   the proxy. Upstream tokens are only in the owner process (never in the worker's env, argv, worktree, prompt or transcript;
   `McpProxyTests`). Every MCP tool use still taints the session (`mcp:<tool>`; triage is already tainted by the issue text and
   never pushes). Implementers and fixers get no MCP: their tools allow none, and `ClaudeWorker.BuildArguments`/`RunAsync` refuse
@@ -397,7 +885,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   a rate limit, 401 or 408) is recorded `github-refused` on the item and the dashboard and does not hold the repo's cursor; the
   issue is taken up again when it next changes.
 - Controls (`Controls/`): Pause/Continue/Stop rows in the ledger's `controls` table (scope `factory` | `epic:<id>` |
-  `item:sc-<id>`; `WorkItem.EpicId` maps items to epics; a plan item's `item:` scope also holds its stories, through
+  `epic:kb-<key>` | `item:sc-<id>` | `item:gh-<key>` | `item:kb-<key>`; `WorkItem.EpicId` maps items to epics, within the item's
+  own source — epic scopes, sc-25985, at the end of this bullet; a plan item's `item:` scope also holds its stories, through
   `WorkItem.PlanItemId` — plan failures and controls, sc-25876, below), written by `factory pause|continue|stop` and the dashboard
   (`ControlActions`), read by every process. `RunPipeline` checks them before every step and, while a worker runs,
   polls them every second (`ControlWatch`): Pause → `IWorker.RequestPause` (a flag file under `<work root>/controls`
@@ -416,6 +905,26 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   worker first). Epic-scope Pause/Stop look up items with no `EpicId` on the board and record it (under the run lock);
   unresolvable ones are reported and the CLI exits non-zero (as on a refused Continue or an unfinished stop). A paused
   factory makes the intake loop list no ready stories; the pipeline claims nothing new in a paused epic/factory.
+  Epic scopes carry their source (sc-25985; `EpicRef` = an `ItemNaming` + the id the ledger holds, `ItemNaming.Epics`:
+  `EpicNaming.Number` | `Key` | `None`): `epic:12` is Shortcut epic 12 — what it always meant, so every row written before
+  Kanban epics had scopes still applies to Shortcut items, and only to them (E9) — and `epic:kb-12` the Kanban epic with ledger
+  key 12 (`kanban_epics`, under KanbanBoard items above); a GitHub issue is in no epic. One rule turns a ledger row into its epic,
+  `ItemNaming.EpicOf(externalId, epicId)`, used by `LedgerControls.EffectiveAsync` (still one query: the item's source comes from
+  its external id, so the epic scope is one more string in the same `IN` list), `RunPipeline.UserPausedAsync` and the dashboard;
+  `IControls.EffectiveAsync`'s signature did not change. `ControlScope.Epic(EpicRef)` writes a scope and `ControlScope.EpicOf`
+  reads only what that writes (`epic:KB-3`, `epic:012` are not scopes: no item's control would read such a row).
+  `factory pause|continue|stop --epic` takes either form (`ItemNaming.ParseEpic`: a bare positive number is a Shortcut epic, `kb-N`
+  in any case a Kanban epic; `sc-N`, `gh-N` and anything else are refused by the parser). `ControlActions` reaches only the
+  epic's own source: Stop lists the active items with that source and `EpicId`, and both Pause and Stop look up that source's
+  active items with no `EpicId` on their own board (`IWorkSource.ReadSpecAsync`, E1 — for Kanban reads only, which allocate the
+  epic's key if needed). An epic its source says cannot exist is refused before anything is written
+  (`IWorkSource.KnowsEpicAsync`: true by default — any number may be a Shortcut epic, pausable before the factory has seen it; a
+  Kanban key the ledger never gave out is refused, "The factory has seen no KanbanBoard epic kb-7 …", since a row for it would
+  land on whichever epic is given that key later; the refusal names the remedy, `factory kanban key --epic <epic GUID>`). The
+  check needs no credential: where the epic's source is not configured (no Kanban write token, or a dashboard host with no
+  registry) its kind answers from the ledger alone (`WorkSourceKind.KnowsEpic`, as `Links` does: `KanbanKeys.KnowsEpicAsync`), so
+  an unknown key is refused there too, while a known epic's control is written whether or not its board can be reached (its
+  items with no recorded epic are then reported as unknown, as before).
   Residual risk: the worker loads the target repo's `.claude/settings.json` (`--setting-sources project,local`), which
   can set `disableAllHooks` and so switch off the pause hook; the pause grace still stops such a worker (session and
   worktree kept), only not at a tool boundary.
@@ -433,6 +942,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   re-reads and decides again, so a backoff never shortens a known reset. A run stopped while a user's factory/epic/item
   Pause also holds is recorded `user-paused`, not `usage-paused`. Each usage read is bounded by
   `UsageOptions.RequestTimeout` (10 s), since the intake loop runs it inline.
+  With several runs in flight (sc-25991): the run whose worker hit the limit pauses the factory and itself; the loop reads the
+  pause before it starts another ready item of that poll and starts none (shown as a deferral with its resume time,
+  `IntakeStatus.Deferrals`); every other run in flight pauses itself `usage-paused` at its next check, session and slot kept;
+  no run is counted as failed; and all of them resume by themselves once it lifts.
   Owner decision (2026-10-08): when every subscription is exhausted the router may keep serving on a local model
   (`subscription_fallback`), but the factory still pauses on the router's `all_exhausted` — unattended work on the
   local model alone is not wanted.
@@ -461,7 +974,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   the error says what lifts it, `FreezeTrigger.Remedy`); the intake loop runs no ready item of any lane after a deferral and stops a
   lane's in-flight items at its first deferral (their stops, listed first, still run in every lane), lists no ready items while the
   row is set, and shows the deferral (`IntakeStatus.DeferredRun`, not cleared by a later stop) and the freeze banner on the
-  pipeline page. Each intake poll runs the evaluator too (`IntakeLoop` `freeze`, `FactoryRunner.CreateFreeze`) before any lane
+  pipeline page. With several runs in flight (sc-25991) a freeze written mid-poll is read before each ready item would start, so
+  none is dispatched into it (shown as a deferral, `new work held: the factory is frozen (<trigger>)`, with what lifts it); the
+  runs in flight each pause `freeze-paused` at their next check and all resume after the Continue; every run the evaluator
+  deferred in the poll is listed (`IntakeStatus.Deferrals`), not only the last. Each intake poll runs the evaluator too (`IntakeLoop` `freeze`, `FactoryRunner.CreateFreeze`) before any lane
   is prepared (triage) or listed: frozen or uncheckable, nothing is triaged or listed. Within a run the evaluator also runs
   before every step but Merge's bookkeeping, before every worker session starts (implement, fixer, CI fixer), before a merge-queue
   base-update push and right before a merge (`RunPipeline.ThrowIfFrozenAsync`); frozen there, the run pauses like a Pause
@@ -484,9 +1000,77 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   counts against its item; after `Intake:MaxItemFailures` in a row `IItemRunner.GiveUpAsync` (`RunPipeline.GiveUpAsync`)
   escalates it (Intake/Implement, escalation comment) or parks it (Paused, with a comment) — an unknown item only gets the
   comment, and a plan item waiting on its stories (`Planned`) one comment and one `plan-held` row per reason, staying `Planned`
-  (sc-25871). Factory-wide failures (`FactoryUnavailableException` from `FactoryRunner`'s shared set-up: worker lock, sandbox,
-  migration, worktree sweep; a `DbException`; `MissingCredentialException`; a failed poll) end the poll and escalate
-  nothing. Both show on the pipeline page (`IntakeStatus`, in memory in the `factory work` process).
+  (sc-25871). Factory-wide failures (`FactoryUnavailableException` from `FactoryRunner`'s shared set-up: the migration at a run's
+  start; the sandbox probe and the worktree sweep at its first worker phase; a `DbException`; `MissingCredentialException`; a
+  failed poll) end the poll and escalate nothing — with several runs in flight (`Intake:MaxConcurrentRuns`) no further item is
+  started, the runs already started run to their end, and the poll shows the failure once. Another run's worker phase holding the
+  sandbox user is no failure: a run waits for it. Failures are counted per item whatever runs beside it. Both show on the
+  pipeline page (`IntakeStatus`, in memory in the `factory work` process).
+  Runs in flight (Phase 4b, sc-25991; `IntakeLoop.PollOnceAsync`, `IntakeStatus`): a poll's runs overlap, so what stops new work
+  can happen while others run. The rules, one per cause — each stops what is NOT yet started, and never ends a run that is: the
+  runs in flight reach their next check (before every step, every second while a worker runs or a slot is waited for), where the
+  existing controls pause them (`freeze-paused`, `usage-paused`, `user-paused`) or they finish by themselves.
+  (1) A factory-wide control found in effect — the usage pause (e.g. set by a sibling run whose worker hit the limit), a Pause
+  of the factory, the freeze's row: read at the poll's start (nothing ready is listed, no triage) and again before EACH ready
+  item is dispatched (`IntakeLoop.HoldsAsync`; the poll listed its work a while ago). Held, no ready item of the poll is
+  started; the in-flight items the poll listed are still run, each run pausing itself at its first check or finishing its Stop
+  (as the serial loop always did). Controls that cannot be read then are the factory's failure (E2: never dispatch blind).
+  (2) A run the freeze evaluator defers (`RunOutcome.Deferred`): no ready item of any lane and no further in-flight item of its
+  lane, as before. (3) A factory-wide failure of one run (a stale helper in its slot, say): nothing more is started this poll;
+  it is not that item's failure and never a sibling's — a run beside it that fails for its own reason is counted against
+  itself alone, one that succeeds clears its own streak. What the status shows: `IntakeStatus.FactoryError` once per poll
+  however many runs and listings hit it (`FactoryFailedAlso`: the count stays one per poll, a different reason is appended
+  `; also: …`); and `IntakeStatus.Deferrals`, every deferral with what lifts it — each deferred run of the poll (not only the
+  last; `DeferredRun` is still the latest), the poll's own evaluation (`intake`), and each control holding new work (`Hold`,
+  ids `usage`/`factory`/`freeze`: "new work held: the factory is paused for usage (…); it lifts by itself at <utc>, or with
+  `factory continue --usage`"), kept until the loop's next read finds it lifted (a poll's start, at most a poll interval after
+  the Continue; the page's banners are the ledger's and current). One deferred run alone renders as the line it always was.
+  Tests: `IntakeDispatchTests` (signalled fake runs), `RunsInFlightTests` (the real loop over real pipelines, two at once: the
+  freeze, the usage pause and a stale helper in one slot, each with both runs' ledger rows and the status).
+  Runs across polls (sc-25992, `IntakeLoop.StartPollAsync`): a poll does NOT wait for its runs — before, a poll ended only when
+  every run it started had, so one item waiting 30 minutes on CI held back every other lane's new items and every claim renewal
+  (once per poll) for as long. The loop now polls on its interval while runs are in flight. Each poll renews every lane's claims
+  first; then lists every lane's in-flight items and starts, at once and OUTSIDE the run capacity, the items being stopped and
+  the plan items waiting on their stories (`InFlightItem`, from `IItemRunner.InFlightItemsAsync`/`RunPipeline.InFlightItemsAsync`;
+  a waiting plan only while nothing holds new work — else it is queued like any in-flight item, so the freeze's, the usage
+  pause's and a factory Pause's rules for it are unchanged; a stop always, as before): they do not count against
+  `Intake:MaxConcurrentRuns`, are still one run per item (the loop's in-flight set and the item's run lock), and whatever they
+  do as the sandbox user goes through the slot lock (`WorkerLock`), so `Worker:Slots` is never exceeded — a pending Stop (a
+  plan's pending stories, say) and a `Planned` evaluation no longer wait for a run to end. Residual, accepted: which kind an
+  item is, is the poll's listing; a state another process changes between the listing and the start (a `factory run` of the
+  same plan item) is the next run's business. Then, only while there is free capacity (`Intake:MaxConcurrentRuns` minus the
+  loop's counted runs in flight, `IntakeLoop.RunsInFlight`), each lane is prepared and its ready items listed, and the rest are
+  started into that capacity in the poll's order. With none free nothing ready is listed or prepared, the earlier poll's
+  dispatch keeps its place (it starts its next item when a run ends), and the poll is owed: the end of a run that frees
+  capacity starts the next poll at once instead of at the next tick (the tick stays armed: no poll skipped or doubled; the loop
+  is one task, so polls never race), as the serial loop polled at once on the tick that passed during its runs. An item the
+  loop already has a run of is never started again; a poll that lists supersedes the previous poll's dispatch, which starts
+  nothing more (its runs go on). The rules above (holds before each ready item, a deferral, a factory-wide failure) apply to
+  each poll's own dispatch. A run's end wakes the loop to re-read the usage pause, so a run that paused the factory for usage
+  still wakes it at the reset. Preparation off the loop's task: a lane's preparation (`IntakeLane.Prepare`, the GitHub issues
+  triage) is started by a poll that lists and runs in the background, at most one per lane at a time (so never two triages of
+  one issue), while later polls go on renewing claims and the run-end wake-up works — a triage waiting up to
+  `Worker:TimeoutMinutes` for a worker slot holds up nothing. A triage shares the worker slots with the items' worker phases
+  through `WorkerLock` (`SandboxTriageRunner` holds a slot from its readiness check to its worktree's removal), so it never runs
+  as a sandbox user another phase is using. Its end wakes the loop for a poll at once that starts no preparation and lists
+  what it released; a preparation that failed is that poll's factory-wide failure (`Poll failed: …`, the lane not listed by it,
+  as an inline failure skipped it; per-issue failures are counted by the triage itself, unchanged). Stopping `factory work`
+  waits for the runs and the preparations in flight, each ending on the cancelled token as before. Status across polls: a
+  run's end clears the runs' deferrals only when its poll is the newest and that poll's own freeze evaluation did not defer it
+  (so an older poll's run never clears a newer poll's `intake` deferral); a poll says the factory is fine only once it has
+  listed, its dispatch has ended, it is the newest that listed and no poll after it hit a factory-wide failure — a poll with no
+  capacity free lists nothing ready and says nothing of the factory, so a listing failure stays shown until the board is listed
+  again. Defaults (E9): with `Intake:MaxConcurrentRuns` 1 the order of runs is unchanged; what differs from the serial loop: a
+  ready item is no longer handed to a run that would claim nothing when the factory was paused since the poll began, and a
+  paused or frozen factory's page says once more, in the deferral list, what holds new work; a poll runs every interval also
+  during a run — claims renewed, the router's usage read (`usage.CheckAsync`), the freeze evaluator run, its main-red GitHub
+  reads cached for `FactoryFreeze.MainRedCacheTtl` (30 s) as before, so a long run costs those reads every `Intake:PollSeconds`
+  where the serial loop made none; a stop and a waiting plan's evaluation run during another item's run; and a triage runs
+  beside the item runs. Tests: `IntakeDispatchTests` (`The_work_loop_polls_again_…`, `A_poll_renews_the_claim_of_an_item_in_flight_…`,
+  `A_poll_with_no_free_capacity_…`, `With_one_run_at_a_time_…`, `Stopping_the_work_loop_waits_…`, `When_a_run_ends_after_a_poll_found_no_capacity_…`,
+  `Items_being_stopped_and_waiting_plans_…`, `While_something_holds_new_work_…`, the two deferral and two factory-error tests across
+  polls, and the three preparation tests). `PollOnceAsync` (tests, and the old contract) is one poll waited for to its end, its
+  preparation inline before the listing.
 - Every state change is a committed ledger row before the next step (`WorkLedger.RecordAsync`), checked
   against the transition table in `Ledger/Lifecycle.cs` first; an illegal transition throws and writes nothing.
   New phases add handlers in `RunPipeline.Handlers`, not table rows (the exceptions, all Phase 4a's: `Plan → Planned`, a plan item
@@ -501,7 +1085,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
 - Typed step outcomes (E7, sc-25389): every ledger row has `Outcome` (`passed`, `failed`, `gate_rejected`, `deferred`,
   `escalated`; NOT NULL + a check constraint), decided in one place — `StepOutcomes.Of(from, state, step, detail)`, called by
   `WorkLedger` for every row it writes (`LedgerEntry.Outcome` is `required`). The rules map earlier stories' typed results (verdict,
-  fix-progress, gate decision, new-tests outcome, stuck rounds, pauses, issue routes; of Phase 4a's rows `plan-held`, `plan-stuck`, `plan-delivery` and `merged-into-changeset` are `deferred`); migration `StepOutcomes` backfilled older rows
+  fix-progress, gate decision, new-tests outcome, stuck rounds, pauses, issue routes; of Phase 4a's rows `plan-held`, `plan-stuck`, `plan-delivery` and `merged-into-changeset` are `deferred`; Phase 4b's `slot-wait`, `slot-held` and `slot-released`, sc-25991, are `passed` — a wait for a worker slot is no failure); migration `StepOutcomes` backfilled older rows
   with the rules as they stood, as frozen SQL (a Postgres test checks it against a frozen literal corpus; never edit the shipped
   migration — a later rule change only affects new rows). Reports are rendered only from the ledger (`LedgerReport`, E5): the
   PR description at open and again at merge (`pr-report`), the board closeout on merge (`closeout`) and the escalation comment list
@@ -519,13 +1103,15 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   data yet), escalation rate, fix rounds per merged PR, reviewer precision (blocking findings a second opinion confirmed / those it
   answered) and intake-to-merge time; N/A over zero matching items; sandbox/demo items are excluded (`Metrics:*`).
 - Plan items (Phase 4a, sc-25870; `Plans/`, `RunPipeline.Plan.cs`): an item labelled `plan` (`PlanLabel`, any case) on a source that
-  plans (`IWorkSource.PlansItems`: Shortcut; false by default, so a GitHub issue's label — which anyone may apply — plans nothing)
+  plans (`IWorkSource.PlansItems`: Shortcut and, since sc-25984, KanbanBoard — "Plans on Kanban" under the Kanban bullet; only a
+  trusted source, `ItemNaming.Trusted`; false by default, so a GitHub issue's label — which anyone may apply — plans nothing)
   goes Intake → Plan instead of Implement, and is never implemented itself. Plan runs one planner session (E2): a fresh one every
   time (never resumed: its checkout is throwaway), on the `high` class (`WorkerModelClass.Planner`), confined like the triage worker
   — `WorkerTools.ReadOnly` (`ReadRule` of its own worktree, `dontAsk`, `--setting-sources ""`; `WorkerPlanRunner` refuses any other
   tools before checkout), in a throwaway `factory/plan-sc-<id>` worktree under its own root (`<WorkRoot>/plan-worktrees`,
-  `SandboxPlanRunner.PlanWorktrees`; contents-read token only, not shared for writing, out-of-tree symlinks removed first, swept
-  with the leftover MCP session files before each planner session when sandboxed, i.e. under the worker run lock) — and reaching
+  `SandboxPlanRunner.PlanWorktrees` — with several worker slots the root of the plan item's slot, `plan-worktrees-n` for slot n,
+  `PlanWorktreesOf`, sc-25990: "Slot isolation"; contents-read token only, not shared for writing, out-of-tree symlinks removed first, swept
+  with the leftover MCP session files before each planner session when sandboxed, i.e. under the sandbox user's lock) — and reaching
   CodeGraph and Kanban only through the loopback MCP proxy under `McpProfile.Planner` (started per session by `SandboxPlanRunner`
   when an upstream is configured; its `--allowedTools` name exactly that profile's tools, `PlannerTools`). With `Worker:RunAs=none`
   (development only) the planner still runs — unlike triage, which refuses: its input is the owner's own story, the same trust as
@@ -571,7 +1157,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   checkpoint (the plan as JSON), then `plan-creating` right before the board is asked for anything, then
   `IWorkSource.CreateChildrenAsync` (the parent's team and epic, Backlog, `blocks` links), then `plan-stories` (the ids in plan
   order, e.g. `sc-12 sc-13`), then Plan → `Planned`. `CreateChildrenAsync` is idempotent, and finds a child again by its
-  idempotency key (sc-25877, `ChildItem.Key(parentRef)`: `dark-factory:child:<parent>:<SHA-256 of the name and the description as
+  idempotency key (sc-25877, `ChildItem.Key(parentRef)`, the parent as its board names it: `dark-factory:child:<parent>:<SHA-256 of the name and the description as
   sent>`, written by code, the same on every retry of the same plan; Shortcut stores it as the story's `external_id`, sent on
   `POST stories`, and the listings carry it, so a child is matched from the listing and then read in full for its relations) —
   so a retry does not depend on the board returning a multi-line Markdown description unchanged. Two stories of one plan never
@@ -597,7 +1183,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   the transition is left and the plan is not read again. `Planned` (a new state; table rows `Plan → Planned`, `Planned → Done`, `Planned → Review` and `Merge → Planned`) has no entry in `Handlers`: the
   item waits on its stories and is evaluated without a worker (dependency-aware release, below); waiting is not a failure
   (outcome `passed`) and gets no held notice. Planner text is untrusted (E3): each created story's description starts with the
-  marker `<!-- dark-factory:planned-from sc-<parent> -->` (`PlannedStory`), then a `Repo:` line naming the plan item's repository
+  marker `<!-- dark-factory:planned-from sc-<parent> -->` (`PlannedStory`; the parent as its BOARD names it, `WorkStory.BoardRef`: a
+  Kanban plan item's GUID, never its `kb-<n>`), then a `Repo:` line naming the plan item's repository
   (the first such line decides, `RepoResolver`: the planner's text cannot send a story to another repo; one repository per plan),
   then the planner's text in a tilde fence (no mention, link or image renders). A story whose description carries the marker is
   `WorkStory.PlannerAuthored`, so `UntrustedName`: its spec is fenced as data in every worker prompt (`PromptFence.Spec`) and its
@@ -631,13 +1218,11 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
 - Dependency-aware release (Phase 4a, sc-25871; `Plans/PlanRelease.cs`, `RunPipeline.Plan.cs` `PlannedAsync`/`ClosePlanAsync`): the
   orchestrator, not a person, releases a plan's stories. `RunPipeline.InFlightAsync` lists every `Planned` plan item (unless a
   control pauses it, or its closeout was given up on, below), so each intake poll — and a `factory run` on it — evaluates it
-  through `HoldAsync` → `PlannedAsync`, under the item's run lock and with no worker: `FactoryRunner.RunAsync` reads the ledger
-  first and, for a `Planned` item that is not being stopped (`RunPipeline.WaitsOnStoriesAsync`), takes no worker run lock, probes no
-  sandbox and sweeps no worktree (the ledger migration now runs before the lock), and tells its pipeline so (`workerless`). A
-  workerless pipeline only evaluates a waiting plan: a Stop that landed after the runner's check (`RunAsync` reads the control
-  again), or an item that is not `Planned`, is left alone — `stop deferred to the next run`, no `StopIdleAsync`, so no
-  `StopOrphanAsync` (sandboxed: a kill of every `_factory` process) and no worktree call while another process's worker runs — and
-  the next run's runner sees the Stop and takes the lock (`PlanRunnerLockTests`, against Postgres).
+  through `HoldAsync` → `PlannedAsync`, under the item's run lock and with no worker: like every run outside its worker phases
+  (sc-25988) it takes no sandbox lock, runs no helper (only the read of the installed helper every run starts with: a stale
+  one fails it factory-wide like any run) and sweeps no worktree, so it is evaluated while another run's worker
+  holds the sandbox user (`PlanRunnerLockTests`, against Postgres). A Stop it finds is finished by that run: the stop of a planner a
+  crashed run left (sandboxed: a kill of every `_factory` process) is a worker phase, waited for.
   The plan's stories are the ids of its newest `plan-stories` row. Blockers read (cost rule): a story with no Merge row and no
   `plan-released` row is held, without a board read, while a blocker the plan itself gave it (`PlanRelease.RecordedBlockers`, from
   the `plan` checkpoint) has no Merge row; only once those have all merged — the evaluation that could release it — are its
@@ -666,7 +1251,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   What holds a plan beyond its own order is a `plan-held` checkpoint (outcome `deferred`), one row holding every such hold, written
   only when its text changes, not every poll: a story held by a blocker outside the plan (`sc-13 held by sc-99 (not a story of this
   plan, and neither merged by the factory nor finished on the board: finish it or remove the relation on the board)`); an archived
-  story (`… is archived on the board, so it was not released and the plan cannot complete: unarchive it`); and a released story a
+  story (`… is archived on the board, so it was not released and the plan cannot complete: unarchive it`; the two halves are the
+  source's own words, `IWorkSource.Shelved` — Kanban: `Closed`, "move it back to Backlog"); and a released story a
   person moved back to the Backlog (`… was released and is back in the backlog: …; moving it to the board's ready state restarts
   it` — it is not released again: a person moved it back on purpose). The last is detected by `IWorkSource.InBacklogAsync`, asked
   once per evaluation only about a released, unmerged story that nothing works — the ledger does not know it, or its item is
@@ -784,7 +1370,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   of its own) stops the stories first (`StopStoriesAsync`), each under its own run lock and on its own rows by the ordinary item
   stop (`prs-drafted`, board Stopped + comment `… was stopped by <who> (with its plan sc-N)`, `stop-reported`, Cancelled): a story
   whose run holds its lock is left to that run (which sees the Stop within a second), one whose worker a crashed run may have left
-  to its own next run (which holds the worker lock and stops the worker first), and one whose stop failed to the next attempt — all
+  to its own next run (which stops the worker first, under the sandbox user's lock), and one whose stop failed to the next attempt — all
   "pending". A story the plan released that the ledger does not know was never claimed: the factory did no work on it, and the
   board is asked before anything is written (through `IWorkSource`, E6). Still as the release left it — not archived, in the ready
   state, no owner or claim but the factory's — it is moved back to the Backlog with a comment that says its plan was stopped before
@@ -804,10 +1390,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   they are): …. Never started (left in the backlog; the factory will not release or start them): ….` and, only when there are
   any, `Released but never started (moved back to the backlog; the factory did no work on them): ….`, `Merged outside the factory
   (left as they are: their change is on the base branch): ….` and `Taken, finished or archived by someone else since their release
-  (left as they are): ….`, Cancelled, its control cleared. A workerless run (no worker run lock) still defers a plan's stop to the
-  next run. A waiting plan item's run only evaluates its stories and watches no control meanwhile, so: a Stop that lands during
+  (left as they are): ….`, Cancelled, its control cleared. A waiting plan item's run only evaluates its stories and watches no control meanwhile, so: a Stop that lands during
   the evaluation is seen when it ends (`HoldAsync` re-reads the control after `PlannedAsync`) and finished by that run under the
-  lock it holds, or — workerless — reported `stop deferred to the next run`; and `factory stop --item <plan>` while a run of the
+  run lock it holds; and `factory stop --item <plan>` while a run of the
   plan holds its lock answers `stop NOT finished: it is a plan and a run of it is active …`, not Ok (exit 1), instead of the
   ordinary item's "is running; its run stops it at once" (exit 0), which stays true only for a run that watches its control. After the stop, a story of the plan
   that reaches the ready state anyway (moved by hand) is refused at claim, once and with no board write: Paused
@@ -882,8 +1467,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   dependent story's worktree holds its blockers' code.
   Merge queue: stays one queue per repository (not per repository and base): stories of one plan must serialise their merges into
   the changeset branch, which one queue gives; a queue per base would only let a plan's stories and default-branch items merge at
-  once, which the single-tenant worker sandbox (one run per machine) would not use, and would change the ledger-derived order and
-  the repo-keyed lock for nothing.
+  once — which, with several runs and worker slots at once (sc-25988, sc-25989), would let a plan's stories and default-branch
+  items of one repository merge at the same time. One queue per repository is kept deliberately (sc-25992): merges into one
+  repository stay one at a time whatever their base, and the ledger-derived order and the repo-keyed lock stay as they are.
   Changeset pull request: when `PlanRelease.Decide` is `Complete`, `PlannedAsync` (the waiting plan's run, GitHub's API only, no
   worker) reads GitHub's compare of the default branch and the changeset branch. Empty (no difference): `changeset-empty`, no pull
   request, and the plan is closed out as above saying so (`Planned → Done`). Before that compare, the plan item's newest `linked`
@@ -1112,6 +1698,412 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   changeset is on the default branch.
 - One run per item: `RunPipeline` holds a Postgres advisory lock on the item id (`PostgresRunLocks`) for the whole
   run, and `WorkItem.Version` is an optimistic concurrency token, so a stale writer's save throws.
+- Worker phases (Phase 4b, sc-25988, E6; `WorkerLock.cs`, `RunPipeline.InWorkerPhaseAsync`): a sandbox user is single-tenant
+  — every exit of its launch helper kills every process of it — so every run of a helper happens under that sandbox user's
+  lock, and a run holds that lock only for its worker phases, not for its whole life (as before sc-25988). This bullet is
+  written for the one sandbox user of the default (`Worker:Slots` 1); with several, read "the sandbox user" as "the slot the
+  phase holds" throughout — which slot that is, is the next bullet's ("Worker slots").
+  The lock: `WorkerLock` = the file `<WorkRoot>/.factory-run.lock` (slot n's: `<WorkRoot>/slot-locks/.factory-run-n.lock`), held exclusively while open (between processes too; the OS
+  releases it if the holder dies), waited for — never failed on — and re-entrant per async flow (`HoldAsync`; `IsHeld` is the
+  flow's own, and a task that outlives the hold it started in no longer holds it). The sandbox carries it
+  (`WorkerSandbox.Lock`, set by `WorkerSlots.Create` for `FactoryOptions.WorkerSlots`, the only place production builds a
+  sandbox; unsandboxed there is none). Enforcement, at the one place a helper process starts: `WorkerSandbox.Start` throws unless the calling flow holds the
+  lock (nothing is started). Every user of it holds it: the sandbox's own short commands take it themselves (`RunAsync`,
+  `EnsureReadyAsync` — the probe and `claude --version` —, `StopAllAsync`, the pgrep included, and `DeleteAsWorkerAsync`, so every
+  worktree, seat and sweep deletion of `GitWorkspace`; never under a clone's lock, so no lock-order cycle), as do
+  `ClaudeWorker.RunAsync` (a whole session) and `SandboxTestRunner.RunAsync` (a whole run: worktree, steps, deletion) — each at
+  once when its caller's phase already holds it. The lock covers the whole life of every helper process, not only the phase
+  that started it: whoever starts one ends it with `WorkerSandbox.EndAsync` (the sandbox's short commands, a worker session, a
+  gate test step), which closes its stdin, waits for its exit on no cancellation token — up to `WorkerSandbox.StopGrace`
+  (10 s) for a short command, so one cancelled mid-way (a Pause or Stop during a test worktree's deletion, a shutdown) does not
+  return while its helper is still killing and sweeping — and, if the helper is still alive then, keeps the lock for it
+  (`WorkerLock.KeepUntil`): the flow's hold ends and the run goes on (escalates, pauses, stops), but the lock file stays open,
+  against every run and process, until that helper has exited. A session whose helper would not stop within the worker's stop
+  grace is first stopped the way a crashed run's leftover is — `ClaudeWorker.StopAsync` runs `WorkerSandbox.StopAllAsync` under
+  the still-held lock (a second run of the helper, whose exit kills every `_factory` process, the first helper among them) and
+  waits once more — and is marked `WorkerStillRunning` only if it is alive even then. A lock kept this way is never silent:
+  `[lock] the sandbox user's lock … stays held, N s after its phase ended: a launch helper run as _factory (sudo pid P) … is
+  still alive …; kill it if it never exits` on standard error when the phase ends and every `WorkerLock.ReportEvery` (30 s)
+  after; runs waiting on it wait as on any holder, honouring Pause and Stop (below). The phases a run holds it for (`InWorkerPhaseAsync`), so that nothing else runs
+  as the sandbox user between a session and its push: Implement, from the orphan's stop to the worktree's removal (the worktree,
+  the session, commit and push, the PR's opening); a fix round (review, CI, conflict) likewise; a plan item's planner seat
+  (orphan stop, sweeps, checkouts, session, removal; `SandboxPlanRunner` takes it too); the gate's new-tests runs
+  (`RunNewTestsAsync`); the stop of a leftover worker in `StopIdleAsync`; and, outside the pipeline, a whole triage
+  (`SandboxTriageRunner`: probe, sweeps, session, removal). Not held: Intake, the review panel's calls, CI and CodeGraph waits,
+  the merge queue and the merge, a waiting plan's evaluation, board and GitHub writes outside those phases. Waiting: a run that
+  finds the lock taken waits at that phase (log `[lock] … waiting for the sandbox user to …`), reading its item's controls every
+  control poll — a Pause (the usage pause and the freeze's row included) or a Stop ends the wait exactly as it ends a step
+  (Paused `user-paused`/`usage-paused`/`freeze-paused`, or the stop), controls unreadable more than `Controls:MaxReadFailures`
+  times in a row pause it (`controls-unreadable`, E2) — and once it has the lock the controls and the freeze evaluator are asked
+  again before the phase starts. So `factory run` beside `factory work` no longer fails at start with "another factory run": it
+  runs, and waits at a worker phase. No wait for the lock is silent or endless by accident (`WorkerLock.HoldAsync`): beside the
+  line a run logs when its wait starts, every wait — a run's, a triage's, a stop's, a sandbox command's own — is reported again
+  every `WorkerLock.ReportEvery` (30 s) with why the last try failed (`[lock] waited N s for the sandbox user's lock … and still
+  waiting …: <error>`; a run's and a triage's to their log, the others to standard error), so an I/O error that does not go
+  away, which .NET cannot tell from "held" on an existing file and which is therefore retried, shows; and a lock file that
+  cannot be opened for any other reason (a work root that cannot be made, no access) is a `FactoryUnavailableException`
+  (`the sandbox user's lock: … cannot be opened`), thrown by the lock itself wherever it is taken: the item, already claimed and
+  at its worker phase, is left where it is and nothing is recorded against it (E10). The two waits outside a run: a triage's
+  (`SandboxTriageRunner`) logs `[lock] gh-N: its triage is waiting for the sandbox user …`, ends with the host, and reads its
+  item's controls every `RunPipeline.DefaultControlPollInterval` — once one holds the item (a Pause of the factory or the item,
+  the usage pause, the freeze, a Stop: what the intake checks before it starts a triage) the triage is put off with
+  `TriageDeferredException`, which `IssueIntake` treats as "not this poll" (logged; no failure counted, nothing recorded,
+  the issue read again next poll); a stop's wait for the orphan's kill (`StopIdleAsync`) logs `[lock] a stop: waiting …`, ends
+  on cancellation and is deliberately not control-aware (a stop is not held up by a control: there is nothing a Pause could
+  mean for it). The run's first worker phase starts, under the lock, with the set-up every run
+  shares (`FactoryRunner`'s `enterSandbox`): `EnsureReadyAsync`, then the sweep of worktrees no run will resume — a failure there
+  is the factory's (`FactoryUnavailableException`: nothing recorded against the item); a run with no worker phase does neither.
+  Clean-up outside a phase (an escalation's or a stop's worktree, the merge queue's base-update worktree:
+  `RunPipeline.RemoveWorktreeAsync`) deletes only if the lock is free now (`TryHoldAsync`) — a run does not hold its item, or its
+  repository's queue turn, for another run's whole session to throw a directory away; left behind (`[cleanup] the sandbox user is
+  busy …`), it is deleted by the sweep the next worker phase of any run starts with, or replaced by the item's next worktree.
+  The rule for every path that can reach a deletion as the worker user (`GitWorkspace` → `IWorkerSandbox.DeleteAsWorkerAsync`)
+  outside a worker phase: it is either a control-aware phase wait or a try that leaves the directory. The paths: (1) the merge
+  queue's base update (`UpdateFromBaseAsync`) restores the item's own `factory-<id>` worktree — with nothing there
+  (`IRepoWorkspace.HasLeftoverAsync` false: the directory does not exist) a fresh worktree runs no helper, so the restore takes
+  no lock; with a leftover there (an earlier pass's clean-up found the sandbox user busy) replacing it deletes it as the worker
+  user first, so the restore is a worker phase (`[lock] sc-N: waiting for the sandbox user to replace its leftover worktree`,
+  ended by a Pause, a Stop or the freeze like any); (2) that update's, an escalation's and a stop's removal: `TryHoldAsync`,
+  above; (3) the clean-up of a worktree whose creation failed under the clone's lock (`GitWorkspace.ReplaceWorktreeAsync`, any
+  caller, on no cancellation token) never waits for the worker user (`IWorkerSandbox.TryDeleteAsWorkerAsync`: inside a phase it
+  has the lock; outside, busy, it leaves the directory — a leftover for (1) or the sweep). Everything else that deletes as the
+  worker user is inside a hold: Implement's and a fix round's Prepare/Restore/Reopen/Remove, the planner's seat (its
+  `PrepareSeatAsync`/`RemoveSeatAsync` and their failure clean-up), a triage's worktree, the gate's test worktrees
+  (`PrepareCommitAsync`, removal), and the three sweeps (a run's at its first worker phase, the triage's, the planner's).
+  Dispatch (`IntakeLoop`): a poll renews every lane's claims, then lists every lane and starts its items — each lane's in-flight
+  ones (stops first), then its ready ones, each once — into the capacity `Intake:MaxConcurrentRuns` leaves beside the runs still
+  in flight, and does not wait for them (sc-25992, "Runs across polls"); stops and waiting plans start outside that capacity;
+  with 1 (the default) the other runs are one after another as they were. Claims are renewed once per poll and lane, also while runs are in flight (`RenewClaimsAsync`, sc-25983), never per
+  dispatched run. Still one run per item (the item's run lock) and one turn per repository (the merge queue).
+  What stops a poll's new work still does with several runs in flight: after a run the freeze deferred no ready item of any
+  lane and no further in-flight item of its lane is started; after a factory-wide failure nothing is; a factory-wide control
+  set since the poll listed its work (the usage pause, a Pause of the factory, the freeze's row) is read before each ready item
+  and starts none (sc-25991; the rules, and what the status and the page show of several runs, are under "Intake failures" —
+  "Runs in flight" — and "Dashboard"); runs already started
+  finish by themselves, each checking the freeze, the usage pause and its controls before every step. Residuals, accepted: (a) one
+  sandbox user means one worker phase at a time — with `Worker:Slots` 1, or for the items of one slot — so a run whose turn in
+  a repository's merge queue needs the new-tests runs, or
+  finds a leftover of its own worktree to replace, waits for another run's session in its slot and holds that turn meanwhile
+  (both waits honour Pause, Stop and the freeze); (b) a helper that never exits (wedged in sudo, say, where the second helper run cannot
+  reach it) keeps the lock, and so every worker phase of every run, until someone kills it — by design: its exit would kill
+  whatever ran as `_factory` then; the periodic `[lock] … stays held … (sudo pid P)` line names it, and waiting runs can be
+  paused or stopped; (c) a worktree is shared by ACL with one sandbox user — its item's slot's — so a worker can
+  write another item's kept worktree of the same slot, as it could between runs before, and never one of another slot
+  (checked before every push of worker work: "Slot isolation", sc-25990); (d) the
+  acceptance harness (`E2e`) still takes the configured work root's locks — every slot's — for its whole life
+  (`WorkerLock.Acquire`, the one fail-fast taker), so a real `factory work` beside it waits at its worker phases rather than failing; (e) the CI fixer's
+  prompt reads the failing checks from GitHub once inside its phase (one bounded read under the lock, not CI's polling).
+  Tests: `WorkerLockTests` (also: a kept lock, its reports, a wait's report, a lock that cannot be opened);
+  `LockScopeTests` (a probe on every call the pipeline makes of its worker, workspaces, test runner, reviewers and GitHub: the
+  sandbox calls all hold the lock, the review, CI and merge calls never do; two runs overlapping; waits honouring Pause, Stop
+  and the freeze; a worker that would not stop keeping every other run's session out until its helper is gone; a base update,
+  a conflict fix round and a CI fix round through the simulated repository of `MergeQueueTests` — the one restore allowed
+  without the lock is the base update's with no leftover, and over a leftover it waits, logged, honouring Pause, Stop and the
+  freeze; the source scan that production builds a sandbox in one place and starts the helper only through `Start`);
+  `WorkerSandboxTests`/`SandboxReadinessTests` (a sudo stand-in that asks the OS, from its own process, whether the lock file is
+  locked at every helper run: `SandboxSupport.LockProbingSudo`; a wedged "helper" stopped by the second helper run, one that
+  will not exit keeping the lock until it does, a cancelled command waited for while it sweeps; the start-up check reading the
+  helper with the lock held elsewhere); `GitWorkspaceTests` (the failed worktree's clean-up never waiting); `IntakeLoopTests`
+  (a run's stale-helper refusal before the ledger; a triage's wait); `PlanTests` (the planner's seat); `IntakeDispatchTests`.
+- Worker slots (Phase 4b, sc-25989, E6/E7; `Worker/WorkerSlots.cs`, `RunPipeline.InWorkerPhaseAsync`): `Worker:Slots`
+  (1–8, default 1) sandbox users run workers side by side. A slot = a sandbox user + its own installed launch helper + its own
+  lock file (`WorkerSlot`: a number and a `WorkerSandbox`): slot 1 is `Worker:RunAs` through `Worker:LaunchHelper` under
+  `<WorkRoot>/.factory-run.lock` — exactly the sandbox before slots — and slot n is `<Worker:RunAs>n` through
+  `<Worker:LaunchHelper>-n` under `<WorkRoot>/slot-locks/.factory-run-n.lock` (`WorkerSlots.UserOf`/`HelperOf`,
+  `WorkerLock.For(root, n)`: the names `setup-worker-user.sh --slots n` creates and installs). The lock files of the slots
+  above 1 are in a directory of their own (`WorkerLock.SlotDirectoryName`) that the pool closes to every sandbox user before
+  it takes any lock (`WorkerSlots.EnsureLocksClosedAsync`, from `HoldAsync`, `TryHoldForAsync` and `AssignedAsync` — every way
+  the pool takes or hands out a slot, a waiting deletion's included; once per pool): the work root's inherited read entry would let one slot's user read another slot's lock
+  file, and `flock` takes an exclusive lock through a read-only descriptor, so code a worker runs could hold another slot's
+  lock and make that slot look busy. Closed as `GitWorkspace` closes `clone-locks`: owner-side, no root
+  (`WorkerSandbox.CloseToWorkerAsync`: `chmod -N`, mode 0700, read back with `ls -led`; off macOS, where no sandbox user can
+  be set up, mode 0700 read back), and a directory that cannot be closed is the factory's failure
+  (`FactoryUnavailableException`: `the worker slots' locks: …`; no slot's lock is taken, slot 1's included). A pool refuses
+  (at construction) a slot above 1 whose lock is beside slot 1's. Nothing of this with one slot or `Worker:RunAs=none`. Each helper's sweep is of its own uid only, so two runs are in a
+  worker phase at once exactly when they hold different slots, and nothing one slot's helper does reaches another slot's
+  processes. The pool (`WorkerSlots.HoldAsync`) hands out a slot, waiting like the single lock did (control-aware through the
+  pipeline's `whileWaiting`, reported every `WorkerLock.ReportEvery`: `[lock] waited N s for a free worker slot …`): a named
+  slot — only that one, however long it is busy — or the first free one in a given order. A flow inside a slot runs any nested
+  phase in it and is refused another (a phase is one sandbox user's). Everything done as a sandbox user is done by the slot the
+  calling flow holds (`WorkerSlots.Current`): the pool is the `IWorkerSandbox` of every `GitWorkspace` and the sandbox of
+  `ClaudeWorker` and `SandboxTestRunner`, resolved per call; with several slots a flow that holds none has no sandbox user and
+  `Current` throws, and `WorkerSandbox.Start` still refuses without that slot's lock.
+  An item's slot (E7): its first worker phase takes a free slot — tried in the order of fewest unfinished items first
+  (`WorkLedger.SlotsByLoadAsync`: items not Done, Cancelled or in Watch, by their last `slot` row; ties by number), so slots
+  fill evenly rather than in number order — and records it as a `slot` checkpoint (Detail `2 _factory2`; outcome passed) under
+  that slot's lock, before the run's sandbox set-up or the phase creates anything. From then on EVERY worker phase of the item
+  waits for that slot and no other, for the item's whole life (`RunPipeline.SlotOf`, read once per run): a resumed or paused
+  session (its transcript is in that user's home, so `claude --resume` works nowhere else), a fix round (review, CI, conflict)
+  and a changeset's fix round, the gate's new-tests runs, a plan item's planner seat, the stop of a worker a crashed run left
+  (`ClaudeWorker.StopOrphanAsync` → that slot's `StopAllAsync`: only that slot's helper runs, so only that user's processes are
+  killed; `StopIdleAsync` waits for the slot, logged `[lock] a stop: waiting for worker slot 2 (_factory2) …`), and its
+  worktrees' deletion. The wait is the worker phase's (`[lock] sc-N: waiting for worker slot 2 (_factory2) (another run's
+  worker phase holds …) to implement`, ended by a Pause, a Stop or the freeze). An item with a `worker-started` row and no
+  `slot` row was worked before slots, or by a one-slot factory (which writes no `slot` row: its ledger is as before, E9): it is
+  slot 1's. An item whose recorded slot is above `Worker:Slots` (the setting was lowered) fails with the reason — `sc-N was
+  started in worker slot 3 (_factory3), but Worker:Slots is 2 …` (`SlotUnavailableException`; Escalated) — and nothing of it
+  is run or deleted as another user. The reason names the two remedies and what each does. (1) `Set Worker:Slots to at least
+  3 again (with that user set up: sudo scripts/setup-worker-user.sh --slots 3) and re-run it`: the re-run (Escalated → Intake)
+  goes on in slot 3 — its session, its worktree, its `slot` row unchanged. A re-run WITHOUT raising the setting fails again
+  with the same reason at its first worker phase: no session, no helper, no worktree made, removed or reopened, no new `slot`
+  row — an item is never restarted in another slot (its branch and worktree path are the same, and the old worktree is another
+  user's). (2) `Or stop it (factory stop --item sc-N)`: the stop reaches Cancelled like any stop (`StopIdleAsync` →
+  `SlotLeftAsync`), but runs nothing as another user and deletes nothing: a worker a crashed run left is NOT stopped (no
+  helper of a configured slot could reach that user's processes), and its worktree is neither reopened nor removed. What stays
+  is on the record before the board is told — a `slot-left` checkpoint (`RunPipeline.SlotLeftDetail`: the slot and user, the
+  pid of the worker left running if there is one, and how to get rid of both; typed outcome `failed`; written once) — and the
+  stop's comment ends with that row's text (`ItemStopper.StopItemAsync`, from the ledger). The plan-stop cascade
+  (`ItemStopper.StopStoriesAsync`) and `GiveUpAsync` start no worker phase and read no slot, so neither can meet the
+  exception: a story of a stopped plan whose crashed worker is on record is left to its own next run, which stops it this way.
+  Which slot the work with no item of its own uses: a triage — any free slot, in number order, recorded nowhere (nothing
+  resumes a triage and its worktree is shared with no one for writing; `SandboxTriageRunner`); a run's sandbox set-up
+  (`enterSandbox`, in its first worker phase) — the slot that phase holds: the readiness probe is of that slot's helper, and
+  the sweep runs there; the merge queue's base update, which makes a fresh worktree outside any worker phase and runs no helper
+  — no slot is held, and the worktree is shared with the item's slot's user by the owner's own `chmod`
+  (`RunPipeline.InItemSlotAsync` → `WorkerSlots.AssignedAsync`; an item with no slot yet, e.g. a plan item that never needed a
+  planner here, is given the least-loaded one, recorded then).
+  Deletions: a directory is deleted as the user it was shared with for writing, under that slot's lock — read from the
+  directory's own ACL (`WorkerSlots.SharedWith`, the `ls -led` listing; the directory is the owner's, so only
+  `WorkerSandbox.ShareAsync` wrote the entry, and for an item's worktree it is the item's recorded slot), never chosen another
+  way. A flow that holds no slot waits for it (`DeleteAsWorkerAsync`), or tries it (`TryDeleteAsWorkerAsync`,
+  `WorkerSlots.TryHoldForAsync`: the pipeline's clean-up outside a phase); a flow that holds another slot — a sweep in another
+  item's worker phase — never waits for a second slot (two such runs would wait on each other): every sweep deletes with the
+  try (`GitWorkspace.SweepOrphansAsync`), so a leftover of a busy slot is left to a sweep that finds it free. A directory shared
+  with no slot (a triage's or a planner's read-only worktree, a seat) was written by no worker: the held slot deletes it, or
+  any free one. Fail closed: a directory writable by a principal that is no slot's user — a slot above `Worker:Slots`, two
+  slots' users, a group, an entry `ls` printed as a UUID (it does that while the directory service does not answer: the listing
+  is read up to 3 times first) — is not deleted as anyone: not as another slot's user, and never owner-side (the owner would
+  walk a tree that user wrote). `WorkerSlots.SharedWith` throws the typed `ForeignWriterException`. A deletion that must
+  happen (`DeleteAsWorkerAsync`: an item replacing that very worktree) fails with it, naming the directory. Every deletion
+  that may be left — `TryDeleteAsWorkerAsync`/`TryHoldForAsync`, so every sweep (`GitWorkspace.SweepOrphansAsync` for the
+  items' worktrees, the gate's test worktrees, the triage worktrees and the planner seats alike: one path) and the pipeline's
+  clean-up outside a phase — leaves the directory, runs no helper for it, and goes on to the next: a leftover of a removed
+  slot never fails a sweep, which would be the whole factory's failure in every run's first worker phase. It is said once per
+  directory per process, on standard error (and in the run's log when its own clean-up meets it): `[cleanup] leaving <path>:
+  it is shared for writing with user:_factory3, not with one of this factory's 2 sandbox users (…). … To get rid of it: set
+  Worker:Slots back so that user is one of this factory's (the next worktree sweep then deletes it as that user), or remove it
+  by hand as root (sudo rm -rf -- '<path>')` (`WorkerSlots.LeftReport`, `LeftForeign`). MCP session files are the owner's own
+  files and are deleted owner-side; no sweep of them deletes as a worker. With ONE slot no ACL decides which user deletes
+  (everything is slot 1's, as before slots, E9), with one addition for a factory lowered to 1: a directory writable by a
+  higher slot's user of this factory's naming (`<Worker:RunAs>2` … `8`) is left, or refused, the same way
+  (`ThrowIfAHigherSlotsAsync`) — slot 1's user could not delete it and the owner would have; any other entry, and a listing
+  that cannot be read, change nothing there.
+  `Worker:RunAs=none` (development): no sandbox user, no lock, no slot — `Worker:Slots` other than 1 is refused at start-up
+  (`FactoryOptions.WorkerSlotCount`) rather than ignored. With `Worker:Slots` unset nothing changed: one user `_factory`, one
+  helper at the same installed path, one lock file, no `slot` row, the same log lines (`… waiting for the sandbox user …`).
+  Not this story (W4): per-slot MCP session directories and seat roots (both still shared under the work root; the session
+  file's ACL check already names the slot's user), the cross-slot write-denial checks, and the documentation of the cross-slot
+  read residual. Residuals, accepted: (a) the slot is the item's for life, so an item waits for its own slot while another is
+  free — the price of never running or deleting anything of an item as a user that did not write it; the first-phase order by
+  load keeps the slots even; (b) sandbox users can read each other's worktrees through the work root's inherited read entry
+  (E7: accepted, written up with W4's checks); (c) lowering `Worker:Slots` with items still in a higher slot escalates those
+  items when they next need a worker (raise it again and re-run them, or stop them), and whatever that slot's user left — their
+  worktrees, a worker a crashed run left running — stays on the machine until the setting is raised again or the owner removes
+  it as root: the factory says so (the `[cleanup] leaving …` line, the `slot-left` row and stop comment) and touches none of it; (d) a
+  directory's slot is read from an ACL listing, so a wrong answer from `ls` is a loud failed deletion, not a deletion as the
+  wrong user; (e) slot 1's own lock file stays `<WorkRoot>/.factory-run.lock` (E9: the path it had before slots), in the work
+  root, which every sandbox user reads: code any slot's worker runs can hold slot 1's lock and make slot 1 look busy — liveness
+  only (no run is started, stopped or deleted by it; waits are reported every 30 s and honour Pause and Stop), and as it was
+  before slots for the one sandbox user's own lock.
+  Tests: `SlotPoolTests` (the pool: names, the refusals of a shared user/helper/lock, two flows in two slots with a third
+  waiting, a named slot waited for beside a free one, the order, `Current` and `AssignedAsync`; which slot a directory is
+  deleted in, through fake helpers that record which ran; the share on macOS; start-up naming the slot whose helper is missing,
+  stale, edited, pinned to another user or unpinned, and the probe of the held slot only; the pipeline: two items in a session
+  at once as two users, the `slot` row written before the set-up, an item interrupted in slot 2 resuming its session there
+  while slot 1 is free, a leftover worker stopped through slot 2 only, a slot no longer configured — its failure's two remedies, a re-run with and
+  without the setting raised, and its stop with and without a worker on record —, a sweep leaving a foreign leftover once and
+  deleting the next, the one-slot rule for a higher slot's leftover, the lock directory closed before any lock by each of the
+  five entry points and once, a directory that cannot be closed, a one-slot factory
+  recording nothing and a pre-slots item being slot 1's, the order by load), `LockScopeTests` (the base update's worktree is
+  the item's slot's user's with no slot held; production builds sandboxes only in the pool), `WorkerSandboxTests` (through
+  `SafeHelper` only: each slot's helper copy sweeps its own uid's processes and never the other's, a copy run as another slot's
+  user sweeps nothing, one pinned to another slot's uid refuses; version 4; the watcher's one redirected group and 200 runs with
+  an empty stderr), `SetupScriptTests` (`--slots 2`: two users, uids, homes, ACLs, per-user helper pins the orchestrator accepts
+  for that user only, one sudoers line each, the toolchain checked through each user's own helper; a shared uid and a count
+  outside 1–8 refused; a re-run with fewer slots removing exactly the higher slots' helper paths, after the sudoers file, and
+  naming the users left; `--slots 8` removing none; `--remove-worker-login` per user), `FactoryOptionsTests` (`Worker:Slots` read, bounded, refused with
+  `Worker:RunAs=none`). Live, not run here: P4b-AT5 and P4b-AT6 (`SlotAcceptanceTests`; docs/acceptance.md).
+- Slot isolation (Phase 4b, sc-25990, E7/E4; `Worker/WorkerSlots.cs`, `Worker/WorkerSandbox.cs`, `Mcp/McpSessions.cs`,
+  `FactoryRunner.cs`): what used to rest on "no other sandbox process runs" holds between slots. Owner decision 2026-10-13:
+  slots are isolated for WRITING, and each has its own MCP session directory; cross-slot READS are accepted (below). Everything
+  here is owner-side — the owner's own `chmod` and `/bin/ls -led` on directories the owner owns, and the owner's own read of
+  modes and ACLs inside a worktree; no root, no change to `setup-worker-user.sh` (the launch helper's change in this story is
+  its stderr only: "The helper's stderr", under the tests).
+  Layout (`WorkerSlots.DirectoryOf(name, slot)`: `name` for slot 1, `name-n` for slot n, as the helpers are named): slot 1 keeps
+  `<WorkRoot>/mcp-sessions`, `triage-worktrees` and `plan-worktrees` exactly where they were (E9: with `Worker:Slots` 1 no
+  path and no behaviour changed, and what an earlier version left there is still swept); slot n has `mcp-sessions-n`,
+  `triage-worktrees-n`, `plan-worktrees-n` (`McpProxySessions.DirectoryOf`, `SandboxTriageRunner.TriageWorktreesOf`,
+  `SandboxPlanRunner.PlanWorktreesOf`). The items' `worktrees`, the clones (`repos`), `clone-locks`, `slot-locks` and `controls`
+  are shared by all slots as before.
+  (1) Worktrees, write isolation: a worktree is shared for writing with one sandbox user — its item's slot's — by the
+  inheritable ACL the owner sets on the empty directory (`WorkerSandbox.ShareAsync`, sc-25989), so another slot's user has no
+  write entry on it. Since a push grant vouches only for the item's own sessions (E4: a tainted session must not change files
+  an untainted session later pushes), `GitWorkspace.CommitAndPushAsync` — every push of worker work — first asks, before
+  anything is staged, committed or a token minted, `IWorkerSandbox.EnsureOnlyWorkerWritesAsync(worktree)`: the worktree's `ls
+  -led` must name no writer but the owner and the user of the slot the pushing phase holds (`WorkerSlots.Current`;
+  `WorkerSlots.WritersBeside`: any `allow` entry with a write right — `write`, `append`, `add_file`, `add_subdirectory`,
+  `delete`, `delete_child` — for another slot's user, any other user, a group or a UUID `ls` could not name, or a mode that
+  lets everyone write; any later line of the listing that is neither an `allow` nor a `deny` entry — a principal with a space
+  in its name, a format this does not know — is itself a reason, never skipped). Otherwise `WorktreeWritersException`
+  ("Refusing to push the work in <path>: its ACL lets user:_factory write it. Only _factory2 … and the owner may write an
+  item's worktree and what is in it …"): nothing is staged, committed or pushed and no token is minted.
+  The root is not enough with several slots: its ACL only its owner (the factory's owner) or root can change, but the files
+  and directories a worker makes inside are that sandbox user's OWN, and code it runs (a build script's `chmod -R a+w`, a tool
+  with umask 0, a `chmod +a`) can open them to another slot's user without touching the root — the work root lets every
+  slot's user search and read down to them. So with `Worker:Slots` > 1 the same call then walks the whole worktree owner-side
+  (`Worker/WorktreeWriters.cs`, `WorktreeWriters.Inside`; in process, no `ls`): every entry, hidden and git-ignored ones
+  included (a build input another slot could have planted is as much a way in as a tracked file; the worktree's `.git` is a
+  file and is judged like any; the admin directory is the clone's, outside the worktree), never following a symbolic link (a
+  link is neither judged nor entered: changing one takes write on its directory, which is judged). It refuses the first entry
+  (a) whose mode has the other-write bit; (b) whose mode has the group-write bit — refused outright, also on the root with
+  several slots: setup gives each sandbox user a primary group of its own that no other slot's user is in and a file made here
+  takes its directory's group (the owner's), so the bit opens nothing between slots in practice, but proving that would take
+  a membership lookup per group and nothing made under the usual umask 022 has it; (c) whose ACL — read from the kernel for
+  that entry itself (`acl_get_link_np`, printed by `acl_to_text`, once per distinct ACL: `WorktreeWriters.NativeAcl`) — has
+  an `allow` entry for anyone but the owner and the worktree's own slot's user with any right beyond `read`, `execute`,
+  `readattr`, `readextattr`, `readsecurity` (so `write`, `append`, `delete`, `delete_child`, `writeattr`, `writeextattr`,
+  `writesecurity`, `chown` and any right this does not know; the other slots' inherited read entries pass: the accepted
+  cross-slot read); or (d) that cannot be judged: a directory the owner cannot list, an entry that vanished or whose name
+  does not read back, an ACL that cannot be read or has a line that is no entry or names no one. The reason names the entry
+  relative to the worktree ("src/deep/work.txt in it has a mode (0646) that lets every user write it", "the ACL of … lets
+  user:_factory write it (write)"). Nothing is skipped and there is no size bound: the cost is linear in the entries, like
+  `git add -A` itself — measured on this repository's worktree 1,137 entries in about 10 ms, and 5,050 entries each holding a
+  four-entry ACL in about 60 ms on a loaded host (about 12 µs an entry; roughly a second per 100,000) — and the walk is
+  cancellable. With ONE slot nothing inside is read and the root's group bit is not judged (E9: there is no other slot's user
+  to open a file to; the root's listing is read as before, so a worktree a higher slot's user may write, left from a larger
+  `Worker:Slots`, is not pushed from).
+  A refusal escalates the item with that reason (typed outcome `escalated`, like a tainted session's refusal) and, like any
+  escalation, its worktree is removed: deliberately not kept — what is in it cannot be vouched for, so it is neither resumed
+  nor pushed later — and said in the reason (so in the escalation comment): the session's work is discarded, a re-run does it
+  again in a fresh worktree, and if it happens again something the worker runs in that repository opens files to other users
+  (`chmod go-w`/umask 022 there, or `Worker:Slots` 1). Because a refusal costs a finished session, it is not decided in a
+  hurry: who may write is read up to 10 times, 200 ms apart (`WorkerSlots.PushAclReads`, about 2 s; with one slot too) —
+  `ls` prints a user's UUID, and an ACL entry has no name, while the directory service is slow to answer. Fail closed: a
+  listing that cannot be read, or shows no directory, refuses at once. Not checked: a seat's read-only worktree
+  (`shareWithWorker` false — never pushed) and the merge queue's base-update push (`PushAsync`: the orchestrator's own merge
+  commit, no worker work).
+  Residuals of (1), accepted: the check is of the worktree as it is at the push, when no process of its slot's user is left
+  (the helper's exit kills them all), so a file that was open to another slot's user WHILE the session ran and was closed
+  again before the push is not seen; and it is the factory's own reading of modes and ACLs, not the kernel's answer to "may
+  that user write this" (an access path that is neither a mode bit nor an ACL entry — there is none known for a role account
+  with a group of its own — would not be seen). Ownership is not read either: an entry in the worktree that another slot's
+  user OWNS (possible only if the worktree's own worker hard-links that user's file into its tree; another slot's user cannot
+  create anything there) could be rewritten by its owner under ordinary modes — code that does that could as well copy what
+  the other slot left in a shared place (the `/tmp` residual below). An owner whose umask gives group write (002) has every
+  push refused with several slots: run the factory under 022, macOS's default.
+  (2) MCP session files, read isolation: the work root's inherited read entry names every slot's user, so with several slots
+  each session directory is made its own slot's user's alone before a session's file is written
+  (`WorkerSandbox.RestrictToWorkerAsync`, every slot's, slot 1's `mcp-sessions` included: `chmod -N` — every entry gone, the
+  inherited ones too, and nothing made there later inherits one —, mode 0700, then two entries for that user: `search` on the
+  directory itself, so it opens the file it is given and cannot list the directory, and an inherit-only `read` for the files
+  made in it; read back with `ls -led`). Once the file is written `McpProxySessions` reads both back: the slot's user must
+  hold `search` on the directory and `read` on the file (as before), and neither may be open to anyone else but the owner
+  (`WorkerSandbox.OpenToOthers`: no `allow` entry of another principal for any right, no group or other mode bit, no line that
+  is not an ACL entry; read up to 5 times before it fails). Any of it failing — the restriction, a read of the listing, the
+  check — is factory-wide as before (`FactoryUnavailableException`, `the MCP session config: … must be readable by _factory2
+  (its worker slot's user) and the owner alone, but its ACL also allows user:_factory, so another slot's worker could read
+  this session's MCP credential`): the session is not started, its file is deleted and its credential revoked. With one slot
+  nothing is restricted and only the old check runs (E9).
+  (3) Seats: a triage's and a planner's worktree root and session directory are those of the slot the seat runs in
+  (`SlotSeat.Of(workRoot, name, slots, slot)` in `FactoryRunner.cs`, the one place both production runners get a seat's
+  worktree root, session directory, user and restriction from) (a triage:
+  whichever free slot it took; a planner: its plan item's slot, so a re-run finds what an earlier run of it left), and each
+  seat's two sweeps (`GitWorkspace.SweepOrphansAsync` of its seat root, `McpProxySessions.SweepAsync` of its session directory,
+  both under the `LiveRuns` claims of sc-25987, unchanged) are of those two directories only: a triage in one slot and a
+  planner in another, at once, neither sweep nor use each other's. One exception, narrow: a triage takes any free slot, so an
+  earlier, dead triage of the SAME issue may have left its worktree in another slot's root, and the clone refuses a second
+  worktree of `factory/triage-gh-<key>` while it is there — so a triage first removes its own issue's leftover, and nothing
+  else, from the other slots' triage roots (`SandboxTriageRunner.RemoveOwnLeftoversAsync`: it holds that item's run lock, and
+  a seat's worktree is shared with no worker for writing, so no slot's user wrote it). A dead session's file in another slot's
+  directory holds a credential that died with its process's proxy and waits for that slot's next seat.
+  Residual, accepted (owner decision 2026-10-13): cross-slot READ. The work root's inherited read entry
+  (`setup-worker-user.sh`) gives every slot's user read on everything made under the work root that is not closed owner-side
+  (`clone-locks`, `slot-locks`, and with several slots each `mcp-sessions[-n]`): the clones, every item's worktree and every
+  seat's worktree, of every slot. So code a worker of one slot runs can read another slot's worktree — another item's
+  unmerged work, of any repository the factory works in — while both run; it cannot change it, and what it read reaches a
+  push only through its own session, which a web or MCP use taints (E4) and review and the gate judge. For triage this means
+  its read confinement is, between slots as within one, Claude Code's own: the triage session's only allow rule is the
+  `ReadRule` of its own worktree with `dontAsk` and `blockReadsOutsideWorkingDirectories`, and the OS does not back it —
+  the triage's sandbox user can read every other slot's worktrees (and, as before slots, its own slot's kept worktrees and
+  the clones). A gap in that enforcement (the Glob/Grep residual under the triage bullet) would therefore reach other slots'
+  unmerged work too, inside the triage's bounded, fenced answer. Also accepted: a sandbox user can still write its OWN slot's
+  other kept worktrees (Worker phases' residual (c)), and (2)'s restriction is re-applied by each session rather than once,
+  so a session directory someone opened up by hand is closed again by the next session, not before it. Also accepted:
+  world-writable places OUTSIDE the work root are shared by every slot's user — `/tmp`, `/private/tmp`, `/var/tmp`, the
+  scratch files NuGet, MSBuild, cargo and other tools put there — so code one slot runs can plant or change a file there that
+  another slot's build reads (a slot's own `$TMPDIR` is per user, but nothing makes a tool use it). Nothing checks those: what
+  such a build then produces still goes through review, CI and the gate, and a web or MCP use taints the session that planted
+  it only for its own push.
+  Tests: `SlotIsolationTests` (the write-grant and the read-alone decisions over `ls -led` listings; the pool asking about the
+  held slot; the ACL of an entry inside a worktree and the walk of a real tree — links, hidden files, an unreadable or
+  vanished directory; on macOS, with the role accounts `daemon` and `nobody` for two slots' users, a real restricted
+  directory and a real worktree whose push is refused once the other user may write it or a file inside it, by a real ACL
+  entry or a mode bit; `SlotSeat.Of`, and that the two production runners take every seat directory from it),
+  `GitWorkspaceTests` (the refused push, for the root and for an entry inside: nothing staged, committed or pushed, no
+  token; ordinary modes and a link out of the worktree still push; one slot reads nothing inside), `McpProxyTests` (the
+  restricted directory, each refusal, one slot unchanged), `SafeCleanupTests` (the layout; a triage and a planner in two
+  slots at once, each with the directories `SlotSeat.Of` gives its slot; the triage's own leftover in another slot's root).
+- Clean-up under overlapping runs (Phase 4b, sc-25987; `Ledger/LiveRuns.cs`, `Git/CloneLock.cs`): no sweep decides from "no other run exists".
+  Whose a leftover is: it carries its item in its name — a worktree directory by `ItemNaming.OwnerOfLeftover` (`factory-<item>`,
+  the changeset worktree `factory-changeset-<item>`, a triage's `factory-triage-<item>`, a planner's worktree or seat
+  `factory-plan-<item>`, the gate's test worktrees `gate-<item>[-base|-head|-base-retry[-N]]`; the merge queue's base-update
+  worktree is the item's own `factory-<item>`), an MCP session file by `ItemNaming.OwnerOfSessionFile` (`<item>.<guid>.json`:
+  `McpProxySessions` is given its `owner`, the item whose run opens the sessions) — and it is a live run's exactly while that
+  item's run lock is held. Each sweep asks `LiveRuns.TryClaimAsync(owner)`: null (another run holds the item's lock) → nothing
+  of it is touched; otherwise a `LeftoverClaim`, for another item that item's run lock itself, held until the deletion (the
+  directory and the clone's `worktree prune`) is done, so no run of it starts in between. A name of no item, an item the ledger
+  never saw (nothing can run it; so also a session file written before files were named) and the asking session's own item
+  (`self`: its run already holds that lock, and what an earlier, dead run of it left is its to delete) are claimed without a
+  lock. The three sweeps: the start-of-run worktree sweep (`FactoryRunner.RunAsync` → `GitWorkspace.SweepOrphansAsync(keep,
+  live, ct)`: the ledger's rule `RunPipeline.WorktreeIsResumableAsync` is asked first and a kept worktree takes no lock; one it
+  would delete is claimed, the rule asked again under the lock — the item's run may have ended as the lock was taken — and only
+  then deleted; no `self`, since the pipeline has not taken its item's lock yet), the triage's and the planner's seat sweeps
+  (`SandboxTriageRunner`, `SandboxPlanRunner`: nothing is resumed, `self` = the session's item, `SandboxTriageRunner.Leftovers`)
+  and the MCP session-file sweep (`McpProxySessions.SweepAsync(directory, live, ct)`, by both). A run's worktree sweep now runs
+  at its first worker phase, under the sandbox user's lock (sc-25988), and its own item's leftovers are then a live run's (it
+  holds that run lock): it replaces them itself when it makes its next worktree. With no other run every other lock is free. A swept item's run lock is held only for the
+  deletion, so a `factory stop` of that item landing in that moment answers "is running" and is finished by the next poll.
+  The shared clone: `<WorkRoot>/repos/<owner>/<name>` has one writer at a time, `CloneLock` — a lock file
+  `<WorkRoot>/clone-locks/<owner>/<name>.lock` held exclusively while open (between processes too; the OS frees it if its holder
+  dies), waited for with a 50 ms retry until the caller's token is cancelled. A wait is never silent (clean-up waits with no
+  cancellation): once it has lasted `CloneLock.ReportEvery` (30 s), and every 30 s after, a line goes to standard error —
+  `[clone-lock] waited N s for <lock file> and still waiting (…): <why the last try failed>` (`CloneLock.WaitReport`) — so a
+  stuck holder, or an I/O error on the lock file that does not go away (.NET reports both alike, so both are retried), shows.
+  `GitWorkspace` holds it around every git
+  operation that changes the clone's refs or worktree list, together with the ref reads that depend on what it just wrote:
+  clone/fetch/`remote set-head` through the start-point read, the prune of the replaced worktree's registration and `worktree
+  add` in one hold (`ReplaceWorktreeAsync`: `PrepareAsync`, `RestoreAsync`, each checkout of `PrepareSeatAsync`, and
+  `PrepareCommitAsync`, which fetches nothing), `BranchStartAsync`, `CreateBranchAsync` with its push, every other `worktree
+  prune` (`RemoveAsync`, `RemoveSeatAsync`, the sweeps), `CommitAndPushAsync`'s commit and push (not its `add -A`),
+  `MergeBaseAsync`'s merge, `PushAsync`, and the fetch of
+  `ChangedFilesAsync` and of a reviewer's read of a commit the clone lacks. What is slow and needs no lock is done before it
+  is taken, never under it: a worktree directory is always deleted first (sandboxed, that is a run of the launch helper; also
+  the directory a fresh worktree replaces, and what a failed `worktree add` left, deleted once the lock is released — the
+  directory is its item's, which only that item's run or a sweep under its run lock touches, so nothing else can act on it
+  half deleted; its stale registration is pruned under the lock), and the installation token of a fetch or push is minted
+  first (a GitHub call) and passed in — still one fresh token per operation, never cached (`CreateBranchAsync` uses one for
+  its fetch and its push), none without a `PushGrant`, and none when `CommitAndPushAsync` finds nothing to commit and nothing
+  ahead of the base (read before the lock). A token minted before a wait of an hour would have expired; the push then fails
+  and the run with it. No git call leaves a process behind to write the clone outside the lock: `OwnerGit` sets
+  `gc.autoDetach=false` and `maintenance.autoDetach=false`, so the automatic maintenance that ends a `fetch`, `commit` or
+  `merge` (`gc --auto`: `pack-refs`, `worktree prune`) runs inside the call, under the lock, not detached.
+  The lock is an advisory `flock`, which any process that can open the file — read-only is enough — can take, and the work
+  root's inheritable ACL entry lets the worker user read everything made under it. So, sandboxed, a `GitWorkspace` closes
+  `<WorkRoot>/clone-locks` to the worker user before it takes its first lock (`IWorkerSandbox.CloseToWorkerAsync`, owner-side,
+  no root and no change to the set-up script or the launch helper: `/bin/chmod -N` removes every ACL entry of the directory,
+  the inherited one included, so nothing made in it later inherits one; mode `0700`; then `/bin/ls -led` must show
+  `drwx------` and no ACL entry at all, `WorkerSandbox.IsClosed`) — code a worker runs (`dotnet test`, `cargo test`) cannot
+  open a lock file, so it cannot hold a clone's lock against other runs. Fail closed: a directory that cannot be closed or
+  does not read back closed is a broken set-up, `FactoryUnavailableException` (`the clone locks: …`, factory-wide: no lock is
+  taken, no git runs, nothing is recorded against the item). Each `GitWorkspace` (each run) closes and checks it once; with
+  `Worker:RunAs=none` there is no worker user and nothing is closed. Reads by object take no lock (a commit's tree, files,
+  diff and grep, `ReopenAsync`, `HeadAsync`, `OverlayAsync`, which writes only its worktree's index and files). Private
+  `…LockedAsync` helpers expect the lock; it is never taken twice by one call chain (a second open would wait for ever). The
+  lock is per clone path, so on a case-insensitive volume two spellings of one repository share it, as they share the clone.
+  Two seats at once each hold a checkout at `…/<owner>/<name>`, so git numbers the second one's admin dir (`widgets1`):
+  `AdminDirAsync` finds a worktree's admin dir by its `gitdir` file, not only by name. Not changed here (later Phase 4b
+  stories): the sandbox user (`DeleteAsWorkerAsync` and every helper exit still kill every `_factory` process — which is why
+  each happens under the sandbox user's lock, "Worker phases").
 - Workers lead their own process group (launched via `/usr/bin/perl` `setpgrp` + `exec`); the pid is checkpointed
   (`worker-started`) as soon as the process exists, and a resumed Implement stops a still-running orphan's group
   (`ClaudeWorker.StopOrphanAsync`, only if it is still a group leader running `Worker:ClaudePath`) before going on.
@@ -1187,8 +2179,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   block's own closing tag, any case or spacing, is neutralised inside it) — the issue (`issue-title`, `issue-body`), the
   reviewer context (`story`, `files`, `diff`, `finding`), findings, CI logs (`ci-log`), conflicted paths (`file`). A GitHub issue
   item's spec (the approved triage's title, summary and proposed fix: model text from untrusted issue text) is fenced as data
-  (`triage`, `PromptFence.Spec`) in every worker prompt (implement, review fix, CI fix, conflict fix); a Shortcut story is
-  written on the owner's board and stays unfenced instructions.
+  (`triage`, `PromptFence.Spec`) in every worker prompt (implement, review fix, CI fix, conflict fix), and so is an item the
+  factory created from a plan, on every source; an item of a trusted source (a Shortcut story, a Kanban item:
+  `ItemNaming.Trusted`, the one trust decision, `WorkStory.UntrustedName`) is written on the owner's board and stays unfenced
+  instructions.
   Interrupts: the taint write of a tool use runs on a never-cancelled token (`ClaudeWorker` passes `CancellationToken.None` to
   `OnUntrusted`), and before resuming a session `RunWorkerSessionAsync` replays its stored `session_events` through
   `StreamJsonState` (`WorkLedger.ReplayTaintsAsync`) and taints it for every web/MCP use found; a failed read fails the run.
@@ -1247,12 +2241,14 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `--git-dir`/`--work-tree`, with the admin dir found from the clone's side (never the worker-writable `.git`
   file, also on resume), and every owner-side git call (all go through `GitWorkspace`) is isolated from the
   owner's own git config by `Git/OwnerGit.cs` (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_LFS_SKIP_SMUDGE=1`;
-  `-c core.hooksPath=/dev/null`, `core.fsmonitor=false`, `rerere.enabled=false`, LFS filters emptied), so no hook, filter or
+  `-c core.hooksPath=/dev/null`, `core.fsmonitor=false`, `rerere.enabled=false`, LFS filters emptied, `gc.autoDetach=false` and
+  `maintenance.autoDetach=false` — no detached maintenance outside the clone's lock, sc-25987), so no hook, filter or
   merge driver a PR's files or `.gitattributes` select runs as the owner; worktrees live under the owner-owned work root (root-owned parent), are shared with
   `_factory` by an inheritable ACL set on the empty directory before checkout (never `chmod -R`, which follows
   symlinks), and are deleted (as `_factory` first) once the PR is open or the item escalates. Only a paused or
   crashed Implement or fix round keeps its worktree for resume; a worker that won't stop marks its exception
-  (`WorkerStillRunning`) so nothing deletes under it. Each run sweeps worktrees no run will resume.
+  (`WorkerStillRunning`) so nothing deletes under it. Each run sweeps worktrees no run will resume, never one a
+  live run owns (sc-25987, above).
   The App private key never reaches a worker's env, argv or worktree (`ClaudeWorkerTests`).
 - Every worker stdout line is a `session_events` row (E7): `ClaudeWorker` taps each line (`WorkerCallbacks.OnLine`) into a
   bounded channel that `SessionRecorder` drains into Postgres in order (gapless `Sequence`, non-JSON lines kept as `raw`);
@@ -1299,6 +2295,63 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `work_items`/`worker_sessions`/`controls`, relayed by `SessionEventRelay` → `PipelineChanges`); session pages join the same
   `SessionBroadcaster` as hub viewers (`ISessionViewers`), so backlog-then-live holds there too. Never log transcript content.
   A plan item's stories are listed beneath its row, from the ledger alone (sc-25876, above).
+  Board links and epics (sc-25985): a row may carry `PipelineRow.Links` (`BoardLink`: the item's and its epic's link), which
+  `DashboardData` takes from each source's `IBoardLinks` (`WorkSourceKind.Links`, `WorkSourceRegistry.BoardLinks`; built whether
+  or not the source has its credential) — read from the ledger alone, never a board. Kanban's is `KanbanLedgerLinks`: the item's
+  GUID and project (`kanban_items`) and its epic's (`kanban_epics`, by `WorkItem.EpicId`) through the one link builder,
+  `KanbanLinks`, on `Kanban:WebUrl`. KanbanBoard's web UI has no page of one item: the link (`?project=<id>[&epic=<id>]&item=<id>`)
+  opens the board of the item's epic, or of its project when it has none (the `item` parameter only tells links apart); an item
+  whose project the ledger has not recorded yet (a key row from before sc-25985) is shown without a link until it is next listed.
+  A row with links shows its id as that link and `epic <kb-N>` beside the title; Shortcut and issue rows have no `IBoardLinks`
+  and are unchanged. `PipelineRow.Epic` (`ItemNaming.EpicOf`) is what the page's epic control rows are keyed by, so a Kanban epic
+  and the Shortcut epic of the same number are two rows, each form posting its own scope (`epic:kb-5`, `epic:5`).
+  Runs in flight (sc-25991): every row has a Run cell (`PipelineRow.Run`, `RunView`) — whether a run of the item is alive, its
+  phase, and its worker slot — so several running items show at once, each as what it is. Design decision, where this comes
+  from: the LEDGER, never the intake loop's memory, so the page is right for the runs of any process (a `factory run` beside
+  `factory work`) and after a restart. (a) Phase = the state in words plus what the item's own rows say it is at
+  (`RunView.PhaseOf`: `implementing`, `review`, `waiting for CI`, `merge queue: waiting for its turn` / `its repository's turn`
+  by `MergeQueue.QueuedRow`/`InTurn`, `waiting on its stories`, `paused in Implement: freeze-paused` — the paused-from state
+  and the pipeline's own reason). (b) The item's slot = `RunPipeline.SlotOf` (its `slot` row; slot 1 for a `worker-started`
+  with none). (c) Its use of the slot = the last of three checkpoints `RunPipeline.InWorkerPhaseAsync` writes (`Ledger/SlotUse.cs`;
+  Detail `<slot|any> <user|-> <what>`, e.g. `2 _factory2 implement`; typed outcome `passed` — a wait is no failure): `slot-wait`
+  once when a run starts waiting for a slot another run's worker phase holds (never per poll of the wait; `any -` for an item
+  with no slot yet), `slot-held` when an outermost worker phase has the slot's lock (a phase inside a phase writes none), and
+  `slot-released` when the phase ends, however it ends, or the wait ends without the slot (`not taken: …`; a Pause, a Stop, the
+  freeze) — written on no cancellation token, bounded, and a failed write only logged. So a worker phase costs two rows (three
+  after a wait), in every sandboxed factory, one slot included; none unsandboxed (`Worker:RunAs=none`: there is no slot), none
+  for a stop's wait and none for a triage (it has no item: an item waiting on a triage's slot shows as waiting). These rows are
+  not work of the attempt: `RunPipeline.CurrentWorkerAttempt` leaves them (and the `slot` row) out, so an attempt holding only
+  them is a fresh one — Implement and a fix round do not take it for a resume, look for a worktree that never was and record
+  `worktree-lost` (which a multi-slot factory's `slot` row did before this). (d) Liveness: a row says what a run last
+  recorded, not that the run is alive — a run that crashed or was killed inside a phase leaves `slot-held` as its last word. So
+  `DashboardData` also asks which items' run locks are held (`liveRuns` = `PostgresRunLocks.HeldAsync`: `pg_locks`, the
+  single-key advisory locks of this database with a positive key — nothing is taken, so asking never makes a run find its
+  item locked; a dead run's lock is gone with its connection), after reading the rows. `RunView.Live` true: `running: <phase> ·
+  holds slot 2 (_factory2) to implement` or `· waiting for a slot to implement` / `waiting for slot 2 (_factory2) to …`; false:
+  `no run now: <phase> · slot 2 (_factory2), not held`, and a held or waiting last row without a live run is said as stale, in
+  the error colour (`no run now: the last one ended holding slot 2 (_factory2) without recording it (crashed or killed)` —
+  only what is known: not whether the slot is free now, nor what the next run does); null (a reader given no lock reader:
+  tests, or a `pg_locks` read that failed — caught, so the page is not marked stale for it) shows the rows' word. A hold or
+  wait is the run's now only while no transition follows its row (`RunView.Ended`: a phase records its next state just before
+  it gives the slot up, so a dangling `slot-held` behind a later `Review` is an earlier run's; for that moment of a live phase
+  the cell says `not held`), and of two items shown holding one slot only the newer hold is (`RunView.Displaced`: the other
+  is stale, `another item's run holds slot 1 (_factory) now: an earlier run of this one ended holding it without recording it
+  (crashed or killed)`). And a run's start, under the item's run lock (`RunAsync` and `HoldAsync`), ends on the record a
+  `slot-held`/`slot-wait` an earlier run left as the item's last slot-use row (`EndEarlierSlotUseAsync`: `slot-released`
+  `<slot> <user> <what> not recorded: ended with an earlier run`, bounded, only logged on failure). Slot bookkeeping rows
+  (`slot`, `slot-left`, `slot-wait`, `slot-held`, `slot-released`: `SlotUse.IsBookkeeping`, one predicate) are never "the
+  item's last row" for a reader by position: the escalation comment's `Last ledger state` (a phase's release is written in
+  its `finally`, before the Escalated row), `GiveUpAsync`'s "while that `plan-held` row is still its last", and a worker
+  attempt's rows (`CurrentWorkerAttempt`). A row shown alive is read again every 15 s (a death writes no row, so no NOTIFY).
+  Residuals, accepted: a clean-up that takes an item's run lock for a moment to delete its leftovers (`LiveRuns`) shows as a
+  run for that moment; a helper that outlives its phase keeps the slot's lock (`WorkerLock.KeepUntil`) though the page says
+  released — the `[lock] … stays held` log line is that case's record. What a one-slot installation now sees (E9): one more
+  column, e.g. `running: implementing · holds slot 1 (_factory) to implement`, then `no run now: review · slot 1 (_factory),
+  not held`; and two more rows per worker phase in its ledger (no report, metric or decision reads them).
+  Tests: `RunsInFlightTests` (two real runs: both holding in two slots; one holding and one waiting with one slot; a dead run's
+  stale row; a dangling hold behind a later transition, ended at the next run's start; two items holding one slot; a failed
+  liveness read; `RunView`'s phase and slot words), `DashboardComponentTests` (two running rows; the deferral list),
+  `LedgerPostgresTests` (`HeldAsync` across lock holders, taking nothing).
 - Review → CI → MergeGate → Merge (sc-25378; `RunPipeline.Gate.cs`, only in a pipeline built with a `GateStage`, which
   production always is): Implement records every model that answers the implementer (`implementer-model` checkpoints, from
   each assistant message's `model`; a record only — the panel does not depend on it). Review is a panel (sc-25379, `Gate/ReviewPanel.cs`): `correctness` and

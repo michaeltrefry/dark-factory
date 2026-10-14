@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using DarkFactory.Orchestrator.Git;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Worker;
 
 namespace DarkFactory.Orchestrator.Tests;
@@ -29,11 +28,37 @@ internal static class SandboxSupport
         "#!/bin/sh\n[ \"$1\" = -n ] && [ \"$2\" = -u ] || exit 99\nshift 3\nexec \"$@\"\n");
 
     /// <summary>
+    /// <see cref="FakeSudo"/> that first records, one line per run in <paramref name="log"/>, whether <paramref name="workerLock"/>
+    /// is locked at that moment — <c>held</c> or <c>free</c>, asked of the OS from this other process (a non-blocking exclusive
+    /// <c>flock</c> on the lock file, as the lock itself takes): a probe on every run of the helper (sc-25988).
+    /// </summary>
+    public static string LockProbingSudo(string dir, WorkerLock workerLock, string log) => Executable(dir, $"probing-sudo-{Guid.NewGuid():N}.sh",
+        "#!/bin/sh\n[ \"$1\" = -n ] && [ \"$2\" = -u ] || exit 99\n"
+        + $"if /usr/bin/perl -e 'use Fcntl qw(:flock); open(my $f, \"<\", $ARGV[0]) or exit 0; exit(flock($f, LOCK_EX | LOCK_NB) ? 0 : 1)' '{workerLock.Path}'; "
+        + $"then echo free >> '{log}'; else echo held >> '{log}'; fi\n"
+        + "shift 3\nexec \"$@\"\n");
+
+    /// <summary>
     /// A sandbox whose helper is a <see cref="SafeHelper"/> copy (as <c>_factory</c>, which we are not: no uid sweep), with
     /// <see cref="LocalRegistry"/> as its registry.
     /// </summary>
     public static WorkerSandbox LocalSandbox(string dir) =>
         new("_factory", SafeHelper.Create(dir, new SafeHelperOptions { Registry = LocalRegistry(dir) }).Path, FakeSudo(dir));
+
+    /// <summary>
+    /// A sandbox that passes the check of the installed helper (<see cref="WorkerSandbox.EnsureHelperCurrentAsync"/>) and can run
+    /// nothing: its "helper" is a stub that only exits — the current one for itself (its own text before setup's two edits is its
+    /// <see cref="WorkerSandbox.HelperSource"/>), never the repo's — and its sudo and its user do not exist.
+    /// <paramref name="installed"/> edits the installed text (to make it stale).
+    /// </summary>
+    public static WorkerSandbox StubSandbox(string dir, WorkerLock? workerLock = null, Func<string, string>? installed = null)
+    {
+        const string user = "df-test-no-such-user";
+        var repoText = $"#!/bin/sh\nsandbox_user=_factory\nsandbox_uid=\nhelper_version={WorkerSandbox.HelperVersion}\nexit 97\n";
+        var text = repoText.Replace("\nsandbox_user=_factory\n", $"\nsandbox_user={user}\n").Replace("\nsandbox_uid=\n", "\nsandbox_uid=450\n");
+        var helper = Executable(dir, $"stub-helper-{Guid.NewGuid():N}.sh", (installed ?? (t => t))(text));
+        return new WorkerSandbox(user, helper, "/nonexistent/df-test-sudo", repoText) { Lock = workerLock };
+    }
 
     /// <summary>Where a worker of <see cref="LocalSandbox"/> records ("pid|start") a process it leaves behind for the helper to kill.</summary>
     public static string LocalRegistry(string dir) => Path.Combine(dir, "local-registry");
@@ -99,6 +124,19 @@ internal static class SandboxSupport
     }
 
     /// <summary>
+    /// The current user's own temporary directory (what the helper must give the worker as TMPDIR, sc-25992): macOS's
+    /// per-user one, else (Linux CI) <c>~/.tmp</c>.
+    /// </summary>
+    public static string UserTempDir()
+    {
+        var psi = new ProcessStartInfo("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"]) { RedirectStandardOutput = true, RedirectStandardError = true };
+        using var p = Process.Start(psi)!;
+        var dir = p.StandardOutput.ReadToEnd().Trim();
+        p.WaitForExit();
+        return p.ExitCode == 0 && dir.StartsWith('/') ? dir : PasswdHome() + "/.tmp";
+    }
+
+    /// <summary>
     /// The process whose "pid|start" record (<see cref="OwnProcess.ShellRecord"/>) a worker script wrote to
     /// <paramref name="pidFile"/>. Startup through the launch helper can take seconds on a loaded machine, so this waits up
     /// to 60 s (failing at once if <paramref name="run"/> ends first) and only accepts a complete line.
@@ -146,8 +184,8 @@ public class WorkerSandboxTests
     }
 
     [Theory]
-    [InlineData(WorkerAuth.ClaudeLogin, new[] { "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH" })]
-    [InlineData(WorkerAuth.RouterKey, new[] { "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH" })]
+    [InlineData(WorkerAuth.ClaudeLogin, new[] { "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR" })]
+    [InlineData(WorkerAuth.RouterKey, new[] { "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR" })]
     public async Task Helper_gives_the_worker_exactly_the_allowlisted_environment(WorkerAuth auth, string[] expected)
     {
         Environment.SetEnvironmentVariable("GH_TOKEN", "ghp_owner_should_not_leak");
@@ -167,6 +205,8 @@ public class WorkerSandboxTests
             Assert.StartsWith(env["HOME"] + "/.local/bin:", env["PATH"]);
             // Build servers would otherwise detach and outlive the run.
             Assert.Equal(("1", "0"), (env["MSBUILDDISABLENODEREUSE"], env["DOTNET_CLI_USE_MSBUILD_SERVER"]));
+            // The running user's own temporary directory, never the shared /tmp (sc-25992: NuGet's locks live under it).
+            Assert.Equal(SandboxSupport.UserTempDir(), env["TMPDIR"]);
         }
         finally
         {
@@ -255,6 +295,135 @@ public class WorkerSandboxTests
         catch (IOException)
         {
         }
+    }
+
+    private const string HomeLine = "\nhome=~\n";
+    private const string GetconfCall = "$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)";
+
+    /// <summary>
+    /// Runs <c>/usr/bin/env</c> through a helper copy whose home is <paramref name="home"/> and whose <c>getconf</c> answers
+    /// <paramref name="getconf"/> (null: no answer, as on Linux), so the owner's real home and temporary directory are never touched.
+    /// The worker's TMPDIR, or null when the helper refused to run it.
+    /// </summary>
+    private async Task<(int ExitCode, string? TmpDir, string Stderr)> RunWithTempDirAsync(string home, string? getconf)
+    {
+        Assert.Equal(1, SafeHelper.SourceCount(HomeLine));
+        Assert.Equal(1, SafeHelper.SourceCount(GetconfCall));
+        Assert.DoesNotContain('\'', home + getconf);
+        var helper = SafeHelper.Create(_dir, new SafeHelperOptions
+        {
+            Mutate = copy => copy.Replace(HomeLine, $"\nhome='{home}'\n")
+                .Replace(GetconfCall, getconf is null ? "$(false || true)" : $"$(echo '{getconf}')"),
+        });
+        var psi = new ProcessStartInfo(helper.Path, ["/usr/bin/env"])
+        {
+            WorkingDirectory = _dir,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        using var p = Process.Start(psi)!;
+        await IgnoringBrokenPipeAsync(async () =>
+        {
+            await p.StandardInput.WriteAsync("\n");
+            await p.StandardInput.FlushAsync();
+        });
+        var stdout = p.StandardOutput.ReadToEndAsync();
+        var stderr = p.StandardError.ReadToEndAsync();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await p.WaitForExitAsync(cts.Token);
+        await IgnoringBrokenPipeAsync(() => { p.StandardInput.Close(); return Task.CompletedTask; });
+        return (p.ExitCode, SandboxSupport.ParseEnv(await stdout).GetValueOrDefault("TMPDIR"), await stderr);
+    }
+
+    private string FakeHome() => Directory.CreateDirectory(Path.Combine(_dir, $"home-{Guid.NewGuid():N}")).FullName;
+
+    [Fact]
+    public async Task Helper_gives_the_systems_per_user_temp_dir_when_it_is_a_directory_the_user_owns()
+    {
+        var home = FakeHome();
+        var system = Directory.CreateDirectory(Path.Combine(_dir, "T")).FullName + "/";
+
+        var (exitCode, tmpdir, stderr) = await RunWithTempDirAsync(home, system);
+
+        Assert.True(exitCode == 0, stderr);
+        Assert.Equal(system, tmpdir);
+        Assert.False(Path.Exists(Path.Combine(home, ".tmp")));
+    }
+
+    [Theory]
+    [InlineData("none")] // Linux: getconf has no such variable
+    [InlineData("relative")]
+    [InlineData("missing")] // an absolute path to nothing
+    [InlineData("not-owned")] // a real directory another user (root) owns
+    [InlineData("symlink")] // a symlink to a directory the user owns
+    public async Task Helper_falls_back_to_a_0700_home_temp_dir_unless_getconf_names_a_directory_the_user_owns(string answer)
+    {
+        var home = FakeHome();
+        var owned = Directory.CreateDirectory(Path.Combine(_dir, $"owned-{Guid.NewGuid():N}")).FullName;
+        var link = Path.Combine(_dir, $"link-{Guid.NewGuid():N}");
+        File.CreateSymbolicLink(link, owned);
+        var getconf = answer switch
+        {
+            "none" => null,
+            "relative" => "relative/T/",
+            "missing" => Path.Combine(_dir, "missing") + "/",
+            "not-owned" => "/usr/",
+            "symlink" => link + "/",
+            _ => throw new ArgumentOutOfRangeException(nameof(answer)),
+        };
+
+        var (exitCode, tmpdir, stderr) = await RunWithTempDirAsync(home, getconf);
+
+        Assert.True(exitCode == 0, stderr);
+        Assert.Equal(Path.Combine(home, ".tmp"), tmpdir);
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(Path.Combine(home, ".tmp")));
+    }
+
+    [Fact]
+    public async Task Helper_makes_an_existing_looser_home_temp_dir_0700()
+    {
+        var home = FakeHome();
+        var tmp = Directory.CreateDirectory(Path.Combine(home, ".tmp")).FullName;
+        File.SetUnixFileMode(tmp, (UnixFileMode)0b111_101_101); // 0755
+
+        var (exitCode, tmpdir, stderr) = await RunWithTempDirAsync(home, null);
+
+        Assert.True(exitCode == 0, stderr);
+        Assert.Equal(tmp, tmpdir);
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(tmp));
+    }
+
+    [Theory]
+    [InlineData("symlink")] // a symlink to a directory the user owns: neither used nor changed
+    [InlineData("file")]
+    [InlineData("uncreatable")] // a home the user cannot write (root's /usr). An existing ~/.tmp another user owns cannot be made
+                                // without root here; the ownership test is the same own_dir as getconf's "not-owned" case above.
+    public async Task Helper_refuses_to_run_with_a_home_temp_dir_that_is_not_the_users_own_directory(string kind)
+    {
+        var home = FakeHome();
+        var target = Directory.CreateDirectory(Path.Combine(_dir, $"target-{Guid.NewGuid():N}")).FullName;
+        File.SetUnixFileMode(target, (UnixFileMode)0b111_101_101); // 0755
+        switch (kind)
+        {
+            case "symlink":
+                File.CreateSymbolicLink(Path.Combine(home, ".tmp"), target);
+                break;
+            case "file":
+                File.WriteAllText(Path.Combine(home, ".tmp"), "");
+                break;
+            case "uncreatable":
+                Assert.False(Path.Exists("/usr/.tmp"));
+                home = "/usr";
+                break;
+        }
+
+        var (exitCode, tmpdir, stderr) = await RunWithTempDirAsync(home, null);
+
+        Assert.Equal(70, exitCode);
+        Assert.Contains("factory-worker-launch: no per-user temporary directory: " + home + "/.tmp must be a directory (not a symlink) owned by the running user", stderr);
+        Assert.Null(tmpdir); // the worker never ran
+        Assert.Equal((UnixFileMode)0b111_101_101, File.GetUnixFileMode(target));
     }
 
     private const string SelfExclusion = "[ \"$pid\" != \"$$\" ] || continue";
@@ -473,6 +642,323 @@ public class WorkerSandboxTests
         Assert.Empty(helper.Refusals);
     }
 
+    // ---- Worker slots (sc-25989): several sandbox users, one helper copy each, pinned to its own user and uid ----
+
+    /// <summary>
+    /// A machine with two sandbox users, each with a leftover process: 400001 is slot 1's (uid 450), 400002 slot 2's (uid 451).
+    /// Synthetic pids, above macOS's pid limit: the seam can only log them.
+    /// </summary>
+    private static string TwoUsersTable => SafeHelper.ListingByUid(Machinery,
+        new Dictionary<string, string[]> { [FakeIdentity.SlotUid(1)] = ["400001 1"], [FakeIdentity.SlotUid(2)] = ["400002 1"] });
+
+    [Theory]
+    [InlineData(1, 400001)]
+    [InlineData(2, 400002)]
+    public async Task Each_slots_helper_sweeps_only_its_own_users_processes_and_leaves_the_other_slots_alone(int slot, int own)
+    {
+        var helper = HelperWithFakeListing(TwoUsersTable, identity: FakeIdentity.Slot(slot));
+
+        var (exitCode, stderr, passes, targets) = await RunFakeListingHelperAsync(helper);
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal("", stderr);
+        Assert.Equal([own], targets); // the other slot's process is never a target
+        Assert.Equal(2, passes);
+        Assert.Empty(helper.Refusals);
+    }
+
+    [Fact]
+    public async Task A_slots_helper_started_as_another_slots_user_sweeps_nothing()
+    {
+        // Slot 2's helper (pinned to _dftest2, uid 451) run as slot 1's user: the sudoers rules forbid it (each helper only as its
+        // own user); were it to happen, the name check fails and no process of either user is listed or signalled.
+        var slot1 = FakeIdentity.Slot(1);
+        var helper = SafeHelper.Create(_dir, new SafeHelperOptions
+        {
+            Identity = slot1,
+            FakeListing = TwoUsersTable,
+            Mutate = copy => copy
+                .Replace($"\nsandbox_user={slot1.User}\n", $"\nsandbox_user={FakeIdentity.SlotUser(2)}\n")
+                .Replace($"\nsandbox_uid={slot1.PinnedUid}\n", $"\nsandbox_uid={FakeIdentity.SlotUid(2)}\n"),
+        });
+
+        var (exitCode, stderr, passes, targets) = await RunFakeListingHelperAsync(helper);
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal("", stderr);
+        Assert.Equal(0, passes); // the process table was never read
+        Assert.Empty(targets);
+    }
+
+    [Fact]
+    public async Task A_slots_helper_pinned_to_another_slots_uid_refuses_its_sweep()
+    {
+        // Slot 2's user running a copy that setup pinned to slot 1's uid (a helper installed over the wrong path).
+        var identity = FakeIdentity.Slot(2) with { PinnedUid = FakeIdentity.SlotUid(1) };
+
+        var (exitCode, stderr, passes, targets) = await RunFakeListingHelperAsync(HelperWithFakeListing(TwoUsersTable, identity: identity));
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("refusing the _dftest2 uid sweep: _dftest2's uid 451 is not the pinned 450", stderr);
+        Assert.Equal(0, passes);
+        Assert.Empty(targets);
+    }
+
+    [Fact]
+    public void The_helper_is_version_5_and_an_installed_version_4_is_stale()
+    {
+        Assert.Equal(5, WorkerSandbox.HelperVersion);
+        Assert.True(SafeHelper.SourceContains($"\nhelper_version={WorkerSandbox.HelperVersion}\n"));
+        const string repo = "#!/bin/bash\nsandbox_user=_factory\nsandbox_uid=\nhelper_version=5\n";
+        var installedV4 = repo.Replace("sandbox_uid=", "sandbox_uid=450").Replace("helper_version=5", "helper_version=4");
+        Assert.Equal("its helper_version 4 is older than 5", WorkerSandbox.StaleHelperReason(installedV4, "_factory", repo));
+        Assert.Null(WorkerSandbox.StaleHelperReason(repo.Replace("sandbox_uid=", "sandbox_uid=450"), "_factory", repo));
+        // A slot's copy is the same text pinned to its own user: current for that user, and for no other.
+        var second = repo.Replace("sandbox_user=_factory", "sandbox_user=_factory2").Replace("sandbox_uid=", "sandbox_uid=451");
+        Assert.Null(WorkerSandbox.StaleHelperReason(second, "_factory2", repo));
+        Assert.Equal("its sandbox_user is not _factory", WorkerSandbox.StaleHelperReason(second, "_factory", repo));
+    }
+
+    [Fact]
+    public void The_watcher_is_killed_and_reaped_in_one_redirected_group()
+    {
+        // sc-25877's flake: bash 3.2 also reports a signal-killed job when it reads the next script line, so a watcher that died
+        // between a kill on one line and a redirected wait on the next put "Terminated: 15" on the helper's real stderr.
+        Assert.True(SafeHelper.SourceContains("\n{ send_signal \"$watcher\" || true; wait \"$watcher\" || true; } 2>/dev/null\n"));
+        Assert.False(SafeHelper.SourceContains("\nsend_signal \"$watcher\""));
+        Assert.False(SafeHelper.SourceContains("\nwait \"$watcher\""));
+    }
+
+    [Fact]
+    public async Task The_helpers_stderr_stays_empty_run_after_run()
+    {
+        // The stray "Terminated: 15" line showed about once in a hundred runs; none here in 200, each a whole helper run and sweep.
+        var helper = HelperWithFakeListing(Machinery);
+        for (var run = 1; run <= 200; run++)
+        {
+            var (exitCode, stderr, _, targets) = await RunFakeListingHelperAsync(helper);
+
+            Assert.True(exitCode == 0 && stderr == "" && targets.Length == 0, $"run {run}: exit {exitCode}, stderr '{stderr}'");
+        }
+    }
+
+    [Fact]
+    public void The_helpers_own_stderr_is_dev_null_from_the_launch_on_and_its_real_stderr_is_descriptor_3()
+    {
+        // bash 3.2's own reports are not the worker's output and not the helper's messages: "child setpgid (N to N): Operation
+        // not permitted" from the child it forks under set -m (8 of 32 loaded runs of the 200-run test), and the job report of
+        // a job a signal ended ("Killed: 9 /usr/bin/env …", "Terminated: 15 ( while … )"), written when bash next reads a script
+        // line — so also for a worker a Stop killed before the helper reached its wait, which no redirection on that wait can
+        // catch (sc-25990). The helper's stderr is /dev/null from the launch to its exit; the worker gets the real one back.
+        Assert.True(SafeHelper.SourceContains(
+            "\nexec 3>&2 2>/dev/null\nset -m # the worker gets its own process group\n/usr/bin/env -i "));
+        Assert.True(SafeHelper.SourceContains("\"$@\" </dev/null 2>&3 3>&- &\nworker=$!\nset +m\n"));
+        // Nothing else the helper starts keeps the real stderr: the watcher, and the sweep's listing and its awk.
+        Assert.True(SafeHelper.SourceContains("\n) <&0 3>&- & #"));
+        Assert.True(SafeHelper.SourceContains("for pid in $(list_uid_procs 3>&- | outside_tree \"$$\" 3>&-); do\n"));
+        // What the helper itself says after the launch goes to the real stderr by name, and nothing after it is sent to fd 2.
+        Assert.True(SafeHelper.SourceContains("processes still appearing after $pass sweeps\" >&3\n"));
+        Assert.False(SafeHelper.SourceContainsAfter("\nexec 3>&2 2>/dev/null\n", ">&2"));
+        Assert.Equal(1, SafeHelper.SourceCount("\" >&3\n")); // the one message printed after the launch
+        Assert.Equal(1, SafeHelper.SourceCount("\nexec "));
+        // The earlier redirections stay (a wait for a signal-killed job reports it too).
+        Assert.True(SafeHelper.SourceContains("\nwait \"$worker\" 2>/dev/null || status=$?\n"));
+        Assert.False(SafeHelper.SourceContains("\nwait \"$worker\" ||"));
+    }
+
+    [Fact]
+    public async Task The_workers_own_stderr_still_reaches_the_helpers_and_the_saved_descriptor_is_closed_for_it()
+    {
+        // The worker holds what any child of this process holds — its three standard descriptors — and no other: not the
+        // helper's saved stderr (3), nor anything else the helper opened.
+        var (exitCode, stderr) = await RunHelperAsync(
+            ["/bin/sh", "-c", "echo from-the-worker >&2; " + OpenDescriptors("worker") + " >&2; exit 7"], "\n", closeStdin: false);
+
+        Assert.Equal((7, "from-the-worker\n" + await InheritedDescriptorsAsync("worker")), (exitCode, stderr));
+    }
+
+    /// <summary>What <see cref="OpenDescriptors"/> prints in a plain child of this test host: nothing, unless the host itself hands its children a descriptor above 2.</summary>
+    private static async Task<string> InheritedDescriptorsAsync(string who)
+    {
+        using var p = Process.Start(new ProcessStartInfo("/bin/sh", ["-c", OpenDescriptors(who)]) { RedirectStandardOutput = true, RedirectStandardInput = true, RedirectStandardError = true })!;
+        var printed = await p.StandardOutput.ReadToEndAsync();
+        await p.WaitForExitAsync();
+        return printed;
+    }
+
+    /// <summary>A shell snippet that prints <c>&lt;who&gt;-fd-N-open</c> for every descriptor 3 to 9 its shell holds.</summary>
+    private static string OpenDescriptors(string who) =>
+        $"for fd in 3 4 5 6 7 8 9; do if ( : <&$fd ) 2>/dev/null; then echo {who}-fd-$fd-open; fi; done";
+
+    [Fact]
+    public async Task The_probe_for_open_descriptors_sees_one_that_is_open()
+    {
+        // The probe the tests below rely on, shown to work: a shell handed descriptor 5 reports it, and only it.
+        var psi = new ProcessStartInfo("/bin/sh", ["-c", $"exec 5</dev/null; /bin/sh -c '{OpenDescriptors("x")}'"]) { RedirectStandardOutput = true };
+        using var p = Process.Start(psi)!;
+        Assert.Equal("x-fd-5-open\n", await p.StandardOutput.ReadToEndAsync(TestContext.Current.CancellationToken));
+        await p.WaitForExitAsync(TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task Nothing_the_helper_starts_but_the_worker_holds_its_real_stderr()
+    {
+        // The orchestrator reads the helper's stderr to its end, so a process that outlived the helper holding it would hang
+        // the read. The watcher and the sweep's listing are started with the saved descriptor closed (their own stderr is
+        // /dev/null); probes inside both say what each holds.
+        const string WatcherLoop = "    while IFS= read -r _; do :; done\n";
+        Assert.True(SafeHelper.SourceContains("\n(\n" + WatcherLoop));
+        var (ofWatcher, ofListing) = (Path.Combine(_dir, "watcher.fds"), Path.Combine(_dir, "listing.fds"));
+        var helper = SafeHelper.Create(_dir, new SafeHelperOptions
+        {
+            Identity = FakeIdentity.SandboxRole,
+            FakeListing = "{ echo listed; " + OpenDescriptors("listing") + "; } >>'" + ofListing + "'; " + Machinery,
+            Mutate = copy => copy.Replace("\n(\n" + WatcherLoop, "\n(\n    { echo watching; " + OpenDescriptors("watcher") + "; } >'" + ofWatcher + "'\n" + WatcherLoop),
+        });
+        var psi = new ProcessStartInfo(helper.Path, ["/bin/sh", "-c", "/bin/sleep 0.3"]) { RedirectStandardInput = true, RedirectStandardError = true };
+        psi.Environment.Remove("SUDO_USER");
+        psi.Environment.Remove("SUDO_UID");
+        using var p = Process.Start(psi)!;
+        await p.StandardInput.WriteAsync("\n");
+        await p.StandardInput.FlushAsync();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var stderr = await p.StandardError.ReadToEndAsync(cts.Token);
+        await p.WaitForExitAsync(cts.Token);
+        p.StandardInput.Close();
+
+        Assert.Equal((0, ""), (p.ExitCode, stderr));
+        Assert.Equal("watching\n" + await InheritedDescriptorsAsync("watcher"), File.ReadAllText(ofWatcher));
+        Assert.Equal("listed\n" + await InheritedDescriptorsAsync("listing"), File.ReadAllText(ofListing));
+    }
+
+    [Fact]
+    public async Task A_program_that_cannot_be_run_is_still_reported_on_the_helpers_stderr()
+    {
+        var (exitCode, stderr) = await RunHelperAsync([Path.Combine(_dir, "no-such-program")], "\n", closeStdin: false);
+
+        Assert.Equal(127, exitCode);
+        Assert.Matches("no-such-program.?: No such file or directory", stderr); // GNU env quotes the name
+    }
+
+    /// <summary>
+    /// Runs a helper whose worker never ends by itself and stops it by closing the helper's stdin: at once — a Stop cancels at
+    /// once, so the worker can be killed before the helper's main shell has reached its wait for it — or only when the worker
+    /// has printed a line, the helper then long since in that wait. The helper's exit code, its stderr, and how long that
+    /// stderr took to end once the helper had exited.
+    /// </summary>
+    private static async Task<(int ExitCode, string Stderr, TimeSpan UntilStderrEnded)> RunStoppedHelperAsync(SafeHelper helper, bool atOnce)
+    {
+        var psi = new ProcessStartInfo(helper.Path, ["/bin/sh", "-c", atOnce ? "exec /bin/sleep 600" : "/bin/sleep 0.5; echo started; exec /bin/sleep 600"])
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        using var p = Process.Start(psi)!;
+        await p.StandardInput.WriteAsync("\n");
+        await p.StandardInput.FlushAsync();
+        var stderrRead = p.StandardError.ReadToEndAsync();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        if (!atOnce)
+        {
+            Assert.Equal("started", await p.StandardOutput.ReadLineAsync(cts.Token));
+        }
+
+        p.StandardInput.Close(); // the Stop
+        await p.WaitForExitAsync(cts.Token);
+        var exited = Stopwatch.GetTimestamp();
+        var stderr = await stderrRead.WaitAsync(cts.Token);
+
+        return (p.ExitCode, stderr, Stopwatch.GetElapsedTime(exited));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_stopped_workers_helper_reports_137_and_writes_no_job_report(bool atOnce)
+    {
+        // Before: "…/factory-worker-launch: line N: <pid> Killed: 9  /usr/bin/env -i …" on every Stop, from the wait for the
+        // worker; and, for a worker killed before the helper reached that wait, from whichever script line bash read next.
+        var (exitCode, stderr, untilStderrEnded) = await RunStoppedHelperAsync(SafeHelper.Create(_dir), atOnce);
+
+        Assert.Equal((137, ""), (exitCode, stderr));
+        // Nothing of the helper's outlives it holding its stderr: the orchestrator's read of it ends with the helper.
+        Assert.True(untilStderrEnded < TimeSpan.FromSeconds(5), $"the helper's stderr ended {untilStderrEnded} after it exited");
+    }
+
+    [Fact]
+    public async Task A_worker_stopped_at_once_leaves_the_helpers_stderr_empty_run_after_run()
+    {
+        // A Stop cancels at once. With the helper as it was (its real stderr still its own and its watcher's while it ran)
+        // this loop never got past run 18 in 30 loaded tries: a line on stderr from the stopped run's machinery. None in 200.
+        var helper = SafeHelper.Create(_dir);
+        for (var run = 1; run <= 200; run++)
+        {
+            var (exitCode, stderr, _) = await RunStoppedHelperAsync(helper, atOnce: true);
+
+            Assert.True(exitCode == 137 && stderr == "", $"run {run}: exit {exitCode}, stderr '{stderr}'");
+        }
+    }
+
+    /// <summary>The helper's line right before its wait for the worker: a pause put in front of it holds the main shell back while the worker dies.</summary>
+    private const string BeforeTheWait = "\nstatus=0\n";
+
+    /// <summary>
+    /// The early job report, made certain: a worker a signal ended BEFORE the helper's main shell reached its wait for it (a
+    /// worker that crashes at once; a Stop on a host so loaded that the watcher gets there first). bash 3.2 then reports the
+    /// job when it next reads a script line or finishes a command — no redirection on the wait itself can catch that. Here the
+    /// main shell is held for 0.3 s in front of its wait (a mutation of the copy: one foreground command), and the worker is
+    /// dead long before: with the helper's stderr still its real one this printed, every time,
+    /// "…: line N: &lt;pid&gt; Filesize limit exceeded: 25 /usr/bin/env -i …" (the worker ending itself) or
+    /// "… Killed: 9 /usr/bin/env -i …" (a Stop). Its stderr is /dev/null from the launch on: nothing arrives.
+    /// </summary>
+    [Theory]
+    [InlineData(false, 153)] // the worker ends itself by a signal: a file size limit of 0 makes its first write SIGXFSZ (25)
+    [InlineData(true, 137)] // the watcher kills it on a Stop that came at once
+    public async Task A_worker_a_signal_ended_before_the_helper_waited_for_it_is_not_reported_on_the_helpers_stderr(bool stopped, int exit)
+    {
+        Assert.True(SafeHelper.SourceContains(BeforeTheWait + "#"));
+        var helper = SafeHelper.Create(_dir, new SafeHelperOptions { Mutate = copy => copy.Replace(BeforeTheWait, "\n/bin/sleep 0.3" + BeforeTheWait) });
+        var file = Path.Combine(_dir, "too-big");
+        var psi = new ProcessStartInfo(helper.Path, ["/bin/sh", "-c", stopped ? "exec /bin/sleep 600" : $"ulimit -f 0; echo x >'{file}'; echo survived >&2"])
+        {
+            RedirectStandardInput = true,
+            RedirectStandardError = true,
+        };
+        using var p = Process.Start(psi)!;
+        await p.StandardInput.WriteAsync("\n");
+        await p.StandardInput.FlushAsync();
+        if (stopped)
+        {
+            p.StandardInput.Close();
+        }
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var stderr = await p.StandardError.ReadToEndAsync(cts.Token);
+        await p.WaitForExitAsync(cts.Token);
+        p.StandardInput.Close();
+
+        Assert.Equal((exit, ""), (p.ExitCode, stderr));
+    }
+
+    [Fact]
+    public async Task What_the_helper_itself_says_after_the_launch_still_reaches_its_stderr_and_bashs_job_report_does_not()
+    {
+        // The one message the helper prints after it launched its worker, with a worker a signal ended in the same run: the
+        // message arrives (through the saved descriptor), the job report of the killed worker does not.
+        var helper = HelperWithFakeListing(Machinery + "; echo \"$((600000 + n)) 1\"");
+        var psi = new ProcessStartInfo(helper.Path, ["/bin/sh", "-c", "exec /bin/sleep 600"]) { RedirectStandardInput = true, RedirectStandardError = true };
+        psi.Environment.Remove("SUDO_USER");
+        psi.Environment.Remove("SUDO_UID");
+        using var p = Process.Start(psi)!;
+        await p.StandardInput.WriteAsync("\n");
+        p.StandardInput.Close(); // stopped at once
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var stderr = await p.StandardError.ReadToEndAsync(cts.Token);
+        await p.WaitForExitAsync(cts.Token);
+
+        Assert.Equal((137, "factory-worker-launch: _dftest processes still appearing after 20 sweeps\n"), (p.ExitCode, stderr));
+    }
+
     [Fact]
     public async Task Uid_sweep_runs_as_the_sandbox_role_account_invoked_through_sudo_by_the_owner()
     {
@@ -632,7 +1118,7 @@ public class WorkerSandboxTests
 
             Assert.True(result.Succeeded, result.StderrTail);
             Assert.Equal("sess-sbx", result.SessionId);
-            Assert.Equal(["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH"], File.ReadAllText(envDump).Split('\n'));
+            Assert.Equal(["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR"], File.ReadAllText(envDump).Split('\n'));
         }
         finally
         {
@@ -659,13 +1145,15 @@ public class WorkerSandboxTests
     }
 
     [Fact]
-    public async Task A_sandboxed_worker_that_will_not_stop_still_cancels_but_is_marked_still_running()
+    public async Task A_sandboxed_worker_that_will_not_stop_still_cancels_is_marked_still_running_and_keeps_the_sandbox_users_lock_until_it_is_gone()
     {
         var pidFile = Path.Combine(_dir, "stuck-pid");
-        // A "sudo" that ignores its stdin closing, as a wedged helper would.
+        // A "sudo" that ignores its stdin closing, as a wedged helper would. The worker user has no process (no such user), so the
+        // second stop — a run of the helper that kills that user's processes — finds nothing to run for.
         var stuckSudo = SandboxSupport.Executable(_dir, "stuck-sudo.sh",
             $"#!/bin/sh\necho {OwnProcess.ShellRecord("$$")} > '{pidFile}'\necho '{{\"type\":\"system\",\"session_id\":\"s\"}}'\nexec /bin/sleep 600 </dev/null\n");
-        var sandbox = new WorkerSandbox("_factory", SafeHelper.Create(_dir).Path, stuckSudo);
+        var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, "stuck-root")).FullName);
+        var sandbox = new WorkerSandbox("_df_no_such_user", SafeHelper.Create(_dir).Path, stuckSudo) { Lock = workerLock };
         var worker = new ClaudeWorker("claude", SandboxSupport.Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(5), sandbox,
             stopGrace: TimeSpan.FromMilliseconds(300));
         using var cts = new CancellationTokenSource();
@@ -679,11 +1167,143 @@ public class WorkerSandboxTests
             var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
             Assert.True(WorkerStillRunning.IsMarked(ex));
             Assert.True(pid.IsAlive);
+            // The session is over for its caller, but its helper is alive and its exit still kills every process of the worker
+            // user: the lock is not released under it (sc-25988), so no other run's worker phase — or helper run — starts.
+            Assert.False(workerLock.IsHeld);
+            Assert.False(await workerLock.TryHoldAsync(() => Task.CompletedTask));
+            Assert.False(await sandbox.TryDeleteAsWorkerAsync(Path.Combine(_dir, "nothing-there"), CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken));
+            var next = workerLock.HoldAsync(() => Task.CompletedTask, CancellationToken.None, retry: TimeSpan.FromMilliseconds(5));
+
+            // Gone: the lock is released, and the waiting phase starts.
+            pid.KillIfStillRunning();
+            await next.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
         }
         finally
         {
             pid.KillIfStillRunning();
         }
+    }
+
+    [Fact]
+    public async Task A_helper_that_ignores_its_closed_stdin_is_stopped_by_a_second_helper_run_under_the_same_lock_and_the_worker_is_not_left_running()
+    {
+        // The first "helper" wedges: it ignores its stdin closing. It records itself where the second run's uid sweep (narrowed
+        // to that registry, as in the helper tests) finds it — standing in for a process of the worker user.
+        var registry = Path.Combine(_dir, "uid-pids");
+        var helper = HelperWithRegistryKill(registry);
+        var pidFile = Path.Combine(_dir, "wedged-pid");
+        var sudo = SandboxSupport.Executable(_dir, "wedging-sudo.sh",
+            "#!/bin/sh\n[ \"$1\" = -n ] && [ \"$2\" = -u ] || exit 99\nshift 3\n"
+            // The stop of every process of the worker user (a no-op through the helper): the real copy, whose exit sweeps.
+            + "if [ \"$2\" = /usr/bin/true ]; then exec \"$@\"; fi\n"
+            + $"echo {OwnProcess.ShellRecord("$$")} >> '{registry}'\necho {OwnProcess.ShellRecord("$$")} > '{pidFile}'\n"
+            + "echo '{\"type\":\"system\",\"session_id\":\"s\"}'\nexec /bin/sleep 600 </dev/null\n");
+        var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, "wedged-root")).FullName);
+        var sandbox = new WorkerSandbox(Environment.UserName, helper.Path, sudo) { Lock = workerLock };
+        var worker = new ClaudeWorker("claude", SandboxSupport.Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(5), sandbox,
+            stopGrace: TimeSpan.FromSeconds(2)); // waited once for the wedged helper, then again after the second helper run killed it
+        using var cts = new CancellationTokenSource();
+        var run = worker.RunAsync(_dir, "p", null, WorkerModelClass.Mid, null, cts.Token);
+        var pid = await SandboxSupport.WaitForPidAsync(pidFile, run);
+        try
+        {
+            await cts.CancelAsync();
+
+            var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+            // Stopped after all: nothing is left running in its worktree, and the lock is free for the next phase.
+            Assert.False(WorkerStillRunning.IsMarked(ex));
+            await OwnProcess.WaitUntilDeadAsync(pid);
+            Assert.Contains(pid.Pid, helper.Targets);
+            Assert.True(await workerLock.TryHoldAsync(() => Task.CompletedTask));
+        }
+        finally
+        {
+            pid.KillIfStillRunning();
+        }
+    }
+
+    [Fact]
+    public async Task A_cancelled_helper_command_is_waited_for_while_it_sweeps_before_the_lock_is_released()
+    {
+        // A helper whose stdin is closed kills its worker's processes and sweeps the worker user's, then exits: a moment's work,
+        // during which the lock must stay held. Here: it notices its stdin closing, takes a moment, and records that it finished.
+        var (started, swept) = (Path.Combine(_dir, "sweeper-started"), Path.Combine(_dir, "sweeper-swept"));
+        var sudo = SandboxSupport.Executable(_dir, "sweeping-sudo.sh",
+            $"#!/bin/sh\necho {OwnProcess.ShellRecord("$$")} > '{started}'\n/bin/cat > /dev/null\n/bin/sleep 0.5\n: > '{swept}'\n");
+        var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, "sweeper-root")).FullName);
+        var sandbox = new WorkerSandbox("_df_no_such_user", SafeHelper.Create(_dir).Path, sudo) { Lock = workerLock };
+        using var cts = new CancellationTokenSource();
+        var sweptWhenReleased = (bool?)null;
+
+        var deletion = sandbox.DeleteAsWorkerAsync(Path.Combine(_dir, "nothing-there"), cts.Token);
+        var pid = await SandboxSupport.WaitForPidAsync(started, deletion);
+        try
+        {
+            // What a waiting run sees the moment it gets the lock: the cancelled command's helper has finished.
+            var next = workerLock.HoldAsync(() => { sweptWhenReleased = File.Exists(swept); return Task.CompletedTask; }, CancellationToken.None,
+                retry: TimeSpan.FromMilliseconds(1));
+            await cts.CancelAsync();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => deletion);
+            Assert.True(File.Exists(swept), "the cancelled command returned before its helper had exited");
+            await next.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+            Assert.True(sweptWhenReleased, "the lock was released while the helper was still sweeping");
+        }
+        finally
+        {
+            pid.KillIfStillRunning();
+        }
+    }
+
+    [Fact]
+    public async Task A_cancelled_helper_command_whose_helper_will_not_exit_keeps_the_lock_until_it_does()
+    {
+        var pidFile = Path.Combine(_dir, "stuck-command-pid");
+        var stuckSudo = SandboxSupport.Executable(_dir, "stuck-command-sudo.sh",
+            $"#!/bin/sh\necho {OwnProcess.ShellRecord("$$")} > '{pidFile}'\nexec /bin/sleep 600 </dev/null\n");
+        var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, "stuck-command-root")).FullName);
+        var sandbox = new WorkerSandbox("_df_no_such_user", SafeHelper.Create(_dir).Path, stuckSudo) { Lock = workerLock, StopGrace = TimeSpan.FromMilliseconds(200) };
+        using var cts = new CancellationTokenSource();
+
+        var deletion = sandbox.DeleteAsWorkerAsync(Path.Combine(_dir, "nothing-there"), cts.Token);
+        var pid = await SandboxSupport.WaitForPidAsync(pidFile, deletion);
+        try
+        {
+            await cts.CancelAsync();
+
+            // The caller is let go after the grace (a shutdown is not held up for ever) — the lock is not.
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => deletion);
+            Assert.True(pid.IsAlive);
+            Assert.False(await workerLock.TryHoldAsync(() => Task.CompletedTask));
+            var next = workerLock.HoldAsync(() => Task.CompletedTask, CancellationToken.None, retry: TimeSpan.FromMilliseconds(5));
+
+            pid.KillIfStillRunning();
+            await next.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            pid.KillIfStillRunning();
+        }
+    }
+
+    [Fact]
+    public async Task A_deletion_that_does_not_wait_runs_no_helper_while_another_runs_worker_phase_holds_the_sandbox_user()
+    {
+        var (sandbox, workerLock, probes) = LockedSandbox();
+        var doomed = Directory.CreateDirectory(Path.Combine(_dir, "doomed-later")).FullName;
+
+        using (WorkerLock.Acquire(Path.GetDirectoryName(workerLock.Path)!)) // another process's worker session
+        {
+            Assert.False(await sandbox.TryDeleteAsWorkerAsync(doomed, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken));
+            Assert.Empty(probes()); // the helper, whose exit would kill that worker, did not run
+            Assert.True(Directory.Exists(doomed));
+        }
+
+        // Free: it deletes, under the lock.
+        Assert.True(await sandbox.TryDeleteAsWorkerAsync(doomed, CancellationToken.None));
+        Assert.Equal(["held"], probes());
+        Assert.False(Directory.Exists(doomed));
     }
 
     [Fact]
@@ -732,9 +1352,12 @@ public class WorkerSandboxTests
         var own = OwnProcess.Of(sleeper);
         SafeHelper.Register(registry, own);
 
-        var stopped = await new WorkerSandbox(Environment.UserName, helper.Path, SandboxSupport.FakeSudo(_dir)).StopAllAsync(CancellationToken.None);
+        // The kill of every process of the worker user: under the sandbox user's lock (sc-25988), taken here by the stop itself.
+        var (sandbox, _, probes) = LockedSandbox(new WorkerSandbox(Environment.UserName, helper.Path, SandboxSupport.FakeSudo(_dir)));
+        var stopped = await sandbox.StopAllAsync(CancellationToken.None);
 
         Assert.True(stopped);
+        Assert.Equal(["held"], probes());
         await OwnProcess.WaitUntilDeadAsync(own);
     }
 
@@ -756,7 +1379,145 @@ public class WorkerSandboxTests
         Assert.Contains("delete_child", listing);
     }
 
+    [Fact]
+    public void A_directory_reads_back_closed_only_with_owner_only_mode_and_no_acl_entry()
+    {
+        Assert.True(WorkerSandbox.IsClosed("drwx------  3 michael  staff  96 Oct 13 17:53 /opt/dark-factory/work/clone-locks\n"));
+        Assert.True(WorkerSandbox.IsClosed("drwx------@ 3 michael  staff  96 Oct 13 17:53 /opt/dark-factory/work/clone-locks\n"));
+        // The work root's inherited entry, as a directory made under it carries it (macOS prints "@" or "+" beside the mode).
+        const string entry = " 0: user:_factory inherited allow list,search,readattr,readextattr,readsecurity,file_inherit,directory_inherit\n";
+        Assert.False(WorkerSandbox.IsClosed("drwx------+ 3 michael  staff  96 Oct 13 17:53 /w/clone-locks\n" + entry));
+        Assert.False(WorkerSandbox.IsClosed("drwx------@ 3 michael  staff  96 Oct 13 17:53 /w/clone-locks\n" + entry));
+        Assert.False(WorkerSandbox.IsClosed("drwx------  3 michael  staff  96 Oct 13 17:53 /w/clone-locks\n 0: group:everyone deny delete\n"));
+        Assert.False(WorkerSandbox.IsClosed("drwxr-xr-x  3 michael  staff  96 Oct 13 17:53 /w/clone-locks\n"));
+        Assert.False(WorkerSandbox.IsClosed("drwx---r-x  3 michael  staff  96 Oct 13 17:53 /w/clone-locks\n"));
+        Assert.False(WorkerSandbox.IsClosed("-rwx------  1 michael  staff  96 Oct 13 17:53 /w/clone-locks\n"));
+        Assert.False(WorkerSandbox.IsClosed(""));
+    }
+
+    [Fact]
+    public async Task Close_to_worker_strips_the_inherited_acl_entry_and_leaves_an_owner_only_directory_on_macos()
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            Assert.Skip("ACLs via chmod are macOS-only.");
+        }
+        // A work root as setup-worker-user.sh leaves it: 0700 with an inheritable read entry for the worker user (here: this user).
+        var root = Directory.CreateDirectory(Path.Combine(_dir, "work")).FullName;
+        File.SetUnixFileMode(root, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        using (var chmod = Process.Start(new ProcessStartInfo("/bin/chmod",
+            ["+a", $"user:{Environment.UserName} allow list,search,read,readattr,readextattr,readsecurity,file_inherit,directory_inherit", root]))!)
+        {
+            await chmod.WaitForExitAsync(TestContext.Current.CancellationToken);
+            Assert.Equal(0, chmod.ExitCode);
+        }
+        var locks = Directory.CreateDirectory(Path.Combine(root, "clone-locks")).FullName;
+        Assert.Contains($"user:{Environment.UserName} inherited allow list,search", await Listing(locks));
+        Assert.False(WorkerSandbox.IsClosed(await Listing(locks)));
+        var sandbox = LocalSandbox(); // no helper runs: closing is the owner's own chmod and ls
+
+        await sandbox.CloseToWorkerAsync(locks, CancellationToken.None);
+
+        var closed = await Listing(locks);
+        Assert.StartsWith("drwx------", closed);
+        Assert.DoesNotContain("allow", closed);
+        Assert.True(WorkerSandbox.IsClosed(closed));
+        // Nothing made in it later inherits an entry: a lock file is the owner's alone, whatever its own mode.
+        var file = Path.Combine(Directory.CreateDirectory(Path.Combine(locks, "acme")).FullName, "widgets.lock");
+        File.WriteAllText(file, "");
+        Assert.DoesNotContain("allow", await Listing(Path.GetDirectoryName(file)!));
+        Assert.DoesNotContain("allow", await Listing(file));
+        // The work root itself keeps its entry (clones and worktrees still inherit it), and closing again changes nothing.
+        Assert.Contains($"user:{Environment.UserName} allow list,search", await Listing(root));
+        await sandbox.CloseToWorkerAsync(locks, CancellationToken.None);
+        // What cannot be closed, or does not read back closed, is an error, never a silent pass.
+        var open = await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.CloseToWorkerAsync(locks,
+            (_, _) => Task.FromResult($"drwx------+ 3 me  staff  96 Oct 13 17:53 {locks}\n 0: user:_factory inherited allow list,search\n"), CancellationToken.None));
+        Assert.Contains($"{locks} is still open to others than its owner", open.Message);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.CloseToWorkerAsync(Path.Combine(root, "missing"), CancellationToken.None));
+    }
+
+    private static async Task<string> Listing(string path)
+    {
+        using var p = Process.Start(new ProcessStartInfo("/bin/ls", ["-led", path]) { RedirectStandardOutput = true })!;
+        return await p.StandardOutput.ReadToEndAsync();
+    }
+
     private WorkerSandbox LocalSandbox() => SandboxSupport.LocalSandbox(_dir);
+
+    /// <summary><see cref="LocalSandbox()"/> with a lock of its own, whose every helper run records whether the lock was held then.</summary>
+    private (WorkerSandbox Sandbox, WorkerLock Lock, Func<string[]> Probes) LockedSandbox(WorkerSandbox? over = null)
+    {
+        var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, $"root-{Guid.NewGuid():N}")).FullName);
+        var log = Path.Combine(_dir, $"lock-probes-{Guid.NewGuid():N}");
+        var sandbox = (over ?? LocalSandbox()) with { Lock = workerLock, SudoPath = SandboxSupport.LockProbingSudo(_dir, workerLock, log) };
+        return (sandbox, workerLock, () => File.Exists(log) ? File.ReadAllLines(log) : []);
+    }
+
+    [Fact]
+    public async Task The_helper_is_never_started_unless_the_calling_flow_holds_the_sandbox_users_lock()
+    {
+        var (sandbox, workerLock, probes) = LockedSandbox();
+
+        var refused = Assert.Throws<InvalidOperationException>(() => sandbox.Start(_dir, "/usr/bin/true", [], new Dictionary<string, string>()));
+
+        Assert.Contains("Refusing a run of /usr/bin/true as _factory", refused.Message);
+        Assert.Contains("is not held", refused.Message);
+        Assert.Empty(probes()); // nothing ran: not even sudo
+        // Held, it starts; and the lock really is locked against every other process while it runs.
+        await workerLock.HoldAsync(async () =>
+        {
+            using var p = sandbox.Start(_dir, "/usr/bin/true", [], new Dictionary<string, string>());
+            await p.WaitForExitAsync();
+            WorkerSandbox.Stop(p);
+            Assert.Equal(0, p.ExitCode);
+        }, CancellationToken.None);
+        Assert.Equal(["held"], probes());
+    }
+
+    [Fact]
+    public async Task Every_run_of_the_helper_a_short_command_a_deletion_and_a_worker_session_happens_with_the_lock_held()
+    {
+        var (sandbox, workerLock, probes) = LockedSandbox();
+        var doomed = Directory.CreateDirectory(Path.Combine(_dir, "doomed")).FullName;
+        File.WriteAllText(Path.Combine(doomed, "file"), "x");
+        var claude = SandboxSupport.Executable(_dir, "fake-claude.sh",
+            "#!/bin/sh\necho '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-lock\"}'\n"
+            + "echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"sess-lock\"}'\n");
+
+        // Each takes the lock itself when its caller holds none …
+        Assert.Equal(0, (await sandbox.RunAsync("/", "/usr/bin/true", [], CancellationToken.None)).ExitCode);
+        await sandbox.DeleteAsWorkerAsync(doomed, CancellationToken.None);
+        var result = await new ClaudeWorker(claude, SandboxSupport.Router, "rk_worker", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1), sandbox)
+            .RunAsync(_dir, "prompt", null, WorkerModelClass.Mid, null, CancellationToken.None);
+        // … and runs under its caller's hold when a worker phase has it (no wait on itself).
+        await workerLock.HoldAsync(async () =>
+        {
+            Assert.Equal(0, (await sandbox.RunAsync("/", "/usr/bin/true", [], CancellationToken.None)).ExitCode);
+            await sandbox.DeleteAsWorkerAsync(Path.Combine(_dir, "nothing-there"), CancellationToken.None);
+        }, CancellationToken.None);
+
+        Assert.False(Directory.Exists(doomed));
+        Assert.True(result.Succeeded, result.StderrTail);
+        Assert.Equal(["held", "held", "held", "held", "held"], probes());
+        Assert.False(workerLock.IsHeld);
+    }
+
+    [Fact]
+    public async Task A_helper_run_waits_while_another_runs_worker_phase_holds_the_sandbox_user()
+    {
+        var (sandbox, workerLock, probes) = LockedSandbox();
+        var other = WorkerLock.Acquire(Path.GetDirectoryName(workerLock.Path)!); // another process's worker session
+
+        var deletion = sandbox.DeleteAsWorkerAsync(Path.Combine(_dir, "nothing-there"), CancellationToken.None);
+        await Task.Delay(600, TestContext.Current.CancellationToken);
+        Assert.False(deletion.IsCompleted);
+        Assert.Empty(probes()); // the helper, whose exit would kill that worker, has not run
+        other.Dispose();
+        await deletion;
+
+        Assert.Equal(["held"], probes());
+    }
 }
 
 /// <summary>
@@ -769,28 +1530,61 @@ public class LiveWorkerSandboxTests
 {
     private static readonly RepoRef Repo = new("acme", "widgets");
 
-    private static async Task<WorkerSandbox> RequireSandboxAsync()
+    /// <summary>
+    /// Every configured worker slot (<c>Worker:Slots</c>, each slot's own user and installed helper as the factory would use them,
+    /// sc-25992), each probed ready. The machine not set up at all (slot 1 not ready) skips; a further configured slot that is not
+    /// ready fails, naming it. Taken without the slots' run locks, as these probes always were: run them with no factory running.
+    /// </summary>
+    private static async Task<IReadOnlyList<WorkerSlot>> RequireSlotsAsync()
     {
-        // Before anything touches the helper: even the readiness probe ends in its uid-wide kill.
+        // Before anything touches a helper: even the readiness probe ends in its uid-wide kill.
         if (Environment.GetEnvironmentVariable("FACTORY_SANDBOX_LIVE") != "1")
         {
-            Assert.Skip("Live sandbox test: set FACTORY_SANDBOX_LIVE=1 to run (kills every _factory process).");
+            Assert.Skip("Live sandbox test: set FACTORY_SANDBOX_LIVE=1 to run (kills every process of every configured sandbox user).");
         }
         if (!OperatingSystem.IsMacOS())
         {
             Assert.Skip("The worker sandbox is macOS-only.");
         }
-        var sandbox = new WorkerSandbox(WorkerSandbox.DefaultUser, WorkerSandbox.DefaultHelperPath);
-        try
+        var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets());
+        if (options.WorkerSlots is not { } pool)
         {
-            var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets());
-            await sandbox.EnsureReadyAsync(options.WorkerAuth, options.ClaudePath, CancellationToken.None);
+            Assert.Skip("Worker:RunAs=none: there is no sandbox user to probe.");
+            throw new UnreachableException();
         }
-        catch (InvalidOperationException ex)
+        var slots = pool.All.Select(s => s with { Sandbox = s.Sandbox with { Lock = null } }).ToList();
+        foreach (var slot in slots)
         {
-            Assert.Skip(ex.Message);
+            try
+            {
+                await slot.Sandbox.EnsureReadyAsync(options.WorkerAuth, options.ClaudePath, CancellationToken.None);
+            }
+            catch (InvalidOperationException ex) when (slot.Number == 1)
+            {
+                Assert.Skip(ex.Message);
+            }
+            catch (InvalidOperationException ex)
+            {
+                Assert.Fail($"Worker {slot} (Worker:Slots is {slots.Count}) is not ready: {ex.Message}");
+            }
         }
-        return sandbox;
+        return slots;
+    }
+
+    /// <summary>Runs <paramref name="probe"/> for every configured slot (<see cref="RequireSlotsAsync"/>); a failure names its slot.</summary>
+    private static async Task ForEachSlotAsync(Func<WorkerSlot, Task> probe)
+    {
+        foreach (var slot in await RequireSlotsAsync())
+        {
+            try
+            {
+                await probe(slot);
+            }
+            catch (Exception ex) when (ex is not Xunit.Sdk.SkipException)
+            {
+                throw new Xunit.Sdk.XunitException($"Worker {slot}: {ex.Message}", ex);
+            }
+        }
     }
 
     private static readonly string OwnerHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
@@ -800,53 +1594,77 @@ public class LiveWorkerSandboxTests
     [InlineData("/bin/ls", ".ssh")]
     [InlineData("/bin/ls", ".config/gh")]
     [InlineData("/bin/cat", "Library/Keychains/login.keychain-db")]
-    public async Task Worker_is_denied_the_owners_home_ssh_keys_gh_config_and_login_keychain(string program, string relative)
-    {
-        var sandbox = await RequireSandboxAsync();
+    public async Task Worker_is_denied_the_owners_home_ssh_keys_gh_config_and_login_keychain(string program, string relative) =>
+        await ForEachSlotAsync(async slot =>
+        {
+            var (exitCode, _, stderr) = await slot.Sandbox.RunAsync("/", program, [Path.Combine(OwnerHome, relative)], CancellationToken.None);
 
-        var (exitCode, _, stderr) = await sandbox.RunAsync("/", program, [Path.Combine(OwnerHome, relative)], CancellationToken.None);
-
-        Assert.NotEqual(0, exitCode);
-        Assert.Contains("Permission denied", stderr);
-    }
+            Assert.NotEqual(0, exitCode);
+            Assert.Contains("Permission denied", stderr);
+        });
 
     /// <summary>
     /// AT6 (docs/acceptance.md): the installed helper, launched exactly as <see cref="ClaudeWorker"/> launches a sandboxed
     /// worker (<see cref="WorkerSandbox.Start"/> with <see cref="ClaudeWorker.BuildRouterVariables"/> for the configured
     /// router URL and <c>Worker:Auth</c>), gives the worker exactly the allowlisted environment, and nothing of the owner's.
-    /// The router key is a probe value: the real key never needs to appear in test output.
+    /// The router key is a probe value: the real key never needs to appear in test output. Every configured slot is probed, and
+    /// each slot's TMPDIR and HOME must be its own user's: a directory that user owns, the owner's and every other slot's apart
+    /// (sc-25992: in a shared temporary directory one sandbox user's NuGet locks refused another's restore).
     /// </summary>
     [Fact]
     public async Task Live_worker_environment_is_exactly_the_allowlist_for_the_configured_auth_mode()
     {
-        var sandbox = await RequireSandboxAsync();
         var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets());
         var auth = options.WorkerAuth;
         string[] expected = auth == WorkerAuth.RouterKey
-            ? ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH"]
-            : ["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH"];
+            ? ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR"]
+            : ["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR"];
         const string probeKey = "rk_live_env_probe";
+        var tempDirs = new List<string>();
+        var homes = new List<string>();
         Environment.SetEnvironmentVariable("GH_TOKEN", "ghp_owner_should_not_leak");
         try
         {
-            using var p = sandbox.Start("/", "/usr/bin/env", [], ClaudeWorker.BuildRouterVariables(options.RouterBaseUrl, probeKey, auth, WorkerModelClass.Mid));
-            var output = await p.StandardOutput.ReadToEndAsync();
-            await p.WaitForExitAsync();
-            WorkerSandbox.Stop(p);
-
-            Assert.Equal(0, p.ExitCode);
-            var env = SandboxSupport.ParseEnv(output);
-            Assert.Equal(expected, env.Keys.Order());
-            Assert.Equal(options.RouterBaseUrl.ToString().TrimEnd('/'), env["ANTHROPIC_BASE_URL"].TrimEnd('/'));
-            Assert.Equal($"{ClaudeWorker.RouterKeyHeader}: {probeKey}\n{WorkerModelClass.Header}: {WorkerModelClass.Mid}", env["ANTHROPIC_CUSTOM_HEADERS"]);
-            if (auth == WorkerAuth.RouterKey)
+            await ForEachSlotAsync(async slot =>
             {
-                Assert.Equal(probeKey, env["ANTHROPIC_AUTH_TOKEN"]);
-            }
-            Assert.DoesNotContain(OwnerHome, env["HOME"]);
-            Assert.StartsWith(env["HOME"] + "/.local/bin:", env["PATH"]);
-            Assert.DoesNotContain(OwnerHome, env["PATH"]);
-            Assert.Equal(("1", "0"), (env["MSBUILDDISABLENODEREUSE"], env["DOTNET_CLI_USE_MSBUILD_SERVER"]));
+                var sandbox = slot.Sandbox;
+                using var p = sandbox.Start("/", "/usr/bin/env", [], ClaudeWorker.BuildRouterVariables(options.RouterBaseUrl, probeKey, auth, WorkerModelClass.Mid));
+                var output = await p.StandardOutput.ReadToEndAsync();
+                await p.WaitForExitAsync();
+                WorkerSandbox.Stop(p);
+
+                Assert.Equal(0, p.ExitCode);
+                var env = SandboxSupport.ParseEnv(output);
+                Assert.Equal(expected, env.Keys.Order());
+                Assert.Equal(options.RouterBaseUrl.ToString().TrimEnd('/'), env["ANTHROPIC_BASE_URL"].TrimEnd('/'));
+                Assert.Equal($"{ClaudeWorker.RouterKeyHeader}: {probeKey}\n{WorkerModelClass.Header}: {WorkerModelClass.Mid}", env["ANTHROPIC_CUSTOM_HEADERS"]);
+                if (auth == WorkerAuth.RouterKey)
+                {
+                    Assert.Equal(probeKey, env["ANTHROPIC_AUTH_TOKEN"]);
+                }
+                Assert.DoesNotContain(OwnerHome, env["HOME"]);
+                Assert.StartsWith(env["HOME"] + "/.local/bin:", env["PATH"]);
+                Assert.DoesNotContain(OwnerHome, env["PATH"]);
+                Assert.Equal(("1", "0"), (env["MSBUILDDISABLENODEREUSE"], env["DOTNET_CLI_USE_MSBUILD_SERVER"]));
+                // The sandbox user's own temporary directory: macOS's per-user one, never the shared /tmp nor the owner's.
+                Assert.StartsWith("/var/folders/", env["TMPDIR"]);
+                Assert.NotEqual(SandboxSupport.UserTempDir(), env["TMPDIR"]);
+
+                // ... and that user's: the directory's owner is the uid the worker runs as.
+                var (code, owned, stderr) = await sandbox.RunAsync("/", "/bin/sh",
+                    ["-c", "printf '%s\\n' \"$TMPDIR\"; /usr/bin/stat -f %u \"$TMPDIR\"; /usr/bin/id -u; /usr/bin/id -un"], CancellationToken.None);
+                Assert.True(code == 0, stderr);
+                var lines = owned.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                Assert.Equal(4, lines.Length);
+                Assert.Equal(env["TMPDIR"], lines[0]);
+                Assert.Equal(lines[2], lines[1]);
+                Assert.Equal(slot.User, lines[3]);
+                tempDirs.Add(env["TMPDIR"]);
+                homes.Add(env["HOME"]);
+            });
+            // No two slots share a temporary directory or a home.
+            Assert.Equal(tempDirs.Count, tempDirs.Distinct().Count());
+            Assert.Equal(homes.Count, homes.Distinct().Count());
         }
         finally
         {
@@ -855,17 +1673,16 @@ public class LiveWorkerSandboxTests
     }
 
     [Fact]
-    public async Task Worker_cannot_read_the_owners_keychain_items()
-    {
-        var sandbox = await RequireSandboxAsync();
+    public async Task Worker_cannot_read_the_owners_keychain_items() =>
+        await ForEachSlotAsync(async slot =>
+        {
+            var (exitCode, stdout, _) = await slot.Sandbox.RunAsync("/", "/usr/bin/security",
+                ["find-generic-password", "-s", SecretAccounts.Service, "-w", Path.Combine(OwnerHome, "Library/Keychains/login.keychain-db")],
+                CancellationToken.None);
 
-        var (exitCode, stdout, _) = await sandbox.RunAsync("/", "/usr/bin/security",
-            ["find-generic-password", "-s", SecretAccounts.Service, "-w", Path.Combine(OwnerHome, "Library/Keychains/login.keychain-db")],
-            CancellationToken.None);
-
-        Assert.NotEqual(0, exitCode);
-        Assert.Empty(stdout.Trim());
-    }
+            Assert.NotEqual(0, exitCode);
+            Assert.Empty(stdout.Trim());
+        });
 
     /// <summary>
     /// AT6, <c>Worker:Auth=router-key</c> (E5): the worker user holds no Claude credential of its own — neither Claude
@@ -875,35 +1692,38 @@ public class LiveWorkerSandboxTests
     [Fact]
     public async Task Worker_user_holds_no_claude_credential_in_router_key_mode()
     {
-        var sandbox = await RequireSandboxAsync();
         if (new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets()).WorkerAuth != WorkerAuth.RouterKey)
         {
             Assert.Skip("Worker:Auth=claude-login: the worker user is expected to hold its own Claude login.");
         }
+        await ForEachSlotAsync(async slot =>
+        {
+            var (exitCode, stdout, stderr) = await slot.Sandbox.RunAsync("/", "/bin/sh",
+                ["-c", """
+                    found=
+                    if test -e "$HOME/.claude/.credentials.json"; then found="$found $HOME/.claude/.credentials.json"; fi
+                    kc="$HOME/Library/Keychains/login.keychain-db"
+                    if test -e "$kc" && /usr/bin/security find-generic-password -s 'Claude Code-credentials' "$kc" >/dev/null 2>&1; then
+                        found="$found keychain:Claude Code-credentials"
+                    fi
+                    echo "found:$found"
+                    """],
+                CancellationToken.None);
 
-        var (exitCode, stdout, stderr) = await sandbox.RunAsync("/", "/bin/sh",
-            ["-c", """
-                found=
-                if test -e "$HOME/.claude/.credentials.json"; then found="$found $HOME/.claude/.credentials.json"; fi
-                kc="$HOME/Library/Keychains/login.keychain-db"
-                if test -e "$kc" && /usr/bin/security find-generic-password -s 'Claude Code-credentials' "$kc" >/dev/null 2>&1; then
-                    found="$found keychain:Claude Code-credentials"
-                fi
-                echo "found:$found"
-                """],
-            CancellationToken.None);
-
-        Assert.True(exitCode == 0, stderr);
-        Assert.Equal("found:", stdout.Trim());
+            Assert.True(exitCode == 0, stderr);
+            Assert.Equal("found:", stdout.Trim());
+        });
     }
 
     [Theory]
     [InlineData("success")]
     [InlineData("failure")]
     [InlineData("stop")]
-    public async Task Worktree_written_by_the_worker_is_gone_after_the_run_ends(string ending)
+    public async Task Worktree_written_by_the_worker_is_gone_after_the_run_ends(string ending) =>
+        await ForEachSlotAsync(slot => WorktreeIsGoneAsync(slot.Sandbox, ending));
+
+    private static async Task WorktreeIsGoneAsync(WorkerSandbox sandbox, string ending)
     {
-        var sandbox = await RequireSandboxAsync();
         var ct = CancellationToken.None;
         var workRoot = Path.Combine(FactoryOptions.DefaultSandboxWorkRoot, $"test-{Guid.NewGuid():N}");
         var remote = Path.Combine(workRoot, "remote.git");
@@ -950,9 +1770,11 @@ public class LiveWorkerSandboxTests
     }
 
     [Fact]
-    public async Task A_setsid_grandchild_of_the_worker_is_dead_once_the_helper_exits()
+    public async Task A_setsid_grandchild_of_the_worker_is_dead_once_the_helper_exits() =>
+        await ForEachSlotAsync(slot => SetsidGrandchildIsDeadAsync(slot.Sandbox));
+
+    private static async Task SetsidGrandchildIsDeadAsync(WorkerSandbox sandbox)
     {
-        var sandbox = await RequireSandboxAsync();
         var ct = CancellationToken.None;
 
         using var p = sandbox.Start("/", "/usr/bin/perl",

@@ -8,7 +8,6 @@ using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Issues;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Mcp;
-using DarkFactory.Orchestrator.Shortcut;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.Worker;
 
@@ -316,9 +315,18 @@ public class McpProxyTests
         Assert.False(File.Exists(path));
         Assert.Equal(HttpStatusCode.Unauthorized, (await Rpc(proxy, McpServers.CodeGraph, credential, "tools/list")).Status);
 
+        // A session opened by an item's run is named for the item, so another run's sweep knows whose run lock guards it (sc-25987).
+        await using (var owned = await new McpProxySessions(proxy, directory, owner: WorkSources.ItemNaming.ParseAny("gh-5"))
+            .OpenAsync(Repo, McpProfile.Triage, CancellationToken.None))
+        {
+            Assert.Equal("gh-5", WorkSources.ItemNaming.OwnerOfSessionFile(Path.GetFileName(owned.ConfigPath))?.ToString());
+            Assert.Matches(@"^gh-5\.[0-9a-f]{32}\.json$", Path.GetFileName(owned.ConfigPath));
+        }
+        Assert.Null(WorkSources.ItemNaming.OwnerOfSessionFile(Path.GetFileName(path)));
+
         // A crashed process's leftover files are swept (their credentials died with that process's proxy).
         File.WriteAllText(Path.Combine(directory, "left.json"), "{}");
-        McpProxySessions.Sweep(directory);
+        await McpProxySessions.SweepAsync(directory, Ledger.LiveRuns.None, CancellationToken.None);
         Assert.Empty(Directory.EnumerateFiles(directory));
     }
 
@@ -580,16 +588,162 @@ public class McpProxyTests
         {
             seen.Add(p);
             return Task.FromResult(p.EndsWith(".json", StringComparison.Ordinal) ? "-rw-------  1 me staff 9 Oct 10 12:00 x\n" : granted);
-        });
+        }) { AclRetry = TimeSpan.Zero };
         var ex = await Assert.ThrowsAsync<WorkSources.FactoryUnavailableException>(() => missing.OpenAsync(Repo, McpProfile.Triage, CancellationToken.None));
         Assert.Contains("setup-worker-user.sh", ex.Message);
         Assert.Empty(Directory.EnumerateFiles(directory));
-        Assert.Equal(2, seen.Count);
+        // The directory once; the file read again (one retry rule with every sandbox ACL check, sc-25992) before it fails.
+        Assert.Equal(1 + Worker.WorkerSandbox.AclReads, seen.Count);
         // Without a worker user (Worker:RunAs=none) nothing is checked.
         await using (await new McpProxySessions(proxy, directory, null, (_, _) => throw new InvalidOperationException("not asked"))
             .OpenAsync(Repo, McpProfile.Triage, CancellationToken.None))
         {
         }
+    }
+
+    // ---- sc-25990: a slot's own session directory, read by its user and the owner alone ----
+
+    private const string SlotDirectory = "drwx------+ 2 me staff 64 Oct 13 12:00 x\n 0: user:_factory2 allow search\n"
+        + " 1: user:_factory2 allow read,readattr,readextattr,readsecurity,file_inherit,only_inherit\n";
+    private const string SlotFile = "-rw-------+ 1 me staff 9 Oct 13 12:00 x\n 0: user:_factory2 inherited allow read,readattr,readextattr,readsecurity\n";
+
+    private static bool IsFile(string path) => path.EndsWith(".json", StringComparison.Ordinal);
+
+    [Fact]
+    public async Task A_slots_session_directory_is_restricted_before_the_file_is_written_and_the_session_starts_when_only_its_user_reads_both()
+    {
+        await using var proxy = await McpProxy.StartAsync(Upstreams(CodeGraphServer()), CancellationToken.None);
+        var directory = McpProxySessions.DirectoryOf(Directory.CreateTempSubdirectory("df-mcp-slot-").FullName, 2);
+        Assert.EndsWith("mcp-sessions-2", directory);
+        var steps = new List<string>();
+        var sessions = new McpProxySessions(proxy, directory, "_factory2",
+            (p, _) => { steps.Add(IsFile(p) ? "ls file" : "ls directory"); return Task.FromResult(IsFile(p) ? SlotFile : SlotDirectory); },
+            owner: WorkSources.ItemNaming.ParseAny("sc-7"),
+            restrict: (p, _) =>
+            {
+                steps.Add($"restrict {Path.GetFileName(p)} holding {Directory.EnumerateFiles(p).Count()} files");
+                return Task.CompletedTask;
+            });
+
+        await using (var session = await sessions.OpenAsync(Repo, McpProfile.Triage, CancellationToken.None))
+        {
+            Assert.StartsWith(directory + Path.DirectorySeparatorChar, session.ConfigPath);
+            Assert.True(File.Exists(session.ConfigPath));
+        }
+        // Restricted first, while nothing of this session is in it; then both read back.
+        Assert.Equal(["restrict mcp-sessions-2 holding 0 files", "ls directory", "ls file"], steps);
+        Assert.Empty(Directory.EnumerateFiles(directory));
+    }
+
+    [Theory]
+    // The work root's inherited entry for slot 1's user is still on the file: slot 1's worker could read slot 2's credential.
+    [InlineData("file", " 1: user:_factory inherited allow read,readattr\n", "its ACL also allows user:_factory")]
+    [InlineData("directory", " 2: user:_factory inherited allow list,search,read\n", "its ACL also allows user:_factory")]
+    [InlineData("file", " 1: group:staff allow read\n", "its ACL also allows group:staff")]
+    [InlineData("file", " 1: ABCDEF01-2345-6789-ABCD-EF0123456789 allow read\n", "its ACL also allows ABCDEF01-2345-6789-ABCD-EF0123456789")]
+    [InlineData("directory", " 2: not an entry\n", "an ACL line could not be read")]
+    public async Task A_session_whose_file_or_directory_another_slots_user_could_read_is_not_started(string which, string extra, string why)
+    {
+        await using var proxy = await McpProxy.StartAsync(Upstreams(CodeGraphServer()), CancellationToken.None);
+        var directory = McpProxySessions.DirectoryOf(Directory.CreateTempSubdirectory("df-mcp-slot-").FullName, 2);
+        var reads = 0;
+        var sessions = new McpProxySessions(proxy, directory, "_factory2", (p, _) =>
+        {
+            reads++;
+            return Task.FromResult((IsFile(p) ? SlotFile : SlotDirectory) + (IsFile(p) == (which == "file") ? extra : ""));
+        }, restrict: (_, _) => Task.CompletedTask)
+        { AclRetry = TimeSpan.Zero };
+
+        var ex = await Assert.ThrowsAsync<WorkSources.FactoryUnavailableException>(() => sessions.OpenAsync(Repo, McpProfile.Triage, CancellationToken.None));
+
+        Assert.StartsWith("the MCP session config: ", ex.Message);
+        Assert.Contains("must be readable by _factory2 (its worker slot's user) and the owner alone", ex.Message);
+        Assert.Contains(why, ex.Message);
+        Assert.Contains("another slot's worker could read this session's MCP credential", ex.Message);
+        Assert.Empty(Directory.EnumerateFiles(directory)); // its file is gone, and with it the credential (revoked)
+        // Read again before it failed the session (ls names a user by its UUID while the directory service is slow to answer).
+        Assert.Equal(WorkerSandbox.AclReads + (which == "file" ? 1 : 0), reads);
+    }
+
+    [Theory]
+    [InlineData("drwx--x---+ 2 me staff 64 Oct 13 12:00 x", "-rw-------+ 1 me staff 9 Oct 13 12:00 x")]
+    [InlineData("drwx------+ 2 me staff 64 Oct 13 12:00 x", "-rw-r--r--+ 1 me staff 9 Oct 13 12:00 x")]
+    public async Task A_session_whose_file_or_directory_mode_opens_it_to_others_is_not_started(string directoryLine, string fileLine)
+    {
+        await using var proxy = await McpProxy.StartAsync(Upstreams(CodeGraphServer()), CancellationToken.None);
+        var directory = McpProxySessions.DirectoryOf(Directory.CreateTempSubdirectory("df-mcp-slot-").FullName, 2);
+        string Acl(string p) => IsFile(p) ? fileLine + SlotFile[SlotFile.IndexOf('\n')..] : directoryLine + SlotDirectory[SlotDirectory.IndexOf('\n')..];
+        var sessions = new McpProxySessions(proxy, directory, "_factory2", (p, _) => Task.FromResult(Acl(p)), restrict: (_, _) => Task.CompletedTask)
+        { AclRetry = TimeSpan.Zero };
+
+        var ex = await Assert.ThrowsAsync<WorkSources.FactoryUnavailableException>(() => sessions.OpenAsync(Repo, McpProfile.Triage, CancellationToken.None));
+
+        Assert.Contains("gives its group or everyone access", ex.Message);
+        Assert.Empty(Directory.EnumerateFiles(directory));
+    }
+
+    [Fact]
+    public async Task A_session_directory_that_cannot_be_restricted_is_a_factory_wide_failure_before_anything_is_granted_or_written()
+    {
+        await using var proxy = await McpProxy.StartAsync(Upstreams(CodeGraphServer()), CancellationToken.None);
+        var directory = McpProxySessions.DirectoryOf(Directory.CreateTempSubdirectory("df-mcp-slot-").FullName, 3);
+        var sessions = new McpProxySessions(proxy, directory, "_factory3", (_, _) => throw new InvalidOperationException("not asked"),
+            restrict: (p, _) => throw new InvalidOperationException($"{p} is still open to others than its owner and _factory3"));
+
+        var ex = await Assert.ThrowsAsync<WorkSources.FactoryUnavailableException>(() => sessions.OpenAsync(Repo, McpProfile.Planner, CancellationToken.None));
+
+        Assert.StartsWith($"the MCP session config: {directory} could not be made _factory3's alone to read: ", ex.Message);
+        Assert.Empty(Directory.EnumerateFiles(directory));
+    }
+
+    [Fact]
+    public async Task With_one_slot_the_session_directory_is_as_before_slots_and_other_users_entries_are_not_judged()
+    {
+        // E9: no restriction, and the work root's inherited entries (a root once set up for more slots has several) do not fail it.
+        await using var proxy = await McpProxy.StartAsync(Upstreams(CodeGraphServer()), CancellationToken.None);
+        var root = Directory.CreateTempSubdirectory("df-mcp-slot-").FullName;
+        var directory = McpProxySessions.DirectoryOf(root, 1);
+        Assert.Equal(Path.Combine(root, McpProxySessions.DirectoryName), directory);
+        const string inherited = " 0: user:_factory inherited allow list,search,read,readattr\n 1: user:_factory2 inherited allow list,search,read,readattr\n";
+        var reads = 0;
+        var sessions = new McpProxySessions(proxy, directory, "_factory", (p, _) =>
+        {
+            reads++;
+            return Task.FromResult((IsFile(p) ? "-rw-------+ 1 me staff 9 Oct 10 12:00 x\n" : "drwx------+ 2 me staff 64 Oct 10 12:00 x\n") + inherited);
+        });
+
+        await using (var session = await sessions.OpenAsync(Repo, McpProfile.Triage, CancellationToken.None))
+        {
+            Assert.True(File.Exists(session.ConfigPath));
+        }
+        Assert.Equal(2, reads);
+    }
+
+    [Fact]
+    public async Task A_session_is_opened_in_a_restricted_directory_and_read_back_from_the_real_listing_on_macos()
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            Assert.Skip("ACLs via chmod +a are macOS-only.");
+        }
+        // The role accounts daemon and nobody stand in for slot 1's and slot 2's users (an ACL entry must name an existing user;
+        // nothing runs as them): the production wiring of a slot above 1 — its user, its restriction, the real `ls -led`.
+        await using var proxy = await McpProxy.StartAsync(Upstreams(CodeGraphServer()), CancellationToken.None);
+        var directory = McpProxySessions.DirectoryOf(Directory.CreateTempSubdirectory("df-mcp-slot-").FullName, 2);
+        var slot2 = new WorkerSandbox("nobody", TestSlots.NoHelper + "-2");
+
+        await using (var session = await new McpProxySessions(proxy, directory, slot2.User, restrict: slot2.RestrictToWorkerAsync)
+            .OpenAsync(Repo, McpProfile.Triage, CancellationToken.None))
+        {
+            Assert.True(File.Exists(session.ConfigPath));
+            Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(directory));
+        }
+        // Checked for slot 1's user, the same directory has no entry: a session of slot 1 would not start on it.
+        var refused = await Assert.ThrowsAsync<WorkSources.FactoryUnavailableException>(() =>
+            new McpProxySessions(proxy, directory, "daemon", restrict: slot2.RestrictToWorkerAsync) { AclRetry = TimeSpan.Zero }
+                .OpenAsync(Repo, McpProfile.Triage, CancellationToken.None));
+        Assert.Contains("grants daemon no ACL 'search' entry", refused.Message);
+        Assert.Empty(Directory.EnumerateFiles(directory));
     }
 
     [Theory]
@@ -601,7 +755,26 @@ public class McpProxyTests
     [InlineData(" 0: user:_factory deny read\n 1: user:_factory allow read", "read", false)]
     [InlineData("-rw-------  1 me staff 9 Oct 10 12:00 user:_factory allow read", "read", false)]
     public void An_acl_listing_grants_a_right_only_through_an_allow_entry_for_that_user_and_no_deny(string listing, string right, bool grants) =>
-        Assert.Equal(grants, McpProxySessions.AclGrants(listing, "_factory", right));
+        Assert.Equal(grants, Worker.WorkerSandbox.Grants(listing, "_factory", right));
+
+    /// <summary>
+    /// sc-25992: one ACL reader (<c>/bin/ls -led</c>) and one way to close a directory to the sandbox users (<c>chmod -N</c>), both
+    /// in the sandbox class (WorkerSandbox.cs): the MCP session directories, the clone locks and the slot locks use them, not copies.
+    /// </summary>
+    [Fact]
+    public void The_acl_reader_and_the_directory_close_exist_once_in_the_orchestrator()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null && !File.Exists(Path.Combine(dir.FullName, "DarkFactory.slnx")))
+        {
+            dir = dir.Parent;
+        }
+        var sources = Directory.EnumerateFiles(Path.Combine(dir!.FullName, "src", "DarkFactory.Orchestrator"), "*.cs", SearchOption.AllDirectories)
+            .Where(f => !f.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}")).ToList();
+        IEnumerable<string> Using(string text) => sources.Where(f => File.ReadAllText(f).Contains(text, StringComparison.Ordinal)).Select(Path.GetFileName)!;
+        Assert.Equal(["WorkerSandbox.cs"], Using("\"/bin/ls\""));
+        Assert.Equal(["WorkerSandbox.cs"], Using("[\"-N\""));
+    }
 
     [Fact]
     public async Task A_failing_mcp_config_sweep_or_proxy_start_is_factory_wide()
@@ -613,7 +786,7 @@ public class McpProxyTests
         try
         {
             var swept = await Assert.ThrowsAsync<WorkSources.FactoryUnavailableException>(() =>
-                SandboxTriageRunner.StartMcpProxyAsync(upstreams, configs, CancellationToken.None));
+                SandboxTriageRunner.StartMcpProxyAsync(upstreams, configs, Ledger.LiveRuns.None, CancellationToken.None));
             Assert.StartsWith("the MCP proxy: ", swept.Message);
         }
         finally
@@ -621,11 +794,11 @@ public class McpProxyTests
             File.SetUnixFileMode(configs, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
         var started = await Assert.ThrowsAsync<WorkSources.FactoryUnavailableException>(() =>
-            SandboxTriageRunner.StartMcpProxyAsync(upstreams, configs, CancellationToken.None,
+            SandboxTriageRunner.StartMcpProxyAsync(upstreams, configs, Ledger.LiveRuns.None, CancellationToken.None,
                 (_, _) => throw new IOException("address in use")));
         Assert.Contains("address in use", started.Message);
         // Without CodeGraph no proxy is started.
-        Assert.Null(await SandboxTriageRunner.StartMcpProxyAsync(McpUpstreams.None, configs, CancellationToken.None,
+        Assert.Null(await SandboxTriageRunner.StartMcpProxyAsync(McpUpstreams.None, configs, Ledger.LiveRuns.None, CancellationToken.None,
             (_, _) => throw new InvalidOperationException("not started")));
     }
 

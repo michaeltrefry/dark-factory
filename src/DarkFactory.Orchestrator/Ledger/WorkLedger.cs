@@ -105,6 +105,14 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
     /// <summary>The item's current state as stored, or null when there is no such item. Reads only.</summary>
     public async Task<WorkState?> StateOfAsync(string source, string externalId, CancellationToken ct) =>
         (await db.WorkItems.AsNoTracking().SingleOrDefaultAsync(x => x.Source == source && x.ExternalId == externalId, ct))?.State;
+
+    /// <summary>The id of an item's row (the key of its run lock, <see cref="IRunLocks"/>), or null when there is no such item. Reads only.</summary>
+    public async Task<long?> IdOfAsync(WorkSources.ItemRef item, CancellationToken ct)
+    {
+        var (source, externalId) = (item.Naming.Source, item.ToString());
+        return (await db.WorkItems.AsNoTracking().SingleOrDefaultAsync(x => x.Source == source && x.ExternalId == externalId, ct))?.Id;
+    }
+
     /// <summary>The item, or null if the ledger has never seen it. Nothing is written.</summary>
     public Task<WorkItem?> FindAsync(string source, string externalId, CancellationToken ct) =>
         db.WorkItems.SingleOrDefaultAsync(x => x.Source == source && x.ExternalId == externalId, ct);
@@ -175,7 +183,7 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
     /// <c>Recorded</c>: every changeset the plan item recorded, for any repository, pushed or not — empty only for a plan recorded
     /// before there were changesets, whose stories target the default branch.
     /// </summary>
-    public async Task<(Plans.Changeset? Changeset, IReadOnlyList<Plans.Changeset> Recorded)> ChangesetOfAsync(long planItemId, Shortcut.RepoRef repo,
+    public async Task<(Plans.Changeset? Changeset, IReadOnlyList<Plans.Changeset> Recorded)> ChangesetOfAsync(long planItemId, RepoRef repo,
         CancellationToken ct)
     {
         var rows = await db.LedgerEntries.AsNoTracking()
@@ -219,6 +227,24 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
         var ids = items.Select(i => i.Id).ToList();
         var rows = await db.LedgerEntries.AsNoTracking().Where(e => ids.Contains(e.WorkItemId)).OrderBy(e => e.Id).ToListAsync(ct);
         return items.ToDictionary(i => i.ExternalId, i => (i, rows.Where(r => r.WorkItemId == i.Id).ToList()), StringComparer.Ordinal);
+    }
+
+    /// <summary>
+    /// The slot numbers 1 to <paramref name="slots"/> ordered by how many unfinished items (not Done, Cancelled or in Watch) the
+    /// ledger has in each (<see cref="RunPipeline.SlotOf"/>'s last <see cref="RunPipeline.Steps.Slot"/> row), fewest first, ties by
+    /// number: where an item with no slot yet is tried first (sc-25989), so slots fill evenly. Reads only.
+    /// </summary>
+    public async Task<IReadOnlyList<int>> SlotsByLoadAsync(int slots, CancellationToken ct)
+    {
+        var rows = await (from e in db.LedgerEntries.AsNoTracking()
+                          join i in db.WorkItems.AsNoTracking() on e.WorkItemId equals i.Id
+                          where e.Step == RunPipeline.Steps.Slot && i.State != WorkState.Done && i.State != WorkState.Cancelled && i.State != WorkState.Watch
+                          orderby e.Id
+                          select new { e.WorkItemId, e.Detail }).ToListAsync(ct);
+        var load = rows.GroupBy(r => r.WorkItemId)
+            .Select(g => int.TryParse(g.Last().Detail?.Split(' ')[0], out var slot) ? slot : 0)
+            .GroupBy(slot => slot).ToDictionary(g => g.Key, g => g.Count());
+        return [.. Enumerable.Range(1, slots).OrderBy(slot => load.GetValueOrDefault(slot)).ThenBy(slot => slot)];
     }
 
     /// <summary>Every row of the item, oldest first.</summary>
