@@ -99,14 +99,18 @@ fi
 unset HOME
 home=~
 path="$home/.local/bin:/usr/local/share/dotnet:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-# The running user's own temporary directory (macOS's per-user /var/folders/…/T/, made 0700 for
-# that user if it is missing); with none the worker would fall back to the shared /tmp.
+# The running user's own temporary directory (macOS's per-user /var/folders/…/T/); where the system
+# has none (Linux CI), a 0700 one in the user's home. Without TMPDIR the worker would fall back to
+# the shared /tmp.
 tmpdir=$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)
 case "$tmpdir" in
     /*) ;;
     *)
-        echo "factory-worker-launch: no per-user temporary directory (getconf DARWIN_USER_TEMP_DIR)" >&2
-        exit 70
+        tmpdir="$home/.tmp"
+        if ! mkdir -p -m 700 "$tmpdir"; then
+            echo "factory-worker-launch: no per-user temporary directory ($tmpdir)" >&2
+            exit 70
+        fi
         ;;
 esac
 

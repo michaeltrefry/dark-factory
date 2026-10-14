@@ -123,14 +123,17 @@ internal static class SandboxSupport
         return home;
     }
 
-    /// <summary>The current user's own temporary directory (what the helper must give the worker as TMPDIR, sc-25992).</summary>
+    /// <summary>
+    /// The current user's own temporary directory (what the helper must give the worker as TMPDIR, sc-25992): macOS's
+    /// per-user one, else (Linux CI) <c>~/.tmp</c>.
+    /// </summary>
     public static string UserTempDir()
     {
-        var psi = new ProcessStartInfo("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"]) { RedirectStandardOutput = true };
+        var psi = new ProcessStartInfo("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"]) { RedirectStandardOutput = true, RedirectStandardError = true };
         using var p = Process.Start(psi)!;
         var dir = p.StandardOutput.ReadToEnd().Trim();
         p.WaitForExit();
-        return dir;
+        return p.ExitCode == 0 && dir.StartsWith('/') ? dir : PasswdHome() + "/.tmp";
     }
 
     /// <summary>
