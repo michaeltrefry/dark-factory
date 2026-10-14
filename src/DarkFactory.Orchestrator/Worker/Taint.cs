@@ -123,10 +123,12 @@ public static class Taint
     /// content its stream-json would not show: a settings file (<see cref="RepoSettingsFiles"/>) defining hooks, project MCP servers or
     /// a command helper (<see cref="CommandSettings"/>), or a <c>permissions.allow</c> rule beyond <see cref="ClaudeWorker.AllowedTools"/>
     /// (e.g. <c>Bash(curl:*)</c>); or a <see cref="McpFile"/> naming any server. A file that cannot be read or parsed taints too (E2:
-    /// unknown settings are not trusted). Null when none of that is there.
+    /// unknown settings are not trusted). Null when none of that is there. <paramref name="allowed"/> is the session's own allow rules
+    /// (null: <see cref="ClaudeWorker.AllowedTools"/>; a factory with <c>Worker:Swift</c> on passes <see cref="ClaudeWorker.SwiftAllowedTools"/>).
     /// </summary>
-    public static string? OfRepoSettings(string worktree)
+    public static string? OfRepoSettings(string worktree, IReadOnlyList<string>? allowed = null)
     {
+        allowed ??= ClaudeWorker.AllowedTools;
         // A .claude that is a symlink (or not a directory) is never read through: it taints.
         var claude = new FileInfo(Path.Combine(worktree, ".claude"));
         try
@@ -150,7 +152,7 @@ public static class Taint
             {
                 if (settings.Document?.RootElement is not { ValueKind: JsonValueKind.Object } root
                     || CommandSettings.Any(key => root.TryGetProperty(key, out _))
-                    || (root.TryGetProperty("permissions", out var permissions) && !OnlyAllowsWorkerTools(permissions)))
+                    || (root.TryGetProperty("permissions", out var permissions) && !OnlyAllowsWorkerTools(permissions, allowed)))
                 {
                     return RepoSettings;
                 }
@@ -171,7 +173,7 @@ public static class Taint
         return null;
     }
 
-    private static bool OnlyAllowsWorkerTools(JsonElement permissions)
+    private static bool OnlyAllowsWorkerTools(JsonElement permissions, IReadOnlyList<string> allowed)
     {
         if (permissions.ValueKind != JsonValueKind.Object)
         {
@@ -182,7 +184,7 @@ public static class Taint
             return true;
         }
         return allow.ValueKind == JsonValueKind.Array && allow.EnumerateArray().All(rule =>
-            rule.ValueKind == JsonValueKind.String && ClaudeWorker.AllowedTools.Contains(rule.GetString(), StringComparer.Ordinal));
+            rule.ValueKind == JsonValueKind.String && allowed.Contains(rule.GetString(), StringComparer.Ordinal));
     }
 
     /// <summary>

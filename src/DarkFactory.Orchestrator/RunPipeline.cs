@@ -88,7 +88,8 @@ public sealed partial class RunPipeline(
     Plans.IPlanRunner? planner = null,
     IReadOnlyList<RepoRef>? configuredRepos = null,
     Worker.WorkerSlots? slots = null,
-    Func<CancellationToken, Task>? enterSandbox = null)
+    Func<CancellationToken, Task>? enterSandbox = null,
+    bool swift = false)
 {
     /// <summary>
     /// The worker slots (sc-25989, E6/E7; null unsandboxed: workers then run as the owner and share no user): one sandbox user
@@ -1441,7 +1442,7 @@ public sealed partial class RunPipeline(
         {
             try
             {
-                session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? BuildPrompt(spec, repo) + stuckHint : BuildResumePrompt(story),
+                session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? BuildPrompt(spec, repo, swift) + stuckHint : BuildResumePrompt(story),
                     models, [SpecInput(story)], "implement", WorkerModelClass.Coding(story), ct);
             }
             catch (WorkerStuckException stuckSession) when (!WorkerStillRunning.IsMarked(stuckSession))
@@ -1572,7 +1573,7 @@ public sealed partial class RunPipeline(
         var item = run.Item;
         var resume = session;
         // The target repo's own Claude settings may feed the session content its stream would not show (hooks, MCP, extra allow rules).
-        var taints = implementing ? inputTaints.Append(Taint.OfRepoSettings(path)).OfType<string>().ToList() : inputTaints;
+        var taints = implementing ? inputTaints.Append(Taint.OfRepoSettings(path, ClaudeWorker.AllowedToolsFor(swift))).OfType<string>().ToList() : inputTaints;
         // Every worker this runs exists to push its work: a tainted session would only be refused its push token after spending
         // the model's time, so it is not resumed at all (E4). Its stored stream is replayed first: a run stopped between storing
         // a web tool's line and committing its taint left the use only there.
@@ -1741,7 +1742,7 @@ public sealed partial class RunPipeline(
                 $"Worker failed (exit {result.ExitCode}, result {result.ResultSubtype ?? "none"}): {result.ResultText} {result.StderrTail}".Trim());
         }
         // The worker can write the repo's settings itself (a hook it added may have run in-session): checked again before it is done.
-        if (implementing && session is not null && Taint.OfRepoSettings(path) is { } changed)
+        if (implementing && session is not null && Taint.OfRepoSettings(path, ClaudeWorker.AllowedToolsFor(swift)) is { } changed)
         {
             await ledger.TaintSessionAsync(item, session, changed, ct);
         }
@@ -2539,7 +2540,20 @@ public sealed partial class RunPipeline(
     internal const string BuildsAndPasses =
         "the build and the tests pass (`dotnet build` and `dotnet test`; in a Rust package `cargo build` and `cargo test`; in a Swift package `swift build` and `swift test`)";
 
-    public static string BuildPrompt(WorkSpec spec, RepoRef repo)
+    /// <summary>
+    /// <see cref="BuildsAndPasses"/> with the factory's xcodebuild wrapper named too, for a factory with <c>Worker:Swift</c> on (sc-26130),
+    /// whose implementers are allowed it (<see cref="ClaudeWorker.AllowedToolsFor"/>); without it the text is exactly
+    /// <see cref="BuildsAndPasses"/> (E7: a .NET/Rust-only factory's prompts are unchanged).
+    /// </summary>
+    internal const string BuildsAndPassesWithXcode =
+        "the build and the tests pass (`dotnet build` and `dotnet test`; in a Rust package `cargo build` and `cargo test`; in a Swift package `swift build` and `swift test`; in an Xcode "
+        + "project `" + SwiftToolchain.DefaultWrapperPath + " build|test -scheme <scheme> -destination 'platform=macOS'` for a macOS "
+        + "app, or `-destination 'platform=iOS Simulator,name=<device>'` for an iOS app, the only xcodebuild command allowed)";
+
+    /// <summary><see cref="BuildsAndPassesWithXcode"/> when <paramref name="swift"/> (<c>Worker:Swift</c>), else <see cref="BuildsAndPasses"/>.</summary>
+    internal static string BuildsAndPassesFor(bool swift) => swift ? BuildsAndPassesWithXcode : BuildsAndPasses;
+
+    public static string BuildPrompt(WorkSpec spec, RepoRef repo, bool swift = false)
     {
         var story = spec.Story;
         var prompt = $"""
@@ -2547,7 +2561,7 @@ public sealed partial class RunPipeline(
             Implement {story.Kind.Noun} {story.Ref} ({story.StoryType}): {PromptFence.Spec(story)}
 
             Make the smallest change that satisfies the story, including a test when the
-            project has tests, and make sure {BuildsAndPasses}.
+            project has tests, and make sure {BuildsAndPassesFor(swift)}.
             Do not commit, push, or open pull requests; the orchestrator does that.
             """;
         if (spec.Epic is { } epic)

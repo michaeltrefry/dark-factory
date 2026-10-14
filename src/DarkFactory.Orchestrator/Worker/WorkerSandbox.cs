@@ -91,6 +91,14 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     /// </summary>
     public string Reinstall { get; init; } = ReinstallCommand;
 
+    /// <summary>
+    /// The Swift/Xcode toolchain this sandbox user must have (sc-26130), or null when the factory works no Swift repository
+    /// (<c>Worker:Swift</c> off, the default: nothing of Swift or Xcode is checked, E7). Set, <see cref="EnsureHelperCurrentAsync"/>
+    /// also checks the installed xcodebuild wrapper and <see cref="EnsureReadyAsync"/> probes Swift, xcodebuild, Xcode's first
+    /// launch and license, and the wrapper as <see cref="User"/> (<see cref="SwiftToolchain.EnsureUsableAsync"/>).
+    /// </summary>
+    public SwiftToolchain? Swift { get; init; }
+
     /// <summary>The hint a missing or unusable sandbox is reported with.</summary>
     private string Hint => $"run `{Reinstall}` once (see README, Worker sandbox)";
 
@@ -410,6 +418,10 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
                 $"Stale helper: the installed launch helper {HelperPath} is not the current scripts/factory-worker-launch ({stale}); "
                 + $"re-run `{Reinstall}` to install it (that kills every process of every worker user: stop `factory work` first).");
         }
+        if (Swift is { } swift)
+        {
+            await swift.EnsureWrapperCurrentAsync(Reinstall, ct);
+        }
     }
 
     /// <summary>What <see cref="EnsureReadyAsync"/> concludes from the probe's result, then the worker user's Claude Code version.</summary>
@@ -445,6 +457,10 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
                 $"Upgrade {User}'s claude: {outdated}, and an older CLI may silently ignore the triage session's read confinement "
                 + $"(`--setting-sources \"\"`, `blockReadsOutsideWorkingDirectories`, `dontAsk`); run `sudo -u {User} -H ~{User}/.local/bin/claude update` "
                 + $"(or delete ~{User}/.local/bin/claude and re-run `{Reinstall}` to reinstall it).");
+        }
+        if (Swift is { } swift)
+        {
+            await swift.EnsureUsableAsync(User, Reinstall, (program, args) => RunAsync("/", program, args, ct));
         }
     }
 

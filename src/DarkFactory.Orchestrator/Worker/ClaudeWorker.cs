@@ -186,6 +186,13 @@ public sealed record WorkerTools
     public static readonly WorkerTools Implementer = new("acceptEdits", ClaudeWorker.AllowedTools, ClaudeWorker.DeniedTools, "project,local",
         confinedToWorkingDirectory: false);
 
+    /// <summary><see cref="Implementer"/> with the xcodebuild wrapper allowed (<see cref="ClaudeWorker.SwiftAllowedTools"/>): a factory with <c>Worker:Swift</c> on (sc-26130).</summary>
+    public static readonly WorkerTools SwiftImplementer = new("acceptEdits", ClaudeWorker.SwiftAllowedTools, ClaudeWorker.DeniedTools, "project,local",
+        confinedToWorkingDirectory: false);
+
+    /// <summary>The implementing worker's tools: <see cref="SwiftImplementer"/> when <paramref name="swift"/>, else <see cref="Implementer"/>.</summary>
+    public static WorkerTools ImplementerFor(bool swift) => swift ? SwiftImplementer : Implementer;
+
     /// <summary>
     /// The tools a read-only session uses: it reads and searches its own checkout, nothing else. None is allowed by name (a bare
     /// <c>Read</c> rule would pre-approve a read of any path): Claude Code runs them without approval inside the working directory
@@ -360,17 +367,46 @@ public sealed class ClaudeWorker(
     public static readonly string[] SwiftTools = ["Bash(swift build:*)", "Bash(swift test:*)"];
 
     /// <summary>
-    /// Tools an implementing worker may use: file tools and the build-and-test commands of the stacks the gate reads (.NET, and
-    /// cargo: <see cref="CargoTools"/>, Swift: <see cref="SwiftTools"/>); no git/gh so it cannot push or merge on its own.
+    /// The only xcodebuild command an implementing worker is allowed (sc-26130, E2/E3), and only in a factory with <c>Worker:Swift</c>
+    /// on (<see cref="AllowedToolsFor"/>): the factory's wrapper at its installed, root-owned absolute path
+    /// (<see cref="SwiftToolchain.DefaultWrapperPath"/>, <c>scripts/factory-xcodebuild</c>), as a prefix rule. The wrapper takes only
+    /// <c>build</c>, <c>build-for-testing</c>, <c>test</c>, <c>test-without-building</c> (and the <c>-list</c> query) for a scheme and a
+    /// macOS or simulator destination, refuses archive/export, every signing or account flag and every build-setting override, forces
+    /// ad hoc signing and the user's own DerivedData (per worktree) and SwiftPM checkouts. An absolute path, not the plain name: the
+    /// worker's PATH starts with its own writable <c>~/.local/bin</c>, where a plain <c>factory-xcodebuild</c> could be a script of the
+    /// worker's. Not a containment boundary: build code (Run Script phases, package plugins and macros) runs as the sandbox user and can
+    /// run <c>/usr/bin/xcodebuild</c> itself (CLAUDE.md, the residuals of the Swift toolchain).
+    /// </summary>
+    public static readonly string[] XcodebuildTools = [$"Bash({SwiftToolchain.DefaultWrapperPath}:*)"];
+
+    /// <summary>
+    /// Raw xcodebuild (and xcrun, which runs it and every other developer tool), denied by name (<see cref="DeniedTools"/>): a target
+    /// repository's settings that allow one still cannot, and taint the session (<see cref="Taint.OfRepoSettings"/>).
+    /// </summary>
+    public static readonly string[] RawXcodebuildTools =
+        ["Bash(xcodebuild:*)", "Bash(/usr/bin/xcodebuild:*)", "Bash(xcrun:*)", "Bash(/usr/bin/xcrun:*)"];
+
+    /// <summary>
+    /// Tools an implementing worker may use: file tools and the build-and-test commands of the stacks the gate reads (.NET, cargo:
+    /// <see cref="CargoTools"/>, Swift: <see cref="SwiftTools"/>); no git/gh so it cannot push or merge on its own. A factory with
+    /// <c>Worker:Swift</c> on adds <see cref="XcodebuildTools"/> (<see cref="AllowedToolsFor"/>). (Declared after the lists it spreads:
+    /// static fields initialise in order.)
     /// </summary>
     public static readonly string[] AllowedTools =
         ["Read", "Edit", "Write", "Glob", "Grep", "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(dotnet restore:*)", .. CargoTools, .. SwiftTools];
 
+    /// <summary><see cref="AllowedTools"/> plus the wrapper rule (<see cref="XcodebuildTools"/>), for a factory with <c>Worker:Swift</c> on (sc-26130).</summary>
+    public static readonly string[] SwiftAllowedTools = [.. AllowedTools, .. XcodebuildTools];
+
+    /// <summary>The implementer's allow rules: <see cref="SwiftAllowedTools"/> when <paramref name="swift"/> (<c>Worker:Swift</c>), else exactly <see cref="AllowedTools"/> (E7).</summary>
+    public static IReadOnlyList<string> AllowedToolsFor(bool swift) => swift ? SwiftAllowedTools : AllowedTools;
+
     /// <summary>
     /// Tools a worker is denied (<c>--disallowedTools</c>, which beats any allow rule, the target repo's own settings included): the
-    /// web tools (<see cref="Taint.WebTools"/>). Defence in depth: a use that still shows in the stream taints the session (E4).
+    /// web tools (<see cref="Taint.WebTools"/>) and raw xcodebuild/xcrun (<see cref="RawXcodebuildTools"/>). Defence in depth: a web
+    /// use that still shows in the stream taints the session (E4).
     /// </summary>
-    public static readonly string[] DeniedTools = Taint.WebTools;
+    public static readonly string[] DeniedTools = [.. Taint.WebTools, .. RawXcodebuildTools];
 
     private static readonly string[] PassThroughVariables =
         ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "TERM", "DOTNET_ROOT"];

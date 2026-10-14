@@ -369,8 +369,9 @@ public static class FactoryRunner
             ledger,
             runLocks,
             workspaces,
+            // The xcodebuild wrapper is allowed only in a factory with Worker:Swift on (sc-26130, E7).
             new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, slots,
-                pauseFlagDirectory: options.PauseFlagDirectory),
+                pauseFlagDirectory: options.PauseFlagDirectory, tools: WorkerTools.ImplementerFor(options.WorkerSwift)),
             new GitHubPullRequests(githubHttp, app),
             options.DefaultRepo,
             log,
@@ -394,7 +395,9 @@ public static class FactoryRunner
             configuredRepos: options.ConfiguredRepos.Select(RepoRef.Parse).ToList(),
             // The worker slots, one held per worker phase (sc-25988, sc-25989); unsandboxed there is none.
             slots: slots,
-            enterSandbox: EnterSandboxAsync);
+            enterSandbox: EnterSandboxAsync,
+            // Its prompts name the xcodebuild wrapper, and its repo-settings taint allows that rule, only with Worker:Swift on (sc-26130).
+            swift: options.WorkerSwift);
 
         return await pipeline.RunAsync(storyId, ct);
     }
