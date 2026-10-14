@@ -60,6 +60,13 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
     /// <summary>Calls per request before an error is thrown (the first try plus retries).</summary>
     public const int MaxAttempts = 4;
 
+    /// <summary>
+    /// Times one story write is decided and sent when Shortcut refuses it 409 Conflict (another writer touched the story at the same
+    /// moment, nothing written): each attempt re-reads the story and decides again by the operation's own rules, so a body computed
+    /// from a read taken before the other write is never sent (sc-25992).
+    /// </summary>
+    public const int MaxConflictAttempts = 3;
+
     /// <summary>The longest a Retry-After is honoured; a longer one waits this long.</summary>
     public static readonly TimeSpan MaxRetryDelay = TimeSpan.FromSeconds(120);
 
@@ -120,20 +127,27 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
     public async Task<ClaimResult> ClaimAsync(int id, bool ignoreScope, CancellationToken ct)
     {
         var me = await MeAsync(ct);
-        var story = await GetStoryAsync(id, ct);
-        if (await ClaimRefusalAsync(story, me, ignoreScope, ct) is { } refusal)
+        var decided = await OnFreshStoryAsync<ClaimResult?>(id, async story =>
         {
-            return ClaimResult.Refused(refusal);
-        }
-        if (ClaimedBy(story, me))
-        {
-            return ClaimResult.Ok;
-        }
-        await UpdateAsync(id, new
-        {
-            owner_ids = story.OwnerIds.Append(me).Distinct(),
-            labels = LabelParams(story.LabelNames.Append(ClaimLabel)),
+            if (await ClaimRefusalAsync(story, me, ignoreScope, ct) is { } refusal)
+            {
+                return ClaimResult.Refused(refusal);
+            }
+            if (ClaimedBy(story, me))
+            {
+                return ClaimResult.Ok;
+            }
+            await UpdateAsync(id, new
+            {
+                owner_ids = story.OwnerIds.Append(me).Distinct(),
+                labels = LabelParams(story.LabelNames.Append(ClaimLabel)),
+            }, ct);
+            return null;
         }, ct);
+        if (decided is not null)
+        {
+            return decided;
+        }
         var after = await GetStoryAsync(id, ct);
         return ClaimedBy(after, me)
             ? ClaimResult.Ok
@@ -164,15 +178,17 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
     public async Task ReleaseAsync(int id, CancellationToken ct)
     {
         var me = await MeAsync(ct);
-        var story = await GetStoryAsync(id, ct);
-        if (!story.OwnerIds.Contains(me) && !story.LabelNames.Contains(ClaimLabel))
+        await OnFreshStoryAsync(id, async story =>
         {
-            return;
-        }
-        await UpdateAsync(id, new
-        {
-            owner_ids = story.OwnerIds.Where(o => o != me),
-            labels = LabelParams(story.LabelNames.Where(l => l != ClaimLabel)),
+            if (story.OwnerIds.Contains(me) || story.LabelNames.Contains(ClaimLabel))
+            {
+                await UpdateAsync(id, new
+                {
+                    owner_ids = story.OwnerIds.Where(o => o != me),
+                    labels = LabelParams(story.LabelNames.Where(l => l != ClaimLabel)),
+                }, ct);
+            }
+            return true;
         }, ct);
     }
 
@@ -202,22 +218,25 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
         {
             throw new ArgumentException("Stopping an item needs a comment saying why.", nameof(comment));
         }
-        var story = await GetStoryAsync(id, ct);
-        var target = await StateIdAsync(story.WorkflowId, BoardStateName(state), ct);
-        if (state == BoardState.Stopped)
+        await OnFreshStoryAsync(id, async story =>
         {
-            var me = await MeAsync(ct);
-            await UpdateAsync(id, new
+            var target = await StateIdAsync(story.WorkflowId, BoardStateName(state), ct);
+            if (state == BoardState.Stopped)
             {
-                workflow_state_id = target,
-                owner_ids = story.OwnerIds.Where(o => o != me),
-                labels = LabelParams(story.LabelNames.Where(l => l != ClaimLabel)),
-            }, ct);
-        }
-        else if (story.WorkflowStateId != target)
-        {
-            await UpdateAsync(id, new { workflow_state_id = target }, ct);
-        }
+                var me = await MeAsync(ct);
+                await UpdateAsync(id, new
+                {
+                    workflow_state_id = target,
+                    owner_ids = story.OwnerIds.Where(o => o != me),
+                    labels = LabelParams(story.LabelNames.Where(l => l != ClaimLabel)),
+                }, ct);
+            }
+            else if (story.WorkflowStateId != target)
+            {
+                await UpdateAsync(id, new { workflow_state_id = target }, ct);
+            }
+            return true;
+        }, ct);
         if (comment is not null)
         {
             await CommentAsync(id, comment, ct);
@@ -229,12 +248,15 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
 
     public async Task LinkAsync(int id, IReadOnlyList<string> urls, CancellationToken ct)
     {
-        var story = await GetStoryAsync(id, ct);
-        var links = story.ExternalLinks.Concat(urls).Distinct().ToList();
-        if (links.Count != story.ExternalLinks.Count)
+        await OnFreshStoryAsync(id, async story =>
         {
-            await UpdateAsync(id, new { external_links = links }, ct);
-        }
+            var links = story.ExternalLinks.Concat(urls).Distinct().ToList();
+            if (links.Count != story.ExternalLinks.Count)
+            {
+                await UpdateAsync(id, new { external_links = links }, ct);
+            }
+            return true;
+        }, ct);
     }
 
     public bool PlansItems => true;
@@ -354,20 +376,20 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
     public const string DoneStateType = "done";
 
     /// <summary>Backlog → <see cref="ReadyState"/>, only for a story still in its workflow's Backlog (state ids by name, from the API).</summary>
-    public async Task<ReadyResult> MakeReadyAsync(int id, CancellationToken ct)
-    {
-        var story = await GetStoryAsync(id, ct);
-        if (story.Archived)
+    public Task<ReadyResult> MakeReadyAsync(int id, CancellationToken ct) =>
+        OnFreshStoryAsync(id, async story =>
         {
-            return ReadyResult.Archived;
-        }
-        if (story.WorkflowStateId != await StateIdAsync(story.WorkflowId, BoardStateName(BoardState.Stopped), ct))
-        {
-            return ReadyResult.AlreadyLeft;
-        }
-        await UpdateAsync(id, new { workflow_state_id = await StateIdAsync(story.WorkflowId, ReadyState, ct) }, ct);
-        return ReadyResult.Moved;
-    }
+            if (story.Archived)
+            {
+                return ReadyResult.Archived;
+            }
+            if (story.WorkflowStateId != await StateIdAsync(story.WorkflowId, BoardStateName(BoardState.Stopped), ct))
+            {
+                return ReadyResult.AlreadyLeft;
+            }
+            await UpdateAsync(id, new { workflow_state_id = await StateIdAsync(story.WorkflowId, ReadyState, ct) }, ct);
+            return ReadyResult.Moved;
+        }, ct);
 
     public async Task<bool> InBacklogAsync(int id, CancellationToken ct)
     {
@@ -382,20 +404,26 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
     public async Task<bool> ReturnUnstartedAsync(int id, string comment, CancellationToken ct)
     {
         var me = await MeAsync(ct);
-        var story = await GetStoryAsync(id, ct);
-        if (story.Archived || !(await ReadyStateIdsAsync(ct)).Contains(story.WorkflowStateId)
-            || story.OwnerIds.Any(o => o != me) || HeldByAnother(story, me))
+        var returned = await OnFreshStoryAsync(id, async story =>
         {
-            return false;
-        }
-        await UpdateAsync(id, new
-        {
-            workflow_state_id = await StateIdAsync(story.WorkflowId, BoardStateName(BoardState.Stopped), ct),
-            owner_ids = story.OwnerIds.Where(o => o != me),
-            labels = LabelParams(story.LabelNames.Where(l => l != ClaimLabel)),
+            if (story.Archived || !(await ReadyStateIdsAsync(ct)).Contains(story.WorkflowStateId)
+                || story.OwnerIds.Any(o => o != me) || HeldByAnother(story, me))
+            {
+                return false;
+            }
+            await UpdateAsync(id, new
+            {
+                workflow_state_id = await StateIdAsync(story.WorkflowId, BoardStateName(BoardState.Stopped), ct),
+                owner_ids = story.OwnerIds.Where(o => o != me),
+                labels = LabelParams(story.LabelNames.Where(l => l != ClaimLabel)),
+            }, ct);
+            return true;
         }, ct);
-        await CommentAsync(id, comment, ct);
-        return true;
+        if (returned)
+        {
+            await CommentAsync(id, comment, ct);
+        }
+        return returned;
     }
 
     /// <summary>Whether a stored description is the one that was sent (line endings and outer whitespace aside).</summary>
@@ -454,6 +482,27 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
     private Task<Story> GetStoryAsync(int id, CancellationToken ct) => SendAsync<Story>(HttpMethod.Get, $"stories/{id}", null, ct);
 
     private Task UpdateAsync(int id, object body, CancellationToken ct) => SendAsync<IdOnly>(HttpMethod.Put, $"stories/{id}", body, ct);
+
+    /// <summary>
+    /// Reads the story and runs <paramref name="decide"/> on it — the operation's own rules, then at most its write. A write
+    /// Shortcut refuses 409 Conflict (<see cref="StoryConflictException"/>: another writer touched the story at that moment, nothing
+    /// written) starts again from a fresh read, so the decision follows what the other writer did and nothing of theirs is
+    /// overwritten by a body computed before it; at most <see cref="MaxConflictAttempts"/> times, then the conflict is thrown.
+    /// </summary>
+    private async Task<T> OnFreshStoryAsync<T>(int id, Func<Story, Task<T>> decide, CancellationToken ct)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await decide(await GetStoryAsync(id, ct));
+            }
+            catch (StoryConflictException) when (attempt < MaxConflictAttempts)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1 << (attempt - 1)), _time, ct);
+            }
+        }
+    }
 
     private static IEnumerable<object> LabelParams(IEnumerable<string> names) => names.Distinct().Select(n => new { name = n });
 
@@ -514,14 +563,18 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
                 continue;
             }
             var detail = await response.Content.ReadAsStringAsync(ct);
-            throw new InvalidOperationException(
-                $"Shortcut {method} {path} failed: {(int)response.StatusCode} {response.ReasonPhrase} {detail[..Math.Min(detail.Length, 300)]}".TrimEnd());
+            var message = $"Shortcut {method} {path} failed: {(int)response.StatusCode} {response.ReasonPhrase} {detail[..Math.Min(detail.Length, 300)]}".TrimEnd();
+            throw response.StatusCode == HttpStatusCode.Conflict && method == HttpMethod.Put
+                ? new StoryConflictException(message)
+                : new InvalidOperationException(message);
         }
     }
 
     /// <summary>
     /// How long to wait before retrying, or null to fail now. A 429 was not processed, so any call is
-    /// retried; a 502/503/504 may have been, so only calls that are safe to repeat (GET, PUT) are.
+    /// retried; a 502/503/504 may have been, so only calls that are safe to repeat (GET, PUT) are. A 409 is never resent here:
+    /// a PUT's body was computed from an earlier read, so its operation reads the story again and decides afresh
+    /// (<see cref="OnFreshStoryAsync"/>).
     /// </summary>
     private TimeSpan? RetryDelay(HttpMethod method, HttpResponseMessage response, int attempt)
     {
@@ -538,6 +591,13 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
         var delay = retryAfter ?? TimeSpan.FromSeconds(1 << (attempt - 1));
         return delay < TimeSpan.Zero ? TimeSpan.Zero : delay > MaxRetryDelay ? MaxRetryDelay : delay;
     }
+
+    /// <summary>
+    /// A story write Shortcut refused 409 Conflict: another writer touched the story at the same moment and nothing was written
+    /// (seen live, sc-25992: Shortcut's own GitHub integration recording a pushed branch on the story in the same second as the
+    /// factory's link write). An <see cref="InvalidOperationException"/>, as every other refusal, once the conflict retries are spent.
+    /// </summary>
+    private sealed class StoryConflictException(string message) : InvalidOperationException(message);
 
     private sealed record IdOnly([property: JsonPropertyName("id")] long Id);
 

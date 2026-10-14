@@ -924,6 +924,29 @@ public class KanbanContractTests
     }
 
     /// <summary>
+    /// sc-25992, the first hosted recording: the factory's service identity is called <c>factory</c>, and scrubbing it out of a
+    /// refusal's message by plain replace also rewrote the claim markers in it (<c>dark-factory:&lt;id&gt;</c> became
+    /// <c>dark-fixture-recorder:&lt;id&gt;</c>). A name is scrubbed — and found by the guard — only where it stands on its own.
+    /// </summary>
+    [Fact]
+    public void A_name_is_scrubbed_and_guarded_where_it_stands_alone_never_inside_a_marker_or_a_longer_word()
+    {
+        var met = new KanbanIdentities();
+        met.Learn("factory");
+        Assert.Equal(
+            "Work item x is already claimed by 'fixture-recorder' with marker 'dark-factory-fixture:another-run'; ask fixture-recorder.",
+            met.Clean("Work item x is already claimed by 'factory' with marker 'dark-factory-fixture:another-run'; ask factory."));
+        Assert.Equal("no claim held with marker 'dark-factory:x' by factory_bot or factory2",
+            met.Clean("no claim held with marker 'dark-factory:x' by factory_bot or factory2"));
+
+        static (string, string) File(string name, Action<KanbanFixture> change) => (name, Mutated(change, name));
+        static void Says(KanbanFixture f, string message) => f.Interactions.First(i => i.IsError && i.Answer is JsonObject).Answer!["message"] = message;
+        Assert.Empty(KanbanFixtureGuard.SetProblems([File("claims.json", f => Says(f, "No claim held by this caller with marker 'dark-factory:x'."))], met));
+        Assert.Contains(KanbanFixtureGuard.SetProblems([File("claims.json", f => Says(f, "Work item x is claimed by 'factory'."))], met),
+            p => p.Contains("answer's message names an identity ('factory')"));
+    }
+
+    /// <summary>
     /// A refusal's message is for people and may name whoever holds the item: the guard fails one that holds a name the set
     /// knows — a <c>claimant</c> or <c>author</c> other than the recorder's anywhere in the set, or one the recording run met.
     /// </summary>

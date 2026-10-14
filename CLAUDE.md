@@ -31,7 +31,10 @@ Claude Code headless workers through the Weave router.
   satisfied" rule (sc-25871), and the classification of a plan's stories with what a failed one holds (sc-25876); `Changeset.cs` — a plan's changeset branch and the changeset review's spec (sc-25872); pipeline handler `RunPipeline.Plan.cs`; the production seat `SandboxPlanRunner` in `FactoryRunner.cs`;
   sc-25870),
   and the outbound gateway (`Gateway/`: `OutboundHttp` builds every GitHub, Shortcut, router, CodeGraph and Kanban `HttpClient` (and the
-  acceptance tests' dashboard client and their loopback-only client of the MCP proxy, `LoopbackMcp`); `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token
+  acceptance tests' dashboard client and their loopback-only client of the MCP proxy, `LoopbackMcp`); the GitHub client's reads
+  (GET/HEAD) answered 502/503/504, failed in the network or with no headers within 30 s are sent again, at most 3 attempts with a
+  1 s then 2 s backoff, the last attempt's answer the caller's as before — writes are never resent (`GitHubReadRetry`, sc-25992: a
+  single 503 on a pull request read escalated an item live); `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token
   credentials; `GitRemoteReads` the github.com remote URL, every clone/fetch's arguments (sc-25391) and the repository a github.com
   remote URL names (`RepoOf`, sc-25981); `KanbanWrites` builds the one MCP client that holds the orchestrator's full-scope Kanban
   token (sc-25981); `GitHubCli` is the only `gh` run),
@@ -81,7 +84,7 @@ Claude Code headless workers through the Weave router.
   Tests run `scripts/factory-worker-launch` only through `SafeHelper` (a checked copy whose every signal goes through a
   seam that signals only the test's own processes, and whose uid-sweep listing names only the helper's tree and the test's
   registered pids; `SafeHelper.Source` is private); `SafeHelperTests` fails if a test
-  reaches the real helper another way (a repo path, the installed path, `Worker:LaunchHelper`/`options.WorkerSandbox`).
+  reaches the real helper another way (a repo path, the installed path, `Worker:LaunchHelper`/`options.WorkerSandbox`/`options.WorkerSlots`, sc-25992).
   A test signals a process only through `OwnProcess` (pid + start time, recorded where the pid cannot have been reused;
   `KillIfStillRunning` signals only while the start time still matches); `OwnProcessTests` fails on any other kill in
   `tests/` (`Process.Kill`, a kill(2) import, a `kill`/`pkill`/`killall` in a script).
@@ -158,13 +161,14 @@ Claude Code headless workers through the Weave router.
   conditional move); a `busy` cannot be provoked on demand (the board answers it only after a write waited 10 s for other
   writers), so that one interaction is authored from the contract's Error shape by the recording handler, not forwarded, and
   marked (`note`, `KanbanRecordingHandler.SyntheticBusyNote`) — the resend after it is the board's own answer.
-  PROVISIONAL (until the epic's terminal story): the committed fixtures say
-  `"recorded_from": "in-repo fake (provisional; re-record against the hosted instance)"` — made by that same recorder against
-  `FakeKanbanBoard` (`KANBAN_RECORD=fake`), which `KanbanFixtureRecording` also proves end to end in every `dotnet test`.
-  Re-record against the hosted board with `KANBAN_RECORD=1` and a full-scope token in `KANBAN_RECORD_TOKEN` (the environment
+  HOSTED (sc-25992, 2026-10-14): the committed fixtures say `"recorded_from": "hosted KanbanBoard"`; before, they were
+  provisional recordings against `FakeKanbanBoard` (`KANBAN_RECORD=fake`, which `KanbanFixtureRecording` still proves end to
+  end in every `dotnet test`). A refusal's message is scrubbed of an identity's name only where the name stands on its own
+  (`KanbanIdentities.Mention`: the factory's identity is called `factory`, and a plain replace rewrote `dark-factory:<id>`
+  markers). Re-record against the hosted board with `KANBAN_RECORD=1` and a full-scope token in `KANBAN_RECORD_TOKEN` (the environment
   only: never the keychain, never a file; `KANBAN_RECORD_URL` for another instance: absolute https, or http on a loopback
   host, else refused — `KanbanFixtureRecording.Endpoint`) — docs/acceptance.md, "Kanban contract
-  fixtures". `KANBAN_FIXTURES_REQUIRE_HOSTED=1` makes a fixture that is still provisional fail `dotnet test`.
+  fixtures". `KANBAN_FIXTURES_REQUIRE_HOSTED=1` (set in CI) makes a provisional fixture fail `dotnet test`.
 - `tests/DarkFactory.AcceptanceTests` — live epic acceptance harness; skips unless `FACTORY_E2E=1`. AT1–AT8 runbook:
   `docs/acceptance.md` (the `factory work` tests use a throwaway ledger DB and their own work root, `E2e.cs`). Phase 2's epic
   AT2/AT4/AT5/AT6 (sc-25391): `ReviewGateTests` (typed outcome per row, merge queue, PR body and closeout equal to the ledger's),
@@ -322,7 +326,11 @@ Worker sandbox (E5): workers run as a hidden sandbox user — `_factory`, or wit
 helper, as that user only). Everything in this paragraph holds per sandbox user.
 The owner's home is ACL-denied to it, so `~/.ssh`, `~/.config/gh` and the login keychain are
 unreachable. Router variables go to the helper on stdin; the helper builds the worker env from scratch
-(PATH, HOME from the password database, MSBuild node reuse/build server off, router vars), refuses any
+(PATH, HOME from the password database, TMPDIR the user's own `getconf DARWIN_USER_TEMP_DIR` (else a 0700 `~/.tmp`; either only if
+it is a real directory, not a symlink, owned by the running user — an unusable getconf answer falls back to `~/.tmp`, an unusable
+`~/.tmp` makes the helper refuse to run, exit 70) — never the shared `/tmp`,
+where one sandbox user's NuGet locks refuse another's restore, helper_version 5, sc-25992 — MSBuild node reuse/build server off,
+router vars), refuses any
 other variable or a program that isn't an absolute path/plain name, and when the worker exits or its stdin
 closes kills the tree, the process group and then every other process of its own user (a sweep of `ps -U "$self_uid"`, the
 helper's own uid and no other, that spares the helper's own pid and its descendants — never `kill -1`, which on macOS kills the
@@ -353,7 +361,7 @@ worker phase with sudo's "a password is required". The readiness check has
 two parts (sc-25988), because a run of a helper kills every process of its user and so belongs under that slot's lock.
 What start-up checks, running nothing and taking no lock (`WorkerSlots.EnsureHelpersCurrentAsync` →
 `WorkerSandbox.EnsureHelperCurrentAsync` per slot): EVERY slot's installed helper is
-read and must have `helper_version` ≥ `WorkerSandbox.HelperVersion` (4), name its own slot's user as `sandbox_user`, pin a uid,
+read and must have `helper_version` ≥ `WorkerSandbox.HelperVersion` (5), name its own slot's user as `sandbox_user`, pin a uid,
 and, with those two lines undone, have the SHA-256 of the
 repo's helper (compiled into the orchestrator as a resource) — else `Stale helper: … re-run \`sudo scripts/setup-worker-user.sh\``
 (or `cannot read the launch helper …`), led with several slots by the slot that failed (`Worker slot 2 (_factory2): Stale
@@ -381,8 +389,9 @@ them, sc-25875). Every normal (re)run kills every process of every sandbox user 
 `--remove-worker-login` (opt-in) is a standalone mode: it runs none of the setup (no helper, no toolchain check, no
 installs) and only deletes each sandbox user's own Claude login (`~/.claude/.credentials.json`, keychain item
 `Claude Code-credentials`; with `--slots n`, of each of the n users), as that user, signalling nothing. The live probe tests
-(`LiveWorkerSandboxTests`) run only with `FACTORY_SANDBOX_LIVE=1`, since they kill every `_factory` process (including an
-interactive `_factory` login).
+(`LiveWorkerSandboxTests`) run only with `FACTORY_SANDBOX_LIVE=1`, since they kill every process of every configured sandbox
+user (including an interactive `_factory` login); they probe every configured slot (`Worker:Slots`, e.g. `Worker__Slots=2`),
+each slot's `TMPDIR` checked to be its own user's (sc-25992).
 
 Secrets in the keychain: `security add-generic-password -w` at its interactive prompt truncates at 128 chars
 (Shortcut tokens are longer → 401). Copy the secret, then

@@ -1,27 +1,27 @@
 {
-  "recorded_from": "in-repo fake (provisional; re-record against the hosted instance)",
+  "recorded_from": "hosted KanbanBoard",
   "parameters": {
-    "project": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-    "projectKey": "DFFIX843A9540",
-    "parent": "75079503-5efd-4e18-b37a-b610448a4d33",
+    "project": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+    "projectKey": "DFFIX16A87D2D",
+    "parent": "b10af0ce-def6-4135-870a-4764314fcdbb",
     "children": [
-      "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
-      "7d05699e-e47c-47b2-84b8-e5b9e984cc8d"
+      "b986bffb-f228-452e-b19a-67034c5bf0b7",
+      "c4633fc6-9721-430a-a27d-1cf203860290"
     ]
   },
   "interactions": [
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "75079503-5efd-4e18-b37a-b610448a4d33"
+        "itemId": "b10af0ce-def6-4135-870a-4764314fcdbb"
       },
       "isError": false,
       "answer": {
-        "id": "75079503-5efd-4e18-b37a-b610448a4d33",
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "id": "b10af0ce-def6-4135-870a-4764314fcdbb",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
         "epic": {
-          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] plan item",
@@ -29,12 +29,12 @@
         "type": "Story",
         "status": "Ready",
         "priority": "Medium",
-        "order": 11,
+        "order": 7,
         "estimate": null,
         "labels": "plan",
         "comments": [],
-        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "createdAtUtc": "2026-10-14T11:43:03.861375+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:03.861377+00:00",
         "claimant": null,
         "claimant_id": null,
         "claim_marker": null,
@@ -51,20 +51,20 @@
     {
       "tool": "create_work_item",
       "arguments": {
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
         "title": "[dark-factory fixture] child 1",
         "type": "Task",
-        "idempotency_key": "dark-factory:child:75079503-5efd-4e18-b37a-b610448a4d33:6784c89c3d21cb6b3bde0818521abd95d3aa3f4e6b351da4c41cf4b1f08165bf",
+        "idempotency_key": "dark-factory:child:b10af0ce-def6-4135-870a-4764314fcdbb:6784c89c3d21cb6b3bde0818521abd95d3aa3f4e6b351da4c41cf4b1f08165bf",
         "description": "First step of the plan.",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417"
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535"
       },
       "isError": false,
       "answer": {
-        "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
         "epic": {
-          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 1",
@@ -72,11 +72,11 @@
         "type": "Task",
         "status": "Backlog",
         "priority": "Medium",
-        "order": 12,
+        "order": 1,
         "estimate": null,
         "comments": [],
-        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "createdAtUtc": "2026-10-14T11:43:04.35415+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:04.354152+00:00",
         "claimant": null,
         "claimant_id": null,
         "claim_marker": null,
@@ -92,20 +92,20 @@
     {
       "tool": "create_work_item",
       "arguments": {
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
         "title": "[dark-factory fixture] child 2",
         "type": "Story",
-        "idempotency_key": "dark-factory:child:75079503-5efd-4e18-b37a-b610448a4d33:3f2fde15267bbc5ccaa95089d455391f0f555f1f59184ee1c799c77f7a40b832",
+        "idempotency_key": "dark-factory:child:b10af0ce-def6-4135-870a-4764314fcdbb:3f2fde15267bbc5ccaa95089d455391f0f555f1f59184ee1c799c77f7a40b832",
         "description": "Second step; needs the first.",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417"
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535"
       },
       "isError": false,
       "answer": {
-        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
         "epic": {
-          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -113,11 +113,11 @@
         "type": "Story",
         "status": "Backlog",
         "priority": "Medium",
-        "order": 13,
+        "order": 2,
         "estimate": null,
         "comments": [],
-        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:04.570565+00:00",
         "claimant": null,
         "claimant_id": null,
         "claim_marker": null,
@@ -133,16 +133,16 @@
     {
       "tool": "add_work_item_dependency",
       "arguments": {
-        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
-        "blocked_by_id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac"
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "blocked_by_id": "b986bffb-f228-452e-b19a-67034c5bf0b7"
       },
       "isError": false,
       "answer": {
-        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
         "epic": {
-          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -150,18 +150,18 @@
         "type": "Story",
         "status": "Backlog",
         "priority": "Medium",
-        "order": 13,
+        "order": 2,
         "estimate": null,
         "comments": [],
-        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:04.570565+00:00",
         "claimant": null,
         "claimant_id": null,
         "claim_marker": null,
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -175,15 +175,15 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "75079503-5efd-4e18-b37a-b610448a4d33"
+        "itemId": "b10af0ce-def6-4135-870a-4764314fcdbb"
       },
       "isError": false,
       "answer": {
-        "id": "75079503-5efd-4e18-b37a-b610448a4d33",
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "id": "b10af0ce-def6-4135-870a-4764314fcdbb",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
         "epic": {
-          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] plan item",
@@ -191,12 +191,12 @@
         "type": "Story",
         "status": "Ready",
         "priority": "Medium",
-        "order": 11,
+        "order": 7,
         "estimate": null,
         "labels": "plan",
         "comments": [],
-        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "createdAtUtc": "2026-10-14T11:43:03.861375+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:03.861377+00:00",
         "claimant": null,
         "claimant_id": null,
         "claim_marker": null,
@@ -213,20 +213,20 @@
     {
       "tool": "create_work_item",
       "arguments": {
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
         "title": "[dark-factory fixture] child 1",
         "type": "Task",
-        "idempotency_key": "dark-factory:child:75079503-5efd-4e18-b37a-b610448a4d33:6784c89c3d21cb6b3bde0818521abd95d3aa3f4e6b351da4c41cf4b1f08165bf",
+        "idempotency_key": "dark-factory:child:b10af0ce-def6-4135-870a-4764314fcdbb:6784c89c3d21cb6b3bde0818521abd95d3aa3f4e6b351da4c41cf4b1f08165bf",
         "description": "First step of the plan.",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417"
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535"
       },
       "isError": false,
       "answer": {
-        "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
         "epic": {
-          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 1",
@@ -234,11 +234,11 @@
         "type": "Task",
         "status": "Backlog",
         "priority": "Medium",
-        "order": 12,
+        "order": 1,
         "estimate": null,
         "comments": [],
-        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "createdAtUtc": "2026-10-14T11:43:04.35415+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:04.354152+00:00",
         "claimant": null,
         "claimant_id": null,
         "claim_marker": null,
@@ -246,7 +246,7 @@
         "blockers": [],
         "dependents": [
           {
-            "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+            "id": "c4633fc6-9721-430a-a27d-1cf203860290",
             "title": "[dark-factory fixture] child 2",
             "status": "Backlog"
           }
@@ -260,20 +260,20 @@
     {
       "tool": "create_work_item",
       "arguments": {
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
         "title": "[dark-factory fixture] child 2",
         "type": "Story",
-        "idempotency_key": "dark-factory:child:75079503-5efd-4e18-b37a-b610448a4d33:3f2fde15267bbc5ccaa95089d455391f0f555f1f59184ee1c799c77f7a40b832",
+        "idempotency_key": "dark-factory:child:b10af0ce-def6-4135-870a-4764314fcdbb:3f2fde15267bbc5ccaa95089d455391f0f555f1f59184ee1c799c77f7a40b832",
         "description": "Second step; needs the first.",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417"
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535"
       },
       "isError": false,
       "answer": {
-        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
         "epic": {
-          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -281,18 +281,18 @@
         "type": "Story",
         "status": "Backlog",
         "priority": "Medium",
-        "order": 13,
+        "order": 2,
         "estimate": null,
         "comments": [],
-        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:04.570565+00:00",
         "claimant": null,
         "claimant_id": null,
         "claim_marker": null,
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -307,15 +307,15 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d"
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290"
       },
       "isError": false,
       "answer": {
-        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
         "epic": {
-          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -323,18 +323,18 @@
         "type": "Story",
         "status": "Backlog",
         "priority": "Medium",
-        "order": 13,
+        "order": 2,
         "estimate": null,
         "comments": [],
-        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:04.570565+00:00",
         "claimant": null,
         "claimant_id": null,
         "claim_marker": null,
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -348,15 +348,15 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d"
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290"
       },
       "isError": false,
       "answer": {
-        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
         "epic": {
-          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -364,18 +364,18 @@
         "type": "Story",
         "status": "Backlog",
         "priority": "Medium",
-        "order": 13,
+        "order": 2,
         "estimate": null,
         "comments": [],
-        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:04.570565+00:00",
         "claimant": null,
         "claimant_id": null,
         "claim_marker": null,
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -389,17 +389,17 @@
     {
       "tool": "update_work_item",
       "arguments": {
-        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290",
         "status": "Ready",
         "expected_version": 1
       },
       "isError": false,
       "answer": {
-        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
         "epic": {
-          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -407,18 +407,18 @@
         "type": "Story",
         "status": "Ready",
         "priority": "Medium",
-        "order": 13,
+        "order": 8,
         "estimate": null,
         "comments": [],
-        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:06.077794+00:00",
         "claimant": null,
         "claimant_id": null,
         "claim_marker": null,
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -432,15 +432,15 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d"
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290"
       },
       "isError": false,
       "answer": {
-        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
         "epic": {
-          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -448,18 +448,18 @@
         "type": "Story",
         "status": "Ready",
         "priority": "Medium",
-        "order": 13,
+        "order": 8,
         "estimate": null,
         "comments": [],
-        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:06.077794+00:00",
         "claimant": null,
         "claimant_id": null,
         "claim_marker": null,
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -473,15 +473,15 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d"
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290"
       },
       "isError": false,
       "answer": {
-        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
         "epic": {
-          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -489,18 +489,18 @@
         "type": "Story",
         "status": "Ready",
         "priority": "Medium",
-        "order": 13,
+        "order": 8,
         "estimate": null,
         "comments": [],
-        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:06.077794+00:00",
         "claimant": null,
         "claimant_id": null,
         "claim_marker": null,
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -514,15 +514,15 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d"
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290"
       },
       "isError": false,
       "answer": {
-        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
         "epic": {
-          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -530,18 +530,18 @@
         "type": "Story",
         "status": "Ready",
         "priority": "Medium",
-        "order": 13,
+        "order": 8,
         "estimate": null,
         "comments": [],
-        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:06.077794+00:00",
         "claimant": null,
         "claimant_id": null,
         "claim_marker": null,
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -555,17 +555,17 @@
     {
       "tool": "update_work_item",
       "arguments": {
-        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290",
         "status": "Backlog",
         "expected_version": 2
       },
       "isError": false,
       "answer": {
-        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
         "epic": {
-          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -573,18 +573,18 @@
         "type": "Story",
         "status": "Backlog",
         "priority": "Medium",
-        "order": 13,
+        "order": 2,
         "estimate": null,
         "comments": [],
-        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:06.945497+00:00",
         "claimant": null,
         "claimant_id": null,
         "claim_marker": null,
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -598,17 +598,17 @@
     {
       "tool": "add_work_item_comment",
       "arguments": {
-        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290",
         "body": "[author: dark-factory] returned by the contract test",
-        "idempotency_key": "dark-factory:comment:b27825282df36192217c3b5b782c038b0b3a3e5054a84dc35666e42ca6f669ce"
+        "idempotency_key": "dark-factory:comment:e5adb565df10c394874d620047931ea17bba2c39f44fefa5f0979f8508a718af"
       },
       "isError": false,
       "answer": {
-        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
         "epic": {
-          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -616,27 +616,27 @@
         "type": "Story",
         "status": "Backlog",
         "priority": "Medium",
-        "order": 13,
+        "order": 2,
         "estimate": null,
         "comments": [
           {
-            "id": "5bee6bfa-f8c0-4cc7-8f50-009b04d82798",
-            "workItemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+            "id": "7597a1e5-7c47-4047-ae87-4c5ff5a6f08c",
+            "workItemId": "c4633fc6-9721-430a-a27d-1cf203860290",
             "author": "fixture-recorder",
             "body": "[author: dark-factory] returned by the contract test",
-            "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
+            "createdAtUtc": "2026-10-14T11:43:07.162841+00:00",
             "author_id": "f0000000-0000-0000-0000-000000000001"
           }
         ],
-        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:07.162841+00:00",
         "claimant": null,
         "claimant_id": null,
         "claim_marker": null,
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -645,22 +645,22 @@
         "links": [],
         "version": 3,
         "label_list": [],
-        "comment_id": "5bee6bfa-f8c0-4cc7-8f50-009b04d82798",
+        "comment_id": "7597a1e5-7c47-4047-ae87-4c5ff5a6f08c",
         "comment_created": true
       }
     },
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d"
+        "itemId": "c4633fc6-9721-430a-a27d-1cf203860290"
       },
       "isError": false,
       "answer": {
-        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "id": "c4633fc6-9721-430a-a27d-1cf203860290",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+        "epicId": "247e70af-aaf5-47f0-9cf0-261328c93535",
         "epic": {
-          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "id": "247e70af-aaf5-47f0-9cf0-261328c93535",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -668,27 +668,27 @@
         "type": "Story",
         "status": "Backlog",
         "priority": "Medium",
-        "order": 13,
+        "order": 2,
         "estimate": null,
         "comments": [
           {
-            "id": "5bee6bfa-f8c0-4cc7-8f50-009b04d82798",
-            "workItemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+            "id": "7597a1e5-7c47-4047-ae87-4c5ff5a6f08c",
+            "workItemId": "c4633fc6-9721-430a-a27d-1cf203860290",
             "author": "fixture-recorder",
             "body": "[author: dark-factory] returned by the contract test",
-            "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
+            "createdAtUtc": "2026-10-14T11:43:07.162841+00:00",
             "author_id": "f0000000-0000-0000-0000-000000000001"
           }
         ],
-        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "createdAtUtc": "2026-10-14T11:43:04.570563+00:00",
+        "updatedAtUtc": "2026-10-14T11:43:07.162841+00:00",
         "claimant": null,
         "claimant_id": null,
         "claim_marker": null,
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
+            "id": "b986bffb-f228-452e-b19a-67034c5bf0b7",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }

@@ -291,12 +291,23 @@ public sealed class KanbanIdentities
         return placeholder;
     }
 
-    /// <summary><paramref name="text"/> (a refusal's message) with every name and id learnt replaced: the longest name first.</summary>
+    /// <summary>
+    /// <paramref name="text"/> (a refusal's message) with every mention of a name learnt (<see cref="Mention"/>) and every id
+    /// learnt replaced: the longest name first.
+    /// </summary>
     public string Clean(string text)
     {
-        text = _names.OrderByDescending(n => n.Length).Aggregate(text, (t, name) => t.Replace(name, KanbanRecordingHandler.Recorder, StringComparison.Ordinal));
+        text = _names.OrderByDescending(n => n.Length).Aggregate(text, (t, name) => Mention(name).Replace(t, KanbanRecordingHandler.Recorder));
         return _ids.Aggregate(text, (t, id) => t.Replace(id.Key, id.Value, StringComparison.OrdinalIgnoreCase));
     }
+
+    /// <summary>
+    /// Where a message names the identity <paramref name="name"/>: the name standing on its own, not inside a longer word,
+    /// hyphenated name or marker (sc-25992). The factory's service identity is called <c>factory</c>, and a plain replace turned
+    /// a claim marker <c>dark-factory:&lt;id&gt;</c> in a refusal's message into <c>dark-fixture-recorder:&lt;id&gt;</c>, a marker
+    /// no caller sent. The fixture guard uses the same rule.
+    /// </summary>
+    public static Regex Mention(string name) => new($@"(?<![\p{{L}}\p{{N}}_-]){Regex.Escape(name)}(?![\p{{L}}\p{{N}}_-])", RegexOptions.CultureInvariant);
 }
 
 /// <summary>The replay met a request the recording does not have (thrown to the adapter, and kept in <see cref="KanbanReplayHandler.Mismatches"/>).</summary>
@@ -776,7 +787,7 @@ public static partial class KanbanFixtureGuard
             var said = !call.IsError ? null
                 : call.Answer is JsonObject error ? error["message"] is JsonValue m && m.TryGetValue<string>(out var message) ? message : null
                 : call.Answer is JsonValue v && v.TryGetValue<string>(out var plain) ? plain : null;
-            if (said is not null && identities.FirstOrDefault(n => n != allowed && said.Contains(n, StringComparison.Ordinal)) is { } named)
+            if (said is not null && identities.FirstOrDefault(n => n != allowed && KanbanIdentities.Mention(n).IsMatch(said)) is { } named)
             {
                 problems.Add($"{where} answer's message names an identity ('{Cut(named)}')");
             }

@@ -127,18 +127,29 @@ for its sessions.
 | Check | Test | Gate |
 | --- | --- | --- |
 | Worker token pushes `factory/*` only on its own repo; push to `main` and to another repo rejected | `AppTokenPushTests.Worker_token_pushes_factory_branches_only_on_its_own_repo` | `FACTORY_E2E=1` (`FACTORY_E2E_OTHER_REPO` optional) |
-| Worker env is exactly the allowlist for the configured `Worker:Auth` (`router-key`: `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `HOME`, `MSBUILDDISABLENODEREUSE`, `PATH`; `claude-login`: the same without `ANTHROPIC_AUTH_TOKEN`); `ANTHROPIC_CUSTOM_HEADERS` is two lines, the router key and `x-weave-model-class` (sc-25659) | `LiveWorkerSandboxTests.Live_worker_environment_is_exactly_the_allowlist_for_the_configured_auth_mode` | `FACTORY_SANDBOX_LIVE=1` |
+| Worker env is exactly the allowlist for the configured `Worker:Auth` (`router-key`: `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `HOME`, `MSBUILDDISABLENODEREUSE`, `PATH`, `TMPDIR` — the sandbox user's own temporary directory, sc-25992; `claude-login`: the same without `ANTHROPIC_AUTH_TOKEN`); `ANTHROPIC_CUSTOM_HEADERS` is two lines, the router key and `x-weave-model-class` (sc-25659) | `LiveWorkerSandboxTests.Live_worker_environment_is_exactly_the_allowlist_for_the_configured_auth_mode` | `FACTORY_SANDBOX_LIVE=1` |
 | `router-key`: `_factory` holds no Claude credential (no `~/.claude/.credentials.json`, no `Claude Code-credentials` keychain item) | `LiveWorkerSandboxTests.Worker_user_holds_no_claude_credential_in_router_key_mode` (skips for `claude-login`) | `FACTORY_SANDBOX_LIVE=1` |
 | `router-key`: `factory run`/`work` refuse to start without an enrolled plan | `RouterEnrollmentCheckTests` (unit, fake router) | none |
 | `~michael`, `.ssh`, `.config/gh`, login keychain unreachable | `LiveWorkerSandboxTests.Worker_is_denied_the_owners_home_ssh_keys_gh_config_and_login_keychain`, `Worker_cannot_read_the_owners_keychain_items` | `FACTORY_SANDBOX_LIVE=1` |
 
 The env probe runs `/usr/bin/env` through the installed helper exactly as `ClaudeWorker` launches a sandboxed worker
 (`WorkerSandbox.Start` with `ClaudeWorker.BuildRouterVariables` for the configured router URL and auth mode, a probe
-router key, and `GH_TOKEN` set in the test process to show nothing of the owner's leaks). The `FACTORY_SANDBOX_LIVE`
-tests kill every `_factory` process: run them only when no `_factory` session is in use:
+router key, and `GH_TOKEN` set in the test process to show nothing of the owner's leaks). Every probe runs once per configured
+worker slot (`Worker:Slots`: each slot's own user and installed helper, `_factory`, `_factory2`, …; sc-25992), a failure naming
+its slot; slot 1 not ready (the machine not set up) skips them, a further configured slot not ready fails. The env probe also
+checks that each slot's `TMPDIR` is under `/var/folders/`, owned by that slot's own uid (run as it: `stat -f %u "$TMPDIR"` equals
+`id -u`, and `id -un` is the slot's user), not the owner's, and that no two slots share a `TMPDIR` or a `HOME`. The
+`FACTORY_SANDBOX_LIVE` tests kill every process of every configured sandbox user: run them only when no sandbox user's session
+is in use and `factory work` is stopped. One slot (the default):
 
 ```sh
-FACTORY_SANDBOX_LIVE=1 dotnet test --project tests/DarkFactory.Orchestrator.Tests -- --filter-class "*LiveWorkerSandboxTests"
+FACTORY_SANDBOX_LIVE=1 dotnet test --project tests/DarkFactory.Orchestrator.Tests --filter-class "*LiveWorkerSandboxTests"
+```
+
+Two slots (after `sudo scripts/setup-worker-user.sh --slots 2`):
+
+```sh
+FACTORY_SANDBOX_LIVE=1 Worker__Slots=2 dotnet test --project tests/DarkFactory.Orchestrator.Tests --filter-class "*LiveWorkerSandboxTests"
 ```
 
 ## AT7 — the router accounts for every model call
@@ -875,11 +886,14 @@ FACTORY_E2E=1 FACTORY_E2E_P4B_KANBAN_PROJECT=<KEY> FACTORY_E2E_P4B_KANBAN_ITEM=<
 What it checks: the item gets one `kb-<n>` however often it is asked for and is listed ready under it in the watched project;
 the run succeeds and the throwaway ledger's transitions start Intake → Implement (claimed, then InProgress on the board) and end
 MergeGate → Merge → Watch (fix rounds between are the panel's call), every row with its typed outcome; one `claimed` and one
-`linked` row (`<pull request> <branch>`, the branch `factory/kb-<n>`) and a `merged-reported` row; on GitHub the pull request
+`linked` row (`<pull request> <branch>`, the branch `factory/kb-<n>`; a throwaway ledger starts its Kanban keys at the seconds
+since 2026-01-01, `E2e.KanbanKeyStart`, so no two runs share an item's branch — sc-25992) and a `merged-reported` row; on GitHub the pull request
 from `factory/kb-<n>` is merged at the commit the Merge row records; on the board the item is `Done`, with the pull request and
 the branch as links of kind `pr` and `branch`, and EXACTLY ONE comment equal to `LedgerReport.MergedCloseout`'s rendering of
 the rows written before the `closeout` `posted` row (attributed, as the pipeline posts it); a second run adds no second
-`claimed`, `linked` or posted `closeout` row, no link and no comment.
+`claimed`, `linked` or posted `closeout` row and no link, and the closeout stays the item's only closeout. Its one board write
+is the factory's once-only notice on an item nothing in this phase moves on (`RunPipeline.HeldNoticeText` for Watch, with a
+`held-notice` row): the test allows that notice at most once and no other comment.
 
 Not live (every `dotnet test`): `KanbanWorkSourceTests` (each member, each refusal, paging, what every write sends — against a
 fake MCP server that behaves as KanbanBoard's contract says, `FakeKanbanBoard`), `KanbanPipelineTests` (the same run through the
@@ -1087,8 +1101,8 @@ Not live (every `dotnet test`): `SlotPoolTests`, `LockScopeTests`, `WorkerSandbo
 `SetupScriptTests` and `FactoryOptionsTests` — the pool, the slot recorded per item and kept (resume, the stop of a leftover
 worker, the worktree's deletion, each waiting for the item's slot), each slot's helper sweeping only its own user's processes,
 start-up naming the slot whose installed helper is missing, stale or pinned to another user, the set-up script for n users, and
-the setting's validation. The live sandbox probes (`LiveWorkerSandboxTests`, `FACTORY_SANDBOX_LIVE=1`) still probe slot 1's
-user only.
+the setting's validation. The live sandbox probes (`LiveWorkerSandboxTests`, `FACTORY_SANDBOX_LIVE=1`) probe every configured
+slot's user (AT6 above: `Worker__Slots=2` for two), including that each slot's `TMPDIR` is its own user's.
 
 ## P4b-AT7 — defaults: one live test per earlier phase behaves as before (sc-25992)
 
@@ -1139,7 +1153,7 @@ meaningless (the AT7 guard) or that the harness already had.
 
 ## Upgrading to Phase 4b (sc-25980)
 
-`sudo scripts/setup-worker-user.sh` once after pulling Phase 4b: the launch helper is version 4, and until it is re-installed
+`sudo scripts/setup-worker-user.sh` once after pulling Phase 4b: the launch helper is version 5 (version 4 added the slots; version 5, sc-25992, gives each sandbox user its own `TMPDIR`: in the shared `/tmp`, `_factory`'s NuGet lock directory refused `_factory2`'s `dotnet restore`, found by the live P4b-AT5), and until it is re-installed
 every `factory run` and `factory work` fails start-up with "Stale helper … re-run `sudo scripts/setup-worker-user.sh`" (close
 any `_factory` session and stop `factory work` first: a setup run kills every `_factory` process). With default settings (no
 Kanban settings, `Worker:Slots` and `Intake:MaxConcurrentRuns` unset) Phase 4b differs from `main` before it only in these,
@@ -1175,10 +1189,11 @@ each deliberate:
 
 `KanbanContractTests` replay `tests/DarkFactory.Orchestrator.Tests/Fixtures/kanban/*.json` in every `dotnet test`: the Kanban
 work source's whole lifecycle, each `tools/call` matched strictly by tool name and arguments. **The committed fixtures are
-provisional.** Each says `"recorded_from": "in-repo fake (provisional; re-record against the hosted instance)"`: they were
-made by the real recorder, but against the in-repo contract-enforcing fake (`FakeKanbanBoard`), so they pin the adapter to
-KanbanBoard's contract as this repository understands it, not yet to what the hosted server answers. One owner-run recording
-replaces them (the epic's terminal story).
+hosted recordings** (sc-25992, 2026-10-14): each says `"recorded_from": "hosted KanbanBoard"`, and CI sets
+`KANBAN_FIXTURES_REQUIRE_HOSTED=1`, so a provisional one (`"in-repo fake (provisional; …)"`, what `KANBAN_RECORD=fake` writes)
+fails the build. The first hosted recording found that the scrubbing of a refusal's message also rewrote claim markers
+(the factory's identity is called `factory`, so `dark-factory:<id>` became `dark-fixture-recorder:<id>`): a name is now
+scrubbed, and guarded, only where it stands on its own (`KanbanIdentities.Mention`).
 
 Prerequisites:
 

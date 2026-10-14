@@ -160,7 +160,7 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     public const string ReinstallCommand = "sudo scripts/setup-worker-user.sh";
 
     /// <summary>The <c>helper_version</c> of <c>scripts/factory-worker-launch</c>: an installed helper below it is stale.</summary>
-    public const int HelperVersion = 4;
+    public const int HelperVersion = 5;
 
     /// <summary>
     /// The oldest Claude Code the worker user may run: 2.1.291, the release the confined triage session was built and checked
