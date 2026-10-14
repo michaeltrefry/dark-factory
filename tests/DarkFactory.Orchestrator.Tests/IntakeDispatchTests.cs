@@ -310,7 +310,7 @@ public class IntakeDispatchTests
         // …and no ready item is, whichever run ends: the hold is read before each would start.
         runner.End(5);
         runner.End(2);
-        await poll;
+        await poll.WaitAsync(TimeSpan.FromSeconds(60));
 
         Assert.Equal([1, 2, 5], runner.Started.Order());
         var hold = Assert.Single(status.Deferrals);
@@ -324,7 +324,7 @@ public class IntakeDispatchTests
         // Lifted: the next poll's first read drops the hold, and the ready items are started.
         Assert.True((await new ControlActions(controls, contexts).ContinueAsync(scope, "tester", CancellationToken.None)).Ok);
         runner.EndAtOnce = true;
-        await loop.PollOnceAsync(CancellationToken.None);
+        await loop.PollOnceAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
         Assert.Empty(status.Deferrals);
         Assert.Equal([1, 1, 2, 2, 3, 4, 5, 5], runner.Started.Order());
     }
@@ -340,7 +340,7 @@ public class IntakeDispatchTests
 
         controls.Broken = new InvalidOperationException("the controls table is gone");
         runner.End(1);
-        await poll;
+        await poll.WaitAsync(TimeSpan.FromSeconds(60));
 
         Assert.Equal([1], runner.Started); // never dispatched blind (E2)
         Assert.Equal((1, "sc-3 not started: the controls could not be read: the controls table is gone"), (status.FactoryError!.Count, status.FactoryError.Message));
@@ -353,13 +353,23 @@ public class IntakeDispatchTests
     {
         var runner = new GatedRunner(1, 2, 3);
         var status = new IntakeStatus(TimeProvider.System);
+        var shown = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        status.Changed += () =>
+        {
+            if (status.FactoryError is not null)
+            {
+                shown.TrySetResult();
+            }
+        };
         var poll = Loop(ListingSource.Listing(4), runner, concurrent: 2, status, maxFailures: 2).PollOnceAsync(CancellationToken.None);
         await runner.WhenStarted(2);
 
-        // sc-1's slot has a stale helper (the factory's failure); sc-2, in flight beside it, then fails for a reason of its own.
+        // sc-1's slot has a stale helper (the factory's failure); sc-2, in flight beside it, then fails for a reason of its own —
+        // once the factory's failure is shown, by when the poll has stopped dispatching.
         runner.Fail(1, new FactoryUnavailableException("the worker sandbox: Stale helper", new InvalidOperationException("Stale helper")));
+        await shown.Task.WaitAsync(TimeSpan.FromSeconds(60));
         runner.Fail(2, new InvalidOperationException("story 2 is gone"));
-        await poll;
+        await poll.WaitAsync(TimeSpan.FromSeconds(60));
 
         Assert.Equal([1, 2], runner.Started.Order()); // nothing more this poll
         Assert.Equal((1, "sc-1 could not run: the worker sandbox: Stale helper"), (status.FactoryError!.Count, status.FactoryError.Message));
@@ -380,7 +390,7 @@ public class IntakeDispatchTests
             await runner.WhenStarted(2);
             runner.Fail(1, new FactoryUnavailableException("the worker sandbox: Stale helper", new InvalidOperationException("Stale helper")));
             runner.Fail(2, new FactoryUnavailableException("the ledger migration: timed out", new TimeoutException("timed out")));
-            await poll;
+            await poll.WaitAsync(TimeSpan.FromSeconds(60));
 
             // One poll, one error: counted once however many of its runs failed, each reason said once.
             Assert.Equal(polls, status.FactoryError!.Count);
@@ -401,7 +411,7 @@ public class IntakeDispatchTests
 
         runner.End(1, Ok with { Deferred = "factory frozen (main-red): main is red; `factory continue --freeze` clears it" });
         runner.End(2, Ok with { Deferred = "factory frozen (main-red): main is red; `factory continue --freeze` clears it" });
-        await poll;
+        await poll.WaitAsync(TimeSpan.FromSeconds(60));
 
         Assert.Equal([1, 2], runner.Started.Order());
         Assert.Equal(["sc-1", "sc-2"], status.Deferrals.Select(d => d.Id).Order());

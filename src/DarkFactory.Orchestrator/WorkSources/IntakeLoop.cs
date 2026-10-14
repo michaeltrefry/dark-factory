@@ -303,11 +303,11 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
             catch (Exception ex) when (!ct.IsCancellationRequested)
             {
                 logger.LogError(ex, "Could not read the controls before starting {Item}; ending this poll", name);
-                FactoryFailed($"{name} not started: the controls could not be read: {ex.Message}");
                 lock (gate)
                 {
                     runsFailed = true;
                 }
+                FactoryFailed($"{name} not started: the controls could not be read: {ex.Message}");
             }
             return false;
         }
@@ -346,11 +346,13 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
                     // Every other item would fail the same way: show it once, escalate nothing, start nothing more, try again next
                     // poll. Not this item's failure, nor one of a run beside it (which ends by itself, its outcome its own).
                     logger.LogError(ex, "Run of {Item} failed for a factory-wide reason; ending this poll", name);
-                    FactoryFailed($"{name} could not run: {ex.Message}");
+                    // Nothing more is started from here on, before anyone is told: whoever sees the error shown sees a poll
+                    // that has already stopped dispatching.
                     lock (gate)
                     {
                         runsFailed = true;
                     }
+                    FactoryFailed($"{name} could not run: {ex.Message}");
                 }
                 catch (Exception ex) when (!ct.IsCancellationRequested)
                 {
