@@ -20,7 +20,7 @@ Claude Code headless workers through the Weave router.
   review and merge gate (`Gate/`: `ReviewModels` (which panel calls count), `ReviewPanel` (roles, prompts, findings),
   `Reviewer.cs` (`IReviewer`/`RouterReviewer`) reading the router's stream with `MessageStream`, `GatePolicy` (+ `RiskyPaths`)
   and the path tiers `PathTiers`, `MergeGate`, `FixLoop`, `CiHeal`, `MergeQueue`, the test-only `GateCheckSeam`, the new-tests
-  check `NewTests.cs` (`NewTestsCheck`)/`XunitNewTests`/`CargoNewTests` (Rust, over the lexer-level `RustSource`)/`SandboxTestRunner`,
+  check `NewTests.cs` (`NewTestsCheck`)/`XunitNewTests`/`CargoNewTests` (Rust, over the lexer-level `RustSource`)/`SwiftNewTests` (Swift Testing, over `SwiftSource`, sc-26127)/`SandboxTestRunner`,
   the plan-time check of a repository's CI workflow triggers `CiTriggers.cs` (sc-25873; pipeline side `RunPipeline.CiTriggers.cs`);
   reviewer prompts in `factory/prompts/`; GitHub side
   `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`, the merge gate and queue `RunPipeline.MergeQueue.cs`),
@@ -2217,7 +2217,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `cargo test:*`, a repository alias or an external `cargo-testx` on the worker's PATH would run — still only repository code in
   the same sandbox, the residual of (b), no more; (d) cargo must be on the worker's PATH (the launch helper's fixed one,
   unchanged: `/opt/homebrew/bin` or `/usr/local/bin`) — where it is not, the commands fail and the worker is where it was before.
-  The result goes back through review, CI and the gate. Triage and the planner gain none of this: `WorkerTools.ReadOnly` has no
+  The result goes back through review, CI and the gate. Swift (sc-26127): `Bash(swift build:*)` and `Bash(swift test:*)`
+  (`ClaudeWorker.SwiftTools`), with the same residuals — the manifest, plugins and macros are code SwiftPM runs, and a build
+  resolves dependencies over the network; `swift run`, `swift package`, `swift repl` and `swift <script>` are denied.
+  Triage and the planner gain none of this: `WorkerTools.ReadOnly` has no
   allow rule but its read rule and denies `Bash` by name.
 - The orchestrator pushes only to `factory/*` (items' branches, and a plan's `factory/changeset-*` branch, sc-25872), with a repo-scoped GitHub App installation token passed
   via git env config (never argv/remote URLs/.git/config) on every network git call. Only the merge gate merges (below).
@@ -2538,7 +2541,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   sealed — the tier must match the policy and CODEOWNERS (root, `.github/`, `docs/`) and cover `.github/workflows/` and
   `factory/prompts/` with a pattern matching everything under them (`PathPattern.CoversEverythingUnder`: a directory
   pattern or trailing `**` naming the directory or an ancestor; naming files in it is invalid); security review — a path
-  whose tier lists `security-review` or that `RiskyPaths` matches (scripts, build/container files, dependency manifests, Rust's
+  whose tier lists `security-review` or that `RiskyPaths` matches (scripts, build/container files, dependency manifests — SwiftPM's
+  `Package.swift`, `Package@swift-*.swift` and `Package.resolved` among them, sc-26127 — Rust's
   `build.rs`, `rust-toolchain*` and `.cargo/config*`,
   keys/.env, security-sensitive names; case-insensitive) needs it, so the policy can add security-review paths but not
   remove the floor. The gate also reads the PR, the diff of the head against the base (`IGateGitHub.GetDiffAsync`;
@@ -2748,6 +2752,42 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (d) by design, not a gap: a file-level import is production code, so an import the PR rebinds (the same name from another
   path) keeps the base's binding in a grafted file — what the real base has; a test that only passes with the new binding
   fails on the base, as it should.
+  Swift/SwiftPM with Swift Testing (Phase 5 S1, sc-26127, `Gate/SwiftNewTests.cs`, a third `INewTestStrategy`, over the
+  lexer-level `Gate/SwiftSource.cs`: line and nested block comments, single-line, multi-line and raw strings with their
+  interpolations, `#/…/#` regexes, backticked names; function, property, initializer and closure bodies skipped, type and
+  extension bodies read; `actor` read as a type only when a name and `{`/`:`/`<`/`where` follow it, since it is also an
+  identifier; unbalanced source throws and the file is unreadable, and so does any `@Test` the reader does not put on a
+  function it records — one dropped before a declaration it does not understand (`#if` between attribute and `func`, a
+  generic clause holding a bracket), and, by a file-wide count of `@Test`/`@Testing.Test` tokens against the recorded test
+  functions' attributes, one in a skipped body (Swift Testing refuses a local test function anyway)). New tests: `@Test` functions in the head
+  versions of changed files under `Tests/<target>/` of the nearest `Package.swift` whose `testTarget(name: "<target>")` has no
+  `path:` (at the base and the head), whose id no base version of a changed file has; the id is Swift Testing's own
+  (`WordsTests.blank()`, `WordsTests.Outer/Inner/deep()`, what `swift test list` prints). Overlay: every changed file under a
+  package's `Tests/` from the head; manifest and production code stay the base's. Unisolable (`unsupported`, later stories'
+  seams): a parameterized test (`@Test(arguments:)` or parameters; S3), a new XCTest `func test…()` in a file importing
+  XCTest (S3), a new test or a test-looking `.swift` file outside a SwiftPM test target (an Xcode project: S5), a test target
+  the base does not declare, a version-specific manifest, an id declared twice, a backticked name, an unreadable changed file
+  that may hold tests. Runs (`SandboxTestRunner`, as `_factory`): `swift --version` (toolchain), `/bin/mkdir -p` of the
+  results directory (SwiftPM writes no report into a missing one), `swift package resolve` (the restore, the only network
+  step), `swift build --build-tests` (stdout kept as the build log), then per test `swift test --skip-build --disable-xctest
+  --filter '^<id escaped>(/|$)' --xunit-output <results>/swift-test-<16 hex of the id's SHA-256>.xml` (Swift Testing matches
+  the filter against the id followed by `/<file>:<line>:<col>`; verified against Swift 6.3.2, whose report for Swift Testing
+  names a case by `classname` `<target>.<Type>.<Nested>` and `name` `f()`, with `<failure>`/`<skipped>` children and suite
+  counts that are checked). Each step reads only its own report (`ResultFilePattern` = `SwiftNewTests.ReportName(id)`, no
+  wildcard) and keeps its exit code (`CaptureOutput`, `ResultFile.ExitCode`); a report is unreadable (never a result) when no
+  step asked for its name (`swift-test-99.xml`, a subdirectory), when it holds a case that is not its step's test (one test's
+  code writing another's report), when its step's exit code is unknown or disagrees with it (0 exactly when no case failed),
+  and a step with no report is unreadable too. A
+  base that does not build with the PR's test files is not attributed yet (S2): every error unattributable, `error`, never
+  a pass. Workers get `swift build` and `swift test` only (`ClaudeWorker.SwiftTools`, prefix rules like cargo's; `swift run`,
+  `swift package`, `swift <script>` taint as an allow rule and are not offered); `Package.swift`, `Package@swift-*.swift` and
+  `Package.resolved` are `RiskyPaths` dependency manifests (a manifest is code SwiftPM runs). Residual, accepted (the Swift
+  counterpart of cargo's (b)): `~_factory/.swiftpm` (its `configuration` — mirrors, registries — and security state) and
+  `~_factory/Library/Caches/org.swift.swiftpm` (the repository and manifest caches) persist across items and are writable by
+  every worker session and by the test code a gate run executes, so an implementer, or a PR's tests, can influence later
+  resolves, builds and gate runs on both commits — as `_factory`'s NuGet cache and `~/.cargo` can. Tests: `SwiftNewTestsTests.cs`
+  (reader, identification, steps/report/build-error parsing, the pipeline to Merge and the rejection, and the real toolchain,
+  skipped without `swift`).
   Upgrading from Phase 1: Review is now a handled state, so the first `factory work` picks up every item parked at Review:
   an open PR is reviewed by the panel like any other (Phase 1's missing `implementer-model` no longer matters, sc-25379),
   and one the owner merged or closed escalates once with a story comment ("merged outside the factory"). An item whose
