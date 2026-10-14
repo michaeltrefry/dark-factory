@@ -875,7 +875,8 @@ FACTORY_E2E=1 FACTORY_E2E_P4B_KANBAN_PROJECT=<KEY> FACTORY_E2E_P4B_KANBAN_ITEM=<
 What it checks: the item gets one `kb-<n>` however often it is asked for and is listed ready under it in the watched project;
 the run succeeds and the throwaway ledger's transitions start Intake → Implement (claimed, then InProgress on the board) and end
 MergeGate → Merge → Watch (fix rounds between are the panel's call), every row with its typed outcome; one `claimed` and one
-`linked` row (`<pull request> <branch>`, the branch `factory/kb-<n>`) and a `merged-reported` row; on GitHub the pull request
+`linked` row (`<pull request> <branch>`, the branch `factory/kb-<n>`; a throwaway ledger starts its Kanban keys at the seconds
+since 2026-01-01, `E2e.KanbanKeyStart`, so no two runs share an item's branch — sc-25992) and a `merged-reported` row; on GitHub the pull request
 from `factory/kb-<n>` is merged at the commit the Merge row records; on the board the item is `Done`, with the pull request and
 the branch as links of kind `pr` and `branch`, and EXACTLY ONE comment equal to `LedgerReport.MergedCloseout`'s rendering of
 the rows written before the `closeout` `posted` row (attributed, as the pipeline posts it); a second run adds no second

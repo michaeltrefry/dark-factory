@@ -118,8 +118,24 @@ internal sealed class E2e : IAsyncDisposable
         var workRoot = Path.Combine(realRoot, "e2e", database);
         var e2e = new E2e(admin, database, realLock, workRoot);
         await LedgerMigrations.MigrateAsync(e2e.Ledger, CancellationToken.None);
+        await using (var ledger = new NpgsqlConnection(e2e.Ledger))
+        {
+            await ledger.OpenAsync();
+            await using var restart = new NpgsqlCommand(
+                $"ALTER TABLE kanban_items ALTER COLUMN \"Id\" RESTART WITH {KanbanKeyStart(DateTimeOffset.UtcNow)}", ledger);
+            await restart.ExecuteNonQueryAsync();
+        }
         return e2e;
     }
+
+    /// <summary>
+    /// The first Kanban key of a throwaway ledger (sc-25992). A Kanban item's branch is <c>factory/kb-&lt;key&gt;</c>, and keys are
+    /// per ledger: started at 1, every live run would name its first item <c>kb-1</c> and push to the branch, and adopt the open
+    /// pull request, that an earlier run left on the sandbox (P4b-AT4 leaves a draft). So each throwaway ledger starts its keys
+    /// at the seconds since 2026-01-01 UTC — distinct for runs started a second apart, and an int until 2094.
+    /// </summary>
+    internal static int KanbanKeyStart(DateTimeOffset now) =>
+        checked((int)Math.Max(1, (now - new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)).Ticks / TimeSpan.TicksPerSecond));
 
     /// <summary>
     /// The watch scope from <c>FACTORY_E2E_WATCH_TEAM</c> / <c>FACTORY_E2E_WATCH_EPIC</c> (at least one), as config keys.
