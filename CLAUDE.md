@@ -2099,16 +2099,28 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   item locked; a dead run's lock is gone with its connection), after reading the rows. `RunView.Live` true: `running: <phase> ·
   holds slot 2 (_factory2) to implement` or `· waiting for a slot to implement` / `waiting for slot 2 (_factory2) to …`; false:
   `no run now: <phase> · slot 2 (_factory2), not held`, and a held or waiting last row without a live run is said as stale, in
-  the error colour (`no run now: the last one ended holding slot 2 (_factory2) without recording it (crashed or killed); the
-  slot is free and its next run goes on` — the OS released the slot's lock with the process); null (a reader given no lock
-  reader: tests) shows the rows' word. A row shown alive is read again every 15 s (a death writes no row, so no NOTIFY).
+  the error colour (`no run now: the last one ended holding slot 2 (_factory2) without recording it (crashed or killed)` —
+  only what is known: not whether the slot is free now, nor what the next run does); null (a reader given no lock reader:
+  tests, or a `pg_locks` read that failed — caught, so the page is not marked stale for it) shows the rows' word. A hold or
+  wait is the run's now only while no transition follows its row (`RunView.Ended`: a phase records its next state just before
+  it gives the slot up, so a dangling `slot-held` behind a later `Review` is an earlier run's; for that moment of a live phase
+  the cell says `not held`), and of two items shown holding one slot only the newer hold is (`RunView.Displaced`: the other
+  is stale, `another item's run holds slot 1 (_factory) now: an earlier run of this one ended holding it without recording it
+  (crashed or killed)`). And a run's start, under the item's run lock (`RunAsync` and `HoldAsync`), ends on the record a
+  `slot-held`/`slot-wait` an earlier run left as the item's last slot-use row (`EndEarlierSlotUseAsync`: `slot-released`
+  `<slot> <user> <what> not recorded: ended with an earlier run`, bounded, only logged on failure). Slot bookkeeping rows
+  (`slot`, `slot-left`, `slot-wait`, `slot-held`, `slot-released`: `SlotUse.IsBookkeeping`, one predicate) are never "the
+  item's last row" for a reader by position: the escalation comment's `Last ledger state` (a phase's release is written in
+  its `finally`, before the Escalated row), `GiveUpAsync`'s "while that `plan-held` row is still its last", and a worker
+  attempt's rows (`CurrentWorkerAttempt`). A row shown alive is read again every 15 s (a death writes no row, so no NOTIFY).
   Residuals, accepted: a clean-up that takes an item's run lock for a moment to delete its leftovers (`LiveRuns`) shows as a
   run for that moment; a helper that outlives its phase keeps the slot's lock (`WorkerLock.KeepUntil`) though the page says
   released — the `[lock] … stays held` log line is that case's record. What a one-slot installation now sees (E9): one more
   column, e.g. `running: implementing · holds slot 1 (_factory) to implement`, then `no run now: review · slot 1 (_factory),
   not held`; and two more rows per worker phase in its ledger (no report, metric or decision reads them).
   Tests: `RunsInFlightTests` (two real runs: both holding in two slots; one holding and one waiting with one slot; a dead run's
-  stale row; `RunView`'s phase and slot words), `DashboardComponentTests` (two running rows; the deferral list),
+  stale row; a dangling hold behind a later transition, ended at the next run's start; two items holding one slot; a failed
+  liveness read; `RunView`'s phase and slot words), `DashboardComponentTests` (two running rows; the deferral list),
   `LedgerPostgresTests` (`HeldAsync` across lock holders, taking nothing).
 - Review → CI → MergeGate → Merge (sc-25378; `RunPipeline.Gate.cs`, only in a pipeline built with a `GateStage`, which
   production always is): Implement records every model that answers the implementer (`implementer-model` checkpoints, from

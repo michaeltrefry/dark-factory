@@ -365,12 +365,112 @@ public class RunsInFlightTests
         // No run holds its lock: the row the dead run left is said as what it is.
         var dead = (await f.Row("sc-9")).Run!;
         Assert.Equal((false, false, true), (dead.Live, dead.Holds, dead.Stale));
-        Assert.StartsWith("no run now: the last one ended holding slot 2 (_dftest2) without recording it", dead.SlotText);
+        // Only what is known: not that the slot is free (another run may hold it now), nor what the next run does.
+        Assert.Equal("no run now: the last one ended holding slot 2 (_dftest2) without recording it (crashed or killed)", dead.SlotText);
 
         // The same rows under a live run (its lock held, in whatever process) are a hold.
         await using var held = await f.Locks.TryAcquireAsync((await f.Row("sc-9")).Id, CancellationToken.None);
         var alive = (await f.Row("sc-9")).Run!;
         Assert.Equal((true, true, false, "holds slot 2 (_dftest2) to implement"), (alive.Live, alive.Holds, alive.Stale, alive.SlotText));
+    }
+
+    /// <summary>Puts <paramref name="id"/> in the ledger as a run that died after its Implement phase recorded Review, holding slot <paramref name="slot"/>, left it.</summary>
+    private static async Task<WorkItem> DiedHolding(Factory f, string id, int slot, bool recordedReview = true)
+    {
+        await using var db = f.Contexts.CreateDbContext();
+        var ledger = new WorkLedger(db, f.Time);
+        var item = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, id, "Crashed", Sandbox.FullName, null, CancellationToken.None);
+        await ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
+        var user = slot == 1 ? "_dftest" : $"_dftest{slot}";
+        await ledger.CheckpointAsync(item, RunPipeline.Steps.Slot, null, $"{slot} {user}", CancellationToken.None);
+        await ledger.CheckpointAsync(item, RunPipeline.Steps.SlotHeld, null, SlotUse.Detail(slot, user, "implement"), CancellationToken.None);
+        if (recordedReview)
+        {
+            await ledger.RecordAsync(item, WorkState.Review, null, null, CancellationToken.None);
+        }
+        return item;
+    }
+
+    [Fact]
+    public async Task A_hold_an_earlier_run_left_before_the_items_state_moved_on_is_not_shown_held_by_its_next_live_run()
+    {
+        // The ledger's last slot-use row is a hold, but Review was recorded after it: that hold was the Implement phase's, whose
+        // run died before its release was written. A live run of the item now (its lock held) does not hold the slot.
+        var f = new Factory(slots: 2);
+        var item = await DiedHolding(f, "sc-9", slot: 2);
+        await using var held = await f.Locks.TryAcquireAsync(item.Id, CancellationToken.None);
+
+        var run = (await f.Row("sc-9")).Run!;
+        Assert.Equal((true, "review", false, false, false), (run.Live, run.Phase, run.Holds, run.Waits, run.Stale));
+        Assert.Equal("slot 2 (_dftest2), not held", run.SlotText);
+    }
+
+    [Fact]
+    public async Task A_run_ends_on_the_record_the_slot_use_an_earlier_run_left_before_it_does_anything_else()
+    {
+        var f = new Factory(slots: 2);
+        await DiedHolding(f, "sc-1", slot: 2);
+
+        await f.RunAsync(1, CancellationToken.None);
+
+        var rows = await f.Rows("sc-1");
+        var released = Assert.Single(rows, r => r.Step == RunPipeline.Steps.SlotReleased);
+        Assert.Equal(("2 _dftest2 implement not recorded: ended with an earlier run", StepOutcome.Passed), (released.Detail, released.Outcome));
+        Assert.Equal(rows.FindIndex(r => r.Step == RunPipeline.Steps.SlotHeld) + 2, rows.IndexOf(released)); // right after the Review row
+        Assert.Equal(SlotUseKind.None, SlotUse.Of(rows).Kind);
+        // A second run finds nothing to end: one row per earlier run's leftover, not one per run.
+        await f.RunAsync(1, CancellationToken.None);
+        Assert.Single(await f.Rows("sc-1"), r => r.Step == RunPipeline.Steps.SlotReleased);
+    }
+
+    [Fact]
+    public async Task A_run_resuming_an_item_whose_earlier_run_died_inside_its_phase_ends_that_hold_on_the_record_before_its_own()
+    {
+        var f = new Factory(slots: 2);
+        await DiedHolding(f, "sc-2", slot: 2, recordedReview: false);
+        f.Seat(2).Finish();
+
+        await f.RunAsync(2, CancellationToken.None);
+
+        var uses = (await f.Rows("sc-2")).Where(r => SlotUse.IsStep(r.Step)).Select(r => (r.Step, r.Detail)).ToList();
+        Assert.Equal([
+            (RunPipeline.Steps.SlotHeld, "2 _dftest2 implement"),
+            (RunPipeline.Steps.SlotReleased, "2 _dftest2 implement not recorded: ended with an earlier run"),
+            (RunPipeline.Steps.SlotHeld, "2 _dftest2 implement"),
+            (RunPipeline.Steps.SlotReleased, "2 _dftest2 implement"),
+        ], uses);
+        Assert.Equal(WorkState.Review, (await f.Last("sc-2")).State);
+    }
+
+    [Fact]
+    public async Task Two_items_shown_holding_one_slot_show_only_the_newer_live_hold_and_the_other_as_stale()
+    {
+        var f = new Factory(slots: 2);
+        var older = await DiedHolding(f, "sc-7", slot: 1, recordedReview: false);
+        var newer = await DiedHolding(f, "sc-8", slot: 1, recordedReview: false);
+        await using var olderLock = await f.Locks.TryAcquireAsync(older.Id, CancellationToken.None);
+        await using var newerLock = await f.Locks.TryAcquireAsync(newer.Id, CancellationToken.None);
+
+        var (a, b) = ((await f.Row("sc-7")).Run!, (await f.Row("sc-8")).Run!);
+        Assert.Equal((true, false, false, true), (b.Holds, b.Stale, a.Holds, a.Stale));
+        Assert.Equal("holds slot 1 (_dftest) to implement", b.SlotText);
+        Assert.Equal("another item's run holds slot 1 (_dftest) now: an earlier run of this one ended holding it without recording it (crashed or killed)", a.SlotText);
+
+        // The newer hold's run is not alive: the older live one is the slot's holder, the newer record is stale.
+        await newerLock!.DisposeAsync();
+        (a, b) = ((await f.Row("sc-7")).Run!, (await f.Row("sc-8")).Run!);
+        Assert.Equal((true, false, false, true), (a.Holds, a.Stale, b.Holds, b.Stale));
+    }
+
+    [Fact]
+    public async Task A_failed_read_of_which_runs_are_alive_shows_the_rows_with_liveness_unknown()
+    {
+        var f = new Factory(slots: 2);
+        await DiedHolding(f, "sc-9", slot: 2, recordedReview: false);
+        var data = new DashboardData(f.Contexts, f.Time, liveRuns: _ => throw new InvalidOperationException("pg_locks unreadable"));
+
+        var run = Assert.Single(await data.ActiveItemsAsync(CancellationToken.None)).Run!;
+        Assert.Equal((null, true, "holds slot 2 (_dftest2) to implement"), (run.Live, run.Holds, run.SlotText));
     }
 
     /// <summary>Rows as a ledger holds them, oldest first: (state, step, detail); step null = a transition.</summary>

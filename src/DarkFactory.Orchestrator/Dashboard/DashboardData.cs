@@ -60,29 +60,47 @@ public sealed record PipelineRow(
 public sealed record RunView(bool? Live, string Phase, SlotUse Use, int? Slot = null, string? SlotUser = null)
 {
     /// <summary>
-    /// The ledger's last word is "holds" or "waits" but no run of the item is alive: the run died (a crash, a kill) before it
-    /// could record the end. Nothing holds the slot's lock for it (the OS released it with the process); the item's next run
-    /// goes on from the ledger.
+    /// The item's state changed after its last slot-use row (a later transition): that hold or wait belongs to an earlier phase
+    /// whose end was not recorded — a run that crashed or was killed after its phase recorded the next state, or whose
+    /// <c>slot-released</c> could not be written — so it is not this run's now. (A live phase records its next state just before it
+    /// gives the slot up: for that moment the cell says "not held".)
     /// </summary>
-    public bool Stale => Live == false && Use.Kind != SlotUseKind.None;
+    public bool Ended { get; init; }
+
+    /// <summary>
+    /// Another item's live run has a newer hold of the same slot (<see cref="DashboardData.ActiveItemsAsync"/>): a slot's lock is
+    /// one run's at a time, so this item's "holds" is a record an earlier run left, and only the newer holder is shown holding it.
+    /// </summary>
+    public bool Displaced { get; init; }
+
+    /// <summary>Whether the last slot-use row is this item's run's use now, as far as the rows can tell.</summary>
+    private bool Current => !Ended && !Displaced;
+
+    /// <summary>
+    /// The ledger's last word is "holds" or "waits" but it is not current: no run of the item is alive (the run died — a crash, a
+    /// kill — before it could record the end), or another item's live run holds that slot now (<see cref="Displaced"/>).
+    /// </summary>
+    public bool Stale => Use.Kind != SlotUseKind.None && (Live == false || Displaced);
 
     /// <summary>Whether the run holds a worker slot now (and, as far as can be told, is alive).</summary>
-    public bool Holds => Use.Kind == SlotUseKind.Holding && Live != false;
+    public bool Holds => Use.Kind == SlotUseKind.Holding && Live != false && Current;
 
     /// <summary>Whether the run waits for a worker slot now.</summary>
-    public bool Waits => Use.Kind == SlotUseKind.Waiting && Live != false;
+    public bool Waits => Use.Kind == SlotUseKind.Waiting && Live != false && Current;
 
     /// <summary>
     /// The slot cell: <c>holds slot 2 (_factory2) to implement</c>, <c>waiting for a slot to implement</c> (an item that has none
     /// yet) or <c>waiting for slot 2 (_factory2) to …</c> (its own, held by another run), the item's slot when it is in no worker
-    /// phase (<c>slot 2 (_factory2), not held</c>), a stale record said as one, or empty before its first worker phase.
+    /// phase (<c>slot 2 (_factory2), not held</c>), a stale record said as one — only what is known: that a run ended holding or
+    /// waiting without recording it, not whether the slot is free now — or empty before its first worker phase.
     /// </summary>
     public string SlotText => this switch
     {
         { Holds: true } => $"holds {Use.Named}{To(Use.What)}",
         { Waits: true } => $"waiting for {Use.Named}{To(Use.What)}",
+        { Stale: true, Displaced: true } => $"another item's run holds {Use.Named} now: an earlier run of this one ended holding it without recording it (crashed or killed)",
         { Stale: true } => $"no run now: the last one ended {(Use.Kind == SlotUseKind.Holding ? "holding" : "waiting for")} {Use.Named} without recording it "
-            + "(crashed or killed); the slot is free and its next run goes on",
+            + "(crashed or killed)",
         { Slot: { } slot } => $"slot {slot}{(SlotUser is null ? "" : $" ({SlotUser})")}, not held",
         _ => "",
     };
@@ -101,7 +119,8 @@ public sealed record RunView(bool? Live, string Phase, SlotUse Use, int? Slot = 
         var slot = RunPipeline.SlotOf(rows);
         var user = rows.LastOrDefault(e => e.Step == RunPipeline.Steps.Slot)?.Detail?.Split(' ') is { Length: > 1 } named ? named[1]
             : use.Slot == slot ? use.User : null;
-        return new RunView(live, PhaseOf(state, rows), use, slot, user);
+        var at = use.Kind == SlotUseKind.None ? -1 : rows.ToList().FindLastIndex(e => SlotUse.IsStep(e.Step));
+        return new RunView(live, PhaseOf(state, rows), use, slot, user) { Ended = at >= 0 && rows.Skip(at + 1).Any(e => e.Step is null) };
     }
 
     /// <summary>
@@ -344,8 +363,18 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
                 .OrderBy(e => e.Id)
                 .ToListAsync(ct))
             .ToLookup(e => e.WorkItemId);
-        var live = liveRuns is null ? null : await liveRuns(ct);
-        return items.Select(i => new PipelineRow(
+        IReadOnlySet<long>? live = null;
+        try
+        {
+            live = liveRuns is null ? null : await liveRuns(ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Who is alive could not be asked (the lock table's read failed): the rows are shown as they stand, Live unknown,
+            // rather than the whole page marked stale.
+            live = null;
+        }
+        var shown = items.Select(i => new PipelineRow(
                 i.Id, i.ExternalId, i.Title, i.Repo, i.State, i.CreatedAt, i.UpdatedAt,
                 PullRequestUrl(links.GetValueOrDefault(i.Id)),
                 // Spend per item (E9, reporting only): the sum of its sessions' measured router costs, null (N/A) when none is
@@ -362,6 +391,13 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
                 onBoard.GetValueOrDefault(i.Id),
                 RunView.Of(i.State, runRows[i.Id].ToList(), live?.Contains(i.Id))))
             .ToList();
+        // A slot's lock is one run's at a time: of two items shown holding one slot (both live, or liveness unknown — a dead run's
+        // hold is already stale), the newer hold is shown holding it, and the other as a record an earlier run left (sc-25991).
+        var displaced = shown.Where(r => r.Run is { Holds: true }).GroupBy(r => r.Run!.Use.Slot).Where(g => g.Count() > 1)
+            .SelectMany(g => g.OrderByDescending(r => r.Run!.Use.Row).Skip(1))
+            .Select(r => r.Id).ToHashSet();
+        return displaced.Count == 0 ? shown
+            : [.. shown.Select(r => displaced.Contains(r.Id) ? r with { Run = r.Run! with { Displaced = true } } : r)];
     }
 
     private static readonly string[] RunSteps = [.. RunView.StepsRead];

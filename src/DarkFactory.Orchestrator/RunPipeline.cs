@@ -268,6 +268,34 @@ public sealed partial class RunPipeline(
     }
 
     /// <summary>
+    /// At a run's start, under the item's run lock (so no other run of it is alive): a slot-use row an earlier run left as the
+    /// item's last — <see cref="Steps.SlotHeld"/> or <see cref="Steps.SlotWait"/> with no <see cref="Steps.SlotReleased"/> after
+    /// it, from a run that crashed or was killed inside a worker phase or a wait, or whose release could not be written — is
+    /// ended on the record (<see cref="Steps.SlotReleased"/>, Detail <c>… not recorded: ended with an earlier run</c>), so the
+    /// pipeline page does not show this live run as holding or waiting for that slot until its next worker phase (sc-25991).
+    /// Like <see cref="SlotReleasedAsync"/>: on no cancellation token but bounded, and a failure is only logged (the page then
+    /// still tells the row from a current one, <see cref="Dashboard.RunView"/>).
+    /// </summary>
+    private async Task EndEarlierSlotUseAsync(WorkItem item, IReadOnlyList<LedgerEntry> history)
+    {
+        if (SlotUse.Of(history) is not { Kind: not SlotUseKind.None } use)
+        {
+            return;
+        }
+        using var bounded = new CancellationTokenSource(_failedSessionEndTimeout);
+        try
+        {
+            await ledger.CheckpointAsync(item, Steps.SlotReleased, null,
+                SlotUse.Detail(use.Slot, use.User, $"{use.What} not recorded: ended with an earlier run"), bounded.Token);
+            log.WriteLine($"[slot] {item.ExternalId}: an earlier run ended {(use.Kind == SlotUseKind.Holding ? "holding" : "waiting for")} {use.Named} without recording it; recorded now");
+        }
+        catch (Exception ex)
+        {
+            log.WriteLine($"[slot] {item.ExternalId}: could not record that an earlier run's use of {use.Named} ended ({ex.GetType().Name}: {ex.Message})");
+        }
+    }
+
+    /// <summary>
     /// The slot the ledger has for <paramref name="item"/> (<see cref="SlotOf"/>; read once per run), or null when it has none.
     /// </summary>
     /// <exception cref="Worker.SlotUnavailableException">It is not one of the configured slots (<c>Worker:Slots</c> was lowered).</exception>
@@ -964,6 +992,7 @@ public sealed partial class RunPipeline(
             log.WriteLine($"[{item.State}] {item.ExternalId} is already running; not touching it.");
             return new RunOutcome(item.Id, item.State, null, null, $"{item.ExternalId} is already running.");
         }
+        await EndEarlierSlotUseAsync(item, await ledger.HistoryAsync(item, ct));
         // A plan item taking one of its changesets through the gate (sc-25873) works in that changeset's repository until it has
         // merged: the pull request, the gate policy, CI and the merge queue are that repository's. Any other item, and a plan item
         // in any other state, works in the repository its story names. Decided from the rows read under the run lock, never from
@@ -1191,6 +1220,7 @@ public sealed partial class RunPipeline(
             return new RunOutcome(item.Id, item.State, null, null, $"{item.ExternalId} is already running.");
         }
         await ledger.RefreshAsync(item, item.Title, item.Repo, item.EpicId, ct);
+        await EndEarlierSlotUseAsync(item, await ledger.HistoryAsync(item, ct));
         var history = await ledger.HistoryAsync(item, ct);
         if (gate is not null && CloseoutPending(item.State, history))
         {
@@ -2182,7 +2212,7 @@ public sealed partial class RunPipeline(
         // Not the slot's bookkeeping (the item's slot, sc-25989, and the run's use of it, sc-25991): those rows are written as a
         // worker phase starts, before the attempt has made anything, so an attempt holding only them is a fresh one — not a
         // resume that would look for a worktree and record it lost.
-        return history.Skip(start).Where(e => e.Step != Steps.Slot && !SlotUse.IsStep(e.Step)).ToList();
+        return history.Skip(start).Where(e => !SlotUse.IsBookkeeping(e.Step)).ToList();
     }
 
     /// <summary>
@@ -2247,7 +2277,7 @@ public sealed partial class RunPipeline(
             // that keeps failing): it may not escalate (it stays Planned and goes on by itself once the cause is gone), so it is
             // told once per reason — one comment, one row — and not again while that row is still its last.
             var detail = Plans.PlanRelease.NotEvaluatedPrefix + reason;
-            if ((await ledger.HistoryAsync(known, ct)).LastOrDefault() is { Step: Steps.PlanHeld } last && last.Detail == detail)
+            if ((await ledger.HistoryAsync(known, ct)).LastOrDefault(e => !SlotUse.IsBookkeeping(e.Step)) is { Step: Steps.PlanHeld } last && last.Detail == detail)
             {
                 log.WriteLine($"[{known.State}] {id} still cannot be evaluated: {reason}; already commented");
                 return "held; already commented for this reason";
@@ -2427,7 +2457,8 @@ public sealed partial class RunPipeline(
     {
         var history = await ledger.HistoryAsync(item, ct);
         var at = history.FindLastIndex(e => e.Step is null && e.State == WorkState.Escalated);
-        var (escalated, last) = (history[at], history[at - 1]);
+        // The step the run reached: not a slot's bookkeeping (sc-25991), which a worker phase's end writes before the Escalated row.
+        var (escalated, last) = (history[at], history.Take(at).Last(e => !SlotUse.IsBookkeeping(e.Step)));
         var (reason, session) = (escalated.Detail, escalated.ClaudeSessionId);
         var lastState = $"{last.State}{(last.Step is null ? "" : $" (after step {last.Step})")} at {last.RecordedAt:u}";
         // A plan of several repositories (sc-25873) may be partly delivered: the record first, then the comment says the same.

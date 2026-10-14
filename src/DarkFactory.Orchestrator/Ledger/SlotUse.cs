@@ -26,7 +26,8 @@ public enum SlotUseKind
 /// <param name="Slot">The slot held, waited for or given up; null for a wait for any free one.</param>
 /// <param name="User">That slot's sandbox user; null with no slot.</param>
 /// <param name="What">What the worker phase does (<c>implement</c>, <c>run the new tests</c>, <c>plan</c>, …), in the pipeline's own words.</param>
-public sealed record SlotUse(SlotUseKind Kind, int? Slot, string? User, string What)
+/// <param name="Row">The ledger id of the row it was read from (0 when not read from one).</param>
+public sealed record SlotUse(SlotUseKind Kind, int? Slot, string? User, string What, long Row = 0)
 {
     public static readonly SlotUse None = new(SlotUseKind.None, null, null, "");
 
@@ -36,12 +37,23 @@ public sealed record SlotUse(SlotUseKind Kind, int? Slot, string? User, string W
     public static bool IsStep(string? step) =>
         step is RunPipeline.Steps.SlotWait or RunPipeline.Steps.SlotHeld or RunPipeline.Steps.SlotReleased;
 
+    /// <summary>
+    /// Whether <paramref name="step"/> is a worker slot's bookkeeping — the item's slot (<see cref="RunPipeline.Steps.Slot"/>,
+    /// sc-25989), a stop's record of a slot no longer configured (<see cref="RunPipeline.Steps.SlotLeft"/>) or the run's use of
+    /// it (<see cref="IsStep"/>, sc-25991). Such a row is written around a phase (a slot's release in the phase's <c>finally</c>,
+    /// before an escalation's row), so it is never "the step the item reached": every reader of an item's last row by position
+    /// passes over these (the escalation comment's last ledger state, a plan's "not evaluated" row still being its last, the
+    /// worker attempt's rows).
+    /// </summary>
+    public static bool IsBookkeeping(string? step) =>
+        step is RunPipeline.Steps.Slot or RunPipeline.Steps.SlotLeft || IsStep(step);
+
     /// <summary>A slot-use row's Detail.</summary>
     public static string Detail(int? slot, string? user, string what) => $"{slot?.ToString() ?? Any} {user ?? NoUser} {what}";
 
     /// <summary>The use the newest slot-use row of <paramref name="history"/> (one item's rows, oldest first) records; none without one.</summary>
     public static SlotUse Of(IEnumerable<LedgerEntry> history) =>
-        history.LastOrDefault(e => IsStep(e.Step)) is { } row ? Parse(row.Step!, row.Detail) : None;
+        history.LastOrDefault(e => IsStep(e.Step)) is { } row ? Parse(row.Step!, row.Detail) with { Row = row.Id } : None;
 
     private static SlotUse Parse(string step, string? detail)
     {
