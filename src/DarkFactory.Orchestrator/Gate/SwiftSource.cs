@@ -242,6 +242,14 @@ public static class SwiftSource
         bool LineStart(int i) => i == from || Word(i - 1) == ";" || text.AsSpan(tokens[i - 1].End, tokens[i].Start - tokens[i - 1].End).Contains('\n');
         // After a body ({ … }) a declaration may follow on the same line: `struct S { @Test func a() {} @Test func b() {} }`.
         bool AfterBody(int i) => i > from && Word(i - 1) == "}";
+        bool ModifiersThenDeclaration(int i)
+        {
+            while (i < to && tokens[i].Kind == Kind.Ident && Modifiers.Contains(Word(i)))
+            {
+                i++;
+            }
+            return i < to && tokens[i].Kind == Kind.Ident && DeclKeywords.Contains(Word(i));
+        }
         var items = new List<SwiftItem>();
         int start = -1, end = -1, bodyOpen = -1;
         string keyword = "", name = "";
@@ -276,7 +284,10 @@ public static class SwiftSource
             var classModifier = word == "class" && (AfterClassModifier.Contains(next) || Modifiers.Contains(next));
             var actorWord = word == "actor" && !IsActorDeclaration(text, tokens, i, to);
             var declares = token.Kind == Kind.Ident && !classModifier && !actorWord && (DeclKeywords.Contains(word) || word.StartsWith('#'));
-            var prefix = (word == "@" && i + 1 < to && tokens[i + 1].Kind == Kind.Ident) || classModifier || (token.Kind == Kind.Ident && IsLeadingModifier(word));
+            // A modifier that may also continue a signature (`async`, `consuming`, …) starts a declaration only when modifiers
+            // and then a declaration keyword follow it (`async func h()` on its own line, not `    async throws -> Int`).
+            var prefix = (word == "@" && i + 1 < to && tokens[i + 1].Kind == Kind.Ident) || classModifier
+                || (token.Kind == Kind.Ident && (IsLeadingModifier(word) || (Modifiers.Contains(word) && ModifiersThenDeclaration(i))));
             if ((declares || prefix) && start >= 0 && keyword.Length > 0 && (LineStart(i) || AfterBody(i)))
             {
                 Flush();
@@ -646,7 +657,7 @@ public static class SwiftSource
     private static readonly HashSet<string> TypeKeywords = new(StringComparer.Ordinal) { "struct", "class", "enum", "actor", "extension", "protocol" };
 
     /// <summary>Words that may stand between a declaration's attributes and its keyword.</summary>
-    private static readonly HashSet<string> Modifiers = new(StringComparer.Ordinal)
+    internal static readonly HashSet<string> Modifiers = new(StringComparer.Ordinal)
     {
         "public", "private", "fileprivate", "internal", "open", "package", "static", "final", "override", "mutating", "nonmutating",
         "nonisolated", "isolated", "required", "convenience", "dynamic", "lazy", "weak", "unowned", "optional", "indirect", "distributed",

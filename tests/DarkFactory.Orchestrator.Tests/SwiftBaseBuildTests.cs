@@ -56,6 +56,28 @@ public class SwiftLayoutTests
         Assert.Throws<FormatException>(() => SwiftSource.Layout("struct S {\n"));
     }
 
+    public static TheoryData<string> EveryModifier => new(SwiftSource.Modifiers.Order(StringComparer.Ordinal));
+
+    [Theory]
+    [MemberData(nameof(EveryModifier))]
+    public void A_declaration_starting_with_any_modifier_on_its_own_line_is_an_item_of_its_own(string modifier)
+    {
+        var text = $"@Test func t() {{}}\n{modifier} func h() {{ x }}";
+
+        var layout = SwiftSource.Layout(text);
+
+        Assert.Equal(["func t: @Test func t() {}", $"func h: {modifier} func h() {{ x }}"], Items(layout.Items, text));
+    }
+
+    [Fact]
+    public void A_modifier_that_continues_a_signature_stays_in_its_declaration()
+    {
+        const string text = "func f()\n    async throws -> Int { 1 }\nfunc g(_ x: consuming S)\n    async {}\n";
+
+        Assert.Equal(["func f: func f()⏎    async throws -> Int { 1 }", "func g: func g(_ x: consuming S)⏎    async {}"],
+            Items(SwiftSource.Layout(text).Items, text));
+    }
+
     [Fact]
     public void A_position_is_placed_in_the_innermost_declaration_and_columns_count_utf8_bytes_as_swiftcs_do()
     {
@@ -281,6 +303,135 @@ public class SwiftBaseBuildTests
         }
     }
 
+    public static TheoryData<string, string> ClashesWithTheBase => new()
+    {
+        { "make();", "ambiguous use of 'make()'" },
+        { "make();", "ambiguous reference to member 'make()'" },
+        { "func make", "invalid redeclaration of 'make()'" },
+    };
+
+    [Theory]
+    [MemberData(nameof(ClashesWithTheBase))]
+    public async Task A_clash_with_a_declaration_the_base_has_is_an_error_never_not_built(string at, string message)
+    {
+        // The base's production code has `public func make() -> String` too: the test's helper clashes with it there.
+        const string tests = Imports + "func make() -> Int { 1 }\n@Test func t() { let x = make(); #expect(x == 1) }\n";
+        var runner = Runner(tests);
+        runner.Answer = spec => Stage(spec) == "head" ? Passing(spec) : Stage(spec) == "base" ? FakeTestRunner.NotBuilt(At(spec, tests, at, message)) : Failing(spec);
+
+        var result = await Check(runner);
+
+        Assert.True(result.Outcome == NewTestsOutcome.Error, $"{message}: {result.Outcome}: {result.Reason}");
+        Assert.Contains(message, result.Reason);
+        Assert.DoesNotContain(runner.Runs, r => Stage(r).StartsWith("base-retry", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task A_build_tool_plugins_error_in_a_new_test_is_an_error_never_not_built()
+    {
+        const string tests = Imports + "@Test func t() { #expect(count(\"a\") == 1) }\n";
+        var runner = Runner(tests);
+        runner.Answer = spec => Stage(spec) == "head" ? Passing(spec)
+            : FakeTestRunner.NotBuilt(At(spec, tests, "count(", "Identifier Name Violation: too short (identifier_name)") with { Code = SwiftNewTests.PluginCode });
+
+        var result = await Check(runner);
+
+        Assert.True(result.Outcome == NewTestsOutcome.Error, $"{result.Outcome}: {result.Reason}");
+        Assert.Contains("(identifier_name)", result.Reason);
+    }
+
+    [Fact]
+    public async Task A_header_error_in_a_type_an_earlier_retry_took_a_member_out_of_is_unremovable_so_its_tests_stay_unproven()
+    {
+        // Stage 1: `area` does not compile on the base and is left out; stage 2: without it Sq no longer conforms to
+        // Shape — the overlay's own doing, not something the base lacks.
+        const string tests = Imports + "struct Sq: Shape {\n    var area: Int { side * side }\n    @Test func t() { #expect(Sq().area == 0) }\n}\n"
+            + "@Test func blank() { #expect(count(\"\") == 0) }\n";
+        var runner = Runner(tests);
+        runner.Answer = spec => Stage(spec) switch
+        {
+            "head" => Passing(spec),
+            "base" => FakeTestRunner.NotBuilt(At(spec, tests, "side * side", "cannot find 'side' in scope")),
+            "base-retry" => FakeTestRunner.NotBuilt(At(spec, tests, "Sq: Shape", "type 'Sq' does not conform to protocol 'Shape'")),
+            _ => Failing(spec),
+        };
+
+        var result = await Check(runner);
+
+        Assert.True(result.Outcome == NewTestsOutcome.Rejected, $"{result.Outcome}: {result.Reason}");
+        Assert.Equal([("WordsTests.Sq/t()", "unproven"), ("WordsTests.blank()", "unproven")],
+            result.Tests.Select(t => (t.Test, t.Base)).OrderBy(t => t.Test, StringComparer.Ordinal));
+        Assert.DoesNotContain(runner.Runs, r => Stage(r) == "base-retry-2");
+        Assert.DoesNotContain("var area", runner.Runs.Single(r => Stage(r) == "base-retry").Replacements[TestFile]);
+    }
+
+    [Fact]
+    public void Every_other_line_reporting_an_error_is_one_with_no_file_and_a_plugins_is_not_the_compilers()
+    {
+        const string log = """
+            <unknown>:0: error: unable to load standard library for target 'arm64-apple-macosx'
+            /x.c:1:10: fatal error: 'y.h' file not found
+            /work/wt/Tests/WordsTests/WordsTests.swift:3:1: fatal error: module map file not found
+            clang: error: linker command failed with exit code 1 (use -v to see invocation)
+            Tests/WordsTests/WordsTests.swift:3:4: error: relative
+            fatal error: too many errors emitted, stopping now
+               |      `- error: cannot find 'x' in scope
+            /work/wt/Tests/WordsTests/WordsTests.swift:4:1: error: Line Length Violation: Line should be 120 characters or less (line_length)
+            warning: nothing to see
+            """;
+
+        Assert.Equal(
+        [
+            new BuildError(null, 0, 0, "swiftc", "<unknown>:0: error: unable to load standard library for target 'arm64-apple-macosx'"),
+            new BuildError(null, 1, 10, "swiftc", "'y.h' file not found"),
+            new BuildError("Tests/WordsTests/WordsTests.swift", 3, 1, "swiftc", "module map file not found"),
+            new BuildError(null, 0, 0, "swiftc", "clang: error: linker command failed with exit code 1 (use -v to see invocation)"),
+            new BuildError(null, 0, 0, "swiftc", "Tests/WordsTests/WordsTests.swift:3:4: error: relative"),
+            new BuildError(null, 0, 0, "swiftc", "fatal error: too many errors emitted, stopping now"),
+            new BuildError("Tests/WordsTests/WordsTests.swift", 4, 1, SwiftNewTests.PluginCode, "Line Length Violation: Line should be 120 characters or less (line_length)"),
+        ], new SwiftNewTests().ParseBuildErrors(log, ["/work/wt"]));
+    }
+
+    [Fact]
+    public void An_error_printed_under_the_worktrees_resolved_path_is_placed_in_the_worktree()
+    {
+        var real = Directory.CreateTempSubdirectory("df-swiftreal-").FullName;
+        var link = real + "-link";
+        try
+        {
+            Directory.CreateSymbolicLink(link, real);
+            Directory.CreateDirectory(Path.Combine(real, "wt"));
+
+            // The root given through the link, the compiler printing the resolved path (and the other way round).
+            Assert.Equal([new BuildError("Tests/A.swift", 1, 2, "swiftc", "x")],
+                new SwiftNewTests().ParseBuildErrors($"{SwiftNewTests.Resolved(real)}/wt/Tests/A.swift:1:2: error: x", [$"{link}/wt"]));
+            Assert.Equal([new BuildError("Tests/A.swift", 1, 2, "swiftc", "x")],
+                new SwiftNewTests().ParseBuildErrors($"{link}/wt/Tests/A.swift:1:2: error: x", [$"{real}/wt"]));
+        }
+        finally
+        {
+            File.Delete(link);
+            Directory.Delete(real, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void On_macos_an_error_under_private_var_is_placed_in_a_worktree_under_var()
+    {
+        Assert.SkipUnless(OperatingSystem.IsMacOS(), "/var is a link to /private/var on macOS only");
+        var root = Path.Combine("/var", "tmp", $"df-wt-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            Assert.Equal([new BuildError("Tests/A.swift", 1, 2, "swiftc", "x")],
+                new SwiftNewTests().ParseBuildErrors($"/private{root}/Tests/A.swift:1:2: error: x", [root]));
+        }
+        finally
+        {
+            Directory.Delete(root);
+        }
+    }
+
     [Fact]
     public void Swiftpms_echo_of_a_failed_compiler_job_is_no_error_of_its_own_but_a_crashed_one_is()
     {
@@ -408,5 +559,38 @@ public class SwiftBaseBuildRunnerTests : IDisposable
         Assert.Contains("Sources/Words/Words.swift", error.Reason);
         Assert.Contains("cannot find 'nope' in scope", error.Reason);
         Assert.Empty(Directory.EnumerateDirectories(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name)));
+    }
+    [Fact]
+    public async Task With_swift_a_clash_with_the_bases_declaration_is_an_error_and_a_header_error_after_a_retry_is_unproven()
+    {
+        Assert.SkipUnless(HasSwift.Value, "swift is not installed");
+        Write("Package.swift", SwiftIdentifyTests.Manifest);
+        Write("Sources/Words/Words.swift", SwiftIdentifyTests.BaseLibrary + "public func make() -> String { \"\" }\npublic protocol Shape { var area: Int { get } }\n");
+        Write(SwiftIdentifyTests.TestFile, SwiftIdentifyTests.BaseTests);
+        Write(".gitignore", ".build/\n");
+        var baseSha = CommitAndPush("base", "main");
+
+        // The head drops the library's make(); the tests declare their own. On the base the two clash: swiftc says
+        // "ambiguous use of 'make()'" inside the new test — something the base HAS, so no evidence: an error.
+        TestGit.Run(_seed, "checkout", "-q", "-b", "factory/sc-8");
+        Write("Sources/Words/Words.swift", SwiftIdentifyTests.FixedLibrary + "public protocol Shape { var area: Int { get } }\n");
+        Write(SwiftIdentifyTests.TestFile, SwiftIdentifyTests.BaseTests
+            + "func make() -> Int { 1 }\n@Test func made() { let x = make(); #expect(x == 1) }\n@Test func blank() { #expect(count(\"\") == 0) }\n");
+        var clash = await Check(baseSha, CommitAndPush("clash", "factory/sc-8"));
+
+        Assert.True(clash.Outcome == NewTestsOutcome.Error, $"{clash.Outcome}: {clash.Reason}");
+        Assert.Contains("ambiguous use of 'make()'", clash.Reason);
+
+        // In stages: `area` uses `side`, which the base lacks, and is left out; without it Sq does not conform to Shape,
+        // at its header — the overlay's own doing, so Sq's test stays unproven, never not-built.
+        TestGit.Run(_seed, "checkout", "-q", "-b", "factory/sc-9", "main");
+        Write("Sources/Words/Words.swift", SwiftIdentifyTests.FixedLibrary + "public func make() -> String { \"\" }\npublic protocol Shape { var area: Int { get } }\npublic let side = 2\n");
+        Write(SwiftIdentifyTests.TestFile, SwiftIdentifyTests.BaseTests
+            + "struct Sq: Shape {\n    var area: Int { side * side }\n    @Test func t() { #expect(count(\"\") == 0) }\n}\n@Test func blank() { #expect(count(\"\") == 0) }\n");
+        var staged = await Check(baseSha, CommitAndPush("square", "factory/sc-9"));
+
+        Assert.True(staged.Outcome == NewTestsOutcome.Rejected, $"{staged.Outcome}: {staged.Reason}");
+        Assert.True(staged.Tests.Single(t => t.Test == "WordsTests.Sq/t()").Base == "unproven", $"{staged.Reason} / {string.Join(", ", staged.BaseRemoved)}");
+        Assert.Contains("does not conform to protocol 'Shape'", staged.Reason);
     }
 }

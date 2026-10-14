@@ -12,6 +12,12 @@ public sealed record SwiftNewTestSet(IReadOnlyList<ChangedFile> TestFiles, IRead
     : NewTestSet(TestFiles, Tests, Unisolable)
 {
     public IReadOnlyDictionary<string, (string Path, string Key)> Locations { get; init; } = new Dictionary<string, (string, string)>(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Each applied <c>.swift</c> test file as the head has it (the base run applies it so): what a retry's file, with
+    /// what did not compile left out, is compared with to tell which types the overlay itself changed.
+    /// </summary>
+    public IReadOnlyDictionary<string, string> Originals { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
 }
 
 /// <summary>
@@ -304,8 +310,17 @@ public sealed class SwiftNewTests : INewTestStrategy
             }
         }
 
+        var originals = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var path in testFiles.Where(f => !f.Deleted).Select(f => f.NewPath!).Where(p => Understands(p) && !IsManifest(p)).Distinct(StringComparer.Ordinal))
+        {
+            if (await head.ReadAsync(path, ct) is { } text)
+            {
+                originals[path] = text;
+            }
+        }
         return new SwiftNewTestSet(testFiles, news.Keys.ToList(), problems)
         {
+            Originals = originals,
             Projects = news.ToDictionary(kv => kv.Key, kv => kv.Value.Package!.ManifestPath, StringComparer.Ordinal),
             Locations = news.Keys.ToDictionary(id => id, id => locations[id], StringComparer.Ordinal),
         };
@@ -480,10 +495,16 @@ public sealed class SwiftNewTests : INewTestStrategy
             : TestCaseResult.Passed;
     }
 
-    /// <summary>A located compiler error: <c>/abs/File.swift:3:28: error: message</c>.</summary>
-    private static readonly Regex LocatedError = new(@"^(?<file>/.+?):(?<line>\d{1,9}):(?<col>\d{1,9}): error: (?<message>.*)$", RegexOptions.CultureInvariant);
+    /// <summary>A located compiler error: <c>/abs/File.swift:3:28: error: message</c> (or <c>fatal error:</c>, clang's).</summary>
+    private static readonly Regex LocatedError = new(@"^(?<file>/.+?):(?<line>\d{1,9}):(?<col>\d{1,9}): (?:fatal )?error: (?<message>.*)$", RegexOptions.CultureInvariant);
 
-    private static readonly Regex UnlocatedError = new(@"^error: (?<message>.*)$", RegexOptions.CultureInvariant);
+    /// <summary>
+    /// Any other line that reports an error: at its start (<c>error: …</c>, <c>fatal error: …</c>) or after a <c>: </c>
+    /// (<c>&lt;unknown&gt;:0: error: …</c>, <c>clang: error: …</c>, a relative <c>Tests/X.swift:1:2: error: …</c>). Such
+    /// a line names no file in the worktree that an error can be placed in, so it is an error with no file. The excerpt
+    /// lines swiftc prints under an error (<c>|  `- error: …</c>) do not match: there <c>error:</c> follows <c>- </c>.
+    /// </summary>
+    private static readonly Regex OtherError = new(@"(?:^|: )(?:fatal )?error: (?<message>.*)$", RegexOptions.CultureInvariant);
 
     /// <summary>
     /// SwiftPM's echo of a compiler job that reported errors and exited 1 (<c>error: emit-module command failed with exit
@@ -493,14 +514,26 @@ public sealed class SwiftNewTests : INewTestStrategy
     private static readonly Regex FailedJob = new(@"^error: [a-z-]+ command failed with exit code 1 \(use -v to see invocation\)$", RegexOptions.CultureInvariant);
 
     /// <summary>
+    /// A located error that ends in a rule tag (<c>… (line_length)</c>): what a build-tool plugin such as SwiftLint prints
+    /// in swiftc's format. It is not the compiler's, so it says nothing about whether a new test builds on the base: it
+    /// keeps its file but takes the code <see cref="PluginCode"/>, which is unattributable.
+    /// </summary>
+    private static readonly Regex RuleTag = new(@" \([a-z][a-z0-9_]*\)$", RegexOptions.CultureInvariant);
+
+    /// <summary>The code of an error a build-tool plugin reported (<see cref="RuleTag"/>).</summary>
+    public const string PluginCode = "plugin";
+
+    /// <summary>
     /// The errors in <c>swift build</c>'s output: each line <c>/abs/path:line:col: error: message</c> (the file made
-    /// relative to one of <paramref name="roots"/>, the worktree; outside it, no path) and each <c>error: message</c> line
-    /// (no file) but SwiftPM's echo of a failed compiler job (<see cref="FailedJob"/>); code <c>swiftc</c>. The source
-    /// excerpt the compiler prints under an error is not read again. Why this text and not another format: SwiftPM's
-    /// <c>swift build</c> has no machine-readable diagnostics on a stable toolchain (swiftc's
-    /// <c>-serialize-diagnostics</c> is clang's binary bitstream, and would add a flag to every build), while the
-    /// <c>file:line:col: error:</c> header line is the same in both of swiftc's diagnostic styles (<c>swift</c>, the
-    /// default since 5.9, and <c>llvm</c>); a build that fails without one names no error, which is unattributable.
+    /// relative to one of <paramref name="roots"/>, the worktree, also when the compiler prints the root's resolved path —
+    /// <c>/private/var/…</c> for <c>/var/…</c>; outside it, no path; code <c>swiftc</c>, or <see cref="PluginCode"/> when
+    /// it ends in a rule tag) and every other line reporting an error (<see cref="OtherError"/>: no file) but SwiftPM's echo
+    /// of a failed compiler job (<see cref="FailedJob"/>). The source excerpt the compiler prints under an error is not
+    /// read again. Why this text and not another format: SwiftPM's <c>swift build</c> has no machine-readable diagnostics
+    /// on a stable toolchain (swiftc's <c>-serialize-diagnostics</c> is clang's binary bitstream, and would add a flag to
+    /// every build), while the <c>file:line:col: error:</c> header line is the same in both of swiftc's diagnostic styles
+    /// (<c>swift</c>, the default since 5.9, and <c>llvm</c>); a build that fails without one names no error, which is
+    /// unattributable.
     /// </summary>
     public IReadOnlyList<BuildError> ParseBuildErrors(string log, IReadOnlyList<string> roots)
     {
@@ -509,12 +542,13 @@ public sealed class SwiftNewTests : INewTestStrategy
         {
             if (LocatedError.Match(line) is { Success: true } located)
             {
+                var message = located.Groups["message"].Value;
                 errors.Add(new BuildError(RelativeTo(located.Groups["file"].Value, roots), int.Parse(located.Groups["line"].Value, System.Globalization.CultureInfo.InvariantCulture),
-                    int.Parse(located.Groups["col"].Value, System.Globalization.CultureInfo.InvariantCulture), "swiftc", located.Groups["message"].Value));
+                    int.Parse(located.Groups["col"].Value, System.Globalization.CultureInfo.InvariantCulture), RuleTag.IsMatch(message) ? PluginCode : "swiftc", message));
             }
-            else if (UnlocatedError.Match(line) is { Success: true } bare && !FailedJob.IsMatch(line))
+            else if (OtherError.Match(line) is { Success: true } other && !FailedJob.IsMatch(line))
             {
-                errors.Add(new BuildError(null, 0, 0, "swiftc", bare.Groups["message"].Value));
+                errors.Add(new BuildError(null, 0, 0, "swiftc", line.StartsWith("error: ", StringComparison.Ordinal) ? other.Groups["message"].Value : line.Trim()));
             }
         }
         return errors.Distinct().ToList();
@@ -523,15 +557,55 @@ public sealed class SwiftNewTests : INewTestStrategy
     private static string? RelativeTo(string file, IReadOnlyList<string> roots)
     {
         var full = Path.GetFullPath(file);
+        var files = new[] { full, Resolved(full) }.Distinct(StringComparer.Ordinal).ToList();
         foreach (var root in roots)
         {
-            var prefix = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)) + Path.DirectorySeparatorChar;
-            if (full.StartsWith(prefix, StringComparison.Ordinal))
+            var rootFull = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
+            foreach (var prefix in new[] { rootFull, Resolved(rootFull) }.Distinct(StringComparer.Ordinal).Select(r => r + Path.DirectorySeparatorChar))
             {
-                return full[prefix.Length..].Replace(Path.DirectorySeparatorChar, '/');
+                if (files.FirstOrDefault(f => f.StartsWith(prefix, StringComparison.Ordinal)) is { } match)
+                {
+                    return match[prefix.Length..].Replace(Path.DirectorySeparatorChar, '/');
+                }
             }
         }
         return null;
+    }
+
+    /// <summary>
+    /// <paramref name="path"/> with every symbolic link among its existing directories resolved (<c>/var</c> is
+    /// <c>/private/var</c> on macOS, as swiftc prints it); the part that does not exist is kept as it is.
+    /// </summary>
+    internal static string Resolved(string path) => Resolved(path, 0);
+
+    private static string Resolved(string path, int links)
+    {
+        var parts = Path.TrimEndingDirectorySeparator(path).Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
+        var current = Path.GetPathRoot(path) ?? "/";
+        for (var n = 0; n < parts.Length; n++)
+        {
+            var next = Path.Combine(current, parts[n]);
+            var rest = parts[(n + 1)..];
+            try
+            {
+                FileSystemInfo info = Directory.Exists(next) ? new DirectoryInfo(next) : new FileInfo(next);
+                if (!info.Exists || links >= 40)
+                {
+                    return Path.Combine([next, .. rest]);
+                }
+                if (info.LinkTarget is not null && info.ResolveLinkTarget(returnFinalTarget: true) is { } target)
+                {
+                    // The target may itself lie under a link (`/var/folders/…` is `/private/var/folders/…`).
+                    return Resolved(Path.Combine([target.FullName, .. rest]), links + 1);
+                }
+                current = next;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                return Path.Combine([next, .. rest]);
+            }
+        }
+        return current;
     }
 
     /// <summary>
@@ -545,7 +619,10 @@ public sealed class SwiftNewTests : INewTestStrategy
     /// base. The retry's files leave every outermost unit out: a helper, another declaration or an <c>import</c> (a module
     /// the base lacks) that did not compile, so the tests that do not need it get their real results, and a test that does
     /// is named by the next stage. An error outside every declaration, between a type's members, or on a
-    /// conditional-compilation line (nothing a test lacks on the base shows there) is unremovable.
+    /// conditional-compilation line (nothing a test lacks on the base shows there) is unremovable, and so is one in the
+    /// header of a type an earlier retry took something out of (<see cref="SwiftNewTestSet.Originals"/>: the overlay's own
+    /// doing). An ambiguity or redeclaration (a clash with a declaration the base has) and a build-tool plugin's error are
+    /// unattributable wherever they are.
     /// </summary>
     public BuildFailure ExplainBuildFailure(NewTestSet set, IReadOnlyDictionary<string, string> applied, IReadOnlyList<BuildError> errors, IReadOnlyList<string> tests)
     {
@@ -559,7 +636,10 @@ public sealed class SwiftNewTests : INewTestStrategy
         }
         foreach (var error in errors)
         {
-            if (swift is null || error.Path is not { } path || !Understands(path) || IsManifest(path) || !applied.TryGetValue(path, out var text))
+            // An ambiguity or a redeclaration is a clash with something the base HAS (its production code declares the name
+            // too): it says nothing about what a new test lacks there. A plugin's error is not the compiler's.
+            if (swift is null || error.Path is not { } path || !Understands(path) || IsManifest(path) || !applied.TryGetValue(path, out var text)
+                || error.Code != "swiftc" || BaseHasIt.IsMatch(error.Message))
             {
                 unattributable.Add(error.ToString());
                 continue;
@@ -586,6 +666,13 @@ public sealed class SwiftNewTests : INewTestStrategy
             else if (last is null || last.IsDirective || (last.BodyOpen >= 0 && position >= last.BodyOpen))
             {
                 unremovable.Add(error.ToString());
+            }
+            else if (last.IsType && (!swift.Originals.TryGetValue(path, out var original) || ChangedTypes(original, file.Layout).Contains(last.Name)))
+            {
+                // A header error (`does not conform to protocol`) in a type an earlier stage took members out of: the
+                // overlay's own doing, not something the base lacks. Nor can a header be judged in a file whose head
+                // version is not known.
+                unremovable.Add($"{error} (in the header of {last.Keyword} {last.Name}, which an earlier retry took something out of: the overlay's own doing)");
             }
             else
             {
@@ -626,6 +713,45 @@ public sealed class SwiftNewTests : INewTestStrategy
             replacements[path] = rewritten.ToString();
         }
         return new BuildFailure(tests.Where(notBuilt.Contains).ToList(), unattributable, unremovable, removed, replacements);
+    }
+
+    /// <summary>An error message that names a clash with a declaration the base has (<c>ambiguous use of</c>, <c>invalid redeclaration of</c>).</summary>
+    private static readonly Regex BaseHasIt = new(@"\bambiguous\b|^invalid redeclaration\b", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+
+    /// <summary>
+    /// The names of the types (and extensions) whose body differs between the head's version of a file and the applied
+    /// one, or that the applied one no longer has: the types an earlier retry took something out of. Matched by the chain
+    /// of names from the top level; an original that cannot be laid out counts every type of the applied file as changed.
+    /// </summary>
+    private static HashSet<string> ChangedTypes(string original, SwiftLayout applied)
+    {
+        var changed = new HashSet<string>(StringComparer.Ordinal);
+        if (original == applied.Text)
+        {
+            return changed;
+        }
+        static IEnumerable<(string Chain, SwiftItem Item, string Body)> Types(SwiftLayout layout, IReadOnlyList<SwiftItem> items, string chain) =>
+            items.Where(i => i.IsType && i.BodyOpen >= 0).SelectMany(i => Types(layout, i.Children, $"{chain}/{i.Keyword} {i.Name}")
+                .Prepend(($"{chain}/{i.Keyword} {i.Name}", i, layout.Text[i.BodyOpen..i.End])));
+        SwiftLayout head;
+        try
+        {
+            head = SwiftSource.Layout(original);
+        }
+        catch (FormatException)
+        {
+            changed.UnionWith(Types(applied, applied.Items, "").Select(t => t.Item.Name));
+            return changed;
+        }
+        var now = Types(applied, applied.Items, "").ToLookup(t => t.Chain, t => t.Body, StringComparer.Ordinal);
+        foreach (var (chain, item, body) in Types(head, head.Items, ""))
+        {
+            if (!now[chain].Contains(body, StringComparer.Ordinal))
+            {
+                changed.Add(item.Name);
+            }
+        }
+        return changed;
     }
 
     private static string Describe(SwiftLayout layout, SwiftItem item) =>
