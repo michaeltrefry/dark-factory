@@ -200,10 +200,19 @@ Claude Code headless workers through the Weave router.
   the merge (sc-25877, `FACTORY_E2E_P4_CARGO_MERGE_STORY`: a test of new code, `not-built` on the base and passing on the head,
   `new-tests` `pass`, a `Merge` gate row, `gate-passed`, the pull request merged; it leaves a crate per run under the sandbox's
   `e2e-rust-merged/`).
-  Phase 4b's P4b-AT1, first version (sc-25981, `KanbanAcceptanceTests`, `FACTORY_E2E_P4B_KANBAN_ITEM` + `FACTORY_E2E_P4B_KANBAN_PROJECT`):
-  `factory run kb-N` on a Ready item of a watched KanbanBoard project — its key given once, the item claimed on the real board
-  (the factory's marker, read back) and moved out of Ready, the pull request opened from `factory/kb-N` and it and the branch
-  linked on the item under their kinds; a second run writes neither claim nor link again. Checked up to "pull request opened".
+  Phase 4b's P4b-AT1 (sc-25981, sc-25992, `KanbanAcceptanceTests`, `FACTORY_E2E_P4B_KANBAN_ITEM` + `FACTORY_E2E_P4B_KANBAN_PROJECT`):
+  one `factory run kb-N` takes a Ready item of a watched KanbanBoard project to a merged pull request with no human — its key
+  given once, claimed on the real board (the factory's marker), Intake → Implement … MergeGate → Merge → Watch with typed
+  outcomes, the pull request from `factory/kb-N` merged at the Merge row's commit, the item `Done` with the pull request and the
+  branch linked under their kinds and exactly one comment equal to `LedgerReport.MergedCloseout`'s rendering of the rows before
+  the posted `closeout`; a second run writes no claim, link or closeout again. P4b-AT4 (`KanbanAcceptanceTests.P4b_AT4_…`):
+  `factory work` with KanbanBoard alone claims the item and opens its pull request (on GitHub, linked with the branch), then
+  `factory stop --item kb-N` stops it. P4b-AT7 (sc-25992, docs/acceptance.md "P4b-AT7 — defaults"): one live test per earlier
+  phase re-run with default settings; `FACTORY_E2E_P4B_DEFAULTS=1` makes the shared harness (`E2e.StartAsync`, `E2e.Options`)
+  fail a test before it starts unless `Kanban:Watch:Projects`, `Kanban:WebUrl` and a Kanban write token from config or env are
+  unset (a keychain write token is hidden from the run's options) and `Worker:Slots` and `Intake:MaxConcurrentRuns` are 1
+  (`E2e.DefaultsProblems`; `DefaultsGuardTests`, not live). Every live test SKIPS when its opt-in, a credential or a variable is
+  missing (the convention since Phase 1, kept): skipped is not passed.
   P4b-AT2 (sc-25984, `KanbanPlanAcceptanceTests`, `FACTORY_E2E_P4B_PLAN_KANBAN_ITEM` + `FACTORY_E2E_P4B_KANBAN_PROJECT`): a real
   planner plans a `plan`-labelled Kanban item into at least 3 items with a dependency chain (else INCONCLUSIVE,
   `PlanLive.ChainProblem`) — each one item of the real board, in the plan item's project and epic, in `Backlog`, marked as planned
@@ -260,7 +269,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional: without it the factory starts and every CodeGraph tool answers the reviewer an error result (recorded), triage gets no CodeGraph, and the merge gate's `risk-threshold` fails wherever a tier requires it (sc-25709), so no normal or protected change merges (`factory run` and `factory work` warn at start-up) |
 | `Kanban:McpUrl` | `https://kanban-mcp.trefry.net/mcp` (`OutboundHttp.KanbanDefaultMcpUrl`; an absolute http(s) URL naming no model provider; MCP Streamable HTTP): the Kanban upstream (sc-25707), offered to reviewers through their tool loop and to a plan item's planner session through the loopback proxy (`McpProfile.Planner`, sc-25870); never to triage sessions, whose proxy is started without it (`McpProfile.Triage`: the issue text is untrusted and the triage's answer is posted on the issue) |
 | `Kanban:Token` | env `FACTORY_KANBAN_TOKEN`, or keychain account `kanban-token`: a KanbanBoard PAT (`Authorization: Bearer`), owner-side only (E5). Optional: without it there is no Kanban upstream (not an error) |
-| `Kanban:WriteToken` | env `FACTORY_KANBAN_WRITE_TOKEN`, or keychain account `kanban-write-token` (sc-25981): the orchestrator's own KanbanBoard PAT, scope `full`, with which the Kanban work source claims, moves, comments on and links items. Owner-side only and apart from `Kanban:Token` (E2): it is read in one place (`WorkSourceRegistry.Kanban`), held by one client (`Gateway/KanbanWrites`) and is in no MCP upstream, profile, allowlist or proxy grant. Needed only to work a Kanban item (`factory run kb-N`, `factory kanban key`): missing, those print the reason and exit 2 |
+| `Kanban:WriteToken` | env `FACTORY_KANBAN_WRITE_TOKEN`, or keychain account `kanban-write-token` (sc-25981): the orchestrator's own KanbanBoard PAT, scope `full`, with which the Kanban work source claims, moves, comments on and links items. Owner-side only and apart from `Kanban:Token` (E2): equal to it is refused at start-up (`WorkSourceRegistry.EnsureKanbanTokensApart`, from `FactoryOptions.ValidateSettings` and again where the source is built; exit 2, naming the keys and neither token, sc-25992 — the read token reaches model sessions through the MCP proxy); it is read in one place (`WorkSourceRegistry.Kanban`), held by one client (`Gateway/KanbanWrites`) and is in no MCP upstream, profile, allowlist or proxy grant. Needed only to work a Kanban item (`factory run kb-N`, `factory kanban key`): missing, those print the reason and exit 2 |
 | `Kanban:Watch:Projects` | empty = watch nothing; comma-separated KanbanBoard project keys (each ≤ 24 characters, no spaces; upper-cased, once each; else refused at start-up naming the key). An item is in scope when its project is one of them. Set, it makes KanbanBoard a configured work source that `factory work` polls (sc-25982) and then needs `Kanban:WriteToken` (else refused at start-up); each key is checked on the board at start-up |
 | `Kanban:WebUrl` | `https://kanban.trefry.net/` (`OutboundHttp.KanbanDefaultWebUrl`; an absolute http(s) URL without credentials, query or fragment, naming no model provider): what a Kanban item's, epic's and document's link is built on (`KanbanLinks`: `?project=<id>[&epic=<id>]&item=<id>`) — KanbanBoard's MCP returns no URL, and nothing is requested from this address |
 | `Shortcut:ApiToken` | env `SHORTCUT_API_TOKEN`, or keychain account `shortcut-api-token`. Needed only to work Shortcut stories (sc-25982): with no Shortcut watch scope the factory starts without it, on its other work sources. With the token and no watch scope, `factory work` picks up no Shortcut story but still finishes the Shortcut items already in its ledger (a lane of its own); without the token it cannot, and warns at start-up when the ledger holds active ones |
@@ -401,8 +410,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   the scope.
 - Work sources are named by `ItemNaming` (`sc-<story>`, `gh-<key>`, `kb-<key>`: the ledger `Source`, external id, `factory/<id>` branch,
   `factory-<id>` worktree, `item:<id>` control scope); `factory run`/`--item` take any of them. The intake loop lists every source
-  in turn (`IntakeLane`: a lane's preparation, the issue triage, runs before any item of the poll), then runs the poll's items, up to
-  `Intake:MaxConcurrentRuns` at once; a triage and the items' worker phases share the sandbox user one at a time through its lock
+  in turn (`IntakeLane`: a lane's preparation, the issue triage, runs before any item the poll starts), then starts the poll's
+  items into the run capacity left by runs still in flight from earlier polls, up to `Intake:MaxConcurrentRuns` at once (a poll
+  does not wait for its runs, sc-25992: "Runs across polls" under "Intake failures"); a triage and the items' worker phases share each sandbox user (worker slot) one at a time through its lock
   ("Worker phases"). The merge queue is per repo across sources.
 - Several work sources (Phase 4b, sc-25982; `WorkSources/WorkSourceRegistry.cs`, E1): every place that needs a source takes it from
   ONE registry keyed by `ItemNaming` — `WorkSourceRegistry.Kinds`, one `WorkSourceKind` per `ItemNaming.All` entry (Shortcut,
@@ -442,7 +452,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   return at once; `GitHubIssueWorkSource` reads only the ledger and lists items of watched repositories), nothing is claimed, and
   the lane has no `Prepare` — only a WATCHED GitHub issues lane triages (`Prepare`), so no issue is triaged for an issues source
   that watches no repository (its lane exists whenever the workers' GitHub App is configured, i.e. always in `factory work`).
-  With any number of lanes the runs overlap only as `Intake:MaxConcurrentRuns` allows, and never in the sandbox ("Worker phases"). A source WITHOUT its credential gets no lane: after the ledger
+  With any number of lanes the runs overlap only as `Intake:MaxConcurrentRuns` allows, and in the sandbox only one worker phase per worker slot ("Worker phases", "Worker slots"). A source WITHOUT its credential gets no lane: after the ledger
   migration `factory work` prints one `warning:` per such source whose ledger still holds active (not Done, not Cancelled)
   items (`WorkSourceRegistry.UnreachableAsync`: the source, the count, the credential that brings it back) — those items
   cannot be finished, stopped or resumed until then, and the dashboard still lists them. `factory run <id>`
@@ -682,6 +692,15 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (as it does a `KanbanException` of that read) and exits 1, no stack trace (`FactoryRunner.RunCommandAsync`). `factory kanban
   key` likewise prints and exits 1 on a board refusal, an HTTP failure or timeout, and a ledger failure
   (`FactoryRunner.IsKanbanKeyFailure`). The spec is the item, its epic and the epic's documents; links are built on `Kanban:WebUrl`.
+  Comments (E3, E4; `KanbanWorkSource.CommentKey`): a comment's idempotency key is the SHA-256 of the item's board id, the item's
+  version when the comment is written and the body — board data only, never a ledger key or a factory counter. Two limits,
+  accepted and unlike Shortcut (whose comments carry no key): (1) the same words said again while the item's version has not
+  moved (a comment, a link and a claim leave it; a move or an edit bumps it) are dropped by the board, which answers the earlier
+  comment, and the factory counts them as posted — e.g. an identical escalation comment after a re-run that moved nothing; (2) a
+  retry of one comment after the version moved in between posts it a second time. No other board datum fixes (1) without
+  breaking the retry: the board's latest comment (a cursor of its comment list) moves with the factory's own comment, so a retry
+  after a lost answer would post again, and leaving the factory's own comments out of the cursor makes a repeat map to the
+  same key once more (sc-25992).
   Trust (E5, sc-25984): trust is a property of the SOURCE, declared once on its naming (`ItemNaming.Trusted`: Shortcut and Kanban
   true — the owner's boards — GitHub issues false, and false for any source that does not say, fail closed) and asked in one
   place, `WorkStory.UntrustedName` = the source is not trusted, or the item is planner-authored (`PlannerAuthored`: its
@@ -690,7 +709,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   answer: the spec in every worker prompt (`PromptFence.Spec`), the name in commit messages and pull request titles
   (`WorkStory.PublicName`) and bodies (`LedgerReport`), and what a worker's input counts as (`RunPipeline.SpecInput`). So a
   Kanban item's spec is unfenced instructions and its name goes on GitHub as written, like a Shortcut story's; only a trusted
-  source plans (`IWorkSource.PlansItems`).
+  source plans (`IWorkSource.PlansItems`). No default can trust (sc-25992): `IWorkSource.Naming` has no default implementation
+  and `WorkStory.Naming` is a required, non-nullable parameter, so a source or a story that does not name its source does not
+  compile (`SourceTrustTests.A_source_and_a_story_must_name_their_source_…`), and no Shortcut default sits outside `Shortcut/`.
   Epics (sc-25985, E4): a Kanban epic is a GUID too, and gets a ledger key of its own the same way — table `kanban_epics`
   (migration `KanbanEpics`; `KanbanEpicKey`: key, the epic's GUID under a unique index, its project's GUID), allocated by
   `KanbanKeys.EpicKeyAsync` when `ReadSpecAsync` first reads an item of the epic, so before the spec, the item's ledger row
@@ -776,7 +797,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   isolation"; directory
   `0700`, file created `0600`; the worker user reads it through the work root's inherited read ACL, which the owner checks
   with `/bin/ls -led` once the file is written — a `search` entry for `Worker:RunAs` on the directory and a `read` entry on the
-  file (`McpProxySessions.AclGrants`; no deny), else the session is not started, factory-wide, "re-run `sudo
+  file (`WorkerSandbox.Grants` over `WorkerSandbox.ListAclAsync`, the one ACL reader and parser, read up to
+  `WorkerSandbox.AclReads` times as every sandbox ACL check is, sc-25992; no deny), else the session is not started, factory-wide, "re-run `sudo
   scripts/setup-worker-user.sh`"; not checked with `Worker:RunAs=none`; outside the triage
   worktree, so the confined session cannot Read it into its transcript) after checkout and before launch, and when the session
   ends deletes it and revokes the credential (`McpProxyGrant.Dispose`: refused from then on); leftover files are swept before
@@ -992,6 +1014,21 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   paused or frozen factory's page says once more, in the deferral list, what holds new work.
   Tests: `IntakeDispatchTests` (signalled fake runs), `RunsInFlightTests` (the real loop over real pipelines, two at once: the
   freeze, the usage pause and a stale helper in one slot, each with both runs' ledger rows and the status).
+  Runs across polls (sc-25992, `IntakeLoop.StartPollAsync`): a poll does NOT wait for its runs — before, a poll ended only when
+  every run it started had, so one item waiting 30 minutes on CI held back every other lane's new items and every claim renewal
+  (once per poll) for as long. The loop now polls on its interval while runs are in flight: each poll renews every lane's claims
+  first (before any lane is prepared or listed: a triage waiting for a worker slot holds up no renewal), then — only while there
+  is free capacity (`Intake:MaxConcurrentRuns` minus the loop's runs in flight, `IntakeLoop.RunsInFlight`) — lists in-flight and
+  ready items and starts them into that capacity in the poll's order; with none free it lists and prepares nothing and the
+  earlier poll's dispatch keeps its place (it starts its next item when a run ends). An item the loop already has a run of is
+  never started again (an in-process in-flight set by external id, beside the item's run lock); a poll that lists supersedes the
+  previous poll's dispatch, which starts nothing more (its runs go on). The rules above (holds before each ready item, a
+  deferral, a factory-wide failure) apply to each poll's own dispatch. A run's end wakes the loop to re-read the usage pause, so
+  a run that paused the factory for usage still wakes it at the reset. Stopping `factory work` waits for the runs in flight, each
+  ending on the cancelled token as before. With `Intake:MaxConcurrentRuns` 1 the order is unchanged — a poll during the run
+  renews claims, finishes nothing new and starts nothing (E9). Tests: `IntakeDispatchTests` (`The_work_loop_polls_again_…`,
+  `A_poll_renews_the_claim_of_an_item_in_flight_…`, `A_poll_with_no_free_capacity_…`, `With_one_run_at_a_time_…`,
+  `Stopping_the_work_loop_waits_…`). `PollOnceAsync` (tests, and the old contract) is one poll waited for to its end.
 - Every state change is a committed ledger row before the next step (`WorkLedger.RecordAsync`), checked
   against the transition table in `Ledger/Lifecycle.cs` first; an illegal transition throws and writes nothing.
   New phases add handlers in `RunPipeline.Handlers`, not table rows (the exceptions, all Phase 4a's: `Plan → Planned`, a plan item
@@ -1388,8 +1425,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   dependent story's worktree holds its blockers' code.
   Merge queue: stays one queue per repository (not per repository and base): stories of one plan must serialise their merges into
   the changeset branch, which one queue gives; a queue per base would only let a plan's stories and default-branch items merge at
-  once, which the single-tenant worker sandbox (one run per machine) would not use, and would change the ledger-derived order and
-  the repo-keyed lock for nothing.
+  once — which, with several runs and worker slots at once (sc-25988, sc-25989), would let a plan's stories and default-branch
+  items of one repository merge at the same time. One queue per repository is kept deliberately (sc-25992): merges into one
+  repository stay one at a time whatever their base, and the ledger-derived order and the repo-keyed lock stay as they are.
   Changeset pull request: when `PlanRelease.Decide` is `Complete`, `PlannedAsync` (the waiting plan's run, GitHub's API only, no
   worker) reads GitHub's compare of the default branch and the changeset branch. Empty (no difference): `changeset-empty`, no pull
   request, and the plan is closed out as above saying so (`Planned → Done`). Before that compare, the plan item's newest `linked`
@@ -1690,10 +1728,11 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   worker user is inside a hold: Implement's and a fix round's Prepare/Restore/Reopen/Remove, the planner's seat (its
   `PrepareSeatAsync`/`RemoveSeatAsync` and their failure clean-up), a triage's worktree, the gate's test worktrees
   (`PrepareCommitAsync`, removal), and the three sweeps (a run's at its first worker phase, the triage's, the planner's).
-  Dispatch (`IntakeLoop`): a poll lists every lane, then runs its items — each lane's in-flight ones (stops first), then its
-  ready ones, each once — with up to `Intake:MaxConcurrentRuns` dispatchers, and ends when its runs have; with 1 (the default)
-  it is the serial loop it was. Claims are renewed in the listing, once per poll and lane, before any run of the poll starts
-  (`RenewClaimsAsync`, sc-25983), never per dispatched run. Still one run per item (the item's run lock) and one turn per repository (the merge queue).
+  Dispatch (`IntakeLoop`): a poll renews every lane's claims, then lists every lane and starts its items — each lane's in-flight
+  ones (stops first), then its ready ones, each once — into the capacity `Intake:MaxConcurrentRuns` leaves beside the runs still
+  in flight, and does not wait for them (sc-25992, "Runs across polls"); with 1 (the default) the runs are one after another as
+  they were. Claims are renewed once per poll and lane, also while runs are in flight (`RenewClaimsAsync`, sc-25983), never per
+  dispatched run. Still one run per item (the item's run lock) and one turn per repository (the merge queue).
   What stops a poll's new work still does with several runs in flight: after a run the freeze deferred no ready item of any
   lane and no further in-flight item of its lane is started; after a factory-wide failure nothing is; a factory-wide control
   set since the poll listed its work (the usage pause, a Pause of the factory, the freeze's row) is read before each ready item

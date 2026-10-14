@@ -494,14 +494,25 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     /// <summary><see cref="CloseToWorkerAsync(string, CancellationToken)"/>, the directory read back through <paramref name="list"/> (tests).</summary>
     internal async Task CloseToWorkerAsync(string path, Func<string, CancellationToken, Task<string>> list, CancellationToken ct)
     {
-        await RunChecked("/bin/chmod", ["-N", path], ct);
-        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        await CloseAsync(path, ct);
         var listing = await list(path, ct);
         if (!IsClosed(listing))
         {
             throw new InvalidOperationException(
                 $"{path} is still open to others than its owner after `chmod -N` and mode 0700 (ls -led: {listing.Trim().ReplaceLineEndings("; ")}), so {User} could reach what is in it.");
         }
+    }
+
+    /// <summary>
+    /// The one way the owner closes a directory of its own to every sandbox user (sc-25992: the clone locks', the slot locks' and
+    /// a slot's MCP session directory all start here): <c>chmod -N</c> removes every ACL entry — the work root's inherited read
+    /// entries among them, so nothing made in it later inherits one — and the mode becomes <c>0700</c>. Each caller then reads it
+    /// back for what it needs (<see cref="IsClosed"/>, or <see cref="OpenToOthers"/> once its own user's entries are added).
+    /// </summary>
+    private static async Task CloseAsync(string path, CancellationToken ct)
+    {
+        await RunChecked("/bin/chmod", ["-N", path], ct);
+        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
     }
 
     /// <summary>
@@ -529,8 +540,7 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     /// <summary><see cref="RestrictToWorkerAsync(string, CancellationToken)"/>, the directory read back through <paramref name="list"/> (tests).</summary>
     internal async Task RestrictToWorkerAsync(string path, Func<string, CancellationToken, Task<string>> list, CancellationToken ct)
     {
-        await RunChecked("/bin/chmod", ["-N", path], ct);
-        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        await CloseAsync(path, ct);
         await RunChecked("/bin/chmod", ["+a", $"user:{User} allow search", path], ct);
         await RunChecked("/bin/chmod", ["+a", $"user:{User} allow {InheritedReadRights}", path], ct);
         var listing = await list(path, ct);

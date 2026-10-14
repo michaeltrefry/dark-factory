@@ -588,11 +588,12 @@ public class McpProxyTests
         {
             seen.Add(p);
             return Task.FromResult(p.EndsWith(".json", StringComparison.Ordinal) ? "-rw-------  1 me staff 9 Oct 10 12:00 x\n" : granted);
-        });
+        }) { AclRetry = TimeSpan.Zero };
         var ex = await Assert.ThrowsAsync<WorkSources.FactoryUnavailableException>(() => missing.OpenAsync(Repo, McpProfile.Triage, CancellationToken.None));
         Assert.Contains("setup-worker-user.sh", ex.Message);
         Assert.Empty(Directory.EnumerateFiles(directory));
-        Assert.Equal(2, seen.Count);
+        // The directory once; the file read again (one retry rule with every sandbox ACL check, sc-25992) before it fails.
+        Assert.Equal(1 + Worker.WorkerSandbox.AclReads, seen.Count);
         // Without a worker user (Worker:RunAs=none) nothing is checked.
         await using (await new McpProxySessions(proxy, directory, null, (_, _) => throw new InvalidOperationException("not asked"))
             .OpenAsync(Repo, McpProfile.Triage, CancellationToken.None))
@@ -754,7 +755,26 @@ public class McpProxyTests
     [InlineData(" 0: user:_factory deny read\n 1: user:_factory allow read", "read", false)]
     [InlineData("-rw-------  1 me staff 9 Oct 10 12:00 user:_factory allow read", "read", false)]
     public void An_acl_listing_grants_a_right_only_through_an_allow_entry_for_that_user_and_no_deny(string listing, string right, bool grants) =>
-        Assert.Equal(grants, McpProxySessions.AclGrants(listing, "_factory", right));
+        Assert.Equal(grants, Worker.WorkerSandbox.Grants(listing, "_factory", right));
+
+    /// <summary>
+    /// sc-25992: one ACL reader (<c>/bin/ls -led</c>) and one way to close a directory to the sandbox users (<c>chmod -N</c>), both
+    /// in the sandbox class (WorkerSandbox.cs): the MCP session directories, the clone locks and the slot locks use them, not copies.
+    /// </summary>
+    [Fact]
+    public void The_acl_reader_and_the_directory_close_exist_once_in_the_orchestrator()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null && !File.Exists(Path.Combine(dir.FullName, "DarkFactory.slnx")))
+        {
+            dir = dir.Parent;
+        }
+        var sources = Directory.EnumerateFiles(Path.Combine(dir!.FullName, "src", "DarkFactory.Orchestrator"), "*.cs", SearchOption.AllDirectories)
+            .Where(f => !f.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}")).ToList();
+        IEnumerable<string> Using(string text) => sources.Where(f => File.ReadAllText(f).Contains(text, StringComparison.Ordinal)).Select(Path.GetFileName)!;
+        Assert.Equal(["WorkerSandbox.cs"], Using("\"/bin/ls\""));
+        Assert.Equal(["WorkerSandbox.cs"], Using("[\"-N\""));
+    }
 
     [Fact]
     public async Task A_failing_mcp_config_sweep_or_proxy_start_is_factory_wide()

@@ -782,7 +782,7 @@ public sealed class SessionCaptureTests : IAsyncLifetime
     }
 
     private static FakeWorkSource Stories() =>
-        new(new WorkStory(1, "List files", "List the files.", "feature", "https://app.shortcut.com/t/story/1"));
+        new(new WorkStory(1, "List files", "List the files.", "feature", "https://app.shortcut.com/t/story/1", ItemNaming.Shortcut));
 
     private sealed class Workspaces : IRepoWorkspace
     {

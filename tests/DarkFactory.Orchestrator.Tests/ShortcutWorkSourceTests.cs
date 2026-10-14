@@ -150,7 +150,7 @@ public class ShortcutWorkSourceTests
     public async Task Work_start_up_check_goes_through_the_work_source_interface()
     {
         // Any IWorkSource (E6), not only the Shortcut adapter: its own check's failure is what start-up reports.
-        var source = new FakeWorkSource(new WorkStory(1, "s", null, "chore", "u"))
+        var source = new FakeWorkSource(new WorkStory(1, "s", null, "chore", "u", ItemNaming.Shortcut))
         {
             ValidateScopeFails = new InvalidOperationException("board says no"),
         };

@@ -1,7 +1,10 @@
 namespace DarkFactory.Orchestrator.WorkSources;
 
 /// <summary>One work item (a Shortcut story, a Kanban item, or a triaged GitHub issue) as the orchestrator sees it.</summary>
-/// <param name="Naming">The item's source naming; null is a Shortcut story.</param>
+/// <param name="Naming">
+/// The item's source naming, always given by the source that read it (sc-25992, E5): trust is decided from it
+/// (<see cref="UntrustedName"/>), so no story is trusted by a default.
+/// </param>
 /// <param name="Closes">
 /// The issue the item's PR closes on merge, as GitHub's closing keyword takes it (<c>owner/name#12</c>); null for none.
 /// </param>
@@ -15,10 +18,10 @@ namespace DarkFactory.Orchestrator.WorkSources;
 /// For an item a plan created: the plan item its marker names, as the ledger names it, when the source had to translate it
 /// (Kanban: the <c>kb-&lt;n&gt;</c> of the GUID in the marker); null otherwise (<see cref="PlannedFrom"/>).
 /// </param>
-public sealed record WorkStory(int Id, string Name, string? Description, string StoryType, string AppUrl, ItemNaming? Naming = null,
+public sealed record WorkStory(int Id, string Name, string? Description, string StoryType, string AppUrl, ItemNaming Naming,
     string? Closes = null, IReadOnlyList<string>? Labels = null, int? Estimate = null, string? BoardId = null, string? PlanRef = null)
 {
-    public ItemNaming Kind => Naming ?? ItemNaming.Shortcut;
+    public ItemNaming Kind => Naming;
 
     /// <summary>
     /// The name as the factory writes it on GitHub (commit message, pull request title and description): an untrusted name
@@ -152,8 +155,11 @@ public sealed record ChildItem(string Name, string Description, string StoryType
 /// </summary>
 public interface IWorkSource
 {
-    /// <summary>How this source's items are named in the ledger and on git (default: Shortcut stories).</summary>
-    ItemNaming Naming => ItemNaming.Shortcut;
+    /// <summary>
+    /// How this source's items are named in the ledger and on git, and whether they are trusted (<see cref="ItemNaming.Trusted"/>).
+    /// No default (sc-25992, E1/E5): every source declares its own, so none is trusted, or named like another, by omission.
+    /// </summary>
+    ItemNaming Naming { get; }
 
     /// <summary>
     /// How many claim refusals in a row an item may get before its run escalates it instead of parking it again (E10), for a source

@@ -500,6 +500,8 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
         _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
         _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl, KanbanMcpUrl);
         _ = (CodeGraphOverlayTimeout, KanbanWatchScope, KanbanWebUrl);
+        // Kanban:WriteToken must not be Kanban:Token (E2, sc-25992); compared where the write token is read, the registry.
+        WorkSources.WorkSourceRegistry.EnsureKanbanTokensApart(this);
     }
 
     public bool TryGet(Func<FactoryOptions, string> secret, out string? value)

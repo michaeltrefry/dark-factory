@@ -163,7 +163,7 @@ public class RunPipelineTests
 {
     internal static readonly RepoRef Sandbox = new("michaeltrefry", "dark-factory-sandbox");
     private static readonly WorkStory Story =
-        new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77");
+        new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77", ItemNaming.Shortcut);
     internal const string PrUrl = "https://github.com/michaeltrefry/dark-factory-sandbox/pull/1";
 
     internal sealed class FakeWorkspaces(bool hasChanges = true, bool worktreeExists = true) : IRepoWorkspace

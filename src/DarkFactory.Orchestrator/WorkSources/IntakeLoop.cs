@@ -45,9 +45,12 @@ public interface IItemRunner
 /// <summary>
 /// <c>factory work</c>: polls the work sources at a fixed interval (the Mac exposes no webhook
 /// endpoint) and runs each in-flight or ready item through the pipeline, up to
-/// <see cref="IntakeOptions.MaxConcurrentRuns"/> at once (sc-25988; 1, the default: one after another). Each item is run once
-/// per poll, in the poll's order (each lane's in-flight items, then its ready ones); a poll ends when its runs have. Runs overlap
-/// only outside the phases that use the sandbox user (<see cref="WorkerLock"/>: a run waits for it there), and one repository's
+/// <see cref="IntakeOptions.MaxConcurrentRuns"/> at once (sc-25988; 1, the default: one after another). Each item is started
+/// at most once per poll, in the poll's order (each lane's in-flight items, then its ready ones). A poll does not wait for its runs
+/// (sc-25992): the loop polls again on its interval while they go on, each poll renewing every lane's claims and starting work
+/// only into the capacity the runs in flight leave, never a second run of an item this loop has in flight. Runs overlap
+/// outside the phases that use a sandbox user, and inside them one per worker slot (<see cref="WorkerLock"/>: a run waits for its
+/// slot there), and one repository's
 /// merges stay one at a time (the merge queue's turn). The
 /// pipeline's Intake claims the item; its run lock stops a second run — of this process or another — running the same item.
 /// While the factory is paused (<see cref="Controls.ControlScope.Factory"/>, the usage pause
@@ -97,45 +100,127 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
     private int _waits;
 
     /// <summary>
-    /// How many times the loop has finished a poll and armed its wake-up (the next tick, or the end of a usage pause) and is
-    /// waiting on it: once it has, moving an injected clock wakes it (a test must not move the clock before this).
+    /// How many times the loop has armed its wake-up (the next tick, the end of a usage pause, or the end of a run in flight) and
+    /// is waiting on it: once it has, moving an injected clock wakes it (a test must not move the clock before this).
     /// </summary>
     internal int Waits => Volatile.Read(ref _waits);
 
     private void Armed() => Interlocked.Increment(ref _waits);
+
+    // Runs in flight across polls (sc-25992): an item is in at most one run of this loop at a time (by its external id), and
+    // there are never more than Intake:MaxConcurrentRuns. A poll dispatches only into the capacity the runs in flight leave.
+    private readonly Lock _runsGate = new();
+    private readonly Dictionary<string, Task> _running = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim _capacity = new(options.MaxConcurrentRuns, options.MaxConcurrentRuns);
+    private Poll? _current;
+    private TaskCompletionSource _runEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>The items this loop has a run of in flight now (<c>sc-12</c>, <c>kb-4</c>).</summary>
+    internal IReadOnlyList<string> RunsInFlight
+    {
+        get
+        {
+            lock (_runsGate)
+            {
+                return [.. _running.Keys];
+            }
+        }
+    }
+
+    private Task RunEnded()
+    {
+        lock (_runsGate)
+        {
+            return _runEnded.Task;
+        }
+    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         logger.LogInformation("Polling for work every {Interval}, running up to {Runs} item(s) at once", options.PollInterval, options.MaxConcurrentRuns);
         using var timer = new PeriodicTimer(options.PollInterval, time);
         Task<bool>? tick = null;
+        try
+        {
+            while (true)
+            {
+                // A poll does not wait for its runs (sc-25992): it dispatches into the free capacity, and the loop polls again on
+                // its interval — renewing claims, finishing stops, starting newly ready items — while they go on.
+                var ended = RunEnded();
+                var resumeAt = (await StartPollAsync(stoppingToken)).ResumeAt;
+                tick ??= timer.WaitForNextTickAsync(stoppingToken).AsTask();
+                while (true)
+                {
+                    // One clock reading decides the wait, and the wake-up is armed straight after it.
+                    var now = time.GetUtcNow();
+                    Task? lifted = resumeAt is { } at && at - now is var wait && wait < options.PollInterval
+                        // Paused for usage until before the next tick: poll again as soon as it lifts.
+                        ? Task.Delay(wait > TimeSpan.Zero ? wait : TimeSpan.Zero, time, stoppingToken)
+                        : null;
+                    Armed();
+                    var woke = await Task.WhenAny(lifted is null ? [tick, ended] : [tick, ended, lifted]);
+                    stoppingToken.ThrowIfCancellationRequested();
+                    if (woke != ended)
+                    {
+                        break;
+                    }
+                    // A run ended: it may have paused the factory for usage (its worker hit the limit), so the loop wakes when
+                    // that pause lifts, as it did when a poll waited for its runs.
+                    ended = RunEnded();
+                    resumeAt = await UsageResumeAtAsync(resumeAt, stoppingToken);
+                }
+                if (tick.IsCompleted)
+                {
+                    if (!await tick)
+                    {
+                        return;
+                    }
+                    tick = null;
+                }
+            }
+        }
+        finally
+        {
+            // Shutdown waits for the runs in flight: each sees the cancelled token and ends as when a poll waited for them.
+            await AllRunsEndedAsync();
+        }
+    }
+
+    /// <summary>Waits until this loop has no run in flight and its last poll's dispatch has ended.</summary>
+    private async Task AllRunsEndedAsync()
+    {
         while (true)
         {
-            var resumeAt = await PollOnceAsync(stoppingToken);
-            tick ??= timer.WaitForNextTickAsync(stoppingToken).AsTask();
-            // One clock reading decides the wait, and the wake-up is armed straight after it.
-            var now = time.GetUtcNow();
-            if (resumeAt is { } at && at - now is var wait && wait < options.PollInterval)
+            Task[] pending;
+            lock (_runsGate)
             {
-                // Paused for usage until before the next tick: poll again as soon as it lifts.
-                var lifted = Task.Delay(wait > TimeSpan.Zero ? wait : TimeSpan.Zero, time, stoppingToken);
-                Armed();
-                await Task.WhenAny(tick, lifted);
-                stoppingToken.ThrowIfCancellationRequested();
+                pending = [.. _running.Values, .. _current is { } poll ? new[] { poll.Done } : []];
             }
-            else
+            if (pending.All(t => t.IsCompleted))
             {
-                Armed();
-                await tick;
+                return;
             }
-            if (tick.IsCompleted)
+            try
             {
-                if (!await tick)
-                {
-                    return;
-                }
-                tick = null;
+                await Task.WhenAll(pending);
             }
+            catch
+            {
+                // A run's own failure or cancellation was reported where it ran.
+            }
+        }
+    }
+
+    private async Task<DateTimeOffset?> UsageResumeAtAsync(DateTimeOffset? fallback, CancellationToken ct)
+    {
+        try
+        {
+            return controls is null ? fallback : (await controls.UsagePauseAsync(ct))?.ResumeAt;
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            logger.LogError(ex, "Could not read the usage pause; polling again next interval");
+            return null;
         }
     }
 
@@ -171,30 +256,74 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
         return (holds, usagePause?.ResumeAt);
     }
 
-    /// <summary>One poll: resume in-flight items first, then run newly ready ones. Returns when a usage pause in effect lifts, if one is.</summary>
+    /// <summary>
+    /// One poll, waited for to its end: resume in-flight items first, then run newly ready ones, and return once every run it
+    /// started has ended. Returns when a usage pause in effect lifts, if one is.
+    /// </summary>
     public async Task<DateTimeOffset?> PollOnceAsync(CancellationToken ct)
     {
-        var work = new List<(IntakeLane Lane, IReadOnlyList<int> InFlight, IReadOnlyList<int> Ready)>();
-        DateTimeOffset? resumeAt = null;
-        bool factoryPaused;
-        // A factory-wide failure is shown once per poll, however many of its listings and runs hit it (sc-25991).
-        var gate = new Lock();
-        var factoryFailed = false;
-        void FactoryFailed(string message)
+        var (resumeAt, done, listed) = await StartPollAsync(ct);
+        await done;
+        // A run may have paused the factory for usage (its worker hit the limit) or the pause may have moved.
+        return listed ? await UsageResumeAtAsync(resumeAt, ct) : resumeAt;
+    }
+
+    /// <summary>
+    /// What one poll decided for the items it listed and has not started yet, read and written under its gate by its dispatch and
+    /// its runs. A newer poll that lists again supersedes it (<see cref="Supersede"/>): it starts nothing more, since the newer
+    /// listing is fresher; its runs go on.
+    /// </summary>
+    private sealed class Poll(CancellationToken ct)
+    {
+        public readonly Lock Gate = new();
+        public readonly CancellationTokenSource Dispatch = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        public Queue<(IntakeLane Lane, int Id, bool Ready)> Queue = new();
+        public bool FactoryFailedFlag;
+        public bool RunsFailed;
+        public bool DeferredRun;
+        public bool NewWorkHeld;
+        public readonly HashSet<IntakeLane> DeferredLanes = [];
+        public Task Done = Task.CompletedTask;
+
+        public void Supersede()
         {
-            lock (gate)
+            try
             {
-                if (factoryFailed)
-                {
-                    _status.FactoryFailedAlso(message);
-                }
-                else
-                {
-                    _status.FactoryFailed(message);
-                }
-                factoryFailed = true;
+                Dispatch.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
             }
         }
+    }
+
+    private void FactoryFailed(Poll poll, string message)
+    {
+        lock (poll.Gate)
+        {
+            if (poll.FactoryFailedFlag)
+            {
+                _status.FactoryFailedAlso(message);
+            }
+            else
+            {
+                _status.FactoryFailed(message);
+            }
+            poll.FactoryFailedFlag = true;
+        }
+    }
+
+    /// <summary>
+    /// One poll's listing and the start of its dispatch (sc-25992): renews every lane's claims, then — only while there is free run
+    /// capacity — lists each lane's in-flight and ready items and starts them into that capacity, in the poll's order, skipping
+    /// any item a run of this loop already has in flight. Returns as soon as the dispatch has started; <c>Done</c> completes
+    /// once the dispatch and every run it started have ended. <c>Listed</c> is false when the poll failed before listing.
+    /// </summary>
+    internal async Task<(DateTimeOffset? ResumeAt, Task Done, bool Listed)> StartPollAsync(CancellationToken ct)
+    {
+        var poll = new Poll(ct);
+        DateTimeOffset? resumeAt = null;
+        bool factoryPaused;
         try
         {
             if (usage is not null)
@@ -223,16 +352,52 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             logger.LogError(ex, "Poll failed; retrying next interval");
-            FactoryFailed($"Poll failed: {ex.Message}");
-            return resumeAt;
+            FactoryFailed(poll, $"Poll failed: {ex.Message}");
+            return (resumeAt, Task.CompletedTask, false);
         }
+        // Claims first, every lane's over its own list (IItemRunner.RenewableAsync: paused and frozen items too, and items a run
+        // of this loop has in flight), before any lane is prepared or listed: a lane's preparation (a triage, which may wait for
+        // a worker slot) never holds up another lane's renewals. The items to run are listed after, so one just paused for a
+        // lost claim is not among them.
+        var renewed = new Dictionary<IntakeLane, IReadOnlyList<int>>();
         foreach (var lane in lanes)
         {
             try
             {
-                // Claims first, over their own list (IItemRunner.RenewableAsync: paused and frozen items too); the items to run
-                // are listed after, so one just paused for a lost claim is not among them.
-                var lost = await RenewClaimsAsync(lane, await lane.Runner.RenewableAsync(ct), ct);
+                renewed[lane] = await RenewClaimsAsync(lane, await lane.Runner.RenewableAsync(ct), ct);
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                // One source failing does not hold up another's items.
+                logger.LogError(ex, "Poll of {Source} failed; retrying next interval", lane.Source.Naming.Source);
+                FactoryFailed(poll, $"Poll failed: {ex.Message}");
+            }
+        }
+        int free;
+        lock (_runsGate)
+        {
+            free = options.MaxConcurrentRuns - _running.Count;
+        }
+        if (free <= 0)
+        {
+            // Every run this loop may have is in flight: nothing could start, so nothing is listed or prepared, and the earlier
+            // poll's dispatch keeps its place (it starts its next item when a run ends).
+            logger.LogInformation("{Runs} run(s) in flight, no capacity free: claims renewed, nothing new listed this poll", options.MaxConcurrentRuns);
+            if (!poll.FactoryFailedFlag)
+            {
+                _status.FactoryOk();
+            }
+            return (resumeAt, Task.CompletedTask, true);
+        }
+        var work = new List<(IntakeLane Lane, IReadOnlyList<int> InFlight, IReadOnlyList<int> Ready)>();
+        foreach (var lane in lanes)
+        {
+            if (!renewed.TryGetValue(lane, out var lost))
+            {
+                continue;
+            }
+            try
+            {
                 IReadOnlyList<int> inFlight = (await lane.Runner.InFlightAsync(ct)).Except(lost).ToList();
                 IReadOnlyList<int> ready = [];
                 if (!factoryPaused)
@@ -250,145 +415,228 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
             {
                 // One source failing to list (its board down) does not hold up another's items.
                 logger.LogError(ex, "Poll of {Source} failed; retrying next interval", lane.Source.Naming.Source);
-                FactoryFailed($"Poll failed: {ex.Message}");
+                FactoryFailed(poll, $"Poll failed: {ex.Message}");
             }
         }
         // The poll's runs, in order: each lane's in-flight items (those being stopped first), then its ready ones; an item once.
         var listed = new HashSet<string>(StringComparer.Ordinal);
-        var queue = new Queue<(IntakeLane Lane, int Id, bool Ready)>(work
+        poll.Queue = new Queue<(IntakeLane Lane, int Id, bool Ready)>(work
             .SelectMany(w => w.InFlight.Select(id => (w.Lane, Id: id, Ready: false)).Concat(w.Ready.Select(id => (w.Lane, Id: id, Ready: true))))
             .Where(x => listed.Add(x.Lane.Source.Naming.Format(x.Id))));
-        // What the runs so far decided for those not yet started, read and written under the gate by every dispatcher.
-        var runsFailed = false;
-        var deferredRun = false;
-        var newWorkHeld = false;
-        var deferredLanes = new HashSet<IntakeLane>();
-        (IntakeLane Lane, int Id, bool Ready)? Next()
+        lock (_runsGate)
         {
-            lock (gate)
-            {
-                // In-flight items (those being stopped first) even after another lane's deferral: a Stop starts no new work. Ready
-                // ones only while nothing was deferred: the factory is frozen, so every new item would be deferred the same way —
-                // and only while no factory-wide control holds new work (MayStartNewAsync).
-                while (!runsFailed && queue.TryDequeue(out var next))
-                {
-                    if (!deferredLanes.Contains(next.Lane) && !(next.Ready && (deferredRun || newWorkHeld)))
-                    {
-                        return next;
-                    }
-                }
-                return null;
-            }
+            // This listing is fresher than the last poll's: that one starts nothing more (its runs go on).
+            _current?.Supersede();
+            _current = poll;
+            poll.Done = DispatchAsync(poll, ct);
         }
-        // Whether a ready item may still be started (sc-25991): the poll listed its work a while ago and other runs are in
-        // flight — one of them, or a person, may have paused the factory for usage, paused it or frozen it since. Then no ready
-        // item of the poll is started, and the hold is shown with what lifts it. Controls that cannot be read are the factory's
-        // failure, which starts nothing more (E2: never dispatch blind).
-        async Task<bool> MayStartNewAsync(string name)
-        {
-            try
-            {
-                var (holds, _) = await HoldsAsync(ct);
-                if (holds.Count == 0)
-                {
-                    return true;
-                }
-                logger.LogInformation("{Item}: not started, nor any other ready item this poll: {Why}", name, string.Join("; ", holds.Select(h => h.Why)));
-                _status.Holding(holds);
-                lock (gate)
-                {
-                    newWorkHeld = true;
-                }
-            }
-            catch (Exception ex) when (!ct.IsCancellationRequested)
-            {
-                logger.LogError(ex, "Could not read the controls before starting {Item}; ending this poll", name);
-                lock (gate)
-                {
-                    runsFailed = true;
-                }
-                FactoryFailed($"{name} not started: the controls could not be read: {ex.Message}");
-            }
-            return false;
-        }
-        async Task DispatchAsync()
-        {
-            while (Next() is var (lane, id, ready))
-            {
-                var name = lane.Source.Naming.Format(id);
-                if (ready && !await MayStartNewAsync(name))
-                {
-                    continue;
-                }
-                try
-                {
-                    var outcome = await lane.Runner.RunAsync(id, ct);
-                    logger.LogInformation("{Item}: {State}{Error}", name, outcome.State, outcome.Error is null ? "" : $" ({outcome.Error})");
-                    _status.ItemOk(name);
-                    lock (gate)
-                    {
-                        if (outcome.Deferred is { } deferred)
-                        {
-                            // The factory is frozen: every other item of the lane would be deferred the same way (its stops came
-                            // first). Each deferred run is shown: with runs in flight, several of one poll can be.
-                            _status.Deferred(name, deferred);
-                            deferredRun = true;
-                            deferredLanes.Add(lane);
-                        }
-                        else if (!deferredRun)
-                        {
-                            _status.NotDeferred();
-                        }
-                    }
-                }
-                catch (Exception ex) when (!ct.IsCancellationRequested && IsFactoryWide(ex))
-                {
-                    // Every other item would fail the same way: show it once, escalate nothing, start nothing more, try again next
-                    // poll. Not this item's failure, nor one of a run beside it (which ends by itself, its outcome its own).
-                    logger.LogError(ex, "Run of {Item} failed for a factory-wide reason; ending this poll", name);
-                    // Nothing more is started from here on, before anyone is told: whoever sees the error shown sees a poll
-                    // that has already stopped dispatching.
-                    lock (gate)
-                    {
-                        runsFailed = true;
-                    }
-                    FactoryFailed($"{name} could not run: {ex.Message}");
-                }
-                catch (Exception ex) when (!ct.IsCancellationRequested)
-                {
-                    // Counted against this item alone, whatever runs beside it.
-                    logger.LogError(ex, "Run of {Item} failed", name);
-                    var failures = _status.ItemFailed(name, $"{ex.GetType().Name}: {ex.Message}");
-                    if (failures == options.MaxItemFailures)
-                    {
-                        await GiveUpAsync(lane, id, $"{failures} runs in a row failed before the pipeline could start; last error: {ex.GetType().Name}: {ex.Message}", ct);
-                    }
-                }
-            }
-        }
-        // One dispatcher runs the items one after another, as ever; more start the next item as soon as one of them is free.
-        var dispatchers = Math.Min(options.MaxConcurrentRuns, queue.Count);
-        if (dispatchers <= 1)
-        {
-            await DispatchAsync();
-        }
-        else
-        {
-            await Task.WhenAll(Enumerable.Range(0, dispatchers).Select(_ => Task.Run(DispatchAsync, ct)));
-        }
-        if (!factoryFailed)
-        {
-            _status.FactoryOk();
-        }
-        // A run may have paused the factory for usage (its worker hit the limit) or the pause may have moved.
+        return (resumeAt, poll.Done, true);
+    }
+
+    /// <summary>
+    /// Whether a ready item may still be started (sc-25991): the poll listed its work a while ago and other runs are in flight —
+    /// one of them, or a person, may have paused the factory for usage, paused it or frozen it since. Then no ready item of the
+    /// poll is started, and the hold is shown with what lifts it. Controls that cannot be read are the factory's failure, which
+    /// starts nothing more (E2: never dispatch blind).
+    /// </summary>
+    private async Task<bool> MayStartNewAsync(Poll poll, string name, CancellationToken ct)
+    {
         try
         {
-            return controls is null ? resumeAt : (await controls.UsagePauseAsync(ct))?.ResumeAt;
+            var (holds, _) = await HoldsAsync(ct);
+            if (holds.Count == 0)
+            {
+                return true;
+            }
+            logger.LogInformation("{Item}: not started, nor any other ready item this poll: {Why}", name, string.Join("; ", holds.Select(h => h.Why)));
+            _status.Holding(holds);
+            lock (poll.Gate)
+            {
+                poll.NewWorkHeld = true;
+            }
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            logger.LogError(ex, "Could not read the usage pause; polling again next interval");
+            logger.LogError(ex, "Could not read the controls before starting {Item}; ending this poll", name);
+            lock (poll.Gate)
+            {
+                poll.RunsFailed = true;
+            }
+            FactoryFailed(poll, $"{name} not started: the controls could not be read: {ex.Message}");
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// The poll's next item to start, or null when it starts nothing more: in-flight items (those being stopped first) even after
+    /// another lane's deferral — a Stop starts no new work; ready ones only while nothing was deferred (the factory is frozen, so
+    /// every new item would be deferred the same way) and no factory-wide control holds new work. An item a run of this loop
+    /// already has in flight is passed over when it would be started (<see cref="DispatchAsync"/>).
+    /// </summary>
+    private (IntakeLane Lane, int Id, bool Ready)? Next(Poll poll)
+    {
+        lock (poll.Gate)
+        {
+            while (!poll.RunsFailed && poll.Queue.TryDequeue(out var next))
+            {
+                if (poll.DeferredLanes.Contains(next.Lane) || (next.Ready && (poll.DeferredRun || poll.NewWorkHeld)))
+                {
+                    continue;
+                }
+                return next;
+            }
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Starts the poll's items one by one as run capacity frees (<see cref="IntakeOptions.MaxConcurrentRuns"/>), until its queue
+    /// is empty, something stops its new work, or a newer poll supersedes it; then waits for the runs it started.
+    /// </summary>
+    private async Task DispatchAsync(Poll poll, CancellationToken ct)
+    {
+        await Task.Yield();
+        var started = new List<Task>();
+        try
+        {
+            while (true)
+            {
+                try
+                {
+                    await _capacity.WaitAsync(poll.Dispatch.Token);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    break; // superseded by a newer poll
+                }
+                var held = true;
+                try
+                {
+                    // A run that ended on shutdown may give its capacity back before this wait sees the cancellation.
+                    if (ct.IsCancellationRequested || Next(poll) is not var (lane, id, ready))
+                    {
+                        break;
+                    }
+                    var name = lane.Source.Naming.Format(id);
+                    if (ready && !await MayStartNewAsync(poll, name, ct))
+                    {
+                        continue;
+                    }
+                    lock (_runsGate)
+                    {
+                        // Superseded or shut down meanwhile, or the item started by another poll's dispatch: not started here.
+                        if (ct.IsCancellationRequested || poll.Dispatch.IsCancellationRequested || _running.ContainsKey(name))
+                        {
+                            continue;
+                        }
+                        // Registered in flight before it starts; it leaves the in-flight set and gives the capacity back when it
+                        // ends.
+                        var start = new Task<Task>(async () =>
+                        {
+                            try
+                            {
+                                await RunOneAsync(poll, lane, id, name, ct);
+                            }
+                            finally
+                            {
+                                Ended(name);
+                            }
+                        });
+                        var run = start.Unwrap();
+                        _running[name] = run;
+                        held = false;
+                        started.Add(run);
+                        start.Start(TaskScheduler.Default);
+                    }
+                }
+                finally
+                {
+                    if (held)
+                    {
+                        _capacity.Release();
+                    }
+                }
+            }
+        }
+        finally
+        {
+            try
+            {
+                await Task.WhenAll(started);
+            }
+            finally
+            {
+                lock (_runsGate)
+                {
+                    // The newest poll that had no factory-wide failure says the factory is fine; an older one does not.
+                    if (ReferenceEquals(_current, poll) && !poll.FactoryFailedFlag)
+                    {
+                        _status.FactoryOk();
+                    }
+                }
+                poll.Dispatch.Dispose();
+            }
+        }
+    }
+
+    private void Ended(string name)
+    {
+        TaskCompletionSource ended;
+        lock (_runsGate)
+        {
+            _running.Remove(name);
+            ended = _runEnded;
+            _runEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+        _capacity.Release();
+        ended.TrySetResult();
+    }
+
+    private async Task RunOneAsync(Poll poll, IntakeLane lane, int id, string name, CancellationToken ct)
+    {
+        try
+        {
+            var outcome = await lane.Runner.RunAsync(id, ct);
+            logger.LogInformation("{Item}: {State}{Error}", name, outcome.State, outcome.Error is null ? "" : $" ({outcome.Error})");
+            _status.ItemOk(name);
+            lock (poll.Gate)
+            {
+                if (outcome.Deferred is { } deferred)
+                {
+                    // The factory is frozen: every other item of the lane would be deferred the same way (its stops came first).
+                    // Each deferred run is shown: with runs in flight, several of one poll can be.
+                    _status.Deferred(name, deferred);
+                    poll.DeferredRun = true;
+                    poll.DeferredLanes.Add(lane);
+                }
+                else if (!poll.DeferredRun)
+                {
+                    _status.NotDeferred();
+                }
+            }
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested && IsFactoryWide(ex))
+        {
+            // Every other item would fail the same way: show it once, escalate nothing, start nothing more, try again next poll.
+            // Not this item's failure, nor one of a run beside it (which ends by itself, its outcome its own).
+            logger.LogError(ex, "Run of {Item} failed for a factory-wide reason; ending this poll", name);
+            // Nothing more is started from here on, before anyone is told: whoever sees the error shown sees a poll that has
+            // already stopped dispatching.
+            lock (poll.Gate)
+            {
+                poll.RunsFailed = true;
+            }
+            FactoryFailed(poll, $"{name} could not run: {ex.Message}");
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            // Counted against this item alone, whatever runs beside it.
+            logger.LogError(ex, "Run of {Item} failed", name);
+            var failures = _status.ItemFailed(name, $"{ex.GetType().Name}: {ex.Message}");
+            if (failures == options.MaxItemFailures)
+            {
+                await GiveUpAsync(lane, id, $"{failures} runs in a row failed before the pipeline could start; last error: {ex.GetType().Name}: {ex.Message}", ct);
+            }
         }
     }
 

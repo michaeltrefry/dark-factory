@@ -556,7 +556,7 @@ public class PlanRepositorySetTests
     [Fact]
     public void The_prompt_of_a_plan_of_several_repositories_says_which_directory_is_which_and_how_to_name_one()
     {
-        var story = new WorkStory(12, "Share the mesh format", "Repo: acme/widgets\nRepo: acme/gears", "feature", "u", Labels: ["plan"]);
+        var story = new WorkStory(12, "Share the mesh format", "Repo: acme/widgets\nRepo: acme/gears", "feature", "u", ItemNaming.Shortcut, Labels: ["plan"]);
         var spec = new WorkSpec(story, null, []);
         PlanCheckout[] checkouts = [new(Widgets, "acme/widgets"), new(Gears, "acme/gears")];
 

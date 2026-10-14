@@ -30,7 +30,7 @@ public class KanbanPlanAcceptanceTests
         ItemNaming.ParseAny(name) is { } item && item.Naming == ItemNaming.Kanban ? item : throw new FormatException($"'{name}' is no Kanban item id.");
 
     /// <summary>The bodies of the item's comments on the real board (the typed caller reads no comments: the factory never does).</summary>
-    private static async Task<List<string>> CommentsAsync(Orchestrator.Mcp.McpHttpClient kanban, Guid item, CancellationToken ct)
+    internal static async Task<List<string>> CommentsAsync(Orchestrator.Mcp.McpHttpClient kanban, Guid item, CancellationToken ct)
     {
         var answer = await kanban.CallToolAsync("get_work_item", new JsonObject { ["itemId"] = item.ToString() }, ct);
         Assert.False(answer.IsError, answer.Text);

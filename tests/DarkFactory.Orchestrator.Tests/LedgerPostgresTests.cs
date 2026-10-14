@@ -84,7 +84,7 @@ public sealed class LedgerPostgresTests : IAsyncLifetime
         var prs = new CountingPullRequests();
         await using var dbA = Context();
         await using var dbB = Context();
-        RunPipeline Pipeline(LedgerDbContext db) => new(new FakeWorkSource(new WorkStory(1, "Fix", "Fix it.", "bug", "https://app.shortcut.com/t/story/1")), new WorkLedger(db, TimeProvider.System),
+        RunPipeline Pipeline(LedgerDbContext db) => new(new FakeWorkSource(new WorkStory(1, "Fix", "Fix it.", "bug", "https://app.shortcut.com/t/story/1", ItemNaming.Shortcut)), new WorkLedger(db, TimeProvider.System),
             new PostgresRunLocks(_cs), new Workspaces(), worker, prs, new RepoRef("acme", "widgets"), TextWriter.Null);
 
         var first = Task.Run(() => Pipeline(dbA).RunAsync(77, CancellationToken.None));

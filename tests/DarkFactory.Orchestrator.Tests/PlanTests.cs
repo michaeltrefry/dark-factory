@@ -195,8 +195,8 @@ public class PlanParserTests
         var child = PlanParser.Parse(PlanAnswers.Answer(story)).Children("sc-12", new RepoRef("acme", "widgets"))[0];
         // The plan item's repository is the story's, whatever the planner's text names.
         Assert.Equal(new RepoRef("acme", "widgets"), RepoResolver.Resolve(child.Description, new RepoRef("o", "default")));
-        var planned = new WorkStory(13, child.Name, child.Description, child.StoryType, "https://app.shortcut.com/t/story/13");
-        var owners = new WorkStory(14, child.Name, "Written by the owner.", "chore", "https://app.shortcut.com/t/story/14");
+        var planned = new WorkStory(13, child.Name, child.Description, child.StoryType, "https://app.shortcut.com/t/story/13", ItemNaming.Shortcut);
+        var owners = new WorkStory(14, child.Name, "Written by the owner.", "chore", "https://app.shortcut.com/t/story/14", ItemNaming.Shortcut);
 
         Assert.True(planned.PlannerAuthored);
         Assert.True(planned.UntrustedName);
@@ -219,18 +219,18 @@ public class PlanParserTests
     [Fact]
     public void The_plan_label_is_read_in_any_case_and_the_planner_runs_on_the_high_class()
     {
-        WorkStory Labelled(params string[] labels) => new(1, "n", null, "feature", "u", Labels: labels);
+        WorkStory Labelled(params string[] labels) => new(1, "n", null, "feature", "u", ItemNaming.Shortcut, Labels: labels);
 
         Assert.True(PlanLabel.IsOn(Labelled("simple", "Plan")));
         Assert.False(PlanLabel.IsOn(Labelled("planning", "simple")));
-        Assert.False(PlanLabel.IsOn(new WorkStory(1, "n", null, "feature", "u")));
+        Assert.False(PlanLabel.IsOn(new WorkStory(1, "n", null, "feature", "u", ItemNaming.Shortcut)));
         Assert.Equal(WorkerModelClass.High, WorkerModelClass.Planner);
     }
 
     [Fact]
     public void The_prompt_states_the_story_the_rules_and_only_the_tools_the_session_was_granted()
     {
-        var story = new WorkStory(12, "Add CSV export", "Reports need a CSV download.", "feature", "u", Labels: ["plan"]);
+        var story = new WorkStory(12, "Add CSV export", "Reports need a CSV download.", "feature", "u", ItemNaming.Shortcut, Labels: ["plan"]);
         var prompt = PlanPrompt.Build(new WorkSpec(story, new WorkEpic(3, "Reports", "All reporting work.", "e"), [new WorkDocument("Spec", "CSV columns", "d")]),
             new RepoRef("acme", "widgets"));
 
@@ -257,7 +257,7 @@ public class PlanPipelineTests
 {
     private static readonly DateTimeOffset T0 = new(2026, 10, 12, 12, 0, 0, TimeSpan.Zero);
     private static readonly WorkStory PlanStory =
-        new(77, "Add CSV export", "Reports need a CSV download.", "feature", "https://app.shortcut.com/trefry/story/77", Labels: ["plan"]);
+        new(77, "Add CSV export", "Reports need a CSV download.", "feature", "https://app.shortcut.com/trefry/story/77", ItemNaming.Shortcut, Labels: ["plan"]);
 
     private static readonly WorkerResult Planned = new("plan-sess", 0, false, "success", PlanAnswers.Valid, "");
 
@@ -726,6 +726,7 @@ public class PlanPipelineTests
     /// <summary>A work source whose child creation succeeds on the board and is then cut off by a cancelled run.</summary>
     private sealed class CancelOnCreate(FakeWorkSource inner, CancellationTokenSource stop) : IWorkSource
     {
+        public ItemNaming Naming => inner.Naming;
         public bool PlansItems => true;
         public Task<IReadOnlyList<int>> ListReadyAsync(CancellationToken ct) => inner.ListReadyAsync(ct);
         public Task<ClaimResult> ClaimAsync(int id, bool ignoreScope, CancellationToken ct) => inner.ClaimAsync(id, ignoreScope, ct);

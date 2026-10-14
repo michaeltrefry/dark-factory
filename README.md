@@ -16,9 +16,11 @@ has a `Repo: owner/name` line.
 
 ### Intake: `factory work`
 
-`factory work` is the long-running trigger: next to the session hub, the same process polls Shortcut every `Intake:PollSeconds`
-(default 60; there is no public webhook endpoint on the Mac) and runs each ready story through
-the pipeline, one at a time (or up to `Intake:MaxConcurrentRuns` at once). Ready means a story in the `To Do` workflow state inside the watch
+`factory work` is the long-running trigger: next to the session hub, the same process polls its work sources — Shortcut,
+KanbanBoard (`Kanban:Watch:Projects`) and GitHub issues (`GitHub:Watch:Repos`), at least one watched — every `Intake:PollSeconds`
+(default 60; there is no public webhook endpoint on the Mac) and runs each ready item through
+the pipeline, one at a time (or up to `Intake:MaxConcurrentRuns` at once). A poll does not wait for its runs: the next one
+renews claims and starts new items into whatever run capacity is free. For Shortcut, ready means a story in the `To Do` workflow state inside the watch
 scope: any team in `Shortcut:Watch:Teams` (mention names or ids) or epic in
 `Shortcut:Watch:Epics` (ids), each comma-separated. An empty scope watches nothing; an unknown
 team or epic stops `factory work` at start-up (exit 2). Teams are listed with the documented
@@ -33,8 +35,8 @@ resume time (or `factory continue --usage`); items paused any other way (parked)
 A run that fails before its pipeline starts (the story was deleted, the board read fails) is retried at the next
 poll; after `Intake:MaxItemFailures` (default 3) such failures in a row the loop gives up on the item: one in Intake or
 Implement is escalated with a story comment, a paused one is parked with a comment (so it no longer auto-resumes).
-A failure every item shares (another sandboxed run holds the work root, the worker sandbox is not ready, the ledger
-or the worktree sweep fails, a missing credential) escalates nothing: it ends the poll and shows as a factory error
+A failure every item shares (the worker sandbox is not ready, the ledger or the worktree sweep fails, a missing
+credential) escalates nothing — another run in a worker phase is no failure: a run waits for its sandbox user: it ends the poll and shows as a factory error
 banner on the dashboard's pipeline page, next to each item's repeated failures, until a poll gets past it.
 
 The board is touched only through `IWorkSource` (`WorkSources/`; Shortcut adapter in
@@ -46,8 +48,8 @@ in `To Do` (or already the factory's), in scope, and not labelled `factory-claim
 owner; the claim is read back after writing. A refused claim parks the item in Paused with no board
 write until the story is ready again. A story whose item sits in a state this phase does not drive
 (e.g. parked at Review) and is dragged back to `To Do` is not re-read: it gets one comment saying so.
-`factory run sc-<id>` goes through the same path and checks for one story; `--ignore-scope` skips
-only the scope checks.
+`factory run sc-<id>` (or `kb-<n>`, a Kanban item; `gh-<n>`, a released GitHub issue) goes through the same path and checks for
+one item; `--ignore-scope` skips only the scope checks.
 
 ```sh
 export Shortcut__Watch__Teams=darkfactory

@@ -5,6 +5,7 @@ namespace DarkFactory.Orchestrator.Tests.Support;
 /// <summary>An in-memory work source serving one story (any id) and recording every board write.</summary>
 public sealed class FakeWorkSource(WorkStory story, bool commentFails = false) : IWorkSource
 {
+    public ItemNaming Naming => ItemNaming.Shortcut;
     public bool CommentFails { get; set; } = commentFails;
     public List<string> Comments { get; } = [];
     /// <summary>Board writes in order, e.g. "claim 77", "state 77 Claimed", "link 77 a b".</summary>

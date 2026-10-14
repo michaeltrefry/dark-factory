@@ -750,7 +750,7 @@ public class KanbanSafeWritesTests
         Assert.Null(typeof(Shortcut.ShortcutWorkSource).GetMethod(nameof(IWorkSource.RenewClaimAsync)));
         Assert.Null(typeof(Issues.GitHubIssueWorkSource).GetMethod(nameof(IWorkSource.RenewClaimAsync)));
         Assert.NotNull(typeof(KanbanWorkSource).GetMethod(nameof(IWorkSource.RenewClaimAsync)));
-        IWorkSource other = new FakeWorkSource(new WorkStory(101, "A story", null, "feature", "https://example.test/101"));
+        IWorkSource other = new FakeWorkSource(new WorkStory(101, "A story", null, "feature", "https://example.test/101", ItemNaming.Shortcut));
 
         Assert.Equal(ClaimRenewal.Held, await other.RenewClaimAsync(101, None));
     }

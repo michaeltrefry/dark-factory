@@ -23,13 +23,32 @@ public class IntakeDispatchTests
     {
         public IReadOnlyList<int> Ready { get; set; } = [];
 
-        protected override object? Invoke(MethodInfo? method, object?[]? args) => method!.Name switch
+        /// <summary>The items whose claim was renewed, once per renewal.</summary>
+        public ConcurrentQueue<int> Renewed { get; } = new();
+
+        private int _listings;
+
+        /// <summary>How many times the ready items were listed.</summary>
+        public int Listings => Volatile.Read(ref _listings);
+
+        protected override object? Invoke(MethodInfo? method, object?[]? args)
         {
-            nameof(IWorkSource.ListReadyAsync) => Task.FromResult(Ready),
-            $"get_{nameof(IWorkSource.Naming)}" => ItemNaming.Shortcut,
-            nameof(IWorkSource.RenewClaimAsync) => Task.FromResult(ClaimRenewal.Held),
-            _ => throw new NotSupportedException(method.Name),
-        };
+            switch (method!.Name)
+            {
+                case nameof(IWorkSource.ListReadyAsync):
+                    Interlocked.Increment(ref _listings);
+                    return Task.FromResult(Ready);
+                case $"get_{nameof(IWorkSource.Naming)}":
+                    return ItemNaming.Shortcut;
+                case nameof(IWorkSource.RenewClaimAsync):
+                    Renewed.Enqueue((int)args![0]!);
+                    return Task.FromResult(ClaimRenewal.Held);
+                default:
+                    throw new NotSupportedException(method.Name);
+            }
+        }
+
+        public static ListingSource Of(IWorkSource source) => (ListingSource)(object)source;
 
         public static IWorkSource Listing(params int[] ready)
         {
@@ -53,6 +72,10 @@ public class IntakeDispatchTests
         /// <summary>When set, a run of the item ends at once this way instead of waiting for the test.</summary>
         public Func<int, Exception?>? Throws { get; set; }
         public bool EndAtOnce { get; set; }
+        /// <summary>When set, a run ends only when the test ends it, also after its token is cancelled (a run finishing its step).</summary>
+        public bool IgnoresCancellation { get; set; }
+        /// <summary>Completes once a run has seen its token cancelled.</summary>
+        public TaskCompletionSource SawCancellation { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<int>>(inFlight);
 
@@ -90,7 +113,17 @@ public class IntakeDispatchTests
                 {
                     throw ex;
                 }
-                return EndAtOnce ? Ok : await _runs.GetOrAdd(id, _ => new(TaskCreationOptions.RunContinuationsAsynchronously)).Task.WaitAsync(ct);
+                if (EndAtOnce)
+                {
+                    return Ok;
+                }
+                var run = _runs.GetOrAdd(id, _ => new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+                if (IgnoresCancellation)
+                {
+                    using var _ = ct.Register(() => SawCancellation.TrySetResult());
+                    return await run;
+                }
+                return await run.WaitAsync(ct);
             }
             finally
             {
@@ -493,5 +526,122 @@ public class IntakeDispatchTests
 
         Assert.Equal(1, Registered([]).MaxConcurrentRuns);
         Assert.Equal(4, Registered(new() { ["Intake:MaxConcurrentRuns"] = "4" }).MaxConcurrentRuns);
+    }
+
+    // sc-25992: a poll does not wait for its runs. Each poll renews claims and dispatches into the capacity the runs still in
+    // flight leave, never a second run of an item in flight. These wait on signals (a run's start, a poll's end), not a clock.
+
+    [Fact]
+    public async Task The_work_loop_polls_again_on_its_interval_and_starts_a_newly_ready_item_while_a_long_run_is_still_in_flight()
+    {
+        var runner = new GatedRunner(1);
+        var source = ListingSource.Listing();
+        var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider();
+        var loop = new IntakeLoop([new IntakeLane(source, runner)], new IntakeOptions(TimeSpan.FromSeconds(60), MaxConcurrentRuns: 2), time,
+            NullLogger<IntakeLoop>.Instance);
+
+        await loop.StartAsync(CancellationToken.None);
+        await runner.WhenStarted(1);
+        await Eventually(() => loop.Waits >= 1, "the first poll arms its wake-up with its run still in flight");
+        ListingSource.Of(source).Ready = [5];
+        time.Advance(TimeSpan.FromSeconds(60));
+        await runner.WhenStarted(2);
+
+        Assert.Equal([1, 5], runner.Started);
+        Assert.Equal(["sc-1", "sc-5"], loop.RunsInFlight.Order());
+        Assert.Equal([1, 1], ListingSource.Of(source).Renewed); // the second poll renewed sc-1's claim while it ran
+        runner.End(1);
+        runner.End(5);
+        await loop.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.Empty(loop.RunsInFlight);
+    }
+
+    [Fact]
+    public async Task A_poll_renews_the_claim_of_an_item_in_flight_and_never_starts_it_a_second_time()
+    {
+        var runner = new GatedRunner(1);
+        var source = ListingSource.Listing(1);
+        var loop = Loop(source, runner, concurrent: 3);
+
+        var first = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await runner.WhenStarted(1);
+        var second = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await second.Done.WaitAsync(TimeSpan.FromSeconds(60)); // its dispatch has ended: it passed over sc-1, in flight and listed again (in flight and ready)
+
+        Assert.Equal([1], runner.Started);
+        Assert.Equal([1, 1], ListingSource.Of(source).Renewed);
+        Assert.False(first.Done.IsCompleted);
+        runner.End(1);
+        await first.Done.WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.Equal([1], runner.Started);
+    }
+
+    [Fact]
+    public async Task A_poll_with_no_free_capacity_lists_nothing_and_the_earlier_poll_starts_its_next_item_when_a_run_ends()
+    {
+        var runner = new GatedRunner(1, 2);
+        var source = ListingSource.Listing(5);
+        var loop = Loop(source, runner, concurrent: 2);
+
+        var first = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await runner.WhenStarted(2);
+        var second = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await second.Done.WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.Equal(1, ListingSource.Of(source).Listings); // every run was in flight: the second poll only renewed
+        Assert.Equal([1, 2, 1, 2], ListingSource.Of(source).Renewed);
+        Assert.Equal([1, 2], runner.Started.Order());
+        runner.End(2);
+        await runner.WhenStarted(3);
+        Assert.Equal([1, 2, 5], runner.Started.Order());
+        Assert.Equal(5, runner.Started.Last());
+        runner.End(1);
+        runner.End(5);
+        await first.Done.WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.Equal(2, runner.Most);
+    }
+
+    [Fact]
+    public async Task With_one_run_at_a_time_a_poll_during_the_run_renews_claims_and_starts_nothing_and_the_order_is_unchanged()
+    {
+        var runner = new GatedRunner(1);
+        var source = ListingSource.Listing(5);
+        var loop = Loop(source, runner, concurrent: 1);
+
+        var first = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await runner.WhenStarted(1);
+        var second = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await second.Done.WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.Equal([1], runner.Started);
+        Assert.Equal([1, 1], ListingSource.Of(source).Renewed);
+        runner.End(1);
+        await runner.WhenStarted(2);
+        Assert.Equal([1, 5], runner.Started);
+        runner.End(5);
+        await first.Done.WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.Equal(1, runner.Most);
+    }
+
+    [Fact]
+    public async Task Stopping_the_work_loop_waits_for_the_runs_in_flight()
+    {
+        var runner = new GatedRunner(1) { IgnoresCancellation = true };
+        var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider();
+        var loop = new IntakeLoop([new IntakeLane(ListingSource.Listing(), runner)], new IntakeOptions(TimeSpan.FromSeconds(60), MaxConcurrentRuns: 2), time,
+            NullLogger<IntakeLoop>.Instance);
+        await loop.StartAsync(CancellationToken.None);
+        await runner.WhenStarted(1);
+        await Eventually(() => loop.Waits >= 1, "the poll is done and the loop waits with its run in flight");
+
+        var stop = loop.StopAsync(CancellationToken.None);
+        await runner.SawCancellation.Task.WaitAsync(TimeSpan.FromSeconds(60));
+        // The run is finishing its step: the loop has not ended under it.
+        Assert.NotSame(stop, await Task.WhenAny(stop, Task.Delay(300)));
+        Assert.False(loop.ExecuteTask!.IsCompleted);
+        runner.End(1);
+        await stop.WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.True(loop.ExecuteTask.IsCompleted);
+        Assert.Empty(loop.RunsInFlight);
     }
 }

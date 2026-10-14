@@ -22,7 +22,7 @@ public class UsagePauseTests
 {
     private static readonly DateTimeOffset T0 = new(2026, 10, 6, 12, 0, 0, TimeSpan.Zero);
     private static readonly TimeSpan Interval = TimeSpan.FromSeconds(60);
-    private static readonly WorkStory Story = new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77");
+    private static readonly WorkStory Story = new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77", ItemNaming.Shortcut);
 
     private const string RouterExhausted =
         """API Error: 429 {"type":"error","error":{"type":"api_error","message":"All enrolled subscription accounts are currently unavailable."}}""";

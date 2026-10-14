@@ -78,6 +78,10 @@ internal sealed class E2e : IAsyncDisposable
         Harness.RequireReviewSettings();
         Harness.RequireClaude();
         await Harness.RequireRouterAsync();
+        // P4b-AT7: the machine's own settings (config and env) are the defaults before any test overrides them. The keychain's
+        // write token is not read here: an AT7 run's options hide it (Options).
+        var configured = FactoryOptions.LoadConfiguration();
+        RequireDefaultsWhenAsked(configured, new FactoryOptions(configured, new OverlaySecrets(new NoSecrets(), new Dictionary<string, string>())));
 
         var realRoot = Harness.Options.WorkRoot;
         RealLocks? realLock = null;
@@ -169,7 +173,69 @@ internal sealed class E2e : IAsyncDisposable
         {
             secrets[account] = ""; // blank is missing
         }
-        return new FactoryOptions(config, new OverlaySecrets(new MacKeychain(), secrets));
+        if (AskedForDefaults())
+        {
+            // P4b-AT7: a Kanban write token in the keychain would give the Kanban source an intake lane; the run hides it, as a
+            // Kanban test hides the Shortcut token. One from config or the environment still fails the guard below.
+            secrets[SecretAccounts.KanbanWriteToken] = "";
+        }
+        var options = new FactoryOptions(config, new OverlaySecrets(new MacKeychain(), secrets));
+        RequireDefaultsWhenAsked(config, options);
+        return options;
+    }
+
+    /// <summary>
+    /// The environment variable that makes a run a P4b-AT7 run (docs/acceptance.md, "P4b-AT7 — defaults"): set to <c>1</c>, every
+    /// live test's options must carry Phase 4b's defaults (<see cref="DefaultsProblems"/>), or the test fails before it starts.
+    /// </summary>
+    public const string DefaultsVariable = "FACTORY_E2E_P4B_DEFAULTS";
+
+    /// <summary>
+    /// What makes <paramref name="options"/> differ from Phase 4b's defaults (sc-25992, P4b-AT7: "With default settings the Phase
+    /// 1–4a live tests behave as before"): a watched Kanban project, a Kanban web URL, a Kanban write token (from config, env or
+    /// keychain: with one the Kanban source has an intake lane), <c>Worker:Slots</c> other than 1, <c>Intake:MaxConcurrentRuns</c>
+    /// other than 1. <c>Kanban:Token</c> and <c>Kanban:McpUrl</c> are Phase 3's (the reviewers' Kanban reads), not Phase 4b's, and
+    /// stay allowed. Empty when the options are the defaults.
+    /// </summary>
+    public static List<string> DefaultsProblems(IConfiguration config, FactoryOptions options)
+    {
+        var problems = new List<string>();
+        foreach (var key in new[] { "Kanban:Watch:Projects", "Kanban:WebUrl" })
+        {
+            if (!string.IsNullOrWhiteSpace(config[key]))
+            {
+                problems.Add($"{key} is set");
+            }
+        }
+        if (options.TryGet(o => o.KanbanWriteToken, out _))
+        {
+            problems.Add("a Kanban write token is configured (Kanban:WriteToken, FACTORY_KANBAN_WRITE_TOKEN or keychain account kanban-write-token)");
+        }
+        if (options.WorkerSlotCount != 1)
+        {
+            problems.Add($"Worker:Slots is {options.WorkerSlotCount}, not 1");
+        }
+        if (options.MaxConcurrentRuns != 1)
+        {
+            problems.Add($"Intake:MaxConcurrentRuns is {options.MaxConcurrentRuns}, not 1");
+        }
+        return problems;
+    }
+
+    private static bool AskedForDefaults(Func<string, string?>? environment = null) =>
+        (environment ?? Environment.GetEnvironmentVariable)(DefaultsVariable) == "1";
+
+    /// <summary>Under <see cref="DefaultsVariable"/>=1, fails the test unless its options are the defaults (<see cref="DefaultsProblems"/>).</summary>
+    public static void RequireDefaultsWhenAsked(IConfiguration config, FactoryOptions options,
+        Func<string, string?>? environment = null)
+    {
+        if (!AskedForDefaults(environment))
+        {
+            return;
+        }
+        var problems = DefaultsProblems(config, options);
+        Assert.True(problems.Count == 0,
+            $"{DefaultsVariable}=1 is a P4b-AT7 run, which must use the default settings, but {string.Join("; ", problems)}. Unset them for this run.");
     }
 
     /// <summary>The env a child <c>factory work</c> needs for the same settings (<c>__</c> separators).</summary>
@@ -378,6 +444,14 @@ internal sealed class RealLocks : IDisposable
 }
 
 /// <summary>Secrets from <paramref name="inner"/> (the owner's keychain) except the accounts overridden here; writes go nowhere.</summary>
+/// <summary>A secret store that holds nothing (the AT7 guard's look at config and env alone).</summary>
+internal sealed class NoSecrets : ISecretStore
+{
+    public string? Get(string account) => null;
+
+    public void Set(string account, string value) => throw new NotSupportedException("The acceptance harness never writes the keychain.");
+}
+
 internal sealed class OverlaySecrets(ISecretStore inner, IReadOnlyDictionary<string, string> overrides) : ISecretStore
 {
     public string? Get(string account) => overrides.TryGetValue(account, out var value) ? value : inner.Get(account);

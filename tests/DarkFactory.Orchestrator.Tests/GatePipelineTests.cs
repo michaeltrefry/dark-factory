@@ -28,7 +28,7 @@ public class GatePipelineTests
     private static readonly string Policy = TestPolicies.Standard();
 
     private static readonly WorkStory Story =
-        new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77");
+        new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77", ItemNaming.Shortcut);
 
     /// <summary>GitHub as the gate sees it: one PR whose head the test can move, CI per commit, the base branch's policy.</summary>
     internal sealed class FakeGateGitHub : IGateGitHub

@@ -523,6 +523,22 @@ public class FactoryOptionsTests
     }
 
     [Fact]
+    public void A_kanban_write_token_equal_to_the_read_token_is_refused_at_start_up_without_printing_either()
+    {
+        // sc-25992 (E2): the read token reaches model sessions through the MCP proxy; the full-scope one must never be it.
+        const string token = "kb_same_full_scope_token_value";
+        var secrets = new InMemorySecrets();
+        secrets.Set(SecretAccounts.KanbanWriteToken, token);
+        var refused = Assert.Throws<InvalidOperationException>(() => Options(new() { ["Kanban:Token"] = token }, secrets).ValidateSettings());
+        Assert.Contains("Kanban:WriteToken must not be the same token as Kanban:Token", refused.Message);
+        Assert.DoesNotContain(token, refused.Message);
+
+        // Apart, or only one of them set, start-up goes on.
+        Options(new() { ["Kanban:Token"] = "kb_read_scope_token" }, secrets).ValidateSettings();
+        Options(new() { ["Kanban:WriteToken"] = "kb_other_full_scope" }).ValidateSettings();
+    }
+
+    [Fact]
     public async Task The_kanban_token_comes_from_config_or_keychain_and_without_one_there_is_no_kanban_upstream()
     {
         var secrets = new InMemorySecrets();

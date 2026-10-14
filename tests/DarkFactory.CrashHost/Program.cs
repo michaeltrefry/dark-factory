@@ -40,8 +40,10 @@ sealed class NoCost : ISessionCostSource
 /// <summary>A one-story board: comments go to a file, other board writes are no-ops.</summary>
 sealed class FileStories(string commentsPath) : IWorkSource
 {
+    public ItemNaming Naming => ItemNaming.Shortcut;
+
     public Task<WorkSpec> ReadSpecAsync(int id, CancellationToken ct) =>
-        Task.FromResult(new WorkSpec(new WorkStory(id, "Add fix.txt", "Create fix.txt.", "bug", $"https://app.shortcut.com/test/story/{id}"), null, []));
+        Task.FromResult(new WorkSpec(new WorkStory(id, "Add fix.txt", "Create fix.txt.", "bug", $"https://app.shortcut.com/test/story/{id}", ItemNaming.Shortcut), null, []));
 
     public Task CommentAsync(int id, string text, CancellationToken ct) =>
         File.AppendAllTextAsync(commentsPath, $"{id}\t{text.ReplaceLineEndings(" ")}\n", ct);

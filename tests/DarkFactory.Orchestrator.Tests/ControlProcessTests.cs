@@ -48,7 +48,7 @@ public sealed class ControlProcessTests : IAsyncLifetime
     private string Origin => Path.Combine(_dir, "origin.git");
     private LedgerDbContextFactory Contexts => new(LedgerDbContext.PostgresOptions(_ledger));
     private IControls Controls => new LedgerControls(Contexts, TimeProvider.System);
-    private readonly FakeWorkSource _stories = new(new WorkStory(StoryId, "Add files", "Add tool files.", "feature", $"https://app.shortcut.com/test/story/{StoryId}"));
+    private readonly FakeWorkSource _stories = new(new WorkStory(StoryId, "Add files", "Add tool files.", "feature", $"https://app.shortcut.com/test/story/{StoryId}", ItemNaming.Shortcut));
     private readonly FakePullRequests _prs = new();
 
     private async Task<RunOutcome> RunAsync(LedgerDbContext db, CancellationToken ct)
