@@ -297,6 +297,135 @@ public class WorkerSandboxTests
         }
     }
 
+    private const string HomeLine = "\nhome=~\n";
+    private const string GetconfCall = "$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)";
+
+    /// <summary>
+    /// Runs <c>/usr/bin/env</c> through a helper copy whose home is <paramref name="home"/> and whose <c>getconf</c> answers
+    /// <paramref name="getconf"/> (null: no answer, as on Linux), so the owner's real home and temporary directory are never touched.
+    /// The worker's TMPDIR, or null when the helper refused to run it.
+    /// </summary>
+    private async Task<(int ExitCode, string? TmpDir, string Stderr)> RunWithTempDirAsync(string home, string? getconf)
+    {
+        Assert.Equal(1, SafeHelper.SourceCount(HomeLine));
+        Assert.Equal(1, SafeHelper.SourceCount(GetconfCall));
+        Assert.DoesNotContain('\'', home + getconf);
+        var helper = SafeHelper.Create(_dir, new SafeHelperOptions
+        {
+            Mutate = copy => copy.Replace(HomeLine, $"\nhome='{home}'\n")
+                .Replace(GetconfCall, getconf is null ? "$(false || true)" : $"$(echo '{getconf}')"),
+        });
+        var psi = new ProcessStartInfo(helper.Path, ["/usr/bin/env"])
+        {
+            WorkingDirectory = _dir,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        using var p = Process.Start(psi)!;
+        await IgnoringBrokenPipeAsync(async () =>
+        {
+            await p.StandardInput.WriteAsync("\n");
+            await p.StandardInput.FlushAsync();
+        });
+        var stdout = p.StandardOutput.ReadToEndAsync();
+        var stderr = p.StandardError.ReadToEndAsync();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await p.WaitForExitAsync(cts.Token);
+        await IgnoringBrokenPipeAsync(() => { p.StandardInput.Close(); return Task.CompletedTask; });
+        return (p.ExitCode, SandboxSupport.ParseEnv(await stdout).GetValueOrDefault("TMPDIR"), await stderr);
+    }
+
+    private string FakeHome() => Directory.CreateDirectory(Path.Combine(_dir, $"home-{Guid.NewGuid():N}")).FullName;
+
+    [Fact]
+    public async Task Helper_gives_the_systems_per_user_temp_dir_when_it_is_a_directory_the_user_owns()
+    {
+        var home = FakeHome();
+        var system = Directory.CreateDirectory(Path.Combine(_dir, "T")).FullName + "/";
+
+        var (exitCode, tmpdir, stderr) = await RunWithTempDirAsync(home, system);
+
+        Assert.True(exitCode == 0, stderr);
+        Assert.Equal(system, tmpdir);
+        Assert.False(Path.Exists(Path.Combine(home, ".tmp")));
+    }
+
+    [Theory]
+    [InlineData("none")] // Linux: getconf has no such variable
+    [InlineData("relative")]
+    [InlineData("missing")] // an absolute path to nothing
+    [InlineData("not-owned")] // a real directory another user (root) owns
+    [InlineData("symlink")] // a symlink to a directory the user owns
+    public async Task Helper_falls_back_to_a_0700_home_temp_dir_unless_getconf_names_a_directory_the_user_owns(string answer)
+    {
+        var home = FakeHome();
+        var owned = Directory.CreateDirectory(Path.Combine(_dir, $"owned-{Guid.NewGuid():N}")).FullName;
+        var link = Path.Combine(_dir, $"link-{Guid.NewGuid():N}");
+        File.CreateSymbolicLink(link, owned);
+        var getconf = answer switch
+        {
+            "none" => null,
+            "relative" => "relative/T/",
+            "missing" => Path.Combine(_dir, "missing") + "/",
+            "not-owned" => "/usr/",
+            "symlink" => link + "/",
+            _ => throw new ArgumentOutOfRangeException(nameof(answer)),
+        };
+
+        var (exitCode, tmpdir, stderr) = await RunWithTempDirAsync(home, getconf);
+
+        Assert.True(exitCode == 0, stderr);
+        Assert.Equal(Path.Combine(home, ".tmp"), tmpdir);
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(tmpdir));
+    }
+
+    [Fact]
+    public async Task Helper_makes_an_existing_looser_home_temp_dir_0700()
+    {
+        var home = FakeHome();
+        var tmp = Directory.CreateDirectory(Path.Combine(home, ".tmp")).FullName;
+        File.SetUnixFileMode(tmp, (UnixFileMode)0b111_101_101); // 0755
+
+        var (exitCode, tmpdir, stderr) = await RunWithTempDirAsync(home, null);
+
+        Assert.True(exitCode == 0, stderr);
+        Assert.Equal(tmp, tmpdir);
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(tmp));
+    }
+
+    [Theory]
+    [InlineData("symlink")] // a symlink to a directory the user owns: neither used nor changed
+    [InlineData("file")]
+    [InlineData("uncreatable")] // a home the user cannot write (root's /usr). An existing ~/.tmp another user owns cannot be made
+                                // without root here; the ownership test is the same own_dir as getconf's "not-owned" case above.
+    public async Task Helper_refuses_to_run_with_a_home_temp_dir_that_is_not_the_users_own_directory(string kind)
+    {
+        var home = FakeHome();
+        var target = Directory.CreateDirectory(Path.Combine(_dir, $"target-{Guid.NewGuid():N}")).FullName;
+        File.SetUnixFileMode(target, (UnixFileMode)0b111_101_101); // 0755
+        switch (kind)
+        {
+            case "symlink":
+                File.CreateSymbolicLink(Path.Combine(home, ".tmp"), target);
+                break;
+            case "file":
+                File.WriteAllText(Path.Combine(home, ".tmp"), "");
+                break;
+            case "uncreatable":
+                Assert.False(Path.Exists("/usr/.tmp"));
+                home = "/usr";
+                break;
+        }
+
+        var (exitCode, tmpdir, stderr) = await RunWithTempDirAsync(home, null);
+
+        Assert.Equal(70, exitCode);
+        Assert.Contains("factory-worker-launch: no per-user temporary directory: " + home + "/.tmp must be a directory (not a symlink) owned by the running user", stderr);
+        Assert.Null(tmpdir); // the worker never ran
+        Assert.Equal((UnixFileMode)0b111_101_101, File.GetUnixFileMode(target));
+    }
+
     private const string SelfExclusion = "[ \"$pid\" != \"$$\" ] || continue";
 
     /// <summary>

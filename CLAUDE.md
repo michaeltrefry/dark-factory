@@ -323,7 +323,9 @@ Worker sandbox (E5): workers run as a hidden sandbox user — `_factory`, or wit
 helper, as that user only). Everything in this paragraph holds per sandbox user.
 The owner's home is ACL-denied to it, so `~/.ssh`, `~/.config/gh` and the login keychain are
 unreachable. Router variables go to the helper on stdin; the helper builds the worker env from scratch
-(PATH, HOME from the password database, TMPDIR the user's own `getconf DARWIN_USER_TEMP_DIR` (else a 0700 `~/.tmp`) — never the shared `/tmp`,
+(PATH, HOME from the password database, TMPDIR the user's own `getconf DARWIN_USER_TEMP_DIR` (else a 0700 `~/.tmp`; either only if
+it is a real directory, not a symlink, owned by the running user — an unusable getconf answer falls back to `~/.tmp`, an unusable
+`~/.tmp` makes the helper refuse to run, exit 70) — never the shared `/tmp`,
 where one sandbox user's NuGet locks refuse another's restore, helper_version 5, sc-25992 — MSBuild node reuse/build server off,
 router vars), refuses any
 other variable or a program that isn't an absolute path/plain name, and when the worker exits or its stdin
