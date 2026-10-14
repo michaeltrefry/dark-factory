@@ -599,12 +599,25 @@ public class WorkerSandboxTests
     }
 
     [Fact]
-    public void The_worker_is_forked_with_stderr_on_dev_null_and_given_the_helpers_stderr_back_before_its_exec()
+    public void The_helpers_own_stderr_is_dev_null_from_the_launch_on_and_its_real_stderr_is_descriptor_3()
     {
-        // The line that test caught under load (8 of 32 loaded runs of it): "child setpgid (N to N): Operation not permitted",
-        // from bash 3.2's forked child under set -m, written before the command's own redirections are applied.
-        Assert.True(SafeHelper.SourceContains("\"$@\" </dev/null 2>&3 3>&- &\n} 3>&2 2>/dev/null\nworker=$!\nset +m\n"));
-        // A worker a Stop killed: bash's "Killed: 9 /usr/bin/env …" job report comes from this wait.
+        // bash 3.2's own reports are not the worker's output and not the helper's messages: "child setpgid (N to N): Operation
+        // not permitted" from the child it forks under set -m (8 of 32 loaded runs of the 200-run test), and the job report of
+        // a job a signal ended ("Killed: 9 /usr/bin/env …", "Terminated: 15 ( while … )"), written when bash next reads a script
+        // line — so also for a worker a Stop killed before the helper reached its wait, which no redirection on that wait can
+        // catch (sc-25990). The helper's stderr is /dev/null from the launch to its exit; the worker gets the real one back.
+        Assert.True(SafeHelper.SourceContains(
+            "\nexec 3>&2 2>/dev/null\nset -m # the worker gets its own process group\n/usr/bin/env -i "));
+        Assert.True(SafeHelper.SourceContains("\"$@\" </dev/null 2>&3 3>&- &\nworker=$!\nset +m\n"));
+        // Nothing else the helper starts keeps the real stderr: the watcher, and the sweep's listing and its awk.
+        Assert.True(SafeHelper.SourceContains("\n) <&0 3>&- & #"));
+        Assert.True(SafeHelper.SourceContains("for pid in $(list_uid_procs 3>&- | outside_tree \"$$\" 3>&-); do\n"));
+        // What the helper itself says after the launch goes to the real stderr by name, and nothing after it is sent to fd 2.
+        Assert.True(SafeHelper.SourceContains("processes still appearing after $pass sweeps\" >&3\n"));
+        Assert.False(SafeHelper.SourceContainsAfter("\nexec 3>&2 2>/dev/null\n", ">&2"));
+        Assert.Equal(1, SafeHelper.SourceCount("\" >&3\n")); // the one message printed after the launch
+        Assert.Equal(1, SafeHelper.SourceCount("\nexec "));
+        // The earlier redirections stay (a wait for a signal-killed job reports it too).
         Assert.True(SafeHelper.SourceContains("\nwait \"$worker\" 2>/dev/null || status=$?\n"));
         Assert.False(SafeHelper.SourceContains("\nwait \"$worker\" ||"));
     }
@@ -612,10 +625,66 @@ public class WorkerSandboxTests
     [Fact]
     public async Task The_workers_own_stderr_still_reaches_the_helpers_and_the_saved_descriptor_is_closed_for_it()
     {
+        // The worker holds what any child of this process holds — its three standard descriptors — and no other: not the
+        // helper's saved stderr (3), nor anything else the helper opened.
         var (exitCode, stderr) = await RunHelperAsync(
-            ["/bin/sh", "-c", "echo from-the-worker >&2; if [ -e /dev/fd/3 ]; then echo fd-3-open >&2; fi; exit 7"], "\n", closeStdin: false);
+            ["/bin/sh", "-c", "echo from-the-worker >&2; " + OpenDescriptors("worker") + " >&2; exit 7"], "\n", closeStdin: false);
 
-        Assert.Equal((7, "from-the-worker\n"), (exitCode, stderr));
+        Assert.Equal((7, "from-the-worker\n" + await InheritedDescriptorsAsync("worker")), (exitCode, stderr));
+    }
+
+    /// <summary>What <see cref="OpenDescriptors"/> prints in a plain child of this test host: nothing, unless the host itself hands its children a descriptor above 2.</summary>
+    private static async Task<string> InheritedDescriptorsAsync(string who)
+    {
+        using var p = Process.Start(new ProcessStartInfo("/bin/sh", ["-c", OpenDescriptors(who)]) { RedirectStandardOutput = true, RedirectStandardInput = true, RedirectStandardError = true })!;
+        var printed = await p.StandardOutput.ReadToEndAsync();
+        await p.WaitForExitAsync();
+        return printed;
+    }
+
+    /// <summary>A shell snippet that prints <c>&lt;who&gt;-fd-N-open</c> for every descriptor 3 to 9 its shell holds.</summary>
+    private static string OpenDescriptors(string who) =>
+        $"for fd in 3 4 5 6 7 8 9; do if ( : <&$fd ) 2>/dev/null; then echo {who}-fd-$fd-open; fi; done";
+
+    [Fact]
+    public async Task The_probe_for_open_descriptors_sees_one_that_is_open()
+    {
+        // The probe the tests below rely on, shown to work: a shell handed descriptor 5 reports it, and only it.
+        var psi = new ProcessStartInfo("/bin/sh", ["-c", $"exec 5</dev/null; /bin/sh -c '{OpenDescriptors("x")}'"]) { RedirectStandardOutput = true };
+        using var p = Process.Start(psi)!;
+        Assert.Equal("x-fd-5-open\n", await p.StandardOutput.ReadToEndAsync(TestContext.Current.CancellationToken));
+        await p.WaitForExitAsync(TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task Nothing_the_helper_starts_but_the_worker_holds_its_real_stderr()
+    {
+        // The orchestrator reads the helper's stderr to its end, so a process that outlived the helper holding it would hang
+        // the read. The watcher and the sweep's listing are started with the saved descriptor closed (their own stderr is
+        // /dev/null); probes inside both say what each holds.
+        const string WatcherLoop = "    while IFS= read -r _; do :; done\n";
+        Assert.True(SafeHelper.SourceContains("\n(\n" + WatcherLoop));
+        var (ofWatcher, ofListing) = (Path.Combine(_dir, "watcher.fds"), Path.Combine(_dir, "listing.fds"));
+        var helper = SafeHelper.Create(_dir, new SafeHelperOptions
+        {
+            Identity = FakeIdentity.SandboxRole,
+            FakeListing = "{ echo listed; " + OpenDescriptors("listing") + "; } >>'" + ofListing + "'; " + Machinery,
+            Mutate = copy => copy.Replace("\n(\n" + WatcherLoop, "\n(\n    { echo watching; " + OpenDescriptors("watcher") + "; } >'" + ofWatcher + "'\n" + WatcherLoop),
+        });
+        var psi = new ProcessStartInfo(helper.Path, ["/bin/sh", "-c", "/bin/sleep 0.3"]) { RedirectStandardInput = true, RedirectStandardError = true };
+        psi.Environment.Remove("SUDO_USER");
+        psi.Environment.Remove("SUDO_UID");
+        using var p = Process.Start(psi)!;
+        await p.StandardInput.WriteAsync("\n");
+        await p.StandardInput.FlushAsync();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var stderr = await p.StandardError.ReadToEndAsync(cts.Token);
+        await p.WaitForExitAsync(cts.Token);
+        p.StandardInput.Close();
+
+        Assert.Equal((0, ""), (p.ExitCode, stderr));
+        Assert.Equal("watching\n" + await InheritedDescriptorsAsync("watcher"), File.ReadAllText(ofWatcher));
+        Assert.Equal("listed\n" + await InheritedDescriptorsAsync("listing"), File.ReadAllText(ofListing));
     }
 
     [Fact]
@@ -627,18 +696,16 @@ public class WorkerSandboxTests
         Assert.Matches("no-such-program.?: No such file or directory", stderr); // GNU env quotes the name
     }
 
-    [Fact]
-    public async Task A_stopped_workers_helper_reports_137_and_writes_no_job_report()
+    /// <summary>
+    /// Runs a helper whose worker never ends by itself and stops it by closing the helper's stdin: at once — a Stop cancels at
+    /// once, so the worker can be killed before the helper's main shell has reached its wait for it — or only when the worker
+    /// has printed a line, the helper then long since in that wait. The helper's exit code, its stderr, and how long that
+    /// stderr took to end once the helper had exited.
+    /// </summary>
+    private static async Task<(int ExitCode, string Stderr, TimeSpan UntilStderrEnded)> RunStoppedHelperAsync(SafeHelper helper, bool atOnce)
     {
-        // Before: "…/factory-worker-launch: line N: <pid> Killed: 9  /usr/bin/env -i …" on every Stop.
-        // The stop comes once the helper is in its wait for the worker — the case its redirected wait answers for. A stdin
-        // closed at once can kill the worker before the helper's main shell has reached that wait, and bash 3.2 then reports
-        // the killed job when it reads the next script line, on the helper's real stderr (the helper is not changed for that:
-        // a session is never stopped that early). The worker's line comes well after the helper's fork: /usr/bin/env, a shell
-        // and a pause, against the two assignments and the watcher's fork the helper runs before it waits.
-        var psi = new ProcessStartInfo(SafeHelper.Create(_dir).Path, ["/bin/sh", "-c", "/bin/sleep 0.5; echo started; exec /bin/sleep 600"])
+        var psi = new ProcessStartInfo(helper.Path, ["/bin/sh", "-c", atOnce ? "exec /bin/sleep 600" : "/bin/sleep 0.5; echo started; exec /bin/sleep 600"])
         {
-            WorkingDirectory = _dir,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -648,12 +715,104 @@ public class WorkerSandboxTests
         await p.StandardInput.FlushAsync();
         var stderrRead = p.StandardError.ReadToEndAsync();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-        Assert.Equal("started", await p.StandardOutput.ReadLineAsync(cts.Token));
+        if (!atOnce)
+        {
+            Assert.Equal("started", await p.StandardOutput.ReadLineAsync(cts.Token));
+        }
 
         p.StandardInput.Close(); // the Stop
         await p.WaitForExitAsync(cts.Token);
+        var exited = Stopwatch.GetTimestamp();
+        var stderr = await stderrRead.WaitAsync(cts.Token);
 
-        Assert.Equal((137, ""), (p.ExitCode, await stderrRead));
+        return (p.ExitCode, stderr, Stopwatch.GetElapsedTime(exited));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_stopped_workers_helper_reports_137_and_writes_no_job_report(bool atOnce)
+    {
+        // Before: "…/factory-worker-launch: line N: <pid> Killed: 9  /usr/bin/env -i …" on every Stop, from the wait for the
+        // worker; and, for a worker killed before the helper reached that wait, from whichever script line bash read next.
+        var (exitCode, stderr, untilStderrEnded) = await RunStoppedHelperAsync(SafeHelper.Create(_dir), atOnce);
+
+        Assert.Equal((137, ""), (exitCode, stderr));
+        // Nothing of the helper's outlives it holding its stderr: the orchestrator's read of it ends with the helper.
+        Assert.True(untilStderrEnded < TimeSpan.FromSeconds(5), $"the helper's stderr ended {untilStderrEnded} after it exited");
+    }
+
+    [Fact]
+    public async Task A_worker_stopped_at_once_leaves_the_helpers_stderr_empty_run_after_run()
+    {
+        // A Stop cancels at once. With the helper as it was (its real stderr still its own and its watcher's while it ran)
+        // this loop never got past run 18 in 30 loaded tries: a line on stderr from the stopped run's machinery. None in 200.
+        var helper = SafeHelper.Create(_dir);
+        for (var run = 1; run <= 200; run++)
+        {
+            var (exitCode, stderr, _) = await RunStoppedHelperAsync(helper, atOnce: true);
+
+            Assert.True(exitCode == 137 && stderr == "", $"run {run}: exit {exitCode}, stderr '{stderr}'");
+        }
+    }
+
+    /// <summary>The helper's line right before its wait for the worker: a pause put in front of it holds the main shell back while the worker dies.</summary>
+    private const string BeforeTheWait = "\nstatus=0\n";
+
+    /// <summary>
+    /// The early job report, made certain: a worker a signal ended BEFORE the helper's main shell reached its wait for it (a
+    /// worker that crashes at once; a Stop on a host so loaded that the watcher gets there first). bash 3.2 then reports the
+    /// job when it next reads a script line or finishes a command — no redirection on the wait itself can catch that. Here the
+    /// main shell is held for 0.3 s in front of its wait (a mutation of the copy: one foreground command), and the worker is
+    /// dead long before: with the helper's stderr still its real one this printed, every time,
+    /// "…: line N: &lt;pid&gt; Filesize limit exceeded: 25 /usr/bin/env -i …" (the worker ending itself) or
+    /// "… Killed: 9 /usr/bin/env -i …" (a Stop). Its stderr is /dev/null from the launch on: nothing arrives.
+    /// </summary>
+    [Theory]
+    [InlineData(false, 153)] // the worker ends itself by a signal: a file size limit of 0 makes its first write SIGXFSZ (25)
+    [InlineData(true, 137)] // the watcher kills it on a Stop that came at once
+    public async Task A_worker_a_signal_ended_before_the_helper_waited_for_it_is_not_reported_on_the_helpers_stderr(bool stopped, int exit)
+    {
+        Assert.True(SafeHelper.SourceContains(BeforeTheWait + "#"));
+        var helper = SafeHelper.Create(_dir, new SafeHelperOptions { Mutate = copy => copy.Replace(BeforeTheWait, "\n/bin/sleep 0.3" + BeforeTheWait) });
+        var file = Path.Combine(_dir, "too-big");
+        var psi = new ProcessStartInfo(helper.Path, ["/bin/sh", "-c", stopped ? "exec /bin/sleep 600" : $"ulimit -f 0; echo x >'{file}'; echo survived >&2"])
+        {
+            RedirectStandardInput = true,
+            RedirectStandardError = true,
+        };
+        using var p = Process.Start(psi)!;
+        await p.StandardInput.WriteAsync("\n");
+        await p.StandardInput.FlushAsync();
+        if (stopped)
+        {
+            p.StandardInput.Close();
+        }
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var stderr = await p.StandardError.ReadToEndAsync(cts.Token);
+        await p.WaitForExitAsync(cts.Token);
+        p.StandardInput.Close();
+
+        Assert.Equal((exit, ""), (p.ExitCode, stderr));
+    }
+
+    [Fact]
+    public async Task What_the_helper_itself_says_after_the_launch_still_reaches_its_stderr_and_bashs_job_report_does_not()
+    {
+        // The one message the helper prints after it launched its worker, with a worker a signal ended in the same run: the
+        // message arrives (through the saved descriptor), the job report of the killed worker does not.
+        var helper = HelperWithFakeListing(Machinery + "; echo \"$((600000 + n)) 1\"");
+        var psi = new ProcessStartInfo(helper.Path, ["/bin/sh", "-c", "exec /bin/sleep 600"]) { RedirectStandardInput = true, RedirectStandardError = true };
+        psi.Environment.Remove("SUDO_USER");
+        psi.Environment.Remove("SUDO_UID");
+        using var p = Process.Start(psi)!;
+        await p.StandardInput.WriteAsync("\n");
+        p.StandardInput.Close(); // stopped at once
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var stderr = await p.StandardError.ReadToEndAsync(cts.Token);
+        await p.WaitForExitAsync(cts.Token);
+
+        Assert.Equal((137, "factory-worker-launch: _dftest processes still appearing after 20 sweeps\n"), (p.ExitCode, stderr));
     }
 
     [Fact]

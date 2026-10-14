@@ -199,7 +199,7 @@ kill_sandbox_user() {
     local pass pid fresh signalled=" "
     for pass in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
         fresh=()
-        for pid in $(list_uid_procs | outside_tree "$$"); do
+        for pid in $(list_uid_procs 3>&- | outside_tree "$$" 3>&-); do
             [ "$pid" != "$$" ] || continue
             case "$signalled" in *" $pid "*) continue ;; esac
             signalled="$signalled$pid "
@@ -208,21 +208,29 @@ kill_sandbox_user() {
         [ ${#fresh[@]} -gt 0 ] || return 0
         kill_pids "${fresh[@]}"
     done
-    echo "factory-worker-launch: $sandbox_user processes still appearing after $pass sweeps" >&2
+    # To fd 3: this runs after the launch, where the helper's stderr is /dev/null (see there).
+    echo "factory-worker-launch: $sandbox_user processes still appearing after $pass sweeps" >&3
 }
 
+# From here on the helper's own stderr is /dev/null and its real stderr is fd 3. bash 3.2 writes reports of its
+# own on stderr that are not the worker's and not this helper's messages, and they would otherwise land on the
+# stderr the orchestrator reads:
+#   - "child setpgid (N to N): Operation not permitted": under set -m both bash and the child it forks call
+#     setpgid for the child; on macOS, under load, the child's own call can lose to the parent's and fail, and
+#     bash's child reports it before it applies the command's redirections (the group is set all the same);
+#   - "<pid> Killed: 9 /usr/bin/env ..." / "Terminated: 15 ( while ... )": a job a signal ended is reported
+#     when bash next reads a script line or waits — also for a worker a Stop killed before this shell reached
+#     its wait, which no redirection on the wait itself can catch.
+# So: the worker's own redirection gives it the real stderr back before the exec (2>&3) and closes fd 3 for it
+# (the worker's stderr, and a failed exec's message, still arrive); every message this helper prints after this
+# line goes to fd 3 explicitly (>&3); and fd 3 is closed for everything else the helper starts (the watcher, the
+# sweep's listing), so nothing but the worker's own tree can hold the orchestrator's stderr open. What is lost
+# with it: bash's own diagnostics after this line (a fork that fails, a set -e exit); the helper then exits
+# non-zero.
+exec 3>&2 2>/dev/null
 set -m # the worker gets its own process group
-# Under set -m both bash and the child it forks call setpgid for the child. On macOS, under load, the
-# child's own call can lose to the parent's and fail, and bash 3.2's child then reports "child setpgid
-# (N to N): Operation not permitted" on its stderr before it applies the command's redirections (the
-# group is set all the same, by the parent's call). So the fork happens with stderr on /dev/null and the
-# worker's own redirection puts the helper's real stderr (saved as fd 3, closed for the worker) back
-# before the exec: the worker's stderr, and a failed exec's message, still reach it. (Only bash's own
-# report of a fork that fails right here is lost with it; the helper then exits non-zero.)
-{
-    /usr/bin/env -i "HOME=$home" "PATH=$path" MSBUILDDISABLENODEREUSE=1 DOTNET_CLI_USE_MSBUILD_SERVER=0 \
-        ${vars[@]+"${vars[@]}"} "$@" </dev/null 2>&3 3>&- &
-} 3>&2 2>/dev/null
+/usr/bin/env -i "HOME=$home" "PATH=$path" MSBUILDDISABLENODEREUSE=1 DOTNET_CLI_USE_MSBUILD_SERVER=0 \
+    ${vars[@]+"${vars[@]}"} "$@" </dev/null 2>&3 3>&- &
 worker=$!
 set +m
 
@@ -233,12 +241,13 @@ set +m
     send_signal -KILL -- "-$worker" || true
     # The uid sweep is the main shell's, after the worker is reaped; from here it would race
     # (and could kill) the main shell's own commands.
-) <&0 & # explicit, or bash gives background jobs /dev/null as stdin
+) <&0 3>&- & # stdin explicit, or bash gives background jobs /dev/null; never the helper's real stderr
 watcher=$!
 
 status=0
-# Redirected: for a worker a signal ended (a Stop's SIGKILL) this wait also prints bash's job report
-# ("Killed: 9 /usr/bin/env ..."). The exit status says it; the worker's own stderr is not this wait's.
+# A worker a signal ended (a Stop's SIGKILL) makes bash print a job report ("Killed: 9 /usr/bin/env ...") here,
+# or at an earlier line if it died before this one: on the helper's own stderr, which is /dev/null since the
+# launch (the redirections below are from before that and are kept). The exit status says it.
 wait "$worker" 2>/dev/null || status=$?
 # The watcher is gone before the sweep, which then spares only $$. Killed and reaped in one
 # redirected group: bash 3.2 also reports a signal-killed job ("Terminated: 15 ( while ... )")

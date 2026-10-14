@@ -85,20 +85,40 @@ Claude Code headless workers through the Weave router.
   A test signals a process only through `OwnProcess` (pid + start time, recorded where the pid cannot have been reused;
   `KillIfStillRunning` signals only while the start time still matches); `OwnProcessTests` fails on any other kill in
   `tests/` (`Process.Kill`, a kill(2) import, a `kill`/`pkill`/`killall` in a script).
-  The stray `… Terminated: 15 ( while … )` line on the helper's stderr (sc-25877's flake: about 1 in 100 runs of any test
-  asserting that stderr is empty) is fixed in the helper itself (sc-25989, `helper_version` 4): bash 3.2 also reports a
-  signal-killed job when it reads the next script line, so the watcher is now killed and reaped in one redirected group
-  (`{ send_signal "$watcher" || true; wait "$watcher" || true; } 2>/dev/null`; `WorkerSandboxTests` asserts that text and runs
-  the helper 200 times with an empty stderr). That 200-run test then caught two more lines that are bash's, not the worker's
-  (same `helper_version` 4, never installed without them): under load (8 of 32 loaded runs of the test, about 1 in 650
-  helper runs) `child setpgid (N to N): Operation not permitted` — under `set -m` bash and the child it forks both call
-  setpgid for the child, the child's call can lose on macOS, and bash 3.2's child reports it before the command's own
-  redirections apply (the group is set all the same) — so the worker is forked with stderr on `/dev/null` and its own
-  redirection gives it the helper's real stderr back before the exec (`{ … "$@" </dev/null 2>&3 3>&- & } 3>&2 2>/dev/null`:
-  the worker's stderr and a failed exec's message still arrive, fd 3 is closed for the worker); and, on every Stop,
-  `… Killed: 9 /usr/bin/env -i …` from the wait for a signal-killed worker, now `wait "$worker" 2>/dev/null` (the exit
-  status 137 says it). So the helper's stderr holds only the worker's own output and the helper's `factory-worker-launch: …`
-  messages. Never loosen those tests' assertion.
+  The helper's stderr (sc-25877's flake, then sc-25989 and sc-25990; all `helper_version` 4, which was never installed without
+  them): it holds only the worker's own output and the helper's `factory-worker-launch: …` messages, never a report of bash's
+  own. bash 3.2 writes three of those on its stderr: `… Terminated: 15 ( while … )` and `… Killed: 9 /usr/bin/env -i …`, the
+  job report of a job a signal ended (the watcher at the end of every run; the worker on every Stop), written when it next
+  reads a script line or finishes a command — about 1 in 100 runs of any test asserting an empty stderr, and for a worker a
+  signal ended BEFORE the helper's main shell had reached its `wait` no redirection on that `wait` can catch it; and, under
+  load (about 1 in 650 helper runs), `child setpgid (N to N): Operation not permitted` — under `set -m` bash and the child it
+  forks both call setpgid for the child, the child's call can lose on macOS, and bash's child reports it before the command's
+  own redirections apply (the group is set all the same). The design (sc-25990): right before the launch the helper moves its
+  own stderr away for the rest of the script — `exec 3>&2 2>/dev/null` — so everything bash itself reports from then on goes
+  nowhere; the worker's own redirection gives it the real stderr back before its exec and closes the saved descriptor for it
+  (`"$@" </dev/null 2>&3 3>&- &`: the worker's stderr and a failed exec's message still arrive, and the worker holds
+  descriptors 0, 1 and 2 only); the one message the helper prints after the launch (`… processes still appearing after N
+  sweeps`) goes to the saved descriptor by name (`>&3`); and fd 3 is closed for everything else the helper starts — the watcher
+  (`) <&0 3>&- &`, whose own stderr is now `/dev/null` too) and the sweep's listing and its awk (`list_uid_procs 3>&- |
+  outside_tree "$$" 3>&-`) — so nothing but the worker's own tree can hold the stderr the orchestrator reads to its end.
+  Everything printed BEFORE the launch (usage, a refused variable, `refusing the _factory uid sweep: …`) is on the real stderr
+  as before. The earlier redirections (`{ send_signal "$watcher" || true; wait "$watcher" || true; } 2>/dev/null`, `wait
+  "$worker" 2>/dev/null`) stay. What is lost with it: bash's own diagnostics after the launch (a fork that fails, a `set -e`
+  exit); the helper then exits non-zero. No safety property changed: the `sandbox_user`/`sandbox_uid` checks, `send_signal`,
+  the sweep and its self-exclusion, the environment, the program check and the exit status are the same lines as before.
+  `WorkerSandboxTests` pins that text; runs the helper 200 times with an empty stderr; stops a worker at once and later (exit
+  137, empty stderr, the stderr ending with the helper) and at once 200 times; holds the main shell 0.3 s in front of its
+  `wait` (a mutation of the test copy) while the worker ends itself by a signal (a file size limit of 0: SIGXFSZ, exit 153) or
+  is killed by a Stop — the early report made certain: with the helper's stderr still its own both print bash's report every
+  time, now neither does; and checks that the worker, the watcher and the sweep's listing hold no descriptor a plain child of
+  the test host does not, and that the helper's own late message still arrives next to a killed worker. Measured (sc-25990,
+  under CPU load the measurement started and stopped itself): the new helper 6,000 stop-at-once runs, 6,000 whole runs with
+  a sweep and 6,000 self-signalled workers, no line on stderr. The helper as it was: the early report did not show by timing
+  alone (0 in 6,000 stop-at-once runs with its watcher's stderr silenced, 0 in 6,200 self-signalled workers, the latter up to
+  36 load generators on 18 cores) — the window is a few script lines wide — and shows in every run once the main shell is
+  held in front of its `wait`; what did fail every stop-at-once loop within 18 runs was the TEST seam's own `awk: i/o error`
+  from a watcher killed mid-`send_signal` (the seam classifies targets with awk; the production `send_signal` is the `kill`
+  builtin and prints nothing), on the watcher's stderr, which was the helper's real one. Never loosen those tests' assertion.
   `CrashResumeTests` also needs the compose Postgres (skips locally without it, fails under `CI`): it
   SIGKILLs `tests/DarkFactory.CrashHost` (the real pipeline with a fake `claude` script) and restarts it.
   `ShortcutContractTests` replay recorded Shortcut API fixtures (`Fixtures/shortcut`, strict request matching);
