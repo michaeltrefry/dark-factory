@@ -1,17 +1,17 @@
 {
-  "recorded_from": "in-repo fake (provisional; re-record against the hosted instance)",
+  "recorded_from": "hosted KanbanBoard",
   "parameters": {
-    "project": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
-    "projectKey": "DFFIX843A9540",
+    "project": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
+    "projectKey": "DFFIX16A87D2D",
     "ready": [
-      "4ae3d636-33f8-4efd-bc52-00b67982d42d",
-      "9b4fb848-95f4-48e3-8856-04876f17f412",
-      "80ab7e81-af57-4b6b-a988-47375acc94ed"
+      "88b20b7a-e756-44e9-b0b1-c890db5b059a",
+      "06d2687d-a87b-40b8-8340-f657161d4b1b",
+      "817105bd-3131-4820-bc82-cf972e2b73d2"
     ],
     "left out": [
-      "0c8e6656-ef05-4376-9c61-4af15000eec6",
-      "0ee183e5-0d57-4e08-adc2-7ab91515201e",
-      "dede71bf-39cd-46e6-8b98-ec585c9bddbc"
+      "dabd9cca-d1d8-4f25-b58a-475c45d003c2",
+      "2c7fdd89-c674-42e1-8654-fb1c26c51a53",
+      "a2a6c293-4e63-4499-8e56-18a52336cbde"
     ]
   },
   "interactions": [
@@ -21,11 +21,12 @@
       "isError": false,
       "answer": [
         {
-          "id": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+          "id": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
           "name": "[dark-factory fixture] contract recording",
-          "key": "DFFIX843A9540",
+          "key": "DFFIX16A87D2D",
+          "description": "Throwaway project of the dark-factory Kanban contract fixtures; deleted after recording.",
           "isArchived": false,
-          "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
+          "createdAtUtc": "2026-10-14T11:42:45.433287+00:00",
           "totalItems": 6,
           "openItems": 6,
           "repository_url": "https://github.com/michaeltrefry/dark-factory-sandbox.git",
@@ -36,7 +37,7 @@
     {
       "tool": "list_work_items",
       "arguments": {
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
         "status": "Ready",
         "unblocked_only": true,
         "claim_state": "unclaimed",
@@ -47,8 +48,8 @@
       "answer": {
         "items": [
           {
-            "id": "4ae3d636-33f8-4efd-bc52-00b67982d42d",
-            "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+            "id": "88b20b7a-e756-44e9-b0b1-c890db5b059a",
+            "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
             "title": "[dark-factory fixture] ready 1",
             "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
             "type": "Task",
@@ -57,8 +58,8 @@
             "order": 0,
             "estimate": null,
             "comments": [],
-            "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-            "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+            "createdAtUtc": "2026-10-14T11:42:46.090058+00:00",
+            "updatedAtUtc": "2026-10-14T11:42:46.090063+00:00",
             "claimant": null,
             "claimant_id": null,
             "claim_marker": null,
@@ -70,8 +71,8 @@
             "label_list": []
           },
           {
-            "id": "9b4fb848-95f4-48e3-8856-04876f17f412",
-            "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+            "id": "06d2687d-a87b-40b8-8340-f657161d4b1b",
+            "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
             "title": "[dark-factory fixture] ready 2",
             "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
             "type": "Task",
@@ -80,8 +81,8 @@
             "order": 1,
             "estimate": null,
             "comments": [],
-            "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-            "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+            "createdAtUtc": "2026-10-14T11:42:46.303157+00:00",
+            "updatedAtUtc": "2026-10-14T11:42:46.303159+00:00",
             "claimant": null,
             "claimant_id": null,
             "claim_marker": null,
@@ -93,26 +94,26 @@
             "label_list": []
           }
         ],
-        "next_cursor": "items:2"
+        "next_cursor": "aS42MzkyNzU3NDk2NjMwMzE1NzAuMDZkMjY4N2RhODdiNDBiODgzNDBmNjU3MTYxZDRiMWI"
       }
     },
     {
       "tool": "list_work_items",
       "arguments": {
-        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
         "status": "Ready",
         "unblocked_only": true,
         "claim_state": "unclaimed",
         "limit": 2,
         "include_comments": false,
-        "cursor": "items:2"
+        "cursor": "aS42MzkyNzU3NDk2NjMwMzE1NzAuMDZkMjY4N2RhODdiNDBiODgzNDBmNjU3MTYxZDRiMWI"
       },
       "isError": false,
       "answer": {
         "items": [
           {
-            "id": "80ab7e81-af57-4b6b-a988-47375acc94ed",
-            "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+            "id": "817105bd-3131-4820-bc82-cf972e2b73d2",
+            "projectId": "e74648fd-b6ae-47d9-805e-493edd40fbfb",
             "title": "[dark-factory fixture] ready 3",
             "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
             "type": "Task",
@@ -121,8 +122,8 @@
             "order": 2,
             "estimate": null,
             "comments": [],
-            "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
-            "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+            "createdAtUtc": "2026-10-14T11:42:46.604289+00:00",
+            "updatedAtUtc": "2026-10-14T11:42:46.604292+00:00",
             "claimant": null,
             "claimant_id": null,
             "claim_marker": null,

@@ -1176,10 +1176,11 @@ each deliberate:
 
 `KanbanContractTests` replay `tests/DarkFactory.Orchestrator.Tests/Fixtures/kanban/*.json` in every `dotnet test`: the Kanban
 work source's whole lifecycle, each `tools/call` matched strictly by tool name and arguments. **The committed fixtures are
-provisional.** Each says `"recorded_from": "in-repo fake (provisional; re-record against the hosted instance)"`: they were
-made by the real recorder, but against the in-repo contract-enforcing fake (`FakeKanbanBoard`), so they pin the adapter to
-KanbanBoard's contract as this repository understands it, not yet to what the hosted server answers. One owner-run recording
-replaces them (the epic's terminal story).
+hosted recordings** (sc-25992, 2026-10-14): each says `"recorded_from": "hosted KanbanBoard"`, and CI sets
+`KANBAN_FIXTURES_REQUIRE_HOSTED=1`, so a provisional one (`"in-repo fake (provisional; …)"`, what `KANBAN_RECORD=fake` writes)
+fails the build. The first hosted recording found that the scrubbing of a refusal's message also rewrote claim markers
+(the factory's identity is called `factory`, so `dark-factory:<id>` became `dark-fixture-recorder:<id>`): a name is now
+scrubbed, and guarded, only where it stands on its own (`KanbanIdentities.Mention`).
 
 Prerequisites:
 

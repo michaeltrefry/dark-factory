@@ -158,13 +158,14 @@ Claude Code headless workers through the Weave router.
   conditional move); a `busy` cannot be provoked on demand (the board answers it only after a write waited 10 s for other
   writers), so that one interaction is authored from the contract's Error shape by the recording handler, not forwarded, and
   marked (`note`, `KanbanRecordingHandler.SyntheticBusyNote`) — the resend after it is the board's own answer.
-  PROVISIONAL (until the epic's terminal story): the committed fixtures say
-  `"recorded_from": "in-repo fake (provisional; re-record against the hosted instance)"` — made by that same recorder against
-  `FakeKanbanBoard` (`KANBAN_RECORD=fake`), which `KanbanFixtureRecording` also proves end to end in every `dotnet test`.
-  Re-record against the hosted board with `KANBAN_RECORD=1` and a full-scope token in `KANBAN_RECORD_TOKEN` (the environment
+  HOSTED (sc-25992, 2026-10-14): the committed fixtures say `"recorded_from": "hosted KanbanBoard"`; before, they were
+  provisional recordings against `FakeKanbanBoard` (`KANBAN_RECORD=fake`, which `KanbanFixtureRecording` still proves end to
+  end in every `dotnet test`). A refusal's message is scrubbed of an identity's name only where the name stands on its own
+  (`KanbanIdentities.Mention`: the factory's identity is called `factory`, and a plain replace rewrote `dark-factory:<id>`
+  markers). Re-record against the hosted board with `KANBAN_RECORD=1` and a full-scope token in `KANBAN_RECORD_TOKEN` (the environment
   only: never the keychain, never a file; `KANBAN_RECORD_URL` for another instance: absolute https, or http on a loopback
   host, else refused — `KanbanFixtureRecording.Endpoint`) — docs/acceptance.md, "Kanban contract
-  fixtures". `KANBAN_FIXTURES_REQUIRE_HOSTED=1` makes a fixture that is still provisional fail `dotnet test`.
+  fixtures". `KANBAN_FIXTURES_REQUIRE_HOSTED=1` (set in CI) makes a provisional fixture fail `dotnet test`.
 - `tests/DarkFactory.AcceptanceTests` — live epic acceptance harness; skips unless `FACTORY_E2E=1`. AT1–AT8 runbook:
   `docs/acceptance.md` (the `factory work` tests use a throwaway ledger DB and their own work root, `E2e.cs`). Phase 2's epic
   AT2/AT4/AT5/AT6 (sc-25391): `ReviewGateTests` (typed outcome per row, merge queue, PR body and closeout equal to the ledger's),
