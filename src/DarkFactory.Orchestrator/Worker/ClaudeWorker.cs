@@ -371,7 +371,7 @@ public sealed class ClaudeWorker(
     {
         if (!WorkerModelClass.IsValid(modelClass))
         {
-            throw new ArgumentException($"'{modelClass}' is not a router model class (high, mid or low).", nameof(modelClass));
+            throw new ArgumentException($"'{modelClass}' is not a router model class (max, high, mid or low).", nameof(modelClass));
         }
         if (routerKey.IndexOfAny(['\r', '\n']) >= 0)
         {
@@ -536,7 +536,7 @@ public sealed class ClaudeWorker(
     {
         if (!WorkerModelClass.IsValid(modelClass))
         {
-            throw new ArgumentException($"'{modelClass}' is not a router model class (high, mid or low).", nameof(modelClass));
+            throw new ArgumentException($"'{modelClass}' is not a router model class (max, high, mid or low).", nameof(modelClass));
         }
         if (pauseFlagDirectory is null)
         {

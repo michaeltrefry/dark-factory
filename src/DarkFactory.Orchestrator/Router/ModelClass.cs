@@ -1,7 +1,7 @@
 namespace DarkFactory.Orchestrator.Router;
 
 /// <summary>
-/// The router's model classes (epic E8, owner decision 2026-10-09): a call names a class with <see cref="Header"/> and never a
+/// The router's model classes (epic E8, owner decision 2026-10-09): <c>max</c>, <c>high</c>, <c>mid</c> and <c>low</c>. A call names a class with <see cref="Header"/> and never a
 /// model id, the router picks the model inside it, and every proxied answer names the served model's class in
 /// <see cref="ResponseHeader"/>. The router refuses a class sent with <c>x-weave-force-model</c> (400
 /// <c>model_class_conflicts_with_force_model</c>), and answers 503 <see cref="Unavailable"/> when no model of the class can
@@ -9,6 +9,7 @@ namespace DarkFactory.Orchestrator.Router;
 /// </summary>
 public static class ModelClass
 {
+    public const string Max = "max";
     public const string High = "high";
     public const string Mid = "mid";
     public const string Low = "low";
