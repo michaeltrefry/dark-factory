@@ -2258,7 +2258,13 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `-skipMacroValidation -skipPackagePluginValidation` (below) and `CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM=
   PROVISIONING_PROFILE_SPECIFIER= PROVISIONING_PROFILE=` (ad hoc), with `~` from the password database, and runs
   `/usr/bin/xcodebuild` under `env -i` (HOME, a fixed PATH, the user's own TMPDIR): xcodebuild reads environment variables as
-  build settings. Per-slot caches: the launch helper gives every worker its own user's HOME and TMPDIR, so each slot's
+  build settings. Two forms for the merge gate (sc-26131; a worker may run them too, on its own working directory only):
+  `--gate build-for-testing|test-without-building …` — the same, but the SwiftPM checkouts are `<DerivedData>/SourcePackages`,
+  inside that working directory's DerivedData, never the shared `~/Library/Caches/dark-factory/SourcePackages` every worker
+  session of the user can edit (`--gate` with `build`, `test` or `-list`, or not first, is refused) — and
+  `clean-derived-data` (no other argument), which deletes the working directory's DerivedData (the gate's checkouts with it)
+  as the running user once its parent resolves inside the user's own home (a symbolic link at the key is removed, never
+  followed; exit 70 when the parent leads out of the home or the directory is still there). Per-slot caches: the launch helper gives every worker its own user's HOME and TMPDIR, so each slot's
   DerivedData and SwiftPM checkouts are its own; so are SwiftPM's own caches (`~/Library/Caches/org.swift.swiftpm`,
   `~/Library/org.swift.swiftpm`; `SwiftToolchain.SwiftPmCachesOf`) wherever a worker runs `swift build`/`swift test` directly —
   those allow rules are not this story's (they come with sc-26127's SwiftPM support). `factory-worker-launch` is unchanged
@@ -2895,43 +2901,75 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   file in that target has; the id is xcodebuild's own, `<Target>/<function>()` or `<Target>/<Type>/<Nested>/<function>()`
   (verified on Xcode 26.5: what `-only-testing:` takes and the result bundle names). `unsupported` (never `no-tests`): a
   changed file that adds tests or looks like a test file that no unit-test target compiles (not a member of its test
-  target — "add it to its test target" —, or compiled only by a UI-test or other target), a membership or project that
+  target — "add it to its test target" —, or compiled only by a UI-test or other target), a file the base run would apply
+  that any other target also compiles — at the head, or at the base where the overlay writes or removes it (a production
+  file the PR moves into the test target) — ("… is compiled by both a test target and <target> at the head|base: the gate
+  cannot apply its test code alone": it would carry head production code into the base run), a membership or project that
   cannot be read, a parameterized test or new XCTest method (S3), a backticked name or an id/path/scheme the wrapper's
   patterns refuse, an id declared twice, a target that does not build for macOS in its scheme's test configuration
   (`SDKROOT` `macosx`, or `auto` with `macosx` in `SUPPORTED_PLATFORMS`; one set only in an `.xcconfig` is not known; iOS is
-  S6), no shared scheme (`xcshareddata/xcschemes`, the workspace's then the project's, first by name) whose test action runs
-  the target — at the head and the same one at the base — or one that only runs a test plan or selects/skips tests, a
-  project named by two workspaces (one names it: `-workspace`), and a base without the target. Base overlay: every changed
+  S6), a test bundle not named for its target (`PRODUCT_NAME` set to anything but `$(TARGET_NAME)` or the target's name, at
+  the head or the base, or one an `.xcconfig` may set: xcodebuild names its tests by the bundle,
+  `XcodeProject.ProductNameProblem`), no shared scheme (`xcshareddata/xcschemes`, the workspace's then the project's, first
+  by name) whose test action runs the target — at the head and the same one at the base — or one that selects/skips tests,
+  a project named by two workspaces (one names it: `-workspace`), and a base without the target. Test plans: a scheme
+  whose test action runs a test plan is used when its ONE default plan (`TestPlanReference default="YES"`: what xcodebuild
+  runs without `-testPlan`, which the gate never passes — the wrapper refuses it) is in the commit and lists the target
+  (`containerPath` relative to the scheme's project or workspace directory, as Xcode 26.5 resolves it; verified) and is
+  enabled; the plan (`XcodeTestPlan`, ≤ 1 MiB JSON, depth 64) is read whole or not at all: version 1, exactly one
+  configuration (each would run every test again), options only of `XcodeTestPlan.Options` (never `testRepetitionMode` or
+  `maximumTestRepetitions`, nor anything unknown), and per test target only `target`, `enabled`, `parallelizable`,
+  `randomExecutionOrdering` and `selectedTests`/`skippedTests` as lists of names; a new test the plan would not run — a
+  skipped entry names it or a type holding it, or it selects others only (`XcodePlanTarget.Excludes`), at the head or at
+  the base, whose own scheme and plan the base run uses — is `unsupported` naming the plan; no default plan, two, or a plan
+  beside the scheme's own testables is a scheme the gate cannot use. LensWorks (the first workload, read 2026-10-14) has no
+  test plan: one shared scheme `Compositor` (Xcode 26: `shouldAutocreateTestPlan = "YES"` with its own testables), a macOS
+  app over synchronized folders, Swift Testing in its unit-test target and XCTest in its UI-test target; Xcode's project
+  templates create no `.xctestplan` either. Base overlay: every changed
   file a unit-test target compiles (head or base); schemes and production code stay the base's, and so does the project file
-  but for one edit: a new test file under classic references (compiled only because the PR's `project.pbxproj` adds it) and a
-  test file the PR removes from one are added to / taken out of the base's test target Sources
+  but for one edit: under classic references every applied file the head's test target compiles and the base's does not —
+  a new test file and a new helper beside it alike — and a test file the PR removes from one are added to / taken out of
+  the base's test target Sources
   (`XcodeProject.WithClassicSources`: a `SOURCE_ROOT` file reference in the main group and a build file in the target's one
   Sources phase, made by text edit and then checked — every other object exactly the base's, the two lists changed by exactly
   those ids, the target compiling exactly the right files — else `unsupported`), written as `NewTestSet.BaseReplacements`;
   the PR's project file itself is never applied (it would bring its production targets' changes). A new file in a
   synchronized folder needs no edit. Runs (`SandboxTestRunner`, as the item's slot's sandbox user): `/usr/bin/xcodebuild
-  -version` and `/usr/bin/xcrun --find xcresulttool` (toolchain), per project+scheme the installed wrapper
-  `SwiftToolchain.DefaultWrapperPath build-for-testing -project|-workspace … -scheme … -destination platform=macOS -quiet`
-  (output kept: the build log; a base that does not build is not attributed yet — every error unattributable, `error`, the
-  S2 seam `ExplainBuildFailure`), then per test the wrapper's `test-without-building … -only-testing:<id> -resultBundlePath
-  <results>/xcode-test-<16 hex>.xcresult -quiet` (exit code kept) and `/usr/bin/xcrun xcresulttool get test-results tests
-  --path <bundle>` (its JSON kept): the bundle is read IN the sandbox by the user whose tests wrote it, and only its JSON
+  -version` and `/usr/bin/xcrun --find xcresulttool` (toolchain), the installed wrapper's `clean-derived-data` (a `Restore`
+  step: failing, the run is an `error`), per project+scheme
+  `SwiftToolchain.DefaultWrapperPath --gate build-for-testing -project|-workspace … -scheme … -destination platform=macOS -quiet`
+  (output kept: the build log; `XcodeNewTests` attributes nothing — unlike `SwiftNewTests` since S2, a base that does not
+  build is every error unattributable, `error`, no retry), then per test the wrapper's `--gate test-without-building …
+  -only-testing:<id> -resultBundlePath <results>/xcode-test-<16 hex>.xcresult -quiet` (exit code kept) and `/usr/bin/xcrun
+  xcresulttool get test-results tests --path <bundle>` (its JSON kept), and last `clean-derived-data` again, a
+  `TestPhase.Cleanup` step: `SandboxTestRunner` runs a run's cleanup steps after every other step however the run ended —
+  built or not, timed out, failed, cancelled by a Pause or Stop — before its worktree is deleted, each bounded by
+  `SandboxTestRunner.CleanupTimeout` (2 min) on no cancellation token, its exit logged and deciding nothing (the next run
+  cleans first anyway). Why: a gate worktree's path is the same for every run of an item (`gate-<item>-base|head`), so its
+  DerivedData (keyed on that path) and, before `--gate`, the shared SwiftPM checkouts were writable by every worker session of
+  the slot and reused by the gate's next run — a session could plant products, a build database or package source for the
+  gate's base run to build on and run; now each run builds from a DerivedData it emptied, with packages it resolved into it,
+  and leaves nothing behind. The bundle is read IN the sandbox by the user whose tests wrote it, and only its JSON
   (bounded by the 50 MB capture) reaches the owner, parsed as untrusted (`XcodeNewTests.Cases`: Xcode 26.5's shape, pinned in
   `Fixtures/xcresult` — `testNodes` → `Unit test bundle` named for the target → `Test Suite`s → `Test Case` with
-  `nodeIdentifier` and `result` `Passed`/`Failed`/`Skipped`/`Expected Failure` (passed); anything else unreadable). A JSON is
+  `nodeIdentifier` and `result` `Passed`/`Failed`/`Skipped`/`Expected Failure`; an `Expected Failure` — a `withKnownIssue`
+  that recorded its issue, xcodebuild exit 0 — is read as skipped: no pass on the head, no failure on the base; anything
+  else unreadable). A JSON is
   read only when xcresulttool exited 0, every case is its step's test, and xcodebuild's exit code agrees (0 exactly when no
   case failed; a test absent from the build gives no case: `not-run`, an `error`). The gateway lint needs nothing new: the
-  steps' programs are `TestStep.Program`, a known local program. Residual, accepted (the Xcode counterpart of `~/.cargo`'s):
-  the wrapper's DerivedData (`~<user>/Library/Developer/Xcode/DerivedData/dark-factory/<key of the worktree path>`) and
-  SwiftPM checkouts persist in the slot user's home, are writable by every worker session of that slot and are reused by the
-  next gate run of a worktree of the same name (`gate-<item>-base|head`), so an implementer could influence later gate runs
-  of the same item; and they are never deleted — the gate's DerivedData grows by two directories per item that reaches the
-  check (remove `…/DerivedData/dark-factory` as that user to reclaim it). Tests: `XcodeNewTestsTests.cs` (the plist reader,
-  membership both ways and its unknowns, platform, schemes, workspaces, identification and every `unsupported` above, the
-  classic edit and its refusals, steps, the recorded xcresulttool JSON and every disagreement, the pipeline to Merge with
-  `Worker:Swift` on and to an escalation with it off, and the real toolchain — the repo's wrapper over the real xcodebuild
-  as the OWNER, never a sandbox user, building `Fixtures/xcode-macos` and `xcode-classic` and running each new test alone on
-  the base and the head, the DerivedData it made in the owner's home deleted after; skipped without Xcode).
+  steps' programs are `TestStep.Program`, a known local program. Residual, accepted (the same class as a target's build
+  phases, which run as the sandbox user on both commits): the head run uses the head's scheme, so its test action's pre- and
+  post-actions and environment variables (and, with a test plan, the head plan's environment and arguments) run in the head
+  run as the sandbox user; the base run uses the base's. Tests: `XcodeNewTestsTests.cs` (the plist reader,
+  membership both ways and its unknowns, platform, product name, schemes, test plans and their refusals, workspaces,
+  identification and every `unsupported` above, a file in both a test and a production target, a new helper file, the
+  classic edit and its refusals, steps — the clean first and last, `--gate` on every build and test —, the recorded
+  xcresulttool JSON (an expected failure included) and every disagreement, the pipeline to Merge with `Worker:Swift` on and to
+  an escalation with it off, and the real toolchain — the repo's wrapper over the real xcodebuild as the OWNER, never a
+  sandbox user, building `Fixtures/xcode-macos`, `xcode-classic` and the test-plan scheme `xcode-plan` and running each new
+  test alone on the base and the head, a file planted in the head run's DerivedData beforehand and both runs' DerivedData
+  gone afterwards; skipped without Xcode), `GateCloneTests.A_cleanup_step_runs_after_every_other_step_however_the_run_ended`,
+  `XcodebuildWrapperTests` (`--gate`, `clean-derived-data`, a link at the key removed and not followed, the refusals).
   Upgrading from Phase 1: Review is now a handled state, so the first `factory work` picks up every item parked at Review:
   an open PR is reviewed by the panel like any other (Phase 1's missing `implementer-model` no longer matters, sc-25379),
   and one the owner merged or closed escalates once with a story comment ("merged outside the factory"). An item whose

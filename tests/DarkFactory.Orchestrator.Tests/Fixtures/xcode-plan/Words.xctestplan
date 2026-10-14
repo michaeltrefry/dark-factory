@@ -1,0 +1,24 @@
+{
+  "configurations" : [
+    {
+      "id" : "5C0B2A51-1D0E-4F6B-9E57-0D3A5C1E2B71",
+      "name" : "Configuration 1",
+      "options" : {
+
+      }
+    }
+  ],
+  "defaultOptions" : {
+    "testTimeoutsEnabled" : true
+  },
+  "testTargets" : [
+    {
+      "target" : {
+        "containerPath" : "container:Words.xcodeproj",
+        "identifier" : "B10000000000000000000102",
+        "name" : "WordsTests"
+      }
+    }
+  ],
+  "version" : 1
+}

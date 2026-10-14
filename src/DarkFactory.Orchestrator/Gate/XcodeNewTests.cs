@@ -20,33 +20,39 @@ namespace DarkFactory.Orchestrator.Gate;
 /// <para>
 /// Unisolable (<c>unsupported</c>, never a pass and never <c>no-tests</c>): a changed file that adds tests, or looks like a
 /// test file, but that no unit-test target compiles (not a member of its test target, or of a UI-test or other target); a
-/// file whose membership cannot be read, or a project that cannot be read; a parameterized test and a new XCTest method (a
+/// file the base run would apply that another target also compiles, at the head or at the base (its head production code
+/// would reach the base run); a file whose membership cannot be read, or a project that cannot be read; a parameterized test and a new XCTest method (a
 /// later story, as for SwiftPM); a backticked name or an id with characters the xcodebuild wrapper refuses; an id declared
-/// twice; a target that builds for anything but macOS in its scheme's test configuration (iOS: a later story); no shared
-/// scheme (<c>xcshareddata/xcschemes</c>) whose test action runs the target (or one only a test plan does), at the head or
-/// at the base; a project named by more than one workspace; a base that lacks the target; and a base project whose
+/// twice; a target that builds for anything but macOS in its scheme's test configuration (iOS: a later story); a test
+/// bundle not named for its target (<see cref="XcodeProject.ProductNameProblem"/>); no shared scheme
+/// (<c>xcshareddata/xcschemes</c>) whose test action — or its default test plan (<see cref="XcodeTestPlan"/>, read whole or
+/// not at all) — runs the target, at the head or at the base; a new test that plan skips or does not select; a project named by more than one workspace; a base that lacks the target; and a base project whose
 /// membership of the new test's file cannot be read or whose project file cannot be given it (below).
 /// </para>
 /// <para>
 /// The base run's overlay: every changed file that a unit-test target compiles, at the head or the base; the schemes and
 /// production code stay the base's, and so does the project file, with one exception. A new file in a synchronized folder
 /// is compiled by the base project as it is; a new test file under classic file references is compiled only because the
-/// PR's <c>project.pbxproj</c> adds it, and a test file the PR removes is still named by the base's — so the base run's
-/// project file is the base's with exactly those test files added to (or taken out of) the test target's Sources
+/// PR's <c>project.pbxproj</c> adds it (a new helper file beside new tests likewise), and a test file the PR removes is
+/// still named by the base's — so the base run's project file is the base's with exactly those test files added to (or taken out of) the test target's Sources
 /// (<see cref="XcodeProject.WithClassicSources"/>, checked to change nothing else), never the PR's, which would bring its
 /// production changes along.
 /// </para>
 /// <para>
 /// Runs (<see cref="SandboxTestRunner"/>, as the sandbox user: never xcodebuild itself, always the installed wrapper
 /// <see cref="SwiftToolchain.DefaultWrapperPath"/>, which forces ad hoc signing and a DerivedData of its own per worktree):
-/// <c>/usr/bin/xcodebuild -version</c> and <c>/usr/bin/xcrun --find xcresulttool</c> (the toolchain), then per project and
-/// scheme <c>factory-xcodebuild build-for-testing -project|-workspace … -scheme … -destination platform=macOS -quiet</c>
+/// <c>/usr/bin/xcodebuild -version</c> and <c>/usr/bin/xcrun --find xcresulttool</c> (the toolchain), the wrapper's
+/// <see cref="CleanDerivedData"/> (the worktree's path, so its DerivedData, is the same for every run of the item: nothing
+/// a worker session of the same user left there is built on), then per project and scheme <c>factory-xcodebuild --gate
+/// build-for-testing -project|-workspace … -scheme … -destination platform=macOS -quiet</c>
 /// (the build; its output is the build log: a base that does not build is not attributed to the new tests yet, so it is an
-/// <c>error</c>), then per test <c>factory-xcodebuild test-without-building … -only-testing:&lt;id&gt; -resultBundlePath
+/// <c>error</c>), then per test <c>factory-xcodebuild --gate test-without-building … -only-testing:&lt;id&gt; -resultBundlePath
 /// &lt;results&gt;/</c><see cref="BundleName"/> (its exit code kept) and <c>/usr/bin/xcrun xcresulttool get test-results
 /// tests --path</c> that bundle (its JSON kept): the result bundle is read in the sandbox, by the user whose tests wrote it,
 /// and only its JSON reaches the owner, bounded like every captured output and parsed as untrusted data
-/// (<see cref="ParseResults"/>).
+/// (<see cref="ParseResults"/>); and last <see cref="CleanDerivedData"/> again, a <see cref="TestPhase.Cleanup"/> step that
+/// runs however the run ended. <see cref="GateMode"/> puts the SwiftPM checkouts inside that DerivedData, never the user's
+/// shared ones every worker session can edit.
 /// </para>
 /// </summary>
 public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWrapperPath) : INewTestStrategy
@@ -62,6 +68,12 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
 
     /// <summary>This Mac: the only destination this strategy builds and tests for (iOS simulators are a later story; a device never, E3).</summary>
     public const string Destination = "platform=macOS";
+
+    /// <summary>The wrapper's action that deletes the working directory's DerivedData (and the gate's package checkouts in it).</summary>
+    public const string CleanDerivedData = "clean-derived-data";
+
+    /// <summary>The wrapper's first argument for the gate's builds and tests: package checkouts inside the run's own DerivedData.</summary>
+    public const string GateMode = "--gate";
 
     private const string Prefix = "xcode-test-";
 
@@ -119,6 +131,9 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
             ? new Build(flag, container, scheme)
             : throw new InvalidOperationException($"'{value}' is not an Xcode build of a new test.");
     }
+
+    /// <summary>How a target is built and tested: its build, its scheme's test configuration and, when the scheme runs a test plan, the plan's path and its entry for the target; or why it cannot be.</summary>
+    private sealed record BuildOf(Build? Build, string? Configuration, string? Problem, (string Path, XcodePlanTarget Target)? Plan = null);
 
     /// <summary>One commit's files, projects, schemes and workspaces, each read once.</summary>
     private sealed class Tree(TestSource source, string sha)
@@ -213,16 +228,16 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
         /// The build of <paramref name="target"/> of <paramref name="project"/>: the first shared scheme (by name; the
         /// workspace's when a workspace names the project, then the project's) whose test action runs it; or why there is none.
         /// </summary>
-        public async Task<(Build? Build, string? Configuration, string? Problem)> BuildOfAsync(XcodeProject project, XcodeTarget target, CancellationToken ct)
+        public async Task<BuildOf> BuildOfAsync(XcodeProject project, XcodeTarget target, CancellationToken ct)
         {
             var (workspaces, problem) = await WorkspacesOfAsync(project.Path, ct);
             if (problem is not null)
             {
-                return (null, null, problem);
+                return new BuildOf(null, null, problem);
             }
             if (workspaces.Count > 1)
             {
-                return (null, null, $"{project.Path} is in more than one workspace ({string.Join(", ", workspaces)}), so which one builds it cannot be told");
+                return new BuildOf(null, null, $"{project.Path} is in more than one workspace ({string.Join(", ", workspaces)}), so which one builds it cannot be told");
             }
             var (flag, container) = workspaces.Count == 1 ? ("-workspace", workspaces[0]) : ("-project", project.Path);
             var directories = workspaces.Select(w => (Dir: w, Base: Parent(w))).Append((Dir: project.Path, Base: project.Directory));
@@ -245,6 +260,28 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                         problems.Add($"the scheme {file} cannot be read ({e.Message})");
                         continue;
                     }
+                    if (scheme.TestPlan is { } reference)
+                    {
+                        // The scheme's default test plan: its targets (containers relative to the same directory as the scheme's).
+                        var planPath = XcodeScheme.ContainerPath(reference, baseDirectory);
+                        IReadOnlyList<XcodePlanTarget> planTargets;
+                        try
+                        {
+                            planTargets = planPath is not null && planPath.EndsWith(".xctestplan", StringComparison.Ordinal)
+                                ? XcodeTestPlan.Parse(await ReadAsync(planPath, ct) ?? throw new FormatException("it is not in the commit"))
+                                : throw new FormatException($"{reference} names no test plan in the repository");
+                        }
+                        catch (FormatException e)
+                        {
+                            problems.Add($"the scheme {name}'s test plan {planPath ?? reference} cannot be read ({e.Message})");
+                            continue;
+                        }
+                        if (planTargets.FirstOrDefault(t => t.Identifier == target.Id && XcodeScheme.ContainerPath(t.Container, baseDirectory) == project.Path) is { } planned)
+                        {
+                            return new BuildOf(new Build(flag, container, name), scheme.TestConfiguration, null, (planPath!, planned));
+                        }
+                        continue;
+                    }
                     var testable = scheme.Testables.FirstOrDefault(t => t.BlueprintId == target.Id && XcodeScheme.ContainerPath(t.Container, baseDirectory) == project.Path);
                     if (testable is null)
                     {
@@ -259,10 +296,10 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                         problems.Add($"the scheme {name} {scheme.Problem ?? "selects or skips some of the target's tests"}");
                         continue;
                     }
-                    return (new Build(flag, container, name), scheme.TestConfiguration, null);
+                    return new BuildOf(new Build(flag, container, name), scheme.TestConfiguration, null);
                 }
             }
-            return (null, null, $"no shared scheme of {container} tests the target {target.Name}"
+            return new BuildOf(null, null, $"no shared scheme of {container} tests the target {target.Name}"
                 + (problems.Count == 0 ? " (share one in Xcode: Manage Schemes → Shared, so it is in xcshareddata/xcschemes)" : $" the gate can use: {string.Join("; ", problems)}"));
         }
     }
@@ -452,6 +489,39 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
         }
         problems.AddRange(twice.Select(id => $"{id} is declared more than once at the head (conditional compilation?), so which one runs cannot be told"));
 
+        // A file applied to the base run must be test code alone: one any other target compiles — at the head, or at the base
+        // where the overlay writes or removes it (an app file the PR moves into the test target, say) — would carry the head's
+        // production code into the base run, or take the base's own out of it.
+        foreach (var change in testFiles.Distinct())
+        {
+            var where = new List<(Tree Tree, string Path, string Commit)>();
+            if (change.NewPath is { } now && Swift(now))
+            {
+                where.Add((head, now, "the head"));
+                where.Add((@base, now, "the base"));
+            }
+            if (change.OldPath is { } old && Swift(old) && old != change.NewPath)
+            {
+                where.Add((@base, old, "the base"));
+            }
+            foreach (var (tree, path, commit) in where)
+            {
+                if (await tree.InPackageAsync(path, ct))
+                {
+                    continue;
+                }
+                var (_, others, unknown) = await TargetsAsync(tree, path);
+                if (others.Count > 0)
+                {
+                    problems.Add($"{path} is compiled by both a test target and {string.Join(", ", others)} at {commit}: the gate cannot apply its test code alone");
+                }
+                else if (unknown.Count > 0)
+                {
+                    problems.Add($"which targets compile {path} at {commit} cannot be told: {string.Join("; ", unknown.Distinct().Take(5))}");
+                }
+            }
+        }
+
         // Each target with new tests: its scheme and platform at the head and the base, and the base compiling the new files.
         var projects = new Dictionary<string, string>(StringComparer.Ordinal);
         var edits = new Dictionary<(string Project, string Target), (List<string> Add, List<string> Remove)>();
@@ -459,7 +529,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
         {
             var (project, target, _) = group.First().Value;
             var label = $"the test target {target.Name} of {project.Path}";
-            var (build, configuration, problem) = await head.BuildOfAsync(project, target, ct);
+            var (build, configuration, problem, headPlan) = await head.BuildOfAsync(project, target, ct);
             if (build is null)
             {
                 problems.Add($"{label} cannot be built and tested at the head: {problem}");
@@ -478,6 +548,11 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
             {
                 groupProblems.Add($"{label} is not a macOS target in its scheme's {configuration} configuration ({headPlatform.Why}): iOS and other destinations are not run by the gate yet");
             }
+            if (project.ProductNameProblem(target, configuration!) is { } headName)
+            {
+                groupProblems.Add($"{label}: {headName}");
+            }
+            groupProblems.AddRange(PlanExcludes(headPlan, "the head", group.Select(n => n.Key), target.Name));
             var baseProject = (await @base.ProjectsAsync(ct)).FirstOrDefault(p => p.Path == project.Path);
             var baseTarget = baseProject.Project?.Targets.FirstOrDefault(t => t.Name == target.Name && t.IsUnitTests);
             if (baseProject.Project is null || baseTarget is null)
@@ -486,7 +561,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
             }
             else
             {
-                var (baseBuild, baseConfiguration, baseProblem) = await @base.BuildOfAsync(baseProject.Project, baseTarget, ct);
+                var (baseBuild, baseConfiguration, baseProblem, basePlan) = await @base.BuildOfAsync(baseProject.Project, baseTarget, ct);
                 if (baseBuild is null || baseBuild.ToString() != build.ToString())
                 {
                     groupProblems.Add(baseBuild is null ? $"at the base {baseProblem}" : $"the base tests {label} with the scheme {baseBuild.Scheme} of {baseBuild.Container}, the head with {build.Scheme} of {build.Container}");
@@ -495,7 +570,42 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                 {
                     groupProblems.Add($"{label} is not a macOS target at the base ({basePlatform.Why})");
                 }
-                foreach (var file in group.Select(n => n.Value.File).Distinct(StringComparer.Ordinal))
+                else if (baseProject.Project.ProductNameProblem(baseTarget, baseConfiguration!) is { } baseName)
+                {
+                    groupProblems.Add($"{label} at the base: {baseName}");
+                }
+                if (baseBuild is not null)
+                {
+                    groupProblems.AddRange(PlanExcludes(basePlan, "the base", group.Select(n => n.Key), target.Name));
+                }
+                // Every applied file the head's target compiles — a new helper beside the new tests too — must be compiled on the base.
+                var applied = testFiles.Select(c => c.NewPath).OfType<string>().Where(p => Swift(p)).Distinct(StringComparer.Ordinal).ToList();
+                var compiled = new List<string>();
+                foreach (var path in applied)
+                {
+                    if (await head.InPackageAsync(path, ct))
+                    {
+                        continue;
+                    }
+                    XcodeMembership atHead;
+                    try
+                    {
+                        atHead = project.Membership(target, path);
+                    }
+                    catch (FormatException e)
+                    {
+                        atHead = XcodeMembership.NotKnown(e.Message);
+                    }
+                    if (atHead.Unknown is { } headWhy)
+                    {
+                        groupProblems.Add($"whether the head's {project.Path} compiles {path} into {target.Name} cannot be told: {headWhy}");
+                    }
+                    else if (atHead.Member)
+                    {
+                        compiled.Add(path);
+                    }
+                }
+                foreach (var file in compiled)
                 {
                     var membership = baseProject.Project.Membership(baseTarget, file);
                     if (membership.Unknown is { } unknownWhy)
@@ -560,6 +670,13 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
 
         (List<string> Add, List<string> Remove) Edits(string project, string target) =>
             edits.TryGetValue((project, target), out var e) ? e : edits[(project, target)] = ([], []);
+
+        // The new tests a scheme's test plan would not run (xcodebuild's -only-testing runs nothing the plan skips or does not select).
+        static IEnumerable<string> PlanExcludes((string Path, XcodePlanTarget Target)? plan, string commit, IEnumerable<string> ids, string targetName) =>
+            plan is not { } p ? []
+            : ids.Select(id => (id, why: p.Target.Excludes(id[(targetName.Length + 1)..])))
+                .Where(x => x.why is not null)
+                .Select(x => $"{x.id}: the test plan {p.Path} at {commit} {x.why}, so the gate cannot run it");
     }
 
     // ---- Running them ------------------------------------------------------------------------------------------------------
@@ -579,11 +696,14 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
         {
             new(TestPhase.Toolchain, Xcodebuild, ["-version"]),
             new(TestPhase.Toolchain, Xcrun, ["--find", "xcresulttool"]),
+            // The worktree's path is the same for every run of the item, so its DerivedData (keyed on it) is deleted first:
+            // nothing a worker session of the same user left there is built on or run. Failing, the run is an error.
+            new(TestPhase.Restore, wrapperPath, [CleanDerivedData]),
         };
         for (var n = 0; n < groups.Count; n++)
         {
             var b = Build.From(groups[n].Key);
-            steps.Add(new TestStep(TestPhase.Build, wrapperPath, ["build-for-testing", b.Flag, b.Container, "-scheme", b.Scheme, "-destination", Destination, "-quiet"])
+            steps.Add(new TestStep(TestPhase.Build, wrapperPath, [GateMode, "build-for-testing", b.Flag, b.Container, "-scheme", b.Scheme, "-destination", Destination, "-quiet"])
                 { CaptureOutput = $"xcode-build-{n}" });
         }
         foreach (var group in groups)
@@ -594,11 +714,13 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                 var bundle = $"{resultsDirectory}/{BundleName(id)}";
                 steps.Add(new TestStep(TestPhase.Test, wrapperPath,
                 [
-                    "test-without-building", b.Flag, b.Container, "-scheme", b.Scheme, "-destination", Destination, $"-only-testing:{id}", "-resultBundlePath", bundle, "-quiet",
+                    GateMode, "test-without-building", b.Flag, b.Container, "-scheme", b.Scheme, "-destination", Destination, $"-only-testing:{id}", "-resultBundlePath", bundle, "-quiet",
                 ]) { CaptureOutput = OutputName(id) });
                 steps.Add(new TestStep(TestPhase.Test, Xcrun, ["xcresulttool", "get", "test-results", "tests", "--path", bundle]) { CaptureOutput = JsonName(id) });
             }
         }
+        // And again once the bundles are read, however the run ended (SandboxTestRunner runs it after a failed build or a timeout too).
+        steps.Add(new TestStep(TestPhase.Cleanup, wrapperPath, [CleanDerivedData]));
         return Task.FromResult<IReadOnlyList<TestStep>>(steps);
     }
 
@@ -606,7 +728,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
     /// Each test's cases from xcresulttool's JSON of its result bundle (Xcode 26's <c>get test-results tests</c>: a tree of
     /// <c>testNodes</c> — test plan, then the <c>Unit test bundle</c> named for the target, then <c>Test Suite</c>s, then
     /// <c>Test Case</c>s with a <c>nodeIdentifier</c> such as <c>Outer/Inner/deep()</c> and a <c>result</c> of
-    /// <c>Passed</c>, <c>Failed</c>, <c>Skipped</c> or <c>Expected Failure</c> (passed)). A case's id is its bundle's name, a
+    /// <c>Passed</c>, <c>Failed</c>, <c>Skipped</c> or <c>Expected Failure</c> (a known issue: read as skipped, so neither a pass on the head nor a failure on the base)). A case's id is its bundle's name, a
     /// <c>/</c>, and its node identifier. The JSON is untrusted (the tests wrote the bundle): it is read only when
     /// xcresulttool exited 0, it is the JSON of exactly one test step (<see cref="JsonName"/>), every case in it is that
     /// step's test, every result is one of those, and the test step's exit code is known and agrees with it (0 exactly when
@@ -716,9 +838,11 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                         }
                         cases.Add(new TestCaseResult($"{bundle}/{identifier}", result switch
                         {
-                            "Passed" or "Expected Failure" => TestCaseResult.Passed,
+                            "Passed" => TestCaseResult.Passed,
                             "Failed" => TestCaseResult.Failed,
-                            "Skipped" => TestCaseResult.Skipped,
+                            // A known issue (withKnownIssue) recorded: the test checked nothing that passed, so it is no pass on
+                            // the head, and no failure on the base either.
+                            "Skipped" or "Expected Failure" => TestCaseResult.Skipped,
                             _ => throw new InvalidDataException($"the test case {bundle}/{identifier} has the result '{result}', which the gate does not read"),
                         }));
                         break; // its children are its messages

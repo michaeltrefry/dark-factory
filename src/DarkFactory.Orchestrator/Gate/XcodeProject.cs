@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using System.Text.Json;
 using System.Xml;
 using System.Xml.Linq;
 
@@ -703,7 +704,11 @@ public sealed class XcodeProject
     };
 
     /// <summary>A build setting of <paramref name="configuration"/> for the target (its own, else the project's): the value, or why it cannot be told.</summary>
-    private (string? Value, string? Problem) Setting(XcodeTarget target, string configuration, string name)
+    private (string? Value, string? Problem) Setting(XcodeTarget target, string configuration, string name) =>
+        SettingOrUnset(target, configuration, name) is (null, null) ? (null, $"{name} is set neither by the target nor by the project") : SettingOrUnset(target, configuration, name);
+
+    /// <summary>As <see cref="Setting"/>, but (null, null) when neither the target nor the project sets it (Xcode's default then applies).</summary>
+    private (string? Value, string? Problem) SettingOrUnset(XcodeTarget target, string configuration, string name)
     {
         foreach (var (owner, label) in new[] { (target.Object, $"the target {target.Name}"), (_project, "the project") })
         {
@@ -725,7 +730,21 @@ public sealed class XcodeProject
                 return (null, $"{label}'s {configuration} configuration is based on an .xcconfig file, which may set {name}");
             }
         }
-        return (null, $"{name} is set neither by the target nor by the project");
+        return (null, null);
+    }
+
+    /// <summary>
+    /// Why the test bundle <paramref name="target"/> builds in <paramref name="configuration"/> is not named for the target —
+    /// its <c>PRODUCT_NAME</c> is set to something but <c>$(TARGET_NAME)</c> or the target's name, or cannot be told (an
+    /// <c>.xcconfig</c>) — or null. xcodebuild names a bundle's tests by the bundle (<c>&lt;product&gt;/…</c> in the result
+    /// bundle), while <c>-only-testing:</c> takes the target's name.
+    /// </summary>
+    public string? ProductNameProblem(XcodeTarget target, string configuration)
+    {
+        var (name, problem) = SettingOrUnset(target, configuration, "PRODUCT_NAME");
+        return problem is not null ? $"its product name cannot be told ({problem})"
+            : name is null or "$(TARGET_NAME)" or "${TARGET_NAME}" || name == target.Name ? null
+            : $"its PRODUCT_NAME is {name}, not the target's name {target.Name}: xcodebuild names its tests by the bundle, which the gate does not map to the target yet";
     }
 
     /// <summary>
@@ -761,7 +780,8 @@ public sealed record XcodeTestable(string BlueprintId, string Container, bool Fi
 /// <summary>
 /// A shared scheme (<c>xcshareddata/xcschemes/&lt;name&gt;.xcscheme</c>): its name, the configuration its test action
 /// builds (<c>Debug</c> when it names none), and the test targets that action runs; <see cref="Problem"/> when the test
-/// action is one the gate does not read (a test plan).
+/// action is one the gate does not read (test plans with no single default, or beside the action's own test targets);
+/// <see cref="TestPlan"/> when it runs its default test plan.
 /// </summary>
 public sealed record XcodeScheme(string Name, string TestConfiguration, IReadOnlyList<XcodeTestable> Testables, string? Problem)
 {
@@ -788,15 +808,36 @@ public sealed record XcodeScheme(string Name, string TestConfiguration, IReadOnl
             return new XcodeScheme(name, "Debug", [], null);
         }
         var configuration = test.Attribute("buildConfiguration")?.Value is { Length: > 0 } c ? c : "Debug";
-        var problem = test.Element("TestPlans") is not null ? "its test action runs a test plan, which the gate does not read" : null;
+        string? problem = null;
+        string? plan = null;
+        if (test.Element("TestPlans") is { } plans)
+        {
+            // xcodebuild runs the scheme's default plan when given no -testPlan (the gate never gives one: the wrapper refuses it).
+            var defaults = plans.Elements("TestPlanReference").Where(r => r.Attribute("default")?.Value == "YES").ToList();
+            if (defaults is not [var only] || only.Attribute("reference")?.Value is not { Length: > 0 } reference)
+            {
+                problem = "its test action names no single default test plan";
+            }
+            else if (test.Element("Testables")?.Elements().Any() == true)
+            {
+                problem = "its test action has both a test plan and test targets of its own";
+            }
+            else
+            {
+                plan = reference;
+            }
+        }
         var testables = (test.Element("Testables")?.Elements("TestableReference") ?? [])
             .Where(t => t.Attribute("skipped")?.Value != "YES")
             .SelectMany(t => t.Elements("BuildableReference").Select(b => new XcodeTestable(
                 b.Attribute("BlueprintIdentifier")?.Value ?? "", b.Attribute("ReferencedContainer")?.Value ?? "",
                 t.Element("SkippedTests") is not null || t.Element("SelectedTests") is not null || t.Attribute("useTestSelectionWhitelist")?.Value == "YES")))
             .ToList();
-        return new XcodeScheme(name, configuration, testables, problem);
+        return new XcodeScheme(name, configuration, testables, problem) { TestPlan = plan };
     }
+
+    /// <summary>The <c>container:</c> reference of the test action's default test plan, when it runs one (its test targets are then the plan's).</summary>
+    public string? TestPlan { get; init; }
 
     /// <summary>
     /// The repository path a <c>container:</c> reference names, relative to <paramref name="directory"/> (the directory
@@ -811,6 +852,147 @@ public sealed record XcodeScheme(string Name, string TestConfiguration, IReadOnl
         var relative = container["container:".Length..];
         return relative.StartsWith('/') ? null : RepoPath.Normalize(directory.Length == 0 ? relative : $"{directory}/{relative}");
     }
+}
+
+/// <summary>
+/// One test target of a test plan: the target (its id and its <c>container:</c> reference, relative to the directory of the
+/// project or workspace whose scheme runs the plan — as Xcode 26.5 resolves it) and the plan's own filters of its tests.
+/// </summary>
+public sealed record XcodePlanTarget(string Identifier, string Container, IReadOnlyList<string>? Selected, IReadOnlyList<string> Skipped)
+{
+    /// <summary>
+    /// Why the plan does not run the test whose place in the target is <paramref name="key"/> (<c>Type/f()</c>, the id
+    /// without the target), or null: a skipped entry names it or a type holding it, or the plan selects tests and none of
+    /// its entries does.
+    /// </summary>
+    public string? Excludes(string key)
+    {
+        static bool Names(string entry, string key) => key == entry || key.StartsWith(entry.TrimEnd('/') + "/", StringComparison.Ordinal);
+        return Skipped.FirstOrDefault(s => Names(s, key)) is { } skipped ? $"skips it ({skipped})"
+            : Selected is not null && !Selected.Any(s => Names(s, key)) ? "selects some of the target's tests, not it"
+            : null;
+    }
+}
+
+/// <summary>
+/// An Xcode test plan (<c>.xctestplan</c>, JSON) as far as the gate reads it, failing closed: exactly one configuration,
+/// options only of the kinds that neither repeat a test nor change what its result means (<see cref="Options"/>), and test
+/// targets whose filters are lists of names. Anything else is a <see cref="FormatException"/>.
+/// </summary>
+public static class XcodeTestPlan
+{
+    /// <summary>The largest test plan read.</summary>
+    public const int MaxChars = 1024 * 1024;
+
+    /// <summary>
+    /// The options a plan may set. Not among them, so refused: <c>testRepetitionMode</c> and <c>maximumTestRepetitions</c>
+    /// (a test run several times, retried on failure or until it fails), and every option this does not know.
+    /// </summary>
+    public static readonly IReadOnlySet<string> Options = new HashSet<string>(StringComparer.Ordinal)
+    {
+        "addressSanitizer", "areLocalizationScreenshotsEnabled", "codeCoverage", "commandLineArgumentEntries", "defaultTestExecutionTimeAllowance",
+        "diagnosticCollectionPolicy", "environmentVariableEntries", "language", "locationScenario", "mainThreadCheckerEnabled",
+        "mallocStackLoggingOptions", "maximumTestExecutionTimeAllowance", "preferredScreenCaptureFormat", "region", "systemAttachmentLifetime",
+        "targetForVariableExpansion", "testExecutionOrdering", "testTimeoutsEnabled", "threadSanitizer", "uiTestingScreenshotsLifetime",
+        "undefinedBehaviorSanitizer", "userAttachmentLifetime",
+    };
+
+    private static readonly IReadOnlySet<string> TargetKeys = new HashSet<string>(StringComparer.Ordinal)
+        { "target", "enabled", "parallelizable", "randomExecutionOrdering", "selectedTests", "skippedTests" };
+
+    /// <summary>The test targets the plan runs (an <c>enabled: false</c> one is not among them); throws <see cref="FormatException"/> for anything not read.</summary>
+    public static IReadOnlyList<XcodePlanTarget> Parse(string text)
+    {
+        if (text.Length > MaxChars)
+        {
+            throw new FormatException($"it is larger than {MaxChars} characters");
+        }
+        JsonElement root;
+        try
+        {
+            using var document = JsonDocument.Parse(text, new JsonDocumentOptions { MaxDepth = 64 });
+            root = document.RootElement.Clone();
+        }
+        catch (JsonException e)
+        {
+            throw new FormatException($"it is not JSON ({e.Message})");
+        }
+        Keys(root, "the plan", "configurations", "defaultOptions", "testTargets", "version");
+        if (!root.TryGetProperty("version", out var version) || version.ValueKind != JsonValueKind.Number || version.GetRawText() != "1")
+        {
+            throw new FormatException("its version is not 1");
+        }
+        if (Array(root, "configurations") is not [var configuration])
+        {
+            throw new FormatException("it has not exactly one configuration (each would run every test again)");
+        }
+        Keys(configuration, "its configuration", "id", "name", "options");
+        foreach (var options in new[] { configuration.TryGetProperty("options", out var o) ? o : default, root.TryGetProperty("defaultOptions", out var d) ? d : default })
+        {
+            if (options.ValueKind == JsonValueKind.Undefined)
+            {
+                continue;
+            }
+            if (options.ValueKind != JsonValueKind.Object)
+            {
+                throw new FormatException("its options are not an object");
+            }
+            foreach (var option in options.EnumerateObject().Where(p => !Options.Contains(p.Name)))
+            {
+                throw new FormatException($"it sets the option {option.Name}, which the gate does not read");
+            }
+        }
+        var targets = new List<XcodePlanTarget>();
+        foreach (var entry in Array(root, "testTargets"))
+        {
+            Keys(entry, "a test target", [.. TargetKeys]);
+            if (!entry.TryGetProperty("target", out var target) || target.ValueKind != JsonValueKind.Object)
+            {
+                throw new FormatException("a test target has no target");
+            }
+            Keys(target, "a test target's target", "containerPath", "identifier", "name");
+            var container = Str(target, "containerPath");
+            var identifier = Str(target, "identifier");
+            if (entry.TryGetProperty("enabled", out var enabled) && enabled.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+            {
+                throw new FormatException("a test target's enabled is not true or false");
+            }
+            if (enabled.ValueKind == JsonValueKind.False)
+            {
+                continue;
+            }
+            targets.Add(new XcodePlanTarget(identifier, container, entry.TryGetProperty("selectedTests", out _) ? Names(entry, "selectedTests") : null,
+                entry.TryGetProperty("skippedTests", out _) ? Names(entry, "skippedTests") : []));
+        }
+        return targets;
+    }
+
+    private static void Keys(JsonElement element, string what, params string[] allowed)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            throw new FormatException($"{what} is not an object");
+        }
+        foreach (var property in element.EnumerateObject())
+        {
+            if (!allowed.Contains(property.Name))
+            {
+                throw new FormatException($"{what} has {property.Name}, which the gate does not read");
+            }
+        }
+    }
+
+    private static List<JsonElement> Array(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Array ? value.EnumerateArray().ToList()
+            : throw new FormatException($"its {name} is not a list");
+
+    private static string Str(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String && value.GetString() is { Length: > 0 } s ? s
+            : throw new FormatException($"a test target's {name} is not a string");
+
+    private static List<string> Names(JsonElement entry, string name) =>
+        Array(entry, name).Select(n => n.ValueKind == JsonValueKind.String && n.GetString() is { Length: > 0 } s ? s
+            : throw new FormatException($"a test target's {name} holds something but a test's name (a form the gate does not read)")).ToList();
 }
 
 /// <summary>The projects an Xcode workspace (<c>contents.xcworkspacedata</c>) names, as repository paths.</summary>

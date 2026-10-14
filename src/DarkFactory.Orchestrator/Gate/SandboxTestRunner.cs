@@ -56,7 +56,50 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
             throw new ArgumentException($"'{spec.ResultsDirectory}' is not a results directory name.", nameof(spec));
         }
         var workspace = await git.PrepareCommitAsync(repo, spec.Name, spec.Commit, ct);
+        var cleaned = false;
         try
+        {
+            var report = await RunInWorktreeAsync(workspace, spec, ct);
+            cleaned = true;
+            return await CleanUpAsync(workspace.Path, spec) is { Length: > 0 } cleanup ? report with { Log = report.Log + cleanup } : report;
+        }
+        finally
+        {
+            if (!cleaned)
+            {
+                await CleanUpAsync(workspace.Path, spec); // a timed-out, failed or cancelled run is cleaned up too
+            }
+            await git.RemoveAsync(repo, workspace, CancellationToken.None);
+        }
+    }
+
+    /// <summary>How long each <see cref="TestPhase.Cleanup"/> step may take (it runs on no cancellation token, after the run's own deadline).</summary>
+    public static readonly TimeSpan CleanupTimeout = TimeSpan.FromMinutes(2);
+
+    /// <summary>
+    /// The run's <see cref="TestPhase.Cleanup"/> steps, each bounded by <see cref="CleanupTimeout"/> and on no cancellation
+    /// token, whatever happened before; their log (empty when there are none). Never throws: a failed clean-up decides nothing.
+    /// </summary>
+    private async Task<string> CleanUpAsync(string worktree, TestRunSpec spec)
+    {
+        var log = new StringBuilder();
+        foreach (var step in spec.Steps.Where(s => s.Phase == TestPhase.Cleanup))
+        {
+            try
+            {
+                var (exit, output, timedOut, _) = await RunStepAsync(worktree, step, CleanupTimeout, CancellationToken.None);
+                log.AppendLine($"$ {step.Program} {string.Join(' ', step.Args)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
+            }
+            catch (Exception e) when (e is not OutOfMemoryException)
+            {
+                log.AppendLine($"$ {step.Program} {string.Join(' ', step.Args)} → could not be run: {e.Message}");
+            }
+        }
+        return log.ToString();
+    }
+
+    private async Task<TestRunReport> RunInWorktreeAsync(Workspace workspace, TestRunSpec spec, CancellationToken ct)
+    {
         {
             if (spec.OverlayFrom is { } overlay)
             {
@@ -74,7 +117,7 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
             // The outputs kept for the steps that report on standard output: build steps' are build logs, test steps' results.
             var buildOutputs = new List<(string Name, string? Content)>();
             var testOutputs = new List<(string Name, string? Content, int ExitCode)>();
-            foreach (var step in spec.Steps)
+            foreach (var step in spec.Steps.Where(s => s.Phase != TestPhase.Cleanup))
             {
                 if (buildFailed && step.Phase == TestPhase.Test)
                 {
@@ -137,10 +180,6 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
             var tooLarge = files.Where(f => f.Content is null).Select(f => f.Name).Concat(testOutputs.Where(o => o.Content is null).Select(o => o.Name))
                 .Select(name => $"{name}: it is larger than {limit}, so it was not read");
             return new TestRunReport(TestRunStatus.Ran, parsed.Cases, log.ToString()) { UnreadableReports = [.. tooLarge, .. parsed.Unreadable] };
-        }
-        finally
-        {
-            await git.RemoveAsync(repo, workspace, CancellationToken.None);
         }
     }
 

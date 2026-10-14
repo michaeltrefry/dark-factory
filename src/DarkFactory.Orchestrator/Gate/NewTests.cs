@@ -34,6 +34,13 @@ public enum TestPhase
     Restore,
     Build,
     Test,
+
+    /// <summary>
+    /// Run after every other step of the run however the run ended — built or not, timed out, failed, cancelled — and
+    /// before its worktree is deleted (e.g. the Xcode wrapper's <c>clean-derived-data</c>, sc-26131): its exit code is
+    /// logged and decides nothing, and it is bounded on its own (<see cref="SandboxTestRunner.CleanupTimeout"/>).
+    /// </summary>
+    Cleanup,
 }
 
 /// <summary>

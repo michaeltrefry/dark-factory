@@ -35,6 +35,17 @@ internal static class XcodeFixture
         (prefix + TestFile, BaseTests),
     ];
 
+    public const string TestPlan = "Words.xctestplan";
+
+    /// <summary>The project with its scheme's test action running a default test plan (Fixtures/xcode-plan) instead of its own test targets.</summary>
+    public static (string Path, string Content)[] PlanFiles(string prefix = "", bool classic = false) =>
+    [
+        .. Files(prefix, classic).Select(f => f.Path == prefix + Scheme ? (f.Path, Read("xcode-plan", "Words.xcscheme")) : f),
+        (prefix + TestPlan, Read("xcode-plan", TestPlan)),
+    ];
+
+    public static string Plan => Read("xcode-plan", TestPlan);
+
     public static string Json(string name) => File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Fixtures", "xcresult", name));
 }
 
@@ -160,7 +171,7 @@ public class XcodeProjectTests
     }
 
     [Fact]
-    public void A_scheme_names_its_test_targets_and_configuration_and_a_test_plan_is_named_as_unread()
+    public void A_scheme_names_its_test_targets_and_configuration_and_a_test_plan_with_no_default_is_named_as_unread()
     {
         var scheme = XcodeScheme.Parse("Words", XcodeFixture.Read("xcode-macos", XcodeFixture.Scheme));
 
@@ -169,6 +180,50 @@ public class XcodeProjectTests
         Assert.Equal("App/Words.xcodeproj", XcodeScheme.ContainerPath("container:Words.xcodeproj", "App"));
         Assert.Contains("test plan", XcodeScheme.Parse("P", "<Scheme><TestAction><TestPlans><TestPlanReference reference=\"container:P.xctestplan\"/></TestPlans></TestAction></Scheme>").Problem);
         Assert.Throws<FormatException>(() => XcodeScheme.Parse("X", "<!DOCTYPE x [<!ENTITY e \"y\">]><Scheme/>"));
+    }
+
+    [Fact]
+    public void A_schemes_default_test_plan_is_read_and_its_targets_and_filters_fail_closed()
+    {
+        var scheme = XcodeScheme.Parse("Words", XcodeFixture.Read("xcode-plan", "Words.xcscheme"));
+        Assert.Equal(("container:Words.xctestplan", null, 0), (scheme.TestPlan, scheme.Problem, scheme.Testables.Count));
+        // No default plan, two, or a plan beside the scheme's own test targets: not read.
+        Assert.Contains("no single default test plan", XcodeScheme.Parse("P", "<Scheme><TestAction><TestPlans><TestPlanReference reference=\"container:P.xctestplan\"/></TestPlans></TestAction></Scheme>").Problem);
+        Assert.Contains("no single default test plan", XcodeScheme.Parse("P", "<Scheme><TestAction><TestPlans><TestPlanReference reference=\"container:A.xctestplan\" default=\"YES\"/><TestPlanReference reference=\"container:B.xctestplan\" default=\"YES\"/></TestPlans></TestAction></Scheme>").Problem);
+        Assert.Contains("both a test plan and test targets", XcodeScheme.Parse("P", "<Scheme><TestAction><TestPlans><TestPlanReference reference=\"container:A.xctestplan\" default=\"YES\"/></TestPlans><Testables><TestableReference skipped=\"NO\"/></Testables></TestAction></Scheme>").Problem);
+
+        var target = Assert.Single(XcodeTestPlan.Parse(XcodeFixture.Plan));
+        Assert.Equal(("B10000000000000000000102", "container:Words.xcodeproj", (IReadOnlyList<string>?)null), (target.Identifier, target.Container, target.Selected));
+        Assert.Null(target.Excludes("WordsTests/notBlank()"));
+        // The plan's filters, by the test's place in its target (a type names every test in it).
+        var filtered = new XcodePlanTarget("x", "c", ["Spaces"], ["Spaces/Only/empty()"]);
+        Assert.Equal("skips it (Spaces/Only/empty())", filtered.Excludes("Spaces/Only/empty()"));
+        Assert.Null(filtered.Excludes("Spaces/other()"));
+        Assert.Equal("selects some of the target's tests, not it", filtered.Excludes("blank()"));
+        Assert.Equal("skips it (Spaces)", new XcodePlanTarget("x", "c", null, ["Spaces"]).Excludes("Spaces/Only/empty()"));
+        Assert.Null(new XcodePlanTarget("x", "c", null, ["Space"]).Excludes("Spaces/Only/empty()"));
+        // A disabled target is not run.
+        Assert.Empty(XcodeTestPlan.Parse(XcodeFixture.Plan.Replace("\"target\" : {", "\"enabled\" : false,\n      \"target\" : {")));
+        Assert.Equal(["a()"], Assert.Single(XcodeTestPlan.Parse(XcodeFixture.Plan.Replace("\"target\" : {", "\"skippedTests\" : [ \"a()\" ],\n      \"target\" : {"))).Skipped);
+    }
+
+    [Theory]
+    [InlineData("\"testTimeoutsEnabled\" : true", "\"testRepetitionMode\" : \"retryOnFailure\"", "the option testRepetitionMode")]
+    [InlineData("\"testTimeoutsEnabled\" : true", "\"maximumTestRepetitions\" : 3", "the option maximumTestRepetitions")]
+    [InlineData("\"options\" : {\n\n      }", "\"options\" : { \"somethingNew\" : 1 }", "the option somethingNew")]
+    [InlineData("\"version\" : 1", "\"version\" : 2", "version is not 1")]
+    [InlineData("\"version\" : 1", "\"version\" : 1, \"extra\" : 1", "the plan has extra")]
+    [InlineData("\"target\" : {", "\"skippedTests\" : { \"suites\" : [ ] },\n      \"target\" : {", "skippedTests is not a list")]
+    [InlineData("\"target\" : {", "\"selectedTests\" : [ { \"name\" : \"a()\" } ],\n      \"target\" : {", "selectedTests holds something but a test's name")]
+    [InlineData("\"target\" : {", "\"testRepetitionMode\" : \"untilFailure\",\n      \"target\" : {", "a test target has testRepetitionMode")]
+    [InlineData("\"identifier\" : \"B10000000000000000000102\",", "", "identifier is not a string")]
+    [InlineData("\"configurations\" : [", "\"configurations\" : [ { \"id\" : \"2\", \"name\" : \"Second\", \"options\" : { } },", "not exactly one configuration")]
+    public void A_test_plan_the_gate_does_not_read_whole_is_refused(string from, string to, string why)
+    {
+        var text = XcodeFixture.Plan.Replace(from, to);
+        Assert.NotEqual(XcodeFixture.Plan, text);
+
+        Assert.Contains(why, Assert.Throws<FormatException>(() => XcodeTestPlan.Parse(text)).Message);
     }
 
     [Fact]
@@ -318,6 +373,70 @@ public class XcodeIdentifyTests
         Assert.Empty(runner.Runs[1].Replacements);
     }
 
+    /// <summary><see cref="ClassicWithNewFile"/> with <see cref="NewFile"/> compiled by the framework target Words too.</summary>
+    private static string AlsoInWords(string project) => project
+        .Replace("/* End PBXBuildFile section */", "C5 = {isa = PBXBuildFile; fileRef = C2; };\n/* End PBXBuildFile section */")
+        .Replace("\t\tB10000000000000000000601 /* Sources */ = {\n\t\t\tisa = PBXSourcesBuildPhase;\n\t\t\tbuildActionMask = 2147483647;\n\t\t\tfiles = (\n",
+            "\t\tB10000000000000000000601 /* Sources */ = {\n\t\t\tisa = PBXSourcesBuildPhase;\n\t\t\tbuildActionMask = 2147483647;\n\t\t\tfiles = (\n\t\t\t\tC5,\n");
+
+    [Fact]
+    public async Task A_test_file_a_production_target_also_compiles_at_the_head_is_unsupported()
+    {
+        var both = AlsoInWords(ClassicWithNewFile);
+        Assert.NotEqual(ClassicWithNewFile, both);
+        var runner = Runner(classic: true, head: [(XcodeFixture.Pbxproj, both), (NewFile, NewTests)]);
+
+        var result = await Check(runner);
+
+        Assert.Equal(NewTestsOutcome.Unsupported, result.Outcome);
+        Assert.Contains($"{NewFile} is compiled by both a test target and Words of Words.xcodeproj at the head: the gate cannot apply its test code alone", result.Reason);
+        Assert.Empty(runner.Runs);
+    }
+
+    [Fact]
+    public async Task A_production_file_the_pr_moves_into_the_test_target_is_unsupported()
+    {
+        // At the base the file is the framework's (its production code); the PR makes it a test file of WordsTests only.
+        var baseProject = AlsoInWords(ClassicWithNewFile)
+            .Replace("\t\t\t\tC1 /* BlankTests.swift in Sources */,\n", "");
+        var runner = Runner(classic: true, head: [(XcodeFixture.Pbxproj, ClassicWithNewFile), (NewFile, NewTests)]);
+        runner.BaseFiles[XcodeFixture.Pbxproj] = baseProject;
+        runner.BaseFiles[NewFile] = "public func blankHelper() -> Bool { true }\n";
+        var atBase = XcodeProject.Parse("Words.xcodeproj", baseProject);
+        Assert.Equal((true, false), (atBase.Membership(atBase.Targets.Single(t => t.Name == "Words"), NewFile).Member,
+            atBase.Membership(atBase.Targets.Single(t => t.Name == "WordsTests"), NewFile).Member));
+
+        var result = await Check(runner);
+
+        Assert.Equal(NewTestsOutcome.Unsupported, result.Outcome);
+        Assert.Contains($"{NewFile} is compiled by both a test target and Words of Words.xcodeproj at the base: the gate cannot apply its test code alone", result.Reason);
+        Assert.Empty(runner.Runs);
+    }
+
+    [Fact]
+    public async Task A_new_helper_file_beside_new_tests_is_added_to_the_base_project_with_them()
+    {
+        const string helper = "WordsTests/Helpers.swift";
+        var withHelper = ClassicWithNewFile
+            .Replace("/* End PBXBuildFile section */", "C6 = {isa = PBXBuildFile; fileRef = C7; };\n/* End PBXBuildFile section */")
+            .Replace("/* End PBXFileReference section */", "C7 = {isa = PBXFileReference; path = Helpers.swift; sourceTree = \"<group>\"; };\n/* End PBXFileReference section */")
+            .Replace("\t\t\t\tC2 /* BlankTests.swift */,\n", "\t\t\t\tC2 /* BlankTests.swift */,\n\t\t\t\tC7,\n")
+            .Replace("\t\t\t\tC1 /* BlankTests.swift in Sources */,\n", "\t\t\t\tC1 /* BlankTests.swift in Sources */,\n\t\t\t\tC6,\n");
+        var runner = Runner(classic: true, head: [(XcodeFixture.Pbxproj, withHelper),
+            (helper, "func spaces(_ n: Int) -> String { String(repeating: \" \", count: n) }\n"),
+            (NewFile, "import Testing\n@testable import Words\n@Test func blank() { #expect(isBlank(spaces(2))) }\n")]);
+
+        var set = await Identify(runner);
+
+        Assert.Empty(set.Unisolable);
+        Assert.Equal(["WordsTests/blank()"], set.Tests);
+        Assert.Contains(new ChangedFile('A', null, helper), set.TestFiles);
+        var grafted = XcodeProject.Parse("Words.xcodeproj", set.BaseReplacements[XcodeFixture.Pbxproj]);
+        var tests = grafted.Targets.Single(t => t.Name == "WordsTests");
+        Assert.True(grafted.Membership(tests, helper).Member);
+        Assert.True(grafted.Membership(tests, NewFile).Member);
+    }
+
     [Fact]
     public async Task A_test_file_removed_from_a_classic_target_is_taken_out_of_the_base_project_too()
     {
@@ -394,6 +513,73 @@ public class XcodeIdentifyTests
 
         Assert.Equal(NewTestsOutcome.Unsupported, result.Outcome);
         Assert.Contains(why, result.Reason);
+    }
+
+    [Theory]
+    [InlineData("PRODUCT_NAME = Spelling;", "its PRODUCT_NAME is Spelling, not the target's name WordsTests")]
+    [InlineData("PRODUCT_NAME = \"$(PROJECT_NAME)Tests\";", "its PRODUCT_NAME is $(PROJECT_NAME)Tests, not the target's name WordsTests")]
+    public async Task A_test_bundle_not_named_for_its_target_is_unsupported(string setting, string why)
+    {
+        const string tests = "PRODUCT_BUNDLE_IDENTIFIER = net.trefry.darkfactory.words.tests;\n\t\t\t\tPRODUCT_NAME = \"$(TARGET_NAME)\";";
+        var project = XcodeFixture.SynchronizedProject.Replace(tests, tests.Replace("PRODUCT_NAME = \"$(TARGET_NAME)\";", setting));
+        Assert.NotEqual(XcodeFixture.SynchronizedProject, project);
+        var runner = CargoIdentifyTests.With(CargoIdentifyTests.Runner([(XcodeFixture.Pbxproj, project), .. XcodeFixture.Files().Skip(1)]), (NewFile, NewTests));
+
+        var result = await Check(runner);
+
+        Assert.Equal(NewTestsOutcome.Unsupported, result.Outcome);
+        Assert.Contains($"the test target WordsTests of Words.xcodeproj: {why}", result.Reason);
+        // Unset (Xcode's default, $(TARGET_NAME)) or the target's own name is fine.
+        foreach (var fine in new[] { "", "PRODUCT_NAME = WordsTests;" })
+        {
+            var ok = CargoIdentifyTests.With(CargoIdentifyTests.Runner([(XcodeFixture.Pbxproj, project.Replace(setting, fine)), .. XcodeFixture.Files().Skip(1)]), (NewFile, NewTests));
+            Assert.Empty((await Identify(ok)).Unisolable);
+        }
+    }
+
+    [Fact]
+    public async Task A_scheme_running_a_default_test_plan_that_runs_the_target_is_used()
+    {
+        var runner = CargoIdentifyTests.With(CargoIdentifyTests.Runner(XcodeFixture.PlanFiles("App/")), ("App/" + NewFile, NewTests));
+
+        var set = await Identify(runner);
+
+        Assert.Empty(set.Unisolable);
+        Assert.Equal(["WordsTests/Spaces/Only/empty()", "WordsTests/blank()"], set.Tests);
+        Assert.Equal("-project\nApp/Words.xcodeproj\nWords", set.Projects["WordsTests/blank()"]);
+    }
+
+    [Theory]
+    // The plan skips the new test, or a type holding it, or selects other tests only: -only-testing would run nothing.
+    [InlineData("\"skippedTests\" : [ \"blank()\" ],", "WordsTests/blank(): the test plan App/Words.xctestplan at the head skips it (blank())")]
+    [InlineData("\"skippedTests\" : [ \"Spaces\" ],", "WordsTests/Spaces/Only/empty(): the test plan App/Words.xctestplan at the head skips it (Spaces)")]
+    [InlineData("\"selectedTests\" : [ \"WordsTests\" ],", "WordsTests/blank(): the test plan App/Words.xctestplan at the head selects some of the target's tests, not it")]
+    // A plan the gate cannot read whole, and one that does not run the target.
+    [InlineData("\"testRepetitionMode\" : \"retryOnFailure\",", "the scheme Words's test plan App/Words.xctestplan cannot be read (a test target has testRepetitionMode")]
+    [InlineData("\"enabled\" : false,", "no shared scheme of App/Words.xcodeproj tests the target WordsTests")]
+    public async Task A_test_plan_that_would_not_run_a_new_test_or_cannot_be_read_is_unsupported(string entry, string why)
+    {
+        var plan = XcodeFixture.Plan.Replace("\"target\" : {", entry + "\n      \"target\" : {");
+        var runner = CargoIdentifyTests.With(CargoIdentifyTests.Runner(XcodeFixture.PlanFiles("App/")), ("App/" + NewFile, NewTests), ("App/" + XcodeFixture.TestPlan, plan));
+
+        var result = await Check(runner);
+
+        Assert.Equal(NewTestsOutcome.Unsupported, result.Outcome);
+        Assert.Contains(why, result.Reason);
+        Assert.Empty(runner.Runs);
+    }
+
+    [Fact]
+    public async Task A_base_whose_test_plan_skips_the_new_test_is_unsupported()
+    {
+        // The base run uses the base's scheme and plan (neither is applied): there the new test would not run.
+        var runner = CargoIdentifyTests.With(CargoIdentifyTests.Runner(XcodeFixture.PlanFiles()), (NewFile, NewTests));
+        runner.BaseFiles[XcodeFixture.TestPlan] = XcodeFixture.Plan.Replace("\"target\" : {", "\"skippedTests\" : [ \"blank()\" ],\n      \"target\" : {");
+
+        var result = await Check(runner);
+
+        Assert.Equal(NewTestsOutcome.Unsupported, result.Outcome);
+        Assert.Contains("WordsTests/blank(): the test plan Words.xctestplan at the base skips it (blank())", result.Reason);
     }
 
     [Fact]
@@ -485,14 +671,21 @@ public class XcodeRunTests
         [
             "Toolchain /usr/bin/xcodebuild -version",
             "Toolchain /usr/bin/xcrun --find xcresulttool",
-            $"Build {wrapper} build-for-testing -project App/Words.xcodeproj -scheme Words -destination platform=macOS -quiet",
-            $"Test {wrapper} test-without-building -project App/Words.xcodeproj -scheme Words -destination platform=macOS -only-testing:WordsTests/blank() -resultBundlePath {bundle} -quiet",
+            $"Restore {wrapper} clean-derived-data",
+            $"Build {wrapper} --gate build-for-testing -project App/Words.xcodeproj -scheme Words -destination platform=macOS -quiet",
+            $"Test {wrapper} --gate test-without-building -project App/Words.xcodeproj -scheme Words -destination platform=macOS -only-testing:WordsTests/blank() -resultBundlePath {bundle} -quiet",
             $"Test /usr/bin/xcrun xcresulttool get test-results tests --path {bundle}",
-            $"Test {wrapper} test-without-building -project App/Words.xcodeproj -scheme Words -destination platform=macOS -only-testing:WordsTests/Spaces/empty() -resultBundlePath .factory-test-results-x/{XcodeNewTests.BundleName("WordsTests/Spaces/empty()")} -quiet",
+            $"Test {wrapper} --gate test-without-building -project App/Words.xcodeproj -scheme Words -destination platform=macOS -only-testing:WordsTests/Spaces/empty() -resultBundlePath .factory-test-results-x/{XcodeNewTests.BundleName("WordsTests/Spaces/empty()")} -quiet",
             $"Test /usr/bin/xcrun xcresulttool get test-results tests --path .factory-test-results-x/{XcodeNewTests.BundleName("WordsTests/Spaces/empty()")}",
+            $"Cleanup {wrapper} clean-derived-data",
         ], steps.Select(s => $"{s.Phase} {s.Program} {string.Join(' ', s.Args)}"));
         Assert.Equal(["xcode-build-0", XcodeNewTests.OutputName("WordsTests/blank()"), XcodeNewTests.JsonName("WordsTests/blank()")],
-            steps.Skip(2).Take(3).Select(s => s.CaptureOutput));
+            steps.Skip(3).Take(3).Select(s => s.CaptureOutput));
+        // The first step after the toolchain's and the last both delete the worktree's DerivedData (a failed first one fails the run).
+        Assert.Equal((TestPhase.Restore, wrapper, "clean-derived-data"), (steps[2].Phase, steps[2].Program, string.Join(' ', steps[2].Args)));
+        Assert.Equal((TestPhase.Cleanup, wrapper, "clean-derived-data"), (steps[^1].Phase, steps[^1].Program, string.Join(' ', steps[^1].Args)));
+        // Every build and test step is a gate run: its packages resolved inside the DerivedData the clean deletes.
+        Assert.All(steps.Where(s => s.Program == wrapper && s.Phase is TestPhase.Build or TestPhase.Test), s => Assert.Equal("--gate", s.Args[0]));
         Assert.All(steps, s => Assert.Null(s.ResultFilePattern));
         Assert.Equal(["WordsTests/blank()", "WordsTests/Spaces/empty()"], FakeTestRunner.Filtered(steps));
     }
@@ -508,6 +701,8 @@ public class XcodeRunTests
     [InlineData("WordsTests/Outer/Inner/deep()", 65, "failed-nested.json", TestCaseResult.Failed)]
     [InlineData("WordsTests/WordsTests/notBlank()", 0, "passed.json", TestCaseResult.Passed)]
     [InlineData("WordsTests/off()", 0, "skipped.json", TestCaseResult.Skipped)]
+    // withKnownIssue { … }: Xcode says "Expected Failure" and xcodebuild exits 0 — no pass on the head, no failure on the base.
+    [InlineData("WordsTests/known()", 0, "expected-failure.json", TestCaseResult.Skipped)]
     public void A_bundles_test_case_is_read_with_its_result(string id, int exit, string fixture, string outcome)
     {
         var results = Parse(id, exit, XcodeFixture.Json(fixture));
@@ -765,11 +960,21 @@ public class XcodeRunnerTests : IDisposable
         Write("WordsTests/BlankTests.swift",
             "import Testing\n@testable import Words\n\n@Test func blank() { #expect(isBlank(\"  \")) }\nstruct Spaces { struct Only { @Test func empty() { #expect(isBlank(\"\")) } } }\n");
         var passing = CommitAndPush("fix", "factory/sc-5");
+        // What a worker session of the same user could leave where the gate's next run of this item builds (its worktree's
+        // path, so its DerivedData's, is the same every run): the run deletes it before it builds, and its own after.
+        var worktrees = Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name);
+        Directory.CreateDirectory(worktrees);
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var gateDerived = new[] { "gate-sc-5-base", "gate-sc-5-head" }.Select(n => SwiftToolchain.DerivedDataOf(home, $"{Physical(worktrees)}/{n}")).ToList();
+        _derivedData.AddRange(gateDerived);
+        Directory.CreateDirectory(Path.Combine(gateDerived[1], "Build", "Products"));
+        File.WriteAllText(Path.Combine(gateDerived[1], "Build", "Products", "planted"), "x");
 
         var pass = await Check(baseSha, passing);
 
         Assert.True(pass.Outcome == NewTestsOutcome.Pass, $"{pass.Outcome}: {pass.Reason}");
         Assert.Equal(("ran", "ran", "xcode-swift-testing"), (pass.BaseRun, pass.HeadRun, pass.Strategy));
+        Assert.All(gateDerived, d => Assert.False(Directory.Exists(d), $"{d} is left after the run"));
         Assert.Equal([("WordsTests/Spaces/Only/empty()", "failed", "passed"), ("WordsTests/blank()", "failed", "passed")],
             pass.Tests.Select(t => (t.Test, t.Base, t.Head)).OrderBy(t => t.Test, StringComparer.Ordinal));
         // Each ran alone: one case each, on both commits.
@@ -783,6 +988,28 @@ public class XcodeRunnerTests : IDisposable
         Assert.True(rejected.Outcome == NewTestsOutcome.Rejected, $"{rejected.Outcome}: {rejected.Reason}");
         Assert.EndsWith("so they check nothing: WordsTests/WordsTests/one()", rejected.Reason);
         Assert.Empty(Directory.EnumerateDirectories(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name)));
+    }
+
+    [Fact]
+    public async Task With_xcode_a_scheme_running_a_default_test_plan_runs_the_new_test_alone_on_the_base_and_the_head()
+    {
+        Assert.SkipUnless(HasXcode.Value, "Xcode is not installed");
+        foreach (var (path, content) in XcodeFixture.PlanFiles())
+        {
+            Write(path, content);
+        }
+        var baseSha = CommitAndPush("base", "main");
+        TestGit.Run(_seed, "checkout", "-q", "-b", "factory/sc-5");
+        Write(XcodeFixture.Library, XcodeFixture.Fixed);
+        Write("WordsTests/BlankTests.swift", "import Testing\n@testable import Words\n\n@Test func blank() { #expect(isBlank(\"  \")) }\n");
+        var head = CommitAndPush("fix", "factory/sc-5");
+
+        var pass = await Check(baseSha, head);
+
+        // xcodebuild runs the scheme's default plan (no -testPlan), -only-testing picks the one test out of it.
+        Assert.True(pass.Outcome == NewTestsOutcome.Pass, $"{pass.Outcome}: {pass.Reason}");
+        Assert.Equal([("WordsTests/blank()", "failed", "passed")], pass.Tests.Select(t => (t.Test, t.Base, t.Head)));
+        Assert.All(pass.Tests, t => Assert.Equal((1, 1), (t.BaseCases.Count, t.HeadCases.Count)));
     }
 
     [Fact]
