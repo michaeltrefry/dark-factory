@@ -758,6 +758,122 @@ public class KanbanContractTests
         Assert.Equal(KanbanRecordingHandler.Recorder, Text(fixture.Interactions[0].Answer!["comments"]![0], "author"));
         Assert.Equal($"Work item x is claimed by {KanbanRecordingHandler.Recorder}.", Text(fixture.Interactions[1].Answer, "message"));
         Assert.DoesNotContain("Avery", read.Text + refused.Text);
+
+        // An address is replaced in the string it stands in, not in the answer's JSON text — where <, +, ' and non-ASCII are
+        // escapes a pattern would cut through. The text around it is kept exactly.
+        var texts = new JsonObject
+        {
+            ["description"] = "Avery <avery+x@acme.example>", ["note"] = "o'neil+te@acme.example — écrire", ["list"] = new JsonArray("a+b@x.io", "no address"),
+        };
+        var (scrubbed, _, other) = Recording(new CannedMcp((_, _) => FakeMcpServer.Text(texts.ToJsonString()), sse: false), own);
+        var answered = await other.CallToolAsync("get_epic", new JsonObject { ["epicId"] = "e" }, None);
+        var epic = scrubbed.Interactions[0].Answer!;
+        Assert.Equal("Avery <redacted@example.com>", Text(epic, "description"));
+        Assert.Equal("o'redacted@example.com — écrire", Text(epic, "note"));
+        Assert.Equal(["redacted@example.com", "no address"], epic["list"]!.AsArray().Select(n => n!.GetValue<string>()));
+        Assert.True(JsonNode.DeepEquals(epic, JsonNode.Parse(answered.Text)));
+        Assert.True(JsonNode.DeepEquals(epic, KanbanFixture.Parse(scrubbed.ToJson()).Interactions[0].Answer));
+    }
+
+    /// <summary>
+    /// One set of identities for a whole run: a name one scenario's handler learnt — or the recorder's own first claim seeded —
+    /// is scrubbed from a refusal another scenario's handler records, though that handler never saw the name in a field.
+    /// </summary>
+    [Fact]
+    public async Task A_name_learnt_anywhere_in_the_run_is_scrubbed_from_a_refusal_in_every_scenario()
+    {
+        var (own, id) = (Guid.NewGuid(), Guid.NewGuid());
+        var refusal = new CannedMcp((_, _) => FakeKanbanBoard.Refusal("already_claimed", $"Work item x is claimed by Jordan Quill ({id})."), sse: false);
+        var plain = new CannedMcp((_, _) =>
+        {
+            var result = FakeMcpServer.Text("Jordan Quill holds the lock.");
+            result["isError"] = true;
+            return result;
+        }, sse: false);
+
+        // A handler of its own (the name never met): recorded as the board said it — which is why the set is shared.
+        var (alone, _, lonely) = Recording(refusal, own);
+        await lonely.CallToolAsync("claim_work_item", new JsonObject { ["id"] = "x" }, None);
+        Assert.Contains("Jordan Quill", Text(alone.Interactions[0].Answer, "message"));
+
+        // The run's set, seeded as the recorder seeds it from its own first claim: scrubbed in a refusal and in a plain error.
+        var met = new KanbanIdentities();
+        met.Learn("Jordan Quill");
+        var placeholder = met.Placeholder(id.ToString());
+        foreach (var (inner, expected) in new (CannedMcp, JsonNode)[]
+        {
+            (refusal, new JsonObject { ["code"] = "already_claimed", ["message"] = $"Work item x is claimed by fixture-recorder ({placeholder})." }),
+            (plain, JsonValue.Create("fixture-recorder holds the lock.")),
+        })
+        {
+            var fixture = new KanbanFixture();
+            var recording = new KanbanRecordingHandler(fixture) { InnerHandler = inner, OwnProjects = [own], Identities = met };
+            var answered = await KanbanWrites.Client(new HttpClient(recording) { BaseAddress = ReplayEndpoint }, "tok").CallToolAsync("claim_work_item", new JsonObject { ["id"] = "x" }, None);
+            Assert.True(JsonNode.DeepEquals(expected, fixture.Interactions[0].Answer), fixture.Interactions[0].Answer!.ToJsonString());
+            Assert.DoesNotContain("Jordan", answered.Text);
+            Assert.DoesNotContain(id.ToString(), answered.Text);
+        }
+    }
+
+    [Fact]
+    public async Task An_identitys_id_is_recorded_as_a_fixed_placeholder_the_same_id_always_the_same()
+    {
+        var (own, first, second) = (Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid());
+        JsonObject Claimed(Guid by) => new()
+        {
+            ["id"] = "x", ["projectId"] = own.ToString(), ["title"] = "mine", ["claimant"] = "Jordan Quill", ["claimant_id"] = by.ToString(),
+            ["comments"] = new JsonArray(
+                new JsonObject { ["author"] = "Jordan Quill", ["author_id"] = first.ToString().ToUpperInvariant(), ["body"] = "one" },
+                new JsonObject { ["author"] = "Sam Reed", ["author_id"] = second.ToString(), ["body"] = "two" },
+                new JsonObject { ["author"] = "a visitor", ["body"] = "written without a token: no author_id" }),
+            ["actor"] = new JsonObject { ["id"] = second.ToString(), ["name"] = "Sam Reed" },
+        };
+        var met = new KanbanIdentities();
+        var fixtures = new List<KanbanFixture>();
+        // Two scenarios' handlers over the run's one set: the second meets the ids in the other order, unclaimed last.
+        JsonObject[][] scenarios =
+        [
+            [Claimed(first)],
+            [Claimed(second), new JsonObject { ["id"] = "x", ["projectId"] = own.ToString(), ["claimant"] = null, ["claimant_id"] = null }],
+        ];
+        foreach (var answers in scenarios)
+        {
+            var queue = new Queue<JsonObject>(answers);
+            var fixture = new KanbanFixture();
+            var recording = new KanbanRecordingHandler(fixture)
+            {
+                InnerHandler = new CannedMcp((_, _) => FakeMcpServer.Text(queue.Dequeue().ToJsonString()), sse: false), OwnProjects = [own], Identities = met,
+            };
+            var mcp = KanbanWrites.Client(new HttpClient(recording) { BaseAddress = ReplayEndpoint }, "tok");
+            foreach (var _ in answers)
+            {
+                await mcp.CallToolAsync("get_work_item", new JsonObject { ["itemId"] = "x" }, None);
+            }
+            fixtures.Add(fixture);
+        }
+
+        const string one = "f0000000-0000-0000-0000-000000000001", two = "f0000000-0000-0000-0000-000000000002";
+        var (a, b, unclaimed) = (fixtures[0].Interactions[0].Answer!, fixtures[1].Interactions[0].Answer!, fixtures[1].Interactions[1].Answer!);
+        Assert.Equal((one, one, two, two), (Text(a, "claimant_id"), Text(a["comments"]![0], "author_id"), Text(a["comments"]![1], "author_id"), Text(a["actor"], "id")));
+        Assert.Equal((two, one, KanbanRecordingHandler.Recorder), (Text(b, "claimant_id"), Text(b["comments"]![0], "author_id"), Text(b["actor"], "name")));
+        Assert.False(a["comments"]![2]!.AsObject().ContainsKey("author_id"));
+        Assert.True(unclaimed.AsObject().ContainsKey("claimant_id"));
+        Assert.Null(unclaimed["claimant_id"]);
+        var json = string.Concat(fixtures.Select(f => f.ToJson()));
+        Assert.DoesNotContain(first.ToString(), json, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(second.ToString(), json, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal([first.ToString(), second.ToString()], met.Ids);
+        Assert.Equal(["Jordan Quill", "Sam Reed", "a visitor"], met.Names.Order(StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public async Task The_change_feed_is_refused_not_recorded()
+    {
+        var feed = new JsonObject { ["items"] = new JsonArray(new JsonObject { ["actor"] = new JsonObject { ["name"] = "Sam Reed" } }), ["next_cursor"] = "c" };
+        var (fixture, _, mcp) = Recording(new CannedMcp((_, _) => FakeMcpServer.Text(feed.ToJsonString()), sse: false), Guid.NewGuid());
+        var refused = await Assert.ThrowsAsync<InvalidOperationException>(() => mcp.CallToolAsync("list_changes", new JsonObject(), None));
+        Assert.Contains("change feed", refused.Message);
+        Assert.Empty(fixture.Interactions);
     }
 
     [Fact]
@@ -799,7 +915,75 @@ public class KanbanContractTests
     public void The_committed_fixtures_hold_no_token_no_email_and_nothing_but_the_recorders_own_throwaways()
     {
         Assert.NotEmpty(Committed());
-        Assert.All(Committed(), file => Assert.Empty(KanbanFixtureGuard.Problems(Path.GetFileName(file), File.ReadAllText(file))));
+        Assert.Empty(KanbanFixtureGuard.SetProblems([.. Committed().Select(file => (Path.GetFileName(file), File.ReadAllText(file)))]));
+        // The identities in them are the recorder's placeholders: the one name, and ids of the fixed shape.
+        var all = string.Concat(Committed().Select(File.ReadAllText));
+        Assert.Contains("\"claimant\": \"fixture-recorder\"", all);
+        Assert.Contains("\"claimant_id\": \"f0000000-0000-0000-0000-000000000001\"", all);
+        Assert.Contains("\"author_id\": \"f0000000-0000-0000-0000-000000000001\"", all);
+    }
+
+    /// <summary>
+    /// A refusal's message is for people and may name whoever holds the item: the guard fails one that holds a name the set
+    /// knows — a <c>claimant</c> or <c>author</c> other than the recorder's anywhere in the set, or one the recording run met.
+    /// </summary>
+    [Fact]
+    public void A_refusal_message_naming_an_identity_fails_the_guard()
+    {
+        static (string, string) File(string name, Action<KanbanFixture>? change = null) => (name, Mutated(change ?? (_ => { }), name));
+        static void Says(KanbanFixture f, string message) => f.Interactions.First(i => i.IsError && i.Answer is JsonObject).Answer!["message"] = message;
+        const string naming = "Work item x is claimed by Jordan Quill.";
+
+        // The name stands in another fixture's claimant: that is a problem there, and the message naming it one here.
+        var set = KanbanFixtureGuard.SetProblems(
+        [
+            File("lifecycle.json", f => f.Calls("claim_work_item")[0].Answer!["claimant"] = "Jordan Quill"),
+            File("claims.json", f => Says(f, naming)),
+        ]);
+        Assert.Contains(set, p => p.StartsWith("lifecycle.json") && p.Contains("identity's name in claimant"));
+        Assert.Contains(set, p => p.StartsWith("claims.json") && p.Contains("answer's message names an identity ('Jordan Quill')"));
+        // Nothing in the set holds the name, but the recording run met it.
+        var met = new KanbanIdentities();
+        met.Learn("Jordan Quill");
+        Assert.Contains(KanbanFixtureGuard.SetProblems([File("claims.json", f => Says(f, naming))], met), p => p.Contains("answer's message names an identity"));
+        // A plain error's text counts as its message.
+        Assert.Contains(KanbanFixtureGuard.SetProblems([File("claims.json", f =>
+        {
+            var at = f.Interactions.FindIndex(i => i.IsError);
+            f.Interactions[at] = f.Interactions[at] with { Answer = JsonValue.Create("Jordan Quill holds the lock.") };
+        })], met), p => p.Contains("answer's message names an identity"));
+        // The recorder's own name is the one a message may hold, and a message naming nobody known passes.
+        Assert.Empty(KanbanFixtureGuard.SetProblems([File("lifecycle.json"), File("claims.json", f => Says(f, $"Work item x is claimed by {KanbanRecordingHandler.Recorder}."))], met));
+        Assert.Empty(KanbanFixtureGuard.SetProblems([File("claims.json", f => Says(f, naming))]));
+        // An id the run met, anywhere in a file.
+        var id = Guid.NewGuid().ToString();
+        met.Placeholder(id);
+        Assert.Contains(KanbanFixtureGuard.SetProblems([File("claims.json", f => Says(f, $"Held by {id.ToUpperInvariant()}."))], met), p => p == "claims.json holds the id of an identity the recording met");
+    }
+
+    [Theory]
+    [InlineData("claimant_id")]
+    [InlineData("author_id")]
+    public void An_identitys_id_that_is_not_the_recorders_placeholder_fails_the_guard(string field)
+    {
+        static JsonObject Holder(KanbanFixture f, string field) => field == "claimant_id"
+            ? f.Calls("claim_work_item")[0].Answer!.AsObject()
+            : f.Interactions.Select(i => i.Answer).OfType<JsonObject>().SelectMany(a => a["comments"] as JsonArray ?? []).OfType<JsonObject>().First();
+        // As recorded: a placeholder. Null (an unclaimed item) is allowed too.
+        Assert.True(KanbanFixtureGuard.IsPlaceholderId(Holder(KanbanFixture.Load("lifecycle.json"), field)[field]!.GetValue<string>()));
+        var unset = KanbanFixtureGuard.Problems("lifecycle.json", Mutated(f => Holder(f, field)[field] = null));
+        Assert.True(unset.Count == 0, string.Join("\n", unset));
+        // A real id, an id of another shape, and a value that is no string.
+        foreach (var value in new JsonNode[] { Guid.NewGuid().ToString(), "F0000000-0000-0000-0000-000000000001", "f0000000-0000-0000-0000-00000000000g", 7 })
+        {
+            Assert.Contains(KanbanFixtureGuard.Problems("lifecycle.json", Mutated(f => Holder(f, field)[field] = value.DeepClone())), p => p.Contains(field));
+        }
+        // And a change's actor.
+        Assert.Contains(KanbanFixtureGuard.Problems("lifecycle.json", Mutated(f => FirstItem(f)["actor"] = new JsonObject { ["id"] = Guid.NewGuid().ToString(), ["name"] = "Sam Reed" })),
+            p => p.Contains("actor.id"));
+        Assert.Contains(KanbanFixtureGuard.Problems("lifecycle.json", Mutated(f => FirstItem(f)["actor"] = new JsonObject { ["name"] = "Sam Reed" })), p => p.Contains("actor.name"));
+        Assert.Empty(KanbanFixtureGuard.Problems("lifecycle.json", Mutated(f => FirstItem(f)["actor"] =
+            new JsonObject { ["id"] = "f0000000-0000-0000-0000-000000000001", ["name"] = KanbanRecordingHandler.Recorder })));
     }
 
     /// <summary>The committed lifecycle fixture with <paramref name="change"/> made to it, as its file's text.</summary>
@@ -917,18 +1101,68 @@ public class KanbanContractTests
 /// <c>KANBAN_RECORD_URL</c> — with the full-scope token in <c>KANBAN_RECORD_TOKEN</c>, which is read from the environment of
 /// whoever runs it and from nowhere else (no keychain, no configuration file), is never written to a fixture and never printed.
 /// <c>KANBAN_RECORD=fake</c>: the same recorder against the in-repo fake, which is how the provisional fixtures were made.
-/// Either way the fixtures are saved only after the board was cleaned up and checked (<see cref="KanbanFixtureRecorder"/>).
+/// Either way the fixtures are saved only after the board was cleaned up and checked (<see cref="KanbanFixtureRecorder"/>) and
+/// after every check on them passed (<see cref="VerifiedAsync"/>), all seven files or none (<see cref="KanbanFixture.SaveAll"/>).
+/// <c>KANBAN_RECORD_URL</c> must be https, or http on a loopback host (<see cref="Endpoint"/>).
 /// </summary>
 public class KanbanFixtureRecording
 {
     public const string TokenVariable = "KANBAN_RECORD_TOKEN";
     public const string UrlVariable = "KANBAN_RECORD_URL";
 
+    /// <summary>
+    /// Where the recorder sends the full-scope token: the hosted board when <paramref name="given"/> (<c>KANBAN_RECORD_URL</c>)
+    /// is unset, else that URL — which must be absolute and https; plain http is taken only for a loopback host (a KanbanBoard
+    /// on this machine). Anything else is refused before a request is made. The URL is not repeated in the refusal.
+    /// </summary>
+    internal static Uri Endpoint(string? given)
+    {
+        if (string.IsNullOrEmpty(given))
+        {
+            return OutboundHttp.KanbanDefaultMcpUrl;
+        }
+        if (!Uri.TryCreate(given, UriKind.Absolute, out var url) || !(url.Scheme == Uri.UriSchemeHttps || (url.Scheme == Uri.UriSchemeHttp && url.IsLoopback)))
+        {
+            throw new ArgumentException($"{UrlVariable} must be an absolute https URL (http only for a loopback host): the full-scope token is sent to it.");
+        }
+        return url;
+    }
+
+    /// <summary>
+    /// The files' text of a recorded fixture set that may be saved — checked before anything is written: every fixture of
+    /// <see cref="KanbanFixture.Names"/> and no other; the literal <paramref name="token"/> in none of them (the guard's pattern
+    /// knows only some token shapes); the guards (<see cref="KanbanFixtureGuard.SetProblems"/>, with the identities the run
+    /// met); and every fixture, as its file's text reads back, replayed strictly in every framing.
+    /// </summary>
+    internal static async Task<IReadOnlyDictionary<string, string>> VerifiedAsync(IReadOnlyDictionary<string, KanbanFixture> fixtures, string token,
+        KanbanIdentities identities)
+    {
+        var files = fixtures.ToDictionary(f => f.Key, f => f.Value.ToJson());
+        Assert.Equal(KanbanFixture.Names.Order(), files.Keys.Order());
+        foreach (var (name, json) in files)
+        {
+            // Which file, never the token itself.
+            Assert.False(json.Contains(token, StringComparison.Ordinal) || json.Contains(KanbanFixture.Escaped(token), StringComparison.Ordinal),
+                $"{name} holds the recording token");
+        }
+        var problems = KanbanFixtureGuard.SetProblems([.. files.Select(f => (f.Key, f.Value))], identities);
+        Assert.True(problems.Count == 0, string.Join("\n", problems));
+        foreach (var (name, json) in files)
+        {
+            foreach (var framing in Enum.GetValues<KanbanFraming>())
+            {
+                await KanbanContractTests.ReplayAsync(name, KanbanFixture.Parse(json), framing);
+            }
+        }
+        return files;
+    }
+
     [Fact]
     public async Task Record()
     {
         var ct = TestContext.Current.CancellationToken;
         KanbanFixtureRecorder recorder;
+        string sent;
         switch (Environment.GetEnvironmentVariable("KANBAN_RECORD"))
         {
             case null or "":
@@ -936,28 +1170,130 @@ public class KanbanFixtureRecording
                     + "or KANBAN_RECORD=fake to re-record the provisional ones against the in-repo fake.");
                 return;
             case "fake":
-                recorder = new(new FakeKanbanBoard().Server.Api, new Uri(FakeKanbanBoard.Url), FakeKanbanBoard.FullToken, KanbanFixture.Provisional,
-                    KanbanContractTests.Scenarios);
+                sent = FakeKanbanBoard.FullToken;
+                recorder = new(new FakeKanbanBoard().Server.Api, new Uri(FakeKanbanBoard.Url), sent, KanbanFixture.Provisional, KanbanContractTests.Scenarios);
                 break;
             case "1":
                 var token = Environment.GetEnvironmentVariable(TokenVariable);
                 Assert.False(string.IsNullOrWhiteSpace(token), $"KANBAN_RECORD=1 needs a full-scope KanbanBoard token in {TokenVariable} (the environment only).");
-                var url = Environment.GetEnvironmentVariable(UrlVariable) is { Length: > 0 } given ? new Uri(given) : OutboundHttp.KanbanDefaultMcpUrl;
-                recorder = new(new HttpClientHandler(), url, token!, KanbanFixture.Hosted, KanbanContractTests.Scenarios);
+                sent = token!;
+                recorder = new(new HttpClientHandler(), Endpoint(Environment.GetEnvironmentVariable(UrlVariable)), sent, KanbanFixture.Hosted,
+                    KanbanContractTests.Scenarios);
                 break;
             case var other:
                 Assert.Fail($"KANBAN_RECORD is '{other}': 1 records against a real KanbanBoard, fake against the in-repo fake.");
                 return;
         }
-        var fixtures = await recorder.RecordAsync(ct);
-        foreach (var (name, fixture) in fixtures)
+        IReadOnlyDictionary<string, KanbanFixture> fixtures;
+        try
         {
-            // Nothing is saved that the guards would refuse.
-            Assert.Empty(KanbanFixtureGuard.Problems(name, fixture.ToJson()));
+            fixtures = await recorder.RecordAsync(ct);
         }
-        foreach (var (name, fixture) in fixtures)
+        finally
         {
-            fixture.Save(KanbanFixture.SourceDirectory, name);
+            // What the sweep found of earlier runs (archived, never deleted): for whoever runs this to act on.
+            foreach (var note in recorder.Notes)
+            {
+                TestContext.Current.TestOutputHelper?.WriteLine(note);
+                Console.Error.WriteLine($"[kanban fixtures] {note}");
+            }
+        }
+        // Nothing is saved that a check refuses, and the set is replaced whole or not at all.
+        KanbanFixture.SaveAll(KanbanFixture.SourceDirectory, await VerifiedAsync(fixtures, sent, recorder.Identities));
+    }
+
+    [Theory]
+    [InlineData("https://kanban.example/mcp")]
+    [InlineData("http://localhost:5080/mcp")]
+    [InlineData("http://127.0.0.1:5080/mcp")]
+    [InlineData("http://[::1]:5080/mcp")]
+    public void The_recording_url_may_be_https_or_http_on_a_loopback_host(string url) => Assert.Equal(new Uri(url), Endpoint(url));
+
+    [Theory]
+    [InlineData("http://kanban.example/mcp")]
+    [InlineData("http://192.168.1.20:5080/mcp")]
+    [InlineData("http://localhost.kanban.example/mcp")]
+    [InlineData("ftp://kanban.example/mcp")]
+    [InlineData("kanban.example/mcp")]
+    [InlineData("/mcp")]
+    public void The_recording_url_is_refused_unless_it_is_absolute_https_or_loopback_http(string url)
+    {
+        // The token would go to it: refused before any request, without repeating the URL.
+        var refused = Assert.Throws<ArgumentException>(() => Endpoint(url));
+        Assert.Contains("absolute https URL", refused.Message);
+        Assert.DoesNotContain(url, refused.Message);
+    }
+
+    [Fact]
+    public void The_recording_url_defaults_to_the_hosted_board()
+    {
+        Assert.Equal(OutboundHttp.KanbanDefaultMcpUrl, Endpoint(null));
+        Assert.Equal(OutboundHttp.KanbanDefaultMcpUrl, Endpoint(""));
+        Assert.Equal(Uri.UriSchemeHttps, OutboundHttp.KanbanDefaultMcpUrl.Scheme);
+    }
+
+    /// <summary>The committed fixtures, parsed: a set <see cref="VerifiedAsync"/> accepts as it is.</summary>
+    private static Dictionary<string, KanbanFixture> CommittedSet() => KanbanFixture.Names.ToDictionary(n => n, KanbanFixture.Load);
+
+    [Fact]
+    public async Task A_recording_is_checked_before_it_is_saved_for_the_literal_token_and_by_a_replay()
+    {
+        // A secret no pattern of the guard knows: 64 hex digits.
+        var token = string.Concat(Enumerable.Repeat("0f3a9c5e", 8));
+        Assert.Empty(KanbanFixtureGuard.Problems("lifecycle.json", KanbanFixture.Load("lifecycle.json").ToJson().Replace("contract test comment", token)));
+        Assert.Equal(KanbanFixture.Names.Order(), (await VerifiedAsync(CommittedSet(), token, new KanbanIdentities())).Keys.Order());
+
+        // The token in an answer: refused, naming the file and not the token.
+        var leaking = CommittedSet();
+        leaking["read-spec.json"].Calls("get_epic")[0].Answer!["description"] = $"Objective: {token}";
+        var leaked = await Assert.ThrowsAnyAsync<Xunit.Sdk.XunitException>(() => VerifiedAsync(leaking, token, new KanbanIdentities()));
+        Assert.Contains("read-spec.json holds the recording token", leaked.Message);
+        Assert.DoesNotContain(token, leaked.Message);
+
+        // A recording the adapter does not replay (a call the board answered is missing): refused.
+        var broken = CommittedSet();
+        broken["busy.json"].Interactions.RemoveAt(broken["busy.json"].Interactions.Count - 1);
+        var unreplayed = await Assert.ThrowsAnyAsync<Xunit.Sdk.XunitException>(() => VerifiedAsync(broken, token, new KanbanIdentities()));
+        Assert.Contains("unexpected extra call", unreplayed.Message);
+
+        // A fixture missing from the set: refused.
+        var short1 = CommittedSet();
+        short1.Remove("plan.json");
+        await Assert.ThrowsAnyAsync<Xunit.Sdk.XunitException>(() => VerifiedAsync(short1, token, new KanbanIdentities()));
+
+        // An identity the run met, named in a refusal: refused by the guards.
+        var met = new KanbanIdentities();
+        met.Learn("Jordan Quill");
+        var naming = CommittedSet();
+        naming["claims.json"].Interactions.First(i => i.IsError).Answer!["message"] = "Work item x is claimed by Jordan Quill.";
+        var named = await Assert.ThrowsAnyAsync<Xunit.Sdk.XunitException>(() => VerifiedAsync(naming, token, met));
+        Assert.Contains("message names an identity", named.Message);
+    }
+
+    [Fact]
+    public void A_fixture_set_is_saved_whole_or_not_at_all()
+    {
+        var root = Directory.CreateTempSubdirectory("kanban-fixtures-").FullName;
+        try
+        {
+            var directory = Path.Combine(root, "kanban");
+            // A first save makes the folder; a second replaces the set: exactly the new files, the old ones gone.
+            KanbanFixture.SaveAll(directory, new Dictionary<string, string> { ["a.json"] = "old a\n", ["gone.json"] = "old\n" });
+            KanbanFixture.SaveAll(directory, new Dictionary<string, string> { ["a.json"] = "new a\n", ["b.json"] = "new b\n" });
+            Assert.Equal(["a.json", "b.json"], Directory.GetFiles(directory).Select(Path.GetFileName).Order());
+            Assert.Equal(("new a\n", "new b\n"), (File.ReadAllText(Path.Combine(directory, "a.json")), File.ReadAllText(Path.Combine(directory, "b.json"))));
+
+            // A save that fails part-way (its second file cannot be written) replaces nothing and leaves nothing beside the folder.
+            Assert.ThrowsAny<IOException>(() => KanbanFixture.SaveAll(directory, new Dictionary<string, string>
+            {
+                ["a.json"] = "newer a\n", ["no-such-folder/b.json"] = "newer b\n",
+            }));
+            Assert.Equal(("new a\n", "new b\n"), (File.ReadAllText(Path.Combine(directory, "a.json")), File.ReadAllText(Path.Combine(directory, "b.json"))));
+            Assert.Equal([directory], Directory.GetFileSystemEntries(root));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
         }
     }
 
@@ -1000,11 +1336,16 @@ public class KanbanFixtureRecording
             Assert.DoesNotContain("PAYROLL", json, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain(theirs.Id.ToString(), json);
             Assert.DoesNotContain("Rotate", json);
-            foreach (var framing in Enum.GetValues<KanbanFraming>())
-            {
-                await KanbanContractTests.ReplayAsync(name, KanbanFixture.Parse(json), framing);
-            }
+            // No identity's id as the board gave it (the fake's start 6b1f0c2e): only the recorder's placeholder.
+            Assert.DoesNotContain("6b1f0c2e", json);
         }
+        // What Record() checks before it saves: the literal token, the guards with the identities met, a replay in every framing.
+        await VerifiedAsync(fixtures, FakeKanbanBoard.FullToken, recorder.Identities);
+        // The token's identity was learnt from the recorder's own first claim, before any scenario ran.
+        Assert.Equal(["factory"], recorder.Identities.Names);
+        Assert.Equal("6b1f0c2e-5a44-4d1b-9c7e-0d2a8f3b1e01", Assert.Single(recorder.Identities.Ids));
+        Assert.Contains("\"claimant_id\": \"f0000000-0000-0000-0000-000000000001\"", fixtures["lifecycle.json"].ToJson());
+        Assert.Empty(recorder.Notes);
         // One project, created under an idempotency key with the throwaway name and key, and deleted at the end.
         var created = Assert.Single(board.Calls, c => c.Tool == "create_project");
         Assert.StartsWith(KanbanFixtureGuard.Prefix, created.Arguments["name"]!.GetValue<string>());
@@ -1055,39 +1396,281 @@ public class KanbanFixtureRecording
         Assert.False(theirs.Archived);
         Assert.Empty(await recorder.LeftBehindAsync(ct));
 
-        // The next run sweeps it (and nothing else) before it starts.
+        // The next run finds it, archived already: it stays as it is — never deleted by a run that did not create it — and is
+        // named for the owner. That run's own project is deleted, by the id the board gave that run.
         board.Instead = null;
-        await Recorder(board).RecordAsync(ct);
-        Assert.Equal([theirs], board.Projects);
+        board.Calls.Clear();
+        var next = Recorder(board);
+        await next.RecordAsync(ct);
+        Assert.Equal([theirs, left], board.Projects);
+        Assert.True(left.Archived);
+        Assert.Equal(next.Project.ToString("D"), Assert.Single(board.Calls, c => c.Tool == "delete_project").Arguments["projectId"]!.GetValue<string>());
+        Assert.NotEqual(left.Id, next.Project);
+        Assert.DoesNotContain(board.Calls, c => c.Tool == "update_project");
+        var note = Assert.Single(next.Notes);
+        Assert.Contains(left.Key, note);
+        Assert.Contains(left.Id.ToString("D"), note);
+        Assert.Contains("still on the board, archived", note);
 
         // Neither: the run fails naming the project, and the check says so afterwards.
         board.Instead = (tool, _) => tool is "delete_project" or "update_project" ? board.Lost() : null;
         var stuck = Recorder(board);
         var failed = await Assert.ThrowsAsync<InvalidOperationException>(() => stuck.RecordAsync(ct));
         Assert.Contains("left something on the board", failed.Message);
-        Assert.Contains(stuck.Project.ToString("D"), failed.Message);
+        Assert.Contains($"project {stuck.Project:D} ({stuck.ProjectKey}) is neither deleted nor archived: it could be neither deleted (", failed.Message);
         board.Instead = null;
         Assert.NotEmpty(await stuck.LeftBehindAsync(ct));
+        board.Projects.RemoveAll(p => p.Id == stuck.Project);
+        board.Items.RemoveAll(i => i.ProjectId == stuck.Project);
+
+        // A delete that happened but whose answer was lost: the archive finds no project, the board read again shows none,
+        // so nothing was left — the run passes and its recordings are kept.
+        board.LoseAnswer = (tool, _) => tool == "delete_project";
+        board.Calls.Clear();
+        var lost = Recorder(board);
+        Assert.Equal(KanbanFixture.Names, (await lost.RecordAsync(ct)).Keys);
+        Assert.Equal(["delete_project", "update_project"], board.Calls.Where(c => c.Tool is "delete_project" or "update_project").Select(c => c.Tool));
+        Assert.Equal([theirs, left], board.Projects);
+        Assert.DoesNotContain(board.Items, i => i.ProjectId == lost.Project);
     }
 
-    /// <summary>The sweep takes only what carries BOTH throwaway prefixes: a project that merely looks alike is left alone.</summary>
+    /// <summary>
+    /// A run that is cancelled (Ctrl-C, a test timeout) still cleans the board up, on a token of its own; and a clean-up that
+    /// itself fails says what may be left, naming the project.
+    /// </summary>
     [Fact]
-    public async Task The_sweep_deletes_only_projects_with_the_throwaway_name_and_key()
+    public async Task A_cancelled_run_still_removes_its_project_and_a_clean_up_that_fails_names_the_project()
+    {
+        var (board, theirs, theirItem) = SharedBoard();
+        using var cancelled = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        // Cancelled in the middle of the lifecycle scenario: items are on the board, several Ready.
+        board.Before = (tool, _) =>
+        {
+            if (tool == "add_work_item_comment")
+            {
+                cancelled.Cancel();
+            }
+        };
+        var recorder = Recorder(board);
+
+        var failed = await Assert.ThrowsAsync<InvalidOperationException>(() => recorder.RecordAsync(cancelled.Token));
+
+        Assert.True(cancelled.IsCancellationRequested);
+        Assert.StartsWith("The Kanban fixture recording failed (its throwaway project was removed)", failed.Message);
+        Assert.NotEqual(Guid.Empty, recorder.Project);
+        Assert.Equal(recorder.Project.ToString("D"), Assert.Single(board.Calls, c => c.Tool == "delete_project").Arguments["projectId"]!.GetValue<string>());
+        Assert.Equal([theirs], board.Projects);
+        Assert.Equal([theirItem], board.Items);
+
+        // The clean-up itself fails (the board cannot be read again after the delete was refused and so was the archive): the
+        // run says what may be left, naming the project by key and id, and still reports the cancellation as the cause.
+        var (second, _, _) = SharedBoard();
+        using var again = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var cleaning = false;
+        second.Before = (tool, _) =>
+        {
+            cleaning |= tool == "delete_project";
+            if (tool == "add_work_item_comment")
+            {
+                again.Cancel();
+            }
+        };
+        second.Instead = (tool, _) => cleaning && tool is "delete_project" or "update_project" or "list_projects" ? second.Lost() : null;
+        var stuck = Recorder(second);
+
+        var left = await Assert.ThrowsAsync<AggregateException>(() => stuck.RecordAsync(again.Token));
+
+        Assert.Contains("left something on the board", left.Message);
+        Assert.Contains($"project {stuck.Project:D} ({stuck.ProjectKey}) may still be on the board, unarchived: the clean-up itself failed", left.Message);
+        Assert.IsAssignableFrom<OperationCanceledException>(left.InnerException);
+        Assert.DoesNotContain(FakeKanbanBoard.FullToken, left.ToString());
+        Assert.Contains(second.Projects, p => p.Id == stuck.Project && !p.Archived);
+    }
+
+    /// <summary>
+    /// A project the board created whose answer never reached the run (so the run has no id to delete it by) is reported, by
+    /// the key this run gave it, and the next run archives it — it is exactly a recording's — and names it.
+    /// </summary>
+    [Fact]
+    public async Task A_project_created_without_its_answer_reaching_the_run_is_reported_and_archived_by_the_next_run()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (board, theirs, _) = SharedBoard();
+        board.LoseAnswer = (tool, _) => tool == "create_project";
+        var recorder = Recorder(board);
+
+        var failed = await Assert.ThrowsAsync<AggregateException>(() => recorder.RecordAsync(ct));
+
+        var orphan = Assert.Single(board.Projects, p => p != theirs);
+        Assert.Equal((Guid.Empty, recorder.ProjectKey, false), (recorder.Project, orphan.Key, orphan.Archived));
+        Assert.Contains("left something on the board", failed.Message);
+        Assert.Contains($"project {orphan.Id:D} ({orphan.Key}) is neither deleted nor archived", failed.Message);
+        Assert.DoesNotContain(board.Calls, c => c.Tool is "delete_project" or "update_project");
+
+        board.LoseAnswer = null;
+        var next = Recorder(board);
+        await next.RecordAsync(ct);
+        Assert.Equal([theirs, orphan], board.Projects);
+        Assert.True(orphan.Archived);
+        Assert.Contains("was archived (not deleted)", Assert.Single(next.Notes, n => n.Contains(orphan.Key) && n.Contains(orphan.Id.ToString("D"))));
+        Assert.Equal(next.Project.ToString("D"), Assert.Single(board.Calls, c => c.Tool == "delete_project").Arguments["projectId"]!.GetValue<string>());
+    }
+
+    /// <summary>Rewrites every answer's text on its way from the board to the recorder.</summary>
+    private sealed class Rewriting(HttpMessageHandler inner, Func<string, string> rewrite) : DelegatingHandler(inner)
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            var response = await base.SendAsync(request, ct);
+            if (response.Content is { } content && response.StatusCode == HttpStatusCode.OK)
+            {
+                response.Content = new StringContent(rewrite(await content.ReadAsStringAsync(ct)), System.Text.Encoding.UTF8, content.Headers.ContentType?.MediaType ?? "application/json");
+            }
+            return response;
+        }
+    }
+
+    /// <summary>
+    /// The recorder end to end with a board whose <c>conflict</c> refusal names the token's identity — in a scenario whose own
+    /// handler never meets that name in a field (the item there is never claimed): the run's shared identities, seeded from
+    /// the recorder's own first claim, scrub it.
+    /// </summary>
+    [Fact]
+    public async Task A_refusal_naming_the_tokens_identity_is_scrubbed_in_a_scenario_that_never_met_the_name()
+    {
+        var board = new FakeKanbanBoard();
+        var transport = new Rewriting(board.Server.Api, body => body.Replace(" is at version ", " was last written by factory and is at version "));
+        var recorder = new KanbanFixtureRecorder(transport, new Uri(FakeKanbanBoard.Url), FakeKanbanBoard.FullToken, KanbanFixture.Provisional, KanbanContractTests.Scenarios);
+
+        var fixtures = await recorder.RecordAsync(TestContext.Current.CancellationToken);
+
+        var conflict = fixtures["conflict.json"];
+        Assert.DoesNotContain(conflict.Interactions, i => i.Answer!.ToJsonString().Contains("claimant\":\"") || i.Answer.ToJsonString().Contains("author\":\""));
+        var message = Assert.Single(conflict.Interactions, i => i.IsError).Answer!["message"]!.GetValue<string>();
+        Assert.Contains($" was last written by {KanbanRecordingHandler.Recorder} and is at version 2.", message);
+        await VerifiedAsync(fixtures, FakeKanbanBoard.FullToken, recorder.Identities);
+        Assert.Empty(board.Projects);
+    }
+
+    private static FakeKanbanBoard.Project Leftover(FakeKanbanBoard board, string key, string? name = null, bool archived = false)
+    {
+        var project = board.AddProject(key);
+        project.Name = name ?? KanbanFixtureGuard.ProjectName;
+        project.Archived = archived;
+        return project;
+    }
+
+    /// <summary>
+    /// What a run that died left is never deleted by a later run, which did not create it: a project that is exactly a
+    /// recording's is archived (reversible) and named for the owner; a project without both prefixes is not even looked into.
+    /// </summary>
+    [Fact]
+    public async Task The_sweep_archives_an_earlier_runs_exact_leftover_names_it_and_deletes_nothing()
     {
         var ct = TestContext.Current.CancellationToken;
         var board = new FakeKanbanBoard();
-        var stale = board.AddProject($"{KanbanFixtureGuard.KeyPrefix}0BADF00D");
-        stale.Name = $"{KanbanFixtureGuard.Prefix} contract recording";
-        stale.Archived = true;
-        board.AddItem(stale, $"{KanbanFixtureGuard.Prefix} left by a run that died");
-        var nameOnly = board.AddProject("REAL");
-        nameOnly.Name = $"{KanbanFixtureGuard.Prefix} a person's notes";
-        var keyOnly = board.AddProject($"{KanbanFixtureGuard.KeyPrefix}ES");
-        keyOnly.Name = "Dffixes";
+        var stale = Leftover(board, $"{KanbanFixtureGuard.KeyPrefix}0BADF00D");
+        var item = board.AddItem(stale, $"{KanbanFixtureGuard.Prefix} left by a run that died");
+        var closed = board.AddItem(stale, $"{KanbanFixtureGuard.Prefix} closed", status: "Closed");
+        board.AddEpic(stale, $"{KanbanFixtureGuard.Prefix} epic").Documents.Add((Guid.NewGuid(), $"{KanbanFixtureGuard.Prefix} spec", "body"));
+        var archived = Leftover(board, $"{KanbanFixtureGuard.KeyPrefix}00C0FFEE", archived: true);
+        var nameOnly = Leftover(board, "REAL", $"{KanbanFixtureGuard.Prefix} a person's notes");
+        var keyOnly = Leftover(board, $"{KanbanFixtureGuard.KeyPrefix}ES", "Dffixes");
+        var theirs = board.AddItem(nameOnly, "A person's note");
 
-        await Recorder(board).SweepAsync(ct);
+        var notes = await Recorder(board).SweepAsync(ct);
 
-        Assert.Equal([nameOnly, keyOnly], board.Projects);
-        Assert.Empty(board.Items);
+        // Everything is still there; the one unarchived leftover is archived, by its id, and nothing else was written.
+        Assert.Equal([stale, archived, nameOnly, keyOnly], board.Projects);
+        Assert.Equal([item, closed, theirs], board.Items);
+        Assert.Equal([true, true, false, false], board.Projects.Select(p => p.Archived));
+        var write = Assert.Single(board.Calls, c => FakeKanbanBoard.WriteTools.Contains(c.Tool));
+        Assert.Equal(("update_project", stale.Id.ToString("D"), true),
+            (write.Tool, write.Arguments["id"]!.GetValue<string>(), write.Arguments["is_archived"]!.GetValue<bool>()));
+        Assert.DoesNotContain(board.Calls, c => c.Tool == "delete_project");
+        // Nothing of a project without both prefixes was read.
+        Assert.DoesNotContain(board.Calls, c => c.Arguments.ToJsonString().Contains(nameOnly.Id.ToString()) || c.Arguments.ToJsonString().Contains(keyOnly.Id.ToString()));
+        // Both leftovers are named, key and id, for the owner to delete.
+        Assert.Equal(2, notes.Count);
+        Assert.Contains(notes, n => n.Contains(stale.Key) && n.Contains(stale.Id.ToString("D")) && n.Contains("was archived (not deleted)"));
+        Assert.Contains(notes, n => n.Contains(archived.Key) && n.Contains(archived.Id.ToString("D")) && n.Contains("still on the board, archived"));
+    }
+
+    public enum Stranger
+    {
+        /// <summary>A prefixed name and a key that starts <c>DFFIX</c> but is not the recorder's shape.</summary>
+        KeyShape,
+        /// <summary>The recorder's key shape and a prefixed name that is not exactly its project's.</summary>
+        Name,
+        /// <summary>Exactly the recorder's name and key, holding a work item that is not a throwaway.</summary>
+        Item,
+        /// <summary>The same, the item closed (hidden from a plain listing).</summary>
+        ClosedItem,
+        /// <summary>Exactly the recorder's name and key, holding an epic that is not a throwaway.</summary>
+        Epic,
+        /// <summary>Exactly the recorder's name and key, a throwaway epic holding a document that is not one.</summary>
+        Document,
+        /// <summary>A stranger that is archived already.</summary>
+        ArchivedItem,
+    }
+
+    /// <summary>
+    /// A project that carries both prefixes but is not exactly a recording's leftover is someone's: it is neither deleted nor
+    /// archived, the run fails naming it, and nothing at all is written — not even to an exact leftover beside it.
+    /// </summary>
+    [Theory]
+    [InlineData(Stranger.KeyShape, "its key is not")]
+    [InlineData(Stranger.Name, "its name is not exactly")]
+    [InlineData(Stranger.Item, "1 work item(s) not titled")]
+    [InlineData(Stranger.ClosedItem, "1 work item(s) not titled")]
+    [InlineData(Stranger.Epic, "1 epic(s) not named")]
+    [InlineData(Stranger.Document, "1 epic document(s) not titled")]
+    [InlineData(Stranger.ArchivedItem, "1 work item(s) not titled")]
+    public async Task A_project_with_both_prefixes_that_is_not_exactly_a_recordings_is_left_untouched_and_fails_the_run(Stranger kind, string why)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var board = new FakeKanbanBoard();
+        var exact = Leftover(board, $"{KanbanFixtureGuard.KeyPrefix}0BADF00D");
+        var stranger = kind switch
+        {
+            Stranger.KeyShape => Leftover(board, $"{KanbanFixtureGuard.KeyPrefix}ES1"),
+            Stranger.Name => Leftover(board, $"{KanbanFixtureGuard.KeyPrefix}12345678", $"{KanbanFixtureGuard.Prefix} contract recording 2"),
+            _ => Leftover(board, $"{KanbanFixtureGuard.KeyPrefix}12345678", archived: kind == Stranger.ArchivedItem),
+        };
+        board.AddItem(stranger, $"{KanbanFixtureGuard.Prefix} a throwaway beside it");
+        switch (kind)
+        {
+            case Stranger.Item or Stranger.ArchivedItem:
+                board.AddItem(stranger, "Real work");
+                break;
+            case Stranger.ClosedItem:
+                board.AddItem(stranger, "Real work", status: "Closed");
+                break;
+            case Stranger.Epic:
+                board.AddEpic(stranger, "Q4 roadmap");
+                break;
+            case Stranger.Document:
+                board.AddEpic(stranger, $"{KanbanFixtureGuard.Prefix} epic").Documents.Add((Guid.NewGuid(), "Board minutes", "private"));
+                break;
+        }
+        var (items, epics) = (board.Items.ToList(), board.Epics.ToList());
+        var recorder = Recorder(board);
+
+        var refused = await Assert.ThrowsAsync<InvalidOperationException>(() => recorder.RecordAsync(ct));
+
+        Assert.StartsWith("The Kanban fixture recorder did not start, and wrote nothing", refused.Message);
+        Assert.Contains($"project {stranger.Id:D} ({stranger.Key}): ", refused.Message);
+        Assert.Contains(why, refused.Message);
+        // What it holds is counted, not repeated.
+        Assert.DoesNotContain("Real work", refused.Message);
+        Assert.DoesNotContain("Q4 roadmap", refused.Message);
+        Assert.DoesNotContain("Board minutes", refused.Message);
+        // Untouched: still there, as archived as it was; nothing written anywhere, the exact leftover included.
+        Assert.Equal([exact, stranger], board.Projects);
+        Assert.Equal((false, kind == Stranger.ArchivedItem), (exact.Archived, stranger.Archived));
+        Assert.Equal(items, board.Items);
+        Assert.Equal(epics, board.Epics);
+        Assert.Empty(board.Writes);
+        Assert.Equal(Guid.Empty, recorder.Project);
     }
 }

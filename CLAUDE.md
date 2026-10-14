@@ -107,14 +107,25 @@ Claude Code headless workers through the Weave router.
   `{tool, arguments, isError, answer}`: the answer is the text block's one JSON document, a refusal's `{code, message}`, or a
   plain MCP error's text. Recording: `KanbanRecordingHandler` (same file) under the adapter, `KanbanFixtureRecorder`
   (`Support/KanbanFixtureRecorder.cs`) around it — one throwaway project created under an idempotency key
-  (`[dark-factory fixture] …`, key `DFFIX<8 hex>`) with an epic, a document and the scenarios' items, deleted afterwards
-  (`delete_project`; archived when the delete is refused), then the board read again and anything of its own neither deleted
-  nor archived fails the run; it first sweeps what an earlier run that died left (projects with BOTH prefixes). The repository
-  is public: a recorded listing keeps only the recording's own projects, items and documents, an answer about anyone else's
-  object is refused, an identity's name becomes `fixture-recorder`, an e-mail a placeholder, and no request header (the token)
-  is ever read into a fixture; `KanbanFixtureGuard` fails a committed fixture that holds a token (`Authorization`, a bearer
-  value, `kbp_…`, a JWT), an e-mail, an identity's name, or an item/project/epic/document/listing entry that is not a throwaway
-  of the fixture's own project. The `conflict` is real (the recorder edits the item between the adapter's read and its
+  (`[dark-factory fixture] contract recording`, key `DFFIX<8 hex>`) with an epic, a document and the scenarios' items, deleted
+  afterwards (`delete_project`, by the id the board returned to this run: the recorder's only hard delete; archived when the
+  delete is refused), on a token of its own (`KanbanFixtureRecorder.CleanupTimeout`, so a cancelled run still cleans up), then
+  the board read again and anything of its own neither deleted nor archived fails the run naming it (a delete whose answer was
+  lost is found gone by that read; a clean-up that itself fails names the project). What an earlier run that died left is
+  never deleted (`SweepAsync`): a project with BOTH prefixes that is exactly a recording's (`NotARecordingAsync`: that name,
+  the key `DFFIX` + 8 upper-case hex, every item, epic and epic document in it prefixed; the contract gives a project no
+  creator to check) is archived — reversible — and named (key, id) in `Notes`, which `Record` prints as `[kanban fixtures] …`
+  for the owner to delete by hand; one that is not exactly that is left untouched and fails the run before anything is
+  written. The repository is public: a recorded listing keeps only the recording's own projects, items and documents, an
+  answer about anyone else's object (and the change feed) is refused, an identity's name becomes `fixture-recorder` and its id
+  a fixed placeholder (`f0000000-0000-0000-0000-00000000000N`; `KanbanIdentities`, one set for the whole run, seeded from the
+  recorder's own first claim, so a refusal's message naming the identity is scrubbed in every scenario), an e-mail a
+  placeholder (replaced in string values, never in JSON text), and no request header (the token) is ever read into a fixture;
+  `KanbanFixtureGuard` fails a committed fixture that holds a token (`Authorization`, a bearer value, `kbp_…`, a JWT), an
+  e-mail, an identity's name, an identity's id that is not the placeholder, a refusal message naming an identity the set or
+  the run knows (`SetProblems`), or an item/project/epic/document/listing entry that is not a throwaway of the fixture's own
+  project. Before `Record` saves, `KanbanFixtureRecording.VerifiedAsync` also searches every file for the literal token and
+  replays every fixture in every framing, and `KanbanFixture.SaveAll` replaces the set whole or not at all. The `conflict` is real (the recorder edits the item between the adapter's read and its
   conditional move); a `busy` cannot be provoked on demand (the board answers it only after a write waited 10 s for other
   writers), so that one interaction is authored from the contract's Error shape by the recording handler, not forwarded, and
   marked (`note`, `KanbanRecordingHandler.SyntheticBusyNote`) — the resend after it is the board's own answer.
@@ -122,7 +133,8 @@ Claude Code headless workers through the Weave router.
   `"recorded_from": "in-repo fake (provisional; re-record against the hosted instance)"` — made by that same recorder against
   `FakeKanbanBoard` (`KANBAN_RECORD=fake`), which `KanbanFixtureRecording` also proves end to end in every `dotnet test`.
   Re-record against the hosted board with `KANBAN_RECORD=1` and a full-scope token in `KANBAN_RECORD_TOKEN` (the environment
-  only: never the keychain, never a file; `KANBAN_RECORD_URL` for another instance) — docs/acceptance.md, "Kanban contract
+  only: never the keychain, never a file; `KANBAN_RECORD_URL` for another instance: absolute https, or http on a loopback
+  host, else refused — `KanbanFixtureRecording.Endpoint`) — docs/acceptance.md, "Kanban contract
   fixtures". `KANBAN_FIXTURES_REQUIRE_HOSTED=1` makes a fixture that is still provisional fail `dotnet test`.
 - `tests/DarkFactory.AcceptanceTests` — live epic acceptance harness; skips unless `FACTORY_E2E=1`. AT1–AT8 runbook:
   `docs/acceptance.md` (the `factory work` tests use a throwaway ledger DB and their own work root, `E2e.cs`). Phase 2's epic

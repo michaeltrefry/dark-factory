@@ -1,25 +1,25 @@
 {
   "recorded_from": "in-repo fake (provisional; re-record against the hosted instance)",
   "parameters": {
-    "project": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-    "projectKey": "DFFIX2A1B0807",
-    "epic": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
-    "inEpic": "cc6c8004-f7f0-47e9-818f-832c14973065",
-    "plain": "e20a050e-d67c-460d-b759-2a749af593a5"
+    "project": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+    "projectKey": "DFFIX843A9540",
+    "epic": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+    "inEpic": "24ba5e12-8070-439a-8da8-6a6784354628",
+    "plain": "5a219205-961f-408a-9ceb-f5e4cc2c17d3"
   },
   "interactions": [
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "cc6c8004-f7f0-47e9-818f-832c14973065"
+        "itemId": "24ba5e12-8070-439a-8da8-6a6784354628"
       },
       "isError": false,
       "answer": {
-        "id": "cc6c8004-f7f0-47e9-818f-832c14973065",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+        "id": "24ba5e12-8070-439a-8da8-6a6784354628",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
         "epic": {
-          "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] item in an epic",
@@ -52,9 +52,9 @@
       "isError": false,
       "answer": [
         {
-          "id": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+          "id": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
           "name": "[dark-factory fixture] contract recording",
-          "key": "DFFIX2A1B0807",
+          "key": "DFFIX843A9540",
           "isArchived": false,
           "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
           "totalItems": 9,
@@ -67,12 +67,12 @@
     {
       "tool": "get_epic",
       "arguments": {
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a"
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417"
       },
       "isError": false,
       "answer": {
-        "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "name": "[dark-factory fixture] epic",
         "description": "Objective: record what the dark-factory adapter asks of KanbanBoard.",
         "isArchived": false,
@@ -83,13 +83,13 @@
     {
       "tool": "list_epic_documents",
       "arguments": {
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a"
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417"
       },
       "isError": false,
       "answer": [
         {
-          "id": "f347563b-523d-449e-a929-d5fc87f69452",
-          "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "9dd5da92-e5cf-4673-baa6-592126f3f646",
+          "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "title": "[dark-factory fixture] spec",
           "body": "# Spec\n\n## Work sources\n\nShortcut and KanbanBoard plug in through one adapter interface.",
           "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
@@ -100,12 +100,12 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "e20a050e-d67c-460d-b759-2a749af593a5"
+        "itemId": "5a219205-961f-408a-9ceb-f5e4cc2c17d3"
       },
       "isError": false,
       "answer": {
-        "id": "e20a050e-d67c-460d-b759-2a749af593a5",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "5a219205-961f-408a-9ceb-f5e4cc2c17d3",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] item without an epic",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -133,9 +133,9 @@
       "isError": false,
       "answer": [
         {
-          "id": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+          "id": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
           "name": "[dark-factory fixture] contract recording",
-          "key": "DFFIX2A1B0807",
+          "key": "DFFIX843A9540",
           "isArchived": false,
           "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
           "totalItems": 9,
@@ -148,12 +148,12 @@
     {
       "tool": "get_epic",
       "arguments": {
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a"
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417"
       },
       "isError": false,
       "answer": {
-        "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "name": "[dark-factory fixture] epic",
         "description": "Objective: record what the dark-factory adapter asks of KanbanBoard.",
         "isArchived": false,

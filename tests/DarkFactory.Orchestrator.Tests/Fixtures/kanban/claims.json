@@ -1,21 +1,21 @@
 {
   "recorded_from": "in-repo fake (provisional; re-record against the hosted instance)",
   "parameters": {
-    "project": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-    "projectKey": "DFFIX2A1B0807",
-    "lapsed": "bb92db44-3f21-496d-9af0-83c9d7570bea",
-    "lost": "a843f370-000d-49b2-b29b-2c78e66c59db"
+    "project": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+    "projectKey": "DFFIX843A9540",
+    "lapsed": "098db644-4424-4a5e-b181-ddaceb733c8f",
+    "lost": "73a6f41e-f156-4cc8-ad23-e982f96db75f"
   },
   "interactions": [
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "bb92db44-3f21-496d-9af0-83c9d7570bea"
+        "itemId": "098db644-4424-4a5e-b181-ddaceb733c8f"
       },
       "isError": false,
       "answer": {
-        "id": "bb92db44-3f21-496d-9af0-83c9d7570bea",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "098db644-4424-4a5e-b181-ddaceb733c8f",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] claim that lapses",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -40,12 +40,12 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "bb92db44-3f21-496d-9af0-83c9d7570bea"
+        "itemId": "098db644-4424-4a5e-b181-ddaceb733c8f"
       },
       "isError": false,
       "answer": {
-        "id": "bb92db44-3f21-496d-9af0-83c9d7570bea",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "098db644-4424-4a5e-b181-ddaceb733c8f",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] claim that lapses",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -73,9 +73,9 @@
       "isError": false,
       "answer": [
         {
-          "id": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+          "id": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
           "name": "[dark-factory fixture] contract recording",
-          "key": "DFFIX2A1B0807",
+          "key": "DFFIX843A9540",
           "isArchived": false,
           "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
           "totalItems": 11,
@@ -88,14 +88,14 @@
     {
       "tool": "claim_work_item",
       "arguments": {
-        "id": "bb92db44-3f21-496d-9af0-83c9d7570bea",
-        "marker": "dark-factory:bb92db44-3f21-496d-9af0-83c9d7570bea",
+        "id": "098db644-4424-4a5e-b181-ddaceb733c8f",
+        "marker": "dark-factory:098db644-4424-4a5e-b181-ddaceb733c8f",
         "ttl_seconds": 86400
       },
       "isError": false,
       "answer": {
-        "id": "bb92db44-3f21-496d-9af0-83c9d7570bea",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "098db644-4424-4a5e-b181-ddaceb733c8f",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] claim that lapses",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -108,7 +108,7 @@
         "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
         "claimant": "fixture-recorder",
         "claimant_id": "f0000000-0000-0000-0000-000000000001",
-        "claim_marker": "dark-factory:bb92db44-3f21-496d-9af0-83c9d7570bea",
+        "claim_marker": "dark-factory:098db644-4424-4a5e-b181-ddaceb733c8f",
         "claim_expires_at_utc": "2026-10-14T12:00:00.000000+00:00",
         "blockers": [],
         "dependents": [],
@@ -120,12 +120,12 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "bb92db44-3f21-496d-9af0-83c9d7570bea"
+        "itemId": "098db644-4424-4a5e-b181-ddaceb733c8f"
       },
       "isError": false,
       "answer": {
-        "id": "bb92db44-3f21-496d-9af0-83c9d7570bea",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "098db644-4424-4a5e-b181-ddaceb733c8f",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] claim that lapses",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -138,7 +138,7 @@
         "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
         "claimant": "fixture-recorder",
         "claimant_id": "f0000000-0000-0000-0000-000000000001",
-        "claim_marker": "dark-factory:bb92db44-3f21-496d-9af0-83c9d7570bea",
+        "claim_marker": "dark-factory:098db644-4424-4a5e-b181-ddaceb733c8f",
         "claim_expires_at_utc": "2026-10-14T12:00:00.000000+00:00",
         "blockers": [],
         "dependents": [],
@@ -150,14 +150,14 @@
     {
       "tool": "update_work_item",
       "arguments": {
-        "itemId": "bb92db44-3f21-496d-9af0-83c9d7570bea",
+        "itemId": "098db644-4424-4a5e-b181-ddaceb733c8f",
         "status": "InProgress",
         "expected_version": 1
       },
       "isError": false,
       "answer": {
-        "id": "bb92db44-3f21-496d-9af0-83c9d7570bea",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "098db644-4424-4a5e-b181-ddaceb733c8f",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] claim that lapses",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -170,7 +170,7 @@
         "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
         "claimant": "fixture-recorder",
         "claimant_id": "f0000000-0000-0000-0000-000000000001",
-        "claim_marker": "dark-factory:bb92db44-3f21-496d-9af0-83c9d7570bea",
+        "claim_marker": "dark-factory:098db644-4424-4a5e-b181-ddaceb733c8f",
         "claim_expires_at_utc": "2026-10-14T12:00:00.000000+00:00",
         "blockers": [],
         "dependents": [],
@@ -182,14 +182,14 @@
     {
       "tool": "renew_work_item_claim",
       "arguments": {
-        "id": "bb92db44-3f21-496d-9af0-83c9d7570bea",
-        "marker": "dark-factory:bb92db44-3f21-496d-9af0-83c9d7570bea",
+        "id": "098db644-4424-4a5e-b181-ddaceb733c8f",
+        "marker": "dark-factory:098db644-4424-4a5e-b181-ddaceb733c8f",
         "ttl_seconds": 86400
       },
       "isError": false,
       "answer": {
-        "id": "bb92db44-3f21-496d-9af0-83c9d7570bea",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "098db644-4424-4a5e-b181-ddaceb733c8f",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] claim that lapses",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -202,7 +202,7 @@
         "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
         "claimant": "fixture-recorder",
         "claimant_id": "f0000000-0000-0000-0000-000000000001",
-        "claim_marker": "dark-factory:bb92db44-3f21-496d-9af0-83c9d7570bea",
+        "claim_marker": "dark-factory:098db644-4424-4a5e-b181-ddaceb733c8f",
         "claim_expires_at_utc": "2026-10-14T12:00:00.000000+00:00",
         "blockers": [],
         "dependents": [],
@@ -214,25 +214,25 @@
     {
       "tool": "renew_work_item_claim",
       "arguments": {
-        "id": "bb92db44-3f21-496d-9af0-83c9d7570bea",
-        "marker": "dark-factory:bb92db44-3f21-496d-9af0-83c9d7570bea",
+        "id": "098db644-4424-4a5e-b181-ddaceb733c8f",
+        "marker": "dark-factory:098db644-4424-4a5e-b181-ddaceb733c8f",
         "ttl_seconds": 86400
       },
       "isError": true,
       "answer": {
         "code": "conflict",
-        "message": "The caller holds no live claim on work item bb92db44-3f21-496d-9af0-83c9d7570bea under this marker."
+        "message": "The caller holds no live claim on work item 098db644-4424-4a5e-b181-ddaceb733c8f under this marker."
       }
     },
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "bb92db44-3f21-496d-9af0-83c9d7570bea"
+        "itemId": "098db644-4424-4a5e-b181-ddaceb733c8f"
       },
       "isError": false,
       "answer": {
-        "id": "bb92db44-3f21-496d-9af0-83c9d7570bea",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "098db644-4424-4a5e-b181-ddaceb733c8f",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] claim that lapses",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -257,14 +257,14 @@
     {
       "tool": "claim_work_item",
       "arguments": {
-        "id": "bb92db44-3f21-496d-9af0-83c9d7570bea",
-        "marker": "dark-factory:bb92db44-3f21-496d-9af0-83c9d7570bea",
+        "id": "098db644-4424-4a5e-b181-ddaceb733c8f",
+        "marker": "dark-factory:098db644-4424-4a5e-b181-ddaceb733c8f",
         "ttl_seconds": 86400
       },
       "isError": false,
       "answer": {
-        "id": "bb92db44-3f21-496d-9af0-83c9d7570bea",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "098db644-4424-4a5e-b181-ddaceb733c8f",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] claim that lapses",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -277,7 +277,7 @@
         "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
         "claimant": "fixture-recorder",
         "claimant_id": "f0000000-0000-0000-0000-000000000001",
-        "claim_marker": "dark-factory:bb92db44-3f21-496d-9af0-83c9d7570bea",
+        "claim_marker": "dark-factory:098db644-4424-4a5e-b181-ddaceb733c8f",
         "claim_expires_at_utc": "2026-10-14T12:00:00.000000+00:00",
         "blockers": [],
         "dependents": [],
@@ -289,12 +289,12 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "a843f370-000d-49b2-b29b-2c78e66c59db"
+        "itemId": "73a6f41e-f156-4cc8-ad23-e982f96db75f"
       },
       "isError": false,
       "answer": {
-        "id": "a843f370-000d-49b2-b29b-2c78e66c59db",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "73a6f41e-f156-4cc8-ad23-e982f96db75f",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] claim that is lost",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -319,12 +319,12 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "a843f370-000d-49b2-b29b-2c78e66c59db"
+        "itemId": "73a6f41e-f156-4cc8-ad23-e982f96db75f"
       },
       "isError": false,
       "answer": {
-        "id": "a843f370-000d-49b2-b29b-2c78e66c59db",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "73a6f41e-f156-4cc8-ad23-e982f96db75f",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] claim that is lost",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -352,9 +352,9 @@
       "isError": false,
       "answer": [
         {
-          "id": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+          "id": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
           "name": "[dark-factory fixture] contract recording",
-          "key": "DFFIX2A1B0807",
+          "key": "DFFIX843A9540",
           "isArchived": false,
           "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
           "totalItems": 11,
@@ -367,14 +367,14 @@
     {
       "tool": "claim_work_item",
       "arguments": {
-        "id": "a843f370-000d-49b2-b29b-2c78e66c59db",
-        "marker": "dark-factory:a843f370-000d-49b2-b29b-2c78e66c59db",
+        "id": "73a6f41e-f156-4cc8-ad23-e982f96db75f",
+        "marker": "dark-factory:73a6f41e-f156-4cc8-ad23-e982f96db75f",
         "ttl_seconds": 86400
       },
       "isError": false,
       "answer": {
-        "id": "a843f370-000d-49b2-b29b-2c78e66c59db",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "73a6f41e-f156-4cc8-ad23-e982f96db75f",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] claim that is lost",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -387,7 +387,7 @@
         "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
         "claimant": "fixture-recorder",
         "claimant_id": "f0000000-0000-0000-0000-000000000001",
-        "claim_marker": "dark-factory:a843f370-000d-49b2-b29b-2c78e66c59db",
+        "claim_marker": "dark-factory:73a6f41e-f156-4cc8-ad23-e982f96db75f",
         "claim_expires_at_utc": "2026-10-14T12:00:00.000000+00:00",
         "blockers": [],
         "dependents": [],
@@ -399,12 +399,12 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "a843f370-000d-49b2-b29b-2c78e66c59db"
+        "itemId": "73a6f41e-f156-4cc8-ad23-e982f96db75f"
       },
       "isError": false,
       "answer": {
-        "id": "a843f370-000d-49b2-b29b-2c78e66c59db",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "73a6f41e-f156-4cc8-ad23-e982f96db75f",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] claim that is lost",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -417,7 +417,7 @@
         "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
         "claimant": "fixture-recorder",
         "claimant_id": "f0000000-0000-0000-0000-000000000001",
-        "claim_marker": "dark-factory:a843f370-000d-49b2-b29b-2c78e66c59db",
+        "claim_marker": "dark-factory:73a6f41e-f156-4cc8-ad23-e982f96db75f",
         "claim_expires_at_utc": "2026-10-14T12:00:00.000000+00:00",
         "blockers": [],
         "dependents": [],
@@ -429,14 +429,14 @@
     {
       "tool": "update_work_item",
       "arguments": {
-        "itemId": "a843f370-000d-49b2-b29b-2c78e66c59db",
+        "itemId": "73a6f41e-f156-4cc8-ad23-e982f96db75f",
         "status": "InProgress",
         "expected_version": 1
       },
       "isError": false,
       "answer": {
-        "id": "a843f370-000d-49b2-b29b-2c78e66c59db",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "73a6f41e-f156-4cc8-ad23-e982f96db75f",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] claim that is lost",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -449,7 +449,7 @@
         "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
         "claimant": "fixture-recorder",
         "claimant_id": "f0000000-0000-0000-0000-000000000001",
-        "claim_marker": "dark-factory:a843f370-000d-49b2-b29b-2c78e66c59db",
+        "claim_marker": "dark-factory:73a6f41e-f156-4cc8-ad23-e982f96db75f",
         "claim_expires_at_utc": "2026-10-14T12:00:00.000000+00:00",
         "blockers": [],
         "dependents": [],
@@ -461,25 +461,25 @@
     {
       "tool": "renew_work_item_claim",
       "arguments": {
-        "id": "a843f370-000d-49b2-b29b-2c78e66c59db",
-        "marker": "dark-factory:a843f370-000d-49b2-b29b-2c78e66c59db",
+        "id": "73a6f41e-f156-4cc8-ad23-e982f96db75f",
+        "marker": "dark-factory:73a6f41e-f156-4cc8-ad23-e982f96db75f",
         "ttl_seconds": 86400
       },
       "isError": true,
       "answer": {
         "code": "already_claimed",
-        "message": "Work item a843f370-000d-49b2-b29b-2c78e66c59db is claimed by someone else."
+        "message": "Work item 73a6f41e-f156-4cc8-ad23-e982f96db75f is claimed by someone else."
       }
     },
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "a843f370-000d-49b2-b29b-2c78e66c59db"
+        "itemId": "73a6f41e-f156-4cc8-ad23-e982f96db75f"
       },
       "isError": false,
       "answer": {
-        "id": "a843f370-000d-49b2-b29b-2c78e66c59db",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "73a6f41e-f156-4cc8-ad23-e982f96db75f",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] claim that is lost",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -504,12 +504,12 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "a843f370-000d-49b2-b29b-2c78e66c59db"
+        "itemId": "73a6f41e-f156-4cc8-ad23-e982f96db75f"
       },
       "isError": false,
       "answer": {
-        "id": "a843f370-000d-49b2-b29b-2c78e66c59db",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "73a6f41e-f156-4cc8-ad23-e982f96db75f",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] claim that is lost",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -537,9 +537,9 @@
       "isError": false,
       "answer": [
         {
-          "id": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+          "id": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
           "name": "[dark-factory fixture] contract recording",
-          "key": "DFFIX2A1B0807",
+          "key": "DFFIX843A9540",
           "isArchived": false,
           "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
           "totalItems": 11,

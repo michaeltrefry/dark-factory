@@ -69,11 +69,16 @@ public sealed record KanbanScenario(string Fixture, Func<KanbanContractSession, 
 /// What it writes on the board is its own and thrown away: ONE project, created under an idempotency key, named
 /// <c>[dark-factory fixture] …</c> with a key <c>DFFIX&lt;8 hex&gt;</c> (<see cref="KanbanFixtureGuard"/>), holding one epic, one
 /// epic document and the scenarios' work items; nothing outside that project is written, and reads of anything else are cut
-/// from the recording. Afterwards — also when a scenario fails — the project is deleted (<c>delete_project</c>, which takes its
-/// epics, documents and items); a delete the board refuses falls back to archiving it (<c>update_project is_archived</c>). Then
-/// the board is read again (<see cref="LeftBehindAsync"/>) and anything of the recorder's that is neither deleted nor archived
-/// fails the run. Before it starts it removes what an earlier run that died left (<see cref="SweepAsync"/>: projects with both
-/// the throwaway name and key prefix, never anything else).
+/// from the recording. Afterwards — also when a scenario fails or the caller cancels — the project is deleted
+/// (<c>delete_project</c>, which takes its epics, documents and items), by the id the board gave THIS run for it: the only hard
+/// delete the recorder ever sends. A delete the board refuses falls back to archiving it (<c>update_project is_archived</c>).
+/// Then the board is read again (<see cref="LeftBehindAsync"/>) and anything of the recorder's that is neither deleted nor
+/// archived fails the run. The clean-up runs on a token of its own (<see cref="CleanupTimeout"/>), so a cancelled or timed-out
+/// run still cleans up, and a clean-up that itself fails is reported as a leftover naming the project.
+/// Before it starts it looks for what an earlier run that died left (<see cref="SweepAsync"/>) and never deletes it: a project
+/// that is exactly a recording's (<see cref="NotARecordingAsync"/>) is archived — reversible — and named in <see cref="Notes"/>
+/// for the owner to delete; one that only looks like it (both prefixes, but not exactly) is left untouched and fails the run.
+/// The contract gives a project no creator or owner, so "made by this token" cannot be part of that test.
 /// The two refusals the story names: a <c>conflict</c> is real — the recorder edits the item, as another caller, between the
 /// adapter's read and its conditional write, so the board refuses the stale <c>expected_version</c>; a <c>busy</c> cannot be
 /// provoked on demand (the board answers it only after a write waited 10 s for other writers), so that one interaction is
@@ -96,13 +101,29 @@ public sealed class KanbanFixtureRecorder(HttpMessageHandler transport, Uri endp
         new HttpClient(transport, disposeHandler: false) { BaseAddress = endpoint, Timeout = OutboundHttp.KanbanTimeout }, token);
     private readonly string _run = Guid.NewGuid().ToString("N");
     private readonly List<Guid> _items = [];
+    private string? _key;
     private Guid _project;
     private Guid _epic;
     private int _created;
 
+    /// <summary>How long the clean-up may take, on a token of its own: it does not end with the caller's.</summary>
+    public static readonly TimeSpan CleanupTimeout = 2 * OutboundHttp.KanbanTimeout;
+
     /// <summary>The project this run created (empty until it has), and every work item made in it.</summary>
     public Guid Project => _project;
     public IReadOnlyList<Guid> Items => _items;
+
+    /// <summary>The key of this run's project: the throwaway prefix and 8 hex digits of the run's id.</summary>
+    public string ProjectKey => _key ??= KanbanFixtureGuard.KeyPrefix + _run[..8].ToUpperInvariant();
+
+    /// <summary>
+    /// The identities this run met: one set for every scenario's recording handler, seeded from the recorder's own first claim
+    /// (before any scenario runs), so a refusal that names the token's identity is scrubbed in whichever scenario it comes.
+    /// </summary>
+    public KanbanIdentities Identities { get; } = new();
+
+    /// <summary>What the sweep found of earlier runs, for whoever runs the recorder to read (<see cref="SweepAsync"/>).</summary>
+    public IReadOnlyList<string> Notes { get; private set; } = [];
 
     /// <summary>
     /// Records every scenario and returns the fixtures by file name. The board is cleaned up and checked before it returns or
@@ -110,15 +131,15 @@ public sealed class KanbanFixtureRecorder(HttpMessageHandler transport, Uri endp
     /// </summary>
     public async Task<IReadOnlyDictionary<string, KanbanFixture>> RecordAsync(CancellationToken ct)
     {
-        await SweepAsync(ct);
-        var key = KanbanFixtureGuard.KeyPrefix + _run[..8].ToUpperInvariant();
+        Notes = await SweepAsync(ct);
+        var key = ProjectKey;
         var fixtures = new Dictionary<string, KanbanFixture>();
         Exception? failed = null;
         try
         {
             var project = await RawAsync("create_project", new JsonObject
             {
-                ["name"] = $"{KanbanFixtureGuard.Prefix} contract recording",
+                ["name"] = KanbanFixtureGuard.ProjectName,
                 ["key"] = key,
                 ["description"] = "Throwaway project of the dark-factory Kanban contract fixtures; deleted after recording.",
                 ["repository_url"] = Repository,
@@ -149,11 +170,26 @@ public sealed class KanbanFixtureRecorder(HttpMessageHandler transport, Uri endp
         {
             failed = ex;
         }
-        var left = await RemoveAsync(ct);
+        // On a token of its own: the caller's may be why the scenarios stopped (Ctrl-C, a test timeout), and the board is
+        // cleaned up all the same.
+        IReadOnlyList<string> left;
+        using (var own = new CancellationTokenSource(CleanupTimeout))
+        {
+            try
+            {
+                left = await RemoveAsync(own.Token);
+            }
+            catch (Exception ex)
+            {
+                var which = _project == Guid.Empty ? $"a project with the key {key}, if the board created it," : $"project {_project:D} ({key})";
+                left = [$"{which} may still be on the board, unarchived: the clean-up itself failed ({ex.GetType().Name}: {ex.Message})"];
+            }
+        }
         if (left.Count > 0)
         {
             var message = $"The Kanban fixture recorder left something on the board: {string.Join("; ", left)}. Remove it by hand "
-                + $"(projects named '{KanbanFixtureGuard.Prefix} …' with a key '{KanbanFixtureGuard.KeyPrefix}…').";
+                + $"(this run's project is '{KanbanFixtureGuard.ProjectName}' with the key {key}"
+                + (_project == Guid.Empty ? "" : $" and the id {_project:D}") + "; the next run archives it if it is still there).";
             throw failed is null ? new InvalidOperationException(message) : new AggregateException(message, failed);
         }
         if (failed is not null)
@@ -169,7 +205,10 @@ public sealed class KanbanFixtureRecorder(HttpMessageHandler transport, Uri endp
         var fixture = new KanbanFixture { RecordedFrom = recordedFrom };
         fixture.Set("project", _project);
         fixture.Parameters["projectKey"] = projectKey;
-        var recording = new KanbanRecordingHandler(fixture) { InnerHandler = transport, OwnProjects = [_project], OwnEpics = [_epic] };
+        var recording = new KanbanRecordingHandler(fixture)
+        {
+            InnerHandler = transport, OwnProjects = [_project], OwnEpics = [_epic], Identities = Identities,
+        };
         var session = new KanbanContractSession(recording, endpoint, token, projectKey, scenario.PageSize);
         switch (scenario.Fixture)
         {
@@ -255,6 +294,12 @@ public sealed class KanbanFixtureRecorder(HttpMessageHandler transport, Uri endp
             default:
                 throw new InvalidOperationException($"The recorder does not know how to set the board up for {scenario.Fixture}.");
         }
+        if (Identities.Names.Count == 0)
+        {
+            // The first scenario's set-up claims an item as the recorder; a reordering that loses that must not go unnoticed.
+            throw new InvalidOperationException("The recorder has not learnt its own identity's name (no claim_work_item of its own before "
+                + $"{scenario.Fixture}); a refusal naming it would be recorded as it is.");
+        }
         await scenario.Run(session, fixture);
         if (fixture.Parameters.ContainsKey("children"))
         {
@@ -270,6 +315,7 @@ public sealed class KanbanFixtureRecorder(HttpMessageHandler transport, Uri endp
     /// </summary>
     private async Task<IReadOnlyList<string>> RemoveAsync(CancellationToken ct)
     {
+        string? refused = null;
         if (_project != Guid.Empty)
         {
             try
@@ -284,25 +330,32 @@ public sealed class KanbanFixtureRecorder(HttpMessageHandler transport, Uri endp
                 }
                 catch (Exception archive) when (archive is not OperationCanceledException)
                 {
-                    return [$"project {_project:D} could be neither deleted ({ex.Message}) nor archived ({archive.Message})"];
+                    // Not a leftover yet: an answer may be lost after the write happened (the delete did delete, and the
+                    // archive then finds no project). The board, read again below, says whether the project is still there.
+                    refused = $"it could be neither deleted ({ex.Message}) nor archived ({archive.Message})";
                 }
             }
         }
-        return await LeftBehindAsync(ct);
+        return await LeftBehindAsync(ct, refused);
     }
 
     /// <summary>
     /// What of the recorder's is still on the board and is neither deleted nor archived: an unarchived project that is this
-    /// run's or carries both throwaway prefixes, and a work item of this run that can still be read outside an archived
-    /// throwaway project. Empty: nothing but archived or deleted throwaways is left.
+    /// run's (by the id the board gave it) or carries both throwaway prefixes, and a work item of this
+    /// run that can still be read anywhere but in this run's archived project. Empty: nothing but archived or deleted
+    /// throwaways is left. <paramref name="refused"/>: why this run's project could not be removed, said with it if it is
+    /// still listed.
     /// </summary>
-    public async Task<IReadOnlyList<string>> LeftBehindAsync(CancellationToken ct)
+    public async Task<IReadOnlyList<string>> LeftBehindAsync(CancellationToken ct, string? refused = null)
     {
         var left = new List<string>();
         var projects = (await RawAsync("list_projects", new JsonObject { ["includeArchived"] = true }, ct))!.AsArray().OfType<JsonObject>().ToList();
-        var archived = projects.Where(p => IsThrowaway(p) && p["isArchived"]?.GetValue<bool>() == true).Select(Id).ToHashSet();
-        left.AddRange(projects.Where(p => (IsThrowaway(p) || Id(p) == _project) && !archived.Contains(Id(p)))
-            .Select(p => $"project {Id(p):D} ({p["key"]}) is neither deleted nor archived"));
+        // A project the board made for this run without this run learning its id (the answer was lost) is not Mine, but it
+        // carries this run's name and key, so it looks like a throwaway and is reported below all the same.
+        bool Mine(JsonObject p) => _project != Guid.Empty && Id(p) == _project;
+        var archived = projects.Where(p => Mine(p) && Archived(p)).Select(Id).ToHashSet();
+        left.AddRange(projects.Where(p => (Mine(p) || LooksThrowaway(p)) && !Archived(p))
+            .Select(p => $"project {Id(p):D} ({Text(p, "key")}) is neither deleted nor archived" + (Mine(p) && refused is not null ? $": {refused}" : "")));
         foreach (var item in _items)
         {
             var read = await _raw.CallToolAsync("get_work_item", new JsonObject { ["itemId"] = item.ToString("D") }, ct);
@@ -322,21 +375,98 @@ public sealed class KanbanFixtureRecorder(HttpMessageHandler transport, Uri endp
     }
 
     /// <summary>
-    /// Deletes every project an earlier run left: those — archived ones included — whose name starts with the throwaway prefix
-    /// AND whose key starts with the throwaway key prefix. No other project is touched.
+    /// What an earlier run that died left, which this run did not create and so never deletes. Every project that looks like a
+    /// throwaway (<see cref="LooksThrowaway"/>: both prefixes) is examined (<see cref="NotARecordingAsync"/>). One that is
+    /// exactly a recording's is archived if it is not yet (<c>update_project is_archived</c>: reversible, and the only write the
+    /// sweep makes) and named — key and id — in the notes returned, for the owner to delete by hand. One that is not is left
+    /// untouched, and the run fails naming it before anything is written: nothing is archived or created then. No project
+    /// without both prefixes is read into or written.
     /// </summary>
-    public async Task SweepAsync(CancellationToken ct)
+    public async Task<IReadOnlyList<string>> SweepAsync(CancellationToken ct)
     {
         var projects = (await RawAsync("list_projects", new JsonObject { ["includeArchived"] = true }, ct))!.AsArray().OfType<JsonObject>();
-        foreach (var stale in projects.Where(IsThrowaway).ToList())
+        var (leftovers, strangers) = (new List<JsonObject>(), new List<string>());
+        foreach (var candidate in projects.Where(LooksThrowaway).ToList())
         {
-            await RawAsync("delete_project", new JsonObject { ["projectId"] = Id(stale).ToString("D") }, ct);
+            if (await NotARecordingAsync(candidate, ct) is { } why)
+            {
+                strangers.Add($"project {Id(candidate):D} ({Text(candidate, "key")}): {why}");
+            }
+            else
+            {
+                leftovers.Add(candidate);
+            }
         }
+        if (strangers.Count > 0)
+        {
+            throw new InvalidOperationException("The Kanban fixture recorder did not start, and wrote nothing: the board holds what looks like a "
+                + $"throwaway of its own (a name starting '{KanbanFixtureGuard.Prefix}' and a key starting '{KanbanFixtureGuard.KeyPrefix}') but is "
+                + $"not exactly a recording's leftover, so it was left untouched — {string.Join("; ", strangers)}. Rename it, or remove it by hand.");
+        }
+        var notes = new List<string>();
+        foreach (var leftover in leftovers)
+        {
+            var was = Archived(leftover);
+            if (!was)
+            {
+                await RawAsync("update_project", new JsonObject { ["id"] = Id(leftover).ToString("D"), ["is_archived"] = true }, ct);
+            }
+            notes.Add($"An earlier recording's leftover project {Text(leftover, "key")} (id {Id(leftover):D}) "
+                + (was ? "is still on the board, archived" : "was archived (not deleted)") + ": delete it by hand when you are sure it is not needed.");
+        }
+        return notes;
     }
 
-    private static bool IsThrowaway(JsonObject project) =>
-        project["name"]?.GetValue<string>().StartsWith(KanbanFixtureGuard.Prefix, StringComparison.Ordinal) == true
-        && project["key"]?.GetValue<string>().StartsWith(KanbanFixtureGuard.KeyPrefix, StringComparison.Ordinal) == true;
+    /// <summary>
+    /// Why <paramref name="project"/> is not exactly what a recording run leaves — null when it is: its name is
+    /// <see cref="KanbanFixtureGuard.ProjectName"/>, its key the throwaway prefix and 8 upper-case hex digits, and everything in
+    /// it — every work item (closed ones and those of archived epics included), every epic and every epic document — is titled
+    /// with the throwaway prefix. (A project carries no creator in the contract, so who made it cannot be asked.) Nothing of
+    /// what it holds is repeated in the answer, only counted: the answer goes into an exception's message.
+    /// </summary>
+    public async Task<string?> NotARecordingAsync(JsonObject project, CancellationToken ct)
+    {
+        if (Text(project, "name") != KanbanFixtureGuard.ProjectName)
+        {
+            return $"its name is not exactly '{KanbanFixtureGuard.ProjectName}'";
+        }
+        if (Text(project, "key") is not { } key || !KanbanFixtureGuard.IsRecorderKey(key))
+        {
+            return $"its key is not '{KanbanFixtureGuard.KeyPrefix}' and 8 upper-case hex digits";
+        }
+        static int Foreign(JsonNode? list, string field) =>
+            list!.AsArray().Count(e => Text(e, field)?.StartsWith(KanbanFixtureGuard.Prefix, StringComparison.Ordinal) != true);
+        var id = Id(project).ToString("D");
+        var items = Foreign(await RawAsync("list_work_items", new JsonObject { ["projectId"] = id, ["includeArchivedEpics"] = true }, ct), "title")
+            + Foreign(await RawAsync("list_work_items", new JsonObject { ["projectId"] = id, ["includeArchivedEpics"] = true, ["status"] = KanbanStatus.Closed }, ct), "title");
+        if (items > 0)
+        {
+            return $"it holds {items} work item(s) not titled '{KanbanFixtureGuard.Prefix} …'";
+        }
+        var epics = (await RawAsync("list_epics", new JsonObject { ["projectId"] = id, ["includeArchived"] = true }, ct))!.AsArray();
+        if (Foreign(epics, "name") is > 0 and var named)
+        {
+            return $"it holds {named} epic(s) not named '{KanbanFixtureGuard.Prefix} …'";
+        }
+        foreach (var epic in epics)
+        {
+            if (Foreign(await RawAsync("list_epic_documents", new JsonObject { ["epicId"] = Id(epic).ToString("D") }, ct), "title") is > 0 and var documents)
+            {
+                return $"it holds {documents} epic document(s) not titled '{KanbanFixtureGuard.Prefix} …'";
+            }
+        }
+        return null;
+    }
+
+    /// <summary>Whether <paramref name="project"/> carries both throwaway prefixes: worth a look, and never enough to write to it.</summary>
+    private static bool LooksThrowaway(JsonObject project) =>
+        Text(project, "name")?.StartsWith(KanbanFixtureGuard.Prefix, StringComparison.Ordinal) == true
+        && Text(project, "key")?.StartsWith(KanbanFixtureGuard.KeyPrefix, StringComparison.Ordinal) == true;
+
+    private static bool Archived(JsonObject project) => project["isArchived"] is JsonValue v && v.TryGetValue<bool>(out var archived) && archived;
+
+    private static string? Text(JsonNode? shape, string field) =>
+        shape is JsonObject o && o[field] is JsonValue v && v.TryGetValue<string>(out var text) ? text : null;
 
     private static Guid Id(JsonNode? shape) => Guid.Parse(shape!["id"]!.GetValue<string>());
 
@@ -373,8 +503,19 @@ public sealed class KanbanFixtureRecorder(HttpMessageHandler transport, Uri endp
         return id;
     }
 
-    private Task ClaimAsOtherAsync(Guid item, CancellationToken ct) =>
-        RawAsync("claim_work_item", new JsonObject { ["id"] = item.ToString("D"), ["marker"] = OtherMarker, ["ttl_seconds"] = 3600 }, ct);
+    /// <summary>
+    /// Claims <paramref name="item"/> under the other marker. The answer names the token's own identity (one token is one
+    /// identity): its name and id are learnt here, from the recorder's first claim on, so every handler scrubs them.
+    /// </summary>
+    private async Task ClaimAsOtherAsync(Guid item, CancellationToken ct)
+    {
+        var claimed = await RawAsync("claim_work_item", new JsonObject { ["id"] = item.ToString("D"), ["marker"] = OtherMarker, ["ttl_seconds"] = 3600 }, ct);
+        Identities.Learn(Text(claimed, "claimant"));
+        if (Text(claimed, "claimant_id") is { } id)
+        {
+            Identities.Placeholder(id);
+        }
+    }
 
     private Task ReleaseAsync(Guid item, string marker, CancellationToken ct) =>
         RawAsync("release_work_item_claim", new JsonObject { ["id"] = item.ToString("D"), ["marker"] = marker }, ct);

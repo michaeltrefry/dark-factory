@@ -1,20 +1,20 @@
 {
   "recorded_from": "in-repo fake (provisional; re-record against the hosted instance)",
   "parameters": {
-    "project": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-    "projectKey": "DFFIX2A1B0807",
-    "item": "4d5e0f98-53ad-49c8-8cdd-73fc2e2f00cf"
+    "project": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+    "projectKey": "DFFIX843A9540",
+    "item": "7ac6c0a7-4529-497e-8c3c-ff7ce184ac29"
   },
   "interactions": [
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "4d5e0f98-53ad-49c8-8cdd-73fc2e2f00cf"
+        "itemId": "7ac6c0a7-4529-497e-8c3c-ff7ce184ac29"
       },
       "isError": false,
       "answer": {
-        "id": "4d5e0f98-53ad-49c8-8cdd-73fc2e2f00cf",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "7ac6c0a7-4529-497e-8c3c-ff7ce184ac29",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] moved after a busy answer",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -39,7 +39,7 @@
     {
       "tool": "update_work_item",
       "arguments": {
-        "itemId": "4d5e0f98-53ad-49c8-8cdd-73fc2e2f00cf",
+        "itemId": "7ac6c0a7-4529-497e-8c3c-ff7ce184ac29",
         "status": "Ready",
         "expected_version": 1
       },
@@ -53,14 +53,14 @@
     {
       "tool": "update_work_item",
       "arguments": {
-        "itemId": "4d5e0f98-53ad-49c8-8cdd-73fc2e2f00cf",
+        "itemId": "7ac6c0a7-4529-497e-8c3c-ff7ce184ac29",
         "status": "Ready",
         "expected_version": 1
       },
       "isError": false,
       "answer": {
-        "id": "4d5e0f98-53ad-49c8-8cdd-73fc2e2f00cf",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "7ac6c0a7-4529-497e-8c3c-ff7ce184ac29",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] moved after a busy answer",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",

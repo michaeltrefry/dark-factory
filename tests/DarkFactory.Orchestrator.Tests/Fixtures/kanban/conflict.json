@@ -1,20 +1,20 @@
 {
   "recorded_from": "in-repo fake (provisional; re-record against the hosted instance)",
   "parameters": {
-    "project": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-    "projectKey": "DFFIX2A1B0807",
-    "item": "46ef07ba-622d-4d90-8e55-259db49a48a6"
+    "project": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+    "projectKey": "DFFIX843A9540",
+    "item": "c842bab7-d57d-46c1-a179-5abcdc169b04"
   },
   "interactions": [
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "46ef07ba-622d-4d90-8e55-259db49a48a6"
+        "itemId": "c842bab7-d57d-46c1-a179-5abcdc169b04"
       },
       "isError": false,
       "answer": {
-        "id": "46ef07ba-622d-4d90-8e55-259db49a48a6",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "c842bab7-d57d-46c1-a179-5abcdc169b04",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] edited under the factory",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -39,25 +39,25 @@
     {
       "tool": "update_work_item",
       "arguments": {
-        "itemId": "46ef07ba-622d-4d90-8e55-259db49a48a6",
+        "itemId": "c842bab7-d57d-46c1-a179-5abcdc169b04",
         "status": "Ready",
         "expected_version": 1
       },
       "isError": true,
       "answer": {
         "code": "conflict",
-        "message": "Work item 46ef07ba-622d-4d90-8e55-259db49a48a6 is at version 2."
+        "message": "Work item c842bab7-d57d-46c1-a179-5abcdc169b04 is at version 2."
       }
     },
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "46ef07ba-622d-4d90-8e55-259db49a48a6"
+        "itemId": "c842bab7-d57d-46c1-a179-5abcdc169b04"
       },
       "isError": false,
       "answer": {
-        "id": "46ef07ba-622d-4d90-8e55-259db49a48a6",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "c842bab7-d57d-46c1-a179-5abcdc169b04",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] edited by someone else",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",
@@ -82,14 +82,14 @@
     {
       "tool": "update_work_item",
       "arguments": {
-        "itemId": "46ef07ba-622d-4d90-8e55-259db49a48a6",
+        "itemId": "c842bab7-d57d-46c1-a179-5abcdc169b04",
         "status": "Ready",
         "expected_version": 2
       },
       "isError": false,
       "answer": {
-        "id": "46ef07ba-622d-4d90-8e55-259db49a48a6",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "id": "c842bab7-d57d-46c1-a179-5abcdc169b04",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] edited by someone else",
         "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
         "type": "Task",

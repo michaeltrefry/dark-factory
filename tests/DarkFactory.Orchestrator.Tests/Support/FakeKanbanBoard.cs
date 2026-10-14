@@ -39,6 +39,7 @@ public sealed class FakeKanbanBoard
         ["update_project"] = (["id"], ["name", "key", "description", "repository_url", "default_branch", "is_archived", "clear"]),
         ["delete_project"] = (["projectId"], []),
         ["create_epic"] = (["projectId", "name"], ["description", "isArchived", "idempotency_key"]),
+        ["list_epics"] = (["projectId"], ["includeArchived"]),
         ["create_epic_document"] = (["epicId", "title", "body"], ["idempotency_key"]),
         ["get_work_item"] = (["itemId"], []),
         ["list_work_items"] = ([], ["projectId", "epicId", "type", "status", "includeArchivedEpics", "unblocked_only", "label", "updated_since",
@@ -59,9 +60,10 @@ public sealed class FakeKanbanBoard
 
     private static readonly Dictionary<string, (Guid Id, string Name)> Identities = new()
     {
-        [FullToken] = (Guid.Parse("f0000000-0000-0000-0000-000000000001"), "factory"),
-        [ReadToken] = (Guid.Parse("f0000000-0000-0000-0000-000000000002"), "factory-read"),
-        [OtherToken] = (Guid.Parse("f0000000-0000-0000-0000-000000000003"), "someone"),
+        // Ids as a real board gives them: not the placeholder shape a recording writes instead (KanbanIdentities).
+        [FullToken] = (Guid.Parse("6b1f0c2e-5a44-4d1b-9c7e-0d2a8f3b1e01"), "factory"),
+        [ReadToken] = (Guid.Parse("6b1f0c2e-5a44-4d1b-9c7e-0d2a8f3b1e02"), "factory-read"),
+        [OtherToken] = (Guid.Parse("6b1f0c2e-5a44-4d1b-9c7e-0d2a8f3b1e03"), "someone"),
     };
 
     public sealed class Project
@@ -343,6 +345,10 @@ public sealed class FakeKanbanBoard
             }
             case "list_work_items":
                 return ListItems(arguments);
+            case "list_epics":
+                return Projects.Any(p => p.Id == Id(arguments, "projectId"))
+                    ? Ok(new JsonArray(Epics.Where(e => e.ProjectId == Id(arguments, "projectId")).Select(e => (JsonNode)EpicShape(e)).ToArray()))
+                    : Refusal("not_found", $"Project {arguments["projectId"]} was not found.");
             case "get_epic":
                 return Epics.FirstOrDefault(e => e.Id == Id(arguments, "epicId")) is { } epic
                     ? Ok(EpicShape(epic))

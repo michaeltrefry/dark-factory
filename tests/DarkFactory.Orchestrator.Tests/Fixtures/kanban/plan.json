@@ -1,27 +1,27 @@
 {
   "recorded_from": "in-repo fake (provisional; re-record against the hosted instance)",
   "parameters": {
-    "project": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-    "projectKey": "DFFIX2A1B0807",
-    "parent": "24a42f9a-ed49-4e1b-b61f-05c5387db5ac",
+    "project": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+    "projectKey": "DFFIX843A9540",
+    "parent": "75079503-5efd-4e18-b37a-b610448a4d33",
     "children": [
-      "c0b0b703-1fa9-4943-9892-2c5d7e39ec93",
-      "91e67a32-1f41-4680-9fc3-6a05859caf60"
+      "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
+      "7d05699e-e47c-47b2-84b8-e5b9e984cc8d"
     ]
   },
   "interactions": [
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "24a42f9a-ed49-4e1b-b61f-05c5387db5ac"
+        "itemId": "75079503-5efd-4e18-b37a-b610448a4d33"
       },
       "isError": false,
       "answer": {
-        "id": "24a42f9a-ed49-4e1b-b61f-05c5387db5ac",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+        "id": "75079503-5efd-4e18-b37a-b610448a4d33",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
         "epic": {
-          "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] plan item",
@@ -51,20 +51,20 @@
     {
       "tool": "create_work_item",
       "arguments": {
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] child 1",
         "type": "Task",
-        "idempotency_key": "dark-factory:child:24a42f9a-ed49-4e1b-b61f-05c5387db5ac:6784c89c3d21cb6b3bde0818521abd95d3aa3f4e6b351da4c41cf4b1f08165bf",
+        "idempotency_key": "dark-factory:child:75079503-5efd-4e18-b37a-b610448a4d33:6784c89c3d21cb6b3bde0818521abd95d3aa3f4e6b351da4c41cf4b1f08165bf",
         "description": "First step of the plan.",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a"
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417"
       },
       "isError": false,
       "answer": {
-        "id": "c0b0b703-1fa9-4943-9892-2c5d7e39ec93",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+        "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
         "epic": {
-          "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 1",
@@ -92,20 +92,20 @@
     {
       "tool": "create_work_item",
       "arguments": {
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] child 2",
         "type": "Story",
-        "idempotency_key": "dark-factory:child:24a42f9a-ed49-4e1b-b61f-05c5387db5ac:3f2fde15267bbc5ccaa95089d455391f0f555f1f59184ee1c799c77f7a40b832",
+        "idempotency_key": "dark-factory:child:75079503-5efd-4e18-b37a-b610448a4d33:3f2fde15267bbc5ccaa95089d455391f0f555f1f59184ee1c799c77f7a40b832",
         "description": "Second step; needs the first.",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a"
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417"
       },
       "isError": false,
       "answer": {
-        "id": "91e67a32-1f41-4680-9fc3-6a05859caf60",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
         "epic": {
-          "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -133,16 +133,16 @@
     {
       "tool": "add_work_item_dependency",
       "arguments": {
-        "id": "91e67a32-1f41-4680-9fc3-6a05859caf60",
-        "blocked_by_id": "c0b0b703-1fa9-4943-9892-2c5d7e39ec93"
+        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+        "blocked_by_id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac"
       },
       "isError": false,
       "answer": {
-        "id": "91e67a32-1f41-4680-9fc3-6a05859caf60",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
         "epic": {
-          "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -161,7 +161,7 @@
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "c0b0b703-1fa9-4943-9892-2c5d7e39ec93",
+            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -175,15 +175,15 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "24a42f9a-ed49-4e1b-b61f-05c5387db5ac"
+        "itemId": "75079503-5efd-4e18-b37a-b610448a4d33"
       },
       "isError": false,
       "answer": {
-        "id": "24a42f9a-ed49-4e1b-b61f-05c5387db5ac",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+        "id": "75079503-5efd-4e18-b37a-b610448a4d33",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
         "epic": {
-          "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] plan item",
@@ -213,20 +213,20 @@
     {
       "tool": "create_work_item",
       "arguments": {
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] child 1",
         "type": "Task",
-        "idempotency_key": "dark-factory:child:24a42f9a-ed49-4e1b-b61f-05c5387db5ac:6784c89c3d21cb6b3bde0818521abd95d3aa3f4e6b351da4c41cf4b1f08165bf",
+        "idempotency_key": "dark-factory:child:75079503-5efd-4e18-b37a-b610448a4d33:6784c89c3d21cb6b3bde0818521abd95d3aa3f4e6b351da4c41cf4b1f08165bf",
         "description": "First step of the plan.",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a"
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417"
       },
       "isError": false,
       "answer": {
-        "id": "c0b0b703-1fa9-4943-9892-2c5d7e39ec93",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+        "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
         "epic": {
-          "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 1",
@@ -246,7 +246,7 @@
         "blockers": [],
         "dependents": [
           {
-            "id": "91e67a32-1f41-4680-9fc3-6a05859caf60",
+            "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
             "title": "[dark-factory fixture] child 2",
             "status": "Backlog"
           }
@@ -260,20 +260,20 @@
     {
       "tool": "create_work_item",
       "arguments": {
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "title": "[dark-factory fixture] child 2",
         "type": "Story",
-        "idempotency_key": "dark-factory:child:24a42f9a-ed49-4e1b-b61f-05c5387db5ac:3f2fde15267bbc5ccaa95089d455391f0f555f1f59184ee1c799c77f7a40b832",
+        "idempotency_key": "dark-factory:child:75079503-5efd-4e18-b37a-b610448a4d33:3f2fde15267bbc5ccaa95089d455391f0f555f1f59184ee1c799c77f7a40b832",
         "description": "Second step; needs the first.",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a"
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417"
       },
       "isError": false,
       "answer": {
-        "id": "91e67a32-1f41-4680-9fc3-6a05859caf60",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
         "epic": {
-          "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -292,7 +292,7 @@
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "c0b0b703-1fa9-4943-9892-2c5d7e39ec93",
+            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -307,15 +307,15 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "91e67a32-1f41-4680-9fc3-6a05859caf60"
+        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d"
       },
       "isError": false,
       "answer": {
-        "id": "91e67a32-1f41-4680-9fc3-6a05859caf60",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
         "epic": {
-          "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -334,7 +334,7 @@
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "c0b0b703-1fa9-4943-9892-2c5d7e39ec93",
+            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -348,15 +348,15 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "91e67a32-1f41-4680-9fc3-6a05859caf60"
+        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d"
       },
       "isError": false,
       "answer": {
-        "id": "91e67a32-1f41-4680-9fc3-6a05859caf60",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
         "epic": {
-          "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -375,7 +375,7 @@
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "c0b0b703-1fa9-4943-9892-2c5d7e39ec93",
+            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -389,17 +389,17 @@
     {
       "tool": "update_work_item",
       "arguments": {
-        "itemId": "91e67a32-1f41-4680-9fc3-6a05859caf60",
+        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
         "status": "Ready",
         "expected_version": 1
       },
       "isError": false,
       "answer": {
-        "id": "91e67a32-1f41-4680-9fc3-6a05859caf60",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
         "epic": {
-          "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -418,7 +418,7 @@
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "c0b0b703-1fa9-4943-9892-2c5d7e39ec93",
+            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -432,15 +432,15 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "91e67a32-1f41-4680-9fc3-6a05859caf60"
+        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d"
       },
       "isError": false,
       "answer": {
-        "id": "91e67a32-1f41-4680-9fc3-6a05859caf60",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
         "epic": {
-          "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -459,7 +459,7 @@
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "c0b0b703-1fa9-4943-9892-2c5d7e39ec93",
+            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -473,15 +473,15 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "91e67a32-1f41-4680-9fc3-6a05859caf60"
+        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d"
       },
       "isError": false,
       "answer": {
-        "id": "91e67a32-1f41-4680-9fc3-6a05859caf60",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
         "epic": {
-          "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -500,7 +500,7 @@
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "c0b0b703-1fa9-4943-9892-2c5d7e39ec93",
+            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -514,15 +514,15 @@
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "91e67a32-1f41-4680-9fc3-6a05859caf60"
+        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d"
       },
       "isError": false,
       "answer": {
-        "id": "91e67a32-1f41-4680-9fc3-6a05859caf60",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
         "epic": {
-          "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -541,7 +541,7 @@
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "c0b0b703-1fa9-4943-9892-2c5d7e39ec93",
+            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -555,17 +555,17 @@
     {
       "tool": "update_work_item",
       "arguments": {
-        "itemId": "91e67a32-1f41-4680-9fc3-6a05859caf60",
+        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
         "status": "Backlog",
         "expected_version": 2
       },
       "isError": false,
       "answer": {
-        "id": "91e67a32-1f41-4680-9fc3-6a05859caf60",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
         "epic": {
-          "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -584,7 +584,7 @@
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "c0b0b703-1fa9-4943-9892-2c5d7e39ec93",
+            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -598,17 +598,17 @@
     {
       "tool": "add_work_item_comment",
       "arguments": {
-        "itemId": "91e67a32-1f41-4680-9fc3-6a05859caf60",
+        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
         "body": "[author: dark-factory] returned by the contract test",
-        "idempotency_key": "dark-factory:comment:fb562af7043a7d9c46d9402c0aea57b0b3393078fd0d867d63f7d3ea6083c3fe"
+        "idempotency_key": "dark-factory:comment:b27825282df36192217c3b5b782c038b0b3a3e5054a84dc35666e42ca6f669ce"
       },
       "isError": false,
       "answer": {
-        "id": "91e67a32-1f41-4680-9fc3-6a05859caf60",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
         "epic": {
-          "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -620,8 +620,8 @@
         "estimate": null,
         "comments": [
           {
-            "id": "d54c7609-76e3-4d6d-868d-ef903721b84d",
-            "workItemId": "91e67a32-1f41-4680-9fc3-6a05859caf60",
+            "id": "5bee6bfa-f8c0-4cc7-8f50-009b04d82798",
+            "workItemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
             "author": "fixture-recorder",
             "body": "[author: dark-factory] returned by the contract test",
             "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
@@ -636,7 +636,7 @@
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "c0b0b703-1fa9-4943-9892-2c5d7e39ec93",
+            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }
@@ -645,22 +645,22 @@
         "links": [],
         "version": 3,
         "label_list": [],
-        "comment_id": "d54c7609-76e3-4d6d-868d-ef903721b84d",
+        "comment_id": "5bee6bfa-f8c0-4cc7-8f50-009b04d82798",
         "comment_created": true
       }
     },
     {
       "tool": "get_work_item",
       "arguments": {
-        "itemId": "91e67a32-1f41-4680-9fc3-6a05859caf60"
+        "itemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d"
       },
       "isError": false,
       "answer": {
-        "id": "91e67a32-1f41-4680-9fc3-6a05859caf60",
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-        "epicId": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+        "id": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
         "epic": {
-          "id": "2bf00a13-85a5-49d5-93e3-78b77316dd5a",
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
           "name": "[dark-factory fixture] epic"
         },
         "title": "[dark-factory fixture] child 2",
@@ -672,8 +672,8 @@
         "estimate": null,
         "comments": [
           {
-            "id": "d54c7609-76e3-4d6d-868d-ef903721b84d",
-            "workItemId": "91e67a32-1f41-4680-9fc3-6a05859caf60",
+            "id": "5bee6bfa-f8c0-4cc7-8f50-009b04d82798",
+            "workItemId": "7d05699e-e47c-47b2-84b8-e5b9e984cc8d",
             "author": "fixture-recorder",
             "body": "[author: dark-factory] returned by the contract test",
             "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
@@ -688,7 +688,7 @@
         "claim_expires_at_utc": null,
         "blockers": [
           {
-            "id": "c0b0b703-1fa9-4943-9892-2c5d7e39ec93",
+            "id": "9a224c3a-0fca-42d5-8038-b7d7c8733cac",
             "title": "[dark-factory fixture] child 1",
             "status": "Backlog"
           }

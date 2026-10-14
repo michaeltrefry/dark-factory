@@ -102,11 +102,59 @@ public sealed class KanbanFixture
 
     public string ToJson() => JsonSerializer.Serialize(this, Json) + "\n";
 
-    public void Save(string directory, string name)
+    /// <summary>
+    /// Replaces the fixture set in <paramref name="directory"/> by <paramref name="files"/> (file name → text), all of them or
+    /// none: every file is written to a staging folder beside it and read back, and only then is the folder swapped in (the old
+    /// one moved aside, put back if the swap fails, deleted once it succeeded). A failure before the swap leaves the old set as it
+    /// was. The folder then holds exactly <paramref name="files"/>.
+    /// </summary>
+    public static void SaveAll(string directory, IReadOnlyDictionary<string, string> files)
     {
-        Directory.CreateDirectory(directory);
-        File.WriteAllText(Path.Combine(directory, name), ToJson());
+        directory = Path.GetFullPath(directory);
+        var parent = Path.GetDirectoryName(directory)!;
+        var tag = $".{Path.GetFileName(directory)}-{Guid.NewGuid():N}";
+        var (staging, replaced) = (Path.Combine(parent, tag + "-staging"), Path.Combine(parent, tag + "-replaced"));
+        Directory.CreateDirectory(staging);
+        try
+        {
+            foreach (var (name, text) in files)
+            {
+                File.WriteAllText(Path.Combine(staging, name), text);
+            }
+            if (files.FirstOrDefault(f => File.ReadAllText(Path.Combine(staging, f.Key)) != f.Value).Key is { } unreadable)
+            {
+                throw new IOException($"{unreadable} did not read back as written; no fixture was replaced.");
+            }
+            var had = Directory.Exists(directory);
+            if (had)
+            {
+                Directory.Move(directory, replaced);
+            }
+            try
+            {
+                Directory.Move(staging, directory);
+            }
+            catch when (had)
+            {
+                Directory.Move(replaced, directory);
+                throw;
+            }
+            if (had)
+            {
+                Directory.Delete(replaced, recursive: true);
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(staging))
+            {
+                Directory.Delete(staging, recursive: true);
+            }
+        }
     }
+
+    /// <summary><paramref name="text"/> as it is written inside a fixture file's JSON string (what to search a file for).</summary>
+    public static string Escaped(string text) => JsonSerializer.Serialize(text, Json)[1..^1];
 
     public Guid Id(string parameter) => Guid.Parse(Parameters[parameter]!.GetValue<string>());
 
@@ -204,6 +252,50 @@ public static class KanbanMcp
             response.Headers.Add(McpHttpClient.SessionHeader, session);
         }
         return response;
+    }
+}
+
+/// <summary>
+/// The identities a recording run met (sc-25986), shared by every recording handler of the run so that a name learnt in one
+/// scenario is scrubbed in all of them: the names (a <c>claimant</c>, an <c>author</c>, an <c>actor</c>'s <c>name</c>), each
+/// recorded as <see cref="KanbanRecordingHandler.Recorder"/>, and the ids (<c>claimant_id</c>, <c>author_id</c>, an
+/// <c>actor</c>'s <c>id</c>), each recorded as a fixed placeholder — <c>f0000000-0000-0000-0000-00000000000N</c>, N counting
+/// from 1 in the order the ids were first seen, so equal ids stay equal (all the adapter does with them is compare).
+/// </summary>
+public sealed class KanbanIdentities
+{
+    private readonly HashSet<string> _names = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _ids = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The real names learnt so far (never written to a fixture).</summary>
+    public IReadOnlyCollection<string> Names => _names;
+
+    /// <summary>The real ids learnt so far (never written to a fixture).</summary>
+    public IReadOnlyCollection<string> Ids => _ids.Keys;
+
+    public void Learn(string? name)
+    {
+        if (!string.IsNullOrWhiteSpace(name) && name != KanbanRecordingHandler.Recorder)
+        {
+            _names.Add(name);
+        }
+    }
+
+    /// <summary>The placeholder <paramref name="id"/> is recorded as: the same for the same id, whatever its case.</summary>
+    public string Placeholder(string id)
+    {
+        if (!_ids.TryGetValue(id, out var placeholder))
+        {
+            _ids[id] = placeholder = $"f0000000-0000-0000-0000-{_ids.Count + 1:x12}";
+        }
+        return placeholder;
+    }
+
+    /// <summary><paramref name="text"/> (a refusal's message) with every name and id learnt replaced: the longest name first.</summary>
+    public string Clean(string text)
+    {
+        text = _names.OrderByDescending(n => n.Length).Aggregate(text, (t, name) => t.Replace(name, KanbanRecordingHandler.Recorder, StringComparison.Ordinal));
+        return _ids.Aggregate(text, (t, id) => t.Replace(id.Key, id.Value, StringComparison.OrdinalIgnoreCase));
     }
 }
 
@@ -322,8 +414,9 @@ public sealed class KanbanReplayHandler(KanbanFixture fixture) : HttpMessageHand
 /// the adapter that same normalised answer, so the recording and its replay see the same board. No request header is ever read
 /// into the fixture: the token is not recorded. The repository is public, so only the recording's own throwaways are kept
 /// (<see cref="OwnProjects"/>, <see cref="OwnEpics"/>): a listing is cut to them (<see cref="Trim"/>), an answer about anything
-/// else is refused (thrown, not recorded), an identity's name is replaced by <see cref="Recorder"/> and an e-mail address
-/// by a placeholder. An answer that is no <c>tools/call</c> result (an HTTP error, a JSON-RPC error) is passed on unrecorded.
+/// else is refused (thrown, not recorded), an identity's name is replaced by <see cref="Recorder"/>, its id by a fixed
+/// placeholder (<see cref="Identities"/>, shared by the run's handlers) and an e-mail address by a placeholder. An answer that
+/// is no <c>tools/call</c> result (an HTTP error, a JSON-RPC error) is passed on unrecorded.
 /// </summary>
 public sealed partial class KanbanRecordingHandler(KanbanFixture fixture) : DelegatingHandler
 {
@@ -339,7 +432,11 @@ public sealed partial class KanbanRecordingHandler(KanbanFixture fixture) : Dele
         + "recording handler, which did not forward this call — the board answers busy only after a write waited 10 s for other "
         + "writers, which no single caller can provoke on demand. The adapter's resend, next, is the board's own answer.";
 
-    private readonly HashSet<string> _names = [];
+    /// <summary>What an e-mail address is recorded as.</summary>
+    public const string RedactedEmail = "redacted@example.com";
+
+    /// <summary>The identities of the run: one set for all its handlers, so a name one scenario learnt is scrubbed in every other.</summary>
+    public KanbanIdentities Identities { get; init; } = new();
 
     /// <summary>The recording's own throwaway projects: all a recorded <c>list_projects</c> or work item listing keeps.</summary>
     public HashSet<Guid> OwnProjects { get; init; } = [];
@@ -395,26 +492,96 @@ public sealed partial class KanbanRecordingHandler(KanbanFixture fixture) : Dele
         return KanbanMcp.Respond(message["id"], interaction.ToResult(), sse: false, session);
     }
 
-    /// <summary>Keeps only what the factory may publish: the recording's own throwaways, no identity's name, no e-mail address.</summary>
+    /// <summary>
+    /// Keeps only what the factory may publish: the recording's own throwaways, no identity's name or id, no e-mail address.
+    /// It works on the answer's nodes, never on its JSON text (where <c>+</c>, <c>&lt;</c> and non-ASCII are escapes a regex
+    /// would cut through).
+    /// </summary>
     private KanbanInteraction Scrub(KanbanInteraction call)
     {
-        var answer = call.Answer is null ? null : JsonNode.Parse(Email().Replace(call.Answer.ToJsonString(), "redacted@example.com"));
+        var answer = call.Answer?.DeepClone();
         if (!call.IsError)
         {
             answer = Trim(call.Tool, answer, OwnProjects, OwnEpics);
         }
         Anonymise(answer);
-        if (call.IsError && answer is JsonObject error && error["message"] is JsonValue m && m.TryGetValue<string>(out var said))
+        if (call.IsError)
         {
-            // A refusal's message may name whoever holds the item.
-            error["message"] = _names.Aggregate(said, (text, name) => text.Replace(name, Recorder, StringComparison.Ordinal));
+            // A refusal's message (or a plain error's text) may name whoever holds the item.
+            if (answer is JsonObject error && error["message"] is JsonValue m && m.TryGetValue<string>(out var said))
+            {
+                error["message"] = Identities.Clean(said);
+            }
+            else if (answer is JsonValue v && v.TryGetValue<string>(out var plain))
+            {
+                answer = JsonValue.Create(Identities.Clean(plain));
+            }
         }
-        return call with { Answer = answer };
+        return call with { Answer = WithoutEmails(answer) };
     }
 
-    /// <summary>Replaces every identity's name (a work item's <c>claimant</c>, a comment's <c>author</c>) by <see cref="Recorder"/>.</summary>
+    /// <summary><paramref name="node"/> with every e-mail address in a string value replaced by <see cref="RedactedEmail"/>.</summary>
+    private static JsonNode? WithoutEmails(JsonNode? node)
+    {
+        static JsonNode? Clean(JsonNode? value) =>
+            value is JsonValue v && v.TryGetValue<string>(out var text) && Email().IsMatch(text) ? JsonValue.Create(Email().Replace(text, RedactedEmail)) : null;
+        switch (node)
+        {
+            case JsonValue:
+                return Clean(node) ?? node;
+            case JsonArray array:
+                for (var i = 0; i < array.Count; i++)
+                {
+                    if (Clean(array[i]) is { } cleaned)
+                    {
+                        array[i] = cleaned;
+                    }
+                    else
+                    {
+                        WithoutEmails(array[i]);
+                    }
+                }
+                break;
+            case JsonObject o:
+                foreach (var (field, value) in o.ToList())
+                {
+                    if (Clean(value) is { } cleaned)
+                    {
+                        o[field] = cleaned;
+                    }
+                    else
+                    {
+                        WithoutEmails(value);
+                    }
+                }
+                break;
+        }
+        return node;
+    }
+
+    /// <summary>
+    /// Replaces every identity the contract's answers carry: a name (a work item's <c>claimant</c>, a comment's <c>author</c>, a
+    /// change's <c>actor.name</c>) by <see cref="Recorder"/>, and an id (<c>claimant_id</c>, <c>author_id</c>, <c>actor.id</c>)
+    /// by its placeholder (<see cref="KanbanIdentities.Placeholder"/>). The contract's shapes carry no other identity (no
+    /// creator, owner, e-mail or avatar on a project, epic, document or work item).
+    /// </summary>
     private void Anonymise(JsonNode? node)
     {
+        void Name(JsonObject o, string field)
+        {
+            if (o[field] is JsonValue v && v.TryGetValue<string>(out var name))
+            {
+                Identities.Learn(name);
+                o[field] = Recorder;
+            }
+        }
+        void Id(JsonObject o, string field)
+        {
+            if (o[field] is JsonValue v && v.TryGetValue<string>(out var id))
+            {
+                o[field] = Identities.Placeholder(id);
+            }
+        }
         switch (node)
         {
             case JsonArray array:
@@ -424,16 +591,14 @@ public sealed partial class KanbanRecordingHandler(KanbanFixture fixture) : Dele
                 }
                 break;
             case JsonObject o:
-                foreach (var field in new[] { "claimant", "author" })
+                Name(o, "claimant");
+                Name(o, "author");
+                Id(o, "claimant_id");
+                Id(o, "author_id");
+                if (o["actor"] is JsonObject actor)
                 {
-                    if (o[field] is JsonValue v && v.TryGetValue<string>(out var name))
-                    {
-                        if (name.Length > 0 && name != Recorder)
-                        {
-                            _names.Add(name);
-                        }
-                        o[field] = Recorder;
-                    }
+                    Name(actor, "name");
+                    Id(actor, "id");
                 }
                 foreach (var child in o.Select(p => p.Value).ToList())
                 {
@@ -458,6 +623,9 @@ public sealed partial class KanbanRecordingHandler(KanbanFixture fixture) : Dele
             new([.. list.Where(e => In(e, field, own)).Select(e => e!.DeepClone())]);
         switch (tool, answer)
         {
+            case ("list_changes", _):
+                // The change feed names other identities' edits field by field (old and new claimants, comment authors).
+                throw new InvalidOperationException("list_changes answers the board's change feed, which the recording handler does not scrub; it is not recorded.");
             case ("list_projects", JsonArray list):
                 return Kept(list, "id", projects);
             case ("list_work_items", JsonArray list):
@@ -481,7 +649,9 @@ public sealed partial class KanbanRecordingHandler(KanbanFixture fixture) : Dele
 /// <summary>
 /// What may not be in a committed Kanban fixture (sc-25986; the repository is public): a token — an <c>Authorization</c>
 /// header's name, a bearer value, a string shaped like a KanbanBoard personal access token (<c>kbp_…</c>), a JSON web token or
-/// the fake board's own tokens —, an e-mail address, an identity's name, and anything of the board that is not the recorder's
+/// the fake board's own tokens —, an e-mail address, an identity's name (in a <c>claimant</c>, an <c>author</c>, an
+/// <c>actor</c>, or — a name the set or the recording run knows — in a refusal's message), an identity's id that is not the
+/// recorder's placeholder (<c>claimant_id</c>, <c>author_id</c>, <c>actor.id</c>), and anything of the board that is not the recorder's
 /// own throwaway: a work item, epic, document or project of another project than the fixture's (<c>parameters.project</c>), or
 /// one whose title or name does not start with <see cref="Prefix"/> (a project's key with <see cref="KeyPrefix"/>), and a
 /// listing longer than <see cref="MaxListed"/>.
@@ -503,9 +673,76 @@ public static partial class KanbanFixtureGuard
     [GeneratedRegex(@"[A-Za-z0-9._%+-]+@(?!example\.com)[A-Za-z0-9.-]+\.[A-Za-z]{2,}")]
     private static partial Regex Email();
 
-    /// <summary>Every problem of the fixture <paramref name="name"/> whose file holds <paramref name="json"/>; empty when it may be committed.</summary>
-    public static IReadOnlyList<string> Problems(string name, string json)
+    [GeneratedRegex("^f0000000-0000-0000-0000-[0-9a-f]{12}$")]
+    private static partial Regex PlaceholderId();
+
+    [GeneratedRegex("^DFFIX[0-9A-F]{8}$")]
+    private static partial Regex RecorderKey();
+
+    /// <summary>The one name the recorder gives its throwaway project.</summary>
+    public const string ProjectName = Prefix + " contract recording";
+
+    /// <summary>Whether <paramref name="id"/> is what an identity's id is recorded as (<see cref="KanbanIdentities.Placeholder"/>).</summary>
+    public static bool IsPlaceholderId(string id) => PlaceholderId().IsMatch(id);
+
+    /// <summary>Whether <paramref name="key"/> is a key the recorder gives its project: <see cref="KeyPrefix"/> and 8 upper-case hex digits.</summary>
+    public static bool IsRecorderKey(string key) => RecorderKey().IsMatch(key);
+
+    /// <summary>
+    /// Every problem of a fixture set (file name and text of each): <see cref="Problems"/> of each fixture, with the names that
+    /// no refusal's message may hold — the real names and ids a recording run learnt (<paramref name="known"/>; none for the
+    /// committed set, whose recording is long over) and every <c>claimant</c>/<c>author</c> other than
+    /// <paramref name="allowed"/> that any fixture of the set holds.
+    /// </summary>
+    public static IReadOnlyList<string> SetProblems(IReadOnlyCollection<(string Name, string Json)> set, KanbanIdentities? known = null,
+        string allowed = KanbanRecordingHandler.Recorder)
     {
+        var names = new HashSet<string>(known?.Names ?? [], StringComparer.Ordinal);
+        foreach (var (_, json) in set)
+        {
+            Names(KanbanMcp.TryParse(json), names);
+        }
+        names.Remove(allowed);
+        var ids = known?.Ids ?? [];
+        return
+        [
+            .. set.SelectMany(f => Problems(f.Name, f.Json, names, allowed)
+                .Concat(ids.Any(id => f.Json.Contains(id, StringComparison.OrdinalIgnoreCase)) ? [$"{f.Name} holds the id of an identity the recording met"] : [])),
+        ];
+
+        static void Names(JsonNode? node, HashSet<string> into)
+        {
+            switch (node)
+            {
+                case JsonArray array:
+                    foreach (var entry in array)
+                    {
+                        Names(entry, into);
+                    }
+                    break;
+                case JsonObject o:
+                    foreach (var (field, value) in o)
+                    {
+                        if (field is "claimant" or "author" && value is JsonValue v && v.TryGetValue<string>(out var name) && name.Length > 0)
+                        {
+                            into.Add(name);
+                        }
+                        Names(value, into);
+                    }
+                    break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Every problem of the fixture <paramref name="name"/> whose file holds <paramref name="json"/>; empty when it may be
+    /// committed. <paramref name="identities"/>: names no refusal's message (and no plain error's text) may hold;
+    /// <paramref name="allowed"/>: the one name a <c>claimant</c> or <c>author</c> may be.
+    /// </summary>
+    public static IReadOnlyList<string> Problems(string name, string json, IReadOnlyCollection<string>? identities = null,
+        string allowed = KanbanRecordingHandler.Recorder)
+    {
+        identities ??= [];
         var problems = new List<string>();
         if (Token().Match(json) is { Success: true } token)
         {
@@ -533,13 +770,21 @@ public static partial class KanbanFixtureGuard
         {
             var call = fixture.Interactions[i];
             var where = $"{name}, call {i + 1} ({call.Tool})";
-            Walk(call.Arguments, $"{where} arguments", project, problems);
-            Walk(call.Answer, $"{where} answer", project, problems);
+            Walk(call.Arguments, $"{where} arguments", project, allowed, problems);
+            Walk(call.Answer, $"{where} answer", project, allowed, problems);
+            // What a refusal says, for people: its message, or a plain error's text. It may name whoever holds the item.
+            var said = !call.IsError ? null
+                : call.Answer is JsonObject error ? error["message"] is JsonValue m && m.TryGetValue<string>(out var message) ? message : null
+                : call.Answer is JsonValue v && v.TryGetValue<string>(out var plain) ? plain : null;
+            if (said is not null && identities.FirstOrDefault(n => n != allowed && said.Contains(n, StringComparison.Ordinal)) is { } named)
+            {
+                problems.Add($"{where} answer's message names an identity ('{Cut(named)}')");
+            }
         }
         return problems;
     }
 
-    private static void Walk(JsonNode? node, string where, Guid project, List<string> problems)
+    private static void Walk(JsonNode? node, string where, Guid project, string allowed, List<string> problems)
     {
         switch (node)
         {
@@ -550,12 +795,24 @@ public static partial class KanbanFixtureGuard
                 }
                 foreach (var entry in array)
                 {
-                    Walk(entry, where, project, problems);
+                    Walk(entry, where, project, allowed, problems);
                 }
                 break;
             case JsonObject o:
                 foreach (var (field, value) in o)
                 {
+                    if (field == "actor" && value is JsonObject actor)
+                    {
+                        if (actor["name"] is JsonValue an && (!an.TryGetValue<string>(out var actorName) || actorName != allowed))
+                        {
+                            problems.Add($"{where} holds an identity's name in actor.name");
+                        }
+                        if (actor["id"] is JsonValue ai && (!ai.TryGetValue<string>(out var actorId) || !IsPlaceholderId(actorId)))
+                        {
+                            problems.Add($"{where} holds an identity's id in actor.id, not the recorder's placeholder");
+                        }
+                        continue;
+                    }
                     if (value is JsonValue v && v.TryGetValue<string>(out var text))
                     {
                         switch (field)
@@ -569,12 +826,19 @@ public static partial class KanbanFixtureGuard
                             case "key" when !text.StartsWith(KeyPrefix, StringComparison.Ordinal):
                                 problems.Add($"{where} holds the project key '{Cut(text)}', not a throwaway's ('{KeyPrefix}…')");
                                 break;
-                            case "claimant" or "author" when text != KanbanRecordingHandler.Recorder:
+                            case "claimant" or "author" when text != allowed:
                                 problems.Add($"{where} holds an identity's name in {field} ('{Cut(text)}')");
+                                break;
+                            case "claimant_id" or "author_id" when !IsPlaceholderId(text):
+                                problems.Add($"{where} holds an identity's id in {field}, not the recorder's placeholder (f0000000-0000-0000-0000-…)");
                                 break;
                         }
                     }
-                    Walk(value, where, project, problems);
+                    else if (field is "claimant_id" or "author_id" or "claimant" or "author" && value is not null)
+                    {
+                        problems.Add($"{where} holds {field} that is neither null nor a string");
+                    }
+                    Walk(value, where, project, allowed, problems);
                 }
                 break;
         }

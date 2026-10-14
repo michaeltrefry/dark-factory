@@ -1,17 +1,17 @@
 {
   "recorded_from": "in-repo fake (provisional; re-record against the hosted instance)",
   "parameters": {
-    "project": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
-    "projectKey": "DFFIX2A1B0807",
+    "project": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+    "projectKey": "DFFIX843A9540",
     "ready": [
-      "5f8d886c-901c-4e80-bed0-8c72e7de5a71",
-      "a202a746-0302-4c0e-9068-e7f7e0665e86",
-      "11a88f62-5319-4390-b05d-fd73e2352083"
+      "4ae3d636-33f8-4efd-bc52-00b67982d42d",
+      "9b4fb848-95f4-48e3-8856-04876f17f412",
+      "80ab7e81-af57-4b6b-a988-47375acc94ed"
     ],
     "left out": [
-      "a90becbd-ab57-447c-a4d8-d12316653799",
-      "a7a22088-06f6-4dc1-bd5f-12b92dfe039a",
-      "61aaf453-ac89-44a4-aaed-1e633268e138"
+      "0c8e6656-ef05-4376-9c61-4af15000eec6",
+      "0ee183e5-0d57-4e08-adc2-7ab91515201e",
+      "dede71bf-39cd-46e6-8b98-ec585c9bddbc"
     ]
   },
   "interactions": [
@@ -21,9 +21,9 @@
       "isError": false,
       "answer": [
         {
-          "id": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+          "id": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
           "name": "[dark-factory fixture] contract recording",
-          "key": "DFFIX2A1B0807",
+          "key": "DFFIX843A9540",
           "isArchived": false,
           "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
           "totalItems": 6,
@@ -36,7 +36,7 @@
     {
       "tool": "list_work_items",
       "arguments": {
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "status": "Ready",
         "unblocked_only": true,
         "claim_state": "unclaimed",
@@ -47,8 +47,8 @@
       "answer": {
         "items": [
           {
-            "id": "5f8d886c-901c-4e80-bed0-8c72e7de5a71",
-            "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+            "id": "4ae3d636-33f8-4efd-bc52-00b67982d42d",
+            "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
             "title": "[dark-factory fixture] ready 1",
             "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
             "type": "Task",
@@ -70,8 +70,8 @@
             "label_list": []
           },
           {
-            "id": "a202a746-0302-4c0e-9068-e7f7e0665e86",
-            "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+            "id": "9b4fb848-95f4-48e3-8856-04876f17f412",
+            "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
             "title": "[dark-factory fixture] ready 2",
             "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
             "type": "Task",
@@ -99,7 +99,7 @@
     {
       "tool": "list_work_items",
       "arguments": {
-        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
         "status": "Ready",
         "unblocked_only": true,
         "claim_state": "unclaimed",
@@ -111,8 +111,8 @@
       "answer": {
         "items": [
           {
-            "id": "11a88f62-5319-4390-b05d-fd73e2352083",
-            "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+            "id": "80ab7e81-af57-4b6b-a988-47375acc94ed",
+            "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
             "title": "[dark-factory fixture] ready 3",
             "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
             "type": "Task",
