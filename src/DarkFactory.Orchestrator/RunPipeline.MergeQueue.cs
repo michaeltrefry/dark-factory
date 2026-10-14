@@ -580,7 +580,7 @@ public sealed partial class RunPipeline
         var merged = history.Skip(fixing + 1).Where(e => e.Step == Steps.BaseMerged).Select(e => BaseUpdate.FromDetail(e.Detail)).LastOrDefault(u => u is not null);
         var found = history.Where(e => e.Step == Steps.MergeConflict).Select(e => BaseUpdate.FromDetail(e.Detail)).LastOrDefault(u => u?.From == fixedHead);
         await RunFixRoundAsync(run, history, round, fixedHead, $"conflicts with the base in {string.Join(", ", found?.Files ?? [])}", [SpecInput(spec.Story)],
-            _ => Task.FromResult(BuildConflictFixPrompt(spec, repo, round, merged!, FixCapOf(history))),
+            _ => Task.FromResult(BuildConflictFixPrompt(spec, repo, round, merged!, FixCapOf(history), swift)),
             BuildConflictFixResumePrompt(spec.Story, round),
             $"{spec.Story.Ref}: merge the base and resolve its conflicts (round {round})", WorkState.Review, $"conflict fix round {round}", WorkerModelClass.Coding(spec.Story), ct,
             prepare: async (workspace, c) =>
@@ -606,7 +606,8 @@ public sealed partial class RunPipeline
     /// repository, so they are fenced as data).
     /// </summary>
     /// <param name="cap">The fix-round cap in effect (<see cref="FixCapOf"/>).</param>
-    public static string BuildConflictFixPrompt(WorkSpec spec, RepoRef repo, int round, BaseUpdate merge, int cap = Lifecycle.MaxFixRounds)
+    public static string BuildConflictFixPrompt(WorkSpec spec, RepoRef repo, int round, BaseUpdate merge, int cap = Lifecycle.MaxFixRounds,
+        bool swift = false)
     {
         var story = spec.Story;
         var files = merge.Files is { Count: > 0 } conflicted
@@ -624,7 +625,7 @@ public sealed partial class RunPipeline
             {files}
 
             Resolve every conflict: edit each file so it keeps both the story's change and what the base changed, with no
-            conflict markers left, and make sure {BuildsAndPasses}. Do not commit, push, or open pull
+            conflict markers left, and make sure {BuildsAndPassesFor(swift)}. Do not commit, push, or open pull
             requests; the orchestrator does that.
             """;
     }

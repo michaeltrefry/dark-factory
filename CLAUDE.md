@@ -80,7 +80,7 @@ Claude Code headless workers through the Weave router.
 - `scripts/` — `setup-worker-user.sh` (one-time root setup of the sandbox users: `_factory`, and with `--slots n` also
   `_factory2` … `_factoryn`, one per worker slot, sc-25989) and `factory-worker-launch` (the helper every sandboxed worker runs
   through, installed root-owned once per sandbox user, each copy pinned to its own user and uid) and `factory-xcodebuild` (the
-  only way a worker runs xcodebuild, sc-26130: installed root-owned, unedited, once for every slot at
+  only xcodebuild command a worker is allowed, sc-26130: installed root-owned, unedited, once for every slot at
   `/usr/local/libexec/dark-factory/factory-xcodebuild`; "Swift toolchain" below).
 - `tests/DarkFactory.Orchestrator.Tests` — unit tests (no network; fake HTTP APIs, InMemory EF, local git).
   Tests run `scripts/factory-worker-launch` only through `SafeHelper` (a checked copy whose every signal goes through a
@@ -308,7 +308,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Worker:RunAs` | `_factory` (the sandbox user, slot 1's; slot n's is this name with n appended: `_factory2`, …); `none` runs workers as the owner (development only) |
 | `Worker:LaunchHelper` | `/usr/local/libexec/dark-factory/factory-worker-launch` (slot 1's installed helper; slot n's is this path with `-n` appended) |
 | `Worker:Slots` | `1` (a whole number 1–8, `WorkerSlots.MaxSlots`; sc-25989): how many sandbox users run workers side by side — worker sessions at a time. 1 is the one user `_factory`, one helper, one lock file, as before slots. Each slot above 1 needs its user and helper set up first (`sudo scripts/setup-worker-user.sh --slots n`), or start-up fails naming the slot (a slot above the count setup was last run with has no installed helper: setup removes the higher slots' helpers). Independent of `Intake:MaxConcurrentRuns`: more runs than slots is the ordinary case (runs also overlap outside worker phases); more slots than runs is allowed (the others serve a `factory run` beside `factory work`; `factory work` says so at start-up). Refused, not ignored, with `Worker:RunAs=none` unless 1 ("Worker slots" below) |
-| `Worker:Swift` | `false` (`true`/`false`, any case; sc-26130): `true` when the factory works Swift/Xcode repositories — every slot's user must then have Swift, xcodebuild with Xcode's first launch done and its license accepted, and the installed, current `factory-xcodebuild` ("Swift toolchain" below). `false` checks nothing of Swift or Xcode (E7: a .NET/Rust-only factory is never refused for a missing Xcode). A setting, not derived from the repositories, because a repository's stack is unknown before its first item is read and start-up reads nothing from GitHub. Refused, not ignored, when `true` with `Worker:RunAs=none` |
+| `Worker:Swift` | `false` (`true`/`false`, any case; sc-26130): `true` when the factory works Swift/Xcode repositories — every slot's user must then have Swift, xcodebuild with Xcode's first launch done and its license accepted, the macOS and iOS Simulator SDKs, and the installed, current `factory-xcodebuild`; implementers are then allowed the wrapper and their prompts name it ("Swift toolchain" below). `false` checks nothing of Swift or Xcode (E7: a .NET/Rust-only factory is never refused for a missing Xcode). A setting, not derived from the repositories, because a repository's stack is unknown before its first item is read and start-up reads nothing from GitHub. Refused, not ignored, when `true` with `Worker:RunAs=none` |
 | `Worker:Auth` | `router-key` (default: the worker holds only the router key, in `X-Weave-Router-Key` and as `ANTHROPIC_AUTH_TOKEN`; the router serves it from plans enrolled with `router login claude` / `router login codex`; `factory run`/`work` refuse to start unless `GET /v1/subscriptions/usage` lists an enabled `managed`/`shared` credential) or `claude-login` (weaker, violates E5: the worker's own Claude login, passed through by the router) |
 | `Worker:TimeoutMinutes` | `30` (> 0) |
 | `Worker:PauseGraceSeconds` | `660` (a paused worker that has not stopped at a tool boundary by then is stopped; must exceed the 600 s longest tool call) |
@@ -2226,37 +2226,66 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   resolves dependencies over the network; `swift run`, `swift package`, `swift repl` and `swift <script>` are denied.
   Triage and the planner gain none of this: `WorkerTools.ReadOnly` has no
   allow rule but its read rule and denies `Bash` by name.
-  Swift toolchain (Phase 5, sc-26130; `scripts/factory-xcodebuild`, `Worker/SwiftToolchain.cs`): xcodebuild only through the
-  factory's wrapper — `ClaudeWorker.XcodebuildTools` = `Bash(/usr/local/libexec/dark-factory/factory-xcodebuild:*)`, the installed
-  root-owned ABSOLUTE path (a plain `factory-xcodebuild` would resolve through the worker's own writable `~/.local/bin`, first on
-  its PATH), on every implementer; raw `xcodebuild`/`/usr/bin/xcodebuild`/`xcrun`/`/usr/bin/xcrun` are in `--disallowedTools`
-  (`ClaudeWorker.RawXcodebuildTools`), and a repository's settings allowing any of them (or the plain wrapper name) taint the
-  session; the prompts name the wrapper (`RunPipeline.BuildsAndPasses`). The wrapper takes `build`, `build-for-testing` or `test`
-  with `-scheme` and a simulator `-destination` (`[generic/]platform=<iOS|tvOS|watchOS|visionOS> Simulator[,name|OS|id|arch=…]`),
-  optionally `-project`/`-workspace` (relative, inside the working directory, no `..`), `-configuration`, `-only-testing:`/
-  `-skip-testing:` (test only), `-resultBundlePath <relative>.xcresult` (for the gate's results) and `-quiet`; and one read-only
-  query, `-list` (a worker needs a scheme's name; it builds nothing — `-showdestinations` is not offered). It refuses (exit 64,
-  nothing run) every other action (`archive`, `-exportArchive`, `analyze`, `clean`, `test-without-building`, …), every
-  `NAME=value` build-setting override (signing, team, profiles, flags, output directories), `-xcconfig`,
-  `-allowProvisioningUpdates` and every other account/signing/export flag, `-derivedDataPath`/`-clonedSourcePackagesDirPath`,
-  `-skipPackagePluginValidation`/`-skipMacroValidation`, and anything unknown. It always adds `-derivedDataPath
-  ~/Library/Developer/Xcode/DerivedData/dark-factory`, `-clonedSourcePackagesDirPath ~/Library/Caches/dark-factory/SourcePackages`
-  (not for `-list`: xcodebuild refuses a DerivedData path without a scheme) and `CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM=
+  Swift toolchain (Phase 5, sc-26130; `scripts/factory-xcodebuild`, `Worker/SwiftToolchain.cs`): the only xcodebuild command a
+  worker is allowed is the factory's wrapper — `ClaudeWorker.XcodebuildTools` = `Bash(/usr/local/libexec/dark-factory/factory-xcodebuild:*)`,
+  the installed root-owned ABSOLUTE path (a plain `factory-xcodebuild` would resolve through the worker's own writable
+  `~/.local/bin`, first on its PATH) — and only in a factory with `Worker:Swift=true`: `ClaudeWorker.AllowedToolsFor(swift)` /
+  `WorkerTools.ImplementerFor(swift)` add it (`SwiftAllowedTools`, `SwiftImplementer`, wired by `FactoryRunner` from
+  `options.WorkerSwift`), and only then do the implementing prompts name it (`RunPipeline.BuildsAndPassesFor(swift)`, the
+  pipeline's `swift` parameter). With `Worker:Swift` unset `ClaudeWorker.AllowedTools`, `WorkerTools.Implementer` and every
+  implementing prompt are exactly as before (E7). Raw `xcodebuild`/`/usr/bin/xcodebuild`/`xcrun`/`/usr/bin/xcrun` are in every
+  implementer's `--disallowedTools` (`ClaudeWorker.RawXcodebuildTools`, whatever the setting), and a repository's settings
+  allowing any of them, the plain wrapper name, or — with `Worker:Swift` off — the wrapper rule itself taint the session
+  (`Taint.OfRepoSettings(path, allowed)`). The wrapper takes `build`, `build-for-testing`, `test` or `test-without-building`
+  with `-scheme` and a `-destination` that is this Mac (`[generic/]platform=macOS[,arch=arm64|x86_64][,variant=Mac
+  Catalyst|macOS]`: macOS apps, e.g. LensWorks) or a simulator (`[generic/]platform=<iOS|tvOS|watchOS|visionOS>
+  Simulator[,name|OS|id|arch=…]`) — never a device (`platform=iOS`, `generic/platform=iOS`, `platform=visionOS`, … refused, E3);
+  optionally `-project`/`-workspace` (relative, inside the working directory: no absolute path, no `.` or `..` component, a
+  leading `.` in a name allowed, and the nearest existing ancestor resolved with `cd -P`/`pwd -P` must be the working directory
+  or under it, so a symbolic link out — or a dangling one — is refused), `-configuration`, `-only-testing:`/`-skip-testing:`
+  (the test actions only; ids may hold `:` and `()`, e.g. Swift Testing's `f(x:)`), `-parallel-testing-enabled NO` (exactly that
+  value; the test actions only), `-resultBundlePath <relative>.xcresult` (the same path rule; e.g. the gate's
+  `.factory-test-results-<guid>/r.xcresult`) and `-quiet`; and one read-only query, `-list` (a worker needs a scheme's name; it
+  builds nothing — `-showdestinations` is not offered). It refuses (exit 64, nothing run) every other action (`archive`,
+  `-exportArchive`, `analyze`, `clean`, …), every `NAME=value` build-setting override (signing, team, profiles, flags, output
+  directories), `-xcconfig`, `-xctestrun`, `-testPlan`, `-allowProvisioningUpdates` and every other account/signing/export flag,
+  `-derivedDataPath`/`-clonedSourcePackagesDirPath`/`-skipMacroValidation`/`-skipPackagePluginValidation` (it sets them itself),
+  and anything unknown. It always adds `-derivedDataPath ~/Library/Developer/Xcode/DerivedData/dark-factory/<key>` — one per
+  working directory, the key the first 16 hex characters of the SHA-256 of `pwd -P` (`SwiftToolchain.DerivedDataOf(home,
+  workingDirectory)`), so two worktrees (two items, or the gate's base and head runs) never share build products, while one
+  worktree's `build-for-testing` and `test-without-building` share theirs —, `-clonedSourcePackagesDirPath
+  ~/Library/Caches/dark-factory/SourcePackages` (not for `-list`: xcodebuild refuses a DerivedData path without a scheme),
+  `-skipMacroValidation -skipPackagePluginValidation` (below) and `CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM=
   PROVISIONING_PROFILE_SPECIFIER= PROVISIONING_PROFILE=` (ad hoc), with `~` from the password database, and runs
   `/usr/bin/xcodebuild` under `env -i` (HOME, a fixed PATH, the user's own TMPDIR): xcodebuild reads environment variables as
   build settings. Per-slot caches: the launch helper gives every worker its own user's HOME and TMPDIR, so each slot's
-  DerivedData, SwiftPM checkouts and `swift build`/`swift test` caches (`~/Library/Caches/org.swift.swiftpm`,
-  `~/Library/org.swift.swiftpm`; `SwiftToolchain.SwiftPmCachesOf`) are its own. `factory-worker-launch` is unchanged
+  DerivedData and SwiftPM checkouts are its own; so are SwiftPM's own caches (`~/Library/Caches/org.swift.swiftpm`,
+  `~/Library/org.swift.swiftpm`; `SwiftToolchain.SwiftPmCachesOf`) wherever a worker runs `swift build`/`swift test` directly —
+  those allow rules are not this story's (they come with sc-26127's SwiftPM support). `factory-worker-launch` is unchanged
   (helper_version 5). Checks, only with `Worker:Swift=true` (`WorkerSandbox.Swift`, set on every slot by `WorkerSlots.Create`):
   start-up and every run's start read the installed wrapper (must equal the compiled-in `scripts/factory-xcodebuild` by SHA-256;
   runs nothing), and each slot's readiness probe (its first worker phase, under its lock, through its own helper, as its user)
-  runs `/usr/bin/swift --version`, `/usr/bin/xcodebuild -version`, `-checkFirstLaunchStatus`, `-license check` and the wrapper
-  (usage, exit 64); a failure is factory-wide and names the slot and user and the fix (`sudo xcodebuild -runFirstLaunch`,
-  `sudo xcodebuild -license accept`, `sudo scripts/setup-worker-user.sh [--slots n] --swift`). Setup installs the wrapper always
-  and checks the same four commands per user through each helper: required with `--swift` (a failure names the user and slot,
-  exit 1), else only reported. Tests: `XcodebuildWrapperTests` (a copy of the wrapper over a stub xcodebuild: every allowed form,
-  every refusal, the environment), `SwiftToolchainTests`, `SetupScriptTests`. After merging, the owner re-runs
-  `sudo scripts/setup-worker-user.sh --slots 2 [--swift]` to install the wrapper.
+  runs `/usr/bin/swift --version`, `/usr/bin/xcodebuild -version`, `-checkFirstLaunchStatus`, `-license check`, `-showsdks`
+  (which must list the macOS and iOS Simulator SDKs, `SwiftToolchain.RequiredSdks`: a missing one is named with its fix,
+  `sudo xcodebuild -downloadPlatform iOS`) and the wrapper (usage, exit 64); a failure is factory-wide and names the slot and
+  user and the fix (`sudo xcodebuild -runFirstLaunch`, `sudo xcodebuild -license accept`, `sudo scripts/setup-worker-user.sh
+  [--slots n] --swift`). The probe does NOT check CoreSimulator, a simulator runtime or a simulator device (`-showsdks` lists SDKs
+  and boots nothing); those are the simulator stories' (S0/S6). Setup installs the wrapper always and checks the same five
+  commands per user through each helper: with `--swift` required — every slot is checked, then every failing user is named
+  (`The Swift toolchain is not usable by: _factory (worker slot 1); …`) and it exits 1; without it only reported, and skipped
+  (`skipped: no Xcode selected`) when `xcode-select -p` fails. Residuals, accepted: (a) the wrapper is the only xcodebuild
+  command a worker's own command line may run, not a containment boundary: build code — Xcode Run Script phases, Swift package
+  plugins and macros, a dependency's build steps, as cargo's `build.rs` and MSBuild targets are for the other stacks — runs as
+  the sandbox user, unrestricted, and can run `/usr/bin/xcodebuild` itself with any action or setting; E3 (ad hoc signing,
+  simulator or this Mac only) rests on the sandbox user holding no signing identity, keychain item or Apple account to sign or
+  upload with. (b) The wrapper always skips Swift macro and package plugin validation (coordinator decision, sc-26130): a fresh
+  sandbox user has trusted no macro or plugin and nobody can click "Trust" for it, so without the skips any package graph with a
+  macro or a build-tool plugin would not build; the validation adds no protection here, since build phases already run arbitrary
+  code as that user (a). Tests: `XcodebuildWrapperTests` (a copy of the wrapper over a stub xcodebuild: every allowed form, every
+  refusal, symbolic links out, the per-directory DerivedData, the environment), `SwiftToolchainTests` (the probe, the setting,
+  the rules and prompts with the setting on and exactly as before with it off), `SetupScriptTests`, and `SafeHelperTests` (only
+  the wrapper's own literals are exempt from the helper scan). After merging, the owner re-runs
+  `sudo scripts/setup-worker-user.sh --slots 2 --swift` to install the wrapper, then sets `Worker__Swift=true`.
 - The orchestrator pushes only to `factory/*` (items' branches, and a plan's `factory/changeset-*` branch, sc-25872), with a repo-scoped GitHub App installation token passed
   via git env config (never argv/remote URLs/.git/config) on every network git call. Only the merge gate merges (below).
   Tokens are minted fresh per call (never cached) and refused if they outlive 1 hour (`GitHubApp`).

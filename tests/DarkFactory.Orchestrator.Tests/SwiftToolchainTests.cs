@@ -1,3 +1,4 @@
+using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.WorkSources;
@@ -28,11 +29,15 @@ public class SwiftToolchainTests
 
     private string Claude => SandboxSupport.Executable(_dir, "fake-claude.sh", "#!/bin/sh\necho '2.1.291 (Claude Code)'\n");
 
-    /// <summary>A fake xcodebuild: <c>-checkFirstLaunchStatus</c> exits <paramref name="firstLaunch"/>, <c>-license check</c> <paramref name="license"/>.</summary>
-    private string Xcodebuild(int firstLaunch = 0, int license = 0) => SandboxSupport.Executable(_dir, $"xcodebuild-{Guid.NewGuid():N}", $$"""
+    /// <summary>
+    /// A fake xcodebuild: <c>-checkFirstLaunchStatus</c> exits <paramref name="firstLaunch"/>, <c>-license check</c> <paramref name="license"/>,
+    /// <c>-showsdks</c> lists <paramref name="sdks"/> (as Xcode prints them: <c>-sdk &lt;name&gt;&lt;version&gt;</c>).
+    /// </summary>
+    private string Xcodebuild(int firstLaunch = 0, int license = 0, string sdks = "macosx iphonesimulator") => SandboxSupport.Executable(_dir, $"xcodebuild-{Guid.NewGuid():N}", $$"""
         #!/bin/sh
         case "$1" in
             -version) echo 'Xcode 26.5' ;;
+            -showsdks) for s in {{sdks}}; do printf '\tSDK 26.5\t-sdk %s26.5\n' "$s"; done ;;
             -checkFirstLaunchStatus) [ {{firstLaunch}} -eq 0 ] || echo 'first launch tasks are not done' >&2; exit {{firstLaunch}} ;;
             -license) [ "$2" = check ] || exit 2; [ {{license}} -eq 0 ] || echo 'You have not agreed to the Xcode license agreements.' >&2; exit {{license}} ;;
             *) exit 2 ;;
@@ -46,8 +51,8 @@ public class SwiftToolchainTests
     private string InstalledWrapper(string? text = null) => SandboxSupport.Executable(_dir, $"factory-xcodebuild-{Guid.NewGuid():N}",
         text ?? File.ReadAllText(Path.Combine(SandboxSupport.RepoRoot, "scripts", "factory-xcodebuild")));
 
-    private SwiftToolchain Toolchain(int firstLaunch = 0, int license = 0, int swiftExit = 0, string? wrapper = null) =>
-        new(Swift(swiftExit), Xcodebuild(firstLaunch, license), wrapper ?? InstalledWrapper());
+    private SwiftToolchain Toolchain(int firstLaunch = 0, int license = 0, int swiftExit = 0, string? wrapper = null, string sdks = "macosx iphonesimulator") =>
+        new(Swift(swiftExit), Xcodebuild(firstLaunch, license, sdks), wrapper ?? InstalledWrapper());
 
     /// <summary>Two slots, each its own fake helper and user, each with its own toolchain.</summary>
     private WorkerSlots Pool(SwiftToolchain? first, SwiftToolchain? second)
@@ -83,6 +88,7 @@ public class SwiftToolchainTests
             Assert.Contains($"{helper} {swift.XcodebuildPath} -version", ran);
             Assert.Contains($"{helper} {swift.XcodebuildPath} -checkFirstLaunchStatus", ran);
             Assert.Contains($"{helper} {swift.XcodebuildPath} -license check", ran);
+            Assert.Contains($"{helper} {swift.XcodebuildPath} -showsdks", ran);
             Assert.Contains($"{helper} {swift.WrapperPath}", ran);
         }
         // Each slot's probe ran through its own helper only.
@@ -94,6 +100,8 @@ public class SwiftToolchainTests
         { "first-launch", "-checkFirstLaunchStatus` as _dftest2 exited 69 (first launch tasks are not done): Xcode's first launch has not been completed; run `sudo xcodebuild -runFirstLaunch`" },
         { "license", "-license check` as _dftest2 exited 69 (You have not agreed to the Xcode license agreements.): Xcode's license has not been accepted; run `sudo xcodebuild -license accept`" },
         { "swift", "--version` as _dftest2 exited 127" },
+        { "no-ios-simulator", "-showsdks` as _dftest2 lists no iOS Simulator SDK (-sdk iphonesimulator…): install the iOS platform (`sudo xcodebuild -downloadPlatform iOS`)" },
+        { "no-sdks", "-showsdks` as _dftest2 lists no macOS SDK (-sdk macosx…) and no iOS Simulator SDK (-sdk iphonesimulator…)" },
         { "wrapper", "the xcodebuild wrapper" },
     };
 
@@ -106,6 +114,8 @@ public class SwiftToolchainTests
             "first-launch" => Toolchain(firstLaunch: 69),
             "license" => Toolchain(license: 69),
             "swift" => Toolchain(swiftExit: 127),
+            "no-ios-simulator" => Toolchain(sdks: "macosx driverkit"),
+            "no-sdks" => Toolchain(sdks: ""),
             // Installed, current by its text (so start-up passes), but not runnable as the user.
             _ => Toolchain() with { WrapperPath = Path.Combine(_dir, "not-executable") },
         };
@@ -212,10 +222,14 @@ public class SwiftToolchainTests
     public void An_implementer_runs_xcodebuild_only_through_the_wrappers_absolute_path_and_raw_xcodebuild_is_denied()
     {
         Assert.Equal(["Bash(/usr/local/libexec/dark-factory/factory-xcodebuild:*)"], ClaudeWorker.XcodebuildTools);
-        Assert.Contains(ClaudeWorker.XcodebuildTools[0], ClaudeWorker.AllowedTools);
+        Assert.Equal([.. ClaudeWorker.AllowedTools, .. ClaudeWorker.XcodebuildTools], ClaudeWorker.SwiftAllowedTools);
+        Assert.Equal(ClaudeWorker.SwiftAllowedTools, WorkerTools.SwiftImplementer.Allowed);
+        Assert.Same(WorkerTools.SwiftImplementer, WorkerTools.ImplementerFor(true));
         // No allow rule names xcodebuild or xcrun but the wrapper's.
-        Assert.All(ClaudeWorker.AllowedTools.Where(a => a.Contains("xcodebuild", StringComparison.Ordinal) || a.Contains("xcrun", StringComparison.Ordinal)),
+        Assert.All(ClaudeWorker.SwiftAllowedTools.Where(a => a.Contains("xcodebuild", StringComparison.Ordinal) || a.Contains("xcrun", StringComparison.Ordinal)),
             a => Assert.Equal(ClaudeWorker.XcodebuildTools[0], a));
+        var swiftArgs = ClaudeWorker.BuildArguments("p", tools: WorkerTools.SwiftImplementer).ToList();
+        Assert.Contains(ClaudeWorker.XcodebuildTools[0], swiftArgs);
         Assert.Equal(["Bash(xcodebuild:*)", "Bash(/usr/bin/xcodebuild:*)", "Bash(xcrun:*)", "Bash(/usr/bin/xcrun:*)"], ClaudeWorker.RawXcodebuildTools);
         var args = ClaudeWorker.BuildArguments("p").ToList();
         var denied = args.Skip(args.IndexOf("--disallowedTools") + 1).TakeWhile(a => !a.StartsWith("--", StringComparison.Ordinal)).ToList();
@@ -223,8 +237,51 @@ public class SwiftToolchainTests
         Assert.All(Taint.WebTools, rule => Assert.Contains(rule, denied));
         // Triage and the planner get none of it.
         Assert.DoesNotContain(ClaudeWorker.BuildArguments("p", null, null, WorkerTools.ReadOnly, "/wt/triage"), a => a.Contains("xcodebuild", StringComparison.Ordinal));
-        // The prompts name the wrapper as the way to build an Xcode project.
-        Assert.Contains(SwiftToolchain.DefaultWrapperPath + " build|test", RunPipeline.BuildsAndPasses);
+        // A Swift factory's prompts name the wrapper as the way to build an Xcode project, macOS app or iOS app on the simulator.
+        Assert.Contains(SwiftToolchain.DefaultWrapperPath + " build|test -scheme <scheme> -destination 'platform=macOS'", RunPipeline.BuildsAndPassesFor(true));
+        Assert.Contains("-destination 'platform=iOS Simulator,name=<device>'", RunPipeline.BuildsAndPassesFor(true));
+    }
+
+    [Fact]
+    public void Without_worker_swift_the_implementers_tools_and_prompts_are_exactly_mains()
+    {
+        // E7: a factory with Worker:Swift unset allows and says nothing of xcodebuild: exactly the base's values (S1's SwiftPM
+        // rules and prompt text, sc-26127, are unconditional there and stay so).
+        string[] mains = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(dotnet restore:*)",
+            "Bash(cargo build:*)", "Bash(cargo check:*)", "Bash(cargo test:*)", "Bash(cargo fetch:*)",
+            "Bash(swift build:*)", "Bash(swift test:*)"];
+        const string mainsBuildsAndPasses =
+            "the build and the tests pass (`dotnet build` and `dotnet test`; in a Rust package `cargo build` and `cargo test`; in a Swift package `swift build` and `swift test`)";
+        var unset = Options([]);
+        Assert.False(unset.WorkerSwift);
+        Assert.Equal(mains, ClaudeWorker.AllowedTools);
+        Assert.Equal(mains, ClaudeWorker.AllowedToolsFor(unset.WorkerSwift));
+        Assert.Same(WorkerTools.Implementer, WorkerTools.ImplementerFor(unset.WorkerSwift));
+        Assert.Equal(mains, WorkerTools.Implementer.Allowed);
+        Assert.DoesNotContain(ClaudeWorker.BuildArguments("p"), a => a.Contains("factory-xcodebuild", StringComparison.Ordinal));
+        Assert.Equal(mainsBuildsAndPasses, RunPipeline.BuildsAndPasses);
+        Assert.Equal(mainsBuildsAndPasses, RunPipeline.BuildsAndPassesFor(unset.WorkerSwift));
+
+        // Every implementing prompt, built as a factory without Worker:Swift builds it, names no xcodebuild; with it, each does.
+        var spec = new WorkSpec(new WorkStory(1, "Story", "Do it.", "feature", "https://example.test/1", ItemNaming.Shortcut), null, []);
+        var repo = RepoRef.Parse("o/r");
+        foreach (var swift in new[] { false, true })
+        {
+            string[] prompts =
+            [
+                RunPipeline.BuildPrompt(spec, repo, swift),
+                RunPipeline.BuildFixPrompt(spec, repo, 1, [], swift: swift),
+                RunPipeline.BuildCiFixPrompt(spec, repo, 1, new string('a', 40), [], swift: swift),
+                RunPipeline.BuildConflictFixPrompt(spec, repo, 1, new BaseUpdate(BaseUpdate.Kinds.Conflict, new string('a', 40), new string('b', 40), Files: ["f"]), swift: swift),
+            ];
+            Assert.All(prompts, prompt => Assert.Equal(swift, prompt.Contains("factory-xcodebuild", StringComparison.Ordinal)));
+            Assert.All(prompts, prompt => Assert.Contains(RunPipeline.BuildsAndPassesFor(swift), prompt.ReplaceLineEndings(" ").Replace("  ", " ")));
+        }
+        Assert.DoesNotContain("xcodebuild", RunPipeline.BuildPrompt(spec, repo));
+        // Production wires both from the one setting: the implementer's tools, and the pipeline's prompts and repo-settings taint.
+        var runner = File.ReadAllText(Path.Combine(SandboxSupport.RepoRoot, "src", "DarkFactory.Orchestrator", "FactoryRunner.cs"));
+        Assert.Contains("pauseFlagDirectory: options.PauseFlagDirectory, tools: WorkerTools.ImplementerFor(options.WorkerSwift)),", runner);
+        Assert.Contains("swift: options.WorkerSwift);", runner);
     }
 
     [Theory]
@@ -240,15 +297,20 @@ public class SwiftToolchainTests
         File.WriteAllText(Path.Combine(dir, ".claude/settings.json"), """{"permissions":{"allow":["RULE"]}}""".Replace("RULE", rule));
 
         Assert.NotNull(Taint.OfRepoSettings(dir));
+        Assert.NotNull(Taint.OfRepoSettings(dir, ClaudeWorker.SwiftAllowedTools));
     }
 
     [Fact]
-    public void A_repos_allow_rule_for_the_wrapper_the_worker_already_has_does_not_taint()
+    public void A_repos_allow_rule_for_the_wrapper_taints_only_where_the_worker_does_not_already_have_it()
     {
         var dir = Directory.CreateTempSubdirectory("df-settings-").FullName;
         Directory.CreateDirectory(Path.Combine(dir, ".claude"));
         File.WriteAllText(Path.Combine(dir, ".claude/settings.json"), """{"permissions":{"allow":["RULE"]}}""".Replace("RULE", ClaudeWorker.XcodebuildTools[0]));
 
-        Assert.Null(Taint.OfRepoSettings(dir));
+        // Worker:Swift on: the worker has the rule already.
+        Assert.Null(Taint.OfRepoSettings(dir, ClaudeWorker.AllowedToolsFor(true)));
+        // Off (the default): the repository would grant what the factory does not (E7), so it taints.
+        Assert.NotNull(Taint.OfRepoSettings(dir, ClaudeWorker.AllowedToolsFor(false)));
+        Assert.NotNull(Taint.OfRepoSettings(dir));
     }
 }

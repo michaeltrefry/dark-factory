@@ -718,7 +718,7 @@ public sealed partial class RunPipeline
         var findings = FixLoop.Fixable(verdict)
             ?? throw new InvalidOperationException($"The verdict on {fixedHead} has no confirmed blocking findings to fix.");
         await RunFixRoundAsync(run, history, round, fixedHead, $"{findings.Count} finding(s)", [SpecInput(spec.Story), WorkerInput.ReviewFindings],
-            _ => Task.FromResult(BuildFixPrompt(spec, repo, round, findings, FixCapOf(history))), BuildFixResumePrompt(spec.Story, round),
+            _ => Task.FromResult(BuildFixPrompt(spec, repo, round, findings, FixCapOf(history), swift)), BuildFixResumePrompt(spec.Story, round),
             $"{spec.Story.Ref}: fix review findings (round {round})", WorkState.Review, $"fix round {round}", WorkerModelClass.Coding(spec.Story), ct);
     }
 
@@ -888,7 +888,7 @@ public sealed partial class RunPipeline
             ?? throw new InvalidOperationException($"CI fix round {round} has no CI triage of the commit it fixes ({fixedHead}).");
         // CI logs do not taint the CI fixer (the rule and why: Taint).
         await RunFixRoundAsync(run, history, round, fixedHead, $"failing checks: {string.Join(", ", triage.Fixable)}", [SpecInput(spec.Story), WorkerInput.CiLog],
-            async c => BuildCiFixPrompt(spec, repo, round, fixedHead, await FailureLogsAsync(run, fixedHead, triage, c), FixCapOf(history)),
+            async c => BuildCiFixPrompt(spec, repo, round, fixedHead, await FailureLogsAsync(run, fixedHead, triage, c), FixCapOf(history), swift),
             BuildCiFixResumePrompt(spec.Story, round),
             $"{spec.Story.Ref}: fix CI (round {round})", WorkState.CI, $"ci fix round {round}", WorkerModelClass.CiFix, ct);
     }
@@ -932,7 +932,8 @@ public sealed partial class RunPipeline
     /// so they are a description of a failure, never instructions.
     /// </summary>
     /// <param name="cap">The fix-round cap in effect (<see cref="FixCapOf"/>).</param>
-    public static string BuildCiFixPrompt(WorkSpec spec, RepoRef repo, int round, string sha, IReadOnlyList<CiFailureLog> failures, int cap = Lifecycle.MaxFixRounds)
+    public static string BuildCiFixPrompt(WorkSpec spec, RepoRef repo, int round, string sha, IReadOnlyList<CiFailureLog> failures, int cap = Lifecycle.MaxFixRounds,
+        bool swift = false)
     {
         var story = spec.Story;
         var blocks = string.Join("\n\n", failures.Select(f => PromptFence.Block("ci-log",
@@ -948,7 +949,7 @@ public sealed partial class RunPipeline
             {blocks}
 
             Find and fix the cause of each failure with the smallest change that keeps the story satisfied, and make sure
-            {BuildsAndPasses}. Do not delete, skip or weaken tests to make CI pass, and do not change CI
+            {BuildsAndPassesFor(swift)}. Do not delete, skip or weaken tests to make CI pass, and do not change CI
             configuration. Do not commit, push, or open pull requests; the orchestrator does that.
             """;
     }
@@ -965,7 +966,8 @@ public sealed partial class RunPipeline
     /// reviewer summary).
     /// </summary>
     /// <param name="cap">The fix-round cap in effect (<see cref="FixCapOf"/>).</param>
-    public static string BuildFixPrompt(WorkSpec spec, RepoRef repo, int round, IReadOnlyList<OpenFinding> findings, int cap = Lifecycle.MaxFixRounds)
+    public static string BuildFixPrompt(WorkSpec spec, RepoRef repo, int round, IReadOnlyList<OpenFinding> findings, int cap = Lifecycle.MaxFixRounds,
+        bool swift = false)
     {
         var story = spec.Story;
         var blocks = string.Join("\n\n", findings.Select(f => RouterReviewer.FindingBlock(f.Finding, f.Role)));
@@ -980,7 +982,7 @@ public sealed partial class RunPipeline
             {blocks}
 
             Fix every finding with the smallest change that keeps the story satisfied, and make sure
-            {BuildsAndPasses}. Do not commit, push, or open pull requests; the orchestrator does that.
+            {BuildsAndPassesFor(swift)}. Do not commit, push, or open pull requests; the orchestrator does that.
             """;
     }
 

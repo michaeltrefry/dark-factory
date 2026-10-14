@@ -476,21 +476,65 @@ public class SafeHelperTests
     /// </list>
     /// The patterns are assembled so this file does not match them itself.
     /// </summary>
+    private static readonly string HelperName = "factory-worker" + "-launch";
+    private static readonly string ScriptsSegment = "\"script" + "s\"";
+    private static readonly string[] InstalledMarkers = ["Default" + "HelperPath", "libexec/" + "dark-factory"];
+
+    /// <summary>
+    /// The xcodebuild wrapper (sc-26130) is no launch helper: it signals nothing and is installed beside the helpers. Exactly its
+    /// literals are taken out of a line before the checks — its repo file (<c>"scripts", "factory-xcodebuild"</c> as the last two
+    /// path segments, so nothing built past it is exempt), its installed
+    /// path, <c>SwiftToolchain.DefaultWrapperPath</c> — and the unchanged checks run on what is left, so anything else on the line
+    /// (a helper path, a comment naming the wrapper) is judged as before.
+    /// </summary>
+    private static readonly Regex WrapperLiterals = new(
+        Regex.Escape(ScriptsSegment) + @"\s*,\s*""factory-xcodebuild""(?=\s*\))|" + Regex.Escape("/usr/local/" + InstalledMarkers[1] + "/factory-xcodebuild")
+        + @"|\bSwiftToolchain\.DefaultWrapperPath\b");
+
+    /// <summary>The line with the wrapper's literals (<see cref="WrapperLiterals"/>) removed: what every check reads.</summary>
+    private static string WithoutWrapperLiterals(string line) => WrapperLiterals.Replace(line, "");
+
+    private static readonly Regex HelperLiteral = new("\"[^\"\\n]*" + Regex.Escape(HelperName) + "[\"/]");
+
+    // The configured pool (options' property, sc-25989) reaches every slot's installed helper too: any use of it counts
+    // (sc-25992); the type's static members (Worker.WorkerSlots.X) do not.
+    private static readonly Regex Configured = new(@"Worker(:|__)Launch" + "Helper|\\.Worker" + @"Sandbox\b(?![(.])|(?<!Worker)\.Worker" + @"Slots\b");
+
+    /// <summary>Whether <paramref name="line"/> (a raw source line of a file that knows the repo root) builds a path into the repo's scripts directory.</summary>
+    private static bool BuildsScriptsPath(string line) => WithoutWrapperLiterals(line).Contains(ScriptsSegment, StringComparison.Ordinal);
+
+    /// <summary>Whether <paramref name="line"/> (raw) names the installed or a configured launch helper.</summary>
+    private static bool NamesHelper(string line)
+    {
+        var rest = WithoutWrapperLiterals(line);
+        return HelperLiteral.IsMatch(rest) || InstalledMarkers.Any(m => rest.Contains(m, StringComparison.Ordinal)) || Configured.IsMatch(rest);
+    }
+
+    [Theory]
+    // A line that also names the wrapper — even only in a comment — is still judged on the rest.
+    [InlineData("var p = Path.Combine(SandboxSupport.RepoRoot, \"script\" + \"s\", \"factory-worker\" + \"-launch\"); // factory-xcodebuild", true, false)]
+    [InlineData("var p = Path.Combine(SandboxSupport.RepoRoot, \"scripts\", \"factory-xcodebuild\", \"..\", \"factory-worker\" + \"-launch\");", true, false)]
+    [InlineData("var h = \"/usr/local/libexec/dark-factory/factory-worker-launch\"; // beside /usr/local/libexec/dark-factory/factory-xcodebuild", false, true)]
+    [InlineData("var w = SwiftToolchain.DefaultWrapperPath; var h = WorkerSandbox.DefaultHelperPath;", false, true)]
+    // The wrapper's own literals alone are not a use of the helper.
+    [InlineData("private static string RepoWrapper => Path.Combine(SandboxSupport.RepoRoot, \"scripts\", \"factory-xcodebuild\");", false, false)]
+    [InlineData("Assert.Equal(\"/usr/local/libexec/dark-factory/factory-xcodebuild\", SwiftToolchain.DefaultWrapperPath);", false, false)]
+    public void Only_the_wrappers_own_literals_are_exempt_from_the_helper_scan(string line, bool buildsScriptsPath, bool namesHelper)
+    {
+        // Seeded lines (the scan reads them exactly as it reads the test tree's).
+        line = line.Replace("\"script\" + \"s\"", ScriptsSegment, StringComparison.Ordinal);
+        Assert.Equal(buildsScriptsPath, BuildsScriptsPath(line));
+        Assert.Equal(namesHelper, NamesHelper(line));
+    }
+
     [Fact]
     public void No_test_runs_the_real_helper_outside_the_safe_entry_point()
     {
-        var helperName = "factory-worker" + "-launch";
-        var scriptsSegment = "\"script" + "s\"";
+        var helperName = HelperName;
+        var scriptsSegment = ScriptsSegment;
         var setupAllowed = new Regex(Regex.Escape(scriptsSegment) + @"\s*,\s*""setup-worker-user\.sh""");
-        // The xcodebuild wrapper (sc-26130) is no launch helper: it signals nothing and is installed beside the helpers, so a line
-        // naming it (its repo file, its installed path) is not a use of the helper. A line naming both still counts.
-        var wrapperOnly = new Regex(@"(?:" + Regex.Escape(scriptsSegment) + @"\s*,\s*)?""?[^""\n]*factory-xcodebuild\b");
         var scriptsPathLiteral = new Regex("\"[^\"\\n]*scripts/" + Regex.Escape(helperName));
-        var helperLiteral = new Regex("\"[^\"\\n]*" + Regex.Escape(helperName) + "[\"/]");
-        string[] installedMarkers = ["Default" + "HelperPath", "libexec/" + "dark-factory"];
-        // The configured pool (options' property, sc-25989) reaches every slot's installed helper too: any use of it counts
-        // (sc-25992); the type's static members (Worker.WorkerSlots.X) do not.
-        var configured = new Regex(@"Worker(:|__)Launch" + "Helper|\\.Worker" + @"Sandbox\b(?![(.])|(?<!Worker)\.Worker" + @"Slots\b");
+        string[] installedMarkers = InstalledMarkers;
         var sourceLeaks = new Regex(@"\bSafeHelper\.Sour" + @"ce\b|\bBuild" + @"Copy\b|GetManifest" + "Resource");
         const string entryPoint = "SafeHelper.cs";
         const string selfFile = "SafeHelperTests.cs";
@@ -587,17 +631,12 @@ public class SafeHelperTests
                 {
                     violations.Add(where);
                 }
-                var namesWrapperOnly = wrapperOnly.IsMatch(line) && !line.Contains(helperName, StringComparison.Ordinal)
-                    && !line.Contains(installedMarkers[0], StringComparison.Ordinal) && !configured.IsMatch(line);
-                if (line.Contains(scriptsSegment, StringComparison.Ordinal) && knowsRepoRoot && !namesWrapperOnly
+                if (BuildsScriptsPath(line) && knowsRepoRoot
                     && !(name == "SetupScriptTests.cs" && setupAllowed.IsMatch(line)))
                 {
                     violations.Add(where);
                 }
-                var namesHelper = helperLiteral.IsMatch(line)
-                    || (!namesWrapperOnly && installedMarkers.Any(m => line.Contains(m, StringComparison.Ordinal)))
-                    || configured.IsMatch(line);
-                if (!namesHelper)
+                if (!NamesHelper(line))
                 {
                     continue;
                 }

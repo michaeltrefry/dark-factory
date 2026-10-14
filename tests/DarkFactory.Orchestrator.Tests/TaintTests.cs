@@ -108,7 +108,7 @@ public class TaintRuleTests
     {
         Assert.Equal(["Bash(cargo build:*)", "Bash(cargo check:*)", "Bash(cargo test:*)", "Bash(cargo fetch:*)"], ClaudeWorker.CargoTools);
         Assert.Equal(
-            ["Read", "Edit", "Write", "Glob", "Grep", "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(dotnet restore:*)", .. ClaudeWorker.CargoTools, .. ClaudeWorker.SwiftTools, .. ClaudeWorker.XcodebuildTools],
+            ["Read", "Edit", "Write", "Glob", "Grep", "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(dotnet restore:*)", .. ClaudeWorker.CargoTools, .. ClaudeWorker.SwiftTools],
             ClaudeWorker.AllowedTools);
         // The implementer's command line carries them.
         var args = ClaudeWorker.BuildArguments("p").ToList();
