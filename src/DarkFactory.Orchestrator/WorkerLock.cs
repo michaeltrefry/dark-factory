@@ -1,3 +1,5 @@
+using DarkFactory.Orchestrator.WorkSources;
+
 namespace DarkFactory.Orchestrator;
 
 /// <summary>
@@ -10,6 +12,14 @@ namespace DarkFactory.Orchestrator;
 /// processes (<c>factory work</c> and a <c>factory run</c>) as well as between the runs of one; the OS releases it if its holder dies.
 /// Re-entrant per async flow (<see cref="HoldAsync{T}"/>): a phase holds it, and what the phase calls — the sandbox's own
 /// commands, a seat inside the run — finds it held rather than waiting on itself. Value equality by path.
+/// <para>It is never released under a launch helper a hold started: a helper that has not exited when its phase gives up on it
+/// (it would not stop within the grace) is handed to <see cref="KeepUntil"/>, and the lock file then stays open — against every
+/// run and process — until that helper is gone, since its exit is still to kill every process of the sandbox user.</para>
+/// <para>No wait is silent, and a lock that cannot be had is the factory's failure, not an item's: a wait is reported once it has
+/// lasted <see cref="ReportEvery"/> and again each time that much more has passed (<see cref="WaitReport"/>, with why the last try
+/// failed — .NET reports a held lock and any other I/O error on an existing file alike, so a persistent error is retried and
+/// shows there); a lock file that cannot be opened for another reason (a work root that cannot be made, no access) is a
+/// <see cref="FactoryUnavailableException"/> (E10).</para>
 /// </summary>
 public sealed record WorkerLock(string Path)
 {
@@ -18,6 +28,19 @@ public sealed record WorkerLock(string Path)
     /// <summary>How long a waiter sleeps between tries when the caller names no interval.</summary>
     public static readonly TimeSpan DefaultRetry = TimeSpan.FromMilliseconds(200);
 
+    /// <summary>How long a wait lasts before it is reported, and between its later reports; also between the reports of a lock kept for a helper.</summary>
+    public static readonly TimeSpan ReportEvery = TimeSpan.FromSeconds(30);
+
+    /// <summary>The line a wait of <paramref name="waited"/> for the lock at <paramref name="path"/> is reported with; <paramref name="why"/> is the last try's error.</summary>
+    public static string WaitReport(string path, TimeSpan waited, string why) =>
+        $"[lock] waited {(long)waited.TotalSeconds} s for the sandbox user's lock {path} and still waiting (another run's worker phase holds it, "
+        + $"a launch helper that would not stop is still alive, or the lock file cannot be opened): {why}";
+
+    /// <summary>The line a lock kept for <paramref name="what"/> (<see cref="KeepUntil"/>) is reported with: when its phase ends, and every <see cref="ReportEvery"/> after.</summary>
+    public static string KeptReport(string path, TimeSpan kept, string what) =>
+        $"[lock] the sandbox user's lock {path} stays held, {(long)kept.TotalSeconds} s after its phase ended: {what} is still alive, and its exit "
+        + "kills every process of the sandbox user. No worker phase of any run starts until it is gone; kill it if it never exits.";
+
     /// <summary>The holds of the current async flow, by lock path. A hold that has ended is not one, whoever still carries it.</summary>
     private static readonly AsyncLocal<IReadOnlyList<Hold>?> Flow = new();
 
@@ -25,7 +48,13 @@ public sealed record WorkerLock(string Path)
     {
         public string Path => path;
         public volatile bool Ended;
+
+        /// <summary>What the lock is kept for after the phase (<see cref="KeepUntil"/>).</summary>
+        public List<Kept> Kept { get; } = [];
     }
+
+    /// <summary>Something a hold started that outlives it: the lock stays until <paramref name="Gone"/> completes.</summary>
+    private sealed record Kept(Task Gone, string What, Action<string> Report, TimeSpan Every);
 
     /// <summary>The lock of the work root <paramref name="workRoot"/>.</summary>
     public static WorkerLock For(string workRoot) => new(System.IO.Path.Combine(System.IO.Path.GetFullPath(workRoot), FileName));
@@ -47,26 +76,59 @@ public sealed record WorkerLock(string Path)
     }
 
     /// <summary>
+    /// Keeps the lock past the end of the current flow's hold until <paramref name="gone"/> completes: for a launch helper the hold
+    /// started that is still alive when its phase gives up on it (<paramref name="what"/> names it, with its pid). The hold ends for
+    /// the flow as usual; the lock file stays open, so no other run or process gets the sandbox user, until then. Reported to
+    /// <paramref name="report"/> (standard error when null) when the phase ends and every <paramref name="reportEvery"/>
+    /// (<see cref="ReportEvery"/> when null) after, with <see cref="KeptReport"/>. Answers false, keeping nothing, when the flow
+    /// holds no lock.
+    /// </summary>
+    public bool KeepUntil(Task gone, string what, Action<string>? report = null, TimeSpan? reportEvery = null)
+    {
+        if (Flow.Value?.FirstOrDefault(h => h.Path == Path && !h.Ended) is not { } hold)
+        {
+            return false;
+        }
+        lock (hold.Kept)
+        {
+            hold.Kept.Add(new Kept(gone, what, report ?? Console.Error.WriteLine, reportEvery ?? ReportEvery));
+        }
+        return true;
+    }
+
+    /// <summary>
     /// Runs <paramref name="phase"/> holding the lock, waiting for it (until <paramref name="ct"/> is cancelled) while another run
     /// or process has it. While it waits, <paramref name="whileWaiting"/> runs after every failed try (every <paramref name="retry"/>,
-    /// <see cref="DefaultRetry"/> when null) and may throw to give up the wait — a run honours Pause and Stop there. A flow that
-    /// already holds the lock runs <paramref name="phase"/> at once.
+    /// <see cref="DefaultRetry"/> when null) and may throw to give up the wait — a run honours Pause and Stop there — and the wait
+    /// is reported to <paramref name="report"/> (standard error when null) every <paramref name="reportEvery"/>
+    /// (<see cref="ReportEvery"/> when null) with <see cref="WaitReport"/>. A flow that already holds the lock runs
+    /// <paramref name="phase"/> at once.
     /// </summary>
-    public async Task<T> HoldAsync<T>(Func<Task<T>> phase, CancellationToken ct, Func<CancellationToken, Task>? whileWaiting = null, TimeSpan? retry = null)
+    /// <exception cref="FactoryUnavailableException">The lock file cannot be opened, and not because it is held.</exception>
+    public async Task<T> HoldAsync<T>(Func<Task<T>> phase, CancellationToken ct, Func<CancellationToken, Task>? whileWaiting = null, TimeSpan? retry = null,
+        Action<string>? report = null, TimeSpan? reportEvery = null)
     {
         if (IsHeld)
         {
             return await phase();
         }
-        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path)!);
+        var every = reportEvery ?? ReportEvery;
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var reported = TimeSpan.Zero;
         FileStream file;
         while (true)
         {
             ct.ThrowIfCancellationRequested();
-            if (TryOpen() is { } opened)
+            if (TryOpen(out var why) is { } opened)
             {
                 file = opened;
                 break;
+            }
+            var waited = System.Diagnostics.Stopwatch.GetElapsedTime(started);
+            if (waited - reported >= every)
+            {
+                reported = waited;
+                (report ?? Console.Error.WriteLine)(WaitReport(Path, waited, why));
             }
             if (whileWaiting is not null)
             {
@@ -90,13 +152,58 @@ public sealed record WorkerLock(string Path)
         finally
         {
             hold.Ended = true;
+            Kept[] alive;
+            lock (hold.Kept)
+            {
+                alive = [.. hold.Kept.Where(k => !k.Gone.IsCompleted)];
+            }
+            if (alive.Length == 0)
+            {
+                file.Dispose();
+            }
+            else
+            {
+                // A helper this hold started is still alive: the flow goes on (it has given up on it), the lock does not.
+                _ = ReleaseWhenGoneAsync(file, alive);
+            }
+        }
+    }
+
+    /// <summary>Closes the lock file once everything in <paramref name="alive"/> is gone, reporting each meanwhile (never silent).</summary>
+    private async Task ReleaseWhenGoneAsync(FileStream file, Kept[] alive)
+    {
+        try
+        {
+            await Task.WhenAll(alive.Select(async kept =>
+            {
+                var started = System.Diagnostics.Stopwatch.GetTimestamp();
+                while (true)
+                {
+                    try
+                    {
+                        kept.Report(KeptReport(Path, System.Diagnostics.Stopwatch.GetElapsedTime(started), kept.What));
+                    }
+                    catch (Exception)
+                    {
+                        // A report that cannot be written neither releases the lock early nor keeps it for ever.
+                    }
+                    if (await Task.WhenAny(kept.Gone, Task.Delay(kept.Every)) == kept.Gone)
+                    {
+                        return;
+                    }
+                }
+            }));
+        }
+        finally
+        {
             file.Dispose();
         }
     }
 
     /// <summary><see cref="HoldAsync{T}"/> for a phase with no result.</summary>
-    public Task HoldAsync(Func<Task> phase, CancellationToken ct, Func<CancellationToken, Task>? whileWaiting = null, TimeSpan? retry = null) =>
-        HoldAsync(async () => { await phase(); return true; }, ct, whileWaiting, retry);
+    public Task HoldAsync(Func<Task> phase, CancellationToken ct, Func<CancellationToken, Task>? whileWaiting = null, TimeSpan? retry = null,
+        Action<string>? report = null, TimeSpan? reportEvery = null) =>
+        HoldAsync(async () => { await phase(); return true; }, ct, whileWaiting, retry, report, reportEvery);
 
     /// <summary>
     /// Runs <paramref name="phase"/> holding the lock if it is free now (or this flow holds it already) and answers true; answers
@@ -109,8 +216,7 @@ public sealed record WorkerLock(string Path)
             await phase();
             return true;
         }
-        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path)!);
-        if (TryOpen() is not { } file)
+        if (TryOpen(out _) is not { } file)
         {
             return false;
         }
@@ -125,24 +231,34 @@ public sealed record WorkerLock(string Path)
     public static IDisposable Acquire(string workRoot)
     {
         var workerLock = For(workRoot);
-        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(workerLock.Path)!);
-        return workerLock.TryOpen() ?? throw new InvalidOperationException(
+        return workerLock.TryOpen(out _) ?? throw new InvalidOperationException(
             $"Another factory run is using {workRoot} ({workerLock.Path} is locked): a worker phase of it holds the sandbox user.");
     }
 
-    /// <summary>The lock file opened exclusively, or null while another holder has it.</summary>
-    private FileStream? TryOpen()
+    /// <summary>
+    /// The lock file opened exclusively, or null while another holder has it (<paramref name="why"/>: the error that says so). Any
+    /// other failure — the work root cannot be made, the file cannot be created or opened — is the factory's
+    /// (<see cref="FactoryUnavailableException"/>): no run can use the sandbox user until it is fixed, and no item is to blame.
+    /// </summary>
+    private FileStream? TryOpen(out string why)
     {
+        why = "";
         try
         {
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path)!);
             // FileShare.None is an exclusive, non-blocking flock on Unix.
             return new FileStream(Path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
         }
-        catch (IOException) when (File.Exists(Path))
+        catch (IOException ex) when (File.Exists(Path))
         {
             // Held: by another run's worker phase, which ends. .NET reports a held lock and any other I/O error on an existing
-            // file alike, so every one is tried again.
+            // file alike, so every one is tried again, and the wait's report carries the error.
+            why = ex.Message;
             return null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException or System.Security.SecurityException)
+        {
+            throw new FactoryUnavailableException($"the sandbox user's lock: {Path} cannot be opened ({ex.GetType().Name}: {ex.Message})", ex);
         }
     }
 }

@@ -111,6 +111,9 @@ public sealed partial class RunPipeline(
     /// asked once more before the phase starts. The run's first worker phase starts with the sandbox set-up every run shares
     /// (<c>enterSandbox</c>: the readiness probe and the sweep of leftover worktrees, both through the launch helper and so under
     /// the lock; a failure there is the factory's, <see cref="FactoryUnavailableException"/>). A phase inside a phase runs at once.
+    /// The wait is logged when it starts and again every <see cref="WorkerLock.ReportEvery"/> (with why the lock could not be
+    /// had), and a lock file that cannot be opened at all is the factory's failure too (<see cref="WorkerLock.HoldAsync{T}"/>:
+    /// the item, already claimed, is left where it is, E10).
     /// </summary>
     private async Task<T> InWorkerPhaseAsync<T>(WorkItem? item, string what, Func<Task<T>> phase, CancellationToken ct)
     {
@@ -160,7 +163,7 @@ public sealed partial class RunPipeline(
                     throw new ControlRequestedException(ControlState.Paused) { ControlsUnreadable = $"{ex.GetType().Name}: {ex.Message}" };
                 }
             }
-        }, _controlPoll);
+        }, _controlPoll, report: log.WriteLine);
     }
 
     private Task InWorkerPhaseAsync(WorkItem? item, string what, Func<Task> phase, CancellationToken ct) =>

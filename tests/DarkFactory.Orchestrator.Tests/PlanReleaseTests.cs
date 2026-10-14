@@ -1393,7 +1393,10 @@ public class PlanRunnerLockTests
         // Another run's worker phase holds the sandbox user's lock for the whole test: a run that needed it would wait for ever.
         using var held = WorkerLock.Acquire(root);
 
-        var evaluated = await FactoryRunner.RunAsync(options, source, 500, ignoreScope: false, TextWriter.Null, CancellationToken.None);
+        // The installed helper is the current one (every run's start checks that, reading it; a stub that could run nothing): the
+        // run's lock is the work root's, held by the other run throughout.
+        var evaluated = await FactoryRunner.RunAsync(options, source, 500, ignoreScope: false, TextWriter.Null, CancellationToken.None, adjustGate: null,
+            testSandbox: SandboxSupport.StubSandbox(root, WorkerLock.For(root)));
 
         // Evaluated without the lock: the story nothing blocks was released.
         Assert.Equal((WorkState.Planned, (string?)null), (evaluated.State, evaluated.Error));

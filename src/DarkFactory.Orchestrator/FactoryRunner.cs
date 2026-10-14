@@ -262,8 +262,9 @@ public static class FactoryRunner
         RunAsync(options, source, storyId, ignoreScope, log, ct, null);
 
     /// <param name="adjustGate">Acceptance harness only: wraps the production gate stage (e.g. to push after the verdict).</param>
+    /// <param name="testSandbox">Tests only: the sandbox in place of the configured one (a fake helper that is the current one for itself).</param>
     internal static async Task<RunOutcome> RunAsync(FactoryOptions options, IWorkSource source, int storyId, bool ignoreScope, TextWriter log,
-        CancellationToken ct, Func<GateStage, GateStage>? adjustGate)
+        CancellationToken ct, Func<GateStage, GateStage>? adjustGate, WorkerSandbox? testSandbox = null)
     {
         // Resolve every credential before touching the ledger so a missing one fails fast.
         var routerKey = options.RouterKey;
@@ -272,12 +273,15 @@ public static class FactoryRunner
         var gateAppId = options.GitHubGateAppId;
         var gateAppKey = options.GitHubGateAppPrivateKeyPem;
         options.RejectReviewModelSettings();
-        var sandbox = options.WorkerSandbox;
+        var sandbox = testSandbox ?? options.WorkerSandbox;
         var pauseGrace = options.PauseGrace;
         var freezeOptions = options.Freeze;
         var stuck = options.StuckDetection;
         var maxControlReadFailures = options.MaxControlReadFailures;
 
+        // Before the ledger or the board is touched: an installed helper that is not the current one fails the factory here, with
+        // nothing claimed or recorded (the rest of the readiness check runs the helper, so it waits for the first worker phase).
+        await EnsureHelperCurrentAsync(sandbox, ct);
         await FactoryWide("the ledger", async () => { await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct); return true; });
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
         var ledger = new WorkLedger(db, TimeProvider.System);
@@ -428,6 +432,35 @@ public static class FactoryRunner
     internal static Task EnsureSandboxReadyAsync(WorkerSandbox sandbox, WorkerAuth auth, string claudePath, CancellationToken ct) =>
         FactoryWide("the worker sandbox", async () => { await sandbox.EnsureReadyAsync(auth, claudePath, ct); return true; });
 
+    /// <summary>
+    /// The part of the readiness check that runs no helper (<see cref="WorkerSandbox.EnsureHelperCurrentAsync"/>: the installed
+    /// launch helper is readable and the current one), a factory-wide failure (E10). Needs no lock and kills nothing, so it runs
+    /// where nothing has been claimed yet: at <c>factory work</c>'s start-up (<see cref="CheckHelperAsync"/>) and at the start of
+    /// every run. Nothing to check unsandboxed.
+    /// </summary>
+    internal static Task EnsureHelperCurrentAsync(WorkerSandbox? sandbox, CancellationToken ct) => sandbox is null
+        ? Task.CompletedTask
+        : FactoryWide("the worker sandbox", async () => { await sandbox.EnsureHelperCurrentAsync(ct); return true; });
+
+    /// <summary>
+    /// <c>factory work</c>'s start-up check of the launch helper: why the installed one cannot be used (missing, unreadable or not
+    /// the current <c>scripts/factory-worker-launch</c>, with the command that installs it), or null. It reads the file and runs
+    /// nothing — the helper's exit kills every process of the worker user, so the probe and the worker user's Claude Code version
+    /// are checked in the first worker phase, under the sandbox user's lock.
+    /// </summary>
+    public static async Task<string?> CheckHelperAsync(WorkerSandbox? sandbox, CancellationToken ct)
+    {
+        try
+        {
+            await EnsureHelperCurrentAsync(sandbox, ct);
+            return null;
+        }
+        catch (FactoryUnavailableException ex)
+        {
+            return ex.InnerException?.Message ?? ex.Message;
+        }
+    }
+
     /// <summary>Runs a set-up step every item shares; its failure is the factory's, not the item's (E10).</summary>
     private static async Task<T> FactoryWide<T>(string what, Func<Task<T>> step)
     {
@@ -529,8 +562,25 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
             throw new FactoryUnavailableException($"the issue triage: {refusal}", new InvalidOperationException(refusal));
         }
         // The whole seat is the sandbox user's: the probe, the sweeps (deletions as that user), the session, the worktree's removal.
-        // A triage is not an item's run and no control interrupts one, so the wait ends only with the lock or the host.
-        return await sandbox.Lock!.HoldAsync(() => RunLockedAsync(sandbox, routerKey, item, repo, prompt, onSession, onTaint, ct), ct);
+        // The wait for it is never blind: logged when it starts and every WorkerLock.ReportEvery after, ended by the host's
+        // shutdown, and ended too once a control holds the issue's item (a Pause of the factory or the item, the usage pause, the
+        // freeze, a Stop — what the intake checks before it starts a triage): the triage is then put off, not failed
+        // (TriageDeferredException), and the intake takes the issue up again on a later poll.
+        var controls = FactoryRunner.Controls(options);
+        var waiting = false;
+        return await sandbox.Lock!.HoldAsync(() => RunLockedAsync(sandbox, routerKey, item, repo, prompt, onSession, onTaint, ct), ct, async c =>
+        {
+            if (!waiting)
+            {
+                waiting = true;
+                log.WriteLine($"[lock] {item.ExternalId}: its triage is waiting for the sandbox user (another run's worker phase holds {sandbox.Lock.Path})");
+            }
+            if (await controls.EffectiveAsync(item.ExternalId, null, c) is var state and not ControlState.Running)
+            {
+                throw new Issues.TriageDeferredException(
+                    $"the triage of {item.ExternalId} was waiting for the sandbox user when a control ({state}) held it; it is taken up again once nothing does");
+            }
+        }, RunPipeline.DefaultControlPollInterval, report: log.WriteLine);
     }
 
     private async Task<WorkerResult> RunLockedAsync(WorkerSandbox sandbox, string routerKey, WorkItem item, RepoRef repo, string prompt,

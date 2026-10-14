@@ -193,8 +193,9 @@ printf 'add-generic-password -U -s dark-factory -a router-key -w %s\n' "$(pbpast
 #    scripts/factory-worker-launch: `factory run`/`work` refuse to start unless the installed helper is the
 #    repo's (same SHA-256 once setup's sandbox_user/sandbox_uid lines are undone, helper_version >= 3):
 #    "Stale helper: the installed launch helper ... is not the current scripts/factory-worker-launch (...);
-#    re-run `sudo scripts/setup-worker-user.sh` to install it". They also refuse a helper that skips its
-#    _factory uid sweep ("... refuses its _factory uid sweep ...").
+#    re-run `sudo scripts/setup-worker-user.sh` to install it" (the file is read, not run, at start-up). A
+#    helper that skips its _factory uid sweep ("... refuses its _factory uid sweep ...") is found by the probe
+#    that runs it, in a run's first worker phase: it fails the factory there, not the item.
 sudo scripts/setup-worker-user.sh
 
 # 5. Worker model auth. Default Worker__Auth=router-key: the worker holds no Anthropic/OpenAI credential,

@@ -56,6 +56,15 @@ public interface IRepoWorkspace
     Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null);
 
     /// <summary>
+    /// Whether something is where <paramref name="branch"/>'s worktree goes — a worktree, or any directory a clean-up left behind
+    /// (sc-25988: one that found the sandbox user busy). <see cref="PrepareAsync"/> and <see cref="RestoreAsync"/> replace it, and
+    /// sandboxed that starts with its deletion as the worker user: a run of the launch helper, so a worker phase. With nothing
+    /// there they run no helper.
+    /// </summary>
+    async Task<bool> HasLeftoverAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) =>
+        await ReopenAsync(repo, branch, ct, baseBranch) is not null;
+
+    /// <summary>
     /// Fetches, and says where <paramref name="branch"/> (a <c>factory/*</c> name) would start: the default branch and its head,
     /// and the branch's head on origin when it exists already. Reads only.
     /// </summary>
@@ -373,9 +382,18 @@ public sealed class GitWorkspace(
         {
             // The lock is released by now (the using above ends before this runs), so the directory is again deleted outside it.
             // A wait for the lock that was cancelled or failed made nothing to clean up (and must not wait for the lock here).
-            await DeleteWorktreeAsync(clone, worktree, CancellationToken.None);
+            // Sandboxed, the deletion is a run of the launch helper, and this clean-up cannot be cancelled: it never waits for the
+            // sandbox user (sc-25988) — inside a worker phase it has it; outside one (the merge queue's base update) it deletes
+            // only if the user is free now, and otherwise leaves the directory to the next sweep or this item's next worktree.
+            await DeleteWorktreeAsync(clone, worktree, CancellationToken.None, waitForWorker: false);
             throw;
         }
+    }
+
+    public Task<bool> HasLeftoverAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null)
+    {
+        EnsureFactoryBranch(branch);
+        return Task.FromResult(Directory.Exists(WorktreePath(repo, branch)));
     }
 
     private static readonly System.Text.RegularExpressions.Regex RunWorktreeName = new("^[a-z0-9][a-z0-9-]*$");
@@ -954,9 +972,16 @@ public sealed class GitWorkspace(
     /// list, so it runs under the clone's lock, taken here (the directory is deleted before it: a slow delete holds up no other run;
     /// <see cref="ReplaceWorktreeAsync"/> deletes before its hold too, so no directory is ever deleted under a clone's lock).
     /// </summary>
-    private async Task DeleteWorktreeAsync(string clone, string worktree, CancellationToken ct)
+    /// <param name="waitForWorker">
+    /// False: the worker user's deletion is not waited for (<see cref="IWorkerSandbox.TryDeleteAsWorkerAsync"/>) — with that user
+    /// busy, nothing is deleted or pruned and the directory stays for a later sweep.
+    /// </param>
+    private async Task DeleteWorktreeAsync(string clone, string worktree, CancellationToken ct, bool waitForWorker = true)
     {
-        await DeleteDirectoryAsync(worktree, ct);
+        if (!await DeleteDirectoryAsync(worktree, ct, waitForWorker))
+        {
+            return;
+        }
         if (Directory.Exists(Path.Combine(clone, ".git")))
         {
             using var cloneLock = await LockAsync(clone, ct);
@@ -964,19 +989,28 @@ public sealed class GitWorkspace(
         }
     }
 
-    private async Task DeleteDirectoryAsync(string worktree, CancellationToken ct)
+    /// <summary>Deletes the directory, as the worker user first; false when that user is busy and <paramref name="waitForWorker"/> is false (nothing deleted).</summary>
+    private async Task<bool> DeleteDirectoryAsync(string worktree, CancellationToken ct, bool waitForWorker = true)
     {
         if (Directory.Exists(worktree))
         {
             if (sandbox is not null)
             {
-                await sandbox.DeleteAsWorkerAsync(worktree, ct);
+                if (waitForWorker)
+                {
+                    await sandbox.DeleteAsWorkerAsync(worktree, ct);
+                }
+                else if (!await sandbox.TryDeleteAsWorkerAsync(worktree, ct))
+                {
+                    return false;
+                }
             }
             if (Directory.Exists(worktree))
             {
                 Directory.Delete(worktree, recursive: true);
             }
         }
+        return true;
     }
 
     private static void EnsureFactoryBranch(string branch)

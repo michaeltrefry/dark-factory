@@ -197,7 +197,27 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
             // Unsandboxed, a program that is not installed fails at start; sandboxed, the helper exits 127 for it.
             return (127, $"{step.Program} could not be started: {e.Message}", false, null);
         }
-        using var process = started;
+        try
+        {
+            return await RunStartedAsync(started, step, remaining, ct);
+        }
+        finally
+        {
+            if (sandbox is null)
+            {
+                started.Dispose();
+            }
+            else
+            {
+                // Exited, or stopped and waited for (StopAsync): disposed now. A helper still alive keeps the sandbox user's lock
+                // until it is gone (sc-25988): its exit still kills every process of the worker user.
+                await sandbox.EndAsync(started, TimeSpan.Zero);
+            }
+        }
+    }
+
+    private async Task<(int ExitCode, string Output, bool TimedOut, string? Captured)> RunStartedAsync(Process process, TestStep step, TimeSpan remaining, CancellationToken ct)
+    {
         var output = new Tail();
         var capture = step.CaptureOutput is null ? null : new Capture(maxResultFileBytes);
         var stdout = PumpAsync(process.StandardOutput, output, capture);
@@ -253,15 +273,9 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSandbox? sandbox, 
             return;
         }
         WorkerSandbox.Stop(process);
-        using var grace = new CancellationTokenSource(StopGrace);
-        try
-        {
-            await process.WaitForExitAsync(grace.Token);
-        }
-        catch (OperationCanceledException)
-        {
-            // Still running as the worker user: the next helper exit (the worktree's deletion) kills it.
-        }
+        // If it is still running as the worker user after the grace: the next helper exit (the worktree's deletion, under the same
+        // hold of the lock) kills it, and until it is gone the lock is kept (WorkerSandbox.EndAsync).
+        await WorkerSandbox.ExitsWithinAsync(process, StopGrace);
     }
 
     private static async Task PumpAsync(StreamReader reader, Tail tail, Capture? capture = null)

@@ -236,13 +236,20 @@ never signals pid or group 0 or 1 or an empty target. So `_factory` is
 single-tenant: whatever runs through the helper holds the sandbox user's lock (`WorkerLock`, `<work root>/.factory-run.lock`) for
 that phase — one worker phase per machine at a time, not one run ("Worker phases", sc-25988, under the invariants). Run
 `sudo scripts/setup-worker-user.sh` once, and again after any change to `scripts/factory-worker-launch`: it installs
-the helper with `sandbox_user` and `sandbox_uid` set (setup refuses a worker uid outside 400-499). `EnsureReadyAsync`
-reads the installed helper first and fails start-up with `Stale helper: … re-run \`sudo scripts/setup-worker-user.sh\``
-unless it has `helper_version` ≥ `WorkerSandbox.HelperVersion` (3) and, with those two lines undone, the SHA-256 of the
-repo's helper (compiled into the orchestrator as a resource); then it probes with the real router variable names
+the helper with `sandbox_user` and `sandbox_uid` set (setup refuses a worker uid outside 400-499). The readiness check has
+two parts (sc-25988), because a run of the helper kills every `_factory` process and so belongs under the sandbox user's lock.
+What start-up checks, running nothing and taking no lock (`WorkerSandbox.EnsureHelperCurrentAsync`): the installed helper is
+read and must have `helper_version` ≥ `WorkerSandbox.HelperVersion` (3) and, with those two lines undone, the SHA-256 of the
+repo's helper (compiled into the orchestrator as a resource) — else `Stale helper: … re-run \`sudo scripts/setup-worker-user.sh\``
+(or `cannot read the launch helper …`). `factory work` and `factory run` refuse to start on it (`FactoryRunner.CheckHelperAsync`,
+in `Program`: the reason, exit 2, before the router check and before the first poll), and every run checks it again first of all
+(`FactoryRunner.RunAsync`, a `FactoryUnavailableException` before the ledger is opened or the board asked: nothing is claimed
+or recorded, and the intake loop ends the poll). What is deferred to a run's first worker phase, and to each triage, under the
+lock (`EnsureReadyAsync`, which starts with the same read): the probe with the real router variable names
 (allowlist `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_AUTH_TOKEN`; `ANTHROPIC_CUSTOM_HEADERS` may come on several
-stdin lines, one header each, which the helper joins with line breaks — helper_version 3, sc-25659) and fails if the probe's stderr
-has a uid-sweep refusal; last it runs `<Worker:ClaudePath> --version` as `_factory` through the helper and fails start-up with
+stdin lines, one header each, which the helper joins with line breaks — helper_version 3, sc-25659), which fails if the helper
+refuses a variable, the user is not usable or the probe's stderr has a uid-sweep refusal; and last `<Worker:ClaudePath> --version`
+as `_factory` through the helper, failing with
 `Upgrade _factory's claude: …` (and the `claude update` command) below `WorkerSandbox.MinClaudeVersion` (2.1.291, the release
 the triage confinement — `--setting-sources ""`, `blockReadsOutsideWorkingDirectories`, `dontAsk` — was checked against; an
 older CLI may silently ignore a setting it does not know). Setup also reports, without failing, whether `cargo` and `rustc`
@@ -868,7 +875,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   orchestrator, not a person, releases a plan's stories. `RunPipeline.InFlightAsync` lists every `Planned` plan item (unless a
   control pauses it, or its closeout was given up on, below), so each intake poll — and a `factory run` on it — evaluates it
   through `HoldAsync` → `PlannedAsync`, under the item's run lock and with no worker: like every run outside its worker phases
-  (sc-25988) it takes no sandbox lock, probes no sandbox and sweeps no worktree, so it is evaluated while another run's worker
+  (sc-25988) it takes no sandbox lock, runs no helper (only the read of the installed helper every run starts with: a stale
+  one fails it factory-wide like any run) and sweeps no worktree, so it is evaluated while another run's worker
   holds the sandbox user (`PlanRunnerLockTests`, against Postgres). A Stop it finds is finished by that run: the stop of a planner a
   crashed run left (sandboxed: a kill of every `_factory` process) is a worker phase, waited for.
   The plan's stories are the ids of its newest `plan-stories` row. Blockers read (cost rule): a story with no Merge row and no
@@ -1356,7 +1364,19 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `EnsureReadyAsync` — the probe and `claude --version` —, `StopAllAsync`, the pgrep included, and `DeleteAsWorkerAsync`, so every
   worktree, seat and sweep deletion of `GitWorkspace`; never under a clone's lock, so no lock-order cycle), as do
   `ClaudeWorker.RunAsync` (a whole session) and `SandboxTestRunner.RunAsync` (a whole run: worktree, steps, deletion) — each at
-  once when its caller's phase already holds it. The phases a run holds it for (`InWorkerPhaseAsync`), so that nothing else runs
+  once when its caller's phase already holds it. The lock covers the whole life of every helper process, not only the phase
+  that started it: whoever starts one ends it with `WorkerSandbox.EndAsync` (the sandbox's short commands, a worker session, a
+  gate test step), which closes its stdin, waits for its exit on no cancellation token — up to `WorkerSandbox.StopGrace`
+  (10 s) for a short command, so one cancelled mid-way (a Pause or Stop during a test worktree's deletion, a shutdown) does not
+  return while its helper is still killing and sweeping — and, if the helper is still alive then, keeps the lock for it
+  (`WorkerLock.KeepUntil`): the flow's hold ends and the run goes on (escalates, pauses, stops), but the lock file stays open,
+  against every run and process, until that helper has exited. A session whose helper would not stop within the worker's stop
+  grace is first stopped the way a crashed run's leftover is — `ClaudeWorker.StopAsync` runs `WorkerSandbox.StopAllAsync` under
+  the still-held lock (a second run of the helper, whose exit kills every `_factory` process, the first helper among them) and
+  waits once more — and is marked `WorkerStillRunning` only if it is alive even then. A lock kept this way is never silent:
+  `[lock] the sandbox user's lock … stays held, N s after its phase ended: a launch helper run as _factory (sudo pid P) … is
+  still alive …; kill it if it never exits` on standard error when the phase ends and every `WorkerLock.ReportEvery` (30 s)
+  after; runs waiting on it wait as on any holder, honouring Pause and Stop (below). The phases a run holds it for (`InWorkerPhaseAsync`), so that nothing else runs
   as the sandbox user between a session and its push: Implement, from the orphan's stop to the worktree's removal (the worktree,
   the session, commit and push, the PR's opening); a fix round (review, CI, conflict) likewise; a plan item's planner seat
   (orphan stop, sweeps, checkouts, session, removal; `SandboxPlanRunner` takes it too); the gate's new-tests runs
@@ -1368,14 +1388,40 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (Paused `user-paused`/`usage-paused`/`freeze-paused`, or the stop), controls unreadable more than `Controls:MaxReadFailures`
   times in a row pause it (`controls-unreadable`, E2) — and once it has the lock the controls and the freeze evaluator are asked
   again before the phase starts. So `factory run` beside `factory work` no longer fails at start with "another factory run": it
-  runs, and waits at a worker phase. A stop's wait (the orphan's kill) and a triage's are not control-aware (a stop is not held
-  up by a control; nothing interrupts a triage). The run's first worker phase starts, under the lock, with the set-up every run
+  runs, and waits at a worker phase. No wait for the lock is silent or endless by accident (`WorkerLock.HoldAsync`): beside the
+  line a run logs when its wait starts, every wait — a run's, a triage's, a stop's, a sandbox command's own — is reported again
+  every `WorkerLock.ReportEvery` (30 s) with why the last try failed (`[lock] waited N s for the sandbox user's lock … and still
+  waiting …: <error>`; a run's and a triage's to their log, the others to standard error), so an I/O error that does not go
+  away, which .NET cannot tell from "held" on an existing file and which is therefore retried, shows; and a lock file that
+  cannot be opened for any other reason (a work root that cannot be made, no access) is a `FactoryUnavailableException`
+  (`the sandbox user's lock: … cannot be opened`), thrown by the lock itself wherever it is taken: the item, already claimed and
+  at its worker phase, is left where it is and nothing is recorded against it (E10). The two waits outside a run: a triage's
+  (`SandboxTriageRunner`) logs `[lock] gh-N: its triage is waiting for the sandbox user …`, ends with the host, and reads its
+  item's controls every `RunPipeline.DefaultControlPollInterval` — once one holds the item (a Pause of the factory or the item,
+  the usage pause, the freeze, a Stop: what the intake checks before it starts a triage) the triage is put off with
+  `TriageDeferredException`, which `IssueIntake` treats as "not this poll" (logged; no failure counted, nothing recorded,
+  the issue read again next poll); a stop's wait for the orphan's kill (`StopIdleAsync`) logs `[lock] a stop: waiting …`, ends
+  on cancellation and is deliberately not control-aware (a stop is not held up by a control: there is nothing a Pause could
+  mean for it). The run's first worker phase starts, under the lock, with the set-up every run
   shares (`FactoryRunner`'s `enterSandbox`): `EnsureReadyAsync`, then the sweep of worktrees no run will resume — a failure there
   is the factory's (`FactoryUnavailableException`: nothing recorded against the item); a run with no worker phase does neither.
   Clean-up outside a phase (an escalation's or a stop's worktree, the merge queue's base-update worktree:
   `RunPipeline.RemoveWorktreeAsync`) deletes only if the lock is free now (`TryHoldAsync`) — a run does not hold its item, or its
   repository's queue turn, for another run's whole session to throw a directory away; left behind (`[cleanup] the sandbox user is
   busy …`), it is deleted by the sweep the next worker phase of any run starts with, or replaced by the item's next worktree.
+  The rule for every path that can reach a deletion as the worker user (`GitWorkspace` → `IWorkerSandbox.DeleteAsWorkerAsync`)
+  outside a worker phase: it is either a control-aware phase wait or a try that leaves the directory. The paths: (1) the merge
+  queue's base update (`UpdateFromBaseAsync`) restores the item's own `factory-<id>` worktree — with nothing there
+  (`IRepoWorkspace.HasLeftoverAsync` false: the directory does not exist) a fresh worktree runs no helper, so the restore takes
+  no lock; with a leftover there (an earlier pass's clean-up found the sandbox user busy) replacing it deletes it as the worker
+  user first, so the restore is a worker phase (`[lock] sc-N: waiting for the sandbox user to replace its leftover worktree`,
+  ended by a Pause, a Stop or the freeze like any); (2) that update's, an escalation's and a stop's removal: `TryHoldAsync`,
+  above; (3) the clean-up of a worktree whose creation failed under the clone's lock (`GitWorkspace.ReplaceWorktreeAsync`, any
+  caller, on no cancellation token) never waits for the worker user (`IWorkerSandbox.TryDeleteAsWorkerAsync`: inside a phase it
+  has the lock; outside, busy, it leaves the directory — a leftover for (1) or the sweep). Everything else that deletes as the
+  worker user is inside a hold: Implement's and a fix round's Prepare/Restore/Reopen/Remove, the planner's seat (its
+  `PrepareSeatAsync`/`RemoveSeatAsync` and their failure clean-up), a triage's worktree, the gate's test worktrees
+  (`PrepareCommitAsync`, removal), and the three sweeps (a run's at its first worker phase, the triage's, the planner's).
   Dispatch (`IntakeLoop`): a poll lists every lane, then runs its items — each lane's in-flight ones (stops first), then its
   ready ones, each once — with up to `Intake:MaxConcurrentRuns` dispatchers, and ends when its runs have; with 1 (the default)
   it is the serial loop it was. Claims are renewed in the listing, once per poll and lane, before any run of the poll starts
@@ -1384,17 +1430,27 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   lane and no further in-flight item of its lane is started; after a factory-wide failure nothing is; runs already started
   finish by themselves, each checking the freeze, the usage pause and its controls before every step. Residuals, accepted until the sandbox has several users (later Phase 4b stories): (a) one
   sandbox user means one worker phase at a time — a run whose turn in a repository's merge queue needs the new-tests runs, or
-  finds a leftover of its own worktree to replace, waits for another run's session and holds that turn meanwhile; (b) a worker
-  that would not stop when its phase ended (`WorkerStillRunning`) outlives the hold, as it outlived the run before: its helper's
-  eventual exit kills whatever runs as `_factory` then; (c) worktrees are still shared with the one user by ACL, so a worker can
+  finds a leftover of its own worktree to replace, waits for another run's session and holds that turn meanwhile (both waits
+  honour Pause, Stop and the freeze); (b) a helper that never exits (wedged in sudo, say, where the second helper run cannot
+  reach it) keeps the lock, and so every worker phase of every run, until someone kills it — by design: its exit would kill
+  whatever ran as `_factory` then; the periodic `[lock] … stays held … (sudo pid P)` line names it, and waiting runs can be
+  paused or stopped; (c) worktrees are still shared with the one user by ACL, so a worker can
   write another item's kept worktree, as it could between runs before (per-slot directories are a later story); (d) the
   acceptance harness (`E2e`) still takes the configured work root's lock for its whole life (`WorkerLock.Acquire`, the one
-  fail-fast taker), so a real `factory work` beside it waits at its worker phases rather than failing. Tests: `WorkerLockTests`;
+  fail-fast taker), so a real `factory work` beside it waits at its worker phases rather than failing; (e) the CI fixer's
+  prompt reads the failing checks from GitHub once inside its phase (one bounded read under the lock, not CI's polling).
+  Tests: `WorkerLockTests` (also: a kept lock, its reports, a wait's report, a lock that cannot be opened);
   `LockScopeTests` (a probe on every call the pipeline makes of its worker, workspaces, test runner, reviewers and GitHub: the
   sandbox calls all hold the lock, the review, CI and merge calls never do; two runs overlapping; waits honouring Pause, Stop
-  and the freeze; the source scan that production builds a sandbox in one place and starts the helper only through `Start`);
+  and the freeze; a worker that would not stop keeping every other run's session out until its helper is gone; a base update,
+  a conflict fix round and a CI fix round through the simulated repository of `MergeQueueTests` — the one restore allowed
+  without the lock is the base update's with no leftover, and over a leftover it waits, logged, honouring Pause, Stop and the
+  freeze; the source scan that production builds a sandbox in one place and starts the helper only through `Start`);
   `WorkerSandboxTests`/`SandboxReadinessTests` (a sudo stand-in that asks the OS, from its own process, whether the lock file is
-  locked at every helper run: `SandboxSupport.LockProbingSudo`); `PlanTests` (the planner's seat); `IntakeDispatchTests`.
+  locked at every helper run: `SandboxSupport.LockProbingSudo`; a wedged "helper" stopped by the second helper run, one that
+  will not exit keeping the lock until it does, a cancelled command waited for while it sweeps; the start-up check reading the
+  helper with the lock held elsewhere); `GitWorkspaceTests` (the failed worktree's clean-up never waiting); `IntakeLoopTests`
+  (a run's stale-helper refusal before the ledger; a triage's wait); `PlanTests` (the planner's seat); `IntakeDispatchTests`.
 - Clean-up under overlapping runs (Phase 4b, sc-25987; `Ledger/LiveRuns.cs`, `Git/CloneLock.cs`): no sweep decides from "no other run exists".
   Whose a leftover is: it carries its item in its name — a worktree directory by `ItemNaming.OwnerOfLeftover` (`factory-<item>`,
   the changeset worktree `factory-changeset-<item>`, a triage's `factory-triage-<item>`, a planner's worktree or seat

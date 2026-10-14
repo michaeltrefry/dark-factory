@@ -619,19 +619,95 @@ public class IntakeLoopTests
             ["GitHub:Gate:AppId"] = "2",
             ["GitHub:Gate:PrivateKeyPem"] = "gate-pem",
             ["Factory:WorkRoot"] = root,
-            // The run's first set-up step: a ledger nothing listens on (never the compose Postgres).
+            // A ledger nothing listens on (never the compose Postgres).
             ["ConnectionStrings:Ledger"] = "Host=127.0.0.1;Port=1;Database=none;Username=none;Password=none;Timeout=2",
-            // Never reached, and never the real sandbox user or helper.
+            // Never run, and never the real sandbox user or helper.
             ["Worker:RunAs"] = "df-test-no-such-user",
             ["Worker:LaunchHelper"] = "/nonexistent/df-test-helper",
         }).Build(), new InMemorySecrets());
 
         // Another run's worker phase holding the sandbox user is no failure any more (sc-25988: a run waits for it, at its own
-        // worker phase); what every item still shares is the set-up, e.g. the ledger.
+        // worker phase); what every item still shares is the set-up.
         using var held = WorkerLock.Acquire(root);
+        var source = GoneStory();
+        // First, the installed launch helper — read, never run, and with no lock (it is held here): one that is missing or not the
+        // current one fails the factory before the ledger is opened or the board asked for anything, so nothing is claimed.
+        var noHelper = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
+            FactoryRunner.RunAsync(options, source, 101, ignoreScope: false, TextWriter.Null, CancellationToken.None));
+        Assert.StartsWith("the worker sandbox: Worker sandbox unavailable: cannot read the launch helper /nonexistent/df-test-helper", noHelper.Message);
+        Assert.True(IntakeLoop.IsFactoryWide(noHelper));
+        var stale = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
+            FactoryRunner.RunAsync(options, source, 101, ignoreScope: false, TextWriter.Null, CancellationToken.None, adjustGate: null,
+                testSandbox: SandboxSupport.StubSandbox(root, WorkerLock.For(root), installed: t => t.Replace($"helper_version={Worker.WorkerSandbox.HelperVersion}", "helper_version=1"))));
+        Assert.StartsWith("the worker sandbox: Stale helper: ", stale.Message);
+        Assert.Contains("re-run `sudo scripts/setup-worker-user.sh`", stale.Message);
+        Assert.Equal((0, 0), (source.Writes.Count, source.Comments.Count));
+
+        // With the current helper installed: the ledger.
         var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
-            FactoryRunner.RunAsync(options, GoneStory(), 101, ignoreScope: false, TextWriter.Null, CancellationToken.None));
+            FactoryRunner.RunAsync(options, source, 101, ignoreScope: false, TextWriter.Null, CancellationToken.None, adjustGate: null,
+                testSandbox: SandboxSupport.StubSandbox(root, WorkerLock.For(root))));
         Assert.StartsWith("the ledger: ", ex.Message);
         Assert.True(IntakeLoop.IsFactoryWide(ex));
+    }
+
+    /// <summary>
+    /// sc-25988: the production triage runner waits for the sandbox user like a run's worker phase — never blind. Against the
+    /// compose Postgres (its controls; skips locally without it); the worker user and helper do not exist and nothing is run:
+    /// the sandbox user's lock is held by another run for the whole test.
+    /// </summary>
+    [Fact]
+    public async Task A_triage_waiting_for_the_sandbox_user_says_so_and_is_put_off_once_a_control_holds_its_item_or_ends_with_the_host()
+    {
+        await using var temp = await TempPostgresDatabase.CreateAsync("df_triage");
+        await LedgerMigrations.MigrateAsync(temp.ConnectionString, CancellationToken.None);
+        var root = Directory.CreateTempSubdirectory("df-triage-lock-").FullName;
+        var options = new FactoryOptions(new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Router:Key"] = "rk",
+            ["Factory:WorkRoot"] = root,
+            ["ConnectionStrings:Ledger"] = temp.ConnectionString,
+            // Never run, and never the real sandbox user or helper.
+            ["Worker:RunAs"] = "df-test-no-such-user",
+            ["Worker:LaunchHelper"] = "/nonexistent/df-test-helper",
+        }).Build(), new InMemorySecrets());
+        var item = new WorkItem { Source = ItemNaming.GitHubIssue.Source, ExternalId = "gh-1", Title = "acme/widgets#7", Repo = "acme/widgets" };
+        var text = new StringWriter();
+        var log = TextWriter.Synchronized(text); // its methods lock the writer itself
+        string Logged()
+        {
+            lock (log)
+            {
+                return text.ToString();
+            }
+        }
+        Task<Worker.WorkerResult> Triage(CancellationToken ct) => new SandboxTriageRunner(options, log).RunAsync(item, new RepoRef("acme", "widgets"),
+            "prompt", (_, _) => Task.CompletedTask, (_, _, _) => Task.CompletedTask, ct);
+        async Task WaitsAsync(Task triage, int times)
+        {
+            var line = $"[lock] gh-1: its triage is waiting for the sandbox user (another run's worker phase holds {WorkerLock.For(root).Path})";
+            for (var i = 0; i < 2000 && Logged().Split(line).Length - 1 < times; i++)
+            {
+                await Task.Delay(5, TestContext.Current.CancellationToken);
+            }
+            Assert.Equal(times, Logged().Split(line).Length - 1);
+            Assert.False(triage.IsCompleted);
+        }
+        using var held = WorkerLock.Acquire(root); // another run's worker session, for the whole test
+
+        // The host shuts down: the wait ends.
+        using var shutdown = new CancellationTokenSource();
+        var stopped = Triage(shutdown.Token);
+        await WaitsAsync(stopped, 1);
+        await shutdown.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => stopped);
+
+        // A Pause on the item: the triage is put off — not failed, and nothing ran.
+        var paused = Triage(CancellationToken.None);
+        await WaitsAsync(paused, 2);
+        await FactoryRunner.Controls(options).SetAsync(Controls.ControlScope.Item("gh-1"), Controls.ControlState.Paused, "tester", CancellationToken.None);
+        var deferred = await Assert.ThrowsAsync<Issues.TriageDeferredException>(() => paused.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken));
+        Assert.Contains("the triage of gh-1 was waiting for the sandbox user when a control (Paused) held it", deferred.Message);
+        Assert.False(IntakeLoop.IsFactoryWide(deferred));
     }
 }

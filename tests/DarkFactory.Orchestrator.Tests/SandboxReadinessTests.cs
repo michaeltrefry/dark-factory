@@ -166,6 +166,32 @@ public class SandboxReadinessTests
     }
 
     [Fact]
+    public async Task Start_up_checks_the_installed_helper_by_reading_it_running_nothing_and_needing_no_lock()
+    {
+        // Another run's worker phase has the sandbox user for the whole test: a check that ran the helper would wait for it.
+        var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, "root")).FullName);
+        using var held = WorkerLock.Acquire(Path.GetDirectoryName(workerLock.Path)!);
+        var none = CancellationToken.None;
+        var wait = TimeSpan.FromSeconds(30);
+
+        // The current helper: nothing to say. `factory work` starts, and the probe waits for the first worker phase.
+        Assert.Null(await FactoryRunner.CheckHelperAsync(Sandbox(CurrentAllowlist) with { Lock = workerLock }, none).WaitAsync(wait, none));
+        // Not the current one, or not there: the reason `factory work` and `factory run` refuse to start with (exit 2).
+        var stale = await FactoryRunner.CheckHelperAsync(Sandbox(CurrentAllowlist,
+            installed: t => Installed(t).Replace($"helper_version={WorkerSandbox.HelperVersion}\n", "helper_version=1\n")) with { Lock = workerLock }, none).WaitAsync(wait, none);
+        Assert.StartsWith("Stale helper: the installed launch helper ", stale);
+        Assert.Contains("helper_version 1 is older than 3", stale);
+        Assert.Contains("re-run `sudo scripts/setup-worker-user.sh`", stale);
+        var missing = await FactoryRunner.CheckHelperAsync(
+            new WorkerSandbox(Environment.UserName, Path.Combine(_dir, "no-such-helper"), SandboxSupport.FakeSudo(_dir), "x") { Lock = workerLock }, none).WaitAsync(wait, none);
+        Assert.Contains("cannot read the launch helper", missing);
+        // Unsandboxed (Worker:RunAs=none) there is no helper to check.
+        Assert.Null(await FactoryRunner.CheckHelperAsync(null, none));
+
+        Assert.False(File.Exists(Ran), "the start-up check ran the helper");
+    }
+
+    [Fact]
     public async Task A_helper_that_cannot_be_read_fails_the_factory_naming_the_setup()
     {
         var sandbox = new WorkerSandbox(Environment.UserName, Path.Combine(_dir, "no-such-helper"), SandboxSupport.FakeSudo(_dir), "x");
