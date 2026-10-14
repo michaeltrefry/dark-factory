@@ -73,32 +73,94 @@ public sealed record UnindexedFile(string Path, string? Language, bool Flagged)
 /// Whether CodeGraph indexes a touched file's language (sc-26133, P5 S7; the CodeGraph side is C3, sc-26137). The contract: the
 /// structured content of <c>analyze_impact_file</c> and <c>file_hotspot</c> carries <c>languageIndexed</c> (boolean: false only for a
 /// source file of a language CodeGraph does not index; true for an indexed language and for a file that is not code) and
-/// <c>language</c> (CodeGraph's name of the file's language, or null). Owner decision 2026-10-14: the gate fails closed on a changed
-/// code file whose language CodeGraph does not index, and passes once it does. Rule (<see cref="Of"/>): <c>languageIndexed: false</c> in
-/// either answer → unindexed; <c>true</c> → indexed (CodeGraph's word); no flag (a CodeGraph that predates C3; E7: .NET and Rust are
-/// unchanged) → unindexed only when the file's extension is one of <see cref="UnindexedBeforeC3"/> and CodeGraph had no data for it
-/// (<c>found</c> not true: a CodeGraph with graph data for a file indexes its language).
+/// <c>language</c> (CodeGraph's capitalised name of the file's language — <c>Swift</c>, <c>C#</c>, <c>C++</c> — or null). Owner
+/// decision 2026-10-14: the gate fails closed on a changed code file whose language CodeGraph does not index, and passes once it does.
+/// Rule (<see cref="Of"/>), per file, after BOTH answers: <c>languageIndexed: false</c> in either → unindexed; <c>true</c> in either and
+/// <c>false</c> in neither → indexed; neither carries the flag (a CodeGraph that predates C3; E7: .NET and Rust are unchanged) →
+/// unindexed only when the file's extension is one of <see cref="UnindexedBeforeC3"/> and CodeGraph had no graph data for it
+/// (<c>analyze_impact_file</c>'s <c>found</c> not true: a CodeGraph with graph data for a file indexes its language). CodeGraph's
+/// <c>language</c> is shown only when it is an inert name (<see cref="Name"/>); otherwise the factory's name by extension stands in.
 /// </summary>
 public static class LanguageCoverage
 {
-    /// <summary>The code languages, by extension (case-insensitive), CodeGraph did not index before C3: today Swift.</summary>
-    public static readonly IReadOnlyDictionary<string, string> UnindexedBeforeC3 =
-        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [".swift"] = "Swift" };
+    /// <summary>
+    /// The code languages, by extension (case-insensitive), CodeGraph's main did not index before C3 (checked against its source,
+    /// 2026-10-14: Swift is indexed only on a feature branch). <c>.m</c> is also MATLAB's: such a file is blocked too until C3 says
+    /// otherwise — a false block, never a false pass.
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, string> UnindexedBeforeC3 = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        [".swift"] = "Swift",
+        [".m"] = "Objective-C",
+        [".mm"] = "Objective-C++",
+        [".kt"] = "Kotlin",
+        [".kts"] = "Kotlin",
+        [".scala"] = "Scala",
+        [".dart"] = "Dart",
+    };
+
+    /// <summary>The longest language name shown.</summary>
+    public const int MaxNameLength = 60;
 
     /// <summary>The language <see cref="UnindexedBeforeC3"/> names for <paramref name="path"/>'s extension, or null.</summary>
     public static string? KnownUnindexed(string path) =>
         UnindexedBeforeC3.TryGetValue(System.IO.Path.GetExtension(path), out var language) ? language : null;
 
-    /// <summary>Whether <paramref name="path"/> is a file whose language CodeGraph does not index, from one answer's fields; null: it is not.</summary>
-    public static UnindexedFile? Of(string path, bool? languageIndexed, string? language, bool? found) => languageIndexed switch
+    /// <summary>
+    /// CodeGraph's <c>language</c> as the gate may show it (E3: it reaches gate reasons, rows and escalation comments): trimmed, at
+    /// most <see cref="MaxNameLength"/> characters, and only ASCII letters, digits, <c>+ # . _ -</c> and spaces; anything else (a line
+    /// break, a backtick, markup) → null, so the factory's own name stands in.
+    /// </summary>
+    public static string? Name(string? language)
     {
-        false => new UnindexedFile(path, string.IsNullOrWhiteSpace(language) ? KnownUnindexed(path) : Cut(language), Flagged: true),
-        true => null,
-        null when found != true && KnownUnindexed(path) is { } known => new UnindexedFile(path, known, Flagged: false),
-        _ => null,
-    };
+        var name = language?.Trim();
+        if (string.IsNullOrEmpty(name) || !name.All(c => char.IsAsciiLetterOrDigit(c) || c is '+' or '#' or '.' or '_' or ' ' or '-'))
+        {
+            return null;
+        }
+        return name.Length > MaxNameLength ? name[..MaxNameLength].TrimEnd() : name;
+    }
 
-    private static string Cut(string s) => s.Length > 60 ? s[..60] : s;
+    /// <summary>
+    /// Whether <paramref name="path"/> is a file whose language CodeGraph does not index, from both answers' fields (a hotspot answer
+    /// not read: null, null); null: it is not.
+    /// </summary>
+    public static UnindexedFile? Of(string path, bool? impactIndexed, string? impactLanguage, bool? hotspotIndexed, string? hotspotLanguage,
+        bool? found)
+    {
+        if (impactIndexed == false || hotspotIndexed == false)
+        {
+            var language = (impactIndexed == false ? Name(impactLanguage) : null) ?? (hotspotIndexed == false ? Name(hotspotLanguage) : null)
+                ?? KnownUnindexed(path);
+            return new UnindexedFile(path, language, Flagged: true);
+        }
+        if (impactIndexed == true || hotspotIndexed == true)
+        {
+            return null;
+        }
+        return found != true && KnownUnindexed(path) is { } known ? new UnindexedFile(path, known, Flagged: false) : null;
+    }
+
+    /// <summary>
+    /// Adds <paramref name="file"/> to <paramref name="files"/>, one entry per path: CodeGraph's word (<see cref="UnindexedFile.Flagged"/>)
+    /// replaces the factory's inference for the same path, never the other way round.
+    /// </summary>
+    public static void Add(List<UnindexedFile> files, UnindexedFile? file)
+    {
+        if (file is null)
+        {
+            return;
+        }
+        var at = files.FindIndex(u => u.Path == file.Path);
+        if (at < 0)
+        {
+            files.Add(file);
+        }
+        else if (file.Flagged && !files[at].Flagged)
+        {
+            files[at] = file;
+        }
+    }
 }
 
 /// <summary>
@@ -124,11 +186,11 @@ public sealed record FileBlastRadius(string Path, BlastRadius Radius, bool Found
 /// <see cref="CommitSha"/>: the commit the metrics were computed at, or the default-branch index commit when the file has no metrics
 /// (<see cref="Found"/> false: counted as 0) or CodeGraph did not record the metrics' commit (<see cref="VitalsCommitUnknown"/>: the
 /// score is used, labelled "vitals commit unknown; index at &lt;sha&gt;"). <see cref="IndexCommitSha"/>: the default-branch index commit
-/// CodeGraph named (null: the same as <see cref="CommitSha"/>), which keys <see cref="HotspotCache"/>. <see cref="Unindexed"/>: the
-/// answer said the file's language is not indexed (kept with a cached score).
+/// CodeGraph named (null: the same as <see cref="CommitSha"/>), which keys <see cref="HotspotCache"/>. <see cref="LanguageIndexed"/>
+/// and <see cref="Language"/>: the answer's C3 fields (sc-26137; <see cref="LanguageCoverage"/>), kept with a cached score.
 /// </summary>
 public sealed record FileHotspot(string Path, double Score, bool Found, string CommitSha, string? IndexCommitSha = null, bool VitalsCommitUnknown = false,
-    UnindexedFile? Unindexed = null)
+    bool? LanguageIndexed = null, string? Language = null)
 {
     /// <summary>The default-branch index commit the score was read against.</summary>
     public string IndexCommit => IndexCommitSha ?? CommitSha;
@@ -257,13 +319,25 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
         var blast = new List<FileBlastRadius>();
         var scores = new List<FileHotspot>();
         var unindexed = new List<UnindexedFile>();
-        CodeGraphRisk Result(bool overlayUnusable = false) => new(headSha, blast, scores, unreadable, overlayUnusable, unindexed);
-        void Unindexed(UnindexedFile? file)
+        // Each file's language is judged once both its answers are read (Judge, LanguageCoverage.Of); a file whose hotspot was not read
+        // (the read stopped at an unreadable input) is unindexed already when its impact answer says so.
+        var impacts = new Dictionary<string, ImpactFileAnswer>();
+        CodeGraphRisk Result(bool overlayUnusable = false)
         {
-            if (file is not null && unindexed.All(u => u.Path != file.Path))
+            foreach (var (path, answer) in impacts)
             {
-                unindexed.Add(file);
+                if (answer.LanguageIndexed == false)
+                {
+                    LanguageCoverage.Add(unindexed, LanguageCoverage.Of(path, false, answer.Language, null, null, answer.Found));
+                }
             }
+            return new(headSha, blast, scores, unreadable, overlayUnusable, unindexed);
+        }
+        void Judge(string path, FileHotspot score)
+        {
+            var impact = impacts[path];
+            LanguageCoverage.Add(unindexed,
+                LanguageCoverage.Of(path, impact.LanguageIndexed, impact.Language, score.LanguageIndexed, score.Language, impact.Found));
         }
         string? project;
         try
@@ -301,7 +375,7 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
                 // CodeGraph has no usable overlay of the head (e.g. the recorded one went stale): the next read requests it again.
                 return Result(overlayUnusable: answer.NotIndexed is not null);
             }
-            Unindexed(LanguageCoverage.Of(path, answer.LanguageIndexed, answer.Language, answer.Found));
+            impacts[path] = answer;
             blast.Add(answer.Found == true && BlastRadii.TryParse(answer.BlastRadius, out var radius)
                 ? new FileBlastRadius(path, radius, true)
                 : new FileBlastRadius(path, BlastRadius.None, false));
@@ -312,7 +386,7 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
             if (hotspots is not null && hotspots.TryGet(path, overlay.BaseSha, out var known))
             {
                 scores.Add(known!);
-                Unindexed(known!.Unindexed);
+                Judge(path, known!);
                 continue;
             }
             if (await Call(() => codeGraph.FileHotspotAsync(project, path, ct), CodeGraphMcpClient.FileHotspotTool, path, unreadable, ct) is not { } answer)
@@ -324,12 +398,8 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
                 unreadable.Add(why);
                 return Result();
             }
-            var score = Score(answer, path) with
-            {
-                // A hotspot answer counts only when it says "not indexed": an absent flag was judged on the impact answer above.
-                Unindexed = answer.LanguageIndexed == false ? LanguageCoverage.Of(path, false, answer.Language, answer.Found) : null,
-            };
-            Unindexed(score.Unindexed);
+            var score = Score(answer, path) with { LanguageIndexed = answer.LanguageIndexed, Language = answer.Language };
+            Judge(path, score);
             scores.Add(score);
             hotspots?.Add(score);
         }

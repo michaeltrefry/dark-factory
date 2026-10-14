@@ -2614,8 +2614,11 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   whose tier lists `security-review` or that `RiskyPaths` matches (scripts, build/container files, dependency manifests — SwiftPM's
   `Package.swift`, `Package@swift-*.swift` and `Package.resolved` among them, sc-26127 — Rust's
   `build.rs`, `rust-toolchain*` and `.cargo/config*`, Apple's (sc-26133: `*.xcodeproj/project.pbxproj`,
-  `*.xcworkspace/contents.xcworkspacedata`, `*.xcscheme`, `*.xcconfig`, `*.entitlements`, `Info.plist`/`*-Info.plist`, XcodeGen's
-  `project.yml`/`project.json`, CocoaPods' `Podfile`, `Podfile.lock`, `*.podspec`, and `*.xctestplan`),
+  `*.xcworkspace/contents.xcworkspacedata`, `*.xcworkspace/xcshareddata/*.xcsettings`, `*.xcscheme`, `*.xcconfig`, `*.xcfilelist`,
+  `*.entitlements`, `Info.plist`/`*-Info.plist`, XcodeGen's `project.yml`/`project.json` — deliberately over-matching: Nx's and
+  legacy .NET's `project.json` get a security review too, which only adds a check — Tuist's `Project.swift`, `Workspace.swift`,
+  `Tuist.swift` and everything under a `Tuist/` directory, CocoaPods' `Podfile`, `Podfile.lock`, `*.podspec`, `*.podspec.json`,
+  Carthage's `Cartfile`, `Cartfile.resolved`, and `*.xctestplan`),
   keys/.env, security-sensitive names; case-insensitive) needs it, so the policy can add security-review paths but not
   remove the floor. The gate also reads the PR, the diff of the head against the base (`IGateGitHub.GetDiffAsync`;
   unreadable → blocked; a file count — one per `diff --git` header, a rename once — other than the PR's `changed_files` →
@@ -2652,17 +2655,28 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   consumers (docs/acceptance.md, P3-AT4a); hotspots have no
   floor — recorded and reported, failing only above an opted-in `max_hotspot`. Languages CodeGraph does not index (sc-26133,
   `LanguageCoverage`; owner decision 2026-10-14: fail closed, pass once CodeGraph indexes it): contract with CodeGraph C3
-  (sc-26137, not deployed yet) — the structured content of `analyze_impact_file` and `file_hotspot` carries `languageIndexed`
-  (bool: false only for a source file of a language CodeGraph does not index; true for an indexed language and for a non-code
-  file; an indexed new file with no data is `found: false, languageIndexed: true`) and `language` (CodeGraph's name, or null).
-  `languageIndexed: false` in either answer → the file is unindexed; `true` → indexed. No flag (a CodeGraph before C3; E7: .NET
-  and Rust unchanged) → unindexed only when the file's extension is one CodeGraph did not index before C3
-  (`LanguageCoverage.UnindexedBeforeC3`: `.swift`, case-insensitive) AND it had no data for it (`found` not true: graph data means
-  the language is indexed). An unindexed touched file (deletes and both sides of a rename included) BLOCKS `risk-threshold`
-  (never pending, also beside an unreadable input): ``risk threshold: CodeGraph does not index the language of a changed code
-  file, so its blast radius and hotspot are unknown: Sources/A.swift (Swift)`` (`; CodeGraph answered no languageIndexed flag
-  (before C3)` when inferred), and the `gate` row's inputs add `language not indexed by CodeGraph: …`; a cached hotspot keeps its
-  flag (`FileHotspot.Unindexed`). So until C3 ships and CodeGraph indexes Swift, no normal or protected Swift change merges.
+  (sc-26137, not deployed yet; `languageIndexed` exists nowhere in CodeGraph today) — the structured content of
+  `analyze_impact_file` and `file_hotspot` carries `languageIndexed` (bool: false only for a source file of a language CodeGraph
+  does not index; true for an indexed language and for a non-code file; an indexed new file with no data is `found: false,
+  languageIndexed: true`) and `language` (CodeGraph's capitalised name — `Swift`, `C#`, `C++`, `Objective-C` — or null). Judged
+  per file after BOTH answers (`LanguageCoverage.Of`): `languageIndexed: false` in either → unindexed; `true` in either and
+  `false` in neither → indexed; neither carries the flag (a CodeGraph before C3; E7: .NET and Rust unchanged) → unindexed only
+  when the file's extension is one CodeGraph's main did not index before C3 (`LanguageCoverage.UnindexedBeforeC3`,
+  case-insensitive: `.swift` Swift, `.m` Objective-C — MATLAB's `.m` is blocked too, a false block — `.mm` Objective-C++, `.kt`/
+  `.kts` Kotlin, `.scala` Scala, `.dart` Dart; checked against CodeGraph's source 2026-10-14, which indexes C#, TypeScript, C,
+  C++, Python, Go, Java, Ruby, Rust, PHP, Bash, SQL, ColdFusion, Terraform and Ansible YAML) AND `analyze_impact_file` had no
+  data for it (`found` not true: graph data means the language is indexed). A file whose hotspot was not read (the read stopped
+  at an unreadable input) is unindexed already when its impact answer says `false`. One entry per file: CodeGraph's word
+  replaces the inference (`LanguageCoverage.Add`). CodeGraph's `language` is untrusted text (E3): shown only when, trimmed, it
+  is at most 60 characters of ASCII letters, digits, `+ # . _ -` and spaces (`LanguageCoverage.Name`); otherwise the factory's
+  name by extension stands in, or `language unknown`. An unindexed touched file (deletes and both sides of a rename included)
+  BLOCKS `risk-threshold` (never pending, also beside an unreadable input): ``risk threshold: CodeGraph does not index the
+  language of a changed code file, so its blast radius and hotspot are unknown: Sources/A.swift (Swift)`` (`; CodeGraph answered
+  no languageIndexed flag (before C3)` when inferred), and the `gate` row's inputs add `language not indexed by CodeGraph: …`; a
+  cached hotspot keeps its answer's flag and name (`FileHotspot.LanguageIndexed`/`Language`). CodeGraph's main does NOT index
+  Swift today (only its feature branch `claude/swift-codegraph-support-8f2e6c` does), so until it does no normal or protected
+  Swift change merges. C3 (sc-26137) must ship no later than Swift support on CodeGraph's main: otherwise a new or deleted Swift
+  file (`found: false`, no flag) keeps being blocked although Swift is indexed — a false block, never a false pass.
   Otherwise a file CodeGraph has no data for (`found: false`,
   e.g. a new file) counts as blast radius none / hotspot 0; a file read over a limit blocks at once, even when another could not be
   read; one CodeGraph cannot read (an error answer, HTTP 403 `tool_not_entitled`, unreachable, the repo not indexed, a C4

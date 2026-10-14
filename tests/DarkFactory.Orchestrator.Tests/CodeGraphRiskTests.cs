@@ -289,15 +289,33 @@ public class CodeGraphRiskTests
 
     [Theory]
     // C3's flag says so, in either answer; the language is CodeGraph's name, else the factory's by extension.
-    [InlineData(SwiftFile, false, "swift", null, null, "swift", true)]
+    [InlineData(SwiftFile, false, "Swift", null, null, "Swift", true)]
     [InlineData(SwiftFile, false, null, null, null, "Swift", true)]
-    [InlineData("src/legacy.m", false, "objective-c", null, null, "objective-c", true)]
-    [InlineData("src/legacy.m", null, null, false, null, "language unknown", true)]
+    [InlineData("src/legacy.m", false, "Objective-C", null, null, "Objective-C", true)]
+    [InlineData("src/legacy.m", null, null, false, null, "Objective-C", true)]
+    [InlineData("tools/gen.zig", null, null, false, null, "language unknown", true)]
+    [InlineData("tools/gen.zig", false, "Objective-C++", null, null, "Objective-C++", true)]
+    // CodeGraph's name is shown only when inert (E3): anything else falls back to the factory's name by extension, or none.
+    [InlineData(SwiftFile, false, "x\n`y", null, null, "Swift", true)]
+    [InlineData("tools/gen.zig", false, "<img src=x>", null, null, "language unknown", true)]
+    [InlineData(SwiftFile, null, null, false, "@user", "Swift", true)]
+    // Both answers judged together: either "false" wins; "true" in one and no flag in the other is indexed.
+    [InlineData(SwiftFile, true, "Swift", false, "Swift", "Swift", true)]
+    [InlineData(SwiftFile, false, "Swift", true, "Swift", "Swift", true)]
+    [InlineData(SwiftFile, null, null, true, "Swift", null, false)]
+    [InlineData(SwiftFile, true, "Swift", null, null, null, false)]
     // C3's flag says indexed: never failed closed, whatever the extension.
-    [InlineData(SwiftFile, true, "swift", true, null, null, false)]
-    // No flag (a CodeGraph before C3): a .swift file it has no data for is unindexed; other files are as before (E7).
+    [InlineData(SwiftFile, true, "Swift", true, null, null, false)]
+    // No flag (a CodeGraph before C3): a file of a language CodeGraph's main did not index, with no data, is unindexed; other files
+    // are as before (E7).
     [InlineData(SwiftFile, null, null, null, null, "Swift", false)]
     [InlineData("Sources/App/COUNTER.SWIFT", null, null, null, null, "Swift", false)]
+    [InlineData("src/legacy.m", null, null, null, null, "Objective-C", false)]
+    [InlineData("src/bridge.mm", null, null, null, null, "Objective-C++", false)]
+    [InlineData("app/src/Main.kt", null, null, null, null, "Kotlin", false)]
+    [InlineData("build.gradle.kts", null, null, null, null, "Kotlin", false)]
+    [InlineData("src/Main.scala", null, null, null, null, "Scala", false)]
+    [InlineData("lib/main.dart", null, null, null, null, "Dart", false)]
     [InlineData("src/a.cs", null, null, null, null, null, false)]
     [InlineData("crates/words/src/lib.rs", null, null, null, null, null, false)]
     [InlineData("docs/notes.md", null, null, null, null, null, false)]
@@ -333,11 +351,57 @@ public class CodeGraphRiskTests
     public void Without_a_flag_a_swift_file_codegraph_has_graph_data_for_is_indexed()
     {
         // A CodeGraph before C3 with nodes for the file indexes its language: no claim is made against it.
-        Assert.Null(LanguageCoverage.Of(SwiftFile, null, null, found: true));
-        Assert.NotNull(LanguageCoverage.Of(SwiftFile, null, null, found: false));
-        Assert.NotNull(LanguageCoverage.Of(SwiftFile, false, "swift", found: true));
+        Assert.Null(LanguageCoverage.Of(SwiftFile, null, null, null, null, found: true));
+        Assert.NotNull(LanguageCoverage.Of(SwiftFile, null, null, null, null, found: false));
+        Assert.NotNull(LanguageCoverage.Of(SwiftFile, false, "Swift", null, null, found: true));
         Assert.Equal("Sources/App/Counter.swift (Swift; CodeGraph answered no languageIndexed flag (before C3))",
-            LanguageCoverage.Of(SwiftFile, null, null, found: false)!.ToString());
+            LanguageCoverage.Of(SwiftFile, null, null, null, null, found: false)!.ToString());
+    }
+
+    [Fact]
+    public void Codegraphs_word_replaces_the_inference_for_the_same_file_never_the_other_way_round()
+    {
+        var inferred = new UnindexedFile(SwiftFile, "Swift", Flagged: false);
+        var flagged = new UnindexedFile(SwiftFile, "Swift", Flagged: true);
+
+        var files = new List<UnindexedFile>();
+        LanguageCoverage.Add(files, inferred);
+        LanguageCoverage.Add(files, flagged);
+        Assert.Equal(flagged, Assert.Single(files));
+
+        LanguageCoverage.Add(files, inferred);
+        Assert.Equal(flagged, Assert.Single(files));
+    }
+
+    [Theory]
+    [InlineData("Swift", "Swift")]
+    [InlineData("  C# ", "C#")]
+    [InlineData("C++", "C++")]
+    [InlineData("Objective-C_2.0", "Objective-C_2.0")]
+    [InlineData("x\n`y", null)]
+    [InlineData("Swift`", null)]
+    [InlineData("Swift\u202e", null)]
+    [InlineData("Swïft", null)]
+    [InlineData("   ", null)]
+    [InlineData(null, null)]
+    public void Codegraphs_language_name_is_shown_only_when_inert(string? language, string? shown)
+    {
+        Assert.Equal(shown, LanguageCoverage.Name(language));
+        Assert.Equal(new string('A', LanguageCoverage.MaxNameLength), LanguageCoverage.Name(new string('A', 200)));
+    }
+
+    [Fact]
+    public async Task A_file_codegraph_says_is_not_indexed_stays_unindexed_when_its_hotspot_cannot_be_read()
+    {
+        var server = Server((tool, args) => tool == "analyze_impact_file"
+            ? C7Answers.ImpactFile(Project, SwiftFile, Head, false, "none", languageIndexed: false, language: "Swift")
+            : FakeMcpServer.OverlayError("repo_not_found", "Unknown repository 'Sandbox'."));
+
+        var risk = await Reader(server).ReadAsync(Repo, Head, Ready, [SwiftFile], CancellationToken.None);
+
+        Assert.Single(risk.Unreadable);
+        Assert.Equal(new UnindexedFile(SwiftFile, "Swift", true), Assert.Single(risk.UnindexedFiles));
+        Assert.Equal(GateOutcome.Blocked, Evaluate(risk, diff: TestPolicies.Diff(SwiftFile)).Outcome);
     }
 
     [Fact]
