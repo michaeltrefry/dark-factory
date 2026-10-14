@@ -2613,7 +2613,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   pattern or trailing `**` naming the directory or an ancestor; naming files in it is invalid); security review — a path
   whose tier lists `security-review` or that `RiskyPaths` matches (scripts, build/container files, dependency manifests — SwiftPM's
   `Package.swift`, `Package@swift-*.swift` and `Package.resolved` among them, sc-26127 — Rust's
-  `build.rs`, `rust-toolchain*` and `.cargo/config*`,
+  `build.rs`, `rust-toolchain*` and `.cargo/config*`, Apple's (sc-26133: `*.xcodeproj/project.pbxproj`,
+  `*.xcworkspace/contents.xcworkspacedata`, `*.xcscheme`, `*.xcconfig`, `*.entitlements`, `Info.plist`/`*-Info.plist`, XcodeGen's
+  `project.yml`/`project.json`, CocoaPods' `Podfile`, `Podfile.lock`, `*.podspec`, and `*.xctestplan`),
   keys/.env, security-sensitive names; case-insensitive) needs it, so the policy can add security-review paths but not
   remove the floor. The gate also reads the PR, the diff of the head against the base (`IGateGitHub.GetDiffAsync`;
   unreadable → blocked; a file count — one per `diff --git` header, a rename once — other than the PR's `changed_files` →
@@ -2648,7 +2650,20 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   radius has a code floor (`GatePolicy.BlastRadiusFloor` =
   high: a critical file always fails; seam `policy-floor:blast-radius`), `max_blast_radius` can only lower it. CodeGraph rates a file critical only for a non-test dependent in another repo (depth 1, or depth 2 over a message edge) or a non-test depth-1 message consumer (`CONSUMES`, built only for repos in its `TrustedDotnetRepositories`); in-repo callers rate high at most, so in practice the floor fires on cross-repo dependents and
   consumers (docs/acceptance.md, P3-AT4a); hotspots have no
-  floor — recorded and reported, failing only above an opted-in `max_hotspot`. A file CodeGraph has no data for (`found: false`,
+  floor — recorded and reported, failing only above an opted-in `max_hotspot`. Languages CodeGraph does not index (sc-26133,
+  `LanguageCoverage`; owner decision 2026-10-14: fail closed, pass once CodeGraph indexes it): contract with CodeGraph C3
+  (sc-26137, not deployed yet) — the structured content of `analyze_impact_file` and `file_hotspot` carries `languageIndexed`
+  (bool: false only for a source file of a language CodeGraph does not index; true for an indexed language and for a non-code
+  file; an indexed new file with no data is `found: false, languageIndexed: true`) and `language` (CodeGraph's name, or null).
+  `languageIndexed: false` in either answer → the file is unindexed; `true` → indexed. No flag (a CodeGraph before C3; E7: .NET
+  and Rust unchanged) → unindexed only when the file's extension is one CodeGraph did not index before C3
+  (`LanguageCoverage.UnindexedBeforeC3`: `.swift`, case-insensitive) AND it had no data for it (`found` not true: graph data means
+  the language is indexed). An unindexed touched file (deletes and both sides of a rename included) BLOCKS `risk-threshold`
+  (never pending, also beside an unreadable input): ``risk threshold: CodeGraph does not index the language of a changed code
+  file, so its blast radius and hotspot are unknown: Sources/A.swift (Swift)`` (`; CodeGraph answered no languageIndexed flag
+  (before C3)` when inferred), and the `gate` row's inputs add `language not indexed by CodeGraph: …`; a cached hotspot keeps its
+  flag (`FileHotspot.Unindexed`). So until C3 ships and CodeGraph indexes Swift, no normal or protected Swift change merges.
+  Otherwise a file CodeGraph has no data for (`found: false`,
   e.g. a new file) counts as blast radius none / hotspot 0; a file read over a limit blocks at once, even when another could not be
   read; one CodeGraph cannot read (an error answer, HTTP 403 `tool_not_entitled`, unreachable, the repo not indexed, a C4
   `notIndexed` answer, no ready overlay of the head, an answer for another commit, another file or without a commit) otherwise

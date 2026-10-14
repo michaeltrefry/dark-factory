@@ -34,7 +34,7 @@ public static class C7Answers
 {
     /// <summary>An <c>analyze_impact_file</c> answer pinned to <paramref name="sha"/> (from its overlay unless <paramref name="overlay"/> is false).</summary>
     public static JsonObject ImpactFile(string repo, string path, string sha, bool found, string blastRadius, bool overlay = true,
-        long overlayId = 41, string? baseSha = FakeCodeGraphRisk.IndexCommit, int count = 2)
+        long overlayId = 41, string? baseSha = FakeCodeGraphRisk.IndexCommit, int count = 2, bool? languageIndexed = null, string? language = null)
     {
         var structured = new JsonObject { ["commitSha"] = sha, ["source"] = overlay ? "overlay" : "default-branch", ["repo"] = repo };
         if (overlay)
@@ -52,6 +52,7 @@ public static class C7Answers
             structured[field] = found ? count : 0;
         }
         structured["unmappedInboundEdges"] = overlay ? 0 : null;
+        C3(structured, languageIndexed, language);
         var text = found
             ? $"# File Blast Radius: {repo}/{path}\n\n**Blast radius:** {blastRadius}"
             : $"# File Blast Radius: {repo}/{path}\n\nNo graph nodes in this file (found: false); blast radius: none.";
@@ -64,7 +65,7 @@ public static class C7Answers
     /// before CodeGraph recorded commits (<c>concernScore</c> null too).
     /// </summary>
     public static JsonObject Hotspot(string repo, string path, double? riskScore, string? commitSha = FakeCodeGraphRisk.IndexCommit,
-        string? indexCommitSha = FakeCodeGraphRisk.IndexCommit, string source = "default-branch")
+        string? indexCommitSha = FakeCodeGraphRisk.IndexCommit, string source = "default-branch", bool? languageIndexed = null, string? language = null)
     {
         var found = riskScore is not null;
         var computed = found ? commitSha : null;
@@ -83,10 +84,24 @@ public static class C7Answers
             ["computedAt"] = found ? "2026-10-09T12:00:00Z" : null,
             ["indexCommitSha"] = indexCommitSha,
         };
+        C3(structured, languageIndexed, language);
         var text = found
             ? $"# File Hotspot: {repo}/{path}\n\n**Risk:** {riskScore:F1}\n**Computed:** 2026-10-09 12:00:00Z at commit {computed ?? "unknown (not recorded for this run)"}"
             : $"# File Hotspot: {repo}/{path}\n\nNo vitals metrics for this file on the default branch (found: false).";
         return FakeMcpServer.Structured($"Commit: {computed ?? "unknown"}\n\n{text}", structured);
+    }
+
+    /// <summary>
+    /// C3's fields (sc-26137, the contract sc-26133 defines; <see cref="LanguageCoverage"/>): <c>languageIndexed</c> and <c>language</c>,
+    /// both left out when <paramref name="languageIndexed"/> is null — an answer of a CodeGraph that predates C3.
+    /// </summary>
+    private static void C3(JsonObject structured, bool? languageIndexed, string? language)
+    {
+        if (languageIndexed is { } indexed)
+        {
+            structured["languageIndexed"] = indexed;
+            structured["language"] = language;
+        }
     }
 
     /// <summary>A <c>tools/call</c> result as <see cref="McpHttpClient"/> hands it over (text joined, structured content, error flag).</summary>
@@ -95,8 +110,9 @@ public static class C7Answers
             result["isError"] is JsonValue e && e.GetValue<bool>(), result["structuredContent"], result);
 
     /// <summary>An <c>analyze_impact_file</c> answer as the factory's client parses it.</summary>
-    public static ImpactFileAnswer ParsedImpactFile(string repo, string path, string sha, bool found, string blastRadius) =>
-        CodeGraphMcpClient.ImpactFile(Result(ImpactFile(repo, path, sha, found, blastRadius)));
+    public static ImpactFileAnswer ParsedImpactFile(string repo, string path, string sha, bool found, string blastRadius,
+        bool? languageIndexed = null, string? language = null) =>
+        CodeGraphMcpClient.ImpactFile(Result(ImpactFile(repo, path, sha, found, blastRadius, languageIndexed: languageIndexed, language: language)));
 
     /// <summary>A <c>file_hotspot</c> answer as the factory's client parses it.</summary>
     public static HotspotAnswer ParsedHotspot(string repo, string path, double? riskScore, string? commitSha = FakeCodeGraphRisk.IndexCommit,

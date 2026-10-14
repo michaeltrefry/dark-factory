@@ -39,20 +39,67 @@ public static class BlastRadii
 /// One <c>analyze_impact_file</c> answer (CodeGraph C7, sc-25735): whether it is an error, its text, the commit it names
 /// (<c>structuredContent.commitSha</c>, <see cref="CodeGraphMcpClient.Commit"/>), the typed not-indexed answer of a SHA with no ready
 /// overlay (C4), an error answer's code (<c>structuredContent.error.code</c>), and the tool's own <c>found</c>, <c>blastRadius</c> and
-/// <c>path</c> (the file it answered about, which must be the one asked about).
+/// <c>path</c> (the file it answered about, which must be the one asked about), and C3's (sc-26137) <c>languageIndexed</c> and
+/// <c>language</c> (<see cref="LanguageCoverage"/>; both null in an answer of a CodeGraph that predates C3).
 /// </summary>
 public sealed record ImpactFileAnswer(bool IsError, string Text, string? CommitSha, CodeGraphNotIndexed? NotIndexed, string? ErrorCode,
-    bool? Found, string? BlastRadius, string? Path = null);
+    bool? Found, string? BlastRadius, string? Path = null, bool? LanguageIndexed = null, string? Language = null);
 
 /// <summary>
 /// One <c>file_hotspot</c> answer (C7, michaeltrefry/CodeGraph PR #76): whether it is an error, its text, the commit its metrics were
 /// computed at (<c>commitSha</c>: null when <c>found</c> is false, and null for metrics computed before CodeGraph recorded the commit),
 /// its <c>source</c> (<c>default-branch</c> or <c>overlay</c>), an error answer's code, the tool's own <c>found</c>, <c>riskScore</c> and
 /// <c>path</c> (the file it answered about, which must be the one asked about), and <c>indexCommitSha</c> — the current default-branch
-/// index commit, given whether or not the file has metrics.
+/// index commit, given whether or not the file has metrics — and C3's (sc-26137) <c>languageIndexed</c> and <c>language</c>
+/// (<see cref="LanguageCoverage"/>).
 /// </summary>
 public sealed record HotspotAnswer(bool IsError, string Text, string? CommitSha, string? Source, string? ErrorCode, bool? Found, double? RiskScore,
-    string? Path = null, string? IndexCommitSha = null);
+    string? Path = null, string? IndexCommitSha = null, bool? LanguageIndexed = null, string? Language = null);
+
+/// <summary>
+/// A touched file whose language CodeGraph does not index (sc-26133, P5 S7): its blast radius and hotspot are unknown, not none, so
+/// <c>risk-threshold</c> fails closed on it. <see cref="Language"/>: the language's name (CodeGraph's, else the factory's by extension),
+/// or null when neither names one. <see cref="Flagged"/>: CodeGraph said so (<c>languageIndexed: false</c>); false — CodeGraph answered
+/// no flag (it predates C3) and the factory knows that language was not indexed before C3 (<see cref="LanguageCoverage.UnindexedBeforeC3"/>).
+/// </summary>
+public sealed record UnindexedFile(string Path, string? Language, bool Flagged)
+{
+    /// <summary>How the gate's reason and row name it: the file and its language.</summary>
+    public override string ToString() =>
+        $"{Path} ({Language ?? "language unknown"}{(Flagged ? "" : "; CodeGraph answered no languageIndexed flag (before C3)")})";
+}
+
+/// <summary>
+/// Whether CodeGraph indexes a touched file's language (sc-26133, P5 S7; the CodeGraph side is C3, sc-26137). The contract: the
+/// structured content of <c>analyze_impact_file</c> and <c>file_hotspot</c> carries <c>languageIndexed</c> (boolean: false only for a
+/// source file of a language CodeGraph does not index; true for an indexed language and for a file that is not code) and
+/// <c>language</c> (CodeGraph's name of the file's language, or null). Owner decision 2026-10-14: the gate fails closed on a changed
+/// code file whose language CodeGraph does not index, and passes once it does. Rule (<see cref="Of"/>): <c>languageIndexed: false</c> in
+/// either answer → unindexed; <c>true</c> → indexed (CodeGraph's word); no flag (a CodeGraph that predates C3; E7: .NET and Rust are
+/// unchanged) → unindexed only when the file's extension is one of <see cref="UnindexedBeforeC3"/> and CodeGraph had no data for it
+/// (<c>found</c> not true: a CodeGraph with graph data for a file indexes its language).
+/// </summary>
+public static class LanguageCoverage
+{
+    /// <summary>The code languages, by extension (case-insensitive), CodeGraph did not index before C3: today Swift.</summary>
+    public static readonly IReadOnlyDictionary<string, string> UnindexedBeforeC3 =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [".swift"] = "Swift" };
+
+    /// <summary>The language <see cref="UnindexedBeforeC3"/> names for <paramref name="path"/>'s extension, or null.</summary>
+    public static string? KnownUnindexed(string path) =>
+        UnindexedBeforeC3.TryGetValue(System.IO.Path.GetExtension(path), out var language) ? language : null;
+
+    /// <summary>Whether <paramref name="path"/> is a file whose language CodeGraph does not index, from one answer's fields; null: it is not.</summary>
+    public static UnindexedFile? Of(string path, bool? languageIndexed, string? language, bool? found) => languageIndexed switch
+    {
+        false => new UnindexedFile(path, string.IsNullOrWhiteSpace(language) ? KnownUnindexed(path) : Cut(language), Flagged: true),
+        true => null,
+        null when found != true && KnownUnindexed(path) is { } known => new UnindexedFile(path, known, Flagged: false),
+        _ => null,
+    };
+
+    private static string Cut(string s) => s.Length > 60 ? s[..60] : s;
+}
 
 /// <summary>
 /// CodeGraph's per-file risk tools, owner-side (sc-25709): <c>analyze_impact_file</c> and <c>file_hotspot</c>. Called only by the
@@ -77,9 +124,11 @@ public sealed record FileBlastRadius(string Path, BlastRadius Radius, bool Found
 /// <see cref="CommitSha"/>: the commit the metrics were computed at, or the default-branch index commit when the file has no metrics
 /// (<see cref="Found"/> false: counted as 0) or CodeGraph did not record the metrics' commit (<see cref="VitalsCommitUnknown"/>: the
 /// score is used, labelled "vitals commit unknown; index at &lt;sha&gt;"). <see cref="IndexCommitSha"/>: the default-branch index commit
-/// CodeGraph named (null: the same as <see cref="CommitSha"/>), which keys <see cref="HotspotCache"/>.
+/// CodeGraph named (null: the same as <see cref="CommitSha"/>), which keys <see cref="HotspotCache"/>. <see cref="Unindexed"/>: the
+/// answer said the file's language is not indexed (kept with a cached score).
 /// </summary>
-public sealed record FileHotspot(string Path, double Score, bool Found, string CommitSha, string? IndexCommitSha = null, bool VitalsCommitUnknown = false)
+public sealed record FileHotspot(string Path, double Score, bool Found, string CommitSha, string? IndexCommitSha = null, bool VitalsCommitUnknown = false,
+    UnindexedFile? Unindexed = null)
 {
     /// <summary>The default-branch index commit the score was read against.</summary>
     public string IndexCommit => IndexCommitSha ?? CommitSha;
@@ -96,11 +145,15 @@ public sealed record FileHotspot(string Path, double Score, bool Found, string C
 /// first): non-empty, <c>risk-threshold</c> is pending unless a file already read is over a limit — the gate waits like pending CI and
 /// escalates at <c>Gate:CiTimeoutMinutes</c> (E4). <see cref="OverlayUnusable"/>: CodeGraph answered that it has no usable overlay of
 /// the head (C4's <c>notIndexed</c>, e.g. a ready overlay gone stale once the default branch moved past its base), so a recorded ready
-/// overlay must not be reused: the next read requests the overlay again.
+/// overlay must not be reused: the next read requests the overlay again. <see cref="Unindexed"/>: the touched files whose language
+/// CodeGraph does not index (<see cref="LanguageCoverage"/>, sc-26133): each fails <c>risk-threshold</c> closed.
 /// </summary>
 public sealed record CodeGraphRisk(string HeadSha, IReadOnlyList<FileBlastRadius> BlastRadius, IReadOnlyList<FileHotspot> Hotspots,
-    IReadOnlyList<string> Unreadable, bool OverlayUnusable = false)
+    IReadOnlyList<string> Unreadable, bool OverlayUnusable = false, IReadOnlyList<UnindexedFile>? Unindexed = null)
 {
+    /// <summary>The touched files whose language CodeGraph does not index (none when <see cref="Unindexed"/> is null).</summary>
+    public IReadOnlyList<UnindexedFile> UnindexedFiles => Unindexed ?? [];
+
     /// <summary>
     /// How many files <see cref="Describe"/> lists beyond those over a limit and the worst and hottest (and how many unreadable entries
     /// it quotes), so one <c>gate</c> row stays well inside the reports' budget (<see cref="Ledger.LedgerReport.MaxFactsLength"/>) whatever
@@ -129,6 +182,7 @@ public sealed record CodeGraphRisk(string HeadSha, IReadOnlyList<FileBlastRadius
             f => (maxHotspot is { } m && f.Score > m) || ReferenceEquals(f, hottest), f => $"{f.Path} {Score(f.Score)}{(f.Found ? "" : " (no data)")}", ", "));
         return $"codegraph blast radius at {HeadSha}: {(BlastRadius.Count == 0 ? "none read" : blast)}"
             + $"; hotspot score (riskScore) on the default branch: {(Hotspots.Count == 0 ? "none read" : string.Join("; ", hot))}"
+            + (UnindexedFiles.Count == 0 ? "" : $"; language not indexed by CodeGraph: {Listed(UnindexedFiles, _ => false, u => u.ToString(), ", ")}")
             + (Unreadable.Count == 0 ? "" : $"; unreadable: {UnreadableText}");
     }
 
@@ -202,7 +256,15 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
         var unreadable = new List<string>();
         var blast = new List<FileBlastRadius>();
         var scores = new List<FileHotspot>();
-        CodeGraphRisk Result(bool overlayUnusable = false) => new(headSha, blast, scores, unreadable, overlayUnusable);
+        var unindexed = new List<UnindexedFile>();
+        CodeGraphRisk Result(bool overlayUnusable = false) => new(headSha, blast, scores, unreadable, overlayUnusable, unindexed);
+        void Unindexed(UnindexedFile? file)
+        {
+            if (file is not null && unindexed.All(u => u.Path != file.Path))
+            {
+                unindexed.Add(file);
+            }
+        }
         string? project;
         try
         {
@@ -239,6 +301,7 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
                 // CodeGraph has no usable overlay of the head (e.g. the recorded one went stale): the next read requests it again.
                 return Result(overlayUnusable: answer.NotIndexed is not null);
             }
+            Unindexed(LanguageCoverage.Of(path, answer.LanguageIndexed, answer.Language, answer.Found));
             blast.Add(answer.Found == true && BlastRadii.TryParse(answer.BlastRadius, out var radius)
                 ? new FileBlastRadius(path, radius, true)
                 : new FileBlastRadius(path, BlastRadius.None, false));
@@ -249,6 +312,7 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
             if (hotspots is not null && hotspots.TryGet(path, overlay.BaseSha, out var known))
             {
                 scores.Add(known!);
+                Unindexed(known!.Unindexed);
                 continue;
             }
             if (await Call(() => codeGraph.FileHotspotAsync(project, path, ct), CodeGraphMcpClient.FileHotspotTool, path, unreadable, ct) is not { } answer)
@@ -260,7 +324,12 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
                 unreadable.Add(why);
                 return Result();
             }
-            var score = Score(answer, path);
+            var score = Score(answer, path) with
+            {
+                // A hotspot answer counts only when it says "not indexed": an absent flag was judged on the impact answer above.
+                Unindexed = answer.LanguageIndexed == false ? LanguageCoverage.Of(path, false, answer.Language, answer.Found) : null,
+            };
+            Unindexed(score.Unindexed);
             scores.Add(score);
             hotspots?.Add(score);
         }

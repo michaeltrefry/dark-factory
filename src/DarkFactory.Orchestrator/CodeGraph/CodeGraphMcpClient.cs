@@ -160,13 +160,15 @@ public sealed partial class CodeGraphMcpClient : ICodeGraph, ICodeGraphRisk
     /// <summary>
     /// An <c>analyze_impact_file</c> answer (C7): CodeGraph's <c>CommitAnswer.Create</c> structured content (<c>commitSha</c>,
     /// <c>source</c>, …) carrying the tool's fields <c>found</c> and <c>blastRadius</c>; a SHA with no ready overlay is C4's
-    /// <c>notIndexed</c>; an error is <c>isError</c> with <c>{"error": {code, message}}</c>.
+    /// <c>notIndexed</c>; an error is <c>isError</c> with <c>{"error": {code, message}}</c>. C3 (sc-26137) adds <c>languageIndexed</c>
+    /// and <c>language</c> (<see cref="LanguageCoverage"/>).
     /// </summary>
     public static ImpactFileAnswer ImpactFile(McpToolResult result)
     {
         var s = result.Structured as JsonObject;
         return new ImpactFileAnswer(result.IsError, result.Text, Commit(result.Structured, result.Text), NotIndexedOf(result.Structured),
-            s?["error"] is JsonObject e ? Str(e, "code") : null, Bool(s, "found"), Str(s, "blastRadius"), Str(s, "path"));
+            s?["error"] is JsonObject e ? Str(e, "code") : null, Bool(s, "found"), Str(s, "blastRadius"), Str(s, "path"),
+            Bool(s, "languageIndexed"), Str(s, "language"));
     }
 
     /// <summary>
@@ -180,7 +182,8 @@ public sealed partial class CodeGraphMcpClient : ICodeGraph, ICodeGraphRisk
         var s = result.Structured as JsonObject;
         double? score = s?["riskScore"] is JsonValue v && v.TryGetValue<double>(out var d) ? d : null;
         return new HotspotAnswer(result.IsError, result.Text, Commit(result.Structured, result.Text), Str(s, "source"),
-            s?["error"] is JsonObject e ? Str(e, "code") : null, Bool(s, "found"), score, Str(s, "path"), Sha(s, "indexCommitSha"));
+            s?["error"] is JsonObject e ? Str(e, "code") : null, Bool(s, "found"), score, Str(s, "path"), Sha(s, "indexCommitSha"),
+            Bool(s, "languageIndexed"), Str(s, "language"));
     }
 
     /// <summary>A full 40-hex sha field, lowercased; otherwise null (never guessed).</summary>
