@@ -521,13 +521,16 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
 
     /// <summary>
     /// How long to wait before retrying, or null to fail now. A 429 was not processed, so any call is
-    /// retried; a 502/503/504 may have been, so only calls that are safe to repeat (GET, PUT) are.
+    /// retried; a 502/503/504 may have been, so only calls that are safe to repeat (GET, PUT) are. A 409 on a PUT is a
+    /// concurrent write to the story that Shortcut refused, nothing written: seen live when its GitHub integration recorded the
+    /// pushed branch on the story in the same second as the factory's link write (sc-25992), so the PUT is sent again.
     /// </summary>
     private TimeSpan? RetryDelay(HttpMethod method, HttpResponseMessage response, int attempt)
     {
         var retryable = response.StatusCode == HttpStatusCode.TooManyRequests
             || (response.StatusCode is HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout
-                && (method == HttpMethod.Get || method == HttpMethod.Put));
+                && (method == HttpMethod.Get || method == HttpMethod.Put))
+            || (response.StatusCode == HttpStatusCode.Conflict && method == HttpMethod.Put);
         if (!retryable)
         {
             return null;

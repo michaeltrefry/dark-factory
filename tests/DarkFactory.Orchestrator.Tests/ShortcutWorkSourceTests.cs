@@ -104,6 +104,36 @@ public class ShortcutWorkSourceTests
     }
 
     [Fact]
+    public async Task A_put_refused_409_for_a_concurrent_write_is_sent_again()
+    {
+        // sc-25992, the live P2-AT1 re-run: Shortcut's GitHub integration recorded the pushed branch on the story in the same
+        // second as the factory's link write, which Shortcut refused 409 Conflict and the item escalated.
+        var (api, time, source) = Api();
+        api.On("GET /api/v3/stories/1", _ => FakeApi.Json(HttpStatusCode.OK, StoryJson));
+        var puts = 0;
+        api.On("PUT /api/v3/stories/1", _ => ++puts == 1
+            ? FakeApi.Json(HttpStatusCode.Conflict, """{"message":"Conflict"}""")
+            : FakeApi.Json(HttpStatusCode.OK, """{"id":1}"""));
+
+        await source.LinkAsync(1, ["https://github.com/o/r/pull/1"], CancellationToken.None);
+
+        Assert.Equal(2, puts);
+        Assert.Equal([TimeSpan.FromSeconds(1)], time.Delays);
+    }
+
+    [Fact]
+    public async Task A_post_refused_409_is_not_repeated()
+    {
+        var (api, time, source) = Api();
+        api.On("POST /api/v3/stories/1/comments", _ => FakeApi.Json(HttpStatusCode.Conflict, """{"message":"Conflict"}"""));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => source.CommentAsync(1, "hi", CancellationToken.None));
+
+        Assert.Single(api.Requests);
+        Assert.Empty(time.Delays);
+    }
+
+    [Fact]
     public async Task Unavailable_post_is_not_repeated_because_it_may_have_been_processed()
     {
         var (api, time, source) = Api();
