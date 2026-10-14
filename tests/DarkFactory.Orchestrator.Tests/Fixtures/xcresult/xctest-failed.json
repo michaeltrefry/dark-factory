@@ -1,0 +1,59 @@
+{
+  "devices" : [
+    {
+      "architecture" : "arm64",
+      "deviceId" : "00000000-0000000000000000",
+      "deviceName" : "My Mac",
+      "modelName" : "MacBook Pro",
+      "osBuildNumber" : "25G83",
+      "osVersion" : "26.6.2",
+      "platform" : "macOS"
+    }
+  ],
+  "testNodes" : [
+    {
+      "children" : [
+        {
+          "children" : [
+            {
+              "children" : [
+                {
+                  "children" : [
+                    {
+                      "name" : "More.swift:10: XCTAssertTrue failed",
+                      "nodeType" : "Failure Message"
+                    }
+                  ],
+                  "duration" : "0.35s",
+                  "durationInSeconds" : 0.3461500406265259,
+                  "name" : "testOld()",
+                  "nodeIdentifier" : "Legacy/testOld()",
+                  "nodeIdentifierURL" : "test://com.apple.xcode/Words/WordsTests/Legacy/testOld",
+                  "nodeType" : "Test Case",
+                  "result" : "Failed"
+                }
+              ],
+              "name" : "Legacy",
+              "nodeIdentifierURL" : "test://com.apple.xcode/Words/WordsTests/Legacy",
+              "nodeType" : "Test Suite",
+              "result" : "Failed"
+            }
+          ],
+          "name" : "WordsTests",
+          "nodeIdentifierURL" : "test://com.apple.xcode/Words/WordsTests",
+          "nodeType" : "Unit test bundle",
+          "result" : "Failed"
+        }
+      ],
+      "name" : "Words",
+      "nodeType" : "Test Plan",
+      "result" : "Failed"
+    }
+  ],
+  "testPlanConfigurations" : [
+    {
+      "configurationId" : "1",
+      "configurationName" : "Test Scheme Action"
+    }
+  ]
+}

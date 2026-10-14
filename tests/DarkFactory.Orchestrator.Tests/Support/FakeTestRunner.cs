@@ -82,9 +82,9 @@ internal sealed class FakeTestRunner : IGateTestRunner
         {
             return []; // reads the test step's bundle
         }
-        if (args.Contains("--xunit-output"))
+        if (args.Contains("--xunit-output") || args.Contains("--disable-swift-testing"))
         {
-            // swift test (SwiftNewTests.Filter): ^<id, escaped>(/|$)
+            // swift test (SwiftNewTests.Filter), Swift Testing's or XCTest's: ^<id, escaped>(/|$)
             var swift = args.SkipWhile(a => a != "--filter").Skip(1).First();
             return [System.Text.RegularExpressions.Regex.Replace(swift[1..^"(/|$)".Length], @"\\(.)", "$1")];
         }

@@ -2863,8 +2863,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `path:` (at the base and the head), whose id no base version of a changed file has; the id is Swift Testing's own
   (`WordsTests.blank()`, `WordsTests.Outer/Inner/deep()`, what `swift test list` prints). Overlay: every changed file under a
   package's `Tests/` from the head; manifest and production code stay the base's. Unisolable (`unsupported`, later stories'
-  seams): a parameterized test (`@Test(arguments:)` or parameters; S3), a new XCTest `func test…()` in a file importing
-  XCTest (S3), a new test or a test-looking `.swift` file outside a SwiftPM test target (an Xcode project: S5), a test target
+  seams): an existing parameterized test whose `arguments:` the PR changes, a test-looking XCTest method the gate cannot run
+  apart (both S3, below), a new test or a test-looking `.swift` file outside a SwiftPM test target (an Xcode project: S5), a test target
   the base does not declare, a version-specific manifest, an id declared twice, a backticked name, an unreadable changed file
   that may hold tests. Runs (`SandboxTestRunner`, as `_factory`): `swift --version` (toolchain), `/bin/mkdir -p` of the
   results directory (SwiftPM writes no report into a missing one), `swift package resolve` (the restore, the only network
@@ -2915,6 +2915,40 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   skipped without `swift`), `SwiftBaseBuildTests.cs` (the layout, not-built, error, retries in stages, unproven; the real
   toolchain: a test of a function the base lacks `not-built` and the check a pass, an import of a module the base lacks
   then its user in stages, a broken production file `error`).
+  XCTest and parameterized tests (Phase 5 S3, sc-26129, both SwiftPM and Xcode; `Gate/SwiftXCTest.cs`, `SwiftSource` now
+  also records types — keyword, names, inheritance entries, generic, attributes, under `#if` — and per function its
+  modifiers, generic clause, signature tail, `#if` and container). Parameterized (`@Test(arguments:)`): one test, its id the
+  signature (`WordsTests.blanks(text:)`, `WordsTests/Params/blanks(text:)`); Swift 6.3.2's xUnit report gives all its cases
+  one `testcase` (failed if any case failed), and Xcode 26.5's result bundle a `Test Case` with an `Arguments` child per
+  case — each read as a case of the test, so it passes on the head only when the test and every case passed. An existing
+  test whose `arguments:` change (`SwiftFunc.TestArguments`, its tokens: layout and comments do not count) is `unsupported`.
+  XCTest: when a changed file of a test target declares a class or a test-looking method (`SwiftXCTest.IsCandidate`: an
+  unparameterized `test…` method of a class or extension, no `@Test`), EVERY `.swift` file of the target (SwiftPM:
+  `Tests/<target>/`; Xcode: every file the target compiles) is read at the head and the base (`SwiftXCTest.Discover`): a
+  class is a test class when its first inheritance entry is `XCTestCase` or a test class of the module; its tests are its
+  own instance methods and those it inherits (an override once), so a new base-class method is a new test of every
+  subclass, and a new subclass's inherited tests are new tests (judged like any: one that passes on the base is rejected).
+  New ids: SwiftPM `Target.Class/testMethod` (what `swift test list` prints), Xcode `Target/Class/testMethod()` (what the
+  bundle names; `-only-testing` takes it). Fail closed — a new test-looking method is `unsupported` when its class inherits
+  a class the module does not declare (another module's), is nested, generic, declared twice or under `#if`, or carries
+  `@objc`; when it is in an extension of a test class (or of a type the module lacks, in a file importing XCTest), under
+  `#if`, private/fileprivate, generic, `@objc`, backticked, or returns anything (only `async`/`throws`); when a class
+  inherits one of those; and when a file of the target cannot be read or placed. `static`/`class` methods and classes that
+  inherit nothing (or a module protocol, `NSObject`) are not tests. SwiftPM runs an XCTest test with XCTest alone (`swift
+  test --skip-build --disable-swift-testing --filter '^<id>(/|$)'`, no `--xunit-output`: SwiftPM writes XCTest's xUnit only
+  with `--parallel`, where an `XCTSkip` reads as passed — verified) and reads XCTest's own stdout lines
+  (`SwiftNewTests.XCTestCases`: `Test Case '-[T.C m]' started.`/`passed|failed|skipped (N seconds).` on Apple platforms,
+  `Test Case 'C.m' …` on Linux — the target is in the kept output's name, `swift-xctest-<hash>-<target hex>.out`), each
+  test started before it ends, ended once, its id the step's, the exit code agreeing; an output mentioning an expected
+  failure reads passes as skipped; a filter matching nothing is no case. Residual, accepted (as cargo's (a)): a test that
+  prints a complete fake XCTest report of itself and picks its exit code is read as what it printed. S2's base-build
+  attribution covers XCTest methods (a new method's own body or its class's header → `not-built`). Fixed beside it: Swift
+  Testing's xUnit `failures` counts issues, not failed cases (a test with two failing `#expect`s was unreadable), now
+  checked against the `<failure>`/`<error>` elements. Tests: `SwiftXCTestTests.cs` (the reader, discovery, SwiftPM and
+  Xcode identification, XCTest's console lines, recorded result bundles `Fixtures/xcresult/xctest-*.json` and
+  `parameterized-*.json`), and the real toolchains (`SwiftRunnerTests`, `XcodeRunnerTests`: a new XCTest method, a
+  subclass inheriting it — SwiftPM's on macOS only — and a parameterized test judged; a vacuous and a skipped XCTest test
+  rejected).
   Xcode projects, macOS (Phase 5 S5, sc-26131, `Gate/XcodeNewTests.cs` over `Gate/XcodeProject.cs`): only with `Worker:Swift`
   on (`NewTestsCheck.StrategiesFor(swift)`, which the pipeline's `swift` parameter picks; off, it is exactly `Strategies` and
   `SwiftNewTests` names an Xcode project's test file `unsupported` "… only in a factory with Worker:Swift on", E7). On,
@@ -2936,7 +2970,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   that any other target also compiles — at the head, or at the base where the overlay writes or removes it (a production
   file the PR moves into the test target) — ("… is compiled by both a test target and <target> at the head|base: the gate
   cannot apply its test code alone": it would carry head production code into the base run), a membership or project that
-  cannot be read, a parameterized test or new XCTest method (S3), a backticked name or an id/path/scheme the wrapper's
+  cannot be read, an existing parameterized test whose arguments change or an XCTest method the gate cannot run apart (S3), a backticked name or an id/path/scheme the wrapper's
   patterns refuse, an id declared twice, a target that does not build for macOS in its scheme's test configuration
   (`SDKROOT` `macosx`, or `auto` with `macosx` in `SUPPORTED_PLATFORMS`; one set only in an `.xcconfig` is not known; iOS is
   S6), a test bundle not named for its target (`PRODUCT_NAME` set to anything but `$(TARGET_NAME)` or the target's name, at

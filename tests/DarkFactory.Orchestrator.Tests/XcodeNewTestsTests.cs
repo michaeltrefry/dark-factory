@@ -594,8 +594,9 @@ public class XcodeIdentifyTests
     }
 
     [Theory]
-    [InlineData("@Test(arguments: [1, 2]) func many(n: Int) {}", "WordsTests/many(n:) in WordsTests/BlankTests.swift is a parameterized test")]
-    [InlineData("final class Legacy: XCTestCase { func testOld() {} }", "WordsTests/Legacy/testOld() in WordsTests/BlankTests.swift is a new XCTest test method")]
+    [InlineData("final class Legacy: SharedCase { func testOld() {} }",
+        "WordsTests/Legacy/testOld() in WordsTests/BlankTests.swift is a new XCTest test method the gate cannot run apart: its class Legacy: it inherits SharedCase")]
+    [InlineData("final class Legacy: XCTestCase { private func testOld() {} }", "WordsTests/Legacy/testOld() in WordsTests/BlankTests.swift is a new XCTest test method the gate cannot run apart: it is private")]
     [InlineData("@Test func `with spaces`() {}", "has a backticked name")]
     public async Task Tests_the_gate_cannot_run_apart_yet_are_unsupported(string declaration, string why)
     {
@@ -1010,6 +1011,37 @@ public class XcodeRunnerTests : IDisposable
         Assert.True(rejected.Outcome == NewTestsOutcome.Rejected, $"{rejected.Outcome}: {rejected.Reason}");
         Assert.EndsWith("so they check nothing: WordsTests/WordsTests/one()", rejected.Reason);
         Assert.Empty(Directory.EnumerateDirectories(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name)));
+    }
+
+    /// <summary>
+    /// sc-26129: a new XCTest method — in its class and in a subclass that inherits it — and a new parameterized test (one
+    /// test, judged from its test case and every argument's), each run alone by -only-testing on the base and the head.
+    /// </summary>
+    [Fact]
+    public async Task With_xcode_a_new_xctest_method_its_subclass_and_a_parameterized_test_are_run_alone_and_judged()
+    {
+        Assert.SkipUnless(HasXcode.Value, "Xcode is not installed");
+        foreach (var (path, content) in XcodeFixture.Files())
+        {
+            Write(path, content);
+        }
+        var baseSha = CommitAndPush("base", "main");
+        TestGit.Run(_seed, "checkout", "-q", "-b", "factory/sc-5");
+        Write(XcodeFixture.Library, XcodeFixture.Fixed);
+        Write("WordsTests/LegacyTests.swift", "import XCTest\n@testable import Words\n\nclass LegacyTests: XCTestCase {\n"
+            + "    func testBlank() async throws { XCTAssertTrue(isBlank(\" \")) }\n}\n\nfinal class MoreTests: LegacyTests {}\n");
+        Write("WordsTests/Params.swift", "import Testing\n@testable import Words\n\nstruct Params {\n"
+            + "    @Test(arguments: [\"\", \" \", \"\\t\"]) func blanks(text: String) { #expect(isBlank(text)) }\n}\n");
+        var head = CommitAndPush("fix", "factory/sc-5");
+
+        var pass = await Check(baseSha, head);
+
+        Assert.True(pass.Outcome == NewTestsOutcome.Pass, $"{pass.Outcome}: {pass.Reason}");
+        Assert.Equal(
+            [("WordsTests/LegacyTests/testBlank()", "failed", "passed"), ("WordsTests/MoreTests/testBlank()", "failed", "passed"), ("WordsTests/Params/blanks(text:)", "failed", "passed")],
+            pass.Tests.Select(t => (t.Test, t.Base, t.Head)).OrderBy(t => t.Test, StringComparer.Ordinal));
+        // The parameterized test: its test case and its three arguments' cases, on both commits.
+        Assert.Equal((4, 4), pass.Tests.Where(t => t.Test.EndsWith("blanks(text:)", StringComparison.Ordinal)).Select(t => (t.BaseCases.Count, t.HeadCases.Count)).Single());
     }
 
     [Fact]

@@ -298,11 +298,8 @@ public class SwiftIdentifyTests
     }
 
     [Theory]
-    [InlineData(TestFile, BaseTests + "@Test(arguments: [1, 2]) func many(n: Int) { #expect(n > 0) }\n",
-        "WordsTests.many(n:) in Tests/WordsTests/WordsTests.swift is a parameterized test")]
-    [InlineData(TestFile, BaseTests + "@Test func withParameter(n: Int) {}\n", "is a parameterized test")]
-    [InlineData("Tests/WordsTests/LegacyTests.swift", "import XCTest\nfinal class LegacyTests: XCTestCase { func testBlank() {} }\n",
-        "WordsTests.LegacyTests/testBlank() in Tests/WordsTests/LegacyTests.swift is a new XCTest test method")]
+    [InlineData("Tests/WordsTests/LegacyTests.swift", "import XCTest\nfinal class LegacyTests: SharedCase { func testBlank() {} }\n",
+        "WordsTests.LegacyTests/testBlank() in Tests/WordsTests/LegacyTests.swift is a new XCTest test method the gate cannot run apart: its class LegacyTests: it inherits SharedCase, which this module does not declare")]
     [InlineData("Sources/Words/Inline.swift", "import Testing\n@Test func inProduction() {}\n",
         "Sources/Words/Inline.swift adds test(s) inProduction() the gate cannot run: it is outside the package's Tests/<target>/ directories")]
     [InlineData("Tests/OtherTests/OtherTests.swift", "import Testing\n@Test func undeclared() {}\n",
@@ -741,5 +738,47 @@ public class SwiftRunnerTests : IDisposable
         Assert.True(rejected.Outcome == NewTestsOutcome.Rejected, $"{rejected.Outcome}: {rejected.Reason}");
         Assert.EndsWith("so they check nothing: WordsTests.one()", rejected.Reason);
         Assert.Empty(Directory.EnumerateDirectories(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name)));
+    }
+
+    /// <summary>
+    /// sc-26129: a new XCTest method (run with XCTest alone, read from XCTest's own lines — Apple's or Linux's) and a new
+    /// parameterized Swift Testing test (one test, all its cases), each failing on the base and passing on the head; a new
+    /// method a subclass inherits is judged in the subclass too (macOS: where the gate runs); a skipped XCTest test is no pass.
+    /// </summary>
+    [Fact]
+    public async Task With_swift_a_new_xctest_method_and_a_new_parameterized_test_are_run_alone_and_judged()
+    {
+        Assert.SkipUnless(HasSwift.Value, "swift is not installed");
+        Write("Package.swift", SwiftIdentifyTests.Manifest);
+        Write("Sources/Words/Words.swift", SwiftIdentifyTests.BaseLibrary);
+        Write(SwiftIdentifyTests.TestFile, SwiftIdentifyTests.BaseTests);
+        Write(".gitignore", ".build/\n");
+        var baseSha = CommitAndPush("base", "main");
+        TestGit.Run(_seed, "checkout", "-q", "-b", "factory/sc-5");
+        Write("Sources/Words/Words.swift", SwiftIdentifyTests.FixedLibrary);
+        const string legacy = "import XCTest\n@testable import Words\n\nclass LegacyTests: XCTestCase {\n    func testBlank() throws { XCTAssertEqual(count(\"\"), 0) }\n}\n";
+        Write("Tests/WordsTests/LegacyTests.swift", legacy + (OperatingSystem.IsMacOS() ? "final class MoreTests: LegacyTests {}\n" : ""));
+        Write(SwiftIdentifyTests.TestFile, SwiftIdentifyTests.BaseTests + "@Test(arguments: [\"\", \"  \"]) func blanks(text: String) { #expect(count(text) == 0) }\n");
+        var passing = CommitAndPush("fix", "factory/sc-5");
+
+        var pass = await Check(baseSha, passing);
+
+        Assert.True(pass.Outcome == NewTestsOutcome.Pass, $"{pass.Outcome}: {pass.Reason}");
+        Assert.Equal(
+            new[] { ("WordsTests.LegacyTests/testBlank", "failed", "passed"), ("WordsTests.blanks(text:)", "failed", "passed") }
+                .Concat(OperatingSystem.IsMacOS() ? [("WordsTests.MoreTests/testBlank", "failed", "passed")] : []).OrderBy(t => t.Item1, StringComparer.Ordinal),
+            pass.Tests.Select(t => (t.Test, t.Base, t.Head)).OrderBy(t => t.Test, StringComparer.Ordinal));
+        Assert.All(pass.Tests, t => Assert.Equal((1, 1), (t.BaseCases.Count, t.HeadCases.Count)));
+
+        Write("Tests/WordsTests/LegacyTests.swift", legacy.Replace("    func testBlank()",
+            "    func testOne() { XCTAssertEqual(count(\"a\"), 1) }\n    func testLater() throws { throw XCTSkip(\"not yet\") }\n    func testBlank()"));
+        var vacuous = CommitAndPush("a test that checks nothing and one that skips", "factory/sc-5");
+
+        var rejected = await Check(baseSha, vacuous);
+
+        Assert.True(rejected.Outcome == NewTestsOutcome.Rejected, $"{rejected.Outcome}: {rejected.Reason}");
+        Assert.Contains("so they check nothing: WordsTests.LegacyTests/testOne", rejected.Reason);
+        Assert.Contains("new test(s) are skipped on the base", rejected.Reason);
+        Assert.Contains("WordsTests.LegacyTests/testLater (skipped)", rejected.Reason);
     }
 }
