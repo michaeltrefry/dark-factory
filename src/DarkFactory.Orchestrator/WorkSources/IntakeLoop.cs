@@ -15,6 +15,14 @@ public interface IItemRunner
     Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct);
 
     /// <summary>
+    /// <see cref="InFlightAsync"/>, in its order, each item with what its run does (sc-25992): one being stopped and a plan item
+    /// waiting on its stories are started by the intake loop every poll outside its run capacity (<see cref="InFlightItem"/>). The
+    /// default marks none, for a runner with no controls and no plans.
+    /// </summary>
+    async Task<IReadOnlyList<InFlightItem>> InFlightItemsAsync(CancellationToken ct) =>
+        [.. (await InFlightAsync(ct)).Select(id => new InFlightItem(id))];
+
+    /// <summary>
     /// Items whose claim the poll keeps (sc-25983, <see cref="IWorkSource.RenewClaimAsync"/>): every item the ledger would resume
     /// by itself — in a state the pipeline drives, or paused in a way that resumes by itself — whatever a Pause, the usage pause
     /// or the freeze says now (those only hold the item for a while; its claim must outlast them), except items being stopped
@@ -43,15 +51,26 @@ public interface IItemRunner
 }
 
 /// <summary>
+/// An item in flight (<see cref="IItemRunner.InFlightItemsAsync"/>). <paramref name="Stopping"/>: it is being stopped — its run
+/// finishes the stop and starts no new work. <paramref name="WaitingPlan"/>: a plan item waiting on its stories
+/// (<c>Planned</c>) — its run evaluates the plan (releases, a closeout, the changeset pull request opened) and ends, running no
+/// worker. The intake loop starts both every poll whatever run capacity is left, without counting them against
+/// <see cref="IntakeOptions.MaxConcurrentRuns"/> (a waiting plan only while no factory-wide control holds new work).
+/// </summary>
+public sealed record InFlightItem(int Id, bool Stopping = false, bool WaitingPlan = false);
+
+/// <summary>
 /// <c>factory work</c>: polls the work sources at a fixed interval (the Mac exposes no webhook
 /// endpoint) and runs each in-flight or ready item through the pipeline, up to
 /// <see cref="IntakeOptions.MaxConcurrentRuns"/> at once (sc-25988; 1, the default: one after another). Each item is started
 /// at most once per poll, in the poll's order (each lane's in-flight items, then its ready ones). A poll does not wait for its runs
 /// (sc-25992): the loop polls again on its interval while they go on, each poll renewing every lane's claims and starting work
-/// only into the capacity the runs in flight leave, never a second run of an item this loop has in flight. Runs overlap
+/// only into the capacity the runs in flight leave, never a second run of an item this loop has in flight. A poll that found no
+/// capacity free is owed: the end of a run that frees capacity starts the next poll at once, as the serial loop's poll came at
+/// once on the tick that passed during its runs. Items being stopped and plan items waiting on their stories
+/// (<see cref="InFlightItem"/>) are started every poll outside that capacity, one run per item all the same. Runs overlap
 /// outside the phases that use a sandbox user, and inside them one per worker slot (<see cref="WorkerLock"/>: a run waits for its
-/// slot there), and one repository's
-/// merges stay one at a time (the merge queue's turn). The
+/// slot there), and one repository's merges stay one at a time (the merge queue's turn). The
 /// pipeline's Intake claims the item; its run lock stops a second run — of this process or another — running the same item.
 /// While the factory is paused (<see cref="Controls.ControlScope.Factory"/>, the usage pause
 /// <see cref="Controls.ControlScope.Usage"/>, or the freeze <see cref="Controls.ControlScope.Freeze"/>) it lists no new ready items; the runner leaves out in-flight items a
@@ -64,9 +83,13 @@ public interface IItemRunner
 /// the loop gives up on the item (<see cref="IItemRunner.GiveUpAsync"/>) instead of retrying it every poll.
 /// <paramref name="lanes"/> holds one lane per work source that is watched or has its credential (sc-25982,
 /// <see cref="WorkSourceRegistry.Lanes"/>: any set of them, in <see cref="WorkSourceRegistry.Kinds"/> order; an unwatched one
-/// lists nothing ready and only has its in-flight items finished; none polls nothing), listed in turn by the same loop
-/// before any item of the poll runs (so a lane's preparation — a triage — runs beside no item run of this process); a source
-/// whose listing fails is skipped for that poll without holding up the others. Items are
+/// lists nothing ready and only has its in-flight items finished; none polls nothing), listed in turn by the same loop. A lane's
+/// preparation (<see cref="IntakeLane.Prepare"/>: a triage) runs off the loop's own task (sc-25992): at most one per lane at a
+/// time, started by a poll that lists, while later polls go on renewing claims; it shares the worker slots with the items'
+/// worker phases through their lock (<see cref="WorkerLock"/>), so it never runs as a sandbox user another phase is using. When it
+/// ends the loop polls at once (a poll that starts no preparation), so the items it released are listed then; a preparation that
+/// failed is that poll's failure, as it was the failure of the poll it ran in. (<see cref="PollOnceAsync"/> prepares inline, before
+/// listing.) A source whose listing fails is skipped for that poll without holding up the others. Items are
 /// keyed by their external id (<c>sc-12</c>, <c>gh-3</c>, <c>kb-4</c>) on the dashboard. A run deferred by the freeze evaluator
 /// (<see cref="RunOutcome.Deferred"/>) is shown on the dashboard and ends the poll's new work: no ready item of any lane is
 /// started after it, and no further in-flight item of its lane — but every lane's in-flight items are started up to then, and
@@ -81,7 +104,10 @@ public interface IItemRunner
 /// first check (or finishing its Stop); (2) a run the freeze deferred, as above — every deferred run is shown, not only the
 /// last; (3) a factory-wide failure of one run: shown once per poll however many runs or listings hit it
 /// (<see cref="IntakeStatus.FactoryFailedAlso"/>), it starts nothing more, and it is never a failure of its own item or of a
-/// run beside it — a sibling's own failure is counted against that sibling alone, as ever.
+/// run beside it — a sibling's own failure is counted against that sibling alone, as ever. Status across polls (sc-25992): a
+/// run's end clears the runs' deferrals only when its poll is the newest and was not itself deferred by the freeze evaluator, and
+/// a poll says the factory is fine only once it has listed, its dispatch has ended, it is the newest that listed, and no poll
+/// after it hit a factory-wide failure (a poll with no capacity free lists nothing ready and says nothing of the factory).
 /// <paramref name="freeze"/>, when set, is the
 /// freeze evaluator run at the start of each poll: frozen (or unable to check), no lane is prepared (no triage) or listed.
 /// </summary>
@@ -100,20 +126,32 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
     private int _waits;
 
     /// <summary>
-    /// How many times the loop has armed its wake-up (the next tick, the end of a usage pause, or the end of a run in flight) and
-    /// is waiting on it: once it has, moving an injected clock wakes it (a test must not move the clock before this).
+    /// How many times the loop has armed its wake-up (the next tick, the end of a usage pause, or the end of a run or a lane's
+    /// preparation in flight) and is waiting on it: once it has, moving an injected clock wakes it (a test must not move the clock
+    /// before this).
     /// </summary>
     internal int Waits => Volatile.Read(ref _waits);
 
     private void Armed() => Interlocked.Increment(ref _waits);
 
     // Runs in flight across polls (sc-25992): an item is in at most one run of this loop at a time (by its external id), and
-    // there are never more than Intake:MaxConcurrentRuns. A poll dispatches only into the capacity the runs in flight leave.
+    // there are never more than Intake:MaxConcurrentRuns counted runs (Counted: false for an item being stopped or a waiting plan,
+    // which a poll starts outside the capacity). A poll dispatches only into the capacity the counted runs leave.
     private readonly Lock _runsGate = new();
-    private readonly Dictionary<string, Task> _running = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, (Task Run, bool Counted)> _running = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _capacity = new(options.MaxConcurrentRuns, options.MaxConcurrentRuns);
     private Poll? _current;
     private TaskCompletionSource _runEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    // Polls by number (each poll's Poll.Number), and the newest poll that hit a factory-wide failure.
+    private long _polls;
+    private long _lastFailedPoll;
+
+    // Each lane's preparation in flight (at most one per lane), the failure of one that ended for the next poll to report, and
+    // whether one ended since the loop last polled (its end wakes the loop for a poll at once).
+    private readonly Dictionary<IntakeLane, Task> _preparing = [];
+    private readonly Dictionary<IntakeLane, Exception> _prepareFailed = [];
+    private int _prepareEnded;
 
     /// <summary>The items this loop has a run of in flight now (<c>sc-12</c>, <c>kb-4</c>).</summary>
     internal IReadOnlyList<string> RunsInFlight
@@ -127,6 +165,26 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
         }
     }
 
+    /// <summary>The lanes whose preparation is running now.</summary>
+    internal int Preparing
+    {
+        get
+        {
+            lock (_runsGate)
+            {
+                return _preparing.Count;
+            }
+        }
+    }
+
+    private int FreeCapacity()
+    {
+        lock (_runsGate)
+        {
+            return options.MaxConcurrentRuns - _running.Values.Count(r => r.Counted);
+        }
+    }
+
     private Task RunEnded()
     {
         lock (_runsGate)
@@ -135,11 +193,24 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
         }
     }
 
+    /// <summary>Wakes the loop: a run or a preparation ended.</summary>
+    private void Wake()
+    {
+        TaskCompletionSource ended;
+        lock (_runsGate)
+        {
+            ended = _runEnded;
+            _runEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+        ended.TrySetResult();
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         logger.LogInformation("Polling for work every {Interval}, running up to {Runs} item(s) at once", options.PollInterval, options.MaxConcurrentRuns);
         using var timer = new PeriodicTimer(options.PollInterval, time);
         Task<bool>? tick = null;
+        var preparation = Preparation.Background;
         try
         {
             while (true)
@@ -147,7 +218,10 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
                 // A poll does not wait for its runs (sc-25992): it dispatches into the free capacity, and the loop polls again on
                 // its interval — renewing claims, finishing stops, starting newly ready items — while they go on.
                 var ended = RunEnded();
-                var resumeAt = (await StartPollAsync(stoppingToken)).ResumeAt;
+                // A preparation that ended before this poll is listed by it: no second poll for it.
+                Interlocked.Exchange(ref _prepareEnded, 0);
+                var (resumeAt, _, _, owed) = await StartPollAsync(stoppingToken, preparation);
+                preparation = Preparation.Background;
                 tick ??= timer.WaitForNextTickAsync(stoppingToken).AsTask();
                 while (true)
                 {
@@ -164,9 +238,22 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
                     {
                         break;
                     }
+                    ended = RunEnded();
+                    if (Interlocked.Exchange(ref _prepareEnded, 0) == 1)
+                    {
+                        // A lane's preparation ended (a triage released items): list them now, in a poll that prepares nothing
+                        // (else every preparation's end would start the next one).
+                        preparation = Preparation.None;
+                        break;
+                    }
+                    if (owed && FreeCapacity() > 0)
+                    {
+                        // The poll had no capacity free and listed nothing ready; a run's end has freed some: poll now, not at the
+                        // next tick (the tick stays armed: no poll is skipped or doubled).
+                        break;
+                    }
                     // A run ended: it may have paused the factory for usage (its worker hit the limit), so the loop wakes when
                     // that pause lifts, as it did when a poll waited for its runs.
-                    ended = RunEnded();
                     resumeAt = await UsageResumeAtAsync(resumeAt, stoppingToken);
                 }
                 if (tick.IsCompleted)
@@ -181,12 +268,13 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
         }
         finally
         {
-            // Shutdown waits for the runs in flight: each sees the cancelled token and ends as when a poll waited for them.
+            // Shutdown waits for the runs and preparations in flight: each sees the cancelled token and ends as when a poll
+            // waited for them.
             await AllRunsEndedAsync();
         }
     }
 
-    /// <summary>Waits until this loop has no run in flight and its last poll's dispatch has ended.</summary>
+    /// <summary>Waits until this loop has no run or preparation in flight and its last poll's dispatch has ended.</summary>
     private async Task AllRunsEndedAsync()
     {
         while (true)
@@ -194,7 +282,7 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
             Task[] pending;
             lock (_runsGate)
             {
-                pending = [.. _running.Values, .. _current is { } poll ? new[] { poll.Done } : []];
+                pending = [.. _running.Values.Select(r => r.Run), .. _preparing.Values, .. _current is { } poll ? new[] { poll.Done } : []];
             }
             if (pending.All(t => t.IsCompleted))
             {
@@ -258,14 +346,27 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
 
     /// <summary>
     /// One poll, waited for to its end: resume in-flight items first, then run newly ready ones, and return once every run it
-    /// started has ended. Returns when a usage pause in effect lifts, if one is.
+    /// started has ended. A lane's preparation runs inline, before its listing. Returns when a usage pause in effect lifts, if one is.
     /// </summary>
     public async Task<DateTimeOffset?> PollOnceAsync(CancellationToken ct)
     {
-        var (resumeAt, done, listed) = await StartPollAsync(ct);
+        var (resumeAt, done, listed, _) = await StartPollAsync(ct);
         await done;
         // A run may have paused the factory for usage (its worker hit the limit) or the pause may have moved.
         return listed ? await UsageResumeAtAsync(resumeAt, ct) : resumeAt;
+    }
+
+    /// <summary>How a poll that lists runs each lane's preparation (<see cref="IntakeLane.Prepare"/>).</summary>
+    internal enum Preparation
+    {
+        /// <summary>Awaited before the lane's listing (<see cref="PollOnceAsync"/>).</summary>
+        Inline,
+
+        /// <summary>Started off the loop's task unless the lane's last one is still running (<c>factory work</c>'s loop).</summary>
+        Background,
+
+        /// <summary>None started: the poll that lists what a preparation that just ended released.</summary>
+        None,
     }
 
     /// <summary>
@@ -273,14 +374,17 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
     /// its runs. A newer poll that lists again supersedes it (<see cref="Supersede"/>): it starts nothing more, since the newer
     /// listing is fresher; its runs go on.
     /// </summary>
-    private sealed class Poll(CancellationToken ct)
+    private sealed class Poll(long number, CancellationToken ct)
     {
+        public readonly long Number = number;
         public readonly Lock Gate = new();
         public readonly CancellationTokenSource Dispatch = CancellationTokenSource.CreateLinkedTokenSource(ct);
         public Queue<(IntakeLane Lane, int Id, bool Ready)> Queue = new();
         public bool FactoryFailedFlag;
         public bool RunsFailed;
         public bool DeferredRun;
+        /// <summary>The poll's own freeze evaluation deferred new work (<c>intake</c>): none of its runs clears that.</summary>
+        public bool IntakeDeferred;
         public bool NewWorkHeld;
         public readonly HashSet<IntakeLane> DeferredLanes = [];
         public Task Done = Task.CompletedTask;
@@ -299,6 +403,11 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
 
     private void FactoryFailed(Poll poll, string message)
     {
+        // Newer than any poll that could still say the factory is fine (DispatchAsync): a lock-free maximum.
+        long seen;
+        while ((seen = Interlocked.Read(ref _lastFailedPoll)) < poll.Number && Interlocked.CompareExchange(ref _lastFailedPoll, poll.Number, seen) != seen)
+        {
+        }
         lock (poll.Gate)
         {
             if (poll.FactoryFailedFlag)
@@ -314,14 +423,17 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
     }
 
     /// <summary>
-    /// One poll's listing and the start of its dispatch (sc-25992): renews every lane's claims, then — only while there is free run
-    /// capacity — lists each lane's in-flight and ready items and starts them into that capacity, in the poll's order, skipping
-    /// any item a run of this loop already has in flight. Returns as soon as the dispatch has started; <c>Done</c> completes
-    /// once the dispatch and every run it started have ended. <c>Listed</c> is false when the poll failed before listing.
+    /// One poll's listing and the start of its dispatch (sc-25992): renews every lane's claims, lists each lane's in-flight items
+    /// and starts those being stopped and the waiting plans outside the run capacity (<see cref="InFlightItem"/>), then — only while
+    /// there is free run capacity — prepares (<paramref name="preparation"/>) and lists each lane's ready items and starts the rest
+    /// into that capacity, in the poll's order, skipping any item a run of this loop already has in flight. Returns as soon as the
+    /// dispatch has started; <c>Done</c> completes once the dispatch and every run it started have ended. <c>Listed</c> is false
+    /// when the poll failed before listing; <c>Owed</c> is true when it found no capacity free and listed nothing ready.
     /// </summary>
-    internal async Task<(DateTimeOffset? ResumeAt, Task Done, bool Listed)> StartPollAsync(CancellationToken ct)
+    internal async Task<(DateTimeOffset? ResumeAt, Task Done, bool Listed, bool Owed)> StartPollAsync(CancellationToken ct,
+        Preparation preparation = Preparation.Inline)
     {
-        var poll = new Poll(ct);
+        var poll = new Poll(Interlocked.Increment(ref _polls), ct);
         DateTimeOffset? resumeAt = null;
         bool factoryPaused;
         try
@@ -341,6 +453,7 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
                 if (await freeze(ct) is { Frozen: true } frozen)
                 {
                     factoryPaused = true;
+                    poll.IntakeDeferred = true;
                     _status.Deferred("intake", frozen.Message, frozen.Remedy);
                 }
                 else
@@ -353,12 +466,11 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
         {
             logger.LogError(ex, "Poll failed; retrying next interval");
             FactoryFailed(poll, $"Poll failed: {ex.Message}");
-            return (resumeAt, Task.CompletedTask, false);
+            return (resumeAt, Task.CompletedTask, false, false);
         }
         // Claims first, every lane's over its own list (IItemRunner.RenewableAsync: paused and frozen items too, and items a run
-        // of this loop has in flight), before any lane is prepared or listed: a lane's preparation (a triage, which may wait for
-        // a worker slot) never holds up another lane's renewals. The items to run are listed after, so one just paused for a
-        // lost claim is not among them.
+        // of this loop has in flight), before any lane is listed: renewals never wait on a lane's preparation, which runs off the
+        // loop's task. The items to run are listed after, so one just paused for a lost claim is not among them.
         var renewed = new Dictionary<IntakeLane, IReadOnlyList<int>>();
         foreach (var lane in lanes)
         {
@@ -373,23 +485,11 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
                 FactoryFailed(poll, $"Poll failed: {ex.Message}");
             }
         }
-        int free;
-        lock (_runsGate)
-        {
-            free = options.MaxConcurrentRuns - _running.Count;
-        }
-        if (free <= 0)
-        {
-            // Every run this loop may have is in flight: nothing could start, so nothing is listed or prepared, and the earlier
-            // poll's dispatch keeps its place (it starts its next item when a run ends).
-            logger.LogInformation("{Runs} run(s) in flight, no capacity free: claims renewed, nothing new listed this poll", options.MaxConcurrentRuns);
-            if (!poll.FactoryFailedFlag)
-            {
-                _status.FactoryOk();
-            }
-            return (resumeAt, Task.CompletedTask, true);
-        }
-        var work = new List<(IntakeLane Lane, IReadOnlyList<int> InFlight, IReadOnlyList<int> Ready)>();
+        // With every run this loop may have in flight, nothing ready could start: nothing ready is listed or prepared, and the
+        // earlier poll's dispatch keeps its place (it starts its next item when a run ends). In-flight items are listed all the
+        // same, for the stops and waiting plans started outside the capacity.
+        var listing = FreeCapacity() > 0;
+        var work = new List<(IntakeLane Lane, IReadOnlyList<InFlightItem> InFlight, IReadOnlyList<int> Ready)>();
         foreach (var lane in lanes)
         {
             if (!renewed.TryGetValue(lane, out var lost))
@@ -398,18 +498,34 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
             }
             try
             {
-                IReadOnlyList<int> inFlight = (await lane.Runner.InFlightAsync(ct)).Except(lost).ToList();
-                IReadOnlyList<int> ready = [];
-                if (!factoryPaused)
+                lock (_runsGate)
                 {
-                    // E.g. GitHub issues: triage new issues and record approvals, so the items they release are listed below.
+                    // A preparation that ended with a failure is this poll's failure, as the inline one was its poll's.
+                    if (_prepareFailed.Remove(lane, out var failed))
+                    {
+                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(failed);
+                    }
+                }
+                IReadOnlyList<InFlightItem> inFlight = (await lane.Runner.InFlightItemsAsync(ct)).Where(i => !lost.Contains(i.Id)).ToList();
+                IReadOnlyList<int> ready = [];
+                if (listing && !factoryPaused)
+                {
+                    // E.g. GitHub issues: triage new issues and record approvals, so the items they release are listed — below when
+                    // inline, by the poll its end starts when in the background.
                     if (lane.Prepare is not null)
                     {
-                        await lane.Prepare(ct);
+                        if (preparation == Preparation.Inline)
+                        {
+                            await lane.Prepare(ct);
+                        }
+                        else if (preparation == Preparation.Background)
+                        {
+                            StartPreparation(lane, ct);
+                        }
                     }
                     ready = await lane.Source.ListReadyAsync(ct);
                 }
-                work.Add((lane, inFlight, ready.Except(inFlight).Distinct().ToList()));
+                work.Add((lane, inFlight, ready.Except(inFlight.Select(i => i.Id)).Distinct().ToList()));
             }
             catch (Exception ex) when (!ct.IsCancellationRequested)
             {
@@ -419,18 +535,131 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
             }
         }
         // The poll's runs, in order: each lane's in-flight items (those being stopped first), then its ready ones; an item once.
+        // Stops and waiting plans (the latter only while nothing holds new work, so the freeze's and the pauses' rules for them
+        // are the ordinary ones) are started now, outside the capacity; the rest are queued for it.
         var listed = new HashSet<string>(StringComparer.Ordinal);
-        poll.Queue = new Queue<(IntakeLane Lane, int Id, bool Ready)>(work
-            .SelectMany(w => w.InFlight.Select(id => (w.Lane, Id: id, Ready: false)).Concat(w.Ready.Select(id => (w.Lane, Id: id, Ready: true))))
-            .Where(x => listed.Add(x.Lane.Source.Naming.Format(x.Id))));
+        var outside = new List<(IntakeLane Lane, int Id)>();
+        var queue = new Queue<(IntakeLane Lane, int Id, bool Ready)>();
+        foreach (var (lane, inFlight, ready) in work)
+        {
+            foreach (var item in inFlight.Where(i => listed.Add(lane.Source.Naming.Format(i.Id))))
+            {
+                if (item.Stopping || (item.WaitingPlan && !factoryPaused))
+                {
+                    outside.Add((lane, item.Id));
+                }
+                else if (listing)
+                {
+                    queue.Enqueue((lane, item.Id, false));
+                }
+            }
+            foreach (var id in ready.Where(id => listed.Add(lane.Source.Naming.Format(id))))
+            {
+                queue.Enqueue((lane, id, true));
+            }
+        }
+        var started = new List<Task>();
+        foreach (var (lane, id) in outside)
+        {
+            if (StartRun(poll, lane, id, counted: false, ct) is { } run)
+            {
+                started.Add(run);
+            }
+        }
+        if (!listing)
+        {
+            logger.LogInformation("{Runs} run(s) in flight, no capacity free: claims renewed, nothing new listed this poll", options.MaxConcurrentRuns);
+            poll.Dispatch.Dispose();
+            return (resumeAt, Task.WhenAll(started), true, true);
+        }
+        poll.Queue = queue;
         lock (_runsGate)
         {
             // This listing is fresher than the last poll's: that one starts nothing more (its runs go on).
             _current?.Supersede();
             _current = poll;
-            poll.Done = DispatchAsync(poll, ct);
+            poll.Done = DispatchAsync(poll, started, ct);
         }
-        return (resumeAt, poll.Done, true);
+        return (resumeAt, poll.Done, true, false);
+    }
+
+    /// <summary>
+    /// Starts <paramref name="lane"/>'s preparation off the loop's task, unless its last one is still running (never two triages
+    /// of one lane at once). Its end wakes the loop for a poll; its failure is kept for that poll to report.
+    /// </summary>
+    private void StartPreparation(IntakeLane lane, CancellationToken ct)
+    {
+        lock (_runsGate)
+        {
+            if (_preparing.ContainsKey(lane) || ct.IsCancellationRequested)
+            {
+                return;
+            }
+            var start = new Task<Task>(async () =>
+            {
+                Exception? failed = null;
+                try
+                {
+                    await lane.Prepare!(ct);
+                }
+                catch (Exception ex) when (!ct.IsCancellationRequested)
+                {
+                    logger.LogError(ex, "Preparation of {Source} failed; reported by the next poll", lane.Source.Naming.Source);
+                    failed = ex;
+                }
+                catch (Exception) when (ct.IsCancellationRequested)
+                {
+                    // Shut down: nothing to report.
+                }
+                finally
+                {
+                    lock (_runsGate)
+                    {
+                        _preparing.Remove(lane);
+                        if (failed is not null)
+                        {
+                            _prepareFailed[lane] = failed;
+                        }
+                    }
+                    Interlocked.Exchange(ref _prepareEnded, 1);
+                    Wake();
+                }
+            });
+            _preparing[lane] = start.Unwrap();
+            start.Start(TaskScheduler.Default);
+        }
+    }
+
+    /// <summary>
+    /// Starts a run of the item unless a run of this loop has it in flight or the loop is shutting down; registered in flight before
+    /// it starts, it leaves the in-flight set — and, <paramref name="counted"/>, gives the capacity it holds back — when it ends.
+    /// </summary>
+    private Task? StartRun(Poll poll, IntakeLane lane, int id, bool counted, CancellationToken ct, bool dispatching = false)
+    {
+        var name = lane.Source.Naming.Format(id);
+        lock (_runsGate)
+        {
+            // Checked under the gate a newer poll supersedes this one's dispatch under.
+            if (ct.IsCancellationRequested || (dispatching && poll.Dispatch.IsCancellationRequested) || _running.ContainsKey(name))
+            {
+                return null;
+            }
+            var start = new Task<Task>(async () =>
+            {
+                try
+                {
+                    await RunOneAsync(poll, lane, id, name, ct);
+                }
+                finally
+                {
+                    Ended(name, counted);
+                }
+            });
+            var run = start.Unwrap();
+            _running[name] = (run, counted);
+            start.Start(TaskScheduler.Default);
+            return run;
+        }
     }
 
     /// <summary>
@@ -491,12 +720,12 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
 
     /// <summary>
     /// Starts the poll's items one by one as run capacity frees (<see cref="IntakeOptions.MaxConcurrentRuns"/>), until its queue
-    /// is empty, something stops its new work, or a newer poll supersedes it; then waits for the runs it started.
+    /// is empty, something stops its new work, or a newer poll supersedes it; then waits for the runs it started
+    /// (<paramref name="started"/>: those it started outside the capacity, too).
     /// </summary>
-    private async Task DispatchAsync(Poll poll, CancellationToken ct)
+    private async Task DispatchAsync(Poll poll, List<Task> started, CancellationToken ct)
     {
         await Task.Yield();
-        var started = new List<Task>();
         try
         {
             while (true)
@@ -522,32 +751,13 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
                     {
                         continue;
                     }
-                    lock (_runsGate)
+                    // Superseded or shut down meanwhile, or the item started by another poll's dispatch: not started here.
+                    if (StartRun(poll, lane, id, counted: true, ct, dispatching: true) is not { } run)
                     {
-                        // Superseded or shut down meanwhile, or the item started by another poll's dispatch: not started here.
-                        if (ct.IsCancellationRequested || poll.Dispatch.IsCancellationRequested || _running.ContainsKey(name))
-                        {
-                            continue;
-                        }
-                        // Registered in flight before it starts; it leaves the in-flight set and gives the capacity back when it
-                        // ends.
-                        var start = new Task<Task>(async () =>
-                        {
-                            try
-                            {
-                                await RunOneAsync(poll, lane, id, name, ct);
-                            }
-                            finally
-                            {
-                                Ended(name);
-                            }
-                        });
-                        var run = start.Unwrap();
-                        _running[name] = run;
-                        held = false;
-                        started.Add(run);
-                        start.Start(TaskScheduler.Default);
+                        continue;
                     }
+                    held = false;
+                    started.Add(run);
                 }
                 finally
                 {
@@ -568,8 +778,9 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
             {
                 lock (_runsGate)
                 {
-                    // The newest poll that had no factory-wide failure says the factory is fine; an older one does not.
-                    if (ReferenceEquals(_current, poll) && !poll.FactoryFailedFlag)
+                    // The newest poll that listed and had no factory-wide failure says the factory is fine — an older one does
+                    // not, and neither does one when a poll after it (one with no capacity free, say) hit such a failure.
+                    if (ReferenceEquals(_current, poll) && !poll.FactoryFailedFlag && Interlocked.Read(ref _lastFailedPoll) < poll.Number)
                     {
                         _status.FactoryOk();
                     }
@@ -579,17 +790,17 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
         }
     }
 
-    private void Ended(string name)
+    private void Ended(string name, bool counted)
     {
-        TaskCompletionSource ended;
         lock (_runsGate)
         {
             _running.Remove(name);
-            ended = _runEnded;
-            _runEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
         }
-        _capacity.Release();
-        ended.TrySetResult();
+        if (counted)
+        {
+            _capacity.Release();
+        }
+        Wake();
     }
 
     private async Task RunOneAsync(Poll poll, IntakeLane lane, int id, string name, CancellationToken ct)
@@ -609,8 +820,10 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
                     poll.DeferredRun = true;
                     poll.DeferredLanes.Add(lane);
                 }
-                else if (!poll.DeferredRun)
+                else if (!poll.DeferredRun && !poll.IntakeDeferred && poll.Number == Interlocked.Read(ref _polls))
                 {
+                    // Runs are dispatched again — said only by the newest poll's run, and not by a poll the freeze evaluator
+                    // deferred: a run of an older poll must not clear what a newer poll recorded.
                     _status.NotDeferred();
                 }
             }
@@ -756,7 +969,7 @@ public static class IntakeServiceCollectionExtensions
             new Router.RouterClient(Gateway.OutboundHttp.RouterApi(options.RouterBaseUrl), options.RouterKey));
         services.AddSingleton(sp => new Router.UsageMonitor(sp.GetRequiredService<Router.IUsageSource>(), sp.GetRequiredService<Controls.IControls>(),
             sp.GetRequiredService<Router.UsageOptions>(), sp.GetRequiredService<TimeProvider>(), sp.GetRequiredService<ILogger<Router.UsageMonitor>>()));
-        // Watches usage while a long item run holds up the intake loop, so running workers pause too.
+        // Watches usage between polls (every Usage:PollSeconds, apart from the poll's own read), so running workers pause too.
         services.AddHostedService(sp => sp.GetRequiredService<Router.UsageMonitor>());
         // Every source the host reaches comes from this one registry (sc-25982): the loop's lanes, the dashboard's controls and Stop.
         services.AddSingleton(_ => new WorkSourceRegistry(options));

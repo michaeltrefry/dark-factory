@@ -52,8 +52,9 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
 {
     /// <summary>
     /// How long a claim lasts unless renewed: the longest KanbanBoard allows (a day). <c>factory work</c> polls every
-    /// <c>Intake:PollSeconds</c> and renews then (<see cref="RenewClaimAsync"/>), so a claim lapses only on an item that is
-    /// parked or escalated, or whose single run holds the intake loop, for a whole day. An item whose run died between the claim and the
+    /// <c>Intake:PollSeconds</c> and renews then (<see cref="RenewClaimAsync"/>) also while runs are in flight (a poll does not
+    /// wait for its runs, sc-25992), so a claim lapses only on an item that is parked, escalated or being stopped, or whose renewals
+    /// the board refused, for a whole day. An item whose run died between the claim and the
     /// move to <c>InProgress</c> stays claimed that long.
     /// </summary>
     public const int ClaimTtlSeconds = 86400;

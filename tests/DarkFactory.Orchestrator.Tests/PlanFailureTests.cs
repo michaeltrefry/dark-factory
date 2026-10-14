@@ -1275,6 +1275,12 @@ public class PlanControlsPostgresTests
         }
         var controls = new LedgerControls(contexts, TimeProvider.System);
         var actions = new ControlActions(controls, contexts);
+        await using (var db = contexts.CreateDbContext())
+        {
+            // The waiting plan is one the intake loop runs outside its run capacity (sc-25992).
+            Assert.Equal([new InFlightItem(500, Stopping: false, WaitingPlan: true)],
+                await RunPipeline.InFlightItemsAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Shortcut, CancellationToken.None, controls));
+        }
 
         var paused = await actions.PauseAsync(ControlScope.Item("sc-500"), "tester", CancellationToken.None);
 
@@ -1292,6 +1298,8 @@ public class PlanControlsPostgresTests
         await using (var db = contexts.CreateDbContext())
         {
             Assert.Equal([500, 9001], await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Shortcut, CancellationToken.None, controls));
+            Assert.Equal([new InFlightItem(500, Stopping: true), new InFlightItem(9001, Stopping: true)],
+                await RunPipeline.InFlightItemsAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Shortcut, CancellationToken.None, controls));
         }
 
         var rows = await new DashboardData(contexts, TimeProvider.System).ActiveItemsAsync(CancellationToken.None);

@@ -116,7 +116,7 @@ public class IntakeLoopTests
         var hosted = app.Services.GetServices<Microsoft.Extensions.Hosting.IHostedService>().ToList();
         Assert.Contains(hosted, s => s is DarkFactory.Orchestrator.Sessions.SessionEventRelay);
         Assert.Contains(hosted, s => s is IntakeLoop);
-        // Watches usage while a long item run holds up the intake loop: the same instance the loop reads at each poll.
+        // Watches usage between polls, so running workers pause too: the same instance the loop reads at each poll.
         Assert.Contains(hosted, s => ReferenceEquals(s, app.Services.GetRequiredService<DarkFactory.Orchestrator.Router.UsageMonitor>()));
     }
 

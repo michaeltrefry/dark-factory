@@ -1159,8 +1159,17 @@ each deliberate:
   pipeline page's deferral list says what holds new work.
 - MCP session files are named `<owner>.<guid>.json` (the owner is the item whose run opened the session).
 - `factory work` polls on its interval while runs are in flight (sc-25992): every poll renews claims, and lists and starts work
-  only into the run capacity left free; with `Intake:MaxConcurrentRuns` 1 a poll during a run renews and starts nothing, and the
-  run order is unchanged.
+  only into the run capacity left free; with `Intake:MaxConcurrentRuns` 1 a poll during a run starts no ordinary item, and the
+  run order is unchanged. When a run ends after such a poll the next poll comes at once (as the old loop's did), not at the next
+  interval.
+- So during a long run every `Intake:PollSeconds` also brings the poll's reads, where the old loop made none until the run
+  ended: claim renewals, the router's usage read and the freeze evaluator — its main-red check's GitHub reads (each repository's
+  base tip and CI), cached 30 s as before.
+- An item being stopped and a plan item waiting on its stories are started every poll whatever runs are in flight (outside
+  `Intake:MaxConcurrentRuns`; their sandbox work still takes a worker slot), so a pending Stop or a plan's releases no longer
+  wait for another item's run to end.
+- The GitHub issues triage runs in the background of the loop (one at a time), beside item runs; its end lists what it
+  released at once. A triage waiting for the sandbox user no longer delays the next poll.
 
 ## Phase 4b — Kanban contract fixtures: recording against the hosted board (sc-25986)
 

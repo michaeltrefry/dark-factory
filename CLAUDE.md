@@ -1009,26 +1009,52 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   ids `usage`/`factory`/`freeze`: "new work held: the factory is paused for usage (…); it lifts by itself at <utc>, or with
   `factory continue --usage`"), kept until the loop's next read finds it lifted (a poll's start, at most a poll interval after
   the Continue; the page's banners are the ledger's and current). One deferred run alone renders as the line it always was.
-  Defaults (E9): with `Intake:MaxConcurrentRuns` 1 the loop is the serial loop it was; the only differences are that a ready
-  item is no longer handed to a run that would claim nothing when the factory was paused since the poll began, and that a
-  paused or frozen factory's page says once more, in the deferral list, what holds new work.
   Tests: `IntakeDispatchTests` (signalled fake runs), `RunsInFlightTests` (the real loop over real pipelines, two at once: the
   freeze, the usage pause and a stale helper in one slot, each with both runs' ledger rows and the status).
   Runs across polls (sc-25992, `IntakeLoop.StartPollAsync`): a poll does NOT wait for its runs — before, a poll ended only when
   every run it started had, so one item waiting 30 minutes on CI held back every other lane's new items and every claim renewal
-  (once per poll) for as long. The loop now polls on its interval while runs are in flight: each poll renews every lane's claims
-  first (before any lane is prepared or listed: a triage waiting for a worker slot holds up no renewal), then — only while there
-  is free capacity (`Intake:MaxConcurrentRuns` minus the loop's runs in flight, `IntakeLoop.RunsInFlight`) — lists in-flight and
-  ready items and starts them into that capacity in the poll's order; with none free it lists and prepares nothing and the
-  earlier poll's dispatch keeps its place (it starts its next item when a run ends). An item the loop already has a run of is
-  never started again (an in-process in-flight set by external id, beside the item's run lock); a poll that lists supersedes the
-  previous poll's dispatch, which starts nothing more (its runs go on). The rules above (holds before each ready item, a
-  deferral, a factory-wide failure) apply to each poll's own dispatch. A run's end wakes the loop to re-read the usage pause, so
-  a run that paused the factory for usage still wakes it at the reset. Stopping `factory work` waits for the runs in flight, each
-  ending on the cancelled token as before. With `Intake:MaxConcurrentRuns` 1 the order is unchanged — a poll during the run
-  renews claims, finishes nothing new and starts nothing (E9). Tests: `IntakeDispatchTests` (`The_work_loop_polls_again_…`,
-  `A_poll_renews_the_claim_of_an_item_in_flight_…`, `A_poll_with_no_free_capacity_…`, `With_one_run_at_a_time_…`,
-  `Stopping_the_work_loop_waits_…`). `PollOnceAsync` (tests, and the old contract) is one poll waited for to its end.
+  (once per poll) for as long. The loop now polls on its interval while runs are in flight. Each poll renews every lane's claims
+  first; then lists every lane's in-flight items and starts, at once and OUTSIDE the run capacity, the items being stopped and
+  the plan items waiting on their stories (`InFlightItem`, from `IItemRunner.InFlightItemsAsync`/`RunPipeline.InFlightItemsAsync`;
+  a waiting plan only while nothing holds new work — else it is queued like any in-flight item, so the freeze's, the usage
+  pause's and a factory Pause's rules for it are unchanged; a stop always, as before): they do not count against
+  `Intake:MaxConcurrentRuns`, are still one run per item (the loop's in-flight set and the item's run lock), and whatever they
+  do as the sandbox user goes through the slot lock (`WorkerLock`), so `Worker:Slots` is never exceeded — a pending Stop (a
+  plan's pending stories, say) and a `Planned` evaluation no longer wait for a run to end. Residual, accepted: which kind an
+  item is, is the poll's listing; a state another process changes between the listing and the start (a `factory run` of the
+  same plan item) is the next run's business. Then, only while there is free capacity (`Intake:MaxConcurrentRuns` minus the
+  loop's counted runs in flight, `IntakeLoop.RunsInFlight`), each lane is prepared and its ready items listed, and the rest are
+  started into that capacity in the poll's order. With none free nothing ready is listed or prepared, the earlier poll's
+  dispatch keeps its place (it starts its next item when a run ends), and the poll is owed: the end of a run that frees
+  capacity starts the next poll at once instead of at the next tick (the tick stays armed: no poll skipped or doubled; the loop
+  is one task, so polls never race), as the serial loop polled at once on the tick that passed during its runs. An item the
+  loop already has a run of is never started again; a poll that lists supersedes the previous poll's dispatch, which starts
+  nothing more (its runs go on). The rules above (holds before each ready item, a deferral, a factory-wide failure) apply to
+  each poll's own dispatch. A run's end wakes the loop to re-read the usage pause, so a run that paused the factory for usage
+  still wakes it at the reset. Preparation off the loop's task: a lane's preparation (`IntakeLane.Prepare`, the GitHub issues
+  triage) is started by a poll that lists and runs in the background, at most one per lane at a time (so never two triages of
+  one issue), while later polls go on renewing claims and the run-end wake-up works — a triage waiting up to
+  `Worker:TimeoutMinutes` for a worker slot holds up nothing. A triage shares the worker slots with the items' worker phases
+  through `WorkerLock` (`SandboxTriageRunner` holds a slot from its readiness check to its worktree's removal), so it never runs
+  as a sandbox user another phase is using. Its end wakes the loop for a poll at once that starts no preparation and lists
+  what it released; a preparation that failed is that poll's factory-wide failure (`Poll failed: …`, the lane not listed by it,
+  as an inline failure skipped it; per-issue failures are counted by the triage itself, unchanged). Stopping `factory work`
+  waits for the runs and the preparations in flight, each ending on the cancelled token as before. Status across polls: a
+  run's end clears the runs' deferrals only when its poll is the newest and that poll's own freeze evaluation did not defer it
+  (so an older poll's run never clears a newer poll's `intake` deferral); a poll says the factory is fine only once it has
+  listed, its dispatch has ended, it is the newest that listed and no poll after it hit a factory-wide failure — a poll with no
+  capacity free lists nothing ready and says nothing of the factory, so a listing failure stays shown until the board is listed
+  again. Defaults (E9): with `Intake:MaxConcurrentRuns` 1 the order of runs is unchanged; what differs from the serial loop: a
+  ready item is no longer handed to a run that would claim nothing when the factory was paused since the poll began, and a
+  paused or frozen factory's page says once more, in the deferral list, what holds new work; a poll runs every interval also
+  during a run — claims renewed, the router's usage read (`usage.CheckAsync`), the freeze evaluator run, its main-red GitHub
+  reads cached for `FactoryFreeze.MainRedCacheTtl` (30 s) as before, so a long run costs those reads every `Intake:PollSeconds`
+  where the serial loop made none; a stop and a waiting plan's evaluation run during another item's run; and a triage runs
+  beside the item runs. Tests: `IntakeDispatchTests` (`The_work_loop_polls_again_…`, `A_poll_renews_the_claim_of_an_item_in_flight_…`,
+  `A_poll_with_no_free_capacity_…`, `With_one_run_at_a_time_…`, `Stopping_the_work_loop_waits_…`, `When_a_run_ends_after_a_poll_found_no_capacity_…`,
+  `Items_being_stopped_and_waiting_plans_…`, `While_something_holds_new_work_…`, the two deferral and two factory-error tests across
+  polls, and the three preparation tests). `PollOnceAsync` (tests, and the old contract) is one poll waited for to its end, its
+  preparation inline before the listing.
 - Every state change is a committed ledger row before the next step (`WorkLedger.RecordAsync`), checked
   against the transition table in `Ledger/Lifecycle.cs` first; an illegal transition throws and writes nothing.
   New phases add handlers in `RunPipeline.Handlers`, not table rows (the exceptions, all Phase 4a's: `Plan → Planned`, a plan item
@@ -1730,8 +1756,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (`PrepareCommitAsync`, removal), and the three sweeps (a run's at its first worker phase, the triage's, the planner's).
   Dispatch (`IntakeLoop`): a poll renews every lane's claims, then lists every lane and starts its items — each lane's in-flight
   ones (stops first), then its ready ones, each once — into the capacity `Intake:MaxConcurrentRuns` leaves beside the runs still
-  in flight, and does not wait for them (sc-25992, "Runs across polls"); with 1 (the default) the runs are one after another as
-  they were. Claims are renewed once per poll and lane, also while runs are in flight (`RenewClaimsAsync`, sc-25983), never per
+  in flight, and does not wait for them (sc-25992, "Runs across polls"); stops and waiting plans start outside that capacity;
+  with 1 (the default) the other runs are one after another as they were. Claims are renewed once per poll and lane, also while runs are in flight (`RenewClaimsAsync`, sc-25983), never per
   dispatched run. Still one run per item (the item's run lock) and one turn per repository (the merge queue).
   What stops a poll's new work still does with several runs in flight: after a run the freeze deferred no ready item of any
   lane and no further in-flight item of its lane is started; after a factory-wide failure nothing is; a factory-wide control
