@@ -1793,6 +1793,57 @@ public class LiveWorkerSandboxTests
         Assert.False(await sandbox.StopAllAsync(ct)); // nothing of _factory's left
     }
 
+    /// <summary>
+    /// sc-26126 (P5 S0 spike): each configured slot's sandbox user, through its installed helper exactly as a worker runs,
+    /// creates an iPhone simulator in its OWN device set, boots it, builds the fixture app (ad hoc signed, E3) into DerivedData
+    /// under a directory shared with that user alone, runs one XCTest unit test and one XCUITest UI test on it, and deletes the
+    /// device — all in ONE helper run (the helper's exit kills every process of the user, CoreSimulatorService and the booted
+    /// simulator included). A failure names what is missing (<see cref="SimulatorProbe"/>). Nothing of the owner's simulators,
+    /// and no system setting, is touched. Slow (minutes per slot); like every live probe it kills every process of each sandbox
+    /// user: run it with no factory running.
+    /// </summary>
+    [Fact]
+    public async Task A_sandbox_user_boots_a_simulator_and_runs_a_unit_test_and_a_ui_test() =>
+        await ForEachSlotAsync(async slot =>
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(45));
+            var ct = timeout.Token;
+            var dir = Path.Combine(FactoryOptions.DefaultSandboxWorkRoot, $"test-ios-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(dir);
+            try
+            {
+                await slot.Sandbox.ShareAsync(dir, ct); // the owner and this slot's user only; everything below inherits it
+                var fixture = Path.Combine(dir, "fixture");
+                CopyDirectory(SimulatorProbe.FixtureDirectory, fixture);
+
+                var (exitCode, stdout, stderr) = await slot.Sandbox.RunAsync(dir, "/bin/bash",
+                    [Path.Combine(fixture, "probe.sh"), Path.Combine(dir, "work")], ct);
+
+                var result = SimulatorProbe.Read(stdout);
+                Assert.True(exitCode == 0 && result is { Unit: "pass", Ui: "pass" },
+                    SimulatorProbe.Explain($"worker slot {slot.Number} ({slot.User})", exitCode, stdout, stderr));
+            }
+            finally
+            {
+                await slot.Sandbox.DeleteAsWorkerAsync(dir, CancellationToken.None);
+                if (Directory.Exists(dir))
+                {
+                    Directory.Delete(dir, recursive: true);
+                }
+            }
+        });
+
+    private static void CopyDirectory(string from, string to)
+    {
+        Directory.CreateDirectory(to);
+        foreach (var file in Directory.EnumerateFiles(from, "*", SearchOption.AllDirectories))
+        {
+            var target = Path.Combine(to, Path.GetRelativePath(from, file));
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            File.Copy(file, target);
+        }
+    }
+
     private static bool ProcessExists(int pid)
     {
         using var ps = Process.Start(new ProcessStartInfo("/bin/ps", ["-p", pid.ToString()]) { RedirectStandardOutput = true })!;

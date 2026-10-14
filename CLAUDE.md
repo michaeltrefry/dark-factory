@@ -3060,6 +3060,30 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   are its only reasons), then merges as usual; the current panel's own verdict is a second one on the head, so if its calls
   still break the rule the gate escalates instead of reviewing again. The fix loop and CI self-heal never carry such a
   role's review (`FixLoop.MustReviewAgain`). See docs/acceptance.md.
+- iOS simulator and UI tests as a sandbox user (Phase 5 S0 spike, sc-26126; `tests/DarkFactory.Orchestrator.Tests/Fixtures/ios-probe`,
+  `SimulatorProbe.cs`). DECISION PENDING the live probe: candidate (a) — run simulator and UI tests as the slot's sandbox user
+  directly — is what the probe tests; (b) a sandbox user kept logged in (an Aqua session) and (c) CI with the gate reading the
+  result are the fall-backs, chosen by what the live run reports missing. The fixture is a SwiftUI app (`ProbeApp`) with one
+  XCTest unit test (`ProbeAppTests`) and one XCUITest (`ProbeAppUITests`), a hand-written `objectVersion 77` project with
+  synchronized folders and a shared scheme (no XcodeGen), ad hoc signed (`CODE_SIGN_IDENTITY=-`, no team: E3). `probe.sh` runs,
+  each step timed and bounded: the session's diagnostics (`launchctl managername`, console user, `xcode-select -p`,
+  `DevToolsSecurity -status`, groups), `xcodebuild -version`, `-checkFirstLaunchStatus`, `simctl list runtimes`, `simctl create
+  df-probe-<pid>` (iPhone 17, else 16, 16e or 15, on the last available iOS runtime listed) in the running user's OWN device set, `simctl
+  bootstatus -b`, `xcodebuild build-for-testing` into DerivedData under its work directory, then `test-without-building
+  -only-testing:ProbeAppTests` and `-only-testing:ProbeAppUITests`, and on exit the device's shutdown and deletion; last line
+  `probe-result: unit=… ui=…`. Owner evidence (2026-10-14, macOS 26 / Darwin 25.6, Xcode 26.5 17F42, iOS 26.5 runtime 23F77; the
+  owner in an Aqua session, in `_developer`, DevToolsSecurity disabled; the helper's environment only — HOME, PATH, TMPDIR):
+  both pass, 74 s in all — create 1 s, boot 33 s, build 14 s, unit test 8 s, UI test 14 s; the device deleted. The sandbox users
+  differ from the owner in exactly what the research names as the risks: `_factory`/`_factory2` are in no `_developer` group,
+  have no login (Aqua) session, and reach launchd only through the owner's bootstrap inherited across `sudo` — CoreSimulatorService
+  is a per-user launchd service, which root reaches for another user with `launchctl asuser <uid>` (Jamf/Apple forum reports);
+  `xcodebuild test` over ssh without a logged-in user fails (testmanagerd / automation), and debugger-style authorization needs a
+  GUI session or DevToolsSecurity/`_developer` (Apple developer forums 727333, 765060; lldb-dev 2019-07). Live probe (owner's OK
+  first: like every live probe it kills every process of each sandbox user):
+  `FACTORY_SANDBOX_LIVE=1 dotnet test --project tests/DarkFactory.Orchestrator.Tests -- --filter-method "*A_sandbox_user_boots_a_simulator_and_runs_a_unit_test_and_a_ui_test"`
+  — per configured slot, one helper run in a directory shared with that slot's user alone; a failure names what is missing
+  (`SimulatorProbe.Read`: the license, first launch, the CoreSimulator service for the user, developer-tools authorization, UI
+  automation/an Aqua session, a permission, a timeout). Nothing changes any system setting, TCC, DevToolsSecurity or launchd state.
 - Processes migrate the ledger through `LedgerMigrations.MigrateAsync` (advisory-locked: EF alone lets two concurrent
   migrators apply the same migration) before reading it; tests migrate their temp database before starting a host.
 - Tests: xunit.v3 on Microsoft.Testing.Platform (`global.json` opts in).
