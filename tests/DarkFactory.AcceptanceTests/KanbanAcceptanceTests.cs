@@ -236,20 +236,26 @@ public class KanbanAcceptanceTests
         Assert.Single(await KanbanPlanAcceptanceTests.CommentsAsync(mcp, guid, ct), c => c == expected);
 
         // A second run resumes from the ledger and writes nothing twice: no second claim, link or closeout. Its one board write is
-        // the factory's once-only notice that nothing in this phase moves a Watch item on (a held-notice row): the closeout stays
-        // the only closeout, the notice is there at most once, and there is no other comment.
-        await FactoryRunner.RunAsync(options, item, ignoreScope: false, Console.Out, ct);
+        // the factory's once-only notice that nothing in this phase moves a Watch item on (a held-notice row): Watch is no handled
+        // state, so RunPipeline.RunAsync sends the item to HoldAsync, whose closeout retry does not apply (the closeout is posted)
+        // and which, finding no held-notice row since the item entered Watch (the first run ends there without one), posts the
+        // notice and then records the row. That is deterministic once the run is dispatched: the only ways it would be 0 are a
+        // freeze deferring the run (asserted against below) or the board refusing the comment (HoldAsync logs it, writes no row,
+        // and leaves it to the next run) — a board failure this test then reports. So exactly one row and exactly one notice.
+        var second = await FactoryRunner.RunAsync(options, item, ignoreScope: false, Console.Out, ct);
+        Assert.True(second.Deferred is null, $"The second run was deferred by the freeze: {second.Deferred}");
+        Assert.True(second.Succeeded, second.Error);
         var resumed = await HistoryAsync(e2e, name, ct);
         Assert.Single(resumed, e => e.Step == RunPipeline.Steps.Claimed);
         Assert.Single(resumed, e => e.Step == RunPipeline.Steps.Linked);
         Assert.Single(resumed, e => e.Step == RunPipeline.Steps.Closeout && e.Detail == RunPipeline.Posted);
-        Assert.InRange(resumed.Count(e => e.Step == RunPipeline.Steps.HeldNotice), 0, 1);
+        Assert.Single(resumed, e => e.Step == RunPipeline.Steps.HeldNotice && e.Detail == RunPipeline.Posted);
         var again = await board.GetItemAsync(guid, ct);
         Assert.Equal(after.Links!.Count, again.Links!.Count);
         var notice = Lines(WorkSourceComments.Attributed(RunPipeline.HeldNoticeText(name, WorkState.Watch)));
         var comments = await KanbanPlanAcceptanceTests.CommentsAsync(mcp, guid, ct);
         Assert.Single(comments, c => c == expected);
-        Assert.InRange(comments.Count(c => c == notice), 0, 1);
+        Assert.Single(comments, c => c == notice);
         Assert.All(comments, c => Assert.True(c == expected || c == notice, $"{name} has a comment that is neither its closeout nor the notice: {c}"));
     }
 

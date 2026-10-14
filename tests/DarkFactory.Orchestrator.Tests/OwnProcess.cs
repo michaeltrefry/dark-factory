@@ -69,6 +69,48 @@ internal sealed record OwnProcess(int Pid, string Start)
         return Parse(File.ReadAllText(pidFile));
     }
 
+    /// <summary>
+    /// As <see cref="StartDetached"/>, and the detached process first forks a child that exits at once and is never reaped (the
+    /// parent then execs <c>sleep</c>, which does not wait): a zombie of the current user, outside this test host's tree, in the
+    /// detached process's group. Returned once <c>ps</c> lists it as a zombie; killing the detached process lets init reap it.
+    /// </summary>
+    public static (OwnProcess Detached, int Zombie) StartDetachedWithZombie(string dir)
+    {
+        var pidFile = Path.Combine(dir, $"detached-{Guid.NewGuid():N}");
+        using (var p = Process.Start(new ProcessStartInfo("/usr/bin/perl", ["-MPOSIX", "-e",
+            "my $f = shift; exit 0 if fork; POSIX::setsid(); exit 0 if fork; "
+            + "open(STDIN, '<', '/dev/null'); open(STDOUT, '>', '/dev/null'); open(STDERR, '>', '/dev/null'); "
+            + "my $z = fork; POSIX::_exit(0) if $z == 0; "
+            + "my $ls = `/bin/ps -o lstart= -p $$`; $ls =~ s/\\s+/ /g; $ls =~ s/^ | $//g; "
+            + "open(my $h, '>', \"$f.tmp\"); print $h \"$$|$ls\\n$z\\n\"; close $h; rename(\"$f.tmp\", $f); exec('/bin/sleep', '600');",
+            pidFile]))!)
+        {
+            p.WaitForExit();
+        }
+        for (var i = 0; i < 200 && !File.Exists(pidFile); i++)
+        {
+            Thread.Sleep(25);
+        }
+        var lines = File.ReadAllLines(pidFile);
+        var detached = Parse(lines[0]);
+        var zombie = int.Parse(lines[1]);
+        for (var i = 0; i < 200 && !StateOf(zombie).StartsWith('Z'); i++)
+        {
+            Thread.Sleep(25);
+        }
+        Assert.True(StateOf(zombie).StartsWith('Z'), $"{zombie} is not a zombie: '{StateOf(zombie)}'");
+        return (detached, zombie);
+    }
+
+    /// <summary><c>ps -o stat=</c> of <paramref name="pid"/>, trimmed; empty when no such process.</summary>
+    public static string StateOf(int pid)
+    {
+        using var p = Process.Start(new ProcessStartInfo("/bin/ps", ["-o", "stat=", "-p", pid.ToString()]) { RedirectStandardOutput = true })!;
+        var text = p.StandardOutput.ReadToEnd();
+        p.WaitForExit();
+        return text.Trim();
+    }
+
     /// <summary><c>ps -o lstart=</c> of <paramref name="pid"/>, whitespace collapsed; null when no such process.</summary>
     public static string? StartTimeOf(int pid)
     {

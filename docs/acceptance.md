@@ -893,7 +893,11 @@ the branch as links of kind `pr` and `branch`, and EXACTLY ONE comment equal to 
 the rows written before the `closeout` `posted` row (attributed, as the pipeline posts it); a second run adds no second
 `claimed`, `linked` or posted `closeout` row and no link, and the closeout stays the item's only closeout. Its one board write
 is the factory's once-only notice on an item nothing in this phase moves on (`RunPipeline.HeldNoticeText` for Watch, with a
-`held-notice` row): the test allows that notice at most once and no other comment.
+`held-notice` row): the second run must not be deferred and must succeed, and the test asserts exactly one posted
+`held-notice` row, exactly one such comment and no other comment. The notice is deterministic: Watch is no handled state, so the
+run goes to `HoldAsync`, which posts it once per state entry (the first run enters Watch without one); it would be missing only if
+the freeze deferred the run or the board refused the comment (logged, no row, retried by the next run) — both reported as
+failures.
 
 Not live (every `dotnet test`): `KanbanWorkSourceTests` (each member, each refusal, paging, what every write sends — against a
 fake MCP server that behaves as KanbanBoard's contract says, `FakeKanbanBoard`), `KanbanPipelineTests` (the same run through the
@@ -1160,7 +1164,7 @@ Kanban settings, `Worker:Slots` and `Intake:MaxConcurrentRuns` unset) Phase 4b d
 each deliberate:
 
 - `factory work` with nothing watched (no Shortcut scope, no `Kanban:Watch:Projects`, no `GitHub:Watch:Repos`) exits 2 naming
-  the three settings; before, it started with a warning and picked nothing up.
+  the three settings; before, it started with a warning and picked nothing up (owner decision, confirmed 2026-10-14: kept).
 - `factory run` beside a running `factory work` waits at its worker phases for the sandbox user (`[lock] … waiting`), instead of
   failing at start because the work root's lock was held.
 - The ledger gets `slot-wait`, `slot-held` and `slot-released` rows (outcome `passed`) and the dashboard a Run column, also on a
