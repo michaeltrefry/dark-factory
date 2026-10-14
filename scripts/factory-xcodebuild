@@ -8,6 +8,8 @@
 #
 #   factory-xcodebuild build|build-for-testing|test|test-without-building -scheme <name> -destination <dest> [options]
 #   factory-xcodebuild -list [-project <p.xcodeproj> | -workspace <w.xcworkspace>]
+#   factory-xcodebuild --gate build-for-testing|test-without-building …   (the merge gate's test runs, sc-26131: below)
+#   factory-xcodebuild clean-derived-data                                (deletes this working directory's DerivedData)
 #
 # Options (each at most once, except the test filters):
 #   -project <relative path>.xcodeproj | -workspace <relative path>.xcworkspace
@@ -33,7 +35,16 @@
 # (-derivedDataPath ~/Library/Developer/Xcode/DerivedData/dark-factory/<first 16 hex of the SHA-256 of `pwd -P`>, so two
 # worktrees — two items, or a gate's base and head runs — never share build products) and SwiftPM checkouts
 # (-clonedSourcePackagesDirPath ~/Library/Caches/dark-factory/SourcePackages); ~ from the password database, never the
-# caller's HOME, so each worker slot's sandbox user builds into its own. And -skipMacroValidation
+# caller's HOME, so each worker slot's sandbox user builds into its own.
+# --gate (the merge gate's runs, sc-26131; nothing else changes): the SwiftPM checkouts go inside that working directory's
+# DerivedData (<DerivedData>/SourcePackages) instead of the shared ~/Library/Caches/dark-factory/SourcePackages, which every
+# worker session of the user can edit — so a gate run compiles only packages it resolved itself.
+# clean-derived-data (no other argument): deletes this working directory's DerivedData (the gate's SourcePackages with it), as
+# the running user, after checking that its parent resolves inside the user's own home; a symbolic link at that path is
+# removed, never followed. The gate runs it before every build of a run and again after the run: a gate worktree's path is
+# the same for every run of an item (gate-<item>-base|head), so without it a worker session of the same user could plant
+# build products or a build database there for the gate's next run to build on and run. Exit 0 once the directory is gone;
+# anything else is a failed clean (the gate's run is then an error, never a pass). And -skipMacroValidation
 # -skipPackagePluginValidation: a fresh sandbox user has trusted no Swift macro or package plugin and nobody can click
 # "Trust" for it, so without them any package graph with a macro or a build-tool plugin cannot build at all.
 # xcodebuild runs with a fresh environment (HOME, a fixed PATH, the user's own TMPDIR when it has one): xcodebuild reads
@@ -59,6 +70,8 @@ refuse() {
 usage() {
     echo "factory-xcodebuild: usage: factory-xcodebuild build|build-for-testing|test|test-without-building -scheme <name> -destination <macOS or simulator> [-project <p.xcodeproj> | -workspace <w.xcworkspace>] [-configuration <name>] [-only-testing:<id>]... [-skip-testing:<id>]... [-parallel-testing-enabled NO] [-resultBundlePath <r.xcresult>] [-quiet]" >&2
     echo "factory-xcodebuild: usage: factory-xcodebuild -list [-project <p.xcodeproj> | -workspace <w.xcworkspace>]" >&2
+    echo "factory-xcodebuild: usage: factory-xcodebuild --gate build-for-testing|test-without-building … (the merge gate's runs)" >&2
+    echo "factory-xcodebuild: usage: factory-xcodebuild clean-derived-data" >&2
     exit 64
 }
 
@@ -101,6 +114,22 @@ relative_path() { # relative_path <value> <suffix>
 
 [ $# -ge 1 ] || usage
 
+# The gate's runs (sc-26131): SwiftPM checkouts inside this working directory's DerivedData, not the user's shared ones.
+gate=0
+if [ "$1" = --gate ]; then
+    gate=1
+    shift
+    [ $# -ge 1 ] || usage
+fi
+
+clean=0
+if [ "$1" = clean-derived-data ]; then
+    [ $# -eq 1 ] || refuse "clean-derived-data with arguments"
+    [ "$gate" -eq 0 ] || refuse "--gate before clean-derived-data"
+    clean=1
+    shift
+fi
+
 action=
 list=0
 scheme=
@@ -120,6 +149,7 @@ while [ $# -gt 0 ]; do
             action=$arg ;;
         -list)
             [ -z "$action" ] && [ "$list" -eq 0 ] || refuse "-list beside an action"
+            [ "$gate" -eq 0 ] || refuse "--gate with -list"
             list=1 ;;
         -scheme)
             [ $# -ge 2 ] || refuse "-scheme without a name"
@@ -175,6 +205,26 @@ home=~
 work_key=$(printf %s "$work_dir" | /usr/bin/shasum -a 256 | /usr/bin/cut -c1-16)
 derived_data=$home/Library/Developer/Xcode/DerivedData/dark-factory/$work_key
 source_packages=$home/Library/Caches/dark-factory/SourcePackages
+[ "$gate" -eq 0 ] || source_packages=$derived_data/SourcePackages
+
+if [ "$clean" -eq 1 ]; then
+    # The DerivedData root must resolve inside the user's own home (no link out of it); the key itself is removed as it is —
+    # rm -rf of a symbolic link removes the link, never what it names.
+    root=${derived_data%/*}
+    /bin/mkdir -p -- "$root" || exit 70
+    real_home=$(cd -P -- "$home" && pwd -P) || exit 70
+    real_root=$(cd -P -- "$root" && pwd -P) || exit 70
+    case "$real_root/" in
+        "$real_home"/*) ;;
+        *) echo "factory-xcodebuild: refusing to clean $derived_data: $root resolves to $real_root, outside $real_home" >&2; exit 70 ;;
+    esac
+    /bin/rm -rf -- "$real_root/$work_key" || exit 70
+    if [ -e "$real_root/$work_key" ] || [ -L "$real_root/$work_key" ]; then
+        echo "factory-xcodebuild: $derived_data is still there after it was deleted" >&2
+        exit 70
+    fi
+    exit 0
+fi
 
 env=("HOME=$home" "PATH=/usr/bin:/bin:/usr/sbin:/sbin")
 tmpdir=${TMPDIR:-}
@@ -191,6 +241,10 @@ fi
 
 [ -n "$action" ] || usage
 [ -n "$scheme" ] || refuse "a build without -scheme"
+case "$gate:$action" in
+    0:* | 1:build-for-testing | 1:test-without-building) ;;
+    *) refuse "--gate with the action '$action' (only build-for-testing and test-without-building)" ;;
+esac
 [ -n "$destination" ] || refuse "a build without -destination"
 case "$action" in
     test | test-without-building) ;;

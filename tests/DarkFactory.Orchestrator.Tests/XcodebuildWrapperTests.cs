@@ -307,6 +307,98 @@ public class XcodebuildWrapperTests
     }
 
     [Fact]
+    public async Task A_gate_run_resolves_its_packages_inside_its_own_derived_data_and_a_workers_run_into_the_shared_checkouts()
+    {
+        // sc-26131: the shared checkouts are every worker session's to edit; the gate's run uses checkouts its own clean deletes.
+        var home = SandboxSupport.PasswdHome();
+        var derived = SwiftToolchain.DerivedDataOf(home, Physical(_dir));
+        foreach (var action in new[] { "build-for-testing", "test-without-building" })
+        {
+            var (exitCode, stderr, ran, _) = await RunAsync(["--gate", action, "-scheme", "App", "-destination", "platform=macOS"]);
+            Assert.True(exitCode == 0, stderr);
+            Assert.Equal(derived + "/SourcePackages", ran[Array.IndexOf(ran, "-clonedSourcePackagesDirPath") + 1]);
+            Assert.Equal(derived, ran[Array.IndexOf(ran, "-derivedDataPath") + 1]);
+            Assert.Equal(action, ran[0]);
+        }
+        var (workerExit, workerErr, worker, _) = await RunAsync(["build-for-testing", "-scheme", "App", "-destination", "platform=macOS"]);
+        Assert.True(workerExit == 0, workerErr);
+        Assert.Equal(SwiftToolchain.SourcePackagesOf(home), worker[Array.IndexOf(worker, "-clonedSourcePackagesDirPath") + 1]);
+    }
+
+    public static TheoryData<string[], string> RefusedGateForms => new()
+    {
+        { ["--gate", "build", "-scheme", "App", "-destination", "platform=macOS"], "--gate with the action 'build'" },
+        { ["--gate", "test", "-scheme", "App", "-destination", "platform=macOS"], "--gate with the action 'test'" },
+        { ["--gate", "-list"], "--gate with -list" },
+        { ["build", "--gate", "-scheme", "App", "-destination", "platform=macOS"], "the option '--gate'" },
+        { ["clean-derived-data", "-quiet"], "clean-derived-data with arguments" },
+        { ["--gate", "clean-derived-data"], "--gate before clean-derived-data" },
+        { ["build", "clean-derived-data"], "the action 'clean-derived-data'" },
+    };
+
+    [Theory]
+    [MemberData(nameof(RefusedGateForms))]
+    public async Task A_refused_gate_or_clean_form_runs_nothing(string[] args, string why)
+    {
+        var (exitCode, stderr, ran, _) = await RunAsync(args);
+
+        Assert.Equal(64, exitCode);
+        Assert.Contains("factory-xcodebuild: refusing " + why, stderr);
+        Assert.Empty(ran);
+    }
+
+    [Fact]
+    public async Task Clean_derived_data_deletes_this_working_directorys_derived_data_and_nothing_else()
+    {
+        var home = SandboxSupport.PasswdHome();
+        var derived = SwiftToolchain.DerivedDataOf(home, Physical(_dir));
+        var other = Directory.CreateTempSubdirectory("df-xcodebuild-keep-").FullName;
+        var otherDerived = SwiftToolchain.DerivedDataOf(home, Physical(other));
+        try
+        {
+            // What a worker session of the same user could have planted: products, a build database, package checkouts.
+            Directory.CreateDirectory(Path.Combine(derived, "Build", "Products", "Debug"));
+            File.WriteAllText(Path.Combine(derived, "Build", "Products", "Debug", "planted"), "x");
+            Directory.CreateDirectory(Path.Combine(derived, "SourcePackages", "checkouts", "dep"));
+            Directory.CreateDirectory(otherDerived);
+
+            var (exitCode, stderr, ran, _) = await RunAsync(["clean-derived-data"]);
+
+            Assert.True(exitCode == 0, stderr);
+            Assert.Empty(ran); // xcodebuild is not run
+            Assert.False(Directory.Exists(derived) || File.Exists(derived));
+            Assert.True(Directory.Exists(otherDerived)); // another working directory's is not touched
+            // Nothing there is a success too.
+            Assert.Equal(0, (await RunAsync(["clean-derived-data"])).ExitCode);
+
+            // A symbolic link at the path is removed, never followed.
+            var target = Directory.CreateTempSubdirectory("df-xcodebuild-target-").FullName;
+            File.WriteAllText(Path.Combine(target, "kept"), "x");
+            File.CreateSymbolicLink(derived, target);
+            var (linkExit, linkErr, _, _) = await RunAsync(["clean-derived-data"]);
+            Assert.True(linkExit == 0, linkErr);
+            Assert.False(File.Exists(derived) || Directory.Exists(derived) || new FileInfo(derived).LinkTarget is not null);
+            Assert.True(File.Exists(Path.Combine(target, "kept")));
+            Directory.Delete(target, recursive: true);
+        }
+        finally
+        {
+            foreach (var d in new[] { derived, otherDerived })
+            {
+                if (new FileInfo(d).LinkTarget is not null)
+                {
+                    File.Delete(d);
+                }
+                else if (Directory.Exists(d))
+                {
+                    Directory.Delete(d, recursive: true);
+                }
+            }
+            Directory.Delete(other, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task No_arguments_prints_the_usage_and_runs_nothing()
     {
         var (exitCode, stderr, _, _) = await RunAsync([]);

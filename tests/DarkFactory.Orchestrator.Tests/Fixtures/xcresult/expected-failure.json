@@ -1,0 +1,45 @@
+{
+  "devices" : [
+    {
+      "architecture" : "arm64",
+      "deviceId" : "00000000-0000000000000000",
+      "deviceName" : "My Mac",
+      "modelName" : "Mac",
+      "osBuildNumber" : "25G83",
+      "osVersion" : "26.6.2",
+      "platform" : "macOS"
+    }
+  ],
+  "testNodes" : [
+    {
+      "children" : [
+        {
+          "children" : [
+            {
+              "duration" : "0.00052s",
+              "durationInSeconds" : 0.0005178451538085938,
+              "name" : "known()",
+              "nodeIdentifier" : "known()",
+              "nodeIdentifierURL" : "test://com.apple.xcode/Words/WordsTests/known()",
+              "nodeType" : "Test Case",
+              "result" : "Expected Failure"
+            }
+          ],
+          "name" : "WordsTests",
+          "nodeIdentifierURL" : "test://com.apple.xcode/Words/WordsTests",
+          "nodeType" : "Unit test bundle",
+          "result" : "Expected Failure"
+        }
+      ],
+      "name" : "Words",
+      "nodeType" : "Test Plan",
+      "result" : "Expected Failure"
+    }
+  ],
+  "testPlanConfigurations" : [
+    {
+      "configurationId" : "1",
+      "configurationName" : "Test Scheme Action"
+    }
+  ]
+}

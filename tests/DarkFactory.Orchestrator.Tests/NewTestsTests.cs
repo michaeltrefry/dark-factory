@@ -1038,6 +1038,56 @@ public class GateCloneTests : IDisposable
     }
 
     [Fact]
+    public async Task A_cleanup_step_runs_after_every_other_step_however_the_run_ended()
+    {
+        // sc-26131: the Xcode wrapper's clean-derived-data runs after a passing run, a failed build, a timeout and a cancellation.
+        var sha = Commit("base", ("src/a.cs", "a"));
+        TestGit.Run(_seed, "push", "-q", _remote, "main");
+        var git = Workspace();
+        await git.ChangedFilesAsync(Repo, sha, sha, CancellationToken.None);
+        var marker = Path.Combine(_root, "cleaned");
+        var cleanup = new TestStep(TestPhase.Cleanup, "/bin/sh", ["-c", $"pwd -P >> '{marker}'; exit 3"]);
+        async Task<(TestRunReport? Report, string[] Cleaned)> Run(TimeSpan timeout, CancellationToken ct, params TestStep[] steps)
+        {
+            File.Delete(marker);
+            var results = NewTestsCheck.NewResultsDirectory();
+            TestRunReport? report = null;
+            try
+            {
+                report = await new SandboxTestRunner(git, slots: null, timeout).RunAsync(Repo,
+                    new TestRunSpec("gate-sc-1-head", sha, null, [], [], [cleanup, .. steps], new XunitNewTests(), results), ct);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            return (report, File.Exists(marker) ? File.ReadAllLines(marker) : []);
+        }
+
+        var ran = await Run(TimeSpan.FromMinutes(1), CancellationToken.None, new TestStep(TestPhase.Test, "/bin/sh", ["-c", "true"]));
+        // Listed first, it still runs last, once, in the run's worktree; its exit code decides nothing.
+        Assert.EndsWith("/gate-sc-1-head", Assert.Single(ran.Cleaned));
+        Assert.Contains("→ exit 3", ran.Report!.Log);
+
+        var buildFailed = await Run(TimeSpan.FromMinutes(1), CancellationToken.None, new TestStep(TestPhase.Build, "/bin/sh", ["-c", "exit 1"]));
+        Assert.Equal((TestRunStatus.BuildFailed, 1), (buildFailed.Report!.Status, buildFailed.Cleaned.Length));
+
+        var timedOut = await Run(TimeSpan.FromSeconds(1), CancellationToken.None, new TestStep(TestPhase.Test, "/bin/sh", ["-c", "sleep 30"]));
+        Assert.Equal((TestRunStatus.TimedOut, 1), (timedOut.Report!.Status, timedOut.Cleaned.Length));
+
+        // Cancelled (a Pause or Stop) while its step runs: cancelled only once the step has started, so the worktree exists.
+        var started = Path.Combine(_root, "started");
+        using var cancel = new CancellationTokenSource();
+        var running = Run(TimeSpan.FromMinutes(1), cancel.Token, new TestStep(TestPhase.Test, "/bin/sh", ["-c", $"touch '{started}'; sleep 30"]));
+        while (!File.Exists(started) && !running.IsCompleted)
+        {
+            await Task.Delay(50);
+        }
+        cancel.Cancel();
+        var cancelled = await running;
+        Assert.Equal((null, 1), (cancelled.Report, cancelled.Cleaned.Length));
+    }
+
+    [Fact]
     public async Task A_vstest_run_reads_only_its_trx_files()
     {
         var (runner, sha) = await ShRunner();

@@ -289,8 +289,12 @@ public class GatePipelineTests
                     gate: new GateStage(GitHub, Panel ?? Reviewer, TimeSpan.FromMilliseconds(1), CiTimeout, GateOnFakeClock ? Time : null,
                         TestRunner, Overlays, NoCodeGraph ? null : RiskReader ?? FakeCodeGraphRisk.Reader(CodeGraph, GateOnFakeClock)),
                     freeze: Freeze is null ? null : new FactoryFreeze(Contexts, Controls, Freeze, TimeProvider.System, GitHub),
-                    maxControlReadFailures: MaxControlReadFailures)
+                    maxControlReadFailures: MaxControlReadFailures,
+                    swift: Swift)
                 .RunAsync(77, ct);
+
+        /// <summary><c>Worker:Swift</c> for the run (sc-26131: the new-tests check then also runs Xcode projects' macOS tests).</summary>
+        public bool Swift { get; init; }
 
         /// <summary>The implementer reports <c>implementerModels</c>; every later session (a fixer) reports <see cref="FixerModels"/>.</summary>
         private sealed class HarnessWorker(Harness h, string?[] implementerModels) : IWorker

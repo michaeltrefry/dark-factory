@@ -1,0 +1,53 @@
+{
+  "devices" : [
+    {
+      "architecture" : "arm64",
+      "deviceId" : "00000000-0000000000000000",
+      "deviceName" : "My Mac",
+      "modelName" : "Mac",
+      "osBuildNumber" : "25G83",
+      "osVersion" : "26.6.2",
+      "platform" : "macOS"
+    }
+  ],
+  "testNodes" : [
+    {
+      "children" : [
+        {
+          "children" : [
+            {
+              "children" : [
+                {
+                  "duration" : "0.00014s",
+                  "durationInSeconds" : 0.00013709068298339844,
+                  "name" : "notBlank()",
+                  "nodeIdentifier" : "WordsTests/notBlank()",
+                  "nodeIdentifierURL" : "test://com.apple.xcode/Words/WordsTests/WordsTests/notBlank()",
+                  "nodeType" : "Test Case",
+                  "result" : "Passed"
+                }
+              ],
+              "name" : "WordsTests",
+              "nodeIdentifierURL" : "test://com.apple.xcode/Words/WordsTests/WordsTests",
+              "nodeType" : "Test Suite",
+              "result" : "Passed"
+            }
+          ],
+          "name" : "WordsTests",
+          "nodeIdentifierURL" : "test://com.apple.xcode/Words/WordsTests",
+          "nodeType" : "Unit test bundle",
+          "result" : "Passed"
+        }
+      ],
+      "name" : "Words",
+      "nodeType" : "Test Plan",
+      "result" : "Passed"
+    }
+  ],
+  "testPlanConfigurations" : [
+    {
+      "configurationId" : "1",
+      "configurationName" : "Test Scheme Action"
+    }
+  ]
+}

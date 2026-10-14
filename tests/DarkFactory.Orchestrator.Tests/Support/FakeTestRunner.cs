@@ -73,6 +73,15 @@ internal sealed class FakeTestRunner : IGateTestRunner
 
     private static IEnumerable<string> Filtered(IReadOnlyList<string> args)
     {
+        if (args.Contains("test-without-building"))
+        {
+            // the xcodebuild wrapper (XcodeNewTests): -only-testing:<id>
+            return args.Where(a => a.StartsWith("-only-testing:", StringComparison.Ordinal)).Select(a => a["-only-testing:".Length..]).ToList();
+        }
+        if (args.Contains("xcresulttool"))
+        {
+            return []; // reads the test step's bundle
+        }
         if (args.Contains("--xunit-output"))
         {
             // swift test (SwiftNewTests.Filter): ^<id, escaped>(/|$)
