@@ -156,6 +156,16 @@ public class GitWorkspaceTests
     {
         public List<string> Calls { get; } = [];
         public Task CloseToWorkerAsync(string path, CancellationToken ct) => Task.CompletedTask;
+
+        /// <summary>The worktree's <c>ls -led</c> as the push check reads it (null: it cannot be read); the check is the production one, for the user <c>_dftest2</c>.</summary>
+        public Func<string, string?> Listing { get; init; } = path => $"drwxr-xr-x+ 3 owner staff 96 Oct 13 12:00 {path}\n 0: user:_dftest2 allow list,add_file,search,delete\n";
+
+        public Task EnsureOnlyWorkerWritesAsync(string path, CancellationToken ct)
+        {
+            Calls.Add($"writers {path}");
+            return DarkFactory.Orchestrator.Worker.WorkerSlots.EnsureOnlyWriterAsync(path, "_dftest2",
+                (p, _) => Task.FromResult(Listing(p) ?? throw new InvalidOperationException("/bin/ls failed (1): no such file")), TimeSpan.Zero, ct);
+        }
         public Task ShareAsync(string path, CancellationToken ct)
         {
             Calls.Add($"share {path} {(Directory.EnumerateFileSystemEntries(path).Any() ? "non-empty" : "empty")}");
@@ -177,6 +187,58 @@ public class GitWorkspaceTests
         }
     }
 
+    /// <summary>
+    /// sc-25990 (E4/E7): the push of worker work is refused — nothing staged, committed or pushed, no token minted — when the
+    /// worktree's write grants name anyone but its own slot's user and the owner, or cannot be read.
+    /// </summary>
+    [Theory]
+    [InlineData(" 0: user:_dftest2 allow list,add_file,search,delete\n 1: user:_dftest allow list,add_file,search", "user:_dftest")]
+    [InlineData(" 0: user:_dftest allow list,add_file,search,delete,add_subdirectory", "user:_dftest")]
+    [InlineData(" 0: user:_dftest2 allow list,add_file,search\n 1: group:staff allow add_file", "group:staff")]
+    [InlineData(" 0: user:_dftest2 allow list,add_file,search\n 1: ABCDEF01-2345-6789-ABCD-EF0123456789 allow delete_child", "ABCDEF01-2345-6789-ABCD-EF0123456789")]
+    [InlineData(null, "could not be read")]
+    public async Task The_push_of_worker_work_is_refused_when_another_user_may_write_the_worktree(string? acl, string names)
+    {
+        var listing = acl;
+        var sandbox = new FakeSandbox { Listing = path => listing is null ? null : $"drwxr-xr-x+ 3 owner staff 96 Oct 13 12:00 {path}\n{listing}\n" };
+        var tokens = 0;
+        var workspace = new GitWorkspace(Path.Combine(_root, "work"), _ => _remote, (_, _) => { tokens++; return Task.FromResult<string?>(Token); },
+            sandbox: sandbox);
+        var story = await workspace.PrepareAsync(Repo, "factory/sc-9", CancellationToken.None);
+        File.WriteAllText(Path.Combine(story.Path, "work.txt"), "the worker's\n");
+        (var before, tokens) = (await workspace.HeadAsync(story, CancellationToken.None), 0);
+
+        var refused = await Assert.ThrowsAsync<DarkFactory.Orchestrator.Worker.WorktreeWritersException>(
+            () => workspace.CommitAndPushAsync(Repo, story, "sc-9: work", TestGrants.Untainted, CancellationToken.None));
+
+        Assert.Contains(names, refused.Message);
+        Assert.Contains("Refusing to push", refused.Message);
+        Assert.Contains("_dftest2", refused.Message); // whose worktree it is
+        Assert.Equal(story.Path, refused.Path);
+        Assert.Equal(0, tokens); // no push token was minted
+        Assert.Equal(before, await workspace.HeadAsync(story, CancellationToken.None)); // nothing committed
+        Assert.Equal("", Git(_root, "--git-dir", _remote, "branch", "--list", "factory/sc-9").Trim()); // nothing pushed
+        Assert.Contains("?? work.txt", Git(story.Path, "status", "--porcelain")); // and nothing staged
+
+        // With only its own slot's user (and the owner) writing it, the same work is pushed.
+        listing = " 0: user:_dftest2 allow list,add_file,search,delete\n 1: user:_dftest inherited allow list,search,readattr\n";
+        Assert.True(await workspace.CommitAndPushAsync(Repo, story, "sc-9: work", TestGrants.Untainted, CancellationToken.None));
+        Assert.NotEqual("", Git(_root, "--git-dir", _remote, "branch", "--list", "factory/sc-9").Trim());
+    }
+
+    [Fact]
+    public async Task A_worktree_shared_with_no_worker_for_writing_is_not_asked_who_writes_it()
+    {
+        // A read-only seat (triage, planner) is never pushed with a grant in production; the check belongs to shared worktrees.
+        var sandbox = new FakeSandbox { Listing = _ => null };
+        var workspace = new GitWorkspace(Path.Combine(_root, "work"), _ => _remote, (_, _) => Task.FromResult<string?>(Token), sandbox: sandbox,
+            shareWithWorker: false);
+        var story = await workspace.PrepareAsync(Repo, "factory/sc-9", CancellationToken.None);
+
+        Assert.False(await workspace.CommitAndPushAsync(Repo, story, "nothing", TestGrants.Untainted, CancellationToken.None));
+        Assert.DoesNotContain(sandbox.Calls, c => c.StartsWith("writers ", StringComparison.Ordinal));
+    }
+
     private GitWorkspace Workspace(DarkFactory.Orchestrator.Worker.IWorkerSandbox sandbox, GitCommand? git = null) =>
         new(Path.Combine(_root, "work"), _ => _remote, (_, _) => Task.FromResult<string?>(Token), git, sandbox);
 
@@ -186,6 +248,7 @@ public class GitWorkspaceTests
         public bool Busy { get; set; } = true;
         public List<string> Calls { get; } = [];
         public Task CloseToWorkerAsync(string path, CancellationToken ct) => Task.CompletedTask;
+        public Task EnsureOnlyWorkerWritesAsync(string path, CancellationToken ct) => Task.CompletedTask;
         public Task ShareAsync(string path, CancellationToken ct) => Task.CompletedTask;
 
         public Task DeleteAsWorkerAsync(string path, CancellationToken ct)

@@ -631,9 +631,29 @@ public class WorkerSandboxTests
     public async Task A_stopped_workers_helper_reports_137_and_writes_no_job_report()
     {
         // Before: "…/factory-worker-launch: line N: <pid> Killed: 9  /usr/bin/env -i …" on every Stop.
-        var (exitCode, stderr) = await RunHelperAsync(["/bin/sleep", "600"], "\n");
+        // The stop comes once the helper is in its wait for the worker — the case its redirected wait answers for. A stdin
+        // closed at once can kill the worker before the helper's main shell has reached that wait, and bash 3.2 then reports
+        // the killed job when it reads the next script line, on the helper's real stderr (the helper is not changed for that:
+        // a session is never stopped that early). The worker's line comes well after the helper's fork: /usr/bin/env, a shell
+        // and a pause, against the two assignments and the watcher's fork the helper runs before it waits.
+        var psi = new ProcessStartInfo(SafeHelper.Create(_dir).Path, ["/bin/sh", "-c", "/bin/sleep 0.5; echo started; exec /bin/sleep 600"])
+        {
+            WorkingDirectory = _dir,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        using var p = Process.Start(psi)!;
+        await p.StandardInput.WriteAsync("\n");
+        await p.StandardInput.FlushAsync();
+        var stderrRead = p.StandardError.ReadToEndAsync();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        Assert.Equal("started", await p.StandardOutput.ReadLineAsync(cts.Token));
 
-        Assert.Equal((137, ""), (exitCode, stderr));
+        p.StandardInput.Close(); // the Stop
+        await p.WaitForExitAsync(cts.Token);
+
+        Assert.Equal((137, ""), (p.ExitCode, await stderrRead));
     }
 
     [Fact]

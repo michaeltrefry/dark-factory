@@ -31,6 +31,28 @@ public interface IWorkerSandbox
     /// directory then reads back closed.
     /// </summary>
     Task CloseToWorkerAsync(string path, CancellationToken ct);
+
+    /// <summary>
+    /// Before worker work in the worktree <paramref name="path"/> is pushed (sc-25990, E4/E7): fails
+    /// (<see cref="WorktreeWritersException"/>) unless the only principals its ACL lets write are the owner and the worker user
+    /// whose work it is — the slot the calling flow holds. A worktree another slot's user, anyone else, or (by its mode) everyone
+    /// could write may hold what a session other than the granted ones put there, so nothing of it is committed or pushed.
+    /// Fails closed: a listing that cannot be read refuses the push too.
+    /// </summary>
+    Task EnsureOnlyWorkerWritesAsync(string path, CancellationToken ct);
+}
+
+/// <summary>
+/// The push of worker work was refused (sc-25990): the worktree <see cref="Path"/> is writable by someone other than its own
+/// slot's sandbox user and the owner, so a session that is not among the push grant's — another slot's, possibly tainted (E4) —
+/// could have changed the files. The item's failure (Escalated, with this reason); a re-run starts in a fresh worktree.
+/// </summary>
+public sealed class WorktreeWritersException(string path, string user, string why)
+    : InvalidOperationException($"Refusing to push the work in {path}: {why}. Only {user} (the sandbox user of the worker slot whose work this is) "
+        + "and the owner may write an item's worktree, so that no other slot's session can change files this push would publish (E4). "
+        + "Nothing was committed or pushed; a re-run starts in a fresh worktree.")
+{
+    public string Path => path;
 }
 
 /// <summary>
@@ -488,6 +510,105 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         var lines = lsOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries);
         return lines.Length == 1 && Regex.IsMatch(lines[0], @"^drwx------[@ ]");
     }
+
+    /// <summary>
+    /// Makes the owner's directory <paramref name="path"/> this sandbox user's alone to read (sc-25990: a slot's MCP session
+    /// directory), owner-side and without root: closed like <see cref="CloseToWorkerAsync(string, CancellationToken)"/>
+    /// (<c>chmod -N</c> — the work root's inherited read entries, one per slot's user, are gone and nothing made in the directory
+    /// later inherits one — and mode <c>0700</c>), then exactly two entries for <see cref="User"/>: <c>search</c> on the directory
+    /// itself (it opens a file it is given the name of; it cannot list the directory) and, inherited by every file made in it
+    /// and applying to nothing else, <c>read</c>. Then <c>/bin/ls -led</c> must show the directory open to that user and to no
+    /// one else (<see cref="OpenToOthers"/>), else this throws.
+    /// </summary>
+    public Task RestrictToWorkerAsync(string path, CancellationToken ct) => RestrictToWorkerAsync(path, ListAclAsync, ct);
+
+    /// <summary><see cref="RestrictToWorkerAsync(string, CancellationToken)"/>, the directory read back through <paramref name="list"/> (tests).</summary>
+    internal async Task RestrictToWorkerAsync(string path, Func<string, CancellationToken, Task<string>> list, CancellationToken ct)
+    {
+        await RunChecked("/bin/chmod", ["-N", path], ct);
+        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        await RunChecked("/bin/chmod", ["+a", $"user:{User} allow search", path], ct);
+        await RunChecked("/bin/chmod", ["+a", $"user:{User} allow {InheritedReadRights}", path], ct);
+        var listing = await list(path, ct);
+        for (var read = 1; read < AclReads && (OpenToOthers(listing, User) is not null || !Grants(listing, User, "search")); read++)
+        {
+            // ls prints an entry's UUID instead of its user name while the directory service does not answer.
+            await Task.Delay(AclRetry, ct);
+            listing = await list(path, ct);
+        }
+        if (OpenToOthers(listing, User) is { } others)
+        {
+            throw new InvalidOperationException(
+                $"{path} is still open to others than its owner and {User} after `chmod -N`, mode 0700 and {User}'s two entries: {others}.");
+        }
+        if (!Grants(listing, User, "search"))
+        {
+            throw new InvalidOperationException(
+                $"{path} grants {User} no ACL 'search' entry after `chmod +a` (ls -led: {listing.Trim().ReplaceLineEndings("; ")}).");
+        }
+    }
+
+    /// <summary>How many times a listing that must name one sandbox user and nobody else is read before it fails (ls names a user by its UUID while the directory service is slow to answer).</summary>
+    internal const int AclReads = 5;
+
+    /// <summary>How long such a listing waits before it is read again.</summary>
+    internal static readonly TimeSpan AclRetry = TimeSpan.FromMilliseconds(200);
+
+    /// <summary>What a file made in a directory restricted to one sandbox user inherits (<see cref="RestrictToWorkerAsync(string, CancellationToken)"/>): read, and nothing on the directory itself.</summary>
+    private const string InheritedReadRights = "read,readattr,readextattr,readsecurity,file_inherit,only_inherit";
+
+    /// <summary>One line of <c>ls -le</c> after the first: an ACL entry — its principal (<c>user:name</c>, <c>group:name</c>, or a bare UUID ls could not name), allow or deny, its rights.</summary>
+    private static readonly Regex AclLine = new(@"^\s*[0-9]+:\s+(?<who>\S+)\s+(?:inherited\s+)?(?<kind>allow|deny)\s+(?<rights>\S+)\s*$");
+
+    /// <summary>
+    /// Whether <paramref name="lsOutput"/> (macOS <c>ls -led</c>: the long listing line, then one line per ACL entry, e.g.
+    /// <c> 0: user:_factory inherited allow read,readattr</c>) has an <c>allow</c> entry for <paramref name="user"/> listing
+    /// <paramref name="right"/> and no <c>deny</c> entry for that user listing it.
+    /// </summary>
+    public static bool Grants(string lsOutput, string user, string right)
+    {
+        var entries = lsOutput.Split('\n').Select(line => AclLine.Match(line))
+            .Where(m => m.Success && m.Groups["who"].Value == $"user:{user}" && m.Groups["rights"].Value.Split(',').Contains(right, StringComparer.Ordinal))
+            .Select(m => m.Groups["kind"].Value).ToList();
+        return entries.Contains("allow") && !entries.Contains("deny");
+    }
+
+    /// <summary>
+    /// Why <paramref name="lsOutput"/> (macOS <c>ls -led</c> of one directory or file of the owner's) shows it open to anyone but
+    /// its owner and <paramref name="user"/>, or null: its mode gives group and others nothing, and every ACL entry that allows
+    /// anything names <paramref name="user"/> or the owner. Fails closed: an empty listing, a first line that is no long listing
+    /// line, and a later line that is no ACL entry are each a reason.
+    /// </summary>
+    public static string? OpenToOthers(string lsOutput, string user)
+    {
+        var lines = lsOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        if (lines.Length == 0 || !Regex.IsMatch(lines[0], @"^[d-][r-][w-][xsS-]"))
+        {
+            return "its `ls -led` listing could not be read";
+        }
+        if (!Regex.IsMatch(lines[0], @"^[d-][r-][w-][xsS-]------[@+ ]"))
+        {
+            return $"its mode ({lines[0].Split(' ')[0]}) gives its group or everyone access";
+        }
+        var others = new List<string>();
+        foreach (var line in lines.Skip(1))
+        {
+            var entry = AclLine.Match(line);
+            if (!entry.Success)
+            {
+                return $"an ACL line could not be read ('{line.Trim()}')";
+            }
+            var who = entry.Groups["who"].Value;
+            if (entry.Groups["kind"].Value == "allow" && who != $"user:{user}" && who != $"user:{Environment.UserName}" && !others.Contains(who))
+            {
+                others.Add(who);
+            }
+        }
+        return others.Count == 0 ? null : $"its ACL also allows {string.Join(", ", others)}";
+    }
+
+    public Task EnsureOnlyWorkerWritesAsync(string path, CancellationToken ct) =>
+        WorkerSlots.EnsureOnlyWriterAsync(path, User, ListAclAsync, TimeSpan.FromMilliseconds(200), ct);
 
     public async Task DeleteAsWorkerAsync(string path, CancellationToken ct)
     {

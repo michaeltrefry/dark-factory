@@ -92,6 +92,13 @@ public sealed class WorkerSlots : IWorkerSandbox
     /// <summary>Slot <paramref name="slot"/>'s launch helper: <paramref name="first"/> for slot 1, then <c>&lt;first&gt;-2</c>, <c>&lt;first&gt;-3</c>, … (as <c>setup-worker-user.sh</c> installs them).</summary>
     public static string HelperOf(string first, int slot) => slot == 1 ? first : $"{first}-{slot}";
 
+    /// <summary>
+    /// Slot <paramref name="slot"/>'s own directory of the work root for <paramref name="name"/> (sc-25990: its MCP session files,
+    /// its triage worktrees, its planner seats): <paramref name="name"/> itself for slot 1 — where it was before slots — then
+    /// <c>&lt;name&gt;-2</c>, <c>&lt;name&gt;-3</c>, …, as the helpers are named.
+    /// </summary>
+    public static string DirectoryOf(string name, int slot) => slot == 1 ? name : $"{name}-{slot}";
+
     /// <summary>What the owner runs to (re)install every slot's helper: <c>sudo scripts/setup-worker-user.sh</c>, with <c>--slots n</c> for more than one.</summary>
     public static string ReinstallCommand(int slots) =>
         slots == 1 ? WorkerSandbox.ReinstallCommand : $"{WorkerSandbox.ReinstallCommand} --slots {slots}";
@@ -300,6 +307,70 @@ public sealed class WorkerSlots : IWorkerSandbox
 
     /// <summary>The held slot shares <paramref name="path"/> with its own user (<see cref="Current"/>): a worktree is one slot's for writing.</summary>
     public Task ShareAsync(string path, CancellationToken ct) => Current.ShareAsync(path, ct);
+
+    /// <summary>The worktree's only writers are the owner and the user of the slot the calling flow holds (<see cref="Current"/>): the push of a worker phase is of its own slot's work.</summary>
+    public Task EnsureOnlyWorkerWritesAsync(string path, CancellationToken ct) =>
+        EnsureOnlyWriterAsync(path, Current.User, ListAcl, AclRetry, ct);
+
+    /// <summary>
+    /// Throws (<see cref="WorktreeWritersException"/>) unless <paramref name="listAcl"/>'s <c>ls -led</c> of the worktree
+    /// <paramref name="path"/> shows no writer but its owner and <paramref name="user"/> (<see cref="WritersBeside"/>). Read up to
+    /// <see cref="AclReads"/> times, <paramref name="retry"/> apart, before a writer fails it (ls prints an entry's UUID instead of
+    /// its user name while the directory service does not answer); a listing that cannot be read fails it at once.
+    /// </summary>
+    internal static async Task EnsureOnlyWriterAsync(string path, string user, Func<string, CancellationToken, Task<string>> listAcl,
+        TimeSpan retry, CancellationToken ct)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            string listing;
+            try
+            {
+                listing = await listAcl(path, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                throw new WorktreeWritersException(path, user, $"who may write it could not be read ({ex.Message})");
+            }
+            if (WritersBeside(listing, user) is not { } why)
+            {
+                return;
+            }
+            if (attempt >= AclReads)
+            {
+                throw new WorktreeWritersException(path, user, why);
+            }
+            await Task.Delay(retry, ct);
+        }
+    }
+
+    /// <summary>
+    /// Why <paramref name="lsOutput"/> (macOS <c>ls -led</c> of a worktree: its long listing line, then one line per ACL entry)
+    /// lets anyone but the owner and <paramref name="user"/> write the directory, or null: no ACL entry grants another principal
+    /// (another slot's user, any other user, a group, an entry ls could not name) a right to write, and its mode does not let
+    /// everyone write. The work root's inherited read entries, which every slot's user has, are not write grants (the accepted
+    /// cross-slot read). Fails closed on a listing with no long listing line.
+    /// </summary>
+    public static string? WritersBeside(string lsOutput, string user)
+    {
+        var first = lsOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+        if (!Regex.IsMatch(first, @"^d[r-][w-][xsS-][r-][w-][xsS-][r-][w-][xtT-]"))
+        {
+            return "who may write it could not be read (its `ls -led` listing has no directory line)";
+        }
+        if (first[8] == 'w')
+        {
+            return $"its mode ({first.Split(' ')[0]}) lets every user write it";
+        }
+        var others = Writers(lsOutput).Where(w => w != $"user:{user}").ToList();
+        return others.Count == 0 ? null : $"its ACL lets {string.Join(", ", others)} write it";
+    }
+
+    /// <summary>
+    /// Makes <paramref name="path"/> the held slot's user's alone to read (<see cref="WorkerSandbox.RestrictToWorkerAsync(string, CancellationToken)"/>):
+    /// a slot's MCP session directory, which no other slot's user may read.
+    /// </summary>
+    public Task RestrictToWorkerAsync(string path, CancellationToken ct) => Current.RestrictToWorkerAsync(path, ct);
 
     /// <summary>Owner-side, and closed to every user but the owner whichever slot asks.</summary>
     public Task CloseToWorkerAsync(string path, CancellationToken ct) => All[0].Sandbox.CloseToWorkerAsync(path, ct);

@@ -304,7 +304,11 @@ allocates, still `sandbox_user`'s uid, and not the sudo caller's); otherwise the
 `send_signal` never signals pid or group 0 or 1 or an empty target. So each sandbox user is
 single-tenant: whatever runs through its helper holds that slot's lock (`WorkerLock`: `<work root>/.factory-run.lock` for slot 1,
 `slot-locks/.factory-run-n.lock` for slot n, a directory closed to every sandbox user) for that phase — one worker phase per sandbox user at a time, not one run ("Worker phases",
-sc-25988, under the invariants), and one per slot side by side. Setup, the owner's, once and again after any change to
+sc-25988, under the invariants), and one per slot side by side. Between slots the sandbox users are isolated for writing, not
+for reading ("Slot isolation", sc-25990, under the invariants): a worktree is written by its own slot's user and the owner
+only (checked before every push of worker work), each slot's MCP session directory is read by its own user and the owner only,
+and every slot's user reads everything else under the work root — other slots' worktrees included — through the work root's
+inherited read entry (accepted). Setup, the owner's, once and again after any change to
 `scripts/factory-worker-launch`: `sudo scripts/setup-worker-user.sh [--slots n]` (n = `Worker:Slots`, 1–8, default 1). Per
 slot it creates the hidden role account (slot 1 `_factory`, slot n `_factoryn`; own group; a uid of its own in 400-499 — setup
 refuses one outside the range, and two slots sharing one, before installing anything; home `/Users/<user>`, mode 0700, so no
@@ -699,7 +703,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   the issue text is untrusted, possibly an outsider's, and the triage's summary and fix are posted on the issue, possibly
   public), and its prompt names them, `TriagePrompt.McpNote`; its `--allowedTools` names exactly those three,
   `SandboxTriageRunner.TriageTools`) in a throwaway `factory/triage-gh-<key>`
-  worktree under its own root (`<WorkRoot>/triage-worktrees`, `SandboxTriageRunner.TriageWorktrees`: never the items'
+  worktree under its own root (`<WorkRoot>/triage-worktrees`, `SandboxTriageRunner.TriageWorktrees` — with several worker slots
+  the root of the slot the triage runs in, `triage-worktrees-n` for slot n, `TriageWorktreesOf`, sc-25990: "Slot isolation" —: never the items'
   `worktrees`, swept before each triage, not ACL-shared for writing — the worker user reads it through the work root's
   inherited read entry) whose git holds a contents-read token; nothing is committed or pushed; the issue text is fenced as
   untrusted. After checkout and before the session starts, the owner removes every symlink in that worktree whose `realpath`
@@ -746,7 +751,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   refused (-32602), the arguments rebuilt by `ReviewTools.CodeGraphArguments` (unknown ones dropped) with the project set,
   `read_node_source` shown only for a node of that project, schemas listed without a project argument. Kanban has no repository
   mapping, so it is NOT repo-scoped: its read calls go through with the session's arguments. The credential never goes in argv
-  (every local user can read `ps`): `McpProxySessions` writes the config to `<WorkRoot>/mcp-sessions/<guid>.json` (directory
+  (every local user can read `ps`): `McpProxySessions` writes the config to `<WorkRoot>/mcp-sessions/<guid>.json` (slot n's
+  directory with several worker slots: `mcp-sessions-n`, made that slot's user's alone to read and checked so, sc-25990: "Slot
+  isolation"; directory
   `0700`, file created `0600`; the worker user reads it through the work root's inherited read ACL, which the owner checks
   with `/bin/ls -led` once the file is written — a `search` entry for `Worker:RunAs` on the directory and a `read` entry on the
   file (`McpProxySessions.AclGrants`; no deny), else the session is not started, factory-wide, "re-run `sudo
@@ -754,7 +761,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   worktree, so the confined session cannot Read it into its transcript) after checkout and before launch, and when the session
   ends deletes it and revokes the credential (`McpProxyGrant.Dispose`: refused from then on); leftover files are swept before
   each triage (a live run's are kept, sc-25987: "Clean-up under overlapping runs"). Residual, accepted: while the session runs, a process that can read that file — the owner, root, or another
-  `_factory` process (none runs then: the triage holds the sandbox user's lock, `WorkerLock`) — could call the session's granted tools through
+  process of the same sandbox user (none runs then: the session holds that user's lock, `WorkerLock`; with several worker slots that
+  is the session's own slot's user and lock, and no other slot's user can read the file, sc-25990) — could call the session's granted tools through
   the proxy. Upstream tokens are only in the owner process (never in the worker's env, argv, worktree, prompt or transcript;
   `McpProxyTests`). Every MCP tool use still taints the session (`mcp:<tool>`; triage is already tainted by the issue text and
   never pushes). Implementers and fixers get no MCP: their tools allow none, and `ClaudeWorker.BuildArguments`/`RunAsync` refuse
@@ -971,7 +979,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   time (never resumed: its checkout is throwaway), on the `high` class (`WorkerModelClass.Planner`), confined like the triage worker
   — `WorkerTools.ReadOnly` (`ReadRule` of its own worktree, `dontAsk`, `--setting-sources ""`; `WorkerPlanRunner` refuses any other
   tools before checkout), in a throwaway `factory/plan-sc-<id>` worktree under its own root (`<WorkRoot>/plan-worktrees`,
-  `SandboxPlanRunner.PlanWorktrees`; contents-read token only, not shared for writing, out-of-tree symlinks removed first, swept
+  `SandboxPlanRunner.PlanWorktrees` — with several worker slots the root of the plan item's slot, `plan-worktrees-n` for slot n,
+  `PlanWorktreesOf`, sc-25990: "Slot isolation"; contents-read token only, not shared for writing, out-of-tree symlinks removed first, swept
   with the leftover MCP session files before each planner session when sandboxed, i.e. under the sandbox user's lock) — and reaching
   CodeGraph and Kanban only through the loopback MCP proxy under `McpProfile.Planner` (started per session by `SandboxPlanRunner`
   when an upstream is configured; its `--allowedTools` name exactly that profile's tools, `PlannerTools`). With `Worker:RunAs=none`
@@ -1645,7 +1654,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   whatever ran as `_factory` then; the periodic `[lock] … stays held … (sudo pid P)` line names it, and waiting runs can be
   paused or stopped; (c) a worktree is shared by ACL with one sandbox user — its item's slot's — so a worker can
   write another item's kept worktree of the same slot, as it could between runs before, and never one of another slot
-  (per-slot directories and the cross-slot checks are a later story); (d) the
+  (checked before every push of worker work: "Slot isolation", sc-25990); (d) the
   acceptance harness (`E2e`) still takes the configured work root's locks — every slot's — for its whole life
   (`WorkerLock.Acquire`, the one fail-fast taker), so a real `factory work` beside it waits at its worker phases rather than failing; (e) the CI fixer's
   prompt reads the failing checks from GitHub once inside its phase (one bounded read under the lock, not CI's polling).
@@ -1779,6 +1788,74 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   outside 1–8 refused; a re-run with fewer slots removing exactly the higher slots' helper paths, after the sudoers file, and
   naming the users left; `--slots 8` removing none; `--remove-worker-login` per user), `FactoryOptionsTests` (`Worker:Slots` read, bounded, refused with
   `Worker:RunAs=none`). Live, not run here: P4b-AT5 and P4b-AT6 (`SlotAcceptanceTests`; docs/acceptance.md).
+- Slot isolation (Phase 4b, sc-25990, E7/E4; `Worker/WorkerSlots.cs`, `Worker/WorkerSandbox.cs`, `Mcp/McpSessions.cs`,
+  `FactoryRunner.cs`): what used to rest on "no other sandbox process runs" holds between slots. Owner decision 2026-10-13:
+  slots are isolated for WRITING, and each has its own MCP session directory; cross-slot READS are accepted (below). Everything
+  here is owner-side — the owner's own `chmod` and `/bin/ls -led` on directories the owner owns; no root, no change to
+  `setup-worker-user.sh` or the launch helper.
+  Layout (`WorkerSlots.DirectoryOf(name, slot)`: `name` for slot 1, `name-n` for slot n, as the helpers are named): slot 1 keeps
+  `<WorkRoot>/mcp-sessions`, `triage-worktrees` and `plan-worktrees` exactly where they were (E9: with `Worker:Slots` 1 no
+  path and no behaviour changed, and what an earlier version left there is still swept); slot n has `mcp-sessions-n`,
+  `triage-worktrees-n`, `plan-worktrees-n` (`McpProxySessions.DirectoryOf`, `SandboxTriageRunner.TriageWorktreesOf`,
+  `SandboxPlanRunner.PlanWorktreesOf`). The items' `worktrees`, the clones (`repos`), `clone-locks`, `slot-locks` and `controls`
+  are shared by all slots as before.
+  (1) Worktrees, write isolation: a worktree is shared for writing with one sandbox user — its item's slot's — by the
+  inheritable ACL the owner sets on the empty directory (`WorkerSandbox.ShareAsync`, sc-25989), so another slot's user has no
+  write entry on it. Since a push grant vouches only for the item's own sessions (E4: a tainted session must not change files
+  an untainted session later pushes), `GitWorkspace.CommitAndPushAsync` — every push of worker work — first asks, before
+  anything is staged, committed or a token minted, `IWorkerSandbox.EnsureOnlyWorkerWritesAsync(worktree)`: the worktree's `ls
+  -led` must name no writer but the owner and the user of the slot the pushing phase holds (`WorkerSlots.Current`;
+  `WorkerSlots.WritersBeside`: any `allow` entry with a write right — `write`, `append`, `add_file`, `add_subdirectory`,
+  `delete`, `delete_child` — for another slot's user, any other user, a group or a UUID `ls` could not name, or a mode that
+  lets everyone write). Otherwise `WorktreeWritersException` ("Refusing to push the work in <path>: its ACL lets user:_factory
+  write it. Only _factory2 … and the owner may write an item's worktree …"): nothing is committed or pushed, the item escalates
+  with that reason (typed outcome `escalated`, like a tainted session's refusal) and a re-run starts in a fresh worktree. Fail
+  closed: a listing that cannot be read, or shows no directory, refuses the push; a writer is read up to 3 times first (`ls`
+  prints a user's UUID while the directory service is slow). The check is of the worktree's root directory, whose ACL only its
+  owner (the factory's owner) or root can change. It runs with one slot too (a worktree a higher slot's user may write, left
+  from a larger `Worker:Slots`, is not pushed from). Not checked: a seat's read-only worktree (`shareWithWorker` false — never
+  pushed) and the merge queue's base-update push (`PushAsync`: the orchestrator's own merge commit, no worker work).
+  (2) MCP session files, read isolation: the work root's inherited read entry names every slot's user, so with several slots
+  each session directory is made its own slot's user's alone before a session's file is written
+  (`WorkerSandbox.RestrictToWorkerAsync`, every slot's, slot 1's `mcp-sessions` included: `chmod -N` — every entry gone, the
+  inherited ones too, and nothing made there later inherits one —, mode 0700, then two entries for that user: `search` on the
+  directory itself, so it opens the file it is given and cannot list the directory, and an inherit-only `read` for the files
+  made in it; read back with `ls -led`). Once the file is written `McpProxySessions` reads both back: the slot's user must
+  hold `search` on the directory and `read` on the file (as before), and neither may be open to anyone else but the owner
+  (`WorkerSandbox.OpenToOthers`: no `allow` entry of another principal for any right, no group or other mode bit, no line that
+  is not an ACL entry; read up to 5 times before it fails). Any of it failing — the restriction, a read of the listing, the
+  check — is factory-wide as before (`FactoryUnavailableException`, `the MCP session config: … must be readable by _factory2
+  (its worker slot's user) and the owner alone, but its ACL also allows user:_factory, so another slot's worker could read
+  this session's MCP credential`): the session is not started, its file is deleted and its credential revoked. With one slot
+  nothing is restricted and only the old check runs (E9).
+  (3) Seats: a triage's and a planner's worktree root and session directory are those of the slot the seat runs in (a triage:
+  whichever free slot it took; a planner: its plan item's slot, so a re-run finds what an earlier run of it left), and each
+  seat's two sweeps (`GitWorkspace.SweepOrphansAsync` of its seat root, `McpProxySessions.SweepAsync` of its session directory,
+  both under the `LiveRuns` claims of sc-25987, unchanged) are of those two directories only: a triage in one slot and a
+  planner in another, at once, neither sweep nor use each other's. One exception, narrow: a triage takes any free slot, so an
+  earlier, dead triage of the SAME issue may have left its worktree in another slot's root, and the clone refuses a second
+  worktree of `factory/triage-gh-<key>` while it is there — so a triage first removes its own issue's leftover, and nothing
+  else, from the other slots' triage roots (`SandboxTriageRunner.RemoveOwnLeftoversAsync`: it holds that item's run lock, and
+  a seat's worktree is shared with no worker for writing, so no slot's user wrote it). A dead session's file in another slot's
+  directory holds a credential that died with its process's proxy and waits for that slot's next seat.
+  Residual, accepted (owner decision 2026-10-13): cross-slot READ. The work root's inherited read entry
+  (`setup-worker-user.sh`) gives every slot's user read on everything made under the work root that is not closed owner-side
+  (`clone-locks`, `slot-locks`, and with several slots each `mcp-sessions[-n]`): the clones, every item's worktree and every
+  seat's worktree, of every slot. So code a worker of one slot runs can read another slot's worktree — another item's
+  unmerged work, of any repository the factory works in — while both run; it cannot change it, and what it read reaches a
+  push only through its own session, which a web or MCP use taints (E4) and review and the gate judge. For triage this means
+  its read confinement is, between slots as within one, Claude Code's own: the triage session's only allow rule is the
+  `ReadRule` of its own worktree with `dontAsk` and `blockReadsOutsideWorkingDirectories`, and the OS does not back it —
+  the triage's sandbox user can read every other slot's worktrees (and, as before slots, its own slot's kept worktrees and
+  the clones). A gap in that enforcement (the Glob/Grep residual under the triage bullet) would therefore reach other slots'
+  unmerged work too, inside the triage's bounded, fenced answer. Also accepted: a sandbox user can still write its OWN slot's
+  other kept worktrees (Worker phases' residual (c)), and (2)'s restriction is re-applied by each session rather than once,
+  so a session directory someone opened up by hand is closed again by the next session, not before it.
+  Tests: `SlotIsolationTests` (the write-grant and the read-alone decisions over `ls -led` listings; the pool asking about the
+  held slot; on macOS, with the role accounts `daemon` and `nobody` for two slots' users, a real restricted directory and a
+  real worktree whose push is refused once the other user may write it), `GitWorkspaceTests` (the refused push: nothing
+  staged, committed or pushed, no token), `McpProxyTests` (the restricted directory, each refusal, one slot unchanged),
+  `SafeCleanupTests` (the layout; a triage and a planner in two slots at once; the triage's own leftover in another slot's root).
 - Clean-up under overlapping runs (Phase 4b, sc-25987; `Ledger/LiveRuns.cs`, `Git/CloneLock.cs`): no sweep decides from "no other run exists".
   Whose a leftover is: it carries its item in its name — a worktree directory by `ItemNaming.OwnerOfLeftover` (`factory-<item>`,
   the changeset worktree `factory-changeset-<item>`, a triage's `factory-triage-<item>`, a planner's worktree or seat

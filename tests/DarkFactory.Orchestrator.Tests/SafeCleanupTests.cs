@@ -79,6 +79,8 @@ public class SafeCleanupTests
 
         public Task ShareAsync(string path, CancellationToken ct) => Task.CompletedTask;
 
+        public Task EnsureOnlyWorkerWritesAsync(string path, CancellationToken ct) => Task.CompletedTask;
+
         public Task DeleteAsWorkerAsync(string path, CancellationToken ct)
         {
             Deletes.Add((path, held()));
@@ -129,6 +131,130 @@ public class SafeCleanupTests
         var path = Path.Combine(Sessions, name);
         File.WriteAllText(path, "{}");
         return path;
+    }
+
+    // ---- sc-25990: each worker slot's own seat and session directories ----
+
+    private GitWorkspace TriageOf(int slot) => Workspaces(SandboxTriageRunner.TriageWorktreesOf(slot));
+    private GitWorkspace PlannerOf(int slot) => Workspaces(SandboxPlanRunner.PlanWorktreesOf(slot));
+
+    private string SessionFileOf(int slot, string name)
+    {
+        var path = Path.Combine(Directory.CreateDirectory(McpProxySessions.DirectoryOf(WorkRoot, slot)).FullName, name);
+        File.WriteAllText(path, "{}");
+        return path;
+    }
+
+    [Fact]
+    public void Slot_1s_seat_and_session_directories_are_where_they_were_before_slots_and_each_other_slot_has_its_own()
+    {
+        // E9: with one slot (and for slot 1 of several) nothing moved, so what an earlier version left there is still swept.
+        Assert.Equal(("triage-worktrees", "plan-worktrees"), (SandboxTriageRunner.TriageWorktreesOf(1), SandboxPlanRunner.PlanWorktreesOf(1)));
+        Assert.Equal(Path.Combine("/work", "mcp-sessions"), McpProxySessions.DirectoryOf("/work", 1));
+        Assert.Equal(("triage-worktrees-2", "plan-worktrees-2"), (SandboxTriageRunner.TriageWorktreesOf(2), SandboxPlanRunner.PlanWorktreesOf(2)));
+        Assert.Equal(Path.Combine("/work", "mcp-sessions-3"), McpProxySessions.DirectoryOf("/work", 3));
+        var all = Enumerable.Range(1, WorkerSlots.MaxSlots).SelectMany(n => new[]
+        {
+            SandboxTriageRunner.TriageWorktreesOf(n), SandboxPlanRunner.PlanWorktreesOf(n), Path.GetFileName(McpProxySessions.DirectoryOf("/work", n)),
+        }).Append(GitWorkspace.ItemWorktrees).ToList();
+        Assert.Equal(all.Count, all.Distinct(StringComparer.Ordinal).Count()); // none shared, none the items' worktrees
+    }
+
+    [Fact]
+    public async Task A_triage_and_a_planner_in_two_slots_at_once_each_sweep_and_use_only_their_own_directories()
+    {
+        // What dead runs left: in slot 1's directories the triage of gh-8, a planner's seat of sc-6 and their session files; in
+        // slot 2's the same kinds, of gh-9 and sc-4.
+        foreach (var id in new[] { "gh-8", "gh-9" })
+        {
+            await Item(id);
+        }
+        foreach (var id in new[] { "sc-4", "sc-6" })
+        {
+            await Item(id, WorkState.Plan);
+        }
+        var slot1 = new[]
+        {
+            (await TriageOf(1).PrepareAsync(Repo, "factory/triage-gh-8", None)).Path,
+            (await PlannerOf(1).PrepareSeatAsync([Repo, Gears], "factory/plan-sc-6", None)).Path,
+            SessionFileOf(1, $"gh-8.{Guid.NewGuid():N}.json"), SessionFileOf(1, $"sc-6.{Guid.NewGuid():N}.json"),
+        };
+        var slot2 = new[]
+        {
+            (await TriageOf(2).PrepareAsync(Repo, "factory/triage-gh-9", None)).Path,
+            (await PlannerOf(2).PrepareSeatAsync([Repo, Gears], "factory/plan-sc-4", None)).Path,
+            SessionFileOf(2, $"gh-9.{Guid.NewGuid():N}.json"), SessionFileOf(2, $"sc-4.{Guid.NewGuid():N}.json"),
+        };
+        static bool There(string path) => Directory.Exists(path) || File.Exists(path);
+        var gh22 = await Item("gh-22");
+        var sc21 = await Item("sc-21", WorkState.Plan);
+        await using var triaging = await Live(gh22);
+        await using var planning = await Live(sc21);
+
+        // The triage of gh-22 in slot 1 and the planner of sc-21 in slot 2, at once: each its two sweeps, then its seat. (In
+        // production each has a ledger connection of its own; the test's one in-memory context is read by one at a time.)
+        using var oneReader = new SemaphoreSlim(1);
+        LiveRuns LiveFor(string self) => new(async (item, ct) =>
+        {
+            await oneReader.WaitAsync(ct);
+            try
+            {
+                return await _ledger.IdOfAsync(item, ct);
+            }
+            finally
+            {
+                oneReader.Release();
+            }
+        }, _locks, ItemNaming.ParseAny(self));
+        Workspace? triage = null;
+        SeatWorkspace? seat = null;
+        await Task.WhenAll(
+            Task.Run(async () =>
+            {
+                await TriageOf(1).SweepOrphansAsync((_, _) => Task.FromResult(false), LiveFor("gh-22"), None);
+                await McpProxySessions.SweepAsync(McpProxySessions.DirectoryOf(WorkRoot, 1), LiveFor("gh-22"), None);
+                triage = await TriageOf(1).PrepareAsync(Repo, "factory/triage-gh-22", None);
+            }),
+            Task.Run(async () =>
+            {
+                await PlannerOf(2).SweepOrphansAsync((_, _) => Task.FromResult(false), LiveFor("sc-21"), None);
+                await McpProxySessions.SweepAsync(McpProxySessions.DirectoryOf(WorkRoot, 2), LiveFor("sc-21"), None);
+                seat = await PlannerOf(2).PrepareSeatAsync([Repo, Gears], "factory/plan-sc-21", None);
+            }));
+
+        // Each used its own slot's root …
+        Assert.StartsWith(Path.Combine(WorkRoot, "triage-worktrees") + Path.DirectorySeparatorChar, triage!.Path);
+        Assert.StartsWith(Path.Combine(WorkRoot, "plan-worktrees-2") + Path.DirectorySeparatorChar, seat!.Path);
+        // … and swept its own slot's seat root and session files, and nothing else: slot 1's planner seats and slot 2's triage
+        // worktrees are for a planner of slot 1 and a triage of slot 2 to sweep.
+        Assert.Equal([false, true, false, false], slot1.Select(There));
+        Assert.Equal([true, false, false, false], slot2.Select(There));
+    }
+
+    [Fact]
+    public async Task A_triage_removes_its_own_issues_leftover_from_another_slots_root_and_nothing_else_there()
+    {
+        // A triage takes any free slot: gh-22's earlier triage died in slot 2, and this one runs in slot 1.
+        var gh22 = await Item("gh-22");
+        var gh7 = await Item("gh-7");
+        await Item("gh-9");
+        var own = (await TriageOf(2).PrepareAsync(Repo, "factory/triage-gh-22", None)).Path;
+        var live = (await TriageOf(2).PrepareAsync(Repo, "factory/triage-gh-7", None)).Path;
+        var dead = (await TriageOf(2).PrepareAsync(Repo, "factory/triage-gh-9", None)).Path;
+        await using var triaging = await Live(gh22);
+        await using var other = await Live(gh7);
+        // Why it must go: the clone refuses a second worktree of the branch while the first is there.
+        await Assert.ThrowsAnyAsync<Exception>(() => TriageOf(1).PrepareAsync(Repo, "factory/triage-gh-22", None));
+
+        await SandboxTriageRunner.RemoveOwnLeftoversAsync([TriageOf(2)], ItemNaming.ParseAny("gh-22"),
+            new LiveRuns(_ledger, _locks, ItemNaming.ParseAny("gh-22")), None);
+
+        // Its own is gone; a live triage's and even a dead one's stay, for a seat of slot 2 to sweep.
+        Assert.Equal((false, true, true), (Directory.Exists(own), Directory.Exists(live), Directory.Exists(dead)));
+        Assert.True(Directory.Exists((await TriageOf(1).PrepareAsync(Repo, "factory/triage-gh-22", None)).Path));
+        // An item with no name (none parses) removes nothing anywhere.
+        await SandboxTriageRunner.RemoveOwnLeftoversAsync([TriageOf(2)], null, new LiveRuns(_ledger, _locks), None);
+        Assert.Equal((true, true), (Directory.Exists(live), Directory.Exists(dead)));
     }
 
     private async Task<string> Head() => (await Workspaces().BranchStartAsync(Repo, "factory/x", None)).BaseSha;
