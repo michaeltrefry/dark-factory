@@ -18,7 +18,7 @@ public class FactoryCliTests
             _ => { calls.Add("work"); return Task.FromResult(0); },
             _ => { calls.Add("dashboard set-password"); return Task.FromResult(0); },
             (action, scope, _) => { calls.Add($"{action} {scope}"); return Task.FromResult(0); },
-            (item, _) => { calls.Add($"kanban key {item}"); return Task.FromResult(0); });
+            (id, epic, _) => { calls.Add(epic ? $"kanban key --epic {id}" : $"kanban key {id}"); return Task.FromResult(0); });
         return (root, calls);
     }
 
@@ -32,6 +32,9 @@ public class FactoryCliTests
     [InlineData("stop --item KB-7", "stop item:kb-7")]
     [InlineData("pause --epic 12", "pause epic:12")]
     [InlineData("stop --epic 12", "stop epic:12")]
+    [InlineData("pause --epic kb-3", "pause epic:kb-3")]
+    [InlineData("continue --epic kb-3", "continue epic:kb-3")]
+    [InlineData("stop --epic KB-3", "stop epic:kb-3")]
     [InlineData("pause --factory", "pause factory")]
     [InlineData("continue --factory", "continue factory")]
     [InlineData("continue --usage", "continue usage")]
@@ -48,6 +51,11 @@ public class FactoryCliTests
     [InlineData("pause --factory --item sc-1")]
     [InlineData("stop --item nope")]
     [InlineData("continue --epic 0")]
+    [InlineData("pause --epic kb-0")]
+    [InlineData("pause --epic gh-3")]
+    [InlineData("stop --epic sc-3")]
+    [InlineData("stop --epic nope")]
+    [InlineData("pause --epic kb-3 --item kb-3")]
     [InlineData("continue --usage --factory")]
     [InlineData("pause --usage")]
     [InlineData("stop --usage")]
@@ -95,6 +103,10 @@ public class FactoryCliTests
     [InlineData("kanban", "key")]
     [InlineData("kanban", "key", "kb-7")]
     [InlineData("kanban", "key", "not-a-guid")]
+    [InlineData("kanban", "key", "--epic")]
+    [InlineData("kanban", "key", "--epic", "kb-3")]
+    [InlineData("kanban", "key", "--epic", "not-a-guid")]
+    [InlineData("kanban", "key", "e0865c06-7b9a-4f0f-9a1e-3a8f3c0f2d11", "--epic", "a1865c06-7b9a-4f0f-9a1e-3a8f3c0f2d22")] // one or the other
     public async Task Invalid_run_arguments_fail_without_running(params string[] args)
     {
         var (root, calls) = Cli();
@@ -110,6 +122,14 @@ public class FactoryCliTests
         var (root, calls) = Cli();
         Assert.Equal(0, await root.Parse(["kanban", "key", "E0865C06-7B9A-4F0F-9A1E-3A8F3C0F2D11"]).InvokeAsync());
         Assert.Equal(["kanban key e0865c06-7b9a-4f0f-9a1e-3a8f3c0f2d11"], calls);
+    }
+
+    [Fact]
+    public async Task Kanban_key_with_epic_passes_the_epics_board_id_as_an_epic()
+    {
+        var (root, calls) = Cli();
+        Assert.Equal(0, await root.Parse(["kanban", "key", "--epic", "A1865C06-7B9A-4F0F-9A1E-3A8F3C0F2D22"]).InvokeAsync());
+        Assert.Equal(["kanban key --epic a1865c06-7b9a-4f0f-9a1e-3a8f3c0f2d22"], calls);
     }
 
     [Fact]

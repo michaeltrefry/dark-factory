@@ -56,10 +56,12 @@
 </div>
 @foreach (var epic in Epics)
 {
-    <div class="controls" data-scope="@ControlScope.Epic(epic)">
-        <span>Epic @epic: <span class="control-state">@(Paused(ControlScope.Epic(epic)) ? "paused" : "running")</span></span>
-        <ControlButton Action="@(Paused(ControlScope.Epic(epic)) ? "continue" : "pause")" Scope="@ControlScope.Epic(epic)" />
-        <ControlButton Action="stop" Scope="@ControlScope.Epic(epic)" />
+    @* An epic's scope carries its source (sc-25985): `epic:12` a Shortcut epic, `epic:kb-3` a Kanban epic. *@
+    var epicScope = ControlScope.Epic(epic);
+    <div class="controls" data-scope="@epicScope">
+        <span>Epic @epic: <span class="control-state">@(Paused(epicScope) ? "paused" : "running")</span></span>
+        <ControlButton Action="@(Paused(epicScope) ? "continue" : "pause")" Scope="@epicScope" />
+        <ControlButton Action="stop" Scope="@epicScope" />
     </div>
 }
 @if (_rows is null)
@@ -143,7 +145,31 @@ else
     private RenderFragment ItemRow(PipelineRow row, PlanStoryView? story, PipelineRow? planRow) => __builder =>
     {
                 <tr @key="row.Id" data-item="@row.Id" class="@(story is null ? null : "plan-story")" data-plan="@planRow?.Id" data-story="@story?.ExternalId">
-                    <td>@if (story is not null) { <span class="plan-indent">↳</span> } <span class="id">@row.ExternalId</span> @row.Title</td>
+                    <td>@if (story is not null) { <span class="plan-indent">↳</span> }
+                        @* The item on its board, where the ledger holds what the link needs (sc-25985: a Kanban item's opens its board). *@
+                        @if (row.Links?.Item is { } itemUrl)
+                        {
+                            <a class="id" href="@itemUrl" target="_blank" rel="noopener noreferrer">@row.ExternalId</a>
+                        }
+                        else
+                        {
+                            <span class="id">@row.ExternalId</span>
+                        }
+                        @($" {row.Title}")
+                        @if (row.Links is not null && row.Epic is { } rowEpic)
+                        {
+                            @(" ")<span class="muted epic" data-epic="@rowEpic">epic
+                                @if (row.Links.Epic is { } epicUrl)
+                                {
+                                    <a href="@epicUrl" target="_blank" rel="noopener noreferrer">@rowEpic</a>
+                                }
+                                else
+                                {
+                                    @rowEpic
+                                }
+                            </span>
+                        }
+                    </td>
                     <td class="state">@row.State
                         @if (row.FailedCloseout is { } closeout)
                         {
@@ -239,9 +265,10 @@ else
     /// <summary>The factory's usage pause while it is in effect (it lifts by itself at its resume time).</summary>
     private Control? UsagePause => _controls.GetValueOrDefault(ControlScope.Usage) is { } c && c.PausesAt(Time.GetUtcNow()) ? c : null;
 
-    private IEnumerable<long> Epics => (_rows ?? []).Select(r => r.EpicId).OfType<long>()
-        .Concat(_controls.Keys.Select(ControlScope.EpicOf).OfType<long>())
-        .Distinct().Order();
+    /// <summary>The epics of the listed items and of every epic control, each source's apart (Shortcut's by number first).</summary>
+    private IEnumerable<EpicRef> Epics => (_rows ?? []).Select(r => r.Epic).OfType<EpicRef>()
+        .Concat(_controls.Keys.Select(ControlScope.EpicOf).OfType<EpicRef>())
+        .Distinct().OrderBy(e => e.Naming.Epics).ThenBy(e => e.Id);
     private ITimer? _tick;
     private bool _loading;
     private bool _again;

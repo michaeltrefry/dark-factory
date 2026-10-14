@@ -7,6 +7,9 @@ using Microsoft.EntityFrameworkCore;
 namespace DarkFactory.Orchestrator.Dashboard;
 
 /// <summary>One active work item as the pipeline view shows it.</summary>
+/// <param name="EpicId">The item's epic as the ledger holds it: an id within the item's own source (<see cref="Epic"/>).</param>
+/// <param name="Links">Links to the item and its epic on their board, built from the ledger (<see cref="IBoardLinks"/>, sc-25985);
+/// null for a source that has none.</param>
 public sealed record PipelineRow(
     long Id,
     string ExternalId,
@@ -22,8 +25,15 @@ public sealed record PipelineRow(
     ControlState Control = ControlState.Running,
     CloseoutStatus? FailedCloseout = null,
     long? PlanItemId = null,
-    PlanView? Plan = null)
+    PlanView? Plan = null,
+    BoardLink? Links = null)
 {
+    /// <summary>
+    /// The item's epic with its source (sc-25985): what the page shows (<c>12</c>, <c>kb-3</c>) and what its epic control form posts
+    /// (<see cref="ControlScope.Epic"/>) — a Kanban epic's key never reads as the Shortcut epic of the same number.
+    /// </summary>
+    public EpicRef? Epic => ItemNaming.EpicOf(ExternalId, EpicId);
+
     /// <summary>Whether the factory will try the failed closeout again (the next poll), or has left it to a human.</summary>
     public bool CloseoutRetrying => FailedCloseout is { Attempts: < RunPipeline.MaxCloseoutAttempts };
 
@@ -132,8 +142,9 @@ public interface IDashboardData
     Task<IReadOnlyList<Metric>> MetricsAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<Metric>>([]);
 }
 
+/// <param name="boardLinks">Each source's links to its items, from the ledger (<see cref="IBoardLinks"/>); none by default.</param>
 public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, TimeProvider time, TimeSpan? quietThreshold = null,
-    MetricsOptions? metrics = null, TimeSpan? metricsTtl = null) : IDashboardData
+    MetricsOptions? metrics = null, TimeSpan? metricsTtl = null, IReadOnlyList<IBoardLinks>? boardLinks = null) : IDashboardData
 {
     private readonly LedgerMetrics _metrics = new(contexts, metrics ?? MetricsOptions.Default);
     private readonly TimeSpan _metricsTtl = metricsTtl ?? DefaultMetricsTtl;
@@ -209,7 +220,7 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
                 .Any(s => s.Id == i.ExternalId && s.State == PlanStoryState.Merged) == true;
             return controls.GetValueOrDefault(ControlScope.Item(i.ExternalId))?.State == ControlState.Stopping
                 || (!merged && controls.GetValueOrDefault(planScope)?.State == ControlState.Stopping) ? ControlState.Stopping
-                : new[] { ControlScope.Factory, ControlScope.Usage, ControlScope.Freeze, ControlScope.Item(i.ExternalId), i.EpicId is { } e ? ControlScope.Epic(e) : "", planScope }
+                : new[] { ControlScope.Factory, ControlScope.Usage, ControlScope.Freeze, ControlScope.Item(i.ExternalId), ItemNaming.EpicOf(i.ExternalId, i.EpicId) is { } e ? ControlScope.Epic(e) : "", planScope }
                     .Any(s => controls.GetValueOrDefault(s)?.PausesAt(now) == true) ? ControlState.Paused
                 : ControlState.Running;
         }
@@ -222,6 +233,14 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
                 .ToListAsync(ct))
             .GroupBy(e => e.WorkItemId)
             .ToDictionary(g => g.Key, g => g.Last().Detail);
+        var onBoard = new Dictionary<long, BoardLink>();
+        foreach (var source in boardLinks ?? [])
+        {
+            foreach (var (id, link) in await source.OfAsync(db, items, ct))
+            {
+                onBoard[id] = link;
+            }
+        }
         var closeouts = await new WorkLedger(db, time).CloseoutRowsAsync(items.Where(i => i.State is WorkState.Watch or WorkState.Planned).Select(i => i.Id).ToList(), ct);
         return items.Select(i => new PipelineRow(
                 i.Id, i.ExternalId, i.Title, i.Repo, i.State, i.CreatedAt, i.UpdatedAt,
@@ -236,7 +255,8 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
                 i.State is WorkState.Watch or WorkState.Planned && RunPipeline.CloseoutOf(closeouts[i.Id]) is { Posted: false, Attempts: > 0 } failed ? failed : null,
                 // A story of a plan is shown under its plan item (sc-25876), which is listed while any story of it is (sc-25877).
                 i.PlanItemId is { } p && byId.ContainsKey(p) ? p : null,
-                plans.GetValueOrDefault(i.Id)))
+                plans.GetValueOrDefault(i.Id),
+                onBoard.GetValueOrDefault(i.Id)))
             .ToList();
     }
 

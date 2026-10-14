@@ -34,8 +34,25 @@ public sealed class FakeCodeGraphRisk : ICodeGraphRisk
     /// <summary>Every call: tool and its main argument.</summary>
     public List<(string Tool, string Argument)> Calls { get; } = [];
 
-    public static CodeGraphRiskReader Reader(FakeCodeGraphRisk? fake = null) =>
-        new(fake ?? new FakeCodeGraphRisk(), TimeSpan.FromSeconds(5), TimeSpan.FromMilliseconds(1));
+    /// <summary>The overlay wait's timeout of a reader whose gate runs on the system clock.</summary>
+    public static readonly TimeSpan OverlayTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// The overlay wait's timeout of a reader whose gate's waits run on a fake clock: that timeout is a timer on the same clock, and
+    /// a fake clock moves in jumps — a <see cref="SteppingClock"/> a whole step per timer created, from another thread; a test's own
+    /// <c>Advance</c> by minutes. A timeout shorter than a jump (<see cref="OverlayTimeout"/>) then fires at an arbitrary moment of
+    /// the wait it bounds — before the overlay is even requested, when the machine is loaded — and the wait answers
+    /// <c>timed-out</c> instead of what CodeGraph would have answered (a second <c>codegraph-overlay</c> row, and no impact read in
+    /// that poll). An hour is past every such test's CI timeout, which is what bounds the gate's wait there.
+    /// </summary>
+    public static readonly TimeSpan FakeClockOverlayTimeout = TimeSpan.FromHours(1);
+
+    /// <param name="onFakeClock">
+    /// Whether the gate the reader serves runs its waits on a fake clock (<see cref="FakeClockOverlayTimeout"/>). A harness that
+    /// hands its gate a fake clock passes it here, so the pairing cannot be got wrong test by test.
+    /// </param>
+    public static CodeGraphRiskReader Reader(FakeCodeGraphRisk? fake = null, bool onFakeClock = false) =>
+        new(fake ?? new FakeCodeGraphRisk(), onFakeClock ? FakeClockOverlayTimeout : OverlayTimeout, TimeSpan.FromMilliseconds(1));
 
     /// <summary>A found file's impact answer at <paramref name="sha"/> (C7).</summary>
     public static ImpactFileAnswer Found(string path, string sha, BlastRadius radius) =>

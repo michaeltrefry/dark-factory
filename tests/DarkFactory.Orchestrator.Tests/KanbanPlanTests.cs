@@ -81,6 +81,11 @@ public class KanbanPlanSourceTests
         // Each has its ledger key (kb-<n>), given the moment the board answered its GUID; the plan item keeps its own.
         Assert.Equal([s.ParentId + 1, s.ParentId + 2, s.ParentId + 3], ids);
         Assert.Equal(s.Made.Select(i => (Guid?)i.Id), [await s.H.Keys.ItemAsync(ids[0], None), await s.H.Keys.ItemAsync(ids[1], None), await s.H.Keys.ItemAsync(ids[2], None)]);
+        // … with its project (sc-25985: the dashboard's link to a planned item is built from the ledger).
+        await using (var db = await s.H.Contexts.CreateDbContextAsync(None))
+        {
+            Assert.All(await db.KanbanItems.Where(i => ids.Contains(i.Id)).ToListAsync(None), i => Assert.Equal(s.H.Project.Id, i.ProjectId));
+        }
         // One create per item, and a dependency only after the item it is on exists and has its key.
         Assert.Equal(["create_work_item", "create_work_item", "add_work_item_dependency", "create_work_item", "add_work_item_dependency"], s.Board.Writes);
         // The plan item itself is not written: no move, no comment, no label.
@@ -301,6 +306,10 @@ public class KanbanPlanSourceTests
         // One read, nothing written.
         Assert.Equal(["get_work_item"], h.Board.Calls.Select(c => c.Tool));
         Assert.Empty(await h.Source().BlockersAsync(doneKey, None));
+        // A blocker is named by its GUID alone (sc-25985): a new key row has no project yet, a known one keeps its own.
+        await using var db = await h.Contexts.CreateDbContextAsync(None);
+        Assert.Equal([(doneKey, (Guid?)h.Project.Id), (closedKey, null), (workingKey, null)],
+            (await db.KanbanItems.Where(i => i.Id != id).OrderBy(i => i.Id).ToListAsync(None)).Select(i => (i.Id, i.ProjectId)));
     }
 
     // ---- MakeReadyAsync, InBacklogAsync ----
@@ -1004,6 +1013,35 @@ public class KanbanPlanPipelineTests
         var (rows, writes) = ((await h.Rows(stories[1])).Count, h.Board.Writes.Count);
         Assert.Equal(WorkState.Paused, (await h.Run(stories[1])).State);
         Assert.Equal((rows, writes), ((await h.Rows(stories[1])).Count, h.Board.Writes.Count));
+    }
+
+    [Fact]
+    public async Task A_planned_item_is_in_its_plan_items_epic_in_the_ledger_and_an_epic_control_holds_it()
+    {
+        var h = new Harness();
+        var (plan, stories) = await h.Plan();
+        var itemA = h.Made[0];
+        Assert.True((await h.Run(plan, workerless: true)).Succeeded);
+        async Task<long?> EpicOf(int id)
+        {
+            await using var db = h.Contexts.CreateDbContext();
+            return (await db.WorkItems.SingleOrDefaultAsync(i => i.ExternalId == $"kb-{id}"))?.EpicId;
+        }
+        var epic = Assert.NotNull(await EpicOf(plan));
+        Assert.Equal(epic, await h.Keys.EpicKeyAsync(h.Epic.Id, h.Project.Id, None));
+
+        // The epic is paused (sc-25985: by its ledger key): the released item, created in that epic, is not claimed.
+        var paused = await h.Actions.PauseAsync(ControlScope.Epic(new EpicRef(ItemNaming.Kanban, epic)), "tester", None);
+        Assert.True(paused.Ok, paused.Message);
+        await h.Run(stories[0]);
+        Assert.Equal(("Ready", null), (itemA.Status, itemA.Claim?.Marker));
+        Assert.Empty(h.Worker.Prompts);
+
+        // Continued, it is worked like any item of the epic.
+        var continued = await h.Actions.ContinueAsync(ControlScope.Epic(new EpicRef(ItemNaming.Kanban, epic)), "tester", None);
+        Assert.True(continued.Ok, continued.Message);
+        await h.Merge(stories[0]);
+        Assert.Equal(epic, await EpicOf(stories[0]));
     }
 
     [Fact]

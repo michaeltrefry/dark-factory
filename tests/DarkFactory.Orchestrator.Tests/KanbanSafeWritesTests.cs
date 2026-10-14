@@ -978,7 +978,7 @@ public class KanbanSafeWritesTests
         switch (hold)
         {
             case "factory": await controls.SetAsync(ControlScope.Factory, ControlState.Paused, "michael", None); break;
-            case "epic": await controls.SetAsync(ControlScope.Epic(7), ControlState.Paused, "michael", None); break;
+            case "epic": await controls.SetAsync(ControlScope.Epic(ItemNaming.Kanban.Epic(7)), ControlState.Paused, "michael", None); break;
             case "item": await controls.SetAsync(ControlScope.Item("kb-1"), ControlState.Paused, "michael", None); break;
             case "freeze": await controls.FreezeAsync("hot-file", "one file, three merges", null, None); break;
             default: await controls.PauseForUsageAsync(DateTimeOffset.UtcNow.AddDays(3), "all_exhausted", None); break;
