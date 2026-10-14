@@ -48,6 +48,75 @@ public sealed record SwiftFile(string Text, IReadOnlyList<string> Imports, IRead
 }
 
 /// <summary>
+/// One declaration of a file's top level or of a type's body, with its span (<see cref="SwiftSource.Layout"/>, sc-26128):
+/// from its first attribute or modifier to its last token (a function's body, a type's closing brace). <see cref="Keyword"/>
+/// is the declaration's keyword (<c>func</c>, <c>struct</c>, <c>import</c>, <c>var</c>, …; <c>#if</c> and its kin for a
+/// conditional-compilation line; empty for tokens that start with no keyword). A type's <see cref="BodyOpen"/> is the offset
+/// of its body's <c>{</c> (−1 for every other item) and <see cref="Children"/> its members.
+/// </summary>
+public sealed record SwiftItem(string Keyword, string Name, int Start, int End, int BodyOpen, IReadOnlyList<SwiftItem> Children)
+{
+    public bool IsType => BodyOpen >= 0 || SwiftSource.IsTypeKeyword(Keyword);
+
+    public bool IsImport => Keyword == "import";
+
+    /// <summary>A <c>#if</c>, <c>#elseif</c>, <c>#else</c> or <c>#endif</c> line: no declaration, and nothing a test lacks shows there.</summary>
+    public bool IsDirective => Keyword is "#if" or "#elseif" or "#else" or "#endif";
+}
+
+/// <summary>A file's declarations with their spans (<see cref="SwiftSource.Layout"/>), and a compiler position's place among them.</summary>
+public sealed record SwiftLayout(string Text, IReadOnlyList<SwiftItem> Items)
+{
+    /// <summary>
+    /// The offset in <see cref="Text"/> of swiftc's 1-based <paramref name="line"/> and <paramref name="column"/> (a column
+    /// counts UTF-8 bytes, as swiftc's do), clamped to the line; −1 when the line is not in the file.
+    /// </summary>
+    public int Position(int line, int column)
+    {
+        if (line < 1)
+        {
+            return -1;
+        }
+        var start = 0;
+        for (var n = 1; n < line; n++)
+        {
+            var next = Text.IndexOf('\n', start);
+            if (next < 0)
+            {
+                return -1;
+            }
+            start = next + 1;
+        }
+        var end = Text.IndexOf('\n', start);
+        end = end < 0 ? Text.Length : end;
+        var at = start;
+        for (var bytes = 0; at < end && bytes < column - 1; at++)
+        {
+            bytes += char.IsHighSurrogate(Text[at]) ? 4 : System.Text.Encoding.UTF8.GetByteCount(Text.AsSpan(at, 1));
+            if (char.IsHighSurrogate(Text[at]))
+            {
+                at++;
+            }
+        }
+        return Math.Min(at, Math.Max(end - 1, start));
+    }
+
+    /// <summary>The items holding <paramref name="position"/>, outermost first (a type, then its member).</summary>
+    public IReadOnlyList<SwiftItem> ItemsAt(int position)
+    {
+        var chain = new List<SwiftItem>();
+        for (var items = Items; items.FirstOrDefault(i => i.Start <= position && position < i.End) is { } item; items = item.Children)
+        {
+            chain.Add(item);
+        }
+        return chain;
+    }
+
+    /// <summary>The 1-based line of <paramref name="position"/>.</summary>
+    public int LineOf(int position) => Text.AsSpan(0, position).Count('\n') + 1;
+}
+
+/// <summary>
 /// A lexer-level reader of Swift source (Phase 5, sc-26127), as <see cref="RustSource"/> is of Rust: no Swift parser ships
 /// with .NET and nothing is compiled, so the gate finds a file's functions, the types they are declared in and their
 /// attributes from its tokens. The lexer knows what can hide an <c>@Test</c> or a brace: line comments and nested block
@@ -138,6 +207,125 @@ public static class SwiftSource
         }
         return targets;
     }
+
+    /// <summary>Whether <paramref name="keyword"/> declares a type or an extension.</summary>
+    public static bool IsTypeKeyword(string keyword) => TypeKeywords.Contains(keyword);
+
+    /// <summary>The keywords that declare something (a new item starts at one on its own line).</summary>
+    private static readonly HashSet<string> DeclKeywords = new(StringComparer.Ordinal)
+    {
+        "func", "var", "let", "init", "deinit", "subscript", "typealias", "associatedtype", "struct", "class", "enum", "actor", "extension",
+        "protocol", "import", "case", "operator", "precedencegroup", "macro",
+    };
+
+    /// <summary>The modifiers that may begin a declaration's line (not <c>async</c>, <c>sending</c> and the like, which also continue a signature or a type).</summary>
+    private static bool IsLeadingModifier(string word) => Modifiers.Contains(word) && word is not ("async" or "sending" or "consuming" or "borrowing" or "isolated");
+
+    /// <summary>
+    /// A file's declarations with their spans (sc-26128): what a base build's compiler error is placed in. The top level
+    /// and every type's body are split into items, each from its first attribute or modifier through its declaration
+    /// (bodies and bracketed groups whole); a new item starts at an attribute, a modifier or a declaration keyword that
+    /// begins a line (or follows a <c>;</c> or a body's <c>}</c>) once the item before has its keyword, so a multi-line signature or an
+    /// attribute on the line above its declaration stays one item. A conditional-compilation line (<c>#if …</c>) is an
+    /// item of its own. Throws <see cref="FormatException"/> as <see cref="Parse"/> does when the brackets do not balance.
+    /// </summary>
+    public static SwiftLayout Layout(string text)
+    {
+        var tokens = Lex(text);
+        var close = Pairs(text, tokens) ?? throw new FormatException("its brackets do not balance");
+        return new SwiftLayout(text, Segment(text, tokens, close, 0, tokens.Count));
+    }
+
+    private static List<SwiftItem> Segment(string text, List<Token> tokens, Dictionary<int, int> close, int from, int to)
+    {
+        string Word(int i) => text[tokens[i].Start..tokens[i].End];
+        bool LineStart(int i) => i == from || Word(i - 1) == ";" || text.AsSpan(tokens[i - 1].End, tokens[i].Start - tokens[i - 1].End).Contains('\n');
+        // After a body ({ … }) a declaration may follow on the same line: `struct S { @Test func a() {} @Test func b() {} }`.
+        bool AfterBody(int i) => i > from && Word(i - 1) == "}";
+        bool ModifiersThenDeclaration(int i)
+        {
+            while (i < to && tokens[i].Kind == Kind.Ident && Modifiers.Contains(Word(i)))
+            {
+                i++;
+            }
+            return i < to && tokens[i].Kind == Kind.Ident && DeclKeywords.Contains(Word(i));
+        }
+        var items = new List<SwiftItem>();
+        int start = -1, end = -1, bodyOpen = -1;
+        string keyword = "", name = "";
+        List<SwiftItem> children = [];
+        void Flush()
+        {
+            if (start >= 0)
+            {
+                items.Add(new SwiftItem(keyword, name, start, end, bodyOpen, children));
+            }
+            (start, end, bodyOpen, keyword, name, children) = (-1, -1, -1, "", "", []);
+        }
+        var i = from;
+        while (i < to)
+        {
+            var token = tokens[i];
+            var word = Word(i);
+            if (word is "#if" or "#elseif" or "#else" or "#endif")
+            {
+                // A conditional-compilation line: an item of its own, through the end of its line.
+                Flush();
+                var j = i + 1;
+                while (j < to && !LineStart(j))
+                {
+                    j = tokens[j].Kind == Kind.Open ? close[j] + 1 : j + 1;
+                }
+                items.Add(new SwiftItem(word, "", token.Start, tokens[j - 1].End, -1, []));
+                i = j;
+                continue;
+            }
+            var next = i + 1 < to ? Word(i + 1) : "";
+            var classModifier = word == "class" && (AfterClassModifier.Contains(next) || Modifiers.Contains(next));
+            var actorWord = word == "actor" && !IsActorDeclaration(text, tokens, i, to);
+            var declares = token.Kind == Kind.Ident && !classModifier && !actorWord && (DeclKeywords.Contains(word) || word.StartsWith('#'));
+            // A modifier that may also continue a signature (`async`, `consuming`, …) starts a declaration only when modifiers
+            // and then a declaration keyword follow it (`async func h()` on its own line, not `    async throws -> Int`).
+            var prefix = (word == "@" && i + 1 < to && tokens[i + 1].Kind == Kind.Ident) || classModifier
+                || (token.Kind == Kind.Ident && (IsLeadingModifier(word) || (Modifiers.Contains(word) && ModifiersThenDeclaration(i))));
+            if ((declares || prefix) && start >= 0 && keyword.Length > 0 && (LineStart(i) || AfterBody(i)))
+            {
+                Flush();
+            }
+            if (start < 0)
+            {
+                start = token.Start;
+            }
+            if (declares && keyword.Length == 0)
+            {
+                keyword = word;
+                name = i + 1 < to && tokens[i + 1].Kind == Kind.Ident ? next : "";
+            }
+            if (token.Kind == Kind.Open)
+            {
+                if (word == "{" && bodyOpen < 0 && TypeKeywords.Contains(keyword))
+                {
+                    bodyOpen = token.Start;
+                    children = Segment(text, tokens, close, i + 1, close[i]);
+                }
+                end = tokens[close[i]].End;
+                i = close[i] + 1;
+                continue;
+            }
+            end = token.End;
+            i++;
+            if (word == ";")
+            {
+                Flush();
+            }
+        }
+        Flush();
+        return items;
+    }
+
+    /// <summary>Whether the <c>actor</c> at <paramref name="at"/> declares an actor: a name follows, then its body, an inheritance clause, generic parameters or a where clause.</summary>
+    private static bool IsActorDeclaration(string text, List<Token> tokens, int at, int to) =>
+        at + 2 < to && tokens[at + 1].Kind == Kind.Ident && text[tokens[at + 2].Start..tokens[at + 2].End] is "{" or ":" or "<" or "where";
 
     /// <summary>A literal's value when it is a plain, single-line string with no escape or interpolation (<c>"Words"</c>), else null.</summary>
     private static string? PlainString(string literal) =>
@@ -469,7 +657,7 @@ public static class SwiftSource
     private static readonly HashSet<string> TypeKeywords = new(StringComparer.Ordinal) { "struct", "class", "enum", "actor", "extension", "protocol" };
 
     /// <summary>Words that may stand between a declaration's attributes and its keyword.</summary>
-    private static readonly HashSet<string> Modifiers = new(StringComparer.Ordinal)
+    internal static readonly HashSet<string> Modifiers = new(StringComparer.Ordinal)
     {
         "public", "private", "fileprivate", "internal", "open", "package", "static", "final", "override", "mutating", "nonmutating",
         "nonisolated", "isolated", "required", "convenience", "dynamic", "lazy", "weak", "unowned", "optional", "indirect", "distributed",
