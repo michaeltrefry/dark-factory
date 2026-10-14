@@ -197,12 +197,17 @@ printf 'add-generic-password -U -s dark-factory -a router-key -w %s\n' "$(pbpast
 #    _factory PROCESS (its toolchain check runs through the helper, whose exit kills them all): close any
 #    `sudo -u _factory` session and stop `factory work` first. Re-run it after pulling any change to
 #    scripts/factory-worker-launch: `factory run`/`work` refuse to start unless the installed helper is the
-#    repo's (same SHA-256 once setup's sandbox_user/sandbox_uid lines are undone, helper_version >= 3):
+#    repo's (same SHA-256 once setup's sandbox_user/sandbox_uid lines are undone, helper_version >= 4):
 #    "Stale helper: the installed launch helper ... is not the current scripts/factory-worker-launch (...);
 #    re-run `sudo scripts/setup-worker-user.sh` to install it" (the file is read, not run, at start-up). A
 #    helper that skips its _factory uid sweep ("... refuses its _factory uid sweep ...") is found by the probe
 #    that runs it, in a run's first worker phase: it fails the factory there, not the item.
 sudo scripts/setup-worker-user.sh
+#    Several worker sessions at once (optional): one sandbox user per worker slot. `--slots 2` also sets up
+#    _factory2 with its own helper (factory-worker-launch-2), sudoers line, home and Claude Code; then set
+#    Worker__Slots=2 (and Intake__MaxConcurrentRuns=2 for `factory work` to use both). Start-up names the
+#    slot whose helper is missing or stale and the command to run, with the slot count.
+#      sudo scripts/setup-worker-user.sh --slots 2
 
 # 5. Worker model auth. Default Worker__Auth=router-key: the worker holds no Anthropic/OpenAI credential,
 #    only the router key; the router serves it from your plans, enrolled on the local router
@@ -210,7 +215,8 @@ sudo scripts/setup-worker-user.sh
 router login claude     # your Claude Pro/Max plan
 router login codex      # your ChatGPT/Codex plan
 #    then delete any Claude login _factory still has (opt-in, standalone: runs none of the setup, no helper,
-#    no toolchain check; deletes only its credentials file and keychain item, as _factory; signals no process):
+#    no toolchain check; deletes only its credentials file and keychain item, as _factory; signals no process;
+#    with --slots <n>, for each of the n sandbox users):
 sudo scripts/setup-worker-user.sh --remove-worker-login
 #    `factory run` / `factory work` refuse to start until the router's GET /v1/subscriptions/usage lists
 #    an enabled, routable, enrolled (managed or shared) plan for the key. A plan in reconnect_required is
@@ -245,10 +251,24 @@ killing every `_factory` process, so close `_factory` sessions and stop `factory
   (all but the helper itself, which then exits with the worker's status), so nothing that forked and `setsid()`ed away survives the run.
   That sweep runs only as `_factory`'s own uid, which setup pins into the installed helper (`sandbox_uid`, in 400–499);
   setup refuses an existing `_factory` whose uid is outside that range.
-  That makes `_factory` single-tenant: **one worker phase at a time per machine** (a worker session, the gate's sandboxed
+  That makes `_factory` single-tenant: **one worker phase at a time per sandbox user** (a worker session, the gate's sandboxed
   test runs, a deletion or stop through the helper), enforced by a lock on `<work root>/.factory-run.lock` that a run holds
   for that phase only and waits for — so `factory run` beside `factory work`, or several items of `factory work`
   (`Intake:MaxConcurrentRuns`), overlap while they wait on reviews, CI and the merge queue.
+- **Worker slots** (optional, `--slots <n>`, 1–8): n sandbox users — `_factory`, `_factory2`, … — each with everything above
+  for itself: its own uid, home, Claude Code, deny entry on your home, read entry on the work root, its own copy of the helper
+  (`factory-worker-launch-2`, …, pinned to its own user and uid, so it sweeps only that user's processes) and its own sudoers
+  line (that helper, as that user only). With `Worker__Slots=<n>` the factory runs one worker phase per slot side by side,
+  each under its own lock file (`slot-locks/.factory-run-2.lock`, …, in a directory the factory closes to every sandbox user). An item keeps the slot its first worker phase took (recorded in the
+  ledger): its session, its fix rounds, the gate's test runs and its worktrees are that user's, and it waits for that slot
+  even if another is free. A worktree is shared for writing with its item's slot's user only; sandbox users can read each
+  other's worktrees. Without `--slots` and `Worker__Slots` nothing changes: one user, one helper, one lock.
+  Lowering the count: re-run setup with the smaller `--slots` (it removes the higher slots' sudoers lines and installed
+  helpers and names the accounts it leaves) and lower `Worker__Slots` to match — a larger `Worker__Slots` fails start-up. An
+  item already worked in a removed slot escalates saying so when it next needs a worker: raise both again and re-run it, or
+  stop it (`factory stop --item <id>`). The factory runs and deletes nothing as a user it no longer has: such an item's
+  worktree (and a worker a crashed run left) stays, reported as `[cleanup] leaving <path>: …`, until the count is raised
+  again or you remove it as root.
 - **`/opt/dark-factory/work`**: the work root (clones + worktrees), owned by you under a root-owned
   parent, readable by `_factory` (an inheritable ACL on the work root itself, never applied recursively).
   Each worktree directory is created empty and shared first (an inheritable read/write ACL for you and

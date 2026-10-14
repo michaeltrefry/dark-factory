@@ -229,6 +229,24 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
         return items.ToDictionary(i => i.ExternalId, i => (i, rows.Where(r => r.WorkItemId == i.Id).ToList()), StringComparer.Ordinal);
     }
 
+    /// <summary>
+    /// The slot numbers 1 to <paramref name="slots"/> ordered by how many unfinished items (not Done, Cancelled or in Watch) the
+    /// ledger has in each (<see cref="RunPipeline.SlotOf"/>'s last <see cref="RunPipeline.Steps.Slot"/> row), fewest first, ties by
+    /// number: where an item with no slot yet is tried first (sc-25989), so slots fill evenly. Reads only.
+    /// </summary>
+    public async Task<IReadOnlyList<int>> SlotsByLoadAsync(int slots, CancellationToken ct)
+    {
+        var rows = await (from e in db.LedgerEntries.AsNoTracking()
+                          join i in db.WorkItems.AsNoTracking() on e.WorkItemId equals i.Id
+                          where e.Step == RunPipeline.Steps.Slot && i.State != WorkState.Done && i.State != WorkState.Cancelled && i.State != WorkState.Watch
+                          orderby e.Id
+                          select new { e.WorkItemId, e.Detail }).ToListAsync(ct);
+        var load = rows.GroupBy(r => r.WorkItemId)
+            .Select(g => int.TryParse(g.Last().Detail?.Split(' ')[0], out var slot) ? slot : 0)
+            .GroupBy(slot => slot).ToDictionary(g => g.Key, g => g.Count());
+        return [.. Enumerable.Range(1, slots).OrderBy(slot => load.GetValueOrDefault(slot)).ThenBy(slot => slot)];
+    }
+
     /// <summary>Every row of the item, oldest first.</summary>
     public Task<List<LedgerEntry>> HistoryAsync(WorkItem item, CancellationToken ct) =>
         db.LedgerEntries.Where(e => e.WorkItemId == item.Id).OrderBy(e => e.Id).ToListAsync(ct);

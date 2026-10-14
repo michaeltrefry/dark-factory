@@ -1348,7 +1348,7 @@ public class CargoRunnerTests : IDisposable
         var sha = CommitAndPush("base", "main");
         var git = Workspace();
         await git.ChangedFilesAsync(Repo, sha, sha, CancellationToken.None);
-        return (new SandboxTestRunner(git, sandbox: null, TimeSpan.FromMinutes(1), maxBytes), sha);
+        return (new SandboxTestRunner(git, slots: null, TimeSpan.FromMinutes(1), maxBytes), sha);
     }
 
     private static TestStep Sh(TestPhase phase, string script, string? capture = null) => new(phase, "/bin/sh", ["-c", script]) { CaptureOutput = capture };
@@ -1378,7 +1378,7 @@ public class CargoRunnerTests : IDisposable
         var large = await runner.RunAsync(Repo, Spec(sha, Sh(TestPhase.Test, "i=0; while [ $i -lt 20 ]; do echo 'test tests::two ... ok'; i=$((i+1)); done", "words:lib:tests::two")), CancellationToken.None);
         Assert.Equal(["words:lib:tests::two: it is larger than 64 bytes, so it was not read"], large.UnreadableReports);
 
-        var (plain, _) = (new SandboxTestRunner(Workspace(), sandbox: null, TimeSpan.FromMinutes(1)), sha);
+        var (plain, _) = (new SandboxTestRunner(Workspace(), slots: null, TimeSpan.FromMinutes(1)), sha);
         const string json = """{"reason":"compiler-message","manifest_path":"/elsewhere/Cargo.toml","message":{"level":"error","message":"boom","spans":[],"code":null}}""";
         var built = await plain.RunAsync(Repo, Spec(sha, Sh(TestPhase.Build, $"echo '{json}'; exit 101", "cargo-build-0"), Sh(TestPhase.Test, "echo never", "words:lib:tests::two")), CancellationToken.None);
         Assert.Equal(TestRunStatus.BuildFailed, built.Status);
@@ -1431,7 +1431,7 @@ public class CargoRunnerTests : IDisposable
     }
 
     private Task<NewTestsResult> Check(string baseSha, string headSha) =>
-        NewTestsCheck.RunAsync(new SandboxTestRunner(Workspace(), sandbox: null, TimeSpan.FromMinutes(10)), NewTestsCheck.Strategies, Repo, baseSha, headSha, "gate-sc-5", null,
+        NewTestsCheck.RunAsync(new SandboxTestRunner(Workspace(), slots: null, TimeSpan.FromMinutes(10)), NewTestsCheck.Strategies, Repo, baseSha, headSha, "gate-sc-5", null,
             TestContext.Current.CancellationToken);
 
     private const string FixedLib = "pub fn words(s: &str) -> usize { s.split_whitespace().count() }\n";

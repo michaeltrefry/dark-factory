@@ -271,7 +271,7 @@ public sealed partial class RunPipeline
         var (_, repo, item) = run;
         var workspace = await workspaces.HasLeftoverAsync(repo, run.Branch, ct, run.BaseBranch)
             ? await InWorkerPhaseAsync(item, "replace its leftover worktree", () => workspaces.RestoreAsync(repo, run.Branch, ct, run.BaseBranch), ct)
-            : await workspaces.RestoreAsync(repo, run.Branch, ct, run.BaseBranch);
+            : await InItemSlotAsync(item, () => workspaces.RestoreAsync(repo, run.Branch, ct, run.BaseBranch), ct);
         run.Workspace = workspace;
         try
         {

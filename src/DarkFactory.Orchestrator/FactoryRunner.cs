@@ -54,6 +54,10 @@ public static class FactoryRunner
             {
                 return unsandboxed;
             }
+            if (SlotsNote(options.WorkerSlotCount, options.MaxConcurrentRuns) is { } slotsNote)
+            {
+                stderr.WriteLine(slotsNote);
+            }
         }
         catch (Exception ex) when (ex is MissingCredentialException or ReviewConfigurationException or InvalidOperationException)
         {
@@ -68,6 +72,17 @@ public static class FactoryRunner
         }
         return null;
     }
+
+    /// <summary>
+    /// <c>factory work</c>'s start-up note when <c>Worker:Slots</c> is larger than <c>Intake:MaxConcurrentRuns</c> (sc-25989), or
+    /// null: allowed — the slots this process cannot fill serve a <c>factory run</c> beside it — but worth saying, since by itself
+    /// <c>factory work</c> then never has more than <paramref name="runs"/> worker sessions at a time. (More runs than slots is
+    /// the ordinary case: runs overlap outside their worker phases too.)
+    /// </summary>
+    internal static string? SlotsNote(int slots, int runs) => slots > runs
+        ? $"note: Worker:Slots is {slots} but Intake:MaxConcurrentRuns is {runs}: factory work runs at most {runs} item{(runs == 1 ? "" : "s")} at once, "
+            + $"so it uses at most {runs} worker slot{(runs == 1 ? "" : "s")} at a time (the others serve a `factory run` beside it); raise Intake:MaxConcurrentRuns to use them"
+        : null;
 
     /// <summary>
     /// The start-up check of one configured work source, through the source (E6): its credentials resolve and every part of its
@@ -287,7 +302,8 @@ public static class FactoryRunner
         var gateAppId = options.GitHubGateAppId;
         var gateAppKey = options.GitHubGateAppPrivateKeyPem;
         options.RejectReviewModelSettings();
-        var sandbox = testSandbox ?? options.WorkerSandbox;
+        // The worker slots (sc-25989): one sandbox user each. A test's sandbox is a pool of that one slot.
+        var slots = testSandbox is null ? options.WorkerSlots : Worker.WorkerSlots.Single(testSandbox);
         var pauseGrace = options.PauseGrace;
         var freezeOptions = options.Freeze;
         var stuck = options.StuckDetection;
@@ -295,14 +311,14 @@ public static class FactoryRunner
 
         // Before the ledger or the board is touched: an installed helper that is not the current one fails the factory here, with
         // nothing claimed or recorded (the rest of the readiness check runs the helper, so it waits for the first worker phase).
-        await EnsureHelperCurrentAsync(sandbox, ct);
+        await EnsureHelperCurrentAsync(slots, ct);
         await FactoryWide("the ledger", async () => { await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct); return true; });
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
         var ledger = new WorkLedger(db, TimeProvider.System);
-        // Sandboxed, the worker user is single-tenant (every helper exit kills all of its processes), so whatever runs through the
-        // helper holds the sandbox user's lock (WorkerLock, sc-25988) — for that phase only, not for the run: the pipeline takes it
-        // (waiting) around each worker phase, and a run that reaches none — a review, a CI or merge-queue wait, a plan item
-        // waiting on its stories — never takes it, probes no sandbox and sweeps no worktree.
+        // Sandboxed, each worker user is single-tenant (every helper exit kills all of its processes), so whatever runs through a
+        // helper holds that slot's lock (WorkerLock, sc-25988) — for that phase only, not for the run: the pipeline takes the
+        // item's slot (waiting) around each worker phase, and a run that reaches none — a review, a CI or merge-queue wait, a plan
+        // item waiting on its stories — never takes one, probes no sandbox and sweeps no worktree.
 
         using var githubHttp = OutboundHttp.GitHubApi();
         using var routerHttp = OutboundHttp.RouterApi(options.RouterBaseUrl);
@@ -312,19 +328,21 @@ public static class FactoryRunner
         using var reviewerHttp = ReviewerHttp(options);
 
         var workspaces = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
-            async (repo, c) => (await app.CreateInstallationTokenAsync(repo, c)).Token, sandbox: sandbox);
+            async (repo, c) => (await app.CreateInstallationTokenAsync(repo, c)).Token, sandbox: slots);
         var runLocks = new PostgresRunLocks(options.LedgerConnectionString);
-        // What the run's first worker phase starts with, under the sandbox user's lock (both run the launch helper; either
-        // failing is the factory's, not the item's, E10): the sandbox readiness probe, then the sweep of worktrees no run will
+        // What the run's first worker phase starts with, under its slot's lock (both run the launch helper; either failing is
+        // the factory's, not the item's, E10): the readiness probe of that slot's sandbox, then the sweep of worktrees no run will
         // resume (left by a killed cleanup, a worker that would not stop, or a clean-up that found the sandbox user busy) — and
         // none a live run owns (sc-25987): another run's gate test worktrees or base-update worktree are its item's, guarded by
         // that item's run lock; this run's own item is guarded the same way (its pipeline holds that lock), so it replaces its
-        // own leftovers itself.
+        // own leftovers itself. A leftover another slot's user wrote is deleted as that user, if that slot is free now, and is
+        // otherwise left to a sweep that finds it free (WorkerSlots.TryDeleteAsWorkerAsync); one a user outside the pool wrote
+        // is left for the owner, reported once, and never fails the sweep.
         async Task EnterSandboxAsync(CancellationToken c)
         {
-            if (sandbox is not null)
+            if (slots is not null)
             {
-                await EnsureSandboxReadyAsync(sandbox, options.WorkerAuth, options.ClaudePath, c);
+                await EnsureSandboxReadyAsync(slots, options.WorkerAuth, options.ClaudePath, c);
             }
             await FactoryWide("the worktree sweep", async () =>
             {
@@ -340,7 +358,7 @@ public static class FactoryRunner
         // One upstream registry: the reviewers' tools and the review's overlay wait (sc-25708) share its CodeGraph client.
         var upstreams = CreateUpstreams(options, codeGraphHttp, kanbanHttp, log);
         var reviewer = new RouterReviewer(reviewerHttp, routerKey, tools: new ReviewTools(workspaces, upstreams.CodeGraph, upstreams.Kanban, log));
-        var gate = CreateGate(options, gateGitHub, reviewer, workspaces, sandbox, upstreams.CodeGraph);
+        var gate = CreateGate(options, gateGitHub, reviewer, workspaces, slots, upstreams.CodeGraph);
         if (adjustGate is not null)
         {
             gate = adjustGate(gate);
@@ -351,7 +369,7 @@ public static class FactoryRunner
             ledger,
             runLocks,
             workspaces,
-            new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, sandbox,
+            new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, slots,
                 pauseFlagDirectory: options.PauseFlagDirectory),
             new GitHubPullRequests(githubHttp, app),
             options.DefaultRepo,
@@ -371,11 +389,11 @@ public static class FactoryRunner
             stuck: stuck,
             maxControlReadFailures: maxControlReadFailures,
             // A plan item's planner session (sc-25870): read-only, in its own throwaway worktree, CodeGraph and Kanban through the proxy.
-            planner: new SandboxPlanRunner(options, sandbox, app, upstreams, log),
+            planner: new SandboxPlanRunner(options, slots, app, upstreams, log),
             // The only repositories a plan naming several may name (sc-25874).
             configuredRepos: options.ConfiguredRepos.Select(RepoRef.Parse).ToList(),
-            // The sandbox user's lock, held per worker phase (sc-25988); unsandboxed there is none.
-            workerLock: sandbox?.Lock,
+            // The worker slots, one held per worker phase (sc-25988, sc-25989); unsandboxed there is none.
+            slots: slots,
             enterSandbox: EnterSandboxAsync);
 
         return await pipeline.RunAsync(storyId, ct);
@@ -437,36 +455,41 @@ public static class FactoryRunner
     /// (sc-25709; without a CodeGraph token there is none, and the check fails wherever a tier requires it).
     /// </summary>
     internal static GateStage CreateGate(FactoryOptions options, IGateGitHub github, IReviewer reviewer, GitWorkspace workspaces,
-        WorkerSandbox? sandbox, ICodeGraphOverlays? codeGraph = null) =>
-        new(github, reviewer, options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, sandbox, options.TestTimeout),
+        WorkerSlots? slots, ICodeGraphOverlays? codeGraph = null) =>
+        new(github, reviewer, options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, slots, options.TestTimeout),
             Overlays: new ReviewOverlays(codeGraph, options.CodeGraphOverlayTimeout),
             Risk: codeGraph is ICodeGraphRisk risk ? new CodeGraphRiskReader(risk, options.CodeGraphOverlayTimeout) : null);
 
-    /// <summary>The sandbox readiness probe, a factory-wide failure (E10): a stale helper fails the factory once, not every item.</summary>
-    internal static Task EnsureSandboxReadyAsync(WorkerSandbox sandbox, WorkerAuth auth, string claudePath, CancellationToken ct) =>
-        FactoryWide("the worker sandbox", async () => { await sandbox.EnsureReadyAsync(auth, claudePath, ct); return true; });
+    /// <summary>
+    /// The sandbox readiness probe of the slot the calling flow holds (<see cref="WorkerSlots.EnsureReadyAsync"/>; a failure names
+    /// the slot when there are several), a factory-wide failure (E10): a stale helper fails the factory once, not every item.
+    /// </summary>
+    internal static Task EnsureSandboxReadyAsync(WorkerSlots slots, WorkerAuth auth, string claudePath, CancellationToken ct) =>
+        FactoryWide("the worker sandbox", async () => { await slots.EnsureReadyAsync(auth, claudePath, ct); return true; });
 
     /// <summary>
-    /// The part of the readiness check that runs no helper (<see cref="WorkerSandbox.EnsureHelperCurrentAsync"/>: the installed
-    /// launch helper is readable and the current one), a factory-wide failure (E10). Needs no lock and kills nothing, so it runs
+    /// The part of the readiness check that runs no helper (<see cref="WorkerSlots.EnsureHelpersCurrentAsync"/>: every slot's
+    /// installed launch helper is readable, the current one and pinned to that slot's user; the first that is not is named by its
+    /// slot), a factory-wide failure (E10). Needs no lock and kills nothing, so it runs
     /// where nothing has been claimed yet: at <c>factory work</c>'s start-up (<see cref="CheckHelperAsync"/>) and at the start of
     /// every run. Nothing to check unsandboxed.
     /// </summary>
-    internal static Task EnsureHelperCurrentAsync(WorkerSandbox? sandbox, CancellationToken ct) => sandbox is null
+    internal static Task EnsureHelperCurrentAsync(WorkerSlots? slots, CancellationToken ct) => slots is null
         ? Task.CompletedTask
-        : FactoryWide("the worker sandbox", async () => { await sandbox.EnsureHelperCurrentAsync(ct); return true; });
+        : FactoryWide("the worker sandbox", async () => { await slots.EnsureHelpersCurrentAsync(ct); return true; });
 
     /// <summary>
-    /// <c>factory work</c>'s start-up check of the launch helper: why the installed one cannot be used (missing, unreadable or not
-    /// the current <c>scripts/factory-worker-launch</c>, with the command that installs it), or null. It reads the file and runs
+    /// <c>factory work</c>'s start-up check of every slot's launch helper: why an installed one cannot be used (missing, unreadable,
+    /// not the current <c>scripts/factory-worker-launch</c> or pinned to another user — naming the slot when there are several —
+    /// with the command that installs them all), or null. It reads the files and runs
     /// nothing — the helper's exit kills every process of the worker user, so the probe and the worker user's Claude Code version
     /// are checked in the first worker phase, under the sandbox user's lock.
     /// </summary>
-    public static async Task<string?> CheckHelperAsync(WorkerSandbox? sandbox, CancellationToken ct)
+    public static async Task<string?> CheckHelperAsync(WorkerSlots? slots, CancellationToken ct)
     {
         try
         {
-            await EnsureHelperCurrentAsync(sandbox, ct);
+            await EnsureHelperCurrentAsync(slots, ct);
             return null;
         }
         catch (FactoryUnavailableException ex)
@@ -568,26 +591,30 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         Func<string, string, CancellationToken, Task> onTaint, CancellationToken ct)
     {
         var routerKey = options.RouterKey;
-        var sandbox = options.WorkerSandbox;
-        if (sandbox is null)
+        var slots = options.WorkerSlots;
+        if (slots is null)
         {
             // factory work refuses to start like this (Program); a triage reached any other way is refused here, factory-wide.
-            var refusal = Issues.IssueIntake.UnsandboxedRefusal(sandbox, [repo])!;
+            var refusal = Issues.IssueIntake.UnsandboxedRefusal(null, [repo])!;
             throw new FactoryUnavailableException($"the issue triage: {refusal}", new InvalidOperationException(refusal));
         }
-        // The whole seat is the sandbox user's: the probe, the sweeps (deletions as that user), the session, the worktree's removal.
+        // The whole seat is one sandbox user's — any free slot's (sc-25989): nothing resumes a triage and its worktree is shared
+        // with no worker for writing, so it needs no slot of its own and none is recorded — the probe, the sweeps (deletions as
+        // that user), the session, the worktree's removal.
         // The wait for it is never blind: logged when it starts and every WorkerLock.ReportEvery after, ended by the host's
         // shutdown, and ended too once a control holds the issue's item (a Pause of the factory or the item, the usage pause, the
         // freeze, a Stop — what the intake checks before it starts a triage): the triage is then put off, not failed
         // (TriageDeferredException), and the intake takes the issue up again on a later poll.
         var controls = FactoryRunner.Controls(options);
         var waiting = false;
-        return await sandbox.Lock!.HoldAsync(() => RunLockedAsync(sandbox, routerKey, item, repo, prompt, onSession, onTaint, ct), ct, async c =>
+        return await slots.HoldAsync(null, slot => RunLockedAsync(slots, slot.Sandbox, routerKey, item, repo, prompt, onSession, onTaint, ct), ct, async c =>
         {
             if (!waiting)
             {
                 waiting = true;
-                log.WriteLine($"[lock] {item.ExternalId}: its triage is waiting for the sandbox user (another run's worker phase holds {sandbox.Lock.Path})");
+                log.WriteLine(slots.Count > 1
+                    ? $"[lock] {item.ExternalId}: its triage is waiting for a free worker slot (other runs' worker phases hold all {slots.Count})"
+                    : $"[lock] {item.ExternalId}: its triage is waiting for the sandbox user (another run's worker phase holds {slots.All[0].Lock?.Path})");
             }
             if (await controls.EffectiveAsync(item.ExternalId, null, c) is var state and not ControlState.Running)
             {
@@ -597,15 +624,15 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         }, RunPipeline.DefaultControlPollInterval, report: log.WriteLine);
     }
 
-    private async Task<WorkerResult> RunLockedAsync(WorkerSandbox sandbox, string routerKey, WorkItem item, RepoRef repo, string prompt,
+    private async Task<WorkerResult> RunLockedAsync(WorkerSlots slots, WorkerSandbox sandbox, string routerKey, WorkItem item, RepoRef repo, string prompt,
         Func<string, CancellationToken, Task> onSession, Func<string, string, CancellationToken, Task> onTaint, CancellationToken ct)
     {
-        await FactoryRunner.EnsureSandboxReadyAsync(sandbox, options.WorkerAuth, options.ClaudePath, ct);
+        await FactoryRunner.EnsureSandboxReadyAsync(slots, options.WorkerAuth, options.ClaudePath, ct);
         using var githubHttp = OutboundHttp.GitHubApi();
         using var routerHttp = OutboundHttp.RouterApi(options.RouterBaseUrl);
         var app = new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System);
         var workspaces = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
-            async (r, c) => (await app.CreateInstallationTokenAsync(r, c, Issues.WorkerTriageRunner.TriageWorkspaceToken)).Token, sandbox: sandbox,
+            async (r, c) => (await app.CreateInstallationTokenAsync(r, c, Issues.WorkerTriageRunner.TriageWorkspaceToken)).Token, sandbox: slots,
             worktreesDirectory: TriageWorktrees, shareWithWorker: false);
         // Whatever a crashed or unstoppable triage left is swept (nothing resumes a triage), this issue's own included: the intake
         // holds its item's run lock around this call. Another live triage's worktree and session file are its item's and are kept.
@@ -628,7 +655,7 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         var configs = Path.Combine(options.WorkRoot, Mcp.McpProxySessions.DirectoryName);
         await using var proxy = await StartMcpProxyAsync(upstreams, configs, live, ct);
         var tools = TriageTools(upstreams, proxy is not null);
-        var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, sandbox,
+        var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, slots,
             pauseFlagDirectory: options.PauseFlagDirectory, tools: tools);
         var sessions = new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)),
             new RouterClient(routerHttp, routerKey), TimeProvider.System, log, costSettleDelay: options.CostSettleDelay);
@@ -684,7 +711,7 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
 /// lock no live run holds (sc-25987: another live planner's seat or a live triage's session file is kept); unsandboxed
 /// (<c>Worker:RunAs=none</c>, development only) nothing is swept, as before.
 /// </summary>
-public sealed class SandboxPlanRunner(FactoryOptions options, WorkerSandbox? sandbox, GitHubApp app, Mcp.McpUpstreams upstreams, TextWriter log)
+public sealed class SandboxPlanRunner(FactoryOptions options, WorkerSlots? slots, GitHubApp app, Mcp.McpUpstreams upstreams, TextWriter log)
     : Plans.IPlanRunner
 {
     /// <summary>The work root's directory of plan worktrees, apart from the items' <c>worktrees</c> and the triage's.</summary>
@@ -692,14 +719,17 @@ public sealed class SandboxPlanRunner(FactoryOptions options, WorkerSandbox? san
 
     public Task<T> RunAsync<T>(WorkItem item, IReadOnlyList<RepoRef> repos, Func<Plans.PlannerSeat, CancellationToken, Task<T>> session,
         CancellationToken ct) =>
-        sandbox?.Lock is { } held ? held.HoldAsync(() => RunLockedAsync(item, repos, session, ct), ct) : RunLockedAsync(item, repos, session, ct);
+        slots is null
+            ? RunLockedAsync(null, item, repos, session, ct)
+            : slots.HoldAsync(null, slot => RunLockedAsync(slot.Sandbox, item, repos, session, ct), ct);
 
-    private async Task<T> RunLockedAsync<T>(WorkItem item, IReadOnlyList<RepoRef> repos, Func<Plans.PlannerSeat, CancellationToken, Task<T>> session,
-        CancellationToken ct)
+    /// <param name="sandbox">The slot the seat is in: the plan item's, which its Plan step holds (sc-25989); null unsandboxed.</param>
+    private async Task<T> RunLockedAsync<T>(WorkerSandbox? sandbox, WorkItem item, IReadOnlyList<RepoRef> repos,
+        Func<Plans.PlannerSeat, CancellationToken, Task<T>> session, CancellationToken ct)
     {
         // The token is minted per repository, contents-read only: a seat of several repositories fetches each with its own.
         var workspaces = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
-            async (r, c) => (await app.CreateInstallationTokenAsync(r, c, Issues.WorkerTriageRunner.TriageWorkspaceToken)).Token, sandbox: sandbox,
+            async (r, c) => (await app.CreateInstallationTokenAsync(r, c, Issues.WorkerTriageRunner.TriageWorkspaceToken)).Token, sandbox: slots,
             worktreesDirectory: PlanWorktrees, shareWithWorker: false);
         var configs = Path.Combine(options.WorkRoot, Mcp.McpProxySessions.DirectoryName);
         Mcp.McpProxy? started;
@@ -720,7 +750,7 @@ public sealed class SandboxPlanRunner(FactoryOptions options, WorkerSandbox? san
             throw new FactoryUnavailableException($"the planner's set-up: {ex.Message}", ex);
         }
         await using var proxy = started;
-        var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, options.RouterKey, options.WorkerAuth, options.WorkerTimeout, sandbox,
+        var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, options.RouterKey, options.WorkerAuth, options.WorkerTimeout, slots,
             pauseFlagDirectory: options.PauseFlagDirectory, tools: PlannerTools(upstreams, proxy is not null));
         return await new Plans.WorkerPlanRunner(workspaces, worker, log,
             proxy is null ? null : new Mcp.McpProxySessions(proxy, configs, sandbox?.User, owner: ItemNaming.ParseAny(item.ExternalId)))

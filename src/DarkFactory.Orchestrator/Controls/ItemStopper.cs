@@ -305,10 +305,12 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
             var kept = several is null ? $"Branch {branch} is kept; nothing was merged or deleted."
                 : $"Branch {branch} is kept in each of {string.Join(", ", changesets.Select(c => c.Repo))}; the stop merged and deleted nothing. "
                     + Plans.Changeset.DeliveryNote(id, several, stopped: true);
+            // What the stop could not stop or remove (sc-25989: the item's worker slot is no longer configured), from its own row.
+            var left = steps.LastOrDefault(e => e.Step == RunPipeline.Steps.SlotLeft)?.Detail is { } stays ? $" {stays}" : "";
             await source.ReportStateAsync(storyId, BoardState.Stopped, unclaimed
                 ? PlanRelease.NeverClaimedComment(id, by)
                 : $"{WorkSourceComments.Author} {id} was stopped by {by}: {what} "
-                    + $"{prs} {kept}", ct);
+                    + $"{prs} {kept}{left}", ct);
             await ledger.CheckpointAsync(item, RunPipeline.Steps.StopReported, session, by, ct);
         }
         await ledger.RecordAsync(item, WorkState.Cancelled, session, $"stopped by {by}", ct);

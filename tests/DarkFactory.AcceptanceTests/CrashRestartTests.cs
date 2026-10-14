@@ -89,7 +89,10 @@ public class CrashRestartTests
     /// <summary>The dotnet host <c>dotnet test</c> runs under (a known local program of the gateway lint), else <c>dotnet</c> on PATH.</summary>
     private static string DotnetHost => Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet";
 
-    private static Process StartWork(IReadOnlyDictionary<string, string> environment)
+    private static Process StartWork(IReadOnlyDictionary<string, string> environment) => StartFactory(environment, "work");
+
+    /// <summary><c>dotnet DarkFactory.Orchestrator.dll &lt;command…&gt;</c> (<c>work</c>, or <c>run sc-N</c>) with the test's settings; its output goes to the test log.</summary>
+    internal static Process StartFactory(IReadOnlyDictionary<string, string> environment, params string[] command)
     {
         var psi = new ProcessStartInfo(DotnetHost)
         {
@@ -98,21 +101,25 @@ public class CrashRestartTests
             UseShellExecute = false,
         };
         psi.ArgumentList.Add(typeof(FactoryRunner).Assembly.Location);
-        psi.ArgumentList.Add("work");
+        foreach (var argument in command)
+        {
+            psi.ArgumentList.Add(argument);
+        }
         foreach (var (name, value) in environment)
         {
             psi.Environment[name] = value;
         }
         var process = Process.Start(psi)!;
         // Drained continuously, so a full pipe never blocks the host.
-        process.OutputDataReceived += (_, e) => { if (e.Data is not null) Console.WriteLine($"[factory work {process.Id}] {e.Data}"); };
-        process.ErrorDataReceived += (_, e) => { if (e.Data is not null) Console.WriteLine($"[factory work {process.Id}!] {e.Data}"); };
+        var label = $"factory {string.Join(' ', command)} {process.Id}";
+        process.OutputDataReceived += (_, e) => { if (e.Data is not null) Console.WriteLine($"[{label}] {e.Data}"); };
+        process.ErrorDataReceived += (_, e) => { if (e.Data is not null) Console.WriteLine($"[{label}!] {e.Data}"); };
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
         return process;
     }
 
-    private static int FreePort()
+    internal static int FreePort()
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
@@ -120,7 +127,7 @@ public class CrashRestartTests
     }
 
     /// <summary>Whether a process with this pid exists (read-only: <c>ps</c>, never a signal).</summary>
-    private static bool IsRunning(int pid)
+    internal static bool IsRunning(int pid)
     {
         using var ps = Process.Start(new ProcessStartInfo("/bin/ps", ["-p", pid.ToString(), "-o", "pid="]) { RedirectStandardOutput = true })!;
         var output = ps.StandardOutput.ReadToEnd();

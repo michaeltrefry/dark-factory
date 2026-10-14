@@ -312,8 +312,14 @@ public enum WorkerAuth
 /// </summary>
 public sealed class ClaudeWorker(
     string claudePath, Uri routerBaseUrl, string routerKey, WorkerAuth auth, TimeSpan timeout,
-    WorkerSandbox? sandbox = null, TimeSpan? stopGrace = null, string? pauseFlagDirectory = null, WorkerTools? tools = null) : IWorker
+    WorkerSlots? slots = null, TimeSpan? stopGrace = null, string? pauseFlagDirectory = null, WorkerTools? tools = null) : IWorker
 {
+    /// <summary>
+    /// The sandbox this worker runs in now: the slot the calling flow holds (<see cref="WorkerSlots.Current"/>, sc-25989) — a
+    /// session, its stop and the stop of a leftover worker are all one sandbox user's, the item's slot — or null unsandboxed.
+    /// </summary>
+    private WorkerSandbox? Sandbox => slots?.Current;
+
     /// <summary>The tools and permission mode every session of this worker runs with (default <see cref="WorkerTools.Implementer"/>).</summary>
     public WorkerTools Tools { get; } = tools ?? WorkerTools.Implementer;
 
@@ -515,14 +521,15 @@ public sealed class ClaudeWorker(
         RunAsync(workingDirectory, prompt, resumeSessionId, modelClass, callbacks, null, ct);
 
     /// <summary>
-    /// Sandboxed, the whole session runs under the sandbox user's lock (<see cref="WorkerSandbox.Lock"/>, sc-25988): the run's
-    /// worker phase holds it already (and waited for it honouring Pause and Stop); a caller that holds none waits for it here.
+    /// Sandboxed, the whole session runs under a sandbox user's lock (<see cref="WorkerSandbox.Lock"/>, sc-25988): the run's
+    /// worker phase holds its slot already (and waited for it honouring Pause and Stop); a caller that holds none waits here for
+    /// a free one (<see cref="WorkerSlots.HoldAsync{T}"/>).
     /// </summary>
     public Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
         WorkerCallbacks? callbacks, string? mcpConfigPath, CancellationToken ct) =>
-        sandbox?.Lock is { } held
-            ? held.HoldAsync(() => RunLockedAsync(workingDirectory, prompt, resumeSessionId, modelClass, callbacks, mcpConfigPath, ct), ct)
-            : RunLockedAsync(workingDirectory, prompt, resumeSessionId, modelClass, callbacks, mcpConfigPath, ct);
+        slots is null
+            ? RunLockedAsync(workingDirectory, prompt, resumeSessionId, modelClass, callbacks, mcpConfigPath, ct)
+            : slots.HoldAsync(null, _ => RunLockedAsync(workingDirectory, prompt, resumeSessionId, modelClass, callbacks, mcpConfigPath, ct), ct);
 
     private async Task<WorkerResult> RunLockedAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
         WorkerCallbacks? callbacks, string? mcpConfigPath, CancellationToken ct)
@@ -595,16 +602,16 @@ public sealed class ClaudeWorker(
         WorkerCallbacks? callbacks, CancellationToken ct)
     {
         // Sandboxed, the helper makes the worker a process-group leader and the pid reported is sudo's.
-        var process = sandbox is null
+        var process = Sandbox is null
             ? StartDirect(workingDirectory, args, modelClass)
-            : sandbox.Start(workingDirectory, claudePath, args, BuildRouterVariables(routerBaseUrl, routerKey, auth, modelClass));
+            : Sandbox.Start(workingDirectory, claudePath, args, BuildRouterVariables(routerBaseUrl, routerKey, auth, modelClass));
         try
         {
             return await RunStartedAsync(process, callbacks, ct);
         }
         finally
         {
-            if (sandbox is null)
+            if (Sandbox is null)
             {
                 process.Dispose();
             }
@@ -613,7 +620,7 @@ public sealed class ClaudeWorker(
                 // Exited, or stopped and waited for above: disposed now. A helper that is still alive (the session is marked
                 // WorkerStillRunning) keeps the sandbox user's lock until it is gone — its exit still kills every process of
                 // the worker user, so no other run's worker may start under it (sc-25988).
-                await sandbox.EndAsync(process, TimeSpan.Zero);
+                await Sandbox.EndAsync(process, TimeSpan.Zero);
             }
         }
     }
@@ -701,7 +708,7 @@ public sealed class ClaudeWorker(
             throw;
         }
         await stderrTask;
-        if (sandbox is not null)
+        if (Sandbox is not null)
         {
             WorkerSandbox.Stop(process);
         }
@@ -729,7 +736,7 @@ public sealed class ClaudeWorker(
     /// <returns>False when the sandboxed worker did not exit even then: its helper is still alive.</returns>
     private async Task<bool> StopAsync(Process process)
     {
-        if (sandbox is null)
+        if (Sandbox is null)
         {
             process.Kill(entireProcessTree: true);
             return true;
@@ -741,8 +748,8 @@ public sealed class ClaudeWorker(
         }
         try
         {
-            using var bounded = new CancellationTokenSource(sandbox.StopGrace);
-            await sandbox.StopAllAsync(bounded.Token);
+            using var bounded = new CancellationTokenSource(Sandbox.StopGrace);
+            await Sandbox.StopAllAsync(bounded.Token);
         }
         catch (Exception)
         {
@@ -780,11 +787,12 @@ public sealed class ClaudeWorker(
 
     public async Task<bool> StopOrphanAsync(int pid, CancellationToken ct)
     {
-        if (sandbox is not null)
+        if (Sandbox is not null)
         {
-            // The recorded pid is sudo's and the owner can't signal the worker user anyway; the worker
-            // user is single-tenant, so any of its processes is a leftover worker: the helper kills them all.
-            return await sandbox.StopAllAsync(ct);
+            // The recorded pid is sudo's and the owner can't signal the worker user anyway; the held slot's user (the
+            // item's: its worker phase holds the slot the ledger recorded) is single-tenant, so any of its processes is a
+            // leftover worker: that slot's helper kills them all, and no other slot's.
+            return await Sandbox.StopAllAsync(ct);
         }
         // Only a group leader running claudePath is ours: a recycled pid is left alone.
         if (await ProcessInfoAsync(pid, ct) is not { } info || info.ProcessGroup != pid || !IsClaudeCommand(info.Command))

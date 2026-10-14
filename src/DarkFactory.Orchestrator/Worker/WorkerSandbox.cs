@@ -35,11 +35,13 @@ public interface IWorkerSandbox
 
 /// <summary>
 /// Runs workers as a dedicated macOS user (E5) through the root-owned launch helper
-/// (<c>scripts/factory-worker-launch</c>), which <c>scripts/setup-worker-user.sh</c> installs
-/// and allows the owner to run as <see cref="User"/> via a NOPASSWD sudoers rule.
+/// (<c>scripts/factory-worker-launch</c>), which <c>scripts/setup-worker-user.sh</c> installs — one copy per sandbox user, pinned
+/// to it — and allows the owner to run as <see cref="User"/> via a NOPASSWD sudoers rule.
 /// Router variables travel on the helper's stdin, never argv; closing stdin stops the worker.
 /// <paramref name="HelperSource"/>: the helper as <c>scripts/factory-worker-launch</c> has it, which the installed one must
 /// match (<see cref="StaleHelperReason"/>); null is the copy compiled into this assembly.
+/// A sandbox is one sandbox user — one worker slot of the pool (<see cref="WorkerSlots"/>, sc-25989), which has one of these per
+/// slot, each with its own user, helper and lock.
 /// Every run of the helper happens under the sandbox user's lock (<see cref="Lock"/>, sc-25988): the helper's exit kills every
 /// process of <see cref="User"/>, another run's worker included. <see cref="Start"/> refuses to launch unless the calling flow
 /// holds it (the caller holds it for as long as the process lives); the short commands here (<see cref="RunAsync(string, string, IEnumerable{string}, CancellationToken)"/>,
@@ -56,6 +58,15 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     /// the work root's); null only for a sandbox a test builds over its own helper copy, which shares its user with no other run.
     /// </summary>
     public WorkerLock? Lock { get; init; }
+
+    /// <summary>
+    /// What the owner runs to (re)install this sandbox's helper: <see cref="ReinstallCommand"/>, with <c>--slots n</c> when the
+    /// factory has several slots (<see cref="WorkerSlots.ReinstallCommand"/>: the script then sets up every slot's user and helper).
+    /// </summary>
+    public string Reinstall { get; init; } = ReinstallCommand;
+
+    /// <summary>The hint a missing or unusable sandbox is reported with.</summary>
+    private string Hint => $"run `{Reinstall}` once (see README, Worker sandbox)";
 
     /// <summary>Runs <paramref name="command"/> holding <see cref="Lock"/> (waited for; at once when the calling flow holds it or there is none).</summary>
     private Task<T> LockedAsync<T>(Func<Task<T>> command, CancellationToken ct) => Lock is null ? command() : Lock.HoldAsync(command, ct);
@@ -121,10 +132,9 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     public const string DefaultHelperPath = "/usr/local/libexec/dark-factory/factory-worker-launch";
     public const string DefaultSudoPath = "/usr/bin/sudo";
     public const string ReinstallCommand = "sudo scripts/setup-worker-user.sh";
-    public const string SetupHint = $"run `{ReinstallCommand}` once (see README, Worker sandbox)";
 
     /// <summary>The <c>helper_version</c> of <c>scripts/factory-worker-launch</c>: an installed helper below it is stale.</summary>
-    public const int HelperVersion = 3;
+    public const int HelperVersion = 4;
 
     /// <summary>
     /// The oldest Claude Code the worker user may run: 2.1.291, the release the confined triage session was built and checked
@@ -347,7 +357,7 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         }
         catch (System.ComponentModel.Win32Exception ex)
         {
-            throw new InvalidOperationException($"Worker sandbox unavailable ({ex.Message}); {SetupHint}.", ex);
+            throw new InvalidOperationException($"Worker sandbox unavailable ({ex.Message}); {Hint}.", ex);
         }
         await EnsureProbedAsync(probe, claudePath, ct);
     }
@@ -366,13 +376,13 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            throw new InvalidOperationException($"Worker sandbox unavailable: cannot read the launch helper {HelperPath} ({ex.Message}); {SetupHint}.", ex);
+            throw new InvalidOperationException($"Worker sandbox unavailable: cannot read the launch helper {HelperPath} ({ex.Message}); {Hint}.", ex);
         }
         if (StaleHelperReason(installed, User, HelperSource) is { } stale)
         {
             throw new InvalidOperationException(
                 $"Stale helper: the installed launch helper {HelperPath} is not the current scripts/factory-worker-launch ({stale}); "
-                + $"re-run `{ReinstallCommand}` to install it (that kills every {User} process: stop `factory work` first).");
+                + $"re-run `{Reinstall}` to install it (that kills every process of every worker user: stop `factory work` first).");
         }
     }
 
@@ -383,32 +393,32 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         {
             throw new InvalidOperationException(
                 $"The installed launch helper {HelperPath} is stale: it refuses the worker's router variables ({probe.Stderr.Trim()}); "
-                + "re-run `sudo scripts/setup-worker-user.sh` to install the current helper.");
+                + $"re-run `{Reinstall}` to install the current helper.");
         }
         if (probe.ExitCode != 0 || probe.Stdout.Trim() != User)
         {
             throw new InvalidOperationException(
-                $"Worker sandbox user '{User}' is not usable through {HelperPath} ({probe.Stderr.Trim()}); {SetupHint}.");
+                $"Worker sandbox user '{User}' is not usable through {HelperPath} ({probe.Stderr.Trim()}); {Hint}.");
         }
         if (probe.Stderr.Split('\n').FirstOrDefault(l => l.Contains("refusing the", StringComparison.Ordinal) && l.Contains("uid sweep", StringComparison.Ordinal))
             is { } refusal)
         {
             throw new InvalidOperationException(
                 $"The installed launch helper {HelperPath} refuses its {User} uid sweep, so a worker's leftovers would outlive its run "
-                + $"({refusal.Trim()}); re-run `{ReinstallCommand}` (it pins {User}'s uid; a {User} whose uid is outside 400-499 must be recreated).");
+                + $"({refusal.Trim()}); re-run `{Reinstall}` (it pins {User}'s uid; a {User} whose uid is outside 400-499 must be recreated).");
         }
         var claude = await RunAsync("/", claudePath, ["--version"], ct);
         if (claude.ExitCode != 0)
         {
             throw new InvalidOperationException(
-                $"Cannot run `{claudePath} --version` as {User} through {HelperPath} (exit {claude.ExitCode}: {claude.Stderr.Trim()}); {SetupHint}.");
+                $"Cannot run `{claudePath} --version` as {User} through {HelperPath} (exit {claude.ExitCode}: {claude.Stderr.Trim()}); {Hint}.");
         }
         if (OutdatedClaudeReason(claude.Stdout) is { } outdated)
         {
             throw new InvalidOperationException(
                 $"Upgrade {User}'s claude: {outdated}, and an older CLI may silently ignore the triage session's read confinement "
                 + $"(`--setting-sources \"\"`, `blockReadsOutsideWorkingDirectories`, `dontAsk`); run `sudo -u {User} -H ~{User}/.local/bin/claude update` "
-                + $"(or delete ~{User}/.local/bin/claude and re-run `{ReinstallCommand}` to reinstall it).");
+                + $"(or delete ~{User}/.local/bin/claude and re-run `{Reinstall}` to reinstall it).");
         }
     }
 
@@ -453,7 +463,7 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     /// mode becomes <c>0700</c>. Then <c>/bin/ls -led</c> must show it closed (<see cref="IsClosed"/>), else this throws.
     /// </summary>
     public Task CloseToWorkerAsync(string path, CancellationToken ct) =>
-        CloseToWorkerAsync(path, (p, c) => RunChecked("/bin/ls", ["-led", "--", p], c, output: true), ct);
+        CloseToWorkerAsync(path, ListAclAsync, ct);
 
     /// <summary><see cref="CloseToWorkerAsync(string, CancellationToken)"/>, the directory read back through <paramref name="list"/> (tests).</summary>
     internal async Task CloseToWorkerAsync(string path, Func<string, CancellationToken, Task<string>> list, CancellationToken ct)
@@ -494,6 +504,12 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         }
         return await Lock.TryHoldAsync(() => DeleteAsWorkerAsync(path, ct));
     }
+
+    /// <summary>
+    /// macOS <c>/bin/ls -led</c> of <paramref name="path"/>, owner-side: its long listing line, then one line per ACL entry (what
+    /// <see cref="IsClosed"/> and <see cref="WorkerSlots.SharedWith"/> read).
+    /// </summary>
+    internal static Task<string> ListAclAsync(string path, CancellationToken ct) => RunChecked("/bin/ls", ["-led", "--", path], ct, output: true);
 
     /// <summary>Runs a local program, failing on a non-zero exit; with <paramref name="output"/> its standard output is read and returned (else "").</summary>
     private static async Task<string> RunChecked(string program, IEnumerable<string> args, CancellationToken ct, bool output = false)
