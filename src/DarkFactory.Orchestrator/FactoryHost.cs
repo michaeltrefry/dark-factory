@@ -105,7 +105,9 @@ public static class FactoryHost
         var links = WorkSourceRegistry.BoardLinks(options); // read now too: an invalid Kanban:WebUrl refuses to start the host
         services.AddSingleton<IDashboardData>(sp =>
             new DashboardData(sp.GetRequiredService<IDbContextFactory<LedgerDbContext>>(), sp.GetRequiredService<TimeProvider>(), quiet, metrics,
-                boardLinks: links));
+                boardLinks: links,
+                // Which items' runs are alive, in this process or another (sc-25991): the run locks, read without taking any.
+                liveRuns: new PostgresRunLocks(options.LedgerConnectionString).HeldAsync));
         // The intake loop's last errors (E10); empty on a host without one.
         services.TryAddSingleton(sp => new IntakeStatus(sp.GetRequiredService<TimeProvider>()));
         // The dashboard's only writes besides login/logout (E8): Pause, Continue and Stop.

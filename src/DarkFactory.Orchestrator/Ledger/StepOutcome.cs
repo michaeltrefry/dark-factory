@@ -132,6 +132,8 @@ public static class StepOutcomes
         RunPipeline.Steps.CiTriggers => CiTriggerCheck.IsBlocked(detail) ? StepOutcome.GateRejected : StepOutcome.Failed,
         RunPipeline.Steps.UsagePause or RunPipeline.Steps.Parked or RunPipeline.Steps.PlanHeld or RunPipeline.Steps.PlanStuck
             or RunPipeline.Steps.PlanDelivery or RunPipeline.Steps.MergedIntoChangeset => StepOutcome.Deferred,
+        // A run's use of a worker slot (sc-25991): a wait for one is no failure and defers nothing — the run goes on by itself.
+        RunPipeline.Steps.SlotWait or RunPipeline.Steps.SlotHeld or RunPipeline.Steps.SlotReleased => StepOutcome.Passed,
         _ => StepOutcome.Passed,
     };
 }

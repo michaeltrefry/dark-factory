@@ -37,9 +37,21 @@
         <ControlButton Action="continue" Scope="@ControlScope.Freeze" />
     </div>
 }
-@if (Intake.DeferredRun is { } deferredRun)
+@* What holds new work, each with what lifts it (sc-25991): one deferred run reads as it always did; several runs deferred in
+   one poll, or a factory-wide control the intake loop found in effect (as of its last read: the banners above and below are the
+   ledger's, current), are listed. *@
+@if (Intake.Deferrals is [{ Hold: false } deferredRun])
 {
-    <p class="error deferred">Deferred (last at @deferredRun.At.ToString("u")): @deferredRun.Message</p>
+    <p class="error deferred" data-deferral="@deferredRun.Id">Deferred (last at @deferredRun.At.ToString("u")): @deferredRun.Message</p>
+}
+else if (Intake.Deferrals is { Count: > 0 } deferrals)
+{
+    <ul class="error deferrals">
+        @foreach (var deferral in deferrals)
+        {
+            <li class="@(deferral.Hold ? "hold" : "deferred")" data-deferral="@deferral.Id">Deferred (last at @deferral.At.ToString("u")): @deferral.Message</li>
+        }
+    </ul>
 }
 @if (UsagePause is { } usage)
 {
@@ -76,7 +88,7 @@ else
 {
     <table class="pipeline">
         <thead>
-            <tr><th>Item</th><th>State</th><th>Repo</th><th>PR</th><th>Elapsed</th><th>Cost</th><th>Sessions</th><th>Control</th></tr>
+            <tr><th>Item</th><th>State</th><th>Run</th><th>Repo</th><th>PR</th><th>Elapsed</th><th>Cost</th><th>Sessions</th><th>Control</th></tr>
         </thead>
         <tbody>
             @* A plan's stories are listed beneath their plan item (sc-25876), not as rows of their own. *@
@@ -101,6 +113,7 @@ else
                                         <span class="@(story.Failing ? "error waits" : "muted waits")">@story.Waits</span>
                                     }
                                 </td>
+                                <td class="muted run">—</td>
                                 <td>@(story.Repo ?? row.Repo)</td>
                                 <td class="muted" colspan="5">—</td>
                             </tr>
@@ -215,6 +228,27 @@ else
                             }
                         }
                     </td>
+                    @* Every run in flight, of this process or another (sc-25991), from the ledger: whether one is alive (the item's
+                       run lock), its phase, and its worker slot — held, waited for, or only the item's. *@
+                    <td class="run" data-live="@(row.Run?.Live is { } alive ? (alive ? "true" : "false") : null)">
+                        @if (row.Run is { } run && !row.Finished)
+                        {
+                            @if (run.Live is { } live)
+                            {
+                                <span class="@(live ? "run-live" : "muted run-live")">@(live ? "running" : "no run now")</span>@(": ")
+                            }
+                            <span class="phase">@run.Phase</span>
+                            @if (run.SlotText is { Length: > 0 } slotText)
+                            {
+                                @(" · ")<span class="@(run.Stale ? "error slot" : run.Holds || run.Waits ? "slot" : "muted slot")"
+                                    data-slot="@(run.Holds ? "held" : run.Waits ? "waiting" : run.Stale ? "stale" : "idle")">@slotText</span>
+                            }
+                        }
+                        else
+                        {
+                            <span class="muted">—</span>
+                        }
+                    </td>
                     <td>@row.Repo</td>
                     <td class="pr">
                         @if (row.PullRequestUrl is { } pr)
@@ -290,7 +324,8 @@ else
 
     private Task OnTickAsync()
     {
-        if (_rows?.Any(r => r.Sessions.Any(s => s.Running)) == true)
+        // A run shown alive is asked about again too (sc-25991): one that died wrote no row, so no change announces it.
+        if (_rows?.Any(r => r.Sessions.Any(s => s.Running) || r.Run?.Live == true) == true)
         {
             return ReloadAsync();
         }

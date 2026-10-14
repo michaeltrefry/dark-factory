@@ -154,12 +154,22 @@ public sealed partial class RunPipeline(
         }
         var owner = item ?? slotOf;
         var recorded = owner is null ? null : await RecordedSlotAsync(owner, ct);
-        async Task<T> InSlotAsync(Worker.WorkerSlot slot)
+        // What the run last put on the record of its use of a slot (sc-25991, the pipeline page's "holds slot n" / "waiting for a
+        // slot"): a wait's start, the slot's taking, and — whatever ends the phase or the wait — its end, below. A phase inside
+        // a phase records none: the outer one's hold is the run's.
+        Worker.WorkerSlot? took = null;
+        var onRecord = false;
+        async Task<T> InSlotAsync(Worker.WorkerSlot slot, bool outermost)
         {
             if (owner is not null && recorded is null)
             {
                 // Under the slot's lock, before the set-up or the phase makes anything in it: the record is what resumes it there.
                 await RecordSlotAsync(owner, slot, ct);
+            }
+            if (outermost && item is not null)
+            {
+                await ledger.CheckpointAsync(item, Steps.SlotHeld, null, SlotUse.Detail(slot.Number, slot.User, what), ct);
+                (took, onRecord) = (slot, true);
             }
             return await EnteredAsync();
         }
@@ -168,7 +178,7 @@ public sealed partial class RunPipeline(
             return recorded is { } other && other != held.Number
                 ? throw new InvalidOperationException(
                     $"Refusing to {what} in worker {held}: {owner!.ExternalId} is worker slot {other}'s, and a phase is one sandbox user's.")
-                : await InSlotAsync(held);
+                : await InSlotAsync(held, outermost: false);
         }
         // An item with no slot yet goes where the fewest unfinished items are, so the slots fill evenly rather than in number order.
         var order = recorded is null && _slots.Count > 1 ? await ledger.SlotsByLoadAsync(_slots.Count, ct) : null;
@@ -177,43 +187,84 @@ public sealed partial class RunPipeline(
             : _slots.Count > 1 ? $"a free worker slot (other runs' worker phases hold all {_slots.Count})"
             : $"the sandbox user (another run's worker phase holds {_slots.All[0].Lock?.Path})";
         var (waited, unreadable) = (false, 0);
-        return await _slots.HoldAsync(recorded, async slot =>
+        // The slot the item waits for by name: its recorded one, or the only one there is; null: any free one.
+        var wanted = recorded ?? (_slots.Count == 1 ? 1 : (int?)null);
+        try
         {
-            if (waited && item is not null)
+            return await _slots.HoldAsync(recorded, async slot =>
             {
-                log.WriteLine(_slots.Count > 1
-                    ? $"[lock] {item.ExternalId}: worker {slot} is free; going on to {what}"
-                    : $"[lock] {item.ExternalId}: the sandbox user is free; going on to {what}");
-                await ThrowIfControlledAsync(item, ct);
-                await ThrowIfFrozenAsync(item, ct);
-            }
-            return await InSlotAsync(slot);
-        }, ct, async c =>
-        {
-            if (!waited)
-            {
-                waited = true;
-                log.WriteLine(_slots.Count > 1
-                    ? $"[lock] {item?.ExternalId ?? "a stop"}: waiting for {waitsFor} to {what}"
-                    : $"[lock] {item?.ExternalId ?? "a stop"}: waiting for the sandbox user to {what} (another run's worker phase holds {_slots.All[0].Lock?.Path})");
-            }
-            if (item is null)
-            {
-                return;
-            }
-            try
-            {
-                await ThrowIfControlledAsync(item, c);
-                unreadable = 0;
-            }
-            catch (Exception ex) when (ex is not ControlRequestedException and not OperationCanceledException)
-            {
-                if (++unreadable > _maxControlReadFailures)
+                if (waited && item is not null)
                 {
-                    throw new ControlRequestedException(ControlState.Paused) { ControlsUnreadable = $"{ex.GetType().Name}: {ex.Message}" };
+                    log.WriteLine(_slots.Count > 1
+                        ? $"[lock] {item.ExternalId}: worker {slot} is free; going on to {what}"
+                        : $"[lock] {item.ExternalId}: the sandbox user is free; going on to {what}");
+                    await ThrowIfControlledAsync(item, ct);
+                    await ThrowIfFrozenAsync(item, ct);
                 }
+                return await InSlotAsync(slot, outermost: true);
+            }, ct, async c =>
+            {
+                if (!waited)
+                {
+                    waited = true;
+                    log.WriteLine(_slots.Count > 1
+                        ? $"[lock] {item?.ExternalId ?? "a stop"}: waiting for {waitsFor} to {what}"
+                        : $"[lock] {item?.ExternalId ?? "a stop"}: waiting for the sandbox user to {what} (another run's worker phase holds {_slots.All[0].Lock?.Path})");
+                    if (item is not null)
+                    {
+                        // Once per wait, never per poll of it.
+                        await ledger.CheckpointAsync(item, Steps.SlotWait, null,
+                            SlotUse.Detail(wanted, wanted is { } n ? _slots.Slot(n).User : null, what), c);
+                        onRecord = true;
+                    }
+                }
+                if (item is null)
+                {
+                    return;
+                }
+                try
+                {
+                    await ThrowIfControlledAsync(item, c);
+                    unreadable = 0;
+                }
+                catch (Exception ex) when (ex is not ControlRequestedException and not OperationCanceledException)
+                {
+                    if (++unreadable > _maxControlReadFailures)
+                    {
+                        throw new ControlRequestedException(ControlState.Paused) { ControlsUnreadable = $"{ex.GetType().Name}: {ex.Message}" };
+                    }
+                }
+            }, _controlPoll, report: log.WriteLine, order: order);
+        }
+        finally
+        {
+            if (onRecord)
+            {
+                await SlotReleasedAsync(item!, took, wanted, what);
             }
-        }, _controlPoll, report: log.WriteLine, order: order);
+        }
+    }
+
+    /// <summary>
+    /// Records that <paramref name="item"/>'s run no longer holds (<paramref name="took"/>) or waits for (<paramref name="wanted"/>;
+    /// null: any) a worker slot (<see cref="Steps.SlotReleased"/>), however the phase or the wait ended — so on no cancellation
+    /// token, but bounded. A record that cannot be written is logged and left: the phase's own outcome stands, and the stale
+    /// "holds" it leaves is told from a live one by the item's run lock (<see cref="SlotUse"/>).
+    /// </summary>
+    private async Task SlotReleasedAsync(WorkItem item, Worker.WorkerSlot? took, int? wanted, string what)
+    {
+        var slot = took?.Number ?? wanted;
+        using var bounded = new CancellationTokenSource(_failedSessionEndTimeout);
+        try
+        {
+            await ledger.CheckpointAsync(item, Steps.SlotReleased, null,
+                SlotUse.Detail(slot, took?.User ?? (slot is { } n && n <= _slots!.Count ? _slots.Slot(n).User : null), took is null ? $"not taken: the wait to {what} ended" : what),
+                bounded.Token);
+        }
+        catch (Exception ex)
+        {
+            log.WriteLine($"[slot] {item.ExternalId}: could not record that it no longer {(took is null ? "waits for" : "holds")} a worker slot ({ex.GetType().Name}: {ex.Message})");
+        }
     }
 
     /// <summary>
@@ -371,6 +422,20 @@ public sealed partial class RunPipeline(
         /// says what stays on the machine, and the stop comment repeats it. The stop itself goes on to Cancelled. Outcome failed.
         /// </summary>
         public const string SlotLeft = "slot-left";
+        /// <summary>
+        /// The run started waiting for a worker slot another run's worker phase holds (sc-25991; <see cref="SlotUse"/>): written
+        /// once per wait, Detail the slot waited for (<c>any -</c> for a free one) and what the phase will do. Outcome passed: a
+        /// wait is no failure.
+        /// </summary>
+        public const string SlotWait = "slot-wait";
+        /// <summary>The run's worker phase has its slot (sc-25991): Detail the slot, its user and what the phase does (<c>2 _factory2 implement</c>).</summary>
+        public const string SlotHeld = "slot-held";
+        /// <summary>
+        /// The run no longer holds or waits for a slot (sc-25991): its worker phase ended, however it ended, or its wait did
+        /// without the slot (a Pause, a Stop, the freeze; Detail then says <c>not taken</c>). A run that died writes none — the
+        /// item's run lock tells its stale <see cref="SlotHeld"/> from a live one.
+        /// </summary>
+        public const string SlotReleased = "slot-released";
         public const string Session = "session";
         public const string WorkerDone = "worker-done";
         public const string Pushed = "pushed";
@@ -2114,7 +2179,10 @@ public sealed partial class RunPipeline(
                 start = i + 1;
             }
         }
-        return history.Skip(start).ToList();
+        // Not the slot's bookkeeping (the item's slot, sc-25989, and the run's use of it, sc-25991): those rows are written as a
+        // worker phase starts, before the attempt has made anything, so an attempt holding only them is a fresh one — not a
+        // resume that would look for a worktree and record it lost.
+        return history.Skip(start).Where(e => e.Step != Steps.Slot && !SlotUse.IsStep(e.Step)).ToList();
     }
 
     /// <summary>

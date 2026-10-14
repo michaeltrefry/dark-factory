@@ -70,6 +70,15 @@ public interface IItemRunner
 /// those being stopped come first (<see cref="IItemRunner.InFlightAsync"/>), so a pending Stop is finished in a frozen factory
 /// too. A factory-wide failure starts nothing more this poll. Runs already started when either happens run to their end: each
 /// run checks the freeze, the usage pause and its controls itself, before every step.
+/// What stops new work with runs in flight (sc-25991) — a poll's runs overlap, so each of these can happen while others run:
+/// (1) a factory-wide control set since the poll listed its work (the usage pause, e.g. by a sibling run whose worker hit the
+/// limit; a Pause of the factory; the freeze's row): the controls are read again before each ready item is started
+/// (<see cref="HoldsAsync"/>) and, held, no ready item of the poll is started — shown with what lifts it
+/// (<see cref="IntakeStatus.Deferrals"/>); in-flight items listed for the poll are still run, each run pausing itself at its
+/// first check (or finishing its Stop); (2) a run the freeze deferred, as above — every deferred run is shown, not only the
+/// last; (3) a factory-wide failure of one run: shown once per poll however many runs or listings hit it
+/// (<see cref="IntakeStatus.FactoryFailedAlso"/>), it starts nothing more, and it is never a failure of its own item or of a
+/// run beside it — a sibling's own failure is counted against that sibling alone, as ever.
 /// <paramref name="freeze"/>, when set, is the
 /// freeze evaluator run at the start of each poll: frozen (or unable to check), no lane is prepared (no triage) or listed.
 /// </summary>
@@ -130,24 +139,72 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
         }
     }
 
+    /// <summary>
+    /// The factory-wide controls that hold new work now (sc-25991), each with what lifts it: the usage pause while it is in
+    /// effect, a Pause of the factory, and the freeze's row (set until a human's Continue). Read at each poll's start and again
+    /// before a ready item is dispatched — runs overlap, so one may have paused the factory since the poll listed its work. An
+    /// unreadable record throws (the caller counts it as the factory's failure: frozen too, E2).
+    /// </summary>
+    private async Task<(IReadOnlyList<(string Scope, string Why, string Lifts)> Holds, DateTimeOffset? ResumeAt)> HoldsAsync(CancellationToken ct)
+    {
+        if (controls is null)
+        {
+            return ([], null);
+        }
+        var holds = new List<(string Scope, string Why, string Lifts)>();
+        var usagePause = await controls.UsagePauseAsync(ct);
+        if (usagePause is not null)
+        {
+            holds.Add((Controls.ControlScope.Usage, $"the factory is paused for usage ({usagePause.Reason ?? "no reason recorded"})",
+                (usagePause.ResumeAt is { } at ? $"it lifts by itself at {at:u}, or with " : "lifted by ") + "`factory continue --usage`"));
+        }
+        if ((await controls.GetAsync(Controls.ControlScope.Factory, ct))?.State == Controls.ControlState.Paused)
+        {
+            holds.Add((Controls.ControlScope.Factory, "the factory is paused", "lifted by `factory continue --factory`"));
+        }
+        // Frozen (sc-25387): no new work until a human's Continue.
+        if (await controls.GetAsync(Controls.ControlScope.Freeze, ct) is { State: not Controls.ControlState.Running } frozen)
+        {
+            holds.Add((Controls.ControlScope.Freeze, $"the factory is frozen ({frozen.Reason ?? "no trigger recorded"})",
+                Controls.FreezeTrigger.Remedy(frozen.Reason ?? "")));
+        }
+        return (holds, usagePause?.ResumeAt);
+    }
+
     /// <summary>One poll: resume in-flight items first, then run newly ready ones. Returns when a usage pause in effect lifts, if one is.</summary>
     public async Task<DateTimeOffset?> PollOnceAsync(CancellationToken ct)
     {
         var work = new List<(IntakeLane Lane, IReadOnlyList<int> InFlight, IReadOnlyList<int> Ready)>();
         DateTimeOffset? resumeAt = null;
         bool factoryPaused;
+        // A factory-wide failure is shown once per poll, however many of its listings and runs hit it (sc-25991).
+        var gate = new Lock();
+        var factoryFailed = false;
+        void FactoryFailed(string message)
+        {
+            lock (gate)
+            {
+                if (factoryFailed)
+                {
+                    _status.FactoryFailedAlso(message);
+                }
+                else
+                {
+                    _status.FactoryFailed(message);
+                }
+                factoryFailed = true;
+            }
+        }
         try
         {
             if (usage is not null)
             {
                 await usage.CheckAsync(ct);
             }
-            var usagePause = controls is null ? null : await controls.UsagePauseAsync(ct);
-            resumeAt = usagePause?.ResumeAt;
-            factoryPaused = usagePause is not null || (controls is not null
-                && ((await controls.GetAsync(Controls.ControlScope.Factory, ct))?.State == Controls.ControlState.Paused
-                    // Frozen (sc-25387): no new work until a human's Continue; an unreadable record fails the poll above (frozen too).
-                    || (await controls.GetAsync(Controls.ControlScope.Freeze, ct)) is { State: not Controls.ControlState.Running }));
+            // An unreadable record fails the poll below (frozen too).
+            (var holds, resumeAt) = await HoldsAsync(ct);
+            _status.Holding(holds);
+            factoryPaused = holds.Count > 0;
             // The freeze evaluator itself (sc-25387), before any lane is listed or prepared: a trigger that holds but is not yet
             // written, or one that cannot be checked (E2), stops triage and new work this poll as a written freeze does.
             if (!factoryPaused && freeze is not null)
@@ -155,7 +212,7 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
                 if (await freeze(ct) is { Frozen: true } frozen)
                 {
                     factoryPaused = true;
-                    _status.Deferred("intake", $"{frozen.Message}; {frozen.Remedy}");
+                    _status.Deferred("intake", frozen.Message, frozen.Remedy);
                 }
                 else
                 {
@@ -166,10 +223,9 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             logger.LogError(ex, "Poll failed; retrying next interval");
-            _status.FactoryFailed($"Poll failed: {ex.Message}");
+            FactoryFailed($"Poll failed: {ex.Message}");
             return resumeAt;
         }
-        var factoryFailed = false;
         foreach (var lane in lanes)
         {
             try
@@ -194,8 +250,7 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
             {
                 // One source failing to list (its board down) does not hold up another's items.
                 logger.LogError(ex, "Poll of {Source} failed; retrying next interval", lane.Source.Naming.Source);
-                _status.FactoryFailed($"Poll failed: {ex.Message}");
-                factoryFailed = true;
+                FactoryFailed($"Poll failed: {ex.Message}");
             }
         }
         // The poll's runs, in order: each lane's in-flight items (those being stopped first), then its ready ones; an item once.
@@ -204,19 +259,20 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
             .SelectMany(w => w.InFlight.Select(id => (w.Lane, Id: id, Ready: false)).Concat(w.Ready.Select(id => (w.Lane, Id: id, Ready: true))))
             .Where(x => listed.Add(x.Lane.Source.Naming.Format(x.Id))));
         // What the runs so far decided for those not yet started, read and written under the gate by every dispatcher.
-        var gate = new Lock();
         var runsFailed = false;
         var deferredRun = false;
+        var newWorkHeld = false;
         var deferredLanes = new HashSet<IntakeLane>();
         (IntakeLane Lane, int Id, bool Ready)? Next()
         {
             lock (gate)
             {
                 // In-flight items (those being stopped first) even after another lane's deferral: a Stop starts no new work. Ready
-                // ones only while nothing was deferred: the factory is frozen, so every new item would be deferred the same way.
+                // ones only while nothing was deferred: the factory is frozen, so every new item would be deferred the same way —
+                // and only while no factory-wide control holds new work (MayStartNewAsync).
                 while (!runsFailed && queue.TryDequeue(out var next))
                 {
-                    if (!deferredLanes.Contains(next.Lane) && !(next.Ready && deferredRun))
+                    if (!deferredLanes.Contains(next.Lane) && !(next.Ready && (deferredRun || newWorkHeld)))
                     {
                         return next;
                     }
@@ -224,11 +280,46 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
                 return null;
             }
         }
+        // Whether a ready item may still be started (sc-25991): the poll listed its work a while ago and other runs are in
+        // flight — one of them, or a person, may have paused the factory for usage, paused it or frozen it since. Then no ready
+        // item of the poll is started, and the hold is shown with what lifts it. Controls that cannot be read are the factory's
+        // failure, which starts nothing more (E2: never dispatch blind).
+        async Task<bool> MayStartNewAsync(string name)
+        {
+            try
+            {
+                var (holds, _) = await HoldsAsync(ct);
+                if (holds.Count == 0)
+                {
+                    return true;
+                }
+                logger.LogInformation("{Item}: not started, nor any other ready item this poll: {Why}", name, string.Join("; ", holds.Select(h => h.Why)));
+                _status.Holding(holds);
+                lock (gate)
+                {
+                    newWorkHeld = true;
+                }
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                logger.LogError(ex, "Could not read the controls before starting {Item}; ending this poll", name);
+                FactoryFailed($"{name} not started: the controls could not be read: {ex.Message}");
+                lock (gate)
+                {
+                    runsFailed = true;
+                }
+            }
+            return false;
+        }
         async Task DispatchAsync()
         {
-            while (Next() is var (lane, id, _))
+            while (Next() is var (lane, id, ready))
             {
                 var name = lane.Source.Naming.Format(id);
+                if (ready && !await MayStartNewAsync(name))
+                {
+                    continue;
+                }
                 try
                 {
                     var outcome = await lane.Runner.RunAsync(id, ct);
@@ -238,7 +329,8 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
                     {
                         if (outcome.Deferred is { } deferred)
                         {
-                            // The factory is frozen: every other item of the lane would be deferred the same way (its stops came first).
+                            // The factory is frozen: every other item of the lane would be deferred the same way (its stops came
+                            // first). Each deferred run is shown: with runs in flight, several of one poll can be.
                             _status.Deferred(name, deferred);
                             deferredRun = true;
                             deferredLanes.Add(lane);
@@ -251,15 +343,13 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
                 }
                 catch (Exception ex) when (!ct.IsCancellationRequested && IsFactoryWide(ex))
                 {
-                    // Every other item would fail the same way: show it once, escalate nothing, start nothing more, try again next poll.
+                    // Every other item would fail the same way: show it once, escalate nothing, start nothing more, try again next
+                    // poll. Not this item's failure, nor one of a run beside it (which ends by itself, its outcome its own).
                     logger.LogError(ex, "Run of {Item} failed for a factory-wide reason; ending this poll", name);
+                    FactoryFailed($"{name} could not run: {ex.Message}");
                     lock (gate)
                     {
-                        if (!runsFailed)
-                        {
-                            _status.FactoryFailed($"{name} could not run: {ex.Message}");
-                        }
-                        factoryFailed = runsFailed = true;
+                        runsFailed = true;
                     }
                 }
                 catch (Exception ex) when (!ct.IsCancellationRequested)

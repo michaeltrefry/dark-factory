@@ -1,8 +1,10 @@
 using System.Collections.Concurrent;
 using System.Reflection;
+using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.WorkSources;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -54,9 +56,29 @@ public class IntakeDispatchTests
 
         public Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<int>>(inFlight);
 
+        private readonly ConcurrentDictionary<int, TaskCompletionSource> _startedAt = new();
+
+        /// <summary>Completes once <paramref name="count"/> runs have started: a signal, so a test waits on no clock.</summary>
+        public Task WhenStarted(int count)
+        {
+            var signal = _startedAt.GetOrAdd(count, _ => new(TaskCreationOptions.RunContinuationsAsynchronously));
+            if (Started.Count >= count)
+            {
+                signal.TrySetResult();
+            }
+            return signal.Task.WaitAsync(TimeSpan.FromSeconds(60));
+        }
+
         public async Task<RunOutcome> RunAsync(int id, CancellationToken ct)
         {
             Started.Enqueue(id);
+            foreach (var (count, signal) in _startedAt)
+            {
+                if (Started.Count >= count)
+                {
+                    signal.TrySetResult();
+                }
+            }
             var now = Interlocked.Increment(ref _running);
             int seen;
             while ((seen = Volatile.Read(ref _most)) < now && Interlocked.CompareExchange(ref _most, now, seen) != seen)
@@ -91,9 +113,35 @@ public class IntakeDispatchTests
 
     private static readonly RunOutcome Ok = new(1, WorkState.Review, null, null, null);
 
-    private static IntakeLoop Loop(IWorkSource source, IItemRunner runner, int concurrent, IntakeStatus? status = null, int maxFailures = 3) =>
+    private static IntakeLoop Loop(IWorkSource source, IItemRunner runner, int concurrent, IntakeStatus? status = null, int maxFailures = 3,
+        IControls? controls = null) =>
         new([new IntakeLane(source, runner)], new IntakeOptions(TimeSpan.FromSeconds(60), maxFailures, concurrent), TimeProvider.System, NullLogger<IntakeLoop>.Instance,
-            status: status);
+            controls, status: status);
+
+    /// <summary>The ledger's controls over a ledger of their own, with the context factory a Continue needs.</summary>
+    private static (LedgerControls Controls, LedgerDbContextFactory Contexts) NewControls()
+    {
+        var contexts = new LedgerDbContextFactory(new DbContextOptionsBuilder<LedgerDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options);
+        return (new LedgerControls(contexts, TimeProvider.System), contexts);
+    }
+
+    /// <summary>Controls that cannot be read once <see cref="Broken"/> is set.</summary>
+    private sealed class BreakableControls(IControls inner) : IControls
+    {
+        public Exception? Broken { get; set; }
+
+        private Task<T> Read<T>(Func<Task<T>> read) => Broken is { } ex ? Task.FromException<T>(ex) : read();
+
+        public Task<Control?> GetAsync(string scope, CancellationToken ct) => Read(() => inner.GetAsync(scope, ct));
+        public Task<ControlState> EffectiveAsync(string externalId, long? epicId, CancellationToken ct) => Read(() => inner.EffectiveAsync(externalId, epicId, ct));
+        public Task<IReadOnlyList<Control>> ListAsync(CancellationToken ct) => Read(() => inner.ListAsync(ct));
+        public Task<Control?> UsagePauseAsync(CancellationToken ct) => Read(() => inner.UsagePauseAsync(ct));
+        public Task<Control> PauseForUsageAsync(DateTimeOffset? resumeAt, string reason, CancellationToken ct) => inner.PauseForUsageAsync(resumeAt, reason, ct);
+        public Task<Control> FreezeAsync(string trigger, string detail, DateTimeOffset? readChangedAt, CancellationToken ct) =>
+            inner.FreezeAsync(trigger, detail, readChangedAt, ct);
+        public Task SetAsync(string scope, ControlState state, string by, CancellationToken ct) => inner.SetAsync(scope, state, by, ct);
+        public Task ClearAsync(string scope, CancellationToken ct) => inner.ClearAsync(scope, ct);
+    }
 
     private static async Task Eventually(Func<bool> condition, string what)
     {
@@ -223,6 +271,182 @@ public class IntakeDispatchTests
         Assert.Contains("sc-1 could not run: the worker sandbox: Stale helper", status.FactoryError.Message);
         Assert.Empty(status.ItemErrors);
         Assert.Empty(runner.GaveUp);
+    }
+
+    // sc-25991: what stops a poll's new work with runs in flight. These wait on signals only (a run's start, the poll's end).
+
+    [Theory]
+    [InlineData(ControlScope.Usage, "the factory is paused for usage (worker-rate-limited)", "factory continue --usage")]
+    [InlineData(ControlScope.Factory, "the factory is paused", "factory continue --factory")]
+    [InlineData(ControlScope.Freeze, "the factory is frozen (main-red)", "factory continue --freeze")]
+    public async Task A_factory_wide_control_set_with_runs_in_flight_starts_no_ready_item_and_is_shown_with_what_lifts_it(string scope, string why, string lifts)
+    {
+        // In flight: 1, 2 and 5; ready: 3 and 4. Two at once.
+        var runner = new GatedRunner(1, 2, 5);
+        var status = new IntakeStatus(TimeProvider.System);
+        var (controls, contexts) = NewControls();
+        var loop = Loop(ListingSource.Listing(3, 4), runner, concurrent: 2, status, controls: controls);
+        var poll = loop.PollOnceAsync(CancellationToken.None);
+        await runner.WhenStarted(2);
+        Assert.Empty(status.Deferrals);
+
+        // Set while both run — by one of them (its worker hit the usage limit), the freeze evaluator, or a person.
+        switch (scope)
+        {
+            case ControlScope.Usage:
+                await controls.PauseForUsageAsync(DateTimeOffset.UtcNow.AddHours(1), "worker-rate-limited", CancellationToken.None);
+                break;
+            case ControlScope.Factory:
+                await controls.SetAsync(ControlScope.Factory, ControlState.Paused, "tester", CancellationToken.None);
+                break;
+            default:
+                await controls.FreezeAsync(FreezeTrigger.MainRed, "main is red", null, CancellationToken.None);
+                break;
+        }
+        // An in-flight item the poll listed is still run (its run pauses itself at its first check, or finishes its Stop)…
+        runner.End(1);
+        await runner.WhenStarted(3);
+        Assert.Equal([1, 2, 5], runner.Started.Order());
+        // …and no ready item is, whichever run ends: the hold is read before each would start.
+        runner.End(5);
+        runner.End(2);
+        await poll;
+
+        Assert.Equal([1, 2, 5], runner.Started.Order());
+        var hold = Assert.Single(status.Deferrals);
+        Assert.Equal((scope, true), (hold.Id, hold.Hold));
+        Assert.StartsWith($"new work held: {why}; ", hold.Message);
+        Assert.Contains(lifts, hold.Lifts);
+        Assert.Null(status.DeferredRun); // no run was deferred: a hold is not one
+        Assert.Null(status.FactoryError);
+        Assert.Empty(status.ItemErrors);
+
+        // Lifted: the next poll's first read drops the hold, and the ready items are started.
+        Assert.True((await new ControlActions(controls, contexts).ContinueAsync(scope, "tester", CancellationToken.None)).Ok);
+        runner.EndAtOnce = true;
+        await loop.PollOnceAsync(CancellationToken.None);
+        Assert.Empty(status.Deferrals);
+        Assert.Equal([1, 1, 2, 2, 3, 4, 5, 5], runner.Started.Order());
+    }
+
+    [Fact]
+    public async Task Controls_that_cannot_be_read_before_a_ready_item_starts_are_the_factorys_failure_and_start_nothing_more()
+    {
+        var runner = new GatedRunner(1);
+        var status = new IntakeStatus(TimeProvider.System);
+        var controls = new BreakableControls(NewControls().Controls);
+        var poll = Loop(ListingSource.Listing(3, 4), runner, concurrent: 1, status, maxFailures: 1, controls: controls).PollOnceAsync(CancellationToken.None);
+        await runner.WhenStarted(1);
+
+        controls.Broken = new InvalidOperationException("the controls table is gone");
+        runner.End(1);
+        await poll;
+
+        Assert.Equal([1], runner.Started); // never dispatched blind (E2)
+        Assert.Equal((1, "sc-3 not started: the controls could not be read: the controls table is gone"), (status.FactoryError!.Count, status.FactoryError.Message));
+        Assert.Empty(status.ItemErrors);
+        Assert.Empty(runner.GaveUp);
+    }
+
+    [Fact]
+    public async Task A_factory_wide_failure_of_one_run_is_not_a_failure_of_the_run_beside_it_whose_own_failure_is_counted_against_it_alone()
+    {
+        var runner = new GatedRunner(1, 2, 3);
+        var status = new IntakeStatus(TimeProvider.System);
+        var poll = Loop(ListingSource.Listing(4), runner, concurrent: 2, status, maxFailures: 2).PollOnceAsync(CancellationToken.None);
+        await runner.WhenStarted(2);
+
+        // sc-1's slot has a stale helper (the factory's failure); sc-2, in flight beside it, then fails for a reason of its own.
+        runner.Fail(1, new FactoryUnavailableException("the worker sandbox: Stale helper", new InvalidOperationException("Stale helper")));
+        runner.Fail(2, new InvalidOperationException("story 2 is gone"));
+        await poll;
+
+        Assert.Equal([1, 2], runner.Started.Order()); // nothing more this poll
+        Assert.Equal((1, "sc-1 could not run: the worker sandbox: Stale helper"), (status.FactoryError!.Count, status.FactoryError.Message));
+        Assert.Equal(["sc-2"], status.ItemErrors.Keys); // sc-1 is not counted against, and sc-2 only for its own failure
+        Assert.Equal((1, "InvalidOperationException: story 2 is gone"), (status.ItemErrors["sc-2"].Count, status.ItemErrors["sc-2"].Message));
+        Assert.Empty(runner.GaveUp);
+    }
+
+    [Fact]
+    public async Task Two_different_factory_wide_failures_in_one_poll_are_one_error_naming_both()
+    {
+        var status = new IntakeStatus(TimeProvider.System);
+
+        for (var polls = 1; polls <= 2; polls++)
+        {
+            var runner = new GatedRunner(1, 2);
+            var poll = Loop(ListingSource.Listing(), runner, concurrent: 2, status).PollOnceAsync(CancellationToken.None);
+            await runner.WhenStarted(2);
+            runner.Fail(1, new FactoryUnavailableException("the worker sandbox: Stale helper", new InvalidOperationException("Stale helper")));
+            runner.Fail(2, new FactoryUnavailableException("the ledger migration: timed out", new TimeoutException("timed out")));
+            await poll;
+
+            // One poll, one error: counted once however many of its runs failed, each reason said once.
+            Assert.Equal(polls, status.FactoryError!.Count);
+            Assert.Contains("sc-1 could not run: the worker sandbox: Stale helper", status.FactoryError.Message);
+            Assert.Contains("sc-2 could not run: the ledger migration: timed out", status.FactoryError.Message);
+            Assert.Contains("; also: ", status.FactoryError.Message);
+            Assert.Empty(status.ItemErrors);
+        }
+    }
+
+    [Fact]
+    public async Task Every_run_the_freeze_defers_in_one_poll_is_shown_until_runs_are_dispatched_again()
+    {
+        var runner = new GatedRunner(1, 2);
+        var status = new IntakeStatus(TimeProvider.System);
+        var poll = Loop(ListingSource.Listing(3), runner, concurrent: 2, status).PollOnceAsync(CancellationToken.None);
+        await runner.WhenStarted(2);
+
+        runner.End(1, Ok with { Deferred = "factory frozen (main-red): main is red; `factory continue --freeze` clears it" });
+        runner.End(2, Ok with { Deferred = "factory frozen (main-red): main is red; `factory continue --freeze` clears it" });
+        await poll;
+
+        Assert.Equal([1, 2], runner.Started.Order());
+        Assert.Equal(["sc-1", "sc-2"], status.Deferrals.Select(d => d.Id).Order());
+        Assert.All(status.Deferrals, d => Assert.Equal((false, 1), (d.Hold, d.Count)));
+        Assert.All(status.Deferrals, d => Assert.Contains("factory continue --freeze", d.Message)); // each says what lifts it
+        Assert.Contains(" deferred: factory frozen (main-red)", status.DeferredRun!.Message);
+
+        // Dispatched again: none stands.
+        var next = new GatedRunner(1, 2) { EndAtOnce = true };
+        await Loop(ListingSource.Listing(3), next, concurrent: 2, status).PollOnceAsync(CancellationToken.None);
+        Assert.Empty(status.Deferrals);
+        Assert.Null(status.DeferredRun);
+    }
+
+    [Fact]
+    public void The_status_keeps_each_hold_until_the_loop_reads_it_lifted_and_tells_viewers_only_of_changes()
+    {
+        var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider(new DateTimeOffset(2026, 10, 13, 9, 0, 0, TimeSpan.Zero));
+        var status = new IntakeStatus(time);
+        var changes = 0;
+        status.Changed += () => changes++;
+        var first = time.GetUtcNow();
+
+        status.Holding([(ControlScope.Usage, "paused for usage", "lifts at noon")]);
+        status.Deferred("sc-1", "factory frozen");
+        time.Advance(TimeSpan.FromMinutes(1));
+        status.Holding([(ControlScope.Usage, "paused for usage", "lifts at noon")]); // read again, unchanged: nothing to tell
+        Assert.Equal(2, changes);
+        Assert.Equal([(ControlScope.Usage, true, first), ("sc-1", false, first)], status.Deferrals.Select(d => (d.Id, d.Hold, d.At)));
+        Assert.Equal("new work held: paused for usage; lifts at noon", status.Deferrals[0].Message);
+
+        // Runs dispatched again clear the runs' deferrals, never a control's hold; the loop's next read lifts that.
+        status.NotDeferred();
+        Assert.Equal([ControlScope.Usage], status.Deferrals.Select(d => d.Id));
+        status.Holding([(ControlScope.Freeze, "frozen", "a Continue")]);
+        Assert.Equal([ControlScope.Freeze], status.Deferrals.Select(d => d.Id));
+        status.Holding([]);
+        Assert.Empty(status.Deferrals);
+        Assert.Equal(5, changes);
+
+        // One poll's factory-wide error: one count, each reason once.
+        status.FactoryFailed("sc-1 could not run: stale helper");
+        status.FactoryFailedAlso("sc-2 could not run: stale helper too");
+        status.FactoryFailedAlso("sc-2 could not run: stale helper too");
+        Assert.Equal((1, "sc-1 could not run: stale helper; also: sc-2 could not run: stale helper too"), (status.FactoryError!.Count, status.FactoryError.Message));
     }
 
     [Fact]

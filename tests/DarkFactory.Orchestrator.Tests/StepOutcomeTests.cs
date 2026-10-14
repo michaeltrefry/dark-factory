@@ -400,6 +400,12 @@ public class StepOutcomeTests
         { WorkState.Planned, WorkState.Paused, null, RunPipeline.UserPaused, StepOutcome.Deferred },
         { WorkState.Planned, WorkState.Cancelled, null, "stopped", StepOutcome.Deferred },
         { WorkState.Intake, WorkState.Paused, null, "claim refused: blocked by sc-12 (not merged)", StepOutcome.Deferred },
+        // A run's use of a worker slot (sc-25991): a wait is no failure and defers nothing.
+        { null, WorkState.Implement, RunPipeline.Steps.SlotWait, "2 _factory2 implement", StepOutcome.Passed },
+        { null, WorkState.Implement, RunPipeline.Steps.SlotWait, "any - implement", StepOutcome.Passed },
+        { null, WorkState.Implement, RunPipeline.Steps.SlotHeld, "2 _factory2 implement", StepOutcome.Passed },
+        { null, WorkState.Implement, RunPipeline.Steps.SlotReleased, "2 _factory2 implement", StepOutcome.Passed },
+        { null, WorkState.Paused, RunPipeline.Steps.SlotReleased, "any - not taken: the wait to implement ended", StepOutcome.Passed },
     };
 
     [Theory]
