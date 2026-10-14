@@ -114,6 +114,18 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
     }
 
     /// <summary>
+    /// The key of an epic no item of which the factory has read yet (<c>factory kanban key --epic</c>, sc-25985), so that the epic
+    /// can be paused or stopped ahead (<c>factory pause --epic kb-&lt;key&gt;</c>): as for an item, the epic is read from the board
+    /// first — an id the board does not know, or one the token may not see, throws and gets no key — and nothing is written to
+    /// the board. An item of the epic read later gets the same key (<see cref="KanbanKeys.EpicKeyAsync"/>).
+    /// </summary>
+    public async Task<int> EpicKeyOfAsync(Guid epicId, CancellationToken ct)
+    {
+        var epic = await board.GetEpicAsync(epicId, ct);
+        return await keys.EpicKeyAsync(epic.Id, epic.ProjectId, ct);
+    }
+
+    /// <summary>
     /// The ready items of every watched project, in the projects' configured order and oldest first within one, each given its
     /// key before anything else is written for it. Listed by the board (<c>list_work_items</c>, paged, comments left out) and
     /// checked again here, so nothing outside the scope, blocked, or claimed slips through.

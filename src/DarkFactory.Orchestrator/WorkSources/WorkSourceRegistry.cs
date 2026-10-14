@@ -33,6 +33,12 @@ namespace DarkFactory.Orchestrator.WorkSources;
 /// The source's links to its items for the dashboard, built from the ledger alone (<see cref="IBoardLinks"/>, sc-25985), or null
 /// for a source whose items the dashboard shows without one.
 /// </param>
+/// <param name="KnowsEpic">
+/// Whether an epic of this name can exist, answered from the ledger alone (sc-25985) — what <see cref="IWorkSource.KnowsEpicAsync"/>
+/// answers, for a caller without the source (its credential is missing, or the host has no registry): an epic control must be
+/// refused on a key the ledger never gave out whether or not the board can be reached. Null for a source whose epics are named
+/// by their own number on the board (any may exist), or that has none.
+/// </param>
 public sealed record WorkSourceKind(
     ItemNaming Naming,
     string Name,
@@ -44,7 +50,8 @@ public sealed record WorkSourceKind(
     Func<FactoryOptions, HttpClient, IDbContextFactory<LedgerDbContext>, IWorkSource> Create,
     Func<FactoryOptions, string?> Unwatched,
     Func<FactoryOptions, IntakeStatus, TextWriter, Func<CancellationToken, Task>>? Prepare = null,
-    Func<FactoryOptions, IBoardLinks>? Links = null);
+    Func<FactoryOptions, IBoardLinks>? Links = null,
+    Func<IDbContextFactory<LedgerDbContext>, long, CancellationToken, Task<bool>>? KnowsEpic = null);
 
 /// <summary>
 /// The factory's work sources (sc-25982), keyed by <see cref="ItemNaming"/>: the one registry <c>factory work</c>'s intake loop and
@@ -109,7 +116,9 @@ public sealed class WorkSourceRegistry(FactoryOptions options, Func<ItemNaming, 
                     + "(those already in flight are still finished)."
                 : null,
             // Needs no credential: the links are built on Kanban:WebUrl from what the ledger recorded.
-            Links: o => new KanbanLedgerLinks(o.KanbanWebUrl)),
+            Links: o => new KanbanLedgerLinks(o.KanbanWebUrl),
+            // Needs none either: an epic key is the ledger's own.
+            KnowsEpic: (contexts, key, ct) => new KanbanKeys(contexts).KnowsEpicAsync(key, ct)),
     ];
 
     /// <summary>

@@ -32,7 +32,8 @@ public interface IItemStops
 /// epics were) are looked up on their own board (<paramref name="sources"/>: the source of a naming, or null when it is not
 /// configured; sc-25982) and their epic recorded under their run lock (<paramref name="locks"/>); any that cannot be resolved are
 /// reported, never silently skipped (E10). An epic its source says cannot exist (<see cref="IWorkSource.KnowsEpicAsync"/>: a Kanban
-/// key the ledger never gave out) is refused before anything is written.
+/// key the ledger never gave out) is refused before anything is written — also when that source is not configured, from the
+/// ledger alone (<see cref="WorkSourceKind.KnowsEpic"/>).
 /// </summary>
 public sealed class ControlActions(
     IControls controls, IDbContextFactory<LedgerDbContext> contexts, IItemStops? stops = null, Func<ItemNaming, IWorkSource?>? sources = null,
@@ -203,15 +204,23 @@ public sealed class ControlActions(
 
     /// <summary>
     /// The refusal of an epic scope whose epic its source says cannot exist (<see cref="IWorkSource.KnowsEpicAsync"/>), or null:
-    /// nothing is written for it. A source that is not configured cannot be asked, and is not: the scope is written, and its
-    /// items are reported as unknown as before.
+    /// nothing is written for it. A source that is not configured is not asked; its kind answers from the ledger alone
+    /// (<see cref="WorkSourceKind.KnowsEpic"/>: no credential needed), so a key the ledger never gave out is refused there too,
+    /// while a known epic's scope is written whether or not its board can be reached (its items are reported as unknown as before).
     /// </summary>
-    private async Task<ControlResult?> UnknownEpicAsync(EpicRef epic, string done, CancellationToken ct) =>
-        sources?.Invoke(epic.Naming) is { } source && !await source.KnowsEpicAsync(epic.Id, ct)
-            ? new ControlResult(false, $"{ControlScope.Epic(epic)}: NOT {done}, and nothing was written. The factory has seen no "
-                + $"{WorkSourceRegistry.KindOf(epic.Naming).Name} epic {epic}: an epic gets its key when the factory first reads an item of it "
-                + "(the dashboard's pipeline page shows it beside the item).")
-            : null;
+    private async Task<ControlResult?> UnknownEpicAsync(EpicRef epic, string done, CancellationToken ct)
+    {
+        var kind = WorkSourceRegistry.KindOf(epic.Naming);
+        var known = sources?.Invoke(epic.Naming) is { } source
+            ? await source.KnowsEpicAsync(epic.Id, ct)
+            : kind.KnowsEpic is null || await kind.KnowsEpic(contexts, epic.Id, ct);
+        return known
+            ? null
+            : new ControlResult(false, $"{ControlScope.Epic(epic)}: NOT {done}, and nothing was written. The factory has seen no "
+                + $"{kind.Name} epic {epic}: an epic gets its key when the factory first reads an item of it "
+                + "(the dashboard's pipeline page shows it beside the item), or ahead of that from "
+                + "`factory kanban key --epic <epic GUID>`.");
+    }
 
     private sealed record EpicResolution(List<string> InEpic, List<string> Unknown, List<string> Running);
 

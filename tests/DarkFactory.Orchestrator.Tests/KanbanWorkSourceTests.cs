@@ -787,6 +787,65 @@ public class KanbanWorkSourceTests
     // ---- Epics (sc-25985) ----
 
     [Fact]
+    public async Task An_epic_gets_a_key_ahead_of_its_items_only_once_it_is_read_from_the_board_and_keeps_it()
+    {
+        var h = new Harness();
+        var epic = h.Board.AddEpic(h.Project, "Word counting");
+
+        // An id the board does not know gets no key, and nothing is written to the board.
+        var unknown = await Assert.ThrowsAsync<KanbanException>(() => h.Source().EpicKeyOfAsync(Guid.NewGuid(), None));
+        Assert.Equal((KanbanException.NotFound, "get_epic"), (unknown.Code, unknown.Tool));
+        Assert.True(FactoryRunner.IsKanbanKeyFailure(unknown, None)); // `factory kanban key --epic`: its message, exit code 1
+        Assert.Empty(h.Board.Writes);
+        await using (var db = h.Db())
+        {
+            Assert.Empty(await db.KanbanEpics.ToListAsync());
+        }
+        // Nor one the board refuses to show (a project the token may not see).
+        h.Board.Instead = (tool, _) => tool == "get_epic" ? FakeKanbanBoard.Refusal("forbidden", "Not yours.") : null;
+        var hidden = await Assert.ThrowsAsync<KanbanException>(() => h.Source().EpicKeyOfAsync(epic.Id, None));
+        Assert.True(FactoryRunner.IsKanbanKeyFailure(hidden, None));
+        await using (var db = h.Db())
+        {
+            Assert.Empty(await db.KanbanEpics.ToListAsync());
+        }
+        h.Board.Instead = null;
+        h.Board.Calls.Clear();
+
+        var key = await h.Source().EpicKeyOfAsync(epic.Id, None);
+        var again = await h.Source().EpicKeyOfAsync(epic.Id, None); // a fresh source, as another run of the command
+
+        Assert.Equal((1, 1), (key, again));
+        Assert.Equal(["get_epic", "get_epic"], h.Board.Calls.Select(c => c.Tool));
+        Assert.Empty(h.Board.Writes);
+        await using (var db = h.Db())
+        {
+            var row = await db.KanbanEpics.SingleAsync();
+            Assert.Equal((1, epic.Id, h.Project.Id), (row.Id, row.EpicId, row.ProjectId));
+        }
+        Assert.True(await h.Source().KnowsEpicAsync(1, None));
+        // An item of the epic read later names it by that key.
+        var item = await h.Key(h.Board.AddItem(h.Project, "Count words", epic: epic));
+        Assert.Equal(1, (await h.Source().ReadSpecAsync(item, None)).Epic!.Id);
+    }
+
+    [Fact]
+    public async Task A_known_epics_project_is_recorded_again_when_it_changed_and_its_key_stays()
+    {
+        var h = new Harness();
+        var keys = new KanbanKeys(h.Contexts);
+        var (epic, p1, p2) = (Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid());
+
+        var first = await keys.EpicKeyAsync(epic, p1, None);
+        var second = await keys.EpicKeyAsync(epic, p2, None);
+
+        Assert.Equal(first, second);
+        await using var db = h.Db();
+        var row = await db.KanbanEpics.AsNoTracking().SingleAsync();
+        Assert.Equal((first, epic, p2), (row.Id, row.EpicId, row.ProjectId));
+    }
+
+    [Fact]
     public async Task An_epic_gets_one_ledger_key_recorded_before_the_spec_names_it_and_keeps_it()
     {
         var h = new Harness();

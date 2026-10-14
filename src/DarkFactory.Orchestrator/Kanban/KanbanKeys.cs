@@ -55,13 +55,19 @@ public sealed class KanbanKeys(IDbContextFactory<LedgerDbContext> contexts, Time
 
     /// <summary>
     /// The key of an epic (sc-25985), allocated now if the factory has not seen the epic before — so recorded before any work
-    /// item or control names it (E4) — with the project it is in.
+    /// item or control names it (E4) — with the project it is in, recorded again when the row has another (as an item's is:
+    /// the dashboard's epic link is built from the ledger).
     /// </summary>
     public async Task<int> EpicKeyAsync(Guid epicId, Guid projectId, CancellationToken ct)
     {
         await using var db = await contexts.CreateDbContextAsync(ct);
-        if (await db.KanbanEpics.AsNoTracking().SingleOrDefaultAsync(e => e.EpicId == epicId, ct) is { } known)
+        if (await db.KanbanEpics.SingleOrDefaultAsync(e => e.EpicId == epicId, ct) is { } known)
         {
+            if (known.ProjectId != projectId)
+            {
+                known.ProjectId = projectId;
+                await db.SaveChangesAsync(ct);
+            }
             return known.Id;
         }
         var row = new KanbanEpicKey { EpicId = epicId, ProjectId = projectId, FirstSeenAt = _time.GetUtcNow() };

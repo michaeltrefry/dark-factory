@@ -151,6 +151,7 @@ dotnet ef database update --project src/DarkFactory.Orchestrator
 dotnet ef migrations add <Name> --project src/DarkFactory.Orchestrator -o Ledger/Migrations
 dotnet run --project src/DarkFactory.Orchestrator -- run sc-1234             # or gh-12 (a released GitHub issue), kb-7 (a Kanban item)
 dotnet run --project src/DarkFactory.Orchestrator -- kanban key <item GUID>   # prints the item's kb-<n> (given now if it has none); only for an item `factory work` has not listed
+dotnet run --project src/DarkFactory.Orchestrator -- kanban key --epic <epic GUID>   # prints the epic's key kb-<n> (given now if it has none), so `pause|stop --epic kb-<n>` works before any item of the epic was read
 dotnet run --project src/DarkFactory.Orchestrator -- work          # long-running host: dashboard + session hub on 127.0.0.1 + the intake loop (polls every configured work source)
 dotnet run --project src/DarkFactory.Orchestrator -- dashboard set-password   # dashboard login (hash → keychain)
 dotnet run --project src/DarkFactory.Orchestrator -- pause --factory          # also continue/stop; --epic N (a Shortcut epic) | kb-N (a Kanban epic's key), or --item sc-N | gh-N | kb-N
@@ -494,8 +495,13 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `kb-1` the epic may both exist); nothing of an epic key is written onto the board. `WorkEpic.Id` is that key (for Shortcut the
   epic's own number), never null. The same migration adds `kanban_items.ProjectId` (nullable: the item's project GUID, recorded
   with the key and again whenever the item is listed with none or another), which with `kanban_epics` is all the dashboard's links
-  need (below). Residual, accepted: an epic has no key — so no scope a person could pause — until the factory has read one item
-  of it; the pipeline page shows the key beside the item from then on.
+  need (below); an epic's project is recorded again likewise when its row has another. An epic no item of which the factory has
+  read yet gets its key ahead from `factory kanban key --epic <epic GUID>` (`FactoryRunner.KanbanEpicKeyAsync` →
+  `KanbanWorkSource.EpicKeyOfAsync`: like the item form it reads the epic from the board first — `get_epic`, read only; one the
+  board does not know or will not show the token gets no key row, exit 1 with the message, `FactoryRunner.IsKanbanKeyFailure` —
+  records GUID → key and project, prints `kb-<n>`, and is idempotent, the unique index deciding a race), so `factory pause|stop
+  --epic kb-<n>` works before its first item is claimed: an item of it read later gets the same key and is held by the row. The
+  command takes exactly one of an item GUID and `--epic <GUID>`. The pipeline page shows the key beside the item once one is read.
 - GitHub issues (sc-25385, `Issues/`): `IssueIntake` polls each watched repo's open issues updated since its ledger cursor
   (`github_issue_cursors`; the first poll of a repo starts from now, no backfill). Each issue gets a key (`github_issues`) and a
   work item `gh-<key>` that waits Paused/parked (`awaiting triage`) until released. Each issue version (sha of title+body) is
@@ -669,7 +675,11 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   epic's key if needed). An epic its source says cannot exist is refused before anything is written
   (`IWorkSource.KnowsEpicAsync`: true by default — any number may be a Shortcut epic, pausable before the factory has seen it; a
   Kanban key the ledger never gave out is refused, "The factory has seen no KanbanBoard epic kb-7 …", since a row for it would
-  land on whichever epic is given that key later); a source that is not configured cannot be asked and is not.
+  land on whichever epic is given that key later; the refusal names the remedy, `factory kanban key --epic <epic GUID>`). The
+  check needs no credential: where the epic's source is not configured (no Kanban write token, or a dashboard host with no
+  registry) its kind answers from the ledger alone (`WorkSourceKind.KnowsEpic`, as `Links` does: `KanbanKeys.KnowsEpicAsync`), so
+  an unknown key is refused there too, while a known epic's control is written whether or not its board can be reached (its
+  items with no recorded epic are then reported as unknown, as before).
   Residual risk: the worker loads the target repo's `.claude/settings.json` (`--setting-sources project,local`), which
   can set `disableAllHooks` and so switch off the pause hook; the pause grace still stops such a worker (session and
   worktree kept), only not at a tool boundary.

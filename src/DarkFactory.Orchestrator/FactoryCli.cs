@@ -14,7 +14,7 @@ public static class FactoryCli
         Func<CancellationToken, Task<int>> work,
         Func<CancellationToken, Task<int>> setDashboardPassword,
         Func<string, string, CancellationToken, Task<int>> control,
-        Func<Guid, CancellationToken, Task<int>>? kanbanKey = null)
+        Func<Guid, bool, CancellationToken, Task<int>>? kanbanKey = null)
     {
         var storyArgument = new Argument<WorkSources.ItemRef?>("item-id")
         {
@@ -101,7 +101,8 @@ public static class FactoryCli
 
         var kanbanItemArgument = new Argument<Guid>("item-id")
         {
-            Description = "The item's id on KanbanBoard (a GUID)",
+            Description = "The item's id on KanbanBoard (a GUID); left out with --epic",
+            Arity = ArgumentArity.ZeroOrOne,
             CustomParser = result =>
             {
                 var token = result.Tokens.Single().Value;
@@ -113,12 +114,39 @@ public static class FactoryCli
                 return default;
             },
         };
+        var kanbanEpicOption = new Option<Guid?>("--epic")
+        {
+            Description = "An epic's id on KanbanBoard (a GUID), in place of an item's: print the epic's key (kb-<number>), giving it one if the factory has read no item of the epic yet; `factory pause|stop --epic kb-<number>` then takes it",
+            CustomParser = result =>
+            {
+                var token = result.Tokens.Single().Value;
+                if (Guid.TryParse(token, out var id))
+                {
+                    return id;
+                }
+                result.AddError($"'{token}' is not a KanbanBoard epic id (expected a GUID).");
+                return null;
+            },
+        };
         var kanbanKeyCommand = new Command("key",
-            "Print the work item id (kb-<number>) of a KanbanBoard item, giving it one if the factory has not seen the item yet; `factory run kb-<number>` then runs it. `factory work` gives every item it lists its id by itself: this is for an item it has not listed.")
+            "Print the work item id (kb-<number>) of a KanbanBoard item, giving it one if the factory has not seen the item yet; `factory run kb-<number>` then runs it. `factory work` gives every item it lists its id by itself: this is for an item it has not listed. With --epic <epic id> instead of an item: print the key of a KanbanBoard epic (also kb-<number>, a number space of its own), giving it one if the factory has read no item of the epic yet, so that the epic can be paused or stopped (`factory pause --epic kb-<number>`) before its first item runs.")
         {
             kanbanItemArgument,
+            kanbanEpicOption,
         };
-        kanbanKeyCommand.SetAction((parse, ct) => kanbanKey is null ? Task.FromResult(1) : kanbanKey(parse.GetValue(kanbanItemArgument), ct));
+        kanbanKeyCommand.Validators.Add(result =>
+        {
+            // Exactly one of the two: an item id, or --epic with an epic id.
+            var item = result.GetResult(kanbanItemArgument) is { Tokens.Count: > 0 };
+            var epic = result.GetResult(kanbanEpicOption) is not null;
+            if (item == epic)
+            {
+                result.AddError("Give exactly one of an item id (a GUID) or --epic <epic id>.");
+            }
+        });
+        kanbanKeyCommand.SetAction((parse, ct) => kanbanKey is null ? Task.FromResult(1)
+            : parse.GetValue(kanbanEpicOption) is { } epic ? kanbanKey(epic, true, ct)
+            : kanbanKey(parse.GetValue(kanbanItemArgument), false, ct));
 
         return new RootCommand("Dark Factory orchestrator")
         {
