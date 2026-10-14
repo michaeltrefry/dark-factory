@@ -78,7 +78,9 @@ public class OwnProcessTests
     /// <summary>
     /// Nothing in the test projects sends a signal except <see cref="OwnProcess"/> (its file is the only one allowed a raw
     /// kill): no <c>Process.Kill</c>, no <c>kill(2)</c> import, no <c>kill</c>/<c>pkill</c>/<c>killall</c>/<c>killpg</c>
-    /// command or call in a script a test writes — except the listed lines, which are the launch helper's seam (its own
+    /// command or call in a script a test writes, or in a script file under <c>tests/</c> (a fixture's <c>.sh</c>/<c>.pl</c>, any
+    /// file with a <c>#!</c> line: the iOS probe, sc-26126, once bounded its steps with a perl timer that signalled a process
+    /// group) — except the listed lines, which are the launch helper's seam (its own
     /// guard: <see cref="SafeHelperTests"/>) and text that is only checked, never run with a real <c>kill</c>.
     /// The patterns are assembled so this file does not match them itself.
     /// </summary>
@@ -118,24 +120,29 @@ public class OwnProcessTests
 
         var testsRoot = Path.Combine(SandboxSupport.RepoRoot, "tests");
         var separator = Path.DirectorySeparatorChar;
-        var files = Directory.EnumerateFiles(testsRoot, "*.cs", SearchOption.AllDirectories)
+        // C# sources, and every script a test runs as it is (a fixture's shell or perl script, or any file with a #! line).
+        string[] scripts = [".sh", ".bash", ".zsh", ".pl", ".py"];
+        var files = Directory.EnumerateFiles(testsRoot, "*", SearchOption.AllDirectories)
             .Where(f => !f.Contains($"{separator}bin{separator}") && !f.Contains($"{separator}obj{separator}"))
+            .Where(f => Path.GetExtension(f) == ".cs" || scripts.Contains(Path.GetExtension(f)) || HasShebang(f))
             .ToList();
         Assert.Contains(files, f => Path.GetFileName(f) == ownerFiles[0]);
         Assert.Contains(files, f => f.Contains($"{separator}DarkFactory.AcceptanceTests{separator}"));
+        Assert.Contains(files, f => f.EndsWith($"ios-probe{separator}probe.sh", StringComparison.Ordinal)); // scripts are read too
 
         var violations = new List<string>();
         var used = new HashSet<string>();
         foreach (var file in files.Where(f => !ownerFiles.Contains(Path.GetFileName(f))))
         {
             var name = Path.GetFileName(file);
+            var comment = Path.GetExtension(file) == ".cs" ? "//" : "#";
             var lines = File.ReadAllLines(file);
             for (var i = 0; i < lines.Length; i++)
             {
                 var trimmed = lines[i].Trim();
                 // A script in a C# string starts its lines after a \n (or \t) escape: matched as the line break it is.
                 var code = trimmed.Replace("\\n", " ").Replace("\\t", " ");
-                if (trimmed.StartsWith("//", StringComparison.Ordinal) || !rawKill.IsMatch(code))
+                if (trimmed.StartsWith(comment, StringComparison.Ordinal) || !rawKill.IsMatch(code))
                 {
                     continue;
                 }
@@ -153,5 +160,12 @@ public class OwnProcessTests
         Assert.True(violations.Count == 0, "violations:\n" + string.Join("\n", violations));
         var unused = allowed.SelectMany(kv => kv.Value.Select(l => $"{kv.Key}|{l}")).Where(a => !used.Contains(a)).ToList();
         Assert.True(unused.Count == 0, "allowances that match no line: " + string.Join("; ", unused));
+    }
+
+    private static bool HasShebang(string file)
+    {
+        using var stream = File.OpenRead(file);
+        Span<byte> head = stackalloc byte[2];
+        return stream.Read(head) == 2 && head[0] == (byte)'#' && head[1] == (byte)'!';
     }
 }
