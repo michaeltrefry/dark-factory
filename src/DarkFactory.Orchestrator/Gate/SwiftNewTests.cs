@@ -49,8 +49,8 @@ public sealed record SwiftNewTestSet(IReadOnlyList<ChangedFile> TestFiles, IRead
 /// Runs, from the worktree root per package holding a new test: <c>swift --version</c> (a toolchain probe: failing, the
 /// run is <see cref="TestRunStatus.ToolchainMissing"/>), <c>/bin/mkdir -p</c> of the run's results directory (SwiftPM
 /// writes no report into a directory that does not exist), <c>swift package resolve</c> (the restore: the only step that
-/// may use the network), <c>swift build --build-tests</c> (the build, its standard output kept as the build log), then
-/// one <c>swift test --skip-build --disable-xctest --filter ^&lt;id&gt;(/|$) --xunit-output …</c> per new test (Swift
+/// may use the network), <c>swift build --build-system native --build-tests</c> (the build, its standard output kept as
+/// the build log; <see cref="BuildSystem"/>), then one <c>swift test --build-system native --skip-build --disable-xctest --filter ^&lt;id&gt;(/|$) --xunit-output …</c> per new test (Swift
 /// Testing matches the filter against the test's id followed by its source location), each reading only its own report
 /// and keeping its exit code, which the report must agree with. Results: Swift Testing's xUnit XML
 /// report (<see cref="ParseResults"/>). A base that does not build with the PR's test files is explained from swiftc's
@@ -357,8 +357,19 @@ public sealed class SwiftNewTests : INewTestStrategy
     public static string Filter(string id) => "^" + Regex.Replace(id, @"[^A-Za-z0-9_\u0080-￿]", @"\$0") + "(/|$)";
 
     /// <summary>
+    /// The build system every build and test step names (<c>--build-system native</c>), never the toolchain's default.
+    /// <see cref="ParseBuildErrors"/> reads the native build system's output: swiftc's diagnostics on standard output, plain
+    /// text. SwiftPM 6.4 made <c>swiftbuild</c> the default, which writes them to standard error, in colour, after its own
+    /// <c>error: SwiftCompile … failed …</c> echo — read as it is, every base that does not build would be an
+    /// <c>error</c> ("names no compiler error"). Named on both steps so <c>swift test --skip-build</c> finds the build's
+    /// products. A toolchain that no longer knows the flag fails the build with an error naming no file: unattributable,
+    /// an <c>error</c>, never a pass.
+    /// </summary>
+    public const string BuildSystem = "native";
+
+    /// <summary>
     /// <c>swift --version</c>; <c>/bin/mkdir -p</c> of the results directory; per package <c>swift package resolve</c> (the
-    /// only step that may use the network) and <c>swift build --build-tests</c> (output kept as the build log); then per new
+    /// only step that may use the network) and <c>swift build --build-system native --build-tests</c> (output kept as the build log); then per new
     /// test one <c>swift test --skip-build --disable-xctest --filter … --xunit-output &lt;results&gt;/</c><see cref="ReportName"/>,
     /// reading that report alone and keeping the step's exit code (<see cref="OutputName"/>).
     /// Run from the worktree root with <c>--package-path</c>.
@@ -378,13 +389,13 @@ public sealed class SwiftNewTests : INewTestStrategy
             new(TestPhase.Restore, MakeDirectory, ["-p", resultsDirectory]),
         };
         steps.AddRange(byPackage.Select(g => new TestStep(TestPhase.Restore, Swift, ["package", "--package-path", g.Key, "resolve"])));
-        steps.AddRange(byPackage.Select((g, n) => new TestStep(TestPhase.Build, Swift, ["build", "--package-path", g.Key, "--build-tests"]) { CaptureOutput = $"swift-build-{n}" }));
+        steps.AddRange(byPackage.Select((g, n) => new TestStep(TestPhase.Build, Swift, ["build", "--package-path", g.Key, "--build-system", BuildSystem, "--build-tests"]) { CaptureOutput = $"swift-build-{n}" }));
         foreach (var id in byPackage.SelectMany(g => g.Select(id => (Id: id, Package: g.Key))))
         {
             // Its own report only (a pattern naming exactly it), and its exit code, which the report must agree with.
             steps.Add(new TestStep(TestPhase.Test, Swift,
             [
-                "test", "--package-path", id.Package, "--skip-build", "--disable-xctest", "--filter", Filter(id.Id),
+                "test", "--package-path", id.Package, "--build-system", BuildSystem, "--skip-build", "--disable-xctest", "--filter", Filter(id.Id),
                 "--xunit-output", $"{resultsDirectory}/{ReportName(id.Id)}",
             ]) { ResultFilePattern = ReportName(id.Id), CaptureOutput = OutputName(id.Id) });
         }

@@ -427,11 +427,11 @@ public class SwiftRunOutputTests
             "Restore /bin/mkdir -p .results",
             "Restore swift package --package-path . resolve",
             "Restore swift package --package-path ./tools/cli resolve",
-            "Build swift build --package-path . --build-tests",
-            "Build swift build --package-path ./tools/cli --build-tests",
-            @$"Test swift test --package-path . --skip-build --disable-xctest --filter ^WordsTests\.blank\(\)(/|$) --xunit-output .results/{SwiftNewTests.ReportName("WordsTests.blank()")}",
-            @$"Test swift test --package-path . --skip-build --disable-xctest --filter ^WordsTests\.Spaces\/double\(\)(/|$) --xunit-output .results/{SwiftNewTests.ReportName("WordsTests.Spaces/double()")}",
-            @$"Test swift test --package-path ./tools/cli --skip-build --disable-xctest --filter ^ToolTests\.runs\(\)(/|$) --xunit-output .results/{SwiftNewTests.ReportName("ToolTests.runs()")}",
+            "Build swift build --package-path . --build-system native --build-tests",
+            "Build swift build --package-path ./tools/cli --build-system native --build-tests",
+            @$"Test swift test --package-path . --build-system native --skip-build --disable-xctest --filter ^WordsTests\.blank\(\)(/|$) --xunit-output .results/{SwiftNewTests.ReportName("WordsTests.blank()")}",
+            @$"Test swift test --package-path . --build-system native --skip-build --disable-xctest --filter ^WordsTests\.Spaces\/double\(\)(/|$) --xunit-output .results/{SwiftNewTests.ReportName("WordsTests.Spaces/double()")}",
+            @$"Test swift test --package-path ./tools/cli --build-system native --skip-build --disable-xctest --filter ^ToolTests\.runs\(\)(/|$) --xunit-output .results/{SwiftNewTests.ReportName("ToolTests.runs()")}",
         ], steps.Select(s => $"{s.Phase} {s.Program} {string.Join(' ', s.Args)}"));
         Assert.Equal(["swift-build-0", "swift-build-1"], steps.Where(s => s.Phase == TestPhase.Build).Select(s => s.CaptureOutput));
         // Each test step reads exactly its own report (no wildcard another test's file could match) and keeps its exit code.

@@ -2833,7 +2833,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   the base does not declare, a version-specific manifest, an id declared twice, a backticked name, an unreadable changed file
   that may hold tests. Runs (`SandboxTestRunner`, as `_factory`): `swift --version` (toolchain), `/bin/mkdir -p` of the
   results directory (SwiftPM writes no report into a missing one), `swift package resolve` (the restore, the only network
-  step), `swift build --build-tests` (stdout kept as the build log), then per test `swift test --skip-build --disable-xctest
+  step), `swift build --build-system native --build-tests` (stdout kept as the build log; the build system pinned, `SwiftNewTests.BuildSystem`:
+  SwiftPM 6.4's default `swiftbuild` writes swiftc's diagnostics to stderr, coloured, which the parser does not read — a base that
+  does not build would always be an `error`), then per test `swift test --build-system native --skip-build --disable-xctest
   --filter '^<id escaped>(/|$)' --xunit-output <results>/swift-test-<16 hex of the id's SHA-256>.xml` (Swift Testing matches
   the filter against the id followed by `/<file>:<line>:<col>`; verified against Swift 6.3.2, whose report for Swift Testing
   names a case by `classname` `<target>.<Type>.<Nested>` and `name` `f()`, with `<failure>`/`<skipped>` children and suite
