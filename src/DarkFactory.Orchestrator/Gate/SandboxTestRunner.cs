@@ -88,11 +88,11 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
             try
             {
                 var (exit, output, timedOut, _) = await RunStepAsync(worktree, step, CleanupTimeout, CancellationToken.None);
-                log.AppendLine($"$ {step.Program} {string.Join(' ', step.Args)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
+                log.AppendLine($"$ {Describe(step)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
             }
             catch (Exception e) when (e is not OutOfMemoryException)
             {
-                log.AppendLine($"$ {step.Program} {string.Join(' ', step.Args)} → could not be run: {e.Message}");
+                log.AppendLine($"$ {Describe(step)} → could not be run: {e.Message}");
             }
         }
         return log.ToString();
@@ -124,11 +124,11 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
                     break;
                 }
                 var (exit, output, timedOut, captured) = await RunStepAsync(workspace.Path, step, deadline - DateTimeOffset.UtcNow, ct);
-                log.AppendLine($"$ {step.Program} {string.Join(' ', step.Args)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
+                log.AppendLine($"$ {Describe(step)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
                 for (var fallback = step.Fallback; !timedOut && exit == TestStep.InvalidCommandLine && fallback is not null; fallback = fallback.Fallback)
                 {
                     (exit, output, timedOut, captured) = await RunStepAsync(workspace.Path, fallback, deadline - DateTimeOffset.UtcNow, ct);
-                    log.AppendLine($"$ {fallback.Program} {string.Join(' ', fallback.Args)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
+                    log.AppendLine($"$ {Describe(fallback)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
                 }
                 if (timedOut)
                 {
@@ -136,7 +136,7 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
                 }
                 if (exit != 0 && step.Phase == TestPhase.Toolchain)
                 {
-                    log.AppendLine($"{step.Program} is not available to the gate's test runs{(Sandbox is null ? "" : $" as {Sandbox.User}")} (`{step.Program} {string.Join(' ', step.Args)}` exited {exit}): "
+                    log.AppendLine($"{step.Program} is not available to the gate's test runs{(Sandbox is null ? "" : $" as {Sandbox.User}")} (`{Describe(step)}` exited {exit}): "
                         + $"install it where the test runs' PATH finds it{(Sandbox is null ? "" : " (the launch helper's fixed PATH: /opt/homebrew/bin, /usr/local/bin, …)")}.");
                     return TestRunReport.Failed(TestRunStatus.ToolchainMissing, log.ToString());
                 }
@@ -328,6 +328,13 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
             capture?.Add(line);
         }
     }
+
+    /// <summary>
+    /// A step's command line for the run's log: an argument longer than 200 characters (the iOS simulator steps' script,
+    /// sc-26132) is shown as its length, so the log's tail is the steps' output, not a script repeated.
+    /// </summary>
+    internal static string Describe(TestStep step) =>
+        string.Join(' ', step.Args.Select(a => a.Length > 200 ? $"<{a.Length} characters>" : a).Prepend(step.Program));
 
     /// <summary>The variables an unsandboxed run keeps from the owner's environment (no secrets: never the router key or a token).</summary>
     private static readonly string[] PassThrough = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "DOTNET_ROOT"];

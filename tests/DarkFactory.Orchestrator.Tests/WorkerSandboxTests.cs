@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.Worker;
 
@@ -1897,6 +1898,86 @@ public class LiveWorkerSandboxTests
         var listing = ps.StandardOutput.ReadToEnd() + ps.StandardError.ReadToEnd();
         ps.WaitForExit();
         return listing;
+    }
+
+    /// <summary>
+    /// sc-26132 (P5 S6): the gate's iOS new-tests check as each configured slot's sandbox user, exactly as production runs it —
+    /// <see cref="SandboxTestRunner"/> over the slot pool, the INSTALLED xcodebuild wrapper, the compiled-in simulator script through
+    /// the slot's helper: the fixture app (Fixtures/xcode-ios) with a new XCTest unit test and a new XCUITest, each failing on the
+    /// base and passing on the head on the run's own simulator (cloned from that user's kept template, created on demand — the
+    /// first run per user boots it once, minutes), every simulator step that needs it booted in one helper run. Needs
+    /// <c>Worker:Swift=true</c> (setup with <c>--swift</c>) and the factory's owner logged in at the console (an Aqua session).
+    /// Slow (minutes per slot); like every live probe it kills every process of each sandbox user: run it with no factory running.
+    /// What it leaves: each user's template simulator (kept by design); the run devices, worktrees and DerivedData are removed.
+    /// </summary>
+    [Fact]
+    public async Task The_ios_gate_runs_a_new_unit_test_and_ui_test_on_a_simulator_as_each_sandbox_user()
+    {
+        await RequireSlotsAsync();
+        var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets());
+        if (!options.WorkerSwift)
+        {
+            Assert.Skip("Worker:Swift is off: the iOS gate runs only in a factory with Worker:Swift=true (setup-worker-user.sh --swift).");
+        }
+        if (options.WorkerSlots is not { } pool)
+        {
+            Assert.Skip("Worker:RunAs=none: there is no sandbox user to run the gate as.");
+            return;
+        }
+        foreach (var slot in pool.All)
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(60));
+            var ct = timeout.Token;
+            var dir = Path.Combine(FactoryOptions.DefaultSandboxWorkRoot, $"test-ios-gate-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(dir);
+            try
+            {
+                var (remote, seed) = (Path.Combine(dir, "remote.git"), Path.Combine(dir, "seed"));
+                TestGit.Run(dir, "init", "--bare", "-b", "main", remote);
+                TestGit.Run(dir, "init", "-b", "main", seed);
+                void Write(string path, string content)
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(seed, path))!);
+                    File.WriteAllText(Path.Combine(seed, path), content);
+                }
+                string Commit(string branch)
+                {
+                    TestGit.Run(seed, "add", "-A");
+                    TestGit.Run(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", branch);
+                    TestGit.Run(seed, "push", "-q", remote, branch);
+                    return TestGit.Run(seed, "rev-parse", "HEAD").Trim();
+                }
+                foreach (var (path, content) in XcodeIosFixture.Files())
+                {
+                    Write(path, content);
+                }
+                var baseSha = Commit("main");
+                TestGit.Run(seed, "checkout", "-q", "-b", "factory/sc-7");
+                foreach (var (path, content) in XcodeIosFixture.Head)
+                {
+                    Write(path, content!);
+                }
+                var headSha = Commit("factory/sc-7");
+                var git = new GitWorkspace(Path.Combine(dir, "work"), _ => remote, (_, _) => Task.FromResult<string?>(null), sandbox: pool);
+
+                var result = await pool.HoldAsync(slot.Number, _ => NewTestsCheck.RunAsync(new SandboxTestRunner(git, pool, TimeSpan.FromMinutes(45)),
+                    NewTestsCheck.StrategiesFor(swift: true), new RepoRef("acme", "tally"), baseSha, headSha, "gate-sc-7",
+                    line => TestContext.Current.TestOutputHelper?.WriteLine(line), ct), ct);
+
+                TestContext.Current.TestOutputHelper?.WriteLine($"worker {slot}: {result.Outcome}: {result.Reason}");
+                Assert.True(result.Outcome == NewTestsOutcome.Pass, $"worker {slot}: {result.Outcome}: {result.Reason}");
+                Assert.Equal([(XcodeIosFixture.UnitTestId, "failed", "passed"), (XcodeIosFixture.UiTestId, "failed", "passed")],
+                    result.Tests.Select(t => (t.Test, t.Base, t.Head)).OrderBy(t => t.Test, StringComparer.Ordinal));
+            }
+            finally
+            {
+                await pool.HoldAsync(slot.Number, s => s.Sandbox.DeleteAsWorkerAsync(dir, CancellationToken.None).ContinueWith(_ => 0), CancellationToken.None);
+                if (Directory.Exists(dir))
+                {
+                    Directory.Delete(dir, recursive: true);
+                }
+            }
+        }
     }
 
     private static bool ProcessExists(int pid)

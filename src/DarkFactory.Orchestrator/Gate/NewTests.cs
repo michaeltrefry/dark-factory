@@ -200,6 +200,9 @@ public record NewTestSet(IReadOnlyList<ChangedFile> TestFiles, IReadOnlyList<str
     /// the base (a Rust file's <c>#[cfg(test)]</c> modules grafted into its base version, <see cref="CargoNewTests"/>).
     /// </summary>
     public IReadOnlyDictionary<string, string> BaseReplacements { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
+
+    /// <summary>What the strategy chose that the result should say (sc-26132: the platform a target building for both is tested on).</summary>
+    public IReadOnlyList<string> Notes { get; init; } = [];
 }
 
 /// <summary>
@@ -505,7 +508,8 @@ public static class NewTestsCheck
                     remaining = remaining.Except(failure.NotBuilt, StringComparer.Ordinal).ToList();
                 }
             }
-            results.Add(Judge(baseSha, headSha, strategy.Name, set.Tests, evidence, headRun));
+            var judged = Judge(baseSha, headSha, strategy.Name, set.Tests, evidence, headRun);
+            results.Add(set.Notes.Count == 0 ? judged : judged with { Reason = $"{judged.Reason} ({string.Join("; ", set.Notes)})" });
         }
         return results.FirstOrDefault(r => !r.Passed) ?? results[0] with
         {

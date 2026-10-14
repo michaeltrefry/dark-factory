@@ -22,12 +22,13 @@ namespace DarkFactory.Orchestrator.Gate;
 /// </para>
 /// <para>
 /// Unisolable (<c>unsupported</c>, never a pass and never <c>no-tests</c>): a changed file that adds tests, or looks like a
-/// test file, but that no unit-test target compiles (not a member of its test target, or of a UI-test or other target); a
+/// test file, but that no unit-test or UI-test target compiles (not a member of its test target, or only of another target); a
 /// file the base run would apply that another target also compiles, at the head or at the base (its head production code
 /// would reach the base run); a file whose membership cannot be read, or a project that cannot be read; an existing
 /// parameterized test whose arguments change, and a test-looking XCTest method the gate cannot run apart (sc-26129, as for
 /// SwiftPM: <see cref="SwiftXCTest"/>); a backticked name or an id with characters the xcodebuild wrapper refuses; an id declared
-/// twice; a target that builds for anything but macOS in its scheme's test configuration (iOS: a later story); a test
+/// twice; a target the gate cannot test (<see cref="XcodeProject.TestPlatform"/>: macOS or an iOS Simulator only, and no macOS
+/// UI tests); a target tested on another platform at the base; a test
 /// bundle not named for its target (<see cref="XcodeProject.ProductNameProblem"/>); no shared scheme
 /// (<c>xcshareddata/xcschemes</c>) whose test action — or its default test plan (<see cref="XcodeTestPlan"/>, read whole or
 /// not at all) — runs the target, at the head or at the base; a new test that plan skips or does not select; a project named by more than one workspace; a base that lacks the target; and a base project whose
@@ -58,6 +59,17 @@ namespace DarkFactory.Orchestrator.Gate;
 /// runs however the run ended. <see cref="GateMode"/> puts the SwiftPM checkouts inside that DerivedData, never the user's
 /// shared ones every worker session can edit.
 /// </para>
+/// <para>
+/// iOS (sc-26132): an iOS unit-test or UI-test target (<see cref="XcodeProject.TestPlatform"/>) runs on the run's own iOS
+/// Simulator. Since every exit of the launch helper kills every process of its user — CoreSimulatorService and a booted
+/// simulator included — everything that needs the simulator booted is ONE step, one helper run. The steps, all
+/// <c>/bin/bash -c</c> <see cref="SimulatorScript"/> (the gate's own code, compiled in) but the build: <c>prepare</c> (a
+/// <see cref="TestPhase.Restore"/> step: refused outside a GUI login session, naming why; the runtime; the slot user's kept
+/// template, created and booted once on demand; the run's device <see cref="DeviceName"/> cloned from it), the build for that
+/// device by name, <c>session</c> (a <see cref="TestPhase.Test"/> step: boot, then per test the wrapper's
+/// <c>test-without-building</c> and xcresulttool into <c>xcode-test-&lt;hash&gt;.json</c>, its exit codes on its output
+/// <see cref="SessionOutput"/>), and <c>remove</c> (a <see cref="TestPhase.Cleanup"/> step: the run's device deleted).
+/// </para>
 /// </summary>
 public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWrapperPath) : INewTestStrategy
 {
@@ -70,7 +82,10 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
 
     public const string Xcrun = "/usr/bin/xcrun";
 
-    /// <summary>This Mac: the only destination this strategy builds and tests for (iOS simulators are a later story; a device never, E3).</summary>
+    /// <summary>
+    /// This Mac: a macOS test target's destination. An iOS one's (sc-26132) is the run's own simulator,
+    /// <c>platform=iOS Simulator,name=</c><see cref="DeviceName"/> to build and <c>…,id=&lt;udid&gt;</c> to test; a device never (E3).
+    /// </summary>
     public const string Destination = "platform=macOS";
 
     /// <summary>The wrapper's action that deletes the working directory's DerivedData (and the gate's package checkouts in it).</summary>
@@ -92,6 +107,38 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
 
     /// <summary>The name xcresulttool's JSON of that bundle is kept under.</summary>
     public static string JsonName(string id) => $"{Prefix}{Hash(id)}.json";
+
+    // ---- iOS Simulator (sc-26132) ----------------------------------------------------------------------------------------
+
+    /// <summary>The shell the simulator steps run under: <c>/bin/bash -c</c> <see cref="SimulatorScript"/>.</summary>
+    public const string Bash = "/bin/bash";
+
+    /// <summary>How long a simulator may take to boot (a fresh template's first boot migrates its data: about 2 minutes as a sandbox user, sc-26126).</summary>
+    public const int BootTimeoutSeconds = 600;
+
+    /// <summary>The name the iOS simulator session's output and exit code are kept under.</summary>
+    public const string SessionOutput = "xcode-ios-session.out";
+
+    /// <summary>
+    /// <c>scripts/factory-ios-simulator</c> as the repository has it, compiled in: the gate's own code (never installed, never a
+    /// worker's), run as <c>/bin/bash -c &lt;text&gt; factory-ios-simulator &lt;command&gt; …</c> by the run's user.
+    /// </summary>
+    public static string SimulatorScript { get; } = ReadScript();
+
+    private static string ReadScript()
+    {
+        using var stream = typeof(XcodeNewTests).Assembly.GetManifestResourceStream("factory-ios-simulator")
+            ?? throw new InvalidOperationException("The factory-ios-simulator resource is missing from the build.");
+        using var reader = new StreamReader(stream);
+        return reader.ReadToEnd();
+    }
+
+    /// <summary>The run's own simulator: <c>dark-factory-gate-&lt;16 hex of the SHA-256 of the run's random results directory&gt;</c>.</summary>
+    public static string DeviceName(string resultsDirectory) => $"dark-factory-gate-{Hash(resultsDirectory)}";
+
+    private static TestStep Simulator(TestPhase phase, IReadOnlyList<string> args) => new(phase, Bash, ["-c", SimulatorScript, "factory-ios-simulator", .. args]);
+
+    private static readonly Regex SessionResult = new(@"^factory-ios-simulator: result (?<hash>[0-9a-f]{16}) test-exit (?<test>\d{1,3}) xcresulttool-exit (?<json>\d{1,3})$", RegexOptions.CultureInvariant);
 
     private static readonly Regex KeptName = new(@"^xcode-test-(?<hash>[0-9a-f]{16})\.(?<kind>out|json)$", RegexOptions.CultureInvariant);
 
@@ -127,13 +174,16 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
     }
 
     /// <summary>The way a test's project is built: the container flag and path, and the scheme (<see cref="NewTestSet.Projects"/>'s value).</summary>
-    private sealed record Build(string Flag, string Container, string Scheme)
+    private sealed record Build(string Flag, string Container, string Scheme, string Platform = XcodeProject.MacOS)
     {
-        public override string ToString() => $"{Flag}\n{Container}\n{Scheme}";
+        public override string ToString() => Platform == XcodeProject.MacOS ? $"{Flag}\n{Container}\n{Scheme}" : $"{Flag}\n{Container}\n{Scheme}\n{Platform}";
 
-        public static Build From(string value) => value.Split('\n') is [var flag, var container, var scheme]
-            ? new Build(flag, container, scheme)
-            : throw new InvalidOperationException($"'{value}' is not an Xcode build of a new test.");
+        public static Build From(string value) => value.Split('\n') switch
+        {
+            [var flag, var container, var scheme] => new Build(flag, container, scheme),
+            [var flag, var container, var scheme, XcodeProject.IOS] => new Build(flag, container, scheme, XcodeProject.IOS),
+            _ => throw new InvalidOperationException($"'{value}' is not an Xcode build of a new test."),
+        };
     }
 
     /// <summary>How a target is built and tested: its build, its scheme's test configuration and, when the scheme runs a test plan, the plan's path and its entry for the target; or why it cannot be.</summary>
@@ -398,13 +448,13 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                     {
                         unknown.Add($"{projectPath}: {why}");
                     }
-                    else if (membership.Member && target.IsUnitTests)
+                    else if (membership.Member && target.IsTestBundle)
                     {
                         tests.Add((project, target));
                     }
                     else if (membership.Member)
                     {
-                        others.Add($"{target.Name} of {projectPath}{(target.ProductType == XcodeTarget.UITestBundle ? " (a UI-test target, which the gate does not run)" : "")}");
+                        others.Add($"{target.Name} of {projectPath}");
                     }
                 }
             }
@@ -495,7 +545,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                 var added = functions.Where(t => !before.Contains(Key(t))).Select(Key).ToList();
                 if (added.Count > 0 || NewTestsCheck.LooksLikeTest(path))
                 {
-                    var where = others.Count > 0 ? $"it is compiled only by {string.Join(", ", others)}, not by a unit-test target"
+                    var where = others.Count > 0 ? $"it is compiled only by {string.Join(", ", others)}, not by a unit-test or UI-test target"
                         : (await head.ProjectsAsync(ct)).Count == 0 ? "it is in no SwiftPM package and there is no Xcode project"
                         : "it is not a member of any test target (add it to its test target: put it in the target's synchronized folder, or add it to the target's Compile Sources)";
                     problems.Add(added.Count > 0 ? $"{path} adds test(s) {string.Join(", ", added)} the gate cannot run: {where}"
@@ -549,13 +599,13 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
         {
             var (projectPath, targetName) = (key[..key.IndexOf('\n')], key[(key.IndexOf('\n') + 1)..]);
             if ((await head.ProjectsAsync(ct)).FirstOrDefault(p => p.Path == projectPath).Project is not { } project
-                || project.Targets.FirstOrDefault(t => t.Name == targetName && t.IsUnitTests) is not { } target)
+                || project.Targets.FirstOrDefault(t => t.Name == targetName && t.IsTestBundle) is not { } target)
             {
                 continue; // the target is gone at the head: no test of it runs
             }
             var (headFiles, headUnknown) = await head.ModuleAsync(project, target, ct);
             var baseProject = (await @base.ProjectsAsync(ct)).FirstOrDefault(p => p.Path == projectPath).Project;
-            var baseTarget = baseProject?.Targets.FirstOrDefault(t => t.Name == targetName && t.IsUnitTests);
+            var baseTarget = baseProject?.Targets.FirstOrDefault(t => t.Name == targetName && t.IsTestBundle);
             var baseFiles = baseProject is not null && baseTarget is not null ? (await @base.ModuleAsync(baseProject, baseTarget, ct)).Files : [];
             var (now, before) = (SwiftXCTest.Discover(headFiles), SwiftXCTest.Discover(baseFiles));
             // A head problem is new unless its place was a test or a problem at the base: one that was only a test-looking
@@ -608,7 +658,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
         {
             var (projectPath, targetName) = (key[..key.IndexOf('\n')], key[(key.IndexOf('\n') + 1)..]);
             if ((await head.ProjectsAsync(ct)).FirstOrDefault(p => p.Path == projectPath).Project is not { } project
-                || project.Targets.FirstOrDefault(t => t.Name == targetName && t.IsUnitTests) is not { } target)
+                || project.Targets.FirstOrDefault(t => t.Name == targetName && t.IsTestBundle) is not { } target)
             {
                 continue; // the target is gone at the head: no test of it runs
             }
@@ -676,6 +726,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
 
         // Each target with new tests: its scheme and platform at the head and the base, and the base compiling the new files.
         var projects = new Dictionary<string, string>(StringComparer.Ordinal);
+        var notes = new SortedSet<string>(StringComparer.Ordinal);
         var edits = new Dictionary<(string Project, string Target), (List<string> Add, List<string> Remove)>();
         foreach (var group in news.GroupBy(n => (n.Value.Project.Path, n.Value.Target.Name)))
         {
@@ -696,9 +747,18 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
             {
                 groupProblems.Add($"the scheme name {build.Scheme} has characters the xcodebuild wrapper refuses");
             }
-            if (project.BuildsForMac(target, configuration!) is { Mac: false } headPlatform)
+            var (platform, platformWhy, platformNote) = project.TestPlatform(target, configuration!);
+            if (platform is null)
             {
-                groupProblems.Add($"{label} is not a macOS target in its scheme's {configuration} configuration ({headPlatform.Why}): iOS and other destinations are not run by the gate yet");
+                groupProblems.Add($"{label} cannot be tested by the gate in its scheme's {configuration} configuration: {platformWhy}");
+            }
+            else
+            {
+                build = build with { Platform = platform };
+                if (platformNote is not null)
+                {
+                    notes.Add(platformNote);
+                }
             }
             if (project.ProductNameProblem(target, configuration!) is { } headName)
             {
@@ -706,7 +766,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
             }
             groupProblems.AddRange(PlanExcludes(headPlan, "the head", group.Select(n => n.Key), target.Name));
             var baseProject = (await @base.ProjectsAsync(ct)).FirstOrDefault(p => p.Path == project.Path);
-            var baseTarget = baseProject.Project?.Targets.FirstOrDefault(t => t.Name == target.Name && t.IsUnitTests);
+            var baseTarget = baseProject.Project?.Targets.FirstOrDefault(t => t.Name == target.Name && t.IsTestBundle);
             if (baseProject.Project is null || baseTarget is null)
             {
                 groupProblems.Add(baseProject.Problem is { } why ? $"the base's {why}" : $"the base has no {label} (a new test target), so its new tests cannot be run on the base");
@@ -714,13 +774,14 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
             else
             {
                 var (baseBuild, baseConfiguration, baseProblem, basePlan) = await @base.BuildOfAsync(baseProject.Project, baseTarget, ct);
-                if (baseBuild is null || baseBuild.ToString() != build.ToString())
+                if (baseBuild is null || baseBuild with { Platform = build.Platform } != build)
                 {
                     groupProblems.Add(baseBuild is null ? $"at the base {baseProblem}" : $"the base tests {label} with the scheme {baseBuild.Scheme} of {baseBuild.Container}, the head with {build.Scheme} of {build.Container}");
                 }
-                else if (baseProject.Project.BuildsForMac(baseTarget, baseConfiguration!) is { Mac: false } basePlatform)
+                else if (platform is not null && baseProject.Project.TestPlatform(baseTarget, baseConfiguration!) is var (basePlatform, baseWhy, _) && basePlatform != platform)
                 {
-                    groupProblems.Add($"{label} is not a macOS target at the base ({basePlatform.Why})");
+                    groupProblems.Add(basePlatform is null ? $"{label} cannot be tested by the gate at the base: {baseWhy}"
+                        : $"{label} is tested on {platform} at the head but on {basePlatform} at the base, so the two runs would not run the same tests");
                 }
                 else if (baseProject.Project.ProductNameProblem(baseTarget, baseConfiguration!) is { } baseName)
                 {
@@ -801,7 +862,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                     break;
                 }
                 var project = XcodeProject.Parse(byProject.Key, text);
-                (text, problem) = project.Targets.Where(t => t.Name == targetName && t.IsUnitTests).ToList() is [var target]
+                (text, problem) = project.Targets.Where(t => t.Name == targetName && t.IsTestBundle).ToList() is [var target]
                     ? project.WithClassicSources(text, target, add, remove)
                     : (null, $"the base does not have exactly one unit-test target {targetName}");
                 if (problem is not null)
@@ -818,7 +879,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
             testFiles.Add(new ChangedFile('M', pbxproj, pbxproj));
         }
 
-        return new NewTestSet(testFiles.Distinct().ToList(), news.Keys.ToList(), problems) { Projects = projects, BaseReplacements = replacements };
+        return new NewTestSet(testFiles.Distinct().ToList(), news.Keys.ToList(), problems) { Projects = projects, BaseReplacements = replacements, Notes = [.. notes] };
 
         (List<string> Add, List<string> Remove) Edits(string project, string target) =>
             edits.TryGetValue((project, target), out var e) ? e : edits[(project, target)] = ([], []);
@@ -852,13 +913,23 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
             // nothing a worker session of the same user left there is built on or run. Failing, the run is an error.
             new(TestPhase.Restore, wrapperPath, [CleanDerivedData]),
         };
+        // iOS (sc-26132): the run's own simulator, cloned from the slot user's kept template, named from the results directory
+        // (random per run) so the build can name it, and removed again however the run ends.
+        var ios = groups.Where(g => Build.From(g.Key).Platform == XcodeProject.IOS).ToList();
+        var device = DeviceName(resultsDirectory);
+        var bootSeconds = BootTimeoutSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        if (ios.Count > 0)
+        {
+            steps.Add(Simulator(TestPhase.Restore, ["prepare", device, bootSeconds]));
+        }
         for (var n = 0; n < groups.Count; n++)
         {
             var b = Build.From(groups[n].Key);
-            steps.Add(new TestStep(TestPhase.Build, wrapperPath, [GateMode, "build-for-testing", b.Flag, b.Container, "-scheme", b.Scheme, "-destination", Destination, "-quiet"])
+            var destination = b.Platform == XcodeProject.IOS ? $"platform=iOS Simulator,name={device}" : Destination;
+            steps.Add(new TestStep(TestPhase.Build, wrapperPath, [GateMode, "build-for-testing", b.Flag, b.Container, "-scheme", b.Scheme, "-destination", destination, "-quiet"])
                 { CaptureOutput = $"xcode-build-{n}" });
         }
-        foreach (var group in groups)
+        foreach (var group in groups.Where(g => Build.From(g.Key).Platform == XcodeProject.MacOS))
         {
             var b = Build.From(group.Key);
             foreach (var id in group)
@@ -871,7 +942,20 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                 steps.Add(new TestStep(TestPhase.Test, Xcrun, ["xcresulttool", "get", "test-results", "tests", "--path", bundle]) { CaptureOutput = JsonName(id) });
             }
         }
-        // And again once the bundles are read, however the run ended (SandboxTestRunner runs it after a failed build or a timeout too).
+        if (ios.Count > 0)
+        {
+            // Everything that needs the booted simulator in ONE helper run (its exit kills the simulator): boot, each test
+            // alone, xcresulttool of each bundle, shutdown. Its output says each test's exit codes; the JSONs are files.
+            var records = ios.SelectMany(g => g.SelectMany(id => Build.From(g.Key) is var b ? new[] { b.Flag, b.Container, b.Scheme, id, Hash(id) } : []));
+            steps.Add(Simulator(TestPhase.Test, ["session", device, resultsDirectory, wrapperPath, bootSeconds, .. records])
+                with { CaptureOutput = SessionOutput, ResultFilePattern = $"{Prefix}*.json" });
+        }
+        // Last, however the run ended (SandboxTestRunner runs cleanup after a failed build or a timeout too): the run's device,
+        // then the DerivedData again once the bundles are read.
+        if (ios.Count > 0)
+        {
+            steps.Add(Simulator(TestPhase.Cleanup, ["remove", device]));
+        }
         steps.Add(new TestStep(TestPhase.Cleanup, wrapperPath, [CleanDerivedData]));
         return Task.FromResult<IReadOnlyList<TestStep>>(steps);
     }
@@ -891,16 +975,46 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
         var results = new Dictionary<string, List<TestCaseResult>>(StringComparer.Ordinal);
         var unreadable = new List<string>();
         var kept = new Dictionary<string, (ResultFile? Out, ResultFile? Json)>(StringComparer.Ordinal);
-        foreach (var file in resultFiles)
+        var files = resultFiles.ToList();
+        // The iOS simulator session (sc-26132): its lines give each test's two exit codes; the JSONs it wrote are files.
+        var session = new Dictionary<string, (int Test, int Json)>(StringComparer.Ordinal);
+        foreach (var output in files.Where(f => f.Name == SessionOutput && f.ExitCode is not null))
         {
-            if (KeptName.Match(file.Name) is not { Success: true } match || file.ExitCode is null)
+            foreach (var line in output.Content.Split('\n').Select(l => l.TrimEnd('\r')))
+            {
+                if (SessionResult.Match(line) is { Success: true } m && !session.TryAdd(m.Groups["hash"].Value, (int.Parse(m.Groups["test"].Value), int.Parse(m.Groups["json"].Value))))
+                {
+                    unreadable.Add($"{SessionOutput}: it reports xcode-test-{m.Groups["hash"].Value} twice");
+                }
+            }
+            if (output.ExitCode != 0)
+            {
+                var why = output.Content.Split('\n').Where(l => l.StartsWith("factory-ios-simulator: ", StringComparison.Ordinal) && !SessionResult.IsMatch(l)).TakeLast(3).ToList();
+                unreadable.Add($"{SessionOutput}: the iOS simulator session failed (exit {output.ExitCode}){(why.Count == 0 ? "" : ": " + string.Join(" ", why))}");
+            }
+        }
+        foreach (var hash in session.Keys)
+        {
+            kept[hash] = (new ResultFile($"{Prefix}{hash}.out", "") { ExitCode = session[hash].Test }, null);
+        }
+        foreach (var file in files.Where(f => f.Name != SessionOutput))
+        {
+            var match = KeptName.Match(file.Name);
+            var fromSession = match.Success && file.ExitCode is null && match.Groups["kind"].Value == "json" && session.ContainsKey(match.Groups["hash"].Value);
+            if (!match.Success || (file.ExitCode is null && !fromSession))
             {
                 unreadable.Add($"{file.Name}: it is not the output of a test step");
                 continue;
             }
             var hash = match.Groups["hash"].Value;
+            var current = fromSession ? file with { ExitCode = session[hash].Json } : file;
             var pair = kept.GetValueOrDefault(hash);
-            kept[hash] = match.Groups["kind"].Value == "out" ? pair with { Out = file } : pair with { Json = file };
+            if ((match.Groups["kind"].Value == "out" ? pair.Out : pair.Json) is not null)
+            {
+                unreadable.Add($"{file.Name}: a second report of the same test");
+                continue;
+            }
+            kept[hash] = match.Groups["kind"].Value == "out" ? pair with { Out = current } : pair with { Json = current };
         }
         foreach (var (hash, (output, json)) in kept.OrderBy(k => k.Key, StringComparer.Ordinal))
         {

@@ -20,7 +20,7 @@ Claude Code headless workers through the Weave router.
   review and merge gate (`Gate/`: `ReviewModels` (which panel calls count), `ReviewPanel` (roles, prompts, findings),
   `Reviewer.cs` (`IReviewer`/`RouterReviewer`) reading the router's stream with `MessageStream`, `GatePolicy` (+ `RiskyPaths`)
   and the path tiers `PathTiers`, `MergeGate`, `FixLoop`, `CiHeal`, `MergeQueue`, the test-only `GateCheckSeam`, the new-tests
-  check `NewTests.cs` (`NewTestsCheck`)/`XunitNewTests`/`CargoNewTests` (Rust, over the lexer-level `RustSource`)/`SwiftNewTests` (Swift Testing, over `SwiftSource`, sc-26127)/`XcodeNewTests` (Xcode projects' macOS tests, over `XcodeProject.cs`, sc-26131)/`SandboxTestRunner`,
+  check `NewTests.cs` (`NewTestsCheck`)/`XunitNewTests`/`CargoNewTests` (Rust, over the lexer-level `RustSource`)/`SwiftNewTests` (Swift Testing, over `SwiftSource`, sc-26127)/`XcodeNewTests` (Xcode projects' macOS tests, sc-26131, and iOS ones on a simulator, sc-26132, over `XcodeProject.cs`)/`SandboxTestRunner`,
   the plan-time check of a repository's CI workflow triggers `CiTriggers.cs` (sc-25873; pipeline side `RunPipeline.CiTriggers.cs`);
   reviewer prompts in `factory/prompts/`; GitHub side
   `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`, the merge gate and queue `RunPipeline.MergeQueue.cs`),
@@ -2312,7 +2312,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `sudo xcodebuild -downloadPlatform iOS`) and the wrapper (usage, exit 64); a failure is factory-wide and names the slot and
   user and the fix (`sudo xcodebuild -runFirstLaunch`, `sudo xcodebuild -license accept`, `sudo scripts/setup-worker-user.sh
   [--slots n] --swift`). The probe does NOT check CoreSimulator, a simulator runtime or a simulator device (`-showsdks` lists SDKs
-  and boots nothing); those are the simulator stories' (S0/S6). Setup installs the wrapper always and checks the same five
+  and boots nothing); the iOS gate checks its session and runtime per run (sc-26132, below). Setup installs the wrapper always and checks the same five
   commands per user through each helper: with `--swift` required — every slot is checked, then every failing user is named
   (`The Swift toolchain is not usable by: _factory (worker slot 1); …`) and it exits 1; without it only reported, and skipped
   (`skipped: no Xcode selected`) when `xcode-select -p` fails. Residuals, accepted: (a) the wrapper is the only xcodebuild
@@ -3087,6 +3087,52 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   test alone on the base and the head, a file planted in the head run's DerivedData beforehand and both runs' DerivedData
   gone afterwards; skipped without Xcode), `GateCloneTests.A_cleanup_step_runs_after_every_other_step_however_the_run_ended`,
   `XcodebuildWrapperTests` (`--gate`, `clean-derived-data`, a link at the key removed and not followed, the refusals).
+  iOS apps on a simulator (Phase 5 S6, sc-26132; `XcodeNewTests`, `XcodeProject.TestPlatform`, `scripts/factory-ios-simulator`).
+  Which platform a test target runs on (`TestPlatform`, its `SDKROOT`/`SUPPORTED_PLATFORMS` in the scheme's test configuration):
+  `macosx` → macOS, `iphoneos`/`iphonesimulator` → an iOS Simulator; one building for both is picked deterministically and the
+  result says which (`NewTestSet.Notes`, appended to the check's reason): a unit-test target on macOS, a UI-test target on iOS.
+  UI-test targets (`XcodeTarget.IsTestBundle`) are now test targets: an iOS one runs (XCUITest), a macOS one is `unsupported`
+  (XCUITest on macOS needs automation mode and an Accessibility grant the sandbox user cannot be given); tvOS/watchOS/visionOS,
+  devices and generic iOS stay refused (E3), and so does a target tested on another platform at the base than at the head.
+  Hosted unit tests and a UI test's target application are built by `build-for-testing` as the scheme says. Runs: every exit of
+  the launch helper kills every process of its user, CoreSimulatorService and the booted simulator included (sc-26126), so
+  everything that needs the simulator booted is ONE step. The simulator steps run `/bin/bash -c <scripts/factory-ios-simulator,
+  compiled in as a resource, XcodeNewTests.SimulatorScript> factory-ios-simulator <command> …` as the item's slot's user through
+  its helper — the gate's own code, never installed (the wrapper is unchanged: no setup re-run): `prepare <device> 600` (a
+  Restore step) refuses, exit 69, unless `launchctl managername` (as that user) is `Aqua` — "The factory must run inside the
+  owner's GUI login session (a Terminal or a LaunchAgent of the owner logged in at the console), not from ssh or as a
+  LaunchDaemon, for the gate's iOS simulator checks" — and without an available iOS runtime or iPhone type (17, 16, 16e, 15),
+  naming it; deletes earlier runs' devices (`dark-factory-gate-<16 hex>`) and templates of another runtime; keeps one template
+  per user and runtime (`dark-factory-gate-template-<runtime>`, created and booted ONCE on demand — the first boot migrates data,
+  minutes — then shut down and kept) in that user's own device set; and clones it as the run's device
+  (`XcodeNewTests.DeviceName`: `dark-factory-gate-` + 16 hex of the run's random results directory). The build (`--gate
+  build-for-testing … -destination platform=iOS Simulator,name=<device>`) is its own step as before. `session <device> <results>
+  <wrapper> 600 <flag> <container> <scheme> <id> <hash>…` (a Test step) boots the device (bounded: `did not boot within N s`,
+  exit 70), runs each test alone (`--gate test-without-building … -destination platform=iOS Simulator,id=<udid> -only-testing:<id>
+  -resultBundlePath <results>/xcode-test-<hash>.xcresult`) and `xcresulttool` of its bundle into `<results>/xcode-test-<hash>.json`,
+  prints `factory-ios-simulator: result <hash> test-exit <n> xcresulttool-exit <m>` per test, and shuts the device down. `remove
+  <device>` (a Cleanup step) deletes the run's device however the run ended. `ParseResults` reads the session's output
+  (`xcode-ios-session.out`) and only the JSON files it reported, each judged exactly as a macOS test's (exit codes agreeing,
+  every case the step's test); a session that failed, a JSON it did not report, a test reported twice or a second report of
+  one test is unreadable — an `error`, never a result. A refused prepare is a `restore-failed` error whose reason carries the
+  script's line. The log shows an argument over 200 characters as `<N characters>` (`SandboxTestRunner.Describe`). With
+  `Worker:Swift` off nothing of this runs (E7). Residuals, accepted: (a) the template lives in the sandbox user's device set,
+  which every worker session of that slot can reach (as `~/.cargo`): a planted template's state would be cloned into the gate's
+  runs, on both commits; (b) within a session the tests of one commit share one booted device, and a process a test leaves
+  inside the simulator could change a later test's bundle or JSON before it is read — tests lying about tests, as (a) under
+  cargo; (c) it needs the factory inside the owner's Aqua session (sc-26126): from ssh or as a LaunchDaemon every iOS check is
+  an error naming why. Do not assume a slot has no process after a simulator run (an Apple per-user agent may be respawned;
+  S0's finding). Tests: `XcodeIosTests` (platforms, identification, steps, the session's results, a recorded iOS UI bundle,
+  `Fixtures/xcresult/ios-ui-passed.json`, the refusal's reason, macOS UI/tvOS/platform change unsupported, both platforms on
+  macOS with the note, E7), `IosSimulatorScriptTests` (a copy of the script over stub `launchctl`/`xcrun`: the Aqua refusal for
+  `prepare` and `session` with nothing touched, no runtime, the template kept and only the gate's leftovers deleted, the
+  session's per-test calls and lines, a boot timeout, the names it refuses), `XcodeIosRunnerTests` (the real toolchain as the
+  OWNER: `Fixtures/xcode-ios`, an iOS app with a hosted XCTest unit-test target and a UI-test target, a new unit test and a new
+  UI test failing on the base and passing on the head on a simulator; the devices it made and the DerivedData deleted after;
+  skipped without Xcode, an iOS runtime or an Aqua session; about 7 minutes with a fresh template). Live, not run by default
+  (kills every process of each sandbox user; the owner's OK first): `FACTORY_SANDBOX_LIVE=1 Worker__Swift=true dotnet test
+  --project tests/DarkFactory.Orchestrator.Tests -- --filter-method "*The_ios_gate_runs_a_new_unit_test_and_ui_test_on_a_simulator_as_each_sandbox_user"`
+  (each configured slot, `Worker__Slots=2` for two; the installed wrapper; leaves each user's template).
   Upgrading from Phase 1: Review is now a handled state, so the first `factory work` picks up every item parked at Review:
   an open PR is reviewed by the panel like any other (Phase 1's missing `implementer-model` no longer matters, sc-25379),
   and one the owner merged or closed escalates once with a story comment ("merged outside the factory"). An item whose
