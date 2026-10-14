@@ -106,6 +106,31 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                     b.ToTable("github_issue_cursors", (string)null);
                 });
 
+            modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.KanbanEpicKey", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<Guid>("EpicId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTimeOffset>("FirstSeenAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<Guid>("ProjectId")
+                        .HasColumnType("uuid");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("EpicId")
+                        .IsUnique();
+
+                    b.ToTable("kanban_epics", (string)null);
+                });
+
             modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.KanbanItem", b =>
                 {
                     b.Property<int>("Id")
@@ -118,6 +143,9 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                         .HasColumnType("timestamp with time zone");
 
                     b.Property<Guid>("ItemId")
+                        .HasColumnType("uuid");
+
+                    b.Property<Guid?>("ProjectId")
                         .HasColumnType("uuid");
 
                     b.HasKey("Id");

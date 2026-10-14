@@ -609,16 +609,13 @@ public class CodeGraphRiskTests
     private static readonly DateTimeOffset Start = new(2026, 10, 8, 12, 0, 0, TimeSpan.Zero);
 
     /// <summary>
-    /// A gate whose waits run on a <see cref="SteppingClock"/> of one-minute steps, with a CI timeout of five. The overlay wait's own
-    /// timeout is an hour: it is a timer on the same clock, and every timer created moves that clock on a whole step from another
-    /// thread, so a timeout shorter than a step (the default reader's 5 s) fires at an arbitrary moment of the wait it bounds — before
-    /// the overlay is even requested, when the machine is loaded — and the wait then answers <c>timed-out</c> instead of what
-    /// CodeGraph would have answered (a second <c>codegraph-overlay</c> row, and no impact read in that poll).
+    /// A gate whose waits run on a <see cref="SteppingClock"/> of one-minute steps, with a CI timeout of five. The harness bounds
+    /// the default reader's overlay wait for the fake clock (<see cref="FakeCodeGraphRisk.FakeClockOverlayTimeout"/>), so the CI
+    /// timeout is what ends the wait.
     /// </summary>
     private static Harness OnSteppingClock(FakeCodeGraphRisk codeGraph) => new()
     {
         GateOnFakeClock = true, Time = new SteppingClock(Start, TimeSpan.FromMinutes(1)), CiTimeout = TimeSpan.FromMinutes(5), CodeGraph = codeGraph,
-        RiskReader = new CodeGraphRiskReader(codeGraph, TimeSpan.FromHours(1), TimeSpan.FromMilliseconds(1)),
     };
 
     [Fact]
@@ -651,7 +648,7 @@ public class CodeGraphRiskTests
         var h = new Harness
         {
             GateOnFakeClock = true, Time = clock, CiTimeout = TimeSpan.FromMinutes(5), CodeGraph = codeGraph,
-            RiskReader = new CodeGraphRiskReader(codeGraph, TimeSpan.FromHours(1), TimeSpan.FromMinutes(1)),
+            RiskReader = new CodeGraphRiskReader(codeGraph, FakeCodeGraphRisk.FakeClockOverlayTimeout, TimeSpan.FromMinutes(1)),
         };
 
         var outcome = await h.Run().WaitAsync(TimeSpan.FromSeconds(60));

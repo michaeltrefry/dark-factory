@@ -93,10 +93,16 @@ dashboard or the CLI, which write the same control rows in the ledger (`controls
 second and the dashboard redraws on `NOTIFY`.
 
 ```sh
-dotnet run --project src/DarkFactory.Orchestrator -- pause --factory       # or --epic 123 / --item sc-1234
+dotnet run --project src/DarkFactory.Orchestrator -- pause --factory       # or --epic 123 (a Shortcut epic) / --epic kb-3 (a Kanban epic) / --item sc-1234
 dotnet run --project src/DarkFactory.Orchestrator -- continue --factory
 dotnet run --project src/DarkFactory.Orchestrator -- stop --item sc-1234   # --epic / --factory stop every active item there
+dotnet run --project src/DarkFactory.Orchestrator -- kanban key --epic <epic GUID>   # a Kanban epic's key (kb-<n>), given now if it has none
 ```
+
+A Kanban epic is named by a key the ledger gives it (`kb-<n>`; the pipeline page shows it beside the epic's items). It gets
+one when the factory first reads an item of it, or ahead of that from `factory kanban key --epic <epic GUID>` (the epic is
+read from the board, nothing is written to it), so the epic can be paused or stopped before its first item is claimed.
+`factory kanban key <item GUID>` does the same for an item (`factory run kb-<n>`). A key the ledger never gave out is refused.
 
 - **Pause**: nothing new is claimed (a paused factory lists no ready stories; a story in a paused epic
   is not claimed) and no next step starts. A running worker stops after its current tool call: every

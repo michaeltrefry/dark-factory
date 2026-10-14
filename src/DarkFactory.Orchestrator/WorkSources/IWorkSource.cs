@@ -34,10 +34,11 @@ public sealed record WorkStory(int Id, string Name, string? Description, string 
 }
 
 /// <param name="Id">
-/// The epic's number on its board, which an epic-scope control addresses (<c>epic:&lt;id&gt;</c>); null for a board whose epics have
-/// none (Kanban: its epics are GUIDs), so no epic control reaches the item.
+/// The epic's id as the ledger holds it (<see cref="Ledger.WorkItem.EpicId"/>) and an epic-scope control names it, within the
+/// item's source (<see cref="ItemNaming.Epic"/>): a Shortcut epic's own number (<c>epic:12</c>), or the key the ledger gave a Kanban
+/// epic, whose board id is a GUID (<c>epic:kb-3</c>; sc-25985) — recorded before the source answers with it (E4).
 /// </param>
-public sealed record WorkEpic(int? Id, string Name, string? Description, string AppUrl);
+public sealed record WorkEpic(long Id, string Name, string? Description, string AppUrl);
 
 public sealed record WorkDocument(string Title, string? Markdown, string AppUrl);
 
@@ -246,6 +247,28 @@ public interface IWorkSource
     /// (the default).
     /// </summary>
     Task<bool> ReturnUnstartedAsync(int id, string comment, CancellationToken ct) => Task.FromResult(false);
+
+    /// <summary>
+    /// Whether <paramref name="epic"/> can be an epic of this source (sc-25985), asked before an epic-scope Pause or Stop writes
+    /// anything. True (the default) for a source whose epics are named by their own number on the board (Shortcut: any number may
+    /// be an epic, and one may be paused before the factory has seen it); a source whose epics are named by a ledger key answers
+    /// whether the ledger gave that key out — a control on any other key names nothing today and would land on whichever epic is
+    /// given the key later. Reads the ledger only, never the board.
+    /// </summary>
+    Task<bool> KnowsEpicAsync(long epic, CancellationToken ct) => Task.FromResult(true);
+}
+
+/// <summary>Links to one item on its board (<see cref="IBoardLinks"/>); null where the ledger does not hold what the link needs.</summary>
+public sealed record BoardLink(string? Item, string? Epic);
+
+/// <summary>
+/// A source's links to its items for the dashboard (sc-25985), built from the ledger alone: the dashboard reads the ledger and
+/// never asks a board (E8). <see cref="OfAsync"/> answers for the items of its own source among those given, by the work
+/// item's ledger id; an item it leaves out is shown without a link.
+/// </summary>
+public interface IBoardLinks
+{
+    Task<IReadOnlyDictionary<long, BoardLink>> OfAsync(Ledger.LedgerDbContext db, IReadOnlyList<Ledger.WorkItem> items, CancellationToken ct);
 }
 
 /// <summary>

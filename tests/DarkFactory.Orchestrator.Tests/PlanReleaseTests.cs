@@ -1283,7 +1283,7 @@ public class PlanReleasePipelineTests
         Assert.Equal(FakeShortcutBoard.InProgress, h.State(b));
     }
 
-    public static TheoryData<string> PausingScopes => [ControlScope.Factory, ControlScope.Epic(42), ControlScope.Item($"sc-{PlanId}"), ControlScope.Freeze];
+    public static TheoryData<string> PausingScopes => [ControlScope.Factory, ControlScope.Epic(ItemNaming.Shortcut.Epic(42)), ControlScope.Item($"sc-{PlanId}"), ControlScope.Freeze];
 
     [Theory]
     [MemberData(nameof(PausingScopes))]

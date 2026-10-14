@@ -197,6 +197,31 @@ public sealed class KanbanItem
     /// <summary>The item's id on the board.</summary>
     public Guid ItemId { get; set; }
 
+    /// <summary>
+    /// The board id of the item's project, as last seen (sc-25985): what the dashboard's link to the item is built from
+    /// (<see cref="Kanban.KanbanLedgerLinks"/> — it reads the ledger only). Null for a row written before it was recorded, until
+    /// the item is next listed or read.
+    /// </summary>
+    public Guid? ProjectId { get; set; }
+
+    public DateTimeOffset FirstSeenAt { get; set; }
+}
+
+/// <summary>
+/// A KanbanBoard epic the factory has seen, and the key (<see cref="Id"/>) the ledger and an epic-scope control name it by
+/// (<see cref="WorkItem.EpicId"/>, <c>epic:kb-&lt;Id&gt;</c>; sc-25985): the board's own id is a GUID, and a bare number already
+/// means a Shortcut epic. One row per epic for good, written before the key is used anywhere (<see cref="Kanban.KanbanKeys"/>, E4).
+/// </summary>
+public sealed class KanbanEpicKey
+{
+    public int Id { get; set; }
+
+    /// <summary>The epic's id on the board.</summary>
+    public Guid EpicId { get; set; }
+
+    /// <summary>The board id of the epic's project: what a link to the epic is built from.</summary>
+    public Guid ProjectId { get; set; }
+
     public DateTimeOffset FirstSeenAt { get; set; }
 }
 
@@ -213,6 +238,7 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
     public DbSet<GitHubIssue> GitHubIssues => Set<GitHubIssue>();
     public DbSet<GitHubIssueCursor> GitHubIssueCursors => Set<GitHubIssueCursor>();
     public DbSet<KanbanItem> KanbanItems => Set<KanbanItem>();
+    public DbSet<KanbanEpicKey> KanbanEpics => Set<KanbanEpicKey>();
     public DbSet<WorkItem> WorkItems => Set<WorkItem>();
     public DbSet<LedgerEntry> LedgerEntries => Set<LedgerEntry>();
     public DbSet<WorkerSession> WorkerSessions => Set<WorkerSession>();
@@ -285,6 +311,11 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
         {
             e.ToTable("kanban_items");
             e.HasIndex(x => x.ItemId).IsUnique();
+        });
+        modelBuilder.Entity<KanbanEpicKey>(e =>
+        {
+            e.ToTable("kanban_epics");
+            e.HasIndex(x => x.EpicId).IsUnique();
         });
         modelBuilder.Entity<SessionTaint>(e =>
         {

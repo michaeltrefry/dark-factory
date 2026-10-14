@@ -1636,7 +1636,7 @@ public sealed partial class RunPipeline(
     /// <summary>Whether a user's Pause holds the item: on the factory, its epic, the item itself or the plan it is a story of (sc-25876).</summary>
     private async Task<bool> UserPausedAsync(WorkItem item)
     {
-        List<string> scopes = item.EpicId is { } epic
+        List<string> scopes = ItemNaming.EpicOf(item.ExternalId, item.EpicId) is { } epic
             ? [ControlScope.Factory, ControlScope.Epic(epic), ControlScope.Item(item.ExternalId)]
             : [ControlScope.Factory, ControlScope.Item(item.ExternalId)];
         if (item.PlanItemId is { } plan && await ledger.ItemAsync(plan, CancellationToken.None) is { } planItem)

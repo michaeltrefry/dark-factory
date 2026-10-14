@@ -216,6 +216,20 @@ public static class FactoryRunner
     }
 
     /// <summary>
+    /// <c>factory kanban key --epic &lt;epic id&gt;</c> (sc-25985): the key <c>kb-&lt;n&gt;</c> of a KanbanBoard epic by its board id,
+    /// given to it now if the factory has read no item of it yet (<see cref="Kanban.KanbanWorkSource.EpicKeyOfAsync"/>: the epic
+    /// must be on the board; nothing is written to it) — what <c>factory pause|stop --epic kb-&lt;n&gt;</c> then takes, so an epic
+    /// can be held before its first item is claimed. Failures are reported as the item form's (<see cref="IsKanbanKeyFailure"/>).
+    /// </summary>
+    public static async Task<string> KanbanEpicKeyAsync(FactoryOptions options, Guid epicId, CancellationToken ct)
+    {
+        using var kanbanHttp = OutboundHttp.KanbanApi(options.KanbanMcpUrl);
+        var source = WorkSourceRegistry.Kanban(options, kanbanHttp);
+        await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
+        return ItemNaming.Kanban.Epic(await source.EpicKeyOfAsync(epicId, ct)).ToString();
+    }
+
+    /// <summary>
     /// Whether <paramref name="ex"/> is a failure <c>factory kanban key</c> reports by its message with exit code 1, rather than
     /// a stack trace: the board refusing or not answering (<see cref="Kanban.KanbanException"/> and any other
     /// <see cref="InvalidOperationException"/>, <see cref="HttpRequestException"/>, an HTTP timeout — a
