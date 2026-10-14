@@ -51,8 +51,13 @@ public class SwiftToolchainTests
     private string InstalledWrapper(string? text = null) => SandboxSupport.Executable(_dir, $"factory-xcodebuild-{Guid.NewGuid():N}",
         text ?? File.ReadAllText(Path.Combine(SandboxSupport.RepoRoot, "scripts", "factory-xcodebuild")));
 
-    private SwiftToolchain Toolchain(int firstLaunch = 0, int license = 0, int swiftExit = 0, string? wrapper = null, string sdks = "macosx iphonesimulator") =>
-        new(Swift(swiftExit), Xcodebuild(firstLaunch, license, sdks), wrapper ?? InstalledWrapper());
+    /// <summary>A fake launchctl: <c>managername</c> answers <paramref name="manager"/> (a GUI login session's is <c>Aqua</c>).</summary>
+    private string Launchctl(string manager = "Aqua") => SandboxSupport.Executable(_dir, $"launchctl-{Guid.NewGuid():N}",
+        $"#!/bin/sh\n[ \"$1\" = managername ] || exit 2\necho {manager}\n");
+
+    private SwiftToolchain Toolchain(int firstLaunch = 0, int license = 0, int swiftExit = 0, string? wrapper = null, string sdks = "macosx iphonesimulator",
+        string manager = "Aqua") =>
+        new(Swift(swiftExit), Xcodebuild(firstLaunch, license, sdks), wrapper ?? InstalledWrapper(), LaunchctlPath: Launchctl(manager));
 
     /// <summary>Two slots, each its own fake helper and user, each with its own toolchain.</summary>
     private WorkerSlots Pool(SwiftToolchain? first, SwiftToolchain? second)
@@ -90,6 +95,7 @@ public class SwiftToolchainTests
             Assert.Contains($"{helper} {swift.XcodebuildPath} -license check", ran);
             Assert.Contains($"{helper} {swift.XcodebuildPath} -showsdks", ran);
             Assert.Contains($"{helper} {swift.WrapperPath}", ran);
+            Assert.Contains($"{helper} {swift.LaunchctlPath} managername", ran); // its launchd session, as that user (sc-26132)
         }
         // Each slot's probe ran through its own helper only.
         Assert.DoesNotContain(HelpersRan, l => l.StartsWith("_dftest ", StringComparison.Ordinal) && l.Contains(second.XcodebuildPath, StringComparison.Ordinal));
@@ -103,6 +109,8 @@ public class SwiftToolchainTests
         { "no-ios-simulator", "-showsdks` as _dftest2 lists no iOS Simulator SDK (-sdk iphonesimulator…): install the iOS platform (`sudo xcodebuild -downloadPlatform iOS`)" },
         { "no-sdks", "-showsdks` as _dftest2 lists no macOS SDK (-sdk macosx…) and no iOS Simulator SDK (-sdk iphonesimulator…)" },
         { "wrapper", "the xcodebuild wrapper" },
+        // sc-26132 (S0's requirement (1)): outside a GUI login session no simulator boots, so the slot is refused here, not item by item.
+        { "not-aqua", "managername` as _dftest2 answers 'Background', not 'Aqua', so the gate's iOS simulator checks cannot run as it" },
     };
 
     [Theory]
@@ -116,6 +124,7 @@ public class SwiftToolchainTests
             "swift" => Toolchain(swiftExit: 127),
             "no-ios-simulator" => Toolchain(sdks: "macosx driverkit"),
             "no-sdks" => Toolchain(sdks: ""),
+            "not-aqua" => Toolchain(manager: "Background"),
             // Installed, current by its text (so start-up passes), but not runnable as the user.
             _ => Toolchain() with { WrapperPath = Path.Combine(_dir, "not-executable") },
         };
@@ -130,7 +139,9 @@ public class SwiftToolchainTests
 
         Assert.Contains("Worker slot 2 (_dftest2): Swift toolchain (Worker:Swift) of _dftest2", ex.Message);
         Assert.Contains(why, ex.Message);
-        Assert.Contains("sudo scripts/setup-worker-user.sh --slots 2 --swift", ex.Message);
+        Assert.Contains(what == "not-aqua"
+            ? "run the factory inside the owner's GUI login session (a Terminal or a LaunchAgent of the owner logged in at the console), not from ssh or as a LaunchDaemon — CLAUDE.md, \"iOS simulator and UI tests as a sandbox user\""
+            : "sudo scripts/setup-worker-user.sh --slots 2 --swift", ex.Message);
     }
 
     [Fact]

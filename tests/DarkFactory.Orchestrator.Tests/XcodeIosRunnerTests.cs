@@ -9,9 +9,9 @@ namespace DarkFactory.Orchestrator.Tests;
 /// <summary>
 /// sc-26132: the real toolchain — the repo's xcodebuild wrapper and simulator script over the real xcodebuild and simulator, as
 /// the OWNER (never a sandbox user), building the fixture iOS app for its own simulator and running a new unit test and a new UI
-/// test alone on the base and the head, judged from the real result bundles. Skipped without Xcode, an iOS Simulator runtime or a
-/// GUI login session. The simulators it creates in the owner's device set (the template too, when there was none) and the
-/// DerivedData the wrapper made are deleted afterwards.
+/// test alone on the base and the head, judged from the real result bundles — each run on a FRESH device it creates and deletes,
+/// within the default <c>Gate:TestTimeoutMinutes</c>. Skipped without Xcode, an iOS Simulator runtime or a GUI login session. Any
+/// simulator it leaves in the owner's device set (a run cut short) and the DerivedData the wrapper made are deleted afterwards.
 /// </summary>
 public class XcodeIosRunnerTests : IDisposable
 {
@@ -28,7 +28,11 @@ public class XcodeIosRunnerTests : IDisposable
         TestGit.Run(_root, "init", "--bare", "-b", "main", _remote);
         TestGit.Run(_root, "init", "-b", "main", _seed);
         _devicesBefore = GateDevices().Select(d => d.Udid).ToHashSet(StringComparer.Ordinal);
+        var records = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Library", "Caches", "dark-factory-gate-devices");
+        _recordsBefore = Directory.Exists(records) ? Directory.GetFiles(records).ToHashSet(StringComparer.Ordinal) : [];
     }
+
+    private readonly HashSet<string> _recordsBefore;
 
     public void Dispose()
     {
@@ -125,17 +129,18 @@ public class XcodeIosRunnerTests : IDisposable
         var wrapper = Path.Combine(SandboxSupport.RepoRoot, "scripts", "factory-xcodebuild");
 
         var result = await NewTestsCheck.RunAsync(
-            new SandboxTestRunner(new GitWorkspace(Path.Combine(_root, "work"), _ => _remote, (_, _) => Task.FromResult<string?>(null)), slots: null, TimeSpan.FromMinutes(30)),
-            NewTestsCheck.StrategiesFor(swift: true, wrapper), Repo, baseSha, headSha, "gate-sc-6", null, TestContext.Current.CancellationToken);
+            new SandboxTestRunner(new GitWorkspace(Path.Combine(_root, "work"), _ => _remote, (_, _) => Task.FromResult<string?>(null)), slots: null, SandboxTestRunner.DefaultTimeout),
+            NewTestsCheck.StrategiesFor(swift: true, wrapper), Repo, baseSha, headSha, "gate-sc-6", line => TestContext.Current.TestOutputHelper?.WriteLine(line),
+            TestContext.Current.CancellationToken);
 
         Assert.True(result.Outcome == NewTestsOutcome.Pass, $"{result.Outcome}: {result.Reason}");
         Assert.Equal([(XcodeIosFixture.UnitTestId, "failed", "passed"), (XcodeIosFixture.UiTestId, "failed", "passed")],
             result.Tests.Select(t => (t.Test, t.Base, t.Head)).OrderBy(t => t.Test, StringComparer.Ordinal));
         Assert.All(result.Tests, t => Assert.Equal((1, 1), (t.BaseCases.Count, t.HeadCases.Count)));
-        // Each run's own device is gone again; of what the gate made only the kept template (one) remains.
-        var left = GateDevices().Select(d => d.Name).ToList();
-        Assert.DoesNotContain(left, n => Regex.IsMatch(n, "^dark-factory-gate-[0-9a-f]{16}$"));
-        Assert.Single(left, n => n.StartsWith("dark-factory-gate-template-", StringComparison.Ordinal));
+        // Each run's own fresh device is gone again, and so is its record: the gate keeps nothing between runs.
+        Assert.Empty(GateDevices().Where(d => !_devicesBefore.Contains(d.Udid)));
+        var records = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Library", "Caches", "dark-factory-gate-devices");
+        Assert.Empty(Directory.Exists(records) ? Directory.GetFiles(records).Where(f => _recordsBefore.Contains(f) is false) : []);
         Assert.Empty(Directory.EnumerateDirectories(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name)));
     }
 }

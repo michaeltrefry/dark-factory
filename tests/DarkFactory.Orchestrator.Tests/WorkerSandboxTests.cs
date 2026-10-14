@@ -1904,11 +1904,15 @@ public class LiveWorkerSandboxTests
     /// sc-26132 (P5 S6): the gate's iOS new-tests check as each configured slot's sandbox user, exactly as production runs it —
     /// <see cref="SandboxTestRunner"/> over the slot pool, the INSTALLED xcodebuild wrapper, the compiled-in simulator script through
     /// the slot's helper: the fixture app (Fixtures/xcode-ios) with a new XCTest unit test and a new XCUITest, each failing on the
-    /// base and passing on the head on the run's own simulator (cloned from that user's kept template, created on demand — the
-    /// first run per user boots it once, minutes), every simulator step that needs it booted in one helper run. Needs
+    /// base and passing on the head on the run's own simulator — a FRESH device each run creates in that user's own device set
+    /// and deletes (its first boot migrates data: minutes as a sandbox user) — every simulator step that needs it booted in one
+    /// helper run, within the DEFAULT <c>Gate:TestTimeoutMinutes</c> per run (the budget production gives it). Then, as S0
+    /// requires (CLAUDE.md, "iOS simulator and UI tests as a sandbox user", (2) and (3)): nothing of the user is left running —
+    /// read as <see cref="WorkerSandbox.StopAllAsync"/> reads it, Apple's respawned agents (<see cref="WorkerSandbox.RespawnedAgents"/>)
+    /// not counted — right after and 15 s after, and the user's device set holds no device of the gate's. Needs
     /// <c>Worker:Swift=true</c> (setup with <c>--swift</c>) and the factory's owner logged in at the console (an Aqua session).
     /// Slow (minutes per slot); like every live probe it kills every process of each sandbox user: run it with no factory running.
-    /// What it leaves: each user's template simulator (kept by design); the run devices, worktrees and DerivedData are removed.
+    /// What it leaves: nothing of the gate's (devices, records, worktrees and DerivedData are removed).
     /// </summary>
     [Fact]
     public async Task The_ios_gate_runs_a_new_unit_test_and_ui_test_on_a_simulator_as_each_sandbox_user()
@@ -1960,7 +1964,7 @@ public class LiveWorkerSandboxTests
                 var headSha = Commit("factory/sc-7");
                 var git = new GitWorkspace(Path.Combine(dir, "work"), _ => remote, (_, _) => Task.FromResult<string?>(null), sandbox: pool);
 
-                var result = await pool.HoldAsync(slot.Number, _ => NewTestsCheck.RunAsync(new SandboxTestRunner(git, pool, TimeSpan.FromMinutes(45)),
+                var result = await pool.HoldAsync(slot.Number, _ => NewTestsCheck.RunAsync(new SandboxTestRunner(git, pool, SandboxTestRunner.DefaultTimeout),
                     NewTestsCheck.StrategiesFor(swift: true), new RepoRef("acme", "tally"), baseSha, headSha, "gate-sc-7",
                     line => TestContext.Current.TestOutputHelper?.WriteLine(line), ct), ct);
 
@@ -1968,6 +1972,16 @@ public class LiveWorkerSandboxTests
                 Assert.True(result.Outcome == NewTestsOutcome.Pass, $"worker {slot}: {result.Outcome}: {result.Reason}");
                 Assert.Equal([(XcodeIosFixture.UnitTestId, "failed", "passed"), (XcodeIosFixture.UiTestId, "failed", "passed")],
                     result.Tests.Select(t => (t.Test, t.Base, t.Head)).OrderBy(t => t.Test, StringComparer.Ordinal));
+                // Nothing of the user left (S0's requirement (2)): StopAllAsync's own reading, the respawned agents not counted.
+                TestContext.Current.TestOutputHelper?.WriteLine($"worker {slot} processes right after:\n{ProcessesOf(slot.User)}");
+                Assert.False(await slot.Sandbox.StopAllAsync(ct), $"worker {slot}: a process of {slot.User} outlived the gate's runs");
+                await Task.Delay(TimeSpan.FromSeconds(15), ct);
+                TestContext.Current.TestOutputHelper?.WriteLine($"worker {slot} processes 15 s after:\n{ProcessesOf(slot.User)}");
+                Assert.False(await slot.Sandbox.StopAllAsync(ct), $"worker {slot}: a process of {slot.User} appeared after the gate's runs");
+                // No device of the gate's kept in the user's own set (S0's (3): this gate keeps none).
+                var (listed, devices, _) = await slot.Sandbox.RunAsync("/", XcodeNewTests.Xcrun, ["simctl", "list", "devices"], ct);
+                Assert.Equal(0, listed);
+                Assert.DoesNotContain("dark-factory-gate-", devices);
             }
             finally
             {

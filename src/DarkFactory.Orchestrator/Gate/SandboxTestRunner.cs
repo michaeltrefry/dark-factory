@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text;
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.Worker;
+using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.Orchestrator.Gate;
 
@@ -133,6 +134,13 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
                 if (timedOut)
                 {
                     return TestRunReport.Failed(TestRunStatus.TimedOut, log.ToString());
+                }
+                if (step.FactoryWideExit is { } unavailable && exit == unavailable)
+                {
+                    // The machine, not the item (sc-26132): nothing of this run is judged, and no item escalates one by one for it.
+                    var why = output.Split('\n').Select(l => l.Trim()).Where(l => l.Length > 0).TakeLast(3);
+                    throw new FactoryUnavailableException($"the gate's test runs: `{Describe(step)}` exited {exit}: {string.Join(" ", why)}",
+                        new InvalidOperationException(output));
                 }
                 if (exit != 0 && step.Phase == TestPhase.Toolchain)
                 {

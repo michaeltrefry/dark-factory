@@ -24,8 +24,12 @@ public sealed record SwiftToolchain(
     string SwiftPath = SwiftToolchain.DefaultSwiftPath,
     string XcodebuildPath = SwiftToolchain.DefaultXcodebuildPath,
     string WrapperPath = SwiftToolchain.DefaultWrapperPath,
-    string? WrapperSource = null)
+    string? WrapperSource = null,
+    string LaunchctlPath = SwiftToolchain.DefaultLaunchctlPath)
 {
+    /// <summary>launchctl, whose <c>managername</c> says which launchd session a process is in (sc-26132: a simulator needs <c>Aqua</c>).</summary>
+    public const string DefaultLaunchctlPath = "/bin/launchctl";
+
     public const string DefaultSwiftPath = "/usr/bin/swift";
     public const string DefaultXcodebuildPath = "/usr/bin/xcodebuild";
 
@@ -101,8 +105,11 @@ public sealed record SwiftToolchain(
     /// (<c>xcodebuild -checkFirstLaunchStatus</c>), its license is accepted (<c>xcodebuild -license check</c>), the SDKs of every
     /// platform the factory builds for are installed (<c>xcodebuild -showsdks</c>, <see cref="RequiredSdks"/>; it lists the SDKs and
     /// starts no simulator — CoreSimulator and the simulator runtimes are not checked here), and the wrapper runs
-    /// as that user (with no arguments it prints its usage and exits 64, running nothing). The first that fails throws, naming the
-    /// user, the command and the fix.
+    /// as that user (with no arguments it prints its usage and exits 64, running nothing); and (sc-26132, S0's requirement (1)) that
+    /// the user's processes are in a GUI login session — <c>launchctl managername</c> as that user answers <c>Aqua</c> — since the
+    /// gate's iOS checks run a simulator, which boots, and XCUITest drives, only there: refused here, factory-wide and naming the
+    /// slot's user, rather than every iOS item escalating one by one. The first that fails throws, naming the user, the command
+    /// and the fix.
     /// </summary>
     public async Task EnsureUsableAsync(
         string user, string reinstall, Func<string, string[], Task<(int ExitCode, string Stdout, string Stderr)>> run)
@@ -119,6 +126,16 @@ public sealed record SwiftToolchain(
                 + string.Join(" and no ", missing.Select(s => $"{s.Platform} SDK (-sdk {s.Sdk}…)"))
                 + ": install " + string.Join(" and ", missing.Select(s => s.Fix))
                 + $", then re-run `{reinstall} --swift` to check it.");
+        }
+        var manager = await run(LaunchctlPath, ["managername"]);
+        if (manager.ExitCode != 0 || manager.Stdout.Trim() != "Aqua")
+        {
+            throw new InvalidOperationException(
+                $"Swift toolchain (Worker:Swift) of {user}: `{LaunchctlPath} managername` as {user} answers "
+                + $"'{Clip(manager.ExitCode == 0 ? manager.Stdout : $"exit {manager.ExitCode}: {manager.Stderr}")}', not 'Aqua', so the gate's iOS "
+                + "simulator checks cannot run as it (a simulator boots, and XCUITest drives it, only in a GUI login session): run the factory "
+                + "inside the owner's GUI login session (a Terminal or a LaunchAgent of the owner logged in at the console), not from ssh or "
+                + "as a LaunchDaemon — CLAUDE.md, \"iOS simulator and UI tests as a sandbox user\".");
         }
         var wrapper = await run(WrapperPath, []);
         if (wrapper.ExitCode != 64 || !wrapper.Stderr.Contains("factory-xcodebuild: usage", StringComparison.Ordinal))

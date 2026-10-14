@@ -1,3 +1,4 @@
+using DarkFactory.Orchestrator.Gate;
 using System.Text.RegularExpressions;
 
 namespace DarkFactory.Orchestrator.Tests;
@@ -80,7 +81,8 @@ public class OwnProcessTests
     /// kill): no <c>Process.Kill</c>, no <c>kill(2)</c> import, no <c>kill</c>/<c>pkill</c>/<c>killall</c>/<c>killpg</c>
     /// command or call in a script a test writes, or in a script file under <c>tests/</c> (a fixture's <c>.sh</c>/<c>.pl</c>, any
     /// file with a <c>#!</c> line: the iOS probe, sc-26126, once bounded its steps with a perl timer that signalled a process
-    /// group) — except the listed lines, which are the launch helper's seam (its own
+    /// group), and the gate's own scripts <c>scripts/factory-ios-simulator</c> and <c>scripts/factory-xcodebuild</c> (sc-26132:
+    /// the simulator steps once bounded the boot with the same kind of perl timer) — except the listed lines, which are the launch helper's seam (its own
     /// guard: <see cref="SafeHelperTests"/>) and text that is only checked, never run with a real <c>kill</c>.
     /// The patterns are assembled so this file does not match them itself.
     /// </summary>
@@ -129,6 +131,15 @@ public class OwnProcessTests
         Assert.Contains(files, f => Path.GetFileName(f) == ownerFiles[0]);
         Assert.Contains(files, f => f.Contains($"{separator}DarkFactory.AcceptanceTests{separator}"));
         Assert.Contains(files, f => f.EndsWith($"ios-probe{separator}probe.sh", StringComparison.Ordinal)); // scripts are read too
+        // The scripts the gate's own test runs execute (sc-26132): the iOS simulator steps, compiled in and run as `/bin/bash -c
+        // <text>` (no lint reads a resource), and the xcodebuild wrapper they and the build steps run. Neither may signal anything:
+        // the step's own deadline (its stdin closed, the helper's sweep) bounds whatever they start.
+        // The simulator script is read as the gate runs it, compiled in (a copy in a throwaway directory).
+        var compiled = Directory.CreateTempSubdirectory("df-ownprocess-").FullName;
+        files.Add(Path.Combine(compiled, "factory-ios-simulator"));
+        File.WriteAllText(files[^1], XcodeNewTests.SimulatorScript);
+        files.Add(Path.Combine(SandboxSupport.RepoRoot, "scripts", "factory-xcodebuild"));
+        Assert.True(File.Exists(files[^1]), files[^1]);
 
         var violations = new List<string>();
         var used = new HashSet<string>();
@@ -157,6 +168,7 @@ public class OwnProcessTests
             }
         }
 
+        Directory.Delete(compiled, recursive: true);
         Assert.True(violations.Count == 0, "violations:\n" + string.Join("\n", violations));
         var unused = allowed.SelectMany(kv => kv.Value.Select(l => $"{kv.Key}|{l}")).Where(a => !used.Contains(a)).ToList();
         Assert.True(unused.Count == 0, "allowances that match no line: " + string.Join("; ", unused));

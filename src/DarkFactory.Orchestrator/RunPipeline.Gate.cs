@@ -1216,7 +1216,9 @@ public sealed partial class RunPipeline
         {
             throw new ControlRequestedException(requested) { ControlsUnreadable = watch.ControlsUnreadable };
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        // The factory's own failure (sc-26132: a machine that cannot run the iOS simulator) is not the item's: it reaches RunAsync,
+        // which lets it through to the intake loop as factory-wide, nothing recorded against the item.
+        catch (Exception ex) when (ex is not OperationCanceledException and not FactoryUnavailableException)
         {
             result = NewTestsResult.Without(pull.BaseSha, pull.HeadSha, NewTestsOutcome.Error, $"the new tests could not be run: {ex.Message}");
         }

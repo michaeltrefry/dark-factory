@@ -64,9 +64,11 @@ namespace DarkFactory.Orchestrator.Gate;
 /// Simulator. Since every exit of the launch helper kills every process of its user — CoreSimulatorService and a booted
 /// simulator included — everything that needs the simulator booted is ONE step, one helper run. The steps, all
 /// <c>/bin/bash -c</c> <see cref="SimulatorScript"/> (the gate's own code, compiled in) but the build: <c>prepare</c> (a
-/// <see cref="TestPhase.Restore"/> step: refused outside a GUI login session, naming why; the runtime; the slot user's kept
-/// template, created and booted once on demand; the run's device <see cref="DeviceName"/> cloned from it), the build for that
-/// device by name, <c>session</c> (a <see cref="TestPhase.Test"/> step: boot, then per test the wrapper's
+/// <see cref="TestPhase.Restore"/> step: refused outside a GUI login session, naming why, and without a runtime — exit
+/// <see cref="SimulatorUnavailableExit"/>, the factory's failure, not the item's; earlier runs' devices deleted once their runs
+/// are over; the run's device <see cref="DeviceName"/> created FRESH from the runtime, never cloned or reused, and checked to be
+/// in the user's own device set), the build for that device by name, <c>session</c> (a <see cref="TestPhase.Test"/> step: the
+/// fresh device's first boot, bounded by <see cref="BootTimeoutSeconds"/>, then per test the wrapper's
 /// <c>test-without-building</c> and xcresulttool into <c>xcode-test-&lt;hash&gt;.json</c>, its exit codes on its output
 /// <see cref="SessionOutput"/>), and <c>remove</c> (a <see cref="TestPhase.Cleanup"/> step: the run's device deleted).
 /// </para>
@@ -113,8 +115,20 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
     /// <summary>The shell the simulator steps run under: <c>/bin/bash -c</c> <see cref="SimulatorScript"/>.</summary>
     public const string Bash = "/bin/bash";
 
-    /// <summary>How long a simulator may take to boot (a fresh template's first boot migrates its data: about 2 minutes as a sandbox user, sc-26126).</summary>
-    public const int BootTimeoutSeconds = 600;
+    /// <summary>
+    /// How long the run's fresh simulator may take to boot: its first boot migrates its data, 2–4.5 minutes as a sandbox user
+    /// (sc-26126: 123, 137, 178 and 272 s seen), so about 2.6 times the slowest seen. Each run (the base's, the head's) boots its
+    /// own device within its own <c>Gate:TestTimeoutMinutes</c> (default 20 minutes), which leaves 8 minutes beside it for the
+    /// build and the tests.
+    /// </summary>
+    public const int BootTimeoutSeconds = 720;
+
+    /// <summary>
+    /// The exit of <c>prepare</c> when this machine cannot run a simulator for the run's user at all (outside a GUI login
+    /// session, no CoreSimulator service, no iOS runtime or iPhone type): the factory's failure, never the item's
+    /// (<see cref="TestStep.FactoryWideExit"/>).
+    /// </summary>
+    public const int SimulatorUnavailableExit = 69;
 
     /// <summary>The name the iOS simulator session's output and exit code are kept under.</summary>
     public const string SessionOutput = "xcode-ios-session.out";
@@ -913,14 +927,14 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
             // nothing a worker session of the same user left there is built on or run. Failing, the run is an error.
             new(TestPhase.Restore, wrapperPath, [CleanDerivedData]),
         };
-        // iOS (sc-26132): the run's own simulator, cloned from the slot user's kept template, named from the results directory
+        // iOS (sc-26132): the run's own simulator, created fresh for it (never cloned or reused), named from the results directory
         // (random per run) so the build can name it, and removed again however the run ends.
         var ios = groups.Where(g => Build.From(g.Key).Platform == XcodeProject.IOS).ToList();
         var device = DeviceName(resultsDirectory);
         var bootSeconds = BootTimeoutSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
         if (ios.Count > 0)
         {
-            steps.Add(Simulator(TestPhase.Restore, ["prepare", device, bootSeconds]));
+            steps.Add(Simulator(TestPhase.Restore, ["prepare", device, resultsDirectory]) with { FactoryWideExit = SimulatorUnavailableExit });
         }
         for (var n = 0; n < groups.Count; n++)
         {
