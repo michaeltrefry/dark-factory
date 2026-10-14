@@ -33,10 +33,10 @@ public class SwiftLinuxProbeTests
         Assert.SkipUnless(OperatingSystem.IsLinux(), "linux probe");
         var text = Run(Path.GetTempPath(), "--version");
         var broken = Package(SwiftIdentifyTests.BaseLibrary + "public func broken() -> Int { nope }\n", SwiftIdentifyTests.BaseTests);
-        text += Run(broken, "build", "--package-path", broken, "--build-tests");
+        text += Run(broken, "build", "--package-path", broken, "--build-system", "native", "--build-tests");
         var clash = Package(SwiftIdentifyTests.BaseLibrary + "public func make() -> String { \"\" }\n",
             SwiftIdentifyTests.BaseTests + "func make() -> Int { 1 }\n@Test func made() { let x = make(); #expect(x == 1) }\n");
-        text += Run(clash, "build", "--package-path", clash, "--build-tests");
+        text += Run(clash, "build", "--package-path", clash, "--build-system", "native", "--build-tests");
         Assert.Fail(text);
     }
 }
