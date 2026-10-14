@@ -449,6 +449,34 @@ public class IssueIntakeTests
     }
 
     [Fact]
+    public async Task A_triage_put_off_while_it_waited_for_the_sandbox_user_is_no_failure_however_often_and_is_taken_up_again()
+    {
+        var h = new Harness(Answer());
+        h.Triage.Answers.Clear();
+        h.Triage.Answers.Add(() => throw new TriageDeferredException("the triage of gh-1 was waiting for the sandbox user when a control (Paused) held it"));
+        await h.Watch();
+        h.Open("maintainer");
+
+        // More often than the failures that would route it to a human (3): put off is not failed.
+        for (var poll = 0; poll < 5; poll++)
+        {
+            await h.Poll();
+        }
+
+        Assert.Equal(5, h.Triage.Prompts.Count);
+        Assert.Empty(h.GitHub.Writes);
+        Assert.Empty(h.Status.ItemErrors);
+        Assert.DoesNotContain(IssueSteps.Triaged, await h.Steps());
+
+        // The sandbox user is free on a later poll: the same version is triaged, as if for the first time.
+        h.Triage.Answers.Add(() => FakeTriage.Says(Answer()));
+        await h.Poll();
+
+        Assert.Contains(IssueSteps.Triaged, await h.Steps());
+        Assert.Empty(h.Status.ItemErrors);
+    }
+
+    [Fact]
     public async Task An_unreadable_triage_answer_needs_a_human()
     {
         var h = new Harness("I could not decide.");

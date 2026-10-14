@@ -376,13 +376,17 @@ public class FactoryOptionsTests
     public void Workers_run_as_the_sandbox_user_by_default_with_a_work_root_outside_both_homes()
     {
         var options = Options([]);
-        Assert.Equal(new Worker.WorkerSandbox("_factory", "/usr/local/libexec/dark-factory/factory-worker-launch"), options.WorkerSandbox);
+        // The sandbox carries its work root's lock (sc-25988): every run of the helper happens under it.
+        Assert.Equal(new Worker.WorkerSandbox("_factory", "/usr/local/libexec/dark-factory/factory-worker-launch") { Lock = Locked("/opt/dark-factory/work") }, options.WorkerSandbox);
         Assert.Equal("/opt/dark-factory/work", options.WorkRoot);
 
         var custom = Options(new() { ["Worker:RunAs"] = "_df2", ["Worker:LaunchHelper"] = "/opt/h", ["Factory:WorkRoot"] = "/w" });
-        Assert.Equal(new Worker.WorkerSandbox("_df2", "/opt/h"), custom.WorkerSandbox);
+        Assert.Equal(new Worker.WorkerSandbox("_df2", "/opt/h") { Lock = Locked("/w") }, custom.WorkerSandbox);
         Assert.Equal("/w", custom.WorkRoot);
     }
+
+    /// <summary>The lock of a work root: its <c>.factory-run.lock</c>.</summary>
+    private static WorkerLock Locked(string workRoot) => new(Path.Combine(workRoot, ".factory-run.lock"));
 
     [Fact]
     public void Run_as_none_runs_workers_as_the_owner_under_the_owners_work_root()
@@ -682,6 +686,17 @@ public class FactoryOptionsTests
 
         Assert.Equal(5, Options(new() { ["Intake:MaxItemFailures"] = "5" }).MaxItemFailures);
         Assert.Throws<InvalidOperationException>(() => Options(new() { ["Intake:MaxItemFailures"] = "0" }).MaxItemFailures);
+
+        // sc-25988: one run at a time unless configured; a value outside 1..8 is refused at start-up, naming the key.
+        Assert.Equal(1, Options([]).MaxConcurrentRuns);
+        Assert.Equal(3, Options(new() { ["Intake:MaxConcurrentRuns"] = "3" }).MaxConcurrentRuns);
+        Assert.Equal(WorkSources.IntakeOptions.MaxConcurrentRunsLimit, Options(new() { ["Intake:MaxConcurrentRuns"] = "8" }).MaxConcurrentRuns);
+        foreach (var refused in new[] { "0", "-1", "9" })
+        {
+            Assert.Contains("Intake:MaxConcurrentRuns must be a whole number from 1 to 8",
+                Assert.Throws<InvalidOperationException>(() => Options(new() { ["Intake:MaxConcurrentRuns"] = refused }).ValidateSettings()).Message);
+        }
+        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Intake:MaxConcurrentRuns"] = "two" }).ValidateSettings());
 
         Assert.Equal(DarkFactory.Orchestrator.RunPipeline.DefaultMaxControlReadFailures, Options([]).MaxControlReadFailures);
         Assert.Equal(4, Options(new() { ["Controls:MaxReadFailures"] = "4" }).MaxControlReadFailures);

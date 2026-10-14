@@ -15,6 +15,17 @@ public interface IWorkerSandbox
     Task DeleteAsWorkerAsync(string path, CancellationToken ct);
 
     /// <summary>
+    /// <see cref="DeleteAsWorkerAsync"/> only if the worker user is free now (or the calling flow holds its lock): answers false,
+    /// deleting nothing and waiting for nothing, while another run's worker phase has it — for clean-up outside a worker phase,
+    /// which must not wait out another run's session and which a later sweep does as well.
+    /// </summary>
+    async Task<bool> TryDeleteAsWorkerAsync(string path, CancellationToken ct)
+    {
+        await DeleteAsWorkerAsync(path, ct);
+        return true;
+    }
+
+    /// <summary>
     /// Closes the owner's directory <paramref name="path"/> to the worker user and everyone else: owner-only mode and no ACL entry
     /// (the work root's inherited one included), so nothing in it can be opened by anyone but the owner. Fails unless the
     /// directory then reads back closed.
@@ -29,10 +40,83 @@ public interface IWorkerSandbox
 /// Router variables travel on the helper's stdin, never argv; closing stdin stops the worker.
 /// <paramref name="HelperSource"/>: the helper as <c>scripts/factory-worker-launch</c> has it, which the installed one must
 /// match (<see cref="StaleHelperReason"/>); null is the copy compiled into this assembly.
+/// Every run of the helper happens under the sandbox user's lock (<see cref="Lock"/>, sc-25988): the helper's exit kills every
+/// process of <see cref="User"/>, another run's worker included. <see cref="Start"/> refuses to launch unless the calling flow
+/// holds it (the caller holds it for as long as the process lives); the short commands here (<see cref="RunAsync(string, string, IEnumerable{string}, CancellationToken)"/>,
+/// <see cref="EnsureReadyAsync"/>, <see cref="StopAllAsync"/>, <see cref="DeleteAsWorkerAsync"/>) take it themselves, waiting,
+/// unless their caller's phase already holds it. And the lock covers the whole life of every helper process: whoever started one
+/// ends it with <see cref="EndAsync"/>, which waits for it to exit (<see cref="StopGrace"/>) and, if it will not, keeps the lock
+/// (<see cref="WorkerLock.KeepUntil"/>) until it is gone — its exit, whenever it comes, still kills every process of <see cref="User"/>.
 /// </summary>
 public sealed record WorkerSandbox(string User, string HelperPath, string SudoPath = WorkerSandbox.DefaultSudoPath, string? HelperSource = null)
     : IWorkerSandbox
 {
+    /// <summary>
+    /// The sandbox user's lock (<see cref="WorkerLock"/>). The production sandbox always has one (<c>FactoryOptions.WorkerSandbox</c>:
+    /// the work root's); null only for a sandbox a test builds over its own helper copy, which shares its user with no other run.
+    /// </summary>
+    public WorkerLock? Lock { get; init; }
+
+    /// <summary>Runs <paramref name="command"/> holding <see cref="Lock"/> (waited for; at once when the calling flow holds it or there is none).</summary>
+    private Task<T> LockedAsync<T>(Func<Task<T>> command, CancellationToken ct) => Lock is null ? command() : Lock.HoldAsync(command, ct);
+
+    /// <summary>How long a helper whose stdin was closed (it then kills its worker's processes, sweeps the user's and exits) is waited for.</summary>
+    public TimeSpan StopGrace { get; init; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>Whether <paramref name="process"/> has exited, waiting up to <paramref name="grace"/> for it (never cancelled otherwise).</summary>
+    public static async Task<bool> ExitsWithinAsync(Process process, TimeSpan grace)
+    {
+        if (process.HasExited)
+        {
+            return true;
+        }
+        if (grace <= TimeSpan.Zero)
+        {
+            return false;
+        }
+        using var bounded = new CancellationTokenSource(grace);
+        try
+        {
+            await process.WaitForExitAsync(bounded.Token);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            return process.HasExited;
+        }
+    }
+
+    /// <summary>
+    /// Ends a helper process <see cref="Start"/> made, for its starter, which is done with it: closes its stdin (<see cref="Stop"/>),
+    /// waits up to <paramref name="grace"/> (<see cref="StopGrace"/> when null) for it to exit — on no cancellation token: a
+    /// cancelled caller must still not leave a helper sweeping behind it — and disposes it. A helper still alive then is not
+    /// abandoned under a free lock: <see cref="Lock"/> stays held until it has exited (<see cref="WorkerLock.KeepUntil"/>, reported
+    /// with its pid), and it is disposed then. Answers whether it exited. The caller reads the exit code before this.
+    /// </summary>
+    public async Task<bool> EndAsync(Process process, TimeSpan? grace = null)
+    {
+        Stop(process);
+        if (await ExitsWithinAsync(process, grace ?? StopGrace))
+        {
+            process.Dispose();
+            return true;
+        }
+        var pid = process.Id;
+        var gone = Task.Run(async () =>
+        {
+            try
+            {
+                await process.WaitForExitAsync(CancellationToken.None);
+            }
+            finally
+            {
+                process.Dispose();
+            }
+        });
+        Lock?.KeepUntil(gone, $"a launch helper run as {User} (sudo pid {pid}) that did not exit when its stdin was closed");
+        return false;
+    }
+
     public const string DefaultUser = "_factory";
     public const string DefaultHelperPath = "/usr/local/libexec/dark-factory/factory-worker-launch";
     public const string DefaultSudoPath = "/usr/bin/sudo";
@@ -95,9 +179,14 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         return block.Append('\n').ToString();
     }
 
-    /// <summary>Starts <paramref name="program"/> as the worker user. The caller must keep stdin open for the life of the run.</summary>
+    /// <summary>
+    /// Starts <paramref name="program"/> as the worker user. The caller must keep stdin open for the life of the run, and must hold
+    /// <see cref="Lock"/> until the process has exited (the helper's exit is the kill of every <see cref="User"/> process): unless
+    /// the calling flow holds it, nothing is started and this throws.
+    /// </summary>
     public Process Start(string workingDirectory, string program, IEnumerable<string> args, IReadOnlyDictionary<string, string> variables)
     {
+        Lock?.Require($"a run of {program} as {User} through {HelperPath}");
         var psi = new ProcessStartInfo(SudoPath)
         {
             WorkingDirectory = workingDirectory,
@@ -132,7 +221,10 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     /// Kills every process of the worker user (left by a crashed run) by running a no-op through the
     /// helper, whose exit kills them all. Returns false, running nothing, when the user has none.
     /// </summary>
-    public async Task<bool> StopAllAsync(CancellationToken ct)
+    public Task<bool> StopAllAsync(CancellationToken ct) => LockedAsync(() => StopAllLockedAsync(ct), ct);
+
+    /// <summary><see cref="StopAllAsync"/> under the lock: with it held no other run's worker is alive, so every process found is a leftover.</summary>
+    private async Task<bool> StopAllLockedAsync(CancellationToken ct)
     {
         var psi = new ProcessStartInfo("/usr/bin/pgrep", ["-U", User]) { RedirectStandardOutput = true, RedirectStandardError = true };
         using (var pgrep = Process.Start(psi)!)
@@ -169,21 +261,27 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     public Task<(int ExitCode, string Stdout, string Stderr)> RunAsync(string workingDirectory, string program, IEnumerable<string> args, CancellationToken ct) =>
         RunAsync(workingDirectory, program, args, new Dictionary<string, string>(), ct);
 
-    private async Task<(int ExitCode, string Stdout, string Stderr)> RunAsync(
+    private Task<(int ExitCode, string Stdout, string Stderr)> RunAsync(
+        string workingDirectory, string program, IEnumerable<string> args, IReadOnlyDictionary<string, string> variables, CancellationToken ct) =>
+        LockedAsync(() => RunLockedAsync(workingDirectory, program, args, variables, ct), ct);
+
+    private async Task<(int ExitCode, string Stdout, string Stderr)> RunLockedAsync(
         string workingDirectory, string program, IEnumerable<string> args, IReadOnlyDictionary<string, string> variables, CancellationToken ct)
     {
-        using var process = Start(workingDirectory, program, args, variables);
-        var stdout = process.StandardOutput.ReadToEndAsync(ct);
-        var stderr = process.StandardError.ReadToEndAsync(ct);
+        var process = Start(workingDirectory, program, args, variables);
         try
         {
+            var stdout = process.StandardOutput.ReadToEndAsync(ct);
+            var stderr = process.StandardError.ReadToEndAsync(ct);
             await process.WaitForExitAsync(ct);
+            return (process.ExitCode, await stdout, await stderr);
         }
         finally
         {
-            Stop(process);
+            // Also when cancelled: the helper, its stdin closed, is now killing and sweeping the worker user's processes, and
+            // the lock this command holds must not be released under that (a waiting run's new worker would be swept).
+            await EndAsync(process);
         }
-        return (process.ExitCode, await stdout, await stderr);
     }
 
     /// <summary>
@@ -234,7 +332,32 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     /// worker user's, or outside 400-499) fails too, since a worker's leftovers would then outlive every run. Last, the worker
     /// user's own Claude Code (<paramref name="claudePath"/>, as the worker sees it) must be at least <see cref="MinClaudeVersion"/>.
     /// </summary>
-    public async Task EnsureReadyAsync(WorkerAuth auth, string claudePath, CancellationToken ct)
+    public Task EnsureReadyAsync(WorkerAuth auth, string claudePath, CancellationToken ct) =>
+        LockedAsync(async () => { await EnsureReadyLockedAsync(auth, claudePath, ct); return true; }, ct);
+
+    private async Task EnsureReadyLockedAsync(WorkerAuth auth, string claudePath, CancellationToken ct)
+    {
+        await EnsureHelperCurrentAsync(ct);
+        // Shaped like a real launch: the headers of a classed session span two lines (E8).
+        var probeVariables = ClaudeWorker.BuildRouterVariables(new Uri("http://127.0.0.1/"), "probe", auth, WorkerModelClass.Mid);
+        (int ExitCode, string Stdout, string Stderr) probe;
+        try
+        {
+            probe = await RunAsync("/", "/usr/bin/id", ["-un"], probeVariables, ct);
+        }
+        catch (System.ComponentModel.Win32Exception ex)
+        {
+            throw new InvalidOperationException($"Worker sandbox unavailable ({ex.Message}); {SetupHint}.", ex);
+        }
+        await EnsureProbedAsync(probe, claudePath, ct);
+    }
+
+    /// <summary>
+    /// The part of <see cref="EnsureReadyAsync"/> that runs nothing — no helper, so no lock and no kill of the worker user's
+    /// processes: the installed helper must be readable and the current one (<see cref="StaleHelperReason"/>). Start-up and
+    /// every run's start check this before anything is claimed or recorded.
+    /// </summary>
+    public async Task EnsureHelperCurrentAsync(CancellationToken ct)
     {
         string installed;
         try
@@ -251,17 +374,11 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
                 $"Stale helper: the installed launch helper {HelperPath} is not the current scripts/factory-worker-launch ({stale}); "
                 + $"re-run `{ReinstallCommand}` to install it (that kills every {User} process: stop `factory work` first).");
         }
-        // Shaped like a real launch: the headers of a classed session span two lines (E8).
-        var probeVariables = ClaudeWorker.BuildRouterVariables(new Uri("http://127.0.0.1/"), "probe", auth, WorkerModelClass.Mid);
-        (int ExitCode, string Stdout, string Stderr) probe;
-        try
-        {
-            probe = await RunAsync("/", "/usr/bin/id", ["-un"], probeVariables, ct);
-        }
-        catch (System.ComponentModel.Win32Exception ex)
-        {
-            throw new InvalidOperationException($"Worker sandbox unavailable ({ex.Message}); {SetupHint}.", ex);
-        }
+    }
+
+    /// <summary>What <see cref="EnsureReadyAsync"/> concludes from the probe's result, then the worker user's Claude Code version.</summary>
+    private async Task EnsureProbedAsync((int ExitCode, string Stdout, string Stderr) probe, string claudePath, CancellationToken ct)
+    {
         if (probe.ExitCode == 64 && probe.Stderr.Contains("non-allowlisted variable", StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
@@ -366,6 +483,16 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     {
         // Best effort: whatever the worker user can't remove, the owner's retry reports.
         await RunAsync("/", "/bin/rm", ["-rf", "--", path], ct);
+    }
+
+    public async Task<bool> TryDeleteAsWorkerAsync(string path, CancellationToken ct)
+    {
+        if (Lock is null)
+        {
+            await DeleteAsWorkerAsync(path, ct);
+            return true;
+        }
+        return await Lock.TryHoldAsync(() => DeleteAsWorkerAsync(path, ct));
     }
 
     /// <summary>Runs a local program, failing on a non-zero exit; with <paramref name="output"/> its standard output is read and returned (else "").</summary>

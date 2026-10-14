@@ -28,11 +28,37 @@ internal static class SandboxSupport
         "#!/bin/sh\n[ \"$1\" = -n ] && [ \"$2\" = -u ] || exit 99\nshift 3\nexec \"$@\"\n");
 
     /// <summary>
+    /// <see cref="FakeSudo"/> that first records, one line per run in <paramref name="log"/>, whether <paramref name="workerLock"/>
+    /// is locked at that moment — <c>held</c> or <c>free</c>, asked of the OS from this other process (a non-blocking exclusive
+    /// <c>flock</c> on the lock file, as the lock itself takes): a probe on every run of the helper (sc-25988).
+    /// </summary>
+    public static string LockProbingSudo(string dir, WorkerLock workerLock, string log) => Executable(dir, $"probing-sudo-{Guid.NewGuid():N}.sh",
+        "#!/bin/sh\n[ \"$1\" = -n ] && [ \"$2\" = -u ] || exit 99\n"
+        + $"if /usr/bin/perl -e 'use Fcntl qw(:flock); open(my $f, \"<\", $ARGV[0]) or exit 0; exit(flock($f, LOCK_EX | LOCK_NB) ? 0 : 1)' '{workerLock.Path}'; "
+        + $"then echo free >> '{log}'; else echo held >> '{log}'; fi\n"
+        + "shift 3\nexec \"$@\"\n");
+
+    /// <summary>
     /// A sandbox whose helper is a <see cref="SafeHelper"/> copy (as <c>_factory</c>, which we are not: no uid sweep), with
     /// <see cref="LocalRegistry"/> as its registry.
     /// </summary>
     public static WorkerSandbox LocalSandbox(string dir) =>
         new("_factory", SafeHelper.Create(dir, new SafeHelperOptions { Registry = LocalRegistry(dir) }).Path, FakeSudo(dir));
+
+    /// <summary>
+    /// A sandbox that passes the check of the installed helper (<see cref="WorkerSandbox.EnsureHelperCurrentAsync"/>) and can run
+    /// nothing: its "helper" is a stub that only exits — the current one for itself (its own text before setup's two edits is its
+    /// <see cref="WorkerSandbox.HelperSource"/>), never the repo's — and its sudo and its user do not exist.
+    /// <paramref name="installed"/> edits the installed text (to make it stale).
+    /// </summary>
+    public static WorkerSandbox StubSandbox(string dir, WorkerLock? workerLock = null, Func<string, string>? installed = null)
+    {
+        const string user = "df-test-no-such-user";
+        var repoText = $"#!/bin/sh\nsandbox_user=_factory\nsandbox_uid=\nhelper_version={WorkerSandbox.HelperVersion}\nexit 97\n";
+        var text = repoText.Replace("\nsandbox_user=_factory\n", $"\nsandbox_user={user}\n").Replace("\nsandbox_uid=\n", "\nsandbox_uid=450\n");
+        var helper = Executable(dir, $"stub-helper-{Guid.NewGuid():N}.sh", (installed ?? (t => t))(text));
+        return new WorkerSandbox(user, helper, "/nonexistent/df-test-sudo", repoText) { Lock = workerLock };
+    }
 
     /// <summary>Where a worker of <see cref="LocalSandbox"/> records ("pid|start") a process it leaves behind for the helper to kill.</summary>
     public static string LocalRegistry(string dir) => Path.Combine(dir, "local-registry");
@@ -658,13 +684,15 @@ public class WorkerSandboxTests
     }
 
     [Fact]
-    public async Task A_sandboxed_worker_that_will_not_stop_still_cancels_but_is_marked_still_running()
+    public async Task A_sandboxed_worker_that_will_not_stop_still_cancels_is_marked_still_running_and_keeps_the_sandbox_users_lock_until_it_is_gone()
     {
         var pidFile = Path.Combine(_dir, "stuck-pid");
-        // A "sudo" that ignores its stdin closing, as a wedged helper would.
+        // A "sudo" that ignores its stdin closing, as a wedged helper would. The worker user has no process (no such user), so the
+        // second stop — a run of the helper that kills that user's processes — finds nothing to run for.
         var stuckSudo = SandboxSupport.Executable(_dir, "stuck-sudo.sh",
             $"#!/bin/sh\necho {OwnProcess.ShellRecord("$$")} > '{pidFile}'\necho '{{\"type\":\"system\",\"session_id\":\"s\"}}'\nexec /bin/sleep 600 </dev/null\n");
-        var sandbox = new WorkerSandbox("_factory", SafeHelper.Create(_dir).Path, stuckSudo);
+        var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, "stuck-root")).FullName);
+        var sandbox = new WorkerSandbox("_df_no_such_user", SafeHelper.Create(_dir).Path, stuckSudo) { Lock = workerLock };
         var worker = new ClaudeWorker("claude", SandboxSupport.Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(5), sandbox,
             stopGrace: TimeSpan.FromMilliseconds(300));
         using var cts = new CancellationTokenSource();
@@ -678,11 +706,143 @@ public class WorkerSandboxTests
             var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
             Assert.True(WorkerStillRunning.IsMarked(ex));
             Assert.True(pid.IsAlive);
+            // The session is over for its caller, but its helper is alive and its exit still kills every process of the worker
+            // user: the lock is not released under it (sc-25988), so no other run's worker phase — or helper run — starts.
+            Assert.False(workerLock.IsHeld);
+            Assert.False(await workerLock.TryHoldAsync(() => Task.CompletedTask));
+            Assert.False(await sandbox.TryDeleteAsWorkerAsync(Path.Combine(_dir, "nothing-there"), CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken));
+            var next = workerLock.HoldAsync(() => Task.CompletedTask, CancellationToken.None, retry: TimeSpan.FromMilliseconds(5));
+
+            // Gone: the lock is released, and the waiting phase starts.
+            pid.KillIfStillRunning();
+            await next.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
         }
         finally
         {
             pid.KillIfStillRunning();
         }
+    }
+
+    [Fact]
+    public async Task A_helper_that_ignores_its_closed_stdin_is_stopped_by_a_second_helper_run_under_the_same_lock_and_the_worker_is_not_left_running()
+    {
+        // The first "helper" wedges: it ignores its stdin closing. It records itself where the second run's uid sweep (narrowed
+        // to that registry, as in the helper tests) finds it — standing in for a process of the worker user.
+        var registry = Path.Combine(_dir, "uid-pids");
+        var helper = HelperWithRegistryKill(registry);
+        var pidFile = Path.Combine(_dir, "wedged-pid");
+        var sudo = SandboxSupport.Executable(_dir, "wedging-sudo.sh",
+            "#!/bin/sh\n[ \"$1\" = -n ] && [ \"$2\" = -u ] || exit 99\nshift 3\n"
+            // The stop of every process of the worker user (a no-op through the helper): the real copy, whose exit sweeps.
+            + "if [ \"$2\" = /usr/bin/true ]; then exec \"$@\"; fi\n"
+            + $"echo {OwnProcess.ShellRecord("$$")} >> '{registry}'\necho {OwnProcess.ShellRecord("$$")} > '{pidFile}'\n"
+            + "echo '{\"type\":\"system\",\"session_id\":\"s\"}'\nexec /bin/sleep 600 </dev/null\n");
+        var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, "wedged-root")).FullName);
+        var sandbox = new WorkerSandbox(Environment.UserName, helper.Path, sudo) { Lock = workerLock };
+        var worker = new ClaudeWorker("claude", SandboxSupport.Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(5), sandbox,
+            stopGrace: TimeSpan.FromSeconds(2)); // waited once for the wedged helper, then again after the second helper run killed it
+        using var cts = new CancellationTokenSource();
+        var run = worker.RunAsync(_dir, "p", null, WorkerModelClass.Mid, null, cts.Token);
+        var pid = await SandboxSupport.WaitForPidAsync(pidFile, run);
+        try
+        {
+            await cts.CancelAsync();
+
+            var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+            // Stopped after all: nothing is left running in its worktree, and the lock is free for the next phase.
+            Assert.False(WorkerStillRunning.IsMarked(ex));
+            await OwnProcess.WaitUntilDeadAsync(pid);
+            Assert.Contains(pid.Pid, helper.Targets);
+            Assert.True(await workerLock.TryHoldAsync(() => Task.CompletedTask));
+        }
+        finally
+        {
+            pid.KillIfStillRunning();
+        }
+    }
+
+    [Fact]
+    public async Task A_cancelled_helper_command_is_waited_for_while_it_sweeps_before_the_lock_is_released()
+    {
+        // A helper whose stdin is closed kills its worker's processes and sweeps the worker user's, then exits: a moment's work,
+        // during which the lock must stay held. Here: it notices its stdin closing, takes a moment, and records that it finished.
+        var (started, swept) = (Path.Combine(_dir, "sweeper-started"), Path.Combine(_dir, "sweeper-swept"));
+        var sudo = SandboxSupport.Executable(_dir, "sweeping-sudo.sh",
+            $"#!/bin/sh\necho {OwnProcess.ShellRecord("$$")} > '{started}'\n/bin/cat > /dev/null\n/bin/sleep 0.5\n: > '{swept}'\n");
+        var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, "sweeper-root")).FullName);
+        var sandbox = new WorkerSandbox("_df_no_such_user", SafeHelper.Create(_dir).Path, sudo) { Lock = workerLock };
+        using var cts = new CancellationTokenSource();
+        var sweptWhenReleased = (bool?)null;
+
+        var deletion = sandbox.DeleteAsWorkerAsync(Path.Combine(_dir, "nothing-there"), cts.Token);
+        var pid = await SandboxSupport.WaitForPidAsync(started, deletion);
+        try
+        {
+            // What a waiting run sees the moment it gets the lock: the cancelled command's helper has finished.
+            var next = workerLock.HoldAsync(() => { sweptWhenReleased = File.Exists(swept); return Task.CompletedTask; }, CancellationToken.None,
+                retry: TimeSpan.FromMilliseconds(1));
+            await cts.CancelAsync();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => deletion);
+            Assert.True(File.Exists(swept), "the cancelled command returned before its helper had exited");
+            await next.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+            Assert.True(sweptWhenReleased, "the lock was released while the helper was still sweeping");
+        }
+        finally
+        {
+            pid.KillIfStillRunning();
+        }
+    }
+
+    [Fact]
+    public async Task A_cancelled_helper_command_whose_helper_will_not_exit_keeps_the_lock_until_it_does()
+    {
+        var pidFile = Path.Combine(_dir, "stuck-command-pid");
+        var stuckSudo = SandboxSupport.Executable(_dir, "stuck-command-sudo.sh",
+            $"#!/bin/sh\necho {OwnProcess.ShellRecord("$$")} > '{pidFile}'\nexec /bin/sleep 600 </dev/null\n");
+        var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, "stuck-command-root")).FullName);
+        var sandbox = new WorkerSandbox("_df_no_such_user", SafeHelper.Create(_dir).Path, stuckSudo) { Lock = workerLock, StopGrace = TimeSpan.FromMilliseconds(200) };
+        using var cts = new CancellationTokenSource();
+
+        var deletion = sandbox.DeleteAsWorkerAsync(Path.Combine(_dir, "nothing-there"), cts.Token);
+        var pid = await SandboxSupport.WaitForPidAsync(pidFile, deletion);
+        try
+        {
+            await cts.CancelAsync();
+
+            // The caller is let go after the grace (a shutdown is not held up for ever) — the lock is not.
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => deletion);
+            Assert.True(pid.IsAlive);
+            Assert.False(await workerLock.TryHoldAsync(() => Task.CompletedTask));
+            var next = workerLock.HoldAsync(() => Task.CompletedTask, CancellationToken.None, retry: TimeSpan.FromMilliseconds(5));
+
+            pid.KillIfStillRunning();
+            await next.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            pid.KillIfStillRunning();
+        }
+    }
+
+    [Fact]
+    public async Task A_deletion_that_does_not_wait_runs_no_helper_while_another_runs_worker_phase_holds_the_sandbox_user()
+    {
+        var (sandbox, workerLock, probes) = LockedSandbox();
+        var doomed = Directory.CreateDirectory(Path.Combine(_dir, "doomed-later")).FullName;
+
+        using (WorkerLock.Acquire(Path.GetDirectoryName(workerLock.Path)!)) // another process's worker session
+        {
+            Assert.False(await sandbox.TryDeleteAsWorkerAsync(doomed, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken));
+            Assert.Empty(probes()); // the helper, whose exit would kill that worker, did not run
+            Assert.True(Directory.Exists(doomed));
+        }
+
+        // Free: it deletes, under the lock.
+        Assert.True(await sandbox.TryDeleteAsWorkerAsync(doomed, CancellationToken.None));
+        Assert.Equal(["held"], probes());
+        Assert.False(Directory.Exists(doomed));
     }
 
     [Fact]
@@ -731,9 +891,12 @@ public class WorkerSandboxTests
         var own = OwnProcess.Of(sleeper);
         SafeHelper.Register(registry, own);
 
-        var stopped = await new WorkerSandbox(Environment.UserName, helper.Path, SandboxSupport.FakeSudo(_dir)).StopAllAsync(CancellationToken.None);
+        // The kill of every process of the worker user: under the sandbox user's lock (sc-25988), taken here by the stop itself.
+        var (sandbox, _, probes) = LockedSandbox(new WorkerSandbox(Environment.UserName, helper.Path, SandboxSupport.FakeSudo(_dir)));
+        var stopped = await sandbox.StopAllAsync(CancellationToken.None);
 
         Assert.True(stopped);
+        Assert.Equal(["held"], probes());
         await OwnProcess.WaitUntilDeadAsync(own);
     }
 
@@ -820,6 +983,80 @@ public class WorkerSandboxTests
     }
 
     private WorkerSandbox LocalSandbox() => SandboxSupport.LocalSandbox(_dir);
+
+    /// <summary><see cref="LocalSandbox()"/> with a lock of its own, whose every helper run records whether the lock was held then.</summary>
+    private (WorkerSandbox Sandbox, WorkerLock Lock, Func<string[]> Probes) LockedSandbox(WorkerSandbox? over = null)
+    {
+        var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, $"root-{Guid.NewGuid():N}")).FullName);
+        var log = Path.Combine(_dir, $"lock-probes-{Guid.NewGuid():N}");
+        var sandbox = (over ?? LocalSandbox()) with { Lock = workerLock, SudoPath = SandboxSupport.LockProbingSudo(_dir, workerLock, log) };
+        return (sandbox, workerLock, () => File.Exists(log) ? File.ReadAllLines(log) : []);
+    }
+
+    [Fact]
+    public async Task The_helper_is_never_started_unless_the_calling_flow_holds_the_sandbox_users_lock()
+    {
+        var (sandbox, workerLock, probes) = LockedSandbox();
+
+        var refused = Assert.Throws<InvalidOperationException>(() => sandbox.Start(_dir, "/usr/bin/true", [], new Dictionary<string, string>()));
+
+        Assert.Contains("Refusing a run of /usr/bin/true as _factory", refused.Message);
+        Assert.Contains("is not held", refused.Message);
+        Assert.Empty(probes()); // nothing ran: not even sudo
+        // Held, it starts; and the lock really is locked against every other process while it runs.
+        await workerLock.HoldAsync(async () =>
+        {
+            using var p = sandbox.Start(_dir, "/usr/bin/true", [], new Dictionary<string, string>());
+            await p.WaitForExitAsync();
+            WorkerSandbox.Stop(p);
+            Assert.Equal(0, p.ExitCode);
+        }, CancellationToken.None);
+        Assert.Equal(["held"], probes());
+    }
+
+    [Fact]
+    public async Task Every_run_of_the_helper_a_short_command_a_deletion_and_a_worker_session_happens_with_the_lock_held()
+    {
+        var (sandbox, workerLock, probes) = LockedSandbox();
+        var doomed = Directory.CreateDirectory(Path.Combine(_dir, "doomed")).FullName;
+        File.WriteAllText(Path.Combine(doomed, "file"), "x");
+        var claude = SandboxSupport.Executable(_dir, "fake-claude.sh",
+            "#!/bin/sh\necho '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-lock\"}'\n"
+            + "echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"sess-lock\"}'\n");
+
+        // Each takes the lock itself when its caller holds none …
+        Assert.Equal(0, (await sandbox.RunAsync("/", "/usr/bin/true", [], CancellationToken.None)).ExitCode);
+        await sandbox.DeleteAsWorkerAsync(doomed, CancellationToken.None);
+        var result = await new ClaudeWorker(claude, SandboxSupport.Router, "rk_worker", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1), sandbox)
+            .RunAsync(_dir, "prompt", null, WorkerModelClass.Mid, null, CancellationToken.None);
+        // … and runs under its caller's hold when a worker phase has it (no wait on itself).
+        await workerLock.HoldAsync(async () =>
+        {
+            Assert.Equal(0, (await sandbox.RunAsync("/", "/usr/bin/true", [], CancellationToken.None)).ExitCode);
+            await sandbox.DeleteAsWorkerAsync(Path.Combine(_dir, "nothing-there"), CancellationToken.None);
+        }, CancellationToken.None);
+
+        Assert.False(Directory.Exists(doomed));
+        Assert.True(result.Succeeded, result.StderrTail);
+        Assert.Equal(["held", "held", "held", "held", "held"], probes());
+        Assert.False(workerLock.IsHeld);
+    }
+
+    [Fact]
+    public async Task A_helper_run_waits_while_another_runs_worker_phase_holds_the_sandbox_user()
+    {
+        var (sandbox, workerLock, probes) = LockedSandbox();
+        var other = WorkerLock.Acquire(Path.GetDirectoryName(workerLock.Path)!); // another process's worker session
+
+        var deletion = sandbox.DeleteAsWorkerAsync(Path.Combine(_dir, "nothing-there"), CancellationToken.None);
+        await Task.Delay(600, TestContext.Current.CancellationToken);
+        Assert.False(deletion.IsCompleted);
+        Assert.Empty(probes()); // the helper, whose exit would kill that worker, has not run
+        other.Dispose();
+        await deletion;
+
+        Assert.Equal(["held"], probes());
+    }
 }
 
 /// <summary>

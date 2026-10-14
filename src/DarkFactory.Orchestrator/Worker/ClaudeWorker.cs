@@ -514,7 +514,17 @@ public sealed class ClaudeWorker(
         WorkerCallbacks? callbacks, CancellationToken ct) =>
         RunAsync(workingDirectory, prompt, resumeSessionId, modelClass, callbacks, null, ct);
 
-    public async Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
+    /// <summary>
+    /// Sandboxed, the whole session runs under the sandbox user's lock (<see cref="WorkerSandbox.Lock"/>, sc-25988): the run's
+    /// worker phase holds it already (and waited for it honouring Pause and Stop); a caller that holds none waits for it here.
+    /// </summary>
+    public Task<WorkerResult> RunAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
+        WorkerCallbacks? callbacks, string? mcpConfigPath, CancellationToken ct) =>
+        sandbox?.Lock is { } held
+            ? held.HoldAsync(() => RunLockedAsync(workingDirectory, prompt, resumeSessionId, modelClass, callbacks, mcpConfigPath, ct), ct)
+            : RunLockedAsync(workingDirectory, prompt, resumeSessionId, modelClass, callbacks, mcpConfigPath, ct);
+
+    private async Task<WorkerResult> RunLockedAsync(string workingDirectory, string prompt, string? resumeSessionId, string modelClass,
         WorkerCallbacks? callbacks, string? mcpConfigPath, CancellationToken ct)
     {
         if (!WorkerModelClass.IsValid(modelClass))
@@ -585,9 +595,31 @@ public sealed class ClaudeWorker(
         WorkerCallbacks? callbacks, CancellationToken ct)
     {
         // Sandboxed, the helper makes the worker a process-group leader and the pid reported is sudo's.
-        using var process = sandbox is null
+        var process = sandbox is null
             ? StartDirect(workingDirectory, args, modelClass)
             : sandbox.Start(workingDirectory, claudePath, args, BuildRouterVariables(routerBaseUrl, routerKey, auth, modelClass));
+        try
+        {
+            return await RunStartedAsync(process, callbacks, ct);
+        }
+        finally
+        {
+            if (sandbox is null)
+            {
+                process.Dispose();
+            }
+            else
+            {
+                // Exited, or stopped and waited for above: disposed now. A helper that is still alive (the session is marked
+                // WorkerStillRunning) keeps the sandbox user's lock until it is gone — its exit still kills every process of
+                // the worker user, so no other run's worker may start under it (sc-25988).
+                await sandbox.EndAsync(process, TimeSpan.Zero);
+            }
+        }
+    }
+
+    private async Task<WorkerResult> RunStartedAsync(Process process, WorkerCallbacks? callbacks, CancellationToken ct)
+    {
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(timeout);
 
@@ -689,7 +721,12 @@ public sealed class ClaudeWorker(
     /// Stops a running worker. Unsandboxed, the owner kills the tree; sandboxed, the owner cannot
     /// signal the worker user's processes, so it closes the helper's stdin and the helper kills them.
     /// </summary>
-    /// <returns>False when the sandboxed worker did not exit within the grace period.</returns>
+    /// <remarks>
+    /// A helper that has not exited within the grace is stopped the way a crashed run's leftover is
+    /// (<see cref="WorkerSandbox.StopAllAsync"/>: a second run of the helper, whose exit kills every process of the worker user —
+    /// the first helper and its worker among them), under the lock this session still holds, and waited for once more.
+    /// </remarks>
+    /// <returns>False when the sandboxed worker did not exit even then: its helper is still alive.</returns>
     private async Task<bool> StopAsync(Process process)
     {
         if (sandbox is null)
@@ -698,16 +735,20 @@ public sealed class ClaudeWorker(
             return true;
         }
         WorkerSandbox.Stop(process);
-        using var grace = new CancellationTokenSource(_stopGrace);
-        try
+        if (await WorkerSandbox.ExitsWithinAsync(process, _stopGrace))
         {
-            await process.WaitForExitAsync(grace.Token);
             return true;
         }
-        catch (OperationCanceledException)
+        try
         {
-            return false;
+            using var bounded = new CancellationTokenSource(sandbox.StopGrace);
+            await sandbox.StopAllAsync(bounded.Token);
         }
+        catch (Exception)
+        {
+            // Could not be run or did not finish: the wait below decides, and a helper still alive keeps the lock.
+        }
+        return await WorkerSandbox.ExitsWithinAsync(process, _stopGrace);
     }
 
     private Process StartDirect(string workingDirectory, IReadOnlyList<string> args, string modelClass)

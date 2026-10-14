@@ -20,7 +20,8 @@ namespace DarkFactory.AcceptanceTests;
 /// Shared plumbing of the live <c>factory work</c> acceptance tests (AT2–AT5, AT7; docs/acceptance.md). Each test runs
 /// against a throwaway ledger database and its own work root under the configured one, so it never reads or writes the
 /// owner's real ledger, controls or worktrees; it holds the configured work root's <see cref="WorkerLock"/> for its whole
-/// run, so no real sandboxed run can share the single-tenant <c>_factory</c> user with it (it skips if one is running).
+/// run, so no real run's worker phase can share the single-tenant <c>_factory</c> user with it (a real run waits at its worker
+/// phases meanwhile; the test skips if one holds the lock when it starts).
 /// </summary>
 internal sealed class E2e : IAsyncDisposable
 {
@@ -28,9 +29,9 @@ internal sealed class E2e : IAsyncDisposable
 
     private readonly NpgsqlConnectionStringBuilder _admin;
     private readonly string _database;
-    private readonly WorkerLock? _realRootLock;
+    private readonly IDisposable? _realRootLock;
 
-    private E2e(NpgsqlConnectionStringBuilder admin, string database, WorkerLock? realRootLock, string workRoot)
+    private E2e(NpgsqlConnectionStringBuilder admin, string database, IDisposable? realRootLock, string workRoot)
     {
         (_admin, _database, _realRootLock, WorkRoot) = (admin, database, realRootLock, workRoot);
         Ledger = new NpgsqlConnectionStringBuilder(admin.ConnectionString) { Database = database }.ConnectionString;
@@ -79,7 +80,7 @@ internal sealed class E2e : IAsyncDisposable
         await Harness.RequireRouterAsync();
 
         var realRoot = Harness.Options.WorkRoot;
-        WorkerLock? realLock = null;
+        IDisposable? realLock = null;
         if (Harness.Options.WorkerSandbox is not null)
         {
             try
@@ -88,7 +89,7 @@ internal sealed class E2e : IAsyncDisposable
             }
             catch (InvalidOperationException ex)
             {
-                Assert.Skip($"A real sandboxed factory run holds the work root: stop `factory work`/`factory run` first. {ex.Message}");
+                Assert.Skip($"A real factory run's worker phase holds the work root: stop `factory work`/`factory run` first. {ex.Message}");
             }
         }
         var admin = new NpgsqlConnectionStringBuilder(Harness.Options.LedgerConnectionString);

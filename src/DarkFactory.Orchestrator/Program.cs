@@ -51,7 +51,9 @@ static async Task<int> RunAsync(ItemRef item, bool ignoreScope, CancellationToke
     var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
     // The item's own source, from the registry: one that is not configured is refused before anything else is asked.
     using var sources = new WorkSourceRegistry(options);
-    return await FactoryRunner.RunCommandAsync(options, c => CheckRouterEnrollmentAsync(options, c),
+    // Start-up checks, each a refusal (exit 2): the installed launch helper is the current one (read, not run), then the router.
+    return await FactoryRunner.RunCommandAsync(options,
+        async c => await FactoryRunner.CheckHelperAsync(options.WorkerSandbox, c) ?? await CheckRouterEnrollmentAsync(options, c),
         c => FactoryRunner.RunAsync(options, sources.Of(item.Naming), item.Id, ignoreScope, Console.Out, c), Console.Error, ct,
         requireSource: () => sources.Of(item.Naming));
 }
@@ -67,6 +69,13 @@ static async Task<int> WorkAsync(CancellationToken ct)
             Console.Error.WriteLine(startError);
             return 2;
         }
+    }
+    // The installed launch helper must be the current one: read, not run (its exit kills every process of the worker user), so
+    // a stale helper refuses the start here rather than leave claimed items waiting at their first worker phase.
+    if (await FactoryRunner.CheckHelperAsync(options.WorkerSandbox, ct) is { } helperError)
+    {
+        Console.Error.WriteLine(helperError);
+        return 2;
     }
     if (await CheckRouterEnrollmentAsync(options, ct) is { } enrollmentError)
     {

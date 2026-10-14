@@ -688,11 +688,15 @@ public class KanbanPlanPipelineTests
             new(new KanbanBoard(KanbanWrites.Client(Board.Client(), FakeKanbanBoard.FullToken), (_, _) => Task.CompletedTask), Keys, new KanbanScope(["DF"]),
                 new Uri("https://kanban.test/"));
 
-        public Task<RunOutcome> Run(int id, bool workerless = false) =>
+        /// <summary>
+        /// One run of the item. A plan item waiting on its stories is only evaluated: like every run outside its worker phases it
+        /// needs no worker and no sandbox lock (sc-25988: there is no "workerless" pipeline any more).
+        /// </summary>
+        public Task<RunOutcome> Run(int id) =>
             new RunPipeline(Source(), new WorkLedger(new LedgerDbContext(_options), TimeProvider.System), Locks, Repo, Worker, Repo, Sandbox, Log,
                 controls: Controls, controlPollInterval: TimeSpan.FromMilliseconds(10),
                 gate: new GateStage(Repo, Reviewer, TimeSpan.FromMilliseconds(5), TimeSpan.FromSeconds(30), Risk: FakeCodeGraphRisk.Reader(CodeGraph)),
-                planner: new Seat(Planner), workerless: workerless).RunAsync(id, None);
+                planner: new Seat(Planner)).RunAsync(id, None);
 
         /// <summary>Lists the plan item ready (which gives it its key) and runs it through its planner: Planned.</summary>
         public async Task<(int Plan, int[] Stories)> Plan()
@@ -834,7 +838,7 @@ public class KanbanPlanPipelineTests
         Assert.Equal(detail, (await View()).LastHeld!.Value.Detail);
 
         // A run of the plan by hand while the claim is lost evaluates nothing: no item released, nothing recorded as released.
-        var held = await h.Run(plan, workerless: true);
+        var held = await h.Run(plan);
         Assert.Equal(WorkState.Planned, held.State);
         Assert.StartsWith($"kb-{plan} is still not the factory's to work ({detail}); its plan is not evaluated and nothing of it is released", held.Error);
         Assert.Empty(await h.Steps(plan, RunPipeline.Steps.PlanReleased));
@@ -845,14 +849,14 @@ public class KanbanPlanPipelineTests
         // Their claim lapses: the poll's renewal takes the item back, and the next evaluation records it and goes on by itself.
         h.Board.Time.Now = h.Board.Time.Now.AddHours(2);
         Assert.True((await h.Source().RenewClaimAsync(plan, None)).IsHeld);
-        var resumed = await h.Run(plan, workerless: true);
+        var resumed = await h.Run(plan);
         Assert.Equal((WorkState.Planned, (string?)null), (resumed.State, resumed.Error));
         Assert.Equal([$"was {detail}"], await h.Steps(plan, RunPipeline.Steps.PlanClaimRegained));
         Assert.Equal(["kb-2"], await h.Steps(plan, RunPipeline.Steps.PlanReleased));
         Assert.Equal("Ready", h.Made[0].Status);
         Assert.Null((await View()).LastHeld);
         // Recorded once: later evaluations add nothing.
-        Assert.True((await h.Run(plan, workerless: true)).Succeeded);
+        Assert.True((await h.Run(plan)).Succeeded);
         Assert.Single(await h.Steps(plan, RunPipeline.Steps.PlanClaimRegained));
 
         // Lost again, for the same reason: a new row.
@@ -909,7 +913,7 @@ public class KanbanPlanPipelineTests
         var start = h.Repo.Tip(Main);
 
         // The waiting plan releases only A: Ready, listed like any ready item; B and C stay in Backlog.
-        Assert.True((await h.Run(plan, workerless: true)).Succeeded, h.Log.ToString());
+        Assert.True((await h.Run(plan)).Succeeded, h.Log.ToString());
         Assert.Equal(("Ready", "Backlog", "Backlog"), (itemA.Status, itemB.Status, itemC.Status));
         Assert.Equal(["kb-2"], await h.Steps(plan, RunPipeline.Steps.PlanReleased));
         Assert.Equal([a], await h.Source().ListReadyAsync(None));
@@ -944,7 +948,7 @@ public class KanbanPlanPipelineTests
         Assert.Contains($"kb-2 merged into its plan's changeset branch `{ChangesetBranch}`", Assert.Single(itemA.Comments).Body);
 
         // A's merge releases B, and only B. It had left the backlog already (by hand): it is left where it is, and now starts.
-        Assert.True((await h.Run(plan, workerless: true)).Succeeded, h.Log.ToString());
+        Assert.True((await h.Run(plan)).Succeeded, h.Log.ToString());
         Assert.Equal(["kb-2", "kb-3 (it had already left the backlog; left where it is)"], await h.Steps(plan, RunPipeline.Steps.PlanReleased));
         Assert.Equal(("Ready", "Backlog"), (itemB.Status, itemC.Status));
         Assert.Equal([b], await h.Source().ListReadyAsync(None));
@@ -953,7 +957,7 @@ public class KanbanPlanPipelineTests
         Assert.Contains("docs/factory-kb-2.md|factory/kb-2", h.Repo.At(h.Repo.Prepared[1].Start)); // B starts from A's merge
 
         // B's merge releases C.
-        Assert.True((await h.Run(plan, workerless: true)).Succeeded, h.Log.ToString());
+        Assert.True((await h.Run(plan)).Succeeded, h.Log.ToString());
         Assert.Equal(["kb-2", "kb-3 (it had already left the backlog; left where it is)", "kb-4"], await h.Steps(plan, RunPipeline.Steps.PlanReleased));
         Assert.Equal("Ready", itemC.Status);
         await h.Merge(c);
@@ -962,7 +966,7 @@ public class KanbanPlanPipelineTests
         Assert.Empty(h.Parent.Comments);
 
         // Every item merged: one pull request from the changeset branch to the default branch, the plan item's own, linked on it.
-        var changeset = await h.Run(plan, workerless: true);
+        var changeset = await h.Run(plan);
         Assert.Equal((WorkState.Review, (string?)null), (changeset.State, changeset.Error));
         var pull = h.Repo.Opened.Single(o => o.Head == ChangesetBranch);
         Assert.Equal((Main, "kb-1: Add CSV export (changeset of 3 stories)"), (pull.Base, pull.Title));
@@ -997,7 +1001,7 @@ public class KanbanPlanPipelineTests
         var h = new Harness();
         var (plan, stories) = await h.Plan();
         var (itemA, itemB) = (h.Made[0], h.Made[1]);
-        Assert.True((await h.Run(plan, workerless: true)).Succeeded);
+        Assert.True((await h.Run(plan)).Succeeded);
         // A is finished by hand on the board (never merged by the factory) and B moved to Ready.
         (itemA.Status, itemB.Status) = ("Done", "Ready");
         Assert.Contains(stories[1], await h.Source().ListReadyAsync(None));
@@ -1021,7 +1025,7 @@ public class KanbanPlanPipelineTests
         var h = new Harness();
         var (plan, stories) = await h.Plan();
         var itemA = h.Made[0];
-        Assert.True((await h.Run(plan, workerless: true)).Succeeded);
+        Assert.True((await h.Run(plan)).Succeeded);
         async Task<long?> EpicOf(int id)
         {
             await using var db = h.Contexts.CreateDbContext();
@@ -1050,7 +1054,7 @@ public class KanbanPlanPipelineTests
         var h = new Harness();
         var (plan, stories) = await h.Plan();
         var (itemA, itemB) = (h.Made[0], h.Made[1]);
-        Assert.True((await h.Run(plan, workerless: true)).Succeeded);
+        Assert.True((await h.Run(plan)).Succeeded);
         // Someone removes B's dependency on A on the board and moves B to Ready: the board lists it, and its own claim rule
         // (no open blocker) would let it be claimed.
         Assert.Contains(itemA, itemB.Blockers);
@@ -1080,7 +1084,7 @@ public class KanbanPlanPipelineTests
         itemA.Blockers.Add(theirs);
         itemB.Status = "Closed";
 
-        Assert.True((await h.Run(plan, workerless: true)).Succeeded, h.Log.ToString());
+        Assert.True((await h.Run(plan)).Succeeded, h.Log.ToString());
 
         var outsider = (await h.Keys.KnownAsync(theirs.Id, None))!.Value;
         Assert.Equal("Backlog", itemA.Status);
@@ -1090,14 +1094,14 @@ public class KanbanPlanPipelineTests
 
         // Their item is finished on the board (never worked by the factory): that satisfies a blocker outside the plan.
         theirs.Status = "Done";
-        Assert.True((await h.Run(plan, workerless: true)).Succeeded, h.Log.ToString());
+        Assert.True((await h.Run(plan)).Succeeded, h.Log.ToString());
         Assert.Equal("Ready", itemA.Status);
         Assert.Equal(["kb-2"], await h.Steps(plan, RunPipeline.Steps.PlanReleased));
 
         // A merges; B, closed on the board, cannot be released: the plan says so in this board's words, and nothing is written to B.
         await h.Merge(2);
         var version = itemB.Version;
-        Assert.True((await h.Run(plan, workerless: true)).Succeeded, h.Log.ToString());
+        Assert.True((await h.Run(plan)).Succeeded, h.Log.ToString());
         Assert.Equal("kb-3 is Closed on the board, so it was not released and the plan cannot complete: move it back to Backlog",
             (await h.Steps(plan, RunPipeline.Steps.PlanHeld)).Last());
         Assert.Contains("kb-3 Closed", h.Log.ToString());
@@ -1106,7 +1110,7 @@ public class KanbanPlanPipelineTests
         Assert.Equal(["kb-2"], await h.Steps(plan, RunPipeline.Steps.PlanReleased));
         // Moved back to Backlog, the next evaluation releases it.
         itemB.Status = "Backlog";
-        Assert.True((await h.Run(plan, workerless: true)).Succeeded, h.Log.ToString());
+        Assert.True((await h.Run(plan)).Succeeded, h.Log.ToString());
         Assert.Equal(["kb-2", "kb-3"], await h.Steps(plan, RunPipeline.Steps.PlanReleased));
     }
 
@@ -1116,7 +1120,7 @@ public class KanbanPlanPipelineTests
         var h = new Harness();
         var (plan, stories) = await h.Plan();
         var (itemA, itemB) = (h.Made[0], h.Made[1]);
-        Assert.True((await h.Run(plan, workerless: true)).Succeeded);
+        Assert.True((await h.Run(plan)).Succeeded);
         Assert.Equal("Ready", itemA.Status);
 
         var stopped = await h.Actions.StopAsync(ControlScope.Item("kb-1"), "tester", None);
@@ -1155,7 +1159,7 @@ public class KanbanPlanPipelineTests
     {
         var h = new Harness();
         var (plan, _) = await h.Plan();
-        Assert.True((await h.Run(plan, workerless: true)).Succeeded);
+        Assert.True((await h.Run(plan)).Succeeded);
         // Someone closes the released item before anything started it: theirs, left as it is.
         var itemA = h.Made[0];
         (itemA.Status, itemA.Version) = ("Closed", itemA.Version + 1);
