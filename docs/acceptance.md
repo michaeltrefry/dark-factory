@@ -891,7 +891,9 @@ since 2026-01-01, `E2e.KanbanKeyStart`, so no two runs share an item's branch â€
 from `factory/kb-<n>` is merged at the commit the Merge row records; on the board the item is `Done`, with the pull request and
 the branch as links of kind `pr` and `branch`, and EXACTLY ONE comment equal to `LedgerReport.MergedCloseout`'s rendering of
 the rows written before the `closeout` `posted` row (attributed, as the pipeline posts it); a second run adds no second
-`claimed`, `linked` or posted `closeout` row, no link and no comment.
+`claimed`, `linked` or posted `closeout` row and no link, and the closeout stays the item's only closeout. Its one board write
+is the factory's once-only notice on an item nothing in this phase moves on (`RunPipeline.HeldNoticeText` for Watch, with a
+`held-notice` row): the test allows that notice at most once and no other comment.
 
 Not live (every `dotnet test`): `KanbanWorkSourceTests` (each member, each refusal, paging, what every write sends â€” against a
 fake MCP server that behaves as KanbanBoard's contract says, `FakeKanbanBoard`), `KanbanPipelineTests` (the same run through the

@@ -235,15 +235,22 @@ public class KanbanAcceptanceTests
         var expected = Lines(WorkSourceComments.Attributed(LedgerReport.MergedCloseout(name, history.Take(closeout).ToList(), costs)));
         Assert.Single(await KanbanPlanAcceptanceTests.CommentsAsync(mcp, guid, ct), c => c == expected);
 
-        // A second run resumes from the ledger and writes nothing twice: no second claim, link or closeout.
+        // A second run resumes from the ledger and writes nothing twice: no second claim, link or closeout. Its one board write is
+        // the factory's once-only notice that nothing in this phase moves a Watch item on (a held-notice row): the closeout stays
+        // the only closeout, the notice is there at most once, and there is no other comment.
         await FactoryRunner.RunAsync(options, item, ignoreScope: false, Console.Out, ct);
         var resumed = await HistoryAsync(e2e, name, ct);
         Assert.Single(resumed, e => e.Step == RunPipeline.Steps.Claimed);
         Assert.Single(resumed, e => e.Step == RunPipeline.Steps.Linked);
         Assert.Single(resumed, e => e.Step == RunPipeline.Steps.Closeout && e.Detail == RunPipeline.Posted);
+        Assert.InRange(resumed.Count(e => e.Step == RunPipeline.Steps.HeldNotice), 0, 1);
         var again = await board.GetItemAsync(guid, ct);
         Assert.Equal(after.Links!.Count, again.Links!.Count);
-        Assert.Single(await KanbanPlanAcceptanceTests.CommentsAsync(mcp, guid, ct), c => c == expected);
+        var notice = Lines(WorkSourceComments.Attributed(RunPipeline.HeldNoticeText(name, WorkState.Watch)));
+        var comments = await KanbanPlanAcceptanceTests.CommentsAsync(mcp, guid, ct);
+        Assert.Single(comments, c => c == expected);
+        Assert.InRange(comments.Count(c => c == notice), 0, 1);
+        Assert.All(comments, c => Assert.True(c == expected || c == notice, $"{name} has a comment that is neither its closeout nor the notice: {c}"));
     }
 
     private static string Lines(string? text) => (text ?? "").Replace("\r\n", "\n", StringComparison.Ordinal);

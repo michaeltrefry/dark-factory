@@ -1260,9 +1260,7 @@ public sealed partial class RunPipeline(
             var id = Naming.Format(storyId);
             try
             {
-                await source.CommentAsync(storyId,
-                    $"{id} is {item.State} in the factory ledger and nothing in this phase of the factory moves it on from there, "
-                    + "so the factory is not working on it whatever its board state.", ct);
+                await source.CommentAsync(storyId, HeldNoticeText(id, item.State), ct);
                 await ledger.CheckpointAsync(item, Steps.HeldNotice, null, "posted", ct);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -1273,6 +1271,14 @@ public sealed partial class RunPipeline(
         log.WriteLine($"[{item.State}] {item.ExternalId} is {item.State}; nothing to do.");
         return await OutcomeAsync(item, item.State == WorkState.Cancelled ? $"{item.ExternalId} is Cancelled." : null, ct);
     }
+
+    /// <summary>
+    /// The once-only notice (a <see cref="Steps.HeldNotice"/> row) a run posts on an item that nothing in this phase of the factory
+    /// moves on from <paramref name="state"/> — e.g. a merged item in Watch, run again.
+    /// </summary>
+    internal static string HeldNoticeText(string id, WorkState state) =>
+        $"{id} is {state} in the factory ledger and nothing in this phase of the factory moves it on from there, "
+        + "so the factory is not working on it whatever its board state.";
 
     /// <summary>The story left the watch scope while the item was in flight: park it, comment once, and stop.</summary>
     private async Task<RunOutcome> ParkOutOfScopeAsync(WorkItem item, int storyId, CancellationToken ct)

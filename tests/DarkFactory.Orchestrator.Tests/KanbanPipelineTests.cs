@@ -82,6 +82,8 @@ public class KanbanPipelineTests
         Assert.Equal(["claim_work_item", "update_work_item", "add_work_item_link", "add_work_item_link", "add_work_item_comment"], h.Board.Writes);
         Assert.Equal((version, 2, "InProgress"), (item.Version, item.Links.Count, item.Status));
         Assert.StartsWith("[author: dark-factory] kb-1", Assert.Single(item.Comments).Body);
+        // The notice is exactly RunPipeline.HeldNoticeText, which the live P4b-AT1 compares a Watch item's comments with.
+        Assert.Equal(WorkSourceComments.Attributed(RunPipeline.HeldNoticeText("kb-1", WorkState.Review)), item.Comments.Single().Body);
         Assert.Single(prs.Opened);
         Assert.Single(worker.Calls);
     }
