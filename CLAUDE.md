@@ -133,6 +133,12 @@ Claude Code headless workers through the Weave router.
   `factory run kb-N` on a Ready item of a watched KanbanBoard project — its key given once, the item claimed on the real board
   (the factory's marker, read back) and moved out of Ready, the pull request opened from `factory/kb-N` and it and the branch
   linked on the item under their kinds; a second run writes neither claim nor link again. Checked up to "pull request opened".
+  P4b-AT2 (sc-25984, `KanbanPlanAcceptanceTests`, `FACTORY_E2E_P4B_PLAN_KANBAN_ITEM` + `FACTORY_E2E_P4B_KANBAN_PROJECT`): a real
+  planner plans a `plan`-labelled Kanban item into at least 3 items with a dependency chain (else INCONCLUSIVE,
+  `PlanLive.ChainProblem`) — each one item of the real board, in the plan item's project and epic, in `Backlog`, marked as planned
+  from the plan item's GUID, with the board's own dependencies — released in order (`Ready` only after its blockers' Merge rows),
+  each worked and merged by the gate into `factory/changeset-kb-<n>`, the changeset then merged by one gated pull request, the
+  plan item `Done` with a closeout equal to `LedgerReport`'s rendering of the throwaway ledger's rows.
   P4b-AT3 (sc-25983, `KanbanAcceptanceTests.P4b_AT3_…`, `FACTORY_E2E_P4B_KANBAN_PROJECT` + `FACTORY_E2E_P4B_KANBAN_OTHER_TOKEN`,
   a second identity's full-scope token; no model): on a throwaway Backlog item the test creates (once, by its idempotency key),
   in flight only in the throwaway ledger — a second caller's claim on the item the factory holds is refused; one intake poll
@@ -344,7 +350,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   The intake loop's claim renewal (sc-25983, below) asks every lane the registry builds — a watched source's and the lane of a
   source that only has its credential alike (`WorkSourceRegistry.Lanes`) — so a Kanban item in flight keeps its claim after
   `Kanban:Watch:Projects` is cleared, for as long as the write token is set; with no token there is no lane, nothing renews it,
-  and the start-up warning says so. Not yet: plans (K4). `factory kanban key <GUID>` stays: the intake loop gives every item it LISTS its key, but
+  and the start-up warning says so. Plans: "Plans on Kanban" below (sc-25984). `factory kanban key <GUID>` stays: the intake loop gives every item it LISTS its key, but
   `factory run kb-<n>` on an item no poll has listed — `factory work` not running, the item outside the watched projects (run
   with `--ignore-scope`), or not `Ready` yet — still needs the key from somewhere. Contract: KanbanBoard's
   `docs/mcp-contract.md` (tool and argument names are compared exactly there, and an argument a tool does not have is refused).
@@ -394,7 +400,65 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   conflict is thrown (a claim left on a still-`Ready` item would hide it from every ready listing for a day). `ReportStateAsync`:
   Claimed → `InProgress`, Merged → `Done`, Stopped → `Backlog` with the factory's claim released and the comment posted; an item
   already in the target column is not written. `LinkAsync` attaches each URL under its kind from the URL (`…/pull/<n>` `pr`,
-  `…/tree/<branch>` `branch`, else `other`). Not handled yet: plans (`PlansItems` false, no children).
+  `…/tree/<branch>` `branch`, else `other`).
+  Plans on Kanban (sc-25984; `KanbanWorkSource`'s plan members, the pipeline unchanged in kind: it reaches the board only through
+  `IWorkSource`, E1). A Kanban item carrying the label `plan` — the board's own labels, read from `label_list` — is a plan item
+  (`PlansItems` true: the board is the owner's, `ItemNaming.Trusted`), planned, released and delivered exactly as "Plan items",
+  "Dependency-aware release", "Plan failures and controls" and "Changeset branch" say for a Shortcut story; what differs is only
+  how the board is written. `CreateChildrenAsync`: each planned item is ONE `create_work_item` in the plan item's project and —
+  when it has one — its epic (no epic: the project alone; nothing is refused, since the items are found again by key, not by
+  where they are), status left to the board's default `Backlog`, type by `KanbanWorkSource.ItemType` (the planner's `feature`,
+  `bug`, `chore` → the board's `Story`, `Issue`, `Task`; `StoryType` is the way back, so a planned item reads back with the type
+  it was planned as; any other type is refused before any write), under the idempotency key `KanbanWorkSource.ChildKey` =
+  `ChildItem.Key(<plan item's GUID>)`: `dark-factory:child:<GUID>:<SHA-256 of the name and the description as sent>`, 120
+  characters (the board takes 128 printable ASCII ones, per identity and project). The board creates once per key and answers
+  the same item on every repeat (`created` false), so a retry after a failure part-way, a restart, or a lost answer (the typed
+  caller sends a keyed create again as it is) creates nothing twice and needs no search for what an earlier attempt made — and a
+  namesake someone else wrote, having no such key, is never taken for a planned item. Residuals of the board's own key rules,
+  accepted: a key belongs to the calling identity, so a retry under ANOTHER identity's `Kanban:WriteToken` would create the
+  items a second time (keep the factory's service identity while a plan's items are being created); a repeat answers the item
+  "as it is now", so one a person edited, moved or closed since is reused as they left it; and deleting an item frees its key,
+  so a retry creates a deleted one again. `import_epic_plan` is NOT used: it always creates a new epic. Identity (E4): the item's GUID is the board's to give, so the board is written first; its ledger key is
+  allocated the moment the create answers — with its project, like any Kanban item's (`KeyAsync(item, project)`, sc-25985), and its epic is recorded when it is first read for work (`ReadSpecAsync` → `EpicKeyAsync`: `WorkItem.EpicId` is the plan item's epic's key, so an `epic:kb-<n>` control holds it) — before its dependencies are written, and `plan-stories`, blockers, branches and every
+  ledger row name it `kb-<n>` from then on. Everything written ONTO the board names GUIDs instead: the idempotency key, and the
+  planned-item marker `<!-- dark-factory:planned-from <plan item's GUID> -->` with the sentence after it (`Plan.Children` is
+  given `WorkStory.BoardRef` — the item's id on its board, `WorkStory.BoardId`, which is its ledger name for a source that has no
+  other, so a Shortcut child's marker and key are byte-for-byte what they were). Where a person reads the marker's plan item the
+  ledger's name stands in (`WorkStory.PlannedFrom`: the Kanban source translates the GUID through `KanbanKeys.KnownAsync`,
+  allocating nothing; `PlannedStory.ParentOf` reads ids up to `MaxParentLength`, 36), so the refusal of a planned item whose plan
+  has not recorded it says "its plan kb-1 has not finished creating its stories". Dependencies: `add_work_item_dependency(id,
+  blocked_by_id)` per blocker (`KanbanBoard.AddDependencyAsync`: no idempotency key and no version — a dependency moves neither —
+  so after a lost answer the blocked item is read and one that lists the blocker is not sent it again; the board treats an
+  existing dependency as success anyway); one the create's own answer already lists is not sent. Cycles: a child blocked by
+  itself or by a later child is refused before any board call (`ArgumentException`; `PlanParser` has already refused a cyclic
+  plan); a dependency the board refuses `cycle` — someone made the blocker depend on the item since — fails the step naming both
+  items (`KanbanItemException`: "kb-3 could not be made to wait for kb-2 … Remove it on the board and re-run the plan item"), the
+  plan item escalates with no `plan-stories` row, and the re-run creates nothing twice. `BlockersAsync`: `get_work_item`'s
+  `blockers`, one read, each by its ledger key (allocated now for an item the factory never saw — with no project, `KanbanKeys.KeyAsync(item)`: a blocker is named by its GUID alone, and its project is recorded when the item itself is next listed or read; a project the row has is kept), finished only in `Done` — a
+  `Closed` blocker still blocks. `MakeReadyAsync`: `Backlog` → `Ready` on the version read (`MoveAsync`: a `conflict` is decided
+  again on a fresh read, their edit kept, their move left standing); `Closed` is the board's archived (`ReadyResult.Archived`,
+  reported in the board's words through `IWorkSource.Shelved` — what a shelved item is, how to undo it, and the verb:
+  Shortcut `archived`/`unarchive it`/`archive`, Kanban `Closed`/`move it back to Backlog`/`close` — wherever a plan speaks of
+  one: the hold "kb-3 is Closed on the board … move it back to Backlog", the waiting log line, a stopped plan's comment ("Taken,
+  finished or Closed by someone else since their release") and the no-longer-validates escalation ("finish or close those
+  stories by hand"); Shortcut's texts are unchanged); any other
+  column has left the backlog. `InBacklogAsync`: the `Backlog` column. `ReturnUnstartedAsync` (a stopped plan's released,
+  never-claimed item): `Ready` → `Backlog` on the version read, the comment, and a claim of the factory's own left on it released
+  — only while it is still `Ready` and carries no claim but the factory's; one someone claimed, moved, finished or closed is
+  theirs, nothing written. A `conflict` on the move is decided again on a fresh read by that same rule — status AND claim, in
+  the method's own loop, not `MoveAsync` (which looks at the status alone) — so an item still `Ready` that gained another
+  caller's claim since the first read is left alone too. One difference from Shortcut, the board's own rule, accepted: the board's ready listing
+  (`unblocked_only`) leaves out an item whose blocker is not `Done`, so a released item is listed once every blocker is `Done`
+  on the board — which the factory's merge of a blocker makes it (`BoardState.Merged`). Any blocker the plan counts as merged
+  that is not `Done` on the board — `merged-into-changeset` (the item stays Escalated and `InProgress`; that escalation already
+  says to move it to `Done`), one a person moved out of `Done` again, one whose move to `Done` the board refused — therefore
+  keeps its released dependents out of the listing until a person moves it to `Done`; and `factory run kb-<n>` on such a
+  dependent is refused by the source, naming the blocker (``claim refused: the item is blocked by `<title>` (<status>)``, the
+  title cut and inert in a code span: a blocker may be a planned item, so its title a planner's text). The
+  pipeline's own check is unchanged and comes before the board's: a planned item moved to `Ready` by hand while a blocker is
+  unmerged is refused at claim naming the blocker (`claim refused: blocked by kb-2 (not merged): …`), also when someone dragged
+  the blocker to `Done` (a story of the plan is satisfied only by the factory's merge). Tests: `KanbanPlanSourceTests`,
+  `SourceTrustTests`, `KanbanPlanPipelineTests` (a whole plan over the fake board through the real gate), `KanbanSafeWritesTests`.
   Safe writes (sc-25983, E3; `KanbanBoard`, the typed caller, so every write has them). Typed refusals: a refused call's
   `{code, message}` is a `KanbanException` with the contract's code (`KanbanException.Codes`: `scope_denied`, `not_found`,
   `conflict`, `already_claimed`, `cycle`, `invalid_argument`, `busy`; `Refused` true: it changed nothing — true only for those
@@ -412,7 +476,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   would refuse a release that happened); a claim and a renewal are read and then sent again whatever the read shows (the same
   caller's claim is idempotent by the contract, and only its own answer tells this identity's claim from another's under the
   same marker). A write that carries an idempotency key — a comment, and `KanbanBoard.CreateItemAsync` (`create_work_item`,
-  key required; the typed caller's create, which plans will use: `KanbanWorkSource` still creates no children) — is sent again
+  key required; the typed caller's create, which a plan's items are made with, sc-25984) — is sent again
   with the same key and no read: the board answers the object the key already made (`comment_created`/`created` false).
   Status changes stay `update_work_item(itemId, status, expected_version)`, not `move_work_item`: a status change has no
   position to ask for, `update_work_item` puts the item at the end of its new column by itself, while `move_work_item` takes an
@@ -431,9 +495,11 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   interface's default is `InFlightAsync`, for a runner with no controls): every item the ledger would resume by itself — in a
   handled state, or Paused from one in a way that resumes by itself (`interrupted`, `user-paused`, `usage-paused`,
   `freeze-paused`, `controls-unreadable`) — WHATEVER the factory, epic, item, usage and freeze controls say now, so a Pause, a
-  usage pause or a freeze of any length (a freeze lasts until a human's Continue) costs no item its claim. NOT renewed: an item
-  being stopped (its stop releases the claim), a parked one (a refused claim, a lost claim, a give-up), an Escalated one, a plan
-  waiting on its stories, a merged or terminal one. The controls are read there only to leave out an item being stopped; when
+  usage pause or a freeze of any length (a freeze lasts until a human's Continue) costs no item its claim; and (sc-25984) a plan
+  item waiting on its stories (`Planned`: no handler, but the factory drives it for as long as its stories take — often longer
+  than a claim lives — and then takes its changeset pull request through the gate; a lost claim does not pause it — it has no state to pause from — but holds it: one `plan-held` row and no evaluation while the claim is someone else's, below). NOT renewed: an item
+  being stopped (its stop releases the claim), a parked one (a refused claim, a lost claim, a give-up), an Escalated one, a
+  merged or terminal one. The controls are read there only to leave out an item being stopped; when
   they cannot be read the item is renewed all the same (the list throws only when the ledger itself cannot be read). The
   renewal list runs nothing: what a poll runs is still `InFlightAsync`'s list (which leaves out what a control pauses), read
   after the renewals. `IntakeLoop.RenewClaimsAsync` asks per lane, whatever the lane's source, before anything is listed ready
@@ -465,7 +531,20 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   claim is released or has lapsed. `Held`: `unpaused`, and on from where it paused. Typed outcome `deferred`, by the rule for every
   pause and every `parked` row (`StepOutcomes`). Nothing is paused when the item's run is active (its run lock is held — that
   run goes on, claims being advisory, and the next poll finds the claim lost again), when it is being stopped (the stop gives it
-  back), or when it is a plan waiting on its stories or a merged item. An item that is not renewed (parked, escalated) loses its
+  back), or when it is a merged item. A plan item waiting on its stories (`Planned`, sc-25984) is not paused, parked or
+  commented on (it has no state to pause from, resumes by itself, and the item is someone else's to write) but HELD: under its
+  run lock it gets one `plan-held` row `claim lost: <reason>` (outcome `deferred`; told apart from the other `plan-held` rows —
+  a blocker outside the plan, `not evaluated: `, `held by a failed story: ` — by that prefix; not written again while that is
+  how its claim is recorded, `RunPipeline.PlanClaimLost`), and `ClaimLostAsync` returns what was done, so the poll leaves the
+  plan out of its runs and shows it on the dashboard's intake row; the dashboard's plan row shows the row too. While the claim
+  is recorded lost nothing of the plan is evaluated — no story released, no changeset pull request opened or linked — whoever
+  runs it: `PlannedAsync` asks `IWorkSource.RenewClaimAsync` first, so a `factory run kb-<n>` by hand answers "is still not the
+  factory's to work (claim lost: …); its plan is not evaluated and nothing of it is released" and writes nothing (a different
+  holder is a new `plan-held` row). The plan item stays in the renewal list, so it resumes by itself: the first evaluation
+  after a renewal that holds (the other claim released or lapsed; the Kanban source takes it back) records
+  `plan-claim-regained` (`was claim lost: …`; outcome passed) and goes on; a later loss is a new `plan-held` row. Stories
+  released before the loss go on (they are their own items, with their own claims). Residual, accepted: between the other
+  caller's claim and the poll that notices it (at most one `Intake:PollSeconds`), an evaluation may still release a story. An item that is not renewed (parked, escalated) loses its
   claim a day after its last renewal, and from then on
   only its `InProgress` column keeps it out of the ready list — the factory's own (`ListReadyAsync` asks for `Ready` only) and
   any other caller's that polls as the contract says; the board shows it unclaimed, so another caller that claims `InProgress`
@@ -485,9 +564,15 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (as it does a `KanbanException` of that read) and exits 1, no stack trace (`FactoryRunner.RunCommandAsync`). `factory kanban
   key` likewise prints and exits 1 on a board refusal, an HTTP failure or timeout, and a ledger failure
   (`FactoryRunner.IsKanbanKeyFailure`). The spec is the item, its epic and the epic's documents; links are built on `Kanban:WebUrl`.
-  Trust (E5): a Kanban item is written on the owner's board and is trusted like a Shortcut story — `WorkStory.UntrustedName` is
-  true only for a GitHub issue's item and a planner-authored story — so its spec is unfenced instructions and its name goes on
-  GitHub as written.
+  Trust (E5, sc-25984): trust is a property of the SOURCE, declared once on its naming (`ItemNaming.Trusted`: Shortcut and Kanban
+  true — the owner's boards — GitHub issues false, and false for any source that does not say, fail closed) and asked in one
+  place, `WorkStory.UntrustedName` = the source is not trusted, or the item is planner-authored (`PlannerAuthored`: its
+  description carries the planned-item marker, which the code writes on every source — planner text is data on every source,
+  and a person who rewrites the item without the marker has taken it over). Everything that states an item reads that one
+  answer: the spec in every worker prompt (`PromptFence.Spec`), the name in commit messages and pull request titles
+  (`WorkStory.PublicName`) and bodies (`LedgerReport`), and what a worker's input counts as (`RunPipeline.SpecInput`). So a
+  Kanban item's spec is unfenced instructions and its name goes on GitHub as written, like a Shortcut story's; only a trusted
+  source plans (`IWorkSource.PlansItems`).
   Epics (sc-25985, E4): a Kanban epic is a GUID too, and gets a ledger key of its own the same way — table `kanban_epics`
   (migration `KanbanEpics`; `KanbanEpicKey`: key, the epic's GUID under a unique index, its project's GUID), allocated by
   `KanbanKeys.EpicKeyAsync` when `ReadSpecAsync` first reads an item of the epic, so before the spec, the item's ledger row
@@ -783,7 +868,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   data yet), escalation rate, fix rounds per merged PR, reviewer precision (blocking findings a second opinion confirmed / those it
   answered) and intake-to-merge time; N/A over zero matching items; sandbox/demo items are excluded (`Metrics:*`).
 - Plan items (Phase 4a, sc-25870; `Plans/`, `RunPipeline.Plan.cs`): an item labelled `plan` (`PlanLabel`, any case) on a source that
-  plans (`IWorkSource.PlansItems`: Shortcut; false by default, so a GitHub issue's label — which anyone may apply — plans nothing)
+  plans (`IWorkSource.PlansItems`: Shortcut and, since sc-25984, KanbanBoard — "Plans on Kanban" under the Kanban bullet; only a
+  trusted source, `ItemNaming.Trusted`; false by default, so a GitHub issue's label — which anyone may apply — plans nothing)
   goes Intake → Plan instead of Implement, and is never implemented itself. Plan runs one planner session (E2): a fresh one every
   time (never resumed: its checkout is throwaway), on the `high` class (`WorkerModelClass.Planner`), confined like the triage worker
   — `WorkerTools.ReadOnly` (`ReadRule` of its own worktree, `dontAsk`, `--setting-sources ""`; `WorkerPlanRunner` refuses any other
@@ -835,7 +921,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   checkpoint (the plan as JSON), then `plan-creating` right before the board is asked for anything, then
   `IWorkSource.CreateChildrenAsync` (the parent's team and epic, Backlog, `blocks` links), then `plan-stories` (the ids in plan
   order, e.g. `sc-12 sc-13`), then Plan → `Planned`. `CreateChildrenAsync` is idempotent, and finds a child again by its
-  idempotency key (sc-25877, `ChildItem.Key(parentRef)`: `dark-factory:child:<parent>:<SHA-256 of the name and the description as
+  idempotency key (sc-25877, `ChildItem.Key(parentRef)`, the parent as its board names it: `dark-factory:child:<parent>:<SHA-256 of the name and the description as
   sent>`, written by code, the same on every retry of the same plan; Shortcut stores it as the story's `external_id`, sent on
   `POST stories`, and the listings carry it, so a child is matched from the listing and then read in full for its relations) —
   so a retry does not depend on the board returning a multi-line Markdown description unchanged. Two stories of one plan never
@@ -861,7 +947,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   the transition is left and the plan is not read again. `Planned` (a new state; table rows `Plan → Planned`, `Planned → Done`, `Planned → Review` and `Merge → Planned`) has no entry in `Handlers`: the
   item waits on its stories and is evaluated without a worker (dependency-aware release, below); waiting is not a failure
   (outcome `passed`) and gets no held notice. Planner text is untrusted (E3): each created story's description starts with the
-  marker `<!-- dark-factory:planned-from sc-<parent> -->` (`PlannedStory`), then a `Repo:` line naming the plan item's repository
+  marker `<!-- dark-factory:planned-from sc-<parent> -->` (`PlannedStory`; the parent as its BOARD names it, `WorkStory.BoardRef`: a
+  Kanban plan item's GUID, never its `kb-<n>`), then a `Repo:` line naming the plan item's repository
   (the first such line decides, `RepoResolver`: the planner's text cannot send a story to another repo; one repository per plan),
   then the planner's text in a tilde fence (no mention, link or image renders). A story whose description carries the marker is
   `WorkStory.PlannerAuthored`, so `UntrustedName`: its spec is fenced as data in every worker prompt (`PromptFence.Spec`) and its
@@ -930,7 +1017,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   What holds a plan beyond its own order is a `plan-held` checkpoint (outcome `deferred`), one row holding every such hold, written
   only when its text changes, not every poll: a story held by a blocker outside the plan (`sc-13 held by sc-99 (not a story of this
   plan, and neither merged by the factory nor finished on the board: finish it or remove the relation on the board)`); an archived
-  story (`… is archived on the board, so it was not released and the plan cannot complete: unarchive it`); and a released story a
+  story (`… is archived on the board, so it was not released and the plan cannot complete: unarchive it`; the two halves are the
+  source's own words, `IWorkSource.Shelved` — Kanban: `Closed`, "move it back to Backlog"); and a released story a
   person moved back to the Backlog (`… was released and is back in the backlog: …; moving it to the board's ready state restarts
   it` — it is not released again: a person moved it back on purpose). The last is detected by `IWorkSource.InBacklogAsync`, asked
   once per evaluation only about a released, unmerged story that nothing works — the ledger does not know it, or its item is
@@ -1512,8 +1600,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   block's own closing tag, any case or spacing, is neutralised inside it) — the issue (`issue-title`, `issue-body`), the
   reviewer context (`story`, `files`, `diff`, `finding`), findings, CI logs (`ci-log`), conflicted paths (`file`). A GitHub issue
   item's spec (the approved triage's title, summary and proposed fix: model text from untrusted issue text) is fenced as data
-  (`triage`, `PromptFence.Spec`) in every worker prompt (implement, review fix, CI fix, conflict fix); a Shortcut story is
-  written on the owner's board and stays unfenced instructions.
+  (`triage`, `PromptFence.Spec`) in every worker prompt (implement, review fix, CI fix, conflict fix), and so is an item the
+  factory created from a plan, on every source; an item of a trusted source (a Shortcut story, a Kanban item:
+  `ItemNaming.Trusted`, the one trust decision, `WorkStory.UntrustedName`) is written on the owner's board and stays unfenced
+  instructions.
   Interrupts: the taint write of a tool use runs on a never-cancelled token (`ClaudeWorker` passes `CancellationToken.None` to
   `OnUntrusted`), and before resuming a session `RunWorkerSessionAsync` replays its stored `session_events` through
   `StreamJsonState` (`WorkLedger.ReplayTaintsAsync`) and taints it for every web/MCP use found; a failed read fails the run.

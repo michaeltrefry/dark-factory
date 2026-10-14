@@ -123,6 +123,8 @@ public static class KanbanStatus
     public const string Ready = "Ready";
     public const string InProgress = "InProgress";
     public const string Done = "Done";
+    /// <summary>Shelved for good: hidden from the board's listings, and as a blocker it still blocks.</summary>
+    public const string Closed = "Closed";
 }
 
 /// <summary>
@@ -153,7 +155,7 @@ public sealed class KanbanBoard(McpHttpClient mcp, Func<TimeSpan, CancellationTo
     public static readonly IReadOnlyList<string> WriteTools =
     [
         "claim_work_item", "renew_work_item_claim", "release_work_item_claim", "update_work_item", "add_work_item_comment",
-        "add_work_item_link", "create_work_item",
+        "add_work_item_link", "create_work_item", "add_work_item_dependency",
     ];
 
     /// <summary>The largest page <c>list_work_items</c> takes.</summary>
@@ -293,6 +295,17 @@ public sealed class KanbanBoard(McpHttpClient mcp, Func<TimeSpan, CancellationTo
         }
         return WriteAsync("create_work_item", arguments, null, null, ct);
     }
+
+    /// <summary>
+    /// Records that <paramref name="id"/> is blocked by <paramref name="blockedById"/> (sc-25984); a dependency that already
+    /// exists changes nothing and succeeds. <see cref="KanbanException.Cycle"/>, nothing changed, when it would make an item block
+    /// itself, directly or through other items. It carries no idempotency key and no expected version (a dependency moves neither
+    /// the item's version nor its timestamp), so after a lost answer the blocked item is read: one that lists the blocker has the
+    /// dependency and is not sent it again.
+    /// </summary>
+    public Task<KanbanWorkItem> AddDependencyAsync(Guid id, Guid blockedById, CancellationToken ct) =>
+        WriteAsync("add_work_item_dependency", new JsonObject { ["id"] = id.ToString(), ["blocked_by_id"] = blockedById.ToString() }, id,
+            now => (now.Blockers ?? []).Any(b => b.Id == blockedById), ct);
 
     /// <summary>For a write its caller may always send again: what a read shows never stands in for the write's own answer.</summary>
     private static bool Again(KanbanWorkItem _) => false;

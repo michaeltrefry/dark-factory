@@ -17,8 +17,18 @@ namespace DarkFactory.Orchestrator.WorkSources;
 /// </param>
 public sealed record ItemNaming(string Source, string Prefix, string Noun, EpicNaming Epics = EpicNaming.None)
 {
+    /// <summary>
+    /// Whether the source's items are written on the owner's own board, by people the owner lets write there (sc-25984, E5): the one
+    /// place a source's trust is decided. A trusted source's item is the owner's text — its name and description are instructions
+    /// to a worker, unfenced, and its name is written on GitHub as it is — and only a trusted source may plan
+    /// (<see cref="IWorkSource.PlansItems"/>). An untrusted source's item (a GitHub issue: anyone may file one) is data everywhere
+    /// (<see cref="WorkStory.UntrustedName"/>). False unless the source says otherwise (fail closed). Whatever the source, text a
+    /// planning model wrote stays untrusted (<see cref="WorkStory.PlannerAuthored"/>).
+    /// </summary>
+    public bool Trusted { get; init; }
+
     /// <summary>Shortcut stories: <c>sc-&lt;story id&gt;</c>. Its epics are named by their Shortcut id alone (<c>epic:12</c>).</summary>
-    public static readonly ItemNaming Shortcut = new("shortcut", "sc", "Shortcut story", EpicNaming.Number);
+    public static readonly ItemNaming Shortcut = new("shortcut", "sc", "Shortcut story", EpicNaming.Number) { Trusted = true };
 
     /// <summary>GitHub issues: <c>gh-&lt;key&gt;</c>, the key the ledger gave the issue (<see cref="Ledger.GitHubIssue"/>), not its number.</summary>
     public static readonly ItemNaming GitHubIssue = new("github", "gh", "GitHub issue");
@@ -28,7 +38,7 @@ public sealed record ItemNaming(string Source, string Prefix, string Noun, EpicN
     /// its id on the board is a GUID, and a GUID names no branch or control scope a person types. Its epics are GUIDs too, and get
     /// a ledger key the same way (<see cref="Ledger.KanbanEpicKey"/>, sc-25985): <c>epic:kb-3</c>.
     /// </summary>
-    public static readonly ItemNaming Kanban = new("kanban", "kb", "Kanban item", EpicNaming.Key);
+    public static readonly ItemNaming Kanban = new("kanban", "kb", "Kanban item", EpicNaming.Key) { Trusted = true };
 
     /// <summary>Every source's naming.</summary>
     public static readonly IReadOnlyList<ItemNaming> All = [Shortcut, GitHubIssue, Kanban];

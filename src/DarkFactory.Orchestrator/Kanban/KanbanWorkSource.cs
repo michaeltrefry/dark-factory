@@ -24,11 +24,29 @@ namespace DarkFactory.Orchestrator.Kanban;
 /// Claims expire (sc-25983): a claim is taken for <see cref="ClaimTtlSeconds"/>, the longest the board allows, and renewed on
 /// each intake poll (<see cref="RenewClaimAsync"/>) for every item the ledger would resume by itself — one in a state the
 /// pipeline drives, or paused in a way that resumes by itself — whatever a Pause, the usage pause or the freeze says now
-/// (<c>RunPipeline.RenewableAsync</c>): a pause of any length does not cost the item its claim. An item that is parked,
+/// (<c>RunPipeline.RenewableAsync</c>): a pause of any length does not cost the item its claim, and neither does a plan item's
+/// wait for its stories (sc-25984). An item that is parked,
 /// escalated or being stopped is not renewed: its claim lapses after a day and what keeps it out of everyone's ready list is its
 /// <c>InProgress</c> column alone (this source lists only <c>Ready</c> items, and so does the contract's "polling for ready
 /// work"); a lapsed claim of an <c>InProgress</c> item the ledger records as claimed by this factory is taken again, by a
-/// renewal or by <see cref="ClaimAsync"/> on a re-run. What this source does not do yet: plans (it creates no children).
+/// renewal or by <see cref="ClaimAsync"/> on a re-run.
+/// Plans (sc-25984): a Kanban item labelled <c>plan</c> (the board's own labels, <c>label_list</c>) is a plan item
+/// (<see cref="PlansItems"/>), like a Shortcut story — the board is the owner's, so its items are trusted and its labels the
+/// owner's to set (<see cref="ItemNaming.Trusted"/>). Its planned items are created one by one in the plan item's project and
+/// epic, in <c>Backlog</c>, each under an idempotency key derived from the plan item's GUID and the item's own content, then
+/// joined by the board's dependencies (<see cref="CreateChildrenAsync"/>; not <c>import_epic_plan</c>, which always makes a new
+/// epic). Each gets its ledger key the moment the board has answered its GUID, before anything else is written for it, so the
+/// ledger and the pipeline name it <c>kb-&lt;n&gt;</c> while everything written onto the board — the planned-item marker, the
+/// idempotency key — names GUIDs (E4). Blockers are the board's dependencies (<see cref="BlockersAsync"/>: finished only in
+/// <c>Done</c>; a <c>Closed</c> blocker still blocks), a release is <c>Backlog</c> → <c>Ready</c> on the version read
+/// (<see cref="MakeReadyAsync"/>), and a released item nobody started goes back the same way (<see cref="ReturnUnstartedAsync"/>).
+/// One difference from Shortcut, the board's own rule: its ready listing leaves out an item whose blocker is not <c>Done</c>, so
+/// a released item is listed only once every blocker is <c>Done</c> on the board — which the factory's merge of a blocker makes
+/// it (<c>BoardState.Merged</c>). Any blocker the plan counts as merged that is not <c>Done</c> on the board — one whose pull
+/// request was merged outside the factory into the plan's changeset branch (its item stays Escalated and <c>InProgress</c>,
+/// as that escalation says), one a person moved out of <c>Done</c> again, one whose move to <c>Done</c> the board refused —
+/// keeps its released dependents out of the listing until a person moves it to <c>Done</c>; <c>factory run kb-&lt;n&gt;</c>
+/// on such a dependent is refused by this source, naming the blocker (<see cref="ClaimAsync"/>).
 /// </summary>
 public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanScope scope, Uri webUrl) : IWorkSource
 {
@@ -213,7 +231,9 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
         }
         if (item.Status == KanbanStatus.Ready && item.OpenBlockers is { Count: > 0 } blockers)
         {
-            return ClaimResult.Refused($"the item is blocked by {string.Join(", ", blockers.Select(b => $"\"{b.Title}\" ({b.Status})"))}");
+            // A blocker's title may be a planner's text (a planned item, sc-25984) and the reason goes to the ledger and wherever
+            // the refusal is reported: each is cut and made one inert code span.
+            return ClaimResult.Refused($"the item is blocked by {string.Join(", ", blockers.Select(b => $"{Quoted(b.Title) ?? "an item"} ({b.Status})"))}");
         }
 
         KanbanWorkItem claimed;
@@ -407,8 +427,12 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
             }
         }
         // The labels and estimate decide the item's coding model class (WorkerModelClass.Coding, E8).
+        // What the factory writes onto the board about the item names its GUID (E4); a planned item's marker names its plan item's
+        // GUID, which the ledger's own name stands in for wherever a person reads it.
+        var planRef = Plans.PlannedStory.ParentOf(description) is { } parent && Guid.TryParseExact(parent, "D", out var plan)
+            && await keys.KnownAsync(plan, ct) is { } planKey ? Naming.Format(planKey) : null;
         var story = new WorkStory(id, item.Title, description, StoryType(item.Type), _links.Item(item), Naming, Labels: item.LabelList ?? [],
-            Estimate: item.Estimate);
+            Estimate: item.Estimate, BoardId: item.Id.ToString("D"), PlanRef: planRef);
         if (item.EpicId is not { } epicId)
         {
             return new WorkSpec(story, null, []);
@@ -509,8 +533,150 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
         }
     }
 
-    public Task<IReadOnlyList<int>> CreateChildrenAsync(int parentId, IReadOnlyList<ChildItem> children, CancellationToken ct) =>
-        throw new NotSupportedException("The Kanban work source creates no plan children.");
+    public bool PlansItems => true;
+
+    /// <summary>A <c>Closed</c> item is the board's archived one: hidden from its listings, and never worked.</summary>
+    public (string Is, string Undo, string Do) Shelved => (KanbanStatus.Closed, $"move it back to {KanbanStatus.Backlog}", "close");
+
+    /// <summary>
+    /// The idempotency key of a planned item (E3, E4): <see cref="ChildItem.Key"/> under the plan item's board id — its GUID, never
+    /// its <c>kb-&lt;n&gt;</c> — so it is the same on every retry and after a restart, and on a ledger that was rebuilt. 120
+    /// characters, inside the board's limit (<see cref="MaxIdempotencyKeyLength"/>).
+    /// </summary>
+    public static string ChildKey(Guid parentId, ChildItem child) => child.Key(parentId.ToString("D"));
+
+    /// <summary>The longest idempotency key the board takes (printable ASCII without spaces).</summary>
+    public const int MaxIdempotencyKeyLength = 128;
+
+    /// <summary>
+    /// Creates a plan's items (sc-25984) in the plan item's project and — when it has one — its epic, in <c>Backlog</c>, in order,
+    /// and joins them by the board's dependencies; returns their ledger keys in order. Each is one <c>create_work_item</c> under
+    /// <see cref="ChildKey"/>: the board creates the item once per key and answers the same item on every repeat
+    /// (<c>created</c> false), so a retry after a failure part-way — or a restart, or a lost answer — creates nothing twice and
+    /// needs no search for what an earlier attempt made (a namesake someone else wrote has no such key and is never taken for
+    /// one). The item's key is allocated as soon as the board has answered its GUID, before its dependencies are written. A
+    /// dependency is <c>add_work_item_dependency</c>, which changes nothing when it exists already; one the created item's own
+    /// answer already lists is not sent again.
+    /// Refused before any board write: a child blocked by itself or by a later child (the only way a plan's own order could be a
+    /// cycle; <see cref="ArgumentException"/>) and a story type the board has no item type for. A dependency the board refuses as
+    /// a <c>cycle</c> — someone made the blocker depend on the item since — fails the call naming both items
+    /// (<see cref="KanbanItemException"/>): the items stay, nothing is recorded as the plan's, and a re-run after the stray
+    /// dependency is removed creates nothing twice.
+    /// </summary>
+    public async Task<IReadOnlyList<int>> CreateChildrenAsync(int parentId, IReadOnlyList<ChildItem> children, CancellationToken ct)
+    {
+        for (var i = 0; i < children.Count; i++)
+        {
+            if (children[i].BlockedBy.Any(b => b < 0 || b >= i))
+            {
+                throw new ArgumentException($"Child {i} may only be blocked by earlier children.", nameof(children));
+            }
+        }
+        var types = children.Select(c => ItemType(c.StoryType)).ToList();
+        var parent = await board.GetItemAsync(await ItemIdAsync(parentId, ct), ct);
+        var made = new List<KanbanWorkItem>();
+        var ids = new List<int>();
+        for (var i = 0; i < children.Count; i++)
+        {
+            var child = children[i];
+            var item = await board.CreateItemAsync(parent.ProjectId, child.Name, types[i], child.Description, parent.EpicId, ChildKey(parent.Id, child), ct);
+            // Its key before anything else is written for it (E4).
+            var id = await keys.KeyAsync(item.Id, item.ProjectId, ct);
+            foreach (var blocker in child.BlockedBy.Distinct())
+            {
+                if ((item.Blockers ?? []).Any(b => b.Id == made[blocker].Id))
+                {
+                    continue;
+                }
+                try
+                {
+                    await board.AddDependencyAsync(item.Id, made[blocker].Id, ct);
+                }
+                catch (KanbanException ex) when (ex.Code == KanbanException.Cycle)
+                {
+                    var (blocked, by) = (Naming.Format(id), Naming.Format(ids[blocker]));
+                    throw new KanbanItemException($"{blocked} could not be made to wait for {by}: the board refuses the dependency as a "
+                        + $"cycle, so {by} already depends on {blocked} (directly or through other items) — a dependency the plan did not "
+                        + "make. Remove it on the board and re-run the plan item; its items are not created twice.");
+                }
+            }
+            made.Add(item);
+            ids.Add(id);
+        }
+        return ids;
+    }
+
+    /// <summary>
+    /// The item's blockers on the board (<c>get_work_item</c>'s <c>blockers</c>: whoever made the dependency), each by its ledger
+    /// key — allocated now for an item the factory has not seen — and whether the board shows it finished: only in <c>Done</c>
+    /// (a <c>Closed</c> blocker still blocks, as the board's own ready listing has it). One read.
+    /// </summary>
+    public async Task<IReadOnlyList<Blocker>> BlockersAsync(int id, CancellationToken ct)
+    {
+        var blockers = new List<Blocker>();
+        foreach (var blocker in (await board.GetItemAsync(await ItemIdAsync(id, ct), ct)).Blockers ?? [])
+        {
+            blockers.Add(new Blocker(await keys.KeyAsync(blocker.Id, ct), blocker.Status == KanbanStatus.Done));
+        }
+        return [.. blockers.DistinctBy(b => b.Id).OrderBy(b => b.Id)];
+    }
+
+    /// <summary>
+    /// <c>Backlog</c> → <c>Ready</c>, on the version just read, only for an item still in <c>Backlog</c>. A <c>Closed</c> item is
+    /// the board's archived one (<see cref="ReadyResult.Archived"/>); one in any other column has left the backlog already and is
+    /// not written. A <c>conflict</c> — someone edited the item since the read — is decided again on a fresh read
+    /// (<see cref="MoveAsync"/>): still in <c>Backlog</c>, it is moved on the new version and their edit kept; moved by them, it
+    /// stays where they put it.
+    /// </summary>
+    public async Task<ReadyResult> MakeReadyAsync(int id, CancellationToken ct)
+    {
+        var item = await board.GetItemAsync(await ItemIdAsync(id, ct), ct);
+        if (item.Status == KanbanStatus.Backlog)
+        {
+            item = await MoveAsync(item, KanbanStatus.Ready, ct);
+            if (item.Status == KanbanStatus.Ready)
+            {
+                return ReadyResult.Moved;
+            }
+        }
+        return item.Status == KanbanStatus.Closed ? ReadyResult.Archived : ReadyResult.AlreadyLeft;
+    }
+
+    public async Task<bool> InBacklogAsync(int id, CancellationToken ct) =>
+        (await board.GetItemAsync(await ItemIdAsync(id, ct), ct)).Status == KanbanStatus.Backlog;
+
+    /// <summary>
+    /// <c>Ready</c> → <c>Backlog</c> with the comment, only for an item that is still <c>Ready</c> and carries no claim but the
+    /// factory's own; any other is left as it is (false, nothing written): someone claimed it, moved it or closed it, and it is
+    /// theirs. The move is conditional on the version read, and a <c>conflict</c> — someone wrote the item since — is decided
+    /// again on a fresh read, by the same rule (status AND claim, so not <see cref="MoveAsync"/>, which looks at the status
+    /// alone): an item someone moved or claimed meanwhile stays where they put it (false, no comment). A claim of the factory's left on it (a run that died between its claim and its move) is released, so the item
+    /// does not read as held while it waits in the backlog.
+    /// </summary>
+    public async Task<bool> ReturnUnstartedAsync(int id, string comment, CancellationToken ct)
+    {
+        var item = await board.GetItemAsync(await ItemIdAsync(id, ct), ct);
+        KanbanWorkItem moved;
+        for (var reread = 0; ; reread++)
+        {
+            if (item.Status != KanbanStatus.Ready || (item.ClaimMarker is { } held && held != Marker(item.Id)))
+            {
+                return false;
+            }
+            try
+            {
+                moved = await board.SetStatusAsync(item.Id, KanbanStatus.Backlog, item.Version, ct);
+                break;
+            }
+            catch (KanbanException ex) when (ex.Code == KanbanException.Conflict && reread < MaxConflictRereads)
+            {
+                item = await board.GetItemAsync(item.Id, ct);
+            }
+        }
+        await ReleaseOursAsync(moved, ct);
+        await CommentOnAsync(moved, comment, ct);
+        return true;
+    }
 
     private Task CommentOnAsync(KanbanWorkItem item, string text, CancellationToken ct)
     {
@@ -573,13 +739,25 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
         !scope.IsEmpty && (await board.ListProjectsAsync(ct))
             .Any(p => p.Id == projectId && scope.Projects.Contains(p.Key, StringComparer.OrdinalIgnoreCase));
 
-    /// <summary>The board's item types in the words the other sources use (prompts and the intake row).</summary>
-    private static string StoryType(string type) => type switch
+    /// <summary>The board's item types in the words the other sources use (prompts and the intake row), and the planner's.</summary>
+    public static string StoryType(string type) => type switch
     {
         "Story" => "feature",
         "Issue" => "bug",
         "Task" => "chore",
         _ => type.ToLowerInvariant(),
+    };
+
+    /// <summary>
+    /// The board's item type of a planned story's type (<see cref="Plans.PlanParser"/> allows exactly these three): the inverse of
+    /// <see cref="StoryType"/>. Any other type has no item type and is refused (nothing is created as something it is not).
+    /// </summary>
+    public static string ItemType(string storyType) => storyType switch
+    {
+        "feature" => "Story",
+        "bug" => "Issue",
+        "chore" => "Task",
+        _ => throw new ArgumentException($"'{storyType}' is no story type the Kanban board has an item type for (feature, bug, chore).", nameof(storyType)),
     };
 
     private static string Cut(string s) => s.Length > 200 ? s[..200] : s;
@@ -589,6 +767,8 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
 /// A Kanban item the factory cannot work as it is named or set up (sc-25981): a <c>kb-&lt;n&gt;</c> the ledger never gave out, or an
 /// item whose repository is unknown (its project archived or gone, or a <c>repository_url</c> that names no github.com repository).
 /// The message says what to do. <c>factory run</c> prints it and exits 1 (<c>FactoryRunner.RunCommandAsync</c>): it is raised
-/// reading the item's spec, before the item has a ledger row to escalate.
+/// reading the item's spec, before the item has a ledger row to escalate. Also (sc-25984) a plan's item the board will not let
+/// wait for its blocker (a dependency refused as a cycle): raised inside the plan item's Plan step, which escalates it with the
+/// message like any failed step.
 /// </summary>
 public sealed class KanbanItemException(string message) : InvalidOperationException(message);

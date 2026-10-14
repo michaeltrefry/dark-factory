@@ -21,12 +21,21 @@ public sealed class KanbanKeys(IDbContextFactory<LedgerDbContext> contexts, Time
     /// The item's key, allocated now if the factory has not seen the item before; its project (<paramref name="projectId"/>) is
     /// recorded with it, and again when the row has none or another (sc-25985: the dashboard's link is built from the ledger).
     /// </summary>
-    public async Task<int> KeyAsync(Guid itemId, Guid projectId, CancellationToken ct)
+    public Task<int> KeyAsync(Guid itemId, Guid projectId, CancellationToken ct) => AllocateAsync(itemId, projectId, ct);
+
+    /// <summary>
+    /// The key of an item named only by its GUID — a blocker in another item's <c>blockers</c>, which carries no project
+    /// (sc-25984) — allocated now, with no project, if the factory has not seen it; a project the row already has is kept, and
+    /// one is recorded when the item itself is next listed or read (<see cref="KeyAsync(Guid, Guid, CancellationToken)"/>).
+    /// </summary>
+    public Task<int> KeyAsync(Guid itemId, CancellationToken ct) => AllocateAsync(itemId, null, ct);
+
+    private async Task<int> AllocateAsync(Guid itemId, Guid? projectId, CancellationToken ct)
     {
         await using var db = await contexts.CreateDbContextAsync(ct);
         if (await db.KanbanItems.SingleOrDefaultAsync(i => i.ItemId == itemId, ct) is { } known)
         {
-            if (known.ProjectId != projectId)
+            if (projectId is not null && known.ProjectId != projectId)
             {
                 known.ProjectId = projectId;
                 await db.SaveChangesAsync(ct);
@@ -51,6 +60,13 @@ public sealed class KanbanKeys(IDbContextFactory<LedgerDbContext> contexts, Time
             }
             return winner.Id;
         }
+    }
+
+    /// <summary>The key of an item the ledger already knows, or null: nothing is allocated (for text that only names an item, sc-25984).</summary>
+    public async Task<int?> KnownAsync(Guid itemId, CancellationToken ct)
+    {
+        await using var db = await contexts.CreateDbContextAsync(ct);
+        return (await db.KanbanItems.AsNoTracking().SingleOrDefaultAsync(i => i.ItemId == itemId, ct))?.Id;
     }
 
     /// <summary>

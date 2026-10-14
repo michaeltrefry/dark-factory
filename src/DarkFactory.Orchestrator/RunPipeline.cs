@@ -363,6 +363,11 @@ public sealed partial class RunPipeline(
         /// <summary>Planned: no story of the plan is failed any more (a person re-ran the failed one); the hold a failed story put on it is lifted.</summary>
         public const string PlanResumed = "plan-resumed";
         /// <summary>
+        /// Planned (sc-25984): the plan item's claim, which a <see cref="PlanHeld"/> row <c>claim lost: …</c> recorded as someone
+        /// else's (<see cref="ClaimLostAsync"/>), is the factory's again; the plan is evaluated again from this row on.
+        /// </summary>
+        public const string PlanClaimRegained = "plan-claim-regained";
+        /// <summary>
         /// Planned: the plan item's comment for the latest <see cref="PlanHeld"/> (failed story), <see cref="PlanStuck"/> or
         /// <see cref="PlanResumed"/> row; Detail is <c>posted</c> or <c>failed: …</c> (tried again by the next evaluations, up to
         /// <see cref="MaxPlanNoticeAttempts"/>).
@@ -538,9 +543,14 @@ public sealed partial class RunPipeline(
     /// <c>user-paused</c>, <c>usage-paused</c>, <c>freeze-paused</c>, <c>controls-unreadable</c>) — WHATEVER the factory, epic,
     /// item, usage and freeze controls say now. Unlike <see cref="InFlightAsync"/>, which leaves out what a control pauses: a
     /// pause only holds an item for a while (a freeze until a human's Continue, however long that takes), and a claim that lapsed
-    /// meanwhile would leave the board showing nobody on an item the factory resumes. Not listed, so not renewed: an item being
-    /// stopped (its own Stop or its plan's; the stop gives the claim back), a parked one (a refused or a lost claim, a give-up),
-    /// an escalated one, a plan waiting on its stories, a merged or finished one. This is never a list of what to run.
+    /// meanwhile would leave the board showing nobody on an item the factory resumes. Also listed (sc-25984): a plan item waiting
+    /// on its stories (<see cref="WorkState.Planned"/>) — it has no handler, but the factory drives it for as long as its stories
+    /// take, often more than a claim's lifetime, and then takes its changeset pull request through the gate; a plan item whose
+    /// claim is lost stays listed and is not paused — it has no state to pause from — but is not evaluated while the claim is
+    /// someone else's (<see cref="ClaimLostAsync"/>: one <c>plan-held</c> row <c>claim lost: …</c>; nothing of it is released and
+    /// no changeset pull request opened until a renewal holds again). Not listed, so not
+    /// renewed: an item being stopped (its own Stop or its plan's; the stop gives the claim back), a parked one (a refused or a
+    /// lost claim, a give-up), an escalated one, a merged or finished one. This is never a list of what to run.
     /// The controls are read only to leave out an item being stopped: when they cannot be read the item is listed (a claim renewed
     /// on an item whose stop then releases it costs nothing; an unreadable control must not cost every item its claim), so this
     /// throws only when the ledger itself cannot be read.
@@ -555,7 +565,7 @@ public sealed partial class RunPipeline(
         var ids = new List<int>();
         foreach (var item in await ledger.ActiveItemsAsync(naming.Source, ct))
         {
-            var resumes = handled.Contains(item.State)
+            var resumes = handled.Contains(item.State) || item.State == WorkState.Planned
                 || (item.State == WorkState.Paused && ResumesAutomatically(await ledger.HistoryAsync(item, ct), handled));
             if (!resumes || !naming.TryParse(item.ExternalId, out var id))
             {
@@ -1447,9 +1457,12 @@ public sealed partial class RunPipeline(
         : result.UsageLimited ? UsagePause.WorkerRateLimited
         : null;
 
-    /// <summary>What the worker handed <paramref name="story"/> reads: the owner's story, or an issue item's approved triage (never the issue's text).</summary>
+    /// <summary>
+    /// What the worker handed <paramref name="story"/> reads: the owner's story (an item of a trusted source,
+    /// <see cref="ItemNaming.Trusted"/>), or an issue item's approved triage (never the issue's text).
+    /// </summary>
     private static WorkerInput SpecInput(WorkStory story) =>
-        story.Kind == ItemNaming.GitHubIssue ? WorkerInput.TriageSummary : WorkerInput.Story;
+        story.Kind.Trusted ? WorkerInput.Story : WorkerInput.TriageSummary;
 
     /// <summary>
     /// The push grant for the current worker attempt (E4): every session the attempt recorded (read fresh, so a session id that
@@ -1991,6 +2004,15 @@ public sealed partial class RunPipeline(
     }
 
     /// <summary>
+    /// How a waiting plan item's claim is recorded as lost (sc-25984): the Detail of its <c>plan-held</c> row <c>claim lost: …</c>
+    /// when no <c>plan-claim-regained</c> row follows it, else null. Told apart from the other <c>plan-held</c> rows by its prefix
+    /// (<see cref="ClaimLost"/>; the others: a blocker outside the plan, <c>not evaluated: </c>, <c>held by a failed story: </c>).
+    /// </summary>
+    internal static string? PlanClaimLost(IReadOnlyList<LedgerEntry> history) =>
+        history.LastOrDefault(e => e.Step == Steps.PlanClaimRegained || (e.Step == Steps.PlanHeld && IsClaimLost(e.Detail)))
+            is { Step: Steps.PlanHeld } lost ? lost.Detail : null;
+
+    /// <summary>
     /// The intake poll's claim renewal found an item held by another caller (sc-25983; see
     /// <see cref="IItemRunner.ClaimLostAsync"/>, <see cref="IWorkSource.RenewClaimAsync"/>): under the item's run lock the item is
     /// paused — Paused <c>claim lost: &lt;reason&gt;</c> from a handled state, then <c>parked</c> with the reason, which names
@@ -2006,7 +2028,14 @@ public sealed partial class RunPipeline(
     /// Typed outcome: deferred (set aside, not judged), like every pause. Returns what was done, or null when nothing was: the
     /// ledger does not know the item, it is being stopped (the stop gives the item back anyway), its run is active (that run goes
     /// on — the board's claims are advisory — and the next poll finds the claim lost again), or it is in a state a lost claim does
-    /// not matter in (a plan waiting on its stories, a merged item).
+    /// not matter in (a merged item).
+    /// A plan item waiting on its stories (Planned, sc-25984) has no state to pause from and resumes by itself, so it is neither
+    /// paused nor parked nor commented on (the item is someone else's): it gets one <c>plan-held</c> row <c>claim lost:
+    /// &lt;reason&gt;</c> — not again while that is how its claim is recorded (<see cref="PlanClaimLost"/>) — and what was done is
+    /// returned, so the poll leaves it out of its runs and shows it. While the claim is recorded lost no evaluation releases a
+    /// story, opens or links a changeset pull request (<see cref="PlannedAsync"/> asks the source first, also on a
+    /// <c>factory run</c> by hand); the item stays listed for renewal, and the first evaluation after a renewal that holds
+    /// records <c>plan-claim-regained</c> and goes on.
     /// </summary>
     public static async Task<string?> ClaimLostAsync(IWorkSource source, WorkLedger ledger, IRunLocks locks, int storyId, string reason,
         TextWriter log, CancellationToken ct, IControls? controls = null)
@@ -2027,6 +2056,16 @@ public sealed partial class RunPipeline(
             return null;
         }
         await ledger.RefreshAsync(known, known.Title, known.Repo, known.EpicId, ct);
+        if (known.State == WorkState.Planned)
+        {
+            var detail = $"{ClaimLost}: {reason}";
+            if (PlanClaimLost(await ledger.HistoryAsync(known, ct)) != detail)
+            {
+                await ledger.CheckpointAsync(known, Steps.PlanHeld, null, detail, ct);
+            }
+            log.WriteLine($"[{known.State}] {id} held: {detail}; not evaluated until its claim is the factory's again");
+            return $"held ({detail}); not evaluated, nothing of the plan released, until its claim is the factory's again";
+        }
         var from = known.State == WorkState.Paused ? (await ledger.ContextAsync(known, ct)).PausedFrom : known.State;
         if (from is not { } pausedAt || !HandledStates.Contains(pausedAt))
         {
