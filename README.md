@@ -18,7 +18,7 @@ has a `Repo: owner/name` line.
 
 `factory work` is the long-running trigger: next to the session hub, the same process polls Shortcut every `Intake:PollSeconds`
 (default 60; there is no public webhook endpoint on the Mac) and runs each ready story through
-the pipeline, one at a time. Ready means a story in the `To Do` workflow state inside the watch
+the pipeline, one at a time (or up to `Intake:MaxConcurrentRuns` at once). Ready means a story in the `To Do` workflow state inside the watch
 scope: any team in `Shortcut:Watch:Teams` (mention names or ids) or epic in
 `Shortcut:Watch:Epics` (ids), each comma-separated. An empty scope watches nothing; an unknown
 team or epic stops `factory work` at start-up (exit 2). Teams are listed with the documented
@@ -199,8 +199,9 @@ printf 'add-generic-password -U -s dark-factory -a router-key -w %s\n' "$(pbpast
 #    scripts/factory-worker-launch: `factory run`/`work` refuse to start unless the installed helper is the
 #    repo's (same SHA-256 once setup's sandbox_user/sandbox_uid lines are undone, helper_version >= 3):
 #    "Stale helper: the installed launch helper ... is not the current scripts/factory-worker-launch (...);
-#    re-run `sudo scripts/setup-worker-user.sh` to install it". They also refuse a helper that skips its
-#    _factory uid sweep ("... refuses its _factory uid sweep ...").
+#    re-run `sudo scripts/setup-worker-user.sh` to install it" (the file is read, not run, at start-up). A
+#    helper that skips its _factory uid sweep ("... refuses its _factory uid sweep ...") is found by the probe
+#    that runs it, in a run's first worker phase: it fails the factory there, not the item.
 sudo scripts/setup-worker-user.sh
 
 # 5. Worker model auth. Default Worker__Auth=router-key: the worker holds no Anthropic/OpenAI credential,
@@ -244,8 +245,10 @@ killing every `_factory` process, so close `_factory` sessions and stop `factory
   (all but the helper itself, which then exits with the worker's status), so nothing that forked and `setsid()`ed away survives the run.
   That sweep runs only as `_factory`'s own uid, which setup pins into the installed helper (`sandbox_uid`, in 400–499);
   setup refuses an existing `_factory` whose uid is outside that range.
-  That makes `_factory` single-tenant: **one sandboxed `factory run` at a time per machine**, enforced by
-  a lock on `<work root>/.factory-run.lock` (a second run fails fast).
+  That makes `_factory` single-tenant: **one worker phase at a time per machine** (a worker session, the gate's sandboxed
+  test runs, a deletion or stop through the helper), enforced by a lock on `<work root>/.factory-run.lock` that a run holds
+  for that phase only and waits for — so `factory run` beside `factory work`, or several items of `factory work`
+  (`Intake:MaxConcurrentRuns`), overlap while they wait on reviews, CI and the merge queue.
 - **`/opt/dark-factory/work`**: the work root (clones + worktrees), owned by you under a root-owned
   parent, readable by `_factory` (an inheritable ACL on the work root itself, never applied recursively).
   Each worktree directory is created empty and shared first (an inheritable read/write ACL for you and

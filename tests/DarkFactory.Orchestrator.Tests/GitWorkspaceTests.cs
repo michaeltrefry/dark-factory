@@ -180,6 +180,60 @@ public class GitWorkspaceTests
     private GitWorkspace Workspace(DarkFactory.Orchestrator.Worker.IWorkerSandbox sandbox, GitCommand? git = null) =>
         new(Path.Combine(_root, "work"), _ => _remote, (_, _) => Task.FromResult<string?>(Token), git, sandbox);
 
+    /// <summary>A sandbox whose worker user another run's worker phase may hold (<see cref="Busy"/>): a deletion that does not wait then deletes nothing.</summary>
+    private sealed class BusySandbox : DarkFactory.Orchestrator.Worker.IWorkerSandbox
+    {
+        public bool Busy { get; set; } = true;
+        public List<string> Calls { get; } = [];
+        public Task CloseToWorkerAsync(string path, CancellationToken ct) => Task.CompletedTask;
+        public Task ShareAsync(string path, CancellationToken ct) => Task.CompletedTask;
+
+        public Task DeleteAsWorkerAsync(string path, CancellationToken ct)
+        {
+            Calls.Add($"delete {path}");
+            Assert.False(Busy, "waited for a busy sandbox user"); // the real one would wait here, on no cancellation token
+            Directory.Delete(path, recursive: true);
+            return Task.CompletedTask;
+        }
+
+        public Task<bool> TryDeleteAsWorkerAsync(string path, CancellationToken ct)
+        {
+            Calls.Add($"try-delete {path}");
+            if (!Busy)
+            {
+                Directory.Delete(path, recursive: true);
+            }
+            return Task.FromResult(!Busy);
+        }
+    }
+
+    [Fact]
+    public async Task The_clean_up_of_a_worktree_that_failed_never_waits_for_a_busy_sandbox_user_and_leaves_the_directory_as_a_leftover()
+    {
+        var sandbox = new BusySandbox();
+        var workspace = Workspace(sandbox);
+        var path = Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name, "factory-sc-404");
+        Assert.False(await workspace.HasLeftoverAsync(Repo, "factory/sc-404", CancellationToken.None));
+
+        // origin has no such branch: `git worktree add` fails under the clone's lock, after the directory was made. Outside a
+        // worker phase (the merge queue's base update) the sandbox user is another run's: the clean-up asks once and leaves it.
+        await Assert.ThrowsAsync<InvalidOperationException>(() => workspace.RestoreAsync(Repo, "factory/sc-404", CancellationToken.None));
+
+        Assert.Equal([$"try-delete {path}"], sandbox.Calls);
+        Assert.True(Directory.Exists(path));
+        // Not a worktree any run could reopen — and still a leftover: replacing it is a deletion as the worker user.
+        Assert.Null(await workspace.ReopenAsync(Repo, "factory/sc-404", CancellationToken.None));
+        Assert.True(await workspace.HasLeftoverAsync(Repo, "factory/sc-404", CancellationToken.None));
+
+        // With the sandbox user free (inside a worker phase) the same failure cleans up after itself.
+        sandbox.Busy = false;
+        sandbox.Calls.Clear();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => workspace.RestoreAsync(Repo, "factory/sc-404", CancellationToken.None));
+        Assert.Equal([$"delete {path}", $"try-delete {path}"], sandbox.Calls);
+        Assert.False(Directory.Exists(path));
+        Assert.False(await workspace.HasLeftoverAsync(Repo, "factory/sc-404", CancellationToken.None));
+    }
+
     private string ClonePath => Path.Combine(_root, "work", "repos", Repo.Owner, Repo.Name);
 
     private int WorktreeCount() => Git(ClonePath, "worktree", "list").Split('\n', StringSplitOptions.RemoveEmptyEntries).Length;

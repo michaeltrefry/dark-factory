@@ -182,7 +182,8 @@ public sealed class WorkSourceRegistry(FactoryOptions options, Func<ItemNaming, 
 
     /// <summary>
     /// <c>factory work</c>'s intake lanes, in <see cref="Kinds"/> order, each with the runner of its items (<paramref name="runner"/>):
-    /// the loop polls them in turn, so two sources' runs (and a triage) never hold the single-tenant worker sandbox at once. One
+    /// the loop lists them in turn; two sources' runs (and a triage) share the single-tenant worker sandbox one at a time through
+    /// its lock (<see cref="WorkerLock"/>, sc-25988). One
     /// lane per source that is watched (<see cref="Configured"/>) — and one per source that only has its credential: the ledger may
     /// hold items of it from before its watch scope was emptied, and without a lane no poll would finish their Stop, retry their
     /// closeout, evaluate a waiting plan or resume a pause (E9). An unwatched source's lane picks up nothing new: its

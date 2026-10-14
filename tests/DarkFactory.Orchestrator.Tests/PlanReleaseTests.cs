@@ -407,9 +407,9 @@ public class PlanReleasePipelineTests
         public FakeWorker Implementer { get; } = new(Reports(Ok), Reports(Ok with { SessionId = "sess-78" }));
         public StringWriter Log { get; } = new();
 
-        public Task<RunOutcome> Run(int id = PlanId, bool ignoreScope = false, bool workerless = false) =>
+        public Task<RunOutcome> Run(int id = PlanId, bool ignoreScope = false) =>
             new RunPipeline(Source, Ledger, Locks, Workspaces, Implementer, Prs, Sandbox, Log, controls: Controls,
-                controlPollInterval: TimeSpan.FromMilliseconds(10), ignoreScope: ignoreScope, workerless: workerless).RunAsync(id, CancellationToken.None);
+                controlPollInterval: TimeSpan.FromMilliseconds(10), ignoreScope: ignoreScope).RunAsync(id, CancellationToken.None);
 
         public Task<string?> GiveUp(string reason) =>
             RunPipeline.GiveUpAsync(Source, Ledger, Locks, PlanId, reason, Log, CancellationToken.None);
@@ -1208,53 +1208,22 @@ public class PlanReleasePipelineTests
     }
 
     [Fact]
-    public async Task A_stop_that_lands_on_a_waiting_plan_after_the_runner_took_no_worker_lock_is_left_to_the_next_run()
+    public async Task A_stop_that_lands_on_a_waiting_plan_is_finished_by_the_run_that_finds_it()
     {
         var h = new Harness();
         await h.Planned(Chain);
         // A planner a crashed run left behind is on record: finishing a stop goes and stops it.
         var plan = (await h.Ledger.FindAsync(ItemNaming.Shortcut.Source, $"sc-{PlanId}", CancellationToken.None))!;
         await h.Ledger.CheckpointAsync(plan, RunPipeline.Steps.WorkerStarted, null, WorkerPid.ToString(), CancellationToken.None);
-        // The runner saw a waiting plan and no Stop, so it took no worker run lock; the Stop lands before the pipeline reads the control.
         await h.Controls.SetAsync(ControlScope.Item($"sc-{PlanId}"), ControlState.Stopping, "test", CancellationToken.None);
 
-        var deferred = await h.Run(workerless: true);
-
-        Assert.Equal(WorkState.Planned, deferred.State);
-        Assert.Contains("stop deferred to the next run", deferred.Error);
-        Assert.Empty(h.Implementer.OrphanStops);
-        Assert.Empty(h.Workspaces.Calls);
-        Assert.Empty(h.Board.Requests);
-        Assert.Empty(await h.Released());
-        Assert.Equal(ControlState.Stopping, await h.Controls.EffectiveAsync($"sc-{PlanId}", 42, CancellationToken.None));
-        Assert.Equal([PlanId], await h.InFlight());
-
-        // The next run is built with the lock (its runner sees the Stop) and finishes the stop.
+        // Any run takes the sandbox user's lock for the phase that needs it (sc-25988; LockScopeTests): none is left to a later run.
         var stopped = await h.Run();
 
         Assert.Equal(WorkState.Cancelled, stopped.State);
         Assert.Equal([WorkerPid], h.Implementer.OrphanStops);
         Assert.Contains(h.Workspaces.Calls, c => c.StartsWith("reopen ", StringComparison.Ordinal));
-    }
-
-    [Fact]
-    public async Task A_run_built_without_the_worker_lock_touches_nothing_but_a_waiting_plan()
-    {
-        var h = new Harness();
-        h.Board.Add(600, FakeShortcutBoard.FactoryTeam, FakeShortcutBoard.ToDo, name: "Hand-written");
-
-        var deferred = await h.Run(600, workerless: true);
-
-        Assert.Contains("sc-600: deferred to the next run", deferred.Error);
-        Assert.Empty(await h.Rows(600));
-        Assert.Empty(h.Board.Requests);
-        Assert.Empty(h.Implementer.Calls);
-        Assert.Empty(h.Workspaces.Calls);
-
-        // A waiting plan is evaluated all the same.
-        var ids = await h.Planned(Chain);
-        Assert.Null((await h.Run(workerless: true)).Error);
-        Assert.Equal([$"sc-{ids[0]}"], await h.Released());
+        Assert.Empty(await h.Released());
     }
 
     [Fact]
@@ -1378,30 +1347,14 @@ public class PlanReleasePipelineTests
 }
 
 /// <summary>
-/// sc-25871: the production runner (<see cref="FactoryRunner"/>) runs a waiting plan item without the worker run lock, and tells its
-/// pipeline so. Against the compose Postgres (skips locally without it); a sandboxed configuration whose worker user and helper do
-/// not exist, so nothing here could reach the real sandbox.
+/// sc-25871, sc-25988: the production runner (<see cref="FactoryRunner"/>) runs a waiting plan item without the sandbox user's lock —
+/// like every run outside its worker phases. Against the compose Postgres (skips locally without it); a sandboxed configuration
+/// whose worker user and helper do not exist, so nothing here could reach the real sandbox.
 /// </summary>
 public class PlanRunnerLockTests
 {
-    /// <summary>The work source with a callback on every read of <see cref="IWorkSource.Naming"/>, everything else forwarded.</summary>
-    public class NamingHook : DispatchProxy
-    {
-        public IWorkSource Target { get; set; } = null!;
-        public Action? OnNaming { get; set; }
-
-        protected override object? Invoke(MethodInfo? method, object?[]? args)
-        {
-            if (method!.Name == $"get_{nameof(IWorkSource.Naming)}")
-            {
-                OnNaming?.Invoke();
-            }
-            return method.Invoke(Target, args);
-        }
-    }
-
     [Fact]
-    public async Task A_waiting_plan_runs_without_the_worker_lock_and_a_stop_landing_after_the_runners_check_is_deferred_by_its_pipeline()
+    public async Task A_waiting_plan_is_evaluated_while_another_runs_worker_phase_holds_the_sandbox_user()
     {
         await using var temp = await TempPostgresDatabase.CreateAsync("df_plan");
         await LedgerMigrations.MigrateAsync(temp.ConnectionString, CancellationToken.None);
@@ -1436,48 +1389,18 @@ public class PlanRunnerLockTests
             await ledger.CheckpointAsync(item, RunPipeline.Steps.PlanStories, null, "sc-9001 sc-9002", CancellationToken.None);
             await ledger.RecordAsync(item, WorkState.Planned, null, "2 stories: sc-9001 sc-9002", CancellationToken.None);
         }
-        var source = DispatchProxy.Create<IWorkSource, NamingHook>();
-        var hook = (NamingHook)(object)source;
-        hook.Target = new ShortcutWorkSource(board.Client(), "tok", new WatchScope(["darkfactory"], []));
-        // Another sandboxed run holds the worker run lock for the whole test: a run that needed it would fail (FactoryUnavailable).
+        var source = new ShortcutWorkSource(board.Client(), "tok", new WatchScope(["darkfactory"], []));
+        // Another run's worker phase holds the sandbox user's lock for the whole test: a run that needed it would wait for ever.
         using var held = WorkerLock.Acquire(root);
 
-        var evaluated = await FactoryRunner.RunAsync(options, source, 500, ignoreScope: false, TextWriter.Null, CancellationToken.None);
+        // The installed helper is the current one (every run's start checks that, reading it; a stub that could run nothing): the
+        // run's lock is the work root's, held by the other run throughout.
+        var evaluated = await FactoryRunner.RunAsync(options, source, 500, ignoreScope: false, TextWriter.Null, CancellationToken.None, adjustGate: null,
+            testSandbox: SandboxSupport.StubSandbox(root, WorkerLock.For(root)));
 
         // Evaluated without the lock: the story nothing blocks was released.
         Assert.Equal((WorkState.Planned, (string?)null), (evaluated.State, evaluated.Error));
         Assert.Equal(FakeShortcutBoard.ToDo, (long)board.Story(9001)["workflow_state_id"]!);
-
-        // A Stop lands after the runner's check and before the pipeline reads the control. The runner reads the source's naming
-        // twice for its check (the state lookup, then the control's scope) and the pipeline reads it next, right before it reads
-        // the control: the Stop is written on that third read.
-        var controls = new LedgerControls(contexts, TimeProvider.System);
-        var reads = 0;
-        hook.OnNaming = () =>
-        {
-            if (++reads == 3)
-            {
-                controls.SetAsync(ControlScope.Item("sc-500"), ControlState.Stopping, "test", CancellationToken.None).GetAwaiter().GetResult();
-            }
-        };
-        board.Requests.Clear();
-
-        var deferred = await FactoryRunner.RunAsync(options, source, 500, ignoreScope: false, TextWriter.Null, CancellationToken.None);
-
-        // The pipeline was told it holds no lock: it finishes no stop (which could stop every worker-user process and remove a
-        // worktree under another run's worker) and leaves it to the next run, which sees the Stop and takes the lock.
-        Assert.True(reads >= 3, $"{reads} reads");
-        Assert.Equal(WorkState.Planned, deferred.State);
-        Assert.Contains("stop deferred to the next run", deferred.Error);
-        Assert.Empty(board.Requests);
-        Assert.Equal(ControlState.Stopping, await controls.EffectiveAsync("sc-500", null, CancellationToken.None));
-        await using var after = contexts.CreateDbContext();
-        Assert.Equal(WorkState.Planned, (await after.WorkItems.AsNoTracking().SingleAsync(i => i.ExternalId == "sc-500")).State);
-        // With the Stop on record, the next run's runner asks for the lock (held here, so it says so) before anything else.
-        hook.OnNaming = null;
-        var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
-            FactoryRunner.RunAsync(options, source, 500, ignoreScope: false, TextWriter.Null, CancellationToken.None));
-        Assert.Contains("only one worker may run at a time", ex.Message);
     }
 }
 

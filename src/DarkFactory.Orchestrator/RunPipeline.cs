@@ -87,15 +87,87 @@ public sealed partial class RunPipeline(
     int? maxControlReadFailures = null,
     Plans.IPlanRunner? planner = null,
     IReadOnlyList<RepoRef>? configuredRepos = null,
-    bool workerless = false)
+    WorkerLock? workerLock = null,
+    Func<CancellationToken, Task>? enterSandbox = null)
 {
     /// <summary>
-    /// Whether this run was built without the worker run lock and the sandbox probe (sc-25871: <see cref="FactoryRunner"/> does so for a
-    /// plan item waiting on its stories). Such a run only evaluates a waiting plan (<see cref="PlannedAsync"/>): anything that could
-    /// reach a worker, the sandbox helper or a worktree — a Stop, or an item that is no longer waiting — is left to the next run,
-    /// which takes the lock.
+    /// The sandbox user's lock (sc-25988, E6; null unsandboxed: workers then run as the owner and share no user). A run holds it
+    /// only for its worker phases (<see cref="InWorkerPhaseAsync"/>) — a worker session with its worktree's set-up, push and
+    /// removal (implement, a review, CI or conflict fix round, a planner's seat), the gate's sandboxed test runs, the stop of a
+    /// worker a crashed run left — and waits on reviews, CI, CodeGraph and the merge queue without it, so other runs' workers run
+    /// meanwhile.
     /// </summary>
-    private readonly bool _workerless = workerless;
+    private readonly WorkerLock? _workerLock = workerLock;
+
+    /// <summary>Whether this run has done its sandbox set-up (<c>enterSandbox</c>): once, in its first worker phase.</summary>
+    private bool _sandboxEntered;
+
+    /// <summary>
+    /// Runs <paramref name="phase"/> as a worker phase: holding the sandbox user's lock, waited for (never failed on) while another
+    /// run — of this process or another, e.g. a <c>factory run</c> beside <c>factory work</c> — has it. While the run waits it
+    /// reads <paramref name="item"/>'s controls every control poll (null: a stop, which no control holds up): a Pause — the usage
+    /// pause and the freeze's row included — or a Stop ends the wait as it ends a step, and controls that cannot be read more than
+    /// <c>Controls:MaxReadFailures</c> times in a row count as a Pause (E2). After a wait the controls and the freeze evaluator are
+    /// asked once more before the phase starts. The run's first worker phase starts with the sandbox set-up every run shares
+    /// (<c>enterSandbox</c>: the readiness probe and the sweep of leftover worktrees, both through the launch helper and so under
+    /// the lock; a failure there is the factory's, <see cref="FactoryUnavailableException"/>). A phase inside a phase runs at once.
+    /// The wait is logged when it starts and again every <see cref="WorkerLock.ReportEvery"/> (with why the lock could not be
+    /// had), and a lock file that cannot be opened at all is the factory's failure too (<see cref="WorkerLock.HoldAsync{T}"/>:
+    /// the item, already claimed, is left where it is, E10).
+    /// </summary>
+    private async Task<T> InWorkerPhaseAsync<T>(WorkItem? item, string what, Func<Task<T>> phase, CancellationToken ct)
+    {
+        async Task<T> EnteredAsync()
+        {
+            if (!_sandboxEntered && enterSandbox is not null)
+            {
+                await enterSandbox(ct);
+            }
+            _sandboxEntered = true;
+            return await phase();
+        }
+        if (_workerLock is null || _workerLock.IsHeld)
+        {
+            return await EnteredAsync();
+        }
+        var (waited, unreadable) = (false, 0);
+        return await _workerLock.HoldAsync(async () =>
+        {
+            if (waited && item is not null)
+            {
+                log.WriteLine($"[lock] {item.ExternalId}: the sandbox user is free; going on to {what}");
+                await ThrowIfControlledAsync(item, ct);
+                await ThrowIfFrozenAsync(item, ct);
+            }
+            return await EnteredAsync();
+        }, ct, async c =>
+        {
+            if (!waited)
+            {
+                waited = true;
+                log.WriteLine($"[lock] {item?.ExternalId ?? "a stop"}: waiting for the sandbox user to {what} (another run's worker phase holds {_workerLock.Path})");
+            }
+            if (item is null)
+            {
+                return;
+            }
+            try
+            {
+                await ThrowIfControlledAsync(item, c);
+                unreadable = 0;
+            }
+            catch (Exception ex) when (ex is not ControlRequestedException and not OperationCanceledException)
+            {
+                if (++unreadable > _maxControlReadFailures)
+                {
+                    throw new ControlRequestedException(ControlState.Paused) { ControlsUnreadable = $"{ex.GetType().Name}: {ex.Message}" };
+                }
+            }
+        }, _controlPoll, report: log.WriteLine);
+    }
+
+    private Task InWorkerPhaseAsync(WorkItem? item, string what, Func<Task> phase, CancellationToken ct) =>
+        InWorkerPhaseAsync(item, what, async () => { await phase(); return true; }, ct);
 
     /// <summary>
     /// The factory's configured repositories (<c>FactoryOptions.ConfiguredRepos</c>; the default repository alone when not given): the
@@ -461,7 +533,9 @@ public sealed partial class RunPipeline(
             {
                 [WorkState.Intake] = IntakeAsync,
                 [WorkState.Plan] = PlanAsync,
-                [WorkState.Implement] = ImplementAsync,
+                // A worker phase from the orphan's stop to the worktree's removal (sc-25988): nothing else may run as the sandbox user
+                // between the session and its push.
+                [WorkState.Implement] = (run, ct) => InWorkerPhaseAsync(run.Item, "implement", () => ImplementAsync(run, ct), ct),
             };
             if (gate is not null)
             {
@@ -607,15 +681,6 @@ public sealed partial class RunPipeline(
         // Decide from the ledger (and the controls) before reading anything from the board.
         var known = await ledger.FindAsync(Naming.Source, Naming.Format(storyId), ct);
         var knownControl = known is null ? ControlState.Running : await _controls.EffectiveAsync(known.ExternalId, known.EpicId, ct);
-        if (_workerless && (known?.State != WorkState.Planned || knownControl == ControlState.Stopping))
-        {
-            // Decided since the runner looked (a Stop landed, or the item moved): this run holds no worker run lock, so it must not
-            // stop an orphaned worker (sandboxed: every worker-user process) or touch a worktree while another process's worker runs.
-            var why = knownControl == ControlState.Stopping ? "stop deferred to the next run" : "deferred to the next run";
-            log.WriteLine($"[{known?.State.ToString() ?? "intake"}] {Naming.Format(storyId)}: {why} (this run was started without the worker run lock)");
-            return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null,
-                $"{Naming.Format(storyId)}: {why}; this run was started without the worker run lock");
-        }
         if (known is not null && knownControl == ControlState.Stopping)
         {
             // A stop is finished even while the factory is frozen: it starts no new work.
@@ -926,14 +991,8 @@ public sealed partial class RunPipeline(
             var evaluated = await PlannedAsync(item, storyId, history, ct);
             // A Stop that landed while the plan was evaluated (sc-25876): nothing watches a control during the evaluation, so this
             // run finishes the stop now, under the run lock it holds — the plan item is not left Stopping with nobody acting on it.
-            // A run started without the worker run lock defers it, as it does a Stop it finds at its start.
             if (!Lifecycle.IsTerminal(item.State) && await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) == ControlState.Stopping)
             {
-                if (_workerless)
-                {
-                    log.WriteLine($"[{item.State}] {item.ExternalId}: stop deferred to the next run (this run was started without the worker run lock)");
-                    return evaluated with { Error = $"{item.ExternalId}: stop deferred to the next run; this run was started without the worker run lock" };
-                }
                 return await FinishStopAsync(item, storyId, RepoRef.Parse(item.Repo), null, workerStillRunning: false);
             }
             return evaluated;
@@ -1483,12 +1542,28 @@ public sealed partial class RunPipeline(
         }
     }
 
+    /// <summary>
+    /// Removes a worktree. Sandboxed, the worker user deletes it first, through the launch helper, so it happens under the sandbox
+    /// user's lock (sc-25988): inside a worker phase at once; outside one (an escalation's or a stop's clean-up, the merge queue's
+    /// base-update worktree) only if the lock is free now — a run does not hold its item, or its repository's queue turn, for
+    /// another run's whole worker session to throw a directory away. Left behind, it is deleted by the sweep the next worker phase
+    /// of any run starts with, or replaced by this item's next worktree. False when it is still there.
+    /// </summary>
     private async Task<bool> RemoveWorktreeAsync(RepoRef repo, Workspace workspace)
     {
         try
         {
-            await workspaces.RemoveAsync(repo, workspace, CancellationToken.None);
-            return true;
+            if (_workerLock is null)
+            {
+                await workspaces.RemoveAsync(repo, workspace, CancellationToken.None);
+                return true;
+            }
+            if (await _workerLock.TryHoldAsync(() => workspaces.RemoveAsync(repo, workspace, CancellationToken.None)))
+            {
+                return true;
+            }
+            log.WriteLine($"[cleanup] the sandbox user is busy (another run's worker phase); leaving {workspace.Path} for the next worker phase's sweep");
+            return false;
         }
         catch (Exception ex)
         {
@@ -1612,7 +1687,10 @@ public sealed partial class RunPipeline(
         {
             var history = await ledger.HistoryAsync(item, ct);
             var attempt = CurrentWorkerAttempt(history);
-            if (OrphanedWorkerPid(attempt) is { } pid && await worker.StopOrphanAsync(pid, ct))
+            // Sandboxed, the stop of a leftover worker is a run of the launch helper (it kills every process of the sandbox user):
+            // a worker phase, waited for, so it never lands under another run's worker.
+            if (OrphanedWorkerPid(attempt) is { } pid
+                && await InWorkerPhaseAsync(null, $"stop {item.ExternalId}'s leftover worker", () => worker.StopOrphanAsync(pid, ct), ct))
             {
                 await ledger.CheckpointAsync(item, Steps.OrphanKilled, null, $"pid {pid}", ct);
             }

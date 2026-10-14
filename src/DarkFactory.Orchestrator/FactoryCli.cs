@@ -93,7 +93,7 @@ public static class FactoryCli
         };
         protectCommand.SetAction((parse, ct) => protectRepo(parse.GetValue(repoArgument)!, ct));
 
-        var workCommand = new Command("work", "Run the long-running factory host until Ctrl-C: the dashboard and session hub on 127.0.0.1:Factory:HostPort (plus Dashboard:BindAddress), and the intake loop that polls every configured work source in turn (Shortcut, KanbanBoard, GitHub issues: any of them, at least one) and runs each ready item, one at a time.");
+        var workCommand = new Command("work", "Run the long-running factory host until Ctrl-C: the dashboard and session hub on 127.0.0.1:Factory:HostPort (plus Dashboard:BindAddress), and the intake loop that polls every configured work source in turn (Shortcut, KanbanBoard, GitHub issues: any of them, at least one) and runs each ready item, one at a time unless Intake:MaxConcurrentRuns says more.");
         workCommand.SetAction((_, ct) => work(ct));
 
         var setPasswordCommand = new Command("set-password", "Set the dashboard login password (read without echo; its hash goes to the keychain).");

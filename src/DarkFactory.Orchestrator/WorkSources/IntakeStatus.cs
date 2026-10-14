@@ -1,8 +1,8 @@
 namespace DarkFactory.Orchestrator.WorkSources;
 
 /// <summary>
-/// A failure the whole factory shares, not one item's: the run lock another sandboxed run holds
-/// (<see cref="WorkerLock"/>), a worker sandbox that is not ready, the ledger migration or the worktree sweep.
+/// A failure the whole factory shares, not one item's: a worker sandbox that is not ready, the ledger migration or the
+/// worktree sweep. (Another run's worker phase holding the sandbox user, <see cref="WorkerLock"/>, is none: a run waits for it.)
 /// Every item would fail the same way, so the intake loop shows it once on the dashboard and escalates no item for it.
 /// </summary>
 public sealed class FactoryUnavailableException(string message, Exception inner) : Exception(message, inner);

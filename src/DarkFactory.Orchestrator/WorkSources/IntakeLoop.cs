@@ -44,8 +44,12 @@ public interface IItemRunner
 
 /// <summary>
 /// <c>factory work</c>: polls the work sources at a fixed interval (the Mac exposes no webhook
-/// endpoint) and runs each in-flight or ready item through the pipeline, one at a time. The
-/// pipeline's Intake claims the item; its run lock stops a second process running the same item.
+/// endpoint) and runs each in-flight or ready item through the pipeline, up to
+/// <see cref="IntakeOptions.MaxConcurrentRuns"/> at once (sc-25988; 1, the default: one after another). Each item is run once
+/// per poll, in the poll's order (each lane's in-flight items, then its ready ones); a poll ends when its runs have. Runs overlap
+/// only outside the phases that use the sandbox user (<see cref="WorkerLock"/>: a run waits for it there), and one repository's
+/// merges stay one at a time (the merge queue's turn). The
+/// pipeline's Intake claims the item; its run lock stops a second run — of this process or another — running the same item.
 /// While the factory is paused (<see cref="Controls.ControlScope.Factory"/>, the usage pause
 /// <see cref="Controls.ControlScope.Usage"/>, or the freeze <see cref="Controls.ControlScope.Freeze"/>) it lists no new ready items; the runner leaves out in-flight items a
 /// control pauses (their claims are still renewed, <see cref="RenewClaimsAsync"/>), and the pipeline itself refuses to claim a story in a paused epic. Each poll first reads the
@@ -57,12 +61,15 @@ public interface IItemRunner
 /// the loop gives up on the item (<see cref="IItemRunner.GiveUpAsync"/>) instead of retrying it every poll.
 /// <paramref name="lanes"/> holds one lane per work source that is watched or has its credential (sc-25982,
 /// <see cref="WorkSourceRegistry.Lanes"/>: any set of them, in <see cref="WorkSourceRegistry.Kinds"/> order; an unwatched one
-/// lists nothing ready and only has its in-flight items finished; none polls nothing), polled in turn by the same loop, so
-/// their runs never overlap; a source whose listing fails is skipped for that poll without holding up the others. Items are
+/// lists nothing ready and only has its in-flight items finished; none polls nothing), listed in turn by the same loop
+/// before any item of the poll runs (so a lane's preparation — a triage — runs beside no item run of this process); a source
+/// whose listing fails is skipped for that poll without holding up the others. Items are
 /// keyed by their external id (<c>sc-12</c>, <c>gh-3</c>, <c>kb-4</c>) on the dashboard. A run deferred by the freeze evaluator
-/// (<see cref="RunOutcome.Deferred"/>) is shown on the dashboard and ends the poll's new work: no ready item of any lane is run,
-/// and a lane's in-flight items stop at its first deferral — but every lane's in-flight items are run up to then, and those
-/// being stopped come first (<see cref="IItemRunner.InFlightAsync"/>), so a pending Stop is finished in a frozen factory too.
+/// (<see cref="RunOutcome.Deferred"/>) is shown on the dashboard and ends the poll's new work: no ready item of any lane is
+/// started after it, and no further in-flight item of its lane — but every lane's in-flight items are started up to then, and
+/// those being stopped come first (<see cref="IItemRunner.InFlightAsync"/>), so a pending Stop is finished in a frozen factory
+/// too. A factory-wide failure starts nothing more this poll. Runs already started when either happens run to their end: each
+/// run checks the freeze, the usage pause and its controls itself, before every step.
 /// <paramref name="freeze"/>, when set, is the
 /// freeze evaluator run at the start of each poll: frozen (or unable to check), no lane is prepared (no triage) or listed.
 /// </summary>
@@ -90,7 +97,7 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        logger.LogInformation("Polling for work every {Interval}", options.PollInterval);
+        logger.LogInformation("Polling for work every {Interval}, running up to {Runs} item(s) at once", options.PollInterval, options.MaxConcurrentRuns);
         using var timer = new PeriodicTimer(options.PollInterval, time);
         Task<bool>? tick = null;
         while (true)
@@ -191,15 +198,35 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
                 factoryFailed = true;
             }
         }
+        // The poll's runs, in order: each lane's in-flight items (those being stopped first), then its ready ones; an item once.
+        var listed = new HashSet<string>(StringComparer.Ordinal);
+        var queue = new Queue<(IntakeLane Lane, int Id, bool Ready)>(work
+            .SelectMany(w => w.InFlight.Select(id => (w.Lane, Id: id, Ready: false)).Concat(w.Ready.Select(id => (w.Lane, Id: id, Ready: true))))
+            .Where(x => listed.Add(x.Lane.Source.Naming.Format(x.Id))));
+        // What the runs so far decided for those not yet started, read and written under the gate by every dispatcher.
+        var gate = new Lock();
         var runsFailed = false;
         var deferredRun = false;
-        foreach (var (lane, inFlight, ready) in work)
+        var deferredLanes = new HashSet<IntakeLane>();
+        (IntakeLane Lane, int Id, bool Ready)? Next()
         {
-            var laneDeferred = false;
-            // In-flight items (those being stopped first) even after another lane's deferral: a Stop starts no new work. Ready ones
-            // only while nothing was deferred: the factory is frozen, so every new item would be deferred the same way.
-            var ids = inFlight.Select(id => (Id: id, Ready: false)).Concat(ready.Select(id => (Id: id, Ready: true)));
-            foreach (var (id, isReady) in ids.TakeWhile(x => !runsFailed && !laneDeferred && !(x.Ready && deferredRun)))
+            lock (gate)
+            {
+                // In-flight items (those being stopped first) even after another lane's deferral: a Stop starts no new work. Ready
+                // ones only while nothing was deferred: the factory is frozen, so every new item would be deferred the same way.
+                while (!runsFailed && queue.TryDequeue(out var next))
+                {
+                    if (!deferredLanes.Contains(next.Lane) && !(next.Ready && deferredRun))
+                    {
+                        return next;
+                    }
+                }
+                return null;
+            }
+        }
+        async Task DispatchAsync()
+        {
+            while (Next() is var (lane, id, _))
             {
                 var name = lane.Source.Naming.Format(id);
                 try
@@ -207,26 +234,37 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
                     var outcome = await lane.Runner.RunAsync(id, ct);
                     logger.LogInformation("{Item}: {State}{Error}", name, outcome.State, outcome.Error is null ? "" : $" ({outcome.Error})");
                     _status.ItemOk(name);
-                    if (outcome.Deferred is { } deferred)
+                    lock (gate)
                     {
-                        // The factory is frozen: every other item of the lane would be deferred the same way (its stops came first).
-                        _status.Deferred(name, deferred);
-                        deferredRun = laneDeferred = true;
-                    }
-                    else if (!deferredRun)
-                    {
-                        _status.NotDeferred();
+                        if (outcome.Deferred is { } deferred)
+                        {
+                            // The factory is frozen: every other item of the lane would be deferred the same way (its stops came first).
+                            _status.Deferred(name, deferred);
+                            deferredRun = true;
+                            deferredLanes.Add(lane);
+                        }
+                        else if (!deferredRun)
+                        {
+                            _status.NotDeferred();
+                        }
                     }
                 }
                 catch (Exception ex) when (!ct.IsCancellationRequested && IsFactoryWide(ex))
                 {
-                    // Every other item would fail the same way: show it once, escalate nothing, try again next poll.
+                    // Every other item would fail the same way: show it once, escalate nothing, start nothing more, try again next poll.
                     logger.LogError(ex, "Run of {Item} failed for a factory-wide reason; ending this poll", name);
-                    _status.FactoryFailed($"{name} could not run: {ex.Message}");
-                    factoryFailed = runsFailed = true;
+                    lock (gate)
+                    {
+                        if (!runsFailed)
+                        {
+                            _status.FactoryFailed($"{name} could not run: {ex.Message}");
+                        }
+                        factoryFailed = runsFailed = true;
+                    }
                 }
                 catch (Exception ex) when (!ct.IsCancellationRequested)
                 {
+                    // Counted against this item alone, whatever runs beside it.
                     logger.LogError(ex, "Run of {Item} failed", name);
                     var failures = _status.ItemFailed(name, $"{ex.GetType().Name}: {ex.Message}");
                     if (failures == options.MaxItemFailures)
@@ -235,6 +273,16 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
                     }
                 }
             }
+        }
+        // One dispatcher runs the items one after another, as ever; more start the next item as soon as one of them is free.
+        var dispatchers = Math.Min(options.MaxConcurrentRuns, queue.Count);
+        if (dispatchers <= 1)
+        {
+            await DispatchAsync();
+        }
+        else
+        {
+            await Task.WhenAll(Enumerable.Range(0, dispatchers).Select(_ => Task.Run(DispatchAsync, ct)));
         }
         if (!factoryFailed)
         {
@@ -338,9 +386,19 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
 public sealed record IntakeLane(IWorkSource Source, IItemRunner Runner, Func<CancellationToken, Task>? Prepare = null);
 
 /// <param name="MaxItemFailures"><c>Intake:MaxItemFailures</c>: runs of one item in a row that may fail before the loop gives up on it.</param>
-public sealed record IntakeOptions(TimeSpan PollInterval, int MaxItemFailures = IntakeOptions.DefaultMaxItemFailures)
+/// <param name="MaxConcurrentRuns"><c>Intake:MaxConcurrentRuns</c> (sc-25988): how many items the loop runs at once; 1 runs them one after another.</param>
+public sealed record IntakeOptions(TimeSpan PollInterval, int MaxItemFailures = IntakeOptions.DefaultMaxItemFailures,
+    int MaxConcurrentRuns = IntakeOptions.DefaultMaxConcurrentRuns)
 {
     public const int DefaultMaxItemFailures = 3;
+    public const int DefaultMaxConcurrentRuns = 1;
+
+    /// <summary>The most runs at once a factory may be configured for: each holds ledger connections and its own clients.</summary>
+    public const int MaxConcurrentRunsLimit = 8;
+
+    public int MaxConcurrentRuns { get; } = MaxConcurrentRuns is >= 1 and <= MaxConcurrentRunsLimit
+        ? MaxConcurrentRuns
+        : throw new ArgumentOutOfRangeException(nameof(MaxConcurrentRuns), MaxConcurrentRuns, $"must be from 1 to {MaxConcurrentRunsLimit}");
 }
 
 public static class IntakeServiceCollectionExtensions
@@ -349,7 +407,7 @@ public static class IntakeServiceCollectionExtensions
     public static IServiceCollection AddIntake(this IServiceCollection services, FactoryOptions options)
     {
         services.TryAddSingleton(TimeProvider.System);
-        services.AddSingleton(new IntakeOptions(options.PollInterval, options.MaxItemFailures));
+        services.AddSingleton(new IntakeOptions(options.PollInterval, options.MaxItemFailures, options.MaxConcurrentRuns));
         // Each run reads the Freeze:* thresholds (FactoryRunner); a bad value fails start-up here rather than every run.
         _ = options.Freeze;
         services.TryAddSingleton(sp => new IntakeStatus(sp.GetRequiredService<TimeProvider>()));
@@ -366,8 +424,9 @@ public static class IntakeServiceCollectionExtensions
         services.AddSingleton<Controls.IItemStops>(sp => new FactoryItemStops(options, sp.GetRequiredService<WorkSourceRegistry>(), Console.Out));
         services.AddHostedService(sp =>
         {
-            // One loop polls every configured source in turn, so a triage and an item run, or two sources' runs, never hold the
-            // single-tenant worker sandbox at once. A watched source without its credential fails the host's start here.
+            // One loop lists every configured source in turn; a triage and the items' worker phases, of whatever source, share the
+            // single-tenant worker sandbox one at a time through its lock (WorkerLock). A watched source without its credential
+            // fails the host's start here.
             var status = sp.GetRequiredService<IntakeStatus>();
             var lanes = sp.GetRequiredService<WorkSourceRegistry>().Lanes(source => new FactoryItemRunner(options, source, Console.Out), status, Console.Out);
             // One evaluator for the loop's life, so its main-red reads are reused within FactoryFreeze.MainRedCacheTtl; built on the

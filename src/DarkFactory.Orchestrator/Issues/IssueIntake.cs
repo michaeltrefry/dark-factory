@@ -201,6 +201,12 @@ public sealed class IssueIntake(
             }
             return outcome;
         }
+        catch (TriageDeferredException ex)
+        {
+            // Put off, not failed (sc-25988): a control came to hold the item while its triage waited for the sandbox user.
+            log.WriteLine($"[issues] {id} ({repo}#{issue.Number}): {ex.Message}");
+            return Outcome.Again;
+        }
         catch (GitHubRequestException ex) when (!ct.IsCancellationRequested && ex.Permanent)
         {
             // GitHub refuses this issue's request as it stands (e.g. 422, 403 locked, 404 gone): retrying every poll would only hold
@@ -333,7 +339,7 @@ public sealed class IssueIntake(
                 error = $"the triage worker's answer could not be read: {ex.Message}";
             }
         }
-        catch (Exception ex) when (!ct.IsCancellationRequested && !IntakeLoop.IsFactoryWide(ex))
+        catch (Exception ex) when (!ct.IsCancellationRequested && !IntakeLoop.IsFactoryWide(ex) && ex is not TriageDeferredException)
         {
             var failures = status.ItemFailed(item.ExternalId, $"{ex.GetType().Name}: {ex.Message}");
             log.WriteLine($"[issues] {item.ExternalId} triage failed ({failures} in a row): {ex.Message}");
