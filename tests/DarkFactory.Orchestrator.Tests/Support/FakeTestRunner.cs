@@ -73,6 +73,11 @@ internal sealed class FakeTestRunner : IGateTestRunner
 
     private static IEnumerable<string> Filtered(IReadOnlyList<string> args)
     {
+        if (args.Count >= 8 && args[0] == "-c" && args[2] == "factory-ios-simulator" && args[3] == "session")
+        {
+            // the iOS simulator session (XcodeNewTests, sc-26132): <flag> <container> <scheme> <id> <hash> records
+            return args.Skip(8).Chunk(5).Select(r => r[3]).ToList();
+        }
         if (args.Contains("test-without-building"))
         {
             // the xcodebuild wrapper (XcodeNewTests): -only-testing:<id>

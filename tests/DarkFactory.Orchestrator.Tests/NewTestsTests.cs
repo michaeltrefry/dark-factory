@@ -142,6 +142,22 @@ public class NewTestsGateTests
     }
 
     [Fact]
+    public async Task A_machine_that_cannot_run_the_tests_fails_the_factory_not_the_item()
+    {
+        // sc-26132: e.g. the iOS simulator outside a GUI login session. The run's failure reaches the intake loop as factory-wide
+        // (IntakeLoop.IsFactoryWide): nothing is recorded against the item, which is not escalated, and the next run checks again.
+        var h = new Harness();
+        h.TestRunner.RunThrows = new WorkSources.FactoryUnavailableException("the gate's test runs: refusing iOS simulator work", new InvalidOperationException("x"));
+
+        var ex = await Assert.ThrowsAsync<WorkSources.FactoryUnavailableException>(() => h.Run());
+
+        Assert.Contains("refusing iOS simulator work", ex.Message);
+        Assert.Empty(await Results(h));
+        Assert.DoesNotContain(await h.Rows(), r => r.State == WorkState.Escalated);
+        Assert.Empty(h.Merges);
+    }
+
+    [Fact]
     public async Task A_result_recorded_for_the_same_base_and_head_is_reused_after_an_interruption()
     {
         var h = new Harness();
@@ -1117,6 +1133,58 @@ public class GateCloneTests : IDisposable
         var judged = NewTestsCheck.Judge(sha, sha, "dotnet-xunit", ["N.T.A"], report, report);
         Assert.Equal(NewTestsOutcome.Error, judged.Outcome);
         Assert.Contains("could not be read, so its results are no evidence: 0/results.xunit.xml: it is larger than 200 bytes", judged.Reason);
+    }
+
+    /// <summary>sc-26132: an iOS simulator step of the compiled-in script, over <see cref="SimulatorScriptStub"/> (never a real simulator).</summary>
+    private static TestStep SimulatorStep(TestPhase phase, SimulatorScriptStub stub, params string[] args) =>
+        new(phase, XcodeNewTests.Bash, ["-c", $"HOME='{stub.Home}'\n{stub.Text}", "factory-ios-simulator", .. args]);
+
+    [Fact]
+    public async Task An_ios_simulator_session_that_fails_gives_its_reason_through_the_real_runner()
+    {
+        // sc-26132: the session's standard output is all the gate keeps of it, so its refusal must be there, not on stderr.
+        var (runner, sha) = await ShRunner();
+        var stub = new SimulatorScriptStub(Directory.CreateDirectory(Path.Combine(_root, "sim")).FullName); // no device: the session cannot run
+        var results = NewTestsCheck.NewResultsDirectory();
+        var session = SimulatorStep(TestPhase.Test, stub, "session", "dark-factory-gate-0123456789abcdef", results, "/nonexistent/wrapper", "720",
+            "-project", "A.xcodeproj", "A", "ATests/a()", "00000000000000aa") with { CaptureOutput = XcodeNewTests.SessionOutput, ResultFilePattern = "xcode-test-*.json" };
+
+        var report = await runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-head", sha, null, [], [], [session], new XcodeNewTests(), results), CancellationToken.None);
+
+        Assert.Equal(TestRunStatus.Ran, report.Status);
+        Assert.Empty(report.Results);
+        Assert.Equal([$"{XcodeNewTests.SessionOutput}: the iOS simulator session failed (exit 70): factory-ios-simulator: error: the device dark-factory-gate-0123456789abcdef does not exist"],
+            report.UnreadableReports);
+    }
+
+    [Fact]
+    public async Task A_step_that_exits_with_its_factory_wide_exit_fails_the_run_as_the_factorys_after_its_cleanup()
+    {
+        // sc-26132: outside a GUI login session no simulator can run for anyone: the factory's failure, never the item's.
+        var (runner, sha) = await ShRunner();
+        var stub = new SimulatorScriptStub(Directory.CreateDirectory(Path.Combine(_root, "sim")).FullName, manager: "Background");
+        var results = NewTestsCheck.NewResultsDirectory();
+        var marker = Path.Combine(_root, "cleaned");
+        TestStep[] steps =
+        [
+            SimulatorStep(TestPhase.Restore, stub, "prepare", "dark-factory-gate-0123456789abcdef", results) with { FactoryWideExit = XcodeNewTests.SimulatorUnavailableExit },
+            new(TestPhase.Test, "/bin/sh", ["-c", "exit 0"]) { CaptureOutput = "never" },
+            new(TestPhase.Cleanup, "/bin/sh", ["-c", $"touch '{marker}'"]),
+        ];
+
+        var ex = await Assert.ThrowsAsync<WorkSources.FactoryUnavailableException>(() =>
+            runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-head", sha, null, [], [], steps, new XcodeNewTests(), results), CancellationToken.None));
+
+        Assert.StartsWith("the gate's test runs: `/bin/bash -c <", ex.Message);
+        Assert.Contains("factory-ios-simulator prepare dark-factory-gate-0123456789abcdef", ex.Message);
+        Assert.Contains("exited 69: factory-ios-simulator: refusing iOS simulator work: launchctl managername is 'Background', not 'Aqua'.", ex.Message);
+        Assert.True(File.Exists(marker), "the run's cleanup did not run");
+        Assert.Empty(stub.CallLines);
+        // Another exit of the same step (a device that cannot be created, say) stays the run's: a restore failure, judged as before.
+        var other = await runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-head", sha, null, [], [],
+            [new TestStep(TestPhase.Restore, "/bin/sh", ["-c", "echo nope; exit 70"]) { FactoryWideExit = XcodeNewTests.SimulatorUnavailableExit }],
+            new XcodeNewTests(), NewTestsCheck.NewResultsDirectory()), CancellationToken.None);
+        Assert.Equal(TestRunStatus.RestoreFailed, other.Status);
     }
 
     [Fact]

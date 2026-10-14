@@ -251,6 +251,9 @@ public sealed record XcodeTarget(string Id, string Name, string ProductType, Pbx
     public const string UITestBundle = "com.apple.product-type.bundle.ui-testing";
 
     public bool IsUnitTests => ProductType == UnitTestBundle;
+
+    /// <summary>A unit-test or UI-test bundle (sc-26132: an iOS UI-test target's tests run on a simulator).</summary>
+    public bool IsTestBundle => ProductType is UnitTestBundle or UITestBundle;
 }
 
 /// <summary>
@@ -747,30 +750,53 @@ public sealed class XcodeProject
             : $"its PRODUCT_NAME is {name}, not the target's name {target.Name}: xcodebuild names its tests by the bundle, which the gate does not map to the target yet";
     }
 
+    /// <summary>This Mac: the destination of a macOS test target.</summary>
+    public const string MacOS = "macOS";
+
+    /// <summary>An iOS Simulator: the destination of an iOS test target (sc-26132; a device never, E3).</summary>
+    public const string IOS = "iOS";
+
     /// <summary>
-    /// Whether <paramref name="target"/> builds for macOS in <paramref name="configuration"/> (its <c>SDKROOT</c> is
-    /// <c>macosx</c>, or <c>auto</c> with <c>macosx</c> among its <c>SUPPORTED_PLATFORMS</c>); else what it builds for, or
-    /// why that cannot be told.
+    /// Where the gate runs the tests of <paramref name="target"/> built in <paramref name="configuration"/> (sc-26131,
+    /// sc-26132): <see cref="MacOS"/> or <see cref="IOS"/> (a simulator), read from its <c>SDKROOT</c> (<c>macosx</c>,
+    /// <c>iphoneos</c>/<c>iphonesimulator</c>, or <c>auto</c> with its <c>SUPPORTED_PLATFORMS</c>); else null and why. A
+    /// target that builds for both is picked deterministically, and <c>Note</c> says which: a unit-test target on macOS (no
+    /// simulator needed), a UI-test target on iOS (the gate runs no macOS UI tests: XCUITest on macOS needs automation mode
+    /// and an Accessibility grant that the sandbox user cannot be given).
     /// </summary>
-    public (bool Mac, string? Why) BuildsForMac(XcodeTarget target, string configuration)
+    public (string? Platform, string? Why, string? Note) TestPlatform(XcodeTarget target, string configuration)
     {
         var (sdk, problem) = Setting(target, configuration, "SDKROOT");
         if (sdk is null)
         {
-            return (false, problem);
+            return (null, problem, null);
         }
-        if (sdk.StartsWith("macosx", StringComparison.Ordinal))
-        {
-            return (true, null);
-        }
+        string[] platforms;
         if (sdk == "auto")
         {
-            var (platforms, why) = Setting(target, configuration, "SUPPORTED_PLATFORMS");
-            return platforms is null ? (false, why)
-                : platforms.Split(' ', StringSplitOptions.RemoveEmptyEntries).Contains("macosx") ? (true, null)
-                : (false, $"it builds for {platforms} only");
+            var (supported, why) = Setting(target, configuration, "SUPPORTED_PLATFORMS");
+            if (supported is null)
+            {
+                return (null, why, null);
+            }
+            platforms = supported.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         }
-        return (false, $"it builds for the {sdk} SDK");
+        else
+        {
+            platforms = [sdk];
+        }
+        var mac = platforms.Any(p => p.StartsWith("macosx", StringComparison.Ordinal));
+        var ios = platforms.Any(p => p.StartsWith("iphoneos", StringComparison.Ordinal) || p.StartsWith("iphonesimulator", StringComparison.Ordinal));
+        var builds = sdk == "auto" ? $"it builds for {string.Join(' ', platforms)} only" : $"it builds for the {sdk} SDK";
+        if (target.ProductType == XcodeTarget.UITestBundle)
+        {
+            return ios ? (IOS, null, mac ? $"{target.Name} builds for macOS and iOS: its UI tests run on an iOS Simulator (the gate runs no macOS UI tests)" : null)
+                : (null, mac ? "it is a macOS UI-test target: the gate runs no macOS UI tests (XCUITest on macOS needs automation mode and an Accessibility grant that the sandbox user cannot be given), only iOS ones on a simulator"
+                    : $"{builds}: the gate runs macOS and iOS Simulator tests only", null);
+        }
+        return mac ? (MacOS, null, ios ? $"{target.Name} builds for macOS and iOS: the gate runs its tests on macOS" : null)
+            : ios ? (IOS, null, null)
+            : (null, $"{builds}: the gate runs macOS and iOS Simulator tests only", null);
     }
 }
 

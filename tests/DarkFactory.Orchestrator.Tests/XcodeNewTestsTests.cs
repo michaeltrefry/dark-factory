@@ -145,18 +145,18 @@ public class XcodeProjectTests
     }
 
     [Theory]
-    [InlineData("SDKROOT = macosx;", true, null)]
-    [InlineData("SDKROOT = iphoneos;", false, "iphoneos SDK")]
-    [InlineData("SDKROOT = auto; SUPPORTED_PLATFORMS = \"iphoneos iphonesimulator macosx\";", true, null)]
-    [InlineData("SDKROOT = auto; SUPPORTED_PLATFORMS = \"iphoneos iphonesimulator\";", false, "iphoneos iphonesimulator only")]
-    [InlineData("", false, "set neither by the target nor by the project")]
-    public void Whether_a_target_builds_for_macos_is_read_from_its_sdk(string settings, bool mac, string? why)
+    [InlineData("SDKROOT = macosx;", "macOS", null)]
+    [InlineData("SDKROOT = iphoneos;", "iOS", null)]
+    [InlineData("SDKROOT = auto; SUPPORTED_PLATFORMS = \"iphoneos iphonesimulator macosx\";", "macOS", null)]
+    [InlineData("SDKROOT = auto; SUPPORTED_PLATFORMS = \"iphoneos iphonesimulator\";", "iOS", null)]
+    [InlineData("", null, "set neither by the target nor by the project")]
+    public void Where_a_target_is_tested_is_read_from_its_sdk(string settings, string? platform, string? why)
     {
         var project = XcodeProject.Parse("Words.xcodeproj", XcodeFixture.SynchronizedProject.Replace("\t\t\t\tSDKROOT = macosx;\n", "\t\t\t\t" + settings + "\n"));
 
-        var (isMac, reason) = project.BuildsForMac(project.Targets.Single(t => t.Name == "WordsTests"), "Debug");
+        var (actual, reason, _) = project.TestPlatform(project.Targets.Single(t => t.Name == "WordsTests"), "Debug");
 
-        Assert.Equal(mac, isMac);
+        Assert.Equal(platform, actual);
         if (why is not null)
         {
             Assert.Contains(why, reason);
@@ -501,9 +501,9 @@ public class XcodeIdentifyTests
     }
 
     [Theory]
-    [InlineData("SDKROOT = macosx;", "SDKROOT = iphoneos;", "is not a macOS target in its scheme's Debug configuration (it builds for the iphoneos SDK): iOS and other destinations are not run by the gate yet")]
-    [InlineData("productType = \"com.apple.product-type.bundle.unit-test\";", "productType = \"com.apple.product-type.bundle.ui-testing\";", "it is compiled only by WordsTests of Words.xcodeproj (a UI-test target, which the gate does not run), not by a unit-test target")]
-    public async Task An_ios_or_ui_test_target_is_unsupported(string from, string to, string why)
+    [InlineData("SDKROOT = macosx;", "SDKROOT = appletvos;", "cannot be tested by the gate in its scheme's Debug configuration: it builds for the appletvos SDK: the gate runs macOS and iOS Simulator tests only")]
+    [InlineData("productType = \"com.apple.product-type.bundle.unit-test\";", "productType = \"com.apple.product-type.bundle.ui-testing\";", "cannot be tested by the gate in its scheme's Debug configuration: it is a macOS UI-test target: the gate runs no macOS UI tests")]
+    public async Task A_tvos_or_macos_ui_test_target_is_unsupported(string from, string to, string why)
     {
         var project = XcodeFixture.SynchronizedProject.Replace(from, to);
         var runner = CargoIdentifyTests.Runner([(XcodeFixture.Pbxproj, project), .. XcodeFixture.Files().Skip(1)]);

@@ -1,0 +1,224 @@
+#!/bin/bash
+# factory-ios-simulator — the merge gate's iOS Simulator steps (Phase 5 S6, sc-26132).
+#
+# Not installed and not a worker's: the orchestrator compiles this file in (XcodeNewTests.SimulatorScript) and runs it as
+# `/bin/bash -c <this text> factory-ios-simulator <command> …`, a step of the gate's test run, as the item's slot's sandbox
+# user through its launch helper (or as the owner with Worker:RunAs=none), in the run's worktree. Builds and tests go through
+# the installed xcodebuild wrapper (`--gate`, so a DerivedData of the run's own); simulators through `xcrun simctl`, in the
+# running user's OWN device set (~/Library/Developer/CoreSimulator/Devices, in its 0700 home: no other slot's user sees it).
+#
+# Every run gets a FRESH device, created from the runtime by this run and deleted again: no device is kept, cloned or reused
+# (a kept device lives in the slot user's device set, which every worker session of that slot can write — whatever it planted
+# there would reach the gate's runs). It signals no process and sets no timer that does: the step's own deadline (its stdin
+# closed, the helper's sweep of the user's processes) is the hard bound of everything it starts.
+#
+#   prepare <device> <results dir>
+#       Refuses (exit 69) unless this process is in a GUI (Aqua) login session: a simulator runs, and XCUITest drives it, only
+#       there (sc-26126). Picks the last available iOS runtime and the first iPhone type of "iPhone 17", "iPhone 16",
+#       "iPhone 16e", "iPhone 15" (none: exit 69, naming what is missing). Deletes what earlier runs left: every device named
+#       dark-factory-gate-… whose run is over — its record (~/Library/Caches/dark-factory-gate-devices/<name>, the absolute path
+#       of its run's results directory) is missing or names a directory that no longer exists (a run's worktree is deleted when
+#       it ends); a live run's device is left alone. Refuses (exit 70) if a device of this run's name already exists (never
+#       reused); records the run (its results directory, made now), creates <device> from the runtime, and checks that it is in
+#       this user's own device set — the home owned by this user, ~/Library/Developer/CoreSimulator/Devices/<udid> there, and
+#       CoreSimulator naming <udid>/data under it as its data path — else deletes it and fails (exit 70).
+#   session <device> <results dir> <wrapper> <boot seconds> [<-project|-workspace> <path> <scheme> <test id> <hash>]...
+#       ONE helper run for everything that needs the booted simulator (the helper's exit kills every process of the user,
+#       CoreSimulatorService and the simulator included, so nothing booted outlives it): boots <device> — `simctl boot`, then
+#       `simctl bootstatus` (no -b) in the background, its outcome polled for with a deadline of <boot seconds> (a fresh
+#       device's first boot migrates its data: 2–4.5 minutes as a sandbox user, sc-26126) — then per test `<wrapper> --gate
+#       test-without-building … -destination platform=iOS Simulator,id=<udid> -only-testing:<id> -resultBundlePath
+#       <results>/xcode-test-<hash>.xcresult -quiet` and `xcrun xcresulttool get test-results tests` of that bundle into
+#       <results>/xcode-test-<hash>.json, printing one line per test:
+#       `factory-ios-simulator: result <hash> test-exit <n> xcresulttool-exit <m>`; then shuts the device down. Exit 0 once
+#       every test ran (whatever its outcome); anything else is the session's failure (`factory-ios-simulator: error: …`).
+#   remove <device>
+#       Shuts down and deletes the run's device (only a dark-factory-gate-<16 hex> name) and its record.
+#
+# Every refusal and failure is a line `factory-ios-simulator: …` on standard OUTPUT (the gate keeps a session's standard output
+# as its result, so the reason reaches the check's), the reason first.
+set -u
+unset CDPATH
+
+# The programs this runs. Tests replace these lines in a copy, never by a variable.
+launchctl=/bin/launchctl
+xcrun=/usr/bin/xcrun
+
+me=factory-ios-simulator
+run_device_re='^dark-factory-gate-[0-9a-f]{16}$'
+gate_device_re='^dark-factory-gate-' # any name the gate gives (or gave) a device: earlier versions' templates included
+hash_re='^[0-9a-f]{16}$' # patterns in variables: bash 3.2 reads one written inline in [[ =~ ]] differently
+records="$HOME/Library/Caches/dark-factory-gate-devices"
+
+fail() { # fail <exit> <message>
+    echo "$me: $2"
+    exit "$1"
+}
+
+# A simulator needs the owner's GUI login session (sc-26126): sudo keeps the caller's bootstrap, so the sandbox user's
+# process is in the owner's Aqua session only when the factory itself runs there.
+require_aqua() {
+    local manager
+    manager=$("$launchctl" managername 2>&1)
+    [ "$manager" = Aqua ] || fail 69 "refusing iOS simulator work: launchctl managername is '$manager', not 'Aqua'. The factory must run inside the owner's GUI login session (a Terminal or a LaunchAgent of the owner logged in at the console), not from ssh or as a LaunchDaemon, for the gate's iOS simulator checks: a simulator cannot boot, and XCUITest cannot drive it, outside one"
+}
+
+# The UDIDs of the devices named exactly <name> in this user's device set, one per line.
+udids_of() {
+    "$xcrun" simctl list devices 2>/dev/null | /usr/bin/awk -v n="$1" '
+        index($0, "    " n " (") == 1 { line = substr($0, length(n) + 7); sub(/\).*/, "", line); print line }'
+}
+
+# The names of this user's devices.
+device_names() {
+    "$xcrun" simctl list devices 2>/dev/null | /usr/bin/awk '/^    / { sub(/^    /, ""); sub(/ \([0-9A-F-]+\) \(.*$/, ""); print }'
+}
+
+remove_named() { # remove_named <name>
+    local udid
+    for udid in $(udids_of "$1"); do
+        "$xcrun" simctl shutdown "$udid" </dev/null >/dev/null 2>&1
+        "$xcrun" simctl delete "$udid" </dev/null >/dev/null 2>&1 || echo "$me: could not delete the device $1 ($udid)" >&2
+    done
+}
+
+# Whether the run that made the device <name> is still going: its record names a results directory that still exists.
+alive() { # alive <name>
+    local path
+    [[ $1 =~ $run_device_re ]] || return 1
+    [ -f "$records/$1" ] || return 1
+    path=$(/usr/bin/head -n 1 "$records/$1" 2>/dev/null)
+    [ -n "$path" ] && [ -d "$path" ]
+}
+
+# The one UDID of <name>, or a failure.
+one_udid() {
+    local found
+    found=$(udids_of "$1")
+    [ -n "$found" ] || fail 70 "error: the device $1 does not exist"
+    [ "$(printf '%s\n' "$found" | /usr/bin/wc -l | /usr/bin/tr -d ' ')" = 1 ] || fail 70 "error: more than one device is named $1"
+    printf '%s\n' "$found"
+}
+
+# Boots <udid>, waiting at most <seconds> for CoreSimulator to say it has finished booting. Nothing is signalled: bootstatus
+# runs in the background, holding none of this step's output, and its outcome (a file) is polled for; past the deadline the
+# step fails, and whatever is left of the boot goes with the device's shutdown and the helper's exit.
+boot() { # boot <udid> <seconds> <status file>
+    local started=$SECONDS
+    /bin/rm -f -- "$3"
+    (
+        if ! "$xcrun" simctl boot "$1"; then
+            "$xcrun" simctl list devices | /usr/bin/grep -F "($1) (Booted)" >/dev/null || { echo boot-failed >"$3"; exit 0; }
+        fi
+        "$xcrun" simctl bootstatus "$1"
+        echo "$?" >"$3"
+    ) </dev/null >/dev/null 2>&1 &
+    while [ ! -s "$3" ]; do
+        [ $((SECONDS - started)) -lt "$2" ] || return 1
+        /bin/sleep 1
+    done
+    [ "$(/bin/cat "$3")" = 0 ] || return 2
+}
+
+[ $# -ge 1 ] || fail 64 "usage: $me prepare|session|remove …"
+action=$1
+shift
+
+case "$action" in
+    prepare)
+        [ $# -eq 2 ] || fail 64 "usage: $me prepare <device> <results dir>"
+        device=$1 results=$2
+        [[ $device =~ $run_device_re ]] || fail 64 "refusing the device name '$device'"
+        require_aqua
+        "$xcrun" simctl list runtimes >/dev/null 2>&1 || fail 69 "the CoreSimulator service does not answer this user (xcrun simctl list runtimes failed)"
+        runtime=$("$xcrun" simctl list runtimes 2>/dev/null | /usr/bin/awk '/^iOS / && !/unavailable/ { id = $NF } END { print id }')
+        [ -n "$runtime" ] || fail 69 "no iOS Simulator runtime is installed for this user (xcrun simctl list runtimes lists none available): install one (sudo xcodebuild -downloadPlatform iOS)"
+        types=$("$xcrun" simctl list devicetypes 2>/dev/null)
+        devtype=
+        for model in "iPhone 17" "iPhone 16" "iPhone 16e" "iPhone 15"; do
+            devtype=$(printf '%s\n' "$types" | /usr/bin/awk -v m="$model (" 'index($0, m) == 1 { sub(/.*\(/, ""); sub(/\).*/, ""); print; exit }')
+            [ -z "$devtype" ] || break
+        done
+        [ -n "$devtype" ] || fail 69 "no iPhone simulator device type (iPhone 17, 16, 16e or 15) is available for the runtime $runtime"
+        /bin/mkdir -p -- "$records" "$results" || fail 70 "error: could not make $records or $results"
+        # What earlier runs left: their devices (and earlier versions' templates), and the records of runs that are over.
+        while IFS= read -r name <&3; do
+            if [[ $name =~ $gate_device_re ]] && [ "$name" != "$device" ] && ! alive "$name"; then
+                remove_named "$name"
+                /bin/rm -f -- "$records/$name"
+            fi
+        done 3< <(device_names)
+        for record in "$records"/dark-factory-gate-*; do
+            [ -e "$record" ] || continue
+            name=${record##*/}
+            alive "$name" || [ -n "$(udids_of "$name")" ] || /bin/rm -f -- "$record"
+        done
+        [ -z "$(udids_of "$device")" ] || fail 70 "error: a device named $device already exists; the gate never reuses a device"
+        abs_results=$(cd -- "$results" && pwd -P) || fail 70 "error: could not read $results"
+        printf '%s\n' "$abs_results" >"$records/$device" || fail 70 "error: could not record $device in $records"
+        udid=$("$xcrun" simctl create "$device" "$devtype" "$runtime" 2>/dev/null | /usr/bin/tail -n 1 | /usr/bin/tr -d '[:space:]')
+        [ -n "$udid" ] || fail 70 "error: could not create the simulator $device ($devtype, $runtime)"
+        # The device is in THIS user's own device set, in its own home (as the S0 probe checks it).
+        set_dir="$HOME/Library/Developer/CoreSimulator/Devices"
+        # JSON writes "/" as "\/".
+        data_path=$("$xcrun" simctl list -j devices 2>/dev/null | /usr/bin/grep '"dataPath"' | /usr/bin/grep -F "$udid" \
+            | /usr/bin/sed 's#\\/#/#g; s/^ *"dataPath" : "//; s/",*$//' | /usr/bin/head -n 1)
+        why=
+        if [ ! -O "$HOME" ]; then
+            why="the home $HOME is not owned by this user"
+        elif [ ! -d "$set_dir/$udid" ]; then
+            why="no directory $set_dir/$udid"
+        elif [ "$data_path" != "$set_dir/$udid/data" ]; then
+            why="CoreSimulator names its data path '$data_path', not $set_dir/$udid/data"
+        fi
+        if [ -n "$why" ]; then
+            remove_named "$device"
+            /bin/rm -f -- "$records/$device"
+            fail 70 "error: the simulator $device ($udid) is not in this user's own device set: $why"
+        fi
+        echo "$me: device $device $udid ($devtype, $runtime), created for this run in $set_dir"
+        ;;
+    session)
+        [ $# -ge 4 ] || fail 64 "usage: $me session <device> <results dir> <wrapper> <boot seconds> [<flag> <container> <scheme> <test id> <hash>]..."
+        device=$1 results=$2 wrapper=$3 boot_seconds=$4
+        shift 4
+        [[ $device =~ $run_device_re ]] || fail 64 "refusing the device name '$device'"
+        [ $(($# % 5)) -eq 0 ] || fail 64 "the tests are not <flag> <container> <scheme> <test id> <hash> records"
+        require_aqua
+        udid=$(one_udid "$device") || { echo "$udid"; exit 70; }
+        /bin/mkdir -p -- "$results" || fail 70 "error: could not make $results"
+        trap '"$xcrun" simctl shutdown "$udid" >/dev/null 2>&1' EXIT
+        boot_started=$SECONDS
+        boot "$udid" "$boot_seconds" "$results/simulator-boot.status"
+        case $? in
+            0) ;;
+            1) fail 70 "error: the simulator $device ($udid) did not boot within $boot_seconds s" ;;
+            *) fail 70 "error: the simulator $device ($udid) failed to boot ($(/bin/cat "$results/simulator-boot.status"))" ;;
+        esac
+        echo "$me: booted $device $udid in $((SECONDS - boot_started)) s"
+        while [ $# -gt 0 ]; do
+            flag=$1 container=$2 scheme=$3 id=$4 hash=$5
+            shift 5
+            [[ $hash =~ $hash_re ]] || fail 64 "refusing the hash '$hash'"
+            bundle="$results/xcode-test-$hash.xcresult"
+            "$wrapper" --gate test-without-building "$flag" "$container" -scheme "$scheme" -destination "platform=iOS Simulator,id=$udid" \
+                "-only-testing:$id" -resultBundlePath "$bundle" -quiet >"$results/xcode-test-$hash.log" 2>&1
+            test_exit=$?
+            if [ "$test_exit" -ne 0 ]; then
+                echo "$me: $id: test-without-building exited $test_exit" >&2
+                /usr/bin/tail -n 20 "$results/xcode-test-$hash.log" >&2
+            fi
+            "$xcrun" xcresulttool get test-results tests --path "$bundle" >"$results/xcode-test-$hash.json" 2>/dev/null
+            json_exit=$?
+            echo "$me: result $hash test-exit $test_exit xcresulttool-exit $json_exit"
+        done
+        ;;
+    remove)
+        [ $# -eq 1 ] || fail 64 "usage: $me remove <device>"
+        [[ $1 =~ $run_device_re ]] || fail 64 "refusing the device name '$1'"
+        remove_named "$1"
+        /bin/rm -f -- "$records/$1"
+        [ -z "$(udids_of "$1")" ] || fail 70 "error: the device $1 is still there"
+        ;;
+    *) fail 64 "unknown command '$action'" ;;
+esac
