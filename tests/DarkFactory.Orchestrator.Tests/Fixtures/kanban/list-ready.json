@@ -1,0 +1,140 @@
+{
+  "recorded_from": "in-repo fake (provisional; re-record against the hosted instance)",
+  "parameters": {
+    "project": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+    "projectKey": "DFFIX2A1B0807",
+    "ready": [
+      "5f8d886c-901c-4e80-bed0-8c72e7de5a71",
+      "a202a746-0302-4c0e-9068-e7f7e0665e86",
+      "11a88f62-5319-4390-b05d-fd73e2352083"
+    ],
+    "left out": [
+      "a90becbd-ab57-447c-a4d8-d12316653799",
+      "a7a22088-06f6-4dc1-bd5f-12b92dfe039a",
+      "61aaf453-ac89-44a4-aaed-1e633268e138"
+    ]
+  },
+  "interactions": [
+    {
+      "tool": "list_projects",
+      "arguments": {},
+      "isError": false,
+      "answer": [
+        {
+          "id": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+          "name": "[dark-factory fixture] contract recording",
+          "key": "DFFIX2A1B0807",
+          "isArchived": false,
+          "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
+          "totalItems": 6,
+          "openItems": 6,
+          "repository_url": "https://github.com/michaeltrefry/dark-factory-sandbox.git",
+          "default_branch": null
+        }
+      ]
+    },
+    {
+      "tool": "list_work_items",
+      "arguments": {
+        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "status": "Ready",
+        "unblocked_only": true,
+        "claim_state": "unclaimed",
+        "limit": 2,
+        "include_comments": false
+      },
+      "isError": false,
+      "answer": {
+        "items": [
+          {
+            "id": "5f8d886c-901c-4e80-bed0-8c72e7de5a71",
+            "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+            "title": "[dark-factory fixture] ready 1",
+            "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+            "type": "Task",
+            "status": "Ready",
+            "priority": "Medium",
+            "order": 0,
+            "estimate": null,
+            "comments": [],
+            "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
+            "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+            "claimant": null,
+            "claimant_id": null,
+            "claim_marker": null,
+            "claim_expires_at_utc": null,
+            "blockers": [],
+            "dependents": [],
+            "links": [],
+            "version": 1,
+            "label_list": []
+          },
+          {
+            "id": "a202a746-0302-4c0e-9068-e7f7e0665e86",
+            "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+            "title": "[dark-factory fixture] ready 2",
+            "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+            "type": "Task",
+            "status": "Ready",
+            "priority": "Medium",
+            "order": 1,
+            "estimate": null,
+            "comments": [],
+            "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
+            "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+            "claimant": null,
+            "claimant_id": null,
+            "claim_marker": null,
+            "claim_expires_at_utc": null,
+            "blockers": [],
+            "dependents": [],
+            "links": [],
+            "version": 1,
+            "label_list": []
+          }
+        ],
+        "next_cursor": "items:2"
+      }
+    },
+    {
+      "tool": "list_work_items",
+      "arguments": {
+        "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+        "status": "Ready",
+        "unblocked_only": true,
+        "claim_state": "unclaimed",
+        "limit": 2,
+        "include_comments": false,
+        "cursor": "items:2"
+      },
+      "isError": false,
+      "answer": {
+        "items": [
+          {
+            "id": "11a88f62-5319-4390-b05d-fd73e2352083",
+            "projectId": "a2d588d4-5d9a-4fda-8adf-c08ed80ce0bd",
+            "title": "[dark-factory fixture] ready 3",
+            "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+            "type": "Task",
+            "status": "Ready",
+            "priority": "Medium",
+            "order": 2,
+            "estimate": null,
+            "comments": [],
+            "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
+            "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+            "claimant": null,
+            "claimant_id": null,
+            "claim_marker": null,
+            "claim_expires_at_utc": null,
+            "blockers": [],
+            "dependents": [],
+            "links": [],
+            "version": 1,
+            "label_list": []
+          }
+        ]
+      }
+    }
+  ]
+}

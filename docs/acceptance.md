@@ -1019,6 +1019,79 @@ text, and a scan that no file outside `Shortcut/` but the registry names the Sho
 options with no keychain and no process environment, so they run (never skip) on a machine whose shell carries
 `SHORTCUT_API_TOKEN` or `FACTORY_KANBAN_WRITE_TOKEN`.
 
+## Phase 4b — Kanban contract fixtures: recording against the hosted board (sc-25986)
+
+`KanbanContractTests` replay `tests/DarkFactory.Orchestrator.Tests/Fixtures/kanban/*.json` in every `dotnet test`: the Kanban
+work source's whole lifecycle, each `tools/call` matched strictly by tool name and arguments. **The committed fixtures are
+provisional.** Each says `"recorded_from": "in-repo fake (provisional; re-record against the hosted instance)"`: they were
+made by the real recorder, but against the in-repo contract-enforcing fake (`FakeKanbanBoard`), so they pin the adapter to
+KanbanBoard's contract as this repository understands it, not yet to what the hosted server answers. One owner-run recording
+replaces them (the epic's terminal story).
+
+Prerequisites:
+
+- a KanbanBoard personal access token of scope `full` — the factory's service identity will do, or a throwaway identity of
+  its own (KanbanBoard's `docs/deployment.md`, "Factory service identity"). It needs to create and delete a project;
+- nothing else: no ledger, no Postgres, no GitHub, no model, no `FACTORY_E2E`.
+
+Run (the token is read from the environment of this one command and from nowhere else — not the keychain, not user-secrets,
+not a file; it is sent as the bearer header and is never written to a fixture or printed):
+
+```sh
+dotnet build
+KANBAN_RECORD=1 KANBAN_RECORD_TOKEN="$(pbpaste)" \
+  tests/DarkFactory.Orchestrator.Tests/bin/Debug/net10.0/DarkFactory.Orchestrator.Tests -method "*KanbanFixtureRecording.Record"
+```
+
+| Variable | Meaning |
+| --- | --- |
+| `KANBAN_RECORD` | `1`: record against a real KanbanBoard. `fake`: record against the in-repo fake (how the provisional fixtures were made). Unset: the recorder is skipped |
+| `KANBAN_RECORD_TOKEN` | the `full`-scope token; required with `KANBAN_RECORD=1`, the environment only |
+| `KANBAN_RECORD_URL` | the MCP endpoint; default the hosted one (`Kanban:McpUrl`'s default) |
+| `KANBAN_FIXTURES_REQUIRE_HOSTED` | `1`: `dotnet test` fails while any committed fixture is still provisional (`KanbanContractTests.The_committed_fixtures_say_where_they_were_recorded_…`). Set it for the run that checks the re-recording, and in CI once the hosted recordings are committed |
+
+What it creates, all its own: one project named `[dark-factory fixture] contract recording` with the key `DFFIX<8 hex>`
+(created under the idempotency key `dark-factory:fixture:<run id>`, `repository_url` the sandbox repository), in it one epic
+(`[dark-factory fixture] epic`), one epic document and sixteen work items titled `[dark-factory fixture] …` — the
+scenarios' items and the two a plan creates. It claims, moves, comments on, links and makes dependencies between those items
+only. Besides that it reads `list_projects` (every project is listed; only its own enters a fixture) and writes nothing
+outside its project.
+
+What it leaves: nothing. When the scenarios are done — or one failed — it deletes the project (`delete_project` takes the
+epic, the document and every item). If the board refuses the delete it archives the project instead (`update_project
+is_archived: true`). Then it reads the board again and fails the run, naming what is left, unless every project of its own is
+deleted or archived and every item it made is gone or inside an archived throwaway. A later run starts by deleting what an
+earlier one left: projects — archived ones too — whose name starts `[dark-factory fixture]` AND whose key starts `DFFIX`,
+never any other. The fixtures are written only after that check passed.
+
+`busy` and `conflict`: the `conflict` in `conflict.json` is the board's own — the recorder edits the item (as another
+caller would) between the adapter's read and its conditional move, so the board refuses the stale `expected_version`. A
+`busy` cannot be provoked on demand through the contract (the board answers it only after a write waited 10 s for other
+writers), so the first `update_work_item` of `busy.json` is authored from the contract's Error shape by the recording
+handler and not forwarded; it carries a `note` saying so, and the adapter's resend after it is the board's own answer.
+
+Verify afterwards:
+
+1. the command printed `Failed: 0, Skipped: 0`;
+2. `git diff --stat tests/DarkFactory.Orchestrator.Tests/Fixtures/kanban` shows all seven files, and
+   `grep -L '"recorded_from": "hosted KanbanBoard"' tests/DarkFactory.Orchestrator.Tests/Fixtures/kanban/*.json` prints nothing;
+3. `dotnet build && KANBAN_FIXTURES_REQUIRE_HOSTED=1 dotnet test` passes: the adapter replays the hosted recordings, and the
+   guard tests find no token, e-mail address, identity's name or anything that is not a `[dark-factory fixture]` throwaway of
+   the recording's own project (read the diff before committing all the same — the repository is public);
+4. on the board (web UI, archived projects shown): no project named `[dark-factory fixture] …`, or only archived ones.
+
+If the replay fails on a hosted recording, the adapter and the hosted server disagree about the contract: that is the finding
+the recording exists for — fix the adapter (or KanbanBoard), never the fixture by hand.
+
+Not live (every `dotnet test`): `KanbanContractTests` — the replay of each fixture in each framing, what each recording holds,
+strict matching (a tool or argument the recording does not have, a missing or changed one, an extra call, a call never made),
+the handshake checks, normalisation of both framings, trimming, the scrubbing of names and e-mail addresses, the guards on
+mutated fixtures (a token in six shapes, an e-mail, a foreign item, project, epic, document, blocker, listing entry, an
+identity's name, an over-long listing), and the provisional check — and `KanbanFixtureRecording`: the recorder end to end
+against the fake board (its fixtures replay; someone else's project on the same board is neither recorded nor written; the
+board is left as found), a scenario that fails (the project is still removed), a delete the board refuses (archived; swept by
+the next run), a project that can be neither deleted nor archived (the run fails naming it), and the sweep's two-prefix rule.
+
 ## Upgrading a Phase 1 ledger: items parked at Review
 
 Phase 1 parked every finished item at Review; since sc-25378 Review is a state the factory drives, so the first

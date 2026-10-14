@@ -94,6 +94,36 @@ Claude Code headless workers through the Weave router.
   SIGKILLs `tests/DarkFactory.CrashHost` (the real pipeline with a fake `claude` script) and restarts it.
   `ShortcutContractTests` replay recorded Shortcut API fixtures (`Fixtures/shortcut`, strict request matching);
   re-record with `SHORTCUT_RECORD=1` (writes only throwaway `[dark-factory fixture]` stories, archived after).
+  `KanbanContractTests` (sc-25986) do the same for KanbanBoard's MCP: the Kanban work source's whole lifecycle — list ready,
+  claim and read back, spec with epic and documents, the status changes, comment, links, release, claim renewal, a lost claim,
+  a plan's items with a dependency and their retry, blockers, make-ready, the return of an unstarted item, the epic key read,
+  a `busy` retried and a `conflict` re-read — as seven scenarios (`KanbanContractTests.Scenarios`), each replayed against its
+  fixture in `Fixtures/kanban` by `KanbanReplayHandler` (`Support/KanbanFixtures.cs`) under `McpHttpClient`. Matching is strict
+  per `tools/call`: the tool name and deep-equal arguments, in order (a tool or argument the recording does not have, a missing
+  one, another value, an extra call, a recorded call never made: each fails, naming the call). The transport is normalised,
+  not recorded: no JSON-RPC envelope, no session id (the replay hands out a fresh one per session and checks the handshake —
+  bearer token on every request, `initialize`, `notifications/initialized`, the closing `DELETE`, no other method), no framing
+  (every fixture is replayed answered as JSON, as an event stream, and alternating). A `KanbanInteraction` is
+  `{tool, arguments, isError, answer}`: the answer is the text block's one JSON document, a refusal's `{code, message}`, or a
+  plain MCP error's text. Recording: `KanbanRecordingHandler` (same file) under the adapter, `KanbanFixtureRecorder`
+  (`Support/KanbanFixtureRecorder.cs`) around it — one throwaway project created under an idempotency key
+  (`[dark-factory fixture] …`, key `DFFIX<8 hex>`) with an epic, a document and the scenarios' items, deleted afterwards
+  (`delete_project`; archived when the delete is refused), then the board read again and anything of its own neither deleted
+  nor archived fails the run; it first sweeps what an earlier run that died left (projects with BOTH prefixes). The repository
+  is public: a recorded listing keeps only the recording's own projects, items and documents, an answer about anyone else's
+  object is refused, an identity's name becomes `fixture-recorder`, an e-mail a placeholder, and no request header (the token)
+  is ever read into a fixture; `KanbanFixtureGuard` fails a committed fixture that holds a token (`Authorization`, a bearer
+  value, `kbp_…`, a JWT), an e-mail, an identity's name, or an item/project/epic/document/listing entry that is not a throwaway
+  of the fixture's own project. The `conflict` is real (the recorder edits the item between the adapter's read and its
+  conditional move); a `busy` cannot be provoked on demand (the board answers it only after a write waited 10 s for other
+  writers), so that one interaction is authored from the contract's Error shape by the recording handler, not forwarded, and
+  marked (`note`, `KanbanRecordingHandler.SyntheticBusyNote`) — the resend after it is the board's own answer.
+  PROVISIONAL (until the epic's terminal story): the committed fixtures say
+  `"recorded_from": "in-repo fake (provisional; re-record against the hosted instance)"` — made by that same recorder against
+  `FakeKanbanBoard` (`KANBAN_RECORD=fake`), which `KanbanFixtureRecording` also proves end to end in every `dotnet test`.
+  Re-record against the hosted board with `KANBAN_RECORD=1` and a full-scope token in `KANBAN_RECORD_TOKEN` (the environment
+  only: never the keychain, never a file; `KANBAN_RECORD_URL` for another instance) — docs/acceptance.md, "Kanban contract
+  fixtures". `KANBAN_FIXTURES_REQUIRE_HOSTED=1` makes a fixture that is still provisional fail `dotnet test`.
 - `tests/DarkFactory.AcceptanceTests` — live epic acceptance harness; skips unless `FACTORY_E2E=1`. AT1–AT8 runbook:
   `docs/acceptance.md` (the `factory work` tests use a throwaway ledger DB and their own work root, `E2e.cs`). Phase 2's epic
   AT2/AT4/AT5/AT6 (sc-25391): `ReviewGateTests` (typed outcome per row, merge queue, PR body and closeout equal to the ledger's),
