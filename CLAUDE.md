@@ -31,7 +31,10 @@ Claude Code headless workers through the Weave router.
   satisfied" rule (sc-25871), and the classification of a plan's stories with what a failed one holds (sc-25876); `Changeset.cs` — a plan's changeset branch and the changeset review's spec (sc-25872); pipeline handler `RunPipeline.Plan.cs`; the production seat `SandboxPlanRunner` in `FactoryRunner.cs`;
   sc-25870),
   and the outbound gateway (`Gateway/`: `OutboundHttp` builds every GitHub, Shortcut, router, CodeGraph and Kanban `HttpClient` (and the
-  acceptance tests' dashboard client and their loopback-only client of the MCP proxy, `LoopbackMcp`); `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token
+  acceptance tests' dashboard client and their loopback-only client of the MCP proxy, `LoopbackMcp`); the GitHub client's reads
+  (GET/HEAD) answered 502/503/504, failed in the network or with no headers within 30 s are sent again, at most 3 attempts with a
+  1 s then 2 s backoff, the last attempt's answer the caller's as before — writes are never resent (`GitHubReadRetry`, sc-25992: a
+  single 503 on a pull request read escalated an item live); `GitRemoteWrites` holds every `git push`'s arguments and git's installation-token
   credentials; `GitRemoteReads` the github.com remote URL, every clone/fetch's arguments (sc-25391) and the repository a github.com
   remote URL names (`RepoOf`, sc-25981); `KanbanWrites` builds the one MCP client that holds the orchestrator's full-scope Kanban
   token (sc-25981); `GitHubCli` is the only `gh` run),
