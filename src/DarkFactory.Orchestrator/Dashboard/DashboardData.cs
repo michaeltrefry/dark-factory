@@ -1,4 +1,5 @@
 using DarkFactory.Orchestrator.Controls;
+using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Plans;
 using DarkFactory.Orchestrator.WorkSources;
@@ -26,7 +27,8 @@ public sealed record PipelineRow(
     CloseoutStatus? FailedCloseout = null,
     long? PlanItemId = null,
     PlanView? Plan = null,
-    BoardLink? Links = null)
+    BoardLink? Links = null,
+    RunView? Run = null)
 {
     /// <summary>
     /// The item's epic with its source (sc-25985): what the page shows (<c>12</c>, <c>kb-3</c>) and what its epic control form posts
@@ -42,6 +44,115 @@ public sealed record PipelineRow(
     /// them and offers no control (nothing of a finished item can be paused or stopped).
     /// </summary>
     public bool Finished => State is WorkState.Done or WorkState.Cancelled;
+}
+
+/// <summary>
+/// What an item's run is doing, as the pipeline page shows it for every run in flight at once (sc-25991) — read from the ledger,
+/// so it is the same for the runs of this process (the intake loop's, up to <c>Intake:MaxConcurrentRuns</c>) and of any other
+/// (a <c>factory run</c> beside <c>factory work</c>), and after a restart; nothing here is the intake loop's memory.
+/// </summary>
+/// <param name="Live">Whether a run of the item is alive now: its run lock is held (<see cref="PostgresRunLocks.HeldAsync"/>), by
+/// whatever process. Null when the reader has no way to ask; the rows are then shown as they stand.</param>
+/// <param name="Phase">The item's state and what it is doing there, in words (<see cref="PhaseOf"/>).</param>
+/// <param name="Use">What the run last recorded of its use of a worker slot (<see cref="SlotUse"/>).</param>
+/// <param name="Slot">The slot the item is in for its whole life (<see cref="RunPipeline.SlotOf"/>), null before its first worker phase.</param>
+/// <param name="SlotUser">That slot's sandbox user, where a row names it.</param>
+public sealed record RunView(bool? Live, string Phase, SlotUse Use, int? Slot = null, string? SlotUser = null)
+{
+    /// <summary>
+    /// The item's state changed after its last slot-use row (a later transition): that hold or wait belongs to an earlier phase
+    /// whose end was not recorded — a run that crashed or was killed after its phase recorded the next state, or whose
+    /// <c>slot-released</c> could not be written — so it is not this run's now. (A live phase records its next state just before it
+    /// gives the slot up: for that moment the cell says "not held".)
+    /// </summary>
+    public bool Ended { get; init; }
+
+    /// <summary>
+    /// Another item's live run has a newer hold of the same slot (<see cref="DashboardData.ActiveItemsAsync"/>): a slot's lock is
+    /// one run's at a time, so this item's "holds" is a record an earlier run left, and only the newer holder is shown holding it.
+    /// </summary>
+    public bool Displaced { get; init; }
+
+    /// <summary>Whether the last slot-use row is this item's run's use now, as far as the rows can tell.</summary>
+    private bool Current => !Ended && !Displaced;
+
+    /// <summary>
+    /// The ledger's last word is "holds" or "waits" but it is not current: no run of the item is alive (the run died — a crash, a
+    /// kill — before it could record the end), or another item's live run holds that slot now (<see cref="Displaced"/>).
+    /// </summary>
+    public bool Stale => Use.Kind != SlotUseKind.None && (Live == false || Displaced);
+
+    /// <summary>Whether the run holds a worker slot now (and, as far as can be told, is alive).</summary>
+    public bool Holds => Use.Kind == SlotUseKind.Holding && Live != false && Current;
+
+    /// <summary>Whether the run waits for a worker slot now.</summary>
+    public bool Waits => Use.Kind == SlotUseKind.Waiting && Live != false && Current;
+
+    /// <summary>
+    /// The slot cell: <c>holds slot 2 (_factory2) to implement</c>, <c>waiting for a slot to implement</c> (an item that has none
+    /// yet) or <c>waiting for slot 2 (_factory2) to …</c> (its own, held by another run), the item's slot when it is in no worker
+    /// phase (<c>slot 2 (_factory2), not held</c>), a stale record said as one — only what is known: that a run ended holding or
+    /// waiting without recording it, not whether the slot is free now — or empty before its first worker phase.
+    /// </summary>
+    public string SlotText => this switch
+    {
+        { Holds: true } => $"holds {Use.Named}{To(Use.What)}",
+        { Waits: true } => $"waiting for {Use.Named}{To(Use.What)}",
+        { Stale: true, Displaced: true } => $"another item's run holds {Use.Named} now: an earlier run of this one ended holding it without recording it (crashed or killed)",
+        { Stale: true } => $"no run now: the last one ended {(Use.Kind == SlotUseKind.Holding ? "holding" : "waiting for")} {Use.Named} without recording it "
+            + "(crashed or killed)",
+        { Slot: { } slot } => $"slot {slot}{(SlotUser is null ? "" : $" ({SlotUser})")}, not held",
+        _ => "",
+    };
+
+    private static string To(string what) => what.Length == 0 ? "" : $" to {what}";
+
+    /// <summary>The few checkpoints a run view is read from, beside the item's transitions: its slot, its use of it, and its place in the merge queue.</summary>
+    public static readonly IReadOnlyList<string> StepsRead =
+        [RunPipeline.Steps.Slot, RunPipeline.Steps.WorkerStarted, RunPipeline.Steps.SlotWait, RunPipeline.Steps.SlotHeld, RunPipeline.Steps.SlotReleased,
+            RunPipeline.Steps.Queued, RunPipeline.Steps.QueueTurn, RunPipeline.Steps.Parked];
+
+    /// <summary>The view of an item in <paramref name="state"/> with <paramref name="rows"/> (its transitions and <see cref="StepsRead"/> rows, oldest first).</summary>
+    public static RunView Of(WorkState state, IReadOnlyList<LedgerEntry> rows, bool? live)
+    {
+        var use = SlotUse.Of(rows);
+        var slot = RunPipeline.SlotOf(rows);
+        var user = rows.LastOrDefault(e => e.Step == RunPipeline.Steps.Slot)?.Detail?.Split(' ') is { Length: > 1 } named ? named[1]
+            : use.Slot == slot ? use.User : null;
+        var at = use.Kind == SlotUseKind.None ? -1 : rows.ToList().FindLastIndex(e => SlotUse.IsStep(e.Step));
+        return new RunView(live, PhaseOf(state, rows), use, slot, user) { Ended = at >= 0 && rows.Skip(at + 1).Any(e => e.Step is null) };
+    }
+
+    /// <summary>
+    /// The phase: the state in words, with what the ledger says the item is at inside it — in the merge queue or holding its
+    /// repository's turn (<see cref="MergeQueue"/>), paused from which state and why.
+    /// </summary>
+    public static string PhaseOf(WorkState state, IReadOnlyList<LedgerEntry> rows)
+    {
+        var transitions = rows.Where(e => e.Step is null).ToList();
+        return state switch
+        {
+            WorkState.Intake => "intake",
+            WorkState.Plan => "planning",
+            WorkState.Planned => "waiting on its stories",
+            WorkState.Implement => "implementing",
+            WorkState.Review => "review",
+            WorkState.Fixing => "fix round",
+            WorkState.CI => "waiting for CI",
+            WorkState.CIHealing => "CI fix round",
+            WorkState.MergeGate when MergeQueue.InTurn(rows, RunPipeline.Steps.QueueTurn) => "merge queue: its repository's turn",
+            WorkState.MergeGate when MergeQueue.QueuedRow(rows, RunPipeline.Steps.Queued) is not null => "merge queue: waiting for its turn",
+            WorkState.MergeGate => "merge gate",
+            WorkState.Merge => "merged: closing out",
+            WorkState.Watch => "merged",
+            WorkState.Paused => "paused" + (transitions.Count > 1 ? $" in {transitions[^2].State}" : "")
+                + (transitions.LastOrDefault()?.Detail is { Length: > 0 } why ? $": {Cut(why)}" : ""),
+            _ => state.ToString().ToLowerInvariant(),
+        };
+    }
+
+    /// <summary>A pause's reason is the pipeline's own word (<c>freeze-paused</c>) or one line of a refusal: bounded for the cell.</summary>
+    private static string Cut(string text) => text.Length <= 160 ? text : text[..160] + "…";
 }
 
 /// <summary>
@@ -143,8 +254,11 @@ public interface IDashboardData
 }
 
 /// <param name="boardLinks">Each source's links to its items, from the ledger (<see cref="IBoardLinks"/>); none by default.</param>
+/// <param name="liveRuns">The items whose run lock is held now (sc-25991, <see cref="PostgresRunLocks.HeldAsync"/>): which rows' runs
+/// are alive, in whatever process. Null: not asked, and <see cref="RunView.Live"/> is unknown.</param>
 public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, TimeProvider time, TimeSpan? quietThreshold = null,
-    MetricsOptions? metrics = null, TimeSpan? metricsTtl = null, IReadOnlyList<IBoardLinks>? boardLinks = null) : IDashboardData
+    MetricsOptions? metrics = null, TimeSpan? metricsTtl = null, IReadOnlyList<IBoardLinks>? boardLinks = null,
+    Func<CancellationToken, Task<IReadOnlySet<long>>>? liveRuns = null) : IDashboardData
 {
     private readonly LedgerMetrics _metrics = new(contexts, metrics ?? MetricsOptions.Default);
     private readonly TimeSpan _metricsTtl = metricsTtl ?? DefaultMetricsTtl;
@@ -242,7 +356,25 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
             }
         }
         var closeouts = await new WorkLedger(db, time).CloseoutRowsAsync(items.Where(i => i.State is WorkState.Watch or WorkState.Planned).Select(i => i.Id).ToList(), ct);
-        return items.Select(i => new PipelineRow(
+        // What each run is at (sc-25991): the rows first, then who is alive — a run that ends between the two reads as ended
+        // with its last rows, never as alive without them.
+        var runRows = (await db.LedgerEntries.AsNoTracking()
+                .Where(e => ids.Contains(e.WorkItemId) && (e.Step == null || RunSteps.Contains(e.Step)))
+                .OrderBy(e => e.Id)
+                .ToListAsync(ct))
+            .ToLookup(e => e.WorkItemId);
+        IReadOnlySet<long>? live = null;
+        try
+        {
+            live = liveRuns is null ? null : await liveRuns(ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Who is alive could not be asked (the lock table's read failed): the rows are shown as they stand, Live unknown,
+            // rather than the whole page marked stale.
+            live = null;
+        }
+        var shown = items.Select(i => new PipelineRow(
                 i.Id, i.ExternalId, i.Title, i.Repo, i.State, i.CreatedAt, i.UpdatedAt,
                 PullRequestUrl(links.GetValueOrDefault(i.Id)),
                 // Spend per item (E9, reporting only): the sum of its sessions' measured router costs, null (N/A) when none is
@@ -256,9 +388,19 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
                 // A story of a plan is shown under its plan item (sc-25876), which is listed while any story of it is (sc-25877).
                 i.PlanItemId is { } p && byId.ContainsKey(p) ? p : null,
                 plans.GetValueOrDefault(i.Id),
-                onBoard.GetValueOrDefault(i.Id)))
+                onBoard.GetValueOrDefault(i.Id),
+                RunView.Of(i.State, runRows[i.Id].ToList(), live?.Contains(i.Id))))
             .ToList();
+        // A slot's lock is one run's at a time: of two items shown holding one slot (both live, or liveness unknown — a dead run's
+        // hold is already stale), the newer hold is shown holding it, and the other as a record an earlier run left (sc-25991).
+        var displaced = shown.Where(r => r.Run is { Holds: true }).GroupBy(r => r.Run!.Use.Slot).Where(g => g.Count() > 1)
+            .SelectMany(g => g.OrderByDescending(r => r.Run!.Use.Row).Skip(1))
+            .Select(r => r.Id).ToHashSet();
+        return displaced.Count == 0 ? shown
+            : [.. shown.Select(r => displaced.Contains(r.Id) ? r with { Run = r.Run! with { Displaced = true } } : r)];
     }
+
+    private static readonly string[] RunSteps = [.. RunView.StepsRead];
 
     private static readonly string[] PlanSteps =
         [RunPipeline.Steps.Plan, RunPipeline.Steps.PlanStories, RunPipeline.Steps.PlanReleased, RunPipeline.Steps.PlanHeld,

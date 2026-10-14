@@ -904,6 +904,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   re-reads and decides again, so a backoff never shortens a known reset. A run stopped while a user's factory/epic/item
   Pause also holds is recorded `user-paused`, not `usage-paused`. Each usage read is bounded by
   `UsageOptions.RequestTimeout` (10 s), since the intake loop runs it inline.
+  With several runs in flight (sc-25991): the run whose worker hit the limit pauses the factory and itself; the loop reads the
+  pause before it starts another ready item of that poll and starts none (shown as a deferral with its resume time,
+  `IntakeStatus.Deferrals`); every other run in flight pauses itself `usage-paused` at its next check, session and slot kept;
+  no run is counted as failed; and all of them resume by themselves once it lifts.
   Owner decision (2026-10-08): when every subscription is exhausted the router may keep serving on a local model
   (`subscription_fallback`), but the factory still pauses on the router's `all_exhausted` — unattended work on the
   local model alone is not wanted.
@@ -932,7 +936,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   the error says what lifts it, `FreezeTrigger.Remedy`); the intake loop runs no ready item of any lane after a deferral and stops a
   lane's in-flight items at its first deferral (their stops, listed first, still run in every lane), lists no ready items while the
   row is set, and shows the deferral (`IntakeStatus.DeferredRun`, not cleared by a later stop) and the freeze banner on the
-  pipeline page. Each intake poll runs the evaluator too (`IntakeLoop` `freeze`, `FactoryRunner.CreateFreeze`) before any lane
+  pipeline page. With several runs in flight (sc-25991) a freeze written mid-poll is read before each ready item would start, so
+  none is dispatched into it (shown as a deferral, `new work held: the factory is frozen (<trigger>)`, with what lifts it); the
+  runs in flight each pause `freeze-paused` at their next check and all resume after the Continue; every run the evaluator
+  deferred in the poll is listed (`IntakeStatus.Deferrals`), not only the last. Each intake poll runs the evaluator too (`IntakeLoop` `freeze`, `FactoryRunner.CreateFreeze`) before any lane
   is prepared (triage) or listed: frozen or uncheckable, nothing is triaged or listed. Within a run the evaluator also runs
   before every step but Merge's bookkeeping, before every worker session starts (implement, fixer, CI fixer), before a merge-queue
   base-update push and right before a merge (`RunPipeline.ThrowIfFrozenAsync`); frozen there, the run pauses like a Pause
@@ -961,6 +968,30 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   started, the runs already started run to their end, and the poll shows the failure once. Another run's worker phase holding the
   sandbox user is no failure: a run waits for it. Failures are counted per item whatever runs beside it. Both show on the
   pipeline page (`IntakeStatus`, in memory in the `factory work` process).
+  Runs in flight (Phase 4b, sc-25991; `IntakeLoop.PollOnceAsync`, `IntakeStatus`): a poll's runs overlap, so what stops new work
+  can happen while others run. The rules, one per cause — each stops what is NOT yet started, and never ends a run that is: the
+  runs in flight reach their next check (before every step, every second while a worker runs or a slot is waited for), where the
+  existing controls pause them (`freeze-paused`, `usage-paused`, `user-paused`) or they finish by themselves.
+  (1) A factory-wide control found in effect — the usage pause (e.g. set by a sibling run whose worker hit the limit), a Pause
+  of the factory, the freeze's row: read at the poll's start (nothing ready is listed, no triage) and again before EACH ready
+  item is dispatched (`IntakeLoop.HoldsAsync`; the poll listed its work a while ago). Held, no ready item of the poll is
+  started; the in-flight items the poll listed are still run, each run pausing itself at its first check or finishing its Stop
+  (as the serial loop always did). Controls that cannot be read then are the factory's failure (E2: never dispatch blind).
+  (2) A run the freeze evaluator defers (`RunOutcome.Deferred`): no ready item of any lane and no further in-flight item of its
+  lane, as before. (3) A factory-wide failure of one run (a stale helper in its slot, say): nothing more is started this poll;
+  it is not that item's failure and never a sibling's — a run beside it that fails for its own reason is counted against
+  itself alone, one that succeeds clears its own streak. What the status shows: `IntakeStatus.FactoryError` once per poll
+  however many runs and listings hit it (`FactoryFailedAlso`: the count stays one per poll, a different reason is appended
+  `; also: …`); and `IntakeStatus.Deferrals`, every deferral with what lifts it — each deferred run of the poll (not only the
+  last; `DeferredRun` is still the latest), the poll's own evaluation (`intake`), and each control holding new work (`Hold`,
+  ids `usage`/`factory`/`freeze`: "new work held: the factory is paused for usage (…); it lifts by itself at <utc>, or with
+  `factory continue --usage`"), kept until the loop's next read finds it lifted (a poll's start, at most a poll interval after
+  the Continue; the page's banners are the ledger's and current). One deferred run alone renders as the line it always was.
+  Defaults (E9): with `Intake:MaxConcurrentRuns` 1 the loop is the serial loop it was; the only differences are that a ready
+  item is no longer handed to a run that would claim nothing when the factory was paused since the poll began, and that a
+  paused or frozen factory's page says once more, in the deferral list, what holds new work.
+  Tests: `IntakeDispatchTests` (signalled fake runs), `RunsInFlightTests` (the real loop over real pipelines, two at once: the
+  freeze, the usage pause and a stale helper in one slot, each with both runs' ledger rows and the status).
 - Every state change is a committed ledger row before the next step (`WorkLedger.RecordAsync`), checked
   against the transition table in `Ledger/Lifecycle.cs` first; an illegal transition throws and writes nothing.
   New phases add handlers in `RunPipeline.Handlers`, not table rows (the exceptions, all Phase 4a's: `Plan → Planned`, a plan item
@@ -975,7 +1006,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
 - Typed step outcomes (E7, sc-25389): every ledger row has `Outcome` (`passed`, `failed`, `gate_rejected`, `deferred`,
   `escalated`; NOT NULL + a check constraint), decided in one place — `StepOutcomes.Of(from, state, step, detail)`, called by
   `WorkLedger` for every row it writes (`LedgerEntry.Outcome` is `required`). The rules map earlier stories' typed results (verdict,
-  fix-progress, gate decision, new-tests outcome, stuck rounds, pauses, issue routes; of Phase 4a's rows `plan-held`, `plan-stuck`, `plan-delivery` and `merged-into-changeset` are `deferred`); migration `StepOutcomes` backfilled older rows
+  fix-progress, gate decision, new-tests outcome, stuck rounds, pauses, issue routes; of Phase 4a's rows `plan-held`, `plan-stuck`, `plan-delivery` and `merged-into-changeset` are `deferred`; Phase 4b's `slot-wait`, `slot-held` and `slot-released`, sc-25991, are `passed` — a wait for a worker slot is no failure); migration `StepOutcomes` backfilled older rows
   with the rules as they stood, as frozen SQL (a Postgres test checks it against a frozen literal corpus; never edit the shipped
   migration — a later rule change only affects new rows). Reports are rendered only from the ledger (`LedgerReport`, E5): the
   PR description at open and again at merge (`pr-report`), the board closeout on merge (`closeout`) and the escalation comment list
@@ -1664,7 +1695,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   it is the serial loop it was. Claims are renewed in the listing, once per poll and lane, before any run of the poll starts
   (`RenewClaimsAsync`, sc-25983), never per dispatched run. Still one run per item (the item's run lock) and one turn per repository (the merge queue).
   What stops a poll's new work still does with several runs in flight: after a run the freeze deferred no ready item of any
-  lane and no further in-flight item of its lane is started; after a factory-wide failure nothing is; runs already started
+  lane and no further in-flight item of its lane is started; after a factory-wide failure nothing is; a factory-wide control
+  set since the poll listed its work (the usage pause, a Pause of the factory, the freeze's row) is read before each ready item
+  and starts none (sc-25991; the rules, and what the status and the page show of several runs, are under "Intake failures" —
+  "Runs in flight" — and "Dashboard"); runs already started
   finish by themselves, each checking the freeze, the usage pause and its controls before every step. Residuals, accepted: (a) one
   sandbox user means one worker phase at a time — with `Worker:Slots` 1, or for the items of one slot — so a run whose turn in
   a repository's merge queue needs the new-tests runs, or
@@ -2190,6 +2224,53 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   A row with links shows its id as that link and `epic <kb-N>` beside the title; Shortcut and issue rows have no `IBoardLinks`
   and are unchanged. `PipelineRow.Epic` (`ItemNaming.EpicOf`) is what the page's epic control rows are keyed by, so a Kanban epic
   and the Shortcut epic of the same number are two rows, each form posting its own scope (`epic:kb-5`, `epic:5`).
+  Runs in flight (sc-25991): every row has a Run cell (`PipelineRow.Run`, `RunView`) — whether a run of the item is alive, its
+  phase, and its worker slot — so several running items show at once, each as what it is. Design decision, where this comes
+  from: the LEDGER, never the intake loop's memory, so the page is right for the runs of any process (a `factory run` beside
+  `factory work`) and after a restart. (a) Phase = the state in words plus what the item's own rows say it is at
+  (`RunView.PhaseOf`: `implementing`, `review`, `waiting for CI`, `merge queue: waiting for its turn` / `its repository's turn`
+  by `MergeQueue.QueuedRow`/`InTurn`, `waiting on its stories`, `paused in Implement: freeze-paused` — the paused-from state
+  and the pipeline's own reason). (b) The item's slot = `RunPipeline.SlotOf` (its `slot` row; slot 1 for a `worker-started`
+  with none). (c) Its use of the slot = the last of three checkpoints `RunPipeline.InWorkerPhaseAsync` writes (`Ledger/SlotUse.cs`;
+  Detail `<slot|any> <user|-> <what>`, e.g. `2 _factory2 implement`; typed outcome `passed` — a wait is no failure): `slot-wait`
+  once when a run starts waiting for a slot another run's worker phase holds (never per poll of the wait; `any -` for an item
+  with no slot yet), `slot-held` when an outermost worker phase has the slot's lock (a phase inside a phase writes none), and
+  `slot-released` when the phase ends, however it ends, or the wait ends without the slot (`not taken: …`; a Pause, a Stop, the
+  freeze) — written on no cancellation token, bounded, and a failed write only logged. So a worker phase costs two rows (three
+  after a wait), in every sandboxed factory, one slot included; none unsandboxed (`Worker:RunAs=none`: there is no slot), none
+  for a stop's wait and none for a triage (it has no item: an item waiting on a triage's slot shows as waiting). These rows are
+  not work of the attempt: `RunPipeline.CurrentWorkerAttempt` leaves them (and the `slot` row) out, so an attempt holding only
+  them is a fresh one — Implement and a fix round do not take it for a resume, look for a worktree that never was and record
+  `worktree-lost` (which a multi-slot factory's `slot` row did before this). (d) Liveness: a row says what a run last
+  recorded, not that the run is alive — a run that crashed or was killed inside a phase leaves `slot-held` as its last word. So
+  `DashboardData` also asks which items' run locks are held (`liveRuns` = `PostgresRunLocks.HeldAsync`: `pg_locks`, the
+  single-key advisory locks of this database with a positive key — nothing is taken, so asking never makes a run find its
+  item locked; a dead run's lock is gone with its connection), after reading the rows. `RunView.Live` true: `running: <phase> ·
+  holds slot 2 (_factory2) to implement` or `· waiting for a slot to implement` / `waiting for slot 2 (_factory2) to …`; false:
+  `no run now: <phase> · slot 2 (_factory2), not held`, and a held or waiting last row without a live run is said as stale, in
+  the error colour (`no run now: the last one ended holding slot 2 (_factory2) without recording it (crashed or killed)` —
+  only what is known: not whether the slot is free now, nor what the next run does); null (a reader given no lock reader:
+  tests, or a `pg_locks` read that failed — caught, so the page is not marked stale for it) shows the rows' word. A hold or
+  wait is the run's now only while no transition follows its row (`RunView.Ended`: a phase records its next state just before
+  it gives the slot up, so a dangling `slot-held` behind a later `Review` is an earlier run's; for that moment of a live phase
+  the cell says `not held`), and of two items shown holding one slot only the newer hold is (`RunView.Displaced`: the other
+  is stale, `another item's run holds slot 1 (_factory) now: an earlier run of this one ended holding it without recording it
+  (crashed or killed)`). And a run's start, under the item's run lock (`RunAsync` and `HoldAsync`), ends on the record a
+  `slot-held`/`slot-wait` an earlier run left as the item's last slot-use row (`EndEarlierSlotUseAsync`: `slot-released`
+  `<slot> <user> <what> not recorded: ended with an earlier run`, bounded, only logged on failure). Slot bookkeeping rows
+  (`slot`, `slot-left`, `slot-wait`, `slot-held`, `slot-released`: `SlotUse.IsBookkeeping`, one predicate) are never "the
+  item's last row" for a reader by position: the escalation comment's `Last ledger state` (a phase's release is written in
+  its `finally`, before the Escalated row), `GiveUpAsync`'s "while that `plan-held` row is still its last", and a worker
+  attempt's rows (`CurrentWorkerAttempt`). A row shown alive is read again every 15 s (a death writes no row, so no NOTIFY).
+  Residuals, accepted: a clean-up that takes an item's run lock for a moment to delete its leftovers (`LiveRuns`) shows as a
+  run for that moment; a helper that outlives its phase keeps the slot's lock (`WorkerLock.KeepUntil`) though the page says
+  released — the `[lock] … stays held` log line is that case's record. What a one-slot installation now sees (E9): one more
+  column, e.g. `running: implementing · holds slot 1 (_factory) to implement`, then `no run now: review · slot 1 (_factory),
+  not held`; and two more rows per worker phase in its ledger (no report, metric or decision reads them).
+  Tests: `RunsInFlightTests` (two real runs: both holding in two slots; one holding and one waiting with one slot; a dead run's
+  stale row; a dangling hold behind a later transition, ended at the next run's start; two items holding one slot; a failed
+  liveness read; `RunView`'s phase and slot words), `DashboardComponentTests` (two running rows; the deferral list),
+  `LedgerPostgresTests` (`HeldAsync` across lock holders, taking nothing).
 - Review → CI → MergeGate → Merge (sc-25378; `RunPipeline.Gate.cs`, only in a pipeline built with a `GateStage`, which
   production always is): Implement records every model that answers the implementer (`implementer-model` checkpoints, from
   each assistant message's `model`; a record only — the panel does not depend on it). Review is a panel (sc-25379, `Gate/ReviewPanel.cs`): `correctness` and

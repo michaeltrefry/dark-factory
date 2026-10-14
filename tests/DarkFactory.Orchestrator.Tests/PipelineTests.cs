@@ -374,9 +374,11 @@ public class RunPipelineTests
         public FakePullRequests Prs { get; init; } = new();
         public InProcessRunLocks Locks { get; } = new();
         public WorkLedger Ledger => new(Db, TimeProvider.System);
+        /// <summary>The worker slots (sc-25989), as every sandboxed factory has; none by default.</summary>
+        public WorkerSlots? Slots { get; init; }
 
         public Task<RunOutcome> Run(FakeWorker worker, CancellationToken ct = default) =>
-            new RunPipeline(Stories, Ledger, Locks, Workspaces, worker, Prs, Sandbox, TextWriter.Null).RunAsync(77, ct);
+            new RunPipeline(Stories, Ledger, Locks, Workspaces, worker, Prs, Sandbox, TextWriter.Null, slots: Slots).RunAsync(77, ct);
 
         public async Task<WorkItem> Item() => await Db.WorkItems.SingleAsync();
         public async Task<List<LedgerEntry>> Rows() => await Db.LedgerEntries.OrderBy(e => e.Id).ToListAsync();
@@ -577,6 +579,19 @@ public class RunPipelineTests
         Assert.Equal([WorkState.Intake, WorkState.Implement, WorkState.Escalated], await h.Transitions());
         Assert.Contains("Last ledger state: Implement (after step worker-done)", Assert.Single(h.Stories.Comments));
         Assert.Empty(h.Prs.Opened);
+    }
+
+    [Fact]
+    public async Task With_a_worker_slot_the_escalation_comment_names_the_step_reached_not_the_slots_release()
+    {
+        // A sandboxed factory (one slot, the default): the Implement phase's end writes slot-released before the Escalated row.
+        var h = new Harness { Workspaces = new(hasChanges: false), Slots = TestSlots.Pool(Directory.CreateTempSubdirectory("df-escalation-slot-").FullName, 1) };
+        var outcome = await h.Run(new FakeWorker(Reports(Ok)));
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        var rows = await h.Rows();
+        Assert.Equal(RunPipeline.Steps.SlotReleased, rows[rows.FindIndex(r => r.Step is null && r.State == WorkState.Escalated) - 1].Step);
+        Assert.Contains("Last ledger state: Implement (after step worker-done)", Assert.Single(h.Stories.Comments));
     }
 
     [Fact]

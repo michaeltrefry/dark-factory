@@ -980,6 +980,22 @@ public class PlanReleasePipelineTests
             : null;
 
     [Fact]
+    public async Task A_slot_bookkeeping_row_after_the_not_evaluated_row_does_not_make_the_same_reason_commented_again()
+    {
+        var h = new Harness();
+        await h.Planned(PlanAnswers.Answer(PlanAnswers.Story("a", "First story"), PlanAnswers.Story("b", "Second story")));
+        Assert.Equal("commented", await h.GiveUp("the board is down"));
+        // A run of the plan item ended an earlier run's slot use on the record (sc-25991): the item's last row is now that
+        // bookkeeping, not a step the item reached, and the not-evaluated row is still its last word.
+        var plan = await h.Db.WorkItems.SingleAsync(i => i.ExternalId == $"sc-{PlanId}");
+        await h.Ledger.CheckpointAsync(plan, RunPipeline.Steps.SlotReleased, null,
+            SlotUse.Detail(1, "_factory", "plan not recorded: ended with an earlier run"), CancellationToken.None);
+
+        Assert.Equal("held; already commented for this reason", await h.GiveUp("the board is down"));
+        Assert.Single(h.Comments(PlanId), c => c.Contains("could not evaluate it", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task A_plan_that_cannot_be_evaluated_is_given_up_on_with_one_comment_and_one_row_per_reason_stays_planned_and_recovers()
     {
         var h = new Harness();

@@ -65,6 +65,15 @@ public sealed class InProcessRunLocks : IRunLocks
 {
     private readonly HashSet<long> _held = [];
 
+    /// <summary>The items whose run lock is held now, as <see cref="PostgresRunLocks.HeldAsync"/> reads them.</summary>
+    public Task<IReadOnlySet<long>> HeldAsync(CancellationToken ct)
+    {
+        lock (_held)
+        {
+            return Task.FromResult<IReadOnlySet<long>>(new HashSet<long>(_held));
+        }
+    }
+
     public Task<IAsyncDisposable?> TryAcquireAsync(long workItemId, CancellationToken ct)
     {
         lock (_held)

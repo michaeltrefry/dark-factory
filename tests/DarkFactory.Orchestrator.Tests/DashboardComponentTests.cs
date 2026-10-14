@@ -243,10 +243,76 @@ public class DashboardComponentTests : BunitContext
 
         var cells = cut.FindAll("tr[data-item='1'] td").Select(td => td.TextContent.Trim()).ToList();
         // s-2 is running and its cost not measured yet: the sum says it covers one of the two sessions (E5).
-        Assert.Equal(["sc-1 Story 1", "Review", "acme/widgets", "PR", "1h 05m", "$1.50 of 1/2 measured"], cells.Take(6));
+        // The Run cell (sc-25991) is empty for a row with no run view; the others are where and what they were.
+        Assert.Equal(["sc-1 Story 1", "Review", "—", "acme/widgets", "PR", "1h 05m", "$1.50 of 1/2 measured"], cells.Take(7));
+        Assert.Equal(["Item", "State", "Run", "Repo", "PR", "Elapsed", "Cost", "Sessions", "Control"], cut.FindAll("table.pipeline th").Select(th => th.TextContent));
         Assert.Equal("https://github.com/acme/widgets/pull/9", cut.Find("td.pr a").GetAttribute("href"));
         Assert.Equal(["sessions/s-1", "sessions/s-2"], cut.FindAll("td.sessions a").Select(a => a.GetAttribute("href")));
         Assert.Equal("#2 (live)", cut.FindAll("td.sessions a")[1].TextContent);
+    }
+
+    private static string Words(AngleSharp.Dom.IElement element) => string.Join(' ', element.TextContent.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+    [Fact]
+    public void Two_running_items_each_show_their_phase_and_their_slot_or_that_they_wait_for_one()
+    {
+        // sc-25991: two runs in flight at once (Intake:MaxConcurrentRuns 2) — one in a worker phase in slot 2, one waiting for a
+        // free slot; a third item in the merge queue with no run now; a fourth whose run died holding its slot.
+        var live = new SessionLink("s-1", 1, Now, null, null, null);
+        _data.Rows =
+        [
+            Row(1, WorkState.Implement, null, null, live) with { Run = new RunView(true, "implementing", new SlotUse(SlotUseKind.Holding, 2, "_factory2", "implement"), 2, "_factory2") },
+            Row(2, WorkState.Implement) with { Run = new RunView(true, "implementing", new SlotUse(SlotUseKind.Waiting, null, null, "implement")) },
+            Row(3, WorkState.MergeGate) with { Run = new RunView(false, "merge queue: waiting for its turn", new SlotUse(SlotUseKind.None, 1, "_factory", "run the new tests"), 1, "_factory") },
+            Row(4, WorkState.Fixing) with { Run = new RunView(false, "fix round", new SlotUse(SlotUseKind.Holding, 1, "_factory", "run the review fix"), 1, "_factory") },
+            Row(5, WorkState.Review) with { Run = new RunView(null, "review", SlotUse.None) },
+        ];
+
+        var cut = Render<Pipeline>();
+
+        Assert.Equal("running: implementing · holds slot 2 (_factory2) to implement", Words(cut.Find("tr[data-item='1'] td.run")));
+        Assert.Equal(("true", "held"), (cut.Find("tr[data-item='1'] td.run").GetAttribute("data-live"), cut.Find("tr[data-item='1'] .slot").GetAttribute("data-slot")));
+        Assert.Equal("running: implementing · waiting for a slot to implement", Words(cut.Find("tr[data-item='2'] td.run")));
+        Assert.Equal(("true", "waiting"), (cut.Find("tr[data-item='2'] td.run").GetAttribute("data-live"), cut.Find("tr[data-item='2'] .slot").GetAttribute("data-slot")));
+        // Both at once: two rows say "running".
+        Assert.Equal(2, cut.FindAll("td.run[data-live='true']").Count);
+        Assert.Equal("no run now: merge queue: waiting for its turn · slot 1 (_factory), not held", Words(cut.Find("tr[data-item='3'] td.run")));
+        Assert.Equal("idle", cut.Find("tr[data-item='3'] .slot").GetAttribute("data-slot"));
+        // A dead run's last word is not shown as a hold.
+        var stale = cut.Find("tr[data-item='4'] .slot");
+        Assert.Equal("stale", stale.GetAttribute("data-slot"));
+        Assert.Contains("error", stale.ClassList);
+        Assert.StartsWith("no run now: the last one ended holding slot 1 (_factory) without recording it", Words(stale));
+        // Liveness not known (a reader with no lock reader): the phase alone, nothing claimed either way.
+        Assert.Equal("review", Words(cut.Find("tr[data-item='5'] td.run")));
+        Assert.Null(cut.Find("tr[data-item='5'] td.run").GetAttribute("data-live"));
+    }
+
+    [Fact]
+    public void Each_deferral_is_listed_with_what_lifts_it_and_one_deferred_run_reads_as_before()
+    {
+        _data.Rows = [];
+        var cut = Render<Pipeline>();
+        Assert.Empty(cut.FindAll(".deferred, .deferrals"));
+
+        // One run deferred: the line it always was.
+        _intake.Deferred("sc-2", "factory frozen (main-red): main is red; `factory continue --freeze` clears it");
+        cut.WaitForAssertion(() => Assert.Equal(
+            $"Deferred (last at {Now:u}): sc-2 deferred: factory frozen (main-red): main is red; `factory continue --freeze` clears it", Words(cut.Find("p.deferred"))));
+        Assert.Empty(cut.FindAll(".deferrals"));
+
+        // A second run of the poll deferred, and a factory-wide control the loop found in effect: each on its own line.
+        _intake.Deferred("sc-3", "factory frozen (main-red): main is red; `factory continue --freeze` clears it");
+        _intake.Holding([(ControlScope.Usage, "the factory is paused for usage (worker-rate-limited)", "it lifts by itself at 2026-10-06 13:00:00Z, or with `factory continue --usage`")]);
+        cut.WaitForAssertion(() => Assert.Equal([ControlScope.Usage, "sc-2", "sc-3"], cut.FindAll(".deferrals li").Select(li => li.GetAttribute("data-deferral"))));
+        Assert.Empty(cut.FindAll("p.deferred"));
+        Assert.Equal($"Deferred (last at {Now:u}): new work held: the factory is paused for usage (worker-rate-limited); it lifts by itself at 2026-10-06 13:00:00Z, or with `factory continue --usage`",
+            Words(cut.Find(".deferrals li.hold")));
+        Assert.All(cut.FindAll(".deferrals li.deferred"), li => Assert.Contains("factory continue --freeze", li.TextContent));
+
+        _intake.NotDeferred();
+        _intake.Holding([]);
+        cut.WaitForAssertion(() => Assert.Empty(cut.FindAll(".deferred, .deferrals")));
     }
 
     /// <summary>The plan row's note about its hold comment, as the page renders it (whitespace collapsed).</summary>
