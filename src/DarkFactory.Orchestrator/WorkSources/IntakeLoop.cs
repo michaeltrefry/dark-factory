@@ -134,6 +134,20 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
 
     private void Armed() => Interlocked.Increment(ref _waits);
 
+    private int _dispatchIdles;
+
+    /// <summary>
+    /// How many times a poll's dispatch has gone idle: waiting for run capacity none of its runs has freed yet, or done starting
+    /// runs (its queue empty, its new work stopped, or superseded). Each is counted only once the dispatch has started every run it
+    /// will start before it, so a test may assert what was not started once this moves, without waiting on a clock.
+    /// </summary>
+    internal int DispatchIdles => Volatile.Read(ref _dispatchIdles);
+
+    private int _shutdownWaits;
+
+    /// <summary>How many times the loop, shutting down, has waited for runs or preparations still in flight.</summary>
+    internal int ShutdownWaits => Volatile.Read(ref _shutdownWaits);
+
     // Runs in flight across polls (sc-25992): an item is in at most one run of this loop at a time (by its external id), and
     // there are never more than Intake:MaxConcurrentRuns counted runs (Counted: false for an item being stopped or a waiting plan,
     // which a poll starts outside the capacity). A poll dispatches only into the capacity the counted runs leave.
@@ -288,6 +302,7 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
             {
                 return;
             }
+            Interlocked.Increment(ref _shutdownWaits);
             try
             {
                 await Task.WhenAll(pending);
@@ -732,7 +747,12 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
             {
                 try
                 {
-                    await _capacity.WaitAsync(poll.Dispatch.Token);
+                    var capacity = _capacity.WaitAsync(poll.Dispatch.Token);
+                    if (!capacity.IsCompleted)
+                    {
+                        Interlocked.Increment(ref _dispatchIdles);
+                    }
+                    await capacity;
                 }
                 catch (OperationCanceledException) when (!ct.IsCancellationRequested)
                 {
@@ -770,6 +790,7 @@ public sealed class IntakeLoop(IReadOnlyList<IntakeLane> lanes, IntakeOptions op
         }
         finally
         {
+            Interlocked.Increment(ref _dispatchIdles);
             try
             {
                 await Task.WhenAll(started);

@@ -202,22 +202,32 @@ public class IntakeDispatchTests
         Assert.True(condition(), what);
     }
 
-    /// <summary>Long enough for a dispatcher that would start one run too many to have done so.</summary>
-    private static Task Settle() => Task.Delay(150);
+    /// <summary>
+    /// Waits until the loop's dispatch has gone idle <paramref name="times"/> times in all (<see cref="IntakeLoop.DispatchIdles"/>):
+    /// waiting for capacity or done starting. By then every run it would start before has been registered in flight
+    /// (<see cref="IntakeLoop.RunsInFlight"/>, written when a run is started), so what is not there was not started: a signal, not a clock.
+    /// </summary>
+    private static Task DispatchIdle(IntakeLoop loop, int times) => Eventually(() => loop.DispatchIdles >= times, $"the dispatch goes idle ({times})");
+
+    /// <summary>Waits until the loop, stopping, waits for what is still in flight — or has stopped, which the caller then sees.</summary>
+    private static Task ShutdownWaits(IntakeLoop loop, Task stop) => Eventually(() => loop.ShutdownWaits >= 1 || stop.IsCompleted, "the stopping loop waits");
 
     [Fact]
     public async Task Up_to_the_configured_number_of_items_run_at_once_in_the_polls_order_and_never_more()
     {
         var runner = new GatedRunner(1, 2);
-        var poll = Loop(ListingSource.Listing(3, 4, 5), runner, concurrent: 2).PollOnceAsync(CancellationToken.None);
+        var loop = Loop(ListingSource.Listing(3, 4, 5), runner, concurrent: 2);
+        var poll = loop.PollOnceAsync(CancellationToken.None);
 
         // In-flight items first, two at once; the third waits for one of them to end.
-        await Eventually(() => runner.Running == 2, "two runs start");
-        await Settle();
+        await Eventually(() => runner.Running >= 2, "two runs start");
+        await DispatchIdle(loop, 1); // waiting for capacity
+        Assert.Equal(["sc-1", "sc-2"], loop.RunsInFlight.Order());
         Assert.Equal([1, 2], runner.Started.Order());
         runner.End(1);
-        await Eventually(() => runner.Started.Count == 3, "the next item starts when a run ends");
-        await Settle();
+        await Eventually(() => runner.Started.Count >= 3, "the next item starts when a run ends");
+        await DispatchIdle(loop, 2);
+        Assert.Equal(["sc-2", "sc-3"], loop.RunsInFlight.Order());
         Assert.Equal([1, 2, 3], runner.Started.Order());
         runner.End(3);
         await Eventually(() => runner.Started.Count == 4, "and the next");
@@ -242,9 +252,10 @@ public class IntakeDispatchTests
 
         foreach (var (id, started) in new[] { (5, 1), (3, 2), (7, 3) })
         {
-            await Eventually(() => runner.Started.Count == started, $"run {started} starts");
-            await Settle();
-            Assert.Equal((started, 1), (runner.Started.Count, runner.Running)); // nothing else beside it
+            await Eventually(() => runner.Started.Count >= started, $"run {started} starts");
+            await DispatchIdle(loop, started); // waiting for capacity
+            Assert.Equal([$"sc-{id}"], loop.RunsInFlight); // nothing else beside it
+            Assert.Equal((started, 1), (runner.Started.Count, runner.Running));
             runner.End(id);
         }
         await poll;
@@ -286,12 +297,15 @@ public class IntakeDispatchTests
     {
         var runner = new GatedRunner(1, 2);
         var status = new IntakeStatus(TimeProvider.System);
-        var poll = Loop(ListingSource.Listing(3, 4), runner, concurrent: 2, status).PollOnceAsync(CancellationToken.None);
-        await Eventually(() => runner.Running == 2, "two runs start");
+        var loop = Loop(ListingSource.Listing(3, 4), runner, concurrent: 2, status);
+        var poll = loop.PollOnceAsync(CancellationToken.None);
+        await Eventually(() => runner.Running >= 2, "two runs start");
+        await DispatchIdle(loop, 1); // waiting for capacity
 
         // The factory is frozen: the deferred run's place is not given to a ready item, nor to another in-flight item of its lane.
         runner.End(1, Ok with { Deferred = "factory frozen (main-red)" });
-        await Settle();
+        await DispatchIdle(loop, 2); // the freed capacity taken, and the dispatch done starting
+        Assert.Equal(["sc-2"], loop.RunsInFlight);
         Assert.Equal([1, 2], runner.Started.Order());
         Assert.False(poll.IsCompleted);
         runner.End(2);
@@ -308,10 +322,12 @@ public class IntakeDispatchTests
         var status = new IntakeStatus(TimeProvider.System);
         var loop = Loop(ListingSource.Listing(4), runner, concurrent: 2, status, maxFailures: 1);
         var poll = loop.PollOnceAsync(CancellationToken.None);
-        await Eventually(() => runner.Running == 2, "two runs start");
+        await Eventually(() => runner.Running >= 2, "two runs start");
+        await DispatchIdle(loop, 1); // waiting for capacity
 
         runner.Fail(1, new FactoryUnavailableException("the worker sandbox: Stale helper", new InvalidOperationException("Stale helper")));
-        await Settle();
+        await DispatchIdle(loop, 2); // the freed capacity taken, and the dispatch done starting
+        Assert.Equal(["sc-2"], loop.RunsInFlight);
         Assert.Equal([1, 2], runner.Started.Order());
         runner.Fail(2, new FactoryUnavailableException("the worker sandbox: Stale helper", new InvalidOperationException("Stale helper")));
         await poll;
@@ -653,8 +669,9 @@ public class IntakeDispatchTests
 
         var stop = loop.StopAsync(CancellationToken.None);
         await runner.SawCancellation.Task.WaitAsync(TimeSpan.FromSeconds(60));
-        // The run is finishing its step: the loop has not ended under it.
-        Assert.NotSame(stop, await Task.WhenAny(stop, Task.Delay(300)));
+        // The run is finishing its step: the loop waits for it and has not ended under it.
+        await ShutdownWaits(loop, stop);
+        Assert.False(stop.IsCompleted);
         Assert.False(loop.ExecuteTask!.IsCompleted);
         runner.End(1);
         await stop.WaitAsync(TimeSpan.FromSeconds(60));
@@ -712,10 +729,11 @@ public class IntakeDispatchTests
         await runner.WhenStarted(3);
         Assert.Equal([1, 8, 9], runner.Started.Order());
 
-        // Still running: the next poll starts neither again.
+        // Still running: the next poll starts neither again. With no capacity free it starts its runs before it returns and its
+        // Done waits for every one of them; every run of 1, 8 and 9 is held open, so Done complete on return proves it started none.
         var third = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
-        await third.Done.WaitAsync(TimeSpan.FromSeconds(60));
-        await Settle();
+        Assert.True(third.Owed);
+        Assert.True(third.Done.IsCompleted, "the poll started a second run of an item in flight");
         Assert.Equal([1, 8, 9], runner.Started.Order());
 
         // They hold none of the capacity: once sc-1 ends, a ready item starts beside them.
@@ -748,8 +766,9 @@ public class IntakeDispatchTests
         runner.Stopping.Add(9);
         runner.WaitingPlans.Add(8);
         var second = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        // The poll has started (registered in flight) everything it starts outside the capacity by the time it returns.
+        Assert.Equal(["sc-1", "sc-9"], loop.RunsInFlight.Order());
         await runner.WhenStarted(2);
-        await Settle();
 
         // The plan waits for capacity as any in-flight item does (its run would be deferred); the stop is finished.
         Assert.Equal([1, 9], runner.Started.Order());
@@ -905,7 +924,7 @@ public class IntakeDispatchTests
         await Eventually(() => loop.Waits >= 1, "the poll is done and the loop waits with the triage in flight");
 
         var stop = loop.StopAsync(CancellationToken.None);
-        await Settle();
+        await ShutdownWaits(loop, stop);
         Assert.False(stop.IsCompleted);
         triage.SetResult();
         await stop.WaitAsync(TimeSpan.FromSeconds(60));
