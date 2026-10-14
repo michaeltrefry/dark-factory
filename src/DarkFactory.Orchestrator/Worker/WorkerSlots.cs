@@ -308,18 +308,29 @@ public sealed class WorkerSlots : IWorkerSandbox
     /// <summary>The held slot shares <paramref name="path"/> with its own user (<see cref="Current"/>): a worktree is one slot's for writing.</summary>
     public Task ShareAsync(string path, CancellationToken ct) => Current.ShareAsync(path, ct);
 
-    /// <summary>The worktree's only writers are the owner and the user of the slot the calling flow holds (<see cref="Current"/>): the push of a worker phase is of its own slot's work.</summary>
+    /// <summary>
+    /// The worktree's only writers are the owner and the user of the slot the calling flow holds (<see cref="Current"/>): the push
+    /// of a worker phase is of its own slot's work. With several slots the whole tree is judged, not only its root
+    /// (<see cref="WorktreeWriters.Inside"/>): what a worker made in it is that user's own to open to another slot's. With one
+    /// slot there is no other slot's user to open it to, and only the root's listing is read.
+    /// </summary>
     public Task EnsureOnlyWorkerWritesAsync(string path, CancellationToken ct) =>
-        EnsureOnlyWriterAsync(path, Current.User, ListAcl, AclRetry, ct);
+        EnsureOnlyWriterAsync(path, Current.User, ListAcl, AclRetry, ct, inside: Count > 1 ? EntryAcl : null);
+
+    /// <summary>How one entry's ACL inside a worktree is read (<see cref="WorktreeWriters.NativeAcl"/>); tests give their own.</summary>
+    internal Func<string, string?> EntryAcl { get; init; } = WorktreeWriters.NativeAcl;
 
     /// <summary>
     /// Throws (<see cref="WorktreeWritersException"/>) unless <paramref name="listAcl"/>'s <c>ls -led</c> of the worktree
-    /// <paramref name="path"/> shows no writer but its owner and <paramref name="user"/> (<see cref="WritersBeside"/>). Read up to
-    /// <see cref="AclReads"/> times, <paramref name="retry"/> apart, before a writer fails it (ls prints an entry's UUID instead of
-    /// its user name while the directory service does not answer); a listing that cannot be read fails it at once.
+    /// <paramref name="path"/> shows no writer but its owner and <paramref name="user"/> (<see cref="WritersBeside"/>) and — with
+    /// <paramref name="inside"/>, the reader of one entry's ACL: several worker slots — nothing inside it does either
+    /// (<see cref="WorktreeWriters.Inside"/>; the root's group bit is then judged too). Read up to <see cref="PushAclReads"/>
+    /// times, <paramref name="retry"/> apart, before a writer fails it (<c>ls</c> prints an entry's UUID instead of its user name,
+    /// and an ACL entry has no name, while the directory service does not answer): a refusal escalates the item and its finished
+    /// work is thrown away with its worktree, so one slow answer must not decide. A listing that cannot be read fails it at once.
     /// </summary>
     internal static async Task EnsureOnlyWriterAsync(string path, string user, Func<string, CancellationToken, Task<string>> listAcl,
-        TimeSpan retry, CancellationToken ct)
+        TimeSpan retry, CancellationToken ct, Func<string, string?>? inside = null)
     {
         for (var attempt = 1; ; attempt++)
         {
@@ -332,11 +343,17 @@ public sealed class WorkerSlots : IWorkerSandbox
             {
                 throw new WorktreeWritersException(path, user, $"who may write it could not be read ({ex.Message})");
             }
-            if (WritersBeside(listing, user) is not { } why)
+            var why = WritersBeside(listing, user, groupToo: inside is not null);
+            if (why is null && inside is not null)
+            {
+                // Off the caller's thread: a walk of the whole tree, a system call or two per entry.
+                why = await Task.Run(() => WorktreeWriters.Inside(path, user, inside, ct), ct);
+            }
+            if (why is null)
             {
                 return;
             }
-            if (attempt >= AclReads)
+            if (attempt >= PushAclReads)
             {
                 throw new WorktreeWritersException(path, user, why);
             }
@@ -344,16 +361,25 @@ public sealed class WorkerSlots : IWorkerSandbox
         }
     }
 
+    /// <summary>How many times who may write a worktree is read before a writer refuses its push (with <see cref="AclRetry"/>'s 200 ms: about 2 s).</summary>
+    internal const int PushAclReads = 10;
+
     /// <summary>
     /// Why <paramref name="lsOutput"/> (macOS <c>ls -led</c> of a worktree: its long listing line, then one line per ACL entry)
     /// lets anyone but the owner and <paramref name="user"/> write the directory, or null: no ACL entry grants another principal
     /// (another slot's user, any other user, a group, an entry ls could not name) a right to write, and its mode does not let
     /// everyone write. The work root's inherited read entries, which every slot's user has, are not write grants (the accepted
-    /// cross-slot read). Fails closed on a listing with no long listing line.
+    /// cross-slot read). Fails closed: a listing with no long listing line, and any later line that is neither an <c>allow</c>
+    /// nor a <c>deny</c> entry (a principal with a space in its name, a format this does not know), are each a reason.
+    /// <para>The group's write bit is judged only with <paramref name="groupToo"/> (several worker slots): then it is refused
+    /// like everyone's, since nothing here proves that the directory's group holds no other slot's user (the owner makes the
+    /// directory, 0755 under the usual umask 022). With one slot it is deliberately not judged: there is no other slot's user
+    /// to be in the group, and an owner whose umask is 002 would have every push refused for nothing.</para>
     /// </summary>
-    public static string? WritersBeside(string lsOutput, string user)
+    public static string? WritersBeside(string lsOutput, string user, bool groupToo = false)
     {
-        var first = lsOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+        var lines = lsOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        var first = lines.FirstOrDefault() ?? "";
         if (!Regex.IsMatch(first, @"^d[r-][w-][xsS-][r-][w-][xsS-][r-][w-][xtT-]"))
         {
             return "who may write it could not be read (its `ls -led` listing has no directory line)";
@@ -362,9 +388,20 @@ public sealed class WorkerSlots : IWorkerSandbox
         {
             return $"its mode ({first.Split(' ')[0]}) lets every user write it";
         }
+        if (groupToo && first[5] == 'w')
+        {
+            return $"its mode ({first.Split(' ')[0]}) lets its group write it";
+        }
+        if (lines.Skip(1).FirstOrDefault(line => !AnyAclEntry.IsMatch(line)) is { } unread)
+        {
+            return $"an ACL line could not be read ('{unread.Trim()}')";
+        }
         var others = Writers(lsOutput).Where(w => w != $"user:{user}").ToList();
         return others.Count == 0 ? null : $"its ACL lets {string.Join(", ", others)} write it";
     }
+
+    /// <summary>One ACL entry of <c>ls -le</c>, allowing or denying: what every line after the first must be for <see cref="WritersBeside"/> to trust the listing.</summary>
+    private static readonly Regex AnyAclEntry = new(@"^\s*[0-9]+:\s+\S+\s+(?:inherited\s+)?(?:allow|deny)\s+\S+\s*$");
 
     /// <summary>
     /// Makes <paramref name="path"/> the held slot's user's alone to read (<see cref="WorkerSandbox.RestrictToWorkerAsync(string, CancellationToken)"/>):

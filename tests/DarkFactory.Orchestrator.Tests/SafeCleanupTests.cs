@@ -208,18 +208,22 @@ public class SafeCleanupTests
         }, _locks, ItemNaming.ParseAny(self));
         Workspace? triage = null;
         SeatWorkspace? seat = null;
+        // Each seat's directories as the production runners get them: SlotSeat.Of for the slot the seat holds.
+        var pool = TestSlots.Pool(Path.Combine(_root, "slots"), 2);
+        var triageSeat = SlotSeat.Of(WorkRoot, SandboxTriageRunner.TriageWorktrees, pool, pool.All[0]);
+        var plannerSeat = SlotSeat.Of(WorkRoot, SandboxPlanRunner.PlanWorktrees, pool, pool.All[1]);
         await Task.WhenAll(
             Task.Run(async () =>
             {
-                await TriageOf(1).SweepOrphansAsync((_, _) => Task.FromResult(false), LiveFor("gh-22"), None);
-                await McpProxySessions.SweepAsync(McpProxySessions.DirectoryOf(WorkRoot, 1), LiveFor("gh-22"), None);
-                triage = await TriageOf(1).PrepareAsync(Repo, "factory/triage-gh-22", None);
+                await Workspaces(triageSeat.Worktrees).SweepOrphansAsync((_, _) => Task.FromResult(false), LiveFor("gh-22"), None);
+                await McpProxySessions.SweepAsync(triageSeat.Sessions, LiveFor("gh-22"), None);
+                triage = await Workspaces(triageSeat.Worktrees).PrepareAsync(Repo, "factory/triage-gh-22", None);
             }),
             Task.Run(async () =>
             {
-                await PlannerOf(2).SweepOrphansAsync((_, _) => Task.FromResult(false), LiveFor("sc-21"), None);
-                await McpProxySessions.SweepAsync(McpProxySessions.DirectoryOf(WorkRoot, 2), LiveFor("sc-21"), None);
-                seat = await PlannerOf(2).PrepareSeatAsync([Repo, Gears], "factory/plan-sc-21", None);
+                await Workspaces(plannerSeat.Worktrees).SweepOrphansAsync((_, _) => Task.FromResult(false), LiveFor("sc-21"), None);
+                await McpProxySessions.SweepAsync(plannerSeat.Sessions, LiveFor("sc-21"), None);
+                seat = await Workspaces(plannerSeat.Worktrees).PrepareSeatAsync([Repo, Gears], "factory/plan-sc-21", None);
             }));
 
         // Each used its own slot's root …

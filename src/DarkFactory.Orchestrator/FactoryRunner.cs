@@ -637,10 +637,11 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         using var routerHttp = OutboundHttp.RouterApi(options.RouterBaseUrl);
         var app = new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System);
         // The seat is the held slot's (sc-25990): its own root of triage worktrees, its own directory of session files.
-        GitWorkspace SeatsOf(int number) => new(options.WorkRoot, GitWorkspace.GitHubRemote,
+        var seat = SlotSeat.Of(options.WorkRoot, TriageWorktrees, slots, slot);
+        GitWorkspace SeatsIn(string worktrees) => new(options.WorkRoot, GitWorkspace.GitHubRemote,
             async (r, c) => (await app.CreateInstallationTokenAsync(r, c, Issues.WorkerTriageRunner.TriageWorkspaceToken)).Token, sandbox: slots,
-            worktreesDirectory: TriageWorktreesOf(number), shareWithWorker: false);
-        var workspaces = SeatsOf(slot.Number);
+            worktreesDirectory: worktrees, shareWithWorker: false);
+        var workspaces = SeatsIn(seat.Worktrees);
         // Whatever a crashed or unstoppable triage left in this slot's root is swept (nothing resumes a triage), this issue's own
         // included: the intake holds its item's run lock around this call. Another live triage's worktree and session file are its
         // item's and are kept, and another slot's directories are that slot's seats' to sweep.
@@ -651,7 +652,7 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
             await workspaces.SweepOrphansAsync((_, _) => Task.FromResult(false), live, ct);
             // The one thing of another slot's root this seat touches: a worktree an earlier, dead triage of this same issue left
             // there (a triage takes any free slot, and the clone would refuse this one's branch while that worktree has it).
-            await RemoveOwnLeftoversAsync(Enumerable.Range(1, slots.Count).Where(n => n != slot.Number).Select(SeatsOf),
+            await RemoveOwnLeftoversAsync(SlotSeat.OthersWorktrees(TriageWorktrees, slots, slot).Select(SeatsIn),
                 ItemNaming.ParseAny(item.ExternalId), live, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -664,16 +665,15 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         // credential revoked when it ends, in a file (never argv).
         using var codeGraphHttp = OutboundHttp.CodeGraphApi(options.CodeGraphBaseUrl);
         var upstreams = FactoryRunner.CreateUpstreams(options, codeGraphHttp, kanbanHttp: null, log);
-        var configs = Mcp.McpProxySessions.DirectoryOf(options.WorkRoot, slot.Number);
-        await using var proxy = await StartMcpProxyAsync(upstreams, configs, live, ct);
+        await using var proxy = await StartMcpProxyAsync(upstreams, seat.Sessions, live, ct);
         var tools = TriageTools(upstreams, proxy is not null);
         var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, slots,
             pauseFlagDirectory: options.PauseFlagDirectory, tools: tools);
         var sessions = new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)),
             new RouterClient(routerHttp, routerKey), TimeProvider.System, log, costSettleDelay: options.CostSettleDelay);
         return await new Issues.WorkerTriageRunner(workspaces, worker, sessions, log,
-            proxy is null ? null : new Mcp.McpProxySessions(proxy, configs, slot.User, owner: ItemNaming.ParseAny(item.ExternalId),
-                restrict: SessionDirectoryRestriction(slots, slot)))
+            proxy is null ? null : new Mcp.McpProxySessions(proxy, seat.Sessions, seat.User, owner: ItemNaming.ParseAny(item.ExternalId),
+                restrict: seat.Restrict))
             .RunAsync(item, repo, prompt, onSession, onTaint, ct);
     }
 
@@ -737,6 +737,32 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
 }
 
 /// <summary>
+/// The directories of one read-only seat — a triage's or a planner's — and whose they are (sc-25990): everything the two
+/// production runners (<see cref="SandboxTriageRunner"/>, <see cref="SandboxPlanRunner"/>) know about where a seat lives comes
+/// from <see cref="Of"/>, given the slot the seat runs in, so neither can sweep, use or open to its worker another slot's.
+/// </summary>
+/// <param name="Worktrees">The seat's root of worktrees under the work root (<c>triage-worktrees</c>, <c>plan-worktrees-2</c>, …).</param>
+/// <param name="Sessions">The seat's directory of MCP session files (<see cref="Mcp.McpProxySessions.DirectoryOf"/>).</param>
+/// <param name="User">The sandbox user the session runs as, which must be able to read its session file; null unsandboxed.</param>
+/// <param name="Restrict">How <paramref name="Sessions"/> is made <paramref name="User"/>'s alone to read (<see cref="SandboxTriageRunner.SessionDirectoryRestriction"/>); null with one slot and unsandboxed.</param>
+internal sealed record SlotSeat(string Worktrees, string Sessions, string? User, Func<string, CancellationToken, Task>? Restrict)
+{
+    /// <summary>
+    /// The seat of <paramref name="slot"/> for the kind of seat whose slot-1 root is <paramref name="worktrees"/>; with no slot
+    /// (unsandboxed, <c>Worker:RunAs=none</c>) the directories are slot 1's, where they were before slots, and nobody's alone.
+    /// </summary>
+    public static SlotSeat Of(string workRoot, string worktrees, WorkerSlots? slots, WorkerSlot? slot) => new(
+        WorkerSlots.DirectoryOf(worktrees, slot?.Number ?? 1),
+        Mcp.McpProxySessions.DirectoryOf(workRoot, slot?.Number ?? 1),
+        slot?.User,
+        slots is null || slot is null ? null : SandboxTriageRunner.SessionDirectoryRestriction(slots, slot));
+
+    /// <summary>The same kind of seat's roots in every slot but <paramref name="slot"/> (what a triage looks through for its own issue's leftover, and nothing else).</summary>
+    public static IEnumerable<string> OthersWorktrees(string worktrees, WorkerSlots slots, WorkerSlot slot) =>
+        slots.All.Where(other => other.Number != slot.Number).Select(other => WorkerSlots.DirectoryOf(worktrees, other.Number));
+}
+
+/// <summary>
 /// Production <see cref="Plans.IPlanRunner"/> (sc-25870, E2): the planner's seat inside an item's run, whose Plan step holds the sandbox
 /// user's lock around it and has checked the sandbox (a worker phase, sc-25988; the seat takes the lock itself, waiting, if a caller does not hold it). Confined like the triage worker (<see cref="SandboxTriageRunner"/>): a read-only worker
 /// (<see cref="WorkerTools.ReadOnly"/>: Read, Glob, Grep inside its own worktree, no settings file loaded) in a worktree under its own
@@ -772,12 +798,11 @@ public sealed class SandboxPlanRunner(FactoryOptions options, WorkerSlots? slots
     {
         var sandbox = slot?.Sandbox;
         // The seat's two directories are its slot's own (sc-25990); unsandboxed, and for slot 1, they are where they always were.
-        var number = slot?.Number ?? 1;
+        var seat = SlotSeat.Of(options.WorkRoot, PlanWorktrees, slots, slot);
         // The token is minted per repository, contents-read only: a seat of several repositories fetches each with its own.
         var workspaces = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
             async (r, c) => (await app.CreateInstallationTokenAsync(r, c, Issues.WorkerTriageRunner.TriageWorkspaceToken)).Token, sandbox: slots,
-            worktreesDirectory: PlanWorktreesOf(number), shareWithWorker: false);
-        var configs = Mcp.McpProxySessions.DirectoryOf(options.WorkRoot, number);
+            worktreesDirectory: seat.Worktrees, shareWithWorker: false);
         Mcp.McpProxy? started;
         try
         {
@@ -787,7 +812,7 @@ public sealed class SandboxPlanRunner(FactoryOptions options, WorkerSlots? slots
                 await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
                 var live = SandboxTriageRunner.Leftovers(db, options, item);
                 await workspaces.SweepOrphansAsync((_, _) => Task.FromResult(false), live, ct);
-                await Mcp.McpProxySessions.SweepAsync(configs, live, ct);
+                await Mcp.McpProxySessions.SweepAsync(seat.Sessions, live, ct);
             }
             started = upstreams.All.Count == 0 ? null : await Mcp.McpProxy.StartAsync(upstreams, ct);
         }
@@ -799,8 +824,8 @@ public sealed class SandboxPlanRunner(FactoryOptions options, WorkerSlots? slots
         var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, options.RouterKey, options.WorkerAuth, options.WorkerTimeout, slots,
             pauseFlagDirectory: options.PauseFlagDirectory, tools: PlannerTools(upstreams, proxy is not null));
         return await new Plans.WorkerPlanRunner(workspaces, worker, log,
-            proxy is null ? null : new Mcp.McpProxySessions(proxy, configs, sandbox?.User, owner: ItemNaming.ParseAny(item.ExternalId),
-                restrict: slot is null ? null : SandboxTriageRunner.SessionDirectoryRestriction(slots!, slot)))
+            proxy is null ? null : new Mcp.McpProxySessions(proxy, seat.Sessions, seat.User, owner: ItemNaming.ParseAny(item.ExternalId),
+                restrict: seat.Restrict))
             .RunAsync(item, repos, session, ct);
     }
 

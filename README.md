@@ -262,7 +262,9 @@ killing every `_factory` process, so close `_factory` sessions and stop `factory
   each under its own lock file (`slot-locks/.factory-run-2.lock`, …, in a directory the factory closes to every sandbox user). An item keeps the slot its first worker phase took (recorded in the
   ledger): its session, its fix rounds, the gate's test runs and its worktrees are that user's, and it waits for that slot
   even if another is free. A worktree is shared for writing with its item's slot's user only, and the factory refuses to
-  push from one any other user may write. Each slot above 1 has its own `mcp-sessions-<n>`, `triage-worktrees-<n>` and
+  push from one any other user may write — with several slots also from one holding a file or directory another user may
+  write (it reads the mode and ACL of everything in the worktree before each push; a group- or world-writable file there
+  escalates the item, so run the factory and its builds under the usual umask 022). Each slot above 1 has its own `mcp-sessions-<n>`, `triage-worktrees-<n>` and
   `plan-worktrees-<n>` under the work root (slot 1 keeps the plain names), and with several slots a session's MCP
   credential file is readable by its own slot's user and the owner only (the factory sets and checks that itself; no extra
   setup). Sandbox users can read each other's worktrees (accepted: isolation between slots is for writing). Without `--slots` and `Worker__Slots` nothing changes: one user, one helper, one lock.

@@ -45,12 +45,16 @@ public interface IWorkerSandbox
 /// <summary>
 /// The push of worker work was refused (sc-25990): the worktree <see cref="Path"/> is writable by someone other than its own
 /// slot's sandbox user and the owner, so a session that is not among the push grant's — another slot's, possibly tainted (E4) —
-/// could have changed the files. The item's failure (Escalated, with this reason); a re-run starts in a fresh worktree.
+/// could have changed the files. The item's failure (Escalated, with this reason). Its worktree is removed with the escalation like
+/// any escalated item's, deliberately: what is in it cannot be vouched for, so it is not kept to be resumed or pushed later; the
+/// reason names the entry, and a re-run does the work again in a fresh worktree.
 /// </summary>
 public sealed class WorktreeWritersException(string path, string user, string why)
     : InvalidOperationException($"Refusing to push the work in {path}: {why}. Only {user} (the sandbox user of the worker slot whose work this is) "
-        + "and the owner may write an item's worktree, so that no other slot's session can change files this push would publish (E4). "
-        + "Nothing was committed or pushed; a re-run starts in a fresh worktree.")
+        + "and the owner may write an item's worktree and what is in it, so that no other slot's session can change files this push would publish (E4). "
+        + "Nothing was committed or pushed, and the session's work is discarded with the worktree (it cannot be vouched for); "
+        + "a re-run does it again in a fresh worktree. If it happens again, something the worker runs in this repository (a build "
+        + "or test step) opens files to other users: `chmod go-w`/umask 022 there, or run with Worker:Slots 1.")
 {
     public string Path => path;
 }
@@ -607,8 +611,9 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         return others.Count == 0 ? null : $"its ACL also allows {string.Join(", ", others)}";
     }
 
+    /// <summary>A sandbox by itself is the one slot there is: the worktree's root is judged, nothing inside it (<see cref="WorkerSlots.EnsureOnlyWorkerWritesAsync"/>).</summary>
     public Task EnsureOnlyWorkerWritesAsync(string path, CancellationToken ct) =>
-        WorkerSlots.EnsureOnlyWriterAsync(path, User, ListAclAsync, TimeSpan.FromMilliseconds(200), ct);
+        WorkerSlots.EnsureOnlyWriterAsync(path, User, ListAclAsync, AclRetry, ct);
 
     public async Task DeleteAsWorkerAsync(string path, CancellationToken ct)
     {

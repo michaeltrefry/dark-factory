@@ -1811,8 +1811,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
 - Slot isolation (Phase 4b, sc-25990, E7/E4; `Worker/WorkerSlots.cs`, `Worker/WorkerSandbox.cs`, `Mcp/McpSessions.cs`,
   `FactoryRunner.cs`): what used to rest on "no other sandbox process runs" holds between slots. Owner decision 2026-10-13:
   slots are isolated for WRITING, and each has its own MCP session directory; cross-slot READS are accepted (below). Everything
-  here is owner-side — the owner's own `chmod` and `/bin/ls -led` on directories the owner owns; no root, no change to
-  `setup-worker-user.sh` or the launch helper.
+  here is owner-side — the owner's own `chmod` and `/bin/ls -led` on directories the owner owns, and the owner's own read of
+  modes and ACLs inside a worktree; no root, no change to `setup-worker-user.sh` (the launch helper's change in this story is
+  its stderr only: "The helper's stderr", under the tests).
   Layout (`WorkerSlots.DirectoryOf(name, slot)`: `name` for slot 1, `name-n` for slot n, as the helpers are named): slot 1 keeps
   `<WorkRoot>/mcp-sessions`, `triage-worktrees` and `plan-worktrees` exactly where they were (E9: with `Worker:Slots` 1 no
   path and no behaviour changed, and what an earlier version left there is still swept); slot n has `mcp-sessions-n`,
@@ -1827,14 +1828,54 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   -led` must name no writer but the owner and the user of the slot the pushing phase holds (`WorkerSlots.Current`;
   `WorkerSlots.WritersBeside`: any `allow` entry with a write right — `write`, `append`, `add_file`, `add_subdirectory`,
   `delete`, `delete_child` — for another slot's user, any other user, a group or a UUID `ls` could not name, or a mode that
-  lets everyone write). Otherwise `WorktreeWritersException` ("Refusing to push the work in <path>: its ACL lets user:_factory
-  write it. Only _factory2 … and the owner may write an item's worktree …"): nothing is committed or pushed, the item escalates
-  with that reason (typed outcome `escalated`, like a tainted session's refusal) and a re-run starts in a fresh worktree. Fail
-  closed: a listing that cannot be read, or shows no directory, refuses the push; a writer is read up to 3 times first (`ls`
-  prints a user's UUID while the directory service is slow). The check is of the worktree's root directory, whose ACL only its
-  owner (the factory's owner) or root can change. It runs with one slot too (a worktree a higher slot's user may write, left
-  from a larger `Worker:Slots`, is not pushed from). Not checked: a seat's read-only worktree (`shareWithWorker` false — never
-  pushed) and the merge queue's base-update push (`PushAsync`: the orchestrator's own merge commit, no worker work).
+  lets everyone write; any later line of the listing that is neither an `allow` nor a `deny` entry — a principal with a space
+  in its name, a format this does not know — is itself a reason, never skipped). Otherwise `WorktreeWritersException`
+  ("Refusing to push the work in <path>: its ACL lets user:_factory write it. Only _factory2 … and the owner may write an
+  item's worktree and what is in it …"): nothing is staged, committed or pushed and no token is minted.
+  The root is not enough with several slots: its ACL only its owner (the factory's owner) or root can change, but the files
+  and directories a worker makes inside are that sandbox user's OWN, and code it runs (a build script's `chmod -R a+w`, a tool
+  with umask 0, a `chmod +a`) can open them to another slot's user without touching the root — the work root lets every
+  slot's user search and read down to them. So with `Worker:Slots` > 1 the same call then walks the whole worktree owner-side
+  (`Worker/WorktreeWriters.cs`, `WorktreeWriters.Inside`; in process, no `ls`): every entry, hidden and git-ignored ones
+  included (a build input another slot could have planted is as much a way in as a tracked file; the worktree's `.git` is a
+  file and is judged like any; the admin directory is the clone's, outside the worktree), never following a symbolic link (a
+  link is neither judged nor entered: changing one takes write on its directory, which is judged). It refuses the first entry
+  (a) whose mode has the other-write bit; (b) whose mode has the group-write bit — refused outright, also on the root with
+  several slots: setup gives each sandbox user a primary group of its own that no other slot's user is in and a file made here
+  takes its directory's group (the owner's), so the bit opens nothing between slots in practice, but proving that would take
+  a membership lookup per group and nothing made under the usual umask 022 has it; (c) whose ACL — read from the kernel for
+  that entry itself (`acl_get_link_np`, printed by `acl_to_text`, once per distinct ACL: `WorktreeWriters.NativeAcl`) — has
+  an `allow` entry for anyone but the owner and the worktree's own slot's user with any right beyond `read`, `execute`,
+  `readattr`, `readextattr`, `readsecurity` (so `write`, `append`, `delete`, `delete_child`, `writeattr`, `writeextattr`,
+  `writesecurity`, `chown` and any right this does not know; the other slots' inherited read entries pass: the accepted
+  cross-slot read); or (d) that cannot be judged: a directory the owner cannot list, an entry that vanished or whose name
+  does not read back, an ACL that cannot be read or has a line that is no entry or names no one. The reason names the entry
+  relative to the worktree ("src/deep/work.txt in it has a mode (0646) that lets every user write it", "the ACL of … lets
+  user:_factory write it (write)"). Nothing is skipped and there is no size bound: the cost is linear in the entries, like
+  `git add -A` itself — measured on this repository's worktree 1,137 entries in about 10 ms, and 5,050 entries each holding a
+  four-entry ACL in about 60 ms on a loaded host (about 12 µs an entry; roughly a second per 100,000) — and the walk is
+  cancellable. With ONE slot nothing inside is read and the root's group bit is not judged (E9: there is no other slot's user
+  to open a file to; the root's listing is read as before, so a worktree a higher slot's user may write, left from a larger
+  `Worker:Slots`, is not pushed from).
+  A refusal escalates the item with that reason (typed outcome `escalated`, like a tainted session's refusal) and, like any
+  escalation, its worktree is removed: deliberately not kept — what is in it cannot be vouched for, so it is neither resumed
+  nor pushed later — and said in the reason (so in the escalation comment): the session's work is discarded, a re-run does it
+  again in a fresh worktree, and if it happens again something the worker runs in that repository opens files to other users
+  (`chmod go-w`/umask 022 there, or `Worker:Slots` 1). Because a refusal costs a finished session, it is not decided in a
+  hurry: who may write is read up to 10 times, 200 ms apart (`WorkerSlots.PushAclReads`, about 2 s; with one slot too) —
+  `ls` prints a user's UUID, and an ACL entry has no name, while the directory service is slow to answer. Fail closed: a
+  listing that cannot be read, or shows no directory, refuses at once. Not checked: a seat's read-only worktree
+  (`shareWithWorker` false — never pushed) and the merge queue's base-update push (`PushAsync`: the orchestrator's own merge
+  commit, no worker work).
+  Residuals of (1), accepted: the check is of the worktree as it is at the push, when no process of its slot's user is left
+  (the helper's exit kills them all), so a file that was open to another slot's user WHILE the session ran and was closed
+  again before the push is not seen; and it is the factory's own reading of modes and ACLs, not the kernel's answer to "may
+  that user write this" (an access path that is neither a mode bit nor an ACL entry — there is none known for a role account
+  with a group of its own — would not be seen). Ownership is not read either: an entry in the worktree that another slot's
+  user OWNS (possible only if the worktree's own worker hard-links that user's file into its tree; another slot's user cannot
+  create anything there) could be rewritten by its owner under ordinary modes — code that does that could as well copy what
+  the other slot left in a shared place (the `/tmp` residual below). An owner whose umask gives group write (002) has every
+  push refused with several slots: run the factory under 022, macOS's default.
   (2) MCP session files, read isolation: the work root's inherited read entry names every slot's user, so with several slots
   each session directory is made its own slot's user's alone before a session's file is written
   (`WorkerSandbox.RestrictToWorkerAsync`, every slot's, slot 1's `mcp-sessions` included: `chmod -N` — every entry gone, the
@@ -1848,7 +1889,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (its worker slot's user) and the owner alone, but its ACL also allows user:_factory, so another slot's worker could read
   this session's MCP credential`): the session is not started, its file is deleted and its credential revoked. With one slot
   nothing is restricted and only the old check runs (E9).
-  (3) Seats: a triage's and a planner's worktree root and session directory are those of the slot the seat runs in (a triage:
+  (3) Seats: a triage's and a planner's worktree root and session directory are those of the slot the seat runs in
+  (`SlotSeat.Of(workRoot, name, slots, slot)` in `FactoryRunner.cs`, the one place both production runners get a seat's
+  worktree root, session directory, user and restriction from) (a triage:
   whichever free slot it took; a planner: its plan item's slot, so a re-run finds what an earlier run of it left), and each
   seat's two sweeps (`GitWorkspace.SweepOrphansAsync` of its seat root, `McpProxySessions.SweepAsync` of its session directory,
   both under the `LiveRuns` claims of sc-25987, unchanged) are of those two directories only: a triage in one slot and a
@@ -1870,12 +1913,21 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   the clones). A gap in that enforcement (the Glob/Grep residual under the triage bullet) would therefore reach other slots'
   unmerged work too, inside the triage's bounded, fenced answer. Also accepted: a sandbox user can still write its OWN slot's
   other kept worktrees (Worker phases' residual (c)), and (2)'s restriction is re-applied by each session rather than once,
-  so a session directory someone opened up by hand is closed again by the next session, not before it.
+  so a session directory someone opened up by hand is closed again by the next session, not before it. Also accepted:
+  world-writable places OUTSIDE the work root are shared by every slot's user — `/tmp`, `/private/tmp`, `/var/tmp`, the
+  scratch files NuGet, MSBuild, cargo and other tools put there — so code one slot runs can plant or change a file there that
+  another slot's build reads (a slot's own `$TMPDIR` is per user, but nothing makes a tool use it). Nothing checks those: what
+  such a build then produces still goes through review, CI and the gate, and a web or MCP use taints the session that planted
+  it only for its own push.
   Tests: `SlotIsolationTests` (the write-grant and the read-alone decisions over `ls -led` listings; the pool asking about the
-  held slot; on macOS, with the role accounts `daemon` and `nobody` for two slots' users, a real restricted directory and a
-  real worktree whose push is refused once the other user may write it), `GitWorkspaceTests` (the refused push: nothing
-  staged, committed or pushed, no token), `McpProxyTests` (the restricted directory, each refusal, one slot unchanged),
-  `SafeCleanupTests` (the layout; a triage and a planner in two slots at once; the triage's own leftover in another slot's root).
+  held slot; the ACL of an entry inside a worktree and the walk of a real tree — links, hidden files, an unreadable or
+  vanished directory; on macOS, with the role accounts `daemon` and `nobody` for two slots' users, a real restricted
+  directory and a real worktree whose push is refused once the other user may write it or a file inside it, by a real ACL
+  entry or a mode bit; `SlotSeat.Of`, and that the two production runners take every seat directory from it),
+  `GitWorkspaceTests` (the refused push, for the root and for an entry inside: nothing staged, committed or pushed, no
+  token; ordinary modes and a link out of the worktree still push; one slot reads nothing inside), `McpProxyTests` (the
+  restricted directory, each refusal, one slot unchanged), `SafeCleanupTests` (the layout; a triage and a planner in two
+  slots at once, each with the directories `SlotSeat.Of` gives its slot; the triage's own leftover in another slot's root).
 - Clean-up under overlapping runs (Phase 4b, sc-25987; `Ledger/LiveRuns.cs`, `Git/CloneLock.cs`): no sweep decides from "no other run exists".
   Whose a leftover is: it carries its item in its name — a worktree directory by `ItemNaming.OwnerOfLeftover` (`factory-<item>`,
   the changeset worktree `factory-changeset-<item>`, a triage's `factory-triage-<item>`, a planner's worktree or seat
