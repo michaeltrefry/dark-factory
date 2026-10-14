@@ -615,6 +615,8 @@ public class SwiftPipelineTests
         };
         h.GitHub.Diff = head => $"diff --git a/Sources/Words/Words.swift b/Sources/Words/Words.swift\n+change at {head}\n"
             + $"diff --git a/{SwiftIdentifyTests.TestFile} b/{SwiftIdentifyTests.TestFile}\n+test at {head}\n";
+        // A CodeGraph that indexes Swift (C3, sc-26137): without it risk-threshold fails closed on every changed Swift file (sc-26133).
+        h.CodeGraph.Impact = (path, sha) => C7Answers.ParsedImpactFile("Sandbox", path, sha, false, "none", languageIndexed: true, language: "swift");
         return h;
     }
 

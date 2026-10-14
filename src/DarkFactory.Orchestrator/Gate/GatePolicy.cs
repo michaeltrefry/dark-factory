@@ -410,6 +410,13 @@ public static class RiskyPaths
             Options)),
         // Rust: a build script runs at build time, the toolchain file picks the compiler, cargo's config can set runners, linkers and registries.
         ("Rust build and toolchain configuration", new Regex(@"(^|/)(build\.rs|rust-toolchain[^/]*|\.cargo/config[^/]*)$", Options)),
+        // Apple (sc-26133): Xcode projects, workspaces, schemes, build settings and test plans set build phases, scripts, signing and
+        // what runs; entitlements and Info.plist grant capabilities; XcodeGen, Tuist, CocoaPods and Carthage files generate projects and
+        // pull dependencies; xcfilelists feed build phases' inputs and outputs. `project.(yml|json)` deliberately over-matches (Nx's and
+        // legacy .NET's project.json get a security review too: it only adds a check).
+        ("Xcode, CocoaPods and app configuration", new Regex(
+            @"(^|/)([^/]+\.xcodeproj/project\.pbxproj|[^/]+\.xcworkspace/contents\.xcworkspacedata|[^/]+\.xcworkspace/xcshareddata/[^/]+\.xcsettings|[^/]+\.xcscheme|[^/]+\.xcconfig|[^/]+\.xcfilelist|[^/]+\.entitlements|([^/]*-)?Info\.plist|project\.(yml|json)|Project\.swift|Workspace\.swift|Tuist\.swift|Tuist/.+|Podfile(\.lock)?|[^/]+\.podspec(\.json)?|Cartfile(\.resolved)?|[^/]+\.xctestplan)$",
+            Options)),
         ("keys and environment files", new Regex(@"\.(pem|key|p12|pfx|crt|cer)$|(^|/)\.env", Options)),
         ("security-sensitive code", new Regex(
             @"auth|secret|credential|token|crypto|passw|permission|sandbox|sudo|keychain|login|oauth|jwt|cert|ssh|security|acl|ruleset|protect",

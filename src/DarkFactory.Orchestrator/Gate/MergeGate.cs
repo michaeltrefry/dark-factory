@@ -441,7 +441,8 @@ public static class MergeGate
     /// <paramref name="limit"/> (<see cref="BlastRadiusLimit"/>), and, when the policy sets <c>max_hotspot</c>, each file's hotspot score
     /// (CodeGraph's riskScore, on the default branch) within it. Inputs not read at all (no CodeGraph configured), read for another
     /// commit or leaving a touched file out block. A file read over a limit blocks even when other inputs could not be read; otherwise
-    /// inputs CodeGraph could not read are pending.
+    /// inputs CodeGraph could not read are pending. A touched file whose language CodeGraph does not index
+    /// (<see cref="CodeGraphRisk.UnindexedFiles"/>, sc-26133) blocks, naming the file and its language.
     /// </summary>
     private static void CodeGraphReasons(RiskThreshold threshold, BlastRadius? limit, string by, string head, IReadOnlyList<string> files,
         CodeGraphRisk? risk, List<string> reasons, List<string> pending)
@@ -470,6 +471,13 @@ public static class MergeGate
                 reasons.Add($"risk threshold: hotspot score (riskScore) over max_hotspot {CodeGraphRisk.Score(maxHotspot)}: "
                     + string.Join(", ", hot.Select(f => $"{f.Path} {CodeGraphRisk.Score(f.Score)} on the default branch {f.CommitLabel}")));
             }
+        }
+        if (risk.UnindexedFiles.Count > 0)
+        {
+            // Fail closed (owner decision 2026-10-14, sc-26133): a file CodeGraph does not index has an unknown blast radius, not none.
+            reasons.Add($"risk threshold: CodeGraph does not index the language of a changed code file, so its blast radius and hotspot are unknown: "
+                + string.Join(", ", risk.UnindexedFiles.Take(CodeGraphRisk.MaxListed))
+                + (risk.UnindexedFiles.Count > CodeGraphRisk.MaxListed ? $", … {risk.UnindexedFiles.Count - CodeGraphRisk.MaxListed} more" : ""));
         }
         if (risk.Unreadable.Count > 0)
         {

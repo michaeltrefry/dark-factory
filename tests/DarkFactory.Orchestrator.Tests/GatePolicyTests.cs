@@ -457,6 +457,11 @@ public class MergeGateTierTests
     [InlineData("scripts/deploy.sh", "scripts/deploy.sh (scripts)")]
     [InlineData("src/App/App.csproj", "src/App/App.csproj (dependencies)")]
     [InlineData("tests/TokenTests.cs", "tests/TokenTests.cs (security-sensitive code)")] // a free path the floor still matches
+    [InlineData("Package.resolved", "Package.resolved (dependencies)")]
+    [InlineData("App.xcodeproj/project.pbxproj", "App.xcodeproj/project.pbxproj (Xcode, CocoaPods and app configuration)")]
+    [InlineData("App/App.entitlements", "App/App.entitlements (Xcode, CocoaPods and app configuration)")]
+    [InlineData("Podfile.lock", "Podfile.lock (Xcode, CocoaPods and app configuration)")]
+    [InlineData("App.xctestplan", "App.xctestplan (Xcode, CocoaPods and app configuration)")]
     [FailsGateCheck(GateCheckCoverage.FloorSecurityReviewPaths)]
     public void A_path_on_the_code_floor_needs_the_security_review_whatever_its_tier(string path, string why)
     {
