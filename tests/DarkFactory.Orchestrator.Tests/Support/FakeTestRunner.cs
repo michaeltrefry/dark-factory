@@ -73,6 +73,12 @@ internal sealed class FakeTestRunner : IGateTestRunner
 
     private static IEnumerable<string> Filtered(IReadOnlyList<string> args)
     {
+        if (args.Contains("--xunit-output"))
+        {
+            // swift test (SwiftNewTests.Filter): ^<id, escaped>(/|$)
+            var swift = args.SkipWhile(a => a != "--filter").Skip(1).First();
+            return [System.Text.RegularExpressions.Regex.Replace(swift[1..^"(/|$)".Length], @"\\(.)", "$1")];
+        }
         var methods = args.Select((a, i) => (a, i)).Where(x => x.a == "--filter-method").Select(x => args[x.i + 1]).ToList();
         if (methods.Count > 0)
         {

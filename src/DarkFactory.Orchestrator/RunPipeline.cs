@@ -2533,10 +2533,11 @@ public sealed partial class RunPipeline(
 
     /// <summary>
     /// What every implementing prompt (implement, review fix, CI fix, conflict fix) asks before the worker stops, naming the
-    /// build-and-test commands the worker is allowed (<see cref="ClaudeWorker.AllowedTools"/>: .NET's, and cargo's since sc-25877).
+    /// build-and-test commands the worker is allowed (<see cref="ClaudeWorker.AllowedTools"/>: .NET's, cargo's since sc-25877, and
+    /// SwiftPM's since sc-26127).
     /// </summary>
     internal const string BuildsAndPasses =
-        "the build and the tests pass (`dotnet build` and `dotnet test`; in a Rust package `cargo build` and `cargo test`)";
+        "the build and the tests pass (`dotnet build` and `dotnet test`; in a Rust package `cargo build` and `cargo test`; in a Swift package `swift build` and `swift test`)";
 
     public static string BuildPrompt(WorkSpec spec, RepoRef repo)
     {

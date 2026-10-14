@@ -108,7 +108,7 @@ public class TaintRuleTests
     {
         Assert.Equal(["Bash(cargo build:*)", "Bash(cargo check:*)", "Bash(cargo test:*)", "Bash(cargo fetch:*)"], ClaudeWorker.CargoTools);
         Assert.Equal(
-            ["Read", "Edit", "Write", "Glob", "Grep", "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(dotnet restore:*)", .. ClaudeWorker.CargoTools],
+            ["Read", "Edit", "Write", "Glob", "Grep", "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(dotnet restore:*)", .. ClaudeWorker.CargoTools, .. ClaudeWorker.SwiftTools],
             ClaudeWorker.AllowedTools);
         // The implementer's command line carries them.
         var args = ClaudeWorker.BuildArguments("p").ToList();
@@ -125,6 +125,52 @@ public class TaintRuleTests
         Assert.DoesNotContain(readOnly, a => a.Contains("dotnet", StringComparison.Ordinal));
         // The prompts name the commands a worker now has.
         Assert.Contains("`cargo build` and `cargo test`", RunPipeline.BuildsAndPasses);
+    }
+
+    /// <summary>
+    /// sc-26127: an implementing worker may build and test a Swift package — exactly <c>swift build</c> and <c>swift test</c>, as
+    /// prefix rules — and nothing else of swift (no <c>swift run</c>, <c>swift package</c> or <c>swift &lt;script&gt;</c>); a
+    /// session that only reads gains none of it.
+    /// </summary>
+    [Fact]
+    public void An_implementing_worker_may_run_exactly_swift_build_and_swift_test_and_a_read_only_session_neither()
+    {
+        Assert.Equal(["Bash(swift build:*)", "Bash(swift test:*)"], ClaudeWorker.SwiftTools);
+        var args = ClaudeWorker.BuildArguments("p").ToList();
+        var allowed = args.Skip(args.IndexOf("--allowedTools") + 1).TakeWhile(a => !a.StartsWith("--", StringComparison.Ordinal)).ToList();
+        Assert.Equal(["Bash(swift build:*)", "Bash(swift test:*)"], allowed.Where(a => a.Contains("swift", StringComparison.Ordinal)));
+        Assert.DoesNotContain(ClaudeWorker.BuildArguments("p", null, null, WorkerTools.ReadOnly, "/wt/triage"), a => a.Contains("swift", StringComparison.Ordinal));
+        Assert.Contains("in a Swift package `swift build` and `swift test`", RunPipeline.BuildsAndPasses);
+    }
+
+    [Theory]
+    [InlineData("Bash(swift build:*)")]
+    [InlineData("Bash(swift test:*)")]
+    public void A_repos_allow_rule_for_a_swift_command_the_worker_already_has_does_not_taint(string rule)
+    {
+        var dir = Directory.CreateTempSubdirectory("df-settings-").FullName;
+        Directory.CreateDirectory(Path.Combine(dir, ".claude"));
+        File.WriteAllText(Path.Combine(dir, ".claude/settings.json"), """{"permissions":{"allow":["RULE"]}}""".Replace("RULE", rule));
+
+        Assert.Null(Taint.OfRepoSettings(dir));
+    }
+
+    [Theory]
+    [InlineData("Bash(swift:*)")]
+    [InlineData("Bash(swift run:*)")]
+    [InlineData("Bash(swift package:*)")]
+    [InlineData("Bash(swift package resolve:*)")]
+    [InlineData("Bash(swift repl:*)")]
+    [InlineData("Bash(swift script.swift:*)")]
+    [InlineData("Bash(swift build*)")]
+    [InlineData("Bash(swiftc:*)")]
+    public void A_repos_allow_rule_for_any_other_swift_command_taints(string rule)
+    {
+        var dir = Directory.CreateTempSubdirectory("df-settings-").FullName;
+        Directory.CreateDirectory(Path.Combine(dir, ".claude"));
+        File.WriteAllText(Path.Combine(dir, ".claude/settings.json"), """{"permissions":{"allow":["Read","RULE"]}}""".Replace("RULE", rule));
+
+        Assert.Equal(Taint.RepoSettings, Taint.OfRepoSettings(dir));
     }
 
     [Theory]

@@ -231,7 +231,8 @@ public sealed record BaseEvidence(TestRunReport Run, BuildFailure? First = null,
 
 /// <summary>
 /// One language/framework's way to find the tests a PR adds (deterministically, from the files at the base and the head)
-/// and to run just those tests. <see cref="XunitNewTests"/> is .NET/xUnit, <see cref="CargoNewTests"/> Rust/cargo; a
+/// and to run just those tests. <see cref="XunitNewTests"/> is .NET/xUnit, <see cref="CargoNewTests"/> Rust/cargo,
+/// <see cref="SwiftNewTests"/> Swift/SwiftPM with Swift Testing; a
 /// stack none claims is <see cref="NewTestsOutcome.Unsupported"/>.
 /// </summary>
 public interface INewTestStrategy
@@ -386,7 +387,7 @@ public static class NewTestsCheck
     public static string NewResultsDirectory() => ResultsDirectoryPrefix + Guid.NewGuid().ToString("N");
 
     /// <summary>The supported stacks.</summary>
-    public static readonly IReadOnlyList<INewTestStrategy> Strategies = [new XunitNewTests(), new CargoNewTests()];
+    public static readonly IReadOnlyList<INewTestStrategy> Strategies = [new XunitNewTests(), new CargoNewTests(), new SwiftNewTests()];
 
     public static async Task<NewTestsResult> RunAsync(IGateTestRunner runner, IReadOnlyList<INewTestStrategy> strategies, RepoRef repo,
         string baseSha, string headSha, string runName, Action<string>? log, CancellationToken ct)

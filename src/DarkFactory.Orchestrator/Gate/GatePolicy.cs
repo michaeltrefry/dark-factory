@@ -406,7 +406,7 @@ public static class RiskyPaths
         ("scripts", new Regex(@"(^|/)scripts?/|\.(sh|bash|zsh|ps1)$", Options)),
         ("build and container definitions", new Regex(@"(^|/)(Dockerfile[^/]*|docker-compose[^/]*\.ya?ml|Makefile)$", Options)),
         ("dependencies", new Regex(
-            @"(^|/)([^/]+\.(cs|fs|vb)proj|Directory\.(Packages|Build)\.props|nuget\.config|global\.json|dotnet-tools\.json|package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|requirements[^/]*\.txt|pyproject\.toml|poetry\.lock|go\.(mod|sum)|Cargo\.(toml|lock)|Gemfile(\.lock)?)$",
+            @"(^|/)([^/]+\.(cs|fs|vb)proj|Directory\.(Packages|Build)\.props|nuget\.config|global\.json|dotnet-tools\.json|package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|requirements[^/]*\.txt|pyproject\.toml|poetry\.lock|go\.(mod|sum)|Cargo\.(toml|lock)|Gemfile(\.lock)?|Package(@swift-[^/]*)?\.swift|Package\.resolved)$",
             Options)),
         // Rust: a build script runs at build time, the toolchain file picks the compiler, cargo's config can set runners, linkers and registries.
         ("Rust build and toolchain configuration", new Regex(@"(^|/)(build\.rs|rust-toolchain[^/]*|\.cargo/config[^/]*)$", Options)),
