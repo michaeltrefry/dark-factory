@@ -8,7 +8,8 @@ namespace DarkFactory.Orchestrator.Tests.Support;
 /// argument the tool does not have, or a required one missing, is <c>invalid_argument</c>), two tokens (<see cref="FullToken"/> and
 /// <see cref="ReadToken"/>: a write tool with the read token is <c>scope_denied</c> before anything else, an unknown token HTTP
 /// 401), identities by token, expiring claims (claim, renew, release), <c>version</c>/<c>expected_version</c>, comment and
-/// create idempotency keys, idempotent links, dependencies (idempotent; a cycle refused), cursor paging, and answers in the contract's shapes (a field without a value left
+/// create idempotency keys, idempotent links, dependencies (idempotent; a cycle refused), cursor paging, the project, epic and
+/// epic-document creates and the project delete a fixture recorder sets its throwaway board up and removes it with (sc-25986), and answers in the contract's shapes (a field without a value left
 /// out or null as the contract says). Every call is recorded with the token it carried. A test can make it answer <c>busy</c>
 /// (<see cref="Busy"/>) or lose an answer after the write happened (<see cref="LoseAnswer"/>), as the contract's "Errors" allow.
 /// </summary>
@@ -34,6 +35,12 @@ public sealed class FakeKanbanBoard
     private static readonly Dictionary<string, (string[] Required, string[] Optional)> Arguments = new()
     {
         ["list_projects"] = ([], ["includeArchived"]),
+        ["create_project"] = (["name", "key"], ["description", "repository_url", "default_branch", "idempotency_key"]),
+        ["update_project"] = (["id"], ["name", "key", "description", "repository_url", "default_branch", "is_archived", "clear"]),
+        ["delete_project"] = (["projectId"], []),
+        ["create_epic"] = (["projectId", "name"], ["description", "isArchived", "idempotency_key"]),
+        ["list_epics"] = (["projectId"], ["includeArchived"]),
+        ["create_epic_document"] = (["epicId", "title", "body"], ["idempotency_key"]),
         ["get_work_item"] = (["itemId"], []),
         ["list_work_items"] = ([], ["projectId", "epicId", "type", "status", "includeArchivedEpics", "unblocked_only", "label", "updated_since",
             "claim_state", "limit", "cursor", "include_comments"]),
@@ -53,17 +60,22 @@ public sealed class FakeKanbanBoard
 
     private static readonly Dictionary<string, (Guid Id, string Name)> Identities = new()
     {
-        [FullToken] = (Guid.Parse("f0000000-0000-0000-0000-000000000001"), "factory"),
-        [ReadToken] = (Guid.Parse("f0000000-0000-0000-0000-000000000002"), "factory-read"),
-        [OtherToken] = (Guid.Parse("f0000000-0000-0000-0000-000000000003"), "someone"),
+        // Ids as a real board gives them: not the placeholder shape a recording writes instead (KanbanIdentities).
+        [FullToken] = (Guid.Parse("6b1f0c2e-5a44-4d1b-9c7e-0d2a8f3b1e01"), "factory"),
+        [ReadToken] = (Guid.Parse("6b1f0c2e-5a44-4d1b-9c7e-0d2a8f3b1e02"), "factory-read"),
+        [OtherToken] = (Guid.Parse("6b1f0c2e-5a44-4d1b-9c7e-0d2a8f3b1e03"), "someone"),
     };
 
     public sealed class Project
     {
         public Guid Id { get; } = Guid.NewGuid();
         public required string Key { get; init; }
+        /// <summary>The project's name; null: <c>Project &lt;key&gt;</c>.</summary>
+        public string? Name { get; set; }
         public string? RepositoryUrl { get; set; }
         public bool Archived { get; set; }
+        /// <summary>The identity and idempotency key that created it through <c>create_project</c>.</summary>
+        public (Guid Identity, string Key)? CreatedWith { get; set; }
     }
 
     public sealed class Epic
@@ -73,6 +85,10 @@ public sealed class FakeKanbanBoard
         public required string Name { get; init; }
         public string? Description { get; set; }
         public List<(Guid Id, string Title, string Body)> Documents { get; } = [];
+        /// <summary>The identity and idempotency key that created it through <c>create_epic</c>.</summary>
+        public (Guid Identity, string Key)? CreatedWith { get; set; }
+        /// <summary>The identity and idempotency key of each document made through <c>create_epic_document</c>.</summary>
+        public Dictionary<(Guid Identity, string Key), Guid> DocumentKeys { get; } = [];
     }
 
     public sealed record Comment(Guid Id, string Author, Guid AuthorId, string Body, string? Key);
@@ -222,20 +238,124 @@ public sealed class FakeKanbanBoard
         switch (tool)
         {
             case "list_projects":
-                return Ok(new JsonArray(Projects.Where(p => !p.Archived).Select(p => (JsonNode)ProjectShape(p)).ToArray()));
+                return Ok(new JsonArray(Projects.Where(p => !p.Archived || arguments["includeArchived"]?.GetValue<bool>() == true)
+                    .Select(p => (JsonNode)ProjectShape(p)).ToArray()));
+            case "create_project":
+            {
+                var (name, projectKey) = (arguments["name"]!.GetValue<string>(), arguments["key"]!.GetValue<string>().ToUpperInvariant());
+                var key = arguments["idempotency_key"]?.GetValue<string>();
+                if (name.Length is 0 or > 160 || projectKey.Length is 0 or > 24 || !ValidKey(key))
+                {
+                    return Refusal("invalid_argument", "name is at most 160 characters, key at most 24, idempotency_key 1 to 128 printable ASCII characters.");
+                }
+                // A repeat of the key by the same identity: nothing created, the project as it is now.
+                var earlier = key is null ? null : Projects.FirstOrDefault(p => p.CreatedWith == (identity.Id, key));
+                if (earlier is null && Projects.Any(p => p.Key == projectKey))
+                {
+                    return Refusal("conflict", $"Another project has the key {projectKey}.");
+                }
+                var made = earlier ?? new Project
+                {
+                    Key = projectKey, Name = name, RepositoryUrl = arguments["repository_url"]?.GetValue<string>(),
+                    CreatedWith = key is null ? null : (identity.Id, key),
+                };
+                if (earlier is null)
+                {
+                    Projects.Add(made);
+                }
+                var created = ProjectShape(made);
+                created["created"] = earlier is null;
+                return Ok(created);
+            }
+            case "update_project":
+            {
+                if (Projects.FirstOrDefault(p => p.Id == Id(arguments, "id")) is not { } changed)
+                {
+                    return Refusal("not_found", $"Project {arguments["id"]} was not found.");
+                }
+                changed.Name = arguments["name"]?.GetValue<string>() ?? changed.Name;
+                changed.RepositoryUrl = arguments["repository_url"]?.GetValue<string>() ?? changed.RepositoryUrl;
+                changed.Archived = arguments["is_archived"]?.GetValue<bool>() ?? changed.Archived;
+                return Ok(ProjectShape(changed));
+            }
+            case "delete_project":
+            {
+                if (Projects.FirstOrDefault(p => p.Id == Id(arguments, "projectId")) is not { } gone)
+                {
+                    return Refusal("not_found", $"Project {arguments["projectId"]} was not found.");
+                }
+                // With its epics, documents and work items; an item left that one of them blocked loses that blocker.
+                Projects.Remove(gone);
+                Epics.RemoveAll(e => e.ProjectId == gone.Id);
+                var deleted = Items.Where(i => i.ProjectId == gone.Id).ToList();
+                Items.RemoveAll(deleted.Contains);
+                Items.ForEach(i => i.Blockers.RemoveAll(deleted.Contains));
+                return Ok(new JsonObject { ["id"] = gone.Id.ToString(), ["entityType"] = "project", ["deleted"] = true });
+            }
+            case "create_epic":
+            {
+                if (Projects.FirstOrDefault(p => p.Id == Id(arguments, "projectId")) is not { } home)
+                {
+                    return Refusal("not_found", $"Project {arguments["projectId"]} was not found.");
+                }
+                var (name, key) = (arguments["name"]!.GetValue<string>(), arguments["idempotency_key"]?.GetValue<string>());
+                if (name.Length is 0 or > 160 || !ValidKey(key))
+                {
+                    return Refusal("invalid_argument", "name is 1 to 160 characters, idempotency_key 1 to 128 printable ASCII characters.");
+                }
+                var earlier = key is null ? null : Epics.FirstOrDefault(e => e.ProjectId == home.Id && e.CreatedWith == (identity.Id, key));
+                var made = earlier ?? new Epic
+                {
+                    ProjectId = home.Id, Name = name, Description = arguments["description"]?.GetValue<string>(),
+                    CreatedWith = key is null ? null : (identity.Id, key),
+                };
+                if (earlier is null)
+                {
+                    Epics.Add(made);
+                }
+                var created = EpicShape(made);
+                created["created"] = earlier is null;
+                return Ok(created);
+            }
+            case "create_epic_document":
+            {
+                if (Epics.FirstOrDefault(e => e.Id == Id(arguments, "epicId")) is not { } of)
+                {
+                    return Refusal("not_found", $"Epic {arguments["epicId"]} was not found.");
+                }
+                var (title, body, key) = (arguments["title"]!.GetValue<string>(), arguments["body"]!.GetValue<string>(),
+                    arguments["idempotency_key"]?.GetValue<string>());
+                if (title.Length is 0 or > 200 || body.Length == 0 || !ValidKey(key))
+                {
+                    return Refusal("invalid_argument", "title is 1 to 200 characters, the body not empty, idempotency_key 1 to 128 printable ASCII characters.");
+                }
+                var repeat = key is not null && of.DocumentKeys.ContainsKey((identity.Id, key));
+                var id = repeat ? of.DocumentKeys[(identity.Id, key!)] : Guid.NewGuid();
+                if (!repeat)
+                {
+                    of.Documents.Add((id, title, body));
+                    if (key is not null)
+                    {
+                        of.DocumentKeys[(identity.Id, key)] = id;
+                    }
+                }
+                var document = DocumentShape(of, of.Documents.First(d => d.Id == id));
+                document["created"] = !repeat;
+                return Ok(document);
+            }
             case "list_work_items":
                 return ListItems(arguments);
+            case "list_epics":
+                return Projects.Any(p => p.Id == Id(arguments, "projectId"))
+                    ? Ok(new JsonArray(Epics.Where(e => e.ProjectId == Id(arguments, "projectId")).Select(e => (JsonNode)EpicShape(e)).ToArray()))
+                    : Refusal("not_found", $"Project {arguments["projectId"]} was not found.");
             case "get_epic":
                 return Epics.FirstOrDefault(e => e.Id == Id(arguments, "epicId")) is { } epic
                     ? Ok(EpicShape(epic))
                     : Refusal("not_found", $"Epic {arguments["epicId"]} was not found.");
             case "list_epic_documents":
                 return Epics.FirstOrDefault(e => e.Id == Id(arguments, "epicId")) is { } owner
-                    ? Ok(new JsonArray(owner.Documents.Select(d => (JsonNode)new JsonObject
-                    {
-                        ["id"] = d.Id.ToString(), ["epicId"] = owner.Id.ToString(), ["title"] = d.Title, ["body"] = d.Body,
-                        ["createdAtUtc"] = Stamp(Time.Now), ["updatedAtUtc"] = Stamp(Time.Now),
-                    }).ToArray()))
+                    ? Ok(new JsonArray(owner.Documents.Select(d => (JsonNode)DocumentShape(owner, d)).ToArray()))
                     : Refusal("not_found", $"Epic {arguments["epicId"]} was not found.");
             case "create_work_item":
             {
@@ -263,9 +383,11 @@ public sealed class FakeKanbanBoard
                     ProjectId = project.Id, Title = arguments["title"]!.GetValue<string>(), Type = arguments["type"]!.GetValue<string>(),
                     Status = arguments["status"]?.GetValue<string>() ?? "Backlog", Description = arguments["description"]?.GetValue<string>(),
                     EpicId = arguments["epicId"] is null ? null : Id(arguments, "epicId"), CreatedWith = key is null ? null : (identity.Id, key),
+                    Estimate = arguments["estimate"]?.GetValue<int>(),
                 };
                 if (earlier is null)
                 {
+                    made.Labels.AddRange((arguments["label_list"] as JsonArray ?? []).Select(l => l!.GetValue<string>()));
                     Items.Add(made);
                 }
                 var created = ItemShape(made);
@@ -340,6 +462,7 @@ public sealed class FakeKanbanBoard
                 {
                     item.Status = status.GetValue<string>();
                 }
+                item.Title = arguments["title"]?.GetValue<string>() ?? item.Title;
                 item.Version++;
                 return Ok(ItemShape(item));
             }
@@ -453,6 +576,15 @@ public sealed class FakeKanbanBoard
         return Ok(page);
     }
 
+    /// <summary>An idempotency key the contract takes: none, or 1 to 128 printable ASCII characters without spaces.</summary>
+    private static bool ValidKey(string? key) => key is null || (key.Length is > 0 and <= 128 && key.All(ch => ch is > ' ' and <= '~'));
+
+    private JsonObject DocumentShape(Epic epic, (Guid Id, string Title, string Body) d) => new()
+    {
+        ["id"] = d.Id.ToString(), ["epicId"] = epic.Id.ToString(), ["title"] = d.Title, ["body"] = d.Body,
+        ["createdAtUtc"] = Stamp(Time.Now), ["updatedAtUtc"] = Stamp(Time.Now),
+    };
+
     private static Guid Id(JsonObject arguments, string name) =>
         Guid.TryParse(arguments[name]?.GetValue<string>(), out var id) ? id : Guid.Empty;
 
@@ -460,7 +592,7 @@ public sealed class FakeKanbanBoard
 
     private JsonObject ProjectShape(Project p) => new()
     {
-        ["id"] = p.Id.ToString(), ["name"] = $"Project {p.Key}", ["key"] = p.Key, ["isArchived"] = p.Archived,
+        ["id"] = p.Id.ToString(), ["name"] = p.Name ?? $"Project {p.Key}", ["key"] = p.Key, ["isArchived"] = p.Archived,
         ["createdAtUtc"] = Stamp(Time.Now), ["totalItems"] = Items.Count(i => i.ProjectId == p.Id),
         ["openItems"] = Items.Count(i => i.ProjectId == p.Id && i.Status is not ("Done" or "Closed")),
         ["repository_url"] = p.RepositoryUrl, ["default_branch"] = null,

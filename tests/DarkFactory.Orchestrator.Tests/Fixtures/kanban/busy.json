@@ -1,0 +1,86 @@
+{
+  "recorded_from": "in-repo fake (provisional; re-record against the hosted instance)",
+  "parameters": {
+    "project": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+    "projectKey": "DFFIX843A9540",
+    "item": "7ac6c0a7-4529-497e-8c3c-ff7ce184ac29"
+  },
+  "interactions": [
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "7ac6c0a7-4529-497e-8c3c-ff7ce184ac29"
+      },
+      "isError": false,
+      "answer": {
+        "id": "7ac6c0a7-4529-497e-8c3c-ff7ce184ac29",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "title": "[dark-factory fixture] moved after a busy answer",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Backlog",
+        "priority": "Medium",
+        "order": 15,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 1,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "update_work_item",
+      "arguments": {
+        "itemId": "7ac6c0a7-4529-497e-8c3c-ff7ce184ac29",
+        "status": "Ready",
+        "expected_version": 1
+      },
+      "isError": true,
+      "answer": {
+        "code": "busy",
+        "message": "update_work_item waited 10 seconds for other writers; retry."
+      },
+      "note": "synthetic: a busy refusal authored from the contract's Error shape (docs/mcp-contract.md of KanbanBoard, \"Errors\") by the recording handler, which did not forward this call — the board answers busy only after a write waited 10 s for other writers, which no single caller can provoke on demand. The adapter's resend, next, is the board's own answer."
+    },
+    {
+      "tool": "update_work_item",
+      "arguments": {
+        "itemId": "7ac6c0a7-4529-497e-8c3c-ff7ce184ac29",
+        "status": "Ready",
+        "expected_version": 1
+      },
+      "isError": false,
+      "answer": {
+        "id": "7ac6c0a7-4529-497e-8c3c-ff7ce184ac29",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "title": "[dark-factory fixture] moved after a busy answer",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 15,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 2,
+        "label_list": []
+      }
+    }
+  ]
+}
