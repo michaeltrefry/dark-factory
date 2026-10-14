@@ -106,6 +106,8 @@ public sealed record Plan
     /// plan of several repositories adds a second fenced block (<see cref="Context"/>): the plan's repositories, their merge order,
     /// what this story waits on and the planner's note on how the repositories interact, so the implementer sees them. A changeset
     /// blocker has no relation on the board: that block and the <c>plan</c> checkpoint are where it is written.
+    /// <paramref name="parentRef"/> is the plan item as its board names it (<see cref="WorkStory.BoardRef"/>: <c>sc-12</c>, a Kanban
+    /// item's GUID): the marker is written onto the board, so it never carries a key only the ledger knows (E4).
     /// </summary>
     public IReadOnlyList<ChildItem> Children(string parentRef, RepoRef repo)
     {
@@ -496,15 +498,19 @@ public static class PlannedStory
 {
     private const string Prefix = "<!-- dark-factory:planned-from ";
 
-    /// <summary>The marker of a story planned from <paramref name="parentRef"/> (the plan item, e.g. <c>sc-12</c>).</summary>
+    /// <summary>
+    /// The marker of a story planned from <paramref name="parentRef"/>: the plan item as its board names it (<c>sc-12</c>; a Kanban
+    /// item's GUID, sc-25984).
+    /// </summary>
     public static string Marker(string parentRef) => $"{Prefix}{parentRef} -->";
 
     /// <summary>Whether <paramref name="description"/> carries a marker, anywhere in it.</summary>
     public static bool IsMarked(string? description) => description?.Contains(Prefix, StringComparison.Ordinal) == true;
 
     /// <summary>
-    /// The plan item the first marker in <paramref name="description"/> names (e.g. <c>sc-12</c>), or null when it carries no marker or
-    /// the marker names nothing that looks like an item id. Text anyone may write: only ever shown, never trusted.
+    /// The plan item the first marker in <paramref name="description"/> names (e.g. <c>sc-12</c>, or a GUID), or null when it carries
+    /// no marker or the marker names nothing that looks like an item id (at most <see cref="MaxParentLength"/> letters, digits and
+    /// hyphens). Text anyone may write: only ever shown, never trusted.
     /// </summary>
     public static string? ParentOf(string? description)
     {
@@ -516,8 +522,11 @@ public static class PlannedStory
         var rest = description![(at + Prefix.Length)..];
         var end = rest.IndexOf(" -->", StringComparison.Ordinal);
         var name = end < 0 ? "" : rest[..end];
-        return name.Length is > 0 and <= 32 && name.All(c => char.IsAsciiLetterOrDigit(c) || c == '-') ? name : null;
+        return name.Length is > 0 and <= MaxParentLength && name.All(c => char.IsAsciiLetterOrDigit(c) || c == '-') ? name : null;
     }
+
+    /// <summary>The longest plan item id a marker is read for: a GUID as text.</summary>
+    public const int MaxParentLength = 36;
 }
 
 /// <summary>The label that makes an item a plan item (sc-25870): Intake sends it to Plan instead of Implement.</summary>

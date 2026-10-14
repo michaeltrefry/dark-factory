@@ -25,9 +25,19 @@ public class KanbanSafeWritesTests
     private const string Marker = "dark-factory:test";
     private const string Pr = "https://github.com/acme/widgets/pull/1";
 
-    /// <summary>Every write the typed caller sends, by its tool, on <paramref name="item"/> (a create: in its project).</summary>
-    private static Dictionary<string, Func<KanbanBoard, Task<KanbanWorkItem>>> Writes(FakeKanbanBoard.Item item) => new()
+    /// <summary>
+    /// Every write the typed caller sends, by its tool, on <paramref name="item"/> (a create: in its project; a dependency: on a
+    /// blocker added to the board here).
+    /// </summary>
+    private static Dictionary<string, Func<KanbanBoard, Task<KanbanWorkItem>>> Writes(KanbanWorkSourceTests.Harness h, FakeKanbanBoard.Item item)
     {
+        var blocker = h.Board.AddItem(h.Project, "A blocker", status: "Backlog");
+        return WritesOn(item, blocker);
+    }
+
+    private static Dictionary<string, Func<KanbanBoard, Task<KanbanWorkItem>>> WritesOn(FakeKanbanBoard.Item item, FakeKanbanBoard.Item blocker) => new()
+    {
+        ["add_work_item_dependency"] = b => b.AddDependencyAsync(item.Id, blocker.Id, None),
         ["claim_work_item"] = b => b.ClaimAsync(item.Id, Marker, 60, None),
         ["renew_work_item_claim"] = b => b.RenewClaimAsync(item.Id, Marker, 60, None),
         ["release_work_item_claim"] = b => b.ReleaseClaimAsync(item.Id, Marker, None),
@@ -53,7 +63,7 @@ public class KanbanSafeWritesTests
     {
         Assert.Equal(["scope_denied", "not_found", "conflict", "already_claimed", "cycle", "invalid_argument", "busy"], KanbanException.Codes);
         var h = new KanbanWorkSourceTests.Harness();
-        Assert.Equal(KanbanBoard.WriteTools.Order(), Writes(h.Board.AddItem(h.Project, "x")).Keys.Order());
+        Assert.Equal(KanbanBoard.WriteTools.Order(), Writes(h, h.Board.AddItem(h.Project, "x")).Keys.Order());
         Assert.Equal((4, 1, 3), (KanbanBoard.MaxBusyRetries, KanbanBoard.MaxRepeatsAfterLostAnswer, KanbanWorkSource.MaxConflictRereads));
     }
 
@@ -68,7 +78,7 @@ public class KanbanSafeWritesTests
     {
         var h = new KanbanWorkSourceTests.Harness();
         var item = h.Board.AddItem(h.Project, "Count words");
-        foreach (var (tool, write) in Writes(item))
+        foreach (var (tool, write) in Writes(h, item))
         {
             h.Board.Calls.Clear();
             h.Board.Instead = (t, _) => t == tool ? FakeKanbanBoard.Refusal(code, $"refused: {code}") : null;
@@ -102,7 +112,7 @@ public class KanbanSafeWritesTests
         var h = new KanbanWorkSourceTests.Harness();
         var item = h.Board.AddItem(h.Project, "Count words");
         // The claim first, so renew and release have one to act on.
-        foreach (var (tool, write) in Writes(item))
+        foreach (var (tool, write) in Writes(h, item))
         {
             h.Board.Calls.Clear();
             h.Waits.Clear();
@@ -119,6 +129,7 @@ public class KanbanSafeWritesTests
         Assert.Equal(("InProgress", 2L, 1, 1), (item.Status, item.Version, item.Comments.Count, item.Links.Count));
         Assert.Null(item.Claim);
         Assert.Single(h.Board.Items, i => i.Title == "A child");
+        Assert.Equal("A blocker", Assert.Single(item.Blockers).Title);
     }
 
     [Fact]

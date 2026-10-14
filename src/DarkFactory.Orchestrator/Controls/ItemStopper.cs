@@ -319,8 +319,11 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
             : $"{id} stopped: Cancelled, PRs drafted: {drafted}, claim released." + (plan is null ? "" : $" {Stories(plan)}");
     }
 
-    /// <summary>What became of a stopped plan's stories, as its comment and the stop's result say it (ids only).</summary>
-    private static string Stories(PlanStop plan)
+    /// <summary>
+    /// What became of a stopped plan's stories, as its comment and the stop's result say it (ids only; a shelved story in the
+    /// board's own word, <see cref="IWorkSource.Shelved"/>: archived on Shortcut, Closed on Kanban).
+    /// </summary>
+    private string Stories(PlanStop plan)
     {
         static string List(List<string> ids) => ids.Count == 0 ? "none" : string.Join(", ", ids);
         static string Some(string what, List<string> ids) => ids.Count == 0 ? "" : $"{what}: {List(ids)}. ";
@@ -328,7 +331,7 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
             + Some("Released but never started (moved back to the backlog; the factory did no work on them)", plan.Returned)
             + $"Already merged (left as they are): {List(plan.Merged)}. "
             + Some("Merged outside the factory (left as they are: their change is on the base branch)", plan.MergedOutside)
-            + Some("Taken, finished or archived by someone else since their release (left as they are)", plan.Left)
+            + Some($"Taken, finished or {source.Shelved.Is} by someone else since their release (left as they are)", plan.Left)
             + $"Never started (left in the backlog; the factory will not release or start them): {List(plan.Unstarted)}.";
     }
 }

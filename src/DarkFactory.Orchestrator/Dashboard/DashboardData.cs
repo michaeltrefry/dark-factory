@@ -51,7 +51,8 @@ public sealed record PipelineRow(
 /// </summary>
 /// <param name="Hold">What a failed story holds, as the plan item records it (<see cref="PlanRelease.HeldByFailed"/>); null when none is failed.</param>
 /// <param name="LastHeld">The plan item's newest <c>plan-held</c> row that names something else (a blocker outside the plan, an archived
-/// story, …), with when it was recorded: such a hold has no record of its end, so it is shown as the last one recorded.</param>
+/// story, …), with when it was recorded: such a hold has no record of its end, so it is shown as the last one recorded. A lost
+/// claim (<c>claim lost: …</c>, sc-25984) does have one (<c>plan-claim-regained</c>) and is shown only until then.</param>
 /// <param name="FailedNotices">How often the plan item's comment for its latest hold by a failed story (or its lifting) was tried and
 /// refused by the board (its <c>plan-notice</c> rows since that record); 0 once it is posted, or when there is none to post.</param>
 /// <param name="Changesets">A plan of several repositories (sc-25873): where each repository's changeset stands, in merge order
@@ -261,7 +262,7 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
 
     private static readonly string[] PlanSteps =
         [RunPipeline.Steps.Plan, RunPipeline.Steps.PlanStories, RunPipeline.Steps.PlanReleased, RunPipeline.Steps.PlanHeld,
-            RunPipeline.Steps.PlanStuck, RunPipeline.Steps.PlanResumed, RunPipeline.Steps.PlanNotice,
+            RunPipeline.Steps.PlanStuck, RunPipeline.Steps.PlanResumed, RunPipeline.Steps.PlanClaimRegained, RunPipeline.Steps.PlanNotice,
             // What its changesets' states are read from (sc-25873).
             RunPipeline.Steps.Changeset, RunPipeline.Steps.ChangesetPushed, RunPipeline.Steps.ChangesetDelivered, RunPipeline.Steps.ChangesetEmpty,
             RunPipeline.Steps.Linked];
@@ -317,8 +318,11 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
             var status = PlanRelease.Classify(ofPlan, released, Blockers,
                 id => known.TryGetValue(id, out var story) ? transitions[story.Id].ToList() : null,
                 changesetStories: blocker => repos?.StoriesIn(PlanRelease.RepoOfChangesetBlocker(blocker)) ?? []);
+            // A lost claim that is the factory's again (sc-25984) holds nothing any more.
+            var claimLost = RunPipeline.PlanClaimLost(since);
             var lastHeld = since.LastOrDefault(e => e.Step == RunPipeline.Steps.PlanHeld
-                && e.Detail?.StartsWith(PlanRelease.FailedPrefix, StringComparison.Ordinal) != true);
+                && e.Detail?.StartsWith(PlanRelease.FailedPrefix, StringComparison.Ordinal) != true
+                && (claimLost is not null || !RunPipeline.IsClaimLost(e.Detail)));
             // The comment for the latest hold by a failed story (or its lifting): tried and refused so far, unless it was posted since.
             var notices = since.Skip(since.FindLastIndex(RunPipeline.IsFailedHoldRow) + 1).Where(e => e.Step == RunPipeline.Steps.PlanNotice).ToList();
             var failedNotices = since.Any(RunPipeline.IsFailedHoldRow) && !notices.Any(n => n.Detail == RunPipeline.Posted) ? notices.Count : 0;

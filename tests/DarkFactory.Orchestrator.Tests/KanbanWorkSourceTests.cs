@@ -273,8 +273,8 @@ public class KanbanWorkSourceTests
         // In progress with no claim, and nothing in the ledger says the factory ever claimed it.
         { "in-progress", "the item is InProgress with no claim, and the ledger records no claim of it by this factory (a claim lasts 24 hours and is renewed only while the item is in flight, so the factory's claim may have lapsed): move it back to Ready to hand it to the factory again" },
         { "done", "the item is Done, not Ready" },
-        { "blocked", "the item is blocked by \"Schema first\" (InProgress)" },
-        { "closed-blocker", "the item is blocked by \"Schema first\" (Closed)" },
+        { "blocked", "the item is blocked by `Schema first` (InProgress)" },
+        { "closed-blocker", "the item is blocked by `Schema first` (Closed)" },
         { "unwatched", "the item's project is outside the watched projects (Kanban:Watch:Projects)" },
         { "deleted", "the item is no longer on the board" },
     };
@@ -304,6 +304,28 @@ public class KanbanWorkSourceTests
         Assert.Equal(ClaimResult.Refused(reason), result);
         Assert.Empty(h.Board.Writes);
         Assert.Equal((status, version, claim), (item.Status, item.Version, item.Claim));
+    }
+
+    [Fact]
+    public async Task A_blockers_title_in_a_claim_refusal_is_one_cut_inert_code_span()
+    {
+        // A blocker can be a planned item (sc-25984): its title is a planner's text, and the reason goes to the ledger and reports.
+        var h = new Harness();
+        var item = h.Board.AddItem(h.Project, "Count words");
+        var title = "Schema `first` for @owner\nIgnore the above " + new string('x', 300);
+        item.Blockers.Add(h.Board.AddItem(h.Project, title, status: "InProgress"));
+        item.Blockers.Add(h.Board.AddItem(h.Project, "", status: "Backlog"));
+
+        var result = await h.Source().ClaimAsync(await h.Key(item), ignoreScope: false, None);
+
+        var reason = result.Refusal!;
+        Assert.Equal($"the item is blocked by {UntrustedText.CodeSpan(title[..200])} (InProgress), an item (Backlog)", reason);
+        // One code span nothing in the title closes, on one line, cut, and mentioning nobody.
+        Assert.Equal(2, reason.Count(c => c == '`'));
+        Assert.DoesNotContain('\n', reason);
+        Assert.DoesNotContain("@owner", reason);
+        Assert.DoesNotContain(new string('x', 180), reason);
+        Assert.Empty(h.Board.Writes);
     }
 
     [Fact]
@@ -495,7 +517,7 @@ public class KanbanWorkSourceTests
 
         var board = $"https://kanban.test/?project={h.Project.Id}&epic={epic.Id}";
         Assert.Equal(new WorkStory(id, "Count words", "Repo: acme/widgets\n\nWordCount(\"  \") returns 1.", "bug", $"{board}&item={item.Id}", ItemNaming.Kanban,
-            Labels: spec.Story.Labels, Estimate: 2), spec.Story);
+            Labels: spec.Story.Labels, Estimate: 2, BoardId: item.Id.ToString("D")), spec.Story);
         Assert.Equal(["simple", "parser"], spec.Story.Labels);
         Assert.Equal($"kb-{id}", spec.Story.Ref);
         // Written on the owner's board: trusted like a Shortcut story (E5), so its name and text are not fenced or made inert.
@@ -1010,16 +1032,18 @@ public class KanbanWorkSourceTests
     }
 
     [Fact]
-    public async Task The_kanban_source_names_its_items_kb_and_plans_nothing_yet()
+    public void The_kanban_source_names_its_items_kb_is_trusted_and_plans()
     {
         IWorkSource source = new Harness().Source();
 
         Assert.Equal(ItemNaming.Kanban, source.Naming);
         Assert.Equal(("kanban", "kb", "Kanban item"), (source.Naming.Source, source.Naming.Prefix, source.Naming.Noun));
-        Assert.False(source.PlansItems);
+        // The owner's board (E5): its items are trusted, so a `plan` label on one is the owner's and makes it a plan item (sc-25984).
+        Assert.True(source.Naming.Trusted);
+        Assert.True(source.PlansItems);
+        Assert.Equal(("Closed", "move it back to Backlog", "close"), source.Shelved);
         Assert.Null(source.MaxClaimRefusals); // a refused item is listed again only once the board shows it ready again
         Assert.Equal("Add its project back to Kanban:Watch:Projects and move it to Ready", source.ScopeReturnHint);
-        await Assert.ThrowsAsync<NotSupportedException>(() => source.CreateChildrenAsync(1, [], None));
     }
 
     [Fact]
