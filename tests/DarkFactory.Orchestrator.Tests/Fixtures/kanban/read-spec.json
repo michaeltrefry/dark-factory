@@ -1,0 +1,165 @@
+{
+  "recorded_from": "in-repo fake (provisional; re-record against the hosted instance)",
+  "parameters": {
+    "project": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+    "projectKey": "DFFIX843A9540",
+    "epic": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+    "inEpic": "24ba5e12-8070-439a-8da8-6a6784354628",
+    "plain": "5a219205-961f-408a-9ceb-f5e4cc2c17d3"
+  },
+  "interactions": [
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "24ba5e12-8070-439a-8da8-6a6784354628"
+      },
+      "isError": false,
+      "answer": {
+        "id": "24ba5e12-8070-439a-8da8-6a6784354628",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "epic": {
+          "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "name": "[dark-factory fixture] epic"
+        },
+        "title": "[dark-factory fixture] item in an epic",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Story",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 7,
+        "estimate": 2,
+        "labels": "simple",
+        "comments": [],
+        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 1,
+        "label_list": [
+          "simple"
+        ]
+      }
+    },
+    {
+      "tool": "list_projects",
+      "arguments": {},
+      "isError": false,
+      "answer": [
+        {
+          "id": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+          "name": "[dark-factory fixture] contract recording",
+          "key": "DFFIX843A9540",
+          "isArchived": false,
+          "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
+          "totalItems": 9,
+          "openItems": 9,
+          "repository_url": "https://github.com/michaeltrefry/dark-factory-sandbox.git",
+          "default_branch": null
+        }
+      ]
+    },
+    {
+      "tool": "get_epic",
+      "arguments": {
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "name": "[dark-factory fixture] epic",
+        "description": "Objective: record what the dark-factory adapter asks of KanbanBoard.",
+        "isArchived": false,
+        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00"
+      }
+    },
+    {
+      "tool": "list_epic_documents",
+      "arguments": {
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417"
+      },
+      "isError": false,
+      "answer": [
+        {
+          "id": "9dd5da92-e5cf-4673-baa6-592126f3f646",
+          "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+          "title": "[dark-factory fixture] spec",
+          "body": "# Spec\n\n## Work sources\n\nShortcut and KanbanBoard plug in through one adapter interface.",
+          "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
+          "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00"
+        }
+      ]
+    },
+    {
+      "tool": "get_work_item",
+      "arguments": {
+        "itemId": "5a219205-961f-408a-9ceb-f5e4cc2c17d3"
+      },
+      "isError": false,
+      "answer": {
+        "id": "5a219205-961f-408a-9ceb-f5e4cc2c17d3",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "title": "[dark-factory fixture] item without an epic",
+        "description": "Throwaway item of the dark-factory Kanban contract fixtures.",
+        "type": "Task",
+        "status": "Ready",
+        "priority": "Medium",
+        "order": 8,
+        "estimate": null,
+        "comments": [],
+        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "claimant": null,
+        "claimant_id": null,
+        "claim_marker": null,
+        "claim_expires_at_utc": null,
+        "blockers": [],
+        "dependents": [],
+        "links": [],
+        "version": 1,
+        "label_list": []
+      }
+    },
+    {
+      "tool": "list_projects",
+      "arguments": {},
+      "isError": false,
+      "answer": [
+        {
+          "id": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+          "name": "[dark-factory fixture] contract recording",
+          "key": "DFFIX843A9540",
+          "isArchived": false,
+          "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
+          "totalItems": 9,
+          "openItems": 9,
+          "repository_url": "https://github.com/michaeltrefry/dark-factory-sandbox.git",
+          "default_branch": null
+        }
+      ]
+    },
+    {
+      "tool": "get_epic",
+      "arguments": {
+        "epicId": "ed936a38-c7e8-41a9-8965-28a997ca6417"
+      },
+      "isError": false,
+      "answer": {
+        "id": "ed936a38-c7e8-41a9-8965-28a997ca6417",
+        "projectId": "630e703a-23ad-4158-8f34-b2fd779d9c5f",
+        "name": "[dark-factory fixture] epic",
+        "description": "Objective: record what the dark-factory adapter asks of KanbanBoard.",
+        "isArchived": false,
+        "createdAtUtc": "2026-10-13T12:00:00.000000+00:00",
+        "updatedAtUtc": "2026-10-13T12:00:00.000000+00:00"
+      }
+    }
+  ]
+}
