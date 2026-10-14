@@ -624,7 +624,7 @@ public class WorkerSandboxTests
         var (exitCode, stderr) = await RunHelperAsync([Path.Combine(_dir, "no-such-program")], "\n", closeStdin: false);
 
         Assert.Equal(127, exitCode);
-        Assert.Contains("no-such-program: No such file or directory", stderr);
+        Assert.Matches("no-such-program.?: No such file or directory", stderr); // GNU env quotes the name
     }
 
     [Fact]
