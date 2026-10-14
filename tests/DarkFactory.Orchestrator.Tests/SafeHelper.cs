@@ -157,6 +157,17 @@ internal sealed class SafeHelper
     /// <summary>Whether the production helper's text contains <paramref name="value"/> (for assertions about it).</summary>
     public static bool SourceContains(string value) => Source.Contains(value, StringComparison.Ordinal);
 
+    /// <summary>Whether the production helper's text has <paramref name="value"/> anywhere after its one <paramref name="marker"/>.</summary>
+    public static bool SourceContainsAfter(string marker, string value)
+    {
+        var source = Source;
+        Assert.Equal(1, Count(source, marker));
+        return source[(source.IndexOf(marker, StringComparison.Ordinal) + marker.Length)..].Contains(value, StringComparison.Ordinal);
+    }
+
+    /// <summary>How many times the production helper's text has <paramref name="value"/>.</summary>
+    public static int SourceCount(string value) => Count(Source, value);
+
     /// <summary>Records a process the test made (outside the helper's tree) as one the seam may kill, with its start time.</summary>
     public static void Register(string registry, OwnProcess process) =>
         File.AppendAllText(registry, $"{process.Pid}|{process.Start}\n");
@@ -275,7 +286,13 @@ internal sealed class SafeHelper
                     esac
                 done < <(__seam_classify "$@")
                 if [ "$refused" -ne 0 ]; then
-                    echo "factory-worker-launch test seam: refusing to signal a process that is not the test's own" >&2
+                    # The helper's real stderr is fd 3 once it has launched its worker (its own is /dev/null from then on);
+                    # the watcher has neither.
+                    if { : >&3; } 2>/dev/null; then
+                        echo "factory-worker-launch test seam: refusing to signal a process that is not the test's own" >&3
+                    else
+                        echo "factory-worker-launch test seam: refusing to signal a process that is not the test's own" >&2
+                    fi
                     exit 99
                 fi
                 [ ${#kills[@]} -gt 0 ] || return 1
