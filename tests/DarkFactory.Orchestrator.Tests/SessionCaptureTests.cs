@@ -505,10 +505,7 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         lastJoined.SetResult();
         var total = await writer.WaitAsync(TimeSpan.FromSeconds(30));
 
-        foreach (var viewer in new[] { early, middle, late })
-        {
-            await WaitUntilAsync(() => Task.FromResult(viewer.Received.Count >= total));
-        }
+        await WaitForEveryEventAsync([early, middle, late], total);
         await Task.Delay(300); // nothing may arrive twice
         foreach (var viewer in new[] { early, middle, late })
         {
@@ -658,10 +655,40 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         }
     }
 
+    /// <summary>
+    /// Waits until every viewer has <paramref name="total"/> events. Fails at once when the hub disconnected one (it would never
+    /// get the rest), and when no viewer has received an event for 15 s (a notification that was missed: nothing more would come);
+    /// not on a fixed deadline, since how far behind the viewers are when the writer stops depends on how loaded the machine is.
+    /// </summary>
+    private static async Task WaitForEveryEventAsync(IReadOnlyList<Viewer> viewers, int total)
+    {
+        string Counts() => string.Join(", ", viewers.Select(v => v.Received.Count)) + $" of {total}";
+        var seen = Counts();
+        var progressed = DateTime.UtcNow;
+        while (viewers.Any(v => v.Received.Count < total))
+        {
+            for (var i = 0; i < viewers.Count; i++)
+            {
+                Assert.True(viewers[i].Disconnected is null, $"viewer {i} was disconnected by the hub ({viewers[i].Disconnected}): {Counts()} events");
+            }
+            if (Counts() is var now && now != seen)
+            {
+                (seen, progressed) = (now, DateTime.UtcNow);
+            }
+            Assert.True(DateTime.UtcNow - progressed < TimeSpan.FromSeconds(15), $"no viewer received an event for 15 s: {seen} events");
+            await Task.Delay(20);
+        }
+    }
+
     private sealed class Viewer : IAsyncDisposable
     {
         public required HubConnection Connection { get; init; }
         public ConcurrentQueue<(SessionEventMessage Event, TimeSpan At)> Received { get; } = new();
+
+        /// <summary>Why the connection closed while the test was still watching (null while open, or once the test closed it).</summary>
+        public string? Disconnected { get; private set; }
+
+        private bool _disposing;
 
         public static async Task<Viewer> JoinAsync(WebApplication app, CookieContainer cookies, string sessionId, Stopwatch? clock = null)
         {
@@ -675,12 +702,24 @@ public sealed class SessionCaptureTests : IAsyncLifetime
                     viewer.Received.Enqueue((e, clock.Elapsed));
                 }
             });
+            viewer.Connection.Closed += ex =>
+            {
+                if (!viewer._disposing)
+                {
+                    viewer.Disconnected = ex?.Message ?? "closed by the server";
+                }
+                return Task.CompletedTask;
+            };
             await viewer.Connection.StartAsync();
             await viewer.Connection.InvokeAsync("JoinSession", sessionId);
             return viewer;
         }
 
-        public ValueTask DisposeAsync() => Connection.DisposeAsync();
+        public ValueTask DisposeAsync()
+        {
+            _disposing = true;
+            return Connection.DisposeAsync();
+        }
     }
 
     private sealed class FakeCosts(params SessionCost?[] answers) : ISessionCostSource
