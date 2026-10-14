@@ -871,7 +871,9 @@ public sealed class GatewayLintTests
         var requests = new System.Collections.Concurrent.ConcurrentQueue<string>();
         var server = Task.Run(async () =>
         {
-            while (!stop.IsCancellationRequested)
+            // Ended only by the cancelled accept (an OperationCanceledException): a loop that checked the token itself could
+            // end normally, when the cancel lands between a request and the next accept.
+            while (true)
             {
                 using var client = await listener.AcceptTcpClientAsync(stop.Token);
                 await using var stream = client.GetStream();
