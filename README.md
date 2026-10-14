@@ -259,10 +259,16 @@ killing every `_factory` process, so close `_factory` sessions and stop `factory
   for itself: its own uid, home, Claude Code, deny entry on your home, read entry on the work root, its own copy of the helper
   (`factory-worker-launch-2`, …, pinned to its own user and uid, so it sweeps only that user's processes) and its own sudoers
   line (that helper, as that user only). With `Worker__Slots=<n>` the factory runs one worker phase per slot side by side,
-  each under its own lock file (`.factory-run-2.lock`, …). An item keeps the slot its first worker phase took (recorded in the
+  each under its own lock file (`slot-locks/.factory-run-2.lock`, …, in a directory the factory closes to every sandbox user). An item keeps the slot its first worker phase took (recorded in the
   ledger): its session, its fix rounds, the gate's test runs and its worktrees are that user's, and it waits for that slot
   even if another is free. A worktree is shared for writing with its item's slot's user only; sandbox users can read each
   other's worktrees. Without `--slots` and `Worker__Slots` nothing changes: one user, one helper, one lock.
+  Lowering the count: re-run setup with the smaller `--slots` (it removes the higher slots' sudoers lines and installed
+  helpers and names the accounts it leaves) and lower `Worker__Slots` to match — a larger `Worker__Slots` fails start-up. An
+  item already worked in a removed slot escalates saying so when it next needs a worker: raise both again and re-run it, or
+  stop it (`factory stop --item <id>`). The factory runs and deletes nothing as a user it no longer has: such an item's
+  worktree (and a worker a crashed run left) stays, reported as `[cleanup] leaving <path>: …`, until the count is raised
+  again or you remove it as root.
 - **`/opt/dark-factory/work`**: the work root (clones + worktrees), owned by you under a root-owned
   parent, readable by `_factory` (an inheritable ACL on the work root itself, never applied recursively).
   Each worktree directory is created empty and shared first (an inheritable read/write ACL for you and

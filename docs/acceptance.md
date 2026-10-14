@@ -9,7 +9,7 @@ opt-in: the tests skip, naming the missing prerequisite, unless their gate varia
   (`_factory2`, …; `Worker:Slots`, sc-25989). Every exit of a sandbox launch helper kills *every* process of its user.
   Do not use an interactive `_factory` session (e.g. its Claude login) while any live test below runs.
 - **Stop your own `factory work` / `factory run` first.** The `factory work` tests (AT2–AT5) hold the configured
-  work root's sandbox lock (`<Factory:WorkRoot>/.factory-run.lock`, and `.factory-run-<n>.lock` of every further slot) for
+  work root's sandbox lock (`<Factory:WorkRoot>/.factory-run.lock`, and `slot-locks/.factory-run-<n>.lock` of every further slot) for
   their whole run and skip if a real run's worker
   phase holds one at that moment, so they never share a sandbox user with one (a real run started meanwhile waits at its
   worker phases, sc-25988). They run against a **throwaway ledger database**

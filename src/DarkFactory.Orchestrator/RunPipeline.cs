@@ -234,9 +234,40 @@ public sealed partial class RunPipeline(
             ? slot
             : throw new Worker.SlotUnavailableException(
                 $"{item.ExternalId} was started in worker slot {slot} ({Worker.WorkerSlots.UserOf(_slots.All[0].User, slot)}), but Worker:Slots is "
-                + $"{_slots.Count}: its session and worktree are that sandbox user's, and nothing of it is run as another. Set Worker:Slots to at "
-                + $"least {slot} again and re-run it, or stop it.");
+                + $"{_slots.Count}: its session and worktree are that sandbox user's, and nothing of it is run or deleted as another. Set Worker:Slots to at "
+                + $"least {slot} again (with that user set up: `{Worker.WorkerSlots.ReinstallCommand(slot)}`) and re-run it: it then goes on in slot {slot}. "
+                + $"A re-run without that fails again with this reason, running nothing. Or stop it (`factory stop --item {item.ExternalId}`): it is cancelled, "
+                + "and whatever it left as that user stays on this machine — its worktree, and a worker a crashed run left, which is not stopped.");
     }
+
+    /// <summary>
+    /// For a stop (<see cref="StopIdleAsync"/>): whether <paramref name="item"/>'s recorded slot is no longer configured
+    /// (<c>Worker:Slots</c> was lowered). Then nothing of it is run or deleted as another user — a worker a crashed run left
+    /// (<paramref name="orphan"/>: its pid) is not stopped, its worktree is not touched — and that is put on the record
+    /// (<see cref="Steps.SlotLeft"/>, once per wording) so the stop goes on to Cancelled and its comment says what stays.
+    /// </summary>
+    private async Task<bool> SlotLeftAsync(WorkItem item, List<LedgerEntry> history, int? orphan, CancellationToken ct)
+    {
+        if (_slots is null || SlotOf(history) is not { } slot || slot <= _slots.Count)
+        {
+            return false;
+        }
+        var detail = SlotLeftDetail(slot, Worker.WorkerSlots.UserOf(_slots.All[0].User, slot), _slots.Count, orphan);
+        if (history.LastOrDefault(e => e.Step == Steps.SlotLeft)?.Detail != detail)
+        {
+            await ledger.CheckpointAsync(item, Steps.SlotLeft, null, detail, ct);
+        }
+        log.WriteLine($"[stopping] {item.ExternalId}: {detail}");
+        return true;
+    }
+
+    /// <summary>What a stop leaves of an item of worker slot <paramref name="slot"/> (<paramref name="user"/>) that is not configured (<see cref="Steps.SlotLeft"/>'s Detail, and the stop comment's last sentences).</summary>
+    internal static string SlotLeftDetail(int slot, string user, int slots, int? orphan) =>
+        $"It was worked in worker slot {slot} ({user}), which is not one of this factory's (Worker:Slots is {slots}), so the stop ran and deleted "
+        + $"nothing as that user: its worktree stays on this machine"
+        + (orphan is { } pid ? $", and the worker a crashed run left (pid {pid}) was NOT stopped and may still be running" : "")
+        + $". Remove them by hand as root, or set Worker:Slots to at least {slot} again: the next worker phase in that slot ends every process of {user} "
+        + "and its worktree sweep deletes the worktree.";
 
     /// <summary>Records <paramref name="slot"/> as <paramref name="item"/>'s (<see cref="Steps.Slot"/>); a one-slot factory writes no row.</summary>
     private async Task RecordSlotAsync(WorkItem item, Worker.WorkerSlot slot, CancellationToken ct)
@@ -334,6 +365,12 @@ public sealed partial class RunPipeline(
         /// for that slot (<see cref="SlotOf"/>). A one-slot factory writes none.
         /// </summary>
         public const string Slot = "slot";
+        /// <summary>
+        /// A stop found the item's recorded slot no longer configured (sc-25989: <c>Worker:Slots</c> was lowered), so it stopped no
+        /// leftover worker and removed no worktree — nothing is run or deleted as another user; Detail (<see cref="SlotLeftDetail"/>)
+        /// says what stays on the machine, and the stop comment repeats it. The stop itself goes on to Cancelled. Outcome failed.
+        /// </summary>
+        public const string SlotLeft = "slot-left";
         public const string Session = "session";
         public const string WorkerDone = "worker-done";
         public const string Pushed = "pushed";
@@ -1674,7 +1711,9 @@ public sealed partial class RunPipeline(
             {
                 return true;
             }
-            log.WriteLine($"[cleanup] the sandbox user is busy (another run's worker phase); leaving {workspace.Path} for the next worker phase's sweep");
+            log.WriteLine(Worker.WorkerSlots.LeftForeign(workspace.Path) is { } foreign
+                ? Worker.WorkerSlots.LeftReport(workspace.Path, foreign)
+                : $"[cleanup] the sandbox user is busy (another run's worker phase); leaving {workspace.Path} for the next worker phase's sweep");
             return false;
         }
         catch (Exception ex)
@@ -1799,6 +1838,12 @@ public sealed partial class RunPipeline(
         {
             var history = await ledger.HistoryAsync(item, ct);
             var attempt = CurrentWorkerAttempt(history);
+            // An item of a slot that is no longer configured (sc-25989) is still stopped — "stop it" is the remedy its failure
+            // names — but with nothing run or deleted as another user: no helper for its leftover worker, its worktree untouched.
+            if (await SlotLeftAsync(item, history, OrphanedWorkerPid(attempt), ct))
+            {
+                return await FinishStopAsync(item, storyId, repo, null, workerStillRunning: false);
+            }
             // Sandboxed, the stop of a leftover worker is a run of the launch helper (it kills every process of the sandbox user):
             // a worker phase, waited for, so it never lands under another run's worker.
             if (OrphanedWorkerPid(attempt) is { } pid

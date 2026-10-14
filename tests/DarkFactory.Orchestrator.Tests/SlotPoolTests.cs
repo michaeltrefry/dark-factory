@@ -41,7 +41,10 @@ public class SlotPoolTests
 
         Assert.Equal(["_factory", "_factory2", "_factory3"], pool.All.Select(s => s.User));
         Assert.Equal(["/opt/h/launch", "/opt/h/launch-2", "/opt/h/launch-3"], pool.All.Select(s => s.Sandbox.HelperPath));
-        Assert.Equal([".factory-run.lock", ".factory-run-2.lock", ".factory-run-3.lock"], pool.All.Select(s => Path.GetFileName(s.Lock!.Path)));
+        // Slot 1's lock is the file it was before slots, in the work root; the others' are in a directory of their own, which
+        // the pool closes to every sandbox user.
+        Assert.Equal([Path.Combine(_root, ".factory-run.lock"), Path.Combine(_root, "slot-locks", ".factory-run-2.lock"), Path.Combine(_root, "slot-locks", ".factory-run-3.lock")],
+            pool.All.Select(s => s.Lock!.Path));
         Assert.Equal(WorkerLock.For(_root), pool.All[0].Lock);
         Assert.All(pool.All, s => Assert.Equal("sudo scripts/setup-worker-user.sh --slots 3", s.Sandbox.Reinstall));
         // One slot: exactly the sandbox before slots, the setup command included.
@@ -62,6 +65,9 @@ public class SlotPoolTests
         Assert.Throws<ArgumentException>(() => new WorkerSlots([Slot(1, "_a", "/h1", 1), new WorkerSlot(2, new WorkerSandbox("_b", "/h2"))]));
         Assert.Throws<ArgumentException>(() => new WorkerSlots([Slot(2, "_a", "/h1", 1)]));
         Assert.Throws<ArgumentException>(() => WorkerSlots.Create("_a", "/h", _root, WorkerSlots.MaxSlots + 1));
+        // A slot above 1 never keeps its lock beside slot 1's: that directory is open to every sandbox user.
+        Assert.Throws<ArgumentException>(() => new WorkerSlots([Slot(1, "_a", "/h1", 1),
+            new WorkerSlot(2, new WorkerSandbox("_b", "/h2") { Lock = new WorkerLock(Path.Combine(_root, ".factory-run-2.lock")) })]));
         _ = new WorkerSlots([Slot(1, "_a", "/h1", 1), Slot(2, "_b", "/h2", 2)]);
     }
 
@@ -182,15 +188,18 @@ public class SlotPoolTests
         Assert.Null(pool.SharedWith("/wt", ReadOnlyListing));
         Assert.Null(pool.SharedWith("/wt", "drwx------  3 owner  staff  96 Oct 13 12:00 /wt\n"));
         // Fails closed: a user above Worker:Slots, or two slots' users, is never deleted as "some" slot's user.
-        var above = Assert.Throws<InvalidOperationException>(() => pool.SharedWith("/wt", SharedListing("_dftest3")));
+        var above = Assert.Throws<ForeignWriterException>(() => pool.SharedWith("/wt", SharedListing("_dftest3")));
+        Assert.Equal("/wt", above.Path);
         Assert.Contains("/wt is shared for writing with user:_dftest3, not with one of this factory's 2 sandbox users (_dftest, _dftest2)", above.Message);
-        Assert.Contains("raise Worker:Slots", above.Message);
-        Assert.Throws<InvalidOperationException>(() => pool.SharedWith("/wt",
+        // Both ways to get rid of it, for the owner.
+        Assert.Contains("set Worker:Slots back so that user is one of this factory's", above.Message);
+        Assert.Contains("remove it by hand as root (`sudo rm -rf -- '/wt'`)", above.Message);
+        Assert.Throws<ForeignWriterException>(() => pool.SharedWith("/wt",
             SharedListing("_dftest") + "\n 4: user:_dftest2 allow list,add_file,search,delete_child"));
         // So is an entry ls could not name (it prints the UUID while the directory service does not answer), and a group's.
-        Assert.Throws<InvalidOperationException>(() => pool.SharedWith("/wt",
+        Assert.Throws<ForeignWriterException>(() => pool.SharedWith("/wt",
             ReadOnlyListing + "\n 2: FFFFEEEE-DDDD-CCCC-BBBB-AAAA000001C3 allow list,add_file,search,delete_child"));
-        Assert.Throws<InvalidOperationException>(() => pool.SharedWith("/wt", ReadOnlyListing + "\n 2: group:staff allow list,add_file"));
+        Assert.Throws<ForeignWriterException>(() => pool.SharedWith("/wt", ReadOnlyListing + "\n 2: group:staff allow list,add_file"));
     }
 
     /// <summary>
@@ -198,7 +207,8 @@ public class SlotPoolTests
     /// current user) behind a fake sudo, and whose ACL reads answer <paramref name="listing"/>: which slot's helper a deletion runs
     /// through, and under which lock.
     /// </summary>
-    private WorkerSlots FakeHelperPool(int count, Func<string, string> listing)
+    private WorkerSlots FakeHelperPool(int count, Func<string, string> listing, Action<string>? report = null,
+        Func<string, CancellationToken, Task>? close = null)
     {
         var sudo = SandboxSupport.FakeSudo(_root);
         return new WorkerSlots([.. Enumerable.Range(1, count).Select(n => new WorkerSlot(n, new WorkerSandbox(TestSlots.Pool(_root, count).All[n - 1].User,
@@ -207,6 +217,9 @@ public class SlotPoolTests
         { Lock = WorkerLock.For(_root, n) }))])
         {
             ListAcl = (path, _) => Task.FromResult(listing(path)),
+            AclRetry = TimeSpan.Zero,
+            Report = report ?? (_ => { }),
+            CloseLocks = close,
         };
     }
 
@@ -282,6 +295,196 @@ public class SlotPoolTests
         await Sweep().WaitAsync(Soon);
         Assert.False(Directory.Exists(leftover));
         Assert.Equal(["2"], HelpersRan); // through slot 2's helper, never slot 1's
+    }
+
+    /// <summary>A leftover worktree under the work root <c>work</c> (where <see cref="GitWorkspace.SweepOrphansAsync"/> looks), holding a file.</summary>
+    private string Leftover(string name)
+    {
+        var path = Directory.CreateDirectory(Path.Combine(_root, "work", GitWorkspace.ItemWorktrees, "o", "r", name)).FullName;
+        File.WriteAllText(Path.Combine(path, "file"), "x");
+        return path;
+    }
+
+    [Fact]
+    public async Task A_sweep_leaves_a_leftover_a_user_outside_the_pool_wrote_says_so_once_and_still_deletes_the_others()
+    {
+        // Worker:Slots was lowered from 3 to 2 with an item of slot 3 on disk: its worktree is _dftest3's, which this factory
+        // runs nothing as. The sweep every run's first worker phase starts with must not fail on it (that would be the whole
+        // factory's failure, every poll): it leaves it, says how to get rid of it, and goes on to the next leftover.
+        var (foreign, own) = (Leftover("factory-sc-8"), Leftover("factory-sc-9"));
+        var reports = new ConcurrentQueue<string>();
+        var pool = FakeHelperPool(2, path => SharedListing(path == foreign ? "_dftest3" : "_dftest2"), reports.Enqueue);
+        var git = new GitWorkspace(Path.Combine(_root, "work"), _ => "unused", (_, _) => Task.FromResult<string?>(null), sandbox: pool);
+        Task Sweep() => pool.HoldAsync(1, async _ =>
+        {
+            await git.SweepOrphansAsync((_, _) => Task.FromResult(false), LiveRuns.None, CancellationToken.None);
+            return true;
+        }, CancellationToken.None);
+
+        await Sweep().WaitAsync(Soon);
+
+        Assert.True(File.Exists(Path.Combine(foreign, "file")), "a directory another user wrote was deleted");
+        Assert.False(Directory.Exists(own)); // the sweep went on
+        Assert.Equal(["2"], HelpersRan); // one helper run, slot 2's, for its own leftover: none for the foreign one
+        var line = Assert.Single(reports);
+        Assert.StartsWith($"[cleanup] leaving {foreign}: it is shared for writing with user:_dftest3, not with one of this factory's 2 sandbox users (_dftest, _dftest2).", line);
+        Assert.Contains("set Worker:Slots back so that user is one of this factory's", line);
+        Assert.Contains($"remove it by hand as root (`sudo rm -rf -- '{foreign}'`)", line);
+        Assert.Equal(line, WorkerSlots.LeftReport(foreign, WorkerSlots.LeftForeign(foreign)!));
+
+        // Every later sweep of this process finds it again: still left, nothing run, and not said again.
+        await Sweep().WaitAsync(Soon);
+        Assert.True(File.Exists(Path.Combine(foreign, "file")));
+        Assert.Equal(["2"], HelpersRan);
+        Assert.Single(reports);
+
+        // A deletion that must happen (an item replacing that very worktree) still fails, typed, deleting nothing.
+        var ex = await Assert.ThrowsAsync<ForeignWriterException>(() => pool.DeleteAsWorkerAsync(foreign, CancellationToken.None));
+        Assert.Equal(foreign, ex.Path);
+        Assert.True(File.Exists(Path.Combine(foreign, "file")));
+        Assert.Equal(["2"], HelpersRan);
+
+        // Worker:Slots raised to 3 again: the same sweep deletes it, as that user, and it is no longer on record as left.
+        var three = FakeHelperPool(3, path => SharedListing(path == foreign ? "_dftest3" : "_dftest2"));
+        var again = new GitWorkspace(Path.Combine(_root, "work"), _ => "unused", (_, _) => Task.FromResult<string?>(null), sandbox: three);
+        await three.HoldAsync(1, async _ =>
+        {
+            await again.SweepOrphansAsync((_, _) => Task.FromResult(false), LiveRuns.None, CancellationToken.None);
+            return true;
+        }, CancellationToken.None).WaitAsync(Soon);
+        Assert.False(Directory.Exists(foreign));
+        Assert.Equal(["2", "3"], HelpersRan);
+        Assert.Null(WorkerSlots.LeftForeign(foreign));
+    }
+
+    [Fact]
+    public async Task A_one_slot_factory_leaves_a_higher_slots_leftover_and_deletes_everything_else_as_before_slots()
+    {
+        // Worker:Slots lowered to 1: slot 1's user could not delete _dftest3's files, and the owner would then walk them.
+        var (foreign, own, odd, unread) = (Leftover("factory-sc-8"), Leftover("factory-sc-9"), NewDirectory("odd"), NewDirectory("unread"));
+        var reports = new ConcurrentQueue<string>();
+        var pool = FakeHelperPool(1, path => path == unread ? throw new InvalidOperationException("no ls -le here")
+            : path == foreign ? SharedListing("_dftest3")
+            : path == odd ? ReadOnlyListing + "\n 2: group:staff allow list,add_file" : SharedListing("_dftest"), reports.Enqueue);
+        var git = new GitWorkspace(Path.Combine(_root, "work"), _ => "unused", (_, _) => Task.FromResult<string?>(null), sandbox: pool);
+
+        await git.SweepOrphansAsync((_, _) => Task.FromResult(false), LiveRuns.None, CancellationToken.None).WaitAsync(Soon);
+
+        Assert.True(File.Exists(Path.Combine(foreign, "file")), "a directory a higher slot's user wrote was deleted");
+        Assert.False(Directory.Exists(own));
+        Assert.Equal(["1"], HelpersRan);
+        Assert.StartsWith($"[cleanup] leaving {foreign}: it is shared for writing with user:_dftest3, a higher worker slot's sandbox user, and Worker:Slots is 1 (_dftest).",
+            Assert.Single(reports));
+        await Assert.ThrowsAsync<ForeignWriterException>(() => pool.DeleteAsWorkerAsync(foreign, CancellationToken.None));
+        Assert.False(await pool.TryDeleteAsWorkerAsync(foreign, CancellationToken.None));
+        Assert.True(File.Exists(Path.Combine(foreign, "file")));
+        Assert.Equal(["1"], HelpersRan);
+        // As before slots (E9): with one slot nothing else about a directory's ACL decides anything, and a listing that
+        // cannot be read judges nothing.
+        Assert.True(await pool.TryDeleteAsWorkerAsync(odd, CancellationToken.None));
+        await pool.DeleteAsWorkerAsync(unread, CancellationToken.None);
+        Assert.False(Directory.Exists(odd) || Directory.Exists(unread));
+        Assert.Equal(["1", "1", "1"], HelpersRan);
+        Assert.Single(reports);
+    }
+
+    // ---- The locks of the slots above 1: in a directory closed to every sandbox user ----
+
+    /// <summary>A pool (of fake helpers) whose lock directory is closed by <paramref name="close"/>; every directory is shared with no slot.</summary>
+    private WorkerSlots ClosingPool(int count, Func<string, CancellationToken, Task> close) => FakeHelperPool(count, _ => ReadOnlyListing, close: close);
+
+    public static TheoryData<string> LockTakers => ["a named slot", "any free slot", "a try", "a deletion", "an assigned slot"];
+
+    [Theory]
+    [MemberData(nameof(LockTakers))]
+    public async Task The_lock_directory_of_the_slots_above_1_is_closed_before_the_pool_takes_any_lock_and_once(string taker)
+    {
+        // A slot's user that can read another slot's lock file can hold its lock (flock works through a read-only descriptor)
+        // and make that slot look busy: the files live in a directory closed to every sandbox user, before any is opened.
+        var closed = new List<(string Directory, bool LockFileThere)>();
+        var slot2 = WorkerLock.For(_root, 2).Path;
+        var pool = ClosingPool(2, (directory, _) =>
+        {
+            closed.Add((directory, File.Exists(slot2)));
+            return Task.CompletedTask;
+        });
+        var phases = 0;
+        Task<bool> Phase(WorkerSlot _)
+        {
+            phases++;
+            return Task.FromResult(true);
+        }
+        Task Take() => taker switch
+        {
+            "a named slot" => pool.HoldAsync(2, Phase, CancellationToken.None),
+            "any free slot" => pool.HoldAsync(null, Phase, CancellationToken.None, order: [2, 1]),
+            "a try" => pool.TryHoldForAsync(Path.Combine(_root, "nothing-there"), Phase, CancellationToken.None),
+            "a deletion" => pool.DeleteAsWorkerAsync(NewDirectory($"deleted-{phases++}"), CancellationToken.None),
+            _ => pool.AssignedAsync(2, () => Phase(pool.All[1])),
+        };
+        Assert.Empty(closed);
+
+        await Take().WaitAsync(Soon);
+        await Take().WaitAsync(Soon);
+
+        Assert.Equal(2, phases);
+        Assert.Equal([(Path.Combine(_root, "slot-locks"), false)], closed); // once, and before slot 2's lock file existed
+        Assert.Equal(Path.Combine(_root, "slot-locks"), Path.GetDirectoryName(slot2));
+        Assert.Equal(_root, Path.GetDirectoryName(pool.All[0].Lock!.Path)); // slot 1's stays where it was (E9), outside it
+    }
+
+    [Fact]
+    public async Task A_lock_directory_that_cannot_be_closed_is_the_factorys_failure_and_no_slot_is_taken()
+    {
+        var pool = ClosingPool(2, (directory, _) => throw new InvalidOperationException($"{directory} is still open to others"));
+        var ran = false;
+        Task<bool> Phase(WorkerSlot _) => Task.FromResult(ran = true);
+
+        var named = await Assert.ThrowsAsync<FactoryUnavailableException>(() => pool.HoldAsync(1, Phase, CancellationToken.None));
+        await Assert.ThrowsAsync<FactoryUnavailableException>(() => pool.HoldAsync(null, Phase, CancellationToken.None));
+        await Assert.ThrowsAsync<FactoryUnavailableException>(() => pool.TryHoldForAsync(Path.Combine(_root, "nothing-there"), Phase, CancellationToken.None));
+        await Assert.ThrowsAsync<FactoryUnavailableException>(() => pool.DeleteAsWorkerAsync(NewDirectory("kept"), CancellationToken.None));
+        await Assert.ThrowsAsync<FactoryUnavailableException>(() => pool.AssignedAsync(2, () => Phase(pool.All[1])));
+
+        Assert.Equal($"the worker slots' locks: {Path.Combine(_root, "slot-locks")} is still open to others", named.Message);
+        Assert.False(ran);
+        Assert.False(File.Exists(WorkerLock.For(_root, 2).Path));
+        Assert.False(File.Exists(WorkerLock.For(_root, 1).Path));
+        Assert.True(Directory.Exists(Path.Combine(_root, "kept")));
+    }
+
+    [Fact]
+    public async Task A_one_slot_pool_has_no_lock_directory_to_close()
+    {
+        var closes = 0;
+        var pool = ClosingPool(1, (_, _) => Task.FromResult(closes++));
+
+        Assert.True(await pool.HoldAsync(null, _ => Task.FromResult(true), CancellationToken.None));
+        Assert.True(await pool.TryHoldForAsync(Path.Combine(_root, "nothing-there"), _ => Task.CompletedTask, CancellationToken.None));
+
+        Assert.Equal(0, closes);
+        Assert.False(Directory.Exists(Path.Combine(_root, "slot-locks")));
+        Assert.True(File.Exists(Path.Combine(_root, WorkerLock.FileName)));
+    }
+
+    [Fact]
+    public async Task The_lock_directory_is_really_closed_on_this_host_with_no_closer_given()
+    {
+        // The production closer (no seam): owner-only afterwards - mode 0700 and, on macOS, no ACL entry at all.
+        var pool = TestSlots.Pool(_root, 2);
+        var directory = Path.Combine(_root, "slot-locks");
+        Directory.CreateDirectory(directory);
+        File.SetUnixFileMode(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+            | UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+
+        Assert.Equal(2, await pool.HoldAsync(2, slot => Task.FromResult(slot.Number), CancellationToken.None));
+
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(directory));
+        if (OperatingSystem.IsMacOS())
+        {
+            Assert.True(WorkerSandbox.IsClosed(await WorkerSandbox.ListAclAsync(directory, CancellationToken.None)));
+        }
+        Assert.True(File.Exists(Path.Combine(directory, ".factory-run-2.lock")));
     }
 
     [Fact]
@@ -662,9 +865,86 @@ public class SlotPoolTests
 
         Assert.Equal(WorkState.Escalated, outcome.State);
         Assert.Contains("sc-77 was started in worker slot 3 (_dftest3), but Worker:Slots is 2", outcome.Error);
-        Assert.Contains("Set Worker:Slots to at least 3 again", outcome.Error);
+        // Both remedies, and what each does.
+        Assert.Contains("Set Worker:Slots to at least 3 again (with that user set up: `sudo scripts/setup-worker-user.sh --slots 3`) and re-run it: it then goes on in slot 3.",
+            outcome.Error);
+        Assert.Contains("A re-run without that fails again with this reason, running nothing.", outcome.Error);
+        Assert.Contains("Or stop it (`factory stop --item sc-77`): it is cancelled, and whatever it left as that user stays on this machine", outcome.Error);
         Assert.Empty(worker.Calls);
         Assert.Empty(probe.Of("IWorker.StopOrphanAsync"));
+
+        // "Re-run it" without raising Worker:Slots: the same failure again, and still nothing run, stopped, deleted or re-recorded
+        // in another slot (it never starts afresh as another user on, or beside, the old worktree).
+        var again = await Pipeline(h, two, probe, worker, TextWriter.Null).RunAsync(77, CancellationToken.None);
+        Assert.Equal((WorkState.Escalated, outcome.Error), (again.State, again.Error));
+        Assert.Empty(worker.Calls);
+        Assert.Empty(probe.Of("IWorker.StopOrphanAsync"));
+        Assert.Empty(probe.Of("IRepoWorkspace.RemoveAsync"));
+        Assert.Equal(["3 _dftest3"], await SlotRows(h));
+
+        // "Set Worker:Slots to at least 3 again and re-run it": it goes on in slot 3, and nowhere else.
+        var raised = new SlotProbe(three);
+        var resumed = await Pipeline(h, three, raised, worker, TextWriter.Null).RunAsync(77, CancellationToken.None);
+        Assert.Equal((WorkState.Review, (string?)null), (resumed.State, resumed.Error));
+        Assert.Equal([3], raised.Of("IWorker.RunAsync"));
+        Assert.Equal(["3 _dftest3"], await SlotRows(h));
+    }
+
+    [Theory]
+    [InlineData(true)] // a run of it crashed with its worker on record
+    [InlineData(false)]
+    public async Task An_item_of_a_slot_no_longer_configured_is_still_stopped_with_nothing_run_or_deleted_as_another_user(bool workerOnRecord)
+    {
+        // The item is worked to Review in slot 3 of 3; its worktree is on disk, shared with slot 3's user.
+        var h = new Harness();
+        h.Workspaces.Root = Path.Combine(_root, "wt");
+        var worktree = Directory.CreateDirectory(Path.Combine(h.Workspaces.Root, "factory", "sc-77")).FullName;
+        WorkerSlots Pool(int count) =>
+            new(TestSlots.Pool(_root, count).All) { ListAcl = (_, _) => Task.FromResult(SharedListing("_dftest3")), AclRetry = TimeSpan.Zero, Report = _ => { } };
+        var three = Pool(3);
+        using (WorkerLock.Acquire(_root, 1))
+        using (WorkerLock.Acquire(_root, 2))
+        {
+            Assert.Equal(WorkState.Review, (await Pipeline(h, three, new SlotProbe(three), new FakeWorker(ReportsModel(ImplementerModel)), TextWriter.Null)
+                .RunAsync(77, CancellationToken.None)).State);
+        }
+        Assert.Equal(["3 _dftest3"], await SlotRows(h));
+        var item = (await h.Ledger.FindAsync(ItemNaming.Shortcut.Source, "sc-77", CancellationToken.None))!;
+        if (workerOnRecord)
+        {
+            await h.Ledger.CheckpointAsync(item, RunPipeline.Steps.WorkerStarted, null, WorkerPid.ToString(), CancellationToken.None);
+        }
+        // Worker:Slots is lowered to 2, and the item is stopped: the remedy its failure names.
+        await h.Controls.SetAsync(ControlScope.Item("sc-77"), ControlState.Stopping, "tester", CancellationToken.None);
+        var two = Pool(2);
+        var probe = new SlotProbe(two);
+        var worker = new FakeWorker(ReportsModel(ImplementerModel)) { OrphanAlive = true };
+        var log = new SyncWriter();
+
+        var outcome = await Pipeline(h, two, probe, worker, log).RunAsync(77, CancellationToken.None).WaitAsync(Soon);
+
+        Assert.Equal((WorkState.Cancelled, (string?)null), (outcome.State, outcome.Error));
+        // Nothing as another user: no helper for the leftover worker (slot 1's or 2's would kill nothing of this item), and
+        // the worktree is neither reopened nor removed.
+        Assert.Empty(worker.OrphanStops);
+        Assert.Empty(probe.Of("IWorker.StopOrphanAsync"));
+        Assert.Empty(probe.Of("IRepoWorkspace.ReopenAsync"));
+        Assert.Empty(probe.Of("IRepoWorkspace.RemoveAsync"));
+        Assert.True(Directory.Exists(worktree));
+        // On the record, typed, and in the stop's comment: what stays on the machine, and how to get rid of it.
+        var detail = RunPipeline.SlotLeftDetail(3, "_dftest3", 2, workerOnRecord ? WorkerPid : null);
+        Assert.StartsWith("It was worked in worker slot 3 (_dftest3), which is not one of this factory's (Worker:Slots is 2), so the stop ran and deleted nothing as that user: "
+            + "its worktree stays on this machine", detail);
+        Assert.Equal(workerOnRecord, detail.Contains($"the worker a crashed run left (pid {WorkerPid}) was NOT stopped and may still be running"));
+        Assert.EndsWith("Remove them by hand as root, or set Worker:Slots to at least 3 again: the next worker phase in that slot ends every process of _dftest3 "
+            + "and its worktree sweep deletes the worktree.", detail);
+        var rows = await h.Ledger.HistoryAsync(item, CancellationToken.None);
+        var row = Assert.Single(rows, e => e.Step == RunPipeline.Steps.SlotLeft);
+        Assert.Equal((detail, StepOutcome.Failed), (row.Detail, row.Outcome));
+        Assert.DoesNotContain(rows, e => e.Step == RunPipeline.Steps.OrphanKilled);
+        Assert.EndsWith($"nothing was merged or deleted. {detail}", Assert.Single(h.Stories.Comments, c => c.Contains("sc-77 was stopped by tester")));
+        Assert.True(log.Logged($"[stopping] sc-77: {detail}"));
+        Assert.Null(await h.Controls.GetAsync(ControlScope.Item("sc-77"), CancellationToken.None));
     }
 
     [Fact]
@@ -733,5 +1013,7 @@ public class SlotPoolTests
         Assert.Equal(2, RunPipeline.SlotOf([Row(RunPipeline.Steps.Slot, "2 _factory2"), Row(RunPipeline.Steps.WorkerStarted, "4242")]));
         Assert.Equal(3, RunPipeline.SlotOf([Row(RunPipeline.Steps.Slot, "2 _factory2"), Row(RunPipeline.Steps.Slot, "3 _factory3")]));
         Assert.Equal(StepOutcome.Passed, StepOutcomes.Of(WorkState.Implement, WorkState.Implement, RunPipeline.Steps.Slot, "2 _factory2"));
+        // A stop that could not stop or remove what an unconfigured slot's user left: the stop goes on, the row says it failed.
+        Assert.Equal(StepOutcome.Failed, StepOutcomes.Of(WorkState.Review, WorkState.Review, RunPipeline.Steps.SlotLeft, RunPipeline.SlotLeftDetail(3, "_factory3", 2, 4242)));
     }
 }

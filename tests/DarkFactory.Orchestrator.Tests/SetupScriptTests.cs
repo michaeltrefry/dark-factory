@@ -169,8 +169,59 @@ public class SetupScriptTests
         Assert.Single(run.Calls, c => c.StartsWith("install ") && c.Contains("factory-worker-launch"));
         Assert.Contains(run.Calls, c => c.StartsWith("install ") && c.EndsWith(" " + WholeScriptRun.HelperPath));
         Assert.Equal([$"owner ALL=(_dftest) NOPASSWD: {WholeScriptRun.HelperPath}"], run.Sudoers.Split('\n').Where(l => l.Contains("NOPASSWD")));
-        Assert.DoesNotContain(run.Calls, c => c.Contains("_dftest2"));
+        // Nothing is set up for a second user (the only mention of it is the read that finds no such account).
+        Assert.DoesNotContain(run.Calls, c => c.Contains("_dftest2") && c != "dscl . -read /Users/_dftest2");
         Assert.DoesNotContain("Worker__Slots", output);
+        Assert.DoesNotContain("No longer set up", output);
+    }
+
+    /// <summary>The removals of installed helpers the run made (the fake <c>rm</c>'s record of every path outside the temp directory).</summary>
+    private static string[] Removals(IEnumerable<string> calls) => [.. calls.Where(c => c.StartsWith("rm "))];
+
+    private static string[] HelperRemovals(int from) =>
+        [.. Enumerable.Range(from, 8 - from + 1).Select(n => $"rm -f -- {WholeScriptRun.HelperPath}-{n}")];
+
+    [Fact]
+    public async Task A_rerun_with_fewer_slots_removes_the_higher_slots_helpers_by_their_exact_paths_and_says_which_users_it_left()
+    {
+        // Left installed, slot 2's helper would still pass the orchestrator's start-up check (which only reads it) with
+        // Worker:Slots still 2, although its sudoers rule is gone: the factory would fail in its first worker phase instead.
+        var run = new WholeScriptRun(_dir);
+        var (firstExit, firstOutput) = await run.RunAsync("--slots", "2");
+        Assert.True(firstExit == 0, firstOutput);
+        // Two slots set up: only the helpers of slots 3 to 8 are named, never slot 1's or slot 2's.
+        Assert.Equal(HelperRemovals(3), Removals(run.Calls));
+        Assert.DoesNotContain("No longer set up", firstOutput);
+        var before = run.Calls.Length;
+
+        var (exitCode, output) = await run.RunAsync();
+
+        Assert.True(exitCode == 0, output);
+        // Exactly the fixed paths of slots 2 to 8, each by name: no glob, no directory, no -r, and never slot 1's helper.
+        Assert.Equal(HelperRemovals(2), Removals(run.Calls.Skip(before)));
+        Assert.Equal([$"owner ALL=(_dftest) NOPASSWD: {WholeScriptRun.HelperPath}"], run.Sudoers.Split('\n').Where(l => l.Contains("NOPASSWD")));
+        // The rules are replaced before the helpers go.
+        var calls = run.Calls.Skip(before).ToList();
+        Assert.True(calls.FindIndex(c => c.StartsWith("install ") && c.EndsWith("/sudoers.d/dark-factory")) < calls.FindIndex(c => c.StartsWith("rm ")), output);
+        // The account stays, and the output says so, by name (and names no user that never existed).
+        Assert.Contains("No longer set up (more slots than --slots 1): _dftest2\n", output);
+        Assert.Contains("has no\n    launch helper and no sudoers rule now: nothing can be run as it", output);
+        Assert.DoesNotContain("_dftest3", output);
+        Assert.DoesNotContain(calls, c => c.StartsWith("dscl . -delete"));
+    }
+
+    [Fact]
+    public async Task Setup_with_all_eight_slots_removes_no_helper()
+    {
+        // The loop over the slots above n is empty at n = 8 (a `seq 9 8` would count down on macOS and name slot 9 and slot 8).
+        var run = new WholeScriptRun(_dir);
+
+        var (exitCode, output) = await run.RunAsync("--slots", "8");
+
+        Assert.True(exitCode == 0, output);
+        Assert.Empty(Removals(run.Calls));
+        Assert.Equal(8, run.Sudoers.Split('\n').Count(l => l.Contains("NOPASSWD")));
+        Assert.DoesNotContain("No longer set up", output);
     }
 
     [Fact]
@@ -248,6 +299,7 @@ public class SetupScriptTests
         private readonly string _log;
         private readonly string _items;
         private readonly string _sudoers;
+        private readonly string _users;
 
         /// <summary>Where setup installs slot 1's helper (its default).</summary>
         public const string HelperPath = "/usr/local/libexec/dark-factory/factory-worker-launch";
@@ -269,6 +321,9 @@ public class SetupScriptTests
             _sudoers = Path.Combine(dir, "installed-sudoers");
             _log = Path.Combine(dir, "calls.log");
             _items = Path.Combine(dir, "keychain-items");
+            // The accounts that exist: the first worker's (as before slots); every other is created by the run that sets it up.
+            _users = Path.Combine(dir, "users");
+            File.WriteAllText(_users, "_dftest\n");
             File.WriteAllText(_items, "2");
             File.WriteAllText(_log, "");
 
@@ -289,7 +344,7 @@ public class SetupScriptTests
                 args=()
                 for a in "$@"; do args+=("${a//\/Users\/$user/$home}"); done
                 case "${args[0]}" in
-                    /bin/rm) args[0]=rm ;;
+                    /bin/rm) ;; # the real rm, on the mapped path in the fake home (the fake rm below is for the script's own calls)
                     /bin/test) args[0]=test ;;
                     /usr/bin/security) args[0]='{{bin}}/security' ;;
                     *) exit 0 ;; # e.g. the Claude Code installer: recorded, not run
@@ -314,8 +369,25 @@ public class SetupScriptTests
                     *NFSHomeDirectory*) echo "NFSHomeDirectory: {{dir}}/ownerhome" ;;
                     *PrimaryGroupID*) echo "PrimaryGroupID: 450" ;;
                     */Users/_dftest2\ UniqueID*) echo "UniqueID: {{secondUid}}" ;;
+                    */Users/_dftest[3-8]\ UniqueID*) n="$*"; n=${n#*/Users/_dftest}; echo "UniqueID: $((449 + ${n%% *}))" ;;
                     *UniqueID*) echo "UniqueID: {{uid}}" ;;
+                    ". -create /Users/"*) [ $# -eq 3 ] && echo "${3#/Users/}" >>'{{_users}}' ;;
+                    ". -read /Users/"*) [ $# -eq 3 ] && { grep -qx "${3#/Users/}" '{{_users}}' || exit 1; } ;;
                 esac
+                exit 0
+                """);
+            // The script's own removals: recorded and NOT done unless the path is under the temp directory (its mktemp
+            // files). Whatever else it would remove - an installed helper, as root in the real run - only shows in the log.
+            SandboxSupport.Executable(bin, "rm", $$"""
+                #!/bin/bash
+                for a in "$@"; do
+                    case "$a" in
+                        -*) ;;
+                        /tmp/?* | /private/tmp/?* | /var/folders/?* | /private/var/folders/?*) ;;
+                        *) echo "rm $*" >>'{{_log}}'; exit 0 ;;
+                    esac
+                done
+                exec /bin/rm "$@"
                 """);
             SandboxSupport.Executable(bin, "install", $$"""
                 #!/bin/bash
@@ -361,7 +433,7 @@ public class SetupScriptTests
             // Refuse to run unless every privileged command resolves to its fake.
             var (exitCode, stdout, stderr) = await BashAsync(_dir, $$"""
                 export PATH='{{bin}}':/usr/bin:/bin
-                for c in sudo id uname dscl chown chmod install visudo mkdir stat security pkill killall pgrep; do
+                for c in sudo id uname dscl chown chmod install visudo mkdir stat security pkill killall pgrep rm; do
                     [ "$(command -v "$c")" = '{{bin}}'/"$c" ] || { echo "fake $c not first on PATH" >&2; exit 99; }
                 done
                 /bin/bash '{{script}}' --owner owner --worker _dftest --work-root '{{_dir}}/work/root' {{args}} 2>&1

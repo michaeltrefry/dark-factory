@@ -24,6 +24,20 @@ public sealed record WorkerSlot(int Number, WorkerSandbox Sandbox)
 public sealed class SlotUnavailableException(string message) : InvalidOperationException(message);
 
 /// <summary>
+/// The directory <see cref="Path"/> is writable by a principal that is not one of this factory's sandbox users (a slot above
+/// <c>Worker:Slots</c>, two slots' users, a group, an entry <c>ls</c> could not name): it is deleted as no one — not as another
+/// slot's user, and not by the owner walking a tree that user wrote. A deletion that must happen fails with this; clean-up that
+/// may be left (<see cref="WorkerSlots.TryHoldForAsync"/>, so every sweep) leaves the directory and says so once.
+/// </summary>
+public sealed class ForeignWriterException(string path, string reason) : InvalidOperationException($"{path} {reason}")
+{
+    public string Path => path;
+
+    /// <summary>Why, as the rest of a sentence about the directory: <c>is shared for writing with …</c>, then the two ways to get rid of it.</summary>
+    public string Reason => reason;
+}
+
+/// <summary>
 /// The pool of worker slots (sc-25989, E6/E7): <c>Worker:Slots</c> sandbox users, each single-tenant — its launch helper's exit
 /// kills every process of that user and of no other — so each has its own lock (<see cref="WorkerLock"/>), and two runs are in a
 /// worker phase at once exactly when they hold different slots. <see cref="HoldAsync{T}"/> hands out a slot: a named one (an
@@ -56,8 +70,17 @@ public sealed class WorkerSlots : IWorkerSandbox
         {
             throw new ArgumentException("Several slots need a sandbox user, a launch helper and a lock each, none shared.", nameof(slots));
         }
+        // Slot 1's lock file stays where it was before slots, in a directory every sandbox user reads; the others' are closed
+        // to them (EnsureLocksClosedAsync), which that directory cannot be.
+        if (slots.Skip(1).Any(s => SameDirectory(s.Lock!, slots[0].Lock!)))
+        {
+            throw new ArgumentException("A slot above 1 keeps its lock in a directory of its own, not beside slot 1's (WorkerLock.For).", nameof(slots));
+        }
         All = slots;
     }
+
+    private static bool SameDirectory(WorkerLock a, WorkerLock b) =>
+        string.Equals(Path.GetDirectoryName(a.Path), Path.GetDirectoryName(b.Path), StringComparison.Ordinal);
 
     public IReadOnlyList<WorkerSlot> All { get; }
 
@@ -105,6 +128,7 @@ public sealed class WorkerSlots : IWorkerSandbox
     {
         // Set in this async method, which the work is called from: it flows into the work and not back to the caller.
         _assigned.Value = Slot(slot);
+        await EnsureLocksClosedAsync(CancellationToken.None);
         return await work();
     }
 
@@ -152,8 +176,10 @@ public sealed class WorkerSlots : IWorkerSandbox
         if (slot is not null || Count == 1)
         {
             var one = slot is { } number ? Slot(number) : All[0];
+            await EnsureLocksClosedAsync(ct);
             return one.Lock is null ? await phase(one) : await one.Lock.HoldAsync(() => phase(one), ct, whileWaiting, retry, report, reportEvery);
         }
+        await EnsureLocksClosedAsync(ct);
         var candidates = (order ?? []).Where(n => n >= 1 && n <= Count).Concat(Enumerable.Range(1, Count)).Distinct().Select(n => All[n - 1]).ToList();
         var every = reportEvery ?? WorkerLock.ReportEvery;
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -183,6 +209,56 @@ public sealed class WorkerSlots : IWorkerSandbox
             }
             await Task.Delay(retry ?? WorkerLock.DefaultRetry, ct);
         }
+    }
+
+    /// <summary>Whether this pool has closed its slots' lock directory to the sandbox users (once is enough: only the owner changes it).</summary>
+    private volatile bool _locksClosed;
+
+    /// <summary>How a lock directory is closed to every sandbox user (<see cref="WorkerSandbox.CloseToWorkerAsync(string, CancellationToken)"/>: owner-side, no root, read back); tests give their own.</summary>
+    internal Func<string, CancellationToken, Task>? CloseLocks { get; init; }
+
+    /// <summary>
+    /// Closes the directory the locks of the slots above 1 are in (<see cref="WorkerLock.SlotDirectoryName"/>) to every sandbox
+    /// user, before this pool takes any of them: the work root's inherited ACL entry would let each slot's user read another
+    /// slot's lock file, and <c>flock</c> takes an exclusive lock through a read-only descriptor, so code one slot's worker runs
+    /// could hold another slot's lock and make that slot look busy. As <see cref="Git.GitWorkspace"/> closes its clone locks:
+    /// owner-side (<c>chmod -N</c>, mode 0700), read back, and a directory that cannot be closed is a broken set-up, not an
+    /// item's failure (<see cref="FactoryUnavailableException"/>: no slot's lock is taken). Slot 1's lock file is not in it
+    /// (it is where it was before slots), and a one-slot pool has no such directory.
+    /// </summary>
+    public async Task EnsureLocksClosedAsync(CancellationToken ct)
+    {
+        if (_locksClosed)
+        {
+            return;
+        }
+        foreach (var directory in All.Skip(1).Select(s => Path.GetDirectoryName(s.Lock!.Path)!).Distinct(StringComparer.Ordinal))
+        {
+            try
+            {
+                Directory.CreateDirectory(directory);
+                await (CloseLocks ?? (OperatingSystem.IsMacOS() ? All[0].Sandbox.CloseToWorkerAsync : CloseByModeAsync))(directory, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                throw new WorkSources.FactoryUnavailableException($"the worker slots' locks: {ex.Message}", ex);
+            }
+        }
+        _locksClosed = true;
+    }
+
+    /// <summary>
+    /// Off macOS — where no sandbox user can be set up (<c>setup-worker-user.sh</c> is macOS only) and <c>chmod -N</c> does not
+    /// exist: the tests' other hosts — a directory is closed by its mode alone: 0700, read back.
+    /// </summary>
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    private static Task CloseByModeAsync(string path, CancellationToken ct)
+    {
+        const UnixFileMode ownerOnly = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+        File.SetUnixFileMode(path, ownerOnly);
+        return File.GetUnixFileMode(path) == ownerOnly
+            ? Task.CompletedTask
+            : throw new InvalidOperationException($"{path} is still open to others than its owner after mode 0700.");
     }
 
     /// <summary>
@@ -239,9 +315,11 @@ public sealed class WorkerSlots : IWorkerSandbox
     {
         if (Count == 1)
         {
+            await ThrowIfAHigherSlotsAsync(path, ct);
             await All[0].Sandbox.DeleteAsWorkerAsync(path, ct);
             return;
         }
+        // The locks' directory is closed by now or by the hold below: a flow that holds a slot took it through this pool.
         var (held, owner) = (Held, await SharedWithAsync(path, ct));
         if (held is not null && (owner is null || owner == held))
         {
@@ -263,7 +341,7 @@ public sealed class WorkerSlots : IWorkerSandbox
     /// shared with none and a flow holding none, every slot) is held by another run.
     /// </summary>
     public Task<bool> TryDeleteAsWorkerAsync(string path, CancellationToken ct) =>
-        Count == 1 ? All[0].Sandbox.TryDeleteAsWorkerAsync(path, ct) : TryHoldForAsync(path, slot => slot.Sandbox.DeleteAsWorkerAsync(path, ct), ct);
+        TryHoldForAsync(path, slot => slot.Sandbox.DeleteAsWorkerAsync(path, ct), ct);
 
     /// <summary>
     /// Runs <paramref name="phase"/> holding the slot that deletes <paramref name="path"/> — the one it was shared with
@@ -273,7 +351,30 @@ public sealed class WorkerSlots : IWorkerSandbox
     /// </summary>
     public async Task<bool> TryHoldForAsync(string path, Func<WorkerSlot, Task> phase, CancellationToken ct)
     {
-        var target = Count == 1 ? All[0] : await SharedWithAsync(path, ct) ?? Held;
+        WorkerSlot? target;
+        try
+        {
+            if (Count == 1)
+            {
+                await ThrowIfAHigherSlotsAsync(path, ct);
+            }
+            else
+            {
+                await EnsureLocksClosedAsync(ct);
+            }
+            target = Count == 1 ? All[0] : await SharedWithAsync(path, ct) ?? Held;
+            Foreign.TryRemove(path, out _);
+        }
+        catch (ForeignWriterException ex)
+        {
+            // Not this factory's to delete, as anyone: left where it is, and said once per directory (a sweep finds it again
+            // in every run's first worker phase).
+            if (Foreign.TryAdd(path, ex.Reason))
+            {
+                Report(LeftReport(path, ex.Reason));
+            }
+            return false;
+        }
         foreach (var slot in target is null ? All : [target])
         {
             if (slot.Lock is null)
@@ -287,6 +388,58 @@ public sealed class WorkerSlots : IWorkerSandbox
             }
         }
         return false;
+    }
+
+    /// <summary>The directories this process left because a user that is not this factory's may write them, each with why (said once each).</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> Foreign = new(StringComparer.Ordinal);
+
+    /// <summary>Where a left directory is reported (standard error; tests give their own).</summary>
+    internal Action<string> Report { get; init; } = Console.Error.WriteLine;
+
+    /// <summary>The line a directory left for a foreign writer is reported with (<paramref name="reason"/>: <see cref="ForeignWriterException.Reason"/>, which names the two ways to get rid of it).</summary>
+    public static string LeftReport(string path, string reason) => $"[cleanup] leaving {path}: it {reason}";
+
+    /// <summary>
+    /// Why the last <see cref="TryHoldForAsync"/> of <paramref name="path"/> in this process left it for good — a user that is
+    /// not one of this factory's may write it (<see cref="ForeignWriterException.Reason"/>) — or null: it was not tried, was
+    /// deleted, or was left only because its slot was busy.
+    /// </summary>
+    public static string? LeftForeign(string path) => Foreign.GetValueOrDefault(path);
+
+    /// <summary>How the owner gets rid of a directory this factory deletes as no one (the end of every <see cref="ForeignWriterException"/>).</summary>
+    private static string Remedy(string path) =>
+        "It is not deleted as another user, nor by the owner (who would walk a tree that user wrote), and no later sweep deletes it as things are. "
+        + "To get rid of it: set Worker:Slots back so that user is one of this factory's (the next worktree sweep then deletes it as that user), "
+        + $"or remove it by hand as root (`sudo rm -rf -- '{path}'`).";
+
+    /// <summary>
+    /// With one slot (no directory's ACL decides anything: everything is slot 1's, as before slots): throws when
+    /// <paramref name="path"/> is writable by a higher slot's user of this factory's naming (<c>&lt;user&gt;2</c> …
+    /// <c>&lt;user&gt;8</c>: <c>Worker:Slots</c> was lowered to 1 with that slot's work on disk) — slot 1's user could not delete
+    /// it, and the owner would. Nothing else is judged here, and a listing that cannot be read (no <c>ls -le</c>) judges nothing.
+    /// </summary>
+    private async Task ThrowIfAHigherSlotsAsync(string path, CancellationToken ct)
+    {
+        if (!Directory.Exists(path))
+        {
+            return;
+        }
+        string listing;
+        try
+        {
+            listing = await ListAcl(path, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return;
+        }
+        var higher = Writers(listing).Where(w => Enumerable.Range(2, MaxSlots - 1).Any(n => w == $"user:{UserOf(All[0].User, n)}")).ToList();
+        if (higher.Count > 0)
+        {
+            throw new ForeignWriterException(path,
+                $"is shared for writing with {string.Join(", ", higher)}, a higher worker slot's sandbox user, and Worker:Slots is 1 ({All[0].User}). "
+                + Remedy(path));
+        }
     }
 
     /// <summary>The slot <paramref name="path"/> is shared with for writing (<see cref="SharedWith"/> of its <c>ls -led</c>), or null: none, or it is gone.</summary>
@@ -314,7 +467,8 @@ public sealed class WorkerSlots : IWorkerSandbox
     /// <summary>How many times a directory's ACL is read before a writer that is not a slot's user fails the deletion.</summary>
     private const int AclReads = 3;
 
-    private static readonly TimeSpan AclRetry = TimeSpan.FromMilliseconds(200);
+    /// <summary>How long a directory's ACL read waits before the next one (tests give their own).</summary>
+    internal TimeSpan AclRetry { get; init; } = TimeSpan.FromMilliseconds(200);
 
     /// <summary>How a directory's ACL is read (<see cref="WorkerSandbox.ListAclAsync"/>: macOS <c>ls -led</c>); tests give their own listing.</summary>
     internal Func<string, CancellationToken, Task<string>> ListAcl { get; init; } = WorkerSandbox.ListAclAsync;
@@ -336,11 +490,7 @@ public sealed class WorkerSlots : IWorkerSandbox
     /// </summary>
     public WorkerSlot? SharedWith(string path, string lsOutput)
     {
-        var writers = lsOutput.Split('\n').Skip(1).Select(line => AclEntry.Match(line))
-            .Where(m => m.Success && m.Groups[2].Value.Split(',').Any(WriteRights.Contains))
-            .Select(m => m.Groups[1].Value)
-            .Where(principal => principal != $"user:{Environment.UserName}")
-            .Distinct(StringComparer.Ordinal).ToList();
+        var writers = Writers(lsOutput);
         if (writers.Count == 0)
         {
             return null;
@@ -349,10 +499,18 @@ public sealed class WorkerSlots : IWorkerSandbox
         var slots = writers.Select(principal => All.FirstOrDefault(s => principal == $"user:{s.User}")).ToList();
         if (writers.Count > 1 || slots[0] is null)
         {
-            throw new InvalidOperationException(
-                $"{path} is shared for writing with {string.Join(", ", writers)}, not with one of this factory's {Count} sandbox users "
-                + $"({string.Join(", ", All.Select(s => s.User))}): raise Worker:Slots to cover that user again, or delete the directory by hand.");
+            throw new ForeignWriterException(path,
+                $"is shared for writing with {string.Join(", ", writers)}, not with one of this factory's {Count} sandbox users "
+                + $"({string.Join(", ", All.Select(s => s.User))}). " + Remedy(path));
         }
         return slots[0];
     }
+
+    /// <summary>The principals, other than the owner, that <paramref name="lsOutput"/> (<c>ls -led</c>) grants a right to write.</summary>
+    private static List<string> Writers(string lsOutput) =>
+        [.. lsOutput.Split('\n').Skip(1).Select(line => AclEntry.Match(line))
+            .Where(m => m.Success && m.Groups[2].Value.Split(',').Any(WriteRights.Contains))
+            .Select(m => m.Groups[1].Value)
+            .Where(principal => principal != $"user:{Environment.UserName}")
+            .Distinct(StringComparer.Ordinal)];
 }

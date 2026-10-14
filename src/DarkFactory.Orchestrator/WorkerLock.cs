@@ -62,10 +62,16 @@ public sealed record WorkerLock(string Path)
 
     /// <summary>
     /// The lock of slot <paramref name="slot"/>'s sandbox user in the work root <paramref name="workRoot"/> (sc-25989): slot 1's is
-    /// <see cref="FileName"/>, the file it was before slots; slot n's is <c>.factory-run-n.lock</c>.
+    /// <see cref="FileName"/>, the file it was before slots (E9), in the work root; slot n's is <c>.factory-run-n.lock</c> in the
+    /// work root's <see cref="SlotDirectoryName"/> — a directory the pool closes to every sandbox user before it takes one
+    /// (<see cref="Worker.WorkerSlots.EnsureLocksClosedAsync"/>), since a user that can read a lock file can hold its lock.
     /// </summary>
-    public static WorkerLock For(string workRoot, int slot) => new(System.IO.Path.Combine(System.IO.Path.GetFullPath(workRoot),
-        slot == 1 ? FileName : $".factory-run-{slot}.lock"));
+    public static WorkerLock For(string workRoot, int slot) => new(slot == 1
+        ? System.IO.Path.Combine(System.IO.Path.GetFullPath(workRoot), FileName)
+        : System.IO.Path.Combine(System.IO.Path.GetFullPath(workRoot), SlotDirectoryName, $".factory-run-{slot}.lock"));
+
+    /// <summary>The directory, in the work root, of the lock files of the slots above 1: closed to every sandbox user.</summary>
+    public const string SlotDirectoryName = "slot-locks";
 
     /// <summary>
     /// Whether the current async flow holds the lock: it is inside a <see cref="HoldAsync{T}"/> of it that has not ended. A task

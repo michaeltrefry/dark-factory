@@ -7,8 +7,9 @@
 # users to set up, one per worker slot. The first is the worker user itself (default _factory, helper
 # factory-worker-launch); slot 2 is <worker>2 (_factory2, helper factory-worker-launch-2), slot 3 <worker>3,
 # and so on. Each gets everything below for itself, and its own copy of the launch helper pinned to its own
-# name and uid. A re-run with a smaller <n> leaves the higher slots' accounts in place but drops their
-# sudoers rules, so their helpers can no longer be run.
+# name and uid. A re-run with a smaller <n> leaves the higher slots' accounts (and their homes) in place but
+# drops their sudoers rules and removes their installed helpers, so nothing can be run as them and a factory
+# whose Worker:Slots still names them fails at start-up ("cannot read the launch helper ...").
 #
 # --remove-worker-login (opt-in, standalone): deletes only each worker user's own Claude Code login — its
 # ~/.claude/.credentials.json and its 'Claude Code-credentials' keychain item — so the worker holds no
@@ -251,6 +252,33 @@ done
 visudo -cqf "$rule"
 install -o root -g wheel -m 0440 "$rule" "$sudoers"
 rm -f "$rule"
+
+# Slots above <n> (a re-run with a smaller --slots): the sudoers file just installed holds no rule for them, so
+# their installed helpers are removed too. Left in place they would still pass the orchestrator's start-up
+# check (it only reads the files) with Worker:Slots unchanged, and the factory would fail later, in its first
+# worker phase, with sudo's "a password is required". This runs as root, so it names only the fixed paths this
+# script itself installs for slots 2-8 - never slot 1's helper, never a glob, never a directory (no -r).
+remove_slot_helper() { # remove_slot_helper <slot 2-8>
+    local stale
+    [[ $1 =~ ^[2-8]$ ]] || { echo "Refusing to remove the helper of slot '$1': not a slot from 2 to 8." >&2; exit 1; }
+    stale=$(slot_helper "$1")
+    [ "$stale" = "$helper_dir/factory-worker-launch-$1" ] \
+        || { echo "Refusing to remove '$stale': not slot $1's helper in $helper_dir." >&2; exit 1; }
+    rm -f -- "$stale"
+}
+unused_workers=()
+for ((slot = slots + 1; slot <= 8; slot++)); do
+    remove_slot_helper "$slot"
+    if dscl . -read "/Users/$(slot_worker "$slot")" >/dev/null 2>&1; then
+        unused_workers+=("$(slot_worker "$slot")")
+    fi
+done
+if [ "${#unused_workers[@]}" -gt 0 ]; then
+    say "No longer set up (more slots than --slots $slots): ${unused_workers[*]}"
+    echo "    Each still exists on this machine, with its home and whatever it owns under $work_root, but has no"
+    echo "    launch helper and no sudoers rule now: nothing can be run as it. Keep Worker:Slots at $slots or lower,"
+    echo "    or set them up again with: sudo $0 --slots <n>"
+fi
 grep -q '^#includedir /private/etc/sudoers.d' /etc/sudoers \
     || echo "warning: /etc/sudoers has no '#includedir /private/etc/sudoers.d'; the rule is inactive." >&2
 
@@ -361,5 +389,6 @@ own login instead (once per worker user):
 EOF
 if [ "$slots" -gt 1 ]; then
     echo
-    echo "Set Worker__Slots=$slots for the factory (a Worker:Slots larger than the slots set up here fails start-up)."
+    echo "Set Worker__Slots=$slots for the factory (a Worker:Slots larger than the slots set up here fails start-up:"
+    echo "the higher slots have no launch helper)."
 fi

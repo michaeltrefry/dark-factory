@@ -43,7 +43,8 @@ public enum StepOutcome
 /// <item>Checkpoints: <c>verdict</c> pass → passed, fail → failed; <c>fix-progress</c> progress → passed, failed → failed; <c>gate</c> Merge →
 /// passed, ReviewHead/Blocked → gate_rejected; <c>new-tests</c> pass → passed, rejected/no-tests → gate_rejected, unsupported/error (the check
 /// could not produce evidence) → failed; <c>ci-failure</c>, <c>merge-conflict</c>, <c>stuck</c>, <c>stuck-retry</c>, <c>worktree-lost</c>,
-/// <c>github-refused</c> → failed; <c>routed-to-human</c> (a triage routed an issue to a human) → escalated; <c>escalation-comment</c> posted → passed, else failed; <c>pr-report</c> or <c>closeout</c> failed → failed; <c>approval-ignored</c>, <c>plan-rejected</c> (the planner's answer broke a rule, sc-25870) → gate_rejected;
+/// <c>github-refused</c>, <c>slot-left</c> (sc-25989: a stop could not stop the leftover worker or remove the worktree of an item whose worker
+/// slot is no longer configured — it ran nothing as another user; the stop itself went on) → failed; <c>routed-to-human</c> (a triage routed an issue to a human) → escalated; <c>escalation-comment</c> posted → passed, else failed; <c>pr-report</c> or <c>closeout</c> failed → failed; <c>approval-ignored</c>, <c>plan-rejected</c> (the planner's answer broke a rule, sc-25870) → gate_rejected;
 /// <c>ci-triggers</c> (sc-25873: whether the repository's CI can report on a plan's story pull requests) blocked — no workflow can run, the
 /// plan is stopped — → gate_rejected, a warning — it could not be told — → failed (the check could not produce an answer; planning goes on);
 /// <c>usage-pause</c>, <c>parked</c> (also on an item paused because another caller took its claim, sc-25983: its Paused row,
@@ -120,7 +121,8 @@ public static class StepOutcomes
             _ => StepOutcome.Failed,
         },
         RunPipeline.Steps.CiFailure or RunPipeline.Steps.MergeConflict or RunPipeline.Steps.Stuck or RunPipeline.Steps.StuckRetry
-            or RunPipeline.Steps.WorktreeLost or RunPipeline.Steps.ControlsUnreadable or Issues.IssueSteps.Refused => StepOutcome.Failed,
+            or RunPipeline.Steps.WorktreeLost or RunPipeline.Steps.ControlsUnreadable or RunPipeline.Steps.SlotLeft
+            or Issues.IssueSteps.Refused => StepOutcome.Failed,
         RunPipeline.Steps.CodeGraphOverlay => Gate.CodeGraphOverlay.FromDetail(detail) is { IsReady: true } ? StepOutcome.Passed : StepOutcome.Failed,
         RunPipeline.Steps.EscalationComment =>detail == "posted" ? StepOutcome.Passed : StepOutcome.Failed,
         Issues.IssueSteps.RoutedToHuman => StepOutcome.Escalated,

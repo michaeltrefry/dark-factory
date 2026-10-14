@@ -401,7 +401,7 @@ public class FactoryOptionsTests
         // appended, under its own lock file.
         var three = Options(new() { ["Worker:Slots"] = "3", ["Worker:RunAs"] = "_df", ["Worker:LaunchHelper"] = "/opt/h", ["Factory:WorkRoot"] = "/w" });
         Assert.Equal(3, three.WorkerSlotCount);
-        Assert.Equal([(1, "_df", "/opt/h", "/w/.factory-run.lock"), (2, "_df2", "/opt/h-2", "/w/.factory-run-2.lock"), (3, "_df3", "/opt/h-3", "/w/.factory-run-3.lock")],
+        Assert.Equal([(1, "_df", "/opt/h", "/w/.factory-run.lock"), (2, "_df2", "/opt/h-2", "/w/slot-locks/.factory-run-2.lock"), (3, "_df3", "/opt/h-3", "/w/slot-locks/.factory-run-3.lock")],
             three.WorkerSlots!.All.Select(s => (s.Number, s.User, s.Sandbox.HelperPath, s.Lock!.Path)));
         Assert.All(three.WorkerSlots.All, s => Assert.Equal("sudo scripts/setup-worker-user.sh --slots 3", s.Sandbox.Reinstall));
         Assert.Equal(Worker.WorkerSlots.MaxSlots, Options(new() { ["Worker:Slots"] = "8" }).WorkerSlots!.Count);

@@ -336,7 +336,8 @@ public static class FactoryRunner
         // none a live run owns (sc-25987): another run's gate test worktrees or base-update worktree are its item's, guarded by
         // that item's run lock; this run's own item is guarded the same way (its pipeline holds that lock), so it replaces its
         // own leftovers itself. A leftover another slot's user wrote is deleted as that user, if that slot is free now, and is
-        // otherwise left to a sweep that finds it free (WorkerSlots.TryDeleteAsWorkerAsync).
+        // otherwise left to a sweep that finds it free (WorkerSlots.TryDeleteAsWorkerAsync); one a user outside the pool wrote
+        // is left for the owner, reported once, and never fails the sweep.
         async Task EnterSandboxAsync(CancellationToken c)
         {
             if (slots is not null)
