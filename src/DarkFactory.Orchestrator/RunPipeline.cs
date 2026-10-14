@@ -2537,7 +2537,9 @@ public sealed partial class RunPipeline(
     /// SwiftPM's since sc-26127).
     /// </summary>
     internal const string BuildsAndPasses =
-        "the build and the tests pass (`dotnet build` and `dotnet test`; in a Rust package `cargo build` and `cargo test`; in a Swift package `swift build` and `swift test`)";
+        "the build and the tests pass (`dotnet build` and `dotnet test`; in a Rust package `cargo build` and `cargo test`; in a Swift package `swift build` and `swift test`; in an Xcode "
+        + "project `" + SwiftToolchain.DefaultWrapperPath + " build|test -scheme <scheme> -destination 'platform=iOS Simulator,name=<device>'`, "
+        + "the only way to run xcodebuild)";
 
     public static string BuildPrompt(WorkSpec spec, RepoRef repo)
     {

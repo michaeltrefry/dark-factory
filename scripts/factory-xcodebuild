@@ -1,0 +1,160 @@
+#!/bin/bash
+# factory-xcodebuild — the only way a Dark Factory worker runs xcodebuild (Phase 5, sc-26130; E2/E3).
+#
+# Installed root-owned (0755) by scripts/setup-worker-user.sh at /usr/local/libexec/dark-factory/factory-xcodebuild,
+# one copy for every sandbox user (it pins nothing per user: everything it names is the running user's own). An
+# implementing worker may run exactly this path (ClaudeWorker.XcodebuildTools); raw xcodebuild and xcrun are denied.
+#
+#   factory-xcodebuild build|build-for-testing|test -scheme <name> -destination <simulator> [options]
+#   factory-xcodebuild -list [-project <p.xcodeproj> | -workspace <w.xcworkspace>]
+#
+# Options (each at most once, except the test filters):
+#   -project <relative path>.xcodeproj | -workspace <relative path>.xcworkspace
+#   -configuration <name>
+#   -only-testing:<test id> / -skip-testing:<test id>      (test only; repeatable)
+#   -resultBundlePath <relative path>.xcresult             (where the gate reads test results from)
+#   -quiet
+# The destination must be a simulator: [generic/]platform=<iOS|tvOS|watchOS|visionOS> Simulator[,name=…|OS=…|id=…|arch=…].
+# -list (the schemes of the project, which a worker needs to name one; it builds nothing) is the only query.
+#
+# Refused (exit 64), with nothing run: every other action (archive, -exportArchive, analyze, installsrc, clean, …), every
+# build-setting override (NAME=value: CODE_SIGN_IDENTITY, DEVELOPMENT_TEAM, PROVISIONING_PROFILE*, OTHER_*FLAGS, a script
+# phase's inputs, an output directory such as SYMROOT/OBJROOT/DSTROOT/CONFIGURATION_BUILD_DIR, …), -xcconfig,
+# -allowProvisioningUpdates and every other signing or account flag, -derivedDataPath and -clonedSourcePackagesDirPath
+# (this script sets them), -skipPackagePluginValidation/-skipMacroValidation (which run package code without trust), an
+# absolute path or one with a `..` component, and any argument it does not know.
+#
+# What it always adds: ad hoc signing and no team or provisioning profile (CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM=
+# PROVISIONING_PROFILE_SPECIFIER= PROVISIONING_PROFILE=), and the running user's own DerivedData and SwiftPM checkouts
+# (-derivedDataPath ~/Library/Developer/Xcode/DerivedData/dark-factory, -clonedSourcePackagesDirPath
+# ~/Library/Caches/dark-factory/SourcePackages; ~ from the password database, never the caller's HOME), so each worker
+# slot's sandbox user builds into its own. xcodebuild runs with a fresh environment (HOME, a fixed PATH, the user's own
+# TMPDIR when it has one): xcodebuild reads environment variables as build settings, so nothing of the caller's reaches it.
+set -eu
+
+# The one xcodebuild this runs (Xcode's, through xcode-select). Tests replace this line in a copy, never by a variable.
+xcodebuild=/usr/bin/xcodebuild
+
+refuse() {
+    echo "factory-xcodebuild: refusing $*" >&2
+    exit 64
+}
+
+usage() {
+    echo "factory-xcodebuild: usage: factory-xcodebuild build|build-for-testing|test -scheme <name> -destination <simulator> [-project <p.xcodeproj> | -workspace <w.xcworkspace>] [-configuration <name>] [-only-testing:<id>]... [-skip-testing:<id>]... [-resultBundlePath <r.xcresult>] [-quiet]" >&2
+    echo "factory-xcodebuild: usage: factory-xcodebuild -list [-project <p.xcodeproj> | -workspace <w.xcworkspace>]" >&2
+    exit 64
+}
+
+# A path relative to the working directory (the worktree) that stays in it: no leading /, no .. component, no empty one.
+# The patterns live in variables: bash 3.2 reads a pattern written inline in [[ =~ ]] differently.
+path_re='^[A-Za-z0-9_][A-Za-z0-9 ._/+-]{0,255}$' # an interval above 255 is no regex to macOS (RE_DUP_MAX)
+scheme_re='^[A-Za-z0-9_][A-Za-z0-9 ._+-]{0,127}$'
+destination_re='^(generic/)?platform=(iOS|tvOS|watchOS|visionOS) Simulator(,(name|OS|id|arch)=[A-Za-z0-9][A-Za-z0-9 ._()-]{0,63})*$'
+configuration_re='^[A-Za-z0-9_][A-Za-z0-9 _-]{0,63}$'
+test_id_re='^[A-Za-z0-9_][A-Za-z0-9_./()-]{0,255}$'
+
+relative_path() { # relative_path <value> <suffix>
+    local value=$1 suffix=$2
+    [[ $value =~ $path_re ]] || return 1
+    case "$value" in *"$suffix") ;; *) return 1 ;; esac
+    case "/$value/" in */../* | */./* | *//*) return 1 ;; esac
+    return 0
+}
+
+[ $# -ge 1 ] || usage
+
+action=
+list=0
+scheme=
+destination=
+container=()
+configuration=
+filters=()
+result_bundle=
+quiet=0
+
+while [ $# -gt 0 ]; do
+    arg=$1
+    case "$arg" in
+        build | build-for-testing | test)
+            [ -z "$action" ] && [ "$list" -eq 0 ] || refuse "a second action '$arg'"
+            action=$arg ;;
+        -list)
+            [ -z "$action" ] && [ "$list" -eq 0 ] || refuse "-list beside an action"
+            list=1 ;;
+        -scheme)
+            [ $# -ge 2 ] || refuse "-scheme without a name"
+            [ -z "$scheme" ] || refuse "a second -scheme"
+            [[ $2 =~ $scheme_re ]] || refuse "the scheme name '$2'"
+            scheme=$2; shift ;;
+        -destination)
+            [ $# -ge 2 ] || refuse "-destination without a value"
+            [ -z "$destination" ] || refuse "a second -destination"
+            [[ $2 =~ $destination_re ]] \
+                || refuse "the destination '$2' (only a simulator: [generic/]platform=<iOS|tvOS|watchOS|visionOS> Simulator[,name=…])"
+            destination=$2; shift ;;
+        -project | -workspace)
+            [ $# -ge 2 ] || refuse "$arg without a path"
+            [ ${#container[@]} -eq 0 ] || refuse "a second -project/-workspace"
+            suffix=.xcodeproj
+            [ "$arg" = -project ] || suffix=.xcworkspace
+            relative_path "$2" "$suffix" || refuse "the $arg path '$2' (a relative path inside the working directory ending $suffix)"
+            container=("$arg" "$2"); shift ;;
+        -configuration)
+            [ $# -ge 2 ] || refuse "-configuration without a name"
+            [ -z "$configuration" ] || refuse "a second -configuration"
+            [[ $2 =~ $configuration_re ]] || refuse "the configuration name '$2'"
+            configuration=$2; shift ;;
+        -only-testing:* | -skip-testing:*)
+            [[ ${arg#*:} =~ $test_id_re ]] || refuse "the test identifier in '$arg'"
+            filters+=("$arg") ;;
+        -resultBundlePath)
+            [ $# -ge 2 ] || refuse "-resultBundlePath without a path"
+            [ -z "$result_bundle" ] || refuse "a second -resultBundlePath"
+            relative_path "$2" .xcresult || refuse "the result bundle path '$2' (a relative path inside the working directory ending .xcresult)"
+            result_bundle=$2; shift ;;
+        -quiet)
+            [ "$quiet" -eq 0 ] || refuse "a second -quiet"
+            quiet=1 ;;
+        *=*) refuse "the build setting override '${arg%%=*}=…' (signing, scripts and output locations are the factory's)" ;;
+        -*) refuse "the option '$arg'" ;;
+        *) refuse "the action '$arg' (only build, build-for-testing and test)" ;;
+    esac
+    shift
+done
+
+# With HOME unset, ~ is the running user's home from the password database: the sandbox user's own, whatever the caller set.
+unset HOME
+home=~
+[ -n "$home" ] && [ ! -L "$home" ] && [ -d "$home" ] && [ -O "$home" ] \
+    || { echo "factory-xcodebuild: the running user's home '$home' is not a directory it owns" >&2; exit 70; }
+derived_data=$home/Library/Developer/Xcode/DerivedData/dark-factory
+source_packages=$home/Library/Caches/dark-factory/SourcePackages
+
+env=("HOME=$home" "PATH=/usr/bin:/bin:/usr/sbin:/sbin")
+tmpdir=${TMPDIR:-}
+tmpdir=${tmpdir%/}
+if [ -n "$tmpdir" ] && [ ! -L "$tmpdir" ] && [ -d "$tmpdir" ] && [ -O "$tmpdir" ]; then
+    env+=("TMPDIR=$tmpdir")
+fi
+
+if [ "$list" -eq 1 ]; then
+    [ -z "$scheme$destination$configuration$result_bundle" ] && [ ${#filters[@]} -eq 0 ] && [ "$quiet" -eq 0 ] \
+        || refuse "-list with anything but -project or -workspace"
+    exec /usr/bin/env -i "${env[@]}" "$xcodebuild" -list ${container[@]+"${container[@]}"} -clonedSourcePackagesDirPath "$source_packages"
+fi
+
+[ -n "$action" ] || usage
+[ -n "$scheme" ] || refuse "a build without -scheme"
+[ -n "$destination" ] || refuse "a build without -destination"
+[ ${#filters[@]} -eq 0 ] || [ "$action" = test ] || refuse "-only-testing/-skip-testing outside the test action"
+
+args=("$action" ${container[@]+"${container[@]}"} -scheme "$scheme" -destination "$destination")
+[ -z "$configuration" ] || args+=(-configuration "$configuration")
+args+=(${filters[@]+"${filters[@]}"})
+[ -z "$result_bundle" ] || args+=(-resultBundlePath "$result_bundle")
+[ "$quiet" -eq 0 ] || args+=(-quiet)
+args+=(-derivedDataPath "$derived_data" -clonedSourcePackagesDirPath "$source_packages")
+args+=(CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER= PROVISIONING_PROFILE=)
+exec /usr/bin/env -i "${env[@]}" "$xcodebuild" "${args[@]}"

@@ -482,6 +482,9 @@ public class SafeHelperTests
         var helperName = "factory-worker" + "-launch";
         var scriptsSegment = "\"script" + "s\"";
         var setupAllowed = new Regex(Regex.Escape(scriptsSegment) + @"\s*,\s*""setup-worker-user\.sh""");
+        // The xcodebuild wrapper (sc-26130) is no launch helper: it signals nothing and is installed beside the helpers, so a line
+        // naming it (its repo file, its installed path) is not a use of the helper. A line naming both still counts.
+        var wrapperOnly = new Regex(@"(?:" + Regex.Escape(scriptsSegment) + @"\s*,\s*)?""?[^""\n]*factory-xcodebuild\b");
         var scriptsPathLiteral = new Regex("\"[^\"\\n]*scripts/" + Regex.Escape(helperName));
         var helperLiteral = new Regex("\"[^\"\\n]*" + Regex.Escape(helperName) + "[\"/]");
         string[] installedMarkers = ["Default" + "HelperPath", "libexec/" + "dark-factory"];
@@ -519,6 +522,12 @@ public class SafeHelperTests
                 "Assert.All(three.Worker" + "Slots.All, s => Assert.Equal(\"sudo scripts/setup-worker-user.sh --slots 3\", s.Sandbox.Reinstall));",
                 "Assert.Null(none.Worker" + "Slots);",
                 "Assert.Equal(Worker.WorkerSlots.MaxSlots, Options(new() { [\"Worker:Slots\"] = \"8\" }).Worker" + "Slots!.Count);",
+            ],
+            // sc-26130: Worker:Swift read into the configured slots (their toolchain only; nothing is run).
+            ["SwiftToolchainTests.cs"] =
+            [
+                "Assert.All(off.Worker" + "Slots!.All, s => Assert.Null(s.Sandbox.Swift));",
+                "Assert.All(on.Worker" + "Slots!.All, s => Assert.Equal(new SwiftToolchain(\"/usr/bin/swift\", \"/usr/bin/xcodebuild\", SwiftToolchain.DefaultWrapperPath), s.Sandbox.Swift));",
             ],
             // A source scan's pattern (the text names the property; nothing is run).
             ["LockScopeTests.cs"] = ["Assert.Equal(2, Lines(@\"FactoryRunner\\.CheckHelperAsync\\(options\\.Worker" + "Slots\").Count(l => l.StartsWith(\"Program.cs: \", StringComparison.Ordinal)));"],
@@ -578,13 +587,15 @@ public class SafeHelperTests
                 {
                     violations.Add(where);
                 }
-                if (line.Contains(scriptsSegment, StringComparison.Ordinal) && knowsRepoRoot
+                var namesWrapperOnly = wrapperOnly.IsMatch(line) && !line.Contains(helperName, StringComparison.Ordinal)
+                    && !line.Contains(installedMarkers[0], StringComparison.Ordinal) && !configured.IsMatch(line);
+                if (line.Contains(scriptsSegment, StringComparison.Ordinal) && knowsRepoRoot && !namesWrapperOnly
                     && !(name == "SetupScriptTests.cs" && setupAllowed.IsMatch(line)))
                 {
                     violations.Add(where);
                 }
                 var namesHelper = helperLiteral.IsMatch(line)
-                    || installedMarkers.Any(m => line.Contains(m, StringComparison.Ordinal))
+                    || (!namesWrapperOnly && installedMarkers.Any(m => line.Contains(m, StringComparison.Ordinal)))
                     || configured.IsMatch(line);
                 if (!namesHelper)
                 {

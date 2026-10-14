@@ -284,6 +284,69 @@ public class SetupScriptTests
         Assert.DoesNotContain(run.Calls, c => c.StartsWith("install ") || c.StartsWith("sudo "));
     }
 
+    // ---- The Swift toolchain (sc-26130): the xcodebuild wrapper, and swift/xcodebuild checked as every slot's user ----
+
+    private static readonly string[] SwiftChecks =
+        ["/usr/bin/swift --version", "/usr/bin/xcodebuild -version", "/usr/bin/xcodebuild -checkFirstLaunchStatus", "/usr/bin/xcodebuild -license check"];
+
+    [Fact]
+    public async Task Setup_installs_the_xcodebuild_wrapper_unedited_root_owned_where_the_workers_rule_names_it()
+    {
+        var run = new WholeScriptRun(_dir);
+
+        var (exitCode, output) = await run.RunAsync("--slots", "2");
+
+        Assert.True(exitCode == 0, output);
+        Assert.Single(run.Calls, c => c == $"install -o root -g wheel -m 0755 {SandboxSupport.RepoRoot}/scripts/factory-xcodebuild {Worker.SwiftToolchain.DefaultWrapperPath}");
+        Assert.Null(Worker.SwiftToolchain.StaleWrapperReason(File.ReadAllText(run.InstalledWrapper))); // only read: never run
+        Assert.Contains($"Bash({Worker.SwiftToolchain.DefaultWrapperPath}:*)", Worker.ClaudeWorker.AllowedTools);
+        // No sudoers rule for it: workers run it as themselves.
+        Assert.DoesNotContain("factory-xcodebuild", run.Sudoers);
+    }
+
+    [Fact]
+    public async Task Without_swift_the_swift_toolchain_of_each_user_is_only_reported_and_a_missing_one_never_fails_the_setup()
+    {
+        // A .NET/Rust-only factory needs no Xcode (E7).
+        var run = new WholeScriptRun(_dir, swiftFailsFor: "_dftest2");
+
+        var (exitCode, output) = await run.RunAsync("--slots", "2");
+
+        Assert.True(exitCode == 0, output);
+        Assert.Contains("Checking the optional Swift toolchain as _dftest2 through the helper", output);
+        Assert.Contains("ok    /usr/bin/xcodebuild -checkFirstLaunchStatus: fake 1.0", output); // _dftest's
+        Assert.Contains("none  /usr/bin/xcodebuild -checkFirstLaunchStatus (exit 69): not available to _dftest2 (Swift repos only", output);
+    }
+
+    [Fact]
+    public async Task With_swift_every_users_swift_toolchain_is_checked_through_its_own_helper()
+    {
+        var run = new WholeScriptRun(_dir);
+
+        var (exitCode, output) = await run.RunAsync("--slots", "2", "--swift");
+
+        Assert.True(exitCode == 0, output);
+        foreach (var (user, helper) in new[] { ("_dftest", WholeScriptRun.HelperPath), ("_dftest2", WholeScriptRun.HelperPath + "-2") })
+        {
+            Assert.Contains($"Checking the Swift toolchain as {user} through the helper (--swift: required)", output);
+            Assert.All(SwiftChecks, check => Assert.Contains($"sudo -u owner sudo -n -u {user} {helper} {check}", run.Calls));
+        }
+    }
+
+    [Fact]
+    public async Task With_swift_a_slot_whose_xcode_first_launch_is_not_done_fails_the_setup_naming_its_user_and_slot()
+    {
+        var run = new WholeScriptRun(_dir, swiftFailsFor: "_dftest2");
+
+        var (exitCode, output) = await run.RunAsync("--slots", "2", "--swift");
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains("FAIL  /usr/bin/xcodebuild -checkFirstLaunchStatus (exit 69): first launch tasks are not done", output);
+        Assert.Contains("The Swift toolchain is not usable by _dftest2 (worker slot 2)", output);
+        Assert.Contains("sudo xcodebuild -runFirstLaunch", output);
+        Assert.DoesNotContain("The Swift toolchain is not usable by _dftest ", output); // slot 1's passed
+    }
+
     /// <summary>
     /// The whole <c>setup-worker-user.sh</c>, run as the current user (never root, never real sudo) with every privileged
     /// or system-changing command replaced on PATH by a fake that records its call. Worker <c>_dftest</c>, whose home
@@ -304,10 +367,12 @@ public class SetupScriptTests
         /// <summary>Where setup installs slot 1's helper (its default).</summary>
         public const string HelperPath = "/usr/local/libexec/dark-factory/factory-worker-launch";
 
-        public WholeScriptRun(string dir, string uid = "450", string secondUid = "451")
+        /// <param name="swiftFailsFor">A worker user (<c>_dftest</c> or <c>_dftest2</c>) whose Xcode first launch the fake helper reports as not done (exit 69).</param>
+        public WholeScriptRun(string dir, string uid = "450", string secondUid = "451", string? swiftFailsFor = null)
         {
             _dir = dir;
             InstalledHelper = Path.Combine(dir, "installed-helper");
+            InstalledWrapper = Path.Combine(dir, "installed-xcodebuild-wrapper");
             var bin = Directory.CreateDirectory(Path.Combine(dir, "bin")).FullName;
             var home = Path.Combine(dir, "home");
             foreach (var each in new[] { home, home + "2" })
@@ -332,7 +397,10 @@ public class SetupScriptTests
                 echo "sudo $*" >>'{{_log}}'
                 for a in "$@"; do
                     case "$a" in
-                        */factory-worker-launch | */factory-worker-launch-[0-9]) IFS= read -r _; echo "fake 1.0"; exit 0 ;;
+                        */factory-worker-launch | */factory-worker-launch-[0-9])
+                            IFS= read -r _
+                            case "$* " in *"-u {{swiftFailsFor ?? "nobody-fails"}} "*-checkFirstLaunchStatus*) echo "first launch tasks are not done" >&2; exit 69 ;; esac
+                            echo "fake 1.0"; exit 0 ;;
                     esac
                 done
                 [ "$1" = -u ] && { [ "$2" = _dftest ] || [ "$2" = _dftest2 ]; } && [ "$3" = env ] || exit 0
@@ -396,6 +464,7 @@ public class SetupScriptTests
                     */factory-worker-launch) cp "${@: -2:1}" '{{InstalledHelper}}' ;;
                     */factory-worker-launch-[0-9]) dest="${@: -1}"; cp "${@: -2:1}" '{{InstalledHelper}}'"-${dest##*-}" ;;
                     */sudoers.d/dark-factory) cp "${@: -2:1}" '{{_sudoers}}' ;;
+                    */factory-xcodebuild) cp "${@: -2:1}" '{{InstalledWrapper}}' ;;
                 esac
                 """);
             foreach (var name in new[] { "chown", "chmod", "visudo", "mkdir", "curl" })
@@ -411,6 +480,9 @@ public class SetupScriptTests
         public string CredentialsFile { get; }
 
         public string InstalledHelper { get; }
+
+        /// <summary>The copy the fake install kept of the installed xcodebuild wrapper.</summary>
+        public string InstalledWrapper { get; }
 
         /// <summary>The copy the fake install kept of slot <paramref name="slot"/>'s installed helper.</summary>
         public string InstalledHelperOf(int slot) => slot == 1 ? InstalledHelper : $"{InstalledHelper}-{slot}";

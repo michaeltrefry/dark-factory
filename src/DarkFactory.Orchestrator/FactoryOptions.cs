@@ -174,8 +174,38 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
     /// names <c>setup-worker-user.sh --slots n</c> creates and installs).
     /// </summary>
     public Worker.WorkerSlots? WorkerSlots => WorkerSlotCount is var count && WorkerUser is { } user
-        ? Worker.WorkerSlots.Create(user, config["Worker:LaunchHelper"] ?? Worker.WorkerSandbox.DefaultHelperPath, WorkRoot, count)
+        ? Worker.WorkerSlots.Create(user, config["Worker:LaunchHelper"] ?? Worker.WorkerSandbox.DefaultHelperPath, WorkRoot, count,
+            WorkerSwift ? new Worker.SwiftToolchain() : null)
         : null;
+
+    /// <summary>
+    /// <c>Worker:Swift</c> (sc-26130): <c>true</c> when the factory works Swift/Xcode repositories, so every sandbox user (worker
+    /// slot) must have Swift, xcodebuild with Xcode's first launch done and its license accepted, and the installed xcodebuild
+    /// wrapper (<see cref="Worker.SwiftToolchain"/>): start-up reads the installed wrapper, and each slot's readiness probe runs the
+    /// rest as that slot's user, failing the factory naming the slot and the fix. <c>false</c> (the default) checks nothing of
+    /// Swift or Xcode, so a .NET/Rust-only factory is never refused because Xcode is absent (E7); setup then only reports the Swift
+    /// toolchain. Why a setting and not the repositories: a target repository's stack is not known before its first item is read,
+    /// and start-up reads nothing from GitHub. With <c>Worker:RunAs=none</c> there is no sandbox user to check, so <c>true</c> is
+    /// refused there rather than ignored.
+    /// </summary>
+    public bool WorkerSwift
+    {
+        get
+        {
+            var swift = config["Worker:Swift"] switch
+            {
+                null => false,
+                var value when string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) => true,
+                var value when string.Equals(value, "false", StringComparison.OrdinalIgnoreCase) => false,
+                var other => throw new InvalidOperationException($"Worker:Swift must be 'true' or 'false', not '{other}'."),
+            };
+            return !swift || WorkerUser is not null
+                ? swift
+                : throw new InvalidOperationException(
+                    "Worker:Swift is true, but Worker:RunAs=none runs workers as the owner, with no sandbox user whose Swift toolchain "
+                    + "could be checked: remove Worker:Swift, or set Worker:RunAs to the worker user.");
+        }
+    }
 
     /// <summary>
     /// <c>Worker:Slots</c> (sc-25989): how many sandbox users run workers side by side, 1 (the default: the one sandbox user, as
@@ -496,7 +526,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
     /// </summary>
     public void ValidateSettings()
     {
-        _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSlotCount, WorkerSlots, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures, MaxConcurrentRuns);
+        _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSlotCount, WorkerSwift, WorkerSlots, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures, MaxConcurrentRuns);
         _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
         _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl, KanbanMcpUrl);
         _ = (CodeGraphOverlayTimeout, KanbanWatchScope, KanbanWebUrl);

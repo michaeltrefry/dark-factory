@@ -1,7 +1,12 @@
 #!/bin/bash
 # setup-worker-user.sh — one-time, idempotent setup of the Dark Factory worker sandbox (E5).
 #
-#   sudo scripts/setup-worker-user.sh [--owner <user>] [--worker <user>] [--slots <n>] [--work-root <dir>] [--remove-worker-login]
+#   sudo scripts/setup-worker-user.sh [--owner <user>] [--worker <user>] [--slots <n>] [--work-root <dir>] [--swift] [--remove-worker-login]
+#
+# --swift (sc-26130; for a factory with Worker:Swift=true, which works Swift/Xcode repositories): makes the Swift toolchain
+# check below required for every slot's user - swift, xcodebuild, Xcode's first launch done and its license accepted, each
+# run as that user through its own helper; a failure names the user and exits 1. Without it the same check only reports
+# (a .NET/Rust-only factory needs no Xcode). The xcodebuild wrapper is installed either way.
 #
 # --slots <n> (1-8, default 1; the orchestrator's Worker:Slots, which must not be larger): how many sandbox
 # users to set up, one per worker slot. The first is the worker user itself (default _factory, helper
@@ -36,9 +41,12 @@ slots=1
 work_root=/opt/dark-factory/work
 helper_dir=/usr/local/libexec/dark-factory
 helper=$helper_dir/factory-worker-launch
+# The only way a worker runs xcodebuild (scripts/factory-xcodebuild); one copy for every slot, it pins nothing per user.
+xcodebuild_wrapper=$helper_dir/factory-xcodebuild
 sudoers=/private/etc/sudoers.d/dark-factory
 script_dir=$(cd "$(dirname "$0")" && pwd)
 remove_worker_login=0
+swift=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -47,7 +55,8 @@ while [ $# -gt 0 ]; do
         --slots) slots=$2; shift 2 ;;
         --work-root) work_root=$2; shift 2 ;;
         --remove-worker-login) remove_worker_login=1; shift ;;
-        *) echo "usage: sudo $0 [--owner <user>] [--worker <user>] [--slots <n>] [--work-root <dir>] [--remove-worker-login]" >&2; exit 64 ;;
+        --swift) swift=1; shift ;;
+        *) echo "usage: sudo $0 [--owner <user>] [--worker <user>] [--slots <n>] [--work-root <dir>] [--swift] [--remove-worker-login]" >&2; exit 64 ;;
     esac
 done
 
@@ -253,6 +262,11 @@ visudo -cqf "$rule"
 install -o root -g wheel -m 0440 "$rule" "$sudoers"
 rm -f "$rule"
 
+# The xcodebuild wrapper (sc-26130): root-owned and unedited (the orchestrator compares it with the repo's when Worker:Swift is
+# on). Workers run it as themselves by its absolute path, the one xcodebuild rule they are allowed; it needs no sudoers rule.
+say "Installing $xcodebuild_wrapper"
+install -o root -g wheel -m 0755 "$script_dir/factory-xcodebuild" "$xcodebuild_wrapper"
+
 # Slots above <n> (a re-run with a smaller --slots): the sudoers file just installed holds no rule for them, so
 # their installed helpers are removed too. Left in place they would still pass the orchestrator's start-up
 # check (it only reads the files) with Worker:Slots unchanged, and the factory would fail later, in its first
@@ -356,6 +370,18 @@ check_optional_toolchain() {
     return 0
 }
 
+swift_tools=("/usr/bin/swift --version" "/usr/bin/xcodebuild -version" "/usr/bin/xcodebuild -checkFirstLaunchStatus" "/usr/bin/xcodebuild -license check")
+swift_failed() { # swift_failed <user>
+    cat >&2 <<EOF
+The Swift toolchain is not usable by $1 (worker slot $slot), which Worker:Swift=true needs. By command:
+  swift / xcodebuild -version: install Xcode and select it (sudo xcode-select -s /Applications/Xcode.app).
+  xcodebuild -checkFirstLaunchStatus: sudo xcodebuild -runFirstLaunch
+  xcodebuild -license check: sudo xcodebuild -license accept
+Then re-run this script with --swift (or set Worker:Swift=false if the factory works no Swift repository).
+EOF
+    exit 1
+}
+
 for slot in $(seq 1 "$slots"); do
     use_slot "$slot"
     echo "warning: the toolchain check runs commands as $worker through the helper, and each helper exit KILLS EVERY" >&2
@@ -370,6 +396,18 @@ for slot in $(seq 1 "$slots"); do
     # (toolchain-missing), never a pass; a factory that builds only .NET needs neither.
     say "Checking the optional Rust toolchain as $worker through the helper"
     check_optional_toolchain "Rust repos only: the new-tests check of a Rust pull request fails without it" "cargo --version" "rustc --version"
+
+    # Swift/Xcode target repositories only (sc-26130): the orchestrator with Worker:Swift=true probes the same four commands as
+    # each slot's user before a worker runs in that slot. Xcode itself is system-wide; its first launch and license are too
+    # (sudo xcodebuild -runFirstLaunch, sudo xcodebuild -license accept), and each user's DerivedData and SwiftPM caches are
+    # under its own home.
+    if [ "$swift" -eq 1 ]; then
+        say "Checking the Swift toolchain as $worker through the helper (--swift: required)"
+        check_toolchain "${swift_tools[@]}" || swift_failed "$worker"
+    else
+        say "Checking the optional Swift toolchain as $worker through the helper"
+        check_optional_toolchain "Swift repos only (Worker:Swift=true; then re-run with --swift)" "${swift_tools[@]}"
+    fi
 
     say "Done. Worker user: $worker  Helper: $helper  Work root: $work_root"
 done

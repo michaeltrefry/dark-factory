@@ -107,9 +107,10 @@ public sealed class WorkerSlots : IWorkerSandbox
     /// The configured pool: <paramref name="count"/> slots over the work root <paramref name="workRoot"/>, slot 1 being
     /// <paramref name="user"/> through <paramref name="helperPath"/> under the work root's lock as before slots.
     /// </summary>
-    public static WorkerSlots Create(string user, string helperPath, string workRoot, int count) =>
+    /// <paramref name="swift"/>: the Swift toolchain every slot's user must have (<c>Worker:Swift</c>, sc-26130), or null.
+    public static WorkerSlots Create(string user, string helperPath, string workRoot, int count, SwiftToolchain? swift = null) =>
         new([.. Enumerable.Range(1, count).Select(n => new WorkerSlot(n,
-            new WorkerSandbox(UserOf(user, n), HelperOf(helperPath, n)) { Lock = WorkerLock.For(workRoot, n), Reinstall = ReinstallCommand(count) }))]);
+            new WorkerSandbox(UserOf(user, n), HelperOf(helperPath, n)) { Lock = WorkerLock.For(workRoot, n), Reinstall = ReinstallCommand(count), Swift = swift }))]);
 
     /// <summary>A pool of the one slot <paramref name="sandbox"/> is.</summary>
     public static WorkerSlots Single(WorkerSandbox sandbox) => new([new WorkerSlot(1, sandbox)]);
