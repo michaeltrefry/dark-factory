@@ -20,7 +20,7 @@ Claude Code headless workers through the Weave router.
   review and merge gate (`Gate/`: `ReviewModels` (which panel calls count), `ReviewPanel` (roles, prompts, findings),
   `Reviewer.cs` (`IReviewer`/`RouterReviewer`) reading the router's stream with `MessageStream`, `GatePolicy` (+ `RiskyPaths`)
   and the path tiers `PathTiers`, `MergeGate`, `FixLoop`, `CiHeal`, `MergeQueue`, the test-only `GateCheckSeam`, the new-tests
-  check `NewTests.cs` (`NewTestsCheck`)/`XunitNewTests`/`CargoNewTests` (Rust, over the lexer-level `RustSource`)/`SwiftNewTests` (Swift Testing, over `SwiftSource`, sc-26127)/`SandboxTestRunner`,
+  check `NewTests.cs` (`NewTestsCheck`)/`XunitNewTests`/`CargoNewTests` (Rust, over the lexer-level `RustSource`)/`SwiftNewTests` (Swift Testing, over `SwiftSource`, sc-26127)/`XcodeNewTests` (Xcode projects' macOS tests, over `XcodeProject.cs`, sc-26131)/`SandboxTestRunner`,
   the plan-time check of a repository's CI workflow triggers `CiTriggers.cs` (sc-25873; pipeline side `RunPipeline.CiTriggers.cs`);
   reviewer prompts in `factory/prompts/`; GitHub side
   `GitHub/GateGitHub.cs`; pipeline handlers `RunPipeline.Gate.cs`, the merge gate and queue `RunPipeline.MergeQueue.cs`),
@@ -2878,6 +2878,60 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   skipped without `swift`), `SwiftBaseBuildTests.cs` (the layout, not-built, error, retries in stages, unproven; the real
   toolchain: a test of a function the base lacks `not-built` and the check a pass, an import of a module the base lacks
   then its user in stages, a broken production file `error`).
+  Xcode projects, macOS (Phase 5 S5, sc-26131, `Gate/XcodeNewTests.cs` over `Gate/XcodeProject.cs`): only with `Worker:Swift`
+  on (`NewTestsCheck.StrategiesFor(swift)`, which the pipeline's `swift` parameter picks; off, it is exactly `Strategies` and
+  `SwiftNewTests` names an Xcode project's test file `unsupported` "… only in a factory with Worker:Swift on", E7). On,
+  `SwiftNewTests(xcode: true)` leaves every `.swift` file in no SwiftPM package (no `Package.swift` above it) to
+  `XcodeNewTests`. Which target compiles a file is read from every `*.xcodeproj/project.pbxproj` of the commit (`Pbx`, an
+  old-style plist reader: a key twice, a data literal, an unknown escape, nesting past 64 throw — never "no targets"), both
+  ways Xcode records it: classic file references (a `PBXBuildFile` of the target's `PBXSourcesBuildPhase`, its file
+  reference's path resolved through its groups: `<group>`, `SOURCE_ROOT`; build products/SDK files are not repository files)
+  and Xcode 16+ synchronized folders (`PBXFileSystemSynchronizedRootGroup`: everything under it, less a
+  `PBXFileSystemSynchronizedBuildFileExceptionSet`'s `membershipExceptions` for the target, plus another folder's exceptions
+  naming it). Anything else — `<absolute>` or another source tree, a `$(…)` path, a path leaving the repository, a folder's
+  `explicitFileTypes`/`explicitFolders`, an exception set of another kind or with a key not read, a `projectDirPath` — is
+  "not known" and fails closed. New tests: `@Test` functions (`SwiftSource`) in the head versions of files a macOS
+  unit-test target (`com.apple.product-type.bundle.unit-test`) compiles at the head, whose id no base version of a changed
+  file in that target has; the id is xcodebuild's own, `<Target>/<function>()` or `<Target>/<Type>/<Nested>/<function>()`
+  (verified on Xcode 26.5: what `-only-testing:` takes and the result bundle names). `unsupported` (never `no-tests`): a
+  changed file that adds tests or looks like a test file that no unit-test target compiles (not a member of its test
+  target — "add it to its test target" —, or compiled only by a UI-test or other target), a membership or project that
+  cannot be read, a parameterized test or new XCTest method (S3), a backticked name or an id/path/scheme the wrapper's
+  patterns refuse, an id declared twice, a target that does not build for macOS in its scheme's test configuration
+  (`SDKROOT` `macosx`, or `auto` with `macosx` in `SUPPORTED_PLATFORMS`; one set only in an `.xcconfig` is not known; iOS is
+  S6), no shared scheme (`xcshareddata/xcschemes`, the workspace's then the project's, first by name) whose test action runs
+  the target — at the head and the same one at the base — or one that only runs a test plan or selects/skips tests, a
+  project named by two workspaces (one names it: `-workspace`), and a base without the target. Base overlay: every changed
+  file a unit-test target compiles (head or base); schemes and production code stay the base's, and so does the project file
+  but for one edit: a new test file under classic references (compiled only because the PR's `project.pbxproj` adds it) and a
+  test file the PR removes from one are added to / taken out of the base's test target Sources
+  (`XcodeProject.WithClassicSources`: a `SOURCE_ROOT` file reference in the main group and a build file in the target's one
+  Sources phase, made by text edit and then checked — every other object exactly the base's, the two lists changed by exactly
+  those ids, the target compiling exactly the right files — else `unsupported`), written as `NewTestSet.BaseReplacements`;
+  the PR's project file itself is never applied (it would bring its production targets' changes). A new file in a
+  synchronized folder needs no edit. Runs (`SandboxTestRunner`, as the item's slot's sandbox user): `/usr/bin/xcodebuild
+  -version` and `/usr/bin/xcrun --find xcresulttool` (toolchain), per project+scheme the installed wrapper
+  `SwiftToolchain.DefaultWrapperPath build-for-testing -project|-workspace … -scheme … -destination platform=macOS -quiet`
+  (output kept: the build log; a base that does not build is not attributed yet — every error unattributable, `error`, the
+  S2 seam `ExplainBuildFailure`), then per test the wrapper's `test-without-building … -only-testing:<id> -resultBundlePath
+  <results>/xcode-test-<16 hex>.xcresult -quiet` (exit code kept) and `/usr/bin/xcrun xcresulttool get test-results tests
+  --path <bundle>` (its JSON kept): the bundle is read IN the sandbox by the user whose tests wrote it, and only its JSON
+  (bounded by the 50 MB capture) reaches the owner, parsed as untrusted (`XcodeNewTests.Cases`: Xcode 26.5's shape, pinned in
+  `Fixtures/xcresult` — `testNodes` → `Unit test bundle` named for the target → `Test Suite`s → `Test Case` with
+  `nodeIdentifier` and `result` `Passed`/`Failed`/`Skipped`/`Expected Failure` (passed); anything else unreadable). A JSON is
+  read only when xcresulttool exited 0, every case is its step's test, and xcodebuild's exit code agrees (0 exactly when no
+  case failed; a test absent from the build gives no case: `not-run`, an `error`). The gateway lint needs nothing new: the
+  steps' programs are `TestStep.Program`, a known local program. Residual, accepted (the Xcode counterpart of `~/.cargo`'s):
+  the wrapper's DerivedData (`~<user>/Library/Developer/Xcode/DerivedData/dark-factory/<key of the worktree path>`) and
+  SwiftPM checkouts persist in the slot user's home, are writable by every worker session of that slot and are reused by the
+  next gate run of a worktree of the same name (`gate-<item>-base|head`), so an implementer could influence later gate runs
+  of the same item; and they are never deleted — the gate's DerivedData grows by two directories per item that reaches the
+  check (remove `…/DerivedData/dark-factory` as that user to reclaim it). Tests: `XcodeNewTestsTests.cs` (the plist reader,
+  membership both ways and its unknowns, platform, schemes, workspaces, identification and every `unsupported` above, the
+  classic edit and its refusals, steps, the recorded xcresulttool JSON and every disagreement, the pipeline to Merge with
+  `Worker:Swift` on and to an escalation with it off, and the real toolchain — the repo's wrapper over the real xcodebuild
+  as the OWNER, never a sandbox user, building `Fixtures/xcode-macos` and `xcode-classic` and running each new test alone on
+  the base and the head, the DerivedData it made in the owner's home deleted after; skipped without Xcode).
   Upgrading from Phase 1: Review is now a handled state, so the first `factory work` picks up every item parked at Review:
   an open PR is reviewed by the panel like any other (Phase 1's missing `implementer-model` no longer matters, sc-25379),
   and one the owner merged or closed escalates once with a story comment ("merged outside the factory"). An item whose

@@ -1,0 +1,67 @@
+{
+  "devices" : [
+    {
+      "architecture" : "arm64",
+      "deviceId" : "00000000-0000000000000000",
+      "deviceName" : "My Mac",
+      "modelName" : "Mac",
+      "osBuildNumber" : "25G83",
+      "osVersion" : "26.6.2",
+      "platform" : "macOS"
+    }
+  ],
+  "testNodes" : [
+    {
+      "children" : [
+        {
+          "children" : [
+            {
+              "children" : [
+                {
+                  "children" : [
+                    {
+                      "children" : [
+                        {
+                          "name" : "More.swift:4: Expectation failed: isBlank(\" \")",
+                          "nodeType" : "Failure Message"
+                        }
+                      ],
+                      "duration" : "0.00063s",
+                      "durationInSeconds" : 0.0006349086761474609,
+                      "name" : "deep()",
+                      "nodeIdentifier" : "Outer/Inner/deep()",
+                      "nodeIdentifierURL" : "test://com.apple.xcode/Words/WordsTests/Outer/Inner/deep()",
+                      "nodeType" : "Test Case",
+                      "result" : "Failed"
+                    }
+                  ],
+                  "name" : "Inner",
+                  "nodeIdentifierURL" : "test://com.apple.xcode/Words/WordsTests/Outer/Inner",
+                  "nodeType" : "Test Suite",
+                  "result" : "Failed"
+                }
+              ],
+              "name" : "Outer",
+              "nodeIdentifierURL" : "test://com.apple.xcode/Words/WordsTests/Outer",
+              "nodeType" : "Test Suite",
+              "result" : "Failed"
+            }
+          ],
+          "name" : "WordsTests",
+          "nodeIdentifierURL" : "test://com.apple.xcode/Words/WordsTests",
+          "nodeType" : "Unit test bundle",
+          "result" : "Failed"
+        }
+      ],
+      "name" : "Words",
+      "nodeType" : "Test Plan",
+      "result" : "Failed"
+    }
+  ],
+  "testPlanConfigurations" : [
+    {
+      "configurationId" : "1",
+      "configurationName" : "Test Scheme Action"
+    }
+  ]
+}

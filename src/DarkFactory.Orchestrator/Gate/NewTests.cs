@@ -389,6 +389,14 @@ public static class NewTestsCheck
     /// <summary>The supported stacks.</summary>
     public static readonly IReadOnlyList<INewTestStrategy> Strategies = [new XunitNewTests(), new CargoNewTests(), new SwiftNewTests()];
 
+    /// <summary>
+    /// The supported stacks of a factory: with <c>Worker:Swift</c> on (<paramref name="swift"/>, sc-26131) also Xcode projects'
+    /// macOS tests (<see cref="XcodeNewTests"/>, run through the installed xcodebuild wrapper <paramref name="wrapperPath"/>);
+    /// off, exactly <see cref="Strategies"/> (E7).
+    /// </summary>
+    public static IReadOnlyList<INewTestStrategy> StrategiesFor(bool swift, string wrapperPath = Worker.SwiftToolchain.DefaultWrapperPath) =>
+        swift ? [new XunitNewTests(), new CargoNewTests(), new SwiftNewTests(xcode: true), new XcodeNewTests(wrapperPath)] : Strategies;
+
     public static async Task<NewTestsResult> RunAsync(IGateTestRunner runner, IReadOnlyList<INewTestStrategy> strategies, RepoRef repo,
         string baseSha, string headSha, string runName, Action<string>? log, CancellationToken ct)
     {

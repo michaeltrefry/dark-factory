@@ -57,7 +57,12 @@ public sealed record SwiftNewTestSet(IReadOnlyList<ChangedFile> TestFiles, IRead
 /// errors (<see cref="ExplainBuildFailure"/>, sc-26128) and retried up to <see cref="BaseRetries"/> times.
 /// </para>
 /// </summary>
-public sealed class SwiftNewTests : INewTestStrategy
+/// <param name="xcode">
+/// Whether <see cref="XcodeNewTests"/> runs beside it (a factory with <c>Worker:Swift</c> on, sc-26131): a file in no SwiftPM
+/// package is then left to it; otherwise such a file that adds tests, or looks like a test, is unsupported here, saying that
+/// an Xcode project's tests are run only with <c>Worker:Swift</c> on.
+/// </param>
+public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
 {
     public string Name => "swift-testing";
 
@@ -162,7 +167,7 @@ public sealed class SwiftNewTests : INewTestStrategy
         {
             if (await PackageAsync(path, ct) is not { } package)
             {
-                return new Location(null, null, false, "it is in no SwiftPM package (no Package.swift above it; Xcode projects are not supported)");
+                return new Location(null, null, false, "it is in no SwiftPM package (no Package.swift above it), and the gate runs an Xcode project's tests only in a factory with Worker:Swift on");
             }
             var parts = Relative(package.Directory, path).Split('/');
             return parts switch
@@ -232,6 +237,10 @@ public sealed class SwiftNewTests : INewTestStrategy
                 continue;
             }
             var place = await head.LocateAsync(path, ct);
+            if (xcode && place.Package is null)
+            {
+                continue; // in no SwiftPM package: an Xcode project's file, XcodeNewTests's (sc-26131)
+            }
             if (await head.ParseAsync(path, ct) is not { } file)
             {
                 var text = await head.ReadAsync(path, ct) ?? "";

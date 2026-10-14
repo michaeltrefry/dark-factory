@@ -1209,7 +1209,7 @@ public sealed partial class RunPipeline
         await using var watch = new TestRunWatch(_controls, _controlPoll, run.Item, log, _maxControlReadFailures, ct);
         try
         {
-            result = await NewTestsCheck.RunAsync(runner, NewTestsCheck.Strategies, run.Repo, pull.BaseSha, pull.HeadSha,
+            result = await NewTestsCheck.RunAsync(runner, NewTestsCheck.StrategiesFor(swift), run.Repo, pull.BaseSha, pull.HeadSha,
                 NewTestsCheck.RunName(run.Story), line => log.WriteLine($"[gate] {line}"), watch.Token);
         }
         catch (Exception) when (watch.Requested is { } requested && !ct.IsCancellationRequested)
