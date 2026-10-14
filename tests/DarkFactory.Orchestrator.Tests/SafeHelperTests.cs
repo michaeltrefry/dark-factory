@@ -389,6 +389,64 @@ public class SafeHelperTests
         }
     }
 
+    [Fact]
+    public async Task Seam_skips_a_dead_process_outside_the_test_rather_than_refusing()
+    {
+        // A dead process (a zombie; on Linux also one its parent is reaping right then, listed with parent 0) is in no one's
+        // tree, yet nothing a signal can reach: the helper's own watcher, reaped by its shell while that shell's seam listed the
+        // processes, was refused that way on CI (sc-25992). Skipped, never signalled, never a refusal.
+        var (detached, zombie) = OwnProcess.StartDetachedWithZombie(_dir);
+        try
+        {
+            var helper = GroupKillOf("400001", extra: $"send_signal -KILL -- {zombie} || true; ");
+
+            var (exitCode, stderr) = await RunAsync(helper);
+
+            Assert.True(exitCode == 0, $"exit {exitCode}: {stderr}");
+            Assert.Empty(helper.Refusals);
+            Assert.Contains($"skip KILL {zombie}", helper.TargetLog);
+            Assert.True(detached.IsAlive);
+        }
+        finally
+        {
+            detached.KillIfStillRunning();
+        }
+    }
+
+    [Fact]
+    public async Task Seam_allows_the_worker_group_when_its_only_member_outside_the_test_is_dead()
+    {
+        // The group's live member is the test's own (registered); its other member is a zombie whose parent is outside the test.
+        var (detached, zombie) = OwnProcess.StartDetachedWithZombie(_dir);
+        try
+        {
+            var registry = Path.Combine(_dir, "reg");
+            SafeHelper.Register(registry, detached);
+            var group = ProcessGroupOf(detached);
+            Assert.Equal(group, Pgid(zombie));
+            var helper = GroupKillOf(group, registry);
+
+            var (exitCode, stderr) = await RunAsync(helper);
+
+            Assert.True(exitCode == 0, $"exit {exitCode}: {stderr}");
+            Assert.Empty(helper.Refusals);
+            Assert.Contains($"log KILL -{group}", helper.TargetLog); // allowed; log-only, so not signalled
+            Assert.True(detached.IsAlive);
+        }
+        finally
+        {
+            detached.KillIfStillRunning();
+        }
+    }
+
+    private static string Pgid(int pid)
+    {
+        using var ps = Process.Start(new ProcessStartInfo("/bin/ps", ["-o", "pgid=", "-p", pid.ToString()]) { RedirectStandardOutput = true })!;
+        var group = ps.StandardOutput.ReadToEnd().Trim();
+        ps.WaitForExit();
+        return group;
+    }
+
     [Theory]
     [InlineData("0", "", "-0")]
     [InlineData("1", "", "-1")]

@@ -60,10 +60,15 @@ internal sealed record SafeHelperOptions
 /// (<see cref="BuildCopy"/>) or <see cref="SourceContains"/>.
 /// <para>The seam (<c>send_signal</c>) logs every target to <see cref="Targets"/> and, per target: signals it if it is the
 /// helper itself, in the helper's process tree, a <see cref="SafeHelperOptions.Registry"/> pid whose start time still matches
-/// (so a reused pid is never hit), or the group of the worker the helper started while every member of that group is one of
-/// those or this test host's own; skips it (no signal) if it is not the current user's or is another process of this test
-/// host's; and otherwise — pid or group 0 or 1 included — refuses: logs it to <see cref="Refusals"/> and exits 99 before
-/// signalling anything in that call.</para>
+/// (so a reused pid is never hit), or the group of the worker the helper started while every live member of that group is one
+/// of those or this test host's own; skips it (no signal) if it is not the current user's, is another process of this test
+/// host's, or is dead; and otherwise — pid or group 0 or 1 included — refuses: logs it to <see cref="Refusals"/> and exits 99
+/// before signalling anything in that call.</para>
+/// <para>Dead is what <c>ps</c> lists in state <c>Z</c> (a zombie) or <c>X</c> (being reaped): nothing a signal can reach. On
+/// Linux a process its parent is reaping at the moment <c>ps</c> reads it is listed with parent 0 and group -1 (the kernel's
+/// <c>/proc/&lt;pid&gt;/stat</c> once the task has lost its signal handlers), so it is in no one's tree: the helper's own
+/// watcher, reaped by the helper's shell while that shell's seam listed the processes for its <c>send_signal "$watcher"</c>,
+/// was refused that way (exit 99, seen once on ubuntu CI). A live process is judged as before.</para>
 /// </summary>
 [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
 internal sealed class SafeHelper
@@ -251,16 +256,17 @@ internal sealed class SafeHelper
             __seam_classify() {
                 local reg
                 reg=" $(__seam_registry | /usr/bin/tr '\n' ' ') "
-                /bin/ps -A -o pid=,ppid=,uid=,pgid= 2>/dev/null | /usr/bin/awk -v self="$$" -v host={{host}} -v uid={{uid}} -v reg="$reg" -v worker="${worker:-}" -v logonly={{(options.LogOnly ? 1 : 0)}} -v targets="$*" '
+                /bin/ps -A -o pid=,ppid=,uid=,pgid=,stat= 2>/dev/null | /usr/bin/awk -v self="$$" -v host={{host}} -v uid={{uid}} -v reg="$reg" -v worker="${worker:-}" -v logonly={{(options.LogOnly ? 1 : 0)}} -v targets="$*" '
                     function under(p, root,   n) { n = 0; while (p != root && (p in up) && n++ < 100000) p = up[p]; return p == root }
                     function own(p) { return p == self || under(p, self) || under(p, host) || index(reg, " " p " ") }
+                    function dead(p) { return state[p] ~ /^[XZ]/ }
                     function out(c, x) { if (c == "kill" && logonly && !(x == self || under(x, self))) c = "log"; print c, x }
                     function group_ok(g,   p) {
                         if (worker !~ /^[0-9]+$/ || g != worker + 0 || g <= 1) return 0
-                        for (p in grp) if (grp[p] + 0 == g && !own(p)) return 0
+                        for (p in grp) if (grp[p] + 0 == g && !own(p) && !dead(p)) return 0
                         return 1
                     }
-                    { up[$1] = $2; owner[$1] = $3; grp[$1] = $4 }
+                    { up[$1] = $2; owner[$1] = $3; grp[$1] = $4; state[$1] = $5 }
                     END {
                         nt = split(targets, t, " ")
                         for (i = 1; i <= nt; i++) {
@@ -268,7 +274,7 @@ internal sealed class SafeHelper
                             if (x ~ /^-[0-9]+$/) out(group_ok(substr(x, 2) + 0) ? "kill" : "refuse", x)
                             else if (x !~ /^[0-9]+$/ || x + 0 <= 1) out("refuse", x)
                             else if (x == self || under(x, self) || index(reg, " " x " ")) out("kill", x)
-                            else if (!(x in up) || owner[x] != uid || under(x, host)) out("skip", x)
+                            else if (!(x in up) || owner[x] != uid || under(x, host) || dead(x)) out("skip", x)
                             else out("refuse", x)
                         }
                     }'

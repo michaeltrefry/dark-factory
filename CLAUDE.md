@@ -83,7 +83,9 @@ Claude Code headless workers through the Weave router.
 - `tests/DarkFactory.Orchestrator.Tests` — unit tests (no network; fake HTTP APIs, InMemory EF, local git).
   Tests run `scripts/factory-worker-launch` only through `SafeHelper` (a checked copy whose every signal goes through a
   seam that signals only the test's own processes, and whose uid-sweep listing names only the helper's tree and the test's
-  registered pids; `SafeHelper.Source` is private); `SafeHelperTests` fails if a test
+  registered pids; a dead target — `ps` state `Z`, or `X`: on Linux a process its parent is reaping right then is listed with
+  parent 0, which once refused the helper's own watcher, exit 99, sc-25992 — is skipped, never signalled, and a dead group
+  member does not count; `SafeHelper.Source` is private); `SafeHelperTests` fails if a test
   reaches the real helper another way (a repo path, the installed path, `Worker:LaunchHelper`/`options.WorkerSandbox`/`options.WorkerSlots`, sc-25992).
   A test signals a process only through `OwnProcess` (pid + start time, recorded where the pid cannot have been reused;
   `KillIfStillRunning` signals only while the start time still matches); `OwnProcessTests` fails on any other kill in
@@ -285,7 +287,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Gate:TestTimeoutMinutes` | `20` (> 0: one sandboxed run — restore, build, the new tests — of the `new-tests-fail-on-base` check; still running at the timeout fails the check) |
 | `Factory:DefaultRepo` | `michaeltrefry/dark-factory-sandbox` (a story line `Repo: owner/name` overrides) |
 | `Factory:Repos` | empty; comma-separated `owner/name` (each well-formed, else refused at start-up naming the key): repositories the factory may plan and work in besides the default one (sc-25877). It only adds to the configured repositories (`FactoryOptions.ConfiguredRepos` = `Factory:DefaultRepo` ∪ `Factory:Repos` ∪ `GitHub:Watch:Repos`, case-insensitive, each once): a plan may name them and the freeze's main-red watches them. It turns on NO issue polling and works with `Worker:RunAs=none`. Both GitHub Apps must be installed there |
-| `Shortcut:Watch:Teams`, `Shortcut:Watch:Epics` | empty = watch nothing; comma-separated team mention names/ids, epic ids. Set, they make Shortcut a configured work source that `factory work` polls and then need `Shortcut:ApiToken` (else refused at start-up). `factory work` needs at least one configured (watched) work source — this, `Kanban:Watch:Projects` or `GitHub:Watch:Repos` — and exits 2 naming all three otherwise (sc-25982; a deliberate change from `main`, where a Shortcut token with an empty scope started the host with a warning and nothing to pick up) |
+| `Shortcut:Watch:Teams`, `Shortcut:Watch:Epics` | empty = watch nothing; comma-separated team mention names/ids, epic ids. Set, they make Shortcut a configured work source that `factory work` polls and then need `Shortcut:ApiToken` (else refused at start-up). `factory work` needs at least one configured (watched) work source — this, `Kanban:Watch:Projects` or `GitHub:Watch:Repos` — and exits 2 naming all three otherwise (sc-25982; a deliberate change from `main`, where a Shortcut token with an empty scope started the host with a warning and nothing to pick up; owner decision, confirmed 2026-10-14: kept) |
 | `GitHub:Watch:Repos` | empty = triage no issues; comma-separated `owner/name` whose issues `factory work` polls and triages (the workers' App needs Issues read/write there; refused with `Worker:RunAs=none`). It is the issue-triage watch list, not the list of repositories the factory may work in: a repository named here is also a configured repository, but to let the factory plan and work in a repository WITHOUT triaging its issues name it in `Factory:Repos` |
 | `Intake:PollSeconds` | `60` (> 0) |
 | `Intake:MaxItemFailures` | `3` (runs of one item failing in a row before `factory work` escalates/parks it, E10) |
@@ -329,7 +331,12 @@ unreachable. Router variables go to the helper on stdin; the helper builds the w
 (PATH, HOME from the password database, TMPDIR the user's own `getconf DARWIN_USER_TEMP_DIR` (else a 0700 `~/.tmp`; either only if
 it is a real directory, not a symlink, owned by the running user — an unusable getconf answer falls back to `~/.tmp`, an unusable
 `~/.tmp` makes the helper refuse to run, exit 70) — never the shared `/tmp`,
-where one sandbox user's NuGet locks refuse another's restore, helper_version 5, sc-25992 — MSBuild node reuse/build server off,
+where one sandbox user's NuGet locks refuse another's restore, helper_version 5, sc-25992. Residual, accepted: a worker session
+can replace its own user's `~/.tmp` with a symlink (on macOS that bites only once it has also replaced its own `getconf
+DARWIN_USER_TEMP_DIR` directory, `…/T`, with one: the helper falls back from that to `~/.tmp`); the helper then refuses that
+slot's later runs with exit 70 until someone removes it — it fails closed and concerns only that user's own files, the same class
+as `~/.cargo`. Recover by removing the symlink(s) as root or as that sandbox user (the helper makes `~/.tmp` again, 0700; macOS
+recreates its `…/T` directory) — MSBuild node reuse/build server off,
 router vars), refuses any
 other variable or a program that isn't an absolute path/plain name, and when the worker exits or its stdin
 closes kills the tree, the process group and then every other process of its own user (a sweep of `ps -U "$self_uid"`, the
@@ -449,7 +456,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   watch scope started `factory work` with a warning and nothing to pick up (and it went on finishing in-flight stories); now
   `factory work` exits 2 unless at least one source is watched, as the story's acceptance says — so an owner who empties every
   watch scope to drain the factory must keep one scope set (the lanes below then finish every source's in-flight items) or finish
-  the leftovers by id. Then each configured source's `ValidateScopeAsync` on its board (`CheckWatchScopeAsync`; an unwatched
+  the leftovers by id (owner decision, confirmed 2026-10-14: kept). Then each configured source's `ValidateScopeAsync` on its board (`CheckWatchScopeAsync`; an unwatched
   source's scope is not checked: no board request). The host (`AddIntake`) registers the registry as a singleton; the intake
   loop takes `registry.Lanes(…)` — one `IntakeLane` per source that is watched OR has its credential (coordinator decision,
   sc-25982 review), each with a `FactoryItemRunner` of its own, whose `InFlightAsync` lists only that source's items
