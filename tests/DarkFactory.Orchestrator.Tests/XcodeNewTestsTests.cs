@@ -793,10 +793,15 @@ public class XcodeRunTests
 /// <summary>sc-26131: an Xcode project's change through the pipeline, with Worker:Swift on.</summary>
 public class XcodePipelineTests
 {
-    [Fact]
-    public async Task An_xcode_change_with_a_new_macos_test_failing_on_the_base_and_passing_on_the_head_merges()
+    private const string NewTest = "import Testing\n@testable import Words\n@Test func blank() { #expect(isBlank(\"\")) }\n";
+
+    /// <summary>
+    /// The Xcode fixture's change (the library fixed, a new Swift Testing file). <paramref name="swiftIndexed"/>: CodeGraph's answers carry
+    /// C3's <c>languageIndexed: true</c> for Swift (sc-26137); without it a changed Swift file fails risk-threshold closed (sc-26133).
+    /// </summary>
+    private static Harness XcodeHarness(bool swift, bool swiftIndexed = true, bool diffHasTest = true)
     {
-        var h = new Harness { Swift = true };
+        var h = new Harness { Swift = swift };
         var runner = h.TestRunner;
         runner.BaseFiles.Clear();
         foreach (var (path, content) in XcodeFixture.Files())
@@ -806,10 +811,21 @@ public class XcodePipelineTests
         runner.HeadFiles = _ => new Dictionary<string, string>(runner.BaseFiles, StringComparer.Ordinal)
         {
             [XcodeFixture.Library] = XcodeFixture.Fixed,
-            ["WordsTests/BlankTests.swift"] = "import Testing\n@testable import Words\n@Test func blank() { #expect(isBlank(\"\")) }\n",
+            ["WordsTests/BlankTests.swift"] = NewTest,
         };
         h.GitHub.Diff = head => $"diff --git a/{XcodeFixture.Library} b/{XcodeFixture.Library}\n+change at {head}\n"
-            + $"diff --git a/WordsTests/BlankTests.swift b/WordsTests/BlankTests.swift\n+test at {head}\n";
+            + (diffHasTest ? $"diff --git a/WordsTests/BlankTests.swift b/WordsTests/BlankTests.swift\n+test at {head}\n" : "");
+        if (swiftIndexed)
+        {
+            h.CodeGraph.Impact = (path, sha) => C7Answers.ParsedImpactFile("Sandbox", path, sha, false, "none", languageIndexed: true, language: "Swift");
+        }
+        return h;
+    }
+
+    [Fact]
+    public async Task An_xcode_change_with_a_new_macos_test_failing_on_the_base_and_passing_on_the_head_merges()
+    {
+        var h = XcodeHarness(swift: true);
 
         var outcome = await h.Run();
 
@@ -824,22 +840,28 @@ public class XcodePipelineTests
     }
 
     [Fact]
+    public async Task An_xcode_change_escalates_on_risk_threshold_while_codegraph_does_not_index_swift()
+    {
+        // A CodeGraph before C3 (no languageIndexed flag) with no data for the Swift files: the new tests pass, the gate fails closed.
+        var h = XcodeHarness(swift: true, swiftIndexed: false);
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Empty(h.Merges);
+        Assert.Equal(NewTestsOutcome.Pass, NewTestsResult.FromDetail((await h.Rows()).Single(r => r.Step == RunPipeline.Steps.NewTests).Detail)!.Outcome);
+        Assert.Contains("CodeGraph does not index the language of a changed code file", outcome.Error);
+        Assert.Contains($"{XcodeFixture.Library} (Swift", outcome.Error);
+        var gate = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.GateDecision);
+        Assert.StartsWith("Blocked ", gate.Detail);
+        Assert.Contains($"language not indexed by CodeGraph: {XcodeFixture.Library} (Swift", gate.Detail);
+    }
+
+    [Fact]
     [FailsGateCheck(GateChecks.NewTestsFailOnBase)]
     public async Task With_worker_swift_off_an_xcode_change_is_not_merged()
     {
-        var h = new Harness();
-        var runner = h.TestRunner;
-        runner.BaseFiles.Clear();
-        foreach (var (path, content) in XcodeFixture.Files())
-        {
-            runner.BaseFiles[path] = content;
-        }
-        runner.HeadFiles = _ => new Dictionary<string, string>(runner.BaseFiles, StringComparer.Ordinal)
-        {
-            [XcodeFixture.Library] = XcodeFixture.Fixed,
-            ["WordsTests/BlankTests.swift"] = "import Testing\n@testable import Words\n@Test func blank() { #expect(isBlank(\"\")) }\n",
-        };
-        h.GitHub.Diff = head => $"diff --git a/{XcodeFixture.Library} b/{XcodeFixture.Library}\n+change at {head}\n";
+        var h = XcodeHarness(swift: false, diffHasTest: false);
 
         var outcome = await h.Run();
 
