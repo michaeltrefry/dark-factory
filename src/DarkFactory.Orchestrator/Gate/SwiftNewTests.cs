@@ -5,6 +5,16 @@ using System.Xml.Linq;
 namespace DarkFactory.Orchestrator.Gate;
 
 /// <summary>
+/// What <see cref="SwiftNewTests.IdentifyAsync"/> found, with each new test's place (sc-26128): its file and its key in
+/// that file (its types and signature, <c>Outer/Inner/f()</c>), by which a base build's errors are placed in it.
+/// </summary>
+public sealed record SwiftNewTestSet(IReadOnlyList<ChangedFile> TestFiles, IReadOnlyList<string> Tests, IReadOnlyList<string> Unisolable)
+    : NewTestSet(TestFiles, Tests, Unisolable)
+{
+    public IReadOnlyDictionary<string, (string Path, string Key)> Locations { get; init; } = new Dictionary<string, (string, string)>(StringComparer.Ordinal);
+}
+
+/// <summary>
 /// Swift/SwiftPM with Swift Testing (Phase 5, sc-26127), beside <see cref="XunitNewTests"/> and <see cref="CargoNewTests"/>.
 /// Nothing is compiled to find tests: <see cref="SwiftSource"/> reads each changed <c>.swift</c> file's functions from its
 /// tokens.
@@ -37,13 +47,16 @@ namespace DarkFactory.Orchestrator.Gate;
 /// one <c>swift test --skip-build --disable-xctest --filter ^&lt;id&gt;(/|$) --xunit-output …</c> per new test (Swift
 /// Testing matches the filter against the test's id followed by its source location), each reading only its own report
 /// and keeping its exit code, which the report must agree with. Results: Swift Testing's xUnit XML
-/// report (<see cref="ParseResults"/>). A base that does not build with the PR's test files is not attributed to the new
-/// tests yet: it is an <c>error</c>, never a pass.
+/// report (<see cref="ParseResults"/>). A base that does not build with the PR's test files is explained from swiftc's
+/// errors (<see cref="ExplainBuildFailure"/>, sc-26128) and retried up to <see cref="BaseRetries"/> times.
 /// </para>
 /// </summary>
 public sealed class SwiftNewTests : INewTestStrategy
 {
     public string Name => "swift-testing";
+
+    /// <summary>swiftc reports in stages (a module that does not resolve hides the errors of the code using it), as rustc does.</summary>
+    public int BaseRetries => 3;
 
     /// <summary>The program every step but the results directory's runs, found on the test runs' PATH (the launch helper's fixed one when sandboxed).</summary>
     public const string Swift = "swift";
@@ -192,6 +205,7 @@ public sealed class SwiftNewTests : INewTestStrategy
         }
 
         var news = new SortedDictionary<string, Location>(StringComparer.Ordinal);
+        var locations = new Dictionary<string, (string Path, string Key)>(StringComparer.Ordinal);
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var twice = new SortedSet<string>(StringComparer.Ordinal);
         var testFiles = new List<ChangedFile>();
@@ -263,6 +277,7 @@ public sealed class SwiftNewTests : INewTestStrategy
                 else
                 {
                     news[id] = place;
+                    locations[id] = (path, Key(test));
                 }
             }
         }
@@ -289,9 +304,10 @@ public sealed class SwiftNewTests : INewTestStrategy
             }
         }
 
-        return new NewTestSet(testFiles, news.Keys.ToList(), problems)
+        return new SwiftNewTestSet(testFiles, news.Keys.ToList(), problems)
         {
             Projects = news.ToDictionary(kv => kv.Key, kv => kv.Value.Package!.ManifestPath, StringComparer.Ordinal),
+            Locations = news.Keys.ToDictionary(id => id, id => locations[id], StringComparer.Ordinal),
         };
     }
 
@@ -470,9 +486,21 @@ public sealed class SwiftNewTests : INewTestStrategy
     private static readonly Regex UnlocatedError = new(@"^error: (?<message>.*)$", RegexOptions.CultureInvariant);
 
     /// <summary>
+    /// SwiftPM's echo of a compiler job that reported errors and exited 1 (<c>error: emit-module command failed with exit
+    /// code 1 (use -v to see invocation)</c>, Swift 6.3.2): it says no more than the located errors beside it. A job that
+    /// failed otherwise (a signal, another exit code) is still an error of its own.
+    /// </summary>
+    private static readonly Regex FailedJob = new(@"^error: [a-z-]+ command failed with exit code 1 \(use -v to see invocation\)$", RegexOptions.CultureInvariant);
+
+    /// <summary>
     /// The errors in <c>swift build</c>'s output: each line <c>/abs/path:line:col: error: message</c> (the file made
     /// relative to one of <paramref name="roots"/>, the worktree; outside it, no path) and each <c>error: message</c> line
-    /// (no file); code <c>swiftc</c>. The source excerpt the compiler prints under an error is not read again.
+    /// (no file) but SwiftPM's echo of a failed compiler job (<see cref="FailedJob"/>); code <c>swiftc</c>. The source
+    /// excerpt the compiler prints under an error is not read again. Why this text and not another format: SwiftPM's
+    /// <c>swift build</c> has no machine-readable diagnostics on a stable toolchain (swiftc's
+    /// <c>-serialize-diagnostics</c> is clang's binary bitstream, and would add a flag to every build), while the
+    /// <c>file:line:col: error:</c> header line is the same in both of swiftc's diagnostic styles (<c>swift</c>, the
+    /// default since 5.9, and <c>llvm</c>); a build that fails without one names no error, which is unattributable.
     /// </summary>
     public IReadOnlyList<BuildError> ParseBuildErrors(string log, IReadOnlyList<string> roots)
     {
@@ -484,7 +512,7 @@ public sealed class SwiftNewTests : INewTestStrategy
                 errors.Add(new BuildError(RelativeTo(located.Groups["file"].Value, roots), int.Parse(located.Groups["line"].Value, System.Globalization.CultureInfo.InvariantCulture),
                     int.Parse(located.Groups["col"].Value, System.Globalization.CultureInfo.InvariantCulture), "swiftc", located.Groups["message"].Value));
             }
-            else if (UnlocatedError.Match(line) is { Success: true } bare)
+            else if (UnlocatedError.Match(line) is { Success: true } bare && !FailedJob.IsMatch(line))
             {
                 errors.Add(new BuildError(null, 0, 0, "swiftc", bare.Groups["message"].Value));
             }
@@ -507,14 +535,100 @@ public sealed class SwiftNewTests : INewTestStrategy
     }
 
     /// <summary>
-    /// Not yet (a later story): a base that does not build with the PR's test files says nothing here about which new test
-    /// cannot build there, so every error is unattributable and the check is an <c>error</c>, never a pass.
+    /// A base that does not build with the PR's test files (sc-26128), as <see cref="CargoNewTests"/> explains rustc's
+    /// errors. Each error is placed, by <see cref="SwiftSource.Layout"/> on the applied file as it was built, in the
+    /// innermost declaration at its position (its unit). Every file the overlay applies is the PR's test code as a whole
+    /// (a changed file under a package's <c>Tests/</c>, from the head), so an error says something about the new tests
+    /// only there: an error in any other file (the base's production code, a manifest, an unchanged test file, a file
+    /// SwiftPM generated), in no file, or a build that names no error, is unattributable. A new test whose own function is
+    /// a unit, or whose type's header (<c>extension Missing</c>, <c>struct S: NewProtocol</c>) is, does not build on the
+    /// base. The retry's files leave every outermost unit out: a helper, another declaration or an <c>import</c> (a module
+    /// the base lacks) that did not compile, so the tests that do not need it get their real results, and a test that does
+    /// is named by the next stage. An error outside every declaration, between a type's members, or on a
+    /// conditional-compilation line (nothing a test lacks on the base shows there) is unremovable.
     /// </summary>
     public BuildFailure ExplainBuildFailure(NewTestSet set, IReadOnlyDictionary<string, string> applied, IReadOnlyList<BuildError> errors, IReadOnlyList<string> tests)
     {
-        var note = "a Swift base that does not build with the PR's test files is not attributed to the new tests yet";
-        IReadOnlyList<string> unattributable = errors.Count == 0 ? [$"the build failed and named no error ({note})"]
-            : [$"{note}:", .. errors.Select(e => e.ToString())];
-        return new BuildFailure([], unattributable, [], [], new Dictionary<string, string>(StringComparer.Ordinal));
+        var swift = set as SwiftNewTestSet;
+        var unattributable = new List<string>();
+        var unremovable = new List<string>();
+        var files = new SortedDictionary<string, (SwiftLayout Layout, HashSet<SwiftItem> Units)>(StringComparer.Ordinal);
+        if (errors.Count == 0)
+        {
+            unattributable.Add("the build failed without naming a compiler error (see the build's output: a manifest, dependency or linker error, or no swiftc)");
+        }
+        foreach (var error in errors)
+        {
+            if (swift is null || error.Path is not { } path || !Understands(path) || IsManifest(path) || !applied.TryGetValue(path, out var text))
+            {
+                unattributable.Add(error.ToString());
+                continue;
+            }
+            if (!files.TryGetValue(path, out var file))
+            {
+                try
+                {
+                    files[path] = file = (SwiftSource.Layout(text), new HashSet<SwiftItem>(ReferenceEqualityComparer.Instance));
+                }
+                catch (FormatException)
+                {
+                    unattributable.Add(error.ToString());
+                    continue;
+                }
+            }
+            var position = file.Layout.Position(error.Line, error.Column);
+            var chain = position < 0 ? [] : file.Layout.ItemsAt(position);
+            var last = chain.Count > 0 ? chain[^1] : null;
+            if (position < 0)
+            {
+                unattributable.Add(error.ToString());
+            }
+            else if (last is null || last.IsDirective || (last.BodyOpen >= 0 && position >= last.BodyOpen))
+            {
+                unremovable.Add(error.ToString());
+            }
+            else
+            {
+                file.Units.Add(last);
+            }
+        }
+
+        var notBuilt = new HashSet<string>(StringComparer.Ordinal);
+        var removed = new List<string>();
+        var replacements = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var (path, (layout, units)) in files.Where(f => f.Value.Units.Count > 0))
+        {
+            SwiftFile parsed;
+            try
+            {
+                parsed = SwiftSource.Parse(layout.Text);
+            }
+            catch (FormatException e)
+            {
+                // Laid out but its tests cannot be found again: nothing is said about them.
+                unattributable.Add($"{path} cannot be read as Swift source ({e.Message}), so its errors cannot be placed in its tests");
+                continue;
+            }
+            foreach (var func in parsed.Tests)
+            {
+                if (layout.ItemsAt(func.Start).Any(units.Contains))
+                {
+                    notBuilt.UnionWith(tests.Where(id => swift!.Locations.TryGetValue(id, out var at) && at == (path, Key(func))));
+                }
+            }
+            var outermost = units.Where(u => !layout.ItemsAt(u.Start).TakeWhile(i => !ReferenceEquals(i, u)).Any(units.Contains)).OrderByDescending(u => u.Start).ToList();
+            var rewritten = new System.Text.StringBuilder(layout.Text);
+            foreach (var unit in outermost)
+            {
+                rewritten.Remove(unit.Start, unit.End - unit.Start);
+            }
+            removed.AddRange(outermost.AsEnumerable().Reverse().Select(u => $"{path}:{layout.LineOf(u.Start)} {Describe(layout, u)}"));
+            replacements[path] = rewritten.ToString();
+        }
+        return new BuildFailure(tests.Where(notBuilt.Contains).ToList(), unattributable, unremovable, removed, replacements);
     }
+
+    private static string Describe(SwiftLayout layout, SwiftItem item) =>
+        item.Keyword.Length > 0 && item.Name.Length > 0 ? $"{item.Keyword} {item.Name}"
+        : Regex.Replace(layout.Text[item.Start..item.End], @"\s+", " ") is var text && text.Length > 60 ? text[..60] + "…" : text;
 }

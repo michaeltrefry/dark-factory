@@ -589,22 +589,6 @@ public class SwiftRunOutputTests
     }
 
     [Fact]
-    public async Task A_base_that_does_not_build_with_the_prs_test_files_is_an_error_never_a_pass()
-    {
-        var runner = SwiftIdentifyTests.Runner((SwiftIdentifyTests.TestFile, SwiftIdentifyTests.BaseTests + "@Test func trims() { #expect(trim(\" a \") == \"a\") }\n"));
-        runner.Answer = spec => spec.OverlayFrom is null ? FakeTestRunner.Report(spec.Steps, TestCaseResult.Passed)
-            : FakeTestRunner.NotBuilt(new BuildError(SwiftIdentifyTests.TestFile, 5, 28, "swiftc", "cannot find 'trim' in scope"));
-
-        var result = await NewTestsCheck.RunAsync(runner, NewTestsCheck.Strategies, new RepoRef("acme", "words"), FakeTestRunner.BaseSha, "head1", "gate-sc-1", null,
-            CancellationToken.None);
-
-        Assert.Equal(NewTestsOutcome.Error, result.Outcome);
-        Assert.Contains("a Swift base that does not build with the PR's test files is not attributed to the new tests yet", result.Reason);
-        Assert.Contains("cannot find 'trim' in scope", result.Reason);
-        Assert.Equal(2, runner.Runs.Count); // no retry
-    }
-
-    [Fact]
     public void The_filter_escapes_every_regex_character_of_the_id()
     {
         Assert.Equal(@"^My_Tests\.A\/B\/f\(x\:_\:\)(/|$)", SwiftNewTests.Filter("My_Tests.A/B/f(x:_:)"));

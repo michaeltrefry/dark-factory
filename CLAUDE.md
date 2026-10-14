@@ -2778,8 +2778,19 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   step asked for its name (`swift-test-99.xml`, a subdirectory), when it holds a case that is not its step's test (one test's
   code writing another's report), when its step's exit code is unknown or disagrees with it (0 exactly when no case failed),
   and a step with no report is unreadable too. A
-  base that does not build with the PR's test files is not attributed yet (S2): every error unattributable, `error`, never
-  a pass. Workers get `swift build` and `swift test` only (`ClaudeWorker.SwiftTools`, prefix rules like cargo's; `swift run`,
+  base that does not build (S2, sc-26128): swiftc's errors are read from `swift build`'s stdout, the `/abs/file:line:col:
+  error: …` header lines (the same in both diagnostic styles; SwiftPM has no stable machine-readable diagnostics, and
+  `-serialize-diagnostics` is clang's binary format), plus every unlocated `error:` line but SwiftPM's echo of a job that
+  exited 1 (`error: emit-module command failed with exit code 1 (use -v …)`); columns are UTF-8 bytes. Each is placed by
+  `SwiftSource.Layout` (each declaration of the top level and of type bodies with its span — attributes, multi-line signature
+  and body; a new one starts at an attribute, modifier or declaration keyword beginning a line or following `;` or a body's
+  `}`; a `#if`/`#else`/`#endif` line is its own item) in the innermost declaration of the applied file. Every applied file is
+  test code as a whole, so: in a new test's own function, or in the header of its type (`extension Missing`), → `not-built`;
+  in another declaration (a helper, a `var`) or an `import` (a module the base's manifest lacks) → left out of the retry
+  (only that import); outside every declaration, between a type's members or on a `#if` line → unremovable (the tests stay
+  `unproven`); in any file not applied (production code, `Package.swift`, an unchanged test file, a generated file), in no
+  file, or a build naming no error → unattributable, `error`. `BaseRetries` 3 (swiftc reports in stages: an unresolved
+  import hides the errors of the code using it); a test the last retry still cannot build is `unproven`. Workers get `swift build` and `swift test` only (`ClaudeWorker.SwiftTools`, prefix rules like cargo's; `swift run`,
   `swift package`, `swift <script>` taint as an allow rule and are not offered); `Package.swift`, `Package@swift-*.swift` and
   `Package.resolved` are `RiskyPaths` dependency manifests (a manifest is code SwiftPM runs). Residual, accepted (the Swift
   counterpart of cargo's (b)): `~_factory/.swiftpm` (its `configuration` — mirrors, registries — and security state) and
@@ -2787,7 +2798,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   every worker session and by the test code a gate run executes, so an implementer, or a PR's tests, can influence later
   resolves, builds and gate runs on both commits — as `_factory`'s NuGet cache and `~/.cargo` can. Tests: `SwiftNewTestsTests.cs`
   (reader, identification, steps/report/build-error parsing, the pipeline to Merge and the rejection, and the real toolchain,
-  skipped without `swift`).
+  skipped without `swift`), `SwiftBaseBuildTests.cs` (the layout, not-built, error, retries in stages, unproven; the real
+  toolchain: a test of a function the base lacks `not-built` and the check a pass, an import of a module the base lacks
+  then its user in stages, a broken production file `error`).
   Upgrading from Phase 1: Review is now a handled state, so the first `factory work` picks up every item parked at Review:
   an open PR is reviewed by the panel like any other (Phase 1's missing `implementer-model` no longer matters, sc-25379),
   and one the owner merged or closed escalates once with a story comment ("merged outside the factory"). An item whose
