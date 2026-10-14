@@ -1,0 +1,82 @@
+{
+  "devices" : [
+    {
+      "architecture" : "arm64",
+      "deviceId" : "00000000-0000000000000000",
+      "deviceName" : "My Mac",
+      "modelName" : "MacBook Pro",
+      "osBuildNumber" : "25G83",
+      "osVersion" : "26.6.2",
+      "platform" : "macOS"
+    }
+  ],
+  "testNodes" : [
+    {
+      "children" : [
+        {
+          "children" : [
+            {
+              "children" : [
+                {
+                  "children" : [
+                    {
+                      "duration" : "0.000085s",
+                      "durationInSeconds" : 8.511543273925781e-05,
+                      "name" : "\" \"",
+                      "nodeType" : "Arguments",
+                      "result" : "Passed"
+                    },
+                    {
+                      "duration" : "0.000088s",
+                      "durationInSeconds" : 8.797645568847656e-05,
+                      "name" : "\"\"",
+                      "nodeType" : "Arguments",
+                      "result" : "Passed"
+                    },
+                    {
+                      "children" : [
+                        {
+                          "name" : "More.swift:15: Expectation failed: isBlank(text → \"a\")",
+                          "nodeType" : "Failure Message"
+                        }
+                      ],
+                      "duration" : "0.0018s",
+                      "durationInSeconds" : 0.0017580986022949219,
+                      "name" : "\"a\"",
+                      "nodeType" : "Arguments",
+                      "result" : "Failed"
+                    }
+                  ],
+                  "duration" : "0.00064s",
+                  "durationInSeconds" : 0.0006437301635742188,
+                  "name" : "blanks(text:)",
+                  "nodeIdentifier" : "Params/blanks(text:)",
+                  "nodeIdentifierURL" : "test://com.apple.xcode/Words/WordsTests/Params/blanks(text:)",
+                  "nodeType" : "Test Case",
+                  "result" : "Failed"
+                }
+              ],
+              "name" : "Params",
+              "nodeIdentifierURL" : "test://com.apple.xcode/Words/WordsTests/Params",
+              "nodeType" : "Test Suite",
+              "result" : "Failed"
+            }
+          ],
+          "name" : "WordsTests",
+          "nodeIdentifierURL" : "test://com.apple.xcode/Words/WordsTests",
+          "nodeType" : "Unit test bundle",
+          "result" : "Failed"
+        }
+      ],
+      "name" : "Words",
+      "nodeType" : "Test Plan",
+      "result" : "Failed"
+    }
+  ],
+  "testPlanConfigurations" : [
+    {
+      "configurationId" : "1",
+      "configurationName" : "Test Scheme Action"
+    }
+  ]
+}

@@ -15,14 +15,18 @@ namespace DarkFactory.Orchestrator.Gate;
 /// closed). New tests: the <c>@Test</c> functions (<see cref="SwiftSource"/>) of the head versions of the files a unit-test
 /// target compiles at the head whose id no base version of a changed file in that target has. The id is what xcodebuild's
 /// <c>-only-testing:</c> takes and its result bundle names: <c>&lt;target&gt;/&lt;function&gt;()</c>, or
-/// <c>&lt;target&gt;/&lt;Type&gt;/&lt;Nested&gt;/&lt;function&gt;()</c> in a type.
+/// <c>&lt;target&gt;/&lt;Type&gt;/&lt;Nested&gt;/&lt;function&gt;()</c> in a type. XCTest's tests (sc-26129) are found over
+/// every file the target compiles, at the head and the base (<see cref="SwiftXCTest.Discover"/>: a subclass runs what it
+/// inherits), named <c>&lt;target&gt;/&lt;Class&gt;/testMethod()</c> as the result bundle names them; a parameterized test
+/// is one test, its result bundle's test case and each of its <c>Arguments</c> cases read as its cases.
 /// </para>
 /// <para>
 /// Unisolable (<c>unsupported</c>, never a pass and never <c>no-tests</c>): a changed file that adds tests, or looks like a
 /// test file, but that no unit-test target compiles (not a member of its test target, or of a UI-test or other target); a
 /// file the base run would apply that another target also compiles, at the head or at the base (its head production code
-/// would reach the base run); a file whose membership cannot be read, or a project that cannot be read; a parameterized test and a new XCTest method (a
-/// later story, as for SwiftPM); a backticked name or an id with characters the xcodebuild wrapper refuses; an id declared
+/// would reach the base run); a file whose membership cannot be read, or a project that cannot be read; an existing
+/// parameterized test whose arguments change, and a test-looking XCTest method the gate cannot run apart (sc-26129, as for
+/// SwiftPM: <see cref="SwiftXCTest"/>); a backticked name or an id with characters the xcodebuild wrapper refuses; an id declared
 /// twice; a target that builds for anything but macOS in its scheme's test configuration (iOS: a later story); a test
 /// bundle not named for its target (<see cref="XcodeProject.ProductNameProblem"/>); no shared scheme
 /// (<c>xcshareddata/xcschemes</c>) whose test action — or its default test plan (<see cref="XcodeTestPlan"/>, read whole or
@@ -178,6 +182,44 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
         }
 
         public async Task<bool> InPackageAsync(string path, CancellationToken ct) => XcodeNewTests.InPackage(await FilesAsync(ct), path);
+
+        /// <summary>
+        /// Every <c>.swift</c> file <paramref name="target"/> compiles, parsed (sc-26129); and those whose membership cannot be
+        /// told or that cannot be read.
+        /// </summary>
+        public async Task<(List<(string Path, SwiftFile File)> Files, List<string> Unknown)> ModuleAsync(XcodeProject project, XcodeTarget target, CancellationToken ct)
+        {
+            var (files, unknown) = (new List<(string, SwiftFile)>(), new List<string>());
+            var all = await FilesAsync(ct);
+            foreach (var path in all.Where(f => f.EndsWith(".swift", StringComparison.Ordinal) && !IsManifest(f) && !XcodeNewTests.InPackage(all, f)).Order(StringComparer.Ordinal))
+            {
+                XcodeMembership membership;
+                try
+                {
+                    membership = project.Membership(target, path);
+                }
+                catch (FormatException e)
+                {
+                    membership = XcodeMembership.NotKnown(e.Message);
+                }
+                if (membership.Unknown is not null)
+                {
+                    unknown.Add(path);
+                }
+                else if (membership.Member)
+                {
+                    if (await ParseAsync(path, ct) is { } file)
+                    {
+                        files.Add((path, file));
+                    }
+                    else
+                    {
+                        unknown.Add(path);
+                    }
+                }
+            }
+            return (files, unknown);
+        }
 
         /// <summary>Every Xcode project of the commit (not one inside another bundle), read; or why it cannot be.</summary>
         public async Task<List<(string Path, XcodeProject? Project, string? Problem)>> ProjectsAsync(CancellationToken ct)
@@ -369,15 +411,25 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
             return (tests, others, unknown);
         }
 
-        // The base's tests of the changed files, by target.
-        var baseIds = new HashSet<string>(StringComparer.Ordinal);
+        // The base's Swift Testing tests of the changed files, by target; and the unit-test targets whose XCTest tests may have
+        // changed (a changed file they compile declares a class or a test-looking method, at the head or the base).
+        var baseTests = new Dictionary<string, SwiftFunc>(StringComparer.Ordinal);
+        var xctestTargets = new SortedSet<string>(StringComparer.Ordinal);
+        static bool MayChangeXCTests(SwiftFile file) => file.Types.Any(t => t.Keyword is "class" or "extension") || file.Funcs.Any(SwiftXCTest.IsCandidate);
         foreach (var old in candidates.Select(c => c.OldPath).OfType<string>().Where(p => Swift(p)))
         {
             if (await @base.ParseAsync(old, ct) is { } file)
             {
-                foreach (var (_, target) in (await TargetsAsync(@base, old)).Tests)
+                foreach (var (project, target) in (await TargetsAsync(@base, old)).Tests)
                 {
-                    baseIds.UnionWith(file.Tests.Concat(file.XCTestMethods).Select(f => $"{target.Name}/{Key(f)}"));
+                    foreach (var test in file.Tests)
+                    {
+                        baseTests.TryAdd($"{target.Name}/{Key(test)}", test);
+                    }
+                    if (MayChangeXCTests(file))
+                    {
+                        xctestTargets.Add($"{project.Path}\n{target.Name}");
+                    }
                 }
             }
         }
@@ -387,6 +439,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
         var twice = new SortedSet<string>(StringComparer.Ordinal);
         var testFiles = new List<ChangedFile>();
         var removedClassic = new List<(string Project, string Target, string Path)>();
+        var argumentsChanged = new HashSet<string>(StringComparer.Ordinal);
         foreach (var change in candidates)
         {
             // A file the base compiled into a unit-test target that the PR deletes or renames: the base run removes it.
@@ -453,26 +506,28 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
             testFiles.Add(change);
             foreach (var (project, target) in tests)
             {
-                foreach (var test in functions)
+                if (MayChangeXCTests(file))
+                {
+                    xctestTargets.Add($"{project.Path}\n{target.Name}");
+                }
+                foreach (var test in file.Tests)
                 {
                     var id = $"{target.Name}/{Key(test)}";
                     if (!seen.Add(id))
                     {
                         twice.Add(id);
                     }
-                    if (baseIds.Contains(id))
+                    if (baseTests.TryGetValue(id, out var was))
                     {
+                        // An existing test: a parameterized one whose arguments changed has new cases that cannot be run apart from its old ones.
+                        if ((test.IsParameterized || was.IsParameterized) && test.TestArguments != was.TestArguments)
+                        {
+                            argumentsChanged.Add(id);
+                            problems.Add($"{id} in {path} is an existing parameterized test whose arguments: the pull request changes: its new cases cannot be run apart from its old ones");
+                        }
                         continue;
                     }
-                    if (!test.IsTest)
-                    {
-                        problems.Add($"{id} in {path} is a new XCTest test method: the gate runs Swift Testing's @Test tests only so far");
-                    }
-                    else if (test.IsParameterized)
-                    {
-                        problems.Add($"{id} in {path} is a parameterized test (@Test(arguments:), or a test function with parameters): the gate cannot run it apart yet");
-                    }
-                    else if (test.Name.Contains('`'))
+                    if (test.Name.Contains('`'))
                     {
                         problems.Add($"{id} in {path} has a backticked name, which the gate cannot name to xcodebuild's -only-testing");
                     }
@@ -483,6 +538,103 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                     else
                     {
                         news[id] = (project, target, path);
+                    }
+                }
+            }
+        }
+
+        // XCTest's tests of each unit-test target a changed file may change them in: every file the target compiles, read at
+        // the head and the base, since a method a class inherits is a test of that class too (sc-26129).
+        foreach (var key in xctestTargets)
+        {
+            var (projectPath, targetName) = (key[..key.IndexOf('\n')], key[(key.IndexOf('\n') + 1)..]);
+            if ((await head.ProjectsAsync(ct)).FirstOrDefault(p => p.Path == projectPath).Project is not { } project
+                || project.Targets.FirstOrDefault(t => t.Name == targetName && t.IsUnitTests) is not { } target)
+            {
+                continue; // the target is gone at the head: no test of it runs
+            }
+            var (headFiles, headUnknown) = await head.ModuleAsync(project, target, ct);
+            var baseProject = (await @base.ProjectsAsync(ct)).FirstOrDefault(p => p.Path == projectPath).Project;
+            var baseTarget = baseProject?.Targets.FirstOrDefault(t => t.Name == targetName && t.IsUnitTests);
+            var baseFiles = baseProject is not null && baseTarget is not null ? (await @base.ModuleAsync(baseProject, baseTarget, ct)).Files : [];
+            var (now, before) = (SwiftXCTest.Discover(headFiles), SwiftXCTest.Discover(baseFiles));
+            // A head problem is new unless its place was a test or a problem at the base: one that was only a test-looking
+            // method of a class that was no test class there is judged now.
+            var known = before.Tests.Select(t => t.Key).Concat(before.Problems.Select(p => p.Key)).ToHashSet(StringComparer.Ordinal);
+            var baseIdsOfTarget = before.Tests.Select(t => t.Key).ToHashSet(StringComparer.Ordinal);
+            var moved = SwiftXCTest.MovedUnchanged(before, now);
+            var added = now.Tests.Where(t => !baseIdsOfTarget.Contains(t.Key) && !moved.Contains(t.Key)).ToList();
+            var unjudged = now.Problems.Where(p => !known.Contains(p.Key)).ToList();
+            problems.AddRange(unjudged.Select(p => $"{targetName}/{p.Key} in {p.Path} is a new XCTest test method the gate cannot run apart: {p.Why}"));
+            if ((added.Count > 0 || unjudged.Count > 0) && headUnknown.Count > 0)
+            {
+                problems.Add($"which files the test target {targetName} compiles, or what they hold, cannot be told ({string.Join(", ", headUnknown.Take(5))}), so which XCTest classes inherit its new tests cannot be told");
+            }
+            foreach (var test in added)
+            {
+                var id = $"{targetName}/{test.Key}";
+                if (!seen.Add(id))
+                {
+                    twice.Add(id);
+                }
+                if (!WrapperTestId.IsMatch(id))
+                {
+                    problems.Add($"{id} in {test.Path} has characters the xcodebuild wrapper refuses in -only-testing");
+                    continue;
+                }
+                news[id] = (project, target, test.Path);
+            }
+        }
+        // An existing parameterized test whose arguments: are the same text may still get new cases: when they name a
+        // declaration of its unit-test target that the pull request changes (a fixture's new case, say). Failing closed (sc-26129).
+        var targetChanges = new SortedDictionary<string, (List<string> Head, List<string> Base)>(StringComparer.Ordinal);
+        foreach (var change in candidates)
+        {
+            foreach (var (tree, at) in new[] { (head, change.NewPath), (@base, change.OldPath) })
+            {
+                if (!Swift(at) || await tree.InPackageAsync(at!, ct))
+                {
+                    continue;
+                }
+                foreach (var (project, target) in (await TargetsAsync(tree, at!)).Tests)
+                {
+                    var key = $"{project.Path}\n{target.Name}";
+                    var entry = targetChanges.TryGetValue(key, out var known) ? known : targetChanges[key] = ([], []);
+                    (ReferenceEquals(tree, head) ? entry.Head : entry.Base).Add(at!);
+                }
+            }
+        }
+        foreach (var (key, (headPaths, basePaths)) in targetChanges)
+        {
+            var (projectPath, targetName) = (key[..key.IndexOf('\n')], key[(key.IndexOf('\n') + 1)..]);
+            if ((await head.ProjectsAsync(ct)).FirstOrDefault(p => p.Path == projectPath).Project is not { } project
+                || project.Targets.FirstOrDefault(t => t.Name == targetName && t.IsUnitTests) is not { } target)
+            {
+                continue; // the target is gone at the head: no test of it runs
+            }
+            var (baseTexts, headTexts) = (new List<string?>(), new List<string?>());
+            foreach (var p in basePaths.Distinct())
+            {
+                baseTexts.Add(await @base.ReadAsync(p, ct));
+            }
+            foreach (var p in headPaths.Distinct())
+            {
+                headTexts.Add(await head.ReadAsync(p, ct));
+            }
+            var changed = SwiftSource.ChangedDeclarations(baseTexts, headTexts);
+            if (changed is { Count: 0 })
+            {
+                continue;
+            }
+            foreach (var (path, file) in (await head.ModuleAsync(project, target, ct)).Files)
+            {
+                foreach (var test in file.Tests.Where(t => t.TestArguments is not null))
+                {
+                    var id = $"{targetName}/{Key(test)}";
+                    var existing = !news.ContainsKey(id) && !argumentsChanged.Contains(id) && (!headPaths.Contains(path) || baseTests.ContainsKey(id));
+                    if (existing && SwiftSource.ArgumentsReachChange(test, changed) is { } why)
+                    {
+                        problems.Add($"{id} in {path} is an existing parameterized test whose cases the pull request may change: {why}; its new cases cannot be run apart from its old ones");
                     }
                 }
             }
@@ -836,16 +988,28 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                         {
                             throw new InvalidDataException("a test case has no nodeIdentifier");
                         }
-                        cases.Add(new TestCaseResult($"{bundle}/{identifier}", result switch
+                        string Outcome(string? value) => value switch
                         {
                             "Passed" => TestCaseResult.Passed,
                             "Failed" => TestCaseResult.Failed,
                             // A known issue (withKnownIssue) recorded: the test checked nothing that passed, so it is no pass on
                             // the head, and no failure on the base either.
                             "Skipped" or "Expected Failure" => TestCaseResult.Skipped,
-                            _ => throw new InvalidDataException($"the test case {bundle}/{identifier} has the result '{result}', which the gate does not read"),
-                        }));
-                        break; // its children are its messages
+                            _ => throw new InvalidDataException($"the test case {bundle}/{identifier} has the result '{value}', which the gate does not read"),
+                        };
+                        cases.Add(new TestCaseResult($"{bundle}/{identifier}", Outcome(result)));
+                        // Its children are its messages and, for a parameterized test (sc-26129), one "Arguments" node per
+                        // argument case: each is a case of the same test, so it passes only when the test and every case did.
+                        if (children.ValueKind == JsonValueKind.Array)
+                        {
+                            foreach (var argument in children.EnumerateArray().Where(a => a.ValueKind == JsonValueKind.Object
+                                && a.TryGetProperty("nodeType", out var t) && t.ValueKind == JsonValueKind.String && t.GetString() == "Arguments"))
+                            {
+                                var value = argument.TryGetProperty("result", out var ar) && ar.ValueKind == JsonValueKind.String ? ar.GetString() : null;
+                                cases.Add(new TestCaseResult($"{bundle}/{identifier}", Outcome(value)));
+                            }
+                        }
+                        break;
                     }
                     case "Unit test bundle" or "UI test bundle":
                         if (bundle is not null)

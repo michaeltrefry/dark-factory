@@ -37,9 +37,22 @@ public sealed record SwiftNewTestSet(IReadOnlyList<ChangedFile> TestFiles, IRead
 /// and its production code stay the base's.
 /// </para>
 /// <para>
-/// Unisolable (the check is <c>unsupported</c>, never a pass), so later stories have a clean seam: a parameterized test
-/// (<c>@Test(arguments:)</c>, or a test function with parameters); a new XCTest method (<c>func test…()</c> in a file that
-/// imports XCTest); a new test, or a changed file that looks like a test (<see cref="NewTestsCheck.LooksLikeTest"/>),
+/// XCTest and parameterized tests (sc-26129). A new parameterized test (<c>@Test(arguments:)</c>) is one test whose id is
+/// its signature (<c>Target.blanks(text:)</c>): Swift Testing reports all its argument cases as one test case, failed when
+/// any case failed. An existing parameterized test whose <c>arguments:</c> the PR changes (<see cref="SwiftFunc.TestArguments"/>)
+/// is unsupported: its new cases cannot be run apart from its old ones; so is one whose arguments are unchanged text but
+/// name a declaration the pull request changes in its test target, or cannot be resolved to names while the target's
+/// declarations change (<see cref="SwiftSource.ArgumentsReachChange"/>). XCTest's tests of a test target are found over
+/// every file of the target at the head and the base (<see cref="SwiftXCTest.Discover"/>, when a changed file there declares
+/// a class or a test-looking method), so a method a class inherits is a test of that class too; a new one is
+/// <c>Target.Class/testMethod</c> (as <c>swift test list</c> names it) and is run with XCTest alone
+/// (<c>--disable-swift-testing --filter</c>), its result read from XCTest's own console lines (<see cref="XCTestCases"/>):
+/// SwiftPM writes an xUnit report for XCTest only with <c>--parallel</c>, where a skipped test reads as passed.
+/// </para>
+/// <para>
+/// Unisolable (the check is <c>unsupported</c>, never a pass): an existing parameterized test whose arguments change; a
+/// test-looking XCTest method the gate cannot run apart (<see cref="SwiftXCTest"/>: an unknown base class, an extension,
+/// <c>#if</c>, <c>@objc</c>, private, …); a new test, or a changed file that looks like a test (<see cref="NewTestsCheck.LooksLikeTest"/>),
 /// outside a SwiftPM test target (an Xcode project, <c>Sources/</c>, a target the manifest does not declare at its default
 /// path, or a package with a version-specific manifest <c>Package@swift-*.swift</c>); a test target the base's manifest
 /// does not declare; a test id declared twice (conditional compilation); a backticked test name; and a changed file that
@@ -90,7 +103,19 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
     /// <summary>The name a test step's standard output and exit code are kept under (<see cref="TestStep.CaptureOutput"/>), beside its report.</summary>
     public static string OutputName(string id) => ReportName(id)[..^".xml".Length] + ".out";
 
-    private static readonly Regex ReportFileName = new(@"^swift-test-[0-9a-f]{16}\.xml$", RegexOptions.CultureInvariant);
+    private static string Hash(string id) => Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(id)))[..16];
+
+    /// <summary>
+    /// The name an XCTest test's step output and exit code are kept under (sc-26129): <c>swift-xctest-&lt;16 hex of the id's
+    /// SHA-256&gt;-&lt;the target's name in hex&gt;.out</c> — the target, because XCTest on Linux names a test by its class
+    /// and method alone.
+    /// </summary>
+    public static string XCTestOutputName(string id) =>
+        $"swift-xctest-{Hash(id)}-{Convert.ToHexStringLower(System.Text.Encoding.UTF8.GetBytes(id[..id.IndexOf('.')]))}.out";
+
+    private static readonly Regex XCTestOutputFileName = new(@"^swift-xctest-(?<hash>[0-9a-f]{16})-(?<target>(?:[0-9a-f]{2})+)\.out$", RegexOptions.CultureInvariant);
+
+    private static readonly Regex ReportFileName =new(@"^swift-test-[0-9a-f]{16}\.xml$", RegexOptions.CultureInvariant);
 
     public bool Understands(string path) => path.EndsWith(".swift", StringComparison.Ordinal);
 
@@ -205,13 +230,23 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
         var (head, @base) = (new Tree(source, source.HeadSha), new Tree(source, source.BaseSha));
         var problems = new List<string>();
 
-        // The base's tests (both kinds) of the changed files, by id.
-        var baseIds = new HashSet<string>(StringComparer.Ordinal);
+        // The base's Swift Testing tests of the changed files, by id; and the test targets whose XCTest tests may have changed
+        // (a changed file there declares a class or a test-looking method, at the head or the base).
+        var baseTests = new Dictionary<string, SwiftFunc>(StringComparer.Ordinal);
+        var xctestTargets = new SortedDictionary<string, Location>(StringComparer.Ordinal);
+        bool MayChangeXCTests(SwiftFile file) => file.Types.Any(t => t.Keyword is "class" or "extension") || file.Funcs.Any(SwiftXCTest.IsCandidate);
         foreach (var old in changes.Select(c => c.OldPath).OfType<string>().Where(p => Understands(p) && !IsManifest(p)))
         {
-            if (await @base.ParseAsync(old, ct) is { } file && await @base.LocateAsync(old, ct) is { Target: { } target })
+            if (await @base.ParseAsync(old, ct) is { } file && await @base.LocateAsync(old, ct) is { Target: { } target } place)
             {
-                baseIds.UnionWith(file.Tests.Concat(file.XCTestMethods).Select(f => Id(target, f)));
+                foreach (var test in file.Tests)
+                {
+                    baseTests.TryAdd(Id(target, test), test);
+                }
+                if (MayChangeXCTests(file))
+                {
+                    xctestTargets[$"{place.Package!.Directory}\n{target}"] = place;
+                }
             }
         }
 
@@ -220,13 +255,22 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var twice = new SortedSet<string>(StringComparer.Ordinal);
         var testFiles = new List<ChangedFile>();
+        var targetChanges = new SortedDictionary<string, (Location Place, List<string> Head, List<string> Base)>(StringComparer.Ordinal);
+        var argumentsChanged = new HashSet<string>(StringComparer.Ordinal);
         foreach (var change in changes)
         {
             // Every changed file under a package's Tests/ is the PR's test code: the base run applies it.
             var inTests = false;
             foreach (var (tree, at) in new[] { (head, change.NewPath), (@base, change.OldPath) })
             {
-                inTests |= at is not null && (await tree.LocateAsync(at, ct)).InTests;
+                var located = at is null ? null : await tree.LocateAsync(at, ct);
+                inTests |= located is { InTests: true };
+                if (located is { Target: { } changedTarget } && Understands(at!) && !IsManifest(at!))
+                {
+                    var entry = targetChanges.TryGetValue($"{located.Package!.Directory}\n{changedTarget}", out var known) ? known
+                        : targetChanges[$"{located.Package!.Directory}\n{changedTarget}"] = (located, [], []);
+                    (ReferenceEquals(tree, head) ? entry.Head : entry.Base).Add(at!);
+                }
             }
             if (inTests)
             {
@@ -251,9 +295,9 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
                 }
                 continue;
             }
-            var tests = file.Tests.Concat(file.XCTestMethods).ToList();
             if (place.Target is not { } target)
             {
+                var tests = file.Tests.Concat(file.XCTestMethods).ToList();
                 // Outside a test target: no test of it can be run apart, so a new one (or a file that looks like a test) is unisolable.
                 var before = change.OldPath is { } old && await @base.ParseAsync(old, ct) is { } was
                     ? was.Tests.Concat(was.XCTestMethods).Select(Key).ToHashSet(StringComparer.Ordinal) : [];
@@ -266,26 +310,28 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
                 }
                 continue;
             }
-            foreach (var test in tests)
+            if (MayChangeXCTests(file))
+            {
+                xctestTargets[$"{place.Package!.Directory}\n{target}"] = place;
+            }
+            foreach (var test in file.Tests)
             {
                 var id = Id(target, test);
                 if (!seen.Add(id))
                 {
                     twice.Add(id);
                 }
-                if (baseIds.Contains(id))
+                if (baseTests.TryGetValue(id, out var was))
                 {
+                    // An existing test: a parameterized one whose arguments changed has new cases that cannot be run apart from its old ones.
+                    if ((test.IsParameterized || was.IsParameterized) && test.TestArguments != was.TestArguments)
+                    {
+                        argumentsChanged.Add(id);
+                        problems.Add($"{id} in {path} is an existing parameterized test whose arguments: the pull request changes: its new cases cannot be run apart from its old ones");
+                    }
                     continue;
                 }
-                if (!test.IsTest)
-                {
-                    problems.Add($"{id} in {path} is a new XCTest test method: the gate runs Swift Testing's @Test tests only so far");
-                }
-                else if (test.IsParameterized)
-                {
-                    problems.Add($"{id} in {path} is a parameterized test (@Test(arguments:), or a test function with parameters): the gate cannot run it apart yet");
-                }
-                else if (test.Name.Contains('`'))
+                if (test.Name.Contains('`'))
                 {
                     problems.Add($"{id} in {path} has a backticked name, which the gate cannot name to Swift Testing's filter");
                 }
@@ -293,6 +339,68 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
                 {
                     news[id] = place;
                     locations[id] = (path, Key(test));
+                }
+            }
+        }
+        // XCTest's tests of each test target a changed file may change them in: every file of the target read at the head and
+        // the base, since a method a class inherits is a test of that class too (sc-26129).
+        foreach (var place in xctestTargets.Values)
+        {
+            var (package, target) = (place.Package!, place.Target!);
+            var (headFiles, headUnreadable) = await ModuleAsync(head, package.Directory, target, ct);
+            var (baseFiles, _) = await ModuleAsync(@base, package.Directory, target, ct);
+            var (now, before) = (SwiftXCTest.Discover(headFiles), SwiftXCTest.Discover(baseFiles));
+            // A head problem is new unless its place was a test or a problem at the base: one that was only a test-looking
+            // method of a class that was no test class there is judged now.
+            var known = before.Tests.Select(t => t.Key).Concat(before.Problems.Select(p => p.Key)).ToHashSet(StringComparer.Ordinal);
+            var baseIdsOfTarget = before.Tests.Select(t => t.Key).ToHashSet(StringComparer.Ordinal);
+            var moved = SwiftXCTest.MovedUnchanged(before, now);
+            var added = now.Tests.Where(t => !baseIdsOfTarget.Contains(t.Key) && !moved.Contains(t.Key)).ToList();
+            var unjudged = now.Problems.Where(p => !known.Contains(p.Key)).ToList();
+            problems.AddRange(unjudged.Select(p => $"{target}.{p.Key} in {p.Path} is a new XCTest test method the gate cannot run apart: {p.Why}"));
+            if ((added.Count > 0 || unjudged.Count > 0) && headUnreadable.Count > 0)
+            {
+                problems.Add($"the test target {target}'s {string.Join(", ", headUnreadable)} cannot be read as Swift source, so which XCTest classes inherit its new tests cannot be told");
+            }
+            foreach (var test in added)
+            {
+                var id = XCTestId(target, test.Class, test.Method.Name);
+                if (!seen.Add(id))
+                {
+                    twice.Add(id);
+                }
+                news[id] = place;
+                locations[id] = (test.Path, Key(test.Method));
+            }
+        }
+        // An existing parameterized test whose arguments: are the same text may still get new cases: when they name a
+        // declaration of its test target that the pull request changes (a fixture's new case, say). Failing closed (sc-26129).
+        foreach (var (place, headPaths, basePaths) in targetChanges.Values)
+        {
+            var (baseTexts, headTexts) = (new List<string?>(), new List<string?>());
+            foreach (var p in basePaths.Distinct())
+            {
+                baseTexts.Add(await @base.ReadAsync(p, ct));
+            }
+            foreach (var p in headPaths.Distinct())
+            {
+                headTexts.Add(await head.ReadAsync(p, ct));
+            }
+            var changed = SwiftSource.ChangedDeclarations(baseTexts, headTexts);
+            if (changed is { Count: 0 })
+            {
+                continue;
+            }
+            foreach (var (path, file) in (await ModuleAsync(head, place.Package!.Directory, place.Target!, ct)).Files)
+            {
+                foreach (var test in file.Tests.Where(t => t.TestArguments is not null))
+                {
+                    var id = Id(place.Target!, test);
+                    var existing = !news.ContainsKey(id) && !argumentsChanged.Contains(id) && (!headPaths.Contains(path) || baseTests.ContainsKey(id));
+                    if (existing && SwiftSource.ArgumentsReachChange(test, changed) is { } why)
+                    {
+                        problems.Add($"{id} in {path} is an existing parameterized test whose cases the pull request may change: {why}; its new cases cannot be run apart from its old ones");
+                    }
                 }
             }
         }
@@ -335,7 +443,32 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
         };
     }
 
-    private const string Undeclared = "does not declare (as testTarget(name: \"…\") with a plain string) the test target";
+    /// <summary>Every <c>.swift</c> file of a test target (<c>Tests/&lt;target&gt;/</c> of the package), parsed; and those that cannot be.</summary>
+    private static async Task<(List<(string Path, SwiftFile File)> Files, List<string> Unreadable)> ModuleAsync(Tree tree, string packageDirectory, string target, CancellationToken ct)
+    {
+        var prefix = Join(packageDirectory, $"Tests/{target}/");
+        var (files, unreadable) = (new List<(string, SwiftFile)>(), new List<string>());
+        foreach (var path in (await tree.FilesAsync(ct)).Where(f => f.StartsWith(prefix, StringComparison.Ordinal) && f.EndsWith(".swift", StringComparison.Ordinal)).Order(StringComparer.Ordinal))
+        {
+            if (await tree.ParseAsync(path, ct) is { } file)
+            {
+                files.Add((path, file));
+            }
+            else
+            {
+                unreadable.Add(path);
+            }
+        }
+        return (files, unreadable);
+    }
+
+    /// <summary>An XCTest test's id as SwiftPM names it (<c>swift test list</c>): <c>Target.Class/testMethod</c>, no parentheses (sc-26129).</summary>
+    public static string XCTestId(string target, string type, string method) => $"{target}.{type}/{method}";
+
+    /// <summary>Whether an id is an XCTest test's (<see cref="XCTestId"/>): a Swift Testing id ends in its parameter list's <c>)</c>.</summary>
+    public static bool IsXCTestId(string id) => !id.EndsWith(')');
+
+    private const string Undeclared ="does not declare (as testTarget(name: \"…\") with a plain string) the test target";
 
     /// <summary>Null when the manifest declares the target at its default path; else what is wrong.</summary>
     private static async Task<string?> TargetAsync(Tree tree, string manifest, string target, CancellationToken ct)
@@ -401,6 +534,16 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
         steps.AddRange(byPackage.Select((g, n) => new TestStep(TestPhase.Build, Swift, ["build", "--package-path", g.Key, "--build-system", BuildSystem, "--build-tests"]) { CaptureOutput = $"swift-build-{n}" }));
         foreach (var id in byPackage.SelectMany(g => g.Select(id => (Id: id, Package: g.Key))))
         {
+            if (IsXCTestId(id.Id))
+            {
+                // An XCTest test (sc-26129): XCTest alone, its own console output kept with the exit code (SwiftPM writes an
+                // xUnit report for XCTest only with --parallel, where a skipped test reads as passed).
+                steps.Add(new TestStep(TestPhase.Test, Swift,
+                [
+                    "test", "--package-path", id.Package, "--build-system", BuildSystem, "--skip-build", "--disable-swift-testing", "--filter", Filter(id.Id),
+                ]) { CaptureOutput = XCTestOutputName(id.Id) });
+                continue;
+            }
             // Its own report only (a pattern naming exactly it), and its exit code, which the report must agree with.
             steps.Add(new TestStep(TestPhase.Test, Swift,
             [
@@ -429,6 +572,23 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
         var results = new Dictionary<string, List<TestCaseResult>>(StringComparer.Ordinal);
         var unreadable = new List<string>();
         var all = resultFiles.ToList();
+        foreach (var output in all.Where(f => f.ExitCode is not null && XCTestOutputFileName.IsMatch(f.Name)))
+        {
+            try
+            {
+                var match = XCTestOutputFileName.Match(output.Name);
+                var target = System.Text.Encoding.UTF8.GetString(Convert.FromHexString(match.Groups["target"].Value));
+                foreach (var result in XCTestCases(output.Content, target, match.Groups["hash"].Value, output.ExitCode!.Value))
+                {
+                    (results.TryGetValue(result.Name, out var list) ? list : results[result.Name] = []).Add(result);
+                }
+            }
+            catch (InvalidDataException e)
+            {
+                unreadable.Add($"{output.Name}: {e.Message}");
+            }
+        }
+        all = all.Where(f => f.ExitCode is null || !XCTestOutputFileName.IsMatch(f.Name)).ToList();
         var exits = all.Where(f => f.ExitCode is not null).ToDictionary(f => f.Name, f => f.ExitCode!.Value, StringComparer.Ordinal);
         var reported = new HashSet<string>(StringComparer.Ordinal);
         foreach (var (name, content) in all.Where(f => f.ExitCode is null))
@@ -462,7 +622,10 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
                         System.Globalization.CultureInfo.InvariantCulture, out var n) ? n : throw new InvalidDataException($"a testsuite has no count of its {attribute}");
                     var (tests, failures, errors, skipped) = (Count("tests"), Count("failures"), Count("errors"), Count("skipped"));
                     var outcomes = suiteCases.Select(Outcome).ToList();
-                    if ((suiteCases.Count != tests && suiteCases.Count != tests + skipped) || outcomes.Count(o => o == TestCaseResult.Failed) != failures + errors
+                    // Swift Testing counts issues in failures (one <failure> per issue: a test with two failed #expect has
+                    // two), not failed cases (sc-26129); a failed case has at least one.
+                    var issues = suiteCases.Sum(c => c.Elements().Count(e => e.Name.LocalName is "failure" or "error"));
+                    if ((suiteCases.Count != tests && suiteCases.Count != tests + skipped) || issues != failures + errors
                         || outcomes.Count(o => o == TestCaseResult.Skipped) != skipped)
                     {
                         throw new InvalidDataException("its testcase elements do not add up to their suite's counts (a test wrote to it, or it is not Swift Testing's report)");
@@ -505,6 +668,107 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
         unreadable.AddRange(exits.Where(e => !reported.Contains(e.Key)).OrderBy(e => e.Key, StringComparer.Ordinal)
             .Select(e => $"{e.Key[..^".out".Length]}.xml: the test step (exit {e.Value}) wrote no report"));
         return new TestResults(results.ToDictionary(kv => kv.Key, kv => (IReadOnlyList<TestCaseResult>)kv.Value, StringComparer.Ordinal), unreadable);
+    }
+
+    private static readonly Regex XCTestStarted = new(@"^Test Case '(?<name>[^']+)' started(?: at .+|\.)$", RegexOptions.CultureInvariant);
+
+    private static readonly Regex XCTestEnded = new(@"^Test Case '(?<name>[^']+)' (?<verdict>passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.?$", RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// A test suite's summary, the same on Apple platforms and in swift-corelibs-xctest (Linux): <c>Executed 1 test, with
+    /// [1 test skipped and ]0 failures (0 unexpected) in 0.001 (0.001) seconds</c>. Its failures count the issues recorded
+    /// (two failed assertions in one test are 2), not the failed tests.
+    /// </summary>
+    private static readonly Regex XCTestSummary = new(
+        @"^\s*Executed (?<tests>\d{1,9}) tests?, with (?:(?<skipped>\d{1,9}) tests? skipped and )?(?<failures>\d{1,9}) failures? \(\d{1,9} unexpected\) in \d+(?:\.\d+)? \(\d+(?:\.\d+)?\) seconds$",
+        RegexOptions.CultureInvariant);
+
+    /// <summary>XCTest on Apple platforms: <c>-[Target.Class testMethod]</c>.</summary>
+    private static readonly Regex XCTestObjCName = new(@"^-\[(?<type>[^ \[\]']+) (?<method>[^ \[\]']+)\]$", RegexOptions.CultureInvariant);
+
+    /// <summary>swift-corelibs-xctest (Linux): <c>Class.testMethod</c>, the class unqualified.</summary>
+    private static readonly Regex XCTestPlainName = new(@"^(?<type>[^ .\[\]']+)\.(?<method>[^ .\[\]']+)$", RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// An XCTest test's result from XCTest's own console output (sc-26129), which SwiftPM prints on standard output: each
+    /// <c>Test Case '…' started</c> line and its <c>Test Case '…' passed|failed|skipped (N seconds)</c> line. Read only in
+    /// that shape: every ended test was started first, ended once, and is the test the step ran (its id's hash is the
+    /// output's), at least one suite summary (<see cref="XCTestSummary"/>) follows the last ended line and every summary
+    /// after it counts exactly the cases read — as many tests, as many skipped, and failures (issues) exactly when a case
+    /// failed, at least one per failed case — and the step's exit code agrees (0 exactly when no case failed); otherwise
+    /// the output is unreadable, never a result. A test process that crashed or was killed (a trap, a fatal error: a case
+    /// started and never ended, and no summary after it) is therefore unreadable, so the check is an <c>error</c>, never a
+    /// failure on the base. A summary of <c>Executed 0 tests</c> and no case line is no case (the filter matched nothing:
+    /// not run). An output that mentions an expected failure (Apple's <c>XCTExpectFailure</c>) has its passes read as
+    /// skipped: no pass on the head, no failure on the base. As with cargo's libtest lines, a test that prints a complete
+    /// fake report of itself and picks its exit code is read as what it printed (accepted: reviewed code lying about itself).
+    /// </summary>
+    internal static List<TestCaseResult> XCTestCases(string output, string target, string hash, int exit)
+    {
+        var started = new HashSet<string>(StringComparer.Ordinal);
+        var ended = new HashSet<string>(StringComparer.Ordinal);
+        var cases = new List<TestCaseResult>();
+        var (skipped, failedCases) = (0, 0);
+        var summaries = new List<(int Tests, int Skipped, int Failures)>();
+        var expectedFailure = output.Contains("expected failure", StringComparison.OrdinalIgnoreCase);
+        foreach (var line in output.Split('\n').Select(l => l.TrimEnd('\r')))
+        {
+            if (XCTestStarted.Match(line) is { Success: true } start)
+            {
+                started.Add(start.Groups["name"].Value);
+                continue;
+            }
+            if (XCTestSummary.Match(line) is { Success: true } summary)
+            {
+                static int Count(Group g) => g.Success ? int.Parse(g.Value, System.Globalization.CultureInfo.InvariantCulture) : 0;
+                summaries.Add((Count(summary.Groups["tests"]), Count(summary.Groups["skipped"]), Count(summary.Groups["failures"])));
+                continue;
+            }
+            if (XCTestEnded.Match(line) is not { Success: true } end)
+            {
+                continue;
+            }
+            summaries.Clear(); // only the summaries after the last ended line count
+            var name = end.Groups["name"].Value;
+            var id = XCTestObjCName.Match(name) is { Success: true } objc ? $"{objc.Groups["type"].Value}/{objc.Groups["method"].Value}"
+                : XCTestPlainName.Match(name) is { Success: true } plain ? XCTestId(target, plain.Groups["type"].Value, plain.Groups["method"].Value)
+                : throw new InvalidDataException($"its test case '{name}' is not named as XCTest names one");
+            if (Hash(id) != hash)
+            {
+                throw new InvalidDataException($"it reports {id}, which is not the test its step ran");
+            }
+            if (!started.Contains(name) || !ended.Add(name))
+            {
+                throw new InvalidDataException($"its test case '{name}' ends {(started.Contains(name) ? "twice" : "without having started")} (a test wrote to it)");
+            }
+            var verdict = end.Groups["verdict"].Value;
+            skipped += verdict == "skipped" ? 1 : 0;
+            failedCases += verdict == "failed" ? 1 : 0;
+            cases.Add(new TestCaseResult(id, verdict switch
+            {
+                "failed" => TestCaseResult.Failed,
+                "passed" when !expectedFailure => TestCaseResult.Passed,
+                _ => TestCaseResult.Skipped,
+            }));
+        }
+        if (started.FirstOrDefault(s => !ended.Contains(s)) is { } unfinished)
+        {
+            throw new InvalidDataException($"its test case '{unfinished}' started and never ended (the test process crashed or was killed)");
+        }
+        if (summaries.Count == 0)
+        {
+            throw new InvalidDataException("no XCTest summary (Executed N tests, …) follows its last test case");
+        }
+        foreach (var wrong in summaries.Where(s => s.Tests != cases.Count || s.Skipped != skipped || (s.Failures == 0) != (failedCases == 0) || s.Failures < failedCases))
+        {
+            throw new InvalidDataException($"its summary (Executed {wrong.Tests} test(s), {wrong.Skipped} skipped, {wrong.Failures} failure(s)) does not agree with its {cases.Count} case(s), {skipped} skipped and {failedCases} failed");
+        }
+        var failed = cases.Count(c => c.Outcome == TestCaseResult.Failed);
+        if ((exit == 0) != (failed == 0))
+        {
+            throw new InvalidDataException($"swift test exited {exit}, which does not agree with its {failed} failing case(s)");
+        }
+        return cases;
     }
 
     private static string Outcome(XElement testcase)
@@ -716,7 +980,8 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
                 unattributable.Add($"{path} cannot be read as Swift source ({e.Message}), so its errors cannot be placed in its tests");
                 continue;
             }
-            foreach (var func in parsed.Tests)
+            // Every function, not only @Test ones: an XCTest test's location is its method (sc-26129).
+            foreach (var func in parsed.Funcs)
             {
                 if (layout.ItemsAt(func.Start).Any(units.Contains))
                 {

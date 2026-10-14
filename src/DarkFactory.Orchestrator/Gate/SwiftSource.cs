@@ -29,11 +29,52 @@ public sealed record SwiftFunc(string Name, IReadOnlyList<string> Types, string 
     /// The function as Swift Testing names it: <c>name()</c>, or with its parameters' argument labels <c>name(x:_:)</c>.
     /// </summary>
     public string Signature => $"{Name}({string.Concat(SwiftSource.Labels(Parameters).Select(l => l + ":"))})";
+
+    /// <summary>The modifiers written before <c>func</c> (<c>static</c>, <c>class</c>, <c>private</c>, <c>override</c>, …; sc-26129).</summary>
+    public IReadOnlyList<string> Modifiers { get; init; } = [];
+
+    /// <summary>Whether the function has a generic parameter clause (<c>func f&lt;T&gt;()</c>).</summary>
+    public bool Generic { get; init; }
+
+    /// <summary>What its signature says after the parameter list, up to its body: <c>async throws</c>, <c>-&gt; Int</c>, a <c>where</c> clause.</summary>
+    public string Tail { get; init; } = "";
+
+    /// <summary>Whether it is declared inside a conditional-compilation block (<c>#if</c>), directly or through its type.</summary>
+    public bool Conditional { get; init; }
+
+    /// <summary>The type or extension it is declared in (its innermost), or null at the top level.</summary>
+    public SwiftType? Container { get; init; }
+
+    /// <summary>
+    /// The <c>arguments:</c> of its <c>@Test</c>, its tokens joined by single spaces (comments and layout left out), or
+    /// null when it has none: what a parameterized test runs over (sc-26129).
+    /// </summary>
+    public string? TestArguments => Attributes.FirstOrDefault(a => a.IsTest && a.HasArguments) is { Arguments: { } text } ? SwiftSource.LabelledTail(text, "arguments") : null;
+
+    /// <summary>
+    /// Its text from the <c>func</c> keyword through its body (or the end of its signature when it has none): what tells a
+    /// method moved unchanged from a new one (sc-26129).
+    /// </summary>
+    public string Source { get; init; } = "";
+}
+
+/// <summary>
+/// A type or extension declared at a file's top level or in another type's body (sc-26129): its keyword, its names from the
+/// top level (an extension's dotted name split), what its inheritance clause names (each entry's tokens, unspaced:
+/// <c>XCTestCase</c>, <c>XCTest.XCTestCase</c>, <c>Base&lt;Int&gt;</c>), whether it has generic parameters, its attributes
+/// and whether it is inside a conditional-compilation block.
+/// </summary>
+public sealed record SwiftType(string Keyword, IReadOnlyList<string> Names, IReadOnlyList<string> Inherits, bool Generic, IReadOnlyList<SwiftAttribute> Attributes, bool Conditional)
+{
+    public string Name => Names[^1];
 }
 
 /// <summary>A parsed Swift source file: its text, its imported modules and every function declared at its top level or in a type body.</summary>
 public sealed record SwiftFile(string Text, IReadOnlyList<string> Imports, IReadOnlyList<SwiftFunc> Funcs)
 {
+    /// <summary>Every type and extension the file declares at its top level or in a type's body (sc-26129).</summary>
+    public IReadOnlyList<SwiftType> Types { get; init; } = [];
+
     /// <summary>Swift Testing's tests: the functions with <c>@Test</c>.</summary>
     public IEnumerable<SwiftFunc> Tests => Funcs.Where(f => f.IsTest);
 
@@ -143,7 +184,8 @@ public static class SwiftSource
         var close = Pairs(text, tokens) ?? throw new FormatException("its brackets do not balance");
         var funcs = new List<SwiftFunc>();
         var imports = new List<string>();
-        new Reader(text, tokens, close, funcs, imports).Scope(0, tokens.Count, []);
+        var types = new List<SwiftType>();
+        new Reader(text, tokens, close, funcs, imports, types).Scope(0, tokens.Count, [], null);
         // The safety net: every @Test the lexer saw must be on a function the reader recorded. One it lost (in a body it
         // skipped, swallowed by a declaration it did not understand) would otherwise be a test the gate never sees.
         var written = TestAttributeTokens(text, tokens);
@@ -152,7 +194,35 @@ public static class SwiftSource
         {
             throw new FormatException($"it has {written} @Test attribute(s) but {recorded} on the test functions this reader found");
         }
-        return new SwiftFile(text, imports, funcs);
+        return new SwiftFile(text, imports, funcs) { Types = types };
+    }
+
+    /// <summary>
+    /// The text from a top-level <paramref name="label"/><c>:</c> of an argument list to its end, as its tokens joined by
+    /// single spaces (so layout and comments do not count); null when the label is not there. <c>@Test</c>'s
+    /// <c>arguments:</c> is its last parameter, so this is every collection it names.
+    /// </summary>
+    public static string? LabelledTail(string arguments, string label)
+    {
+        List<Token> tokens;
+        try
+        {
+            tokens = Lex(arguments);
+        }
+        catch (FormatException)
+        {
+            return arguments; // unreadable: the text itself, so any change to it is seen
+        }
+        var depth = 0;
+        for (var i = 0; i + 1 < tokens.Count; i++)
+        {
+            depth += tokens[i].Kind switch { Kind.Open => 1, Kind.Close => -1, _ => 0 };
+            if (depth == 0 && tokens[i].Kind == Kind.Ident && arguments[tokens[i].Start..tokens[i].End] == label && arguments[tokens[i + 1].Start..tokens[i + 1].End] == ":")
+            {
+                return string.Join(" ", tokens.Skip(i).Select(t => arguments[t.Start..t.End]));
+            }
+        }
+        return null;
     }
 
     /// <summary>How many <c>@Test</c> and <c>@Testing.Test</c> attributes the tokens hold, however they are spaced.</summary>
@@ -355,6 +425,159 @@ public static class SwiftSource
         }
         return false;
     }
+
+    /// <summary>Words that name no declaration of a module (literals, <c>self</c>, operators spelled as words).</summary>
+    private static readonly HashSet<string> ExpressionKeywords = new(StringComparer.Ordinal)
+    {
+        "true", "false", "nil", "self", "Self", "super", "in", "as", "is", "try", "await", "let", "var", "inout", "some", "any", "_",
+    };
+
+    /// <summary>
+    /// The identifiers an expression's tokens name (backticks removed; a leading <c>arguments:</c> label left out), or null
+    /// when the reader cannot resolve it to names: its tokens do not lex, or a string literal interpolates
+    /// (<c>\(…)</c>) an expression the lexer does not split (sc-26129).
+    /// </summary>
+    public static IReadOnlySet<string>? Identifiers(string expression)
+    {
+        List<Token> tokens;
+        try
+        {
+            tokens = Lex(expression);
+        }
+        catch (FormatException)
+        {
+            return null;
+        }
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < tokens.Count; i++)
+        {
+            var word = expression[tokens[i].Start..tokens[i].End];
+            if (i == 0 && word == "arguments" && tokens.Count > 1 && expression[tokens[1].Start..tokens[1].End] == ":")
+            {
+                i++;
+                continue;
+            }
+            if (tokens[i].Kind == Kind.Literal && (word.Contains("\\(", StringComparison.Ordinal) || word.Contains("\\#", StringComparison.Ordinal)))
+            {
+                return null;
+            }
+            if (tokens[i].Kind == Kind.Ident && word.Trim('`') is var name && !ExpressionKeywords.Contains(name) && !name.StartsWith('$') && !name.StartsWith('#'))
+            {
+                names.Add(name);
+            }
+        }
+        return names;
+    }
+
+    /// <summary>
+    /// The names a file declares at its top level and in its types' bodies, at any depth, each with what a change to it
+    /// shows as (sc-26129): a function's, property's or case's whole text; a type's header (attributes, name, inheritance)
+    /// with the texts of its members that are not functions — a new test method does not change its suite, a new case or
+    /// stored property does. Layout does not count (<see cref="Collapse"/>). Throws <see cref="FormatException"/> as
+    /// <see cref="Layout"/> does.
+    /// </summary>
+    public static IReadOnlyList<(string Name, string Text)> Declarations(string text)
+    {
+        var found = new List<(string, string)>();
+        string Of(SwiftItem item)
+        {
+            if (item.BodyOpen < 0)
+            {
+                return Collapse(text[item.Start..item.End]);
+            }
+            var members = item.Children.Where(c => c.Keyword != "func").Select(Of);
+            return Collapse(text[item.Start..item.BodyOpen]) + " { " + string.Join(" ; ", members) + " }";
+        }
+        void Walk(IEnumerable<SwiftItem> items)
+        {
+            foreach (var item in items)
+            {
+                if (item.Name.Length > 0)
+                {
+                    found.Add((item.Name.Trim('`'), Of(item)));
+                }
+                Walk(item.Children);
+            }
+        }
+        Walk(Layout(text).Items);
+        return found;
+    }
+
+    /// <summary>A text with every run of whitespace made one space, trimmed.</summary>
+    public static string Collapse(string text) => string.Join(' ', text.Split((char[])[' ', '\t', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries));
+
+    /// <summary>
+    /// The names whose declarations differ between the base and the head versions of a set of files (each a text, or null
+    /// where the commit lacks it): a name declared in one and not the other, or with other texts (<see cref="Declarations"/>).
+    /// Null when a version cannot be laid out (the caller fails closed).
+    /// </summary>
+    public static IReadOnlySet<string>? ChangedDeclarations(IEnumerable<string?> @base, IEnumerable<string?> head)
+    {
+        static Dictionary<string, List<string>>? Index(IEnumerable<string?> texts)
+        {
+            var index = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            foreach (var text in texts.OfType<string>())
+            {
+                IReadOnlyList<(string Name, string Text)> declarations;
+                try
+                {
+                    declarations = Declarations(text);
+                }
+                catch (FormatException)
+                {
+                    return null;
+                }
+                foreach (var (name, body) in declarations)
+                {
+                    (index.TryGetValue(name, out var list) ? list : index[name] = []).Add(body);
+                }
+            }
+            return index;
+        }
+        if (Index(@base) is not { } before || Index(head) is not { } after)
+        {
+            return null;
+        }
+        var changed = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var name in before.Keys.Union(after.Keys))
+        {
+            var (a, b) = (before.GetValueOrDefault(name) ?? [], after.GetValueOrDefault(name) ?? []);
+            if (!a.Order(StringComparer.Ordinal).SequenceEqual(b.Order(StringComparer.Ordinal), StringComparer.Ordinal))
+            {
+                changed.Add(name);
+            }
+        }
+        return changed;
+    }
+
+    /// <summary>
+    /// Why an existing parameterized test's cases may change with the pull request though its <c>arguments:</c> do not
+    /// (sc-26129), or null: an identifier of its arguments or of its parameter list names a declaration that
+    /// <paramref name="changed"/> (<see cref="ChangedDeclarations"/> of the test target's changed files) holds; or, failing
+    /// closed, the arguments cannot be resolved to names, or the changed files cannot be read, while the test target's
+    /// files change at all.
+    /// </summary>
+    public static string? ArgumentsReachChange(SwiftFunc test, IReadOnlySet<string>? changed)
+    {
+        if (test.TestArguments is not { } arguments || changed is { Count: 0 })
+        {
+            return null;
+        }
+        if (changed is null)
+        {
+            return "the declarations of the test target's changed files cannot be read, so whether its arguments: change cannot be told";
+        }
+        if (Identifiers(arguments) is not { } names || Identifiers(test.Parameters) is not { } parameters)
+        {
+            return "its arguments: are not a form the gate can resolve to names, and the pull request changes declarations of its test target";
+        }
+        return names.Concat(parameters).Where(changed.Contains).Order(StringComparer.Ordinal).FirstOrDefault() is { } name
+            ? $"its arguments: name {name}, which the pull request changes in its test target"
+            : null;
+    }
+
+    /// <summary>A text with each line's leading indentation (and a trailing carriage return) removed.</summary>
+    public static string WithoutIndentation(string text) => string.Join('\n', text.Split('\n').Select(l => l.TrimEnd('\r').TrimStart(' ', '\t')));
 
     /// <summary>The argument labels of a parameter list's text (<c>_ x: Int, y: Int</c> → <c>_</c>, <c>y</c>): each parameter's first word.</summary>
     public static IReadOnlyList<string> Labels(string parameters)
@@ -670,14 +893,23 @@ public static class SwiftSource
     /// <summary>The kinds an import may name (<c>import struct Foo.Bar</c>).</summary>
     private static readonly HashSet<string> ImportKinds = new(StringComparer.Ordinal) { "struct", "class", "enum", "protocol", "typealias", "func", "var", "let", "actor" };
 
-    private sealed class Reader(string text, List<Token> tokens, Dictionary<int, int> close, List<SwiftFunc> funcs, List<string> imports)
+    private sealed class Reader(string text, List<Token> tokens, Dictionary<int, int> close, List<SwiftFunc> funcs, List<string> imports, List<SwiftType> types)
     {
         private string Word(int i) => text[tokens[i].Start..tokens[i].End];
 
-        /// <summary>Reads the declarations of tokens <paramref name="from"/>..<paramref name="to"/> (exclusive), declared in <paramref name="types"/>.</summary>
-        public void Scope(int from, int to, IReadOnlyList<string> types)
+        private bool NewLineBefore(int i) => i > 0 && text.AsSpan(tokens[i - 1].End, tokens[i].Start - tokens[i - 1].End).Contains('\n');
+
+        /// <summary>
+        /// Reads the declarations of tokens <paramref name="from"/>..<paramref name="to"/> (exclusive), declared in
+        /// <paramref name="names"/> (the type <paramref name="container"/>, null at the top level). Conditional-compilation
+        /// blocks are counted (<c>#if</c> … <c>#endif</c>), so what is declared inside one is marked.
+        /// </summary>
+        public void Scope(int from, int to, IReadOnlyList<string> names, SwiftType? container)
         {
             var pending = new List<SwiftAttribute>();
+            var modifiers = new List<string>();
+            var conditional = 0;
+            var outer = container?.Conditional ?? false;
             var i = from;
             while (i < to)
             {
@@ -703,29 +935,41 @@ public static class SwiftSource
                 }
                 if (tokens[i].Kind == Kind.Ident && Modifiers.Contains(word))
                 {
+                    modifiers.Add(word);
                     // private(set), nonisolated(unsafe): the modifier's own argument.
                     i = i + 1 < to && Word(i + 1) == "(" && tokens[i + 1].Start == tokens[i].End ? close[i + 1] + 1 : i + 1;
                     continue;
                 }
                 if (word == "class" && i + 1 < to && (AfterClassModifier.Contains(Word(i + 1)) || Modifiers.Contains(Word(i + 1))))
                 {
+                    modifiers.Add(word);
                     i++;
                     continue;
+                }
+                if (word is "#if")
+                {
+                    conditional++;
+                }
+                else if (word is "#endif")
+                {
+                    conditional = Math.Max(0, conditional - 1);
                 }
                 if (word == "func" && tokens[i].Kind == Kind.Ident)
                 {
                     var recorded = funcs.Count;
-                    i = Func(i, to, types, pending);
+                    i = Func(i, to, names, pending, modifiers, container, outer || conditional > 0);
                     pending = funcs.Count > recorded ? [] : Drop(pending, at: i);
+                    modifiers = [];
                     continue;
                 }
                 if (tokens[i].Kind == Kind.Ident && TypeKeywords.Contains(word))
                 {
-                    i = Type(i, to, types);
+                    i = Type(i, to, names, pending, outer || conditional > 0);
                     pending = Drop(pending, at: i);
+                    modifiers = [];
                     continue;
                 }
-                if (word == "import" && types.Count == 0)
+                if (word == "import" && names.Count == 0)
                 {
                     // import Foo, import struct Foo.Bar, @testable import Foo: the module is the first word of the path.
                     var j = i + 1;
@@ -738,10 +982,12 @@ public static class SwiftSource
                         imports.Add(Word(j));
                     }
                     pending = Drop(pending, at: i);
+                    modifiers = [];
                     i = j + 1;
                     continue;
                 }
                 pending = Drop(pending, at: i);
+                modifiers = [];
                 i = tokens[i].Kind == Kind.Open ? close[i] + 1 : i + 1;
             }
             Drop(pending, at: to);
@@ -760,8 +1006,8 @@ public static class SwiftSource
             return [];
         }
 
-        /// <summary>A function: its name (an identifier, or an operator's characters) up to its parameter list. Its body is left to the scope, which skips it.</summary>
-        private int Func(int at, int to, IReadOnlyList<string> types, List<SwiftAttribute> attributes)
+        /// <summary>A function: its name (an identifier, or an operator's characters) up to its parameter list, and its signature's tail. Its body is left to the scope, which skips it.</summary>
+        private int Func(int at, int to, IReadOnlyList<string> names, List<SwiftAttribute> attributes, List<string> modifiers, SwiftType? container, bool conditional)
         {
             var j = at + 1;
             var name = "";
@@ -778,20 +1024,38 @@ public static class SwiftSource
             }
             // A generic parameter clause (its angle brackets are no delimiters to the lexer), then the parameter list. A
             // brace first is not a function this reader understands: the scope reads on from there.
+            var generic = false;
             while (j < to && tokens[j].Kind != Kind.Open)
             {
+                generic |= Word(j) == "<";
                 j++;
             }
             if (j >= to || name.Length == 0 || Word(j) != "(")
             {
                 return j;
             }
-            funcs.Add(new SwiftFunc(name, types, text[tokens[j].End..tokens[close[j]].Start], attributes, tokens[at].Start));
+            // The tail: effects, a result type, a where clause — up to the body, a `;`, or the next declaration on a line of its own.
+            var k = close[j] + 1;
+            while (k < to && Word(k) is not ("{" or ";") && !(NewLineBefore(k) && (Word(k) is "@" or "}" || Word(k).StartsWith('#') || DeclKeywords.Contains(Word(k)) || Modifiers.Contains(Word(k)))))
+            {
+                k = tokens[k].Kind == Kind.Open ? close[k] + 1 : k + 1;
+            }
+            var tail = k > close[j] + 1 ? text[tokens[close[j] + 1].Start..tokens[k - 1].End] : "";
+            var last = k < to && Word(k) == "{" ? close[k] : k - 1;
+            funcs.Add(new SwiftFunc(name, names, text[tokens[j].End..tokens[close[j]].Start], attributes, tokens[at].Start)
+            {
+                Source = text[tokens[at].Start..tokens[last].End],
+                Modifiers = [.. modifiers],
+                Generic = generic,
+                Tail = tail,
+                Conditional = conditional,
+                Container = container,
+            });
             return close[j] + 1;
         }
 
-        /// <summary>A type or extension: its (dotted) name, then its body read as a scope of its own.</summary>
-        private int Type(int at, int to, IReadOnlyList<string> types)
+        /// <summary>A type or extension: its (dotted) name, its generic clause and inheritance clause, then its body read as a scope of its own.</summary>
+        private int Type(int at, int to, IReadOnlyList<string> outerNames, List<SwiftAttribute> attributes, bool conditional)
         {
             var j = at + 1;
             var names = new List<string>();
@@ -814,15 +1078,47 @@ public static class SwiftSource
             {
                 return at + 1;
             }
+            var generic = j < to && Word(j) == "<";
+            var inherits = new List<string>();
+            var entry = new System.Text.StringBuilder();
+            var (inClause, seenClause) = (false, false);
+            var angle = 0;
             while (j < to && Word(j) != "{")
             {
+                var word = Word(j);
+                var before = angle;
+                angle = Math.Max(0, angle + (word == "<" ? 1 : word == ">" ? -1 : 0));
+                if (word == "where" && before == 0)
+                {
+                    inClause = false;
+                    seenClause = true;
+                }
+                else if (word == ":" && !inClause && !seenClause && before == 0)
+                {
+                    inClause = seenClause = true;
+                }
+                else if (inClause && word == "," && before == 0)
+                {
+                    inherits.Add(entry.ToString());
+                    entry.Clear();
+                }
+                else if (inClause)
+                {
+                    entry.Append(tokens[j].Kind == Kind.Open ? text[tokens[j].Start..tokens[close[j]].End] : word);
+                }
                 j = tokens[j].Kind == Kind.Open ? close[j] + 1 : j + 1;
+            }
+            if (entry.Length > 0)
+            {
+                inherits.Add(entry.ToString());
             }
             if (j >= to)
             {
                 return j;
             }
-            Scope(j + 1, close[j], [.. types, .. names]);
+            var type = new SwiftType(Word(at), [.. outerNames, .. names], inherits, generic, [.. attributes], conditional);
+            types.Add(type);
+            Scope(j + 1, close[j], type.Names, type);
             return close[j] + 1;
         }
     }
