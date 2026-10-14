@@ -3061,29 +3061,50 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   still break the rule the gate escalates instead of reviewing again. The fix loop and CI self-heal never carry such a
   role's review (`FixLoop.MustReviewAgain`). See docs/acceptance.md.
 - iOS simulator and UI tests as a sandbox user (Phase 5 S0 spike, sc-26126; `tests/DarkFactory.Orchestrator.Tests/Fixtures/ios-probe`,
-  `SimulatorProbe.cs`). DECISION PENDING the live probe: candidate (a) — run simulator and UI tests as the slot's sandbox user
-  directly — is what the probe tests; (b) a sandbox user kept logged in (an Aqua session) and (c) CI with the gate reading the
-  result are the fall-backs, chosen by what the live run reports missing. The fixture is a SwiftUI app (`ProbeApp`) with one
-  XCTest unit test (`ProbeAppTests`) and one XCUITest (`ProbeAppUITests`), a hand-written `objectVersion 77` project with
-  synchronized folders and a shared scheme (no XcodeGen), ad hoc signed (`CODE_SIGN_IDENTITY=-`, no team: E3). `probe.sh` runs,
-  each step timed and bounded: the session's diagnostics (`launchctl managername`, console user, `xcode-select -p`,
-  `DevToolsSecurity -status`, groups), `xcodebuild -version`, `-checkFirstLaunchStatus`, `simctl list runtimes`, `simctl create
-  df-probe-<pid>` (iPhone 17, else 16, 16e or 15, on the last available iOS runtime listed) in the running user's OWN device set, `simctl
-  bootstatus -b`, `xcodebuild build-for-testing` into DerivedData under its work directory, then `test-without-building
-  -only-testing:ProbeAppTests` and `-only-testing:ProbeAppUITests`, and on exit the device's shutdown and deletion; last line
-  `probe-result: unit=… ui=…`. Owner evidence (2026-10-14, macOS 26 / Darwin 25.6, Xcode 26.5 17F42, iOS 26.5 runtime 23F77; the
-  owner in an Aqua session, in `_developer`, DevToolsSecurity disabled; the helper's environment only — HOME, PATH, TMPDIR):
-  both pass, 74 s in all — create 1 s, boot 33 s, build 14 s, unit test 8 s, UI test 14 s; the device deleted. The sandbox users
-  differ from the owner in exactly what the research names as the risks: `_factory`/`_factory2` are in no `_developer` group,
-  have no login (Aqua) session, and reach launchd only through the owner's bootstrap inherited across `sudo` — CoreSimulatorService
-  is a per-user launchd service, which root reaches for another user with `launchctl asuser <uid>` (Jamf/Apple forum reports);
-  `xcodebuild test` over ssh without a logged-in user fails (testmanagerd / automation), and debugger-style authorization needs a
-  GUI session or DevToolsSecurity/`_developer` (Apple developer forums 727333, 765060; lldb-dev 2019-07). Live probe (owner's OK
-  first: like every live probe it kills every process of each sandbox user):
-  `FACTORY_SANDBOX_LIVE=1 dotnet test --project tests/DarkFactory.Orchestrator.Tests -- --filter-method "*A_sandbox_user_boots_a_simulator_and_runs_a_unit_test_and_a_ui_test"`
-  — per configured slot, one helper run in a directory shared with that slot's user alone; a failure names what is missing
-  (`SimulatorProbe.Read`: the license, first launch, the CoreSimulator service for the user, developer-tools authorization, UI
-  automation/an Aqua session, a permission, a timeout). Nothing changes any system setting, TCC, DevToolsSecurity or launchd state.
+  `SimulatorProbe.cs`). DECISION (from the live probe, 2026-10-14): S6 runs BOTH (i) iOS unit tests in the simulator and (ii)
+  iOS UI tests (XCUITest) as the slot's sandbox user directly, through its launch helper like any worker command — design (a).
+  No system change was needed: no `_developer` membership, no DevToolsSecurity, no TCC grant, no `launchctl asuser`, no
+  sudoers or helper change. (b) a sandbox user kept logged in and (c) CI with the gate reading the result are not used.
+  The fixture is a SwiftUI app (`ProbeApp`) with one XCTest unit test (`ProbeAppTests`) and one XCUITest (`ProbeAppUITests`), a
+  hand-written `objectVersion 77` project with synchronized folders and a shared scheme (no XcodeGen), ad hoc signed
+  (`CODE_SIGN_IDENTITY=-`, no team: E3). `probe.sh` runs, each step timed and bounded: the session's diagnostics (`launchctl
+  managername`, console user, `xcode-select -p`, `DevToolsSecurity -status`, groups), `xcodebuild -version`,
+  `-checkFirstLaunchStatus`, `simctl list runtimes`, `simctl create df-probe-<pid>` (iPhone 17, else 16, 16e or 15, on the last
+  available iOS runtime listed) in the running user's OWN device set (`~<user>/Library/Developer/CoreSimulator/Devices`, in its
+  0700 home: E4), `simctl bootstatus -b`, `xcodebuild build-for-testing` into DerivedData under its work directory, then
+  `test-without-building -only-testing:ProbeAppTests` and `-only-testing:ProbeAppUITests`, and on exit the device's shutdown and
+  deletion; last line `probe-result: unit=… ui=…`. All in ONE helper run: the helper's exit kills every process of the user,
+  the booted simulator and the user's CoreSimulatorService included, so a simulator never outlives the run that booted it.
+  Evidence (macOS 26 / Darwin 25.6, Xcode 26.5 17F42, iOS 26.5 runtime 23F77; the helper's environment only — HOME, PATH,
+  TMPDIR). Live, `Worker__Slots=2`, after `sudo scripts/setup-worker-user.sh --slots 2 --swift`: four runs, every one passing for
+  both slots; the timed one — `_factory` (uid 498): create 0 s, boot 123 s, build 17 s, unit test 10 s, UI test 16 s, device
+  deleted; `_factory2` (uid 496): create 0 s, boot 137 s, build 15 s, unit test 9 s, UI test 14 s, device deleted; the test
+  5 min 52 s for both. Owner, for comparison: boot 33 s, build 14 s, unit 8 s, UI 14 s (74 s in all). Each sandbox user ran with
+  `launchctl managername` = `Aqua`, not in `_developer`, DevToolsSecurity disabled. Why it works, and the residual it carries:
+  `sudo` keeps the caller's launchd bootstrap and audit session, so a sandbox user's process started by an owner logged in at the
+  console (console user `michael`) is in the owner's Aqua session — CoreSimulatorService is started for the sandbox user's uid
+  from there, and XCUITest's automation (testmanagerd inside the simulator) needs nothing more. So it holds only while the
+  factory itself runs inside the owner's GUI login session (Terminal, or a LaunchAgent of the owner's); it is UNTESTED, and by
+  the research likely to fail, when the factory runs from ssh with no one logged in, or as a LaunchDaemon (manager
+  `System`/`Background`: simctl reaching no CoreSimulatorService, `xcodebuild test` failing in testmanagerd — Apple developer
+  forums 670598, 727333, 765060; lldb-dev 2019-07). S6's readiness check should therefore report `launchctl managername` and
+  refuse simulator work when it is not `Aqua`, naming this. Other findings for S6: the first boot of a fresh device takes about
+  2 minutes as a sandbox user (data migration; 33 s for the owner's), so a per-slot device kept in that user's device set
+  (shut down, not deleted, between runs) saves most of it; a per-user launchd service (`distnoted`) of the sandbox user may be
+  respawned after the helper's sweep and is swept again by the next helper exit (seen after the runs; it holds no file of the
+  run). What each other option would need from the owner, should (a) stop working: (b) a logged-in sandbox user — enable a
+  login for a hidden role account (a password and a shell, then fast user switching or `loginwindow`), which gives it a full GUI
+  session and keychain: a large widening of a role account meant to have none; (c) CI — a macOS runner per target repository
+  with the simulator and the gate reading the result: no local change, but the iOS gate checks then depend on hosted macOS
+  minutes and on CI reporting each test. If a headless start (ssh/daemon) is ever wanted, the narrowest system change is root's
+  `launchctl asuser <uid>` in front of the helper's command (a change to the sudoers rule/helper: it puts the sandbox user's
+  process in that user's own per-user launchd domain) — untested here. Live probe (the owner's OK first: like every live probe
+  it kills every process of each sandbox user):
+  `FACTORY_SANDBOX_LIVE=1 Worker__Slots=2 dotnet test --project tests/DarkFactory.Orchestrator.Tests -- --filter-method "*A_sandbox_user_boots_a_simulator_and_runs_a_unit_test_and_a_ui_test" --report-xunit-xml`
+  (the per-step evidence is the test's output, in the xUnit report also when it passes) — per configured slot, one helper run in
+  a directory shared with that slot's user alone; a failure names what is missing (`SimulatorProbe.Read`: the license, first
+  launch, the CoreSimulator service for the user, developer-tools authorization, UI automation/an Aqua session, a permission, a
+  timeout). Nothing changes any system setting, TCC, DevToolsSecurity or launchd state.
 - Processes migrate the ledger through `LedgerMigrations.MigrateAsync` (advisory-locked: EF alone lets two concurrent
   migrators apply the same migration) before reading it; tests migrate their temp database before starting a host.
 - Tests: xunit.v3 on Microsoft.Testing.Platform (`global.json` opts in).

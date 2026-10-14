@@ -1819,6 +1819,8 @@ public class LiveWorkerSandboxTests
                 var (exitCode, stdout, stderr) = await slot.Sandbox.RunAsync(dir, "/bin/bash",
                     [Path.Combine(fixture, "probe.sh"), Path.Combine(dir, "work")], ct);
 
+                // The evidence, also when it passes (each step and its timing): `-- --output detailed` shows it.
+                TestContext.Current.TestOutputHelper?.WriteLine($"worker slot {slot.Number} ({slot.User}), exit {exitCode}:\n{stdout}");
                 var result = SimulatorProbe.Read(stdout);
                 Assert.True(exitCode == 0 && result is { Unit: "pass", Ui: "pass" },
                     SimulatorProbe.Explain($"worker slot {slot.Number} ({slot.User})", exitCode, stdout, stderr));
