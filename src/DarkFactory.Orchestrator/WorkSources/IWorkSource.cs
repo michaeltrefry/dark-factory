@@ -258,10 +258,12 @@ public interface IWorkSource
         throw new NotSupportedException("This work source creates no plan children, so it has none to make ready.");
 
     /// <summary>
-    /// How this board shelves an item for good and how a person undoes it (<see cref="ReadyResult.Archived"/>), in the board's own
-    /// words: what a plan says about a story it could not release (<see cref="Plans.PlanRelease.HeldArchived"/>).
+    /// How this board shelves an item for good (what such an item is, and the verb for doing it) and how a person undoes it
+    /// (<see cref="ReadyResult.Archived"/>), in the board's own words: what a plan says about a story it could not release
+    /// (<see cref="Plans.PlanRelease.HeldArchived"/>), a stopped plan's comment about a released story someone shelved, and the
+    /// escalation that tells a person to finish or shelve a broken plan's stories.
     /// </summary>
-    (string Is, string Undo) Shelved => ("archived", "unarchive it");
+    (string Is, string Undo, string Do) Shelved => ("archived", "unarchive it", "archive");
 
     /// <summary>
     /// Whether the item waits in the source's backlog (not archived), where nothing picks it up (sc-25871): how a plan notices a

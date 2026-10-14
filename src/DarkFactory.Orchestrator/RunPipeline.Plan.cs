@@ -67,7 +67,7 @@ public sealed partial class RunPipeline
                     + $"no story from it: {ex.Message}. "
                     + (creating > planned
                         ? "Some of its stories may already be on the board, so a re-run would use the same plan and fail the same way: "
-                            + "finish or archive those stories by hand."
+                            + $"finish or {source.Shelved.Do} those stories by hand."
                         : "None of its stories was created: a re-run plans afresh."));
             }
             log.WriteLine($"[plan] continuing with the plan recorded at {history[planned].RecordedAt:u}");
@@ -346,6 +346,9 @@ public sealed partial class RunPipeline
     /// neither reaches this evaluation, which a paused or stopping plan item is not given. A board that cannot be read
     /// or written throws: nothing is recorded, the next run evaluates again, and the intake loop gives up on a plan that keeps
     /// failing (<see cref="GiveUpAsync"/>: one comment and one <c>plan-held</c> row; the item stays Planned).
+    /// A plan item whose claim is recorded as someone else's (sc-25984, <see cref="PlanClaimLost"/>) is not evaluated at all:
+    /// the source is asked first (<see cref="IWorkSource.RenewClaimAsync"/>), and only once the item is the factory's again is
+    /// <c>plan-claim-regained</c> recorded and the evaluation made.
     /// </summary>
     private async Task<RunOutcome> PlannedAsync(WorkItem item, int storyId, List<LedgerEntry> history, CancellationToken ct)
     {
@@ -356,6 +359,27 @@ public sealed partial class RunPipeline
             throw new InvalidOperationException($"{item.ExternalId} is {item.State} but its ledger records no story of its plan.");
         }
         var since = history.Skip(recorded + 1).ToList();
+        // Its claim was found to be someone else's (sc-25984, ClaimLostAsync): nothing is evaluated — no story released, no
+        // changeset pull request opened or linked — until the source says the item is the factory's again; whoever runs this.
+        if (PlanClaimLost(history) is { } lostClaim)
+        {
+            var renewal = await source.RenewClaimAsync(storyId, ct);
+            if (!renewal.IsHeld)
+            {
+                var why = renewal.Lost is { } lost
+                    ? $"{item.ExternalId} is still not the factory's to work ({ClaimLost}: {lost}); its plan is not evaluated and nothing of it is released"
+                    : $"{item.ExternalId} is not evaluated: its claim was lost and the board would not confirm it is the factory's again ({renewal.NotRenewed})";
+                if (renewal.Lost is { } now && $"{ClaimLost}: {now}" != lostClaim)
+                {
+                    await ledger.CheckpointAsync(item, Steps.PlanHeld, null, $"{ClaimLost}: {now}", ct);
+                }
+                log.WriteLine($"[{item.State}] {why}");
+                return await OutcomeAsync(item, $"{why}. It goes on by itself once the other claim is released or has lapsed; "
+                    + $"`factory stop --item {item.ExternalId}` gives the plan up.", ct);
+            }
+            await ledger.CheckpointAsync(item, Steps.PlanClaimRegained, null, $"was {lostClaim}", ct);
+            log.WriteLine($"[{item.State}] {item.ExternalId}: its claim is the factory's again; evaluating its plan");
+        }
         var known = await ledger.ItemsByIdAsync(Naming.Source, stories, ct);
         var released = since.Where(e => e.Step == Steps.PlanReleased).Select(e => PlanRelease.StoriesOf(e.Detail).FirstOrDefault() ?? "")
             .ToHashSet(StringComparer.Ordinal);
@@ -459,7 +483,7 @@ public sealed partial class RunPipeline
         }
         var waiting = status.Failed.Select(f => $"{f.Id} {f.Failure!.As}")
             .Concat(decision.Held.Select(h => $"{h.Id} on {string.Join(", ", h.By)}"))
-            .Concat(archived.Select(s => $"{s} archived"))
+            .Concat(archived.Select(s => $"{s} {source.Shelved.Is}"))
             .Concat(inFlight.Select(s => back.Contains(s) ? $"{s} released, back in the backlog" : $"{s} released, not merged")).ToList();
         log.WriteLine($"[{item.State}] {item.ExternalId}: {stories.Count(Merged)} of {stories.Count} stories merged"
             + (done.Count == 0 ? "" : $"; released {string.Join(", ", done)}")

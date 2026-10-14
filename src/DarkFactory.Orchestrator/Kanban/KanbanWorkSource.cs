@@ -42,9 +42,11 @@ namespace DarkFactory.Orchestrator.Kanban;
 /// (<see cref="MakeReadyAsync"/>), and a released item nobody started goes back the same way (<see cref="ReturnUnstartedAsync"/>).
 /// One difference from Shortcut, the board's own rule: its ready listing leaves out an item whose blocker is not <c>Done</c>, so
 /// a released item is listed only once every blocker is <c>Done</c> on the board — which the factory's merge of a blocker makes
-/// it (<c>BoardState.Merged</c>). A blocker the plan counts as merged without the factory moving it (a pull request merged
-/// outside the factory into the plan's changeset branch: its item stays Escalated and <c>InProgress</c>) keeps its dependents
-/// out of the listing until a person moves it to <c>Done</c>, as that escalation says.
+/// it (<c>BoardState.Merged</c>). Any blocker the plan counts as merged that is not <c>Done</c> on the board — one whose pull
+/// request was merged outside the factory into the plan's changeset branch (its item stays Escalated and <c>InProgress</c>,
+/// as that escalation says), one a person moved out of <c>Done</c> again, one whose move to <c>Done</c> the board refused —
+/// keeps its released dependents out of the listing until a person moves it to <c>Done</c>; <c>factory run kb-&lt;n&gt;</c>
+/// on such a dependent is refused by this source, naming the blocker (<see cref="ClaimAsync"/>).
 /// </summary>
 public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanScope scope, Uri webUrl) : IWorkSource
 {
@@ -213,7 +215,9 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
         }
         if (item.Status == KanbanStatus.Ready && item.OpenBlockers is { Count: > 0 } blockers)
         {
-            return ClaimResult.Refused($"the item is blocked by {string.Join(", ", blockers.Select(b => $"\"{b.Title}\" ({b.Status})"))}");
+            // A blocker's title may be a planner's text (a planned item, sc-25984) and the reason goes to the ledger and wherever
+            // the refusal is reported: each is cut and made one inert code span.
+            return ClaimResult.Refused($"the item is blocked by {string.Join(", ", blockers.Select(b => $"{Quoted(b.Title) ?? "an item"} ({b.Status})"))}");
         }
 
         KanbanWorkItem claimed;
@@ -511,7 +515,7 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
     public bool PlansItems => true;
 
     /// <summary>A <c>Closed</c> item is the board's archived one: hidden from its listings, and never worked.</summary>
-    public (string Is, string Undo) Shelved => (KanbanStatus.Closed, $"move it back to {KanbanStatus.Backlog}");
+    public (string Is, string Undo, string Do) Shelved => (KanbanStatus.Closed, $"move it back to {KanbanStatus.Backlog}", "close");
 
     /// <summary>
     /// The idempotency key of a planned item (E3, E4): <see cref="ChildItem.Key"/> under the plan item's board id — its GUID, never
@@ -623,21 +627,30 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
     /// <summary>
     /// <c>Ready</c> → <c>Backlog</c> with the comment, only for an item that is still <c>Ready</c> and carries no claim but the
     /// factory's own; any other is left as it is (false, nothing written): someone claimed it, moved it or closed it, and it is
-    /// theirs. The move is conditional on the version read; an item someone moved meanwhile stays where they put it (false, no
-    /// comment). A claim of the factory's left on it (a run that died between its claim and its move) is released, so the item
+    /// theirs. The move is conditional on the version read, and a <c>conflict</c> — someone wrote the item since — is decided
+    /// again on a fresh read, by the same rule (status AND claim, so not <see cref="MoveAsync"/>, which looks at the status
+    /// alone): an item someone moved or claimed meanwhile stays where they put it (false, no comment). A claim of the factory's left on it (a run that died between its claim and its move) is released, so the item
     /// does not read as held while it waits in the backlog.
     /// </summary>
     public async Task<bool> ReturnUnstartedAsync(int id, string comment, CancellationToken ct)
     {
         var item = await board.GetItemAsync(await ItemIdAsync(id, ct), ct);
-        if (item.Status != KanbanStatus.Ready || (item.ClaimMarker is { } held && held != Marker(item.Id)))
+        KanbanWorkItem moved;
+        for (var reread = 0; ; reread++)
         {
-            return false;
-        }
-        var moved = await MoveAsync(item, KanbanStatus.Backlog, ct);
-        if (moved.Status != KanbanStatus.Backlog)
-        {
-            return false;
+            if (item.Status != KanbanStatus.Ready || (item.ClaimMarker is { } held && held != Marker(item.Id)))
+            {
+                return false;
+            }
+            try
+            {
+                moved = await board.SetStatusAsync(item.Id, KanbanStatus.Backlog, item.Version, ct);
+                break;
+            }
+            catch (KanbanException ex) when (ex.Code == KanbanException.Conflict && reread < MaxConflictRereads)
+            {
+                item = await board.GetItemAsync(item.Id, ct);
+            }
         }
         await ReleaseOursAsync(moved, ct);
         await CommentOnAsync(moved, comment, ct);

@@ -1,5 +1,6 @@
 using System.Text.Json.Nodes;
 using DarkFactory.Orchestrator.Controls;
+using DarkFactory.Orchestrator.Dashboard;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Gateway;
 using DarkFactory.Orchestrator.Kanban;
@@ -403,10 +404,11 @@ public class KanbanPlanSourceTests
     [InlineData("Closed")]
     [InlineData("Backlog")]
     [InlineData("moved-meanwhile")]
+    [InlineData("claimed-meanwhile")]
     public async Task An_item_someone_took_finished_or_moved_since_its_release_is_theirs_and_is_not_written(string what)
     {
         var h = new KanbanWorkSourceTests.Harness();
-        var item = h.Board.AddItem(h.Project, "First story", status: what is "claimed" or "moved-meanwhile" ? "Ready" : what);
+        var item = h.Board.AddItem(h.Project, "First story", status: what is "claimed" or "moved-meanwhile" or "claimed-meanwhile" ? "Ready" : what);
         var id = await h.Key(item);
         if (what == "claimed")
         {
@@ -423,15 +425,36 @@ public class KanbanPlanSourceTests
                 }
             };
         }
+        if (what == "claimed-meanwhile")
+        {
+            // Someone edits its title and claims it between the factory's read and its move: still Ready, and theirs.
+            h.Board.Before = (tool, _) =>
+            {
+                if (tool == "update_work_item" && item.Claim is null)
+                {
+                    (item.Title, item.Version) = ("First story, theirs", item.Version + 1);
+                    h.Board.ClaimAsSomeoneElse(item);
+                }
+            };
+        }
         var claim = item.Claim;
+        var meanwhile = what is "moved-meanwhile" or "claimed-meanwhile";
 
         Assert.False(await h.Source().ReturnUnstartedAsync(id, "returned", None));
 
-        Assert.Equal((what is "claimed" ? "Ready" : what is "moved-meanwhile" ? "InProgress" : what, claim), (item.Status, item.Claim));
+        Assert.Equal(what is "claimed" or "claimed-meanwhile" ? "Ready" : what is "moved-meanwhile" ? "InProgress" : what, item.Status);
+        if (what == "claimed-meanwhile")
+        {
+            Assert.Equal(("their-run", "First story, theirs"), (item.Claim!.Value.Marker, item.Title));
+        }
+        else
+        {
+            Assert.Equal(claim, item.Claim);
+        }
         Assert.Empty(item.Comments);
-        // Nothing of theirs is overwritten: the one move sent (moved-meanwhile) was refused on its stale version.
-        Assert.Equal(what == "moved-meanwhile" ? ["update_work_item"] : [], h.Board.Writes);
-        Assert.Equal(what == "moved-meanwhile" ? 2L : 1L, item.Version);
+        // Nothing of theirs is overwritten: the one move sent (…-meanwhile) was refused on its stale version.
+        Assert.Equal(meanwhile ? ["update_work_item"] : [], h.Board.Writes);
+        Assert.Equal(meanwhile ? 2L : 1L, item.Version);
     }
 
     // ---- The spec of a planned item ----
@@ -761,17 +784,72 @@ public class KanbanPlanPipelineTests
         Assert.Equal([plan], await Renewable());
         Assert.All(h.Made, i => Assert.Null(i.Claim));
 
-        // A claim someone else took of the waiting plan item pauses nothing: its evaluation works nothing, and it stays Planned.
-        h.Board.Time.Now = h.Board.Time.Now.AddHours(25);
+    }
+
+    [Fact]
+    public async Task A_waiting_plan_item_whose_claim_someone_else_took_is_held_releases_nothing_and_resumes_once_the_claim_is_the_factorys_again()
+    {
+        var h = new Harness();
+        var (plan, _) = await h.Plan();
+        async Task<string?> ClaimLost(string reason)
+        {
+            await using var db = h.Contexts.CreateDbContext();
+            return await RunPipeline.ClaimLostAsync(h.Source(), new WorkLedger(db, TimeProvider.System), h.Locks, plan, reason, TextWriter.Null, None, h.Controls);
+        }
+
+        // Someone else claims the waiting plan item; the poll's renewal finds the claim lost.
         h.Board.ClaimAsSomeoneElse(h.Parent);
         var lost = await h.Source().RenewClaimAsync(plan, None);
         Assert.NotNull(lost.Lost);
-        await using (var db = h.Contexts.CreateDbContext())
-        {
-            Assert.Null(await RunPipeline.ClaimLostAsync(h.Source(), new WorkLedger(db, TimeProvider.System), h.Locks, plan, lost.Lost!, TextWriter.Null, None, h.Controls));
-        }
+        var detail = $"claim lost: {lost.Lost}";
+
+        // It has no state to pause from: it stays Planned, with one plan-held row (deferred) and no comment on an item that is
+        // someone else's — and the poll is told, so it leaves the plan out of its runs and shows it.
+        var what = await ClaimLost(lost.Lost!);
+        Assert.Equal($"held ({detail}); not evaluated, nothing of the plan released, until its claim is the factory's again", what);
         Assert.Equal(WorkState.Planned, (await h.Transitions(plan))[^1]);
         Assert.Empty(h.Parent.Comments);
+        Assert.Equal([detail], await h.Steps(plan, RunPipeline.Steps.PlanHeld));
+        var row = (await h.Rows(plan))[^1];
+        Assert.Equal((RunPipeline.Steps.PlanHeld, StepOutcome.Deferred), (row.Step, row.Outcome));
+        // The next poll finds it lost still: told again, not recorded again. Its claim is still one the poll asks about.
+        Assert.NotNull(await ClaimLost(lost.Lost!));
+        Assert.Equal([detail], await h.Steps(plan, RunPipeline.Steps.PlanHeld));
+        await using (var db = h.Contexts.CreateDbContext())
+        {
+            Assert.Equal([plan], await RunPipeline.RenewableAsync(new WorkLedger(db, TimeProvider.System), ItemNaming.Kanban, None, h.Controls));
+        }
+        // The dashboard's plan row shows the hold.
+        async Task<PlanView> View() =>
+            Assert.Single(await new DashboardData(h.Contexts, TimeProvider.System).ActiveItemsAsync(None), r => r.ExternalId == $"kb-{plan}").Plan!;
+        Assert.Equal(detail, (await View()).LastHeld!.Value.Detail);
+
+        // A run of the plan by hand while the claim is lost evaluates nothing: no item released, nothing recorded as released.
+        var held = await h.Run(plan, workerless: true);
+        Assert.Equal(WorkState.Planned, held.State);
+        Assert.StartsWith($"kb-{plan} is still not the factory's to work ({detail}); its plan is not evaluated and nothing of it is released", held.Error);
+        Assert.Empty(await h.Steps(plan, RunPipeline.Steps.PlanReleased));
+        Assert.All(h.Made, i => Assert.Equal("Backlog", i.Status));
+        Assert.Equal("their-run", h.Parent.Claim!.Value.Marker);
+        Assert.Equal([detail], await h.Steps(plan, RunPipeline.Steps.PlanHeld));
+
+        // Their claim lapses: the poll's renewal takes the item back, and the next evaluation records it and goes on by itself.
+        h.Board.Time.Now = h.Board.Time.Now.AddHours(2);
+        Assert.True((await h.Source().RenewClaimAsync(plan, None)).IsHeld);
+        var resumed = await h.Run(plan, workerless: true);
+        Assert.Equal((WorkState.Planned, (string?)null), (resumed.State, resumed.Error));
+        Assert.Equal([$"was {detail}"], await h.Steps(plan, RunPipeline.Steps.PlanClaimRegained));
+        Assert.Equal(["kb-2"], await h.Steps(plan, RunPipeline.Steps.PlanReleased));
+        Assert.Equal("Ready", h.Made[0].Status);
+        Assert.Null((await View()).LastHeld);
+        // Recorded once: later evaluations add nothing.
+        Assert.True((await h.Run(plan, workerless: true)).Succeeded);
+        Assert.Single(await h.Steps(plan, RunPipeline.Steps.PlanClaimRegained));
+
+        // Lost again, for the same reason: a new row.
+        h.Board.ClaimAsSomeoneElse(h.Parent);
+        Assert.NotNull(await ClaimLost(lost.Lost!));
+        Assert.Equal([detail, detail], await h.Steps(plan, RunPipeline.Steps.PlanHeld));
     }
 
     [Fact]
@@ -929,6 +1007,31 @@ public class KanbanPlanPipelineTests
     }
 
     [Fact]
+    public async Task A_planned_item_whose_dependency_someone_removed_on_the_board_is_still_held_to_the_blocker_its_plan_recorded()
+    {
+        var h = new Harness();
+        var (plan, stories) = await h.Plan();
+        var (itemA, itemB) = (h.Made[0], h.Made[1]);
+        Assert.True((await h.Run(plan, workerless: true)).Succeeded);
+        // Someone removes B's dependency on A on the board and moves B to Ready: the board lists it, and its own claim rule
+        // (no open blocker) would let it be claimed.
+        Assert.Contains(itemA, itemB.Blockers);
+        itemB.Blockers.Clear();
+        itemB.Status = "Ready";
+        Assert.Contains(stories[1], await h.Source().ListReadyAsync(None));
+        var writes = h.Board.Writes.Count;
+
+        var outcome = await h.Run(stories[1]);
+
+        // The plan's `plan` checkpoint recorded the blocker: it holds the item whatever the board says now.
+        Assert.Equal(WorkState.Paused, outcome.State);
+        Assert.StartsWith("claim refused: blocked by kb-2 (not merged)", (await h.Rows(stories[1])).Last(r => r.Step is null).Detail);
+        Assert.Equal((writes, "Ready"), (h.Board.Writes.Count, itemB.Status));
+        Assert.Null(itemB.Claim);
+        Assert.Empty(h.Worker.Prompts);
+    }
+
+    [Fact]
     public async Task A_blocker_outside_the_plan_holds_a_planned_item_until_it_is_done_and_a_closed_planned_item_is_reported_in_the_boards_words()
     {
         var h = new Harness();
@@ -959,6 +1062,8 @@ public class KanbanPlanPipelineTests
         Assert.True((await h.Run(plan, workerless: true)).Succeeded, h.Log.ToString());
         Assert.Equal("kb-3 is Closed on the board, so it was not released and the plan cannot complete: move it back to Backlog",
             (await h.Steps(plan, RunPipeline.Steps.PlanHeld)).Last());
+        Assert.Contains("kb-3 Closed", h.Log.ToString());
+        Assert.DoesNotContain("archived", h.Log.ToString());
         Assert.Equal(("Closed", version), (itemB.Status, itemB.Version));
         Assert.Equal(["kb-2"], await h.Steps(plan, RunPipeline.Steps.PlanReleased));
         // Moved back to Backlog, the next evaluation releases it.
@@ -1005,6 +1110,51 @@ public class KanbanPlanPipelineTests
         Assert.StartsWith("claim refused: blocked by its plan kb-1, which was stopped", (await h.Rows(stories[1])).Last(r => r.Step is null).Detail);
         Assert.Equal(writes, h.Board.Writes.Count);
         Assert.Null(itemB.Claim);
+    }
+
+    [Fact]
+    public async Task A_stopped_kanban_plan_says_in_the_boards_word_what_someone_did_with_a_released_item()
+    {
+        var h = new Harness();
+        var (plan, _) = await h.Plan();
+        Assert.True((await h.Run(plan, workerless: true)).Succeeded);
+        // Someone closes the released item before anything started it: theirs, left as it is.
+        var itemA = h.Made[0];
+        (itemA.Status, itemA.Version) = ("Closed", itemA.Version + 1);
+        var version = itemA.Version;
+
+        var stopped = await h.Actions.StopAsync(ControlScope.Item("kb-1"), "tester", None);
+
+        Assert.True(stopped.Ok, stopped.Message);
+        Assert.Equal(("Closed", version, 0), (itemA.Status, itemA.Version, itemA.Comments.Count));
+        // Kanban has no "archived": the comment uses the board's own word for a shelved item.
+        var comment = Assert.Single(h.Parent.Comments).Body;
+        Assert.Contains("Taken, finished or Closed by someone else since their release (left as they are): kb-2.", comment);
+        Assert.DoesNotContain("archived", comment);
+    }
+
+    [Fact]
+    public async Task A_recorded_kanban_plan_that_no_longer_validates_says_what_to_do_with_its_items_in_the_boards_word()
+    {
+        var h = new Harness();
+        var plan = Assert.Single(await h.Source().ListReadyAsync(None));
+        h.Board.Instead = (tool, arguments) => tool == "create_work_item" && arguments["title"]!.GetValue<string>() == "Second story"
+            ? FakeMcpServer.Structured("An error occurred invoking the tool.", new JsonObject(), isError: true) : null;
+        Assert.Equal(WorkState.Escalated, (await h.Run(plan)).State);
+        h.Board.Instead = null;
+        // The plan recorded before the board write began no longer passes the rules (here: no story at all).
+        await using (var db = h.Contexts.CreateDbContext())
+        {
+            var item = await db.WorkItems.SingleAsync(i => i.ExternalId == $"kb-{plan}");
+            (await db.LedgerEntries.SingleAsync(e => e.WorkItemId == item.Id && e.Step == RunPipeline.Steps.Plan)).Detail = """{"stories": []}""";
+            await db.SaveChangesAsync(None);
+        }
+
+        var stuck = await h.Run(plan);
+
+        Assert.Equal(WorkState.Escalated, stuck.State);
+        Assert.Contains("no longer validates", stuck.Error);
+        Assert.Contains("finish or close those stories by hand", stuck.Error);
     }
 
     [Fact]

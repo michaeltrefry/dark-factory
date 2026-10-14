@@ -437,15 +437,24 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `blockers`, one read, each by its ledger key (allocated now for an item the factory never saw), finished only in `Done` — a
   `Closed` blocker still blocks. `MakeReadyAsync`: `Backlog` → `Ready` on the version read (`MoveAsync`: a `conflict` is decided
   again on a fresh read, their edit kept, their move left standing); `Closed` is the board's archived (`ReadyResult.Archived`,
-  reported in the board's words through `IWorkSource.Shelved`: "kb-3 is Closed on the board … move it back to Backlog"); any other
+  reported in the board's words through `IWorkSource.Shelved` — what a shelved item is, how to undo it, and the verb:
+  Shortcut `archived`/`unarchive it`/`archive`, Kanban `Closed`/`move it back to Backlog`/`close` — wherever a plan speaks of
+  one: the hold "kb-3 is Closed on the board … move it back to Backlog", the waiting log line, a stopped plan's comment ("Taken,
+  finished or Closed by someone else since their release") and the no-longer-validates escalation ("finish or close those
+  stories by hand"); Shortcut's texts are unchanged); any other
   column has left the backlog. `InBacklogAsync`: the `Backlog` column. `ReturnUnstartedAsync` (a stopped plan's released,
   never-claimed item): `Ready` → `Backlog` on the version read, the comment, and a claim of the factory's own left on it released
   — only while it is still `Ready` and carries no claim but the factory's; one someone claimed, moved, finished or closed is
-  theirs, nothing written. One difference from Shortcut, the board's own rule, accepted: the board's ready listing
+  theirs, nothing written. A `conflict` on the move is decided again on a fresh read by that same rule — status AND claim, in
+  the method's own loop, not `MoveAsync` (which looks at the status alone) — so an item still `Ready` that gained another
+  caller's claim since the first read is left alone too. One difference from Shortcut, the board's own rule, accepted: the board's ready listing
   (`unblocked_only`) leaves out an item whose blocker is not `Done`, so a released item is listed once every blocker is `Done`
-  on the board — which the factory's merge of a blocker makes it (`BoardState.Merged`). A blocker the plan counts as merged
-  without the factory moving its item (`merged-into-changeset`: the item stays Escalated and `InProgress`) therefore keeps its
-  released dependents out of the listing until a person moves it to `Done` — what that escalation already says to do. The
+  on the board — which the factory's merge of a blocker makes it (`BoardState.Merged`). Any blocker the plan counts as merged
+  that is not `Done` on the board — `merged-into-changeset` (the item stays Escalated and `InProgress`; that escalation already
+  says to move it to `Done`), one a person moved out of `Done` again, one whose move to `Done` the board refused — therefore
+  keeps its released dependents out of the listing until a person moves it to `Done`; and `factory run kb-<n>` on such a
+  dependent is refused by the source, naming the blocker (``claim refused: the item is blocked by `<title>` (<status>)``, the
+  title cut and inert in a code span: a blocker may be a planned item, so its title a planner's text). The
   pipeline's own check is unchanged and comes before the board's: a planned item moved to `Ready` by hand while a blocker is
   unmerged is refused at claim naming the blocker (`claim refused: blocked by kb-2 (not merged): …`), also when someone dragged
   the blocker to `Done` (a story of the plan is satisfied only by the factory's merge). Tests: `KanbanPlanSourceTests`,
@@ -488,7 +497,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `freeze-paused`, `controls-unreadable`) — WHATEVER the factory, epic, item, usage and freeze controls say now, so a Pause, a
   usage pause or a freeze of any length (a freeze lasts until a human's Continue) costs no item its claim; and (sc-25984) a plan
   item waiting on its stories (`Planned`: no handler, but the factory drives it for as long as its stories take — often longer
-  than a claim lives — and then takes its changeset pull request through the gate; a lost claim never pauses it, below). NOT renewed: an item
+  than a claim lives — and then takes its changeset pull request through the gate; a lost claim does not pause it — it has no state to pause from — but holds it: one `plan-held` row and no evaluation while the claim is someone else's, below). NOT renewed: an item
   being stopped (its stop releases the claim), a parked one (a refused claim, a lost claim, a give-up), an Escalated one, a
   merged or terminal one. The controls are read there only to leave out an item being stopped; when
   they cannot be read the item is renewed all the same (the list throws only when the ledger itself cannot be read). The
@@ -522,7 +531,20 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   claim is released or has lapsed. `Held`: `unpaused`, and on from where it paused. Typed outcome `deferred`, by the rule for every
   pause and every `parked` row (`StepOutcomes`). Nothing is paused when the item's run is active (its run lock is held — that
   run goes on, claims being advisory, and the next poll finds the claim lost again), when it is being stopped (the stop gives it
-  back), or when it is a plan waiting on its stories or a merged item. An item that is not renewed (parked, escalated) loses its
+  back), or when it is a merged item. A plan item waiting on its stories (`Planned`, sc-25984) is not paused, parked or
+  commented on (it has no state to pause from, resumes by itself, and the item is someone else's to write) but HELD: under its
+  run lock it gets one `plan-held` row `claim lost: <reason>` (outcome `deferred`; told apart from the other `plan-held` rows —
+  a blocker outside the plan, `not evaluated: `, `held by a failed story: ` — by that prefix; not written again while that is
+  how its claim is recorded, `RunPipeline.PlanClaimLost`), and `ClaimLostAsync` returns what was done, so the poll leaves the
+  plan out of its runs and shows it on the dashboard's intake row; the dashboard's plan row shows the row too. While the claim
+  is recorded lost nothing of the plan is evaluated — no story released, no changeset pull request opened or linked — whoever
+  runs it: `PlannedAsync` asks `IWorkSource.RenewClaimAsync` first, so a `factory run kb-<n>` by hand answers "is still not the
+  factory's to work (claim lost: …); its plan is not evaluated and nothing of it is released" and writes nothing (a different
+  holder is a new `plan-held` row). The plan item stays in the renewal list, so it resumes by itself: the first evaluation
+  after a renewal that holds (the other claim released or lapsed; the Kanban source takes it back) records
+  `plan-claim-regained` (`was claim lost: …`; outcome passed) and goes on; a later loss is a new `plan-held` row. Stories
+  released before the loss go on (they are their own items, with their own claims). Residual, accepted: between the other
+  caller's claim and the poll that notices it (at most one `Intake:PollSeconds`), an evaluation may still release a story. An item that is not renewed (parked, escalated) loses its
   claim a day after its last renewal, and from then on
   only its `InProgress` column keeps it out of the ready list — the factory's own (`ListReadyAsync` asks for `Ready` only) and
   any other caller's that polls as the contract says; the board shows it unclaimed, so another caller that claims `InProgress`
