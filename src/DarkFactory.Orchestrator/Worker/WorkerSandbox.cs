@@ -267,15 +267,60 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     /// </summary>
     public Task<bool> StopAllAsync(CancellationToken ct) => LockedAsync(() => StopAllLockedAsync(ct), ct);
 
+    /// <summary>
+    /// Apple's per-user launchd agents that launchd starts again in the sandbox user's own launchd domain seconds after the
+    /// helper's sweep killed them, with nothing of that user running (sc-26126, observed live: see CLAUDE.md, "Worker
+    /// sandbox"). Each is its exact command line as <c>ps -o command</c> prints it, and counts only as a child of launchd
+    /// (parent pid 1). They are no leftover of a worker: <see cref="StopAllAsync"/> does not count them (it would otherwise
+    /// report a crashed run's worker after every helper run, and run the helper for them). The helper's sweep is unchanged —
+    /// it still kills them at every exit, like any process of the user — so a worker that started one of these programs itself
+    /// gains nothing that outlives the next helper exit of its slot.
+    /// </summary>
+    public static readonly IReadOnlySet<string> RespawnedAgents = new HashSet<string>(StringComparer.Ordinal)
+    {
+        "/usr/sbin/distnoted agent",
+    };
+
+    /// <summary>
+    /// The pids of a <c>ps -o pid=,ppid=,command=</c> listing that are a worker's leftovers: every process but a
+    /// <see cref="RespawnedAgents"/> agent whose parent is launchd. A line that does not read as pid, ppid and command counts
+    /// (fail closed: the helper is then run).
+    /// </summary>
+    public static IReadOnlyList<string> Leftovers(string listing)
+    {
+        var leftovers = new List<string>();
+        foreach (var raw in listing.Split('\n'))
+        {
+            var line = raw.Trim();
+            if (line.Length == 0)
+            {
+                continue;
+            }
+            var parts = line.Split((char[]?)null, 3, StringSplitOptions.RemoveEmptyEntries);
+            var agent = parts.Length == 3 && parts[1] == "1" && RespawnedAgents.Contains(parts[2].Trim());
+            if (!agent)
+            {
+                leftovers.Add(parts[0]);
+            }
+        }
+        return leftovers;
+    }
+
     /// <summary><see cref="StopAllAsync"/> under the lock: with it held no other run's worker is alive, so every process found is a leftover.</summary>
     private async Task<bool> StopAllLockedAsync(CancellationToken ct)
     {
-        var psi = new ProcessStartInfo("/usr/bin/pgrep", ["-U", User]) { RedirectStandardOutput = true, RedirectStandardError = true };
-        using (var pgrep = Process.Start(psi)!)
+        var psi = new ProcessStartInfo("/bin/ps", ["-U", User, "-o", "pid=,ppid=,command="])
         {
-            var pids = await pgrep.StandardOutput.ReadToEndAsync(ct);
-            await pgrep.WaitForExitAsync(ct);
-            if (pgrep.ExitCode != 0 || pids.Trim().Length == 0)
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        using (var ps = Process.Start(psi)!)
+        {
+            var listing = await ps.StandardOutput.ReadToEndAsync(ct);
+            await ps.StandardError.ReadToEndAsync(ct);
+            await ps.WaitForExitAsync(ct);
+            // ps exits 1 for a user with no process (and for one that does not exist): nothing to stop either way.
+            if (ps.ExitCode != 0 || Leftovers(listing).Count == 0)
             {
                 return false;
             }

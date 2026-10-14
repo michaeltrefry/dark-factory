@@ -1342,6 +1342,22 @@ public class WorkerSandboxTests
         Assert.False(File.Exists(marker));
     }
 
+    /// <summary>
+    /// sc-26126: launchd starts Apple's per-user <c>distnoted</c> agent again in the sandbox user's domain after every sweep, so
+    /// it is no crashed run's leftover — but only that exact command as a child of launchd: the same program under another
+    /// parent, with other arguments, or any other process still counts.
+    /// </summary>
+    [Fact]
+    public void Only_a_respawned_apple_agent_under_launchd_is_no_leftover()
+    {
+        Assert.Empty(WorkerSandbox.Leftovers("  4974     1 /usr/sbin/distnoted agent\n"));
+        Assert.Equal(["700"], WorkerSandbox.Leftovers("  700   650 /usr/sbin/distnoted agent\n"));
+        Assert.Equal(["701"], WorkerSandbox.Leftovers("  701     1 /usr/sbin/distnoted agent --extra\n"));
+        Assert.Equal(["702"], WorkerSandbox.Leftovers("  702     1 /bin/sleep 600\n"));
+        Assert.Equal(["703"], WorkerSandbox.Leftovers("  703     1 /tmp/x/usr/sbin/distnoted agent\n"));
+        Assert.Equal(["704"], WorkerSandbox.Leftovers("704\n")); // unreadable: counted (fail closed)
+    }
+
     [Fact]
     public async Task Stop_all_kills_the_worker_users_processes_through_the_helper()
     {
@@ -1790,7 +1806,9 @@ public class LiveWorkerSandboxTests
             await Task.Delay(100, ct);
         }
         Assert.False(ProcessExists(grandchild), $"setsid grandchild {grandchild} outlived the helper");
-        Assert.False(await sandbox.StopAllAsync(ct)); // nothing of _factory's left
+        // Nothing of _factory's left. launchd starts Apple's per-user distnoted agent again seconds after any sweep (sc-26126),
+        // so this holds only because StopAllAsync does not count that agent (WorkerSandbox.RespawnedAgents).
+        Assert.False(await sandbox.StopAllAsync(ct));
     }
 
     /// <summary>
@@ -1799,8 +1817,12 @@ public class LiveWorkerSandboxTests
     /// under a directory shared with that user alone, runs one XCTest unit test and one XCUITest UI test on it, and deletes the
     /// device — all in ONE helper run (the helper's exit kills every process of the user, CoreSimulatorService and the booted
     /// simulator included). A failure names what is missing (<see cref="SimulatorProbe"/>). Nothing of the owner's simulators,
-    /// and no system setting, is touched. Slow (minutes per slot); like every live probe it kills every process of each sandbox
-    /// user: run it with no factory running.
+    /// and no system setting, is touched. The probe sets no timer and signals nothing: this test's token is the one bound, and
+    /// its cancellation ends the helper run (which kills every process of that slot's user), the step it was cut short in read
+    /// from the probe's progress file. The evidence — each step and its timing, and the slot user's processes before and after
+    /// the helper run (`ps`, read-only) — is the test's output, kept in the xUnit report with `--report-xunit-xml` also when it
+    /// passes (`--output detailed` shows a passing test's output only on failure; CLAUDE.md has the command). Slow (minutes per slot); like every live probe it kills every process of each
+    /// sandbox user: run it with no factory running.
     /// </summary>
     [Fact]
     public async Task A_sandbox_user_boots_a_simulator_and_runs_a_unit_test_and_a_ui_test() =>
@@ -1808,19 +1830,37 @@ public class LiveWorkerSandboxTests
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(45));
             var ct = timeout.Token;
+            var output = TestContext.Current.TestOutputHelper;
             var dir = Path.Combine(FactoryOptions.DefaultSandboxWorkRoot, $"test-ios-{Guid.NewGuid():N}");
             Directory.CreateDirectory(dir);
             try
             {
-                await slot.Sandbox.ShareAsync(dir, ct); // the owner and this slot's user only; everything below inherits it
+                // Writable by the owner and this slot's user alone (every slot's user reads it through the work root's
+                // inherited read entry); everything below inherits it.
+                await slot.Sandbox.ShareAsync(dir, ct);
                 var fixture = Path.Combine(dir, "fixture");
                 CopyDirectory(SimulatorProbe.FixtureDirectory, fixture);
 
-                var (exitCode, stdout, stderr) = await slot.Sandbox.RunAsync(dir, "/bin/bash",
-                    [Path.Combine(fixture, "probe.sh"), Path.Combine(dir, "work")], ct);
-
-                // The evidence, also when it passes (each step and its timing): `-- --output detailed` shows it.
-                TestContext.Current.TestOutputHelper?.WriteLine($"worker slot {slot.Number} ({slot.User}), exit {exitCode}:\n{stdout}");
+                output?.WriteLine($"worker slot {slot.Number} ({slot.User}) processes before:\n{ProcessesOf(slot.User)}");
+                int exitCode;
+                string stdout, stderr;
+                try
+                {
+                    (exitCode, stdout, stderr) = await slot.Sandbox.RunAsync(dir, "/bin/bash",
+                        [Path.Combine(fixture, "probe.sh"), Path.Combine(dir, "work")], ct);
+                }
+                catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+                {
+                    var progress = Path.Combine(dir, "work", "progress");
+                    var read = File.Exists(progress) ? File.ReadAllText(progress) : "";
+                    Assert.Fail(SimulatorProbe.Explain($"worker slot {slot.Number} ({slot.User}), cut short after 45 min", -1, read, ""));
+                    throw;
+                }
+                output?.WriteLine($"worker slot {slot.Number} ({slot.User}), exit {exitCode}:\n{stdout}\n--- stderr ---\n{stderr}");
+                // What is left of the user right after its helper's sweep, and a moment later (a launchd agent respawned).
+                output?.WriteLine($"worker slot {slot.Number} ({slot.User}) processes right after:\n{ProcessesOf(slot.User)}");
+                await Task.Delay(TimeSpan.FromSeconds(15), CancellationToken.None);
+                output?.WriteLine($"worker slot {slot.Number} ({slot.User}) processes 15 s after:\n{ProcessesOf(slot.User)}");
                 var result = SimulatorProbe.Read(stdout);
                 Assert.True(exitCode == 0 && result is { Unit: "pass", Ui: "pass" },
                     SimulatorProbe.Explain($"worker slot {slot.Number} ({slot.User})", exitCode, stdout, stderr));
@@ -1844,6 +1884,19 @@ public class LiveWorkerSandboxTests
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
             File.Copy(file, target);
         }
+    }
+
+    /// <summary>The user's processes as <c>ps</c> lists them (pid, parent, uid, start, command): a read, nothing signalled.</summary>
+    private static string ProcessesOf(string user)
+    {
+        using var ps = Process.Start(new ProcessStartInfo("/bin/ps", ["-U", user, "-o", "pid,ppid,uid,lstart,command"])
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        })!;
+        var listing = ps.StandardOutput.ReadToEnd() + ps.StandardError.ReadToEnd();
+        ps.WaitForExit();
+        return listing;
     }
 
     private static bool ProcessExists(int pid)

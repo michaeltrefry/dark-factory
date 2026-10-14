@@ -404,6 +404,42 @@ installs) and only deletes each sandbox user's own Claude login (`~/.claude/.cre
 user (including an interactive `_factory` login); they probe every configured slot (`Worker:Slots`, e.g. `Worker__Slots=2`),
 each slot's `TMPDIR` checked to be its own user's (sc-25992).
 
+The one exception to "kills every other process of its own user" (sc-26126, observed live 2026-10-14): Apple's per-user
+`distnoted` agent. Every sandbox user that has ever run has a launchd domain of its own (`user/<uid>`, listed by `launchctl print
+system`; the owner may not print it), and launchd starts `/usr/sbin/distnoted agent` there again seconds after the helper's sweep
+killed it, with nothing of that user running — so after any helper run `ps -U _factory` lists one process, parent 1. Observed:
+`_factory2`'s distnoted 22412 (started 17:50:23) gone and 80177 started at 18:12:23 after a probe-only helper run, again 91788
+at 18:27:48 seconds after the S0 probe's helper exited; `_factory`'s 4974 → 87793 at 18:22:11, seconds after its probe's helper
+exited; each new pid, parent 1, uid the slot's, nothing else of the user left; the later runs' records are under "iOS simulator
+and UI tests as a sandbox user". The sweep kills it every time like any process (SIGKILL as the same uid), and launchd's respawn
+takes seconds, well after the sweep's last pass, so it never makes `processes still appearing after N sweeps`. What it changed in
+code: `WorkerSandbox.StopAllAsync` (the stop of a crashed run's leftovers, `orphan-killed`) reads `ps -U <user> -o
+pid=,ppid=,command=` instead of `pgrep -U` and does not count a process whose parent is launchd (1) AND whose command line is
+exactly one of `WorkerSandbox.RespawnedAgents` (`/usr/sbin/distnoted agent`, the only one seen to come back; never a ppid-only or
+name-only rule: the same program under another parent or with other arguments, or anything else, still counts —
+`WorkerSandboxTests.Only_a_respawned_apple_agent_under_launchd_is_no_leftover`); without it every stop after a helper run reported
+a leftover worker and ran the helper again, and `A_setsid_grandchild_of_the_worker_is_dead_once_the_helper_exits` asserted
+nothing-left against a respawn race. The helper is unchanged (still helper_version 5): its sweep kills the agent as before, so a
+worker that runs `/usr/sbin/distnoted agent` itself gains nothing past its slot's next helper exit. The agents a simulator run
+starts in that domain (CoreSimulatorService, SimulatorTrampoline, SimLaunchHost, SimStreamProcessorService, `cfprefsd agent`,
+`lsd`, `secd`, …) are killed by the sweep and were not seen to come back.
+
+Residual, accepted pending the owner's decision (sc-26126; it is not new — it holds for every sandboxed worker since Phase 1, and
+Phase 5's iOS simulator work depends on it): the sandbox user's process lives in the OWNER's launchd bootstrap and audit
+session. `sudo` changes the uid but keeps the caller's Mach bootstrap port and audit session, so a worker started by a factory
+that runs in the owner's GUI login (Terminal, or a LaunchAgent of the owner's) reports `launchctl managername` = `Aqua` (seen in
+every S0 run for both slots) — inferred, since the sandbox users have no login of their own: the owner's `gui/501` login domain
+(`launchctl print gui/501`: session Aqua, asid 100025, created by `loginwindow`; the process's own audit session is readable
+only by root, `launchctl procinfo`), not a domain of its own. So a worker can LOOK UP every Mach service name of the owner's GUI session (the pasteboard, the owner's `distnoted`,
+WindowServer, `pboard`, the owner's per-session agents) and send it messages; whether each service then serves a client of
+another uid is that service's own check (some check the caller's uid or audit token, some do not), which the factory has not
+tested — no probe has run as `_factory` against any of them, and none will without the owner's OK. What it is NOT: the owner's
+files, keychain or credentials (the ACL deny on the owner's home and the separate uid stand), nor the owner's processes (no
+signal crosses uids). What S6 adds: it relies on it — the simulator and XCUITest work only because the sandbox user is in an Aqua
+session (`launchctl managername` Aqua; untested, and per the research failing, from ssh or as a LaunchDaemon). The alternative
+that removes it, `launchctl asuser <uid>` as root in front of the helper's command (the process in the sandbox user's own
+per-user domain, a sudoers/helper change), is untested and may lose the Aqua session the simulator needs.
+
 Secrets in the keychain: `security add-generic-password -w` at its interactive prompt truncates at 128 chars
 (Shortcut tokens are longer → 401). Copy the secret, then
 `printf 'add-generic-password -U -s dark-factory -a <account> -w %s\n' "$(pbpaste)" | security -i`
@@ -1713,7 +1749,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (`WorkerSandbox.Lock`, set by `WorkerSlots.Create` for `FactoryOptions.WorkerSlots`, the only place production builds a
   sandbox; unsandboxed there is none). Enforcement, at the one place a helper process starts: `WorkerSandbox.Start` throws unless the calling flow holds the
   lock (nothing is started). Every user of it holds it: the sandbox's own short commands take it themselves (`RunAsync`,
-  `EnsureReadyAsync` — the probe and `claude --version` —, `StopAllAsync`, the pgrep included, and `DeleteAsWorkerAsync`, so every
+  `EnsureReadyAsync` — the probe and `claude --version` —, `StopAllAsync`, its `ps` listing included, and `DeleteAsWorkerAsync`, so every
   worktree, seat and sweep deletion of `GitWorkspace`; never under a clone's lock, so no lock-order cycle), as do
   `ClaudeWorker.RunAsync` (a whole session) and `SandboxTestRunner.RunAsync` (a whole run: worktree, steps, deletion) — each at
   once when its caller's phase already holds it. The lock covers the whole life of every helper process, not only the phase
@@ -3067,44 +3103,67 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   sudoers or helper change. (b) a sandbox user kept logged in and (c) CI with the gate reading the result are not used.
   The fixture is a SwiftUI app (`ProbeApp`) with one XCTest unit test (`ProbeAppTests`) and one XCUITest (`ProbeAppUITests`), a
   hand-written `objectVersion 77` project with synchronized folders and a shared scheme (no XcodeGen), ad hoc signed
-  (`CODE_SIGN_IDENTITY=-`, no team: E3). `probe.sh` runs, each step timed and bounded: the session's diagnostics (`launchctl
-  managername`, console user, `xcode-select -p`, `DevToolsSecurity -status`, groups), `xcodebuild -version`,
-  `-checkFirstLaunchStatus`, `simctl list runtimes`, `simctl create df-probe-<pid>` (iPhone 17, else 16, 16e or 15, on the last
-  available iOS runtime listed) in the running user's OWN device set (`~<user>/Library/Developer/CoreSimulator/Devices`, in its
-  0700 home: E4), `simctl bootstatus -b`, `xcodebuild build-for-testing` into DerivedData under its work directory, then
-  `test-without-building -only-testing:ProbeAppTests` and `-only-testing:ProbeAppUITests`, and on exit the device's shutdown and
-  deletion; last line `probe-result: unit=… ui=…`. All in ONE helper run: the helper's exit kills every process of the user,
-  the booted simulator and the user's CoreSimulatorService included, so a simulator never outlives the run that booted it.
+  (`CODE_SIGN_IDENTITY=-`, no team: E3). `probe.sh` runs, each step announced (`probe: <step> started`, on stdout and in
+  `<work>/progress`) and timed: the session's diagnostics (`launchctl managername`, console user, `xcode-select -p`,
+  `DevToolsSecurity -status`, groups), `xcodebuild -version`, `-checkFirstLaunchStatus`, `simctl list runtimes`, `list
+  devicetypes`, `list devices` (whose `df-probe-*` devices — left by an earlier run cut short — it deletes first, in the user's
+  own set), `simctl create df-probe-<pid>` (iPhone 17, else 16, 16e or 15, on the last available iOS runtime listed), then the
+  check that the device is in the running user's OWN device set (E4): the home is owned by the running uid, the directory
+  `$HOME/Library/Developer/CoreSimulator/Devices/<udid>` exists, and CoreSimulator's own `simctl list -j devices` names
+  `…/Devices/<udid>/data` under it as the device's `dataPath` — else the step `device-set` fails naming which; then
+  `simctl bootstatus -b`, `xcodebuild build-for-testing` into DerivedData under its work directory, `test-without-building
+  -only-testing:ProbeAppTests` and `-only-testing:ProbeAppUITests`, and on exit the device's shutdown and deletion; last line
+  `probe-result: unit=… ui=…`. All in ONE helper run: the helper's exit kills every process of the user, the booted simulator and
+  the user's CoreSimulatorService included, so a simulator never outlives the run that booted it. The probe signals no process
+  and has no timer of its own (an earlier version bounded each step with a perl `alarm` that signalled the step's process group;
+  removed, and `OwnProcessTests` now reads every script under `tests/` too): its one bound is the live test's 45-minute token,
+  whose cancellation closes the helper's stdin — the helper then kills every process of that slot's user, never another's — and
+  the test then names the step the run was cut short in from `<work>/progress` (`SimulatorProbe.Read`). A failure names what is
+  missing from the failing step's own lines only (its `FAILED` line and its output block): the license, first launch, the
+  CoreSimulator service for the user, the device set, developer-tools authorization, UI automation, a permission, the step a run
+  was cut short in, and — whenever anything failed — a launchd manager that is not `Aqua`.
   Evidence (macOS 26 / Darwin 25.6, Xcode 26.5 17F42, iOS 26.5 runtime 23F77; the helper's environment only — HOME, PATH,
-  TMPDIR). Live, `Worker__Slots=2`, after `sudo scripts/setup-worker-user.sh --slots 2 --swift`: four runs, every one passing for
-  both slots; the timed one — `_factory` (uid 498): create 0 s, boot 123 s, build 17 s, unit test 10 s, UI test 16 s, device
-  deleted; `_factory2` (uid 496): create 0 s, boot 137 s, build 15 s, unit test 9 s, UI test 14 s, device deleted; the test
-  5 min 52 s for both. Owner, for comparison: boot 33 s, build 14 s, unit 8 s, UI 14 s (74 s in all). Each sandbox user ran with
-  `launchctl managername` = `Aqua`, not in `_developer`, DevToolsSecurity disabled. Why it works, and the residual it carries:
-  `sudo` keeps the caller's launchd bootstrap and audit session, so a sandbox user's process started by an owner logged in at the
-  console (console user `michael`) is in the owner's Aqua session — CoreSimulatorService is started for the sandbox user's uid
-  from there, and XCUITest's automation (testmanagerd inside the simulator) needs nothing more. So it holds only while the
-  factory itself runs inside the owner's GUI login session (Terminal, or a LaunchAgent of the owner's); it is UNTESTED, and by
-  the research likely to fail, when the factory runs from ssh with no one logged in, or as a LaunchDaemon (manager
-  `System`/`Background`: simctl reaching no CoreSimulatorService, `xcodebuild test` failing in testmanagerd — Apple developer
-  forums 670598, 727333, 765060; lldb-dev 2019-07). S6's readiness check should therefore report `launchctl managername` and
-  refuse simulator work when it is not `Aqua`, naming this. Other findings for S6: the first boot of a fresh device takes about
-  2 minutes as a sandbox user (data migration; 33 s for the owner's), so a per-slot device kept in that user's device set
-  (shut down, not deleted, between runs) saves most of it; a per-user launchd service (`distnoted`) of the sandbox user may be
-  respawned after the helper's sweep and is swept again by the next helper exit (seen after the runs; it holds no file of the
-  run). What each other option would need from the owner, should (a) stop working: (b) a logged-in sandbox user — enable a
-  login for a hidden role account (a password and a shell, then fast user switching or `loginwindow`), which gives it a full GUI
-  session and keychain: a large widening of a role account meant to have none; (c) CI — a macOS runner per target repository
-  with the simulator and the gate reading the result: no local change, but the iOS gate checks then depend on hosted macOS
-  minutes and on CI reporting each test. If a headless start (ssh/daemon) is ever wanted, the narrowest system change is root's
-  `launchctl asuser <uid>` in front of the helper's command (a change to the sudoers rule/helper: it puts the sandbox user's
-  process in that user's own per-user launchd domain) — untested here. Live probe (the owner's OK first: like every live probe
-  it kills every process of each sandbox user):
+  TMPDIR), live, `Worker__Slots=2`, after `sudo scripts/setup-worker-user.sh --slots 2 --swift`. Runs 1–3 (before the fixes):
+  pass/fail only, every one passing for both slots. Run 4, the first with captured output: `_factory` (uid 498) create 0 s, boot
+  123 s, build 17 s, unit 10 s, UI 16 s; `_factory2` (uid 496) create 0 s, boot 137 s, build 15 s, unit 9 s, UI 14 s; each device
+  deleted; 5 min 52 s for both. Runs 5 and 6 (this probe, 2026-10-14 18:12 and 18:32), both passing for both slots (run 5 under `--output detailed`, which kept no output of a passing test); run 6's
+  record (`--report-xunit-xml`): `_factory` boot 272 s, build 14 s, unit 8 s, UI 17 s, shutdown 4 s, delete 0 s; `_factory2` boot
+  178 s, build 28 s, unit 8 s, UI 24 s, shutdown 4 s, delete 0 s; 9 min 55 s for both; the device sets
+  `/Users/_factory/Library/Developer/CoreSimulator/Devices` (home owned by uid 498, `dataPath` `…/Devices/7B60BD02-…/data`) and
+  `/Users/_factory2/…/Devices` (uid 496, `…/44F5AB0C-…/data`); the helper's stderr empty (no `processes still appearing`); the
+  slot user's processes right after its helper exited: none; 15 s later: one, `/usr/sbin/distnoted agent`, parent 1 (`_factory`
+  53023 started 18:38:01, `_factory2` 58137 at 18:42:20) — the respawned agent under "Worker sandbox" above. Owner, for
+  comparison: boot 33 s, build 14 s, unit 8 s, UI 14 s (74 s in all). Each sandbox user ran with `launchctl managername` =
+  `Aqua`, console user `michael`, not in `_developer`, DevToolsSecurity disabled.
+  Why it works, and the residual it carries: `sudo` keeps the caller's launchd bootstrap and audit session, so a sandbox user's
+  process started by an owner logged in at the console is in the owner's Aqua session — CoreSimulatorService is started for the
+  sandbox user's uid from there, and XCUITest's automation (testmanagerd inside the simulator) needs nothing more. That same fact
+  is the bootstrap residual under "Worker sandbox" above (a worker can look up the owner's GUI-session Mach services; owner
+  decision pending): S6 depends on it and must say so. It holds only while the factory itself runs inside the owner's GUI login
+  session (Terminal, or a LaunchAgent of the owner's); it is UNTESTED, and by the research likely to fail, when the factory runs
+  from ssh with no one logged in, or as a LaunchDaemon (manager `System`/`Background`: simctl reaching no CoreSimulatorService,
+  `xcodebuild test` failing in testmanagerd — Apple developer forums 670598, 727333, 765060; lldb-dev 2019-07).
+  REQUIRED of S6 (sc-26132), recorded here so it is not lost: (1) its readiness check runs `launchctl managername` as the slot's
+  user through the helper and REFUSES simulator work (unit and UI tests alike) unless it answers `Aqua`, naming this paragraph —
+  never a silent skip; (2) its "nothing of the user left" checks treat Apple's respawned per-user agents as `StopAllAsync` does
+  (`WorkerSandbox.RespawnedAgents`, exact command line under launchd only; add an agent there only after seeing it come back
+  with nothing of the user running), never by a ppid-only or name-only rule; (3) a device it keeps lives in the slot user's own
+  set and is checked there as the probe does. Other findings for S6: the first boot of a fresh device takes 2–4.5 minutes as a
+  sandbox user (data migration; 33 s for the owner's), so a per-slot device kept in that user's device set (shut down, not
+  deleted, between runs) saves most of it. What each other option would need from the owner, should (a) stop working: (b) a
+  logged-in sandbox user — enable a login for a hidden role account (a password and a shell, then fast user switching or
+  `loginwindow`), which gives it a full GUI session and keychain: a large widening of a role account meant to have none; (c) CI —
+  a macOS runner per target repository with the simulator and the gate reading the result: no local change, but the iOS gate
+  checks then depend on hosted macOS minutes and on CI reporting each test. If a headless start (ssh/daemon) is ever wanted, the
+  narrowest system change is root's `launchctl asuser <uid>` in front of the helper's command (a change to the sudoers
+  rule/helper: it puts the sandbox user's process in that user's own per-user launchd domain) — untested here.
+  Live probe (the owner's OK first: like every live probe it kills every process of each sandbox user):
   `FACTORY_SANDBOX_LIVE=1 Worker__Slots=2 dotnet test --project tests/DarkFactory.Orchestrator.Tests -- --filter-method "*A_sandbox_user_boots_a_simulator_and_runs_a_unit_test_and_a_ui_test" --report-xunit-xml`
-  (the per-step evidence is the test's output, in the xUnit report also when it passes) — per configured slot, one helper run in
-  a directory shared with that slot's user alone; a failure names what is missing (`SimulatorProbe.Read`: the license, first
-  launch, the CoreSimulator service for the user, developer-tools authorization, UI automation/an Aqua session, a permission, a
-  timeout). Nothing changes any system setting, TCC, DevToolsSecurity or launchd state.
+  — the evidence (each step and its timing, the device set, the helper's stderr, the slot user's processes before, right after
+  and 15 s after its helper run) is the test's output, kept in the xUnit report also when it passes (`--output detailed` shows a
+  passing test's output only on failure). Per configured slot, one helper run in a directory writable by the owner and that slot's
+  user alone (readable by every slot's user through the work root's inherited read entry). Nothing changes any system setting,
+  TCC, DevToolsSecurity or launchd state.
 - Processes migrate the ledger through `LedgerMigrations.MigrateAsync` (advisory-locked: EF alone lets two concurrent
   migrators apply the same migration) before reading it; tests migrate their temp database before starting a host.
 - Tests: xunit.v3 on Microsoft.Testing.Platform (`global.json` opts in).
