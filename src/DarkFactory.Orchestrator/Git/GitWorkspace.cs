@@ -873,6 +873,12 @@ public sealed class GitWorkspace(
         ArgumentNullException.ThrowIfNull(grant);
         EnsureFactoryBranch(workspace.Branch);
         var dir = workspace.Path;
+        if (sandbox is not null && shareWithWorker)
+        {
+            // Before anything of the worktree is staged (sc-25990, E4/E7): the grant vouches for this slot's sessions only, so a
+            // worktree any other user could write — another slot's, whose session may be tainted — is not published.
+            await sandbox.EnsureOnlyWorkerWritesAsync(dir, ct);
+        }
         string[] tree = [$"--git-dir={workspace.GitDir}", $"--work-tree={dir}"];
         await Git(dir, null, ct, [.. tree, "add", "-A"]);
         async Task<bool> Dirty() => (await Git(dir, null, ct, [.. tree, "status", "--porcelain"])).Trim().Length > 0;
