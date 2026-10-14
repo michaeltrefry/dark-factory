@@ -1493,7 +1493,7 @@ public class PlanCloseoutReportTests
     [Fact]
     public void A_plan_storys_pull_request_and_closeout_say_it_went_to_its_plans_changeset_branch_and_any_other_items_say_nothing_new()
     {
-        var story = new WorkStory(12, "First story", "…", "chore", "https://app.shortcut.com/trefry/story/12");
+        var story = new WorkStory(12, "First story", "…", "chore", "https://app.shortcut.com/trefry/story/12", ItemNaming.Shortcut);
         List<LedgerEntry> rows = [Row(WorkState.Implement), Row(WorkState.MergeGate, RunPipeline.Steps.MergeFiles, new MergeFiles("factory/changeset-sc-9", ["a.cs"]).ToDetail()),
             Row(WorkState.Merge, detail: "abc123")];
 

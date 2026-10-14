@@ -725,7 +725,7 @@ public class WorkSourceRegistryTests
             }
         }
         var asked = new List<ItemNaming>();
-        var story = new FakeWorkSource(new WorkStory(5, "s", null, "chore", "u")) { Epic = new WorkEpic(9, "Phase", null, "u") };
+        var story = new FakeWorkSource(new WorkStory(5, "s", null, "chore", "u", ItemNaming.Shortcut)) { Epic = new WorkEpic(9, "Phase", null, "u") };
         var actions = new ControlActions(b.Controls, b.Kanban.Contexts, sources: naming =>
         {
             asked.Add(naming);

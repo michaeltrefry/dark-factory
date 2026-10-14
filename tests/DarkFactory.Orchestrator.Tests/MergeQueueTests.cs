@@ -380,6 +380,7 @@ public class MergeQueueTests
     /// <summary>The board, serialised: two runs may write to it at once.</summary>
     internal sealed class LockedSource(IWorkSource inner) : IWorkSource
     {
+        public ItemNaming Naming => inner.Naming;
         private readonly SemaphoreSlim _gate = new(1, 1);
 
         private async Task<T> One<T>(Func<Task<T>> call)
@@ -425,7 +426,7 @@ public class MergeQueueTests
         public IRunLocks Locks { get; set; } = locks ?? new InProcessRunLocks();
         /// <summary>The board behind <see cref="Stories"/> (every story id is the same story; its epic can be changed between runs).</summary>
         public FakeWorkSource Board { get; init; } =
-            new(new WorkStory(0, "Queue me", "Change one file.", "feature", "https://app.shortcut.com/trefry/story/0"));
+            new(new WorkStory(0, "Queue me", "Change one file.", "feature", "https://app.shortcut.com/trefry/story/0", ItemNaming.Shortcut));
         public IWorkSource Stories => LazyInitializer.EnsureInitialized(ref _stories, () => new LockedSource(Board));
         private IWorkSource? _stories;
         /// <summary>The factory's controls (Pause/Continue/Stop), kept in the shared ledger.</summary>
@@ -594,7 +595,7 @@ public class MergeQueueTests
         // A simple story: its conflict fix round runs on its coding class (low), not the CI fixer's (mid) (E8).
         var h = new Harness
         {
-            Board = new(new WorkStory(0, "Queue me", "Change one file.", "feature", "https://app.shortcut.com/trefry/story/0", Labels: ["simple"])),
+            Board = new(new WorkStory(0, "Queue me", "Change one file.", "feature", "https://app.shortcut.com/trefry/story/0", ItemNaming.Shortcut, Labels: ["simple"])),
         };
         Assert.Equal(WorkState.Watch, (await h.Run(A)).State);
         h.Repo.Conflicting.Add(Branch(B));

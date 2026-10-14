@@ -510,6 +510,21 @@ public class SourceTrustTests
         planned ? $"{PlannedStory.Marker(naming == ItemNaming.Kanban ? "e0865c06-7b9a-4f0f-9a1e-3a8f3c0f2d11" : "sc-5")}\n{Text}" : Text,
         "feature", "https://board.test/item/7", naming);
 
+    /// <summary>
+    /// sc-25992 (E5, E1): trust comes from the source alone — no source and no story has a default naming, so a new source (or a
+    /// story built without one) cannot be trusted by omission, and no Shortcut default sits outside Shortcut's folder.
+    /// </summary>
+    [Fact]
+    public void A_source_and_a_story_must_name_their_source_there_is_no_default_naming()
+    {
+        var getter = typeof(IWorkSource).GetProperty(nameof(IWorkSource.Naming))!.GetMethod!;
+        Assert.True(getter.IsAbstract, "IWorkSource.Naming has a default implementation");
+        var naming = typeof(WorkStory).GetConstructors().Single().GetParameters().Single(p => p.Name == nameof(WorkStory.Naming));
+        Assert.False(naming.HasDefaultValue, "WorkStory's naming has a default");
+        Assert.False(new System.Reflection.NullabilityInfoContext().Create(naming).ReadState == System.Reflection.NullabilityState.Nullable,
+            "WorkStory's naming may be null");
+    }
+
     /// <summary>Every worker prompt that states an item's spec: implement, review fix, CI fix, conflict fix.</summary>
     private static IEnumerable<string> WorkerPrompts(WorkStory story)
     {
@@ -614,6 +629,7 @@ public class SourceTrustTests
     /// <summary>A source that says nothing about plans: the interface's defaults.</summary>
     private sealed class Unplanned : IWorkSource
     {
+        public ItemNaming Naming => ItemNaming.Shortcut;
         public Task<IReadOnlyList<int>> ListReadyAsync(CancellationToken ct) => throw new NotSupportedException();
         public Task<ClaimResult> ClaimAsync(int id, bool ignoreScope, CancellationToken ct) => throw new NotSupportedException();
         public Task<bool> InScopeAsync(int id, CancellationToken ct) => throw new NotSupportedException();

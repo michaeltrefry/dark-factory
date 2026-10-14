@@ -151,9 +151,29 @@ public sealed class WorkSourceRegistry(FactoryOptions options, Func<ItemNaming, 
     /// <paramref name="kanbanHttp"/> (<see cref="OutboundHttp.KanbanApi"/>). That client is apart from the Kanban upstream of
     /// <see cref="FactoryRunner.CreateUpstreams"/>, which holds the read token and is all a model session reaches (E2).
     /// </summary>
-    public static KanbanWorkSource Kanban(FactoryOptions options, HttpClient kanbanHttp, IDbContextFactory<LedgerDbContext>? contexts = null) =>
-        new(new KanbanBoard(KanbanWrites.Client(kanbanHttp, options.KanbanWriteToken)), new KanbanKeys(contexts ?? Ledger(options)),
+    public static KanbanWorkSource Kanban(FactoryOptions options, HttpClient kanbanHttp, IDbContextFactory<LedgerDbContext>? contexts = null)
+    {
+        EnsureKanbanTokensApart(options);
+        return new(new KanbanBoard(KanbanWrites.Client(kanbanHttp, options.KanbanWriteToken)), new KanbanKeys(contexts ?? Ledger(options)),
             options.KanbanWatchScope, options.KanbanWebUrl);
+    }
+
+    /// <summary>
+    /// Refuses <c>Kanban:WriteToken</c> equal to <c>Kanban:Token</c> (sc-25992, E2): the read token is handed to the loopback MCP
+    /// proxy that model sessions call, so the same full-scope token there would give them the orchestrator's writes. Checked at
+    /// start-up (<see cref="FactoryOptions.ValidateSettings"/>) and again before the work source is built, whenever both are set,
+    /// from whichever source each comes; the message names the keys, never either token.
+    /// </summary>
+    public static void EnsureKanbanTokensApart(FactoryOptions options)
+    {
+        if (options.TryGet(o => o.KanbanToken, out var read) && options.TryGet(o => o.KanbanWriteToken, out var write)
+            && string.Equals(read, write, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "Kanban:WriteToken must not be the same token as Kanban:Token: the read token reaches model sessions through the MCP "
+                + "proxy, so it must be a separate read-scope KanbanBoard token (the write token is the factory's own full-scope one).");
+        }
+    }
 
     private static LedgerDbContextFactory Ledger(FactoryOptions options) => new(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
 

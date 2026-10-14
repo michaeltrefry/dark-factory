@@ -21,7 +21,7 @@ namespace DarkFactory.Orchestrator.Tests;
 public class FreezeTests
 {
     private static readonly DateTimeOffset T0 = new(2026, 10, 8, 12, 0, 0, TimeSpan.Zero);
-    private static readonly WorkStory Story = new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77");
+    private static readonly WorkStory Story = new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77", ItemNaming.Shortcut);
     private const string Repo = "michaeltrefry/dark-factory-sandbox";
 
     /// <summary>The base branch's CI as the main-red trigger reads it: the tip after a merge, and that tip's checks.</summary>
@@ -1131,6 +1131,7 @@ public class FreezeTests
     /// <summary>A board listing the given ready stories; the runner under test never reads it otherwise.</summary>
     private sealed class Ready(params int[] ids) : IWorkSource
     {
+        public ItemNaming Naming => ItemNaming.Shortcut;
         public Task<IReadOnlyList<int>> ListReadyAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<int>>(ids);
         public Task<ClaimResult> ClaimAsync(int id, bool ignoreScope, CancellationToken ct) => throw new NotSupportedException();
         public Task<bool> InScopeAsync(int id, CancellationToken ct) => throw new NotSupportedException();

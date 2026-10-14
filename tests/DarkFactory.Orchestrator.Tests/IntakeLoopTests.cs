@@ -116,7 +116,7 @@ public class IntakeLoopTests
         var hosted = app.Services.GetServices<Microsoft.Extensions.Hosting.IHostedService>().ToList();
         Assert.Contains(hosted, s => s is DarkFactory.Orchestrator.Sessions.SessionEventRelay);
         Assert.Contains(hosted, s => s is IntakeLoop);
-        // Watches usage while a long item run holds up the intake loop: the same instance the loop reads at each poll.
+        // Watches usage between polls, so running workers pause too: the same instance the loop reads at each poll.
         Assert.Contains(hosted, s => ReferenceEquals(s, app.Services.GetRequiredService<DarkFactory.Orchestrator.Router.UsageMonitor>()));
     }
 
@@ -428,6 +428,7 @@ public class IntakeLoopTests
 
     private sealed class ScriptedSource(Func<IReadOnlyList<int>> ready) : IWorkSource
     {
+        public ItemNaming Naming => ItemNaming.Shortcut;
         public Task<IReadOnlyList<int>> ListReadyAsync(CancellationToken ct) => Task.FromResult(ready());
         public Task<ClaimResult> ClaimAsync(int id, bool ignoreScope, CancellationToken ct) => throw new NotSupportedException();
         public Task<bool> InScopeAsync(int id, CancellationToken ct) => throw new NotSupportedException();
@@ -479,7 +480,7 @@ public class IntakeLoopTests
         return runner;
     }
 
-    private static FakeWorkSource GoneStory() => new(new WorkStory(101, "s", null, "chore", "https://app.shortcut.com/t/story/101"))
+    private static FakeWorkSource GoneStory() => new(new WorkStory(101, "s", null, "chore", "https://app.shortcut.com/t/story/101", ItemNaming.Shortcut))
     {
         ReadSpecFails = new InvalidOperationException("Shortcut GET stories/101 failed: 404 Not Found"),
     };

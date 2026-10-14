@@ -23,13 +23,35 @@ public class IntakeDispatchTests
     {
         public IReadOnlyList<int> Ready { get; set; } = [];
 
-        protected override object? Invoke(MethodInfo? method, object?[]? args) => method!.Name switch
+        /// <summary>When set, listing the ready items fails this way (the board is down).</summary>
+        public Exception? ListThrows { get; set; }
+
+        /// <summary>The items whose claim was renewed, once per renewal.</summary>
+        public ConcurrentQueue<int> Renewed { get; } = new();
+
+        private int _listings;
+
+        /// <summary>How many times the ready items were listed.</summary>
+        public int Listings => Volatile.Read(ref _listings);
+
+        protected override object? Invoke(MethodInfo? method, object?[]? args)
         {
-            nameof(IWorkSource.ListReadyAsync) => Task.FromResult(Ready),
-            $"get_{nameof(IWorkSource.Naming)}" => ItemNaming.Shortcut,
-            nameof(IWorkSource.RenewClaimAsync) => Task.FromResult(ClaimRenewal.Held),
-            _ => throw new NotSupportedException(method.Name),
-        };
+            switch (method!.Name)
+            {
+                case nameof(IWorkSource.ListReadyAsync):
+                    Interlocked.Increment(ref _listings);
+                    return ListThrows is { } down ? Task.FromException<IReadOnlyList<int>>(down) : Task.FromResult(Ready);
+                case $"get_{nameof(IWorkSource.Naming)}":
+                    return ItemNaming.Shortcut;
+                case nameof(IWorkSource.RenewClaimAsync):
+                    Renewed.Enqueue((int)args![0]!);
+                    return Task.FromResult(ClaimRenewal.Held);
+                default:
+                    throw new NotSupportedException(method.Name);
+            }
+        }
+
+        public static ListingSource Of(IWorkSource source) => (ListingSource)(object)source;
 
         public static IWorkSource Listing(params int[] ready)
         {
@@ -53,8 +75,26 @@ public class IntakeDispatchTests
         /// <summary>When set, a run of the item ends at once this way instead of waiting for the test.</summary>
         public Func<int, Exception?>? Throws { get; set; }
         public bool EndAtOnce { get; set; }
+        /// <summary>When set, a run ends only when the test ends it, also after its token is cancelled (a run finishing its step).</summary>
+        public bool IgnoresCancellation { get; set; }
+        /// <summary>Completes once a run has seen its token cancelled.</summary>
+        public TaskCompletionSource SawCancellation { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<int>>(inFlight);
+        /// <summary>The items listed in flight, in order (settable: what the ledger says changes between polls).</summary>
+        public IReadOnlyList<int> InFlight { get; set; } = inFlight;
+
+        /// <summary>Of <see cref="InFlight"/>, those being stopped and the plan items waiting on their stories (sc-25992).</summary>
+        public HashSet<int> Stopping { get; } = [];
+        public HashSet<int> WaitingPlans { get; } = [];
+
+        /// <summary>When set, listing the items in flight (and so the renewable ones) fails this way.</summary>
+        public Exception? ListThrows { get; set; }
+
+        public Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct) =>
+            ListThrows is { } down ? Task.FromException<IReadOnlyList<int>>(down) : Task.FromResult(InFlight);
+
+        public async Task<IReadOnlyList<InFlightItem>> InFlightItemsAsync(CancellationToken ct) =>
+            [.. (await InFlightAsync(ct)).Select(id => new InFlightItem(id, Stopping.Contains(id), WaitingPlans.Contains(id)))];
 
         private readonly ConcurrentDictionary<int, TaskCompletionSource> _startedAt = new();
 
@@ -90,7 +130,17 @@ public class IntakeDispatchTests
                 {
                     throw ex;
                 }
-                return EndAtOnce ? Ok : await _runs.GetOrAdd(id, _ => new(TaskCreationOptions.RunContinuationsAsynchronously)).Task.WaitAsync(ct);
+                if (EndAtOnce)
+                {
+                    return Ok;
+                }
+                var run = _runs.GetOrAdd(id, _ => new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+                if (IgnoresCancellation)
+                {
+                    using var _ = ct.Register(() => SawCancellation.TrySetResult());
+                    return await run;
+                }
+                return await run.WaitAsync(ct);
             }
             finally
             {
@@ -114,9 +164,9 @@ public class IntakeDispatchTests
     private static readonly RunOutcome Ok = new(1, WorkState.Review, null, null, null);
 
     private static IntakeLoop Loop(IWorkSource source, IItemRunner runner, int concurrent, IntakeStatus? status = null, int maxFailures = 3,
-        IControls? controls = null) =>
+        IControls? controls = null, Func<CancellationToken, Task<FreezeStatus>>? freeze = null) =>
         new([new IntakeLane(source, runner)], new IntakeOptions(TimeSpan.FromSeconds(60), maxFailures, concurrent), TimeProvider.System, NullLogger<IntakeLoop>.Instance,
-            controls, status: status);
+            controls, status: status, freeze: freeze);
 
     /// <summary>The ledger's controls over a ledger of their own, with the context factory a Continue needs.</summary>
     private static (LedgerControls Controls, LedgerDbContextFactory Contexts) NewControls()
@@ -493,5 +543,372 @@ public class IntakeDispatchTests
 
         Assert.Equal(1, Registered([]).MaxConcurrentRuns);
         Assert.Equal(4, Registered(new() { ["Intake:MaxConcurrentRuns"] = "4" }).MaxConcurrentRuns);
+    }
+
+    // sc-25992: a poll does not wait for its runs. Each poll renews claims and dispatches into the capacity the runs still in
+    // flight leave, never a second run of an item in flight. These wait on signals (a run's start, a poll's end), not a clock.
+
+    [Fact]
+    public async Task The_work_loop_polls_again_on_its_interval_and_starts_a_newly_ready_item_while_a_long_run_is_still_in_flight()
+    {
+        var runner = new GatedRunner(1);
+        var source = ListingSource.Listing();
+        var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider();
+        var loop = new IntakeLoop([new IntakeLane(source, runner)], new IntakeOptions(TimeSpan.FromSeconds(60), MaxConcurrentRuns: 2), time,
+            NullLogger<IntakeLoop>.Instance);
+
+        await loop.StartAsync(CancellationToken.None);
+        await runner.WhenStarted(1);
+        await Eventually(() => loop.Waits >= 1, "the first poll arms its wake-up with its run still in flight");
+        ListingSource.Of(source).Ready = [5];
+        time.Advance(TimeSpan.FromSeconds(60));
+        await runner.WhenStarted(2);
+
+        Assert.Equal([1, 5], runner.Started);
+        Assert.Equal(["sc-1", "sc-5"], loop.RunsInFlight.Order());
+        Assert.Equal([1, 1], ListingSource.Of(source).Renewed); // the second poll renewed sc-1's claim while it ran
+        runner.End(1);
+        runner.End(5);
+        await loop.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.Empty(loop.RunsInFlight);
+    }
+
+    [Fact]
+    public async Task A_poll_renews_the_claim_of_an_item_in_flight_and_never_starts_it_a_second_time()
+    {
+        var runner = new GatedRunner(1);
+        var source = ListingSource.Listing(1);
+        var loop = Loop(source, runner, concurrent: 3);
+
+        var first = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await runner.WhenStarted(1);
+        var second = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await second.Done.WaitAsync(TimeSpan.FromSeconds(60)); // its dispatch has ended: it passed over sc-1, in flight and listed again (in flight and ready)
+
+        Assert.Equal([1], runner.Started);
+        Assert.Equal([1, 1], ListingSource.Of(source).Renewed);
+        Assert.False(first.Done.IsCompleted);
+        runner.End(1);
+        await first.Done.WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.Equal([1], runner.Started);
+    }
+
+    [Fact]
+    public async Task A_poll_with_no_free_capacity_lists_nothing_and_the_earlier_poll_starts_its_next_item_when_a_run_ends()
+    {
+        var runner = new GatedRunner(1, 2);
+        var source = ListingSource.Listing(5);
+        var loop = Loop(source, runner, concurrent: 2);
+
+        var first = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await runner.WhenStarted(2);
+        var second = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await second.Done.WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.Equal(1, ListingSource.Of(source).Listings); // every run was in flight: the second poll only renewed
+        Assert.Equal([1, 2, 1, 2], ListingSource.Of(source).Renewed);
+        Assert.Equal([1, 2], runner.Started.Order());
+        runner.End(2);
+        await runner.WhenStarted(3);
+        Assert.Equal([1, 2, 5], runner.Started.Order());
+        Assert.Equal(5, runner.Started.Last());
+        runner.End(1);
+        runner.End(5);
+        await first.Done.WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.Equal(2, runner.Most);
+    }
+
+    [Fact]
+    public async Task With_one_run_at_a_time_a_poll_during_the_run_renews_claims_and_starts_nothing_and_the_order_is_unchanged()
+    {
+        var runner = new GatedRunner(1);
+        var source = ListingSource.Listing(5);
+        var loop = Loop(source, runner, concurrent: 1);
+
+        var first = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await runner.WhenStarted(1);
+        var second = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await second.Done.WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.Equal([1], runner.Started);
+        Assert.Equal([1, 1], ListingSource.Of(source).Renewed);
+        runner.End(1);
+        await runner.WhenStarted(2);
+        Assert.Equal([1, 5], runner.Started);
+        runner.End(5);
+        await first.Done.WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.Equal(1, runner.Most);
+    }
+
+    [Fact]
+    public async Task Stopping_the_work_loop_waits_for_the_runs_in_flight()
+    {
+        var runner = new GatedRunner(1) { IgnoresCancellation = true };
+        var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider();
+        var loop = new IntakeLoop([new IntakeLane(ListingSource.Listing(), runner)], new IntakeOptions(TimeSpan.FromSeconds(60), MaxConcurrentRuns: 2), time,
+            NullLogger<IntakeLoop>.Instance);
+        await loop.StartAsync(CancellationToken.None);
+        await runner.WhenStarted(1);
+        await Eventually(() => loop.Waits >= 1, "the poll is done and the loop waits with its run in flight");
+
+        var stop = loop.StopAsync(CancellationToken.None);
+        await runner.SawCancellation.Task.WaitAsync(TimeSpan.FromSeconds(60));
+        // The run is finishing its step: the loop has not ended under it.
+        Assert.NotSame(stop, await Task.WhenAny(stop, Task.Delay(300)));
+        Assert.False(loop.ExecuteTask!.IsCompleted);
+        runner.End(1);
+        await stop.WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.True(loop.ExecuteTask.IsCompleted);
+        Assert.Empty(loop.RunsInFlight);
+    }
+
+    // sc-25992, round 2: a run's end that frees capacity polls at once after a poll found none; stops and waiting plans start
+    // outside the capacity; a lane's preparation runs off the loop's task; status kept per poll across polls.
+
+    private static Func<CancellationToken, Task<FreezeStatus>> Freeze(Func<bool> frozen) =>
+        _ => Task.FromResult(frozen() ? FreezeStatus.Holds(FreezeTrigger.MainRed, "main is red") : FreezeStatus.Clear);
+
+    [Fact]
+    public async Task When_a_run_ends_after_a_poll_found_no_capacity_free_the_next_listing_comes_at_once_not_at_the_next_interval()
+    {
+        var runner = new GatedRunner(1);
+        var source = ListingSource.Listing();
+        var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider();
+        var loop = new IntakeLoop([new IntakeLane(source, runner)], new IntakeOptions(TimeSpan.FromSeconds(60)), time, NullLogger<IntakeLoop>.Instance);
+
+        await loop.StartAsync(CancellationToken.None);
+        await runner.WhenStarted(1);
+        await Eventually(() => loop.Waits >= 1, "the first poll arms its wake-up with its run in flight");
+        ListingSource.Of(source).Ready = [5];
+        time.Advance(TimeSpan.FromSeconds(60));
+        await Eventually(() => ListingSource.Of(source).Renewed.Count == 2 && loop.Waits >= 2, "the poll during the run renews and waits again");
+        Assert.Equal(1, ListingSource.Of(source).Listings); // it found no capacity free: nothing ready listed
+
+        // The run ends: the clock does not move, and the newly ready item is listed and started all the same.
+        runner.InFlight = [];
+        runner.End(1);
+        await runner.WhenStarted(2);
+        Assert.Equal([1, 5], runner.Started);
+        Assert.Equal(2, ListingSource.Of(source).Listings);
+        runner.End(5);
+        await loop.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+    }
+
+    [Fact]
+    public async Task Items_being_stopped_and_waiting_plans_start_every_poll_outside_the_run_capacity_once_each()
+    {
+        var runner = new GatedRunner(1);
+        var source = ListingSource.Listing();
+        var loop = Loop(source, runner, concurrent: 1);
+        var first = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await runner.WhenStarted(1);
+
+        // The one run there is room for is in flight; sc-9 is being stopped (a plan's pending stop, say) and sc-8 waits on its stories.
+        runner.InFlight = [9, 1, 8];
+        runner.Stopping.Add(9);
+        runner.WaitingPlans.Add(8);
+        var second = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.True(second.Owed);
+        await runner.WhenStarted(3);
+        Assert.Equal([1, 8, 9], runner.Started.Order());
+
+        // Still running: the next poll starts neither again.
+        var third = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await third.Done.WaitAsync(TimeSpan.FromSeconds(60));
+        await Settle();
+        Assert.Equal([1, 8, 9], runner.Started.Order());
+
+        // They hold none of the capacity: once sc-1 ends, a ready item starts beside them.
+        runner.InFlight = [9, 8];
+        ListingSource.Of(source).Ready = [5];
+        runner.End(1);
+        await first.Done.WaitAsync(TimeSpan.FromSeconds(60));
+        var fourth = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await runner.WhenStarted(4);
+        Assert.Equal(5, runner.Started.Last());
+        Assert.Equal(["sc-5", "sc-8", "sc-9"], loop.RunsInFlight.Order());
+        runner.End(5);
+        runner.End(8);
+        runner.End(9);
+        await Task.WhenAll(second.Done, fourth.Done).WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.Empty(loop.RunsInFlight);
+    }
+
+    [Fact]
+    public async Task While_something_holds_new_work_a_stop_still_starts_outside_the_capacity_and_a_waiting_plan_does_not()
+    {
+        var frozen = false;
+        var runner = new GatedRunner(1);
+        var loop = Loop(ListingSource.Listing(), runner, concurrent: 1, freeze: Freeze(() => frozen));
+        var first = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await runner.WhenStarted(1);
+
+        frozen = true;
+        runner.InFlight = [9, 1, 8];
+        runner.Stopping.Add(9);
+        runner.WaitingPlans.Add(8);
+        var second = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await runner.WhenStarted(2);
+        await Settle();
+
+        // The plan waits for capacity as any in-flight item does (its run would be deferred); the stop is finished.
+        Assert.Equal([1, 9], runner.Started.Order());
+        runner.End(9);
+        runner.End(1);
+        await Task.WhenAll(first.Done, second.Done).WaitAsync(TimeSpan.FromSeconds(60));
+    }
+
+    [Fact]
+    public async Task A_run_of_an_older_poll_that_ends_does_not_clear_the_freeze_deferral_a_newer_poll_recorded()
+    {
+        var frozen = false;
+        var runner = new GatedRunner(1);
+        var status = new IntakeStatus(TimeProvider.System);
+        var loop = Loop(ListingSource.Listing(), runner, concurrent: 2, status, freeze: Freeze(() => frozen));
+        var first = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await runner.WhenStarted(1);
+
+        frozen = true;
+        runner.InFlight = [];
+        await (await loop.StartPollAsync(CancellationToken.None)).Done.WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.Equal(["intake"], status.Deferrals.Select(d => d.Id));
+        runner.End(1);
+        await first.Done.WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.Equal(["intake"], status.Deferrals.Select(d => d.Id));
+    }
+
+    [Fact]
+    public async Task A_run_that_ends_undeferred_does_not_clear_the_freeze_deferral_of_its_own_poll()
+    {
+        var runner = new GatedRunner(9);
+        runner.Stopping.Add(9);
+        var status = new IntakeStatus(TimeProvider.System);
+        var poll = Loop(ListingSource.Listing(), runner, concurrent: 1, status, freeze: Freeze(() => true)).PollOnceAsync(CancellationToken.None);
+        await runner.WhenStarted(1);
+
+        runner.End(9); // the stop is finished in the frozen factory: not a dispatch of new work
+        await poll.WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.Equal(["intake"], status.Deferrals.Select(d => d.Id));
+    }
+
+    [Fact]
+    public async Task A_poll_with_no_capacity_free_does_not_clear_a_listing_failure_it_did_not_list_again()
+    {
+        var down = ListingSource.Listing();
+        ListingSource.Of(down).ListThrows = new HttpRequestException("the board is down");
+        var runner = new GatedRunner(1);
+        var status = new IntakeStatus(TimeProvider.System);
+        var loop = new IntakeLoop([new IntakeLane(down, new GatedRunner()), new IntakeLane(ListingSource.Listing(), runner)],
+            new IntakeOptions(TimeSpan.FromSeconds(60)), TimeProvider.System, NullLogger<IntakeLoop>.Instance, status: status);
+        var first = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await runner.WhenStarted(1);
+        Assert.Equal("Poll failed: the board is down", status.FactoryError!.Message);
+
+        var second = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await second.Done.WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.True(second.Owed);
+        Assert.Equal("Poll failed: the board is down", status.FactoryError?.Message); // the board was not listed again: still shown
+        runner.End(1);
+        await first.Done.WaitAsync(TimeSpan.FromSeconds(60));
+    }
+
+    [Fact]
+    public async Task An_earlier_polls_dispatch_that_ends_does_not_clear_a_failure_a_later_poll_hit()
+    {
+        var runner = new GatedRunner(1);
+        var status = new IntakeStatus(TimeProvider.System);
+        var loop = Loop(ListingSource.Listing(), runner, concurrent: 1, status);
+        var first = await loop.StartPollAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+        await runner.WhenStarted(1);
+
+        runner.ListThrows = new InvalidOperationException("the ledger is unreadable");
+        await (await loop.StartPollAsync(CancellationToken.None)).Done.WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.NotNull(status.FactoryError);
+        runner.End(1);
+        await first.Done.WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.Equal("Poll failed: the ledger is unreadable", status.FactoryError?.Message);
+    }
+
+    [Fact]
+    public async Task A_lanes_preparation_runs_off_the_loop_one_at_a_time_and_its_end_lists_what_it_released_at_once()
+    {
+        var runner = new GatedRunner(1);
+        var source = ListingSource.Listing();
+        var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider();
+        var triage = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var prepares = 0;
+        var lane = new IntakeLane(source, runner, async ct =>
+        {
+            Interlocked.Increment(ref prepares);
+            await triage.Task.WaitAsync(ct); // waiting for a worker slot, say
+            ListingSource.Of(source).Ready = [5];
+        });
+        var loop = new IntakeLoop([lane], new IntakeOptions(TimeSpan.FromSeconds(60), MaxConcurrentRuns: 2), time, NullLogger<IntakeLoop>.Instance);
+
+        await loop.StartAsync(CancellationToken.None);
+        await runner.WhenStarted(1); // the poll did not wait for the triage
+        await Eventually(() => loop.Waits >= 1 && Volatile.Read(ref prepares) == 1, "the first poll arms its wake-up, its triage started");
+        time.Advance(TimeSpan.FromSeconds(60));
+        await Eventually(() => ListingSource.Of(source).Renewed.Count == 2 && loop.Waits >= 2, "the next poll renews while the triage waits");
+        Assert.Equal((1, 1), (Volatile.Read(ref prepares), loop.Preparing)); // and starts no second one
+
+        // The triage ends: the loop lists at once (the clock does not move) and starts what it released, preparing nothing more.
+        triage.SetResult();
+        await runner.WhenStarted(2);
+        await Eventually(() => loop.Waits >= 3, "the loop waits again");
+        Assert.Equal([1, 5], runner.Started);
+        Assert.Equal((1, 0), (Volatile.Read(ref prepares), loop.Preparing));
+        runner.End(1);
+        runner.End(5);
+        await loop.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+    }
+
+    [Fact]
+    public async Task A_preparation_that_fails_is_the_failure_of_the_poll_its_end_starts_which_does_not_list_its_lane()
+    {
+        var source = ListingSource.Listing();
+        var status = new IntakeStatus(TimeProvider.System);
+        var lane = new IntakeLane(source, new GatedRunner(), async _ =>
+        {
+            await Task.Yield();
+            throw new HttpRequestException("GitHub is down");
+        });
+        var loop = new IntakeLoop([lane], new IntakeOptions(TimeSpan.FromSeconds(60)), new Microsoft.Extensions.Time.Testing.FakeTimeProvider(),
+            NullLogger<IntakeLoop>.Instance, status: status);
+
+        await loop.StartAsync(CancellationToken.None);
+        await Eventually(() => status.FactoryError is not null && loop.Waits >= 2, "the poll after the triage reports its failure");
+
+        Assert.Equal((1, "Poll failed: GitHub is down"), (status.FactoryError!.Count, status.FactoryError.Message));
+        Assert.Equal(1, ListingSource.Of(source).Listings); // the reporting poll skipped the lane, as the inline failure did
+        await loop.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+    }
+
+    [Fact]
+    public async Task Stopping_the_work_loop_waits_for_a_preparation_in_flight()
+    {
+        var triage = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var lane = new IntakeLane(ListingSource.Listing(), new GatedRunner(), async _ =>
+        {
+            started.TrySetResult();
+            await triage.Task; // finishing its step after the cancellation
+        });
+        var loop = new IntakeLoop([lane], new IntakeOptions(TimeSpan.FromSeconds(60)), new Microsoft.Extensions.Time.Testing.FakeTimeProvider(),
+            NullLogger<IntakeLoop>.Instance);
+        await loop.StartAsync(CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(60));
+        await Eventually(() => loop.Waits >= 1, "the poll is done and the loop waits with the triage in flight");
+
+        var stop = loop.StopAsync(CancellationToken.None);
+        await Settle();
+        Assert.False(stop.IsCompleted);
+        triage.SetResult();
+        await stop.WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.Equal(0, loop.Preparing);
     }
 }

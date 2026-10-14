@@ -18,7 +18,7 @@ namespace DarkFactory.Orchestrator.Tests;
 public class ControlTests
 {
     private const string Session = "sess-ctl";
-    private static readonly WorkStory Story = new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77");
+    private static readonly WorkStory Story = new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77", ItemNaming.Shortcut);
 
     /// <summary>
     /// Works in tool calls until its run is cancelled or, honouring a pause, until the call after the pause request

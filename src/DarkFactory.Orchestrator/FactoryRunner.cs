@@ -847,6 +847,12 @@ public sealed class FactoryItemRunner(FactoryOptions options, IWorkSource source
         return await RunPipeline.InFlightAsync(new WorkLedger(db, TimeProvider.System), source.Naming, ct, FactoryRunner.Controls(options));
     }
 
+    public async Task<IReadOnlyList<InFlightItem>> InFlightItemsAsync(CancellationToken ct)
+    {
+        await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
+        return await RunPipeline.InFlightItemsAsync(new WorkLedger(db, TimeProvider.System), source.Naming, ct, FactoryRunner.Controls(options));
+    }
+
     public async Task<IReadOnlyList<int>> RenewableAsync(CancellationToken ct)
     {
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));

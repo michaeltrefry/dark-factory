@@ -813,13 +813,23 @@ public sealed partial class RunPipeline(
     /// <param name="naming">The source whose items to list: each source's items are listed, and run, by its own intake lane (sc-25982).</param>
     /// <param name="handled">The states the runner's pipeline drives; default <see cref="HandledStates"/> (production).</param>
     public static async Task<IReadOnlyList<int>> InFlightAsync(WorkLedger ledger, ItemNaming naming, CancellationToken ct, IControls? controls = null,
-        IReadOnlySet<WorkState>? handled = null)
+        IReadOnlySet<WorkState>? handled = null) =>
+        [.. (await InFlightItemsAsync(ledger, naming, ct, controls, handled)).Select(i => i.Id)];
+
+    /// <summary>
+    /// <see cref="InFlightAsync"/>, each item with what its run does (sc-25992, <see cref="IItemRunner.InFlightItemsAsync"/>): an item
+    /// being stopped (<see cref="InFlightItem.Stopping"/>) and a plan item waiting on its stories (<see cref="InFlightItem.WaitingPlan"/>,
+    /// <see cref="WorkState.Planned"/>: its run evaluates the plan and ends, <see cref="HoldAsync"/>) are run by the intake loop
+    /// outside its run capacity.
+    /// </summary>
+    public static async Task<IReadOnlyList<InFlightItem>> InFlightItemsAsync(WorkLedger ledger, ItemNaming naming, CancellationToken ct,
+        IControls? controls = null, IReadOnlySet<WorkState>? handled = null)
     {
         controls ??= NoControls.Instance;
         handled ??= HandledStates;
         var stopping = (await controls.ListAsync(ct)).Where(c => c.State == ControlState.Stopping).Select(c => c.Scope).ToHashSet();
-        var stops = new List<int>();
-        var ids = new List<int>();
+        var stops = new List<InFlightItem>();
+        var ids = new List<InFlightItem>();
         var active = await ledger.ActiveItemsAsync(naming.Source, ct);
         // A merged item whose closeout failed is listed until it is posted or its attempts are used up (a run retries it from Watch);
         // a finished plan whose closeout failed likewise (it waits in Planned).
@@ -845,7 +855,8 @@ public sealed partial class RunPipeline(
             }
             if (naming.TryParse(item.ExternalId, out var id))
             {
-                (beingStopped ? stops : ids).Add(id);
+                (beingStopped ? stops : ids).Add(new InFlightItem(id, Stopping: beingStopped,
+                    WaitingPlan: !beingStopped && item.State == WorkState.Planned));
             }
         }
         return [.. stops, .. ids];

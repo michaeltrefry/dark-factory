@@ -69,7 +69,7 @@ internal sealed class TranscriptReplay(string[] lines, Func<bool> paused)
 /// </summary>
 public class StuckWorkerTests
 {
-    private static readonly WorkStory Story = new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77");
+    private static readonly WorkStory Story = new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77", ItemNaming.Shortcut);
 
     /// <summary>A worker that replays one transcript per session, in order; the pause flag is per run, as ClaudeWorker's is.</summary>
     private sealed class ReplayWorker(params TranscriptReplay[] sessions) : IWorker

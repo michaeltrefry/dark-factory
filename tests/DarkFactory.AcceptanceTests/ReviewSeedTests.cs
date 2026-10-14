@@ -15,7 +15,7 @@ public class ReviewSeedTests
 {
     internal static readonly WorkStory Story = new(25379, "Whitespace-only input counts as zero words",
         "WordCounter.Count(\"  \") returns 1. Blank input (only spaces) must count as zero words.", "bug",
-        "https://app.shortcut.com/trefry/story/25379");
+        "https://app.shortcut.com/trefry/story/25379", ItemNaming.Shortcut);
 
     /// <summary>
     /// The story the consumed flag is reviewed against: it asks for the <c>WordCount:IgnoreBlankInput</c> setting the fixture adds,
@@ -26,7 +26,7 @@ public class ReviewSeedTests
         + "(only spaces) counts as zero words and runs of spaces do not count as extra words; when it is off, Count keeps today's "
         + "behaviour for callers that rely on it. Add tests for the default and for the setting switched off, and document the "
         + "setting in the README's configuration table.", "bug",
-        "https://app.shortcut.com/trefry/story/25379");
+        "https://app.shortcut.com/trefry/story/25379", ItemNaming.Shortcut);
 
     private static readonly PullFacts Pull = new(1, "https://github.com/michaeltrefry/dark-factory-sandbox/pull/1", true, false, false,
         "1111111111111111111111111111111111111111", "main", "0000000000000000000000000000000000000000", null);

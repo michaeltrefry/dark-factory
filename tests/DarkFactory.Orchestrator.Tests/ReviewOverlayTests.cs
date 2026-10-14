@@ -28,7 +28,7 @@ public class ReviewOverlayTests
     private const string Listing = "- **r-tools** [csharp]\n  Repo: https://github.com/o/r-tools\n- **R Service** [csharp]\n  Repo: https://github.com/O/R.git\n";
     private static readonly RepoRef Repo = new("o", "r");
 
-    private static readonly WorkStory Story = new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77");
+    private static readonly WorkStory Story = new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77", ItemNaming.Shortcut);
     private static readonly PullFacts Pull = new(1, "https://github.com/o/r/pull/1", true, false, false, Head, "main", Base, null);
     private static readonly RepoFiles Files = new(["src/X.cs"], false);
 

@@ -10,10 +10,10 @@ using Microsoft.EntityFrameworkCore;
 namespace DarkFactory.AcceptanceTests;
 
 /// <summary>
-/// Phase 4b's P4b-AT1, first version (sc-25981; docs/acceptance.md): <c>factory run kb-N</c> takes a Ready item of a watched
-/// KanbanBoard project to an opened pull request — claimed on the real board, worked, and the pull request and branch linked on
-/// the item. It checks up to "pull request opened": what the review and the merge gate then decide is not asserted here.
-/// P4b-AT4 (sc-25982): <c>factory work</c> starts with no Shortcut token and works a Kanban item, then stops it by its id.
+/// Phase 4b's P4b-AT1 (sc-25981, sc-25992; docs/acceptance.md): <c>factory run kb-N</c> takes a Ready item of a watched
+/// KanbanBoard project to a merged pull request with no human — claimed, InProgress, the pull request and branch linked on the
+/// item, Done, and one closeout comment equal to the ledger's rendering. P4b-AT4 (sc-25982): <c>factory work</c> starts with no
+/// Shortcut token and works a Kanban item — claims it and opens its pull request — then stops it by its id.
 /// </summary>
 public class KanbanAcceptanceTests
 {
@@ -98,10 +98,20 @@ public class KanbanAcceptanceTests
                 var history = await HistoryAsync(e2e, name, ct);
                 Assert.Single(history, e => e.Step == RunPipeline.Steps.Claimed);
                 var prUrl = Assert.Single(history, e => e.Step == RunPipeline.Steps.Linked).Detail!.Split(' ')[0];
+                // Worked: claimed under the item's own marker, and its pull request opened on GitHub from the item's own branch and
+                // linked on the item, with the branch.
                 var claimed = await board.GetItemAsync(guid, ct);
                 Assert.Equal(KanbanWorkSource.Marker(guid), claimed.ClaimMarker);
                 Assert.Contains(claimed.Status, new[] { KanbanStatus.InProgress, KanbanStatus.Done }); // Done if the gate went on to merge it
                 Assert.Single(claimed.Links!, l => l.Kind == "pr" && l.Url == prUrl);
+                await using (var ledgerRow = e2e.Db())
+                {
+                    var workRepo = RepoRef.Parse((await ledgerRow.WorkItems.AsNoTracking().SingleAsync(w => w.ExternalId == name, ct)).Repo);
+                    Assert.Single(await E2e.PullRequestsAsync(workRepo, ItemNaming.Kanban.BranchName(key!.Value), ct),
+                        p => p.GetProperty("html_url").GetString() == prUrl);
+                    Assert.Single(claimed.Links!, l => l.Kind == "branch"
+                        && l.Url == RunPipeline.BranchUrl(workRepo, ItemNaming.Kanban.BranchName(key.Value)));
+                }
 
                 // `factory stop --item kb-N`, through the same code path, while the host runs: the item's own source is found by its id.
                 if (claimed.Status == KanbanStatus.Done)
@@ -148,85 +158,95 @@ public class KanbanAcceptanceTests
         return item is null ? [] : await db.LedgerEntries.AsNoTracking().Where(e => e.WorkItemId == item.Id).OrderBy(e => e.Id).ToListAsync(ct);
     }
 
+    /// <summary>
+    /// P4b-AT1 (epic sc-25980; sc-25981, sc-25992): "A Ready item in a watched Kanban project becomes a merged pull request with
+    /// no human: claimed, InProgress, PR and branch links on the item, Done, a closeout comment equal to the ledger's." One
+    /// <c>factory run kb-N</c> takes the item through the whole pipeline — implement, the review panel, CI, the merge gate and the
+    /// merge queue — to Watch, as Phase 2's <see cref="ReviewGateTests"/> does for a Shortcut story. The item's fix must be small
+    /// enough to pass the real gate (a one-line bug fix in the sandbox repo, as for P2-AT1).
+    /// </summary>
     [Fact]
-    public async Task P4b_AT1_factory_run_takes_a_ready_kanban_item_to_an_opened_pull_request_linked_on_the_item()
+    public async Task P4b_AT1_a_ready_kanban_item_becomes_a_merged_pull_request_with_no_human_and_its_closeout_is_the_ledgers()
     {
         Harness.RequireOptIn();
         var itemId = Harness.RequireEnv("FACTORY_E2E_P4B_KANBAN_ITEM",
-            "the id (GUID) of a Ready, unclaimed, unblocked KanbanBoard item whose fix lands in the sandbox repo");
+            "the id (GUID) of a Ready, unclaimed, unblocked KanbanBoard bug item whose small fix lands in the sandbox repo (the gate will merge it; a fresh item each run)");
         Assert.True(Guid.TryParse(itemId, out var guid), $"FACTORY_E2E_P4B_KANBAN_ITEM='{itemId}' is not a GUID");
         var project = Harness.RequireEnv("FACTORY_E2E_P4B_KANBAN_PROJECT", "the key of that item's project (the test's Kanban:Watch:Projects)");
         var writeToken = Harness.RequireSecret(o => o.KanbanWriteToken);
-        var appId = Harness.RequireSecret(o => o.GitHubAppId);
-        var appKey = Harness.RequireSecret(o => o.GitHubAppPrivateKeyPem);
         await using var e2e = await E2e.StartAsync("df_p4b_at1", ItemNaming.Kanban);
-        var ct = TestContext.Current.CancellationToken;
         var options = e2e.Options(new Dictionary<string, string?> { [KanbanScope.Setting] = project });
+        await ReviewGateTests.RequireGateReadyAsync(options, TestContext.Current.CancellationToken);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        timeout.CancelAfter(TimeSpan.FromMinutes(60));
+        var ct = timeout.Token;
 
         using var kanbanHttp = OutboundHttp.KanbanApi(options.KanbanMcpUrl);
-        var board = new KanbanBoard(KanbanWrites.Client(kanbanHttp, writeToken));
+        var mcp = KanbanWrites.Client(kanbanHttp, writeToken);
+        var board = new KanbanBoard(mcp);
         var before = await board.GetItemAsync(guid, ct);
         Assert.True(before is { Status: KanbanStatus.Ready, ClaimMarker: null } && before.OpenBlockers.Count == 0,
             $"The item must be Ready, unclaimed and unblocked; it is {before.Status}, claimed by {before.Claimant ?? "nobody"}, "
             + $"with {before.OpenBlockers.Count} open blocker(s).");
 
-        // The item gets its key (the same one however often it is asked for), then `factory run kb-N`.
+        // The item gets its key (the same one however often it is asked for), and is listed ready under it in the watched project.
         var name = await FactoryRunner.KanbanKeyAsync(options, guid, ct);
         Assert.Equal(name, await FactoryRunner.KanbanKeyAsync(options, guid, ct));
         var item = ItemNaming.ParseAny(name) ?? throw new InvalidOperationException($"'{name}' is no work item id.");
         Assert.Equal(ItemNaming.Kanban, item.Naming);
-        // It is listed ready, under that key, before the run.
         Assert.Contains(item.Id, await WorkSourceRegistry.Kanban(options, kanbanHttp).ListReadyAsync(ct));
 
+        // No human from here: one run, to the merge.
         var outcome = await FactoryRunner.RunAsync(options, item, ignoreScope: false, Console.Out, ct);
         Console.WriteLine($"[p4b-at1] {name}: {outcome.State}{(outcome.Error is null ? "" : $" ({outcome.Error})")}");
+        Assert.True(outcome.Succeeded, outcome.Error);
 
-        // Ledger: claimed, then the pull request and branch linked, under the item's key.
         await using var db = e2e.Db();
         var row = await db.WorkItems.AsNoTracking().SingleAsync(w => w.Source == ItemNaming.Kanban.Source && w.ExternalId == name, ct);
-        var history = await db.LedgerEntries.AsNoTracking().Where(e => e.WorkItemId == row.Id).OrderBy(e => e.Id).ToListAsync(ct);
+        var history = await HistoryAsync(e2e, name, ct);
+        var states = history.Where(e => e.Step is null).Select(e => e.State).ToList();
+        // Claimed, then InProgress on the board (Implement), then the gate; fix rounds between are the panel's call.
+        Assert.Equal([WorkState.Intake, WorkState.Implement], states.Take(2));
+        Assert.Equal([WorkState.MergeGate, WorkState.Merge, WorkState.Watch], states.TakeLast(3));
+        ReviewGateTests.AssertTypedOutcomes(history);
         Assert.Single(history, e => e.Step == RunPipeline.Steps.Claimed);
-        var linked = Assert.Single(history, e => e.Step == RunPipeline.Steps.Linked);
-        var links = linked.Detail!.Split(' ');
+        var links = Assert.Single(history, e => e.Step == RunPipeline.Steps.Linked).Detail!.Split(' ');
         Assert.Equal(2, links.Length);
         var (prUrl, branchUrl) = (links[0], links[1]);
         var repo = RepoRef.Parse(row.Repo);
         Assert.Equal(RunPipeline.BranchUrl(repo, ItemNaming.Kanban.BranchName(item.Id)), branchUrl);
-        Assert.Contains(history, e => e.Step is null && e.State == WorkState.Review);
+        Assert.Contains(history, e => e.Step == RunPipeline.Steps.MergedReported);
 
-        // GitHub: the pull request exists, from the item's own branch.
-        using var github = OutboundHttp.GitHubApi();
-        var token = (await new GitHubApp(github, appId, appKey, TimeProvider.System).CreateInstallationTokenAsync(repo, ct)).Token;
-        using var request = GitHubApp.Request(HttpMethod.Get,
-            $"repos/{repo.Owner}/{repo.Name}/pulls?state=all&head={Uri.EscapeDataString($"{repo.Owner}:{ItemNaming.Kanban.BranchName(item.Id)}")}",
-            "Bearer", token);
-        using var response = await github.SendAsync(request, ct);
-        response.EnsureSuccessStatusCode();
-        Assert.Single((await response.Content.ReadFromJsonAsync<JsonElement>(ct)).EnumerateArray(), p => p.GetProperty("html_url").GetString() == prUrl);
+        // GitHub: the pull request from the item's own branch is merged, at the commit the ledger's Merge row records.
+        var pull = Assert.Single(await E2e.PullRequestsAsync(repo, ItemNaming.Kanban.BranchName(item.Id), ct),
+            p => p.GetProperty("html_url").GetString() == prUrl);
+        Assert.NotEqual(JsonValueKind.Null, pull.GetProperty("merged_at").ValueKind);
+        Assert.Equal(history.Single(e => e.Step is null && e.State == WorkState.Merge).Detail, pull.GetProperty("merge_commit_sha").GetString());
 
-        // The board: the factory's claim under the marker derived from the item's board id, the item taken out of Ready, and the
-        // pull request and the branch as links of their kinds.
+        // The board: Done, the pull request and the branch as links of their kinds, and exactly one closeout comment, equal to the
+        // ledger's rendering of the rows written before it was posted.
         var after = await board.GetItemAsync(guid, ct);
-        Assert.Equal(KanbanWorkSource.Marker(guid), after.ClaimMarker);
-        Assert.NotNull(after.ClaimantId);
-        Assert.Contains(after.Status, new[] { KanbanStatus.InProgress, KanbanStatus.Done }); // Done if the gate went on to merge it
+        Assert.Equal(KanbanStatus.Done, after.Status);
         Assert.Single(after.Links!, l => l.Kind == "pr" && l.Url == prUrl);
         Assert.Single(after.Links!, l => l.Kind == "branch" && l.Url == branchUrl);
+        var closeout = history.FindIndex(e => e.Step == RunPipeline.Steps.Closeout && e.Detail == RunPipeline.Posted);
+        Assert.True(closeout >= 0, $"{name}'s ledger has no posted closeout row");
+        var costs = await new WorkLedger(db, TimeProvider.System).SessionCostsAsync(row, ct);
+        var expected = Lines(WorkSourceComments.Attributed(LedgerReport.MergedCloseout(name, history.Take(closeout).ToList(), costs)));
+        Assert.Single(await KanbanPlanAcceptanceTests.CommentsAsync(mcp, guid, ct), c => c == expected);
 
-        // A second run resumes from the ledger and writes nothing twice. (An escalated item re-enters Intake by design — a re-run
-        // is its remedy — so the resume is only checked for an item the first run did not escalate.)
-        if (outcome.State == WorkState.Escalated)
-        {
-            Console.WriteLine($"[p4b-at1] {name} escalated after its pull request was opened; the resume is not checked.");
-            return;
-        }
+        // A second run resumes from the ledger and writes nothing twice: no second claim, link or closeout.
         await FactoryRunner.RunAsync(options, item, ignoreScope: false, Console.Out, ct);
-        var resumed = await db.LedgerEntries.AsNoTracking().Where(e => e.WorkItemId == row.Id).ToListAsync(ct);
+        var resumed = await HistoryAsync(e2e, name, ct);
         Assert.Single(resumed, e => e.Step == RunPipeline.Steps.Claimed);
         Assert.Single(resumed, e => e.Step == RunPipeline.Steps.Linked);
+        Assert.Single(resumed, e => e.Step == RunPipeline.Steps.Closeout && e.Detail == RunPipeline.Posted);
         var again = await board.GetItemAsync(guid, ct);
         Assert.Equal(after.Links!.Count, again.Links!.Count);
+        Assert.Single(await KanbanPlanAcceptanceTests.CommentsAsync(mcp, guid, ct), c => c == expected);
     }
+
+    private static string Lines(string? text) => (text ?? "").Replace("\r\n", "\n", StringComparison.Ordinal);
 
     /// <summary>
     /// P4b-AT3 (sc-25983; docs/acceptance.md): on the real board, with a second caller (another identity's full-scope token) — a

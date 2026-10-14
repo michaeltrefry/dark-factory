@@ -819,7 +819,7 @@ public class IssueIntakeTests
         var h = new Harness(Answer());
         await h.Watch();
         h.Open("maintainer");
-        var shortcut = new FakeWorkSource(new WorkStory(77, "s", "d", "bug", "u"));
+        var shortcut = new FakeWorkSource(new WorkStory(77, "s", "d", "bug", "u", ItemNaming.Shortcut));
         var shortcutRuns = new Runner();
         var issueRuns = new Runner();
         var loop = new IntakeLoop([new IntakeLane(shortcut, shortcutRuns), new IntakeLane(h.Source(), issueRuns, h.Intake().PollAsync)],

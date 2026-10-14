@@ -229,7 +229,7 @@ public class StepOutcomeTests
 
         var reports = new[]
         {
-            LedgerReport.PullRequestBody(new WorkStory(77, "story", "d", "bug", "https://app.shortcut.com/trefry/story/77"), history, [1m]),
+            LedgerReport.PullRequestBody(new WorkStory(77, "story", "d", "bug", "https://app.shortcut.com/trefry/story/77", ItemNaming.Shortcut), history, [1m]),
             LedgerReport.MergedCloseout("sc-77", history, [1m]),
         };
 

@@ -40,7 +40,7 @@ public class PromptFenceTests
         ItemNaming.GitHubIssue, "acme/widgets#1");
 
     private static WorkStory Shortcut() => new(12, "Count blank input as zero", "Repo: acme/widgets\n\nAC: WordCount(\" \") is 0.", "feature",
-        "https://app.shortcut.com/x/story/12");
+        "https://app.shortcut.com/x/story/12", ItemNaming.Shortcut);
 
     private static WorkSpec Spec(WorkStory story) => new(story, null, []);
 

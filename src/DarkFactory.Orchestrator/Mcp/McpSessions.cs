@@ -1,5 +1,3 @@
-using System.Diagnostics;
-using System.Text.RegularExpressions;
 using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.Orchestrator.Mcp;
@@ -39,8 +37,8 @@ public interface IMcpSessions
 /// user reads it through the work root's inherited read entry, <c>setup-worker-user.sh</c>), made <c>0700</c> itself, and each file is
 /// created <c>0600</c>; it lives outside the session's worktree, so a session confined to its worktree cannot Read it into its
 /// transcript. With <paramref name="workerUser"/> (<c>Worker:RunAs</c>; null for <c>none</c>), once the file is written the owner
-/// checks that the directory's ACL lets that user search it and the file's lets it read it (<see cref="AclGrants"/>, from
-/// <c>/bin/ls -led</c>), else the session is not started (<see cref="FactoryUnavailableException"/>: re-run the setup). The file is
+/// checks that the directory's ACL lets that user search it and the file's lets it read it (<see cref="Worker.WorkerSandbox.Grants"/>, from
+/// <c>/bin/ls -led</c>, <see cref="Worker.WorkerSandbox.ListAclAsync"/>: the one ACL reader and parser, sc-25992), else the session is not started (<see cref="FactoryUnavailableException"/>: re-run the setup). The file is
 /// deleted and the credential revoked when the session ends: afterwards it opens nothing. Residual: while the session runs, a
 /// process that can read the file (the owner, root, or another process of the worker user — none runs then, under the worker run
 /// lock) could use the session's granted tools through the proxy. With <paramref name="owner"/> (the item whose run opens the
@@ -57,7 +55,7 @@ public interface IMcpSessions
 /// same slot's user, and none runs while the session holds that slot's lock; another slot's worker cannot read the file.
 /// Without <paramref name="restrict"/> (one slot, as before slots) the directory is as it always was.</para>
 /// </summary>
-public sealed partial class McpProxySessions(McpProxy proxy, string directory, string? workerUser = null,
+public sealed class McpProxySessions(McpProxy proxy, string directory, string? workerUser = null,
     Func<string, CancellationToken, Task<string>>? readAcl = null, ItemRef? owner = null,
     Func<string, CancellationToken, Task>? restrict = null) : IMcpSessions
 {
@@ -140,7 +138,7 @@ public sealed partial class McpProxySessions(McpProxy proxy, string directory, s
             }
             if (workerUser is not null)
             {
-                await EnsureWorkerCanReadAsync(workerUser, Path.GetFullPath(directory), path, readAcl ?? ListAclAsync, ct, alone: restrict is not null,
+                await EnsureWorkerCanReadAsync(workerUser, Path.GetFullPath(directory), path, readAcl ?? Worker.WorkerSandbox.ListAclAsync, ct, alone: restrict is not null,
                     AclRetry);
             }
             return new Session(grant, path);
@@ -166,7 +164,10 @@ public sealed partial class McpProxySessions(McpProxy proxy, string directory, s
         foreach (var (path, right) in new[] { (dir, "search"), (file, "read") })
         {
             var acl = "";
-            for (var read = 1; read <= (alone ? Worker.WorkerSandbox.AclReads : 1); read++)
+            // One retry rule with every other sandbox ACL check (Worker.WorkerSandbox.RestrictToWorkerAsync): ls prints an entry's
+            // UUID instead of its user name while the directory service does not answer, so a listing that does not show what it
+            // must is read again, up to WorkerSandbox.AclReads times, before it fails the session.
+            for (var read = 1; ; read++)
             {
                 try
                 {
@@ -176,15 +177,14 @@ public sealed partial class McpProxySessions(McpProxy proxy, string directory, s
                 {
                     throw new FactoryUnavailableException($"the MCP session config: cannot read the ACL of {path}: {ex.Message}", ex);
                 }
-                // ls prints an entry's UUID instead of its user name while the directory service does not answer: a listing that
-                // must name one user and nobody else is read again before it fails the session.
-                if (!alone || (AclGrants(acl, user, right) && Worker.WorkerSandbox.OpenToOthers(acl, user) is null))
+                if ((Worker.WorkerSandbox.Grants(acl, user, right) && (!alone || Worker.WorkerSandbox.OpenToOthers(acl, user) is null))
+                    || read >= Worker.WorkerSandbox.AclReads)
                 {
                     break;
                 }
                 await Task.Delay(retry ?? Worker.WorkerSandbox.AclRetry, ct);
             }
-            if (!AclGrants(acl, user, right))
+            if (!Worker.WorkerSandbox.Grants(acl, user, right))
             {
                 var why = $"{path} grants {user} no ACL '{right}' entry, so the worker cannot read its MCP configuration; re-run `sudo scripts/setup-worker-user.sh`";
                 throw new FactoryUnavailableException($"the MCP session config: {why}", new InvalidOperationException(why));
@@ -196,54 +196,6 @@ public sealed partial class McpProxySessions(McpProxy proxy, string directory, s
                 throw new FactoryUnavailableException($"the MCP session config: {why}", new InvalidOperationException(why));
             }
         }
-    }
-
-    /// <summary>
-    /// Whether <paramref name="lsOutput"/> (macOS <c>ls -led</c>: one line per ACL entry, e.g. <c> 0: user:_factory inherited allow
-    /// read,readattr</c>) has an <c>allow</c> entry for <paramref name="user"/> listing <paramref name="right"/> and no <c>deny</c> entry
-    /// for that user listing it.
-    /// </summary>
-    public static bool AclGrants(string lsOutput, string user, string right)
-    {
-        var (allowed, denied) = (false, false);
-        foreach (Match m in AclEntry().Matches(lsOutput))
-        {
-            if (m.Groups["user"].Value != user || !m.Groups["rights"].Value.Split(',').Contains(right, StringComparer.Ordinal))
-            {
-                continue;
-            }
-            if (m.Groups["kind"].Value == "deny")
-            {
-                denied = true;
-            }
-            else
-            {
-                allowed = true;
-            }
-        }
-        return allowed && !denied;
-    }
-
-    [GeneratedRegex(@"^\s*\d+:\s+user:(?<user>\S+)\s+(?:inherited\s+)?(?<kind>allow|deny)\s+(?<rights>\S+)", RegexOptions.Multiline)]
-    private static partial Regex AclEntry();
-
-    /// <summary>The ACL of <paramref name="path"/> as <c>/bin/ls -led</c> prints it (a local program, owner-side).</summary>
-    private static async Task<string> ListAclAsync(string path, CancellationToken ct)
-    {
-        var psi = new ProcessStartInfo("/bin/ls") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
-        foreach (var arg in new[] { "-led", "--", path })
-        {
-            psi.ArgumentList.Add(arg);
-        }
-        using var p = Process.Start(psi)!;
-        var stdout = p.StandardOutput.ReadToEndAsync(ct);
-        var stderr = p.StandardError.ReadToEndAsync(ct);
-        await p.WaitForExitAsync(ct);
-        if (p.ExitCode != 0)
-        {
-            throw new InvalidOperationException($"/bin/ls failed ({p.ExitCode}): {(await stderr).Trim()}");
-        }
-        return await stdout;
     }
 
     private sealed class Session(McpProxyGrant grant, string path) : IMcpSession

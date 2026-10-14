@@ -22,7 +22,7 @@ namespace DarkFactory.Orchestrator.Tests;
 public class RunsInFlightTests
 {
     private static readonly DateTimeOffset T0 = new(2026, 10, 13, 9, 0, 0, TimeSpan.Zero);
-    private static readonly WorkStory Story = new(1, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/1");
+    private static readonly WorkStory Story = new(1, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/1", ItemNaming.Shortcut);
     private static readonly TimeSpan Signal = TimeSpan.FromSeconds(60);
 
     /// <summary>One item's worker: its first session says it started, then ends when — and how — the test says.</summary>

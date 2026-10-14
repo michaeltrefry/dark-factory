@@ -15,7 +15,7 @@ namespace DarkFactory.Orchestrator.Tests;
 public class WorkerModelClassTests
 {
     private static WorkStory StoryWith(IReadOnlyList<string>? labels = null, int? estimate = null) =>
-        new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77",
+        new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77", ItemNaming.Shortcut,
             Labels: labels, Estimate: estimate);
 
     [Theory]

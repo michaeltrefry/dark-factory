@@ -52,6 +52,8 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
 {
     public static readonly Uri DefaultBaseAddress = Gateway.OutboundHttp.ShortcutApiBase;
 
+    public ItemNaming Naming => ItemNaming.Shortcut;
+
     public const string ClaimLabel = "factory-claimed";
     public const string ReadyState = "To Do";
 
@@ -178,7 +180,7 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
     {
         var story = await GetStoryAsync(id, ct);
         // The labels and estimate decide the item's coding model class (WorkerModelClass.Coding, E8).
-        var work = new WorkStory(story.Id, story.Name, story.Description, story.StoryType, story.AppUrl, Labels: story.LabelNames,
+        var work = new WorkStory(story.Id, story.Name, story.Description, story.StoryType, story.AppUrl, ItemNaming.Shortcut, Labels: story.LabelNames,
             Estimate: story.Estimate);
         if (story.EpicId is not { } epicId)
         {
