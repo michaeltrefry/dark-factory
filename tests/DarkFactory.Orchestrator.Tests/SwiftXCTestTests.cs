@@ -276,6 +276,85 @@ public class SwiftXCTestIdentifyTests
         }
     }
 
+    [Theory]
+    // A class that inherited nothing at the base (its method only test-looking) now inherits another module's class.
+    [InlineData("import XCTest\nclass Foo { func testX() {} }\n", "import XCTest\nclass Foo: SharedCase { func testX() {} }\n", "its class Foo: it inherits SharedCase")]
+    // An extension of a type the module does not declare, in a file that now imports XCTest.
+    [InlineData("extension Foo { func testX() {} }\n", "import XCTest\nextension Foo { func testX() {} }\n", "declared in an extension of Foo")]
+    public async Task A_method_that_was_only_test_looking_at_the_base_and_cannot_be_run_apart_at_the_head_is_unsupported(string before, string after, string why)
+    {
+        const string path = "Tests/WordsTests/Foo.swift";
+        var runner = Runner((path, after));
+        runner.BaseFiles[path] = before;
+
+        var set = await Identify(runner);
+
+        Assert.Empty(set.Tests);
+        var problem = Assert.Single(set.Unisolable);
+        Assert.Contains($"WordsTests.Foo/testX() in {path} is a new XCTest test method the gate cannot run apart: ", problem);
+        Assert.Contains(why, problem);
+    }
+
+    [Fact]
+    public async Task A_test_moved_unchanged_to_a_renamed_class_or_another_class_is_not_new_and_one_changed_on_the_way_is()
+    {
+        const string other = "Tests/WordsTests/OtherTests.swift";
+        const string method = "    func testTwo() {\n        XCTAssertEqual(count(\"a b\"), 2)\n    }\n";
+        var renamed = Runner((LegacyFile, Legacy.Replace("class LegacyTests", "class RenamedTests")));
+        // Moved to another class, its indentation changed on the way (tabs).
+        var moved = Runner((LegacyFile, "import XCTest\n\nclass LegacyTests: XCTestCase {}\n"),
+            (other, "import XCTest\n@testable import Words\n\nfinal class OtherTests: XCTestCase {\n\tfunc testTwo() {\n\t\tXCTAssertEqual(count(\"a b\"), 2)\n\t}\n}\n"));
+        moved.BaseFiles[LegacyFile] = "import XCTest\n@testable import Words\n\nclass LegacyTests: XCTestCase {\n" + method + "}\n";
+        moved.BaseFiles[other] = "import XCTest\n@testable import Words\n\nfinal class OtherTests: XCTestCase {}\n";
+        var changed = Runner((LegacyFile, Legacy.Replace("class LegacyTests", "class RenamedTests").Replace("2) }", "2, \"two\") }")));
+
+        Assert.Empty((await Identify(renamed)).Tests);
+        Assert.Empty((await Identify(moved)).Tests);
+        Assert.Equal(["WordsTests.RenamedTests/testTwo"], (await Identify(changed)).Tests);
+    }
+
+    [Theory]
+    // The fixture the arguments name gets a new value: unsupported.
+    [InlineData("@Test(arguments: Fixtures.all)", "enum Fixtures { static let all = [1, 2, 3] }\n", "its arguments: name Fixtures, which the pull request changes in its test target")]
+    // A changed declaration the arguments do not name: nothing.
+    [InlineData("@Test(arguments: Fixtures.all)", "enum Fixtures { static let all = [1, 2] }\nenum Unrelated { static let x = 1 }\n", null)]
+    // A new function in the fixture's type changes none of its values: nothing.
+    [InlineData("@Test(arguments: Fixtures.all)", "enum Fixtures {\n    static let all = [1, 2]\n    static func helper() {}\n}\n", null)]
+    // Arguments the gate cannot resolve to names (an interpolation), while the target's declarations change: unsupported.
+    [InlineData("@Test(arguments: [\"\\(1)\"])", "enum Fixtures { static let all = [1, 2, 3] }\n", "its arguments: are not a form the gate can resolve to names, and the pull request changes declarations of its test target")]
+    public async Task An_existing_parameterized_test_whose_arguments_name_a_declaration_the_pull_request_changes_is_unsupported(string attribute, string fixtures, string? why)
+    {
+        const string fixturesPath = "Tests/WordsTests/Fixtures.swift";
+        var runner = Runner((fixturesPath, fixtures));
+        runner.BaseFiles[TestFile] = SwiftIdentifyTests.BaseTests + attribute + " func many(n: Int) { #expect(n > 0) }\n";
+        runner.BaseFiles[fixturesPath] = "enum Fixtures { static let all = [1, 2] }\n";
+
+        var set = await Identify(runner);
+
+        Assert.Empty(set.Tests);
+        if (why is null)
+        {
+            Assert.Empty(set.Unisolable);
+        }
+        else
+        {
+            Assert.Equal($"WordsTests.many(n:) in {TestFile} is an existing parameterized test whose cases the pull request may change: {why}; its new cases cannot be run apart from its old ones", Assert.Single(set.Unisolable));
+        }
+    }
+
+    [Fact]
+    public async Task A_new_test_beside_an_existing_parameterized_one_changes_nothing_its_arguments_name()
+    {
+        const string suite = "import Testing\n\nstruct S {\n    static let all = [1, 2]\n    @Test(arguments: S.all) func many(n: Int) { #expect(n > 0) }\nEXTRA}\n";
+        var runner = Runner((TestFile, suite.Replace("EXTRA", "    @Test func extra() { #expect(true) }\n")));
+        runner.BaseFiles[TestFile] = suite.Replace("EXTRA", "");
+
+        var set = await Identify(runner);
+
+        Assert.Equal(["WordsTests.S/extra()"], set.Tests);
+        Assert.Empty(set.Unisolable);
+    }
+
     [Fact]
     public async Task A_new_xctest_method_calling_code_the_base_lacks_is_not_built()
     {
@@ -366,12 +445,32 @@ public class SwiftXCTestOutputTests
     [InlineData("Test Case 'Sub.testSub' passed (0.001 seconds)\n", 0, "ends without having started")]
     [InlineData(LinuxPassed + "\nTest Case 'Sub.testSub' passed (0.001 seconds)\n", 0, "ends twice")]
     [InlineData("Test Case 'a b c' started.\nTest Case 'a b c' passed (0.001 seconds).\n", 0, "is not named as XCTest names one")]
+    // No summary after the case, or one only before it.
+    [InlineData("Test Case 'Sub.testSub' started at x\nTest Case 'Sub.testSub' passed (0.001 seconds)\n", 0, "no XCTest summary (Executed N tests, …) follows its last test case")]
+    [InlineData("Test Case 'Sub.testSub' started at x\n\t Executed 1 test, with 0 failures (0 unexpected) in 0.001 (0.001) seconds\nTest Case 'Sub.testSub' passed (0.001 seconds)\n", 0, "no XCTest summary")]
+    // A summary that does not count the cases read: tests, skipped, failures.
+    [InlineData(LinuxPassed + "\n\t Executed 2 tests, with 0 failures (0 unexpected) in 0.001 (0.001) seconds\n", 0, "its summary (Executed 2 test(s), 0 skipped, 0 failure(s)) does not agree with its 1 case(s), 0 skipped and 0 failed")]
+    [InlineData(DarwinSkipped + "\n\t Executed 1 test, with 0 failures (0 unexpected) in 0.001 (0.001) seconds\n", 0, "does not agree with its 1 case(s), 1 skipped and 0 failed")]
+    [InlineData(DarwinFailed + "\n\t Executed 1 test, with 0 failures (0 unexpected) in 0.045 (0.045) seconds\n", 1, "does not agree with its 1 case(s), 0 skipped and 1 failed")]
+    [InlineData(LinuxPassed + "\n\t Executed 1 test, with 1 failure (0 unexpected) in 0.001 (0.001) seconds\n", 0, "does not agree with its 1 case(s), 0 skipped and 0 failed")]
+    // A test process that crashed (Swift 6.3.2 on macOS, an index out of range): started, never ended, no summary.
+    [InlineData("Test Suite 'T' started at 2026-10-14 16:29:58.157.\nTest Case '-[LibTests.Sub testSub]' started.\nSwift/ContiguousArrayBuffer.swift:692: Fatal error: Index out of range\n", 1, "its test case '-[LibTests.Sub testSub]' started and never ended (the test process crashed or was killed)")]
     public void Output_that_cannot_be_trusted_is_unreadable_never_a_result(string output, int exit, string why)
     {
         var results = Parse(output, exit);
 
         Assert.Empty(results.Cases);
         Assert.Contains(why, Assert.Single(results.Unreadable));
+    }
+
+    [Fact]
+    public void A_summarys_failures_count_issues_so_two_failed_assertions_in_one_failed_test_agree()
+    {
+        // Swift 6.3.2 on macOS: one test with two failed XCTAssertEqual calls.
+        var results = Parse(DarwinFailed.Replace("with 1 failure", "with 2 failures"), 1);
+
+        Assert.Empty(results.Unreadable);
+        Assert.Equal([new TestCaseResult(Id, TestCaseResult.Failed)], results.Cases[Id]);
     }
 
     [Fact]
@@ -493,6 +592,62 @@ public class XcodeXCTestTests
         Assert.Equal(["WordsTests/Params/blank(text:)"], set.Tests);
         Assert.Empty(changedSet.Tests);
         Assert.Contains("WordsTests/Params/blank(text:) in WordsTests/Params.swift is an existing parameterized test whose arguments: the pull request changes", Assert.Single(changedSet.Unisolable));
+    }
+
+    [Theory]
+    [InlineData("import XCTest\nclass Foo { func testX() {} }\n", "import XCTest\nclass Foo: SharedCase { func testX() {} }\n", "its class Foo: it inherits SharedCase")]
+    [InlineData("extension Foo { func testX() {} }\n", "import XCTest\nextension Foo { func testX() {} }\n", "declared in an extension of Foo")]
+    public async Task A_method_that_was_only_test_looking_at_the_base_and_cannot_be_run_apart_at_the_head_is_unsupported(string before, string after, string why)
+    {
+        const string path = "WordsTests/Foo.swift";
+        var runner = Runner((path, after));
+        runner.BaseFiles[path] = before;
+
+        var set = await Identify(runner);
+
+        Assert.Empty(set.Tests);
+        var problem = Assert.Single(set.Unisolable);
+        Assert.Contains($"WordsTests/Foo/testX() in {path} is a new XCTest test method the gate cannot run apart: ", problem);
+        Assert.Contains(why, problem);
+    }
+
+    [Fact]
+    public async Task A_test_moved_unchanged_to_a_renamed_class_or_another_class_is_not_new_and_one_changed_on_the_way_is()
+    {
+        const string other = "WordsTests/OtherTests.swift";
+        var renamed = Runner((LegacyFile, Legacy.Replace("class LegacyTests", "class RenamedTests")));
+        var moved = Runner((LegacyFile, "import XCTest\n\nclass LegacyTests: XCTestCase {}\n"),
+            (other, "import XCTest\n@testable import Words\n\nfinal class OtherTests: XCTestCase {\n\tfunc testOld() {\n\t\tXCTAssertFalse(isBlank(\"a\"))\n\t}\n}\n"));
+        moved.BaseFiles[LegacyFile] = "import XCTest\n@testable import Words\n\nclass LegacyTests: XCTestCase {\n    func testOld() {\n        XCTAssertFalse(isBlank(\"a\"))\n    }\n}\n";
+        moved.BaseFiles[other] = "import XCTest\n@testable import Words\n\nfinal class OtherTests: XCTestCase {}\n";
+        var changed = Runner((LegacyFile, Legacy.Replace("class LegacyTests", "class RenamedTests").Replace("\"a\")) }", "\"b\")) }")));
+
+        Assert.Empty((await Identify(renamed)).Tests);
+        Assert.Empty((await Identify(moved)).Tests);
+        Assert.Equal(["WordsTests/RenamedTests/testOld()"], (await Identify(changed)).Tests);
+    }
+
+    [Theory]
+    [InlineData("enum Fixtures { static let all = [\"\", \" \", \"\\t\"] }\n", "its arguments: name Fixtures, which the pull request changes in its test target")]
+    [InlineData("enum Fixtures { static let all = [\"\", \" \"] }\nenum Unrelated { static let x = 1 }\n", null)]
+    public async Task An_existing_parameterized_test_whose_arguments_name_a_declaration_the_pull_request_changes_is_unsupported(string fixtures, string? why)
+    {
+        const string fixturesPath = "WordsTests/Fixtures.swift";
+        var runner = Runner((fixturesPath, fixtures));
+        runner.BaseFiles["WordsTests/Params.swift"] = "import Testing\n@testable import Words\n\nstruct Params {\n    @Test(arguments: Fixtures.all) func blank(text: String) { #expect(isBlank(text)) }\n}\n";
+        runner.BaseFiles[fixturesPath] = "enum Fixtures { static let all = [\"\", \" \"] }\n";
+
+        var set = await Identify(runner);
+
+        Assert.Empty(set.Tests);
+        if (why is null)
+        {
+            Assert.Empty(set.Unisolable);
+        }
+        else
+        {
+            Assert.Equal($"WordsTests/Params/blank(text:) in WordsTests/Params.swift is an existing parameterized test whose cases the pull request may change: {why}; its new cases cannot be run apart from its old ones", Assert.Single(set.Unisolable));
+        }
     }
 
     private static TestResults Parse(string id, int testExit, string fixture) => new XcodeNewTests().ParseResults(

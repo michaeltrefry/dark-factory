@@ -50,6 +50,12 @@ public sealed record SwiftFunc(string Name, IReadOnlyList<string> Types, string 
     /// null when it has none: what a parameterized test runs over (sc-26129).
     /// </summary>
     public string? TestArguments => Attributes.FirstOrDefault(a => a.IsTest && a.HasArguments) is { Arguments: { } text } ? SwiftSource.LabelledTail(text, "arguments") : null;
+
+    /// <summary>
+    /// Its text from the <c>func</c> keyword through its body (or the end of its signature when it has none): what tells a
+    /// method moved unchanged from a new one (sc-26129).
+    /// </summary>
+    public string Source { get; init; } = "";
 }
 
 /// <summary>
@@ -419,6 +425,159 @@ public static class SwiftSource
         }
         return false;
     }
+
+    /// <summary>Words that name no declaration of a module (literals, <c>self</c>, operators spelled as words).</summary>
+    private static readonly HashSet<string> ExpressionKeywords = new(StringComparer.Ordinal)
+    {
+        "true", "false", "nil", "self", "Self", "super", "in", "as", "is", "try", "await", "let", "var", "inout", "some", "any", "_",
+    };
+
+    /// <summary>
+    /// The identifiers an expression's tokens name (backticks removed; a leading <c>arguments:</c> label left out), or null
+    /// when the reader cannot resolve it to names: its tokens do not lex, or a string literal interpolates
+    /// (<c>\(…)</c>) an expression the lexer does not split (sc-26129).
+    /// </summary>
+    public static IReadOnlySet<string>? Identifiers(string expression)
+    {
+        List<Token> tokens;
+        try
+        {
+            tokens = Lex(expression);
+        }
+        catch (FormatException)
+        {
+            return null;
+        }
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < tokens.Count; i++)
+        {
+            var word = expression[tokens[i].Start..tokens[i].End];
+            if (i == 0 && word == "arguments" && tokens.Count > 1 && expression[tokens[1].Start..tokens[1].End] == ":")
+            {
+                i++;
+                continue;
+            }
+            if (tokens[i].Kind == Kind.Literal && (word.Contains("\\(", StringComparison.Ordinal) || word.Contains("\\#", StringComparison.Ordinal)))
+            {
+                return null;
+            }
+            if (tokens[i].Kind == Kind.Ident && word.Trim('`') is var name && !ExpressionKeywords.Contains(name) && !name.StartsWith('$') && !name.StartsWith('#'))
+            {
+                names.Add(name);
+            }
+        }
+        return names;
+    }
+
+    /// <summary>
+    /// The names a file declares at its top level and in its types' bodies, at any depth, each with what a change to it
+    /// shows as (sc-26129): a function's, property's or case's whole text; a type's header (attributes, name, inheritance)
+    /// with the texts of its members that are not functions — a new test method does not change its suite, a new case or
+    /// stored property does. Layout does not count (<see cref="Collapse"/>). Throws <see cref="FormatException"/> as
+    /// <see cref="Layout"/> does.
+    /// </summary>
+    public static IReadOnlyList<(string Name, string Text)> Declarations(string text)
+    {
+        var found = new List<(string, string)>();
+        string Of(SwiftItem item)
+        {
+            if (item.BodyOpen < 0)
+            {
+                return Collapse(text[item.Start..item.End]);
+            }
+            var members = item.Children.Where(c => c.Keyword != "func").Select(Of);
+            return Collapse(text[item.Start..item.BodyOpen]) + " { " + string.Join(" ; ", members) + " }";
+        }
+        void Walk(IEnumerable<SwiftItem> items)
+        {
+            foreach (var item in items)
+            {
+                if (item.Name.Length > 0)
+                {
+                    found.Add((item.Name.Trim('`'), Of(item)));
+                }
+                Walk(item.Children);
+            }
+        }
+        Walk(Layout(text).Items);
+        return found;
+    }
+
+    /// <summary>A text with every run of whitespace made one space, trimmed.</summary>
+    public static string Collapse(string text) => string.Join(' ', text.Split((char[])[' ', '\t', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries));
+
+    /// <summary>
+    /// The names whose declarations differ between the base and the head versions of a set of files (each a text, or null
+    /// where the commit lacks it): a name declared in one and not the other, or with other texts (<see cref="Declarations"/>).
+    /// Null when a version cannot be laid out (the caller fails closed).
+    /// </summary>
+    public static IReadOnlySet<string>? ChangedDeclarations(IEnumerable<string?> @base, IEnumerable<string?> head)
+    {
+        static Dictionary<string, List<string>>? Index(IEnumerable<string?> texts)
+        {
+            var index = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            foreach (var text in texts.OfType<string>())
+            {
+                IReadOnlyList<(string Name, string Text)> declarations;
+                try
+                {
+                    declarations = Declarations(text);
+                }
+                catch (FormatException)
+                {
+                    return null;
+                }
+                foreach (var (name, body) in declarations)
+                {
+                    (index.TryGetValue(name, out var list) ? list : index[name] = []).Add(body);
+                }
+            }
+            return index;
+        }
+        if (Index(@base) is not { } before || Index(head) is not { } after)
+        {
+            return null;
+        }
+        var changed = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var name in before.Keys.Union(after.Keys))
+        {
+            var (a, b) = (before.GetValueOrDefault(name) ?? [], after.GetValueOrDefault(name) ?? []);
+            if (!a.Order(StringComparer.Ordinal).SequenceEqual(b.Order(StringComparer.Ordinal), StringComparer.Ordinal))
+            {
+                changed.Add(name);
+            }
+        }
+        return changed;
+    }
+
+    /// <summary>
+    /// Why an existing parameterized test's cases may change with the pull request though its <c>arguments:</c> do not
+    /// (sc-26129), or null: an identifier of its arguments or of its parameter list names a declaration that
+    /// <paramref name="changed"/> (<see cref="ChangedDeclarations"/> of the test target's changed files) holds; or, failing
+    /// closed, the arguments cannot be resolved to names, or the changed files cannot be read, while the test target's
+    /// files change at all.
+    /// </summary>
+    public static string? ArgumentsReachChange(SwiftFunc test, IReadOnlySet<string>? changed)
+    {
+        if (test.TestArguments is not { } arguments || changed is { Count: 0 })
+        {
+            return null;
+        }
+        if (changed is null)
+        {
+            return "the declarations of the test target's changed files cannot be read, so whether its arguments: change cannot be told";
+        }
+        if (Identifiers(arguments) is not { } names || Identifiers(test.Parameters) is not { } parameters)
+        {
+            return "its arguments: are not a form the gate can resolve to names, and the pull request changes declarations of its test target";
+        }
+        return names.Concat(parameters).Where(changed.Contains).Order(StringComparer.Ordinal).FirstOrDefault() is { } name
+            ? $"its arguments: name {name}, which the pull request changes in its test target"
+            : null;
+    }
+
+    /// <summary>A text with each line's leading indentation (and a trailing carriage return) removed.</summary>
+    public static string WithoutIndentation(string text) => string.Join('\n', text.Split('\n').Select(l => l.TrimEnd('\r').TrimStart(' ', '\t')));
 
     /// <summary>The argument labels of a parameter list's text (<c>_ x: Int, y: Int</c> → <c>_</c>, <c>y</c>): each parameter's first word.</summary>
     public static IReadOnlyList<string> Labels(string parameters)
@@ -882,8 +1041,10 @@ public static class SwiftSource
                 k = tokens[k].Kind == Kind.Open ? close[k] + 1 : k + 1;
             }
             var tail = k > close[j] + 1 ? text[tokens[close[j] + 1].Start..tokens[k - 1].End] : "";
+            var last = k < to && Word(k) == "{" ? close[k] : k - 1;
             funcs.Add(new SwiftFunc(name, names, text[tokens[j].End..tokens[close[j]].Start], attributes, tokens[at].Start)
             {
+                Source = text[tokens[at].Start..tokens[last].End],
                 Modifiers = [.. modifiers],
                 Generic = generic,
                 Tail = tail,

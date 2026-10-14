@@ -2921,7 +2921,13 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   signature (`WordsTests.blanks(text:)`, `WordsTests/Params/blanks(text:)`); Swift 6.3.2's xUnit report gives all its cases
   one `testcase` (failed if any case failed), and Xcode 26.5's result bundle a `Test Case` with an `Arguments` child per
   case — each read as a case of the test, so it passes on the head only when the test and every case passed. An existing
-  test whose `arguments:` change (`SwiftFunc.TestArguments`, its tokens: layout and comments do not count) is `unsupported`.
+  test whose `arguments:` change (`SwiftFunc.TestArguments`, its tokens: layout and comments do not count) is `unsupported`;
+  so, failing closed, is an existing one whose `arguments:` are the same text — anywhere in a test target the PR changes a
+  `.swift` file of, changed or not — when an identifier of its arguments or parameter list names a declaration of the
+  target's changed files whose text differs between the base and the head (`SwiftSource.ChangedDeclarations`: a function's,
+  property's or case's text; a type's header plus its members that are not functions, so a new test method changes no suite
+  and a fixture's new value or case does), or when its arguments cannot be resolved to names (an interpolated string, tokens
+  that do not lex) while any declaration of those files changes (`SwiftSource.ArgumentsReachChange`).
   XCTest: when a changed file of a test target declares a class or a test-looking method (`SwiftXCTest.IsCandidate`: an
   unparameterized `test…` method of a class or extension, no `@Test`), EVERY `.swift` file of the target (SwiftPM:
   `Tests/<target>/`; Xcode: every file the target compiles) is read at the head and the base (`SwiftXCTest.Discover`): a
@@ -2929,7 +2935,12 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   own instance methods and those it inherits (an override once), so a new base-class method is a new test of every
   subclass, and a new subclass's inherited tests are new tests (judged like any: one that passes on the base is rejected).
   New ids: SwiftPM `Target.Class/testMethod` (what `swift test list` prints), Xcode `Target/Class/testMethod()` (what the
-  bundle names; `-only-testing` takes it). Fail closed — a new test-looking method is `unsupported` when its class inherits
+  bundle names; `-only-testing` takes it). Moved unchanged (as cargo's): a head test whose method — signature and body,
+  leading indentation aside (`SwiftFunc.Source`) — is the text of a method a class of the same target declared at the base
+  whose test the PR removes or renames away (its class renamed, the method moved to another class) is not new
+  (`SwiftXCTest.MovedUnchanged`). A head problem counts as new unless its place was a test or a problem at the base: a method
+  that was only test-looking there (its class inherited nothing, an extension in a file not importing XCTest) is judged.
+  Fail closed — a new test-looking method is `unsupported` when its class inherits
   a class the module does not declare (another module's), is nested, generic, declared twice or under `#if`, or carries
   `@objc`; when it is in an extension of a test class (or of a type the module lacks, in a file importing XCTest), under
   `#if`, private/fileprivate, generic, `@objc`, backticked, or returns anything (only `async`/`throws`); when a class
@@ -2939,8 +2950,13 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   with `--parallel`, where an `XCTSkip` reads as passed — verified) and reads XCTest's own stdout lines
   (`SwiftNewTests.XCTestCases`: `Test Case '-[T.C m]' started.`/`passed|failed|skipped (N seconds).` on Apple platforms,
   `Test Case 'C.m' …` on Linux — the target is in the kept output's name, `swift-xctest-<hash>-<target hex>.out`), each
-  test started before it ends, ended once, its id the step's, the exit code agreeing; an output mentioning an expected
-  failure reads passes as skipped; a filter matching nothing is no case. Residual, accepted (as cargo's (a)): a test that
+  test started before it ends, ended once, its id the step's, at least one suite summary (`Executed N test(s), with [K
+  test(s) skipped and ]F failure(s) (U unexpected) in …`, the same on Apple platforms and Linux) after the last ended line,
+  each such summary counting the cases read — N tests, K skipped, F > 0 exactly when a case failed and at least one per
+  failed case (F counts issues: two failed assertions are 2, verified on Swift 6.3.2) — and the exit code agreeing; an
+  output mentioning an expected failure reads passes as skipped; `Executed 0 tests` and no case line is no case. A test
+  process that crashed or was killed (a case started and never ended, no summary) is unreadable, so the check is an
+  `error` — never a failure on the base. Residual, accepted (as cargo's (a)): a test that
   prints a complete fake XCTest report of itself and picks its exit code is read as what it printed. S2's base-build
   attribution covers XCTest methods (a new method's own body or its class's header → `not-built`). Fixed beside it: Swift
   Testing's xUnit `failures` counts issues, not failed cases (a test with two failing `#expect`s was unreadable), now

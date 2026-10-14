@@ -35,6 +35,12 @@ public sealed record XCTestModule(IReadOnlyList<XCTestMethod> Tests, IReadOnlyLi
 /// <c>throws</c>. A <c>static</c> or <c>class</c> method is not a test (XCTest runs instance methods). A class that inherits
 /// nothing, or first names a type the module declares as no class (a protocol), is no test class.
 /// </para>
+/// <para>
+/// New tests (the callers, <see cref="SwiftNewTests"/> and <see cref="XcodeNewTests"/>): a head test whose place
+/// (<see cref="XCTestMethod.Key"/>) the base's tests do not have, unless it was moved unchanged (<see cref="MovedUnchanged"/>).
+/// A head problem is reported unless its place was a test or a problem at the base — a method that was only a candidate
+/// there (in a class that was no test class) is judged like a new one.
+/// </para>
 /// </summary>
 public static class SwiftXCTest
 {
@@ -179,6 +185,21 @@ public static class SwiftXCTest
             tests.AddRange(mine);
         }
         return new XCTestModule(tests, problems, candidates);
+    }
+
+    /// <summary>
+    /// The tests of <paramref name="now"/> (the head) that the pull request moved unchanged (sc-26129, as cargo's): the
+    /// test's method — its signature and body, leading indentation aside (<see cref="SwiftFunc.Source"/>,
+    /// <see cref="SwiftSource.WithoutIndentation"/>) — is the same text as a method a class of the same target declared at
+    /// <paramref name="before"/> (the base) whose test is gone at the head: removed, or renamed away (its class renamed, or
+    /// the method moved to another class). Such a test is not new.
+    /// </summary>
+    public static IReadOnlySet<string> MovedUnchanged(XCTestModule before, XCTestModule now)
+    {
+        var keys = now.Tests.Select(t => t.Key).ToHashSet(StringComparer.Ordinal);
+        var gone = before.Tests.Where(t => t.Method.Container!.Name == t.Class && !keys.Contains(t.Key))
+            .Select(t => SwiftSource.WithoutIndentation(t.Method.Source)).ToHashSet(StringComparer.Ordinal);
+        return now.Tests.Where(t => gone.Contains(SwiftSource.WithoutIndentation(t.Method.Source))).Select(t => t.Key).ToHashSet(StringComparer.Ordinal);
     }
 
     private static bool IsStatic(SwiftFunc f) => f.Modifiers.Any(m => m is "static" or "class");

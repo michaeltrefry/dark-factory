@@ -439,6 +439,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
         var twice = new SortedSet<string>(StringComparer.Ordinal);
         var testFiles = new List<ChangedFile>();
         var removedClassic = new List<(string Project, string Target, string Path)>();
+        var argumentsChanged = new HashSet<string>(StringComparer.Ordinal);
         foreach (var change in candidates)
         {
             // A file the base compiled into a unit-test target that the PR deletes or renames: the base run removes it.
@@ -521,6 +522,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                         // An existing test: a parameterized one whose arguments changed has new cases that cannot be run apart from its old ones.
                         if ((test.IsParameterized || was.IsParameterized) && test.TestArguments != was.TestArguments)
                         {
+                            argumentsChanged.Add(id);
                             problems.Add($"{id} in {path} is an existing parameterized test whose arguments: the pull request changes: its new cases cannot be run apart from its old ones");
                         }
                         continue;
@@ -556,9 +558,12 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
             var baseTarget = baseProject?.Targets.FirstOrDefault(t => t.Name == targetName && t.IsUnitTests);
             var baseFiles = baseProject is not null && baseTarget is not null ? (await @base.ModuleAsync(baseProject, baseTarget, ct)).Files : [];
             var (now, before) = (SwiftXCTest.Discover(headFiles), SwiftXCTest.Discover(baseFiles));
-            var known = before.Tests.Select(t => t.Key).Concat(before.Candidates).Concat(before.Problems.Select(p => p.Key)).ToHashSet(StringComparer.Ordinal);
+            // A head problem is new unless its place was a test or a problem at the base: one that was only a test-looking
+            // method of a class that was no test class there is judged now.
+            var known = before.Tests.Select(t => t.Key).Concat(before.Problems.Select(p => p.Key)).ToHashSet(StringComparer.Ordinal);
             var baseIdsOfTarget = before.Tests.Select(t => t.Key).ToHashSet(StringComparer.Ordinal);
-            var added = now.Tests.Where(t => !baseIdsOfTarget.Contains(t.Key)).ToList();
+            var moved = SwiftXCTest.MovedUnchanged(before, now);
+            var added = now.Tests.Where(t => !baseIdsOfTarget.Contains(t.Key) && !moved.Contains(t.Key)).ToList();
             var unjudged = now.Problems.Where(p => !known.Contains(p.Key)).ToList();
             problems.AddRange(unjudged.Select(p => $"{targetName}/{p.Key} in {p.Path} is a new XCTest test method the gate cannot run apart: {p.Why}"));
             if ((added.Count > 0 || unjudged.Count > 0) && headUnknown.Count > 0)
@@ -578,6 +583,60 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                     continue;
                 }
                 news[id] = (project, target, test.Path);
+            }
+        }
+        // An existing parameterized test whose arguments: are the same text may still get new cases: when they name a
+        // declaration of its unit-test target that the pull request changes (a fixture's new case, say). Failing closed (sc-26129).
+        var targetChanges = new SortedDictionary<string, (List<string> Head, List<string> Base)>(StringComparer.Ordinal);
+        foreach (var change in candidates)
+        {
+            foreach (var (tree, at) in new[] { (head, change.NewPath), (@base, change.OldPath) })
+            {
+                if (!Swift(at) || await tree.InPackageAsync(at!, ct))
+                {
+                    continue;
+                }
+                foreach (var (project, target) in (await TargetsAsync(tree, at!)).Tests)
+                {
+                    var key = $"{project.Path}\n{target.Name}";
+                    var entry = targetChanges.TryGetValue(key, out var known) ? known : targetChanges[key] = ([], []);
+                    (ReferenceEquals(tree, head) ? entry.Head : entry.Base).Add(at!);
+                }
+            }
+        }
+        foreach (var (key, (headPaths, basePaths)) in targetChanges)
+        {
+            var (projectPath, targetName) = (key[..key.IndexOf('\n')], key[(key.IndexOf('\n') + 1)..]);
+            if ((await head.ProjectsAsync(ct)).FirstOrDefault(p => p.Path == projectPath).Project is not { } project
+                || project.Targets.FirstOrDefault(t => t.Name == targetName && t.IsUnitTests) is not { } target)
+            {
+                continue; // the target is gone at the head: no test of it runs
+            }
+            var (baseTexts, headTexts) = (new List<string?>(), new List<string?>());
+            foreach (var p in basePaths.Distinct())
+            {
+                baseTexts.Add(await @base.ReadAsync(p, ct));
+            }
+            foreach (var p in headPaths.Distinct())
+            {
+                headTexts.Add(await head.ReadAsync(p, ct));
+            }
+            var changed = SwiftSource.ChangedDeclarations(baseTexts, headTexts);
+            if (changed is { Count: 0 })
+            {
+                continue;
+            }
+            foreach (var (path, file) in (await head.ModuleAsync(project, target, ct)).Files)
+            {
+                foreach (var test in file.Tests.Where(t => t.TestArguments is not null))
+                {
+                    var id = $"{targetName}/{Key(test)}";
+                    var existing = !news.ContainsKey(id) && !argumentsChanged.Contains(id) && (!headPaths.Contains(path) || baseTests.ContainsKey(id));
+                    if (existing && SwiftSource.ArgumentsReachChange(test, changed) is { } why)
+                    {
+                        problems.Add($"{id} in {path} is an existing parameterized test whose cases the pull request may change: {why}; its new cases cannot be run apart from its old ones");
+                    }
+                }
             }
         }
         problems.AddRange(twice.Select(id => $"{id} is declared more than once at the head (conditional compilation?), so which one runs cannot be told"));
