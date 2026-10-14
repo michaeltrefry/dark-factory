@@ -52,7 +52,7 @@ public class WorkerModelClassTests
     [InlineData(WorkerAuth.ClaudeLogin, new[] { "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS" })]
     public void The_class_rides_in_the_custom_headers_next_to_the_router_key_and_adds_no_variable(WorkerAuth auth, string[] keys)
     {
-        foreach (var modelClass in new[] { "high", "mid", "low" })
+        foreach (var modelClass in new[] { "max", "high", "mid", "low" })
         {
             var env = ClaudeWorker.BuildRouterVariables(new Uri("http://localhost:8080/"), "rk_worker", auth, modelClass);
 
@@ -68,9 +68,10 @@ public class WorkerModelClassTests
     [InlineData("")]
     [InlineData("MID")] // the router reads it case-insensitively, but the factory sends exactly its own values
     [InlineData("ultra")]
+    [InlineData("MAX")]
     [InlineData("mid\nx-weave-force-model: claude-opus-5-5")] // a second header smuggled in
     [InlineData("mid ")]
-    public async Task Anything_but_high_mid_or_low_is_refused_before_a_worker_starts(string modelClass)
+    public async Task Anything_but_max_high_mid_or_low_is_refused_before_a_worker_starts(string modelClass)
     {
         Assert.Throws<ArgumentException>(() => ClaudeWorker.BuildRouterVariables(new Uri("http://localhost:8080/"), "rk", WorkerAuth.RouterKey, modelClass));
         await Assert.ThrowsAsync<ArgumentException>(() =>

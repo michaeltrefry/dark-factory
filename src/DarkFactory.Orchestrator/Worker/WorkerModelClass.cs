@@ -13,6 +13,7 @@ public static class WorkerModelClass
     /// <summary>The router's request header naming the class (<see cref="Router.ModelClass.Header"/>).</summary>
     public const string Header = Router.ModelClass.Header;
 
+    public const string Max = Router.ModelClass.Max;
     public const string High = Router.ModelClass.High;
     public const string Mid = Router.ModelClass.Mid;
     public const string Low = Router.ModelClass.Low;
@@ -29,8 +30,8 @@ public static class WorkerModelClass
     /// <summary>The planner's class (sc-25870): a plan decides what every story after it builds.</summary>
     public const string Planner = High;
 
-    /// <summary>Whether <paramref name="modelClass"/> is one the router takes (exactly <c>high</c>, <c>mid</c> or <c>low</c>).</summary>
-    public static bool IsValid(string? modelClass) => modelClass is High or Mid or Low;
+    /// <summary>Whether <paramref name="modelClass"/> is one the router takes (exactly <c>max</c>, <c>high</c>, <c>mid</c> or <c>low</c>).</summary>
+    public static bool IsValid(string? modelClass) => modelClass is Max or High or Mid or Low;
 
     /// <summary>
     /// A story is simple when it carries the <see cref="SimpleLabel"/> label (any case) or an estimate of 1 or 2 points; otherwise
