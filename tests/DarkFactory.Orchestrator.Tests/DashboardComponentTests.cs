@@ -181,6 +181,59 @@ public class DashboardComponentTests : BunitContext
         new(id, $"sc-{id}", $"Story {id}", "acme/widgets", state, Now.AddMinutes(-65), Now, pr, cost, sessions);
 
     [Fact]
+    public void Pipeline_lists_a_kanban_item_with_its_id_a_link_to_it_its_epic_and_controls_on_the_kanban_scopes()
+    {
+        const string board = "https://kanban.test/?project=7f0c5a52-3b0e-4b6f-9a51-0d8a8a1f2c11";
+        _data.Rows =
+        [
+            // Kanban item 4 in the Kanban epic with ledger key 5, and a Shortcut story in Shortcut epic 5: the same number.
+            new(1, "kb-4", "Count words", "acme/widgets", WorkState.Implement, Now.AddMinutes(-5), Now, null, null, [], EpicId: 5,
+                Links: new BoardLink($"{board}&epic=e1&item=i1", $"{board}&epic=e1")),
+            Row(77, WorkState.Implement) with { EpicId = 5 },
+            // A Kanban item in no epic, and one whose project the ledger has not recorded yet (no link to build).
+            new(3, "kb-6", "Split words", "acme/widgets", WorkState.Review, Now, Now, null, null, [], Links: new BoardLink($"{board}&item=i3", null)),
+            new(4, "kb-7", "Old", "acme/widgets", WorkState.Review, Now, Now, null, null, [], EpicId: 5, Links: new BoardLink(null, null)),
+        ];
+        _data.Controls = [new Control { Scope = "epic:kb-5", State = ControlState.Paused, ChangedBy = "michael" }];
+
+        var cut = Render<Pipeline>();
+
+        var row = cut.Find("tr[data-item='1']");
+        var id = row.QuerySelector("a.id")!;
+        Assert.Equal(("kb-4", $"{board}&epic=e1&item=i1", "noopener noreferrer"), (id.TextContent, id.GetAttribute("href"), id.GetAttribute("rel")));
+        Assert.Contains("Count words", row.TextContent);
+        var epic = row.QuerySelector(".epic")!;
+        Assert.Equal(("kb-5", "kb-5", $"{board}&epic=e1"),
+            (epic.GetAttribute("data-epic"), epic.QuerySelector("a")!.TextContent, epic.QuerySelector("a")!.GetAttribute("href")));
+        // Its own controls post the item's scope.
+        Assert.Equal(["item:kb-4", "item:kb-4"], row.QuerySelectorAll("td.control form").Select(f => f.GetAttribute("data-scope")));
+        Assert.Equal(["pause", "stop"], row.QuerySelectorAll("td.control form").Select(f => f.GetAttribute("data-action")));
+
+        // Two epic control rows, one per source: the Kanban epic's posts `epic:kb-5` (paused: Continue), the Shortcut epic's `epic:5`.
+        Assert.Equal(["factory", "epic:5", "epic:kb-5"], cut.FindAll("div.controls").Select(d => d.GetAttribute("data-scope")));
+        var kanban = cut.Find("div.controls[data-scope='epic:kb-5']");
+        Assert.Contains("Epic kb-5: paused", kanban.TextContent);
+        Assert.Equal([("continue", "epic:kb-5"), ("stop", "epic:kb-5")],
+            kanban.QuerySelectorAll("form").Select(f => (f.GetAttribute("data-action"), f.GetAttribute("data-scope"))));
+        Assert.Equal(["epic:kb-5", "epic:kb-5"], kanban.QuerySelectorAll("input[name='scope']").Select(i => i.GetAttribute("value")));
+        var shortcut = cut.Find("div.controls[data-scope='epic:5']");
+        Assert.Contains("Epic 5: running", shortcut.TextContent);
+        Assert.Equal([("pause", "epic:5"), ("stop", "epic:5")],
+            shortcut.QuerySelectorAll("form").Select(f => (f.GetAttribute("data-action"), f.GetAttribute("data-scope"))));
+
+        // A Shortcut story's row is what it was: its id as text, no link and no epic beside it.
+        var story = cut.Find("tr[data-item='77']");
+        Assert.Equal("sc-77", story.QuerySelector("span.id")!.TextContent);
+        Assert.Empty(story.QuerySelectorAll("a.id, .epic"));
+        // No epic: none shown. No project in the ledger yet: the id as text, the epic without a link.
+        Assert.NotNull(cut.Find("tr[data-item='3'] a.id"));
+        Assert.Empty(cut.FindAll("tr[data-item='3'] .epic"));
+        Assert.Equal("kb-7", cut.Find("tr[data-item='4'] span.id").TextContent);
+        Assert.Equal("epic kb-5", System.Text.RegularExpressions.Regex.Replace(cut.Find("tr[data-item='4'] .epic").TextContent.Trim(), @"\s+", " "));
+        Assert.Empty(cut.FindAll("tr[data-item='4'] .epic a"));
+    }
+
+    [Fact]
     public void Pipeline_lists_each_active_item_with_state_repo_pr_elapsed_cost_and_session_links()
     {
         _data.Rows = [Row(1, WorkState.Review, "https://github.com/acme/widgets/pull/9", 1.5m,

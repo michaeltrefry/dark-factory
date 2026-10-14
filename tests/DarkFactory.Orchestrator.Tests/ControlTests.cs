@@ -359,7 +359,7 @@ public class ControlTests
             await ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
         }
 
-        await h.Actions().StopAsync(ControlScope.Epic(5), "tester", CancellationToken.None);
+        await h.Actions().StopAsync(ControlScope.Epic(ItemNaming.Shortcut.Epic(5)), "tester", CancellationToken.None);
         var states = await h.Db.WorkItems.AsNoTracking().OrderBy(i => i.Id).Select(i => i.State).ToListAsync();
         Assert.Equal([WorkState.Cancelled, WorkState.Cancelled, WorkState.Implement], states);
 
@@ -585,7 +585,7 @@ public class ControlTests
         var h = new Harness { Stories = new(Story) { Epic = new WorkEpic(5, "Phase 1", null, "https://app.shortcut.com/trefry/epic/5") } };
         await SeedImplementing(h, "sc-77"); // recorded before the ledger kept epics
 
-        var result = await h.Actions().StopAsync(ControlScope.Epic(5), "tester", CancellationToken.None);
+        var result = await h.Actions().StopAsync(ControlScope.Epic(ItemNaming.Shortcut.Epic(5)), "tester", CancellationToken.None);
 
         Assert.True(result.Ok, result.Message);
         Assert.Equal(WorkState.Cancelled, (await h.Item()).State);
@@ -598,7 +598,7 @@ public class ControlTests
         var h = new Harness { Stories = new(Story) { ReadSpecFails = new HttpRequestException("Shortcut down") } };
         await SeedImplementing(h, "sc-77");
 
-        var result = await h.Actions().StopAsync(ControlScope.Epic(5), "tester", CancellationToken.None);
+        var result = await h.Actions().StopAsync(ControlScope.Epic(ItemNaming.Shortcut.Epic(5)), "tester", CancellationToken.None);
 
         Assert.False(result.Ok);
         Assert.Contains("1 item(s) with an unknown epic NOT stopped: sc-77", result.Message);
@@ -612,14 +612,14 @@ public class ControlTests
         await SeedImplementing(h, "sc-77");
         Assert.Equal([77], await h.InFlight());
 
-        var result = await h.Actions().PauseAsync(ControlScope.Epic(5), "tester", CancellationToken.None);
+        var result = await h.Actions().PauseAsync(ControlScope.Epic(ItemNaming.Shortcut.Epic(5)), "tester", CancellationToken.None);
 
         Assert.True(result.Ok, result.Message);
         Assert.Empty(await h.InFlight()); // the intake loop does not run it while its epic is paused
 
         var unreachable = new Harness { Stories = new(Story) { ReadSpecFails = new HttpRequestException("Shortcut down") } };
         await SeedImplementing(unreachable, "sc-77");
-        var reported = await unreachable.Actions().PauseAsync(ControlScope.Epic(5), "tester", CancellationToken.None);
+        var reported = await unreachable.Actions().PauseAsync(ControlScope.Epic(ItemNaming.Shortcut.Epic(5)), "tester", CancellationToken.None);
         Assert.False(reported.Ok);
         Assert.Contains("1 item(s) with an unknown epic NOT paused: sc-77", reported.Message);
     }
@@ -667,11 +667,64 @@ public class ControlTests
     [InlineData("epic:5", true)]
     [InlineData("item:sc-7", true)]
     [InlineData("item:7", true)]
+    [InlineData("epic:kb-3", true)]
     [InlineData("epic:0", false)]
     [InlineData("epic:x", false)]
+    [InlineData("epic:kb-0", false)]
+    [InlineData("epic:KB-3", false)] // not as it is written: no item's control would read the row
+    [InlineData("epic:012", false)]
+    [InlineData("epic: 12", false)]
+    [InlineData("epic:gh-3", false)] // an issue is in no epic
+    [InlineData("epic:sc-3", false)] // a Shortcut epic is its number alone
     [InlineData("item:nope", false)]
     [InlineData("everything", false)]
     public void Scopes_are_validated(string scope, bool valid) => Assert.Equal(valid, ControlScope.IsValid(scope));
+
+    [Fact]
+    public void An_epic_scope_carries_its_source_and_a_bare_number_stays_a_shortcut_epic()
+    {
+        var (shortcut, kanban) = (ItemNaming.Shortcut.Epic(12), ItemNaming.Kanban.Epic(12));
+
+        // The same number, two epics, two scopes: `epic:12` is what it always was.
+        Assert.Equal(("12", "epic:12"), (shortcut.ToString(), ControlScope.Epic(shortcut)));
+        Assert.Equal(("kb-12", "epic:kb-12"), (kanban.ToString(), ControlScope.Epic(kanban)));
+        Assert.NotEqual(shortcut, kanban);
+        Assert.Equal(shortcut, ControlScope.EpicOf("epic:12"));
+        Assert.Equal(kanban, ControlScope.EpicOf("epic:kb-12"));
+        Assert.Null(ControlScope.EpicOf("item:kb-12"));
+        Assert.Null(ControlScope.EpicOf("factory"));
+        Assert.Null(ControlScope.ItemOf("epic:kb-12"));
+
+        // An item's ledger row names its epic by a number within the item's own source.
+        Assert.Equal(shortcut, ItemNaming.EpicOf("sc-7", 12));
+        Assert.Equal(kanban, ItemNaming.EpicOf("kb-7", 12));
+        Assert.Null(ItemNaming.EpicOf("gh-7", 12));
+        Assert.Null(ItemNaming.EpicOf("kb-7", null));
+        Assert.Null(ItemNaming.EpicOf("nope", 12));
+        Assert.Throws<InvalidOperationException>(() => ItemNaming.GitHubIssue.Epic(12));
+    }
+
+    [Theory]
+    [InlineData("12", "epic:12")]
+    [InlineData(" 12 ", "epic:12")]
+    [InlineData("kb-3", "epic:kb-3")]
+    [InlineData("KB-3", "epic:kb-3")]
+    [InlineData("kb-03", "epic:kb-3")]
+    [InlineData("9223372036854775807", "epic:9223372036854775807")]
+    [InlineData("0", null)]
+    [InlineData("-5", null)]
+    [InlineData("+5", null)]
+    [InlineData("kb-0", null)]
+    [InlineData("kb-", null)]
+    [InlineData("kb3", null)]
+    [InlineData("sc-12", null)]
+    [InlineData("gh-12", null)]
+    [InlineData("epic:12", null)]
+    [InlineData("1e3", null)]
+    [InlineData("", null)]
+    [InlineData(null, null)]
+    public void An_epic_is_parsed_as_a_person_types_it(string? typed, string? scope) =>
+        Assert.Equal(scope, ItemNaming.ParseEpic(typed) is { } epic ? ControlScope.Epic(epic) : null);
 
     [Fact]
     public async Task Refused_scope_names_every_valid_scope_including_usage_and_freeze()
@@ -679,7 +732,9 @@ public class ControlTests
         // Refused before the ledger is opened, so no database is needed.
         var controls = new LedgerControls(null!, TimeProvider.System);
         var ex = await Assert.ThrowsAsync<ArgumentException>(() => controls.SetAsync("everything", ControlState.Paused, "tester", CancellationToken.None));
-        Assert.Contains("(factory, usage, freeze, epic:<id>, item:sc-<id>, item:gh-<key> or item:kb-<n>)", ex.Message);
+        Assert.Contains("(factory, usage, freeze, epic:<id>, epic:kb-<n>, item:sc-<id>, item:gh-<key> or item:kb-<n>)", ex.Message);
+        // Every source whose epics carry its prefix (sc-25985) has its epic scope named too.
+        Assert.All(ItemNaming.All.Where(n => n.Epics == EpicNaming.Key), naming => Assert.Contains($"epic:{naming.Prefix}-<", ex.Message));
         // Every source's items have a scope (sc-25982): a new source's must be named here too.
         Assert.All(ItemNaming.All, naming => Assert.Contains($"item:{naming.Prefix}-<", ex.Message));
     }

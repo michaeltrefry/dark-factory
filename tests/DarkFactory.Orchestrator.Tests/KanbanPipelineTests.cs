@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json.Nodes;
+using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Gateway;
 using DarkFactory.Orchestrator.Kanban;
 using DarkFactory.Orchestrator.Ledger;
@@ -9,6 +10,8 @@ using DarkFactory.Orchestrator.Mcp;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.Extensions.Configuration;
 using static DarkFactory.Orchestrator.Tests.RunPipelineTests;
 
@@ -376,6 +379,8 @@ public sealed class KanbanKeysPostgresTests : IAsyncLifetime
         }
     }
 
+    private static readonly Guid Project = Guid.NewGuid();
+
     /// <summary>A separate "process": its own context factory (and so its own connections).</summary>
     private KanbanKeys Process() => new(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(_cs)));
 
@@ -392,6 +397,89 @@ public sealed class KanbanKeysPostgresTests : IAsyncLifetime
         db.KanbanItems.Add(new KanbanItem { ItemId = item, FirstSeenAt = DateTimeOffset.UtcNow });
         var ex = await Assert.ThrowsAsync<DbUpdateException>(() => db.SaveChangesAsync());
         Assert.Equal(Npgsql.PostgresErrorCodes.UniqueViolation, Assert.IsType<Npgsql.PostgresException>(ex.InnerException).SqlState);
+    }
+
+    [Fact]
+    public async Task The_epics_migration_keeps_the_item_keys_adds_the_project_and_one_key_row_per_epic_and_rolls_back()
+    {
+        var (item, epic) = (Guid.NewGuid(), Guid.NewGuid());
+        await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_cs)))
+        {
+            // A key given out before the migration, and a Shortcut epic control from before Kanban epics had scopes.
+            var migrator = db.GetService<IMigrator>();
+            await migrator.MigrateAsync("20261013214208_KanbanItems");
+            await db.Database.ExecuteSqlAsync($"INSERT INTO kanban_items (\"ItemId\", \"FirstSeenAt\") VALUES ({item}, now())");
+            await db.Database.ExecuteSqlAsync(
+                $"INSERT INTO controls (\"Scope\", \"State\", \"ChangedBy\", \"ChangedAt\") VALUES ('epic:1', 'Paused', 'michael', now())");
+            await migrator.MigrateAsync();
+            Assert.Empty(await db.Database.GetPendingMigrationsAsync());
+        }
+        await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_cs)))
+        {
+            var row = await db.KanbanItems.AsNoTracking().SingleAsync();
+            Assert.Equal((item, (Guid?)null), (row.ItemId, row.ProjectId));
+            // The item keeps its key, and its project is recorded the next time it is seen.
+            Assert.Equal(row.Id, await Process().KeyAsync(item, Project, CancellationToken.None));
+            Assert.Equal(Project, (await db.KanbanItems.AsNoTracking().SingleAsync()).ProjectId);
+
+            // The database itself refuses a second key for the same epic.
+            var key = await Process().EpicKeyAsync(epic, Project, CancellationToken.None);
+            db.KanbanEpics.Add(new KanbanEpicKey { EpicId = epic, ProjectId = Project, FirstSeenAt = DateTimeOffset.UtcNow });
+            var ex = await Assert.ThrowsAsync<DbUpdateException>(() => db.SaveChangesAsync());
+            Assert.Equal(Npgsql.PostgresErrorCodes.UniqueViolation, Assert.IsType<Npgsql.PostgresException>(ex.InnerException).SqlState);
+
+            // The old row still means Shortcut epic 1 — and only that: the Kanban epic with the same key is another scope (E9).
+            Assert.Equal(1, key);
+            var controls = new LedgerControls(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(_cs)), TimeProvider.System);
+            Assert.Equal(ControlState.Paused, await controls.EffectiveAsync("sc-7", 1, CancellationToken.None));
+            Assert.Equal(ControlState.Running, await controls.EffectiveAsync("kb-7", 1, CancellationToken.None));
+            await controls.SetAsync("epic:kb-1", ControlState.Paused, "michael", CancellationToken.None);
+            await controls.SetAsync("epic:1", ControlState.Running, "michael", CancellationToken.None);
+            Assert.Equal(ControlState.Running, await controls.EffectiveAsync("sc-7", 1, CancellationToken.None));
+            Assert.Equal(ControlState.Paused, await controls.EffectiveAsync("kb-7", 1, CancellationToken.None));
+            Assert.Equal(ControlState.Running, await controls.EffectiveAsync("kb-7", 2, CancellationToken.None));
+            Assert.Equal(ControlState.Running, await controls.EffectiveAsync("kb-7", null, CancellationToken.None));
+        }
+        await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_cs)))
+        {
+            // Down drops the epic keys and the project and keeps the item keys.
+            await db.GetService<IMigrator>().MigrateAsync("20261013214208_KanbanItems");
+            Assert.Equal(item, await db.Database.SqlQuery<Guid>($"SELECT \"ItemId\" AS \"Value\" FROM kanban_items").SingleAsync());
+            Assert.Equal(0, await db.Database.SqlQuery<int>(
+                $"SELECT count(*)::int AS \"Value\" FROM information_schema.tables WHERE table_name = 'kanban_epics'").SingleAsync());
+            await db.GetService<IMigrator>().MigrateAsync();
+        }
+    }
+
+    [Fact]
+    public async Task The_same_epic_always_gets_the_same_key_from_processes_allocating_at_once()
+    {
+        var epics = Enumerable.Range(0, 6).Select(_ => Guid.NewGuid()).ToList();
+        using var start = new SemaphoreSlim(0);
+        var processes = Enumerable.Range(0, 6).Select(_ => Task.Run(async () =>
+        {
+            var answers = new List<(Guid Epic, int Key)>();
+            await start.WaitAsync();
+            foreach (var epic in epics)
+            {
+                answers.Add((epic, await Process().EpicKeyAsync(epic, Project, CancellationToken.None)));
+            }
+            return answers;
+        })).ToList();
+        start.Release(processes.Count);
+        var asked = (await Task.WhenAll(processes)).SelectMany(a => a).ToList();
+
+        var byEpic = asked.GroupBy(a => a.Epic).ToDictionary(g => g.Key, g => g.Select(a => a.Key).Distinct().ToList());
+        Assert.All(byEpic.Values, keys => Assert.Single(keys)); // one key per epic, whoever asked
+        Assert.Equal(epics.Count, byEpic.Values.Select(k => k[0]).Distinct().Count());
+        Assert.All(epics, epic => Assert.True(byEpic[epic][0] > 0));
+        foreach (var epic in epics)
+        {
+            Assert.Equal(byEpic[epic][0], await Process().EpicKeyAsync(epic, Project, CancellationToken.None));
+            Assert.True(await Process().KnowsEpicAsync(byEpic[epic][0], CancellationToken.None));
+        }
+        Assert.False(await Process().KnowsEpicAsync(int.MaxValue, CancellationToken.None));
+        Assert.False(await Process().KnowsEpicAsync(long.MaxValue, CancellationToken.None));
     }
 
     [Fact]
@@ -430,7 +518,7 @@ public sealed class KanbanKeysPostgresTests : IAsyncLifetime
             await start.WaitAsync();
             foreach (var item in items)
             {
-                answers.Add((item, await Process().KeyAsync(item, CancellationToken.None)));
+                answers.Add((item, await Process().KeyAsync(item, Project, CancellationToken.None)));
             }
             return answers;
         })).ToList();
@@ -449,7 +537,7 @@ public sealed class KanbanKeysPostgresTests : IAsyncLifetime
         foreach (var item in items)
         {
             var key = byItem[item][0];
-            Assert.Equal(key, await Process().KeyAsync(item, CancellationToken.None));
+            Assert.Equal(key, await Process().KeyAsync(item, Project, CancellationToken.None));
             Assert.Equal(item, await Process().ItemAsync(key, CancellationToken.None));
         }
         Assert.Null(await Process().ItemAsync(int.MaxValue, CancellationToken.None));

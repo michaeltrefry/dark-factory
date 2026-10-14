@@ -708,9 +708,11 @@ public class WorkSourceRegistryTests
     }
 
     [Fact]
-    public async Task An_epic_scope_reaches_only_sources_whose_epics_have_numbers_and_asks_each_item_its_own_board()
+    public async Task An_epic_scope_reaches_only_its_own_sources_items_and_asks_each_its_own_board()
     {
-        Assert.Equal(["shortcut"], ItemNaming.All.Where(n => n.NumberedEpics).Select(n => n.Source));
+        // Shortcut's epics are named by their number, Kanban's by a ledger key with the prefix; an issue is in no epic.
+        Assert.Equal([("shortcut", EpicNaming.Number), ("github", EpicNaming.None), ("kanban", EpicNaming.Key)],
+            ItemNaming.All.Select(n => (n.Source, n.Epics)));
         var b = new Boards();
         await using (var db = b.Kanban.Db())
         {
@@ -730,11 +732,12 @@ public class WorkSourceRegistryTests
             return naming == ItemNaming.Shortcut ? story : null;
         }, locks: b.Locks);
 
-        var paused = await actions.PauseAsync(ControlScope.Epic(9), "tester", None);
+        var paused = await actions.PauseAsync(ControlScope.Epic(ItemNaming.Shortcut.Epic(9)), "tester", None);
 
-        // Only the Shortcut story was looked up, on the Shortcut board; the others are in no numbered epic and are not "unknown".
+        // Only the Shortcut story was looked up, on the Shortcut board; the others are not Shortcut's and are not "unknown".
         Assert.True(paused.Ok, paused.Message);
-        Assert.Equal([ItemNaming.Shortcut], asked);
+        // (Asked for twice: whether the epic can exist, then the story's own board.)
+        Assert.Equal([ItemNaming.Shortcut, ItemNaming.Shortcut], asked);
         Assert.Equal(9, (await b.Item("sc-5"))!.EpicId);
         Assert.Null((await b.Item("kb-5"))!.EpicId);
 
@@ -744,9 +747,285 @@ public class WorkSourceRegistryTests
             var row = await new WorkLedger(db, TimeProvider.System).GetOrCreateAsync("shortcut", "sc-6", "t", "acme/widgets", null, None);
             await new WorkLedger(db, TimeProvider.System).RecordAsync(row, WorkState.Implement, null, null, None);
         }
-        var unconfigured = await new ControlActions(b.Controls, b.Kanban.Contexts, sources: _ => null).PauseAsync(ControlScope.Epic(9), "tester", None);
+        var unconfigured = await new ControlActions(b.Controls, b.Kanban.Contexts, sources: _ => null)
+            .PauseAsync(ControlScope.Epic(ItemNaming.Shortcut.Epic(9)), "tester", None);
         Assert.False(unconfigured.Ok);
         Assert.Contains("1 item(s) with an unknown epic NOT paused: sc-6", unconfigured.Message);
+        // The Kanban epic scope reaches the Kanban item alone: the story and the issue's item are not its to resolve.
+        var key = await new KanbanKeys(b.Kanban.Contexts).EpicKeyAsync(Guid.NewGuid(), b.Kanban.Project.Id, None);
+        var kanban = await new ControlActions(b.Controls, b.Kanban.Contexts, sources: _ => null)
+            .PauseAsync(ControlScope.Epic(ItemNaming.Kanban.Epic(key)), "tester", None);
+        Assert.Contains("1 item(s) with an unknown epic NOT paused: kb-5 ", kanban.Message);
+    }
+
+    // ---- Kanban epics (sc-25985) ----
+
+    /// <summary>A Shortcut story in flight whose Shortcut epic has the number <paramref name="epic"/>: a Kanban epic's key may be the same number.</summary>
+    private static async Task ShortcutStoryInEpicAsync(Boards b, string id, long epic)
+    {
+        await using var db = b.Kanban.Db();
+        var ledger = new WorkLedger(db, TimeProvider.System);
+        var row = await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, id, "A story", "acme/widgets", null, None, epic);
+        await ledger.RecordAsync(row, WorkState.Implement, null, null, None);
+    }
+
+    [Fact]
+    public async Task Pausing_a_kanban_epic_pauses_its_items_claims_nothing_new_in_it_and_leaves_the_shortcut_epic_of_that_number_alone()
+    {
+        var b = new Boards();
+        var epic = b.Kanban.Board.AddEpic(b.Kanban.Project, "Word counting");
+        var first = b.Kanban.Board.AddItem(b.Kanban.Project, "Count words", epic: epic);
+        using var sources = b.Registry(Options(Core, Kanban));
+        await b.Loop(sources).PollOnceAsync(None);
+        // The epic got its ledger key when the item's spec was read, and the item's row holds it.
+        Assert.Equal((WorkState.Review, (long?)1), ((await b.Item("kb-1"))!.State, (await b.Item("kb-1"))!.EpicId));
+        await using (var db = b.Kanban.Db())
+        {
+            var key = await db.KanbanEpics.SingleAsync();
+            Assert.Equal((1, epic.Id, b.Kanban.Project.Id), (key.Id, key.EpicId, key.ProjectId));
+        }
+        // Shortcut epic 1 is another epic: the same number, another source.
+        await ShortcutStoryInEpicAsync(b, "sc-50", 1);
+        var second = b.Kanban.Board.AddItem(b.Kanban.Project, "Trim words", epic: epic);
+        var outside = b.Kanban.Board.AddItem(b.Kanban.Project, "Split words");
+        var actions = b.Actions(sources);
+
+        var paused = await actions.PauseAsync("epic:kb-1", "tester", None);
+
+        Assert.True(paused.Ok, paused.Message);
+        Assert.Equal(ControlState.Paused, (await b.Controls.GetAsync("epic:kb-1", None))!.State);
+        Assert.Null(await b.Controls.GetAsync("epic:1", None));
+        Assert.Equal(ControlState.Paused, await b.Controls.EffectiveAsync("kb-1", 1, None));
+        Assert.Equal(ControlState.Running, await b.Controls.EffectiveAsync("sc-50", 1, None));
+
+        await b.Loop(sources).PollOnceAsync(None);
+
+        // Nothing new is claimed in the paused epic; an item outside it is worked as usual.
+        Assert.Equal(("Ready", null), (second.Status, second.Claim?.Marker));
+        Assert.Null(await b.Item("kb-2"));
+        Assert.Equal("InProgress", outside.Status);
+        Assert.Equal(WorkState.Review, (await b.Item("kb-3"))!.State);
+        Assert.Equal("InProgress", first.Status);
+
+        Assert.True((await actions.ContinueAsync("epic:kb-1", "tester", None)).Ok);
+        await b.Loop(sources).PollOnceAsync(None);
+
+        Assert.Equal(ControlState.Running, await b.Controls.EffectiveAsync("kb-1", 1, None));
+        Assert.Equal("InProgress", second.Status);
+        Assert.Equal((WorkState.Review, (long?)1), ((await b.Item("kb-2"))!.State, (await b.Item("kb-2"))!.EpicId));
+
+        // And the other way round: a row `epic:1`, as written before Kanban epics had scopes, holds the Shortcut story alone.
+        Assert.True((await new ControlActions(b.Controls, b.Kanban.Contexts).PauseAsync("epic:1", "tester", None)).Ok);
+        Assert.Equal(ControlState.Paused, await b.Controls.EffectiveAsync("sc-50", 1, None));
+        Assert.Equal(ControlState.Running, await b.Controls.EffectiveAsync("kb-1", 1, None));
+        Assert.Equal(ControlState.Running, await b.Controls.EffectiveAsync("kb-2", 1, None));
+    }
+
+    [Fact]
+    public async Task Stopping_a_kanban_epic_stops_its_unfinished_items_only_and_is_not_ok_while_a_stop_is_unfinished()
+    {
+        var b = new Boards();
+        var (epic, other) = (b.Kanban.Board.AddEpic(b.Kanban.Project, "Word counting"), b.Kanban.Board.AddEpic(b.Kanban.Project, "Trimming"));
+        var first = b.Kanban.Board.AddItem(b.Kanban.Project, "Count words", epic: epic);
+        var second = b.Kanban.Board.AddItem(b.Kanban.Project, "Count lines", epic: epic);
+        var elsewhere = b.Kanban.Board.AddItem(b.Kanban.Project, "Trim words", epic: other);
+        using var sources = b.Registry(Options(Core, Kanban));
+        await b.Loop(sources).PollOnceAsync(None);
+        Assert.Equal([(long?)1, 1, 2], new[] { (await b.Item("kb-1"))!.EpicId, (await b.Item("kb-2"))!.EpicId, (await b.Item("kb-3"))!.EpicId });
+        await ShortcutStoryInEpicAsync(b, "sc-50", 1);
+        // The board refuses the second item's move for now: its stop cannot finish.
+        b.Kanban.Board.Instead = (tool, arguments) => tool is "update_work_item" or "move_work_item" && Guid.Parse((string)arguments["itemId"]!) == second.Id
+            ? FakeKanbanBoard.Refusal("forbidden", "Not now.")
+            : null;
+
+        var unfinished = await b.Actions(sources).StopAsync("epic:kb-1", "tester", None);
+
+        // Non-zero exit while a stop is unfinished; the item keeps its Stopping control for the next poll or `factory stop`.
+        Assert.False(unfinished.Ok);
+        Assert.Equal(1, unfinished.ExitCode);
+        Assert.Contains("kb-2: stop NOT finished", unfinished.Message);
+        Assert.Equal((WorkState.Cancelled, "Backlog", null), ((await b.Item("kb-1"))!.State, first.Status, first.Claim?.Marker));
+        Assert.Equal(WorkState.Review, (await b.Item("kb-2"))!.State);
+        Assert.Equal(ControlState.Stopping, (await b.Controls.GetAsync(ControlScope.Item("kb-2"), None))!.State);
+
+        b.Kanban.Board.Instead = null;
+        var stopped = await b.Actions(sources).StopAsync("epic:kb-1", "tester", None);
+
+        Assert.True(stopped.Ok, stopped.Message);
+        Assert.Equal(0, stopped.ExitCode);
+        Assert.Equal((WorkState.Cancelled, "Backlog"), ((await b.Item("kb-2"))!.State, second.Status));
+        // Another Kanban epic's item and the story of Shortcut epic 1 were never the scope's.
+        Assert.Equal((WorkState.Review, "InProgress"), ((await b.Item("kb-3"))!.State, elsewhere.Status));
+        Assert.Equal(WorkState.Implement, (await b.Item("sc-50"))!.State);
+        Assert.Null(await b.Controls.GetAsync(ControlScope.Item("kb-3"), None));
+        Assert.Null(await b.Controls.GetAsync(ControlScope.Item("sc-50"), None));
+        Assert.Equal("epic:kb-1: no active items to stop.", (await b.Actions(sources).StopAsync("epic:kb-1", "tester", None)).Message);
+    }
+
+    [Fact]
+    public async Task A_kanban_epic_scope_reaches_an_item_the_ledger_has_no_epic_for_by_asking_the_kanban_board()
+    {
+        var b = new Boards();
+        var epic = b.Kanban.Board.AddEpic(b.Kanban.Project, "Word counting");
+        var early = b.Kanban.Board.AddItem(b.Kanban.Project, "Count words", epic: epic);
+        var later = b.Kanban.Board.AddItem(b.Kanban.Project, "Count lines", epic: epic);
+        var loose = b.Kanban.Board.AddItem(b.Kanban.Project, "Trim words");
+        using var sources = b.Registry(Options(Core, Kanban));
+        await b.Loop(sources).PollOnceAsync(None);
+        // As recorded before Kanban epics had keys: the first item's row names no epic.
+        await using (var db = b.Kanban.Db())
+        {
+            (await db.WorkItems.SingleAsync(i => i.ExternalId == "kb-1")).EpicId = null;
+            await db.SaveChangesAsync();
+        }
+        b.Kanban.Board.Calls.Clear();
+
+        var paused = await b.Actions(sources).PauseAsync("epic:kb-1", "tester", None);
+
+        // Looked up on the Kanban board (reads only) and recorded, so the pause holds it; the item in no epic is in none.
+        Assert.True(paused.Ok, paused.Message);
+        Assert.Empty(b.Kanban.Board.Writes);
+        Assert.Contains(b.Kanban.Board.Calls, c => c.Tool == "get_work_item");
+        Assert.Equal(1, (await b.Item("kb-1"))!.EpicId);
+        Assert.Null((await b.Item("kb-3"))!.EpicId);
+        Assert.Equal(ControlState.Paused, await b.Controls.EffectiveAsync("kb-1", (await b.Item("kb-1"))!.EpicId, None));
+        Assert.Equal(ControlState.Running, await b.Controls.EffectiveAsync("kb-3", (await b.Item("kb-3"))!.EpicId, None));
+
+        // Stop finds such an item too, whether or not its epic could be recorded first.
+        await using (var db = b.Kanban.Db())
+        {
+            (await db.WorkItems.SingleAsync(i => i.ExternalId == "kb-2")).EpicId = null;
+            await db.SaveChangesAsync();
+        }
+        var stopped = await b.Actions(sources).StopAsync("epic:kb-1", "tester", None);
+        Assert.True(stopped.Ok, stopped.Message);
+        Assert.Equal((WorkState.Cancelled, WorkState.Cancelled, WorkState.Review),
+            ((await b.Item("kb-1"))!.State, (await b.Item("kb-2"))!.State, (await b.Item("kb-3"))!.State));
+        Assert.Equal(("Backlog", "Backlog", "InProgress"), (early.Status, later.Status, loose.Status));
+
+        // An item whose board cannot be read is reported, never silently skipped.
+        Assert.True((await b.Actions(sources).ContinueAsync("epic:kb-1", "tester", None)).Ok);
+        var unread = b.Kanban.Board.AddItem(b.Kanban.Project, "Join words", epic: epic);
+        await b.Loop(sources).PollOnceAsync(None);
+        await using (var db = b.Kanban.Db())
+        {
+            (await db.WorkItems.SingleAsync(i => i.ExternalId == "kb-4")).EpicId = null;
+            await db.SaveChangesAsync();
+        }
+        b.Kanban.Board.Instead = (tool, _) => tool == "get_work_item" ? FakeKanbanBoard.Refusal("forbidden", "Not now.") : null;
+        var reported = await b.Actions(sources).PauseAsync("epic:kb-1", "tester", None);
+        Assert.False(reported.Ok);
+        // (kb-3 is in no epic, which only its board could say.)
+        Assert.Contains("2 item(s) with an unknown epic NOT paused: kb-3, kb-4 ", reported.Message);
+        Assert.Equal("InProgress", unread.Status);
+    }
+
+    [Theory]
+    [InlineData("pause", "paused")]
+    [InlineData("stop", "stopped")]
+    public async Task An_epic_control_on_a_kanban_key_the_ledger_never_gave_out_is_refused_before_anything_is_written(string action, string done)
+    {
+        var b = new Boards();
+        using var sources = b.Registry(Options(Core, Kanban));
+        var actions = b.Actions(sources);
+
+        var refused = action == "pause" ? await actions.PauseAsync("epic:kb-7", "tester", None) : await actions.StopAsync("epic:kb-7", "tester", None);
+
+        // A row for it would name no epic today and land on whichever epic is given key 7 later.
+        Assert.False(refused.Ok);
+        Assert.Equal($"epic:kb-7: NOT {done}, and nothing was written. The factory has seen no KanbanBoard epic kb-7: an epic gets its key when the "
+            + "factory first reads an item of it (the dashboard's pipeline page shows it beside the item), or ahead of that from "
+            + "`factory kanban key --epic <epic GUID>`.", refused.Message);
+        Assert.Empty(await b.Controls.ListAsync(None));
+        Assert.Empty(b.Kanban.Board.Calls);
+        // A Shortcut epic is named by its own number: one the factory has not seen yet may be paused ahead (as it always could).
+        using var shortcut = b.Registry(Options(Core, Shortcut));
+        Assert.True((await b.Actions(shortcut).PauseAsync("epic:7", "tester", None)).Ok);
+    }
+
+    [Theory]
+    [InlineData("pause", "paused")]
+    [InlineData("stop", "stopped")]
+    public async Task A_kanban_epic_key_the_ledger_never_gave_out_is_refused_without_the_kanban_source_too_and_a_known_one_is_written(
+        string action, string done)
+    {
+        // Kanban not configured (no write token), or a host with no registry at all: the check needs the ledger alone.
+        var b = new Boards();
+        foreach (var sources in new Func<ItemNaming, IWorkSource?>?[] { _ => null, null })
+        {
+            var actions = new ControlActions(b.Controls, b.Kanban.Contexts, sources: sources);
+
+            var refused = action == "pause" ? await actions.PauseAsync("epic:kb-7", "tester", None) : await actions.StopAsync("epic:kb-7", "tester", None);
+
+            Assert.False(refused.Ok);
+            Assert.StartsWith($"epic:kb-7: NOT {done}, and nothing was written. The factory has seen no KanbanBoard epic kb-7", refused.Message);
+            Assert.Empty(await b.Controls.ListAsync(None));
+        }
+        Assert.Empty(b.Kanban.Board.Calls);
+
+        // A known epic's control is written all the same: an unconfigured source is no reason to refuse.
+        await using (var db = b.Kanban.Db())
+        {
+            db.KanbanEpics.Add(new KanbanEpicKey { Id = 7, EpicId = Guid.NewGuid(), ProjectId = b.Kanban.Project.Id, FirstSeenAt = DateTimeOffset.UtcNow });
+            await db.SaveChangesAsync();
+        }
+        var unconfigured = new ControlActions(b.Controls, b.Kanban.Contexts, sources: _ => null);
+        var known = action == "pause" ? await unconfigured.PauseAsync("epic:kb-7", "tester", None) : await unconfigured.StopAsync("epic:kb-7", "tester", None);
+        Assert.True(known.Ok, known.Message);
+        if (action == "pause")
+        {
+            Assert.Equal([("epic:kb-7", ControlState.Paused)], (await b.Controls.ListAsync(None)).Select(c => (c.Scope, c.State)));
+        }
+        else
+        {
+            // A Stop is written on the epic's items, and it has none: accepted, not refused.
+            Assert.Equal("epic:kb-7: no active items to stop.", known.Message);
+        }
+        // The next key is still refused, and a Shortcut epic needs no ledger row with or without its source.
+        Assert.False((await unconfigured.PauseAsync("epic:kb-8", "tester", None)).Ok);
+        Assert.True((await unconfigured.PauseAsync("epic:8", "tester", None)).Ok);
+    }
+
+    [Fact]
+    public async Task An_epic_given_its_key_ahead_can_be_paused_before_any_item_of_it_was_read_and_the_pause_holds_its_first_item()
+    {
+        var b = new Boards();
+        var epic = b.Kanban.Board.AddEpic(b.Kanban.Project, "Word counting");
+        using var sources = b.Registry(Options(Core, Kanban));
+        var actions = b.Actions(sources);
+        // Before the key: the epic has no name a control could use.
+        Assert.False((await actions.PauseAsync("epic:kb-1", "tester", None)).Ok);
+
+        // `factory kanban key --epic <GUID>`: read from the board, written to the ledger alone.
+        var key = await ((KanbanWorkSource)sources.Of(ItemNaming.Kanban)).EpicKeyOfAsync(epic.Id, None);
+
+        Assert.Equal(1, key);
+        Assert.Empty(b.Kanban.Board.Writes);
+        var paused = await actions.PauseAsync("epic:kb-1", "tester", None);
+        Assert.True(paused.Ok, paused.Message);
+        Assert.Equal(ControlState.Paused, (await b.Controls.GetAsync("epic:kb-1", None))!.State);
+
+        // The epic's first items arrive only now: the one in it is not claimed, the one outside it is worked.
+        var inside = b.Kanban.Board.AddItem(b.Kanban.Project, "Count words", epic: epic);
+        var outside = b.Kanban.Board.AddItem(b.Kanban.Project, "Split words");
+        await b.Loop(sources).PollOnceAsync(None);
+
+        Assert.Equal(("Ready", null), (inside.Status, inside.Claim?.Marker));
+        Assert.Null(await b.Item("kb-1"));
+        Assert.Equal(["claim_work_item"], b.Kanban.Board.Writes.Take(1)); // one claim: the outside item's
+        Assert.Single(b.Kanban.Board.Writes, w => w == "claim_work_item");
+        Assert.Equal("InProgress", outside.Status);
+        Assert.Equal(WorkState.Review, (await b.Item("kb-2"))!.State);
+
+        // Continued, the item is claimed under the very key given ahead.
+        Assert.True((await actions.ContinueAsync("epic:kb-1", "tester", None)).Ok);
+        await b.Loop(sources).PollOnceAsync(None);
+        Assert.Equal("InProgress", inside.Status);
+        Assert.Equal((WorkState.Review, (long?)1), ((await b.Item("kb-1"))!.State, (await b.Item("kb-1"))!.EpicId));
+        await using (var db = b.Kanban.Db())
+        {
+            Assert.Equal((1, epic.Id), ((await db.KanbanEpics.SingleAsync()).Id, (await db.KanbanEpics.SingleAsync()).EpicId));
+        }
     }
 
     // ---- The work host ----
@@ -774,7 +1053,7 @@ public class WorkSourceRegistryTests
     private static async Task<string> Help(params string[] args)
     {
         var root = FactoryCli.Build((_, _, _) => Task.FromResult(0), (_, _, _, _) => Task.FromResult(0), (_, _) => Task.FromResult(0),
-            _ => Task.FromResult(0), _ => Task.FromResult(0), (_, _, _) => Task.FromResult(0), (_, _) => Task.FromResult(0));
+            _ => Task.FromResult(0), _ => Task.FromResult(0), (_, _, _) => Task.FromResult(0), (_, _, _) => Task.FromResult(0));
         var output = new StringWriter();
         Assert.Equal(0, await root.Parse([.. args, "--help"]).InvokeAsync(new() { Output = output, Error = output }));
         // One line, so wrapped help text still matches.
@@ -806,12 +1085,14 @@ public class WorkSourceRegistryTests
         }
         Assert.Contains("move it back to its board's Backlog with a comment, releasing the claim", await Help("stop"));
         Assert.Contains("`factory work` gives every item it lists its id by itself", await Help("kanban", "key"));
+        Assert.Contains("--epic", await Help("kanban", "key"));
+        Assert.Contains("so that the epic can be paused or stopped (`factory pause --epic kb-<number>`) before its first item runs", await Help("kanban", "key"));
     }
 
     [Theory]
-    [InlineData("pause", "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic N or --factory.")]
-    [InlineData("stop", "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic N or --factory.")]
-    [InlineData("continue", "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic N, --factory, --usage or --freeze.")]
+    [InlineData("pause", "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N) or --factory.")]
+    [InlineData("stop", "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N) or --factory.")]
+    [InlineData("continue", "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N), --factory, --usage or --freeze.")]
     public void A_control_with_no_scope_says_which_ids_an_item_takes(string action, string expected)
     {
         var root = FactoryCli.Build((_, _, _) => Task.FromResult(0), (_, _, _, _) => Task.FromResult(0), (_, _) => Task.FromResult(0),

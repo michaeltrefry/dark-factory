@@ -107,7 +107,23 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
     /// board first — an id the board does not know throws (<see cref="KanbanException.NotFound"/>) and gets no key — and nothing
     /// is written to the board.
     /// </summary>
-    public async Task<int> KeyOfAsync(Guid itemId, CancellationToken ct) => await keys.KeyAsync((await board.GetItemAsync(itemId, ct)).Id, ct);
+    public async Task<int> KeyOfAsync(Guid itemId, CancellationToken ct)
+    {
+        var item = await board.GetItemAsync(itemId, ct);
+        return await keys.KeyAsync(item.Id, item.ProjectId, ct);
+    }
+
+    /// <summary>
+    /// The key of an epic no item of which the factory has read yet (<c>factory kanban key --epic</c>, sc-25985), so that the epic
+    /// can be paused or stopped ahead (<c>factory pause --epic kb-&lt;key&gt;</c>): as for an item, the epic is read from the board
+    /// first — an id the board does not know, or one the token may not see, throws and gets no key — and nothing is written to
+    /// the board. An item of the epic read later gets the same key (<see cref="KanbanKeys.EpicKeyAsync"/>).
+    /// </summary>
+    public async Task<int> EpicKeyOfAsync(Guid epicId, CancellationToken ct)
+    {
+        var epic = await board.GetEpicAsync(epicId, ct);
+        return await keys.EpicKeyAsync(epic.Id, epic.ProjectId, ct);
+    }
 
     /// <summary>
     /// The ready items of every watched project, in the projects' configured order and oldest first within one, each given its
@@ -135,7 +151,7 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
                 foreach (var item in answer.Items.Where(i => i.ProjectId == project.Id && i.Status == KanbanStatus.Ready
                     && i.ClaimMarker is null && i.OpenBlockers.Count == 0))
                 {
-                    var key = await keys.KeyAsync(item.Id, ct);
+                    var key = await keys.KeyAsync(item.Id, item.ProjectId, ct);
                     if (!ready.Contains(key))
                     {
                         ready.Add(key);
@@ -401,9 +417,14 @@ public sealed class KanbanWorkSource(KanbanBoard board, KanbanKeys keys, KanbanS
         var documents = (await board.ListEpicDocumentsAsync(epicId, ct))
             .Select(d => new WorkDocument(d.Title, d.Body, _links.Document(item.ProjectId, epicId, d.Id)))
             .ToList();
-        // A Kanban epic has no number an epic-scope control addresses: none reaches the item.
-        return new WorkSpec(story, new WorkEpic(null, epic.Name, epic.Description, _links.Epic(item.ProjectId, epicId)), documents);
+        // The epic's ledger key (sc-25985), recorded before the spec names it (E4): what the item's ledger row and the scope
+        // `epic:kb-<key>` hold. The epic's GUID never leaves this folder.
+        var epicKey = await keys.EpicKeyAsync(epicId, item.ProjectId, ct);
+        return new WorkSpec(story, new WorkEpic(epicKey, epic.Name, epic.Description, _links.Epic(item.ProjectId, epicId)), documents);
     }
+
+    /// <summary>Whether the ledger gave this epic key out (<see cref="KanbanKeys.KnowsEpicAsync"/>): a Kanban epic has no other name.</summary>
+    public Task<bool> KnowsEpicAsync(long epic, CancellationToken ct) => keys.KnowsEpicAsync(epic, ct);
 
     /// <summary>
     /// Claimed: <c>InProgress</c>. Merged: <c>Done</c>. Stopped: <c>Backlog</c>, the factory's claim released, and the comment

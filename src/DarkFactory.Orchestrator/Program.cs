@@ -9,13 +9,13 @@ using Microsoft.Extensions.Hosting;
 
 return await FactoryCli.Build(RunAsync, SetupGitHubAppAsync, ProtectRepoAsync, WorkAsync, SetDashboardPasswordAsync, ControlAsync, KanbanKeyAsync).Parse(args).InvokeAsync();
 
-static async Task<int> KanbanKeyAsync(Guid itemId, CancellationToken ct)
+static async Task<int> KanbanKeyAsync(Guid id, bool epic, CancellationToken ct)
 {
     var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
     try
     {
         options.ValidateSettings();
-        Console.WriteLine(await FactoryRunner.KanbanKeyAsync(options, itemId, ct));
+        Console.WriteLine(epic ? await FactoryRunner.KanbanEpicKeyAsync(options, id, ct) : await FactoryRunner.KanbanKeyAsync(options, id, ct));
         return 0;
     }
     catch (MissingCredentialException ex)

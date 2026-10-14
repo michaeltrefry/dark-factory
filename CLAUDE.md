@@ -36,7 +36,7 @@ Claude Code headless workers through the Weave router.
   remote URL names (`RepoOf`, sc-25981); `KanbanWrites` builds the one MCP client that holds the orchestrator's full-scope Kanban
   token (sc-25981); `GitHubCli` is the only `gh` run),
   and KanbanBoard as a third work source (`Kanban/`, sc-25981: `KanbanWorkSource`, its typed MCP caller `KanbanBoard.cs`, and
-  `KanbanKeys.cs` — the ledger's `kb-<n>` keys, the watch scope `KanbanScope`, the web links `KanbanLinks`). `RepoRef` and
+  `KanbanKeys.cs` — the ledger's `kb-<n>` keys of items and of epics, the watch scope `KanbanScope`, the web links `KanbanLinks` and the dashboard's `KanbanLedgerLinks`). `RepoRef` and
   `RepoResolver` (`RepoRef.cs`) are in the root namespace: every source and the pipeline use them.
 - `src/DarkFactory.Analyzers` — the gateway lint (sc-25390), a Roslyn analyzer every build of the orchestrator and of
   `tests/DarkFactory.AcceptanceTests` runs (CI's `build-test` included), all errors: DF0001 an HTTP client/handler (made,
@@ -151,9 +151,10 @@ dotnet ef database update --project src/DarkFactory.Orchestrator
 dotnet ef migrations add <Name> --project src/DarkFactory.Orchestrator -o Ledger/Migrations
 dotnet run --project src/DarkFactory.Orchestrator -- run sc-1234             # or gh-12 (a released GitHub issue), kb-7 (a Kanban item)
 dotnet run --project src/DarkFactory.Orchestrator -- kanban key <item GUID>   # prints the item's kb-<n> (given now if it has none); only for an item `factory work` has not listed
+dotnet run --project src/DarkFactory.Orchestrator -- kanban key --epic <epic GUID>   # prints the epic's key kb-<n> (given now if it has none), so `pause|stop --epic kb-<n>` works before any item of the epic was read
 dotnet run --project src/DarkFactory.Orchestrator -- work          # long-running host: dashboard + session hub on 127.0.0.1 + the intake loop (polls every configured work source)
 dotnet run --project src/DarkFactory.Orchestrator -- dashboard set-password   # dashboard login (hash → keychain)
-dotnet run --project src/DarkFactory.Orchestrator -- pause --factory          # also continue/stop; --epic N or --item sc-N | gh-N | kb-N
+dotnet run --project src/DarkFactory.Orchestrator -- pause --factory          # also continue/stop; --epic N (a Shortcut epic) | kb-N (a Kanban epic's key), or --item sc-N | gh-N | kb-N
 dotnet run --project src/DarkFactory.Orchestrator -- continue --freeze        # clear the automatic freeze (also --usage)
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup --gate   # the merge gate's own App (then re-run protect)
@@ -334,17 +335,16 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   An invalid scope's message names every source's item scope (`item:sc-<id>, item:gh-<key> or item:kb-<n>`).
   Tests (`WorkSourceRegistryTests`) build their options from explicit settings with no keychain and no process environment
   (`FactoryOptions`' `environment` parameter, tests only), so none is skipped on a machine whose shell carries a source's token. `IItemStops` has one member, `StopAsync(ItemRef)`. Epic scopes
-  (`--epic N`): an epic is named by its number, so the scope reaches only the items of sources whose epics have one
-  (`ItemNaming.NumberedEpics`: Shortcut today; a Kanban epic is a GUID — K5), and an item whose epic the ledger lacks is looked up
-  on its own board (`ControlActions`' `sources`), one not configured being reported as unknown. Residual, accepted: the
-  dashboard's rows and links are still worded for Shortcut (K5).
+  carry their source (sc-25985, under Controls below): `--epic N` is a Shortcut epic, `--epic kb-N` a Kanban epic, each reaching
+  only its own source's items, and an item whose epic the ledger lacks is looked up
+  on its own board (`ControlActions`' `sources`), one not configured being reported as unknown.
 - KanbanBoard items (Phase 4b, sc-25981, sc-25982; `Kanban/`): a third work source behind `IWorkSource`. Polled by `factory work`
   when `Kanban:Watch:Projects` is set (the registry above), run by `factory run kb-<n>`, and paused, continued and stopped by id
   like any item (Stop: pull request to draft, item back to `Backlog` with a comment, the factory's claim released, Cancelled).
   The intake loop's claim renewal (sc-25983, below) asks every lane the registry builds — a watched source's and the lane of a
   source that only has its credential alike (`WorkSourceRegistry.Lanes`) — so a Kanban item in flight keeps its claim after
   `Kanban:Watch:Projects` is cleared, for as long as the write token is set; with no token there is no lane, nothing renews it,
-  and the start-up warning says so. Not yet: plans (K4), epic-scope controls and the dashboard's Kanban rows (K5). `factory kanban key <GUID>` stays: the intake loop gives every item it LISTS its key, but
+  and the start-up warning says so. Not yet: plans (K4). `factory kanban key <GUID>` stays: the intake loop gives every item it LISTS its key, but
   `factory run kb-<n>` on an item no poll has listed — `factory work` not running, the item outside the watched projects (run
   with `--ignore-scope`), or not `Ready` yet — still needs the key from somewhere. Contract: KanbanBoard's
   `docs/mcp-contract.md` (tool and argument names are compared exactly there, and an argument a tool does not have is refused).
@@ -487,7 +487,21 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (`FactoryRunner.IsKanbanKeyFailure`). The spec is the item, its epic and the epic's documents; links are built on `Kanban:WebUrl`.
   Trust (E5): a Kanban item is written on the owner's board and is trusted like a Shortcut story — `WorkStory.UntrustedName` is
   true only for a GitHub issue's item and a planner-authored story — so its spec is unfenced instructions and its name goes on
-  GitHub as written. A Kanban epic has no number (`WorkEpic.Id` null), so no `epic:<id>` control reaches a Kanban item.
+  GitHub as written.
+  Epics (sc-25985, E4): a Kanban epic is a GUID too, and gets a ledger key of its own the same way — table `kanban_epics`
+  (migration `KanbanEpics`; `KanbanEpicKey`: key, the epic's GUID under a unique index, its project's GUID), allocated by
+  `KanbanKeys.EpicKeyAsync` when `ReadSpecAsync` first reads an item of the epic, so before the spec, the item's ledger row
+  (`WorkItem.EpicId` = that key) or any control names it. Item keys and epic keys are two number spaces (`kb-1` the item and
+  `kb-1` the epic may both exist); nothing of an epic key is written onto the board. `WorkEpic.Id` is that key (for Shortcut the
+  epic's own number), never null. The same migration adds `kanban_items.ProjectId` (nullable: the item's project GUID, recorded
+  with the key and again whenever the item is listed with none or another), which with `kanban_epics` is all the dashboard's links
+  need (below); an epic's project is recorded again likewise when its row has another. An epic no item of which the factory has
+  read yet gets its key ahead from `factory kanban key --epic <epic GUID>` (`FactoryRunner.KanbanEpicKeyAsync` →
+  `KanbanWorkSource.EpicKeyOfAsync`: like the item form it reads the epic from the board first — `get_epic`, read only; one the
+  board does not know or will not show the token gets no key row, exit 1 with the message, `FactoryRunner.IsKanbanKeyFailure` —
+  records GUID → key and project, prints `kb-<n>`, and is idempotent, the unique index deciding a race), so `factory pause|stop
+  --epic kb-<n>` works before its first item is claimed: an item of it read later gets the same key and is held by the row. The
+  command takes exactly one of an item GUID and `--epic <GUID>`. The pipeline page shows the key beside the item once one is read.
 - GitHub issues (sc-25385, `Issues/`): `IssueIntake` polls each watched repo's open issues updated since its ledger cursor
   (`github_issue_cursors`; the first poll of a repo starts from now, no backfill). Each issue gets a key (`github_issues`) and a
   work item `gh-<key>` that waits Paused/parked (`awaiting triage`) until released. Each issue version (sha of title+body) is
@@ -626,7 +640,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   a rate limit, 401 or 408) is recorded `github-refused` on the item and the dashboard and does not hold the repo's cursor; the
   issue is taken up again when it next changes.
 - Controls (`Controls/`): Pause/Continue/Stop rows in the ledger's `controls` table (scope `factory` | `epic:<id>` |
-  `item:sc-<id>`; `WorkItem.EpicId` maps items to epics; a plan item's `item:` scope also holds its stories, through
+  `epic:kb-<key>` | `item:sc-<id>` | `item:gh-<key>` | `item:kb-<key>`; `WorkItem.EpicId` maps items to epics, within the item's
+  own source — epic scopes, sc-25985, at the end of this bullet; a plan item's `item:` scope also holds its stories, through
   `WorkItem.PlanItemId` — plan failures and controls, sc-25876, below), written by `factory pause|continue|stop` and the dashboard
   (`ControlActions`), read by every process. `RunPipeline` checks them before every step and, while a worker runs,
   polls them every second (`ControlWatch`): Pause → `IWorker.RequestPause` (a flag file under `<work root>/controls`
@@ -645,6 +660,26 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   worker first). Epic-scope Pause/Stop look up items with no `EpicId` on the board and record it (under the run lock);
   unresolvable ones are reported and the CLI exits non-zero (as on a refused Continue or an unfinished stop). A paused
   factory makes the intake loop list no ready stories; the pipeline claims nothing new in a paused epic/factory.
+  Epic scopes carry their source (sc-25985; `EpicRef` = an `ItemNaming` + the id the ledger holds, `ItemNaming.Epics`:
+  `EpicNaming.Number` | `Key` | `None`): `epic:12` is Shortcut epic 12 — what it always meant, so every row written before
+  Kanban epics had scopes still applies to Shortcut items, and only to them (E9) — and `epic:kb-12` the Kanban epic with ledger
+  key 12 (`kanban_epics`, under KanbanBoard items above); a GitHub issue is in no epic. One rule turns a ledger row into its epic,
+  `ItemNaming.EpicOf(externalId, epicId)`, used by `LedgerControls.EffectiveAsync` (still one query: the item's source comes from
+  its external id, so the epic scope is one more string in the same `IN` list), `RunPipeline.UserPausedAsync` and the dashboard;
+  `IControls.EffectiveAsync`'s signature did not change. `ControlScope.Epic(EpicRef)` writes a scope and `ControlScope.EpicOf`
+  reads only what that writes (`epic:KB-3`, `epic:012` are not scopes: no item's control would read such a row).
+  `factory pause|continue|stop --epic` takes either form (`ItemNaming.ParseEpic`: a bare positive number is a Shortcut epic, `kb-N`
+  in any case a Kanban epic; `sc-N`, `gh-N` and anything else are refused by the parser). `ControlActions` reaches only the
+  epic's own source: Stop lists the active items with that source and `EpicId`, and both Pause and Stop look up that source's
+  active items with no `EpicId` on their own board (`IWorkSource.ReadSpecAsync`, E1 — for Kanban reads only, which allocate the
+  epic's key if needed). An epic its source says cannot exist is refused before anything is written
+  (`IWorkSource.KnowsEpicAsync`: true by default — any number may be a Shortcut epic, pausable before the factory has seen it; a
+  Kanban key the ledger never gave out is refused, "The factory has seen no KanbanBoard epic kb-7 …", since a row for it would
+  land on whichever epic is given that key later; the refusal names the remedy, `factory kanban key --epic <epic GUID>`). The
+  check needs no credential: where the epic's source is not configured (no Kanban write token, or a dashboard host with no
+  registry) its kind answers from the ledger alone (`WorkSourceKind.KnowsEpic`, as `Links` does: `KanbanKeys.KnowsEpicAsync`), so
+  an unknown key is refused there too, while a known epic's control is written whether or not its board can be reached (its
+  items with no recorded epic are then reported as unknown, as before).
   Residual risk: the worker loads the target repo's `.claude/settings.json` (`--setting-sources project,local`), which
   can set `disableAllHooks` and so switch off the pause hook; the pause grace still stops such a worker (session and
   worktree kept), only not at a tool boundary.
@@ -1591,6 +1626,16 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `work_items`/`worker_sessions`/`controls`, relayed by `SessionEventRelay` → `PipelineChanges`); session pages join the same
   `SessionBroadcaster` as hub viewers (`ISessionViewers`), so backlog-then-live holds there too. Never log transcript content.
   A plan item's stories are listed beneath its row, from the ledger alone (sc-25876, above).
+  Board links and epics (sc-25985): a row may carry `PipelineRow.Links` (`BoardLink`: the item's and its epic's link), which
+  `DashboardData` takes from each source's `IBoardLinks` (`WorkSourceKind.Links`, `WorkSourceRegistry.BoardLinks`; built whether
+  or not the source has its credential) — read from the ledger alone, never a board. Kanban's is `KanbanLedgerLinks`: the item's
+  GUID and project (`kanban_items`) and its epic's (`kanban_epics`, by `WorkItem.EpicId`) through the one link builder,
+  `KanbanLinks`, on `Kanban:WebUrl`. KanbanBoard's web UI has no page of one item: the link (`?project=<id>[&epic=<id>]&item=<id>`)
+  opens the board of the item's epic, or of its project when it has none (the `item` parameter only tells links apart); an item
+  whose project the ledger has not recorded yet (a key row from before sc-25985) is shown without a link until it is next listed.
+  A row with links shows its id as that link and `epic <kb-N>` beside the title; Shortcut and issue rows have no `IBoardLinks`
+  and are unchanged. `PipelineRow.Epic` (`ItemNaming.EpicOf`) is what the page's epic control rows are keyed by, so a Kanban epic
+  and the Shortcut epic of the same number are two rows, each form posting its own scope (`epic:kb-5`, `epic:5`).
 - Review → CI → MergeGate → Merge (sc-25378; `RunPipeline.Gate.cs`, only in a pipeline built with a `GateStage`, which
   production always is): Implement records every model that answers the implementer (`implementer-model` checkpoints, from
   each assistant message's `model`; a record only — the panel does not depend on it). Review is a panel (sc-25379, `Gate/ReviewPanel.cs`): `correctness` and

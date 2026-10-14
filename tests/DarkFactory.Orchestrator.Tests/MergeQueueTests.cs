@@ -848,7 +848,7 @@ public class MergeQueueTests
         Assert.Contains($"{StoryId.Format(C)} is 3 of 3 in the merge queue", h.Logged);
 
         // B's epic is paused while B waits between runs: no run of B is active, so nothing is written to its ledger.
-        await Set(h, ControlScope.Epic(epic), ControlState.Paused);
+        await Set(h, ControlScope.Epic(ItemNaming.Shortcut.Epic(epic)), ControlState.Paused);
         release.SetResult();
         Assert.Equal(WorkState.Watch, (await runA).State);
         Assert.Equal(WorkState.MergeGate, (await h.Run(B)).State); // paused: nothing to do
@@ -861,7 +861,7 @@ public class MergeQueueTests
 
         // Continue: B keeps its approval-time place (its queued row is unchanged) and merges on a head containing C's merge.
         var queued = (await h.Rows(B)).Single(r => r.Step == RunPipeline.Steps.Queued).Id;
-        await Set(h, ControlScope.Epic(epic), ControlState.Running);
+        await Set(h, ControlScope.Epic(ItemNaming.Shortcut.Epic(epic)), ControlState.Running);
         Assert.Equal(WorkState.Watch, (await h.Run(B)).State);
         Assert.Equal([Branch(A), Branch(C), Branch(B)], h.Repo.Merges.Select(m => m.Branch));
         Assert.All(h.Repo.Merges, m => Assert.Equal(m.MainCount, m.Contained));

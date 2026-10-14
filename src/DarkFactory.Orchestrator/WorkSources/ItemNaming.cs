@@ -11,28 +11,63 @@ namespace DarkFactory.Orchestrator.WorkSources;
 /// <param name="Source">The ledger's source column.</param>
 /// <param name="Prefix">The external id's prefix, e.g. <c>sc</c>.</param>
 /// <param name="Noun">What an item is called in prose (prompts, comments), e.g. <c>Shortcut story</c>.</param>
-/// <param name="NumberedEpics">
-/// Whether the source's epics have a number an epic-scope control names (<c>epic:&lt;n&gt;</c>, <c>factory pause --epic N</c>): such a
-/// control reaches only the items of a source that has them.
+/// <param name="Epics">
+/// How the source's epics are named in an epic-scope control (<see cref="EpicNaming"/>; sc-25985), or that it has none: an epic
+/// control names its source, and reaches only that source's items.
 /// </param>
-public sealed record ItemNaming(string Source, string Prefix, string Noun, bool NumberedEpics = false)
+public sealed record ItemNaming(string Source, string Prefix, string Noun, EpicNaming Epics = EpicNaming.None)
 {
-    /// <summary>Shortcut stories: <c>sc-&lt;story id&gt;</c>.</summary>
-    public static readonly ItemNaming Shortcut = new("shortcut", "sc", "Shortcut story", NumberedEpics: true);
+    /// <summary>Shortcut stories: <c>sc-&lt;story id&gt;</c>. Its epics are named by their Shortcut id alone (<c>epic:12</c>).</summary>
+    public static readonly ItemNaming Shortcut = new("shortcut", "sc", "Shortcut story", EpicNaming.Number);
 
     /// <summary>GitHub issues: <c>gh-&lt;key&gt;</c>, the key the ledger gave the issue (<see cref="Ledger.GitHubIssue"/>), not its number.</summary>
     public static readonly ItemNaming GitHubIssue = new("github", "gh", "GitHub issue");
 
     /// <summary>
     /// KanbanBoard work items (sc-25981): <c>kb-&lt;key&gt;</c>, the key the ledger gave the item (<see cref="Ledger.KanbanItem"/>) —
-    /// its id on the board is a GUID, and a GUID names no branch or control scope a person types.
+    /// its id on the board is a GUID, and a GUID names no branch or control scope a person types. Its epics are GUIDs too, and get
+    /// a ledger key the same way (<see cref="Ledger.KanbanEpicKey"/>, sc-25985): <c>epic:kb-3</c>.
     /// </summary>
-    public static readonly ItemNaming Kanban = new("kanban", "kb", "Kanban item");
+    public static readonly ItemNaming Kanban = new("kanban", "kb", "Kanban item", EpicNaming.Key);
 
     /// <summary>Every source's naming.</summary>
     public static readonly IReadOnlyList<ItemNaming> All = [Shortcut, GitHubIssue, Kanban];
 
     public string Format(int id) => $"{Prefix}-{id}";
+
+    /// <summary>The epic of this source with the id the ledger holds for it (<see cref="Ledger.WorkItem.EpicId"/>).</summary>
+    /// <exception cref="InvalidOperationException">The source has no epics.</exception>
+    public EpicRef Epic(long id) => Epics == EpicNaming.None
+        ? throw new InvalidOperationException($"A {Noun} is in no epic an epic control could name.")
+        : new EpicRef(this, id);
+
+    /// <summary>
+    /// The epic an item's ledger row names (its external id and <see cref="Ledger.WorkItem.EpicId"/>): the id alone says nothing —
+    /// a Shortcut epic's number and a Kanban epic's key may be the same number. Null for an item in no epic, or of a source without epics.
+    /// </summary>
+    public static EpicRef? EpicOf(string externalId, long? epicId) =>
+        epicId is { } id && ParseAny(externalId) is { Naming.Epics: not EpicNaming.None } item ? new EpicRef(item.Naming, id) : null;
+
+    /// <summary>
+    /// Parses an epic as a person types it (<c>factory pause --epic</c>): a bare positive number is a Shortcut epic's id (what
+    /// <c>--epic N</c> always meant), <c>kb-&lt;n&gt;</c> (any case) a Kanban epic's key. Null for anything else.
+    /// </summary>
+    public static EpicRef? ParseEpic(string? value)
+    {
+        var text = value?.Trim() ?? "";
+        foreach (var naming in All.Where(n => n.Epics != EpicNaming.None))
+        {
+            var number = naming.Epics == EpicNaming.Number ? text
+                : text.StartsWith(naming.Prefix + "-", StringComparison.OrdinalIgnoreCase) ? text[(naming.Prefix.Length + 1)..]
+                : "";
+            if (number.Length > 0 && number.All(char.IsAsciiDigit)
+                && long.TryParse(number, NumberStyles.None, CultureInfo.InvariantCulture, out var id) && id > 0)
+            {
+                return new EpicRef(naming, id);
+            }
+        }
+        return null;
+    }
 
     public string BranchName(int id) => $"factory/{Format(id)}";
 
@@ -134,6 +169,34 @@ public sealed record ItemNaming(string Source, string Prefix, string Noun, bool 
         }
         return null;
     }
+}
+
+/// <summary>How a source's epics are named in an epic-scope control (<c>epic:&lt;name&gt;</c>, <c>factory pause --epic &lt;name&gt;</c>).</summary>
+public enum EpicNaming
+{
+    /// <summary>The source has no epics: no epic control reaches its items.</summary>
+    None,
+
+    /// <summary>
+    /// By the epic's own number on its board, with no prefix: <c>epic:12</c>. Shortcut only — what an epic scope was before any
+    /// other source had epics, so the control rows written then stay valid.
+    /// </summary>
+    Number,
+
+    /// <summary>By the key the ledger gave the epic, with the source's prefix: <c>epic:kb-3</c>.</summary>
+    Key,
+}
+
+/// <summary>
+/// One epic of one source (sc-25985): the source and the id the ledger holds for the epic (<see cref="Ledger.WorkItem.EpicId"/> —
+/// Shortcut's own epic id, or the key the ledger gave a Kanban epic). Written <c>12</c> or <c>kb-3</c>, so two sources' epics with
+/// the same number are never one scope.
+/// </summary>
+public sealed record EpicRef(ItemNaming Naming, long Id)
+{
+    public override string ToString() => Naming.Epics == EpicNaming.Number
+        ? Id.ToString(CultureInfo.InvariantCulture)
+        : $"{Naming.Prefix}-{Id.ToString(CultureInfo.InvariantCulture)}";
 }
 
 /// <summary>One item of one source, e.g. <c>gh-3</c>.</summary>

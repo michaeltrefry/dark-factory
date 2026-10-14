@@ -477,6 +477,55 @@ public sealed class DashboardHostTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task The_page_lists_a_kanban_item_with_its_link_and_epic_and_its_epic_control_post_pauses_that_epic_alone()
+    {
+        var (project, epic, item) = (Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid());
+        await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_db!.ConnectionString)))
+        {
+            db.KanbanItems.Add(new KanbanItem { ItemId = item, ProjectId = project, FirstSeenAt = DateTimeOffset.UtcNow });
+            db.KanbanEpics.Add(new KanbanEpicKey { EpicId = epic, ProjectId = project, FirstSeenAt = DateTimeOffset.UtcNow });
+            await db.SaveChangesAsync();
+            var ledger = new WorkLedger(db, TimeProvider.System);
+            // The Kanban epic's ledger key and the Shortcut epic's number are both 1.
+            await ledger.GetOrCreateAsync(ItemNaming.Kanban.Source, "kb-1", "Count words", "acme/widgets", null, CancellationToken.None, 1);
+            await ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-12", "Story", "acme/widgets", null, CancellationToken.None, 1);
+        }
+        await using var app = await StartAsync(new() { ["Kanban:WebUrl"] = "https://kanban.test/board/" });
+        var cookies = await DashboardLogin.LoginAsync(app.Address());
+        using var http = DashboardLogin.Client(app.Address(), cookies);
+
+        var page = await http.GetStringAsync("/");
+
+        // The link is built on Kanban:WebUrl from the ledger's ids: it opens the item's epic board in the Kanban UI.
+        var board = $"https://kanban.test/board/?project={project}&amp;epic={epic}";
+        Assert.Contains($"<a class=\"id\" href=\"{board}&amp;item={item}\" target=\"_blank\" rel=\"noopener noreferrer\">kb-1</a>", page);
+        Assert.Contains($"<a href=\"{board}\" target=\"_blank\" rel=\"noopener noreferrer\">kb-1</a>", page);
+        Assert.Contains("data-scope=\"epic:kb-1\"", page);
+        Assert.Contains("data-scope=\"epic:1\"", page);
+        Assert.Matches("<form[^>]*data-action=\"stop\"[^>]*data-scope=\"item:kb-1\"", page);
+
+        using var pause = await DashboardLogin.PostAsync(http, DashboardControls.Path,
+            new Dictionary<string, string> { ["action"] = "pause", ["scope"] = "epic:kb-1" }, DashboardLogin.TokenFrom(page));
+
+        Assert.Equal(HttpStatusCode.Redirect, pause.StatusCode);
+        await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_db!.ConnectionString)))
+        {
+            var control = await db.Controls.SingleAsync();
+            Assert.Equal(("epic:kb-1", Controls.ControlState.Paused, DashboardControls.By), (control.Scope, control.State, control.ChangedBy));
+        }
+        var controls = FactoryRunner.Controls(new FactoryOptions(
+            new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?> { ["ConnectionStrings:Ledger"] = _db!.ConnectionString }).Build(),
+            new InMemorySecrets()));
+        Assert.Equal(Controls.ControlState.Paused, await controls.EffectiveAsync("kb-1", 1, CancellationToken.None));
+        Assert.Equal(Controls.ControlState.Running, await controls.EffectiveAsync("sc-12", 1, CancellationToken.None));
+        Assert.Contains("Epic kb-1: <span class=\"control-state\">paused</span>", await http.GetStringAsync("/"));
+        // A scope that is not written as the factory writes it is refused: no item's control would ever read the row.
+        using var odd = await DashboardLogin.PostAsync(http, DashboardControls.Path,
+            new Dictionary<string, string> { ["action"] = "pause", ["scope"] = "epic:KB-1" }, DashboardLogin.TokenFrom(await http.GetStringAsync("/")));
+        Assert.Equal(HttpStatusCode.BadRequest, odd.StatusCode);
+    }
+
+    [Fact]
     public async Task Logging_out_ends_the_session()
     {
         await using var app = await StartAsync();
