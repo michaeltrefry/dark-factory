@@ -103,22 +103,219 @@ public class ShortcutWorkSourceTests
         Assert.Equal(1, (await source.ReadSpecAsync(1, CancellationToken.None)).Story.Id);
     }
 
+    /// <summary>
+    /// One story on a fake board that applies the fields a PUT sends. <see cref="Conflicts"/> are other writers: each PUT while one
+    /// is queued runs it (it changes the story) and is refused 409 Conflict with nothing written, as Shortcut does.
+    /// </summary>
+    private sealed class ConflictBoard
+    {
+        public const string Me = "me";
+        public const long Backlog = 1, ToDo = 2, InProgress = 3;
+
+        public List<string> Owners { get; set; } = [];
+        public List<string> Labels { get; set; } = [];
+        public List<string> Links { get; set; } = [];
+        public long State { get; set; } = ToDo;
+        public Queue<Action<ConflictBoard>> Conflicts { get; } = new();
+        public int Puts { get; private set; }
+        public int Written { get; private set; }
+        public int Comments { get; private set; }
+
+        /// <summary>The story's owners, labels and state, comparable as one string.</summary>
+        public string Fields => $"owners [{string.Join(", ", Owners)}] labels [{string.Join(", ", Labels)}] state {State}";
+
+        public ConflictBoard(FakeApi api)
+        {
+            api.On("GET /api/v3/member", HttpStatusCode.OK, """{"id":"me"}""");
+            api.On("GET /api/v3/groups", HttpStatusCode.OK, """[{"id":"g1","mention_name":"darkfactory"}]""");
+            api.On("GET /api/v3/workflows", HttpStatusCode.OK, """
+                [{"id":1,"name":"W","states":[{"id":1,"name":"Backlog"},{"id":2,"name":"To Do"},{"id":3,"name":"In Progress"},
+                  {"id":4,"name":"Done","type":"done"}]}]
+                """);
+            api.On("GET /api/v3/stories/1", _ => FakeApi.Json(HttpStatusCode.OK, new JsonObject
+            {
+                ["id"] = 1, ["name"] = "n", ["description"] = "d", ["story_type"] = "bug", ["app_url"] = "https://app.shortcut.com/t/story/1",
+                ["archived"] = false, ["workflow_id"] = 1, ["workflow_state_id"] = State, ["group_id"] = "g1", ["epic_id"] = null,
+                ["owner_ids"] = new JsonArray([.. Owners.Select(o => (JsonNode)o)]),
+                ["labels"] = new JsonArray([.. Labels.Select(l => (JsonNode)new JsonObject { ["name"] = l })]),
+                ["external_links"] = new JsonArray([.. Links.Select(l => (JsonNode)l)]),
+            }.ToJsonString()));
+            api.On("PUT /api/v3/stories/1", request =>
+            {
+                Puts++;
+                if (Conflicts.TryDequeue(out var other))
+                {
+                    other(this);
+                    return FakeApi.Json(HttpStatusCode.Conflict, """{"message":"Conflict"}""");
+                }
+                Written++;
+                var body = JsonNode.Parse(request.Body!)!.AsObject();
+                if (body["owner_ids"] is JsonArray owners)
+                {
+                    Owners = [.. owners.Select(o => o!.GetValue<string>())];
+                }
+                if (body["labels"] is JsonArray labels)
+                {
+                    Labels = [.. labels.Select(l => l!["name"]!.GetValue<string>())];
+                }
+                if (body["external_links"] is JsonArray links)
+                {
+                    Links = [.. links.Select(l => l!.GetValue<string>())];
+                }
+                if (body["workflow_state_id"] is { } state)
+                {
+                    State = state.GetValue<long>();
+                }
+                return FakeApi.Json(HttpStatusCode.OK, """{"id":1}""");
+            });
+            api.On("POST /api/v3/stories/1/comments", _ =>
+            {
+                Comments++;
+                return FakeApi.Json(HttpStatusCode.Created, """{"id":9}""");
+            });
+        }
+    }
+
     [Fact]
-    public async Task A_put_refused_409_for_a_concurrent_write_is_sent_again()
+    public async Task A_link_write_refused_409_reads_the_story_again_and_keeps_the_other_writers_link()
     {
         // sc-25992, the live P2-AT1 re-run: Shortcut's GitHub integration recorded the pushed branch on the story in the same
         // second as the factory's link write, which Shortcut refused 409 Conflict and the item escalated.
         var (api, time, source) = Api();
-        api.On("GET /api/v3/stories/1", _ => FakeApi.Json(HttpStatusCode.OK, StoryJson));
-        var puts = 0;
-        api.On("PUT /api/v3/stories/1", _ => ++puts == 1
-            ? FakeApi.Json(HttpStatusCode.Conflict, """{"message":"Conflict"}""")
-            : FakeApi.Json(HttpStatusCode.OK, """{"id":1}"""));
+        var board = new ConflictBoard(api);
+        board.Conflicts.Enqueue(b => b.Links.Add("https://github.com/o/r/tree/factory/sc-1"));
 
         await source.LinkAsync(1, ["https://github.com/o/r/pull/1"], CancellationToken.None);
 
-        Assert.Equal(2, puts);
+        Assert.Equal(["https://github.com/o/r/tree/factory/sc-1", "https://github.com/o/r/pull/1"], board.Links);
+        Assert.Equal((2, 1), (board.Puts, board.Written));
+        Assert.Equal(2, api.Requests.Count(r => r.Method == HttpMethod.Get && r.PathAndQuery == "/api/v3/stories/1"));
         Assert.Equal([TimeSpan.FromSeconds(1)], time.Delays);
+    }
+
+    [Fact]
+    public async Task A_claim_refused_409_is_refused_when_another_claimant_took_the_story_meanwhile()
+    {
+        var (api, _, source) = Api();
+        var board = new ConflictBoard(api);
+        board.Conflicts.Enqueue(b => (b.Owners, b.Labels) = (["other"], [ShortcutWorkSource.ClaimLabel]));
+
+        var result = await source.ClaimAsync(1, ignoreScope: false, CancellationToken.None);
+
+        Assert.False(result.Claimed);
+        Assert.Contains("another claimant holds it", result.Refusal);
+        Assert.Equal("owners [other] labels [factory-claimed] state 2", board.Fields);
+        Assert.Equal((1, 0), (board.Puts, board.Written));
+    }
+
+    [Fact]
+    public async Task A_claim_refused_409_keeps_an_owner_and_a_label_another_writer_added_meanwhile()
+    {
+        var (api, _, source) = Api();
+        var board = new ConflictBoard(api);
+        board.Conflicts.Enqueue(b => (b.Owners, b.Labels) = (["person"], ["urgent"]));
+
+        var result = await source.ClaimAsync(1, ignoreScope: false, CancellationToken.None);
+
+        Assert.True(result.Claimed, result.Refusal);
+        Assert.Equal("owners [person, me] labels [urgent, factory-claimed] state 2", board.Fields);
+        Assert.Equal((2, 1), (board.Puts, board.Written));
+    }
+
+    [Fact]
+    public async Task A_claim_refused_409_is_refused_when_the_story_left_the_ready_state_meanwhile()
+    {
+        var (api, _, source) = Api();
+        var board = new ConflictBoard(api);
+        board.Conflicts.Enqueue(b => b.State = ConflictBoard.Backlog);
+
+        var result = await source.ClaimAsync(1, ignoreScope: false, CancellationToken.None);
+
+        Assert.Equal(ClaimResult.Refused($"the story is no longer in {ShortcutWorkSource.ReadyState}"), result);
+        Assert.Equal((ConflictBoard.Backlog, 1, 0), (board.State, board.Puts, board.Written));
+    }
+
+    [Fact]
+    public async Task A_release_refused_409_keeps_an_owner_another_writer_added_meanwhile()
+    {
+        var (api, _, source) = Api();
+        var board = new ConflictBoard(api) { Owners = [ConflictBoard.Me], Labels = [ShortcutWorkSource.ClaimLabel] };
+        board.Conflicts.Enqueue(b => (b.Owners, b.Labels) = ([ConflictBoard.Me, "person"], [ShortcutWorkSource.ClaimLabel, "urgent"]));
+
+        await source.ReleaseAsync(1, CancellationToken.None);
+
+        Assert.Equal("owners [person] labels [urgent] state 2", board.Fields);
+        Assert.Equal((2, 1), (board.Puts, board.Written));
+    }
+
+    [Fact]
+    public async Task A_stop_refused_409_keeps_a_label_another_writer_added_and_comments_once()
+    {
+        var (api, _, source) = Api();
+        var board = new ConflictBoard(api) { Owners = [ConflictBoard.Me], Labels = [ShortcutWorkSource.ClaimLabel], State = ConflictBoard.InProgress };
+        board.Conflicts.Enqueue(b => b.Labels.Add("keep"));
+
+        await source.ReportStateAsync(1, BoardState.Stopped, "stopped", CancellationToken.None);
+
+        Assert.Equal("owners [] labels [keep] state 1", board.Fields);
+        Assert.Equal((2, 1, 1), (board.Puts, board.Written, board.Comments));
+    }
+
+    [Fact]
+    public async Task A_return_refused_409_leaves_the_story_to_a_person_who_took_it_meanwhile()
+    {
+        var (api, _, source) = Api();
+        var board = new ConflictBoard(api);
+        board.Conflicts.Enqueue(b => b.Owners = ["person"]);
+
+        Assert.False(await source.ReturnUnstartedAsync(1, "returned", CancellationToken.None));
+
+        Assert.Equal("owners [person] labels [] state 2", board.Fields);
+        Assert.Equal((1, 0, 0), (board.Puts, board.Written, board.Comments));
+    }
+
+    [Fact]
+    public async Task A_release_to_ready_refused_409_leaves_a_story_moved_on_meanwhile()
+    {
+        var (api, _, source) = Api();
+        var board = new ConflictBoard(api) { State = ConflictBoard.Backlog };
+        board.Conflicts.Enqueue(b => b.State = ConflictBoard.InProgress);
+
+        Assert.Equal(ReadyResult.AlreadyLeft, await source.MakeReadyAsync(1, CancellationToken.None));
+
+        Assert.Equal((ConflictBoard.InProgress, 1, 0), (board.State, board.Puts, board.Written));
+    }
+
+    [Fact]
+    public async Task A_write_refused_409_on_an_unchanged_story_is_written_once()
+    {
+        var (api, _, source) = Api();
+        var board = new ConflictBoard(api);
+        board.Conflicts.Enqueue(_ => { });
+
+        Assert.True(await source.ReturnUnstartedAsync(1, "returned", CancellationToken.None));
+
+        Assert.Equal(ConflictBoard.Backlog, board.State);
+        Assert.Equal((2, 1, 1), (board.Puts, board.Written, board.Comments));
+    }
+
+    [Fact]
+    public async Task A_write_refused_409_every_time_gives_up_after_the_bound()
+    {
+        var (api, time, source) = Api();
+        var board = new ConflictBoard(api);
+        for (var i = 0; i < 10; i++)
+        {
+            board.Conflicts.Enqueue(_ => { });
+        }
+
+        // An InvalidOperationException like every other refusal, so callers handle it as before.
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(
+            () => source.LinkAsync(1, ["https://github.com/o/r/pull/1"], CancellationToken.None));
+
+        Assert.StartsWith("Shortcut PUT stories/1 failed: 409", ex.Message);
+        Assert.Equal((ShortcutWorkSource.MaxConflictAttempts, 0), (board.Puts, board.Written));
+        Assert.Equal([TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2)], time.Delays);
     }
 
     [Fact]
