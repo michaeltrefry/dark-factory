@@ -403,6 +403,9 @@ public static class RiskyPaths
     [
         ("CI and repository automation", new Regex(@"^\.github/", Options)),
         ("the factory's own policy and prompts", new Regex(@"^factory/", Options)),
+        // A repository's prepare recipe (sc-26232): it declares the artifacts the harness downloads and the steps every build of the
+        // repository runs first — a build recipe like Package.swift or build.rs, so it always calls the security review in.
+        ("the prepare recipe", new Regex(@"^\.factory/", Options)),
         ("scripts", new Regex(@"(^|/)scripts?/|\.(sh|bash|zsh|ps1)$", Options)),
         ("build and container definitions", new Regex(@"(^|/)(Dockerfile[^/]*|docker-compose[^/]*\.ya?ml|Makefile)$", Options)),
         ("dependencies", new Regex(

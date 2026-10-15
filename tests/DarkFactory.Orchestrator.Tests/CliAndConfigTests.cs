@@ -192,6 +192,23 @@ public class FactoryOptionsTests
     private static FactoryOptions Options(Dictionary<string, string?> config, InMemorySecrets? secrets = null) =>
         new(new ConfigurationBuilder().AddInMemoryCollection(config).Build(), secrets ?? new InMemorySecrets());
 
+    [Theory]
+    [InlineData(null, false)]
+    [InlineData("true", true)]
+    [InlineData("FALSE", false)]
+    public void Worker_prepare_is_read_and_defaults_off(string? value, bool expected)
+    {
+        Assert.Equal(expected, Options(value is null ? [] : new() { ["Worker:Prepare"] = value }).WorkerPrepare);
+    }
+
+    [Fact]
+    public void A_worker_prepare_that_is_no_boolean_is_refused_at_start_up()
+    {
+        var refused = Assert.Throws<InvalidOperationException>(Options(new() { ["Worker:Prepare"] = "yes" }).ValidateSettings);
+
+        Assert.Equal("Worker:Prepare must be 'true' or 'false', not 'yes'.", refused.Message);
+    }
+
     [Fact]
     public void Defaults_point_at_local_router_sandbox_and_compose_postgres()
     {

@@ -34,6 +34,7 @@
     <!-- The launch helper as the repo has it: the installed one must match it (WorkerSandbox.StaleHelperReason). Only compared, never run. -->
     <EmbeddedResource Include="../../scripts/factory-worker-launch" LogicalName="factory-worker-launch" />
     <EmbeddedResource Include="../../scripts/factory-xcodebuild" LogicalName="factory-xcodebuild" />
+    <EmbeddedResource Include="../../scripts/factory-prepare" LogicalName="factory-prepare" />
     <!-- The gate's iOS Simulator steps (sc-26132): run as `/bin/bash -c <text>` by the gate's test runs, never installed. -->
     <EmbeddedResource Include="../../scripts/factory-ios-simulator" LogicalName="factory-ios-simulator" />
     <!-- The gateway lint's model provider markers (one list, also embedded in the analyzer): Router:BaseUrl may name none. -->

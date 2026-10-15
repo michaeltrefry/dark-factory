@@ -74,6 +74,21 @@ public sealed record TestStep(TestPhase Phase, string Program, IReadOnlyList<str
     /// (<see cref="WorkSources.FactoryUnavailableException"/>), never the item's — after the run's cleanup steps, as always.
     /// </summary>
     public int? FactoryWideExit { get; init; }
+
+    /// <summary>
+    /// The directory the step runs in, relative to the worktree root ('/'-separated; null or "." the root; sc-26232: a prepare
+    /// recipe's <c>cwd</c>). The runner refuses one that is not a directory inside the worktree once every link is resolved.
+    /// </summary>
+    public string? WorkingDirectory { get; init; }
+
+    /// <summary>How long this step may take at most (sc-26232: a recipe step's <c>timeout_minutes</c>), always within the run's own deadline.</summary>
+    public TimeSpan? Timeout { get; init; }
+
+    /// <summary>Whether the runner replaces <c>${worktree}</c> in <see cref="Program"/> and <see cref="Args"/> with the run's worktree (sc-26232: a recipe step).</summary>
+    public bool ExpandsWorktree { get; init; }
+
+    /// <summary>What the run's log calls the step, before its command line (sc-26232: <c>prepare step &lt;name&gt;</c>).</summary>
+    public string? Label { get; init; }
 }
 
 /// <summary>
@@ -414,8 +429,14 @@ public static class NewTestsCheck
     public static IReadOnlyList<INewTestStrategy> StrategiesFor(bool swift, string wrapperPath = Worker.SwiftToolchain.DefaultWrapperPath) =>
         swift ? [new XunitNewTests(), new CargoNewTests(), new SwiftNewTests(xcode: true), new XcodeNewTests(wrapperPath)] : Strategies;
 
+    /// <param name="prepared">
+    /// Each commit's prepare recipe steps (sc-26232; <see cref="Prepare.PreparedCommits"/>, artifacts already fetched owner-side): every
+    /// run of a commit runs its own commit's steps — the base run and its retries the base's (the overlay applies only test files),
+    /// the head run the head's — after the strategy's toolchain probes and before its restore. Null, or a commit with no recipe:
+    /// the runs are exactly as before (E7).
+    /// </param>
     public static async Task<NewTestsResult> RunAsync(IGateTestRunner runner, IReadOnlyList<INewTestStrategy> strategies, RepoRef repo,
-        string baseSha, string headSha, string runName, Action<string>? log, CancellationToken ct)
+        string baseSha, string headSha, string runName, Action<string>? log, CancellationToken ct, Prepare.PreparedCommits? prepared = null)
     {
         var changes = await runner.ChangesAsync(repo, baseSha, headSha, ct);
         var source = new TestSource(runner, repo, baseSha, headSha);
@@ -461,7 +482,8 @@ public static class NewTestsCheck
             {
                 var directory = NewResultsDirectory();
                 return new TestRunSpec(name, commit, from, from is null ? [] : overlay, from is null ? [] : deletes,
-                    await strategy.StepsAsync(source, commit, tests, set.Projects, directory, ct), strategy, directory)
+                    Prepare.PrepareSteps.Before(prepared?.StepsFor(commit) ?? [], await strategy.StepsAsync(source, commit, tests, set.Projects, directory, ct)),
+                    strategy, directory)
                 {
                     Replacements = from is null ? new Dictionary<string, string>(StringComparer.Ordinal) : set.BaseReplacements,
                 };

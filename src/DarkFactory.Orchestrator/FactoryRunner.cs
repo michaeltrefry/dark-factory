@@ -308,7 +308,7 @@ public static class FactoryRunner
 
         // Before the ledger or the board is touched: an installed helper that is not the current one fails the factory here, with
         // nothing claimed or recorded (the rest of the readiness check runs the helper, so it waits for the first worker phase).
-        await EnsureHelperCurrentAsync(slots, ct);
+        await EnsureHelperCurrentAsync(slots, ct, options.WorkerPrepare);
         await FactoryWide("the ledger", async () => { await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct); return true; });
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
         var ledger = new WorkLedger(db, TimeProvider.System);
@@ -355,7 +355,11 @@ public static class FactoryRunner
         // One upstream registry: the reviewers' tools and the review's overlay wait (sc-25708) share its CodeGraph client.
         var upstreams = CreateUpstreams(options, codeGraphHttp, kanbanHttp, log);
         var reviewer = new RouterReviewer(reviewerHttp, routerKey, tools: new ReviewTools(workspaces, upstreams.CodeGraph, upstreams.Kanban, log));
-        var gate = CreateGate(options, gateGitHub, reviewer, workspaces, slots, upstreams.CodeGraph);
+        // Prepare recipes' artifacts (sc-26232): downloaded by the harness alone, through the gateway, into the read-only cache.
+        using var artifactHttp = OutboundHttp.ArtifactDownload(DnsArtifactResolver.Instance);
+        var artifacts = new Prepare.ArtifactFetcher(artifactHttp, DnsArtifactResolver.Instance,
+            new Prepare.ArtifactCache(Prepare.ArtifactCache.RootOf(options.WorkRoot)));
+        var gate = CreateGate(options, gateGitHub, reviewer, workspaces, slots, upstreams.CodeGraph, artifacts);
         if (adjustGate is not null)
         {
             gate = adjustGate(gate);
@@ -368,7 +372,7 @@ public static class FactoryRunner
             workspaces,
             // The xcodebuild wrapper is allowed only in a factory with Worker:Swift on (sc-26130, E7).
             new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerTimeout, slots,
-                pauseFlagDirectory: options.PauseFlagDirectory, tools: WorkerTools.ImplementerFor(options.WorkerSwift)),
+                pauseFlagDirectory: options.PauseFlagDirectory, tools: WorkerTools.ImplementerFor(options.WorkerSwift, options.WorkerPrepare)),
             new GitHubPullRequests(githubHttp, app),
             options.DefaultRepo,
             log,
@@ -394,7 +398,11 @@ public static class FactoryRunner
             slots: slots,
             enterSandbox: EnterSandboxAsync,
             // Its prompts name the xcodebuild wrapper, and its repo-settings taint allows that rule, only with Worker:Swift on (sc-26130).
-            swift: options.WorkerSwift);
+            swift: options.WorkerSwift,
+            // Worker:Prepare (sc-26232): implementers' factory-prepare, its prefetch and its request spool.
+            workerPrepare: options.WorkerPrepare
+                ? new Prepare.WorkerPrepare(artifacts, Prepare.WorkerPrepare.SpoolRootOf(options.WorkRoot), log)
+                : null);
 
         return await pipeline.RunAsync(storyId, ct);
     }
@@ -455,10 +463,12 @@ public static class FactoryRunner
     /// (sc-25709; without a CodeGraph token there is none, and the check fails wherever a tier requires it).
     /// </summary>
     internal static GateStage CreateGate(FactoryOptions options, IGateGitHub github, IReviewer reviewer, GitWorkspace workspaces,
-        WorkerSlots? slots, ICodeGraphOverlays? codeGraph = null) =>
+        WorkerSlots? slots, ICodeGraphOverlays? codeGraph = null, Prepare.ArtifactFetcher? artifacts = null) =>
         new(github, reviewer, options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, slots, options.TestTimeout),
             Overlays: new ReviewOverlays(codeGraph, options.CodeGraphOverlayTimeout),
-            Risk: codeGraph is ICodeGraphRisk risk ? new CodeGraphRiskReader(risk, options.CodeGraphOverlayTimeout) : null);
+            Risk: codeGraph is ICodeGraphRisk risk ? new CodeGraphRiskReader(risk, options.CodeGraphOverlayTimeout) : null,
+            // Each commit's prepare recipe (sc-26232): its artifacts fetched owner-side, its steps run before the build.
+            Prepare: artifacts is null ? null : new Prepare.PrepareStage(artifacts));
 
     /// <summary>
     /// The sandbox readiness probe of the slot the calling flow holds (<see cref="WorkerSlots.EnsureReadyAsync"/>; a failure names
@@ -474,9 +484,22 @@ public static class FactoryRunner
     /// where nothing has been claimed yet: at <c>factory work</c>'s start-up (<see cref="CheckHelperAsync"/>) and at the start of
     /// every run. Nothing to check unsandboxed.
     /// </summary>
-    internal static Task EnsureHelperCurrentAsync(WorkerSlots? slots, CancellationToken ct) => slots is null
-        ? Task.CompletedTask
-        : FactoryWide("the worker sandbox", async () => { await slots.EnsureHelpersCurrentAsync(ct); return true; });
+    internal static async Task EnsureHelperCurrentAsync(WorkerSlots? slots, CancellationToken ct, bool prepare = false)
+    {
+        if (slots is not null)
+        {
+            await FactoryWide("the worker sandbox", async () => { await slots.EnsureHelpersCurrentAsync(ct); return true; });
+        }
+        if (prepare)
+        {
+            // Worker:Prepare (sc-26232): the workers' factory-prepare must be the installed, current copy (read, never run).
+            await FactoryWide("factory-prepare", async () =>
+            {
+                await Prepare.PrepareTool.EnsureCurrentAsync(WorkerSlots.ReinstallCommand(slots?.Count ?? 1), ct);
+                return true;
+            });
+        }
+    }
 
     /// <summary>
     /// <c>factory work</c>'s start-up check of every slot's launch helper: why an installed one cannot be used (missing, unreadable,
@@ -485,11 +508,11 @@ public static class FactoryRunner
     /// nothing — the helper's exit kills every process of the worker user, so the probe and the worker user's Claude Code version
     /// are checked in the first worker phase, under the sandbox user's lock.
     /// </summary>
-    public static async Task<string?> CheckHelperAsync(WorkerSlots? slots, CancellationToken ct)
+    public static async Task<string?> CheckHelperAsync(WorkerSlots? slots, CancellationToken ct, bool prepare = false)
     {
         try
         {
-            await EnsureHelperCurrentAsync(slots, ct);
+            await EnsureHelperCurrentAsync(slots, ct, prepare);
             return null;
         }
         catch (FactoryUnavailableException ex)

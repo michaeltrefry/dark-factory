@@ -54,7 +54,8 @@ public enum StepOutcome
 /// which of a plan's changesets are on their default branch when it escalates or is stopped — a record, judged by nothing) → deferred;
 /// <c>merged-into-changeset</c> (sc-25877: a plan story's pull request was merged outside the factory into its plan's changeset branch
 /// — its own gate never judged it; the changeset pull request's review and gate do) → deferred; <c>plan-notice</c> (the plan
-/// item's comment for a hold) posted → passed, failed → failed; every other checkpoint (a completed sub-step, <c>plan-resumed</c> and <c>plan-claim-regained</c> among
+/// item's comment for a hold) posted → passed, failed → failed; <c>artifact-fetch</c> (sc-26232: a harness download of a prepare
+/// recipe's artifact) fetched → passed, failed → failed; every other checkpoint (a completed sub-step, <c>plan-resumed</c> and <c>plan-claim-regained</c> among
 /// them) → passed.</item>
 /// </list>
 /// A run deferred by the freeze before it starts (<see cref="RunOutcome.Deferred"/>) writes no row, so it has no outcome to record.
@@ -126,7 +127,7 @@ public static class StepOutcomes
         RunPipeline.Steps.CodeGraphOverlay => Gate.CodeGraphOverlay.FromDetail(detail) is { IsReady: true } ? StepOutcome.Passed : StepOutcome.Failed,
         RunPipeline.Steps.EscalationComment =>detail == "posted" ? StepOutcome.Passed : StepOutcome.Failed,
         Issues.IssueSteps.RoutedToHuman => StepOutcome.Escalated,
-        RunPipeline.Steps.PrReport or RunPipeline.Steps.Closeout or RunPipeline.Steps.PlanNotice =>
+        RunPipeline.Steps.PrReport or RunPipeline.Steps.Closeout or RunPipeline.Steps.PlanNotice or RunPipeline.Steps.ArtifactFetch =>
             detail?.StartsWith("failed", StringComparison.Ordinal) == true ? StepOutcome.Failed : StepOutcome.Passed,
         Issues.IssueSteps.ApprovalIgnored or RunPipeline.Steps.PlanRejected => StepOutcome.GateRejected,
         RunPipeline.Steps.CiTriggers => CiTriggerCheck.IsBlocked(detail) ? StepOutcome.GateRejected : StepOutcome.Failed,

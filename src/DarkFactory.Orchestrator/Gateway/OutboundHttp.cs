@@ -5,7 +5,7 @@ namespace DarkFactory.Orchestrator.Gateway;
 /// <summary>
 /// The factory's only outbound HTTP (E2, sc-25390): every <see cref="HttpClient"/> to GitHub's REST API (both Apps, the
 /// owner's admin token for rulesets, CI job logs and the blob-storage download GitHub redirects them to), to Shortcut, to
-/// the router, to CodeGraph and to Kanban is built here, one named client per service; the typed clients (<c>GitHubApp</c>, <c>GitHubPullRequests</c>,
+/// the router, to CodeGraph and to Kanban, and a prepare recipe's artifact downloads (sc-26232), are built here, one named client per service; the typed clients (<c>GitHubApp</c>, <c>GitHubPullRequests</c>,
 /// <c>GitHubGate</c>, <c>GitHubIssuesClient</c>, <c>RepoProtection</c>, <c>GitHubAppSetup</c>, <c>ShortcutWorkSource</c>,
 /// <c>RouterClient</c>, <c>RouterReviewer</c>, <c>CodeGraphMcpClient</c>, <c>McpHttpClient</c>) use the one they are given. The <c>DarkFactory.Analyzers</c> gateway lint fails
 /// the build on an HTTP client, handler, socket or web request made anywhere else in the orchestrator or the acceptance tests (DF0001) and on a
@@ -65,6 +65,15 @@ public static class OutboundHttp
 
     /// <summary>A client for KanbanBoard's MCP endpoint <paramref name="mcpUrl"/> (<c>Kanban:McpUrl</c>; requests go to the base address itself).</summary>
     public static HttpClient KanbanApi(Uri mcpUrl) => new() { BaseAddress = mcpUrl, Timeout = KanbanTimeout };
+
+    /// <summary>
+    /// The client of a prepare recipe's artifact downloads (sc-26232), owner-side only: every connection goes to an address
+    /// <paramref name="resolver"/> answered and <see cref="ArtifactAddresses"/> allows (public unicast; checked and pinned in the
+    /// connect callback), no proxy, no redirect followed by the handler (the downloader follows at most a few itself, each URL checked
+    /// again), nothing decompressed. No timeout of its own: the downloader bounds each download as a whole (headers and body).
+    /// </summary>
+    public static HttpClient ArtifactDownload(IArtifactResolver resolver) =>
+        new(ArtifactTransport.Handler(resolver)) { Timeout = Timeout.InfiniteTimeSpan };
 
     /// <summary>
     /// A client for the factory's own dashboard at <paramref name="baseAddress"/> (the live acceptance tests' login): it keeps

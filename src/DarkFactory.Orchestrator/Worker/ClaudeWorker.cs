@@ -193,6 +193,14 @@ public sealed record WorkerTools
     public static WorkerTools ImplementerFor(bool swift) => swift ? SwiftImplementer : Implementer;
 
     /// <summary>
+    /// <see cref="ImplementerFor(bool)"/>, with the installed <c>factory-prepare</c> allowed too when <paramref name="prepare"/>
+    /// (<c>Worker:Prepare</c>, sc-26232; <see cref="ClaudeWorker.AllowedToolsFor(bool, bool)"/>).
+    /// </summary>
+    public static WorkerTools ImplementerFor(bool swift, bool prepare) => prepare
+        ? new("acceptEdits", ClaudeWorker.AllowedToolsFor(swift, prepare), ClaudeWorker.DeniedTools, "project,local", confinedToWorkingDirectory: false)
+        : ImplementerFor(swift);
+
+    /// <summary>
     /// The tools a read-only session uses: it reads and searches its own checkout, nothing else. None is allowed by name (a bare
     /// <c>Read</c> rule would pre-approve a read of any path): Claude Code runs them without approval inside the working directory
     /// only, and bounds Glob and Grep by the <c>Read</c> rules.
@@ -379,6 +387,14 @@ public sealed class ClaudeWorker(
 
     /// <summary>The implementer's allow rules: <see cref="SwiftAllowedTools"/> when <paramref name="swift"/> (<c>Worker:Swift</c>), else exactly <see cref="AllowedTools"/> (E7).</summary>
     public static IReadOnlyList<string> AllowedToolsFor(bool swift) => swift ? SwiftAllowedTools : AllowedTools;
+
+    /// <summary>
+    /// The implementer's allow rules with <c>Worker:Prepare</c> (sc-26232) too: <see cref="AllowedToolsFor(bool)"/> plus the one rule
+    /// naming the installed <c>factory-prepare</c> (<see cref="Prepare.PrepareTool.AllowRule"/>) when <paramref name="prepare"/>;
+    /// without it exactly <see cref="AllowedToolsFor(bool)"/> (E7).
+    /// </summary>
+    public static IReadOnlyList<string> AllowedToolsFor(bool swift, bool prepare) =>
+        prepare ? [.. AllowedToolsFor(swift), Prepare.PrepareTool.AllowRule] : AllowedToolsFor(swift);
 
     /// <summary>
     /// Tools a worker is denied (<c>--disallowedTools</c>, which beats any allow rule, the target repo's own settings included): the

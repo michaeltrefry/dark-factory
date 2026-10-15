@@ -46,6 +46,8 @@ helper_dir=/usr/local/libexec/dark-factory
 helper=$helper_dir/factory-worker-launch
 # The only xcodebuild command a worker is allowed (scripts/factory-xcodebuild); one copy for every slot, it pins nothing per user.
 xcodebuild_wrapper=$helper_dir/factory-xcodebuild
+# The workers' factory-prepare (scripts/factory-prepare, sc-26232; Worker:Prepare=true): one copy for every slot.
+prepare_tool=$helper_dir/factory-prepare
 sudoers=/private/etc/sudoers.d/dark-factory
 script_dir=$(cd "$(dirname "$0")" && pwd)
 remove_worker_login=0
@@ -269,6 +271,11 @@ rm -f "$rule"
 # on). Workers run it as themselves by its absolute path, the one xcodebuild rule they are allowed; it needs no sudoers rule.
 say "Installing $xcodebuild_wrapper"
 install -o root -g wheel -m 0755 "$script_dir/factory-xcodebuild" "$xcodebuild_wrapper"
+
+# factory-prepare (sc-26232): root-owned and unedited (the orchestrator compares it with the repo's when Worker:Prepare is on).
+# Workers run it as themselves by its absolute path; it downloads nothing (the factory owner does) and needs no sudoers rule.
+say "Installing $prepare_tool"
+install -o root -g wheel -m 0755 "$script_dir/factory-prepare" "$prepare_tool"
 
 # Slots above <n> (a re-run with a smaller --slots): the sudoers file just installed holds no rule for them, so
 # their installed helpers are removed too. Left in place they would still pass the orchestrator's start-up

@@ -287,14 +287,21 @@ public class GatePipelineTests
                     controls: RunControls ?? Controls,
                     controlPollInterval: ControlPoll,
                     gate: new GateStage(GitHub, Panel ?? Reviewer, TimeSpan.FromMilliseconds(1), CiTimeout, GateOnFakeClock ? Time : null,
-                        TestRunner, Overlays, NoCodeGraph ? null : RiskReader ?? FakeCodeGraphRisk.Reader(CodeGraph, GateOnFakeClock)),
+                        TestRunner, Overlays, NoCodeGraph ? null : RiskReader ?? FakeCodeGraphRisk.Reader(CodeGraph, GateOnFakeClock), Prepare),
                     freeze: Freeze is null ? null : new FactoryFreeze(Contexts, Controls, Freeze, TimeProvider.System, GitHub),
                     maxControlReadFailures: MaxControlReadFailures,
-                    swift: Swift)
+                    swift: Swift,
+                    workerPrepare: WorkerPrepare)
                 .RunAsync(77, ct);
+
+        /// <summary><c>Worker:Prepare</c>'s worker side (sc-26232): prefetch and a request spool for each implementing session; none by default.</summary>
+        public Orchestrator.Prepare.WorkerPrepare? WorkerPrepare { get; init; }
 
         /// <summary><c>Worker:Swift</c> for the run (sc-26131: the new-tests check then also runs Xcode projects' macOS tests).</summary>
         public bool Swift { get; init; }
+
+        /// <summary>The gate's prepare stage (sc-26232): each commit's recipe read and its artifacts fetched before the runs; none by default.</summary>
+        public Orchestrator.Prepare.PrepareStage? Prepare { get; init; }
 
         /// <summary>The implementer reports <c>implementerModels</c>; every later session (a fixer) reports <see cref="FixerModels"/>.</summary>
         private sealed class HarnessWorker(Harness h, string?[] implementerModels) : IWorker

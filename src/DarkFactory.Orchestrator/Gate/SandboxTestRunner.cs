@@ -237,10 +237,26 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
     /// </summary>
     private async Task<(int ExitCode, string Output, bool TimedOut, string? Captured)> RunStepAsync(string worktree, TestStep step, TimeSpan remaining, CancellationToken ct)
     {
+        if (step.Timeout is { } own && own < remaining)
+        {
+            remaining = own;
+        }
+        if (StepDirectory(worktree, step) is not { } directory)
+        {
+            return (126, $"`{step.WorkingDirectory}` is not a directory inside the worktree (every link resolved), so the step was not run", false, null);
+        }
+        if (step.ExpandsWorktree)
+        {
+            step = step with
+            {
+                Program = step.Program.Replace(Prepare.PrepareRecipe.WorktreePlaceholder, worktree, StringComparison.Ordinal),
+                Args = step.Args.Select(a => a.Replace(Prepare.PrepareRecipe.WorktreePlaceholder, worktree, StringComparison.Ordinal)).ToList(),
+            };
+        }
         Process started;
         try
         {
-            started = Sandbox is null ? StartDirect(worktree, step) : Sandbox.Start(worktree, step.Program, step.Args, new Dictionary<string, string>());
+            started = Sandbox is null ? StartDirect(directory, step) : Sandbox.Start(directory, step.Program, step.Args, new Dictionary<string, string>());
         }
         catch (System.ComponentModel.Win32Exception e) when (Sandbox is null)
         {
@@ -338,11 +354,31 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
     }
 
     /// <summary>
+    /// The directory <paramref name="step"/> runs in (sc-26232): the worktree, or its <see cref="TestStep.WorkingDirectory"/> when
+    /// that is a directory inside the worktree once every link is resolved (owner-side); null when it is not (the step is not run).
+    /// </summary>
+    internal static string? StepDirectory(string worktree, TestStep step)
+    {
+        if (step.WorkingDirectory is null or "." || Prepare.PrepareRecipe.RelativeDirectory(step.WorkingDirectory) is not { } relative)
+        {
+            return step.WorkingDirectory is null or "." ? worktree : null;
+        }
+        var full = Path.Combine(worktree, relative);
+        if (!Directory.Exists(full))
+        {
+            return null;
+        }
+        var (root, real) = (RealPath(worktree), RealPath(full));
+        return real.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal) ? full : null;
+    }
+
+    /// <summary>
     /// A step's command line for the run's log: an argument longer than 200 characters (the iOS simulator steps' script,
     /// sc-26132) is shown as its length, so the log's tail is the steps' output, not a script repeated.
     /// </summary>
     internal static string Describe(TestStep step) =>
-        string.Join(' ', step.Args.Select(a => a.Length > 200 ? $"<{a.Length} characters>" : a).Prepend(step.Program));
+        (step.Label is { } label ? $"[{label}{(step.WorkingDirectory is null or "." ? "" : $" in {step.WorkingDirectory}")}] " : "")
+        + string.Join(' ', step.Args.Select(a => a.Length > 200 ? $"<{a.Length} characters>" : a).Prepend(step.Program));
 
     /// <summary>The variables an unsandboxed run keeps from the owner's environment (no secrets: never the router key or a token).</summary>
     private static readonly string[] PassThrough = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "DOTNET_ROOT"];

@@ -89,8 +89,16 @@ public sealed partial class RunPipeline(
     IReadOnlyList<RepoRef>? configuredRepos = null,
     Worker.WorkerSlots? slots = null,
     Func<CancellationToken, Task>? enterSandbox = null,
-    bool swift = false)
+    bool swift = false,
+    Prepare.WorkerPrepare? workerPrepare = null)
 {
+    /// <summary>
+    /// <c>Worker:Prepare</c> (sc-26232), or null when it is off: before each implementing session of a worktree with a prepare recipe
+    /// its artifacts are fetched owner-side and the session gets a request spool for <c>factory-prepare</c>, named in its prompt
+    /// (<see cref="RunSessionAsync"/>). Off, sessions are exactly as before (E7).
+    /// </summary>
+    private readonly Prepare.WorkerPrepare? _workerPrepare = workerPrepare;
+
     /// <summary>
     /// The worker slots (sc-25989, E6/E7; null unsandboxed: workers then run as the owner and share no user): one sandbox user
     /// each, with its own lock (sc-25988). A run holds a slot only for its worker phases (<see cref="InWorkerPhaseAsync"/>) — a
@@ -517,6 +525,12 @@ public sealed partial class RunPipeline(
         /// reused when the review is resumed (crash, Ctrl-C, a pause) instead of waiting again; any other outcome is retried.
         /// </summary>
         public const string CodeGraphOverlay = "codegraph-overlay";
+        /// <summary>
+        /// One harness download of a prepare recipe's artifact (sc-26232): Detail <c>fetched &lt;name&gt; &lt;url&gt; sha256=&lt;hex&gt;
+        /// bytes=&lt;n&gt;</c> (outcome passed), or <c>failed: …</c> for a worker session's prefetch that could not fetch one (outcome
+        /// failed; the session still starts — its <c>factory-prepare</c> asks again). A cache hit writes none.
+        /// </summary>
+        public const string ArtifactFetch = "artifact-fetch";
         /// <summary>Review: a reviewer's verdict on one head commit; Detail is the <see cref="Gate.ReviewVerdict"/> JSON.</summary>
         public const string Verdict = "verdict";
         /// <summary>
@@ -1570,10 +1584,59 @@ public sealed partial class RunPipeline(
         string? session, Func<string?, string> prompt, HashSet<string> models, IReadOnlyList<string> inputTaints, string label, string modelClass,
         CancellationToken ct)
     {
+        // Worker:Prepare (sc-26232): an implementing session of a worktree with a prepare recipe gets its artifacts fetched first
+        // (owner-side, so most sessions never ask) and a request spool its factory-prepare asks through while it runs.
+        if (!implementing || _workerPrepare is not { } prepare || Prepare.WorkerPrepare.ReadRecipe(path) is (null, null))
+        {
+            return await RunSessionCoreAsync(run, runner, path, mcpConfig, implementing, session, prompt, models, inputTaints, label, modelClass, ct);
+        }
+        var item = run.Item;
+        if (await prepare.PrefetchAsync(path, async (download, c) =>
+            {
+                await ledger.CheckpointAsync(item, Steps.ArtifactFetch, session, download.ToDetail(), c);
+                log.WriteLine($"[{label}] {download.ToDetail()}");
+            }, ct) is { } failed)
+        {
+            await ledger.CheckpointAsync(item, Steps.ArtifactFetch, session, $"failed: {failed}", ct);
+            log.WriteLine($"[{label}] the prepare recipe's artifacts could not be fetched before the session (it can ask again): {failed}");
+        }
+        // The spool's downloads happen while the session streams (and writes the ledger): they are recorded once it has ended.
+        var downloads = new System.Collections.Concurrent.ConcurrentQueue<Prepare.ArtifactDownloaded>();
+        var spool = await prepare.OpenAsync(path, _slots?.Current, (download, _) =>
+        {
+            downloads.Enqueue(download);
+            return Task.CompletedTask;
+        }, ct);
+        try
+        {
+            return await RunSessionCoreAsync(run, runner, path, mcpConfig, implementing, session, resume => prompt(resume) + Prepare.WorkerPrepare.Note(spool.Directory),
+                models, inputTaints, label, modelClass, ct);
+        }
+        finally
+        {
+            await spool.DisposeAsync();
+            while (downloads.TryDequeue(out var download))
+            {
+                try
+                {
+                    await ledger.CheckpointAsync(item, Steps.ArtifactFetch, null, download.ToDetail(), CancellationToken.None);
+                }
+                catch (Exception ex) when (ex is not OutOfMemoryException)
+                {
+                    log.WriteLine($"[{label}] could not record {download.ToDetail()}: {ex.Message}");
+                }
+            }
+        }
+    }
+
+    private async Task<(string? Session, WorkerResult Result)> RunSessionCoreAsync(Run run, IWorker runner, string path, string? mcpConfig, bool implementing,
+        string? session, Func<string?, string> prompt, HashSet<string> models, IReadOnlyList<string> inputTaints, string label, string modelClass,
+        CancellationToken ct)
+    {
         var item = run.Item;
         var resume = session;
         // The target repo's own Claude settings may feed the session content its stream would not show (hooks, MCP, extra allow rules).
-        var taints = implementing ? inputTaints.Append(Taint.OfRepoSettings(path, ClaudeWorker.AllowedToolsFor(swift))).OfType<string>().ToList() : inputTaints;
+        var taints = implementing ? inputTaints.Append(Taint.OfRepoSettings(path, ClaudeWorker.AllowedToolsFor(swift, _workerPrepare is not null))).OfType<string>().ToList() : inputTaints;
         // Every worker this runs exists to push its work: a tainted session would only be refused its push token after spending
         // the model's time, so it is not resumed at all (E4). Its stored stream is replayed first: a run stopped between storing
         // a web tool's line and committing its taint left the use only there.
@@ -1742,7 +1805,7 @@ public sealed partial class RunPipeline(
                 $"Worker failed (exit {result.ExitCode}, result {result.ResultSubtype ?? "none"}): {result.ResultText} {result.StderrTail}".Trim());
         }
         // The worker can write the repo's settings itself (a hook it added may have run in-session): checked again before it is done.
-        if (implementing && session is not null && Taint.OfRepoSettings(path, ClaudeWorker.AllowedToolsFor(swift)) is { } changed)
+        if (implementing && session is not null && Taint.OfRepoSettings(path, ClaudeWorker.AllowedToolsFor(swift, _workerPrepare is not null)) is { } changed)
         {
             await ledger.TaintSessionAsync(item, session, changed, ct);
         }
