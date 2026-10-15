@@ -1622,7 +1622,7 @@ public class LiveWorkerSandboxTests
     /// <summary>
     /// AT6 (docs/acceptance.md): the installed helper, launched exactly as <see cref="ClaudeWorker"/> launches a sandboxed
     /// worker (<see cref="WorkerSandbox.Start"/> with <see cref="ClaudeWorker.BuildRouterVariables"/> for the configured
-    /// router URL and <c>Worker:Auth</c>), gives the worker exactly the allowlisted environment, and nothing of the owner's.
+    /// router URL), gives the worker exactly the allowlisted environment, and nothing of the owner's.
     /// The router key is a probe value: the real key never needs to appear in test output. Every configured slot is probed, and
     /// each slot's TMPDIR and HOME must be its own user's: a directory that user owns, the owner's and every other slot's apart
     /// (sc-25992: in a shared temporary directory one sandbox user's NuGet locks refused another's restore).

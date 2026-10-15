@@ -419,7 +419,7 @@ public sealed class ClaudeWorker(
     }
 
     /// <summary>Unsandboxed environment: OS basics from the parent plus the router variables.</summary>
-    public static Dictionary<string, string> BuildEnvironment(IDictionary parent, Uri routerBaseUrl, string routerKey,         string modelClass)
+    public static Dictionary<string, string> BuildEnvironment(IDictionary parent, Uri routerBaseUrl, string routerKey, string modelClass)
     {
         var env = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var name in PassThroughVariables)

@@ -38,7 +38,7 @@ public sealed record SubscriptionUsage(
     /// Plans enrolled on the router for this key (<c>simple-router login claude|codex</c>: source <c>managed</c>, or
     /// <c>shared</c> by another member) and not disabled. Credentials presented or observed from a client's own login
     /// do not count: in <c>router-key</c> mode the worker presents none. Nor does a plan the router reports not
-    /// <c>routable</c> (e.g. <c>reconnect_required</c>): the router cannot route onto it until a human reconnects it.
+    /// <c>routable</c> (<c>auth_rejected</c>, simple-router's only unroutable state): the router cannot route onto it until a human logs in again.
     /// </summary>
     public int EnrolledCredentials =>
         Enrolled.Count(c => c.Enabled != false && c.Routable);

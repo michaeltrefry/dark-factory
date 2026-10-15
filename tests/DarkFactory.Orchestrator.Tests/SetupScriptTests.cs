@@ -568,6 +568,14 @@ public class SetupScriptTests
         }
     }
 
+    /// <summary>sc-26197: Worker:Auth=claude-login is retired; the setup script names it nowhere.</summary>
+    [Fact]
+    public void The_setup_script_names_no_claude_login_mode()
+    {
+        var script = File.ReadAllText(Path.Combine(SandboxSupport.RepoRoot, "scripts", "setup-worker-user.sh"));
+        Assert.DoesNotContain("claude-login", script, StringComparison.OrdinalIgnoreCase);
+    }
+
     private Task<(int ExitCode, string Stdout, string Stderr)> CheckToolchainAsync(params string[] tools) => RunCheckAsync("check_toolchain ", tools);
 
     private Task<(int ExitCode, string Stdout, string Stderr)> RunCheckAsync(string call, params string[] tools)

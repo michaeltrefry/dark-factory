@@ -2170,7 +2170,14 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `model_class_unavailable:`, with `Retry-After`; it never falls back to another class) is `WorkerResult.ModelClassUnavailable`: it
   pauses the factory for usage like the rate-limit backstop (reason `worker-model-class-unavailable`, backoff, Paused `usage-paused`,
   auto-resumed, same session) and never escalates; the same text in a non-error result is model prose and the failure escalates as
-  usual. The router (simple-router): it fails over inside the tier on limits, plan refusals and overloads, so a worker sees that 429
+  usual. What the worker's Claude Code does with that 429 (measured on 2.1.291 against a stub with simple-router's exact body,
+  `RealClaudeTierEmptyTests`, which runs the real `claude` where one is on PATH, skipped otherwise): it retries a 429 only while
+  `Retry-After` is 60 s or less — up to `CLAUDE_CODE_MAX_RETRIES` (default 10) times, each wait the larger of `Retry-After` and
+  its own backoff (`Retry-After: 5`: 11 requests, exit after about 200 s; `60`: one a minute, about 10 min in all) — and above 60 s
+  (61, 90, 120 … 3600 measured) it sends one request and gives up at once. Either way the session ends with an error result
+  (`is_error`, `terminal_reason: api_error`) `API Error: Request rejected (429) · model_class_unavailable: …`, so the pause holds
+  and nothing escalates; the worst case, a reset 60 s away for the whole retry run, costs about 10 min, under `Worker:TimeoutMinutes`
+  (30). The router (simple-router): it fails over inside the tier on limits, plan refusals and overloads, so a worker sees that 429
   only once the whole tier is spent. Per the owner, a tier's models are Fable/Astra (`max`), Opus/Sol (`high`), Mimo/Terra/Sonnet
   (`mid`) and Qwen 3.8/Luna/Haiku (`low`); `mid` and `low` may be served by local models (Mimo, Qwen, …), whose sessions cost $0
   (a valid recorded cost). Served model names are recorded only (`implementer-model`, a review's `served`), never checked: only the
@@ -2479,11 +2486,11 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   2026-10-09, epic E8, sc-25626; `ReviewModels`, `Router/ModelClass.cs`): no model id is pinned in code or config, the router
   picks the model inside the class, and any model may review or confirm — including the one that wrote the code, or the
   one that served the review a second opinion checks (there is no family, version or independence rule). Each role makes one
-  router call (`RouterReviewer`: `POST /v1/messages` with `"stream": true` — the router cancels a call that has sent its
-  client nothing for 10 s — assembled by `MessageStream`, which fails closed on an `error` event (a transient `server_error`/`api_error` one after the turn is retried, below), a stream without
+  router call (`RouterReviewer`: `POST /v1/messages` with `"stream": true` — simple-router itself has no client-side idle cut-off; only its Codex and local
+  upstreams end an upstream stream silent for their `StreamIdleTimeout` (300 s, 120 s) — assembled by `MessageStream`, which fails closed on an `error` event (a transient `server_error`/`api_error` one after the turn is retried, below), a stream without
   `message_stop` or one silent for 2 min (`RouterReviewer.DefaultIdleTimeout`; the router is expected to send Anthropic `ping`
-  events during a long upstream silence — simple-router, owner-side fix: it emits them on its translated streams — so a
-  live turn never looks idle); router key only, `x-weave-model-class: high` and never `x-weave-force-model` (which
+  events during a long upstream silence, so a live turn never looks idle — this depends on simple-router sc-26203 (keep-alive
+  pings on its translated streams), not on its main yet; until it ships, an upstream silent for 2 min fails the turn closed); router key only, `x-weave-model-class: high` and never `x-weave-force-model` (which
   simple-router ignores), body `model` the fixed placeholder `ModelClass.RequestModel` (`default`: simple-router takes the tier
   from the class header and reads the body model only when no header is sent, so the in-class pick serves the call), its own fresh
   `X-Claude-Code-Session-Id` so the cost stays scoped to it and no worker session or transcript reaches it) whose system

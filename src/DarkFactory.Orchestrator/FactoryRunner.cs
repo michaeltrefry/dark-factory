@@ -133,7 +133,7 @@ public static class FactoryRunner
         return unroutable.Count > 0
             ? $"Worker:Auth=router-key, but every enrolled plan the router at {options.RouterBaseUrl} lists for this router key is "
                 + $"not routable ({string.Join(", ", unroutable.Select(c => $"{c.Provider} {c.State ?? "unknown state"}"))}), so every "
-                + "worker model call would fail. Reconnect the plan on the router (`simple-router login claude` for a Claude plan, "
+                + "worker model call would fail. Log in again on the router (`simple-router login claude` for a Claude plan, "
                 + "`simple-router login codex` for a Codex plan: in the simple-router repository, "
                 + "`dotnet run --project src/SimpleRouter -- login claude|codex`), then start again."
             : $"Worker:Auth=router-key, but the router at {options.RouterBaseUrl} lists no enrolled, enabled plan for this router key "

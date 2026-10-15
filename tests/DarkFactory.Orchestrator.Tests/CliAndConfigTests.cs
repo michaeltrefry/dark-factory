@@ -388,9 +388,13 @@ public class FactoryOptionsTests
     [Fact]
     public void No_claude_login_code_path_is_left_in_the_orchestrator()
     {
-        // sc-26197: the mode is gone, not merely refused: only its refusal in FactoryOptions may name it.
+        // sc-26197: the mode is gone, not merely refused: only its refusal in FactoryOptions may name it. The orchestrator's
+        // C# and Razor sources are scanned, and each script through the one way a test may read it (SafeHelperTests): the
+        // launch helper through SafeHelper, the simulator script as the gate compiles it in, the xcodebuild wrapper by its own
+        // path; setup-worker-user.sh in SetupScriptTests.
         var src = Path.Combine(RepoRoot(), "src", "DarkFactory.Orchestrator");
         var offenders = Directory.EnumerateFiles(src, "*.cs", SearchOption.AllDirectories)
+            .Concat(Directory.EnumerateFiles(src, "*.razor", SearchOption.AllDirectories))
             .Where(f => !f.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}")
                 && !f.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}"))
             .Where(f => File.ReadAllText(f) is var text
@@ -399,6 +403,12 @@ public class FactoryOptionsTests
             .Select(Path.GetFileName)
             .ToList();
         Assert.Empty(offenders);
+
+        Assert.DoesNotContain("claude-login", XcodeNewTests.SimulatorScript, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("claude-login", File.ReadAllText(Path.Combine(RepoRoot(), "scripts", "factory-xcodebuild")),
+            StringComparison.OrdinalIgnoreCase);
+        Assert.All(new[] { "claude-login", "Claude-login", "CLAUDE-LOGIN", "claude_login", "CLAUDE_LOGIN" },
+            spelling => Assert.False(SafeHelper.SourceContains(spelling), spelling));
     }
 
     private static string RepoRoot()
@@ -982,15 +992,15 @@ public class RouterEnrollmentCheckTests
     }
 
     [Fact]
-    public async Task An_enabled_plan_the_router_cannot_route_onto_is_not_counted_and_fails_naming_the_reconnect()
+    public async Task An_enabled_plan_the_router_cannot_route_onto_is_not_counted_and_fails_naming_the_login_again()
     {
-        const string credential = """{"provider":"claude","source":"managed","credential_key":"a","routable":false,"enabled":true,"state":"reconnect_required"}""";
+        const string credential = """{"provider":"claude","source":"managed","credential_key":"a","routable":false,"enabled":true,"state":"auth_rejected"}""";
 
         var error = await CheckAsync(Options("router-key"), Router(credential));
 
         Assert.NotNull(error);
-        Assert.Contains("not routable (claude reconnect_required)", error);
-        Assert.Contains("Reconnect the plan", error);
+        Assert.Contains("not routable (claude auth_rejected)", error);
+        Assert.Contains("Log in again on the router", error);
         Assert.Contains("simple-router login claude", error);
         Assert.Contains("simple-router login codex", error);
     }
