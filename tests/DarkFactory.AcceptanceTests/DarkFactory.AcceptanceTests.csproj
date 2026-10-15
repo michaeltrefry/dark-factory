@@ -18,6 +18,8 @@
     <None Include="../DarkFactory.Orchestrator.Tests/Fixtures/review/*.diff" Link="Fixtures/review/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <!-- The recorded transcripts the stub Claude Code CLI of the stuck tests replays (FreezeAndStuckTests), shared with StuckWorkerTests. -->
     <None Include="../DarkFactory.Orchestrator.Tests/Fixtures/stream-json-stuck-loop.jsonl;../DarkFactory.Orchestrator.Tests/Fixtures/stream-json-silence-progress.jsonl" Link="Fixtures/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <!-- The Phase 5 seeds (sc-26134): what the runbook puts on the target repositories once, and what SwiftLiveTests identify. -->
+    <None Include="Seeds/**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

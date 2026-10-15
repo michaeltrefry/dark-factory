@@ -1321,3 +1321,170 @@ reviewer models, with no served model class — is not escalated for it: the gat
 panel (high class) reviews that head once, then it merges as usual. This happens once per head: if the new verdict's calls
 still break the rule (e.g. the router answers without an `X-Weave-Model-Class: high` header), the gate escalates with the
 reason rather than reviewing again.
+
+# Phase 5 acceptance runbook (Swift, epic sc-26124; sc-26134)
+
+Phase 5 makes the factory work Swift: SwiftPM packages (Swift Testing and XCTest), macOS Xcode projects and iOS apps, whose
+unit and UI tests the gate's new-tests check runs on a fresh iOS Simulator as the sandbox user. The live tests are
+`SwiftAcceptanceTests` (P5-AT1–AT6) and `SwiftRealRunTests` (P5-AT7) in `tests/DarkFactory.AcceptanceTests`, with their helpers
+in `SwiftLive.cs`. Like every live test since Phase 1 each one **skips** — never fails — without `FACTORY_E2E=1`, a credential
+or one of its own variables, so `dotnet test` stays green and runs none of them; **skipped is not passed** (read the summary).
+Each of P5-AT1–AT6 runs `factory run` (the production wiring, `FactoryRunner.RunAsync`) on a To Do story against a **throwaway
+ledger** and its own work root (`E2e`), and takes every worker slot's lock of the configured work root for its whole run: stop
+`factory work` first, and run the tests **one at a time** (a second test that finds the locks taken skips).
+
+## Prerequisites (the owner, once)
+
+1. **The router**: simple-router at `http://127.0.0.1:8790` (the default `Router:BaseUrl`), its key in the keychain (account
+   `router-key`), Claude (and Codex) enrolled (`simple-router login claude`), its `max`/`high`/`mid`/`low` tiers servable.
+2. **The sandbox users with Swift**: `sudo scripts/setup-worker-user.sh --slots 2 --swift` (stop `factory work` and close every
+   `_factory*` session first: setup kills every process of each sandbox user), then in the shell that runs the tests
+   `export Worker__Swift=true Worker__Slots=2`. Every test checks `Worker:Swift` and skips without it: the Swift and Xcode
+   strategies run only in a factory with it on. Each slot's user needs Swift, xcodebuild with Xcode's first launch done and its
+   licence accepted, the macOS and iOS Simulator SDKs, an iOS Simulator runtime, and the installed `factory-xcodebuild`
+   (`CLAUDE.md`, "Swift toolchain", says which of these setup and start-up check).
+3. **For iOS (P5-AT3, P5-AT4, P5-AT7's iOS change): the owner logged in at the console** (an Aqua session), and the tests (or
+   `factory work`) started from that GUI login — Terminal, not ssh. The simulator works as the sandbox user only inside the
+   owner's Aqua session (`CLAUDE.md`, the S0 residual); from ssh the gate's `prepare` step refuses, as the factory's failure, not
+   the item's.
+4. **Both GitHub Apps** (the workers' and the gate's) installed on every repository below, `factory github-repo protect
+   <owner/name>` run for each (the gate App as the `pull_request`-mode bypass), and each repository named in `Factory__Repos`
+   (e.g. `export Factory__Repos=michaeltrefry/LensWorks`) so the factory may plan and work in it and the freeze's main-red
+   watches it.
+5. **LensWorks** (`michaeltrefry/LensWorks`, default branch `main`; the macOS app `native/Compositor.xcodeproj`, scheme
+   `Compositor`, Swift Testing unit target `CompositorTests`): merge the setup pull request from LensWorks branch
+   `claude/dark-factory-setup` — a **version 4** `factory/gate.yaml` (with `max_changeset_lines`/`max_changeset_files`),
+   `CODEOWNERS` covering the sealed paths, and a CI workflow that runs the unit tests on pull requests (its `pull_request`
+   trigger must also match `factory/**` bases if LensWorks plans are run: "CI that cannot run" in `CLAUDE.md`). The tests read
+   the policy from `main` through the gate App and skip naming the step when it is missing.
+6. **CodeGraph**: the token (`FACTORY_CODEGRAPH_TOKEN` or keychain `codegraph-token`), and every target repository (the sandbox,
+   LensWorks, the iOS repository) indexed. **Until CodeGraph C3 (sc-26137) is deployed and indexes Swift, the gate blocks every
+   Swift change on `risk-threshold`** (`CodeGraph does not index the language of a changed code file …`; the gate row's inputs say
+   `language not indexed by CodeGraph`; sc-26133: fail closed). So **P5-AT1–AT4 and P5-AT5's second part can only pass after
+   C3**: each asks CodeGraph first (`file_hotspot`'s `languageIndexed` for a Swift file of its repository,
+   `SwiftLive.LanguageIndexedAsync`; no flag at all means a CodeGraph before C3) and SKIPS saying so while Swift is not indexed.
+   P5-AT5's first part is the opposite and skips once Swift is indexed. P5-AT6 does not depend on it (the gate rejects the test
+   before it asks CodeGraph).
+7. **The seeds** (once, by an owner's pull request to each repository's `main`): the tests seed only a test, and the production
+   change it needs, into a target that already exists on the base — a test target the base lacks cannot be run there (the check
+   would be `unsupported`; `SwiftLiveTests.Without_the_package_on_the_base_the_merging_change_could_not_be_run_there`). Copy:
+   - `tests/DarkFactory.AcceptanceTests/Seeds/swift-package/` to **`e2e-swift/`** of the sandbox
+     (`michaeltrefry/dark-factory-sandbox`): the SwiftPM package `DfE2eSwift`, test target `DfE2eSwiftTests` (XCTest), for
+     P5-AT2, AT5 and AT6;
+   - `tests/DarkFactory.AcceptanceTests/Seeds/ios-app/` to **`e2e-ios/`** of the iOS repository, for P5-AT3 and AT4: the iOS
+     app `Tally` (`SDKROOT = iphoneos`, synchronized folders; the unit tests' fixture app, `Fixtures/xcode-ios`), its hosted
+     unit-test target `TallyTests`, its UI-test target `TallyUITests`, a shared scheme, and `Tally/E2eRun.swift` — the run
+     counter (`static let count = 0`) the app shows as the `e2e-runs` label.
+
+   The iOS repository is `FACTORY_E2E_P5_IOS_REPO` (`owner/name`), **default: the sandbox**: the owner has no iOS app on GitHub
+   today (no SceneWorks iOS app exists), so the throwaway `Tally` app in the sandbox stands in; `FACTORY_E2E_P5_IOS_DIR` moves
+   the seed (default `e2e-ios`). Every seeded file says `[dark-factory e2e]`; the sandbox's own .NET CI and build read none of
+   them. A test whose seed is missing on `main` skips naming this step.
+
+## P5-AT1 to P5-AT6
+
+Every `*_STORY` is a **fresh To Do story**, one per test. For the sandbox ones: a bug story whose fix lands in **normal** code of
+the sandbox (the P2-AT1 kind), with every new xUnit test it asks for failing on main — the merging tests need the story's own
+tests to pass the check too, and a rejection names only the first failing strategy (the P4-AT4 lesson). The seeded tests push
+their Swift files to the item's `factory/sc-<id>` branch as the workers' App before the first review, and the review panel is the
+seeded stand-in `SeededReviewer`, so the gate's own rule decides; P5-AT1 is a real implementer and the real panel.
+
+```sh
+export FACTORY_E2E=1 Worker__Swift=true Worker__Slots=2 Factory__Repos=michaeltrefry/LensWorks
+FACTORY_E2E_P5_LENSWORKS_STORY=sc-<id> dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P5_AT1_*"
+FACTORY_E2E_P5_SWIFTPM_STORY=sc-<id> dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P5_AT2_*"
+FACTORY_E2E_P5_IOS_UNIT_STORY=sc-<id> dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P5_AT3_*"
+FACTORY_E2E_P5_IOS_UI_STORY=sc-<id> dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P5_AT4_*"
+FACTORY_E2E_P5_UNINDEXED_STORY=sc-<id> dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P5_AT5_the_gate_refuses_*"
+FACTORY_E2E_P5_INDEXED_STORY=sc-<id> dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P5_AT5_the_gate_accepts_*"
+FACTORY_E2E_P5_SWIFT_PASSING_STORY=sc-<id> dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P5_AT6_*"
+```
+
+(Add `FACTORY_E2E_P5_IOS_REPO=<owner/name>` and `FACTORY_E2E_P5_IOS_DIR=<dir>` to AT3/AT4 for another iOS repository; its story
+then needs a `Repo:` line naming it.)
+
+| AT | Test (`SwiftAcceptanceTests.`) | Variables | Setup it does | Expected |
+| --- | --- | --- | --- | --- |
+| P5-AT1 | `P5_AT1_a_lensworks_change_with_a_new_swift_testing_test_merges_with_no_human` | `FACTORY_E2E_P5_LENSWORKS_STORY`: a To Do story with a `Repo: michaeltrefry/LensWorks` line asking for a small change to the Compositor app and a new Swift Testing (`@Test`) test of it in `CompositorTests` that fails without the change | none: a real implementer, the real high-class panel, LensWorks' CI | the item's ledger repo is LensWorks; a typed outcome on every row; the last `new-tests` row `pass`, its strategies holding `xcode-swift-testing`, with a `CompositorTests/…` test not passing on the base and `passed` on the head; the last `gate` row a `Merge` decision (`passed`) listing `new-tests-fail-on-base` and naming no unindexed file; `gate-passed` = the head the check judged; MergeGate → Merge → Watch; the last verdict passed, on the high class, for that head; the PR merged at that head, its merge commit the Merge row's; `CompositorTests`, read from the merge commit's project, a macOS unit-test bundle; the story Done |
+| P5-AT2 | `P5_AT2_a_swiftpm_change_with_a_new_xctest_test_merges` | `FACTORY_E2E_P5_SWIFTPM_STORY` | pushes `e2e-swift/Sources/DfE2eSwift/P<run>.swift` (a new function) and `e2e-swift/Tests/DfE2eSwiftTests/P<run>Tests.swift` (an XCTest test calling it) | AT1's ledger checks with strategy `swift-testing`; `DfE2eSwiftTests.P<run>Tests/testDoubles` `not-built` on the base (it calls code the PR adds) and `passed` on the head; merged; **the sandbox's main then holds both files** (one pair per run, safe to delete) |
+| P5-AT3 | `P5_AT3_an_ios_app_change_with_a_new_unit_test_run_in_the_simulator_merges` | `FACTORY_E2E_P5_IOS_UNIT_STORY`; optional `FACTORY_E2E_P5_IOS_REPO`, `FACTORY_E2E_P5_IOS_DIR` | raises `e2e-ios/Tally/E2eRun.swift`'s count to main's + 1 and pushes `e2e-ios/TallyTests/E2eUnit<run>Tests.swift` (XCTest: `E2eRun.count >= <count>`) | strategy `xcode-swift-testing`; `TallyTests/E2eUnit<run>Tests/testRunCountReached()` `failed` on the base and `passed` on the head, each on the run's own fresh iOS Simulator as the sandbox user; merged; its target, read at the merge commit, an **iOS** unit-test bundle; **main's run count goes up by one** |
+| P5-AT4 | `P5_AT4_an_ios_ui_test_runs_in_the_simulator_and_merges` | `FACTORY_E2E_P5_IOS_UI_STORY` (+ the same optional two) | raises the count likewise and pushes `e2e-ios/TallyUITests/E2eUi<run>UITests.swift` (XCUITest: launch the app, read the `e2e-runs` label, `>= <count>`) | `TallyUITests/E2eUi<run>UITests/testRunCountShown()` `failed` on the base and `passed` on the head (the S0 way: everything that needs the simulator booted in one helper run, a fresh device per run, deleted after); merged; its target an **iOS UI-test** bundle |
+| P5-AT5 (a) | `P5_AT5_the_gate_refuses_a_swift_change_while_codegraph_does_not_index_swift` | `FACTORY_E2E_P5_UNINDEXED_STORY`; skips once CodeGraph indexes Swift | AT2's change | the `new-tests` row `pass` (nothing else blocks it); the last `gate` row `Blocked …CodeGraph does not index the language of a changed code file…` (`gate_rejected`), its inputs `language not indexed by CodeGraph: e2e-swift/Sources/DfE2eSwift/P<run>.swift (Swift…`; MergeGate → Escalated; nothing merged; the PR closed and its branch deleted at the end |
+| P5-AT5 (b) | `P5_AT5_the_gate_accepts_the_swift_change_once_codegraph_indexes_swift` | `FACTORY_E2E_P5_INDEXED_STORY`; skips until CodeGraph (C3) answers `languageIndexed: true` for Swift | AT2's change | merged as AT2; the `gate` row's inputs list the Swift source file's blast radius (`codegraph blast radius at …`) and no `language not indexed` |
+| P5-AT6 | `P5_AT6_a_new_swift_test_that_already_passes_on_the_base_is_gate_rejected` | `FACTORY_E2E_P5_SWIFT_PASSING_STORY` | pushes `e2e-swift/Tests/DfE2eSwiftTests/E2eAlreadyPassing.swift` (Swift Testing, `#expect(1 + 1 == 2)`) | the last `new-tests` row `rejected` (`gate_rejected`), strategy `swift-testing`, `DfE2eSwiftTests.e2eAlreadyPassesOnTheBase()` `passed` on both and named in the reason; the last `gate` row `Blocked …new-tests-fail-on-base (rejected)…`; MergeGate → Escalated; nothing merged; the PR closed and its branch deleted |
+
+**By hand after the runs:** the non-merging tests leave their story In Progress with an escalation comment (move it back or
+archive it); delete a `factory/sc-<id>` branch a crashed run left. The merged files stay on the target's `main` (the sandbox's
+`e2e-swift/Sources/DfE2eSwift/P*.swift` and `e2e-swift/Tests/DfE2eSwiftTests/P*Tests.swift`, the iOS repository's
+`e2e-ios/TallyTests/E2eUnit*`, `e2e-ios/TallyUITests/E2eUi*` and its raised run count); they are inert, keep passing, and may be
+deleted whenever — each run makes new ones, which is what keeps its test new on every base.
+
+Not live, in every `dotnet test` (`SwiftLiveTests`): each seed identified by the real strategy (`SwiftNewTests`, `XcodeNewTests`)
+exactly as the live test looks it up, nothing unisolable, and each strategy leaving the other's files alone; the iOS test targets
+read as iOS unit-/UI-test bundles; the run counter read and raised; `SwiftLive.MergedProblems` (the merged ledger's checks)
+naming each missing part; the gate's own words for an unindexed language.
+
+## P5-AT7 — a real LensWorks epic and a real iOS change through the factory
+
+A runbook step, then a read-only check of the real ledger.
+
+1. Prerequisites as above (C3 deployed and Swift indexed: before it every Swift change escalates at the gate), with the
+   factory's real ledger and settings: `Worker__Swift=true`, `Worker__Slots=2`, `Intake__MaxConcurrentRuns=2` if the stories may
+   run side by side, `Factory__Repos` naming LensWorks and the iOS repository.
+2. One real LensWorks epic: its stories To Do with a `Repo: michaeltrefry/LensWorks` line, each a real change with a new Swift
+   Testing test in `CompositorTests` (or a `plan`-labelled story the factory plans into such stories). One real iOS change: a To
+   Do story whose `Repo:` line names the iOS repository and asks for a change with a new unit or UI test in an iOS target. Watch
+   them: on Shortcut `Shortcut__Watch__Epics=<the epic>,<the iOS story's epic>`; on KanbanBoard `Kanban__Watch__Projects=<key>`
+   with the items Ready.
+3. From the owner's GUI login (Aqua): `dotnet run --project src/DarkFactory.Orchestrator -- work`, and follow the dashboard until
+   every item is in Watch or Done (an escalation is a finding: fix it and `factory run <id>` again).
+4. Check the ledger, read only (no write, no lock, no model):
+
+   ```sh
+   FACTORY_E2E=1 FACTORY_E2E_P5_IOS_REPO=<owner/name> FACTORY_E2E_P5_AT7_ITEMS=sc-<id>,sc-<id>,… \
+     dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P5_AT7_*"
+   ```
+
+   `SwiftRealRunTests.P5_AT7_a_real_lensworks_epic_and_a_real_ios_change_went_through_the_factory` reads each listed item
+   (`sc-N` or `kb-N`, as the ledger names it) from the configured ledger (`ConnectionStrings:Ledger`): every row's typed outcome;
+   a plan item (it has `plan-stories`) Done; every other item merged as P5-AT1's checks say (MergeGate → Merge → Watch/Done,
+   `new-tests` `pass` naming `swift-testing` or `xcode-swift-testing` with a new test failing on the base and passing on the head,
+   a `Merge` gate decision naming no unindexed file, `gate-passed` the judged head) and its pull request merged on GitHub at the
+   Merge row's commit; and, among them, at least one LensWorks item and one item of `FACTORY_E2E_P5_IOS_REPO` whose new test's
+   target, read at the merge commit, runs on an iOS Simulator. List every item of the epic and the iOS change.
+
+## Phase 5 — earlier stacks unchanged, and the rest of the evidence
+
+**One .NET and one Rust live test re-run** with `Worker__Swift=true` and `Worker__Slots=2` (E7: a Swift-enabled factory judges
+.NET and Rust exactly as before; the Swift strategies leave their files alone):
+
+| Stack | Test | Section |
+| --- | --- | --- |
+| .NET | `ReviewGateTests.Gate_merges_a_green_pr_a_high_class_panel_passed_and_the_ledger_records_the_merge_commit` (`FACTORY_E2E_GATE_STORY`) | P2-AT1 |
+| Rust | `GateNegativeTests.P4_AT4_a_rust_test_that_fails_on_the_base_and_passes_on_the_head_merges` (`FACTORY_E2E_P4_CARGO_MERGE_STORY`) | P4-AT4 |
+
+```sh
+export FACTORY_E2E=1 Worker__Swift=true Worker__Slots=2
+FACTORY_E2E_GATE_STORY=sc-<id> dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*Gate_merges_a_green_pr_a_high_class_panel_passed*"
+FACTORY_E2E_P4_CARGO_MERGE_STORY=sc-<id> dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*P4_AT4_a_rust_test_that_fails_on_the_base*"
+```
+
+Pass: both pass as in their own sections (not skipped). Not with `FACTORY_E2E_P4B_DEFAULTS=1`: that guard requires one slot.
+
+**Unit, CI, lint and gate-coverage evidence** (no live service):
+
+- `dotnet build` (the gateway lint, sc-25390, runs on the orchestrator and on this acceptance project) and `dotnet test` from the
+  repository root green, with the ledger Postgres at `localhost:5434` (`docker compose up -d`): the Swift and Xcode strategies'
+  tests (`SwiftNewTestsTests`, `SwiftXCTestTests`, `SwiftBaseBuildTests`, `XcodeNewTestsTests`, `XcodeIosTests`,
+  `XcodeIosRunnerTests`, `XcodebuildWrapperTests`, `IosSimulatorScriptTests`, `SwiftToolchainTests`), the risk rule
+  (`CodeGraphRiskTests`: an unindexed language fails closed), `SetupScriptTests` (`--swift`) and `SwiftLiveTests` above. Those
+  that need Xcode run on the owner's Mac; CI's Linux runner skips them.
+- CI (`.github/workflows/ci.yml`, job `build-test`) green on the integration branch's head: build (gateway lint), migrations,
+  `dotnet test`.
+- `GatewayLintTests` (the lint's seeded violations and the clean tree) and `GateCheckCoverageTests` (every gate check has a
+  running test that fails with the check disabled) pass in that run.
+- The sandbox probes with Swift, as the owner from the GUI login with no factory running (they kill every process of each
+  sandbox user): `FACTORY_SANDBOX_LIVE=1 Worker__Swift=true Worker__Slots=2 dotnet test --project
+  tests/DarkFactory.Orchestrator.Tests -- --filter-class "*LiveWorkerSandboxTests"`, among them
+  `The_ios_gate_runs_a_new_unit_test_and_ui_test_on_a_simulator_as_each_sandbox_user` (the iOS gate on a fresh simulator in
+  each slot, nothing of the user left after).

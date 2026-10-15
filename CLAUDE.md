@@ -222,6 +222,13 @@ it replaced the Weave router fork at `localhost:8080`, sc-26197).
   unset (a keychain write token is hidden from the run's options) and `Worker:Slots` and `Intake:MaxConcurrentRuns` are 1
   (`E2e.DefaultsProblems`; `DefaultsGuardTests`, not live). Every live test SKIPS when its opt-in, a credential or a variable is
   missing (the convention since Phase 1, kept): skipped is not passed.
+  Phase 5's P5-AT1–AT7 (sc-26134, docs/acceptance.md "Phase 5"; `SwiftAcceptanceTests`, `SwiftRealRunTests`, helpers
+  `SwiftLive.cs`, the non-live `SwiftLiveTests`): a LensWorks change with a new Swift Testing test merged by a real
+  implementer and panel; seeded SwiftPM (XCTest) and iOS (unit and UI test on a simulator) changes merged; the gate refusing
+  a Swift change while CodeGraph does not index Swift, then accepting it; a Swift test already passing on the base rejected;
+  and a read-only check of the real ledger after a real LensWorks epic and iOS change. Each needs `Worker:Swift=true` and its
+  `FACTORY_E2E_P5_*` variable; the merging ones skip until CodeGraph indexes Swift (C3, sc-26137). The seeds the target
+  repositories hold once are `tests/DarkFactory.AcceptanceTests/Seeds/` (a SwiftPM package, an iOS app).
   P4b-AT2 (sc-25984, `KanbanPlanAcceptanceTests`, `FACTORY_E2E_P4B_PLAN_KANBAN_ITEM` + `FACTORY_E2E_P4B_KANBAN_PROJECT`): a real
   planner plans a `plan`-labelled Kanban item into at least 3 items with a dependency chain (else INCONCLUSIVE,
   `PlanLive.ChainProblem`) — each one item of the real board, in the plan item's project and epic, in `Backlog`, marked as planned
