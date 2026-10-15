@@ -5,8 +5,8 @@ A dark software factory for AI development
 
 `factory run sc-<id>` reads one Shortcut story, records it in the ledger (Postgres),
 creates a git worktree of the target repo on `factory/sc-<id>`, runs Claude Code
-headless (`claude -p --output-format stream-json`) through the Weave router at
-`localhost:8080`, pushes the branch with a GitHub App installation token scoped to
+headless (`claude -p --output-format stream-json`) through the model router
+(simple-router, michaeltrefry/simple-router) at `127.0.0.1:8790`, pushes the branch with a GitHub App installation token scoped to
 that one repo, and opens a PR whose body links the story. The ledger records
 `Intake → Implement → Review` with timestamps and the Claude session id; the router's
 `GET /v1/sessions/<session-id>/cost` reports the run's cost.
@@ -134,8 +134,8 @@ separate `usage` control (reason, resume time) beside the user's `factory` one: 
 running workers stop at their next tool call as for Pause (item recorded Paused `usage-paused` with a
 `usage-pause` checkpoint), and at the resume time work starts again by itself. Unknown usage (router
 unreachable, or no credential known yet, e.g. after a router restart) never pauses. Backstop: a worker that
-fails with the router's exhaustion answer (429 "All enrolled subscription accounts are currently
-unavailable."), an API 429/529 or a plan usage limit pauses the factory with the same backoff instead of
+fails with the router's exhaustion answer (simple-router's 429 `rate_limit_error` whose message starts
+`model_class_unavailable:`), an API 429/529 or a plan usage limit pauses the factory with the same backoff instead of
 escalating; the item resumes its own session afterwards. (529/overloaded is treated as usage-limited on purpose:
 it never escalates an item.) A user's Continue does not lift the usage pause
 (and its end does not lift a user's pause); `factory continue --usage` (or the dashboard banner's Continue)
@@ -213,19 +213,19 @@ sudo scripts/setup-worker-user.sh
 
 # 5. Worker model auth. Default Worker__Auth=router-key: the worker holds no Anthropic/OpenAI credential,
 #    only the router key; the router serves it from your plans, enrolled on the local router
-#    (michaeltrefry/router at Router:BaseUrl) for the same router key:
-router login claude     # your Claude Pro/Max plan
-router login codex      # your ChatGPT/Codex plan
+#    (simple-router, michaeltrefry/simple-router, at Router:BaseUrl) for the same router key; in the
+#    simple-router repository (`simple-router login claude|codex`):
+dotnet run --project src/SimpleRouter -- login claude   # your Claude Pro/Max plan
+dotnet run --project src/SimpleRouter -- login codex    # your ChatGPT/Codex plan
 #    then delete any Claude login _factory still has (opt-in, standalone: runs none of the setup, no helper,
 #    no toolchain check; deletes only its credentials file and keychain item, as _factory; signals no process;
 #    with --slots <n>, for each of the n sandbox users):
 sudo scripts/setup-worker-user.sh --remove-worker-login
 #    `factory run` / `factory work` refuse to start until the router's GET /v1/subscriptions/usage lists
-#    an enabled, routable, enrolled (managed or shared) plan for the key. A plan in reconnect_required is
-#    not routable: reconnect it with `router login claude` (or `router login codex`).
-#    Fallback, weaker (violates E5: the worker then holds a Claude login): Worker__Auth=claude-login, and
-#    log the _factory user in once (never copy your own credentials):
-#      sudo -u _factory -H /Users/_factory/.local/bin/claude   # then /login, then /exit
+#    an enabled, routable, enrolled (managed or shared) plan for the key. A plan whose login was rejected
+#    (auth_rejected) is not routable: log in again with `simple-router login claude` (or `... codex`).
+#    Worker__Auth=claude-login was retired (sc-26197): simple-router serves every session from its own stored
+#    logins and never forwards a worker's, so `factory run` / `factory work` refuse to start with it (exit 2).
 
 # 6. Dashboard login password (prompted twice, no echo; `factory work` refuses to start without it)
 dotnet run --project src/DarkFactory.Orchestrator -- dashboard set-password

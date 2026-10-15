@@ -3,9 +3,10 @@ namespace DarkFactory.Orchestrator.Router;
 /// <summary>
 /// The router's model classes (epic E8, owner decision 2026-10-09): <c>max</c>, <c>high</c>, <c>mid</c> and <c>low</c>. A call names a class with <see cref="Header"/> and never a
 /// model id, the router picks the model inside it, and every proxied answer names the served model's class in
-/// <see cref="ResponseHeader"/>. The router refuses a class sent with <c>x-weave-force-model</c> (400
-/// <c>model_class_conflicts_with_force_model</c>), and answers 503 <see cref="Unavailable"/> when no model of the class can
-/// serve (it never falls back to another class); a class whose models a spent subscription refuses answers that 429.
+/// <see cref="ResponseHeader"/>. The router (simple-router) ignores <c>x-weave-force-model</c> (no refusal, no pin); the factory
+/// never sends it all the same. When no model of the class can serve now — usage limits, cooldowns, a missing or rejected login,
+/// no model that fits — it answers 429 <c>rate_limit_error</c> whose message starts <c>model_class_unavailable:</c>, with
+/// <c>Retry-After</c> (it never falls back to another class).
 /// </summary>
 public static class ModelClass
 {
@@ -20,7 +21,7 @@ public static class ModelClass
     /// <summary>The response header naming the class of the model that served the call.</summary>
     public const string ResponseHeader = "X-Weave-Model-Class";
 
-    /// <summary>The router's answer (message prefix / error code) when no model of the requested class can serve the call.</summary>
+    /// <summary>The prefix of the router's 429 <c>rate_limit_error</c> message when no model of the requested class can serve the call.</summary>
     public const string Unavailable = "model_class_unavailable";
 
     /// <summary>

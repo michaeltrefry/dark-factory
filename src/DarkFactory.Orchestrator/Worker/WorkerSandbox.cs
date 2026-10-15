@@ -416,19 +416,19 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     /// Fails fast, with the setup command, when the user, helper or sudoers rule is missing, or when the installed helper
     /// is stale. Before anything runs, the installed file must be the current helper (<see cref="StaleHelperReason"/>; it is
     /// installed 0755, so readable): an older one may lack the uid sweep's guards. Then the probe hands it the router variable
-    /// names a worker launch uses for <paramref name="auth"/> (dummy values), so a helper whose allowlist refuses one fails
+    /// names a worker launch uses (dummy values), so a helper whose allowlist refuses one fails
     /// here once instead of failing every worker launch; and a helper that refuses its uid sweep (its pinned uid is not the
     /// worker user's, or outside 400-499) fails too, since a worker's leftovers would then outlive every run. Last, the worker
     /// user's own Claude Code (<paramref name="claudePath"/>, as the worker sees it) must be at least <see cref="MinClaudeVersion"/>.
     /// </summary>
-    public Task EnsureReadyAsync(WorkerAuth auth, string claudePath, CancellationToken ct) =>
-        LockedAsync(async () => { await EnsureReadyLockedAsync(auth, claudePath, ct); return true; }, ct);
+    public Task EnsureReadyAsync(string claudePath, CancellationToken ct) =>
+        LockedAsync(async () => { await EnsureReadyLockedAsync(claudePath, ct); return true; }, ct);
 
-    private async Task EnsureReadyLockedAsync(WorkerAuth auth, string claudePath, CancellationToken ct)
+    private async Task EnsureReadyLockedAsync(string claudePath, CancellationToken ct)
     {
         await EnsureHelperCurrentAsync(ct);
         // Shaped like a real launch: the headers of a classed session span two lines (E8).
-        var probeVariables = ClaudeWorker.BuildRouterVariables(new Uri("http://127.0.0.1/"), "probe", auth, WorkerModelClass.Mid);
+        var probeVariables = ClaudeWorker.BuildRouterVariables(new Uri("http://127.0.0.1/"), "probe", WorkerModelClass.Mid);
         (int ExitCode, string Stdout, string Stderr) probe;
         try
         {

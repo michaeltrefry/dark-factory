@@ -31,8 +31,8 @@ public sealed record ConfirmRequest(WorkStory Story, string Repo, PullFacts Pull
     ReviewPrompt Prompt, string Session, CodeGraphOverlay? Overlay = null);
 
 /// <summary>
-/// The router refused a review call for usage (429/529, its exhaustion or rate-limit body, or 503
-/// <see cref="ModelClass.Unavailable"/>: no model of the high class can serve): the plans ran out, not the review. The pipeline pauses the factory for usage instead of escalating the item.
+/// The router refused a review call for usage (429/529, or its exhaustion body: simple-router's 429 <c>rate_limit_error</c>
+/// whose message starts <see cref="ModelClass.Unavailable"/>, no model of the high class can serve now): the plans ran out, not the review. The pipeline pauses the factory for usage instead of escalating the item.
 /// </summary>
 public sealed class RouterUsageLimitedException(string message) : Exception(message);
 
@@ -66,9 +66,8 @@ public interface IReviewer
 }
 
 /// <summary>
-/// The panel's calls through the Weave router (never a provider directly), each naming the high model class with
-/// <see cref="ModelClass.Header"/> and never a model id (no <c>x-weave-force-model</c>, which the router refuses alongside a
-/// class): the router picks the model inside the class (<see cref="ReviewModels"/>), and the body's required <c>model</c> is
+/// The panel's calls through the router (simple-router; never a provider directly), each naming the high model class with
+/// <see cref="ModelClass.Header"/> and never a model id (no <c>x-weave-force-model</c>, which simple-router ignores): the router picks the model inside the class (<see cref="ReviewModels"/>), and the body's required <c>model</c> is
 /// the fixed placeholder <see cref="ModelClass.RequestModel"/>. Each call is its own fresh router session that carries only the
 /// role's prompt, the story and the PR (<see cref="BuildPrompt"/>). The router key is the only credential sent, as the worker
 /// sends it. The system prompt is the role's prompt file, verbatim (<see cref="ReviewPrompts"/>).
@@ -413,11 +412,11 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     }
 
     /// <summary>
-    /// Whether a failed router answer is a usage refusal: 429 (the router's "every subscription unavailable" answer, a class
-    /// whose models a spent subscription refuses, or an upstream rate limit), 529 (overloaded), the router's
-    /// <see cref="ModelClass.Unavailable"/> (no model of the high class can serve: never another class, so the factory waits),
-    /// or a body carrying one of the worker's usage markers (<see cref="WorkerResult.UsageLimitMarkers"/>: the router's
-    /// exhaustion text, <c>rate_limit_error</c>, ...).
+    /// Whether a failed router answer is a usage refusal: 429 (simple-router's exhaustion answer, <c>rate_limit_error</c> whose
+    /// message starts <see cref="ModelClass.Unavailable"/>: no model of the high class can serve now, never another class, so the
+    /// factory waits; or an upstream rate limit), 529 (overloaded), a body naming <see cref="ModelClass.Unavailable"/> whatever its
+    /// status, or a body carrying one of the worker's usage markers (<see cref="WorkerResult.UsageLimitMarkers"/>:
+    /// <c>rate_limit_error</c>, <c>overloaded_error</c>, ...).
     /// </summary>
     public static bool UsageLimited(int status, string body) =>
         status is 429 or 529 || ModelClass.IsUnavailable(body)

@@ -420,7 +420,7 @@ public class ReviewerToolLoopTests
         var turns = 0;
         var router = new FakeApi().On("POST /v1/messages", _ => turns++ == 0
             ? SseAnswers.Response(SseAnswers.ToolTurn(("toolu_1", "read_file", "{\"path\": \"src/X.cs\"}")))
-            : FakeApi.Json((HttpStatusCode)429, """{"type":"error","error":{"type":"rate_limit_error","message":"All enrolled subscription accounts are currently unavailable."}}"""));
+            : FakeApi.Json((HttpStatusCode)429, """{"type":"error","error":{"type":"rate_limit_error","message":"model_class_unavailable: no model in the high tier can serve this request now (usage limit, login or availability); the earliest resets at 2026-10-15 13:00:00Z."}}"""));
 
         await Assert.ThrowsAsync<RouterUsageLimitedException>(() =>
             Reviewer(router, Repo(new() { ["src/X.cs"] = XSource })).ReviewAsync(Request, CancellationToken.None));

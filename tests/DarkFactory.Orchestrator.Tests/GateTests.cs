@@ -311,7 +311,7 @@ public class RouterReviewerTests
         Assert.Equal((Request.Session, Request.Prompt.Id), (review.Session!, review.Prompt!));
         var sent = api.Requests.Single();
         Assert.Equal("high", sent.Headers["x-weave-model-class"]);
-        // Never a model pin: the router refuses a class sent with x-weave-force-model (model_class_conflicts_with_force_model).
+        // Never a model pin: no x-weave-force-model (simple-router ignores it; the factory never sends it).
         Assert.DoesNotContain(sent.Headers.Keys, k => k.Contains("force-model", StringComparison.OrdinalIgnoreCase));
         Assert.Equal("rk_test", sent.Headers["X-Weave-Router-Key"]);
         Assert.Equal("Bearer rk_test", sent.Headers["Authorization"]);
@@ -444,12 +444,10 @@ public class RouterReviewerTests
     // The class's models all refused by a spent subscription: that 429.
     [InlineData(HttpStatusCode.TooManyRequests,
         """{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit."}}""")]
-    // No model of the high class can serve: the router never falls back to another class, so the factory waits.
-    [InlineData(HttpStatusCode.ServiceUnavailable,
-        """{"type":"error","error":{"type":"api_error","message":"model_class_unavailable: no high model can serve this request"}}""")]
+    // No model of the high class can serve: simple-router's exact answer (sc-26197). It never falls back to another class, so the factory waits.
+    [InlineData(HttpStatusCode.TooManyRequests,
+        """{"type":"error","error":{"type":"rate_limit_error","message":"model_class_unavailable: no model in the high tier can serve this request now (usage limit, login or availability); the earliest resets at 2026-10-15 13:00:00Z."}}""")]
     [InlineData((HttpStatusCode)529, """{"type":"error","error":{"type":"overloaded_error"}}""")]
-    [InlineData(HttpStatusCode.ServiceUnavailable,
-        """{"type":"error","error":{"type":"api_error","message":"All enrolled subscription accounts are currently unavailable."}}""")]
     public async Task A_router_usage_refusal_throws_usage_limited(HttpStatusCode status, string body)
     {
         var api = new FakeApi().On("POST /v1/messages", status, body);
@@ -462,7 +460,6 @@ public class RouterReviewerTests
 
     [Theory]
     [InlineData(HttpStatusCode.ServiceUnavailable, """{"type":"error","error":{"type":"api_error","message":"upstream unavailable"}}""")]
-    [InlineData(HttpStatusCode.BadRequest, """{"error":"model_class_conflicts_with_force_model","message":"x-weave-model-class cannot be combined with x-weave-force-model"}""")]
     [InlineData(HttpStatusCode.BadRequest, """{"error":"model_class_header_invalid","message":"unknown class"}""")]
     public async Task Any_other_router_refusal_fails_the_call_and_is_no_usage_refusal(HttpStatusCode status, string body)
     {
@@ -546,7 +543,7 @@ public class RouterReviewerTests
     [Theory]
     [InlineData("overloaded_error", "Overloaded")]
     [InlineData("rate_limit_error", "Number of request tokens has exceeded your per-minute rate limit")]
-    [InlineData("api_error", "All enrolled subscription accounts are currently unavailable.")]
+    [InlineData("api_error", "model_class_unavailable: no model in the high tier can serve this request now (usage limit, login or availability); the earliest resets at 2026-10-15 13:00:00Z.")]
     public async Task A_usage_error_event_mid_stream_throws_usage_limited(string type, string message)
     {
         var events = SseAnswers.MessageStart("claude-opus-5-5") + SseAnswers.TextBlockStart(0) + SseAnswers.TextDelta(0, "Partial")

@@ -184,15 +184,14 @@ public class WorkerSandboxTests
         Assert.Throws<ArgumentException>(() => WorkerSandbox.BuildVariableBlock(new Dictionary<string, string> { ["A"] = "1\nPATH=/evil" }));
     }
 
-    [Theory]
-    [InlineData(WorkerAuth.ClaudeLogin, new[] { "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR" })]
-    [InlineData(WorkerAuth.RouterKey, new[] { "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR" })]
-    public async Task Helper_gives_the_worker_exactly_the_allowlisted_environment(WorkerAuth auth, string[] expected)
+    [Fact]
+    public async Task Helper_gives_the_worker_exactly_the_allowlisted_environment()
     {
+        string[] expected = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR"];
         Environment.SetEnvironmentVariable("GH_TOKEN", "ghp_owner_should_not_leak");
         try
         {
-            using var p = LocalSandbox().Start(_dir, "/usr/bin/env", [], ClaudeWorker.BuildRouterVariables(SandboxSupport.Router, "rk_worker", auth, WorkerModelClass.Low));
+            using var p = LocalSandbox().Start(_dir, "/usr/bin/env", [], ClaudeWorker.BuildRouterVariables(SandboxSupport.Router, "rk_worker", WorkerModelClass.Low));
             var output = await p.StandardOutput.ReadToEndAsync();
             await p.WaitForExitAsync();
             WorkerSandbox.Stop(p);
@@ -1114,12 +1113,12 @@ public class WorkerSandboxTests
         Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", "sk-ant-should-not-leak");
         try
         {
-            var worker = new ClaudeWorker(claude, SandboxSupport.Router, "rk_worker", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1), LocalSandbox());
+            var worker = new ClaudeWorker(claude, SandboxSupport.Router, "rk_worker", TimeSpan.FromMinutes(1), LocalSandbox());
             var result = await worker.RunAsync(_dir, "prompt", null, WorkerModelClass.Mid, null, CancellationToken.None);
 
             Assert.True(result.Succeeded, result.StderrTail);
             Assert.Equal("sess-sbx", result.SessionId);
-            Assert.Equal(["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR"], File.ReadAllText(envDump).Split('\n'));
+            Assert.Equal(["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR"], File.ReadAllText(envDump).Split('\n'));
         }
         finally
         {
@@ -1133,7 +1132,7 @@ public class WorkerSandboxTests
         var pidFile = Path.Combine(_dir, "pid");
         var claude = SandboxSupport.Executable(_dir, "slow-claude.sh",
             $"#!/bin/sh\necho {OwnProcess.ShellRecord("$$")} > '{pidFile}'\necho '{{\"type\":\"system\",\"session_id\":\"s\"}}'\nsleep 600\n");
-        var worker = new ClaudeWorker(claude, SandboxSupport.Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(5), LocalSandbox());
+        var worker = new ClaudeWorker(claude, SandboxSupport.Router, "k", TimeSpan.FromMinutes(5), LocalSandbox());
         using var cts = new CancellationTokenSource();
         var run = worker.RunAsync(_dir, "p", null, WorkerModelClass.Mid, null, cts.Token);
         var pid = await SandboxSupport.WaitForPidAsync(pidFile, run);
@@ -1155,7 +1154,7 @@ public class WorkerSandboxTests
             $"#!/bin/sh\necho {OwnProcess.ShellRecord("$$")} > '{pidFile}'\necho '{{\"type\":\"system\",\"session_id\":\"s\"}}'\nexec /bin/sleep 600 </dev/null\n");
         var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, "stuck-root")).FullName);
         var sandbox = new WorkerSandbox("_df_no_such_user", SafeHelper.Create(_dir).Path, stuckSudo) { Lock = workerLock };
-        var worker = new ClaudeWorker("claude", SandboxSupport.Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(5), sandbox,
+        var worker = new ClaudeWorker("claude", SandboxSupport.Router, "k", TimeSpan.FromMinutes(5), sandbox,
             stopGrace: TimeSpan.FromMilliseconds(300));
         using var cts = new CancellationTokenSource();
         var run = worker.RunAsync(_dir, "p", null, WorkerModelClass.Mid, null, cts.Token);
@@ -1202,7 +1201,7 @@ public class WorkerSandboxTests
             + "echo '{\"type\":\"system\",\"session_id\":\"s\"}'\nexec /bin/sleep 600 </dev/null\n");
         var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, "wedged-root")).FullName);
         var sandbox = new WorkerSandbox(Environment.UserName, helper.Path, sudo) { Lock = workerLock };
-        var worker = new ClaudeWorker("claude", SandboxSupport.Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(5), sandbox,
+        var worker = new ClaudeWorker("claude", SandboxSupport.Router, "k", TimeSpan.FromMinutes(5), sandbox,
             stopGrace: TimeSpan.FromSeconds(2)); // waited once for the wedged helper, then again after the second helper run killed it
         using var cts = new CancellationTokenSource();
         var run = worker.RunAsync(_dir, "p", null, WorkerModelClass.Mid, null, cts.Token);
@@ -1326,7 +1325,7 @@ public class WorkerSandboxTests
         using var orphanProcess = StartSetsidSleeper();
         var orphan = OwnProcess.Of(orphanProcess);
         SafeHelper.Register(registry, orphan);
-        var worker = new ClaudeWorker("claude", SandboxSupport.Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1),
+        var worker = new ClaudeWorker("claude", SandboxSupport.Router, "k", TimeSpan.FromMinutes(1),
             new WorkerSandbox(Environment.UserName, helper.Path, SandboxSupport.FakeSudo(_dir)));
 
         Assert.True(await worker.StopOrphanAsync(999_999, CancellationToken.None));
@@ -1505,7 +1504,7 @@ public class WorkerSandboxTests
         // Each takes the lock itself when its caller holds none …
         Assert.Equal(0, (await sandbox.RunAsync("/", "/usr/bin/true", [], CancellationToken.None)).ExitCode);
         await sandbox.DeleteAsWorkerAsync(doomed, CancellationToken.None);
-        var result = await new ClaudeWorker(claude, SandboxSupport.Router, "rk_worker", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1), sandbox)
+        var result = await new ClaudeWorker(claude, SandboxSupport.Router, "rk_worker", TimeSpan.FromMinutes(1), sandbox)
             .RunAsync(_dir, "prompt", null, WorkerModelClass.Mid, null, CancellationToken.None);
         // … and runs under its caller's hold when a worker phase has it (no wait on itself).
         await workerLock.HoldAsync(async () =>
@@ -1574,7 +1573,7 @@ public class LiveWorkerSandboxTests
         {
             try
             {
-                await slot.Sandbox.EnsureReadyAsync(options.WorkerAuth, options.ClaudePath, CancellationToken.None);
+                await slot.Sandbox.EnsureReadyAsync(options.ClaudePath, CancellationToken.None);
             }
             catch (InvalidOperationException ex) when (slot.Number == 1)
             {
@@ -1623,19 +1622,16 @@ public class LiveWorkerSandboxTests
     /// <summary>
     /// AT6 (docs/acceptance.md): the installed helper, launched exactly as <see cref="ClaudeWorker"/> launches a sandboxed
     /// worker (<see cref="WorkerSandbox.Start"/> with <see cref="ClaudeWorker.BuildRouterVariables"/> for the configured
-    /// router URL and <c>Worker:Auth</c>), gives the worker exactly the allowlisted environment, and nothing of the owner's.
+    /// router URL), gives the worker exactly the allowlisted environment, and nothing of the owner's.
     /// The router key is a probe value: the real key never needs to appear in test output. Every configured slot is probed, and
     /// each slot's TMPDIR and HOME must be its own user's: a directory that user owns, the owner's and every other slot's apart
     /// (sc-25992: in a shared temporary directory one sandbox user's NuGet locks refused another's restore).
     /// </summary>
     [Fact]
-    public async Task Live_worker_environment_is_exactly_the_allowlist_for_the_configured_auth_mode()
+    public async Task Live_worker_environment_is_exactly_the_allowlist()
     {
         var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets());
-        var auth = options.WorkerAuth;
-        string[] expected = auth == WorkerAuth.RouterKey
-            ? ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR"]
-            : ["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR"];
+        string[] expected = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "DOTNET_CLI_USE_MSBUILD_SERVER", "HOME", "MSBUILDDISABLENODEREUSE", "PATH", "TMPDIR"];
         const string probeKey = "rk_live_env_probe";
         var tempDirs = new List<string>();
         var homes = new List<string>();
@@ -1645,7 +1641,7 @@ public class LiveWorkerSandboxTests
             await ForEachSlotAsync(async slot =>
             {
                 var sandbox = slot.Sandbox;
-                using var p = sandbox.Start("/", "/usr/bin/env", [], ClaudeWorker.BuildRouterVariables(options.RouterBaseUrl, probeKey, auth, WorkerModelClass.Mid));
+                using var p = sandbox.Start("/", "/usr/bin/env", [], ClaudeWorker.BuildRouterVariables(options.RouterBaseUrl, probeKey, WorkerModelClass.Mid));
                 var output = await p.StandardOutput.ReadToEndAsync();
                 await p.WaitForExitAsync();
                 WorkerSandbox.Stop(p);
@@ -1655,10 +1651,7 @@ public class LiveWorkerSandboxTests
                 Assert.Equal(expected, env.Keys.Order());
                 Assert.Equal(options.RouterBaseUrl.ToString().TrimEnd('/'), env["ANTHROPIC_BASE_URL"].TrimEnd('/'));
                 Assert.Equal($"{ClaudeWorker.RouterKeyHeader}: {probeKey}\n{WorkerModelClass.Header}: {WorkerModelClass.Mid}", env["ANTHROPIC_CUSTOM_HEADERS"]);
-                if (auth == WorkerAuth.RouterKey)
-                {
-                    Assert.Equal(probeKey, env["ANTHROPIC_AUTH_TOKEN"]);
-                }
+                Assert.Equal(probeKey, env["ANTHROPIC_AUTH_TOKEN"]);
                 Assert.DoesNotContain(OwnerHome, env["HOME"]);
                 Assert.StartsWith(env["HOME"] + "/.local/bin:", env["PATH"]);
                 Assert.DoesNotContain(OwnerHome, env["PATH"]);
@@ -1702,17 +1695,13 @@ public class LiveWorkerSandboxTests
         });
 
     /// <summary>
-    /// AT6, <c>Worker:Auth=router-key</c> (E5): the worker user holds no Claude credential of its own — neither Claude
+    /// AT6 (E5): the worker user holds no Claude credential of its own — neither Claude
     /// Code's credentials file nor its keychain item (attributes only are looked up; no secret is read). Removed by
-    /// <c>sudo scripts/setup-worker-user.sh --remove-worker-login</c>. Skips in <c>claude-login</c> mode, which needs one.
+    /// <c>sudo scripts/setup-worker-user.sh --remove-worker-login</c>.
     /// </summary>
     [Fact]
-    public async Task Worker_user_holds_no_claude_credential_in_router_key_mode()
+    public async Task Worker_user_holds_no_claude_credential()
     {
-        if (new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets()).WorkerAuth != WorkerAuth.RouterKey)
-        {
-            Assert.Skip("Worker:Auth=claude-login: the worker user is expected to hold its own Claude login.");
-        }
         await ForEachSlotAsync(async slot =>
         {
             var (exitCode, stdout, stderr) = await slot.Sandbox.RunAsync("/", "/bin/sh",

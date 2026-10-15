@@ -72,7 +72,7 @@ public class SandboxReadinessTests
     public async Task A_worker_claude_older_than_the_minimum_fails_the_factory_naming_the_upgrade(string version)
     {
         var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
-            FactoryRunner.EnsureSandboxReadyAsync(Sandbox(CurrentAllowlist), WorkerAuth.RouterKey, Claude(version), CancellationToken.None));
+            FactoryRunner.EnsureSandboxReadyAsync(Sandbox(CurrentAllowlist), Claude(version), CancellationToken.None));
 
         Assert.Contains($"Upgrade {Environment.UserName}'s claude", ex.Message);
         Assert.Contains(WorkerSandbox.MinClaudeVersion, ex.Message);
@@ -86,13 +86,13 @@ public class SandboxReadinessTests
     [InlineData("3.0.0 (Claude Code)")]
     [InlineData("2.1.291+abc")]
     public async Task A_worker_claude_at_or_above_the_minimum_passes(string version) =>
-        await FactoryRunner.EnsureSandboxReadyAsync(Sandbox(CurrentAllowlist), WorkerAuth.RouterKey, Claude(version), CancellationToken.None);
+        await FactoryRunner.EnsureSandboxReadyAsync(Sandbox(CurrentAllowlist), Claude(version), CancellationToken.None);
 
     [Fact]
     public async Task A_worker_claude_that_cannot_run_fails_the_factory_naming_the_setup()
     {
         var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
-            FactoryRunner.EnsureSandboxReadyAsync(Sandbox(CurrentAllowlist), WorkerAuth.RouterKey, Claude("2.1.291", exit: 127), CancellationToken.None));
+            FactoryRunner.EnsureSandboxReadyAsync(Sandbox(CurrentAllowlist), Claude("2.1.291", exit: 127), CancellationToken.None));
 
         Assert.Contains("Cannot run", ex.Message);
         Assert.Contains("exit 127", ex.Message);
@@ -103,7 +103,7 @@ public class SandboxReadinessTests
     public async Task A_stale_helper_that_refuses_a_router_variable_fails_the_factory_naming_the_setup_rerun()
     {
         var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
-            FactoryRunner.EnsureSandboxReadyAsync(Sandbox(StaleAllowlist), WorkerAuth.RouterKey, Claude(), CancellationToken.None));
+            FactoryRunner.EnsureSandboxReadyAsync(Sandbox(StaleAllowlist), Claude(), CancellationToken.None));
 
         Assert.Contains("re-run `sudo scripts/setup-worker-user.sh`", ex.Message);
         Assert.Contains("ANTHROPIC_AUTH_TOKEN", ex.Message);
@@ -112,13 +112,9 @@ public class SandboxReadinessTests
     [Fact]
     public async Task The_current_helper_passes_the_probe_with_the_router_key_variables()
     {
-        await FactoryRunner.EnsureSandboxReadyAsync(Sandbox(CurrentAllowlist), WorkerAuth.RouterKey, Claude(), CancellationToken.None);
+        await FactoryRunner.EnsureSandboxReadyAsync(Sandbox(CurrentAllowlist), Claude(), CancellationToken.None);
         Assert.True(File.Exists(Ran));
     }
-
-    [Fact]
-    public async Task Claude_login_mode_probes_only_the_variables_it_sends() =>
-        await FactoryRunner.EnsureSandboxReadyAsync(Sandbox(StaleAllowlist), WorkerAuth.ClaudeLogin, Claude(), CancellationToken.None);
 
     [Fact]
     public async Task The_readiness_probe_and_the_claude_version_check_run_the_helper_under_the_sandbox_users_lock()
@@ -128,7 +124,7 @@ public class SandboxReadinessTests
         var log = Path.Combine(_dir, "lock-probes");
         var sandbox = Sandbox(CurrentAllowlist) with { Lock = workerLock, SudoPath = SandboxSupport.LockProbingSudo(_dir, workerLock, log) };
 
-        await FactoryRunner.EnsureSandboxReadyAsync(sandbox, WorkerAuth.RouterKey, Claude(), CancellationToken.None);
+        await FactoryRunner.EnsureSandboxReadyAsync(sandbox, Claude(), CancellationToken.None);
 
         Assert.Equal(["held", "held"], File.ReadAllLines(log));
         Assert.False(workerLock.IsHeld);
@@ -157,7 +153,7 @@ public class SandboxReadinessTests
         };
 
         var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
-            FactoryRunner.EnsureSandboxReadyAsync(Sandbox(CurrentAllowlist, installed: edit), WorkerAuth.RouterKey, Claude(), CancellationToken.None));
+            FactoryRunner.EnsureSandboxReadyAsync(Sandbox(CurrentAllowlist, installed: edit), Claude(), CancellationToken.None));
 
         Assert.Contains("Stale helper", ex.Message);
         Assert.Contains(reason, ex.Message);
@@ -197,7 +193,7 @@ public class SandboxReadinessTests
         var sandbox = new WorkerSandbox(Environment.UserName, Path.Combine(_dir, "no-such-helper"), SandboxSupport.FakeSudo(_dir), "x");
 
         var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
-            FactoryRunner.EnsureSandboxReadyAsync(sandbox, WorkerAuth.RouterKey, Claude(), CancellationToken.None));
+            FactoryRunner.EnsureSandboxReadyAsync(sandbox, Claude(), CancellationToken.None));
 
         Assert.Contains("cannot read the launch helper", ex.Message);
         Assert.Contains("sudo scripts/setup-worker-user.sh", ex.Message);
@@ -210,7 +206,7 @@ public class SandboxReadinessTests
         var refusal = "echo \"factory-worker-launch: refusing the _factory uid sweep: pinned uid 89 is outside 400-499\" >&2";
 
         var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
-            FactoryRunner.EnsureSandboxReadyAsync(Sandbox(CurrentAllowlist, refusal), WorkerAuth.RouterKey, Claude(), CancellationToken.None));
+            FactoryRunner.EnsureSandboxReadyAsync(Sandbox(CurrentAllowlist, refusal), Claude(), CancellationToken.None));
 
         Assert.Contains("refuses its", ex.Message);
         Assert.Contains("pinned uid 89 is outside 400-499", ex.Message);

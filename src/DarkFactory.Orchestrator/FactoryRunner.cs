@@ -102,20 +102,16 @@ public static class FactoryRunner
     }
 
     /// <summary>
-    /// <c>factory run</c>'s and <c>factory work</c>'s start-up check for <c>Worker:Auth=router-key</c> (the default): the
+    /// <c>factory run</c>'s and <c>factory work</c>'s start-up check (<c>Worker:Auth=router-key</c>, the only mode): the
     /// worker holds no provider credential, so the router must have at least one plan enrolled for the router key, or
     /// every worker model call fails. A failure, not a warning (E10): without a plan no worker can do anything, and an
     /// unreadable usage report (router down, bad key) leaves enrollment unverified, so it fails too.
-    /// Returns what is wrong, or null (always null for <c>claude-login</c>).
+    /// Returns what is wrong, or null.
     /// </summary>
     public static async Task<string?> CheckRouterEnrollmentAsync(FactoryOptions options, IUsageSource usage, CancellationToken ct)
     {
-        if (options.WorkerAuth != WorkerAuth.RouterKey)
-        {
-            return null;
-        }
-        const string remedy = "Enroll a plan on the router for this key (`router login claude` and/or `router login codex`), "
-            + "or set Worker__Auth=claude-login (weaker: the worker then holds a Claude login, which E5 forbids).";
+        const string remedy = "Enroll a plan on the router for this key (`simple-router login claude` and/or `simple-router login codex`: in the simple-router "
+            + "repository, `dotnet run --project src/SimpleRouter -- login claude|codex`).";
         SubscriptionUsage report;
         try
         {
@@ -137,8 +133,9 @@ public static class FactoryRunner
         return unroutable.Count > 0
             ? $"Worker:Auth=router-key, but every enrolled plan the router at {options.RouterBaseUrl} lists for this router key is "
                 + $"not routable ({string.Join(", ", unroutable.Select(c => $"{c.Provider} {c.State ?? "unknown state"}"))}), so every "
-                + "worker model call would fail. Reconnect the plan on the router (`router login claude` for a Claude plan, "
-                + "`router login codex` for a Codex plan), then start again."
+                + "worker model call would fail. Log in again on the router (`simple-router login claude` for a Claude plan, "
+                + "`simple-router login codex` for a Codex plan: in the simple-router repository, "
+                + "`dotnet run --project src/SimpleRouter -- login claude|codex`), then start again."
             : $"Worker:Auth=router-key, but the router at {options.RouterBaseUrl} lists no enrolled, enabled plan for this router key "
                 + $"(GET /v1/subscriptions/usage has no managed or shared credential), so every worker model call would fail. {remedy}";
     }
@@ -342,7 +339,7 @@ public static class FactoryRunner
         {
             if (slots is not null)
             {
-                await EnsureSandboxReadyAsync(slots, options.WorkerAuth, options.ClaudePath, c);
+                await EnsureSandboxReadyAsync(slots, options.ClaudePath, c);
             }
             await FactoryWide("the worktree sweep", async () =>
             {
@@ -370,7 +367,7 @@ public static class FactoryRunner
             runLocks,
             workspaces,
             // The xcodebuild wrapper is allowed only in a factory with Worker:Swift on (sc-26130, E7).
-            new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, slots,
+            new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerTimeout, slots,
                 pauseFlagDirectory: options.PauseFlagDirectory, tools: WorkerTools.ImplementerFor(options.WorkerSwift)),
             new GitHubPullRequests(githubHttp, app),
             options.DefaultRepo,
@@ -467,8 +464,8 @@ public static class FactoryRunner
     /// The sandbox readiness probe of the slot the calling flow holds (<see cref="WorkerSlots.EnsureReadyAsync"/>; a failure names
     /// the slot when there are several), a factory-wide failure (E10): a stale helper fails the factory once, not every item.
     /// </summary>
-    internal static Task EnsureSandboxReadyAsync(WorkerSlots slots, WorkerAuth auth, string claudePath, CancellationToken ct) =>
-        FactoryWide("the worker sandbox", async () => { await slots.EnsureReadyAsync(auth, claudePath, ct); return true; });
+    internal static Task EnsureSandboxReadyAsync(WorkerSlots slots, string claudePath, CancellationToken ct) =>
+        FactoryWide("the worker sandbox", async () => { await slots.EnsureReadyAsync(claudePath, ct); return true; });
 
     /// <summary>
     /// The part of the readiness check that runs no helper (<see cref="WorkerSlots.EnsureHelpersCurrentAsync"/>: every slot's
@@ -635,7 +632,7 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
     private async Task<WorkerResult> RunLockedAsync(WorkerSlots slots, WorkerSlot slot, string routerKey, WorkItem item, RepoRef repo, string prompt,
         Func<string, CancellationToken, Task> onSession, Func<string, string, CancellationToken, Task> onTaint, CancellationToken ct)
     {
-        await FactoryRunner.EnsureSandboxReadyAsync(slots, options.WorkerAuth, options.ClaudePath, ct);
+        await FactoryRunner.EnsureSandboxReadyAsync(slots, options.ClaudePath, ct);
         using var githubHttp = OutboundHttp.GitHubApi();
         using var routerHttp = OutboundHttp.RouterApi(options.RouterBaseUrl);
         var app = new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System);
@@ -670,7 +667,7 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         var upstreams = FactoryRunner.CreateUpstreams(options, codeGraphHttp, kanbanHttp: null, log);
         await using var proxy = await StartMcpProxyAsync(upstreams, seat.Sessions, live, ct);
         var tools = TriageTools(upstreams, proxy is not null);
-        var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, slots,
+        var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerTimeout, slots,
             pauseFlagDirectory: options.PauseFlagDirectory, tools: tools);
         var sessions = new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)),
             new RouterClient(routerHttp, routerKey), TimeProvider.System, log, costSettleDelay: options.CostSettleDelay);
@@ -824,7 +821,7 @@ public sealed class SandboxPlanRunner(FactoryOptions options, WorkerSlots? slots
             throw new FactoryUnavailableException($"the planner's set-up: {ex.Message}", ex);
         }
         await using var proxy = started;
-        var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, options.RouterKey, options.WorkerAuth, options.WorkerTimeout, slots,
+        var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, options.RouterKey, options.WorkerTimeout, slots,
             pauseFlagDirectory: options.PauseFlagDirectory, tools: PlannerTools(upstreams, proxy is not null));
         return await new Plans.WorkerPlanRunner(workspaces, worker, log,
             proxy is null ? null : new Mcp.McpProxySessions(proxy, seat.Sessions, seat.User, owner: ItemNaming.ParseAny(item.ExternalId),

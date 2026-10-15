@@ -272,7 +272,7 @@ public class WorkerTaintTests
             var ledger = new WorkLedger(db, TimeProvider.System);
             var item = await ledger.GetOrCreateAsync("github", "gh-1", "t", "acme/widgets", null, CancellationToken.None);
             var workspaces = new LocalWorkspaces(dir);
-            var worker = new ClaudeWorker(script, Router, "rk_worker", WorkerAuth.RouterKey, TimeSpan.FromMinutes(1), tools: WorkerTools.ReadOnly);
+            var worker = new ClaudeWorker(script, Router, "rk_worker", TimeSpan.FromMinutes(1), tools: WorkerTools.ReadOnly);
             var seen = new List<string>();
 
             var result = await new WorkerTriageRunner(workspaces, worker, null, TextWriter.Null).RunAsync(item, new RepoRef("acme", "widgets"),
@@ -322,7 +322,7 @@ public class WorkerTaintTests
             """);
         var reported = new List<(string, string)>();
 
-        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.RouterKey, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
+        var result = await new ClaudeWorker(script, Router, "k", TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
             new WorkerCallbacks(OnUntrusted: (s, reason, _) => { reported.Add((s, reason)); File.WriteAllText(flag, ""); return Task.CompletedTask; }),
             CancellationToken.None);
 
@@ -343,7 +343,7 @@ public class WorkerTaintTests
         using var run = new CancellationTokenSource();
         var cancellable = new List<bool>();
 
-        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.RouterKey, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
+        var result = await new ClaudeWorker(script, Router, "k", TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
             new WorkerCallbacks(OnUntrusted: (_, _, c) => { cancellable.Add(c.CanBeCanceled); return Task.CompletedTask; }), run.Token);
 
         Assert.True(result.Succeeded);
@@ -361,7 +361,7 @@ public class WorkerTaintTests
             """);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            new ClaudeWorker(script, Router, "k", WorkerAuth.RouterKey, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid, null, CancellationToken.None));
+            new ClaudeWorker(script, Router, "k", TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid, null, CancellationToken.None));
 
         Assert.Contains("web:WebFetch", ex.Message);
     }

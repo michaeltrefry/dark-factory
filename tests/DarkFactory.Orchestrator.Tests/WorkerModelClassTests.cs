@@ -47,14 +47,13 @@ public class WorkerModelClassTests
         Assert.Equal("x-weave-model-class", WorkerModelClass.Header);
     }
 
-    [Theory]
-    [InlineData(WorkerAuth.RouterKey, new[] { "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS" })]
-    [InlineData(WorkerAuth.ClaudeLogin, new[] { "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS" })]
-    public void The_class_rides_in_the_custom_headers_next_to_the_router_key_and_adds_no_variable(WorkerAuth auth, string[] keys)
+    [Fact]
+    public void The_class_rides_in_the_custom_headers_next_to_the_router_key_and_adds_no_variable()
     {
+        string[] keys = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS"];
         foreach (var modelClass in new[] { "max", "high", "mid", "low" })
         {
-            var env = ClaudeWorker.BuildRouterVariables(new Uri("http://localhost:8080/"), "rk_worker", auth, modelClass);
+            var env = ClaudeWorker.BuildRouterVariables(new Uri("http://localhost:8080/"), "rk_worker", modelClass);
 
             Assert.Equal(keys, env.Keys.Order());
             Assert.Equal($"X-Weave-Router-Key: rk_worker\nx-weave-model-class: {modelClass}", env["ANTHROPIC_CUSTOM_HEADERS"]);
@@ -73,18 +72,17 @@ public class WorkerModelClassTests
     [InlineData("mid ")]
     public async Task Anything_but_max_high_mid_or_low_is_refused_before_a_worker_starts(string modelClass)
     {
-        Assert.Throws<ArgumentException>(() => ClaudeWorker.BuildRouterVariables(new Uri("http://localhost:8080/"), "rk", WorkerAuth.RouterKey, modelClass));
+        Assert.Throws<ArgumentException>(() => ClaudeWorker.BuildRouterVariables(new Uri("http://localhost:8080/"), "rk", modelClass));
         await Assert.ThrowsAsync<ArgumentException>(() =>
-            new ClaudeWorker("/nonexistent/claude", new Uri("http://localhost:8080/"), "rk", WorkerAuth.RouterKey, TimeSpan.FromMinutes(1))
+            new ClaudeWorker("/nonexistent/claude", new Uri("http://localhost:8080/"), "rk", TimeSpan.FromMinutes(1))
                 .RunAsync(Path.GetTempPath(), "p", null, modelClass, null, CancellationToken.None));
     }
 
     [Theory]
-    [InlineData(WorkerAuth.RouterKey, "rk_a\nx-weave-force-model: claude-opus-5-5")]
-    [InlineData(WorkerAuth.ClaudeLogin, "rk_a\nx-weave-force-model: claude-opus-5-5")]
-    [InlineData(WorkerAuth.ClaudeLogin, "rk_a\rx")]
-    public void A_router_key_with_a_line_break_is_refused_in_every_auth_mode(WorkerAuth auth, string key) =>
-        Assert.Throws<ArgumentException>(() => ClaudeWorker.BuildRouterVariables(new Uri("http://localhost:8080/"), key, auth, WorkerModelClass.Mid));
+    [InlineData("rk_a\nx-weave-force-model: claude-opus-5-5")]
+    [InlineData("rk_a\rx")]
+    public void A_router_key_with_a_line_break_is_refused(string key) =>
+        Assert.Throws<ArgumentException>(() => ClaudeWorker.BuildRouterVariables(new Uri("http://localhost:8080/"), key, WorkerModelClass.Mid));
 
     [Fact]
     public void No_session_argument_pins_a_model()
@@ -100,7 +98,7 @@ public class WorkerModelClassTests
     [Fact]
     public void The_helper_block_carries_each_header_on_its_own_line_and_still_refuses_any_other_line_break()
     {
-        var variables = ClaudeWorker.BuildRouterVariables(new Uri("http://localhost:8080/"), "rk_worker", WorkerAuth.RouterKey, WorkerModelClass.Low);
+        var variables = ClaudeWorker.BuildRouterVariables(new Uri("http://localhost:8080/"), "rk_worker", WorkerModelClass.Low);
 
         Assert.Equal(
             "ANTHROPIC_BASE_URL=http://localhost:8080\nANTHROPIC_CUSTOM_HEADERS=X-Weave-Router-Key: rk_worker\n"
@@ -113,8 +111,9 @@ public class WorkerModelClassTests
     }
 
     [Theory]
-    [InlineData(true, "API Error: 503 {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"model_class_unavailable: no model of class mid can serve this request\"}}", "", true)]
-    [InlineData(true, "failed", "Error: model_class_unavailable: no model of class low can serve this request", true)]
+    // simple-router's exact answer (sc-26197): 429 rate_limit_error, message prefixed model_class_unavailable, as Claude Code reports it.
+    [InlineData(true, "API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"model_class_unavailable: no model in the mid tier can serve this request now (usage limit, login or availability); the earliest resets at 2026-10-15 13:00:00Z. Run 'simple-router login claude'.\"}}", "", true)]
+    [InlineData(true, "failed", "Error: model_class_unavailable: no model in the low tier can serve this request now (usage limit, login or availability); the earliest resets at 2026-10-15 13:00:00Z.", true)]
     [InlineData(false, "The router answers model_class_unavailable when no model of the class can serve; I documented it.", "", false)] // prose
     [InlineData(true, "error_max_turns", "", false)]
     public void Model_class_unavailable_is_recognised_only_in_an_error_result_or_stderr(bool isError, string resultText, string stderr, bool expected)

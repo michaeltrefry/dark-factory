@@ -31,12 +31,12 @@ opt-in: the tests skip, naming the missing prerequisite, unless their gate varia
   kills every `_factory` process — see the first bullet).
 
 Common prerequisites: `docker compose up -d` (ledger Postgres on 5434), the router on `Router:BaseUrl`
-(default `http://localhost:8080`), keychain entries for the router key, Shortcut token and GitHub App
+(default `http://127.0.0.1:8790`: simple-router, michaeltrefry/simple-router), keychain entries for the router key, Shortcut token and GitHub App
 (`factory github-app setup`), `sudo scripts/setup-worker-user.sh` done once (or `Worker__RunAs=none` to run workers
-as yourself, development only), and the model auth: for `Worker:Auth=router-key` (the default) your plans enrolled on
-the router for the router key (`router login claude`, `router login codex`; `factory run`/`work` refuse to start
-without one) and `_factory`'s own login removed (`sudo scripts/setup-worker-user.sh --remove-worker-login`); for
-`Worker:Auth=claude-login` (weaker, violates E5) the `_factory` Claude login instead.
+as yourself, development only), and the model auth (`Worker:Auth=router-key`, the only mode: `claude-login` was retired, sc-26197): your plans enrolled on
+the router for the router key (`simple-router login claude`, `simple-router login codex`, run in the simple-router
+repository as `dotnet run --project src/SimpleRouter -- login claude|codex`; `factory run`/`work` refuse to start
+without one) and `_factory`'s own login removed (`sudo scripts/setup-worker-user.sh --remove-worker-login`).
 
 Run one test at a time with a class filter, e.g.:
 
@@ -127,8 +127,8 @@ for its sessions.
 | Check | Test | Gate |
 | --- | --- | --- |
 | Worker token pushes `factory/*` only on its own repo; push to `main` and to another repo rejected | `AppTokenPushTests.Worker_token_pushes_factory_branches_only_on_its_own_repo` | `FACTORY_E2E=1` (`FACTORY_E2E_OTHER_REPO` optional) |
-| Worker env is exactly the allowlist for the configured `Worker:Auth` (`router-key`: `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `HOME`, `MSBUILDDISABLENODEREUSE`, `PATH`, `TMPDIR` — the sandbox user's own temporary directory, sc-25992; `claude-login`: the same without `ANTHROPIC_AUTH_TOKEN`); `ANTHROPIC_CUSTOM_HEADERS` is two lines, the router key and `x-weave-model-class` (sc-25659) | `LiveWorkerSandboxTests.Live_worker_environment_is_exactly_the_allowlist_for_the_configured_auth_mode` | `FACTORY_SANDBOX_LIVE=1` |
-| `router-key`: `_factory` holds no Claude credential (no `~/.claude/.credentials.json`, no `Claude Code-credentials` keychain item) | `LiveWorkerSandboxTests.Worker_user_holds_no_claude_credential_in_router_key_mode` (skips for `claude-login`) | `FACTORY_SANDBOX_LIVE=1` |
+| Worker env is exactly the allowlist (`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `HOME`, `MSBUILDDISABLENODEREUSE`, `PATH`, `TMPDIR` — the sandbox user's own temporary directory, sc-25992); `ANTHROPIC_CUSTOM_HEADERS` is two lines, the router key and `x-weave-model-class` (sc-25659) | `LiveWorkerSandboxTests.Live_worker_environment_is_exactly_the_allowlist` | `FACTORY_SANDBOX_LIVE=1` |
+| `_factory` holds no Claude credential (no `~/.claude/.credentials.json`, no `Claude Code-credentials` keychain item) | `LiveWorkerSandboxTests.Worker_user_holds_no_claude_credential` | `FACTORY_SANDBOX_LIVE=1` |
 | `router-key`: `factory run`/`work` refuse to start without an enrolled plan | `RouterEnrollmentCheckTests` (unit, fake router) | none |
 | `~michael`, `.ssh`, `.config/gh`, login keychain unreachable | `LiveWorkerSandboxTests.Worker_is_denied_the_owners_home_ssh_keys_gh_config_and_login_keychain`, `Worker_cannot_read_the_owners_keychain_items` | `FACTORY_SANDBOX_LIVE=1` |
 
@@ -162,10 +162,9 @@ cost is ≥ 0. A cost of 0 is valid: the router may serve turns (or a whole sess
 still counts toward `request_count`. A 404 or `request_count == 0` means not recorded (yet).
 
 That proves every *session* is costed, not that no call bypassed a session. Owner, by hand, for the AT2 window: in the
-router's logs (`docker compose logs router --since <start> --until <end>` from the router checkout) or its telemetry
-store, count the model requests in the window and compare with the sum of the sessions' `request_count`; any request
+router's request records (simple-router's recent requests, dashboard `http://127.0.0.1:8790/ui`, or its store), count the model requests in the window and compare with the sum of the sessions' `request_count`; any request
 with no Claude Code session id is a call the factory made outside a worker session and fails AT7. The exact log field
-or telemetry query that carries the session id is the router's (michaeltrefry/router) and is not pinned here — check
+or query that carries the session id is the router's (simple-router, michaeltrefry/simple-router) and is not pinned here — check
 it there before relying on a count.
 
 ## AT8 — tracker readback
@@ -208,11 +207,10 @@ Owner set-up, once (the test skips naming whichever is missing):
    `risk-threshold` is read and do not.
 
 No reviewer model is set anywhere (owner decision 2026-10-09, epic E8, sc-25626): every review and second opinion names
-the router's `high` model class (`x-weave-model-class: high`, never `x-weave-force-model`) and the router picks the model,
-so the router must have a servable `high` class (its `model_tiers`/`model_classes`; a `model_class_unavailable` 503 pauses
-the factory for usage). The factory's router key must have no routing-policy caller passthrough and no blind-experiment
-passthrough arm: that path 503s `model_class_unavailable` for a class request whose body model (`default`) is outside the
-class, which would usage-pause every review in a loop. A call counts only when the router's `X-Weave-Model-Class` response
+the router's `high` model class (`x-weave-model-class: high`, never `x-weave-force-model`, which simple-router ignores) and
+the router picks the model, so the router must have a servable `high` tier (simple-router answers 429 `rate_limit_error` whose
+message starts `model_class_unavailable:`, with `Retry-After`, when no model of the tier can serve now; that pauses the factory
+for usage). simple-router takes the tier from the header and never from the body model (`default`). A call counts only when the router's `X-Weave-Model-Class` response
 header says `high`. The retired
 `Review:*Models` settings are refused: with one set, these tests, the seeded review (`ReviewSeedTests`) and the Phase 1
 AT1–AT5 runs skip naming it, and `factory run`/`factory work` print the reason and exit 2.
@@ -311,7 +309,7 @@ texts (rerun the comparison by hand from the throwaway ledger before it is dropp
 Every worker session names a router model class and pins no model. Prerequisite: the launch helper is helper_version 3 (it joins
 the two `ANTHROPIC_CUSTOM_HEADERS` lines); a helper installed before sc-25659 fails start-up as stale, so re-run
 `sudo scripts/setup-worker-user.sh` once (stop `factory work` first: it kills every `_factory` process). The router must know the
-classes (`x-weave-model-class`, michaeltrefry/router "Model tiers and classes") and have a servable model in `mid` and `low`.
+classes (`x-weave-model-class`: simple-router's tiers `max`, `high`, `mid`, `low`) and have a servable model in `mid` and `low`.
 
 Unit-tested (no gate): the class per role and the simple/complex rule (`WorkerModelClassTests`; conflict fix rounds in
 `MergeQueueTests.A_branch_that_conflicts_with_main_goes_to_the_fix_loop_instead_of_merging`, triage in `TriageWorktreeTests` and

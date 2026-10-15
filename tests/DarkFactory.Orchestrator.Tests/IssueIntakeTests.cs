@@ -512,7 +512,7 @@ public class IssueIntakeTests
         var h = new Harness(Answer());
         h.Triage.Answers.Clear();
         h.Triage.Answers.Add(() => new WorkerResult("triage-sess", 1, true, "error",
-            "API Error: 503 {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"model_class_unavailable: no low model can serve\"}}", ""));
+            "API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"model_class_unavailable: no model in the low tier can serve this request now (usage limit, login or availability); the earliest resets at 2026-10-15 13:00:00Z.\"}}", ""));
         await h.Watch();
         h.Open("maintainer");
 

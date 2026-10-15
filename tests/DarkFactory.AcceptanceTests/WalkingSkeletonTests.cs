@@ -39,7 +39,7 @@ public class WalkingSkeletonTests
             dir = Directory.CreateDirectory(Path.Combine(Harness.Options.WorkRoot, $"e2e-worker-{Guid.NewGuid():N}")).FullName;
             await sandbox.ShareAsync(dir, ct);
         }
-        var worker = new ClaudeWorker(Harness.Options.ClaudePath, Harness.Options.RouterBaseUrl, routerKey, Harness.Options.WorkerAuth, TimeSpan.FromMinutes(5), sandbox);
+        var worker = new ClaudeWorker(Harness.Options.ClaudePath, Harness.Options.RouterBaseUrl, routerKey, TimeSpan.FromMinutes(5), sandbox);
         var result = await worker.RunAsync(dir, "Reply with the single word OK. Do not use any tools.", null, WorkerModelClass.Mid, null, ct);
 
         Assert.True(result.Succeeded, $"worker failed: exit {result.ExitCode}: {result.ResultText} {result.StderrTail}");

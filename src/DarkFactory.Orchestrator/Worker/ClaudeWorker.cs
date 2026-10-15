@@ -12,14 +12,13 @@ public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError,
     public bool Succeeded => ExitCode == 0 && !IsError && SessionId is not null;
 
     /// <summary>
-    /// How a failed session reads when the plans ran out rather than the work failing: the router's answer when every
-    /// subscription is exhausted (429 "All enrolled subscription accounts are currently unavailable."), an upstream 429
+    /// How a failed session reads when the plans ran out rather than the work failing: simple-router's answer when no model of
+    /// the session's class can serve (429 <c>rate_limit_error</c>, message <c>model_class_unavailable: …</c>), an upstream 429
     /// or 529 passed through (Claude Code's "API Error: 429 …", <c>rate_limit_error</c>, <c>overloaded_error</c>,
     /// "Repeated 529 Overloaded errors") and a plan's own limit ("usage limit reached", "hit your limit").
     /// </summary>
     public static readonly string[] UsageLimitMarkers =
     [
-        "All enrolled subscription accounts are currently unavailable",
         "API Error: 429",
         "API Error: 529",
         "rate_limit_error",
@@ -46,7 +45,7 @@ public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError,
     /// </summary>
     public bool HookStopped => TerminalReason == HookStoppedReason;
 
-    /// <summary>The router's refusal when no model of the session's class can serve it (503; the message prefix).</summary>
+    /// <summary>The router's refusal when no model of the session's class can serve it (the prefix of its 429 <c>rate_limit_error</c> message).</summary>
     public const string ModelClassUnavailableMarker = Router.ModelClass.Unavailable;
 
     /// <summary>
@@ -283,26 +282,6 @@ public static class WorkerStillRunning
     public static bool IsMarked(Exception ex) => ex.Data.Contains(Key);
 }
 
-/// <summary>How the worker's Claude Code authenticates. Neither mode hands the worker a provider key (E1).</summary>
-public enum WorkerAuth
-{
-    /// <summary>
-    /// Weaker, opt-in (<c>Worker:Auth=claude-login</c>): Claude Code uses the worker user's own Claude login (its
-    /// <c>claude</c> OAuth session) and the router passes it upstream. The worker then holds an Anthropic credential,
-    /// which E5 forbids; kept only as a fallback for a router with no enrolled plans.
-    /// </summary>
-    ClaudeLogin,
-
-    /// <summary>
-    /// Default (<c>Worker:Auth=router-key</c>): the worker holds no provider credential, only the router key. It goes in
-    /// <c>X-Weave-Router-Key</c> (the router's preferred routing token) and as <c>ANTHROPIC_AUTH_TOKEN</c>, so Claude Code
-    /// starts without a login and sends it as <c>Authorization: Bearer rk_…</c>, which the router strips before any
-    /// upstream relay (unlike <c>x-api-key</c>, which its pass-through tier would forward). The router serves the
-    /// request from the plans enrolled for the key (<c>router login claude</c> / <c>router login codex</c>).
-    /// </summary>
-    RouterKey,
-}
-
 /// <summary>
 /// Runs Claude Code headless in a worktree. The child gets an allowlisted
 /// environment: OS basics plus the router URL and router key — never the
@@ -318,7 +297,7 @@ public enum WorkerAuth
 /// run's flag file there: the worker stops after its current tool call and <c>claude --resume</c> continues it.
 /// </summary>
 public sealed class ClaudeWorker(
-    string claudePath, Uri routerBaseUrl, string routerKey, WorkerAuth auth, TimeSpan timeout,
+    string claudePath, Uri routerBaseUrl, string routerKey, TimeSpan timeout,
     WorkerSlots? slots = null, TimeSpan? stopGrace = null, string? pauseFlagDirectory = null, WorkerTools? tools = null) : IWorker
 {
     /// <summary>
@@ -416,7 +395,7 @@ public sealed class ClaudeWorker(
     /// <c>ANTHROPIC_CUSTOM_HEADERS</c> holds two header lines (Claude Code splits it on line breaks): the router key and the session's
     /// model class (<see cref="WorkerModelClass.Header"/>, E8). Nothing names a model: no <c>ANTHROPIC_MODEL</c>, no force-model header.
     /// </summary>
-    public static Dictionary<string, string> BuildRouterVariables(Uri routerBaseUrl, string routerKey, WorkerAuth auth, string modelClass)
+    public static Dictionary<string, string> BuildRouterVariables(Uri routerBaseUrl, string routerKey, string modelClass)
     {
         if (!WorkerModelClass.IsValid(modelClass))
         {
@@ -424,24 +403,23 @@ public sealed class ClaudeWorker(
         }
         if (routerKey.IndexOfAny(['\r', '\n']) >= 0)
         {
-            // In the header lines it would end its own header and could add another (a force-model pin), in every auth mode.
+            // In the header lines it would end its own header and could add another (a force-model pin).
             throw new ArgumentException("The router key contains a line break.", nameof(routerKey));
         }
         var env = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["ANTHROPIC_BASE_URL"] = routerBaseUrl.ToString().TrimEnd('/'),
             ["ANTHROPIC_CUSTOM_HEADERS"] = $"{RouterKeyHeader}: {routerKey}\n{WorkerModelClass.Header}: {modelClass}",
+            // Also as the token, so Claude Code starts without a login and sends it as Authorization: Bearer rk_…, which the
+            // router strips before any upstream relay. The worker holds no provider credential (E5): the router serves the
+            // request from the plans enrolled on it (simple-router login claude|codex).
+            ["ANTHROPIC_AUTH_TOKEN"] = routerKey,
         };
-        if (auth == WorkerAuth.RouterKey)
-        {
-            env["ANTHROPIC_AUTH_TOKEN"] = routerKey;
-        }
         return env;
     }
 
     /// <summary>Unsandboxed environment: OS basics from the parent plus the router variables.</summary>
-    public static Dictionary<string, string> BuildEnvironment(IDictionary parent, Uri routerBaseUrl, string routerKey, WorkerAuth auth,
-        string modelClass)
+    public static Dictionary<string, string> BuildEnvironment(IDictionary parent, Uri routerBaseUrl, string routerKey, string modelClass)
     {
         var env = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var name in PassThroughVariables)
@@ -451,7 +429,7 @@ public sealed class ClaudeWorker(
                 env[name] = value;
             }
         }
-        foreach (var (k, v) in BuildRouterVariables(routerBaseUrl, routerKey, auth, modelClass))
+        foreach (var (k, v) in BuildRouterVariables(routerBaseUrl, routerKey, modelClass))
         {
             env[k] = v;
         }
@@ -653,7 +631,7 @@ public sealed class ClaudeWorker(
         // Sandboxed, the helper makes the worker a process-group leader and the pid reported is sudo's.
         var process = Sandbox is null
             ? StartDirect(workingDirectory, args, modelClass)
-            : Sandbox.Start(workingDirectory, claudePath, args, BuildRouterVariables(routerBaseUrl, routerKey, auth, modelClass));
+            : Sandbox.Start(workingDirectory, claudePath, args, BuildRouterVariables(routerBaseUrl, routerKey, modelClass));
         try
         {
             return await RunStartedAsync(process, callbacks, ct);
@@ -825,7 +803,7 @@ public sealed class ClaudeWorker(
             psi.ArgumentList.Add(arg);
         }
         psi.Environment.Clear();
-        foreach (var (k, v) in BuildEnvironment(Environment.GetEnvironmentVariables(), routerBaseUrl, routerKey, auth, modelClass))
+        foreach (var (k, v) in BuildEnvironment(Environment.GetEnvironmentVariables(), routerBaseUrl, routerKey, modelClass))
         {
             psi.Environment[k] = v;
         }
