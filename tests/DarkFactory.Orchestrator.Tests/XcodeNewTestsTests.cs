@@ -940,21 +940,21 @@ public class XcodePipelineTests
     }
 
     [Fact]
-    public async Task An_xcode_change_escalates_on_risk_threshold_while_codegraph_does_not_index_swift()
+    public async Task An_xcode_change_merges_while_codegraph_does_not_index_swift_recording_no_codegraph_data()
     {
-        // A CodeGraph before C3 (no languageIndexed flag) with no data for the Swift files: the new tests pass, the gate fails closed.
+        // A CodeGraph before C3 (no languageIndexed flag) with no data for the Swift files: the new tests pass, and the gate records the
+        // Swift files as having no CodeGraph data and merges (sc-26254; before, it failed closed).
         var h = XcodeHarness(swift: true, swiftIndexed: false);
 
         var outcome = await h.Run();
 
-        Assert.Equal(WorkState.Escalated, outcome.State);
-        Assert.Empty(h.Merges);
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal([$"merge 1 {Sha1}"], h.Merges);
         Assert.Equal(NewTestsOutcome.Pass, NewTestsResult.FromDetail((await h.Rows()).Single(r => r.Step == RunPipeline.Steps.NewTests).Detail)!.Outcome);
-        Assert.Contains("CodeGraph does not index the language of a changed code file", outcome.Error);
-        Assert.Contains($"{XcodeFixture.Library} (Swift", outcome.Error);
         var gate = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.GateDecision);
-        Assert.StartsWith("Blocked ", gate.Detail);
-        Assert.Contains($"language not indexed by CodeGraph: {XcodeFixture.Library} (Swift", gate.Detail);
+        Assert.StartsWith("Merge ", gate.Detail);
+        var noData = gate.Detail![gate.Detail.IndexOf("no CodeGraph data: its language (Swift) is not indexed by CodeGraph", StringComparison.Ordinal)..];
+        Assert.Contains(XcodeFixture.Library, noData);
     }
 
     [Fact]

@@ -195,16 +195,21 @@ Owner set-up, once (the test skips naming whichever is missing):
    a sealed or protected path escalates instead of merging. Since sc-25382 a normal-tier change must also add an xUnit test
    that fails on the base and passes on the head (`new-tests-fail-on-base`, run sandboxed as `_factory`, so `sudo
    scripts/setup-worker-user.sh` must be in place), and the policy must list that check in `normal` and `protected`.
-4. **CodeGraph, since Phase 3 (sc-25709):** every normal or protected change needs `risk-threshold`, which reads CodeGraph's blast
-   radius for the head and hotspots for the default branch, so a live merge also needs (a) the CodeGraph token in the keychain
-   (account `codegraph-token`, or `CodeGraph:Token` / env `FACTORY_CODEGRAPH_TOKEN`; without one `factory run`/`work` warn at
-   start-up and the gate fails `risk-threshold` at once), (b) `michaeltrefry/dark-factory-sandbox` indexed in the hosted CodeGraph
+4. **CodeGraph, since Phase 3 (sc-25709; optional since sc-26254):** every normal or protected change needs `risk-threshold`,
+   which reads CodeGraph's blast radius for the head and hotspots for the default branch when CodeGraph can give them; without
+   them the gate records `no CodeGraph data: <reason>` per file and decides on size and fix rounds, so a merge does not need
+   CodeGraph. For the CodeGraph tests below (and to see its data used) you need (a) the CodeGraph token in the keychain
+   (account `codegraph-token`, or `CodeGraph:Token` / env `FACTORY_CODEGRAPH_TOKEN`; without one `factory run`/`work` print a
+   note at start-up and the gate records `no CodeGraph data: CodeGraph is not configured …` for every file), (b) `michaeltrefry/dark-factory-sandbox` indexed in the hosted CodeGraph
    (its project's repository URL exactly `https://github.com/michaeltrefry/dark-factory-sandbox`), and (c) CodeGraph's head overlays
    (C4/C6, michaeltrefry/CodeGraph PRs #71/#75) and risk tools (C7, PR #76: `analyze_impact_file`, `file_hotspot`) deployed and the
-   token entitled to them. Missing any of these, the gate waits on `risk-threshold` like pending CI and escalates at
-   `Gate:CiTimeoutMinutes` instead of merging — so `ReviewGateTests`, `IssueTriageTests`' build test, the P2 epic AT2 run and the
-   Phase 1 AT1–AT5 runs (which go through the gate) all need them; `GateNegativeTests` and `FreezeAndStuckTests` escalate before
-   `risk-threshold` is read and do not.
+   token entitled to them. Missing any of these, the gate does NOT wait or escalate for it: it records `no CodeGraph data:
+   <reason>` for the files concerned and merges on the change's other inputs (with no head overlay ready, the blast radius is
+   read from the default-branch index instead, labelled `on the default branch as of <sha>, not the PR head`, and still held to
+   the floor). So `ReviewGateTests`, `IssueTriageTests`' build test, the P2 epic AT2 run and the Phase 1 AT1–AT5 runs (which go
+   through the gate) merge without CodeGraph; they need it only to see its data used in the `gate` row. The CodeGraph tests
+   (`CodeGraphGateTests`: a critical file escalating) need all of (a)–(c). `GateNegativeTests` and `FreezeAndStuckTests`
+   escalate before `risk-threshold` is read either way.
 
 No reviewer model is set anywhere (owner decision 2026-10-09, epic E8, sc-25626): every review and second opinion names
 the router's `high` model class (`x-weave-model-class: high`, never `x-weave-force-model`, which simple-router ignores) and
@@ -483,7 +488,7 @@ FACTORY_E2E=1 FACTORY_E2E_P3_CRITICAL_STORY=sc-<id> FACTORY_E2E_P3_UNREACHABLE_S
 | P3-AT3 `CodeGraphTriageTests.A_triage_session_uses_codegraph_through_the_proxy_and_holds_no_codegraph_token` | `FACTORY_E2E_ISSUES=1`, `GH_TOKEN` (the owner) | opens a fixture issue asking for a `search_graph` lookup; sets `Worker:ClaudePath` to a scanning wrapper (`ScanWrapper`, a Perl script under the test's work root, which the worker user reads through the work root's inherited read entry): as `_factory`, with the exact env and argv the factory gives Claude Code, it compares the SHA-256 of every window of the CodeGraph token's length in its env values, argv, the `--mcp-config` file and every file of the triage worktree with the token's hash (only the hash is written into it), prints `dark-factory-e2e-scan {…counts…}` as the session's first (raw) line, then `exec`s the real `claude` | the session's events hold a `mcp__codegraph__search_graph` tool_use whose result carries the factory's commit label ("CodeGraph's index of …"); the session that made it is tainted (a `session_taints` row for its session id; the row keeps the first reason, `issue-text` for a triage, so the MCP use is evidenced by the stored tool_use); the scan line shows 0 hits in env, argv, `--mcp-config` and worktree (and that it saw variables, arguments, the config file and files); no stored event holds the token; then, through the production proxy with a triage grant (the test as its MCP client, `OutboundHttp.LoopbackMcp`), `tools/list` is exactly `search_graph`, `get_code_snippet`, `read_node_source`, `analyze_impact` is refused with JSON-RPC -32602, `search_graph` answers with the commit label, and the Kanban endpoint is 404. No `search_graph` call is `INCONCLUSIVE`. Cleanup: the issue is closed |
 | Epic AT5 Kanban `CodeGraphTriageTests.A_reviewer_session_can_call_a_kanban_read_tool_and_is_never_offered_a_write_tool` | a Kanban token | none (no model: the test plays the reviewer's tool_use blocks) | the reviewers' tools offer `list_projects` and only tools on `McpServers.KanbanTools`, no write tool; `list_projects` answers (not an error), recorded with its hash and size; `create_work_item` asked for anyway answers "There is no tool named …" and is not forwarded |
 | P3-AT4 (a) `CodeGraphGateTests.A_pr_touching_a_critical_file_escalates_on_risk_threshold` | `FACTORY_E2E_P3_CRITICAL_STORY` | finds a critical file itself: every normal-tier `src/**/*.cs` file on the sandbox's main (at most 60) asked of `analyze_impact_file` at CodeGraph's default-branch index commit (`file_hotspot`'s `indexCommitSha`) until one answers `critical`; then, before the first (seeded) review, appends `// [dark-factory e2e] P3-AT4 blast-radius probe` to it on the PR branch as the workers' App | the last `gate` row is `Blocked …risk threshold: blast radius at <head> over <limit>: <file> critical…` (`gate_rejected`; the limit's wording depends on the sandbox policy's version, so the test asserts only the prefix and `<file> critical`); MergeGate → Escalated; no `gate-passed`, no Merge; the PR not merged. Needs a critical file on the sandbox's main (none found: the test skips saying so) — see **Seeding a critical file** below. Cleanup: the PR is closed and its branch deleted |
-| P3-AT4 (b) `CodeGraphGateTests.With_codegraph_unreachable_the_gate_waits_then_blocks_and_does_not_merge` | `FACTORY_E2E_P3_UNREACHABLE_STORY` (and a CodeGraph token: without one the check fails at once instead of waiting) | `CodeGraph:BaseUrl` = `http://127.0.0.1:9/` (a closed port: every CodeGraph call is refused), `CodeGraph:OverlayTimeoutMinutes` = 1, `Gate:CiTimeoutMinutes` = 10 (it also bounds the CI wait before MergeGate, so this assumes the sandbox's CI finishes within 10 minutes; a slower CI escalates at CI instead and the test fails); the panel seeded | every `codegraph-overlay` row is not ready; the last `gate` row is `Blocked …CodeGraph could still not be read after 00:10:00 (Gate:CiTimeoutMinutes)…` (`gate_rejected`); MergeGate → Escalated; nothing merged. The pending evaluations themselves are not ledger rows (only decisions are, by design), so "pending" shows as the not-ready overlay rows and the Blocked reason naming the timeout. Cleanup: the PR is closed and its branch deleted |
+| P3-AT4 (b) `CodeGraphGateTests.With_codegraph_unreachable_the_gate_records_no_codegraph_data_and_merges` (rewritten by sc-26254; before, it waited and blocked at `Gate:CiTimeoutMinutes`) | `FACTORY_E2E_P3_UNREACHABLE_STORY`: a story whose fix lands in normal code (the gate will merge it), and a CodeGraph token (without one CodeGraph is not configured and not asked at all) | `CodeGraph:BaseUrl` = `http://127.0.0.1:9/` (a closed port: every CodeGraph call is refused), `CodeGraph:OverlayTimeoutMinutes` = 1; the panel seeded | every `codegraph-overlay` row is not ready; the last `gate` row is a `Merge` whose inputs record `no CodeGraph data: CodeGraph could not be reached or asked: …` for the touched files; MergeGate → Merge; the PR merged |
 
 In-process versions (every `dotnet test`): `ReviewerToolLoopTests` (tool calls with hash and size, every turn's class, the report's
 tool errors), `ReviewOverlayTests`, `McpProxyTests` (the triage session's env/argv/worktree with a fake CLI, the proxy's refusals, the
@@ -1335,12 +1340,12 @@ ledger** and its own work root (`E2e`), and takes every worker slot's lock of th
 
 **Read before running anything — order and preconditions:**
 
-- **P5-AT5's first part (`P5_AT5_the_gate_refuses_…`) must be run live BEFORE CodeGraph C3 (sc-26137) is deployed, and its
-  second part (`P5_AT5_the_gate_accepts_…`) AFTER.** The refusal of an unindexed Swift change can only be shown while CodeGraph
-  does not index Swift (the first part skips once it does), and the acceptance only once it does. Missing the window before C3
-  means the refusal is never shown live.
-- **P5-AT1–AT4 and P5-AT5's second part skip until C3 indexes Swift** (prerequisite 6). Skipped is not passed: they are run
-  again after C3.
+- **P5-AT5a (`P5_AT5a_the_gate_records_no_codegraph_data_…`) must be run live BEFORE CodeGraph C3 (sc-26137) is deployed, and
+  P5-AT5b (`P5_AT5b_the_gate_uses_codegraphs_data_…`) AFTER.** An unindexed Swift change recorded as having no CodeGraph data
+  can only be shown while CodeGraph does not index Swift (AT5a skips once it does), and CodeGraph's data of Swift files used
+  only once it does. Missing the window before C3 means AT5a is never shown live.
+- **P5-AT1–AT4 do not depend on CodeGraph** (sc-26254: the factory works with or without CodeGraph): before C3 their Swift
+  files are recorded in the `gate` row as `no CodeGraph data: its language (Swift) is not indexed by CodeGraph` and they merge.
 - **P5-AT3 and P5-AT4 one at a time, never side by side**: both raise the one run counter of the iOS app
   (`e2e-ios/Tally/E2eRun.swift`) from main's value, so two runs at once would raise it to the same number and the later merge
   would conflict or its test prove nothing.
@@ -1371,18 +1376,16 @@ ledger** and its own work root (`E2e`), and takes every worker slot's lock of th
    `CODEOWNERS` covering the sealed paths, and a CI workflow that runs the unit tests on pull requests (its `pull_request`
    trigger must also match `factory/**` bases if LensWorks plans are run: "CI that cannot run" in `CLAUDE.md`). The tests read
    the policy from `main` through the gate App and skip naming the step when it is missing.
-6. **CodeGraph**: the token (`FACTORY_CODEGRAPH_TOKEN` or keychain `codegraph-token`), and every target repository (the sandbox,
-   LensWorks, the iOS repository) indexed. **Until CodeGraph C3 (sc-26137) is deployed and indexes Swift, the gate blocks every
-   Swift change on `risk-threshold`** (`CodeGraph does not index the language of a changed code file …`; the gate row's inputs say
-   `language not indexed by CodeGraph`; sc-26133: fail closed). So **P5-AT1–AT4 and P5-AT5's second part can only pass after
-   C3**: each asks CodeGraph first about a Swift file of its repository on `main` (`SwiftLive.LanguageIndexedAsync`: `file_hotspot`,
-   then `analyze_impact_file` at the default-branch index commit that answer names, decided by the gate's own rule over both
-   answers, `LanguageCoverage.Of`; no flag at all means a CodeGraph before C3) and SKIPS saying so while Swift is not indexed.
-   P5-AT5's first part is the opposite and skips once Swift is indexed. The probe FAILS — it never skips — when CodeGraph answers
-   either tool with an error, or counts the language as indexed while it has no data for the file (`found` not true): a probe
-   that read either as "not indexed" would leave the merging tests skipping for ever and the refusal test running on a false
-   premise. P5-AT6 does not depend on it (the gate rejects the test
-   before it asks CodeGraph).
+6. **CodeGraph** (only P5-AT5 needs it, sc-26254): the token (`FACTORY_CODEGRAPH_TOKEN` or keychain `codegraph-token`) and the
+   sandbox indexed. While CodeGraph C3 (sc-26137, the contract still consumed for the record) is not deployed or does not index
+   Swift, the gate records each changed Swift file as `no CodeGraph data: its language (Swift) is not indexed by CodeGraph` and
+   decides `risk-threshold` on the change's size and fix rounds — the change merges. P5-AT5 asks CodeGraph first about a Swift
+   file of the sandbox's package on `main` (`SwiftLive.LanguageIndexedAsync`: `file_hotspot`, then `analyze_impact_file` at the
+   default-branch index commit that answer names, decided by the gate's own rule over both answers, `LanguageCoverage.Of`; no flag
+   at all means a CodeGraph before C3): AT5a skips once Swift is indexed, AT5b until it is. The probe FAILS — it never skips —
+   when CodeGraph answers either tool with an error, or counts the language as indexed while it has no data for the file (`found`
+   not true): a probe that read either as "not indexed" would leave AT5b skipping for ever and AT5a running on a false premise.
+   P5-AT1–AT4 and P5-AT6 do not ask CodeGraph.
 7. **The seeds** (once, by an owner's pull request to each repository's `main`): the tests seed only a test, and the production
    change it needs, into a target that already exists on the base — a test target the base lacks cannot be run there (the check
    would be `unsupported`; `SwiftLiveTests.Without_the_package_on_the_base_the_merging_change_could_not_be_run_there`). Copy:
@@ -1430,12 +1433,12 @@ then needs a `Repo:` line naming it.)
 
 | AT | Test (`SwiftAcceptanceTests.`) | Variables | Setup it does | Expected |
 | --- | --- | --- | --- | --- |
-| P5-AT1 | `P5_AT1_a_lensworks_change_with_a_new_swift_testing_test_merges_with_no_human` | `FACTORY_E2E_P5_LENSWORKS_STORY`: a To Do story with a `Repo: michaeltrefry/LensWorks` line asking for a small change to the Compositor app and a new Swift Testing (`@Test`) test of it in `CompositorTests` that fails without the change (the test may call API the change adds: it is then `not-built` on the base) | none: a real implementer, the real high-class panel, LensWorks' CI | the item's ledger repo is LensWorks; a typed outcome on every row; the last `new-tests` row `pass`, its strategies holding `xcode-swift-testing`, with a `CompositorTests/…` test not passing on the base and `passed` on the head; the last `gate` row a `Merge` decision (`passed`) listing `new-tests-fail-on-base` and naming no unindexed file; `gate-passed` = the head the check judged; MergeGate → Merge → Watch; the last verdict passed, on the high class, for that head; the PR merged at that head, its merge commit the Merge row's; `CompositorTests`, read from the merge commit's project, a macOS unit-test bundle; the story Done |
+| P5-AT1 | `P5_AT1_a_lensworks_change_with_a_new_swift_testing_test_merges_with_no_human` | `FACTORY_E2E_P5_LENSWORKS_STORY`: a To Do story with a `Repo: michaeltrefry/LensWorks` line asking for a small change to the Compositor app and a new Swift Testing (`@Test`) test of it in `CompositorTests` that fails without the change (the test may call API the change adds: it is then `not-built` on the base) | none: a real implementer, the real high-class panel, LensWorks' CI | the item's ledger repo is LensWorks; a typed outcome on every row; the last `new-tests` row `pass`, its strategies holding `xcode-swift-testing`, with a `CompositorTests/…` test not passing on the base and `passed` on the head; the last `gate` row a `Merge` decision (`passed`) listing `new-tests-fail-on-base`; `gate-passed` = the head the check judged; MergeGate → Merge → Watch; the last verdict passed, on the high class, for that head; the PR merged at that head, its merge commit the Merge row's; `CompositorTests`, read from the merge commit's project, a macOS unit-test bundle; the story Done |
 | P5-AT2 | `P5_AT2_a_swiftpm_change_with_a_new_xctest_test_merges` | `FACTORY_E2E_P5_SWIFTPM_STORY` | pushes `e2e-swift/Sources/DfE2eSwift/P<run>.swift` (a new function) and `e2e-swift/Tests/DfE2eSwiftTests/P<run>Tests.swift` (an XCTest test calling it) | AT1's ledger checks with strategy `swift-testing`; `DfE2eSwiftTests.P<run>Tests/testDoubles` `not-built` on the base (it calls code the PR adds) and `passed` on the head; merged; **the sandbox's main then holds both files** (one pair per run, safe to delete) |
 | P5-AT3 | `P5_AT3_an_ios_app_change_with_a_new_unit_test_run_in_the_simulator_merges` | `FACTORY_E2E_P5_IOS_UNIT_STORY`; optional `FACTORY_E2E_P5_IOS_REPO`, `FACTORY_E2E_P5_IOS_DIR` | raises `e2e-ios/Tally/E2eRun.swift`'s count to main's + 1 and pushes `e2e-ios/TallyTests/E2eUnit<run>Tests.swift` (XCTest: `E2eRun.count >= <count>`) | strategy `xcode-swift-testing`; `TallyTests/E2eUnit<run>Tests/testRunCountReached()` `failed` on the base and `passed` on the head, each on the run's own fresh iOS Simulator as the sandbox user; merged; its target, read at the merge commit, an **iOS** unit-test bundle; **main's run count goes up by one** |
 | P5-AT4 | `P5_AT4_an_ios_ui_test_runs_in_the_simulator_and_merges` | `FACTORY_E2E_P5_IOS_UI_STORY` (+ the same optional two) | raises the count likewise and pushes `e2e-ios/TallyUITests/E2eUi<run>UITests.swift` (XCUITest: launch the app, read the `e2e-runs` label, `>= <count>`) | `TallyUITests/E2eUi<run>UITests/testRunCountShown()` `failed` on the base and `passed` on the head (the S0 way: everything that needs the simulator booted in one helper run, a fresh device per run, deleted after); merged; its target an **iOS UI-test** bundle |
-| P5-AT5 (a) | `P5_AT5_the_gate_refuses_a_swift_change_while_codegraph_does_not_index_swift` | `FACTORY_E2E_P5_UNINDEXED_STORY`; skips once CodeGraph indexes Swift | AT2's change | the `new-tests` row `pass` (nothing else blocks it); the last `gate` row `Blocked …CodeGraph does not index the language of a changed code file…` (`gate_rejected`), its inputs `language not indexed by CodeGraph: e2e-swift/Sources/DfE2eSwift/P<run>.swift (Swift…`; MergeGate → Escalated; nothing merged; the PR closed and its branch deleted at the end |
-| P5-AT5 (b) | `P5_AT5_the_gate_accepts_the_swift_change_once_codegraph_indexes_swift` | `FACTORY_E2E_P5_INDEXED_STORY`; skips until CodeGraph (C3) answers `languageIndexed: true` for Swift | AT2's change | merged as AT2; the `gate` row's inputs list the Swift source file's blast radius (`codegraph blast radius at …`) and no `language not indexed` |
+| P5-AT5 (a) | `P5_AT5a_the_gate_records_no_codegraph_data_for_an_unindexed_swift_change_and_merges` | `FACTORY_E2E_P5_UNINDEXED_STORY`: a story whose fix lands in normal code (the gate will merge it); skips once CodeGraph indexes Swift | AT2's change | merged as AT2; the last `gate` row a `Merge` whose inputs record `no CodeGraph data: its language (Swift) is not indexed by CodeGraph…: …e2e-swift/Sources/DfE2eSwift/P<run>.swift…` (sc-26254; before, the gate refused it) |
+| P5-AT5 (b) | `P5_AT5b_the_gate_uses_codegraphs_data_of_the_swift_change_once_codegraph_indexes_swift` | `FACTORY_E2E_P5_INDEXED_STORY`; skips until CodeGraph (C3) answers `languageIndexed: true` for Swift | AT2's change | merged as AT2; the `gate` row's blast radius list (`codegraph blast radius at …`) names the Swift source file, and no Swift file is recorded as not indexed |
 | P5-AT6 | `P5_AT6_a_new_swift_test_that_already_passes_on_the_base_is_gate_rejected` | `FACTORY_E2E_P5_SWIFT_PASSING_STORY`: a sandbox bug story whose text tells the implementer to add **no** .NET/xUnit test (a rejected result names only the first strategy that rejected; the test fails naming the strategy that did, `SwiftLive.RejectedByProblem`) | pushes `e2e-swift/Tests/DfE2eSwiftTests/E2eAlreadyPassing.swift` (Swift Testing, `#expect(1 + 1 == 2)`) | the last `new-tests` row `rejected` (`gate_rejected`), strategy `swift-testing`, `DfE2eSwiftTests.e2eAlreadyPassesOnTheBase()` `passed` on both and named in the reason; the last `gate` row `Blocked …new-tests-fail-on-base (rejected)…`; MergeGate → Escalated; nothing merged; the PR closed and its branch deleted |
 
 **By hand after the runs:** the non-merging tests leave their story In Progress with an escalation comment (move it back or
@@ -1455,7 +1458,7 @@ iOS rules (`SwiftLive.EpicProblems`, `SwiftLive.IosProblem`).
 
 A runbook step, then a read-only check of the real ledger.
 
-1. Prerequisites as above (C3 deployed and Swift indexed: before it every Swift change escalates at the gate), with the
+1. Prerequisites as above (CodeGraph not needed: without C3 the Swift files are recorded as having no CodeGraph data), with the
    factory's real ledger and settings: `Worker__Swift=true`, `Worker__Slots=2`, `Intake__MaxConcurrentRuns=2` if the stories may
    run side by side, `Factory__Repos` naming LensWorks and the iOS repository.
 2. One real LensWorks epic: at least two of its stories To Do with a

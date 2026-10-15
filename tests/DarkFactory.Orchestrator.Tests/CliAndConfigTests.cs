@@ -347,17 +347,19 @@ public class FactoryOptionsTests
     }
 
     [Fact]
-    public async Task Factory_run_and_work_warn_at_start_up_without_a_codegraph_token_and_still_start()
+    public async Task Factory_run_and_work_note_at_start_up_without_a_codegraph_token_and_still_start()
     {
-        Assert.Null(FactoryRunner.CodeGraphTokenWarning(Options(new() { ["CodeGraph:Token"] = "cg_config" })));
+        Assert.Null(FactoryRunner.CodeGraphTokenNote(Options(new() { ["CodeGraph:Token"] = "cg_config" })));
         if (Environment.GetEnvironmentVariable("FACTORY_CODEGRAPH_TOKEN") is not null)
         {
             return; // the environment supplies a token
         }
-        const string warning = "no CodeGraph token (CodeGraph:Token, env FACTORY_CODEGRAPH_TOKEN, or keychain account 'codegraph-token' "
-            + "(service 'dark-factory')): the merge gate will merge no change whose tier requires risk-threshold";
-        // `factory work` prints the same warning (Program.cs, through CodeGraphTokenWarning) before it starts.
-        Assert.Equal(warning, FactoryRunner.CodeGraphTokenWarning(Options([])));
+        // sc-26254: informational only — the gate merges without CodeGraph, recording no CodeGraph data.
+        const string warning = "note: no CodeGraph token (CodeGraph:Token, env FACTORY_CODEGRAPH_TOKEN, or keychain account 'codegraph-token' "
+            + "(service 'dark-factory')): the merge gate records no CodeGraph data for every file and decides risk-threshold on the change's "
+            + "size and fix rounds; reviewers and triage get no CodeGraph tools";
+        // `factory work` prints the same note (FactoryRunner.CheckWorkStartAsync, through CodeGraphTokenNote) before it starts.
+        Assert.Equal(warning, FactoryRunner.CodeGraphTokenNote(Options([])));
         var stderr = new StringWriter();
         var calls = new List<string>();
 

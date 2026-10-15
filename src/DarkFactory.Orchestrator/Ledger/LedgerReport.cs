@@ -20,6 +20,9 @@ public static class LedgerReport
 
     private const int MaxFragment = 400;
 
+    /// <summary>The longest list of files with no CodeGraph data a gate row's line shows (sc-26254).</summary>
+    private const int MaxNoCodeGraphData = 2000;
+
     /// <summary>How many failing tools' names a review's (or its second opinions') tool use names; the rest are counted.</summary>
     public const int MaxFailingToolsShown = 3;
 
@@ -344,7 +347,11 @@ public static class LedgerReport
         switch (row.Step)
         {
             case RunPipeline.Steps.GateDecision:
-                return $"merge gate: {Code(row.Detail ?? "")}";
+                // The files CodeGraph gave no data for (sc-26254) are at the end of the row, past the clip: said on their own.
+                var detail = row.Detail ?? "";
+                var noData = detail.IndexOf(CodeGraphRisk.NoDataMark, StringComparison.Ordinal);
+                return $"merge gate: {Code(detail)}"
+                    + (noData < 0 ? "" : $"; {UntrustedText.CodeSpan(Clip(detail[(noData + CodeGraphRisk.NoDataSeparator.Length)..], MaxNoCodeGraphData))}");
             case RunPipeline.Steps.CiFailure when CiTriage.FromDetail(row.Detail) is { } triage:
                 return $"CI on {Code(Ci.Short(triage.HeadSha))} failed: the PR's {List(triage.Fixable)}; not the PR's {List(triage.NotThePrs)}";
             case RunPipeline.Steps.MergeConflict:

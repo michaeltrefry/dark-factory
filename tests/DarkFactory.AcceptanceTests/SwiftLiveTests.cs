@@ -167,8 +167,9 @@ public class SwiftLiveTests
             ["swift-testing"], _ => true), p => p.Contains("no expected new test", StringComparison.Ordinal));
         Assert.Contains(SwiftLive.MergedProblems(Merged(Result(NewTestsOutcome.Rejected, "swift-testing", Seeded), gate), ["swift-testing"], _ => true),
             p => p.StartsWith("new-tests is rejected", StringComparison.Ordinal));
-        Assert.Contains(SwiftLive.MergedProblems(Merged(Result(NewTestsOutcome.Pass, "swift-testing", Seeded), $"{gate}; {SwiftLive.UnindexedMark}: a.swift (Swift)"),
-            ["swift-testing"], _ => true), p => p.Contains("does not index", StringComparison.Ordinal));
+        // sc-26254: a Merge that records a Swift file as having no CodeGraph data is a merge like any other.
+        Assert.Empty(SwiftLive.MergedProblems(Merged(Result(NewTestsOutcome.Pass, "swift-testing", Seeded), $"{gate}; {SwiftLive.UnindexedSwiftMark}: a.swift"),
+            ["swift-testing"], t => t.Test == "T/C/test()"));
         Assert.Contains(SwiftLive.MergedProblems(Merged(Result(NewTestsOutcome.Pass, "swift-testing", Seeded), $"{GateOutcome.Blocked} head1: no"),
             ["swift-testing"], _ => true), p => p.StartsWith("the last gate row is not a Merge decision", StringComparison.Ordinal));
         var escalated = Merged(Result(NewTestsOutcome.Pass, "swift-testing", Seeded), gate)[..^2];
@@ -269,7 +270,7 @@ public class SwiftLiveTests
     public void The_live_checks_name_the_gates_own_words_for_an_unindexed_language()
     {
         var risk = new CodeGraphRisk("head1", [], [], [], Unindexed: [new UnindexedFile("a.swift", "Swift", Flagged: true)]);
-        Assert.Contains(SwiftLive.UnindexedMark, risk.Describe());
-        Assert.Contains("a.swift (Swift)", risk.Describe());
+        Assert.Contains($"{SwiftLive.UnindexedSwiftMark}: a.swift", risk.Describe());
+        Assert.Contains($"{SwiftLive.UnindexedSwiftMark}: a.swift", risk.Judged(["a.swift"]).Describe());
     }
 }

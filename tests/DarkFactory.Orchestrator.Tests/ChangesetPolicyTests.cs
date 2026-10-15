@@ -187,10 +187,11 @@ public class ChangesetPolicyTests
             var hot = Evaluate(V4.Replace("max_hotspot: off", "max_hotspot: 0.5", StringComparison.Ordinal), Lines(1), changeset,
                 risk: TestRisk.With(Head, Lines(1), _ => BlastRadius.Low, _ => 0.9));
             Assert.Contains("over max_hotspot 0.5", Assert.Single(hot.Reasons));
-            // CodeGraph not read at all still fails the check.
+            // CodeGraph not read at all: recorded as no CodeGraph data, decided on the rest (sc-26254), for either kind.
             var change = new ChangeFacts(Lines(1), null, 0, changeset);
-            Assert.Equal(GateOutcome.Blocked,
-                MergeGate.Evaluate(V4, null, TestPolicies.Counting(Pull, change), change, Green, [Full], PassingTests).Outcome);
+            var none = MergeGate.Evaluate(V4, null, TestPolicies.Counting(Pull, change), change, Green, [Full], PassingTests);
+            Assert.Equal(GateOutcome.Merge, none.Outcome);
+            Assert.Contains("no CodeGraph data: CodeGraph is not configured", none.Inputs);
         }
     }
 

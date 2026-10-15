@@ -419,17 +419,18 @@ public class CodeGraphGateTests
     }
 
     /// <summary>
-    /// P3-AT4 (b): with CodeGraph unreachable (<c>CodeGraph:BaseUrl</c> = a closed loopback port, <see cref="Unreachable"/>) the gate
-    /// waits on risk-threshold like pending CI — the overlay of the head cannot be read, recorded as a not-ready
-    /// <c>codegraph-overlay</c> checkpoint — and at <c>Gate:CiTimeoutMinutes</c> (10 here: it also bounds the CI wait before MergeGate, so the sandbox CI must finish within it) records Blocked and escalates; nothing merges.
-    /// The pending evaluations themselves are not ledger rows (by design: only decisions are), so "pending" shows as the not-ready
-    /// overlay row and the Blocked reason naming the timeout.
+    /// P3-AT4 (b), since sc-26254 (the factory works with or without CodeGraph): with CodeGraph unreachable (<c>CodeGraph:BaseUrl</c>
+    /// = a closed loopback port, <see cref="Unreachable"/>) the gate does not wait for it: the overlay of the head cannot be read
+    /// (a not-ready <c>codegraph-overlay</c> checkpoint), every touched file is recorded in the Merge <c>gate</c> row as
+    /// <c>no CodeGraph data: CodeGraph could not be reached or asked</c>, risk-threshold is decided on the change's size and fix rounds,
+    /// and the pull request merges.
     /// </summary>
     [Fact]
-    public async Task With_codegraph_unreachable_the_gate_waits_then_blocks_and_does_not_merge()
+    public async Task With_codegraph_unreachable_the_gate_records_no_codegraph_data_and_merges()
     {
         Harness.RequireOptIn();
-        var storyId = E2e.Story("FACTORY_E2E_P3_UNREACHABLE_STORY", "a To Do bug story whose fix lands in normal code of the sandbox repo");
+        var storyId = E2e.Story("FACTORY_E2E_P3_UNREACHABLE_STORY",
+            "a To Do bug story whose fix lands in normal code of the sandbox repo (the gate will merge it)");
         await using var e2e = await E2e.StartAsync("df_e2e_p3at4_unreachable");
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         timeout.CancelAfter(RunTimeout);
@@ -438,9 +439,8 @@ public class CodeGraphGateTests
         {
             ["CodeGraph:BaseUrl"] = Unreachable,
             ["CodeGraph:OverlayTimeoutMinutes"] = "1",
-            ["Gate:CiTimeoutMinutes"] = "10", // also bounds the CI wait before MergeGate: the sandbox CI must finish within it
         });
-        CodeGraphLive.RequireToken(options); // without a token risk-threshold fails at once instead of waiting
+        CodeGraphLive.RequireToken(options); // a configured CodeGraph that cannot be reached (without a token it is not asked at all)
         await ReviewGateTests.RequireGateReadyAsync(options, ct);
         using var sandbox = new SandboxRepo(options, options.DefaultRepo);
         try
@@ -449,11 +449,19 @@ public class CodeGraphGateTests
             var outcome = await FactoryRunner.RunAsync(options, WorkSourceRegistry.Shortcut(options, shortcutHttp), storyId, ignoreScope: true,
                 Console.Out, ct, gate => gate with { Reviewer = new SeededReviewer() });
 
-            await AssertEscalatedAtTheGateAsync(e2e, options, storyId, outcome, "CodeGraph could still not be read after 00:10:00 (Gate:CiTimeoutMinutes)", ct);
+            Assert.True(outcome.Succeeded, outcome.Error);
             var history = await e2e.HistoryAsync(storyId, ct);
+            ReviewGateTests.AssertTypedOutcomes(history);
+            Assert.Contains(history, e => e.Step is null && e.State == WorkState.Merge);
+            var gate = history.Last(e => e.Step == RunPipeline.Steps.GateDecision);
+            Assert.StartsWith($"{GateOutcome.Merge} ", gate.Detail);
+            Assert.Contains($"{CodeGraphRisk.NoDataPrefix}CodeGraph could not be reached or asked", gate.Detail);
             var overlays = history.Where(e => e.Step == RunPipeline.Steps.CodeGraphOverlay).Select(e => CodeGraphOverlay.FromDetail(e.Detail)).ToList();
             Assert.NotEmpty(overlays);
             Assert.All(overlays, o => Assert.False(o?.IsReady ?? false, $"an overlay was ready with CodeGraph unreachable: {o?.Describe}"));
+            var url = RunPipeline.LinkedPullRequestUrl(history);
+            var pr = (await E2e.PullRequestsAsync(options.DefaultRepo, storyId, ct)).Single(p => p.GetProperty("html_url").GetString() == url);
+            Assert.NotEqual(JsonValueKind.Null, pr.GetProperty("merged_at").ValueKind);
         }
         finally
         {

@@ -466,7 +466,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
     /// The CodeGraph token (<c>CodeGraph:Token</c>, env <c>FACTORY_CODEGRAPH_TOKEN</c>, or keychain account <c>codegraph-token</c>):
     /// owner-side only, sent by the reviewers' CodeGraph client and nowhere else (E5). Optional: without it the factory starts and
     /// reviewers' <c>analyze_impact</c> answers an error result (recorded in the verdict) instead of asking CodeGraph, and the merge
-    /// gate's <c>risk-threshold</c> fails wherever a tier requires it (sc-25709: CodeGraph's blast radius cannot be read).
+    /// gate's <c>risk-threshold</c> records no CodeGraph data for every file and decides on size and fix rounds (sc-26254).
     /// </summary>
     public string CodeGraphToken =>
         Secret("CodeGraph:Token", "FACTORY_CODEGRAPH_TOKEN", SecretAccounts.CodeGraphToken, "CodeGraph token");
