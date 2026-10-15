@@ -316,22 +316,27 @@ public sealed class WorkerSlots : IWorkerSandbox
     /// slot there is no other slot's user to open it to, and only the root's listing is read.
     /// </summary>
     public Task EnsureOnlyWorkerWritesAsync(string path, CancellationToken ct) =>
-        EnsureOnlyWriterAsync(path, Current.User, ListAcl, AclRetry, ct, inside: Count > 1 ? EntryAcl : null);
+        EnsureOnlyWriterAsync(path, Current.User, ListAcl, AclRetry, ct, inside: Count > 1 ? EntryAcl : null,
+            owners: Count > 1 ? EntryOwners : null);
 
     /// <summary>How one entry's ACL inside a worktree is read (<see cref="WorktreeWriters.NativeAcl"/>); tests give their own.</summary>
     internal Func<string, string?> EntryAcl { get; init; } = WorktreeWriters.NativeAcl;
+
+    /// <summary>For a slot's user, the reader of who owns one entry inside a worktree (<see cref="WorktreeWriters.NativeOwners"/>); tests give their own.</summary>
+    internal Func<string, Func<string, string?>> EntryOwners { get; init; } = WorktreeWriters.NativeOwners;
 
     /// <summary>
     /// Throws (<see cref="WorktreeWritersException"/>) unless <paramref name="listAcl"/>'s <c>ls -led</c> of the worktree
     /// <paramref name="path"/> shows no writer but its owner and <paramref name="user"/> (<see cref="WritersBeside"/>) and — with
     /// <paramref name="inside"/>, the reader of one entry's ACL: several worker slots — nothing inside it does either
-    /// (<see cref="WorktreeWriters.Inside"/>; the root's group bit is then judged too). Read up to <see cref="PushAclReads"/>
+    /// (<see cref="WorktreeWriters.Inside"/>; the root's group bit is then judged too) — nor, with <paramref name="owners"/>,
+    /// does anyone but the owner and <paramref name="user"/> own an entry inside it (sc-26134). Read up to <see cref="PushAclReads"/>
     /// times, <paramref name="retry"/> apart, before a writer fails it (<c>ls</c> prints an entry's UUID instead of its user name,
     /// and an ACL entry has no name, while the directory service does not answer): a refusal escalates the item and its finished
     /// work is thrown away with its worktree, so one slow answer must not decide. A listing that cannot be read fails it at once.
     /// </summary>
     internal static async Task EnsureOnlyWriterAsync(string path, string user, Func<string, CancellationToken, Task<string>> listAcl,
-        TimeSpan retry, CancellationToken ct, Func<string, string?>? inside = null)
+        TimeSpan retry, CancellationToken ct, Func<string, string?>? inside = null, Func<string, Func<string, string?>>? owners = null)
     {
         for (var attempt = 1; ; attempt++)
         {
@@ -348,7 +353,8 @@ public sealed class WorkerSlots : IWorkerSandbox
             if (why is null && inside is not null)
             {
                 // Off the caller's thread: a walk of the whole tree, a system call or two per entry.
-                why = await Task.Run(() => WorktreeWriters.Inside(path, user, inside, ct), ct);
+                // The owner reader is made again each attempt: the user's lookup may not have answered the last time.
+                why = await Task.Run(() => WorktreeWriters.Inside(path, user, inside, ct, owners?.Invoke(user)), ct);
             }
             if (why is null)
             {

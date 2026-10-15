@@ -22,28 +22,38 @@ public class XcodebuildWrapperTests
     private string Ran => Path.Combine(_dir, "stub-ran");
 
     /// <summary>The copy, its xcodebuild the stub (which writes <c>ARG</c> and <c>ENV</c> lines to <see cref="Ran"/>).</summary>
-    private string Wrapper()
-    {
-        var stub = SandboxSupport.Executable(_dir, "stub-xcodebuild", $$"""
-            #!/bin/sh
+    private string Wrapper(string then = "") => WrapperCopy(_dir, $$"""
             for a in "$@"; do echo "ARG $a"; done >> '{{Ran}}'
             /usr/bin/env | sed 's/^/ENV /' >> '{{Ran}}'
+            {{then}}
             """);
+
+    /// <summary>A copy of the repo's wrapper in <paramref name="dir"/> whose xcodebuild is a <c>/bin/sh</c> stub running <paramref name="stubBody"/> in the working directory.</summary>
+    internal static string WrapperCopy(string dir, string stubBody)
+    {
+        var stub = SandboxSupport.Executable(dir, "stub-xcodebuild", "#!/bin/sh\n" + stubBody + "\n");
         var text = File.ReadAllText(RepoWrapper);
         Assert.Equal(1, CountLines(text, RealLine));
-        return SandboxSupport.Executable(_dir, "factory-xcodebuild", text.Replace("\n" + RealLine + "\n", $"\nxcodebuild={stub}\n"));
+        return SandboxSupport.Executable(dir, "factory-xcodebuild", text.Replace("\n" + RealLine + "\n", $"\nxcodebuild={stub}\n"));
     }
+
+    /// <summary>What Xcode makes in a project it opens with no <c>project.xcworkspace</c> (seen with Xcode 26, under umask 022 and 077 alike): every directory 0777 (sc-26134). After a moment, so its birth time is past the run's stamp even on a file system with coarse timestamps.</summary>
+    internal const string XcodeMakesWorkspace = """
+        sleep 0.05
+        mkdir -p App.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/configuration
+        chmod -R 777 App.xcodeproj/project.xcworkspace
+        """;
 
     private static int CountLines(string text, string line) => text.Split('\n').Count(l => l == line);
 
     private async Task<(int ExitCode, string Stderr, string[] Args, Dictionary<string, string> Env)> RunAsync(
-        string[] args, Dictionary<string, string>? env = null, string? workingDirectory = null)
+        string[] args, Dictionary<string, string>? env = null, string? workingDirectory = null, string then = "")
     {
         if (File.Exists(Ran))
         {
             File.Delete(Ran);
         }
-        var psi = new ProcessStartInfo(Wrapper()) { WorkingDirectory = workingDirectory ?? _dir, RedirectStandardOutput = true, RedirectStandardError = true };
+        var psi = new ProcessStartInfo(Wrapper(then)) { WorkingDirectory = workingDirectory ?? _dir, RedirectStandardOutput = true, RedirectStandardError = true };
         foreach (var arg in args)
         {
             psi.ArgumentList.Add(arg);
@@ -463,5 +473,82 @@ public class XcodebuildWrapperTests
         var text = File.ReadAllText(RepoWrapper);
         Assert.Contains("derived_data=" + SwiftToolchain.DerivedDataRootOf("$home") + "/$work_key\n", text);
         Assert.Contains("source_packages=" + SwiftToolchain.SourcePackagesOf("$home") + "\n", text);
+        Assert.Contains("stamp=$runs/$work_key\n", text);
+        Assert.Contains("local runs=" + Path.GetDirectoryName(SwiftToolchain.BuildStampOf("$home", "/opt/w/a")) + " ", text);
+    }
+
+    private static UnixFileMode Mode(string path) => File.GetUnixFileMode(path);
+
+    private const UnixFileMode Open777 = (UnixFileMode)0b111_111_111;
+    private const UnixFileMode Dir755 = (UnixFileMode)0b111_101_101;
+
+    /// <summary>
+    /// sc-26134: Xcode makes what it creates in a project 0777 whatever the umask, and with several worker slots the factory refuses
+    /// to push a worktree with an entry another user may write — every first iOS build threw its session's work away. Once its
+    /// xcodebuild has returned (whatever its exit status, which it keeps) the wrapper takes group and other write off exactly what
+    /// was born in the working directory during the run: nothing older, however open, and no link's target.
+    /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(65)]
+    public async Task What_the_run_made_writable_for_others_in_the_working_directory_is_closed_before_the_wrapper_returns(int exitCode)
+    {
+        var work = Directory.CreateDirectory(Path.Combine(_dir, "proj")).FullName;
+        Directory.CreateDirectory(Path.Combine(work, "App.xcodeproj"));
+        var older = Directory.CreateDirectory(Path.Combine(work, "older")).FullName;
+        File.SetUnixFileMode(older, Open777); // open before the run: still the push check's to refuse
+        var outside = Directory.CreateDirectory(Path.Combine(_dir, "outside")).FullName;
+        File.SetUnixFileMode(outside, Open777);
+        var home = SandboxSupport.PasswdHome();
+        var stamp = SwiftToolchain.BuildStampOf(home, Physical(work));
+
+        var (code, stderr, _, _) = await RunAsync(["build", "-scheme", "App", "-destination", "generic/platform=iOS Simulator"], workingDirectory: work,
+            then: XcodeMakesWorkspace + $"""
+
+            echo resolved > Package.resolved
+            chmod 666 Package.resolved
+            mkdir group-only && chmod 775 group-only
+            ln -s '{outside}' link-out
+            exit {exitCode}
+            """);
+
+        Assert.Equal(exitCode, code);
+        Assert.Equal("", stderr);
+        var workspace = Path.Combine(work, "App.xcodeproj", "project.xcworkspace");
+        foreach (var directory in new[] { workspace, Path.Combine(workspace, "xcshareddata"), Path.Combine(workspace, "xcshareddata", "swiftpm"),
+            Path.Combine(workspace, "xcshareddata", "swiftpm", "configuration"), Path.Combine(work, "group-only") })
+        {
+            Assert.Equal(Dir755, Mode(directory));
+        }
+        Assert.Equal((UnixFileMode)0b110_100_100, Mode(Path.Combine(work, "Package.resolved")));
+        Assert.Equal(Open777, Mode(older)); // older than the run: untouched
+        Assert.Equal(Open777, Mode(outside)); // a link's target: untouched
+        Assert.False(File.Exists(stamp)); // the clean-up ran: the stamp is gone
+    }
+
+    [Fact]
+    public async Task A_run_killed_before_its_clean_up_leaves_its_stamp_and_the_next_run_closes_what_it_made()
+    {
+        var work = Directory.CreateDirectory(Path.Combine(_dir, "proj")).FullName;
+        var stamp = SwiftToolchain.BuildStampOf(SandboxSupport.PasswdHome(), Physical(work));
+        Directory.CreateDirectory(Path.GetDirectoryName(stamp)!);
+        File.WriteAllText(stamp, ""); // as a killed run left it
+        try
+        {
+            await Task.Delay(50); // past the stamp even with coarse timestamps
+            var killed = Directory.CreateDirectory(Path.Combine(work, "made-by-the-killed-run")).FullName;
+            File.SetUnixFileMode(killed, Open777);
+
+            var (code, stderr, _, _) = await RunAsync(["-list"], workingDirectory: work);
+
+            Assert.Equal(0, code);
+            Assert.Equal("", stderr);
+            Assert.Equal(Dir755, Mode(killed));
+            Assert.False(File.Exists(stamp));
+        }
+        finally
+        {
+            File.Delete(stamp);
+        }
     }
 }

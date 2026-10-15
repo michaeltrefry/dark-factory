@@ -52,6 +52,14 @@ public sealed record SwiftToolchain(
     /// <summary>The directory under which the wrapper keeps every working directory's DerivedData, for the user whose home is <paramref name="home"/>.</summary>
     public static string DerivedDataRootOf(string home) => $"{home}/Library/Developer/Xcode/DerivedData/dark-factory";
 
+    /// <summary>
+    /// The stamp of the wrapper's xcodebuild run in <paramref name="workingDirectory"/> (its physical path) for the user whose home
+    /// is <paramref name="home"/> (sc-26134): made before xcodebuild starts, removed once what the run made writable for others in
+    /// the working directory has been closed again; one a killed run left is kept by the next run, whose clean-up then covers both.
+    /// </summary>
+    public static string BuildStampOf(string home, string workingDirectory) =>
+        $"{home}/Library/Caches/dark-factory/xcodebuild-runs/{Sha256(workingDirectory)[..16]}";
+
     /// <summary>The wrapper's SwiftPM checkouts (<c>-clonedSourcePackagesDirPath</c>) for the user whose home is <paramref name="home"/>.</summary>
     public static string SourcePackagesOf(string home) => $"{home}/Library/Caches/dark-factory/SourcePackages";
 

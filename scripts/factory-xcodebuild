@@ -233,10 +233,47 @@ if [ -n "$tmpdir" ] && [ ! -L "$tmpdir" ] && [ -d "$tmpdir" ] && [ -O "$tmpdir" 
     env+=("TMPDIR=$tmpdir")
 fi
 
+# Xcode makes what it creates in a project it opens 0777 WHATEVER THE UMASK (sc-26134; seen with Xcode 26 under umask 022 and
+# 077 alike: -list or a build of a project with no project.xcworkspace makes <p>.xcodeproj/project.xcworkspace/xcshareddata/
+# swiftpm/configuration, every directory drwxrwxrwx; one that already exists is left as it is). With several worker slots the
+# factory refuses to push a worktree with an entry another user may write (WorktreeWriters, sc-25990), so every first build of
+# an iOS project would throw its session's work away. So xcodebuild is not exec'd: once it has returned, every entry INSIDE the
+# working directory that this user owns, that was born after the run began and that its group or everyone may write loses those
+# write bits (chmod go-w; links are not chosen, and chmod changes only what this user owns). Nothing older is touched (an entry made writable before the run,
+# by anyone, is still the push check's to refuse) and nothing of another user's (the push check refuses an entry another user
+# owns, sc-26134). When the run began is a stamp file in the user's own home, one per working directory, made before xcodebuild
+# starts and removed after the clean-up: a run that never got there (killed: a Bash tool's timeout, a Stop) leaves it, and the
+# next run in this working directory keeps the older stamp, so its clean-up covers what the killed run made too.
+# Residual, accepted: while xcodebuild runs, what it made 0777 is writable by every user who can reach it (another slot's user,
+# through the work root's read entry) until this clean-up. What they CREATE there is theirs and refused at the push; a file of
+# this user's that they CHANGE in that window is not seen (the push check's own residual: a file open while the session ran
+# and closed again before the push).
+run_xcodebuild() {
+    local runs=$home/Library/Caches/dark-factory/xcodebuild-runs stamp status=0 uid
+    /bin/mkdir -p -- "$runs" || exit 70
+    stamp=$runs/$work_key
+    if [ -L "$stamp" ] || [ ! -f "$stamp" ]; then
+        { /bin/rm -f -- "$stamp" && : > "$stamp"; } || { echo "factory-xcodebuild: could not write $stamp" >&2; exit 70; }
+    fi
+    /usr/bin/env -i "${env[@]}" "$xcodebuild" "$@" || status=$?
+    uid=$(/usr/bin/id -u)
+    # Born after the stamp: the birth time, which macOS keeps. Where find cannot read one (GNU find on Linux: only this script's
+    # tests run there), the inode change time — wider (an older entry changed during the run counts too), never narrower.
+    born=-newerBm
+    [ "$(/usr/bin/uname -s)" = Darwin ] || born=-cnewer
+    if /usr/bin/find "$work_dir" "$born" "$stamp" -user "$uid" ! -type l \( -perm -020 -o -perm -002 \) -exec /bin/chmod go-w {} +; then
+        /bin/rm -f -- "$stamp"
+    else
+        echo "factory-xcodebuild: could not take group and other write off what this build made in $work_dir; the factory will refuse to push it" >&2
+        [ "$status" -ne 0 ] || status=70
+    fi
+    exit "$status"
+}
+
 if [ "$list" -eq 1 ]; then
     [ -z "$scheme$destination$configuration$result_bundle$parallel" ] && [ ${#filters[@]} -eq 0 ] && [ "$quiet" -eq 0 ] \
         || refuse "-list with anything but -project or -workspace"
-    exec /usr/bin/env -i "${env[@]}" "$xcodebuild" -list ${container[@]+"${container[@]}"} -clonedSourcePackagesDirPath "$source_packages"
+    run_xcodebuild -list ${container[@]+"${container[@]}"} -clonedSourcePackagesDirPath "$source_packages"
 fi
 
 [ -n "$action" ] || usage
@@ -262,4 +299,4 @@ args+=(${filters[@]+"${filters[@]}"})
 args+=(-derivedDataPath "$derived_data" -clonedSourcePackagesDirPath "$source_packages")
 args+=(-skipMacroValidation -skipPackagePluginValidation)
 args+=(CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER= PROVISIONING_PROFILE=)
-exec /usr/bin/env -i "${env[@]}" "$xcodebuild" "${args[@]}"
+run_xcodebuild "${args[@]}"
