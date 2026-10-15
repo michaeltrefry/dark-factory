@@ -257,7 +257,11 @@ run_xcodebuild() {
     fi
     /usr/bin/env -i "${env[@]}" "$xcodebuild" "$@" || status=$?
     uid=$(/usr/bin/id -u)
-    if /usr/bin/find "$work_dir" -newerBm "$stamp" -user "$uid" ! -type l \( -perm -020 -o -perm -002 \) -exec /bin/chmod go-w {} +; then
+    # Born after the stamp: the birth time, which macOS keeps. Where find cannot read one (GNU find on Linux: only this script's
+    # tests run there), the inode change time — wider (an older entry changed during the run counts too), never narrower.
+    born=-newerBm
+    [ "$(/usr/bin/uname -s)" = Darwin ] || born=-cnewer
+    if /usr/bin/find "$work_dir" "$born" "$stamp" -user "$uid" ! -type l \( -perm -020 -o -perm -002 \) -exec /bin/chmod go-w {} +; then
         /bin/rm -f -- "$stamp"
     else
         echo "factory-xcodebuild: could not take group and other write off what this build made in $work_dir; the factory will refuse to push it" >&2

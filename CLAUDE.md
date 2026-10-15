@@ -2065,8 +2065,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   is skipped (ignored ones included), and nothing is chmod-ed owner-side before it. Instead the xcodebuild wrapper
   (`scripts/factory-xcodebuild`, every form that runs xcodebuild, `-list` and `--gate` included) no longer `exec`s it: once
   xcodebuild has returned (its exit status kept), it takes group and other write (`chmod go-w`) off every entry INSIDE the
-  working directory that the running user owns, that is no link and that was BORN after the run began (`find -newerBm`
-  against a stamp, `SwiftToolchain.BuildStampOf`: `~/Library/Caches/dark-factory/xcodebuild-runs/<key>`, one per working
+  working directory that the running user owns, that is no link and that was BORN after the run began (`find -newerBm`; on
+  Linux, where GNU find reads no birth time and only the wrapper's tests run, `-cnewer`, wider) against a stamp, `SwiftToolchain.BuildStampOf`: `~/Library/Caches/dark-factory/xcodebuild-runs/<key>`, one per working
   directory, made before xcodebuild starts and removed after the clean-up; a run killed before its clean-up — a Bash tool's
   timeout, a Stop — leaves it, and the next run there keeps the older stamp, so its clean-up covers what the killed run made
   too, and whatever was born between the two runs). Nothing older is touched (an entry opened before the run is still the
