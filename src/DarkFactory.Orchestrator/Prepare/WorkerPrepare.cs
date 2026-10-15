@@ -51,6 +51,9 @@ public sealed class WorkerPrepare(ArtifactFetcher fetcher, string spoolRoot, Tex
 
     public TimeSpan PollInterval { get; init; } = DefaultPollInterval;
 
+    /// <summary>Whether a session's spool is polled in the background (always in production; tests that poll by hand turn it off).</summary>
+    internal bool PollsInBackground { get; init; } = true;
+
     /// <summary>
     /// The recipe in <paramref name="worktree"/>, read owner-side without trusting the tree: <c>.factory</c> must not be a link, and
     /// the file is read through <c>.factory</c>'s own descriptor (<see cref="SafeFile.ReadAt"/>: the directory opened with
@@ -242,6 +245,7 @@ public sealed class PrepareSpoolSession : IAsyncDisposable
     private readonly CancellationTokenSource _stop = new();
     private readonly Task _loop;
     private readonly HashSet<string> _handled = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim _polling = new(1, 1);
     private readonly WorkerPrepare _prepare;
     private readonly string _worktree;
     private readonly Func<ArtifactDownloaded, CancellationToken, Task>? _onDownloaded;
@@ -252,7 +256,7 @@ public sealed class PrepareSpoolSession : IAsyncDisposable
         Action<string>? onFailed, TextWriter log)
     {
         (_prepare, Directory, _worktree, _onDownloaded, _onFailed, _log) = (prepare, directory, worktree, onDownloaded, onFailed, log);
-        _loop = Task.Run(LoopAsync);
+        _loop = prepare.PollsInBackground ? Task.Run(LoopAsync) : Task.CompletedTask;
     }
 
     public string Directory { get; }
@@ -270,7 +274,15 @@ public sealed class PrepareSpoolSession : IAsyncDisposable
         {
             do
             {
-                await PollOnceAsync(_stop.Token);
+                try
+                {
+                    await PollOnceAsync(_stop.Token);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException && ex is not OutOfMemoryException)
+                {
+                    // Whatever one poll meets, the session's later requests are still answered.
+                    _log.WriteLine($"[prepare] a poll of the request spool failed: {ex.Message}");
+                }
             }
             while (await timer.WaitForNextTickAsync(_stop.Token));
         }
@@ -279,7 +291,24 @@ public sealed class PrepareSpoolSession : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// One pass over the spool. Passes never overlap (a second caller waits for the first), so a request is answered exactly once,
+    /// and every complete request a pass saw is answered (or failed to be written) when it returns.
+    /// </summary>
     internal async Task PollOnceAsync(CancellationToken ct)
+    {
+        await _polling.WaitAsync(ct);
+        try
+        {
+            await PollLockedAsync(ct);
+        }
+        finally
+        {
+            _polling.Release();
+        }
+    }
+
+    private async Task PollLockedAsync(CancellationToken ct)
     {
         IEnumerable<string> files;
         try
@@ -355,5 +384,6 @@ public sealed class PrepareSpoolSession : IAsyncDisposable
             _log.WriteLine($"[prepare] could not remove the request spool {Directory}: {ex.Message}");
         }
         _stop.Dispose();
+        _polling.Dispose();
     }
 }

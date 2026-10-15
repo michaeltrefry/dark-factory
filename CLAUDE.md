@@ -2320,7 +2320,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `openat` from it — so a `.factory` swapped for a link after the check is never followed), applying every download rule,
   filling the cache and writing `response-<id>` (NUL fields: `ok` and the plan with every placeholder expanded,
   `PrepareSteps.WorkerPlan`, or `error` and why) — written to a fresh random name and renamed into place (whole; a link the
-  worker planted at that name is replaced, never followed). A session's spool is answered with a fetch at most
+  worker planted at that name is replaced, never followed). Each request id is answered exactly once: passes over a spool never
+  overlap (`PrepareSpoolSession.PollOnceAsync` waits for the pass before it, so a pass returns only once every complete request
+  it saw is answered), and a pass that throws is logged and the next one still runs (sc-26134). A session's spool is answered with a fetch at most
   `WorkerPrepare.MaxRequestsPerSession` (20) times; every later request is answered `error` at once. A failed fetch is answered
   with `ArtifactFetchException.WorkerMessage` — for a hash mismatch "… does not match the pinned sha256 <pinned>", never the
   served bytes' hash — while the full reason is an `artifact-fetch` `failed: …` checkpoint. The spool's downloads and failures
