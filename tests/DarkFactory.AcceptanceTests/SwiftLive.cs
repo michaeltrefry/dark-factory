@@ -216,8 +216,8 @@ internal static class SwiftLive
     /// reads and by the gate's own rule (<see cref="LanguageCoverage.Of"/>; pure). <paramref name="impact"/>: the
     /// <c>analyze_impact_file</c> answer, null when it was not read; a C4 <c>notIndexed</c> answer (no ready overlay of the commit
     /// asked at) counts as not read. An error answer of either tool throws — the probe fails, it never skips on it: a CodeGraph that
-    /// cannot answer would otherwise leave the merging tests skipping for ever and the refusal test (P5-AT5a) running on a false
-    /// premise. And a file the rule counts as indexed must be one CodeGraph knows (<c>found: true</c>): an answer about a path
+    /// cannot answer would otherwise leave P5-AT5b skipping for ever and P5-AT5a (an unindexed Swift change recorded as no CodeGraph
+    /// data) running on a false premise. And a file the rule counts as indexed must be one CodeGraph knows (<c>found: true</c>): an answer about a path
     /// CodeGraph has no data for says nothing of its language. Before C3 (no flag) a Swift file CodeGraph has no graph data for is
     /// unindexed by the rule (<see cref="LanguageCoverage.UnindexedBeforeC3"/>).
     /// </summary>
@@ -275,14 +275,17 @@ internal static class SwiftLive
         }
     }
 
-    /// <summary>Skips unless CodeGraph indexes Swift in <paramref name="repo"/> (a merge of a Swift change needs it: AT1–AT5b).</summary>
+    /// <summary>
+    /// Skips unless CodeGraph indexes Swift in <paramref name="repo"/>: only P5-AT5b, which shows the gate USING CodeGraph's data of
+    /// Swift files. No merge needs it (sc-26254: without it the gate records no CodeGraph data and merges).
+    /// </summary>
     public static async Task RequireSwiftIndexedAsync(FactoryOptions options, RepoRef repo, string path, CancellationToken ct)
     {
         var (indexed, said) = await LanguageIndexedAsync(options, repo, path, ct);
         if (!indexed)
         {
-            Assert.Skip($"{said}. Until CodeGraph C3 (sc-26137) is deployed and indexes Swift, the gate blocks every Swift change on "
-                + "risk-threshold (`language not indexed by CodeGraph`), so this merging test cannot pass yet.");
+            Assert.Skip($"{said}. P5-AT5b shows the gate using CodeGraph's data of Swift files, which needs CodeGraph C3 (sc-26137) "
+                + "deployed and indexing Swift; until then run P5-AT5a.");
         }
     }
 
@@ -390,10 +393,6 @@ internal static class SwiftLive
             {
                 problems.Add($"the gate's Merge decision does not list {GateChecks.NewTestsFailOnBase}");
             }
-            if (detail.Contains(UnindexedMark, StringComparison.Ordinal))
-            {
-                problems.Add($"the gate's Merge decision names a file CodeGraph does not index: {detail}");
-            }
         }
         var passed = history.LastOrDefault(e => e.Step == RunPipeline.Steps.GatePassed)?.Detail;
         if (passed is null || newTests is null || passed != newTests.HeadSha)
@@ -493,9 +492,9 @@ internal static class SwiftLive
                 + string.Join(", ", ios.Select(t => $"{t.Id} {t.Test} {t.Base}"));
     }
 
-    /// <summary>How a <c>gate</c> row's CodeGraph inputs name a file whose language CodeGraph does not index (<see cref="CodeGraphRisk.Describe"/>).</summary>
-    public const string UnindexedMark = "language not indexed by CodeGraph";
-
-    /// <summary>How the gate's reason names it (<see cref="MergeGate"/>, sc-26133).</summary>
-    public const string UnindexedReason = "CodeGraph does not index the language of a changed code file";
+    /// <summary>
+    /// How a <c>gate</c> row's CodeGraph inputs name a Swift file CodeGraph does not index (<see cref="CodeGraphRisk.Describe"/>,
+    /// <see cref="UnindexedFile.Reason"/>): recorded as no CodeGraph data, never blocking (sc-26254).
+    /// </summary>
+    public const string UnindexedSwiftMark = CodeGraphRisk.NoDataPrefix + "its language (Swift) is not indexed by CodeGraph";
 }

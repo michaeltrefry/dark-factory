@@ -58,26 +58,38 @@ public sealed record HotspotAnswer(bool IsError, string Text, string? CommitSha,
 
 /// <summary>
 /// A touched file whose language CodeGraph does not index (sc-26133, P5 S7): its blast radius and hotspot are unknown, not none, so
-/// <c>risk-threshold</c> fails closed on it. <see cref="Language"/>: the language's name (CodeGraph's, else the factory's by extension),
-/// or null when neither names one. <see cref="Flagged"/>: CodeGraph said so (<c>languageIndexed: false</c>); false — CodeGraph answered
-/// no flag (it predates C3) and the factory knows that language was not indexed before C3 (<see cref="LanguageCoverage.UnindexedBeforeC3"/>).
+/// <c>risk-threshold</c> records it as having no CodeGraph data (sc-26254) and decides on the change's other inputs.
+/// <see cref="Language"/>: the language's name (CodeGraph's, else the factory's by extension), or null when neither names one.
+/// <see cref="Flagged"/>: CodeGraph said so (<c>languageIndexed: false</c>); false — CodeGraph answered no flag (it predates C3) and the
+/// factory knows that language was not indexed before C3 (<see cref="LanguageCoverage.UnindexedBeforeC3"/>).
 /// </summary>
 public sealed record UnindexedFile(string Path, string? Language, bool Flagged)
 {
-    /// <summary>How the gate's reason and row name it: the file and its language.</summary>
+    /// <summary>How the gate's row names it: the file and its language.</summary>
     public override string ToString() =>
         $"{Path} ({Language ?? "language unknown"}{(Flagged ? "" : "; CodeGraph answered no languageIndexed flag (before C3)")})";
+
+    /// <summary>Why the file has no CodeGraph data, as <see cref="NoCodeGraphData.Reason"/> says it.</summary>
+    public string Reason =>
+        $"its language ({Language ?? "unknown"}) is not indexed by CodeGraph{(Flagged ? "" : " (CodeGraph answered no languageIndexed flag: before C3)")}";
 }
+
+/// <summary>
+/// A touched file for which CodeGraph gave the gate no usable input (sc-26254), and why: CodeGraph not configured, unreachable or
+/// refusing, the repository not indexed, no ready overlay of the head, an answer for another commit or file, an unreadable answer, or
+/// a language CodeGraph does not index. <c>risk-threshold</c> then decides on the file's other inputs; the reason is recorded.
+/// </summary>
+public sealed record NoCodeGraphData(string Path, string Reason);
 
 /// <summary>
 /// Whether CodeGraph indexes a touched file's language (sc-26133, P5 S7; the CodeGraph side is C3, sc-26137). The contract: the
 /// structured content of <c>analyze_impact_file</c> and <c>file_hotspot</c> carries <c>languageIndexed</c> (boolean: false only for a
 /// source file of a language CodeGraph does not index; true for an indexed language and for a file that is not code) and
-/// <c>language</c> (CodeGraph's capitalised name of the file's language — <c>Swift</c>, <c>C#</c>, <c>C++</c> — or null). Owner
-/// decision 2026-10-14: the gate fails closed on a changed code file whose language CodeGraph does not index, and passes once it does.
-/// Rule (<see cref="Of"/>), per file, after BOTH answers: <c>languageIndexed: false</c> in either → unindexed; <c>true</c> in either and
-/// <c>false</c> in neither → indexed; neither carries the flag (a CodeGraph that predates C3; E7: .NET and Rust are unchanged) →
-/// unindexed only when the file's extension is one of <see cref="UnindexedBeforeC3"/> and CodeGraph had no graph data for it
+/// <c>language</c> (CodeGraph's capitalised name of the file's language — <c>Swift</c>, <c>C#</c>, <c>C++</c> — or null). Since
+/// sc-26254 (owner decision 2026-10-15: the factory works with or without CodeGraph) such a file is recorded as having no CodeGraph
+/// data, never blocking. Rule (<see cref="Of"/>), per file, after both answers: <c>languageIndexed: false</c> in either → unindexed;
+/// <c>true</c> in either and <c>false</c> in neither → indexed; neither carries the flag (a CodeGraph that predates C3) → unindexed
+/// only when the file's extension is one of <see cref="UnindexedBeforeC3"/> and CodeGraph had no graph data for it
 /// (<c>analyze_impact_file</c>'s <c>found</c> not true: a CodeGraph with graph data for a file indexes its language). CodeGraph's
 /// <c>language</c> is shown only when it is an inert name (<see cref="Name"/>); otherwise the factory's name by extension stands in.
 /// </summary>
@@ -85,8 +97,8 @@ public static class LanguageCoverage
 {
     /// <summary>
     /// The code languages, by extension (case-insensitive), CodeGraph's main did not index before C3 (checked against its source,
-    /// 2026-10-14: Swift is indexed only on a feature branch). <c>.m</c> is also MATLAB's: such a file is blocked too until C3 says
-    /// otherwise — a false block, never a false pass.
+    /// 2026-10-14: Swift is indexed only on a feature branch). <c>.m</c> is also MATLAB's: such a file is recorded with no CodeGraph
+    /// data too until C3 says otherwise (sc-26254).
     /// </summary>
     public static readonly IReadOnlyDictionary<string, string> UnindexedBeforeC3 = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
     {
@@ -202,24 +214,51 @@ public sealed record FileHotspot(string Path, double Score, bool Found, string C
 /// <summary>
 /// CodeGraph's inputs to <c>risk-threshold</c> for one evaluation (sc-25709), read fresh: each touched file's blast radius for exactly
 /// <see cref="HeadSha"/> (E3) and its hotspot score on the default branch, each recorded with the commit CodeGraph named (the
-/// default-branch exception of E3). <see cref="Unreadable"/>: what could not be read (CodeGraph unreachable or refusing, the repository
-/// not indexed, no ready overlay of the head, an answer for another commit or file, or an unreadable one; the reader stops at the
-/// first): non-empty, <c>risk-threshold</c> is pending unless a file already read is over a limit — the gate waits like pending CI and
-/// escalates at <c>Gate:CiTimeoutMinutes</c> (E4). <see cref="OverlayUnusable"/>: CodeGraph answered that it has no usable overlay of
-/// the head (C4's <c>notIndexed</c>, e.g. a ready overlay gone stale once the default branch moved past its base), so a recorded ready
-/// overlay must not be reused: the next read requests the overlay again. <see cref="Unindexed"/>: the touched files whose language
-/// CodeGraph does not index (<see cref="LanguageCoverage"/>, sc-26133): each fails <c>risk-threshold</c> closed.
+/// default-branch exception of E3). <see cref="NoData"/> (sc-26254): the touched files CodeGraph gave no usable input for, and why
+/// (CodeGraph unreachable or refusing, the repository not indexed, no ready overlay of the head, an answer for another commit or file,
+/// or an unreadable one; a file may be named once per tool) — the gate decides on the file's other inputs and records the reason.
+/// <see cref="OverlayUnusable"/>: CodeGraph answered that it has no usable overlay of the head (C4's <c>notIndexed</c>, e.g. a ready
+/// overlay gone stale once the default branch moved past its base), so a recorded ready overlay must not be reused: the gate requests
+/// the overlay again once. <see cref="Unindexed"/>: the touched files whose language CodeGraph does not index
+/// (<see cref="LanguageCoverage"/>, sc-26133): their blast radius and hotspot are not used, and each is recorded as having no
+/// CodeGraph data (<see cref="Judged"/>).
 /// </summary>
 public sealed record CodeGraphRisk(string HeadSha, IReadOnlyList<FileBlastRadius> BlastRadius, IReadOnlyList<FileHotspot> Hotspots,
-    IReadOnlyList<string> Unreadable, bool OverlayUnusable = false, IReadOnlyList<UnindexedFile>? Unindexed = null)
+    IReadOnlyList<NoCodeGraphData> NoData, bool OverlayUnusable = false, IReadOnlyList<UnindexedFile>? Unindexed = null)
 {
     /// <summary>The touched files whose language CodeGraph does not index (none when <see cref="Unindexed"/> is null).</summary>
     public IReadOnlyList<UnindexedFile> UnindexedFiles => Unindexed ?? [];
 
+    /// <summary>Every one of <paramref name="files"/> with no CodeGraph data at <paramref name="headSha"/>, for the one <paramref name="reason"/>.</summary>
+    public static CodeGraphRisk None(string headSha, IEnumerable<string> files, string reason) =>
+        new(headSha, [], [], files.Select(f => new NoCodeGraphData(f, reason)).ToList());
+
     /// <summary>
-    /// How many files <see cref="Describe"/> lists beyond those over a limit and the worst and hottest (and how many unreadable entries
-    /// it quotes), so one <c>gate</c> row stays well inside the reports' budget (<see cref="Ledger.LedgerReport.MaxFactsLength"/>) whatever
-    /// the PR's size: the rest are counted.
+    /// What the gate judges, for exactly <paramref name="files"/>: the blast radii and hotspots of files whose language CodeGraph indexes,
+    /// and every other file with no CodeGraph data and why — <see cref="NoData"/> and any file the inputs leave out (the unindexed files
+    /// are added by <see cref="AllNoData"/>, their language the one reason).
+    /// </summary>
+    public CodeGraphRisk Judged(IReadOnlyList<string> files)
+    {
+        var unindexed = UnindexedFiles.Select(u => u.Path).ToHashSet(StringComparer.Ordinal);
+        var blast = BlastRadius.Where(f => !unindexed.Contains(f.Path)).ToList();
+        var hot = Hotspots.Where(f => !unindexed.Contains(f.Path)).ToList();
+        // An unindexed file's reason is its language (AllNoData), whatever else its answers said.
+        var noData = NoData.Where(n => !unindexed.Contains(n.Path)).ToList();
+        foreach (var file in files.Where(f => !unindexed.Contains(f)))
+        {
+            if (noData.All(n => n.Path != file) && (blast.All(b => b.Path != file) || hot.All(h => h.Path != file)))
+            {
+                noData.Add(new NoCodeGraphData(file, "CodeGraph's inputs leave it out"));
+            }
+        }
+        return this with { BlastRadius = blast, Hotspots = hot, NoData = noData };
+    }
+
+    /// <summary>
+    /// How many files <see cref="Describe"/> lists beyond those over a limit and the worst and hottest (and how many files with no data
+    /// it names per reason, and how many reasons), so one <c>gate</c> row stays well inside the reports' budget
+    /// (<see cref="Ledger.LedgerReport.MaxFactsLength"/>) whatever the PR's size: the rest are counted.
     /// </summary>
     public const int MaxListed = 20;
 
@@ -230,9 +269,18 @@ public sealed record CodeGraphRisk(string HeadSha, IReadOnlyList<FileBlastRadius
     public FileHotspot? Hottest => Hotspots.OrderByDescending(f => f.Score).FirstOrDefault();
 
     /// <summary>
+    /// Every file with no CodeGraph data and why: <see cref="NoData"/>, and each unindexed file (<see cref="UnindexedFiles"/>) with its
+    /// language as the reason.
+    /// </summary>
+    public IReadOnlyList<NoCodeGraphData> AllNoData => [.. NoData, .. UnindexedFiles.Select(u => new NoCodeGraphData(u.Path, u.Reason))];
+
+    /// <summary>How many distinct files have no CodeGraph data.</summary>
+    public int NoDataFiles => AllNoData.Select(n => n.Path).Distinct(StringComparer.Ordinal).Count();
+
+    /// <summary>
     /// The inputs as the <c>gate</c> checkpoint records them: each file's blast radius at the head and each hotspot score with its commit
     /// — every file over <paramref name="limit"/> or <paramref name="maxHotspot"/>, the worst and the hottest, then the first
-    /// <see cref="MaxListed"/> others, and how many more there are — and what could not be read (<see cref="UnreadableText"/>).
+    /// <see cref="MaxListed"/> others, and how many more there are — and the files with no CodeGraph data (<see cref="NoDataText"/>).
     /// </summary>
     public string Describe(BlastRadius? limit = null, double? maxHotspot = null)
     {
@@ -244,12 +292,21 @@ public sealed record CodeGraphRisk(string HeadSha, IReadOnlyList<FileBlastRadius
             f => (maxHotspot is { } m && f.Score > m) || ReferenceEquals(f, hottest), f => $"{f.Path} {Score(f.Score)}{(f.Found ? "" : " (no data)")}", ", "));
         return $"codegraph blast radius at {HeadSha}: {(BlastRadius.Count == 0 ? "none read" : blast)}"
             + $"; hotspot score (riskScore) on the default branch: {(Hotspots.Count == 0 ? "none read" : string.Join("; ", hot))}"
-            + (UnindexedFiles.Count == 0 ? "" : $"; language not indexed by CodeGraph: {Listed(UnindexedFiles, _ => false, u => u.ToString(), ", ")}")
-            + (Unreadable.Count == 0 ? "" : $"; unreadable: {UnreadableText}");
+            + (AllNoData.Count == 0 ? "" : $"; {NoDataText}");
     }
 
-    /// <summary>What could not be read: the first <see cref="MaxListed"/> entries, and how many more.</summary>
-    public string UnreadableText => Listed(Unreadable, _ => false, u => u, "; ");
+    /// <summary>Where the files with no CodeGraph data start in a <c>gate</c> row (<see cref="Describe"/>), as the reports find them.</summary>
+    public const string NoDataMark = "; " + NoDataPrefix;
+
+    /// <summary>How a <c>gate</c> row and the reports name a file with no CodeGraph data (sc-26254).</summary>
+    public const string NoDataPrefix = "no CodeGraph data: ";
+
+    /// <summary>
+    /// The files with no CodeGraph data, by reason — <c>no CodeGraph data: &lt;reason&gt;: &lt;files&gt;</c> — each reason's files, and
+    /// the reasons, capped at <see cref="MaxListed"/> with how many more.
+    /// </summary>
+    public string NoDataText => Listed(AllNoData.GroupBy(n => n.Reason, StringComparer.Ordinal).ToList(), _ => false,
+        g => $"{NoDataPrefix}{g.Key}: {Listed(g.Select(n => n.Path).ToList(), _ => false, p => p, ", ")}", "; ");
 
     /// <summary>Every item <paramref name="always"/> picks, the first <see cref="MaxListed"/> of the others (in order), and "… N more".</summary>
     private static string Listed<T>(IReadOnlyList<T> items, Func<T, bool> always, Func<T, string> text, string separator)
@@ -293,10 +350,14 @@ public sealed class HotspotCache
 /// Reads <see cref="CodeGraphRisk"/> for a PR head (sc-25709), owner-side: the project pinned by exact repository URL
 /// (<see cref="ICodeGraphOverlays.FindProjectAsync"/>), then per touched file <c>analyze_impact_file</c> with <c>sha</c> = the head
 /// and <c>depth</c> = <see cref="ImpactDepth"/> (only once CodeGraph's overlay of the head is ready: <see cref="Overlays"/>, waited
-/// for by the pipeline), then per file <c>file_hotspot</c> (default branch only). It stops at the first input it cannot read
-/// (<see cref="CodeGraphRisk.Unreadable"/>): the gate is pending then anyway, and reads everything again. A file CodeGraph has no data
-/// for (<c>found: false</c>, e.g. a new file) counts as blast radius none and hotspot 0 (owner decision 2026-10-10); its hotspot is
-/// recorded at CodeGraph's <c>indexCommitSha</c>, since C7 names no metrics commit (<c>commitSha</c> null) for a file without metrics.
+/// for by the pipeline, bounded by <c>CodeGraph:OverlayTimeoutMinutes</c>), then per file <c>file_hotspot</c> (default branch only).
+/// Whatever it cannot read is recorded per file (<see cref="CodeGraphRisk.NoData"/>, sc-26254) and the read goes on: a file's answer
+/// that cannot be used (an error answer, another commit or file, an unreadable one) concerns that file only; a call that cannot be made
+/// at all (CodeGraph unreachable, refusing over HTTP, a timeout) or C4's <c>notIndexed</c> (no usable overlay of the head) ends that
+/// tool's calls, its remaining files recorded with the same reason, so an unreachable CodeGraph costs one call per tool, not one per
+/// file. A file CodeGraph has no data for (<c>found: false</c>, e.g. a new file) counts as blast radius none and hotspot 0 (owner
+/// decision 2026-10-10); its hotspot is recorded at CodeGraph's <c>indexCommitSha</c>, since C7 names no metrics commit
+/// (<c>commitSha</c> null) for a file without metrics.
 /// </summary>
 public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overlayTimeout, TimeSpan? pollInterval = null)
 {
@@ -310,35 +371,17 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
     public ReviewOverlays Overlays { get; } = new(codeGraph, overlayTimeout, pollInterval);
 
     /// <param name="hotspots">
-    /// Hotspot scores read earlier in the same wait: one read at the ready overlay's base commit is used instead of asking again.
+    /// Hotspot scores read earlier (e.g. before an overlay was requested again): one read at the ready overlay's base commit is used
+    /// instead of asking again.
     /// </param>
     public async Task<CodeGraphRisk> ReadAsync(RepoRef repo, string headSha, CodeGraphOverlay overlay, IReadOnlyList<string> paths, CancellationToken ct,
         HotspotCache? hotspots = null)
     {
-        var unreadable = new List<string>();
+        var noData = new List<NoCodeGraphData>();
         var blast = new List<FileBlastRadius>();
         var scores = new List<FileHotspot>();
         var unindexed = new List<UnindexedFile>();
-        // Each file's language is judged once both its answers are read (Judge, LanguageCoverage.Of); a file whose hotspot was not read
-        // (the read stopped at an unreadable input) is unindexed already when its impact answer says so.
-        var impacts = new Dictionary<string, ImpactFileAnswer>();
-        CodeGraphRisk Result(bool overlayUnusable = false)
-        {
-            foreach (var (path, answer) in impacts)
-            {
-                if (answer.LanguageIndexed == false)
-                {
-                    LanguageCoverage.Add(unindexed, LanguageCoverage.Of(path, false, answer.Language, null, null, answer.Found));
-                }
-            }
-            return new(headSha, blast, scores, unreadable, overlayUnusable, unindexed);
-        }
-        void Judge(string path, FileHotspot score)
-        {
-            var impact = impacts[path];
-            LanguageCoverage.Add(unindexed,
-                LanguageCoverage.Of(path, impact.LanguageIndexed, impact.Language, score.LanguageIndexed, score.Language, impact.Found));
-        }
+        var overlayUnusable = false;
         string? project;
         try
         {
@@ -346,64 +389,109 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
         {
-            unreadable.Add($"CodeGraph could not be reached or asked: {Cut(ex.Message)}");
-            return Result();
+            return CodeGraphRisk.None(headSha, paths, $"CodeGraph could not be reached or asked: {Cut(ex.Message)}");
         }
         if (project is null)
         {
-            unreadable.Add($"{repo.FullName}: {ReviewTools.NotIndexed}");
-            return Result();
+            return CodeGraphRisk.None(headSha, paths, $"{repo.FullName}: {ReviewTools.NotIndexed}");
         }
         var head = headSha.ToLowerInvariant();
+        var impacts = new Dictionary<string, ImpactFileAnswer>();
         if (!overlay.IsReady || !string.Equals(overlay.HeadSha, headSha, StringComparison.OrdinalIgnoreCase))
         {
             // E3: the blast radius is read for exactly the head, which CodeGraph answers only from a ready overlay of it.
-            unreadable.Add($"blast radius: no ready CodeGraph overlay of {headSha} ({overlay.Describe})");
-            return Result();
+            var why = $"blast radius: no ready CodeGraph overlay of {headSha} ({overlay.Describe})";
+            noData.AddRange(paths.Select(p => new NoCodeGraphData(p, why)));
         }
-        foreach (var path in paths)
+        else
         {
-            ct.ThrowIfCancellationRequested();
-            if (await Call(() => codeGraph.AnalyzeImpactFileAsync(project, path, headSha, ImpactDepth, ct), CodeGraphMcpClient.AnalyzeImpactFileTool, path, unreadable, ct)
-                is not { } answer)
+            string? ended = null;
+            foreach (var path in paths)
             {
-                return Result();
+                ct.ThrowIfCancellationRequested();
+                if (ended is not null)
+                {
+                    noData.Add(new NoCodeGraphData(path, ended));
+                    continue;
+                }
+                var (answer, failed) = await Call(() => codeGraph.AnalyzeImpactFileAsync(project, path, headSha, ImpactDepth, ct),
+                    CodeGraphMcpClient.AnalyzeImpactFileTool, ct);
+                if (answer is null)
+                {
+                    noData.Add(new NoCodeGraphData(path, failed!));
+                    ended = $"{CodeGraphMcpClient.AnalyzeImpactFileTool} not asked: {failed}";
+                    continue;
+                }
+                if (Impact(answer, head) is { } why)
+                {
+                    noData.Add(new NoCodeGraphData(path, why));
+                    if (answer.NotIndexed is not null)
+                    {
+                        // CodeGraph has no usable overlay of the head (e.g. the recorded one went stale): it answers no file of it.
+                        overlayUnusable = true;
+                        ended = $"{CodeGraphMcpClient.AnalyzeImpactFileTool} not asked: {why}";
+                    }
+                    continue;
+                }
+                if (!SamePath(answer.Path, path))
+                {
+                    noData.Add(new NoCodeGraphData(path, OtherPath(CodeGraphMcpClient.AnalyzeImpactFileTool, answer.Path, path)));
+                    continue;
+                }
+                impacts[path] = answer;
+                blast.Add(answer.Found == true && BlastRadii.TryParse(answer.BlastRadius, out var radius)
+                    ? new FileBlastRadius(path, radius, true)
+                    : new FileBlastRadius(path, BlastRadius.None, false));
             }
-            if (Impact(answer, path, head) is { } why)
-            {
-                unreadable.Add(why);
-                // CodeGraph has no usable overlay of the head (e.g. the recorded one went stale): the next read requests it again.
-                return Result(overlayUnusable: answer.NotIndexed is not null);
-            }
-            impacts[path] = answer;
-            blast.Add(answer.Found == true && BlastRadii.TryParse(answer.BlastRadius, out var radius)
-                ? new FileBlastRadius(path, radius, true)
-                : new FileBlastRadius(path, BlastRadius.None, false));
         }
+        var hotspotAnswers = new Dictionary<string, FileHotspot>();
+        string? hotspotsEnded = null;
         foreach (var path in paths)
         {
             ct.ThrowIfCancellationRequested();
             if (hotspots is not null && hotspots.TryGet(path, overlay.BaseSha, out var known))
             {
                 scores.Add(known!);
-                Judge(path, known!);
+                hotspotAnswers[path] = known!;
                 continue;
             }
-            if (await Call(() => codeGraph.FileHotspotAsync(project, path, ct), CodeGraphMcpClient.FileHotspotTool, path, unreadable, ct) is not { } answer)
+            if (hotspotsEnded is not null)
             {
-                return Result();
+                noData.Add(new NoCodeGraphData(path, hotspotsEnded));
+                continue;
+            }
+            var (answer, failed) = await Call(() => codeGraph.FileHotspotAsync(project, path, ct), CodeGraphMcpClient.FileHotspotTool, ct);
+            if (answer is null)
+            {
+                noData.Add(new NoCodeGraphData(path, failed!));
+                hotspotsEnded = $"{CodeGraphMcpClient.FileHotspotTool} not asked: {failed}";
+                continue;
             }
             if (Hotspot(answer, path) is { } why)
             {
-                unreadable.Add(why);
-                return Result();
+                noData.Add(new NoCodeGraphData(path, why));
+                continue;
             }
             var score = Score(answer, path) with { LanguageIndexed = answer.LanguageIndexed, Language = answer.Language };
-            Judge(path, score);
             scores.Add(score);
+            hotspotAnswers[path] = score;
             hotspots?.Add(score);
         }
-        return Result();
+        // Each file's language is judged from whatever both answers say (LanguageCoverage.Of): a flag in either decides.
+        foreach (var path in paths)
+        {
+            var impact = impacts.GetValueOrDefault(path);
+            var score = hotspotAnswers.GetValueOrDefault(path);
+            if (impact is null && score is null)
+            {
+                continue;
+            }
+            // Without an impact answer the factory's own inference (no flag, no graph data) is not made: nothing says CodeGraph has no
+            // graph data for the file.
+            LanguageCoverage.Add(unindexed, LanguageCoverage.Of(path, impact?.LanguageIndexed, impact?.Language, score?.LanguageIndexed,
+                score?.Language, impact is null ? true : impact.Found));
+        }
+        return new CodeGraphRisk(headSha, blast, scores, noData, overlayUnusable, unindexed);
     }
 
     /// <summary>
@@ -417,31 +505,30 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
             : new FileHotspot(path, answer.RiskScore!.Value, true, answer.IndexCommitSha!, answer.IndexCommitSha, VitalsCommitUnknown: true)
         : new FileHotspot(path, 0, false, answer.IndexCommitSha ?? answer.CommitSha!, answer.IndexCommitSha);
 
-    /// <summary>Why an impact answer cannot be used for <paramref name="head"/>, or null when it can.</summary>
-    private static string? Impact(ImpactFileAnswer answer, string path, string head) => answer switch
+    /// <summary>Why an impact answer cannot be used for <paramref name="head"/> (the file's path checked apart), or null when it can.</summary>
+    private static string? Impact(ImpactFileAnswer answer, string head) => answer switch
     {
-        { NotIndexed: { } n } => $"{path}: {CodeGraphMcpClient.AnalyzeImpactFileTool} is not indexed for the head ({Cut(n.Code)}, status {Cut(n.Status)})",
-        { IsError: true } => $"{path}: {CodeGraphMcpClient.AnalyzeImpactFileTool}{(answer.ErrorCode is { } code ? $" ({Cut(code)})" : "")}: {Cut(answer.Text)}",
-        _ when answer.CommitSha != head => $"{path}: {CodeGraphMcpClient.AnalyzeImpactFileTool} answered for {answer.CommitSha ?? "an unnamed commit"}, not the head",
-        _ when !SamePath(answer.Path, path) => OtherPath(CodeGraphMcpClient.AnalyzeImpactFileTool, answer.Path, path),
-        { Found: null } => $"{path}: {CodeGraphMcpClient.AnalyzeImpactFileTool} answered no 'found'",
+        { NotIndexed: { } n } => $"{CodeGraphMcpClient.AnalyzeImpactFileTool} is not indexed for the head ({Cut(n.Code)}, status {Cut(n.Status)})",
+        { IsError: true } => $"{CodeGraphMcpClient.AnalyzeImpactFileTool}{(answer.ErrorCode is { } code ? $" ({Cut(code)})" : "")}: {Cut(answer.Text)}",
+        _ when answer.CommitSha != head => $"{CodeGraphMcpClient.AnalyzeImpactFileTool} answered for {answer.CommitSha ?? "an unnamed commit"}, not the head",
+        { Found: null } => $"{CodeGraphMcpClient.AnalyzeImpactFileTool} answered no 'found'",
         { Found: true } when !BlastRadii.TryParse(answer.BlastRadius, out _) =>
-            $"{path}: {CodeGraphMcpClient.AnalyzeImpactFileTool} answered an unknown blast radius '{Cut(answer.BlastRadius ?? "(none)")}'",
+            $"{CodeGraphMcpClient.AnalyzeImpactFileTool} answered an unknown blast radius '{Cut(answer.BlastRadius ?? "(none)")}'",
         _ => null,
     };
 
     /// <summary>Why a hotspot answer cannot be used, or null when it can.</summary>
     private static string? Hotspot(HotspotAnswer answer, string path) => answer switch
     {
-        { IsError: true } => $"{path}: {CodeGraphMcpClient.FileHotspotTool}{(answer.ErrorCode is { } code ? $" ({Cut(code)})" : "")}: {Cut(answer.Text)}",
+        { IsError: true } => $"{CodeGraphMcpClient.FileHotspotTool}{(answer.ErrorCode is { } code ? $" ({Cut(code)})" : "")}: {Cut(answer.Text)}",
         // E3's exception is the default branch only, recorded with its commit: an answer naming no commit at all (neither the metrics'
         // commitSha nor the index's indexCommitSha), or not from the default branch, is not used.
-        { CommitSha: null, IndexCommitSha: null } => $"{path}: {CodeGraphMcpClient.FileHotspotTool} named no commit (neither commitSha nor indexCommitSha)",
-        { Source: { } source } when source != DefaultBranchSource => $"{path}: {CodeGraphMcpClient.FileHotspotTool} answered from '{Cut(source)}', not the default branch",
+        { CommitSha: null, IndexCommitSha: null } => $"{CodeGraphMcpClient.FileHotspotTool} named no commit (neither commitSha nor indexCommitSha)",
+        { Source: { } source } when source != DefaultBranchSource => $"{CodeGraphMcpClient.FileHotspotTool} answered from '{Cut(source)}', not the default branch",
         _ when !SamePath(answer.Path, path) => OtherPath(CodeGraphMcpClient.FileHotspotTool, answer.Path, path),
-        { Found: null } => $"{path}: {CodeGraphMcpClient.FileHotspotTool} answered no 'found'",
-        { Found: true, RiskScore: null } => $"{path}: {CodeGraphMcpClient.FileHotspotTool} answered no riskScore",
-        { Found: true, RiskScore: < 0 or double.NaN or double.PositiveInfinity } => $"{path}: {CodeGraphMcpClient.FileHotspotTool} answered an invalid riskScore",
+        { Found: null } => $"{CodeGraphMcpClient.FileHotspotTool} answered no 'found'",
+        { Found: true, RiskScore: null } => $"{CodeGraphMcpClient.FileHotspotTool} answered no riskScore",
+        { Found: true, RiskScore: < 0 or double.NaN or double.PositiveInfinity } => $"{CodeGraphMcpClient.FileHotspotTool} answered an invalid riskScore",
         _ => null,
     };
 
@@ -450,26 +537,27 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
         answered is not null && RepoPath.Normalize(answered) is { } a && a == RepoPath.Normalize(asked);
 
     private static string OtherPath(string tool, string? answered, string asked) =>
-        $"{asked}: {tool} answered about {(answered is null ? "no path" : $"'{Cut(answered)}'")}, not {asked}";
+        $"{tool} answered about {(answered is null ? "no path" : $"'{Cut(answered)}'")}, not {asked}";
 
-    /// <summary>One call; a call that cannot be made (unreachable, refused over HTTP) is recorded as unreadable and answers null.</summary>
-    private static async Task<T?> Call<T>(Func<Task<T>> call, string tool, string path, List<string> unreadable, CancellationToken ct) where T : class
+    /// <summary>
+    /// One call: its answer, or — a call that cannot be made (unreachable, refused over HTTP, timed out in its HTTP client) — null and why.
+    /// </summary>
+    private static async Task<(T? Answer, string? Failed)> Call<T>(Func<Task<T>> call, string tool, CancellationToken ct) where T : class
     {
         try
         {
-            return await call();
+            return (await call(), null);
         }
         catch (McpHttpException ex) when (ex.StatusCode == 403)
         {
-            unreadable.Add(ex.Code == McpHttpException.NotEntitled
-                ? $"{path}: not entitled to {tool}"
-                : $"{path}: {tool}: CodeGraph answered 403{(ex.Code is { } code ? $" ({Cut(code)})" : "")}");
+            return (null, ex.Code == McpHttpException.NotEntitled
+                ? $"not entitled to {tool}"
+                : $"{tool}: CodeGraph answered 403{(ex.Code is { } code ? $" ({Cut(code)})" : "")}");
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
         {
-            unreadable.Add($"{path}: {tool} could not be sent: {Cut(ex.Message)}");
+            return (null, $"{tool} could not be sent: {Cut(ex.Message)}");
         }
-        return null;
     }
 
     private static string Cut(string s) => s.Length > 300 ? s[..300] : s;

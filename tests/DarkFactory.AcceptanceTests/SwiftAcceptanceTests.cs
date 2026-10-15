@@ -130,15 +130,14 @@ public class SwiftAcceptanceTests
     /// <c>Repo:</c> line names <c>michaeltrefry/LensWorks</c> (macOS app <c>native/Compositor.xcodeproj</c>, scheme
     /// <c>Compositor</c>, Swift Testing unit target <c>CompositorTests</c>): a real implementer writes the change and its test, the
     /// real panel reviews it on the high class, CI runs, and the gate's new-tests check runs the new test with xcodebuild as the
-    /// sandbox user on macOS — failing on the base, passing on the head — and merges. Needs CodeGraph to index Swift (C3): before,
-    /// the gate blocks every Swift change on risk-threshold, and this test skips saying so.
+    /// sandbox user on macOS — failing on the base, passing on the head — and merges. Does not depend on CodeGraph (sc-26254): a
+    /// Swift file CodeGraph does not index is recorded as having no CodeGraph data.
     /// </summary>
     [Fact]
     public async Task P5_AT1_a_lensworks_change_with_a_new_swift_testing_test_merges_with_no_human()
     {
         await using var run = await StartAsync("FACTORY_E2E_P5_LENSWORKS_STORY", "df_e2e_p5at1", _ => SwiftLive.LensWorks, merges: true,
             "a To Do story with a `Repo: michaeltrefry/LensWorks` line asking for a small change with a new Swift Testing test in CompositorTests");
-        await SwiftLive.RequireSwiftIndexedAsync(run.Options, run.Repo.Repo, await SwiftLive.SwiftFileOnMainAsync(run.Repo, "native/", run.Ct), run.Ct);
 
         var outcome = await FactoryRunAsync(run);
 
@@ -161,7 +160,7 @@ public class SwiftAcceptanceTests
     /// package <c>e2e-swift/</c> (<see cref="SwiftSeeds.PackageSeed"/>, on main by the runbook's one-time set-up), a source file with a
     /// new function and an XCTest test calling it (<see cref="SwiftSeeds.MergingChange"/>): <c>not-built</c> on the base, passed on
     /// the head, judged by the SwiftPM strategy as the worker user. The gate merges; the sandbox's main then holds both files (one
-    /// pair per run, marked safe to delete). Needs CodeGraph to index Swift (C3).
+    /// pair per run, marked safe to delete). Does not depend on CodeGraph (sc-26254).
     /// </summary>
     [Fact]
     public async Task P5_AT2_a_swiftpm_change_with_a_new_xctest_test_merges()
@@ -170,7 +169,6 @@ public class SwiftAcceptanceTests
             "a To Do bug story whose fix lands in normal code of the sandbox repo (the gate will merge it)");
         await RequirePackageAsync(run);
         var change = SwiftSeeds.MergingChange(SwiftSeeds.RunId());
-        await SwiftLive.RequireSwiftIndexedAsync(run.Options, run.Repo.Repo, $"{SwiftSeeds.PackageDir}/Sources/DfE2eSwift/DfE2eSwift.swift", run.Ct);
 
         var outcome = await FactoryRunAsync(run, gate => gate with { Reviewer = SeedMergingChange(run, change) });
 
@@ -217,16 +215,14 @@ public class SwiftAcceptanceTests
     /// <c>FACTORY_E2E_P5_IOS_DIR</c> (default <c>e2e-ios</c>). Before the first review the test raises the app's run count
     /// (<c>Tally/E2eRun.swift</c>) on the PR branch and adds an XCTest unit test that the count is reached: it fails on the base
     /// (one lower) and passes on the head, each run on the run's own fresh iOS Simulator as the sandbox user. The gate merges.
-    /// Needs the owner logged in at the console (an Aqua session) and CodeGraph to index Swift (C3).
+    /// Needs the owner logged in at the console (an Aqua session); does not depend on CodeGraph (sc-26254).
     /// </summary>
     [Fact]
     public async Task P5_AT3_an_ios_app_change_with_a_new_unit_test_run_in_the_simulator_merges()
     {
         await using var run = await StartAsync("FACTORY_E2E_P5_IOS_UNIT_STORY", "df_e2e_p5at3", SwiftLive.IosRepo, merges: true,
             "a To Do bug story whose Repo: line names the iOS repository (default: the sandbox) and whose fix lands in its normal code");
-        // The seed first (a missing seed skips with "copy the seed"), then CodeGraph's probe of one of its Swift files.
         var (reviewer, testId) = await SeedIosAsync(run, SwiftSeeds.IosUnitTest);
-        await SwiftLive.RequireSwiftIndexedAsync(run.Options, run.Repo.Repo, SwiftSeeds.CounterFile(SwiftLive.IosDir()), run.Ct);
 
         var outcome = await FactoryRunAsync(run, gate => gate with { Reviewer = reviewer });
 
@@ -249,7 +245,6 @@ public class SwiftAcceptanceTests
         await using var run = await StartAsync("FACTORY_E2E_P5_IOS_UI_STORY", "df_e2e_p5at4", SwiftLive.IosRepo, merges: true,
             "a To Do bug story whose Repo: line names the iOS repository (default: the sandbox) and whose fix lands in its normal code");
         var (reviewer, testId) = await SeedIosAsync(run, SwiftSeeds.IosUiTest);
-        await SwiftLive.RequireSwiftIndexedAsync(run.Options, run.Repo.Repo, SwiftSeeds.CounterFile(SwiftLive.IosDir()), run.Ct);
 
         var outcome = await FactoryRunAsync(run, gate => gate with { Reviewer = reviewer });
 
@@ -261,43 +256,41 @@ public class SwiftAcceptanceTests
     }
 
     /// <summary>
-    /// P5-AT5, first part: while CodeGraph does not index Swift the gate refuses a Swift change. The same change as P5-AT2, whose
-    /// new test passes the new-tests check, so nothing but risk-threshold can block it: the last <c>gate</c> row is Blocked with the
-    /// reason <c>CodeGraph does not index the language of a changed code file</c> naming the Swift files, its CodeGraph inputs say
-    /// <c>language not indexed by CodeGraph</c>, and nothing merges. Skips once CodeGraph indexes Swift (after C3 the refusal of
-    /// Swift cannot be shown).
+    /// P5-AT5a: while CodeGraph does not index Swift the gate records "no CodeGraph data" for the Swift files and merges (sc-26254:
+    /// the factory works with or without CodeGraph). The same change as P5-AT2: its new test passes the new-tests check, the last
+    /// <c>gate</c> row is a Merge whose CodeGraph inputs name each changed Swift file under
+    /// <c>no CodeGraph data: its language (Swift) is not indexed by CodeGraph</c>, and the pull request is merged. Skips once
+    /// CodeGraph indexes Swift (after C3 an unindexed Swift file cannot be shown: run P5-AT5b).
     /// </summary>
     [Fact]
-    public async Task P5_AT5_the_gate_refuses_a_swift_change_while_codegraph_does_not_index_swift()
+    public async Task P5_AT5a_the_gate_records_no_codegraph_data_for_an_unindexed_swift_change_and_merges()
     {
-        await using var run = await StartAsync("FACTORY_E2E_P5_UNINDEXED_STORY", "df_e2e_p5at5a", o => o.DefaultRepo, merges: false,
-            "a To Do bug story whose fix lands in normal code of the sandbox repo");
+        await using var run = await StartAsync("FACTORY_E2E_P5_UNINDEXED_STORY", "df_e2e_p5at5a", o => o.DefaultRepo, merges: true,
+            "a To Do bug story whose fix lands in normal code of the sandbox repo (the gate will merge it)");
         await RequirePackageAsync(run);
         var (indexed, said) = await SwiftLive.LanguageIndexedAsync(run.Options, run.Repo.Repo, $"{SwiftSeeds.PackageDir}/Sources/DfE2eSwift/DfE2eSwift.swift", run.Ct);
         if (indexed)
         {
-            Assert.Skip($"{said}: the refusal of an unindexed Swift change can only be shown before C3 (run the second part instead).");
+            Assert.Skip($"{said}: an unindexed Swift change can only be shown before C3 (run P5-AT5b instead).");
         }
         var change = SwiftSeeds.MergingChange(SwiftSeeds.RunId());
 
         var outcome = await FactoryRunAsync(run, gate => gate with { Reviewer = SeedMergingChange(run, change) });
 
-        var (history, gate) = await AssertBlockedAsync(run, outcome, SwiftLive.UnindexedReason);
-        // Nothing else blocked it: the new test passed the new-tests check.
-        var newTests = NewTestsResult.FromDetail(history.Last(e => e.Step == RunPipeline.Steps.NewTests).Detail)!;
-        Assert.True(newTests.Outcome == NewTestsOutcome.Pass, $"{newTests.Outcome}: {newTests.Reason}");
-        Assert.Contains(SwiftLive.UnindexedMark, gate.Detail);
-        Assert.Contains(change.Source, gate.Detail);
-        Assert.Contains($"{change.Source} (Swift", outcome.Error);
+        var (history, _, _) = await AssertMergedAsync(run, outcome, new SwiftNewTests().Name, t => t.Test == change.TestId);
+        var gate = history.Last(e => e.Step == RunPipeline.Steps.GateDecision).Detail!;
+        var noData = gate.IndexOf(SwiftLive.UnindexedSwiftMark, StringComparison.Ordinal);
+        Assert.True(noData >= 0, $"the Merge gate row records no unindexed Swift file: {gate}");
+        Assert.Contains(change.Source, gate[noData..]);
     }
 
     /// <summary>
-    /// P5-AT5, second part: once CodeGraph indexes Swift (C3, sc-26137, deployed with <c>languageIndexed</c>) the gate accepts the
-    /// same change: risk-threshold reads each Swift file's blast radius, names no file as not indexed, and the change merges. Skips
-    /// until CodeGraph says it indexes Swift.
+    /// P5-AT5b: once CodeGraph indexes Swift (C3, sc-26137, deployed with <c>languageIndexed</c>) the gate uses its data of the same
+    /// change: risk-threshold reads each Swift file's blast radius at the head, records no Swift file as not indexed, and the change
+    /// merges. Skips until CodeGraph says it indexes Swift.
     /// </summary>
     [Fact]
-    public async Task P5_AT5_the_gate_accepts_the_swift_change_once_codegraph_indexes_swift()
+    public async Task P5_AT5b_the_gate_uses_codegraphs_data_of_the_swift_change_once_codegraph_indexes_swift()
     {
         await using var run = await StartAsync("FACTORY_E2E_P5_INDEXED_STORY", "df_e2e_p5at5b", o => o.DefaultRepo, merges: true,
             "a To Do bug story whose fix lands in normal code of the sandbox repo (the gate will merge it)");
@@ -308,11 +301,13 @@ public class SwiftAcceptanceTests
         var outcome = await FactoryRunAsync(run, gate => gate with { Reviewer = SeedMergingChange(run, change) });
 
         var (history, _, _) = await AssertMergedAsync(run, outcome, new SwiftNewTests().Name, t => t.Test == change.TestId);
-        var gate = history.Last(e => e.Step == RunPipeline.Steps.GateDecision);
-        Assert.DoesNotContain(SwiftLive.UnindexedMark, gate.Detail);
-        // risk-threshold read CodeGraph's blast radius of the Swift files at the head (CodeGraphRisk.Describe lists them).
-        Assert.Contains("codegraph blast radius at", gate.Detail);
-        Assert.Contains(change.Source, gate.Detail);
+        var gate = history.Last(e => e.Step == RunPipeline.Steps.GateDecision).Detail!;
+        Assert.DoesNotContain(SwiftLive.UnindexedSwiftMark, gate);
+        // risk-threshold read CodeGraph's blast radius of the Swift files at the head (CodeGraphRisk.Describe lists them first).
+        var blast = gate.IndexOf("codegraph blast radius at", StringComparison.Ordinal);
+        Assert.True(blast >= 0, $"the Merge gate row has no CodeGraph inputs: {gate}");
+        var hotspots = gate.IndexOf("; hotspot score", blast, StringComparison.Ordinal);
+        Assert.Contains(change.Source, gate[blast..(hotspots < 0 ? gate.Length : hotspots)]);
     }
 
     /// <summary>

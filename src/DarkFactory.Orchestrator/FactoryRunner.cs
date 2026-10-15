@@ -36,9 +36,9 @@ public static class FactoryRunner
             _ = (options.RouterKey, options.GitHubAppId, options.GitHubAppPrivateKeyPem, options.DashboardPasswordHash);
             _ = (options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem);
             options.RejectReviewModelSettings();
-            if (CodeGraphTokenWarning(options) is { } codeGraphWarning)
+            if (CodeGraphTokenNote(options) is { } codeGraphNote)
             {
-                stderr.WriteLine(codeGraphWarning);
+                stderr.WriteLine(codeGraphNote);
             }
             _ = Dashboard.DashboardBinding.Addresses(options.DashboardBindAddress);
             configured = sources.Configured;
@@ -166,9 +166,9 @@ public static class FactoryRunner
         {
             options.RejectReviewModelSettings();
             requireSource?.Invoke();
-            if (CodeGraphTokenWarning(options) is { } warning)
+            if (CodeGraphTokenNote(options) is { } codeGraphNote)
             {
-                stderr.WriteLine(warning);
+                stderr.WriteLine(codeGraphNote);
             }
             if (await checkEnrollment(ct) is { } enrollmentError)
             {
@@ -193,12 +193,14 @@ public static class FactoryRunner
     }
 
     /// <summary>
-    /// The start-up warning of <c>factory run</c> and <c>factory work</c> when no CodeGraph token is configured (sc-25709: the factory still
-    /// starts, but <c>risk-threshold</c> cannot read CodeGraph, so the gate merges nothing that needs it), or null with a token.
+    /// The start-up note of <c>factory run</c> and <c>factory work</c> when no CodeGraph token is configured, or null with a token.
+    /// Informational only (sc-26254: the factory works with or without CodeGraph): <c>risk-threshold</c> then records "no CodeGraph
+    /// data" for every file and decides on the change's size and fix rounds.
     /// </summary>
-    internal static string? CodeGraphTokenWarning(FactoryOptions options) =>
+    internal static string? CodeGraphTokenNote(FactoryOptions options) =>
         options.TryGet(o => o.CodeGraphToken, out _) ? null
-            : $"no CodeGraph token ({MergeGate.CodeGraphTokenSources}): the merge gate will merge no change whose tier requires risk-threshold";
+            : $"note: no CodeGraph token ({MergeGate.CodeGraphTokenSources}): the merge gate records no CodeGraph data for every file and "
+                + "decides risk-threshold on the change's size and fix rounds; reviewers and triage get no CodeGraph tools";
 
     /// <summary>
     /// <c>factory run &lt;item&gt;</c> for an item of any source — a Shortcut story (<c>sc-N</c>), a GitHub issue (<c>gh-N</c>) or a

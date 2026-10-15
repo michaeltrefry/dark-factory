@@ -401,89 +401,35 @@ public sealed partial class RunPipeline
     /// <summary>
     /// One evaluation of the gate on <paramref name="pull"/> (facts read now, E1), checkpointed. Merge → the decision. A head
     /// with no verdict → Review (null). CodeGraph's inputs to <c>risk-threshold</c> (sc-25709) are read only when the gate without them
-    /// would merge (so a change another rule blocks escalates without asking CodeGraph); still unreadable (Pending) → every fact is read
-    /// again after <c>Gate:CiPollSeconds</c> (controls checked, and the PR read again: merged → recorded as found merged, closed →
-    /// escalate, a new head → Review, each null), like pending CI. The whole wait — CodeGraph's overlay wait and reads included — is
-    /// bounded by <c>Gate:CiTimeoutMinutes</c>: still pending then, it is blocked. Anything else → escalate.
+    /// would merge (so a change another rule blocks escalates without asking CodeGraph), once: whatever CodeGraph cannot give — it is
+    /// not configured, unreachable, refusing, has no ready overlay of the head within <c>CodeGraph:OverlayTimeoutMinutes</c>, or does
+    /// not index a file's language — is recorded as no CodeGraph data for those files and the gate decides on the rest (sc-26254: the
+    /// factory works with or without CodeGraph; never a wait for CodeGraph past its overlay timeout). <c>Gate:CiTimeoutMinutes</c> still
+    /// bounds the whole CodeGraph read as a backstop: a read cut off there counts as no CodeGraph data. Anything else → escalate.
     /// </summary>
     private async Task<GateDecision?> EvaluateGateAsync(Run run, PullFacts pull, CancellationToken ct)
     {
-        var deadline = GateTime.GetUtcNow() + Gate.CiTimeout;
-        using var timeout = new CancellationTokenSource(Gate.CiTimeout, GateTime);
-        using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
-        var hotspots = new HotspotCache();
-        var requestOverlay = false;
-        GateDecision? waiting = null;
-        GateDecision decision;
-        GateDecision TimedOut(GateDecision pending) => pending with
+        var history = await ledger.HistoryAsync(run.Item, ct);
+        var (policy, policyError) = await ReadPolicyAsync(run, pull, ct);
+        string? diff = null, diffError = null;
+        try
         {
-            Outcome = GateOutcome.Blocked,
-            Reasons = [.. pending.Reasons, $"risk threshold: CodeGraph could still not be read after {Gate.CiTimeout} (Gate:CiTimeoutMinutes)"],
-        };
-        while (true)
+            diff = await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or HttpRequestException)
         {
-            try
-            {
-                var history = await ledger.HistoryAsync(run.Item, ct);
-                var (policy, policyError) = await ReadPolicyAsync(run, pull, ct);
-                string? diff = null, diffError = null;
-                try
-                {
-                    diff = await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
-                }
-                catch (Exception ex) when (ex is InvalidOperationException or HttpRequestException)
-                {
-                    diffError = ex.Message;
-                }
-                var fixRounds = TransitionContext.From(history.Where(e => e.Step is null).Select(e => e.State).ToList()).FixRounds;
-                var ci = await Gate.GitHub.GetCiAsync(run.Repo, pull.HeadSha, ct);
-                var newTests = await NewTestsAsync(run, pull, history, policy, diff, ct);
-                var change = new ChangeFacts(diff, diffError, fixRounds, IsChangesetPull(run.Changeset, pull));
-                // Everything but CodeGraph first: CodeGraph is asked only about a change nothing else blocks.
-                decision = MergeGate.Evaluate(policy, policyError, pull, change, ci, Verdicts(history), newTests, riskUnread: Gate.Risk is not null);
-                if (decision.Outcome == GateOutcome.Pending && Gate.Risk is { } reader && diff is not null)
-                {
-                    waiting ??= decision;
-                    var risk = await CodeGraphRiskAsync(run, pull, diff, reader, requestOverlay, hotspots, bounded.Token, ct);
-                    requestOverlay = risk.OverlayUnusable;
-                    decision = MergeGate.Evaluate(policy, policyError, pull, change, ci, Verdicts(history), newTests, risk);
-                }
-                if (decision.Outcome != GateOutcome.Pending)
-                {
-                    break;
-                }
-                waiting = decision;
-                if (GateTime.GetUtcNow() >= deadline)
-                {
-                    decision = TimedOut(decision);
-                    break;
-                }
-                log.WriteLine($"[gate] {decision.Detail}; reading again in {Gate.CiPollInterval}");
-                await Task.Delay(Gate.CiPollInterval, GateTime, bounded.Token);
-                await ThrowIfControlledAsync(run.Item, ct);
-                // The PR may have changed during the wait: the gate judges it as it is now, and never holds the queue for an old head.
-                var (nowHistory, now) = await ReadPullAsync(run, ct);
-                if (now.Merged)
-                {
-                    await RecordFoundMergedAsync(run, nowHistory, now, ct);
-                    return null;
-                }
-                await EnsureOpenAsync(run, now, ct);
-                if (now.HeadSha != pull.HeadSha)
-                {
-                    await ledger.RecordAsync(run.Item, WorkState.Review, null,
-                        $"head moved to {now.HeadSha} while the merge gate waited for CodeGraph; reviewing it again", ct);
-                    return null;
-                }
-                pull = now;
-            }
-            catch (OperationCanceledException) when (timeout.IsCancellationRequested && !ct.IsCancellationRequested)
-            {
-                // The deadline fell inside a CodeGraph call or the overlay wait: blocked there, never later.
-                decision = TimedOut(waiting ?? new GateDecision(GateOutcome.Pending, pull.HeadSha,
-                    [$"risk threshold: CodeGraph's inputs for {Ci.Short(pull.HeadSha)} were still being read"]) { Changeset = IsChangesetPull(run.Changeset, pull) });
-                break;
-            }
+            diffError = ex.Message;
+        }
+        var fixRounds = TransitionContext.From(history.Where(e => e.Step is null).Select(e => e.State).ToList()).FixRounds;
+        var ci = await Gate.GitHub.GetCiAsync(run.Repo, pull.HeadSha, ct);
+        var newTests = await NewTestsAsync(run, pull, history, policy, diff, ct);
+        var change = new ChangeFacts(diff, diffError, fixRounds, IsChangesetPull(run.Changeset, pull));
+        // Everything but CodeGraph first: CodeGraph is asked only about a change nothing else blocks.
+        var decision = MergeGate.Evaluate(policy, policyError, pull, change, ci, Verdicts(history), newTests, riskUnread: Gate.Risk is not null);
+        if (decision.Outcome == GateOutcome.Pending && Gate.Risk is { } reader && diff is not null)
+        {
+            var risk = await CodeGraphRiskAsync(run, pull, diff, reader, ct);
+            decision = MergeGate.Evaluate(policy, policyError, pull, change, ci, Verdicts(history), newTests, risk);
         }
         await ledger.CheckpointAsync(run.Item, Steps.GateDecision, null, decision.Detail, ct);
         log.WriteLine($"[gate] {decision.Detail}");
@@ -493,6 +439,7 @@ public sealed partial class RunPipeline
                 await ledger.RecordAsync(run.Item, WorkState.Review, null, $"{decision.Reasons[0]}; reviewing {pull.HeadSha} again", ct);
                 return null;
             case GateOutcome.Blocked:
+            case GateOutcome.Pending: // never with CodeGraph's inputs read; fail closed if it ever were
                 throw new GateBlockedException($"The merge gate refused {pull.HtmlUrl}: {string.Join("; ", decision.Reasons)}");
         }
         return decision;

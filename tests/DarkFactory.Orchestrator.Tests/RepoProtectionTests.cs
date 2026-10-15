@@ -34,7 +34,7 @@ public class RepoProtectionTests
         Assert.Equal(0, pr.GetProperty("required_approving_review_count").GetInt32());
         // Every parameter GitHub's pull_request rule takes, so no GitHub default decides one.
         Assert.Equal(
-            ["allowed_merge_methods", "dismiss_stale_reviews_on_push", "dismissal_restriction", "require_code_owner_review",
+            ["allowed_merge_methods", "dismiss_stale_reviews_on_push", "require_code_owner_review",
              "require_extra_approval_for_unattributed_changes", "require_last_push_approval", "required_approving_review_count",
              "required_review_thread_resolution", "required_reviewers"],
             pr.EnumerateObject().Select(p => p.Name).Order(StringComparer.Ordinal));
@@ -42,10 +42,6 @@ public class RepoProtectionTests
             "require_last_push_approval", "required_review_thread_resolution" }, name => Assert.False(pr.GetProperty(name).GetBoolean()));
         Assert.Empty(pr.GetProperty("required_reviewers").EnumerateArray());
         Assert.Equal(["merge", "squash", "rebase"], Strings(pr.GetProperty("allowed_merge_methods")));
-        var dismissal = pr.GetProperty("dismissal_restriction");
-        Assert.Equal(["allowed_actors", "enabled"], dismissal.EnumerateObject().Select(p => p.Name).Order(StringComparer.Ordinal));
-        Assert.False(dismissal.GetProperty("enabled").GetBoolean());
-        Assert.Empty(dismissal.GetProperty("allowed_actors").EnumerateArray());
         Assert.False(rules[1].TryGetProperty("parameters", out _));
     }
 
@@ -146,33 +142,6 @@ public class RepoProtectionTests
         Assert.Equal(1, exit);
         Assert.Contains(RepoProtection.MainRulesetName, error.ToString());
         Assert.Contains("pull_request.require_extra_approval_for_unattributed_changes: sent false, GitHub holds true", error.ToString());
-        Assert.DoesNotContain("verified", output.ToString());
-    }
-
-    [Fact]
-    public async Task Protect_fails_when_github_holds_another_dismissal_restriction_after_the_write()
-    {
-        var github = new GitHubRulesets
-        {
-            Store = ruleset =>
-            {
-                foreach (var rule in ruleset["rules"]!.AsArray())
-                {
-                    if (rule!["type"]!.GetValue<string>() == "pull_request")
-                    {
-                        rule["parameters"]!["dismissal_restriction"] = JsonNode.Parse("""{"allowed_actors":[],"enabled":true}""");
-                    }
-                }
-            },
-        };
-        var output = new StringWriter();
-        var error = new StringWriter();
-
-        var exit = await RepoProtection.RunAsync(github.Api.Client("https://api.github.com/"), "gho_admin", Sandbox, output, error, CancellationToken.None);
-
-        Assert.Equal(1, exit);
-        Assert.Contains("pull_request.dismissal_restriction: sent", error.ToString());
-        Assert.Contains("\"enabled\":true", error.ToString());
         Assert.DoesNotContain("verified", output.ToString());
     }
 

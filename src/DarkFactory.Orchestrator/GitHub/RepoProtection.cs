@@ -55,16 +55,7 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
         [property: JsonPropertyName("required_review_thread_resolution")] bool RequiredReviewThreadResolution,
         [property: JsonPropertyName("require_extra_approval_for_unattributed_changes")] bool RequireExtraApprovalForUnattributedChanges,
         [property: JsonPropertyName("required_reviewers")] IReadOnlyList<JsonElement> RequiredReviewers,
-        [property: JsonPropertyName("allowed_merge_methods")] IReadOnlyList<string> AllowedMergeMethods,
-        [property: JsonPropertyName("dismissal_restriction")] DismissalRestriction DismissalRestriction);
-
-    /// <summary>
-    /// Who may dismiss a review on the PR (GitHub's <c>dismissal_restriction</c>, which GitHub now stores on every
-    /// pull_request rule — as <c>{"allowed_actors":[],"enabled":false}</c> when not sent): off, no actors.
-    /// </summary>
-    public sealed record DismissalRestriction(
-        [property: JsonPropertyName("enabled")] bool Enabled,
-        [property: JsonPropertyName("allowed_actors")] IReadOnlyList<JsonElement> AllowedActors);
+        [property: JsonPropertyName("allowed_merge_methods")] IReadOnlyList<string> AllowedMergeMethods);
 
     /// <summary>
     /// The main ruleset's PR rule: no approvals and no review conditions (the merge gate is the review, and a PR's
@@ -79,8 +70,7 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
         RequiredReviewThreadResolution: false,
         RequireExtraApprovalForUnattributedChanges: false,
         RequiredReviewers: [],
-        AllowedMergeMethods: ["merge", "squash", "rebase"],
-        DismissalRestriction: new(Enabled: false, AllowedActors: []));
+        AllowedMergeMethods: ["merge", "squash", "rebase"]);
 
     public sealed record BypassActor(
         [property: JsonPropertyName("actor_id")] long ActorId,

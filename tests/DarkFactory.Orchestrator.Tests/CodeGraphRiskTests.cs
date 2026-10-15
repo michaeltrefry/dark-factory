@@ -13,8 +13,9 @@ namespace DarkFactory.Orchestrator.Tests;
 /// sc-25709: the merge gate's <c>risk-threshold</c> reads CodeGraph's blast radius (per touched file, for exactly the head) and hotspot
 /// score (default branch, recorded with its commit). Code floor: a critical blast radius fails; <c>factory/gate.yaml</c> version 3 can
 /// only tighten it (<c>max_blast_radius</c>) and opts in to a hotspot limit (<c>max_hotspot</c>, the hotspot score being CodeGraph's
-/// riskScore). A file CodeGraph has no data for counts as none / 0; one it cannot read leaves the check pending until
-/// <c>Gate:CiTimeoutMinutes</c>.
+/// riskScore). A file CodeGraph has no data for counts as none / 0. Since sc-26254 (the factory works with or without CodeGraph) a file
+/// CodeGraph gives no usable input for — not configured, unreachable, no ready overlay, another commit or file, an unindexed language —
+/// is recorded as having no CodeGraph data and judged on its other inputs; never pending, never blocked for it.
 /// <para>
 /// CodeGraph's tools are its C7 contract (sc-25735, not deployed yet): answers through <c>CommitAnswer.Create</c> (michaeltrefry/CodeGraph
 /// PR #71), whose structured content is
@@ -171,36 +172,73 @@ public class CodeGraphRiskTests
     }
 
     [Fact]
-    [FailsGateCheck(GateChecks.RiskThreshold)]
-    public void CodeGraph_inputs_that_could_not_be_read_leave_risk_threshold_pending_and_never_merge()
+    public void CodeGraph_inputs_that_could_not_be_read_are_recorded_as_no_codegraph_data_and_the_change_merges_on_its_other_inputs()
     {
-        var unreadable = new CodeGraphRisk(Head, [], [], [$"blast radius: no ready CodeGraph overlay of {Head} (timed-out)"]);
+        // sc-26254: no ready overlay of the head (e.g. timed out) — the gate neither waits nor blocks for it.
+        var why = $"blast radius: no ready CodeGraph overlay of {Head} (timed-out)";
+        var unreadable = new CodeGraphRisk(Head, [], [], [new NoCodeGraphData("src/a.cs", why), new NoCodeGraphData("src/b.cs", why)]);
 
         var decision = Evaluate(unreadable);
 
-        Assert.Equal(GateOutcome.Pending, decision.Outcome);
-        Assert.Equal($"risk threshold: CodeGraph could not be read for {Head[..12]}: blast radius: no ready CodeGraph overlay of {Head} (timed-out)",
-            Assert.Single(decision.Reasons));
-        // Anything else blocking: blocked at once (no wait), the unread inputs named too.
+        Assert.Equal(GateOutcome.Merge, decision.Outcome);
+        Assert.Contains($"no CodeGraph data: {why}: src/a.cs, src/b.cs", decision.Inputs);
+        Assert.Contains("no CodeGraph data for 2 of 2 file(s), judged on size and fix rounds", decision.Detail);
+        // Anything else blocking still blocks, the missing inputs recorded beside it.
         var blocked = Evaluate(unreadable, verdict: Full with { Verdict = ReviewVerdict.Fail });
         Assert.Equal(GateOutcome.Blocked, blocked.Outcome);
-        Assert.Contains(blocked.Reasons, r => r.StartsWith("risk threshold: CodeGraph could not be read", StringComparison.Ordinal));
+        Assert.Equal($"the review of {Head[..12]} is 'fail'", Assert.Single(blocked.Reasons));
+        Assert.Contains($"no CodeGraph data: {why}", blocked.Detail);
     }
 
     [Fact]
-    public void A_file_read_over_a_limit_blocks_at_once_even_when_another_could_not_be_read()
+    [FailsGateCheck(GateChecks.RiskThreshold)]
+    public void Without_codegraph_data_the_size_limits_still_decide_risk_threshold()
     {
-        var partial = new CodeGraphRisk(Head, [new FileBlastRadius("src/a.cs", BlastRadius.Critical, true)], [],
-            ["src/b.cs: analyze_impact_file could not be sent: connection refused"]);
+        // sc-26254: a file with no CodeGraph data is judged on its other inputs — a change over max_changed_lines still fails.
+        var big = TestPolicies.Diff("src/a.cs", lines: 30);
+        var policy = TestPolicies.Standard(maxLines: 10);
+
+        var none = Evaluate(null, policy, big);
+
+        Assert.Equal(GateOutcome.Blocked, none.Outcome);
+        Assert.Equal("risk threshold: 30 changed lines exceed max_changed_lines 10", Assert.Single(none.Reasons));
+        Assert.Contains("no CodeGraph data: CodeGraph is not configured (no CodeGraph token: ", none.Detail);
+        // Within the limit, the same change without CodeGraph merges.
+        Assert.Equal(GateOutcome.Merge, Evaluate(null, TestPolicies.Standard(maxLines: 100), big).Outcome);
+    }
+
+    [Fact]
+    public void A_file_read_over_a_limit_blocks_even_when_another_has_no_codegraph_data()
+    {
+        var partial = new CodeGraphRisk(Head, [new FileBlastRadius("src/a.cs", BlastRadius.Critical, true)],
+            [new FileHotspot("src/a.cs", 0.1, true, IndexCommit)],
+            [new NoCodeGraphData("src/b.cs", "analyze_impact_file could not be sent: connection refused")]);
 
         var decision = Evaluate(partial);
 
         Assert.Equal(GateOutcome.Blocked, decision.Outcome);
-        Assert.Equal([$"risk threshold: blast radius at {Head[..12]} over the code floor (critical always fails): src/a.cs critical",
-            $"risk threshold: CodeGraph could not be read for {Head[..12]}: src/b.cs: analyze_impact_file could not be sent: connection refused"],
-            decision.Reasons);
-        // Nothing over a limit: pending.
-        Assert.Equal(GateOutcome.Pending, Evaluate(partial with { BlastRadius = [new FileBlastRadius("src/a.cs", BlastRadius.Low, true)] }).Outcome);
+        Assert.Equal($"risk threshold: blast radius at {Head[..12]} over the code floor (critical always fails): src/a.cs critical",
+            Assert.Single(decision.Reasons));
+        Assert.Contains("no CodeGraph data: analyze_impact_file could not be sent: connection refused: src/b.cs", decision.Inputs);
+        // Nothing over a limit: merged, the missing file recorded.
+        var low = Evaluate(partial with { BlastRadius = [new FileBlastRadius("src/a.cs", BlastRadius.Low, true)] });
+        Assert.Equal(GateOutcome.Merge, low.Outcome);
+        Assert.Contains("no CodeGraph data for 1 of 2 file(s)", low.Detail);
+    }
+
+    [Fact]
+    public void A_hotspot_codegraph_gave_is_held_to_max_hotspot_even_when_the_blast_radius_could_not_be_read()
+    {
+        var why = $"blast radius: no ready CodeGraph overlay of {Head} (refused)";
+        var hotOnly = new CodeGraphRisk(Head, [], [new FileHotspot("src/a.cs", 0.9, true, IndexCommit), new FileHotspot("src/b.cs", 0.1, true, IndexCommit)],
+            [new NoCodeGraphData("src/a.cs", why), new NoCodeGraphData("src/b.cs", why)]);
+
+        var decision = Evaluate(hotOnly, TestPolicies.V3("high", "0.5"));
+
+        Assert.Equal(GateOutcome.Blocked, decision.Outcome);
+        Assert.Equal($"risk threshold: hotspot score (riskScore) over max_hotspot 0.5: src/a.cs 0.9 on the default branch at {IndexCommit}",
+            Assert.Single(decision.Reasons));
+        Assert.Equal(GateOutcome.Merge, Evaluate(hotOnly, TestPolicies.V3("high", "1")).Outcome);
     }
 
     [Fact]
@@ -226,7 +264,7 @@ public class CodeGraphRiskTests
         var diff = string.Concat(files.Select(f => TestPolicies.Diff(f)));
         var critical = files[150];
         var risk = TestRisk.With(Head, diff, f => f == critical ? BlastRadius.Critical : BlastRadius.Low, f => f == files[7] ? 0.9 : 0.1)
-            with { Unreadable = [] };
+            with { NoData = [] };
         var decision = Evaluate(risk, TestPolicies.Standard(maxLines: 10_000, maxFiles: 1_000), diff);
 
         Assert.Equal(GateOutcome.Blocked, decision.Outcome);
@@ -237,22 +275,33 @@ public class CodeGraphRiskTests
         Assert.True(decision.Detail.Length < 20_000, $"gate row of {decision.Detail.Length} chars");
         var row = new LedgerEntry { State = WorkState.MergeGate, Step = RunPipeline.Steps.GateDecision, Detail = decision.Detail, Outcome = StepOutcome.GateRejected };
         Assert.Contains($"{critical} critical", LedgerReport.Facts([row], []));
-        // Unreadable entries are capped too.
-        var many = new CodeGraphRisk(Head, [], [], Enumerable.Range(0, 50).Select(i => $"entry {i}").ToList());
-        Assert.EndsWith("entry 19; … 30 more", many.UnreadableText);
+        // Files with no CodeGraph data are capped too: per reason, and the reasons.
+        var oneReason = Evaluate(null, TestPolicies.Standard(maxLines: 10_000, maxFiles: 1_000), diff);
+        Assert.Equal(GateOutcome.Merge, oneReason.Outcome);
+        Assert.Contains($"{files[19]}, … 280 more", oneReason.Inputs);
+        Assert.True(oneReason.Detail.Length < 20_000, $"gate row of {oneReason.Detail.Length} chars");
+        Assert.Contains("no CodeGraph data: CodeGraph is not configured", LedgerReport.Facts(
+            [new LedgerEntry { State = WorkState.MergeGate, Step = RunPipeline.Steps.GateDecision, Detail = oneReason.Detail, Outcome = StepOutcome.Passed }], []));
+        var many = new CodeGraphRisk(Head, [], [], Enumerable.Range(0, 50).Select(i => new NoCodeGraphData($"f{i}", $"entry {i}")).ToList());
+        Assert.EndsWith("no CodeGraph data: entry 19: f19; … 30 more", many.NoDataText);
     }
 
     [Fact]
-    [FailsGateCheck(GateChecks.RiskThreshold)]
-    public void CodeGraph_inputs_not_read_read_for_another_commit_or_leaving_a_file_out_block()
+    public void CodeGraph_inputs_not_read_read_for_another_commit_or_leaving_a_file_out_are_no_codegraph_data()
     {
-        Assert.Contains("CodeGraph is not configured: no CodeGraph token; set CodeGraph:Token, env FACTORY_CODEGRAPH_TOKEN, or keychain account "
-            + "'codegraph-token' (service 'dark-factory')", Assert.Single(Evaluate(null).Reasons));
-        Assert.Contains($"read for {Other[..12]}, not the head", Assert.Single(Evaluate(Radii(BlastRadius.Low) with { HeadSha = Other }).Reasons));
+        var none = Evaluate(null);
+        Assert.Equal(GateOutcome.Merge, none.Outcome);
+        Assert.Contains("no CodeGraph data: CodeGraph is not configured (no CodeGraph token: CodeGraph:Token, env FACTORY_CODEGRAPH_TOKEN, or keychain "
+            + "account 'codegraph-token' (service 'dark-factory')): src/a.cs, src/b.cs", none.Inputs);
+        var other = Evaluate(Radii(BlastRadius.Critical) with { HeadSha = Other });
+        Assert.Equal(GateOutcome.Merge, other.Outcome); // a critical answer for another commit is not the head's: no data, not a block
+        Assert.Contains($"no CodeGraph data: CodeGraph's inputs were read for {Other[..12]}, not the head: src/a.cs, src/b.cs", other.Inputs);
         var partial = Radii(BlastRadius.Low);
-        Assert.Contains("CodeGraph's inputs leave out src/b.cs",
-            Assert.Single(Evaluate(partial with { BlastRadius = partial.BlastRadius.Take(1).ToList() }).Reasons));
-        Assert.Equal(GateOutcome.Blocked, Evaluate(partial with { Hotspots = partial.Hotspots.Skip(1).ToList() }).Outcome);
+        var leftOut = Evaluate(partial with { BlastRadius = partial.BlastRadius.Take(1).ToList() });
+        Assert.Equal(GateOutcome.Merge, leftOut.Outcome);
+        Assert.Contains("no CodeGraph data: CodeGraph's inputs leave it out: src/b.cs", leftOut.Inputs);
+        Assert.Contains("no CodeGraph data: CodeGraph's inputs leave it out: src/a.cs",
+            Evaluate(partial with { Hotspots = partial.Hotspots.Skip(1).ToList() }).Inputs);
     }
 
     [Fact]
@@ -261,7 +310,7 @@ public class CodeGraphRiskTests
         var docs = TestPolicies.Diff("docs/a.md");
         var decision = Evaluate(null, diff: docs);
         Assert.Equal(GateOutcome.Merge, decision.Outcome);
-        Assert.DoesNotContain("codegraph", decision.Detail);
+        Assert.DoesNotContain("codegraph", decision.Detail, StringComparison.OrdinalIgnoreCase);
     }
 
     // ---- languages CodeGraph does not index (sc-26133, P5 S7; CodeGraph's side is C3, sc-26137) ----
@@ -269,22 +318,28 @@ public class CodeGraphRiskTests
     private const string SwiftFile = "Sources/App/Counter.swift";
 
     [Fact]
-    [FailsGateCheck(GateChecks.RiskThreshold)]
-    public void A_changed_file_whose_language_codegraph_does_not_index_fails_risk_threshold_closed_and_passes_once_it_is_indexed()
+    public void A_changed_file_whose_language_codegraph_does_not_index_is_recorded_as_no_codegraph_data_and_merges()
     {
         var diff = TestPolicies.Diff(SwiftFile);
         var unindexed = TestRisk.None(Head, diff) with { Unindexed = [new UnindexedFile(SwiftFile, "Swift", Flagged: true)] };
 
         var decision = Evaluate(unindexed, diff: diff);
 
-        Assert.Equal(GateOutcome.Blocked, decision.Outcome);
-        Assert.Equal("risk threshold: CodeGraph does not index the language of a changed code file, so its blast radius and hotspot are unknown: "
-            + $"{SwiftFile} (Swift)", Assert.Single(decision.Reasons));
-        Assert.Contains($"language not indexed by CodeGraph: {SwiftFile} (Swift)", decision.Inputs);
-        // Not pending: blocked at once, even when something else could not be read.
-        Assert.Equal(GateOutcome.Blocked, Evaluate(unindexed with { Unreadable = ["x: could not be sent"] }, diff: diff).Outcome);
-        // Once CodeGraph indexes it, the same change passes.
-        Assert.Equal(GateOutcome.Merge, Evaluate(TestRisk.None(Head, diff), diff: diff).Outcome);
+        // sc-26254: recorded, not blocking (before: blocked closed).
+        Assert.Equal(GateOutcome.Merge, decision.Outcome);
+        Assert.Contains($"no CodeGraph data: its language (Swift) is not indexed by CodeGraph: {SwiftFile}", decision.Inputs);
+        Assert.Contains("no CodeGraph data for 1 of 1 file(s)", decision.Detail);
+        // Its language is its one reason: not also "left out" (its inputs are set aside, not missing).
+        Assert.DoesNotContain("leave it out", decision.Inputs);
+        // Its own blast radius is not used (CodeGraph has no graph of it), but an indexed file beside it is held to the floor.
+        var both = TestPolicies.Diff(SwiftFile) + TestPolicies.Diff("src/a.cs");
+        var mixed = TestRisk.With(Head, both, f => f == SwiftFile ? BlastRadius.Critical : BlastRadius.Low, _ => 0)
+            with { Unindexed = [new UnindexedFile(SwiftFile, "Swift", Flagged: true)] };
+        Assert.Equal(GateOutcome.Merge, Evaluate(mixed, diff: both).Outcome);
+        var critical = TestRisk.With(Head, both, f => f == "src/a.cs" ? BlastRadius.Critical : BlastRadius.None, _ => 0)
+            with { Unindexed = [new UnindexedFile(SwiftFile, "Swift", Flagged: true)] };
+        Assert.Equal($"risk threshold: blast radius at {Head[..12]} over the code floor (critical always fails): src/a.cs critical",
+            Assert.Single(Evaluate(critical, diff: both).Reasons));
     }
 
     [Theory]
@@ -328,7 +383,7 @@ public class CodeGraphRiskTests
 
         var risk = await Reader(server).ReadAsync(Repo, Head, Ready, [path], CancellationToken.None);
 
-        Assert.Empty(risk.Unreadable);
+        Assert.Empty(risk.NoData);
         Assert.Single(risk.BlastRadius);
         Assert.Single(risk.Hotspots);
         if (language is null)
@@ -341,10 +396,12 @@ public class CodeGraphRiskTests
         Assert.Equal(path, file.Path);
         Assert.Equal(language == "language unknown" ? null : language, file.Language);
         Assert.Equal(flagged, file.Flagged);
-        var reason = Assert.Single(Evaluate(risk, diff: TestPolicies.Diff(path)).Reasons);
-        Assert.EndsWith(file.ToString(), reason);
-        Assert.Contains(path, reason);
-        Assert.Contains(language, reason);
+        // sc-26254: recorded as no CodeGraph data, naming the file and its language, and merged.
+        var decision = Evaluate(risk, diff: TestPolicies.Diff(path));
+        Assert.Equal(GateOutcome.Merge, decision.Outcome);
+        Assert.Contains($"no CodeGraph data: {file.Reason}: {path}", decision.Inputs);
+        Assert.Contains($"its language ({(language == "language unknown" ? "unknown" : language)}) is not indexed by CodeGraph", file.Reason);
+        Assert.Equal(!flagged, file.Reason.Contains("before C3", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -399,9 +456,12 @@ public class CodeGraphRiskTests
 
         var risk = await Reader(server).ReadAsync(Repo, Head, Ready, [SwiftFile], CancellationToken.None);
 
-        Assert.Single(risk.Unreadable);
+        Assert.StartsWith("file_hotspot (repo_not_found)", Assert.Single(risk.NoData).Reason);
         Assert.Equal(new UnindexedFile(SwiftFile, "Swift", true), Assert.Single(risk.UnindexedFiles));
-        Assert.Equal(GateOutcome.Blocked, Evaluate(risk, diff: TestPolicies.Diff(SwiftFile)).Outcome);
+        var decision = Evaluate(risk, diff: TestPolicies.Diff(SwiftFile));
+        Assert.Equal(GateOutcome.Merge, decision.Outcome);
+        // The language is the reason the gate records for the file (its blast radius and hotspot mean nothing there).
+        Assert.Contains($"no CodeGraph data: its language (Swift) is not indexed by CodeGraph: {SwiftFile}", decision.Inputs);
     }
 
     [Fact]
@@ -464,7 +524,7 @@ public class CodeGraphRiskTests
 
         var risk = await Reader(server).ReadAsync(Repo, Head, Ready, ["src/a.cs", "src/New.cs"], CancellationToken.None);
 
-        Assert.Empty(risk.Unreadable);
+        Assert.Empty(risk.NoData);
         Assert.Equal([new FileBlastRadius("src/a.cs", BlastRadius.High, true), new FileBlastRadius("src/New.cs", BlastRadius.None, false)], risk.BlastRadius);
         // C7 (PR #76) names no metrics commit for a file without metrics (commitSha null): its 0 is recorded at indexCommitSha.
         Assert.Equal([new FileHotspot("src/a.cs", 0.42, true, IndexCommit, IndexCommit), new FileHotspot("src/New.cs", 0, false, IndexCommit, IndexCommit)],
@@ -482,26 +542,26 @@ public class CodeGraphRiskTests
 
     public static TheoryData<string, string> UnreadableAnswers() => new()
     {
-        { "not-indexed", "src/a.cs: analyze_impact_file is not indexed for the head (commit_not_indexed, status indexing)" },
-        { "unknown-repo", "src/a.cs: analyze_impact_file (repo_not_found): Error (repo_not_found): Unknown repository 'Sandbox'." },
-        { "not-entitled", "src/a.cs: not entitled to analyze_impact_file" },
-        { "other-commit", $"src/a.cs: analyze_impact_file answered for {Other}, not the head" },
-        { "unknown-radius", "src/a.cs: analyze_impact_file answered an unknown blast radius 'severe'" },
-        { "no-found", "src/a.cs: analyze_impact_file answered no 'found'" },
-        { "unreachable", "src/a.cs: analyze_impact_file could not be sent: " },
-        { "hotspot-error", "src/a.cs: file_hotspot (repo_not_found): Error (repo_not_found): Unknown repository 'Sandbox'." },
-        { "hotspot-not-entitled", "src/a.cs: not entitled to file_hotspot" },
-        { "hotspot-overlay", "src/a.cs: file_hotspot answered from 'overlay', not the default branch" },
-        { "hotspot-no-commit", "src/a.cs: file_hotspot named no commit (neither commitSha nor indexCommitSha)" },
-        { "hotspot-no-score", "src/a.cs: file_hotspot answered no riskScore" },
-        { "other-path", "src/a.cs: analyze_impact_file answered about 'src/b.cs', not src/a.cs" },
-        { "no-path", "src/a.cs: analyze_impact_file answered about no path, not src/a.cs" },
-        { "hotspot-other-path", "src/a.cs: file_hotspot answered about 'src/a.cs.bak', not src/a.cs" },
+        { "not-indexed", "analyze_impact_file is not indexed for the head (commit_not_indexed, status indexing)" },
+        { "unknown-repo", "analyze_impact_file (repo_not_found): Error (repo_not_found): Unknown repository 'Sandbox'." },
+        { "not-entitled", "not entitled to analyze_impact_file" },
+        { "other-commit", $"analyze_impact_file answered for {Other}, not the head" },
+        { "unknown-radius", "analyze_impact_file answered an unknown blast radius 'severe'" },
+        { "no-found", "analyze_impact_file answered no 'found'" },
+        { "unreachable", "analyze_impact_file could not be sent: " },
+        { "hotspot-error", "file_hotspot (repo_not_found): Error (repo_not_found): Unknown repository 'Sandbox'." },
+        { "hotspot-not-entitled", "not entitled to file_hotspot" },
+        { "hotspot-overlay", "file_hotspot answered from 'overlay', not the default branch" },
+        { "hotspot-no-commit", "file_hotspot named no commit (neither commitSha nor indexCommitSha)" },
+        { "hotspot-no-score", "file_hotspot answered no riskScore" },
+        { "other-path", "analyze_impact_file answered about 'src/b.cs', not src/a.cs" },
+        { "no-path", "analyze_impact_file answered about no path, not src/a.cs" },
+        { "hotspot-other-path", "file_hotspot answered about 'src/a.cs.bak', not src/a.cs" },
     };
 
     [Theory]
     [MemberData(nameof(UnreadableAnswers))]
-    public async Task A_file_codegraph_cannot_read_is_unreadable(string kind, string why)
+    public async Task A_file_codegraph_cannot_read_has_no_codegraph_data_and_the_gate_merges_on_its_other_inputs(string kind, string why)
     {
         var server = Server((tool, args) => (kind, tool) switch
         {
@@ -527,8 +587,14 @@ public class CodeGraphRiskTests
 
         var risk = await Reader(server).ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None);
 
-        Assert.StartsWith(why, Assert.Single(risk.Unreadable));
-        Assert.Equal(GateOutcome.Pending, Evaluate(risk, diff: TestPolicies.Diff("src/a.cs")).Outcome);
+        var noData = Assert.Single(risk.NoData);
+        Assert.Equal("src/a.cs", noData.Path);
+        Assert.StartsWith(why, noData.Reason);
+        // The other tool's answer is still used: one of the two inputs is read whichever failed.
+        Assert.Equal(1, risk.BlastRadius.Count + risk.Hotspots.Count);
+        var decision = Evaluate(risk, diff: TestPolicies.Diff("src/a.cs"));
+        Assert.Equal(GateOutcome.Merge, decision.Outcome);
+        Assert.Contains($"no CodeGraph data: {why}", decision.Inputs);
     }
 
     [Fact]
@@ -542,7 +608,7 @@ public class CodeGraphRiskTests
 
         var risk = await Reader(server).ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None);
 
-        Assert.Empty(risk.Unreadable);
+        Assert.Empty(risk.NoData);
         Assert.Equal([new FileHotspot("src/a.cs", 0.7, true, IndexCommit, IndexCommit, VitalsCommitUnknown: true)], risk.Hotspots);
         Assert.Contains($"vitals commit unknown; index at {IndexCommit}: src/a.cs 0.7", risk.Describe());
         // The score counts: a version 3 hotspot limit below it fails the check.
@@ -555,7 +621,7 @@ public class CodeGraphRiskTests
     }
 
     [Fact]
-    public async Task A_hotspot_read_in_a_wait_is_reused_by_its_index_commit_even_when_the_metrics_are_older()
+    public async Task A_hotspot_read_earlier_is_reused_by_its_index_commit_even_when_the_metrics_are_older()
     {
         // The metrics were computed at an older default-branch commit than the index's now (commitSha != indexCommitSha): the score is
         // recorded at its own commit, and the cache is keyed by the index commit — the commit the next read looks it up by (the overlay's base).
@@ -575,7 +641,7 @@ public class CodeGraphRiskTests
     }
 
     [Fact]
-    public async Task No_ready_overlay_of_the_head_leaves_the_inputs_unread_and_nothing_more_is_asked()
+    public async Task No_ready_overlay_of_the_head_leaves_the_blast_radius_unread_and_the_hotspots_are_still_read()
     {
         var server = Server((tool, args) => tool == "file_hotspot" ? HotspotAnswer(args["path"]!.GetValue<string>(), true, 0.3)
             : ImpactAnswer(Head, args["path"]!.GetValue<string>(), true, "low"));
@@ -583,31 +649,47 @@ public class CodeGraphRiskTests
 
         var risk = await Reader(server).ReadAsync(Repo, Head, timedOut, ["src/a.cs"], CancellationToken.None);
 
-        Assert.Equal($"blast radius: no ready CodeGraph overlay of {Head} (timed-out (overlay 41): not ready within 10 min)", Assert.Single(risk.Unreadable));
+        Assert.Equal(new NoCodeGraphData("src/a.cs", $"blast radius: no ready CodeGraph overlay of {Head} (timed-out (overlay 41): not ready within 10 min)"),
+            Assert.Single(risk.NoData));
         Assert.Empty(risk.BlastRadius);
-        // The reader stops at the first input it cannot read: the gate is pending anyway, and reads everything again.
-        Assert.DoesNotContain(server.Calls, c => c.Tool is "analyze_impact_file" or "file_hotspot");
-        Assert.Empty(risk.Hotspots);
+        // E3: no blast radius asked without the head's overlay; the hotspot is the default branch's, so it is still read and used.
+        Assert.DoesNotContain(server.Calls, c => c.Tool == "analyze_impact_file");
+        Assert.Equal([new FileHotspot("src/a.cs", 0.3, true, IndexCommit, IndexCommit)], risk.Hotspots);
         // A ready overlay of another commit is not the head's either.
         var other = await Reader(server).ReadAsync(Repo, Head, Ready with { HeadSha = Other }, ["src/a.cs"], CancellationToken.None);
-        Assert.StartsWith("blast radius: no ready CodeGraph overlay", Assert.Single(other.Unreadable));
+        Assert.StartsWith("blast radius: no ready CodeGraph overlay", Assert.Single(other.NoData).Reason);
     }
 
     [Fact]
-    public async Task The_reader_stops_at_the_first_file_it_cannot_read()
+    public async Task A_call_that_cannot_be_made_ends_that_tools_calls_and_an_unusable_answer_concerns_its_file_only()
     {
-        var server = Server((tool, args) => (tool, args["path"]!.GetValue<string>()) switch
+        // CodeGraph unreachable for analyze_impact_file: asked once, every file recorded, the hotspots still read.
+        var down = Server((tool, args) => (tool, args["path"]!.GetValue<string>()) switch
         {
-            ("analyze_impact_file", "src/a.cs") => throw new HttpRequestException("connection refused"),
-            ("analyze_impact_file", var p) => ImpactAnswer(Head, p, true, "low"),
+            ("analyze_impact_file", _) => throw new HttpRequestException("connection refused"),
             (_, var p) => HotspotAnswer(p, true, 0.1),
         });
 
-        var risk = await Reader(server).ReadAsync(Repo, Head, Ready, ["src/a.cs", "src/b.cs"], CancellationToken.None);
+        var risk = await Reader(down).ReadAsync(Repo, Head, Ready, ["src/a.cs", "src/b.cs"], CancellationToken.None);
 
-        Assert.StartsWith("src/a.cs: analyze_impact_file could not be sent", Assert.Single(risk.Unreadable));
-        Assert.Equal(["src/a.cs"], server.Calls.Where(c => c.Tool is "analyze_impact_file" or "file_hotspot").Select(c => c.Arguments["path"]!.GetValue<string>()));
+        Assert.Single(down.Calls, c => c.Tool == "analyze_impact_file");
+        Assert.Equal(["src/a.cs", "src/b.cs"], risk.NoData.Select(n => n.Path));
+        Assert.StartsWith("analyze_impact_file could not be sent", risk.NoData[0].Reason);
+        Assert.StartsWith("analyze_impact_file not asked: analyze_impact_file could not be sent", risk.NoData[1].Reason);
+        Assert.Equal(2, risk.Hotspots.Count);
         Assert.False(risk.OverlayUnusable);
+
+        // An answer for another commit concerns that file only: the next file is asked and used.
+        var oneOff = Server((tool, args) => (tool, args["path"]!.GetValue<string>()) switch
+        {
+            ("analyze_impact_file", "src/a.cs") => ImpactAnswer(Other, "src/a.cs", true, "low"),
+            ("analyze_impact_file", var p) => ImpactAnswer(Head, p, true, "critical"),
+            (_, var p) => HotspotAnswer(p, true, 0.1),
+        });
+        var partial = await Reader(oneOff).ReadAsync(Repo, Head, Ready, ["src/a.cs", "src/b.cs"], CancellationToken.None);
+        Assert.Equal("src/a.cs", Assert.Single(partial.NoData).Path);
+        Assert.Equal([new FileBlastRadius("src/b.cs", BlastRadius.Critical, true)], partial.BlastRadius);
+        Assert.Equal(GateOutcome.Blocked, Evaluate(partial).Outcome);
     }
 
     [Fact]
@@ -617,7 +699,7 @@ public class CodeGraphRiskTests
 
         var risk = await Reader(server).ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None);
 
-        Assert.Empty(risk.Unreadable);
+        Assert.Empty(risk.NoData);
         Assert.Equal([new FileBlastRadius("src/a.cs", BlastRadius.Low, true)], risk.BlastRadius);
     }
 
@@ -629,19 +711,20 @@ public class CodeGraphRiskTests
         var risk = await Reader(server).ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None);
 
         Assert.True(risk.OverlayUnusable);
-        Assert.Contains("status stale", Assert.Single(risk.Unreadable));
+        Assert.Contains("status stale", Assert.Single(risk.NoData, n => n.Reason.StartsWith("analyze_impact_file", StringComparison.Ordinal)).Reason);
     }
 
     [Fact]
-    public async Task A_repository_codegraph_does_not_index_or_cannot_be_asked_about_is_unreadable()
+    public async Task A_repository_codegraph_does_not_index_or_cannot_be_asked_about_has_no_codegraph_data()
     {
         var unindexed = FakeMcpServer.CodeGraph("- **Other** [csharp]\n  Repo: https://github.com/o/other\n", (_, _) => FakeMcpServer.Text("x"));
-        Assert.Equal("o/r: repository not indexed in CodeGraph",
-            Assert.Single((await Reader(unindexed).ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None)).Unreadable));
+        Assert.Equal(new NoCodeGraphData("src/a.cs", "o/r: repository not indexed in CodeGraph"),
+            Assert.Single((await Reader(unindexed).ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None)).NoData));
 
         var down = new FakeMcpServer("/mcp", [], (_, _) => throw new HttpRequestException("connection refused"));
-        Assert.StartsWith("CodeGraph could not be reached or asked: ",
-            Assert.Single((await Reader(down).ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None)).Unreadable));
+        var risk = await Reader(down).ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None);
+        Assert.StartsWith("CodeGraph could not be reached or asked: ", Assert.Single(risk.NoData).Reason);
+        Assert.Equal(GateOutcome.Merge, Evaluate(risk, diff: TestPolicies.Diff("src/a.cs")).Outcome);
     }
 
     // ---- the risk tools are the gate's and, through the proxy, the planner's (sc-25874) ----
@@ -726,29 +809,30 @@ public class CodeGraphRiskTests
     }
 
     [Fact]
-    public async Task A_pr_changing_a_swift_file_escalates_while_codegraph_does_not_index_swift_and_merges_once_it_does()
+    public async Task A_pr_changing_a_swift_file_codegraph_does_not_index_merges_recording_no_codegraph_data()
     {
         static string SwiftDiff(string head) => TestPolicies.Diff("Sources/App/Counter.swift", marker: head);
 
-        // A CodeGraph before C3 (no languageIndexed flag) with no data for the file: fail closed, naming the file and its language.
+        // A CodeGraph before C3 (no languageIndexed flag) with no data for the file: recorded, never blocking (sc-26254).
         var before = new Harness();
         before.GitHub.Diff = SwiftDiff;
-        var escalated = await before.Run();
-        Assert.Equal(WorkState.Escalated, escalated.State);
-        Assert.Empty(before.Merges);
-        Assert.Contains("CodeGraph does not index the language of a changed code file", escalated.Error);
-        Assert.Contains("Sources/App/Counter.swift (Swift", escalated.Error);
+        var merged = await before.Run();
+        Assert.True(merged.Succeeded, merged.Error);
+        Assert.Equal(WorkState.Watch, merged.State);
         var gate = Assert.Single(await before.Rows(), r => r.Step == RunPipeline.Steps.GateDecision);
-        Assert.StartsWith("Blocked ", gate.Detail);
-        Assert.Contains("language not indexed by CodeGraph: Sources/App/Counter.swift (Swift", gate.Detail);
+        Assert.StartsWith("Merge ", gate.Detail);
+        Assert.Contains("no CodeGraph data: its language (Swift) is not indexed by CodeGraph (CodeGraph answered no languageIndexed flag: before C3): "
+            + "Sources/App/Counter.swift", gate.Detail);
+        // The reports render it from the ledger (E8).
+        Assert.Contains("no CodeGraph data: its language (Swift) is not indexed by CodeGraph", LedgerReport.Facts(await before.Rows(), []));
 
-        // CodeGraph's C3 says it now indexes Swift: the same change merges.
+        // CodeGraph's C3 says it indexes Swift: its data is used.
         var after = new Harness();
         after.GitHub.Diff = SwiftDiff;
         after.CodeGraph.Impact = (path, sha) => C7Answers.ParsedImpactFile("Sandbox", path, sha, false, "none", languageIndexed: true, language: "swift");
-        var merged = await after.Run();
-        Assert.True(merged.Succeeded, merged.Error);
-        Assert.Equal(WorkState.Watch, merged.State);
+        var indexed = await after.Run();
+        Assert.True(indexed.Succeeded, indexed.Error);
+        Assert.DoesNotContain("no CodeGraph data", Assert.Single(await after.Rows(), r => r.Step == RunPipeline.Steps.GateDecision).Detail);
     }
 
     [Fact]
@@ -772,54 +856,76 @@ public class CodeGraphRiskTests
     }
 
     [Fact]
-    public async Task CodeGraph_unreadable_for_a_while_is_waited_for_like_pending_ci_then_the_pr_merges()
+    public async Task CodeGraph_unreachable_is_recorded_as_no_codegraph_data_and_the_pr_merges_without_waiting()
     {
         var h = new Harness();
-        var reads = 0;
-        h.CodeGraph.Hotspot = path => ++reads <= 3 ? throw new HttpRequestException("connection refused") : FakeCodeGraphRisk.Hot(path, 0.2);
+        h.CodeGraph.Hotspot = _ => throw new HttpRequestException("connection refused");
 
         var outcome = await h.Run();
 
         Assert.True(outcome.Succeeded, outcome.Error);
         Assert.Equal(WorkState.Watch, outcome.State);
-        Assert.True(reads > 3);
-        // Pending evaluations are not decisions: one gate row, the merge.
-        Assert.StartsWith("Merge ", Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.GateDecision).Detail);
+        // Asked once — no wait, no second read.
+        Assert.Single(h.CodeGraph.Calls, c => c.Tool == "file_hotspot");
+        var gate = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.GateDecision);
+        Assert.StartsWith("Merge ", gate.Detail);
+        Assert.Contains("no CodeGraph data: file_hotspot could not be sent: connection refused: src/x.cs", gate.Detail);
+        // The blast radius CodeGraph did answer is still recorded.
+        Assert.Contains($"codegraph blast radius at {Sha1}: src/x.cs none (no data)", gate.Detail);
     }
 
     private static readonly DateTimeOffset Start = new(2026, 10, 8, 12, 0, 0, TimeSpan.Zero);
 
-    /// <summary>
-    /// A gate whose waits run on a <see cref="SteppingClock"/> of one-minute steps, with a CI timeout of five. The harness bounds
-    /// the default reader's overlay wait for the fake clock (<see cref="FakeCodeGraphRisk.FakeClockOverlayTimeout"/>), so the CI
-    /// timeout is what ends the wait.
-    /// </summary>
-    private static Harness OnSteppingClock(FakeCodeGraphRisk codeGraph) => new()
-    {
-        GateOnFakeClock = true, Time = new SteppingClock(Start, TimeSpan.FromMinutes(1)), CiTimeout = TimeSpan.FromMinutes(5), CodeGraph = codeGraph,
-    };
-
     [Fact]
-    public async Task CodeGraph_still_unreadable_at_the_ci_timeout_escalates()
+    public async Task A_head_codegraph_answers_not_indexed_for_is_asked_for_once_more_then_merges_with_no_codegraph_data()
     {
-        // Fake time: every wait moves the clock on by itself, so the timeout is reached in steps, whatever the load.
-        var h = OnSteppingClock(new FakeCodeGraphRisk { Impact = (_, sha) => FakeCodeGraphRisk.NotIndexed(sha, "indexing") });
+        var h = new Harness();
+        h.CodeGraph.Impact = (_, sha) => FakeCodeGraphRisk.NotIndexed(sha, "indexing");
 
-        var outcome = await h.Run().WaitAsync(TimeSpan.FromSeconds(60));
+        var outcome = await h.Run();
 
-        Assert.Equal(WorkState.Escalated, outcome.State);
-        Assert.Empty(h.Merges);
-        Assert.Contains("src/x.cs: analyze_impact_file is not indexed for the head (commit_not_indexed, status indexing)", outcome.Error);
-        Assert.Contains("CodeGraph could still not be read after 00:05:00 (Gate:CiTimeoutMinutes)", outcome.Error);
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(WorkState.Watch, outcome.State);
+        // The overlay requested, found unusable, requested once more — and then the gate goes on without the blast radius.
+        Assert.Equal(2, h.CodeGraph.Calls.Count(c => c.Tool == "request_overlay"));
+        Assert.Equal(2, h.CodeGraph.Calls.Count(c => c.Tool == "analyze_impact_file"));
         var gate = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.GateDecision);
-        Assert.StartsWith("Blocked ", gate.Detail);
-        Assert.Equal(StepOutcome.GateRejected, gate.Outcome);
+        Assert.StartsWith("Merge ", gate.Detail);
+        Assert.Contains("no CodeGraph data: analyze_impact_file is not indexed for the head (commit_not_indexed, status indexing): src/x.cs", gate.Detail);
     }
 
     [Fact]
-    public async Task The_ci_timeout_bounds_the_overlay_wait_inside_one_read_of_the_gate()
+    public async Task An_overlay_still_indexing_is_waited_for_at_most_the_overlay_timeout_then_the_pr_merges()
     {
-        // The overlay is still indexing for longer than the CI timeout: the gate escalates at the CI timeout, not at the overlay's.
+        // The overlay never becomes ready: the gate waits CodeGraph:OverlayTimeoutMinutes (3 min here), never Gate:CiTimeoutMinutes (an hour).
+        var codeGraph = new FakeCodeGraphRisk
+        {
+            Overlay = sha => new OverlayAnswer(false, "queued", 7, "queued", sha, null, null),
+            Status = id => new OverlayAnswer(false, "indexing", id, "indexing", Sha1, null, null),
+        };
+        var clock = new SteppingClock(Start, TimeSpan.FromMinutes(1));
+        var h = new Harness
+        {
+            GateOnFakeClock = true, Time = clock, CiTimeout = TimeSpan.FromHours(1), CodeGraph = codeGraph,
+            RiskReader = new CodeGraphRiskReader(codeGraph, TimeSpan.FromMinutes(3), TimeSpan.FromMinutes(1)),
+        };
+
+        var outcome = await h.Run().WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(WorkState.Watch, outcome.State);
+        var elapsed = clock.GetUtcNow() - Start;
+        Assert.True(elapsed < TimeSpan.FromMinutes(30), $"the gate's wait ran {elapsed} of fake time");
+        var gate = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.GateDecision);
+        Assert.StartsWith("Merge ", gate.Detail);
+        Assert.Contains($"no CodeGraph data: blast radius: no ready CodeGraph overlay of {Sha1} (timed-out", gate.Detail);
+        Assert.DoesNotContain(codeGraph.Calls, c => c.Tool == "analyze_impact_file");
+    }
+
+    [Fact]
+    public async Task The_ci_timeout_still_bounds_a_codegraph_that_hangs_and_the_pr_then_merges()
+    {
+        // A backstop: an overlay timeout longer than the CI timeout (an hour here, CI 5 min) — the read is cut off at the CI timeout.
         var codeGraph = new FakeCodeGraphRisk
         {
             Overlay = sha => new OverlayAnswer(false, "queued", 7, "queued", sha, null, null),
@@ -834,49 +940,47 @@ public class CodeGraphRiskTests
 
         var outcome = await h.Run().WaitAsync(TimeSpan.FromSeconds(60));
 
-        Assert.Equal(WorkState.Escalated, outcome.State);
-        Assert.Empty(h.Merges);
-        Assert.Contains("CodeGraph could still not be read after 00:05:00 (Gate:CiTimeoutMinutes)", outcome.Error);
-        // Cut off at the CI timeout (a few steps of slack), never left to run to the overlay's hour.
+        Assert.True(outcome.Succeeded, outcome.Error);
         var elapsed = clock.GetUtcNow() - Start;
         Assert.True(elapsed < TimeSpan.FromMinutes(20), $"the gate's wait ran {elapsed} of fake time");
-        Assert.True(codeGraph.Calls.Count(c => c.Tool == "get_overlay_status") < 20);
+        var gate = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.GateDecision);
+        Assert.StartsWith("Merge ", gate.Detail);
+        Assert.Contains("no CodeGraph data: CodeGraph did not answer within 00:05:00 (Gate:CiTimeoutMinutes): src/x.cs", gate.Detail);
     }
 
     [Fact]
-    public async Task No_ready_overlay_of_the_head_keeps_the_gate_pending_until_the_ci_timeout()
-    {
-        var h = OnSteppingClock(new FakeCodeGraphRisk
-        {
-            Overlay = _ => new OverlayAnswer(true, "Error (overlays_unavailable): overlays are off", null, null, null, null, null,
-                ErrorCode: "overlays_unavailable"),
-        });
-
-        var outcome = await h.Run().WaitAsync(TimeSpan.FromSeconds(60));
-
-        Assert.Equal(WorkState.Escalated, outcome.State);
-        Assert.Contains($"blast radius: no ready CodeGraph overlay of {Sha1} (refused", outcome.Error);
-        Assert.DoesNotContain(h.CodeGraph.Calls, c => c.Tool == "analyze_impact_file");
-        var overlay = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.CodeGraphOverlay);
-        Assert.Equal(CodeGraphOverlay.Refused, CodeGraphOverlay.FromDetail(overlay.Detail)!.Outcome);
-    }
-
-    [Fact]
-    public async Task An_overlay_refused_for_a_while_is_asked_for_again_each_poll_and_its_outcome_recorded_once()
+    public async Task An_overlay_codegraph_refuses_leaves_the_blast_radius_unread_and_the_pr_merges_at_once()
     {
         var h = new Harness();
-        var requests = 0;
-        h.CodeGraph.Overlay = sha => ++requests <= 2
-            ? new OverlayAnswer(true, "Error (overlays_unavailable): overlays are off", null, null, null, null, null, ErrorCode: "overlays_unavailable")
-            : new OverlayAnswer(false, "ready", 7, "ready", sha, FakeCodeGraphRisk.IndexCommit, null);
+        h.CodeGraph.Overlay = _ => new OverlayAnswer(true, "Error (overlays_unavailable): overlays are off", null, null, null, null, null,
+            ErrorCode: "overlays_unavailable");
 
         var outcome = await h.Run();
 
         Assert.True(outcome.Succeeded, outcome.Error);
-        Assert.Equal(3, requests);
-        // Refused twice, recorded once; then ready.
-        Assert.Equal([CodeGraphOverlay.Refused, CodeGraphOverlay.Ready], (await h.Rows()).Where(r => r.Step == RunPipeline.Steps.CodeGraphOverlay)
-            .Select(r => CodeGraphOverlay.FromDetail(r.Detail)!.Outcome));
+        Assert.DoesNotContain(h.CodeGraph.Calls, c => c.Tool == "analyze_impact_file");
+        Assert.Single(h.CodeGraph.Calls, c => c.Tool == "request_overlay");
+        var overlay = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.CodeGraphOverlay);
+        Assert.Equal(CodeGraphOverlay.Refused, CodeGraphOverlay.FromDetail(overlay.Detail)!.Outcome);
+        var gate = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.GateDecision);
+        Assert.StartsWith("Merge ", gate.Detail);
+        Assert.Contains($"no CodeGraph data: blast radius: no ready CodeGraph overlay of {Sha1} (refused", gate.Detail);
+    }
+
+    [Fact]
+    public async Task A_hotspot_over_an_opted_in_limit_still_escalates_when_the_blast_radius_could_not_be_read()
+    {
+        var h = new Harness();
+        h.GitHub.PolicyText = TestPolicies.V3("high", "0.5");
+        h.CodeGraph.Overlay = _ => new OverlayAnswer(true, "Error (overlays_unavailable): overlays are off", null, null, null, null, null,
+            ErrorCode: "overlays_unavailable");
+        h.CodeGraph.Hotspot = path => FakeCodeGraphRisk.Hot(path, 0.9);
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Empty(h.Merges);
+        Assert.Contains("hotspot score (riskScore) over max_hotspot 0.5: src/x.cs 0.9", outcome.Error);
     }
 
     [Fact]
@@ -899,9 +1003,12 @@ public class CodeGraphRiskTests
         Assert.Equal(WorkState.Watch, outcome.State);
         Assert.Equal(Sha1, h.CodeGraph.Calls.Single(c => c.Tool == "request_overlay").Argument);
         Assert.Equal(2, h.CodeGraph.Calls.Count(c => c.Tool == "analyze_impact_file"));
-        // The review's overlay, then the gate's fresh one (not one row per poll).
+        // The review's overlay, then the gate's fresh one.
         Assert.Equal([7L, 8L], (await h.Rows()).Where(r => r.Step == RunPipeline.Steps.CodeGraphOverlay)
             .Select(r => CodeGraphOverlay.FromDetail(r.Detail)!.OverlayId));
+        var gate = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.GateDecision);
+        Assert.DoesNotContain("no CodeGraph data", gate.Detail);
+        Assert.Contains("worst blast radius low (src/x.cs)", gate.Detail);
     }
 
     [Fact]
@@ -932,71 +1039,34 @@ public class CodeGraphRiskTests
     }
 
     [Fact]
-    public async Task Hotspots_read_during_one_wait_are_not_asked_for_again()
-    {
-        var h = new Harness();
-        h.GitHub.Diff = head => TestPolicies.Diff("src/a.cs", marker: head) + TestPolicies.Diff("src/b.cs", marker: head);
-        var bReads = 0;
-        h.CodeGraph.Hotspot = path => path == "src/b.cs" && ++bReads <= 2 ? throw new HttpRequestException("connection refused") : FakeCodeGraphRisk.Hot(path, 0.1);
-
-        var outcome = await h.Run();
-
-        Assert.True(outcome.Succeeded, outcome.Error);
-        Assert.Equal(3, h.CodeGraph.Calls.Count(c => c == ("file_hotspot", "src/b.cs")));
-        Assert.Equal(1, h.CodeGraph.Calls.Count(c => c == ("file_hotspot", "src/a.cs"))); // read once, at the overlay's base commit
-    }
-
-    [Fact]
-    public async Task A_push_during_the_codegraph_wait_sends_the_new_head_to_review_and_never_merges_the_old_one()
-    {
-        var h = new Harness();
-        var first = true;
-        h.CodeGraph.Hotspot = path =>
-        {
-            if (first)
-            {
-                first = false;
-                h.GitHub.Head = ShaB; // pushed while the gate waits
-                throw new HttpRequestException("connection refused");
-            }
-            return FakeCodeGraphRisk.Hot(path, 0.1);
-        };
-
-        var outcome = await h.Run();
-
-        Assert.True(outcome.Succeeded, outcome.Error);
-        Assert.Equal([$"merge 1 {ShaB}"], h.Merges);
-        Assert.Contains(await h.Rows(), r => r.Step is null && r.State == WorkState.Review && r.Detail?.StartsWith($"head moved to {ShaB} while the merge gate waited") == true);
-        Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.GateDecision && r.Detail!.StartsWith("Merge ", StringComparison.Ordinal));
-    }
-
-    [Fact]
-    public async Task A_pr_closed_during_the_codegraph_wait_escalates_and_is_not_merged()
-    {
-        var h = new Harness();
-        h.CodeGraph.Hotspot = _ =>
-        {
-            h.GitHub.Open = false;
-            throw new HttpRequestException("connection refused");
-        };
-
-        var outcome = await h.Run();
-
-        Assert.Equal(WorkState.Escalated, outcome.State);
-        Assert.Contains("is closed outside the factory", outcome.Error);
-        Assert.Empty(h.Merges);
-        Assert.Equal(1, h.CodeGraph.Calls.Count(c => c.Tool == "file_hotspot"));
-    }
-
-    [Fact]
-    public async Task Without_codegraph_risk_threshold_fails_wherever_it_is_required()
+    public async Task Without_codegraph_the_pr_merges_recording_no_codegraph_data()
     {
         var h = new Harness { NoCodeGraph = true };
 
         var outcome = await h.Run();
 
+        // sc-26254 (owner decision 2026-10-15): the factory works with or without CodeGraph.
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Equal(WorkState.Watch, outcome.State);
+        Assert.Single(h.Merges);
+        var gate = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.GateDecision);
+        Assert.StartsWith("Merge ", gate.Detail);
+        Assert.Contains("no CodeGraph data: CodeGraph is not configured (no CodeGraph token: ", gate.Detail);
+        Assert.Contains("no CodeGraph data for 1 of 1 file(s), judged on size and fix rounds", gate.Detail);
+        Assert.Contains("no CodeGraph data: CodeGraph is not configured", LedgerReport.Facts(await h.Rows(), []));
+    }
+
+    [Fact]
+    public async Task Without_codegraph_a_change_over_the_size_limit_still_escalates()
+    {
+        var h = new Harness { NoCodeGraph = true };
+        h.GitHub.PolicyText = TestPolicies.Standard(maxLines: 1);
+        h.GitHub.Diff = head => TestPolicies.Diff("src/x.cs", lines: 5, marker: head);
+
+        var outcome = await h.Run();
+
         Assert.Equal(WorkState.Escalated, outcome.State);
-        Assert.Contains("CodeGraph is not configured", outcome.Error);
         Assert.Empty(h.Merges);
+        Assert.Contains("risk threshold: 5 changed lines exceed max_changed_lines 1", outcome.Error);
     }
 }

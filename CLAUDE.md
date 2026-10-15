@@ -209,7 +209,7 @@ it replaced the Weave router fork at `localhost:8080`, sc-26197).
   Phase 3's epic AT1–AT5 (sc-25710, `CodeGraphAcceptanceTests.cs`): `CodeGraphReviewTests` (the real panel's tool calls, turns and
   overlay-bound CodeGraph answers), `CodeGraphTriageTests` (a triage session through the proxy, scanned for the CodeGraph token by a
   wrapper Claude Code path, `ScanWrapper`; the production proxy refusing off-profile tools; a live Kanban read through the reviewers'
-  tools), `CodeGraphGateTests` (a critical file escalating on risk-threshold; CodeGraph unreachable blocking at the CI timeout).
+  tools), `CodeGraphGateTests` (a critical file escalating on risk-threshold; CodeGraph unreachable recorded as no CodeGraph data and merged, sc-26254).
   Phase 4a's P4-AT4 (sc-25875): `GateNegativeTests.P4_AT4_…` (a seeded cargo package on the PR branch: the new-tests check run by
   cargo as the worker user; needs cargo and rustc for `_factory`) — the rejection (a test that already passes on the base) and
   the merge (sc-25877, `FACTORY_E2E_P4_CARGO_MERGE_STORY`: a test of new code, `not-built` on the base and passing on the head,
@@ -231,9 +231,11 @@ it replaced the Weave router fork at `localhost:8080`, sc-26197).
   Phase 5's P5-AT1–AT7 (sc-26134, docs/acceptance.md "Phase 5"; `SwiftAcceptanceTests`, `SwiftRealRunTests`, helpers
   `SwiftLive.cs`, the non-live `SwiftLiveTests`): a LensWorks change with a new Swift Testing test merged by a real
   implementer and panel; seeded SwiftPM (XCTest) and iOS (unit and UI test on a simulator) changes merged; the gate refusing
-  a Swift change while CodeGraph does not index Swift, then accepting it; a Swift test already passing on the base rejected;
+  a Swift change merged recording `no CodeGraph data` while CodeGraph does not index Swift (P5-AT5a), and merged on CodeGraph's
+  data of it once it does (P5-AT5b); a Swift test already passing on the base rejected;
   and a read-only check of the real ledger after a real LensWorks epic and iOS change. Each needs `Worker:Swift=true` and its
-  `FACTORY_E2E_P5_*` variable; the merging ones skip until CodeGraph indexes Swift (C3, sc-26137). The seeds the target
+  `FACTORY_E2E_P5_*` variable; none depends on CodeGraph (sc-26254) but P5-AT5a (skips once CodeGraph indexes Swift) and P5-AT5b
+  (skips until it does: C3, sc-26137). The seeds the target
   repositories hold once are `tests/DarkFactory.AcceptanceTests/Seeds/` (a SwiftPM package, an iOS app).
   P4b-AT2 (sc-25984, `KanbanPlanAcceptanceTests`, `FACTORY_E2E_P4B_PLAN_KANBAN_ITEM` + `FACTORY_E2E_P4B_KANBAN_PROJECT`): a real
   planner plans a `plan`-labelled Kanban item into at least 3 items with a dependency chain (else INCONCLUSIVE,
@@ -289,7 +291,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Router:Key` | env `FACTORY_ROUTER_KEY`, or keychain account `router-key` |
 | `CodeGraph:BaseUrl` | the hosted CodeGraph (`OutboundHttp.CodeGraphDefaultBase`; an absolute http(s) URL naming no model provider): reviewers' CodeGraph tools (`ReviewTools.CodeGraphTools`) go to its `mcp` endpoint |
 | `CodeGraph:OverlayTimeoutMinutes` | `10` (> 0: how long a review waits, before its first panel call, for CodeGraph's overlay of the PR head; not ready by then, reviewers' CodeGraph calls read the default-branch index, labelled not the PR head; sc-25708) |
-| `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional: without it the factory starts and every CodeGraph tool answers the reviewer an error result (recorded), triage gets no CodeGraph, and the merge gate's `risk-threshold` fails wherever a tier requires it (sc-25709), so no normal or protected change merges (`factory run` and `factory work` warn at start-up) |
+| `CodeGraph:Token` | env `FACTORY_CODEGRAPH_TOKEN`, or keychain account `codegraph-token`; owner-side only (E5). Optional (sc-26254: the factory works with or without CodeGraph): without it the factory starts and every CodeGraph tool answers the reviewer an error result (recorded), triage gets no CodeGraph, and the merge gate's `risk-threshold` records `no CodeGraph data` for every file and decides on the change's size and fix rounds — merges proceed (`factory run` and `factory work` print an informational note at start-up, `FactoryRunner.CodeGraphTokenNote`) |
 | `Kanban:McpUrl` | `https://kanban-mcp.trefry.net/mcp` (`OutboundHttp.KanbanDefaultMcpUrl`; an absolute http(s) URL naming no model provider; MCP Streamable HTTP): the Kanban upstream (sc-25707), offered to reviewers through their tool loop and to a plan item's planner session through the loopback proxy (`McpProfile.Planner`, sc-25870); never to triage sessions, whose proxy is started without it (`McpProfile.Triage`: the issue text is untrusted and the triage's answer is posted on the issue) |
 | `Kanban:Token` | env `FACTORY_KANBAN_TOKEN`, or keychain account `kanban-token`: a KanbanBoard PAT (`Authorization: Bearer`), owner-side only (E5). Optional: without it there is no Kanban upstream (not an error) |
 | `Kanban:WriteToken` | env `FACTORY_KANBAN_WRITE_TOKEN`, or keychain account `kanban-write-token` (sc-25981): the orchestrator's own KanbanBoard PAT, scope `full`, with which the Kanban work source claims, moves, comments on and links items. Owner-side only and apart from `Kanban:Token` (E2): equal to it is refused at start-up (`WorkSourceRegistry.EnsureKanbanTokensApart`, from `FactoryOptions.ValidateSettings` and again where the source is built; exit 2, naming the keys and neither token, sc-25992 — the read token reaches model sessions through the MCP proxy); it is read in one place (`WorkSourceRegistry.Kanban`), held by one client (`Gateway/KanbanWrites`) and is in no MCP upstream, profile, allowlist or proxy grant. Needed only to work a Kanban item (`factory run kb-N`, `factory kanban key`): missing, those print the reason and exit 2 |
@@ -2833,58 +2835,66 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (`MergeGate.TouchedFiles`: both sides of a rename, deletes) `analyze_impact_file(repo, path, sha = head, depth = 3)` — only once
   CodeGraph's overlay of exactly the head is ready (a ready `codegraph-overlay` checkpoint for that head, e.g. the review's, is
   reused until a read answers C4's `notIndexed` — e.g. status `stale`, the default branch moved past its base:
-  `CodeGraphRisk.OverlayUnusable` — after which the next read requests the overlay again, `ReviewOverlays.WaitAsync` re-requesting a
-  stale one; otherwise requested and waited for like the review's and checkpointed, an outcome the last row for that head already
-  records not written again) and only an answer naming the head (E3) and the file asked about (its `path`, normalized like the
+  `CodeGraphRisk.OverlayUnusable` — after which the gate requests the overlay again ONCE and reads again, `ReviewOverlays.WaitAsync`
+  re-requesting a stale one; otherwise requested and waited for like the review's, at most `CodeGraph:OverlayTimeoutMinutes`, and
+  checkpointed, an outcome the last row for that head already records not written again) and only an answer naming the head (E3) and the file asked about (its `path`, normalized like the
   diff's) — then `file_hotspot(repo, path)` from the default branch only (`source: default-branch`, the asked `path`), recorded with
   the commit it names (E3's exception) as C7 (michaeltrefry/CodeGraph PR #76) shapes it: `commitSha` is the metrics' commit and
   `indexCommitSha` the current default-branch index commit; a file without metrics (`found: false`, e.g. new) answers `commitSha`
   null and counts as 0 recorded at `indexCommitSha`; a found file with a null `commitSha` (metrics computed before CodeGraph recorded
   commits) keeps its score, recorded at `indexCommitSha` and labelled "vitals commit unknown; index at <sha>"; an answer naming
-  neither commit is unreadable. Each answer is reused within one wait while the ready overlay's base is its index commit
-  (`HotspotCache`, keyed by `indexCommitSha` — the commit the lookup names). The reader stops at the first input it cannot read. "The hotspot score" is CodeGraph's `riskScore`. The blast
+  neither commit is unreadable. A hotspot answer is reused by the read after an overlay requested again while the ready overlay's
+  base is its index commit (`HotspotCache`, keyed by `indexCommitSha` — the commit the lookup names). "The hotspot score" is
+  CodeGraph's `riskScore`. CodeGraph is optional (sc-26254, owner decision 2026-10-15: "The factory should be able to work with or
+  without CodeGraph"): its inputs are used when available, and every touched file it gives no usable input for is recorded as
+  having NO CODEGRAPH DATA, with why (`NoCodeGraphData`, `CodeGraphRisk.NoData`), and judged on its other inputs (changed lines and
+  files, fix rounds, the changeset limits) — never pending, never blocked for it. The causes: CodeGraph not configured (no token:
+  `GateStage.Risk` null, `CodeGraph is not configured (no CodeGraph token: …)`), unreachable or refusing (HTTP 403
+  `tool_not_entitled`, a timeout), the repository not indexed, no ready overlay of the head within `CodeGraph:OverlayTimeoutMinutes`
+  (failed, refused, timed out, stale after the one re-request, unavailable — the blast radius only: the hotspots, the default
+  branch's, are still read and used), an error answer, an answer for another commit or another file or unreadable (that file and
+  tool only), inputs read for another head or leaving a file out, and a language CodeGraph does not index (below). The reader
+  (`CodeGraphRiskReader`) goes on past an unusable answer to the next file; a call that cannot be made at all (thrown: unreachable,
+  refused over HTTP, timed out) or C4's `notIndexed` ends that tool's calls, its remaining files recorded `<tool> not asked: <why>`,
+  so an unreachable CodeGraph costs one call per tool. `EvaluateGateAsync` evaluates once more with the inputs read — no polling
+  loop (`GateOutcome.Pending` comes only from the evaluation before CodeGraph is read); `Gate:CiTimeoutMinutes` bounds the whole
+  CodeGraph read only as a backstop for a CodeGraph that hangs (cut off: every file `CodeGraph did not answer within …`). The blast
   radius has a code floor (`GatePolicy.BlastRadiusFloor` =
   high: a critical file always fails; seam `policy-floor:blast-radius`), `max_blast_radius` can only lower it. CodeGraph rates a file critical only for a non-test dependent in another repo (depth 1, or depth 2 over a message edge) or a non-test depth-1 message consumer (`CONSUMES`, built only for repos in its `TrustedDotnetRepositories`); in-repo callers rate high at most, so in practice the floor fires on cross-repo dependents and
   consumers (docs/acceptance.md, P3-AT4a); hotspots have no
-  floor — recorded and reported, failing only above an opted-in `max_hotspot`. Languages CodeGraph does not index (sc-26133,
-  `LanguageCoverage`; owner decision 2026-10-14: fail closed, pass once CodeGraph indexes it): contract with CodeGraph C3
-  (sc-26137, not deployed yet; `languageIndexed` exists nowhere in CodeGraph today) — the structured content of
+  floor — recorded and reported, failing only above an opted-in `max_hotspot`. Both apply to a file CodeGraph answered for;
+  `policy-floor:blast-radius` holds wherever there is data. Languages CodeGraph does not index (sc-26133, `LanguageCoverage`;
+  RECORDED, NOT BLOCKING since sc-26254 — owner decision 2026-10-15 replacing 2026-10-14's fail closed): contract with CodeGraph
+  C3 (sc-26137, not deployed yet; `languageIndexed` exists nowhere in CodeGraph today; still consumed, for the record) — the structured content of
   `analyze_impact_file` and `file_hotspot` carries `languageIndexed` (bool: false only for a source file of a language CodeGraph
   does not index; true for an indexed language and for a non-code file; an indexed new file with no data is `found: false,
   languageIndexed: true`) and `language` (CodeGraph's capitalised name — `Swift`, `C#`, `C++`, `Objective-C` — or null). Judged
   per file after BOTH answers (`LanguageCoverage.Of`): `languageIndexed: false` in either → unindexed; `true` in either and
   `false` in neither → indexed; neither carries the flag (a CodeGraph before C3; E7: .NET and Rust unchanged) → unindexed only
   when the file's extension is one CodeGraph's main did not index before C3 (`LanguageCoverage.UnindexedBeforeC3`,
-  case-insensitive: `.swift` Swift, `.m` Objective-C — MATLAB's `.m` is blocked too, a false block — `.mm` Objective-C++, `.kt`/
+  case-insensitive: `.swift` Swift, `.m` Objective-C — MATLAB's `.m` too — `.mm` Objective-C++, `.kt`/
   `.kts` Kotlin, `.scala` Scala, `.dart` Dart; checked against CodeGraph's source 2026-10-14, which indexes C#, TypeScript, C,
   C++, Python, Go, Java, Ruby, Rust, PHP, Bash, SQL, ColdFusion, Terraform and Ansible YAML) AND `analyze_impact_file` had no
-  data for it (`found` not true: graph data means the language is indexed). A file whose hotspot was not read (the read stopped
-  at an unreadable input) is unindexed already when its impact answer says `false`. One entry per file: CodeGraph's word
+  data for it (`found` not true: graph data means the language is indexed). A file whose hotspot was not read is unindexed
+  already when its impact answer says `false`; without an impact answer only a hotspot's `false` counts (no inference). One entry per file: CodeGraph's word
   replaces the inference (`LanguageCoverage.Add`). CodeGraph's `language` is untrusted text (E3): shown only when, trimmed, it
   is at most 60 characters of ASCII letters, digits, `+ # . _ -` and spaces (`LanguageCoverage.Name`); otherwise the factory's
   name by extension stands in, or `language unknown`. An unindexed touched file (deletes and both sides of a rename included)
-  BLOCKS `risk-threshold` (never pending, also beside an unreadable input): ``risk threshold: CodeGraph does not index the
-  language of a changed code file, so its blast radius and hotspot are unknown: Sources/A.swift (Swift)`` (`; CodeGraph answered
-  no languageIndexed flag (before C3)` when inferred), and the `gate` row's inputs add `language not indexed by CodeGraph: …`; a
-  cached hotspot keeps its answer's flag and name (`FileHotspot.LanguageIndexed`/`Language`). CodeGraph's main does NOT index
-  Swift today (only its feature branch `claude/swift-codegraph-support-8f2e6c` does), so until it does no normal or protected
-  Swift change merges. C3 (sc-26137) must ship no later than Swift support on CodeGraph's main: otherwise a new or deleted Swift
-  file (`found: false`, no flag) keeps being blocked although Swift is indexed — a false block, never a false pass.
-  Otherwise a file CodeGraph has no data for (`found: false`,
-  e.g. a new file) counts as blast radius none / hotspot 0; a file read over a limit blocks at once, even when another could not be
-  read; one CodeGraph cannot read (an error answer, HTTP 403 `tool_not_entitled`, unreachable, the repo not indexed, a C4
-  `notIndexed` answer, no ready overlay of the head, an answer for another commit, another file or without a commit) otherwise
-  makes the decision `Pending` (owner decision 2026-10-10): `EvaluateGateAsync` reads every fact again every `Gate:CiPollSeconds`
-  like pending CI (controls checked and the PR read again between reads — found merged → recorded as found merged, closed →
-  escalate, a new head → Review — so the wait never holds the queue's turn for an old head; pending evaluations are not
-  checkpointed). One deadline bounds the whole wait, CodeGraph's overlay wait and calls included (a `CancellationTokenSource` on
-  `GateTime`): at `Gate:CiTimeoutMinutes` it is recorded Blocked and escalates, even mid-call; a real Pause/Stop still propagates.
-  No CodeGraph configured (no token: `GateStage.Risk` null) fails the check at once, wherever it is required — so a factory without
-  a CodeGraph token merges no normal or protected change; the reason names the setting, and `factory run` and `factory work` warn
-  at start-up (`FactoryRunner.CodeGraphTokenWarning`). Inputs read for another head or leaving a touched file out block. The inputs
-  are in the `gate` checkpoint's Detail after ` | ` (`CodeGraphRisk.Describe`): every file over a limit, the worst and the hottest,
-  then the first `CodeGraphRisk.MaxListed` (20) others with "… N more", each hotspot with its commit, and what could not be read
-  (capped likewise), so one row stays inside the reports' budget; a failure's
+  has no CodeGraph data: its blast radius and hotspot are not used, and the `gate` row records ``no CodeGraph data: its language
+  (Swift) is not indexed by CodeGraph: Sources/A.swift`` (` (CodeGraph answered no languageIndexed flag: before C3)` when
+  inferred; `UnindexedFile.Reason`); the change is judged on its other inputs and merges like any other. A cached hotspot keeps
+  its answer's flag and name (`FileHotspot.LanguageIndexed`/`Language`). CodeGraph's main does NOT index Swift today (only its
+  feature branch `claude/swift-codegraph-support-8f2e6c` does): Swift changes merge, recorded as having no CodeGraph data, until
+  it does; then its data of them is used.
+  A file CodeGraph has no data for (`found: false`, e.g. a new file, of an indexed language) counts as blast radius none /
+  hotspot 0; a file read over a limit blocks, whatever other files lack. `factory run` and `factory work` print an informational
+  note at start-up without a token (`FactoryRunner.CodeGraphTokenNote`). The inputs are in the `gate` checkpoint's Detail after
+  ` | ` (`CodeGraphRisk.Describe` of `CodeGraphRisk.Judged`): every file over a limit, the worst and the hottest, then the first
+  `CodeGraphRisk.MaxListed` (20) others with "… N more", each hotspot with its commit, and the files with no CodeGraph data —
+  ``no CodeGraph data: <reason>: <file>, …`` per reason, each reason's files and the reasons capped likewise
+  (`CodeGraphRisk.NoDataText`) — so one row stays inside the reports' budget; a Merge's reason adds `no CodeGraph data for N of M
+  file(s), judged on size and fix rounds`. The reports (PR body, closeout, escalation comment: `LedgerReport`) show a `gate`
+  row's no-data list on its own, after the row's clipped text (`CodeGraphRisk.NoDataMark`, at most 2,000 characters); a failure's
   reason names each file over the limit with its blast radius (or hotspot score), so the escalation comment and the PR report (both
   from the ledger) name it. The gate sends `analyze_impact_file`/`file_hotspot` (`CodeGraphMcpClient.RiskTools`) straight through the MCP
   client. They are on no reviewers' tool list and not in the triage profile; since sc-25874 they are on the planner profile's

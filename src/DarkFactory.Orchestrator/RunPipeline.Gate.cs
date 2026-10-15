@@ -14,7 +14,7 @@ namespace DarkFactory.Orchestrator;
 /// test runs of the <c>new-tests-fail-on-base</c> check (<see cref="Tests"/>; none: the check cannot run, so it fails
 /// wherever it is required), and the wait for CodeGraph's overlay of the head at the start of a review (<see cref="Overlays"/>,
 /// sc-25708; none: no overlay is asked for and reviewers' CodeGraph calls read the default-branch index), and CodeGraph's inputs to
-/// <c>risk-threshold</c> (<see cref="Risk"/>, sc-25709; none: no CodeGraph is configured, so the check fails wherever it is required).
+/// <c>risk-threshold</c> (<see cref="Risk"/>, sc-25709; none: no CodeGraph is configured, so every file has no CodeGraph data, sc-26254).
 /// </summary>
 public sealed record GateStage(
     IGateGitHub GitHub,
@@ -631,7 +631,7 @@ public sealed partial class RunPipeline
             return recorded;
         }
         var overlay = await overlays.WaitAsync(run.Repo, pull.HeadSha, _ => ThrowIfControlledAsync(run.Item, ct), GateTime, wait ?? ct);
-        // The gate's pending wait asks again every poll: an outcome the last row for this head already records is not written again.
+        // An outcome the last row for this head already records (a stale overlay asked for again, a re-run) is not written again.
         if (row?.Detail != overlay.ToDetail())
         {
             await ledger.CheckpointAsync(run.Item, Steps.CodeGraphOverlay, null, overlay.ToDetail(), ct);
@@ -642,17 +642,37 @@ public sealed partial class RunPipeline
 
     /// <summary>
     /// CodeGraph's inputs to <c>risk-threshold</c> for the PR head (sc-25709), read only once everything else the gate checks holds (the
-    /// gate evaluated without them came out <see cref="GateOutcome.Pending"/>). The blast radius needs CodeGraph's overlay of exactly the
-    /// head (<see cref="HeadOverlayAsync"/>: a ready one recorded for it is reused unless <paramref name="requestOverlay"/>); the hotspots
-    /// are read from the default branch (reused from <paramref name="hotspots"/> within one wait). <paramref name="wait"/> bounds the
-    /// CodeGraph calls (the gate's deadline).
+    /// gate evaluated without them came out <see cref="GateOutcome.Pending"/>), and read once (sc-26254). The blast radius needs
+    /// CodeGraph's overlay of exactly the head (<see cref="HeadOverlayAsync"/>: a ready one recorded for it is reused; otherwise it is
+    /// requested and waited for, at most <c>CodeGraph:OverlayTimeoutMinutes</c>); a recorded one CodeGraph no longer uses
+    /// (<see cref="CodeGraphRisk.OverlayUnusable"/>, e.g. stale) is requested again once. The hotspots are read from the default branch.
+    /// The whole read is bounded by <c>Gate:CiTimeoutMinutes</c> (a backstop for a CodeGraph that hangs): cut off there, every file has
+    /// no CodeGraph data. Whatever is missing is recorded per file and never holds the gate.
     /// </summary>
-    private async Task<CodeGraphRisk> CodeGraphRiskAsync(Run run, PullFacts pull, string diff, CodeGraphRiskReader reader, bool requestOverlay,
-        HotspotCache hotspots, CancellationToken wait, CancellationToken ct)
+    private async Task<CodeGraphRisk> CodeGraphRiskAsync(Run run, PullFacts pull, string diff, CodeGraphRiskReader reader, CancellationToken ct)
     {
-        var overlay = await HeadOverlayAsync(run, pull, reader.Overlays, "gate", ct, requestOverlay, wait);
-        await ThrowIfControlledAsync(run.Item, ct);
-        var risk = await reader.ReadAsync(run.Repo, pull.HeadSha, overlay, MergeGate.TouchedFiles(diff), wait, hotspots);
+        var files = MergeGate.TouchedFiles(diff);
+        using var timeout = new CancellationTokenSource(Gate.CiTimeout, GateTime);
+        using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
+        CodeGraphRisk risk;
+        try
+        {
+            var hotspots = new HotspotCache();
+            var overlay = await HeadOverlayAsync(run, pull, reader.Overlays, "gate", ct, wait: bounded.Token);
+            await ThrowIfControlledAsync(run.Item, ct);
+            risk = await reader.ReadAsync(run.Repo, pull.HeadSha, overlay, files, bounded.Token, hotspots);
+            if (risk.OverlayUnusable)
+            {
+                // CodeGraph no longer uses the overlay it had of the head (e.g. it went stale once the default branch moved): asked again once.
+                overlay = await HeadOverlayAsync(run, pull, reader.Overlays, "gate", ct, requestAgain: true, wait: bounded.Token);
+                await ThrowIfControlledAsync(run.Item, ct);
+                risk = await reader.ReadAsync(run.Repo, pull.HeadSha, overlay, files, bounded.Token, hotspots);
+            }
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            risk = CodeGraphRisk.None(pull.HeadSha, files, $"CodeGraph did not answer within {Gate.CiTimeout} (Gate:CiTimeoutMinutes)");
+        }
         log.WriteLine($"[gate] {risk.Describe()}");
         return risk;
     }
