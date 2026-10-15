@@ -40,7 +40,11 @@ it replaced the Weave router fork at `localhost:8080`, sc-26197).
   remote URL names (`RepoOf`, sc-25981); `KanbanWrites` builds the one MCP client that holds the orchestrator's full-scope Kanban
   token (sc-25981); `GitHubCli` is the only `gh` run),
   and KanbanBoard as a third work source (`Kanban/`, sc-25981: `KanbanWorkSource`, its typed MCP caller `KanbanBoard.cs`, and
-  `KanbanKeys.cs` — the ledger's `kb-<n>` keys of items and of epics, the watch scope `KanbanScope`, the web links `KanbanLinks` and the dashboard's `KanbanLedgerLinks`). `RepoRef` and
+  `KanbanKeys.cs` — the ledger's `kb-<n>` keys of items and of epics, the watch scope `KanbanScope`, the web links `KanbanLinks` and the dashboard's `KanbanLedgerLinks`),
+  and repositories' prepare recipes (`Prepare/`, sc-26232: `PrepareRecipe` — the `.factory/prepare.yaml` schema —, `ArtifactFetcher`
+  and `ArtifactCache` — the harness's downloads into the read-only cache; the transport and the address rules are the gateway's
+  `Gateway/ArtifactDownloads.cs` —, `PrepareSteps`, the gate's `PrepareStage`, the workers' `WorkerPrepare` (prefetch and request
+  spool) and `PrepareTool`; "Prepare recipes" under the invariants). `RepoRef` and
   `RepoResolver` (`RepoRef.cs`) are in the root namespace: every source and the pipeline use them.
 - `src/DarkFactory.Analyzers` — the gateway lint (sc-25390), a Roslyn analyzer every build of the orchestrator and of
   `tests/DarkFactory.AcceptanceTests` runs (CI's `build-test` included), all errors: DF0001 an HTTP client/handler (made,
@@ -82,7 +86,9 @@ it replaced the Weave router fork at `localhost:8080`, sc-26197).
   `_factory2` … `_factoryn`, one per worker slot, sc-25989) and `factory-worker-launch` (the helper every sandboxed worker runs
   through, installed root-owned once per sandbox user, each copy pinned to its own user and uid) and `factory-xcodebuild` (the
   only xcodebuild command a worker is allowed, sc-26130: installed root-owned, unedited, once for every slot at
-  `/usr/local/libexec/dark-factory/factory-xcodebuild`; "Swift toolchain" below).
+  `/usr/local/libexec/dark-factory/factory-xcodebuild`; "Swift toolchain" below) and `factory-prepare` (a worker's way to run its
+  repository's prepare recipe, sc-26232: installed the same way at `/usr/local/libexec/dark-factory/factory-prepare`; "Prepare
+  recipes" below).
 - `tests/DarkFactory.Orchestrator.Tests` — unit tests (no network; fake HTTP APIs, InMemory EF, local git).
   Tests run `scripts/factory-worker-launch` only through `SafeHelper` (a checked copy whose every signal goes through a
   seam that signals only the test's own processes, and whose uid-sweep listing names only the helper's tree and the test's
@@ -316,6 +322,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Worker:RunAs` | `_factory` (the sandbox user, slot 1's; slot n's is this name with n appended: `_factory2`, …); `none` runs workers as the owner (development only) |
 | `Worker:LaunchHelper` | `/usr/local/libexec/dark-factory/factory-worker-launch` (slot 1's installed helper; slot n's is this path with `-n` appended) |
 | `Worker:Slots` | `1` (a whole number 1–8, `WorkerSlots.MaxSlots`; sc-25989): how many sandbox users run workers side by side — worker sessions at a time. 1 is the one user `_factory`, one helper, one lock file, as before slots. Each slot above 1 needs its user and helper set up first (`sudo scripts/setup-worker-user.sh --slots n`), or start-up fails naming the slot (a slot above the count setup was last run with has no installed helper: setup removes the higher slots' helpers). Independent of `Intake:MaxConcurrentRuns`: more runs than slots is the ordinary case (runs also overlap outside worker phases); more slots than runs is allowed (the others serve a `factory run` beside `factory work`; `factory work` says so at start-up). Refused, not ignored, with `Worker:RunAs=none` unless 1 ("Worker slots" below) |
+| `Worker:Prepare` | `false` (`true`/`false`, any case; sc-26232): `true` lets implementing workers prepare their worktree from its repository's `.factory/prepare.yaml` — they are allowed the installed `factory-prepare` (one rule, its absolute path), which start-up then requires current (`sudo scripts/setup-worker-user.sh` installs it), and every implementing session is told its request spool, one whose worktree has a recipe also prefetched ("Prepare recipes" below). `false` changes nothing for workers (E7); the gate prepares each commit by its own recipe either way |
 | `Worker:Swift` | `false` (`true`/`false`, any case; sc-26130): `true` when the factory works Swift/Xcode repositories — every slot's user must then have Swift, xcodebuild with Xcode's first launch done and its license accepted, the macOS and iOS Simulator SDKs, and the installed, current `factory-xcodebuild`; implementers are then allowed the wrapper and their prompts name it ("Swift toolchain" below). `false` checks nothing of Swift or Xcode (E7: a .NET/Rust-only factory is never refused for a missing Xcode). A setting, not derived from the repositories, because a repository's stack is unknown before its first item is read and start-up reads nothing from GitHub. Refused, not ignored, when `true` with `Worker:RunAs=none` |
 | `Worker:Auth` | `router-key` (default: the worker holds only the router key, in `X-Weave-Router-Key` and as `ANTHROPIC_AUTH_TOKEN`; the router serves it from plans enrolled with `simple-router login claude` / `simple-router login codex` (in the simple-router repository: `dotnet run --project src/SimpleRouter -- login claude|codex`); `factory run`/`work` refuse to start unless `GET /v1/subscriptions/usage` lists an enabled `managed`/`shared` credential) — the only mode. `claude-login` (any case) is retired (sc-26197): simple-router never forwards a client's own login (it serves every session from its own stored logins), so the mode only skipped the enrolment check; it is refused at start-up (`FactoryOptions.CheckWorkerAuth`, from `ValidateSettings`, `FactoryOptions.ClaudeLoginRetired`: `factory run` and `factory work` print the reason and exit 2), and nothing of it is left in the code (`No_claude_login_code_path_is_left_in_the_orchestrator`) |
 | `Worker:TimeoutMinutes` | `30` (> 0) |
@@ -2230,6 +2237,117 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
     directly with any class or none.
   A target repo whose default branch carries refused settings gets no implementer until they are removed. Triage loads no settings
   at all (`--setting-sources ""`).
+- Prepare recipes (Phase 5, sc-26232, owner decision 2026-10-15: repositories declare how a checkout is prepared and the factory
+  runs it; no repository is reshaped for the harness and no human is needed for a routine recipe change; `Prepare/`;
+  docs/prepare-recipes.md has the schema and a LensWorks example). Recipe: `.factory/prepare.yaml` at the repository root (NOT
+  the sealed `factory/gate.yaml`), strict and versioned (`PrepareRecipe.Parse`, `version: 1`; any unknown or missing key, or a
+  value off its rules, refuses the whole recipe): `artifacts` (name, https `url`, `sha256`, `max_bytes`, `unpack`
+  none|zip|tar|tar.gz, `max_unpacked_bytes`) and `steps` (name, `argv` — no shell string; the program an absolute path, a plain
+  name on the launch helper's fixed PATH, or a `${artifact:…}`/`${worktree}` path; WHICH program is not judged — any program
+  (a shell, an interpreter, a build tool) can reach the network as the sandbox user, so no list of programs is kept (owner
+  decision, review of PR #108) — `cwd` relative with no `..`, `env` without the helper's, the loader's, the shells' or the
+  router's variables, `timeout_minutes` 1–120); placeholders `${worktree}` and `${artifact:<name>}` (its cached path).
+  Trust: a build recipe like `Package.swift` or `build.rs`: `.factory/` is on the code floor `RiskyPaths` (every change to it
+  calls the security review in, whatever its tier) and the factory merges it with no human. Each commit uses its OWN recipe.
+  Downloads (E2): ONLY the harness, owner-side, through the gateway (`OutboundHttp.ArtifactDownload` over
+  `Gateway/ArtifactDownloads.cs`; the lint forbids an HTTP client elsewhere): https only; the URL checked before anything is
+  resolved (`ArtifactUrls`: no user info or fragment, no port but 443, `localhost`/`*.localhost` and a non-public IP literal
+  refused — a redirect's URL likewise); every address
+  the host resolves to must be public (`ArtifactAddresses.Blocked`: loopback, RFC 1918, CGNAT 100.64/10, link-local, multicast,
+  reserved/broadcast, documentation and benchmarking ranges, unique-local/site-local IPv6, and any IPv6 form carrying such an
+  IPv4 — mapped, compatible, NAT64 64:ff9b::/96, 6to4, Teredo — while IPv4-translated ::ffff:0:0/96, local-use NAT64
+  64:ff9b:1::/48 and the rest of 64:ff9b::/32 are refused outright), checked before the request and again in the transport's
+  connect callback, which tries the addresses it checked in the resolver's order and connects only to one of them
+  (`ArtifactAddresses.ConnectAsync`; pinned: no rebinding window); no proxy, no automatic redirect — at most
+  `ArtifactFetcher.MaxRedirects` (5), each URL checked again, never to http; only status 200; `max_bytes` enforced from the
+  declared length and while streaming; SHA-256 computed while streaming into an owner-only temporary file, cached only on a
+  match; the whole download bounded (`ArtifactFetcher.DefaultTimeout`, 15 min). Every failure is an `ArtifactFetchException`
+  naming the artifact. Cache: `<WorkRoot>/artifact-cache/<sha256>-<unpack>/content` + `manifest.json` (written last; an entry
+  without it is never used), content-addressed, the owner's; the root opened read-only to all (`WorkerSandbox.OpenReadOnlyToAllAsync`:
+  on macOS `chmod -N` — the work root's inherited entries removed, so nothing made in it inherits one — mode `0755`, read back
+  with `ls -led`, `IsReadOnlyToOthers`), every directory `0755`, every file `0644` (`0755` when the archive marked it
+  executable): every sandbox user reads it, none writes it. Unpacking refuses links, devices, absolute or `..` names, duplicates,
+  more than `ArtifactCache.MaxEntries` entries and more than `max_unpacked_bytes`. Before every use an entry is verified whole
+  (`ArtifactCache.Verify`: no link, nothing writable by anyone but the owner — modes and every entry's own ACL, `WorktreeWriters`
+  —, the content exactly its manifest's paths, sizes and SHA-256s, and an artifact kept as downloaded the recipe's SHA-256); one
+  that definitely fails (a mismatch) is deleted and fetched again; one that cannot be read to tell (an I/O failure) is an
+  `ArtifactFetchException` and is left as it is (never deleted on a doubt). A cache verifies an entry in full once: later uses
+  by the same cache skip the hashing while the manifest is the same file (`ArtifactCache.Verifications`; its modification time
+  and length — .NET exposes no inode — since only the owner writes the root and an entry is replaced only with a new manifest).
+  A cache's first use sweeps `.download-*`/`.partial-*` leftovers older than `ArtifactFetcher.DefaultTimeout` (a dead process's).
+  A cache root that cannot be made, opened read-only to all or read back so is the factory's failure
+  (`FactoryUnavailableException`: nothing recorded against the item), never an item's. Built outputs are never cached. Gate
+  (`PrepareStage`, `GateStage.Prepare`): before the new-tests runs and OUTSIDE the worker slot's lock (a download needs no sandbox
+  user; watched for Pause/Stop), the PR's changes are read ONCE (one fetch of the gate's clone, handed to the check too; a fetch
+  that fails is the check's error with its old reason, "the new tests could not be run: …"), then each commit's recipe is read
+  from the gate's clone, parsed and its artifacts fetched, the whole stage bounded by `Gate:TestTimeoutMinutes` (a hanging
+  download is the check's `error`, "… not ready within … (Gate:TestTimeoutMinutes)"), each download a ledger `artifact-fetch`
+  checkpoint (`fetched <name> <url> sha256=<hex> bytes=<n>`, outcome passed). Each commit uses its own recipe, with ONE exception
+  (decision A, review of PR #108): when the BASE's recipe fails at the FETCH stage (its artifact vanished, say — not a parse
+  error and not a step failure) AND the PR changes `.factory/prepare.yaml`, the base is prepared with the HEAD's recipe (its
+  artifacts and its steps) and the new-tests result's reason — so the gate's `new-tests` row — says so ("base prepared with the
+  head's recipe: the base's own recipe could not be fetched: …"); without it, every PR of such a repository would be an `error`,
+  the one fixing the recipe included, and only a human could break the deadlock. Then in EVERY strategy's runs
+  (xUnit, cargo, SwiftPM, Xcode macOS and iOS: `NewTestsCheck.RunAsync`'s `prepared`, `PrepareSteps.Before`) the commit's own
+  steps run after the strategy's toolchain probes and before its restore — the base runs and their retries the base's (the
+  overlay applies only test files, and never anything under `.factory/`, whatever a strategy counts as a test file:
+  `NewTestsCheck.IsPrepareRecipePath`), the head run the head's — as `TestStep`s of the Restore phase, sandboxed like every step:
+  `/usr/bin/env NAME=value … program args` (the launch helper passes no variable but the router's), the step's own directory
+  (`TestStep.WorkingDirectory`, refused unless it is a directory inside the worktree with every link resolved) and bound
+  (`TestStep.Timeout`, within the run's deadline), `${worktree}` expanded by the runner. Recipe argv is DATA run through the
+  existing `TestStep.Program` seam the gateway lint's `KnownLocalPrograms` names (no new DF0001 entry). A recipe that does not
+  parse, an artifact that cannot be fetched, or a step that fails (a failed restore) is the check's `error`, never a pass. No
+  recipe: nothing changes (E7). A PR that changes only the recipe adds no test, so where `new-tests-fail-on-base` is required
+  (any normal or protected path) it is `no-tests` under the existing rule — decision B: the rule is NOT changed for recipes, as
+  it is not for a dependency bump today; a recipe change normally rides with the code change that needs it. Workers
+  (`Worker:Prepare`, `WorkerPrepare`): implementers keep no MCP and gain no network-reaching tool. Before EVERY implementing
+  session the pipeline opens the session's request spool (also with no recipe in the worktree: the session may add one; the
+  prompt says the command works once a recipe exists), and for a worktree with a recipe it first fetches the artifacts
+  owner-side (`PrefetchAsync`; a failure is an `artifact-fetch` `failed: …` checkpoint, outcome failed, and the session still
+  starts — it may be the one fixing the recipe). The spool (`<WorkRoot>/prepare-spool/<guid>`: the
+  spool root `0711` and no ACL, the session's directory closed then `user:<slot user> allow list,search,add_file` —
+  `WorkerSandbox.OpenSpoolToWorkerAsync`, read back — so that user may add a file and read the answers, never delete or change
+  one it did not make; unsandboxed `0700`), named in the prompt (`WorkerPrepare.Note`). The worker's only new rule is
+  `Bash(/usr/local/libexec/dark-factory/factory-prepare:*)` (`PrepareTool.AllowRule`, the installed root-owned absolute path;
+  `ClaudeWorker.AllowedToolsFor(swift, prepare)`; a repository's settings allowing it taint when `Worker:Prepare` is off).
+  `scripts/factory-prepare --spool <dir>` writes one `request-<id>` (ended by an `end` line), waits (bounded, `--wait`, 1800 s),
+  and runs the answer's steps one by one (`/usr/bin/env … program args` in `<root>/<dir>`, no shell; the first failure's status
+  is its exit). The owner process polls the spool every 0.5 s while the session runs (`PrepareSpoolSession`): a complete request
+  is answered by reading the recipe from the worktree itself (`WorkerPrepare.ReadRecipe`: `.factory` must not be a link, and the
+  file is read through `.factory`'s own descriptor — `SafeFile.ReadAt`: the directory opened `O_DIRECTORY | O_NOFOLLOW`, the file
+  `openat` from it — so a `.factory` swapped for a link after the check is never followed), applying every download rule,
+  filling the cache and writing `response-<id>` (NUL fields: `ok` and the plan with every placeholder expanded,
+  `PrepareSteps.WorkerPlan`, or `error` and why) — written to a fresh random name and renamed into place (whole; a link the
+  worker planted at that name is replaced, never followed). A session's spool is answered with a fetch at most
+  `WorkerPrepare.MaxRequestsPerSession` (20) times; every later request is answered `error` at once. A failed fetch is answered
+  with `ArtifactFetchException.WorkerMessage` — for a hash mismatch "… does not match the pinned sha256 <pinned>", never the
+  served bytes' hash — while the full reason is an `artifact-fetch` `failed: …` checkpoint. The spool's downloads and failures
+  are checkpointed once the session ends (the session's own stream writes the ledger meanwhile); the spool is removed with the
+  session. Start-up and every run's start with `Worker:Prepare` read the installed `factory-prepare` and refuse a missing or stale
+  one (`PrepareTool.EnsureCurrentAsync`, factory-wide). Taint, said plainly: a worker's `factory-prepare` runs the recipe in its
+  worktree as it is then — the worker's own, UNREVIEWED edit, at whatever URLs and hashes it names — and the steps' output (and
+  so whatever those artifacts make them print) reaches the session. The session is not tainted for it: accepted, the residual
+  of a build's own code (a worker could as well make `cargo build`'s build script fetch and print anything); what it pushes
+  goes through review (`.factory/` calls the security review in) and the gate, which runs each commit's own recipe. Residuals,
+  accepted: (a) a step, like `cargo build`'s build script, runs repository code as the sandbox user, which can reach the network
+  — nothing in the recipe's schema contains that (no program list is kept, above); (b) a worker that edits the recipe can make
+  `factory-prepare` run any program as itself — no more than its build's own code could; and since it can add files to its spool it could forge an answer for its own `factory-prepare`, which
+  again runs only as itself; (c) the cache has no size bound or eviction (each entry is at most `max_unpacked_bytes`); remove
+  `<WorkRoot>/artifact-cache` by hand to reclaim it; (d) a worker's prefetch and spool downloads run inside its worker phase (the
+  worktree exists only there); the gate's run outside it; (e) a Bash call has its own timeout (at most 10 minutes), so a very
+  long recipe needs the worker to give it one; (f) a `.partial-*` store still unpacking after `ArtifactFetcher.DefaultTimeout`
+  could be swept by another process's first use, failing that store (an error, fetched again next time). Tests:
+  `PrepareRecipeTests`/`ArtifactAddressTests` (schema, refusals, SSRF rules, the connect order), `ArtifactFetchTests` (fake
+  server: hash, size, redirects, ports, DNS to a private address, archives, a changed, partial or unreadable entry, the
+  verification memo, the sweep; on macOS the real ACLs with the role account `nobody`, nested directories included),
+  `PrepareGateTests` (every strategy runs each commit's own recipe; E7 without one, with one read of the changes; failures;
+  decision A both ways; the stage's timeout; a cache root that cannot be set up; nothing of `.factory/` overlaid; the pipeline's
+  `artifact-fetch` row), `PrepareRealRunTests` (the owner's real SwiftPM build
+  of a package that needs the artifact, served by a local HTTP server through injected resolver and transport seams — the
+  production rules unchanged), `WorkerPrepareTests` (the real script over a real spool, the pipeline's prefetch and spool —
+  also with no recipe —, the answer's wording and the ledger's full reason, the request cap, `.factory` swapped for a link
+  between the check and the read, tools, `PrepareTool`), `SetupScriptTests`, `FactoryOptionsTests`. Setup: re-run `sudo scripts/setup-worker-user.sh [--slots n]`
+  to install `factory-prepare` before setting `Worker__Prepare=true`.
 - Untrusted-input taint (E4, sc-25386, `Worker/Taint.cs`): a worker session that has read untrusted content is tainted — a
   `session_taints` row keyed by its Claude session id (insert-only; a Postgres trigger refuses UPDATE/DELETE; the first reason
   is kept), so it holds across resume and crash and nothing clears it. Sources: the input the orchestrator hands it

@@ -363,6 +363,22 @@ public class SetupScriptTests
     }
 
     [Fact]
+    public async Task Setup_installs_factory_prepare_unedited_root_owned_where_the_workers_rule_names_it()
+    {
+        var run = new WholeScriptRun(_dir);
+
+        var (exitCode, output) = await run.RunAsync("--slots", "2");
+
+        Assert.True(exitCode == 0, output);
+        Assert.Single(run.Calls, c => c == $"install -o root -g wheel -m 0755 {SandboxSupport.RepoRoot}/scripts/factory-prepare {Prepare.PrepareTool.InstalledPath}");
+        Assert.Null(Prepare.PrepareTool.StaleReason(File.ReadAllText(run.InstalledPrepare))); // only read: never run
+        Assert.Contains($"Bash({Prepare.PrepareTool.InstalledPath}:*)", Worker.ClaudeWorker.AllowedToolsFor(swift: false, prepare: true));
+        Assert.DoesNotContain(Prepare.PrepareTool.AllowRule, Worker.ClaudeWorker.AllowedToolsFor(swift: true, prepare: false));
+        // No sudoers rule for it: workers run it as themselves.
+        Assert.DoesNotContain("factory-prepare", run.Sudoers);
+    }
+
+    [Fact]
     public async Task Setup_installs_the_xcodebuild_wrapper_unedited_root_owned_where_the_workers_rule_names_it()
     {
         var run = new WholeScriptRun(_dir);
@@ -497,6 +513,7 @@ public class SetupScriptTests
             _dir = dir;
             InstalledHelper = Path.Combine(dir, "installed-helper");
             InstalledWrapper = Path.Combine(dir, "installed-xcodebuild-wrapper");
+            InstalledPrepare = Path.Combine(dir, "installed-factory-prepare");
             var bin = Directory.CreateDirectory(Path.Combine(dir, "bin")).FullName;
             var home = Path.Combine(dir, "home");
             foreach (var each in new[] { home, home + "2" })
@@ -599,6 +616,7 @@ public class SetupScriptTests
                     */factory-worker-launch-[0-9]) dest="${@: -1}"; cp "${@: -2:1}" '{{InstalledHelper}}'"-${dest##*-}" ;;
                     */sudoers.d/dark-factory) cp "${@: -2:1}" '{{_sudoers}}' ;;
                     */factory-xcodebuild) cp "${@: -2:1}" '{{InstalledWrapper}}' ;;
+                    */factory-prepare) cp "${@: -2:1}" '{{InstalledPrepare}}' ;;
                 esac
                 """);
             foreach (var name in new[] { "chown", "chmod", "visudo", "mkdir", "curl" })
@@ -620,6 +638,9 @@ public class SetupScriptTests
 
         /// <summary>The copy the fake install kept of the installed xcodebuild wrapper.</summary>
         public string InstalledWrapper { get; }
+
+        /// <summary>The copy the fake install kept of the installed factory-prepare (sc-26232).</summary>
+        public string InstalledPrepare { get; }
 
         /// <summary>The copy the fake install kept of slot <paramref name="slot"/>'s installed helper.</summary>
         public string InstalledHelperOf(int slot) => slot == 1 ? InstalledHelper : $"{InstalledHelper}-{slot}";

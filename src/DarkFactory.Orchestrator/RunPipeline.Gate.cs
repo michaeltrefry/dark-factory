@@ -24,7 +24,8 @@ public sealed record GateStage(
     TimeProvider? Time = null,
     IGateTestRunner? Tests = null,
     ReviewOverlays? Overlays = null,
-    CodeGraphRiskReader? Risk = null)
+    CodeGraphRiskReader? Risk = null,
+    Prepare.PrepareStage? Prepare = null)
 {
     public static readonly TimeSpan DefaultCiPollInterval = TimeSpan.FromSeconds(30);
     public static readonly TimeSpan DefaultCiTimeout = TimeSpan.FromMinutes(30);
@@ -1191,17 +1192,69 @@ public sealed partial class RunPipeline
         }
         else
         {
+            var (prepared, failed) = await PrepareCommitsAsync(run, pull, runner, ct);
             // The runs are the sandbox user's (their worktrees, every step, the worktrees' deletion): one worker phase (sc-25988),
             // waited for while another run's worker has the sandbox user, the merge gate's other facts read without it.
-            result = await InWorkerPhaseAsync(run.Item, "run the new tests", () => RunNewTestsAsync(run, pull, runner, ct), ct);
+            result = failed ?? await InWorkerPhaseAsync(run.Item, "run the new tests", () => RunNewTestsAsync(run, pull, runner, prepared, ct), ct);
         }
         await ledger.CheckpointAsync(run.Item, Steps.NewTests, null, result.ToDetail(), ct);
         log.WriteLine($"[gate] new tests ({result.Outcome}): {result.Reason}");
         return result;
     }
 
+    /// <summary>
+    /// The base's and the head's prepare recipes (sc-26232), before the sandboxed runs and outside the worker slot's lock (a
+    /// download needs no sandbox user): each commit's own recipe read from the gate's clone and its artifacts fetched owner-side
+    /// (<see cref="GateStage.Prepare"/>), each download checkpointed (<see cref="Steps.ArtifactFetch"/>). A recipe that does not
+    /// parse or an artifact that cannot be fetched is the check's <c>error</c> result (<c>Failed</c>), recorded like any, never a
+    /// pass; no stage, or no recipe in either commit: nothing (E7). Watched for a Pause or Stop like the runs.
+    /// </summary>
+    private async Task<(Prepare.PreparedCommits? Prepared, NewTestsResult? Failed)> PrepareCommitsAsync(Run run, PullFacts pull, IGateTestRunner runner,
+        CancellationToken ct)
+    {
+        if (Gate.Prepare is not { } stage)
+        {
+            return (null, null);
+        }
+        // The PR's changes are read once (the clone fetched once) and handed to the check (sc-26232): a fetch that fails is the
+        // check's error with the reason it always had.
+        IReadOnlyList<ChangedFile> changes;
+        try
+        {
+            changes = await runner.ChangesAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException and not FactoryUnavailableException)
+        {
+            return (null, NewTestsResult.Without(pull.BaseSha, pull.HeadSha, NewTestsOutcome.Error, $"the new tests could not be run: {ex.Message}"));
+        }
+        await using var watch = new TestRunWatch(_controls, _controlPoll, run.Item, log, _maxControlReadFailures, ct);
+        try
+        {
+            // Bounded by Gate:TestTimeoutMinutes (the stage's own timeout): a download that hangs is the check's error, not a hang.
+            var prepared = await stage.ForCommitsAsync(runner, run.Repo, pull.BaseSha, pull.HeadSha, async (download, c) =>
+            {
+                await ledger.CheckpointAsync(run.Item, Steps.ArtifactFetch, null, download.ToDetail(), c);
+                log.WriteLine($"[gate] {download.ToDetail()}");
+            }, watch.Token, changes);
+            if (prepared.Note is { } note)
+            {
+                log.WriteLine($"[gate] {note}");
+            }
+            return (prepared, null);
+        }
+        catch (Exception) when (watch.Requested is { } requested && !ct.IsCancellationRequested)
+        {
+            throw new ControlRequestedException(requested) { ControlsUnreadable = watch.ControlsUnreadable };
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException and not FactoryUnavailableException)
+        {
+            return (null, NewTestsResult.Without(pull.BaseSha, pull.HeadSha, NewTestsOutcome.Error,
+                $"the commits could not be prepared for the new tests' runs, so they were not run: {ex.Message}"));
+        }
+    }
+
     /// <summary>The sandboxed runs of <see cref="NewTestsAsync"/>, watched for a Pause or Stop; the caller holds the sandbox user's lock.</summary>
-    private async Task<NewTestsResult> RunNewTestsAsync(Run run, PullFacts pull, IGateTestRunner runner, CancellationToken ct)
+    private async Task<NewTestsResult> RunNewTestsAsync(Run run, PullFacts pull, IGateTestRunner runner, Prepare.PreparedCommits? prepared, CancellationToken ct)
     {
         NewTestsResult result;
         // The runs execute model-written code for up to Gate:TestTimeoutMinutes each: a Pause or Stop cancels them (the
@@ -1210,7 +1263,7 @@ public sealed partial class RunPipeline
         try
         {
             result = await NewTestsCheck.RunAsync(runner, NewTestsCheck.StrategiesFor(swift), run.Repo, pull.BaseSha, pull.HeadSha,
-                NewTestsCheck.RunName(run.Story), line => log.WriteLine($"[gate] {line}"), watch.Token);
+                NewTestsCheck.RunName(run.Story), line => log.WriteLine($"[gate] {line}"), watch.Token, prepared);
         }
         catch (Exception) when (watch.Requested is { } requested && !ct.IsCancellationRequested)
         {

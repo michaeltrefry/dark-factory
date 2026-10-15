@@ -53,7 +53,7 @@ static async Task<int> RunAsync(ItemRef item, bool ignoreScope, CancellationToke
     using var sources = new WorkSourceRegistry(options);
     // Start-up checks, each a refusal (exit 2): the installed launch helper is the current one (read, not run), then the router.
     return await FactoryRunner.RunCommandAsync(options,
-        async c => await FactoryRunner.CheckHelperAsync(options.WorkerSlots, c) ?? await CheckRouterEnrollmentAsync(options, c),
+        async c => await FactoryRunner.CheckHelperAsync(options.WorkerSlots, c, options.WorkerPrepare) ?? await CheckRouterEnrollmentAsync(options, c),
         c => FactoryRunner.RunAsync(options, sources.Of(item.Naming), item.Id, ignoreScope, Console.Out, c), Console.Error, ct,
         requireSource: () => sources.Of(item.Naming));
 }
@@ -72,7 +72,7 @@ static async Task<int> WorkAsync(CancellationToken ct)
     }
     // The installed launch helper must be the current one: read, not run (its exit kills every process of the worker user), so
     // a stale helper refuses the start here rather than leave claimed items waiting at their first worker phase.
-    if (await FactoryRunner.CheckHelperAsync(options.WorkerSlots, ct) is { } helperError)
+    if (await FactoryRunner.CheckHelperAsync(options.WorkerSlots, ct, options.WorkerPrepare) is { } helperError)
     {
         Console.Error.WriteLine(helperError);
         return 2;

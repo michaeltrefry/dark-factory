@@ -110,8 +110,19 @@ internal sealed class FakeTestRunner : IGateTestRunner
 
     private Dictionary<string, string> FilesAt(string sha) => sha == BaseSha ? BaseFiles : HeadFiles(sha);
 
+    /// <summary>How many times the PR's changes were read (each one a fetch of the gate's clone in production).</summary>
+    public int ChangesCalls { get; private set; }
+
+    /// <summary>When set, reading the PR's changes throws this (a fetch that fails: offline, say).</summary>
+    public Exception? ChangesThrow { get; set; }
+
     public Task<IReadOnlyList<ChangedFile>> ChangesAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct)
     {
+        ChangesCalls++;
+        if (ChangesThrow is { } failure)
+        {
+            return Task.FromException<IReadOnlyList<ChangedFile>>(failure);
+        }
         if (Changes is { } changes)
         {
             return Task.FromResult(changes);

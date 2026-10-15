@@ -485,11 +485,13 @@ public class SafeHelperTests
     /// literals are taken out of a line before the checks — its repo file (<c>"scripts", "factory-xcodebuild"</c> as the last two
     /// path segments, so nothing built past it is exempt), its installed
     /// path, <c>SwiftToolchain.DefaultWrapperPath</c> — and the unchanged checks run on what is left, so anything else on the line
-    /// (a helper path, a comment naming the wrapper) is judged as before.
+    /// (a helper path, a comment naming the wrapper) is judged as before. The workers' <c>factory-prepare</c> (sc-26232) likewise: it
+    /// signals nothing, is installed beside the helpers, and its literals (repo file, installed path,
+    /// <c>PrepareTool.InstalledPath</c>/<c>AllowRule</c>) are taken out the same way.
     /// </summary>
     private static readonly Regex WrapperLiterals = new(
-        Regex.Escape(ScriptsSegment) + @"\s*,\s*""factory-xcodebuild""(?=\s*\))|" + Regex.Escape("/usr/local/" + InstalledMarkers[1] + "/factory-xcodebuild")
-        + @"|\bSwiftToolchain\.DefaultWrapperPath\b");
+        Regex.Escape(ScriptsSegment) + @"\s*,\s*""factory-(xcodebuild|prepare)""(?=\s*\))|" + Regex.Escape("/usr/local/" + InstalledMarkers[1] + "/factory-") + "(xcodebuild|prepare)"
+        + @"|\bSwiftToolchain\.DefaultWrapperPath\b|\bPrepareTool\.(InstalledPath|AllowRule)\b");
 
     /// <summary>The line with the wrapper's literals (<see cref="WrapperLiterals"/>) removed: what every check reads.</summary>
     private static string WithoutWrapperLiterals(string line) => WrapperLiterals.Replace(line, "");

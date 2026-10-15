@@ -330,8 +330,8 @@ public class SwiftToolchainTests
         Assert.DoesNotContain("xcodebuild", RunPipeline.BuildPrompt(spec, repo));
         // Production wires both from the one setting: the implementer's tools, and the pipeline's prompts and repo-settings taint.
         var runner = File.ReadAllText(Path.Combine(SandboxSupport.RepoRoot, "src", "DarkFactory.Orchestrator", "FactoryRunner.cs"));
-        Assert.Contains("pauseFlagDirectory: options.PauseFlagDirectory, tools: WorkerTools.ImplementerFor(options.WorkerSwift)),", runner);
-        Assert.Contains("swift: options.WorkerSwift);", runner);
+        Assert.Contains("pauseFlagDirectory: options.PauseFlagDirectory, tools: WorkerTools.ImplementerFor(options.WorkerSwift, options.WorkerPrepare)),", runner);
+        Assert.Contains("swift: options.WorkerSwift,", runner);
     }
 
     [Theory]

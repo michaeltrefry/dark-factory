@@ -1,0 +1,143 @@
+#!/bin/bash
+# factory-prepare — prepares a Dark Factory worker's worktree as its repository's recipe (.factory/prepare.yaml) says (sc-26232).
+#
+# Installed root-owned and unedited by scripts/setup-worker-user.sh at /usr/local/libexec/dark-factory/factory-prepare (one copy
+# for every slot: it pins nothing per user). With Worker:Prepare=true an implementing worker is allowed exactly that absolute
+# path, and its prompt names this session's spool:
+#   /usr/local/libexec/dark-factory/factory-prepare --spool <dir> [--wait <seconds>]
+# run from the repository root.
+#
+# It downloads nothing. It writes a request into the spool — a directory of the factory owner's that only this session's
+# sandbox user may add files to, and that the owner process polls while the session runs — and waits (at most --wait
+# seconds, 1800 by default) for the owner's answer. The owner reads the recipe from the worktree itself, fetches its
+# artifacts (https only, public addresses only, size-bounded, SHA-256 pinned) into the read-only artifact cache, and answers
+# with the steps to run, every placeholder expanded: NUL-terminated fields
+#   ok, "factory-prepare-plan 1", <steps>, then per step: <name> <dir> <n> <NAME=value>... <m> <program> <arg>...
+# or: error, <why>. The steps then run here, as this user, one after another: each in its directory under the repository
+# root, through `/usr/bin/env NAME=value... program args...` (no shell). The first that fails ends the run with its status.
+#
+# Exit status: 0 when every step succeeded; the failing step's status; 64 usage; 65 an answer this cannot read; 66 no recipe
+# here; 69 no spool (the factory's session has ended); 73 the request could not be written; 75 no answer in time; 1 the
+# factory refused (its reason on stderr).
+set -u
+
+usage() {
+    echo "usage: factory-prepare --spool <dir> [--wait <seconds>] (run from the repository root)" >&2
+    exit 64
+}
+
+spool=
+wait_seconds=1800
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --spool) [ $# -ge 2 ] || usage; spool=$2; shift 2 ;;
+        --wait)
+            [ $# -ge 2 ] || usage
+            case "$2" in '' | *[!0-9]*) usage ;; esac
+            wait_seconds=$2
+            shift 2
+            ;;
+        *) usage ;;
+    esac
+done
+[ -n "$spool" ] || usage
+case "$spool" in
+    /*) ;;
+    *) echo "factory-prepare: --spool must be an absolute path" >&2; exit 64 ;;
+esac
+if [ ! -d "$spool" ]; then
+    echo "factory-prepare: there is no spool $spool (it exists only while the factory's worker session runs)" >&2
+    exit 69
+fi
+
+root=$(pwd -P)
+if [ ! -f "$root/.factory/prepare.yaml" ]; then
+    echo "factory-prepare: no .factory/prepare.yaml in $root: run it from the repository root" >&2
+    exit 66
+fi
+
+id="$(date +%s)-$$-${RANDOM}"
+request="$spool/request-$id"
+response="$spool/response-$id"
+# One write, never over an existing file; the owner answers only a request that ends with its "end" line.
+set -o noclobber
+if ! printf 'factory-prepare-request 1\n%s\nend\n' "$root" >"$request"; then
+    echo "factory-prepare: could not write the request $request" >&2
+    exit 73
+fi
+set +o noclobber
+
+echo "factory-prepare: asked the factory to fetch the recipe's artifacts (request $id); waiting up to ${wait_seconds}s" >&2
+waited=0
+while [ ! -f "$response" ]; do
+    if [ "$waited" -ge "$wait_seconds" ]; then
+        echo "factory-prepare: no answer from the factory within ${wait_seconds}s" >&2
+        exit 75
+    fi
+    sleep 1
+    waited=$((waited + 1))
+done
+# The owner renames the answer into place whole: what is there is complete.
+exec 3<"$response"
+field=
+next() {
+    IFS= read -r -d '' field <&3
+}
+number() {
+    case "$field" in '' | *[!0-9]*) echo "factory-prepare: the factory's answer could not be read" >&2; exit 65 ;; esac
+}
+
+next || { echo "factory-prepare: the factory's answer is empty" >&2; exit 65; }
+case "$field" in
+    ok) ;;
+    error)
+        next || field="(no reason given)"
+        echo "factory-prepare: the factory refused: $field" >&2
+        exit 1
+        ;;
+    *) echo "factory-prepare: the factory's answer could not be read" >&2; exit 65 ;;
+esac
+next && [ "$field" = "factory-prepare-plan 1" ] || { echo "factory-prepare: the factory's answer is not a plan this can read" >&2; exit 65; }
+next || exit 65
+number
+steps=$field
+
+i=0
+while [ "$i" -lt "$steps" ]; do
+    next || exit 65
+    name=$field
+    next || exit 65
+    dir=$field
+    case "/$dir/" in */../*) echo "factory-prepare: step $name names a directory outside the repository" >&2; exit 65 ;; esac
+    next || exit 65
+    number
+    count=$field
+    vars=()
+    j=0
+    while [ "$j" -lt "$count" ]; do
+        next || exit 65
+        vars+=("$field")
+        j=$((j + 1))
+    done
+    next || exit 65
+    number
+    count=$field
+    [ "$count" -ge 1 ] || exit 65
+    args=()
+    j=0
+    while [ "$j" -lt "$count" ]; do
+        next || exit 65
+        args+=("$field")
+        j=$((j + 1))
+    done
+    echo "factory-prepare: step $name (in $dir): ${args[*]}" >&2
+    (cd "$root/$dir" && exec /usr/bin/env ${vars[@]+"${vars[@]}"} "${args[@]}")
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "factory-prepare: step $name failed (exit $status)" >&2
+        exit "$status"
+    fi
+    i=$((i + 1))
+done
+echo "factory-prepare: $steps step(s) done" >&2
+exit 0

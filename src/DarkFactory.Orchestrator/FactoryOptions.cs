@@ -208,6 +208,22 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
     }
 
     /// <summary>
+    /// <c>Worker:Prepare</c> (sc-26232): <c>true</c> when implementing workers may prepare their worktree from its repository's
+    /// prepare recipe (<c>.factory/prepare.yaml</c>): they are allowed the factory's <c>factory-prepare</c> command at its installed,
+    /// root-owned path (<see cref="Prepare.PrepareTool.InstalledPath"/>), which start-up then requires current; before every
+    /// implementing session of a worktree with a recipe the harness fetches the recipe's artifacts owner-side, opens the session's
+    /// request spool and names the command in the prompt. <c>false</c> (the default) changes nothing for workers (E7); the gate
+    /// prepares each commit by its recipe either way.
+    /// </summary>
+    public bool WorkerPrepare => config["Worker:Prepare"] switch
+    {
+        null => false,
+        var value when string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) => true,
+        var value when string.Equals(value, "false", StringComparison.OrdinalIgnoreCase) => false,
+        var other => throw new InvalidOperationException($"Worker:Prepare must be 'true' or 'false', not '{other}'."),
+    };
+
+    /// <summary>
     /// <c>Worker:Slots</c> (sc-25989): how many sandbox users run workers side by side, 1 (the default: the one sandbox user, as
     /// before slots) to <see cref="Worker.WorkerSlots.MaxSlots"/>. Two runs are in a worker phase at once only in different slots,
     /// so it bounds the worker sessions at a time; it is independent of <c>Intake:MaxConcurrentRuns</c>, which may be larger (runs
@@ -547,7 +563,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
     /// </summary>
     public void ValidateSettings()
     {
-        _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSlotCount, WorkerSwift, WorkerSlots, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures, MaxConcurrentRuns);
+        _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSlotCount, WorkerSwift, WorkerPrepare, WorkerSlots, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures, MaxConcurrentRuns);
         _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
         _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl, KanbanMcpUrl);
         _ = (CodeGraphOverlayTimeout, KanbanWatchScope, KanbanWebUrl);

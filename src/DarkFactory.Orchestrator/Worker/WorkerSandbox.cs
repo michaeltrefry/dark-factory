@@ -591,6 +591,47 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     }
 
     /// <summary>
+    /// Opens the owner's directory <paramref name="path"/> to every user for reading and to no one but its owner for writing
+    /// (sc-26232: the artifact cache), owner-side and without root: on macOS <c>chmod -N</c> removes every ACL entry — the work
+    /// root's inherited read entries among them, so nothing made in it later inherits one — then the mode becomes <c>0755</c>.
+    /// The caller reads it back (<see cref="IsReadOnlyToOthers"/>).
+    /// </summary>
+    public static Task OpenReadOnlyToAllAsync(string path, CancellationToken ct) => ResetAsync(path, ReadOnlyToOthersMode, ct);
+
+    /// <summary>
+    /// The owner's directory <paramref name="path"/> with no ACL entry (on macOS <c>chmod -N</c>: the work root's inherited ones
+    /// removed, so nothing made in it later inherits one) and mode <paramref name="mode"/>.
+    /// </summary>
+    public static async Task ResetAsync(string path, UnixFileMode mode, CancellationToken ct)
+    {
+        if (OperatingSystem.IsMacOS())
+        {
+            await RunChecked("/bin/chmod", ["-N", path], ct);
+        }
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(path, mode);
+        }
+    }
+
+    /// <summary><c>0755</c>: the owner writes, everyone reads and enters.</summary>
+    public const UnixFileMode ReadOnlyToOthersMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+        | UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
+
+    /// <summary>
+    /// Whether <paramref name="lsOutput"/> (macOS <c>ls -led</c> of one directory) shows a directory only its owner can write and
+    /// everyone can read: mode <c>drwxr-xr-x</c> and no ACL entry at all.
+    /// </summary>
+    public static bool IsReadOnlyToOthers(string lsOutput)
+    {
+        var lines = lsOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        return lines.Length == 1 && Regex.IsMatch(lines[0], @"^drwxr-xr-x[@ ]");
+    }
+
+    /// <summary>macOS <c>/bin/ls -led</c> of <paramref name="path"/> (<see cref="IsReadOnlyToOthers"/> reads it).</summary>
+    public static Task<string> ListAsync(string path, CancellationToken ct) => ListAclAsync(path, ct);
+
+    /// <summary>
     /// Makes the owner's directory <paramref name="path"/> this sandbox user's alone to read (sc-25990: a slot's MCP session
     /// directory), owner-side and without root: closed like <see cref="CloseToWorkerAsync(string, CancellationToken)"/>
     /// (<c>chmod -N</c> — the work root's inherited read entries, one per slot's user, are gone and nothing made in the directory
@@ -623,6 +664,33 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         {
             throw new InvalidOperationException(
                 $"{path} grants {User} no ACL 'search' entry after `chmod +a` (ls -led: {listing.Trim().ReplaceLineEndings("; ")}).");
+        }
+    }
+
+    /// <summary>
+    /// Opens the owner's directory <paramref name="path"/> to this sandbox user as a request spool (sc-26232: a worker session's
+    /// <c>factory-prepare</c> requests): closed like <see cref="CloseToWorkerAsync(string, CancellationToken)"/> (<c>chmod -N</c>,
+    /// mode <c>0700</c>), then one entry for <see cref="User"/>: <c>list,search,add_file</c> — it may make a file in the directory and
+    /// read what is there by mode (the owner's answers are <c>0644</c>), never delete or change a file it did not make. Read back:
+    /// the user is granted <c>add_file</c> and the directory is open to no one else (<see cref="OpenToOthers"/>), else this throws.
+    /// </summary>
+    public async Task OpenSpoolToWorkerAsync(string path, CancellationToken ct)
+    {
+        await CloseAsync(path, ct);
+        await RunChecked("/bin/chmod", ["+a", $"user:{User} allow list,search,add_file", path], ct);
+        var listing = await ListAclAsync(path, ct);
+        for (var read = 1; read < AclReads && (OpenToOthers(listing, User) is not null || !Grants(listing, User, "add_file")); read++)
+        {
+            await Task.Delay(AclRetry, ct);
+            listing = await ListAclAsync(path, ct);
+        }
+        if (OpenToOthers(listing, User) is { } others)
+        {
+            throw new InvalidOperationException($"{path} is still open to others than its owner and {User} after `chmod -N`, mode 0700 and {User}'s entry: {others}.");
+        }
+        if (!Grants(listing, User, "add_file"))
+        {
+            throw new InvalidOperationException($"{path} grants {User} no ACL 'add_file' entry after `chmod +a` (ls -led: {listing.Trim().ReplaceLineEndings("; ")}).");
         }
     }
 
