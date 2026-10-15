@@ -2543,8 +2543,8 @@ public sealed partial class RunPipeline(
     /// <summary>
     /// <see cref="BuildsAndPasses"/> with the factory's xcodebuild wrapper named too, for a factory with <c>Worker:Swift</c> on (sc-26130),
     /// whose implementers are allowed it (<see cref="ClaudeWorker.AllowedToolsFor"/>); without it the text is exactly
-    /// <see cref="BuildsAndPasses"/>, which names SwiftPM's commands in every factory (an E7 exception like cargo's, pending the
-    /// owner's confirmation: CLAUDE.md, "Swift toolchain").
+    /// <see cref="BuildsAndPasses"/>, which names SwiftPM's commands in every factory (an E7 exception like cargo's, confirmed by the
+    /// owner 2026-10-15: CLAUDE.md, "Swift toolchain").
     /// </summary>
     internal const string BuildsAndPassesWithXcode =
         "the build and the tests pass (`dotnet build` and `dotnet test`; in a Rust package `cargo build` and `cargo test`; in a Swift package `swift build` and `swift test`; in an Xcode "

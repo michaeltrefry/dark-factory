@@ -708,6 +708,44 @@ public class XcodeIdentifyTests
         Assert.Contains($"{NewFile} adds test(s) blank(), Spaces/Only/empty() the gate cannot run: it is in a SwiftPM test target's directory and the Xcode test target "
             + "WordsTests of Words.xcodeproj compiles it too, so which of them runs its tests cannot be told", result.Reason);
     }
+
+    [Theory]
+    // A path: that is not a plain string: where the test target's sources are cannot be read.
+    [InlineData("path: testsPath)", "Package.swift: its test target WordsTests declares a path: that cannot be resolved")]
+    // A path: leaving the package.
+    [InlineData("path: \"../WordsTests\")", "Package.swift: its test target WordsTests declares a path: that cannot be resolved")]
+    public async Task A_package_whose_test_target_path_cannot_be_resolved_makes_an_xcode_test_targets_file_unsupported_naming_the_manifest(
+        string path, string problem)
+    {
+        // The package's test target may hold the Xcode test target's file at a path the reader cannot resolve: fail closed.
+        var manifest = SwiftIdentifyTests.Manifest.Replace(".testTarget(name: \"WordsTests\", dependencies: [\"Words\"])",
+            $".testTarget(name: \"WordsTests\", dependencies: [\"Words\"], {path}");
+        Assert.NotEqual(SwiftIdentifyTests.Manifest, manifest);
+        var runner = Mixed(manifest: manifest);
+
+        var xcode = await Identify(runner);
+        var result = await Check(runner);
+
+        Assert.DoesNotContain("WordsTests/blank()", xcode.Tests);
+        Assert.Equal(NewTestsOutcome.Unsupported, result.Outcome);
+        Assert.Contains($"{NewFile} adds test(s) blank(), Spaces/Only/empty() the gate cannot run: whether it is in a SwiftPM test target's directory "
+            + $"cannot be told ({problem}), and the Xcode test target WordsTests of Words.xcodeproj compiles it, so which of them runs its tests cannot be told",
+            result.Reason);
+    }
+
+    [Fact]
+    public async Task A_package_manifest_that_cannot_be_read_makes_an_xcode_test_targets_file_unsupported_naming_the_manifest()
+    {
+        // The commit lists the manifest, but reading it gives nothing.
+        var head = Mixed().HeadFiles(Head);
+        var owners = new SwiftOwnership(_ => Task.FromResult<IReadOnlySet<string>>(head.Keys.ToHashSet(StringComparer.Ordinal)),
+            (path, _) => Task.FromResult(path == "Package.swift" ? null : head.GetValueOrDefault(path)));
+
+        var (owner, why) = await owners.OfAsync(NewFile, CancellationToken.None);
+
+        Assert.Equal(SwiftOwner.Both, owner);
+        Assert.StartsWith("whether it is in a SwiftPM test target's directory cannot be told (Package.swift: it cannot be read), and the Xcode test target WordsTests of", why);
+    }
 }
 
 /// <summary>sc-26131: an Xcode run's steps, xcresulttool's JSON, and xcodebuild's build errors.</summary>
