@@ -5,8 +5,9 @@
 #
 # --swift (sc-26130; for a factory with Worker:Swift=true, which works Swift/Xcode repositories): makes the Swift toolchain
 # check below required for every slot's user - swift, xcodebuild, Xcode's first launch done and its license accepted, and
-# the macOS and iOS Simulator SDKs listed by `xcodebuild -showsdks` (CoreSimulator and simulator runtimes are not checked),
-# each run as that user through its own helper; every slot is checked, then the users that failed are named and it exits 1.
+# the macOS and iOS Simulator SDKs listed by `xcodebuild -showsdks`, and (sc-26134) a GUI login session (`launchctl
+# managername` is Aqua) in which `xcrun simctl list runtimes -j` lists an available iOS runtime and `xcrun simctl list
+# devicetypes -j` an iPhone device type (no simulator is booted), each run as that user through its own helper; every slot is checked, then the users that failed are named and it exits 1.
 # Without it the same check only reports (a .NET/Rust-only factory needs no Xcode), and is skipped when no Xcode is
 # selected (`xcode-select -p` fails). The xcodebuild wrapper is installed either way.
 #
@@ -377,7 +378,7 @@ swift_tools=("/usr/bin/swift --version" "/usr/bin/xcodebuild -version" "/usr/bin
 swift_sdks="macosx iphonesimulator"
 
 # check_swift_sdks - `xcodebuild -showsdks` as the worker through the helper must list every SDK of $swift_sdks.
-# It lists SDKs and starts no simulator (CoreSimulator is not checked here). Returns 1 naming each one missing.
+# It lists SDKs and starts no simulator (CoreSimulator: check_swift_simulator). Returns 1 naming each one missing.
 check_swift_sdks() {
     local out sdk missing=0
     if ! out=$(with_open_stdin sudo -u "$owner" sudo -n -u "$worker" "$helper" /usr/bin/xcodebuild -showsdks 2>&1); then
@@ -391,6 +392,55 @@ check_swift_sdks() {
         esac
     done
     [ "$missing" -eq 0 ]
+}
+
+# simctl_lists <runtimes|devicetypes> - reads `xcrun simctl list <what> -j` on stdin; succeeds when it lists an available iOS
+# runtime (a runtime object with "platform": "iOS" and "isAvailable": true) or an iPhone device type ("productFamily":
+# "iPhone"). Only each list entry's own fields count (brace depth 2), not those of the objects nested in it.
+simctl_lists() {
+    awk -v what="$1" '
+        { text = text $0 " " }
+        END {
+            depth = 0; entry = ""; found = 0
+            for (i = 1; i <= length(text); i++) {
+                c = substr(text, i, 1)
+                if (c == "{") { depth++; if (depth == 2) entry = ""; continue }
+                if (c == "}") {
+                    if (depth == 2) {
+                        if (what == "runtimes") { if (entry ~ /"platform"[ ]*:[ ]*"iOS"/ && entry ~ /"isAvailable"[ ]*:[ ]*true/) found = 1 }
+                        else if (entry ~ /"productFamily"[ ]*:[ ]*"iPhone"/) found = 1
+                    }
+                    depth--
+                    continue
+                }
+                if (depth == 2) entry = entry c
+            }
+            exit found ? 0 : 1
+        }'
+}
+
+# check_swift_simulator - as the worker through the helper, booting nothing (sc-26134): its processes are in a GUI (Aqua) login
+# session (`launchctl managername`), and only then - CoreSimulator answers a user only in one - `xcrun simctl list runtimes -j`
+# lists an available iOS runtime and `xcrun simctl list devicetypes -j` an iPhone device type. Returns 1 naming what failed.
+check_swift_simulator() {
+    local out what
+    out=$(with_open_stdin sudo -u "$owner" sudo -n -u "$worker" "$helper" /bin/launchctl managername 2>&1)
+    if [ "$out" != Aqua ]; then
+        echo "    FAIL  /bin/launchctl managername is '$out', not 'Aqua': run this script from the owner's GUI login session (a Terminal at the console), not over ssh" >&2
+        return 1
+    fi
+    echo "    ok    /bin/launchctl managername: Aqua"
+    for what in runtimes devicetypes; do
+        if ! out=$(with_open_stdin sudo -u "$owner" sudo -n -u "$worker" "$helper" /usr/bin/xcrun simctl list "$what" -j 2>&1); then
+            echo "    FAIL  /usr/bin/xcrun simctl list $what -j: $out" >&2
+            return 1
+        fi
+        if ! printf '%s\n' "$out" | simctl_lists "$what"; then
+            echo "    FAIL  /usr/bin/xcrun simctl list $what -j lists no $([ "$what" = runtimes ] && echo 'available iOS simulator runtime' || echo 'iPhone simulator device type') (sudo xcodebuild -downloadPlatform iOS)" >&2
+            return 1
+        fi
+        echo "    ok    /usr/bin/xcrun simctl list $what -j"
+    done
 }
 
 # --swift: the slots whose Swift toolchain failed, collected across every slot and named at the end.
@@ -417,7 +467,7 @@ for slot in $(seq 1 "$slots"); do
     # under its own home.
     if [ "$swift" -eq 1 ]; then
         say "Checking the Swift toolchain as $worker through the helper (--swift: required)"
-        if ! check_toolchain "${swift_tools[@]}" || ! check_swift_sdks; then
+        if ! check_toolchain "${swift_tools[@]}" || ! check_swift_sdks || ! check_swift_simulator; then
             swift_failed_users="$swift_failed_users $worker (worker slot $slot);"
         fi
     elif ! xcode-select -p >/dev/null 2>&1; then
@@ -438,6 +488,8 @@ which Worker:Swift=true needs (each FAIL line above names the command). By comma
   xcodebuild -checkFirstLaunchStatus: sudo xcodebuild -runFirstLaunch
   xcodebuild -license check: sudo xcodebuild -license accept
   xcodebuild -showsdks without iphonesimulator: sudo xcodebuild -downloadPlatform iOS
+  launchctl managername not Aqua: run this script from the owner's GUI login session (a Terminal at the console)
+  xcrun simctl list without an available iOS runtime or an iPhone device type: sudo xcodebuild -downloadPlatform iOS
 Then re-run this script with --swift (or set Worker:Swift=false if the factory works no Swift repository).
 EOF
     exit 1

@@ -25,8 +25,12 @@ public sealed record SwiftToolchain(
     string XcodebuildPath = SwiftToolchain.DefaultXcodebuildPath,
     string WrapperPath = SwiftToolchain.DefaultWrapperPath,
     string? WrapperSource = null,
-    string LaunchctlPath = SwiftToolchain.DefaultLaunchctlPath)
+    string LaunchctlPath = SwiftToolchain.DefaultLaunchctlPath,
+    string XcrunPath = SwiftToolchain.DefaultXcrunPath)
 {
+    /// <summary>xcrun, through which the probe lists the user's simulator runtimes and device types (<c>xcrun simctl list … -j</c>; sc-26134).</summary>
+    public const string DefaultXcrunPath = "/usr/bin/xcrun";
+
     /// <summary>launchctl, whose <c>managername</c> says which launchd session a process is in (sc-26132: a simulator needs <c>Aqua</c>).</summary>
     public const string DefaultLaunchctlPath = "/bin/launchctl";
 
@@ -104,12 +108,14 @@ public sealed record SwiftToolchain(
     /// launch helper, under its slot's lock): Swift answers, xcodebuild answers, Xcode's first launch is done
     /// (<c>xcodebuild -checkFirstLaunchStatus</c>), its license is accepted (<c>xcodebuild -license check</c>), the SDKs of every
     /// platform the factory builds for are installed (<c>xcodebuild -showsdks</c>, <see cref="RequiredSdks"/>; it lists the SDKs and
-    /// starts no simulator — CoreSimulator and the simulator runtimes are not checked here), and the wrapper runs
+    /// starts no simulator), and the wrapper runs
     /// as that user (with no arguments it prints its usage and exits 64, running nothing); and (sc-26132, S0's requirement (1)) that
     /// the user's processes are in a GUI login session — <c>launchctl managername</c> as that user answers <c>Aqua</c> — since the
     /// gate's iOS checks run a simulator, which boots, and XCUITest drives, only there: refused here, factory-wide and naming the
-    /// slot's user, rather than every iOS item escalating one by one. The first that fails throws, naming the user, the command
-    /// and the fix.
+    /// slot's user, rather than every iOS item escalating one by one; then (sc-26134), after that session check since
+    /// CoreSimulator answers a user only in one, that the user can make an iPhone simulator, booting nothing:
+    /// <c>xcrun simctl list runtimes -j</c> lists an available iOS runtime and <c>xcrun simctl list devicetypes -j</c> an iPhone
+    /// device type (<see cref="SimulatorProblem"/>). The first that fails throws, naming the user, the command and the fix.
     /// </summary>
     public async Task EnsureUsableAsync(
         string user, string reinstall, Func<string, string[], Task<(int ExitCode, string Stdout, string Stderr)>> run)
@@ -136,6 +142,16 @@ public sealed record SwiftToolchain(
                 + "simulator checks cannot run as it (a simulator boots, and XCUITest drives it, only in a GUI login session): run the factory "
                 + "inside the owner's GUI login session (a Terminal or a LaunchAgent of the owner logged in at the console), not from ssh or "
                 + "as a LaunchDaemon — CLAUDE.md, \"iOS simulator and UI tests as a sandbox user\".");
+        }
+        foreach (var (what, args) in new[] { ("runtimes", new[] { "simctl", "list", "runtimes", "-j" }), ("devicetypes", new[] { "simctl", "list", "devicetypes", "-j" }) })
+        {
+            var listed = await run(XcrunPath, args);
+            if (SimulatorProblem(what, listed.ExitCode, listed.Stdout, listed.Stderr) is { } problem)
+            {
+                throw new InvalidOperationException(
+                    $"Swift toolchain (Worker:Swift) of {user}: `{XcrunPath} {string.Join(' ', args)}` as {user} {problem}, so the gate's iOS simulator "
+                    + $"checks cannot run as it: install an iOS simulator runtime (`sudo xcodebuild -downloadPlatform iOS`), then re-run `{reinstall} --swift` to check it.");
+            }
         }
         var wrapper = await run(WrapperPath, []);
         if (wrapper.ExitCode != 64 || !wrapper.Stderr.Contains("factory-xcodebuild: usage", StringComparison.Ordinal))
@@ -167,6 +183,38 @@ public sealed record SwiftToolchain(
         ("macOS", "macosx", "Xcode (its macOS SDK ships with it)"),
         ("iOS Simulator", "iphonesimulator", "the iOS platform (`sudo xcodebuild -downloadPlatform iOS`)"),
     ];
+
+    /// <summary>
+    /// Why an <c>xcrun simctl list runtimes|devicetypes -j</c> answer (<paramref name="what"/>) shows no simulator the gate can
+    /// make, or null: runtimes must include one whose <c>platform</c> is <c>iOS</c> and <c>isAvailable</c> is true; device types
+    /// one whose <c>productFamily</c> is <c>iPhone</c>. A failed command or JSON that is not that shape is a problem too.
+    /// </summary>
+    public static string? SimulatorProblem(string what, int exitCode, string stdout, string stderr)
+    {
+        if (exitCode != 0)
+        {
+            return $"exited {exitCode} ({Clip(stderr.Length > 0 ? stderr : stdout)})";
+        }
+        try
+        {
+            using var json = System.Text.Json.JsonDocument.Parse(stdout);
+            if (json.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object || !json.RootElement.TryGetProperty(what, out var list)
+                || list.ValueKind != System.Text.Json.JsonValueKind.Array)
+            {
+                return $"answers no {what} list";
+            }
+            static bool Is(System.Text.Json.JsonElement e, string name, string value) =>
+                e.ValueKind == System.Text.Json.JsonValueKind.Object && e.TryGetProperty(name, out var v) && v.ValueKind == System.Text.Json.JsonValueKind.String && v.GetString() == value;
+            return what == "runtimes"
+                ? list.EnumerateArray().Any(r => Is(r, "platform", "iOS") && r.TryGetProperty("isAvailable", out var a) && a.ValueKind == System.Text.Json.JsonValueKind.True)
+                    ? null : "lists no available iOS simulator runtime"
+                : list.EnumerateArray().Any(d => Is(d, "productFamily", "iPhone")) ? null : "lists no iPhone simulator device type";
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return $"answers no JSON {what} list";
+        }
+    }
 
     private static string Clip(string text)
     {

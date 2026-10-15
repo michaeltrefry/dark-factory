@@ -279,6 +279,9 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     public static readonly IReadOnlySet<string> RespawnedAgents = new HashSet<string>(StringComparer.Ordinal)
     {
         "/usr/sbin/distnoted agent",
+        // sc-26134 (seen in S6's live run): after a simctl call as the user, launchd also starts these two in its domain.
+        "/usr/libexec/lsd",
+        "/usr/sbin/cfprefsd agent",
     };
 
     /// <summary>

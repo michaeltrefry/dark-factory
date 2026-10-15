@@ -54,7 +54,9 @@ public sealed record SwiftNewTestSet(IReadOnlyList<ChangedFile> TestFiles, IRead
 /// test-looking XCTest method the gate cannot run apart (<see cref="SwiftXCTest"/>: an unknown base class, an extension,
 /// <c>#if</c>, <c>@objc</c>, private, …); a new test, or a changed file that looks like a test (<see cref="NewTestsCheck.LooksLikeTest"/>),
 /// outside a SwiftPM test target (an Xcode project, <c>Sources/</c>, a target the manifest does not declare at its default
-/// path, or a package with a version-specific manifest <c>Package@swift-*.swift</c>); a test target the base's manifest
+/// path, or a package with a version-specific manifest <c>Package@swift-*.swift</c>; beside an Xcode project which files are
+/// this strategy's is <see cref="SwiftOwnership"/>'s rule, sc-26134: a file an Xcode test target compiles outside the package's
+/// test targets is <see cref="XcodeNewTests"/>'s, and one in both is unsupported here); a test target the base's manifest
 /// does not declare; a test id declared twice (conditional compilation); a backticked test name; and a changed file that
 /// may hold tests but cannot be read.
 /// </para>
@@ -66,7 +68,7 @@ public sealed record SwiftNewTestSet(IReadOnlyList<ChangedFile> TestFiles, IRead
 /// the build log; <see cref="BuildSystem"/>), then one <c>swift test --build-system native --skip-build --disable-xctest --filter ^&lt;id&gt;(/|$) --xunit-output …</c> per new test (Swift
 /// Testing matches the filter against the test's id followed by its source location), each reading only its own report
 /// and keeping its exit code, which the report must agree with. Results: Swift Testing's xUnit XML
-/// report (<see cref="ParseResults"/>). A base that does not build with the PR's test files is explained from swiftc's
+/// report (<see cref="ParseResults"/>), with its event stream (<c>--event-stream-output-path</c>, <see cref="EventsName"/>): a case that passed with a known issue (<c>withKnownIssue</c>) is a plain pass in the report and is read as skipped. A base that does not build with the PR's test files is explained from swiftc's
 /// errors (<see cref="ExplainBuildFailure"/>, sc-26128) and retried up to <see cref="BaseRetries"/> times.
 /// </para>
 /// </summary>
@@ -103,6 +105,27 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
     /// <summary>The name a test step's standard output and exit code are kept under (<see cref="TestStep.CaptureOutput"/>), beside its report.</summary>
     public static string OutputName(string id) => ReportName(id)[..^".xml".Length] + ".out";
 
+    /// <summary>
+    /// The Swift Testing event stream a test's step writes beside its report (<c>swift-test-&lt;hash&gt;.events.jsonl</c>,
+    /// sc-26134): Swift Testing's JSON event stream, schema version <see cref="EventStreamVersion"/>, read for the known
+    /// issues its xUnit report does not show (<see cref="ParseResults"/>).
+    /// </summary>
+    public static string EventsName(string id) => ReportName(id)[..^".xml".Length] + EventsSuffix;
+
+    private const string EventsSuffix = ".events.jsonl";
+
+    /// <summary>
+    /// What a Swift Testing step's results are read from (<see cref="TestStep.ResultFilePattern"/>): its report and its event
+    /// stream, both named by the test's hash (<c>swift-test-&lt;hash&gt;.*</c>), so no other test's file matches.
+    /// </summary>
+    public static string ResultPattern(string id) => ReportName(id)[..^".xml".Length] + ".*";
+
+    /// <summary>
+    /// The version of Swift Testing's JSON event stream asked for (<c>--event-stream-version 0</c>): the schema swift-testing
+    /// documents as stable (its Documentation/ABI/JSON.md), whose <c>issueRecorded</c> events carry <c>issue.isKnown</c>.
+    /// </summary>
+    public const string EventStreamVersion = "0";
+
     private static string Hash(string id) => Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(id)))[..16];
 
     /// <summary>
@@ -116,6 +139,8 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
     private static readonly Regex XCTestOutputFileName = new(@"^swift-xctest-(?<hash>[0-9a-f]{16})-(?<target>(?:[0-9a-f]{2})+)\.out$", RegexOptions.CultureInvariant);
 
     private static readonly Regex ReportFileName =new(@"^swift-test-[0-9a-f]{16}\.xml$", RegexOptions.CultureInvariant);
+
+    private static readonly Regex EventsFileName = new(@"^swift-test-[0-9a-f]{16}\.events\.jsonl$", RegexOptions.CultureInvariant);
 
     public bool Understands(string path) => path.EndsWith(".swift", StringComparison.Ordinal);
 
@@ -149,6 +174,11 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
             }
             return text;
         }
+
+        private SwiftOwnership? _owners;
+
+        /// <summary>Which strategy judges each file of this commit (sc-26134: a package beside an Xcode project).</summary>
+        public SwiftOwnership Owners => _owners ??= new SwiftOwnership(async ct => await FilesAsync(ct), ReadAsync);
 
         public async Task<SwiftFile?> ParseAsync(string path, CancellationToken ct)
         {
@@ -284,6 +314,20 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
             if (xcode && place.Package is null)
             {
                 continue; // in no SwiftPM package: an Xcode project's file, XcodeNewTests's (sc-26131)
+            }
+            if (place.Package is not null && await head.Owners.OfAsync(path, ct) is var (owner, both) && owner != SwiftOwner.SwiftPM)
+            {
+                // A package beside an Xcode project (sc-26134): a file an Xcode test target compiles outside the package's test
+                // targets is XcodeNewTests's; one in both, or with Worker:Swift off, has tests the gate cannot run here.
+                if (owner == SwiftOwner.Xcode && xcode)
+                {
+                    continue;
+                }
+                place = place with
+                {
+                    Target = null,
+                    Problem = both ?? "an Xcode project's test target compiles it, and the gate runs an Xcode project's tests only in a factory with Worker:Swift on",
+                };
             }
             if (await head.ParseAsync(path, ct) is not { } file)
             {
@@ -450,6 +494,10 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
         var (files, unreadable) = (new List<(string, SwiftFile)>(), new List<string>());
         foreach (var path in (await tree.FilesAsync(ct)).Where(f => f.StartsWith(prefix, StringComparison.Ordinal) && f.EndsWith(".swift", StringComparison.Ordinal)).Order(StringComparer.Ordinal))
         {
+            if ((await tree.Owners.OfAsync(path, ct)).Owner != SwiftOwner.SwiftPM)
+            {
+                continue; // an Xcode test target compiles it too (sc-26134): its tests are no SwiftPM target's alone
+            }
             if (await tree.ParseAsync(path, ct) is { } file)
             {
                 files.Add((path, file));
@@ -549,7 +597,8 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
             [
                 "test", "--package-path", id.Package, "--build-system", BuildSystem, "--skip-build", "--disable-xctest", "--filter", Filter(id.Id),
                 "--xunit-output", $"{resultsDirectory}/{ReportName(id.Id)}",
-            ]) { ResultFilePattern = ReportName(id.Id), CaptureOutput = OutputName(id.Id) });
+                "--event-stream-output-path", $"{resultsDirectory}/{EventsName(id.Id)}", "--event-stream-version", EventStreamVersion,
+            ]) { ResultFilePattern = ResultPattern(id.Id), CaptureOutput = OutputName(id.Id) });
         }
         return Task.FromResult<IReadOnlyList<TestStep>>(steps);
     }
@@ -565,7 +614,7 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
     /// is one a step asked for (<see cref="ReportName"/>, at the results directory's top), every case in it is the test
     /// that step ran (its name is that test's), and the step's exit code is known and agrees with it (0 exactly when no
     /// case failed): a test that writes another test's report, or a report of its own, is never read as a result. A
-    /// step whose report is missing is unreadable too.
+    /// step whose report is missing is unreadable too, and so is a report without its event stream (<see cref="EventsName"/>, read by <see cref="KnownIssue"/>): a passing case of a run that recorded a known issue is read as skipped (Swift Testing writes it as a plain pass; also when the step's output mentions a known issue).
     /// </summary>
     public TestResults ParseResults(IEnumerable<ResultFile> resultFiles)
     {
@@ -590,8 +639,10 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
         }
         all = all.Where(f => f.ExitCode is null || !XCTestOutputFileName.IsMatch(f.Name)).ToList();
         var exits = all.Where(f => f.ExitCode is not null).ToDictionary(f => f.Name, f => f.ExitCode!.Value, StringComparer.Ordinal);
+        var outputs = all.Where(f => f.ExitCode is not null).ToDictionary(f => f.Name, f => f.Content, StringComparer.Ordinal);
+        var streams = all.Where(f => f.ExitCode is null && EventsFileName.IsMatch(f.Name)).ToDictionary(f => f.Name, f => f.Content, StringComparer.Ordinal);
         var reported = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var (name, content) in all.Where(f => f.ExitCode is null))
+        foreach (var (name, content) in all.Where(f => f.ExitCode is null && !EventsFileName.IsMatch(f.Name)))
         {
             var cases = new List<(string, TestCaseResult)>();
             try
@@ -653,6 +704,17 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
                 if ((exit == 0) != (failed == 0))
                 {
                     throw new InvalidDataException($"swift test exited {exit}, which does not agree with its {failed} failing case(s)");
+                }
+                // A known issue (withKnownIssue) leaves a plain passing testcase in the report (Swift 6.3.2): the case passed
+                // only because its failure was expected, so it is read as skipped — no pass on the head, no failure on the base.
+                var events = name[..^".xml".Length] + EventsSuffix;
+                if (!streams.TryGetValue(events, out var stream))
+                {
+                    throw new InvalidDataException($"its step wrote no Swift Testing event stream ({events}), so whether a case passed only with a known issue cannot be told");
+                }
+                if (KnownIssue(stream) || outputs[output].Contains("known issue", StringComparison.OrdinalIgnoreCase))
+                {
+                    cases = cases.Select(c => c.Item2.Outcome == TestCaseResult.Passed ? (c.Item1, new TestCaseResult(c.Item1, TestCaseResult.Skipped)) : c).ToList();
                 }
             }
             catch (Exception e) when (e is XmlException or InvalidDataException)
@@ -769,6 +831,42 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
             throw new InvalidDataException($"swift test exited {exit}, which does not agree with its {failed} failing case(s)");
         }
         return cases;
+    }
+
+    /// <summary>
+    /// Whether a Swift Testing event stream (JSON Lines, schema <see cref="EventStreamVersion"/>) records a known issue: an
+    /// <c>event</c> record of kind <c>issueRecorded</c> whose <c>issue.isKnown</c> is true (sc-26134). Read only when every
+    /// line is a JSON object of that schema version and a <c>runEnded</c> event closes the run; otherwise unreadable, never
+    /// "no known issue".
+    /// </summary>
+    internal static bool KnownIssue(string stream)
+    {
+        var (known, ended) = (false, false);
+        foreach (var line in stream.Split('\n').Select(l => l.Trim()).Where(l => l.Length > 0))
+        {
+            try
+            {
+                using var record = System.Text.Json.JsonDocument.Parse(line);
+                var root = record.RootElement;
+                if (root.ValueKind != System.Text.Json.JsonValueKind.Object
+                    || !root.TryGetProperty("version", out var version) || version.ValueKind != System.Text.Json.JsonValueKind.Number || version.GetRawText() != EventStreamVersion
+                    || !root.TryGetProperty("kind", out var kind) || !root.TryGetProperty("payload", out var payload) || payload.ValueKind != System.Text.Json.JsonValueKind.Object)
+                {
+                    throw new InvalidDataException($"its Swift Testing event stream has a record that is not of schema version {EventStreamVersion}");
+                }
+                if (kind.ValueEquals("event") && payload.TryGetProperty("kind", out var what))
+                {
+                    ended |= what.ValueEquals("runEnded");
+                    known |= what.ValueEquals("issueRecorded") && payload.TryGetProperty("issue", out var issue) && issue.ValueKind == System.Text.Json.JsonValueKind.Object
+                        && issue.TryGetProperty("isKnown", out var isKnown) && isKnown.ValueKind == System.Text.Json.JsonValueKind.True;
+                }
+            }
+            catch (System.Text.Json.JsonException e)
+            {
+                throw new InvalidDataException($"its Swift Testing event stream has a line that is not JSON ({e.Message})");
+            }
+        }
+        return ended ? known : throw new InvalidDataException("its Swift Testing event stream has no runEnded event (the run did not finish writing it)");
     }
 
     private static string Outcome(XElement testcase)

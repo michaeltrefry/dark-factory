@@ -426,15 +426,17 @@ public class SwiftRunOutputTests
             "Restore swift package --package-path ./tools/cli resolve",
             "Build swift build --package-path . --build-system native --build-tests",
             "Build swift build --package-path ./tools/cli --build-system native --build-tests",
-            @$"Test swift test --package-path . --build-system native --skip-build --disable-xctest --filter ^WordsTests\.blank\(\)(/|$) --xunit-output .results/{SwiftNewTests.ReportName("WordsTests.blank()")}",
-            @$"Test swift test --package-path . --build-system native --skip-build --disable-xctest --filter ^WordsTests\.Spaces\/double\(\)(/|$) --xunit-output .results/{SwiftNewTests.ReportName("WordsTests.Spaces/double()")}",
-            @$"Test swift test --package-path ./tools/cli --build-system native --skip-build --disable-xctest --filter ^ToolTests\.runs\(\)(/|$) --xunit-output .results/{SwiftNewTests.ReportName("ToolTests.runs()")}",
+            @$"Test swift test --package-path . --build-system native --skip-build --disable-xctest --filter ^WordsTests\.blank\(\)(/|$) --xunit-output .results/{SwiftNewTests.ReportName("WordsTests.blank()")} --event-stream-output-path .results/{SwiftNewTests.EventsName("WordsTests.blank()")} --event-stream-version 0",
+            @$"Test swift test --package-path . --build-system native --skip-build --disable-xctest --filter ^WordsTests\.Spaces\/double\(\)(/|$) --xunit-output .results/{SwiftNewTests.ReportName("WordsTests.Spaces/double()")} --event-stream-output-path .results/{SwiftNewTests.EventsName("WordsTests.Spaces/double()")} --event-stream-version 0",
+            @$"Test swift test --package-path ./tools/cli --build-system native --skip-build --disable-xctest --filter ^ToolTests\.runs\(\)(/|$) --xunit-output .results/{SwiftNewTests.ReportName("ToolTests.runs()")} --event-stream-output-path .results/{SwiftNewTests.EventsName("ToolTests.runs()")} --event-stream-version 0",
         ], steps.Select(s => $"{s.Phase} {s.Program} {string.Join(' ', s.Args)}"));
         Assert.Equal(["swift-build-0", "swift-build-1"], steps.Where(s => s.Phase == TestPhase.Build).Select(s => s.CaptureOutput));
-        // Each test step reads exactly its own report (no wildcard another test's file could match) and keeps its exit code.
-        Assert.Equal(new[] { "WordsTests.blank()", "WordsTests.Spaces/double()", "ToolTests.runs()" }.Select(id => ((string?)SwiftNewTests.ReportName(id), (string?)SwiftNewTests.OutputName(id))),
+        // Each test step reads exactly its own report and event stream (a pattern of its own hash alone) and keeps its exit code.
+        Assert.Equal(new[] { "WordsTests.blank()", "WordsTests.Spaces/double()", "ToolTests.runs()" }.Select(id => ((string?)SwiftNewTests.ResultPattern(id), (string?)SwiftNewTests.OutputName(id))),
             steps.Where(s => s.Phase == TestPhase.Test).Select(s => (s.ResultFilePattern, s.CaptureOutput)));
         Assert.Matches(@"^swift-test-[0-9a-f]{16}\.xml$", SwiftNewTests.ReportName("WordsTests.blank()"));
+        Assert.Matches(@"^swift-test-[0-9a-f]{16}\.\*$", SwiftNewTests.ResultPattern("WordsTests.blank()"));
+        Assert.Equal(SwiftNewTests.ReportName("WordsTests.blank()")[..^4] + ".events.jsonl", SwiftNewTests.EventsName("WordsTests.blank()"));
         Assert.Equal(3, steps.Where(s => s.Phase == TestPhase.Test).Select(s => s.ResultFilePattern).Distinct().Count());
         // No step runs anything but swift and the one mkdir: the gateway lint's known local program is TestStep.Program.
         Assert.All(steps, s => Assert.Contains(s.Program, new[] { SwiftNewTests.Swift, SwiftNewTests.MakeDirectory }));
@@ -475,9 +477,75 @@ public class SwiftRunOutputTests
         </testsuites>
         """;
 
-    /// <summary>A test step's report and its kept exit code, as the runner hands them to <see cref="SwiftNewTests.ParseResults"/>.</summary>
-    private static ResultFile[] Step(string id, string report, int exit) =>
-        [new ResultFile(SwiftNewTests.ReportName(id), report), new ResultFile(SwiftNewTests.OutputName(id), "") { ExitCode = exit }];
+    /// <summary>An event stream (version 0) of a run with no known issue: what matters is its closing runEnded event.</summary>
+    internal const string RunEnded = """
+        {"kind":"event","payload":{"kind":"runStarted","messages":[]},"version":0}
+        {"kind":"event","payload":{"kind":"testStarted","messages":[],"testID":"WordsTests.known()/WordsTests.swift:4:2"},"version":0}
+        {"kind":"event","payload":{"kind":"runEnded","messages":[]},"version":0}
+        """;
+
+    /// <summary>
+    /// What Swift 6.3.2 wrote for a test whose only failure is inside <c>withKnownIssue</c> (backtraces and paths cut): its
+    /// report is a plain pass, its event stream records the issue as known, and its output says so.
+    /// </summary>
+    internal const string KnownIssueReport = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <testsuites>
+          <testsuite name="TestResults" errors="0" tests="1" failures="0" skipped="0" time="0.001865833">
+            <testcase classname="WordsTests" name="known()" time="0.001489834" />
+          </testsuite>
+        </testsuites>
+        """;
+
+    internal const string KnownIssueEvents = """
+        {"kind":"test","payload":{"id":"WordsTests.known()\/WordsTests.swift:4:2","isParameterized":false,"kind":"function","name":"known()"},"version":0}
+        {"kind":"event","payload":{"kind":"runStarted","messages":[{"symbol":"default","text":"Test run started."}]},"version":0}
+        {"kind":"event","payload":{"kind":"testStarted","messages":[{"symbol":"default","text":"Test known() started."}],"testID":"WordsTests.known()\/WordsTests.swift:4:2"},"version":0}
+        {"kind":"event","payload":{"_comments":[],"issue":{"isKnown":true},"kind":"issueRecorded","messages":[{"symbol":"passWithKnownIssue","text":"Expectation failed: (one() → 1) == 2"}],"testID":"WordsTests.known()\/WordsTests.swift:4:2"},"version":0}
+        {"kind":"event","payload":{"kind":"testEnded","messages":[{"symbol":"passWithKnownIssue","text":"Test known() passed after 0.001 seconds with 1 known issue."}],"testID":"WordsTests.known()\/WordsTests.swift:4:2"},"version":0}
+        {"kind":"event","payload":{"kind":"runEnded","messages":[{"symbol":"passWithKnownIssue","text":"Test run with 1 test in 0 suites passed after 0.001 seconds with 1 known issue."}]},"version":0}
+        """;
+
+    /// <summary>A test step's report, its kept exit code and output, and its event stream, as the runner hands them to <see cref="SwiftNewTests.ParseResults"/>.</summary>
+    private static ResultFile[] Step(string id, string report, int exit, string events = RunEnded, string output = "") =>
+        [new ResultFile(SwiftNewTests.ReportName(id), report), new ResultFile(SwiftNewTests.OutputName(id), output) { ExitCode = exit }, new ResultFile(SwiftNewTests.EventsName(id), events)];
+
+    /// <summary>
+    /// sc-26134: Swift Testing writes a test that passed only with a known issue (<c>withKnownIssue</c>) as a plain passing
+    /// testcase; read from its event stream (or its output), it is skipped — no pass on the head — never passed. A known
+    /// issue's mention in the output alone does the same (belt and braces); a failing case stays failed.
+    /// </summary>
+    [Fact]
+    public void A_case_that_passed_only_with_a_known_issue_is_read_as_skipped_never_passed()
+    {
+        var fromEvents = Strategy.ParseResults(Step("WordsTests.known()", KnownIssueReport, 0, KnownIssueEvents));
+        var fromOutput = Strategy.ParseResults(Step("WordsTests.known()", KnownIssueReport, 0,
+            output: "━ Test known() passed after 0.001 seconds with 1 known issue.\n"));
+        var plain = Strategy.ParseResults(Step("WordsTests.known()", KnownIssueReport, 0));
+        var failing = Strategy.ParseResults(Step("WordsTests.Outer/Inner/deep()", Failing, 1, KnownIssueEvents));
+
+        Assert.Empty(fromEvents.Unreadable);
+        Assert.Equal([new TestCaseResult("WordsTests.known()", TestCaseResult.Skipped)], fromEvents.Cases["WordsTests.known()"]);
+        Assert.Equal([new TestCaseResult("WordsTests.known()", TestCaseResult.Skipped)], fromOutput.Cases["WordsTests.known()"]);
+        Assert.Equal([new TestCaseResult("WordsTests.known()", TestCaseResult.Passed)], plain.Cases["WordsTests.known()"]);
+        Assert.Equal(TestCaseResult.Failed, failing.Cases["WordsTests.Outer/Inner/deep()"].Single().Outcome);
+    }
+
+    [Theory]
+    [InlineData(null, "wrote no Swift Testing event stream")]
+    [InlineData("", "has no runEnded event")]
+    [InlineData("{\"kind\":\"event\",\"payload\":{\"kind\":\"runStarted\"},\"version\":0}\n", "has no runEnded event")]
+    [InlineData("{\"kind\":\"event\",\"payload\":{\"kind\":\"runEnded\"},\"version\":\"6.3.0\"}\n", "not of schema version 0")]
+    [InlineData("{\"kind\":\"event\",\"payload\":{\"kind\":\"runEnded\"},\"version\":1}\n", "not of schema version 0")]
+    [InlineData("{\"kind\":\"event\",\"payload\":{\"kind\":\"runEnded\"},\"version\":0}\nnot json\n", "a line that is not JSON")]
+    public void A_report_whose_event_stream_is_missing_or_cannot_be_trusted_is_unreadable(string? events, string why)
+    {
+        var files = Step("WordsTests.blank()", Passing, 0, events ?? "");
+        var results = Strategy.ParseResults(events is null ? files[..2] : files);
+
+        Assert.Empty(results.Cases);
+        Assert.Contains(why, Assert.Single(results.Unreadable));
+    }
 
     [Fact]
     public void Swift_testings_report_gives_each_test_its_outcome_under_its_swift_testing_id()
@@ -780,5 +848,39 @@ public class SwiftRunnerTests : IDisposable
         Assert.Contains("so they check nothing: WordsTests.LegacyTests/testOne", rejected.Reason);
         Assert.Contains("new test(s) are skipped on the base", rejected.Reason);
         Assert.Contains("WordsTests.LegacyTests/testLater (skipped)", rejected.Reason);
+    }
+
+    /// <summary>
+    /// sc-26134: a new test that wraps the PR's new code in <c>withKnownIssue</c> (and, on macOS, an XCTest method in
+    /// <c>XCTExpectFailure</c>) does not build on the base and "passes" on the head only because its failure is expected:
+    /// it checks nothing, so it is read as skipped on the head and the check is rejected, never a pass.
+    /// </summary>
+    [Fact]
+    public async Task With_swift_a_new_test_that_passes_only_with_a_known_issue_is_rejected_not_passed()
+    {
+        Assert.SkipUnless(HasSwift.Value, "swift is not installed");
+        Write("Package.swift", SwiftIdentifyTests.Manifest);
+        Write("Sources/Words/Words.swift", SwiftIdentifyTests.BaseLibrary);
+        Write(SwiftIdentifyTests.TestFile, SwiftIdentifyTests.BaseTests);
+        Write(".gitignore", ".build/\n");
+        var baseSha = CommitAndPush("base", "main");
+        TestGit.Run(_seed, "checkout", "-q", "-b", "factory/sc-5");
+        Write("Sources/Words/Words.swift", SwiftIdentifyTests.FixedLibrary + "public func trim(_ s: String) -> String { s }\n");
+        Write(SwiftIdentifyTests.TestFile, SwiftIdentifyTests.BaseTests + "@Test func trims() { withKnownIssue { #expect(trim(\" a \") == \"a\") } }\n");
+        if (OperatingSystem.IsMacOS())
+        {
+            Write("Tests/WordsTests/LegacyTests.swift",
+                "import XCTest\n@testable import Words\n\nclass LegacyTests: XCTestCase {\n    func testTrim() { XCTExpectFailure(\"not yet\") { XCTAssertEqual(trim(\" a \"), \"a\") } }\n}\n");
+        }
+        var head = CommitAndPush("a test that expects its own failure", "factory/sc-5");
+
+        var result = await Check(baseSha, head);
+
+        Assert.True(result.Outcome == NewTestsOutcome.Rejected, $"{result.Outcome}: {result.Reason}");
+        Assert.Equal(new[] { ("WordsTests.trims()", "not-built", "skipped") }
+                .Concat(OperatingSystem.IsMacOS() ? [("WordsTests.LegacyTests/testTrim", "not-built", "skipped")] : []).OrderBy(t => t.Item1, StringComparer.Ordinal),
+            result.Tests.Select(t => (t.Test, t.Base, t.Head)).OrderBy(t => t.Test, StringComparer.Ordinal));
+        Assert.Contains("new test(s) do not pass on the head", result.Reason);
+        Assert.Contains("WordsTests.trims() (skipped)", result.Reason);
     }
 }

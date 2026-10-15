@@ -632,21 +632,81 @@ public class XcodeIdentifyTests
         Assert.Equal("-workspace\nWords.xcworkspace\nWords", set.Projects["WordsTests/blank()"]);
     }
 
-    [Fact]
-    public async Task A_swiftpm_package_beside_an_xcode_project_is_left_to_the_swiftpm_strategy()
+    /// <summary>
+    /// A root <c>Package.swift</c> with an Xcode project under it (sc-26134): <paramref name="newFile"/> holds
+    /// <see cref="NewTests"/>, and the package's own test target gets one new test too.
+    /// </summary>
+    private static FakeTestRunner Mixed(string newFile = NewFile, string manifest = SwiftIdentifyTests.Manifest, params (string Path, string? Content)[] more)
     {
-        var runner = Runner(head: [(NewFile, NewTests),
-            ("Package.swift", SwiftIdentifyTests.Manifest), ("Sources/Words/Words.swift", SwiftIdentifyTests.FixedLibrary),
-            (SwiftIdentifyTests.TestFile, SwiftIdentifyTests.BaseTests + "@Test func blank() { #expect(count(\"\") == 0) }\n")]);
-        runner.BaseFiles["Package.swift"] = SwiftIdentifyTests.Manifest;
+        var runner = Runner(head: [(newFile, NewTests), (XcodeFixture.Library, XcodeFixture.Fixed),
+            ("Package.swift", manifest), ("Sources/Words/Words.swift", SwiftIdentifyTests.FixedLibrary),
+            (SwiftIdentifyTests.TestFile, SwiftIdentifyTests.BaseTests + "@Test func blank() { #expect(count(\"\") == 0) }\n"), .. more]);
+        runner.BaseFiles["Package.swift"] = manifest;
         runner.BaseFiles["Sources/Words/Words.swift"] = SwiftIdentifyTests.BaseLibrary;
         runner.BaseFiles[SwiftIdentifyTests.TestFile] = SwiftIdentifyTests.BaseTests;
+        return runner;
+    }
+
+    [Fact]
+    public async Task Beside_a_root_package_an_xcode_test_targets_file_is_the_xcode_strategys_and_the_packages_tests_the_swiftpm_strategys()
+    {
+        var runner = Mixed();
+
+        var xcode = await Identify(runner);
+        var swiftpm = await new SwiftNewTests(xcode: true).IdentifyAsync(new TestSource(runner, Repo, FakeTestRunner.BaseSha, Head),
+            await runner.ChangesAsync(Repo, FakeTestRunner.BaseSha, Head, CancellationToken.None), CancellationToken.None);
+        var result = await Check(runner);
+
+        // Each file is judged by exactly one strategy: the Xcode test target's file by Xcode, the package's Tests/ by SwiftPM.
+        Assert.Empty(xcode.Unisolable);
+        Assert.Equal(["WordsTests/Spaces/Only/empty()", "WordsTests/blank()"], xcode.Tests);
+        Assert.Equal([new ChangedFile('A', null, NewFile)], xcode.TestFiles);
+        Assert.Empty(swiftpm.Unisolable);
+        Assert.Equal(["WordsTests.blank()"], swiftpm.Tests);
+        Assert.Equal([new ChangedFile('M', SwiftIdentifyTests.TestFile, SwiftIdentifyTests.TestFile)], swiftpm.TestFiles);
+        Assert.True(result.Passed, result.Reason);
+    }
+
+    [Fact]
+    public async Task Beside_a_root_package_with_worker_swift_off_an_xcode_test_targets_new_tests_are_unsupported_saying_why()
+    {
+        var result = await Check(Mixed(), swift: false);
+
+        Assert.Equal(NewTestsOutcome.Unsupported, result.Outcome);
+        Assert.Contains($"{NewFile} adds test(s) blank(), Spaces/Only/empty() the gate cannot run: an Xcode project's test target compiles it, "
+            + "and the gate runs an Xcode project's tests only in a factory with Worker:Swift on", result.Reason);
+    }
+
+    [Fact]
+    public async Task Beside_a_root_package_a_file_in_neither_a_package_test_target_nor_an_xcode_one_is_unsupported_once()
+    {
+        // Classic file references: the PR adds the file under the project, but to no target, and it is outside the package's Tests/.
+        var runner = Runner(classic: true, head: [(NewFile, NewTests), ("Package.swift", SwiftIdentifyTests.Manifest)]);
+        runner.BaseFiles["Package.swift"] = SwiftIdentifyTests.Manifest;
 
         var result = await Check(runner);
 
-        // Package.swift at the root holds every file below it, the Xcode project's too: SwiftPM's rule (nearest manifest) decides.
         Assert.Equal(NewTestsOutcome.Unsupported, result.Outcome);
-        Assert.Contains("WordsTests/BlankTests.swift adds test(s) blank(), Spaces/Only/empty() the gate cannot run: it is outside the package's Tests/<target>/ directories", result.Reason);
+        Assert.Contains($"{NewFile} adds test(s) blank(), Spaces/Only/empty() the gate cannot run: it is outside the package's Tests/<target>/ directories", result.Reason);
+        Assert.DoesNotContain("not a member of any test target", result.Reason);
+    }
+
+    [Fact]
+    public async Task A_file_in_both_a_package_test_targets_path_and_an_xcode_test_target_is_unsupported_naming_both()
+    {
+        // The package's test target declares the Xcode test target's synchronized folder as its path:.
+        var manifest = SwiftIdentifyTests.Manifest.Replace(".testTarget(name: \"WordsTests\", dependencies: [\"Words\"])",
+            ".testTarget(name: \"WordsTests\", dependencies: [\"Words\"], path: \"WordsTests\")");
+        Assert.NotEqual(SwiftIdentifyTests.Manifest, manifest);
+        var runner = Mixed(manifest: manifest);
+
+        var xcode = await Identify(runner);
+        var result = await Check(runner);
+
+        Assert.DoesNotContain("WordsTests/blank()", xcode.Tests);
+        Assert.Equal(NewTestsOutcome.Unsupported, result.Outcome);
+        Assert.Contains($"{NewFile} adds test(s) blank(), Spaces/Only/empty() the gate cannot run: it is in a SwiftPM test target's directory and the Xcode test target "
+            + "WordsTests of Words.xcodeproj compiles it too, so which of them runs its tests cannot be told", result.Reason);
     }
 }
 
