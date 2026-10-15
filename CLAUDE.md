@@ -2563,6 +2563,15 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `work_items`/`worker_sessions`/`controls`, relayed by `SessionEventRelay` → `PipelineChanges`); session pages join the same
   `SessionBroadcaster` as hub viewers (`ISessionViewers`), so backlog-then-live holds there too. Never log transcript content.
   A plan item's stories are listed beneath its row, from the ledger alone (sc-25876, above).
+  Control rows and merged items (sc-26134): the factory's and each epic's control row says its control in words that are never
+  activity — factory `accepting work` | `paused` | `stopping` | `frozen` | `paused for usage`, epic `not paused` | `paused` |
+  `stopping` — then `N running, M waiting, K merged` of its listed items (`Activity.Of`: running = a run of the item is alive,
+  `RunView.Live`; merged = in Watch after its Merge row, no run alive; waiting = every other listed item not finished, liveness
+  unknown included; a finished plan item counts as none). An epic whose listed items are all merged or finished and whose own
+  control is not Paused/Stopping gets no control row (nothing is left of it to pause or stop): it is named in one muted
+  `finished-epics` line instead; an epic with only a control row and no listed item keeps its row. A merged item
+  (`PipelineRow.MergedAt`: its last Merge transition, while in Watch) shows no Pause/Stop, and its Elapsed is the time until the
+  merge plus `merged <utc>`; its closeout-retry line is unchanged.
   Board links and epics (sc-25985): a row may carry `PipelineRow.Links` (`BoardLink`: the item's and its epic's link), which
   `DashboardData` takes from each source's `IBoardLinks` (`WorkSourceKind.Links`, `WorkSourceRegistry.BoardLinks`; built whether
   or not the source has its credential) — read from the ledger alone, never a board. Kanban's is `KanbanLedgerLinks`: the item's

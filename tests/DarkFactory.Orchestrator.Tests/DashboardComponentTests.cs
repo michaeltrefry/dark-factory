@@ -217,7 +217,7 @@ public class DashboardComponentTests : BunitContext
             kanban.QuerySelectorAll("form").Select(f => (f.GetAttribute("data-action"), f.GetAttribute("data-scope"))));
         Assert.Equal(["epic:kb-5", "epic:kb-5"], kanban.QuerySelectorAll("input[name='scope']").Select(i => i.GetAttribute("value")));
         var shortcut = cut.Find("div.controls[data-scope='epic:5']");
-        Assert.Contains("Epic 5: running", shortcut.TextContent);
+        Assert.Contains("Epic 5: not paused", shortcut.TextContent);
         Assert.Equal([("pause", "epic:5"), ("stop", "epic:5")],
             shortcut.QuerySelectorAll("form").Select(f => (f.GetAttribute("data-action"), f.GetAttribute("data-scope"))));
 
@@ -286,6 +286,120 @@ public class DashboardComponentTests : BunitContext
         // Liveness not known (a reader with no lock reader): the phase alone, nothing claimed either way.
         Assert.Equal("review", Words(cut.Find("tr[data-item='5'] td.run")));
         Assert.Null(cut.Find("tr[data-item='5'] td.run").GetAttribute("data-live"));
+    }
+
+    private static RunView Alive(bool live) => new(live, "phase", SlotUse.None);
+
+    [Fact]
+    public void Control_rows_say_the_control_state_in_words_and_what_the_listed_items_are_doing()
+    {
+        // sc-26134: "running" on a control row read as "work is running". Epic 5: one item with a live run, one with none, one
+        // merged; epic 6: only a merged item (no control row, named as finished); epic 7: only a merged item but paused (kept,
+        // so its Pause can be continued); epic 8: a control row and no item.
+        _data.Rows =
+        [
+            Row(1, WorkState.Implement) with { EpicId = 5, Run = Alive(true) },
+            Row(2, WorkState.CI) with { EpicId = 5, Run = Alive(false) },
+            Row(3, WorkState.Watch) with { EpicId = 5, MergedAt = Now.AddMinutes(-5), Run = Alive(false) },
+            Row(4, WorkState.Watch) with { EpicId = 6, MergedAt = Now.AddMinutes(-5), Run = Alive(false) },
+            Row(9, WorkState.Watch) with { EpicId = 7, MergedAt = Now.AddMinutes(-5) },
+            // A finished plan item (listed only to group its stories) counts as nothing.
+            Row(10, WorkState.Done),
+        ];
+        _data.Controls =
+        [
+            new Control { Scope = "epic:7", State = ControlState.Paused, ChangedBy = "michael" },
+            new Control { Scope = "epic:8", State = ControlState.Stopping, ChangedBy = "michael" },
+            // Continued, and no item listed: its control row stays (nothing says it is finished).
+            new Control { Scope = "epic:11", State = ControlState.Running, ChangedBy = "michael" },
+        ];
+
+        var cut = Render<Pipeline>();
+
+        var factory = cut.Find("div.controls[data-scope='factory']");
+        Assert.Equal("accepting work", factory.QuerySelector(".control-state")!.TextContent);
+        Assert.Equal("1 running, 1 waiting, 3 merged", factory.QuerySelector(".activity")!.TextContent);
+        Assert.Equal(["factory", "epic:5", "epic:7", "epic:8", "epic:11"], cut.FindAll("div.controls").Select(d => d.GetAttribute("data-scope")));
+        var five = cut.Find("div.controls[data-scope='epic:5']");
+        Assert.Equal(("not paused", "1 running, 1 waiting, 1 merged"), (five.QuerySelector(".control-state")!.TextContent, five.QuerySelector(".activity")!.TextContent));
+        var seven = cut.Find("div.controls[data-scope='epic:7']");
+        Assert.Equal(("paused", "0 running, 0 waiting, 1 merged"), (seven.QuerySelector(".control-state")!.TextContent, seven.QuerySelector(".activity")!.TextContent));
+        Assert.Equal("stopping", cut.Find("div.controls[data-scope='epic:8'] .control-state").TextContent);
+        Assert.Equal(("not paused", "0 running, 0 waiting, 0 merged"),
+            (cut.Find("div.controls[data-scope='epic:11'] .control-state").TextContent, cut.Find("div.controls[data-scope='epic:11'] .activity").TextContent));
+        Assert.Equal("Epics with every listed item merged or finished (nothing left to pause or stop): 6", Words(cut.Find("p.finished-epics")));
+        Assert.DoesNotContain("running", cut.FindAll("div.controls .control-state").Select(s => s.TextContent));
+    }
+
+    [Theory]
+    [InlineData(ControlScope.Factory, ControlState.Paused, "paused")]
+    [InlineData(ControlScope.Factory, ControlState.Stopping, "stopping")]
+    [InlineData(ControlScope.Freeze, ControlState.Paused, "frozen")]
+    [InlineData(ControlScope.Usage, ControlState.Paused, "paused for usage")]
+    [InlineData(ControlScope.Factory, ControlState.Running, "accepting work")]
+    public void The_factory_row_names_its_control_state(string scope, ControlState state, string words)
+    {
+        _data.Rows = [];
+        _data.Controls = [new Control { Scope = scope, State = state, ChangedBy = "michael", ChangedAt = Now, ResumeAt = Now.AddMinutes(30) }];
+
+        var cut = Render<Pipeline>();
+
+        Assert.Equal(words, cut.Find("div.controls[data-scope='factory'] .control-state").TextContent);
+        Assert.Equal("0 running, 0 waiting, 0 merged", cut.Find("div.controls[data-scope='factory'] .activity").TextContent);
+    }
+
+    [Fact]
+    public void A_merged_item_offers_no_pause_or_stop_and_its_elapsed_time_stops_at_its_merge()
+    {
+        var time = (FakeTimeProvider)Services.GetRequiredService<TimeProvider>();
+        _data.Rows =
+        [
+            Row(1, WorkState.Watch) with { MergedAt = Now.AddMinutes(-5), FailedCloseout = new CloseoutStatus(1, false, "failed: Shortcut down") },
+            Row(2, WorkState.Review),
+        ];
+
+        var cut = Render<Pipeline>();
+
+        var merged = cut.Find("tr[data-item='1']");
+        Assert.Empty(merged.QuerySelectorAll("td.control form"));
+        Assert.Equal("1h 00m, merged 2026-10-06 11:55:00Z", merged.QuerySelector("td.elapsed")!.TextContent);
+        // Its closeout information is as it was.
+        Assert.Contains("retried on the next poll", merged.QuerySelector(".closeout-failed")!.TextContent);
+        // An item not merged keeps its controls and its running time.
+        Assert.Equal(["pause", "stop"], cut.FindAll("tr[data-item='2'] td.control form").Select(f => f.GetAttribute("data-action")));
+        Assert.Equal("1h 05m", cut.Find("tr[data-item='2'] td.elapsed").TextContent);
+
+        time.Advance(TimeSpan.FromDays(6));
+        _changes.Notify(null);
+        cut.WaitForAssertion(() => Assert.Equal("6d 1h", cut.Find("tr[data-item='2'] td.elapsed").TextContent));
+        Assert.Equal("1h 00m, merged 2026-10-06 11:55:00Z", cut.Find("tr[data-item='1'] td.elapsed").TextContent);
+    }
+
+    [Fact]
+    public void An_item_is_merged_from_its_last_merge_row_only_while_it_is_in_watch_and_the_activity_counts_each_row_once()
+    {
+        LedgerEntry Transition(WorkState state, int minutes) =>
+            new() { State = state, RecordedAt = Now.AddMinutes(minutes), Outcome = StepOutcome.Passed };
+        LedgerEntry[] rows =
+        [
+            Transition(WorkState.Merge, -30), Transition(WorkState.Planned, -29), Transition(WorkState.Merge, -10),
+            new() { State = WorkState.Merge, Step = "closeout", RecordedAt = Now.AddMinutes(-9), Outcome = StepOutcome.Passed },
+            Transition(WorkState.Watch, -8),
+        ];
+        Assert.Equal(Now.AddMinutes(-10), PipelineRow.MergedAtOf(WorkState.Watch, rows));
+        Assert.Null(PipelineRow.MergedAtOf(WorkState.Merge, rows));
+        Assert.Null(PipelineRow.MergedAtOf(WorkState.Watch, [Transition(WorkState.Watch, -1)]));
+
+        var activity = Activity.Of(
+        [
+            Row(1, WorkState.Watch) with { MergedAt = Now, Run = Alive(true) }, // a live run (a closeout retry) counts as running
+            Row(2, WorkState.Watch) with { MergedAt = Now },
+            Row(3, WorkState.Review) with { Run = new RunView(null, "review", SlotUse.None) }, // liveness unknown: waiting
+            Row(4, WorkState.Cancelled),
+        ]);
+        Assert.Equal(new Activity(1, 1, 1), activity);
+        Assert.True(activity.Active);
+        Assert.False(Activity.Of([Row(2, WorkState.Watch) with { MergedAt = Now }]).Active);
     }
 
     [Fact]

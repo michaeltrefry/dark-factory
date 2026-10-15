@@ -61,20 +61,28 @@ else if (Intake.Deferrals is { Count: > 0 } deferrals)
         <ControlButton Action="continue" Scope="@ControlScope.Usage" />
     </div>
 }
+@* Control rows (sc-26134): the control's state in words that cannot be read as activity, then what the listed items are doing. *@
 <div class="controls" data-scope="@ControlScope.Factory">
-    <span>Factory: <span class="control-state">@(Paused(ControlScope.Factory) ? "paused" : "running")</span></span>
+    <span>Factory: <span class="control-state">@FactoryState</span></span>
+    <span class="activity">@Activity.Of(_rows ?? [])</span>
     <ControlButton Action="@(Paused(ControlScope.Factory) ? "continue" : "pause")" Scope="@ControlScope.Factory" />
     <ControlButton Action="stop" Scope="@ControlScope.Factory" />
 </div>
-@foreach (var epic in Epics)
+@foreach (var epic in Epics.Where(e => !EpicFinished(e)))
 {
     @* An epic's scope carries its source (sc-25985): `epic:12` a Shortcut epic, `epic:kb-3` a Kanban epic. *@
     var epicScope = ControlScope.Epic(epic);
     <div class="controls" data-scope="@epicScope">
-        <span>Epic @epic: <span class="control-state">@(Paused(epicScope) ? "paused" : "running")</span></span>
+        <span>Epic @epic: <span class="control-state">@EpicState(epicScope)</span></span>
+        <span class="activity">@Activity.Of(RowsOf(epic))</span>
         <ControlButton Action="@(Paused(epicScope) ? "continue" : "pause")" Scope="@epicScope" />
         <ControlButton Action="stop" Scope="@epicScope" />
     </div>
+}
+@if (Epics.Where(EpicFinished).ToList() is { Count: > 0 } finishedEpics)
+{
+    <p class="muted finished-epics">Epics with every listed item merged or finished (nothing left to pause or stop):
+        @string.Join(", ", finishedEpics)</p>
 }
 @if (_rows is null)
 {
@@ -260,7 +268,15 @@ else
                             <span class="muted">—</span>
                         }
                     </td>
-                    <td class="elapsed">@Format.Elapsed(Time.GetUtcNow() - row.CreatedAt)</td>
+                    @* A merged item's time stops at its merge (sc-26134): nothing of it is in progress since. *@
+                    @if (row.MergedAt is { } mergedAt)
+                    {
+                        <td class="elapsed" data-merged="@mergedAt.ToString("u")">@Format.Elapsed(mergedAt - row.CreatedAt), merged @mergedAt.ToString("u")</td>
+                    }
+                    else
+                    {
+                        <td class="elapsed">@Format.Elapsed(Time.GetUtcNow() - row.CreatedAt)</td>
+                    }
                     <td class="cost">@Format.ItemCost(row.CostUsd, row.Sessions)</td>
                     <td class="sessions">
                         @foreach (var s in row.Sessions.Where(s => s.ClaudeSessionId is not null))
@@ -275,7 +291,8 @@ else
                         {
                             <span class="control-state">@(row.Control == ControlState.Stopping ? "stopping" : "paused")</span>
                         }
-                        @if (row.Control != ControlState.Stopping && !row.Finished)
+                        @* Nothing of a finished plan item or a merged item can be paused or stopped (sc-26134): no buttons. *@
+                        @if (row.Control != ControlState.Stopping && !row.Finished && !row.Merged)
                         {
                             var scope = ControlScope.Item(row.ExternalId);
                             <ControlButton Action="@(Paused(scope) ? "continue" : "pause")" Scope="@scope" />
@@ -292,6 +309,37 @@ else
 
     /// <summary>Whether this scope's own control (not an enclosing one) pauses it: Continue clears exactly that.</summary>
     private bool Paused(string scope) => _controls.GetValueOrDefault(scope)?.State == ControlState.Paused;
+
+    /// <summary>
+    /// The factory's control in words (sc-26134) — whether it takes new work, never whether work is running (the activity beside
+    /// it says that): stopping, paused (a human's Pause), frozen (the freeze), paused for usage, else accepting work.
+    /// </summary>
+    private string FactoryState =>
+        _controls.GetValueOrDefault(ControlScope.Factory)?.State == ControlState.Stopping ? "stopping"
+        : Paused(ControlScope.Factory) ? "paused"
+        : Freeze is not null ? "frozen"
+        : UsagePause is not null ? "paused for usage"
+        : "accepting work";
+
+    /// <summary>An epic's own control in words (sc-26134): stopping, paused, else not paused.</summary>
+    private string EpicState(string scope) => _controls.GetValueOrDefault(scope)?.State switch
+    {
+        ControlState.Stopping => "stopping",
+        ControlState.Paused => "paused",
+        _ => "not paused",
+    };
+
+    /// <summary>The listed items of an epic.</summary>
+    private IEnumerable<PipelineRow> RowsOf(EpicRef epic) => (_rows ?? []).Where(r => r.Epic == epic);
+
+    /// <summary>
+    /// An epic whose listed items are all merged or finished and whose own control holds nothing (sc-26134): it gets no control
+    /// row — there is nothing left of it to pause or stop — and is named in one muted line instead, so it never looks active.
+    /// An epic with no listed item at all (only a control row) keeps its control row, so a Pause on it can be continued.
+    /// </summary>
+    private bool EpicFinished(EpicRef epic) =>
+        RowsOf(epic).Any() && !Activity.Of(RowsOf(epic)).Active
+        && _controls.GetValueOrDefault(ControlScope.Epic(epic))?.State is null or ControlState.Running;
 
     /// <summary>The factory's freeze while it holds (until a human's Continue).</summary>
     private Control? Freeze => _controls.GetValueOrDefault(ControlScope.Freeze) is { State: not ControlState.Running } c ? c : null;
