@@ -3107,8 +3107,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   -version` and `/usr/bin/xcrun --find xcresulttool` (toolchain), the installed wrapper's `clean-derived-data` (a `Restore`
   step: failing, the run is an `error`), per project+scheme
   `SwiftToolchain.DefaultWrapperPath --gate build-for-testing -project|-workspace … -scheme … -destination platform=macOS -quiet`
-  (output kept: the build log; `XcodeNewTests` attributes nothing — unlike `SwiftNewTests` since S2, a base that does not
-  build is every error unattributable, `error`, no retry), then per test the wrapper's `--gate test-without-building …
+  (its standard output kept: the build log, "Base build" below), then per test the wrapper's `--gate test-without-building …
   -only-testing:<id> -resultBundlePath <results>/xcode-test-<16 hex>.xcresult -quiet` (exit code kept) and `/usr/bin/xcrun
   xcresulttool get test-results tests --path <bundle>` (its JSON kept), and last `clean-derived-data` again, a
   `TestPhase.Cleanup` step: `SandboxTestRunner` runs a run's cleanup steps after every other step however the run ended —
@@ -3225,6 +3224,37 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `FACTORY_SANDBOX_LIVE=1 Worker__Swift=true Worker__Slots=2 dotnet test --project tests/DarkFactory.Orchestrator.Tests -- --filter-method "*The_ios_gate_runs_a_new_unit_test_and_ui_test_on_a_simulator_as_each_sandbox_user" --report-xunit-xml`
   (each configured slot; the installed wrapper; per slot two runs each booting a fresh device, then nothing of the user left —
   `StopAllAsync`'s reading, right after and 15 s later — and no device of the gate's in its set; leaves nothing).
+  Base build, Xcode (sc-26134, feature-end fixes round 2; `XcodeNewTests.ParseBuildErrors`/`ExplainBuildFailure`/`BaseRetries`):
+  an Xcode project's base that does not build with the PR's test files — the usual shape: a new test calls what the PR adds —
+  is explained by SwiftPM's rules (S2) through the same code: `XcodeNewTests.IdentifyAsync` returns a `SwiftNewTestSet` (each
+  new test's file and key — an XCTest test's: the method its class runs —, and the applied files as the head has them) and
+  `ExplainBuildFailure` is `SwiftNewTests.ExplainBuildFailure`. So: not-built for a new test whose own function or type header
+  holds a swiftc error, every other outermost declaration that did not compile left out of the next retry (`BaseRetries` 3, as
+  SwiftPM: a type or signature error — the module interface, built first — hides the body errors), unremovable (tests stay
+  `unproven`) for an error between members, outside every declaration, on a `#if` line or in the header of a type an earlier
+  retry changed, and unattributable (`error`) for an error in any file the overlay did not apply — production code, an
+  unchanged test file, a generated file or macro expansion outside the worktree — in no file, an ambiguity or redeclaration, a
+  plugin's rule-tagged error, or a build naming no error. The applied files are the head's test files of the unit-test or
+  UI-test target (with classic references the base's project file given them, which holds no swiftc error). The errors are
+  read from the build step's STANDARD OUTPUT (`CaptureOutput`; the same step for macOS and an iOS Simulator destination, outside
+  the simulator script), as recorded with Xcode 26.5 (`Fixtures/xcode-build`): swiftc's `/abs/File.swift:l:c: error: …` (Xcode
+  prints a `/private/tmp|var` worktree as `/tmp|/var/…`: resolved before it is made relative), and as errors in no file the
+  linker's `…/App.xcodeproj: AppTests: clang: error: linker command failed …`, `error: Build input file cannot be found: …`,
+  and xcodebuild's `Command PhaseScriptExecution failed with a nonzero exit code` (`FailedCommand`: no `error:` on it, so read
+  by its own rule); `Failed frontend command:` and the invocation after it are not errors; `** TEST BUILD FAILED **`, the failed
+  commands' list and `xcodebuild: error:` go to standard error, unread — a build failing with nothing on standard output names no
+  error, unattributable. iOS: a retry is a run of its own (a fresh results directory, so a fresh device from its own `prepare`,
+  deleted by its own `remove`; never the base run's), each run bounded by its own `Gate:TestTimeoutMinutes` as every run of the
+  check is (SwiftPM and cargo alike); a run whose build fails stops before `session`, so it never boots — of a base and its
+  retries only the one that builds pays the 2–4.5 minute first boot, and a failed attempt costs a device creation and a build.
+  Residual, accepted (S2's): a run-script phase that prints a located error in swiftc's format without a rule tag into an
+  applied test file would be read as the compiler's. Tests: `XcodeBaseBuildTests` (each recorded output read into its errors,
+  the `/tmp` form, then through the check: macOS not-built + a retry, swiftc's stages through three retries, iOS XCTest not-built
+  with each run's own device, broken production code on both platforms an error with no retry, a new test's own error beside a
+  script phase's, the linker's or a missing input's an error, an unchanged test file's an error), the real toolchain as the
+  OWNER (`XcodeRunnerTests.With_xcode_a_new_test_calling_code_the_base_lacks_is_not_built_there_and_a_base_that_does_not_build_is_an_error`,
+  `XcodeIosRunnerTests.With_xcode_and_a_simulator_a_new_ios_test_calling_code_the_base_lacks_…`, and the classic-reference test
+  now not-built where it was an `error`).
   Upgrading from Phase 1: Review is now a handled state, so the first `factory work` picks up every item parked at Review:
   an open PR is reviewed by the panel like any other (Phase 1's missing `implementer-model` no longer matters, sc-25379),
   and one the owner merged or closed escalates once with a story comment ("merged outside the factory"). An item whose

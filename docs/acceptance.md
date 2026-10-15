@@ -1341,7 +1341,6 @@ ledger** and its own work root (`E2e`), and takes every worker slot's lock of th
   means the refusal is never shown live.
 - **P5-AT1–AT4 and P5-AT5's second part skip until C3 indexes Swift** (prerequisite 6). Skipped is not passed: they are run
   again after C3.
-- **P5-AT1 and P5-AT7 are run only after the fix "Xcode base-build attribution (feature-end round 2)" is merged** (prerequisite 8).
 - **P5-AT3 and P5-AT4 one at a time, never side by side**: both raise the one run counter of the iOS app
   (`e2e-ios/Tally/E2eRun.swift`) from main's value, so two runs at once would raise it to the same number and the later merge
   would conflict or its test prove nothing.
@@ -1399,12 +1398,6 @@ ledger** and its own work root (`E2e`), and takes every worker slot's lock of th
    today (no SceneWorks iOS app exists), so the throwaway `Tally` app in the sandbox stands in; `FACTORY_E2E_P5_IOS_DIR` moves
    the seed (default `e2e-ios`). Every seeded file says `[dark-factory e2e]`; the sandbox's own .NET CI and build read none of
    them. A test whose seed is missing on `main` skips naming this step.
-8. **For P5-AT1 and P5-AT7: the fix "Xcode base-build attribution (feature-end round 2)" merged** into the integration branch
-   the factory runs from. Until it is, the Xcode strategy does not attribute a base that fails to build: a new Xcode test that
-   calls API the pull request adds makes the base fail to build, and the check is then an `error` instead of the test counting
-   as `not-built`, so the gate escalates. P5-AT1 and P5-AT7 (real implementers, real Xcode changes) are therefore run only after
-   that fix; until then a new Xcode test may only call API the base already has (its failure on the base must come from what the
-   test asserts, not from code the base lacks). The seeded iOS tests (P5-AT3, P5-AT4) already only read API the base has.
 
 ## P5-AT1 to P5-AT6
 
@@ -1431,7 +1424,7 @@ then needs a `Repo:` line naming it.)
 
 | AT | Test (`SwiftAcceptanceTests.`) | Variables | Setup it does | Expected |
 | --- | --- | --- | --- | --- |
-| P5-AT1 | `P5_AT1_a_lensworks_change_with_a_new_swift_testing_test_merges_with_no_human` | `FACTORY_E2E_P5_LENSWORKS_STORY`: a To Do story with a `Repo: michaeltrefry/LensWorks` line asking for a small change to the Compositor app and a new Swift Testing (`@Test`) test of it in `CompositorTests` that fails without the change — until "Xcode base-build attribution (feature-end round 2)" is merged (prerequisite 8) do not run it; after, the test may call new API | none: a real implementer, the real high-class panel, LensWorks' CI | the item's ledger repo is LensWorks; a typed outcome on every row; the last `new-tests` row `pass`, its strategies holding `xcode-swift-testing`, with a `CompositorTests/…` test not passing on the base and `passed` on the head; the last `gate` row a `Merge` decision (`passed`) listing `new-tests-fail-on-base` and naming no unindexed file; `gate-passed` = the head the check judged; MergeGate → Merge → Watch; the last verdict passed, on the high class, for that head; the PR merged at that head, its merge commit the Merge row's; `CompositorTests`, read from the merge commit's project, a macOS unit-test bundle; the story Done |
+| P5-AT1 | `P5_AT1_a_lensworks_change_with_a_new_swift_testing_test_merges_with_no_human` | `FACTORY_E2E_P5_LENSWORKS_STORY`: a To Do story with a `Repo: michaeltrefry/LensWorks` line asking for a small change to the Compositor app and a new Swift Testing (`@Test`) test of it in `CompositorTests` that fails without the change (the test may call API the change adds: it is then `not-built` on the base) | none: a real implementer, the real high-class panel, LensWorks' CI | the item's ledger repo is LensWorks; a typed outcome on every row; the last `new-tests` row `pass`, its strategies holding `xcode-swift-testing`, with a `CompositorTests/…` test not passing on the base and `passed` on the head; the last `gate` row a `Merge` decision (`passed`) listing `new-tests-fail-on-base` and naming no unindexed file; `gate-passed` = the head the check judged; MergeGate → Merge → Watch; the last verdict passed, on the high class, for that head; the PR merged at that head, its merge commit the Merge row's; `CompositorTests`, read from the merge commit's project, a macOS unit-test bundle; the story Done |
 | P5-AT2 | `P5_AT2_a_swiftpm_change_with_a_new_xctest_test_merges` | `FACTORY_E2E_P5_SWIFTPM_STORY` | pushes `e2e-swift/Sources/DfE2eSwift/P<run>.swift` (a new function) and `e2e-swift/Tests/DfE2eSwiftTests/P<run>Tests.swift` (an XCTest test calling it) | AT1's ledger checks with strategy `swift-testing`; `DfE2eSwiftTests.P<run>Tests/testDoubles` `not-built` on the base (it calls code the PR adds) and `passed` on the head; merged; **the sandbox's main then holds both files** (one pair per run, safe to delete) |
 | P5-AT3 | `P5_AT3_an_ios_app_change_with_a_new_unit_test_run_in_the_simulator_merges` | `FACTORY_E2E_P5_IOS_UNIT_STORY`; optional `FACTORY_E2E_P5_IOS_REPO`, `FACTORY_E2E_P5_IOS_DIR` | raises `e2e-ios/Tally/E2eRun.swift`'s count to main's + 1 and pushes `e2e-ios/TallyTests/E2eUnit<run>Tests.swift` (XCTest: `E2eRun.count >= <count>`) | strategy `xcode-swift-testing`; `TallyTests/E2eUnit<run>Tests/testRunCountReached()` `failed` on the base and `passed` on the head, each on the run's own fresh iOS Simulator as the sandbox user; merged; its target, read at the merge commit, an **iOS** unit-test bundle; **main's run count goes up by one** |
 | P5-AT4 | `P5_AT4_an_ios_ui_test_runs_in_the_simulator_and_merges` | `FACTORY_E2E_P5_IOS_UI_STORY` (+ the same optional two) | raises the count likewise and pushes `e2e-ios/TallyUITests/E2eUi<run>UITests.swift` (XCUITest: launch the app, read the `e2e-runs` label, `>= <count>`) | `TallyUITests/E2eUi<run>UITests/testRunCountShown()` `failed` on the base and `passed` on the head (the S0 way: everything that needs the simulator booted in one helper run, a fresh device per run, deleted after); merged; its target an **iOS UI-test** bundle |
@@ -1459,8 +1452,7 @@ A runbook step, then a read-only check of the real ledger.
 1. Prerequisites as above (C3 deployed and Swift indexed: before it every Swift change escalates at the gate), with the
    factory's real ledger and settings: `Worker__Swift=true`, `Worker__Slots=2`, `Intake__MaxConcurrentRuns=2` if the stories may
    run side by side, `Factory__Repos` naming LensWorks and the iOS repository.
-2. **Only after "Xcode base-build attribution (feature-end round 2)" is merged** (prerequisite 8; before it a new Xcode test may
-   only call API the base already has). One real LensWorks epic: at least two of its stories To Do with a
+2. One real LensWorks epic: at least two of its stories To Do with a
    `Repo: michaeltrefry/LensWorks` line, each a real change with a new Swift Testing test in `CompositorTests` (or a
    `plan`-labelled story the factory plans into such stories). One real iOS change: a To
    Do story whose `Repo:` line names the iOS repository and asks for a change with a new unit or UI test in an iOS target. Watch

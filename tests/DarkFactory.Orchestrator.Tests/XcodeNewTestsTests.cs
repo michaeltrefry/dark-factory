@@ -836,8 +836,9 @@ public class XcodeRunTests
     }
 
     [Fact]
-    public async Task A_base_that_does_not_build_with_the_prs_test_files_is_an_error_never_a_pass()
+    public async Task A_new_tests_own_compiler_error_on_the_base_makes_it_not_built_there_not_an_error()
     {
+        // sc-26134: attributed as for SwiftPM (XcodeBaseBuildTests has the rest, from xcodebuild's real output).
         var runner = XcodeIdentifyTests.Runner(head: [("WordsTests/BlankTests.swift", "import Testing\n@Test func trims() { #expect(trim(\" a \") == \"a\") }\n")]);
         runner.Answer = spec => spec.OverlayFrom is null ? FakeTestRunner.Report(spec.Steps, TestCaseResult.Passed)
             : FakeTestRunner.NotBuilt(new BuildError("WordsTests/BlankTests.swift", 2, 30, "swiftc", "cannot find 'trim' in scope"));
@@ -845,9 +846,9 @@ public class XcodeRunTests
         var result = await NewTestsCheck.RunAsync(runner, NewTestsCheck.StrategiesFor(true), new RepoRef("acme", "words"), FakeTestRunner.BaseSha, "head1", "gate-sc-1", null,
             CancellationToken.None);
 
-        Assert.Equal(NewTestsOutcome.Error, result.Outcome);
-        Assert.Contains("an Xcode project's base that does not build with the PR's test files is not attributed to the new tests yet", result.Reason);
-        Assert.Equal(2, runner.Runs.Count); // no retry
+        Assert.True(result.Outcome == NewTestsOutcome.Pass, $"{result.Outcome}: {result.Reason}");
+        Assert.Equal([("WordsTests/trims()", "not-built", "passed")], result.Tests.Select(t => (t.Test, t.Base, t.Head)));
+        Assert.Equal(2, runner.Runs.Count); // no other test, so no retry
     }
 }
 
@@ -1024,7 +1025,8 @@ public class XcodeRunnerTests : IDisposable
             NewTestsCheck.StrategiesFor(swift: true, wrapper), Repo, baseSha, headSha, "gate-sc-5", null, TestContext.Current.CancellationToken);
         var worktrees = Physical(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name));
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        _derivedData.AddRange(new[] { "gate-sc-5-base", "gate-sc-5-head" }.Select(n => SwiftToolchain.DerivedDataOf(home, $"{worktrees}/{n}")));
+        _derivedData.AddRange(new[] { "gate-sc-5-base", "gate-sc-5-head", "gate-sc-5-base-retry", "gate-sc-5-base-retry-2", "gate-sc-5-base-retry-3" }
+            .Select(n => SwiftToolchain.DerivedDataOf(home, $"{worktrees}/{n}")));
         return result;
     }
 
@@ -1145,10 +1147,10 @@ public class XcodeRunnerTests : IDisposable
 
         var result = await Check(baseSha, head);
 
-        // On the base the test file is compiled (no Extra.swift there: extra() does not exist, so it does not build — an error, not
-        // yet attributed) — so the test is written against the base's API only, below.
-        Assert.Equal(NewTestsOutcome.Error, result.Outcome);
-        Assert.Contains("cannot find 'extra' in scope", result.Reason);
+        // On the base the test file is compiled (no Extra.swift there: extra() does not exist, so the new test does not build there:
+        // not-built, sc-26134) — and with a test written against the base's API only, it fails there, below.
+        Assert.True(result.Outcome == NewTestsOutcome.Pass, $"{result.Outcome}: {result.Reason}");
+        Assert.Equal([("WordsTests/blank()", "not-built", "passed")], result.Tests.Select(t => (t.Test, t.Base, t.Head)));
 
         Write("WordsTests/BlankTests.swift", "import Testing\n@testable import Words\n\n@Test func blank() { #expect(isBlank(\"  \")) }\n");
         var plain = CommitAndPush("only the base's API", "factory/sc-5");
@@ -1157,5 +1159,51 @@ public class XcodeRunnerTests : IDisposable
 
         Assert.True(pass.Outcome == NewTestsOutcome.Pass, $"{pass.Outcome}: {pass.Reason}");
         Assert.Equal([("WordsTests/blank()", "failed", "passed")], pass.Tests.Select(t => (t.Test, t.Base, t.Head)));
+    }
+
+    /// <summary>
+    /// sc-26134: a new test that calls a function the PR adds does not build on the base — not-built there, from xcodebuild's
+    /// real errors — and the other new test gets its real result from a retry without it; a base whose production code does not
+    /// build is an error.
+    /// </summary>
+    [Fact]
+    public async Task With_xcode_a_new_test_calling_code_the_base_lacks_is_not_built_there_and_a_base_that_does_not_build_is_an_error()
+    {
+        Assert.SkipUnless(HasXcode.Value, "Xcode is not installed");
+        foreach (var (path, content) in XcodeFixture.Files())
+        {
+            Write(path, content);
+        }
+        var baseSha = CommitAndPush("base", "main");
+        TestGit.Run(_seed, "checkout", "-q", "-b", "factory/sc-5");
+        Write(XcodeFixture.Library, XcodeFixture.Fixed);
+        Write("Words/Count.swift", "public func wordCount(_ text: String) -> Int {\n    text.split(separator: \" \").count\n}\n");
+        Write("WordsTests/CountTests.swift", "import Testing\n@testable import Words\n\nstruct CountTests {\n    @Test func counts() {\n        #expect(wordCount(\"a b\") == 2)\n    }\n\n"
+            + "    @Test func blank() {\n        #expect(isBlank(\" \"))\n    }\n}\n");
+        var head = CommitAndPush("count words", "factory/sc-5");
+
+        var pass = await Check(baseSha, head);
+
+        Assert.True(pass.Outcome == NewTestsOutcome.Pass, $"{pass.Outcome}: {pass.Reason}");
+        Assert.Equal([("WordsTests/CountTests/blank()", "failed", "passed"), ("WordsTests/CountTests/counts()", "not-built", "passed")],
+            pass.Tests.Select(t => (t.Test, t.Base, t.Head)).OrderBy(t => t.Test, StringComparer.Ordinal));
+        Assert.Equal(("build-failed", "ran"), (pass.BaseRun, pass.BaseRetry));
+        Assert.Equal(["WordsTests/CountTests.swift:5 func counts"], pass.BaseRemoved);
+
+        // A base whose production code does not build: the same change on top of it is an error, naming the base's file.
+        TestGit.Run(_seed, "checkout", "-q", "main");
+        Write(XcodeFixture.Library, "public func isBlank(_ text: String) -> Bool {\n    undefinedThing\n}\n");
+        var broken = CommitAndPush("broken base", "main");
+        TestGit.Run(_seed, "checkout", "-q", "-b", "factory/sc-7");
+        Write(XcodeFixture.Library, XcodeFixture.Fixed);
+        Write("WordsTests/BlankTests.swift", "import Testing\n@testable import Words\n\n@Test func blank() { #expect(isBlank(\" \")) }\n");
+        var fixing = CommitAndPush("fix the build", "factory/sc-7");
+
+        var error = await Check(broken, fixing);
+
+        Assert.True(error.Outcome == NewTestsOutcome.Error, $"{error.Outcome}: {error.Reason}");
+        Assert.Contains("says nothing about the new tests (not a compiler error in those files): Words/Words.swift(2,5): swiftc cannot find 'undefinedThing' in scope", error.Reason);
+        Assert.Equal(("build-failed", "ran", (string?)null), (error.BaseRun, error.HeadRun, error.BaseRetry));
+        Assert.Empty(Directory.EnumerateDirectories(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name)));
     }
 }

@@ -247,7 +247,7 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
     private static string Id(string target, SwiftFunc func) => Id(target, func.Types, func.Signature);
 
     /// <summary>A function's place in its file, independent of the module (for a file in no test target).</summary>
-    private static string Key(SwiftFunc func) => string.Join("/", func.Types.Append(func.Signature));
+    internal static string Key(SwiftFunc func) => string.Join("/", func.Types.Append(func.Signature));
 
     // ---- Finding the new tests ---------------------------------------------------------------------------------------------
 
