@@ -11,7 +11,7 @@ namespace DarkFactory.Orchestrator.Prepare;
 /// the launch helper passes no variable but the router's (it builds the environment from scratch), so the recipe's go on env's
 /// command line — data, never a shell string. The program is the recipe's own (an absolute path, a cache path, or a plain name
 /// resolved on the launch helper's fixed PATH): recipe argv is data run through the existing <see cref="TestStep.Program"/> seam,
-/// which the gateway lint's <c>KnownLocalPrograms</c> names; a refused downloader never gets this far (<see cref="PrepareRecipe.RefusedPrograms"/>).
+/// which the gateway lint's <c>KnownLocalPrograms</c> names. Which program it is, is not judged (any can reach the network).
 /// </summary>
 public static class PrepareSteps
 {

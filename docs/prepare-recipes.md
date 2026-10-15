@@ -9,7 +9,7 @@ reshaped for the harness. CLAUDE.md, "Prepare recipes", has the rules; this page
 version: 1
 artifacts:                      # optional, at most 16
   - name: <a-z0-9._->           # referenced as ${artifact:<name>}
-    url: https://…              # https only; no user info, no fragment; a public host (checked again at connect)
+    url: https://…              # https only, port 443; no user info, no fragment; a public host (checked again at connect)
     sha256: <64 hex>            # required; the download is kept only when it matches
     max_bytes: <1 … 4 GiB>      # the download is refused past it (declared length or while streaming)
     unpack: none|zip|tar|tar.gz # optional, default none (the file as downloaded)
@@ -17,7 +17,7 @@ artifacts:                      # optional, at most 16
 steps:                          # 1 to 32, run in order; the first failure ends the preparation
   - name: <a-z0-9._->
     argv: [<program>, <arg>, …] # no shell string: an absolute path, a plain name on the helper's fixed PATH,
-                                #   or ${artifact:…}/… / ${worktree}/…; never curl, wget, ssh, … (declare an artifact)
+                                #   or ${artifact:…}/… / ${worktree}/…; which program is not judged (declare what you download as an artifact)
     cwd: <relative dir>         # optional, default the repository root; no '..'
     env: {NAME: value}          # optional; PATH, HOME, TMPDIR, DYLD_*, LD_*, ANTHROPIC_* … are refused
     timeout_minutes: <1 … 120>  # optional; always within the run's own Gate:TestTimeoutMinutes
@@ -60,7 +60,14 @@ with the security review (the path is on the gate's floor) and merged by the fac
 
 - The gate: before every new-tests strategy's build (xUnit, cargo, SwiftPM, Xcode macOS and iOS), each commit's own recipe —
   the base runs use the base's, the head run the head's. Artifacts are fetched owner-side first, outside the worker slot's
-  lock; the steps run as the sandbox user. Any failure is the check's `error`, never a pass.
-- Workers (`Worker:Prepare=true`): the harness fetches the worktree's recipe artifacts before each implementing session, and
-  the prompt names `/usr/local/libexec/dark-factory/factory-prepare --spool <dir>`, which asks the harness (through the
-  session's request spool) to fetch the current recipe's artifacts and then runs its steps as the worker.
+  lock, the whole preparation bounded by `Gate:TestTimeoutMinutes`; the steps run as the sandbox user. Any failure is the
+  check's `error`, never a pass. One exception: when the base's own recipe can no longer be fetched (its URL vanished) and
+  the pull request changes `.factory/prepare.yaml`, the base is prepared with the head's recipe, and the check's result says
+  so — so the pull request that fixes the recipe is not refused by it.
+- A pull request that changes only the recipe adds no test: on a path that requires new tests the check is `no-tests`, as
+  for any dependency bump. Change the recipe in the pull request whose code needs it.
+- Workers (`Worker:Prepare=true`): every implementing session's prompt names
+  `/usr/local/libexec/dark-factory/factory-prepare --spool <dir>`, which asks the harness (through the session's request
+  spool) to fetch the current recipe's artifacts and then runs its steps as the worker — it works once the worktree has a
+  recipe, one the session added included; the harness also fetches the artifacts of a recipe the worktree already has before
+  the session starts.

@@ -467,8 +467,8 @@ public static class FactoryRunner
         new(github, reviewer, options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, slots, options.TestTimeout),
             Overlays: new ReviewOverlays(codeGraph, options.CodeGraphOverlayTimeout),
             Risk: codeGraph is ICodeGraphRisk risk ? new CodeGraphRiskReader(risk, options.CodeGraphOverlayTimeout) : null,
-            // Each commit's prepare recipe (sc-26232): its artifacts fetched owner-side, its steps run before the build.
-            Prepare: artifacts is null ? null : new Prepare.PrepareStage(artifacts));
+            // Each commit's prepare recipe (sc-26232): its artifacts fetched owner-side (bounded by Gate:TestTimeoutMinutes), its steps run before the build.
+            Prepare: artifacts is null ? null : new Prepare.PrepareStage(artifacts, options.TestTimeout));
 
     /// <summary>
     /// The sandbox readiness probe of the slot the calling flow holds (<see cref="WorkerSlots.EnsureReadyAsync"/>; a failure names

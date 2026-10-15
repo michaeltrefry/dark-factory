@@ -134,23 +134,184 @@ public sealed class PrepareGateTests : IDisposable
             "dark-factory-gate-[0-9a-f]{16}", "<simulator>"); // the iOS run's own simulator, named per run
         Assert.Equal(plain.Runs.Select(Steps), prepared.Runs.Select(Steps));
         Assert.Empty(_server.Requests);
+        // One read of the PR's changes (one fetch of the gate's clone) per check: the stage's, reused by the check.
+        Assert.Equal((1, 1), (plain.ChangesCalls, prepared.ChangesCalls));
     }
 
     [Fact]
     public async Task A_recipe_that_does_not_parse_or_an_artifact_that_cannot_be_fetched_fails_naming_the_commit()
     {
-        var bad = WithRecipes(new FakeTestRunner(), null, "version: 1\nsteps: [{name: a, argv: [curl, x]}]\n");
+        var bad = WithRecipes(new FakeTestRunner(), null, "version: 1\nsteps: [{name: a, argv: [make], shell: true}]\n");
         var badParse = await Assert.ThrowsAsync<PrepareFailedException>(() =>
             Stage().ForCommitsAsync(bad, Repo, FakeTestRunner.BaseSha, "head1", null, CancellationToken.None));
         Assert.StartsWith("head1's prepare recipe: .factory/prepare.yaml", badParse.Message);
-        Assert.Contains("may not run curl", badParse.Message);
+        Assert.Contains("unknown key 'shell'", badParse.Message);
 
-        var missing = WithRecipes(new FakeTestRunner(),
-            $"version: 1\nartifacts: [{{name: sdk, url: 'https://files.example/gone.zip', sha256: {PrepareRecipeTests.Sha}, max_bytes: 10}}]\nsteps: [{{name: a, argv: [make]}}]\n", null);
+        // The PR leaves the recipe as it is: the base's own recipe (its artifact gone) fails the check naming the base.
+        var missing = WithRecipes(new FakeTestRunner(), GoneRecipe, GoneRecipe);
         var badFetch = await Assert.ThrowsAsync<PrepareFailedException>(() =>
             Stage().ForCommitsAsync(missing, Repo, FakeTestRunner.BaseSha, "head1", null, CancellationToken.None));
         Assert.StartsWith("base0's prepare recipe: artifact sdk", badFetch.Message);
         Assert.Contains("answered 404", badFetch.Message);
+    }
+
+    private static readonly string GoneRecipe =
+        $"version: 1\nartifacts: [{{name: sdk, url: 'https://files.example/gone.zip', sha256: {PrepareRecipeTests.Sha}, max_bytes: 10}}]\nsteps: [{{name: a, argv: [make]}}]\n";
+
+    [Fact]
+    public async Task A_base_whose_recipe_cannot_be_fetched_is_prepared_with_the_heads_only_when_the_pr_changes_the_recipe()
+    {
+        // Decision A: the PR that fixes a recipe whose artifact vanished is not refused by the recipe it fixes.
+        var fixing = WithRecipes(new FakeTestRunner(), GoneRecipe, Recipe("head-recipe"));
+
+        var prepared = await Stage().ForCommitsAsync(fixing, Repo, FakeTestRunner.BaseSha, "head1", null, CancellationToken.None);
+        var result = await Check(fixing, prepared);
+
+        Assert.Equal(prepared.StepsFor("head1"), prepared.StepsFor(FakeTestRunner.BaseSha));
+        Assert.Contains("head-recipe", Assert.Single(prepared.StepsFor(FakeTestRunner.BaseSha)).Args);
+        Assert.StartsWith("base prepared with the head's recipe: the base's own recipe could not be fetched: artifact sdk", prepared.Note);
+        Assert.Contains("answered 404", prepared.Note);
+        Assert.Equal(NewTestsOutcome.Pass, result.Outcome);
+        Assert.EndsWith(prepared.Note, result.Reason); // recorded with the result, so on the gate's new-tests row
+        Assert.All(fixing.Runs, r => Assert.Contains(r.Steps, s => s.Args.Contains("head-recipe")));
+
+        // A base recipe that does not PARSE is no fetch failure: each commit keeps its own, and the check is an error.
+        var unparsable = WithRecipes(new FakeTestRunner(), "version: 1\nsteps: [{name: a, argv: [make], shell: true}]\n", Recipe("head-recipe"));
+        var refused = await Assert.ThrowsAsync<PrepareFailedException>(() =>
+            Stage().ForCommitsAsync(unparsable, Repo, FakeTestRunner.BaseSha, "head1", null, CancellationToken.None));
+        Assert.StartsWith("base0's prepare recipe:", refused.Message);
+
+        // The head's own recipe failing too is named as the head's.
+        var both = WithRecipes(new FakeTestRunner(), GoneRecipe, GoneRecipe.Replace("gone.zip", "also-gone.zip"));
+        var headFails = await Assert.ThrowsAsync<PrepareFailedException>(() =>
+            Stage().ForCommitsAsync(both, Repo, FakeTestRunner.BaseSha, "head1", null, CancellationToken.None));
+        Assert.StartsWith("head1's prepare recipe: artifact sdk", headFails.Message);
+        Assert.Contains("also-gone.zip", headFails.Message);
+    }
+
+    [Fact]
+    public async Task A_recipe_only_pr_adds_no_test_and_is_no_tests_under_the_existing_rule()
+    {
+        // Decision B: the rule is not changed for recipes (as for a dependency bump); a recipe change rides with the code needing it.
+        var runner = new FakeTestRunner();
+        runner.HeadFiles = _ => new Dictionary<string, string>(runner.BaseFiles, StringComparer.Ordinal) { [PrepareRecipe.Path] = Recipe("head-recipe") };
+        var prepared = await Stage().ForCommitsAsync(runner, Repo, FakeTestRunner.BaseSha, "head1", null, CancellationToken.None);
+
+        var result = await Check(runner, prepared);
+
+        Assert.Equal(NewTestsOutcome.NoTests, result.Outcome);
+        Assert.Empty(runner.Runs);
+    }
+
+    [Fact]
+    public async Task The_stage_is_bounded_by_the_gates_test_timeout_and_a_slow_download_is_an_error()
+    {
+        var slow = new PrepareStage(new ArtifactFetcher(new HttpClient(new SlowServer()), _resolver, new ArtifactCache(ArtifactCache.RootOf(_root))),
+            TimeSpan.FromMilliseconds(300));
+        var runner = WithRecipes(new FakeTestRunner(), GoneRecipe, GoneRecipe);
+        var watch = Stopwatch.StartNew();
+
+        var timedOut = await Assert.ThrowsAsync<PrepareFailedException>(() =>
+            slow.ForCommitsAsync(runner, Repo, FakeTestRunner.BaseSha, "head1", null, CancellationToken.None));
+
+        Assert.Contains("were not ready within 0.3 seconds (Gate:TestTimeoutMinutes)", timedOut.Message);
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(30), $"{watch.Elapsed}"); // the server waits 45 s
+
+        // Through the pipeline: the gate's new-tests row is an error, the item escalates, nothing ran.
+        var h = new GatePipelineTests.Harness { Prepare = slow };
+        WithRecipes(h.TestRunner, GoneRecipe, GoneRecipe);
+        var outcome = await h.Run();
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        var error = NewTestsResult.FromDetail((await h.Rows()).Last(r => r.Step == RunPipeline.Steps.NewTests).Detail)!;
+        Assert.Equal(NewTestsOutcome.Error, error.Outcome);
+        Assert.Contains("(Gate:TestTimeoutMinutes)", error.Reason);
+        Assert.Empty(h.TestRunner.Runs);
+    }
+
+    private sealed class SlowServer : HttpMessageHandler
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(45), ct);
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        }
+    }
+
+    [Fact]
+    public async Task A_cache_root_that_cannot_be_set_up_is_the_factorys_failure_not_the_items()
+    {
+        // The work root's artifact-cache is a file: the cache cannot be made.
+        File.WriteAllText(ArtifactCache.RootOf(_root), "not a directory");
+        var runner = WithRecipes(new FakeTestRunner(), GoneRecipe, GoneRecipe);
+
+        var failed = await Assert.ThrowsAsync<Orchestrator.WorkSources.FactoryUnavailableException>(() =>
+            Stage().ForCommitsAsync(runner, Repo, FakeTestRunner.BaseSha, "head1", null, CancellationToken.None));
+        Assert.Contains("the artifact cache", failed.Message);
+
+        // A root that is a link reads back as no directory: the factory's failure as well.
+        File.Delete(ArtifactCache.RootOf(_root));
+        Directory.CreateSymbolicLink(ArtifactCache.RootOf(_root), Directory.CreateDirectory(Path.Combine(_root, "elsewhere")).FullName);
+        var linked = await Assert.ThrowsAsync<Orchestrator.WorkSources.FactoryUnavailableException>(() =>
+            new ArtifactCache(ArtifactCache.RootOf(_root)).EnsureRootAsync(CancellationToken.None));
+        Assert.Contains("is not a directory", linked.Message);
+    }
+
+    [Fact]
+    public async Task Through_the_pipeline_a_fetch_of_the_clone_that_fails_keeps_the_reason_it_always_had()
+    {
+        var h = new GatePipelineTests.Harness { Prepare = Stage() };
+        h.TestRunner.ChangesThrow = new InvalidOperationException("git fetch failed: offline");
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        var error = NewTestsResult.FromDetail((await h.Rows()).Last(r => r.Step == RunPipeline.Steps.NewTests).Detail)!;
+        Assert.Equal((NewTestsOutcome.Error, "the new tests could not be run: git fetch failed: offline"), (error.Outcome, error.Reason));
+        Assert.Equal(1, h.TestRunner.ChangesCalls);
+    }
+
+    /// <summary>A stack whose test files include the PR's recipe (as a strategy could claim it): the base run must never get it.</summary>
+    private sealed class ClaimsTheRecipe(INewTestStrategy inner) : INewTestStrategy
+    {
+        public string Name => inner.Name;
+        public bool Understands(string path) => inner.Understands(path);
+        public string BuildLogPattern => inner.BuildLogPattern;
+
+        public async Task<NewTestSet> IdentifyAsync(TestSource source, IReadOnlyList<ChangedFile> changes, CancellationToken ct)
+        {
+            var set = await inner.IdentifyAsync(source, changes, ct);
+            return set with
+            {
+                TestFiles = [.. set.TestFiles, new ChangedFile('M', PrepareRecipe.Path, PrepareRecipe.Path), new ChangedFile('R', ".FACTORY/old.yaml", "tests/moved.yaml")],
+                BaseReplacements = new Dictionary<string, string>(set.BaseReplacements) { [PrepareRecipe.Path] = "planted" },
+            };
+        }
+
+        public Task<IReadOnlyList<TestStep>> StepsAsync(TestSource source, string commit, IReadOnlyList<string> tests, IReadOnlyDictionary<string, string> projects,
+            string resultsDirectory, CancellationToken ct) => inner.StepsAsync(source, commit, tests, projects, resultsDirectory, ct);
+
+        public TestResults ParseResults(IEnumerable<ResultFile> resultFiles) => inner.ParseResults(resultFiles);
+        public IReadOnlyList<BuildError> ParseBuildErrors(string log, IReadOnlyList<string> roots) => inner.ParseBuildErrors(log, roots);
+        public BuildFailure ExplainBuildFailure(NewTestSet set, IReadOnlyDictionary<string, string> applied, IReadOnlyList<BuildError> errors, IReadOnlyList<string> tests) =>
+            inner.ExplainBuildFailure(set, applied, errors, tests);
+    }
+
+    [Fact]
+    public async Task Nothing_under_dot_factory_is_ever_overlaid_onto_a_base_run()
+    {
+        var runner = WithRecipes(new FakeTestRunner(), Recipe("base-recipe"), Recipe("head-recipe"));
+
+        var result = await NewTestsCheck.RunAsync(runner, [new ClaimsTheRecipe(new XunitNewTests())], Repo, FakeTestRunner.BaseSha, "head1", "gate-sc-1", null,
+            CancellationToken.None);
+
+        Assert.Equal(NewTestsOutcome.Pass, result.Outcome);
+        var baseRun = Assert.Single(runner.Runs, r => r.OverlayFrom is not null);
+        Assert.Contains(FakeTestRunner.NewTestFile, baseRun.OverlayPaths);
+        Assert.Contains("tests/moved.yaml", baseRun.OverlayPaths);
+        Assert.DoesNotContain(baseRun.OverlayPaths, NewTestsCheck.IsPrepareRecipePath);
+        Assert.DoesNotContain(baseRun.DeletePaths, NewTestsCheck.IsPrepareRecipePath);
+        Assert.DoesNotContain(baseRun.Replacements.Keys, NewTestsCheck.IsPrepareRecipePath);
+        Assert.True(NewTestsCheck.IsPrepareRecipePath(".FACTORY/old.yaml"));
     }
 
     [Fact]
@@ -196,7 +357,7 @@ public sealed class PrepareGateTests : IDisposable
     public async Task Through_the_pipeline_a_recipe_that_cannot_be_prepared_is_an_error_and_a_download_is_on_the_ledger()
     {
         var failing = new GatePipelineTests.Harness { Prepare = Stage() };
-        WithRecipes(failing.TestRunner, null, "version: 1\nsteps: [{name: a, argv: [wget]}]\n");
+        WithRecipes(failing.TestRunner, null, "version: 1\nsteps: [{name: a, argv: [make], shell: true}]\n");
 
         var refused = await failing.Run();
 
@@ -204,7 +365,7 @@ public sealed class PrepareGateTests : IDisposable
         Assert.Empty(failing.Merges);
         var error = NewTestsResult.FromDetail((await failing.Rows()).Last(r => r.Step == RunPipeline.Steps.NewTests).Detail)!;
         Assert.Equal(NewTestsOutcome.Error, error.Outcome);
-        Assert.Contains("may not run wget", error.Reason);
+        Assert.Contains("unknown key 'shell'", error.Reason);
         Assert.Empty(failing.TestRunner.Runs); // nothing ran
 
         var body = "sdk"u8.ToArray();

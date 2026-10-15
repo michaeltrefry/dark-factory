@@ -160,7 +160,93 @@ public sealed class ArtifactFetchTests : IDisposable
         var refused = await Assert.ThrowsAsync<ArtifactFetchException>(() => Fetcher().EnsureAsync(artifact, null, CancellationToken.None));
 
         Assert.Contains($"not the recipe's {artifact.Sha256}", refused.Message);
+        Assert.Contains($"has SHA-256 {Sha256("tampered"u8.ToArray())}", refused.Message); // the full reason: the ledger's and the gate's
+        // What a worker is told: never the served bytes' hash.
+        Assert.Equal($"artifact tool: https://files.example/sdk.bin does not match the pinned sha256 {artifact.Sha256}; nothing was cached", refused.WorkerMessage);
+        Assert.DoesNotContain(Sha256("tampered"u8.ToArray()), refused.WorkerMessage);
         Assert.Empty(Directory.EnumerateFileSystemEntries(ArtifactCache.RootOf(_root)));
+    }
+
+    [Fact]
+    public async Task A_verified_entry_is_not_hashed_again_by_the_same_cache_until_its_manifest_changes()
+    {
+        var body = "the sdk"u8.ToArray();
+        _server.Serve("https://files.example/sdk.bin", body);
+        var artifact = Artifact("https://files.example/sdk.bin", body);
+        var cache = new ArtifactCache(ArtifactCache.RootOf(_root));
+        var fetcher = new ArtifactFetcher(new HttpClient(_server), _resolver, cache);
+
+        var path = await fetcher.EnsureAsync(artifact, null, CancellationToken.None);
+        Assert.Equal(1, cache.Verifications); // the store's own read-back
+        Assert.Equal(path, await cache.TryGetAsync(artifact, CancellationToken.None));
+        Assert.Equal(path, await fetcher.EnsureAsync(artifact, null, CancellationToken.None));
+        Assert.Equal(1, cache.Verifications);
+
+        // A new manifest (the entry replaced) is verified in full again; another cache verifies for itself.
+        var manifest = Path.Combine(Path.GetDirectoryName(Path.GetDirectoryName(path))!, ArtifactCache.ManifestName);
+        System.IO.File.SetLastWriteTimeUtc(manifest, DateTime.UtcNow.AddMinutes(-3));
+        Assert.Equal(path, await cache.TryGetAsync(artifact, CancellationToken.None));
+        Assert.Equal(2, cache.Verifications);
+        var other = new ArtifactCache(ArtifactCache.RootOf(_root));
+        Assert.Equal(path, await other.TryGetAsync(artifact, CancellationToken.None));
+        Assert.Equal(1, other.Verifications);
+        Assert.Single(_server.Requests);
+    }
+
+    [Fact]
+    public async Task An_entry_that_cannot_be_read_to_verify_is_an_error_and_is_not_deleted()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.Skip("Unix modes.");
+        }
+        var zip = Zip(("sdk/a.h", "a", 0x81A4));
+        _server.Serve("https://files.example/sdk.zip", zip);
+        var artifact = Artifact("https://files.example/sdk.zip", zip, ArtifactUnpack.Zip);
+        var path = await Fetcher().EnsureAsync(artifact, null, CancellationToken.None);
+        var file = Path.Combine(path, "sdk/a.h");
+        System.IO.File.SetUnixFileMode(file, UnixFileMode.None); // the owner cannot read it: an I/O failure, not a mismatch
+        try
+        {
+            var unreadable = await Assert.ThrowsAsync<ArtifactFetchException>(() => new ArtifactCache(ArtifactCache.RootOf(_root)).TryGetAsync(artifact, CancellationToken.None));
+            Assert.Contains("could not be read to verify it, so it was neither used nor deleted", unreadable.Message);
+            Assert.True(System.IO.File.Exists(file)); // left as it is
+            var fetch = await Assert.ThrowsAsync<ArtifactFetchException>(() => Fetcher().EnsureAsync(artifact, null, CancellationToken.None));
+            Assert.Contains("neither used nor deleted", fetch.Message);
+            Assert.Single(_server.Requests); // never fetched again over it
+        }
+        finally
+        {
+            System.IO.File.SetUnixFileMode(file, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
+        }
+        Assert.Equal(path, await new ArtifactCache(ArtifactCache.RootOf(_root)).TryGetAsync(artifact, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task The_first_use_of_a_cache_sweeps_downloads_and_stores_a_dead_process_left_and_only_those()
+    {
+        var root = ArtifactCache.RootOf(_root);
+        Directory.CreateDirectory(root);
+        var old = DateTime.UtcNow - ArtifactFetcher.DefaultTimeout - TimeSpan.FromMinutes(1);
+        var staleDownload = Path.Combine(root, ".download-0123");
+        System.IO.File.WriteAllText(staleDownload, "half");
+        System.IO.File.SetLastWriteTimeUtc(staleDownload, old);
+        var stalePartial = Directory.CreateDirectory(Path.Combine(root, ".partial-0123")).FullName;
+        System.IO.File.WriteAllText(Path.Combine(stalePartial, "x"), "x");
+        Directory.SetLastWriteTimeUtc(stalePartial, old);
+        var liveDownload = Path.Combine(root, ".download-4567"); // another process's download, still being written
+        System.IO.File.WriteAllText(liveDownload, "live");
+        var livePartial = Directory.CreateDirectory(Path.Combine(root, ".partial-4567")).FullName;
+        var entry = Directory.CreateDirectory(Path.Combine(root, "old-entry")).FullName; // not a leftover's name
+        Directory.SetLastWriteTimeUtc(entry, old);
+
+        await new ArtifactCache(root).EnsureRootAsync(CancellationToken.None);
+
+        Assert.False(System.IO.File.Exists(staleDownload));
+        Assert.False(Directory.Exists(stalePartial));
+        Assert.True(System.IO.File.Exists(liveDownload));
+        Assert.True(Directory.Exists(livePartial));
+        Assert.True(Directory.Exists(entry));
     }
 
     [Theory]
@@ -197,6 +283,7 @@ public sealed class ArtifactFetchTests : IDisposable
     [InlineData("https://127.0.0.1/x", "loopback")]
     [InlineData("https://[fd00::1]/x", "unique-local")]
     [InlineData("https://localhost/x", "local host")]
+    [InlineData("https://other.example:8443/x", "names port 8443")]
     public async Task A_redirect_is_checked_like_the_first_url_and_never_followed_to_a_refused_one(string location, string why)
     {
         var body = "x"u8.ToArray();
@@ -362,6 +449,48 @@ public sealed class ArtifactFetchTests : IDisposable
         Chmod("+a", "user:nobody allow add_file", ArtifactCache.RootOf(_root));
         await new ArtifactCache(ArtifactCache.RootOf(_root)).EnsureRootAsync(CancellationToken.None);
         Assert.True(WorkerSandbox.IsReadOnlyToOthers(await WorkerSandbox.ListAsync(ArtifactCache.RootOf(_root), CancellationToken.None)));
+    }
+
+    [Fact]
+    public async Task An_archive_with_nested_directories_unpacks_owner_only_writable_with_no_acl_entry_anywhere_on_macos()
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            Assert.Skip("ACLs via chmod +a are macOS-only.");
+        }
+        // The work root carries the inherited read entry setup gives it; nothing in the cache may inherit it, at any depth.
+        Chmod("+a", "user:nobody allow list,search,read,readattr,readextattr,readsecurity,file_inherit,directory_inherit", _root);
+        var zip = Zip(("a/b/c/deep.h", "deep", 0x81A4), ("a/b/run", "#!/bin/sh", 0x81ED), ("x/", null, 0x41ED));
+        _server.Serve("https://files.example/nested.zip", zip);
+        var tar = TarGz(File("p/q/r/deep.txt", "deep"), new PaxTarEntry(TarEntryType.Directory, "p/empty/"));
+        _server.Serve("https://files.example/nested.tar.gz", tar);
+
+        var fromZip = await Fetcher().EnsureAsync(Artifact("https://files.example/nested.zip", zip, ArtifactUnpack.Zip), null, CancellationToken.None);
+        var fromTar = await Fetcher().EnsureAsync(Artifact("https://files.example/nested.tar.gz", tar, ArtifactUnpack.TarGz), null, CancellationToken.None);
+
+        var directory = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+            | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
+        var file = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead;
+        foreach (var content in new[] { fromZip, fromTar })
+        {
+            var entry = Path.GetDirectoryName(content)!;
+            Assert.Null(WorktreeWriters.Inside(entry, Environment.UserName, WorktreeWriters.NativeAcl, CancellationToken.None));
+            foreach (var path in Directory.EnumerateFileSystemEntries(entry, "*", SearchOption.AllDirectories).Prepend(entry))
+            {
+                Assert.Null(WorktreeWriters.NativeAcl(path));
+            }
+        }
+        foreach (var nested in new[] { "a", "a/b", "a/b/c", "x" })
+        {
+            Assert.Equal(directory, System.IO.File.GetUnixFileMode(Path.Combine(fromZip, nested)));
+        }
+        foreach (var nested in new[] { "p", "p/q", "p/q/r", "p/empty" })
+        {
+            Assert.Equal(directory, System.IO.File.GetUnixFileMode(Path.Combine(fromTar, nested)));
+        }
+        Assert.Equal(file, System.IO.File.GetUnixFileMode(Path.Combine(fromZip, "a/b/c/deep.h")));
+        Assert.Equal(directory, System.IO.File.GetUnixFileMode(Path.Combine(fromZip, "a/b/run"))); // executable: 0755
+        Assert.Equal(file, System.IO.File.GetUnixFileMode(Path.Combine(fromTar, "p/q/r/deep.txt")));
     }
 
     private static void Chmod(params string[] args)

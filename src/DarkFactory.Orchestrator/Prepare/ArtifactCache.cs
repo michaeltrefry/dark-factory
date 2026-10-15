@@ -4,11 +4,19 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using DarkFactory.Orchestrator.Worker;
+using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.Orchestrator.Prepare;
 
-/// <summary>An artifact could not be fetched, verified, unpacked or cached; the message says why (never a pass: the gate's check is an <c>error</c>).</summary>
-public sealed class ArtifactFetchException(string message, Exception? inner = null) : Exception(message, inner);
+/// <summary>
+/// An artifact could not be fetched, verified, unpacked or cached; the message says why (never a pass: the gate's check is an
+/// <c>error</c>). <see cref="WorkerMessage"/> is what a worker session's <c>factory-prepare</c> is told: the same, except where the
+/// full message holds what the served bytes were (their SHA-256), which stays on the ledger and in the gate's result.
+/// </summary>
+public sealed class ArtifactFetchException(string message, Exception? inner = null, string? workerMessage = null) : Exception(message, inner)
+{
+    public string WorkerMessage { get; } = workerMessage ?? message;
+}
 
 /// <summary>One file or directory of a cached artifact's content: its path ('/'-separated, relative to the content), and for a file its size, SHA-256 and whether it is executable.</summary>
 public sealed record CachedEntry(
@@ -34,8 +42,13 @@ public sealed record CacheManifest(
 /// <c>0755</c> and every file <c>0644</c> (<c>0755</c> when the archive marked it executable). Before an entry is used it is verified
 /// whole (<see cref="TryGetAsync"/>): the root still read-only, nothing in the entry writable by anyone but the owner (the mode bits
 /// and every entry's own ACL, <see cref="WorktreeWriters"/>), no link anywhere, and the content exactly its manifest — every path,
-/// size and SHA-256 (and for an artifact kept as downloaded, the SHA-256 the recipe pins). An entry that fails is deleted and
-/// fetched again; a partial one (no manifest) is never used. Only downloads are cached: nothing a build makes ever is.
+/// size and SHA-256 (and for an artifact kept as downloaded, the SHA-256 the recipe pins). An entry that definitely fails (a
+/// mismatch) is deleted and fetched again; one that cannot be read to tell is an error and is left as it is; a partial one (no
+/// manifest) is never used. A verified entry is not hashed again by the same cache while its manifest is the same file
+/// (<see cref="Verifications"/>): the root and every entry are the owner's alone to write, and an entry is replaced only by a new
+/// manifest. The root's set-up failing is the factory's failure (<see cref="FactoryUnavailableException"/>), never an item's. Each
+/// cache's first use sweeps the leftovers of downloads and stores that died (older than <see cref="ArtifactFetcher.DefaultTimeout"/>).
+/// Only downloads are cached: nothing a build makes ever is.
 /// </summary>
 public sealed class ArtifactCache(string root)
 {
@@ -53,6 +66,12 @@ public sealed class ArtifactCache(string root)
     private readonly SemaphoreSlim _rootOnce = new(1, 1);
     private bool _rootReady;
 
+    /// <summary>Entries this cache verified in full, by entry directory: the manifest's identity when it was (its modification time and length).</summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (long Ticks, long Length, string Path)> _verified = new(StringComparer.Ordinal);
+
+    /// <summary>How many full verifications (every file hashed) this cache made: a test's count.</summary>
+    internal int Verifications;
+
     /// <summary>The entry directory of <paramref name="artifact"/>.</summary>
     public string EntryOf(PrepareArtifact artifact) => System.IO.Path.Combine(root, $"{artifact.Sha256}-{UnpackName(artifact.Unpack)}");
 
@@ -65,7 +84,11 @@ public sealed class ArtifactCache(string root)
         _ => throw new ArgumentOutOfRangeException(nameof(unpack)),
     };
 
-    /// <summary>Makes the root (once per instance) and opens it read-only to all, then checks it reads back so.</summary>
+    /// <summary>
+    /// Makes the root (once per instance), opens it read-only to all and sweeps the stale leftovers in it, then checks it reads back
+    /// read-only. A root that cannot be made, opened or read back so is the factory's failure (<see cref="FactoryUnavailableException"/>:
+    /// no item's), as any broken set-up is.
+    /// </summary>
     public async Task EnsureRootAsync(CancellationToken ct)
     {
         await _rootOnce.WaitAsync(ct);
@@ -73,8 +96,16 @@ public sealed class ArtifactCache(string root)
         {
             if (!_rootReady)
             {
-                System.IO.Directory.CreateDirectory(root);
-                await WorkerSandbox.OpenReadOnlyToAllAsync(root, ct);
+                try
+                {
+                    System.IO.Directory.CreateDirectory(root);
+                    await WorkerSandbox.OpenReadOnlyToAllAsync(root, ct);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException and not OutOfMemoryException)
+                {
+                    throw new FactoryUnavailableException($"the artifact cache {root} cannot be made read-only to every user: {ex.Message}", ex);
+                }
+                SweepStale(DateTime.UtcNow - ArtifactFetcher.DefaultTimeout);
                 _rootReady = true;
             }
         }
@@ -82,9 +113,45 @@ public sealed class ArtifactCache(string root)
         {
             _rootOnce.Release();
         }
-        if (await RootProblemAsync(ct) is { } problem)
+        string? problem;
+        try
         {
-            throw new ArtifactFetchException($"the artifact cache {root} {problem}");
+            problem = await RootProblemAsync(ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException and not OutOfMemoryException)
+        {
+            throw new FactoryUnavailableException($"the artifact cache {root} cannot be read back: {ex.Message}", ex);
+        }
+        if (problem is not null)
+        {
+            throw new FactoryUnavailableException($"the artifact cache {root} {problem}", new InvalidOperationException(problem));
+        }
+    }
+
+    /// <summary>
+    /// Deletes the downloads (<c>.download-*</c>) and stores (<c>.partial-*</c>) left in the root by a process that died, last written
+    /// before <paramref name="before"/> (a download is bounded by <see cref="ArtifactFetcher.DefaultTimeout"/>, so one that old is no
+    /// live fetch's). Each is the owner's, and nothing else can write the root.
+    /// </summary>
+    internal void SweepStale(DateTime before)
+    {
+        IEnumerable<FileSystemInfo> leftovers;
+        try
+        {
+            leftovers = new DirectoryInfo(root).EnumerateFileSystemInfos()
+                .Where(i => i.Name.StartsWith(".download-", StringComparison.Ordinal) || i.Name.StartsWith(".partial-", StringComparison.Ordinal))
+                .ToList();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return;
+        }
+        foreach (var leftover in leftovers)
+        {
+            if (leftover.LastWriteTimeUtc < before)
+            {
+                Delete(leftover.FullName);
+            }
         }
     }
 
@@ -106,7 +173,8 @@ public sealed class ArtifactCache(string root)
 
     /// <summary>
     /// The path <c>${artifact:…}</c> names for <paramref name="artifact"/> — its file (kept as downloaded) or its content directory
-    /// (unpacked) — when the cache holds a verified, complete entry; null otherwise (an entry that fails verification is deleted).
+    /// (unpacked) — when the cache holds a verified, complete entry; null otherwise (an entry that definitely fails verification is
+    /// deleted). An entry that cannot be read to tell throws <see cref="ArtifactFetchException"/> and is left as it is.
     /// </summary>
     public async Task<string?> TryGetAsync(PrepareArtifact artifact, CancellationToken ct)
     {
@@ -116,9 +184,20 @@ public sealed class ArtifactCache(string root)
         {
             return null;
         }
-        if (Verify(artifact, entry, ct) is { } path)
+        return Checked(artifact, entry, ct);
+    }
+
+    /// <summary><see cref="Verify"/>'s answer acted on: the path; null after deleting a mismatch; an unreadable entry thrown, not deleted.</summary>
+    private string? Checked(PrepareArtifact artifact, string entry, CancellationToken ct)
+    {
+        var verified = Verify(artifact, entry, ct);
+        if (verified.Path is { } path)
         {
             return path;
+        }
+        if (verified.Unreadable is { } why)
+        {
+            throw new ArtifactFetchException($"the cached {artifact.Name} ({entry}) could not be read to verify it, so it was neither used nor deleted: {why}");
         }
         Delete(entry);
         return null;
@@ -169,14 +248,19 @@ public sealed class ArtifactCache(string root)
             catch (IOException) when (System.IO.Directory.Exists(entry))
             {
                 // Another fetch of the same artifact won the race: its entry is used if it verifies, else replaced.
-                if (Verify(artifact, entry, ct) is { } theirs)
+                if (Checked(artifact, entry, ct) is { } theirs)
                 {
                     return theirs;
                 }
-                Delete(entry);
                 System.IO.Directory.Move(partial, entry);
             }
-            return Verify(artifact, entry, ct) ?? throw new ArtifactFetchException($"the cached {artifact.Name} did not verify after it was written");
+            _verified.TryRemove(entry, out _);
+            return Verify(artifact, entry, ct) switch
+            {
+                { Path: { } path } => path,
+                { Unreadable: { } why } => throw new ArtifactFetchException($"the cached {artifact.Name} could not be read back after it was written: {why}"),
+                _ => throw new ArtifactFetchException($"the cached {artifact.Name} did not verify after it was written"),
+            };
         }
         finally
         {
@@ -187,50 +271,86 @@ public sealed class ArtifactCache(string root)
         }
     }
 
+    /// <summary>What <see cref="Verify"/> found: the entry's <see cref="Path"/>; or, both null, a definite mismatch; or why it could not be read to tell.</summary>
+    internal sealed record Verified(string? Path, string? Unreadable)
+    {
+        public static readonly Verified Mismatch = new(null, null);
+    }
+
+    /// <summary>A link found in an entry: a definite mismatch (nothing cached holds one), not a read failure.</summary>
+    private sealed class LinkInEntryException(string message) : IOException(message);
+
     /// <summary>
-    /// The path of a complete, unchanged entry, or null: no link in it, nothing in it writable by anyone but the owner, its manifest
-    /// for this SHA-256 and layout, and its content exactly the manifest (every path, size and hash).
+    /// A complete, unchanged entry's path, or a definite mismatch — a link in it, anything in it writable by anyone but the owner,
+    /// no manifest or one that is not this SHA-256's and layout's, content other than the manifest (a path, size or hash) — or why it
+    /// could not be read to tell (an I/O failure: the entry is then left as it is). An entry this cache verified in full is not
+    /// hashed again while its manifest is the same file (modification time and length; .NET exposes no inode): only the owner writes
+    /// the root and its entries, and an entry is replaced only with a new manifest.
     /// </summary>
-    internal string? Verify(PrepareArtifact artifact, string entry, CancellationToken ct)
+    internal Verified Verify(PrepareArtifact artifact, string entry, CancellationToken ct)
     {
         try
         {
             var info = new DirectoryInfo(entry);
             if (!info.Exists || info.LinkTarget is not null || (info.UnixFileMode & (UnixFileMode.GroupWrite | UnixFileMode.OtherWrite)) != 0)
             {
-                return null;
+                return Verified.Mismatch;
             }
+            var manifestPath = System.IO.Path.Combine(entry, ManifestName);
+            var manifestInfo = new FileInfo(manifestPath);
+            if (manifestInfo is not { Exists: true, LinkTarget: null })
+            {
+                return Verified.Mismatch;
+            }
+            if (_verified.TryGetValue(entry, out var known) && known.Ticks == manifestInfo.LastWriteTimeUtc.Ticks && known.Length == manifestInfo.Length)
+            {
+                return new Verified(known.Path, null);
+            }
+            Interlocked.Increment(ref Verifications);
             if (WorktreeWriters.NativeAcl(entry) is { } ownAcl && WorktreeWriters.AclWriter(ownAcl, Environment.UserName) is not null)
             {
-                return null;
+                return Verified.Mismatch;
             }
             if (WorktreeWriters.Inside(entry, Environment.UserName, WorktreeWriters.NativeAcl, ct) is not null)
             {
-                return null;
+                return Verified.Mismatch;
             }
-            var manifestPath = System.IO.Path.Combine(entry, ManifestName);
-            if (new FileInfo(manifestPath) is not { Exists: true, LinkTarget: null } || JsonSerializer.Deserialize<CacheManifest>(File.ReadAllText(manifestPath)) is not { } manifest
+            if (JsonSerializer.Deserialize<CacheManifest>(File.ReadAllText(manifestPath)) is not { } manifest
                 || manifest.Sha256 != artifact.Sha256 || manifest.Unpack != UnpackName(artifact.Unpack) || manifest.Entries is null)
             {
-                return null;
+                return Verified.Mismatch;
             }
             var content = System.IO.Path.Combine(entry, ContentName);
             var actual = Walk(content, ct);
             if (!actual.SequenceEqual(manifest.Entries))
             {
-                return null;
+                return Verified.Mismatch;
             }
+            string? path;
             if (artifact.Unpack == ArtifactUnpack.None)
             {
-                return manifest.File is { } file && actual is [{ Directory: false } only] && only.Path == file && only.Sha256 == artifact.Sha256
+                path = manifest.File is { } file && actual is [{ Directory: false } only] && only.Path == file && only.Sha256 == artifact.Sha256
                     ? System.IO.Path.Combine(content, file)
                     : null;
             }
-            return content;
+            else
+            {
+                path = content;
+            }
+            if (path is null)
+            {
+                return Verified.Mismatch;
+            }
+            _verified[entry] = (manifestInfo.LastWriteTimeUtc.Ticks, manifestInfo.Length, path);
+            return new Verified(path, null);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        catch (Exception ex) when (ex is LinkInEntryException or JsonException or NotSupportedException)
         {
-            return null;
+            return Verified.Mismatch;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return new Verified(null, $"{ex.GetType().Name}: {ex.Message}");
         }
     }
 
@@ -247,7 +367,7 @@ public sealed class ArtifactCache(string root)
                 var relative = System.IO.Path.GetRelativePath(content, item.FullName).Replace(System.IO.Path.DirectorySeparatorChar, '/');
                 if (item.Attributes.HasFlag(FileAttributes.ReparsePoint) || item.LinkTarget is not null)
                 {
-                    throw new IOException($"{relative} is a link");
+                    throw new LinkInEntryException($"{relative} is a link");
                 }
                 if (item is DirectoryInfo)
                 {
@@ -435,8 +555,9 @@ public sealed class ArtifactCache(string root)
     }
 
     /// <summary>Deletes an entry or partial directory owner-side: every directory in it is the owner's and no one else can write it, so nothing in it was made by another user; links are removed, never followed.</summary>
-    private static void Delete(string path)
+    private void Delete(string path)
     {
+        _verified.TryRemove(path, out _);
         try
         {
             if (new FileInfo(path) is { LinkTarget: not null } link)

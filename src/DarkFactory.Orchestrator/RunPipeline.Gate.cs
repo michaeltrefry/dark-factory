@@ -1216,14 +1216,30 @@ public sealed partial class RunPipeline
         {
             return (null, null);
         }
+        // The PR's changes are read once (the clone fetched once) and handed to the check (sc-26232): a fetch that fails is the
+        // check's error with the reason it always had.
+        IReadOnlyList<ChangedFile> changes;
+        try
+        {
+            changes = await runner.ChangesAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException and not FactoryUnavailableException)
+        {
+            return (null, NewTestsResult.Without(pull.BaseSha, pull.HeadSha, NewTestsOutcome.Error, $"the new tests could not be run: {ex.Message}"));
+        }
         await using var watch = new TestRunWatch(_controls, _controlPoll, run.Item, log, _maxControlReadFailures, ct);
         try
         {
+            // Bounded by Gate:TestTimeoutMinutes (the stage's own timeout): a download that hangs is the check's error, not a hang.
             var prepared = await stage.ForCommitsAsync(runner, run.Repo, pull.BaseSha, pull.HeadSha, async (download, c) =>
             {
                 await ledger.CheckpointAsync(run.Item, Steps.ArtifactFetch, null, download.ToDetail(), c);
                 log.WriteLine($"[gate] {download.ToDetail()}");
-            }, watch.Token);
+            }, watch.Token, changes);
+            if (prepared.Note is { } note)
+            {
+                log.WriteLine($"[gate] {note}");
+            }
             return (prepared, null);
         }
         catch (Exception) when (watch.Requested is { } requested && !ct.IsCancellationRequested)

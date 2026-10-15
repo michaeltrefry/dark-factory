@@ -49,32 +49,81 @@ public static class SafeFile
                     ? new(null, $"cannot be opened (errno {errno})")
                     : SafeFileRead.Missing;
             }
-            using var handle = new SafeFileHandle(fd, ownsHandle: true);
-            using var stream = new FileStream(handle, FileAccess.Read, bufferSize: 1);
-            if (!stream.CanSeek)
-            {
-                return new(null, "is not a regular file"); // a FIFO or socket
-            }
-            var buffer = new byte[MaxBytes + 1];
-            var total = 0;
-            int read;
-            while (total < buffer.Length && (read = stream.Read(buffer, total, buffer.Length - total)) > 0)
-            {
-                total += read;
-            }
-            if (total > MaxBytes)
-            {
-                return new(null, $"is larger than {MaxBytes} bytes");
-            }
-            // A UTF-8 byte order mark is not text: JSON parsers (Claude Code's included) skip it, so it must not make the file unreadable.
-            var start = total >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF ? 3 : 0;
-            return new(new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true).GetString(buffer, start, total - start), null);
+            return ReadOpened(fd);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OutOfMemoryException or DecoderFallbackException
             or NotSupportedException or ArgumentException)
         {
             return new(null, $"cannot be read ({ex.GetType().Name})");
         }
+    }
+
+    /// <summary>
+    /// <paramref name="name"/> in <paramref name="directory"/>, read like <see cref="Read"/> but through the directory's own descriptor
+    /// (sc-26232): the directory is opened with <c>O_DIRECTORY | O_NOFOLLOW</c> — a link put in its place, before or after any check
+    /// the caller made, fails the open — and the file with <c>openat</c> from that descriptor (<c>O_NOFOLLOW | O_NONBLOCK</c>), so a
+    /// directory swapped for a link between a check and the read is never followed out of the tree. Only <paramref name="directory"/>'s
+    /// parents are trusted (the caller's own). A directory or file that does not exist is <see cref="SafeFileRead.Missing"/>.
+    /// </summary>
+    public static SafeFileRead ReadAt(string directory, string name)
+    {
+        if (name.Length == 0 || name.Contains('/') || name is "." or "..")
+        {
+            throw new ArgumentException("a plain file name is required", nameof(name));
+        }
+        try
+        {
+            var directoryFd = open(directory, DirectoryFlags(OperatingSystem.IsMacOS(), OperatingSystem.IsLinux(), RuntimeInformation.ProcessArchitecture));
+            if (directoryFd < 0)
+            {
+                var errno = Marshal.GetLastPInvokeError();
+                return errno == ENOENT ? SafeFileRead.Missing : new(null, $"is in a directory that cannot be opened without following a link (errno {errno})");
+            }
+            using var directoryHandle = new SafeFileHandle(directoryFd, ownsHandle: true);
+            var fd = openat(directoryFd, name, OpenFlags());
+            if (fd < 0)
+            {
+                var errno = Marshal.GetLastPInvokeError();
+                return errno == ENOENT ? SafeFileRead.Missing
+                    : errno == ELOOP ? new(null, "is a symlink")
+                    : new(null, $"cannot be opened (errno {errno})");
+            }
+            return ReadOpened(fd);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OutOfMemoryException or DecoderFallbackException
+            or NotSupportedException)
+        {
+            return new(null, $"cannot be read ({ex.GetType().Name})");
+        }
+    }
+
+    private const int ENOENT = 2;
+
+    private static int ELOOP => OperatingSystem.IsMacOS() ? 62 : 40;
+
+    /// <summary>Reads an open descriptor (owned from here on) as <see cref="Read"/> does: a regular file of at most <see cref="MaxBytes"/>.</summary>
+    private static SafeFileRead ReadOpened(int fd)
+    {
+        using var handle = new SafeFileHandle(fd, ownsHandle: true);
+        using var stream = new FileStream(handle, FileAccess.Read, bufferSize: 1);
+        if (!stream.CanSeek)
+        {
+            return new(null, "is not a regular file"); // a FIFO or socket
+        }
+        var buffer = new byte[MaxBytes + 1];
+        var total = 0;
+        int read;
+        while (total < buffer.Length && (read = stream.Read(buffer, total, buffer.Length - total)) > 0)
+        {
+            total += read;
+        }
+        if (total > MaxBytes)
+        {
+            return new(null, $"is larger than {MaxBytes} bytes");
+        }
+        // A UTF-8 byte order mark is not text: JSON parsers (Claude Code's included) skip it, so it must not make the file unreadable.
+        var start = total >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF ? 3 : 0;
+        return new(new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true).GetString(buffer, start, total - start), null);
     }
 
     private static int OpenFlags() => OpenFlags(OperatingSystem.IsMacOS(), OperatingSystem.IsLinux(), RuntimeInformation.ProcessArchitecture);
@@ -101,6 +150,28 @@ public static class SafeFile
         }
         throw new PlatformNotSupportedException("SafeFile reads only on macOS and Linux.");
     }
+
+    /// <summary><c>O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC</c> for the platform (as <see cref="OpenFlags(bool, bool, Architecture)"/>: anything else throws).</summary>
+    internal static int DirectoryFlags(bool macOS, bool linux, Architecture architecture)
+    {
+        if (macOS)
+        {
+            return 0x100000 | 0x100 | 0x1000000;
+        }
+        if (linux)
+        {
+            return architecture switch
+            {
+                Architecture.X64 => 0x10000 | 0x20000 | 0x80000,
+                Architecture.Arm64 or Architecture.Arm => 0x4000 | 0x8000 | 0x80000,
+                _ => throw new PlatformNotSupportedException($"SafeFile has no open flags for Linux on {architecture}."),
+            };
+        }
+        throw new PlatformNotSupportedException("SafeFile reads only on macOS and Linux.");
+    }
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int openat(int directoryFd, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, int flags);
 
     [DllImport("libc", SetLastError = true)]
     private static extern int open([MarshalAs(UnmanagedType.LPUTF8Str)] string path, int flags);

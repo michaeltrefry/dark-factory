@@ -69,16 +69,6 @@ public sealed record PrepareRecipe(IReadOnlyList<PrepareArtifact> Artifacts, IRe
 
     public const int MaxTimeoutMinutes = 120;
 
-    /// <summary>
-    /// Programs a step may not run (by base name): the raw downloaders and remote shells. An artifact is declared and fetched by the
-    /// harness (hash-pinned, owner-side), not by a step. Not a containment boundary: a step runs build code (a script, a compiler
-    /// plugin) that can reach the network as the sandbox user, as <c>cargo build</c> or <c>swift build</c> can — CLAUDE.md's residual.
-    /// </summary>
-    public static readonly IReadOnlySet<string> RefusedPrograms = new HashSet<string>(StringComparer.Ordinal)
-    {
-        "curl", "wget", "nc", "ncat", "netcat", "socat", "ssh", "scp", "sftp", "rsync", "ftp", "tftp", "telnet", "gh", "aria2c",
-        "http", "https", "xh", "lynx", "links", "w3m", "sudo", "su",
-    };
 
     /// <summary>Variables a step may not set: the ones the launch helper owns, the loader's, the shells' and the router's.</summary>
     private static readonly HashSet<string> RefusedVariables = new(StringComparer.Ordinal)
@@ -243,7 +233,10 @@ public sealed record PrepareRecipe(IReadOnlyList<PrepareArtifact> Artifacts, IRe
     /// <summary>
     /// Why <paramref name="program"/> is not a program a step may run, as an exception: it must be an absolute path with no
     /// <c>..</c>, a placeholder followed by such a path (<c>${artifact:sdk}/bin/tool</c>, <c>${worktree}/tools/gen</c>), or a plain
-    /// name resolved on the launch helper's fixed PATH; never a refused downloader (<see cref="RefusedPrograms"/>).
+    /// name resolved on the launch helper's fixed PATH. Which program it is, is not judged: a step may run any program (a shell, an
+    /// interpreter, a build tool) and so reach the network as the sandbox user, as <c>cargo build</c> or <c>swift build</c> can — no
+    /// list of programs could stop that, so none is kept (CLAUDE.md's residual). An artifact is declared so that the harness fetches
+    /// it hash-pinned; a step that downloads anything itself is the recipe's own, reviewed code.
     /// </summary>
     private static void ProgramProblem(string program, string where)
     {
@@ -259,10 +252,6 @@ public sealed record PrepareRecipe(IReadOnlyList<PrepareArtifact> Artifacts, IRe
         if (program.Contains('=', StringComparison.Ordinal) || program.Split('/').Any(s => s is ".." or "."))
         {
             throw Fail($"{where} may hold no '=' and no '.' or '..' path segment: '{program}'");
-        }
-        if (RefusedPrograms.Contains(program.Split('/')[^1]))
-        {
-            throw Fail($"{where}: a step may not run {program.Split('/')[^1]}; declare what it would download as an artifact (the harness fetches it, hash-pinned)");
         }
     }
 

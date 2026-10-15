@@ -105,12 +105,13 @@ public sealed class WorkerPrepareTests : IDisposable
     public async Task A_recipe_the_owner_refuses_a_failing_step_and_a_missing_spool_or_recipe_each_end_factory_prepare_with_its_status()
     {
         var prepare = Prepare();
-        var refused = Worktree("version: 1\nsteps: [{name: a, argv: [curl, x]}]\n");
+        var refused = Worktree("version: 1\nsteps: [{name: a, argv: [make], shell: true}]\n");
         await using (var session = await prepare.OpenAsync(refused, null, null, CancellationToken.None))
         {
             var (exit, stderr) = await RunScriptAsync(refused, "--spool", session.Directory, "--wait", "30");
             Assert.Equal(1, exit);
-            Assert.Contains("the factory refused: .factory/prepare.yaml: steps[0].argv[0]: a step may not run curl", stderr);
+            Assert.Contains("the factory refused: .factory/prepare.yaml", stderr);
+            Assert.Contains("unknown key 'shell'", stderr);
         }
 
         var failing = Worktree("version: 1\nsteps: [{name: boom, argv: [/bin/sh, -c, 'exit 7']}, {name: never, argv: [/usr/bin/touch, never]}]\n");
@@ -239,8 +240,129 @@ public sealed class WorkerPrepareTests : IDisposable
         Assert.StartsWith("fetched data https://files.example/a.txt", fetched.Detail);
         Assert.Single(_server.Requests);
         Assert.Empty(Directory.EnumerateDirectories(WorkerPrepare.SpoolRootOf(_root))); // removed with the session
-        // A fix round's session of a worktree with no recipe is told nothing (E7): only sessions that have one are.
-        Assert.All(h.WorkerCalls.Skip(1), c => Assert.DoesNotContain("factory-prepare", c.Prompt));
+    }
+
+    [Fact]
+    public async Task With_worker_prepare_a_session_of_a_worktree_without_a_recipe_still_gets_its_spool_and_can_add_one()
+    {
+        var (recipe, _) = RecipeWithArtifact("  - name: a\n    argv: [/usr/bin/true]\n");
+        var h = new GatePipelineTests.Harness { WorkerPrepare = Prepare() };
+        h.Workspaces.Root = Path.Combine(_root, "worktrees");
+        var worktree = Path.Combine(h.Workspaces.Root, "factory", "sc-77");
+        Directory.CreateDirectory(worktree);
+        string? answer = null;
+        h.WorkerOverrides[0] = async call =>
+        {
+            // The session adds the recipe itself, then asks: the spool was there from the start.
+            Directory.CreateDirectory(Path.Combine(worktree, PrepareRecipe.Directory));
+            File.WriteAllText(Path.Combine(worktree, PrepareRecipe.Path), recipe);
+            var spool = System.Text.RegularExpressions.Regex.Match(call.Prompt, "--spool (\\S+)`").Groups[1].Value;
+            File.WriteAllText(Path.Combine(spool, "request-1"), $"{WorkerPrepare.RequestHeader}\n{worktree}\n{WorkerPrepare.RequestEnd}\n");
+            for (var i = 0; i < 400 && answer is null; i++)
+            {
+                await Task.Delay(25);
+                answer = File.Exists(Path.Combine(spool, "response-1")) ? File.ReadAllText(Path.Combine(spool, "response-1")) : null;
+            }
+            return await GatePipelineTests.ReportsModel(GatePipelineTests.ImplementerModel)(call);
+        };
+
+        var outcome = await h.Run();
+
+        Assert.True(outcome.Succeeded, outcome.Error);
+        Assert.Contains("or once you add one", h.WorkerCalls[0].Prompt);
+        Assert.StartsWith($"ok\0{PrepareSteps.PlanHeader}\0", answer);
+        // Nothing to prefetch before the session; the session's own request downloaded it, recorded once the session ended.
+        var fetched = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.ArtifactFetch);
+        Assert.StartsWith("fetched data https://files.example/a.txt", fetched.Detail);
+    }
+
+    [Fact]
+    public async Task A_workers_request_is_never_told_the_served_hash_but_the_ledger_gets_the_full_reason()
+    {
+        _server.Serve("https://files.example/a.txt", "tampered"u8.ToArray());
+        var pinned = ArtifactFetchTests.Sha256("artifact text\n"u8.ToArray());
+        var served = ArtifactFetchTests.Sha256("tampered"u8.ToArray());
+        var worktree = Worktree($"version: 1\nartifacts: [{{name: data, url: 'https://files.example/a.txt', sha256: {pinned}, max_bytes: 1000}}]\nsteps: [{{name: a, argv: [/usr/bin/true]}}]\n");
+        var failures = new List<string>();
+        var session = await Prepare(TimeSpan.FromHours(1)).OpenAsync(worktree, null, null, CancellationToken.None, failures.Add);
+        await using (session)
+        {
+            File.WriteAllText(Path.Combine(session.Directory, "request-1"), $"{WorkerPrepare.RequestHeader}\n{worktree}\n{WorkerPrepare.RequestEnd}\n");
+            await session.PollOnceAsync(CancellationToken.None);
+
+            var answer = File.ReadAllText(Path.Combine(session.Directory, "response-1"));
+            Assert.Equal($"error\0artifact data: https://files.example/a.txt does not match the pinned sha256 {pinned}; nothing was cached\0", answer);
+            Assert.DoesNotContain(served, answer);
+            Assert.Contains(served, Assert.Single(failures));
+        }
+
+        // Through the pipeline the full reason is on the ledger, as a failed artifact-fetch row.
+        var h = new GatePipelineTests.Harness { WorkerPrepare = Prepare() };
+        h.Workspaces.Root = Path.Combine(_root, "worktrees");
+        var tree = Path.Combine(h.Workspaces.Root, "factory", "sc-77");
+        Directory.CreateDirectory(tree);
+        h.WorkerOverrides[0] = async call =>
+        {
+            Directory.CreateDirectory(Path.Combine(tree, PrepareRecipe.Directory));
+            File.WriteAllText(Path.Combine(tree, PrepareRecipe.Path), File.ReadAllText(Path.Combine(worktree, PrepareRecipe.Path)));
+            var spool = System.Text.RegularExpressions.Regex.Match(call.Prompt, "--spool (\\S+)`").Groups[1].Value;
+            File.WriteAllText(Path.Combine(spool, "request-1"), $"{WorkerPrepare.RequestHeader}\n{tree}\n{WorkerPrepare.RequestEnd}\n");
+            for (var i = 0; i < 400 && !File.Exists(Path.Combine(spool, "response-1")); i++)
+            {
+                await Task.Delay(25);
+            }
+            return await GatePipelineTests.ReportsModel(GatePipelineTests.ImplementerModel)(call);
+        };
+        var outcome = await h.Run();
+        Assert.True(outcome.Succeeded, outcome.Error);
+        var row = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.ArtifactFetch);
+        Assert.StartsWith("failed: artifact data", row.Detail);
+        Assert.Contains($"has SHA-256 {served}", row.Detail);
+    }
+
+    [Fact]
+    public async Task A_session_is_answered_with_a_fetch_at_most_twenty_times_and_with_an_error_after()
+    {
+        var worktree = Worktree("version: 1\nsteps: [{name: a, argv: [/usr/bin/true]}]\n");
+        await using var session = await Prepare(TimeSpan.FromHours(1)).OpenAsync(worktree, null, null, CancellationToken.None);
+        for (var i = 1; i <= WorkerPrepare.MaxRequestsPerSession + 2; i++)
+        {
+            File.WriteAllText(Path.Combine(session.Directory, $"request-{i:00}"), $"{WorkerPrepare.RequestHeader}\n{worktree}\n{WorkerPrepare.RequestEnd}\n");
+        }
+
+        await session.PollOnceAsync(CancellationToken.None);
+
+        Assert.Equal(20, WorkerPrepare.MaxRequestsPerSession);
+        Assert.Equal((22, 20), (session.Answered, session.Fetched));
+        Assert.StartsWith("ok\0", File.ReadAllText(Path.Combine(session.Directory, "response-20")));
+        foreach (var late in new[] { "response-21", "response-22" })
+        {
+            Assert.Equal("error\0this session has already asked 20 times, the most a session may: nothing more is fetched for it\0",
+                File.ReadAllText(Path.Combine(session.Directory, late)));
+        }
+    }
+
+    [Fact]
+    public void A_dot_factory_swapped_for_a_link_between_the_check_and_the_read_is_never_followed()
+    {
+        var outside = Directory.CreateDirectory(Path.Combine(_root, "outside")).FullName;
+        File.WriteAllText(Path.Combine(outside, "prepare.yaml"), "version: 1\nsteps: [{name: planted, argv: [make]}]\n");
+        var worktree = Worktree("version: 1\nsteps: [{name: own, argv: [make]}]\n");
+        var real = Path.Combine(worktree, PrepareRecipe.Directory);
+
+        // After the check found a real directory: the worker moves it aside and puts a link to the outside in its place.
+        var (recipe, why) = WorkerPrepare.ReadRecipe(worktree, () =>
+        {
+            Directory.Move(real, real + "-moved");
+            Directory.CreateSymbolicLink(real, outside);
+        });
+
+        Assert.Null(recipe);
+        Assert.StartsWith($"{PrepareRecipe.Path} is in a directory that cannot be opened without following a link", why);
+        // Unswapped, the same read finds the worktree's own recipe.
+        Directory.Delete(real);
+        Directory.Move(real + "-moved", real);
+        Assert.Equal("own", WorkerPrepare.ReadRecipe(worktree).Recipe!.Steps[0].Name);
     }
 
     [Fact]

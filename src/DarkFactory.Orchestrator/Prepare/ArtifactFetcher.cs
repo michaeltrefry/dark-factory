@@ -68,12 +68,23 @@ public sealed class ArtifactFetcher(HttpClient http, IArtifactResolver resolver,
             }
             finally
             {
-                File.Delete(temp);
+                try
+                {
+                    File.Delete(temp);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Left behind: swept by the next cache's first use once it is older than a download can take.
+                }
             }
         }
         catch (ArtifactFetchException)
         {
             throw;
+        }
+        catch (WorkSources.FactoryUnavailableException)
+        {
+            throw; // the cache's root could not be set up: the factory's failure, never this artifact's (or an item's)
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -172,7 +183,8 @@ public sealed class ArtifactFetcher(HttpClient http, IArtifactResolver resolver,
             var sha = Convert.ToHexStringLower(hash.GetHashAndReset());
             if (sha != artifact.Sha256)
             {
-                throw new ArtifactFetchException($"artifact {artifact.Name}: {url} has SHA-256 {sha}, not the recipe's {artifact.Sha256}; nothing was cached");
+                throw new ArtifactFetchException($"artifact {artifact.Name}: {url} has SHA-256 {sha}, not the recipe's {artifact.Sha256}; nothing was cached",
+                    workerMessage: $"artifact {artifact.Name}: {url} does not match the pinned sha256 {artifact.Sha256}; nothing was cached");
             }
             return (total, Uri.UnescapeDataString(artifact.Url.Segments[^1]).TrimEnd('/'));
         }

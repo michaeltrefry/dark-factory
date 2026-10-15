@@ -527,8 +527,9 @@ public sealed partial class RunPipeline(
         public const string CodeGraphOverlay = "codegraph-overlay";
         /// <summary>
         /// One harness download of a prepare recipe's artifact (sc-26232): Detail <c>fetched &lt;name&gt; &lt;url&gt; sha256=&lt;hex&gt;
-        /// bytes=&lt;n&gt;</c> (outcome passed), or <c>failed: …</c> for a worker session's prefetch that could not fetch one (outcome
-        /// failed; the session still starts — its <c>factory-prepare</c> asks again). A cache hit writes none.
+        /// bytes=&lt;n&gt;</c> (outcome passed), or <c>failed: …</c> for a worker session's prefetch, or a request of its
+        /// <c>factory-prepare</c>, that could not fetch one (outcome failed; the full reason, the served bytes' hash included; the
+        /// session still starts, or goes on). A cache hit writes none.
         /// </summary>
         public const string ArtifactFetch = "artifact-fetch";
         /// <summary>Review: a reviewer's verdict on one head commit; Detail is the <see cref="Gate.ReviewVerdict"/> JSON.</summary>
@@ -1584,9 +1585,10 @@ public sealed partial class RunPipeline(
         string? session, Func<string?, string> prompt, HashSet<string> models, IReadOnlyList<string> inputTaints, string label, string modelClass,
         CancellationToken ct)
     {
-        // Worker:Prepare (sc-26232): an implementing session of a worktree with a prepare recipe gets its artifacts fetched first
-        // (owner-side, so most sessions never ask) and a request spool its factory-prepare asks through while it runs.
-        if (!implementing || _workerPrepare is not { } prepare || Prepare.WorkerPrepare.ReadRecipe(path) is (null, null))
+        // Worker:Prepare (sc-26232): every implementing session gets a request spool its factory-prepare asks through while it
+        // runs (named in its prompt: a session may add the recipe itself), and a worktree that has a recipe gets its artifacts
+        // fetched first (owner-side, so most sessions never ask).
+        if (!implementing || _workerPrepare is not { } prepare)
         {
             return await RunSessionCoreAsync(run, runner, path, mcpConfig, implementing, session, prompt, models, inputTaints, label, modelClass, ct);
         }
@@ -1600,13 +1602,14 @@ public sealed partial class RunPipeline(
             await ledger.CheckpointAsync(item, Steps.ArtifactFetch, session, $"failed: {failed}", ct);
             log.WriteLine($"[{label}] the prepare recipe's artifacts could not be fetched before the session (it can ask again): {failed}");
         }
-        // The spool's downloads happen while the session streams (and writes the ledger): they are recorded once it has ended.
-        var downloads = new System.Collections.Concurrent.ConcurrentQueue<Prepare.ArtifactDownloaded>();
+        // The spool's downloads and failures happen while the session streams (and writes the ledger): they are recorded once it
+        // has ended — a failure in full (the worker was told less: never the served bytes' hash).
+        var downloads = new System.Collections.Concurrent.ConcurrentQueue<string>();
         var spool = await prepare.OpenAsync(path, _slots?.Current, (download, _) =>
         {
-            downloads.Enqueue(download);
+            downloads.Enqueue(download.ToDetail());
             return Task.CompletedTask;
-        }, ct);
+        }, ct, why => downloads.Enqueue($"failed: {why}"));
         try
         {
             return await RunSessionCoreAsync(run, runner, path, mcpConfig, implementing, session, resume => prompt(resume) + Prepare.WorkerPrepare.Note(spool.Directory),
@@ -1615,15 +1618,15 @@ public sealed partial class RunPipeline(
         finally
         {
             await spool.DisposeAsync();
-            while (downloads.TryDequeue(out var download))
+            while (downloads.TryDequeue(out var detail))
             {
                 try
                 {
-                    await ledger.CheckpointAsync(item, Steps.ArtifactFetch, null, download.ToDetail(), CancellationToken.None);
+                    await ledger.CheckpointAsync(item, Steps.ArtifactFetch, null, detail, CancellationToken.None);
                 }
                 catch (Exception ex) when (ex is not OutOfMemoryException)
                 {
-                    log.WriteLine($"[{label}] could not record {download.ToDetail()}: {ex.Message}");
+                    log.WriteLine($"[{label}] could not record {detail}: {ex.Message}");
                 }
             }
         }

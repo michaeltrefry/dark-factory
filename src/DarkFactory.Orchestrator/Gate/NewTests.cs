@@ -433,12 +433,28 @@ public static class NewTestsCheck
     /// Each commit's prepare recipe steps (sc-26232; <see cref="Prepare.PreparedCommits"/>, artifacts already fetched owner-side): every
     /// run of a commit runs its own commit's steps — the base run and its retries the base's (the overlay applies only test files),
     /// the head run the head's — after the strategy's toolchain probes and before its restore. Null, or a commit with no recipe:
-    /// the runs are exactly as before (E7).
+    /// the runs are exactly as before (E7). Its <see cref="Prepare.PreparedCommits.Changes"/>, when it has them, are the PR's changes
+    /// already read (one fetch per check); its <see cref="Prepare.PreparedCommits.Note"/> (the base prepared with the head's recipe)
+    /// is added to the result's reason.
     /// </param>
     public static async Task<NewTestsResult> RunAsync(IGateTestRunner runner, IReadOnlyList<INewTestStrategy> strategies, RepoRef repo,
         string baseSha, string headSha, string runName, Action<string>? log, CancellationToken ct, Prepare.PreparedCommits? prepared = null)
     {
-        var changes = await runner.ChangesAsync(repo, baseSha, headSha, ct);
+        var result = await RunCoreAsync(runner, strategies, repo, baseSha, headSha, runName, log, ct, prepared);
+        return prepared?.Note is { } note ? result with { Reason = $"{result.Reason}; {note}" } : result;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="path"/> is under the prepare recipe's directory (<c>.factory/</c>, any case): never applied onto a base
+    /// run (sc-26232) — each commit is prepared by its own recipe, so the PR's recipe must not reach the base's worktree as a "test file".
+    /// </summary>
+    public static bool IsPrepareRecipePath(string path) =>
+        path.StartsWith(Prepare.PrepareRecipe.Directory + "/", StringComparison.OrdinalIgnoreCase);
+
+    private static async Task<NewTestsResult> RunCoreAsync(IGateTestRunner runner, IReadOnlyList<INewTestStrategy> strategies, RepoRef repo,
+        string baseSha, string headSha, string runName, Action<string>? log, CancellationToken ct, Prepare.PreparedCommits? prepared)
+    {
+        var changes = prepared?.Changes ?? await runner.ChangesAsync(repo, baseSha, headSha, ct);
         var source = new TestSource(runner, repo, baseSha, headSha);
         var found = new List<(INewTestStrategy Strategy, NewTestSet Set)>();
         foreach (var strategy in strategies)
@@ -474,9 +490,13 @@ public static class NewTestsCheck
         var results = new List<NewTestsResult>();
         foreach (var (strategy, set) in withTests)
         {
-            var overlay = set.TestFiles.Where(f => !f.Deleted).Select(f => f.NewPath!).Distinct(StringComparer.Ordinal).ToList();
+            // Nothing under .factory/ is applied onto the base (sc-26232): the base is prepared by its own recipe.
+            var overlay = set.TestFiles.Where(f => !f.Deleted).Select(f => f.NewPath!).Where(p => !IsPrepareRecipePath(p))
+                .Distinct(StringComparer.Ordinal).ToList();
             var deletes = set.TestFiles.Where(f => f.OldPath is not null && f.OldPath != f.NewPath).Select(f => f.OldPath!)
-                .Where(p => !overlay.Contains(p)).Distinct(StringComparer.Ordinal).ToList();
+                .Where(p => !overlay.Contains(p) && !IsPrepareRecipePath(p)).Distinct(StringComparer.Ordinal).ToList();
+            var baseReplacements = set.BaseReplacements.Where(r => !IsPrepareRecipePath(r.Key))
+                .ToDictionary(r => r.Key, r => r.Value, StringComparer.Ordinal);
             log?.Invoke($"{strategy.Name}: {set.Tests.Count} new test(s): {string.Join(", ", set.Tests)}; base {Ci.Short(baseSha)} + {overlay.Count} test file(s), then head {Ci.Short(headSha)}");
             async Task<TestRunSpec> Spec(string name, string commit, string? from, IReadOnlyList<string> tests)
             {
@@ -485,7 +505,7 @@ public static class NewTestsCheck
                     Prepare.PrepareSteps.Before(prepared?.StepsFor(commit) ?? [], await strategy.StepsAsync(source, commit, tests, set.Projects, directory, ct)),
                     strategy, directory)
                 {
-                    Replacements = from is null ? new Dictionary<string, string>(StringComparer.Ordinal) : set.BaseReplacements,
+                    Replacements = from is null ? new Dictionary<string, string>(StringComparer.Ordinal) : baseReplacements,
                 };
             }
             var baseSpec = await Spec($"{runName}-base", baseSha, headSha, set.Tests);
@@ -499,7 +519,7 @@ public static class NewTestsCheck
                 var applied = new Dictionary<string, string>(StringComparer.Ordinal);
                 foreach (var path in overlay)
                 {
-                    if ((set.BaseReplacements.TryGetValue(path, out var grafted) ? grafted : await source.ReadAsync(headSha, path, ct)) is { } text)
+                    if ((baseReplacements.TryGetValue(path, out var grafted) ? grafted : await source.ReadAsync(headSha, path, ct)) is { } text)
                     {
                         applied[path] = text;
                     }
@@ -508,7 +528,7 @@ public static class NewTestsCheck
                 evidence = evidence with { First = failure };
                 var remaining = set.Tests.Except(failure.NotBuilt, StringComparer.Ordinal).ToList();
                 var stripped = new Dictionary<string, string>(applied, StringComparer.Ordinal);
-                var rewritten = set.BaseReplacements.Keys.ToHashSet(StringComparer.Ordinal);
+                var rewritten = baseReplacements.Keys.ToHashSet(StringComparer.Ordinal);
                 for (var attempt = 1; attempt <= Math.Max(strategy.BaseRetries, 1) && failure.Unattributable.Count == 0 && failure.Unremovable.Count == 0
                     && remaining.Count > 0 && failure.Replacements.Count > 0; attempt++)
                 {

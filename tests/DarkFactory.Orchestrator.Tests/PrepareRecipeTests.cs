@@ -75,9 +75,6 @@ public class PrepareRecipeTests
         { "version: 1\nsteps: [{name: a, argv: [bin/make]}]\n", "must be an absolute path" },
         { "version: 1\nsteps: [{name: a, argv: [-rf]}]\n", "must be an absolute path" },
         { "version: 1\nsteps: [{name: a, argv: [/usr/bin/../bin/make]}]\n", "no '.' or '..' path segment" },
-        { "version: 1\nsteps: [{name: a, argv: [curl, -o, x, 'https://e.com/x']}]\n", "may not run curl" },
-        { "version: 1\nsteps: [{name: a, argv: [/usr/bin/wget, x]}]\n", "may not run wget" },
-        { "version: 1\nsteps: [{name: a, argv: [sudo, make]}]\n", "may not run sudo" },
         { "version: 1\nsteps: [{name: a, argv: [make], cwd: ../x}]\n", "cwd must be a relative directory" },
         { "version: 1\nsteps: [{name: a, argv: [make], cwd: /tmp}]\n", "cwd must be a relative directory" },
         { "version: 1\nsteps: [{name: a, argv: [make], env: {PATH: /evil}}]\n", "may not set PATH" },
@@ -95,6 +92,7 @@ public class PrepareRecipeTests
         { $"version: 1\nartifacts: [{{name: s, url: 'https://10.1.2.3/a', sha256: {Sha}, max_bytes: 1}}]\nsteps: [{{name: a, argv: [make]}}]\n", "a private (10/8) address" },
         { $"version: 1\nartifacts: [{{name: s, url: 'https://[::1]/a', sha256: {Sha}, max_bytes: 1}}]\nsteps: [{{name: a, argv: [make]}}]\n", "the loopback address" },
         { $"version: 1\nartifacts: [{{name: s, url: 'https://e.com/a#x', sha256: {Sha}, max_bytes: 1}}]\nsteps: [{{name: a, argv: [make]}}]\n", "fragment" },
+        { $"version: 1\nartifacts: [{{name: s, url: 'https://e.com:8443/a', sha256: {Sha}, max_bytes: 1}}]\nsteps: [{{name: a, argv: [make]}}]\n", "names port 8443" },
         { "version: 1\nartifacts: [{name: s, url: 'https://e.com/a', sha256: abc, max_bytes: 1}]\nsteps: [{name: a, argv: [make]}]\n", "sha256 must be 64 hexadecimal" },
         { $"version: 1\nartifacts: [{{name: s, url: 'https://e.com/a', sha256: {Sha}}}]\nsteps: [{{name: a, argv: [make]}}]\n", "is missing 'max_bytes'" },
         { $"version: 1\nartifacts: [{{name: s, url: 'https://e.com/a', sha256: {Sha}, max_bytes: 0}}]\nsteps: [{{name: a, argv: [make]}}]\n", "max_bytes must be a whole number" },
@@ -112,6 +110,15 @@ public class PrepareRecipeTests
 
         Assert.StartsWith(PrepareRecipe.Path, refused.Message);
         Assert.Contains(why, refused.Message);
+    }
+
+    [Fact]
+    public void Which_program_a_step_runs_is_not_judged_since_any_program_can_reach_the_network()
+    {
+        // No list of programs is kept: a shell or an interpreter reaches the network as well as curl does (CLAUDE.md's residual).
+        var recipe = PrepareRecipe.Parse("version: 1\nsteps: [{name: a, argv: [curl, -fsSL, 'https://e.com/x']}, {name: b, argv: [/usr/bin/wget, x]}]\n");
+
+        Assert.Equal(["curl", "/usr/bin/wget"], recipe.Steps.Select(s => s.Argv[0]));
     }
 
     [Fact]
@@ -158,6 +165,16 @@ public class ArtifactAddressTests
     [InlineData("64:ff9b::a00:1", "NAT64")]
     [InlineData("2002:0a00:0001::1", "6to4")]
     [InlineData("2001:db8::1", "documentation")]
+    [InlineData("::ffff:0:a00:1", "IPv4-translated")]
+    [InlineData("::ffff:0:5db8:d822", "IPv4-translated")]          // even of a public IPv4 address: refused outright
+    [InlineData("64:ff9b:1::5db8:d822", "local-use NAT64")]        // the whole /48, whatever it carries
+    [InlineData("64:ff9b:1:ffff::1", "local-use NAT64")]
+    [InlineData("64:ff9b:0:1::5db8:d822", "off the well-known")]   // 64:ff9b::/32 with bytes 4..11 not zero
+    [InlineData("64:ff9b::1:0:0:5db8:d822", "off the well-known")]
+    [InlineData("2001:0:4136:e378:8000:63bf:f5ff:fffe", "Teredo address of a private (10/8)")] // client 10.0.0.1, inverted
+    [InlineData("2001:0:4136:e378:8000:63bf:80ff:fffe", "Teredo address of a loopback")]       // client 127.0.0.1
+    [InlineData("2002:7f00:1::1", "6to4 address of a loopback")]
+    [InlineData("2002:c0a8:0101::1", "6to4 address of a private (192.168/16)")]
     public void A_non_public_address_is_refused(string address, string why)
     {
         Assert.Contains(why, ArtifactAddresses.Blocked(IPAddress.Parse(address)));
@@ -169,9 +186,36 @@ public class ArtifactAddressTests
     [InlineData("172.32.0.1")]
     [InlineData("2606:4700::1111")]
     [InlineData("::ffff:93.184.216.34")]
+    [InlineData("64:ff9b::5db8:d822")]                         // the well-known NAT64 prefix of a public address
+    [InlineData("2002:5db8:d822::1")]                          // 6to4 of a public address
+    [InlineData("2001:0:4136:e378:8000:63bf:a247:27dd")]       // Teredo of the public 93.184.216.34
     public void A_public_address_is_allowed(string address)
     {
         Assert.Null(ArtifactAddresses.Blocked(IPAddress.Parse(address)));
+    }
+
+    [Fact]
+    public async Task The_connection_tries_each_checked_address_in_order_until_one_answers()
+    {
+        var addresses = new[] { "2606:4700::1111", "93.184.216.34", "93.184.216.35" }.Select(IPAddress.Parse).ToList();
+        var tried = new List<IPAddress>();
+        Task<Stream> Connect(IPAddress address, int port, CancellationToken ct)
+        {
+            tried.Add(address);
+            Assert.Equal(443, port);
+            return address.Equals(addresses[1])
+                ? Task.FromResult<Stream>(new MemoryStream([1]))
+                : Task.FromException<Stream>(new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.NetworkUnreachable));
+        }
+
+        await using var stream = await ArtifactAddresses.ConnectAsync(addresses, 443, Connect, CancellationToken.None);
+
+        Assert.Equal(1, stream.ReadByte());
+        Assert.Equal(addresses.Take(2), tried); // the first failed, the second answered, the third was never tried
+        tried.Clear();
+        var none = await Assert.ThrowsAsync<System.Net.Sockets.SocketException>(() => ArtifactAddresses.ConnectAsync([addresses[0], addresses[2]], 443, Connect, CancellationToken.None));
+        Assert.Equal([addresses[0], addresses[2]], tried); // every address tried, in order, then the last failure
+        Assert.Equal(System.Net.Sockets.SocketError.NetworkUnreachable, none.SocketErrorCode);
     }
 
     [Fact]
@@ -194,6 +238,9 @@ public class ArtifactAddressTests
     [InlineData("ftp://e.com/x", "https")]
     [InlineData("https://sub.localhost/x", "local host")]
     [InlineData("https://169.254.169.254/latest/meta-data", "link-local")]
+    [InlineData("https://download.adobe.com:443/x.zip", null)]
+    [InlineData("https://download.adobe.com:8443/x.zip", "names port 8443")]
+    [InlineData("https://download.adobe.com:80/x.zip", "names port 80")]
     public void A_url_is_checked_before_anything_is_resolved(string url, string? why)
     {
         var problem = ArtifactUrls.Problem(new Uri(url));

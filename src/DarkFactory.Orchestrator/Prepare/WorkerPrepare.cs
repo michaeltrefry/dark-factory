@@ -19,10 +19,13 @@ namespace DarkFactory.Orchestrator.Prepare;
 /// applies every download rule, fills the cache and answers with the steps to run — every placeholder expanded — or why not;
 /// <c>factory-prepare</c> waits for the answer (bounded) and runs the steps as the worker.</item>
 /// </list>
-/// Downloading a recipe-declared artifact is not untrusted input in the E4 sense: it is hash-pinned by a reviewed file, and
-/// fetched by the harness, never shown to a model. The recipe text in a worktree is the worker's own edit (it is reviewed, and the
-/// gate runs each commit's own recipe); what a worker could make a step run, it could equally make <c>cargo build</c>'s build
-/// script run (CLAUDE.md's residual).
+/// What this does NOT give: a reviewed recipe. The recipe a session's <c>factory-prepare</c> asks for is the worktree's as it is
+/// then — the worker's own, unreviewed edit, at whatever URLs and hashes it names — and its steps' output (and so whatever the
+/// artifacts it pinned make them print) reaches the session, as a build's own output does. Accepted, the residual of a build's
+/// own code (CLAUDE.md, "Prepare recipes"): a worker could equally make <c>cargo build</c>'s build script fetch and print anything;
+/// the session is not tainted for it, and what it then pushes goes through review (the recipe path is on the security-review
+/// floor) and the gate, which runs each commit's own recipe. The worker is told only what its own recipe asked for: a hash
+/// mismatch is answered "does not match the pinned sha256", never the served bytes' hash (that stays on the ledger).
 /// </summary>
 public sealed class WorkerPrepare(ArtifactFetcher fetcher, string spoolRoot, TextWriter log)
 {
@@ -49,10 +52,13 @@ public sealed class WorkerPrepare(ArtifactFetcher fetcher, string spoolRoot, Tex
     public TimeSpan PollInterval { get; init; } = DefaultPollInterval;
 
     /// <summary>
-    /// The recipe in <paramref name="worktree"/>, read owner-side without trusting the tree: <c>.factory</c> must not be a link and
-    /// the file is read as <see cref="SafeFile"/> reads (no link, no FIFO, at most 1 MiB). (null, null) when there is none.
+    /// The recipe in <paramref name="worktree"/>, read owner-side without trusting the tree: <c>.factory</c> must not be a link, and
+    /// the file is read through <c>.factory</c>'s own descriptor (<see cref="SafeFile.ReadAt"/>: the directory opened with
+    /// <c>O_NOFOLLOW | O_DIRECTORY</c>, the file with <c>openat</c> from it — no link, no FIFO, at most 1 MiB), so a <c>.factory</c>
+    /// the worker swaps for a link after the check is never followed. (null, null) when there is none.
+    /// <paramref name="afterCheck"/> is a test seam, run between the check and the read.
     /// </summary>
-    public static (PrepareRecipe? Recipe, string? Error) ReadRecipe(string worktree)
+    public static (PrepareRecipe? Recipe, string? Error) ReadRecipe(string worktree, Action? afterCheck = null)
     {
         var directory = new DirectoryInfo(Path.Combine(worktree, PrepareRecipe.Directory));
         if (directory.LinkTarget is not null)
@@ -63,7 +69,8 @@ public sealed class WorkerPrepare(ArtifactFetcher fetcher, string spoolRoot, Tex
         {
             return (null, null);
         }
-        var read = SafeFile.Read(Path.Combine(worktree, PrepareRecipe.Path));
+        afterCheck?.Invoke();
+        var read = SafeFile.ReadAt(directory.FullName, Path.GetFileName(PrepareRecipe.Path));
         if (read.IsMissing)
         {
             return (null, null);
@@ -109,7 +116,7 @@ public sealed class WorkerPrepare(ArtifactFetcher fetcher, string spoolRoot, Tex
     /// files to it and no one else may do anything; unsandboxed the worker is the owner) and polls it until disposed.
     /// </summary>
     public async Task<PrepareSpoolSession> OpenAsync(string worktree, WorkerSandbox? sandbox, Func<ArtifactDownloaded, CancellationToken, Task>? onDownloaded,
-        CancellationToken ct)
+        CancellationToken ct, Action<string>? onFailed = null)
     {
         Directory.CreateDirectory(spoolRoot);
         await WorkerSandbox.ResetAsync(spoolRoot, sandbox is null ? UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute : SpoolRootMode, ct);
@@ -131,21 +138,30 @@ public sealed class WorkerPrepare(ArtifactFetcher fetcher, string spoolRoot, Tex
             Directory.Delete(directory, recursive: true);
             throw;
         }
-        return new PrepareSpoolSession(this, directory, worktree, onDownloaded, log);
+        return new PrepareSpoolSession(this, directory, worktree, onDownloaded, onFailed, log);
     }
 
-    /// <summary>The prompt's paragraph for a session whose worktree has a recipe: the command, with this session's spool.</summary>
+    /// <summary>
+    /// The prompt's paragraph for every implementing session with <c>Worker:Prepare</c> on: the command, with this session's spool. It
+    /// works once the worktree has a recipe — one it had, or one the session adds.
+    /// </summary>
     public static string Note(string spool) =>
-        $"\n\nThis repository has a prepare recipe ({PrepareRecipe.Path}). Before you build or test, run `{PrepareTool.InstalledPath} --spool {spool}` "
-        + "from the repository root, and run it again after you change the recipe: the factory fetches the recipe's artifacts (you cannot "
-        + "download them yourself) and the command then runs the recipe's steps. It can take several minutes, so give that Bash call a "
-        + "timeout of 600000 ms.";
+        $"\n\nIf this repository has a prepare recipe ({PrepareRecipe.Path}), or once you add one, run `{PrepareTool.InstalledPath} --spool {spool}` "
+        + "from the repository root before you build or test, and run it again after you change the recipe: the factory fetches the recipe's "
+        + "artifacts (you cannot download them yourself) and the command then runs the recipe's steps. Without a recipe it does nothing. It "
+        + "can take several minutes, so give that Bash call a timeout of 600000 ms.";
+
+    /// <summary>The most requests one session's spool is answered with a fetch; every later one is answered <c>error</c> at once.</summary>
+    public const int MaxRequestsPerSession = 20;
 
     /// <summary>
     /// Answers one request of a session in <paramref name="worktree"/>: <c>ok</c> and the worker plan
-    /// (<see cref="PrepareSteps.WorkerPlan"/>), or <c>error</c> and why — NUL-terminated fields.
+    /// (<see cref="PrepareSteps.WorkerPlan"/>), or <c>error</c> and why — NUL-terminated fields. A fetch that fails is answered with
+    /// <see cref="ArtifactFetchException.WorkerMessage"/> (never the served bytes' hash); the full message goes to
+    /// <paramref name="onFailed"/> (the ledger).
     /// </summary>
-    internal async Task<string> AnswerAsync(string worktree, Func<ArtifactDownloaded, CancellationToken, Task>? onDownloaded, CancellationToken ct)
+    internal async Task<string> AnswerAsync(string worktree, Func<ArtifactDownloaded, CancellationToken, Task>? onDownloaded, CancellationToken ct,
+        Action<string>? onFailed = null)
     {
         var (recipe, error) = ReadRecipe(worktree);
         if (recipe is null)
@@ -157,7 +173,13 @@ public sealed class WorkerPrepare(ArtifactFetcher fetcher, string spoolRoot, Tex
             var artifacts = await fetcher.EnsureAsync(recipe, onDownloaded, ct);
             return "ok\0" + PrepareSteps.WorkerPlan(recipe, worktree, artifacts);
         }
-        catch (Exception ex) when (ex is ArtifactFetchException or PrepareRecipeException)
+        catch (ArtifactFetchException ex)
+        {
+            onFailed?.Invoke(ex.Message);
+            log.WriteLine($"[prepare] a session's request could not be prepared: {ex.Message}");
+            return Error(ex.WorkerMessage);
+        }
+        catch (PrepareRecipeException ex)
         {
             return Error(ex.Message);
         }
@@ -223,11 +245,13 @@ public sealed class PrepareSpoolSession : IAsyncDisposable
     private readonly WorkerPrepare _prepare;
     private readonly string _worktree;
     private readonly Func<ArtifactDownloaded, CancellationToken, Task>? _onDownloaded;
+    private readonly Action<string>? _onFailed;
     private readonly TextWriter _log;
 
-    internal PrepareSpoolSession(WorkerPrepare prepare, string directory, string worktree, Func<ArtifactDownloaded, CancellationToken, Task>? onDownloaded, TextWriter log)
+    internal PrepareSpoolSession(WorkerPrepare prepare, string directory, string worktree, Func<ArtifactDownloaded, CancellationToken, Task>? onDownloaded,
+        Action<string>? onFailed, TextWriter log)
     {
-        (_prepare, Directory, _worktree, _onDownloaded, _log) = (prepare, directory, worktree, onDownloaded, log);
+        (_prepare, Directory, _worktree, _onDownloaded, _onFailed, _log) = (prepare, directory, worktree, onDownloaded, onFailed, log);
         _loop = Task.Run(LoopAsync);
     }
 
@@ -235,6 +259,9 @@ public sealed class PrepareSpoolSession : IAsyncDisposable
 
     /// <summary>How many requests have been answered.</summary>
     public int Answered { get; private set; }
+
+    /// <summary>How many requests were answered with a fetch (at most <see cref="WorkerPrepare.MaxRequestsPerSession"/>).</summary>
+    public int Fetched { get; private set; }
 
     private async Task LoopAsync()
     {
@@ -272,9 +299,19 @@ public sealed class PrepareSpoolSession : IAsyncDisposable
             string answer;
             try
             {
-                answer = refusal is null
-                    ? await _prepare.AnswerAsync(_worktree, _onDownloaded, ct)
-                    : $"error\0{refusal}\0";
+                if (refusal is not null)
+                {
+                    answer = $"error\0{refusal}\0";
+                }
+                else if (Fetched >= WorkerPrepare.MaxRequestsPerSession)
+                {
+                    answer = $"error\0this session has already asked {WorkerPrepare.MaxRequestsPerSession} times, the most a session may: nothing more is fetched for it\0";
+                }
+                else
+                {
+                    Fetched++;
+                    answer = await _prepare.AnswerAsync(_worktree, _onDownloaded, ct, _onFailed);
+                }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {

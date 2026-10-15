@@ -25,7 +25,8 @@ public sealed class ArtifactAddressException(string message) : Exception(message
 /// private (RFC 1918), shared/CGNAT (100.64/10), link-local, multicast, broadcast and reserved IPv4, the IETF/documentation and
 /// benchmarking ranges, and in IPv6 the unspecified and loopback addresses, unique-local (fc00::/7), link-local (fe80::/10),
 /// site-local (fec0::/10), multicast (ff00::/8), documentation (2001:db8::/32), discard (100::/64) — and any IPv6 form that carries
-/// an IPv4 address (mapped, compatible, NAT64 64:ff9b::/96, 6to4 2002::/16, Teredo 2001::/32) is judged by that IPv4 address.
+/// an IPv4 address (mapped, compatible, NAT64 64:ff9b::/96, 6to4 2002::/16, Teredo 2001::/32) is judged by that IPv4 address,
+/// while IPv4-translated (::ffff:0:0/96), local-use NAT64 (64:ff9b:1::/48) and the rest of 64:ff9b::/32 are refused outright.
 /// </summary>
 public static class ArtifactAddresses
 {
@@ -82,14 +83,28 @@ public static class ArtifactAddresses
             return why;
         }
         // An IPv6 form that carries an IPv4 address is judged by that address: mapped ::ffff:a.b.c.d, compatible ::a.b.c.d,
-        // NAT64 64:ff9b::a.b.c.d (and its local-use 64:ff9b:1::/48), 6to4 2002:AABB:CCDD::, Teredo 2001:0::/32 (the client's
-        // address, inverted, in the last 32 bits).
+        // NAT64 64:ff9b::a.b.c.d, 6to4 2002:AABB:CCDD::, Teredo 2001:0::/32 (the client's address, inverted, in the last 32
+        // bits). Forms whose IPv4 address cannot be judged that way are refused outright: IPv4-translated ::ffff:0:a.b.c.d (SIIT),
+        // the local-use NAT64 prefix 64:ff9b:1::/48 (a network's own translator, reaching whatever it was set up to reach) and
+        // any other address of 64:ff9b::/32 off the well-known 64:ff9b::/96 (bytes 4..11 not zero).
         if (address.IsIPv4MappedToIPv6 || (b.Take(12).All(x => x == 0)))
         {
             return Embedded(b[12..16], "an IPv4-mapped or -compatible address");
         }
+        if (b.Take(8).All(x => x == 0) && b[8] == 0xff && b[9] == 0xff && b[10] == 0 && b[11] == 0)
+        {
+            return "an IPv4-translated (::ffff:0:0/96) address";
+        }
         if (b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b)
         {
+            if (b[4] == 0 && b[5] == 1)
+            {
+                return "a local-use NAT64 (64:ff9b:1::/48) address";
+            }
+            if (b[4..12].Any(x => x != 0))
+            {
+                return "a NAT64 (64:ff9b::/32) address off the well-known 64:ff9b::/96 prefix";
+            }
             return Embedded(b[12..16], "a NAT64 address");
         }
         if (b[0] == 0x20 && b[1] == 0x02)
@@ -126,7 +141,14 @@ public static class ArtifactAddresses
     /// lookup between the check and the connection, so a rebinding answer changes nothing). A host that is an IP literal is judged
     /// as that address.
     /// </summary>
-    public static async Task<IPAddress> ChooseAsync(string host, IArtifactResolver resolver, CancellationToken ct)
+    public static async Task<IPAddress> ChooseAsync(string host, IArtifactResolver resolver, CancellationToken ct) =>
+        (await CheckAsync(host, resolver, ct))[0];
+
+    /// <summary>
+    /// Every address <paramref name="host"/> resolves to, in the resolver's order, each checked (<see cref="Blocked"/>): one blocked
+    /// address refuses the host. The connect callback tries them in this order (<see cref="ConnectAsync"/>).
+    /// </summary>
+    public static async Task<IReadOnlyList<IPAddress>> CheckAsync(string host, IArtifactResolver resolver, CancellationToken ct)
     {
         var literal = host.Trim('[', ']');
         IReadOnlyList<IPAddress> addresses = IPAddress.TryParse(literal, out var ip) ? [ip] : await resolver.ResolveAsync(host, ct);
@@ -141,7 +163,30 @@ public static class ArtifactAddresses
                 throw new ArtifactAddressException($"{host} resolves to {address}, {why}: artifacts are downloaded from public addresses only");
             }
         }
-        return addresses[0];
+        return addresses;
+    }
+
+    /// <summary>
+    /// Connects to the first of <paramref name="addresses"/> (each already checked) that answers, trying them in order through
+    /// <paramref name="connect"/>; when none does, the last failure is thrown.
+    /// </summary>
+    public static async Task<Stream> ConnectAsync(IReadOnlyList<IPAddress> addresses, int port,
+        Func<IPAddress, int, CancellationToken, Task<Stream>> connect, CancellationToken ct)
+    {
+        Exception? last = null;
+        foreach (var address in addresses)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                return await connect(address, port, ct);
+            }
+            catch (Exception ex) when (ex is SocketException or IOException)
+            {
+                last = ex;
+            }
+        }
+        throw last ?? new ArtifactAddressException("there is no address to connect to");
     }
 }
 
@@ -171,6 +216,10 @@ public static class ArtifactUrls
         {
             return "has no host";
         }
+        if (url.Port != 443)
+        {
+            return $"names port {url.Port}: artifacts are downloaded from port 443 only";
+        }
         var host = url.IdnHost.TrimEnd('.');
         if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase) || host.EndsWith(".localhost", StringComparison.OrdinalIgnoreCase))
         {
@@ -187,7 +236,7 @@ public static class ArtifactUrls
 /// <summary>
 /// The HTTP transport of the artifact downloads (sc-26232), the only one: <see cref="OutboundHttp.ArtifactDownload"/> builds it.
 /// Every connection is made to the address <see cref="ArtifactAddresses.ChooseAsync"/> checked in the same callback (the host's
-/// every resolved address must be public; the one connected to is the one checked), no proxy is used (an environment proxy would
+/// every resolved address must be public; they are tried in the resolver's order, and each one connected to is one checked), no proxy is used (an environment proxy would
 /// connect elsewhere), no redirect is followed by the handler (the downloader follows a bounded number itself, checking each), and
 /// nothing is decompressed (the hash is of the bytes as served).
 /// </summary>
@@ -203,18 +252,23 @@ internal static class ArtifactTransport
         ConnectTimeout = TimeSpan.FromSeconds(30),
         ConnectCallback = async (context, ct) =>
         {
-            var address = await ArtifactAddresses.ChooseAsync(context.DnsEndPoint.Host, resolver, ct);
-            var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
-            try
-            {
-                await socket.ConnectAsync(new IPEndPoint(address, context.DnsEndPoint.Port), ct);
-                return new NetworkStream(socket, ownsSocket: true);
-            }
-            catch
-            {
-                socket.Dispose();
-                throw;
-            }
+            var addresses = await ArtifactAddresses.CheckAsync(context.DnsEndPoint.Host, resolver, ct);
+            return await ArtifactAddresses.ConnectAsync(addresses, context.DnsEndPoint.Port, ConnectOneAsync, ct);
         },
     };
+
+    private static async Task<Stream> ConnectOneAsync(IPAddress address, int port, CancellationToken ct)
+    {
+        var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+        try
+        {
+            await socket.ConnectAsync(new IPEndPoint(address, port), ct);
+            return new NetworkStream(socket, ownsSocket: true);
+        }
+        catch
+        {
+            socket.Dispose();
+            throw;
+        }
+    }
 }
