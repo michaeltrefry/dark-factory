@@ -163,12 +163,15 @@ public class GitWorkspaceTests
         /// <summary>Several worker slots: what is inside the worktree is judged too, each entry's ACL read through <see cref="EntryAcl"/> (null: one slot, the root alone).</summary>
         public Func<string, string?>? EntryAcl { get; init; }
 
+        /// <summary>With several slots, the reader of who owns each entry inside, for the slot's user (null: not judged).</summary>
+        public Func<string, Func<string, string?>>? Owners { get; init; }
+
         public Task EnsureOnlyWorkerWritesAsync(string path, CancellationToken ct)
         {
             Calls.Add($"writers {path}");
             return DarkFactory.Orchestrator.Worker.WorkerSlots.EnsureOnlyWriterAsync(path, "_dftest2",
                 (p, _) => Task.FromResult(Listing(p) ?? throw new InvalidOperationException("/bin/ls failed (1): no such file")), TimeSpan.Zero, ct,
-                inside: EntryAcl);
+                inside: EntryAcl, owners: Owners);
         }
         public Task ShareAsync(string path, CancellationToken ct)
         {
@@ -343,6 +346,46 @@ public class GitWorkspaceTests
         File.SetUnixFileMode(file, (UnixFileMode)0b110_110_110); // 0666
 
         Assert.True(await workspace.CommitAndPushAsync(Repo, story, "sc-9: work", TestGrants.Untainted, CancellationToken.None));
+    }
+
+    /// <summary>
+    /// sc-26134, the first real iOS story: the worker's build made <c>App.xcodeproj/project.xcworkspace</c> (untracked; Xcode makes
+    /// it on first use, 0777 whatever the umask) and, with several slots, the push of 65 minutes of work was refused. The same
+    /// build through the xcodebuild wrapper — which closes what its run made once xcodebuild returns — pushes; the push check
+    /// itself is unchanged (it still refuses Xcode's own 0777 directory), and it now also judges who owns each entry.
+    /// </summary>
+    [Fact]
+    public async Task With_several_slots_an_xcode_build_through_the_wrapper_still_pushes_while_the_same_build_without_it_is_refused()
+    {
+        var bin = Directory.CreateDirectory(Path.Combine(_root, "bin")).FullName;
+        var wrapper = XcodebuildWrapperTests.WrapperCopy(bin, XcodebuildWrapperTests.XcodeMakesWorkspace);
+        var xcode = Path.Combine(bin, "stub-xcodebuild"); // the same "Xcode", run without the wrapper
+        var sandbox = new FakeSandbox { EntryAcl = _ => null, Owners = _ => DarkFactory.Orchestrator.Worker.WorktreeWriters.NativeOwners(Environment.UserName) };
+        var workspace = Workspace(sandbox);
+        var story = await workspace.PrepareAsync(Repo, "factory/sc-9", CancellationToken.None);
+        var project = Directory.CreateDirectory(Path.Combine(story.Path, "App.xcodeproj")).FullName;
+        File.WriteAllText(Path.Combine(project, "project.pbxproj"), "// the worker's\n");
+
+        async Task<int> Run(string program, params string[] args)
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo(program, args) { WorkingDirectory = story.Path, RedirectStandardError = true };
+            using var p = System.Diagnostics.Process.Start(psi)!;
+            var stderr = await p.StandardError.ReadToEndAsync();
+            await p.WaitForExitAsync();
+            Assert.Equal("", stderr);
+            return p.ExitCode;
+        }
+
+        Assert.Equal(0, await Run(xcode, "build"));
+        var refused = await Assert.ThrowsAsync<DarkFactory.Orchestrator.Worker.WorktreeWritersException>(
+            () => workspace.CommitAndPushAsync(Repo, story, "sc-9: work", TestGrants.Untainted, CancellationToken.None));
+        Assert.Contains("App.xcodeproj/project.xcworkspace in it has a mode (0777) that lets every user write it", refused.Message);
+        Directory.Delete(Path.Combine(project, "project.xcworkspace"), recursive: true);
+
+        Assert.Equal(0, await Run(wrapper, "build", "-scheme", "App", "-destination", "platform=iOS Simulator,name=iPhone 17"));
+        Assert.Equal((UnixFileMode)0b111_101_101, File.GetUnixFileMode(Path.Combine(project, "project.xcworkspace", "xcshareddata", "swiftpm", "configuration")));
+        Assert.True(await workspace.CommitAndPushAsync(Repo, story, "sc-9: work", TestGrants.Untainted, CancellationToken.None));
+        Assert.Equal("// the worker's\n", Git(_remote, "show", "factory/sc-9:App.xcodeproj/project.pbxproj"));
     }
 
     [Fact]

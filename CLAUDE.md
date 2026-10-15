@@ -2052,11 +2052,38 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (the helper's exit kills them all), so a file that was open to another slot's user WHILE the session ran and was closed
   again before the push is not seen; and it is the factory's own reading of modes and ACLs, not the kernel's answer to "may
   that user write this" (an access path that is neither a mode bit nor an ACL entry — there is none known for a role account
-  with a group of its own — would not be seen). Ownership is not read either: an entry in the worktree that another slot's
-  user OWNS (possible only if the worktree's own worker hard-links that user's file into its tree; another slot's user cannot
-  create anything there) could be rewritten by its owner under ordinary modes — code that does that could as well copy what
-  the other slot left in a shared place (the `/tmp` residual below). An owner whose umask gives group write (002) has every
-  push refused with several slots: run the factory under 022, macOS's default.
+  with a group of its own — would not be seen). An owner whose umask gives group write (002) has every push refused with
+  several slots: run the factory under 022, macOS's default. (A worker's own umask is at least 022 whatever the
+  orchestrator's: sudo, through which every helper runs, ORs its default 0022 into the caller's, and neither the helper nor
+  the wrappers set one.)
+  Ownership and Xcode (sc-26134; the first real iOS story's push was refused, 65 minutes of work thrown away: `SceneWorks-
+  mobile.xcodeproj/project.xcworkspace in it has a mode (0777)`). Xcode makes what it creates in a project it opens 0777
+  WHATEVER THE UMASK — measured with Xcode 26 as the owner under umask 022 and 077 alike: `-list` or a build of a project with
+  no `project.xcworkspace` (untracked in most repositories: Xcode makes it on first use) makes `<p>.xcodeproj/project.xcworkspace/
+  xcshareddata/swiftpm/configuration`, every directory `drwxrwxrwx`; a directory that already exists is left as it is; `swift
+  build` makes nothing writable for others. So the cause is Xcode, not a umask, and the push check is NOT loosened: no entry
+  is skipped (ignored ones included), and nothing is chmod-ed owner-side before it. Instead the xcodebuild wrapper
+  (`scripts/factory-xcodebuild`, every form that runs xcodebuild, `-list` and `--gate` included) no longer `exec`s it: once
+  xcodebuild has returned (its exit status kept), it takes group and other write (`chmod go-w`) off every entry INSIDE the
+  working directory that the running user owns, that is no link and that was BORN after the run began (`find -newerBm`
+  against a stamp, `SwiftToolchain.BuildStampOf`: `~/Library/Caches/dark-factory/xcodebuild-runs/<key>`, one per working
+  directory, made before xcodebuild starts and removed after the clean-up; a run killed before its clean-up — a Bash tool's
+  timeout, a Stop — leaves it, and the next run there keeps the older stamp, so its clean-up covers what the killed run made
+  too, and whatever was born between the two runs). Nothing older is touched (an entry opened before the run is still the
+  push check's to refuse) and nothing of another user's. A clean-up that fails is the run's failure (exit 70 when xcodebuild
+  had succeeded, said on stderr). And the push check now also reads who OWNS each entry inside (`WorktreeWriters.NativeOwners`,
+  `lstat`'s uid against the owner's and the slot's user's, looked up by name with `getpwnam`; with several slots only, macOS
+  only; fail closed: an owner that cannot be read, or a slot's user that cannot be looked up, refuses), before its mode: an
+  entry another user owns is refused ("… is owned by uid N, neither the owner nor _factory2, and its owner may change it"),
+  whatever its mode. While xcodebuild runs, what it made 0777 is writable by another slot's user (through the work root's
+  read entry): what that user CREATES there is its own and so refused at the push; this also closes the earlier residual of a
+  hard link to another slot's user's file. Residuals, accepted: a file of the worker's own that another slot's user CHANGES
+  inside such a directory during the build, before the wrapper's clean-up, is not seen (the check's own residual above: open
+  while the session ran, closed before the push); a killed build's 0777 entries with no later wrapper run stay open and the
+  push is refused (fail closed); and another tool that makes entries writable for others (a prepare step, a build script, a
+  raw xcodebuild that build code runs) is not cleaned up: its push is refused as before. Changing the wrapper changed its
+  installed copy: `sudo scripts/setup-worker-user.sh [--slots n] --swift` once (start-up refuses a stale wrapper with
+  `Worker:Swift=true`); the launch helper is unchanged (helper_version 5).
   (2) MCP session files, read isolation: the work root's inherited read entry names every slot's user, so with several slots
   each session directory is made its own slot's user's alone before a session's file is written
   (`WorkerSandbox.RestrictToWorkerAsync`, every slot's, slot 1's `mcp-sessions` included: `chmod -N` — every entry gone, the

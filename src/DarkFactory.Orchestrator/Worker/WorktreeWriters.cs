@@ -18,9 +18,13 @@ namespace DarkFactory.Orchestrator.Worker;
 /// holds no other slot's user would take a membership lookup per group, and nothing the factory or a worker makes under the
 /// usual umask (022) is group-writable. Fails closed: an entry that cannot be read, vanished while it was read, or whose ACL
 /// cannot be read is a reason.</para>
-/// <para>What it cannot see: a file that was writable while the session ran and was closed again before the push — the check is
-/// of the tree as it is when no process of its slot's user is left (the launch helper's exit kills them all) — and who OWNS
-/// an entry (another slot's user owns one here only if this worktree's own worker hard-linked that user's file into it).</para>
+/// <para>With an owner reader (<see cref="NativeOwners"/>, the push's) it also refuses an entry OWNED by anyone but the owner
+/// and the slot's user (sc-26134): its owner may change it whatever its mode. Another slot's user can own one here when an
+/// entry was writable to it for a while — Xcode makes what it creates 0777 whatever the umask, and the xcodebuild wrapper takes
+/// that back only once its build has returned — or when this worktree's own worker hard-linked that user's file into it.</para>
+/// <para>What it cannot see: a file of the owner's or the slot's user's that was writable while the session ran and was closed
+/// again before the push — the check is of the tree as it is when no process of its slot's user is left (the launch helper's
+/// exit kills them all).</para>
 /// </summary>
 internal static class WorktreeWriters
 {
@@ -33,7 +37,7 @@ internal static class WorktreeWriters
     /// <paramref name="user"/>, or null. <paramref name="aclOf"/> reads one entry's ACL (<see cref="NativeAcl"/>; tests give
     /// their own). The root itself is not judged here (<see cref="WorkerSlots.WritersBeside"/> does).
     /// </summary>
-    public static string? Inside(string root, string user, Func<string, string?> aclOf, CancellationToken ct)
+    public static string? Inside(string root, string user, Func<string, string?> aclOf, CancellationToken ct, Func<string, string?>? ownerOf = null)
     {
         var pending = new Stack<string>([root]);
         var path = root;
@@ -54,6 +58,10 @@ internal static class WorktreeWriters
                     if (attributes.HasFlag(FileAttributes.ReparsePoint))
                     {
                         continue;
+                    }
+                    if (ownerOf?.Invoke(path) is { } owner)
+                    {
+                        return $"{Relative(root, path)} in it {owner}";
                     }
                     var mode = entry.UnixFileMode;
                     if ((mode & UnixFileMode.OtherWrite) != 0)
@@ -174,6 +182,69 @@ internal static class WorktreeWriters
             _ = acl_free(acl);
         }
     }
+
+    /// <summary>
+    /// The owner reader of the push's walk (<see cref="Inside"/>): for one entry (never a link's target), why its owner is
+    /// neither this process's user (the factory's owner, whose git checked the worktree out) nor <paramref name="user"/> (the
+    /// slot's), or null. Fails closed: an entry whose owner cannot be read, and every entry when <paramref name="user"/> cannot
+    /// be looked up, is a reason. macOS only (the sandbox users are); elsewhere it judges nothing.
+    /// </summary>
+    public static Func<string, string?> NativeOwners(string user)
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            return _ => null;
+        }
+        var self = geteuid();
+        var slot = UidOf(user);
+        return path =>
+        {
+            if (slot is null)
+            {
+                return $"could not be judged: the user {user} could not be looked up, so who may own what is in it is not known";
+            }
+            if (OwnerOf(path) is not { } owner)
+            {
+                return "could not be read (its owner is not known), so who may write it is not known";
+            }
+            return owner == self || owner == slot ? null : $"is owned by uid {owner}, neither the owner nor {user}, and its owner may change it";
+        };
+    }
+
+    /// <summary>The uid that owns <paramref name="path"/> itself (<c>lstat</c>), or null when it cannot be read. macOS only.</summary>
+    internal static uint? OwnerOf(string path)
+    {
+        // struct stat with 64-bit inodes (arm64's lstat, x86_64's lstat$INODE64): st_dev 4, st_mode 2, st_nlink 2, st_ino 8,
+        // then st_uid at offset 16. The buffer is larger than the struct (144 bytes).
+        var buffer = new byte[256];
+        var result = RuntimeInformation.ProcessArchitecture == Architecture.X64 ? lstat_inode64(path, buffer) : lstat(path, buffer);
+        return result == 0 ? BitConverter.ToUInt32(buffer, 16) : null;
+    }
+
+    /// <summary>The uid of the user named <paramref name="user"/> (<c>getpwnam</c>), or null when it is not known. macOS only.</summary>
+    internal static uint? UidOf(string user)
+    {
+        lock (PasswordLock) // getpwnam answers in a buffer of its own
+        {
+            var entry = getpwnam(user);
+            // struct passwd: char *pw_name, char *pw_passwd, then uid_t pw_uid at offset 16.
+            return entry == IntPtr.Zero ? null : (uint)Marshal.ReadInt32(entry, 16);
+        }
+    }
+
+    private static readonly object PasswordLock = new();
+
+    [DllImport("libc", EntryPoint = "lstat", SetLastError = true)]
+    private static extern int lstat([MarshalAs(UnmanagedType.LPUTF8Str)] string path, byte[] buffer);
+
+    [DllImport("libc", EntryPoint = "lstat$INODE64", SetLastError = true)]
+    private static extern int lstat_inode64([MarshalAs(UnmanagedType.LPUTF8Str)] string path, byte[] buffer);
+
+    [DllImport("libc")]
+    private static extern uint geteuid();
+
+    [DllImport("libc", CharSet = CharSet.Ansi, BestFitMapping = false)]
+    private static extern IntPtr getpwnam([MarshalAs(UnmanagedType.LPUTF8Str)] string name);
 
     /// <summary>ACLs already printed, by their external form (<see cref="NativeAcl"/>); bounded.</summary>
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> Printed = new(StringComparer.Ordinal);

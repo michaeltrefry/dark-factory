@@ -92,6 +92,7 @@ public class SlotIsolationTests
     {
         var listing = SharedWith("_dftest2");
         var (reads, inside) = (0, new List<string>());
+        var owners = new List<string>();
         // A real (test-made) directory for what is inside it; its root's listing is the fake one.
         var wt = Directory.CreateDirectory(Path.Combine(_root, "wt")).FullName;
         File.WriteAllText(Path.Combine(wt, "work.txt"), "x");
@@ -99,6 +100,7 @@ public class SlotIsolationTests
         {
             ListAcl = (_, _) => { reads++; return Task.FromResult(listing); },
             EntryAcl = path => { inside.Add(path); return null; },
+            EntryOwners = user => { owners.Add(user); return _ => null; },
             AclRetry = TimeSpan.Zero,
             CloseLocks = (_, _) => Task.CompletedTask,
         };
@@ -108,6 +110,7 @@ public class SlotIsolationTests
         Assert.True(await In(2));
         Assert.Equal(1, reads); // a clean listing is read once
         Assert.Equal([Path.Combine(wt, "work.txt")], inside); // and, with several slots, what is inside it is read too
+        Assert.Equal(["_dftest2"], owners); // and who owns it, for the held slot's user (sc-26134)
 
         // The same worktree is not slot 1's: its session did not write it under a grant of its own.
         var refused = await Assert.ThrowsAsync<WorktreeWritersException>(() => In(1));
@@ -143,6 +146,7 @@ public class SlotIsolationTests
         {
             ListAcl = (_, _) => { reads++; return Task.FromResult(SharedWith("_dftest")); },
             EntryAcl = _ => { inside++; return null; },
+            EntryOwners = _ => { inside++; return _ => null; },
         };
 
         await pool.EnsureOnlyWorkerWritesAsync(wt, CancellationToken.None);
@@ -240,6 +244,76 @@ public class SlotIsolationTests
         // A worktree that is gone, and a cancelled walk.
         Assert.StartsWith("the directory itself in it could not be read (", WorktreeWriters.Inside(Path.Combine(_root, "gone"), "_dftest2", _ => null, CancellationToken.None));
         Assert.Throws<OperationCanceledException>(() => WorktreeWriters.Inside(wt, "_dftest2", _ => null, new CancellationToken(canceled: true)));
+    }
+
+    /// <summary>
+    /// sc-26134: with an owner reader the walk also refuses an entry owned by anyone but the owner and the slot's user — whose
+    /// owner may change it whatever its mode (another slot's user can own one after Xcode made a directory 0777 for the length
+    /// of a build, or through a hard link) — before its mode is judged; a link is still neither judged nor entered.
+    /// </summary>
+    [Fact]
+    public void The_walk_refuses_an_entry_owned_by_anyone_but_the_owner_and_the_slots_user()
+    {
+        var wt = Directory.CreateDirectory(Path.Combine(_root, "owned")).FullName;
+        var deep = Directory.CreateDirectory(Path.Combine(wt, "a", "b")).FullName;
+        File.WriteAllText(Path.Combine(deep, "theirs"), "");
+        File.WriteAllText(Path.Combine(wt, "mine"), "");
+        Directory.CreateSymbolicLink(Path.Combine(wt, "link"), deep);
+        var asked = new List<string>();
+        string? Walk(Func<string, string?> ownerOf) => WorktreeWriters.Inside(wt, "_dftest2", _ => null, CancellationToken.None,
+            path => { asked.Add(Path.GetRelativePath(wt, path)); return ownerOf(path); });
+
+        Assert.Null(Walk(_ => null));
+        Assert.Equal(["a", "a/b", "a/b/theirs", "mine"], asked.Order(StringComparer.Ordinal)); // every entry but the link
+        Assert.Equal("a/b/theirs in it is owned by uid 451, neither the owner nor _dftest2, and its owner may change it",
+            Walk(path => path.EndsWith("theirs", StringComparison.Ordinal) ? "is owned by uid 451, neither the owner nor _dftest2, and its owner may change it" : null));
+        // The owner is judged before the mode: a foreign 0644 file is refused for its owner, not passed for its mode.
+        File.SetUnixFileMode(Path.Combine(wt, "mine"), (UnixFileMode)0b110_110_110);
+        Assert.Equal("mine in it is someone else's", Walk(path => path.EndsWith("mine", StringComparison.Ordinal) ? "is someone else's" : null));
+        Assert.Equal("mine in it has a mode (0666) that lets every user write it", Walk(_ => null));
+    }
+
+    /// <summary>The push's owner reader on macOS: the real owner of each entry (lstat), the slot's user looked up by name, fail closed.</summary>
+    [Fact]
+    public void The_native_owner_reader_allows_the_owner_and_the_slots_user_and_refuses_root_and_an_unknown_user()
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            Assert.Skip("The sandbox users, and so the owner check, are macOS-only.");
+        }
+        var wt = Directory.CreateDirectory(Path.Combine(_root, "native-owned")).FullName;
+        var mine = Path.Combine(wt, "mine");
+        File.WriteAllText(mine, "");
+        var me = WorktreeWriters.UidOf(Environment.UserName);
+        Assert.NotNull(me);
+        Assert.Equal(me, WorktreeWriters.OwnerOf(mine));
+        Assert.Equal(0u, WorktreeWriters.OwnerOf("/"));
+        Assert.Equal(0u, WorktreeWriters.UidOf("root"));
+        Assert.Null(WorktreeWriters.UidOf("_dftest_no_such_user"));
+        Assert.Null(WorktreeWriters.OwnerOf(Path.Combine(wt, "gone")));
+
+        // The owner's own files pass, for any slot's user that exists ("daemon" stands in for one).
+        Assert.Null(WorktreeWriters.Inside(wt, "daemon", _ => null, CancellationToken.None, WorktreeWriters.NativeOwners("daemon")));
+        // A slot's user that cannot be looked up: nothing can be judged.
+        Assert.Equal("mine in it could not be judged: the user _dftest_no_such_user could not be looked up, so who may own what is in it is not known",
+            WorktreeWriters.Inside(wt, "_dftest_no_such_user", _ => null, CancellationToken.None, WorktreeWriters.NativeOwners("_dftest_no_such_user")));
+        // A hard link to another user's file (root's, 0644): its mode lets no one else write, but its owner may.
+        File.Delete(mine);
+        File.CreateSymbolicLink(Path.Combine(wt, "a-link-to-it"), "/private/etc/hosts"); // a link: not judged
+        Assert.Null(WorktreeWriters.Inside(wt, "daemon", _ => null, CancellationToken.None, WorktreeWriters.NativeOwners("daemon")));
+        using (var ln = System.Diagnostics.Process.Start("/bin/ln", ["/private/etc/hosts", Path.Combine(wt, "hosts")]))
+        {
+            ln.WaitForExit();
+        }
+        if (!File.Exists(Path.Combine(wt, "hosts")))
+        {
+            Assert.Skip("This volume does not let /private/etc/hosts be hard-linked into a temporary directory.");
+        }
+        Assert.Equal("hosts in it is owned by uid 0, neither the owner nor daemon, and its owner may change it",
+            WorktreeWriters.Inside(wt, "daemon", _ => null, CancellationToken.None, WorktreeWriters.NativeOwners("daemon")));
+        // With the slot's user being that owner (root, here), it passes.
+        Assert.Null(WorktreeWriters.Inside(wt, "root", _ => null, CancellationToken.None, WorktreeWriters.NativeOwners("root")));
+        File.Delete(Path.Combine(wt, "hosts")); // the link only: root's file is untouched
     }
 
     [Fact]
