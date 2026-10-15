@@ -194,8 +194,8 @@ public class SwiftLiveTests
         Assert.False(SwiftLive.ProbeOf("a.swift", Impact(true, true), Hot(true, false)).Indexed);
         // Before C3 (no flag): a Swift file CodeGraph has no data for is unindexed.
         Assert.False(SwiftLive.ProbeOf("a.swift", Impact(false, null), Hot(false, null)).Indexed);
-        // A C4 notIndexed impact answer (no overlay of that commit) is not read: the hotspot answer decides.
-        var notIndexed = Impact(null, null) with { IsError = true, NotIndexed = new CodeGraphNotIndexed("not_indexed", "none", "no overlay", null, null) };
+        // A C4 notIndexed impact answer (no overlay of that commit) is not read, whatever fields it carries: the hotspot answer decides.
+        var notIndexed = Impact(false, false) with { IsError = true, NotIndexed = new CodeGraphNotIndexed("not_indexed", "none", "no overlay", null, null) };
         Assert.True(SwiftLive.ProbeOf("a.swift", notIndexed, Hot(true, true)).Indexed);
         // An error answer fails the probe rather than reading as "not indexed".
         Assert.Contains("file_hotspot answered an error", Assert.Throws<InvalidOperationException>(() =>
@@ -248,8 +248,9 @@ public class SwiftLiveTests
         var missing = SwiftLive.EpicProblems([Item("sc-10", null, stories: ["sc-11", "sc-12"]), Item("sc-11", null)], []);
         Assert.Contains(missing, p => p.StartsWith("no real LensWorks epic", StringComparison.Ordinal));
         Assert.Contains(missing, p => p.Contains("sc-12, a story of the plan sc-10, is not listed", StringComparison.Ordinal));
-        Assert.Contains(SwiftLive.EpicProblems([Item("sc-10", null, stories: ["sc-11"]), Item("sc-11", null, delivered: false)], []),
-            p => p.Contains("sc-11, a story of the plan sc-10, was not delivered", StringComparison.Ordinal));
+        var undelivered = SwiftLive.EpicProblems([Item("sc-10", null, stories: ["sc-11"]), Item("sc-11", null, delivered: false)], []);
+        Assert.Contains(undelivered, p => p.Contains("sc-11, a story of the plan sc-10, was not delivered", StringComparison.Ordinal));
+        Assert.Contains(undelivered, p => p.StartsWith("no real LensWorks epic", StringComparison.Ordinal));
     }
 
     [Fact]
