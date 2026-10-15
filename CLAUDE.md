@@ -2299,7 +2299,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `options.WorkerSwift`), and only then do the implementing prompts name it (`RunPipeline.BuildsAndPassesFor(swift)`, the
   pipeline's `swift` parameter). With `Worker:Swift` unset no allow rule and no prompt names the
   wrapper. NOT as before Phase 5, in every factory whatever the setting — an E7 exception, like cargo's tools (sc-25877), kept
-  always-on by coordinator decision and pending the owner's confirmation (sc-26134): `Bash(swift build:*)` and `Bash(swift
+  always-on by coordinator decision, confirmed by the owner 2026-10-15 (sc-26134): `Bash(swift build:*)` and `Bash(swift
   test:*)` in `ClaudeWorker.AllowedTools` (`SwiftTools`, sc-26127), the Swift text of every implementing prompt's build-and-test
   clause (`RunPipeline.BuildsAndPasses`), `SwiftNewTests` among the default new-tests strategies (`NewTestsCheck.Strategies`),
   and raw `xcodebuild`/`/usr/bin/xcodebuild`/`xcrun`/`/usr/bin/xcrun` in every implementer's `--disallowedTools`

@@ -292,7 +292,7 @@ public class SwiftToolchainTests
     public void Without_worker_swift_only_the_xcode_wrapper_rule_and_prompt_clause_are_absent_and_the_always_on_swift_parts_are_there()
     {
         // With Worker:Swift unset no rule or prompt names the xcodebuild wrapper. What every factory gets whatever the setting —
-        // an E7 exception like cargo's tools (sc-25877), pending the owner's confirmation (sc-26134): SwiftPM's two allow rules,
+        // an E7 exception like cargo's tools (sc-25877), confirmed by the owner 2026-10-15 (sc-26134): SwiftPM's two allow rules,
         // the Swift text of the build-and-test clause, raw xcodebuild/xcrun denied, and SwiftNewTests among the strategies.
         string[] alwaysOn = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(dotnet restore:*)",
             "Bash(cargo build:*)", "Bash(cargo check:*)", "Bash(cargo test:*)", "Bash(cargo fetch:*)",

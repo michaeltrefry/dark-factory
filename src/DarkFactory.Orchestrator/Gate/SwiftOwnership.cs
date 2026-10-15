@@ -27,7 +27,9 @@ public enum SwiftOwner
 /// <item>In a package outside its test targets (an Xcode project's test folder beside a root <c>Package.swift</c>, or the
 /// package's own sources): <see cref="SwiftOwner.Xcode"/> when an Xcode project's unit-test or UI-test target compiles it, or
 /// whether one does cannot be told (Xcode then fails closed on it); otherwise <see cref="SwiftOwner.SwiftPM"/>, which names a
-/// test there unsupported as before.</item>
+/// test there unsupported as before. Fail closed: when the package's test target directories are not all known (its
+/// manifest cannot be read, or a test target's <c>path:</c> cannot be resolved), such a file is <see cref="SwiftOwner.Both"/>
+/// instead of <see cref="SwiftOwner.Xcode"/>, the reason naming the manifest's problem.</item>
 /// </list>
 /// Membership is read as <see cref="XcodeNewTests"/> reads it (<see cref="XcodeProject.Membership"/> over every
 /// <c>*.xcodeproj/project.pbxproj</c> of the commit; a project that cannot be read makes it not known).
@@ -57,38 +59,51 @@ public sealed class SwiftOwnership(Func<CancellationToken, Task<IReadOnlySet<str
 
     /// <summary>
     /// The directories of a package's test targets, relative to the package: <c>Tests</c> (the default layout) and each
-    /// <c>testTarget(…, path: "…")</c>'s declared path. A manifest that cannot be read gives <c>Tests</c> alone.
+    /// <c>testTarget(…, path: "…")</c>'s declared path; and why they are not all known — a manifest that cannot be read, or
+    /// a test target's <c>path:</c> that is not a plain string inside the package — when they are not (only <c>Tests</c>
+    /// and the paths that could be read are then given).
     /// </summary>
-    private async Task<IReadOnlyList<string>> TestDirectoriesAsync(string package, CancellationToken ct)
+    private async Task<(IReadOnlyList<string> Directories, string? Problem)> TestDirectoriesAsync(string package, CancellationToken ct)
     {
         if (!_manifests.TryGetValue(package, out var known))
         {
+            var manifestPath = package.Length == 0 ? "Package.swift" : $"{package}/Package.swift";
             var directories = new List<string> { "Tests" };
             string? problem = null;
             try
             {
-                var manifest = await read(package.Length == 0 ? "Package.swift" : $"{package}/Package.swift", ct) ?? "";
-                directories.AddRange(SwiftSource.TestTargetPaths(manifest).Select(t => t.Path).OfType<string>()
-                    .Select(p => p.Trim('/')).Where(p => p.Length > 0 && !p.Split('/').Any(s => s is "." or "..")));
+                var manifest = await read(manifestPath, ct) ?? throw new FormatException("it cannot be read");
+                foreach (var (name, custom, declared) in SwiftSource.TestTargetPaths(manifest))
+                {
+                    var path = declared?.Trim('/');
+                    if (path is { Length: > 0 } && !path.Split('/').Any(s => s is "." or ".."))
+                    {
+                        directories.Add(path);
+                    }
+                    else if (custom)
+                    {
+                        problem ??= $"its test target {name} declares a path: that cannot be resolved";
+                    }
+                }
             }
             catch (FormatException e)
             {
                 problem = e.Message;
             }
-            _manifests[package] = known = (directories, problem);
+            _manifests[package] = known = (directories, problem is null ? null : $"{manifestPath}: {problem}");
         }
-        return known.Directories;
+        return known;
     }
 
-    /// <summary>Whether <paramref name="path"/> is in a test target's directory of its SwiftPM package (<see cref="TestDirectoriesAsync"/>).</summary>
-    public async Task<bool> InPackageTestsAsync(string path, CancellationToken ct)
+    /// <summary>
+    /// Whether <paramref name="path"/> is in a test target's directory of its SwiftPM package (<see cref="TestDirectoriesAsync"/>),
+    /// and why its package's test targets are not all known when they are not.
+    /// </summary>
+    private async Task<(bool InTests, string? Problem)> InPackageTestsAsync(string package, string path, CancellationToken ct)
     {
-        if (PackageOf(await files(ct), path) is not { } package)
-        {
-            return false;
-        }
         var relative = package.Length == 0 ? path : path[(package.Length + 1)..];
-        return (await TestDirectoriesAsync(package, ct)).Any(d => relative.StartsWith(d + "/", StringComparison.Ordinal));
+        var (directories, problem) = await TestDirectoriesAsync(package, ct);
+        return (directories.Any(d => relative.StartsWith(d + "/", StringComparison.Ordinal)), problem);
     }
 
     /// <summary>The Xcode test targets that compile <paramref name="path"/> (<c>Target of Project</c>), and why membership cannot be told where it cannot.</summary>
@@ -145,11 +160,11 @@ public sealed class SwiftOwnership(Func<CancellationToken, Task<IReadOnlySet<str
     /// <summary>Which strategy judges <paramref name="path"/>, and why it is <see cref="SwiftOwner.Both"/> when it is.</summary>
     public async Task<(SwiftOwner Owner, string? Why)> OfAsync(string path, CancellationToken ct)
     {
-        if (PackageOf(await files(ct), path) is null)
+        if (PackageOf(await files(ct), path) is not { } package)
         {
             return (SwiftOwner.Xcode, null);
         }
-        var inTests = await InPackageTestsAsync(path, ct);
+        var (inTests, manifestProblem) = await InPackageTestsAsync(package, path, ct);
         var (tests, unknown) = await XcodeTestTargetsAsync(path, ct);
         if (inTests)
         {
@@ -158,6 +173,14 @@ public sealed class SwiftOwnership(Func<CancellationToken, Task<IReadOnlySet<str
                 : unknown.Count > 0
                 ? (SwiftOwner.Both, $"it is in a SwiftPM test target's directory, and whether an Xcode test target compiles it too cannot be told: {string.Join("; ", unknown.Distinct().Take(5))}")
                 : (SwiftOwner.SwiftPM, null);
+        }
+        if (manifestProblem is not null && (tests.Count > 0 || unknown.Count > 0))
+        {
+            // Fail closed: a test target of the package may hold it, at a path that could not be read.
+            return (SwiftOwner.Both, $"whether it is in a SwiftPM test target's directory cannot be told ({manifestProblem}), and "
+                + (tests.Count > 0
+                    ? $"the Xcode test target {string.Join(", ", tests)} compiles it, so which of them runs its tests cannot be told"
+                    : $"whether an Xcode test target compiles it cannot be told either: {string.Join("; ", unknown.Distinct().Take(5))}"));
         }
         return tests.Count > 0 || unknown.Count > 0 ? (SwiftOwner.Xcode, null) : (SwiftOwner.SwiftPM, null);
     }

@@ -413,14 +413,40 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         Assert.Equal(("error", (decimal?)null), (session.ExitStatus, session.CostUsd));
     }
 
+    /// <summary>
+    /// A viewer that joins a running session gets its stored backlog, then every later event live, once each and in order.
+    /// "Live" is proved by order, not by a wall-clock bet (an absolute 1 s bound failed under full-suite load): after the
+    /// viewer joined, the worker writes its next line only once the viewer has received the one before, so an event held
+    /// back until the session ends, or never relayed, stalls the session and fails the test. The wait per event is a
+    /// generous liveness bound (<see cref="LiveDeliveryTimeout"/>), and the failure says how long the viewer was waited for.
+    /// </summary>
     [Fact]
-    public async Task Joining_a_running_session_gets_its_backlog_then_live_events_once_each_within_a_second()
+    public async Task Joining_a_running_session_gets_its_backlog_then_each_live_event_before_the_next_is_written_once_each()
     {
         await using var host = await StartHostAsync();
         var app = host.App;
 
         var clock = Stopwatch.StartNew();
-        var worker = new FixtureWorker(clock, firstBatch: 5);
+        Viewer? joined = null;
+        string? notLive = null;
+        var worker = new FixtureWorker(clock, firstBatch: 5)
+        {
+            // After the worker wrote line i (0-based): the viewer must have it before line i + 1 is written.
+            Written = async (i, ct) =>
+            {
+                var waited = Stopwatch.StartNew();
+                while (joined!.Received.Count < i + 1)
+                {
+                    if (waited.Elapsed > LiveDeliveryTimeout)
+                    {
+                        notLive = $"event {i + 1} was not delivered within {waited.Elapsed} of being written, while the session was " +
+                            $"still running (the viewer had {joined.Received.Count} events)";
+                        throw new TimeoutException(notLive);
+                    }
+                    await Task.Delay(10, ct);
+                }
+            },
+        };
         await using var ledgerDb = Context();
         var pipeline = new RunPipeline(Stories(), new WorkLedger(ledgerDb, TimeProvider.System), new PostgresRunLocks(_cs),
             new Workspaces(), worker, new PullRequests(), new RepoRef("acme", "widgets"), TextWriter.Null,
@@ -432,26 +458,35 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         await WaitUntilAsync(async () => (await EventsAsync()).Count == 5);
 
         await using var viewer = await Viewer.JoinAsync(app, _cookies, StreamJsonFixture.SessionId, clock);
+        joined = viewer;
 
         worker.Release.SetResult();
-        var outcome = await run.WaitAsync(TimeSpan.FromSeconds(30));
+        var outcome = await run.WaitAsync(TimeSpan.FromSeconds(90));
+        Assert.Null(notLive);
         Assert.True(outcome.Succeeded, outcome.Error);
-        await WaitUntilAsync(() => Task.FromResult(viewer.Received.Count >= StreamJsonFixture.Fresh.Length));
         await Task.Delay(200); // nothing may arrive twice
 
         var got = viewer.Received.ToList();
         Assert.Equal(Enumerable.Range(1, 11).Select(i => (long)i), got.Select(r => r.Event.Sequence));
         Assert.Equal(StreamJsonFixture.Fresh, got.Select(r => r.Event.Payload));
-        foreach (var (e, at) in got.Skip(5))
+        // Each live event reached the viewer before the worker wrote the next line.
+        foreach (var (e, at) in got.Skip(5).SkipLast(1))
         {
-            var latency = at - worker.EmittedAt[(int)e.Sequence - 1];
-            Assert.True(latency < TimeSpan.FromSeconds(1), $"event {e.Sequence} arrived {latency} after the worker wrote it");
+            var next = worker.EmittedAt[(int)e.Sequence];
+            Assert.True(at < next, $"event {e.Sequence} arrived at {at}, after the worker wrote event {e.Sequence + 1} at {next}");
         }
 
         await using var db = Context();
         var session = await db.WorkerSessions.SingleAsync();
         Assert.Equal((StreamJsonFixture.SessionId, "succeeded", 0.429606m), (session.ClaudeSessionId, session.ExitStatus, session.CostUsd));
     }
+
+    /// <summary>
+    /// How long one live event may take from the worker's line to the viewer: a liveness bound, not a latency target. The
+    /// path (recorder → insert → NOTIFY → relay → broadcaster → SignalR) takes milliseconds when idle and has taken over a
+    /// second under full-suite load; an event that is not relayed live never arrives while the session waits, whatever the bound.
+    /// </summary>
+    private static readonly TimeSpan LiveDeliveryTimeout = TimeSpan.FromSeconds(10);
 
     /// <summary>
     /// The backlog→live handoff under load: a recorder outside the host (as a separate
@@ -841,9 +876,15 @@ public sealed class SessionCaptureTests : IAsyncLifetime
         public Task<bool> StopOrphanAsync(int pid, CancellationToken ct) => Task.FromResult(false);
     }
 
-    /// <summary>Writes the recorded fixture: a first batch, then (once released) the rest, 50 ms apart.</summary>
+    /// <summary>
+    /// Writes the recorded fixture: a first batch, then (once released) the rest, 50 ms apart — each only once
+    /// <see cref="Written"/>, when set, has returned for the line before.
+    /// </summary>
     private sealed class FixtureWorker(Stopwatch clock, int firstBatch) : IWorker
     {
+        /// <summary>Called with a line's index after each line of the released part is written.</summary>
+        public Func<int, CancellationToken, Task>? Written { get; init; }
+
         public TaskCompletionSource FirstBatchSent { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TimeSpan[] EmittedAt { get; } = new TimeSpan[StreamJsonFixture.Fresh.Length];
@@ -869,6 +910,10 @@ public sealed class SessionCaptureTests : IAsyncLifetime
                 if (i == 0)
                 {
                     await callbacks.OnSession!(StreamJsonFixture.SessionId, ct);
+                }
+                if (i >= firstBatch && Written is not null)
+                {
+                    await Written(i, ct);
                 }
             }
             return new WorkerResult(StreamJsonFixture.SessionId, 0, false, "success", "done", "");

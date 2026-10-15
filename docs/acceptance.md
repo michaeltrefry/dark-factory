@@ -1396,8 +1396,14 @@ ledger** and its own work root (`E2e`), and takes every worker slot's lock of th
 
    The iOS repository is `FACTORY_E2E_P5_IOS_REPO` (`owner/name`), **default: the sandbox**: the owner has no iOS app on GitHub
    today (no SceneWorks iOS app exists), so the throwaway `Tally` app in the sandbox stands in; `FACTORY_E2E_P5_IOS_DIR` moves
-   the seed (default `e2e-ios`). Every seeded file says `[dark-factory e2e]`; the sandbox's own .NET CI and build read none of
-   them. A test whose seed is missing on `main` skips naming this step.
+   the seed (default `e2e-ios`). Not every seeded file carries the `[dark-factory e2e]` marker: in `e2e-swift/` all three do
+   (`Package.swift`, `DfE2eSwift.swift`, `DfE2eSwiftTests.swift`), in `e2e-ios/` only `Tally/Tally.swift` and
+   `Tally/E2eRun.swift` — `project.pbxproj`, `Tally.xcscheme`, `Counter.swift`, `TallyTests.swift` and `TallyUITests.swift`
+   have none (they were copied unchanged into the sandbox, michaeltrefry/dark-factory-sandbox#90, and are left so); the
+   directories `e2e-swift/` and `e2e-ios/` are what mark them as the e2e seeds. The sandbox's own .NET CI and build read none of
+   them. A test whose seed is missing on `main` skips naming this step. **After the seed pull request merges, have CodeGraph
+   re-index the sandbox (and any other seeded repository) before P5-AT2–AT6**: the language probe of step 6 needs `found: true`
+   for the seed's Swift files, and fails, rather than skips, when CodeGraph indexes Swift but its index predates the seed.
 
 ## P5-AT1 to P5-AT6
 
