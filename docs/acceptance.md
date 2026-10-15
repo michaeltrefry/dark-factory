@@ -203,10 +203,13 @@ Owner set-up, once (the test skips naming whichever is missing):
    note at start-up and the gate records `no CodeGraph data: CodeGraph is not configured …` for every file), (b) `michaeltrefry/dark-factory-sandbox` indexed in the hosted CodeGraph
    (its project's repository URL exactly `https://github.com/michaeltrefry/dark-factory-sandbox`), and (c) CodeGraph's head overlays
    (C4/C6, michaeltrefry/CodeGraph PRs #71/#75) and risk tools (C7, PR #76: `analyze_impact_file`, `file_hotspot`) deployed and the
-   token entitled to them. Missing any of these, the gate waits on `risk-threshold` like pending CI and escalates at
-   `Gate:CiTimeoutMinutes` instead of merging — so `ReviewGateTests`, `IssueTriageTests`' build test, the P2 epic AT2 run and the
-   Phase 1 AT1–AT5 runs (which go through the gate) all need them; `GateNegativeTests` and `FreezeAndStuckTests` escalate before
-   `risk-threshold` is read and do not.
+   token entitled to them. Missing any of these, the gate does NOT wait or escalate for it: it records `no CodeGraph data:
+   <reason>` for the files concerned and merges on the change's other inputs (with no head overlay ready, the blast radius is
+   read from the default-branch index instead, labelled `on the default branch as of <sha>, not the PR head`, and still held to
+   the floor). So `ReviewGateTests`, `IssueTriageTests`' build test, the P2 epic AT2 run and the Phase 1 AT1–AT5 runs (which go
+   through the gate) merge without CodeGraph; they need it only to see its data used in the `gate` row. The CodeGraph tests
+   (`CodeGraphGateTests`: a critical file escalating) need all of (a)–(c). `GateNegativeTests` and `FreezeAndStuckTests`
+   escalate before `risk-threshold` is read either way.
 
 No reviewer model is set anywhere (owner decision 2026-10-09, epic E8, sc-25626): every review and second opinion names
 the router's `high` model class (`x-weave-model-class: high`, never `x-weave-force-model`, which simple-router ignores) and

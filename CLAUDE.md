@@ -2848,15 +2848,30 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   CodeGraph's `riskScore`. CodeGraph is optional (sc-26254, owner decision 2026-10-15: "The factory should be able to work with or
   without CodeGraph"): its inputs are used when available, and every touched file it gives no usable input for is recorded as
   having NO CODEGRAPH DATA, with why (`NoCodeGraphData`, `CodeGraphRisk.NoData`), and judged on its other inputs (changed lines and
-  files, fix rounds, the changeset limits) — never pending, never blocked for it. The causes: CodeGraph not configured (no token:
-  `GateStage.Risk` null, `CodeGraph is not configured (no CodeGraph token: …)`), unreachable or refusing (HTTP 403
-  `tool_not_entitled`, a timeout), the repository not indexed, no ready overlay of the head within `CodeGraph:OverlayTimeoutMinutes`
-  (failed, refused, timed out, stale after the one re-request, unavailable — the blast radius only: the hotspots, the default
-  branch's, are still read and used), an error answer, an answer for another commit or another file or unreadable (that file and
-  tool only), inputs read for another head or leaving a file out, and a language CodeGraph does not index (below). The reader
-  (`CodeGraphRiskReader`) goes on past an unusable answer to the next file; a call that cannot be made at all (thrown: unreachable,
-  refused over HTTP, timed out) or C4's `notIndexed` ends that tool's calls, its remaining files recorded `<tool> not asked: <why>`,
-  so an unreachable CodeGraph costs one call per tool. `EvaluateGateAsync` evaluates once more with the inputs read — no polling
+  files, fix rounds, the changeset limits) — never pending, never blocked for it. What is left as no data — the owner's decision
+  (2026-10-15), stated as the residual: CodeGraph UNAVAILABLE — not configured (no token: `GateStage.Risk` null, `CodeGraph is not
+  configured (no CodeGraph token: …)`), down after the retries below, refusing (HTTP 403 `tool_not_entitled`, another 4xx), the
+  repository or the file's language not indexed (below), or BOTH the head-overlay read and the default-branch read of a file's blast
+  radius failing — and, per file and tool, an error answer, an answer for another commit or another file, inputs read for another
+  head or leaving a file out. A misread or a transient failure is NOT missing data (sc-26254 review): (1) a blast radius CodeGraph
+  answers for a found file is parsed in any case (`BlastRadii.TryParseAnswer`; the policy's own `max_blast_radius` stays lowercase
+  only), and one the gate does not recognise BLOCKS (`UnrecognisedBlastRadius`, `CodeGraphRisk.Unrecognised`: "risk threshold:
+  CodeGraph answered an unrecognised blast radius `<value>` for <file>", the value shown only as a plain word); (2) a call that
+  throws — unreachable, HTTP 5xx/408/429, a timeout, a broken answer — is tried `CodeGraphRiskReader.Attempts` (3) times with
+  `Backoff` 1 s then 2 s between (an injectable delay; inside the `Gate:CiTimeoutMinutes` backstop) before it counts as
+  unreachable; a typed answer (an error code, an HTTP 4xx) is never retried; (3) with no ready overlay of the head (failed, refused,
+  timed out, unavailable within `CodeGraph:OverlayTimeoutMinutes`) — or once CodeGraph answers C4's `notIndexed` for the head (the
+  overlay then also requested again once) — the blast radius is read from the default-branch index: `analyze_impact_file` with no
+  `sha`, an answer that names its commit and comes from `source: default-branch` only, recorded with that commit
+  (`FileBlastRadius.DefaultBranchCommit`) and labelled ``codegraph blast radius on the default branch as of <sha>, not the PR
+  head``, and held to the same floor and `max_blast_radius` (a failure says `blast radius on the default branch as of <sha>, not
+  the PR head, over …`); only if that read fails too is the file without data, both reasons recorded (``blast radius: <why not
+  at the head>; on the default branch: <why>``); (4) a file whose language CodeGraph does not index keeps whatever data CodeGraph
+  did answer for it (`found: true`: a critical from one tool still blocks), only the missing part recorded (``hotspot: its
+  language …`` / ``blast radius: its language …``; `CodeGraphRisk.Judged`, `UnindexedFile.Missing`). The reader
+  (`CodeGraphRiskReader`) goes on past an unusable answer to the next file; a call that cannot be made at all (after its retries,
+  or refused over HTTP) ends that tool's calls, its remaining files recorded `<tool> not asked: <why>`, so an unreachable
+  CodeGraph costs one call (and its retries) per tool. `EvaluateGateAsync` evaluates once more with the inputs read — no polling
   loop (`GateOutcome.Pending` comes only from the evaluation before CodeGraph is read); `Gate:CiTimeoutMinutes` bounds the whole
   CodeGraph read only as a backstop for a CodeGraph that hangs (cut off: every file `CodeGraph did not answer within …`). The blast
   radius has a code floor (`GatePolicy.BlastRadiusFloor` =
@@ -2880,7 +2895,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   replaces the inference (`LanguageCoverage.Add`). CodeGraph's `language` is untrusted text (E3): shown only when, trimmed, it
   is at most 60 characters of ASCII letters, digits, `+ # . _ -` and spaces (`LanguageCoverage.Name`); otherwise the factory's
   name by extension stands in, or `language unknown`. An unindexed touched file (deletes and both sides of a rename included)
-  has no CodeGraph data: its blast radius and hotspot are not used, and the `gate` row records ``no CodeGraph data: its language
+  has no CodeGraph data for what CodeGraph did not answer (`found` not true; data it did answer is used, (4) above), and the `gate` row records ``no CodeGraph data: its language
   (Swift) is not indexed by CodeGraph: Sources/A.swift`` (` (CodeGraph answered no languageIndexed flag: before C3)` when
   inferred; `UnindexedFile.Reason`); the change is judged on its other inputs and merges like any other. A cached hotspot keeps
   its answer's flag and name (`FileHotspot.LanguageIndexed`/`Language`). CodeGraph's main does NOT index Swift today (only its
@@ -2894,7 +2909,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   ``no CodeGraph data: <reason>: <file>, …`` per reason, each reason's files and the reasons capped likewise
   (`CodeGraphRisk.NoDataText`) — so one row stays inside the reports' budget; a Merge's reason adds `no CodeGraph data for N of M
   file(s), judged on size and fix rounds`. The reports (PR body, closeout, escalation comment: `LedgerReport`) show a `gate`
-  row's no-data list on its own, after the row's clipped text (`CodeGraphRisk.NoDataMark`, at most 2,000 characters); a failure's
+  row's no-data list on its own, after the row's clipped text (`CodeGraphRisk.NoDataMark`, at most 2,000 characters), found by a
+  separator no other text of the row can hold (`CodeGraphRisk.Separator`, U+241E: every path, reason and CodeGraph text of the
+  row, the decision's reasons included, goes through `CodeGraphRisk.Inert`), so CodeGraph's text cannot move the split; a failure's
   reason names each file over the limit with its blast radius (or hotspot score), so the escalation comment and the PR report (both
   from the ledger) name it. The gate sends `analyze_impact_file`/`file_hotspot` (`CodeGraphMcpClient.RiskTools`) straight through the MCP
   client. They are on no reviewers' tool list and not in the triage profile; since sc-25874 they are on the planner profile's

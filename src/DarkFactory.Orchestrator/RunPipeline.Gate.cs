@@ -642,10 +642,12 @@ public sealed partial class RunPipeline
 
     /// <summary>
     /// CodeGraph's inputs to <c>risk-threshold</c> for the PR head (sc-25709), read only once everything else the gate checks holds (the
-    /// gate evaluated without them came out <see cref="GateOutcome.Pending"/>), and read once (sc-26254). The blast radius needs
-    /// CodeGraph's overlay of exactly the head (<see cref="HeadOverlayAsync"/>: a ready one recorded for it is reused; otherwise it is
-    /// requested and waited for, at most <c>CodeGraph:OverlayTimeoutMinutes</c>); a recorded one CodeGraph no longer uses
+    /// gate evaluated without them came out <see cref="GateOutcome.Pending"/>), and read once (sc-26254). The blast radius is read at
+    /// the head through CodeGraph's overlay of exactly the head (<see cref="HeadOverlayAsync"/>: a ready one recorded for it is reused;
+    /// otherwise it is requested and waited for, at most <c>CodeGraph:OverlayTimeoutMinutes</c>), else from the default-branch index,
+    /// labelled not the PR head (<see cref="CodeGraphRiskReader"/>); a recorded overlay CodeGraph no longer uses
     /// (<see cref="CodeGraphRisk.OverlayUnusable"/>, e.g. stale) is requested again once. The hotspots are read from the default branch.
+    /// A call that fails transiently is retried by the reader (<see cref="CodeGraphRiskReader.Attempts"/>) inside this backstop.
     /// The whole read is bounded by <c>Gate:CiTimeoutMinutes</c> (a backstop for a CodeGraph that hangs): cut off there, every file has
     /// no CodeGraph data. Whatever is missing is recorded per file and never holds the gate.
     /// </summary>

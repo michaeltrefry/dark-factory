@@ -148,10 +148,20 @@ public sealed partial class CodeGraphMcpClient : ICodeGraph, ICodeGraphRisk
     /// </summary>
     public static readonly IReadOnlyList<string> RiskTools = [AnalyzeImpactFileTool, FileHotspotTool];
 
-    /// <summary><c>analyze_impact_file(repo, path, sha, depth)</c>, straight through the MCP client (the gate's own call).</summary>
-    public async Task<ImpactFileAnswer> AnalyzeImpactFileAsync(string project, string path, string sha, int depth, CancellationToken ct) =>
-        ImpactFile(await _client.CallToolAsync(AnalyzeImpactFileTool,
-            new JsonObject { ["repo"] = project, ["path"] = path, ["sha"] = sha, ["depth"] = depth }, ct));
+    /// <summary>
+    /// <c>analyze_impact_file(repo, path, sha, depth)</c>, straight through the MCP client (the gate's own call); <paramref name="sha"/>
+    /// null sends no <c>sha</c>: the default-branch index answers (sc-26254).
+    /// </summary>
+    public async Task<ImpactFileAnswer> AnalyzeImpactFileAsync(string project, string path, string? sha, int depth, CancellationToken ct)
+    {
+        var arguments = new JsonObject { ["repo"] = project, ["path"] = path };
+        if (sha is not null)
+        {
+            arguments["sha"] = sha;
+        }
+        arguments["depth"] = depth;
+        return ImpactFile(await _client.CallToolAsync(AnalyzeImpactFileTool, arguments, ct));
+    }
 
     /// <summary><c>file_hotspot(repo, path)</c>, straight through the MCP client (the gate's own call).</summary>
     public async Task<HotspotAnswer> FileHotspotAsync(string project, string path, CancellationToken ct) =>
@@ -168,7 +178,7 @@ public sealed partial class CodeGraphMcpClient : ICodeGraph, ICodeGraphRisk
         var s = result.Structured as JsonObject;
         return new ImpactFileAnswer(result.IsError, result.Text, Commit(result.Structured, result.Text), NotIndexedOf(result.Structured),
             s?["error"] is JsonObject e ? Str(e, "code") : null, Bool(s, "found"), Str(s, "blastRadius"), Str(s, "path"),
-            Bool(s, "languageIndexed"), Str(s, "language"));
+            Bool(s, "languageIndexed"), Str(s, "language"), Str(s, "source"));
     }
 
     /// <summary>

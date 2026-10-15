@@ -351,7 +351,7 @@ public static class LedgerReport
                 var detail = row.Detail ?? "";
                 var noData = detail.IndexOf(CodeGraphRisk.NoDataMark, StringComparison.Ordinal);
                 return $"merge gate: {Code(detail)}"
-                    + (noData < 0 ? "" : $"; {UntrustedText.CodeSpan(Clip(detail[(noData + 2)..], MaxNoCodeGraphData))}");
+                    + (noData < 0 ? "" : $"; {UntrustedText.CodeSpan(Clip(detail[(noData + CodeGraphRisk.NoDataSeparator.Length)..], MaxNoCodeGraphData))}");
             case RunPipeline.Steps.CiFailure when CiTriage.FromDetail(row.Detail) is { } triage:
                 return $"CI on {Code(Ci.Short(triage.HeadSha))} failed: the PR's {List(triage.Fixable)}; not the PR's {List(triage.NotThePrs)}";
             case RunPipeline.Steps.MergeConflict:

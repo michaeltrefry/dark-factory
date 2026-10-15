@@ -167,7 +167,8 @@ public sealed record GateDecision(GateOutcome Outcome, string HeadSha, IReadOnly
     public const string ChangesetMark = " (changeset pull request)";
 
     public string Detail =>
-        $"{Outcome} {Ci.Short(HeadSha)}{(Changeset ? ChangesetMark : "")}: {string.Join("; ", Reasons)}{(Inputs is null ? "" : $" | {Inputs}")}";
+        // The reasons go through CodeGraphRisk.Inert, so only the inputs' own separator can mark where the files with no CodeGraph data start.
+        $"{Outcome} {Ci.Short(HeadSha)}{(Changeset ? ChangesetMark : "")}: {CodeGraphRisk.Inert(string.Join("; ", Reasons))}{(Inputs is null ? "" : $" | {Inputs}")}";
 }
 
 /// <summary>
@@ -398,7 +399,7 @@ public static class MergeGate
                 ? $"{classified.ChangedLines} changed lines within {linesKey} {maxLines}, {classified.ChangedFiles} files within {filesKey} {maxFiles}"
                 : $"{classified.ChangedLines} changed lines, {classified.ChangedFiles} files";
             passed.Add($"risk within threshold ({size}, {change.FixRounds} fix rounds, "
-                + $"worst blast radius {(worst is null ? "none (no file)" : $"{BlastRadii.Name(worst.Radius)} ({worst.Path})")}, "
+                + $"worst blast radius {(worst is null ? "none (no file)" : $"{BlastRadii.Name(worst.Radius)} ({worst.Path}{(worst.DefaultBranchCommit is { } c ? $", on the default branch as of {Ci.Short(c)}, not the PR head" : "")})")}, "
                 + $"highest hotspot score {(hottest is null ? "none (no file)" : $"{CodeGraphRisk.Score(hottest.Score)} ({hottest.Path})")}"
                 + $"{(policy.Risk.MaxHotspot is { } max ? $" within max_hotspot {CodeGraphRisk.Score(max)}" : ", max_hotspot off")}"
                 + $"{(judged.NoDataFiles > 0 ? $"; no CodeGraph data for {judged.NoDataFiles} of {TouchedFiles(diff).Count} file(s), judged on size and fix rounds" : "")})");
@@ -453,11 +454,16 @@ public static class MergeGate
     /// </summary>
     private static void CodeGraphReasons(RiskThreshold threshold, BlastRadius? limit, string by, string head, CodeGraphRisk risk, List<string> reasons)
     {
-        var over = risk.BlastRadius.Where(f => limit is { } l && f.Radius > l).OrderByDescending(f => f.Radius).ToList();
-        if (over.Count > 0)
+        // A blast radius read from the default-branch index (no overlay of the head was ready, sc-26254) is held to the same limit,
+        // labelled with its commit.
+        foreach (var where in risk.BlastRadius.Where(f => limit is { } l && f.Radius > l).GroupBy(f => f.DefaultBranchCommit))
         {
-            reasons.Add($"risk threshold: blast radius at {Ci.Short(head)} over {by}: {string.Join(", ", over.Select(f => $"{f.Path} {BlastRadii.Name(f.Radius)}"))}");
+            var over = where.OrderByDescending(f => f.Radius).ToList();
+            reasons.Add($"risk threshold: blast radius {(where.Key is { } c ? $"on the default branch as of {Ci.Short(c)}, not the PR head," : $"at {Ci.Short(head)}")} "
+                + $"over {by}: {string.Join(", ", over.Select(f => $"{f.Path} {BlastRadii.Name(f.Radius)}"))}");
         }
+        // A blast radius CodeGraph answered that the gate does not recognise is a misread, not missing data: it blocks.
+        reasons.AddRange(risk.UnrecognisedRadii.Select(u => u.Reason));
         if (threshold.MaxHotspot is { } maxHotspot)
         {
             var hot = risk.Hotspots.Where(f => f.Score > maxHotspot).OrderByDescending(f => f.Score).ToList();

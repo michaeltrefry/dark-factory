@@ -52,7 +52,10 @@ public sealed class FakeCodeGraphRisk : ICodeGraphRisk
     /// hands its gate a fake clock passes it here, so the pairing cannot be got wrong test by test.
     /// </param>
     public static CodeGraphRiskReader Reader(FakeCodeGraphRisk? fake = null, bool onFakeClock = false) =>
-        new(fake ?? new FakeCodeGraphRisk(), onFakeClock ? FakeClockOverlayTimeout : OverlayTimeout, TimeSpan.FromMilliseconds(1));
+        new(fake ?? new FakeCodeGraphRisk(), onFakeClock ? FakeClockOverlayTimeout : OverlayTimeout, TimeSpan.FromMilliseconds(1), NoWait);
+
+    /// <summary>A test reader's wait between attempts: none (the retries are counted, not timed).</summary>
+    public static Task NoWait(TimeSpan delay, CancellationToken ct) => Task.CompletedTask;
 
     /// <summary>A found file's impact answer at <paramref name="sha"/> (C7).</summary>
     public static ImpactFileAnswer Found(string path, string sha, BlastRadius radius) =>
@@ -86,12 +89,25 @@ public sealed class FakeCodeGraphRisk : ICodeGraphRisk
         return Task.FromResult(Status?.Invoke(overlayId) ?? new OverlayAnswer(false, "failed", overlayId, "failed", null, null, "polled"));
     }
 
-    public Task<ImpactFileAnswer> AnalyzeImpactFileAsync(string project, string path, string sha, int depth, CancellationToken ct)
+    public Task<ImpactFileAnswer> AnalyzeImpactFileAsync(string project, string path, string? sha, int depth, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
-        Calls.Add(("analyze_impact_file", path));
-        return Task.FromResult(Impact?.Invoke(path, sha) ?? C7Answers.ParsedImpactFile(project, path, sha, false, "none"));
+        Calls.Add((sha is null ? DefaultBranchImpactCall : "analyze_impact_file", path));
+        // No sha: the default-branch index answers, at its index commit (sc-26254).
+        return Task.FromResult(sha is null
+            ? DefaultImpact?.Invoke(path) ?? CodeGraphMcpClient.ImpactFile(C7Answers.Result(C7Answers.ImpactFile(project, path, IndexCommit, false, "none", overlay: false)))
+            : Impact?.Invoke(path, sha) ?? C7Answers.ParsedImpactFile(project, path, sha, false, "none"));
     }
+
+    /// <summary>How <see cref="Calls"/> names an <c>analyze_impact_file</c> call sent without <c>sha</c> (the default branch).</summary>
+    public const string DefaultBranchImpactCall = "analyze_impact_file (default branch)";
+
+    /// <summary>When set, the default-branch impact answer for a path (a call without <c>sha</c>); throw from it to make the call fail.</summary>
+    public Func<string, ImpactFileAnswer>? DefaultImpact { get; set; }
+
+    /// <summary>A found file's default-branch impact answer at the index commit (C7, no <c>sha</c> asked).</summary>
+    public static ImpactFileAnswer FoundOnDefault(string path, BlastRadius radius) =>
+        CodeGraphMcpClient.ImpactFile(C7Answers.Result(C7Answers.ImpactFile("Sandbox", path, IndexCommit, true, BlastRadii.Name(radius), overlay: false)));
 
     public Task<HotspotAnswer> FileHotspotAsync(string project, string path, CancellationToken ct)
     {

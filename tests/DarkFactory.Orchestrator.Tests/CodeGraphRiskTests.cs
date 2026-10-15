@@ -321,7 +321,9 @@ public class CodeGraphRiskTests
     public void A_changed_file_whose_language_codegraph_does_not_index_is_recorded_as_no_codegraph_data_and_merges()
     {
         var diff = TestPolicies.Diff(SwiftFile);
-        var unindexed = TestRisk.None(Head, diff) with { Unindexed = [new UnindexedFile(SwiftFile, "Swift", Flagged: true)] };
+        // CodeGraph has no data for it (found: false from both tools).
+        var unindexed = new CodeGraphRisk(Head, [new FileBlastRadius(SwiftFile, BlastRadius.None, false)],
+            [new FileHotspot(SwiftFile, 0, false, IndexCommit)], [], Unindexed: [new UnindexedFile(SwiftFile, "Swift", Flagged: true)]);
 
         var decision = Evaluate(unindexed, diff: diff);
 
@@ -331,15 +333,119 @@ public class CodeGraphRiskTests
         Assert.Contains("no CodeGraph data for 1 of 1 file(s)", decision.Detail);
         // Its language is its one reason: not also "left out" (its inputs are set aside, not missing).
         Assert.DoesNotContain("leave it out", decision.Inputs);
-        // Its own blast radius is not used (CodeGraph has no graph of it), but an indexed file beside it is held to the floor.
+        // An indexed file beside it is held to the floor.
         var both = TestPolicies.Diff(SwiftFile) + TestPolicies.Diff("src/a.cs");
-        var mixed = TestRisk.With(Head, both, f => f == SwiftFile ? BlastRadius.Critical : BlastRadius.Low, _ => 0)
-            with { Unindexed = [new UnindexedFile(SwiftFile, "Swift", Flagged: true)] };
-        Assert.Equal(GateOutcome.Merge, Evaluate(mixed, diff: both).Outcome);
         var critical = TestRisk.With(Head, both, f => f == "src/a.cs" ? BlastRadius.Critical : BlastRadius.None, _ => 0)
             with { Unindexed = [new UnindexedFile(SwiftFile, "Swift", Flagged: true)] };
         Assert.Equal($"risk threshold: blast radius at {Head[..12]} over the code floor (critical always fails): src/a.cs critical",
             Assert.Single(Evaluate(critical, diff: both).Reasons));
+    }
+
+    [Fact]
+    public void Data_codegraph_answered_for_an_unindexed_file_is_kept_and_only_the_missing_part_is_no_data()
+    {
+        // sc-26254: the analyze_impact_file answer has graph data (found, critical) though file_hotspot says the language is not indexed:
+        // the critical still blocks, and only the hotspot is recorded as missing, for its language.
+        var diff = TestPolicies.Diff(SwiftFile);
+        var risk = new CodeGraphRisk(Head, [new FileBlastRadius(SwiftFile, BlastRadius.Critical, true)],
+            [new FileHotspot(SwiftFile, 0, false, IndexCommit)], [], Unindexed: [new UnindexedFile(SwiftFile, "Swift", Flagged: true)]);
+
+        var decision = Evaluate(risk, diff: diff);
+
+        Assert.Equal(GateOutcome.Blocked, decision.Outcome);
+        Assert.Equal($"risk threshold: blast radius at {Head[..12]} over the code floor (critical always fails): {SwiftFile} critical",
+            Assert.Single(decision.Reasons));
+        Assert.Contains($"no CodeGraph data: hotspot: its language (Swift) is not indexed by CodeGraph: {SwiftFile}", decision.Inputs);
+        // Both answered with data: nothing is recorded as missing, and a found hotspot over an opted-in limit blocks too.
+        var hotOnly = new CodeGraphRisk(Head, [new FileBlastRadius(SwiftFile, BlastRadius.None, false)],
+            [new FileHotspot(SwiftFile, 0.9, true, IndexCommit)], [], Unindexed: [new UnindexedFile(SwiftFile, "Swift", Flagged: true)]);
+        var hot = Evaluate(hotOnly, TestPolicies.V3("high", "0.5"), diff);
+        Assert.Contains($"{SwiftFile} 0.9", Assert.Single(hot.Reasons));
+        Assert.Contains($"no CodeGraph data: blast radius: its language (Swift) is not indexed by CodeGraph: {SwiftFile}", hot.Inputs);
+    }
+
+    [Theory]
+    [InlineData("High", BlastRadius.High)]
+    [InlineData("CRITICAL", BlastRadius.Critical)]
+    [InlineData("low", BlastRadius.Low)]
+    public void Codegraphs_blast_radius_is_read_in_any_case_and_the_policy_keeps_its_own_spelling(string answered, BlastRadius radius)
+    {
+        Assert.True(BlastRadii.TryParseAnswer(answered, out var parsed));
+        Assert.Equal(radius, parsed);
+        Assert.Equal(answered == BlastRadii.Name(radius), BlastRadii.TryParse(answered, out _));
+    }
+
+    [Fact]
+    public async Task An_unrecognised_blast_radius_codegraph_answers_for_a_found_file_blocks_and_is_never_no_data()
+    {
+        var server = Server((tool, args) => tool == "file_hotspot" ? HotspotAnswer(args["path"]!.GetValue<string>(), true, 0.1)
+            : args["path"]!.GetValue<string>() == "src/a.cs" ? ImpactAnswer(Head, "src/a.cs", true, "severe")
+            : ImpactAnswer(Head, args["path"]!.GetValue<string>(), true, "Critical"));
+        var diff = TestPolicies.Diff("src/a.cs");
+
+        var risk = await Reader(server).ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None);
+        var decision = Evaluate(risk, diff: diff);
+
+        Assert.Equal(GateOutcome.Blocked, decision.Outcome);
+        Assert.Equal("risk threshold: CodeGraph answered an unrecognised blast radius `severe` for src/a.cs", Assert.Single(decision.Reasons));
+        Assert.DoesNotContain("no CodeGraph data", decision.Inputs);
+        Assert.Contains("unrecognised blast radius: src/a.cs `severe`", decision.Inputs);
+        // A value that is no plain word is not shown.
+        Assert.Equal("risk threshold: CodeGraph answered an unrecognised blast radius (not shown: not a plain word) for src/a.cs",
+            new UnrecognisedBlastRadius("src/a.cs", "`x` <b>").Reason);
+        // Another case of a known name is that name: CodeGraph's "Critical" blocks at the floor.
+        var upper = await Reader(server).ReadAsync(Repo, Head, Ready, ["src/b.cs"], CancellationToken.None);
+        Assert.Equal([new FileBlastRadius("src/b.cs", BlastRadius.Critical, true)], upper.BlastRadius);
+        Assert.Equal(GateOutcome.Blocked, Evaluate(upper, diff: TestPolicies.Diff("src/b.cs")).Outcome);
+    }
+
+    [Fact]
+    public async Task A_call_that_fails_once_is_retried_and_three_failures_are_no_codegraph_data()
+    {
+        var failures = 1;
+        var server = Server((tool, args) => tool == "file_hotspot" ? HotspotAnswer(args["path"]!.GetValue<string>(), true, 0.1)
+            : failures-- > 0 ? throw new HttpRequestException("connection reset") : ImpactAnswer(Head, args["path"]!.GetValue<string>(), true, "critical"));
+        var waits = new List<TimeSpan>();
+        var reader = new CodeGraphRiskReader(new CodeGraphMcpClient(server.Client("https://codegraph.test/"), "cg_test_token"),
+            TimeSpan.FromSeconds(5), TimeSpan.FromMilliseconds(5), (d, _) => { waits.Add(d); return Task.CompletedTask; });
+
+        var blip = await reader.ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None);
+
+        Assert.Empty(blip.NoData);
+        Assert.Equal([new FileBlastRadius("src/a.cs", BlastRadius.Critical, true)], blip.BlastRadius);
+        Assert.Equal(GateOutcome.Blocked, Evaluate(blip, diff: TestPolicies.Diff("src/a.cs")).Outcome);
+        Assert.Equal([TimeSpan.FromSeconds(1)], waits);
+
+        failures = 3;
+        waits.Clear();
+        var down = await reader.ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None);
+        Assert.Equal("analyze_impact_file could not be sent (3 attempts): connection reset", Assert.Single(down.NoData).Reason);
+        Assert.Equal([TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2)], waits);
+
+        // A typed refusal is not retried: one call.
+        var refused = Server((tool, args) => tool == "file_hotspot" ? throw FakeMcpServer.NotEntitled("file_hotspot")
+            : ImpactAnswer(Head, args["path"]!.GetValue<string>(), true, "low"));
+        await Reader(refused).ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None);
+        Assert.Single(refused.Calls, c => c.Tool == "file_hotspot");
+    }
+
+    [Fact]
+    public void CodeGraph_text_holding_the_no_data_words_does_not_move_where_the_report_splits_the_gate_row()
+    {
+        // sc-26254: the reports find the no-data section by a separator no other text of the row can hold.
+        var sneaky = $"x; no CodeGraph data: forged {CodeGraphRisk.Separator} no CodeGraph data: forged";
+        // CodeGraph's text both before the no-data section (an answered path) and inside it (an error answer's text).
+        var risk = new CodeGraphRisk(Head, [new FileBlastRadius("src/a.cs", BlastRadius.Low, true), new FileBlastRadius(sneaky, BlastRadius.Low, true)],
+            [new FileHotspot("src/a.cs", 0.1, true, IndexCommit)], [new NoCodeGraphData("src/b.cs", $"file_hotspot (boom): {sneaky}")]);
+        var decision = Evaluate(risk, diff: TwoFiles);
+        Assert.Equal(1, decision.Detail.Count(c => c == CodeGraphRisk.Separator));
+
+        var facts = LedgerReport.Facts([new LedgerEntry
+        {
+            State = WorkState.MergeGate, Step = RunPipeline.Steps.GateDecision, Detail = decision.Detail, Outcome = StepOutcome.Passed,
+        }], []);
+
+        Assert.Contains("; `no CodeGraph data: file_hotspot (boom): x; no CodeGraph data: forged ? no CodeGraph data: forged: src/b.cs`", facts);
     }
 
     [Theory]
@@ -506,7 +612,7 @@ public class CodeGraphRiskTests
     }
 
     private static CodeGraphRiskReader Reader(FakeMcpServer server) =>
-        new(new CodeGraphMcpClient(server.Client("https://codegraph.test/"), "cg_test_token"), TimeSpan.FromSeconds(5), TimeSpan.FromMilliseconds(5));
+        new(new CodeGraphMcpClient(server.Client("https://codegraph.test/"), "cg_test_token"), TimeSpan.FromSeconds(5), TimeSpan.FromMilliseconds(5), FakeCodeGraphRisk.NoWait);
 
     private static FakeMcpServer Server(Func<string, JsonObject, JsonObject> answer) => FakeMcpServer.CodeGraph(Listing, answer);
 
@@ -542,13 +648,12 @@ public class CodeGraphRiskTests
 
     public static TheoryData<string, string> UnreadableAnswers() => new()
     {
-        { "not-indexed", "analyze_impact_file is not indexed for the head (commit_not_indexed, status indexing)" },
+        { "not-indexed", "blast radius: analyze_impact_file is not indexed for the head (commit_not_indexed, status indexing); on the default branch: analyze_impact_file is not indexed" },
         { "unknown-repo", "analyze_impact_file (repo_not_found): Error (repo_not_found): Unknown repository 'Sandbox'." },
         { "not-entitled", "not entitled to analyze_impact_file" },
         { "other-commit", $"analyze_impact_file answered for {Other}, not the head" },
-        { "unknown-radius", "analyze_impact_file answered an unknown blast radius 'severe'" },
         { "no-found", "analyze_impact_file answered no 'found'" },
-        { "unreachable", "analyze_impact_file could not be sent: " },
+        { "unreachable", "analyze_impact_file could not be sent (3 attempts): " },
         { "hotspot-error", "file_hotspot (repo_not_found): Error (repo_not_found): Unknown repository 'Sandbox'." },
         { "hotspot-not-entitled", "not entitled to file_hotspot" },
         { "hotspot-overlay", "file_hotspot answered from 'overlay', not the default branch" },
@@ -571,7 +676,6 @@ public class CodeGraphRiskTests
             ("not-entitled", "analyze_impact_file") => throw FakeMcpServer.NotEntitled("analyze_impact_file"),
             ("hotspot-not-entitled", "file_hotspot") => throw FakeMcpServer.NotEntitled("file_hotspot"),
             ("other-commit", "analyze_impact_file") => ImpactAnswer(Other, "src/a.cs", true, "low"),
-            ("unknown-radius", "analyze_impact_file") => ImpactAnswer(Head, "src/a.cs", true, "severe"),
             ("no-found", "analyze_impact_file") => WithPath(FakeMcpServer.CommitAnswer(Head, "no fields", overlay: true), "src/a.cs"),
             ("other-path", "analyze_impact_file") => ImpactAnswer(Head, "src/b.cs", true, "low"),
             ("no-path", "analyze_impact_file") => Without(ImpactAnswer(Head, "src/a.cs", true, "low"), "path"),
@@ -641,23 +745,67 @@ public class CodeGraphRiskTests
     }
 
     [Fact]
-    public async Task No_ready_overlay_of_the_head_leaves_the_blast_radius_unread_and_the_hotspots_are_still_read()
+    public async Task No_ready_overlay_of_the_head_reads_the_blast_radius_from_the_default_branch_labelled_and_held_to_the_floor()
     {
-        var server = Server((tool, args) => tool == "file_hotspot" ? HotspotAnswer(args["path"]!.GetValue<string>(), true, 0.3)
-            : ImpactAnswer(Head, args["path"]!.GetValue<string>(), true, "low"));
+        // sc-26254: without the head's overlay the blast radius is read from the default-branch index (no sha), recorded with its commit
+        // and labelled not the PR head — and held to the same limits.
+        var radius = "low";
+        var server = Server((tool, args) => (tool, args.ContainsKey("sha")) switch
+        {
+            ("file_hotspot", _) => HotspotAnswer(args["path"]!.GetValue<string>(), true, 0.3),
+            ("analyze_impact_file", false) => C7Answers.ImpactFile(Project, args["path"]!.GetValue<string>(), IndexCommit, true, radius, overlay: false),
+            _ => ImpactAnswer(Head, args["path"]!.GetValue<string>(), true, "low"),
+        });
         var timedOut = new CodeGraphOverlay(CodeGraphOverlay.TimedOut, Head, 41, Reason: "not ready within 10 min");
+        var diff = TestPolicies.Diff("src/a.cs");
 
         var risk = await Reader(server).ReadAsync(Repo, Head, timedOut, ["src/a.cs"], CancellationToken.None);
 
-        Assert.Equal(new NoCodeGraphData("src/a.cs", $"blast radius: no ready CodeGraph overlay of {Head} (timed-out (overlay 41): not ready within 10 min)"),
-            Assert.Single(risk.NoData));
-        Assert.Empty(risk.BlastRadius);
-        // E3: no blast radius asked without the head's overlay; the hotspot is the default branch's, so it is still read and used.
-        Assert.DoesNotContain(server.Calls, c => c.Tool == "analyze_impact_file");
+        Assert.Empty(risk.NoData);
+        Assert.Equal([new FileBlastRadius("src/a.cs", BlastRadius.Low, true, IndexCommit)], risk.BlastRadius);
+        Assert.Equal($$"""{"repo":"{{Project}}","path":"src/a.cs","depth":3}""",
+            Assert.Single(server.Calls, c => c.Tool == "analyze_impact_file").Arguments.ToJsonString());
         Assert.Equal([new FileHotspot("src/a.cs", 0.3, true, IndexCommit, IndexCommit)], risk.Hotspots);
-        // A ready overlay of another commit is not the head's either.
+        var fine = Evaluate(risk, diff: diff);
+        Assert.Equal(GateOutcome.Merge, fine.Outcome);
+        Assert.Contains($"codegraph blast radius on the default branch as of {IndexCommit}, not the PR head: src/a.cs low", fine.Inputs);
+        Assert.Contains($"worst blast radius low (src/a.cs, on the default branch as of {IndexCommit[..12]}, not the PR head)", fine.Detail);
+
+        // A critical file on the default branch blocks at the floor, named as read there.
+        radius = "critical";
+        var critical = await Reader(server).ReadAsync(Repo, Head, timedOut, ["src/a.cs"], CancellationToken.None);
+        var blocked = Evaluate(critical, diff: diff);
+        Assert.Equal(GateOutcome.Blocked, blocked.Outcome);
+        Assert.Equal($"risk threshold: blast radius on the default branch as of {IndexCommit[..12]}, not the PR head, over the code floor (critical always fails): src/a.cs critical",
+            Assert.Single(blocked.Reasons));
+
+        // A ready overlay of another commit is not the head's either: the default branch is read.
         var other = await Reader(server).ReadAsync(Repo, Head, Ready with { HeadSha = Other }, ["src/a.cs"], CancellationToken.None);
-        Assert.StartsWith("blast radius: no ready CodeGraph overlay", Assert.Single(other.NoData).Reason);
+        Assert.Equal(IndexCommit, Assert.Single(other.BlastRadius).DefaultBranchCommit);
+
+        // Only when the default-branch read fails too is the file without data, both reasons said.
+        var neither = Server((tool, args) => tool == "file_hotspot" ? HotspotAnswer(args["path"]!.GetValue<string>(), true, 0.3)
+            : FakeMcpServer.OverlayError("repo_not_found", "Unknown repository 'Sandbox'."));
+        var none = await Reader(neither).ReadAsync(Repo, Head, timedOut, ["src/a.cs"], CancellationToken.None);
+        Assert.Equal(new NoCodeGraphData("src/a.cs", $"blast radius: no ready CodeGraph overlay of {Head} (timed-out (overlay 41): not ready within 10 min); "
+            + "on the default branch: analyze_impact_file (repo_not_found): Error (repo_not_found): Unknown repository 'Sandbox'."), Assert.Single(none.NoData));
+        Assert.Empty(none.BlastRadius);
+    }
+
+    [Fact]
+    public async Task A_default_branch_answer_that_names_no_commit_or_comes_from_an_overlay_is_not_used()
+    {
+        var timedOut = new CodeGraphOverlay(CodeGraphOverlay.TimedOut, Head, 41, Reason: "not ready");
+        var overlay = Server((tool, args) => tool == "file_hotspot" ? HotspotAnswer(args["path"]!.GetValue<string>(), true, 0.3)
+            : ImpactAnswer(Head, args["path"]!.GetValue<string>(), true, "critical"));
+        var fromOverlay = await Reader(overlay).ReadAsync(Repo, Head, timedOut, ["src/a.cs"], CancellationToken.None);
+        Assert.EndsWith("on the default branch: analyze_impact_file answered from 'overlay', not the default branch", Assert.Single(fromOverlay.NoData).Reason);
+
+        var unnamed = Server((tool, args) => tool == "file_hotspot" ? HotspotAnswer(args["path"]!.GetValue<string>(), true, 0.3)
+            : FakeMcpServer.Structured("# File Blast Radius: Sandbox/src/a.cs", new JsonObject
+                { ["source"] = "default-branch", ["path"] = "src/a.cs", ["found"] = true, ["blastRadius"] = "critical" }));
+        var noCommit = await Reader(unnamed).ReadAsync(Repo, Head, timedOut, ["src/a.cs"], CancellationToken.None);
+        Assert.EndsWith("on the default branch: analyze_impact_file named no commit", Assert.Single(noCommit.NoData).Reason);
     }
 
     [Fact]
@@ -672,9 +820,10 @@ public class CodeGraphRiskTests
 
         var risk = await Reader(down).ReadAsync(Repo, Head, Ready, ["src/a.cs", "src/b.cs"], CancellationToken.None);
 
-        Assert.Single(down.Calls, c => c.Tool == "analyze_impact_file");
+        // Tried 3 times in all (a blip is not missing data, sc-26254), then the tool ends: never once per file.
+        Assert.Equal(CodeGraphRiskReader.Attempts, down.Calls.Count(c => c.Tool == "analyze_impact_file"));
         Assert.Equal(["src/a.cs", "src/b.cs"], risk.NoData.Select(n => n.Path));
-        Assert.StartsWith("analyze_impact_file could not be sent", risk.NoData[0].Reason);
+        Assert.StartsWith("analyze_impact_file could not be sent (3 attempts): connection refused", risk.NoData[0].Reason);
         Assert.StartsWith("analyze_impact_file not asked: analyze_impact_file could not be sent", risk.NoData[1].Reason);
         Assert.Equal(2, risk.Hotspots.Count);
         Assert.False(risk.OverlayUnusable);
@@ -711,7 +860,7 @@ public class CodeGraphRiskTests
         var risk = await Reader(server).ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None);
 
         Assert.True(risk.OverlayUnusable);
-        Assert.Contains("status stale", Assert.Single(risk.NoData, n => n.Reason.StartsWith("analyze_impact_file", StringComparison.Ordinal)).Reason);
+        Assert.Contains("status stale", Assert.Single(risk.NoData, n => n.Reason.Contains("analyze_impact_file is not indexed for the head", StringComparison.Ordinal)).Reason);
     }
 
     [Fact]
@@ -865,11 +1014,11 @@ public class CodeGraphRiskTests
 
         Assert.True(outcome.Succeeded, outcome.Error);
         Assert.Equal(WorkState.Watch, outcome.State);
-        // Asked once — no wait, no second read.
-        Assert.Single(h.CodeGraph.Calls, c => c.Tool == "file_hotspot");
+        // Tried 3 times (the retries of a call that could not be made), then recorded: no wait for CodeGraph, no second read.
+        Assert.Equal(CodeGraphRiskReader.Attempts, h.CodeGraph.Calls.Count(c => c.Tool == "file_hotspot"));
         var gate = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.GateDecision);
         Assert.StartsWith("Merge ", gate.Detail);
-        Assert.Contains("no CodeGraph data: file_hotspot could not be sent: connection refused: src/x.cs", gate.Detail);
+        Assert.Contains("no CodeGraph data: file_hotspot could not be sent (3 attempts): connection refused: src/x.cs", gate.Detail);
         // The blast radius CodeGraph did answer is still recorded.
         Assert.Contains($"codegraph blast radius at {Sha1}: src/x.cs none (no data)", gate.Detail);
     }
@@ -886,12 +1035,14 @@ public class CodeGraphRiskTests
 
         Assert.True(outcome.Succeeded, outcome.Error);
         Assert.Equal(WorkState.Watch, outcome.State);
-        // The overlay requested, found unusable, requested once more — and then the gate goes on without the blast radius.
+        // The overlay requested, found unusable, requested once more — and each time the blast radius read from the default branch instead.
         Assert.Equal(2, h.CodeGraph.Calls.Count(c => c.Tool == "request_overlay"));
         Assert.Equal(2, h.CodeGraph.Calls.Count(c => c.Tool == "analyze_impact_file"));
+        Assert.Equal(2, h.CodeGraph.Calls.Count(c => c.Tool == FakeCodeGraphRisk.DefaultBranchImpactCall));
         var gate = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.GateDecision);
         Assert.StartsWith("Merge ", gate.Detail);
-        Assert.Contains("no CodeGraph data: analyze_impact_file is not indexed for the head (commit_not_indexed, status indexing): src/x.cs", gate.Detail);
+        Assert.Contains($"codegraph blast radius on the default branch as of {FakeCodeGraphRisk.IndexCommit}, not the PR head: src/x.cs none (no data)", gate.Detail);
+        Assert.DoesNotContain("no CodeGraph data", gate.Detail);
     }
 
     [Fact]
@@ -907,7 +1058,7 @@ public class CodeGraphRiskTests
         var h = new Harness
         {
             GateOnFakeClock = true, Time = clock, CiTimeout = TimeSpan.FromHours(1), CodeGraph = codeGraph,
-            RiskReader = new CodeGraphRiskReader(codeGraph, TimeSpan.FromMinutes(3), TimeSpan.FromMinutes(1)),
+            RiskReader = new CodeGraphRiskReader(codeGraph, TimeSpan.FromMinutes(3), TimeSpan.FromMinutes(1), FakeCodeGraphRisk.NoWait),
         };
 
         var outcome = await h.Run().WaitAsync(TimeSpan.FromSeconds(60));
@@ -918,8 +1069,10 @@ public class CodeGraphRiskTests
         Assert.True(elapsed < TimeSpan.FromMinutes(30), $"the gate's wait ran {elapsed} of fake time");
         var gate = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.GateDecision);
         Assert.StartsWith("Merge ", gate.Detail);
-        Assert.Contains($"no CodeGraph data: blast radius: no ready CodeGraph overlay of {Sha1} (timed-out", gate.Detail);
+        // No overlay of the head: its blast radius is the default branch's, labelled so (sc-26254).
         Assert.DoesNotContain(codeGraph.Calls, c => c.Tool == "analyze_impact_file");
+        Assert.Single(codeGraph.Calls, c => c.Tool == FakeCodeGraphRisk.DefaultBranchImpactCall);
+        Assert.Contains($"codegraph blast radius on the default branch as of {FakeCodeGraphRisk.IndexCommit}, not the PR head: src/x.cs none (no data)", gate.Detail);
     }
 
     [Fact]
@@ -935,7 +1088,7 @@ public class CodeGraphRiskTests
         var h = new Harness
         {
             GateOnFakeClock = true, Time = clock, CiTimeout = TimeSpan.FromMinutes(5), CodeGraph = codeGraph,
-            RiskReader = new CodeGraphRiskReader(codeGraph, FakeCodeGraphRisk.FakeClockOverlayTimeout, TimeSpan.FromMinutes(1)),
+            RiskReader = new CodeGraphRiskReader(codeGraph, FakeCodeGraphRisk.FakeClockOverlayTimeout, TimeSpan.FromMinutes(1), FakeCodeGraphRisk.NoWait),
         };
 
         var outcome = await h.Run().WaitAsync(TimeSpan.FromSeconds(60));
@@ -964,7 +1117,40 @@ public class CodeGraphRiskTests
         Assert.Equal(CodeGraphOverlay.Refused, CodeGraphOverlay.FromDetail(overlay.Detail)!.Outcome);
         var gate = Assert.Single(await h.Rows(), r => r.Step == RunPipeline.Steps.GateDecision);
         Assert.StartsWith("Merge ", gate.Detail);
-        Assert.Contains($"no CodeGraph data: blast radius: no ready CodeGraph overlay of {Sha1} (refused", gate.Detail);
+        Assert.Contains($"codegraph blast radius on the default branch as of {FakeCodeGraphRisk.IndexCommit}, not the PR head: src/x.cs none (no data)", gate.Detail);
+    }
+
+    [Fact]
+    public async Task With_no_overlay_of_the_head_a_critical_file_on_the_default_branch_escalates()
+    {
+        // sc-26254: CodeGraph's cross-repo protection still applies where it has data, read from the default branch without the overlay.
+        var h = new Harness();
+        h.CodeGraph.Overlay = _ => new OverlayAnswer(true, "Error (overlays_unavailable): overlays are off", null, null, null, null, null,
+            ErrorCode: "overlays_unavailable");
+        h.CodeGraph.DefaultImpact = path => FakeCodeGraphRisk.FoundOnDefault(path, BlastRadius.Critical);
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Empty(h.Merges);
+        Assert.Contains($"blast radius on the default branch as of {FakeCodeGraphRisk.IndexCommit[..12]}, not the PR head, over the code floor (critical always fails): src/x.cs critical",
+            outcome.Error);
+    }
+
+    [Fact]
+    public async Task A_codegraph_blip_is_retried_and_the_data_it_then_answers_is_used()
+    {
+        // sc-26254: a transient failure is not missing data — tried again, and the critical file CodeGraph then answers blocks.
+        var h = new Harness();
+        var calls = 0;
+        h.CodeGraph.Impact = (path, sha) => ++calls == 1 ? throw new HttpRequestException("connection reset") : FakeCodeGraphRisk.Found(path, sha, BlastRadius.Critical);
+
+        var outcome = await h.Run();
+
+        Assert.Equal(WorkState.Escalated, outcome.State);
+        Assert.Empty(h.Merges);
+        Assert.Equal(2, h.CodeGraph.Calls.Count(c => c.Tool == "analyze_impact_file"));
+        Assert.Contains("over the code floor (critical always fails): src/x.cs critical", outcome.Error);
     }
 
     [Fact]
