@@ -11,6 +11,8 @@ namespace DarkFactory.Orchestrator.Dashboard;
 /// <param name="EpicId">The item's epic as the ledger holds it: an id within the item's own source (<see cref="Epic"/>).</param>
 /// <param name="Links">Links to the item and its epic on their board, built from the ledger (<see cref="IBoardLinks"/>, sc-25985);
 /// null for a source that has none.</param>
+/// <param name="MergedAt">When the item merged (sc-26134): the time of its last Merge transition, for an item in Watch; null
+/// otherwise. A merged item offers no Pause or Stop (nothing of it is left to pause or stop) and its elapsed time stops there.</param>
 public sealed record PipelineRow(
     long Id,
     string ExternalId,
@@ -28,8 +30,16 @@ public sealed record PipelineRow(
     long? PlanItemId = null,
     PlanView? Plan = null,
     BoardLink? Links = null,
-    RunView? Run = null)
+    RunView? Run = null,
+    DateTimeOffset? MergedAt = null)
 {
+    /// <summary>In Watch after its Merge row (sc-26134): merged, waiting only for its closeout or the watch period.</summary>
+    public bool Merged => MergedAt is not null;
+
+    /// <summary>When the item merged, if it is in Watch: its last Merge transition's time (<see cref="MergedAt"/>).</summary>
+    public static DateTimeOffset? MergedAtOf(WorkState state, IEnumerable<LedgerEntry> rows) =>
+        state == WorkState.Watch ? rows.LastOrDefault(e => e.Step is null && e.State == WorkState.Merge)?.RecordedAt : null;
+
     /// <summary>
     /// The item's epic with its source (sc-25985): what the page shows (<c>12</c>, <c>kb-3</c>) and what its epic control form posts
     /// (<see cref="ControlScope.Epic"/>) — a Kanban epic's key never reads as the Shortcut epic of the same number.
@@ -44,6 +54,29 @@ public sealed record PipelineRow(
     /// them and offers no control (nothing of a finished item can be paused or stopped).
     /// </summary>
     public bool Finished => State is WorkState.Done or WorkState.Cancelled;
+}
+
+/// <summary>
+/// What a control row of the pipeline page (the factory's, an epic's) sums up of its listed items (sc-26134), from the rows
+/// already read: <see cref="Running"/> — a run of the item is alive now (<see cref="RunView.Live"/> true: its run lock is held);
+/// <see cref="Merged"/> — merged, in Watch, and no run alive (<see cref="PipelineRow.Merged"/>); <see cref="Waiting"/> — every
+/// other listed item that is not finished (no run alive, or liveness unknown: waiting for CI, its queue turn, a slot, a poll, a
+/// person). A finished plan item (Done, Cancelled; listed only to group its stories) counts as none of them.
+/// </summary>
+public sealed record Activity(int Running, int Waiting, int Merged)
+{
+    public static Activity Of(IEnumerable<PipelineRow> rows)
+    {
+        var list = rows.Where(r => !r.Finished).ToList();
+        var running = list.Count(r => r.Run?.Live == true);
+        var merged = list.Count(r => r.Run?.Live != true && r.Merged);
+        return new Activity(running, list.Count - running - merged, merged);
+    }
+
+    /// <summary>Whether anything is left to do: some listed item is running or waiting (an epic of merged items alone is done).</summary>
+    public bool Active => Running + Waiting > 0;
+
+    public override string ToString() => $"{Running} running, {Waiting} waiting, {Merged} merged";
 }
 
 /// <summary>
@@ -389,7 +422,8 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
                 i.PlanItemId is { } p && byId.ContainsKey(p) ? p : null,
                 plans.GetValueOrDefault(i.Id),
                 onBoard.GetValueOrDefault(i.Id),
-                RunView.Of(i.State, runRows[i.Id].ToList(), live?.Contains(i.Id))))
+                RunView.Of(i.State, runRows[i.Id].ToList(), live?.Contains(i.Id)),
+                PipelineRow.MergedAtOf(i.State, runRows[i.Id])))
             .ToList();
         // A slot's lock is one run's at a time: of two items shown holding one slot (both live, or liveness unknown — a dead run's
         // hold is already stale), the newer hold is shown holding it, and the other as a record an earlier run left (sc-25991).

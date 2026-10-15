@@ -154,6 +154,29 @@ public sealed class LedgerPostgresTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task The_dashboard_reads_a_merged_items_merge_time_from_its_merge_row_and_none_before_it_is_in_watch()
+    {
+        // sc-26134: a merged item's elapsed time stops at its merge and it offers no controls, decided from the ledger's rows.
+        await using var db = Context();
+        var ledger = new WorkLedger(db, TimeProvider.System);
+        var item = await ledger.GetOrCreateAsync("shortcut", "sc-1", "One", "o/r", null, CancellationToken.None);
+        var data = new Dashboard.DashboardData(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(_cs)), TimeProvider.System);
+        foreach (var state in new[] { WorkState.Implement, WorkState.Review, WorkState.CI, WorkState.MergeGate, WorkState.Merge })
+        {
+            await ledger.RecordAsync(item, state, null, null, CancellationToken.None);
+        }
+        Assert.Null((await data.ActiveItemsAsync(CancellationToken.None)).Single(r => r.ExternalId == "sc-1").MergedAt);
+
+        await ledger.RecordAsync(item, WorkState.Watch, null, null, CancellationToken.None);
+
+        await using var check = Context();
+        var merge = await check.LedgerEntries.SingleAsync(e => e.WorkItemId == item.Id && e.Step == null && e.State == WorkState.Merge);
+        var row = (await data.ActiveItemsAsync(CancellationToken.None)).Single(r => r.ExternalId == "sc-1");
+        Assert.Equal(merge.RecordedAt, row.MergedAt);
+        Assert.True(row.Merged);
+    }
+
+    [Fact]
     public async Task A_sweep_leaves_what_another_processes_live_run_owns_and_deletes_it_once_that_run_is_gone()
     {
         // sc-25987: the live run is another process's — its own PostgresRunLocks, its own connection — and the sweeper's context
