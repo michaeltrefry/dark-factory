@@ -28,16 +28,26 @@ public class XcodeIosRunnerTests : IDisposable
         TestGit.Run(_root, "init", "--bare", "-b", "main", _remote);
         TestGit.Run(_root, "init", "-b", "main", _seed);
         _devicesBefore = GateDevices().Select(d => d.Udid).ToHashSet(StringComparer.Ordinal);
-        var records = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Library", "Caches", "dark-factory-gate-devices");
-        _recordsBefore = Directory.Exists(records) ? Directory.GetFiles(records).ToHashSet(StringComparer.Ordinal) : [];
+        _physicalRoot = Physical(_root);
     }
 
-    private readonly HashSet<string> _recordsBefore;
+    private readonly string _physicalRoot;
+
+    /// <summary>
+    /// The gate devices this test's runs made and left: a new one whose record names a results directory under this test's own
+    /// root. Another gate run of the owner's (a live factory's, another test's) has devices and records of its own at the same
+    /// time, which are never this test's to assert on or delete.
+    /// </summary>
+    private List<(string Name, string Udid)> OwnDevices()
+    {
+        var own = GateDeviceRecords.Under(GateDeviceRecords.Directory, _physicalRoot);
+        return GateDevices().Where(d => !_devicesBefore.Contains(d.Udid) && own.Contains(d.Name)).ToList();
+    }
 
     public void Dispose()
     {
-        // Only the devices this test made: the gate's names that were not there before.
-        foreach (var (_, udid) in GateDevices().Where(d => !_devicesBefore.Contains(d.Udid)))
+        // Only the devices this test made (their records point into its root): never another run's.
+        foreach (var (_, udid) in OwnDevices())
         {
             Output(XcodeNewTests.Xcrun, "simctl", "shutdown", udid);
             Output(XcodeNewTests.Xcrun, "simctl", "delete", udid);
@@ -138,9 +148,8 @@ public class XcodeIosRunnerTests : IDisposable
             result.Tests.Select(t => (t.Test, t.Base, t.Head)).OrderBy(t => t.Test, StringComparer.Ordinal));
         Assert.All(result.Tests, t => Assert.Equal((1, 1), (t.BaseCases.Count, t.HeadCases.Count)));
         // Each run's own fresh device is gone again, and so is its record: the gate keeps nothing between runs.
-        Assert.Empty(GateDevices().Where(d => !_devicesBefore.Contains(d.Udid)));
-        var records = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Library", "Caches", "dark-factory-gate-devices");
-        Assert.Empty(Directory.Exists(records) ? Directory.GetFiles(records).Where(f => _recordsBefore.Contains(f) is false) : []);
+        Assert.Empty(OwnDevices());
+        Assert.Empty(GateDeviceRecords.Under(GateDeviceRecords.Directory, _physicalRoot));
         Assert.Empty(Directory.EnumerateDirectories(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name)));
     }
 
@@ -177,7 +186,7 @@ public class XcodeIosRunnerTests : IDisposable
             pass.Tests.Select(t => (t.Test, t.Base, t.Head)).OrderBy(t => t.Test, StringComparer.Ordinal));
         Assert.Equal(("build-failed", "ran"), (pass.BaseRun, pass.BaseRetry));
         Assert.Equal([$"{XcodeIosFixture.UnitTestFile}:9 func testPreviousTakesOne"], pass.BaseRemoved);
-        Assert.Empty(GateDevices().Where(d => !_devicesBefore.Contains(d.Udid)));
+        Assert.Empty(OwnDevices());
 
         // A base whose production code does not build: an error, naming the base's file.
         TestGit.Run(_seed, "checkout", "-q", "main");
@@ -193,7 +202,70 @@ public class XcodeIosRunnerTests : IDisposable
         Assert.True(error.Outcome == NewTestsOutcome.Error, $"{error.Outcome}: {error.Reason}");
         Assert.Contains("says nothing about the new tests (not a compiler error in those files): Tally/Counter.swift(2,24): swiftc cannot find 'zero' in scope", error.Reason);
         Assert.Equal(("build-failed", "ran", (string?)null), (error.BaseRun, error.HeadRun, error.BaseRetry));
-        Assert.Empty(GateDevices().Where(d => !_devicesBefore.Contains(d.Udid)));
+        Assert.Empty(OwnDevices());
         Assert.Empty(Directory.EnumerateDirectories(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name)));
+    }
+}
+
+/// <summary>
+/// The records <c>scripts/factory-ios-simulator</c> keeps of its runs' devices: <c>~/Library/Caches/dark-factory-gate-devices/&lt;name&gt;</c>,
+/// whose first line is the absolute physical path of that run's results directory.
+/// </summary>
+public static class GateDeviceRecords
+{
+    public static readonly string Directory =
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Library", "Caches", "dark-factory-gate-devices");
+
+    /// <summary>The device names whose record names a results directory under <paramref name="root"/> (a physical path), or <paramref name="root"/> itself.</summary>
+    public static HashSet<string> Under(string records, string root)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        if (!System.IO.Directory.Exists(records))
+        {
+            return names;
+        }
+        var prefix = root.TrimEnd('/') + "/";
+        foreach (var record in System.IO.Directory.GetFiles(records, "dark-factory-gate-*"))
+        {
+            string first;
+            try
+            {
+                first = File.ReadLines(record).FirstOrDefault() ?? "";
+            }
+            catch (IOException)
+            {
+                continue; // removed meanwhile by its own run
+            }
+            if (first == prefix.TrimEnd('/') || first.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                names.Add(Path.GetFileName(record));
+            }
+        }
+        return names;
+    }
+}
+
+public sealed class GateDeviceRecordsTests : IDisposable
+{
+    private readonly string _dir = System.IO.Directory.CreateTempSubdirectory("df-gate-records-").FullName;
+
+    public void Dispose() => System.IO.Directory.Delete(_dir, recursive: true);
+
+    [Fact]
+    public void Only_records_naming_a_results_directory_under_the_root_are_the_roots()
+    {
+        var records = System.IO.Directory.CreateDirectory(Path.Combine(_dir, "records")).FullName;
+        void Record(string name, string text) => File.WriteAllText(Path.Combine(records, name), text);
+        Record("dark-factory-gate-0000000000000001", "/private/var/t/df-iosrun-a/work/worktrees/acme/tally/gate-sc-6-base/.factory-test-results-x\n");
+        Record("dark-factory-gate-0000000000000002", "/private/var/t/df-iosrun-a\n");
+        Record("dark-factory-gate-0000000000000003", "/private/var/t/df-iosrun-ab/work/x\n"); // a sibling sharing the prefix
+        Record("dark-factory-gate-0000000000000004", "/opt/dark-factory/work/worktrees/o/n/gate-sc-9-head/r\n"); // a live factory's run
+        Record("dark-factory-gate-0000000000000005", "");
+        Record("not-a-record", "/private/var/t/df-iosrun-a/x\n");
+
+        Assert.Equal(["dark-factory-gate-0000000000000001", "dark-factory-gate-0000000000000002"],
+            GateDeviceRecords.Under(records, "/private/var/t/df-iosrun-a/").Order(StringComparer.Ordinal));
+        Assert.Equal(["dark-factory-gate-0000000000000004"], GateDeviceRecords.Under(records, "/opt/dark-factory/work"));
+        Assert.Empty(GateDeviceRecords.Under(Path.Combine(_dir, "none"), "/private/var/t/df-iosrun-a"));
     }
 }

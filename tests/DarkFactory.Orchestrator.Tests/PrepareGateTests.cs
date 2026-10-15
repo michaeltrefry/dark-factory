@@ -445,52 +445,63 @@ public sealed class PrepareRealRunTests : IDisposable
         return TestGit.Run(_seed, "rev-parse", "HEAD").Trim();
     }
 
-    /// <summary>A local HTTP server answering one path with <paramref name="body"/>, counting requests.</summary>
-    private sealed class LocalServer : IDisposable
+    /// <summary>
+    /// A local HTTP server answering every request with <paramref name="body"/>, counting requests. It listens on a port the kernel
+    /// gives it at bind time (port 0), so no other socket can take the port between choosing it and listening on it: a probed free
+    /// port handed to <see cref="HttpListener"/> could be, and under a full suite's load was ("Address already in use"). One
+    /// request per connection (<c>Connection: close</c>).
+    /// </summary>
+    internal sealed class LocalServer : IDisposable
     {
-        private readonly HttpListener _listener;
-        private readonly Task _loop;
+        private readonly System.Net.Sockets.TcpListener _listener = new(IPAddress.Loopback, 0);
+        private readonly CancellationTokenSource _stop = new();
 
         public int Requests;
 
         public LocalServer(byte[] body)
         {
-            // A free port, taken again if another test took it between the probe and the listener's start.
-            for (var attempt = 1; ; attempt++)
+            _listener.Start();
+            Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
+            _ = Task.Run(async () =>
             {
-                var probe = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
-                probe.Start();
-                Port = ((IPEndPoint)probe.LocalEndpoint).Port;
-                probe.Stop();
-                _listener = new HttpListener();
-                _listener.Prefixes.Add($"http://127.0.0.1:{Port}/");
-                try
+                while (!_stop.IsCancellationRequested)
                 {
-                    _listener.Start();
-                    break;
-                }
-                catch (HttpListenerException) when (attempt < 20)
-                {
-                    _listener.Close();
-                }
-            }
-            _loop = Task.Run(async () =>
-            {
-                while (_listener.IsListening)
-                {
-                    HttpListenerContext context;
+                    System.Net.Sockets.TcpClient client;
                     try
                     {
-                        context = await _listener.GetContextAsync();
+                        client = await _listener.AcceptTcpClientAsync(_stop.Token);
                     }
                     catch (Exception)
                     {
                         return;
                     }
-                    Interlocked.Increment(ref Requests);
-                    context.Response.ContentLength64 = body.Length;
-                    await context.Response.OutputStream.WriteAsync(body);
-                    context.Response.Close();
+                    _ = Task.Run(async () =>
+                    {
+                        using (client)
+                        {
+                            try
+                            {
+                                var stream = client.GetStream();
+                                var head = new List<byte>();
+                                var buffer = new byte[1];
+                                while (!(head.Count >= 4 && head[^4] == '\r' && head[^3] == '\n' && head[^2] == '\r' && head[^1] == '\n'))
+                                {
+                                    if (await stream.ReadAsync(buffer, _stop.Token) == 0)
+                                    {
+                                        return;
+                                    }
+                                    head.Add(buffer[0]);
+                                }
+                                Interlocked.Increment(ref Requests);
+                                await stream.WriteAsync(System.Text.Encoding.ASCII.GetBytes(
+                                    $"HTTP/1.1 200 OK\r\nContent-Length: {body.Length}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n"), _stop.Token);
+                                await stream.WriteAsync(body, _stop.Token);
+                            }
+                            catch (Exception)
+                            {
+                            }
+                        }
+                    });
                 }
             });
         }
@@ -499,13 +510,13 @@ public sealed class PrepareRealRunTests : IDisposable
 
         public void Dispose()
         {
+            _stop.Cancel();
             _listener.Stop();
-            _listener.Close();
         }
     }
 
     /// <summary>The injected transport: the request for the artifact's https URL is carried to the local server (as plain http).</summary>
-    private sealed class ToLocal(int port) : DelegatingHandler(new HttpClientHandler { AllowAutoRedirect = false })
+    internal sealed class ToLocal(int port) : DelegatingHandler(new HttpClientHandler { AllowAutoRedirect = false })
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
@@ -566,5 +577,30 @@ public sealed class PrepareRealRunTests : IDisposable
         Assert.Single(downloads);
         Assert.Equal(NewTestsOutcome.Error, unprepared.Outcome);
         Assert.Empty(Directory.EnumerateDirectories(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name)));
+    }
+}
+
+/// <summary>The real-run test's local artifact server, without swift: bound by the kernel, and answering a client through the transport.</summary>
+public sealed class PrepareLocalServerTests
+{
+    [Fact]
+    public async Task The_local_server_answers_each_request_with_its_body_and_counts_them()
+    {
+        var body = ArtifactFetchTests.Zip(("gen/Generated.swift", "func generatedMagic() -> Int { 42 }\n", 0x81A4));
+        // Many at once, as a loaded suite opens sockets: each has a port of its own, none refused.
+        var all = Enumerable.Range(0, 50).Select(_ => new PrepareRealRunTests.LocalServer(body)).ToList();
+        try
+        {
+            Assert.Equal(50, all.Select(s => s.Port).Distinct().Count());
+            using var client = new HttpClient(new PrepareRealRunTests.ToLocal(all[^1].Port));
+
+            Assert.Equal(body, await client.GetByteArrayAsync("https://artifacts.example/gen.zip", TestContext.Current.CancellationToken));
+            Assert.Equal(body, await client.GetByteArrayAsync("https://artifacts.example/gen.zip", TestContext.Current.CancellationToken));
+            Assert.Equal(2, all[^1].Requests);
+        }
+        finally
+        {
+            all.ForEach(s => s.Dispose());
+        }
     }
 }

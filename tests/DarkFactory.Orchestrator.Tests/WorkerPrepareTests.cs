@@ -31,11 +31,34 @@ public sealed class WorkerPrepareTests : IDisposable
         }
     }
 
-    private WorkerPrepare Prepare(TimeSpan? poll = null) =>
+    private WorkerPrepare Prepare() =>
         new(new ArtifactFetcher(new HttpClient(_server), _resolver, new ArtifactCache(ArtifactCache.RootOf(_root))), WorkerPrepare.SpoolRootOf(_root), TextWriter.Null)
         {
-            PollInterval = poll ?? TimeSpan.FromMilliseconds(50),
+            PollInterval = TimeSpan.FromMilliseconds(50),
         };
+
+    /// <summary>A session's spool the test polls by hand (<see cref="PrepareSpoolSession.PollOnceAsync"/>): nothing polls it in the background.</summary>
+    private WorkerPrepare PolledByHand() =>
+        new(new ArtifactFetcher(new HttpClient(_server), _resolver, new ArtifactCache(ArtifactCache.RootOf(_root))), WorkerPrepare.SpoolRootOf(_root), TextWriter.Null)
+        {
+            PollsInBackground = false,
+        };
+
+    /// <summary>Waits, as factory-prepare does, for the owner's answer to <paramref name="id"/>: its text, or null after a minute (a bound, not a sync).</summary>
+    private static async Task<string?> AwaitAnswerAsync(string spool, string id)
+    {
+        var path = Path.Combine(spool, $"response-{id}");
+        var deadline = Stopwatch.StartNew();
+        while (deadline.Elapsed < TimeSpan.FromSeconds(60))
+        {
+            if (File.Exists(path))
+            {
+                return File.ReadAllText(path);
+            }
+            await Task.Delay(25);
+        }
+        return null;
+    }
 
     private string Worktree(string? recipe)
     {
@@ -141,7 +164,7 @@ public sealed class WorkerPrepareTests : IDisposable
         var worktree = Worktree("version: 1\nsteps: [{name: a, argv: [/usr/bin/true]}]\n");
         var outside = Path.Combine(_root, "outside.txt");
         File.WriteAllText(outside, "untouched");
-        var prepare = Prepare(TimeSpan.FromHours(1)); // polled by hand below
+        var prepare = PolledByHand();
         var session = await prepare.OpenAsync(worktree, null, null, CancellationToken.None);
 
         File.WriteAllText(Path.Combine(session.Directory, "request-half"), $"{WorkerPrepare.RequestHeader}\n{worktree}\n"); // not ended yet
@@ -164,6 +187,35 @@ public sealed class WorkerPrepareTests : IDisposable
 
         await session.DisposeAsync();
         Assert.False(Directory.Exists(session.Directory));
+    }
+
+    [Fact]
+    public async Task Two_polls_at_once_answer_a_request_exactly_once_and_neither_returns_before_it_is_answered()
+    {
+        var (recipe, _) = RecipeWithArtifact("  - name: a\n    argv: [/usr/bin/true]\n");
+        var worktree = Worktree(recipe);
+        var downloaded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var session = await PolledByHand().OpenAsync(worktree, null, async (_, _) =>
+        {
+            downloaded.TrySetResult();
+            await release.Task;
+        }, CancellationToken.None);
+        File.WriteAllText(Path.Combine(session.Directory, "request-1"), $"{WorkerPrepare.RequestHeader}\n{worktree}\n{WorkerPrepare.RequestEnd}\n");
+
+        var first = session.PollOnceAsync(CancellationToken.None);
+        await downloaded.Task.WaitAsync(TimeSpan.FromSeconds(60)); // the first pass is inside its fetch, request-1 taken
+        var second = session.PollOnceAsync(CancellationToken.None);
+
+        // The second pass waits for the first: it neither answers request-1 again nor returns before its answer is written.
+        Assert.False(second.IsCompleted);
+        Assert.False(File.Exists(Path.Combine(session.Directory, "response-1")));
+        release.SetResult();
+        await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.Equal((1, 1), (session.Answered, session.Fetched));
+        Assert.StartsWith("ok\0", File.ReadAllText(Path.Combine(session.Directory, "response-1")));
+        Assert.Single(_server.Requests);
     }
 
     [Fact]
@@ -221,11 +273,7 @@ public sealed class WorkerPrepareTests : IDisposable
             // As factory-prepare does, from inside the session: a request, then the owner's answer.
             var spool = System.Text.RegularExpressions.Regex.Match(call.Prompt, "--spool (\\S+)`").Groups[1].Value;
             File.WriteAllText(Path.Combine(spool, "request-1"), $"{WorkerPrepare.RequestHeader}\n{worktree}\n{WorkerPrepare.RequestEnd}\n");
-            for (var i = 0; i < 400 && answer is null; i++)
-            {
-                await Task.Delay(25);
-                answer = File.Exists(Path.Combine(spool, "response-1")) ? File.ReadAllText(Path.Combine(spool, "response-1")) : null;
-            }
+            answer = await AwaitAnswerAsync(spool, "1");
             return await GatePipelineTests.ReportsModel(GatePipelineTests.ImplementerModel)(call);
         };
 
@@ -258,11 +306,7 @@ public sealed class WorkerPrepareTests : IDisposable
             File.WriteAllText(Path.Combine(worktree, PrepareRecipe.Path), recipe);
             var spool = System.Text.RegularExpressions.Regex.Match(call.Prompt, "--spool (\\S+)`").Groups[1].Value;
             File.WriteAllText(Path.Combine(spool, "request-1"), $"{WorkerPrepare.RequestHeader}\n{worktree}\n{WorkerPrepare.RequestEnd}\n");
-            for (var i = 0; i < 400 && answer is null; i++)
-            {
-                await Task.Delay(25);
-                answer = File.Exists(Path.Combine(spool, "response-1")) ? File.ReadAllText(Path.Combine(spool, "response-1")) : null;
-            }
+            answer = await AwaitAnswerAsync(spool, "1");
             return await GatePipelineTests.ReportsModel(GatePipelineTests.ImplementerModel)(call);
         };
 
@@ -284,7 +328,7 @@ public sealed class WorkerPrepareTests : IDisposable
         var served = ArtifactFetchTests.Sha256("tampered"u8.ToArray());
         var worktree = Worktree($"version: 1\nartifacts: [{{name: data, url: 'https://files.example/a.txt', sha256: {pinned}, max_bytes: 1000}}]\nsteps: [{{name: a, argv: [/usr/bin/true]}}]\n");
         var failures = new List<string>();
-        var session = await Prepare(TimeSpan.FromHours(1)).OpenAsync(worktree, null, null, CancellationToken.None, failures.Add);
+        var session = await PolledByHand().OpenAsync(worktree, null, null, CancellationToken.None, failures.Add);
         await using (session)
         {
             File.WriteAllText(Path.Combine(session.Directory, "request-1"), $"{WorkerPrepare.RequestHeader}\n{worktree}\n{WorkerPrepare.RequestEnd}\n");
@@ -307,10 +351,7 @@ public sealed class WorkerPrepareTests : IDisposable
             File.WriteAllText(Path.Combine(tree, PrepareRecipe.Path), File.ReadAllText(Path.Combine(worktree, PrepareRecipe.Path)));
             var spool = System.Text.RegularExpressions.Regex.Match(call.Prompt, "--spool (\\S+)`").Groups[1].Value;
             File.WriteAllText(Path.Combine(spool, "request-1"), $"{WorkerPrepare.RequestHeader}\n{tree}\n{WorkerPrepare.RequestEnd}\n");
-            for (var i = 0; i < 400 && !File.Exists(Path.Combine(spool, "response-1")); i++)
-            {
-                await Task.Delay(25);
-            }
+            Assert.NotNull(await AwaitAnswerAsync(spool, "1"));
             return await GatePipelineTests.ReportsModel(GatePipelineTests.ImplementerModel)(call);
         };
         var outcome = await h.Run();
@@ -324,7 +365,7 @@ public sealed class WorkerPrepareTests : IDisposable
     public async Task A_session_is_answered_with_a_fetch_at_most_twenty_times_and_with_an_error_after()
     {
         var worktree = Worktree("version: 1\nsteps: [{name: a, argv: [/usr/bin/true]}]\n");
-        await using var session = await Prepare(TimeSpan.FromHours(1)).OpenAsync(worktree, null, null, CancellationToken.None);
+        await using var session = await PolledByHand().OpenAsync(worktree, null, null, CancellationToken.None);
         for (var i = 1; i <= WorkerPrepare.MaxRequestsPerSession + 2; i++)
         {
             File.WriteAllText(Path.Combine(session.Directory, $"request-{i:00}"), $"{WorkerPrepare.RequestHeader}\n{worktree}\n{WorkerPrepare.RequestEnd}\n");
