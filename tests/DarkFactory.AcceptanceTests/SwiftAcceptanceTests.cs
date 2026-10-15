@@ -224,8 +224,9 @@ public class SwiftAcceptanceTests
     {
         await using var run = await StartAsync("FACTORY_E2E_P5_IOS_UNIT_STORY", "df_e2e_p5at3", SwiftLive.IosRepo, merges: true,
             "a To Do bug story whose Repo: line names the iOS repository (default: the sandbox) and whose fix lands in its normal code");
-        await SwiftLive.RequireSwiftIndexedAsync(run.Options, run.Repo.Repo, SwiftSeeds.CounterFile(SwiftLive.IosDir()), run.Ct);
+        // The seed first (a missing seed skips with "copy the seed"), then CodeGraph's probe of one of its Swift files.
         var (reviewer, testId) = await SeedIosAsync(run, SwiftSeeds.IosUnitTest);
+        await SwiftLive.RequireSwiftIndexedAsync(run.Options, run.Repo.Repo, SwiftSeeds.CounterFile(SwiftLive.IosDir()), run.Ct);
 
         var outcome = await FactoryRunAsync(run, gate => gate with { Reviewer = reviewer });
 
@@ -247,8 +248,8 @@ public class SwiftAcceptanceTests
     {
         await using var run = await StartAsync("FACTORY_E2E_P5_IOS_UI_STORY", "df_e2e_p5at4", SwiftLive.IosRepo, merges: true,
             "a To Do bug story whose Repo: line names the iOS repository (default: the sandbox) and whose fix lands in its normal code");
-        await SwiftLive.RequireSwiftIndexedAsync(run.Options, run.Repo.Repo, SwiftSeeds.CounterFile(SwiftLive.IosDir()), run.Ct);
         var (reviewer, testId) = await SeedIosAsync(run, SwiftSeeds.IosUiTest);
+        await SwiftLive.RequireSwiftIndexedAsync(run.Options, run.Repo.Repo, SwiftSeeds.CounterFile(SwiftLive.IosDir()), run.Ct);
 
         var outcome = await FactoryRunAsync(run, gate => gate with { Reviewer = reviewer });
 
@@ -318,13 +319,14 @@ public class SwiftAcceptanceTests
     /// P5-AT6: a new Swift test that already passes on the base is refused. Before the first review the test pushes a Swift Testing
     /// test asserting nothing the change does (<see cref="SwiftSeeds.AlreadyPassing"/>) into the sandbox's package; the SwiftPM
     /// strategy runs it on the base, where it passes, and the gate rejects it by name (<c>gate_rejected</c>). Nothing merges.
-    /// The story's own .NET tests must each fail on main (as P4-AT4's rejection): the result names the first failing strategy.
+    /// The story must tell its implementer to add no .NET/xUnit test: a rejected result names only the first strategy that rejected
+    /// (the P4-AT4 lesson), and the test fails naming that strategy when it is not the SwiftPM one.
     /// </summary>
     [Fact]
     public async Task P5_AT6_a_new_swift_test_that_already_passes_on_the_base_is_gate_rejected()
     {
         await using var run = await StartAsync("FACTORY_E2E_P5_SWIFT_PASSING_STORY", "df_e2e_p5at6", o => o.DefaultRepo, merges: false,
-            "a To Do bug story whose fix lands in normal code of the sandbox repo, each of its new xUnit tests failing on main");
+            "a To Do bug story whose fix lands in normal code of the sandbox repo and that tells its implementer to add no .NET/xUnit test");
         await RequirePackageAsync(run);
         var seed = SwiftSeeds.AlreadyPassing;
         var reviewer = new SeededReviewer(beforeFirst: async (_, ct) =>
@@ -341,7 +343,8 @@ public class SwiftAcceptanceTests
         Assert.Equal(StepOutcome.GateRejected, newTests.Outcome);
         var result = Assert.IsType<NewTestsResult>(NewTestsResult.FromDetail(newTests.Detail));
         Assert.True(result.Outcome == NewTestsOutcome.Rejected, $"{result.Outcome}: {result.Reason}");
-        Assert.Equal(new SwiftNewTests().Name, result.Strategy);
+        var rejectedBy = SwiftLive.RejectedByProblem(result, new SwiftNewTests().Name);
+        Assert.True(rejectedBy is null, rejectedBy);
         var passing = Assert.Single(result.Tests, t => t.Test == seed.TestId);
         Assert.Equal((TestCaseResult.Passed, TestCaseResult.Passed), (passing.Base, passing.Head));
         Assert.Contains(seed.TestId, result.Reason);
@@ -352,7 +355,9 @@ public class SwiftAcceptanceTests
 /// P5-AT7 (sc-26134; docs/acceptance.md, "P5-AT7"): one real LensWorks epic and one real iOS change went through the factory. The
 /// runbook runs them with <c>factory work</c> over a watch scope on the owner's real ledger; this test then checks that ledger,
 /// read only (no write, no lock, no model): each item listed in <c>FACTORY_E2E_P5_AT7_ITEMS</c> merged through the gate with a new
-/// Swift test, and the set holds a LensWorks item and an item of the iOS repository whose new test ran on an iOS Simulator.
+/// Swift test (a plan item: Done); the LensWorks items are a real epic (<see cref="SwiftLive.EpicProblems"/>: at least two items of
+/// one epic, or a plan item with every story it planned, and every item the ledger holds of that epic listed and delivered); and an
+/// item of the iOS repository has a new test on an iOS target that was run and failed on the base (<see cref="SwiftLive.IosProblem"/>).
 /// </summary>
 public class SwiftRealRunTests
 {
@@ -369,7 +374,8 @@ public class SwiftRealRunTests
         var ct = TestContext.Current.CancellationToken;
         await using var db = await Harness.RequireLedgerAsync();
 
-        var platforms = new List<(RepoRef Repo, string Id, string? Platform)>();
+        var tests = new List<SwiftLive.RealTest>();
+        var items = new List<SwiftLive.RealItem>();
         foreach (var id in ids)
         {
             var item = await db.WorkItems.AsNoTracking().SingleOrDefaultAsync(i => i.ExternalId == id, ct);
@@ -380,6 +386,8 @@ public class SwiftRealRunTests
             {
                 // A plan item: it is delivered by its changeset pull request and closed out; its stories are listed and checked themselves.
                 Assert.True(item!.State == WorkState.Done, $"{id} is a plan item in {item.State}, not Done");
+                items.Add(new(id, RepoRef.Parse(item.Repo), item.Source, item.EpicId, Delivered: true,
+                    Orchestrator.Plans.PlanRelease.StoriesOf(history.Last(e => e.Step == RunPipeline.Steps.PlanStories).Detail)));
                 continue;
             }
             var problems = SwiftLive.MergedProblems(history, [new SwiftNewTests().Name, new XcodeNewTests().Name], _ => true);
@@ -394,13 +402,20 @@ public class SwiftRealRunTests
             Assert.Equal(history.Last(e => e.Step is null && e.State == WorkState.Merge).Detail, mergeCommit);
             foreach (var test in newTests.Tests.Where(t => t.Test.Contains('/') && t.Head == TestCaseResult.Passed && t.Base != TestCaseResult.Passed))
             {
-                platforms.Add((repo, id, (await SwiftLive.TargetAtAsync(github, mergeCommit, test.Test, ct))?.Platform));
+                tests.Add(new(repo, id, test.Test, (await SwiftLive.TargetAtAsync(github, mergeCommit, test.Test, ct))?.Platform, test.Base));
             }
-            platforms.Add((repo, id, null));
+            items.Add(new(id, repo, item!.Source, item.EpicId, Delivered: true, []));
         }
 
-        Assert.True(platforms.Any(p => p.Repo.Is(SwiftLive.LensWorks)), $"none of {listed} is a LensWorks item");
-        Assert.True(platforms.Any(p => p.Repo.Is(iosRepo) && p.Platform == XcodeProject.IOS),
-            $"none of {listed} is an item of {iosRepo} whose new test ran on an iOS Simulator");
+        // Every item the ledger holds of each listed LensWorks item's epic, so a part of the epic left off the list fails.
+        var ledgerOfEpics = new List<SwiftLive.RealItem>();
+        foreach (var (source, epic) in items.Where(i => i.Repo.Is(SwiftLive.LensWorks) && i.EpicId is not null).Select(i => (i.Source, i.EpicId!.Value)).Distinct())
+        {
+            ledgerOfEpics.AddRange((await db.WorkItems.AsNoTracking().Where(i => i.Source == source && i.EpicId == epic).ToListAsync(ct))
+                .Select(i => new SwiftLive.RealItem(i.ExternalId, RepoRef.Parse(i.Repo), i.Source, i.EpicId, Delivered: false, [])));
+        }
+        var epicProblems = SwiftLive.EpicProblems(items, ledgerOfEpics);
+        Assert.True(epicProblems.Count == 0, string.Join("; ", epicProblems));
+        Assert.Null(SwiftLive.IosProblem(tests, iosRepo));
     }
 }

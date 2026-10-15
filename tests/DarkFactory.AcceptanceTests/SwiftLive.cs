@@ -212,10 +212,46 @@ internal static class SwiftLive
     }
 
     /// <summary>
-    /// Whether CodeGraph indexes <paramref name="path"/>'s language in <paramref name="repo"/>, from <c>file_hotspot</c>'s C3 flag
-    /// (sc-26137): true or false as CodeGraph says; false too when it answers no flag (a CodeGraph before C3, which indexes no
-    /// Swift: the gate then blocks every Swift change, <see cref="LanguageCoverage.UnindexedBeforeC3"/>). Skips without a CodeGraph
-    /// token or when <paramref name="repo"/> is not indexed.
+    /// Whether the gate would count <paramref name="path"/>'s language as indexed by CodeGraph, from the same two answers the gate
+    /// reads and by the gate's own rule (<see cref="LanguageCoverage.Of"/>; pure). <paramref name="impact"/>: the
+    /// <c>analyze_impact_file</c> answer, null when it was not read; a C4 <c>notIndexed</c> answer (no ready overlay of the commit
+    /// asked at) counts as not read. An error answer of either tool throws — the probe fails, it never skips on it: a CodeGraph that
+    /// cannot answer would otherwise leave the merging tests skipping for ever and the refusal test (P5-AT5a) running on a false
+    /// premise. And a file the rule counts as indexed must be one CodeGraph knows (<c>found: true</c>): an answer about a path
+    /// CodeGraph has no data for says nothing of its language. Before C3 (no flag) a Swift file CodeGraph has no graph data for is
+    /// unindexed by the rule (<see cref="LanguageCoverage.UnindexedBeforeC3"/>).
+    /// </summary>
+    public static (bool Indexed, string Said) ProbeOf(string path, ImpactFileAnswer? impact, HotspotAnswer hotspot)
+    {
+        if (hotspot.IsError)
+        {
+            throw new InvalidOperationException($"CodeGraph's file_hotspot answered an error for {path} ({hotspot.ErrorCode ?? "no code"}): {hotspot.Text}");
+        }
+        if (impact is { IsError: true, NotIndexed: null })
+        {
+            throw new InvalidOperationException($"CodeGraph's analyze_impact_file answered an error for {path} ({impact.ErrorCode ?? "no code"}): {impact.Text}");
+        }
+        var read = impact is { NotIndexed: null } ? impact : null;
+        var found = read?.Found ?? hotspot.Found;
+        var unindexed = LanguageCoverage.Of(path, read?.LanguageIndexed, read?.Language, hotspot.LanguageIndexed, hotspot.Language, found);
+        var answers = read is null ? "file_hotspot's answer (analyze_impact_file not read)" : "analyze_impact_file's and file_hotspot's answers";
+        if (unindexed is not null)
+        {
+            return (false, $"By the gate's rule over {answers}, CodeGraph does not index {unindexed}");
+        }
+        if (found != true)
+        {
+            throw new InvalidOperationException($"CodeGraph has no data for {path} (found: {found?.ToString() ?? "none"}), so its answers say "
+                + "nothing of the file's language: probe a file CodeGraph has indexed.");
+        }
+        return (true, $"By the gate's rule over {answers}, CodeGraph indexes {path}'s language "
+            + $"({LanguageCoverage.Name(read?.Language) ?? LanguageCoverage.Name(hotspot.Language) ?? "unnamed"})");
+    }
+
+    /// <summary>
+    /// <see cref="ProbeOf"/> over CodeGraph's live answers for <paramref name="path"/> in <paramref name="repo"/>: <c>file_hotspot</c>,
+    /// then <c>analyze_impact_file</c> at the default-branch index commit the hotspot answer names. Skips without a CodeGraph token
+    /// or when <paramref name="repo"/> is not indexed; FAILS when CodeGraph answers an error or does not know the file.
     /// </summary>
     public static async Task<(bool Indexed, string Said)> LanguageIndexedAsync(FactoryOptions options, RepoRef repo, string path, CancellationToken ct)
     {
@@ -223,13 +259,20 @@ internal static class SwiftLive
         using var http = OutboundHttp.CodeGraphApi(options.CodeGraphBaseUrl);
         var codeGraph = new CodeGraphMcpClient(http, token);
         var project = await CodeGraphLive.RequireProjectAsync(codeGraph, repo, ct);
-        var answer = await codeGraph.FileHotspotAsync(project, path, ct);
-        return answer.LanguageIndexed switch
+        var hotspot = await codeGraph.FileHotspotAsync(project, path, ct);
+        var commit = hotspot.IndexCommitSha ?? hotspot.CommitSha;
+        var impact = hotspot.IsError || commit is null
+            ? null
+            : await codeGraph.AnalyzeImpactFileAsync(project, path, commit, CodeGraphRiskReader.ImpactDepth, ct);
+        try
         {
-            true => (true, $"CodeGraph indexes {path}'s language ({answer.Language ?? "unnamed"})"),
-            false => (false, $"CodeGraph says it does not index {path}'s language ({answer.Language ?? "unnamed"})"),
-            null => (false, $"CodeGraph answered no languageIndexed flag for {path}: it predates C3 (sc-26137)"),
-        };
+            return ProbeOf(path, impact, hotspot);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Assert.Fail($"The CodeGraph language probe of {repo}: {ex.Message}");
+            throw;
+        }
     }
 
     /// <summary>Skips unless CodeGraph indexes Swift in <paramref name="repo"/> (a merge of a Swift change needs it: AT1–AT5b).</summary>
@@ -358,6 +401,96 @@ internal static class SwiftLive
             problems.Add($"gate-passed ({passed ?? "none"}) does not name the head the new-tests check judged ({newTests?.HeadSha ?? "none"})");
         }
         return problems;
+    }
+
+    /// <summary>
+    /// Null when <paramref name="result"/> was decided by <paramref name="expected"/> alone; else a message naming the strategy that
+    /// did decide it (pure). A rejected result names only the first strategy that rejected, so a .NET/xUnit test the implementer
+    /// added that passes on the base would be the one named (P5-AT6's story must ask for none).
+    /// </summary>
+    public static string? RejectedByProblem(NewTestsResult result, string expected) =>
+        result.Strategy == expected
+            ? null
+            : $"the new-tests check was decided by strategy '{result.Strategy ?? "none"}', not {expected} ({result.Outcome}: {result.Reason}); "
+                + "the story must tell its implementer to add no .NET/xUnit test";
+
+    /// <summary>
+    /// One ledger item P5-AT7 reads: its id, repository, source, epic, whether it was delivered (merged through the gate; for a plan
+    /// item, Done) and, for a plan item, the stories its newest <c>plan-stories</c> row lists (else empty).
+    /// </summary>
+    public sealed record RealItem(string Id, RepoRef Repo, string Source, long? EpicId, bool Delivered, IReadOnlyList<string> PlanStories);
+
+    /// <summary>
+    /// What makes the listed items short of a real LensWorks epic (pure; empty when they are one). A real epic is EITHER at least two
+    /// listed LensWorks items (not plan items) of one epic (same source and <c>EpicId</c>), OR a listed LensWorks plan item every story
+    /// of which (its <c>plan-stories</c>) is listed and delivered. And for every epic of a listed LensWorks item, every item the ledger
+    /// holds of it (<paramref name="ledgerOfEpics"/>) must be listed and delivered, so a part of the epic left out of the list or not
+    /// merged fails the test rather than going unseen.
+    /// </summary>
+    public static List<string> EpicProblems(IReadOnlyList<RealItem> listed, IReadOnlyList<RealItem> ledgerOfEpics)
+    {
+        var problems = new List<string>();
+        var byId = listed.ToDictionary(i => i.Id, StringComparer.Ordinal);
+        var lens = listed.Where(i => i.Repo.Is(LensWorks)).ToList();
+        var epics = lens.Where(i => i.EpicId is not null).Select(i => (i.Source, Epic: i.EpicId!.Value)).Distinct().ToList();
+        var plans = lens.Where(i => i.PlanStories.Count > 0).ToList();
+        var sharedEpic = epics.Any(e => lens.Count(i => i.PlanStories.Count == 0 && i.Source == e.Source && i.EpicId == e.Epic) >= 2);
+        var wholePlan = plans.Any(p => p.PlanStories.All(s => byId.TryGetValue(s, out var story) && story.Delivered));
+        if (!sharedEpic && !wholePlan)
+        {
+            problems.Add($"no real LensWorks epic among {string.Join(", ", listed.Select(i => i.Id))}: list at least two LensWorks items of one "
+                + "epic, or a LensWorks plan item and every story it planned");
+        }
+        foreach (var (source, epic) in epics)
+        {
+            foreach (var item in ledgerOfEpics.Where(i => i.Source == source && i.EpicId == epic).OrderBy(i => i.Id, StringComparer.Ordinal))
+            {
+                if (!byId.TryGetValue(item.Id, out var seen))
+                {
+                    problems.Add($"the ledger holds {item.Id} of the epic {epic} ({source}), which is not listed");
+                }
+                else if (!seen.Delivered)
+                {
+                    problems.Add($"{item.Id} of the epic {epic} ({source}) was not delivered");
+                }
+            }
+        }
+        foreach (var plan in plans)
+        {
+            foreach (var story in plan.PlanStories)
+            {
+                if (!byId.TryGetValue(story, out var seen))
+                {
+                    problems.Add($"{story}, a story of the plan {plan.Id}, is not listed");
+                }
+                else if (!seen.Delivered)
+                {
+                    problems.Add($"{story}, a story of the plan {plan.Id}, was not delivered");
+                }
+            }
+        }
+        return [.. problems.Distinct()];
+    }
+
+    /// <summary>One new test of a P5-AT7 item: the item's repository and id, the platform its target runs on, and its base result.</summary>
+    public sealed record RealTest(RepoRef Repo, string Id, string Test, string? Platform, string Base);
+
+    /// <summary>
+    /// Null when one of <paramref name="tests"/> is of <paramref name="iosRepo"/>, its target runs on an iOS Simulator, and it was RUN
+    /// on the base and failed there (<see cref="TestCaseResult.Failed"/>): only an executed test proves the simulator ran it — a
+    /// <see cref="NewTestsCheck.NotBuilt"/> base never reached one. Else why not (pure).
+    /// </summary>
+    public static string? IosProblem(IReadOnlyList<RealTest> tests, RepoRef iosRepo)
+    {
+        var ios = tests.Where(t => t.Repo.Is(iosRepo) && t.Platform == XcodeProject.IOS).ToList();
+        if (ios.Any(t => t.Base == TestCaseResult.Failed))
+        {
+            return null;
+        }
+        return ios.Count == 0
+            ? $"no listed item of {iosRepo} has a new test whose target runs on an iOS Simulator"
+            : $"no new test of {iosRepo} on an iOS target was run and failed on the base (so the simulator never ran one there): "
+                + string.Join(", ", ios.Select(t => $"{t.Id} {t.Test} {t.Base}"));
     }
 
     /// <summary>How a <c>gate</c> row's CodeGraph inputs name a file whose language CodeGraph does not index (<see cref="CodeGraphRisk.Describe"/>).</summary>

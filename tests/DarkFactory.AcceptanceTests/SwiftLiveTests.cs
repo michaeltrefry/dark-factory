@@ -176,6 +176,94 @@ public class SwiftLiveTests
         Assert.Contains(SwiftLive.MergedProblems(escalated, ["swift-testing"], _ => true), p => p.StartsWith("the transitions do not end", StringComparison.Ordinal));
     }
 
+    private static ImpactFileAnswer Impact(bool? found, bool? indexed, string? language = null) =>
+        new(false, "{}", "c1", null, null, found, "low", "a.swift", indexed, language);
+
+    private static HotspotAnswer Hot(bool? found, bool? indexed, string? language = null) =>
+        new(false, "{}", found == true ? "c1" : null, "default-branch", null, found, found == true ? 1 : null, "a.swift", "c1", indexed, language);
+
+    [Fact]
+    public void The_language_probe_is_the_gates_rule_over_both_answers_and_fails_on_an_error_or_an_unknown_file()
+    {
+        // C3, both flags: indexed when either says true and neither false.
+        Assert.True(SwiftLive.ProbeOf("a.swift", Impact(true, true, "Swift"), Hot(true, null)).Indexed);
+        // A false flag in EITHER answer is unindexed (the gate's rule): the impact answer's alone is enough.
+        var (indexed, said) = SwiftLive.ProbeOf("a.swift", Impact(true, false, "Swift"), Hot(true, true, "Swift"));
+        Assert.False(indexed);
+        Assert.Contains("a.swift (Swift)", said);
+        Assert.False(SwiftLive.ProbeOf("a.swift", Impact(true, true), Hot(true, false)).Indexed);
+        // Before C3 (no flag): a Swift file CodeGraph has no data for is unindexed.
+        Assert.False(SwiftLive.ProbeOf("a.swift", Impact(false, null), Hot(false, null)).Indexed);
+        // A C4 notIndexed impact answer (no overlay of that commit) is not read: the hotspot answer decides.
+        var notIndexed = Impact(null, null) with { IsError = true, NotIndexed = new CodeGraphNotIndexed("not_indexed", "none", "no overlay", null, null) };
+        Assert.True(SwiftLive.ProbeOf("a.swift", notIndexed, Hot(true, true)).Indexed);
+        // An error answer fails the probe rather than reading as "not indexed".
+        Assert.Contains("file_hotspot answered an error", Assert.Throws<InvalidOperationException>(() =>
+            SwiftLive.ProbeOf("a.swift", null, Hot(null, null) with { IsError = true, ErrorCode = "repo_not_found" })).Message);
+        Assert.Contains("analyze_impact_file answered an error", Assert.Throws<InvalidOperationException>(() =>
+            SwiftLive.ProbeOf("a.swift", Impact(null, null) with { IsError = true, ErrorCode = "invalid_ref" }, Hot(true, true))).Message);
+        // An indexed language but a file CodeGraph does not know proves nothing.
+        Assert.Contains("has no data for a.swift", Assert.Throws<InvalidOperationException>(() =>
+            SwiftLive.ProbeOf("a.swift", Impact(false, true), Hot(false, true))).Message);
+    }
+
+    [Fact]
+    public void P5_AT6_names_the_strategy_that_decided_when_it_is_not_the_expected_one()
+    {
+        Assert.Null(SwiftLive.RejectedByProblem(Result(NewTestsOutcome.Rejected, "swift-testing"), "swift-testing"));
+        var problem = SwiftLive.RejectedByProblem(Result(NewTestsOutcome.Rejected, "dotnet-xunit"), "swift-testing");
+        Assert.Contains("decided by strategy 'dotnet-xunit'", problem);
+        Assert.Contains("add no .NET/xUnit test", problem);
+    }
+
+    private static readonly RepoRef Lens = SwiftLive.LensWorks;
+
+    private static SwiftLive.RealItem Item(string id, long? epic, bool delivered = true, string source = "shortcut", RepoRef? repo = null, params string[] stories) =>
+        new(id, repo ?? Lens, source, epic, delivered, stories);
+
+    [Fact]
+    public void P5_AT7_needs_a_real_lensworks_epic_listed_whole()
+    {
+        var ios = Item("sc-9", 7, repo: Repo);
+        // Two LensWorks items of one epic, every item of it listed.
+        Assert.Empty(SwiftLive.EpicProblems([Item("sc-1", 5), Item("sc-2", 5), ios], [Item("sc-1", 5), Item("sc-2", 5)]));
+        // One LensWorks item alone is no epic.
+        Assert.Contains(SwiftLive.EpicProblems([Item("sc-1", 5), ios], [Item("sc-1", 5)]), p => p.StartsWith("no real LensWorks epic", StringComparison.Ordinal));
+        // Two items of DIFFERENT epics are no epic.
+        Assert.Contains(SwiftLive.EpicProblems([Item("sc-1", 5), Item("sc-2", 6)], [Item("sc-1", 5), Item("sc-2", 6)]),
+            p => p.StartsWith("no real LensWorks epic", StringComparison.Ordinal));
+        // Two items with no epic are no epic.
+        Assert.Contains(SwiftLive.EpicProblems([Item("sc-1", null), Item("sc-2", null)], []), p => p.StartsWith("no real LensWorks epic", StringComparison.Ordinal));
+        // An item of the epic in the ledger but not listed.
+        Assert.Contains(SwiftLive.EpicProblems([Item("sc-1", 5), Item("sc-2", 5)], [Item("sc-1", 5), Item("sc-2", 5), Item("sc-3", 5)]),
+            p => p.Contains("holds sc-3 of the epic 5", StringComparison.Ordinal));
+        // A listed item of the epic not delivered.
+        Assert.Contains(SwiftLive.EpicProblems([Item("sc-1", 5), Item("sc-2", 5, delivered: false)], [Item("sc-1", 5), Item("sc-2", 5)]),
+            p => p.Contains("sc-2 of the epic 5 (shortcut) was not delivered", StringComparison.Ordinal));
+        // The same epic number of another source is another epic.
+        Assert.Empty(SwiftLive.EpicProblems([Item("sc-1", 5), Item("sc-2", 5)], [Item("sc-1", 5), Item("sc-2", 5), Item("kb-3", 5, source: "kanban")]));
+        // A plan item with every story listed and merged.
+        Assert.Empty(SwiftLive.EpicProblems([Item("sc-10", null, stories: ["sc-11", "sc-12"]), Item("sc-11", null), Item("sc-12", null)], []));
+        // A plan whose story is not listed, or not merged.
+        var missing = SwiftLive.EpicProblems([Item("sc-10", null, stories: ["sc-11", "sc-12"]), Item("sc-11", null)], []);
+        Assert.Contains(missing, p => p.StartsWith("no real LensWorks epic", StringComparison.Ordinal));
+        Assert.Contains(missing, p => p.Contains("sc-12, a story of the plan sc-10, is not listed", StringComparison.Ordinal));
+        Assert.Contains(SwiftLive.EpicProblems([Item("sc-10", null, stories: ["sc-11"]), Item("sc-11", null, delivered: false)], []),
+            p => p.Contains("sc-11, a story of the plan sc-10, was not delivered", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void P5_AT7_needs_an_ios_test_that_ran_and_failed_on_the_base()
+    {
+        Assert.Null(SwiftLive.IosProblem([new(Repo, "sc-9", "T/C/t()", XcodeProject.IOS, TestCaseResult.Failed)], Repo));
+        // Not built on the base: the simulator never ran it there.
+        Assert.Contains("was run and failed on the base",
+            SwiftLive.IosProblem([new(Repo, "sc-9", "T/C/t()", XcodeProject.IOS, NewTestsCheck.NotBuilt)], Repo));
+        // A macOS target, or another repository's iOS test, is not the iOS change.
+        Assert.Contains("runs on an iOS Simulator", SwiftLive.IosProblem([new(Repo, "sc-9", "T/C/t()", XcodeProject.MacOS, TestCaseResult.Failed)], Repo));
+        Assert.Contains("runs on an iOS Simulator", SwiftLive.IosProblem([new(Lens, "sc-1", "T/C/t()", XcodeProject.IOS, TestCaseResult.Failed)], Repo));
+    }
+
     [Fact]
     public void The_live_checks_name_the_gates_own_words_for_an_unindexed_language()
     {
