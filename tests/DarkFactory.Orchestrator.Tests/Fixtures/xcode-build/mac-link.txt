@@ -1,0 +1,6 @@
+Undefined symbols for architecture arm64:
+  "_df_nowhere", referenced from:
+      WordsTests.links() -> () in LinkTests.o
+ld: symbol(s) not found for architecture arm64
+/opt/dark-factory/work/worktrees/acme/app/gate-sc-1-base/Words.xcodeproj: WordsTests: clang: error: linker command failed with exit code 1 (use -v to see invocation)
+note: Using codesigning identity override: -

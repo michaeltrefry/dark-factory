@@ -1,0 +1,4 @@
+boom
+Command PhaseScriptExecution failed with a nonzero exit code
+note: Using codesigning identity override: -
+note: Run script build phase 'Script' will be run during every build because the option to run the script phase "Based on dependency analysis" is unchecked. (in target 'WordsTests' from project 'Words')

@@ -1,0 +1,3 @@
+error: Build input file cannot be found: '/opt/dark-factory/work/worktrees/acme/app/gate-sc-1-base/WordsTests/WordsTests.swift'. Did you forget to declare this file as an output of a script phase or custom build rule which produces it? (in target 'WordsTests' from project 'Words')
+error: Build input file cannot be found: '/opt/dark-factory/work/worktrees/acme/app/gate-sc-1-base/WordsTests/WordsTests.swift'. Did you forget to declare this file as an output of a script phase or custom build rule which produces it? (in target 'WordsTests' from project 'Words')
+note: Using codesigning identity override: -

@@ -46,7 +46,7 @@ public class XcodeIosRunnerTests : IDisposable
         if (Directory.Exists(worktrees))
         {
             var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            foreach (var name in new[] { "gate-sc-6-base", "gate-sc-6-head" })
+            foreach (var name in new[] { "gate-sc-6-base", "gate-sc-6-head", "gate-sc-6-base-retry", "gate-sc-6-base-retry-2", "gate-sc-6-base-retry-3" })
             {
                 var derived = SwiftToolchain.DerivedDataOf(home, $"{Physical(worktrees)}/{name}");
                 if (Directory.Exists(derived))
@@ -141,6 +141,59 @@ public class XcodeIosRunnerTests : IDisposable
         Assert.Empty(GateDevices().Where(d => !_devicesBefore.Contains(d.Udid)));
         var records = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Library", "Caches", "dark-factory-gate-devices");
         Assert.Empty(Directory.Exists(records) ? Directory.GetFiles(records).Where(f => _recordsBefore.Contains(f) is false) : []);
+        Assert.Empty(Directory.EnumerateDirectories(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name)));
+    }
+
+    private Task<NewTestsResult> Check(string baseSha, string headSha) => NewTestsCheck.RunAsync(
+        new SandboxTestRunner(new GitWorkspace(Path.Combine(_root, "work"), _ => _remote, (_, _) => Task.FromResult<string?>(null)), slots: null, SandboxTestRunner.DefaultTimeout),
+        NewTestsCheck.StrategiesFor(swift: true, Path.Combine(SandboxSupport.RepoRoot, "scripts", "factory-xcodebuild")), Repo, baseSha, headSha, "gate-sc-6",
+        line => TestContext.Current.TestOutputHelper?.WriteLine(line), TestContext.Current.CancellationToken);
+
+    /// <summary>
+    /// sc-26134: on the simulator destination, a new XCTest method calling a function the PR adds does not build on the base —
+    /// not-built there, from xcodebuild's real errors — and the other new method gets its real result from a retry without it, a
+    /// run of its own on a fresh device of its own; a base whose production code does not build is an error.
+    /// </summary>
+    [Fact]
+    public async Task With_xcode_and_a_simulator_a_new_ios_test_calling_code_the_base_lacks_is_not_built_there_and_a_base_that_does_not_build_is_an_error()
+    {
+        Assert.SkipWhen(Missing.Value is not null, Missing.Value ?? "");
+        foreach (var (path, content) in XcodeIosFixture.Files())
+        {
+            Write(path, content);
+        }
+        var baseSha = CommitAndPush("base", "main");
+        TestGit.Run(_seed, "checkout", "-q", "-b", "factory/sc-6");
+        Write(XcodeIosFixture.Counter, "enum Counter {\n    static let start = 0\n\n    static func next(_ value: Int) -> Int { value + 1 }\n\n"
+            + "    static func previous(_ value: Int) -> Int { value - 1 }\n}\n");
+        Write(XcodeIosFixture.UnitTestFile, "import XCTest\n@testable import Tally\n\nfinal class IncrementTests: XCTestCase {\n    func testNextAddsOne() {\n"
+            + "        XCTAssertEqual(Counter.next(41), 42)\n    }\n\n    func testPreviousTakesOne() {\n        XCTAssertEqual(Counter.previous(42), 41)\n    }\n}\n");
+        var head = CommitAndPush("previous", "factory/sc-6");
+
+        var pass = await Check(baseSha, head);
+
+        Assert.True(pass.Outcome == NewTestsOutcome.Pass, $"{pass.Outcome}: {pass.Reason}");
+        Assert.Equal([("TallyTests/IncrementTests/testNextAddsOne()", "failed", "passed"), ("TallyTests/IncrementTests/testPreviousTakesOne()", "not-built", "passed")],
+            pass.Tests.Select(t => (t.Test, t.Base, t.Head)).OrderBy(t => t.Test, StringComparer.Ordinal));
+        Assert.Equal(("build-failed", "ran"), (pass.BaseRun, pass.BaseRetry));
+        Assert.Equal([$"{XcodeIosFixture.UnitTestFile}:9 func testPreviousTakesOne"], pass.BaseRemoved);
+        Assert.Empty(GateDevices().Where(d => !_devicesBefore.Contains(d.Udid)));
+
+        // A base whose production code does not build: an error, naming the base's file.
+        TestGit.Run(_seed, "checkout", "-q", "main");
+        Write(XcodeIosFixture.Counter, "enum Counter {\n    static let start = zero\n\n    static func next(_ value: Int) -> Int { value }\n}\n");
+        var broken = CommitAndPush("broken base", "main");
+        TestGit.Run(_seed, "checkout", "-q", "-b", "factory/sc-8");
+        Write(XcodeIosFixture.Counter, XcodeIosFixture.Fixed);
+        Write(XcodeIosFixture.UnitTestFile, XcodeIosFixture.UnitTest);
+        var fixing = CommitAndPush("fix the build", "factory/sc-8");
+
+        var error = await Check(broken, fixing);
+
+        Assert.True(error.Outcome == NewTestsOutcome.Error, $"{error.Outcome}: {error.Reason}");
+        Assert.Contains("says nothing about the new tests (not a compiler error in those files): Tally/Counter.swift(2,24): swiftc cannot find 'zero' in scope", error.Reason);
+        Assert.Equal(("build-failed", "ran", (string?)null), (error.BaseRun, error.HeadRun, error.BaseRetry));
+        Assert.Empty(GateDevices().Where(d => !_devicesBefore.Contains(d.Udid)));
         Assert.Empty(Directory.EnumerateDirectories(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name)));
     }
 }

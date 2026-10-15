@@ -52,8 +52,9 @@ namespace DarkFactory.Orchestrator.Gate;
 /// <see cref="CleanDerivedData"/> (the worktree's path, so its DerivedData, is the same for every run of the item: nothing
 /// a worker session of the same user left there is built on), then per project and scheme <c>factory-xcodebuild --gate
 /// build-for-testing -project|-workspace … -scheme … -destination platform=macOS -quiet</c>
-/// (the build; its output is the build log: a base that does not build is not attributed to the new tests yet, so it is an
-/// <c>error</c>), then per test <c>factory-xcodebuild --gate test-without-building … -only-testing:&lt;id&gt; -resultBundlePath
+/// (the build; its standard output is the build log: a base that does not build with the PR's test files is explained from
+/// swiftc's errors in it as for SwiftPM, <see cref="ExplainBuildFailure"/>, and retried up to <see cref="BaseRetries"/> times,
+/// sc-26134), then per test <c>factory-xcodebuild --gate test-without-building … -only-testing:&lt;id&gt; -resultBundlePath
 /// &lt;results&gt;/</c><see cref="BundleName"/> (its exit code kept) and <c>/usr/bin/xcrun xcresulttool get test-results
 /// tests --path</c> that bundle (its JSON kept): the result bundle is read in the sandbox, by the user whose tests wrote it,
 /// and only its JSON reaches the owner, bounded like every captured output and parsed as untrusted data
@@ -72,7 +73,12 @@ namespace DarkFactory.Orchestrator.Gate;
 /// in the user's own device set), the build for that device by name, <c>session</c> (a <see cref="TestPhase.Test"/> step: the
 /// fresh device's first boot, bounded by <see cref="BootTimeoutSeconds"/>, then per test the wrapper's
 /// <c>test-without-building</c> and xcresulttool into <c>xcode-test-&lt;hash&gt;.json</c>, its exit codes on its output
-/// <see cref="SessionOutput"/>), and <c>remove</c> (a <see cref="TestPhase.Cleanup"/> step: the run's device deleted).
+/// <see cref="SessionOutput"/>), and <c>remove</c> (a <see cref="TestPhase.Cleanup"/> step: the run's device deleted). The
+/// build is a step of its own, outside the simulator script, so its standard output is the build log as on macOS. A base that
+/// does not build is retried as a run of its own (sc-26134): a fresh results directory, so a fresh device, created by its
+/// <c>prepare</c> and deleted by its <c>remove</c> — never a device of the run before — and each run bounded by its own
+/// <c>Gate:TestTimeoutMinutes</c> like every run of the check. A run whose build fails stops before <c>session</c>, so it
+/// never boots its device: of a base and its retries only the one that builds pays for a first boot.
 /// </para>
 /// </summary>
 public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWrapperPath) : INewTestStrategy
@@ -119,7 +125,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
 
     /// <summary>
     /// How long the run's fresh simulator may take to boot: its first boot migrates its data, 2–4.5 minutes as a sandbox user
-    /// (sc-26126: 123, 137, 178 and 272 s seen), so about 2.6 times the slowest seen. Each run (the base's, the head's) boots its
+    /// (sc-26126: 123, 137, 178 and 272 s seen), so about 2.6 times the slowest seen. Each run (the base's, a retry's, the head's) boots its
     /// own device within its own <c>Gate:TestTimeoutMinutes</c> (default 20 minutes), which leaves 8 minutes beside it for the
     /// build and the tests.
     /// </summary>
@@ -408,8 +414,11 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
         }
     }
 
-    /// <summary>A test function's place in its target: its types and signature (the id without the target).</summary>
-    private static string Key(SwiftFunc func) => string.Join("/", func.Types.Append(func.Signature));
+    /// <summary>
+    /// A test function's place in its target: its types and signature (the id without the target) — <see cref="SwiftNewTests.Key"/>,
+    /// so a base build's errors are placed in it as for SwiftPM (sc-26134).
+    /// </summary>
+    private static string Key(SwiftFunc func) => SwiftNewTests.Key(func);
 
     /// <summary>A test's id as xcodebuild names it: <c>Target/Type/Nested/f()</c>.</summary>
     public static string Id(string target, IReadOnlyList<string> types, string signature) => string.Join("/", new[] { target }.Concat(types).Append(signature));
@@ -497,6 +506,8 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
         }
 
         var news = new SortedDictionary<string, (XcodeProject Project, XcodeTarget Target, string File)>(StringComparer.Ordinal);
+        // Each new test's file and place in it (its function, or for XCTest the method its class runs), where a base build's errors are placed.
+        var locations = new Dictionary<string, (string Path, string Key)>(StringComparer.Ordinal);
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var twice = new SortedSet<string>(StringComparer.Ordinal);
         var testFiles = new List<ChangedFile>();
@@ -600,6 +611,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                     else
                     {
                         news[id] = (project, target, path);
+                        locations[id] = (path, Key(test));
                     }
                 }
             }
@@ -645,6 +657,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                     continue;
                 }
                 news[id] = (project, target, test.Path);
+                locations[id] = (test.Path, Key(test.Method));
             }
         }
         // An existing parameterized test whose arguments: are the same text may still get new cases: when they name a
@@ -891,7 +904,24 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
             testFiles.Add(new ChangedFile('M', pbxproj, pbxproj));
         }
 
-        return new NewTestSet(testFiles.Distinct().ToList(), news.Keys.ToList(), problems) { Projects = projects, BaseReplacements = replacements, Notes = [.. notes] };
+        // Each applied test file as the head has it (the base run applies it so): a retry's file, with what did not compile
+        // left out, is compared with it to tell which types the overlay itself changed (SwiftNewTests.ExplainBuildFailure).
+        var originals = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var path in testFiles.Where(f => !f.Deleted).Select(f => f.NewPath!).Where(p => Swift(p)).Distinct(StringComparer.Ordinal))
+        {
+            if (await head.ReadAsync(path, ct) is { } text)
+            {
+                originals[path] = text;
+            }
+        }
+        return new SwiftNewTestSet(testFiles.Distinct().ToList(), news.Keys.ToList(), problems)
+        {
+            Projects = projects,
+            BaseReplacements = replacements,
+            Notes = [.. notes],
+            Originals = originals,
+            Locations = news.Keys.ToDictionary(id => id, id => locations[id], StringComparer.Ordinal),
+        };
 
         (List<string> Add, List<string> Remove) Edits(string project, string target) =>
             edits.TryGetValue((project, target), out var e) ? e : edits[(project, target)] = ([], []);
@@ -1166,18 +1196,54 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
 
     private static readonly SwiftNewTests SwiftErrors = new();
 
-    /// <summary>The compiler's errors in the build's output, read as <see cref="SwiftNewTests.ParseBuildErrors"/> reads swift build's (<c>/abs/File.swift:3:5: error: …</c>).</summary>
-    public IReadOnlyList<BuildError> ParseBuildErrors(string log, IReadOnlyList<string> roots) => SwiftErrors.ParseBuildErrors(log, roots);
+    /// <summary>
+    /// As for SwiftPM (sc-26134): swiftc reports in stages — a type or import that does not resolve hides the errors of the
+    /// code using it, and an error in a declaration's signature (the module's interface, built first) hides the errors in
+    /// function bodies — so a base that does not build is retried up to three times, each without what did not compile.
+    /// </summary>
+    public int BaseRetries => 3;
 
     /// <summary>
-    /// Not yet (a later story, as for SwiftPM): a base that does not build with the PR's test files says nothing here about
-    /// which new test cannot build there, so every error is unattributable and the check is an <c>error</c>, never a pass.
+    /// A build command xcodebuild reports as failed in its own words, with no <c>error:</c> (Xcode 26.5 with <c>-quiet</c>):
+    /// <c>Command PhaseScriptExecution failed with a nonzero exit code</c> — a run-script phase, which may be a test target's
+    /// own. It names no file in the applied test code, so it is unattributable.
     /// </summary>
-    public BuildFailure ExplainBuildFailure(NewTestSet set, IReadOnlyDictionary<string, string> applied, IReadOnlyList<BuildError> errors, IReadOnlyList<string> tests)
-    {
-        var note = "an Xcode project's base that does not build with the PR's test files is not attributed to the new tests yet";
-        IReadOnlyList<string> unattributable = errors.Count == 0 ? [$"the build failed and named no error ({note})"]
-            : [$"{note}:", .. errors.Select(e => e.ToString())];
-        return new BuildFailure([], unattributable, [], [], new Dictionary<string, string>(StringComparer.Ordinal));
-    }
+    private static readonly Regex FailedCommand = new(@"^Command [A-Za-z][A-Za-z0-9]* failed\b", RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// The errors in the build's standard output (<c>factory-xcodebuild --gate build-for-testing … -quiet</c>, kept by
+    /// <see cref="TestStep.CaptureOutput"/>, the same for macOS and an iOS Simulator destination), read as
+    /// <see cref="SwiftNewTests.ParseBuildErrors"/> reads <c>swift build</c>'s: swiftc's <c>/abs/File.swift:3:5: error: …</c>
+    /// (Xcode prints the path as it standardizes it, <c>/tmp/…</c> or <c>/var/…</c> for a worktree under <c>/private</c>: the
+    /// file is resolved before it is made relative), and every other line that reports an error with no file — the linker's
+    /// <c>…/App.xcodeproj: AppTests: clang: error: linker command failed …</c>, <c>error: Build input file cannot be found: …</c>,
+    /// a signing error — plus xcodebuild's <see cref="FailedCommand"/> lines. What Xcode 26.5 prints and does not: the
+    /// <c>Failed frontend command:</c> line and the compiler invocation after it (they say no more than the located errors),
+    /// notes and warnings; <c>** TEST BUILD FAILED **</c>, the list of failed build commands and xcodebuild's own
+    /// <c>xcodebuild: error: …</c> go to standard error, which is not read — a build that failed with nothing on standard output
+    /// names no error, which is unattributable.
+    /// </summary>
+    public IReadOnlyList<BuildError> ParseBuildErrors(string log, IReadOnlyList<string> roots) =>
+        SwiftErrors.ParseBuildErrors(log, roots)
+            .Concat(log.Split('\n').Select(l => l.TrimEnd('\r')).Where(l => FailedCommand.IsMatch(l)).Select(l => new BuildError(null, 0, 0, "xcodebuild", l)))
+            .Distinct().ToList();
+
+    /// <summary>
+    /// A base that does not build with the PR's test files (sc-26134), by exactly the rules of
+    /// <see cref="SwiftNewTests.ExplainBuildFailure"/> (the same code, over this strategy's <see cref="SwiftNewTestSet"/>):
+    /// each swiftc error is placed by <see cref="SwiftSource.Layout"/> in the innermost declaration at its position, in the
+    /// files the overlay applied only — the head's test files of the unit-test or UI-test target, as the base run built them
+    /// (a classic-reference project's test file included: the base's project file is given it, <see cref="XcodeProject.WithClassicSources"/>).
+    /// A new test whose own function (an XCTest test's: the method its class runs) or whose type's header is such a declaration
+    /// is <c>not-built</c>; every other outermost declaration that did not compile is left out of the next retry
+    /// (<see cref="BaseRetries"/>), so the other tests get their real results; an error between members, outside every
+    /// declaration or on a conditional-compilation line, and one in the header of a type an earlier retry changed, is
+    /// unremovable (those tests stay <c>unproven</c>). Unattributable, so the check is an <c>error</c>: an error in any file the
+    /// overlay did not apply (the base's production code, an unchanged test file, a file Xcode generated, a macro expansion
+    /// outside the worktree), the project file, packages, Info.plist, a script phase, the linker or signing, an error in no
+    /// file, an ambiguity or redeclaration (a clash with what the base has), a build-tool plugin's error, and a build that
+    /// names no error.
+    /// </summary>
+    public BuildFailure ExplainBuildFailure(NewTestSet set, IReadOnlyDictionary<string, string> applied, IReadOnlyList<BuildError> errors, IReadOnlyList<string> tests) =>
+        SwiftErrors.ExplainBuildFailure(set, applied, errors, tests);
 }
