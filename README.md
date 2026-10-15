@@ -224,9 +224,8 @@ sudo scripts/setup-worker-user.sh --remove-worker-login
 #    `factory run` / `factory work` refuse to start until the router's GET /v1/subscriptions/usage lists
 #    an enabled, routable, enrolled (managed or shared) plan for the key. A plan whose login was rejected
 #    (auth_rejected) is not routable: log in again with `simple-router login claude` (or `... codex`).
-#    Fallback, weaker (violates E5: the worker then holds a Claude login): Worker__Auth=claude-login, and
-#    log the _factory user in once (never copy your own credentials):
-#      sudo -u _factory -H /Users/_factory/.local/bin/claude   # then /login, then /exit
+#    Worker__Auth=claude-login was retired (sc-26197): simple-router serves every session from its own stored
+#    logins and never forwards a worker's, so `factory run` / `factory work` refuse to start with it (exit 2).
 
 # 6. Dashboard login password (prompted twice, no echo; `factory work` refuses to start without it)
 dotnet run --project src/DarkFactory.Orchestrator -- dashboard set-password

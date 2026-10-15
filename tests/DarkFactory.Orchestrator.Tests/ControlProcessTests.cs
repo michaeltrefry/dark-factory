@@ -58,7 +58,7 @@ public sealed class ControlProcessTests : IAsyncLifetime
             new WorkLedger(db, TimeProvider.System),
             new PostgresRunLocks(_ledger),
             new GitWorkspace(Path.Combine(_dir, "work"), _ => Origin, (_, _) => Task.FromResult<string?>(null)),
-            new ClaudeWorker(Path.Combine(_dir, "fake-claude.sh"), new Uri("http://127.0.0.1:9/"), "rk_test", WorkerAuth.ClaudeLogin,
+            new ClaudeWorker(Path.Combine(_dir, "fake-claude.sh"), new Uri("http://127.0.0.1:9/"), "rk_test",
                 TimeSpan.FromMinutes(2), pauseFlagDirectory: Path.Combine(_dir, "controls")),
             _prs,
             Repo,

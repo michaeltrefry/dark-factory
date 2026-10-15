@@ -199,7 +199,7 @@ public class FactoryOptionsTests
         Assert.Equal(new Uri("http://127.0.0.1:8790/"), options.RouterBaseUrl); // simple-router (sc-26197)
         Assert.Equal("michaeltrefry/dark-factory-sandbox", options.DefaultRepo.FullName);
         Assert.Contains("Port=5434", options.LedgerConnectionString);
-        Assert.Equal(Worker.WorkerAuth.RouterKey, options.WorkerAuth); // the worker holds no provider credential by default (E5)
+        options.CheckWorkerAuth(); // router-key, the only mode: the worker holds no provider credential (E5)
     }
 
     [Fact]
@@ -365,11 +365,50 @@ public class FactoryOptionsTests
     }
 
     [Fact]
-    public void Worker_auth_mode_is_configurable_and_validated()
+    public void Worker_auth_accepts_only_router_key()
     {
-        Assert.Equal(Worker.WorkerAuth.RouterKey, Options(new() { ["Worker:Auth"] = "router-key" }).WorkerAuth);
-        Assert.Equal(Worker.WorkerAuth.ClaudeLogin, Options(new() { ["Worker:Auth"] = "claude-login" }).WorkerAuth);
-        Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:Auth"] = "api-key" }).WorkerAuth);
+        Options(new() { ["Worker:Auth"] = "router-key" }).ValidateSettings();
+        var unknown = Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:Auth"] = "api-key" }).ValidateSettings());
+        Assert.Contains("Worker:Auth must be 'router-key'", unknown.Message);
+    }
+
+    [Theory]
+    [InlineData("claude-login")]
+    [InlineData("Claude-Login")]
+    [InlineData(" CLAUDE-LOGIN ")]
+    public void Worker_auth_claude_login_is_retired_and_refused_at_start_up(string value)
+    {
+        // The non-default value is read (a refusal, not ignored) and refused by the start-up validation (exit 2).
+        var refused = Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:Auth"] = value }).ValidateSettings());
+        Assert.Equal(FactoryOptions.ClaudeLoginRetired, refused.Message);
+        Assert.Contains("retired", refused.Message);
+        Assert.Contains("simple-router", refused.Message);
+    }
+
+    [Fact]
+    public void No_claude_login_code_path_is_left_in_the_orchestrator()
+    {
+        // sc-26197: the mode is gone, not merely refused: only its refusal in FactoryOptions may name it.
+        var src = Path.Combine(RepoRoot(), "src", "DarkFactory.Orchestrator");
+        var offenders = Directory.EnumerateFiles(src, "*.cs", SearchOption.AllDirectories)
+            .Where(f => !f.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}")
+                && !f.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}"))
+            .Where(f => File.ReadAllText(f) is var text
+                && (System.Text.RegularExpressions.Regex.IsMatch(text, @"\bWorkerAuth\b") || text.Contains("ClaudeLogin,", StringComparison.Ordinal)
+                    || (text.Contains("claude-login", StringComparison.OrdinalIgnoreCase) && Path.GetFileName(f) != "FactoryOptions.cs")))
+            .Select(Path.GetFileName)
+            .ToList();
+        Assert.Empty(offenders);
+    }
+
+    private static string RepoRoot()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null && !File.Exists(Path.Combine(dir.FullName, "CLAUDE.md")))
+        {
+            dir = dir.Parent;
+        }
+        return dir?.FullName ?? throw new InvalidOperationException("repository root not found");
     }
 
     [Fact]
@@ -965,12 +1004,4 @@ public class RouterEnrollmentCheckTests
         Assert.Contains("could not be read", error);
     }
 
-    [Fact]
-    public async Task Claude_login_mode_skips_the_check_without_calling_the_router()
-    {
-        var api = new FakeApi();
-
-        Assert.Null(await CheckAsync(Options("claude-login"), api));
-        Assert.Empty(api.Requests);
-    }
 }

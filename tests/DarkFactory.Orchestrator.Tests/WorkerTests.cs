@@ -108,21 +108,21 @@ public class ClaudeWorkerTests
     [Fact]
     public void Environment_carries_only_router_url_and_router_key_header()
     {
-        var env = ClaudeWorker.BuildEnvironment(ParentEnvironment(), Router, "rk_worker", WorkerAuth.ClaudeLogin, WorkerModelClass.Mid);
+        var env = ClaudeWorker.BuildEnvironment(ParentEnvironment(), Router, "rk_worker", WorkerModelClass.Mid);
 
         Assert.Equal("http://localhost:8080", env["ANTHROPIC_BASE_URL"]);
         Assert.Equal("X-Weave-Router-Key: rk_worker\nx-weave-model-class: mid", env["ANTHROPIC_CUSTOM_HEADERS"]);
         Assert.Equal("/usr/bin:/bin", env["PATH"]);
         Assert.Equal("/Users/someone", env["HOME"]);
 
-        Assert.Equal(["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "HOME", "PATH", "USER"], env.Keys.Order());
+        Assert.Equal(["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "HOME", "PATH", "USER"], env.Keys.Order());
         Assert.DoesNotContain(env.Values, v => v.Contains("sk-") || v.Contains("ghp_") || v.Contains("oauth") || v.Contains("leak"));
     }
 
     [Fact]
     public void Router_key_auth_mode_uses_the_router_key_as_bearer_auth_token_and_nothing_else()
     {
-        var env = ClaudeWorker.BuildEnvironment(ParentEnvironment(), Router, "rk_worker", WorkerAuth.RouterKey, WorkerModelClass.Low);
+        var env = ClaudeWorker.BuildEnvironment(ParentEnvironment(), Router, "rk_worker", WorkerModelClass.Low);
 
         // Bearer (ANTHROPIC_AUTH_TOKEN), not x-api-key (ANTHROPIC_API_KEY): the router strips an rk_ bearer before
         // any upstream relay, while its pass-through tier forwards x-api-key as is.
@@ -160,7 +160,7 @@ public class ClaudeWorkerTests
         Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", "sk-ant-should-not-leak");
         try
         {
-            var worker = new ClaudeWorker(script, Router, "rk_worker", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1));
+            var worker = new ClaudeWorker(script, Router, "rk_worker", TimeSpan.FromMinutes(1));
             var lines = new List<string>();
             var result = await worker.RunAsync(dir, "prompt", null, WorkerModelClass.Mid,
                 new WorkerCallbacks(OnLine: (line, _) => { lines.Add(line); return ValueTask.CompletedTask; }), CancellationToken.None);
@@ -207,7 +207,7 @@ public class ClaudeWorkerTests
         Environment.SetEnvironmentVariable("GitHub__PrivateKeyPem", pem);
         try
         {
-            var result = await new ClaudeWorker(script, Router, "rk_worker", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1))
+            var result = await new ClaudeWorker(script, Router, "rk_worker", TimeSpan.FromMinutes(1))
                 .RunAsync(worktree, "implement the story", null, WorkerModelClass.Mid, null, CancellationToken.None);
 
             Assert.True(result.Succeeded);
@@ -232,7 +232,7 @@ public class ClaudeWorkerTests
         var script = Path.Combine(dir, "fake-claude.sh");
         SandboxSupport.ExecutableAt(script, "#!/bin/sh\necho '{\"type\":\"system\",\"session_id\":\"s\"}'\necho boom >&2\nexit 3\n");
 
-        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid, null, CancellationToken.None);
+        var result = await new ClaudeWorker(script, Router, "k", TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid, null, CancellationToken.None);
 
         Assert.False(result.Succeeded);
         Assert.Equal(3, result.ExitCode);
@@ -288,7 +288,7 @@ public class ClaudeWorkerTests
             """);
         Directory.CreateDirectory(flags);
         File.WriteAllText(Path.Combine(flags, "factory-sc-9.pause"), "stale");
-        var worker = new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1), pauseFlagDirectory: flags);
+        var worker = new ClaudeWorker(script, Router, "k", TimeSpan.FromMinutes(1), pauseFlagDirectory: flags);
 
         var run = worker.RunAsync(worktree, "p", null, WorkerModelClass.Mid, new WorkerCallbacks(OnSession: (_, _) =>
         {
@@ -315,7 +315,7 @@ public class ClaudeWorkerTests
         var flag = ClaudeWorker.PauseFlagPath(flags, Path.Combine(dir, "factory-sc-9"));
         File.WriteAllText(flag, "");
         File.SetUnixFileMode(flag, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-        IWorker worker = new ClaudeWorker("claude", Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1), pauseFlagDirectory: flags);
+        IWorker worker = new ClaudeWorker("claude", Router, "k", TimeSpan.FromMinutes(1), pauseFlagDirectory: flags);
 
         worker.RequestPause(Path.Combine(dir, "factory-sc-9"));
 
@@ -356,7 +356,7 @@ public class ClaudeWorkerTests
             """);
         var seen = new List<string>();
 
-        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", "sess-early", WorkerModelClass.Mid,
+        var result = await new ClaudeWorker(script, Router, "k", TimeSpan.FromMinutes(1)).RunAsync(dir, "p", "sess-early", WorkerModelClass.Mid,
             new WorkerCallbacks(OnSession: (sid, _) =>
             {
                 seen.Add(sid);
@@ -382,7 +382,7 @@ public class ClaudeWorkerTests
             """);
 
         // The tap never finishes on its own (a stalled database): only the worker timeout can end it.
-        var run = new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMilliseconds(500)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
+        var run = new ClaudeWorker(script, Router, "k", TimeSpan.FromMilliseconds(500)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
             new WorkerCallbacks(OnLine: async (_, c) => await Task.Delay(Timeout.Infinite, c)), CancellationToken.None);
 
         // (WaitAsync's own TimeoutException has a different message.)
@@ -404,7 +404,7 @@ public class ClaudeWorkerTests
             """);
         var events = new List<string>();
 
-        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
+        var result = await new ClaudeWorker(script, Router, "k", TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
             new WorkerCallbacks(
                 OnStarted: (pid, _) => { events.Add($"started {pid}"); return Task.CompletedTask; },
                 OnSession: (sid, _) => { events.Add($"session {sid}"); return Task.CompletedTask; }),
@@ -431,7 +431,7 @@ public class ClaudeWorkerTests
             """);
         var models = new List<string>();
 
-        var result = await new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
+        var result = await new ClaudeWorker(script, Router, "k", TimeSpan.FromMinutes(1)).RunAsync(dir, "p", null, WorkerModelClass.Mid,
             new WorkerCallbacks(OnModel: (model, _) => { models.Add(model); return Task.CompletedTask; }), CancellationToken.None);
 
         Assert.True(result.Succeeded, result.StderrTail);
@@ -448,7 +448,7 @@ public class ClaudeWorkerTests
         try
         {
             await Task.Delay(300);
-            var worker = new ClaudeWorker(Path.Combine(dir, "fake-claude.sh"), Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1));
+            var worker = new ClaudeWorker(Path.Combine(dir, "fake-claude.sh"), Router, "k", TimeSpan.FromMinutes(1));
 
             Assert.False(await worker.StopOrphanAsync(other.Pid, CancellationToken.None));
             Assert.False(otherProcess.HasExited);
@@ -474,7 +474,7 @@ public class ClaudeWorkerTests
             echo '{"type":"system","subtype":"init","session_id":"s"}'
             wait
             """);
-        var worker = new ClaudeWorker(script, Router, "k", WorkerAuth.ClaudeLogin, TimeSpan.FromMinutes(1));
+        var worker = new ClaudeWorker(script, Router, "k", TimeSpan.FromMinutes(1));
         var started = new TaskCompletionSource<int>();
         // Stands in for the crashed orchestrator: the worker keeps running while we stop it "from the next run".
         var run = worker.RunAsync(dir, "p", null, WorkerModelClass.Mid, new WorkerCallbacks(OnStarted: (pid, _) => { started.SetResult(pid); return Task.CompletedTask; }), CancellationToken.None);

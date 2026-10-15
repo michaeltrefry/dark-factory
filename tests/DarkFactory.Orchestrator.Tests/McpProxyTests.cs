@@ -391,7 +391,7 @@ public class McpProxyTests
         // Kanban is configured here, but the triage profile grants none of it (as production, which does not even start its upstream).
         var tools = WorkerTools.ReadOnly.WithMcp(McpProfile.Triage.ToolRules(upstreams));
         Assert.True(tools.IsReadOnly);
-        var worker = new ClaudeWorker(script, new Uri("http://localhost:8080/"), "rk_worker", WorkerAuth.RouterKey, TimeSpan.FromMinutes(1), tools: tools);
+        var worker = new ClaudeWorker(script, new Uri("http://localhost:8080/"), "rk_worker", TimeSpan.FromMinutes(1), tools: tools);
         var workspaces = new DirWorkspaces(worktree);
         await using var db = TestDb.Create();
         var ledger = new WorkLedger(db, TimeProvider.System);
@@ -469,7 +469,7 @@ public class McpProxyTests
             echo '{"type":"system","subtype":"init","session_id":"impl-1"}'
             echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"impl-1"}'
             """);
-        var worker = new ClaudeWorker(script, new Uri("http://localhost:8080/"), "rk", WorkerAuth.RouterKey, TimeSpan.FromMinutes(1));
+        var worker = new ClaudeWorker(script, new Uri("http://localhost:8080/"), "rk", TimeSpan.FromMinutes(1));
         Assert.True((await worker.RunAsync(root, "implement", null, WorkerModelClass.Mid, null, CancellationToken.None)).Succeeded);
         var argv = File.ReadAllLines(argsDump);
         Assert.Contains("--strict-mcp-config", argv);

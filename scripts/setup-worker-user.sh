@@ -448,13 +448,10 @@ slots_flag=
 use_slot 1
 cat <<EOF
 
-Workers use Worker:Auth=router-key (the default) and hold only the router key: enroll your plans on the
+Workers hold only the router key (Worker:Auth=router-key, the only mode): enroll your plans on the
 router instead (simple-router login claude, simple-router login codex). If a worker user still has a Claude login of its
 own, remove it (that runs nothing else and signals no process):
     sudo $0$slots_flag --remove-worker-login
-Worker:Auth=claude-login (weaker: the worker holds a Claude login, which E5 forbids) needs each worker's
-own login instead (once per worker user):
-    sudo -u $worker -H $worker_home/.local/bin/claude      # then /login, then /exit
 EOF
 if [ "$slots" -gt 1 ]; then
     echo

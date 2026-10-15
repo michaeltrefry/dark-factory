@@ -33,11 +33,10 @@ opt-in: the tests skip, naming the missing prerequisite, unless their gate varia
 Common prerequisites: `docker compose up -d` (ledger Postgres on 5434), the router on `Router:BaseUrl`
 (default `http://127.0.0.1:8790`: simple-router, michaeltrefry/simple-router), keychain entries for the router key, Shortcut token and GitHub App
 (`factory github-app setup`), `sudo scripts/setup-worker-user.sh` done once (or `Worker__RunAs=none` to run workers
-as yourself, development only), and the model auth: for `Worker:Auth=router-key` (the default) your plans enrolled on
+as yourself, development only), and the model auth (`Worker:Auth=router-key`, the only mode: `claude-login` was retired, sc-26197): your plans enrolled on
 the router for the router key (`simple-router login claude`, `simple-router login codex`, run in the simple-router
 repository as `dotnet run --project src/SimpleRouter -- login claude|codex`; `factory run`/`work` refuse to start
-without one) and `_factory`'s own login removed (`sudo scripts/setup-worker-user.sh --remove-worker-login`); for
-`Worker:Auth=claude-login` (weaker, violates E5) the `_factory` Claude login instead.
+without one) and `_factory`'s own login removed (`sudo scripts/setup-worker-user.sh --remove-worker-login`).
 
 Run one test at a time with a class filter, e.g.:
 
@@ -128,8 +127,8 @@ for its sessions.
 | Check | Test | Gate |
 | --- | --- | --- |
 | Worker token pushes `factory/*` only on its own repo; push to `main` and to another repo rejected | `AppTokenPushTests.Worker_token_pushes_factory_branches_only_on_its_own_repo` | `FACTORY_E2E=1` (`FACTORY_E2E_OTHER_REPO` optional) |
-| Worker env is exactly the allowlist for the configured `Worker:Auth` (`router-key`: `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `HOME`, `MSBUILDDISABLENODEREUSE`, `PATH`, `TMPDIR` — the sandbox user's own temporary directory, sc-25992; `claude-login`: the same without `ANTHROPIC_AUTH_TOKEN`); `ANTHROPIC_CUSTOM_HEADERS` is two lines, the router key and `x-weave-model-class` (sc-25659) | `LiveWorkerSandboxTests.Live_worker_environment_is_exactly_the_allowlist_for_the_configured_auth_mode` | `FACTORY_SANDBOX_LIVE=1` |
-| `router-key`: `_factory` holds no Claude credential (no `~/.claude/.credentials.json`, no `Claude Code-credentials` keychain item) | `LiveWorkerSandboxTests.Worker_user_holds_no_claude_credential_in_router_key_mode` (skips for `claude-login`) | `FACTORY_SANDBOX_LIVE=1` |
+| Worker env is exactly the allowlist (`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `HOME`, `MSBUILDDISABLENODEREUSE`, `PATH`, `TMPDIR` — the sandbox user's own temporary directory, sc-25992); `ANTHROPIC_CUSTOM_HEADERS` is two lines, the router key and `x-weave-model-class` (sc-25659) | `LiveWorkerSandboxTests.Live_worker_environment_is_exactly_the_allowlist` | `FACTORY_SANDBOX_LIVE=1` |
+| `_factory` holds no Claude credential (no `~/.claude/.credentials.json`, no `Claude Code-credentials` keychain item) | `LiveWorkerSandboxTests.Worker_user_holds_no_claude_credential` | `FACTORY_SANDBOX_LIVE=1` |
 | `router-key`: `factory run`/`work` refuse to start without an enrolled plan | `RouterEnrollmentCheckTests` (unit, fake router) | none |
 | `~michael`, `.ssh`, `.config/gh`, login keychain unreachable | `LiveWorkerSandboxTests.Worker_is_denied_the_owners_home_ssh_keys_gh_config_and_login_keychain`, `Worker_cannot_read_the_owners_keychain_items` | `FACTORY_SANDBOX_LIVE=1` |
 

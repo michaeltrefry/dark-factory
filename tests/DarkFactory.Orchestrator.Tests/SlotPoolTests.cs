@@ -628,11 +628,11 @@ public class SlotPoolTests
             new WorkerSlot(1, new WorkerSandbox("_dftest", first, sudo, repo) { Lock = WorkerLock.For(_root, 1) }),
             new WorkerSlot(2, new WorkerSandbox("_dftest2", second, sudo, repo) { Lock = WorkerLock.For(_root, 2) })]);
 
-        await pool.HoldAsync(1, async _ => { await FactoryRunner.EnsureSandboxReadyAsync(pool, WorkerAuth.RouterKey, claude, CancellationToken.None); return true; },
+        await pool.HoldAsync(1, async _ => { await FactoryRunner.EnsureSandboxReadyAsync(pool, claude, CancellationToken.None); return true; },
             CancellationToken.None);
         Assert.All(HelpersRan, ran => Assert.Equal(first, ran)); // only slot 1's helper ran for slot 1's probe
         var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() => pool.HoldAsync(2,
-            async _ => { await FactoryRunner.EnsureSandboxReadyAsync(pool, WorkerAuth.RouterKey, claude, CancellationToken.None); return true; }, CancellationToken.None));
+            async _ => { await FactoryRunner.EnsureSandboxReadyAsync(pool, claude, CancellationToken.None); return true; }, CancellationToken.None));
 
         Assert.Contains("Worker slot 2 (_dftest2): Worker sandbox user '_dftest2' is not usable through " + second, ex.Message);
         Assert.Contains(second, HelpersRan);

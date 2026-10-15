@@ -72,7 +72,7 @@ public class SwiftToolchainTests
     }
 
     private Task ProbeAsync(WorkerSlots pool, int slot) => pool.HoldAsync(slot,
-        async _ => { await FactoryRunner.EnsureSandboxReadyAsync(pool, WorkerAuth.RouterKey, Claude, CancellationToken.None); return true; },
+        async _ => { await FactoryRunner.EnsureSandboxReadyAsync(pool, Claude, CancellationToken.None); return true; },
         CancellationToken.None);
 
     private string[] HelpersRan => File.Exists(Ran) ? File.ReadAllLines(Ran) : [];
@@ -152,7 +152,7 @@ public class SwiftToolchainTests
         var sandbox = new WorkerSandbox(Environment.UserName, helper, SandboxSupport.FakeSudo(_dir), RepoHelper) { Swift = Toolchain(firstLaunch: 69) };
 
         var ex = await Assert.ThrowsAsync<FactoryUnavailableException>(() =>
-            FactoryRunner.EnsureSandboxReadyAsync(sandbox, WorkerAuth.RouterKey, Claude, CancellationToken.None));
+            FactoryRunner.EnsureSandboxReadyAsync(sandbox, Claude, CancellationToken.None));
 
         Assert.Contains($"Swift toolchain (Worker:Swift) of {Environment.UserName}: ", ex.Message);
         Assert.DoesNotContain("Worker slot", ex.Message);

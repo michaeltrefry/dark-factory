@@ -240,13 +240,34 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
         var user => user,
     };
 
-    /// <summary><c>Worker:Auth</c> = <c>router-key</c> (default) or <c>claude-login</c> (weaker, violates E5); see <see cref="Worker.WorkerAuth"/>.</summary>
-    public Worker.WorkerAuth WorkerAuth => (config["Worker:Auth"] ?? "router-key") switch
+    /// <summary>
+    /// Why <c>claude-login</c> was retired (sc-26197): the factory's router, simple-router, never forwards a client's own
+    /// login — it serves every session from its own stored logins — so the mode behaved like <c>router-key</c> while skipping
+    /// the start-up enrolment check.
+    /// </summary>
+    public const string ClaudeLoginRetired =
+        "Worker:Auth=claude-login was retired (sc-26197): the router (simple-router) serves every session from its own stored "
+        + "logins and never forwards a worker's own Claude login, so the mode only skipped the start-up check of the router's "
+        + "enrolled plans. Remove Worker:Auth (router-key, the only mode, is the default) and enroll a plan on the router "
+        + "(simple-router login claude|codex).";
+
+    /// <summary>
+    /// <c>Worker:Auth</c>: only <c>router-key</c> (the default; the worker holds the router key and no provider credential, E5).
+    /// <c>claude-login</c> (any case) is refused with <see cref="ClaudeLoginRetired"/>, any other value as unknown; both by
+    /// <see cref="ValidateSettings"/>, so <c>factory run</c> and <c>factory work</c> exit 2 rather than ignore the setting.
+    /// </summary>
+    public void CheckWorkerAuth()
     {
-        "claude-login" => Worker.WorkerAuth.ClaudeLogin,
-        "router-key" => Worker.WorkerAuth.RouterKey,
-        var other => throw new InvalidOperationException($"Worker:Auth must be 'router-key' or 'claude-login', not '{other}'."),
-    };
+        switch (config["Worker:Auth"])
+        {
+            case null or "router-key":
+                return;
+            case var retired when string.Equals(retired.Trim(), "claude-login", StringComparison.OrdinalIgnoreCase):
+                throw new InvalidOperationException(ClaudeLoginRetired);
+            case var other:
+                throw new InvalidOperationException($"Worker:Auth must be 'router-key' (the only mode), not '{other}'.");
+        }
+    }
 
     /// <summary><c>Shortcut:Watch:Teams</c> / <c>Shortcut:Watch:Epics</c>; empty watches nothing.</summary>
     public WatchScope WatchScope => WatchScope.From(config);
@@ -526,10 +547,11 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
     /// </summary>
     public void ValidateSettings()
     {
-        _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSlotCount, WorkerSwift, WorkerSlots, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures, MaxConcurrentRuns);
+        _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSlotCount, WorkerSwift, WorkerSlots, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures, MaxConcurrentRuns);
         _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
         _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl, KanbanMcpUrl);
         _ = (CodeGraphOverlayTimeout, KanbanWatchScope, KanbanWebUrl);
+        CheckWorkerAuth();
         // Kanban:WriteToken must not be Kanban:Token (E2, sc-25992); compared where the write token is read, the registry.
         WorkSources.WorkSourceRegistry.EnsureKanbanTokensApart(this);
     }

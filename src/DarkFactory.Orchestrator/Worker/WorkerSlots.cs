@@ -287,10 +287,10 @@ public sealed class WorkerSlots : IWorkerSandbox
     /// the calling flow holds — every run probes its own slot in its first worker phase, so each slot is probed before a worker
     /// runs in it. A failure names the slot when there are several.
     /// </summary>
-    public Task EnsureReadyAsync(WorkerAuth auth, string claudePath, CancellationToken ct)
+    public Task EnsureReadyAsync(string claudePath, CancellationToken ct)
     {
         var slot = Held ?? (Count == 1 ? All[0] : throw new InvalidOperationException("No worker slot is held: the readiness probe is of the held slot."));
-        return NamedAsync(slot, () => slot.Sandbox.EnsureReadyAsync(auth, claudePath, ct));
+        return NamedAsync(slot, () => slot.Sandbox.EnsureReadyAsync(claudePath, ct));
     }
 
     /// <summary>Runs <paramref name="check"/>, its failure led by <paramref name="slot"/> when the pool has several.</summary>
