@@ -16,7 +16,7 @@ namespace DarkFactory.AcceptanceTests;
 /// by an owner's pull request, once. A new test's target must exist on the base (a new test target cannot be run there: the check
 /// would be <c>unsupported</c>), so each run seeds only a test, and the production change it needs, into those.
 /// </summary>
-internal static partial class SwiftSeeds
+internal static class SwiftSeeds
 {
     /// <summary>The SwiftPM package's seed directory under <c>Seeds/</c>.</summary>
     public const string PackageSeed = "swift-package";
@@ -86,8 +86,10 @@ internal static partial class SwiftSeeds
             """,
             $"{PackageTarget}.e2eAlreadyPassesOnTheBase()");
 
-    [GeneratedRegex(@"static let count = (\d+)")]
-    private static partial Regex CountLine();
+    // A plain Regex, not [GeneratedRegex]: the gateway lint compiles this project's sources without its source generators.
+    private static readonly Regex CountPattern = new(@"static let count = (\d+)", RegexOptions.CultureInvariant);
+
+    private static Regex CountLine() => CountPattern;
 
     /// <summary>The iOS app's run counter file (<c>Tally/E2eRun.swift</c>) under <paramref name="dir"/>.</summary>
     public static string CounterFile(string dir) => $"{dir}/Tally/E2eRun.swift";
