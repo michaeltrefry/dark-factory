@@ -182,7 +182,7 @@ public class GatePipelineTests
             Requests.Add(request);
             if (Requests.Count <= UsageLimitedCalls)
             {
-                throw new RouterUsageLimitedException("The review call through the router failed: 429 All enrolled subscription accounts are currently unavailable.");
+                throw new RouterUsageLimitedException("The review call through the router failed: 429 model_class_unavailable: no model in the high tier can serve this request now (usage limit, login or availability); the earliest resets at 2026-10-15 13:00:00Z.");
             }
             return Task.FromResult(new RoleReview(request.Role, Served(request), ServedClass(request), request.Session,
                 request.Prompt.Id, Findings(request), "reviewed"));

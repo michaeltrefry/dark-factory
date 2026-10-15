@@ -813,9 +813,9 @@ public class PlanPipelineTests
     public static TheoryData<WorkerResult, string> UsageRefusals => new()
     {
         { new WorkerResult("plan-sess", 1, true, "success",
-            """API Error: 429 {"type":"error","error":{"type":"api_error","message":"All enrolled subscription accounts are currently unavailable."}}""", ""),
+            """API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit."}}""", ""),
             UsagePause.WorkerRateLimited },
-        { new WorkerResult("plan-sess", 1, true, "success", """API Error: 503 {"error":{"type":"model_class_unavailable"}}""", ""),
+        { new WorkerResult("plan-sess", 1, true, "success", """API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"model_class_unavailable: no model in the high tier can serve this request now (usage limit, login or availability); the earliest resets at 2026-10-15 13:00:00Z."}}""", ""),
             UsagePause.WorkerModelClassUnavailable },
     };
 

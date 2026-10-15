@@ -12,14 +12,13 @@ public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError,
     public bool Succeeded => ExitCode == 0 && !IsError && SessionId is not null;
 
     /// <summary>
-    /// How a failed session reads when the plans ran out rather than the work failing: the router's answer when every
-    /// subscription is exhausted (429 "All enrolled subscription accounts are currently unavailable."), an upstream 429
+    /// How a failed session reads when the plans ran out rather than the work failing: simple-router's answer when no model of
+    /// the session's class can serve (429 <c>rate_limit_error</c>, message <c>model_class_unavailable: …</c>), an upstream 429
     /// or 529 passed through (Claude Code's "API Error: 429 …", <c>rate_limit_error</c>, <c>overloaded_error</c>,
     /// "Repeated 529 Overloaded errors") and a plan's own limit ("usage limit reached", "hit your limit").
     /// </summary>
     public static readonly string[] UsageLimitMarkers =
     [
-        "All enrolled subscription accounts are currently unavailable",
         "API Error: 429",
         "API Error: 529",
         "rate_limit_error",
@@ -46,7 +45,7 @@ public sealed record WorkerResult(string? SessionId, int ExitCode, bool IsError,
     /// </summary>
     public bool HookStopped => TerminalReason == HookStoppedReason;
 
-    /// <summary>The router's refusal when no model of the session's class can serve it (503; the message prefix).</summary>
+    /// <summary>The router's refusal when no model of the session's class can serve it (the prefix of its 429 <c>rate_limit_error</c> message).</summary>
     public const string ModelClassUnavailableMarker = Router.ModelClass.Unavailable;
 
     /// <summary>
@@ -298,7 +297,7 @@ public enum WorkerAuth
     /// <c>X-Weave-Router-Key</c> (the router's preferred routing token) and as <c>ANTHROPIC_AUTH_TOKEN</c>, so Claude Code
     /// starts without a login and sends it as <c>Authorization: Bearer rk_…</c>, which the router strips before any
     /// upstream relay (unlike <c>x-api-key</c>, which its pass-through tier would forward). The router serves the
-    /// request from the plans enrolled for the key (<c>router login claude</c> / <c>router login codex</c>).
+    /// request from the plans enrolled for the key (<c>simple-router login claude</c> / <c>simple-router login codex</c>).
     /// </summary>
     RouterKey,
 }

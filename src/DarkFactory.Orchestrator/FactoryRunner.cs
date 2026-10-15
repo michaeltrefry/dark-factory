@@ -114,7 +114,8 @@ public static class FactoryRunner
         {
             return null;
         }
-        const string remedy = "Enroll a plan on the router for this key (`router login claude` and/or `router login codex`), "
+        const string remedy = "Enroll a plan on the router for this key (`simple-router login claude` and/or `simple-router login codex`: in the simple-router "
+            + "repository, `dotnet run --project src/SimpleRouter -- login claude|codex`), "
             + "or set Worker__Auth=claude-login (weaker: the worker then holds a Claude login, which E5 forbids).";
         SubscriptionUsage report;
         try
@@ -137,8 +138,9 @@ public static class FactoryRunner
         return unroutable.Count > 0
             ? $"Worker:Auth=router-key, but every enrolled plan the router at {options.RouterBaseUrl} lists for this router key is "
                 + $"not routable ({string.Join(", ", unroutable.Select(c => $"{c.Provider} {c.State ?? "unknown state"}"))}), so every "
-                + "worker model call would fail. Reconnect the plan on the router (`router login claude` for a Claude plan, "
-                + "`router login codex` for a Codex plan), then start again."
+                + "worker model call would fail. Reconnect the plan on the router (`simple-router login claude` for a Claude plan, "
+                + "`simple-router login codex` for a Codex plan: in the simple-router repository, "
+                + "`dotnet run --project src/SimpleRouter -- login claude|codex`), then start again."
             : $"Worker:Auth=router-key, but the router at {options.RouterBaseUrl} lists no enrolled, enabled plan for this router key "
                 + $"(GET /v1/subscriptions/usage has no managed or shared credential), so every worker model call would fail. {remedy}";
     }

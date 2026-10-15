@@ -113,8 +113,9 @@ public class WorkerModelClassTests
     }
 
     [Theory]
-    [InlineData(true, "API Error: 503 {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"model_class_unavailable: no model of class mid can serve this request\"}}", "", true)]
-    [InlineData(true, "failed", "Error: model_class_unavailable: no model of class low can serve this request", true)]
+    // simple-router's exact answer (sc-26197): 429 rate_limit_error, message prefixed model_class_unavailable, as Claude Code reports it.
+    [InlineData(true, "API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"model_class_unavailable: no model in the mid tier can serve this request now (usage limit, login or availability); the earliest resets at 2026-10-15 13:00:00Z. Run 'simple-router login claude'.\"}}", "", true)]
+    [InlineData(true, "failed", "Error: model_class_unavailable: no model in the low tier can serve this request now (usage limit, login or availability); the earliest resets at 2026-10-15 13:00:00Z.", true)]
     [InlineData(false, "The router answers model_class_unavailable when no model of the class can serve; I documented it.", "", false)] // prose
     [InlineData(true, "error_max_turns", "", false)]
     public void Model_class_unavailable_is_recognised_only_in_an_error_result_or_stderr(bool isError, string resultText, string stderr, bool expected)

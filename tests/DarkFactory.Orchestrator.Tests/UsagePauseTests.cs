@@ -24,8 +24,9 @@ public class UsagePauseTests
     private static readonly TimeSpan Interval = TimeSpan.FromSeconds(60);
     private static readonly WorkStory Story = new(77, "Whitespace counts as a word", "WordCount(\"  \") returns 1.", "bug", "https://app.shortcut.com/trefry/story/77", ItemNaming.Shortcut);
 
+    /// <summary>An upstream rate limit as Claude Code reports it (simple-router's own exhaustion answer is <see cref="ClassUnavailable"/>).</summary>
     private const string RouterExhausted =
-        """API Error: 429 {"type":"error","error":{"type":"api_error","message":"All enrolled subscription accounts are currently unavailable."}}""";
+        """API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."}}""";
 
     private sealed class Ledgers
     {
@@ -187,7 +188,7 @@ public class UsagePauseTests
     }
 
     [Fact]
-    public async Task A_worker_failing_with_the_router_exhaustion_error_pauses_the_factory_instead_of_escalating_and_resumes_its_session()
+    public async Task A_worker_failing_with_an_upstream_rate_limit_error_pauses_the_factory_instead_of_escalating_and_resumes_its_session()
     {
         var l = new Ledgers();
         var source = new FakeWorkSource(Story);
@@ -584,8 +585,9 @@ public class UsagePauseTests
         Assert.Equal(userScope is null, (await l.Rows()).Any(r => r.Step == RunPipeline.Steps.UsagePause));
     }
 
+    /// <summary>simple-router's answer when no model of the tier can serve (429 <c>rate_limit_error</c>, sc-26197), as Claude Code reports it.</summary>
     private const string ClassUnavailable =
-        """API Error: 503 {"type":"error","error":{"type":"api_error","message":"model_class_unavailable: no model of class mid can serve this request"}}""";
+        """API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"model_class_unavailable: no model in the mid tier can serve this request now (usage limit, login or availability); the earliest resets at 2026-10-15 13:00:00Z."}}""";
 
     [Fact]
     public async Task A_worker_refused_with_model_class_unavailable_pauses_like_a_usage_refusal_and_resumes_its_session()
@@ -621,7 +623,7 @@ public class UsagePauseTests
         var l = new Ledgers();
         var source = new FakeWorkSource(Story);
         var worker = new FakeWorker(Reports(new WorkerResult("sess-77", 1, false, "success",
-            "The router returns model_class_unavailable (503) when a class has no servable model; I could not finish the tests.", "")));
+            "The router returns model_class_unavailable (429) when a class has no servable model; I could not finish the tests.", "")));
 
         var outcome = await l.Pipeline(source, worker).RunAsync(77, CancellationToken.None);
 

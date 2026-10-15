@@ -162,7 +162,7 @@ public sealed partial class RunPipeline
     /// that commit (E3) before it counts; a commit that already has a verdict is not reviewed again. Every call's router
     /// session is named in the ledger (<see cref="Steps.ReviewSession"/>, with its role and prompt hash) before the call, and
     /// never as a row's Claude session (that column stays the worker's). The router refusing a call for usage (including its
-    /// <c>model_class_unavailable</c> 503: no high-class model can serve) pauses the factory for usage (the item resumes and the
+    /// 429 <c>rate_limit_error</c> <c>model_class_unavailable: …</c>: no high-class model can serve now) pauses the factory for usage (the item resumes and the
     /// head is reviewed again once it lifts).
     /// Fix loop (sc-25380): pass → CI. A fail whose only cause is confirmed blocking findings (<see cref="FixLoop.Fixable"/>)
     /// → Fixing (a fixer worker gets those findings), unless <see cref="Lifecycle.MaxFixRounds"/> rounds are used: then it
@@ -1023,7 +1023,7 @@ public sealed partial class RunPipeline
 
     /// <summary>
     /// Makes one panel call. The router refusing it for usage (<see cref="RouterReviewer.UsageLimited"/>: a 429, 529, or its
-    /// <c>model_class_unavailable</c> 503) means the plans ran out, not the review: the factory pauses
+    /// 429 <c>model_class_unavailable: …</c>) means the plans ran out, not the review: the factory pauses
     /// (backing off) and the head is reviewed again afterwards. Without a control table nothing could hold the pause, so
     /// the failure escalates.
     /// </summary>

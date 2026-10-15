@@ -2,7 +2,8 @@
 
 Autonomous software factory. A deterministic .NET orchestrator (no model decides a
 state transition) moves Shortcut stories through a ledgered state machine and runs
-Claude Code headless workers through the Weave router.
+Claude Code headless workers through the model router, simple-router (michaeltrefry/simple-router, `http://127.0.0.1:8790`;
+it replaced the Weave router fork at `localhost:8080`, sc-26197).
 
 ## Layout
 
@@ -271,7 +272,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 
 | Key | Default / source |
 | --- | --- |
-| `Router:BaseUrl` | `http://localhost:8080` (an absolute http(s) URL; one naming a model provider's host or key — `src/DarkFactory.Analyzers/ProviderMarkers.txt`, the gateway lint's list, embedded in both the analyzer and the orchestrator, `Gateway/ProviderMarkers.cs` — is refused, P1-E1) |
+| `Router:BaseUrl` | `http://127.0.0.1:8790` (simple-router; an absolute http(s) URL; one naming a model provider's host or key — `src/DarkFactory.Analyzers/ProviderMarkers.txt`, the gateway lint's list, embedded in both the analyzer and the orchestrator, `Gateway/ProviderMarkers.cs` — is refused, P1-E1) |
 | `Router:Key` | env `FACTORY_ROUTER_KEY`, or keychain account `router-key` |
 | `CodeGraph:BaseUrl` | the hosted CodeGraph (`OutboundHttp.CodeGraphDefaultBase`; an absolute http(s) URL naming no model provider): reviewers' CodeGraph tools (`ReviewTools.CodeGraphTools`) go to its `mcp` endpoint |
 | `CodeGraph:OverlayTimeoutMinutes` | `10` (> 0: how long a review waits, before its first panel call, for CodeGraph's overlay of the PR head; not ready by then, reviewers' CodeGraph calls read the default-branch index, labelled not the PR head; sc-25708) |
@@ -309,7 +310,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Worker:LaunchHelper` | `/usr/local/libexec/dark-factory/factory-worker-launch` (slot 1's installed helper; slot n's is this path with `-n` appended) |
 | `Worker:Slots` | `1` (a whole number 1–8, `WorkerSlots.MaxSlots`; sc-25989): how many sandbox users run workers side by side — worker sessions at a time. 1 is the one user `_factory`, one helper, one lock file, as before slots. Each slot above 1 needs its user and helper set up first (`sudo scripts/setup-worker-user.sh --slots n`), or start-up fails naming the slot (a slot above the count setup was last run with has no installed helper: setup removes the higher slots' helpers). Independent of `Intake:MaxConcurrentRuns`: more runs than slots is the ordinary case (runs also overlap outside worker phases); more slots than runs is allowed (the others serve a `factory run` beside `factory work`; `factory work` says so at start-up). Refused, not ignored, with `Worker:RunAs=none` unless 1 ("Worker slots" below) |
 | `Worker:Swift` | `false` (`true`/`false`, any case; sc-26130): `true` when the factory works Swift/Xcode repositories — every slot's user must then have Swift, xcodebuild with Xcode's first launch done and its license accepted, the macOS and iOS Simulator SDKs, and the installed, current `factory-xcodebuild`; implementers are then allowed the wrapper and their prompts name it ("Swift toolchain" below). `false` checks nothing of Swift or Xcode (E7: a .NET/Rust-only factory is never refused for a missing Xcode). A setting, not derived from the repositories, because a repository's stack is unknown before its first item is read and start-up reads nothing from GitHub. Refused, not ignored, when `true` with `Worker:RunAs=none` |
-| `Worker:Auth` | `router-key` (default: the worker holds only the router key, in `X-Weave-Router-Key` and as `ANTHROPIC_AUTH_TOKEN`; the router serves it from plans enrolled with `router login claude` / `router login codex`; `factory run`/`work` refuse to start unless `GET /v1/subscriptions/usage` lists an enabled `managed`/`shared` credential) or `claude-login` (weaker, violates E5: the worker's own Claude login, passed through by the router) |
+| `Worker:Auth` | `router-key` (default: the worker holds only the router key, in `X-Weave-Router-Key` and as `ANTHROPIC_AUTH_TOKEN`; the router serves it from plans enrolled with `simple-router login claude` / `simple-router login codex` (in the simple-router repository: `dotnet run --project src/SimpleRouter -- login claude|codex`); `factory run`/`work` refuse to start unless `GET /v1/subscriptions/usage` lists an enabled `managed`/`shared` credential) or `claude-login` (weaker, violates E5: the worker's own Claude login, passed through by the router) |
 | `Worker:TimeoutMinutes` | `30` (> 0) |
 | `Worker:PauseGraceSeconds` | `660` (a paused worker that has not stopped at a tool boundary by then is stopped; must exceed the 600 s longest tool call) |
 | `Worker:StuckRepeats` | `5` (≥ 2: near-identical turns, or cycles of up to 4 turns, in a row that make a running worker stuck; sc-25388) |
@@ -973,7 +974,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   while `now < ResumeAt` (`Control.PausesAt`), so it lifts by itself and the intake loop wakes at `ResumeAt`. `UsageMonitor`
   pauses when the router reports `all_exhausted` (until `resumes_at`, or a 1→60 min doubling backoff when none); unknown
   usage never pauses. Backstop: a worker result that is `WorkerResult.UsageLimited` (Claude Code's `"error":"rate_limit"`, or
-  a marker such as the router's 429 "All enrolled subscription accounts are currently unavailable.") pauses with the
+  a marker such as `rate_limit_error`; simple-router's exhaustion answer, 429 `rate_limit_error` whose message starts
+  `model_class_unavailable:`, is `WorkerResult.ModelClassUnavailable` below and pauses the same way) pauses with the
   backoff and records Paused `usage-paused` (auto-resumed, same session) instead of Escalated; `UsageLimited` matches the
   result text only when the result is an error (`is_error`), so model prose about rate limits still escalates. Only
   `continue --usage` lifts it early; Pause/Stop on it are refused. The lift holds against the reading that set it (a
@@ -2163,11 +2165,17 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   read from the issue at spec time — they only pick the class, and need not come from a collaborator, since an issue template can
   apply one; a failed read logs a warning and counts as no labels, i.e. `mid`, never an item failure). Each run of a worker session checkpoints `worker-model-class` (Detail: the class), right after
   the session's `session` row (a resumed session gets a fresh row: the class is re-derived each run). A failed session whose error
-  result (`is_error`) or stderr carries `model_class_unavailable` (the router's 503 when no model of the class can serve; it never
-  falls back to another class) is `WorkerResult.ModelClassUnavailable`: it pauses the factory for usage like the rate-limit backstop
-  (reason `worker-model-class-unavailable`, backoff, Paused `usage-paused`, auto-resumed, same session) and never escalates; the same
-  text in a non-error result is model prose and the failure escalates as usual. A class whose models are all refused by a spent
-  subscription comes back as that 429 and takes the existing usage path. Claude Code's own small utility calls (titles, summaries)
+  result (`is_error`) or stderr carries `model_class_unavailable` (simple-router's answer when no model of the tier can serve now —
+  usage limits, cooldowns, a missing or rejected login, no model that fits: 429 `rate_limit_error` whose message starts
+  `model_class_unavailable:`, with `Retry-After`; it never falls back to another class) is `WorkerResult.ModelClassUnavailable`: it
+  pauses the factory for usage like the rate-limit backstop (reason `worker-model-class-unavailable`, backoff, Paused `usage-paused`,
+  auto-resumed, same session) and never escalates; the same text in a non-error result is model prose and the failure escalates as
+  usual. The router (simple-router): it fails over inside the tier on limits, plan refusals and overloads, so a worker sees that 429
+  only once the whole tier is spent. Per the owner, a tier's models are Fable/Astra (`max`), Opus/Sol (`high`), Mimo/Terra/Sonnet
+  (`mid`) and Qwen 3.8/Luna/Haiku (`low`); `mid` and `low` may be served by local models (Mimo, Qwen, …), whose sessions cost $0
+  (a valid recorded cost). Served model names are recorded only (`implementer-model`, a review's `served`), never checked: only the
+  served class is (`X-Weave-Model-Class`). simple-router ignores `x-weave-force-model` (no refusal); the factory never sends it and
+  the repo settings guard below still refuses a settings file that would. Claude Code's own small utility calls (titles, summaries)
   carry the same headers, so they run on the session's class too (accepted). The router key is refused if it holds a CR or LF, in
   every auth mode (it would end its header line and could add another).
   Repo settings guard (`Worker/RepoSettingsGuard.cs`): an implementing worker loads the worktree's `.claude/settings.json` and
@@ -2474,11 +2482,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   one that served the review a second opinion checks (there is no family, version or independence rule). Each role makes one
   router call (`RouterReviewer`: `POST /v1/messages` with `"stream": true` — the router cancels a call that has sent its
   client nothing for 10 s — assembled by `MessageStream`, which fails closed on an `error` event (a transient `server_error`/`api_error` one after the turn is retried, below), a stream without
-  `message_stop` or one silent for 2 min; router key only, `x-weave-model-class: high` and never `x-weave-force-model` (the
-  router refuses the two together), body `model` the fixed placeholder `ModelClass.RequestModel` (`default`: no catalog model
-  has it, so no passthrough lane serves it verbatim; the router's in-class pick serves the call — the factory's router key
-  must therefore have no routing-policy caller passthrough or blind-experiment passthrough arm, which 503s
-  `model_class_unavailable` for a body model outside the class and would usage-pause every review in a loop), its own fresh
+  `message_stop` or one silent for 2 min; router key only, `x-weave-model-class: high` and never `x-weave-force-model` (which
+  simple-router ignores), body `model` the fixed placeholder `ModelClass.RequestModel` (`default`: simple-router takes the tier
+  from the class header and reads the body model only when no header is sent, so the in-class pick serves the call), its own fresh
   `X-Claude-Code-Session-Id` so the cost stays scoped to it and no worker session or transcript reaches it) whose system
   prompt is the role's prompt file and whose message holds the story, the base commit's file list
   (`IGateGitHub.GetFilesAsync`) and the diff of the PR's head commit — nothing else. Tool loop (sc-25705, sc-25706,
@@ -2579,8 +2585,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   stream's `message_start`) and served class (`class`, from the `X-Weave-Model-Class` response header), session, prompt and
   findings) is a `verdict` checkpoint bound to that head SHA. Anything but a clean findings line served on the `high` class
   is an unusable review and a fail; a second opinion not served on it is unusable (the finding stays blocking). A missing or
-  blank class header fails closed (E2). The router's `model_class_unavailable` 503 (no high-class model can serve; it never
-  falls back to another class) and the class's spent-subscription 429 are usage refusals: they pause the factory
+  blank class header fails closed (E2). The router's 429 `rate_limit_error` `model_class_unavailable: …` (no high-class model can
+  serve now; it never falls back to another class), any other 429 and a 529 are usage refusals: they pause the factory
   (`UsagePause.ReviewerRateLimited`) and never escalate. Fix loop (sc-25380, `Gate/FixLoop.cs`, `FixAsync`): a fail whose
   only cause is blocking findings every one of which a second opinion confirmed (`FixLoop.Fixable`; a review or confirmation not served on the high class makes it unfixable) goes Review → Fixing (row
   Detail = the fixed head); any other fail (an unusable answer, a missing role, an unusable confirmation) escalates. A fix

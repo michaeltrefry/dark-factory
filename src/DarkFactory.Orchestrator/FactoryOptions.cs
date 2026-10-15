@@ -20,7 +20,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
         "Host=localhost;Port=5434;Database=factory;Username=factory;Password=factory";
 
     /// <summary>
-    /// <c>Router:BaseUrl</c> (default <c>http://localhost:8080</c>): the Weave router every model call goes through. An absolute
+    /// <c>Router:BaseUrl</c> (default <c>http://127.0.0.1:8790</c>, simple-router's port): the model router (simple-router) every model call goes through. An absolute
     /// http(s) URL naming no model provider (<see cref="Gateway.ProviderMarkers"/>, the gateway lint's list): the lint sees only the
     /// code, so a provider host given through configuration is refused here (Phase 1 E1), and the factory refuses to start.
     /// </summary>
@@ -28,14 +28,14 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
     {
         get
         {
-            var text = config["Router:BaseUrl"] ?? "http://localhost:8080";
+            var text = config["Router:BaseUrl"] ?? "http://127.0.0.1:8790";
             if (!Uri.TryCreate(text, UriKind.Absolute, out var url) || url.Scheme is not ("http" or "https"))
             {
                 throw new InvalidOperationException($"Router:BaseUrl must be an absolute http(s) URL, not '{text}'.");
             }
             return Gateway.ProviderMarkers.In(text) is { } provider
                 ? throw new InvalidOperationException(
-                    $"Router:BaseUrl names a model provider ('{provider}'): every model call goes through the Weave router only (Phase 1 E1).")
+                    $"Router:BaseUrl names a model provider ('{provider}'): every model call goes through the router only (Phase 1 E1).")
                 : url;
         }
     }

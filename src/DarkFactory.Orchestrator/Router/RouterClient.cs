@@ -35,7 +35,7 @@ public sealed record SubscriptionUsage(
     [property: JsonPropertyName("credentials")] IReadOnlyList<UsageCredential>? Credentials = null)
 {
     /// <summary>
-    /// Plans enrolled on the router for this key (<c>router login claude|codex</c>: source <c>managed</c>, or
+    /// Plans enrolled on the router for this key (<c>simple-router login claude|codex</c>: source <c>managed</c>, or
     /// <c>shared</c> by another member) and not disabled. Credentials presented or observed from a client's own login
     /// do not count: in <c>router-key</c> mode the worker presents none. Nor does a plan the router reports not
     /// <c>routable</c> (e.g. <c>reconnect_required</c>): the router cannot route onto it until a human reconnects it.
@@ -65,7 +65,7 @@ public interface IUsageSource
     Task<SubscriptionUsage> GetUsageAsync(CancellationToken ct);
 }
 
-/// <summary>Reads the Weave router's committed cost for a Claude Code session id, and its subscription usage.</summary>
+/// <summary>Reads the router's (simple-router's) committed cost for a Claude Code session id, and its subscription usage.</summary>
 public sealed class RouterClient(HttpClient http, string routerKey) : ISessionCostSource, IUsageSource
 {
     /// <summary>Throws when the router does not answer with a usage report.</summary>

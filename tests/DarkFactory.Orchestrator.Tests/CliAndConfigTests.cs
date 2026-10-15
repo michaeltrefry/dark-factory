@@ -196,7 +196,7 @@ public class FactoryOptionsTests
     public void Defaults_point_at_local_router_sandbox_and_compose_postgres()
     {
         var options = Options([]);
-        Assert.Equal(new Uri("http://localhost:8080/"), options.RouterBaseUrl);
+        Assert.Equal(new Uri("http://127.0.0.1:8790/"), options.RouterBaseUrl); // simple-router (sc-26197)
         Assert.Equal("michaeltrefry/dark-factory-sandbox", options.DefaultRepo.FullName);
         Assert.Contains("Port=5434", options.LedgerConnectionString);
         Assert.Equal(Worker.WorkerAuth.RouterKey, options.WorkerAuth); // the worker holds no provider credential by default (E5)
@@ -938,8 +938,8 @@ public class RouterEnrollmentCheckTests
 
         Assert.NotNull(error);
         Assert.Contains("no enrolled", error);
-        Assert.Contains("router login claude", error);
-        Assert.Contains("router login codex", error);
+        Assert.Contains("simple-router login claude", error);
+        Assert.Contains("simple-router login codex", error);
     }
 
     [Fact]
@@ -952,8 +952,8 @@ public class RouterEnrollmentCheckTests
         Assert.NotNull(error);
         Assert.Contains("not routable (claude reconnect_required)", error);
         Assert.Contains("Reconnect the plan", error);
-        Assert.Contains("router login claude", error);
-        Assert.Contains("router login codex", error);
+        Assert.Contains("simple-router login claude", error);
+        Assert.Contains("simple-router login codex", error);
     }
 
     [Fact]
