@@ -481,6 +481,7 @@ public class SwiftXCTestOutputTests
             new ResultFile(SwiftNewTests.XCTestOutputName(Id), LinuxPassed) { ExitCode = 0 },
             new ResultFile(SwiftNewTests.ReportName("LibTests.free()"), SwiftRunOutputTests.Passing.Replace("WordsTests", "LibTests").Replace("blank()", "free()")),
             new ResultFile(SwiftNewTests.OutputName("LibTests.free()"), "") { ExitCode = 0 },
+            new ResultFile(SwiftNewTests.EventsName("LibTests.free()"), SwiftRunOutputTests.RunEnded),
         ]);
 
         Assert.Empty(results.Unreadable);
@@ -515,7 +516,8 @@ public class SwiftXCTestOutputTests
     public void A_parameterized_tests_report_and_one_with_several_issues_are_read(string report, int exit, string outcome)
     {
         const string id = "LibTests.S/pairs(_:s:)";
-        var results = Strategy.ParseResults([new ResultFile(SwiftNewTests.ReportName(id), report), new ResultFile(SwiftNewTests.OutputName(id), "") { ExitCode = exit }]);
+        var results = Strategy.ParseResults([new ResultFile(SwiftNewTests.ReportName(id), report), new ResultFile(SwiftNewTests.OutputName(id), "") { ExitCode = exit },
+            new ResultFile(SwiftNewTests.EventsName(id), SwiftRunOutputTests.RunEnded)]);
 
         Assert.Empty(results.Unreadable);
         Assert.Equal([new TestCaseResult(id, outcome)], results.Cases[id]);

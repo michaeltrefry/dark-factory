@@ -416,16 +416,24 @@ and UI tests as a sandbox user". The sweep kills it every time like any process 
 takes seconds, well after the sweep's last pass, so it never makes `processes still appearing after N sweeps`. What it changed in
 code: `WorkerSandbox.StopAllAsync` (the stop of a crashed run's leftovers, `orphan-killed`) reads `ps -U <user> -o
 pid=,ppid=,command=` instead of `pgrep -U` and does not count a process whose parent is launchd (1) AND whose command line is
-exactly one of `WorkerSandbox.RespawnedAgents` (`/usr/sbin/distnoted agent`, the only one seen to come back; never a ppid-only or
-name-only rule: the same program under another parent or with other arguments, or anything else, still counts —
-`WorkerSandboxTests.Only_a_respawned_apple_agent_under_launchd_is_no_leftover`); without it every stop after a helper run reported
+exactly one of `WorkerSandbox.RespawnedAgents` (`/usr/sbin/distnoted agent`; and, since S6's live run, `/usr/libexec/lsd` and
+`/usr/sbin/cfprefsd agent`, sc-26134; never a ppid-only or name-only rule: the same program under another parent or with other arguments, or anything else, still counts —
+`WorkerSandboxTests.Only_a_respawned_apple_agent_under_launchd_is_no_leftover`,
+`The_agents_launchd_starts_after_simctl_under_launchd_are_no_leftover_and_nothing_like_them_is`); without it every stop after a helper run reported
 a leftover worker and ran the helper again, and `A_setsid_grandchild_of_the_worker_is_dead_once_the_helper_exits` asserted
 nothing-left against a respawn race. The helper is unchanged (still helper_version 5): its sweep kills the agent as before, so a
 worker that runs `/usr/sbin/distnoted agent` itself gains nothing past its slot's next helper exit. The agents a simulator run
 starts in that domain (CoreSimulatorService, SimulatorTrampoline, SimLaunchHost, SimStreamProcessorService, `cfprefsd agent`,
-`lsd`, `secd`, …) are killed by the sweep and were not seen to come back.
+`lsd`, `secd`, …) are killed by the sweep. Two of them do come back (sc-26134, S6's live run, all passing): seconds after the last
+helper run of a `simctl` call as the user (the live S6 test's final `simctl list devices` and `DeleteAsWorkerAsync`), launchd
+started `/usr/libexec/lsd`, `/usr/sbin/distnoted agent` and `/usr/sbin/cfprefsd agent` for `_factory`, each parent 1 and the
+slot's uid — so `lsd` and the `cfprefsd` agent are in `RespawnedAgents` too, by the same exact-command-line-under-launchd rule;
+before, the next `StopAllAsync` counted them as a crashed run's worker (a spurious `orphan-killed` and an extra helper run). The
+live S6 test checks the user's processes once more 15 s after its own last run as that user (only `RespawnedAgents` allowed). The
+others were not seen to come back.
 
-Residual, accepted pending the owner's decision (sc-26126; it is not new — it holds for every sandboxed worker since Phase 1, and
+Residual, accepted by the owner 2026-10-15 (sc-26126; the follow-up is epic sc-26198, "iOS gate checks on GitHub-hosted runners +
+isolated worker sessions"; it is not new — it holds for every sandboxed worker since Phase 1, and
 Phase 5's iOS simulator work depends on it): the sandbox user's process lives in the OWNER's launchd bootstrap and audit
 session. `sudo` changes the uid but keeps the caller's Mach bootstrap port and audit session, so a worker started by a factory
 that runs in the owner's GUI login (Terminal, or a LaunchAgent of the owner's) reports `launchctl managername` = `Aqua` (seen in
@@ -2282,9 +2290,13 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `~/.local/bin`, first on its PATH) — and only in a factory with `Worker:Swift=true`: `ClaudeWorker.AllowedToolsFor(swift)` /
   `WorkerTools.ImplementerFor(swift)` add it (`SwiftAllowedTools`, `SwiftImplementer`, wired by `FactoryRunner` from
   `options.WorkerSwift`), and only then do the implementing prompts name it (`RunPipeline.BuildsAndPassesFor(swift)`, the
-  pipeline's `swift` parameter). With `Worker:Swift` unset `ClaudeWorker.AllowedTools`, `WorkerTools.Implementer` and every
-  implementing prompt are exactly as before (E7). Raw `xcodebuild`/`/usr/bin/xcodebuild`/`xcrun`/`/usr/bin/xcrun` are in every
-  implementer's `--disallowedTools` (`ClaudeWorker.RawXcodebuildTools`, whatever the setting), and a repository's settings
+  pipeline's `swift` parameter). With `Worker:Swift` unset no allow rule and no prompt names the
+  wrapper. NOT as before Phase 5, in every factory whatever the setting — an E7 exception, like cargo's tools (sc-25877), kept
+  always-on by coordinator decision and pending the owner's confirmation (sc-26134): `Bash(swift build:*)` and `Bash(swift
+  test:*)` in `ClaudeWorker.AllowedTools` (`SwiftTools`, sc-26127), the Swift text of every implementing prompt's build-and-test
+  clause (`RunPipeline.BuildsAndPasses`), `SwiftNewTests` among the default new-tests strategies (`NewTestsCheck.Strategies`),
+  and raw `xcodebuild`/`/usr/bin/xcodebuild`/`xcrun`/`/usr/bin/xcrun` in every implementer's `--disallowedTools`
+  (`ClaudeWorker.RawXcodebuildTools`, `SwiftToolchainTests.Without_worker_swift_only_the_xcode_wrapper_rule_and_prompt_clause_are_absent_and_the_always_on_swift_parts_are_there`), and a repository's settings
   allowing any of them, the plain wrapper name, or — with `Worker:Swift` off — the wrapper rule itself taint the session
   (`Taint.OfRepoSettings(path, allowed)`). The wrapper takes `build`, `build-for-testing`, `test` or `test-without-building`
   with `-scheme` and a `-destination` that is this Mac (`[generic/]platform=macOS[,arch=arm64|x86_64][,variant=Mac
@@ -2325,10 +2337,15 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (which must list the macOS and iOS Simulator SDKs, `SwiftToolchain.RequiredSdks`: a missing one is named with its fix,
   `sudo xcodebuild -downloadPlatform iOS`) and the wrapper (usage, exit 64); a failure is factory-wide and names the slot and
   user and the fix (`sudo xcodebuild -runFirstLaunch`, `sudo xcodebuild -license accept`, `sudo scripts/setup-worker-user.sh
-  [--slots n] --swift`). The probe does NOT check CoreSimulator, a simulator runtime or a simulator device (`-showsdks` lists SDKs
-  and boots nothing); the iOS gate checks the runtime per run, and the probe the GUI login session (`launchctl managername` as
-  the slot's user must answer `Aqua`, sc-26132, below). Setup installs the wrapper always and checks the same five
-  commands per user through each helper: with `--swift` required — every slot is checked, then every failing user is named
+  [--slots n] --swift`). Then the GUI login session (`launchctl managername` as the slot's user must answer `Aqua`,
+  sc-26132, below) and, after it since CoreSimulator answers a user only in one, the user's ability to make an iPhone simulator,
+  booting nothing (sc-26134, `SwiftToolchain.SimulatorProblem`): `/usr/bin/xcrun simctl list runtimes -j` as that user must list
+  a runtime with `platform` `iOS` and `isAvailable` true, and `/usr/bin/xcrun simctl list devicetypes -j` a device type with
+  `productFamily` `iPhone`; else factory-wide, naming the slot, the user and `sudo xcodebuild -downloadPlatform iOS`. No device
+  is created or booted (the iOS gate still checks its runtime and device per run). Setup installs the wrapper always and checks
+  the same commands per user through each helper (with `--swift`, also `/bin/launchctl managername` and the two `simctl` lists,
+  in that order, `check_swift_simulator`; this changed setup, so an installation with `Worker:Swift=true` re-runs `sudo
+  scripts/setup-worker-user.sh --slots n --swift`): with `--swift` required — every slot is checked, then every failing user is named
   (`The Swift toolchain is not usable by: _factory (worker slot 1); …`) and it exits 1; without it only reported, and skipped
   (`skipped: no Xcode selected`) when `xcode-select -p` fails. Residuals, accepted: (a) the wrapper is the only xcodebuild
   command a worker's own command line may run, not a containment boundary: build code — Xcode Run Script phases, Swift package
@@ -2340,7 +2357,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   macro or a build-tool plugin would not build; the validation adds no protection here, since build phases already run arbitrary
   code as that user (a). Tests: `XcodebuildWrapperTests` (a copy of the wrapper over a stub xcodebuild: every allowed form, every
   refusal, symbolic links out, the per-directory DerivedData, the environment), `SwiftToolchainTests` (the probe, the setting,
-  the rules and prompts with the setting on and exactly as before with it off), `SetupScriptTests`, and `SafeHelperTests` (only
+  the rules and prompts with the setting on, and with it off the wrapper absent and the always-on Swift parts present), `SetupScriptTests`, and `SafeHelperTests` (only
   the wrapper's own literals are exempt from the helper scan). After merging, the owner re-runs
   `sudo scripts/setup-worker-user.sh --slots 2 --swift` to install the wrapper, then sets `Worker__Swift=true`.
 - The orchestrator pushes only to `factory/*` (items' branches, and a plan's `factory/changeset-*` branch, sc-25872), with a repo-scoped GitHub App installation token passed
@@ -2913,23 +2930,36 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   versions of changed files under `Tests/<target>/` of the nearest `Package.swift` whose `testTarget(name: "<target>")` has no
   `path:` (at the base and the head), whose id no base version of a changed file has; the id is Swift Testing's own
   (`WordsTests.blank()`, `WordsTests.Outer/Inner/deep()`, what `swift test list` prints). Overlay: every changed file under a
-  package's `Tests/` from the head; manifest and production code stay the base's. Unisolable (`unsupported`, later stories'
-  seams): an existing parameterized test whose `arguments:` the PR changes, a test-looking XCTest method the gate cannot run
-  apart (both S3, below), a new test or a test-looking `.swift` file outside a SwiftPM test target (an Xcode project: S5), a test target
+  package's `Tests/` from the head; manifest and production code stay the base's. Unisolable (`unsupported`): an existing parameterized test whose
+  `arguments:` the PR changes, a test-looking XCTest method the gate cannot run apart (both S3, below: XCTest tests are run, with
+  XCTest alone), a new test or a test-looking `.swift` file outside a SwiftPM test target (an Xcode project's file is
+  `XcodeNewTests`'s with `Worker:Swift` on, S5 below; which strategy judges a file beside a root `Package.swift` is
+  `Gate/SwiftOwnership.cs`'s one rule, sc-26134: a file of an Xcode test target outside the package's test targets is Xcode's, a
+  file in both a package test target's directory — `Tests/` or a declared `path:` — and an Xcode test target is unsupported
+  naming both, and neither strategy ever judges one file twice), a test target
   the base does not declare, a version-specific manifest, an id declared twice, a backticked name, an unreadable changed file
   that may hold tests. Runs (`SandboxTestRunner`, as `_factory`): `swift --version` (toolchain), `/bin/mkdir -p` of the
   results directory (SwiftPM writes no report into a missing one), `swift package resolve` (the restore, the only network
   step), `swift build --build-system native --build-tests` (stdout kept as the build log; the build system pinned, `SwiftNewTests.BuildSystem`:
   SwiftPM 6.4's default `swiftbuild` writes swiftc's diagnostics to stderr, coloured, which the parser does not read — a base that
-  does not build would always be an `error`), then per test `swift test --build-system native --skip-build --disable-xctest
-  --filter '^<id escaped>(/|$)' --xunit-output <results>/swift-test-<16 hex of the id's SHA-256>.xml` (Swift Testing matches
+  does not build would always be an `error`), then per Swift Testing test `swift test --build-system native --skip-build --disable-xctest
+  --filter '^<id escaped>(/|$)' --xunit-output <results>/swift-test-<16 hex of the id's SHA-256>.xml --event-stream-output-path
+  <results>/swift-test-<same>.events.jsonl --event-stream-version 0` (an XCTest test is run with `--disable-swift-testing`
+  instead and read from XCTest's own lines: S3 below) (Swift Testing matches
   the filter against the id followed by `/<file>:<line>:<col>`; verified against Swift 6.3.2, whose report for Swift Testing
   names a case by `classname` `<target>.<Type>.<Nested>` and `name` `f()`, with `<failure>`/`<skipped>` children and suite
-  counts that are checked). Each step reads only its own report (`ResultFilePattern` = `SwiftNewTests.ReportName(id)`, no
-  wildcard) and keeps its exit code (`CaptureOutput`, `ResultFile.ExitCode`); a report is unreadable (never a result) when no
+  counts that are checked). Each step reads only its own report and event stream (`ResultFilePattern` = `SwiftNewTests.ResultPattern(id)`,
+  `swift-test-<its hash>.*`: no other test's file matches) and keeps its exit code (`CaptureOutput`, `ResultFile.ExitCode`); a report is unreadable (never a result) when no
   step asked for its name (`swift-test-99.xml`, a subdirectory), when it holds a case that is not its step's test (one test's
   code writing another's report), when its step's exit code is unknown or disagrees with it (0 exactly when no case failed),
-  and a step with no report is unreadable too. A
+  and a step with no report is unreadable too. Known issues (sc-26134): Swift Testing writes a test that passed only because
+  its failure was expected (`withKnownIssue`) as a plain passing testcase in its xUnit report (verified on 6.3.2), so each report
+  is read with its event stream — Swift Testing's JSON event stream, schema version 0 (its documented stable ABI; the SwiftPM
+  flag is hidden, and a toolchain without it fails the step: an `error`, never a pass): an `issueRecorded` event whose
+  `issue.isKnown` is true makes the step's passing case `skipped` (no pass on the head, no failure on the base), as does a step
+  output mentioning a known issue; a stream that is missing, not JSON, of another schema version or without a `runEnded` event
+  makes the report unreadable (`SwiftNewTests.KnownIssue`). XCTest's `XCTExpectFailure` in SwiftPM is read as skipped already
+  (S3's reader; verified on 6.3.2, macOS). Real toolchain: `SwiftRunnerTests.With_swift_a_new_test_that_passes_only_with_a_known_issue_is_rejected_not_passed`. A
   base that does not build (S2, sc-26128): swiftc's errors are read from `swift build`'s stdout, the `/abs/file:line:col:
   error: …` header lines (the same in both diagnostic styles; SwiftPM has no stable machine-readable diagnostics, and
   `-serialize-diagnostics` is clang's binary format; `fatal error:` too), the file made relative to the worktree also when
@@ -3239,8 +3269,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   Why it works, and the residual it carries: `sudo` keeps the caller's launchd bootstrap and audit session, so a sandbox user's
   process started by an owner logged in at the console is in the owner's Aqua session — CoreSimulatorService is started for the
   sandbox user's uid from there, and XCUITest's automation (testmanagerd inside the simulator) needs nothing more. That same fact
-  is the bootstrap residual under "Worker sandbox" above (a worker can look up the owner's GUI-session Mach services; owner
-  decision pending): S6 depends on it and must say so. It holds only while the factory itself runs inside the owner's GUI login
+  is the bootstrap residual under "Worker sandbox" above (a worker can look up the owner's GUI-session Mach services; accepted
+  by the owner 2026-10-15, follow-up epic sc-26198): S6 depends on it and must say so. It holds only while the factory itself runs inside the owner's GUI login
   session (Terminal, or a LaunchAgent of the owner's); it is UNTESTED, and by the research likely to fail, when the factory runs
   from ssh with no one logged in, or as a LaunchDaemon (manager `System`/`Background`: simctl reaching no CoreSimulatorService,
   `xcodebuild test` failing in testmanagerd — Apple developer forums 670598, 727333, 765060; lldb-dev 2019-07).

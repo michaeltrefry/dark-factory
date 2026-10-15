@@ -658,15 +658,28 @@ public sealed class SessionCaptureTests : IAsyncLifetime
     /// <summary>
     /// Waits until every viewer has <paramref name="total"/> events. Fails at once when the hub disconnected one (it would never
     /// get the rest), and when no viewer has received an event for 15 s (a notification that was missed: nothing more would come);
-    /// not on a fixed deadline, since how far behind the viewers are when the writer stops depends on how loaded the machine is.
+    /// not on a short fixed deadline, since how far behind the viewers are when the writer stops depends on how loaded the machine
+    /// is. Bounded overall all the same (<paramref name="overall"/>, 120 s by default: a viewer that keeps receiving something but
+    /// never all would otherwise wait for ever), and failing at once when a viewer has received more than <paramref name="total"/>
+    /// (an event delivered twice: the wait would end with the duplicate counted as one of the expected).
     /// </summary>
-    private static async Task WaitForEveryEventAsync(IReadOnlyList<Viewer> viewers, int total)
+    private static async Task WaitForEveryEventAsync(IReadOnlyList<Viewer> viewers, int total, TimeSpan? overall = null)
     {
         string Counts() => string.Join(", ", viewers.Select(v => v.Received.Count)) + $" of {total}";
         var seen = Counts();
         var progressed = DateTime.UtcNow;
-        while (viewers.Any(v => v.Received.Count < total))
+        var deadline = DateTime.UtcNow + (overall ?? TimeSpan.FromSeconds(120));
+        while (true)
         {
+            for (var i = 0; i < viewers.Count; i++)
+            {
+                Assert.True(viewers[i].Received.Count <= total, $"viewer {i} received more than {total} events: {Counts()}");
+            }
+            if (viewers.All(v => v.Received.Count == total))
+            {
+                return;
+            }
+            Assert.True(DateTime.UtcNow < deadline, $"not every viewer received every event within {(overall ?? TimeSpan.FromSeconds(120)).TotalSeconds:0} s: {Counts()} events");
             for (var i = 0; i < viewers.Count; i++)
             {
                 Assert.True(viewers[i].Disconnected is null, $"viewer {i} was disconnected by the hub ({viewers[i].Disconnected}): {Counts()} events");
@@ -678,6 +691,50 @@ public sealed class SessionCaptureTests : IAsyncLifetime
             Assert.True(DateTime.UtcNow - progressed < TimeSpan.FromSeconds(15), $"no viewer received an event for 15 s: {seen} events");
             await Task.Delay(20);
         }
+    }
+
+    /// <summary>A viewer holding <paramref name="count"/> events and no connection: what the wait reads, alone.</summary>
+    private static Viewer Holding(int count)
+    {
+        var viewer = new Viewer { Connection = null! };
+        for (var i = 0; i < count; i++)
+        {
+            viewer.Received.Enqueue((null!, TimeSpan.Zero));
+        }
+        return viewer;
+    }
+
+    [Fact]
+    public async Task The_wait_for_every_event_fails_at_once_on_a_viewer_with_more_events_than_were_written()
+    {
+        var clock = Stopwatch.StartNew();
+
+        var failure = await Assert.ThrowsAnyAsync<Exception>(() => WaitForEveryEventAsync([Holding(3), Holding(4)], 3));
+
+        Assert.Contains("viewer 1 received more than 3 events: 3, 4 of 3", failure.Message);
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(5), $"took {clock.Elapsed}");
+    }
+
+    [Fact]
+    public async Task The_wait_for_every_event_is_bounded_overall()
+    {
+        // Progress keeps coming (the 15 s no-progress check never trips), but never every event: the overall deadline ends it.
+        var slow = Holding(0);
+        using var stop = new CancellationTokenSource();
+        var feeder = Task.Run(async () =>
+        {
+            while (!stop.IsCancellationRequested && slow.Received.Count < 1000)
+            {
+                slow.Received.Enqueue((null!, TimeSpan.Zero));
+                await Task.Delay(50);
+            }
+        });
+
+        var failure = await Assert.ThrowsAnyAsync<Exception>(() => WaitForEveryEventAsync([slow], 1000, TimeSpan.FromSeconds(1)));
+        await stop.CancelAsync();
+        await feeder;
+
+        Assert.Contains("not every viewer received every event within 1 s", failure.Message);
     }
 
     private sealed class Viewer : IAsyncDisposable

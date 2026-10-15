@@ -290,6 +290,78 @@ public class SetupScriptTests
         ["/usr/bin/swift --version", "/usr/bin/xcodebuild -version", "/usr/bin/xcodebuild -checkFirstLaunchStatus", "/usr/bin/xcodebuild -license check",
             "/usr/bin/xcodebuild -showsdks"];
 
+    /// <summary>With --swift, after <see cref="SwiftChecks"/> pass (sc-26134): the GUI session first, then CoreSimulator's two lists, in this order.</summary>
+    private static readonly string[] SimulatorChecks = ["/bin/launchctl managername", "/usr/bin/xcrun simctl list runtimes -j", "/usr/bin/xcrun simctl list devicetypes -j"];
+
+    /// <summary>
+    /// <c>xcrun simctl list runtimes -j</c> as Xcode 26.5 prints it (cut): an iOS runtime, available, whose nested device types
+    /// carry fields of their own — only the runtime's own fields count.
+    /// </summary>
+    internal const string SimRuntimes = """
+        {
+          "runtimes" : [
+            {
+              "isAvailable" : true,
+              "version" : "26.5",
+              "supportedDeviceTypes" : [
+                {
+                  "name" : "iPhone 17 Pro",
+                  "productFamily" : "iPhone"
+                }
+              ],
+              "identifier" : "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+              "platform" : "iOS",
+              "name" : "iOS 26.5"
+            }
+          ]
+        }
+        """;
+
+    internal const string SimDeviceTypes = """
+        {
+          "devicetypes" : [
+            {
+              "productFamily" : "iPhone",
+              "identifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro",
+              "name" : "iPhone 17 Pro"
+            }
+          ]
+        }
+        """;
+
+    public static TheoryData<string, string> SimulatorFailures => new()
+    {
+        { "not-aqua", "FAIL  /bin/launchctl managername is 'Background', not 'Aqua': run this script from the owner's GUI login session" },
+        { "no-runtime", "FAIL  /usr/bin/xcrun simctl list runtimes -j lists no available iOS simulator runtime (sudo xcodebuild -downloadPlatform iOS)" },
+        { "no-iphone", "FAIL  /usr/bin/xcrun simctl list devicetypes -j lists no iPhone simulator device type (sudo xcodebuild -downloadPlatform iOS)" },
+    };
+
+    /// <summary>
+    /// sc-26134: with --swift, each slot's user is checked able to make an iPhone simulator, booting nothing — after its GUI
+    /// session (CoreSimulator answers a user only in one) — and a slot that is not fails the setup naming its user, slot and fix.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(SimulatorFailures))]
+    public async Task With_swift_a_slot_that_cannot_make_an_iphone_simulator_fails_the_setup_naming_its_user_and_slot(string what, string why)
+    {
+        var run = new WholeScriptRun(_dir, notAquaFor: what == "not-aqua" ? "_dftest2" : null, noRuntimeFor: what == "no-runtime" ? "_dftest2" : null,
+            noIphoneFor: what == "no-iphone" ? "_dftest2" : null);
+
+        var (exitCode, output) = await run.RunAsync("--slots", "2", "--swift");
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains(why, output);
+        Assert.Contains("The Swift toolchain is not usable by: _dftest2 (worker slot 2)\n", output);
+        Assert.Contains(what == "not-aqua" ? "launchctl managername not Aqua: run this script from the owner's GUI login session"
+            : "xcrun simctl list without an available iOS runtime or an iPhone device type: sudo xcodebuild -downloadPlatform iOS", output);
+        Assert.Contains("ok    /usr/bin/xcrun simctl list devicetypes -j", output); // slot 1's passed
+        if (what == "not-aqua")
+        {
+            // CoreSimulator is asked only once the user is in a GUI login session.
+            Assert.DoesNotContain(run.Calls, c => c.Contains("-u _dftest2 ", StringComparison.Ordinal) && c.Contains("simctl", StringComparison.Ordinal));
+        }
+    }
+
     [Fact]
     public async Task Setup_installs_the_xcodebuild_wrapper_unedited_root_owned_where_the_workers_rule_names_it()
     {
@@ -358,6 +430,8 @@ public class SetupScriptTests
         {
             Assert.Contains($"Checking the Swift toolchain as {user} through the helper (--swift: required)", output);
             Assert.All(SwiftChecks, check => Assert.Contains($"sudo -u owner sudo -n -u {user} {helper} {check}", run.Calls));
+            Assert.Equal(SimulatorChecks.Select(check => $"sudo -u owner sudo -n -u {user} {helper} {check}"),
+                run.Calls.Where(c => c.StartsWith($"sudo -u owner sudo -n -u {user} {helper} ", StringComparison.Ordinal) && SimulatorChecks.Any(c.EndsWith)));
         }
     }
 
@@ -414,8 +488,11 @@ public class SetupScriptTests
         /// <param name="swiftFailsFor">A worker user (<c>_dftest</c> or <c>_dftest2</c>) whose Xcode first launch the fake helper reports as not done (exit 69).</param>
         /// <param name="sdksMissingFor">A worker user whose <c>xcodebuild -showsdks</c> lists no iOS Simulator SDK.</param>
         /// <param name="xcodeSelected">Whether the fake <c>xcode-select -p</c> answers (false: it fails, as with no Xcode).</param>
+        /// <param name="notAquaFor">A worker user whose <c>launchctl managername</c> answers <c>Background</c> (no GUI login session).</param>
+        /// <param name="noRuntimeFor">A worker user whose <c>xcrun simctl list runtimes -j</c> lists only an unavailable iOS runtime.</param>
+        /// <param name="noIphoneFor">A worker user whose <c>xcrun simctl list devicetypes -j</c> lists only an iPad.</param>
         public WholeScriptRun(string dir, string uid = "450", string secondUid = "451", string? swiftFailsFor = null,
-            string? sdksMissingFor = null, bool xcodeSelected = true)
+            string? sdksMissingFor = null, bool xcodeSelected = true, string? notAquaFor = null, string? noRuntimeFor = null, string? noIphoneFor = null)
         {
             _dir = dir;
             InstalledHelper = Path.Combine(dir, "installed-helper");
@@ -450,6 +527,12 @@ public class SetupScriptTests
                             case "$* " in
                                 *"-u {{sdksMissingFor ?? "nobody-fails"}} "*-showsdks*) printf 'macOS SDKs:\n\tmacOS 26.5\t-sdk macosx26.5\n'; exit 0 ;;
                                 *-showsdks*) printf 'macOS SDKs:\n\tmacOS 26.5\t-sdk macosx26.5\niOS Simulator SDKs:\n\tSimulator - iOS 26.5\t-sdk iphonesimulator26.5\n'; exit 0 ;;
+                                *"-u {{notAquaFor ?? "nobody-fails"}} "*"/bin/launchctl managername"*) echo Background; exit 0 ;;
+                                *"/bin/launchctl managername"*) echo Aqua; exit 0 ;;
+                                *"-u {{noRuntimeFor ?? "nobody-fails"}} "*"simctl list runtimes -j"*) printf '%s\n' '{{SimRuntimes.Replace("\"isAvailable\" : true", "\"isAvailable\" : false")}}'; exit 0 ;;
+                                *"simctl list runtimes -j"*) printf '%s\n' '{{SimRuntimes}}'; exit 0 ;;
+                                *"-u {{noIphoneFor ?? "nobody-fails"}} "*"simctl list devicetypes -j"*) printf '%s\n' '{{SimDeviceTypes.Replace("\"productFamily\" : \"iPhone\"", "\"productFamily\" : \"iPad\"")}}'; exit 0 ;;
+                                *"simctl list devicetypes -j"*) printf '%s\n' '{{SimDeviceTypes}}'; exit 0 ;;
                             esac
                             echo "fake 1.0"; exit 0 ;;
                     esac

@@ -55,9 +55,27 @@ public class SwiftToolchainTests
     private string Launchctl(string manager = "Aqua") => SandboxSupport.Executable(_dir, $"launchctl-{Guid.NewGuid():N}",
         $"#!/bin/sh\n[ \"$1\" = managername ] || exit 2\necho {manager}\n");
 
+    internal const string IosRuntimes = """
+        {"runtimes":[{"isAvailable":true,"version":"26.5","identifier":"com.apple.CoreSimulator.SimRuntime.iOS-26-5","platform":"iOS","name":"iOS 26.5"}]}
+        """;
+
+    internal const string IphoneTypes = """
+        {"devicetypes":[{"productFamily":"iPhone","identifier":"com.apple.CoreSimulator.SimDeviceType.iPhone-17","name":"iPhone 17"}]}
+        """;
+
+    /// <summary>A fake xcrun: <c>simctl list runtimes -j</c> prints <paramref name="runtimes"/>, <c>simctl list devicetypes -j</c> <paramref name="types"/>; anything else exits 2.</summary>
+    private string Xcrun(string runtimes = IosRuntimes, string types = IphoneTypes)
+    {
+        var (r, t) = (Path.Combine(_dir, $"runtimes-{Guid.NewGuid():N}.json"), Path.Combine(_dir, $"types-{Guid.NewGuid():N}.json"));
+        File.WriteAllText(r, runtimes);
+        File.WriteAllText(t, types);
+        return SandboxSupport.Executable(_dir, $"xcrun-{Guid.NewGuid():N}",
+            $"#!/bin/sh\n[ \"$1 $2 $4\" = 'simctl list -j' ] || exit 2\ncase \"$3\" in runtimes) cat '{r}' ;; devicetypes) cat '{t}' ;; *) exit 2 ;; esac\n");
+    }
+
     private SwiftToolchain Toolchain(int firstLaunch = 0, int license = 0, int swiftExit = 0, string? wrapper = null, string sdks = "macosx iphonesimulator",
-        string manager = "Aqua") =>
-        new(Swift(swiftExit), Xcodebuild(firstLaunch, license, sdks), wrapper ?? InstalledWrapper(), LaunchctlPath: Launchctl(manager));
+        string manager = "Aqua", string runtimes = IosRuntimes, string types = IphoneTypes) =>
+        new(Swift(swiftExit), Xcodebuild(firstLaunch, license, sdks), wrapper ?? InstalledWrapper(), LaunchctlPath: Launchctl(manager), XcrunPath: Xcrun(runtimes, types));
 
     /// <summary>Two slots, each its own fake helper and user, each with its own toolchain.</summary>
     private WorkerSlots Pool(SwiftToolchain? first, SwiftToolchain? second)
@@ -96,6 +114,9 @@ public class SwiftToolchainTests
             Assert.Contains($"{helper} {swift.XcodebuildPath} -showsdks", ran);
             Assert.Contains($"{helper} {swift.WrapperPath}", ran);
             Assert.Contains($"{helper} {swift.LaunchctlPath} managername", ran); // its launchd session, as that user (sc-26132)
+            // Its simulator runtimes and device types, as that user, after the session check (sc-26134): nothing is booted.
+            Assert.Equal([$"{helper} {swift.LaunchctlPath} managername", $"{helper} {swift.XcrunPath} simctl list runtimes -j", $"{helper} {swift.XcrunPath} simctl list devicetypes -j"],
+                ran.Where(l => l.Contains(swift.LaunchctlPath, StringComparison.Ordinal) || l.Contains(swift.XcrunPath, StringComparison.Ordinal)));
         }
         // Each slot's probe ran through its own helper only.
         Assert.DoesNotContain(HelpersRan, l => l.StartsWith("_dftest ", StringComparison.Ordinal) && l.Contains(second.XcodebuildPath, StringComparison.Ordinal));
@@ -111,6 +132,11 @@ public class SwiftToolchainTests
         { "wrapper", "the xcodebuild wrapper" },
         // sc-26132 (S0's requirement (1)): outside a GUI login session no simulator boots, so the slot is refused here, not item by item.
         { "not-aqua", "managername` as _dftest2 answers 'Background', not 'Aqua', so the gate's iOS simulator checks cannot run as it" },
+        // sc-26134: CoreSimulator as the slot's user, booting nothing.
+        { "no-ios-runtime", "simctl list runtimes -j` as _dftest2 lists no available iOS simulator runtime, so the gate's iOS simulator checks cannot run as it: install an iOS simulator runtime (`sudo xcodebuild -downloadPlatform iOS`)" },
+        { "unavailable-runtime", "simctl list runtimes -j` as _dftest2 lists no available iOS simulator runtime" },
+        { "no-iphone", "simctl list devicetypes -j` as _dftest2 lists no iPhone simulator device type" },
+        { "simctl-fails", "simctl list runtimes -j` as _dftest2 answers no JSON runtimes list" },
     };
 
     [Theory]
@@ -125,6 +151,10 @@ public class SwiftToolchainTests
             "no-ios-simulator" => Toolchain(sdks: "macosx driverkit"),
             "no-sdks" => Toolchain(sdks: ""),
             "not-aqua" => Toolchain(manager: "Background"),
+            "no-ios-runtime" => Toolchain(runtimes: IosRuntimes.Replace("\"platform\":\"iOS\"", "\"platform\":\"watchOS\"")),
+            "unavailable-runtime" => Toolchain(runtimes: IosRuntimes.Replace("\"isAvailable\":true", "\"isAvailable\":false")),
+            "no-iphone" => Toolchain(types: IphoneTypes.Replace("\"productFamily\":\"iPhone\"", "\"productFamily\":\"iPad\"")),
+            "simctl-fails" => Toolchain(runtimes: "CoreSimulatorService connection became invalid"),
             // Installed, current by its text (so start-up passes), but not runnable as the user.
             _ => Toolchain() with { WrapperPath = Path.Combine(_dir, "not-executable") },
         };
@@ -139,6 +169,11 @@ public class SwiftToolchainTests
 
         Assert.Contains("Worker slot 2 (_dftest2): Swift toolchain (Worker:Swift) of _dftest2", ex.Message);
         Assert.Contains(why, ex.Message);
+        if (what == "not-aqua")
+        {
+            // CoreSimulator is asked only once the user is known to be in a GUI login session (sc-26134).
+            Assert.DoesNotContain(HelpersRan, l => l.StartsWith("_dftest2 ", StringComparison.Ordinal) && l.Contains("simctl", StringComparison.Ordinal));
+        }
         Assert.Contains(what == "not-aqua"
             ? "run the factory inside the owner's GUI login session (a Terminal or a LaunchAgent of the owner logged in at the console), not from ssh or as a LaunchDaemon — CLAUDE.md, \"iOS simulator and UI tests as a sandbox user\""
             : "sudo scripts/setup-worker-user.sh --slots 2 --swift", ex.Message);
@@ -254,24 +289,28 @@ public class SwiftToolchainTests
     }
 
     [Fact]
-    public void Without_worker_swift_the_implementers_tools_and_prompts_are_exactly_mains()
+    public void Without_worker_swift_only_the_xcode_wrapper_rule_and_prompt_clause_are_absent_and_the_always_on_swift_parts_are_there()
     {
-        // E7: a factory with Worker:Swift unset allows and says nothing of xcodebuild: exactly the base's values (S1's SwiftPM
-        // rules and prompt text, sc-26127, are unconditional there and stay so).
-        string[] mains = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(dotnet restore:*)",
+        // With Worker:Swift unset no rule or prompt names the xcodebuild wrapper. What every factory gets whatever the setting —
+        // an E7 exception like cargo's tools (sc-25877), pending the owner's confirmation (sc-26134): SwiftPM's two allow rules,
+        // the Swift text of the build-and-test clause, raw xcodebuild/xcrun denied, and SwiftNewTests among the strategies.
+        string[] alwaysOn = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(dotnet restore:*)",
             "Bash(cargo build:*)", "Bash(cargo check:*)", "Bash(cargo test:*)", "Bash(cargo fetch:*)",
             "Bash(swift build:*)", "Bash(swift test:*)"];
-        const string mainsBuildsAndPasses =
+        const string alwaysOnBuildsAndPasses =
             "the build and the tests pass (`dotnet build` and `dotnet test`; in a Rust package `cargo build` and `cargo test`; in a Swift package `swift build` and `swift test`)";
         var unset = Options([]);
         Assert.False(unset.WorkerSwift);
-        Assert.Equal(mains, ClaudeWorker.AllowedTools);
-        Assert.Equal(mains, ClaudeWorker.AllowedToolsFor(unset.WorkerSwift));
+        Assert.Equal(alwaysOn, ClaudeWorker.AllowedTools);
+        Assert.Equal(alwaysOn, ClaudeWorker.AllowedToolsFor(unset.WorkerSwift));
         Assert.Same(WorkerTools.Implementer, WorkerTools.ImplementerFor(unset.WorkerSwift));
-        Assert.Equal(mains, WorkerTools.Implementer.Allowed);
+        Assert.Equal(alwaysOn, WorkerTools.Implementer.Allowed);
         Assert.DoesNotContain(ClaudeWorker.BuildArguments("p"), a => a.Contains("factory-xcodebuild", StringComparison.Ordinal));
-        Assert.Equal(mainsBuildsAndPasses, RunPipeline.BuildsAndPasses);
-        Assert.Equal(mainsBuildsAndPasses, RunPipeline.BuildsAndPassesFor(unset.WorkerSwift));
+        Assert.All(ClaudeWorker.RawXcodebuildTools, rule => Assert.Contains(rule, WorkerTools.Implementer.Denied));
+        Assert.Contains(NewTestsCheck.StrategiesFor(unset.WorkerSwift), s => s is SwiftNewTests);
+        Assert.DoesNotContain(NewTestsCheck.StrategiesFor(unset.WorkerSwift), s => s is XcodeNewTests);
+        Assert.Equal(alwaysOnBuildsAndPasses, RunPipeline.BuildsAndPasses);
+        Assert.Equal(alwaysOnBuildsAndPasses, RunPipeline.BuildsAndPassesFor(unset.WorkerSwift));
 
         // Every implementing prompt, built as a factory without Worker:Swift builds it, names no xcodebuild; with it, each does.
         var spec = new WorkSpec(new WorkStory(1, "Story", "Do it.", "feature", "https://example.test/1", ItemNaming.Shortcut), null, []);

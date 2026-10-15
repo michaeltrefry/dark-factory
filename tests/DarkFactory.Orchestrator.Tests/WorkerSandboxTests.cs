@@ -1358,6 +1358,25 @@ public class WorkerSandboxTests
         Assert.Equal(["704"], WorkerSandbox.Leftovers("704\n")); // unreadable: counted (fail closed)
     }
 
+    /// <summary>
+    /// sc-26134 (S6's live run): after a <c>simctl</c> call as the sandbox user launchd also starts <c>lsd</c> and the
+    /// <c>cfprefsd</c> agent in its domain — no leftover either, by the same rule: that exact command line, parent launchd.
+    /// </summary>
+    [Theory]
+    [InlineData("/usr/libexec/lsd")]
+    [InlineData("/usr/sbin/cfprefsd agent")]
+    public void The_agents_launchd_starts_after_simctl_under_launchd_are_no_leftover_and_nothing_like_them_is(string agent)
+    {
+        Assert.Contains(agent, WorkerSandbox.RespawnedAgents);
+        Assert.Empty(WorkerSandbox.Leftovers($"  5101     1 {agent}\n"));
+        Assert.Equal(["710"], WorkerSandbox.Leftovers($"  710   650 {agent}\n")); // not launchd's child
+        Assert.Equal(["711"], WorkerSandbox.Leftovers($"  711     1 {agent} --extra\n"));
+        Assert.Equal(["712"], WorkerSandbox.Leftovers($"  712     1 /tmp/x{agent}\n"));
+        // All three at once (as seen live), and a real leftover beside them still counts alone.
+        Assert.Equal(["713"], WorkerSandbox.Leftovers(
+            "  4974     1 /usr/sbin/distnoted agent\n  4975     1 /usr/libexec/lsd\n  4976     1 /usr/sbin/cfprefsd agent\n  713   1 /bin/sleep 600\n"));
+    }
+
     [Fact]
     public async Task Stop_all_kills_the_worker_users_processes_through_the_helper()
     {
@@ -1980,6 +1999,11 @@ public class LiveWorkerSandboxTests
                     Directory.Delete(dir, recursive: true);
                 }
             }
+            // Once more after the test's own last runs as the user (its simctl list and the deletion above, sc-26134): launchd
+            // starts its agents seconds later, and only those (RespawnedAgents) may be running then.
+            await Task.Delay(TimeSpan.FromSeconds(15), ct);
+            TestContext.Current.TestOutputHelper?.WriteLine($"worker {slot} processes 15 s after the test's own last run:\n{ProcessesOf(slot.User)}");
+            Assert.False(await slot.Sandbox.StopAllAsync(ct), $"worker {slot}: a process of {slot.User} outlived the test's own last simctl or deletion");
         }
     }
 

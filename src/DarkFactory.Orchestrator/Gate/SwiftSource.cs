@@ -245,12 +245,19 @@ public static class SwiftSource
     /// whether the call sets a <c>path:</c> (its sources are then not at <c>Tests/&lt;name&gt;/</c>). A name that is not a
     /// plain string literal is not read (a manifest that computes it declares nothing this reader can see).
     /// </summary>
-    public static IReadOnlyList<(string Name, bool CustomPath)> TestTargets(string manifest)
+    public static IReadOnlyList<(string Name, bool CustomPath)> TestTargets(string manifest) =>
+        TestTargetPaths(manifest).Select(t => (t.Name, t.CustomPath)).ToList();
+
+    /// <summary>
+    /// <see cref="TestTargets"/> with each declared <c>path:</c> (sc-26134): its plain string, or null when there is none or
+    /// it is not a plain string literal (<c>CustomPath</c> then still says one is declared).
+    /// </summary>
+    public static IReadOnlyList<(string Name, bool CustomPath, string? Path)> TestTargetPaths(string manifest)
     {
         var tokens = Lex(manifest);
         var close = Pairs(manifest, tokens) ?? throw new FormatException("its brackets do not balance");
         string Word(int i) => manifest[tokens[i].Start..tokens[i].End];
-        var targets = new List<(string, bool)>();
+        var targets = new List<(string, bool, string?)>();
         for (var i = 0; i + 1 < tokens.Count; i++)
         {
             if (tokens[i].Kind != Kind.Ident || Word(i) != "testTarget" || Word(i + 1) != "(")
@@ -259,6 +266,7 @@ public static class SwiftSource
             }
             string? name = null;
             var path = false;
+            string? pathValue = null;
             for (var j = i + 2; j + 2 < close[i + 1]; j = tokens[j].Kind == Kind.Open ? close[j] + 1 : j + 1)
             {
                 if (tokens[j].Kind == Kind.Ident && Word(j + 1) == ":")
@@ -267,12 +275,16 @@ public static class SwiftSource
                     {
                         name ??= value;
                     }
+                    if (Word(j) == "path" && !path && tokens[j + 2].Kind == Kind.Literal)
+                    {
+                        pathValue = PlainString(Word(j + 2));
+                    }
                     path |= Word(j) == "path";
                 }
             }
             if (name is not null)
             {
-                targets.Add((name, path));
+                targets.Add((name, path, pathValue));
             }
         }
         return targets;

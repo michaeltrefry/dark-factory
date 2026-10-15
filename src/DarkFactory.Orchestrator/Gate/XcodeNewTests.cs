@@ -9,8 +9,10 @@ namespace DarkFactory.Orchestrator.Gate;
 /// (SwiftPM). Only in a factory with <c>Worker:Swift</c> on (<see cref="NewTestsCheck.StrategiesFor"/>, E7): with it off,
 /// <see cref="SwiftNewTests"/> names an Xcode project's test file unsupported and says why.
 /// <para>
-/// Which files: a changed <c>.swift</c> file in no SwiftPM package (no <c>Package.swift</c> above it, else it is
-/// <see cref="SwiftNewTests"/>'s). Which target compiles it is read from every <c>*.xcodeproj/project.pbxproj</c> of the
+/// Which files: a changed <c>.swift</c> file that <see cref="SwiftOwnership"/> gives it (sc-26134) — one in no SwiftPM
+/// package, or one of a package outside its test targets that an Xcode project's test target compiles (an Xcode project
+/// beside a root <c>Package.swift</c>); a package's other files are <see cref="SwiftNewTests"/>'s, and a file in a package's
+/// test target that an Xcode test target also compiles is neither's (<see cref="SwiftNewTests"/> names it unsupported). Which target compiles it is read from every <c>*.xcodeproj/project.pbxproj</c> of the
 /// commit (<see cref="XcodeProject.Membership"/>: classic file references and synchronized folders, anything unread failing
 /// closed). New tests: the <c>@Test</c> functions (<see cref="SwiftSource"/>) of the head versions of the files a unit-test
 /// target compiles at the head whose id no base version of a changed file in that target has. The id is what xcodebuild's
@@ -171,22 +173,6 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
 
     private static string Parent(string path) => path.LastIndexOf('/') is var slash and >= 0 ? path[..slash] : "";
 
-    /// <summary>Whether a SwiftPM package holds <paramref name="path"/> in <paramref name="files"/> (a <c>Package.swift</c> in a directory above it).</summary>
-    internal static bool InPackage(IReadOnlySet<string> files, string path)
-    {
-        for (var directory = Parent(path); ; directory = Parent(directory))
-        {
-            if (files.Contains(directory.Length == 0 ? "Package.swift" : $"{directory}/Package.swift"))
-            {
-                return true;
-            }
-            if (directory.Length == 0)
-            {
-                return false;
-            }
-        }
-    }
-
     /// <summary>The way a test's project is built: the container flag and path, and the scheme (<see cref="NewTestSet.Projects"/>'s value).</summary>
     private sealed record Build(string Flag, string Container, string Scheme, string Platform = XcodeProject.MacOS)
     {
@@ -245,7 +231,15 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
             return file;
         }
 
-        public async Task<bool> InPackageAsync(string path, CancellationToken ct) => XcodeNewTests.InPackage(await FilesAsync(ct), path);
+        private SwiftOwnership? _owners;
+
+        /// <summary>
+        /// Whether <paramref name="path"/> is not this strategy's to judge (<see cref="SwiftOwnership"/>, sc-26134): a SwiftPM
+        /// package's file that no Xcode test target compiles, or one in a package's test target that one also compiles
+        /// (<see cref="SwiftNewTests"/> names that unsupported).
+        /// </summary>
+        public async Task<bool> InPackageAsync(string path, CancellationToken ct) =>
+            (await (_owners ??= new SwiftOwnership(async c => await FilesAsync(c), ReadAsync)).OfAsync(path, ct)).Owner != SwiftOwner.Xcode;
 
         /// <summary>
         /// Every <c>.swift</c> file <paramref name="target"/> compiles, parsed (sc-26129); and those whose membership cannot be
@@ -255,8 +249,12 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
         {
             var (files, unknown) = (new List<(string, SwiftFile)>(), new List<string>());
             var all = await FilesAsync(ct);
-            foreach (var path in all.Where(f => f.EndsWith(".swift", StringComparison.Ordinal) && !IsManifest(f) && !XcodeNewTests.InPackage(all, f)).Order(StringComparer.Ordinal))
+            foreach (var path in all.Where(f => f.EndsWith(".swift", StringComparison.Ordinal) && !IsManifest(f)).Order(StringComparer.Ordinal))
             {
+                if (await InPackageAsync(path, ct))
+                {
+                    continue;
+                }
                 XcodeMembership membership;
                 try
                 {
