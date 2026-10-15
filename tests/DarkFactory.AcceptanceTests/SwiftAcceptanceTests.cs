@@ -131,8 +131,7 @@ public class SwiftAcceptanceTests
     /// <c>Compositor</c>, Swift Testing unit target <c>CompositorTests</c>): a real implementer writes the change and its test, the
     /// real panel reviews it on the high class, CI runs, and the gate's new-tests check runs the new test with xcodebuild as the
     /// sandbox user on macOS — failing on the base, passing on the head — and merges. Needs CodeGraph to index Swift (C3): before,
-    /// the gate blocks every Swift change on risk-threshold, and this test skips saying so. Run it only once the fix "Xcode
-    /// base-build attribution (feature-end round 2)" is merged (docs/acceptance.md, Phase 5 prerequisite 8).
+    /// the gate blocks every Swift change on risk-threshold, and this test skips saying so.
     /// </summary>
     [Fact]
     public async Task P5_AT1_a_lensworks_change_with_a_new_swift_testing_test_merges_with_no_human()
