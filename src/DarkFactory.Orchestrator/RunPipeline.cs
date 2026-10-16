@@ -2615,7 +2615,20 @@ public sealed partial class RunPipeline(
     internal const string BuildsAndPassesWithXcode =
         "the build and the tests pass (`dotnet build` and `dotnet test`; in a Rust package `cargo build` and `cargo test`; in a Swift package `swift build` and `swift test`; in an Xcode "
         + "project `" + SwiftToolchain.DefaultWrapperPath + " build|test -scheme <scheme> -destination 'platform=macOS'` for a macOS "
-        + "app, or `-destination 'platform=iOS Simulator,name=<device>'` for an iOS app, the only xcodebuild command allowed)";
+        + "app, or `-destination 'platform=iOS Simulator,name=<device>'` for an iOS app, the only xcodebuild command allowed). "
+        + SwiftSandboxNote;
+
+    /// <summary>
+    /// What a Swift factory's implementer cannot run, said up front (sc-26134): a live iOS run (sc-26248) spent 9 of its 26 tool calls
+    /// — each a model turn — on <c>git</c> (which fails on the worktree's ownership), raw <c>xcrun simctl</c> (to find a simulator's
+    /// name) and <c>ls</c> of the wrapper's directory, all denied. No allow rule changes: this only names what was already denied, and
+    /// where a simulator's name comes from instead. Ends without a full stop: every prompt puts one after <see cref="BuildsAndPassesFor"/>.
+    /// </summary>
+    internal const string SwiftSandboxNote =
+        "Apart from the commands this prompt names, your shell is denied: there is no git (the orchestrator reads your changes from "
+        + "the worktree), no raw `xcodebuild`, `xcrun` or `simctl`, and nothing outside this worktree can be read or listed, so do not "
+        + "try them. For an iOS app take `<device>` from the repository's CI workflow or README; if no simulator has that name, the "
+        + "wrapper's xcodebuild error lists the available destinations to pick from";
 
     /// <summary><see cref="BuildsAndPassesWithXcode"/> when <paramref name="swift"/> (<c>Worker:Swift</c>), else <see cref="BuildsAndPasses"/>.</summary>
     internal static string BuildsAndPassesFor(bool swift) => swift ? BuildsAndPassesWithXcode : BuildsAndPasses;
