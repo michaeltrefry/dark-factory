@@ -59,8 +59,10 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
         [property: JsonPropertyName("dismissal_restriction")] DismissalRestriction DismissalRestriction);
 
     /// <summary>
-    /// Who may dismiss a review on the PR (GitHub's <c>dismissal_restriction</c>, which GitHub now stores on every
-    /// pull_request rule — as <c>{"allowed_actors":[],"enabled":false}</c> when not sent): off, no actors.
+    /// Who may dismiss a review on the PR (GitHub's <c>dismissal_restriction</c>): off, no actors. Always sent. An
+    /// organization's repository stores it on every pull_request rule (as <c>{"allowed_actors":[],"enabled":false}</c>
+    /// when not sent); a personal account's repository drops it. So the read-back takes it held absent as this disabled
+    /// default — the one parameter that may be absent; any other value GitHub holds for it still fails.
     /// </summary>
     public sealed record DismissalRestriction(
         [property: JsonPropertyName("enabled")] bool Enabled,
@@ -201,7 +203,12 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
             var storedParameters = Field(match, "parameters");
             foreach (var name in Names(sentParameters).Union(Names(storedParameters)).Order(StringComparer.Ordinal))
             {
-                Compare($"{type}.{name}", Field(sentParameters, name), Field(storedParameters, name), differences);
+                var held = Field(storedParameters, name);
+                if (name == DismissalRestrictionName && held.ValueKind == JsonValueKind.Undefined)
+                {
+                    held = DisabledDismissalRestriction; // GitHub drops it on a personal account's repository
+                }
+                Compare($"{type}.{name}", Field(sentParameters, name), held, differences);
             }
         }
         return differences;
@@ -212,6 +219,12 @@ public sealed class RepoProtection(HttpClient http, string adminToken, TextWrite
         static IEnumerable<string> Names(JsonElement element) =>
             element.ValueKind == JsonValueKind.Object ? element.EnumerateObject().Select(p => p.Name) : [];
     }
+
+    private const string DismissalRestrictionName = "dismissal_restriction";
+
+    /// <summary>GitHub's disabled default for <c>dismissal_restriction</c>, what a repository that does not store it means.</summary>
+    private static readonly JsonElement DisabledDismissalRestriction =
+        JsonSerializer.SerializeToElement(new DismissalRestriction(Enabled: false, AllowedActors: []), Json);
 
     private static JsonElement Field(JsonElement element, string name) =>
         element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out var value) ? value : default;

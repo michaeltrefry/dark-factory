@@ -177,6 +177,32 @@ public class RepoProtectionTests
     }
 
     [Fact]
+    public async Task Protect_succeeds_when_github_drops_the_disabled_dismissal_restriction_on_a_personal_repository()
+    {
+        var github = new GitHubRulesets
+        {
+            Store = ruleset =>
+            {
+                foreach (var rule in ruleset["rules"]!.AsArray())
+                {
+                    if (rule!["type"]!.GetValue<string>() == "pull_request")
+                    {
+                        rule["parameters"]!.AsObject().Remove("dismissal_restriction");
+                    }
+                }
+            },
+        };
+        var output = new StringWriter();
+        var error = new StringWriter();
+
+        var exit = await RepoProtection.RunAsync(github.Api.Client("https://api.github.com/"), "gho_admin", Sandbox, output, error, CancellationToken.None);
+
+        Assert.Equal(0, exit);
+        Assert.Equal("", error.ToString());
+        Assert.Equal(3, output.ToString().Split('\n').Count(l => l.StartsWith("verified ruleset")));
+    }
+
+    [Fact]
     public async Task Protect_fails_on_a_pull_request_parameter_github_defaults_that_was_not_sent()
     {
         var github = new GitHubRulesets
