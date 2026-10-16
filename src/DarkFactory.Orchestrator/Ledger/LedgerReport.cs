@@ -347,10 +347,11 @@ public static class LedgerReport
         switch (row.Step)
         {
             case RunPipeline.Steps.GateDecision:
-                // The files CodeGraph gave no data for (sc-26254) are at the end of the row, past the clip: said on their own.
+                // The files CodeGraph gave no data for (sc-26254) are at the end of the row, past the clip: said on their own, once —
+                // the row is shown up to them (sc-26134).
                 var detail = row.Detail ?? "";
                 var noData = detail.IndexOf(CodeGraphRisk.NoDataMark, StringComparison.Ordinal);
-                return $"merge gate: {Code(detail)}"
+                return $"merge gate: {Code(noData < 0 ? detail : detail[..noData])}"
                     + (noData < 0 ? "" : $"; {UntrustedText.CodeSpan(Clip(detail[(noData + CodeGraphRisk.NoDataSeparator.Length)..], MaxNoCodeGraphData))}");
             case RunPipeline.Steps.CiFailure when CiTriage.FromDetail(row.Detail) is { } triage:
                 return $"CI on {Code(Ci.Short(triage.HeadSha))} failed: the PR's {List(triage.Fixable)}; not the PR's {List(triage.NotThePrs)}";

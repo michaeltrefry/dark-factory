@@ -235,30 +235,14 @@ public class SwiftToolchainTests
     }
 
     [Fact]
-    public void Worker_swift_defaults_to_off_is_read_validated_and_refused_without_a_sandbox_user()
+    public void With_worker_swift_every_slots_sandbox_carries_the_default_toolchain_and_without_it_none()
     {
-        // Off (E7): the pool carries no toolchain.
+        // Worker:Swift's reading and validation are FactoryOptionsTests'; this is what it gives the slot pool. Off (E7): no toolchain.
         var off = Options([]);
-        Assert.False(off.WorkerSwift);
         Assert.All(off.WorkerSlots!.All, s => Assert.Null(s.Sandbox.Swift));
-        off.ValidateSettings();
-
-        // On: every slot's sandbox carries the default toolchain (the system's swift and xcodebuild, the installed wrapper).
+        // On: the system's swift and xcodebuild, the installed wrapper, in every slot.
         var on = Options(new() { ["Worker:Swift"] = "true", ["Worker:Slots"] = "2" });
-        Assert.True(on.WorkerSwift);
         Assert.All(on.WorkerSlots!.All, s => Assert.Equal(new SwiftToolchain("/usr/bin/swift", "/usr/bin/xcodebuild", SwiftToolchain.DefaultWrapperPath), s.Sandbox.Swift));
-        on.ValidateSettings();
-        Assert.True(Options(new() { ["Worker:Swift"] = "True" }).WorkerSwift);
-        Assert.False(Options(new() { ["Worker:Swift"] = "false" }).WorkerSwift);
-
-        foreach (var refused in new[] { "yes", "1", "", "on" })
-        {
-            Assert.Contains("Worker:Swift must be 'true' or 'false'",
-                Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:Swift"] = refused }).ValidateSettings()).Message);
-        }
-        Assert.Contains("Worker:Swift is true, but Worker:RunAs=none",
-            Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:Swift"] = "true", ["Worker:RunAs"] = "none" }).ValidateSettings()).Message);
-        Options(new() { ["Worker:Swift"] = "false", ["Worker:RunAs"] = "none" }).ValidateSettings();
     }
 
     private static FactoryOptions Options(Dictionary<string, string?> config) =>

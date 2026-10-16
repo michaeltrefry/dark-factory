@@ -345,8 +345,9 @@ public sealed class ClaudeWorker(
     /// each a Claude Code prefix rule like <see cref="CargoTools"/>. Denied, so: <c>swift run</c>, <c>swift package</c> (its
     /// plugins, <c>resolve</c>, <c>update</c>, …), <c>swift repl</c>, <c>swift &lt;script&gt;</c> (running a file), every
     /// other subcommand and any form whose second word is not the subcommand. Accepted residual, the same as cargo's and
-    /// dotnet's (<see cref="Taint"/>): what follows the prefix is the worker's (<c>--package-path</c>, <c>-Xswiftc</c>, a test
-    /// filter), and these commands run code the repository and its dependencies supply — the package manifest
+    /// dotnet's (<see cref="Taint"/>): what follows the prefix is the worker's (<c>--package-path</c>, <c>-Xswiftc</c>,
+    /// <c>-Xcc</c>, <c>-Xlinker</c>, <c>-Xxcbuild</c>, <c>--disable-sandbox</c> — SwiftPM's own sandbox of the manifest and plugins
+    /// off —, <c>--scratch-path</c>/<c>--cache-path</c> outside the worktree, a test filter), and these commands run code the repository and its dependencies supply — the package manifest
     /// (<c>Package.swift</c> is Swift that SwiftPM runs), build-tool plugins, macros, tests — and resolve dependencies over
     /// the network, as the sandbox user with no credential but the router key; the result goes back through review, CI and
     /// the gate.

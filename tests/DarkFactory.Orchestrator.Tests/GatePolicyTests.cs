@@ -462,6 +462,13 @@ public class MergeGateTierTests
     [InlineData("App/App.entitlements", "App/App.entitlements (Xcode, CocoaPods and app configuration)")]
     [InlineData("Podfile.lock", "Podfile.lock (Xcode, CocoaPods and app configuration)")]
     [InlineData("App.xctestplan", "App.xctestplan (Xcode, CocoaPods and app configuration)")]
+    // An Info.plist under any name, XcodeGen's project.yaml, and SwiftPM build-tool plugin sources (sc-26134).
+    [InlineData("App/AppInfo.plist", "App/AppInfo.plist (Xcode, CocoaPods and app configuration)")]
+    [InlineData("App/Info-Debug.plist", "App/Info-Debug.plist (Xcode, CocoaPods and app configuration)")]
+    [InlineData("App/Info.plist", "App/Info.plist (Xcode, CocoaPods and app configuration)")]
+    [InlineData("project.yaml", "project.yaml (Xcode, CocoaPods and app configuration)")]
+    [InlineData("Plugins/GenPlugin/Plugin.swift", "Plugins/GenPlugin/Plugin.swift (Xcode, CocoaPods and app configuration)")]
+    [InlineData("Packages/Kit/Plugins/Gen/main.swift", "Packages/Kit/Plugins/Gen/main.swift (Xcode, CocoaPods and app configuration)")]
     [FailsGateCheck(GateCheckCoverage.FloorSecurityReviewPaths)]
     public void A_path_on_the_code_floor_needs_the_security_review_whatever_its_tier(string path, string why)
     {

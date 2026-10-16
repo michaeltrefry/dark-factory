@@ -349,8 +349,9 @@ internal static class SwiftLive
     /// What a merged item's ledger must hold (pure; empty when it holds it): typed outcomes are checked apart. The transitions end
     /// MergeGate → Merge → (Watch, and Done when the closeout is done); the last <c>new-tests</c> row is <c>pass</c> naming one of
     /// <paramref name="strategies"/> and holding a test <paramref name="isTest"/> picks that did not pass on the base and passed on the
-    /// head; the last <c>gate</c> row is a Merge decision listing <c>new-tests-fail-on-base</c> and naming no file CodeGraph does not
-    /// index; <c>gate-passed</c> names the head the check judged.
+    /// head; the last <c>gate</c> row is a Merge decision listing <c>new-tests-fail-on-base</c> (a file CodeGraph does not index may be
+    /// named there as having no CodeGraph data: that never blocks since sc-26254, and P5-AT5a/5b check it apart); <c>gate-passed</c>
+    /// names the head the check judged.
     /// </summary>
     public static List<string> MergedProblems(IReadOnlyList<LedgerEntry> history, IReadOnlyCollection<string> strategies, Func<NewTestResult, bool> isTest)
     {
@@ -497,4 +498,74 @@ internal static class SwiftLive
     /// <see cref="UnindexedFile.Reason"/>): recorded as no CodeGraph data, never blocking (sc-26254).
     /// </summary>
     public const string UnindexedSwiftMark = CodeGraphRisk.NoDataPrefix + "its language (Swift) is not indexed by CodeGraph";
+
+    /// <summary>
+    /// Why an item's ledger does not show the real panel passing the head the gate merged (pure; null when it does), for P5-AT7: its
+    /// last verdict passed, is for the head of its last <c>gate-passed</c> row, and every review and second opinion of it was served
+    /// on the router's high class with no panel-rule problem (as <c>ReviewGateTests.AssertHighClassPanel</c> asserts).
+    /// </summary>
+    public static string? PanelProblem(List<LedgerEntry> history)
+    {
+        var verdicts = RunPipeline.Verdicts(history);
+        if (verdicts.Count == 0)
+        {
+            return "no review verdict";
+        }
+        var verdict = verdicts[^1];
+        var passed = history.LastOrDefault(e => e.Step == RunPipeline.Steps.GatePassed)?.Detail;
+        if (!verdict.Passed)
+        {
+            return $"the last verdict did not pass: {verdict.Summary}";
+        }
+        if (verdict.HeadSha != passed)
+        {
+            return $"the last verdict is for {verdict.HeadSha}, not the head the gate passed ({passed ?? "none"})";
+        }
+        if (verdict.Reviews.Count == 0)
+        {
+            return "the last verdict has no review";
+        }
+        var off = verdict.Reviews.Where(r => r.ServedClass != ReviewModels.Class).Select(r => $"{r.Role} on class {r.ServedClass ?? "(none)"}").ToList();
+        if (off.Count > 0)
+        {
+            return $"not served on the {ReviewModels.Class} class: {string.Join(", ", off)}";
+        }
+        var problems = verdict.Reviews.SelectMany(ReviewModels.Problems).ToList();
+        return problems.Count > 0 ? $"panel problems: {string.Join("; ", problems)}" : null;
+    }
+
+    /// <summary>
+    /// Why a <c>gate</c> row does not show CodeGraph's blast radius of <paramref name="file"/> read at the PR head with data (pure; null
+    /// when it does), for P5-AT5b: the file must be an entry of the at-head list of <see cref="CodeGraphRisk.Describe"/> — the text
+    /// between <c>codegraph blast radius at &lt;head&gt;: </c> and the first <c>;</c> after it, so neither the default-branch list nor the
+    /// hotspots nor the no-data section counts — that entry must not end <c> (no data)</c> (CodeGraph's <c>found: false</c>), and no
+    /// <c>no CodeGraph data:</c> entry may name the file.
+    /// </summary>
+    public static string? BlastRadiusAtHeadProblem(string gate, string file)
+    {
+        const string AtHead = "codegraph blast radius at ";
+        var start = gate.IndexOf(AtHead, StringComparison.Ordinal);
+        if (start < 0)
+        {
+            return $"the gate row has no CodeGraph inputs: {gate}";
+        }
+        var list = gate.IndexOf(": ", start + AtHead.Length, StringComparison.Ordinal);
+        var end = list < 0 ? -1 : gate.IndexOf(';', list);
+        var atHead = list < 0 ? "" : gate[(list + 2)..(end < 0 ? gate.Length : end)];
+        var entry = atHead.Split(", ").FirstOrDefault(e => e.StartsWith(file + " ", StringComparison.Ordinal));
+        if (entry is null)
+        {
+            return $"{file} is not in the blast radius read at the head ({atHead}): {gate}";
+        }
+        if (entry.EndsWith(" (no data)", StringComparison.Ordinal))
+        {
+            return $"CodeGraph had no data for {file} at the head ({entry}): {gate}";
+        }
+        var noData = gate.IndexOf(CodeGraphRisk.NoDataMark, StringComparison.Ordinal);
+        if (noData >= 0 && gate[noData..].Contains(file, StringComparison.Ordinal))
+        {
+            return $"the gate row records no CodeGraph data for {file}: {gate[noData..]}";
+        }
+        return null;
+    }
 }

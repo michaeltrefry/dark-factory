@@ -303,11 +303,8 @@ public class SwiftAcceptanceTests
         var (history, _, _) = await AssertMergedAsync(run, outcome, new SwiftNewTests().Name, t => t.Test == change.TestId);
         var gate = history.Last(e => e.Step == RunPipeline.Steps.GateDecision).Detail!;
         Assert.DoesNotContain(SwiftLive.UnindexedSwiftMark, gate);
-        // risk-threshold read CodeGraph's blast radius of the Swift files at the head (CodeGraphRisk.Describe lists them first).
-        var blast = gate.IndexOf("codegraph blast radius at", StringComparison.Ordinal);
-        Assert.True(blast >= 0, $"the Merge gate row has no CodeGraph inputs: {gate}");
-        var hotspots = gate.IndexOf("; hotspot score", blast, StringComparison.Ordinal);
-        Assert.Contains(change.Source, gate[blast..(hotspots < 0 ? gate.Length : hotspots)]);
+        // risk-threshold read CodeGraph's blast radius of the Swift file at the head, with data (SwiftLiveTests prove the check).
+        Assert.Null(SwiftLive.BlastRadiusAtHeadProblem(gate, change.Source));
     }
 
     /// <summary>
@@ -350,7 +347,7 @@ public class SwiftAcceptanceTests
 /// P5-AT7 (sc-26134; docs/acceptance.md, "P5-AT7"): one real LensWorks epic and one real iOS change went through the factory. The
 /// runbook runs them with <c>factory work</c> over a watch scope on the owner's real ledger; this test then checks that ledger,
 /// read only (no write, no lock, no model): each item listed in <c>FACTORY_E2E_P5_AT7_ITEMS</c> merged through the gate with a new
-/// Swift test (a plan item: Done); the LensWorks items are a real epic (<see cref="SwiftLive.EpicProblems"/>: at least two items of
+/// Swift test (a plan item: Done), its last verdict a pass of the real panel on the high class for the head the gate passed; the LensWorks items are a real epic (<see cref="SwiftLive.EpicProblems"/>: at least two items of
 /// one epic, or a plan item with every story it planned, and every item the ledger holds of that epic listed and delivered); and an
 /// item of the iOS repository has a new test on an iOS target that was run and failed on the base (<see cref="SwiftLive.IosProblem"/>).
 /// </summary>
@@ -377,6 +374,8 @@ public class SwiftRealRunTests
             Assert.True(item is not null, $"the ledger ({options.LedgerConnectionString.Split(';')[0]}…) has no item {id}");
             var history = await db.LedgerEntries.AsNoTracking().Where(e => e.WorkItemId == item!.Id).OrderBy(e => e.Id).ToListAsync(ct);
             ReviewGateTests.AssertTypedOutcomes(history);
+            // The real panel, on the high class, passed the head the gate merged (a plan item: its changeset pull request's head).
+            Assert.True(SwiftLive.PanelProblem(history) is null, $"{id}: {SwiftLive.PanelProblem(history)}");
             if (history.Any(e => e.Step == RunPipeline.Steps.PlanStories))
             {
                 // A plan item: it is delivered by its changeset pull request and closed out; its stories are listed and checked themselves.
