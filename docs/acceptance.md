@@ -1380,10 +1380,10 @@ ledger** and its own work root (`E2e`), and takes every worker slot's lock of th
    trigger must also match `factory/**` bases if LensWorks plans are run: "CI that cannot run" in `CLAUDE.md`). The tests read
    the policy from `main` through the gate App and skip naming the step when it is missing.
 6. **CodeGraph** (only P5-AT5 needs it, sc-26254): the token (`FACTORY_CODEGRAPH_TOKEN` or keychain `codegraph-token`) and the
-   sandbox indexed. While CodeGraph C3 (sc-26137, the contract still consumed for the record) is not deployed or does not index
-   Swift, the gate records each changed Swift file as `no CodeGraph data: its language (Swift) is not indexed by CodeGraph` and
-   decides `risk-threshold` on the change's size, fix rounds and any available CodeGraph data — missing inputs alone do not
-   block a merge. P5-AT5 asks CodeGraph first about a Swift
+   sandbox indexed. CodeGraph C3 (sc-26137) is deployed. While CodeGraph does not index Swift the gate records each changed
+   Swift file as `no CodeGraph data: its language (Swift) is not indexed by CodeGraph` (CodeGraph missing or unreachable is
+   likewise recorded as `no CodeGraph data: <reason>`) and decides `risk-threshold` on the change's size, fix rounds and any
+   available CodeGraph data — missing inputs alone do not block a merge. P5-AT5 asks CodeGraph first about a Swift
    file of the sandbox's package on `main` (`SwiftLive.LanguageIndexedAsync`: `file_hotspot`, then `analyze_impact_file` at the
    default-branch index commit that answer names, decided by the gate's own rule over both answers, `LanguageCoverage.Of`; no flag
    at all means a CodeGraph before C3): AT5a skips once Swift is indexed, AT5b until it is. The probe FAILS — it never skips —
@@ -1441,7 +1441,7 @@ then needs a `Repo:` line naming it.)
 | P5-AT2 | `P5_AT2_a_swiftpm_change_with_a_new_xctest_test_merges` | `FACTORY_E2E_P5_SWIFTPM_STORY` | pushes `e2e-swift/Sources/DfE2eSwift/P<run>.swift` (a new function) and `e2e-swift/Tests/DfE2eSwiftTests/P<run>Tests.swift` (an XCTest test calling it) | AT1's ledger checks with strategy `swift-testing`; `DfE2eSwiftTests.P<run>Tests/testDoubles` `not-built` on the base (it calls code the PR adds) and `passed` on the head; merged; **the sandbox's main then holds both files** (one pair per run, safe to delete) |
 | P5-AT3 | `P5_AT3_an_ios_app_change_with_a_new_unit_test_run_in_the_simulator_merges` | `FACTORY_E2E_P5_IOS_UNIT_STORY`; optional `FACTORY_E2E_P5_IOS_REPO`, `FACTORY_E2E_P5_IOS_DIR` | raises `e2e-ios/Tally/E2eRun.swift`'s count to main's + 1 and pushes `e2e-ios/TallyTests/E2eUnit<run>Tests.swift` (XCTest: `E2eRun.count >= <count>`) | strategy `xcode-swift-testing`; `TallyTests/E2eUnit<run>Tests/testRunCountReached()` `failed` on the base and `passed` on the head, each on the run's own fresh iOS Simulator as the sandbox user; merged; its target, read at the merge commit, an **iOS** unit-test bundle; **main's run count goes up by one** |
 | P5-AT4 | `P5_AT4_an_ios_ui_test_runs_in_the_simulator_and_merges` | `FACTORY_E2E_P5_IOS_UI_STORY` (+ the same optional two) | raises the count likewise and pushes `e2e-ios/TallyUITests/E2eUi<run>UITests.swift` (XCUITest: launch the app, read the `e2e-runs` label, `>= <count>`) | `TallyUITests/E2eUi<run>UITests/testRunCountShown()` `failed` on the base and `passed` on the head (the S0 way: everything that needs the simulator booted in one helper run, a fresh device per run, deleted after); merged; its target an **iOS UI-test** bundle |
-| P5-AT5 (a) | `P5_AT5a_the_gate_records_no_codegraph_data_for_an_unindexed_swift_change_and_merges` | `FACTORY_E2E_P5_UNINDEXED_STORY`: a story whose fix lands in normal code (the gate will merge it); skips once CodeGraph indexes Swift | AT2's change | merged as AT2; the last `gate` row a `Merge` whose inputs record `no CodeGraph data: its language (Swift) is not indexed by CodeGraph…: …e2e-swift/Sources/DfE2eSwift/P<run>.swift…` (sc-26254; pre-C3 historical only: C3 shipped before a live refusal run, and a refusal is no longer required) |
+| P5-AT5 (a) | `P5_AT5a_the_gate_records_no_codegraph_data_for_an_unindexed_swift_change_and_merges` | `FACTORY_E2E_P5_UNINDEXED_STORY`: a story whose fix lands in normal code (the gate will merge it); skips once CodeGraph indexes Swift | AT2's change | merged as AT2; the last `gate` row a `Merge` whose inputs record `no CodeGraph data: its language (Swift) is not indexed by CodeGraph…: …e2e-swift/Sources/DfE2eSwift/P<run>.swift…` (sc-26254: replaces the pre-C3 refusal, which was never run live and is no longer required) |
 | P5-AT5 (b) | `P5_AT5b_the_gate_uses_codegraphs_data_of_the_swift_change_once_codegraph_indexes_swift` | `FACTORY_E2E_P5_INDEXED_STORY`; skips until CodeGraph (C3) answers `languageIndexed: true` for Swift | AT2's change | merged as AT2; the `gate` row's blast radius list (`codegraph blast radius at …`) names the Swift source file, and no Swift file is recorded as not indexed |
 | P5-AT6 | `P5_AT6_a_new_swift_test_that_already_passes_on_the_base_is_gate_rejected` | `FACTORY_E2E_P5_SWIFT_PASSING_STORY`: a sandbox bug story whose text tells the implementer to add **no** .NET/xUnit test (a rejected result names only the first strategy that rejected; the test fails naming the strategy that did, `SwiftLive.RejectedByProblem`) | pushes `e2e-swift/Tests/DfE2eSwiftTests/E2eAlreadyPassing.swift` (Swift Testing, `#expect(1 + 1 == 2)`) | the last `new-tests` row `rejected` (`gate_rejected`), strategy `swift-testing`, `DfE2eSwiftTests.e2eAlreadyPassesOnTheBase()` `passed` on both and named in the reason; the last `gate` row `Blocked …new-tests-fail-on-base (rejected)…`; MergeGate → Escalated; nothing merged; the PR closed and its branch deleted |
 
@@ -1462,7 +1462,7 @@ iOS rules (`SwiftLive.EpicProblems`, `SwiftLive.IosProblem`).
 
 A runbook step, then a read-only check of the real ledger.
 
-1. Prerequisites as above (CodeGraph not needed: without C3 the Swift files are recorded as having no CodeGraph data), with the
+1. Prerequisites as above (CodeGraph not needed: the factory works with or without CodeGraph data, sc-26254), with the
    factory's real ledger and settings: `Worker__Swift=true`, `Worker__Slots=2`, `Intake__MaxConcurrentRuns=2` if the stories may
    run side by side, `Factory__Repos` naming LensWorks and the iOS repository.
 2. One real LensWorks epic: at least two of its stories To Do with a
