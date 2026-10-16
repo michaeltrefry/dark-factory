@@ -250,7 +250,7 @@ public sealed class IssueIntake(
         {
             if (classifier is not null)
             {
-                var classification = await classifier.ClassifyAsync(item.Id, version, issue.Title, issue.Body, ct);
+                var classification = await ClassifyAsync(item, version, issue, ct);
                 await using var classificationDb = await contexts.CreateDbContextAsync(ct);
                 classificationDb.IssueClassifications.Add(classification);
                 await classificationDb.SaveChangesAsync(ct);
@@ -304,6 +304,39 @@ public sealed class IssueIntake(
         }
         await ApprovalsAsync(ledger, item, repo, record, comments, ct);
         return Outcome.Done;
+    }
+
+    /// <summary>The optional HTTP call still obeys live controls, including Stop. A control is a deferral, not unavailability.</summary>
+    private async Task<IssueClassification> ClassifyAsync(WorkItem item, string version, IssueFacts issue, CancellationToken ct)
+    {
+        using var call = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var pending = classifier!.ClassifyAsync(item.Id, version, issue.Title, issue.Body, call.Token);
+        try
+        {
+            while (!pending.IsCompleted)
+            {
+                await Task.WhenAny(pending, Task.Delay(TimeSpan.FromSeconds(1), call.Token));
+                ct.ThrowIfCancellationRequested();
+                if (await controls.EffectiveAsync(item.ExternalId, null, ct) != ControlState.Running)
+                {
+                    throw new TriageDeferredException("a control holds classification; retried once running");
+                }
+            }
+            var result = await pending;
+            ct.ThrowIfCancellationRequested();
+            if (await controls.EffectiveAsync(item.ExternalId, null, ct) != ControlState.Running)
+            {
+                throw new TriageDeferredException("a control holds classification; retried once running");
+            }
+            return result;
+        }
+        finally
+        {
+            // Drain before disposing the request's lifetime or releasing the intake lock. Never leave a call running behind triage.
+            await call.CancelAsync();
+            try { await pending; }
+            catch (OperationCanceledException) when (call.IsCancellationRequested) { }
+        }
     }
 
     /// <summary>

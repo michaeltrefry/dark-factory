@@ -499,7 +499,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
         _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSlotCount, WorkerSlots, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures, MaxConcurrentRuns);
         _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
         _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl, KanbanMcpUrl);
-        _ = (CodeGraphOverlayTimeout, KanbanWatchScope, KanbanWebUrl, IssueClassificationMode, IssueClassificationModel);
+        _ = (CodeGraphOverlayTimeout, KanbanWatchScope, KanbanWebUrl, IssueClassificationMode, IssueClassificationModel, IssueClassificationTimeout, IssueClassificationMaxInputChars);
         // Kanban:WriteToken must not be Kanban:Token (E2, sc-25992); compared where the write token is read, the registry.
         WorkSources.WorkSourceRegistry.EnsureKanbanTokensApart(this);
     }
@@ -526,6 +526,16 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
                 : throw new InvalidOperationException("Issues:Classification:Model must name an explicit SystemOne catalog model in shadow mode.");
         }
     }
+
+    /// <summary>Total classifier HTTP deadline, including the response body; no retries (default 5 seconds).</summary>
+    public TimeSpan IssueClassificationTimeout =>
+        config.GetValue("Issues:Classification:TimeoutSeconds", 5d) is var seconds
+            && double.IsFinite(seconds) && seconds > 0 && seconds <= uint.MaxValue / 1000d
+            ? TimeSpan.FromSeconds(seconds)
+            : throw new InvalidOperationException("Issues:Classification:TimeoutSeconds must be finite, more than 0, and fit the request timer.");
+
+    /// <summary>Complete title + body budget in UTF-16 characters, not tokens or a universal model context limit.</summary>
+    public int IssueClassificationMaxInputChars => AtLeast("Issues:Classification:MaxInputChars", 4096, 1);
 
     public bool TryGet(Func<FactoryOptions, string> secret, out string? value)
     {

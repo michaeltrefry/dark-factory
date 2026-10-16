@@ -19,6 +19,7 @@ public class IssueClassificationTests
         public int Calls { get; private set; }
         public string? Body { get; private set; }
         public string Answer { get; set; } = Reply("bug");
+        public Func<CancellationToken, Task<HttpResponseMessage>>? Respond { get; set; }
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             Calls++;
@@ -26,6 +27,7 @@ public class IssueClassificationTests
             Assert.Equal("router-secret", Assert.Single(request.Headers.GetValues("X-Weave-Router-Key")));
             Assert.False(request.Headers.Contains("x-weave-model-class"));
             Body = await request.Content!.ReadAsStringAsync(ct);
+            if (Respond is not null) { return await Respond(ct); }
             return new(HttpStatusCode.OK) { Content = new StringContent(Answer, Encoding.UTF8, "application/json") };
         }
     }
@@ -199,6 +201,173 @@ public class IssueClassificationTests
         Assert.Equal(123, row.InputTokens);
         Assert.Equal(.63, row.Confidence);
         Assert.Equal(IssueClassifier.PromptVersion, row.PromptVersion);
+    }
+
+    [Theory]
+    [InlineData("timeout", "timeout")]
+    [InlineData("http", "http_error")]
+    [InlineData("transport", "http_error")]
+    [InlineData("malformed", "invalid_response")]
+    [InlineData("range", "invalid_response")]
+    [InlineData("distribution", "invalid_response")]
+    [InlineData("question", "invalid_response")]
+    [InlineData("label", "invalid_response")]
+    [InlineData("nonfinite", "invalid_response")]
+    public async Task Classifier_failures_are_observable_and_never_spend_triage_budget_or_pause_usage(string failure, string expected)
+    {
+        using var router = new Router();
+        router.Answer = failure switch
+        {
+            "malformed" => "{private-report",
+            "range" => Reply("bug").Replace("0.8", "1.2"),
+            "distribution" => Reply("bug").Replace("0.8", "0.2"),
+            "question" => Reply("bug").Replace("issue_kind", "other"),
+            "label" => Reply("unknown"),
+            "nonfinite" => Reply("bug").Replace("0.8", "1e999"),
+            _ => Reply("bug")
+        };
+        if (failure == "timeout") { router.Respond = async ct => { await Task.Delay(Timeout.InfiniteTimeSpan, ct); throw new Exception(); }; }
+        if (failure == "transport") { router.Respond = _ => throw new HttpRequestException("private-report"); }
+        if (failure == "http") { router.Respond = _ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.TooManyRequests) { Content = new StringContent("private-report all_exhausted") }); }
+        using var http = new HttpClient(router) { BaseAddress = new("http://router.test/") };
+        var options = Options(("Issues:Classification:Mode", "shadow"), ("Issues:Classification:Model", "catalog-d3"), ("Issues:Classification:TimeoutSeconds", "0.05"));
+        var h = new IssueIntakeTests.Harness(Answer()) { Classifier = IssueClassifier.Create(options, http, () => "router-secret") };
+        var observedFailures = 0;
+        h.Status.Changed += () => observedFailures = Math.Max(observedFailures, h.Status.ItemErrors.Values.Sum(e => e.Count));
+        await h.Watch();
+        h.Open("visitor");
+        await h.Poll();
+        Assert.Single(h.Triage.Prompts);
+        Assert.Equal(IssueRoute.AwaitingApproval, IssueIntake.Latest(await h.Rows())!.Route);
+        Assert.Equal(0, observedFailures);
+        Assert.Null(await h.Controls.UsagePauseAsync(CancellationToken.None));
+        await using var db = h.Db();
+        var row = await db.IssueClassifications.SingleAsync();
+        Assert.Equal(expected, row.Status);
+        if (failure == "timeout") { Assert.InRange(row.ElapsedMs, 1, 2000); }
+        Assert.Null(row.Label);
+        Assert.Null(row.Probabilities);
+        Assert.Null(row.Confidence);
+        Assert.DoesNotContain("private-report", JsonSerializer.Serialize(row));
+        Assert.Equal(1, router.Calls);
+    }
+
+    [Theory]
+    [InlineData(10, "skipped_oversize", 0)]
+    [InlineData(4096, "completed", 1)]
+    public async Task Input_budget_counts_complete_title_and_body_without_changing_triage(int budget, string status, int calls)
+    {
+        using var router = new Router();
+        using var http = new HttpClient(router) { BaseAddress = new("http://router.test/") };
+        var options = Options(("Issues:Classification:Mode", "shadow"), ("Issues:Classification:Model", "catalog-d3"), ("Issues:Classification:MaxInputChars", budget.ToString()));
+        var h = new IssueIntakeTests.Harness(Answer()) { Classifier = IssueClassifier.Create(options, http, () => "router-secret") };
+        var baseline = new IssueIntakeTests.Harness(Answer());
+        const string body = "Full body with its final evidence intact.";
+        await h.Watch(); await baseline.Watch();
+        h.Open("visitor", body); baseline.Open("visitor", body);
+        await h.Poll(); await baseline.Poll();
+        Assert.Equal(Assert.Single(baseline.Triage.Prompts), Assert.Single(h.Triage.Prompts));
+        Assert.Contains(body, h.Triage.Prompts[0]);
+        Assert.Contains("WordCount counts whitespace", h.Triage.Prompts[0]);
+        Assert.Equal(calls, router.Calls);
+        await using var db = h.Db();
+        Assert.Equal(status, (await db.IssueClassifications.SingleAsync()).Status);
+    }
+
+    private sealed class SlowBody(TaskCompletionSource cancelled) : HttpContent
+    {
+        protected override bool TryComputeLength(out long length) { length = 0; return false; }
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
+            throw new InvalidOperationException("the response body must receive the deadline token");
+        protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken ct)
+        {
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, ct); }
+            finally { if (ct.IsCancellationRequested) { cancelled.SetResult(); } }
+        }
+    }
+
+    [Fact]
+    public async Task Total_deadline_cancels_a_response_body_that_never_finishes()
+    {
+        var cancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var router = new Router { Respond = _ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new SlowBody(cancelled) }) };
+        using var http = new HttpClient(router) { BaseAddress = new("http://router.test/") };
+        var options = Options(("Issues:Classification:Mode", "shadow"), ("Issues:Classification:Model", "catalog-d3"), ("Issues:Classification:TimeoutSeconds", "0.05"));
+        var h = new IssueIntakeTests.Harness(Answer()) { Classifier = IssueClassifier.Create(options, http, () => "router-secret") };
+        await h.Watch(); h.Open("visitor");
+        await h.Poll().WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.True(cancelled.Task.IsCompletedSuccessfully);
+        Assert.Single(h.Triage.Prompts);
+        await using var db = h.Db();
+        Assert.Equal("timeout", (await db.IssueClassifications.SingleAsync()).Status);
+        Assert.Null(await h.Controls.UsagePauseAsync(CancellationToken.None));
+        Assert.Empty(h.Status.ItemErrors);
+        Assert.Equal(1, router.Calls);
+    }
+
+    [Theory]
+    [InlineData(11, "skipped_oversize")]
+    [InlineData(12, "completed")]
+    public async Task Budget_is_the_sum_of_title_and_body_with_an_inclusive_boundary(int budget, string expected)
+    {
+        using var router = new Router();
+        using var http = new HttpClient(router) { BaseAddress = new("http://router.test/") };
+        var classifier = new IssueClassifier(http, "router-secret", "catalog-d3", maxInputChars: budget);
+        var row = await classifier.ClassifyAsync(1, "hash", "123456", "123456", CancellationToken.None);
+        Assert.Equal(expected, row.Status);
+        Assert.Equal(expected == "completed" ? 1 : 0, router.Calls);
+    }
+
+    [Theory]
+    [InlineData("pause")]
+    [InlineData("stop")]
+    [InlineData("caller")]
+    public async Task Controls_and_caller_cancellation_stop_classification_without_recording_unavailable(string control)
+    {
+        using var router = new Router();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        router.Respond = async ct =>
+        {
+            entered.SetResult();
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, ct); }
+            finally { if (ct.IsCancellationRequested) { cancelled.SetResult(); } }
+            throw new Exception();
+        };
+        using var http = new HttpClient(router) { BaseAddress = new("http://router.test/") };
+        var h = new IssueIntakeTests.Harness(Answer()) { Classifier = new IssueClassifier(http, "router-secret", "catalog-d3") };
+        await h.Watch(); h.Open("visitor");
+        using var caller = new CancellationTokenSource();
+        var poll = h.Intake().PollAsync(caller.Token);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        if (control == "caller") { caller.Cancel(); }
+        else { await h.Controls.SetAsync("item:gh-1", control == "pause" ? ControlState.Paused : ControlState.Stopping, "test", CancellationToken.None); }
+        await cancelled.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        if (control == "caller") { await Assert.ThrowsAnyAsync<OperationCanceledException>(() => poll); }
+        else { await poll.WaitAsync(TimeSpan.FromSeconds(3)); }
+        Assert.Empty(h.Triage.Prompts);
+        Assert.Empty(h.Status.ItemErrors);
+        await using var db = h.Db();
+        Assert.Empty(await db.IssueClassifications.ToListAsync());
+        Assert.DoesNotContain(await h.Rows(), r => r.Step == IssueSteps.Triaged);
+    }
+
+    [Fact]
+    public void Bounds_are_validated_even_when_disabled_and_read_nondefault_settings()
+    {
+        Assert.Equal(TimeSpan.FromSeconds(5), Options().IssueClassificationTimeout);
+        Assert.Equal(4096, Options().IssueClassificationMaxInputChars);
+        var options = Options(("Issues:Classification:TimeoutSeconds", "1.25"), ("Issues:Classification:MaxInputChars", "123"));
+        options.ValidateSettings();
+        Assert.Equal(TimeSpan.FromSeconds(1.25), options.IssueClassificationTimeout);
+        Assert.Equal(123, options.IssueClassificationMaxInputChars);
+        foreach (var key in new[] { "Issues:Classification:TimeoutSeconds", "Issues:Classification:MaxInputChars" })
+        {
+            foreach (var invalid in key.EndsWith("TimeoutSeconds") ? new[] { "0", "-1", "NaN", "Infinity", "1e99" } : new[] { "0", "-1" })
+            {
+                Assert.Contains(key, Assert.Throws<InvalidOperationException>(() => Options((key, invalid)).ValidateSettings()).Message);
+            }
+        }
     }
 
     internal static FactoryOptions Options(params (string Key, string Value)[] values) =>
