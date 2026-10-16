@@ -273,6 +273,39 @@ public class SwiftToolchainTests
     }
 
     [Fact]
+    public void A_swift_factorys_prompts_say_what_the_shell_denies_and_where_a_simulator_name_comes_from()
+    {
+        // sc-26134: a live iOS worker (sc-26248) spent 9 of 26 tool calls on git, raw xcrun simctl and ls outside the worktree,
+        // all denied. The Swift clause says so up front; the .NET/Rust clause is unchanged (E7, pinned by the test below).
+        var clause = RunPipeline.BuildsAndPassesFor(true);
+        Assert.EndsWith("the only xcodebuild command allowed). " + RunPipeline.SwiftSandboxNote, clause);
+        Assert.Contains("there is no git", clause);
+        Assert.Contains("no raw `xcodebuild`, `xcrun` or `simctl`", clause);
+        Assert.Contains("your shell is allowed no other command", clause);
+        Assert.Contains("no `ls`, `cat` or `find`", clause);
+        Assert.Contains("use the Read, Glob and Grep tools to look at files", clause);
+        Assert.DoesNotContain("outside this worktree", clause);
+        Assert.Contains("take `<device>` from the repository's CI workflow or README", clause);
+        Assert.Contains("xcodebuild's error, which the wrapper passes through, lists the available destinations", clause);
+        Assert.False(RunPipeline.SwiftSandboxNote.EndsWith('.'), "every prompt puts its own full stop after the clause");
+        Assert.DoesNotContain(RunPipeline.SwiftSandboxNote, RunPipeline.BuildsAndPassesFor(false));
+
+        var spec = new WorkSpec(new WorkStory(1, "Story", "Do it.", "feature", "https://example.test/1", ItemNaming.Shortcut), null, []);
+        var repo = RepoRef.Parse("o/r");
+        foreach (var swift in new[] { false, true })
+        {
+            string[] prompts =
+            [
+                RunPipeline.BuildPrompt(spec, repo, swift),
+                RunPipeline.BuildFixPrompt(spec, repo, 1, [], swift: swift),
+                RunPipeline.BuildCiFixPrompt(spec, repo, 1, new string('a', 40), [], swift: swift),
+                RunPipeline.BuildConflictFixPrompt(spec, repo, 1, new BaseUpdate(BaseUpdate.Kinds.Conflict, new string('a', 40), new string('b', 40), Files: ["f"]), swift: swift),
+            ];
+            Assert.All(prompts, prompt => Assert.Equal(swift, prompt.ReplaceLineEndings(" ").Replace("  ", " ").Contains(RunPipeline.SwiftSandboxNote + ".", StringComparison.Ordinal)));
+        }
+    }
+
+    [Fact]
     public void Without_worker_swift_only_the_xcode_wrapper_rule_and_prompt_clause_are_absent_and_the_always_on_swift_parts_are_there()
     {
         // With Worker:Swift unset no rule or prompt names the xcodebuild wrapper. What every factory gets whatever the setting —
